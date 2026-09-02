@@ -1,21 +1,17 @@
-//! Presents a Sony DualSense as a real USB/IP composite device through `vhci_hcd`.
-//! The USB parent is required for Wine's ContainerId pairing and for `snd-usb-audio`
-//! to create the ALSA card that GE-Proton enumerates; `/dev/uhid` provides neither.
+//! Sony DualSense as a USB/IP composite device through in-kernel `vhci_hcd`.
+//! Wine needs a USB parent for ContainerId pairing; `snd-usb-audio` needs one for the
+//! ALSA card GE-Proton enumerates. `/dev/uhid` provides neither.
 //!
-//! The four-interface layout is transcribed from `lsusb -v` for wired `054c:0ce6`:
-//! UAC 1.0 control; S16LE 4-channel 48 kHz OUT on isochronous endpoint `0x01`;
-//! S16LE 2-channel 48 kHz IN on `0x82`; and HID interrupt IN/OUT on `0x84`/`0x03`.
-//! [`tests::config_descriptor_matches_hardware`] pins the hardware `wTotalLength` (`0x00E3`).
-//! The HID descriptor length always matches the served 273-byte [`DUALSENSE_RDESC`],
-//! which is proven to bind `hid-playstation` despite hardware advertising 289 bytes.
+//! Four interfaces from wired `054c:0ce6`: UAC 1.0 control; S16LE 4-channel 48 kHz OUT
+//! on isochronous `0x01`; S16LE 2-channel 48 kHz IN on `0x82`; HID interrupt IN/OUT on
+//! `0x84`/`0x03`. [`tests::config_descriptor_matches_hardware`] pins `wTotalLength`
+//! `0x00E3`. HID report length is the 273-byte [`DUALSENSE_RDESC`], not the 289
+//! hardware advertises; `hid-playstation` binds the shorter one.
 //!
-//! Audio OUT packets are converted from the raw four-channel S16LE pad layout to `f32`
-//! and published once per pad through [`take_audio_rx`]; the downstream 0xD1 path is unchanged.
-//! Queue overflow drops audio rather than blocking a URB reply and stalling the kernel ISO ring.
-//!
-//! This relies only on the in-kernel `vhci_hcd`, not an out-of-tree or Secure-Boot-bypassing module.
-//! The vendored USB/IP server serializes URBs and sleeps for endpoint service intervals, so HID
-//! polls may wait behind audio; concurrency requires seqnum-keyed out-of-order completions.
+//! Audio OUT is converted to `f32` and published once per pad via [`take_audio_rx`].
+//! Queue overflow drops rather than blocking a URB reply (that stalls the kernel ISO
+//! ring). The vendored USB/IP server serializes URBs, so HID polls may wait behind
+//! audio; concurrency needs seqnum-keyed out-of-order completions.
 
 use super::dualsense_proto::{
     ds_pairing_reply, parse_ds_output, serialize_state, DsFeedback, DsState,
@@ -34,54 +30,44 @@ use usbip_sim::{
     UsbInterfaceHandler, Version,
 };
 
-/// The pad's audio quad: ch0/1 = headphone L/R (ch1 doubles as the internal mono speaker),
-/// ch2/ch3 = the two haptic voice coils. Same layout `pad_sink`/`split_quad` already assume.
+/// ch0/1 headphone L/R (ch1 is also the internal mono speaker); ch2/ch3 haptic coils.
+/// Same layout as `pad_sink` / `split_quad`.
 pub const PAD_AUDIO_CHANNELS: usize = 4;
 
-/// Isochronous OUT endpoint (haptics + speaker), from the hardware capture.
+/// Hardware isochronous OUT (haptics + speaker).
 const EP_AUDIO_OUT: u8 = 0x01;
-/// Isochronous IN endpoint (headset mic).
+/// Hardware isochronous IN (headset mic).
 const EP_AUDIO_IN: u8 = 0x82;
-/// Interrupt IN endpoint (HID input report `0x01`).
+/// HID input report `0x01`.
 const EP_HID_IN: u8 = 0x84;
-/// Interrupt OUT endpoint (HID output report `0x02`).
+/// HID output report `0x02`.
 const EP_HID_OUT: u8 = 0x03;
 
-/// `bInterval` for the HID endpoints. **Deliberately 4 (1 ms at high speed), not the hardware's 6
-/// (4 ms).** Nothing fingerprints the polling interval, and inheriting the hardware's 250 Hz cap
-/// would add up to 4 ms of input latency the uhid pad does not have — a real regression on the one
-/// axis this product is judged by.
+/// HID `bInterval` 4 = 1 ms at high speed, not hardware's 6 (4 ms / 250 Hz). Matching
+/// hardware would add up to 4 ms of input latency the uhid pad does not have.
 const HID_INTERVAL: u8 = 4;
-/// `bInterval` for the isochronous audio endpoints — 4 ⇒ one packet per millisecond at high speed,
-/// exactly as the hardware declares.
+/// Isochronous `bInterval` 4 = one packet per millisecond at high speed, as hardware.
 const AUDIO_INTERVAL: u8 = 4;
 
-/// `wMaxPacketSize` of the audio OUT endpoint: 49 frames × 4 ch × 2 bytes. One millisecond of
-/// 48 kHz is 48 frames; the spare frame is the slack an *adaptive* sink needs to absorb the host's
-/// clock drift, and the hardware declares the same 392.
+/// 49 frames × 4 ch × 2 bytes. 48 kHz is 48 frames/ms; the spare is adaptive-sink slack
+/// for host clock drift. Hardware declares 392.
 const AUDIO_OUT_MPS: u16 = 392;
-/// `wMaxPacketSize` of the audio IN endpoint: 49 frames × 2 ch × 2 bytes.
+/// 49 frames × 2 ch × 2 bytes.
 const AUDIO_IN_MPS: u16 = 196;
 
-/// How many decoded audio chunks may queue for the streamer before we drop. The consumer wakes
-/// every 5 ms and each chunk is ~1 ms, so this is generous; dropping beats blocking the URB reply,
-/// which would stall the kernel's ISO ring and xrun the game's stream.
+/// Decoded chunks queued before drop. Consumer wakes every 5 ms, each chunk ~1 ms;
+/// drop rather than block the URB reply (that stalls the kernel ISO ring).
 const AUDIO_QUEUE_DEPTH: usize = 256;
 
-// ---- per-pad audio hand-off to the host's pad-audio streamer ----
-
-/// Receivers published by live usbip pads, indexed by wire pad index.
+/// Audio receivers for live usbip pads, indexed by wire pad.
 ///
-/// The pad is created on the session's input thread while the pad-audio streamer runs on its own
-/// thread in another crate, so the two are joined by this registry rather than by a call graph. A
-/// `Receiver` is single-consumer by construction, so [`take_audio_rx`] hands it over exactly once;
-/// the streamer's existing open-with-backoff loop covers the case where it looks before the pad
-/// exists.
+/// Pad creation is on the session input thread; the streamer lives in another crate, so
+/// they join here rather than by a call graph. [`take_audio_rx`] hands the single-consumer
+/// `Receiver` over once; the streamer's open-with-backoff covers looking before the pad exists.
 static AUDIO_RX: Mutex<Vec<Option<Receiver<Vec<f32>>>>> = Mutex::new(Vec::new());
 
-/// Take the audio receiver for wire pad `pad`, if a usbip DualSense has published one and nobody
-/// has claimed it yet. Returns interleaved `f32` chunks of [`PAD_AUDIO_CHANNELS`] channels at
-/// 48 kHz — the pad's raw hardware quad.
+/// Take the unpublished audio receiver for wire pad `pad`, if any. Interleaved `f32`
+/// of [`PAD_AUDIO_CHANNELS`] at 48 kHz.
 pub fn take_audio_rx(pad: u8) -> Option<Receiver<Vec<f32>>> {
     let mut g = AUDIO_RX.lock().ok()?;
     g.get_mut(pad as usize).and_then(Option::take)
@@ -104,8 +90,6 @@ fn clear_audio_rx(pad: u8) {
     }
 }
 
-// ---- descriptor helpers ----
-
 fn ep(address: u8, attributes: u8, max_packet_size: u16, interval: u8) -> UsbEndpoint {
     UsbEndpoint {
         address,
@@ -115,8 +99,8 @@ fn ep(address: u8, attributes: u8, max_packet_size: u16, interval: u8) -> UsbEnd
     }
 }
 
-/// The 9-byte HID class descriptor for interface 3. `bcdHID 1.11`, country 0 — the hardware's
-/// values (the Deck helper in [`super::steam_usbip`] bakes its own 1.10/33, hence a local copy).
+/// HID class descriptor for interface 3. Hardware is `bcdHID 1.11`, country 0 — the Deck
+/// helper in [`super::steam_usbip`] bakes 1.10/33, so this is a local copy.
 fn hid_class_descriptor(report_len: usize) -> Vec<u8> {
     let l = report_len as u16;
     #[rustfmt::skip]
@@ -131,10 +115,8 @@ fn hid_class_descriptor(report_len: usize) -> Vec<u8> {
     d
 }
 
-/// The class-specific **Audio Control** descriptor block for interface 0, verbatim from the
-/// hardware capture: the 4-channel USB-streaming input terminal feeding a feature unit and the
-/// Speaker output terminal, plus the Headset input terminal feeding the USB-streaming output
-/// terminal. `wTotalLength` is `0x0049` (73) — the length of everything below.
+/// Interface 0 Audio Control class descriptors, verbatim from hardware. `wTotalLength`
+/// `0x0049` (73) is the length of this block.
 #[rustfmt::skip]
 fn audio_control_descriptor() -> Vec<u8> {
     vec![
@@ -155,8 +137,8 @@ fn audio_control_descriptor() -> Vec<u8> {
     ]
 }
 
-/// The class-specific **Audio Streaming** block for one direction: `AS_GENERAL` naming the terminal
-/// it links to, then a Type-I `FORMAT_TYPE` fixing PCM S16 at 48 kHz over `channels` channels.
+/// Audio Streaming class descriptors: `AS_GENERAL` (terminal link) then Type-I PCM S16
+/// at 48 kHz over `channels`.
 #[rustfmt::skip]
 fn audio_streaming_descriptor(terminal_link: u8, channels: u8) -> Vec<u8> {
     vec![
@@ -167,8 +149,8 @@ fn audio_streaming_descriptor(terminal_link: u8, channels: u8) -> Vec<u8> {
     ]
 }
 
-/// The 2 bytes a UAC 1.0 isochronous endpoint descriptor carries past the standard 7
-/// (`bRefresh`, `bSynchAddress`), and the `AS_ENDPOINT` descriptor that follows it.
+/// UAC 1.0 isochronous extras past the 7-byte endpoint (`bRefresh`, `bSynchAddress`)
+/// plus the following `AS_ENDPOINT`.
 fn audio_endpoint_extras() -> (Vec<u8>, Vec<u8>) {
     let in_descriptor = vec![0x00, 0x00]; // bRefresh, bSynchAddress
     #[rustfmt::skip]
@@ -179,29 +161,23 @@ fn audio_endpoint_extras() -> (Vec<u8>, Vec<u8>) {
     (in_descriptor, trailer)
 }
 
-// ---- interface handlers ----
-
-/// Answers the standard per-interface requests every interface must survive: `SET_INTERFACE` (which
-/// `snd-usb-audio` uses to arm and disarm a streaming altsetting), `GET_INTERFACE`, and
-/// `GET_STATUS`. Returns `None` if the request was not one of those.
+/// `SET_INTERFACE` (`snd-usb-audio` arms/disarms a streaming altsetting), `GET_INTERFACE`,
+/// `GET_STATUS`. `None` if the request is none of those.
 fn standard_interface_reply(setup: SetupPacket, current_alt: &mut u8) -> Option<Vec<u8>> {
     match (setup.request_type, setup.request) {
-        // SET_INTERFACE — wValue is the alternate setting. ACK with no data.
         (0x01, 0x0B) => {
             *current_alt = setup.value as u8;
             Some(Vec::new())
         }
-        // GET_INTERFACE — report whichever setting is armed.
         (0x81, 0x0A) => Some(vec![*current_alt]),
-        // GET_STATUS — interfaces are always "0".
+        // GET_STATUS — interfaces report 0.
         (0x81, 0x00) => Some(vec![0x00, 0x00]),
         _ => None,
     }
 }
 
-/// Interface 0 — Audio Control. Serves the topology descriptor and answers the feature-unit
-/// mute/volume queries `snd-usb-audio` makes while building its mixer. A refused query only costs
-/// the mixer control, but answering keeps `amixer`/`wpctl` showing the pad the way hardware does.
+/// Interface 0 Audio Control. Answers feature-unit mute/volume so `snd-usb-audio` builds
+/// a mixer; refusing only drops the control, but `amixer`/`wpctl` then look unlike hardware.
 #[derive(Debug, Default)]
 struct AudioControlHandler {
     current_alt: u8,
@@ -223,21 +199,16 @@ impl UsbInterfaceHandler for AudioControlHandler {
         if let Some(r) = standard_interface_reply(setup, &mut self.current_alt) {
             return Ok(r);
         }
-        // Class requests carry the control selector in wValue's high byte: 0x01 = MUTE (1 byte),
-        // 0x02 = VOLUME (2 bytes, signed 1/256 dB).
+        // wValue high byte is the control selector: 0x01 MUTE (1 byte), 0x02 VOLUME
+        // (2 bytes, signed 1/256 dB).
         let selector = (setup.value >> 8) as u8;
         Ok(match (setup.request_type, setup.request, selector) {
-            // GET_CUR / GET_MIN / GET_MAX / GET_RES on MUTE.
             (0xA1, 0x81..=0x84, 0x01) => vec![0x00], // never muted
-            // GET_CUR on VOLUME — 0 dB.
-            (0xA1, 0x81, 0x02) => 0i16.to_le_bytes().to_vec(),
-            // GET_MIN — −60 dB.
-            (0xA1, 0x82, 0x02) => (-60i16 * 256).to_le_bytes().to_vec(),
-            // GET_MAX — 0 dB.
-            (0xA1, 0x83, 0x02) => 0i16.to_le_bytes().to_vec(),
-            // GET_RES — 3/16 dB, the step the hardware advertises.
-            (0xA1, 0x84, 0x02) => 0x0030i16.to_le_bytes().to_vec(),
-            // SET_CUR and anything else: ACK silently, exactly as the hardware tolerates.
+            (0xA1, 0x81, 0x02) => 0i16.to_le_bytes().to_vec(), // 0 dB
+            (0xA1, 0x82, 0x02) => (-60i16 * 256).to_le_bytes().to_vec(), // −60 dB
+            (0xA1, 0x83, 0x02) => 0i16.to_le_bytes().to_vec(), // 0 dB
+            (0xA1, 0x84, 0x02) => 0x0030i16.to_le_bytes().to_vec(), // 3/16 dB, hardware step
+            // Unknown class request: ACK, as hardware does.
             _ => Vec::new(),
         })
     }
@@ -247,21 +218,19 @@ impl UsbInterfaceHandler for AudioControlHandler {
     }
 }
 
-/// Interface 1 — Audio Streaming OUT. **This is the capture point**: every isochronous packet the
-/// kernel pushes here is one service interval of the game's haptic/speaker quad.
+/// Interface 1 Audio Streaming OUT. Each isochronous packet is one service interval of
+/// the game's haptic/speaker quad.
 #[derive(Debug)]
 struct SpeakerStreamHandler {
     tx: SyncSender<Vec<f32>>,
     current_alt: u8,
-    /// Packets dropped because the streamer fell behind — logged once per burst rather than per
-    /// packet so a stalled consumer cannot itself become the log flood.
+    /// Queue-full drops; logged on powers of two so a stall cannot flood the log.
     dropped: u64,
 }
 
 impl UsbInterfaceHandler for SpeakerStreamHandler {
     fn get_class_specific_descriptor(&self) -> Vec<u8> {
-        // Alt 0 is the zero-bandwidth setting and carries no class-specific descriptor; the real
-        // ones live on alt 1 (see `build_device`).
+        // Alt 0 is zero-bandwidth and has no class descriptor; alt 1 is in `build_device`.
         Vec::new()
     }
 
@@ -286,7 +255,7 @@ impl UsbInterfaceHandler for SpeakerStreamHandler {
         if total >= 2 {
             let mut pcm = Vec::with_capacity(total / 2);
             for p in packets {
-                // Trailing odd byte can only mean a truncated frame; `chunks_exact` drops it.
+                // Truncated frame: `chunks_exact` drops a trailing odd byte.
                 for s in p.data.chunks_exact(2) {
                     pcm.push(i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0);
                 }
@@ -301,7 +270,7 @@ impl UsbInterfaceHandler for SpeakerStreamHandler {
                 }
             }
         }
-        // OUT packets are acknowledged with no payload; the caller fills in actual_length.
+        // OUT: empty replies; the caller fills actual_length.
         Ok(vec![Vec::new(); packets.len()])
     }
 
@@ -310,8 +279,8 @@ impl UsbInterfaceHandler for SpeakerStreamHandler {
     }
 }
 
-/// Interface 2 — Audio Streaming IN (the headset mic). Declared for topology fidelity so the ALSA
-/// card looks like the hardware's; it streams silence until pad-mic capture exists.
+/// Interface 2 Audio Streaming IN (headset mic). Topology only; streams silence until
+/// pad-mic capture exists.
 #[derive(Debug, Default)]
 struct MicStreamHandler {
     current_alt: u8,
@@ -338,10 +307,9 @@ impl UsbInterfaceHandler for MicStreamHandler {
     }
 }
 
-/// Interface 3 — the controller itself. Mirrors [`super::dualsense::DualSensePad`]'s codec: report
-/// `0x01` out of the interrupt-IN endpoint, report `0x02` in on the interrupt-OUT endpoint, and the
-/// `0x05`/`0x09`/`0x20` feature reports `hid-playstation` demands during init (without them no
-/// input devices ever appear).
+/// Interface 3 HID. Same codec as [`super::dualsense::DualSensePad`]: input `0x01`,
+/// output `0x02`, feature `0x05`/`0x09`/`0x20` (`hid-playstation` init; without them no
+/// input devices appear).
 struct HidHandler {
     report: Arc<Mutex<[u8; DS_INPUT_REPORT_LEN]>>,
     feedback: Arc<Mutex<DsFeedback>>,
@@ -349,8 +317,8 @@ struct HidHandler {
     current_alt: u8,
 }
 
-// Hand-written because `DsFeedback` is not `Debug` (it carries `HidOutput`s), and the trait bound
-// on `UsbInterfaceHandler` only ever wants a name for tracing.
+// Hand-written: `DsFeedback` is not `Debug` (it holds `HidOutput`s); the trait only
+// wants a name for tracing.
 impl std::fmt::Debug for HidHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HidHandler")
@@ -378,9 +346,8 @@ impl UsbInterfaceHandler for HidHandler {
                 return Ok(r);
             }
             return Ok(match (setup.request_type, setup.request) {
-                // GET_DESCRIPTOR(Report) — standard, interface recipient.
                 (0x81, 0x06) if (setup.value >> 8) == 0x22 => DUALSENSE_RDESC.to_vec(),
-                // HID GET_REPORT(Feature) — wValue low byte is the report id.
+                // HID GET_REPORT(Feature): wValue low byte is the report id.
                 (0xA1, 0x01) => {
                     let pairing = ds_pairing_reply(self.pad);
                     match setup.value as u8 {
@@ -390,26 +357,22 @@ impl UsbInterfaceHandler for HidHandler {
                         _ => Vec::new(),
                     }
                 }
-                // HID SET_REPORT — every known DualSense writer sends feedback as an OUTPUT report
-                // on the interrupt endpoint, but parse it anyway so a SET_REPORT writer is not
-                // silently ignored.
+                // HID SET_REPORT: known writers use interrupt OUT, but parse here too so a
+                // control-pipe writer is not dropped.
                 (0x21, 0x09) => {
                     self.absorb_output(req);
                     Vec::new()
                 }
-                // SET_IDLE / SET_PROTOCOL.
                 (0x21, 0x0A) | (0x21, 0x0B) => Vec::new(),
                 _ => Vec::new(),
             });
         }
         match ep.direction() {
-            // Interrupt IN: hand over the current state report. The sim paces this by bInterval.
             Direction::In => Ok(self
                 .report
                 .lock()
                 .map(|g| g.to_vec())
                 .unwrap_or_else(|_| vec![0u8; DS_INPUT_REPORT_LEN])),
-            // Interrupt OUT: report 0x02 — rumble / lightbar / player LEDs / adaptive triggers.
             Direction::Out => {
                 self.absorb_output(req);
                 Ok(Vec::new())
@@ -423,8 +386,8 @@ impl UsbInterfaceHandler for HidHandler {
 }
 
 impl HidHandler {
-    /// Fold one HID output report into the pending feedback. Merged rather than replaced: a writer
-    /// may split rumble and LED updates across reports, and `service` drains at its own cadence.
+    /// Merge one HID output into pending feedback. Writers may split rumble and LEDs
+    /// across reports; `service` drains on its own cadence.
     fn absorb_output(&mut self, data: &[u8]) {
         let mut fb = DsFeedback::default();
         parse_ds_output(self.pad, data, &mut fb);
@@ -437,11 +400,8 @@ impl HidHandler {
     }
 }
 
-// ---- device assembly ----
-
-/// Assemble the 4-interface composite DualSense. `index` is the wire pad index; it varies nothing
-/// in the descriptors (the hardware has no `iSerialNumber`, and `hid-playstation` takes the per-pad
-/// identity from the `0x09` pairing feature report instead).
+/// Assemble the 4-interface composite. `index` is the wire pad; it does not appear in
+/// descriptors (no `iSerialNumber`; `hid-playstation` takes identity from feature `0x09`).
 fn build_device(
     index: u8,
     report: &Arc<Mutex<[u8; DS_INPUT_REPORT_LEN]>>,
@@ -453,26 +413,20 @@ fn build_device(
     let mut dev = UsbDevice::new(0); // one device per server, so the default bus_id "0-0-0" stands.
     dev.vendor_id = DS_VENDOR as u16;
     dev.product_id = DS_PRODUCT as u16;
-    dev.usb_version = Version::from(0x0200u16); // bcdUSB 2.00
-    dev.device_bcd = Version::from(0x0100u16); // bcdDevice 1.00
-    dev.configuration_attributes = 0xC0; // self-powered, as the hardware reports
+    dev.usb_version = Version::from(0x0200u16);
+    dev.device_bcd = Version::from(0x0100u16);
+    dev.configuration_attributes = 0xC0; // self-powered, as hardware reports
     dev.configuration_max_power = 250; // 500 mA in 2 mA units
     dev.set_manufacturer_name("Sony Interactive Entertainment");
     dev.set_product_name("DualSense Wireless Controller");
-    // A real DualSense reports **no iSerialNumber**, but the vendored server's `UsbDevice::default`
-    // fills in the placeholder string "Serial" — which ALSA bakes into the card id and PipeWire into
-    // the node names: `…DualSense_Wireless_Controller_Serial-00` where the hardware gives
-    // `…DualSense_Wireless_Controller-00`. Clear it so every name a matcher can key on is
-    // byte-identical to a physical pad's.
-    //
-    // ⚠ This is fidelity, NOT a fix for UCM selection — measured on .41 2026-08-18, `alsa-ucm-conf`
-    // keys on `${CardComponents}` (`USB054c:0ce6`), so the DualSense UCM matched with the
-    // placeholder still present. Do not re-derive that: the profile a card lands on is chosen by
-    // verb priority, not by its name.
+    // Hardware has no iSerialNumber. `UsbDevice::default` fills "Serial", which ALSA/PipeWire
+    // bake into card/node names. Clear it so matchers see the same names as a physical pad.
+    // UCM keys on `${CardComponents}` (`USB054c:0ce6`), not the name — do not treat this as
+    // a UCM-selection fix.
     dev.unset_serial_number();
 
     dev
-        // Interface 0 — Audio Control (no endpoints).
+        // Interface 0: Audio Control, no endpoints.
         .with_interface(
             0x01,
             0x01,
@@ -481,7 +435,7 @@ fn build_device(
             vec![],
             boxed(AudioControlHandler::default()),
         )
-        // Interface 1 — Audio Streaming OUT: alt 0 idle, alt 1 carries the isochronous endpoint.
+        // Interface 1: Audio Streaming OUT, alt 0 idle / alt 1 isochronous.
         .with_interface(
             0x01,
             0x02,
@@ -505,7 +459,7 @@ fn build_device(
             endpoint_extra: vec![ep_extra.clone()],
             endpoint_trailers: vec![ep_trailer.clone()],
         }])
-        // Interface 2 — Audio Streaming IN (headset mic).
+        // Interface 2: Audio Streaming IN (headset mic).
         .with_interface(
             0x01,
             0x02,
@@ -525,7 +479,7 @@ fn build_device(
             endpoint_extra: vec![ep_extra],
             endpoint_trailers: vec![ep_trailer],
         }])
-        // Interface 3 — HID.
+        // Interface 3: HID.
         .with_interface(
             0x03,
             0x00,
@@ -544,10 +498,10 @@ fn build_device(
         )
 }
 
-/// A virtual DualSense presented over USB/IP, carrying its own USB Audio Class sound card.
+/// Virtual DualSense over USB/IP, with its own UAC sound card.
 ///
-/// Dropping it detaches the `vhci_hcd` port — the pad and its ALSA card disappear together, exactly
-/// as unplugging the hardware would — and withdraws the audio receiver.
+/// Drop detaches the `vhci_hcd` port (pad and ALSA card go together) and withdraws the
+/// audio receiver.
 pub struct DualSenseUsbip {
     report: Arc<Mutex<[u8; DS_INPUT_REPORT_LEN]>>,
     feedback: Arc<Mutex<DsFeedback>>,
@@ -558,10 +512,9 @@ pub struct DualSenseUsbip {
 }
 
 impl DualSenseUsbip {
-    /// Bind a virtual DualSense for wire pad `index` and attach it locally via `vhci_hcd`.
-    ///
-    /// Fails (so the caller can degrade to uhid) when `vhci_hcd` is absent or its sysfs `attach` is
-    /// not writable — see [`super::steam_usbip::attach_device`].
+    /// Bind wire pad `index` and attach via `vhci_hcd`. Fails (caller degrades to uhid)
+    /// when `vhci_hcd` is missing or sysfs `attach` is not writable — see
+    /// [`super::steam_usbip::attach_device`].
     pub fn open(index: u8) -> Result<DualSenseUsbip> {
         let report = Arc::new(Mutex::new([0u8; DS_INPUT_REPORT_LEN]));
         let feedback = Arc::new(Mutex::new(DsFeedback::default()));
@@ -572,21 +525,15 @@ impl DualSenseUsbip {
             &format!("virtual DualSense {index}"),
         )?;
 
-        // **A successful attach is not a working pad.** `vhci_hcd` accepts the socket immediately
-        // and enumerates asynchronously, so any protocol fault downstream of the attach — a reply
-        // the kernel rejects, a descriptor it will not parse — surfaces a few hundred milliseconds
-        // later as a device that appears and then vanishes. Returning `Ok` on the attach alone
-        // reported those as success, and because this transport *replaces* uhid the user was left
-        // with no pad at all rather than a degraded one. That has now happened twice, so the
-        // contract is: `open` returns `Ok` only once the kernel has actually bound a driver, and
-        // the caller's existing uhid fallback covers everything else.
+        // `vhci_hcd` accepts the socket immediately and enumerates later. A bad URB or
+        // descriptor then appears and vanishes. Return `Ok` only after a HID driver binds;
+        // this transport replaces uhid, so the caller's uhid fallback covers the rest.
         if let Err(e) = wait_until_bound(index) {
             drop(attach); // detach the port before the caller retries or degrades
             return Err(e);
         }
 
-        // Publish only once the device is attached *and* bound, so a failed bringup leaves no stale
-        // receiver for the streamer to drain forever.
+        // Publish only after bind so a failed bringup leaves no stale receiver for the streamer.
         publish_audio_rx(index, rx);
         tracing::info!(
             index,
@@ -603,7 +550,7 @@ impl DualSenseUsbip {
         })
     }
 
-    /// Serialize `st` into report `0x01`, ready for the next interrupt-IN poll.
+    /// Serialize `st` as report `0x01` for the next interrupt-IN poll.
     pub fn write_state(&mut self, st: &DsState) {
         self.seq = self.seq.wrapping_add(1);
         let ts = self.clock.ds_ticks(Instant::now());
@@ -614,7 +561,7 @@ impl DualSenseUsbip {
         }
     }
 
-    /// Drain the feedback the kernel/game has written to the pad since the last call.
+    /// Drain HID feedback written since the last call.
     pub fn service(&mut self) -> DsFeedback {
         self.feedback
             .lock()
@@ -629,21 +576,14 @@ impl Drop for DualSenseUsbip {
     }
 }
 
-/// How long to give the kernel to enumerate the pad and bind a HID driver to it.
-///
-/// Enumeration + `hid-playstation` bind measured ~330 ms on an idle box; the failure this guards
-/// against tore the device down ~400 ms after attach. Three seconds is comfortably clear of both,
-/// and the cost of waiting is paid once per pad arrival. `PUNKTFUNK_DUALSENSE_USBIP_GRACE_MS`
-/// overrides it; `0` skips the check entirely (useful when bisecting the transport itself).
+/// Enumerate + HID-bind grace (3 s). Bind is ~330 ms idle; a failed URB tears the device
+/// down ~400 ms after attach. `PUNKTFUNK_DUALSENSE_USBIP_GRACE_MS` overrides; `0` skips.
 const BIND_GRACE: std::time::Duration = std::time::Duration::from_millis(3000);
 
-/// Block until the kernel has enumerated the virtual pad *and* bound a HID driver to its HID
-/// interface, or the grace period expires.
+/// Wait until a HID driver has bound the pad's HID interface, or the grace expires.
 ///
-/// Checking for the `usb_device` node alone is not enough: in the 2026-08-17 failure the node was
-/// created and then removed ~400 ms later when the calibration reply tore the connection down, so a
-/// single early poll saw a healthy device. Requiring a bound HID driver with an `input` child means
-/// the thing the pad exists to provide actually came up.
+/// The `usb_device` node alone is not enough: it can appear and vanish when a later URB
+/// fails. A bound HID driver with an `input` child means the pad actually came up.
 fn wait_until_bound(index: u8) -> Result<()> {
     let grace = std::env::var("PUNKTFUNK_DUALSENSE_USBIP_GRACE_MS")
         .ok()
@@ -674,7 +614,6 @@ fn wait_until_bound(index: u8) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    // Which of the two it is tells the operator where to look, so say it rather than "failed".
     if saw_device {
         anyhow::bail!(
             "the virtual DualSense enumerated but no HID driver bound within {:?} — it is present \
@@ -690,14 +629,14 @@ fn wait_until_bound(index: u8) -> Result<()> {
     )
 }
 
-/// Whether the pad's HID interface under `sysfs` has a bound HID driver that produced an input
-/// device. Either `hid-playstation` or `hid-generic` counts — both give a usable pad.
+/// True when the pad's HID interface has a bound driver that registered an input device.
+/// `hid-playstation` or `hid-generic` both count.
 fn hid_input_bound(sysfs: &std::path::Path) -> bool {
     let Ok(entries) = std::fs::read_dir(sysfs) else {
         return false;
     };
     for e in entries.flatten() {
-        // The HID function is interface 3; its sysfs node is `<busid>:1.3`.
+        // HID function is interface 3; its sysfs node is `<busid>:1.3`.
         if !e.file_name().to_string_lossy().ends_with(":1.3") {
             continue;
         }
@@ -705,8 +644,8 @@ fn hid_input_bound(sysfs: &std::path::Path) -> bool {
             continue;
         };
         for c in children.flatten() {
-            // `0003:054C:0CE6.000N` — the bound HID device. `input/` appears only once a driver
-            // has claimed it and registered; a probe that fails leaves the directory absent.
+            // Bound HID device is `0003:054C:0CE6.000N`. `input/` exists only after a driver
+            // claimed it; a failed probe leaves the directory absent.
             if c.file_name().to_string_lossy().starts_with("0003:")
                 && c.path().join("input").is_dir()
             {
@@ -717,29 +656,22 @@ fn hid_input_bound(sysfs: &std::path::Path) -> bool {
     false
 }
 
-/// The sysfs path of an attached virtual DualSense's `usb_device` node, plus the udev properties
-/// wine turns into a Windows ContainerId.
+/// Sysfs `usb_device` of an attached virtual DualSense, plus the udev fields wine packs
+/// into a Windows ContainerId.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsbTopology {
-    /// e.g. `/sys/devices/platform/vhci_hcd.0/usb11/11-2` — the `usb_device` both container-id
-    /// derivations must land on.
+    /// `usb_device` node both ContainerId derivations must land on.
     pub sysfs_path: std::path::PathBuf,
-    /// `PRODUCT` (`vendor/product/bcd`), `BUSNUM` and `DEVNUM`, the fields wine packs into the GUID.
+    /// `BUSNUM` / `DEVNUM` wine packs into the GUID.
     pub busnum: String,
     pub devnum: String,
 }
 
-/// Locate the attached virtual DualSense's USB device in sysfs.
+/// Sysfs `usb_device` of the attached virtual DualSense, if any.
 ///
-/// Used to *prove* the fix rather than to implement it: with a real USB device the audio sinks get
-/// their `device.sysfs.path` from PipeWire's own ALSA/udev path, and wine walks the HID device's own
-/// tree — neither needs us to tell it anything. This just lets the devtest print the node both
-/// derivations will land on, so a mismatch is visible without launching a game.
-///
-/// **Assumes a single virtual DualSense.** It matches on vendor/product under a `vhci_hcd` path,
-/// which cannot tell two virtual pads apart (the hardware has no `iSerialNumber`, so neither can
-/// anything else); with several attached it returns the first. Good enough for the devtest, which
-/// attaches exactly one.
+/// Devtest helper: with a real USB device, PipeWire and wine walk udev themselves.
+/// Matches vendor/product under `vhci_hcd`; several pads return the first (hardware
+/// has no `iSerialNumber` either).
 pub fn find_usb_topology() -> Option<UsbTopology> {
     let attr = |dir: &std::path::Path, name: &str| {
         std::fs::read_to_string(dir.join(name))
@@ -767,12 +699,9 @@ pub fn find_usb_topology() -> Option<UsbTopology> {
     None
 }
 
-/// Whether a usbip DualSense should be attempted before the uhid pad.
+/// Prefer usbip DualSense over uhid when `PUNKTFUNK_DUALSENSE_USBIP` is `1`/`true`.
 ///
-/// **Opt-in for now** (`PUNKTFUNK_DUALSENSE_USBIP=1`). The uhid pad is the long-validated default
-/// and this changes the pad's whole kernel presentation — including minting a real ALSA card that
-/// supersedes the pad-audio sinks — so it stays behind a flag until it has been through on-glass
-/// verification. Flip the default here once it has.
+/// Opt-in: this mints a real ALSA card that supersedes the pad-audio sinks.
 pub fn usbip_preferred() -> bool {
     matches!(
         std::env::var("PUNKTFUNK_DUALSENSE_USBIP").ok().as_deref(),
@@ -784,9 +713,8 @@ pub fn usbip_preferred() -> bool {
 mod tests {
     use super::*;
 
-    /// Sum the descriptor bytes the device would emit for its configuration, the way
-    /// `UsbDevice::handle_urb` assembles them. Kept in lockstep with that assembly by the
-    /// `wTotalLength` assertion below, which is the number the hardware publishes.
+    /// Byte length of the configuration descriptor `UsbDevice::handle_urb` would emit.
+    /// [`config_descriptor_matches_hardware`] pins it to hardware `wTotalLength`.
     fn assembled_config_len() -> usize {
         let (ep_extra, ep_trailer) = audio_endpoint_extras();
         let iso_ep_len = 7 + ep_extra.len() + ep_trailer.len();
@@ -799,19 +727,15 @@ mod tests {
             + 9 + hid_class_descriptor(DUALSENSE_RDESC.len()).len() + 7 + 7 // interface 3
     }
 
-    /// The assembled configuration descriptor must be exactly as long as the hardware's, which
-    /// `lsusb -v` on a wired `054c:0ce6` reports as `wTotalLength 0x00e3`. This is the cheapest
-    /// possible check that the whole descriptor set — terminal topology, both streaming interfaces
-    /// with their alt settings, the 9-byte isochronous endpoints, the HID interface — is shaped
-    /// like the real pad rather than merely self-consistent.
+    /// Assembled config length equals hardware `wTotalLength` `0x00e3` (`lsusb -v` on
+    /// wired `054c:0ce6`).
     #[test]
     fn config_descriptor_matches_hardware() {
         assert_eq!(assembled_config_len(), 0x00E3);
     }
 
-    /// The Audio Control block's own `wTotalLength` (bytes 5..7 of the HEADER descriptor) must
-    /// equal the block's real length, or `snd-usb-audio` walks off the end of the topology and
-    /// creates no PCM at all.
+    /// Audio Control `wTotalLength` (HEADER bytes 5..7) must equal the block length, or
+    /// `snd-usb-audio` walks off the topology and creates no PCM.
     #[test]
     fn audio_control_total_length_is_self_consistent() {
         let d = audio_control_descriptor();
@@ -820,9 +744,7 @@ mod tests {
         assert_eq!(stated, 0x49, "hardware publishes 73");
     }
 
-    /// Every descriptor in the Audio Control block must declare its own `bLength` correctly —
-    /// the kernel walks the block by hopping `bLength` bytes at a time, so one wrong byte
-    /// desynchronises everything after it.
+    /// Kernel walks the AC block by `bLength`; one wrong byte desynchronises the rest.
     #[test]
     fn audio_control_sub_descriptors_walk_cleanly() {
         let d = audio_control_descriptor();
@@ -839,9 +761,7 @@ mod tests {
         assert_eq!(seen, 7, "header + 2 input + 2 feature + 2 output terminals");
     }
 
-    /// The streaming block fixes the format the whole design depends on: 48 kHz, 16-bit, and
-    /// **4 channels** on the OUT side. GE-Proton rejects any haptic PCM that is not exactly that,
-    /// so a slip here reproduces the original bug with a real ALSA card in place.
+    /// OUT format is 48 kHz S16 4-channel. GE-Proton rejects any other haptic PCM.
     #[test]
     fn streaming_format_is_48k_s16_quad() {
         let d = audio_streaming_descriptor(1, 4);
@@ -855,8 +775,8 @@ mod tests {
         assert_eq!(rate, 48_000);
     }
 
-    /// The OUT endpoint must hold a whole millisecond of the quad with a frame to spare, or an
-    /// adaptive sink underruns the moment the host's clock drifts.
+    /// OUT max packet holds 1 ms of the quad plus one spare frame, or an adaptive sink
+    /// underruns when the host clock drifts.
     #[test]
     fn audio_out_packet_holds_a_millisecond_of_quad() {
         let bytes_per_frame = PAD_AUDIO_CHANNELS * 2;
@@ -864,8 +784,6 @@ mod tests {
         assert!(AUDIO_OUT_MPS as usize >= 48 * bytes_per_frame);
     }
 
-    /// Isochronous OUT packets must turn into interleaved `f32` quad frames, and the URB must be
-    /// acknowledged packet-for-packet whatever the consumer does.
     #[test]
     fn iso_out_decodes_s16_quad_to_f32() {
         let (tx, rx) = sync_channel::<Vec<f32>>(4);
@@ -901,7 +819,6 @@ mod tests {
         assert_eq!(pcm[4], 0.0);
     }
 
-    /// A wedged consumer must not wedge the URB path: packets are dropped, the reply still comes.
     #[test]
     fn iso_out_drops_rather_than_blocking_when_the_streamer_stalls() {
         let (tx, _rx) = sync_channel::<Vec<f32>>(1);
@@ -925,8 +842,8 @@ mod tests {
         assert!(h.dropped > 0, "a full queue must register drops");
     }
 
-    /// `SET_INTERFACE` is how `snd-usb-audio` arms alt 1 to start streaming and returns to alt 0 to
-    /// stop. Losing it would leave the endpoint permanently idle.
+    /// `snd-usb-audio` arms alt 1 with `SET_INTERFACE` and returns to alt 0 to stop.
+    /// Losing the request leaves the endpoint idle.
     #[test]
     fn set_interface_is_tracked_and_reported() {
         let mut alt = 0u8;
@@ -949,8 +866,8 @@ mod tests {
         assert_eq!(standard_interface_reply(get, &mut alt), Some(vec![1]));
     }
 
-    /// `hid-playstation` will not publish any input device until the `0x05`/`0x09`/`0x20` feature
-    /// reports answer, and the `0x09` MAC must differ per pad or SDL/Steam merge the two pads.
+    /// `hid-playstation` publishes no input device until feature `0x05`/`0x09`/`0x20`
+    /// answer; `0x09` MAC must differ per pad or SDL/Steam merge them.
     #[test]
     fn hid_feature_reports_answer_and_the_mac_is_per_pad() {
         let feature = |h: &mut HidHandler, id: u8| {
@@ -989,8 +906,6 @@ mod tests {
         assert_ne!(m0[1..7], m1[1..7], "per-pad MAC must differ");
     }
 
-    /// A rumble output report on the interrupt-OUT endpoint must reach `service`, which is the
-    /// entire feedback path back to the client's pad.
     #[test]
     fn interrupt_out_report_becomes_feedback() {
         let feedback = Arc::new(Mutex::new(DsFeedback::default()));
@@ -1024,8 +939,6 @@ mod tests {
         assert_eq!(got, Some((0x4000, 0x8000)));
     }
 
-    /// The interrupt-IN endpoint must hand back exactly the report `write_state` last serialized,
-    /// report id included.
     #[test]
     fn interrupt_in_serves_the_current_state_report() {
         let report = Arc::new(Mutex::new([0u8; DS_INPUT_REPORT_LEN]));
@@ -1058,8 +971,6 @@ mod tests {
         assert_eq!(got[7], 7, "sequence number");
     }
 
-    /// The audio hand-off is take-once and per-pad, so two pads never cross streams and a second
-    /// consumer cannot silently steal the first one's samples.
     #[test]
     fn audio_receiver_handoff_is_take_once_per_pad() {
         let (tx, rx) = sync_channel::<Vec<f32>>(1);

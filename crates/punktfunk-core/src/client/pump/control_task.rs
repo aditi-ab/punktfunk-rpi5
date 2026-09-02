@@ -1,7 +1,7 @@
-//! Control task: the handshake stream stays open for mid-stream renegotiation + speed tests.
-//! Outbound requests (mode switch, probe) and inbound replies (Reconfigured, ProbeResult) are
-//! multiplexed with `select!`; a single outbound channel (`ctrl_rx`) keeps one writer so the
-//! two `&mut ctrl_send` borrows don't collide across branches.
+//! Control task: the handshake stream stays open for mid-stream
+//! renegotiation and speed tests. Outbound requests and inbound replies
+//! multiplex on `select!`; one `ctrl_rx` writer so the two `&mut ctrl_send`
+//! borrows never collide across branches.
 
 use super::super::*;
 use super::*;
@@ -10,46 +10,41 @@ pub(super) struct ControlTask {
     pub(super) ctrl_rx: tokio::sync::mpsc::Receiver<CtrlRequest>,
     pub(super) ctrl_send: quinn::SendStream,
     pub(super) ctrl_recv: io::MsgReader,
-    /// `None` = no connect-time skew handshake (old host) — clock re-sync stays off.
+    /// `None` = no connect-time skew handshake (old host); clock re-sync stays off.
     pub(super) clock_rtt_ns: Option<u64>,
     pub(super) mode_slot: Arc<Mutex<Mode>>,
     pub(super) probe: Arc<Mutex<ProbeState>>,
-    /// The latest host `BitrateChanged` ack, drained by the pump's ABR on its report tick.
+    /// Latest host `BitrateChanged` ack; the pump ABR drains it on the report tick.
     pub(super) bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>>,
-    /// The live encoder-target mirror ([`NativeClient::current_bitrate_kbps`]): unlike the
-    /// drain-once ack slot above, this one always holds the latest acked rate for stats HUDs.
+    /// Live encoder-target ([`NativeClient::current_bitrate_kbps`]). Unlike the
+    /// drain-once ack above, this always holds the latest acked rate for HUDs.
     pub(super) live_bitrate: Arc<AtomicU32>,
-    /// Outbound decode-recovery KEYFRAME asks, counted here because this is the one choke point
-    /// every emitter funnels through (embedder, `note_frame_index`, the pump's own asks) — the
-    /// pump drains the count per report window as the ABR's recovery signal.
+    /// Outbound KEYFRAME asks. Counted here: every emitter (embedder,
+    /// `note_frame_index`, pump) funnels through this choke point. The pump
+    /// drains the count per report window as the ABR recovery signal.
     pub(super) recovery_kf: Arc<AtomicU32>,
-    /// The last host-announced pipeline gap in ms ([`crate::quic::PipelineGap`]), `0` = none
-    /// pending. Written here on arrival, drained by the pump, which discards the report window in
-    /// flight — a host-local capture/encoder rebuild is not congestion (the `bitrate_ack` pattern,
-    /// as an atomic because the value is a plain number the pump only ever swaps out).
+    /// Last host pipeline gap in ms ([`crate::quic::PipelineGap`]); `0` = none.
+    /// Pump drains it and discards the in-flight report window — a host-local
+    /// rebuild is not congestion. Atomic because the pump only ever swaps it.
     pub(super) pipeline_gap: Arc<AtomicU32>,
     pub(super) clock_offset: Arc<std::sync::atomic::AtomicI64>,
     pub(super) clock_gen: Arc<AtomicU32>,
-    /// Clipboard metadata events (ClipState/ClipOffer) feed the same event plane the
-    /// clipboard task uses for fetch data.
+    /// ClipState/ClipOffer share the fetch-data event plane.
     pub(super) clip_event_tx: std::sync::mpsc::SyncSender<ClipEventCore>,
-    /// Host cursor shapes ([`CursorShape`], sent on pointer-bitmap change) → the embedder's
-    /// shape plane ([`NativeClient::next_cursor_shape`]).
+    /// Host [`CursorShape`] → [`NativeClient::next_cursor_shape`].
     pub(super) cursor_shape_tx: std::sync::mpsc::SyncSender<crate::quic::CursorShape>,
-    /// Bumped on every ACCEPTED mode switch (the `clock_gen` pattern): the pump watches it and
-    /// resets the bitrate controller's mode-scoped learned state — the encoder ceiling / compute
-    /// knee it was taught belong to the OLD mode.
+    /// Bumped on every ACCEPTED mode switch (`clock_gen` pattern). The pump
+    /// resets bitrate-controller state that belonged to the old mode.
     pub(super) mode_gen: Arc<AtomicU32>,
-    /// The session's LIVE access grants ([`NativeClient::access_grants`]): every inbound
-    /// [`AccessUpdate`] overwrites it (latest wins) BEFORE the event is forwarded, so a reader
-    /// woken by the event never sees the pre-update mask.
+    /// Live access grants ([`NativeClient::access_grants`]). Every inbound
+    /// [`AccessUpdate`] overwrites this BEFORE the event is forwarded, so a
+    /// reader woken by the event never sees the pre-update mask.
     pub(super) access_grants: Arc<AtomicU32>,
-    /// The live access deadline (client wall clock, unix seconds; `0` = permanent) — re-anchored
-    /// from every `AccessUpdate`'s relative `remaining_secs`.
+    /// Live access deadline (client unix seconds; `0` = permanent). Re-anchored
+    /// from each `AccessUpdate`'s relative `remaining_secs`.
     pub(super) access_deadline_unix: Arc<std::sync::atomic::AtomicU64>,
-    /// Access updates → the embedder's event plane ([`NativeClient::next_access_update`]).
-    /// try_send like the clipboard/cursor planes: a lagging embedder drops the oldest news,
-    /// and the two live slots above already hold the latest truth it would re-derive.
+    /// Access updates → [`NativeClient::next_access_update`]. try_send: a
+    /// lagging embedder drops the oldest; the two live slots already hold truth.
     pub(super) access_tx: std::sync::mpsc::SyncSender<crate::quic::AccessUpdate>,
 }
 
@@ -75,18 +70,16 @@ impl ControlTask {
             access_deadline_unix,
             access_tx,
         } = self;
-        // Mid-stream clock re-sync (see [`ClockResync`]): a batch runs every
-        // CLOCK_RESYNC_INTERVAL and whenever the pump asks (CtrlRequest::ClockResync after
-        // its first no-op clock flush). Echoes interleave with the other control replies in
-        // the read arm below; only when the host answered the connect-time handshake — an
-        // old host would just eat the probes.
+        // Mid-stream clock re-sync ([`ClockResync`]): a batch every
+        // CLOCK_RESYNC_INTERVAL and when the pump asks (CtrlRequest::ClockResync
+        // after its first no-op flush). Echoes land in the read arm; skip if
+        // the host never answered the connect-time handshake.
         let mut resync = ClockResync::new();
         let mut resync_guard = clock_rtt_ns.map(ResyncGuard::new);
-        // Inter-round spacing: without it the whole 8-round batch completes inside one
-        // ~6 ms video burst and every round samples the same congestion state — a batch
-        // that starts mid-burst is then wholly congested and gets rejected. 7 ms staggers
-        // the rounds across the ~16.7 ms frame cycle so the min-RTT round almost always
-        // lands in a quiet inter-burst gap, even at PyroWave-class bitrates.
+        // 7 ms: without spacing the 8-round batch finishes inside one ~6 ms
+        // video burst and every round samples the same congestion. 7 ms
+        // staggers rounds across the ~16.7 ms frame so min-RTT usually
+        // lands in a quiet gap.
         const RESYNC_ROUND_SPACING: std::time::Duration = std::time::Duration::from_millis(7);
         let mut staged_round: Option<tokio::time::Instant> = None;
         let mut resync_tick = tokio::time::interval_at(
@@ -135,7 +128,7 @@ impl ControlTask {
                 _ = async { tokio::time::sleep_until(staged_round.unwrap()).await },
                         if staged_round.is_some() => {
                     staged_round = None;
-                    // Stamped at send time so the inter-round spacing stays out of the RTT.
+                    // Stamp at send so inter-round spacing is not in the RTT.
                     let probe = resync.next_probe(wall_clock_ns());
                     if io::write_msg(&mut ctrl_send, &probe.encode()).await.is_err() {
                         break;
@@ -153,14 +146,10 @@ impl ControlTask {
                         }
                     } else if let Ok(result) = ProbeResult::decode(&msg) {
                         let mut p = probe.lock().unwrap();
-                        // Freeze the delivered figures now (the burst is done). The mirrored
-                        // counters are probe-scoped (stamped at the reassembler's FLAG_PROBE
-                        // routing), so video around the burst inflates nothing; the client's
-                        // first→last arrival interval is frozen with them — the denominator
-                        // that measures when the bytes actually ARRIVED, not when the host
-                        // stopped sending (its window closes while the bottleneck queue is
-                        // still draining this way, which is how a 1 GbE link once "measured"
-                        // 1266 Mbps).
+                        // Freeze delivered figures now. Counters are probe-scoped
+                        // (FLAG_PROBE), so video around the burst does not inflate
+                        // them. Freeze first→last arrival with them: that interval
+                        // is when the bytes arrived, not when the host stopped sending.
                         let base_p = p.base_packets.unwrap_or(p.rx_packets_now);
                         let base_b = p.base_bytes.unwrap_or(p.rx_bytes_now);
                         p.delivered_packets = p.rx_packets_now.saturating_sub(base_p);
@@ -177,7 +166,7 @@ impl ControlTask {
                         p.host_send_dropped = result.send_dropped;
                         p.host_duration_ms = result.duration_ms;
                         p.done = true;
-                        p.active = false; // burst over — the pump stops mirroring counters
+                        p.active = false; // burst over — pump stops mirroring
                         tracing::info!(
                             host_goodput_bytes = result.bytes_sent,
                             wire_packets_sent = result.wire_packets_sent,
@@ -188,33 +177,23 @@ impl ControlTask {
                             "speed-test probe result"
                         );
                     } else if let Ok(ack) = BitrateChanged::decode(&msg) {
-                        // Adaptive bitrate: the host's clamp is authoritative — park it for
-                        // the pump's controller (which also reads any ack as "this host
-                        // renegotiates", arming further steps).
+                        // Host clamp is authoritative. Park it for the pump
+                        // controller; any ack also means this host renegotiates.
                         tracing::info!(
                             kbps = ack.bitrate_kbps,
                             "host re-targeted encoder bitrate"
                         );
-                        // 0 would be a nonsense ack (the controller ignores it too) — don't
-                        // let it wipe the HUD's live target.
+                        // 0 is a nonsense ack (controller ignores it too); don't
+                        // wipe the HUD's live target.
                         if ack.bitrate_kbps > 0 {
                             live_bitrate.store(ack.bitrate_kbps, Ordering::Relaxed);
                         }
                         bitrate_ack.lock().unwrap().push_back(ack.bitrate_kbps);
                     } else if let Ok(gap) = crate::quic::PipelineGap::decode(&msg) {
-                        // The host rebuilt its capture ring + encoder in place and nothing flowed
-                        // while it did. Park it for the pump, which discards the report window in
-                        // flight: that window carries almost no stream through no fault of the
-                        // link, and one such "congestion" verdict ends slow start for the session
-                        // (the 0.29 field log: 401 ms of rebuild cost three minutes at ~15 Mbps).
-                        // Latest-wins — a second gap inside one window is still one window to
-                        // discard, and the newer number is the one worth logging. Floored at 1
-                        // because 0 is the slot's "nothing pending": the ANNOUNCEMENT is what
-                        // arms the discard, so a host that rounds its measurement down to zero
-                        // must not silently disarm it.
-                        //
-                        // info, not debug: this is the forensic trail that separates a host-local
-                        // stall from a link event in a field log, and it is rare by construction.
+                        // Host rebuilt capture+encoder; park for the pump to discard
+                        // the in-flight report window (not congestion). Latest-wins.
+                        // Floor at 1: 0 means nothing pending, so a rounded-down
+                        // gap must not silently disarm the discard.
                         tracing::info!(
                             gap_ms = gap.gap_ms,
                             "host rebuilt its capture/encode pipeline — discarding the report \
@@ -239,9 +218,8 @@ impl ControlTask {
                                         (Some((offset_ns, rtt_ns)), true)
                                     }
                                     ResyncAdmit::Rejected { streak } => {
-                                        // warn, not debug: repeated rejections are exactly the
-                                        // stale-offset starvation signature the 2026-07
-                                        // PyroWave-sawtooth report had to be diagnosed without.
+                                        // Repeated rejections are the stale-offset
+                                        // starvation signature (RTT above session floor).
                                         tracing::warn!(
                                             rtt_us = rtt_ns / 1000,
                                             floor_us = guard.floor_rtt_ns() / 1000,
@@ -253,10 +231,6 @@ impl ControlTask {
                                     }
                                 };
                                 if let Some((offset_ns, rtt_ns)) = apply {
-                                    // info, not debug: ≤1/min, and it is THE forensic
-                                    // trail for a stale-offset (stepped/slewed wall clock)
-                                    // latency plateau — the 2026-07 two-pair investigation
-                                    // had to reconstruct this blind.
                                     tracing::info!(
                                         offset_ns,
                                         rtt_us = rtt_ns / 1000,
@@ -270,31 +244,24 @@ impl ControlTask {
                             ResyncStep::Idle => {}
                         }
                     } else if let Ok(state) = ClipState::decode(&msg) {
-                        // Host ack / policy / backend update for the toggle UI (try_send: a
-                        // lagging embedder drops the newest — a stale toggle heals on the next).
+                        // Host ack/policy for the toggle UI. try_send: lagging
+                        // embedder drops newest; a stale toggle heals on the next.
                         let _ = clip_event_tx.try_send(ClipEventCore::State {
                             enabled: state.enabled,
                             policy: state.policy,
                             reason: state.reason,
                         });
                     } else if let Ok(offer) = ClipOffer::decode(&msg) {
-                        // The host copied something: surface the lazy format list; the embedder
-                        // fetches only if a local app pastes.
+                        // Host copied: surface the lazy format list; fetch only on paste.
                         let _ = clip_event_tx.try_send(ClipEventCore::RemoteOffer {
                             seq: offer.seq,
                             kinds: offer.kinds,
                         });
                     } else if let Ok(chg) = crate::quic::ShardPayloadChanged::decode(&msg) {
-                        // Mid-session shard renegotiation (design/shard-payload-reneg.md): the
-                        // host re-keys the sealed video geometry. Per-frame pinning means there
-                        // is nothing to re-key on the receive path — the reassembler follows
-                        // each frame's own header and every buffer is statically sized for the
-                        // ceiling — so the dispatch is validate + ack. The ack is telemetry for
-                        // a shrink and the GATE for a grow (the host emits nothing above the
-                        // old size until it lands). Validate against our own receive bounds —
-                        // the same ceiling we advertised in `Hello::max_shard_payload` — and
-                        // answer an out-of-bounds request with SILENCE, not an ack: a buggy
-                        // host must never read a granted grow out of garbage.
+                        // Mid-session shard re-key (design/shard-payload-reneg.md).
+                        // Per-frame pinning: nothing to re-key on receive; ack is
+                        // telemetry on shrink and the GATE on grow. Silence (no ack)
+                        // on out-of-bounds — never grant a grow from garbage.
                         let n = chg.shard_payload as usize;
                         if (crate::config::MIN_SHARD_PAYLOAD..=crate::config::max_shard_payload())
                             .contains(&n)
@@ -317,11 +284,9 @@ impl ControlTask {
                             );
                         }
                     } else if let Ok(upd) = crate::quic::AccessUpdate::decode(&msg) {
-                        // Mid-session access change (a console edit) or an expiry warning
-                        // (T−5 m / T−1 m). Latest-wins per design: fold the update into the
-                        // live slots FIRST, then wake the embedder — the host enforces
-                        // regardless, this is the courtesy that lets the client release a
-                        // grab it no longer backs and warn before the expiry close.
+                        // Console edit or T−5m/T−1m expiry. Fold into live slots
+                        // FIRST, then wake the embedder so a reader never sees the
+                        // pre-update mask. Host still enforces; this is courtesy.
                         tracing::info!(
                             grants = upd.grants,
                             remaining_secs = upd.remaining_secs,
@@ -337,8 +302,8 @@ impl ControlTask {
                         );
                         let _ = access_tx.try_send(upd);
                     } else if let Ok(shape) = crate::quic::CursorShape::decode(&msg) {
-                        // Pointer bitmap changed (cursor channel, only when negotiated). try_send:
-                        // an overflowing ring drops the newest shape — the next change resends.
+                        // Pointer bitmap changed. try_send: overflow drops newest;
+                        // the next shape change resends.
                         let _ = cursor_shape_tx.try_send(shape);
                     } else {
                         tracing::warn!(

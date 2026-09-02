@@ -1,22 +1,14 @@
 //! Pointer and touch input inside the console.
 //!
-//! The console is a focus UI: a pad moves a cursor and presses A. A pointer brings its
-//! own cursor, so every widget resolves a press directly onto whatever is under it and
-//! **acts on the press**, not on the release.
+//! Widgets act on press, not release. Focused list and carousel items scroll toward
+//! the centre, so the pressed row has already moved by lift; click-on-release would
+//! hit the wrong row. There is no drag gesture competing with press-to-act.
 //!
-//! That is deliberate, not a shortcut. Both the menu list and the two carousels scroll
-//! the FOCUSED item toward the centre of the screen, so the thing you pressed has already
-//! slid out from under your finger by the time it lifts. A click-on-release rule would
-//! have to chase it, and on a touchscreen — where the finger doesn't move but the content
-//! does — it would routinely land on the wrong row. Press-to-act has no such race, and
-//! the console has no drag gesture for it to compete with.
-//!
-//! Coordinates are device pixels: the run loop converts (it owns the window and therefore
-//! the display scale), and a widget hit-tests the very rect it drew last frame.
+//! Coordinates are device pixels: the run loop converts (it owns the window and the
+//! display scale). A widget hit-tests the rect it drew last frame.
 
 use skia_safe::Rect;
 
-/// A pointer/touch interaction, in device pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Pointer {
     pub x: f64,
@@ -26,37 +18,32 @@ pub(crate) struct Pointer {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PointerKind {
-    /// The primary button went down, or a finger touched the glass — the acting edge.
+    /// Primary button down, or a finger down — the acting edge.
     Press,
-    /// The primary button or finger came up. Widgets ignore it today; it is carried so a
-    /// later drag gesture has an edge to close on.
+    /// Primary button or finger up. Ignored today; kept so a drag can close.
     Release,
     /// Motion, with or without a button held.
     Move,
-    /// The gesture was abandoned (the pointer left the window).
+    /// Gesture abandoned (pointer left the window).
     Cancel,
     /// One scroll step; `up` = away from the user.
     Scroll { up: bool },
-    /// The secondary (right) button went down — the pointer's B. Handled by the shell for
-    /// every screen at once, so no screen has to remember to offer a way back.
+    /// Secondary (right) button down — the pointer's B. The shell handles it for every screen.
     Back,
 }
 
 impl Pointer {
-    /// Is this the edge widgets act on?
     pub(crate) fn press(&self) -> bool {
         self.kind == PointerKind::Press
     }
 
-    /// Inside `rect`? Half-open, so neighbouring rects can share an edge without both
-    /// claiming the same pixel. An EMPTY rect never hits — which is what lets a list
-    /// record `Rect::new_empty()` for rows it culled and keep its indices aligned.
+    /// Half-open, so neighbours can share an edge. An empty rect never hits — culled
+    /// list rows store `Rect::new_empty()` and keep their indices aligned.
     pub(crate) fn hits(&self, rect: Rect) -> bool {
         let (x, y) = (self.x as f32, self.y as f32);
         x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
     }
 
-    /// The index of the first rect under the pointer.
     pub(crate) fn pick(&self, rects: &[Rect]) -> Option<usize> {
         rects.iter().position(|r| self.hits(*r))
     }
@@ -83,7 +70,6 @@ mod tests {
             "the right edge belongs to the next"
         );
         assert!(!at(9.0, 20.0).hits(r));
-        // A culled row's placeholder must never swallow a press.
         assert!(!at(0.0, 0.0).hits(Rect::new_empty()));
     }
 

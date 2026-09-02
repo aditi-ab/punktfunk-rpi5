@@ -1,32 +1,26 @@
-//! The **provenance manifest**: how a plugin got onto this box, remembered for as long as it is
-//! installed (design `plugin-store.md` §4.5).
+//! Provenance of each installed plugin (design `plugin-store.md`).
 //!
-//! `node_modules` knows *what* is installed; it has no idea whether the operator picked a reviewed
-//! entry off the official shelf or pasted a tarball URL into the danger dialog. That distinction is
-//! exactly what the console has to keep showing — an unverified plugin must stay visibly
-//! unverified in the Installed list and in the header above its own UI, long after the install
-//! dialog is forgotten.
+//! `<plugins_dir>/install-manifest.json`, written only by store installs.
+//! `node_modules` names the package; this file names how it arrived.
 //!
-//! `<plugins_dir>/install-manifest.json`, written by the host (which is the only thing that ever
-//! performs a *store* install). **Absence is meaningful**: a package with no manifest entry was
-//! installed by the CLI, and is reported as [`Tier::Cli`] rather than being silently promoted.
+//! Absence is [`Tier::Cli`]: CLI `plugins add` never writes a row, and a
+//! missing or corrupt file reads as empty rather than inventing a tier.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// How a plugin came to be installed. Ordered by how much review stands behind it.
+/// JSON spelling is the console badge key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Tier {
-    /// From the built-in source's index: unom reviewed this exact tarball.
+    /// Official index; this exact tarball was reviewed.
     Verified,
-    /// From an operator-added source's index: pinned and integrity-checked, but curated by
-    /// somebody else. Attribution, never the badge (D6).
+    /// Operator-added index. Attribution only — never the verified badge.
     External,
-    /// Installed from a raw package spec through the danger dialog. Nobody reviewed it.
+    /// Raw package spec. No index pin.
     Unverified,
-    /// No manifest entry — `punktfunk-host plugins add` put it there.
+    /// No manifest row. CLI `plugins add` never writes one.
     Cli,
 }
 
@@ -41,27 +35,23 @@ impl Tier {
     }
 }
 
-/// One remembered install.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Record {
     pub tier: Tier,
-    /// The catalog source's slug, when the install came off a shelf.
+    /// Catalog source slug; absent for unverified and CLI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// The catalog entry id, when there was one — lets the console re-associate an installed
-    /// package with its shelf row even if the package name is unusual.
+    /// Catalog entry id. Re-links the catalog row when the package name differs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_id: Option<String>,
-    /// The version we installed (as pinned). The *live* version always comes from disk; this is
-    /// what we asked for.
+    /// Requested pin. Live version is always read from disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// The raw spec, for [`Tier::Unverified`] installs — the only record of what the operator
-    /// actually typed.
+    /// Raw spec for [`Tier::Unverified`]. Only record of what was typed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<String>,
-    /// RFC-3339 install time (wall clock — display only).
+    /// Wall-clock RFC-3339 stamp. Display only; never compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_at: Option<String>,
 }
@@ -69,7 +59,7 @@ pub(crate) struct Record {
 #[derive(Serialize, Deserialize)]
 struct ManifestFile {
     schema: u32,
-    /// Keyed by npm package name. `BTreeMap` so the file has a stable, diffable order.
+    /// npm package name → record. `BTreeMap` keeps the on-disk order stable.
     #[serde(default)]
     plugins: BTreeMap<String, Record>,
 }
@@ -87,8 +77,7 @@ fn manifest_path(plugins_dir: &std::path::Path) -> std::path::PathBuf {
     plugins_dir.join("install-manifest.json")
 }
 
-/// Read the manifest. A missing or corrupt file reads as empty — every package then reports as
-/// CLI-installed, which is the honest answer when we have no provenance to show.
+/// Missing or corrupt file is empty: every package then reports as CLI.
 pub(crate) fn load(plugins_dir: &std::path::Path) -> BTreeMap<String, Record> {
     let Ok(bytes) = std::fs::read(manifest_path(plugins_dir)) else {
         return BTreeMap::new();
@@ -109,14 +98,12 @@ pub(crate) fn load(plugins_dir: &std::path::Path) -> BTreeMap<String, Record> {
     }
 }
 
-/// Record (or replace) one package's provenance.
 pub(crate) fn record(plugins_dir: &std::path::Path, pkg: &str, rec: Record) -> Result<()> {
     let mut plugins = load(plugins_dir);
     plugins.insert(pkg.to_string(), rec);
     write(plugins_dir, plugins)
 }
 
-/// Forget a package (on uninstall). Silent if it wasn't recorded.
 pub(crate) fn forget(plugins_dir: &std::path::Path, pkg: &str) -> Result<()> {
     let mut plugins = load(plugins_dir);
     if plugins.remove(pkg).is_none() {
@@ -138,15 +125,14 @@ fn write(plugins_dir: &std::path::Path, plugins: BTreeMap<String, Record>) -> Re
     Ok(())
 }
 
-/// Wall-clock RFC-3339-ish stamp for [`Record::installed_at`]. Display only — nothing compares
-/// these, so a clock jump costs a cosmetic oddity, never a decision.
+/// RFC-3339 UTC stamp for [`Record::installed_at`].
 pub(crate) fn now_stamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Civil-date arithmetic from a Unix timestamp (days since epoch → y/m/d), so this needs no
-    // date crate. UTC, second resolution.
+    // Howard Hinnant civil-from-days. `719_468` is Unix epoch → Mar-based civil;
+    // `146_097` is a 400-year Gregorian era. UTC, no date crate.
     let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     let z = days + 719_468;
@@ -192,7 +178,6 @@ mod tests {
         let r = m.get("@punktfunk/plugin-rom-manager").unwrap();
         assert_eq!(r.tier, Tier::Verified);
         assert_eq!(r.version.as_deref(), Some("0.2.1"));
-        // A package we never recorded has no entry — the caller reports it as CLI-installed.
         assert!(!m.contains_key("punktfunk-plugin-other"));
     }
 
@@ -213,7 +198,7 @@ mod tests {
         let m = load(dir.path());
         assert!(!m.contains_key("@x/y"));
         assert!(m.contains_key("@x/z"));
-        forget(dir.path(), "@not/here").unwrap(); // no-op, no error
+        forget(dir.path(), "@not/here").unwrap();
     }
 
     #[test]
@@ -225,7 +210,6 @@ mod tests {
 
     #[test]
     fn tier_json_spelling_is_stable() {
-        // The console keys its badges off these strings.
         assert_eq!(
             serde_json::to_string(&Tier::Unverified).unwrap(),
             "\"unverified\""
@@ -240,7 +224,7 @@ mod tests {
         assert!(s.ends_with('Z'));
         assert_eq!(&s[4..5], "-");
         assert_eq!(&s[10..11], "T");
-        // A known epoch value, to catch the civil-date arithmetic drifting.
+        // Floor so a zeroed or pre-epoch conversion cannot pass as now.
         assert!(s.as_str() > "2026-01-01T00:00:00Z", "{s}");
     }
 }

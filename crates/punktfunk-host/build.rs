@@ -1,16 +1,8 @@
-//! Build script: stamps the build version. NVENC deliberately needs NOTHING here — the entry
-//! points (`NvEncodeAPICreateInstance` / `NvEncodeAPIGetMaxSupportedVersion`) live in
-//! `nvEncodeAPI64.dll`, which only exists where the NVIDIA driver is installed, so
-//! `encode/windows/nvenc.rs` resolves them at RUNTIME (`LoadLibraryExW`). The former link-time
-//! import (`cargo:rustc-link-lib=nvencodeapi`) made the Windows loader kill the all-vendor host
-//! binary on every AMD/Intel-only box before `main` ("nvencodeapi64.dll was not found").
+//! Do not `cargo:rustc-link-lib=nvencodeapi`. `nvEncodeAPI64.dll` ships only
+//! with the NVIDIA driver; a link-time import aborts the all-vendor host before
+//! `main`. `pf-encode` loads the entry points at runtime (`LoadLibraryExW`).
 fn main() {
-    // Build provenance: stamp the exact package/build version into the binary so a running host
-    // can report what it is (mgmt /health, the startup log, `--version`) and a stale/shadowed
-    // install is detectable. CI (deb.yml / rpm.yml / the RPM spec / the PKGBUILD) sets
-    // PUNKTFUNK_BUILD_VERSION to the full package version (e.g. `0.2.0~ci120.g802e98d`); a plain
-    // `cargo build` falls back to the crate version. Deliberately NOT git-derived — the RPM builds
-    // from a `git archive` tarball with no .git, and a hard git dependency would break it.
+    // Not git-derived: RPM packaging uses a `git archive` tarball with no `.git`.
     let version = std::env::var("PUNKTFUNK_BUILD_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -18,11 +10,8 @@ fn main() {
     println!("cargo:rustc-env=PUNKTFUNK_VERSION={version}");
     println!("cargo:rerun-if-env-changed=PUNKTFUNK_BUILD_VERSION");
 
-    // Windows identity resources: the branded icon + version info. Task Manager / Explorer show a
-    // process by its version-info FileDescription — without one the host appears as a bare
-    // "punktfunk-host.exe" with no icon. Same winresource pattern as clients/windows and
-    // punktfunk-tray (cfg(windows) = build HOST, so Linux packaging builds skip it; CARGO_CFG_WINDOWS
-    // = TARGET).
+    // cfg(windows) is the HOST (Linux packaging skips this); `CARGO_CFG_WINDOWS` is
+    // the TARGET. Task Manager / Explorer show FileDescription, not the exe name.
     #[cfg(windows)]
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         let icon = "../../packaging/windows/branding/punktfunk.ico";

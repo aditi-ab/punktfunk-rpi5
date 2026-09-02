@@ -1,13 +1,13 @@
-//! Windows update apply: download the immutable installer, verify it, persist intent and spawn it
+//! Windows update apply: download the installer, verify it, persist intent, and spawn it
 //! outside the service's kill-on-close job. Boot reconciliation records the outcome.
 //!
-//! The Ed25519-signed manifest binds the file SHA-256. Stable releases additionally require the
-//! per-artifact signing-leaf pin, a trusted Authenticode chain and the expected publisher subject;
-//! old schema-1 clients already enforce the leaf pin. Canary/local builds may use a self-signed
-//! certificate, but still require a valid signature and any pins the manifest supplies.
+//! The Ed25519-signed manifest binds the file SHA-256. Stable releases also require the
+//! per-artifact signing-leaf pin, a trusted Authenticode chain, and the expected publisher
+//! subject. Canary and local builds still need a valid signature and any pins the manifest
+//! supplies.
 //!
-//! Signer information comes from the same `WinVerifyTrust` state used for verification. No second
-//! file parse can inspect different bytes.
+//! Signer information comes from the same `WinVerifyTrust` state used for verification.
+//! A second file parse would inspect different bytes.
 
 #![cfg(target_os = "windows")]
 
@@ -16,17 +16,16 @@ use super::manifest::WindowsHostAsset;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
-/// Free-space preflight: require this multiple of the download size (installer + Inno's
-/// unpack scratch + headroom).
+/// 3× download size: installer + Inno unpack scratch + headroom.
 const DISK_MARGIN: u64 = 3;
 
-/// Keep the target + this many previous installers cached for the manual-rollback path.
+/// Target plus one previous installer, for manual rollback.
 const KEEP_INSTALLERS: usize = 2;
 
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The winget-blessed silent flags (`packaging/winget/unom.PunktfunkHost.installer.yaml`).
+/// Must match `packaging/winget/unom.PunktfunkHost.installer.yaml`.
 const SILENT_ARGS: [&str; 4] = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"];
 
 fn staging_dir() -> PathBuf {
@@ -39,8 +38,8 @@ fn log_path(version: &str) -> PathBuf {
         .join(format!("update-{version}.log"))
 }
 
-/// The whole pipeline, run on a blocking thread. Reports progress/stage through the callbacks
-/// so this file stays free of the runtime-state lock.
+/// Blocking-thread pipeline. Progress and stage go through the callbacks so this
+/// file never takes the runtime-state lock.
 pub(super) fn run_apply(
     asset: &WindowsHostAsset,
     target_version: &str,
@@ -82,11 +81,7 @@ pub(super) fn run_apply(
     if let Some(parent) = log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // The point of no return: after this record exists, boot reconciliation owns the outcome.
-    //
-    // Nothing about the status tray is recorded here: the installer force-kills every tray to
-    // unlock punktfunk-tray.exe and, under /VERYSILENT, never runs its own relaunch entry, but
-    // `tray::supervise` in the new host puts one back without needing to be told.
+    // After this record exists, boot reconciliation owns the outcome.
     jobs::write_json_atomic(
         &jobs::intent_path(),
         &IntentRecord {
@@ -101,8 +96,8 @@ pub(super) fn run_apply(
     )
     .map_err(|e| ("applying", format!("write intent record: {e}")))?;
 
-    // Let the 202 + the console's next status poll leave the box before the installer starts
-    // stopping the service under us (plan R4).
+    // 2 s: the 202 and the console's next status poll must leave before the
+    // installer stops this service.
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let spawned = {
@@ -116,14 +111,12 @@ pub(super) fn run_apply(
     };
     match spawned {
         Ok(child) => {
-            // Detached on purpose: the child must outlive us. Dropping a Child does not kill it.
+            // Detached: the child must outlive us. Dropping a Child does not kill it.
             drop(child);
             stage("restarting");
             Ok(())
         }
         Err(e) => {
-            // Most likely: the job object stopped allowing breakaway (R3). Clear the intent —
-            // nothing irreversible happened — and surface the real error.
             let _ = std::fs::remove_file(jobs::intent_path());
             Err((
                 "applying",
@@ -142,13 +135,12 @@ fn quarantine(part: &Path) {
     let _ = std::fs::rename(part, &bad);
 }
 
-/// Download `url` to `part`, resuming an existing partial file when the server honors Range.
 fn download(url: &str, part: &Path, progress: &dyn Fn(u64, Option<u64>)) -> Result<(), String> {
     if !url.starts_with("https://") {
         return Err("installer url must be https".into());
     }
-    // Connect timeout only, deliberately no global one: this streams an installer that is tens of
-    // MB, and a whole-request deadline would abort a slow-but-healthy download.
+    // Connect timeout only. A whole-request deadline would abort a slow but healthy
+    // multi-MB download.
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(15)))
         .max_redirects(3)
@@ -183,8 +175,7 @@ fn download(url: &str, part: &Path, progress: &dyn Fn(u64, Option<u64>)) -> Resu
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        // Never truncate at open: on a 206 we append to the existing partial, and the
-        // fresh-download path truncates explicitly via `set_len(0)` below.
+        // Do not truncate at open: a 206 appends; a fresh download uses `set_len(0)` below.
         .truncate(false)
         .open(part)
         .map_err(|e| format!("open staging file: {e}"))?;
@@ -197,8 +188,8 @@ fn download(url: &str, part: &Path, progress: &dyn Fn(u64, Option<u64>)) -> Resu
     };
     progress(received, total);
 
-    // Unlimited reader, not `read_to_vec` — the installer is streamed to disk in 64 KiB chunks so
-    // it never lands in memory, and ureq 3's body-read caps do not apply to this path.
+    // Stream to disk. `read_to_vec` would load the installer; ureq 3's body-read caps
+    // do not apply here.
     let mut reader = resp.into_body().into_reader();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -251,8 +242,8 @@ fn preflight_disk(at: &Path, needed: u64) -> Result<(), String> {
     use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let dir = at.parent().unwrap_or(at);
     let mut free: u64 = 0;
-    // SAFETY: the HSTRING is a valid NUL-terminated path living across the call, and the out
-    // param points at a live local u64; the API retains neither.
+    // SAFETY: `HSTRING` is a valid path that outlives the call; `free` is a live local.
+    // The API retains neither.
     unsafe { GetDiskFreeSpaceExW(&HSTRING::from(dir.as_os_str()), Some(&mut free), None, None) }
         .map_err(|e| format!("disk preflight: {e}"))?;
     if free < needed {
@@ -263,14 +254,13 @@ fn preflight_disk(at: &Path, needed: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Authenticode. With `subject` (the stable channel): the signature must chain to a TRUSTED
-/// root (`S_OK`) and the signing certificate's simple display name must equal it — the
-/// publisher property that survives Azure's per-request leaf rotation (security-review
-/// 2026-08-31 H-3). Without: valid embedded signature (untrusted root tolerated — canary/local
-/// builds are still self-signed), signing-leaf SHA-256 ∈ `pins` when pins are present. The leaf
-/// comes out of the same `WinVerifyTrust` state via `WTHelperGetProvSignerFromChain`.
-/// (`pub(crate)`: the service supervisor's boot-loop rollback re-checks the cached previous
-/// installer with it.)
+/// Authenticode. With `subject` (stable): `S_OK` trusted chain, and the signing cert's
+/// simple display name equals it — the publisher identity that survives leaf rotation.
+/// Without: valid embedded signature (untrusted root allowed); leaf SHA-256 ∈ `pins`
+/// when pins are present.
+///
+/// The leaf comes from the same `WinVerifyTrust` state via `WTHelperGetProvSignerFromChain`.
+/// `pub(crate)` so boot-loop rollback can re-check the cached previous installer.
 pub(crate) fn verify_authenticode(
     path: &Path,
     pins: &[String],
@@ -320,10 +310,6 @@ pub(crate) fn verify_authenticode(
         )
     };
     let verdict = (|| {
-        // A manifest that names the publisher demands the REAL chain verdict: `S_OK` means
-        // "signed by a certificate chaining to a root this machine trusts". The untrusted-root
-        // tolerance exists only for the subject-less legacy lanes — canary and local builds,
-        // still self-signed (security-review 2026-08-31 H-3).
         let ok = status == S_OK.0 || (subject.is_none() && status == CERT_E_UNTRUSTEDROOT.0);
         if !ok {
             return Err(format!(
@@ -342,10 +328,9 @@ pub(crate) fn verify_authenticode(
             );
             return Ok(());
         }
-        // Same-state leaf extraction: no second parse of the file.
-        // SAFETY: `hWVTStateData` is the live verification state the VERIFY call above
-        // populated (status checked OK); the returned pointer borrows that state, which stays
-        // alive until the CLOSE call below, and is null-checked before use.
+        // Same-state leaf: do not parse the file again.
+        // SAFETY: `hWVTStateData` is the live VERIFY state (status already OK). The
+        // returned pointer borrows that state until CLOSE below, and is null-checked.
         let prov = unsafe { WTHelperProvDataFromStateData(data.hWVTStateData) };
         if prov.is_null() {
             return Err("WinVerifyTrust returned no provider state".into());
@@ -364,7 +349,7 @@ pub(crate) fn verify_authenticode(
             if s.csCertChain == 0 || s.pasCertChain.is_null() {
                 return Err("empty Authenticode cert chain".into());
             }
-            // pasCertChain[0] is the SIGNING cert (leaf → root order).
+            // `pasCertChain[0]` is the signing cert (leaf → root).
             &*(*s.pasCertChain).pCert
         };
         if let Some(expected) = subject {
@@ -372,11 +357,9 @@ pub(crate) fn verify_authenticode(
                 CertGetNameStringW, CERT_CONTEXT, CERT_NAME_SIMPLE_DISPLAY_TYPE,
             };
             let leaf_ptr: *const CERT_CONTEXT = leaf;
-            // The signing certificate's simple display name (its subject CN) — the publisher
-            // value the Ed25519-signed manifest binds. Two-call pattern: required length
-            // (including the NUL), then the string itself.
-            // SAFETY: `leaf` borrows the live verification state checked above; the API only
-            // reads the context on the length call.
+            // Two-call `CertGetNameStringW`: required length (including NUL), then the string.
+            // SAFETY: `leaf` borrows the live verification state; the length call only reads
+            // the context.
             let len = unsafe {
                 CertGetNameStringW(leaf_ptr, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, None)
             } as usize;
@@ -417,7 +400,7 @@ pub(crate) fn verify_authenticode(
         Ok(())
     })();
 
-    // Always release the verification state.
+    // CLOSE even when `verdict` is Err; the state is live until this call.
     data.dwStateAction = WTD_STATEACTION_CLOSE;
     // SAFETY: same live `data`/`file_info`/`action` as the VERIFY call; CLOSE releases
     // `hWVTStateData`, after which no borrow of the state remains (the leaf/DER reads all
@@ -432,8 +415,6 @@ pub(crate) fn verify_authenticode(
     verdict
 }
 
-/// Keep the freshly-verified target plus the newest previous installers; sweep the rest (and
-/// any stale `.part`/`.bad` from other versions).
 fn prune_installers(dir: &Path, keep_newest: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

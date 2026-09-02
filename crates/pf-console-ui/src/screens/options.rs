@@ -1,24 +1,13 @@
-//! The console's context menu: something the user is looking at, and the actions that apply
-//! to it. One screen, any subject.
+//! Context menu for whatever the console is looking at: a saved host, a pinned
+//! profile card, or a library title. One screen; the subject names the object
+//! and [`OptionsScreen::actions`] owns the verbs.
 //!
-//! It arrived as the saved host's own menu — Wake, Copy link, Edit…, Forget — because a
-//! renamed machine or an address typed in with a fat thumb stayed wrong forever otherwise,
-//! and the tile is where a host is, so the tile is where its actions belong. Generalising it
-//! is what stops the console growing a second idiom per verb: the library had "Copy link"
-//! wired straight to X, so one action had two shapes, and a console that answers every new
-//! action with another face button runs out of buttons long before it runs out of actions.
-//! Here a screen names a SUBJECT and the menu owns the verbs, which makes the next one — hide
-//! a title, add it to Steam, override its profile — a row in [`OptionsScreen::actions`].
+//! Which face button raises it is per screen (carousel ▲, library X); both
+//! legends say "Options". A pinned card offers Unpin only — it is a shortcut,
+//! not a second host.
 //!
-//! Which button raises it is per screen, because the screens differ; only the WORD is
-//! load-bearing, and both legends say "Options". Home's carousel is horizontal, so up is the
-//! one free direction and ▲ opens it — the gesture the Android console already teaches. The
-//! library spends up on grid rows, so there it is X, which is free precisely because copying
-//! a link stopped being a button. X also keeps the menu reachable with a mouse: the hint bar
-//! turns face-button hints into presses, and ▲ only became one of those alongside this change.
-//!
-//! A pinned profile card offers only Unpin: it is a shortcut, not a second host, and offering
-//! to forget the host from it would blur precisely the distinction a pin exists to draw.
+//! Evidence: `design/host-actions.md`. Tests in this module pin the arm-then-fire
+//! rule, the host-key NUL split, and the padless Library row.
 
 use crate::glyphs::{Hint, HintKey};
 use crate::library::LibraryGame;
@@ -33,41 +22,33 @@ use skia_safe::{Canvas, Rect};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Action {
     Wake,
-    /// One of the host's OWN actions — sleep / restart / shut down it
-    /// (`design/host-actions.md` §7), indexed into [`HostRow::actions`], which the service
-    /// thread filled from the host's discovery. Indexed rather than a variant per verb
-    /// because the console must render an action this build has never heard of: the host
-    /// already sent a label and said whether this device may run it.
+    /// Indexed into [`HostRow::actions`]. Not a variant per id: this build must
+    /// render a label the host sent that we have never heard of.
     Host(usize),
     SendLogs,
-    /// Open this host's game library — the same shelf the home carousel's Y opens, offered
-    /// here because Y is a face button and a TV remote has none. Saved-and-paired only,
-    /// exactly like that Y (an unpaired host has no shelf to fetch).
+    /// Same gate as the carousel's Y (saved and paired). Here because a TV
+    /// remote has no Y.
     Library,
     CopyLink,
     Edit,
-    /// Choose the profile the host's primary tile connects with (opens the
-    /// [`Screen::BindProfile`] chooser). Offered on saved primary tiles only — a pinned
-    /// card's profile IS the card, and a title's menu addresses the title.
+    /// [`Screen::BindProfile`] for the primary tile. Not on a pin: the pin is
+    /// the profile.
     BindProfile,
-    /// Share this device's clipboard with THIS host while streaming
-    /// (`KnownHost::clipboard_sync`). Per-host because it is a trust decision about that
-    /// host — which is why it lives on the host and not in Settings. A toggle: the label
-    /// carries the current state, activating flips it.
+    /// Per-host [`KnownHost::clipboard_sync`]. Lives on the host, not Settings:
+    /// the other end of the pipe is this machine.
     Clipboard,
     Forget,
     Unpin,
     Cancel,
 }
 
-/// What the menu was raised ON. Every difference between two menus in this file is a match on
-/// this enum and nothing else, which is what keeps a third kind of menu to a variant and a
-/// row list rather than another screen with its own list, dispatch and legend.
+/// What the menu was raised on. A third kind is a variant plus a row list, not
+/// another screen.
 pub(crate) enum Subject {
-    /// A saved host's carousel tile, or a pinned profile card (the pin rides in the row).
+    /// Saved host tile, or a pinned profile card (the pin rides in the row).
     Host(HostRow),
-    /// One title on a shelf, and the host serving it — that host's pin included, so a link
-    /// taken off a pinned card's shelf still streams the way that card does.
+    /// Title on a shelf, with the serving host (pin included) so a link off a
+    /// pinned card still streams as that card does.
     Game {
         host: HostRow,
         id: String,
@@ -76,20 +57,13 @@ pub(crate) enum Subject {
 }
 
 pub(crate) struct OptionsScreen {
-    /// The subject this menu was opened on, by value. Discovery rewrites the carousel and the
-    /// library re-collates its shelf while the menu is up; holding an index or a borrow would
-    /// let the menu retarget itself onto whatever slid into that slot, and "Forget" must never
-    /// be able to do that.
+    /// Subject by value. Discovery rewrites the carousel and the shelf while
+    /// this is up; an index or borrow would retarget Forget onto whatever slid
+    /// into the slot.
     subject: Subject,
     list: MenuList,
-    /// The row currently armed, if any: an action with no undo arms on the first press and
-    /// only fires on the second. Forget was the first; the host's own destructive actions
-    /// (restart, shut down) join it. The other clients forget outright; a console is driven
-    /// by a thumbstick from across a room, which is a good reason to be stricter than they
-    /// are, and none at all to be looser.
-    ///
-    /// Holding WHICH action is armed, rather than a bare flag, is what stops an arming press
-    /// on one destructive row from firing a different one the cursor then landed on.
+    /// Destructive row armed on first press, fires on second. `Option<Action>`
+    /// not a bool: arming Forget must not fire Restart if the cursor moved.
     armed: Option<Action>,
 }
 
@@ -106,14 +80,12 @@ impl OptionsScreen {
         }
     }
 
-    /// Is this row worth opening a menu for at all? Only saved hosts have anything to
-    /// edit or forget; a discovered-but-unsaved one is not ours to change. A title needs no
-    /// such gate — its one action fails soft, and a shelf only exists for a saved host.
+    /// Saved hosts only. A discovered-but-unsaved row is not ours to edit.
+    /// Titles skip this: a shelf only exists for a saved host.
     pub(crate) fn available(host: &HostRow) -> bool {
         host.saved
     }
 
-    /// The host every action here ultimately addresses — a title's is the one serving it.
     fn host(&self) -> &HostRow {
         match &self.subject {
             Subject::Host(h) => h,
@@ -131,51 +103,36 @@ impl OptionsScreen {
         }
     }
 
-    /// A pinned card's key is the host's with the profile id appended past a NUL (see the
-    /// service's row builder) — every command here addresses the HOST.
+    /// Pinned-card keys append the profile id past a NUL (service row builder).
+    /// Commands address the host half.
     fn host_key(&self) -> &str {
         let key = self.host().key.as_str();
         key.split('\0').next().unwrap_or(key)
     }
 
-    // `_platform` is the seam platform-conditional rows plug into (Send logs used it until
-    // Android grew an uploader); unused today, kept so the next such row has its question
-    // already answered at every call site.
+    // Unused: seam for platform-conditional rows. Call sites already pass it.
     fn actions(&self, _platform: crate::platform::Platform) -> Vec<Action> {
         let host = match &self.subject {
             Subject::Host(h) => h,
-            // Deliberately not [Play, …]: the host menu does not repeat its tile's own A
-            // press either, and duplicating the primary action is the one thing a menu about
-            // consistency should not start life doing. Copy link leads so the cursor, which
-            // starts on row 0, is already on the row nearly everyone came for.
+            // Not Play: the tile's A already launches. Copy link first: cursor starts at 0.
             Subject::Game { .. } => return vec![Action::CopyLink, Action::Cancel],
         };
         if host.pin.is_some() {
             return vec![Action::Unpin, Action::CopyLink, Action::Cancel];
         }
         let mut a = Vec::new();
-        // Waking a host that is already answering would just sit there counting seconds.
+        // Online already: Wake would sit there counting seconds.
         if host.can_wake && !host.online {
             a.push(Action::Wake);
         }
-        // …and the other half of that round trip, immediately below it: the host's own
-        // actions, as IT reported them for this device. Nothing is decided here — the list is
-        // empty unless the host is reachable and this device's access carries the grant, so
-        // "Sleep host" appears exactly where "Wake host" was the evening before.
         a.extend((0..host.actions.len()).map(Action::Host));
-        // "Send logs" needs a paired identity (the upload authenticates with the streaming
-        // cert) and a reachable host — on anything else the row would only ever toast an
-        // error. This is the log-escape hatch for platforms whose own filesystem the user
-        // can't reach (Deck Gaming Mode, tvOS): the bundle lands on the host, listed in
-        // its web console next to the host's own logs.
-        // Every platform has an uploader now (Android's rides `nativeSendLogs` over the
-        // same `logring` the desktop drains), so paired-and-reachable is the whole gate.
+        // Upload authenticates with the streaming cert and needs a live host;
+        // anything else would only toast an error.
         if host.paired && host.online {
             a.push(Action::SendLogs);
         }
-        // The shelf, on the same terms the carousel's Y offers it. Ahead of Copy link
-        // because it is the one row here that goes somewhere rather than acting on the
-        // host — and on a remote-only device it is the ONLY way to the library.
+        // Same gate as carousel Y. Ahead of Copy link: this row navigates, and
+        // on a padless remote it is the only way to the shelf.
         if host.paired && host.saved {
             a.push(Action::Library);
         }
@@ -190,8 +147,6 @@ impl OptionsScreen {
         a
     }
 
-    /// One label per action for the whole console, so the same verb cannot end up worded two
-    /// ways on two screens — which is the mess this menu exists to clear up.
     fn label(&self, a: Action) -> String {
         match a {
             Action::Wake => "Wake host".into(),
@@ -224,11 +179,8 @@ impl OptionsScreen {
         }
     }
 
-    /// Whether a row reads as live. Only a host action can be dead: the host said it cannot
-    /// run that verb right now (no suspend support, a foreign inhibitor, a second local user).
-    /// The row stays — activating it explains why — because a row that quietly vanished would
-    /// leave the person wondering whether they had imagined it (the host's own honesty rule:
-    /// "unavailable, because X", never a dead switch and never a silence).
+    /// Host-reported verbs can be unavailable. The row stays; activating it
+    /// toasts why. Vanishing would look like the verb never existed.
     fn enabled(&self, a: Action) -> bool {
         match a {
             Action::Host(i) => self.host().actions.get(i).is_none_or(|act| act.available),
@@ -272,9 +224,8 @@ impl OptionsScreen {
         let Some(action) = actions.get(self.list.cursor).copied() else {
             return pulse;
         };
-        // Moving off an armed row disarms it: an arming press is about THAT row, and leaving
-        // it must not leave a live trigger behind — neither for the next visit, nor for the
-        // destructive row the cursor happened to land on next.
+        // Arming is per row. Leaving it must not leave a live trigger on the
+        // next destructive row the cursor lands on.
         if !matches!(msg, ListMsg::Activate) && self.armed != Some(action) {
             self.armed = None;
         }
@@ -288,9 +239,8 @@ impl OptionsScreen {
         }
     }
 
-    /// This subject's `punktfunk://` link, built from the store at ACTIVATION — never at open.
-    /// The store is what holds the fingerprint and stable id, and the row the menu was raised
-    /// on may have left it since; a link built early would be a link built from a lie.
+    /// `punktfunk://` from the store at activation, never at open. The row may
+    /// have left the store while the menu was up.
     fn link(&self, store: &dyn crate::store::SettingsStore) -> Option<String> {
         match &self.subject {
             Subject::Host(h) => crate::screens::host_link(store, h),
@@ -333,16 +283,14 @@ impl OptionsScreen {
                         fx.copy = Some(url);
                         fx.toast = Some("Link copied".into());
                     }
-                    // Only if the host left the store between opening this menu and now.
+                    // Host left the store between open and now.
                     None => fx.toast = Some("This host isn't saved any more".into()),
                 }
                 fx.pop();
             }
-            // Same two steps the home carousel's Y takes: ask for the shelf, then open it
-            // on the epoch read BEFORE the command drains, so the screen can tell its own
-            // fetch's titles from the ones already in the model. `replace`, not push — the
-            // menu has said its piece, and Back from the shelf belongs on the carousel
-            // rather than on a menu about the host you just left.
+            // Fetch, then open on the epoch taken *before* the command drains
+            // so this fetch's titles are distinct from ones already in the
+            // model. Replace, not push: Back from the shelf is the carousel.
             Action::Library => {
                 let host = self.host();
                 fx.cmds.push(ConsoleCmd::FetchLibrary {
@@ -388,10 +336,9 @@ impl OptionsScreen {
             Action::Host(i) => {
                 let host = self.host();
                 let Some(act) = host.actions.get(i) else {
-                    return; // the row list changed under the cursor — do nothing, silently
+                    return; // row list changed under the cursor
                 };
-                // A host the host itself says it cannot do right now: say why rather than
-                // send a request we know it will refuse.
+                // Host says no: toast why rather than send a request it will refuse.
                 if !act.available {
                     let why = act.unavailable_reason.clone();
                     fx.toast = Some(if why.is_empty() {
@@ -402,9 +349,8 @@ impl OptionsScreen {
                     fx.pop();
                     return;
                 }
-                // Restart and shut down lose whatever is running on that machine, so they take
-                // the Forget treatment: arm, then fire. Sleep is reversible from the same menu
-                // (Wake host), so it goes on one press.
+                // `danger` (restart, shut down) arms then fires. Sleep is
+                // reversible via Wake, so one press.
                 if act.danger && self.armed != Some(action) {
                     self.armed = Some(action);
                     return;
@@ -445,8 +391,6 @@ impl OptionsScreen {
         ]
     }
 
-    /// What this menu is FOR, in a line. Per subject, because a menu that opened from a cover
-    /// and one that opened from a host tile are answering two different questions.
     fn blurb(&self) -> String {
         match &self.subject {
             Subject::Host(h) if h.pin.is_some() => {
@@ -468,8 +412,7 @@ impl OptionsScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
-        // The explainer line, as on Add Host — it says what this menu is FOR, and the air it
-        // takes is what keeps the first row off the title.
+        // Air under the title so the first row does not sit on it.
         fonts.leading(
             canvas,
             &self.blurb(),
@@ -496,8 +439,6 @@ impl OptionsScreen {
     }
 }
 
-/// The title half of the menu — what the library's X raises, where the host half is what the
-/// home carousel's ▲ raises.
 impl OptionsScreen {
     pub(crate) fn for_game(host: &HostRow, game: &LibraryGame) -> OptionsScreen {
         OptionsScreen::on(Subject::Game {
@@ -514,9 +455,8 @@ mod tests {
     use crate::model::ProfileChip;
     use crate::screens::Nav;
 
-    /// Activate one row. `run` reads the store, and — for Library — the shared library's
-    /// fetch epoch; nothing else in this menu touches the context, so one throwaway is
-    /// enough for every action test here.
+    /// Drive `run` with a throwaway `Ctx`. Only the store and, for Library, the
+    /// fetch epoch are read.
     fn run_action(s: &mut OptionsScreen, action: Action, fx: &mut Outbox) {
         let mut settings = pf_client_core::trust::Settings::default();
         let library = crate::library::LibraryShared::default();
@@ -556,7 +496,6 @@ mod tests {
         }
     }
 
-    /// A host that reported the three power actions for this device, sleep available.
     fn powered() -> HostRow {
         let act = |id: &str, label: &str, danger: bool, available: bool| crate::model::HostAction {
             id: id.into(),
@@ -632,10 +571,6 @@ mod tests {
             .contains(&Action::Wake));
     }
 
-    /// "Send logs" is offered wherever a paired, reachable host can receive it — on BOTH
-    /// platforms since Android's uploader landed (`SkiaConsole.sendLogs` → `nativeSendLogs`
-    /// over the shared `logring`); before that the row was desktop-only, because a row that
-    /// can only toast "not available" is a promise broken.
     #[test]
     fn send_logs_is_offered_on_every_platform_with_an_uploader() {
         let reachable = OptionsScreen::for_host(&HostRow {
@@ -651,9 +586,6 @@ mod tests {
             .contains(&Action::SendLogs));
     }
 
-    /// The host's own actions sit right under Wake — the two halves of one round trip — and
-    /// only exist because the HOST offered them: an empty list (older host, unreachable host,
-    /// or a device without the grant) leaves the menu exactly as it was.
     #[test]
     fn host_actions_appear_only_when_the_host_offered_them() {
         let none = OptionsScreen::for_host(&host());
@@ -669,7 +601,7 @@ mod tests {
             3
         );
         assert_eq!(s.label(Action::Host(0)), "Sleep host");
-        // An id this build has never heard of still renders — the host sent the label.
+        // Unknown id still renders: the host sent the label.
         let future = OptionsScreen::for_host(&HostRow {
             actions: vec![crate::model::HostAction {
                 id: "plugin:vpn:toggle".into(),
@@ -683,14 +615,13 @@ mod tests {
         assert_eq!(future.label(Action::Host(0)), "Toggle the VPN");
     }
 
-    /// Sleep is reversible from this very menu, so it goes on one press. Restart and shut down
-    /// are not, so they take Forget's arm-then-fire — and arming one must never leave the
-    /// OTHER one live, which is exactly the bug a bare `armed` flag would have shipped.
+    /// Sleep fires on one press. Restart/shut down arm. Arming one must not
+    /// leave the other live (`armed` is `Option<Action>`, not a bool).
     #[test]
     fn destructive_host_actions_arm_before_they_fire() {
         let mut s = OptionsScreen::for_host(&powered());
         let mut fx = Outbox::default();
-        run_action(&mut s, Action::Host(0), &mut fx); // sleep — one press
+        run_action(&mut s, Action::Host(0), &mut fx);
         assert!(matches!(
             fx.cmds.first(),
             Some(ConsoleCmd::HostAction { action_id, .. }) if action_id == "power.sleep"
@@ -698,13 +629,12 @@ mod tests {
 
         let mut s = OptionsScreen::for_host(&powered());
         let mut fx = Outbox::default();
-        run_action(&mut s, Action::Host(2), &mut fx); // shut down — arms
+        run_action(&mut s, Action::Host(2), &mut fx);
         assert!(fx.cmds.is_empty(), "the first press only arms");
         assert_eq!(
             s.label(Action::Host(2)),
             "Shut down host \u{2014} press again"
         );
-        // The armed row is that one row: moving to Restart and pressing must not shut down.
         assert_eq!(s.label(Action::Host(1)), "Restart host");
         let mut fx = Outbox::default();
         run_action(&mut s, Action::Host(1), &mut fx);
@@ -712,7 +642,6 @@ mod tests {
             fx.cmds.is_empty(),
             "arming shut down must not leave restart armed"
         );
-        // Pressing the armed row again fires it.
         let mut s = OptionsScreen::for_host(&powered());
         let mut fx = Outbox::default();
         run_action(&mut s, Action::Host(2), &mut fx);
@@ -723,8 +652,6 @@ mod tests {
         ));
     }
 
-    /// An action the host says it cannot run right now stays on the menu, disabled, and
-    /// explains itself — never a silent row and never a request we know will be refused.
     #[test]
     fn an_unavailable_action_explains_itself_instead_of_firing() {
         let mut s = OptionsScreen::for_host(&HostRow {
@@ -754,14 +681,12 @@ mod tests {
             s.actions(crate::platform::Platform::Desktop),
             vec![Action::Unpin, Action::CopyLink, Action::Cancel]
         );
-        // …and its commands still address the HOST, not the pin's composite key.
+        // Commands address the host, not the pin's composite key.
         assert_eq!(s.host_key(), "aa");
     }
 
-    /// The shelf is on this menu, which is the only route to it that survives a device with
-    /// no face buttons: home's Y opens it too, but an Android TV remote has no Y. Offered on
-    /// the same terms that Y is (saved AND paired), and it REPLACES the menu, so Back from
-    /// the shelf lands on the carousel rather than on a menu about the host just left.
+    /// Padless path to the shelf (no Y on a TV remote). Saved and paired;
+    /// Replace so Back lands on the carousel.
     #[test]
     fn the_library_hangs_off_the_menu_for_a_padless_device() {
         let mut s = OptionsScreen::for_host(&host());
@@ -780,7 +705,7 @@ mod tests {
             _ => panic!("expected the shelf to replace the menu"),
         }
 
-        // An unpaired host has no shelf to fetch — the row is absent, not inert.
+        // Unpaired: row absent, not inert.
         let unpaired = OptionsScreen::for_host(&HostRow {
             paired: false,
             ..host()
@@ -790,9 +715,6 @@ mod tests {
             .contains(&Action::Library));
     }
 
-    /// "Default profile…" swaps the menu for the chooser — a Replace like Edit's, and for
-    /// the same reason — addressed to the HOST's plain key even from rows that carry a
-    /// composite one.
     #[test]
     fn default_profile_opens_the_chooser_on_the_hosts_plain_key() {
         let mut s = OptionsScreen::for_host(&host());
@@ -810,8 +732,6 @@ mod tests {
         }
     }
 
-    /// The clipboard toggle: the label says where the host stands, activating flips it —
-    /// and both address the HOST's plain key.
     #[test]
     fn the_clipboard_toggle_flips_the_stored_state() {
         let mut s = OptionsScreen::for_host(&host());
@@ -896,8 +816,7 @@ mod tests {
             s.actions(crate::platform::Platform::Desktop),
             vec![Action::CopyLink, Action::Cancel]
         );
-        // The cursor starts on row 0, so the row nearly everyone opened this for is the row
-        // the confirm press is already on.
+        // Cursor starts at 0: Copy link is already under confirm.
         assert_eq!(s.list.cursor, 0);
         assert_eq!(s.title(), "Hollow Knight");
     }
@@ -929,15 +848,13 @@ mod tests {
             Some("prof-1"),
             "a link taken off a pinned card's shelf carries that card's profile"
         );
-        // Host-addressed commands still reach past the pin's composite key.
+        // Host-addressed commands still use the host half of a pin key.
         assert_eq!(s.host_key(), "aa");
     }
 
     #[test]
     fn copy_link_always_closes_the_menu_and_says_what_happened() {
-        // Whether the store still knows the host decides WHICH of the two things it says,
-        // and nothing else: a menu that stayed open on failure would leave the user pressing
-        // a row that can only fail again.
+        // Always Pop. Staying open on failure would leave a row that can only fail again.
         for mut s in [
             OptionsScreen::for_host(&host()),
             OptionsScreen::for_game(&host(), &game()),

@@ -1,21 +1,16 @@
-//! Windows capture GPU mechanics — the win32u GPU-preference hook, HLSL shader compilation, HDR
-//! FP16→P010 conversion ([`HdrP010Converter`]), video-engine colour conversion ([`VideoConverter`]),
+//! Windows capture GPU mechanics: win32u GPU-preference hook, HLSL compile,
+//! HDR FP16→P010 ([`HdrP010Converter`]), video-engine CSC ([`VideoConverter`]),
 //! and the P010 self-test. Consumed by [`super::idd_push`].
 //!
-//! The shared IDD-push capture IDENTITY — [`WinCaptureTarget`], [`D3d11Frame`], [`pack_luid`], and
-//! [`make_device`] (the D3D11 device factory + GPU scheduling-priority hardening) — moved into the
-//! `pf-frame` leaf crate so capture, encode, and pf-vdisplay share one identity type without a
-//! capture↔encode↔vdisplay cycle (plan §W6); this module re-exports it so every existing
-//! `crate::dxgi::*` path keeps resolving. DXGI Desktop Duplication has been removed; this
-//! module contains no capturer.
+//! Capture identity ([`WinCaptureTarget`], [`D3d11Frame`], [`pack_luid`],
+//! [`make_device`]) lives in `pf-frame` so capture, encode, and pf-vdisplay share
+//! one type without a crate cycle. This module re-exports them so `crate::dxgi::*`
+//! still resolves. There is no capturer here.
 
 pub use pf_frame::dxgi::{make_device, pack_luid, D3d11Frame, PyroFrameShare, WinCaptureTarget};
 
-// The P010 colour self-test (sweep Phase 5.5) — the `hdr-p010-selftest` subcommand, its f64
-// reference math and the f16 uploader. None of it runs in a session; re-exported at the old paths
-// (`main.rs` drives the subcommand, `pf-encode`'s qsv live e2e uses the bars helper).
-// Explicit `#[path]`, like `idd_push`'s children: this file is itself reached through a `#[path]`
-// from `lib.rs`, so a bare `mod selftest;` would resolve to `windows/selftest.rs`.
+// `#[path]`: this file is itself reached through a `#[path]` from `lib.rs`, so a
+// bare `mod selftest;` would resolve to `windows/selftest.rs`.
 #[path = "dxgi/selftest.rs"]
 mod selftest;
 pub use selftest::{hdr_p010_convert_bars_on_luid, hdr_p010_selftest_at};
@@ -45,34 +40,25 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_SAMPLE_DESC,
 };
 
-/// How many times DXGI has actually called our hooked `NtGdiDdDDIGetCachedHybridQueryValue`.
-/// Reported by [`hybrid_hook_hits`] on every IDD-push open, which is the first point at which DXGI
-/// has been exercised (factory → `EnumAdapterByLuid` → device). The patch-readback check in
-/// [`install_gpu_pref_hook`] proves the BYTES landed; only this counter proves DXGI actually
-/// reaches the export on this build — so `0` here means the hook is inert and a
-/// reparenting-flavoured symptom (see [`install_gpu_pref_hook`]) has some other cause.
+/// Hits on the hooked `NtGdiDdDDIGetCachedHybridQueryValue`. Patch-readback in
+/// [`install_gpu_pref_hook`] only proves the bytes landed; `0` here means DXGI
+/// never reached the export on this build.
 static HYBRID_HOOK_HITS: AtomicU64 = AtomicU64::new(0);
 
-/// See [`HYBRID_HOOK_HITS`] — surfaced in the IDD-push open log so a dead hook is visible in the
-/// field instead of being a silent write-only counter.
 pub(crate) fn hybrid_hook_hits() -> u64 {
     HYBRID_HOOK_HITS.load(Ordering::Relaxed)
 }
 
-// kernel32 — declared directly so we don't pull the whole Win32_System_Diagnostics_Debug feature for
-// one call. FlushInstructionCache serializes the i-cache after the inline patch: the patch is written
-// on the main thread but DXGI runs the hooked export from the encode/worker thread (possibly a
-// different core), so the "same-thread, no flush needed" assumption was wrong.
+// Declared here so we skip the Win32_System_Diagnostics_Debug feature for one call.
+// DXGI runs the hooked export on the encode worker, possibly another core;
+// FlushInstructionCache after the patch so that core does not keep the old bytes.
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn FlushInstructionCache(h: *mut c_void, base: *const c_void, size: usize) -> i32;
     fn GetCurrentProcess() -> *mut c_void;
 }
-/// Replacement for `win32u.dll!NtGdiDdDDIGetCachedHybridQueryValue`: always report
-/// `D3DKMT_GPU_PREFERENCE_STATE_UNSPECIFIED` (3). We fully replace the function (never call the
-/// original), so no trampoline is needed. (Independent reimplementation of the same technique Apollo
-/// uses: Apollo installs its hook via the MinHook library; this is an original inline byte-patch and
-/// copies no Apollo/GPL source.)
+/// Always report `D3DKMT_GPU_PREFERENCE_STATE_UNSPECIFIED` (3). Replaces the
+/// export in full, so there is no trampoline back to the original.
 unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
     HYBRID_HOOK_HITS.fetch_add(1, Ordering::Relaxed);
     if gpu_preference.is_null() {
@@ -85,22 +71,13 @@ unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
     0 // STATUS_SUCCESS
 }
 
-/// The win32u GPU-preference hook (the same technique Apollo applies, reimplemented here from the
-/// documented DDI — no GPL source copied). On a HYBRID-GPU box DXGI resolves a GPU preference
-/// (registry + power settings + the hybrid-adapter DDI) and REPARENTS outputs onto the chosen render
-/// GPU, ignoring `SET_RENDER_ADAPTER` (observed on the RTX 4090 + AMD iGPU box). Faking a cached
-/// preference of UNSPECIFIED makes DXGI skip that resolution, so an output is NOT reparented and
-/// stays on one adapter.
+/// Fake `D3DKMT_GPU_PREFERENCE_STATE_UNSPECIFIED` so DXGI skips hybrid
+/// GPU-preference resolution. Without this, DXGI reparents outputs onto the
+/// preferred render GPU and ignores `SET_RENDER_ADAPTER`, so the IDD-push ring
+/// and the driver's swap-chain land on different adapters (`DRV_STATUS_TEX_FAIL`).
 ///
-/// **Why it is still installed now that DXGI Desktop Duplication is gone:** the IDD-push ring and
-/// the driver's swap-chain must live on the SAME adapter, and the host pins that with
-/// `SET_RENDER_ADAPTER` at monitor ADD (see `idd_push::open_inner`). A DXGI reparent moves the
-/// virtual output off the pinned GPU behind the host's back — which surfaces as the driver's
-/// `DRV_STATUS_TEX_FAIL` ("could not open our textures — render-adapter mismatch") and costs a
-/// ring rebind. So the hook's job changed from "keep DDA on one adapter" to "keep the VIRTUAL
-/// DISPLAY on the adapter we pinned"; the mechanism is unchanged. Installed once from
-/// `main.rs`, before the virtual-display setup creates the first DXGI factory; lasts the process
-/// lifetime. [`hybrid_hook_hits`] reports whether DXGI ever actually calls it.
+/// Call once from `main.rs` before the first DXGI factory. Lasts the process
+/// lifetime. [`hybrid_hook_hits`] reports whether DXGI actually calls it.
 pub fn install_gpu_pref_hook() {
     use std::sync::Once;
     static HOOK: Once = Once::new();
@@ -124,15 +101,10 @@ pub fn install_gpu_pref_hook() {
             GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
             SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         };
-        // Per-monitor-v2 DPI awareness. It was originally set here because
-        // `IDXGIOutput5::DuplicateOutput1` returns E_ACCESSDENIED without it; DDA is gone, but the
-        // awareness still matters — an UNAWARE/SYSTEM-aware process gets DPI-VIRTUALIZED window and
-        // cursor coordinates, while every geometry the host computes comes from CCD in PHYSICAL
-        // pixels (`source_desktop_rect`, `desktop_bounds`). Mixing the two mis-aims the compose
-        // kick's `SetCursorPos` and the cursor-blend placement on any scaled display. Set here
-        // because this is the earliest process-wide hook point. `SetProcessDpiAwarenessContext`
-        // fails with E_ACCESS_DENIED if awareness was already set (manifest / earlier call) — log
-        // the outcome AND the effective awareness so a mis-scaled pointer is diagnosable.
+        // Per-monitor-v2: UNAWARE/SYSTEM virtualizes window and cursor coords, while
+        // host geometry is CCD physical pixels. Mix them and `SetCursorPos` / cursor
+        // blend miss on a scaled display. Earliest process-wide hook point.
+        // E_ACCESS_DENIED if already set — log the effective awareness too.
         match SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
             Ok(()) => tracing::info!("DPI awareness set: PER_MONITOR_AWARE_V2"),
             Err(e) => tracing::warn!(error = ?e,
@@ -159,8 +131,8 @@ pub fn install_gpu_pref_hook() {
             return;
         };
         let target = target as usize as *mut u8;
-        // x64 absolute jump to our replacement: `mov rax, imm64 ; jmp rax` (12 bytes). We never call the
-        // original, so no trampoline/relocation (hence no detour crate / C length-disassembler dep).
+        // x64 absolute jump: `mov rax, imm64; jmp rax` (12 bytes). No trampoline —
+        // we never call the original, so no relocation / length-disassembler.
         let hook = hybrid_query_hook as *const () as usize;
         let mut patch = [0u8; 12];
         patch[0] = 0x48;
@@ -183,13 +155,10 @@ pub fn install_gpu_pref_hook() {
         std::ptr::copy_nonoverlapping(patch.as_ptr(), target, 12);
         let mut restore = PAGE_PROTECTION_FLAGS(0);
         let _ = VirtualProtect(target as *const c_void, 12, old, &mut restore);
-        // Serialize the i-cache: the patch is written here (main thread) but DXGI calls the export from
-        // the capture/encode worker thread — possibly a different core with a stale i-cache, in which
-        // case it would keep running the ORIGINAL function and DXGI would still reparent. (Apollo's
-        // MinHook does this flush internally; our hand-rolled patch must do it explicitly.)
+        // Patch is on the main thread; DXGI calls the export from the encode worker,
+        // possibly another core with a stale i-cache that would still run the original.
         let _ = FlushInstructionCache(GetCurrentProcess(), target as *const c_void, 12);
-        // VERIFY the patch actually landed (CFG/hotpatch/short-stub could silently reject it). Read it
-        // back; an error! (not a cheery "installed") makes a dead hook obvious in the logs.
+        // CFG / hotpatch / a short stub can reject the write silently. Read it back.
         let mut readback = [0u8; 12];
         std::ptr::copy_nonoverlapping(target, readback.as_mut_ptr(), 12);
         if readback == patch {
@@ -208,11 +177,11 @@ pub fn install_gpu_pref_hook() {
     });
 }
 
-/// Compile one HLSL entry point. Returns the bytecode blob's bytes.
+/// Compile one HLSL entry point to bytecode.
 ///
 /// # Safety
-/// `entry` and `target` must be valid NUL-terminated ASCII pointers (an `s!()` literal at every
-/// call site); `src` is a plain Rust `&str`, read only for the duration of the call.
+/// `entry` and `target` must be valid NUL-terminated ASCII (`s!()` at every
+/// call site); `src` is a live `&str` for the duration of the call.
 pub(crate) unsafe fn compile_shader(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u8>> {
     // SAFETY: `D3DCompile` reads `src.as_ptr()` for exactly `src.len()` bytes (a live `&str` that
     // outlives the synchronous call) plus the two caller-supplied NUL-terminated `PCSTR`s (per the
@@ -265,22 +234,19 @@ VOut main(uint vid : SV_VertexID) {
 }
 ";
 
-/// P010 **luma** pixel shader: scRGB FP16 desktop (linear, Rec.709 primaries, 1.0 = 80 nits) →
-/// BT.2020 PQ → BT.2020 non-constant-luminance limited-range Y′, written as a 10-bit code in the high
-/// 10 bits of an R16_UNORM render-target view of the P010 plane-0 (luma). The colour pipeline
-/// (scRGB→nits→BT.2020-linear→PQ) is IDENTICAL to the R10 HDR path; only the final RGB→Y + studio-range
-/// quantization differs. The shared HLSL is factored into [`HDR_P010_COMMON`].
+/// Shared scRGB FP16 → BT.2020 PQ math for the P010 luma and chroma passes.
+/// scRGB 1.0 = 80 nits. Identical to the R10 HDR path until RGB→Y + studio-range.
 const HDR_P010_COMMON: &str = r"
 Texture2D<float4> tx : register(t0);
 SamplerState sm : register(s0);
-// Rec.709 → Rec.2020 primaries (linear). Same matrix as the R10 HdrConverter (mul(M, v)).
+// Rec.709 → Rec.2020 (linear). Same matrix as the R10 converter.
 static const float3x3 BT709_TO_BT2020 = {
     0.627403914, 0.329283038, 0.043313048,
     0.069097292, 0.919540405, 0.011362303,
     0.016391439, 0.088013308, 0.895595253
 };
 float3 pq_oetf(float3 L) {
-    // L normalized so 1.0 = 10000 nits. ST 2084. (Identical to HdrConverter.)
+    // L is 1.0 = 10000 nits (ST 2084).
     const float m1 = 0.1593017578125;
     const float m2 = 78.84375;
     const float c1 = 0.8359375;
@@ -289,13 +255,12 @@ float3 pq_oetf(float3 L) {
     float3 Lp = pow(saturate(L), m1);
     return pow((c1 + c2 * Lp) / (1.0 + c3 * Lp), m2);
 }
-// scRGB FP16 sample -> PQ-encoded BT.2020 RGB in [0,1] (the SAME pixels the R10 path would store,
-// before quantization). Used by both the luma and chroma passes so they agree bit-for-bit with the
-// existing HdrConverter colour math + the Rust reference.
+// PQ BT.2020 RGB in [0,1] — the same pixels the R10 path stores before quantize.
+// Both P010 passes use this so they match HdrConverter and the Rust reference.
 float3 scrgb_to_pq2020(float2 uv) {
     float3 scrgb = max(tx.Sample(sm, uv).rgb, 0.0); // scRGB can be negative (wide gamut); clamp
     float3 nits = scrgb * 80.0;                      // scRGB 1.0 = 80 nits
-    float3 lin2020 = mul(BT709_TO_BT2020, nits);     // primaries conversion (linear)
+    float3 lin2020 = mul(BT709_TO_BT2020, nits);
     return pq_oetf(lin2020 / 10000.0);               // normalize to 10k nits, encode PQ -> [0,1]
 }
 // BT.2020 non-constant-luminance, on the PQ-encoded (gamma) RGB. Kr/Kg/Kb per Rec.2020.
@@ -316,13 +281,12 @@ float2 studio_cbcr_code(float3 rgb_pq) {
     float crc = 512.0 + 896.0 * cr;
     return float2(clamp(cbc, 64.0, 960.0), clamp(crc, 64.0, 960.0));
 }
-// P010 stores the 10-bit code in the HIGH 10 bits of each 16-bit sample (code10 << 6). As an
-// R16_UNORM / R16G16_UNORM render target the UNORM float that maps to that stored u16 is
-// code10*64 / 65535.0. (Verified in hdr_p010_selftest against the readback.)
+// P010 stores the 10-bit code in the high 10 bits (code10 << 6). As R16_UNORM
+// the float that maps to that u16 is code10*64 / 65535.0.
 float code10_to_unorm(float code10) { return (code10 * 64.0) / 65535.0; }
 ";
 
-/// P010 LUMA pass PS — full-res, writes Y′ to plane 0 (R16_UNORM RTV).
+/// P010 luma: full-res Y′ into plane 0 (`R16_UNORM`).
 const HDR_P010_Y_PS: &str = r"
 #include_common
 float main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
@@ -332,21 +296,17 @@ float main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 }
 ";
 
-/// P010 CHROMA pass PS — half-res, writes interleaved (Cb,Cr) to plane 1 (R16G16_UNORM RTV).
-/// **Left-cosited** (H.273 chroma_loc type 0 — the default every decoder infers when
-/// chroma_loc_info is unsignaled, and what the clients' sampling corrections assume): the chroma
-/// sample sits ON the even luma column, vertically centered between its two rows — so the filter
-/// is the 2-row average of that ONE column, IN scRGB-linear space before the PQ encode, then
-/// Cb/Cr from the averaged-then-PQ-encoded RGB. (The old 2×2 box was CENTER-sited — a
-/// half-luma-pixel chroma shift against what decoders reconstruct; the narrow column decimation
-/// also keeps desktop text/edge chroma crisp, and block-uniform inputs stay exact for
-/// `hdr_p010_selftest`.) `inv_src` = (1/srcW, 1/srcH).
+/// P010 chroma: half-res interleaved (Cb,Cr) on plane 1 (`R16G16_UNORM`).
+/// Left-cosited (H.273 chroma_loc type 0, the unsignaled default). Average the
+/// even luma column's two rows in scRGB-linear, then PQ + Cb/Cr. A 2×2 box is
+/// centre-sited and shifts chroma by half a luma pixel against the decoder.
+/// `inv_src` = (1/srcW, 1/srcH).
 const HDR_P010_UV_PS: &str = r"
 #include_common
 cbuffer C : register(b0) { float2 inv_src; float2 pad; };
 float2 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
-    // `uv` is the chroma RT texel centre = the middle of the 2x2 luma block; the left-cosited
-    // target is the block's LEFT column, whose two texel centres sit at uv + (-h.x, ±h.y).
+    // `uv` is the chroma texel centre (middle of the 2×2 luma block). Left-cosite
+    // is the LEFT column: the two centres sit at uv + (-h.x, ±h.y).
     float2 h = inv_src * 0.5;
     float3 a = max(tx.Sample(sm, uv + float2(-h.x, -h.y)).rgb, 0.0);
     float3 b = max(tx.Sample(sm, uv + float2(-h.x,  h.y)).rgb, 0.0);
@@ -359,30 +319,21 @@ float2 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 }
 ";
 
-/// scRGB FP16 → **R10G10B10A2** (BT.2020 PQ, FULL-range RGB) — one full-res pass, the HDR twin of
-/// the SDR 4:4:4 BGRA passthrough. Keeps full chroma all the way to the encoder: NVENC ingests the
-/// packed 10-bit RGB (`NV_ENC_BUFFER_FORMAT_ABGR10`) and CSCs it to YUV **4:4:4** itself under
-/// FREXT, per the BT.2020/PQ VUI the encoder writes — HEVC Main 4:4:4 10. Without this the HDR
-/// path had only [`HdrP010Converter`], whose chroma pass subsamples, so a session that negotiated
-/// 4:4:4 on an HDR display silently fell back to 4:2:0.
+/// scRGB FP16 → `R10G10B10A2` (BT.2020 PQ, full-range RGB), one full-res pass.
+/// NVENC takes packed 10-bit RGB as `NV_ENC_BUFFER_FORMAT_ABGR10` and CSC to
+/// YUV 4:4:4 itself. Colour math is [`HDR_P010_COMMON`]'s `scrgb_to_pq2020`.
 ///
-/// The colour math is [`HDR_P010_COMMON`]'s `scrgb_to_pq2020` verbatim — the SAME pixels the P010
-/// luma pass starts from — so the two HDR outputs agree bit-for-bit before quantization. Only the
-/// destination differs: no RGB→YUV, no studio-range squeeze and no chroma decimation here, just the
-/// hardware's UNORM quantization of the PQ values into 10 bits per channel.
-///
-/// Channel order: DXGI `R10G10B10A2_UNORM` stores R in the low 10 bits, which is exactly what
-/// NVENC calls `ABGR10` (it names A2B10G10R10 from the MSB down) — the same relationship the SDR
-/// path relies on between DXGI `B8G8R8A8` and NVENC's `ARGB`. So the shader writes natural RGB
-/// order and no swizzle is needed.
+/// DXGI `R10G10B10A2_UNORM` stores R in the low 10 bits, which NVENC names
+/// `ABGR10` (A2B10G10R10 from the MSB). Same as SDR `B8G8R8A8` vs `ARGB`.
+/// The shader writes RGB; no swizzle.
 pub(crate) struct HdrRgb10Converter {
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
 }
 
-/// R10G10B10A2 pass PS — full-res, writes PQ-encoded BT.2020 RGB straight to the packed 10-bit
-/// target. `saturate` is implicit in the UNORM render target; `scrgb_to_pq2020` already clamps.
+/// R10G10B10A2 pass: PQ BT.2020 RGB into the packed 10-bit target. `saturate` is
+/// implicit in the UNORM RT; `scrgb_to_pq2020` already clamps.
 const HDR_RGB10_PS: &str = r"
 #include_common
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
@@ -390,11 +341,9 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 }
 ";
 
-/// The 10-bit **SDR** pass PS ([`HdrRgb10Converter::new_sdr_expand`]) — full-res, samples the
-/// 8-bit BGRA slot and writes the SAME sRGB values into the packed 10-bit target. No colour math
-/// on purpose: the UNORM sample→write roundtrip IS the 8→10 expansion (code 255/255 lands on
-/// 1023/1023), and the transfer stays sRGB/BT.709 exactly as the 8-bit SDR path treats BGRA —
-/// the depth gain is the ENCODER's (Main10 coding precision), not the source's.
+/// 10-bit SDR pass: BGRA → packed 10-bit, same sRGB values. The UNORM roundtrip
+/// is the 8→10 expand (255/255 → 1023/1023). Transfer stays sRGB/BT.709; extra
+/// bits are encoder precision, not source depth.
 const SDR_RGB10_PS: &str = r"
 Texture2D<float4> tx : register(t0);
 SamplerState sm : register(s0);
@@ -404,7 +353,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 ";
 
 impl HdrRgb10Converter {
-    /// The HDR pass: FP16 scRGB in, PQ-encoded BT.2020 RGB out.
+    /// FP16 scRGB in, PQ-encoded BT.2020 RGB out.
     pub(crate) fn new(device: &ID3D11Device) -> Result<Self> {
         Self::from_ps(
             device,
@@ -412,9 +361,8 @@ impl HdrRgb10Converter {
         )
     }
 
-    /// The 10-bit **SDR** pass: BGRA in, the same sRGB values out at 10-bit UNORM (see
-    /// [`SDR_RGB10_PS`]). Identical plumbing — only the pixel shader differs — so the two
-    /// depth paths share the VS/sampler/draw and cannot drift.
+    /// 10-bit SDR pass: BGRA in, same sRGB out at 10-bit UNORM (see
+    /// [`SDR_RGB10_PS`]). Same VS/sampler/draw as the HDR pass so they cannot drift.
     pub(crate) fn new_sdr_expand(device: &ID3D11Device) -> Result<Self> {
         Self::from_ps(device, SDR_RGB10_PS.to_string())
     }
@@ -431,8 +379,8 @@ impl HdrRgb10Converter {
             device.CreateVertexShader(&vsb, None, Some(&mut vs))?;
             let mut ps = None;
             device.CreatePixelShader(&psb, None, Some(&mut ps))?;
-            // POINT, like the P010 luma pass: this is a 1:1 full-res resample, so every RT pixel
-            // maps to exactly one source texel centre and filtering would only blur it.
+            // POINT: 1:1 full-res, each RT pixel is one source texel centre.
+            // Filtering would only blur it.
             let sd = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
                 AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -452,8 +400,7 @@ impl HdrRgb10Converter {
         }
     }
 
-    /// A plain (non-planar) RTV of the packed 10-bit output texture. Built once per out-ring slot,
-    /// like the P010 plane views — never per frame.
+    /// Non-planar RTV of the packed 10-bit output. Once per out-ring slot, never per frame.
     pub(crate) fn rtv(
         device: &ID3D11Device,
         dst: &ID3D11Texture2D,
@@ -481,7 +428,6 @@ impl HdrRgb10Converter {
         }
     }
 
-    /// Convert `src_srv` (FP16 scRGB, WxH) into the `R10G10B10A2` texture behind `rtv`.
     pub(crate) fn convert(
         &self,
         ctx: &ID3D11DeviceContext,
@@ -512,7 +458,7 @@ impl HdrRgb10Converter {
             ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
             ctx.PSSetShader(&self.ps, None);
             ctx.Draw(3, 0);
-            // Unbind for the next frame's re-RTV / NVENC read.
+            // Unbind so the next frame can re-RTV and NVENC can read.
             ctx.OMSetRenderTargets(Some(&[None]), None);
             ctx.PSSetShaderResources(0, Some(&[None]));
             Ok(())
@@ -520,52 +466,33 @@ impl HdrRgb10Converter {
     }
 }
 
-/// scRGB FP16 → **P010** (BT.2020 PQ, 10-bit limited/studio range) conversion, in OUR OWN shader (two
-/// passes: full-res luma + half-res chroma). NVIDIA's D3D11 VideoProcessor cannot do RGB→P010 (renders
-/// green), so we quantize to studio-range 10-bit YUV directly and feed NVENC native P010 — skipping
-/// NVENC's internal RGB→YUV CSC (which runs on the contended SM). One per capture device (rebuilt on
-/// device recreate). The 4:4:4 twin is [`HdrRgb10Converter`].
+/// scRGB FP16 → P010 (BT.2020 PQ, 10-bit studio range) in two shader passes
+/// (full-res luma, half-res chroma). NVIDIA's D3D11 VideoProcessor cannot do
+/// RGB→P010 (renders green). One per capture device; rebuilt on device recreate.
 ///
-/// Plane writes use per-plane render-target views of the single P010 texture: an `R16_UNORM` RTV
-/// selects plane 0 (luma, full WxH), an `R16G16_UNORM` RTV selects plane 1 (chroma, W/2 x H/2). This
-/// planar-RTV mechanism needs a D3D11.3+ runtime + driver support; [`HdrP010Converter::convert`]
-/// surfaces a clear error if `CreateRenderTargetView` rejects the plane format. (There is no runtime
-/// fallback — the error propagates through `try_consume` and ends the session; the "R10 path" the
-/// original design referenced was never kept.)
+/// Plane writes are planar RTVs of one P010 texture: `R16_UNORM` = plane 0
+/// luma, `R16G16_UNORM` = plane 1 chroma. Needs D3D11.3+; a rejected plane
+/// format fails the session — there is no runtime fallback.
 pub(crate) struct HdrP010Converter {
     vs: ID3D11VertexShader,
     ps_y: ID3D11PixelShader,
     ps_uv: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
-    /// Constant buffer for the chroma pass: `inv_src` = (1/srcW, 1/srcH), 16 bytes. IMMUTABLE and
-    /// filled at construction — it depends only on the source size, and the converter is already
-    /// rebuilt whenever the mode changes. It used to be a DYNAMIC buffer that `convert` Mapped,
-    /// wrote and Unmapped on EVERY HDR frame, inside the ring slot's keyed-mutex hold, with the
-    /// `Map`'s failure silently ignored (leaving the pass reading a stale/garbage texel size).
+    /// Chroma-pass `inv_src` = (1/srcW, 1/srcH), 16 bytes. Immutable: source size
+    /// is fixed for this converter, which is already rebuilt on mode change.
     cbuf: ID3D11Buffer,
 }
 
-// The three converters' methods below are SAFE fns. They were `unsafe fn` because their bodies are
-// D3D11 FFI, which is not the same thing as having a caller contract: every parameter is a borrowed
-// windows-rs COM wrapper (`&ID3D11Device`, `&ID3D11DeviceContext`, `&ID3D11Texture2D`, the views) or
-// a plain `u32`/`bool`, each body builds its own descriptors from those, and every created interface
-// owns its reference. There is nothing a caller can pass that makes them unsound, and the proofs the
-// markers carried said exactly that — "`?`-checked D3D11 methods on the live `device` borrow" — which
-// is a description of the body, not an obligation. `unsafe` now marks the FFI inside them, where the
-// blocks and their proofs already were. `compile_shader` KEEPS its marker: it takes `PCSTR`, a raw
-// pointer the caller must guarantee is a NUL-terminated literal.
 impl HdrP010Converter {
-    /// `w`/`h` are the SOURCE dimensions this converter's chroma pass will sample, baked into the
-    /// immutable constant buffer. Rebuild the converter if they change (the IDD capturer's
-    /// `recreate_ring` already drops it).
+    /// `w`/`h` are the source size baked into the immutable chroma constant buffer.
+    /// Rebuild if they change (`recreate_ring` already drops this converter).
     pub(crate) fn new(device: &ID3D11Device, w: u32, h: u32) -> Result<Self> {
         // SAFETY: every call is a `?`-checked D3D11 method on the live `device` borrow, over
         // fully-initialized stack descriptors and live `Option` out-params; `compile_shader` receives
         // `s!()` literals (its contract). Each created COM interface owns its own reference, and no
         // raw pointer outlives the call that produced it.
         unsafe {
-            // Inline the shared HLSL (D3DCompile has no include handler wired here). The two PS sources
-            // carry a `#include_common` marker we substitute before compiling.
+            // D3DCompile has no include handler here; substitute `#include_common`.
             let y_src = HDR_P010_Y_PS.replace("#include_common", HDR_P010_COMMON);
             let uv_src = HDR_P010_UV_PS.replace("#include_common", HDR_P010_COMMON);
             let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
@@ -578,11 +505,8 @@ impl HdrP010Converter {
             let mut ps_uv = None;
             device.CreatePixelShader(&uvb, None, Some(&mut ps_uv))?;
             let sd = D3D11_SAMPLER_DESC {
-                // POINT: the Y pass samples a single texel centre exactly, and the UV pass takes its OWN
-                // two explicit taps on the 2x2 block's LEFT column (left-cositing) and averages them.
-                // Point sampling keeps each tap exact; the averaging is in the shader, not the sampler.
-                // (It was a 4-tap CENTER-sited 2x2 box until that was found to shift chroma by half a
-                // luma pixel — see `HDR_P010_UV_PS`.)
+                // POINT: Y samples one texel centre; UV takes two explicit left-column
+                // taps and averages in the shader. Filtering would blur those taps.
                 Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
                 AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
                 AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -593,8 +517,7 @@ impl HdrP010Converter {
             };
             let mut sampler = None;
             device.CreateSamplerState(&sd, Some(&mut sampler))?;
-            // `inv_src` never changes for a given source size — build the buffer IMMUTABLE with its
-            // contents, so the chroma pass needs no per-frame Map (and has no unchecked failure).
+            // `inv_src` is fixed for this source size; IMMUTABLE so convert never Maps.
             let inv_src: [f32; 4] = [1.0 / w.max(1) as f32, 1.0 / h.max(1) as f32, 0.0, 0.0];
             let cbd = D3D11_BUFFER_DESC {
                 ByteWidth: 16, // float2 inv_src + float2 pad
@@ -620,13 +543,9 @@ impl HdrP010Converter {
         }
     }
 
-    /// Create a per-plane RTV of the P010 texture `dst` with the given single-plane `format`
-    /// (`R16_UNORM` for plane 0 luma, `R16G16_UNORM` for plane 1 chroma). The plane is selected by the
-    /// view format (planar-RTV semantics); MipSlice 0.
-    ///
-    /// Called ONCE PER OUT-RING SLOT by the owner of the P010 textures, not per frame — see
-    /// [`Self::convert`]. Fails when the driver rejects a planar RTV, which is the one hard
-    /// requirement of this whole path (a D3D11.3+ runtime plus driver support).
+    /// Per-plane RTV of P010 `dst`: `R16_UNORM` = plane 0 luma, `R16G16_UNORM` =
+    /// plane 1 chroma (format selects the plane). Once per out-ring slot, not per
+    /// frame. Fails if the driver rejects planar RTVs (D3D11.3+ required).
     pub(crate) fn plane_rtv(
         device: &ID3D11Device,
         dst: &ID3D11Texture2D,
@@ -657,16 +576,10 @@ impl HdrP010Converter {
         }
     }
 
-    /// Convert `src_srv` (FP16 scRGB, WxH) into a `DXGI_FORMAT_P010` texture through the two plane
-    /// RTVs the CALLER built for it ([`Self::plane_rtv`]): full-res luma → `y_rtv` (plane 0),
-    /// half-res chroma → `uv_rtv` (plane 1). `w`/`h` are the full luma dimensions (must be even) and
-    /// must match the `w`/`h` this converter was constructed with.
-    ///
-    /// Takes the views rather than creating them: two `CreateRenderTargetView`s per frame — plus a
-    /// Map/Unmap of a never-changing 16-byte constant buffer — was pure per-frame cost inside the
-    /// ring slot's keyed-mutex hold, i.e. time the DRIVER spent blocked on that slot. Both are
-    /// lifetime-of-mode facts: the views belong to the out-ring slot (built in `ensure_out_ring`),
-    /// the buffer to this converter, which is already rebuilt on every mode change.
+    /// Convert `src_srv` (FP16 scRGB, WxH) into P010 via caller-built plane RTVs
+    /// ([`Self::plane_rtv`]). `w`/`h` are full luma dims (even) and must match
+    /// construction. Views live on the out-ring slot so this path never
+    /// `CreateRenderTargetView`s inside the keyed-mutex hold.
     pub(crate) fn convert(
         &self,
         ctx: &ID3D11DeviceContext,
@@ -680,7 +593,6 @@ impl HdrP010Converter {
         // immediate context) over borrowed slices of fully-initialized locals (the viewports) and
         // clones of the caller's live SRV/RTVs. No raw pointers and no mapping on this path.
         unsafe {
-            // Shared pipeline state.
             ctx.OMSetBlendState(None, None, 0xffff_ffff); // opaque overwrite
             ctx.VSSetShader(&self.vs, None);
             ctx.PSSetShaderResources(0, Some(&[Some(src_srv.clone())]));
@@ -688,7 +600,6 @@ impl HdrP010Converter {
             ctx.IASetInputLayout(None);
             ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-            // --- LUMA pass: full-res, plane 0 ---
             let vp_y = D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -703,7 +614,6 @@ impl HdrP010Converter {
             ctx.Draw(3, 0);
             ctx.OMSetRenderTargets(Some(&[None]), None);
 
-            // --- CHROMA pass: half-res, plane 1 ---
             let vp_uv = D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -718,7 +628,7 @@ impl HdrP010Converter {
             ctx.PSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
             ctx.Draw(3, 0);
 
-            // Unbind for the next frame's re-RTV / NVENC read.
+            // Unbind so the next frame can re-RTV and NVENC can read.
             ctx.OMSetRenderTargets(Some(&[None]), None);
             ctx.PSSetShaderResources(0, Some(&[None]));
             Ok(())
@@ -726,10 +636,9 @@ impl HdrP010Converter {
     }
 }
 
-/// PyroWave LUMA pass PS — full-res, writes Y′ to a separate `R8_UNORM` texture. BT.709 limited from
-/// the 8-bit sRGB (gamma) BGRA slot, BYTE-IDENTICAL to the Linux `rgb2yuv.comp` `lumaY` (so the
-/// wavelet client — whose golden fixtures come from that shader — decodes the same colours). `Load`
-/// (texelFetch) reads the exact source texel: RTV pixel (x,y) → source texel (x,y).
+/// PyroWave luma: full-res Y′ into `R8_UNORM`. BT.709 limited from 8-bit sRGB
+/// BGRA, byte-identical to Linux `rgb2yuv.comp` `lumaY`. `Load` (not Sample)
+/// so RTV pixel (x,y) is source texel (x,y).
 const PYRO_Y_PS: &str = r"
 Texture2D<float4> tx : register(t0);
 float main(float4 pos : SV_POSITION) : SV_TARGET {
@@ -738,10 +647,9 @@ float main(float4 pos : SV_POSITION) : SV_TARGET {
 }
 ";
 
-/// PyroWave CHROMA pass PS — half-res, writes interleaved (Cb,Cr) to a separate `R8G8_UNORM` texture.
-/// **2×2 box average** (centre-sited) of the four luma-block RGB texels, then BT.709 limited Cb/Cr —
-/// BYTE-IDENTICAL to `rgb2yuv.comp` (which averages `(c00+c10+c01+c11)*0.25` then U/V), so the chroma
-/// siting matches the client's decoder. Even dimensions guarantee the 2×2 block is in-bounds.
+/// PyroWave chroma: half-res interleaved CbCr into `R8G8_UNORM`. Centre-sited
+/// 2×2 box, then BT.709 limited Cb/Cr — byte-identical to `rgb2yuv.comp`.
+/// Even dimensions keep the 2×2 block in-bounds.
 const PYRO_UV_PS: &str = r"
 Texture2D<float4> tx : register(t0);
 float2 main(float4 pos : SV_POSITION) : SV_TARGET {
@@ -757,8 +665,7 @@ float2 main(float4 pos : SV_POSITION) : SV_TARGET {
 }
 ";
 
-/// PyroWave 4:4:4 CHROMA pass PS — FULL-res, per-pixel (no box filter, no siting), the Windows twin
-/// of the Linux `rgb2yuv444.comp` chroma math.
+/// PyroWave 4:4:4 chroma: full-res, per-pixel. Windows twin of `rgb2yuv444.comp`.
 const PYRO_UV444_PS: &str = r"
 Texture2D<float4> tx : register(t0);
 float2 main(float4 pos : SV_POSITION) : SV_TARGET {
@@ -769,10 +676,9 @@ float2 main(float4 pos : SV_POSITION) : SV_TARGET {
 }
 ";
 
-/// Shared HLSL for the PyroWave **HDR** passes: scRGB FP16 → PQ-encoded BT.2020 → 10-bit studio
-/// codes MSB-packed into 16-bit UNORM — the SAME colour math as [`HDR_P010_COMMON`] (verified by
-/// `hdr_p010_selftest`), restated over `Load`ed texels so the pyrowave passes stay texel-exact like
-/// their SDR twins. The wavelet client decodes these planes with the same CSC rows as the P010 path.
+/// Shared HDR PyroWave math: scRGB FP16 → PQ BT.2020 → 10-bit studio codes
+/// packed into 16-bit UNORM. Same CSC as [`HDR_P010_COMMON`], over `Load`ed
+/// texels so the passes stay texel-exact like the SDR twins.
 const PYRO_HDR_COMMON: &str = r"
 Texture2D<float4> tx : register(t0);
 static const float3x3 BT709_TO_BT2020 = {
@@ -809,7 +715,7 @@ float2 cbcr_unorm(float3 pq) {
 }
 ";
 
-/// PyroWave HDR LUMA pass PS — full-res, writes PQ Y′ studio codes to an `R16_UNORM` texture.
+/// PyroWave HDR luma: full-res PQ Y′ studio codes into `R16_UNORM`.
 const PYRO_HDR_Y_PS: &str = r"
 #include_common
 float main(float4 pos : SV_POSITION) : SV_TARGET {
@@ -818,9 +724,8 @@ float main(float4 pos : SV_POSITION) : SV_TARGET {
 }
 ";
 
-/// PyroWave HDR 4:2:0 CHROMA pass PS — half-res, centre-sited 2×2 box in scRGB-LINEAR space (the
-/// pyrowave family's siting, matching the SDR pass + `rgb2yuv.comp`, NOT the P010 path's
-/// left-cositing), then PQ + studio Cb/Cr into an `R16G16_UNORM` texture.
+/// PyroWave HDR 4:2:0 chroma: half-res, centre-sited 2×2 in scRGB-linear
+/// (matches SDR + `rgb2yuv.comp`, not the P010 left-cosite), then PQ + studio Cb/Cr.
 const PYRO_HDR_UV_PS: &str = r"
 #include_common
 float2 main(float4 pos : SV_POSITION) : SV_TARGET {
@@ -834,7 +739,7 @@ float2 main(float4 pos : SV_POSITION) : SV_TARGET {
 }
 ";
 
-/// PyroWave HDR 4:4:4 CHROMA pass PS — full-res, per-pixel.
+/// PyroWave HDR 4:4:4 chroma: full-res, per-pixel.
 const PYRO_HDR_UV444_PS: &str = r"
 #include_common
 float2 main(float4 pos : SV_POSITION) : SV_TARGET {
@@ -843,21 +748,19 @@ float2 main(float4 pos : SV_POSITION) : SV_TARGET {
 }
 ";
 
-/// scRGB/BGRA → **separate** YUV planes for the PyroWave wavelet encoder: a full-res Y texture + a
-/// (half- or full-res) interleaved CbCr texture (design/pyrowave-windows-host-zerocopy.md +
-/// design/pyrowave-444-hdr.md). SDR mode reads the BGRA slot and writes BT.709-limited 8-bit planes
-/// (`R8_UNORM`/`R8G8_UNORM`), byte-identical to the Linux `rgb2yuv(444).comp`; HDR mode reads the
-/// scRGB FP16 slot and writes P010-style 10-bit studio codes MSB-packed into 16-bit planes
-/// (`R16_UNORM`/`R16G16_UNORM`), colour math identical to [`HdrP010Converter`]. The wavelet encoder
-/// imports the two SEPARATE textures into its own Vulkan device — the NVIDIA D3D11→Vulkan import of
-/// a single *planar* NV12 texture is unreliable at arbitrary sizes, whereas simple single/
-/// two-component textures import reliably. The caller owns the two textures + their RTVs (shareable,
-/// per out-ring slot); this only records the passes.
+/// BGRA/scRGB → separate Y and interleaved CbCr textures for the PyroWave
+/// wavelet encoder (`design/pyrowave-windows-host-zerocopy.md`,
+/// `design/pyrowave-444-hdr.md`). SDR writes BT.709-limited 8-bit planes;
+/// HDR writes P010-style 10-bit studio codes into 16-bit planes.
+///
+/// Two textures, not one planar NV12: NVIDIA's D3D11→Vulkan import of a
+/// planar NV12 is unreliable at arbitrary sizes. Caller owns the textures
+/// and RTVs (shareable, per out-ring slot).
 pub(crate) struct BgraToYuvPlanes {
     vs: ID3D11VertexShader,
     ps_y: ID3D11PixelShader,
     ps_uv: ID3D11PixelShader,
-    /// Full-res chroma pass (4:4:4) — the chroma viewport skips the /2.
+    /// Full-res chroma (4:4:4): the chroma viewport skips the /2.
     chroma444: bool,
 }
 
@@ -896,9 +799,8 @@ impl BgraToYuvPlanes {
         }
     }
 
-    /// Convert `src_srv` (BGRA slot for SDR / scRGB FP16 slot for HDR, WxH) → `y_rtv` (full-res Y
-    /// texture) + `cbcr_rtv` (half- or full-res CbCr texture per the constructed mode). Two opaque
-    /// passes; `w`/`h` are the full luma dims (even for 4:2:0).
+    /// `src_srv` (BGRA SDR / scRGB FP16 HDR) → `y_rtv` (full-res Y) + `cbcr_rtv`
+    /// (half- or full-res CbCr). `w`/`h` are full luma dims (even for 4:2:0).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn convert(
         &self,
@@ -919,7 +821,6 @@ impl BgraToYuvPlanes {
             ctx.IASetInputLayout(None);
             ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-            // LUMA pass: full-res → the R8 Y texture.
             ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -933,7 +834,6 @@ impl BgraToYuvPlanes {
             ctx.Draw(3, 0);
             ctx.OMSetRenderTargets(Some(&[None]), None);
 
-            // CHROMA pass: half-res (4:2:0) or full-res (4:4:4) → the CbCr texture.
             let (cw, ch) = if self.chroma444 {
                 (w, h)
             } else {
@@ -972,18 +872,14 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_RATIONAL,
 };
 
-/// D3D11 **Video Processor** colour/format converter — runs on the GPU's dedicated VIDEO engine, NOT
-/// the 3D engine, so the per-frame RGB→YUV conversion does not contend with a GPU-saturating game (the
-/// HDR pixel-shader path and NVENC's internal RGB→YUV both use the 3D/compute engine, which an AAA
-/// title pins at ~100%). Output is **always NV12, BT.709 studio-range** — one of NVENC's native YUV
-/// inputs, so it encodes with no further conversion.
+/// D3D11 Video Processor CSC on the dedicated video engine, not the 3D
+/// engine, so RGB→YUV does not contend with a GPU-bound game. Output is
+/// always NV12, BT.709 studio-range — a native NVENC YUV input.
 ///
-/// It does NOT produce P010/BT.2020 PQ: [`VideoConverter::new`] pins the output colour space to
-/// `YCBCR_STUDIO_G22_LEFT_P709` unconditionally, and NVIDIA's video processor cannot do RGB→P010 at
-/// all (it renders green) — the HDR path is [`HdrP010Converter`]'s shader instead. The `scrgb_input`
-/// arm of `new` is likewise the only part of the HDR story here (an FP16 desktop tone-mapped DOWN to
-/// 8-bit BT.709), and it currently has no caller: `idd_push::ensure_converter` builds this converter
-/// only on the SDR/BGRA path and always passes `false`.
+/// Does not produce P010/BT.2020: `new` pins
+/// `YCBCR_STUDIO_G22_LEFT_P709`, and NVIDIA's processor cannot RGB→P010
+/// (renders green). `scrgb_input` tone-maps FP16 down to 8-bit BT.709;
+/// `idd_push::ensure_converter` currently always passes `false`.
 pub(crate) struct VideoConverter {
     vdev: ID3D11VideoDevice,
     vctx: ID3D11VideoContext1,
@@ -992,11 +888,8 @@ pub(crate) struct VideoConverter {
 }
 
 impl VideoConverter {
-    /// A BGRA/FP16-RGB → **NV12 (BT.709 limited SDR)** video-engine converter. `scrgb_input` picks
-    /// the input colour space: `false` = 8-bit sRGB `BGRA` (the SDR ring); `true` = FP16 scRGB
-    /// linear (the HDR ring, used by a PyroWave session that tone-maps the HDR desktop down to the
-    /// 8-bit wavelet stream). The output is always studio-range BT.709 NV12 — the P010/BT.2020 HDR
-    /// path is [`HdrP010Converter`]'s job, never this one.
+    /// BGRA/FP16-RGB → NV12 (BT.709 limited SDR) on the video engine.
+    /// `scrgb_input`: `false` = 8-bit sRGB BGRA, `true` = FP16 scRGB linear.
     pub(crate) fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
@@ -1034,9 +927,8 @@ impl VideoConverter {
                 .CreateVideoProcessor(&enumr, 0)
                 .context("CreateVideoProcessor")?;
 
-            // Full-range RGB in → studio-range BT.709 NV12 out. Input gamma follows the ring format:
-            // scRGB linear (G10) for the FP16 HDR ring, sRGB (G22) for the 8-bit BGRA SDR ring. The
-            // output is always BT.709 SDR (the video processor tone-maps the scRGB case).
+            // Full-range RGB in → studio BT.709 NV12 out. G10 = FP16 scRGB ring,
+            // G22 = 8-bit BGRA ring. Output is always BT.709 SDR (tone-maps scRGB).
             let in_cs = if scrgb_input {
                 DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
             } else {
@@ -1045,13 +937,10 @@ impl VideoConverter {
             let out_cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
             vctx.VideoProcessorSetStreamColorSpace1(&vp, 0, in_cs);
             vctx.VideoProcessorSetOutputColorSpace1(&vp, out_cs);
-            // Progressive: one frame in, one frame out — no deinterlace, no frame-rate conversion.
+            // Progressive: one frame in, one out — no deinterlace, no frame-rate convert.
             vctx.VideoProcessorSetStreamFrameFormat(&vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-            // …and no vendor "auto processing" either. Its documented DEFAULT is ENABLED, so until
-            // now the comment above claimed something only this call delivers: denoise, edge
-            // enhancement and whatever else the driver folds in were free to run inside every SDR
-            // `VideoProcessorBlt` — on the desktop-capture hot path, altering the pixels we encode
-            // and costing video-engine time nobody asked for.
+            // Default auto-processing is ENABLED: denoise / edge enhance would
+            // rewrite desktop pixels on every Blt. Force it off.
             vctx.VideoProcessorSetStreamAutoProcessingMode(&vp, 0, false);
 
             Ok(Self {
@@ -1063,9 +952,9 @@ impl VideoConverter {
         }
     }
 
-    /// Convert `input` (BGRA, or scRGB FP16 for a converter built with `scrgb_input`) → `output`
-    /// (NV12, BT.709 studio-range — see the type doc: never P010) on the video engine. Views are
-    /// created per call (cheap relative to the Blt) so the input texture can vary frame to frame.
+    /// `input` (BGRA, or scRGB FP16 if built with `scrgb_input`) → `output`
+    /// (NV12, BT.709 studio — never P010). Views are per call so the input
+    /// texture can vary frame to frame.
     pub(crate) fn convert(&self, input: &ID3D11Texture2D, output: &ID3D11Texture2D) -> Result<()> {
         // SAFETY: both view creations are `?`-checked calls on `self.vdev` with fully-initialized
         // stack descriptors and live out-params. `stream.pInputSurface` is a `ManuallyDrop` of the
@@ -1108,10 +997,8 @@ impl VideoConverter {
             let blt =
                 self.vctx
                     .VideoProcessorBlt(&self.vp, &out_view, 0, std::slice::from_ref(&stream));
-            // COM in-params never transfer ownership: the Blt only borrowed the input view, and the
-            // struct's `ManuallyDrop` field suppressed its release — drop it by hand, success or not.
-            // (Skipping this leaked one view + its UMD allocation PER CONVERTED FRAME — the SDR hot
-            // path; D3D11 defers the actual destruction until the GPU is done with the blit.)
+            // Blt only borrows the input view; `ManuallyDrop` suppressed Drop.
+            // Release once on both paths — skipping this leaked one view per frame.
             drop(std::mem::ManuallyDrop::into_inner(stream.pInputSurface));
             blt.context("VideoProcessorBlt")
         }

@@ -1,70 +1,54 @@
 //! Borrowed-device wrap: the presenter's live Vulkan handles loaded into ash
 //! function tables, plus the queue-lock contract every queue submission runs under.
 //!
-//! Ownership: everything in [`DeviceHandles`] is BORROWED. This crate never creates
-//! and never destroys the instance/device — [`DecodeDevice`]'s ash wrappers are
-//! function tables over foreign handles, and dropping them destroys nothing. The
-//! objects this crate does create (sessions, images, buffers, pools) are destroyed
-//! by their owning structs' `Drop` impls, all of which must run before the borrowed
-//! device dies — the same liveness contract FFmpeg's decoder had over the identical
-//! handle bundle (`pf-client-core`'s `VulkanDecodeDevice`), now written down.
+//! Everything in [`DeviceHandles`] is BORROWED. This crate never creates or
+//! destroys the instance/device — [`DecodeDevice`]'s ash wrappers are function
+//! tables over foreign handles, and dropping them destroys nothing. Objects this
+//! crate does create (sessions, images, buffers, pools) are destroyed by their
+//! owning structs' `Drop` impls, which must run before the borrowed device dies.
 
 use ash::vk;
 use ash::vk::Handle;
 
-/// The borrowed handles of the presenter's decode-capable device, as raw integers so
-/// the type stays FFI-plain (mirrors `pf-client-core`'s `VulkanDecodeDevice`, which
-/// adapts into this in WP-C — pf-vkdecode deliberately does not depend on it).
+/// Presenter's decode-capable device as raw integers so the type stays FFI-plain.
+/// Same shape as `pf-client-core`'s `VulkanDecodeDevice`; this crate does not
+/// depend on it.
 ///
 /// Caller contract (checked where cheap, otherwise trusted):
-/// - All four handles are live, and stay live for the lifetime of every object this
-///   crate builds from them (the presenter outlives every session pump).
-/// - The instance/device were created with the Vulkan Video decode stack enabled:
-///   `VK_KHR_video_queue`, `VK_KHR_video_decode_queue`, and the per-codec extension
-///   of every decoder that will be built on the bundle
-///   (`VK_KHR_video_decode_h264` for [`crate::VkH264Decoder`],
-///   `VK_KHR_video_decode_h265` for [`crate::VkH265Decoder`]), plus the
-///   `synchronization2` and `timelineSemaphore` features (the presenter's device
-///   meets all of this when it advertises `video_decode`).
-/// - `decode_qf`/`decode_queue_index` name a queue with `VIDEO_DECODE_KHR` ops.
-///   Which CODEC operations that family advertises is not trusted but READ
-///   ([`DecodeDevice::decode_codec_ops`]) and each decoder refuses up front when
-///   its own is missing — a physical-device caps query answers for hardware
-///   regardless of which extensions the device was created with, so this is the
-///   only thing standing between a wrong bundle and `vkCreateVideoSessionKHR` on
-///   an unenabled codec. `graphics_qf` is the family the presenter samples on
-///   (image sharing crosses the two when they differ).
+/// - All four handles stay live for every object this crate builds from them.
+/// - The instance/device were created with `VK_KHR_video_queue`,
+///   `VK_KHR_video_decode_queue`, the per-codec decode extension of every decoder
+///   built on the bundle, plus `synchronization2` and `timelineSemaphore`.
+/// - `decode_qf`/`decode_queue_index` name a `VIDEO_DECODE_KHR` queue. Codec
+///   operations are READ ([`DecodeDevice::decode_codec_ops`]), not trusted:
+///   a physical-device caps query answers for hardware even when the device was
+///   created without that codec's extension. `graphics_qf` is the family the
+///   presenter samples on (image sharing crosses the two when they differ).
 #[derive(Debug, Clone)]
 pub struct DeviceHandles {
-    /// `PFN_vkGetInstanceProcAddr` from the loader; everything else is resolved
-    /// through it.
+    /// Loader `PFN_vkGetInstanceProcAddr`; every other entry is resolved through it.
     pub get_instance_proc_addr: usize,
     pub instance: usize,
     pub physical_device: usize,
     pub device: usize,
-    /// The video-decode queue family.
     pub decode_qf: u32,
-    /// Queue index within `decode_qf` this decoder submits on.
     pub decode_queue_index: u32,
-    /// The presenter's graphics+present family (the other side of image sharing).
+    /// Presenter's graphics+present family — the other side of image sharing.
     pub graphics_qf: u32,
 }
 
-/// External synchronization for `vkQueueSubmit`: the caller supplies the lock that
-/// serializes EVERY submit on the shared device — in WP-C that is pf-client-core's
-/// `QueueLock`, the same object the presenter holds around its own submits/presents
-/// (the 2026-07-09 `VK_ERROR_DEVICE_LOST` race is why this is a first-class contract
-/// and not an afterthought). Tests use [`NoopQueueLock`].
+/// Serializes every `vkQueueSubmit` on the shared device. The caller supplies
+/// the same lock the presenter holds around its own submits/presents; a race
+/// here is `VK_ERROR_DEVICE_LOST`. Tests use [`NoopQueueLock`].
 ///
-/// `lock` blocks until the queue is free and takes it; `unlock` releases it. Use
-/// [`QueueSubmitGuard`] rather than calling the pair by hand.
+/// Use [`QueueSubmitGuard`] rather than calling `lock`/`unlock` by hand.
 pub trait QueueLock {
     fn lock(&self);
     fn unlock(&self);
 }
 
-/// A [`QueueLock`] that guards nothing — for tests and for callers whose decode
-/// queue is provably not shared with any other submitter.
+/// A [`QueueLock`] that guards nothing. Tests, or a decode queue no other
+/// submitter shares.
 #[derive(Debug, Default)]
 pub struct NoopQueueLock;
 
@@ -73,15 +57,13 @@ impl QueueLock for NoopQueueLock {
     fn unlock(&self) {}
 }
 
-/// RAII scope over a [`QueueLock`]: acquired for exactly the duration of a queue
-/// submission, released on drop (including unwinds — though this crate's own paths
-/// never panic while holding it).
+/// Holds a [`QueueLock`] for one queue submission; released on drop, including
+/// unwind.
 pub struct QueueSubmitGuard<'a> {
     lock: &'a dyn QueueLock,
 }
 
 impl<'a> QueueSubmitGuard<'a> {
-    /// Take the queue (blocking until free).
     pub fn acquire(lock: &'a dyn QueueLock) -> Self {
         lock.lock();
         Self { lock }
@@ -95,34 +77,25 @@ impl Drop for QueueSubmitGuard<'_> {
 }
 
 /// A [`DeviceHandles`] bundle that cannot host the decoder being built. Caller
-/// bugs (a half-filled bundle) and device gaps (a decode family that does not run
-/// this codec) — never stream conditions.
+/// bugs and device gaps — never stream conditions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceError {
-    /// One of the four raw handles is zero/null.
     NullHandle(&'static str),
-    /// The decode queue family advertises no decode operation for the codec the
-    /// decoder needs — either the device was created without that codec's
-    /// extension, or `decode_qf` names the wrong family. Refusing here is what
-    /// keeps `vkCreateVideoSessionKHR` from being called with a profile the
-    /// device never enabled (the caps query alone would not catch it: it asks the
-    /// PHYSICAL device, which answers for the hardware).
+    /// Decode family advertises no op for this codec: extension missing at
+    /// device create, or `decode_qf` is the wrong family. Caps queries ask the
+    /// PHYSICAL device and would still green-light an unenabled codec.
     NoCodecOperation {
         family: u32,
-        /// The codec, spelled the way the caller would recognize it
-        /// (`"H.264 decode"` / `"H.265 decode"`).
+        /// Codec name as the caller would write it (`"H.264 decode"`).
         wanted: &'static str,
     },
 }
 
-/// A device allocation that cannot proceed. Wraps the raw Vulkan failure OR the
-/// memory-type miss that used to be silently papered over with index 0 — a wrong
-/// type index is at best an immediate validation error and at worst a mapping of
-/// the wrong heap, so a miss is an ERROR here, never a fallback.
+/// Device allocation failure. A memory-type miss is an error, never a fallback
+/// to index 0 — a wrong type maps the wrong heap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AllocError {
     Vk(vk::Result),
-    /// No memory type satisfies (`type_bits`, `flags`) on this device.
     NoMemoryType {
         type_bits: u32,
         flags: vk::MemoryPropertyFlags,
@@ -135,9 +108,8 @@ impl From<vk::Result> for AllocError {
     }
 }
 
-/// First memory type matching `bits` and `want` — an [`AllocError::NoMemoryType`]
-/// when none does (the encoder's `find_mem` falls back to 0 there; here the miss
-/// surfaces).
+/// First memory type matching `bits` and `want`. [`AllocError::NoMemoryType`]
+/// when none does — never index 0.
 pub(crate) fn find_memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     bits: u32,
@@ -154,15 +126,12 @@ pub(crate) fn find_memory_type(
     })
 }
 
-/// First memory type matching `bits` that also carries `prefer`; when none does,
-/// the first type matching `bits` at all. A driver constrains `memoryTypeBits` to
-/// where the allocation can legally live — NVIDIA (610.88) reports some video-
-/// session bindings host-visible-ONLY, which is spec-legal, so a hard `prefer`
-/// requirement there is unsatisfiable by construction. Still an
-/// [`AllocError::NoMemoryType`] when `bits` selects nothing whatsoever (that
-/// miss-is-error contract stays; only the property preference softens). Mapped
-/// staging paths (the bitstream ring) must NOT use this: they require
-/// `HOST_VISIBLE|HOST_COHERENT` as a hard property, not a preference.
+/// First type matching `bits` that also carries `prefer`; else the first type
+/// matching `bits` at all. Drivers may constrain `memoryTypeBits` to a heap that
+/// lacks `prefer` (spec-legal for some video-session bindings), so a hard
+/// `prefer` is unsatisfiable by construction. Still [`AllocError::NoMemoryType`]
+/// when `bits` selects nothing. Mapped staging (bitstream ring) must not use
+/// this: it needs `HOST_VISIBLE|HOST_COHERENT` as a hard property.
 pub(crate) fn find_memory_type_preferring(
     props: &vk::PhysicalDeviceMemoryProperties,
     bits: u32,
@@ -193,11 +162,8 @@ impl std::fmt::Display for DeviceError {
 
 impl std::error::Error for DeviceError {}
 
-/// The borrowed device with ash function tables loaded: the object every other
-/// module in this crate makes its Vulkan calls through.
-///
-/// Clone is cheap-ish (ash tables are plain structs of function pointers) and safe:
-/// clones share the same borrowed handles under the same liveness contract.
+/// Borrowed device with ash tables loaded. Clone is cheap (function-pointer
+/// structs) and shares the same borrowed handles under the same liveness contract.
 #[derive(Clone)]
 pub struct DecodeDevice {
     instance: ash::Instance,
@@ -209,29 +175,15 @@ pub struct DecodeDevice {
     decode_queue: vk::Queue,
     decode_qf: u32,
     graphics_qf: u32,
-    /// The decode family advertises `queryResultStatusSupport`: per-op
-    /// RESULT_STATUS queries are legal in its video coding scopes. FALSE on RADV
-    /// (2026-08, .25: recording one anyway hangs the VCN ring) — the decoder
-    /// must skip queries entirely there and fall back to timeline-completion
-    /// verdicts.
+    /// Decode family advertises `queryResultStatusSupport`. FALSE means skip
+    /// RESULT_STATUS queries entirely — recording one hangs the VCN ring (RADV);
+    /// fall back to timeline-completion verdicts.
     result_status_queries: bool,
-    /// `VkQueueFamilyVideoPropertiesKHR::videoCodecOperations` of the decode
-    /// family — which codecs this queue can actually run decode ops for.
-    ///
-    /// Read from the SAME `vkGetPhysicalDeviceQueueFamilyProperties2` call as the
-    /// status-query support (one extra chained struct, no extra round trip). It
-    /// is the only honest answer to "may I create a DECODE_H265 session here?":
+    /// Decode family's `VkQueueFamilyVideoPropertiesKHR::videoCodecOperations`.
     /// `vkGetPhysicalDeviceVideoCapabilitiesKHR` is a PHYSICAL-device query and
-    /// succeeds on capable hardware whether or not the VkDevice was created with
-    /// `VK_KHR_video_decode_h265` enabled, so caps derivation alone would happily
-    /// lead into `vkCreateVideoSessionKHR` on an unenabled codec — undefined
-    /// behaviour instead of a clean demote to the next decoder rung.
-    ///
-    /// Empty (no bits) is treated as "this family decodes nothing" and refuses.
-    /// That is safe to rely on because every driver hosting Vulkan Video fills
-    /// this struct — it is how applications pick a decode queue in the first
-    /// place (FFmpeg's own `vulkan_video.c` selects its family by exactly this
-    /// field, on the very drivers the shipping FFmpeg-Vulkan rung runs on).
+    /// succeeds whether or not the VkDevice enabled that codec's extension, so
+    /// caps alone would walk into `vkCreateVideoSessionKHR` on an unenabled
+    /// codec. Empty bits: this family decodes nothing; the decoder refuses.
     decode_codec_ops: vk::VideoCodecOperationFlagsKHR,
 }
 
@@ -298,11 +250,8 @@ impl DecodeDevice {
         let decode_queue =
             unsafe { device.get_device_queue(handles.decode_qf, handles.decode_queue_index) };
 
-        // The two per-family video facts, from ONE query: whether RESULT_STATUS
-        // queries are legal here, and which codec operations this family can run
-        // (struct field docs for both). An out-of-range decode family — a bundle
-        // naming a queue this physical device does not have — answers "no" to
-        // both, and the codec check then refuses the decoder outright.
+        // One query fills both per-family facts. An out-of-range decode family
+        // answers no to both; the codec check then refuses the decoder.
         let physical_device = vk::PhysicalDevice::from_raw(handles.physical_device as u64);
         // SAFETY: live physical device (caller contract); the two-call form fills
         // the chained per-family structs.
@@ -338,8 +287,7 @@ impl DecodeDevice {
             (false, vk::VideoCodecOperationFlagsKHR::NONE)
         };
 
-        // `entry` is only the ladder the tables above were loaded through; nothing
-        // needs it afterwards (ash tables own their function pointers).
+        // `entry` was only the load ladder; ash tables own their function pointers.
         drop(entry);
 
         Ok(Self {
@@ -361,24 +309,17 @@ impl DecodeDevice {
         &self.device
     }
 
-    /// Whether the decode family supports per-op RESULT_STATUS queries (struct
-    /// field docs — FALSE on RADV, where recording one hangs the VCN).
     pub(crate) fn result_status_queries(&self) -> bool {
         self.result_status_queries
     }
 
-    /// The codec operations the decode family advertises (struct field docs).
     pub fn decode_codec_ops(&self) -> vk::VideoCodecOperationFlagsKHR {
         self.decode_codec_ops
     }
 
-    /// Refuse unless the decode family advertises `op`.
-    ///
-    /// The decoders' first act, before any caps query: a physical-device caps
-    /// query answers for the HARDWARE and would happily green-light a codec the
-    /// VkDevice never enabled the extension for, at which point
-    /// `vkCreateVideoSessionKHR` is undefined behaviour. This turns that into the
-    /// ladder's clean, named demote.
+    /// Refuse unless the decode family advertises `op`. Call before any caps
+    /// query: those answer for the hardware and would green-light a codec the
+    /// VkDevice never enabled.
     pub(crate) fn require_codec_op(
         &self,
         op: vk::VideoCodecOperationFlagsKHR,
@@ -418,10 +359,9 @@ impl DecodeDevice {
         self.decode_qf
     }
 
-    /// The queue families image sharing spans: empty (EXCLUSIVE) when decode and
-    /// graphics are one family, both otherwise (CONCURRENT — the presenter samples
-    /// decode output on its own family and per-frame ownership transfers would buy
-    /// latency for nothing at punktfunk's frame rates).
+    /// Families image sharing spans: empty (EXCLUSIVE) when decode and graphics
+    /// are one family, both otherwise (CONCURRENT). Per-frame ownership transfers
+    /// would add latency for nothing at these frame rates.
     pub(crate) fn sharing_families(&self) -> Vec<u32> {
         if self.decode_qf == self.graphics_qf {
             Vec::new()
@@ -430,7 +370,7 @@ impl DecodeDevice {
         }
     }
 
-    /// The device's memory properties (queried fresh; cheap and stateless).
+    /// Device memory properties, queried fresh (cheap, stateless).
     pub(crate) fn memory_properties(&self) -> vk::PhysicalDeviceMemoryProperties {
         // SAFETY: `physical_device` is live per the DeviceHandles contract; the call
         // fills a plain struct and touches nothing else.
@@ -485,7 +425,6 @@ mod tests {
         props.memory_types[1].property_flags =
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-        // A hit resolves to the matching index, not the first.
         assert_eq!(
             find_memory_type(
                 &props,
@@ -494,7 +433,6 @@ mod tests {
             ),
             Ok(1)
         );
-        // A type excluded by the requirement bits does not count as a hit.
         assert_eq!(
             find_memory_type(&props, 0b01, vk::MemoryPropertyFlags::HOST_VISIBLE),
             Err(AllocError::NoMemoryType {
@@ -502,7 +440,6 @@ mod tests {
                 flags: vk::MemoryPropertyFlags::HOST_VISIBLE
             })
         );
-        // Flags nothing advertises: an error carrying the miss, never index 0.
         assert_eq!(
             find_memory_type(&props, 0b11, vk::MemoryPropertyFlags::PROTECTED),
             Err(AllocError::NoMemoryType {
@@ -525,18 +462,15 @@ mod tests {
         props.memory_types[3].property_flags =
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-        // The preferred property wins over a lower-indexed non-preferred type.
         assert_eq!(
             find_memory_type_preferring(&props, 0b0011, vk::MemoryPropertyFlags::DEVICE_LOCAL),
             Ok(1)
         );
-        // The NVIDIA session-binding shape: `memoryTypeBits` names only a
-        // host-visible type — honor the bits instead of erroring.
+        // `memoryTypeBits` names only a host-visible type: honor the bits.
         assert_eq!(
             find_memory_type_preferring(&props, 0b1000, vk::MemoryPropertyFlags::DEVICE_LOCAL),
             Ok(3)
         );
-        // Bits selecting nothing remain a hard miss, never index 0.
         assert_eq!(
             find_memory_type_preferring(&props, 0b0000, vk::MemoryPropertyFlags::DEVICE_LOCAL),
             Err(AllocError::NoMemoryType {

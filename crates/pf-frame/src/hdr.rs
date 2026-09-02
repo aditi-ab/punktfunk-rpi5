@@ -1,30 +1,30 @@
-//! Pure HDR static-metadata helpers shared by the capture (source mastering metadata) and encode
-//! (in-band SEI) paths — kept platform-independent and unit-tested here so the byte-level logic is
-//! verified on every target, even though the only *callers* of the SEI builders are the Windows
-//! NVENC path (`encode/nvenc.rs`) and of the display conversion the Windows DXGI/WGC capturers.
+//! HDR10 static-metadata helpers shared by capture (source mastering) and encode
+//! (in-band SEI). Platform-independent so the byte-level logic is unit-tested on
+//! every target.
 //!
-//! Units follow the HDR10 standards so the values pass straight through:
-//! - chromaticities in 1/50000 increments (SMPTE ST.2086 / DXGI `DXGI_HDR_METADATA_HDR10`),
+//! Units follow HDR10 so values pass through:
+//! - chromaticities in 1/50000 (SMPTE ST.2086 / `DXGI_HDR_METADATA_HDR10`),
 //! - mastering luminance in 0.0001 cd/m²,
-//! - content light level (MaxCLL/MaxFALL) in cd/m² (nits).
+//! - MaxCLL/MaxFALL in cd/m² (nits).
+//!
+//! SEI builders are consumed by the Windows NVENC path; display conversion by
+//! the Windows DXGI/WGC capturers.
 
 use punktfunk_core::quic::HdrMeta;
 
-/// HEVC/H.264 SEI payload type for `mastering_display_colour_volume` (SMPTE ST.2086). Same code
-/// point in AVC and HEVC.
+/// HEVC/H.264 SEI payload type `mastering_display_colour_volume` (ST.2086). Same
+/// code point in AVC and HEVC.
 pub const SEI_TYPE_MASTERING_DISPLAY_COLOUR_VOLUME: u32 = 137;
-/// HEVC/H.264 SEI payload type for `content_light_level_info` (CEA-861.3 MaxCLL/MaxFALL).
+/// HEVC/H.264 SEI payload type `content_light_level_info` (CEA-861.3).
 pub const SEI_TYPE_CONTENT_LIGHT_LEVEL_INFO: u32 = 144;
 
-/// Quantize a CIE xy chromaticity coordinate (0.0..=1.0) to ST.2086 1/50000 units.
 fn xy_to_2086(v: f32) -> u16 {
     (v * 50000.0).round().clamp(0.0, 65535.0) as u16
 }
 
-/// Build an [`HdrMeta`] from a source display's measured colour volume — the chromaticities (CIE xy)
-/// and luminances (cd/m²) reported by e.g. Windows `IDXGIOutput6::GetDesc1`. `max_cll`/`max_fall`
-/// are content light levels in nits; pass `0` when unknown (GetDesc1 doesn't expose them — Apollo
-/// zeroes them too, and a `0` lets the display fall back to the mastering luminance).
+/// Build [`HdrMeta`] from a source display's measured colour volume (CIE xy,
+/// cd/m²). `max_cll`/`max_fall` are nits; pass `0` when unknown — GetDesc1 does
+/// not expose them, and `0` lets the display fall back to mastering luminance.
 #[allow(clippy::too_many_arguments)]
 pub fn hdr_meta_from_display(
     red: (f32, f32),
@@ -51,11 +51,11 @@ pub fn hdr_meta_from_display(
     }
 }
 
-/// Convert an [`HdrMeta`] display volume into the pf-vdisplay `AddRequest` luminance fields —
-/// `(max nits, max frame-average nits, min MILLI-nits)` — which the driver codes into the virtual
-/// monitor's EDID CTA-861.3 HDR block. Pure unit conversion: mastering luminance is 0.0001 cd/m²
-/// (so nits = /10 000, milli-nits = /10); MaxFALL is already nits and doubles as the display's
-/// frame-average ceiling.
+/// [`HdrMeta`] volume → pf-vdisplay `AddRequest` luminance:
+/// `(max nits, max frame-average nits, min milli-nits)`.
+///
+/// Mastering luminance is 0.0001 cd/m² (nits = /10_000, milli-nits = /10).
+/// MaxFALL is already nits and is the display's frame-average ceiling.
 pub fn vdisplay_luminance_fields(m: &HdrMeta) -> (u32, u32, u32) {
     (
         m.max_display_mastering_luminance / 10_000,
@@ -64,9 +64,7 @@ pub fn vdisplay_luminance_fields(m: &HdrMeta) -> (u32, u32, u32) {
     )
 }
 
-/// A generic HDR10 default (BT.2020 primaries, D65 white, 1000-nit mastering, MaxCLL 1000 /
-/// MaxFALL 400) — the baseline a host sends until it reads the source display's real mastering
-/// metadata, and the values clients used to hardcode.
+/// BT.2020 / D65 / 1000-nit HDR10 default until the source display is read.
 pub fn generic_hdr10() -> HdrMeta {
     HdrMeta {
         display_primaries: [[8500, 39850], [6550, 2300], [35400, 14600]], // BT.2020 G, B, R
@@ -78,10 +76,8 @@ pub fn generic_hdr10() -> HdrMeta {
     }
 }
 
-/// The `mastering_display_colour_volume` SEI payload (HEVC/H.264 type
-/// [`SEI_TYPE_MASTERING_DISPLAY_COLOUR_VOLUME`]) — 24 bytes, big-endian (SEI RBSP order), in G/B/R
-/// primary order per ST.2086. Pass this raw payload to NVENC's `NV_ENC_SEI_PAYLOAD` (NVENC wraps it
-/// in the SEI NAL).
+/// `mastering_display_colour_volume` SEI payload: 24 bytes, big-endian, G/B/R
+/// per ST.2086. Pass the raw bytes to NVENC `NV_ENC_SEI_PAYLOAD`.
 pub fn hevc_mastering_display_sei(m: &HdrMeta) -> [u8; 24] {
     let mut b = [0u8; 24];
     let mut o = 0;
@@ -105,8 +101,7 @@ pub fn hevc_mastering_display_sei(m: &HdrMeta) -> [u8; 24] {
     b
 }
 
-/// The `content_light_level_info` SEI payload (HEVC/H.264 type
-/// [`SEI_TYPE_CONTENT_LIGHT_LEVEL_INFO`]) — 4 bytes, big-endian: MaxCLL then MaxFALL.
+/// `content_light_level_info` SEI payload: 4 bytes, big-endian, MaxCLL then MaxFALL.
 pub fn hevc_content_light_level_sei(m: &HdrMeta) -> [u8; 4] {
     let mut b = [0u8; 4];
     b[0..2].copy_from_slice(&m.max_cll.to_be_bytes());
@@ -120,7 +115,6 @@ mod tests {
 
     #[test]
     fn display_conversion_bt2020_1000nit() {
-        // BT.2020 primaries + D65 white, a 1000-nit / 0.0001-nit mastering display.
         let m = hdr_meta_from_display(
             (0.708, 0.292),   // red
             (0.170, 0.797),   // green
@@ -147,13 +141,13 @@ mod tests {
         let m = generic_hdr10();
         let p = hevc_mastering_display_sei(&m);
         assert_eq!(p.len(), 24);
-        // First field = green.x = 8500 = 0x2134, big-endian.
+        // First field = green.x (ST.2086 G/B/R), big-endian.
         assert_eq!(&p[0..2], &8500u16.to_be_bytes());
-        assert_eq!(&p[2..4], &39850u16.to_be_bytes()); // green.y
-        assert_eq!(&p[4..6], &6550u16.to_be_bytes()); // blue.x
-        assert_eq!(&p[12..14], &15635u16.to_be_bytes()); // white.x
-        assert_eq!(&p[16..20], &10_000_000u32.to_be_bytes()); // max lum
-        assert_eq!(&p[20..24], &1u32.to_be_bytes()); // min lum
+        assert_eq!(&p[2..4], &39850u16.to_be_bytes());
+        assert_eq!(&p[4..6], &6550u16.to_be_bytes());
+        assert_eq!(&p[12..14], &15635u16.to_be_bytes());
+        assert_eq!(&p[16..20], &10_000_000u32.to_be_bytes());
+        assert_eq!(&p[20..24], &1u32.to_be_bytes());
     }
 
     #[test]
@@ -165,8 +159,7 @@ mod tests {
 
     #[test]
     fn vdisplay_luminance_fields_convert_units() {
-        // An 800-nit / 0.05-nit panel with a 400-nit frame-average ceiling: the AddRequest fields
-        // come out as whole nits / nits / MILLI-nits.
+        // 800 nits / 0.05 nits / 400 MaxFALL → (nits, nits, milli-nits).
         let m = hdr_meta_from_display(
             (0.680, 0.320),
             (0.265, 0.690),
@@ -178,7 +171,7 @@ mod tests {
             400,
         );
         assert_eq!(vdisplay_luminance_fields(&m), (800, 400, 50));
-        // The all-zero (unknown) volume stays all-zero — the driver keeps its EDID defaults.
+        // Unknown (all-zero) volume stays all-zero; the driver keeps EDID defaults.
         assert_eq!(vdisplay_luminance_fields(&HdrMeta::default()), (0, 0, 0));
     }
 

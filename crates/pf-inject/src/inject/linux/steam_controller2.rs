@@ -1,22 +1,14 @@
-//! Virtual **Steam Controller 2** (Triton) via UHID — the as-is passthrough backend
-//! ([`GamepadPref::SteamController2`](punktfunk_core::config::GamepadPref)). The
-//! transport-independent contract (descriptor, report ids, the typed fallback serializer, the
-//! rumble parser) lives in [`super::triton_proto`]; this module is the `/dev/uhid` plumbing.
+//! Virtual Steam Controller 2 (Triton) over `/dev/uhid` — as-is passthrough for
+//! [`GamepadPref::SteamController2`](punktfunk_core::config::GamepadPref). Descriptor,
+//! report ids, typed fallback, rumble parser: [`super::triton_proto`].
 //!
-//! Deltas vs the Deck backend ([`super::steam_controller`]):
+//! Mainline `hid-steam` does not bind `28DE:1302`, so the node is `hid-generic` hidraw
+//! with no evdev. Steam Input over hidraw is the only consumer; `gamepad_mode` does
+//! not apply. [`RichInput::HidReport`](punktfunk_core::quic::RichInput) is written
+//! unchanged; Steam SET_REPORT / OUTPUT writes are acked and queued for the physical pad.
 //!
-//! 1. **No kernel driver.** Mainline `hid-steam` doesn't bind `28DE:1302`, so the device gets
-//!    `hid-generic` + a hidraw node and NO evdev — Steam Input (hidapi over hidraw) is the only
-//!    consumer, exactly as it is for the physical pad. No `gamepad_mode` machinery applies.
-//! 2. **Raw mirroring.** Input reports arrive verbatim from the client
-//!    ([`RichInput::HidReport`](punktfunk_core::quic::RichInput)) and are written unchanged;
-//!    everything Steam writes back (SET_REPORT features, OUTPUT haptics) is acked and forwarded
-//!    raw for replay on the physical controller.
-//! 3. **usbip first, UHID fallback.** Steam ignores UHID devices (`Interface: -1`) for the
-//!    Triton exactly as it did for the Deck — CONFIRMED on-glass 2026-07-15 — so the preferred
-//!    transport is [`super::triton_usbip`] (`vhci_hcd`), which presents a real USB device
-//!    byte-matched to the physical wired pad's captured descriptors. UHID remains the degraded
-//!    fallback (hidraw exists, Steam won't list it) for hosts without `vhci_hcd`/root.
+//! Steam ignores UHID (`Interface: -1`). Preferred transport is
+//! [`super::triton_usbip`] (`vhci_hcd`); this module is the fallback when that is missing.
 
 use super::triton_proto::{
     parse_triton_rumble, serialize_triton_state, strip_report_prefix, triton_feature_reply,
@@ -35,18 +27,18 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 
-/// A virtual Steam Controller 2 backed by `/dev/uhid`. Dropping it destroys the device.
+/// `/dev/uhid` Triton pad. Drop issues `UHID_DESTROY`.
 pub struct TritonPad {
     fd: File,
-    /// Synth-mode sequence counter (the raw path carries the physical pad's own seq).
+    /// Synth-mode sequence; the raw path carries the physical pad's own seq.
     seq: u8,
-    /// Raw reports Steam wrote since the last service pass, kind-tagged for the 0xCD plane.
+    /// Steam writes since the last service pass, kind-tagged for the 0xCD plane.
     pending_raw: Vec<(u8, Vec<u8>)>,
-    /// The last feature SET_REPORT (id-first) — the query half of the Valve GET dance.
+    /// Last feature SET_REPORT (id-first) — the query half of the Valve GET dance.
     last_set: Vec<u8>,
     serial: String,
     unit_id: u32,
-    /// Last GET query command logged, so the tester-facing log line fires once per distinct cmd.
+    /// Last GET command logged, so the tester line fires once per distinct cmd.
     last_get_logged: u8,
 }
 
@@ -76,29 +68,28 @@ impl TritonPad {
     fn send_create2(&mut self, index: u8) -> Result<()> {
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
-        // The physical pad's USB product string is "Steam Controller"; keep the punktfunk prefix
-        // convention every virtual pad uses (Steam matches on VID/PID, not the name).
+        // Steam matches VID/PID, not the product string. Keep the Punktfunk prefix
+        // every virtual pad uses.
         put_cstr(
             &mut ev,
             4,
             128,
             &format!("Punktfunk Steam Controller 2 {index}"),
-        ); // name[128]
-        put_cstr(&mut ev, 132, 64, &format!("punktfunk/triton/{index}")); // phys[64]
-        put_cstr(&mut ev, 196, 64, &format!("punktfunk-triton-{index}")); // uniq[64]
-        ev[260..262].copy_from_slice(&(TRITON_RDESC.len() as u16).to_ne_bytes()); // rd_size
-        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes()); // bus
+        );
+        put_cstr(&mut ev, 132, 64, &format!("punktfunk/triton/{index}"));
+        put_cstr(&mut ev, 196, 64, &format!("punktfunk-triton-{index}"));
+        ev[260..262].copy_from_slice(&(TRITON_RDESC.len() as u16).to_ne_bytes());
+        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes());
         ev[264..268].copy_from_slice(&TRITON_VENDOR.to_ne_bytes());
         ev[268..272].copy_from_slice(&TRITON_WIRED_PRODUCT.to_ne_bytes());
-        ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes()); // version
-        ev[276..280].copy_from_slice(&0u32.to_ne_bytes()); // country
+        ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes());
+        ev[276..280].copy_from_slice(&0u32.to_ne_bytes());
         ev[280..280 + TRITON_RDESC.len()].copy_from_slice(TRITON_RDESC);
         self.fd.write_all(&ev).context("write UHID_CREATE2")?;
         Ok(())
     }
 
-    /// Mirror one report out: the client's raw bytes verbatim in as-is mode, else a synthesized
-    /// minimal `0x42` state report from the typed fallback fields.
+    /// Client raw bytes verbatim, else a synthesized `0x42` state report from typed fields.
     pub fn write_state(&mut self, st: &TritonState) -> Result<()> {
         if st.raw_len > 0 {
             let len = (st.raw_len as usize).min(st.raw.len());
@@ -113,16 +104,15 @@ impl TritonPad {
     fn write_input(&mut self, data: &[u8]) -> Result<()> {
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
-        ev[4..6].copy_from_slice(&(data.len() as u16).to_ne_bytes()); // input2.size
-        ev[6..6 + data.len()].copy_from_slice(data); // input2.data
+        ev[4..6].copy_from_slice(&(data.len() as u16).to_ne_bytes());
+        ev[6..6 + data.len()].copy_from_slice(data);
         self.fd.write_all(&ev).context("write UHID_INPUT2")?;
         Ok(())
     }
 
-    /// Service the device, non-blocking: ack SET_REPORTs (a stalled ack blocks the writer ~5 s),
-    /// answer GET_REPORTs (best-effort canned reply — the query/answer feature dance can't
-    /// round-trip to the physical pad synchronously), and queue every report Steam wrote for raw
-    /// forwarding. Returns the rumble level if a `0x80` output report was seen this pass.
+    /// Non-blocking. Ack SET_REPORT (a stall blocks the writer ~5 s), answer GET_REPORT
+    /// from canned state (the Valve query cannot round-trip to the physical pad), and
+    /// queue Steam's writes for raw forward. Returns rumble if a `0x80` output was seen.
     pub fn service(&mut self) -> Option<(u16, u16)> {
         let mut rumble = None;
         let mut ev = [0u8; UHID_EVENT_SIZE];
@@ -149,17 +139,14 @@ impl TritonPad {
                     if let Some(r) = parse_triton_rumble(&rep) {
                         rumble = Some(r); // some stacks send haptics on the feature path
                     }
-                    // Remember the command — it selects the NEXT GET_REPORT's answer (the Valve
-                    // query dance) — and forward it raw to the physical pad.
+                    // Selects the next GET_REPORT answer (Valve query dance).
                     self.queue_raw(HID_RAW_FEATURE, &rep);
                     self.last_set = rep;
                     let _ = self.reply_set_report(id);
                 }
                 UHID_GET_REPORT => {
-                    // The answer half of the Valve query dance: echo the LAST SET's command with
-                    // a plausible payload (attributes / serial). Answering with the wrong command
-                    // type makes Steam drop the pad — confirmed on-glass 2026-07-15; the dance
-                    // can't round-trip to the physical pad synchronously.
+                    // Echo last SET's command with a canned payload. The wrong command type
+                    // makes Steam drop the pad; the dance cannot round-trip live.
                     let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
                     let reply = triton_feature_reply(&self.last_set, &self.serial, self.unit_id);
                     if reply[1] != self.last_get_logged {
@@ -171,14 +158,14 @@ impl TritonPad {
                     }
                     let _ = self.reply_get_report(id, &reply);
                 }
-                _ => {} // Start/Stop/Open/Close — ignore
+                _ => {}
             }
         }
         rumble
     }
 
-    /// Queue a raw report for the 0xCD plane, capped so a hidraw client gone haywire can't grow
-    /// the queue unboundedly between pumps (newest wins — these are level-styled commands).
+    /// Cap 32 so a hidraw client gone haywire cannot grow the queue between pumps.
+    /// Newest wins — these are level-styled commands.
     fn queue_raw(&mut self, kind: u8, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -193,7 +180,7 @@ impl TritonPad {
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_GET_REPORT_REPLY.to_ne_bytes());
         ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        ev[8..10].copy_from_slice(&0u16.to_ne_bytes()); // err 0
+        ev[8..10].copy_from_slice(&0u16.to_ne_bytes());
         ev[10..12].copy_from_slice(&(data.len() as u16).to_ne_bytes());
         ev[12..12 + data.len()].copy_from_slice(data);
         self.fd.write_all(&ev).context("UHID_GET_REPORT_REPLY")?;
@@ -204,7 +191,7 @@ impl TritonPad {
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_SET_REPORT_REPLY.to_ne_bytes());
         ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        ev[8..10].copy_from_slice(&0u16.to_ne_bytes()); // err 0 (ack)
+        ev[8..10].copy_from_slice(&0u16.to_ne_bytes());
         self.fd.write_all(&ev).context("UHID_SET_REPORT_REPLY")?;
         Ok(())
     }
@@ -218,16 +205,14 @@ impl Drop for TritonPad {
     }
 }
 
-/// The transport a manager pad drives: usbip (`vhci_hcd`, a real USB device Steam lists) with
-/// UHID as the degraded fallback — the same ladder shape as the Deck's [`super::steam_controller`],
-/// minus the gadget rung (no captured gadget layout for the Triton, and usbip is universal).
+/// usbip (`vhci_hcd`) first — a real USB device Steam lists — with UHID as fallback.
+/// No gadget rung: no captured gadget layout for Triton, and usbip is universal.
 pub enum TritonTransport {
     Usbip(crate::triton_usbip::TritonUsbip),
     Uhid(TritonPad),
 }
 
-/// One transport `service()` pass: Steam's latest rumble `(left, right)` plus the raw
-/// `(kind, payload)` reports it wrote since the last pass.
+/// One `service()` pass: rumble `(left, right)` plus raw `(kind, payload)` writes.
 type TritonServiced = (Option<(u16, u16)>, Vec<(u8, Vec<u8>)>);
 
 impl TritonTransport {
@@ -240,7 +225,6 @@ impl TritonTransport {
         }
     }
 
-    /// `(rumble, raw reports)` Steam wrote since the last pass.
     fn service(&mut self) -> TritonServiced {
         match self {
             TritonTransport::Usbip(u) => {
@@ -255,9 +239,8 @@ impl TritonTransport {
     }
 }
 
-/// Open the best Steam-visible SC2 transport: **usbip (`vhci_hcd`) → UHID.** Steam is confirmed
-/// (on-glass 2026-07-15) to ignore the UHID leg, so reaching the fallback means the pad exists as
-/// hidraw only — flagged loudly, with the vhci_hcd remedy in the log.
+/// Best Steam-visible SC2 transport: usbip (`vhci_hcd`) then UHID. Steam ignores the
+/// UHID leg (`Interface: -1`), so fallback is hidraw-only — log the `vhci_hcd` remedy.
 fn open_transport(idx: u8, puck: bool) -> Result<TritonTransport> {
     if crate::steam_usbip::usbip_preferred() {
         let opened = if puck {
@@ -282,8 +265,7 @@ fn open_transport(idx: u8, puck: bool) -> Result<TritonTransport> {
     Ok(TritonTransport::Uhid(p))
 }
 
-/// The Triton-specific half of the shared stateful manager (see [`PadProto`]): raw mirroring
-/// with the typed fallback, and the raw-forwarding service pass.
+/// Triton [`PadProto`]: raw mirroring with typed fallback, and raw-forwarding `service`.
 #[derive(Default)]
 pub struct TritonProto {
     puck: bool,
@@ -310,8 +292,8 @@ impl PadProto for TritonProto {
         TritonState::neutral()
     }
 
-    /// Typed fallback merge. Once raw reports flow (`raw_len > 0`) the frame only refreshes the
-    /// typed fields for diagnostics — `write_state` keeps mirroring the raw report.
+    /// Typed fallback. Once `raw_len > 0`, only refresh typed fields for diagnostics;
+    /// `write_state` keeps mirroring the raw report.
     fn merge_frame(
         &self,
         prev: &TritonState,
@@ -326,8 +308,8 @@ impl PadProto for TritonProto {
             f.left_trigger,
             f.right_trigger,
         );
-        // As-is mode is sticky: a typed frame between two raw reports must not flap the pad back
-        // to synth mode (the client sends BOTH planes — typed keeps the degrade paths alive).
+        // As-is is sticky: a typed frame between two raw reports must not flap back to synth
+        // (the client sends both planes so degrade paths stay alive).
         s.raw = prev.raw;
         s.raw_len = prev.raw_len;
         s
@@ -342,22 +324,19 @@ impl PadProto for TritonProto {
             st.raw[..len].copy_from_slice(&data[..len]);
             st.raw_len = len as u8;
         }
-        // Touchpad/Motion/TouchpadEx: nothing to fold — the raw feed carries pads + IMU natively,
-        // and the synth fallback has no surface for them.
+        // Touchpad/Motion/TouchpadEx: the raw feed already carries pads + IMU; synth has no surface.
     }
 
-    // `neutralize_gyro` / `clear_rich` stay the no-op defaults: this backend never sees a
-    // `RichInput::Motion` to go stale, and its motion lives inside an opaque passthrough report
-    // whose bytes we would have to reach into blind. A raw feed that stops is the client's own
-    // device report stopping, so the same last-report re-emission applies here — worth revisiting
-    // if SC2 gyro ever shows the phantom-rotation signature the DualSense family had.
+    // `neutralize_gyro` / `clear_rich` stay the no-op defaults: this backend never sees
+    // `RichInput::Motion`, and motion lives inside an opaque passthrough report.
+    // A stopped raw feed is the client's own last report; re-emit it.
 
     fn write_state(&self, pad: &mut TritonTransport, st: &TritonState) {
         pad.write_state(st);
     }
 
-    /// Ack + queue Steam's writes, then hand them to the pump as raw 0xCD events; rumble ALSO
-    /// rides the universal 0xCA plane (deduped) so the client's phone-mirror path keeps working.
+    /// Ack + queue Steam's writes onto 0xCD; rumble also rides 0xCA (deduped) so the
+    /// client's phone-mirror path keeps working.
     fn service(&self, pad: &mut TritonTransport, idx: u8) -> PadFeedback {
         let (rumble, raw) = pad.service();
         let hidout = raw
@@ -372,34 +351,31 @@ impl PadProto for TritonProto {
             // No trigger motors on this protocol — see `PadFeedback::rumble`.
             rumble: rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout,
-            // Rumble-plane liveness: Steam is a hidraw writer here too, so the shared
-            // abandoned-rumble force-off applies (the raw 0xCD passthrough plane is unaffected).
+            // Steam is a hidraw writer here too, so abandoned-rumble force-off applies
+            // (the 0xCD passthrough plane is unaffected).
             rumble_drove: Some(rumble.is_some()),
             resync: false,
         }
     }
 }
 
-/// All virtual Steam Controller 2 pads of a session — `PUNKTFUNK_GAMEPAD=steamcontroller2`
-/// (aliases `sc2`/`ibex`), or the per-pad kind an Android client declares for a captured
-/// physical pad.
+/// Session's virtual SC2 pads — `PUNKTFUNK_GAMEPAD=steamcontroller2` (aliases `sc2`/`ibex`),
+/// or the per-pad kind an Android client declares for a captured physical pad.
 pub type Triton2Manager = UhidManager<TritonProto>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// On-box smoke: the virtual SC2 must create a hidraw node under `hid-generic` (no evdev —
-    /// nothing binds the PID) carrying the Valve identity, mirror a raw state report verbatim,
-    /// and tear down on drop. `#[ignore]`d in CI (touches `/dev/uhid`); run on a Linux box:
-    /// `cargo test -p punktfunk-host -- --ignored triton`.
+    /// Creates a hidraw node under `hid-generic` (no evdev — nothing binds the PID) with
+    /// the Valve identity, mirrors a raw state report, tears down on drop. Ignored in CI
+    /// (touches `/dev/uhid`); on a Linux box: `cargo test -p punktfunk-host -- --ignored triton`.
     #[test]
     #[ignore = "creates a real /dev/uhid device; needs the input group"]
     fn triton_backend_creates_hidraw_and_mirrors_raw() {
         let mut pad = TritonPad::open(0).expect("open TritonPad (/dev/uhid + input group?)");
-        // Mirror one raw report (as the client would forward it).
         let mut st = TritonState::neutral();
-        let raw: &[u8] = &[0x42, 1, 0x01, 0, 0, 0, 0xFF, 0x7F]; // A held, LT full — truncated is fine
+        let raw: &[u8] = &[0x42, 1, 0x01, 0, 0, 0, 0xFF, 0x7F]; // truncated fixture is enough
         st.raw[..raw.len()].copy_from_slice(raw);
         st.raw_len = raw.len() as u8;
         for _ in 0..50 {
@@ -407,7 +383,6 @@ mod tests {
             pad.write_state(&st).expect("write_state");
             std::thread::sleep(std::time::Duration::from_millis(4));
         }
-        // The device exists with the Valve identity (hidraw only; /proc/bus/input has no entry).
         let found = std::fs::read_dir("/sys/bus/hid/devices")
             .map(|d| {
                 d.flatten()

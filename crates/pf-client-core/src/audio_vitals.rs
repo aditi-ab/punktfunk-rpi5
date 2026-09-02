@@ -1,46 +1,39 @@
-//! Playback vitals: what the device callback knows and the decode thread logs.
+//! Playback gauges the device callback publishes and the decode thread logs.
 //!
-//! The PipeWire callback (`audio.rs`) runs on the graph's realtime data loop now
-//! (`RT_PROCESS`), where formatting a log line — a `String` allocation, the subscriber's mutex,
-//! a write to stderr and the log ring — is exactly the class of thing a realtime thread must
-//! not do: at best it is a priority inversion against whatever holds the lock, at worst it is a
-//! missed graph cycle, which is a click. So the callback publishes numbers into these atomics
-//! and the decode thread, an ordinary thread that already wakes every frame, prints them at the
-//! old cadence with the old field names (`audio playback buffer_ms= target_ms= underruns=
-//! drift_sheds= drift_inserts= plc_ms=`), so a field-log grep keeps working. The WASAPI twin runs its render
-//! loop on a plain thread and could log in place, but publishes here too: one logging site,
-//! one line shape, on both platforms.
+//! PipeWire's callback runs on the graph data loop (`RT_PROCESS`): a `String`, a subscriber
+//! mutex, or a write to the log ring is a priority inversion or a missed cycle. The callback
+//! stores atomics here; the decode thread, already waking every frame, prints them.
+//! Log field names stay `buffer_ms`, `target_ms`, `underruns`, `drift_sheds`,
+//! `drift_inserts`, `plc_ms`. WASAPI's render loop is a plain thread and could log in place,
+//! but publishes here too so both platforms share one line.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// Counters and gauges the device callback publishes. All `Relaxed`: every field is a
-/// self-contained reading, nothing here orders anything else.
+/// Callback-published counters and gauges. All `Relaxed`: each field is a self-contained reading.
 #[derive(Debug, Default)]
 pub struct PlaybackVitals {
-    /// Device callbacks served (primed or not) — proof of life for the pull side.
+    /// Callbacks entered, primed or not.
     pub callbacks: AtomicU64,
-    /// Callbacks the ring could not fill (a genuine underrun) — see `JitterPolicy::note_read`.
+    /// Ring could not fill the callback. See `JitterPolicy::note_read`.
     pub underruns: AtomicU64,
-    /// Drops the policy asked for: drift sheds and hard trims together.
+    /// Policy drops: drift sheds and hard trims together.
     pub sheds: AtomicU64,
-    /// Inserts the policy asked for: sync-driven deepening, one duplicated crossfaded frame each
-    /// (`JitterStep::insert_front`). Logged next to `sheds` so concealment in BOTH directions
-    /// stays visible — a ring being quietly deepened is a picture moving away from its audio.
+    /// Policy inserts (`JitterStep::insert_front`): one duplicated, crossfaded frame each.
+    /// Deepening without this counter hides audio drifting off the picture.
     pub inserts: AtomicU64,
-    /// The policy's smoothed ring depth, ms — what drift correction reacts to.
+    /// Smoothed ring depth, ms. Drift correction reacts to this.
     pub buffer_ms: AtomicU32,
-    /// The policy's LIVE target depth, ms (grows under underrun pressure, follows A/V sync).
+    /// Live target depth, ms: grows under underrun pressure, follows A/V sync.
     pub target_ms: AtomicU32,
-    /// The device quantum as first seen: frames the graph/engine asked for per callback, the
-    /// mapped buffer's capacity, and what we actually write. `write_frames == 0` = not seen yet.
+    /// First-seen quantum: graph request, mapped capacity, frames written.
+    /// `write_frames == 0` means not yet observed.
     pub requested_frames: AtomicU32,
     pub capacity_frames: AtomicU32,
     pub write_frames: AtomicU32,
 }
 
 impl PlaybackVitals {
-    /// Callback side: one callback done. `ran_short` = it could not be filled from the ring;
-    /// `shed` = the policy dropped something this callback; `insert` = it duplicated a frame.
+    /// From the callback: one cycle. `ran_short` is a ring miss, not a shed.
     pub fn note_callback(
         &self,
         ran_short: bool,
@@ -63,20 +56,19 @@ impl PlaybackVitals {
         self.target_ms.store(target_ms, Ordering::Relaxed);
     }
 
-    /// Callback side: the quantum, published once (the first callback that has one).
+    /// From the callback: store the quantum. Caller publishes on the first callback that has one.
     pub fn note_quantum(&self, requested: u32, capacity: u32, write: u32) {
         self.requested_frames.store(requested, Ordering::Relaxed);
         self.capacity_frames.store(capacity, Ordering::Relaxed);
         self.write_frames.store(write, Ordering::Relaxed);
     }
 
-    /// Whether [`note_quantum`](Self::note_quantum) has been called.
     pub fn quantum_known(&self) -> bool {
         self.write_frames.load(Ordering::Relaxed) > 0
     }
 
-    /// A consistent-enough snapshot for a log line (each field is read once; a callback landing
-    /// between two reads skews a counter by one, which a 10 s log line does not care about).
+    /// Log snapshot. Each field is one Relaxed load; a callback between loads can skew a
+    /// counter by one, which a ~10 s line does not care about.
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             callbacks: self.callbacks.load(Ordering::Relaxed),
@@ -92,7 +84,6 @@ impl PlaybackVitals {
     }
 }
 
-/// One reading of [`PlaybackVitals`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snapshot {
     pub callbacks: u64,

@@ -1,28 +1,18 @@
-//! OS-clipboard bridge for the spawned session client (`design/clipboard-and-file-transfer.md`
-//! §5). The protocol half already exists in `punktfunk_core::clipboard` — the per-session task
-//! that runs fetch streams — and `NativeClient` exposes it as `clip_control` / `clip_offer` /
-//! `clip_fetch` / `clip_serve` / `next_clip`. What was missing on Windows is exactly what §5.2
-//! writes in Swift for macOS: the code that talks to the actual pasteboard. This is that half.
+//! OS-clipboard bridge for the spawned session client.
 //!
-//! Shape (one thread, owned by the session pump):
+//! Protocol and fetch streams live in `punktfunk_core::clipboard`. This
+//! thread talks to the pasteboard. Evidence: `design/clipboard-and-file-transfer.md`.
 //!
-//! * **Local → remote** stays lazy by construction. A poll of `GetClipboardSequenceNumber`
-//!   spots a local copy, we announce the FORMAT LIST (`clip_offer`) and nothing else; the
-//!   bytes are read only if the host actually pastes and sends a `FetchRequest`.
-//! * **Remote → local** is EAGER in this first cut, and that is a deliberate deviation from
-//!   §5.2's promise-based apply. macOS gets laziness free from `NSPasteboardItemDataProvider`;
-//!   the Windows equivalent is delayed rendering (`SetClipboardData(fmt, NULL)` answered on
-//!   `WM_RENDERFORMAT`), which needs a clipboard-owning window running its own message pump —
-//!   a bigger piece than this. So we fetch on the offer and place real bytes, under
-//!   [`EAGER_FETCH_CAP`] so a huge host-side copy can't pull megabytes nobody pastes. Text is
-//!   tiny and always crosses; a large image simply isn't mirrored until delayed rendering lands.
-//! * **Echo suppression** is §3.4's Windows rule verbatim: record the clipboard sequence
-//!   number right after our own `SetClipboardData` and ignore exactly that change, or every
-//!   copy ping-pongs between the two machines forever.
+//! Local copies announce a format list (`clip_offer`); bytes cross only on
+//! `FetchRequest`. Remote offers are fetched and placed as real bytes —
+//! delayed rendering needs a clipboard-owning window and its own message
+//! pump, which this thread is not. [`EAGER_FETCH_CAP`] skips a payload too
+//! large to pull for a paste that may never happen.
 //!
-//! Secrets are respected: a clipboard carrying `ExcludeClipboardContentFromMonitorProcessing`
-//! (what password managers set) is never announced and never served — the Windows counterpart
-//! of §5.2's `org.nspasteboard.ConcealedType` skip.
+//! After our `SetClipboardData`, that sequence number is ignored, or each
+//! side re-offers the other's apply. A clipboard marked
+//! `ExcludeClipboardContentFromMonitorProcessing` is never announced or
+//! served. `run` is a no-op without `HOST_CAP_CLIPBOARD`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -32,35 +22,27 @@ use punktfunk_core::client::NativeClient;
 use punktfunk_core::clipboard::ClipEventCore;
 use punktfunk_core::quic::{ClipKind, CLIP_FILE_INDEX_NONE, HOST_CAP_CLIPBOARD};
 
-/// Wire mime for UTF-8 text — the one format every peer must handle (§3.5).
+/// UTF-8 text — every peer must handle this mime.
 const MIME_TEXT: &str = "text/plain;charset=utf-8";
-/// Wire mime for the image floor (§3.5). Read/written through the "PNG" registered clipboard
-/// format; apps that only publish `CF_DIB` are a follow-up (the conversion the host already
-/// has in `image_to_dib`).
+/// Registered "PNG" clipboard format, not `CF_DIB`.
 const MIME_PNG: &str = "image/png";
 
-/// Ceiling on an EAGERLY fetched remote payload (see the module docs). Text never approaches
-/// it; it exists so a host-side copy of something enormous doesn't cross for a paste that may
-/// never happen. Lifted once delayed rendering makes the fetch lazy.
+/// 4 MiB. Eager remote fetches above this are skipped; the paste may never happen.
 const EAGER_FETCH_CAP: u64 = 4 << 20;
 
-/// How often the local clipboard is polled for changes. §3.2 asks for ≥ 100 ms between offers;
-/// 400 ms keeps a copy→focus→paste round trip comfortably ahead of the user.
+/// 400 ms. Spec floor between offers is 100 ms; this stays ahead of copy→paste.
 const POLL: Duration = Duration::from_millis(400);
 
-/// Drain-and-poll cadence: how long `next_clip` blocks before we re-check the clipboard and
-/// the stop flag.
+/// 120 ms. Bounds how long `stop` waits; Win32 is polled on [`POLL`], not this.
 const EVENT_WAIT: Duration = Duration::from_millis(120);
 
-/// Run the clipboard bridge until `stop` is set or the session closes. Returns immediately
-/// (doing nothing) when the host didn't advertise `HOST_CAP_CLIPBOARD` — an older host, or one
-/// whose backend can't do it — so this is safe to spawn unconditionally.
+/// Safe to spawn unconditionally: no-op without `HOST_CAP_CLIPBOARD`.
 pub fn run(client: Arc<NativeClient>, stop: Arc<AtomicBool>) {
     if client.host_caps() & HOST_CAP_CLIPBOARD == 0 {
         tracing::info!("host has no clipboard capability — shared clipboard off");
         return;
     }
-    // Opt-in per §3.1: nothing is announced or served until this crosses enabled.
+    // Opt-in: nothing is announced or served until the host sees enabled.
     if let Err(e) = client.clip_control(true, 0) {
         tracing::warn!(error = %e, "clipboard: enable failed");
         return;
@@ -68,62 +50,53 @@ pub fn run(client: Arc<NativeClient>, stop: Arc<AtomicBool>) {
     tracing::info!("shared clipboard enabled");
 
     let mut state = State {
-        // Adopt the CURRENT sequence number without announcing: whatever is on the clipboard
-        // from before the session started is the user's, not a copy they made for this stream.
+        // Seed the live sequence without offering: a pre-session clipboard is not a copy for this stream.
         last_seq: os::sequence_number(),
         ..Default::default()
     };
     let mut next_poll = Instant::now() + POLL;
 
     while !stop.load(Ordering::SeqCst) {
-        // Inbound first — a pending FetchRequest is the host waiting on us. `NoFrame` is the
-        // ordinary poll timeout (nothing pending); anything else means the connection is gone
-        // and the session teardown is already on its way.
+        // FetchRequest first — the host is blocked on us.
         match client.next_clip(EVENT_WAIT) {
             Ok(ev) => handle_event(&client, &mut state, ev),
             Err(punktfunk_core::error::PunktfunkError::NoFrame) => {}
             Err(_) => break,
         }
-        // The local clipboard is polled on its OWN cadence, not once per inbound wait: the
-        // event wait is short (it bounds teardown latency), and hammering the Win32 clipboard
-        // eight times a second would contend with whatever app the user is actually copying in.
+        // Poll Win32 on [`POLL`], not every wait. This wait is short so teardown is not delayed.
         let now = Instant::now();
         if now >= next_poll {
             poll_local(&client, &mut state);
             next_poll = now + POLL;
         }
     }
-    // Best-effort: tell the host to stop announcing into a session that's ending.
     let _ = client.clip_control(false, 0);
 }
 
 #[derive(Default)]
 struct State {
-    /// Clipboard sequence number as of our last look — a change means someone copied.
     last_seq: u32,
-    /// The sequence number our OWN `SetClipboardData` produced (§3.4 echo suppression).
+    /// Sequence we wrote; swallow that one change or offers echo.
     self_written_seq: Option<u32>,
-    /// Monotonic offer counter (§3.2 — newest wins).
+    /// Newest-wins offer id.
     offer_seq: u32,
-    /// Rate-limit guard for offers (§3.2 asks ≥ 100 ms).
+    /// Skip a new offer under 100 ms.
     last_offer: Option<Instant>,
-    /// The host's current offer, so a fetch can name its `seq`.
     remote_offer: Option<u32>,
-    /// In-flight eager fetch → the mime it will deliver, so `Data` knows how to place it.
+    /// In-flight fetch id and the mime `Data` will place.
     pending_fetch: Option<(u32, String)>,
-    /// The last payload we placed locally, kept only to answer a host fetch of our own echo
-    /// without re-reading the OS clipboard.
+    /// Last local apply, reused when the host fetches our echo (CF_UNICODETEXT round-trips are lossy).
     last_applied: Option<(String, Vec<u8>)>,
 }
 
-/// A local clipboard change → announce the format list (never the bytes).
+/// Announce the local format list; never the bytes.
 fn poll_local(client: &NativeClient, state: &mut State) {
     let seq = os::sequence_number();
     if seq == state.last_seq {
         return;
     }
     state.last_seq = seq;
-    // Our own apply — swallow it, or the two clipboards chase each other forever.
+    // Our apply — drop it or both sides re-offer forever.
     if state.self_written_seq == Some(seq) {
         state.self_written_seq = None;
         return;
@@ -169,8 +142,6 @@ fn handle_event(client: &NativeClient, state: &mut State, ev: ClipEventCore) {
         } => {
             tracing::info!(enabled, policy, reason, "clipboard: host state");
         }
-        // The host copied. Pull the best format we can place (see the module docs on why this
-        // is eager for now) — text preferred, then PNG.
         ClipEventCore::RemoteOffer { seq, kinds } => {
             state.remote_offer = Some(seq);
             let pick = kinds
@@ -194,7 +165,6 @@ fn handle_event(client: &NativeClient, state: &mut State, ev: ClipEventCore) {
                 Err(e) => tracing::warn!(error = %e, "clipboard: fetch failed to start"),
             }
         }
-        // Bytes for the fetch above — place them, then record the sequence number they cause.
         ClipEventCore::Data {
             xfer_id,
             bytes,
@@ -211,7 +181,7 @@ fn handle_event(client: &NativeClient, state: &mut State, ev: ClipEventCore) {
             }
             match os::set(&mime, &bytes) {
                 Ok(()) => {
-                    // §3.4: this is the change WE caused; ignore exactly it.
+                    // This sequence number is ours; ignore exactly it.
                     state.self_written_seq = Some(os::sequence_number());
                     state.last_applied = Some((mime.clone(), bytes));
                     tracing::debug!(mime = %mime, "clipboard: applied remote content");
@@ -219,8 +189,7 @@ fn handle_event(client: &NativeClient, state: &mut State, ev: ClipEventCore) {
                 Err(e) => tracing::warn!(error = %e, mime = %mime, "clipboard: apply failed"),
             }
         }
-        // The host is pasting what we offered: read the bytes NOW (this is the lazy half) and
-        // answer. A read failure still answers — with a cancel — so the host isn't left waiting.
+        // A failed read still cancels, or the host waits forever.
         ClipEventCore::FetchRequest {
             req_id,
             seq: _,
@@ -231,8 +200,7 @@ fn handle_event(client: &NativeClient, state: &mut State, ev: ClipEventCore) {
                 let _ = client.clip_cancel(req_id);
                 return;
             }
-            // Serve our own last-applied payload verbatim when it still matches — avoids a
-            // lossy OS round trip for content that originated on the host anyway.
+            // Prefer the payload we just applied: a CF_UNICODETEXT round-trip is lossy.
             let bytes = match &state.last_applied {
                 Some((m, b)) if *m == mime && state.self_written_seq.is_some() => Ok(b.clone()),
                 _ => os::get(&mime),
@@ -260,10 +228,7 @@ fn handle_event(client: &NativeClient, state: &mut State, ev: ClipEventCore) {
     }
 }
 
-/// Put plain text on this machine's clipboard — the "Copy link" affordance, which has nothing
-/// to do with the streaming bridge above but wants the same OS plumbing. Best-effort: a
-/// clipboard another process is holding open is a transient nuisance, never worth failing a
-/// user action over. A no-op where this build has no OS clipboard.
+/// Best-effort local text set ("Copy link"). Not the session bridge; never fails the caller.
 pub fn set_text(text: &str) {
     if let Err(e) = os::set(MIME_TEXT, text.as_bytes()) {
         tracing::warn!(error = %format!("{e:#}"), "copying to the clipboard");
@@ -272,8 +237,7 @@ pub fn set_text(text: &str) {
 
 #[cfg(windows)]
 mod os {
-    //! The Win32 clipboard seam. Every entry point opens the clipboard, does one thing and
-    //! closes it — holding it across a network fetch would block every other app on the box.
+    //! Win32 clipboard. Open, one operation, close — holding across a network fetch blocks every other app.
 
     use super::{MIME_PNG, MIME_TEXT};
     use anyhow::{anyhow, bail, Result};
@@ -289,7 +253,6 @@ mod os {
 
     const CF_UNICODETEXT: u32 = 13;
 
-    /// A registered clipboard format id, by name (`PNG`, the concealed marker, …).
     fn registered(name: &str) -> u32 {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: `wide` is a local NUL-terminated UTF-16 buffer that outlives this synchronous call.
@@ -300,11 +263,11 @@ mod os {
         registered("PNG")
     }
 
-    /// RAII clipboard open — `CloseClipboard` must run even on the error paths.
+    /// Opened clipboard; `CloseClipboard` runs on every drop, including error paths.
     struct Clip;
     impl Clip {
         fn open() -> Result<Clip> {
-            // A retry loop: another app can hold the clipboard for a moment.
+            // Another process may hold the clipboard; fail after ~100 ms.
             for _ in 0..10 {
                 // SAFETY: takes no pointer; `None` is the documented "associate with no window" argument.
                 if unsafe { OpenClipboard(None) }.as_bool() {
@@ -327,14 +290,13 @@ mod os {
         unsafe { GetClipboardSequenceNumber() }
     }
 
-    /// Password managers mark secrets with this format; §5.2's concealed-type rule.
+    /// Password managers mark secrets with this format; skip those clipboards.
     pub fn is_concealed() -> bool {
         let fmt = registered("ExcludeClipboardContentFromMonitorProcessing");
         // SAFETY: a scalar format id in, a status out; reads nothing through a pointer.
         unsafe { IsClipboardFormatAvailable(fmt) }.as_bool()
     }
 
-    /// The wire kinds the current clipboard can supply, with size hints where they're free.
     pub fn available_kinds() -> Vec<(&'static str, u64)> {
         let mut out = Vec::new();
         // SAFETY: as above — a scalar format id, status out.
@@ -348,7 +310,6 @@ mod os {
         out
     }
 
-    /// Read one wire format off the clipboard.
     pub fn get(mime: &str) -> Result<Vec<u8>> {
         let _clip = Clip::open()?;
         match mime {
@@ -401,7 +362,6 @@ mod os {
         }
     }
 
-    /// Place one wire format on the clipboard, replacing its contents.
     pub fn set(mime: &str, bytes: &[u8]) -> Result<()> {
         let (fmt, payload) = match mime {
             MIME_TEXT => {
@@ -443,9 +403,7 @@ mod os {
 
 #[cfg(not(windows))]
 mod os {
-    //! Non-Windows stub. Linux needs the Wayland `data-control` seam (the same protocol the
-    //! host side already speaks) — the bridge above is platform-neutral and will drive it
-    //! unchanged once this module grows a real implementation.
+    //! Stub. Sequence stays 0; get/set fail. The session loop still runs.
     use anyhow::{bail, Result};
 
     pub fn sequence_number() -> u32 {

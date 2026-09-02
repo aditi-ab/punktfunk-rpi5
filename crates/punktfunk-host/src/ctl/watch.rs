@@ -1,47 +1,33 @@
-//! `punktfunk-host ctl watch` — the host's SSE event stream bridged to **line-JSON on stdout**,
-//! one object per line, flushed per line. That shape is the whole point: a Quickshell `Process`, a
-//! waybar `custom/` module and `while read -r line` all consume it without an SSE parser, and none
-//! of them ever sees a token (I3 — the plugin holds no credential because it holds no HTTP client).
+//! Line-JSON stdout for `punktfunk-host ctl watch`.
 //!
-//! Reconnection is the interesting part. `mgmt/events.rs` keeps a ~1024-event ring and resumes
-//! from `Last-Event-ID`; a consumer whose cursor has fallen off the ring gets a synthetic
-//! `event: dropped` frame first and is expected to re-snapshot. We surface both facts to the
-//! consumer as ordinary lines:
+//! One flushed object per line over the host SSE stream (`mgmt/events.rs`). Resume is
+//! `?since=` against the ~1024-event ring; every frame with an `id:` advances the cursor
+//! so a host restart mid-watch continues from the last delivered event.
 //!
-//! - `{"v":1,"kind":"ctl.resync"}` — emitted **once** after a `dropped` frame, and also after any
-//!   reconnect that could not resume exactly (no cursor yet). A widget that sees it re-runs
-//!   `ctl status` / `ctl pending` rather than trusting its incremental state.
-//! - `{"v":1,"kind":"ctl.disconnected","data":{"error":"…"}}` — the stream dropped and we are
-//!   backing off. Purely informational; the reconnect is automatic.
-//! - `{"v":1,"kind":"ctl.heartbeat"}` — the host's SSE keep-alive, roughly every 15 s. A consumer
-//!   can use it as a liveness signal, and it is also what lets *us* notice that our own consumer
-//!   has gone away (see [`emit`]).
+//! Synthetic kinds:
+//! - `ctl.resync` — after a `dropped` frame, or a reconnect that could not resume. The
+//!   consumer must re-snapshot (`ctl status` / `ctl pending`); further events will not.
+//! - `ctl.disconnected` — the stream dropped; reconnect is automatic.
+//! - `ctl.heartbeat` — host keep-alive, ~15 s. Writing it is how [`emit`] notices the
+//!   consumer is gone (EPIPE on a read-only pipe never fires).
 //!
-//! The cursor advances on every frame with an `id:`, so a host restart mid-watch resumes from the
-//! last event actually delivered. Backoff is capped and jittered only by the cap: an operator's
-//! plugin reconnecting in a tight loop against a host that is down would otherwise be the thing
-//! that keeps hitting the SSE connection cap.
-//!
-//! The connection cap (`MAX_EVENT_STREAMS` = 32) is shared with the console; the plugin is
-//! specified to hold exactly one stream. Exhausting it is a 503, which arrives here as an ordinary
-//! API failure with the host's own message.
+//! Backoff 1–30 s so a tight loop cannot exhaust `MAX_EVENT_STREAMS` (32, shared with
+//! the console). First connect and a pin mismatch still exit; retry cannot fix those.
 
 use std::io::{BufRead, BufReader, Write};
 use std::time::Duration;
 
 use super::client::{Client, Failure, Result, SCHEMA_VERSION};
 
-/// Reconnect backoff: quick enough that a host restart is invisible to a widget, slow enough that
-/// a host that is genuinely down doesn't get hammered.
+/// 1 s hides a host restart from a widget; 30 s is the cap against a down host.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 pub fn run(kinds: Option<&str>, since: Option<u64>) -> Result<()> {
     let mut cursor = since;
     let mut backoff = BACKOFF_MIN;
-    // First connect is the only one allowed to fail the process: a bad pin, a missing token or a
-    // host that has never run are all conditions a retry cannot fix, and a `watch` that silently
-    // spins forever on them is worse than an exit code the caller can see.
+    // First connect may fail the process: a bad pin, missing token, or never-run host
+    // cannot be retried; spinning forever hides that from the caller.
     let mut client = Client::connect(None)?;
     loop {
         match pump(&client, kinds, &mut cursor) {
@@ -52,10 +38,8 @@ pub fn run(kinds: Option<&str>, since: Option<u64>) -> Result<()> {
         }
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(BACKOFF_MAX);
-        // Rebuild the client on every reconnect rather than reusing it: that re-reads
-        // `native-cert.pem`, so a host that regenerated its identity while we were disconnected
-        // is picked up instead of pinning us out forever (risk register #1). A pin that is now
-        // genuinely wrong still exits 4 on the next attempt, which is the intended signal.
+        // Rebuild so we re-read `native-cert.pem`. Reusing the client pins forever if the
+        // host regenerated its identity while we were down.
         match Client::connect(None) {
             Ok(c) => {
                 client = c;
@@ -67,7 +51,7 @@ pub fn run(kinds: Option<&str>, since: Option<u64>) -> Result<()> {
     }
 }
 
-/// One connection's worth of frames. Returns `Ok(())` when the server closed the stream.
+/// `Ok(())` means the server closed the stream, not that watch is done.
 fn pump(client: &Client, kinds: Option<&str>, cursor: &mut Option<u64>) -> Result<()> {
     let mut path = String::from("/api/v1/events");
     let mut sep = '?';
@@ -80,8 +64,6 @@ fn pump(client: &Client, kinds: Option<&str>, cursor: &mut Option<u64>) -> Resul
     }
     let reader = BufReader::new(client.stream(&path)?);
 
-    // One SSE frame = `id:`/`event:`/`data:` lines terminated by a blank line. Keep-alive comments
-    // (`:` prefix) are skipped; they exist to detect a dead peer, not to be forwarded.
     let mut id: Option<u64> = None;
     let mut kind: Option<String> = None;
     let mut data = String::new();
@@ -101,15 +83,9 @@ fn pump(client: &Client, kinds: Option<&str>, cursor: &mut Option<u64>) -> Resul
         };
         let value = value.strip_prefix(' ').unwrap_or(value);
         match field {
-            // A comment (`: keep-alive`) splits with an empty field name. The host sends one every
-            // 15 s, and we turn it into the one line that proves BOTH directions are alive.
-            //
-            // The write is the point. Our consumer is a shell widget, and when it dies its end of
-            // our stdout pipe closes — but a stream that is only ever READ never notices, so an
-            // idle host leaves `ctl watch` running forever against the server's connection cap.
-            // Measured on an Omarchy box: six orphaned watchers after three shell restarts, all on
-            // a host with no events at all. Writing here turns the next keep-alive into an EPIPE,
-            // and [`emit`] exits on it.
+            // Empty field: SSE comment (`: keep-alive`, ~15 s). Writing the heartbeat is
+            // the liveness check — a read-only stdout never sees the widget die, so idle
+            // watchers would hold a `MAX_EVENT_STREAMS` slot until reboot. [`emit`] exits on EPIPE.
             "" => emit(serde_json::json!({ "v": SCHEMA_VERSION, "kind": "ctl.heartbeat" })),
             "id" => id = value.parse().ok(),
             "event" => kind = Some(value.to_string()),
@@ -125,14 +101,12 @@ fn pump(client: &Client, kinds: Option<&str>, cursor: &mut Option<u64>) -> Resul
     Ok(())
 }
 
-/// Turn one decoded frame into a line of stdout, advancing the resume cursor.
 fn dispatch(kind: &str, data: &str, id: Option<u64>, cursor: &mut Option<u64>) {
     if let Some(seq) = id {
         *cursor = Some(seq);
     }
     if kind == "dropped" {
-        // We fell off the catch-up ring: whatever the consumer believes about pending devices or
-        // live sessions may be stale, and no amount of further events will repair it.
+        // Fell off the catch-up ring. Further events cannot repair stale widget state.
         emit_control("ctl.resync", None);
         return;
     }
@@ -154,13 +128,9 @@ fn emit_control(kind: &str, error: Option<&str>) {
     emit(line);
 }
 
-/// One line, flushed. A widget reading incrementally must not wait on an 8 KiB stdio buffer to
-/// fill before it learns a device is knocking.
-///
-/// **A failed write ends the process**, rather than being ignored as it was: the only reason a
-/// write to our own stdout fails is that the consumer is gone, and carrying on would hold an SSE
-/// stream open against the host's connection cap for as long as the box stays up. Exit 0 — the
-/// consumer going away is a normal end to a `watch`, not an error anyone needs to see.
+/// One flushed line: an 8 KiB stdio buffer would hide the next event from a widget.
+/// Write/flush failure means the consumer is gone. Exit 0 (normal end) so we
+/// drop the SSE slot instead of holding `MAX_EVENT_STREAMS` until reboot.
 fn emit(line: serde_json::Value) {
     let mut out = std::io::stdout().lock();
     if writeln!(out, "{line}").is_err() || out.flush().is_err() {
@@ -168,8 +138,7 @@ fn emit(line: serde_json::Value) {
     }
 }
 
-/// Minimal percent-encoding for the `kinds` query value. The grammar the host accepts is
-/// `[a-z0-9_.*,-]`, so this only ever has to escape what a typo could introduce.
+/// Host `kinds` grammar is `[a-z0-9_.*,-]`; encode only what a typo could introduce.
 fn urlencode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -196,8 +165,7 @@ mod tests {
 
     #[test]
     fn a_dropped_frame_advances_the_cursor_and_asks_for_a_resync() {
-        // The cursor must advance even for `dropped`: resuming from before it would replay the
-        // same fell-off-the-ring condition on every reconnect.
+        // Advance even for `dropped`: resuming from before it would replay the ring miss.
         let mut cursor = None;
         dispatch("dropped", r#"{"dropped":true}"#, Some(7), &mut cursor);
         assert_eq!(cursor, Some(7));

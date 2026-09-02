@@ -1,32 +1,18 @@
-//! The bare-spawn **splash client** — the reason a fresh headless gamescope delivers frames at all.
+//! Nested X11 splash so a fresh headless gamescope composites (and thus captures).
 //!
-//! gamescope only composites (and only on a composite pushes a buffer to its PipeWire capture
-//! node) when a client paints. A dedicated Steam launch paints NOTHING for the whole Steam
-//! bootstrap (no window maps until the gamepad UI's first frame) — so a fresh
-//! spawn's capture negotiated a format, reached `Streaming`, and then starved: zero buffers, the
-//! 10 s first-frame timeout, teardown — and every native-plane retry killed the half-booted Steam
-//! and started from zero, while the GameStream plane died on its single wait (the "fresh gamescope
-//! output never delivers frames" field failure; root-caused on-box 2026-07-27 with a raw pw_stream
-//! probe: `sleep infinity` nested → 0 buffers ever, `vkcube` nested → 60/s immediately).
+//! gamescope pushes a PipeWire buffer only on composite, and composites only a
+//! client that paints. The parent `spawn` wrapper backgrounds this process
+//! before exec'ing the nested app. [`run`] maps a full-screen window and damages
+//! it at [`TICK`] until the X connection dies.
 //!
-//! This client runs INSIDE the spawned gamescope (the nested-command wrapper backgrounds it before
-//! exec'ing the real app) and guarantees damage from the first second: a dark window with a subtle
-//! breathing bar painted at ~2.5 Hz. Two gamescope focus facts, both live-proven on c31743d:
+//! `--steam` composites only windows whose appid is in the root
+//! `GAMESCOPECTRL_BASELAYER_APPID` list. The splash sets `STEAM_GAME` to
+//! [`STEAM_UI_APPID`] and seeds that list iff empty; Steam's rewrite at game
+//! launch is the handover. Without `--steam` any mapped painting window
+//! composites and the atoms are inert.
 //!
-//! * In `--steam` mode gamescope composites ONLY windows whose Steam appid is listed in the root
-//!   window's `GAMESCOPECTRL_BASELAYER_APPID` property (a plain mapped+painting window — even
-//!   vkcube — gets zero composites). So the splash declares itself as the Steam client UI
-//!   (`STEAM_GAME=769`) and seeds the baselayer with that appid iff nobody has written it yet.
-//!   When Steam finishes booting it rewrites the baselayer as part of launching the game, which
-//!   hands composite focus to the real game window with no action on our side (verified: 2.5 Hz
-//!   splash cadence → 60 Hz game cadence on the same capture stream, no gap).
-//! * In plain (non-`--steam`) mode any mapped painting window composites; the atoms are inert.
-//!
-//! The splash never exits on its own while the session lives: after the game takes focus it keeps
-//! painting unfocused (damage on an unfocused window schedules no composite — harmless), so if the
-//! game's window briefly goes away (Steam updater closed, level-load window swap) and gamescope
-//! re-focuses the splash, liveness returns instead of a frozen last frame. It dies with the session:
-//! gamescope's reaper kills it at teardown, and any X error (the connection dropping) exits cleanly.
+//! Unfocused paints schedule no composite. The process does not exit on its own;
+//! gamescope's reaper, or an X error, is the only stop.
 
 use anyhow::{Context, Result};
 use std::time::Duration;
@@ -38,22 +24,16 @@ use x11rb::protocol::xproto::{
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-/// The Steam client UI's appid — the identity the splash borrows so `--steam`-mode gamescope
-/// treats it as focusable before (and beneath) any real game.
+/// Steam client UI appid (not a game). `--steam` treats this id as the overlay client.
 const STEAM_UI_APPID: u32 = 769;
 
-/// Window/bar palette: near-black background, greys the bar breathes through.
 const BG: u32 = 0x0d0d0d;
 
-/// How often the splash repaints (each paint is the damage that makes gamescope push a capture
-/// buffer). 400 ms ≈ 2.5 fps — far inside every first-frame budget, invisible in CPU terms.
+/// 400 ms ≈ 2.5 fps. Each paint is the damage that makes gamescope push a capture buffer.
 const TICK: Duration = Duration::from_millis(400);
 
-/// Entry point for the hidden `gamescope-splash` host subcommand. Blocks for the session's
-/// lifetime; returns (or errors) only when the X connection is gone or never came up.
+/// Hidden `gamescope-splash` subcommand. Blocks until DISPLAY is unreachable or X dies.
 pub(crate) fn run() -> Result<()> {
-    // gamescope execs its nested command only once Xwayland is ready and DISPLAY is set, so the
-    // first attempt normally lands — the retry covers a slow Xwayland under driver-init load.
     let (conn, screen_num) = connect_with_retry()?;
     let screen = &conn.setup().roots[screen_num];
     let (w, h) = (screen.width_in_pixels, screen.height_in_pixels);
@@ -78,9 +58,7 @@ pub(crate) fn run() -> Result<()> {
         AtomEnum::STRING,
         b"Punktfunk",
     )?;
-    // STEAM_GAME on the window + GAMESCOPECTRL_BASELAYER_APPID on the root — the pair that makes a
-    // `--steam` gamescope composite us. Seed the baselayer only while unset: once Steam is up it
-    // owns that property (its rewrite at game launch is exactly the handover we want).
+    // Seed the baselayer only while empty; Steam's rewrite at game launch is the handover.
     let steam_game = conn.intern_atom(false, b"STEAM_GAME")?.reply()?.atom;
     conn.change_property32(
         PropMode::REPLACE,
@@ -116,9 +94,8 @@ pub(crate) fn run() -> Result<()> {
         "gamescope splash: mapped"
     );
 
-    // The breathing bar. Server-side fills generate the damage; the background pixel handles
-    // exposures, so no event loop is needed. Any request failing = the session (or its Xwayland)
-    // is gone = a clean exit.
+    // Server-side fills are the damage; the background pixel handles exposures, so there is no
+    // event loop. A failed request means the session (or its Xwayland) is gone.
     let bar_w = 120i16;
     let bar_h = 8i16;
     let bar = Rectangle {
@@ -129,7 +106,6 @@ pub(crate) fn run() -> Result<()> {
     };
     let mut t: u32 = 0;
     loop {
-        // 8-step triangle pulse through dark greys (0x1a…0x40 per channel).
         let phase = (t % 8) as i32;
         let tri = if phase < 4 { phase } else { 8 - phase };
         let grey = 0x1a + 0x0c * tri as u32;
@@ -143,23 +119,13 @@ pub(crate) fn run() -> Result<()> {
     }
 }
 
-/// How long the splash waits for the session's X server before giving up.
+/// 10 s matches the capture first-frame timeout. Waiting longer cannot save the stream.
 const CONNECT_BUDGET: Duration = Duration::from_secs(10);
 
-/// Connect to the session's `DISPLAY`, retrying briefly — gamescope sets the variable before
-/// exec'ing the nested command, but a slow Xwayland under cold driver init gets a grace window.
-///
-/// The retry runs on a worker thread and the budget is enforced by `recv_timeout` rather than by
-/// re-checking a deadline between attempts. The difference is the whole point: `x11rb::connect`
-/// has no timeout of its own, so against an Xwayland that ACCEPTED the socket and then never
-/// answered the setup handshake it blocks indefinitely — and a deadline consulted only in the
-/// `Err` arm is never reached at all. That is the failure this module exists to prevent, from the
-/// inside: no painting client, no composite, no PipeWire buffers, and the capture dies on its 10 s
-/// first-frame timeout having never logged "gamescope splash: mapped", so the diagnosis points
-/// anywhere but here.
-///
-/// A worker still stuck in `connect` is abandoned rather than joined; it is one thread in a
-/// process whose whole job is this window, and the alternative is the hang.
+/// `x11rb::connect` has no timeout. An Xwayland that accepts the socket and never
+/// answers setup blocks forever, and a deadline consulted only on `Err` is never
+/// reached. The retry therefore runs on a worker and the budget is `recv_timeout`.
+/// A worker still stuck in `connect` is abandoned; joining it would hang this process.
 fn connect_with_retry() -> Result<(RustConnection, usize)> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -181,8 +147,7 @@ fn connect_with_retry() -> Result<(RustConnection, usize)> {
             }
         })
         .context("gamescope splash: could not start the X connect thread")?;
-    // A little past the worker's own deadline, so a connect that merely finished slowly still wins
-    // and only a genuinely blocked one trips this.
+    // One second past the worker deadline so a slow-but-finished connect still wins.
     match rx.recv_timeout(CONNECT_BUDGET + Duration::from_secs(1)) {
         Ok(Ok(conn)) => Ok(conn),
         Ok(Err(e)) => Err(e).context("gamescope splash: could not connect to the session DISPLAY"),

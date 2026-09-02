@@ -1,7 +1,13 @@
-//! The video data plane: on RTSP PLAY, learn the client's UDP endpoint (it pings the video
-//! port), then run capture → NVENC encode → [`VideoPacketizer`] → UDP send. The source is
-//! either real portal desktop capture (`PUNKTFUNK_VIDEO_SOURCE=portal`, the portal PipeWire path) or
-//! a synthetic test pattern (default). Runs on its own native thread.
+//! GameStream video data plane.
+//!
+//! On RTSP PLAY the client pings [`VIDEO_PORT`]; we learn that UDP endpoint and run
+//! capture → encode → [`VideoPacketizer`] → UDP. Source is portal PipeWire
+//! (`PUNKTFUNK_VIDEO_SOURCE=portal`), a compositor virtual output (`virtual`), or
+//! a synthetic test pattern (default).
+//!
+//! Runs on its own native thread. Encode, FEC packetize, and paced send are
+//! separate threads joined by depth-2 queues. Game lifetime:
+//! `design/session-game-lifetime.md`.
 
 use super::video::{FrameType, VideoPacketizer};
 use super::VIDEO_PORT;
@@ -24,31 +30,21 @@ pub struct StreamConfig {
     pub codec: Codec,
     /// Client's `x-nv-vqos[0].fec.minRequiredFecPackets` — parity floor per FEC block.
     pub min_fec: u8,
-    /// Client requested HDR (`dynamicRangeMode != 0`) AND the host can deliver it ([`host_hdr_capable`]).
-    /// Drives the capturer's proactive advanced-color enable; the encoder picks Main10 from the captured
-    /// (P010) frame format. Always `false` on a non-HDR host, so the SDR path is unchanged.
+    /// Client asked for HDR (`dynamicRangeMode != 0`) and the host can deliver it.
+    /// Encoder picks Main10 from the captured (P010) format. Always `false` on SDR hosts.
     pub hdr: bool,
-    /// Client's `x-nv-video[0].videoEncoderSlicesPerFrame` — the per-frame slice count its
-    /// decoder wants (moonlight-common-c requests 1 for every HARDWARE decoder and 4 only for
-    /// software slice-threading). Honored as the encoder's slicing ceiling: hardware TV decoders
-    /// (Amlogic — Chromecast with Google TV) wedge the whole device on multi-slice AUs they
-    /// never asked for (the 0.17.0 4-slice-default field regression). Absent ⇒ 1.
+    /// Client's `x-nv-video[0].videoEncoderSlicesPerFrame`. Hardware TV decoders wedge on
+    /// multi-slice AUs they did not request. Absent ⇒ 1.
     pub slices: u32,
-    /// The client echoed `SS_ENC_VIDEO` in its ANNOUNCE `x-ss-general.encryptionEnabled`, so
-    /// every video shard is AES-128-GCM-sealed under the `/launch` rikey (WP7). Only ever true
-    /// when the host advertised the bit in the first place — see `gs_video_encryption_offered`.
+    /// Client echoed `SS_ENC_VIDEO`; shards are AES-128-GCM-sealed under the `/launch` rikey.
+    /// Only true when the host advertised the bit (`gs_video_encryption_offered`).
     pub encrypt_video: bool,
 }
 
-/// A pooled capturer plus the three properties reuse must match on — its HDR-ness, its
-/// metadata-cursor mode (both fixed at PipeWire-negotiation time) and **which screen it is
-/// actually capturing**: the `capture_monitor` pin, or `None` for the portal's own pick. A
-/// mismatch on any of them needs a fresh screencast session (see `AppState::video_cap`).
-///
-/// The pin belongs in the key because it is a *live* setting — the console can re-aim the host
-/// between two GameStream connects (`design/per-monitor-portal-capture.md` §7.3). Without it the
-/// second connect would silently keep streaming the previous screen, which is the exact failure
-/// the pin exists to prevent.
+/// Pooled capturer plus the three reuse keys: HDR-ness, metadata-cursor mode (both fixed at
+/// PipeWire negotiation), and the `capture_monitor` pin (`None` = portal's pick). A mismatch
+/// needs a fresh screencast session. The pin is live — without it a reconnect keeps the
+/// previous screen (`design/per-monitor-portal-capture.md`).
 pub type PooledCapturer = (Box<dyn Capturer>, bool, bool, Option<String>);
 
 /// Slot for the persistent screen capturer, shared with the control plane and reused across
@@ -59,26 +55,18 @@ pub type CapturerSlot = Arc<std::sync::Mutex<Option<PooledCapturer>>>;
 /// control plane and drained by the video thread (see [`AppState::rfi_range`](super::AppState)).
 pub type RfiSlot = Arc<std::sync::Mutex<Option<(i64, i64)>>>;
 
-/// What the stream thread needs to give the launched game a lifetime
-/// (design/session-game-lifetime.md). Bundled because the three only exist together — the control
-/// plane builds them from the live `AppState` at RTSP PLAY, and the stream thread is where they are
-/// spent.
+/// Game-lifetime wiring spent by the stream thread (`design/session-game-lifetime.md`).
+/// The control plane builds these from live `AppState` at RTSP PLAY; they only exist together.
 pub struct GameLifetime {
-    /// The session's deliberate-quit flag ([`super::AppState::quit`]), read when the stream ends: a
-    /// decision may end the game, a drop gets a reconnect window first.
+    /// [`super::AppState::quit`]: a decision may end the game; a drop gets a reconnect window.
     pub quit: Arc<AtomicBool>,
-    /// Hex cert fingerprint of the paired client that owns the launch, so only it can reclaim its own
-    /// game. `None` when the peer cert couldn't be read.
+    /// Paired client's cert fingerprint; only it can reclaim the launch. `None` if unread.
     pub fingerprint: Option<String>,
-    /// Source IP of the launching peer ([`super::LaunchSession::peer_ip`]), enforced when the video
-    /// thread learns its UDP endpoint so an off-path LAN peer cannot win the endpoint race and be
-    /// handed the (plaintext) video stream. `None` keeps the pre-owner behavior. security-review
-    /// 2026-08-15 finding 1.
+    /// Launching peer's source IP ([`super::LaunchSession::peer_ip`]). Bound when the video
+    /// thread learns its UDP endpoint so an off-path LAN peer cannot win the race. `None` = open.
     pub owner_ip: Option<std::net::IpAddr>,
-    /// This session's A/V ping payload ([`super::AppState::av_ping`]) — the other half of the
-    /// endpoint guard beside `owner_ip`, and the half a peer sharing that address cannot forge.
+    /// Session A/V ping payload — the half of the endpoint guard a shared-address peer cannot forge.
     pub av_ping: [u8; super::AV_PING_LEN],
-    /// Ends the whole session, deliberately — the action for "the launched game exited".
     pub on_game_exit: super::OnSessionLost,
 }
 
@@ -93,36 +81,25 @@ pub fn start(
     force_idr: Arc<AtomicBool>,
     rfi_range: RfiSlot,
     loss: Arc<super::GsLossStats>,
-    // The session rikey, ONLY when `cfg.encrypt_video` (WP7). Deliberately its own parameter
-    // rather than a `StreamConfig` field: that struct is `Debug`-logged at stream start, and a
-    // session key has no business in the log.
+    // Session rikey, only when `cfg.encrypt_video`. Not a `StreamConfig` field: that
+    // struct is `Debug`-logged at stream start.
     gcm_key: Option<[u8; 16]>,
     video_cap: CapturerSlot,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
     on_lost: super::OnSessionLost,
-    // Bumped as the LAST act of this thread — the full-teardown-complete signal `/resume`'s
-    // media restart waits on (see `AppState::media_exited`).
+    // Last act of this thread — `/resume` waits on this counter (`AppState::media_exited`).
     media_exited: Arc<std::sync::atomic::AtomicU64>,
     life: GameLifetime,
 ) {
     let _ = std::thread::Builder::new()
         .name("punktfunk-video".into())
         .spawn(move || {
-            // Same scheduling posture as the native path's capture/encode thread (Linux nice -10 /
-            // Windows HIGHEST + session tuning) — GameStream previously ran unboosted on Linux.
             crate::native::boost_thread_priority(true);
-            // A GameStream viewer may be video-only too — hold the suspend/idle inhibitor for
-            // this stream's lifetime (plane parity with the native LiveSessionGuard).
+            // Hold even for video-only viewers — plane parity with native `LiveSessionGuard`.
             let _sleep = crate::sleep_inhibit::hold();
             tracing::info!(?cfg, "video stream starting");
-            // Lifecycle events + the script-facing marker file, plane parity with the native loop
-            // (RFC §4): `announce` emits `stream.started`/`stream.stopped` and holds the marker for
-            // the span between. It runs BEFORE `run` because `run` is what launches the app — the
-            // marker has to exist by the time the title's own wrapper script executes, or the
-            // wrapper takes its "not streaming" branch mid-stream. The RTSP layer carries no client
-            // device name, so `client` is empty here — the `plane` field is what hooks key on.
-            // `client.connected` fires alongside `stream.started` because a Moonlight client has no
-            // persistent connection to anchor it to.
+            // Before `run`: `run` launches the app, and the title's wrapper keys on this marker.
+            // RTSP carries no device name, so `client` is empty; hooks key on `plane`.
             let stream_marker = crate::stream_marker::announce(crate::stream_marker::StreamInfo {
                 width: cfg.width,
                 height: cfg.height,
@@ -140,10 +117,7 @@ pub fn start(
             crate::events::emit(crate::events::EventKind::ClientConnected {
                 client: event_client.clone(),
             });
-            // GPU clock pin (Linux, opt-in `PUNKTFUNK_PIN_CLOCKS`): hold the box-wide vendor clock
-            // floor while this compat-plane stream runs, refcounted with every other live session
-            // across both planes. Released when the closure exits (stream stopped) — so idle clocks
-            // aren't pinned between Moonlight sessions. No-op off Linux / when the flag is unset.
+            // Released when the closure exits so idle clocks are not pinned between sessions.
             #[cfg(target_os = "linux")]
             let _clock_pin = crate::gpuclocks::session_pin();
             let result = run(
@@ -159,9 +133,7 @@ pub fn start(
                 &on_lost,
                 &life,
             );
-            // A clean return is a stop (RTSP teardown / cancel / client unreachable) → `quit`;
-            // an error return is `error`. The compat plane can't tell a user stop from an idle
-            // vanish the way the native plane's typed close code can.
+            // Clean return is a stop; error is `error`. Compat has no typed close code.
             let reason = match &result {
                 Ok(()) => crate::events::DisconnectReason::Quit,
                 Err(_) => crate::events::DisconnectReason::Error,
@@ -170,16 +142,14 @@ pub fn start(
                 tracing::error!(error = %format!("{e:#}"), "video stream failed");
             }
             running.store(false, Ordering::SeqCst);
-            // Retract the marker and fire `stream.stopped` — explicitly here, before
-            // `client.disconnected`, so the compat plane keeps the native loop's event order.
+            // Before `client.disconnected` — native loop event order.
             drop(stream_marker);
             crate::events::emit(crate::events::EventKind::ClientDisconnected {
                 client: event_client,
                 reason,
             });
             tracing::info!("video stream stopped");
-            // LAST: everything above (capturer re-pool, lease guard, marker, events) has run,
-            // so a `/resume` waiting on this counter can safely start the successor threads.
+            // After capturer re-pool, lease, marker, events — `/resume` may start successors.
             media_exited.fetch_add(1, Ordering::SeqCst);
         });
 }
@@ -192,67 +162,43 @@ fn run(
     force_idr: &AtomicBool,
     rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
     loss: &super::GsLossStats,
-    // The session rikey when SS_ENC_VIDEO was negotiated — see `start`.
     gcm_key: Option<[u8; 16]>,
     video_cap: &std::sync::Mutex<Option<PooledCapturer>>,
-    // Shared stats recorder for the web-console capture/graph. Threaded into `stream_body` (the
-    // encode loop); per-frame sample emission is wired by a later pass.
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
-    // Whole-session teardown for the send thread's client-unreachable detection.
     on_lost: &super::OnSessionLost,
-    // The launched game's lifetime wiring (quit flag, launch owner, game-exit teardown).
     life: &GameLifetime,
 ) -> Result<()> {
-    // GameStream capture/encode thread: apply Windows session tuning (no-op off Windows).
     pf_frame::session_tuning::on_hot_thread();
-    // Reject an out-of-range client mode before allocating capture/encode buffers.
+    // Reject an out-of-range mode before allocating capture/encode buffers.
     encode::validate_dimensions(cfg.codec, cfg.width, cfg.height)
         .context("client-requested video mode")?;
     let sock = UdpSocket::bind(("0.0.0.0", VIDEO_PORT)).context("bind video UDP")?;
-    // Grow SO_SNDBUF/RCVBUF (avoid host-side ENOBUFS at high bitrate) like the native plane.
-    // The opt-in DSCP/QoS tag happens after connect below (Windows qWAVE derives the flow from
-    // the connected 5-tuple).
+    // QoS is after `connect` — Windows qWAVE derives the flow from the connected 5-tuple.
     punktfunk_core::transport::grow_socket_buffers(&sock);
-    // The client pings the video port so we learn where to send; it re-pings until video
-    // flows, so a missed early ping is fine.
+    // Client re-pings until video flows, so a missed early ping is fine.
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
     tracing::info!(
         port = VIDEO_PORT,
         "video: awaiting client ping to learn endpoint"
     );
-    // Bound to the launch owner's source IP AND to this session's ping payload — see
-    // `super::learn_client_endpoint`, which both media planes share so they cannot drift on what
-    // counts as their client.
+    // Owner IP and this session's ping payload — both media planes share `learn_client_endpoint`.
     let client = super::learn_client_endpoint(&sock, "video", life.owner_ip, &life.av_ping)?;
     sock.connect(client)
         .context("connect client video endpoint")?;
-    // Opt-in DSCP/QoS-tag this as the video class (PUNKTFUNK_DSCP=1); the guard keeps the
-    // Windows qWAVE flow alive for the whole stream (this function's scope IS the stream).
+    // Guard keeps the Windows qWAVE flow alive for this function's scope (the stream).
     let _qos_flow = punktfunk_core::transport::set_media_qos(
         &sock,
         punktfunk_core::transport::MediaClass::Video,
     );
     tracing::info!(%client, "video: client endpoint learned");
-    // Short label for web-console stats captures: the client's peer IP.
     let client_label = client.ip().to_string();
 
-    // Native client-resolution source: create a compositor virtual output sized to the client's
-    // request and capture it (no scaling). Self-contained — deliberately NOT pooled in
-    // `video_cap`, since a reconnect at a different resolution needs a freshly-sized output; the
-    // output is released when this capturer drops at stream end (RAII via its keepalive).
+    // Not pooled: a reconnect at a different resolution needs a freshly-sized output.
     if pf_host_config::config().video_source.as_deref() == Some("virtual") {
-        // Reference point for adopting the launched game's processes: anything the host will call
-        // "this session's game" has to have started after this instant. Taken HERE — before the prep
-        // steps, before the source (a bare-spawn gamescope nests the game inside it), before the
-        // launch — because a reading taken later would reject the very process it is meant to find.
-        // Erring early can only ever include more of our own launch, never a copy from before it.
+        // Before prep, source, and launch — a later stamp would reject the process it is meant to find.
         let fresh_stamp = crate::gamelease::launch_clock();
-        // Everything the host knows about the title being launched, resolved in ONE library scan:
-        // what to run, what to call it, and how to recognize it once it is up.
         let target = resolve_gs_app(app);
-        // Moonlight has no session resume, so a client coming back for a game it left behind does it
-        // by launching the title again. Reprieve that game before anything starts, so the copy the
-        // player is about to be handed isn't killed out from under them when the old window closes.
+        // Moonlight has no resume; relaunch must reprieve the leftover game before anything starts.
         if let Some(t) = target.as_ref() {
             let reprieved =
                 crate::gamelease::readopt(life.fingerprint.as_deref(), t.game.id.as_deref());
@@ -264,12 +210,8 @@ fn run(
                 );
             }
         }
-        // ...and the other half of coming back for it: the host's own record of what it launched, for
-        // whom (`crate::launchreg`). Plane parity with the native path — same registry, same rule.
-        // A relaunch of a title this client's copy of which is still running neither starts a second
-        // copy nor mints a fresh reference instant the running game could never satisfy. A paired
-        // Moonlight client has a fingerprint; an anonymous one (or an operator-typed `apps.json`
-        // entry with no library id) is not recordable and behaves exactly as it always has.
+        // Do not start a second copy or mint a stamp the running game could never satisfy.
+        // Anonymous / no library id is unrecordable.
         let launch_claim = target.as_ref().map(|t| {
             crate::launchreg::claim(
                 life.fingerprint.as_deref(),
@@ -279,11 +221,8 @@ fn run(
         });
         let launch_stamp = launch_claim.as_ref().map_or(fresh_stamp, |c| c.stamp());
         let adopt_launch = launch_claim.as_ref().is_some_and(|c| !c.must_spawn());
-        // Per-app prep steps (RFC §6): the entry's own `prep` plus a custom library title's,
-        // run synchronously BEFORE the virtual output opens or anything launches (an HDR
-        // toggle / sink switch must land first — and gamescope's nested launch happens inside
-        // `open_gs_virtual_source`). The guard's drop runs the undos at stream end — reverse
-        // order, best-effort, on every exit path including a panic-unwind.
+        // Before the virtual output opens: HDR toggle / sink switch must land first.
+        // Guard drop undoes in reverse, including panic-unwind.
         let mut prep_cmds = app.map(|a| a.prep.clone()).unwrap_or_default();
         if let Some(lib_id) = app.and_then(|a| a.library_id.as_deref()) {
             prep_cmds.extend(crate::library::prep_for(lib_id));
@@ -292,28 +231,19 @@ fn run(
             "PF_APP_TITLE".to_string(),
             app.map(|a| a.title.clone()).unwrap_or_default(),
         )];
-        // The negotiated mode, same `PF_STREAM_*` names as the native plane's prep env and the
-        // marker file — one vocabulary for a script whichever client connected.
+        // Same `PF_STREAM_*` names as the native plane's prep env and the marker file.
         prep_env.extend(crate::hooks::prep_mode_env(
             cfg.width, cfg.height, cfg.fps, cfg.hdr,
         ));
         let _prep = (!prep_cmds.is_empty()).then(|| crate::hooks::run_prep(&prep_cmds, &prep_env));
-        // Open the virtual-display source: pick the live compositor, normalize the session env
-        // (apply_session_env + input/gamescope routing — ATTACH/resize + KWin/Mutter retargeting,
-        // exactly like the native plane), create a virtual output at the client mode, and capture it.
-        // Re-runnable: the encode loop calls it again on a mid-stream capture loss to FOLLOW a
-        // Desktop<->Game switch.
+        // Re-runnable: the encode loop calls it again on a mid-stream capture loss.
         let (mut capturer, compositor, gamescope_route) =
             open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit)?;
-        // Only the Linux `launch_is_nested` reads it; gamescope does not exist on Windows.
+        // Only Linux `launch_is_nested` reads it; gamescope does not exist on Windows.
         #[cfg(not(target_os = "linux"))]
         let _ = &gamescope_route;
-        // Register this session in the admission table. GameStream acquires a REAL display but
-        // never registered, so `admit`'s Windows budgets — `max_displays` and the NVENC session
-        // headroom — could not see it: both gate on `!live.is_empty()`, so a Moonlight-held display
-        // was invisible to them and a native connect could be admitted past a budget the box had
-        // already spent. Identity is `None` (the compat plane has no cert fingerprint), which is the
-        // same "anonymous" the conflict policy already handles. Dropped at the end of `run`.
+        // GameStream holds a real display; without this, Windows `admit` budgets cannot see it.
+        // `None` identity is the anonymous slot. Dropped at the end of `run`.
         let _admission_guard = crate::vdisplay::admission::register(
             None,
             (cfg.width, cfg.height, cfg.fps),
@@ -327,29 +257,14 @@ fn run(
             h = cfg.height,
             "video source: virtual display (native client resolution)"
         );
-        // Launch the app's command now that capture is live, for the backends that DON'T nest it via
-        // set_launch_command above: Windows (no gamescope) and, on Linux, everything but gamescope's
-        // bare-spawn sub-mode (kwin/mutter/wlroots stream the existing desktop; a managed/attached
-        // gamescope is a running session to launch INTO — `launch_session_command` routes both).
-        // A library title (Steam/Epic/GOG/Xbox/custom, surfaced in /applist) carries its
-        // store-qualified id — resolved against the host's OWN library (the client can only pick an
-        // existing title, never inject a command). An apps.json entry instead carries an
-        // operator-typed `cmd`. Library id wins when both are set.
-        //
-        // ...and once per LAUNCH, not once per `/launch` request: `adopt_launch` is the record's
-        // verdict that this client's copy of the title is already running (see above), and
-        // `spawned_now` is what actually happened — the record is settled from it below.
+        // Launch now that capture is live, for backends that do not nest via `set_launch_command`.
+        // Library id wins over an operator-typed `cmd`. Skip spawn when `adopt_launch`.
         #[allow(unused_mut)]
         let mut spawned_now = false;
-        // Windows hands back a pid rather than a child; kept for the lease (see the native plane
-        // and `gamelease::LeaseRequest::spawned`). `None` elsewhere, when nothing was spawned, and
-        // when what was spawned only forwards the launch (`library::WinRecipe::owns_game`).
+        // Windows pid for the lease. `None` when nothing spawned, or the spawn only forwards.
         #[allow(unused_mut)]
         let mut spawned_pid: Option<u32> = None;
-        // Close this client's previous game first, when the operator asked for that — the compat
-        // plane's half of `GameOnNewLaunch`. Moonlight clients are cert-paired, so they carry the
-        // fingerprint the launch records are keyed by and the policy applies to them exactly as it
-        // does on the native plane.
+        // `GameOnNewLaunch`: Moonlight is cert-paired, so the fingerprint keys the same records.
         if !adopt_launch {
             if let Some(t) = target.as_ref() {
                 crate::gamelease::end_others_for_new_launch(
@@ -367,12 +282,9 @@ fn run(
                      a second one"
                 );
             } else {
-                // A library title launches by its store-qualified id (the interactive-session spawner
-                // resolves the store's own recipe); an operator-typed command runs as itself.
                 let launched = match (t.game.id.as_deref(), t.command.as_deref()) {
                     (Some(id), _) => crate::library::launch_gamestream_library(id).map(Some),
                     (None, Some(cmd)) => crate::library::launch_gamestream_command(cmd).map(Some),
-                    // Nothing to start (a target that names neither) — not a spawn, so no pid.
                     (None, None) => Ok(None),
                 };
                 match launched {
@@ -386,16 +298,10 @@ fn run(
                 }
             }
         }
-        // Linux keeps the spawned child rather than dropping it: it is the primary liveness signal
-        // for a title whose store told us nothing else, and the handle the termination ladder
-        // signals. A gamescope bare spawn already nested the command (`set_launch_command` in the
-        // source open), so launching again would start it twice.
+        // Keep the child: it is the liveness signal and the termination-ladder handle.
+        // Gamescope bare-spawn already nested the command; launching again would start it twice.
         #[cfg(target_os = "linux")]
         let spawned_launch = match target.as_ref().and_then(|t| t.command.as_deref()) {
-            // Already ours and still running: don't hand the player a second copy. The nested arm
-            // below reaches the same conclusion through the display registry, whose reuse key includes
-            // the launch command — a kept gamescope with the game inside it is re-attached, not
-            // respawned.
             Some(cmd) if adopt_launch => {
                 tracing::info!(
                     command = %cmd,
@@ -405,7 +311,6 @@ fn run(
                 None
             }
             Some(_) if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()) => {
-                // gamescope spawned it as its own nested child when the source opened above.
                 spawned_now = true;
                 None
             }
@@ -423,7 +328,6 @@ fn run(
         };
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         let _ = adopt_launch;
-        // Settle the record against what actually happened (see the native plane).
         if let Some(c) = launch_claim.as_ref() {
             if spawned_now {
                 c.launched();
@@ -432,15 +336,8 @@ fn run(
             }
         }
 
-        // The launched game's lifetime, in both directions (design/session-game-lifetime.md) — the
-        // compat plane's half of what the native plane already does:
-        //
-        // * **its exit ends the session**, so Moonlight returns to its app list instead of leaving
-        //   the player on a bare desktop or a hidden launcher.
-        // * **this session ending can end it** — never by default; only when the operator asked, and
-        //   for a mere drop only after a reconnect window (the guard's drop). Moonlight can't resume
-        //   a session, but the window still protects unsaved progress on a network blip, and a
-        //   relaunch of the same title reclaims the game (above).
+        // Exit ends the session; session end can end the game only if asked, and a drop waits
+        // the reconnect window (`design/session-game-lifetime.md`).
         let _game_life = target.as_ref().map(|t| {
             #[cfg(target_os = "linux")]
             let nested = crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref());
@@ -454,9 +351,7 @@ fn run(
             let on_exit: crate::gamelease::OnExit = {
                 let on_game_exit = life.on_game_exit.clone();
                 Box::new(move || {
-                    // Read the setting at fire time, so flipping it mid-session takes effect. The
-                    // lease itself keeps running either way — the status surface still reports the
-                    // game.
+                    // Read at fire time so a mid-session flip takes effect. The lease still runs.
                     if !crate::session_settings::get().session_on_game_exit {
                         tracing::info!(
                             "the launched game exited, but ending the session on game exit is off — \
@@ -465,16 +360,14 @@ fn run(
                         return;
                     }
                     tracing::info!("the launched game exited — ending the session");
-                    // Deliberate: the player finished. The display skips its keep-alive linger and
-                    // the launch state is cleared, so Moonlight's next `/launch` starts cleanly.
+                    // Skip keep-alive linger so the next `/launch` starts clean.
                     on_game_exit();
                 })
             };
             let lease = crate::gamelease::open(
                 crate::gamelease::LeaseRequest {
                     game: t.game.clone(),
-                    // RTSP carries no client device name, so the peer IP is the best label there is
-                    // (the same one the stats capture uses).
+                    // RTSP carries no device name; peer IP is the stats-capture label too.
                     client: client_label.clone(),
                     plane: crate::events::Plane::Gamestream,
                     spec: t.detect.clone(),
@@ -483,14 +376,12 @@ fn run(
                     child,
                     spawned: spawned_pid,
                     launch_stamp,
-                    // For an adopted launch this is the ORIGINAL launch's slot, so the record keeps
-                    // tracking the same processes across the handover.
+                    // Adopted launch keeps the original slot across the handover.
                     procs: launch_claim.as_ref().and_then(|c| c.procs()),
                 },
                 on_exit,
             );
-            // Declared first so it drops first: the console loses the live row before the policy
-            // below can replace it with a `grace` one, rather than briefly showing both.
+            // Drops first so the console does not briefly show live and `grace` rows together.
             let published = crate::session_status::publish_gamestream_game(lease.shared());
             (
                 published,
@@ -498,27 +389,19 @@ fn run(
                     lease,
                     life.quit.clone(),
                     life.fingerprint.clone(),
-                    // The record's hold moves in here — its drop opens the reconnect window the next
-                    // `/launch` of this title is matched against.
+                    // Drop opens the reconnect window the next `/launch` of this title matches.
                     launch_claim,
                 ),
             )
         });
-        // Rebuild closure: re-open the source on a mid-stream capture loss, RE-DETECTING the live
-        // compositor — so a Desktop<->Game switch (at the client's fixed mode) is FOLLOWED in place
-        // without a Moonlight reconnect. (A resolution change can't be followed mid-stream on
-        // GameStream — WxH is locked at ANNOUNCE — but a session toggle keeps the negotiated mode.)
+        // Re-detect the live compositor so a Desktop↔Game switch is followed in place.
+        // WxH is locked at ANNOUNCE — a resolution change cannot follow mid-stream.
         let rebuild =
             || open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit).map(|(c, _, _)| c);
         return stream_body(
             &mut capturer,
             Some(&rebuild),
-            // Mirrors the source's own `set_hw_cursor` request (`open_gs_virtual_source`):
-            // cursor-as-metadata + host blend wherever the backend composites — the
-            // compositor-EMBEDS fallback never paints on a Mutter virtual stream (the
-            // native plane's no-channel rule, `session_plan::cursor_blend_for`). gamescope
-            // remains the pointerless residual — its capture carries no cursor either way
-            // (the native plane's XFixes source is not wired on this plane).
+            // Gamescope capture carries no cursor either way; Mutter embed never paints.
             compositor != crate::vdisplay::Compositor::Gamescope
                 && blend_capable_metadata_cursor(&cfg),
             &sock,
@@ -534,21 +417,10 @@ fn run(
         );
     }
 
-    // Reuse the persistent capturer (one screencast session → clean reconnect); create it on
-    // the first stream. Borrow it for this stream and return it on exit. Reuse is gated on the
-    // pooled capturer's HDR-ness matching this stream's negotiated `cfg.hdr` — the depth is a
-    // PipeWire-negotiation-time property of the screencast session, so an HDR↔SDR change needs a
-    // fresh session (same pattern as the audio capturer's channel-count gate).
-    // Cursor-as-metadata only where the encode backend this session resolves to composites
-    // `frame.cursor` (the caps-aware negotiation — mirror of the native plane's); otherwise ask
-    // the portal to EMBED the pointer so no backend × cursor-mode combination streams
-    // cursorless. Synthetic frames carry no pointer either way.
+    // Reuse gated on HDR + cursor mode + pin. Depth is a PipeWire-negotiation property;
+    // mismatch needs a fresh session. Embed the pointer unless this backend composites it.
     let metadata_cursor = blend_capable_metadata_cursor(&cfg);
-    // Which screen this stream must show. The host-wide pin (§5.3) applies to the compat plane too:
-    // the portal chooser cannot name a head, so a pinned host MIRRORS it here the same way the
-    // virtual source does via `vdisplay::open`. Without this a Moonlight client on a pinned host
-    // would silently get whichever monitor the portal handed back — "showing the wrong monitor is
-    // worse than showing none" is the rule the whole feature is built on.
+    // Host-wide pin: without this, Moonlight gets whichever head the portal hands back.
     #[cfg(target_os = "linux")]
     let pinned = crate::vdisplay::capture_monitor();
     #[cfg(not(target_os = "linux"))]
@@ -609,7 +481,7 @@ fn run(
         }
     };
     capturer.set_active(true);
-    // Portal/synthetic source: no compositor virtual output to re-detect, so no rebuild closure.
+    // Portal/synthetic: no virtual output to re-detect.
     let result = stream_body(
         &mut capturer,
         None,
@@ -626,14 +498,8 @@ fn run(
         on_lost,
     );
     capturer.set_active(false);
-    // Re-pool ONLY a capturer that can still produce frames. Every terminal state of the portal
-    // backend is sticky (`Capturer::is_alive`): a dead zerocopy-import worker, an exited PipeWire
-    // thread, or a compositor that went away all make the NEXT stream fail at exactly the same
-    // point — and this path has no rebuild closure (unlike the virtual-output path above), so a
-    // re-admitted dead capturer wedged GameStream portal video permanently, at 10 s per reconnect
-    // attempt. Dropping it instead costs one fresh screencast session on the next connect. Note
-    // `result` may already be `Err` here, which is itself that signal. (`metadata_cursor` and the
-    // monitor pin ride along as the other two reuse keys, beside HDR-ness — see `PooledCapturer`.)
+    // Portal terminal states are sticky and this path has no rebuild. Re-pooling a dead
+    // capturer wedges the next connect; drop it and pay one fresh screencast session.
     if result.is_ok() && capturer.is_alive() {
         *video_cap.lock().unwrap() = Some((capturer, cfg.hdr, metadata_cursor, pinned));
     } else {
@@ -647,23 +513,17 @@ fn run(
     result
 }
 
-/// Open a capturer on the **pinned physical monitor** for the compat plane's portal source
-/// (`design/per-monitor-portal-capture.md` §5.3). The pin is host-wide, so it has to be honored on
-/// every plane that captures a screen — and the portal source is the one that otherwise takes
-/// "whichever head the portal hands back".
-///
-/// Deliberately *not* the `open_gs_virtual_source` path: this source launches nothing and creates no
-/// virtual output, so it needs neither the game-lifetime machinery nor the registry (a mirror is
-/// [`DisplayOwnership::External`](crate::vdisplay::DisplayOwnership) and would pass straight through
-/// it anyway). A missing monitor fails the stream loudly rather than falling back to another screen.
+/// Capturer on the pinned physical monitor for the portal source
+/// (`design/per-monitor-portal-capture.md`). Not [`open_gs_virtual_source`]: a mirror launches
+/// nothing and creates no virtual output. A missing monitor fails the stream rather than
+/// falling back to another screen.
 #[cfg(target_os = "linux")]
 fn open_gs_mirror_source(
     connector: &str,
     cfg: StreamConfig,
     metadata_cursor: bool,
 ) -> Result<Box<dyn Capturer>> {
-    // Follow the live session first, exactly as the virtual source does — a mirror host that
-    // switched Desktop↔Game since startup must be enumerated against the compositor that is up now.
+    // Enumerate against the compositor that is up now — Desktop↔Game may have switched.
     let active = crate::vdisplay::detect_active_session();
     crate::vdisplay::observe_session_instance(&active);
     crate::vdisplay::apply_session_env(&active);
@@ -671,16 +531,11 @@ fn open_gs_mirror_source(
         .map(Ok)
         .unwrap_or_else(crate::vdisplay::detect)
         .context("detect compositor")?;
-    // Point input at the same backend the video landed on. A mirror streams an existing head, so no
-    // gamescope sub-mode applies and no route is resolved here at all.
+    // Mirror streams an existing head: no gamescope sub-mode, no route.
     crate::inject::set_backend_id(crate::vdisplay::input_backend_id(compositor));
     let mut vd = crate::vdisplay::open_mirror(compositor, connector)?;
-    // Cursor mode is the session's negotiated one: metadata where this encode path composites
-    // `frame.cursor`, otherwise let the compositor embed it (§7.5 — one resolver, per-backend
-    // expression).
     vd.set_hw_cursor(metadata_cursor);
-    // The mirror backend ignores the requested mode by design (§7.3 — a panel runs at the mode its
-    // owner set, and the client scales); pass the client's anyway so the argument stays honest.
+    // Panel runs at the owner's mode; the client scales. Pass the client's anyway.
     let vout = vd
         .create(punktfunk_core::Mode {
             width: cfg.width,
@@ -690,9 +545,6 @@ fn open_gs_mirror_source(
         .context("start mirroring the pinned monitor")?;
     crate::capture::capture_virtual_output(
         vout,
-        // The capture format comes from the shared SessionPlan (WP5.1) — the same resolver the
-        // native plane uses, so the `gpu` predicate, HDR-ness and the producer-native-NV12 CSC
-        // skip can't drift between the planes. See `gs_session_plan`.
         gs_session_plan(&cfg, metadata_cursor).output_format(),
         crate::session_plan::CaptureBackend::resolve(),
         compositor == crate::vdisplay::Compositor::Kwin,
@@ -700,28 +552,18 @@ fn open_gs_mirror_source(
     .context("attach a capturer to the mirrored monitor")
 }
 
-/// What the compat plane resolved about the app a client launched: identity for the lease, the status
-/// surface and the `game.*` events; the signals that recognize the running game; and the command to
-/// run it.
+/// Resolved launch: lease identity, detect signals, and the command to run.
 struct GsApp {
     game: crate::gamelease::GameRef,
-    /// This entry opens a LAUNCHER rather than a game (design D4) — carried through from
-    /// [`crate::library::LaunchTarget`] so the lease can stay untracked for it.
+    /// Launcher tile, not a game — the lease stays untracked ([`crate::library::LaunchTarget`]).
     launcher: bool,
     detect: crate::library::DetectSpec,
-    /// The resolved shell command. `Some` on Linux, which runs it itself; `None` for a Windows
-    /// library title, which launches by id through the interactive-session spawner instead.
+    /// `Some` on Linux (host runs it). `None` for a Windows library title (launch by id).
     command: Option<String>,
 }
 
-/// Resolve a `/launch`ed catalog entry against the host's **own** library — the client sends only an
-/// appid, and everything the session does with the title afterwards comes from what the host knows
-/// about it.
-///
-/// A library pick carries its store's detect signals. An operator-typed `apps.json` command has no
-/// library entry behind it, so its title is the whole identity and its own first token — when that is
-/// an absolute executable — the only signal there is; the host spawns it directly anyway, so the child
-/// is the primary tracking either way. `None` = nothing to launch (Desktop, or an unresolvable entry).
+/// Resolve a `/launch` catalog entry against the host's own library. The client sends only
+/// an appid. `None` = nothing to launch (Desktop, or an unresolvable entry).
 fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
     let app = app?;
     if let Some(id) = app.library_id.as_deref() {
@@ -734,8 +576,6 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
                     command: t.command,
                 })
             }
-            // Same fallback (and same warning) the plain command resolution has always had, so a
-            // client picking a stale title sees why nothing started.
             None => tracing::warn!(
                 launch_id = id,
                 "requested launch id not in this host's library (or no launch recipe) — ignoring"
@@ -748,7 +588,6 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
         .map(str::trim)
         .filter(|c| !c.is_empty())?;
     Some(GsApp {
-        // An operator-typed command has no library entry behind it, so it is never a launcher tile.
         launcher: false,
         game: crate::gamelease::GameRef {
             id: None,
@@ -764,19 +603,9 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
     })
 }
 
-/// Open the virtual-display video source for a GameStream session: pick the LIVE compositor + normalize
-/// the session env (apply_session_env + input/gamescope routing — ATTACH/resize, KWin/Mutter
-/// retargeting) exactly like the native plane (native.rs resolve_compositor), create a virtual
-/// output at the client's mode, and capture it. Returns the capturer (it owns the output's keepalive;
-/// the stateless VirtualDisplay factory is dropped here) plus the resolved compositor. An apps.json
-/// entry can PIN a compositor (skips the live detect/retarget). Re-run on a mid-stream capture loss to
-/// FOLLOW a Desktop<->Game switch: it re-detects the now-live compositor and re-targets at it. Does NOT
-/// launch the app (that happens once at stream start; a rebuild must not re-spawn it).
-/// Cursor-as-metadata for this plane (GameStream has no cursor channel): only where the encode
-/// backend this session resolves to composites `frame.cursor` — the same CUDA-payload
-/// prediction `SessionPlan`/`handshake::cursor_forward` make (the NVIDIA resolution plus the
-/// zero-copy master switch). Shared by the monitor-mirror and virtual-output sources so their
-/// `set_hw_cursor` request and `stream_body`'s blend flag cannot drift.
+/// Cursor-as-metadata only where this session's encode backend composites `frame.cursor`.
+/// Shared by the mirror and virtual-output sources so `set_hw_cursor` and `stream_body`'s
+/// blend flag cannot drift. GameStream has no cursor channel.
 fn blend_capable_metadata_cursor(cfg: &StreamConfig) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -790,14 +619,14 @@ fn blend_capable_metadata_cursor(cfg: &StreamConfig) -> bool {
     }
 }
 
+/// Virtual-display source at the client's mode. Re-run on mid-stream capture loss to follow a
+/// Desktop↔Game switch. Does not launch the app — a rebuild must not re-spawn it. The capturer
+/// owns the output keepalive; the factory is dropped here.
 fn open_gs_virtual_source(
     cfg: StreamConfig,
     app: Option<&super::apps::AppEntry>,
-    // The resolved title (see [`resolve_gs_app`]) — its command is what a bare-spawn gamescope nests
-    // and what decides whether this session is a dedicated game session at all. Resolved once by the
-    // caller, so a mid-stream rebuild can't re-resolve to something different.
+    // Resolved once by the caller so a rebuild cannot re-resolve to something different.
     launch: Option<&GsApp>,
-    // The session's deliberate-quit flag, handed to the display's keep-alive lease.
     quit: &Arc<AtomicBool>,
 ) -> Result<(
     Box<dyn Capturer>,
@@ -805,33 +634,23 @@ fn open_gs_virtual_source(
     Option<crate::vdisplay::GamescopeRoute>,
 )> {
     let (compositor, gamescope_route) = if let Some(c) = app.and_then(|a| a.compositor) {
-        // An app-pinned compositor still needs a route resolved, or `create` falls through to a
-        // bare spawn on a box pinned to the managed session (mirrors `native::resolve_compositor`).
+        // Still resolve a route, or `create` falls through to a bare spawn on a managed box.
         let r = crate::vdisplay::resolve_gamescope_route(c, false);
         (c, r)
     } else {
-        // Windows has a single virtual-display backend (pf-vdisplay); `vdisplay::open` ignores the
-        // compositor arg there, so short-circuit the Linux session-detection state machine with a
-        // placeholder — mirrors `native::resolve_compositor`. Without this, the Linux `detect()`
-        // below bails on Windows ("could not detect compositor … XDG_CURRENT_DESKTOP=''"), which
-        // killed the GameStream video thread → black screen (the native plane was already guarded).
+        // `vdisplay::open` ignores the compositor on Windows; skip Linux `detect()` which bails.
         #[cfg(target_os = "windows")]
         {
             (crate::vdisplay::Compositor::Kwin, None)
         }
         #[cfg(not(target_os = "windows"))]
         {
-            // A client is (re)connecting → cancel any pending TV-session restore (review #3).
             crate::vdisplay::cancel_pending_tv_restore();
             let active = crate::vdisplay::detect_active_session();
-            // A4: fold any compositor-instance change (idle-time Game↔Desktop switch) into the epoch
-            // before acquiring, so a GameStream reconnect never reuses a dead-instance node.
+            // Fold an idle-time Game↔Desktop instance change into the epoch before acquire.
             crate::vdisplay::observe_session_instance(&active);
             crate::vdisplay::apply_session_env(&active);
-            // Dedicated game session (B0): a GameStream app whose launch RESOLVES to a command (library
-            // id / apps.json command), under `game_session=dedicated` with gamescope available, gets its
-            // own headless gamescope spawn at the client mode — same routing as the native plane. Gate on
-            // the resolved command so an unresolvable entry falls back to auto routing (review #9).
+            // Gate on a resolved command so an unresolvable entry falls back to auto routing.
             let has_launch = launch.and_then(|t| t.command.as_deref()).is_some();
             if crate::vdisplay::wants_dedicated_game_session(has_launch) {
                 let c = crate::vdisplay::Compositor::Gamescope;
@@ -848,36 +667,17 @@ fn open_gs_virtual_source(
         }
     };
     let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
-    // Out-of-band cursor for the virtual source (the native plane's no-channel rule, mirrored):
-    // GameStream has no cursor channel, and the compositor-EMBEDS fallback never paints on a
-    // Mutter virtual stream (stage-global overlay suppression since Mutter 48 — see
-    // pf-vdisplay `mutter.rs`), so ask for cursor-as-metadata wherever the resolved backend
-    // composites `frame.cursor`; `stream_body`'s blend flag mirrors this request. gamescope
-    // stays off: its capture carries no metadata either way, and the request would cost the
-    // native-NV12 shape for nothing.
+    // Mutter virtual never paints an embedded pointer. Gamescope stays off: no metadata
+    // either way, and the request would cost the native-NV12 shape for nothing.
     vd.set_hw_cursor(
         compositor != crate::vdisplay::Compositor::Gamescope && blend_capable_metadata_cursor(&cfg),
     );
-    // Carry the resolved launch command on the backend instance (per-session) rather than a
-    // process-global env var, so concurrent sessions can't stomp each other's launch target. It is
-    // the RESOLVED command, so gamescope's bare spawn nests a library title exactly like an
-    // apps.json command (it previously nested only `cmd`, silently dropping library picks). Off
-    // Linux this is a no-op backend-side, and a library title resolves to no command at all — the
-    // interactive-session spawner launches it by id instead.
+    // Per-session, not a process-global env: concurrent sessions must not stomp launch targets.
     vd.set_launch_command(launch.and_then(|t| t.command.clone()));
-    // This plane's resolved gamescope sub-mode, on the instance for the same reason as the launch
-    // command above — the GameStream and native planes both resolve a route, so publishing
-    // through the process env let either retarget the other's `create`.
+    // Same reason: a process env let either plane retarget the other's `create`.
     vd.set_gamescope_route(gamescope_route.clone());
-    // Serialize with the punktfunk/1 plane's IDD-push setup dance (Goal-1 §2.5). A GameStream
-    // connect used to skip it entirely, so it could ADD/reconfigure the shared monitor while a
-    // native session was mid-build (and vice versa), and its sealed-channel delivery would replace
-    // the native session's ring (newest-wins) — each plane could freeze the other. GameStream has
-    // no cooperative stop-flag plumbing, so it registers a flag nobody reads: a LATER session that
-    // preempts this one signals it, waits the 3 s release grace, then force-preempts the monitor —
-    // this session then fails on capture and tears down cleanly (the intended handover). GameStream
-    // is anonymous (no client cert), so it holds the ANONYMOUS slot (0) — GS stays single-display,
-    // and only a later slot-0 session (another GS/anonymous connect) preempts it.
+    // Register an unread stop flag so a later session can preempt (3 s grace, then force).
+    // Anonymous slot 0 — only another slot-0 connect preempts it.
     #[cfg(target_os = "windows")]
     let _idd_setup_guard = matches!(
         crate::session_plan::CaptureBackend::resolve(),
@@ -896,27 +696,14 @@ fn open_gs_virtual_source(
             height: cfg.height,
             refresh_hz: cfg.fps,
         },
-        // GameStream's deliberate quit is the Moonlight "Quit App" (nvhttp `h_cancel`), the
-        // management stop, or the launched game exiting — not a QUIC close code. All three set the
-        // session's quit flag ([`super::AppState::quit`]), so the display skips its keep-alive linger
-        // for a stop the way it does on the native plane, and only a real drop lingers.
+        // Quit App / management stop / game exit skip linger; only a real drop lingers.
         quit.clone(),
-        None, // fresh session — no display superseded
+        None,
     )
     .context("create virtual output at client resolution")?;
-    // HDR: pass the negotiated `cfg.hdr` (client asked for HDR AND the host can deliver it). On the
-    // Windows IDD-push path this proactively enables advanced color on the virtual display so a Main10
-    // PQ stream flows even from an SDR desktop; an already-HDR desktop streams PQ regardless (the
-    // capturer follows the display). No-op on Linux: virtual-output capture is SDR-only upstream
-    // (Mutter RecordVirtual), and `host_hdr_capable` therefore keeps `cfg.hdr` false for this
-    // source — the Linux HDR path is the portal monitor mirror (`video_source=portal`).
+    // Linux virtual-output capture is SDR-only (Mutter RecordVirtual); HDR is portal mirror.
     let mut capturer = capture::capture_virtual_output(
         vout,
-        // Capture format from the shared SessionPlan (WP5.1) — one resolver for both planes.
-        // The visible upgrade over the old hardcoded `OutputFormat::resolve(hdr, gpu)`: a
-        // gamescope session (cursor blend off — see `set_hw_cursor` above) now gets
-        // `nv12_native`, so the producer's NV12 feeds Vulkan Video directly and the per-frame
-        // RGB→NV12 CSC the native plane already skips is skipped here too.
         gs_session_plan(
             &cfg,
             compositor != crate::vdisplay::Compositor::Gamescope
@@ -931,13 +718,8 @@ fn open_gs_virtual_source(
     Ok((capturer, compositor, gamescope_route))
 }
 
-/// The GameStream session's [`SessionPlan`](crate::session_plan::SessionPlan) (WP5.1): the same
-/// shared resolver the native plane uses, at this plane's negotiated shape — 4:2:0 (stock
-/// Moonlight; 4:4:4 is the Sunshine-extension follow-up this unlocks), depth 10 only with HDR
-/// (Moonlight's HDR toggle is the only 10-bit negotiation the protocol has), and NO
-/// cursor-forward (GameStream has no client cursor channel). Only `output_format()` is consumed
-/// today — the capture format stops being hand-hardcoded and picks up `nv12_native` where the
-/// plan resolves it.
+/// Shared [`SessionPlan`](crate::session_plan::SessionPlan) at this plane's shape: 4:2:0,
+/// depth 10 only with HDR, no cursor-forward (GameStream has no client cursor channel).
 fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_plan::SessionPlan {
     crate::session_plan::SessionPlan::resolve(
         if cfg.hdr { 10 } else { 8 },
@@ -945,20 +727,16 @@ fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_pla
         encode::ChromaFormat::Yuv420,
         cfg.codec,
         cursor_blend,
-        false, // no cursor-forward on this plane
+        false,
         cfg.slices > 1,
     )
 }
 
-/// The encoder bit depth implied by the captured frame's pixel format: a 10-bit (HDR) source — the
-/// Windows IDD-push capturer's `P010`/`Rgb10a2` when the desktop is HDR — opens NVENC as HEVC Main10
-/// (BT.2020 PQ); everything else is 8-bit. The encoder backends already key the real profile off the
-/// `format`, so this just keeps the `bit_depth` argument honest (the old hard-coded `8` mislabeled an
-/// HDR stream that the format had already promoted to 10-bit).
+/// Encoder `bit_depth` from the captured format. Backends key the real profile off `format`;
+/// this keeps the argument honest (a hard-coded `8` mislabels a P010 stream).
 fn gs_bit_depth(format: crate::capture::PixelFormat) -> u8 {
     use crate::capture::PixelFormat;
     match format {
-        // Windows IDD-push HDR formats, and the Linux GNOME 50+ portal HDR formats.
         PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::X2Rgb10 | PixelFormat::X2Bgr10 => {
             10
         }
@@ -966,7 +744,6 @@ fn gs_bit_depth(format: crate::capture::PixelFormat) -> u8 {
     }
 }
 
-/// One frame's packets, handed from the encode thread to the send thread.
 type PacketBatch = Vec<Vec<u8>>;
 
 /// Send `pkts` with as few syscalls as possible (`sendmmsg`, up to 64 per call). The socket is
@@ -1018,11 +795,8 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Windows: coalesce each paced burst's equal-size packets into `WSASendMsg(UDP_SEND_MSG_SIZE)`
-/// super-buffers (UDP Send Offload — the Windows analogue of Linux GSO), so a 16-packet burst is one
-/// syscall instead of 16. Reuses the proven core USO primitive; it returns how many leading packets
-/// it sent, and we send any remainder (USO off via `PUNKTFUNK_GSO=0`, a size-mixed burst, or a
-/// frame's short final packet) with a per-packet `send`. The socket is connected.
+/// Windows USO: equal-size packets of a paced burst go in one `WSASendMsg`. Remainder
+/// (USO off, mixed sizes, or the frame's short last packet) is a per-packet `send`.
 #[cfg(target_os = "windows")]
 fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
     let refs: Vec<&[u8]> = pkts.iter().map(|p| p.as_slice()).collect();
@@ -1033,8 +807,7 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Portable fallback (other non-Linux dev builds, e.g. macOS — GameStream hosting never ships there):
-/// one syscall per packet.
+/// One syscall per packet (non-Linux, non-Windows; GameStream hosting does not ship there).
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
     for p in pkts {
@@ -1043,47 +816,34 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// One encoded frame handed from the encode loop to the packetizer thread: the frame's access
-/// units (owned buffers, each with its frame type) plus the shared 90 kHz RTP timestamp. FEC
-/// packetization runs on the packetizer thread — off the encode loop — so it never serializes
-/// behind encode (measured ~3 ms/frame at 4K, which capped GameStream's frame rate well below what
-/// the encoder alone can sustain).
+/// One encoded frame handed to the packetizer: AUs plus the 90 kHz RTP timestamp.
+/// FEC runs on that thread so it never serializes behind encode.
 struct RawFrame {
-    /// `(bitstream, type, wire frameIndex)` per AU. The stream loop assigns the index (it owns
-    /// the numbering — see its `au_seq`), so the encoder's RFI bookkeeping stays 1:1 with what
-    /// Moonlight sees across mid-stream encoder rebuilds.
+    /// `(bitstream, type, wire frameIndex)` per AU. The stream loop owns numbering (`au_seq`)
+    /// so RFI stays 1:1 with Moonlight across mid-stream encoder rebuilds.
     aus: Vec<(Vec<u8>, FrameType, u32)>,
     ts: u32,
-    /// When this frame's capture was sampled (the encode-loop tick) — the packetizer stamps
-    /// `now - cap_at` into the wire's `frame_processing_latency` field (1/10 ms), which is what
-    /// Moonlight's performance overlay shows as "Host processing latency".
+    /// Encode-loop tick. Packetizer stamps `now - cap_at` as wire `frame_processing_latency`
+    /// (1/10 ms) — Moonlight's "Host processing latency".
     cap_at: Instant,
 }
 
-/// Packetizer thread: turns each [`RawFrame`]'s access units into wire datagrams (data + Reed–Solomon
-/// FEC parity shards) via the stateful [`VideoPacketizer`], then hands the batch to the paced sender.
-/// It sits between encode and send so the FEC never blocks the encode loop. Backpressure: the hand-off
-/// to the sender BLOCKS, so if the paced sender falls behind, the packetizer stalls and the
-/// encode→packetizer queue fills — the encode loop then drops the newest frame (see the loop) rather
-/// than stalling. Tallies goodput (bytes handed to the wire) into `goodput` for the encode loop's stats
-/// window. Exits when either neighbor's channel closes (session teardown / client gone).
+/// Packetize AUs into data + Reed–Solomon shards, then hand the batch to the paced sender.
+/// The send hand-off blocks so backpressure fills the encode queue and the encode loop drops
+/// the newest frame rather than stalling. Exits when either neighbor's channel closes.
 fn spawn_packetizer(
     rx: std::sync::mpsc::Receiver<RawFrame>,
     tx: std::sync::mpsc::SyncSender<PacketBatch>,
-    // Spent batches coming back from the paced sender (WP1.3): their datagram buffers refill
-    // the packetizer's pool and the batch shells are reused, so a steady-state frame allocates
-    // nothing. `try_recv` only — an empty return channel just means allocating fresh.
+    // Recycled batches. `try_recv` only — an empty return channel means allocate fresh.
     pool_rx: std::sync::mpsc::Receiver<PacketBatch>,
     mut pk: VideoPacketizer,
-    // Live FEC percent from the 1 Hz adaptation step (WP2.3) — applied between frames, never
-    // mid-AU (per-frame block geometry + per-packet wire percent keep the client in step).
+    // Applied between frames, never mid-AU (block geometry + wire percent stay in step).
     fec_pct_live: Arc<std::sync::atomic::AtomicU8>,
     goodput: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("punktfunk-pkt".into())
         .spawn(move || {
-            // Above-normal, like the send thread — this stage is on the per-frame critical path.
             crate::native::boost_thread_priority(false);
             let mut shells: Vec<PacketBatch> = Vec::new();
             let mut cur_pct = fec_pct_live.load(std::sync::atomic::Ordering::Relaxed);
@@ -1098,8 +858,7 @@ fn spawn_packetizer(
                     shells.push(spent);
                 }
                 let mut batch = shells.pop().unwrap_or_default();
-                // Host processing latency for the wire header (Sunshine extension, 1/10 ms,
-                // saturating — a stalled pipeline reports the max rather than wrapping).
+                // Wire header, 1/10 ms, saturating — a stall reports max rather than wrapping.
                 let processing_100us =
                     u16::try_from(frame.cap_at.elapsed().as_micros() / 100).unwrap_or(u16::MAX);
                 for (au, ft, idx) in frame.aus {
@@ -1109,9 +868,8 @@ fn spawn_packetizer(
                     continue;
                 }
                 let bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
-                // Blocking send: propagates the paced sender's backpressure upstream (see above).
                 if tx.send(batch).is_err() {
-                    break; // sender exited (client gone)
+                    break;
                 }
                 goodput.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1120,31 +878,18 @@ fn spawn_packetizer(
     Ok(())
 }
 
-/// Dedicated send thread: one [`PacketBatch`] per frame arrives on `rx`; its packets go out in
-/// `sendmmsg` chunks under the shared [`send_pacing`](crate::send_pacing) policy, now at the
-/// native plane's parameterization (GS competitive program WP1.2): an
-/// [`auto_burst_bytes`](crate::send_pacing::auto_burst_bytes) microburst leaves immediately —
-/// a normal-size frame therefore goes out whole, unpaced, ~0 added latency — and only the
-/// overflow of an oversized frame (an IDR, a scene-change delta) spreads, across the time it
-/// actually needs at ~3× the stream rate ([`native_budget`](crate::send_pacing::native_budget)),
-/// bounded to ~2 frame intervals. The old shape (`burst_bytes: None`, fixed ¾-interval budget)
-/// spread EVERY frame — a 3-packet P-frame paid the same ~11 ms tail as a 4K keyframe. The
-/// chunking stays BOUNDED (≤ 12 steps, chunk ≥ 16): on this non-RT send thread every paced step
-/// ends in a `thread::sleep` whose overshoot must stay independent of bitrate.
-///
-/// Spent batches go back to the packetizer through `pool_tx` (buffer recycling, WP1.3); each
-/// frame's wire spread is pushed to `spread_us` for the encode loop's 1 s stats window. On send
-/// failure (client gone) it ends the whole session via `on_lost` — not just this thread: audio
-/// would otherwise keep streaming at the dead endpoint and the stale launch state would wedge
-/// the next connect (see `AppState::end_session`).
-#[allow(clippy::too_many_arguments)] // one construction site; a params struct would only rename the list
+/// Paced send thread. A normal-size frame leaves whole via
+/// [`auto_burst_bytes`](crate::send_pacing::auto_burst_bytes); only IDR / scene-change overflow
+/// spreads at ~3× stream rate, bounded to ~2 frame intervals. Chunking is ≤ 12 steps, chunk ≥
+/// 16: every paced step ends in `thread::sleep` whose overshoot must stay bitrate-independent.
+/// Send failure ends the whole session via `on_lost` — audio would otherwise keep streaming at
+/// the dead endpoint.
+#[allow(clippy::too_many_arguments)]
 fn spawn_sender(
     sock: UdpSocket,
     rx: std::sync::mpsc::Receiver<PacketBatch>,
     frame_interval: Duration,
-    // ~3× the derived encoder rate, LIVE (the 1 Hz adaptation step retargets it with the
-    // encoder): the proven-safe drain rate for the paced overflow, and the burst sizing rate.
-    // `0` = `PUNKTFUNK_PACE_FACTOR=0`, the legacy deadline-fraction spread.
+    // ~3× the derived encoder rate, live. `0` = `PUNKTFUNK_PACE_FACTOR=0` (legacy spread).
     pace_rate_bps: Arc<std::sync::atomic::AtomicU64>,
     pool_tx: std::sync::mpsc::SyncSender<PacketBatch>,
     spread_us: Arc<std::sync::Mutex<Vec<u32>>>,
@@ -1154,13 +899,10 @@ fn spawn_sender(
     std::thread::Builder::new()
         .name("punktfunk-send".into())
         .spawn(move || {
-            // Transmit thread: above-normal, matching the native path's send thread (includes the
-            // Windows session tuning/MMCSS this used to call directly; adds the Linux nice -5).
             crate::native::boost_thread_priority(false);
             let mut sent: u64 = 0;
             let mut dropped: u64 = 0;
             while let Ok(mut batch) = rx.recv() {
-                // FEC test knob (PUNKTFUNK_VIDEO_DROP) — same knob the native plane honors.
                 dropped += crate::send_pacing::inject_video_drop(&mut batch);
                 if batch.is_empty() {
                     continue;
@@ -1190,7 +932,7 @@ fn spawn_sender(
                 });
                 match r {
                     Ok(stat) => {
-                        // Bounded stats push (a stalled reader must not grow this unbounded).
+                        // A stalled reader must not grow this unbounded.
                         let mut v = spread_us.lock().unwrap_or_else(|p| p.into_inner());
                         if v.len() < 1024 {
                             v.push(stat.spread_us);
@@ -1203,8 +945,6 @@ fn spawn_sender(
                         return;
                     }
                 }
-                // Recycle the spent batch (best-effort: a full/closed return channel just drops
-                // it, and the packetizer allocates fresh).
                 let _ = pool_tx.try_send(batch);
             }
             tracing::debug!(sent, dropped, "video sender exiting");
@@ -1215,74 +955,39 @@ fn spawn_sender(
 
 use crate::send_pacing::percentile;
 
-/// How long to ignore further keyframe requests after emitting one.
-///
-/// The window bounds IDR emission in TIME, so it needs an absolute floor rather than a frame
-/// count: it has to outlast the round trip in which the client receives and decodes the IDR it
-/// already asked for. The original `frame_interval * 2` closes long before that at high refresh —
-/// 16.7 ms at 120 fps, while a Moonlight client under loss re-asks every ~30 ms — so every request
-/// passed the gate and the stream became ~32 full IDRs/s, whose bulk causes the very loss that
-/// prompts the next request. That storm sustains itself and reads as stutter at a flat latency
-/// (field log, AMD RX 7800 XT / Bazzite 44 HEVC, 2026-08-22: 1118 requests, 1115 honoured, 3
-/// coalesced). 100 ms matches the encoder-reset backoff below and is about one IDR's service time
-/// on a saturated link.
+/// Ignore further IDR requests after emitting one. Floor is 100 ms: `frame_interval * 2` is
+/// 16.7 ms at 120 fps, while a client under loss re-asks every ~30 ms — every request would
+/// pass and the IDR storm would feed the loss that prompts the next request.
 fn keyframe_coalesce_window(frame_interval: Duration) -> Duration {
     (frame_interval * 2).max(Duration::from_millis(100))
 }
 
-/// The encode → packetize loop, over a borrowed capturer. Sending runs on a dedicated thread
-/// (see [`spawn_sender`]) so a send spike can never stall capture/encode.
+/// Encode loop over a borrowed capturer. Send is a dedicated thread so a send spike cannot
+/// stall capture/encode.
 #[allow(clippy::too_many_arguments)]
 fn stream_body(
-    // `&mut Box` (not `&mut dyn`) so a mid-stream capture-loss rebuild can SWAP the capturer in place.
+    // `&mut Box` so a capture-loss rebuild can swap the capturer in place.
     capturer: &mut Box<dyn Capturer>,
-    // Re-open the video source on capture loss (virtual-display path → follow a Desktop<->Game switch);
-    // `None` for the portal/synthetic source, which has nothing to re-detect (propagate the error).
+    // Virtual-display: re-open on capture loss. `None` for portal/synthetic — propagate.
     rebuild: Option<&dyn Fn() -> Result<Box<dyn Capturer>>>,
-    // The capture hands the encoder cursor bitmaps to composite (cursor-as-metadata negotiated
-    // because the resolved backend blends — see the callers). `false` = the pointer is embedded
-    // in the pixels (or absent), so the encoder is asked to composite nothing.
+    // Encoder composites cursor bitmaps. `false` = pointer is embedded (or absent).
     cursor_blend: bool,
     sock: &UdpSocket,
     cfg: StreamConfig,
     running: &Arc<AtomicBool>,
     force_idr: &AtomicBool,
     rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
-    // Client-reported loss counters (control 0x0201) — read as deltas by the 1 Hz adaptation
-    // step below (WP2.2-2.4: adaptive FEC percent + bitrate de-rating under the wire budget).
+    // Client 0x0201 loss counters — 1 Hz adaptation reads deltas.
     loss: &super::GsLossStats,
-    // The session rikey when SS_ENC_VIDEO was negotiated (WP7) — see `start`.
     gcm_key: Option<[u8; 16]>,
-    // Shared stats recorder. The encode loop reads `stats.is_armed()` per frame to decide whether
-    // to accumulate the per-stage split, then emits a `StatsSample` at its 1 s aggregation boundary.
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
-    // Short client label (peer IP) seeded into the capture meta on the first armed registration.
     client_label: &str,
-    // Whole-session teardown, handed to the send thread's client-unreachable detection.
     on_lost: &super::OnSessionLost,
 ) -> Result<()> {
-    // The first frame establishes the authoritative size/format for the encoder.
     let mut frame = capturer.next_frame().context("capture first frame")?;
     if frame.width != cfg.width || frame.height != cfg.height {
-        // Deliberately NOT fatal, and deliberately not "resize the output" (which read as an
-        // instruction nothing was carrying out). A mismatch has two very different causes and only
-        // one of them is a fault:
-        //
-        //   * Mirroring a pinned monitor — EXPECTED. §7.3: a panel runs at the mode its owner set
-        //     and the client scales, so `open_gs_mirror_source` passes the client's mode purely to
-        //     keep the argument honest and the backend ignores it. Failing here would break every
-        //     mirror session.
-        //   * A virtual display — a FAULT. That output was created at the client's negotiated size
-        //     precisely so this can't happen, so a mismatch means the backend did not build what it
-        //     was asked for. The KWin backend now reads its output back and re-asserts the mode, so
-        //     look for its `KWin built our virtual output at a DIFFERENT size` / `would not
-        //     re-assert` lines just above this one — they carry the cause and the remedy.
-        //
-        // What the client does with it is the part worth stating plainly: the encoder opens at the
-        // CAPTURED size below, so Moonlight receives a bitstream that disagrees with the resolution
-        // it configured its decoder from. Tolerant decoders re-init off the SPS and scale; strict
-        // ones (Media Foundation on Xbox) may instead produce nothing and ask for a keyframe every
-        // ~50 ms until the client gives up and drops the session.
+        // Not fatal. Expected for a mirror (panel's own mode); a fault on a virtual display
+        // created at the negotiated size. Encoder opens at the captured size.
         tracing::warn!(
             captured = ?(frame.width, frame.height),
             negotiated = ?(cfg.width, cfg.height),
@@ -1291,29 +996,19 @@ fn stream_body(
              otherwise — see the vdisplay lines above)"
         );
     }
-    // FEC overhead percent (Sunshine default 20). Override with PUNKTFUNK_FEC_PCT (0 = data-only).
-    // Read before the encoder opens: the encoder rate is derived UNDER the parity it will carry.
+    // Sunshine default 20. `PUNKTFUNK_FEC_PCT=0` is data-only. Read before the encoder opens:
+    // encoder rate is derived under this parity.
     let fec_pct: u8 = std::env::var("PUNKTFUNK_FEC_PCT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
-    // WP2.1 (GS competitive program): the client's configured bitrate is a WIRE budget, so the
-    // encoder rate is derived under it — parity + per-shard framing fit INSIDE the number the
-    // client asked for. The old shape handed the encoder the full negotiated rate and stacked
-    // 20 % FEC plus framing on top: every session carried ≈1.23× what the client configured,
-    // and on the constrained links where the setting matters the overshoot WAS the failure
-    // (the native plane made the same correction in ABR overhaul Phase 4).
-    // `mut`: the 1 Hz adaptation step below re-derives it when client-reported loss moves the
-    // FEC percent or de-rates the budget (WP2.2-2.4) — mid-stream encoder rebuilds then reopen
-    // at the LIVE rate, not the session-start one.
+    // Client bitrate is a wire budget: parity + framing fit inside it. `mut` because 1 Hz
+    // adaptation re-derives; mid-stream rebuilds reopen at the live rate.
     let mut enc_bps = gs_encoder_bps(cfg.bitrate_kbps, fec_pct, cfg.packet_size);
-    // Loss-driven adaptation state (WP2.2-2.4): FEC percent within [configured..50] and the
-    // wire budget within [floor..negotiated], stepped once per stats window from the client's
-    // 0x0201 loss reports. `PUNKTFUNK_GS_ADAPT=0` pins both at the configured values.
+    // `PUNKTFUNK_GS_ADAPT=0` pins FEC and budget at the configured values.
     let mut adapt = GsAdapt::new(fec_pct, cfg.bitrate_kbps);
     let mut adapt_lost_seen: u64 = 0;
-    // `false` once the encoder refuses an in-place retarget (software paths): adaptation would
-    // otherwise raise FEC without room under the budget, re-creating the WP2.1 overshoot.
+    // Software paths refuse in-place retarget; raising FEC then overshoots the budget.
     let mut adapt_supported = true;
     let mut enc = encode::open_video(
         cfg.codec,
@@ -1323,47 +1018,28 @@ fn stream_body(
         cfg.fps,
         enc_bps,
         frame.is_cuda(),
-        // 8-bit SDR, or 10-bit when the captured frame is HDR (P010) — see `gs_bit_depth`.
         gs_bit_depth(frame.format),
-        // GameStream/Moonlight stays 4:2:0 — stock Moonlight clients can't decode 4:4:4, and the
-        // Windows IDD-push capturer can't yet deliver full-chroma frames. 4:4:4 is punktfunk/1-native only.
+        // Stock Moonlight cannot decode 4:4:4.
         encode::ChromaFormat::Yuv420,
-        // True only when THIS session's capture negotiated cursor-as-metadata — which the
-        // callers grant only where the resolved backend composites (`cursor_blend_capable`).
         cursor_blend,
-        // The client's requested slices-per-frame (its DECODER's ceiling) — see `StreamConfig`.
         cfg.slices,
     )
     .context("open video encoder for stream")?;
-    // Tell the encoder how deep the capturer lets it pipeline. Without this an in-place backend
-    // (Windows direct-NVENC, which encodes the capturer's textures with no CopyResource) bounds
-    // itself by an env cap instead of the ring it is actually reading, and the capturer rotates a
-    // texture out from under a live encode — torn/mixed frames, never an error. The backend now
-    // also fails safe when nobody tells it, but pass the REAL depth: `idd_depth` is configurable
-    // and a deeper ring is free pipelining the fallback would forfeit.
+    // Without this, an in-place backend bounds itself by an env cap and the capturer rotates
+    // a texture out from under a live encode — torn frames, never an error.
     enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
-    // What `enc` was opened against. The capture source can change size/format UNDER this loop with
-    // nothing negotiating it (see the follow-the-source guard below); tracked so the loop can notice.
-    // Both sites that swap `enc` re-bind `frame` with it, so this is always
-    // `(frame.format, frame.width, frame.height)` right after one.
+    // Source can change size/format under this loop with nothing negotiating it.
     let mut enc_src = (frame.format, frame.width, frame.height);
     let mut pk = VideoPacketizer::new(cfg.packet_size, fec_pct, cfg.min_fec);
-    // SS_ENC_VIDEO (WP7): seal every shard under the session's rikey when the client
-    // negotiated it. `cfg.encrypt_video` is already gated on the host having OFFERED the bit.
     if cfg.encrypt_video {
         match gcm_key {
             Some(key) => pk.set_encryption_key(key),
-            // Can't happen (a session exists by RTSP PLAY), and streaming PLAINTEXT to a client
-            // expecting ciphertext is a black screen — refuse instead.
+            // Streaming plaintext to a client expecting ciphertext is a black screen.
             None => anyhow::bail!("SS_ENC_VIDEO negotiated but the session key is gone"),
         }
     }
 
-    // Pace at the client's negotiated frame rate, re-encoding the last captured frame when the
-    // compositor produced no new one. Compositors only emit frames on damage, so a static or
-    // slow-updating desktop would otherwise starve the client into a "network too slow" abort.
-    // Re-encoding an unchanged frame is cheap — NVENC emits a near-empty P-frame. The upper
-    // bound just guards against an absurd client request (the encoder is opened at `cfg.fps`).
+    // Compositors emit on damage; re-encode the last frame or a static desktop starves the client.
     let target_fps = cfg.fps.clamp(1, 240);
     let frame_interval = Duration::from_secs_f64(1.0 / target_fps as f64);
     let mut fps_count: u32 = 0;
@@ -1372,32 +1048,19 @@ fn stream_body(
     let mut sent_batches: u64 = 0;
     let mut dropped_batches: u64 = 0;
 
-    // Three-stage pipeline so FEC packetization never blocks encode: `encode loop → [raw AUs] →
-    // packetizer (FEC/RS) → [wire batch] → paced sender`, each stage on its own thread joined by a
-    // depth-2 bounded queue. Depth 2 means a slow stage can buffer one frame while the next is
-    // produced; beyond that the NEWEST frame is dropped (the client recovers via FEC/RFI) rather than
-    // stalling the encode loop. Backpressure chains up: a slow sender blocks the packetizer, which
-    // fills the encode→packetizer queue, which makes the encode loop drop — encode itself never
-    // waits. Goodput (bytes handed to the wire) is tallied by the packetizer into `goodput`, read at
-    // the encode loop's 1 s stats boundary (the old inline batch-byte sum moved with packetization).
+    // Depth-2 queues: a slow stage buffers one frame; beyond that the newest drops (FEC/RFI).
     let goodput = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<PacketBatch>(2);
-    // Sender → packetizer buffer-recycle channel (WP1.3). Depth 4 > the two depth-2 pipeline
-    // queues combined, so a batch always has a slot on the way back in steady state.
+    // Depth 4 > the two depth-2 queues combined, so a batch always has a return slot.
     let (pool_tx, pool_rx) = std::sync::mpsc::sync_channel::<PacketBatch>(4);
-    // Per-frame wire spread (µs) from the paced sender, drained at the 1 s stats boundary.
     let spread_us = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
-    // Pace rate for the send thread's microburst + overflow budget: `factor ×` the derived
-    // encoder rate, the same 3×-default lever as the native plane (the link demonstrably
-    // carries 1× sustained, so a bounded 3× excursion is safe; `PUNKTFUNK_PACE_FACTOR=0`
-    // restores the legacy deadline-fraction spread).
+    // 3× default: the link carries 1× sustained, so a bounded 3× excursion is safe.
+    // `PUNKTFUNK_PACE_FACTOR=0` restores the legacy deadline-fraction spread.
     let pace_factor: f64 = std::env::var("PUNKTFUNK_PACE_FACTOR")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|f: &f64| f.is_finite() && *f >= 0.0)
         .unwrap_or(3.0);
-    // Live cross-thread knobs the 1 Hz adaptation step retargets (WP2.3/2.4): the sender's
-    // pace rate follows the encoder rate; the packetizer's FEC percent follows the loss state.
     let pace_rate_bps = Arc::new(std::sync::atomic::AtomicU64::new(
         (enc_bps as f64 * pace_factor) as u64,
     ));
@@ -1422,91 +1085,53 @@ fn stream_body(
         goodput.clone(),
     )?;
 
-    // Per-stage timing (PUNKTFUNK_PERF=1): max µs/stage per second + unique vs re-encoded frames,
-    // to pinpoint stalls. `unique` counts genuinely-new captured frames (vs re-encoded holds).
     let perf = pf_host_config::config().perf;
     let (mut mx_cap, mut mx_enc, mut mx_pkt, mut mx_send, mut uniq) =
         (0u128, 0u128, 0u128, 0u128, 0u32);
-    // Web-console stats accumulation (active when `perf` OR a capture is armed): per-stage vectors
-    // for p50/p99, the goodput bytes queued to the sender this window, the previous window's
-    // dropped-frame count for delta computation, and the registration id cached on the first sample.
     let codec_name = cfg.codec.label();
     let mut sid: Option<u32> = None;
     let (mut v_cap, mut v_enc, mut v_pkt, mut v_send): (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut last_dropped_batches: u64 = 0;
-    // Absolute next-frame deadline — the single pacing clock for the loop.
     let mut next_frame = Instant::now();
-    // Frame-driven wire-rate cap (see `send_pacing::CaptureCredit`): a loop local so it
-    // survives every in-loop rebuild path — a mid-stream rebuild can't reopen the overshoot.
+    // Loop-local so a mid-stream rebuild cannot reopen the overshoot.
     let mut cap_credit = crate::send_pacing::CaptureCredit::new(Instant::now());
-    // RFI capability is fixed for the session (probed at encoder open). Query it once so the
-    // recovery path skips the always-`false` invalidate call on encoders without NVENC RFI and
-    // forces a keyframe directly instead.
+    // Session-fixed; query once so encoders without NVENC RFI skip the always-false invalidate.
     let mut supports_rfi = enc.caps().supports_rfi;
 
-    // Bound consecutive capture-loss rebuilds (a delivered frame clears the counter) so a permanently
-    // dead source can't loop forever — it ends the stream after the cap, falling back to a reconnect.
+    // A delivered frame clears this; a permanently dead source ends the stream after the cap.
     const MAX_REBUILDS: u32 = 5;
     let mut rebuilds: u32 = 0;
-    // Encode-stall recovery, the GameStream twin of the native path's ladder (native/stream.rs,
-    // `reset_stalled_encoder`): a submit/poll failure or a silent stall rebuilds the encoder in
-    // place — bounded — instead of ending the stream. The backends deliberately turn a wedged
-    // GPU into a bounded error so the caller can do exactly this; without the ladder here, every
-    // such error cost a Moonlight client a full disconnect/reconnect. `last_au_at` feeds the
-    // silent-wedge watchdog below (backends whose non-blocking poll returns `None` forever
-    // instead of erroring); every received AU clears the reset budget.
+    // Submit/poll failure or a silent stall rebuilds in place (native `reset_stalled_encoder`).
+    // `last_au_at` is the silent-wedge watchdog: poll returning `None` forever never errors.
     const MAX_ENCODER_RESETS: u32 = 5;
     let mut encoder_resets: u32 = 0;
     let mut last_au_at = Instant::now();
 
-    // Coalesce forced keyframes. Under loss Moonlight spams IDR/RFI requests; on an encoder without
-    // RFI (VAAPI/AMD — `supports_rfi=false`) each one becomes a full IDR, so an un-coalesced request
-    // stream turns EVERY frame into a 4K IDR, saturates the send path, and collapses the session
-    // instead of recovering. One fresh IDR already resolves all pending loss, so after emitting one
-    // we ignore further keyframe requests for the in-flight window below. NVENC ref-invalidation
-    // (cheap, no IDR spike) is never rate-limited — only full keyframes are.
+    // Without RFI each request is a full IDR. One IDR resolves pending loss; NVENC
+    // invalidate is never rate-limited.
     let keyframe_coalesce = keyframe_coalesce_window(frame_interval);
     let mut last_keyframe: Option<Instant> = None;
-    // A frame dropped at the pipeline head (below) breaks the reference chain for the following
-    // P-frames: the client never receives it, but the encoder advanced its references past it, and —
-    // packetization being downstream now — a dropped frame consumes no frameIndex for the client to
-    // detect the gap. So the host re-anchors itself: a drop arms a keyframe on the next iteration,
-    // routed through the same coalesce gate as client IDR requests so a burst of drops (congestion)
-    // can't become an IDR storm.
+    // A pipeline-head drop consumes no frameIndex; the client cannot see the gap. Arm an IDR
+    // through the same coalesce gate so a burst of drops cannot become an IDR storm.
     let mut recover_after_drop = false;
-    // The stream's wire frameIndex numbering, owned HERE (the index of the next AU handed to the
-    // packetizer thread; a dropped-at-the-queue frame consumes none). A submission's future index
-    // is `au_seq + enc_inflight` (AUs are emitted FIFO, one per submission); passing it to
-    // `Encoder::submit_indexed` keeps the encoder's RFI bookkeeping 1:1 with Moonlight's frame
-    // numbers across the in-place encoder rebuild above (an internal counter would desync there).
-    // A pipeline-head drop desyncs the prediction by the dropped AU count for the frames already
-    // in flight — bounded and self-healing: the drop arms `recover_after_drop`, whose forced IDR
-    // resets the encoder's reference state (stale LTR/DPB bookkeeping dies with it).
+    // Wire frameIndex owned here. `submit_indexed(au_seq + enc_inflight)` keeps RFI 1:1
+    // with Moonlight across in-place rebuilds (an internal counter would desync).
     let mut au_seq: u32 = 0;
     let mut enc_inflight: u32 = 0;
 
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
-        // Measure per-stage timing when `PUNKTFUNK_PERF` is set OR a web-console stats capture is
-        // armed (cheap Relaxed atomic, re-read each frame).
         let measure = perf || stats.is_armed();
-        // Advance to the freshest captured frame if one arrived; otherwise reuse the last.
         match capturer.try_latest() {
             Ok(Some(f)) => {
                 frame = f;
                 uniq += 1;
-                rebuilds = 0; // a delivered frame clears the consecutive-loss counter
+                rebuilds = 0;
             }
-            Ok(None) => {} // no new frame — reuse the last (static/idle desktop)
+            Ok(None) => {}
             Err(e) => {
-                // The capture source went away — the compositor was torn down on a Desktop<->Game
-                // switch, or the virtual output was removed. On the virtual-display path, re-detect the
-                // now-live compositor and re-attach IN PLACE (the send thread + packetizer + socket +
-                // RTP clock all survive), then force an IDR so Moonlight resyncs — so the stream FOLLOWS
-                // the switch with no client reconnect. Build the new source BEFORE dropping the old.
-                // Bounded by a counter + a ~40s budget; on exhaustion, end the stream (Moonlight
-                // reconnect). The portal/synthetic path has no rebuild closure → propagate as before.
+                // Rebuild in place (send/packetizer/socket/RTP survive). No rebuild → propagate.
                 let Some(rebuild) = rebuild else {
                     return Err(e).context("capture frame");
                 };
@@ -1535,54 +1160,36 @@ fn stream_body(
                 *capturer = new_cap;
                 capturer.set_active(true);
                 frame = capturer.next_frame().context("first frame after rebuild")?;
-                // Re-open the encoder for the new source (same negotiated WxH → same SPS profile) and
-                // force an IDR so Moonlight resyncs on the first emitted AU.
                 enc = encode::open_video(
                     cfg.codec,
                     frame.format,
                     frame.width,
                     frame.height,
                     cfg.fps,
-                    enc_bps, // wire-budget-derived — see the first open above (WP2.1)
+                    enc_bps,
                     frame.is_cuda(),
                     gs_bit_depth(frame.format),
-                    encode::ChromaFormat::Yuv420, // GameStream stays 4:2:0
-                    cursor_blend,                 // same capture cursor mode — see the first open
-                    cfg.slices,                   // client slicing ceiling — see the first open
+                    encode::ChromaFormat::Yuv420,
+                    cursor_blend,
+                    cfg.slices,
                 )
                 .context("reopen encoder after rebuild")?;
-                // A rebuilt encoder starts unconfigured — same reason as the first open above.
                 enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
                 enc_src = (frame.format, frame.width, frame.height);
                 supports_rfi = enc.caps().supports_rfi;
                 enc.request_keyframe();
                 last_keyframe = Some(Instant::now());
                 next_frame = Instant::now();
-                // The old encoder died with its in-flight submissions — their AUs will never
-                // arrive, so the numbering prediction restarts at `au_seq` (the fresh encoder's
-                // reference state is empty, so the reused predictions meet no stale bookkeeping).
+                // Old encoder died with in-flight AUs; numbering restarts at `au_seq`.
                 enc_inflight = 0;
                 tracing::info!("gamestream: source rebuilt — stream continues");
                 continue;
             }
         }
         let t_cap = tick.elapsed();
-        // Follow an AUTONOMOUS source mode change — one nothing negotiated. The IDD-push capturer
-        // re-opens its ring on a confirmed display-descriptor change (a fullscreen game mode-setting
-        // the virtual display, or an HDR flip changing the format), and the encoder is the one
-        // component that cannot follow a resolution change in place. Every `submit` below then
-        // refuses the frame ("captured WxH != encoder AxB"), and the submit ladder only rebuilds the
-        // encoder IN PLACE — at the SAME configured size — which cannot fix a size the source has
-        // already left, so all five resets burn on it and the stream ends (native/stream.rs carried
-        // the identical gap; a 2026-08-22 field report hit it there at 4K→1080p).
-        //
-        // GameStream has no mid-stream mode-change message, so the client is NOT told: Moonlight
-        // decodes a bitstream that disagrees with the resolution it configured its decoder from.
-        // That is the same bargain the first open above already takes whenever the captured size
-        // differs from the negotiated one (the monitor-mirror case) — tolerant decoders re-init off
-        // the SPS and scale, a strict one (Media Foundation on Xbox) may stall and drop the session.
-        // Taking it here too is strictly better than the alternative, which is ending every stream
-        // the moment a game changes mode.
+        // Source changed size/format with nothing negotiating it. The encoder cannot follow a
+        // resolution change in place; reopen at the delivered size. GameStream has no mid-stream
+        // mode message — the client is not told.
         if enc_src != (frame.format, frame.width, frame.height) {
             match encode::open_video(
                 cfg.codec,
@@ -1590,13 +1197,12 @@ fn stream_body(
                 frame.width,
                 frame.height,
                 cfg.fps,
-                enc_bps, // wire-budget-derived — see the first open above (WP2.1)
+                enc_bps,
                 frame.is_cuda(),
-                // Derived from the delivered format, so an HDR flip re-opens at the right depth.
                 gs_bit_depth(frame.format),
-                encode::ChromaFormat::Yuv420, // GameStream stays 4:2:0 — see the first open
-                cursor_blend,                 // same capture cursor mode — see the first open
-                cfg.slices,                   // client slicing ceiling — see the first open
+                encode::ChromaFormat::Yuv420,
+                cursor_blend,
+                cfg.slices,
             ) {
                 Ok(e) => {
                     tracing::info!(
@@ -1609,25 +1215,17 @@ fn stream_body(
                     );
                     enc = e;
                     enc_src = (frame.format, frame.width, frame.height);
-                    // A rebuilt encoder starts unconfigured — same reasons as the first open.
                     enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
                     supports_rfi = enc.caps().supports_rfi;
                     enc.request_keyframe();
                     last_keyframe = Some(Instant::now());
-                    // The old encoder died with its in-flight submissions — their AUs will never
-                    // arrive, so the numbering prediction restarts at `au_seq` (same reasoning as
-                    // the capture rebuild above). Restart the stall clock for the fresh encoder and
-                    // give it the full reset budget.
+                    // Old encoder died with in-flight AUs; numbering restarts at `au_seq`.
                     enc_inflight = 0;
                     encoder_resets = 0;
                     last_au_at = Instant::now();
                 }
                 Err(e) => {
-                    // Don't spend the stream on the FIRST failed open: the mode-set that triggered
-                    // this is exactly the kind of event that leaves the driver settling, which is
-                    // what the submit ladder's backoff exists for. Spend the shared reset budget at
-                    // the same exponential pace, re-entering this guard each round — the old encoder
-                    // stays installed and mismatched meanwhile, so it simply keeps failing submit.
+                    // First failed open is a settling driver; spend the shared reset budget.
                     encoder_resets += 1;
                     if encoder_resets > MAX_ENCODER_RESETS {
                         return Err(e).context("reopen encoder at the source's new mode");
@@ -1643,19 +1241,9 @@ fn stream_body(
                 }
             }
         }
-        // Honor a client recovery request. Prefer reference-frame invalidation (the encoder
-        // re-references an older still-valid frame — no costly IDR spike); if the encoder can't
-        // invalidate (range too old, or no NVENC RFI) it returns false and we force a keyframe.
-        // A prior pipeline drop needs a fresh keyframe to re-anchor the reference chain (see
-        // below). Consumed only when the keyframe is actually EMITTED (in the coalesce gate) —
-        // read-and-clear here let the gate swallow the request for good.
         let mut want_keyframe = recover_after_drop;
         if let Some((first, last)) = rfi_range.lock().unwrap().take() {
-            // Prefer reference-frame invalidation when the encoder supports it (no costly IDR
-            // spike); otherwise — or if the range is too old to invalidate — fall back to a keyframe.
-            // Sanity-cap the range first: wider than RFI_MAX_RANGE exceeds any encoder's reference
-            // history (or is a phantom range from a desynced counter) — keyframe, never a
-            // force-reference that could ship corruption as a clean frame.
+            // Wider than RFI_MAX_RANGE is a phantom range — keyframe, never a force-reference.
             let width = (last as u32).wrapping_sub(first as u32);
             if width > punktfunk_core::packet::RFI_MAX_RANGE
                 || !(supports_rfi && enc.invalidate_ref_frames(first, last))
@@ -1663,13 +1251,9 @@ fn stream_body(
                 want_keyframe = true;
             }
         }
-        // An explicit IDR request (or a rangeless RFI) asks for a keyframe so the client resyncs
-        // immediately instead of waiting for the next GOP boundary.
         if force_idr.swap(false, Ordering::SeqCst) {
             want_keyframe = true;
         }
-        // Coalesce: emit at most one forced keyframe per in-flight window, so a burst of recovery
-        // requests during one loss event doesn't turn every frame into a full IDR (see above).
         if want_keyframe {
             let now = Instant::now();
             let emit = match last_keyframe {
@@ -1679,26 +1263,16 @@ fn stream_body(
             if emit {
                 enc.request_keyframe();
                 last_keyframe = Some(now);
-                // A drop-recovery request is satisfied by an EMITTED keyframe, not by being
-                // read: coalesced away it would be lost — never retried — leaving duplicate wire
-                // indices in the encoder's reference table for a later RFI to anchor on (the
-                // stale-anchor case rfi.rs exists to prevent). Keep it armed until this point.
+                // Satisfied only by an emitted IDR. Coalesced away it is never retried and
+                // leaves duplicate wire indices for a later RFI to anchor on.
                 recover_after_drop = false;
             } else {
                 tracing::debug!("video: keyframe request coalesced (IDR still in flight)");
             }
         }
-        // The source's REAL HDR grade to the encoder (WP5.4) — an HDR backend embeds it as
-        // in-band mastering/CLL SEI on keyframes, which is the channel a STOCK Moonlight
-        // decoder tone-maps from. This plane never called it: an HDR GameStream session shipped
-        // no grade at all (the 0x010e control cue only flips the display mode and carries the
-        // generic fallback metadata). Cheap per frame by the trait's contract; `None` (SDR /
-        // no-metadata capturer) is the no-op it always was.
+        // Stock Moonlight tone-maps from in-band mastering/CLL SEI on keyframes. `None` is a no-op.
         enc.set_hdr_meta(capturer.hdr_meta());
         if let Err(e) = enc.submit_indexed(&frame, au_seq.wrapping_add(enc_inflight)) {
-            // The input half of an encode stall (see native/stream.rs): rebuild the encoder in
-            // place instead of ending the stream. A backend without an in-place rebuild
-            // (`reset` = false) or an exhausted budget still fails the session, with the cause.
             encoder_resets += 1;
             if encoder_resets > MAX_ENCODER_RESETS || !enc.reset() {
                 tracing::error!(
@@ -1709,10 +1283,7 @@ fn stream_body(
                 );
                 return Err(e).context("encoder submit");
             }
-            // The owed AUs died with the discarded encoder state; numbering restarts at `au_seq`,
-            // and the rebuilt encoder's reference state is empty so the reused predictions meet
-            // no stale bookkeeping (same reasoning as the capture rebuild above). The IDR
-            // bypasses the coalesce gate: a rebuilt encoder MUST resync the client.
+            // Owed AUs died with the discarded state. IDR bypasses coalesce: the client must resync.
             enc_inflight = 0;
             enc.request_keyframe();
             last_keyframe = Some(Instant::now());
@@ -1720,8 +1291,7 @@ fn stream_body(
             tracing::warn!(error = %format!("{e:#}"), reset = encoder_resets,
                 max = MAX_ENCODER_RESETS,
                 "encoder submit failed — encoder rebuilt in place, forcing an IDR");
-            // Real backoff between attempts, not a frame period: five instant retries burn out
-            // inside one driver hiccup (the native ladder's 2026-07 field lesson).
+            // Five instant retries burn out inside one driver hiccup.
             let backoff =
                 frame_interval.max(Duration::from_millis(100u64 << (encoder_resets - 1).min(4)));
             next_frame = Instant::now() + backoff;
@@ -1731,16 +1301,10 @@ fn stream_body(
         enc_inflight = enc_inflight.wrapping_add(1);
         let t_enc = tick.elapsed();
 
-        // 90 kHz RTP timestamp from wall-clock, so a variable capture rate stays correct.
+        // 90 kHz RTP from wall-clock so a variable capture rate stays correct.
         let ts = (stream_start.elapsed().as_secs_f64() * 90_000.0) as u32;
-        // Drain the encoder's access units (owned buffers) — FEC/packetization runs on the
-        // packetizer thread, off this loop, so it never serializes behind encode. Each AU is
-        // stamped with its wire frameIndex here (`au_seq + position`); the numbering only
-        // ADVANCES if the batch is actually enqueued below (a dropped batch consumes none).
         let mut aus: Vec<(Vec<u8>, FrameType, u32)> = Vec::new();
-        // A poll error is the output half of an encode stall (e.g. a bounded fence timeout from
-        // a wedged GPU) — carry it to the shared stall recovery below, after the AUs already
-        // drained are handed off, instead of killing the session outright.
+        // Carry a poll error to stall recovery after already-drained AUs are handed off.
         let mut poll_err: Option<anyhow::Error> = None;
         loop {
             let au = match enc.poll() {
@@ -1759,15 +1323,12 @@ fn stream_body(
             let idx = au_seq.wrapping_add(aus.len() as u32);
             aus.push((au.data, ft, idx));
             enc_inflight = enc_inflight.saturating_sub(1);
-            // Every AU proves the encoder is alive.
             last_au_at = Instant::now();
             encoder_resets = 0;
         }
         let t_pkt = tick.elapsed();
 
-        // Hand the frame's AUs to the pipeline; never block here. A full queue means the pipeline
-        // (packetizer, or the paced sender behind it) is behind — drop this frame (FEC/RFI covers the
-        // client) and keep encoding, so a downstream stall can never cap the encode rate.
+        // Never block: a full queue drops this frame (FEC/RFI covers) so encode is never capped.
         if !aus.is_empty() {
             let batch_len = aus.len() as u32;
             match raw_tx.try_send(RawFrame {
@@ -1781,7 +1342,7 @@ fn stream_body(
                 }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
                     dropped_batches += 1;
-                    recover_after_drop = true; // re-anchor the reference chain on the next frame
+                    recover_after_drop = true;
                     if dropped_batches.is_power_of_two() {
                         tracing::warn!(
                             dropped_batches,
@@ -1790,14 +1351,11 @@ fn stream_body(
                     }
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                    break; // packetizer/sender exited (client gone)
+                    break;
                 }
             }
         }
-        // Encode-stall recovery, the poll half (mirrors the native path's watchdog): an explicit
-        // poll error, or no AU within the window while frames are owed — the silent wedge, where
-        // a non-blocking poll returns `None` forever and nothing else ever errors. The window
-        // scales with the frame interval so low-fps modes can't false-trip.
+        // Poll error, or no AU while frames are owed. Window scales so low-fps cannot false-trip.
         let stall_window = Duration::from_secs(2).max(frame_interval * 8);
         if poll_err.is_some() || (enc_inflight > 0 && last_au_at.elapsed() >= stall_window) {
             let why = match &poll_err {
@@ -1829,10 +1387,7 @@ fn stream_body(
             let t_send = tick.elapsed();
             let cap_us = t_cap.as_micros();
             let enc_us = (t_enc - t_cap).as_micros();
-            // `poll` = drain the encoder's AUs; `enqueue` = hand-off to the pipeline. FEC/packetize
-            // and the paced send now run on their own threads, off this loop — so both of these
-            // should be small; if they aren't, the encode loop is being stalled by pipeline
-            // backpressure (a full queue), which is the signal that a downstream stage can't keep up.
+            // Both should be small; if not, a full queue is stalling encode.
             let poll_us = (t_pkt - t_enc).as_micros();
             let enqueue_us = (t_send - t_pkt).as_micros();
             mx_cap = mx_cap.max(cap_us);
@@ -1848,18 +1403,11 @@ fn stream_body(
         fps_count += 1;
         if fps_t.elapsed() >= Duration::from_secs(1) {
             let secs = fps_t.elapsed().as_secs_f64();
-            // Bytes handed to the wire this window, tallied by the packetizer thread (goodput).
             let win_bytes = goodput.swap(0, std::sync::atomic::Ordering::Relaxed);
-            // The sender's per-frame wire-spread samples for this window — drained EVERY window
-            // (not just when armed) so its bounded push buffer stays fresh.
+            // Drain every window so the sender's bounded push buffer stays fresh.
             let mut v_spread =
                 std::mem::take(&mut *spread_us.lock().unwrap_or_else(|p| p.into_inner()));
             if perf {
-                // Max µs/stage this second on the ENCODE loop: cap=drain channel, enc=submit
-                // (zero-copy device copy + NVENC), pkt=poll (AU drain), send=enqueue to the pipeline.
-                // FEC/packetize and the paced send run on their own threads now, so pkt/send here
-                // should be near-zero — a nonzero value means encode is being stalled by pipeline
-                // backpressure. `uniq`=new captured frames (vs re-encoded).
                 tracing::info!(
                     fps = fps_count,
                     uniq,
@@ -1877,9 +1425,7 @@ fn stream_body(
                     "video: streaming"
                 );
             }
-            // Web-console capture: build the aggregated sample. The host send side exposes no
-            // receiver-side packet loss / FEC-recovery / send-buffer EAGAIN counters, so those stay
-            // 0 (not fabricated); `frames_dropped` is the per-frame pipeline-queue overflow delta.
+            // Host send side has no receiver-side loss / FEC-recovery / EAGAIN counters; leave 0.
             if stats.is_armed() {
                 let session_id = *sid.get_or_insert_with(|| {
                     stats.register_session(
@@ -1892,7 +1438,7 @@ fn stream_body(
                     )
                 });
                 let sample = crate::stats_recorder::StatsSample {
-                    t_ms: 0, // stamped by push_sample from the capture's monotonic start
+                    t_ms: 0,
                     session_id,
                     stages: vec![
                         crate::stats_recorder::StageTiming {
@@ -1915,8 +1461,6 @@ fn stream_body(
                             p50_us: percentile(&mut v_send, 0.50) as f32,
                             p99_us: percentile(&mut v_send, 0.99) as f32,
                         },
-                        // The paced sender's per-frame wire spread (burst + paced overflow),
-                        // measured on ITS thread — the number WP1.2's microburst change moves.
                         crate::stats_recorder::StageTiming {
                             name: "send_spread".into(),
                             p50_us: percentile(&mut v_spread, 0.50) as f32,
@@ -1926,8 +1470,7 @@ fn stream_body(
                     fps: (uniq as f64 / secs) as f32,
                     repeat_fps: (fps_count.saturating_sub(uniq) as f64 / secs) as f32,
                     mbps: (win_bytes as f64 * 8.0 / secs / 1_000_000.0) as f32,
-                    // The LIVE wire budget (de-rated under loss, decayed back on clean windows)
-                    // — the console shows what the host actually targets, not the ask.
+                    // Live wire budget, not the client's ask.
                     bitrate_kbps: adapt.budget_kbps,
                     frames_dropped: dropped_batches.saturating_sub(last_dropped_batches) as u32,
                     packets_dropped: 0,
@@ -1936,13 +1479,8 @@ fn stream_body(
                 };
                 stats.push_sample(session_id, sample);
             }
-            // 1 Hz loss adaptation (WP2.2-2.4): fold the window's client-reported loss into the
-            // FEC percent + wire budget, then retarget the encoder IN PLACE under the (possibly
-            // de-rated) budget with the new parity carved out — the wire never exceeds what the
-            // adaptation decided, which is the WP2.1 invariant kept live. The packetizer and the
-            // send pacer follow through their atomics. An encoder that refuses the in-place
-            // retarget (software paths) disables adaptation for the session: raising FEC with a
-            // frozen encoder rate would push the wire back over the budget.
+            // Wire never exceeds the live budget. A refused in-place retarget disables
+            // adaptation: raising FEC with a frozen encoder rate would overshoot.
             if adapt_supported && gs_adapt_enabled() {
                 let lost_total = loss.lost.load(std::sync::atomic::Ordering::Relaxed);
                 let lost_delta = lost_total.saturating_sub(adapt_lost_seen);
@@ -1986,21 +1524,12 @@ fn stream_body(
             fps_count = 0;
             fps_t = Instant::now();
         }
-        // Single pacing authority: hold a steady cadence at the target rate from an absolute
-        // clock. No double-sleep. If a slow frame put us behind, resync to now rather than
-        // bursting to catch up.
+        // Absolute clock. Behind a slow frame: resync to now rather than bursting to catch up.
         next_frame += frame_interval;
         if crate::send_pacing::frame_driven_enabled() && capturer.supports_arrival_wait() {
-            // T1.1 frame-driven trigger (GS competitive program WP1.1, ported from the native
-            // loop): instead of sleeping out the whole tick and then SAMPLING — which holds a
-            // frame that arrived just after the previous sample for up to a full interval,
-            // ~half on average — sleep only to the rate floor and wake on the capture's actual
-            // arrival. The 0.9×interval floor (anchored to THIS tick's sample) leaves per-gap
-            // jitter headroom; the credit bucket pins the long-run AVERAGE at the negotiated
-            // rate, so a mirrored panel running faster than the session (§7.3 — a mirror keeps
-            // the panel's own mode) cannot overdrive the wire. The +0.5×interval deadline keeps
-            // a static desktop re-encoding (client liveness, bitrate shape) at ~1.5×interval
-            // cadence, exactly the legacy repeat-frame behavior.
+            // 0.9× floor leaves jitter headroom; credit pins the long-run average so a faster
+            // mirrored panel cannot overdrive the wire. +0.5× deadline keeps static-desktop
+            // re-encode at ~1.5×interval (client liveness).
             cap_credit.charge();
             let earliest = std::cmp::max(
                 tick + frame_interval.mul_f32(0.9),
@@ -2010,8 +1539,7 @@ fn stream_body(
                 std::thread::sleep(d);
             }
             capturer.wait_arrival(tick + frame_interval.mul_f32(1.5));
-            // Arrivals are the clock now: re-anchor the absolute tick so the legacy resync math
-            // stays sane if a mid-stream rebuild flips this loop back to the fixed cadence.
+            // Arrivals are the clock; re-anchor so a rebuild back to fixed cadence stays sane.
             next_frame = Instant::now() + frame_interval;
         } else {
             match next_frame.checked_duration_since(Instant::now()) {
@@ -2023,16 +1551,11 @@ fn stream_body(
     Ok(())
 }
 
-/// The encoder video rate the client's configured bitrate affords once GameStream wire framing
-/// (RTP + reserved + NV header: 32 B per `packetSize + 16 − 32` payload bytes) and the session's
-/// FEC parity are carved out — the compat-plane twin of the native plane's
-/// `encoder_kbps_for_budget` (ABR overhaul Phase 4): the number a Moonlight user sets is a WIRE
-/// budget, not an encoder rate with ~23 % stacked on top. Moonlight's bitrate setting governs
-/// video alone (audio is negotiated separately, as on Sunshine-class hosts), so no audio
-/// reservation is subtracted. Floored at 500 kbps: a degenerate ask still streams, it just
-/// overshoots honestly.
+/// Encoder rate under the client's wire budget: 32 B framing per `packetSize + 16 − 32`
+/// payload bytes plus FEC parity. No audio reservation (Moonlight bitrate is video-only).
+/// Floor 500 kbps: a degenerate ask still streams.
 fn gs_encoder_bps(bitrate_kbps: u32, fec_pct: u8, packet_size: usize) -> u64 {
-    let pps = (packet_size + 16).saturating_sub(32).max(1) as u64; // = VideoPacketizer's payload
+    let pps = (packet_size + 16).saturating_sub(32).max(1) as u64;
     let blocksize = pps + 32;
     let video = bitrate_kbps as u64 * 1000 * pps * 100 / (blocksize * (100 + fec_pct as u64));
     video.max(500_000)
@@ -2045,26 +1568,16 @@ fn gs_adapt_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("PUNKTFUNK_GS_ADAPT").as_deref() != Ok("0"))
 }
 
-/// Loss-driven adaptation state for one GameStream session (WP2.2-2.4), stepped once per
-/// stats window (~1 s) from the client's `0x0201` loss reports. Two levers, one invariant:
-///
-/// * **FEC percent** climbs fast under loss (each lossy window: `+max(5, pct/2)`, capped at
-///   [`Self::FEC_MAX`]) and decays slowly on clean windows (−5 per 8 clean, floored at the
-///   configured base) — random/burst loss is answered with parity first, the cheap lever.
-/// * **Wire budget** de-rates only under SUSTAINED loss (from the 2nd consecutive lossy
-///   window: ×0.85, floored at max(¼ of the negotiated rate, 5 Mbps)) and climbs back at
-///   1/20 of the negotiated rate per 4 clean windows — persistent congestion is answered
-///   with fewer bits, the native controller's division of labour.
-///
-/// The invariant: whoever applies a step re-derives the ENCODER rate under
-/// (budget, percent) — see the apply site — so the wire never exceeds the live budget.
-/// Constants are deliberately conservative first values (the WP0.3 netem matrix tunes them);
-/// no Sunshine-class host adapts at all, so conservative is already ahead.
+/// Loss-driven FEC percent and wire budget, stepped ~1 s from client `0x0201` reports.
+/// FEC climbs `+max(5, pct/2)` per lossy window (cap [`Self::FEC_MAX`]) and decays −5 per
+/// 8 clean (floor `base_pct`). Budget de-rates ×0.85 from the 2nd consecutive lossy window
+/// (floor max(¼ cap, 5 Mbps)) and climbs cap/20 per 4 clean. Apply site re-derives the
+/// encoder rate under (budget, percent) so the wire never exceeds the live budget.
 #[derive(Clone, Copy, Debug)]
 struct GsAdapt {
-    /// The session's configured FEC percent — the decay floor.
+    /// Decay floor.
     base_pct: u8,
-    /// The client's negotiated bitrate (kbps) — the recovery ceiling.
+    /// Recovery ceiling (client negotiated kbps).
     cap_kbps: u32,
     fec_pct: u8,
     budget_kbps: u32,
@@ -2132,20 +1645,14 @@ mod tests {
         }
     }
 
-    /// What the compat plane decides to track. The negative cases are the load-bearing ones: a
-    /// Desktop entry launches nothing, so it must take no lease at all — the feature has to stay
-    /// completely inert for a plain desktop stream.
+    /// Desktop / no command must take no lease — a plain desktop stream stays inert.
     #[test]
     fn only_an_entry_that_launches_something_gets_tracked() {
-        // Nothing selected (no `/launch` app) → nothing to track.
         assert!(resolve_gs_app(None).is_none());
-        // Desktop: a title with no command and no library id.
         assert!(resolve_gs_app(Some(&entry("Desktop", None))).is_none());
-        // A blank command is the same as none.
         assert!(resolve_gs_app(Some(&entry("Blank", Some("   ")))).is_none());
 
-        // An operator-typed apps.json command: no library entry behind it, so the title is the whole
-        // identity and there is no store-qualified id for the console to match box art on.
+        // Operator-typed command: title is the whole identity; no store id for box art.
         let t = resolve_gs_app(Some(&entry(
             "Steam Big Picture",
             Some("  steam -gamepadui  "),
@@ -2155,30 +1662,24 @@ mod tests {
         assert_eq!(t.game.id, None);
         assert_eq!(t.game.store, None);
         assert_eq!(t.game.title, "Steam Big Picture");
-        // `steam` is a PATH lookup, not an absolute executable, so nothing is asserted about the
-        // process — the host's own child is what tracks it (see `library::spec_from_command`).
+        // PATH lookup, not an absolute executable — the host's child tracks it.
         assert!(t.detect.is_empty());
 
-        // A titleless entry still shows up as something a human can read.
         let t = resolve_gs_app(Some(&entry("", Some("/opt/game/run")))).expect("tracked");
         assert_eq!(t.game.title, "/opt/game/run");
     }
 
-    /// The coalesce window must bound forced IDRs in time, not in frames. A frame-scaled window
-    /// vanishes exactly where it matters most — at high refresh, where a client's recovery spam
-    /// arrives far slower than two frame intervals and so passes the gate every time.
+    /// Window is time, not frames: at 120 fps two intervals is 16.7 ms, under a ~30 ms re-ask.
     #[test]
     fn keyframe_coalesce_window_outlasts_a_clients_request_cadence() {
-        // The observed storm: a 120 fps session against a client re-asking every ~30 ms. The
-        // pre-floor window was 16.7 ms, so every request became a full IDR.
         let at_120 = keyframe_coalesce_window(Duration::from_secs_f64(1.0 / 120.0));
         assert!(
             at_120 >= Duration::from_millis(100),
             "120 fps window {at_120:?} does not outlast a ~30 ms request cadence"
         );
-        // 60 fps was under the floor too (33.3 ms), which is why this is not a 120-only fix.
+        // 60 fps is 33.3 ms — also under the floor.
         assert!(keyframe_coalesce_window(Duration::from_secs_f64(1.0 / 60.0)) >= at_120);
-        // A slow stream keeps the frame-scaled window — the floor only ever raises it.
+        // Slow stream keeps the frame-scaled window; the floor only raises.
         assert_eq!(
             keyframe_coalesce_window(Duration::from_millis(200)),
             Duration::from_millis(400)
@@ -2190,8 +1691,7 @@ mod tests {
     #[test]
     fn sender_delivers_batches() {
         let rx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        // Generous: on a CI host saturated by parallel release builds, this thread can be
-        // starved for whole seconds between recv() wakeups.
+        // Saturated CI can starve this thread for seconds between recv() wakeups.
         rx_sock
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
@@ -2205,8 +1705,7 @@ mod tests {
         spawn_sender(
             tx_sock,
             rx,
-            Duration::from_millis(8), // ~120fps frame interval
-            // 3× a 20 Mbps stream — the canonical pace rate.
+            Duration::from_millis(8),
             Arc::new(std::sync::atomic::AtomicU64::new(3 * 20_000_000)),
             pool_tx,
             spread.clone(),
@@ -2215,11 +1714,8 @@ mod tests {
         )
         .unwrap();
 
-        // 3 frames of 20 packets, content-tagged for verification. The TOTAL burst must fit
-        // the receive socket's DEFAULT buffer even if this thread never drains concurrently
-        // (a starved CI runner): a 1200 B datagram costs ~2.5 KB kernel truesize, and the
-        // default rmem (~212 KB) holds only ~80 — a bigger burst gets silently dropped by
-        // the kernel and the test can never complete (the old 3×100 flaked exactly there).
+        // Default rmem (~212 KB) holds ~80 × 1200 B datagrams (~2.5 KB truesize).
+        // A bigger burst is silently dropped if this thread never drains concurrently.
         const PER_FRAME: usize = 20;
         let mut sent = Vec::new();
         for f in 0..3u8 {
@@ -2234,7 +1730,7 @@ mod tests {
             sent.extend(batch.iter().cloned());
             tx.send(batch).unwrap();
         }
-        drop(tx); // sender drains then exits
+        drop(tx);
 
         let mut got = 0usize;
         let mut buf = [0u8; 2048];
@@ -2247,7 +1743,6 @@ mod tests {
         }
         assert_eq!(got, 3 * PER_FRAME);
         assert!(running.load(Ordering::SeqCst), "no spurious client-gone");
-        // Spent batches came back for recycling, and each frame recorded a wire spread.
         let mut recycled = 0;
         while pool_rx.try_recv().is_ok() {
             recycled += 1;
@@ -2262,55 +1757,43 @@ mod tests {
         );
     }
 
-    /// WP2.1: the encoder rate is derived UNDER the client's configured wire budget — framing
-    /// (32 B per 1376 B payload at the default packetSize) and FEC parity fit inside it. The old
-    /// shape (encoder = the full configured rate) overshot the wire by ≈1.23× at 20 % FEC.
+    /// Framing (32 B per 1376 B payload) and FEC parity fit inside the configured wire budget.
     #[test]
     fn encoder_rate_fits_inside_the_wire_budget() {
-        // 20 Mbps configured, 20 % FEC, packetSize 1392: enc = 20e6 × 1376/1408 × 100/120.
+        // 20 Mbps, 20 % FEC, packetSize 1392: enc = 20e6 × 1376/1408 × 100/120.
         let enc = gs_encoder_bps(20_000, 20, 1392);
         assert_eq!(enc, 16_287_878);
-        // Re-derive the wire this rate spends: it must not exceed the configured budget.
         let wire = enc * 1408 / 1376 * 120 / 100;
         assert!(wire <= 20_000_000, "wire {wire} exceeds the 20 Mbps budget");
         assert!(
             wire >= 19_800_000,
             "wire {wire} leaves more than 1 % of the budget unused"
         );
-        // FEC off: only framing is carved out.
         assert_eq!(gs_encoder_bps(20_000, 0, 1392), 20_000_000 * 1376 / 1408);
-        // Degenerate ask: floored, never zero.
         assert_eq!(gs_encoder_bps(0, 20, 1392), 500_000);
     }
 
-    /// WP2.2-2.4: the loss-adaptation state machine — FEC climbs fast and decays slow, the
-    /// budget de-rates only under SUSTAINED loss and recovers gradually, and both stay inside
-    /// their bounds whatever the input sequence.
+    /// FEC climbs fast and decays slow; budget de-rates only under sustained loss.
     #[test]
     fn loss_adaptation_steps_and_bounds() {
         let mut a = GsAdapt::new(20, 20_000);
-        // A clean session never moves either lever.
         for _ in 0..100 {
             assert!(!a.step(0), "clean windows must not change anything at rest");
         }
         assert_eq!((a.fec_pct, a.budget_kbps), (20, 20_000));
 
-        // First lossy window: FEC climbs (+max(5, 20/2) = +10), budget HOLDS (one bad window
-        // is a blip, not congestion).
+        // First lossy: FEC +10, budget holds (one window is a blip).
         assert!(a.step(7));
         assert_eq!((a.fec_pct, a.budget_kbps), (30, 20_000));
-        // Second consecutive lossy window: FEC keeps climbing, budget de-rates ×0.85.
+        // Second consecutive: budget de-rates ×0.85.
         assert!(a.step(3));
         assert_eq!((a.fec_pct, a.budget_kbps), (45, 17_000));
-        // Sustained loss saturates FEC at the cap and walks the budget to its floor (¼ cap).
         for _ in 0..30 {
             a.step(1);
         }
         assert_eq!(a.fec_pct, GsAdapt::FEC_MAX);
         assert_eq!(a.budget_kbps, 5_000, "floor = max(cap/4, 5 Mbps)");
 
-        // Recovery: budget climbs cap/20 per 4 clean windows, FEC decays 5 per 8 clean —
-        // both settle exactly at their configured values, never above.
         let mut changes = 0;
         for _ in 0..400 {
             if a.step(0) {
@@ -2321,19 +1804,17 @@ mod tests {
         }
         assert_eq!((a.fec_pct, a.budget_kbps), (20, 20_000));
         assert!(changes > 0, "recovery must actually step");
-        // A relapse mid-recovery resets the clean streak: the next single lossy window
-        // climbs FEC but does NOT de-rate the budget again.
+        // Relapse resets the clean streak: one lossy window climbs FEC, does not de-rate.
         let budget_before_relapse = a.budget_kbps;
         a.step(2);
         assert_eq!(a.budget_kbps, budget_before_relapse);
         assert!(a.fec_pct > 20);
     }
 
-    /// The tiny-cap edge: the budget floor can never exceed the cap, and a 5 Mbps session
-    /// simply never de-rates.
+    /// Budget floor cannot exceed the cap; a session below 5 Mbps never de-rates.
     #[test]
     fn loss_adaptation_tiny_session_never_derates_below_itself() {
-        let mut a = GsAdapt::new(20, 4_000); // below the 5 Mbps absolute floor
+        let mut a = GsAdapt::new(20, 4_000);
         for _ in 0..10 {
             a.step(9);
         }

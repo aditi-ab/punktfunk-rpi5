@@ -1,11 +1,11 @@
-//! The quick-action ring's editor on the console (design/touch-client-overlay.md §3.3): the
-//! editor IS the ring — the in-stream [`Ring`], the same type, full size over a gradient
-//! backdrop, in its editing mode. A pad: stick or D-pad to a slot, A picks what it holds from
-//! the catalogue by group, Y lifts a disc and A drops it on another to swap, B goes back. A
-//! pointer: click a disc to pick, carry it onto another to swap. Under the ring the shortcuts
-//! sit as rows — name and legend — with New shortcut and Reset to default; a row opens
-//! [`super::shortcut_editor::ShortcutEditorScreen`]. Writes go through the same load-then-save
-//! the settings screen uses, so another writer's edits are never reverted.
+//! Console editor for the in-stream quick-action [`Ring`].
+//!
+//! Same type as the overlay, in editing mode. Stick or D-pad to a slot; A opens
+//! the catalogue picker; Y lifts a disc and A on another swaps. Shortcut rows
+//! under the ring open [`super::shortcut_editor::ShortcutEditorScreen`].
+//!
+//! Writes load-then-save like the settings screen, so another writer's edits
+//! are never reverted. Design: `design/touch-client-overlay.md`.
 
 use crate::glyphs::{Hint, HintKey};
 use crate::pointer::{Pointer, PointerKind};
@@ -20,21 +20,20 @@ use pf_client_core::overlay_actions::{
 use pf_client_core::ring::{RingFacts, RING_RADIUS, SLOT_DIAMETER};
 use skia_safe::{Canvas, Color4f, RRect, Rect};
 
-/// The stage under the ring and the caption over it, in design units. The stage fits the
-/// ring exactly as it draws in-stream — the top slot, the bottom slot and the label band
-/// under it — with one pad above and below, so nothing of the ring is clipped.
+/// Stage and caption in design units. Height is the in-stream ring (top slot, bottom
+/// slot, label band) plus `STAGE_PAD` above and below so nothing is clipped.
 const STAGE_PAD: f64 = 16.0;
 const RING_ABOVE: f64 = (RING_RADIUS + SLOT_DIAMETER / 2.0) as f64;
 const RING_BELOW: f64 = (RING_RADIUS + SLOT_DIAMETER + LABEL_H) as f64;
 const STAGE_H: f64 = STAGE_PAD + RING_ABOVE + RING_BELOW + STAGE_PAD;
 const CAPTION_H: f64 = 34.0;
 const CORNER: f64 = 22.0;
-/// Height kept for the shortcut rows under the stage before the stage starts scaling down.
+/// Shortcut-row floor: below this the stage scales down rather than shrinking the list.
 const LIST_MIN: f64 = 140.0;
-/// The ring's horizontal extent plus breathing room — the width half of the fit.
+/// Horizontal fit: in-stream ring width plus 24 px of pad.
 const RING_W: f64 = 2.0 * RING_ABOVE + 24.0;
 
-/// The ring rows parse the blob on the platform's default ring, like the ring itself does.
+/// Same platform mapping the in-stream ring uses to pick a default blob.
 pub(crate) fn ring_platform(platform: crate::platform::Platform) -> RingPlatform {
     match platform {
         crate::platform::Platform::Desktop => RingPlatform::Desktop,
@@ -42,7 +41,6 @@ pub(crate) fn ring_platform(platform: crate::platform::Platform) -> RingPlatform
     }
 }
 
-/// The picker over a slot: the catalogue as a list, the current pick marked.
 struct Picker {
     slot: usize,
     list: MenuList,
@@ -60,8 +58,8 @@ pub(crate) struct RingEditorScreen {
     ring: Ring,
     cfg: OverlayConfig,
     platform: crate::platform::Platform,
-    /// The blob `cfg` came from — the settings string, re-adopted whenever it changes under
-    /// this screen (the shortcut editor writes it and pops back here).
+    /// Settings string `cfg` was parsed from. Re-adopted when the shortcut editor pops
+    /// back after writing it.
     blob: String,
     list: MenuList,
     focus: Focus,
@@ -69,11 +67,11 @@ pub(crate) struct RingEditorScreen {
     stage: Rect,
     list_rect: Rect,
     reset_armed: bool,
-    /// The stick's sector as last reported, whichever widget has the focus — so a handoff
-    /// back to the ring knows whether the stick is still held.
+    /// Last stick sector, even while the list is focused, so a handoff back to the ring
+    /// knows whether the stick is still held.
     stick: Option<u8>,
-    /// The list was just entered by the stick's sector; the four-way move that rides behind
-    /// it in the same sample must not also step the list.
+    /// Stick sector just entered the list; the four-way Move in the same sample must not
+    /// also step a row.
     swallow_move: bool,
 }
 
@@ -102,8 +100,8 @@ impl RingEditorScreen {
         "Quick actions".into()
     }
 
-    /// Take the blob as the ring to edit. The ring parses on the desktop default, so an
-    /// empty blob is handed the platform's own default written out.
+    /// Parse `blob` into the ring. Empty is replaced with this platform's default JSON:
+    /// the ring parser otherwise assumes desktop.
     fn adopt(&mut self, blob: &str, platform: crate::platform::Platform) {
         self.platform = platform;
         self.blob = blob.to_string();
@@ -124,8 +122,7 @@ impl RingEditorScreen {
         });
     }
 
-    /// Write `blob` rebased on the file (this screen is one more whole-file writer), and
-    /// show it.
+    /// Whole-file writer: rebase on a fresh load so a concurrent save is not reverted.
     fn write(&mut self, blob: String, ctx: &mut Ctx) {
         *ctx.settings = ctx.store.load();
         ctx.settings.overlay_actions = blob;
@@ -150,7 +147,7 @@ impl RingEditorScreen {
         self.write(cfg.to_json(), ctx);
     }
 
-    /// Back to the platform ring: an empty blob, like the settings row did.
+    /// Empty blob = platform default, same as the settings row.
     fn reset(&mut self, ctx: &mut Ctx, fx: &mut Outbox) {
         self.write(String::new(), ctx);
         fx.toast = Some("Quick actions reset".into());
@@ -202,7 +199,6 @@ impl RingEditorScreen {
         }
     }
 
-    /// The rows under the ring: the shortcuts, New shortcut, Reset to default.
     fn rows(&self) -> Vec<RowSpec> {
         let mut rows: Vec<RowSpec> = self
             .cfg
@@ -310,10 +306,8 @@ impl RingEditorScreen {
         }
         match self.focus {
             Focus::Ring => {
-                // Down past 6 o'clock walks into the list: the D-pad's Down there, or the
-                // stick pushed down AGAIN once its first push has put the highlight there.
-                // Never the stick's own four-way move: it rides behind the sector that
-                // landed on 6, and the ring ignores it while the stick is engaged.
+                // Down from 6 o'clock: D-pad Down, or a second stick push once highlight
+                // is there. Not the stick's four-way Move (it rides behind the sector).
                 let at_six = self.ring.highlight() == Some(3) && !self.ring.carrying();
                 let walks = at_six
                     && !self.ring.stick_engaged()
@@ -343,8 +337,8 @@ impl RingEditorScreen {
                     return None;
                 }
                 if ev == MenuEvent::Move(MenuDir::Up) && self.list.cursor == 0 {
-                    // Back onto the ring at 6 o'clock. A stick still held stays the
-                    // ring's until it lets go, so its repeats step nothing.
+                    // Up from row 0 returns to 6 o'clock. A held stick stays the ring's
+                    // so repeats do not step slots.
                     self.focus = Focus::Ring;
                     self.ring.set_highlight(3);
                     self.ring.adopt_stick(self.stick.is_some());
@@ -362,7 +356,7 @@ impl RingEditorScreen {
 
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
         if let Some(pk) = self.picker.as_mut() {
-            // A modal: what lands on the card is the list's, a press elsewhere dismisses it.
+            // Modal: eat every pointer event. A press outside the card dismisses it.
             if p.hits(pk.rect) || matches!(p.kind, PointerKind::Scroll { .. }) {
                 let (msg, _) = pk.list.pointer(p, pk.rows.len());
                 if msg == ListMsg::Activate {
@@ -460,11 +454,8 @@ impl RingEditorScreen {
             ROW_MAX_W * 0.9 * k,
         );
 
-        // The stage: a flat card face, like every other card on this shell (a gradient
-        // read as decoration on the Deck). On a screen too short for the ring AND the
-        // shortcut rows — a landscape phone — the rows move BESIDE the stage and the ring
-        // takes the height; only when even that cannot hold it does the stage scale down.
-        // The ring is as large as the screen allows, and never clipped.
+        // Side-by-side when stacked fit would shrink the ring below 0.75 and width
+        // holds RING_W plus a 420-wide list. Scale down only if even that cannot hold it.
         let caption_h = (CAPTION_H + 12.0) * k;
         let fit_below = (f64::from(rect.height()) - caption_h - LIST_MIN * k) / (STAGE_H * k);
         let side = fit_below < 0.75 && f64::from(rect.width()) >= (RING_W + 420.0) * k;
@@ -493,13 +484,10 @@ impl RingEditorScreen {
         canvas.draw_rrect(rr, &fill(card_face(0.20)));
         canvas.draw_rrect(rr, &stroke(fg(0.14), kf));
         if self.focus == Focus::Ring && self.picker.is_none() {
-            // Corner in DESIGN units — the halo scales it itself, like `panel` does; a
-            // pre-scaled corner squares the scale and reads as a second, rounder card.
+            // Corner in design units: `focus_halo` scales it. A pre-scaled corner double-scales.
             focus_halo(canvas, stage, CORNER as f32, kf, 1.0);
         }
 
-        // The ring, one pad below the stage's top, at the stage's own scale; its pixels
-        // only inside it.
         self.ring.recentre(
             stage.center_x(),
             stage.top + (STAGE_PAD + RING_ABOVE) as f32 * rk,
@@ -516,7 +504,6 @@ impl RingEditorScreen {
         );
         canvas.restore();
 
-        // The shortcuts: under the stage, or beside it on a short-wide screen.
         let list_rect = if side {
             Rect::from_ltrb(
                 stage.right + 8.0 * kf,
@@ -539,13 +526,10 @@ impl RingEditorScreen {
             self.focus == Focus::List && self.picker.is_none(),
         );
 
-        // The picker: a card over everything, the way the ring's own sheet sits.
         if let Some(pk) = self.picker.as_mut() {
-            // Over EVERYTHING, the heading included — the content rect is not the screen,
-            // and a scrim that stops at its edge reads as a band. The canvas is translated
-            // (insets, transitions), so overshoot every edge by more than any heading,
-            // hint bar or inset can be. The hint bar draws after this and stays legible,
-            // carrying the picker's own controls.
+            // Scrim the full canvas, not `rect`: the content rect is not the screen, and
+            // the canvas is translated (insets, transitions). 2000 px overshoots any
+            // heading or inset; the hint bar draws after this and stays legible.
             canvas.draw_rect(
                 rect.with_outset((2000.0 * kf, 2000.0 * kf)),
                 &fill(Color4f::new(0.0, 0.0, 0.0, 0.45)),
@@ -581,8 +565,6 @@ impl RingEditorScreen {
 mod tests {
     use super::*;
 
-    /// The picker lists the shared catalogue with the slot's current pick marked and the
-    /// cursor on it; choosing the empty entry empties the slot.
     #[test]
     fn the_picker_marks_the_current_pick_and_empty_empties_the_slot() {
         let blob = r#"{"v":2,"ring":["stats",null,null,null,null,null]}"#;

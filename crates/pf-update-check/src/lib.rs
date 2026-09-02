@@ -1,34 +1,28 @@
-//! Shared update-**check** core for the punktfunk host and the Linux client.
+//! Shared update-check core for the host and the Linux client.
 //!
-//! Both products answer the same question — *does a newer build exist for this box's
-//! channel?* — from the same Ed25519-signed per-channel manifest. This crate owns the part
-//! where being wrong is a security bug, so that it exists exactly once:
+//! Both products ask whether a newer build exists for this box's channel,
+//! from one Ed25519-signed per-channel manifest. Being wrong here is a
+//! security bug, so the check lives once:
 //!
-//! * [`sig`] — detached Ed25519 verification against pinned keys.
-//! * [`manifest`] — the signed document's schema and its fail-closed validation rules.
-//! * [`feed`] — fetching the document (and verifying over the *final*, post-redirect bytes).
-//! * [`version`] — channels, and the comparison that decides "newer" across packaging formats.
-//! * [`detect`] — the install-kind ladder, parameterised by [`detect::Product`].
+//! * [`sig`] — detached Ed25519 against pinned keys.
+//! * [`manifest`] — schema and fail-closed validation.
+//! * [`feed`] — fetch; verify the post-redirect bytes.
+//! * [`version`] — channel and "newer" across packaging formats.
+//! * [`detect`] — install-kind ladder, parameterised by [`detect::Product`].
 //!
-//! There is deliberately **no apply code here**. Applying an update is privileged, per-product
-//! and per-platform; it lives with the product that does it (`punktfunk-host::update`,
-//! `pf-client-core::update`, and the root helper in `pf-update`).
+//! No apply code. Apply is privileged and per-product (`punktfunk-host::update`,
+//! `pf-client-core::update`, the root helper in `pf-update`).
 
-// This crate parses a SIGNED, NETWORK-FETCHED manifest and, per the header above, "owns the part
-// where being wrong is a security bug". Signature verification is worthless if the parser around
-// it can be made to read out of bounds, so the absence of unsafe here is a security property and
-// is now enforced rather than merely true today.
+// Signed network bytes. A bounds bug in the parser would void the signature check.
 #![forbid(unsafe_code)]
 
-/// The Ed25519 public keys trusted for update manifests — two slots, so a key rotation is
-/// "sign with the new one, ship builds trusting both, retire the old" (the plugin-store
-/// `OFFICIAL_KEYS` drill) rather than a flag day. The private half is the
-/// `UPDATE_MANIFEST_KEY` CI secret and the operator's offline backup.
+/// Pinned Ed25519 keys for update manifests. Two slots: sign with the new key,
+/// ship builds that trust both, then retire the old. Private half is the
+/// `UPDATE_MANIFEST_KEY` CI secret plus the operator's offline backup.
 ///
-/// It lives here, not in either binary, because the host and the client consume the SAME
-/// signed manifest: two pin lists could disagree about who may announce a release, and the
-/// one that drifted would be the one nobody noticed. `scripts/ci/publish-update-manifest.sh`
-/// cross-checks the signing key against this file before it signs anything.
+/// Lives here, not in either binary: host and client consume the same manifest,
+/// so one pin list. `scripts/ci/publish-update-manifest.sh` checks the signing
+/// key against this file before it signs.
 pub const OFFICIAL_UPDATE_KEYS: [&str; 2] = [
     "ed25519:6rmlLg1aQ55cgB6icpC5BEpbMJxwPKdGaDQtDcJ0yLI=",
     "", // rotation slot

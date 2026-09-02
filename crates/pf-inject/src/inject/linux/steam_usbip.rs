@@ -1,21 +1,15 @@
-//! Virtual Steam Deck over **USB/IP** (`vhci_hcd`) — the shippable, Secure-Boot-clean, universal
-//! alternative to [`super::steam_gadget`] (`raw_gadget` + `dummy_hcd`, SteamOS-only).
+//! Virtual Steam Deck over USB/IP (`vhci_hcd`).
 //!
-//! Like the gadget, this presents a *real* 3-interface USB Steam Deck (mouse = interface 0, keyboard
-//! = 1, **controller = 2**) — the interface-2 layout Steam's own driver filters on, so Steam Input
-//! promotes it (a UHID Deck, `Interface: -1`, never is). Unlike the gadget it needs no out-of-tree
-//! module: `vhci_hcd` is in-tree + signed on SteamOS, Bazzite, and ~every distro, loads under Secure
-//! Boot, and needs no MOK. A userspace [`usbip_sim`] server emulates the Deck; the local `vhci_hcd`
-//! attaches it. **Validated on Bazzite**: `vhci_hcd` enumerates the 3-interface Deck, `hid-steam`
-//! binds it, and Steam reserves an XInput slot — identical recognition to the gadget.
+//! Three interfaces (mouse 0, keyboard 1, controller 2) so Steam Input promotes
+//! the pad — a UHID Deck reports `Interface: -1` and never is. Unlike
+//! [`super::steam_gadget`] (`raw_gadget` + `dummy_hcd`) this uses in-tree
+//! `vhci_hcd`: [`usbip_sim`] emulates the device and the local host attaches it.
 //!
-//! The device model + the USB/IP protocol come from the vendored [`usbip_sim`] crate (the upstream
-//! `usbip` crate trimmed of its libusb host mode); the captured descriptors + the `0x83`/`0xAE`
-//! feature contract come from the shared [`super::steam_proto`] (one source of truth with the gadget).
-//!
-//! **Attach** is in-process: the host preconnects and accepts only that TCP 4-tuple before handing
-//! the socket to `vhci_hcd`. The unauthenticated `usbip` CLI path is an explicit debugging override;
-//! failures in the secure path degrade to UHID.
+//! Descriptors and the `0x83`/`0xAE` feature contract live in
+//! [`super::steam_proto`]. Attach is in-process: the host preconnects and
+//! accepts only that TCP 4-tuple before handing the socket to `vhci_hcd`.
+//! `PUNKTFUNK_USBIP_ATTACH=cli` is an unauthenticated debug override.
+//! Callers degrade to UHID on failure.
 
 use super::steam_proto::{
     deck_serial, deck_unit_id, feature_reply, neutral_deck_report, parse_steam_output,
@@ -39,12 +33,11 @@ use usbip_sim::{
 
 const STEAM_VENDOR: u16 = 0x28DE;
 const STEAMDECK_PRODUCT: u16 = 0x1205;
-/// The single device's USB/IP bus id (one device per server, so the fixed default is fine).
+/// One device per server, so the usbip default bus id is enough.
 const BUS_ID: &str = "0-0-0";
-/// The usbip default TCP port — the server must listen here for the `usbip` CLI fallback to attach.
+/// usbip CLI default; [`attach_via_cli`] must listen here.
 const USBIP_TCP_PORT: u16 = 3240;
 
-/// Build the 9-byte HID class descriptor inserted between the interface and endpoint descriptors.
 fn hid_desc(report_len: usize, country: u8) -> Vec<u8> {
     let l = report_len as u16;
     #[rustfmt::skip]
@@ -52,16 +45,13 @@ fn hid_desc(report_len: usize, country: u8) -> Vec<u8> {
     d
 }
 
-/// The Deck **controller** interface (vendor HID, interface 2): answers the HID feature reports
-/// (descriptor / `0x83` attributes / `0xAE` serial), streams the current 64-byte state on the
-/// interrupt-IN endpoint, and surfaces rumble written via SET_REPORT.
+/// Interface 2 (vendor HID). Steam Input filters on this layout; idle mouse/kbd
+/// on 0/1 stay silent.
 #[derive(Debug)]
 struct ControllerHandler {
-    /// The current 64-byte Deck input report, shared with [`SteamDeckUsbip::write_state`].
     report: Arc<Mutex<[u8; 64]>>,
-    /// Rumble extracted from the kernel's SET_REPORTs, drained by [`SteamDeckUsbip::service`].
     feedback: Arc<Mutex<SteamFeedback>>,
-    /// The host's last SET_REPORT command (drives [`feature_reply`]).
+    /// Last SET_REPORT; next GET_REPORT feeds [`feature_reply`].
     last_set: Vec<u8>,
     serial: String,
     unit_id: u32,
@@ -81,11 +71,9 @@ impl UsbInterfaceHandler for ControllerHandler {
     ) -> std::io::Result<Vec<u8>> {
         if ep.is_ep0() {
             Ok(match (setup.request_type, setup.request) {
-                // GET report descriptor (standard, interface recipient).
+                // GET_DESCRIPTOR report (wValue hi = 0x22).
                 (0x81, 0x06) if (setup.value >> 8) == 0x22 => RDESC_DECK_CTRL.to_vec(),
-                // HID GET_REPORT (feature) — the Deck `0x83`/`0xAE` contract.
                 (0xA1, 0x01) => feature_reply(&self.last_set, &self.serial, self.unit_id).to_vec(),
-                // HID SET_REPORT — remember the command (for the next feature reply) + surface rumble.
                 (0x21, 0x09) => {
                     self.last_set = req.to_vec();
                     // `parse_steam_output` expects `[report-id(0), cmd, …]`; EP0 OUT data is `[cmd, …]`.
@@ -104,8 +92,7 @@ impl UsbInterfaceHandler for ControllerHandler {
                 _ => vec![],
             })
         } else if let Direction::In = ep.direction() {
-            // Interrupt-IN poll: return the current report. The vendored sim paces interrupt-IN by
-            // bInterval (vhci_hcd does NOT throttle the server side), so this isn't a busy spin.
+            // vhci_hcd does not throttle; usbip_sim paces interrupt-IN by bInterval.
             let r = self
                 .report
                 .lock()
@@ -121,7 +108,7 @@ impl UsbInterfaceHandler for ControllerHandler {
     }
 }
 
-/// A minimal idle HID interface (mouse / keyboard) — serves only its report descriptor.
+/// Mouse/keyboard: report descriptor only; no state, no rumble.
 #[derive(Debug)]
 struct IdleHidHandler {
     report_desc: Vec<u8>,
@@ -163,18 +150,17 @@ fn ep(addr: u8, mps: u16) -> UsbEndpoint {
     }
 }
 
-/// Assemble the simulated 3-interface USB Deck. The controller handler shares `report` + `feedback`
-/// with the owning [`SteamDeckUsbip`].
+/// Three-interface Deck; `report`/`feedback` are shared with [`SteamDeckUsbip`].
 fn build_device(
     index: u8,
     report: &Arc<Mutex<[u8; 64]>>,
     feedback: &Arc<Mutex<SteamFeedback>>,
 ) -> UsbDevice {
-    let mut dev = UsbDevice::new(0); // one device per server; bus_id stays the default "0-0-0".
+    let mut dev = UsbDevice::new(0); // bus_id stays BUS_ID
     dev.vendor_id = STEAM_VENDOR;
     dev.product_id = STEAMDECK_PRODUCT;
-    dev.usb_version = Version::from(0x0200u16); // bcdUSB 2.00
-    dev.device_bcd = Version::from(0x0300u16); // bcdDevice 3.00 (matches the gadget)
+    dev.usb_version = Version::from(0x0200u16);
+    dev.device_bcd = Version::from(0x0300u16); // match the gadget's bcdDevice
     dev.set_manufacturer_name("Valve Software");
     dev.set_product_name("Steam Deck Controller");
     dev.set_serial_number(&deck_serial(index));
@@ -214,9 +200,7 @@ fn build_device(
     )
 }
 
-/// Owns the emulation-server thread (a dedicated current-thread tokio runtime) and stops it on drop.
-/// Run on its own thread so `SteamDeckUsbip::open` works whether or not the caller is inside a tokio
-/// runtime (creating a runtime inside one would panic).
+/// Dedicated current-thread runtime. Nested runtimes panic, so this is its own thread.
 struct ServerThread {
     stop: Arc<tokio::sync::Notify>,
     join: Option<JoinHandle<()>>,
@@ -269,8 +253,7 @@ impl Drop for ServerThread {
     }
 }
 
-/// Serve one connected USB/IP socket. The in-process path pre-authenticates its socket by
-/// accepting the exact client 4-tuple; the legacy CLI path still supplies a one-shot listener.
+/// One USB/IP socket. In-process hands a pre-accepted 4-tuple; CLI hands a one-shot listener.
 async fn run_server(
     endpoint: ServerEndpoint,
     server: Arc<UsbIpServer>,
@@ -305,17 +288,10 @@ async fn run_server(
             }
         }
     };
-    // URB replies are small and interleave with the kernel's next SUBMITs; without
-    // TCP_NODELAY the multi-interface request/response pattern collapses into
-    // ~40 ms Nagle/delayed-ACK stalls (observed as ~22 reports/s on the Puck's
-    // active hidraw against a 266 Hz source).
+    // URB replies interleave with SUBMITs; Nagle + delayed ACK stalls that round trip.
     sock.set_nodelay(true).ok();
     let trace = super::usbip_trace::trace_prefix(&label);
     let conn = tokio::spawn(async move {
-        // The handler's Err arm used to be discarded. It is the *only* signal that
-        // we tore the connection down rather than the kernel — and the kernel's
-        // side of that (`recv xbuf`, `sendmsg failed`) reads identically either
-        // way, so throwing it away cost days of mis-attributed diagnosis.
         let sink = trace.and_then(|prefix| match super::usbip_trace::open_trace(&prefix) {
             Ok(s) => {
                 tracing::info!(prefix, "usbip byte trace armed");
@@ -343,26 +319,19 @@ async fn run_server(
             ),
         }
     });
-    // Stay until the kernel closes the connection (or the attachment is dropped) — the runtime
-    // lives on this thread, so returning early would kill the task serving the device.
+    // Runtime lives on this thread; returning here aborts the handler task.
     tokio::select! {
         _ = stop.notified() => {}
         _ = conn => {}
     }
 }
 
-/// A usbip-attached simulated device: the `vhci_hcd` port plus the socket + emulation server
-/// keeping it alive. Dropping it detaches the port FIRST (the kernel closes its socket end and
-/// tears the device down — Steam releases its slot), then drops the socket and stops the server —
-/// the teardown order the Deck transport shipped with. Shared by every usbip-presented pad
-/// (the Deck here, the Steam Controller 2 in [`super::triton_usbip`]).
+/// Drop detaches the `vhci_hcd` port first so the kernel tears the device down
+/// before the socket and server go. Shared with [`super::triton_usbip`].
 pub(crate) struct UsbipAttachment {
-    /// The `vhci_hcd` port we attached to — written to the sysfs `detach` file on drop.
     vhci_port: u16,
-    /// Kept alive so the connected socket fd we handed to `vhci_hcd` stays valid (in-process attach
-    /// only; the CLI hands its own fd to the kernel and exits, so this is `None` there).
+    /// Holds the fd handed to `vhci_hcd`. CLI attach is `None` — the CLI already passed its fd.
     _client_sock: Option<TcpStream>,
-    /// Emulation-server thread; dropped (stopped) after the detach.
     _server: ServerThread,
 }
 
@@ -374,8 +343,7 @@ impl Drop for UsbipAttachment {
     }
 }
 
-/// Attach through the authenticated in-process path. `PUNKTFUNK_USBIP_ATTACH=cli` explicitly
-/// selects the legacy unauthenticated fallback for debugging.
+/// In-process attach. `PUNKTFUNK_USBIP_ATTACH=cli` selects the unauthenticated CLI fallback.
 pub(crate) fn attach_device(build: impl Fn() -> UsbDevice, label: &str) -> Result<UsbipAttachment> {
     ensure_modules();
     if vhci_base().is_none() {
@@ -402,17 +370,15 @@ fn accept_expected_client(
     }
 }
 
-/// In-process attach: authenticate our loopback socket, import, then hand it to `vhci_hcd`.
 fn attach_in_process(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
-    // An ephemeral loopback port (avoids contending the usbip default with another pad).
+    // Port 0: do not contend USBIP_TCP_PORT with another pad.
     let listener =
         std::net::TcpListener::bind(("127.0.0.1", 0)).context("bind loopback usbip server")?;
     let port = listener
         .local_addr()
         .context("usbip server local_addr")?
         .port();
-    // Connect first, then accept only that socket's kernel-assigned source address. A local
-    // process may reach the visible port first, but it cannot own our live TCP 4-tuple.
+    // Connect first, then accept that 4-tuple. A racer can hit the port; it cannot own our tuple.
     let mut sock = connect_loopback(port).context("connect to usbip server")?;
     let expected = sock.local_addr().context("usbip client local_addr")?;
     let server_sock = accept_expected_client(&listener, expected)?;
@@ -422,9 +388,7 @@ fn attach_in_process(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
     let server = ServerThread::spawn(ServerEndpoint::Connected(server_sock), dev, label)?;
     let (devid, speed) = import_handshake(&mut sock).context("usbip import handshake")?;
 
-    // Hand the connected socket to vhci_hcd. Clear BOTH timeouts first: the kernel's vhci rx/tx
-    // threads honour SO_RCVTIMEO/SO_SNDTIMEO on this socket, so the 3s handshake timeouts would
-    // otherwise tear the device down after 3s idle (rx) or a 3s-blocked send (tx).
+    // Kernel vhci rx/tx honour SO_RCVTIMEO/SO_SNDTIMEO; handshake timeouts would idle-kill the device.
     let vhci_port = vhci_find_free_port(speed).context("find a free vhci port")?;
     sock.set_read_timeout(None).ok();
     sock.set_write_timeout(None).ok();
@@ -442,8 +406,7 @@ fn attach_in_process(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
     })
 }
 
-/// Fallback: emulate on the usbip default port and let the `usbip` CLI attach (it picks the vhci
-/// port itself; we recover it by diffing the sysfs status).
+/// CLI attach: listen on [`USBIP_TCP_PORT`], recover the vhci port by diffing sysfs status.
 fn attach_via_cli(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", USBIP_TCP_PORT))
         .with_context(|| format!("bind usbip default port {USBIP_TCP_PORT} for CLI attach"))?;
@@ -469,8 +432,7 @@ fn attach_via_cli(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
     })
 }
 
-/// A virtual Steam Deck presented over USB/IP. Dropping it detaches the `vhci_hcd` port (the device
-/// disappears, Steam releases its slot) and stops the emulation server.
+/// Virtual Deck on `vhci_hcd`. Drop detaches the port and stops the server.
 pub struct SteamDeckUsbip {
     report: Arc<Mutex<[u8; 64]>>,
     feedback: Arc<Mutex<SteamFeedback>>,
@@ -479,7 +441,7 @@ pub struct SteamDeckUsbip {
 }
 
 impl SteamDeckUsbip {
-    /// Bind a virtual Deck and attach it locally via `vhci_hcd`. `index` varies only the serial.
+    /// Attach a virtual Deck. `index` varies only the serial.
     pub fn open(index: u8) -> Result<SteamDeckUsbip> {
         let report = Arc::new(Mutex::new(neutral_deck_report()));
         let feedback = Arc::new(Mutex::new(SteamFeedback::default()));
@@ -495,7 +457,6 @@ impl SteamDeckUsbip {
         })
     }
 
-    /// Serialize `st` into the 64-byte Deck report streamed on the controller interrupt-IN endpoint.
     pub fn write_state(&mut self, st: &SteamState) {
         self.seq = self.seq.wrapping_add(1);
         let mut r = [0u8; 64];
@@ -505,7 +466,6 @@ impl SteamDeckUsbip {
         }
     }
 
-    /// Drain any rumble feedback the kernel/Steam wrote to the device.
     pub fn service(&mut self) -> SteamFeedback {
         self.feedback
             .lock()
@@ -514,12 +474,12 @@ impl SteamDeckUsbip {
     }
 }
 
-// ---- USB/IP import handshake (we act as the usbip *client* before handing the fd to the kernel) ----
+// ---- USB/IP import handshake (we are the usbip client until the fd is handed to the kernel) ----
 
 const USBIP_VERSION: u16 = 0x0111;
 const OP_REQ_IMPORT: u16 = 0x8003;
 
-/// Connect to our own loopback server, retrying briefly while the server thread comes up.
+/// Retry ~500 ms while the server thread comes up.
 fn connect_loopback(port: u16) -> Result<TcpStream> {
     let addr = ("127.0.0.1", port);
     let mut last = None;
@@ -541,13 +501,10 @@ fn connect_loopback(port: u16) -> Result<TcpStream> {
     ))
 }
 
-/// Send `OP_REQ_IMPORT` for [`BUS_ID`] and read `OP_REP_IMPORT`, returning `(devid, speed)` parsed
-/// from the device record (the same `devid = bus_num<<16 | dev_num` + speed `vhci_hcd` wants). The
-/// whole 320-byte reply MUST be consumed here so the socket starts clean at the kernel's first
-/// `USBIP_CMD_SUBMIT`.
+/// `OP_REQ_IMPORT` for [`BUS_ID`]. Consume the full 320-byte reply so the kernel's
+/// first `USBIP_CMD_SUBMIT` sees a clean socket. Returns `(bus_num<<16 | dev_num, speed)`.
 fn import_handshake(sock: &mut TcpStream) -> Result<(u32, u32)> {
-    // Bounded so a non-responsive server can't head-block the per-session input thread (this talks
-    // to our own in-process loopback server, so a working handshake completes in well under a ms).
+    // 1 s cap so a wedged handshake cannot head-block the input thread.
     sock.set_read_timeout(Some(Duration::from_secs(1))).ok();
     sock.set_write_timeout(Some(Duration::from_secs(1))).ok();
 
@@ -561,7 +518,7 @@ fn import_handshake(sock: &mut TcpStream) -> Result<(u32, u32)> {
     req.extend_from_slice(&busid);
     sock.write_all(&req).context("send OP_REQ_IMPORT")?;
 
-    // Reply: version(2) code(2) status(4), then the 312-byte device record on success.
+    // Header: version(2) code(2) status(4); then 312-byte device record.
     let mut header = [0u8; 8];
     sock.read_exact(&mut header)
         .context("read OP_REP_IMPORT header")?;
@@ -582,13 +539,11 @@ fn import_handshake(sock: &mut TcpStream) -> Result<(u32, u32)> {
 
 // ---- vhci_hcd sysfs plumbing ----
 
-/// Best-effort load of `vhci_hcd` (in-tree + signed on SteamOS/Bazzite/most distros).
 pub fn ensure_modules() {
     let _ = Command::new("modprobe").arg("vhci_hcd").status();
 }
 
-/// Run `usbip attach -r 127.0.0.1 -b 0-0-0`, bounded by a deadline so a hung CLI can't head-block
-/// the per-session input thread indefinitely (the caller runs this inline on that thread).
+/// `usbip attach`; 6 s cap so a hung CLI cannot head-block the input thread.
 fn usbip_attach_cli() -> Result<()> {
     let mut child = Command::new("usbip")
         .args(["attach", "-r", "127.0.0.1", "-b", BUS_ID])
@@ -609,9 +564,7 @@ fn usbip_attach_cli() -> Result<()> {
     }
 }
 
-/// Whether a usbip attach should be attempted at all. Default on (the universal Steam-promotable
-/// transport on non-SteamOS hosts); `PUNKTFUNK_STEAM_USBIP=0` forces it off, `=1` forces it on.
-/// [`open`](SteamDeckUsbip::open) still degrades gracefully if `vhci_hcd` turns out to be absent.
+/// Default on. `PUNKTFUNK_STEAM_USBIP=0`/`false` skips usbip; `open` still degrades if `vhci_hcd` is missing.
 pub fn usbip_preferred() -> bool {
     !matches!(
         std::env::var("PUNKTFUNK_STEAM_USBIP").ok().as_deref(),
@@ -619,9 +572,7 @@ pub fn usbip_preferred() -> bool {
     )
 }
 
-/// The `vhci_hcd.0` (or legacy `vhci_hcd`) platform sysfs directory, if present.
-/// `pub(crate)` so the diagnostics probe ([`crate::vhci_probe`]) asks the same question the attach
-/// path asks, rather than growing a second copy of these paths that can drift from it.
+/// `vhci_hcd.0` or legacy `vhci_hcd`. Shared with [`crate::vhci_probe`] so the paths cannot drift.
 pub(crate) fn vhci_base() -> Option<PathBuf> {
     for p in [
         "/sys/devices/platform/vhci_hcd.0",
@@ -640,8 +591,7 @@ fn read_status() -> Result<String> {
     std::fs::read_to_string(base.join("status")).context("read vhci_hcd status")
 }
 
-/// One parsed `status` row: `(port, hub_is_superspeed, sta)`. Handles both the modern
-/// `hub port sta …` and the legacy `port sta …` column layouts; returns `None` for header/blank rows.
+/// Parse one `status` row. Modern `hub port sta …` and legacy `port sta …`; `None` for headers.
 fn parse_status_row(line: &str) -> Option<(u16, bool, u32)> {
     let t: Vec<&str> = line.split_whitespace().collect();
     if t.is_empty() {
@@ -659,10 +609,10 @@ fn parse_status_row(line: &str) -> Option<(u16, bool, u32)> {
     Some((port, hub_ss.unwrap_or(false), sta))
 }
 
-/// `sta == 4` is `VDEV_ST_NULL` (a free port).
+/// Kernel `VDEV_ST_NULL`: a free vhci port.
 const VDEV_ST_NULL: u32 = 4;
 
-/// Pick a free `vhci_hcd` port matching the device speed (`usbip_speed >= 5` ⇒ SuperSpeed hub).
+/// Free port matching speed (`usbip_speed >= 5` is SuperSpeed).
 fn vhci_find_free_port(usbip_speed: u32) -> Result<u16> {
     let want_ss = usbip_speed >= 5;
     let status = read_status()?;
@@ -673,7 +623,7 @@ fn vhci_find_free_port(usbip_speed: u32) -> Result<u16> {
             }
         }
     }
-    // Speed-class match failed (legacy single-hub status): take any free port.
+    // Legacy single-hub status has no speed class: take any free port.
     for line in status.lines() {
         if let Some((port, _, sta)) = parse_status_row(line) {
             if sta == VDEV_ST_NULL {
@@ -684,7 +634,7 @@ fn vhci_find_free_port(usbip_speed: u32) -> Result<u16> {
     bail!("no free vhci_hcd port (all ports in use?)")
 }
 
-/// Ports currently in use (`sta != VDEV_ST_NULL`) — snapshotted around a CLI attach to recover its port.
+/// Occupied ports; snapshotted around CLI attach to recover its port.
 fn vhci_used_ports() -> HashSet<u16> {
     read_status()
         .unwrap_or_default()
@@ -695,7 +645,7 @@ fn vhci_used_ports() -> HashSet<u16> {
         .collect()
 }
 
-/// Poll the status file (briefly) for a port that became used since `before` — the one the CLI attached.
+/// Wait up to 2 s for a port that became used since `before`.
 fn wait_for_new_port(before: &HashSet<u16>) -> Result<u16> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -725,8 +675,7 @@ fn vhci_detach(port: u16) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The `status` parser handles the modern `hub port sta …` layout, the legacy `port sta …`
-    /// layout, and skips header/blank lines — a slip here would mean attaching to a busy port.
+    /// Modern and legacy `status` layouts; a miss here attaches to a busy port.
     #[test]
     fn status_parser_handles_both_layouts() {
         // modern
@@ -751,14 +700,13 @@ mod tests {
         assert_eq!(parse_status_row(""), None);
     }
 
-    /// A free HS port is preferred for an HS device; a free SS port for an SS device.
     #[test]
     fn free_port_selection_matches_speed() {
         let status = "hub port sta spd dev      sockfd local_busid\n\
                       hs  0000 006 000 00000000 000000 0-0\n\
                       hs  0001 004 000 00000000 000000 0-0\n\
                       ss  0008 004 000 00000000 000000 0-0\n";
-        // Reuse the parser directly (vhci_find_free_port reads sysfs; test the selection logic).
+        // `vhci_find_free_port` reads sysfs; test the selection against a fixture.
         let hs = status
             .lines()
             .filter_map(parse_status_row)
@@ -784,11 +732,7 @@ mod tests {
         assert_eq!(accepted.peer_addr().unwrap(), expected);
     }
 
-    /// The emulation server serves exactly ONE USB/IP connection — the kernel's single `vhci_hcd`
-    /// attach — and the loopback port closes with it. Anything that can still reach that port
-    /// afterwards can import the device: read the streaming client's live controller reports and
-    /// write HID SET_REPORTs at it, with no authentication anywhere in USB/IP to stop it. Needs
-    /// neither root nor `vhci_hcd` — only the listener side is under test.
+    /// One USB/IP connection, then the loopback port closes. No root / `vhci_hcd`.
     #[test]
     fn usbip_server_serves_one_connection_then_closes_the_port() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -803,12 +747,10 @@ mod tests {
         )
         .expect("spawn the emulation server");
 
-        // The one legitimate importer (what `attach_in_process` does before handing the fd to
-        // `vhci_hcd`), held open for the rest of the test exactly as the kernel holds it.
+        // Held open like the kernel's vhci fd.
         let _kernel = connect_loopback(port).expect("the attach connects");
 
-        // Poll: the accept races the connect above (the connection sits in the listen backlog
-        // until the server thread picks it up), and the port closes only once it has.
+        // Accept races connect (backlog); the port closes only after the server picks it up.
         let mut refused = false;
         for _ in 0..100 {
             match TcpStream::connect(("127.0.0.1", port)) {
@@ -826,8 +768,7 @@ mod tests {
         drop(server);
     }
 
-    /// On-box smoke test (needs root + `vhci_hcd`): attach a virtual Deck, confirm `hid-steam` binds
-    /// it (the `Steam Deck` evdev appears) and that it tears down on drop. `#[ignore]`d in CI.
+    /// `hid-steam` binds (`Steam Deck` evdev) and tears down on drop. Needs root + `vhci_hcd`.
     #[test]
     #[ignore = "attaches a real vhci_hcd device; needs root + vhci_hcd"]
     fn usbip_deck_binds_and_tears_down() {
@@ -854,12 +795,8 @@ mod tests {
         );
     }
 
-    /// On-box smoke test (needs root + `vhci_hcd`): rumble the attached virtual Deck exactly like
-    /// Steam does — a `0xEB` feature SET_REPORT on the hid-steam hidraw node — and confirm
-    /// [`SteamDeckUsbip::service`] surfaces `(left, right)` for the 0xCA plane. The Deck presents
-    /// 3 interfaces (0 mouse / 1 kbd / 2 controller); only the CONTROLLER interface's EP0 handler
-    /// parses feedback (the idle interfaces ACK silently, like real hardware), and Steam filters
-    /// on interface 2 — so the write must land there. `#[ignore]`d in CI.
+    /// Rumble via interface-2 hidraw SET_REPORT (`0xEB`); idle ifaces ACK and Steam
+    /// filters on iface 2. Needs root + `vhci_hcd`.
     #[test]
     #[ignore = "attaches a real vhci_hcd device; needs root + vhci_hcd"]
     fn usbip_deck_rumble_flows_via_controller_interface() {
@@ -873,8 +810,7 @@ mod tests {
             let _ = pad.service();
             std::thread::sleep(Duration::from_millis(8));
         }
-        // The hid-steam hidraw node on USB interface 2 (bInterfaceNumber is the HID device's
-        // parent attribute).
+        // hid-steam hidraw on iface 2; `bInterfaceNumber` is the HID parent's attribute.
         let node = std::fs::read_dir("/sys/class/hidraw")
             .expect("/sys/class/hidraw")
             .flatten()

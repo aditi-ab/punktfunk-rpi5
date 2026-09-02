@@ -1,41 +1,28 @@
-//! Sorting and grouping the library — all policy, no Skia.
+//! Sorting and grouping the library — policy only, no Skia.
 //!
-//! Kept a separate, pure module for two reasons. It is the half of "alternate views and
-//! group & sort" that has to be identical on every client, so this file is also the
-//! portable SPEC the Apple and Android ports implement; and grouping rules are exactly the
-//! kind of thing that reads obviously correct and is quietly wrong (a platform-less Steam
-//! library collapsing into one "Unknown" heap, a fold that files "The Witcher" under T).
-//! Both are cheap to test here and expensive to notice on a TV.
+//! Identical on every client: Apple and Android implement this file. Pin the groups
+//! with `clients/shared/library-collate-vectors.json` (`vectors_match_the_shared_file`).
+//! Change a rule here, regenerate that file in the same commit.
 //!
-//! The spec is also MACHINE-READABLE: `clients/shared/library-collate-vectors.json` pins the
-//! groups these rules produce over one mixed library (`vectors_match_the_shared_file`), and the
-//! ports read the same file — change a rule here, regenerate the file in the same commit.
-//!
-//! Everything returns INDICES into the caller's slice. The screens' art cache, fetch pump
-//! and cursor arithmetic all key off the shared model's ordering, so a collation that
-//! handed back cloned games would fork the identity of every title in the shelf.
+//! Returns indices into the caller's slice. Art cache, fetch pump and cursor arithmetic
+//! all key off the shared model's order.
 
 use crate::library::{store_label, LibraryGame};
 
-/// How titles are ordered within a group.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum SortKey {
-    /// The host's own order, untouched. The DEFAULT, and byte-identical to the shelf as it
-    /// has always been — a user who never opens the sort pills must see no change at all.
+    /// Default. Must match the host's list so an unused sort is a no-op.
     #[default]
     HostOrder,
-    /// A–Z, case- and diacritic-relaxed, with the leading article folded away.
+    /// A–Z after [`sort_title`].
     Title,
-    /// Platform label A–Z, then title within it.
     Platform,
-    /// Store label A–Z, then title.
     Store,
 }
 
 impl SortKey {
-    /// Parse the persisted `library_sort` value. Lenient by design: an unknown string is a
-    /// newer client's key, and the right answer to one is today's shelf rather than an
-    /// error — the same rule `ui_palette` follows.
+    /// Persisted `library_sort`. Unknown strings (a newer client's key) fall back to
+    /// [`SortKey::HostOrder`], same as `ui_palette`.
     pub(crate) fn parse(s: &str) -> SortKey {
         match s {
             "title" => SortKey::Title,
@@ -45,8 +32,7 @@ impl SortKey {
         }
     }
 
-    /// The persisted name. A FILE FORMAT — renaming one silently resets every user's
-    /// chosen sort to the default on their next launch.
+    /// Persisted id. Renaming one resets every stored sort on next launch.
     pub(crate) fn id(self) -> &'static str {
         match self {
             SortKey::HostOrder => "host",
@@ -65,7 +51,6 @@ impl SortKey {
         }
     }
 
-    /// The pills, in the order they are offered.
     pub(crate) const ALL: [SortKey; 4] = [
         SortKey::HostOrder,
         SortKey::Title,
@@ -74,40 +59,30 @@ impl SortKey {
     ];
 }
 
-/// What a group IS, kept as data rather than a formatted string so a filtered library can
-/// be compared against it without re-parsing a label.
+/// Group identity as data, not a label, so a filter can match without re-parsing.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum GroupKey {
-    /// The launcher entries (design D4's leading group).
     Launchers,
     Platform(String),
     Store(String),
 }
 
-/// One collated bucket: what it is, what to call it, and which games are in it.
 #[derive(Clone, Debug)]
 pub(crate) struct Group {
     pub key: GroupKey,
     pub label: String,
-    /// Indices into the slice passed to [`collate`], in display order.
+    /// Indices into the slice passed to [`collate`], display order.
     pub games: Vec<usize>,
 }
 
-/// What to bucket by. `None` = one group holding everything (the plain shelf).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GroupBy {
     Platform,
     Store,
 }
 
-/// Fold a title down to something sortable: lowercase, diacritics relaxed to their base
-/// letter, punctuation dropped, and a leading article removed.
-///
-/// The article fold is what a user actually means by A–Z. "The Witcher 3" belongs under W;
-/// left alone, every "The …" in a library piles up under T and the sort is useless exactly
-/// where it is most needed. English articles only — the host's titles are whatever the
-/// store called them, and inventing rules for languages we cannot detect would file things
-/// under letters nobody expects.
+/// "The Witcher 3" belongs under W. English articles only — titles are store strings
+/// and we cannot detect language.
 pub(crate) fn sort_title(title: &str) -> String {
     let relaxed: String = title
         .to_lowercase()
@@ -127,8 +102,7 @@ pub(crate) fn sort_title(title: &str) -> String {
     let trimmed = relaxed.trim();
     for article in ["the ", "a ", "an "] {
         if let Some(rest) = trimmed.strip_prefix(article) {
-            // Guard against a title that IS an article ("The", "A Way Out" keeps "way out",
-            // but a bare "The" must not sort as an empty string and float to the front).
+            // Bare "The" must not fold to empty and float to the front.
             let rest = rest.trim();
             if !rest.is_empty() {
                 return rest.to_string();
@@ -138,12 +112,8 @@ pub(crate) fn sort_title(title: &str) -> String {
     trimmed.to_string()
 }
 
-/// The bucket label for one game under `by`.
-///
-/// The interesting case is a game with no platform. It does NOT go to "Unknown": a Steam
-/// library is entirely platform-less, and one giant "Unknown" heap would be a worse view
-/// than no grouping at all. A store-front game buckets under its STORE instead ("Steam"),
-/// which is both true and useful, and only an entry with neither lands in "Other".
+/// No platform does not mean "Unknown": a Steam library is all platform-less, so
+/// store-front games bucket under the store and only a game with neither is "Other".
 fn bucket(g: &LibraryGame, by: GroupBy) -> GroupKey {
     match by {
         GroupBy::Platform => match g
@@ -169,19 +139,14 @@ fn label_of(key: &GroupKey) -> String {
     }
 }
 
-/// Collate `games` into display groups.
-///
-/// Launchers always form the leading group, which is how design D4's "launcher entries come
-/// first" invariant survives grouping BY CONSTRUCTION rather than by every caller
-/// remembering it. Sorting applies WITHIN groups, never across them.
+/// Launchers lead by construction; sort applies inside a group, never across.
 pub(crate) fn collate(
     games: &[LibraryGame],
     sort: SortKey,
     group_by: Option<GroupBy>,
 ) -> Vec<Group> {
     let mut launchers: Vec<usize> = Vec::new();
-    // Insertion-ordered rather than a map, so groups appear in the order the library first
-    // mentions them and two runs over the same library agree.
+    // Vec, not a map: first-seen order, so two runs over the same library agree.
     let mut buckets: Vec<(GroupKey, Vec<usize>)> = Vec::new();
 
     for (i, g) in games.iter().enumerate() {
@@ -191,9 +156,7 @@ pub(crate) fn collate(
         }
         let key = match group_by {
             Some(by) => bucket(g, by),
-            // Ungrouped: one bucket holding the whole shelf. Its label is never drawn (the
-            // shelf has no heading when there is only one group), so it names itself
-            // honestly rather than inventing a title.
+            // Ungrouped: one bucket. The label is never drawn (no heading for a single group).
             None => GroupKey::Platform("All".to_string()),
         };
         match buckets.iter_mut().find(|(k, _)| *k == key) {
@@ -205,7 +168,6 @@ pub(crate) fn collate(
     let order = |a: usize, b: usize| -> std::cmp::Ordering {
         let (ga, gb) = (&games[a], &games[b]);
         match sort {
-            // Untouched: the host's order IS the order, so the comparator never fires.
             SortKey::HostOrder => a.cmp(&b),
             SortKey::Title => sort_title(&ga.title)
                 .cmp(&sort_title(&gb.title))
@@ -226,9 +188,7 @@ pub(crate) fn collate(
 
     let mut out: Vec<Group> = Vec::with_capacity(buckets.len() + 1);
     if !launchers.is_empty() {
-        // Launchers keep the host's order whatever the sort says: there are two or three of
-        // them, they are a fixed set, and shuffling them by title makes muscle memory
-        // useless for no gain.
+        // Launchers stay in host order: two or three of them, and title-sort breaks muscle memory.
         out.push(Group {
             key: GroupKey::Launchers,
             label: label_of(&GroupKey::Launchers),
@@ -236,8 +196,7 @@ pub(crate) fn collate(
         });
     }
     for (key, mut idx) in buckets {
-        // `sort_by` is stable, and every comparator falls back to the index, so equal keys
-        // keep the host's order rather than an arbitrary one.
+        // Stable sort plus index fallback: equal keys keep host order.
         idx.sort_by(|&a, &b| order(a, b));
         out.push(Group {
             label: label_of(&key),
@@ -245,8 +204,7 @@ pub(crate) fn collate(
             games: idx,
         });
     }
-    // Groups themselves go A–Z by label, launchers excepted — they were pushed first and
-    // `sort_by` is stable, so pinning them by key keeps them leading.
+    // A–Z by label; launchers stay first via the lead key (`sort_by` is stable).
     out.sort_by(|a, b| {
         let lead = |g: &Group| u8::from(g.key != GroupKey::Launchers);
         lead(a).cmp(&lead(b)).then_with(|| a.label.cmp(&b.label))
@@ -254,7 +212,7 @@ pub(crate) fn collate(
     out
 }
 
-/// The flat index list for a group filter — `None` = the whole library, in collated order.
+/// Indices for a group filter. `None` is the whole library, collated order.
 pub(crate) fn filtered(
     games: &[LibraryGame],
     sort: SortKey,
@@ -276,9 +234,7 @@ pub(crate) fn filtered(
     }
 }
 
-/// Is there anything worth browsing? A library with one platform and one store has nothing
-/// to drill INTO, and a screen that opens onto a single tile is worse than no screen —
-/// so the button that reaches it is hidden rather than made to disappoint.
+/// Hide the browse entry when grouping would yield a single tile.
 pub(crate) fn worth_browsing(games: &[LibraryGame]) -> bool {
     collate(games, SortKey::HostOrder, Some(GroupBy::Platform))
         .iter()
@@ -316,12 +272,9 @@ mod tests {
         assert_eq!(sort_title("The Witcher 3"), "witcher 3");
         assert_eq!(sort_title("A Way Out"), "way out");
         assert_eq!(sort_title("An Untitled Story"), "untitled story");
-        // Not an article, just a word starting with one.
         assert_eq!(sort_title("Theme Hospital"), "theme hospital");
         assert_eq!(sort_title("Anno 1800"), "anno 1800");
-        // Diacritics relax; punctuation goes.
         assert_eq!(sort_title("Pokémon: Red!"), "pokemon red");
-        // A title that is ONLY an article keeps something to sort on.
         assert_eq!(sort_title("The"), "the");
     }
 
@@ -331,7 +284,6 @@ mod tests {
             game("a", "Dota 2", "steam", None, false),
             game("b", "Half-Life", "steam", None, false),
             game("c", "Shadow of the Colossus", "custom", Some("PS2"), false),
-            // Neither a platform nor a store we have a label for.
             game("d", "Mystery", "wat", None, false),
         ];
         let groups = collate(&games, SortKey::HostOrder, Some(GroupBy::Platform));
@@ -368,8 +320,6 @@ mod tests {
             game("a", "Aaa", "steam", Some("PC"), false),
             game("b", "Mmm", "steam", Some("PC"), false),
         ];
-        // The default must leave the shelf exactly as the host handed it over — a user who
-        // never touches the sort pills sees no change whatever.
         assert_eq!(filtered(&games, SortKey::HostOrder, None), vec![0, 1, 2]);
         assert_eq!(filtered(&games, SortKey::Title, None), vec![1, 2, 0]);
     }
@@ -396,8 +346,7 @@ mod tests {
             filtered(&games, SortKey::HostOrder, Some(&want)),
             vec![0, 2]
         );
-        // A filter naming a group that no longer exists yields nothing, rather than
-        // silently showing everything — a stale filter must not look like a working shelf.
+        // A stale filter yields empty, not the whole shelf.
         let gone = GroupKey::Platform("PS3".into());
         assert!(filtered(&games, SortKey::HostOrder, Some(&gone)).is_empty());
     }
@@ -406,20 +355,17 @@ mod tests {
     fn empty_and_single_group_libraries_are_not_worth_browsing() {
         assert!(!worth_browsing(&[]));
         assert!(!worth_browsing(&[game("l", "Steam", "steam", None, true)]));
-        // One store, no platforms: nothing to choose between, so the button stays hidden.
         let one = [
             game("a", "Dota", "steam", None, false),
             game("b", "HL", "steam", None, false),
         ];
         assert!(!worth_browsing(&one));
-        // A second group earns the screen.
         let two = [
             game("a", "Dota", "steam", None, false),
             game("b", "Ico", "custom", Some("PS2"), false),
         ];
         assert!(worth_browsing(&two));
-        // Launchers alone never count — every library has them, and a screen offering
-        // only "Launchers" is the single-tile screen this rule exists to prevent.
+        // Launchers never count: every library has them, and "Launchers" alone is one tile.
         let launcher_plus_one = [
             game("l", "Steam", "steam", None, true),
             game("a", "Dota", "steam", None, false),
@@ -427,8 +373,6 @@ mod tests {
         assert!(!worth_browsing(&launcher_plus_one));
     }
 
-    /// The persisted strings, pinned literally. They are a FILE FORMAT: renaming one here
-    /// silently resets every user's chosen sort to the default on their next launch.
     #[test]
     fn sort_keys_parse_from_their_stored_names_and_unknown_falls_back() {
         assert_eq!(SortKey::parse("title"), SortKey::Title);
@@ -437,19 +381,11 @@ mod tests {
         for k in EVERY_SORT {
             assert_eq!(SortKey::parse(k.id()), k, "{} round-trips", k.label());
         }
-        // Anything else is a newer client's key, and the right answer to one is today's
-        // shelf rather than an error — the rule `ui_palette` already follows.
         assert_eq!(SortKey::parse("something-newer"), SortKey::HostOrder);
         assert_eq!(SortKey::parse(""), SortKey::HostOrder);
         assert_eq!(SortKey::default(), SortKey::HostOrder);
     }
 
-    /// The cross-client parity file. `clients/shared/library-collate-vectors.json` pins, from
-    /// this module's rules, the exact groups every (sort, group_by) must produce over one
-    /// mixed library, the flat lists a filter yields, which libraries are worth browsing,
-    /// the title fold, the store labels and the persisted sort ids — so the Apple and Android
-    /// ports have a machine contract to read instead of prose to transcribe. This crate is
-    /// the source of truth: a rule change here regenerates the file, never the other way.
     #[test]
     fn vectors_match_the_shared_file() {
         let raw = include_str!("../../../clients/shared/library-collate-vectors.json");

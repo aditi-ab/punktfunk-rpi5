@@ -1,4 +1,16 @@
-//! The per-frame present path (route input → video image → CSC → blit → present). HOT PATH.
+//! Per-frame present: `FrameInput` → video image → CSC → letterboxed blit → present.
+//!
+//! [`Presenter::present`] returns `false` when the swapchain is out of date; the
+//! caller recreates with current window state and may retry. One frame in flight:
+//! the submit fence covers the command buffer, staging buffer, and the parked
+//! hardware frame. Hardware lanes import or bind before acquire so a failed
+//! import does not consume the acquire semaphore.
+//!
+//! HDR follows the frame's PQ flag. No HDR10 surface → CSC shader mode 1
+//! tonemaps onto SDR. Pin peak with `PUNKTFUNK_TONEMAP_PEAK` (default 4.9 ≈
+//! 1000 nits / 203). Windows: `PUNKTFUNK_D3D11_NO_MUTEX=1` skips the keyed mutex.
+//!
+//! Evidence: `csc_depth_packing` table tests; `design/pyrowave-444-hdr.md`.
 
 use super::gpu::*;
 use super::{FrameInput, Presenter, Retired};
@@ -12,11 +24,8 @@ use ash::vk::Handle as _;
 use pf_client_core::video::{NativeVkFrame, NativeVkLayout, RawVkFormat};
 
 impl Presenter {
-    /// Present one frame: route `input` into the video image (staging upload or dmabuf
-    /// import + CSC pass; `Redraw` re-blits what's retained), clear, letterbox-blit,
-    /// blend the console-UI `overlay` quad if one arrived, present. Returns false when
-    /// the swapchain was out of date — the caller recreates (with current window state)
-    /// and may retry.
+    /// Present one frame. `false` means the swapchain is out of date — the
+    /// caller recreates it (current window state) and may retry.
     pub fn present(
         &mut self,
         window: &sdl3::video::Window,
@@ -24,21 +33,10 @@ impl Presenter {
         overlay: Option<&OverlayFrame>,
     ) -> Result<bool> {
         if self.extent.width == 0 || self.extent.height == 0 {
-            return Ok(true); // minimized — nothing to do
+            return Ok(true); // minimized: true, not false (false recreates)
         }
-        // SDR↔HDR follows the FRAMES' own signaling (the host flips PQ in-band):
-        // switch modes before anything touches this frame. Only where the surface
-        // offers HDR10 — otherwise PQ stays on the SDR swapchain and the CSC shader
-        // tonemaps (mode 1).
-        //
-        // The CPU lane used to be the exception here: it arrived as swscale RGBA with no
-        // CSC/tonemap pass at all, so it was pinned to the SDR swapchain (a mode-0
-        // composite of sRGB content as PQ is the field-reported psychedelic cyan/magenta
-        // picture, reproduced 2026-07-21 on a Fedora-class client with no hw HEVC decode
-        // and GNOME/Mesa offering HDR10 on an SDR desktop) and a PQ stream simply came out
-        // washed out. Since M8 it goes through the SAME planar CSC pass as every hardware
-        // lane, so it gets the same answer as every hardware lane: PQ where the surface
-        // offers HDR10, the shader's mode-1 tonemap where it does not.
+        // HDR follows this frame's PQ flag before any work. No HDR10 surface →
+        // PQ stays on the SDR swapchain; CSC shader mode 1 tonemaps.
         let frame_pq = match &input {
             FrameInput::Redraw => None,
             FrameInput::Cpu(f) => Some(f.color.is_pq()),
@@ -51,11 +49,7 @@ impl Presenter {
             FrameInput::NativeVk(f) => Some(f.color.is_pq()),
         };
         if let Some(pq) = frame_pq {
-            // A PQ stream we can only tone-map (no HDR10 surface) is the silent failure behind
-            // "HDR isn't advertised": the compositor never sees an HDR-committing app. Say so
-            // once — its presence proves PQ IS arriving and the surface/compositor is the
-            // blocker (on the Deck: gamescope's WSI layer not visible in the flatpak sandbox);
-            // its absence, with a plain SDR stream, points back at the host not sending PQ.
+            // Once: missing HDR is the surface/compositor, not a host that omitted PQ.
             if pq && self.hdr10_format.is_none() && !self.hdr_downgrade_warned {
                 self.hdr_downgrade_warned = true;
                 tracing::warn!(
@@ -69,9 +63,8 @@ impl Presenter {
                 self.set_hdr_mode(window, want)?;
             }
         }
-        // Hardware frames prepare before anything touches the queue: an import/view the
-        // driver rejects must fail out here, before this present consumed the acquire
-        // semaphore.
+        // Import/view before acquire: a reject must fail before this present
+        // consumes the acquire semaphore.
         #[cfg(target_os = "linux")]
         let mut hw_frame: Option<HwFrame> = None;
         #[cfg(windows)]
@@ -79,9 +72,8 @@ impl Presenter {
         let mut native_frame: Option<NativeVkFrame> = None;
         #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
         let mut pyro_frame: Option<pf_client_core::video_pyrowave::PyroWavePlanarFrame> = None;
-        // A real frame that is NOT a CPU one — the signal that the software rung's plane
-        // images are dead weight (see below). `Redraw` is deliberately not one: it
-        // re-blits the retained video image and says nothing about which lane is decoding.
+        // Non-CPU real frame: software plane images are dead (freed after the
+        // fence). `Redraw` is not one — it re-blits retained video.
         let mut hw_lane = false;
         let cpu_frame = match input {
             FrameInput::Redraw => None,
@@ -112,8 +104,8 @@ impl Presenter {
                 hw_lane = true;
                 None
             }
-            // Same device, and the decoder already made the per-plane views — no
-            // import, no view creation, nothing that can fail out here.
+            // Same device; decoder already made the per-plane views — no import,
+            // no view create, nothing that can fail here.
             FrameInput::NativeVk(f) => {
                 native_frame = Some(f);
                 hw_lane = true;
@@ -121,10 +113,11 @@ impl Presenter {
             }
         };
 
-        // One frame in flight: the fence covers the command buffer, the staging buffer
-        // AND the previously submitted hw frame — waiting makes all three reusable.
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // One frame in flight: the fence covers the command buffer, the staging
+        // buffer, and the previously submitted hw frame.
+
+        // SAFETY: `fence` is owned here. `submitted` means the last `queue_submit`
+        // named it; wait idles that submit, then reset is legal.
         unsafe {
             if self.submitted {
                 self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
@@ -135,11 +128,8 @@ impl Presenter {
         if let Some(old) = self.retired_hw.take() {
             old.destroy(&self.device);
         }
-        // A hardware frame after a software one: the plane images are ~12 MB at 4K and
-        // nothing will sample them again. This is not hypothetical — M8's codec fallback
-        // starts a NEW session on this same presenter, and that one can be hardware where
-        // the one that raised it was not. The fence wait above is what makes them
-        // unreferenced, so this is the first safe moment.
+        // First fence wait is the first moment the software plane images are
+        // unreferenced. Hardware lane will not sample them again.
         if hw_lane {
             if let Some(p) = self.cpu_planes.take() {
                 tracing::debug!("freeing the software rung's plane images (hardware lane)");
@@ -161,7 +151,7 @@ impl Presenter {
                 self.rebuild_video_image(f.width, f.height)?;
                 tracing::info!(width = f.width, height = f.height, "video image (re)built");
             }
-            // Safe while nothing in flight references the set — the fence wait above.
+            // Descriptor set idle: fence wait above.
             self.csc
                 .bind_planes(&self.device, f.luma_view, f.chroma_view);
         }
@@ -185,9 +175,7 @@ impl Presenter {
                 self.rebuild_video_image(f.width, f.height)?;
                 tracing::info!(width = f.width, height = f.height, "video image (re)built");
             }
-            // The UV-scale crop below assumes an origin crop (punktfunk hosts emit
-            // nothing else); a nonzero origin would display the wrong window — say so
-            // rather than be silently wrong.
+            // UV-scale crop is origin-only; a nonzero origin would show the wrong window.
             if f.crop_x != 0 || f.crop_y != 0 {
                 use std::sync::atomic::{AtomicBool, Ordering};
                 static WARNED: AtomicBool = AtomicBool::new(false);
@@ -200,8 +188,7 @@ impl Presenter {
                     );
                 }
             }
-            // Decoder-owned plane views (R8 + R8G8); the fence wait above is what
-            // makes the descriptor set rebindable.
+            // Decoder-owned plane views; fence wait above makes the set rebindable.
             self.csc.bind_planes(
                 &self.device,
                 vk::ImageView::from_raw(f.plane_views[0]),
@@ -218,8 +205,7 @@ impl Presenter {
                 self.rebuild_video_image(f.width, f.height)?;
                 tracing::info!(width = f.width, height = f.height, "video image (re)built");
             }
-            // The decode leaves them in GENERAL — the software rung's uploaded planes are
-            // the other producer for this pass and arrive in SHADER_READ_ONLY_OPTIMAL.
+            // Decode leaves planes in GENERAL; CPU uploads arrive in SHADER_READ_ONLY_OPTIMAL.
             self.csc_planar.bind_planes_planar(
                 &self.device,
                 f.views.map(vk::ImageView::from_raw),
@@ -227,7 +213,7 @@ impl Presenter {
             );
         }
         if cpu_offsets.is_some() {
-            // Safe while nothing in flight references the set — the fence wait above.
+            // Descriptor set idle: fence wait above.
             let views = self
                 .cpu_planes
                 .as_ref()
@@ -240,7 +226,7 @@ impl Presenter {
             );
         }
         if let Some(o) = overlay {
-            // Point the composite at this overlay image (same fence-wait safety).
+            // Descriptor set idle: fence wait above.
             let infos = [vk::DescriptorImageInfo::default()
                 .image_view(o.view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
@@ -249,14 +235,13 @@ impl Presenter {
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&infos)];
-            // SAFETY: per the Vulkan contract above - recorded into a command buffer this code
-            // owns and has begun, referencing handles it also owns; nothing is submitted until the
-            // recording is ended.
+            // SAFETY: overlay `desc_set` is owned here; fence wait above means no
+            // in-flight cmd buf samples it. `writes`/`infos` outlive the call.
             unsafe { self.device.update_descriptor_sets(&writes, &[]) };
         }
 
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `swapchain` and `acquire_sem` are owned here. Fence wait above
+        // completed the last submit that waited `acquire_sem`, so it is not pending.
         let (index, _suboptimal) = match unsafe {
             self.swap_d.acquire_next_image(
                 self.swapchain,
@@ -267,7 +252,7 @@ impl Presenter {
         } {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                // Never submitted — the import (if any) dies here, GPU never saw it.
+                // Acquire failed: GPU never saw the import; destroy it here.
                 #[cfg(target_os = "linux")]
                 if let Some(f) = hw_frame {
                     f.destroy(&self.device);
@@ -283,9 +268,10 @@ impl Presenter {
         };
         let swap_image = self.images[index as usize];
 
-        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
-        // and has begun, referencing handles it also owns; nothing is submitted until the
-        // recording is ended.
+        // SAFETY: `cmd_buf` is owned and idle (fence wait above). Recording names
+        // images/views/sets this presenter owns (or a live overlay/native frame
+        // parked until the next fence). Submit and present take `queue` under
+        // `queue_lock`. Builders are locals that outlive each call.
         unsafe {
             self.device.begin_command_buffer(
                 self.cmd_buf,
@@ -293,9 +279,7 @@ impl Presenter {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
 
-            // Dmabuf frame: acquire the foreign planes, then the CSC pass renders
-            // NV12→RGBA into the video image (render pass ends it in TRANSFER_SRC for
-            // the blit below).
+            // CSC render pass leaves the video image in TRANSFER_SRC for the blit.
             #[cfg(target_os = "linux")]
             if let (Some(f), Some(v)) = (&hw_frame, &self.video) {
                 for view_image in [f.luma_image(), f.chroma_image()] {
@@ -306,8 +290,8 @@ impl Presenter {
                     height: v.height,
                 };
                 let ten_bit = f.is_p010();
-                // No crop: `dmabuf::import` already creates the plane images at the frame
-                // size over the surface's real stride, so 0..1 spans exactly the picture.
+                // No crop: `dmabuf::import` sizes plane images to the picture, so
+                // 0..1 is the picture (not the surface stride).
                 self.record_csc(
                     v.framebuffer,
                     extent,
@@ -318,12 +302,9 @@ impl Presenter {
                 );
             }
 
-            // D3D11 frame: acquire the imported RGB texture from the external "queue
-            // family" (the keyed mutex on the submit is the actual cross-API sync) and
-            // blit it into the video image — the frame arrives as ready RGB from the
-            // decoder's VideoProcessor (sRGB BGRA8, or PQ RGB10A2 on the HDR ring —
-            // matching the HDR-mode video image), so there is no CSC pass; the blit
-            // converts component order. Same layout dance as the CPU staging path.
+            // VideoProcessor already delivered RGB matching the HDR-mode video
+            // image; blit is component order. Cross-API sync is the keyed mutex
+            // on submit, not this external-queue acquire.
             #[cfg(windows)]
             if let (Some(f), Some(v)) = (&win_frame, &self.video) {
                 external_acquire_barrier(&self.device, self.cmd_buf, f.image(), self.qfi);
@@ -351,7 +332,7 @@ impl Presenter {
                     v.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[blit],
-                    vk::Filter::NEAREST, // 1:1 — the composite blit below does the scaling
+                    vk::Filter::NEAREST, // 1:1; the composite blit below scales
                 );
                 barrier(
                     &self.device,
@@ -362,20 +343,9 @@ impl Presenter {
                 );
             }
 
-            // Native (pf-vkdecode) frame: the decoded image is already on THIS device,
-            // and the sync facts ride the frame itself (no frames lock — the decoder
-            // stamped layout/semaphore/value at delivery and nothing mutates them; the
-            // FFmpeg-Vulkan rung that shared this path until M10 needed one because
-            // libavcodec mutated the state per submission).
-            // Transition the picture's LAYER for sampling, run the same CSC pass with
-            // the coded-vs-display UV scale (the 1088-row lesson), then transition BACK
-            // to the decode layout the frame names — and the submit below signals the
-            // image's timeline at `value + 1` when these reads/restores complete, which
-            // the decoder (told via the release token) waits before that image's next
-            // decode use: the layout round-trip is ORDERED against decode, not raced.
-            // The pool images are created CONCURRENT across the graphics+decode
-            // families, so these are plain layout transitions — no queue-family
-            // ownership transfer.
+            // Image already on this device; layout and semaphore ride the frame.
+            // Pool images are CONCURRENT across graphics+decode, so these are
+            // layout transitions, not queue-family ownership transfers.
             let mut native_wait: Option<(vk::Semaphore, u64)> = None;
             if let (Some(f), Some(v)) = (&native_frame, &self.video) {
                 let image = vk::Image::from_raw(f.image);
@@ -395,17 +365,9 @@ impl Presenter {
                     width: v.width,
                     height: v.height,
                 };
-                // Bit depth and MSB packing come from the PICTURE's own format, which
-                // the decoder stamps on every frame — H.264 and HEVC Main deliver
-                // NV12 (8-bit), Main 10 delivers P010 (10 significant bits in the
-                // MSBs of 16), RExt delivers the two-plane 4:4:4 pair — and which can
-                // change mid-stream when the host renegotiates. Nothing here assumes
-                // a codec: 8-bit transfer/range math over a P010 surface decodes
-                // correctly and displays wrong, the plausible-looking-and-wrong class
-                // this program refuses. Chroma siting needs no decision — the CSC
-                // shader's quarter-texel 4:2:0 correction self-disables when the
-                // chroma plane is full width, so the 4:4:4 formats are already right.
-                // Colour rides the frame (BT.709-limited SDR default).
+                // Depth/packing from the picture format (can change mid-stream).
+                // 8-bit math over P010 decodes and displays the wrong range.
+                // `uv_scale` is picture/coded so a taller decode pool does not show.
                 let (depth, msb_packed) = csc_depth_packing_or_8bit(f.vk_format);
                 self.record_csc(
                     v.framebuffer,
@@ -429,21 +391,15 @@ impl Presenter {
                 native_wait = Some((vk::Semaphore::from_raw(f.semaphore), f.semaphore_value));
             }
 
-            // PyroWave frame: the planes are already on THIS device, decode
-            // fence-complete and barriered to fragment sampling (GENERAL) by the
-            // decoder — no acquire needed, just the planar CSC pass.
+            // Planes already on this device and in GENERAL for fragment sampling.
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             if let (Some(f), Some(v)) = (&pyro_frame, &self.video) {
                 let extent = vk::Extent2D {
                     width: v.width,
                     height: v.height,
                 };
-                // An HDR (PQ) pyrowave session carries P010-style 10-bit studio codes
-                // MSB-packed into 16-bit planes (design/pyrowave-444-hdr.md §2.2) — same
-                // sampling scale as the P010 path; SDR sessions are plain 8-bit BT.709
-                // limited. Depth follows THIS codec's colour contract (negotiation
-                // couples 10-bit ⟺ PQ for it), which is why it is decided here and not
-                // inside the shared record.
+                // PQ pyrowave is 10-bit MSB-packed (`design/pyrowave-444-hdr.md`);
+                // SDR is 8-bit. This codec couples 10-bit ⇔ PQ.
                 let (depth, msb_packed) = if f.color.is_pq() {
                     (10, true)
                 } else {
@@ -452,11 +408,8 @@ impl Presenter {
                 self.record_csc_planar(v.framebuffer, extent, f.color, depth, msb_packed);
             }
 
-            // Software frame (M8): staging → three R8 plane images → the planar CSC pass,
-            // the same pass and the same `csc_rows` coefficients the hardware lanes use.
-            // The planes are tightly packed by construction (`CpuPlanarFrame`), so no
-            // `buffer_row_length` is needed and none is set — a stride here would be a
-            // second place for the layout to be wrong.
+            // Tightly packed (`CpuPlanarFrame`): leave `buffer_row_length` zero —
+            // a stride here would be a second place for the layout to be wrong.
             if let (Some(f), Some(offsets), Some(v), Some(s), Some(p)) = (
                 cpu_frame,
                 cpu_offsets,
@@ -464,9 +417,8 @@ impl Presenter {
                 &self.staging,
                 &self.cpu_planes,
             ) {
-                // First upload into freshly built images comes from UNDEFINED (there is
-                // nothing to preserve); every later one from where the previous frame's
-                // CSC pass left them.
+                // Fresh images start UNDEFINED; later uploads start where the
+                // previous CSC pass left them (SHADER_READ_ONLY_OPTIMAL).
                 let from = if p.initialized {
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                 } else {
@@ -508,14 +460,11 @@ impl Presenter {
                     width: v.width,
                     height: v.height,
                 };
-                // Always 8-bit, no MSB packing — R8 planes, whatever the stream signals.
-                // A PQ AV1 stream on this rung therefore tone-maps through the shader's
-                // mode 1 like every other lane, instead of being read as 10-bit.
+                // Always 8-bit, no MSB packing — R8 planes, whatever the stream
+                // signals. PQ tone-maps through shader mode 1, not 10-bit.
                 self.record_csc_planar(v.framebuffer, extent, f.color, 8, false);
             }
 
-            // Swapchain image: discard old content, clear to black (the letterbox bars),
-            // blit the video in, hand to present.
             barrier(
                 &self.device,
                 self.cmd_buf,
@@ -557,8 +506,8 @@ impl Presenter {
                 );
             }
             if let Some(o) = overlay {
-                // Cross-submit visibility for the overlay image (Skia flushed it on this
-                // queue): same-layout barrier = execution + memory dependency only.
+                // Skia flushed on this queue: same-layout barrier is execution
+                // + memory only (cross-submit visibility).
                 barrier(
                     &self.device,
                     self.cmd_buf,
@@ -573,7 +522,6 @@ impl Presenter {
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
-                // The composite pass blends the quad and ends the image PRESENT-ready.
                 self.device.cmd_begin_render_pass(
                     self.cmd_buf,
                     &vk::RenderPassBeginInfo::default()
@@ -630,11 +578,9 @@ impl Presenter {
                 );
             }
             self.device.end_command_buffer(self.cmd_buf)?;
-            // The plane images now have content and a real layout, so the NEXT upload
-            // must transition from SHADER_READ_ONLY_OPTIMAL rather than discard them from
-            // UNDEFINED. Recorded, not submitted — but the only path from here to another
-            // record goes through this command buffer, and a submit failure below tears
-            // the presenter down rather than re-recording.
+            // Next CPU upload must transition from SHADER_READ_ONLY_OPTIMAL.
+            // Set here after record, before submit: a submit failure tears the
+            // presenter down rather than re-recording.
             if let Some(p) = self.cpu_planes.as_mut() {
                 p.initialized = true;
             }
@@ -644,18 +590,11 @@ impl Presenter {
             let mut wait_sems = vec![self.acquire_sem];
             let mut wait_stages = vec![vk::PipelineStageFlags::TRANSFER];
             let mut signal_sems = vec![render_sem];
-            // The decoded frame's timeline semaphore.
             let mut wait_values = vec![0u64];
             let mut signal_values = vec![0u64];
-            // Wait the decode-complete value at FRAGMENT_SHADER (chaining with the layer
-            // barrier — the same dependency-chain rule `native_layer_barrier` documents),
-            // and SIGNAL `value + 1` when our reads and the layout restore are done. The
-            // decoder learns of the enqueued signal through the release token
-            // (`mark_presented`) and waits it before the image's next decode use;
-            // per-IMAGE timelines make the value spaces private, so this cannot collide
-            // with any other image's counter. (This is the same write-back contract
-            // libavcodec's `AVVkFrame` demanded — that rung is gone, the contract is
-            // not.)
+            // Wait decode-complete at FRAGMENT_SHADER (`native_layer_barrier`
+            // chain). Signal `value + 1` when reads and layout restore finish
+            // (`mark_presented`). Per-image timelines keep value spaces private.
             if let Some((sem, value)) = &native_wait {
                 wait_sems.push(*sem);
                 wait_stages.push(vk::PipelineStageFlags::FRAGMENT_SHADER);
@@ -674,10 +613,9 @@ impl Presenter {
             if native_wait.is_some() {
                 submit = submit.push_next(&mut timeline);
             }
-            // D3D11 frame: bracket the submit in the shared texture's keyed mutex, key 0
-            // both ways (the decode side copies under acquire(0)/release(0) too) — the
-            // GPU-side acquire is what orders our sampling after the decoder's copy, and
-            // our completion release is what unblocks the ring slot's reuse.
+            // Keyed mutex, key 0 both ways (decode copies under acquire(0)/release(0)
+            // too). Acquire orders sampling after the decoder copy; release
+            // unblocks the ring slot.
             #[cfg(windows)]
             let keyed_mem;
             #[cfg(windows)]
@@ -688,8 +626,8 @@ impl Presenter {
             let mut keyed_info;
             #[cfg(windows)]
             if let Some(f) = &win_frame {
-                // Bisect knob: PUNKTFUNK_D3D11_NO_MUTEX=1 skips the acquire/release pair
-                // (torn frames possible — debugging only).
+                // `PUNKTFUNK_D3D11_NO_MUTEX=1` skips acquire/release (torn frames;
+                // debugging only).
                 if std::env::var_os("PUNKTFUNK_D3D11_NO_MUTEX").is_none() {
                     keyed_mem = [f.memory()];
                     keyed_info = vk::Win32KeyedMutexAcquireReleaseInfoKHR::default()
@@ -702,15 +640,14 @@ impl Presenter {
                 }
             }
             let submitted = {
-                // Queue external sync vs the pump's decode submits (see `queue_lock`).
+                // Queue external sync vs the pump's decode submits (`queue_lock`).
                 let _q = self.queue_lock.guard();
                 self.device.queue_submit(self.queue, &[submit], self.fence)
             };
             submitted?;
             self.submitted = true;
-            // The hw frame is on the GPU now — park it until the fence proves the reads
-            // done (released at the next present's fence wait, or in Drop). At most one of
-            // hw_frame/win_frame/native_frame is set (they route from the same `input`).
+            // Park until the fence proves the reads done (next present's wait, or
+            // Drop). At most one of hw_frame / win_frame / native_frame is set.
             self.retired_hw = None;
             #[cfg(target_os = "linux")]
             if let Some(f) = hw_frame.take() {
@@ -720,12 +657,9 @@ impl Presenter {
             if let Some(f) = win_frame.take() {
                 self.retired_hw = Some(Retired::D3d11(f));
             }
-            // Native frame: the submit above enqueued our `value + 1` signal — mark
-            // the token so the decoder waits that write-back before reusing the
-            // image (a failed submit skipped this whole block, leaving the token
-            // unmarked: no phantom signal is ever promised). Then park until the
-            // fence proves the sampling reads done — the drop THEN sends the
-            // release token (never at record time).
+            // Submit enqueued `value + 1` — `mark_presented` so the decoder waits
+            // that write-back. Failed submit never reaches here (no phantom signal).
+            // Park until the fence; Drop sends the release token.
             if let Some(mut f) = native_frame.take() {
                 f.guard.mark_presented();
                 self.retired_hw = Some(Retired::NativeVk(f));
@@ -734,8 +668,7 @@ impl Presenter {
             let swapchains = [self.swapchain];
             let indices = [index];
             let present_sems = [render_sem];
-            // On-glass timing (T0.2): attach a monotonically increasing present id the
-            // PresentTimer's `vkWaitForPresentKHR` resolves to real visibility.
+            // Monotonic present id for `PresentTimer`'s `vkWaitForPresentKHR`.
             let ids = [self.next_present_id + 1];
             let mut pid_info = vk::PresentIdKHR::default().present_ids(&ids);
             let mut present_info = vk::PresentInfoKHR::default()
@@ -746,15 +679,15 @@ impl Presenter {
                 self.next_present_id += 1;
                 present_info = present_info.push_next(&mut pid_info);
             }
-            // Same queue external-sync rule as the submit above. Scoped tightly: the
-            // OUT_OF_DATE arm re-enters the lock via recreate_swapchain's queue drain.
+            // Same queue external-sync as the submit. Scoped tightly: OUT_OF_DATE
+            // re-enters the lock via `recreate_swapchain`'s queue drain.
             let present_res = {
                 let _q = self.queue_lock.guard();
                 self.swap_d.queue_present(self.queue, &present_info)
             };
             match present_res {
                 Ok(_) => {
-                    // A failed present's id may never signal — claimable only on Ok.
+                    // A failed present's id may never signal — claim it only on Ok.
                     if self.present_timer.is_some() {
                         self.last_presented = Some((self.swapchain, self.next_present_id));
                     }
@@ -769,17 +702,17 @@ impl Presenter {
         }
     }
 
-    /// Record the NV12→RGBA CSC pass into the video image (framebuffer): fullscreen
-    /// triangle, CICP-driven push-constant rows. Shared by the dmabuf and Vulkan-Video
-    /// paths — only the plane views bound beforehand, and `uv_scale`, differ.
+    /// NV12→RGBA CSC into the video image: fullscreen triangle, CICP push-constant
+    /// rows. Shared by the dmabuf and Vulkan-Video paths — only the bound plane
+    /// views and `uv_scale` differ.
     ///
-    /// `extent` is the picture (the framebuffer's own size); `uv_scale` is picture/surface
-    /// per axis, i.e. `[1.0, 1.0]` unless the bound planes are a decode pool allocated
-    /// larger than the picture. See the shader's `params.zw` for why that happens.
+    /// `extent` is the picture (framebuffer size). `uv_scale` is picture/surface
+    /// per axis: `[1.0, 1.0]` unless the bound planes are a decode pool larger
+    /// than the picture. See the shader's `params.zw`.
     ///
     /// # Safety
-    /// `self.cmd_buf` must be in the recording state; the CSC descriptor set must point
-    /// at live plane views.
+    /// `self.cmd_buf` must be recording; the CSC descriptor set must point at
+    /// live plane views.
     unsafe fn record_csc(
         &self,
         framebuffer: vk::Framebuffer,
@@ -789,9 +722,8 @@ impl Presenter {
         depth: u8,
         msb_packed: bool,
     ) {
-        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
-        // and has begun, referencing handles it also owns; nothing is submitted until the
-        // recording is ended.
+        // SAFETY: `cmd_buf` is recording (`# Safety` on this fn). CSC pipeline,
+        // layout, and desc_set are owned here; plane views were bound this present.
         unsafe {
             self.device.cmd_begin_render_pass(
                 self.cmd_buf,
@@ -838,8 +770,8 @@ impl Presenter {
                 &[],
             );
             let rows = csc_rows(color, depth, msb_packed);
-            // Mode 1 = PQ→SDR tonemap (a PQ stream without an HDR10 surface); mode 0
-            // passes the transfer through (SDR as-is, or PQ onto the HDR10 swapchain).
+            // Mode 1 = PQ→SDR tonemap (PQ stream, no HDR10 surface); mode 0
+            // passes the transfer through (SDR, or PQ onto the HDR10 swapchain).
             let mode = if color.is_pq() && !self.hdr_active {
                 1.0f32
             } else {
@@ -848,12 +780,11 @@ impl Presenter {
             let peak = std::env::var("PUNKTFUNK_TONEMAP_PEAK")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(4.9); // ≈1000 nits over the 203-nit reference
+                .unwrap_or(4.9); // ≈1000 nits / 203-nit reference
             let mut pc = [0f32; 16];
             pc[..12].copy_from_slice(rows.as_flattened());
             pc[12] = mode;
             pc[13] = peak;
-            // Crop: 1.0 unless the source image is a decode pool bigger than the picture.
             pc[14] = uv_scale[0];
             pc[15] = uv_scale[1];
             let words = pc.map(f32::to_ne_bytes);
@@ -870,13 +801,13 @@ impl Presenter {
         }
     }
 
-    /// [`record_csc`] over the planar (3-plane) pass — the PyroWave decode output and,
-    /// since M8, the software rung's uploaded I420.
+    /// [`record_csc`] on the planar (3-plane) pass — PyroWave decode output and
+    /// the software rung's uploaded I420.
     ///
-    /// `depth`/`msb_packed` are the PRODUCER's, never inferred from the colour: pyrowave
-    /// couples 10-bit to PQ by negotiation, the software rung is 8-bit whatever it is
-    /// showing, and reading PQ as "therefore 10-bit MSB-packed" over an 8-bit plane
-    /// samples at a quarter scale — decoded correctly, displayed wrong.
+    /// `depth`/`msb_packed` are the producer's, never inferred from colour.
+    /// Pyrowave couples 10-bit to PQ by negotiation; the software rung is 8-bit
+    /// regardless. Treating PQ as 10-bit MSB-packed over an 8-bit plane samples
+    /// at quarter scale.
     unsafe fn record_csc_planar(
         &self,
         framebuffer: vk::Framebuffer,
@@ -886,9 +817,8 @@ impl Presenter {
         msb_packed: bool,
     ) {
         let planar = &self.csc_planar;
-        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
-        // and has begun, referencing handles it also owns; nothing is submitted until the
-        // recording is ended.
+        // SAFETY: caller holds `cmd_buf` recording. Planar pipeline, layout, and
+        // desc_set are owned here; plane views were bound this present.
         unsafe {
             self.device.cmd_begin_render_pass(
                 self.cmd_buf,
@@ -935,8 +865,7 @@ impl Presenter {
                 &[],
             );
             let rows = csc_rows(color, depth, msb_packed);
-            // Mode 1 = PQ→SDR tonemap (PQ stream without an HDR10 surface); mode 0 passes
-            // the transfer through — identical to the NV12 arm above.
+            // Mode 1 = PQ→SDR tonemap; mode 0 passes the transfer through.
             let mode = if color.is_pq() && !self.hdr_active {
                 1.0f32
             } else {
@@ -945,7 +874,7 @@ impl Presenter {
             let peak = std::env::var("PUNKTFUNK_TONEMAP_PEAK")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(4.9); // ≈1000 nits over the 203-nit reference
+                .unwrap_or(4.9); // ≈1000 nits / 203-nit reference
             let mut pc = [0f32; 16];
             pc[..12].copy_from_slice(rows.as_flattened());
             pc[12] = mode;
@@ -965,24 +894,17 @@ impl Presenter {
     }
 }
 
-/// The CSC pass's `(bit depth, MSB-packed)` pair for a decoded picture's `VkFormat`,
-/// or `None` for a format this presenter has no colour math for.
+/// CSC `(bit depth, MSB-packed)` for a decoded picture's `VkFormat`, or `None`.
 ///
-/// This is the whole of what the shader needs to know about the picture format, and
-/// it is a property of the STREAM, never of the codec — the frame carries the real
-/// format ([`NativeVkFrame::vk_format`], from pf-vkdecode) and it is read here:
-/// - 8-bit two-plane (NV12-layout and its 4:4:4 sibling) → depth 8, unpacked.
-/// - 10-bit two-plane `3PACK16` (P010-layout and its 4:4:4 sibling) → depth 10,
-///   MSB-packed: 10 significant bits live in the MSBs of 16, so a UNORM16 sample
-///   reads `code·64/65535` and `csc_rows` folds in the `65535/65472` correction.
-///   Rendering those with 8-bit math is not a subtle error — range expansion and the
-///   PQ curve both land wrong — but it is a silent one, which is why the depth is
-///   derived rather than assumed.
+/// Stream property, not codec: the frame carries [`NativeVkFrame::vk_format`].
+/// 8-bit two-plane → depth 8, unpacked. 10-bit two-plane `3PACK16` → depth 10,
+/// MSB-packed (10 bits in the MSBs of 16): a UNORM16 sample reads
+/// `code·64/65535`; `csc_rows` applies `65535/65472`. 8-bit math on those
+/// expands range and the PQ curve wrong.
 ///
-/// Chroma subsampling deliberately does NOT appear: the CSC shader samples both
-/// planes in normalized coordinates and self-disables its quarter-texel 4:2:0 siting
-/// correction when the chroma plane is full width, so 4:2:0 and 4:4:4 differ only in
-/// what the sampler reads. Pure, with a test pinning the table.
+/// Chroma subsampling is not here. The shader samples both planes in
+/// normalized coordinates and disables quarter-texel 4:2:0 siting when chroma
+/// is full width. Pinned by the table test below.
 fn csc_depth_packing(raw: RawVkFormat) -> Option<(u8, bool)> {
     [
         (vk::Format::G8_B8R8_2PLANE_420_UNORM, (8, false)),
@@ -1000,15 +922,12 @@ fn csc_depth_packing(raw: RawVkFormat) -> Option<(u8, bool)> {
     .find_map(|(f, dp)| (f.as_raw() == raw.0).then_some(dp))
 }
 
-/// [`csc_depth_packing`] with the 8-bit fallback for a format the decode lane should
-/// never hand us — pf-vkdecode refuses a picture format it has no plane mapping for
-/// before a session exists. Unreachable is not impossible, so it is said once PER
-/// FORMAT rather than silently guessed forever.
+/// [`csc_depth_packing`] plus 8-bit fallback. pf-vkdecode refuses an unmapped
+/// picture format before a session exists; unreachable is not impossible, so
+/// warn once per format.
 ///
-/// Per format, not once per process: a session can renegotiate its picture format
-/// mid-stream (the ABR/HDR flips this program exists around), so a single latch
-/// would let the first unmapped format silence every later, DIFFERENT one — and the
-/// second one is the interesting one, because the pair says the gap is systematic.
+/// Per format, not once per process: a session can renegotiate mid-stream, and
+/// a single latch would silence a later different unmapped format.
 fn csc_depth_packing_or_8bit(raw: RawVkFormat) -> (u8, bool) {
     csc_depth_packing(raw).unwrap_or_else(|| {
         use std::sync::Mutex;
@@ -1030,18 +949,14 @@ fn csc_depth_packing_or_8bit(raw: RawVkFormat) -> (u8, bool) {
 mod tests {
     use super::*;
 
-    /// What bit depth and packing the CSC pass runs for a decoded picture's format.
-    /// The lane reads it off the frame — an HEVC Main 10 stream reaches the decoder as
-    /// P010 — and rendering that with 8-bit range/transfer math is wrong in a way only a
-    /// side-by-side would catch.
+    /// 8-bit math on a 10-bit `3PACK16` picture expands range and the PQ curve wrong.
     #[test]
     fn csc_depth_and_packing_follow_the_pictures_format() {
         let d = |fmt: vk::Format| csc_depth_packing(RawVkFormat(fmt.as_raw()));
-        // 8-bit: H.264, HEVC Main, and the 4:4:4 RExt 8-bit sibling.
         assert_eq!(d(vk::Format::G8_B8R8_2PLANE_420_UNORM), Some((8, false)));
         assert_eq!(d(vk::Format::G8_B8R8_2PLANE_444_UNORM), Some((8, false)));
-        // 10-bit, MSB-packed into 16: HEVC Main 10 and its 4:4:4 sibling. The packing
-        // flag is what recovers exact `code/1023` from a UNORM16 sample.
+        // 10-bit, MSB-packed into 16. The packing flag recovers `code/1023` from
+        // a UNORM16 sample.
         assert_eq!(
             d(vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16),
             Some((10, true))
@@ -1050,30 +965,20 @@ mod tests {
             d(vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16),
             Some((10, true))
         );
-        // Formats the two-binding CSC pass cannot sample at all (3-plane 4:4:4,
-        // 16-bit) — pf-vkdecode never produces them — have no mapping rather than a
-        // plausible default.
+        // Formats the two-binding CSC pass cannot sample (3-plane 4:4:4, 16-bit)
+        // have no mapping, not a plausible default.
         assert_eq!(d(vk::Format::G8_B8_R8_3PLANE_444_UNORM), None);
         assert_eq!(d(vk::Format::G16_B16R16_2PLANE_444_UNORM), None);
         assert_eq!(csc_depth_packing(RawVkFormat(0)), None);
         assert_eq!(csc_depth_packing(RawVkFormat(-1)), None);
-        // …and the fallback says 8-bit for those rather than panicking, because a
-        // wrong-looking picture beats a dead session.
+        // Fallback is 8-bit, not a panic: a wrong picture beats a dead session.
         assert_eq!(csc_depth_packing_or_8bit(RawVkFormat(0)), (8, false));
     }
 
-    /// The decode lane's CLOSURE, and since M10 the only cross-check that can state
-    /// it: the producer is pf-vkdecode, whose output-format vocabulary this presenter
-    /// has no dependency on — so the check is against
-    /// [`pf_client_core::video::native_picture_formats`], which forwards
-    /// `pf_vkdecode::OUTPUT_FORMATS` verbatim.
-    ///
-    /// Without it, pf-vkdecode growing a fifth output format (12-bit RExt) would
-    /// build images fine, reach `csc_depth_packing_or_8bit`, render 10 or 12 bits as
-    /// 8 behind one warn line — and the table test above would stay green, because it
-    /// only asks this file's own table about itself. Note there is NO converse
-    /// assertion: pf-vkdecode is not obliged to produce every format the CSC pass can
-    /// sample.
+    /// Pins this table against [`pf_client_core::video::native_picture_formats`]
+    /// (forwards `pf_vkdecode::OUTPUT_FORMATS`). A new decoder format would
+    /// otherwise hit the 8-bit fallback while the table test above stayed green.
+    /// No converse: pf-vkdecode need not produce every format CSC can sample.
     #[test]
     fn every_format_the_native_decoder_can_deliver_has_colour_math_here() {
         let produced = pf_client_core::video::native_picture_formats();

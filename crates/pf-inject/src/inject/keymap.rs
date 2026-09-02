@@ -1,22 +1,17 @@
-//! Key/button mapping tables (plan §W4, carved out of the inject facade): the Windows Virtual-Key
-//! → Linux-evdev keyboard map (mirrored bit-for-bit by the Windows SendInput positional table), the
-//! GameStream mouse-button → evdev `BTN_*` map, and the in-process semantic-VK flag. Pure lookup
-//! tables — no state, no OS handles.
+//! Windows Virtual-Key → Linux evdev, and GameStream mouse button → `BTN_*`.
+//!
+//! The Windows SendInput positional table must stay bit-for-bit with [`vk_to_evdev`].
+//! [`KEY_FLAG_SEMANTIC_VK`] is in-process only. No state, no OS handles.
 
-/// In-process tag on a key event's `flags`: the VK in `code` is **layout-semantic** (already
-/// resolved under the sending client's keyboard layout — the GameStream/Moonlight convention)
-/// rather than the punktfunk-native **US-positional** convention (the physical key's US-layout VK,
-/// which every first-party client sends — the client's local layout never touches the wire).
-/// The Windows injector maps semantic VKs through the foreground app's layout and positional VKs
-/// through a fixed table; conflating the two is exactly the German y↔z / ö→ü scramble.
-/// Set ONLY by `gamestream::input::decode`; the punktfunk/1 ingest strips it from wire events, so
-/// a network client can never flip the host's key-decoding convention.
+/// High bit of `flags`: `code` is a layout-semantic VK (GameStream), not US-positional.
+///
+/// Windows maps semantic VKs through the foreground layout and positional VKs through a
+/// fixed table; mixing them swaps y/z on German layouts. Set by `gamestream::input::decode`.
+/// The punktfunk/1 ingest strips this bit from wire events.
 pub const KEY_FLAG_SEMANTIC_VK: u32 = 0x8000_0000;
 
-/// Map a Windows Virtual-Key code (as sent by Moonlight/GameStream) to a Linux evdev key code.
 pub fn vk_to_evdev(vk: u8) -> Option<u16> {
     match vk {
-        // --- Navigation / editing / whitespace ---
         0x08 => Some(14),  // VK_BACK     -> KEY_BACKSPACE
         0x09 => Some(15),  // VK_TAB      -> KEY_TAB
         0x0D => Some(28),  // VK_RETURN   -> KEY_ENTER
@@ -36,18 +31,16 @@ pub fn vk_to_evdev(vk: u8) -> Option<u16> {
         0x2D => Some(110), // VK_INSERT   -> KEY_INSERT
         0x2E => Some(111), // VK_DELETE   -> KEY_DELETE
 
-        // --- Consumer/media keys (Android TV remotes, keyboard media rows) ---
         0xB0 => Some(163), // VK_MEDIA_NEXT_TRACK -> KEY_NEXTSONG
         0xB1 => Some(165), // VK_MEDIA_PREV_TRACK -> KEY_PREVIOUSSONG
         0xB2 => Some(166), // VK_MEDIA_STOP       -> KEY_STOPCD
         0xB3 => Some(164), // VK_MEDIA_PLAY_PAUSE -> KEY_PLAYPAUSE
 
-        // --- Generic modifiers ---
         0x10 => Some(42), // VK_SHIFT   -> KEY_LEFTSHIFT
         0x11 => Some(29), // VK_CONTROL -> KEY_LEFTCTRL
         0x12 => Some(56), // VK_MENU    -> KEY_LEFTALT
 
-        // --- Digit row (KEY_0 is 11, KEY_1..KEY_9 are 2..10) ---
+        // KEY_0 is 11; KEY_1..KEY_9 are 2..10.
         0x30 => Some(11), // VK_0
         0x31 => Some(2),  // VK_1
         0x32 => Some(3),  // VK_2
@@ -59,7 +52,7 @@ pub fn vk_to_evdev(vk: u8) -> Option<u16> {
         0x38 => Some(9),  // VK_8
         0x39 => Some(10), // VK_9
 
-        // --- Letters A-Z (NOT sequential in evdev) ---
+        // A-Z evdev codes are not sequential.
         0x41 => Some(30), // A
         0x42 => Some(48), // B
         0x43 => Some(46), // C
@@ -87,12 +80,10 @@ pub fn vk_to_evdev(vk: u8) -> Option<u16> {
         0x59 => Some(21), // Y
         0x5A => Some(44), // Z
 
-        // --- Meta / context-menu ---
         0x5B => Some(125), // VK_LWIN -> KEY_LEFTMETA
         0x5C => Some(126), // VK_RWIN -> KEY_RIGHTMETA
         0x5D => Some(127), // VK_APPS -> KEY_COMPOSE
 
-        // --- Numpad ---
         0x60 => Some(82), // KP0
         0x61 => Some(79), // KP1
         0x62 => Some(80), // KP2
@@ -110,7 +101,7 @@ pub fn vk_to_evdev(vk: u8) -> Option<u16> {
         0x6E => Some(83), // VK_DECIMAL   -> KEY_KPDOT
         0x6F => Some(98), // VK_DIVIDE    -> KEY_KPSLASH
 
-        // --- Function keys (F1..F10 = 59..68, F11/F12 = 87/88) ---
+        // F1..F10 = 59..68; F11/F12 = 87/88.
         0x70 => Some(59),
         0x71 => Some(60),
         0x72 => Some(61),
@@ -124,11 +115,9 @@ pub fn vk_to_evdev(vk: u8) -> Option<u16> {
         0x7A => Some(87),
         0x7B => Some(88),
 
-        // --- Locks ---
         0x90 => Some(69), // VK_NUMLOCK -> KEY_NUMLOCK
         0x91 => Some(70), // VK_SCROLL  -> KEY_SCROLLLOCK
 
-        // --- Left/right modifiers ---
         0xA0 => Some(42),  // VK_LSHIFT   -> KEY_LEFTSHIFT
         0xA1 => Some(54),  // VK_RSHIFT   -> KEY_RIGHTSHIFT
         0xA2 => Some(29),  // VK_LCONTROL -> KEY_LEFTCTRL
@@ -136,7 +125,7 @@ pub fn vk_to_evdev(vk: u8) -> Option<u16> {
         0xA4 => Some(56),  // VK_LMENU    -> KEY_LEFTALT
         0xA5 => Some(100), // VK_RMENU    -> KEY_RIGHTALT
 
-        // --- OEM punctuation (US layout) ---
+        // OEM VKs are US-layout positions.
         0xBA => Some(39), // VK_OEM_1      -> KEY_SEMICOLON
         0xBB => Some(13), // VK_OEM_PLUS   -> KEY_EQUAL
         0xBC => Some(51), // VK_OEM_COMMA  -> KEY_COMMA
@@ -154,7 +143,7 @@ pub fn vk_to_evdev(vk: u8) -> Option<u16> {
     }
 }
 
-/// Map a GameStream mouse button id (1=left … 5=X2) to a Linux evdev `BTN_*` code.
+/// GameStream button ids are not evdev order: 2 is middle, 3 is right.
 #[cfg(target_os = "linux")]
 pub(crate) fn gs_button_to_evdev(b: u32) -> Option<u32> {
     Some(match b {

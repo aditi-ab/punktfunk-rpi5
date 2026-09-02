@@ -27,14 +27,20 @@ the reader must do. Bold lead is a noun or an API name. Fail at 160 lines.
 
 Touch a function → rewrite its comment in the same diff. Do not sweep the file.
 
-- `//` : four lines (fail at 6). `//!` / `///` : 8–20 (fail at 24).
-- Keep `// SAFETY:` exact.
-- Delete restatement, field reports, `ponytail:`.
+Present tense. The live rule, for someone with the file open and not the git log.
+Cover the next five lines with your hand: if the comment is only interesting as
+history (old versions, a scare, a soak, a ticket), delete it. Keep the invariant.
+Not a poem. `// SAFETY:` is a proof, not how the bug was found.
+
+- `//` : four lines (fail at 6). `//!` / `///` : 8–20 (fail at 24). Length is a
+  backstop, not the style. A four-line war story is still wrong.
 - Keep lifetime, weak-ref, why this number. One to three lines.
 - A comment never enforces a trust boundary.
 
-Bad (in the file): `Field 2026-08-28, iPad Pro / iOS 27 over Tailscale: …`
-Good (in the file): `250 ms ≈ 30 refreshes at 120 Hz. A miss freezes the picture.`
+Bad: `A v2 host never stamps the field, so a v3 driver would refuse every attach…`
+Good: `A host that leaves this field zero fails the bind.`
+Bad: `Field 2026-08-28, iPad Pro / iOS 27 over Tailscale: …`
+Good: `250 ms ≈ 30 refreshes at 120 Hz. A miss freezes the picture.`
 
 ## Agent skills
 

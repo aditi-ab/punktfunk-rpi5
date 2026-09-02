@@ -1,14 +1,17 @@
-//! The blocking data-plane pump: poll the session for access units, run the adaptive-FEC
-//! loss reports, the ABR controller + startup capacity probe, the jump-to-live detectors,
-//! and the standing-latency bleed, and hand frames to the embedder.
+//! Blocking data-plane pump: poll the session, run Adaptive-FEC / ABR /
+//! jump-to-live / standing-latency, and hand frames to the embedder.
+//!
+//! Dedicated user-interactive thread. Newest-frame drop on embedder lag.
+//! [`FLAG_PROBE`] filler never enters the decoder. Tests here pin the
+//! delivery-report cadence, the probe-target derivation, and the pipeline-gap
+//! window discard.
 
 use super::super::*;
 use super::*;
 
-/// Data-plane pump on a blocking thread: poll the session, hand frames to the embedder.
-/// try_send drops the newest frame when the embedder lags (freshness over completeness).
-/// Speed-test filler ([`FLAG_PROBE`]) is folded into the probe accumulator instead of the
-/// decoder queue — it isn't video.
+/// Data-plane pump on a blocking thread. `try_send` drops the newest frame
+/// when the embedder lags. [`FLAG_PROBE`] filler goes to the probe accumulator,
+/// not the decoder.
 pub(super) struct DataPump {
     pub(super) session: Session,
     pub(super) frames: Arc<FrameChannel>,
@@ -19,52 +22,47 @@ pub(super) struct DataPump {
     pub(super) clock_offset: Arc<std::sync::atomic::AtomicI64>,
     pub(super) clock_gen: Arc<AtomicU32>,
     pub(super) decode_lat: Arc<Mutex<DecodeLatAcc>>,
-    /// Host encode-stage latency window accumulator (the ABR encode signal — see
-    /// [`super::super::frame_channel::EncodeLatAcc`]); fed by the datagram task.
+    /// Host encode-stage window ([`super::super::frame_channel::EncodeLatAcc`]);
+    /// fed by the datagram task, not the overlay's lossy `host_timing_tx`.
     pub(super) encode_lat: Arc<Mutex<super::super::frame_channel::EncodeLatAcc>>,
-    /// Accepted-mode-switch generation (control task bumps): a change resets the controller's
-    /// mode-scoped learned state ([`BitrateController::on_mode_switch`]).
+    /// Control-task mode-switch generation. A change resets mode-scoped ABR
+    /// state ([`BitrateController::on_mode_switch`]).
     pub(super) mode_gen: Arc<AtomicU32>,
     pub(super) frames_dropped: Arc<std::sync::atomic::AtomicU64>,
     pub(super) fec_recovered: Arc<std::sync::atomic::AtomicU64>,
-    /// Host `BitrateChanged` acks since the last report tick, drained in arrival order — a
-    /// queue so a corrective short retarget can't be clobbered by a full resolve ack in the
-    /// same window (review §2.4; host-cap learning needs two CONSECUTIVE short acks).
+    /// Host `BitrateChanged` acks, drained in arrival order. A queue so a
+    /// corrective short retarget cannot be clobbered by a full resolve ack
+    /// in the same window (host-cap learning needs two consecutive shorts).
     pub(super) bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>>,
-    /// Outbound decode-recovery keyframe asks, counted by the control task at its send choke
-    /// point; drained per report window as the ABR's recovery signal.
+    /// Decode-recovery keyframe asks, counted at the control-task send choke.
+    /// Drained per report window as the ABR recovery signal.
     pub(super) recovery_kf: Arc<AtomicU32>,
-    /// The host announced a capture/encode pipeline rebuild ([`crate::quic::PipelineGap`]): the
-    /// gap's length in ms, `0` = none pending. Drained every iteration — see
-    /// [`take_pipeline_gap`].
+    /// Host pipeline-rebuild gap in ms ([`crate::quic::PipelineGap`]); `0` =
+    /// none. Drained each iteration — see [`take_pipeline_gap`].
     pub(super) pipeline_gap: Arc<AtomicU32>,
-    /// The embedder's REQUESTED rate (0 = Automatic — the only case the ABR arms).
+    /// Embedder-requested rate. `0` = Automatic (the only case ABR arms).
     pub(super) bitrate_kbps: u32,
-    /// The rate the host actually configured (echoed in Welcome).
+    /// Rate the host actually configured (Welcome echo; old host echoes 0).
     pub(super) resolved_bitrate_kbps: u32,
     pub(super) negotiated_codec: u8,
-    /// The negotiated encode bit depth and chroma wire byte — session constants a mode switch
-    /// does NOT change, carried so the stream-shape cap can be recomputed for a new geometry
-    /// (review §2.1).
+    /// Negotiated bit depth and chroma. Mode switches do not change them;
+    /// carried so the stream-shape cap can be recomputed for a new geometry.
     pub(super) bit_depth: u8,
     pub(super) chroma_format: u8,
-    /// The host marks idle-keepalive repeats with `USER_FLAG_REPEAT`
-    /// ([`crate::quic::HOST_CAP2_REPEAT_MARK`] in the Welcome — RFC §4.1). Only then do the
-    /// per-window active/repeat counts below mean anything; against an older host the ABR is
-    /// handed `None` and keeps its legacy window arithmetic.
+    /// Host marks idle-keepalive repeats (`USER_FLAG_REPEAT` / Welcome
+    /// [`crate::quic::HOST_CAP2_REPEAT_MARK`]). Older hosts get `None` and
+    /// legacy ABR window arithmetic.
     pub(super) marks_repeats: bool,
-    /// The audio plane's wire reservation (RFC §5.1) — added to the window's wire-byte
-    /// `actual` so the controller's domain matches the budget its targets are in.
+    /// Audio-plane wire reservation. Added to window `actual` so the
+    /// controller's domain matches the budget its targets are in.
     pub(super) audio_reserved_kbps: u32,
-    /// What this session's mode + codec could plausibly use (see
-    /// [`crate::abr::stream_ceiling_kbps`]) — the bound the probe-measured link ceiling is held
-    /// to. Computed where the negotiated geometry lives; recomputed here on an accepted mode
-    /// switch (review §2.1).
+    /// Mode+codec ceiling ([`crate::abr::stream_ceiling_kbps`]). Holds the
+    /// probe-measured link ceiling; recomputed on an accepted mode switch.
     pub(super) stream_cap_kbps: u32,
-    /// The negotiated refresh, which sets the frame budget the ABR sizes its host-encode
-    /// thresholds against (see [`crate::abr::BitrateController::set_frame_budget`]).
+    /// Negotiated refresh. ABR sizes host-encode thresholds in these frame
+    /// budgets ([`crate::abr::BitrateController::set_frame_budget`]).
     pub(super) refresh_hz: u32,
-    /// The accepted mode, written by the control task on a mode switch — read when `mode_gen`
+    /// Accepted mode, written by the control task. Read when `mode_gen`
     /// moves so the frame budget follows the new refresh.
     pub(super) mode_slot: Arc<Mutex<crate::config::Mode>>,
 }
@@ -99,18 +97,15 @@ impl DataPump {
             refresh_hz,
             mode_slot: pump_mode_slot,
         } = self;
-        pin_thread_user_interactive(); // feeds the frame channel → the user-interactive video pump
-        register_hot_tid(&pump_hot_tids); // this thread does UDP receive + FEC reassembly — hint it
-                                          // Adaptive-FEC loss reporting: every ADAPT_REPORT_INTERVAL, report the loss observed over the
-                                          // window (shards FEC recovered, plus a bump if any frame went unrecoverable) so the host can
-                                          // size FEC to the link. Suppressed during a speed test (its FLAG_PROBE filler would skew it).
+        pin_thread_user_interactive(); // frame channel → user-interactive video pump
+        register_hot_tid(&pump_hot_tids); // UDP receive + FEC reassembly
+        // Adaptive-FEC loss window. FLAG_PROBE filler would skew it, so
+        // reports are suppressed for the whole speed-test burst.
         const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
         let mut last_report = Instant::now();
-        // Has the host been told, once, that data-plane packets are reaching us? See the send site:
-        // the delivery count is reported every window while it is ZERO (the state the host acts on)
-        // and once more when the first packets land, then never again. A host that predates the
-        // message logs "unknown control message" for each one, so a healthy session must not stream
-        // them — one line per session is a fair price on an old host, eighty a minute is not.
+        // DeliveryReport: every window while packets_received is 0, once
+        // more when the first packets land, then never. Older hosts log
+        // each unknown control message.
         let mut delivery_confirmed = false;
         let (
             mut last_recovered,
@@ -119,68 +114,34 @@ impl DataPump {
             mut last_dropped,
             mut last_bytes,
         ) = (0u64, 0u64, 0u64, 0u64, 0u64);
-        // PUNKTFUNK_PERF: per-window pump observability — the Session's receive stage split
-        // (recv / decrypt / reassemble+FEC, see `Session::take_pump_perf`) and completed-AU
-        // inter-arrival jitter. Smoothness has no metric otherwise: jump-to-live counters only
-        // fire after the stream is already seconds behind.
+        // PUNKTFUNK_PERF: recv/decrypt/reassemble split plus AU inter-arrival
+        // jitter. Jump-to-live only fires after the stream is already behind.
         let pump_perf_on = std::env::var("PUNKTFUNK_PERF").is_ok_and(|v| v != "0");
         let mut arrivals_us: Vec<u32> = Vec::new();
         let mut last_arrival: Option<Instant> = None;
-        // Adaptive bitrate (see `crate::abr`): armed only when the embedder asked for Automatic
-        // (`bitrate_kbps == 0`) and the host echoed the rate it actually configured (an old host
-        // echoes 0 → controller stays permanently off). Fed once per report window with the same
-        // deltas the LossReport uses, plus the window's mean skew-corrected one-way delay, the
-        // actual delivered throughput (climb gate + proven-throughput mark), and whether a
-        // jump-to-live flush fired.
-        // PyroWave sessions PIN their rate (§4.6): AIMD descent turns wavelets to mush well
-        // above its floor, and the climb probe's VBV reasoning doesn't apply to hard
-        // per-frame CBR — controller and capacity probe stay off (0 = permanently off).
+        // ABR: Automatic (`bitrate_kbps == 0`) and a non-zero Welcome echo.
+        // Old host echoes 0 → controller stays off. PyroWave pins the rate
+        // (hard per-frame CBR — AIMD and the climb probe stay off).
         let rate_pinned = negotiated_codec == crate::quic::CODEC_PYROWAVE;
-        // All-intra streams have no reference chains: the frame channel drains to the newest
-        // AU instead of strict FIFO (see `FrameChannel::set_all_intra`), so a slow consumer
-        // caps its standing queue at ~1 frame with zero recovery cost.
+        // All-intra: no reference chain, so the channel drains to newest
+        // (`FrameChannel::set_all_intra`) instead of strict FIFO.
         frames.set_all_intra(negotiated_codec == crate::quic::CODEC_PYROWAVE);
         let mut abr = BitrateController::new(if bitrate_kbps == 0 && !rate_pinned {
             resolved_bitrate_kbps
         } else {
             0
         });
-        // Bound whatever the capacity probe measures by what this stream's shape could plausibly
-        // use. Without it the climb ceiling is pure link capacity, and a fat LAN authorizes rates
-        // no inter-coded stream benefits from — the field session walked to 657 Mbps for 1440p120
-        // and drove the client's decode latency from 0.8 ms to 10 ms getting there.
+        // Bound the probe by stream shape, not raw link capacity. A fat LAN
+        // otherwise licenses rates no inter-coded stream can use.
         abr.set_stream_cap(stream_cap_kbps);
-        // Size the host-encode thresholds in this session's frame budgets rather than the 120 Hz
-        // durations they were calibrated at — a 60 Hz session otherwise takes the SEVERE
-        // one-window ×0.7 on an ordinary one-frame encode hiccup.
+        // Encode thresholds in this session's frame budgets, not the 120 Hz
+        // durations they were calibrated at. 60 Hz would take SEVERE ×0.7
+        // on an ordinary one-frame encode hiccup.
         abr.set_frame_budget(refresh_hz);
-        // Startup link-capacity probe (Automatic sessions): the controller's ceiling is the
-        // negotiated start rate — the conservative 20 Mbps default, historically a box Automatic
-        // could NEVER climb out of. One speed-test burst shortly after the stream settles
-        // measures what the link actually delivers; ×0.7 (headroom for FEC overhead + variance)
-        // becomes the climb ceiling and slow start does the rest. Old hosts decline (all-zero
-        // reply) or never answer (timeout clears the state so LossReports resume) — either way
-        // the ceiling stays negotiated, exactly the old behavior. PUNKTFUNK_ABR_PROBE=0 opts out.
-        // The burst target is DERIVED from `stream_cap_kbps`, not set "far above any plausible
-        // link". It used to be a flat 2 Gbps on that reasoning — the burst must measure the link
-        // and not itself — but the ABR already discards every bit measured above what the session
-        // could use: `set_ceiling` clamps to the stream cap set a few lines up, so everything past
-        // `stream_cap_kbps / 0.7` is thrown away the moment it lands. All that height bought was
-        // bufferbloat for a number nothing reads, and on links the burst DISTURBS it backfires — a
-        // constrained Wi-Fi link can black-hole under 2 Gbps (measured on webOS: the probe hitting
-        // the 6 s timeout delayed first video to 14 s, and a "successful" one still reported
-        // send_dropped=20211; the same shape is reported on a Fire TV Stick 4K Max), and a 2-3
-        // core TV client starves decoding the firehose.
-        //
-        // ×2 is the smallest multiplier that still PROVES the cap: the measured ceiling is
-        // `delivered × 0.7`, so reaching `stream_cap_kbps` needs `delivered ≥ cap × 1.43` and the
-        // rest is margin. Deriving it this way cannot cap anyone — a session whose mode and codec
-        // justify a high ceiling asks for a correspondingly high target by itself, and a mode we
-        // cannot size (`stream_ceiling_kbps` → `u32::MAX`) still gets the old 2 Gbps. It also
-        // fixes webOS and every other constrained client, not just the box that reported it.
-        //
-        // `PUNKTFUNK_ABR_PROBE_KBPS` overrides the target outright (unset/0/garbage → the derived
-        // one). An embedder that caps its own speed test wants this capped to match.
+        // Startup capacity probe (Automatic): one burst after video flows.
+        // Ceiling = delivered × 0.7. Target is `2 × stream_cap` (need
+        // delivered ≥ cap × 1.43; `set_ceiling` clamps to the stream cap).
+        // `PUNKTFUNK_ABR_PROBE=0` opts out; `_KBPS` overrides the target.
         let capacity_probe_kbps: u32 = std::env::var("PUNKTFUNK_ABR_PROBE_KBPS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
@@ -188,10 +149,8 @@ impl DataPump {
             .unwrap_or_else(|| probe_target_kbps(stream_cap_kbps));
         const CAPACITY_PROBE_MS: u32 = 800;
         const CAPACITY_PROBE_DELAY: Duration = Duration::from_secs(2);
-        // Wide enough for the burst's own aftermath: on a constrained path the burst leaves a
-        // queue + QUIC loss-recovery backoff between the host's "complete" and our receipt (a
-        // field session measured 8.6 s), and a result past the deadline is thrown away — the
-        // probe then cost the disturbance AND taught nothing.
+        // Burst aftermath: queue + QUIC loss-recovery sit between host
+        // "complete" and our receipt. A late result is discarded.
         const CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
         let mut capacity_probe_at: Option<Instant> = (bitrate_kbps == 0
             && !rate_pinned
@@ -199,98 +158,64 @@ impl DataPump {
             && std::env::var("PUNKTFUNK_ABR_PROBE").map_or(true, |v| v != "0"))
         .then(|| Instant::now() + CAPACITY_PROBE_DELAY);
         let mut capacity_probe_deadline: Option<Instant> = None;
-        // Edge detector + watchdog for a probe of EITHER origin (the startup capacity probe or an
-        // embedder speed test via `NativeClient::request_probe`). The startup path had both built
-        // in; the embedder path had neither, so an unanswered request wedged the report tick and a
-        // finished one left the ABR window anchored before the burst.
+        // Leading/trailing edge of any probe (startup or embedder). An
+        // unanswered request must not wedge the report tick forever.
         let mut was_probing = false;
-        // `frames_completed` as the burst began, so the probe-end block below can ask "did ANY
-        // frame survive this burst" rather than only "has one ever arrived" — see there.
+        // `frames_completed` at burst start: "did any frame survive", not
+        // "has one ever arrived".
         let mut frames_at_probe_start: u64 = 0;
-        // The window this closes is discarded outright: no LossReport, no standing-latency close,
-        // no ABR feed. Two causes, both of them "this window's signals describe something other
-        // than the link, and one bogus congestion verdict here ends slow start for good":
-        //
-        //  * a probe just ended. The `last_*` rebase below cannot fully clean the tail — probe
-        //    frames still pending in the reassembler age out as `frames_dropped` for another
-        //    LOSS_WINDOW (~120 ms) AFTER the rebase, and the burst may have latched
-        //    `flush_in_window` — and either reads as SEVERE congestion. The 2026-07 field
-        //    report's Automatic session backed off 20→14 Mb/s one second in (exactly one report
-        //    tick after its capacity probe) and, with slow start dead from that first
-        //    "congestion", crawled additively for the entire match.
-        //  * the HOST announced that it rebuilt its capture ring and encoder in place
-        //    ([`crate::quic::PipelineGap`], drained just below). Nothing flowed while it did, so
-        //    the straddling window carries a fraction of its target with zero loss — the 0.29
-        //    field log's 401 ms exclusive-topology eviction, which cost that session three
-        //    minutes at ~15 Mbps.
+        // Discard this window's LossReport / ABR / standing-latency close.
+        // Probe tail (reassembler still aging FLAG_PROBE as drops) and a
+        // host pipeline rebuild both describe something other than the
+        // link; one bogus congestion verdict ends slow start for good.
         let mut discard_abr_window = false;
         let mut probe_watchdog: Option<Instant> = None;
         let (mut owd_sum_ns, mut owd_frames) = (0i128, 0u32);
-        // Per-window AU activity split (RFC §4.1): total completed video AUs and how many the
-        // host flagged as idle-keepalive repeats. Meaningful only on a `marks_repeats` host.
+        // Completed video AUs vs host-marked idle repeats. Meaningful only
+        // when `marks_repeats`.
         let (mut au_frames, mut au_repeats) = (0u32, 0u32);
         let mut flush_in_window = false;
-        // Jump-to-live state (see the guard in the loop below): when the clock-based over-bound
-        // run began (`stale_since`, armed only when the skew handshake succeeded so the clocks
-        // are comparable), when the clock-free non-draining-queue run began (`standing_since`),
-        // and the last-jump instant for the shared cooldown. Wall-clock runs (T1.4), not frame
-        // counts — the detectors' sensitivity must not scale with fps or repeat cadence.
+        // Jump-to-live: clock-based over-bound run (`stale_since`, needs
+        // skew handshake), clock-free queue run (`standing_since`), shared
+        // cooldown. Wall-clock, not frame counts — fps must not scale it.
         let mut stale_since: Option<Instant> = None;
         let mut standing_since: Option<Instant> = None;
         let mut last_flush: Option<Instant> = None;
-        // Clock-detector health: consecutive clock-triggered flushes that found no local backlog
-        // (see NOOP_FLUSH_DATAGRAMS). Reaching NOOP_CLOCK_FLUSHES_TO_DISARM turns the clock-based
-        // detector off (a clock step / upstream queue it can't fix) — until a mid-stream clock
-        // re-sync lands and re-arms it (`pump_clock_gen` below). The FIRST no-op flush also asks
-        // the control task for an immediate re-sync (via the report tick): the flush finding no
-        // local backlog IS the "the wall clock stepped under me" signal.
+        // Consecutive clock-triggered flushes that found no local backlog.
+        // `NOOP_CLOCK_FLUSHES_TO_DISARM` turns the clock detector off until
+        // a re-sync (`pump_clock_gen`). First no-op also asks for re-sync.
         let mut noop_clock_flushes: u32 = 0;
         let mut clock_detector_armed = true;
         let mut resync_wanted = false;
         let mut seen_clock_gen = pump_clock_gen.load(Ordering::Relaxed);
         let mut seen_mode_gen = pump_mode_gen.load(Ordering::Relaxed);
-        // Standing-latency bleed (see StandingLatency): the third detector, for the small,
-        // constant, loss-free OWD elevation the two jump-to-live detectors deliberately
-        // tolerate (< QUEUE_HIGH frames, < FLUSH_LATENCY behind) — a sub-frame standing
-        // backlog, or a stale clock offset after a wall-clock step, either of which otherwise
-        // reads as permanent extra "network" latency for the rest of the session.
+        // Standing-latency bleed: loss-free OWD elevation the two jump
+        // detectors tolerate (< QUEUE_HIGH, < FLUSH_LATENCY). Otherwise it
+        // reads as permanent extra network latency.
         let mut standing_lat = StandingLatency::new();
         while !pump_shutdown.load(Ordering::SeqCst) {
-            // The live host↔client offset: re-loaded every iteration so an applied mid-stream
-            // re-sync takes effect on the very next frame's latency math.
+            // Reloaded every iteration so a mid-stream re-sync hits the
+            // next frame's latency math.
             let clock_offset_ns = pump_clock_offset.load(Ordering::Relaxed);
-            // An applied re-sync invalidates the staleness run measured under the OLD offset:
-            // reset the counters and re-arm the clock-based detector if a step had disarmed it.
+            // Re-sync invalidates the staleness run under the old offset.
             let clock_gen = pump_clock_gen.load(Ordering::Relaxed);
             if clock_gen != seen_clock_gen {
                 seen_clock_gen = clock_gen;
                 stale_since = None;
                 noop_clock_flushes = 0;
-                // Every OWD reading shifted with the offset — the standing-latency floor and
-                // any elevation measured under the old one are meaningless now. If a stale
-                // offset WAS the elevation, this is also the moment it gets fixed.
+                // Every OWD reading shifted with the offset; the old floor
+                // is meaningless. A stale offset that WAS the elevation
+                // is fixed here.
                 standing_lat.rebase();
                 if !clock_detector_armed {
                     clock_detector_armed = true;
                     tracing::info!("clock re-sync applied — clock-based jump-to-live re-armed");
                 }
             }
-            // A host-announced capture/encode rebuild (see `discard_abr_window` above). Drained
-            // here rather than at the report tick so the flag is set before the tick that closes
-            // the window the gap landed in — that is the window whose signals the rebuild
-            // corrupted, and it is the one we can still do something about.
-            //
-            // A rebuild long enough to straddle a window boundary damaged the PREVIOUS window
-            // too, and that one is already decided: it was fed to the controller and its
-            // LossReport is on the wire. Retracting it would mean holding every window back by a
-            // window in case a gap follows, which trades a rare over-reaction for a permanent one.
-            // So the limitation is deliberate: only the window in flight is discarded. The host
-            // sends this the moment the rebuild completes, so the announcement lands inside the
-            // damaged window whenever the rebuild is shorter than a window — the 401 ms field case
-            // against 750 ms windows, and every case observed so far. A rebuild that outlasts a
-            // window still leaks its first one: the controller's two-window confirmation holds the
-            // RATE unless that window also cleared a severe tier, but ANY bad window retires slow
-            // start, so a leak still costs the doubling climb.
+            // Drain here, not at the report tick, so the in-flight window
+            // (the one the rebuild corrupted) is the one we can still drop.
+            // A gap that straddled a boundary already fed the previous
+            // window; holding every window back would be a permanent lag.
             if let Some(gap_ms) = take_pipeline_gap(&pump_pipeline_gap) {
                 discard_abr_window = true;
                 tracing::debug!(
@@ -299,20 +224,17 @@ impl DataPump {
                     "host pipeline gap — the report window in flight is discarded"
                 );
             }
-            // Mirror the reassembler's unrecoverable-drop count for the client's keyframe-recovery
-            // loop, and (during a speed test) the packet-level receive counters for the throughput
-            // measurement. Updated every iteration (not just on a produced frame) so they stay current
-            // through a total-loss drought where no AU completes. Cheap: a few relaxed atomic loads.
+            // Mirror drop/FEC counters every iteration, not only on a
+            // produced frame — a total-loss drought completes no AU.
             let st = session.stats();
             frames_dropped.store(st.frames_dropped, Ordering::Relaxed);
             fec_recovered.store(st.fec_recovered_shards, Ordering::Relaxed);
             let probe_active = {
                 let mut p = pump_probe.lock().unwrap();
                 if p.active && !p.done {
-                    // Arm edge (first mirror tick): zero the arrival stamps before the burst can
-                    // claim them — the ProbeRequest is still queued locally (the burst starts a
-                    // round trip later), so the reset cannot race a probe packet. `st` predates
-                    // the reset, so the stamps mirror 0 on this tick and live values after.
+                    // First mirror tick: zero arrival stamps before the
+                    // burst can claim them. ProbeRequest is still local, so
+                    // the reset cannot race a probe packet.
                     let arming = p.base_bytes.is_none();
                     if arming {
                         session.reset_probe_arrivals();
@@ -329,13 +251,10 @@ impl DataPump {
                 }
                 p.active && !p.done
             };
-            // A probe just ended (either kind): rebase EVERY window anchor past the burst. Its
-            // FLAG_PROBE filler landed in `bytes_received`/`packets_received` (session.rs counts
-            // every accepted datagram) but never reached the decoder, and the report tick was
-            // suppressed for the whole burst, so `last_*` still points before it. Without this the
-            // first post-burst window reads the burst rate as `actual_kbps` and poisons the ABR's
-            // monotone proven-throughput high-water mark — which never decays — and divides the
-            // window's loss by a packet count inflated with filler.
+            // Probe ended: rebase every window anchor past the burst.
+            // FLAG_PROBE landed in packet/byte counters but never the
+            // decoder; without this the first post-burst window poisons
+            // proven-throughput (monotone, never decays) and loss_ppm.
             if was_probing && !probe_active {
                 last_recovered = st.fec_recovered_shards;
                 last_late = st.fec_late_shards;
@@ -345,18 +264,10 @@ impl DataPump {
                 last_report = Instant::now();
                 discard_abr_window = true;
                 flush_in_window = false;
-                // …and if the burst swallowed the video with it, re-anchor the decoder. This runs
-                // on EVERY probe end — a successful one, a timed-out one, an embedder "Test
-                // connection" — and the frame-count guard is what makes it a no-op the rest of the
-                // time: a burst the link couldn't hold can take the keyframe down with it, and
-                // then nothing re-requests one, so the client sits on black until some unrelated
-                // recovery path happens to fire. That is the reported Fire TV / webOS black
-                // screen. Compared against the count SNAPSHOTTED at the burst's leading edge
-                // rather than against 0: at startup the two are the same test, but this one also
-                // catches a burst that kills an already-running stream (an embedder speed test
-                // mid-session), which the cumulative counter never could. At most one request per
-                // probe, and it funnels through the control task's coalescer like the other two
-                // emitters in this file, so it cannot IDR-storm.
+                // Burst may have taken the keyframe with it. Compare
+                // against the count snapshotted at the leading edge, not
+                // 0: that also catches a mid-session embedder speed test.
+                // One request per probe, via the control-task coalescer.
                 if st.frames_completed == frames_at_probe_start {
                     let _ = ctrl_tx.try_send(CtrlRequest::Keyframe);
                     tracing::warn!(
@@ -364,9 +275,8 @@ impl DataPump {
                     );
                 }
             }
-            // Arm a watchdog on the leading edge of ANY probe, so a host that silently ignores
-            // `ProbeRequest` (an old build — anticipated, see the capacity-probe timeout below)
-            // cannot latch `active` forever and suppress the report tick for the whole session.
+            // Leading edge of any probe: an old host that ignores
+            // ProbeRequest must not latch `active` and mute reports.
             if !was_probing && probe_active {
                 let burst = Duration::from_millis(pump_probe.lock().unwrap().duration_ms as u64);
                 probe_watchdog = Some(Instant::now() + burst + CAPACITY_PROBE_TIMEOUT);
@@ -384,17 +294,10 @@ impl DataPump {
                 }
             }
             was_probing = probe_active;
-            // Fire the startup link-capacity probe once the stream has settled (see the constants
-            // above), and fold its measurement into the ABR ceiling when the result lands.
-            // Never steal the slot from an embedder speed test in flight: there is one `ProbeState`
-            // and no correlation id, so a clobber both wrecks the user's "Test connection" figure
-            // (its base counters get re-snapshotted mid-burst against the full-burst denominator)
-            // and mis-scales our own ceiling. Retry once it finishes.
-            // "Settled" means a frame actually decoded, not a wall-clock delay: the 2 s timer
-            // alone fired the burst while a slow host bring-up (IDD display acquisition ran
-            // ~6 s in the field) was still emitting its FIRST IDR — the burst drowned it
-            // (black video for 5–11 s, decoder refusing AUs) and the host, busy bringing up,
-            // answered past the timeout anyway. Reschedule until video flows.
+            // Startup probe once video flows. One ProbeState, no
+            // correlation id — do not clobber an embedder speed test.
+            // "Settled" is a completed frame, not the 2 s timer: a slow
+            // host bring-up is still emitting its first IDR.
             if capacity_probe_at.is_some_and(|at| Instant::now() >= at)
                 && (probe_active || st.frames_completed == 0)
             {
@@ -427,13 +330,10 @@ impl DataPump {
                 let mut p = pump_probe.lock().unwrap();
                 if p.done {
                     capacity_probe_deadline = None;
-                    // An all-zero reply is a decline (old host / probe-less build) — keep the
-                    // negotiated ceiling. Otherwise: delivered wire kbps × 0.7, over the
-                    // CLIENT-measured receive interval (the host's send window closes while the
-                    // bottleneck queue is still draining toward us, so dividing by ITS duration
-                    // overstates the link — a 1 GbE link "measured" 1266 Mbps, and the inflated
-                    // ceiling is permanent because set_ceiling never lowers); the host duration
-                    // is the fallback when the burst delivered too few packets for an interval.
+                    // All-zero reply = decline: keep the negotiated ceiling.
+                    // Else delivered × 0.7 over the CLIENT receive interval
+                    // (the host send window closes while the bottleneck
+                    // queue is still draining; that duration overstates).
                     if p.host_duration_ms > 0 && p.delivered_bytes > 0 {
                         let window_ms = p.throughput_window_ms();
                         let delivered_kbps =
@@ -452,15 +352,13 @@ impl DataPump {
                             "adaptive bitrate: capacity probe declined — keeping negotiated ceiling"
                         );
                     }
-                    // Rebase the ABR window's byte anchor past the burst. (The wire measure
-                    // nets the probe filler out by construction — see `wire_bytes` — but the
-                    // anchor still has to skip the video that landed around the burst under a
-                    // suppressed report tick, which would otherwise divide a long span's
-                    // bytes by one window.)
+                    // Rebase the ABR byte anchor past the burst. `wire_bytes`
+                    // already nets filler; this skips video that landed under
+                    // a suppressed report tick (else a long span / one window).
                     last_bytes = wire_bytes(&st);
                 } else if Instant::now() >= deadline {
-                    // The host never answered (a build that ignores ProbeRequest): clear the
-                    // stuck-active state so LossReports resume, keep the negotiated ceiling.
+                    // Host never answered: clear stuck-active so LossReports
+                    // resume. Keep the negotiated ceiling.
                     p.active = false;
                     capacity_probe_deadline = None;
                     tracing::info!(
@@ -469,15 +367,14 @@ impl DataPump {
                 }
             }
             if !probe_active && last_report.elapsed() >= ADAPT_REPORT_INTERVAL {
-                // A no-op clock flush earlier in this window suspected a wall-clock step: fire
-                // the mid-stream re-sync now (once — the 60 s periodic covers everything else).
+                // No-op clock flush suspected a wall-clock step: re-sync
+                // once. The 60 s periodic covers everything else.
                 if resync_wanted {
                     resync_wanted = false;
                     let _ = ctrl_tx.try_send(CtrlRequest::ClockResync);
                 }
-                // All-intra drain-to-newest skips are NOT losses (the wire delivered them) —
-                // surface them at debug so a slow consumer is visible without alarming the
-                // OSD loss counters.
+                // All-intra drain-to-newest skips are not losses (the wire
+                // delivered them). Debug only — do not alarm OSD loss.
                 let skipped = frames.take_skipped();
                 if skipped > 0 {
                     tracing::debug!(skipped, "all-intra frame channel drained to newest");
@@ -491,11 +388,9 @@ impl DataPump {
                     window_dropped,
                 );
                 if discard {
-                    // See `discard_abr_window` for the two causes. The LossReport goes with it
-                    // either way: from a probe tail it would spike the host's adaptive FEC off
-                    // deliberate overload, and across a host rebuild `loss_ppm` is computed over a
-                    // window that received almost nothing — a denominator near zero, where one
-                    // aged-out shard reads as several percent (see `window_loss_ppm`'s own tests).
+                    // LossReport goes with the window: probe tail would
+                    // spike host FEC off deliberate overload; a rebuild
+                    // window has a near-zero denominator.
                     tracing::debug!(
                         loss_ppm,
                         window_dropped,
@@ -503,36 +398,20 @@ impl DataPump {
                     );
                 } else {
                     let _ = ctrl_tx.try_send(CtrlRequest::Loss(LossReport { loss_ppm }));
-                    // Rides with the loss report — it is what makes `loss_ppm = 0` readable at the
-                    // host, which cannot otherwise tell a flawless link from one delivering
-                    // nothing. The session TOTAL, not this window's, so one message stands on its
-                    // own. Deliberately inside the same arm: a discarded window is discarded
-                    // because the host was rebuilding or a probe distorted it, and staying silent
-                    // there keeps that contract exact. Nothing is lost — the state this reports
-                    // (no packets at all) produces no discards, so its windows always send.
-                    //
-                    // Sent every window while the count is ZERO, then ONCE when the first packets
-                    // land (so the host stops guessing and can name the other failure confidently),
-                    // then never again: a healthy session must not stream a message that older
-                    // hosts log as unknown on every arrival.
-                    // ponytail: only start-of-session death is covered. A path that dies MID-stream
-                    // leaves the count frozen above zero and silent, which the host still reads as
-                    // healthy — detecting that needs a stalled-counter check with its own timing,
-                    // worth adding if a mid-session case is ever reported.
+                    // DeliveryReport rides the loss report so `loss_ppm = 0`
+                    // is readable (flawless vs delivering nothing). Session
+                    // total, same arm: a discarded window stays silent.
+                    // Cadence is in [`should_report_delivery`].
                     if should_report_delivery(st.packets_received, &mut delivery_confirmed) {
                         let _ = ctrl_tx.try_send(CtrlRequest::Delivery(DeliveryReport {
                             packets_received: st.packets_received,
                         }));
                     }
                 }
-                // Standing-latency bleed: close the detector's window with this report's loss
-                // verdict and run its escalation ladder — re-sync first (free; a stale offset
-                // from a stepped wall clock produces exactly this signature and the applied
-                // re-sync rebases the floor), then a bounded flush+keyframe (drains a real
-                // sub-threshold standing backlog the jump-to-live thresholds tolerate), then a
-                // loud disarm (the path latency itself changed; nothing local fixes that).
-                // A discard window closes the detector as NOT-loss-free: its clean-run resets
-                // (conservative) and no action can fire off probe residue.
+                // Standing-latency window close. Escalation: re-sync (stale
+                // offset), then bleed (flush+keyframe), then disarm (path
+                // latency changed). A discard window is NOT loss-free —
+                // no action off probe residue.
                 match standing_lat.on_window(!discard && loss_ppm == 0 && window_dropped == 0) {
                     StandingLatAction::None => {}
                     StandingLatAction::Resync { above_ms } => {
@@ -545,16 +424,14 @@ impl DataPump {
                         let _ = ctrl_tx.try_send(CtrlRequest::ClockResync);
                     }
                     StandingLatAction::Bleed { above_ms } => {
-                        // Shares the jump-to-live cooldown: an unexecuted bleed simply re-arms
-                        // over the next windows (the detector's run rebuilds).
+                        // Shares the jump-to-live cooldown. An unexecuted
+                        // bleed re-arms as the detector's run rebuilds.
                         if last_flush.is_none_or(|t| t.elapsed() >= FLUSH_COOLDOWN) {
                             last_flush = Some(Instant::now());
-                            // Deliberately NOT `flush_in_window = true`: that flag is the ABR's
-                            // SEVERE verdict (an immediate ×0.7 back-off), and the bleed fires
-                            // only after ~6 provably loss-free windows with a sub-25ms elevation
-                            // the controller itself scores as fine. The bleed's effect reaches
-                            // the ABR through the window's own honest signals (OWD/loss/decode);
-                            // the flag stays exclusive to the jump-to-live path below.
+                            // Not `flush_in_window`: that is ABR SEVERE
+                            // (immediate ×0.7). Bleed fires after ~6 clean
+                            // windows with a sub-25 ms elevation the
+                            // controller already scores as fine.
                             let flushed = session.flush_backlog().unwrap_or(0);
                             let dropped = frames.clear();
                             let _ = ctrl_tx.try_send(CtrlRequest::Keyframe);
@@ -577,24 +454,17 @@ impl DataPump {
                         );
                     }
                 }
-                // Adaptive bitrate: an accepted mode switch first (it invalidates the
-                // mode-scoped learned state), then drain any host ack (its clamp is
-                // authoritative), then feed the controller this window's congestion signals; a
-                // decision becomes a SetBitrate on the control stream.
                 let mg = pump_mode_gen.load(Ordering::Relaxed);
                 if mg != seen_mode_gen {
                     seen_mode_gen = mg;
                     abr.on_mode_switch();
                     let m = *pump_mode_slot.lock().unwrap();
-                    // The frame budget is a property of the MODE: a switch that changes the
-                    // refresh changes what one frame of encode time costs, and the encode
-                    // thresholds are sized in those.
+                    // Frame budget is a mode property: refresh changes
+                    // what one frame of encode time costs.
                     abr.set_frame_budget(m.refresh_hz);
-                    // So is the stream-shape cap (review §2.1): computed once from the
-                    // Welcome mode, 1080p→4K kept a 1080p-sized climb ceiling (under-running
-                    // quality on a fat link) and 4K→720p left an oversized cap standing with
-                    // only the reactive loss/decode signals to bound the climb.
-                    // `set_stream_cap` also rebinds an already-learned ceiling downward.
+                    // Stream-shape cap too. `set_stream_cap` also rebinds
+                    // an already-learned ceiling downward for the new
+                    // geometry.
                     abr.set_stream_cap(crate::abr::stream_ceiling_kbps(
                         m.width,
                         m.height,
@@ -610,50 +480,42 @@ impl DataPump {
                 let owd_mean_us =
                     (owd_frames > 0).then(|| (owd_sum_ns / owd_frames as i128 / 1000) as i64);
                 (owd_sum_ns, owd_frames) = (0, 0);
-                // Active = new content the source actually produced this window. `None` toward
-                // an older host that doesn't mark repeats — the ABR then keeps its legacy
-                // window arithmetic rather than misreading "no flags" as "all active".
+                // Active = new content this window. `None` on an older
+                // host: "no flags" is not "all active".
                 let active_frames = if marks_repeats {
                     Some(au_frames.saturating_sub(au_repeats))
                 } else {
                     None
                 };
                 (au_frames, au_repeats) = (0, 0);
-                // Drain the embedder's decode-latency window (always, so it stays bounded even when
-                // the controller is disabled) → the mean feeds the decode signal; `None` when the
-                // embedder reported nothing this window (old embedder / no decoded frames).
+                // Drain even when ABR is off so the accumulator stays
+                // bounded. `None` = nothing reported this window.
                 let decode_mean_us = {
                     let mut acc = pump_decode_lat.lock().unwrap();
                     let (sum, count) = (acc.sum_us, acc.count);
                     *acc = DecodeLatAcc::default();
                     (count > 0).then(|| (sum / count as u64) as i64)
                 };
-                // Same drain for the host-encode window (0xCF `encode_us` via the datagram
-                // task) — `None` on an old host that doesn't send stage timings.
+                // Host-encode window (0xCF `encode_us`). `None` on an
+                // old host that does not send stage timings.
                 let encode_mean_us = {
                     let mut acc = pump_encode_lat.lock().unwrap();
                     let (sum, count) = (acc.sum_us, acc.count);
                     *acc = Default::default();
                     (count > 0).then(|| (sum / count as u64) as i64)
                 };
-                // Decode-recovery keyframe asks this window (counted at the control task's send
-                // choke point). Always drained so a discard window can't leak its count into
-                // the next one.
+                // Always drain so a discard window cannot leak its
+                // count into the next one.
                 let recovery_kf_reqs = pump_recovery_kf.swap(0, Ordering::Relaxed);
-                // The window's ACTUAL delivered throughput — what the pipeline really carried, vs
-                // the target it was allowed. WIRE bytes (RFC §5.1): the targets are wire
-                // BUDGETS now, so `actual` measures what the budget actually buys — headers,
-                // seals and FEC parity included (the redundancy the host adds in answer to loss
-                // SPENDS the budget; under the old encoder-domain targets that read ~25 % high,
-                // which is why this used to be media bytes), minus the speed-test filler (the
-                // probe's spend, not the stream's), plus the audio plane's reservation — audio
-                // rides the control connection and is spent whether or not video flows.
+                // Wire throughput vs target: headers, seals, FEC parity
+                // included (they spend the budget), minus probe filler,
+                // plus the audio reservation (spent whether video flows).
                 let window_ms = last_report.elapsed().as_millis().max(1) as u64;
                 let actual_kbps = ((wire_bytes(&st).wrapping_sub(last_bytes).saturating_mul(8)
                     / window_ms) as u32)
                     .saturating_add(audio_reserved_kbps);
-                // A discard window feeds the controller NOTHING — its signals are probe-tail
-                // residue, and one "congestion" verdict here ends slow start for good.
+                // Discard window: signals are probe-tail residue. One
+                // congestion verdict here ends slow start for good.
                 let verdict = if discard {
                     None
                 } else {
@@ -671,9 +533,8 @@ impl DataPump {
                     )
                 };
                 if let Some(kbps) = verdict {
-                    // Log the window's signals alongside the decision so an on-glass session can
-                    // tell a decode-/encode-driven re-target (the new signals — elevated with
-                    // loss/OWD flat) from a network-driven one.
+                    // Log window signals with the decision so decode-/
+                    // encode-driven retargets are separable from network.
                     tracing::info!(
                         kbps,
                         loss_ppm,
@@ -686,8 +547,8 @@ impl DataPump {
                         "adaptive bitrate: requesting encoder re-target"
                     );
                     if ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps)).is_err() {
-                        // Never reached the control task — tell the controller, or three of
-                        // these retire it for the session as "the host never acked".
+                        // Never reached the control task. Three of these
+                        // retire the controller as "the host never acked".
                         abr.on_request_dropped();
                         tracing::warn!(
                             kbps,
@@ -717,8 +578,8 @@ impl DataPump {
                             "pump stage split (window)"
                         );
                     }
-                    // Inter-arrival jitter over the window's completed AUs. `late` counts gaps
-                    // over 2× the window median — the "a frame arrived visibly off-beat" tally.
+                    // Inter-arrival jitter. `late` = gaps over 2× the
+                    // window median (a frame arrived visibly off-beat).
                     if arrivals_us.len() >= 8 {
                         arrivals_us.sort_unstable();
                         let pct = |q: usize| arrivals_us[(arrivals_us.len() - 1) * q / 100];
@@ -741,14 +602,13 @@ impl DataPump {
                     if frame.flags & FLAG_PROBE as u32 != 0 {
                         continue; // speed-test filler, not video — measured via the counters above
                     }
-                    // A prefix part is not an AU arrival: the inter-arrival series, the OWD
-                    // window and the clock-based staleness detector below all measure per-AU
-                    // signals, so only the delivery that completes an AU feeds them (parts
-                    // would bias OWD low and constantly reset the staleness run).
+                    // Prefix parts are not AU arrivals. Inter-arrival,
+                    // OWD, and the clock detector are per-AU; parts
+                    // would bias OWD low and reset the staleness run.
                     let is_au = frame.complete;
                     if is_au {
-                        // The window's activity split (RFC §4.1) — repeats are the host's
-                        // idle keepalive, not new content.
+                        // Repeats are the host's idle keepalive, not
+                        // new content.
                         au_frames = au_frames.saturating_add(1);
                         if frame.flags & crate::packet::USER_FLAG_REPEAT != 0 {
                             au_repeats = au_repeats.saturating_add(1);
@@ -757,32 +617,21 @@ impl DataPump {
                     if pump_perf_on && is_au {
                         let now = Instant::now();
                         if let Some(prev) = last_arrival.replace(now) {
-                            // 4096 ≈ 17 s at 240 fps — a stuck window can't grow it unbounded.
+                            // 4096 ≈ 17 s at 240 fps — a stuck window
+                            // cannot grow it unbounded.
                             if arrivals_us.len() < 4096 {
                                 arrivals_us
                                     .push((now - prev).as_micros().min(u32::MAX as u128) as u32);
                             }
                         }
                     }
-                    // Jump-to-live guard. A standing receive/hand-off queue never drains by itself —
-                    // the pump consumes strictly in order at the arrival rate, so once behind, the
-                    // stream stays behind for good (observed live: stuck 6–7 s). Pre-decode AUs are
-                    // reference-chained (infinite GOP), so we can NOT drop a frame mid-stream to catch
-                    // up; the only safe recovery is to discard the whole backlog and re-anchor decode
-                    // on a fresh keyframe. Two independent "we're behind" signals arm it, both gated by
-                    // FLUSH_COOLDOWN, both suspended during a speed test (the probe MEASURES a saturated
-                    // queue; flushing would corrupt its counters):
-                    //  * clock-based — completed frames sit > FLUSH_LATENCY behind the skew-corrected
-                    //    capture clock continuously for FLUSH_AFTER. Needs the skew handshake, and
-                    //    also catches kernel/reassembler backlog the hand-off queue hasn't reached yet.
-                    //  * clock-free — the pre-decode hand-off queue stopped draining: its depth stayed
-                    //    ≥ QUEUE_HIGH (never falling to QUEUE_LOW, still high at the trip) for
-                    //    STANDING_TIME. Works with no handshake / a same-clock session (where the
-                    //    clock path is disarmed), and is the direct signal that the embedder can't
-                    //    keep up. A transient Wi-Fi clump drains within ~100 ms and never trips it.
+                    // Jump-to-live. In-order consume never catches up;
+                    // infinite GOP cannot drop a frame. Clock: > FLUSH_LATENCY
+                    // for FLUSH_AFTER. Queue: ≥ QUEUE_HIGH for STANDING_TIME
+                    // (still high at the trip). Both gated by FLUSH_COOLDOWN.
                     if probe_active {
-                        // Keep both detectors disarmed across a speed test so its (deliberately)
-                        // saturated queue doesn't leave a primed run that fires the moment it ends.
+                        // Probe measures a saturated queue; a primed run
+                        // would fire the moment the burst ended.
                         stale_since = None;
                         standing_since = None;
                     } else {
@@ -791,16 +640,13 @@ impl DataPump {
                         } else {
                             0
                         };
-                        // Feed the adaptive-bitrate controller's OWD window (mean capture→received
-                        // delay): rising delay under zero loss is queue growth — the pre-loss
-                        // congestion signal. Only meaningful with a clock handshake.
+                        // Mean capture→received delay. Rising delay under
+                        // zero loss is queue growth — the pre-loss signal.
                         if clock_offset_ns != 0 && lat_ns > 0 {
                             owd_sum_ns += lat_ns;
                             owd_frames += 1;
-                            // The standing-latency detector rides the same signal, but off the
-                            // window MINIMUM (robust against jitter/burst spikes — a standing
-                            // state elevates the floor itself). Same 10 s plausibility clamp as
-                            // the hn stats use.
+                            // Window MINIMUM, not mean: a standing state
+                            // elevates the floor. 10 s clamp matches hn stats.
                             if lat_ns < 10_000_000_000 {
                                 standing_lat.note_frame(lat_ns);
                             }
@@ -819,9 +665,9 @@ impl DataPump {
                         } else if depth <= QUEUE_LOW {
                             standing_since = None;
                         }
-                        // The queue trip additionally requires the depth to still be high NOW, so
-                        // a run that started ≥ high but is hovering in the hysteresis band (a
-                        // clump mid-drain) never fires on elapsed time alone.
+                        // Still high NOW: a run that started ≥ high but is
+                        // in the hysteresis band (clump mid-drain) must
+                        // not fire on elapsed time alone.
                         let clock_behind = stale_since.is_some_and(|t| t.elapsed() >= FLUSH_AFTER);
                         let queue_behind = depth >= QUEUE_HIGH
                             && standing_since.is_some_and(|t| t.elapsed() >= STANDING_TIME);
@@ -831,7 +677,7 @@ impl DataPump {
                             stale_since = None;
                             standing_since = None;
                             last_flush = Some(Instant::now());
-                            flush_in_window = true; // strongest "link can't hold the rate" signal
+                            flush_in_window = true; // ABR SEVERE: link cannot hold the rate
                             let flushed = session.flush_backlog().unwrap_or(0);
                             let dropped = frames.clear();
                             let _ = ctrl_tx.try_send(CtrlRequest::Keyframe);
@@ -842,11 +688,9 @@ impl DataPump {
                                 dropped_frames = dropped,
                                 "receive backlog stopped draining — jumped to live (flush + keyframe)"
                             );
-                            // Clock-detector health check: a clock-only trigger whose flush found
-                            // no local backlog is a false "behind" reading (a wall-clock step, or
-                            // an upstream queue a local flush can't drain) — repeated, it would
-                            // cost a recovery IDR every cooldown forever. Disarm after two in a
-                            // row; the clock-free queue detector keeps covering real backlogs.
+                            // Clock-only flush with no local backlog is a
+                            // false behind (clock step / upstream queue).
+                            // Two in a row disarm; the queue detector stays.
                             if clock_behind
                                 && !queue_behind
                                 && flushed < NOOP_FLUSH_DATAGRAMS
@@ -854,10 +698,9 @@ impl DataPump {
                             {
                                 noop_clock_flushes += 1;
                                 if noop_clock_flushes == 1 {
-                                    // First no-op flush = a wall-clock step is the prime
-                                    // suspect: ask for an immediate re-sync (sent on the next
-                                    // report tick). Applied, it resets these counters and
-                                    // re-arms the detector before the disarm below triggers.
+                                    // First no-op: ask for an immediate
+                                    // re-sync. Applied, it re-arms before
+                                    // the disarm below triggers.
                                     resync_wanted = true;
                                 }
                                 if noop_clock_flushes >= NOOP_CLOCK_FLUSHES_TO_DISARM {
@@ -871,7 +714,7 @@ impl DataPump {
                             } else {
                                 noop_clock_flushes = 0;
                             }
-                            continue; // this frame is part of the stale past — don't render it
+                            continue; // this frame is the stale past
                         }
                     }
                     frames.push(frame);
@@ -882,18 +725,14 @@ impl DataPump {
                 Err(_) => break,
             }
         }
-        // The pump exited (shutdown / fatal session error) — wake any consumer blocked in
-        // `next_frame` with a Closed signal instead of a spurious timeout (the old mpsc did this
-        // implicitly when the sender dropped).
+        // Wake a consumer blocked in `next_frame` with Closed, not a timeout.
         frames.close();
     }
 }
 
-/// Take the host's pending pipeline gap, if one landed since the last call: `Some(gap_ms)` = the
-/// host finished rebuilding its capture ring and encoder, so the report window in flight must be
-/// discarded. Drains the slot (the control task writes it; `0` = nothing pending), which is what
-/// makes the discard cover exactly ONE window — a rebuild announced once must not go on poisoning
-/// windows that were never near it.
+/// Drain the host's pending pipeline gap. `Some(gap_ms)` = the in-flight
+/// report window must be discarded. Swap-to-zero so one announcement
+/// cannot keep poisoning later windows.
 fn take_pipeline_gap(slot: &AtomicU32) -> Option<u32> {
     match slot.swap(0, Ordering::Relaxed) {
         0 => None,
@@ -901,34 +740,29 @@ fn take_pipeline_gap(slot: &AtomicU32) -> Option<u32> {
     }
 }
 
-/// Does this report window owe the host a [`DeliveryReport`], and record that it has been told?
+/// Whether this window owes the host a [`DeliveryReport`].
 ///
-/// Every window while `packets_received` is ZERO — that is the state the host escalates on, and it
-/// must keep hearing it — then exactly ONCE more when the first packets land, so the host learns
-/// delivery works and can stop hedging its stall diagnosis. Silent after that: a host that predates
-/// the message logs every unknown control message, and a healthy hours-long session must not fill
-/// its log with them.
+/// Every window while `packets_received` is 0 (the host escalates on
+/// that), then once when the first packets land, then silence. Older
+/// hosts log every unknown control message.
 fn should_report_delivery(packets_received: u64, confirmed: &mut bool) -> bool {
     let owed = packets_received == 0 || !*confirmed;
     *confirmed = packets_received > 0;
     owed
 }
 
-/// The capacity probe's burst target for a session bounded at `stream_cap_kbps`, in kbps — the
-/// default `PUNKTFUNK_ABR_PROBE_KBPS` overrides. See the probe's comment in the pump for why it is
-/// derived rather than fixed: `BitrateController::set_ceiling` clamps the measurement to the
-/// stream cap, so every bit measured above `cap / 0.7` is discarded, and bursting for it only
-/// buys bufferbloat. ×2 clears that `1.43×` bar with margin.
+/// Capacity-probe burst target in kbps. `PUNKTFUNK_ABR_PROBE_KBPS`
+/// overrides. `set_ceiling` clamps to the stream cap, so bits above
+/// `cap / 0.7` are discarded; ×2 clears the 1.43× bar with margin.
 ///
-/// `u32::MAX` in (a mode [`crate::abr::stream_ceiling_kbps`] declines to size) keeps the historic
-/// 2 Gbps, which is also the ceiling on the whole derivation: this can only ever lower the target.
+/// `u32::MAX` (a mode [`crate::abr::stream_ceiling_kbps`] declines to size)
+/// keeps 2 Gbps — also the hard ceiling; this can only lower the target.
 fn probe_target_kbps(stream_cap_kbps: u32) -> u32 {
     stream_cap_kbps.saturating_mul(2).min(2_000_000)
 }
 
-/// The controller's WIRE measure (RFC §5.1): every received media-plane byte — headers, seals
-/// and FEC parity included, because they spend the budget the targets are denominated in —
-/// minus the speed-test filler (the probe's spend, not the stream's).
+/// Wire measure: every received media-plane byte (headers, seals, FEC
+/// parity spend the budget) minus speed-test filler.
 fn wire_bytes(st: &crate::stats::Stats) -> u64 {
     st.bytes_received.wrapping_sub(st.probe_bytes_received)
 }
@@ -937,22 +771,18 @@ fn wire_bytes(st: &crate::stats::Stats) -> u64 {
 mod tests {
     use super::*;
 
-    /// The host must keep hearing "zero" for as long as it is true (that is the black-screen
-    /// signal), get exactly one confirmation when video starts, and then silence — the noise budget
-    /// on an older host, which warns per unknown message, is what pays for the first two.
+    /// DeliveryReport: "zero" while true, one confirmation when video
+    /// starts, then silence (older hosts warn per unknown message).
     #[test]
     fn the_delivery_count_is_reported_while_zero_then_once_more_and_never_again() {
         let mut confirmed = false;
-        // Nothing arriving: reported every window, for as long as it stays true.
         for _ in 0..5 {
             assert!(
                 should_report_delivery(0, &mut confirmed),
                 "a dead data plane must be re-reported every window"
             );
         }
-        // First packets land: one confirmation, so the host can name the other failure confidently.
         assert!(should_report_delivery(500, &mut confirmed));
-        // Healthy from here: silent.
         for n in [900, 1_200, 90_000] {
             assert!(
                 !should_report_delivery(n, &mut confirmed),
@@ -961,8 +791,7 @@ mod tests {
         }
     }
 
-    /// A session that never receives anything must never look confirmed, no matter how long it runs
-    /// — the whole point is that the host keeps being told.
+    /// A session that never receives must never look confirmed.
     #[test]
     fn a_session_that_receives_nothing_never_reports_itself_healthy() {
         let mut confirmed = false;
@@ -972,13 +801,10 @@ mod tests {
         }
     }
 
-    /// The burst has to be big enough to PROVE the stream cap and no bigger. Anything the burst
-    /// measures above `cap / 0.7` is discarded by `BitrateController::set_ceiling` (pinned by
-    /// `abr::tests::the_stream_bound_clamps_a_learned_ceiling_only`) and paid for in bufferbloat.
+    /// Burst must prove the stream cap and no more. Above `cap / 0.7`
+    /// is discarded by `set_ceiling` (see `abr::tests::the_stream_bound_clamps_a_learned_ceiling_only`).
     #[test]
     fn the_probe_target_proves_the_stream_cap_without_overshooting_it() {
-        // Real modes, from the smallest a session runs to the largest — including 1440p120, the
-        // field session that walked to 657 Mbps and taught the ABR the cap in the first place.
         for (w, h, hz, codec, depth) in [
             (1280, 720, 60, crate::quic::CODEC_HEVC, 8),
             (1920, 1080, 60, crate::quic::CODEC_H264, 8),
@@ -987,21 +813,15 @@ mod tests {
         ] {
             let cap = crate::abr::stream_ceiling_kbps(w, h, hz, codec, depth, 0);
             let target = probe_target_kbps(cap);
-            // Enough: a link that delivers the whole burst measures `delivered × 0.7`, and that
-            // has to reach the cap or the session can never climb to what its mode allows.
             assert!(
                 target.saturating_mul(7) / 10 >= cap,
                 "{w}x{h}@{hz}: a {target} kbps burst cannot prove a {cap} kbps cap"
             );
-            // …and no more: a target that overshoots what the clamp keeps is pure bufferbloat.
-            // (The old flat 2 Gbps overshot 1440p120 by 6×.)
             assert!(
                 target <= cap.saturating_mul(2),
                 "{w}x{h}@{hz}: {target} kbps chases capacity the clamp discards"
             );
         }
-        // A mode `stream_ceiling_kbps` declines to size (`u32::MAX`) keeps the historic 2 Gbps,
-        // which is also the hard ceiling on the derivation — it can only ever lower the target.
         assert_eq!(probe_target_kbps(u32::MAX), 2_000_000);
         assert_eq!(probe_target_kbps(1_500_000), 2_000_000);
     }
@@ -1016,14 +836,13 @@ mod tests {
         );
         slot.store(401, Ordering::Relaxed);
         assert_eq!(take_pipeline_gap(&slot), Some(401));
-        // The drain is what bounds the damage to ONE window: a rebuild announced once must not
-        // keep discarding windows that were nowhere near it (each discarded window is also a
-        // LossReport the host never gets, and its adaptive FEC reads that silence as a clean link).
+        // Drain bounds discard to one window. Silence would look like
+        // a clean link to host adaptive FEC.
         assert_eq!(take_pipeline_gap(&slot), None);
     }
 
-    /// A client-role session over a loopback that carries nothing — the pump under test is not
-    /// being asked about frames, only about what it does at its report tick.
+    /// Idle client-role loopback. The pump under test is its report tick,
+    /// not frames.
     fn idle_client_session() -> (crate::transport::LoopbackTransport, Session) {
         let (host_tp, client_tp) = crate::transport::loopback_pair(0, 0);
         let cfg = crate::config::Config {
@@ -1041,25 +860,18 @@ mod tests {
             salt: [1, 2, 3, 4],
             loopback_drop_period: 0,
         };
-        // The host end is returned rather than dropped so the link stays whole for the pump's
-        // whole run — a half-torn transport is a different test than this one.
+        // Keep the host end so the link stays whole for the pump's run.
         (host_tp, Session::new(cfg, Box::new(client_tp)).unwrap())
     }
 
-    /// The client half of the host-rebuild repair, end to end: a real [`PipelineGap`] arrives on a
-    /// real control stream, the real control task parks it, and the real pump throws away the
-    /// report window it landed in.
+    /// Host-rebuild repair, end to end: a real [`PipelineGap`] on a real
+    /// control stream, the control task parks it, the pump discards the
+    /// window it landed in.
     ///
-    /// What the assertions watch is the window's LOSS REPORT, because that is the discarded
-    /// window's only externally visible product on an idle session — the ABR feed it also
-    /// suppresses is the very next branch off the same `discard`, and the controller can't be
-    /// coaxed into a visible verdict without traffic to decide about. The suppression matters in
-    /// its own right too: across a gap the window's `loss_ppm` is computed over a denominator of
-    /// nearly nothing, and reporting that figure would have the host raise FEC against a link that
-    /// never dropped anything.
-    ///
-    /// The second window is asserted too, and is half the point: the discard must cover the window
-    /// the gap landed in and then get out of the way.
+    /// Assertions watch the window's LossReport — the discarded window's
+    /// only externally visible product on an idle session. A near-zero
+    /// denominator would have the host raise FEC against a link that
+    /// never dropped. The next window must report: discard is one wide.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn a_host_pipeline_gap_discards_the_report_window_in_flight() {
         let server = crate::quic::endpoint::server("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -1071,9 +883,9 @@ mod tests {
         });
         let client_conn = client.connect(addr, "punktfunk").unwrap().await.unwrap();
         let (_server_ep, host_conn) = accept.await.unwrap();
-        // The host opens the control stream here (in a session the client opens it during the
-        // handshake) purely because this test's host end only ever WRITES: a stream the client
-        // opened would stay invisible to a peer that never sends.
+        // Host opens the control stream (normally the client does during
+        // handshake): this host end only writes, so a client-opened
+        // stream would stay invisible.
         let accept_ctrl = tokio::spawn(async move { client_conn.accept_bi().await.unwrap() });
         let (mut host_send, _host_recv) = host_conn.open_bi().await.unwrap();
         io::write_msg(&mut host_send, &crate::quic::RequestKeyframe.encode())
@@ -1081,10 +893,8 @@ mod tests {
             .expect("open the stream with a message the client ignores");
         let (ctrl_send, ctrl_recv) = accept_ctrl.await.unwrap();
 
-        // The slot the control task writes and the pump drains — the whole subject of the test.
         let pipeline_gap = Arc::new(AtomicU32::new(0));
-        // The control task's own outbound channel: its sender is held to the end of the test so
-        // the task doesn't exit on a closed request channel mid-run.
+        // Hold the sender so the task does not exit on a closed channel.
         let (_task_ctrl_tx, task_ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(8);
         let (clip_event_tx, _clip_event_rx) = std::sync::mpsc::sync_channel(8);
         let (cursor_shape_tx, _cursor_shape_rx) = std::sync::mpsc::sync_channel(8);
@@ -1117,9 +927,8 @@ mod tests {
             .run(),
         );
 
-        // The pump. An EXPLICIT bitrate (not Automatic) keeps both the controller and the startup
-        // capacity probe out of this: the probe would fire at 2 s and discard a window of its own,
-        // which is the other cause of the very flag under test.
+        // Explicit bitrate (not Automatic): keep the controller and the
+        // startup probe out. The probe would discard a window of its own.
         let (pump_ctrl_tx, mut pump_ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(8);
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (_host_tp, session) = idle_client_session();
@@ -1158,7 +967,7 @@ mod tests {
         let started = Instant::now();
         let pump_thread = std::thread::spawn(move || pump.run());
 
-        // Mid-window, the way a rebuild actually lands: 200 ms into a 750 ms window.
+        // Mid-window, as a rebuild actually lands: 200 ms into 750 ms.
         tokio::time::sleep(Duration::from_millis(200)).await;
         io::write_msg(
             &mut host_send,
@@ -1167,8 +976,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Past the first report tick (750 ms), nowhere near the second (1500 ms): the window the
-        // gap landed in must have produced NOTHING. A pump that ignored the gap reports here.
+        // Past the first report tick (750 ms), not the second (1500 ms).
         tokio::time::sleep_until(
             tokio::time::Instant::from_std(started) + Duration::from_millis(1_150),
         )
@@ -1183,8 +991,8 @@ mod tests {
             "and the announcement must be drained, so it can't discard a second window"
         );
 
-        // The NEXT window is clean and must report normally — the discard is one window wide, and
-        // a pump that had wedged instead of discarding would fail here rather than pass above.
+        // Next window must report. A wedged pump would fail here rather
+        // than pass the discard assert above.
         let reported = tokio::time::timeout(Duration::from_millis(1_500), pump_ctrl_rx.recv())
             .await
             .expect("the window after the gap reports on schedule");

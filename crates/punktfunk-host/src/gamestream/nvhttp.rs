@@ -1,12 +1,12 @@
-//! The nvhttp servers: plain HTTP on 47989 and mutual-TLS on 47984. Serves `/serverinfo`,
-//! the `/pair` flow, `/applist`, and `/launch`/`/resume`/`/cancel`. Over HTTPS the client is
-//! mutual-TLS-authenticated, so `/serverinfo` reports `PairStatus=1` there.
+//! GameStream nvhttp: plain HTTP on 47989 and mutual-TLS on 47984.
 //!
-//! The pairing PIN is delivered out-of-band ONLY through the bearer-authenticated management
-//! API (`POST /api/v1/pair/pin`): the operator reads the PIN off the Moonlight client and
-//! types it into the host console. There is deliberately NO unauthenticated nvhttp PIN
-//! endpoint — one would let a network client submit its own displayed PIN and drive the whole
-//! ceremony to a pinned cert with no operator consent (security-review 2026-06-28 #1).
+//! Routes: `/serverinfo`, `/pair`, `/applist`, `/appasset`, `/launch`, `/resume`, `/cancel`.
+//! HTTPS is mTLS; `/serverinfo` reports `PairStatus=1` only for a pinned client cert.
+//!
+//! The PIN is out of band via bearer `POST /api/v1/pair/pin`. Do not add an nvhttp PIN
+//! route — a client could submit the PIN it already displays and pin its own cert.
+//!
+//! Pairing and grants: `design/per-client-access.md`.
 
 use super::tls::{PeerAddr, PeerCertFingerprint};
 use super::{serverinfo, AppState, LaunchSession, HTTPS_PORT, HTTP_PORT, RTSP_PORT};
@@ -23,23 +23,19 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// Which listener a request arrived on — HTTPS means a mutual-TLS-authenticated client.
+/// HTTPS listener: the client presented a cert (mTLS). HTTP is never paired.
 #[derive(Clone, Copy)]
 struct Https(bool);
 
 pub async fn run(state: Arc<AppState>) -> Result<()> {
-    // Mutual-TLS: request + verify the client cert (Moonlight presents one for the
-    // post-pairing pairchallenge + all post-pair endpoints).
+    // Request and verify the client cert; Moonlight presents one after pairing.
     let tls = super::tls::server_config(&state.identity.cert_pem, &state.identity.key_pem)?;
 
     let http_addr = SocketAddr::from(([0, 0, 0, 0], HTTP_PORT));
     let https_addr = SocketAddr::from(([0, 0, 0, 0], HTTPS_PORT));
     tracing::info!(%http_addr, %https_addr, "nvhttp listening (serverinfo + pair + launch)");
 
-    // Both listeners run the governed acceptor (connection ceilings + header deadlines;
-    // security-review 2026-08-31 M-6). HTTPS additionally runs the handshake itself so handlers
-    // see the verified peer cert as a PeerCertFingerprint extension; the post-pair endpoints
-    // gate on the paired allow-list.
+    // HTTPS handshake attaches `PeerCertFingerprint`; post-pair routes gate on the allow-list.
     tokio::try_join!(
         super::tls::serve_plain(http_addr, router(state.clone(), false)),
         super::tls::serve_https(https_addr, router(state, true), tls),
@@ -47,9 +43,7 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
-/// True iff the request arrived over HTTPS with a client cert whose SHA-256 fingerprint is pinned
-/// in the paired allow-list. Plain-HTTP requests carry no client cert and are never paired. This is
-/// the post-handshake authorization check (Apollo's `get_verified_cert`) gating the launch surface.
+/// Pinned SHA-256 of the HTTPS client cert. HTTP has no cert, so never paired.
 fn peer_is_paired(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) -> bool {
     let Some(Extension(PeerCertFingerprint(Some(fp)))) = peer else {
         return false;
@@ -61,8 +55,7 @@ fn peer_is_paired(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) 
         .any(|der| hex::encode(punktfunk_core::quic::endpoint::cert_fingerprint(der)) == *fp)
 }
 
-/// The peer's client-cert fingerprint as raw bytes — the form [`LaunchSession::owner_fp`] stores.
-/// `None` when no (or a blank/short) cert was presented.
+/// Hex fingerprint as the 32-byte form [`LaunchSession::owner_fp`] stores.
 fn peer_fp(peer: &Option<Extension<PeerCertFingerprint>>) -> Option<[u8; 32]> {
     match peer {
         Some(Extension(PeerCertFingerprint(Some(fp)))) => hex::decode(fp)
@@ -72,37 +65,29 @@ fn peer_fp(peer: &Option<Extension<PeerCertFingerprint>>) -> Option<[u8; 32]> {
     }
 }
 
-/// The grant mask the verified HTTPS peer is authorized for *right now*, resolved against the
-/// shared grants registry (design/per-client-access.md §8, WP13). `None` = an EXPIRED grants
-/// record — the launch surface fails that closed exactly like an unpaired cert. A fingerprint
-/// with NO record is ungoverned (`Some(GRANT_ALL)`): the Moonlight plane's pairing authority
-/// is its own cert list, so existing pairings keep full control (plan §8 risk table) — but a
-/// record that exists (created via the console) governs. Consulted only AFTER
-/// [`peer_is_paired`], which is why a certless peer resolves to expired-shaped `None` here:
-/// it can never reach this gate with the pairing gate intact, and if it somehow did, failing
-/// closed is the right wrong answer.
+/// Effective grant mask for this HTTPS peer. `None` is expired — fail closed like unpaired.
+/// No registry row is ungoverned (`GRANT_ALL`); a console-created row governs. Certless
+/// peers also return `None` (they never pass [`peer_is_paired`]). See
+/// `design/per-client-access.md`.
 fn peer_grants(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) -> Option<u32> {
     let Some(Extension(PeerCertFingerprint(Some(fp)))) = peer else {
         return None;
     };
     match st.access.get() {
         Some(np) => np.moonlight_effective(fp, super::wall_unix_now()),
-        // No registry wired (tests / embedders that never call `serve`): pre-grants behavior.
+        // No registry (tests / embedders that skip `serve`): pre-grants = full control.
         None => Some(GRANT_ALL),
     }
 }
 
-/// Whether the caller may control (resume/cancel) the current launch session. `true` when there is
-/// no session (nothing to protect — keeps cancel idempotent), or the session's owner fingerprint
-/// matches the caller's. Only a paired-but-DIFFERENT client with a known, mismatching fingerprint is
-/// rejected — so a same-client control action always succeeds, but one paired client can no longer
-/// resume or cancel *another* paired client's session (security-review 2026-07-17).
+/// Resume/cancel: true if there is no session, fingerprints match, or either side is unknown.
+/// Unknown fingerprints fail open so a same-client control is never locked out.
 fn peer_may_control_session(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) -> bool {
     match st.launch.lock().unwrap().as_ref() {
         None => true,
         Some(session) => match (session.owner_fp, peer_fp(peer)) {
             (Some(owner), Some(caller)) => owner == caller,
-            // Owner or caller fingerprint unknown → the `peer_is_paired` gate already applied stands.
+            // Unknown fp: pairing already passed; fail open.
             _ => true,
         },
     }
@@ -130,11 +115,8 @@ async fn h_serverinfo(
     Extension(Https(https)): Extension<Https>,
     peer: Option<Extension<PeerCertFingerprint>>,
 ) -> impl IntoResponse {
-    // PairStatus=1 only when the HTTPS peer presented a *pinned* client cert; an unpaired client
-    // (or plain HTTP) sees 0 and is steered into the pairing flow.
     let paired = https && peer_is_paired(&peer, &st);
-    // The running app id, visible to the session OWNER only (WP3 — see `owner_current_game` /
-    // the rationale on `serverinfo_xml`). This is what makes Moonlight show Resume/Quit.
+    // Owner-only `currentgame`: Moonlight uses it to show Resume/Quit.
     let current_game = if paired {
         owner_current_game(&st.launch.lock().unwrap(), peer_fp(&peer))
     } else {
@@ -148,11 +130,9 @@ async fn h_serverinfo(
     ))
 }
 
-/// The `currentgame` a given caller may see: the live session's appid iff the caller IS the
-/// session owner (fingerprints known on both sides and equal), else 0. Pure — unit-tested.
-/// Stricter than [`peer_may_control_session`] on purpose: that gate fails OPEN when a
-/// fingerprint is unknown (so a same-client control action can't be locked out), but an
-/// ADVERTISEMENT fails closed — an unknown owner is nobody's business to see.
+/// `currentgame` for this caller: the live appid only when both fingerprints are known and
+/// equal, else 0. Stricter than [`peer_may_control_session`]: unknown fps fail closed here
+/// (advertisement) but open there (control).
 fn owner_current_game(launch: &Option<LaunchSession>, caller: Option<[u8; 32]>) -> u32 {
     match (launch, caller) {
         (Some(s), Some(fp)) if s.owner_fp == Some(fp) => s.appid,
@@ -171,11 +151,8 @@ async fn h_applist(
     xml(super::apps::applist_xml())
 }
 
-/// Box-art cover proxy (`/appasset?appid=N&AssetType=2&AssetIdx=0`). Moonlight fetches per-app covers
-/// from the HOST, so we resolve the appid to its library title and proxy the cover image bytes (Steam/
-/// Epic CDN, etc.). 404 for Desktop / apps.json entries (no art) or any fetch failure — Moonlight then
-/// shows its title-only placeholder. Paired clients only (same gate as `/applist`). The resolve+fetch is
-/// blocking (disk + network), so it runs on a blocking thread off the async runtime.
+/// Cover bytes for `appid`. Fetch is disk+network, so `spawn_blocking`. 404 (Desktop, no art,
+/// or fetch failure) is Moonlight's title-only placeholder.
 async fn h_appasset(
     State(st): State<Arc<AppState>>,
     peer: Option<Extension<PeerCertFingerprint>>,
@@ -204,11 +181,8 @@ async fn h_launch(
         tracing::warn!("launch rejected — client is not paired");
         return xml(error_xml()).into_response();
     }
-    // Per-client access (WP13, design §8): LAUNCH + expiry beside the pairing gate. An expired
-    // grants record fails closed exactly like an unpaired cert; a Controller-only record (no
-    // LAUNCH bit) is refused too — on GameStream, launch IS the session, there is no owner-
-    // launched session to join. The protocol has no reject vocabulary, so the client just sees
-    // the generic error and the story lives in the console (silent enforcement, accepted).
+    // GRANT_LAUNCH + unexpired, besides pairing. GameStream has no join of an owner-launched
+    // session, and no reject vocabulary — the client sees the generic error XML.
     match peer_grants(&peer, &st) {
         Some(g) if g & GRANT_LAUNCH != 0 => {}
         Some(_) => {
@@ -222,9 +196,7 @@ async fn h_launch(
     }
     let req_fp: Option<[u8; 32]> = peer_fp(&peer);
 
-    // Mode-conflict ADMISSION (Stage 4) — GameStream is single-session (`st.launch`), so a DIFFERENT
-    // paired client launching while a session is live is governed by `mode_conflict` (see
-    // [`gamestream_admission`]). Snapshot the live owner + mode (Copy) so the lock isn't held over it.
+    // Snapshot owner + mode (Copy) so the launch lock is not held over admission.
     let mut forced_mode: Option<(u32, u32, u32)> = None;
     {
         let live = st
@@ -233,8 +205,8 @@ async fn h_launch(
             .unwrap()
             .as_ref()
             .map(|s| (s.owner_fp, (s.width, s.height, s.fps)));
-        // Same Windows default as the native path (separate → reject; see `effective_conflict`) so a
-        // 2nd Moonlight client gets a clean 503 rather than wedging the shared monitor's capture.
+        // Native default: `separate` → reject. A second Moonlight client then gets 503
+        // instead of wedging the shared monitor's capture.
         let conflict = crate::vdisplay::admission::effective_conflict();
         match gamestream_admission(live, req_fp, conflict) {
             GsDecision::Serve => {}
@@ -255,7 +227,7 @@ async fn h_launch(
 
     match launch(&st, &q) {
         Ok(mut session) => {
-            // Bind the (unauthenticated) RTSP/UDP media plane to this paired client's source IP.
+            // Bind unauthenticated RTSP/UDP to this paired client's source IP.
             session.peer_ip = addr.map(|Extension(PeerAddr(a))| a.ip());
             session.owner_fp = req_fp;
             if let Some((w, h, f)) = forced_mode {
@@ -263,14 +235,10 @@ async fn h_launch(
                 session.height = h;
                 session.fps = f;
             }
-            // A new session starts undecided: whatever ended the last one says nothing about this
-            // one (see `AppState::quit`). The game this launch reclaims — if this client left one
-            // waiting out its reconnect window — is reprieved by the stream thread, which resolves
-            // the title anyway and so needs no second library scan here.
+            // New session: last quit reason does not apply (`AppState::quit`).
             st.quit.store(false, std::sync::atomic::Ordering::SeqCst);
-            // Fresh A/V ping payload for this session, before the client's RTSP SETUP asks for it:
-            // it is what the media planes use to tell this client's first datagram apart from any
-            // other arriving at the port from the same address.
+            // Mint ping before RTSP SETUP. Media planes use it to tell this client's first
+            // datagram from others at the same address.
             st.mint_av_ping();
             *st.launch.lock().unwrap() = Some(session);
             tracing::info!(
@@ -300,8 +268,7 @@ async fn h_resume(
         tracing::warn!("resume rejected — client is not paired");
         return xml(error_xml());
     }
-    // Same access gate as `/launch` (WP13): resuming re-attaches the full input/media planes,
-    // so it needs the same LAUNCH grant, and expiry fails closed like unpaired.
+    // Resume re-attaches input and media, so the same GRANT_LAUNCH + expiry gate as `/launch`.
     match peer_grants(&peer, &st) {
         Some(g) if g & GRANT_LAUNCH != 0 => {}
         Some(_) => {
@@ -317,13 +284,9 @@ async fn h_resume(
         tracing::warn!("resume rejected — caller does not own the session");
         return xml(error_xml());
     }
-    // RESTART the media planes for this connection (WP3). Moonlight resumes with a fresh RTSP
-    // handshake, but a PLAY that finds `streaming` still true takes its "already running"
-    // branch — the old threads keep streaming at the VANISHED endpoint and the resumed client
-    // gets no media. Clear the run flags and WAIT (bounded) for the old threads' full exit:
-    // their teardown must complete before the successor's threads start, or the two race over
-    // the pooled capturer and the old exit path stomps the new session's flags. A timeout
-    // proceeds anyway — worst case is exactly the old (media-less) behavior.
+    // PLAY skips if `streaming` is still true. Clear flags and wait for exit so teardown
+    // cannot stomp the new session's capturer/flags. 2 s bound: do not hang; timeout is
+    // the old media-less outcome. 20 ms poll is well under thread-exit time.
     let before = st.media_exited.load(std::sync::atomic::Ordering::SeqCst);
     let expected = u64::from(
         st.streaming
@@ -346,16 +309,10 @@ async fn h_resume(
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
-    // RE-KEY the session with the fresh rikey/rikeyid this resume carries (WP3 — the handler
-    // used to read no query params at all). A resuming Moonlight mints NEW session keys and
-    // derives its control-GCM and audio-CBC state from them; keeping the original launch's
-    // keys meant every post-resume control packet failed decrypt and audio decoded to noise.
-    // Keys present → they replace the session's; malformed → refuse the resume (streaming
-    // against keys the client doesn't hold is a worse failure than a clean error); absent →
-    // keep the current keys (nothing claimed otherwise). `surroundAudioInfo` needs no reading
-    // here: the RTSP ANNOUNCE that follows re-negotiates audio for the new connection anyway.
-    // The launch may have been cleared by the old threads' client-unreachable teardown while
-    // we waited — then there is nothing to resume, and the client falls back to `/launch`.
+    // Resume mints new rikey; control-GCM and audio-CBC derive from it. Present → replace;
+    // malformed → refuse (streaming on keys the client does not hold is worse); absent → keep.
+    // Teardown during the wait can clear `launch`. ANNOUNCE re-negotiates audio — ignore
+    // surroundAudioInfo here.
     {
         let mut launch = st.launch.lock().unwrap();
         let Some(session) = launch.as_mut() else {
@@ -377,15 +334,13 @@ async fn h_resume(
                 }
             }
         }
-        // Re-bind the media/RTSP source-IP filters to where the client resumes FROM — a device
-        // that moved networks (Wi-Fi → ethernet) resumes instead of being filtered out.
+        // Re-bind RTSP/media IP filters to the resume source; the client may have changed networks.
         if let Some(Extension(PeerAddr(a))) = addr {
             session.peer_ip = Some(a.ip());
         }
     }
-    // A resume is a new connection with a new RTSP handshake and new media threads, so it gets a
-    // new ping payload too — the old one may have been observed on the wire (RTSP is plaintext
-    // until `SS_ENC_CONTROL_V2`), and nothing that learns an endpoint after this point has seen it.
+    // New ping: RTSP is plaintext until `SS_ENC_CONTROL_V2`, so the previous payload may
+    // already be on the wire.
     st.mint_av_ping();
     xml(session_url_xml(&st, "resume"))
 }
@@ -398,11 +353,8 @@ async fn h_cancel(
         tracing::warn!("cancel rejected — client is not paired");
         return xml(error_xml());
     }
-    // Expiry gates `/cancel` likewise (an expired record fails closed exactly like unpaired) —
-    // but the LAUNCH bit deliberately does NOT: cancel is Moonlight's "Quit App", a teardown,
-    // and `peer_may_control_session` below already restricts it to the session's owner. Denying
-    // a mid-session-downgraded owner its own quit would only wedge the session it is trying to
-    // end — ending sessions is what enforcement *wants*.
+    // Expiry fails closed; GRANT_LAUNCH does not apply. Cancel is Quit App for the owner
+    // (`peer_may_control_session`); denying it wedges the session they are ending.
     if peer_grants(&peer, &st).is_none() {
         tracing::warn!("cancel rejected — this client's access has expired");
         return xml(error_xml());
@@ -411,18 +363,13 @@ async fn h_cancel(
         tracing::warn!("cancel rejected — caller does not own the session");
         return xml(error_xml());
     }
-    // Quit semantics, and now literally so: `/cancel` is Moonlight's "Quit App" — a decision, not a
-    // drop. The shared full teardown (launch cleared + both media threads stop on their flags) runs
-    // with the session's quit flag set, so the virtual display skips its keep-alive linger and the
-    // end-game-on-session-end policy treats this as the operator asking. The virtual
-    // output/gamescope teardown follows via the capturer's RAII.
+    // `/cancel` is Quit App, not a drop: `quit_session` sets the quit flag so the virtual
+    // display skips keep-alive linger and end-game policy treats it as operator intent.
     st.quit_session("client /cancel");
     xml("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\"><cancel>1</cancel></root>\n".to_string())
 }
 
-/// Parse the `rikey`/`rikeyid` pair out of a `/launch` or `/resume` query: the 16-byte AES
-/// session key (hex) every media/control crypto derives from, and the signed 32-bit key id
-/// (negative values wrap to a big-endian u32 IV later).
+/// `rikey` (16-byte AES hex) and signed `rikeyid` (negative values wrap to a BE u32 IV).
 fn parse_rikey(q: &HashMap<String, String>) -> Result<([u8; 16], i32)> {
     let rikey = q.get("rikey").ok_or_else(|| anyhow!("missing rikey"))?;
     let key_bytes = hex::decode(rikey).context("rikey hex")?;
@@ -435,7 +382,6 @@ fn parse_rikey(q: &HashMap<String, String>) -> Result<([u8; 16], i32)> {
     Ok((gcm_key, rikeyid))
 }
 
-/// Parse the `/launch` query (rikey/rikeyid/mode) into a [`LaunchSession`].
 fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> {
     let (gcm_key, rikeyid) = parse_rikey(q)?;
     let (width, height, fps) = q
@@ -450,12 +396,12 @@ fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> 
         height,
         fps,
         appid,
-        peer_ip: None,  // set by `h_launch` from the verified HTTPS peer address
-        owner_fp: None, // set by `h_launch` from the verified HTTPS peer cert fingerprint
+        peer_ip: None,  // `h_launch` fills from the verified HTTPS peer
+        owner_fp: None, // `h_launch` fills from the client cert
     })
 }
 
-/// `"1920x1080x60"` → `(1920, 1080, 60)`.
+/// GameStream `mode`: `"WxHxFPS"`.
 fn parse_mode(mode: &str) -> Option<(u32, u32, u32)> {
     let mut it = mode.split('x');
     let w = it.next()?.parse().ok()?;
@@ -464,25 +410,21 @@ fn parse_mode(mode: &str) -> Option<(u32, u32, u32)> {
     Some((w, h, fps))
 }
 
-/// A live GameStream session's `(owner cert fingerprint, mode)` snapshot for [`gamestream_admission`].
+/// `(owner_fp, mode)` snapshot for [`gamestream_admission`].
 type LiveGs = (Option<[u8; 32]>, (u32, u32, u32));
 
-/// The outcome of [`gamestream_admission`].
 enum GsDecision {
-    /// Proceed with the launch (no live session, a same-client re-launch, or `steal`/`separate`
-    /// taking over the single session).
+    /// No session, same client, or `steal`/`separate` taking the one session.
     Serve,
-    /// Serve at the live session's mode (`join` — honest-downgrade).
+    /// Admit at the live mode (`join`).
     Join((u32, u32, u32)),
-    /// Refuse with a 503 (`reject`).
+    /// 503 (`reject`).
     Reject,
 }
 
-/// The GameStream single-session mode-conflict decision (Stage 4, pure so it's unit-tested). `live`
-/// is the currently-live session's `(owner_fp, mode)` (`None` ⇒ no session live). No session or a
-/// same-client re-launch ⇒ `Serve`; a DIFFERENT client launching applies `policy` — `reject` ⇒
-/// `Reject`, `join` ⇒ `Join` the live mode, `steal`/`separate` (GameStream has no separate) ⇒ `Serve`
-/// (take over the one session).
+/// Single-session mode-conflict. No session or same client → Serve. A different client
+/// applies `policy`; GameStream has no `separate`, so `steal`/`separate` both Serve
+/// (take the one session).
 fn gamestream_admission(
     live: Option<LiveGs>,
     req_fp: Option<[u8; 32]>,
@@ -494,7 +436,7 @@ fn gamestream_admission(
     };
     let different = match (owner, req_fp) {
         (Some(o), Some(r)) => o != r,
-        _ => true, // unknown owner or anonymous requester → treat as a different client
+        _ => true, // unknown owner or anonymous requester: treat as a different client
     };
     if !different {
         return GsDecision::Serve;
@@ -551,11 +493,8 @@ async fn h_pair(
             _ => Ok(pair_error_xml()),
         }
     } else if phrase == Some("pairchallenge") {
-        // The ceremony's last step, which Moonlight makes over the TLS port with the cert phase 4
-        // has just pinned — so the pinned handshake is the proof, and only a pinned caller is told
-        // it is paired. Anyone else (the plain-HTTP listener, or an HTTPS peer presenting a cert
-        // that is not in the allow-list) gets the same answer an unpaired host gives, so this
-        // endpoint asserts no pairing the caller does not hold (security-review 2026-08-25).
+        // Last step is over TLS with the just-pinned cert. Only a pinned caller is told they
+        // are paired; HTTP or an unpinned cert get the unpaired answer.
         if peer_is_paired(&peer, &st) {
             Ok(paired_ok_xml())
         } else {
@@ -568,10 +507,8 @@ async fn h_pair(
         st.pairing.serverchallengeresp(&st.identity, &uniqueid, v)
     } else if let Some(v) = q.get("clientpairingsecret") {
         let r = st.pairing.clientpairingsecret(&uniqueid, v, &st.paired);
-        // Phase 4 may just have pinned the FIRST pairing — bring the ENet control port up now
-        // (idempotent; rust-safety WP0) so this client's imminent /launch finds the control
-        // stream listening. Moonlight connects control before video, so "eventually up" would
-        // be an aborted session.
+        // First pairing: bring ENet control up now (idempotent). Moonlight connects control
+        // before video; waiting would abort the session.
         if let Err(e) = super::sync_control(&st) {
             tracing::warn!(error = %format!("{e:#}"), "control port sync after pairing failed");
         }
@@ -625,15 +562,12 @@ mod tests {
         hex::encode(punktfunk_core::quic::endpoint::cert_fingerprint(der))
     }
 
-    /// The launch surface (launch/resume/applist/cancel) must reject any client whose cert
-    /// fingerprint is not in the paired allow-list — including a certless (plain-HTTP) peer.
     #[test]
     fn launch_gate_requires_a_pinned_client_cert() {
         let st = test_state();
         let der = b"a-client-cert-der".to_vec();
         let peer = Some(Extension(PeerCertFingerprint(Some(fp_of(&der)))));
 
-        // Empty allow-list: a presented cert, an absent extension, and an explicit None all fail.
         assert!(!peer_is_paired(&peer, &st), "unknown cert must be rejected");
         assert!(
             !peer_is_paired(&None, &st),
@@ -644,7 +578,6 @@ mod tests {
             "certless HTTPS peer must be rejected"
         );
 
-        // After pinning, the same fingerprint is accepted but a different cert still isn't.
         st.paired.lock().unwrap().push(der);
         assert!(peer_is_paired(&peer, &st), "pinned cert must be accepted");
         let other = Some(Extension(PeerCertFingerprint(Some(fp_of(
@@ -656,10 +589,6 @@ mod tests {
         );
     }
 
-    /// `pairchallenge` is the ceremony's last step and Moonlight makes it over the TLS port with
-    /// the cert phase 4 just pinned, so only a pinned caller is told it is paired. A plain-HTTP
-    /// scanner (no client cert at all) and an HTTPS peer with an unpinned cert both get the
-    /// unpaired answer — the endpoint must not assert a pairing the caller does not hold.
     #[tokio::test]
     async fn pairchallenge_answers_only_a_pinned_client() {
         async fn challenge(
@@ -680,7 +609,6 @@ mod tests {
         let der = b"pairchallenge-client-der".to_vec();
         let peer = Some(Extension(PeerCertFingerprint(Some(fp_of(&der)))));
 
-        // Plain HTTP (no cert) and an unpinned HTTPS cert both answer as an unpaired host.
         let plain = challenge(&st, None).await;
         assert!(plain.contains("<paired>0</paired>"), "plain HTTP: {plain}");
         let unpinned = challenge(&st, peer.clone()).await;
@@ -689,7 +617,6 @@ mod tests {
             "unpinned cert: {unpinned}"
         );
 
-        // Once phase 4 has pinned the cert, the real client's last step still succeeds.
         st.paired.lock().unwrap().push(der);
         let pinned = challenge(&st, peer).await;
         assert!(pinned.contains("<paired>1</paired>"), "pinned: {pinned}");
@@ -700,17 +627,14 @@ mod tests {
         use crate::vdisplay::policy::ModeConflict;
         let (a, b) = ([1u8; 32], [2u8; 32]);
         let live = Some((Some(a), (2560, 1440, 120)));
-        // No live session → always Serve.
         assert!(matches!(
             gamestream_admission(None, Some(b), ModeConflict::Reject),
             GsDecision::Serve
         ));
-        // Same-client re-launch → Serve regardless of policy.
         assert!(matches!(
             gamestream_admission(live, Some(a), ModeConflict::Reject),
             GsDecision::Serve
         ));
-        // A DIFFERENT client applies the policy.
         assert!(matches!(
             gamestream_admission(live, Some(b), ModeConflict::Reject),
             GsDecision::Reject
@@ -727,14 +651,13 @@ mod tests {
             gamestream_admission(live, Some(b), ModeConflict::Separate),
             GsDecision::Serve
         ));
-        // Anonymous requester (no cert presented) is treated as a different client.
+        // No cert: treat as a different client.
         assert!(matches!(
             gamestream_admission(live, None, ModeConflict::Reject),
             GsDecision::Reject
         ));
     }
 
-    /// A fresh grants registry backed by a per-test temp store.
     fn test_registry(
         tag: &str,
     ) -> (
@@ -752,10 +675,6 @@ mod tests {
         (np, p)
     }
 
-    /// WP13's resolution rule at the nvhttp gate: no grants record = ungoverned full control
-    /// (existing Moonlight pairings keep today's behavior); a record that exists governs; an
-    /// expired record resolves `None` — the shape the handlers fail closed exactly like
-    /// unpaired. Certless peers resolve `None` too (they never pass `peer_is_paired` anyway).
     #[test]
     fn peer_grants_resolution_rule() {
         use crate::native_pairing::Access;
@@ -765,14 +684,11 @@ mod tests {
         let fp_hex = fp_of(&der);
         let peer = Some(Extension(PeerCertFingerprint(Some(fp_hex.clone()))));
 
-        // No registry wired (an AppState that never went through `serve`): pre-grants behavior.
         assert_eq!(peer_grants(&peer, &st), Some(GRANT_ALL));
 
         let (np, store) = test_registry("rule");
         assert!(st.access.set(np.clone()).is_ok());
-        // Registry wired, no record: ungoverned.
         assert_eq!(peer_grants(&peer, &st), Some(GRANT_ALL));
-        // A Controller-only record governs — LAUNCH absent.
         np.add_with_access(
             "Guest",
             &fp_hex,
@@ -784,7 +700,6 @@ mod tests {
         .unwrap();
         assert_eq!(peer_grants(&peer, &st), Some(GRANT_GAMEPAD));
         assert_eq!(peer_grants(&peer, &st).unwrap() & GRANT_LAUNCH, 0);
-        // Expired: the fail-closed shape.
         np.set_access(
             &fp_hex,
             Access {
@@ -794,8 +709,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(peer_grants(&peer, &st), None);
-        // Certless peer: `None` — it can never reach the grants gate past `peer_is_paired`,
-        // and failing closed is the right wrong answer if it somehow did.
         assert_eq!(peer_grants(&None, &st), None);
         assert_eq!(
             peer_grants(&Some(Extension(PeerCertFingerprint(None))), &st),
@@ -804,10 +717,6 @@ mod tests {
         let _ = std::fs::remove_file(&store);
     }
 
-    /// The WP13 acceptance at handler level: `/resume` (same gate as `/launch`) works for a
-    /// paired client with no grants record (stock back-compat), refuses a Controller-only
-    /// record (no LAUNCH), refuses an expired record exactly like unpaired — and `/cancel`
-    /// gates on expiry only, so a re-granted limited client can still quit its own session.
     #[tokio::test]
     async fn resume_and_cancel_honor_grants_and_expiry() {
         use crate::native_pairing::Access;
@@ -840,7 +749,6 @@ mod tests {
         };
         *st.launch.lock().unwrap() = Some(session);
 
-        // No grants record: a stock Moonlight pairing resumes exactly as today.
         let ok = body_of(
             h_resume(State(st.clone()), peer.clone(), None, Query(HashMap::new()))
                 .await
@@ -849,7 +757,6 @@ mod tests {
         .await;
         assert!(ok.contains("<resume>1</resume>"), "ungoverned resume: {ok}");
 
-        // Controller-only record: the LAUNCH bit is missing — refused.
         let now = super::super::wall_unix_now();
         np.add_with_access(
             "Guest",
@@ -868,7 +775,6 @@ mod tests {
         .await;
         assert!(!no.contains("<resume>1</resume>"), "no-LAUNCH resume: {no}");
 
-        // Expired full record: fails closed exactly like unpaired — for /resume AND /cancel.
         np.set_access(
             &fp_hex,
             Access {
@@ -896,8 +802,7 @@ mod tests {
             "a refused cancel must not tear the session down"
         );
 
-        // Re-granted Controller-only (unexpired, still no LAUNCH): /cancel is deliberately NOT
-        // LAUNCH-gated — the session's owner may always quit its own app.
+        // Owner cancel is not GRANT_LAUNCH-gated: a limited client can still quit.
         np.set_access(
             &fp_hex,
             Access {
@@ -917,9 +822,8 @@ mod tests {
         let _ = std::fs::remove_file(&store);
     }
 
-    /// WP3: `currentgame` is advertised to the session OWNER only. A non-owner (or an unknown
-    /// fingerprint on either side) keeps seeing free/0 — which is what keeps it on the `/launch`
-    /// path and the reject/join/steal admission, instead of routing into owner-only `/resume`.
+    /// Non-owner / unknown fp sees `currentgame=0`, so Moonlight stays on `/launch` (admission)
+    /// instead of owner-only `/resume`.
     #[test]
     fn current_game_is_owner_scoped() {
         let owner = [7u8; 32];
@@ -936,20 +840,14 @@ mod tests {
                 owner_fp,
             })
         };
-        // The owner sees the running app.
         assert_eq!(owner_current_game(&session(Some(owner)), Some(owner)), 4242);
-        // A different paired client sees a free host.
         assert_eq!(owner_current_game(&session(Some(owner)), Some(other)), 0);
-        // Unknown fingerprints — either side — fail CLOSED (unlike the control gate).
+        // Unknown fps fail closed here (unlike the control gate).
         assert_eq!(owner_current_game(&session(None), Some(owner)), 0);
         assert_eq!(owner_current_game(&session(Some(owner)), None), 0);
-        // No session: free.
         assert_eq!(owner_current_game(&None, Some(owner)), 0);
     }
 
-    /// WP3: a resume carrying a fresh `rikey`/`rikeyid` RE-KEYS the live session (control GCM +
-    /// audio CBC derive from it — stale keys made every post-resume packet undecryptable); a
-    /// malformed rikey refuses the resume; a keyless resume keeps the current keys.
     #[tokio::test]
     async fn resume_rekeys_the_session() {
         async fn body_of(resp: Response) -> String {
@@ -975,7 +873,6 @@ mod tests {
             owner_fp: Some(owner_fp),
         });
 
-        // Fresh keys on the query → the session now carries them.
         let mut q = HashMap::new();
         q.insert("rikey".to_string(), "22".repeat(16));
         q.insert("rikeyid".to_string(), "-5".to_string());
@@ -993,7 +890,6 @@ mod tests {
             assert_eq!(s.rikeyid, -5);
         }
 
-        // Malformed rikey → refused, and the session's keys stay what they were.
         let mut bad = HashMap::new();
         bad.insert("rikey".to_string(), "zz".to_string());
         let no = body_of(
@@ -1008,7 +904,6 @@ mod tests {
             [0x22; 16]
         );
 
-        // No rikey at all → resume succeeds on the current keys (nothing claimed otherwise).
         let ok = body_of(
             h_resume(State(st.clone()), peer.clone(), None, Query(HashMap::new()))
                 .await

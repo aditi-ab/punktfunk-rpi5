@@ -1,50 +1,41 @@
-//! Shared TLS trust primitives for the punktfunk clients: the certificate-fingerprint hash and
-//! the one canonical fingerprint-pinning [`ServerCertVerifier`](rustls::client::danger::ServerCertVerifier)
-//! (`PinVerify`). Trust across the whole system is the SHA-256 of the host's self-signed leaf cert
-//! (TOFU-pinned), not a CA chain — and this verifier is what the QUIC connect, the game-library
-//! HTTP client, and the tray status poll all share, instead of hand-rolling it three times on a
-//! trust boundary. Behind the light `tls` feature (rustls + sha2 only — no QUIC runtime), which
-//! the heavier `quic` feature pulls in.
+//! Certificate-fingerprint hash and the fingerprint-pinning
+//! [`ServerCertVerifier`](rustls::client::danger::ServerCertVerifier) (`PinVerify`).
+//! Trust is the SHA-256 of the host's self-signed leaf (TOFU-pinned), not a CA
+//! chain. QUIC connect, game-library HTTP, and the tray status poll share this
+//! verifier. Behind the light `tls` feature (rustls + sha2, no QUIC runtime);
+//! the heavier `quic` feature pulls it in.
 
 use std::sync::{Arc, Mutex};
 
-/// A blocking HTTP agent over a caller-built `rustls::ClientConfig` — the only way to give an
-/// HTTP client the [`PinVerify`] verifier below.
+/// Blocking HTTP agent over a caller-built `rustls::ClientConfig`, so HTTP can
+/// use [`PinVerify`].
 #[cfg(feature = "ureq-tls")]
 pub mod ureq_agent;
 
 /// Install aws-lc-rs as this process's rustls provider. Call once, early, from `main`.
 ///
-/// aws-lc-rs is currently the ONLY backend in the tree, so rustls can infer it and this call is
-/// belt-and-braces rather than load-bearing. It is kept because the inference is what breaks
-/// first: the moment any dependency drags a second backend in — which is exactly what `ureq 2`
-/// used to do, naming `rustls/ring` in its own dependency line where no dependent could switch it
-/// off — rustls stops guessing, and every config built through `ClientConfig::builder()` rather
-/// than `builder_with_provider` **panics** instead of picking one. Calling this makes the choice
-/// explicit and survives that. Idempotent: losing the race to another installer is the expected
-/// outcome, not an error, since every caller in this workspace installs the same provider.
+/// A second rustls backend in the tree makes `ClientConfig::builder()` panic
+/// instead of inferring one; this call makes the choice explicit. Idempotent:
+/// losing the race to another installer is expected — every caller here installs
+/// the same provider.
 pub fn install_default_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-/// SHA-256 of a certificate's DER encoding — the fingerprint clients pin. Re-exported as
+/// SHA-256 of the certificate DER — the fingerprint clients pin. Re-exported as
 /// `crate::quic::endpoint::cert_fingerprint` for callers that already reach it there.
 pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
     use sha2::Digest;
     sha2::Sha256::digest(cert_der).into()
 }
 
-/// Fingerprint-pinning verifier: trust is the SHA-256 of the host's (self-signed) leaf cert,
-/// not a CA chain.
+/// Fingerprint-pinning verifier. `pin = Some(sha256)` rejects a leaf that does
+/// not hash to `sha256`; `pin = None` accepts any leaf (TOFU) — pair with
+/// [`with_observed`](Self::with_observed) so the embedder can persist and pin later.
 ///
-/// - `pin = Some(sha256)` rejects any host whose leaf doesn't hash to `sha256`.
-/// - `pin = None` accepts any leaf (trust-on-first-use) — pair with [`with_observed`](Self::with_observed)
-///   to record what was seen so the embedder can persist it and pin it from then on.
-///
-/// The handshake signatures are ALWAYS verified for real even though the cert is pinned:
-/// `CertificateVerify` is what proves the peer *holds the pinned cert's private key* — skip it and
-/// an active MITM can replay the host's (public) certificate, match the pin, and complete the
-/// handshake with its own key.
+/// Handshake signatures are still verified: `CertificateVerify` proves the peer
+/// holds the pinned cert's private key. Skip it and a MITM can replay the
+/// (public) cert, match the pin, and finish with its own key.
 #[derive(Debug)]
 pub struct PinVerify {
     pin: Option<[u8; 32]>,
@@ -52,9 +43,8 @@ pub struct PinVerify {
 }
 
 impl PinVerify {
-    /// A verifier that pins `pin` (or accepts any when `None`) without recording what it saw —
-    /// the HTTP clients, which connect with a known pin or accept-any and never need to persist
-    /// the observed fingerprint.
+    /// Pin `pin` (or accept any when `None`) without recording the leaf. HTTP
+    /// clients use this: known pin or accept-any, nothing to persist.
     pub fn new(pin: Option<[u8; 32]>) -> Self {
         Self {
             pin,
@@ -62,9 +52,8 @@ impl PinVerify {
         }
     }
 
-    /// Like [`new`](Self::new) but also writes the observed leaf fingerprint into `slot` during
-    /// the handshake, so a trust-on-first-use caller (the QUIC connect) can read it off the slot
-    /// and pin it on the next connect.
+    /// Like [`new`](Self::new), and writes the observed leaf fingerprint into
+    /// `slot` during the handshake so a TOFU caller can pin it on the next connect.
     pub fn with_observed(pin: Option<[u8; 32]>, slot: Arc<Mutex<Option<[u8; 32]>>>) -> Self {
         Self {
             pin,
@@ -82,8 +71,8 @@ impl rustls::client::danger::ServerCertVerifier for PinVerify {
         _ocsp: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // Only hash the leaf when the result depends on it: a pin to check and/or a slot to
-        // record into. Accept-any-without-recording (an un-pinned HTTP agent) skips it.
+        // Hash the leaf only when a pin must be checked or a slot recorded.
+        // Accept-any without recording (unpinned HTTP) skips it.
         if self.pin.is_some() || self.observed.is_some() {
             let fp = cert_fingerprint(end_entity.as_ref());
             if let Some(slot) = &self.observed {
@@ -141,8 +130,8 @@ mod tests {
     use rustls::client::danger::ServerCertVerifier;
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
-    /// Drive the pin check against `cert_bytes`. `verify_server_cert` only hashes the leaf, so
-    /// arbitrary bytes stand in for a DER certificate here.
+    /// Drive the pin check. `verify_server_cert` only hashes the leaf, so arbitrary
+    /// bytes stand in for DER here.
     fn verify(v: &PinVerify, cert_bytes: &[u8]) -> std::result::Result<(), rustls::Error> {
         let der = CertificateDer::from(cert_bytes.to_vec());
         let name = ServerName::try_from("punktfunk").unwrap();

@@ -1,26 +1,14 @@
-//! Install / uninstall **jobs** (design `plugin-store.md` §4.3).
+//! Install and uninstall **jobs** for the plugin store (`design/plugin-store.md`).
 //!
-//! A package operation takes tens of seconds, so the API hands back a job id immediately (202) and
-//! the console polls. One at a time: `bun add` and `bun remove` share a lockfile and a
-//! `node_modules` tree, so a second concurrent op is a corruption bug waiting to happen — a
-//! request that arrives while a job runs gets 409, not a queue.
+//! A package op takes tens of seconds, so the API returns a job id (HTTP 202) and
+//! the console polls. `bun add` / `bun remove` share a lockfile and `node_modules`;
+//! a request that arrives while a job runs is 409, not a queue.
 //!
-//! The pipeline, and why each step is there:
+//! Pipeline: resolve → verify pin vs registry integrity → install → check on-disk
+//! version (else roll back) → record provenance → restart the runner (it rediscovers
+//! units only at startup).
 //!
-//! ```text
-//!   resolve  → what exactly are we installing (catalog entry ⇒ pkg@version+integrity, or a raw spec)
-//!   verify   → the registry's advertised integrity for that version MUST equal the index pin
-//!   install  → spawn the runner CLI (`bun add`), streaming its output into the job log
-//!   check    → the version on disk is the version we pinned, else roll back
-//!   record   → provenance manifest, so the tier stays visible forever
-//!   restart  → the runner rediscovers units only at startup, so activation is a restart
-//! ```
-//!
-//! **verify** is the step that makes "verified" mean something. A reviewed entry pins a tarball
-//! hash; if the registry now advertises a different hash for that same version, someone republished
-//! it after review and the install is refused before any code is fetched, let alone run. Tier-3
-//! (raw spec) installs skip it — there is no pin to check against, and that asymmetry *is* the
-//! tier.
+//! Verify is skipped for raw-spec installs: there is no pin.
 
 use super::index::{scope_of, Entry};
 use super::manifest::{self, Record, Tier};
@@ -31,17 +19,12 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// How long a package op may run before we kill it. `bun add` over a cold cache on a slow link is
-/// the worst case; five minutes is far past it.
+/// 300s: `bun add` over a cold cache on a slow link is the worst case.
 const JOB_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// How many finished jobs we keep for the console to read back.
 const JOB_HISTORY: usize = 20;
 
-/// Lines of runner output retained per job (the console shows a tail).
 const LOG_LINES: usize = 200;
-
-// ---------------------------------------------------------------- job records
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -51,19 +34,14 @@ pub(crate) enum State {
     Failed,
 }
 
-/// A job as the console sees it. Field names are snake_case like the rest of the management API
-/// (the *file* formats — index, sources, manifest — follow npm's camelCase instead).
+/// Snake_case matches the management API; index/sources/manifest files use npm camelCase.
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct Job {
     pub id: String,
-    /// `install` or `uninstall`.
     pub kind: String,
-    /// What the operator asked for — a package name, or the raw spec they typed.
     pub target: String,
     pub state: State,
-    /// Coarse step name, for a progress line the operator can read.
     pub phase: String,
-    /// Tail of the runner's combined stdout/stderr.
     pub log: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -91,7 +69,6 @@ fn lock() -> std::sync::MutexGuard<'static, Jobs> {
     jobs().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Start tracking a job, refusing if one is already in flight (single-flight, §4.3).
 fn begin(kind: &str, target: &str) -> Result<String> {
     let mut g = lock();
     if let Some(active) = g.jobs.iter().find(|j| j.state == State::Running) {
@@ -162,32 +139,27 @@ fn finish(id: &str, result: Result<()>) {
     }
 }
 
-/// One job by id.
 pub(crate) fn get(id: &str) -> Option<Job> {
     lock().jobs.iter().find(|j| j.id == id).cloned()
 }
 
-/// Recent jobs, newest last.
+/// Newest last.
 pub(crate) fn list() -> Vec<Job> {
     lock().jobs.iter().cloned().collect()
 }
 
-/// Is a job in flight? (The console disables install buttons on this.)
 pub(crate) fn busy() -> bool {
     lock().jobs.iter().any(|j| j.state == State::Running)
 }
 
-// ---------------------------------------------------------------- install plans
-
-/// A fully resolved install: everything the executor needs, with the trust decision already made.
+/// Resolved install: spec, pins, and tier already decided.
 pub(crate) struct Plan {
-    /// Package name without a version.
+    /// Bare package name; `None` for URL/git specs.
     pub pkg: Option<String>,
-    /// The argument handed to `bun add` — `pkg@version` for a catalogued entry, the raw spec
-    /// otherwise.
+    /// `bun add` operand: `pkg@version` for a catalog entry, else the raw spec.
     pub spec: String,
     pub version: Option<String>,
-    /// `(scope, registry_url)` to map in the plugins dir's `bunfig.toml`.
+    /// `(scope, registry_url)` mapped into the plugins dir `bunfig.toml`.
     pub registry: Option<(String, String)>,
     pub integrity: Option<String>,
     pub tier: Tier,
@@ -196,7 +168,6 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    /// From a catalog entry: exact version, pinned integrity, scope→registry mapping.
     pub(crate) fn from_entry(entry: &Entry, source: &str, verified: bool) -> Result<Plan> {
         let scope = scope_of(&entry.pkg).context("catalog entry package must be scoped")?;
         Ok(Plan {
@@ -215,7 +186,7 @@ impl Plan {
         })
     }
 
-    /// From a raw package spec typed into the danger dialog. No pin, no review, no shelf.
+    /// Raw spec: no pin, no review, no catalog source.
     pub(crate) fn from_spec(spec: &str) -> Result<Plan> {
         let spec = validate_spec(spec)?;
         Ok(Plan {
@@ -231,13 +202,10 @@ impl Plan {
     }
 }
 
-/// Accept only specs we're willing to hand to `bun add`.
+/// Specs the console may pass to `bun add`.
 ///
-/// This is not shell quoting (we always exec with an argument vector, never a shell) — it is about
-/// what the *package manager* will do with the string. Two real hazards: a leading `-` turns the
-/// operand into a flag, and `file:` specs would let a console session install code from anywhere on
-/// the host's filesystem, which is a different (and larger) capability than "install a package".
-/// Local paths remain available through the CLI, which is where local development belongs.
+/// Not shell quoting (exec is an argv). A leading `-` is a flag; `file:` /
+/// `link:` / `portal:` would install from the host filesystem. Those stay CLI-only.
 fn validate_spec(spec: &str) -> Result<String> {
     let s = spec.trim();
     if s.is_empty() {
@@ -258,7 +226,7 @@ fn validate_spec(spec: &str) -> Result<String> {
             bail!("`{bad}` specs are not installable from the console — use the `punktfunk-host plugins add` CLI");
         }
     }
-    // URL-ish specs: only https and git+https. (http:// and git:// are unauthenticated transports.)
+    // Only https and git+https. http:// and git:// are unauthenticated.
     if lower.contains("://")
         && !(lower.starts_with("https://") || lower.starts_with("git+https://"))
     {
@@ -267,14 +235,14 @@ fn validate_spec(spec: &str) -> Result<String> {
     Ok(s.to_string())
 }
 
-/// Best-effort package name from an npm-style spec (`@scope/name`, `@scope/name@1.2.3`, `name@1`).
-/// `None` for URL/git specs — those are identified after the fact by diffing `node_modules`.
+/// Bare name from an npm spec (`@scope/name`, `@scope/name@1.2.3`, `name@1`).
+/// `None` for URL/git — those are identified by diffing `node_modules`.
 fn parse_spec_pkg(spec: &str) -> Option<String> {
     if spec.contains("://") {
         return None;
     }
     if let Some(rest) = spec.strip_prefix('@') {
-        // Scoped: the version separator is the '@' AFTER the scope's slash.
+        // Version separator is the '@' after the scope slash.
         let (scope_and_name, _) = match rest.split_once('/') {
             Some((scope, tail)) => match tail.split_once('@') {
                 Some((name, ver)) => (format!("@{scope}/{name}"), Some(ver)),
@@ -292,9 +260,6 @@ fn parse_spec_pkg(spec: &str) -> Option<String> {
     )
 }
 
-// ---------------------------------------------------------------- execution
-
-/// Kick off an install. Returns the job id; the work runs on a detached thread.
 pub(crate) fn spawn_install(plan: Plan) -> Result<String> {
     let target = plan.pkg.clone().unwrap_or_else(|| plan.spec.clone());
     let id = begin("install", &target)?;
@@ -310,7 +275,6 @@ pub(crate) fn spawn_install(plan: Plan) -> Result<String> {
     Ok(id)
 }
 
-/// Kick off an uninstall.
 pub(crate) fn spawn_uninstall(pkg: String) -> Result<String> {
     if super::valid_installed_pkg(&pkg).is_err() {
         bail!("not an installable plugin package name");
@@ -331,7 +295,7 @@ pub(crate) fn spawn_uninstall(pkg: String) -> Result<String> {
 fn run_install(id: &str, plan: Plan) -> Result<()> {
     let dir = super::plugins_dir();
 
-    // ---- verify: the pin must still describe what the registry serves ------------------------
+    // Pin must still match what the registry serves.
     if let (Some(integrity), Some(pkg), Some(version), Some((_, registry))) = (
         plan.integrity.as_deref(),
         plan.pkg.as_deref(),
@@ -351,33 +315,26 @@ fn run_install(id: &str, plan: Plan) -> Result<()> {
         log_line(id, format!("integrity ok: {pkg}@{version}"));
     }
 
-    // ---- install ------------------------------------------------------------------------------
     set_phase(id, "installing");
-    // Before anything else: make this dir bun's install root. Without a `package.json` here, `bun
-    // add` walks up and installs into the nearest ancestor that has one — successfully, exit 0,
-    // into somebody else's tree (see `ensure_plugin_root`).
+    // Without a `package.json` here, `bun add` walks up and installs into the
+    // nearest ancestor that has one — exit 0, wrong tree (`ensure_plugin_root`).
     super::ensure_plugin_root(&dir).with_context(|| format!("prepare {}", dir.display()))?;
     let before = super::installed_packages(&dir);
-    // Map the entry's scope to its registry ourselves rather than through a runner flag: the
-    // installed scripting package can be older than this binary, and an older runner would read an
-    // unknown flag's value as a package name (see `ensure_bunfig_scope`).
+    // Map the scope in bunfig ourselves. An older runner would treat an unknown
+    // flag's value as a package name (`ensure_bunfig_scope`).
     if let Some((scope, url)) = &plan.registry {
         super::ensure_bunfig_scope(&dir, scope, url)
             .with_context(|| format!("map {scope} to {url}"))?;
     }
     let mut args = vec!["add".to_string(), plan.spec.clone()];
     if plan.version.is_some() {
-        // Pin the dependency range too, so a later `bun install` in this tree can't drift off the
-        // reviewed version. Safely ignored by a runner too old to know it (an unknown `-`-prefixed
-        // flag is skipped, not misread) — the version we install is exact either way, so the worst
-        // case is a caret range recorded in package.json.
+        // Pin the range so a later `bun install` cannot drift. An old runner skips an
+        // unknown `-` flag; we still install an exact version either way.
         args.push("--exact".into());
     }
     if !plan.spec.starts_with("@punktfunk/") {
-        // The runner CLI's supply-chain gate refuses anything resolving off Punktfunk's own
-        // registry unless told otherwise. Here the operator already made that decision — either by
-        // adding the source, or in the danger dialog — so pass the flag rather than making the gate
-        // unable to express "yes, deliberately".
+        // The runner refuses non-Punktfunk registries unless this flag is set.
+        // Catalog add or raw-spec install already made that choice.
         args.push("--allow-public-registry".into());
     }
     args.push("--plugins".into());
@@ -385,14 +342,13 @@ fn run_install(id: &str, plan: Plan) -> Result<()> {
 
     run_runner(id, &args)?;
 
-    // ---- check: is what landed what we asked for? ---------------------------------------------
     set_phase(id, "checking");
     let after = super::installed_packages(&dir);
     let added: Vec<_> = after
         .iter()
         .filter(|p| !before.iter().any(|b| b.pkg == p.pkg))
         .collect();
-    // For a catalogued install we know the package name; for a URL/git spec we learn it here.
+    // Catalogued installs know the name; URL/git specs learn it from the diff.
     let pkg = plan
         .pkg
         .clone()
@@ -402,10 +358,8 @@ fn run_install(id: &str, plan: Plan) -> Result<()> {
              punktfunk plugin? (it must be named `@scope/plugin-*` or `punktfunk-plugin-*`)",
         )?;
     let installed = after.iter().find(|p| p.pkg == pkg).with_context(|| {
-        // The runner said it succeeded and the package still isn't here. The one field cause is a
-        // capturing ancestor `package.json` (`ensure_plugin_root`) — which this job now seeds
-        // against, so reaching here means a tree we deliberately don't seed (packages present, no
-        // `package.json`). Name the file rather than leaving the operator with a dead end.
+        // Runner succeeded but the package is missing. Name the capturing ancestor
+        // `package.json` if any (`ensure_plugin_root` seeds this dir).
         match super::capturing_ancestor(&dir) {
             Some(p) => format!(
                 "the runner reported success but {pkg} is not in {} — `{}` is capturing the \
@@ -420,7 +374,7 @@ fn run_install(id: &str, plan: Plan) -> Result<()> {
 
     if let (Some(want), Some(got)) = (plan.version.as_deref(), installed.version.as_deref()) {
         if want != got {
-            // Roll back rather than leave an unreviewed version installed under a verified badge.
+            // Do not leave an unreviewed version under a verified badge.
             log_line(id, format!("rolling back: expected {want}, found {got}"));
             set_phase(id, "rolling back");
             let _ = run_runner(
@@ -436,7 +390,6 @@ fn run_install(id: &str, plan: Plan) -> Result<()> {
         }
     }
 
-    // ---- record + activate ---------------------------------------------------------------------
     set_phase(id, "recording");
     manifest::record(
         &dir,
@@ -474,9 +427,8 @@ fn run_uninstall(id: &str, pkg: &str) -> Result<()> {
     Ok(())
 }
 
-/// Restart the runner so it rediscovers units. Best-effort and non-fatal: the package IS installed
-/// at this point, so a restart failure must not present as an install failure — it presents as
-/// "installed, runner needs a nudge", which the console says out loud.
+/// Best-effort restart so the runner rediscovers units. The package is already
+/// installed: a restart failure is not an install failure.
 fn restart_runner(id: &str) {
     set_phase(id, "restarting runner");
     match crate::plugins::restart_runtime() {
@@ -489,22 +441,20 @@ fn restart_runner(id: &str) {
     }
 }
 
-/// Run the bun runner CLI with `args`, streaming both streams into the job log.
 fn run_runner(id: &str, args: &[String]) -> Result<()> {
     let (program, prefix) = crate::plugins::runner_command()?;
     tracing::info!(job = %id, program = %program.display(), ?args, "spawning the plugin runner");
     let mut child = Command::new(&program)
         .args(&prefix)
         .args(args)
-        // No stdin: `bun add` must never sit waiting on a prompt inside a service.
+        // `bun add` must not block on a prompt inside a service.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("run the plugin runner ({})", program.display()))?;
 
-    // Pump both streams concurrently: bun writes progress to one and errors to the other, and a
-    // full pipe on either would block the child.
+    // Pump both streams: a full pipe on either blocks the child.
     let mut pumps = Vec::new();
     if let Some(out) = child.stdout.take() {
         let job = id.to_string();
@@ -542,7 +492,6 @@ fn run_runner(id: &str, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Copy one child stream into the job log, line by line.
 fn pump(job: &str, stream: impl std::io::Read) {
     for line in BufReader::new(stream).lines().map_while(Result::ok) {
         let line = line.trim_end().to_string();
@@ -552,17 +501,14 @@ fn pump(job: &str, stream: impl std::io::Read) {
     }
 }
 
-// ---------------------------------------------------------------- registry preflight
-
-/// The integrity hash the registry itself advertises for `pkg@version`.
+/// Integrity hash the registry advertises for `pkg@version`.
 ///
-/// This is the check that gives the pin teeth. npm clients already refuse a tarball whose bytes
-/// don't match the registry's advertised hash, so the remaining attack is a *republish* — same
-/// version, new content, new hash. Comparing the registry's current hash against the reviewed one
-/// catches exactly that, before anything is downloaded.
+/// Clients already refuse a tarball that mismatches this hash. The remaining
+/// attack is a republish (same version, new bytes). Compare against the review
+/// pin before download.
 fn registry_integrity(registry: &str, pkg: &str, version: &str) -> Result<String> {
     let base = registry.trim_end_matches('/');
-    // npm registry convention: the scope separator is percent-encoded in the packument path.
+    // Packument path percent-encodes the scope slash.
     let url = format!("{base}/{}", pkg.replace('/', "%2f"));
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
@@ -613,11 +559,10 @@ mod tests {
 
         assert!(validate_spec("").is_err());
         assert!(validate_spec("   ").is_err());
-        // a leading dash would be parsed by bun as a flag, not an operand
+        // bun would parse a leading dash as a flag, not an operand
         assert!(validate_spec("--production").is_err());
         assert!(validate_spec("a b").is_err());
-        // local-path specs are CLI-only: installing from anywhere on the filesystem is a bigger
-        // capability than installing a package
+        // file:/link: would install from the host filesystem; that stays CLI-only
         assert!(validate_spec("file:/etc/passwd").is_err());
         assert!(validate_spec("link:../evil").is_err());
         // unauthenticated transports
@@ -654,7 +599,6 @@ mod tests {
         );
         assert_eq!(plan.integrity.as_deref(), Some("sha512-AAAA"));
 
-        // The same entry from an operator-added source is External, never Verified (D6).
         let ext = Plan::from_entry(&idx.plugins[0], "retro-hub", false).unwrap();
         assert_eq!(ext.tier, Tier::External);
         assert_eq!(ext.source.as_deref(), Some("retro-hub"));
@@ -673,7 +617,7 @@ mod tests {
         assert!(plan.registry.is_none());
     }
 
-    /// `begin` is process-global and single-flight, so tests that create jobs must not overlap.
+    /// `begin` is process-global and single-flight; overlapping tests race.
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
         static M: Mutex<()> = Mutex::new(());
         M.lock().unwrap_or_else(|e| e.into_inner())

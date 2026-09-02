@@ -1,8 +1,12 @@
-//! The console's focusable widgets: the vertical menu list (settings / add-host / pair
-//! screens) and the controller-driven on-screen keyboard — ports of the Swift
-//! `GamepadMenuList` / `GamepadKeyboard`, immediate-mode: the WIDGET owns cursor,
-//! springs and scroll, the SCREEN owns the domain (row content and what an activation
-//! means), and every frame the screen hands the widget fresh row specs.
+//! Immediate-mode focus widgets: the settings menu list, the section tab strip,
+//! and the controller keyboard.
+//!
+//! The widget owns cursor, springs, and scroll. The screen owns row content and
+//! what an activation means; every frame it hands the widget a fresh `RowSpec`
+//! slice. Ports of Apple's `GamepadMenuList` / `GamepadKeyboard`.
+//!
+//! Pixel contracts live in the tests below: a stepped value stays in its field,
+//! and a slip on one row does not blank the rest of the column.
 
 use crate::anim::{approach, entrances, springs, Entrance, EntranceAt, Spring, TRAY_C, TRAY_K};
 use crate::library::{BUMP_C, BUMP_K};
@@ -11,35 +15,32 @@ use crate::theme::{accent, fg, fill, stroke, Fonts, PanelStroke, EDGE_INSET, W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Paint, PathBuilder, RRect, Rect};
 
-// --- Menu list -----------------------------------------------------------------------------
+// Menu list
 
-/// What a menu-list consumed event means for the owning screen.
+/// What a consumed menu event means for the owning screen.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ListMsg {
     None,
-    /// Left/right on the focused row (the screen returns whether the value changed).
+    /// Left/right on the focused row.
     Adjust(i32),
-    /// A on the focused row.
     Activate,
 }
 
-/// One row's look, rebuilt by the screen each frame (never stale).
+/// One row, rebuilt by the screen each frame.
 #[derive(Clone)]
 pub(crate) struct RowSpec {
-    /// Section header drawn above this row (the first row of each group carries it).
+    /// Header above this row; only the first row of a group carries it.
     pub header: Option<&'static str>,
     pub label: String,
-    /// `None` = an action row (its label draws centered, brand-tinted).
+    /// `None` = action row (centred label, brand tint).
     pub value: Option<String>,
-    /// Placeholder styling for an empty field's value.
+    /// Dim the value as a placeholder when the field is empty.
     pub value_dim: bool,
-    /// The live-edit caret after the value (this row is what the keyboard types into).
+    /// Live-edit caret; this is the row the keyboard types into.
     pub caret: bool,
-    /// Show ‹ › chevrons while focused (left/right steps the value).
+    /// ‹ › while focused; left/right steps the value.
     pub adjustable: bool,
-    /// Rows render dimmed when they aren't actionable: an action row's centered label loses
-    /// its brand tint, a value row's label greys — the look for a setting that depends on
-    /// another one being on (Echo cancellation under Microphone).
+    /// Dimmed when not actionable (a setting that depends on another being on).
     pub enabled: bool,
 }
 
@@ -79,88 +80,64 @@ const ROW_GAP: f64 = 6.0;
 const HEADER_H: f64 = 34.0;
 pub(crate) const ROW_MAX_W: f64 = 620.0;
 
-/// How far a stepped value slips before springing back, design units. The affordable 80 %
-/// of Apple's option-band drum: one sprung position plus a crossfade, rather than
-/// neighbours rendered in 3-D — our rows draw their value as a single text run, so a real
-/// drum would mean laying out values we never otherwise measure.
+/// How far a stepped value slips before springing back, design units.
+/// One sprung offset plus a crossfade: rows draw a single text run, not neighbouring values.
 const SLIP_DP: f64 = 14.0;
-/// Accumulated slip is capped here so a held repeat reads as one accelerating travel
-/// rather than throwing the value off the row.
+/// Cap so a held repeat is one travel, not a value thrown off the row.
 const SLIP_MAX: f64 = 22.0;
-/// The confirm dip's floor — the visual sibling of the haptic that already fires.
+/// Confirm-dip floor (visual sibling of the haptic).
 const PRESS_DIP: f64 = 0.97;
-/// How far a row rises into place on mount. A twelfth of the carousel's travel: same
-/// language, but a settings list that fans open like a shelf of box art is a settings list
-/// showing off.
+/// Mount rise, design units. A twelfth of the carousel travel — same language, smaller.
 const ROW_RISE: f64 = 12.0;
 
-/// The value a step left behind, and everything its half of the crossfade needs to draw.
 struct SlipPrev {
-    /// Which row it belongs to — by index AND label, because the screen rebuilds the row
-    /// set from scratch every frame. A row appearing or dropping above the cursor would
-    /// otherwise hand this text to whatever inherited the index, i.e. slide one setting's
-    /// old value across a different setting's row.
+    /// Index and label both: the screen rebuilds rows every frame, so an index
+    /// alone would slide this text onto whichever row inherited it.
     row: usize,
     label: String,
     text: String,
-    /// Where this text sits RELATIVE to the incoming one (∓[`SLIP_DP`], set from the step
-    /// direction), so the pair keeps travelling the right way round even after the spring
-    /// reverses through zero on an accumulated repeat.
+    /// Offset from the incoming value (∓[`SLIP_DP`]). Relative so a reverse
+    /// through zero on a held repeat still travels the right way.
     offset: f64,
-    /// The slip position the step armed at, and so the span the crossfade divides by.
-    /// Deliberately not [`SLIP_DP`]: a held repeat accumulates as far as [`SLIP_MAX`], and
-    /// normalising that against the smaller constant leaves the INCOMING value at alpha 0
-    /// for the first third of the travel — a fast repeat showing nothing but stale text.
+    /// Slip position at arm time — the span the crossfade divides by. Not [`SLIP_DP`]:
+    /// a held repeat reaches [`SLIP_MAX`], and dividing by the smaller constant leaves
+    /// the incoming value at alpha 0 for the first third of travel.
     arm: f64,
 }
 
-/// The focus list: authoritative cursor, spring recoil at the ends, a scroll offset
-/// that chases the focused row, and a per-row focus amount for the scale/tint ease.
 pub(crate) struct MenuList {
     pub cursor: usize,
     bump: Spring,
     scroll: f64,
-    /// The COLOUR channel of focus (tint, alpha, chevrons), eased with `approach`.
-    /// Deliberately not sprung: an overshooting colour would overshoot past the palette's
-    /// accent into a tint that isn't in the palette at all.
+    /// Colour channel of focus (tint, alpha, chevrons), eased. Not sprung:
+    /// overshoot would leave the palette.
     focus: Vec<f64>,
-    /// The SCALE channel, sprung — the whisker of overshoot is the pop that makes a
-    /// focused row read as picked up rather than merely tinted.
+    /// Scale channel, sprung — the overshoot is the "picked up" pop.
     focus_pop: Vec<Spring>,
-    /// The activated row's dip, resting at 1.0. One spring, not one per row: only the
-    /// focused row can be activated, so only one can ever be dipping.
+    /// Confirm dip, rest 1.0. One spring: only the focused row can be dipping.
     press: Spring,
-    /// A stepped value's displacement, chasing 0 from ±[`SLIP_DP`]. Never reset on a new
-    /// step — its velocity is what makes held repeats accumulate into one travel instead of
-    /// restarting the crossfade.
+    /// Stepped-value displacement, chasing 0 from ±[`SLIP_DP`]. Not reset on a
+    /// new step: velocity is what lets held repeats accumulate into one travel.
     slip: Spring,
-    /// The value the slip is sliding OUT, and where — `None` whenever nothing is mid-step,
-    /// which is also what tells every OTHER row it has no crossfade to draw.
+    /// Value sliding out. `None` = no mid-step, so every other row draws no crossfade.
     slip_prev: Option<SlipPrev>,
-    /// Direction of the step the list last emitted, consumed by the next render. The list
-    /// arms the slip ITSELF by noticing the value changed, so no screen has to report it —
-    /// and a refused adjust (the value didn't move) correctly produces no slip at all.
+    /// Last emitted step direction, consumed next render. The list arms slip by
+    /// noticing the value changed; a refused adjust produces none.
     step_dir: i32,
-    /// Each row's value string as last drawn — the "before" half of the crossfade, and how
-    /// the list detects that an adjust actually landed.
+    /// Last-drawn value per row: the "before" of the crossfade, and whether an adjust landed.
     shown: Vec<String>,
-    /// The mount entrance and the clock it runs on. Deliberately NOT replayed on a tab
-    /// switch: `jump_to` already seats everything instantly (chasing through rows that no
-    /// longer exist reads as a glitch), and re-fanning the rows on every L1/R1 would turn a
-    /// skim through the sections into a flicker.
+    /// Mount entrance. Not replayed on a tab switch: `jump_to` seats instantly,
+    /// and chasing rows that no longer exist reads as a glitch.
     entrance: Option<Entrance>,
     entrance_armed: bool,
     age: f64,
-    /// Next render, seat the scroll and the focus ease instantly instead of chasing — see
-    /// [`MenuList::jump_to`].
+    /// Next render seats scroll and focus instantly; see [`MenuList::jump_to`].
     snap: bool,
-    /// Each row's rect as the last frame actually drew it, device px — what a pointer hit-
-    /// tests against. One entry per row, `Rect::new_empty()` for rows scrolled out of view,
-    /// so an index into this is an index into `rows`.
+    /// Last-drawn row rects, device px. Empty for rows scrolled out of view, so
+    /// an index here is an index into `rows`.
     geom: Vec<Rect>,
-    /// Nothing left on the move after the last render — no entrance, every focus ease and
-    /// spring at its target, the scroll where it wants to be. `false` until the first
-    /// render, so a fresh list always asks for a frame.
+    /// True once nothing is still moving. `false` until the first render so a
+    /// fresh list always asks for a frame.
     settled: bool,
 }
 
@@ -186,33 +163,29 @@ impl MenuList {
         }
     }
 
-    /// Is anything still on the move — an entrance, a focus ease, a spring, the scroll?
-    /// The damage-gated stream overlay asks every frame and keeps redrawing until this is
-    /// false; the console draws every frame regardless and never needs to ask — which is
-    /// why the Android console (editor only, no stream overlay) never calls it.
+    /// True while an entrance, ease, or spring is still moving. The damage-gated
+    /// stream overlay redraws until this is false; the console paints every frame.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn animating(&self) -> bool {
         !self.settled
     }
 
-    /// Move the cursor WITHOUT the scroll gliding there. For a tab switch, where the whole
-    /// row set is replaced: chasing would sweep the viewport through rows that no longer
-    /// exist, which reads as a glitch rather than as motion.
+    /// Move the cursor without the scroll gliding. For a tab switch: chasing
+    /// would sweep through rows that no longer exist.
     pub(crate) fn jump_to(&mut self, cursor: usize) {
         self.cursor = cursor;
         self.snap = true;
     }
 
-    /// Route a menu event. Up/down move focus (Boundary = recoil), left/right become
-    /// [`ListMsg::Adjust`], A becomes [`ListMsg::Activate`]. B is the SCREEN's.
+    /// Up/down move focus (Boundary = recoil). Left/right → [`ListMsg::Adjust`],
+    /// A → [`ListMsg::Activate`]. B is the screen's.
     pub(crate) fn menu(&mut self, ev: MenuEvent, len: usize) -> (ListMsg, Option<MenuPulse>) {
         match ev {
             MenuEvent::Move(MenuDir::Up) => (ListMsg::None, self.step(-1, len)),
             MenuEvent::Move(MenuDir::Down) => (ListMsg::None, self.step(1, len)),
             MenuEvent::Move(MenuDir::Left) => (ListMsg::Adjust(-1), self.armed(-1)),
             MenuEvent::Move(MenuDir::Right) => (ListMsg::Adjust(1), self.armed(1)),
-            // A on a value row cycles it FORWARD, so the slip travels the same way a Right
-            // would; on an action row nothing steps and the render simply finds no change.
+            // A cycles a value row forward (same slip as Right); an action row does not step.
             MenuEvent::Confirm => {
                 self.armed(1);
                 self.dip();
@@ -222,40 +195,33 @@ impl MenuList {
         }
     }
 
-    /// Note that a step went out in `dir`. Returns `None` so it drops into the pulse slot of
-    /// the arms above without changing what they report — the SCREEN decides whether the
-    /// step landed, and the next render finds out by looking at the value.
+    /// Record that a step went out in `dir`. Returns `None` so it fills the pulse
+    /// slot without changing it; the next render sees whether the value moved.
     fn armed(&mut self, dir: i32) -> Option<MenuPulse> {
         self.step_dir = dir;
         None
     }
 
-    /// Kick the confirm dip. Separate from [`Self::armed`] because a press is worth showing
-    /// even on an action row, where no value will change.
+    /// Confirm dip. Separate from [`Self::armed`]: an action row still presses.
     fn dip(&mut self) {
         self.press.pos = PRESS_DIP;
     }
 
-    /// A row's drawn rect, for tests that assert on what a press can actually reach.
+    /// Last-drawn row rect; tests assert what a press can reach.
     #[cfg(test)]
     pub(crate) fn row_rect(&self, i: usize) -> Option<Rect> {
         self.geom.get(i).copied().filter(|r| !r.is_empty())
     }
 
-    /// Route a pointer. A press picks the row under it, focuses it AND activates it —
-    /// one click does what the pad needs a move plus an A for, which is what a mouse user
-    /// expects of a row that IS its control ("click Resolution, resolution changes").
-    /// Because activation wraps, every value stays reachable by clicking alone.
-    ///
-    /// A press in the list's empty margin is swallowed, not passed on: it must not fall
-    /// through to whatever the screen draws behind the list.
+    /// Press focuses and activates the row under it (click = move + A). A press
+    /// in empty margin is swallowed so it does not fall through to the screen.
     pub(crate) fn pointer(&mut self, p: Pointer, len: usize) -> (ListMsg, Option<MenuPulse>) {
         match p.kind {
             PointerKind::Scroll { up } => (ListMsg::None, self.step(if up { -1 } else { 1 }, len)),
             PointerKind::Press => match p.pick(&self.geom) {
                 Some(i) if i < len => {
                     self.cursor = i;
-                    // Same forward cycle A performs, so a click reads the same as a press.
+                    // Same forward cycle as A, so a click matches a pad press.
                     self.armed(1);
                     self.dip();
                     (ListMsg::Activate, Some(MenuPulse::Confirm))
@@ -269,7 +235,7 @@ impl MenuList {
     fn step(&mut self, delta: i32, len: usize) -> Option<MenuPulse> {
         let target = self.cursor as i32 + delta;
         if len == 0 || target < 0 || target >= len as i32 {
-            // Refused at an end: the dull thud plus a short vertical recoil.
+            // End of the list: Boundary pulse plus 14 dp vertical recoil.
             self.bump = Spring {
                 pos: -14.0 * f64::from(delta.signum()),
                 vel: 0.0,
@@ -280,8 +246,8 @@ impl MenuList {
         Some(MenuPulse::Move)
     }
 
-    /// Render the rows into `rect`. `active` = this list owns focus (a keyboard tray on
-    /// top parks it — rows keep their look but the focus ring rests).
+    /// Draw the rows in `rect`. `active` is false when a keyboard tray parks
+    /// focus: rows keep their look, the focus ring rests.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render(
         &mut self,
@@ -294,8 +260,7 @@ impl MenuList {
         active: bool,
     ) {
         let reduce = crate::theme::reduce_motion();
-        // The list keeps its own clock: `render` is handed `dt` but never the shell's `t`,
-        // and a per-MOUNT animation wants a per-mount clock anyway.
+        // Own clock: `render` gets `dt` but never the shell's `t`.
         self.age += dt;
         if !self.entrance_armed {
             self.entrance_armed = true;
@@ -305,9 +270,8 @@ impl MenuList {
             self.entrance = None;
         }
         if self.snap {
-            // A replaced row set has no shared history with the old one — start every row's
-            // focus ease from scratch so the new cursor is simply THERE. The slip goes with
-            // it: a value "changing" because the whole row set was swapped is not a step.
+            // Replaced rows share no history: snap focus, drop slip. A value that
+            // "changed" because the row set swapped is not a step.
             self.focus.clear();
             self.focus_pop.clear();
             self.shown.clear();
@@ -324,8 +288,7 @@ impl MenuList {
             } else {
                 approach(*f, target, dt, 0.06)
             };
-            // An approach never arrives on its own; land it once it is imperceptible, so
-            // the list can report itself settled.
+            // `approach` never arrives; land once the delta is imperceptible so we can settle.
             if (*f - target).abs() < 0.002 {
                 *f = target;
             }
@@ -342,8 +305,7 @@ impl MenuList {
         self.bump.step(0.0, BUMP_K, BUMP_C, dt);
         self.bump.settle(0.0, 0.3, 4.0);
         if reduce {
-            // Reduced motion keeps the recoil's MEANING (the move was refused) in the
-            // haptic the screen already fired, and drops the travel.
+            // Reduced motion: keep the Boundary haptic, drop the recoil travel.
             self.bump = Spring::rest(0.0);
             self.press = Spring::rest(1.0);
         } else {
@@ -351,15 +313,10 @@ impl MenuList {
             self.press.settle(1.0, 0.0005, 0.005);
         }
 
-        // Arm the value slip. A step went out (`step_dir`) AND the value under the cursor
-        // actually changed — comparing what we DREW last frame against what the screen just
-        // handed us is what makes a refused adjust produce no motion at all, without any
-        // screen having to report whether its edit landed. The direction is taken
-        // unconditionally so a step can never leak into a later frame, but only a row that
-        // ADVERTISES stepping may slip: A and a pointer press arm one whatever the row is, so
-        // a row whose value merely re-reads differently under the press — a profile's "Pinned
-        // to 3 hosts" as the count changes — would otherwise slide its value sideways with no
-        // chevrons on screen ever having promised that it steps.
+        // Arm slip only if `step_dir` is set AND this row is `adjustable` AND the
+        // drawn value actually changed. Take `step_dir` anyway so it cannot leak
+        // into a later frame. A and pointer press arm regardless of row type, so
+        // a re-read value (host count) would otherwise slide with no chevrons.
         let dir = std::mem::take(&mut self.step_dir);
         let stepped = if dir != 0 && !reduce {
             rows.get(self.cursor).filter(|r| r.adjustable)
@@ -370,13 +327,10 @@ impl MenuList {
             let now = row.value.as_deref().unwrap_or_default();
             if self.shown.get(self.cursor).is_some_and(|p| p != now) {
                 let prev = self.shown[self.cursor].clone();
-                // ADD rather than set, and never touch `vel`: two fast presses accumulate
-                // into one accelerating travel instead of restarting the crossfade.
+                // Add, never reset `vel`: two fast presses become one accelerating travel.
                 self.slip.pos =
                     (self.slip.pos + SLIP_DP * f64::from(dir)).clamp(-SLIP_MAX, SLIP_MAX);
-                // A step that exactly cancels one still in flight leaves no travel to
-                // crossfade over — and no span to normalise the fade against — so the new
-                // value simply takes the row.
+                // Exact cancel of in-flight slip: no travel, no fade span — new value takes the row.
                 self.slip_prev = if self.slip.pos == 0.0 {
                     None
                 } else {
@@ -395,14 +349,13 @@ impl MenuList {
         if self.slip.pos == 0.0 {
             self.slip_prev = None;
         }
-        // This frame's values become the "before" the next step compares against. Recorded
-        // for EVERY row, not just the drawn ones: a row scrolled out of view still has a
-        // value, and reading a stale one back later would fake a change.
+        // Record every row's value, including culled ones: a stale off-screen
+        // value would later fake a change.
         self.shown.clear();
         self.shown
             .extend(rows.iter().map(|r| r.value.clone().unwrap_or_default()));
 
-        // Row tops (design units) incl. headers, so scroll math and drawing agree.
+        // Row tops in design units, headers included, so scroll and draw share one list.
         let mut tops = Vec::with_capacity(rows.len());
         let mut y = 0.0;
         for row in rows {
@@ -415,7 +368,6 @@ impl MenuList {
         let content_h = (y - ROW_GAP).max(0.0) * k;
         let view_h = f64::from(rect.height());
 
-        // The scroll chases the focused row into the middle band, clamped to content.
         let focused_center = tops.get(self.cursor).map_or(0.0, |t| (t + ROW_H / 2.0) * k);
         let target = (focused_center - view_h / 2.0).clamp(0.0, (content_h - view_h).max(0.0));
         self.scroll = if std::mem::take(&mut self.snap) {
@@ -426,8 +378,6 @@ impl MenuList {
         if (self.scroll - target).abs() < 0.25 {
             self.scroll = target;
         }
-        // Settled once nothing above has anywhere left to go — read back by `animating`.
-        // The springs land exactly (`settle`), the eases are landed above.
         let cursor = if active { Some(self.cursor) } else { None };
         let focus_target = |i: usize| if Some(i) == cursor { 1.0 } else { 0.0 };
         self.settled = self.entrance.is_none()
@@ -463,8 +413,7 @@ impl MenuList {
             {
                 continue;
             }
-            // Culled first, then the entrance: an off-screen row costs nothing to not
-            // animate, and the rise is far smaller than the 8 dp cull margin either way.
+            // Cull before the entrance: off-screen rows skip the rise, which is < 8 dp anyway.
             let ent = self
                 .entrance
                 .map_or(EntranceAt::SETTLED, |e| e.at(i, self.age));
@@ -481,9 +430,8 @@ impl MenuList {
                     fg(0.45),
                 );
             }
-            // Focus scale springs 0.98 → 1.0 about the row center, times the confirm dip.
-            // Two channels rather than one because they answer different questions: the pop
-            // says "this is the row", the dip says "and you just pressed it".
+            // Scale 0.98 → 1.0 about the centre, times the confirm dip. Two
+            // channels: pop = this is the row, dip = you just pressed it.
             let pop = self.focus_pop.get(i).map_or(f, |s| s.pos);
             let dip = if i == self.cursor {
                 self.press.pos
@@ -496,9 +444,8 @@ impl MenuList {
             canvas.translate((cx as f32, cy as f32));
             canvas.scale((scale as f32, scale as f32));
             canvas.translate((-cx as f32, -cy as f32));
-            // One layer per row, only while it is still arriving — a row is a panel plus
-            // two text runs, so a whole-row fade genuinely needs one. Bounded to the row's
-            // own rect so it never becomes a full-screen pass.
+            // Per-row layer only while arriving (panel + two text runs). Bounds
+            // are the row rect so this is never a full-screen pass.
             let fading = ent.fade < 1.0;
             if fading {
                 let bounds =
@@ -506,8 +453,7 @@ impl MenuList {
                 canvas.save_layer_alpha_f(bounds, ent.fade as f32);
             }
             let r = Rect::from_xywh(x0 as f32, top as f32, row_w as f32, (ROW_H * k) as f32);
-            // The untransformed rect: the focus scale is a 2 % breath about the centre, far
-            // inside the slop a finger brings, and clicking must not depend on the ease.
+            // Hit-test the unscaled rect: 2 % scale is inside finger slop; click must not depend on the ease.
             self.geom[i] = r;
             let stroke = if row.caret {
                 PanelStroke::Brand(0.7)
@@ -522,15 +468,13 @@ impl MenuList {
                 None
             };
             crate::theme::panel(canvas, r, 14.0, tint, stroke, k as f32);
-            // The lit edge, for the focused row only — a settings screen paints dozens of
-            // resting rows every frame and none of them need a specular highlight.
+            // Specular only on the focused row; a settings screen paints dozens of idle rows.
             if f > 0.5 {
                 crate::theme::panel_highlight(canvas, r, 14.0, k as f32);
             }
 
             let baseline = cy + 16.0 * k * 0.36;
             if row.value.is_none() {
-                // Action row: centered label, brand when actionable.
                 let color = if row.enabled { accent(1.0) } else { fg(0.35) };
                 let tw = fonts.measure(&row.label, W::SemiBold, 16.0 * k) as f64;
                 fonts.draw(
@@ -562,19 +506,14 @@ impl MenuList {
                 };
                 let chevron_w = if row.adjustable { 18.0 * k } else { 0.0 };
                 let caret_w = if row.caret { 8.0 * k } else { 0.0 };
-                // The value FIELD: a fixed right edge and a maximum width, with every string
-                // right-aligned against that edge by its OWN measured width. Sharing one
-                // anchor computed from the incoming value is what threw the outgoing text
-                // off the row: left-aligned on someone else's alignment it started life
-                // displaced by the width difference and hung that far past the field, which
-                // on "PyroWave (wired LAN)" → "Automatic" is most of a hundred px.
+                // Each string right-aligns on its own measured width against a
+                // fixed right edge. Sharing the incoming string's anchor left-
+                // aligns the outgoing one by the width delta and hangs it past
+                // the field.
                 let vmax = row_w * 0.55;
                 let val_right = x0 + row_w - 16.0 * k - chevron_w - caret_w;
                 let place = |s: &str| val_right - f64::from(fonts.measure(s, W::Medium, 15.0 * k));
-                // The sprung slip + crossfade. `slip_prev` names its ROW — index and label
-                // both, since an index alone is not an identity across a rebuild — so a
-                // value that changed somewhere else (a profile row appearing, a dependent
-                // row re-enabling) can't drag this one's text sideways.
+                // Gate on index AND label: an index is not identity across a rebuild.
                 let slipping = self
                     .slip_prev
                     .as_ref()
@@ -584,24 +523,17 @@ impl MenuList {
                 } else {
                     0.0
                 };
-                // Gated on the SLIPPING row exactly as `dx` above is. There is one slip
-                // spring for the whole list, so an ungated fade read the same spring on
-                // every row and blanked the entire value column each time any one value
-                // stepped. Signed rather than `.abs()`, so the deliberate overshoot back
-                // through zero clamps to nothing instead of fading the ghost in again.
+                // Same row-gate as `dx`: one slip spring for the list, so an
+                // ungated fade blanks every value. Signed, not `.abs()`, so
+                // overshoot through zero does not fade the ghost back in.
                 let gone = slipping.map_or(0.0, |p| (self.slip.pos / p.arm).clamp(0.0, 1.0) as f32);
                 let alpha =
                     |c: skia_safe::Color4f, a: f32| skia_safe::Color4f::new(c.r, c.g, c.b, c.a * a);
-                // Head-truncate: keep the END of a long address visible while typing. Done
-                // BEFORE placing, so what is right-aligned is the string actually drawn —
-                // measuring the untruncated one left every long value floating short of the
-                // edge by whatever the ellipsis saved.
+                // Truncate the head before placing: right-align the drawn string.
+                // Measuring the untruncated one floats long values short of the edge.
                 let shown = truncate_head(fonts, value, W::Medium, 15.0 * k, vmax);
-                // Nothing else confines the pair: the widget's only clip is the LIST rect,
-                // which is the full window width, leaving a couple of hundred px of open
-                // background either side of the row for a sliding value to cross. Only while
-                // there is travel to hide — a settled value fits the field by construction,
-                // and a clip per row per frame is not free.
+                // Clip the field only while slipping: the list clip is the full
+                // window, and a settled value already fits.
                 if slipping.is_some() {
                     canvas.save();
                     canvas.clip_rect(
@@ -616,7 +548,6 @@ impl MenuList {
                     );
                 }
                 if let Some(p) = slipping {
-                    // The value being left, sliding out the way the step came from.
                     let prev_text = truncate_head(fonts, &p.text, W::Medium, 15.0 * k, vmax);
                     fonts.draw(
                         canvas,
@@ -638,11 +569,10 @@ impl MenuList {
                     alpha(vcolor, 1.0 - gone),
                 );
                 if slipping.is_some() {
-                    canvas.restore(); // the value field
+                    canvas.restore(); // value-field clip
                 }
                 if row.caret {
-                    // Rides `dx` so the caret stays welded to the end of the text rather
-                    // than detaching from it mid-slip.
+                    // Ride `dx` so the caret stays on the text end mid-slip.
                     canvas.draw_rect(
                         Rect::from_xywh(
                             (val_right + 3.0 * k + dx) as f32,
@@ -655,14 +585,13 @@ impl MenuList {
                 }
                 if row.adjustable && f > 0.01 {
                     let alpha = 0.6 * f as f32;
-                    // Drawn after, and outside the field's clip: the chevrons frame the
-                    // value, so a value on the move passes UNDER them.
+                    // After, outside the field clip: a moving value passes under the chevrons.
                     chevron(canvas, place(&shown) - 11.0 * k, cy, 4.0 * k, true, alpha);
                     chevron(canvas, x0 + row_w - 16.0 * k, cy, 4.0 * k, false, alpha);
                 }
             }
             if fading {
-                canvas.restore(); // the entrance layer
+                canvas.restore(); // entrance layer
             }
             canvas.restore();
         }
@@ -670,47 +599,34 @@ impl MenuList {
     }
 }
 
-// --- Tab strip ---------------------------------------------------------------------------
+// Tab strip
 
-/// The strip's design height, including the air under it before the first row.
+/// Strip band height, including air under the pills before the first row.
 pub(crate) const TAB_STRIP_H: f64 = 46.0;
 
-/// Where the pill row sits inside that band, and how tall it is.
-///
-/// The band is 46 but the pills only occupy 2..32 of it — the remaining 14 is air between the
-/// strip and whatever it sits above. Published because a caller that draws anything BEHIND the
-/// row (the library bar's focus wash) needs the row's true extent, not the band's, or the
-/// backdrop comes out with 2 dp above the content and 14 below.
+/// Pill row inside the band: top 2, height 30; the remaining 14 is air below.
+/// Published so a backdrop (library focus wash) uses the row, not the 46 band.
 pub(crate) const TAB_PILL_TOP: f64 = 2.0;
 pub(crate) const TAB_PILL_H: f64 = 30.0;
 
-/// The horizontal section switcher above a menu list. Purely presentational — the SCREEN
-/// owns which tab is selected and what the shoulders do; this draws the pills and slides
-/// one highlight between them, so switching sections reads as travel rather than a swap.
+/// Horizontal section switcher. Presentational: the screen owns selection and
+/// the shoulders; this draws the pills and slides one highlight between them.
 pub(crate) struct TabStrip {
-    /// Chased highlight geometry `(x, width)` in device px, SPRUNG rather than eased so
-    /// velocity carries across rapid L1/R1: a fast skim through the sections reads as one
-    /// accelerating travel instead of a series of restarted eases that each begin at zero
-    /// speed. (The option-band lesson from the Apple gamepad UI, applied to the one widget
-    /// here that gets hammered.) `None` until the first render, so a freshly opened screen
-    /// doesn't animate its highlight in from x = 0.
+    /// Highlight `(x, width)` in device px, sprung so velocity carries across
+    /// rapid L1/R1. `None` until first render so a new screen does not fly in
+    /// from x = 0.
     indicator: Option<(Spring, Spring)>,
-    /// Each pill's rect as last drawn, device px — the strip is the one part of a settings
-    /// screen a pointer can reach directly, so it hit-tests against what it drew.
+    /// Last-drawn pill rects, device px — the pointer hit-tests what was drawn.
     pills: Vec<Rect>,
 }
 
-/// A pill's label size and its padding either side, in design units.
 const PILL_TEXT: f64 = 13.0;
 const PILL_PAD_X: f64 = 13.0;
-/// Air between two pills.
 const PILL_GAP: f64 = 7.0;
 
-/// Each pill's width and the run's total, in device px.
-///
-/// Shared with [`TabStrip::width`] rather than computed twice, because a caller that
-/// RIGHT-ALIGNS a strip has to know the run's width before the strip draws itself — and a
-/// second copy of this arithmetic would put the measured edge somewhere the drawn edge is not.
+/// Each pill's width and the run's total, device px. Shared with
+/// [`TabStrip::width`]: a trailing-aligned caller needs the width before draw,
+/// and a second copy of this arithmetic would disagree with the drawn edge.
 fn pill_widths(labels: &[&str], fonts: &Fonts, k: f64) -> (Vec<f64>, f64) {
     let size = PILL_TEXT * k;
     let widths: Vec<f64> = labels
@@ -722,8 +638,7 @@ fn pill_widths(labels: &[&str], fonts: &Fonts, k: f64) -> (Vec<f64>, f64) {
 }
 
 impl TabStrip {
-    /// How wide this run of pills draws. For a caller placing the strip against a TRAILING
-    /// edge, where the position depends on the width.
+    /// Drawn width of this pill run, for a caller placing it on a trailing edge.
     pub(crate) fn width(labels: &[&str], fonts: &Fonts, k: f64) -> f64 {
         pill_widths(labels, fonts, k).1
     }
@@ -735,28 +650,22 @@ impl TabStrip {
         }
     }
 
-    /// A pill's drawn rect, for tests that assert on what a press can actually reach.
+    /// Last-drawn pill rect; tests assert what a press can reach.
     #[cfg(test)]
     pub(crate) fn pill(&self, i: usize) -> Option<Rect> {
         self.pills.get(i).copied()
     }
 
-    /// The tab a press landed on, if any. Pills are small, so the hit box is the full
-    /// strip height rather than the drawn pill — a tap that lands just above or below the
-    /// text still selects, which on a touchscreen is the difference between working and
-    /// not.
+    /// Tab a press landed on. Hit box is the full strip height: pills are too
+    /// small for a tap that misses the text.
     pub(crate) fn pointer(&self, p: Pointer) -> Option<usize> {
         p.press().then(|| p.pick(&self.pills)).flatten()
     }
 
-    /// Draw the pills along the leading edge of `rect`'s top band, at the same
-    /// [`EDGE_INSET`] the heading above them uses. Returns nothing — the caller already
-    /// knows the band is [`TAB_STRIP_H`] tall.
-    ///
-    /// `focused` = the strip itself holds the D-pad focus (a remote with no shoulder
-    /// buttons steps onto it from the list's top row): the highlight brightens and grows
-    /// ‹ › chevrons, the same affordance a focused value row shows for left/right.
-    #[allow(clippy::too_many_arguments)] // the crate's render signature, same as MenuList's
+    /// Draw pills on the leading edge of `rect`'s top band, at [`EDGE_INSET`].
+    /// `focused` is D-pad focus (no-shoulder remote): highlight brightens and
+    /// grows ‹ ›, the same left/right affordance as a focused value row.
+    #[allow(clippy::too_many_arguments)] // same render signature as MenuList
     pub(crate) fn render(
         &mut self,
         canvas: &Canvas,
@@ -775,23 +684,14 @@ impl TabStrip {
         let size = PILL_TEXT * k;
         let (widths, total) = pill_widths(labels, fonts, k);
         let gap = PILL_GAP * k;
-        // Leading, under the heading it belongs to — a strip centred beneath a left-aligned
-        // title reads as two unrelated pieces of chrome. Both callers hand this widget the
-        // full content width, so the inset is measured here rather than baked into the band.
-        //
-        // Written as a clamp rather than a branch so it degrades CONTINUOUSLY as the window
-        // narrows: full inset while both fit, then centred, then hard against the leading
-        // edge once the run is wider than the band. That last case spends its overflow on
-        // the right, which is the side the user has not looked at yet — losing the first
-        // section instead would cost them the one the strip is read from. Neither reference
-        // client can reach it (both scroll their strip) and the narrowest window the console
-        // is tested at still clears the first case.
+        // Leading, under the heading: a centred strip under a left-aligned
+        // title reads as two pieces of chrome. Clamp, not a branch: full inset,
+        // then centred, then flush-left (overflow spends on the unread right).
         let inset = EDGE_INSET * k;
         let slack = f64::from(rect.width()) - total;
         let mut x = f64::from(rect.left) + inset.min((slack / 2.0).max(0.0));
         let top = f64::from(rect.top) + TAB_PILL_TOP * k;
 
-        // Where the highlight wants to be, then the eased position it actually draws at.
         let sel = selected.min(labels.len() - 1);
         let target = (
             x + widths[..sel].iter().sum::<f64>() + gap * sel as f64,
@@ -808,8 +708,7 @@ impl TabStrip {
             } else {
                 sx.step_spec(target.0, springs::INDICATOR, dt);
                 sw.step_spec(target.1, springs::INDICATOR, dt);
-                // Epsilons in DEVICE PX (this geometry is already scaled by `k`), so the
-                // pill stops sub-pixel-jittering rather than at some design-unit fraction.
+                // Settle in device px (already × `k`) so the pill stops sub-pixel jittering.
                 sx.settle(target.0, 0.05, 0.5);
                 sw.settle(target.1, 0.05, 0.5);
             }
@@ -824,7 +723,7 @@ impl TabStrip {
             k as f32,
         );
         if focused {
-            // The focused value row's ‹ › affordance, on the strip: left/right travel here.
+            // Same ‹ › as a focused value row: left/right travel here.
             let cy = top + pill_h / 2.0;
             chevron(canvas, ix - 9.0 * k, cy, 4.0 * k, true, 0.9);
             chevron(canvas, ix + iw + 9.0 * k, cy, 4.0 * k, false, 0.9);
@@ -833,11 +732,9 @@ impl TabStrip {
         let baseline = top + pill_h / 2.0 + size * 0.36;
         self.pills.clear();
         for (i, label) in labels.iter().enumerate() {
-            // Fade each label toward white by how much the highlight actually covers it, so
-            // the two labels a sliding highlight passes between light up together.
+            // Fade toward white by highlight overlap so both labels light as it slides.
             let pill_x = x;
-            // Full-height hit box (see `TabStrip::pointer`), and only ever grown from the
-            // pill's own span so two neighbours can't both claim a press.
+            // Full-height hit box; width is this pill only, so neighbours cannot both claim a press.
             self.pills.push(Rect::from_xywh(
                 pill_x as f32,
                 rect.top,
@@ -861,7 +758,6 @@ impl TabStrip {
     }
 }
 
-/// Middle-of-nowhere helper: drop chars from the FRONT until the tail fits.
 fn truncate_head(fonts: &Fonts, text: &str, w: W, size: f64, max_w: f64) -> String {
     if f64::from(fonts.measure(text, w, size)) <= max_w {
         return text.to_string();
@@ -888,13 +784,13 @@ fn chevron(canvas: &Canvas, x: f64, cy: f64, r: f64, left: bool, alpha: f32) {
     canvas.draw_path(&path.detach(), &p);
 }
 
-// --- On-screen keyboard ----------------------------------------------------------------------
+// On-screen keyboard
 
-/// What the keyboard may type per field (backspace always works).
+/// What a field accepts (backspace always works).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Charset {
     Free,
-    /// Addresses/hostnames — everything but whitespace.
+    /// Hostnames: everything but whitespace.
     Hostname,
     Digits,
 }
@@ -923,8 +819,7 @@ enum Key {
     Done,
 }
 
-/// Digits first (addresses/ports), then letters; the last char column carries the
-/// hostname/address punctuation — the Swift grid, verbatim.
+/// Digits first, then letters; last char column is hostname punctuation. Swift grid, verbatim.
 fn key_rows() -> &'static [Vec<Key>] {
     use std::sync::OnceLock;
     static ROWS: OnceLock<Vec<Vec<Key>>> = OnceLock::new();
@@ -940,23 +835,22 @@ fn key_rows() -> &'static [Vec<Key>] {
     })
 }
 
-/// The controller keyboard: a fixed key grid in a bottom tray. Dpad/stick moves the key
-/// cursor, A types, X backspaces, B/Y/Done confirms. Edits apply live — closing IS done.
+/// Controller keyboard: fixed grid in a bottom tray. D-pad moves, A types, X
+/// backspaces, B/Y/Done confirms. Edits apply live; closing is done.
 pub(crate) struct Keyboard {
     row: usize,
     col: usize,
-    /// Tray slide-in (0 hidden → 1 seated), the Swift `.spring(0.32, 0.86)`.
+    /// Tray slide-in, 0 hidden → 1 seated. Swift `.spring(0.32, 0.86)`.
     tray: Spring,
     key_flash: f64,
-    /// Each key's rect and identity as last drawn — the tray slides, so hit-testing has to
-    /// read the drawn geometry rather than recompute a seated layout.
+    /// Last-drawn key rects. The tray slides, so hit-test what was drawn, not a seated layout.
     keys: Vec<(Rect, Key)>,
 }
 
 impl Keyboard {
     pub(crate) fn new() -> Keyboard {
         Keyboard {
-            row: 1, // opens on "q"
+            row: 1, // letter row, not digits
             col: 0,
             tray: Spring::rest(0.0),
             key_flash: 0.0,
@@ -964,10 +858,8 @@ impl Keyboard {
         }
     }
 
-    /// Route a pointer at the tray. A press types the key under it and moves the key
-    /// cursor there, so a pad can carry on from wherever a finger left off. A press that
-    /// lands on the tray but between keys is swallowed — the tray is modal, and a stray
-    /// tap must not reach the list behind it.
+    /// Press types the key under it and moves the cursor there. A miss between
+    /// keys is swallowed: the tray is modal and must not reach the list behind.
     pub(crate) fn pointer(&mut self, p: Pointer) -> (KeyMsg, Option<MenuPulse>) {
         if !p.press() {
             return (KeyMsg::None, None);
@@ -976,8 +868,7 @@ impl Keyboard {
             return (KeyMsg::None, None);
         };
         let key = self.keys[i].1;
-        // Re-seat the cursor from the key's identity, not the draw index: `key_rows` is the
-        // one layout authority and the two must not be able to drift apart.
+        // Cursor from key identity, not draw index: `key_rows` is the layout authority.
         if let Some((r, c)) = key_rows()
             .iter()
             .enumerate()
@@ -995,14 +886,14 @@ impl Keyboard {
         }
     }
 
-    /// Does `p` land on the tray at all? The screen asks before routing, so a press
-    /// outside a raised keyboard can dismiss it instead of falling through to the list.
+    /// Whether `p` hits the tray. The screen asks first so a press outside a
+    /// raised keyboard dismisses it instead of falling through to the list.
     pub(crate) fn covers(&self, p: Pointer) -> bool {
         self.keys.iter().any(|(r, _)| p.hits(*r))
     }
 
-    /// Route a menu event; the SCREEN applies `Type`/`Backspace` to its field (charset
-    /// checks included — a refusal comes back as a boundary pulse from the screen).
+    /// The screen applies `Type`/`Backspace` (charset included); a refusal
+    /// comes back as Boundary from the screen.
     pub(crate) fn menu(&mut self, ev: MenuEvent) -> (KeyMsg, Option<MenuPulse>) {
         let rows = key_rows();
         match ev {
@@ -1016,8 +907,8 @@ impl Keyboard {
                         if next < 0 || next >= rows.len() as i32 {
                             return (KeyMsg::None, Some(MenuPulse::Boundary));
                         }
-                        // Map the column proportionally between rows of different
-                        // widths (Done goes up to the rightmost letters, not "e").
+                        // Proportional column map across unequal row widths
+                        // (Done goes up to the last letter, not "e").
                         let from = (rows[row as usize].len() - 1).max(1) as f64;
                         let to = (rows[next as usize].len() - 1) as f64;
                         col = (col as f64 * to / from).round() as i32;
@@ -1050,8 +941,7 @@ impl Keyboard {
         }
     }
 
-    /// Advance the tray spring toward shown/hidden. Returns the current seat 0..1 —
-    /// at exactly 0 while hidden, so the caller can skip rendering.
+    /// Step the tray toward shown/hidden. Returns 0..1; exactly 0 while hidden so the caller can skip draw.
     pub(crate) fn seat(&mut self, shown: bool, dt: f64) -> f64 {
         self.tray
             .step(if shown { 1.0 } else { 0.0 }, TRAY_K, TRAY_C, dt);
@@ -1060,13 +950,13 @@ impl Keyboard {
         self.tray.pos.clamp(0.0, 1.2)
     }
 
-    /// The tray's design height (pre-`k`), for layout above it.
+    /// Tray height in design units (pre-`k`), for layout above it.
     pub(crate) fn tray_height() -> f64 {
         5.0 * 42.0 + 4.0 * 7.0 + 2.0 * 14.0
     }
 
-    /// Render the tray with its bottom edge at `bottom`, horizontally centered, slid by
-    /// `seat` (0..1). The caller clips nothing — the tray rises from below the screen.
+    /// Draw the tray with its bottom at `bottom`, centred, slid by `seat` (0..1).
+    /// The caller clips nothing: the tray rises from below the screen.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render(
         &mut self,
@@ -1108,7 +998,6 @@ impl Keyboard {
                 let face = if focused {
                     let mut b = accent(1.0);
                     if self.key_flash > 0.02 {
-                        // A just-typed key flashes brighter, then eases back.
                         let f = self.key_flash as f32;
                         b = skia_safe::Color4f::new(
                             b.r + (1.0 - b.r) * 0.5 * f,
@@ -1125,8 +1014,7 @@ impl Keyboard {
                     RRect::new_rect_xy(kr, (9.0 * k) as f32, (9.0 * k) as f32),
                     &fill(face),
                 );
-                // The focused key is filled with the accent, so its letter needs ink that
-                // reads on THAT, not on the field.
+                // Focused fill is accent; letter ink must read on that, not on the field.
                 let ink = if focused {
                     crate::theme::on_accent()
                 } else {
@@ -1173,8 +1061,6 @@ impl Keyboard {
     }
 }
 
-/// A round-capped, round-joined stroke — the console's hand-drawn marks (chevrons, ticks,
-/// the pad silhouettes) all want those, so they get their own wrapper over `theme::stroke`.
 fn stroke_paint(ink: skia_safe::Color4f, width: f32) -> Paint {
     let mut p = stroke(ink, width);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
@@ -1183,7 +1069,7 @@ fn stroke_paint(ink: skia_safe::Color4f, width: f32) -> Paint {
 }
 
 fn draw_space_icon(canvas: &Canvas, cx: f64, cy: f64, k: f64, ink: skia_safe::Color4f) {
-    // ⎵ — an underline bracket.
+    // Space: underline bracket.
     let (w, h) = (16.0 * k, 5.0 * k);
     let p = stroke_paint(ink, (1.6 * k) as f32);
     let mut path = PathBuilder::new();
@@ -1195,7 +1081,7 @@ fn draw_space_icon(canvas: &Canvas, cx: f64, cy: f64, k: f64, ink: skia_safe::Co
 }
 
 fn draw_backspace_icon(canvas: &Canvas, cx: f64, cy: f64, k: f64, ink: skia_safe::Color4f) {
-    // ⌫ — the left-pointing cap with an ✕ inside.
+    // Backspace: left-pointing cap with an × inside.
     let (w, h) = (18.0 * k, 12.0 * k);
     let nose = 6.0 * k;
     let p = stroke_paint(ink, (1.6 * k) as f32);
@@ -1249,8 +1135,7 @@ mod tests {
     #[test]
     fn keyboard_proportional_column_mapping() {
         let mut k = kb();
-        // Walk to the digits row's far right ("0", col 9), then down to the bottom row:
-        // col must land on Done (rightmost of 3), not clamp to some middle key.
+        // Far-right of digits ("0"), then down: col must land on Done, not a middle key.
         for _ in 0..9 {
             k.menu(MenuEvent::Move(MenuDir::Right));
         }
@@ -1270,7 +1155,7 @@ mod tests {
         let mut k = kb();
         let (_, pulse) = k.menu(MenuEvent::Move(MenuDir::Left));
         assert!(matches!(pulse, Some(MenuPulse::Boundary)));
-        // X backspaces, B/Y are done — from anywhere.
+        // X backspaces; B/Y are done, from anywhere.
         assert_eq!(k.menu(MenuEvent::Tertiary).0, KeyMsg::Backspace);
         assert_eq!(k.menu(MenuEvent::Secondary).0, KeyMsg::Done);
         assert_eq!(k.menu(MenuEvent::Back).0, KeyMsg::Done);
@@ -1319,10 +1204,8 @@ mod tests {
         "Profiles",
     ];
 
-    /// The sprung tab pill must accelerate through a burst without ever leaving the strip.
-    /// A spring that carries velocity CAN fly past its target, and the failure mode is a
-    /// highlight that shoots off the end of the section list — this pins that it doesn't,
-    /// and that it still lands exactly on the selected pill afterwards.
+    /// A velocity-carrying spring can overshoot: pin that a burst never leaves
+    /// the strip, and that it still lands on the selected pill.
     #[test]
     fn tab_indicator_rides_a_burst_without_leaving_the_strip() {
         let fonts = crate::theme::build_fonts().unwrap();
@@ -1330,8 +1213,7 @@ mod tests {
         let rect = Rect::from_xywh(0.0, 0.0, 900.0, TAB_STRIP_H as f32);
         let mut strip = TabStrip::new();
         let dt = 1.0 / 60.0;
-        // Seat on the first tab, then a 5-step burst at one press per frame — far faster
-        // than the spring can settle, which is the whole point.
+        // Seat, then a 5-step burst at one press per frame — faster than the spring can settle.
         strip.render(surface.canvas(), rect, &TABS, 0, false, &fonts, 1.0, dt);
         let mut worst_left = f64::MAX;
         let mut worst_right = f64::MIN;
@@ -1341,7 +1223,6 @@ mod tests {
             worst_left = worst_left.min(ix);
             worst_right = worst_right.max(ix + iw);
         }
-        // Then let it land.
         for _ in 0..240 {
             strip.render(surface.canvas(), rect, &TABS, 5, false, &fonts, 1.0, dt);
             let (ix, iw) = strip.indicator.map(|(x, w)| (x.pos, w.pos)).unwrap();
@@ -1366,16 +1247,15 @@ mod tests {
         );
     }
 
-    /// The strip stands on the same column as the heading above it — [`EDGE_INSET`], scaled
-    /// like every other design unit — and gives that column up only in the order a shrinking
-    /// window forces: inset, then centred, then flush. Asserted as that ordering rather than
-    /// against three measured x's, so it still means something when a tab is renamed.
+    /// Same column as the heading ([`EDGE_INSET`]); a shrinking window gives it
+    /// up as inset, then centred, then flush. Ordering, not three pixel x's,
+    /// so a renamed tab does not break the pin.
     #[test]
     fn tab_strip_stands_on_the_edge_inset_and_gives_it_up_in_order() {
         let fonts = crate::theme::build_fonts().unwrap();
         let mut surface = skia_safe::surfaces::raster_n32_premul((1400, 160)).unwrap();
         let dt = 1.0 / 60.0;
-        // What the seven sections actually measure, so nothing below is a hardcoded pixel.
+        // Measure the actual run so nothing below is a hardcoded pixel.
         let mut run = |w: f32, k: f64| {
             let rect = Rect::from_xywh(0.0, 0.0, w, (TAB_STRIP_H * k) as f32);
             let mut strip = TabStrip::new();
@@ -1387,8 +1267,7 @@ mod tests {
             (rect, f64::from(first.left), f64::from(last.right))
         };
 
-        // Room for both insets: the strip starts exactly on the heading's column, at every
-        // scale, and still ends inside the band.
+        // Both insets fit: starts on the heading column at every scale, still inside the band.
         for k in [0.75, 1.0, 2.0] {
             let (rect, left, right) = run(1400.0, k);
             assert!(
@@ -1405,8 +1284,7 @@ mod tests {
         let (_, wide_left, wide_right) = run(1400.0, 1.0);
         let total = wide_right - wide_left;
 
-        // Too narrow for both insets but still wider than the run: it centres, which is the
-        // only placement that does not spend the whole shortfall on one edge.
+        // Narrower than both insets, wider than the run: centre so the shortfall is not all on one edge.
         let (rect, left, right) = run((total + EDGE_INSET) as f32, 1.0);
         assert!(
             (left - f64::from(rect.left) - (f64::from(rect.right) - right)).abs() < 0.5,
@@ -1414,7 +1292,7 @@ mod tests {
             f64::from(rect.right) - right
         );
 
-        // Wider than the band: flush against the leading edge, overflowing right only.
+        // Wider than the band: flush left, overflow right only.
         let (rect, left, right) = run((total - 40.0) as f32, 1.0);
         assert!(
             (left - f64::from(rect.left)).abs() < 0.5,
@@ -1438,13 +1316,10 @@ mod tests {
         }]
     }
 
-    /// One row's pixel region to compare across renders: `(row index, (x0, x1), (y0, y1))`.
     type Band = (usize, (i32, i32), (i32, i32));
 
-    /// A whole COLUMN of steppable value rows — the shape the settings screen actually
-    /// draws, and the one thing a single-row list cannot stand in for: on a one-row list the
-    /// slipping row is the only row, so a crossfade that leaks onto its neighbours has no
-    /// neighbours to leak onto.
+    /// A column of steppable rows. A one-row list cannot catch a crossfade that
+    /// leaks: the slipping row would be the only row.
     fn value_rows(values: &[&str]) -> Vec<RowSpec> {
         values
             .iter()
@@ -1471,8 +1346,7 @@ mod tests {
         px
     }
 
-    /// How many bytes of one band of two readbacks differ. A COUNT rather than the two
-    /// slices, because `assert_eq!` on a megapixel prints a megapixel.
+    /// Differing bytes in one band. A count: `assert_eq!` on a megapixel prints a megapixel.
     fn band_diff(a: &[u8], b: &[u8], w: i32, x: (i32, i32), y: (i32, i32)) -> usize {
         let mut differing = 0;
         for row in y.0..y.1 {
@@ -1487,14 +1361,8 @@ mod tests {
         differing
     }
 
-    /// Stepping ONE row's value leaves every other row's pixels exactly as they were.
-    ///
-    /// The list owns a SINGLE slip spring, so the crossfade alpha derived from it has to be
-    /// gated on the slipping row's identity the way its sibling displacement already is.
-    /// Ungated, one press dropped EVERY value in the list to alpha 0 and faded them back
-    /// over ~200 ms while the labels sat still — a whole settings column blinking on one
-    /// step, and worse on a held repeat, where the accumulated slip pins the alpha at zero
-    /// for several consecutive frames.
+    /// Stepping one row must leave every other row's pixels unchanged. One
+    /// slip spring for the list: ungated alpha blanks the whole value column.
     #[test]
     fn stepping_one_value_leaves_the_other_rows_alone() {
         let fonts = crate::theme::build_fonts().unwrap();
@@ -1505,8 +1373,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         let before = value_rows(&["Native", "Automatic", "20 Mbps", "Balanced", "On", "Off"]);
         let mut list = MenuList::new();
-        // Settled first: the mount entrance, the scroll and the focus ease all travel on
-        // their own, and the claim under test is that nothing ELSE moves.
+        // Settle first: entrance, scroll, and focus travel on their own; the claim is nothing else moves.
         for _ in 0..240 {
             surface.canvas().clear(clear);
             list.render(surface.canvas(), rect, &before, &fonts, 1.0, dt, true);
@@ -1523,9 +1390,8 @@ mod tests {
             .collect();
         let settled = read_back(&mut surface, w, h);
 
-        // The bands really are where those values live: a row whose value string differs
-        // draws differently in exactly this region, so the equality asserted below is not a
-        // comparison of two identical patches of background.
+        // Probe: a different value in this band must actually differ, so the
+        // equality below is not two identical patches of background.
         let mut probe = MenuList::new();
         let probed = value_rows(&["Native", "Automatic", "20 Mbps", "Native", "On", "Off"]);
         for _ in 0..240 {
@@ -1568,17 +1434,9 @@ mod tests {
         assert!(armed, "the step must have animated, or this proves nothing");
     }
 
-    /// A stepped value stays inside its field, however wide the value it is leaving.
-    ///
-    /// Both halves of the crossfade used to share ONE anchor — the right-alignment computed
-    /// from the INCOMING string's width — so the outgoing text was left-aligned on someone
-    /// else's alignment: it appeared displaced by the width difference and hung that far
-    /// past the field, at full alpha, for the whole spring. Nothing clipped it either; the
-    /// widget's only clip is the LIST rect, which is the full window width. "PyroWave (wired
-    /// LAN)" → "AV1" is most of a hundred px of ghost text sitting on the background.
-    ///
-    /// Asserted on the band OUTSIDE the field, whose ink — the › chevron, the panel's own
-    /// edge — is fixed once the row has settled, so any change there is text that escaped.
+    /// A stepped value stays inside its field, however wide the value it leaves.
+    /// Asserted on the band outside the field (chevron, panel edge): that ink
+    /// is fixed once settled, so any change there is escaped text.
     #[test]
     fn a_stepped_value_stays_inside_its_field() {
         let fonts = crate::theme::build_fonts().unwrap();
@@ -1594,8 +1452,7 @@ mod tests {
             list.render(surface.canvas(), rect, &wide, &fonts, 1.0, dt, true);
         }
         let r = list.row_rect(0).expect("the row is on screen");
-        // The field's right edge, as `render` computes it: the row's 16 dp gutter plus the
-        // 18 dp the chevrons reserve, at k = 1. Two px of slack for the clip's own edge.
+        // Field right edge as `render` computes it (16 dp gutter + 18 dp chevrons, k = 1). Two px of clip slack.
         let field_right = (f64::from(r.right) - 16.0 - 18.0).ceil() as i32;
         let outside = (field_right + 2, w);
         let band_y = (r.top as i32, r.bottom.ceil() as i32);
@@ -1618,9 +1475,8 @@ mod tests {
         assert!(armed, "the step must have animated, or this proves nothing");
     }
 
-    /// The value slip: armed only when a step actually CHANGED the value, and always
-    /// settling back onto the row's own position. A slip that never returns to identity
-    /// leaves the value permanently offset, which is the bug this shape can have.
+    /// Slip arms only when the value actually changed, and settles back to
+    /// identity. A slip that never returns leaves the value permanently offset.
     #[test]
     fn value_slip_arms_on_a_real_step_and_settles_to_identity() {
         let fonts = crate::theme::build_fonts().unwrap();
@@ -1635,7 +1491,7 @@ mod tests {
         frame(&mut list, &value_row("10 Mbps"));
         assert_eq!(list.slip.pos, 0.0, "nothing has stepped yet");
 
-        // A step the screen HONOURED: the value it hands back next frame differs.
+        // Honoured: the next frame's value differs.
         assert_eq!(
             list.menu(MenuEvent::Move(MenuDir::Right), 1).0,
             ListMsg::Adjust(1)
@@ -1653,16 +1509,14 @@ mod tests {
         assert_eq!(list.slip.pos, 0.0, "settled back onto the row");
         assert!(list.slip_prev.is_none(), "and forgot the old value");
 
-        // A step the screen REFUSED (value unchanged) must not move anything — this is why
-        // the list detects the change itself instead of trusting the event.
+        // Refused (value unchanged) must not move. The list detects the change; it does not trust the event.
         list.menu(MenuEvent::Move(MenuDir::Right), 1);
         frame(&mut list, &value_row("20 Mbps"));
         assert_eq!(list.slip.pos, 0.0);
         assert!(list.slip_prev.is_none());
     }
 
-    /// Reduced motion keeps the STATE and drops the journey: the value is simply the new
-    /// one, the focus is simply on the row, and a refused move leaves no recoil behind.
+    /// Reduced motion keeps state and drops travel: new value, focused row, no recoil.
     #[test]
     fn reduce_motion_drops_travel_but_not_state() {
         let fonts = crate::theme::build_fonts().unwrap();
@@ -1692,7 +1546,7 @@ mod tests {
         );
         assert_eq!(list.slip.pos, 0.0, "no slip under reduced motion");
         assert!(list.slip_prev.is_none());
-        // A refused move still pulses (the screen's job) but leaves no recoil travel.
+        // Refused move still pulses; no recoil travel.
         assert!(matches!(
             list.menu(MenuEvent::Move(MenuDir::Up), 1).1,
             Some(MenuPulse::Boundary)
@@ -1707,14 +1561,13 @@ mod tests {
             true,
         );
         assert_eq!(list.bump.pos, 0.0, "recoil travel suppressed");
-        // The focus channel still ARRIVES — reduced motion is not "unfocused".
+        // Focus still arrives: reduced motion is not unfocused.
         assert_eq!(list.focus_pop[0].pos, 1.0);
         crate::theme::set_reduce_motion(false);
     }
 
-    /// The mount entrance arms once, retires when it is over (so the steady state pays
-    /// nothing for it at all), and is NOT replayed by a tab switch — re-fanning the rows on
-    /// every L1/R1 would turn a skim through the sections into a flicker.
+    /// Mount entrance arms once, retires when done, and is not replayed by a
+    /// tab switch (re-fanning on every L1/R1 would flicker a skim).
     #[test]
     fn menu_list_entrance_plays_once_and_retires() {
         let fonts = crate::theme::build_fonts().unwrap();

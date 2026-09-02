@@ -1,6 +1,5 @@
-//! GF(2¹⁶) Leopard-RS backend (`reed-solomon-simd`). SIMD, O(n log n), up to 65535
-//! shards/block — this is what removes the GameStream 255-shard / ~1 Gbps wall.
-//! Shard length must be even.
+//! GF(2¹⁶) Leopard-RS backend (`reed-solomon-simd`). SIMD, O(n log n), up to
+//! 65535 shards/block. Shard length must be even.
 
 use super::{
     validate_block_shape, validate_encode_shape, validate_into_shape, ErasureCoder, FecError,
@@ -11,12 +10,9 @@ use std::sync::Mutex;
 
 #[derive(Default)]
 pub struct Gf16Coder {
-    /// Cached Leopard encoder (plan Phase 1.4): `reset()` re-shapes it per block while
-    /// reusing its working space, so steady-state frames cost no encoder construction (the
-    /// old `reed_solomon_simd::encode` convenience call built one — engine CPU-feature
-    /// detection, FFT planning, work-buffer allocs — per block). `Mutex` only to keep the
-    /// `&self` trait surface; a session's coder is driven by its one send thread, so the
-    /// lock is uncontended.
+    /// Cached encoder. `reset()` reshapes per block and reuses working space.
+    /// `Mutex` keeps the `&self` trait surface; the session's one send thread
+    /// holds it uncontended.
     enc: Mutex<Option<ReedSolomonEncoder>>,
 }
 
@@ -64,8 +60,7 @@ impl ErasureCoder for Gf16Coder {
                 .map_err(|_| FecError::Backend("gf16 add shard"))?;
         }
         let result = enc.encode().map_err(|_| FecError::Backend("gf16 encode"))?;
-        // Copy the parity into the caller's pooled buffers: existing `Vec`s are reused
-        // (clear keeps capacity), the pool grows once to the session's high-water M.
+        // Reuse pooled `Vec`s (`clear` keeps capacity); grow once to high-water M.
         out.truncate(recovery_count);
         let mut parity = result.recovery_iter();
         for buf in out.iter_mut() {
@@ -98,7 +93,6 @@ impl ErasureCoder for Gf16Coder {
                 need: data_count,
             });
         }
-        // Fast path: all originals already present, or FEC disabled.
         let originals_complete = received[..data_count].iter().all(|s| s.is_some());
         if recovery_count == 0 || originals_complete {
             let mut out = Vec::with_capacity(data_count);
@@ -111,7 +105,6 @@ impl ErasureCoder for Gf16Coder {
             return Ok(out);
         }
 
-        // Hand the decoder the surviving originals and recovery shards, indexed.
         let original_in: Vec<(usize, &[u8])> = received[..data_count]
             .iter()
             .enumerate()
@@ -127,7 +120,6 @@ impl ErasureCoder for Gf16Coder {
             reed_solomon_simd::decode(data_count, recovery_count, original_in, recovery_in)
                 .map_err(|_| FecError::Backend("gf16 decode"))?;
 
-        // Merge surviving originals with the recovered ones.
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(data_count);
         for (i, slot) in received[..data_count].iter().enumerate() {
             if let Some(s) = slot {
@@ -150,14 +142,14 @@ impl ErasureCoder for Gf16Coder {
     ) -> Result<(), FecError> {
         validate_into_shape(data, have, recovery, recovery_count)?;
         if have.iter().all(|h| *h) {
-            return Ok(()); // nothing missing — no codec work, no copies
+            return Ok(());
         }
         if data[0].len() % 2 != 0 {
             return Err(FecError::Config("GF(2^16) shard length must be even"));
         }
         let data_count = data.len();
-        // Present originals as indexed refs (shared reborrows of the caller's slots); the decoder
-        // returns the restored shards owned, so the borrows end before the write-back below.
+        // Indexed refs into the caller's slots; decoder returns owned shards,
+        // so these borrows end before the write-back below.
         let original_in: Vec<(usize, &[u8])> = data
             .iter()
             .zip(have)

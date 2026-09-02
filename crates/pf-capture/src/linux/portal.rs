@@ -1,32 +1,28 @@
-//! The portal CONTROL PLANE: the xdg ScreenCast / RemoteDesktop handshake (async, `ashpd` over
-//! zbus, on its own tokio runtime), the cursor-mode choice, and GNOME's BT.2100 colour-mode probe.
+//! xdg ScreenCast / RemoteDesktop control plane: ashpd handshake on a dedicated
+//! tokio runtime, cursor-mode ladder, and GNOME's BT.2100 colour-mode probe.
 //!
-//! Split out of `linux/mod.rs` (sweep Phase 5.3) to separate the async control plane from the
-//! realtime half: nothing here runs per frame — the handshake happens once, then the thread parks
-//! until `PortalSession`'s `Drop` (in the parent) releases it, and DROPPING the zbus
-//! connection is what ends the compositor's cast. The probe is likewise a one-shot D-Bus round-trip
-//! for a control-plane caller.
+//! Nothing here is per-frame. The handshake runs once; the thread then parks until
+//! `PortalSession`'s `Drop` (parent module) fires `quit_rx`. ashpd's `Session` has
+//! no `Drop` — releasing the zbus connection is what ends the compositor's cast.
+//! Drop the runtime before signalling done so that session is actually gone.
+//!
+//! HDR offer is scoped to `PUNKTFUNK_CAPTURE_MONITOR` when set; unpinned it is
+//! "any head in BT.2100". See `design/per-monitor-portal-capture.md`. The probe
+//! is one session-bus round-trip; call from control-plane threads only.
 
 use anyhow::{anyhow, Context, Result};
 use std::os::fd::OwnedFd;
 
-/// Whether the monitor this host would mirror is currently in BT.2100 (HDR) colour mode — the
-/// precondition for Mutter's monitor screencast advertising the 10-bit PQ formats (GNOME 50+;
-/// Mutter only appends the HDR formats while the mirrored monitor's colour state is BT.2020+PQ).
-/// Queried over the session bus: `DisplayConfig.GetCurrentState`, monitor property
-/// `"color-mode" == 1` (`META_COLOR_MODE_BT2100`). `false` on any error — not GNOME, a pre-48
-/// Mutter without colour modes, no monitors — so callers fall back to the honest SDR offer.
-/// Blocking (one D-Bus round-trip on a fresh connection); call from control-plane threads only.
+/// Mutter advertises 10-bit PQ only while the mirrored head is BT.2100.
+/// `false` on any error (not GNOME, no colour modes, no monitors) so the
+/// caller offers SDR. Blocking session-bus round-trip; control-plane only.
 ///
-/// **Scoped to `PUNKTFUNK_CAPTURE_MONITOR` when it is set** (`design/per-monitor-portal-capture.md`
-/// §7.4). Without a pin this asks "is ANY monitor in HDR mode", which was a fair heuristic while the
-/// capture path took whatever monitor it was handed — but once the operator names the head, an
-/// HDR-capable *neighbour* must not talk this host into offering PQ formats for an SDR panel.
+/// When `PUNKTFUNK_CAPTURE_MONITOR` is set, only that connector counts — an
+/// HDR neighbour must not pull PQ onto an SDR panel. Unpinned: any head.
+/// See `design/per-monitor-portal-capture.md`.
 pub fn gnome_hdr_monitor_active() -> bool {
     use ashpd::zbus;
-    // GetCurrentState reply: (serial, monitors, logical_monitors, properties); each monitor is
-    // (spec(ssss), modes a(siiddada{sv}), properties a{sv}) — "color-mode" lives in the monitor
-    // properties.
+    // `color-mode` is on the monitor properties dict, not the logical-monitor one.
     type Mode = (
         String,
         i32,
@@ -57,8 +53,8 @@ pub fn gnome_hdr_monitor_active() -> bool {
         std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
     );
     let probe = || -> Result<bool> {
-        // zbus is built async-only here (ashpd's tokio integration) — run the one round-trip on
-        // a throwaway current-thread runtime; this is a control-plane call, never per-frame.
+        // zbus is async-only here (ashpd's tokio). Throwaway current-thread runtime:
+        // one round-trip, not the handshake path that needs a pumped reader.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -105,14 +101,9 @@ pub fn gnome_hdr_monitor_active() -> bool {
     }
 }
 
-/// Should this host offer the HDR (10-bit PQ) formats, given each head as `(connector, is_bt2100)`
-/// and the `PUNKTFUNK_CAPTURE_MONITOR` pin?
-///
-/// Pinned: only that head's colour mode counts — an HDR-capable neighbour must not talk the host
-/// into offering PQ for the SDR panel it is actually streaming. A pin naming no live head reports
-/// SDR rather than falling back to "any": the session is about to fail on that same missing
-/// monitor, and an over-claimed HDR offer would be a second, quieter wrong answer.
-/// Unpinned: the pre-existing "any monitor is in HDR mode" heuristic, unchanged.
+/// Pinned: only that connector's BT.2100 bit. A pin that names no live head is
+/// SDR, not "any" — the session is about to fail on that missing monitor, and an
+/// HDR offer would be a second wrong answer it would not fail on. Unpinned: any head.
 fn hdr_offer_for(heads: &[(&str, bool)], pinned: Option<&str>) -> bool {
     match pinned {
         Some(want) => heads
@@ -123,16 +114,11 @@ fn hdr_offer_for(heads: &[(&str, bool)], pinned: Option<&str>) -> bool {
     }
 }
 
-/// Pick the ScreenCast cursor mode from what the backend advertises (`AvailableCursorModes`).
-/// With `want_metadata` the ladder prefers **cursor-as-metadata**: the compositor keeps its cheap
-/// hardware cursor plane and ships the pointer as PipeWire `SPA_META_Cursor` metadata (position +
-/// an occasional bitmap), which the consumer composites itself — avoiding the producer burning the
-/// cursor into every frame (`Embedded`), which on gamescope would defeat its HW cursor plane.
-/// Without it — the session's encode path has no compositing stage for a metadata cursor
-/// (`pf-encode`'s `cursor_blend_capable` said the resolved backend can't blend) — the ladder
-/// prefers `Embedded`, so the pointer is in the pixels instead of in metadata nothing would draw.
-/// Both ladders fall through to the other mode, then `Hidden`; a failed property query (an older
-/// portal) keeps the prior `Embedded` behavior so the cursor is never silently lost.
+/// Ladder against `AvailableCursorModes`. Metadata keeps the HW cursor plane
+/// and ships `SPA_META_Cursor`; Embedded burns the pointer into every frame
+/// (gamescope: that defeats its HW plane). Prefer Metadata when `want_metadata`;
+/// otherwise Embedded — a metadata cursor with no blend stage is never drawn.
+/// A failed query defaults Embedded so an older portal does not silently hide it.
 async fn choose_cursor_mode(
     proxy: &ashpd::desktop::screencast::Screencast,
     want_metadata: bool,
@@ -162,8 +148,8 @@ async fn choose_cursor_mode(
             CursorMode::Embedded
         }
         Ok(avail) if avail.contains(CursorMode::Metadata) => {
-            // Embedded wanted but not offered. Metadata still beats Hidden: the CPU capture
-            // path composites `SPA_META_Cursor` inline, so part of the matrix keeps a pointer.
+            // Embedded wanted, not offered. Metadata still beats Hidden: the CPU
+            // path composites `SPA_META_Cursor` inline.
             tracing::warn!(
                 ?avail,
                 "ScreenCast: Embedded cursor not advertised — requesting cursor-as-metadata \
@@ -188,9 +174,8 @@ async fn choose_cursor_mode(
     }
 }
 
-/// The portal handshake: connect ScreenCast, select a single monitor, start, open the
-/// PipeWire remote, hand the fd + node id back, then keep the session alive until `quit_rx`
-/// resolves (the capturer's `Drop` — see [`PortalSession`]).
+/// Handshake then park on `quit_rx`. ashpd `Session` has no `Drop`; holding
+/// the zbus connection is what keeps the compositor's cast alive.
 pub(super) fn portal_thread(
     setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>,
     quit_rx: tokio::sync::oneshot::Receiver<()>,
@@ -200,9 +185,9 @@ pub(super) fn portal_thread(
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
 
-    // Multi-thread runtime: the zbus connection's background reader must be pumped
-    // continuously across the create_session → select_sources → start handshake, or the
-    // portal reports "Invalid session". (A current-thread runtime starves it.)
+    // Multi-thread: zbus's background reader must stay pumped across
+    // create_session → select_sources → start, or the portal returns
+    // "Invalid session". A current-thread runtime starves it.
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -231,9 +216,8 @@ pub(super) fn portal_thread(
                     &session,
                     SelectSourcesOptions::default()
                         .set_cursor_mode(cursor_mode)
-                        // Only MONITOR is offered by the wlroots backend
-                        // (AvailableSourceTypes=1); requesting unsupported types
-                        // invalidates the session.
+                        // wlroots advertises MONITOR only (`AvailableSourceTypes=1`).
+                        // Asking for an unsupported type invalidates the session.
                         .set_sources(BitFlags::from_flag(SourceType::Monitor))
                         .set_multiple(false)
                         .set_persist_mode(PersistMode::DoNot),
@@ -263,9 +247,8 @@ pub(super) fn portal_thread(
                 .send(Ok((fd, node_id)))
                 .map_err(|_| anyhow!("capturer dropped before setup completed"))?;
 
-            // Keep `proxy` + `session` (and the underlying zbus connection) alive for the
-            // capture; the cast is torn down when the connection drops (ashpd's `Session`
-            // has no `Drop`) — which now happens when this park returns, not at process exit.
+            // Hold `proxy` + `session` (the zbus connection). ashpd `Session` has
+            // no `Drop`; the compositor ends the cast when that connection drops.
             let _keep_alive = (&proxy, &session);
             let _ = quit_rx.await;
             Ok(())
@@ -276,18 +259,17 @@ pub(super) fn portal_thread(
             let _ = err_tx.send(Err(format!("{e:#}")));
         }
     });
-    // Drop the runtime HERE, before the caller signals completion: shutting the 2 workers down is
-    // what finishes releasing the zbus connection, so a `done` signal sent after this means the
-    // compositor-side session is really gone (see `PortalSession::drop`).
+    // Drop the runtime before the caller signals done: the two workers finishing
+    // is what releases the zbus connection, so the compositor session is gone
+    // (`PortalSession::drop`).
     drop(rt);
 }
 
-/// Combined RemoteDesktop+ScreenCast portal setup (KWin/GNOME). ScreenCast sources are selected
-/// on a session created via RemoteDesktop, so a single RemoteDesktop `start` grant —
-/// pre-authorized headlessly via the `kde-authorized` permission, exactly like the libei input
-/// path — also covers screen capture, with no separate ScreenCast dialog (which has no such
-/// bypass). Yields the same PipeWire fd + node id as the standalone path; the consumer is
-/// identical, as is the `quit_rx` teardown park (see [`PortalSession`]).
+/// RemoteDesktop+ScreenCast on one session (KWin/GNOME). Sources are selected on
+/// a RemoteDesktop session so a single `start` grant — the `kde-authorized`
+/// headless bypass, same as libei — covers capture. ScreenCast has no such
+/// bypass; a standalone path would show a dialog. Same fd + node id, same
+/// `quit_rx` park as [`portal_thread`].
 pub(super) fn portal_thread_remote_desktop(
     setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>,
     quit_rx: tokio::sync::oneshot::Receiver<()>,
@@ -323,9 +305,9 @@ pub(super) fn portal_thread_remote_desktop(
                 .create_session(Default::default())
                 .await
                 .context("create RemoteDesktop session")?;
-            // RemoteDesktop requires a device selection; we never connect_to_eis on this session
-            // (input injection runs its own), but selecting devices is what makes `start` the
-            // RemoteDesktop grant the kde-authorized bypass covers.
+            // Device selection is required even though this session never
+            // `connect_to_eis` (inject has its own). Without it, `start` is not
+            // the RemoteDesktop grant `kde-authorized` covers.
             remote
                 .select_devices(
                     &session,
@@ -372,8 +354,7 @@ pub(super) fn portal_thread_remote_desktop(
                 .send(Ok((fd, node_id)))
                 .map_err(|_| anyhow!("capturer dropped before setup completed"))?;
 
-            // Keep the proxies + session (and their zbus connection) alive for the capture, until
-            // the capturer's `Drop` fires the quit channel.
+            // Same as `portal_thread`: hold the zbus connection until `quit_rx`.
             let _keep_alive = (&remote, &screencast, &session);
             let _ = quit_rx.await;
             Ok(())
@@ -398,8 +379,6 @@ mod hdr_offer_tests {
         assert!(!hdr_offer_for(&[("DP-1", false)], None));
     }
 
-    /// The regression this exists to prevent: an HDR TV on HDMI while the pinned head is an SDR
-    /// desk monitor. Before scoping, the host offered PQ formats for a panel that can't show them.
     #[test]
     fn a_pin_ignores_an_hdr_neighbour() {
         let heads = [("DP-1", false), ("HDMI-A-1", true)];

@@ -1,20 +1,19 @@
-//! **How was this installed, and on which channel?** (design §4.1)
+//! Install-kind and channel detection for the host and the Linux client.
 //!
-//! The apply strategy — and, where no apply leg exists, the command hint a UI shows — hangs
-//! off the install kind. Detection is a ladder over facts nothing request-side can influence:
-//! packaging writes a root-owned marker, a sysext self-identifies via its merged
-//! extension-release, a flatpak by its sandbox, Nix by store path, and so on.
+//! The apply path (and the command hint when there is none) hangs off the
+//! install kind. The ladder reads facts the request side cannot influence:
+//! a root-owned marker, a merged sysext extension-release, a flatpak
+//! sandbox, a Nix store path.
 //!
-//! The ladder is shared between the host and the client because the delivery channels are the
-//! same ones; what differs is spelled out in [`Product`] — which marker file to read, whether
-//! a flatpak rung exists at all, and what a user-owned binary means. The ladder itself is a
-//! pure function over a [`Probe`], so every rung is unit-testable without a box.
+//! Host and client share the ladder; [`Product`] picks the marker, whether
+//! a flatpak rung exists, and what a user-owned binary means. [`classify`]
+//! is a pure function over [`Probe`], so each rung is unit-testable without
+//! a box.
 
 use crate::version::{conf_channel, windows_channel_of, Channel};
 use std::path::{Path, PathBuf};
 
-/// Which punktfunk program is asking. The rungs differ (see the module docs), and mixing them
-/// up would misreport a client-only box as an un-updatable host.
+/// Which program is asking. Mixing host and client would misreport a client-only box as an un-updatable host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Product {
     Host,
@@ -22,15 +21,11 @@ pub enum Product {
 }
 
 impl Product {
-    /// Where this product's packaging stamps how it was installed. First word = kind
-    /// (`apt`|`dnf`|`pacman`), optional second word = channel (`stable`|`canary`).
+    /// First word = kind (`apt`|`dnf`|`pacman`), optional second = channel (`stable`|`canary`).
     ///
-    /// The two products use SEPARATE files on purpose: a box can carry both packages, and
-    /// every packaging format we ship treats two packages owning one path as a hard conflict.
-    ///
-    /// The client's lives in its own DIRECTORY, not just under its own name, because the host
-    /// RPM claims `%{_datadir}/punktfunk/*` with a glob — a sibling file in there would be
-    /// owned by both subpackages and `dnf install punktfunk punktfunk-client` would refuse.
+    /// Separate files: a box can carry both packages, and two packages owning one path is a
+    /// packaging conflict. The client file is in its own directory because the host RPM
+    /// claims `%{_datadir}/punktfunk/*` — a sibling would be owned by both subpackages.
     pub fn marker_path(self) -> &'static str {
         match self {
             Product::Host => "/usr/share/punktfunk/install-kind",
@@ -38,8 +33,7 @@ impl Product {
         }
     }
 
-    /// The merged sysext names itself here (written by the sysext build scripts); its presence
-    /// means the running `/usr` overlay came from that image, regardless of any leftover marker.
+    /// Merged sysext identity. Presence means `/usr` came from that image, even if a leftover marker remains.
     pub fn sysext_marker(self) -> &'static str {
         match self {
             Product::Host => "/usr/lib/extension-release.d/extension-release.punktfunk",
@@ -47,7 +41,6 @@ impl Product {
         }
     }
 
-    /// The binary name, for the command hints.
     pub fn binary(self) -> &'static str {
         match self {
             Product::Host => "punktfunk-host",
@@ -56,7 +49,7 @@ impl Product {
     }
 }
 
-/// The sysext updater's own config (`CHANNEL=stable|canary`).
+/// `CHANNEL=stable|canary` for the sysext updater.
 const SYSEXT_CONF: &str = "/etc/punktfunk-sysext.conf";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,38 +84,29 @@ impl InstallKind {
     }
 }
 
-/// The facts the ladder reads, gathered once by [`gather`] (tests build these directly).
+/// Inputs to [`classify`]. Tests construct this; [`gather`] fills it from the box.
 #[derive(Debug, Default)]
 pub struct Probe {
-    /// Running on Windows (cfg, not a file).
     pub windows: bool,
-    /// The running exe's path.
     pub exe: PathBuf,
-    /// `$HOME`, if any.
     pub home: Option<PathBuf>,
-    /// This process is inside a flatpak sandbox.
     pub flatpak: bool,
-    /// Contents of [`Product::marker_path`], if present.
     pub marker: Option<String>,
-    /// [`Product::sysext_marker`] exists (merged sysext overlay).
     pub sysext: bool,
-    /// Contents of [`SYSEXT_CONF`], if present.
     pub sysext_conf: Option<String>,
-    /// `/run/ostree-booted` exists (rpm-ostree / bootc family).
+    /// `/run/ostree-booted` (rpm-ostree / bootc).
     pub ostree_booted: bool,
-    /// The asking binary's own version string, for the Windows channel heuristic.
+    /// Fed to [`windows_channel_of`].
     pub version: String,
 }
 
-/// Gather the real probe for `product`. Cheap (a few `stat`s and two small reads); consumers
-/// cache the classification, not this.
+/// Live probe for `product`. Consumers cache [`classify`], not this.
 pub fn gather(product: Product, version: &str) -> Probe {
     Probe {
         windows: cfg!(target_os = "windows"),
         exe: std::env::current_exe().unwrap_or_default(),
         home: std::env::var_os("HOME").map(PathBuf::from),
-        // Both are set by flatpak inside the sandbox; the exe path is the belt to that
-        // env-var braces, since a portal-spawned process can inherit a stripped environment.
+        // FLATPAK_ID can be missing after a portal spawn; `/.flatpak-info` still exists.
         flatpak: product == Product::Client
             && (std::env::var_os("FLATPAK_ID").is_some() || Path::new("/.flatpak-info").exists()),
         marker: std::fs::read_to_string(product.marker_path()).ok(),
@@ -133,14 +117,14 @@ pub fn gather(product: Product, version: &str) -> Probe {
     }
 }
 
-/// The ladder (design §4.1). Order matters and each rung is a fact the caller can't forge:
-/// flatpak sandbox > sysext overlay > Nix store path > dev/source tree > user-owned Deck
-/// build > package marker (flipped to rpm-ostree when the box is ostree-booted) > `source`.
+/// Order matters; each rung is a fact the caller cannot forge.
+/// flatpak > sysext > Nix store > cargo `target/` > user-owned Deck build >
+/// package marker (rpm-ostree when ostree-booted) > `source`.
 pub fn classify(p: &Probe, product: Product) -> (InstallKind, Channel) {
     if p.windows {
-        // The installer is the only supported Windows delivery; a loose cargo build shows
-        // itself by not living under Program Files. Channel: canary installers carry the CI
-        // run as the third component (`M.m.<run>`), see `windows_channel_of`.
+        // Only the installer is a Windows delivery. A cargo build is not under
+        // Program Files. Canary installers put the CI run in the third version
+        // component (`M.m.<run>`).
         let installed = p
             .exe
             .to_string_lossy()
@@ -156,8 +140,7 @@ pub fn classify(p: &Probe, product: Product) -> (InstallKind, Channel) {
         };
     }
 
-    // Inside the sandbox `/usr` is the runtime's, so every file rung below would read the
-    // WRONG box's facts. This must stay first.
+    // Sandbox `/usr` is the runtime; file rungs below would read the wrong box. Stay first.
     if p.flatpak {
         return (InstallKind::Flatpak, Channel::Stable);
     }
@@ -175,18 +158,16 @@ pub fn classify(p: &Probe, product: Product) -> (InstallKind, Channel) {
         return (InstallKind::Nix, Channel::Stable);
     }
 
-    // A cargo tree anywhere (CI, dev box, the Deck checkout mid-build) is `source`; the
-    // Deck's install script runs the binary out of `~/punktfunk/target-steamos/`, which is
-    // user-owned but NOT a plain `target/` dir — that distinction is the marker here.
+    // Cargo `target/` is source even under $HOME. The Deck install lives in
+    // `target-steamos/`, user-owned but not a cargo tree.
     let exe_str = p.exe.to_string_lossy().to_string();
     if exe_str.contains("/target/") {
         return (InstallKind::Source, Channel::Stable);
     }
     if let Some(home) = &p.home {
         if p.exe.starts_with(home) {
-            // Only the HOST has an on-device Deck build (scripts/steamdeck/update.sh builds
-            // the host). A client binary under $HOME is someone's own build or a copy into
-            // ~/.local/bin — nothing knows how to update it, so say `source` and mean it.
+            // Only the host has an on-device Deck build (`scripts/steamdeck/update.sh`).
+            // A client under $HOME is a private copy — report `source`.
             return match product {
                 Product::Host => (InstallKind::SteamosSource, Channel::Canary),
                 Product::Client => (InstallKind::Source, Channel::Stable),
@@ -203,8 +184,7 @@ pub fn classify(p: &Probe, product: Product) -> (InstallKind, Channel) {
         };
         let kind = match kind {
             "apt" => Some(InstallKind::Apt),
-            // An ostree-booted box consumed the RPM by layering (or an image build); either
-            // way `dnf upgrade` is not how it updates.
+            // Ostree consumed the RPM by layering; `dnf upgrade` is not the update path.
             "dnf" if p.ostree_booted => Some(InstallKind::RpmOstree),
             "dnf" => Some(InstallKind::Dnf),
             "pacman" => Some(InstallKind::Pacman),
@@ -218,8 +198,7 @@ pub fn classify(p: &Probe, product: Product) -> (InstallKind, Channel) {
     (InstallKind::Source, Channel::Stable)
 }
 
-/// The per-kind "how to update" command a UI shows while (or instead of) an apply path
-/// existing (design §5). One line, copy-pastable, no placeholders.
+/// One-line, copy-pastable "how to update" hint. No placeholders.
 pub fn update_command(kind: InstallKind, product: Product) -> String {
     let bin = product.binary();
     match (kind, product) {
@@ -227,8 +206,7 @@ pub fn update_command(kind: InstallKind, product: Product) -> String {
             "winget upgrade unom.PunktfunkHost   (or re-run the newer installer)".into()
         }
         (InstallKind::Flatpak, _) => "flatpak update --user io.unom.Punktfunk".into(),
-        // The signed sysext feed carries the HOST image only; a client sysext is the local
-        // `packaging/arch/build-sysext.sh` wrapper, which has no feed to update from.
+        // The signed feed carries the host image only; the client sysext is a local rebuild.
         (InstallKind::Sysext, Product::Host) => "sudo punktfunk-sysext update".into(),
         (InstallKind::Sysext, Product::Client) => {
             "rebuild the client sysext: bash packaging/arch/build-sysext.sh <new .pkg.tar.zst> \
@@ -315,8 +293,6 @@ mod tests {
         assert_eq!(classify(&p, Product::Host).0, InstallKind::SteamosSource);
     }
 
-    /// The same user-owned path means something else for the client: there is no on-device
-    /// client build script, so it must not claim the Deck source-rebuild leg.
     #[test]
     fn ladder_user_owned_client_is_plain_source() {
         let mut p = probe("/home/deck/.local/bin/punktfunk-client");
@@ -351,8 +327,6 @@ mod tests {
         assert_eq!(classify(&p, Product::Host).0, InstallKind::Source);
     }
 
-    /// Inside the sandbox every /usr fact belongs to the flatpak runtime, not the box — so a
-    /// leftover host marker on the real system must not win.
     #[test]
     fn flatpak_wins_over_every_file_rung() {
         let mut p = probe("/app/bin/punktfunk-client");
@@ -381,7 +355,6 @@ mod tests {
         assert_eq!(classify(&p, Product::Host).0, InstallKind::Source);
     }
 
-    /// Command hints are user-facing copy — they must name the right package per product.
     #[test]
     fn hints_are_product_specific() {
         assert!(update_command(InstallKind::Apt, Product::Client).contains("punktfunk-client"));

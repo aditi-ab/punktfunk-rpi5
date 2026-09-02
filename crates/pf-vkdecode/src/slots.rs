@@ -1,11 +1,9 @@
-//! The hardware DPB slot ledger: [`pf_bitstream::h264::PicId`]s mapped to the slot
-//! indices a Vulkan Video session binds DPB images by.
+//! Maps planner [`PicId`]s to the DPB slot indices a Vulkan Video session binds
+//! images by.
 //!
-//! Division of labour: pf-bitstream's DPB runs the 8.2.5/C.4.5.3 processes and
-//! DECIDES which pictures live and die — this map only translates its verdicts into
-//! stable slot indices. It therefore never evicts on its own: running out of slots is
-//! an error ([`SlotError::Full`]), because it can only mean removals were missed, and
-//! a silent eviction would hide that bug behind corrupted output.
+//! pf-bitstream owns which pictures live; this ledger only translates those
+//! verdicts. It never evicts: [`SlotError::Full`] means a `removed` entry was
+//! missed. A silent eviction would hide that behind corrupted output.
 
 use pf_bitstream::h264::DpbUpdate;
 use pf_bitstream::h264::PicId;
@@ -14,12 +12,12 @@ use tracing::trace;
 /// The H.264 slot ceiling: 16 reference frames plus the picture being decoded.
 const MAX_SLOTS: usize = 17;
 
-/// What went wrong with a slot operation. Both variants are caller bugs, not stream
-/// conditions — pf-bitstream degrades stream damage to warnings long before here.
+/// Caller bugs, not stream conditions — pf-bitstream degrades stream damage
+/// to warnings long before here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotError {
-    /// No free slot. The map is sized to `max_dpb_frames + 1`, which the planner's
-    /// DPB never exceeds; overflow means this map missed `removed` entries.
+    /// Sized to `max_dpb_frames + 1`, which the planner never exceeds; overflow
+    /// means this map missed a `removed` entry.
     Full { capacity: usize },
     /// The id already holds a slot; ids are per-picture and never re-assigned.
     AlreadyAssigned { id: PicId, slot: u8 },
@@ -43,45 +41,32 @@ impl std::fmt::Display for SlotError {
 
 impl std::error::Error for SlotError {}
 
-/// The slot ledger. One per decode session; feed it every [`DpbUpdate`] in decode
-/// order.
+/// Per-session PicId → slot index. Feed every [`DpbUpdate`] in decode order.
 ///
-/// [`Self::apply`] does that whole-update. `plan_to_vk` and `plan_to_vk_av1` do it in
-/// two halves instead: they ASSIGN the stored picture and hand the removals back as a
-/// `release_after_decode` list for the caller to apply once the decode op is issued.
-/// The split is not a convenience — releasing a removal before the assignment lets
-/// [`Self::assign`] return the slot this AU's own submission still names, which is a
-/// picture decoding into one it predicts from. A caller that drops the list leaks a
-/// slot per AU.
+/// [`Self::apply`] releases `removed` immediately. `plan_to_vk` and
+/// `plan_to_vk_av1` assign the stored picture and return removals as
+/// `release_after_decode` — apply that list only after the decode is issued.
+/// Releasing first lets [`Self::assign`] recycle a slot this AU still names.
+/// Dropping the list leaks one slot per AU.
 ///
-/// `plan_to_vk_h265` still applies its removals internally, and that is safe rather
-/// than lucky: `H265Planner` snapshots `dpb_refs` AFTER `decode_rps`, so a picture
-/// this AU's RPS dropped is never in the set its reference lists are built from.
+/// `plan_to_vk_h265` applies removals internally: `H265Planner` snapshots
+/// `dpb_refs` after `decode_rps`, so a dropped picture is never in this AU's
+/// reference lists.
 ///
-/// Invariants (unit-tested):
-/// - a [`PicId`] keeps its slot from [`Self::assign`] until [`Self::release`];
-/// - a slot is reused only after its holder is released;
-/// - assigning past capacity errors instead of evicting.
-///
-/// Slots are pure planner bookkeeping: consumers never hold a SLOT (the decoder's
-/// picture pool decouples IMAGES from slots — a re-activated slot binds a fresh
-/// free image, so a delivered picture's image is never a decode target while the
-/// consumer reads it).
+/// Slots are planner bookkeeping. The picture pool binds a fresh image on
+/// re-activation, so a delivered image is never a decode target while a
+/// consumer reads it.
 #[derive(Debug, Clone)]
 pub struct SlotMap {
-    /// `slots[i]` holds the id bound to slot `i`, `None` while the slot is free.
     slots: Vec<Option<PicId>>,
 }
 
 impl SlotMap {
-    /// Sized from [`pf_bitstream::h264::PicturePlan::max_dpb_frames`] plus one for
-    /// the picture being decoded (its setup slot coexists with a full reference
-    /// window).
+    /// `max_dpb_frames + 1` so the setup slot coexists with a full reference window.
     ///
-    /// pf-bitstream's envelope gate rejects any SPS asking for a DPB deeper than the
-    /// spec's 16 frames before a plan exists, so a larger request here is a caller
-    /// bug — debug-asserted, never silently clamped (a clamp would turn the bug into
-    /// silent evictions later).
+    /// Larger than the H.264 16-frame ceiling is a caller bug (the envelope gate
+    /// already rejected it). Debug-asserted, never clamped: a clamp would become
+    /// silent evictions later.
     pub fn new(max_dpb_frames: usize) -> Self {
         debug_assert!(
             max_dpb_frames < MAX_SLOTS,
@@ -93,19 +78,14 @@ impl SlotMap {
         }
     }
 
-    /// Total slot count (fixed at construction).
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }
 
-    /// Slots currently held.
     pub fn active(&self) -> usize {
         self.slots.iter().filter(|slot| slot.is_some()).count()
     }
 
-    /// The held slots as `(slot, id)` pairs, in slot order — WP-B walks this to
-    /// build `VkVideoReferenceSlotInfoKHR` bindings and to map slots back to their
-    /// images.
     pub fn held(&self) -> impl Iterator<Item = (u8, PicId)> + '_ {
         self.slots
             .iter()
@@ -114,7 +94,6 @@ impl SlotMap {
             .filter_map(|(index, slot)| slot.map(|id| (index as u8, id)))
     }
 
-    /// Bind `id` to the lowest free slot.
     pub fn assign(&mut self, id: PicId) -> Result<u8, SlotError> {
         if let Some(slot) = self.slot_of(id) {
             return Err(SlotError::AlreadyAssigned { id, slot });
@@ -131,7 +110,6 @@ impl SlotMap {
         Ok(free as u8)
     }
 
-    /// The slot `id` holds, if any.
     pub fn slot_of(&self, id: PicId) -> Option<u8> {
         self.slots
             .iter()
@@ -140,19 +118,13 @@ impl SlotMap {
             .map(|index| index as u8)
     }
 
-    /// Free `id`'s slot. Returns whether the id held one.
+    /// End DPB residency for `id`. A picture holds its slot while the planner
+    /// holds it as a reference or as a decoded picture awaiting output; only a
+    /// [`DpbUpdate::removed`] entry ends that. `plan_to_vk` / `plan_to_vk_av1`
+    /// defer this via `release_after_decode` until the decode is issued.
     ///
-    /// Slot lifetime is DPB RESIDENCY: a picture holds its slot for exactly as long
-    /// as the planner's DPB holds the picture — as a reference OR as a decoded
-    /// picture awaiting output — and that residency ends only when a
-    /// [`DpbUpdate::removed`] entry reports it. This method is that report's
-    /// primitive: [`Self::apply`] calls it with the planner's `removed` ids, and so
-    /// do the conversions' callers via `release_after_decode` — one AU's removals,
-    /// deferred until its decode op is issued. Nothing else may release a slot.
-    ///
-    /// Releasing is CPU-side bookkeeping (the slot becomes assignable to a later
-    /// picture); keeping the released slot's IMAGE out of reuse until in-flight
-    /// decodes complete is the backend's synchronization, not this ledger's.
+    /// The slot becomes assignable immediately. Keeping the IMAGE out of reuse
+    /// until in-flight decodes complete is the backend's job, not this ledger's.
     pub fn release(&mut self, id: PicId) -> bool {
         match self.slots.iter().position(|slot| *slot == Some(id)) {
             Some(index) => {
@@ -163,17 +135,13 @@ impl SlotMap {
         }
     }
 
-    /// Apply one [`DpbUpdate`]: release every `removed` id.
-    ///
-    /// `outputs` is deliberately ignored: output-readiness is display sequencing,
-    /// not the end of DPB residency — a display-ready picture can still be a
-    /// reference (its slot stays), and only its later `removed` entry frees the
-    /// slot.
+    /// Release every `removed` id. `outputs` is display order, not residency:
+    /// a display-ready picture can still be a reference, so its slot stays
+    /// until a later `removed` entry.
     pub fn apply(&mut self, update: &DpbUpdate) {
         for &id in &update.removed {
             if !self.release(id) {
-                // Tolerated but never silent: reachable only when the caller skipped
-                // feeding an AU's plan through this map.
+                // Reachable only if the caller skipped an AU's plan.
                 trace!(id, "DpbUpdate removed an id this SlotMap never assigned");
             }
         }
@@ -186,18 +154,16 @@ mod tests {
 
     #[test]
     fn a_pic_id_keeps_its_slot_until_released_and_the_slot_is_then_reusable() {
-        let mut slots = SlotMap::new(3); // capacity 4
+        let mut slots = SlotMap::new(3);
         let s0 = slots.assign(10).unwrap();
         let s1 = slots.assign(11).unwrap();
         assert_ne!(s0, s1);
 
-        // Stable across unrelated churn.
         assert_eq!(slots.slot_of(10), Some(s0));
         slots.release(11);
         assert_eq!(slots.slot_of(10), Some(s0));
         assert_eq!(slots.slot_of(11), None);
 
-        // The freed slot is reusable; the held one is not.
         let s2 = slots.assign(12).unwrap();
         assert_eq!(s2, s1, "the lowest free slot is the released one");
         assert_eq!(slots.slot_of(10), Some(s0));
@@ -206,11 +172,10 @@ mod tests {
 
     #[test]
     fn assigning_past_capacity_is_an_error_never_a_silent_eviction() {
-        let mut slots = SlotMap::new(1); // capacity 2
+        let mut slots = SlotMap::new(1);
         slots.assign(1).unwrap();
         slots.assign(2).unwrap();
         assert_eq!(slots.assign(3), Err(SlotError::Full { capacity: 2 }));
-        // The failed assign evicted nothing.
         assert_eq!(slots.slot_of(1), Some(0));
         assert_eq!(slots.slot_of(2), Some(1));
     }
@@ -257,7 +222,7 @@ mod tests {
         slots.assign(2).unwrap();
         slots.apply(&DpbUpdate {
             stored: None,
-            outputs: vec![1], // display-ready, still a reference: must keep its slot
+            outputs: vec![1], // still a reference — slot must stay
             removed: vec![2],
         });
         assert_eq!(slots.slot_of(1), Some(0));
@@ -266,8 +231,6 @@ mod tests {
 
     #[test]
     fn a_hundred_synthetic_dpb_updates_churn_without_aliasing_a_slot() {
-        // A sliding window of 4 references over 100 pictures: each id's slot must
-        // stay fixed while it lives, and no two live ids may ever share a slot.
         let mut slots = SlotMap::new(4);
         let mut recorded: Vec<(PicId, u8)> = Vec::new();
         for id in 0u64..100 {
@@ -287,7 +250,6 @@ mod tests {
             for gone in removed {
                 recorded.retain(|&(held_id, _)| held_id != gone);
             }
-            // Every live picture still holds exactly the slot it was assigned.
             for &(live, slot) in &recorded {
                 assert_eq!(slots.slot_of(live), Some(slot));
             }

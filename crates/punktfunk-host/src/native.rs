@@ -1,26 +1,15 @@
-//! The `punktfunk/1` native host: QUIC control plane + the hardened core data plane over UDP.
-//! This is punktfunk's own protocol, past the GameStream compatibility layer:
+//! Native `punktfunk/1` host: QUIC control plane plus the core data plane over UDP.
 //!
-//! * the Welcome negotiates **GF(2¹⁶) Leopard FEC** (inexpressible in GameStream) + AES-GCM;
-//! * the client's Hello requests a display mode and the host creates a **native virtual
-//!   output** at exactly that size/refresh (same vdisplay backends as the GameStream path);
-//! * **input arrives as QUIC datagrams** — encrypted, congestion-managed, no ENet
-//!   retransmission spikes — and feeds the session's input injector;
-//! * video frames carry a wall-clock `pts_ns`, so a same-host client measures the full
-//!   capture→encode→FEC→UDP→reassemble latency per frame.
+//! Welcome negotiates GF(2¹⁶) Leopard FEC and AES-GCM. Hello names a display mode;
+//! the host opens a virtual output at that size/refresh (same backends as GameStream).
+//! Input arrives as QUIC datagrams into the session injector. Video AUs carry
+//! wall-clock `pts_ns`. Concurrent sessions share host-lifetime audio/input/mic;
+//! isolated gamescope spawns do not. Data plane is native threads, not async.
+//! A session also carries desktop Opus (`AUDIO_MAGIC`) and gamepads (`RUMBLE_MAGIC`).
 //!
-//! `punktfunk-host punktfunk1-host [--port 9777] [--source synthetic|virtual] [--seconds 30]
-//!  [--frames 300]` serves sessions back to back (one at a time — the virtual output and
-//!  encoder are single-tenant); `punktfunk-probe --connect host:9777` is the counterpart.
-//!  The data plane runs on native threads (no async on the frame path).
-//!
-//! Alongside video + input, a session carries **audio** (desktop Opus, 5 ms frames, host →
-//! client QUIC datagrams tagged [`punktfunk_core::quic::AUDIO_MAGIC`]) and **gamepads** (client
-//! GamepadButton/GamepadAxis datagrams accumulated into per-pad state for the virtual xpad;
-//! force feedback flows back as [`punktfunk_core::quic::RUMBLE_MAGIC`] datagrams).
-//!
-//! Trust: the host serves with its persistent identity (`~/.config/punktfunk/cert.pem`, shared
-//! with GameStream pairing) and logs the SHA-256 fingerprint clients pin.
+//! Serves `~/.config/punktfunk/cert.pem` (shared with GameStream pairing) and logs
+//! the SHA-256 fingerprint clients pin. `punktfunk-probe --connect host:9777` is
+//! the counterpart. Evidence: `design/` and the tests below.
 
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Role};
@@ -38,144 +27,95 @@ use rand::RngCore;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-/// Per-thread OS scheduling QoS lives in the shared `pf-frame` leaf crate (plan §W1/§W6);
-/// re-exported so `crate::native::boost_thread_priority` stays stable (the GameStream path and the
-/// native data plane reach it there).
+/// Shared with GameStream.
 pub(crate) use pf_frame::thread_qos::boost_thread_priority;
 
-/// Compositor-preference resolution (plan §W1); `serve_session` reaches `resolve_compositor` here.
 mod compositor;
 use compositor::resolve_compositor;
 
-/// Virtual-gamepad backend resolution (plan §W1); `serve_session` + the `Pads` state machine reach
-/// `resolve_gamepad`/`resolve_pad_kind`/`route_decision` here. Crate-visible because the choice of
-/// Windows Xbox backend (`windows_xbox_hid`) is not the native plane's alone — the GameStream plane
-/// presents the same virtual pad and has to make the same choice, from one definition.
+/// GameStream presents the same virtual pad and must pick `windows_xbox_hid` from this definition.
 pub(crate) mod gamepad;
 use gamepad::{resolve_gamepad, resolve_pad_kind, route_decision};
 
-/// The SPAKE2 pairing ceremony (plan §W1); `serve_session` dispatches a PairRequest connection here.
 mod pairing;
 use pairing::pair_ceremony;
 
-/// The native audio plane (plan §W1); the session setup spawns `audio_thread` here.
 mod audio;
 use audio::audio_thread;
 
-/// Per-pad DualSense audio (the 0xD1 plane): loopback capture of the pre-provisioned pad
-/// endpoints → per-kind silence gate → stereo Opus → `PAD_AUDIO_MAGIC` datagrams. The input
-/// thread spawns/reaps one streamer per arriving pad (`input`); the Welcome advertises the cap
-/// via `pad_audio::host_cap` (`handshake`).
+/// Per-pad DualSense audio (0xD1 → `PAD_AUDIO_MAGIC`). The input thread spawns one
+/// streamer per pad; Welcome advertises the cap via `pad_audio::host_cap`.
 mod pad_audio;
 
-/// The native input plane (plan §W1); the session setup spawns `input_thread` and feeds it a
-/// channel of `ClientInput`. The `Pads` router + rumble live there too.
 mod input;
-/// Per-pad motion inter-arrival statistics ([`motion_cadence::MotionCadence`]) — the "gyro feels
-/// floaty" measurement, summarized at `info` when a session ends.
+/// Per-pad motion inter-arrival ([`motion_cadence::MotionCadence`]), logged at session end.
 mod motion_cadence;
 use input::{input_thread, ClientInput};
 
-/// The Hello→Welcome→Start negotiation (plan §W1); `serve_session` calls `handshake::negotiate`
-/// after the pairing gate.
 mod handshake;
-/// MTU resilience for the video data plane: `PUNKTFUNK_WIRE_MTU` override, the per-session
-/// path-MTU watch on the control connection, and the per-peer learned shard-payload clamp.
+/// `PUNKTFUNK_WIRE_MTU`, the control-connection path-MTU watch, and the per-peer shard clamp.
 mod wire_mtu;
 
-/// The mid-stream control task (plan §W1); `serve_session` spawns `control::run` after the
-/// handshake to multiplex renegotiation / speed-test control messages onto the data-plane channels.
 mod control;
-/// Cursor-forward channel (M2): the encode loop's shape/state emission.
 mod cursor_fwd;
 
-/// The capture→encode→send data plane (plan §W1); `serve_session` dispatches the synthetic or
-/// virtual source here (`synthetic_stream` / `virtual_stream`) and hands the latter a
-/// `SessionContext`. `reconfig_allowed` gates mid-stream live reconfigure.
 mod stream;
 use stream::{reconfig_allowed, synthetic_stream, virtual_stream, SessionContext};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Punktfunk1Source {
-    /// Deterministic test frames (protocol verification; the client byte-checks them).
+    /// Protocol-test frames; the client byte-checks the payload.
     Synthetic,
-    /// Real capture: virtual display at the client's requested mode → NVENC.
+    /// Virtual display at the requested mode → NVENC.
     Virtual,
 }
 
 pub struct Punktfunk1Options {
     pub port: u16,
     pub source: Punktfunk1Source,
-    /// Virtual-source stream duration.
     pub seconds: u32,
-    /// Synthetic-source frame count.
     pub frames: u32,
-    /// Exit after this many sessions (0 = serve forever).
+    /// `0` = serve forever.
     pub max_sessions: u32,
-    /// Maximum sessions streaming **at once** (a NVENC/GPU bound); further clients wait in the
-    /// accept queue until a slot frees. Concurrent sessions each get their own virtual output +
-    /// encoder; on the shared-desktop backends (kwin/mutter/wlroots) they share the host-lifetime
-    /// input/audio/mic services — multiple devices viewing (and controlling) the *same* desktop —
-    /// while ISOLATED gamescope spawns (`design/gamescope-multiuser.md`) each carry their own
-    /// input/audio/mic plane: independent desktops, multi-user on one box.
-    /// `0` = unlimited (bounded only by the GPU). Default a conservative few.
+    /// Simultaneous streams (NVENC/GPU bound). Shared-desktop backends share host-lifetime
+    /// input/audio/mic; isolated gamescope spawns do not (`design/gamescope-multiuser.md`).
+    /// `0` = unlimited. Overflow waits in the accept queue.
     pub max_concurrent: usize,
-    /// Only serve clients whose certificate fingerprint is in the paired set. Implies
-    /// `allow_pairing` (a host that requires pairing must accept ceremonies to admit
-    /// anyone).
+    /// Paired-fingerprint gate. Implies `allow_pairing` — a host that requires pairing
+    /// must still accept ceremonies.
     pub require_pairing: bool,
-    /// Accept pairing ceremonies (the operator "arming" pairing mode). Default off: a host
-    /// with neither flag set rejects unsolicited PairRequests outright, closing that
-    /// attack surface. `require_pairing` forces this on.
+    /// Accept PairRequests. Default off; `require_pairing` forces this on.
     pub allow_pairing: bool,
-    /// Fixed pairing PIN (tests); `None` = a fresh random 4-digit PIN per ceremony.
+    /// Tests: fixed PIN. `None` = a fresh random 4-digit PIN per ceremony.
     pub pairing_pin: Option<String>,
-    /// Paired-clients store path override (tests); `None` = the default config path.
+    /// Tests: store path. `None` = the default config path.
     pub paired_store: Option<std::path::PathBuf>,
-    /// Fixed data-plane UDP port. `None`/`Some(0)` (default): bind a random ephemeral port and
-    /// **hole-punch** — wait ~2.5 s for the client's punch, then fall back to its reported address
-    /// (traverses NAT / a stateful inter-VLAN firewall with no forwarded port, at the cost of the
-    /// punch-timeout on a firewall that drops the punch). `Some(p)`: bind that fixed port and
-    /// stream **directly** to the client's reported address with no punch-wait — for a host whose
-    /// data port is fixed + firewall-opened/forwarded, this removes the punch-timeout delay. A
-    /// fixed port only fits one data plane at a time, so a concurrent session finding it busy
-    /// falls back to random + hole-punch (see [`bind_data_socket`]).
+    /// Fixed data-plane UDP port. `None`/`Some(0)`: ephemeral bind + ~2.5 s hole-punch,
+    /// then the reported address. `Some(p)`: bind `p` and stream direct (no punch wait);
+    /// a busy fixed port falls back to ephemeral + punch ([`bind_data_socket`]).
     pub data_port: Option<u16>,
-    /// Control-connection idle timeout — the **disconnect-detection latency** (how long a vanished
-    /// client takes to be declared dead, which bounds how fast a dropped session tears down / lingers
-    /// and thus the reconnect-overlap window). `None` = the core default (8s). Set from
-    /// `PUNKTFUNK_IDLE_TIMEOUT_MS`; clamped to a ≥1s floor with a keep-alive that scales to it so a
-    /// live session never false-closes.
+    /// Disconnect-detection latency. `None` = core default (8 s). From
+    /// `PUNKTFUNK_IDLE_TIMEOUT_MS`; ≥1 s floor, keep-alive scales so a live session
+    /// never false-closes.
     pub idle_timeout: Option<std::time::Duration>,
-    /// Advertise this host over mDNS (`_punktfunk._udp`). Default on; `--no-mdns` /
-    /// `PUNKTFUNK_MDNS=0` turns it off for multicast-dead environments (bridged Docker, CI netns)
-    /// — clients then connect via `--connect HOST:PORT` / a manually-added host, which always works.
+    /// `_punktfunk._udp` advert. `--no-mdns` / `PUNKTFUNK_MDNS=0` skips it.
     pub mdns: bool,
 }
 
-/// Bind the per-session data-plane UDP socket, honoring [`Punktfunk1Options::data_port`]. Returns
-/// `(socket, direct)`: `direct = true` (a successfully-bound fixed port) means "stream straight to
-/// the client's reported address, no hole-punch"; `false` (random port, or a busy fixed port) means
-/// "hole-punch". The socket is held from the handshake through streaming — no drop-then-rebind
-/// window in which a concurrent session could steal a fixed port.
+/// Bind the per-session data-plane UDP socket ([`Punktfunk1Options::data_port`]).
+/// Returns `(socket, direct)`: `direct` = a bound fixed port (stream to the reported
+/// address, no punch); otherwise hole-punch. Held from handshake through streaming —
+/// no drop-then-rebind window that could steal a fixed port.
 ///
-/// `local_ip` is the address the client's QUIC connection was RECEIVED on (`Connection::local_ip`),
-/// and binding to it is load-bearing on a multi-homed host. The client's data socket is
-/// `connect`ed to the host IP it dialed, so its kernel accepts video only from THAT source
-/// address; a wildcard bind here lets the routing table pick the egress interface independently of
-/// the one the control plane arrived on, and the two differ whenever a host has two paths to the
-/// client — Ethernet and Wi-Fi both up on the same LAN is the everyday case. Every video datagram
-/// is then dropped by the client's kernel before userspace: nothing counts it, `loss_ppm` stays 0
-/// (no packets, no gaps), the hole-punch still arrives so the host logs `punched=true`, and the
-/// control plane — which quinn pins to the right local address — stays perfectly healthy. That is
-/// the "connects fine, black screen forever" shape with every gauge green, and it is invisible on
-/// both ends. `None` (platform can't report it) or a bind failure falls back to the wildcard.
+/// `local_ip` is the address the QUIC connection was received on. Bind it: the client's
+/// data socket is `connect`ed to the host IP it dialed, and its kernel drops any other
+/// source. A wildcard bind lets the routing table pick a different egress on a
+/// multi-homed host. `None` or a bind failure falls back to the wildcard.
 fn bind_data_socket(
     data_port: Option<u16>,
     local_ip: Option<std::net::IpAddr>,
 ) -> std::io::Result<(std::net::UdpSocket, bool)> {
-    // An IPv4-mapped v6 local address (dual-stack endpoint) must be unmapped before it can bind a
-    // socket that will `connect` to a v4 peer — the families have to match.
+    // Dual-stack endpoints report IPv4-mapped v6; unmap so a v4 `connect` can bind.
     let local_ip = local_ip.map(|ip| match ip {
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
         v4 => v4,
@@ -196,9 +136,8 @@ fn bind_data_socket(
     }
     match std::net::UdpSocket::bind((wildcard(local_ip), 0)) {
         Ok(sock) => Ok((sock, false)),
-        // The control plane arrived on this address moments ago, so a failure here means it just
-        // went away (an adapter dropped mid-handshake). The wildcard still reaches a client the
-        // routing table can route to — degraded, not dead — so take it and say why.
+        // The control connection arrived here; a bind failure means the adapter dropped.
+        // Wildcard still reaches a routable client.
         Err(e) if local_ip.is_some() => {
             tracing::warn!(
                 local_ip = ?local_ip,
@@ -213,18 +152,14 @@ fn bind_data_socket(
     }
 }
 
-/// The native (punktfunk/1) trust store + on-demand arming PIN, shared with the management API.
 use crate::native_pairing::{NativePairing, PairingDecision};
 use crate::send_pacing::{percentile, PaceStat};
-/// The shared streaming-stats recorder (web-console capture/graph), shared with the management API
-/// and the GameStream loop; threaded into each session's `SessionContext`.
 use crate::stats_recorder::StatsRecorder;
 
-/// Minimum spacing between accepted pairing ceremonies (bounds online PIN guessing — with
-/// SPAKE2 an attacker already gets only one guess per ceremony; this caps the rate).
+/// Bounds online PIN guessing: SPAKE2 already gives one guess per ceremony; this caps the rate.
 const PAIRING_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Deterministic test frame: `u32 LE index` then `data[i] = idx + i` (wrapping).
+/// `u32 LE index` then `data[i] = idx + i` (wrapping) — the client byte-checks this.
 pub fn test_frame(idx: u32, len: usize) -> Vec<u8> {
     let mut d = vec![0u8; len];
     d[0..4].copy_from_slice(&idx.to_le_bytes());
@@ -241,9 +176,8 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// Host wall clock, unix seconds — the clock every per-client-access deadline is stored in and
-/// evaluated against (design/per-client-access.md §4: wall time at each check, no cached
-/// monotonic offset, so an NTP step moves a deadline with the clock).
+/// Unix seconds. Access deadlines are stored and checked in wall time, not a cached
+/// monotonic offset, so an NTP step moves a deadline with the clock.
 fn wall_unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -251,9 +185,8 @@ fn wall_unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// The Welcome/AccessUpdate remaining-lifetime field for a deadline at `now`: saturating whole
-/// seconds with a floor of 1 — `0` means *permanent* on the wire, so a deadline that is due this
-/// very second must still advertise as expiring, never as forever.
+/// Remaining lifetime on the wire: saturating whole seconds, floor 1. `0` means *permanent*,
+/// so a deadline due this second still advertises as expiring.
 fn remaining_secs_wire(deadline: Option<i64>, now: i64) -> u32 {
     deadline
         .map(|d| u32::try_from((d - now).max(1)).unwrap_or(u32::MAX))
@@ -266,28 +199,22 @@ pub fn run(opts: Punktfunk1Options) -> Result<()> {
         .enable_all()
         .build()
         .context("tokio runtime")?;
-    // Standalone CLI: arm at startup iff --allow-pairing/--require-pairing (back-compat — the PIN
-    // is logged). The unified `serve --native` path instead arms on demand via the management API.
+    // Standalone CLI arms at startup from the flags (PIN is logged). `serve --native` arms on demand.
     let np = Arc::new(NativePairing::load_with(
         opts.paired_store.clone(),
         opts.pairing_pin.clone(),
         opts.allow_pairing || opts.require_pairing,
     )?);
-    // Standalone `punktfunk1-host` has no mgmt API to arm capture, so this recorder stays disarmed
-    // (harmless — the loops' `is_armed()` gate is always false). The unified `serve` shares one
-    // recorder across mgmt + both streaming paths instead.
+    // No mgmt API here, so the recorder stays disarmed (`is_armed()` is always false).
     let stats = StatsRecorder::new(crate::stats_recorder::default_dir());
-    // Standalone runs resolve the native identity themselves (the unified `serve` resolves it
-    // once for both planes — see `crate::identity::load_or_adopt`'s once-per-process note).
+    // Standalone resolves identity itself; unified `serve` does it once for both planes.
     let ident = crate::identity::load_or_adopt(&np).context("native host identity")?;
-    // Standalone `punktfunk1-host` runs no management API, so advertise no `mgmt` port (0).
+    // No management API → advertise no `mgmt` port (0).
     rt.block_on(serve(opts, 0, np, stats, ident))
 }
 
-/// [`run`] with a throwaway in-memory identity — for the in-process tests, which must never
-/// read or (worse) MINT identity files in the machine's real config dir: on a dev box that is
-/// also a live host, a test-minted `native-cert.pem` would be adopted by the real host at its
-/// next restart and strand every pinned client.
+/// [`run`] with an in-memory identity. Tests must not mint `native-cert.pem` in the real
+/// config dir: a live host on the same box would adopt it and strand every pinned client.
 #[cfg(test)]
 fn run_ephemeral(opts: Punktfunk1Options) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -309,40 +236,24 @@ fn fingerprint_hex(fp: &[u8; 32]) -> String {
     fp.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The persistent listener: accept clients back to back on one endpoint. Sessions are
-/// served one at a time (the virtual output + NVENC are single-tenant); a client that
-/// connects mid-session waits in the accept queue. A failed session logs and the loop
-/// keeps serving — only endpoint-level failures are fatal.
-/// Config for the native (punktfunk/1) host when the unified `serve` runs it in-process.
+/// Native host config when unified `serve` runs it in-process.
 pub(crate) struct NativeServe {
     pub port: u16,
-    /// Gate sessions on pairing. **Default on** — an open host any LAN device can stream from is
-    /// insecure; `serve --open` turns it off (trusted single-user setups). Pairing is armed on
-    /// demand from the web console (arm → PIN); paired devices persist.
+    /// Default on. `serve --open` turns it off. Pairing is armed on demand from the console.
     pub require_pairing: bool,
-    /// The management API's TCP port, advertised over mDNS so a client browses the game library on
-    /// the same host IP (the unified `serve` always runs the mgmt API, so this is its bind port).
+    /// Management API TCP port, advertised over mDNS so a client browses the library on this IP.
     pub mgmt_port: u16,
-    /// Fixed data-plane UDP port (`--data-port` / `PUNKTFUNK_DATA_PORT`); see
-    /// [`Punktfunk1Options::data_port`]. `None` = random port + hole-punch (the default).
+    /// [`Punktfunk1Options::data_port`]. `None` = ephemeral + hole-punch.
     pub data_port: Option<u16>,
-    /// Advertise over mDNS (`--no-mdns` / `PUNKTFUNK_MDNS=0` turns it off). Gates the native
-    /// `_punktfunk._udp` advert AND the GameStream `_nvstream` advert — the serve-level knob for
-    /// multicast-dead environments; see [`Punktfunk1Options::mdns`].
+    /// Gates `_punktfunk._udp` and GameStream `_nvstream` together. See [`Punktfunk1Options::mdns`].
     pub mdns: bool,
 }
 
-/// Options for the native host when the unified `serve --native` runs it: real virtual capture,
-/// persistent (no session/duration cut), pairing armed on demand via the management API (the
-/// shared [`NativePairing`] starts disarmed).
-/// Default cap on simultaneously-streaming sessions (each holds an NVENC session; high-res
-/// split-encode holds two). Conservative — consumer NVENC historically capped concurrent sessions;
-/// overflow clients wait in the accept queue. Override with `--max-concurrent`.
+/// NVENC session cap (high-res split-encode holds two). Overflow waits in the accept queue.
 pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 4;
 
-/// The control-connection idle timeout (disconnect-detection latency) from
-/// `PUNKTFUNK_IDLE_TIMEOUT_MS`; `None` (unset/invalid/zero) = the core default (8s). Clamped
-/// downstream to a ≥1s floor with a keep-alive that scales to it, so a live session never false-closes.
+/// `PUNKTFUNK_IDLE_TIMEOUT_MS`; `None` (unset/invalid/zero) = core default (8 s). Clamped
+/// downstream to ≥1 s with a keep-alive that scales, so a live session never false-closes.
 pub(crate) fn idle_timeout_from_env() -> Option<std::time::Duration> {
     std::env::var("PUNKTFUNK_IDLE_TIMEOUT_MS")
         .ok()
@@ -355,7 +266,7 @@ pub(crate) fn native_serve_opts(cfg: &NativeServe) -> Punktfunk1Options {
     Punktfunk1Options {
         port: cfg.port,
         source: Punktfunk1Source::Virtual,
-        seconds: 7 * 24 * 3600, // per-session cap; large enough not to cut a live stream
+        seconds: 7 * 24 * 3600, // 7 days: a cap, not a cut of a live stream
         frames: 0,
         max_sessions: 0,
         max_concurrent: DEFAULT_MAX_CONCURRENT,
@@ -374,8 +285,7 @@ pub(crate) async fn serve(
     mgmt_port: u16,
     np: Arc<NativePairing>,
     stats: Arc<StatsRecorder>,
-    // The identity split (`crate::identity`): P-256 on hosts no native client ever pinned, the
-    // legacy RSA cert otherwise — resolved by the caller so the planes cannot race adoption.
+    // Caller-resolved so the planes cannot race adoption (P-256 vs legacy RSA).
     identity: crate::identity::NativeIdentity,
 ) -> Result<()> {
     let fingerprint = endpoint::fingerprint_of_pem(&identity.cert_pem)
@@ -394,10 +304,8 @@ pub(crate) async fn serve(
         "punktfunk/1 host listening (QUIC) — clients pin this fingerprint"
     );
 
-    // mDNS: advertise the native service so clients auto-discover this host (the analogue of the
-    // GameStream _nvstream advert; both run in the unified host). Held for the host's lifetime —
-    // dropping `_advert` unregisters. Best-effort: a discovery failure must not stop streaming
-    // (manual `--connect HOST:PORT` always works), so we log and continue.
+    // Held for the host lifetime — dropping `_advert` unregisters. Best-effort: a
+    // discovery failure must not stop streaming (`--connect HOST:PORT` still works).
     let _advert = if !opts.mdns {
         tracing::info!(
             "mDNS advertisement disabled (--no-mdns / PUNKTFUNK_MDNS) — clients connect by address"
@@ -411,7 +319,7 @@ pub(crate) async fn serve(
             &fingerprint_hex(&fingerprint),
             opts.require_pairing,
             &h.uniqueid,
-            // 0 = standalone `punktfunk1-host` (no mgmt API) → don't advertise an `mgmt` port.
+            // 0 = standalone (no mgmt API) → do not advertise an `mgmt` port.
             (mgmt_port != 0).then_some(mgmt_port),
             &h.os_chain,
         )
@@ -424,60 +332,35 @@ pub(crate) async fn serve(
         }
     };
 
-    // One audio capturer for the whole host lifetime, handed from session to session
-    // (avoids a PipeWire stream setup per session — see AudioCapSlot).
+    // Host-lifetime capturer: one PipeWire stream, handed session to session (`AudioCapSlot`).
     let audio_cap: AudioCapSlot = Arc::new(std::sync::Mutex::new(None));
-    // One pointer/keyboard injector for the whole host lifetime (see InjectorService): the
-    // RemoteDesktop-portal grant is established ONCE and reused, instead of a CreateSession per
-    // session — which, under rapid client reconnects, raced a prior session's portal teardown and
-    // wedged KWin's EIS setup ("EIS setup timed out"). Gamepads stay per-session (uinput).
+    // Host-lifetime injector: one RemoteDesktop-portal grant. A CreateSession per session
+    // races portal teardown on reconnect and wedges KWin EIS. Gamepads stay per-session.
     let injector = crate::inject::InjectorService::start();
-    // One virtual microphone for the whole host lifetime (see [`crate::audio::MicPump`]): the
-    // client's mic uplink (0xCB) is Opus-decoded and fed into a persistent virtual mic host apps
-    // record from (Linux PipeWire Audio/Source; Windows a virtual audio device's render endpoint).
-    // The pump opens the backend EAGERLY (the mic device exists before any game launches and
-    // binds its capture device) and self-heals when the backend dies (PipeWire restart, Windows
-    // endpoint churn).
+    // Host-lifetime virtual mic ([`crate::audio::MicPump`]): 0xCB Opus → a persistent source
+    // games can bind before they launch. Opens eagerly; self-heals if the backend dies.
     let mic_service = crate::audio::MicPump::start();
-    // Windows, env-gated (PUNKTFUNK_PAD_AUDIO / _SLOTS): pre-provision the per-pad "DualSense
-    // speaker" render endpoints once per host lifetime — idempotent devnode + stamp work on a
-    // dedicated COM thread, results published for sessions to query by pad index
-    // (crate::audio::pad_endpoint::endpoint_for). If any stamp is stored-but-not-served, the
-    // worker performs ONE AudioEndpointBuilder+Audiosrv restart now, before any session exists.
-    // Failures log once and leave the feature off: pads still work, just without pad audio.
+    // Windows (`PUNKTFUNK_PAD_AUDIO` / `_SLOTS`): pre-provision DualSense speaker endpoints
+    // once. A stored-but-not-served stamp triggers one Audiosrv restart before any session.
+    // Failure logs once and leaves pads working without pad audio.
     #[cfg(target_os = "windows")]
     crate::audio::pad_endpoint::provision_at_startup();
-    // Windows: mint the punktfunk-owned audio endpoints ("Punktfunk Speakers/Microphone" —
-    // instances of Valve's streaming drivers, the wiring plan's tier-0). Best-effort on a
-    // worker thread; without Steam's drivers the wiring plan keeps its name-based ladder.
+    // Windows: mint "Punktfunk Speakers/Microphone" (Valve streaming drivers). Best-effort;
+    // without Steam's drivers the wiring plan keeps its name-based ladder.
     #[cfg(target_os = "windows")]
     crate::audio::minted::provision_at_startup();
-    // Host-lifetime worker that fires debounced TV-session restores (the managed gamescope path
-    // restores the box's autologin gaming session on idle, not per-disconnect — see
-    // `vdisplay::restore_managed_session`). Held for serve()'s lifetime; dropping it stops it.
+    // Debounced TV-session restore on idle, not per-disconnect. Dropping this stops it.
     let _restore_worker = crate::vdisplay::start_restore_worker();
-    // A3: recover a TV takeover stranded by a crashed previous host instance (persisted to
-    // $XDG_RUNTIME_DIR) — schedule a restore after a reconnect grace. No-op on a clean start.
+    // Recover a takeover stranded by a crashed previous instance (`$XDG_RUNTIME_DIR`).
     crate::vdisplay::restore_takeover_on_startup();
-    // …and check the takeover's one un-automatable prerequisite BEFORE a stream needs it: on a box
-    // that will use the takeover, the host's user must be in the `punktfunk` group the packaged
-    // privilege helper gates on. Missing membership fails nothing — the takeover degrades to
-    // mirroring the box's own session — so without this it surfaces only as a black screen on
-    // every connect. No-op off Linux and on any box the takeover can't apply to.
+    // Takeover needs the host user in `punktfunk`. Missing membership degrades to mirroring.
+    // No-op off Linux.
     crate::vdisplay::preflight_takeover_privilege();
-    // Same verdicts, second destination: the log line above is for whoever reads logs, and the
-    // registry is for whoever opens the console. Runs after the subsystems the probes inspect are
-    // up, so a probe never reports a device node that was about to appear.
+    // Console registry after the probed subsystems are up, so a probe never names a node
+    // that was about to appear.
     crate::diagnostics::preflight();
-    // …and the other end of that: give the box its session back when WE are the ones going away.
     install_shutdown_restore();
-    // (No cover-art warmer any more: it existed to fetch GOG/Xbox art off the hot path for the two
-    // built-in scanners that had to ask a network catalog what a cover was. Those scanners are gone,
-    // and a library plugin resolves art while it scans and publishes it on the entry — so `all_games()`
-    // never touches the network to begin with.)
-    // Pairing state (arming PIN + trust store) is shared with the management API. If it was armed
-    // at startup (the CLI flags), surface the PIN the headless operator reads from the log; the
-    // web console arms it on demand instead (a fresh, time-limited PIN).
+    // Headless CLI: surface the PIN if armed at startup. The console arms on demand.
     let st = np.status();
     if let Some(pin) = &st.pin {
         tracing::info!(
@@ -485,21 +368,15 @@ pub(crate) async fn serve(
             require = opts.require_pairing,
             "pairing armed — enter the PIN shown on the console to pair a client"
         );
-        // The PIN is a shared secret: print it straight to the operator's terminal, NOT through
-        // tracing. A tracing event also lands in the DEBUG log ring that field bug reports ship
-        // (GET /api/v1/logs), which must never carry the pairing secret.
+        // Shared secret: print to the operator's terminal, not tracing — GET /api/v1/logs
+        // ships the DEBUG ring.
         eprintln!("[punktfunk] pairing PIN: {pin}  (enter this on the client to pair)");
     }
     let last_pairing = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     let opts = Arc::new(opts);
 
-    // Concurrency: serve up to `max_concurrent` sessions at once. Each gets its own virtual output +
-    // NVENC encoder; shared-desktop sessions share the host-lifetime input/audio/mic services
-    // (multiple devices viewing/controlling the SAME desktop), isolated gamescope spawns bring
-    // their own per-session planes (`design/gamescope-multiuser.md`). A permit is taken
-    // before accepting, so overflow clients wait in QUIC's accept backlog until a slot frees;
-    // `max_concurrent == 0` means unlimited (GPU-bounded). The heavy handshake + pipeline run inside
-    // the spawned task, so a slow client never blocks the accept loop.
+    // Permit taken before accept: overflow waits in QUIC's backlog. `0` = unlimited.
+    // Handshake + pipeline run in the spawned task so a slow client never blocks accept.
     let permits = match opts.max_concurrent {
         0 => tokio::sync::Semaphore::MAX_PERMITS,
         n => n,
@@ -516,23 +393,18 @@ pub(crate) async fn serve(
     loop {
         let incoming = match ep.accept().await {
             Some(i) => i,
-            None => break, // endpoint closed
+            None => break,
         };
-        // Complete the QUIC handshake in the accept loop (it's ~1 RTT): a failed handshake (e.g. a
-        // pin mismatch — the client aborts) must NOT consume a session slot, mirroring the old
-        // serial loop. The slow part (control handshake, pairing, the capture/encode pipeline) runs
-        // in the spawned task, so a slow client still never blocks accepting the next one.
+        // Handshake here (~1 RTT): a pin mismatch must not consume a session slot.
         let conn = match incoming.await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "QUIC accept failed");
-                continue; // not counted toward max_sessions
+                continue;
             }
         };
-        // Take the session slot only AFTER the handshake, so a full host still ACCEPTS the
-        // connection and the waiting client sees a live path (quinn's keep-alive holds it) instead
-        // of a silent dial timeout — previously the loop parked on this await before `accept()`, so
-        // a host at its concurrency cap looked simply unreachable.
+        // Slot after handshake: a full host still accepts, so the waiter sees a live path
+        // (keep-alive) instead of a silent dial timeout.
         let permit = sem
             .clone()
             .acquire_owned()
@@ -547,13 +419,9 @@ pub(crate) async fn serve(
         let stats = stats.clone();
         let inj_tx = injector.sender();
         let mic_tx = mic_service.sender();
-        // The session permit + the pool it came from are handed to serve_session, which owns the
-        // permit's lifetime: it's released while a knock is parked for delegated approval and
-        // re-acquired on approval, so the hold is no longer a simple closure-scoped binding.
+        // `serve_session` owns the permit: released while a knock is parked, re-acquired on approval.
         let sem_session = sem.clone();
-        // Kept for the error path below: `serve_session` consumes `conn`, but a setup failure
-        // must still close the connection with a typed reason (quinn connections are cheap
-        // Arc-handle clones).
+        // `serve_session` consumes `conn`; a setup failure still needs a typed close (cheap clone).
         let conn_err = conn.clone();
         sessions.spawn(async move {
             match serve_session(
@@ -577,13 +445,8 @@ pub(crate) async fn serve(
                     "closed before the control handshake (reachability probe)"
                 ),
                 Err(e) => {
-                    // Make the failure legible to the client (the [`close_rejected`] discipline,
-                    // extended to EVERY session error): a setup failure that just drops the
-                    // connection reaches the client as a bare close mid-control-frame ("control
-                    // stream finished mid-frame") — indistinguishable from transport trouble.
-                    // Close with the typed setup-failed code, carrying the error text in the
-                    // reason bytes for client-side logs. When a gate already closed with its own
-                    // typed code, or the peer closed first, this close is a no-op (first wins).
+                    // Typed setup-failed close so the client does not see a bare mid-frame drop.
+                    // First-wins: a gate that already closed, or a peer close, makes this a no-op.
                     let detail = format!("{e:#}");
                     let mut cut = detail.len().min(256);
                     while !detail.is_char_boundary(cut) {
@@ -602,28 +465,20 @@ pub(crate) async fn serve(
             break;
         }
     }
-    // Stop accepting; let the in-flight sessions finish (max_sessions reached or endpoint closed).
+    // Drain in-flight sessions (max_sessions reached or endpoint closed).
     while sessions.join_next().await.is_some() {}
     ep.wait_idle().await;
     Ok(())
 }
 
-/// How long a shutdown waits for the box's session to be handed back before exiting anyway. The
-/// restore is a couple of `systemctl` calls (or one `pkexec` helper run); this only bounds a
-/// genuine wedge, well inside systemd's 90 s `TimeoutStopSec`.
+/// Shutdown wait for the box's session to come back. Bounds a wedge; well inside systemd's
+/// 90 s `TimeoutStopSec`.
 const SHUTDOWN_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Hand the box's own session back on the way out. Until this existed the host had NO signal
-/// handling at all: `SIGTERM` killed it outright, which is fine for a host that owns nothing — but
-/// a managed gamescope takeover owns the box's session, and on a mask-fragile display manager
-/// (Nobara's plasmalogin) it has STOPPED that display manager for the length of the stream. Killed
-/// there, the host leaves a box with no graphical session and nothing left to restart it: the
-/// crash-restore state lives in `$XDG_RUNTIME_DIR`, which logind removes along with the user
-/// manager, so even the next host start can't heal it. `systemctl --user restart punktfunk-host`
-/// mid-stream — or a package update doing it for you — was enough.
-///
-/// So: catch `SIGTERM`/`SIGINT`, restore, then exit. Restoring runs on a blocking thread (it shells
-/// out) under [`SHUTDOWN_RESTORE_GRACE`], and a host that took nothing over exits immediately.
+/// Catch `SIGTERM`/`SIGINT`, restore the box's session, then exit. A takeover that stopped
+/// the display manager leaves no graphical session if killed; crash-restore lives in
+/// `$XDG_RUNTIME_DIR`, which logind removes with the user manager. Blocking restore under
+/// [`SHUTDOWN_RESTORE_GRACE`]; a host that took nothing over exits immediately.
 fn install_shutdown_restore() {
     #[cfg(unix)]
     tokio::spawn(async {
@@ -660,28 +515,19 @@ fn install_shutdown_restore() {
     });
 }
 
-/// The accept loop is sequential, so the control phase must be bounded — a client that
-/// connects and never finishes the handshake would otherwise wedge the host for everyone.
+/// Bound the control phase; an unfinished handshake would otherwise wedge the host.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long the stream thread may still run AFTER its session was told to stop before
-/// [`serve_session`] gives up waiting for it.
-///
-/// Must exceed every legitimate post-stop path so a slow-but-healthy teardown is never abandoned:
-/// the capture-loss rebuild budget is 40 s and one pipeline-build attempt can take ~10 s on a cold
-/// compositor, so 90 s leaves generous headroom.
+/// Wait after `stop` before [`serve_session`] abandons the stream thread.
+/// Capture-loss rebuild is 40 s; a cold pipeline-build can take ~10 s. 90 s leaves headroom.
 const STREAM_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// How long teardown waits for the audio + input threads once the connection is closed. They exit
-/// promptly by construction (the audio loop checks `stop` every ≤5 s; the input thread's channel
-/// drops with the connection), so this only catches a genuine wedge.
+/// Audio/input join after close. Audio checks `stop` every ≤5 s; the input channel drops
+/// with the connection. This only catches a wedge.
 const SIDE_THREAD_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Resolves once `stop` has been set for [`STREAM_STOP_GRACE`] — i.e. the session was told to end
-/// and its stream thread *still* hasn't returned.
-///
-/// Polled rather than notified: `stop` is a plain flag shared with blocking threads, and the poll
-/// only runs while a session is live (every 500 ms, one relaxed atomic load).
+/// Resolves once `stop` has been set for [`STREAM_STOP_GRACE`].
+/// Polled: `stop` is a plain flag shared with blocking threads (500 ms, one relaxed load).
 async fn stop_overdue(stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -689,28 +535,20 @@ async fn stop_overdue(stop: &AtomicBool) {
     tokio::time::sleep(STREAM_STOP_GRACE).await;
 }
 
-/// QUIC application error code the host closes with on a `mode_conflict = reject` admission refusal,
-/// carrying the human-readable busy reason (live mode + client label) the client surfaces. A distinct
-/// code lets a client tell "host busy" apart from a transport failure. Shared with the clients via
-/// `punktfunk_core::reject` so they can decode it (`RejectReason::Busy`).
+/// `mode_conflict = reject` close code. Distinct from transport failure (`RejectReason::Busy`).
 const REJECT_BUSY_CODE: u32 = punktfunk_core::reject::REJECT_BUSY_CLOSE_CODE;
 
-/// Make a gate rejection legible to the client BEFORE erroring out of the session task: close
-/// with the typed application code (`punktfunk_core::reject`) so the client renders the real
-/// reason ("pairing not armed", "denied in the console") — the task's `Err` then only logs.
-/// Without this the dropped connection closes with a bare code 0, indistinguishable on the
-/// client from transport trouble (the "not accepted" support-thread failure mode).
+/// Close with the typed reject code before the session task returns `Err`. A bare drop
+/// closes with code 0, which the client cannot tell from transport trouble.
 fn close_rejected(conn: &quinn::Connection, reason: punktfunk_core::reject::RejectReason) {
     conn.close(reason.close_code().into(), reason.to_string().as_bytes());
 }
 
-/// Quiet per-(session, grant-class) enforcement-drop accounting (design/per-client-access.md
-/// §5.5): one counter and ONE `warn!` per class for the whole session — a misbehaving or
-/// malicious client must not turn the log into the DoS — with the totals surfaced once in the
-/// datagram loop's end-of-stream line.
+/// One counter and one `warn!` per grant class per session. Totals at end-of-stream;
+/// per-event logging would be a log DoS.
 struct GrantDrops {
-    // One slot per grant BIT (7 with `Power`), indexed by bit position — Power never produces
-    // input drops, but `idx` must stay in bounds for every `GrantClass`.
+    // One slot per grant bit (7 with `Power`). Power never drops input; `idx` must still
+    // stay in bounds for every `GrantClass`.
     counts: [AtomicU64; 7],
     warned: [AtomicBool; 7],
 }
@@ -723,14 +561,12 @@ impl GrantDrops {
         }
     }
 
-    /// A class's slot in the fixed tables — the bit position of its grant, so the layout can
-    /// never drift from the wire vocabulary.
+    /// Bit position of the grant, so the table cannot drift from the wire vocabulary.
     fn idx(class: GrantClass) -> usize {
         class.bit().trailing_zeros() as usize
     }
 
-    /// Count one dropped item; log only the FIRST drop of each class (the support signal for
-    /// "my keyboard does nothing" against an old client with no grants UX).
+    /// Count one drop; log only the first of each class.
     fn note(&self, class: GrantClass) {
         let i = Self::idx(class);
         self.counts[i].fetch_add(1, Ordering::Relaxed);
@@ -743,7 +579,7 @@ impl GrantDrops {
         }
     }
 
-    /// `Class=count` pairs for the end-of-session line; `"none"` when nothing was dropped.
+    /// `Class=count` pairs; `"none"` when nothing was dropped.
     fn summary(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
@@ -770,17 +606,15 @@ impl GrantDrops {
     }
 }
 
-/// The expiry-warning thresholds, seconds before the deadline (design §4: best-effort toasts at
-/// T−5 m and T−1 m; older clients simply miss them).
+/// Seconds before the deadline for best-effort toasts (T−5 m, T−1 m). Older clients miss them.
 const ACCESS_WARN_SECS: [i64; 2] = [300, 60];
 
-/// Which of [`ACCESS_WARN_SECS`] are already *behind* a deadline at `now` — those are marked
-/// spent instead of fired, both at admission (the Welcome just told the client its remaining
-/// time) and after an edit (the pushed `AccessUpdate` just did the same), so a threshold only
-/// ever fires by being CROSSED live.
+/// Thresholds already behind the deadline at `now` are spent, not fired — at admission
+/// (Welcome just advertised remaining) and after an edit (`AccessUpdate` just did). A
+/// threshold only fires by being crossed live.
 fn spent_warnings(deadline: Option<i64>, now: i64) -> [bool; 2] {
     match deadline {
-        None => [true, true], // permanent — nothing to warn about
+        None => [true, true],
         Some(d) => [
             d - now <= ACCESS_WARN_SECS[0],
             d - now <= ACCESS_WARN_SECS[1],
@@ -788,13 +622,11 @@ fn spent_warnings(deadline: Option<i64>, now: i64) -> [bool; 2] {
     }
 }
 
-/// How long the access lifecycle task sleeps before re-evaluating: until the next unfired
-/// boundary (warning threshold or the deadline itself), re-derived from `deadline − now` on
-/// EVERY lap and capped at 30 s — the design's wall-clock rule (§4): no cached monotonic
-/// instant, so an NTP step moves the effective deadline with the clock within one cap interval.
+/// Sleep until the next unfired boundary, re-derived from `deadline − now` each lap and
+/// capped at 30 s so an NTP step moves the deadline within one cap interval.
 fn access_sleep(deadline: Option<i64>, warned: &[bool; 2], now: i64) -> std::time::Duration {
     let Some(d) = deadline else {
-        // Permanent access: nothing timed to do — park; the watch/close arms do the waking.
+        // Permanent: park; the watch/close arms wake.
         return std::time::Duration::from_secs(3600);
     };
     let mut next = d;
@@ -806,12 +638,9 @@ fn access_sleep(deadline: Option<i64>, warned: &[bool; 2], now: i64) -> std::tim
     std::time::Duration::from_secs((next - now).clamp(1, 30) as u64)
 }
 
-/// The per-session access lifecycle (design §4/§5.6): owns the expiry deadline and the watch
-/// subscription. Sends best-effort `AccessUpdate` warnings at T−5 m / T−1 m and on every grant
-/// edit (the client's chip/toasts track them), folds edits into the session's live mask within
-/// one event, and closes the connection with the typed expiry code at deadline fire, on an
-/// "expire now" edit (a deadline already in the past), or on unpair (`revoked`). Closing only
-/// THIS connection ends only this device's session — the owner's stream is untouched.
+/// Per-session access: expiry deadline + watch. Best-effort `AccessUpdate` at T−5 m / T−1 m
+/// and on every grant edit; folds the live mask within one event; typed-close at deadline,
+/// "expire now", or unpair. Closes only this connection — the owner's stream is untouched.
 async fn access_lifecycle(
     conn: quinn::Connection,
     mut watch_rx: tokio::sync::watch::Receiver<crate::native_pairing::AccessState>,
@@ -822,18 +651,13 @@ async fn access_lifecycle(
     device: crate::events::DeviceRef,
 ) {
     let mut warned = spent_warnings(deadline, wall_unix_now());
-    // The host-power signal (`design/host-actions.md` §5.8): a `power.*` action ending every
-    // session closes THIS connection with the typed code, so the client says "the host is
-    // going to sleep" instead of a bare transport error.
+    // `power.*` ending every session: typed close so the client does not see a transport error.
     let mut power_rx = crate::power::closing_rx();
     loop {
         let now = wall_unix_now();
         if let Some(d) = deadline {
             if now >= d {
-                // Evaluated against the WALL CLOCK at fire (design §4): `d − now` was recomputed
-                // each lap rather than cached as a monotonic offset, so an NTP step moved this
-                // moment with the clock. The typed close renders as "your access to this host
-                // has expired" on every client.
+                // Wall clock at fire: `d − now` is recomputed each lap, so an NTP step moves it.
                 tracing::info!(
                     device = %device.name,
                     fingerprint = %device.fingerprint,
@@ -855,15 +679,14 @@ async fn access_lifecycle(
             }
         }
         tokio::select! {
-            // Re-loop and re-evaluate; the sleep is a bounded slice of `deadline − now`.
             () = tokio::time::sleep(access_sleep(deadline, &warned, wall_unix_now())) => {}
             changed = watch_rx.changed() => {
                 if changed.is_err() {
-                    return; // registry gone — the host is shutting down
+                    return; // registry gone — host shutting down
                 }
                 let st = *watch_rx.borrow_and_update();
                 if st.revoked {
-                    // Unpair is terminal (design §5.6): end the session, don't merely mute it.
+                    // Unpair is terminal: end the session, do not merely mute it.
                     tracing::info!(
                         device = %device.name,
                         fingerprint = %device.fingerprint,
@@ -872,11 +695,9 @@ async fn access_lifecycle(
                     close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired);
                     return;
                 }
-                // Fold the edit into the live mask immediately — the datagram filter reads it
-                // on the very next event (design §5.6). Resources set up under a wider mask are
-                // starved by that same filter (tearing a live uinput pad down mid-game is churn
-                // for no security: no event can reach it). Clipboard is the cheap exception:
-                // clearing the enable flag stops the coordinator forwarding host copies at once.
+                // Live mask updates now; the datagram filter reads it on the next event.
+                // Wider-mask resources stay up and starve (tearing a live uinput pad is churn).
+                // Clipboard is the cheap exception: clear the flag, stop forwarding copies.
                 grants.store(st.grants, Ordering::Relaxed);
                 if st.grants & GRANT_CLIPBOARD == 0 {
                     clip_enabled.store(false, Ordering::SeqCst);
@@ -884,9 +705,7 @@ async fn access_lifecycle(
                 deadline = st.deadline_unix;
                 let now = wall_unix_now();
                 warned = spent_warnings(deadline, now);
-                // Tell the client so its UI tracks the edit (an "expire now" — deadline already
-                // past — skips straight to the close on the re-loop instead of advertising a
-                // phantom second of access).
+                // Skip an "expire now" (deadline already past) so we do not advertise a phantom second.
                 if deadline.is_none_or(|d| d > now) {
                     let _ = access_tx.send(AccessUpdate {
                         grants: st.grants,
@@ -900,38 +719,24 @@ async fn access_lifecycle(
                     return;
                 }
             }
-            _ = conn.closed() => return, // session over — nothing left to guard
+            _ = conn.closed() => return,
         }
     }
 }
 
-/// QUIC application error code a client closes with on a **deliberate quit** (a user "stop", not a
-/// network drop). The host reads it off the connection's `ApplicationClosed` reason and tears the
-/// session's virtual display down IMMEDIATELY, skipping the keep-alive linger — an unwanted disconnect
-/// (idle timeout / reset / any other code) still lingers so a reconnect can resume. Shared with the
-/// clients via `punktfunk_core::quic::QUIT_CLOSE_CODE`.
+/// Client close code for a deliberate quit (user "stop"). Tears the virtual display down
+/// immediately, skipping the keep-alive linger. Any other close still lingers for reconnect.
 const QUIT_CODE: u32 = punktfunk_core::quic::QUIT_CLOSE_CODE;
 
-/// Encoder bitrate (kbps) the host falls back to when the client expresses no preference
-/// (`Hello::bitrate_kbps == 0`) — the long-standing 20 Mbps default. A client that knows its
-/// link (e.g. after a speed test) requests an explicit rate instead.
+/// Fallback when `Hello::bitrate_kbps == 0` (20 Mbps). A client that knows its link asks.
 const DEFAULT_BITRATE_KBPS: u32 = 20_000;
-/// Bounds a client's requested bitrate before configuring NVENC: a 500 kbps floor keeps the stream
-/// above unusable, and a **2 Gbps** ceiling is generous headroom over the 1 Gbps+ target that
-/// GF(2¹⁶) Leopard FEC was built to reach — it lifts the GF(2⁸)/~1 Gbps wall, and at 1 Gbps a frame
-/// is only a few-hundred shards in one block (far under the 65535 limit). Enough for 5K@240 with
-/// margin. Resolved value is echoed in `Welcome::bitrate_kbps`. The native data plane batches sends
-/// (`sendmmsg`) and paces each frame on a dedicated send thread (microburst cap), validated to a
-/// clean 1 Gbps with zero send-buffer drops; sustained overruns are still counted as
-/// `packets_send_dropped`.
+/// Floor keeps the stream usable; ceiling is headroom over the 1 Gbps+ Leopard target
+/// (5K@240 with margin). Echoed in `Welcome::bitrate_kbps`.
 const MIN_BITRATE_KBPS: u32 = 500;
-// 8 Gbps ceiling — headroom for a 2.5 Gbps link and the 5 Gbps path (home-worker-3 → Mac Studio,
-// Mac is 10G). The encoder is pixel-rate bound, not bitrate bound (NVENC emits multi-Gbps trivially;
-// ~1 Gpix/s per engine, ~2 with the auto 2-way split), so the real ceiling is the transport send
-// path (UDP GSO + per-packet alloc removal), not this number.
+// 8 Gbps: encoder is pixel-rate bound (~1 Gpix/s per NVENC, ~2 with 2-way split). The
+// real ceiling is the transport send path, not this number.
 const MAX_BITRATE_KBPS: u32 = 8_000_000;
 
-/// Resolve a client's [`Hello::bitrate_kbps`] request to the rate the host will configure:
 /// `0` → host default; anything else clamped into `[MIN, MAX]`.
 fn resolve_bitrate_kbps(requested: u32) -> u32 {
     if requested == 0 {
@@ -941,18 +746,10 @@ fn resolve_bitrate_kbps(requested: u32) -> u32 {
     }
 }
 
-/// [`resolve_bitrate_kbps`] with the codec's floor semantics: PyroWave has no useful
-/// low-rate regime (wavelet quality collapses far above the H.26x floor — plan §4.6), so
-/// an Automatic client (`0`) gets the codec's ~1.6 bpp operating point for the negotiated
-/// mode instead of the 20 Mbps H.26x default. The rate is then PINNED for the session:
-/// the client's ABR controller stays off for this codec and the host refuses mid-stream
-/// retargets.
-///
-/// PyroWave ignores an explicit client rate too (ABR overhaul RFC §5.2): a fixed rate is
-/// ill-defined for an all-intra codec (bpp is the operating point, not kbps) and it used to
-/// bypass the `PUNKTFUNK_PYROWAVE_MAX_MBPS` operator ceiling. Clients grey the control out;
-/// this arm is the belt-and-braces for embedders that never update their UI. H.26x/AV1
-/// explicit rates are honored unchanged (the operator knows the link).
+/// PyroWave Automatic (`0`) pins ~1.6 bpp for the negotiated mode, not the 20 Mbps H.26x
+/// default. ABR stays off; mid-stream retargets are refused. An explicit client rate is
+/// ignored — kbps is ill-defined for all-intra bpp; every rate still goes through
+/// `PUNKTFUNK_PYROWAVE_MAX_MBPS`. H.26x/AV1 explicit rates stand.
 fn resolve_bitrate_kbps_for(
     codec: crate::encode::Codec,
     requested: u32,
@@ -968,9 +765,8 @@ fn resolve_bitrate_kbps_for(
                  treating it as Automatic and resolving the per-mode pin"
             );
         }
-        // ~1.6 bpp for 4:2:0. 4:4:4 doubles the samples per pixel (3 vs 1.5) but chroma
-        // compresses better than luma → ×1.625 ≈ 2.6 bpp; 16-bit planes add ~15 % (both
-        // factors measured against the Phase-0 fixture matrix, design/pyrowave-444-hdr.md).
+        // ~1.6 bpp 4:2:0. 4:4:4 is ×1.625 ≈ 2.6 bpp (chroma compresses better than luma);
+        // 10-bit planes add ~15 %. See `design/pyrowave-444-hdr.md`.
         let bpp_x10: u64 = if chroma.is_444() { 26 } else { 16 };
         let mut bps =
             mode.width as u64 * mode.height as u64 * u64::from(mode.refresh_hz.max(1)) * bpp_x10
@@ -981,11 +777,8 @@ fn resolve_bitrate_kbps_for(
         let pin = u32::try_from(bps / 1000)
             .unwrap_or(MAX_BITRATE_KBPS)
             .clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
-        // Operator link ceiling. PyroWave's Automatic pin is open-loop (all-intra, so ABR and the
-        // capacity probe are off) — at a high pixel rate it can outrun the physical link (e.g.
-        // 4:4:4 + HDR at 5120x1440@240 pins ~5.3 Gbps, over a 5 GbE link), and the overshoot just
-        // becomes packet loss / partial frames. `PUNKTFUNK_PYROWAVE_MAX_MBPS` lets a host on a
-        // constrained link cap the pin to what the fabric carries; unset ⇒ no cap (unchanged).
+        // Open-loop pin can outrun the link. `PUNKTFUNK_PYROWAVE_MAX_MBPS` caps it;
+        // unset ⇒ no cap.
         if let Some(ceiling) = pyrowave_auto_pin_ceiling_kbps() {
             if pin > ceiling {
                 tracing::warn!(
@@ -1002,33 +795,19 @@ fn resolve_bitrate_kbps_for(
     resolve_bitrate_kbps(requested)
 }
 
-/// One shard's wire overhead: the 40-byte punktfunk header + the 24-byte crypto seal that ride
-/// INSIDE the UDP payload next to every `shard_payload` bytes of media (~4.5 % at 1408).
+/// 40-byte header + 24-byte crypto seal inside each UDP payload (~4.5 % at 1408).
 const SHARD_WIRE_OVERHEAD: u64 =
     (punktfunk_core::packet::HEADER_LEN + punktfunk_core::packet::CRYPTO_OVERHEAD) as u64;
 
-/// The wire-budget → encoder-rate derivation (ABR overhaul RFC §5.1, amended 2026-08-27: no
-/// capability handshake — on current builds the client's bitrate number IS a total session
-/// wire budget, full stop).
-///
-/// What rides on the wire for `video` kbps of encoder output: FEC parity (`fec_percent` more
-/// shards), packet framing ([`SHARD_WIRE_OVERHEAD`] per shard), and the audio plane's
-/// reservation off the top. So:
+/// Wire budget → encoder rate. Client bitrate is the session wire budget.
 ///
 /// ```text
 /// wire  = video × (payload+64)/payload × (100+fec)/100 + audio
 /// video = (wire − audio) × payload/(payload+64) × 100/(100+fec)
 /// ```
 ///
-/// "20 Mbps" used to mean 22–30+ Mbps on the wire — and on the constrained links where the
-/// setting matters most, the overshoot WAS the failure. Adaptive FEC now reallocates *within*
-/// the budget: the encode loop re-derives this on every FEC step, so more parity means a
-/// lower encoder rate, never a fatter wire. Floored at [`MIN_BITRATE_KBPS`] — a budget too
-/// small for its own audio still streams, it just overshoots honestly (the resolve gates keep
-/// audio ≤ ~25 % of the number, so this is corrupt-input territory).
-///
-/// PyroWave sessions bypass this entirely (callers pass their rate through): the pin is an
-/// all-intra ENCODER operating point (bpp), and the controller is off for that codec anyway.
+/// Adaptive FEC reallocates inside the budget: more parity, lower encoder rate, never a
+/// fatter wire. Floored at [`MIN_BITRATE_KBPS`]. PyroWave bypasses this (bpp pin, ABR off).
 fn encoder_kbps_for_budget(
     budget_kbps: u32,
     audio_kbps: u32,
@@ -1044,11 +823,9 @@ fn encoder_kbps_for_budget(
         .max(MIN_BITRATE_KBPS)
 }
 
-/// [`encoder_kbps_for_budget`]'s inverse: the wire budget an encoder rate actually spends —
-/// what a short apply (the encoder clamped below the ask) must report BACK to the client, so
-/// its controller's climb base tracks wire truth. Rounds up where the derivation rounds down,
-/// so `budget_kbps_for_encoder(encoder_kbps_for_budget(b)) ≤ b` always holds: a roundtrip
-/// never inflates the budget the client believes.
+/// Inverse: wire spend of an encoder rate. A short apply reports this so the client's climb
+/// base tracks wire truth. Rounds up where the derivation rounds down, so a roundtrip never
+/// inflates the budget the client believes.
 fn budget_kbps_for_encoder(
     encoder_kbps: u32,
     audio_kbps: u32,
@@ -1061,22 +838,18 @@ fn budget_kbps_for_encoder(
     u32::try_from(wire.saturating_add(audio_kbps as u64)).unwrap_or(u32::MAX)
 }
 
-/// The budget↔encoder conversion at one moment in time (RFC §5.1): the session constants
-/// plus a SNAPSHOT of the adaptive FEC percent, taken by the caller at each encoder touch —
-/// the FEC-step watcher in the stream loop re-derives when the live percent moves on. `Copy`,
-/// so it threads next to the `Copy` [`SessionPlan`](crate::session_plan::SessionPlan) through
-/// the build chain without ceremony.
+/// Budget↔encoder at one moment: session constants plus a snapshot of adaptive FEC,
+/// taken at each encoder touch. Stream loop re-derives when the live percent moves.
 #[derive(Clone, Copy, Debug)]
 struct EncDerive {
     audio_kbps: u32,
     shard_payload: u16,
     fec_percent: u8,
-    /// PyroWave: the pin IS an encoder rate — both directions are the identity.
+    /// PyroWave: pin is an encoder rate; both directions are identity.
     identity: bool,
 }
 
 impl EncDerive {
-    /// The encoder video rate a wire budget affords right now.
     fn enc_kbps(&self, budget_kbps: u32) -> u32 {
         if self.identity {
             budget_kbps
@@ -1090,8 +863,6 @@ impl EncDerive {
         }
     }
 
-    /// The wire budget an encoder rate actually spends — for read-backs (a short apply must
-    /// report budget truth to the client).
     fn budget_kbps(&self, encoder_kbps: u32) -> u32 {
         if self.identity {
             encoder_kbps
@@ -1105,14 +876,9 @@ impl EncDerive {
         }
     }
 
-    /// The budget an encoder read-back corresponds to, in the REQUEST's own truncated terms.
-    /// The budget→enc→budget roundtrip deflates by design (`budget_kbps_for_encoder` never
-    /// inflates), so a read-back that lost only the truncation IS the full ask — comparing
-    /// the raw roundtrip against the request instead minted a phantom encoder ceiling 1–2
-    /// kbps under EVERY successful apply, the control task then clamped every climb to it,
-    /// and the client's controller learned it as a host cap: field sessions ratcheted
-    /// 20 → 2.3 Mbps with no way back (0.32.0 regression). Only a genuine driver
-    /// short-apply — below what the request itself derives to — reports short.
+    /// Read-back in the request's truncated terms. The roundtrip deflates, so a read-back
+    /// that lost only truncation is the full ask. Only a genuine driver short-apply reports
+    /// short.
     fn applied_budget_kbps(&self, requested_budget_kbps: u32, applied_enc_kbps: u32) -> u32 {
         let b = self.budget_kbps(applied_enc_kbps);
         if b >= self.budget_kbps(self.enc_kbps(requested_budget_kbps)) {
@@ -1123,12 +889,9 @@ impl EncDerive {
     }
 }
 
-/// The audio plane's wire reservation for the budget derivation, from the RESOLVED Welcome:
-/// the exact PCM cost on the lossless plane, else the Opus ladder's planned cost — the same
-/// shared [`plan_audio_budget`](punktfunk_core::audio::plan_audio_budget) rung the audio
-/// thread runs, with redundancy exactly when the session GRANTED it (`HOST_CAP_AUDIO_RED`).
-/// The client mirrors this from the same Welcome fields; an operator-pinned non-default tier
-/// skews its mirror by a few hundred kbps, well inside the utilization gate's ¾ tolerance.
+/// Audio reservation from the resolved Welcome: PCM cost, else the same
+/// [`plan_audio_budget`](punktfunk_core::audio::plan_audio_budget) rung the audio thread
+/// runs, with redundancy only when `HOST_CAP_AUDIO_RED` was granted.
 fn audio_reserved_kbps(welcome: &punktfunk_core::quic::Welcome) -> u32 {
     if welcome.audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM {
         punktfunk_core::audio::pcm::bitrate_kbps(
@@ -1147,10 +910,8 @@ fn audio_reserved_kbps(welcome: &punktfunk_core::quic::Welcome) -> u32 {
     }
 }
 
-/// Operator ceiling for PyroWave's open-loop Automatic bitrate pin: `PUNKTFUNK_PYROWAVE_MAX_MBPS`
-/// (megabits/s) → kbps, or `None` when unset/zero/invalid (no cap — the raw bpp pin stands).
-/// Consulted for every PyroWave session — an explicit client bitrate resolves through the
-/// pin too (RFC §5.2), so nothing bypasses the ceiling.
+/// `PUNKTFUNK_PYROWAVE_MAX_MBPS` (Mb/s) → kbps. `None` when unset/zero/invalid (no cap).
+/// Every PyroWave session, including an explicit client rate, goes through the pin.
 fn pyrowave_auto_pin_ceiling_kbps() -> Option<u32> {
     std::env::var("PUNKTFUNK_PYROWAVE_MAX_MBPS")
         .ok()
@@ -1159,19 +920,14 @@ fn pyrowave_auto_pin_ceiling_kbps() -> Option<u32> {
         .map(|m| m.saturating_mul(1000))
 }
 
-/// Resolve the audio channel count the session will capture + encode from the client's request.
-/// Normalizes to one of 2 (stereo) / 6 (5.1) / 8 (7.1); anything else (older client, garbage)
-/// becomes stereo. Both backends can produce the requested count (PipeWire pads/upmixes positions,
-/// WASAPI loopback up/downmixes via AUTOCONVERTPCM), so no capability clamp is needed here — the
-/// surround channels just carry up/downmixed content when the host's sink has fewer real channels.
+/// 2 / 6 / 8; anything else (older client, garbage) becomes stereo. Both backends can
+/// produce the count; fewer real sink channels just carry up/downmixed content.
 fn resolve_audio_channels(requested: u8) -> u8 {
     punktfunk_core::audio::normalize_channels(requested)
 }
 
-/// Static FEC override: `PUNKTFUNK_FEC_PCT`, when set, PINS the recovery percent and DISABLES
-/// adaptive FEC — so a speed test / measurement keeps a fixed, known overhead. `None` ⇒ adaptive
-/// FEC (the host sizes recovery to the loss the client reports). `0` disables FEC entirely.
-/// Clamped to ≤ 90.
+/// `PUNKTFUNK_FEC_PCT` pins recovery and disables adaptive FEC. `None` ⇒ adaptive. `0`
+/// disables FEC. Clamped to ≤ 90.
 fn fec_static_override() -> Option<u8> {
     std::env::var("PUNKTFUNK_FEC_PCT")
         .ok()
@@ -1179,52 +935,39 @@ fn fec_static_override() -> Option<u8> {
         .map(|p| p.min(90))
 }
 
-/// Adaptive-FEC band + starting point. Every recovery shard is extra wire bytes AND an extra
-/// packet, so on a clean link FEC decays toward [`FEC_MIN`] (fewer packets — the win for a
-/// packet-rate-bound uplink like the Steam Deck's WiFi tx); loss ramps it toward [`FEC_MAX`].
-/// Sessions start moderate so the first frames (before any loss report) are protected.
+/// Adaptive-FEC band. Clean link decays toward [`FEC_MIN`] (fewer packets on a rate-bound
+/// uplink); loss ramps toward [`FEC_MAX`]. Start moderate so the first frames are protected.
 const FEC_MIN: u8 = 1;
 const FEC_MAX: u8 = 50;
 const FEC_ADAPTIVE_START: u8 = 10;
 
-/// Map the client's reported data-plane loss (ppm of shards, see [`LossReport`]) to a recovery
-/// percentage. FEC must EXCEED the loss rate to recover a block, so target ≈ loss × 1.4 + 1 pt of
-/// margin, clamped to the band. A clean link (≈0 ppm) lands on [`FEC_MIN`].
+/// Loss ppm ([`LossReport`]) → recovery %. FEC must exceed loss, so target ≈ loss × 1.4 + 1.
+/// Clean (≈0 ppm) lands on [`FEC_MIN`].
 fn adapt_fec(loss_ppm: u32) -> u8 {
     let loss_pct = loss_ppm as f64 / 10_000.0; // ppm → percent
     let target = (loss_pct * 1.4).ceil() as u32 + 1;
     target.clamp(FEC_MIN as u32, FEC_MAX as u32) as u8
 }
 
-/// The decay floor once a session has seen real loss ("burned", ABR overhaul RFC §2.4).
+/// Decay floor after any real loss. 5 % so a static stretch cannot drop protection before motion.
 const FEC_BURNED_MIN: u8 = 5;
-/// Clean 750 ms report windows (~2 min) a burned session must string together before the
-/// floor steps back to [`FEC_MIN`].
+/// Clean 750 ms windows (~2 min) before a burned session re-earns [`FEC_MIN`].
 const FEC_REEARN_WINDOWS: u32 = 160;
-/// Ceiling on the doubled re-earn requirement (~16 min) — a periodic-burst link converges to
-/// "armored for the session" without the counter running away.
+/// Cap on the doubled re-earn (~16 min) so a periodic-burst link does not run the counter away.
 const FEC_REEARN_MAX: u32 = 1280;
 
-/// Adaptive-FEC decay floor with a memory of real loss (ABR overhaul RFC §2.4; pure —
-/// unit-tested).
+/// Adaptive-FEC decay floor with a memory of real loss.
 ///
-/// The plain 1 pt/window decay converges on [`FEC_MIN`] (1 %) over any clean stretch — on a
-/// lossy link that is precisely backwards: static content strips the armor, then the first
-/// motion frame arrives essentially unprotected and dies (the 2026-08-26 motion-onset field
-/// chain, step 2). Once a window reports ANY shard loss (`loss_ppm > 0` — loss is discrete,
-/// so nonzero means real lost shards, not noise), the floor rises to [`FEC_BURNED_MIN`].
-///
-/// Not session-permanent — the controller's house rule (the encode stand-down, `7246f0fe`)
-/// is that nothing learned from evidence is forever: [`FEC_REEARN_WINDOWS`] clean windows
-/// re-earn the 1 % floor, a link that re-burns before the step-down has proven itself
-/// doubles the next requirement (to [`FEC_REEARN_MAX`]), and a step-down that survives its
-/// own horizon resets the requirement to base.
+/// Any `loss_ppm > 0` (loss is discrete — nonzero means real shards) raises the floor to
+/// [`FEC_BURNED_MIN`]. [`FEC_REEARN_WINDOWS`] clean windows re-earn 1 %; a re-burn before
+/// that step-down doubles the next requirement (to [`FEC_REEARN_MAX`]); surviving the
+/// horizon resets to base.
 #[derive(Debug)]
 struct FecFloor {
     floor: u8,
     clean_windows: u32,
     reearn: u32,
-    /// Clean windows since the floor last stepped down; `None` = no step-down on probation.
+    /// Clean windows since the last step-down; `None` = no step-down on probation.
     since_stepdown: Option<u32>,
 }
 
@@ -1240,12 +983,12 @@ impl Default for FecFloor {
 }
 
 impl FecFloor {
-    /// Feed one report window; returns the floor the adaptive target must not decay below.
+    /// One report window; returns the floor the adaptive target must not decay below.
     fn on_report(&mut self, loss_ppm: u32) -> u8 {
         if loss_ppm > 0 {
             if let Some(w) = self.since_stepdown.take() {
                 if w < self.reearn {
-                    // The clean run that earned the step-down was luck — demand double.
+                    // Step-down did not survive — demand double.
                     self.reearn = (self.reearn * 2).min(FEC_REEARN_MAX);
                 }
             }
@@ -1256,7 +999,7 @@ impl FecFloor {
             if let Some(w) = self.since_stepdown.as_mut() {
                 *w = w.saturating_add(1);
                 if *w >= self.reearn {
-                    // The step-down outlived its probation — the link really recovered.
+                    // Step-down outlived probation — the link recovered.
                     self.reearn = FEC_REEARN_WINDOWS;
                     self.since_stepdown = None;
                 }
@@ -1271,8 +1014,7 @@ impl FecFloor {
     }
 }
 
-/// Apply the latest adaptive-FEC target to the session if it changed (cheap relaxed load + compare),
-/// called once per frame on the data-plane send path.
+/// Per-frame send path: apply the adaptive-FEC target if it changed (relaxed load + compare).
 fn apply_fec_target(session: &mut Session, fec_target: &AtomicU8) {
     let t = fec_target.load(Ordering::Relaxed);
     if session.fec_percent() != t {
@@ -1280,34 +1022,23 @@ fn apply_fec_target(session: &mut Session, fec_target: &AtomicU8) {
     }
 }
 
-/// Persistent audio-capturer slot, reused across sessions (same pattern as the GameStream
-/// path): keeps one warm PipeWire capture stream instead of a connect/negotiate cycle —
-/// and a daemon-side node churn — per session. (Drop now tears a capturer down cleanly.)
+/// Host-lifetime PipeWire capturer, reused across sessions (one connect/negotiate, not per session).
 type AudioCapSlot = Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCapturer>>>>;
 
-/// How long the host keeps an unpaired knock PARKED — connection held open — waiting for the
-/// operator to click Approve in the console (delegated approval, roadmap §8b-1). The QUIC
-/// keep-alive (4 s, under the 8 s idle timeout) holds the path warm meanwhile, so on approval the
-/// device pairs and streams with NO reconnect. Bounded well under the pending entry's TTL (10 min);
-/// the client uses a comparable connect timeout, and a client that gives up first closes the
-/// connection (the host stops waiting at once).
+/// Park an unpaired knock for console Approve. QUIC keep-alive (4 s, under 8 s idle) holds
+/// the path; approval streams with no reconnect. Under the pending TTL (10 min).
 const PENDING_APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// How a served connection ended. A peer that completes the QUIC handshake and closes cleanly
-/// (code 0) without ever opening the control stream is a reachability probe (the clients'
-/// hosts-page "online" pips / `--reachable`) or an abandoned connect — routine, and logged
-/// quietly: as a WARN it buried the real failures in a wake-on-LAN triage log.
+/// A QUIC handshake that closes code 0 with no control stream is a reachability probe
+/// (`--reachable` / hosts-page pips). Log at debug, not warn.
 enum Served {
     Session,
     ProbeClose,
 }
 
-/// One client session: handshake → input/audio planes → data plane until done/disconnect.
-/// Everything torn down on return (RAII: virtual output, encoder, threads via channel close).
-/// A connection whose first message is a PairRequest runs the pairing ceremony instead.
-// Each argument is a distinct host-lifetime handle threaded from `serve` (config, the audio +
-// injector services, the trust store, pairing state) — bundling them into a context struct would
-// obscure more than it'd save.
+/// Handshake → input/audio → data plane. RAII teardown. A first-message PairRequest is
+/// the pairing ceremony instead.
+// Distinct host-lifetime handles from `serve`; a context struct would hide the lifetimes.
 #[allow(clippy::too_many_arguments)]
 async fn serve_session(
     conn: quinn::Connection,
@@ -1319,21 +1050,17 @@ async fn serve_session(
     np: &NativePairing,
     last_pairing: &std::sync::Mutex<Option<std::time::Instant>>,
     stats: Arc<StatsRecorder>,
-    // The session slot. Owned here (not just held by the spawning task) because an unpaired knock
-    // RELEASES it while parked for delegated approval, then RE-ACQUIRES one on approval — so a
-    // parked knock can't hold a streaming slot. `sem` is the pool it re-acquires from.
+    // Owned here: an unpaired knock releases it while parked and re-acquires on approval.
     mut permit: tokio::sync::OwnedSemaphorePermit,
     sem: Arc<tokio::sync::Semaphore>,
 ) -> Result<Served> {
     let peer = conn.remote_address();
 
-    // First message decides what this connection is: a pairing ceremony or a session.
     let (mut send, mut recv) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
         .await
         .map_err(|_| anyhow!("control stream timeout"))?
     {
-        // A clean close before any control stream: a reachability probe / abandoned connect,
-        // not a failed session (see [`Served::ProbeClose`]).
+        // Clean close before any control stream: reachability probe ([`Served::ProbeClose`]).
         Err(quinn::ConnectionError::ApplicationClosed(ref ac))
             if ac.error_code == quinn::VarInt::from_u32(0) =>
         {
@@ -1345,9 +1072,7 @@ async fn serve_session(
         .await
         .map_err(|_| anyhow!("first message timeout"))??;
     if let Ok(req) = PairRequest::decode(&first) {
-        // The client fingerprint (cert possession is proven by the QUIC handshake) is needed to honor
-        // a fingerprint-bound PIN window (#9): a window the operator armed for a SPECIFIC device must
-        // not be consumable — or burnable — by any other fingerprint.
+        // Fingerprint-bound PIN window: only this device may consume (or burn) it.
         let Some(client_fp) = endpoint::peer_fingerprint(&conn) else {
             close_rejected(
                 &conn,
@@ -1356,18 +1081,9 @@ async fn serve_session(
             anyhow::bail!("pairing requires the client to present a certificate");
         };
         let client_fp_hex = fingerprint_hex(&client_fp);
-        // The cooldown is charged BEFORE the arming state is consulted, and stamped on EVERY
-        // outcome — including the rejections.
-        //
-        // It used to be charged only after `pin_for_attempt` returned a PIN, which made the two
-        // rejections free: an unpaired LAN peer could ask "is pairing armed right now?" at
-        // unlimited rate at zero cost, learning the moment the operator opens a window and racing
-        // the legitimate device into it (2026-08-05 review M-5). Charging first costs an attacker
-        // one cooldown per probe and makes armed/disarmed indistinguishable from rate-limited.
-        //
-        // The trade is deliberate: a peer spamming knocks can now hold the cooldown against the
-        // operator's real device. That is a visible, self-limiting nuisance — the operator retries
-        // — whereas the oracle was silent and gave away the window.
+        // Charge the cooldown before consulting arming, on every outcome including rejections.
+        // Otherwise "is pairing armed?" is a free oracle. A spam of knocks can hold the
+        // cooldown against the real device.
         {
             let mut last = last_pairing.lock().unwrap();
             if let Some(t) = *last {
@@ -1381,8 +1097,7 @@ async fn serve_session(
             }
             *last = Some(std::time::Instant::now());
         }
-        // Resolve the live arming PIN per attempt (so a lapsed window no longer pairs), honoring any
-        // fingerprint binding.
+        // Live PIN per attempt so a lapsed window no longer pairs; honor fingerprint binding.
         let pin = match np.pin_for_attempt(&client_fp_hex) {
             crate::native_pairing::PinAttempt::Pin(pin) => pin,
             crate::native_pairing::PinAttempt::Disarmed => {
@@ -1391,8 +1106,7 @@ async fn serve_session(
                     "pairing not armed (arm it in the console, or start with --allow-pairing)"
                 )
             }
-            // Armed for a DIFFERENT device — reject without running the ceremony, so this attempt does
-            // NOT consume (burn) the operator's window for the device they actually selected (#9).
+            // Armed for a different device: reject without the ceremony so this does not burn the window.
             crate::native_pairing::PinAttempt::BoundToOther => {
                 close_rejected(
                     &conn,
@@ -1408,15 +1122,10 @@ async fn serve_session(
             .map(|()| Served::Session);
     }
 
-    // Pairing gate for a session Hello (a PairRequest was handled above). Lifted OUT of the
-    // `handshake` future below for two reasons: (1) the approval wait must not be bound by the
-    // short HANDSHAKE_TIMEOUT — a human reads the console and clicks Approve; (2) the NVENC session
-    // permit is released while parked, so a knock awaiting approval can't hold a streaming slot.
-    // On approval the device is now paired, so the handshake proceeds and the session starts with
-    // NO client reconnect (delegated approval, roadmap §8b-1).
+    // Pairing gate outside the handshake future: approval wait must not be bound by
+    // HANDSHAKE_TIMEOUT, and the NVENC permit is released while parked.
     if opts.require_pairing {
-        // Decode just enough to gate (the Hello carries the device name for the pending label);
-        // the `handshake` future re-decodes for the real session — a few dozen bytes, negligible.
+        // Hello name for the pending label; handshake re-decodes for the real session.
         let gate_hello = Hello::decode(&first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
         if gate_hello.abi_version != punktfunk_core::WIRE_VERSION {
             close_rejected(
@@ -1430,10 +1139,8 @@ async fn serve_session(
             );
         }
         let fp = endpoint::peer_fingerprint(&conn);
-        // The admission verb is `effective`, not `is_paired` (the facade's two-verbs contract):
-        // an EXPIRED record is listed but not authorized, so it falls into the delegated-approval
-        // knock below exactly like an unpaired device — the guest's reconnect shows up in the
-        // console as pending and re-approval is the re-grant (design §4).
+        // `effective`, not `is_paired`: an expired record is listed but not authorized, so it
+        // knocks like an unpaired device and re-approval is the re-grant.
         let authorized = fp
             .as_ref()
             .map(|fp| {
@@ -1442,8 +1149,7 @@ async fn serve_session(
             })
             .unwrap_or(false);
         if !authorized {
-            // An anonymous client (no certificate) has no identity to approve — reject outright
-            // (the PIN ceremony is its way in). Mirrors the prior behavior for anonymous knocks.
+            // Anonymous: no identity to approve. PIN ceremony is the way in.
             let Some(fp) = fp else {
                 close_rejected(
                     &conn,
@@ -1455,27 +1161,20 @@ async fn serve_session(
                 );
             };
             let fp_hex = fingerprint_hex(&fp);
-            // Sanitize the wire-supplied name before it reaches the log / console (untrusted: an
-            // unpaired device could embed terminal escapes / bidi overrides); note_pending stores
-            // the same sanitized form and derives a fingerprint label when empty.
+            // Sanitize the wire name before log/console (escapes / bidi). Empty → fingerprint label.
             let label = crate::native_pairing::sanitize_device_name(
                 gate_hello.name.as_deref().unwrap_or(""),
                 &fp_hex,
             );
             tracing::info!(name = %label, fingerprint = %fp_hex,
                 "unpaired device knocked — parking connection for delegated approval in the console");
-            // Record the QUIC-validated source IP so the pending queue's per-source cap can stop one
-            // host from flooding/evicting genuine knocks (#13). The returned knock generation makes
-            // this connection the ONE an approval admits — a retrying client parks a fresh
-            // connection per knock, and admitting every parked sibling on a single Approve spun up
-            // three concurrent Mutter virtual monitors and segfaulted gnome-shell (2026-07-10).
+            // QUIC-validated source IP for the pending per-source cap. Knock generation makes
+            // this connection the one an approval admits — siblings must not all start a session.
             let knock_seq = np.note_pending(&label, &fp_hex, Some(peer.ip()));
-            // Free the session slot while a human decides — a parked knock must not hold an NVENC
-            // permit (a handful of parked knocks would otherwise block every real session).
+            // Parked knock must not hold an NVENC permit.
             drop(permit);
             let decision = tokio::select! {
                 d = np.wait_for_decision(&fp_hex, knock_seq, PENDING_APPROVAL_WAIT) => d,
-                // The client gave up (closed the connection) before a decision — stop waiting.
                 _ = conn.closed() => anyhow::bail!("client disconnected before pairing approval"),
             };
             match decision {
@@ -1502,8 +1201,7 @@ async fn serve_session(
                     )
                 }
             }
-            // Re-acquire a session slot for the now-approved session (waits if all slots are busy,
-            // exactly like any freshly accepted client).
+            // Re-acquire like any freshly accepted client (waits if busy).
             permit = sem
                 .clone()
                 .acquire_owned()
@@ -1511,49 +1209,35 @@ async fn serve_session(
                 .expect("session semaphore is never closed");
         }
     }
-    // Held for the rest of the session (RAII frees the slot on return). For an already-paired
-    // client this is the original permit; for a just-approved knock it's the re-acquired one.
+    // RAII frees the slot on return (original or re-acquired).
     let _permit = permit;
 
-    // Per-client access (design/per-client-access.md, WP3): resolve this session's grants ONCE at
-    // admission — the effective mask + raw deadline off the trust record, plus the watch
-    // subscription every later edit/unpair arrives on. An anonymous client (no certificate, only
-    // possible on an `--open` host) and an identity with no record keep today's full control:
-    // grants live on the trust record, and a device without one has nothing to enforce.
+    // Grants once at admission: effective mask + deadline + watch. Anonymous (`--open`) and
+    // an identity with no record keep full control — nothing on the trust record to enforce.
     let session_fp_hex = endpoint::peer_fingerprint(&conn).map(|fp| fingerprint_hex(&fp));
     let admit_unix = wall_unix_now();
     let (initial_grants, deadline_unix, access_watch) = match session_fp_hex.as_deref() {
         Some(fp_hex) => match np.effective(fp_hex, admit_unix) {
             Some(mask) => {
-                // Subscribe BEFORE reading the deadline off the channel's current value, so an
-                // edit racing this admission lands either in this borrow or as the watch's
-                // first change notification — never in a gap between the two.
+                // Subscribe before reading the deadline so a racing edit lands in this borrow
+                // or as the first change — never in a gap.
                 let rx = np.subscribe(fp_hex);
                 let deadline = rx.borrow().deadline_unix;
                 (mask, deadline, Some(rx))
             }
-            // The record expired (or was unpaired) between the pairing gate above and here —
-            // a lost race with the deadline on a pairing-required host: close with the typed
-            // expiry so the client renders the real reason instead of a setup error.
+            // Expired between the pairing gate and here: typed expiry, not a setup error.
             None if opts.require_pairing => {
                 close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired);
                 anyhow::bail!("access expired between admission and session setup");
             }
-            // An `--open` host admits unpaired identities with full control (today's behavior);
-            // an expired record there was never gating anything either.
+            // `--open`: unpaired / expired identities keep full control.
             None => (GRANT_ALL, None, None),
         },
         None => (GRANT_ALL, None, None),
     };
-    // The one mask every enforcement point reads (design §5.2, one relaxed load per event): the
-    // datagram dispatch filter, the input thread's setup guards, and the control task's
-    // clipboard resolution all share this atomic. The access lifecycle task below is its only
-    // writer after admission.
+    // One relaxed load per event; the lifecycle task is the only writer after admission.
     let session_grants = Arc::new(AtomicU32::new(initial_grants));
-    // WP5 launch gate (design §5.4): a session that asked to launch a title without the LAUNCH
-    // grant is refused HERE — before the handshake, so no Welcome is ever sent and the client
-    // shows the typed reason — rather than silently dropped into a bare desktop it didn't ask
-    // for. Decoded only on the ungranted path; the handshake re-decodes for the real session.
+    // Launch without LAUNCH: refuse before handshake (typed reason), not a silent bare desktop.
     if initial_grants & GRANT_LAUNCH == 0 && Hello::decode(&first).is_ok_and(|h| h.launch.is_some())
     {
         close_rejected(
@@ -1567,22 +1251,14 @@ async fn serve_session(
     let source = opts.source;
     let frames = opts.frames;
     let data_port = opts.data_port;
-    // Session-transition trace (latency plan P0.1): zeroed here — the Hello is in hand, pairing
-    // gates are behind us — and finished by the send thread when the FIRST video packet leaves.
-    // The completed totals surface per session in `session_status` (→ mgmt `/status`).
+    // Hello in hand; send thread finishes this when the first video packet leaves.
     let bringup = crate::bringup::Trace::start("bringup", Arc::new(AtomicU32::new(0)));
-    // The mid-stream resize counterpart: each accepted Reconfigure runs its own trace into this
-    // shared slot (latest wins), registered alongside the bring-up total.
+    // Mid-stream resize counterpart; latest accepted Reconfigure wins.
     let resize_ms: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 
-    // Stop signal: stream duration elapsed or the client went away. Created (with its watcher)
-    // BEFORE the handshake so the Welcome-time display prep can already observe a client that
-    // vanished mid-handshake (its build-retry loop aborts on `stop`).
+    // Created before handshake so Welcome-time display prep aborts if the client vanishes.
     let stop = Arc::new(AtomicBool::new(false));
-    // Deliberate-quit signal: set (before `stop`, so the display lease reads it on teardown) when
-    // the client closed the connection with `QUIT_CODE` — a user "stop", which skips the
-    // keep-alive linger. A bare disconnect / idle timeout leaves it false → the display lingers
-    // for a reconnect.
+    // Set before `stop` on `QUIT_CODE` so the display lease skips the keep-alive linger.
     let quit = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
@@ -1620,38 +1296,23 @@ async fn serve_session(
         .await
         .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
     let (ctrl_send, ctrl_recv) = (send, recv);
-    // Can this session's backend live-reconfigure (mid-stream Reconfigure)? Gated OFF for:
-    //   * gamescope (all sub-modes): a spawn respawn restarts the game, managed restarts the box's
-    //     game-mode session, attach doesn't own the display — a resize must never relaunch the title
-    //     (design/midstream-resolution-resize.md H1/D3). The client keeps scaling client-side.
-    //   * an `identity: per-client-mode` policy: the mode is part of the display-identity slot key,
-    //     so a resize would resolve a DIFFERENT slot — on Windows a fresh monitor ADD instead of the
-    //     in-place reconfigure, on KWin a differently-named output — defeating the policy's
-    //     per-resolution identity. Honest downgrade: reject, client scales (H5).
-    //   * a monitor MIRROR (a `capture_monitor` pin): a physical head runs at the mode its owner set
-    //     and the mirror backend ignores the requested one, so a resize would restart the identical
-    //     cast at the identical size (design/per-monitor-portal-capture.md §7.3).
-    // The SYNTHETIC source stays reconfigurable on purpose (nothing to rebuild — the ack round-trip
-    // is the whole effect): it is the compositor-free protocol test source, and the C-ABI roundtrip
-    // test + client harnesses exercise the Reconfigure/Reconfigured plumbing through it.
-    // Captured once at session setup; the control task answers `accepted: false` when gated.
+    // Live reconfigure is off for gamescope (resize must not relaunch the title),
+    // `identity: per-client-mode` (resize would resolve a different slot), and a
+    // monitor mirror (physical head ignores the requested mode). Synthetic stays on.
+    // Captured once here.
     let live_reconfig_ok = {
         let per_client_mode_identity = crate::vdisplay::policy::prefs()
             .configured_effective()
             .is_some_and(|e| e.identity == crate::vdisplay::policy::Identity::PerClientMode);
-        // Read once here, like the identity above: this session opened its display under whatever
-        // the pin said at bring-up, so a console change mid-session must not retroactively change
-        // what THIS session answers a Reconfigure with. Linux-only because `vdisplay::open` only
-        // routes to the mirror there — a pin left in a Windows host's settings streams nothing
-        // different, and must not silently disable resize as a side effect.
+        // Pin at bring-up; a console change mid-session must not change this session's answer.
+        // Linux-only: `vdisplay::open` only routes to the mirror there.
         #[cfg(target_os = "linux")]
         let mirrored = crate::vdisplay::capture_monitor().is_some();
         #[cfg(not(target_os = "linux"))]
         let mirrored = false;
         reconfig_allowed(compositor, per_client_mode_identity, mirrored)
     };
-    // Negotiated codec (HEVC / H.264 / AV1), derived from the Welcome. `Copy`, so the control task's
-    // `async move` captures a copy and it stays usable for the data-plane SessionContext below.
+    // `Copy` so the control task's `async move` and SessionContext both keep it.
     let codec = crate::encode::Codec::from_wire(welcome.codec);
     let client_udp = std::net::SocketAddr::new(peer.ip(), start.client_udp_port);
     tracing::info!(
@@ -1663,84 +1324,40 @@ async fn serve_session(
         "handshake complete — streaming"
     );
 
-    // Control task: the handshake stream stays open for mid-stream renegotiation and speed
-    // tests. A validated Reconfigure is acked, then handed to the data-plane thread, which
-    // rebuilds capture/encoder/virtual output at the new mode (the data plane itself is
-    // untouched). A ProbeRequest is handed to the data plane, which bursts FLAG_PROBE filler and
-    // hands back a ProbeResult that this task writes to the client. The two control directions
-    // (inbound requests, outbound probe results) are multiplexed with `select!`.
+    // Handshake stream stays open: Reconfigure → data plane rebuilds capture/encoder;
+    // ProbeRequest → FLAG_PROBE burst. Inbound and outbound multiplexed with `select!`.
     let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<punktfunk_core::Mode>();
     let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel::<()>();
-    // Client LTR-RFI recovery: the control task forwards each `RfiRequest`'s lost-frame range here;
-    // the encode loop prefers `Encoder::invalidate_ref_frames` (a clean re-anchor P-frame) over a
-    // full IDR when the encoder supports it (native-AMF LTR / Windows NVENC).
+    // LTR-RFI: encode loop prefers `invalidate_ref_frames` over a full IDR when the encoder can.
     let (rfi_tx, rfi_rx) = std::sync::mpsc::channel::<(u32, u32)>();
     let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
-    // Encoder-truth bridge, data plane → control task (§ABR overdrive). The encode loop publishes
-    // here; the control task reads at `SetBitrate`-resolve time, so the ack the client's
-    // controller climbs from tracks what the encoder ACTUALLY does, not what was asked:
-    // - `live_bitrate`: the encoder's applied rate (kbps) — also the send pacer's/console's view.
-    // - `encoder_ceiling_kbps`: the discovered codec-level ceiling (0 = none discovered yet);
-    //   resolves land at min(policy clamp, ceiling), so overshoots stop costing rebuilds.
-    // - `cadence_degraded`: encode can't hold the frame cadence — a climb is refused (acked at
-    //   the current rate); the network isn't the bottleneck, more bits are anti-medicine.
-    // Plain atomics, not a channel: only the freshest value matters, and only at resolve time.
+    // Encoder truth for `SetBitrate` resolve: applied rate, discovered ceiling (`0` = none),
+    // cadence-degraded (climb refused — more bits are not the fix). Atomics: freshest only.
     let live_bitrate = Arc::new(AtomicU32::new(welcome.bitrate_kbps));
     let encoder_ceiling_kbps = Arc::new(AtomicU32::new(0));
     let cadence_degraded = Arc::new(AtomicBool::new(false));
-    // The live behind-cadence score behind that flag, so the climb-refusal log line carries its
-    // evidence (a refusal without the score left a 23-minute floor-pinned field session with no
-    // trace of why).
+    // Behind-cadence score for the climb-refusal log (the flag alone has no evidence).
     let cadence_behind_score = Arc::new(AtomicU32::new(0));
-    // Delivery truth, control task → data plane: the packet count the client reports having
-    // received all session (`u32::MAX` until a client new enough to answer sends one). The data
-    // plane needs it to tell a clean link from a dead one — `loss_ppm = 0` means both — before it
-    // blames the client for a stream that never reached it.
+    // Client-received packet count (`u32::MAX` until the client answers). Distinguishes a
+    // clean link from a dead one (`loss_ppm = 0` means both).
     let client_packets_received = Arc::new(AtomicU32::new(u32::MAX));
     let client_packets_received_ctl = client_packets_received.clone();
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
     let (probe_result_tx, probe_result_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
-    // Mode-switch outcome, data plane → control task (same pattern as `probe_result_tx`): the accept
-    // ack is written BEFORE the rebuild, so a failed rebuild (host stays at the old mode) or a
-    // backend that honored a different refresh must CORRECT the client's mode slot with a second
-    // `Reconfigured { accepted: true, mode: <actually live> }` — the client handler treats any
-    // accepted ack as "the active mode is now X" and fixes itself; old clients just log it.
+    // Accept ack is written before the rebuild; a failed or differently-honored rebuild must
+    // correct the client's mode slot with a second `Reconfigured { accepted: true, mode }`.
     let (reconfig_result_tx, reconfig_result_rx) =
         tokio::sync::mpsc::unbounded_channel::<Reconfigured>();
-    // Unsolicited bitrate re-target, data plane → control task (the `reconfig_result_tx` pattern
-    // again, for the same reason). A pipeline rebuild can RE-RESOLVE an Automatic rate — most
-    // visibly when the source delivers a different size than the session negotiated, e.g. a
-    // client that asked for 1080p mirroring a 4K panel — and that number is what everything
-    // downstream reasons about: the send pacer, the console, and the base a `SetBitrate` ack is
-    // measured against. The client's copy only ever moved on an ack, so it stayed on the
-    // negotiated rate while the host encoded at another one, and the ABR's first climb computed
-    // from that stale base asked for LESS than the host was already sending — a re-target
-    // downward, with the rebuild it costs. Tell the client instead; `BitrateChanged` already
-    // means exactly this and old clients already handle one arriving unprompted.
+    // Rebuild can re-resolve Automatic (1080p client mirroring a 4K panel). Tell the client
+    // (`BitrateChanged`); otherwise ABR's first climb is from a stale lower base.
     let (retarget_tx, retarget_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    // Pipeline-gap announcements, data plane → control task (the same bridge pattern, for the same
-    // reason: the control task is the control stream's sole writer). A rebuild that keeps the
-    // session up — a mode switch, or the Windows exclusive-topology eviction recovery — still
-    // stops the stream dead for a few hundred milliseconds, and the client's adaptive-bitrate
-    // controller reads the report window that straddles it as congestion. We are the only party
-    // that knows it was us, so we say so: the channel carries the rebuild's length in ms, and the
-    // control task turns it into a `PipelineGap` the client answers by discarding that window.
+    // Rebuild gap (ms) → `PipelineGap` so the client discards that ABR window as congestion.
     let (gap_tx, gap_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    // Cursor-forward bridge (M2): the encode loop diffs each frame's cursor serial and hands
-    // changed SHAPES here; the control task (the control stream's sole writer) sends them.
-    // Same shape as `probe_result_tx`. Wired even when the channel wasn't negotiated — it
-    // just never fires then.
+    // Encode loop diffs cursor serial; control task is the sole writer. Wired even if unused.
     let (cursor_shape_tx, cursor_shape_rx) =
         tokio::sync::mpsc::unbounded_channel::<punktfunk_core::quic::CursorShape>();
-    // Mid-session shard renegotiation (design/shard-payload-reneg.md Phase 2): the wire-MTU
-    // watcher decides (constrained-path shrink / ack-gated jumbo grow), the control task
-    // writes the `ShardPayloadChanged` and routes the acks back, and the data-plane loop
-    // applies `Session::set_shard_payload` between AUs (drained next to `bitrate_rx`).
-    // Channels are wired unconditionally (they just never fire); the DRIVER exists only for
-    // a client that advertised `Hello::max_shard_payload` on a non-chunk-aligned session —
-    // PyroWave clients parse chunk-aligned AUs in windows of the `Welcome` value pinned at
-    // session start (read once over the C ABI), so those sessions keep the leg-1
-    // next-session clamp instead of a mid-stream re-key.
+    // Channels always wired. Driver only if `Hello::max_shard_payload` and not PyroWave
+    // (PyroWave pins the Welcome value for the session; mid-stream re-key would desync).
     let (shard_change_tx, shard_change_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
     let (shard_ack_tx, shard_ack_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
     let (shard_apply_tx, shard_apply_rx) = std::sync::mpsc::channel::<usize>();
@@ -1751,55 +1368,32 @@ async fn serve_session(
             ack_rx: shard_ack_rx,
             apply_tx: shard_apply_tx,
         });
-    // The session is real: watch this connection's MTU discovery settle and turn it into a
-    // path verdict (WARN + learned clamp for the next session on a constrained path; clears
-    // a stale clamp on a healthy one) — and, with the driver above, heal or grow THIS
-    // session mid-stream. Bounded ~10 s task unless a jumbo grow leaves it as revert guard.
+    // Path-MTU watch: clamp for the next session, and heal/grow this one if the driver exists.
     wire_mtu::spawn_watch(
         conn.clone(),
         welcome.shard_payload as usize,
         hello.max_shard_payload,
         shard_reneg,
     );
-    // Negotiated cursor forwarding: the HOST_CAP_CURSOR bit the Welcome advertised, read back
-    // rather than recomputed (`handshake::cursor_forward` computed it once, with the encoder
-    // blend-capability gate — re-running it here could drift, and would re-probe).
+    // Read back from Welcome, not recomputed (would re-probe and could drift).
     let cursor_forward = welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0;
-    // Who renders the pointer RIGHT NOW (client `CursorRenderMode`, flipped live by the mouse-
-    // model chord): `true` = client draws (exclude + forward), `false` = host composites (the
-    // capture model). Starts true — the pre-message behavior for cap sessions. Control task
-    // writes, data-plane loop edge-detects.
+    // `true` = client draws (exclude + forward), `false` = host composites. Starts true.
     let cursor_client_draws = Arc::new(AtomicBool::new(true));
     let cursor_client_draws_dp = cursor_client_draws.clone();
-    // Adaptive FEC: the control task maps each client LossReport to a recovery percent and publishes
-    // it here; the data-plane send loop reads + applies it per frame. Disabled (pinned) when
-    // PUNKTFUNK_FEC_PCT is set. Seeded with the session's starting FEC so it's a no-op until a report.
+    // Control task publishes LossReport → recovery %; send loop applies per frame. Seeded no-op.
     let adaptive_fec = fec_static_override().is_none();
     let fec_target = Arc::new(AtomicU8::new(welcome.fec.fec_percent));
     let fec_target_ctl = fec_target.clone();
-    // Phase-locked capture bridge (design/phase-locked-capture.md): the control task stores the
-    // client's PhaseReports here; the encode loop's controller drains them. Inert until a
-    // vsync-aware client actually reports.
+    // PhaseReports from the control task; encode loop drains. Inert until a vsync-aware client.
     let phase_ctl = Arc::new(stream::PhaseCtl::new());
     let phase_ctl_control = phase_ctl.clone();
-    // The session's negotiated rate — the pin PyroWave retarget-refusals ack (§4.6).
+    // Negotiated rate; PyroWave retarget-refusals ack this pin.
     let session_bitrate_kbps = welcome.bitrate_kbps;
-    // Shared-clipboard enable state (client `ClipControl` → host). The coordinator reads it to
-    // decide whether to forward host copies; the control task flips it on each `ClipControl`,
-    // and the access lifecycle task clears it if a mid-session edit revokes CLIPBOARD.
+    // Control task flips on `ClipControl`; lifecycle clears it if CLIPBOARD is revoked.
     let clip_enabled = Arc::new(AtomicBool::new(false));
-    // Start the host clipboard coordinator. On success it watches the session clipboard, forwards
-    // host copies as `ClipOffer`s (`clip.offer_rx` → control task → client), installs client
-    // offers as a lazy source, and owns the fetch-stream accept loop. `available` is false when
-    // there's no backend (gamescope / older GNOME / an unsupported platform) — the control task
-    // then answers `ClipControl` with `BACKEND_UNAVAILABLE` and the decline loop below handles
-    // stray fetch streams.
-    //
-    // Deny-at-setup (per-client access §5.4): without the CLIPBOARD grant the coordinator never
-    // starts — a watcher that doesn't exist can't leak a host copy past a filter bug. The inert
-    // handle (dead channels, `available: false`) keeps the control task's clipboard arms
-    // uniform; `ClipControl` then resolves NOT_PERMITTED, and the decline loop below still
-    // answers stray fetch streams, exactly the disabled-policy behavior.
+    // Without CLIPBOARD the coordinator never starts (a watcher that doesn't exist can't leak).
+    // Inert handle (`available: false`) keeps control-task arms uniform: NOT_PERMITTED, and
+    // the decline loop still answers stray fetches.
     let clip = if initial_grants & GRANT_CLIPBOARD != 0 {
         pf_clipboard::start(conn.clone(), clip_enabled.clone(), compositor.is_some()).await
     } else {
@@ -1812,10 +1406,7 @@ async fn serve_session(
         }
     };
     let clip_available = clip.available;
-    // AccessUpdates (expiry warnings + mid-session grant edits), lifecycle task → control task —
-    // the control task is the control stream's sole writer, so they cross on a channel arm (the
-    // `clip_offer_rx` shape). The sender lives in the access lifecycle task below; for a session
-    // with no fingerprint it's dropped instead and the arm disables itself.
+    // Lifecycle → control task (sole writer). No fingerprint → drop the sender, arm disables.
     let (access_tx, access_rx) = tokio::sync::mpsc::unbounded_channel::<AccessUpdate>();
     tokio::spawn(control::run(control::Task {
         ctrl_send,
@@ -1850,13 +1441,10 @@ async fn serve_session(
         session_grants: session_grants.clone(),
         access_rx,
     }));
-    // The access lifecycle task (WP3): owns the session's expiry deadline and folds every watch
-    // edit into the live mask. Only sessions with a fingerprint have a record to watch; dropping
-    // `access_tx` otherwise retires the control task's update arm.
+    // Only a fingerprint has a record to watch; dropping `access_tx` retires the update arm.
     match (session_fp_hex.clone(), access_watch) {
         (Some(fp_hex), Some(watch_rx)) => {
-            // The lifecycle events' device identity: the trust store's operator-curated name for
-            // this fingerprint (a rename at approval wins), else the sanitized Hello name.
+            // Trust-store name (rename at approval wins), else the sanitized Hello name.
             let device = crate::events::DeviceRef {
                 name: np
                     .list()
@@ -1884,33 +1472,25 @@ async fn serve_session(
         }
         _ => drop(access_tx),
     }
-    // Fetch streams with no backend behind them are answered `CLIP_FETCH_UNAVAILABLE` instead of
-    // hanging (the coordinator owns `accept_bi` when a backend is live — exactly one consumer).
+    // No backend: decline fetches instead of hanging (coordinator owns `accept_bi` when live).
     if !clip_available && pf_clipboard::enabled() {
         pf_clipboard::spawn_decline_loop(conn.clone());
     }
 
-    // Session isolation (`design/gamescope-multiuser.md`): an isolated gamescope spawn gets a
-    // per-session input/audio/mic plane instead of the shared host-lifetime ones, so concurrent
-    // independent sessions never hear or drive each other. The identity is STABLE per client
-    // (cert-fingerprint prefix) — that is what lets the keep-alive registry hand a kept spawn,
-    // whose relay path + audio env are baked into its process, back to the same client on a
-    // reconnect and never to another. Minted here, after the handshake resolved the compositor +
-    // route and BEFORE the input/audio threads spawn, so every plane wires against one decision
-    // (`compositor::session_is_isolated` — the same predicate the mid-stream rebuild sites use).
+    // Isolated gamescope: per-session input/audio/mic. Identity is the cert-fingerprint prefix
+    // so keep-alive hands a kept spawn back to the same client. Minted after handshake, before
+    // the input/audio threads (`compositor::session_is_isolated`).
     #[cfg(target_os = "linux")]
     let isolation: Option<crate::vdisplay::SessionIsolation> = compositor
         .filter(|c| compositor::session_is_isolated(*c, gamescope_route.as_ref()))
         .map(|_| {
-            // Unpaired (`--open`) clients have no fingerprint; a per-accept sequence keeps them
-            // isolated from each other at the cost of keep-alive reuse across reconnects.
+            // `--open` has no fingerprint; a per-accept sequence isolates at the cost of keep-alive.
             static ANON_SEQ: AtomicU64 = AtomicU64::new(0);
             let id = session_fp_hex
                 .as_deref()
                 .map(|fp| fp[..fp.len().min(8)].to_string())
                 .unwrap_or_else(|| format!("anon{}", ANON_SEQ.fetch_add(1, Ordering::Relaxed)));
-            // Monitor-mode capture has no per-session sink to route to — the audio plane then
-            // stays shared (input/mic still isolate).
+            // Monitor-mode has no per-session sink — audio stays shared; input/mic still isolate.
             let sink = crate::audio::per_session_sink_possible()
                 .then(|| format!("punktfunk-speaker-iso-{id}"));
             let mic_source = Some(format!("punktfunk-mic-{id}"));
@@ -1918,9 +1498,7 @@ async fn serve_session(
                 "isolated gamescope session — per-session input/audio/mic planes");
             crate::vdisplay::SessionIsolation::new(id, sink, mic_source)
         });
-    // The session's own pinned injector (lazy-open against its relay file) + the swappable route
-    // the input thread sends through. Both live to the end of this function = the session's end;
-    // dropping the service ends its thread and closes the EIS connection.
+    // Pinned injector + swappable route. Drop at session end closes the EIS connection.
     #[cfg(target_os = "linux")]
     let session_injector = isolation
         .as_ref()
@@ -1934,9 +1512,7 @@ async fn serve_session(
     });
     #[cfg(not(target_os = "linux"))]
     let input_route = input::InputRoute::new(inj_tx.clone());
-    // The isolated session's own mic pump + virtual source (`punktfunk-mic-{id}`), replacing the
-    // shared host-lifetime one for THIS session's 0xCB uplink. Dropped (with the datagram task's
-    // sender) at session end, which tears the source down.
+    // Isolated mic pump (`punktfunk-mic-{id}`) for this session's 0xCB uplink. Drop tears it down.
     #[cfg(target_os = "linux")]
     let session_mic = isolation
         .as_ref()
@@ -1945,46 +1521,19 @@ async fn serve_session(
     #[cfg(target_os = "linux")]
     let mic_tx = session_mic.as_ref().map(|p| p.sender()).unwrap_or(mic_tx);
 
-    // Input plane: QUIC datagrams → channel → a native per-session thread. Pointer/keyboard
-    // events are forwarded to the session's injector target (`input_route` — the shared
-    // host-lifetime [`InjectorService`] so the portal grant persists across sessions, or an
-    // isolated session's own pinned one); this thread owns the session's virtual gamepads (uinput,
-    // per-session) and sends force feedback back over `conn`. It exits when the channel closes
-    // (datagram task ends on disconnect) — fresh gamepad state per session.
-    //
-    // ONE channel for both event kinds deliberately: rich input (gyro at the pad's report
-    // rate) used to ride a second channel that the thread only drained after the main
-    // channel's 4 ms recv timeout — every motion sample of a pure-gyro aim (no button
-    // traffic) ate up to 4 ms of added latency/jitter. A single channel wakes the thread on
-    // whichever arrives.
-    // BOUNDED, and lossy on overflow — the mic plane on this very datagram loop has been bounded
-    // with `try_send` since security-review S6, and the three input planes had simply never been
-    // given the same treatment (2026-08-05 review M-3).
-    //
-    // The producer is one `read_datagram` loop that can push a message per datagram; the consumer
-    // handles ONE item per iteration and then runs a full gamepad feedback pump + heartbeat. The
-    // producer therefore outruns the consumer by orders of magnitude, and with an unbounded queue
-    // the backlog is host RSS: pen batches amplify ~8× from wire to heap, so a paired client on a
-    // 100 Mbps link grows the host by ~100 MB/s until it dies. Reachable by any paired client, or
-    // any LAN peer under `--open`.
-    //
-    // Dropping is correct here in a way it would not be for a reliable stream: input is a
-    // real-time plane where a sample that cannot be delivered promptly is already stale — the
-    // freshest state wins, and the injector re-syncs from the next event.
+    // One bounded channel for pointer/keyboard and rich input. Unbounded is RSS DoS: the
+    // producer outruns the consumer; pen batches amplify. Drop is correct — stale input is
+    // already worthless; the injector re-syncs from the next event.
     const INPUT_QUEUE_DEPTH: usize = 1024;
     let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<ClientInput>(INPUT_QUEUE_DEPTH);
     let rich_tx = input_tx.clone();
-    // The stream loop's handle into the same pipeline: it parks the seat pointer on the
-    // streamed surface (stream.rs `park_pointer`) through exactly the path client input takes.
+    // Stream loop parks the seat pointer through the same path client input takes.
     #[cfg(target_os = "linux")]
     let input_tx_stream = input_tx.clone();
     let input_handle = {
         let conn = conn.clone();
         let gamepad = welcome.gamepad;
-        // Pad audio (0xD1) negotiated: the Welcome advertised the cap (Windows + provisioned
-        // endpoints + the client asked — handshake reads `pad_audio::host_cap`). Read back off
-        // the Welcome rather than recomputed, so the input thread's spawns cannot disagree
-        // with what the client was told.
+        // Read HOST_CAP_PAD_AUDIO back off Welcome so the input thread cannot disagree.
         let pad_audio_on = welcome.host_caps & punktfunk_core::quic::HOST_CAP_PAD_AUDIO != 0;
         let grants = session_grants.clone();
         std::thread::Builder::new()
@@ -1995,22 +1544,15 @@ async fn serve_session(
             })
             .context("spawn input thread")?
     };
-    // One reader for ALL client→host datagrams, demuxed by magic byte (two read_datagram loops
-    // would race for datagrams): 0xCB → mic uplink (Opus, forwarded to the host-lifetime mic
-    // service), 0xCC → rich input (DualSense touchpad / motion, to the per-session input thread),
-    // 0xC8 → input (also the input thread). The magics are disjoint, so decode order doesn't
-    // matter. Unknown tags are ignored.
+    // One `read_datagram` loop (two would race): 0xCB mic, 0xCC rich, 0xC8 input. Magics disjoint.
     let input_conn = conn.clone();
     let grants_dp = session_grants.clone();
     tokio::spawn(async move {
         let (mut input_count, mut mic_count, mut rich_count) = (0u64, 0u64, 0u64);
         let mut dropped = 0u64;
-        // Per-client-access enforcement drops (design §5.5): counted per class, one warn on the
-        // first drop of each, totals in the end-of-stream line below — never per-event logging.
+        // Per-class counts; one warn on the first drop; totals at end-of-stream.
         let denied = GrantDrops::new();
-        // `try_send` on a full queue drops rather than blocking this loop — blocking here would
-        // stall the mic plane and the datagram reader itself. A DISCONNECTED channel is the input
-        // thread having gone away, which is the one condition that ends the loop.
+        // Full queue: drop, never block (would stall mic + this reader). Disconnected ends the loop.
         let mut offer = |tx: &std::sync::mpsc::SyncSender<ClientInput>, item: ClientInput| match tx
             .try_send(item)
         {
@@ -2022,23 +1564,17 @@ async fn serve_session(
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
         };
         while let Ok(d) = input_conn.read_datagram().await {
-            // The enforcement mask (design §5.2): ONE relaxed load per datagram; every plane
-            // below tests it before its item is offered anywhere. The mic/rich/pen planes are
-            // classed by their plane tag before per-event decode (§5.3); the 0xC8 events go
-            // through the exhaustive `classify`.
+            // One relaxed load per datagram; test before offering. Mic/rich/pen by plane tag;
+            // 0xC8 through `classify`.
             let mask = grants_dp.load(Ordering::Relaxed);
             if let Some((seq, pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
                 if mask & GRANT_MIC == 0 {
-                    // Dropping here IS the "never attaches to the mic service" setup gate:
-                    // forwarding frames is the only attach this plane has.
+                    // Dropping here is the setup gate: forwarding is the only attach this plane has.
                     denied.note(GrantClass::Mic);
                     continue;
                 }
                 mic_count += 1;
-                // Host-lifetime mic service (bounded queue): `try_send` drops the frame when the
-                // service is full or gone, never blocking this datagram loop (security-review S6).
-                // seq + pts ride along — the pump's de-jitter reorders, conceals losses and
-                // tracks cadence with them (they used to be decoded here and thrown away).
+                // Bounded `try_send`: never block this loop. seq + pts ride for de-jitter.
                 let _ = mic_tx.try_send(crate::audio::MicFrame {
                     seq,
                     pts_ns: pts,
@@ -2054,9 +1590,7 @@ async fn serve_session(
                     break;
                 }
             } else if let Some(pen) = punktfunk_core::quic::PenBatch::decode(&d) {
-                // 0xCC kind 0x05 — the stylus plane (RichInput::decode returns None for it by
-                // design; see punktfunk_core::quic::pen). Routed to the same input thread,
-                // which owns the per-session tracker + virtual tablet.
+                // 0xCC kind 0x05 stylus (`RichInput::decode` returns None). Same input thread.
                 if mask & GRANT_POINTER == 0 {
                     denied.note(GrantClass::Pointer);
                     continue;
@@ -2072,10 +1606,7 @@ async fn serve_session(
                     continue;
                 }
                 input_count += 1;
-                // Wire hygiene: KEY_FLAG_SEMANTIC_VK is an in-process tag (GameStream ingest
-                // only) — strip it from network events so a client can't flip the host's
-                // key-decoding convention. Other kinds keep flags verbatim (MouseMoveAbs packs
-                // its reference extent there).
+                // KEY_FLAG_SEMANTIC_VK is in-process (GameStream ingest). Strip it from the wire.
                 if matches!(
                     ev.kind,
                     punktfunk_core::input::InputKind::KeyDown
@@ -2098,11 +1629,7 @@ async fn serve_session(
         );
     });
 
-    // (The stop/quit flags + their disconnect watcher are created above, before the handshake, so
-    // the Welcome-time display prep can observe a mid-handshake disconnect.)
-    // Lifecycle events (RFC §4): this point — handshake complete, pairing/admission passed — is
-    // where the client counts as CONNECTED; the close watcher below pairs it with the
-    // disconnect + its decoded reason. A client rejected earlier never emits either.
+    // Handshake complete: CONNECTED. A client rejected earlier never emits either.
     let event_client = crate::events::ClientRef {
         name: hello.name.clone().unwrap_or_default(),
         fingerprint: endpoint::peer_fingerprint(&conn).map(|fp| fingerprint_hex(&fp)),
@@ -2131,9 +1658,7 @@ async fn serve_session(
         });
     }
 
-    // Register this now-live session for mode-conflict admission (Stage 4): carry its identity, the
-    // negotiated mode, and its stop flag so a LATER connecting client's admission can see it and
-    // (under `steal`) signal it. The guard removes the entry when this session ends.
+    // Mode-conflict admission: later clients see this identity + mode + stop (and may `steal`).
     let _live_guard = {
         let id = endpoint::peer_fingerprint(&conn);
         let label = id
@@ -2156,33 +1681,21 @@ async fn serve_session(
         )
     };
 
-    // Audio plane (virtual source only — synthetic runs are protocol tests): desktop Opus
-    // → host→client QUIC datagrams, on its own native thread. Best-effort on every failure
-    // (no PipeWire audio, spawn error): the session continues without audio — and a spawn
-    // error must NOT early-return here, the threads above are already running.
+    // Virtual source only. Best-effort: a spawn error must not early-return (threads already up).
     let audio_handle = if opts.source == Punktfunk1Source::Virtual {
         let conn = conn.clone();
         let stop = stop.clone();
         let cap = audio_cap.clone();
         let channels = welcome.audio_channels;
-        // Read the granted bit back off the Welcome (the cursor plane's precedent), so the wire
-        // the client was promised and the wire we actually send cannot disagree — then re-derive
-        // the SAME budget rung from it, so the encode tier and the redundancy decision are one
-        // choice made once rather than two settings that can drift apart.
+        // Read the granted bit back off Welcome, then re-derive the same budget rung from it.
         let budget = handshake::audio_budget(
             welcome.host_caps & punktfunk_core::quic::HOST_CAP_AUDIO_RED != 0,
             welcome.bitrate_kbps,
             channels,
         );
-        // …and the resolved audio FORMAT read back the same way, for the same reason. The
-        // client opens its output device from these four Welcome fields, so the capture rate,
-        // the samples-per-frame and the wire tag the encode loop uses have to come from the
-        // identical bytes rather than from a second evaluation of the §8.4 gate — which reads
-        // process configuration and a live connection property, neither of which is guaranteed
-        // to answer the same way twice.
+        // Format from Welcome bytes, not a second evaluation of the gate (config + live property).
         let audio_plane = handshake::AudioPlane::from_welcome(&welcome);
-        // An isolated session's audio captures its OWN named sink (`design/gamescope-multiuser.md`);
-        // `None` (every other session, and monitor-mode hosts) is the shared path unchanged.
+        // Isolated session captures its own named sink; `None` is the shared path.
         #[cfg(target_os = "linux")]
         let iso_sink = isolation.as_ref().and_then(|i| i.sink.clone());
         #[cfg(not(target_os = "linux"))]
@@ -2196,15 +1709,10 @@ async fn serve_session(
         None
     };
 
-    // HDR static metadata (ST.2086 mastering + CEA-861.3 content light level), host → client, sent
-    // once at session start when an HDR session was negotiated, as a generic HDR10 baseline. The
-    // virtual-source stream loop then sends the source display's REAL mastering metadata (Windows
-    // GetDesc1) as soon as capture starts and re-sends it on keyframes; the client applies the
-    // latest it receives. This baseline covers the synthetic source and the pre-capture gap.
+    // HDR10 baseline at start. The virtual stream then sends the source's real mastering
+    // (GetDesc1) on capture start and keyframes. This covers synthetic + the pre-capture gap.
     if welcome.color.is_hdr() {
-        // Prefer the CLIENT's own display volume (Hello::display_hdr): the virtual display's EDID
-        // now advertises it, so host apps tone-map to exactly that volume — echoing it here keeps
-        // the mastering metadata honest end-to-end. Generic HDR10 only for older clients.
+        // Client display volume (Hello::display_hdr) — EDID advertises it. Generic HDR10 for old clients.
         let meta = hello
             .display_hdr
             .unwrap_or_else(pf_frame::hdr::generic_hdr10);
@@ -2215,18 +1723,13 @@ async fn serve_session(
         );
     }
 
-    // Test hook (synthetic source only): a scripted feedback burst on the host→client
-    // planes — rumble (0xCA) + DualSense HID-output (0xCD) — so loopback tests can assert
-    // the client's feedback path without a real game writing output reports to a real pad.
+    // Synthetic-only test hook: rumble (0xCA) + HID-output (0xCD) for loopback, no real pad.
     if opts.source == Punktfunk1Source::Synthetic
         && std::env::var("PUNKTFUNK_TEST_FEEDBACK").as_deref() == Ok("1")
     {
         use punktfunk_core::quic::HidOutput;
-        // v3 envelope (seq 0, 400 ms TTL, both impulse-trigger motors asserted) so the
-        // loopback/probe assertion covers the self-terminating tail AND the trigger tail behind
-        // it, not just the level. The trigger levels are deliberately DIFFERENT from each other
-        // and from the handles: a decoder that reads the wrong offset produces a plausible-looking
-        // number rather than a zero, so identical values would hide the mistake.
+        // 400 ms TTL + both trigger motors. Trigger levels differ from each other and the
+        // handles so a wrong-offset decoder cannot hide behind a plausible zero.
         let d = punktfunk_core::quic::encode_rumble_datagram_v3(
             0, 0x4000, 0x8000, 0, 400, 0x2000, 0x6000,
         );
@@ -2253,15 +1756,12 @@ async fn serve_session(
         tracing::info!("PUNKTFUNK_TEST_FEEDBACK: scripted rumble + hidout burst sent");
     }
 
-    // Data plane on a native thread (no async on the hot path — design invariant).
+    // Native thread: no async on the hot path.
     let cfg = welcome.session_config(Role::Host);
     let source = opts.source;
     let (seconds, frames) = (opts.seconds, opts.frames);
     let mode = hello.mode;
-    // Script-facing runtime marker: `$XDG_RUNTIME_DIR/punktfunk/stream` exists (with this session's
-    // negotiated mode) for exactly as long as this session streams. Held by RAII to session end, so
-    // every exit path — clean disconnect, error, panic-unwind — retracts it. Lets a launch wrapper
-    // branch "streaming → run the game as-is; not → my local multi-head gamescope" (see the module).
+    // `$XDG_RUNTIME_DIR/punktfunk/stream` while this session streams. RAII retracts on every exit.
     let _stream_marker = crate::stream_marker::announce(crate::stream_marker::StreamInfo {
         width: mode.width,
         height: mode.height,
@@ -2271,25 +1771,11 @@ async fn serve_session(
         launch: hello.launch.clone(),
         plane: crate::events::Plane::Native,
     });
-    // GPU clock pin (Linux, opt-in `PUNKTFUNK_PIN_CLOCKS`): hold the box-wide vendor clock floor for
-    // as long as THIS session streams, refcounted with every other live session across both planes.
-    // RAII like the marker above — armed on the first live client, released when the last one
-    // disconnects, so idle clocks aren't pinned while nobody is connected. No-op off Linux / when
-    // the flag is unset.
+    // Linux `PUNKTFUNK_PIN_CLOCKS`: refcounted vendor clock floor while any session streams.
     #[cfg(target_os = "linux")]
     let _clock_pin = crate::gpuclocks::session_pin();
-    // The session's launch, threaded into the data plane. Windows carries the store-qualified id
-    // (spawned into the interactive user session once capture is live); other hosts resolve the id
-    // to its shell command HERE against the host's own library — a client can only ever pick an
-    // existing title, never send a command — and the data plane runs it per-backend (nested into a
-    // bare-spawn gamescope, or spawned into the live session once capture is up).
-    // ONE library lookup for the whole session: enumerating the installed stores touches every
-    // launcher's on-disk metadata, and the data plane needs three things out of it — what to run, what
-    // to call the title, and how to recognize its process once a launcher has handed off
-    // (design/session-game-lifetime.md §4).
-    //
-    // On a blocking thread: a `plugin`-kind entry resolves by asking the plugin that owns it over
-    // loopback (`library::ask_plugin_launch`), and this is an async context.
+    // One library lookup: command, title, process identity. Client picks an existing id, never
+    // a command. Blocking: plugin entries ask over loopback from this async context.
     let launch_target = match hello.launch.as_deref() {
         None => None,
         Some(id) => {
@@ -2321,31 +1807,18 @@ async fn serve_session(
     let launch_for_dp = launch_target.as_ref().and(hello.launch.clone());
     #[cfg(not(target_os = "windows"))]
     let launch_for_dp = launch_target.as_ref().and_then(|t| t.command.clone());
-    // A client reconnecting inside its game's reconnect window takes the game back: nothing is ended,
-    // and this session adopts it. Matched on (this client, this title) so it can only ever reclaim its
-    // own game.
-    //
-    // Cancelling the pending termination is all this does — the *game* is re-adopted in the data plane
-    // through `crate::launchreg`, which is what carries the original launch's reference instant across
-    // sessions (a reprieved lease can't: its watcher is cancelled and its exit action closes a
-    // connection that is already gone). Both are needed, and neither subsumes the other: this one
-    // exists only under `GameOnSessionEnd::Always`, the record exists whatever the policy says.
+    // Reconnect inside the game's window: cancel pending termination. Data plane re-adopts via
+    // `launchreg` (carries the original launch instant). Matched on (this client, this title).
     if let Some(target) = launch_target.as_ref() {
         let fp = punktfunk_core::quic::endpoint::peer_fingerprint(&conn).map(hex::encode);
-        // The reprieved leases are deliberately dropped: they are corpses (see `readopt`), and this
-        // plane has nothing to say about them that `readopt` has not already logged per lease.
+        // `readopt` already logged leftover processes.
         let _reprieved = crate::gamelease::readopt(fp.as_deref(), target.game.id.as_deref());
     }
-    // Per-title prep steps (RFC §6) for a launched CUSTOM library title: run synchronously
-    // before the data plane starts (so before the display opens and the title spawns); the
-    // guard's drop — any serve_session exit — runs the undos in reverse, best-effort.
-    // `block_in_place`: prep is blocking operator code and this is a multi-thread runtime;
-    // the closure only runs when the title actually has prep steps.
+    // Custom-title prep before the display opens. Drop undoes in reverse. `block_in_place`:
+    // operator code is blocking and this is a multi-thread runtime.
     let _prep = hello.launch.as_deref().and_then(|id| {
         let cmds = crate::library::prep_for(id);
-        // The app identity plus the negotiated mode (`prep_mode_env` — the marker file's
-        // `PF_STREAM_*` vocabulary), so a prep step can set a per-mode FPS cap instead of
-        // hard-coding one per device.
+        // `PF_APP_ID` + `PF_STREAM_*` so a prep step can set a per-mode FPS cap.
         let mut env = vec![("PF_APP_ID".to_string(), id.to_string())];
         env.extend(crate::hooks::prep_mode_env(
             hello.mode.width,
@@ -2356,32 +1829,20 @@ async fn serve_session(
         (!cmds.is_empty())
             .then(|| tokio::task::block_in_place(|| crate::hooks::run_prep(&cmds, &env)))
     });
-    // The client asked for this box's audio devices to be left alone
-    // (`CLIENT_CAP_KEEP_HOST_AUDIO` — its "keep playing on the host" setting): hold the
-    // wiring override for exactly this session's lifetime, BEFORE the data plane opens the
-    // audio capture. Windows then skips the IPolicyConfig default parking and loopbacks the
-    // operator's own default device; Linux taps the default sink's monitor instead of
-    // claiming the default. RAII — every exit path hands the devices back.
+    // `CLIENT_CAP_KEEP_HOST_AUDIO`: hold the wiring override before capture opens. RAII.
     let _keep_host_audio = (hello.client_caps & punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO
         != 0)
         .then(crate::audio::capture_policy::keep_host_audio_guard);
-    // The resolved number is the session's TOTAL WIRE budget (RFC §5.1): the Welcome, every
-    // ack, the HUD and this whole control plane speak budget — only the encoder opens are
-    // handed the derived video rate (`EncDerive` in the stream loop: budget minus the audio
-    // reservation, over framing + FEC overhead). PyroWave is the exception (its pin is an
-    // all-intra encoder operating point): budget == encoder rate there.
+    // Welcome/acks/HUD speak wire budget. Encoder opens get the derived video rate (`EncDerive`).
+    // PyroWave: budget == encoder rate (bpp pin).
     let bitrate_kbps = welcome.bitrate_kbps;
     let audio_reserved_kbps = audio_reserved_kbps(&welcome);
-    // "Automatic" request: the resolved rate is a host default — for PyroWave a per-mode
-    // bpp pin the data plane re-resolves on a mid-stream mode switch. PyroWave is Automatic
-    // unconditionally (`resolve_bitrate_kbps_for` overrode any explicit rate — RFC §5.2).
+    // Automatic: host default. PyroWave is Automatic unconditionally (explicit rate overridden).
     let bitrate_auto = hello.bitrate_kbps == 0 || codec == crate::encode::Codec::PyroWave;
-    let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
-                                       // The session's HDR verdict — read back from the Welcome's colour label (what the client
-                                       // was told) rather than re-derived from the depth: a 10-bit SDR session says 10 + SDR.
+    let bit_depth = welcome.bit_depth;
+    // HDR from Welcome colour, not from depth: a 10-bit SDR session is 10 + SDR.
     let hdr = welcome.color.is_hdr();
-    // Resolved chroma — derive the typed value back from the wire byte the Welcome carried (so the
-    // session uses exactly what the client was told). `Yuv444` only when the handshake gate passed.
+    // Typed chroma from the Welcome byte. `Yuv444` only when the handshake gate passed.
     let chroma = if welcome.chroma_format == punktfunk_core::quic::CHROMA_IDC_444 {
         crate::encode::ChromaFormat::Yuv444
     } else {
@@ -2389,38 +1850,25 @@ async fn serve_session(
     };
     let stop_stream = stop.clone();
     let quit_stream = quit.clone();
-    // The client display's HDR volume (Hello): the virtual display's EDID advertises it (host apps
-    // tone-map to the client's real panel) and the 0xCE mastering metadata echoes it. `None` =
-    // older client / no HDR display → the built-in defaults everywhere.
+    // Client HDR volume for EDID + 0xCE. `None` = older client / no HDR → built-in defaults.
     let client_hdr = hello.display_hdr;
-    let fec_target_dp = fec_target.clone(); // data-plane handle to the adaptive-FEC target
-    let conn_stream = conn.clone(); // for sending the source's real HDR metadata (0xCE) mid-stream
-                                    // Per-AU host-timing emission (0xCF): only when the client advertised the cap bit. All
-                                    // first-party clients do (the core connector ORs it in); an older client leaves it clear
-                                    // and gets no extra datagrams.
+    let fec_target_dp = fec_target.clone();
+    let conn_stream = conn.clone();
+    // 0xCF host-timing only if the client advertised the cap; older clients get no extra datagrams.
     let timing_conn =
         (hello.video_caps & punktfunk_core::quic::VIDEO_CAP_HOST_TIMING != 0).then(|| conn.clone());
-    // Probe-sequence capability: the client reassembles speed-test filler in its own index window,
-    // so mid-session bursts don't consume video frame indexes. An older client (bit clear) gets
-    // mid-session probes declined instead — see `run_probe_burst`.
+    // Client reassembles probe filler in its own index window. Bit clear → decline mid-session probes.
     let probe_seq = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_PROBE_SEQ != 0;
-    // Streamed-AU capability: the client's reassembler accepts sentinel-headed streamed blocks,
-    // so a chunked encoder session may ship an AU's early FEC blocks while its tail encodes.
+    // Sentinel-headed streamed blocks: ship early FEC while the AU tail still encodes.
     let streamed_au = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_STREAMED_AU != 0;
-    // Multi-slice capability: the client's DECODER accepts AUs carrying several slice NALs, so
-    // the encoder may keep its multi-slice default (§7 LN1). Absent ⇒ single-slice frames —
-    // TV-SoC decoders (Amlogic: Chromecast with Google TV) wedge the device on multi-slice AUs.
+    // Absent ⇒ single-slice. Some TV-SoC decoders wedge on multi-slice AUs.
     let multi_slice = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE != 0;
-    let stats_dp = stats; // data-plane handle to the shared stats recorder
-                          // Short label for web-console stats captures: the client's cert-fingerprint prefix, else its
-                          // peer IP (no fingerprint = anonymous TOFU/--open client).
+    let stats_dp = stats;
+    // Stats label: cert-fingerprint prefix, else peer IP (anonymous TOFU/--open).
     let client_label = endpoint::peer_fingerprint(&conn)
         .map(|fp| fingerprint_hex(&fp)[..12].to_string())
         .unwrap_or_else(|| conn.remote_address().ip().to_string());
-    // The client's DISPLAY name for the status surface (local summary → the tray's connect
-    // toast): the trust store's operator-curated name for this fingerprint first (a rename at
-    // approval time wins over whatever the device calls itself), else the sanitized Hello name.
-    // `None` (nameless knock from an old client / Android) keeps the summary name-free.
+    // Tray toast: trust-store name (rename at approval wins), else sanitized Hello. `None` if nameless.
     let client_name = endpoint::peer_fingerprint(&conn)
         .map(|fp| fingerprint_hex(&fp))
         .and_then(|fp_hex| {
@@ -2434,12 +1882,10 @@ async fn serve_session(
                         .then(|| crate::native_pairing::sanitize_device_name(raw, &fp_hex))
                 })
         });
-    // Transition-trace handles for the data plane (P0.1): the punch stamp + the virtual-stream
-    // stages ride the same per-session trace; resizes write their totals into the shared slot.
+    // Punch + virtual-stream stages on the same trace; resizes write into the shared slot.
     let bringup_dp = bringup.clone();
     let resize_ms_dp = resize_ms.clone();
-    // Isolation handles for the data plane (the stream thread re-points input across mid-stream
-    // compositor switches and hands the identity to every backend it opens).
+    // Stream thread re-points input across compositor switches and hands identity to backends.
     #[cfg(target_os = "linux")]
     let isolation_dp = isolation.clone();
     #[cfg(target_os = "linux")]
@@ -2448,30 +1894,20 @@ async fn serve_session(
     let inj_shared_tx_dp = inj_tx.clone();
     #[cfg(target_os = "linux")]
     let inj_session_tx_dp = inj_session_tx.clone();
-    // The address the control connection arrived on, for the data plane's source-address check
-    // below — the one comparison that distinguishes "the client is filtering our video" from
-    // "the video never left". Captured here because the send loop runs on a blocking thread.
+    // Control-plane local IP for the source-address check (send loop is a blocking thread).
     let control_local_ip = conn.local_ip();
     let result: Result<()> = async {
         let stream_thread = tokio::task::spawn_blocking(move || -> Result<()> {
-            // Bring up the (already-bound) data-plane socket. Default: hole-punch — wait briefly
-            // for the client's punch, then stream to its OBSERVED source, so video traverses a
-            // NAT / stateful inter-VLAN firewall (control + side planes ride the client-initiated
-            // QUIC, but the raw video UDP needs the client to open the path first); falls back to
-            // the reported address for clients that don't punch (flat-LAN, unchanged). With a fixed
-            // `--data-port` (`direct`), skip the punch-wait and stream straight to the reported
-            // address — the operator declared a reachable, firewall-opened port, so there's no
-            // punch-timeout to pay. (Direct trusts the reported port: it can't cross a client-side
-            // NAT that remaps it.)
+            // Default: hole-punch, then stream to the observed source (NAT / stateful firewall).
+            // `direct` (`--data-port`): skip the wait, stream to the reported address (trusts
+            // the reported port; cannot cross a client-side NAT that remaps it).
             let bound = if direct {
                 UdpTransport::from_socket(data_sock, &client_udp.to_string()).map(|t| (t, false))
             } else {
                 UdpTransport::from_socket_punch(
                     data_sock,
                     &client_udp.to_string(),
-                    // Only honour a punch from the peer QUIC already authenticated: the punch is
-                    // there to discover the NAT-remapped *port*, and `client_udp`'s IP is the
-                    // host-observed QUIC remote (only its port is client-reported).
+                    // Punch discovers the NAT-remapped port; IP is the host-observed QUIC remote.
                     client_udp.ip(),
                     std::time::Duration::from_millis(2500),
                 )
@@ -2479,18 +1915,13 @@ async fn serve_session(
             let (transport, punched) = match bound {
                 Ok(v) => v,
                 Err(e) => {
-                    // Surface the failure here directly: a data-plane bind error would otherwise be
-                    // reported only after teardown (and a teardown stall could swallow it entirely).
+                    // Surface here: a teardown stall would otherwise swallow a bind error.
                     tracing::error!(error = %e, %client_udp, udp_port, "data-plane socket setup failed");
                     return Err(anyhow::Error::new(e)).context("bind data plane");
                 }
             };
             bringup_dp.mark("punch_done");
-            // Post-`connect`, `local_addr` reports the source address the kernel will actually
-            // stamp on every video datagram — the number that has to match the host IP the client
-            // dialed, because its data socket is connected and its kernel drops anything else
-            // before userspace. Logged unconditionally: a black-screen report is unanswerable
-            // without it (this session's showed only the port).
+            // Post-`connect` `local_addr` is the source stamped on every video datagram.
             let local = transport.local_addr().ok();
             tracing::info!(
                 %client_udp,
@@ -2502,8 +1933,7 @@ async fn serve_session(
                  address with no hole-punch; else punched=true → the client's observed source, \
                  false → no punch seen, the reported address)"
             );
-            // A video source address that isn't the one the control plane arrived on means the
-            // client will discard every datagram we send, however healthy this end looks.
+            // Wrong egress: the client's connected socket drops every datagram before userspace.
             if let (Some(l), Some(c)) = (local.map(|a| a.ip()), control_local_ip) {
                 let c = match c {
                     std::net::IpAddr::V6(v6) => {
@@ -2524,15 +1954,8 @@ async fn serve_session(
                     );
                 }
             }
-            // A punch that never arrives is not a routine fallback — it is the fingerprint of a
-            // data port the client cannot reach INBOUND, and every client punches (5/s for the
-            // first three seconds, then every two). Video then goes to an address the client only
-            // CLAIMED, unverified, and if anything on the path needed the flow opened client-first
-            // it silently goes nowhere: black picture, healthy control plane, no error anywhere.
-            // On Windows the usual cause is a firewall rule that opens fixed ports only, while
-            // this port is ephemeral and different every session (fixed by the program-scoped rule
-            // `service install` now adds — an install predating it still has the old rules).
-            // `direct` skips the punch by operator choice, so it is not a failure there.
+            // No punch: inbound UDP to this port looks blocked. Video then goes to an unverified
+            // claimed address. `direct` skips the punch by operator choice, so it is not a failure.
             if !direct && !punched {
                 tracing::warn!(
                     %client_udp,
@@ -2621,16 +2044,13 @@ async fn serve_session(
                         inj_session_tx: inj_session_tx_dp,
                     };
                     match prep {
-                        // P1.1: the display prep started at Welcome on its own thread — hand it
-                        // the post-punch context and adopt its result as the stream result (that
-                        // thread runs `virtual_stream` on the pipeline it already built).
+                        // Display prep started at Welcome: hand it the post-punch context.
                         Some((ctx_tx, prep_thread)) => match ctx_tx.send(ctx) {
                             Ok(()) => match prep_thread.join() {
                                 Ok(r) => r,
                                 Err(_) => Err(anyhow!("prepared stream thread panicked")),
                             },
-                            // The prep thread died before the hand-off (panicked during prep —
-                            // its guard/lease unwound): run the stream inline instead.
+                            // Prep died before hand-off (guard/lease unwound): build inline.
                             Err(std::sync::mpsc::SendError(ctx)) => {
                                 tracing::warn!(
                                     "display-prep thread gone before hand-off — building inline"
@@ -2643,21 +2063,9 @@ async fn serve_session(
                 }
             }
         });
-        // `stop` is only ADVISORY: the stream thread observes it between iterations, so a call that
-        // blocks without a bound INSIDE one (a compositor CLI that never returns, a D-Bus round-trip
-        // on a stuck bus, a driver wait on a hung GPU) never reaches the check — and nothing else
-        // can end the session, because every teardown below runs only once this await resolves. That
-        // made one stuck syscall a permanent zombie: it kept its semaphore slot (four of them and the
-        // host stops accepting entirely), its admission entry (a later client gets "host busy"
-        // forever) and its stream marker, and even the console's Stop button — which just sets this
-        // same flag — could not clear it.
-        //
-        // So bound the wait: once the session HAS been told to stop, give the thread
-        // `STREAM_STOP_GRACE` to return, then stop waiting for it and let teardown run. The thread is
-        // detached, not killed (a blocking thread can't be cancelled in Rust) — it keeps its capturer
-        // and encoder until the stuck call returns, and its own guards unwind if it ever does. That
-        // is a leak, but a bounded one: the session's slot and admission entry come back, so the rest
-        // of the host keeps serving.
+        // `stop` is advisory: a stuck syscall inside an iteration never sees it, and teardown
+        // waits on this join. Bound the wait: after `STREAM_STOP_GRACE`, abandon the thread
+        // (cannot cancel a blocking thread) so the slot and admission entry come back.
         tokio::select! {
             joined = stream_thread => joined.context("stream thread")??,
             () = stop_overdue(&stop) => {
@@ -2670,25 +2078,19 @@ async fn serve_session(
                 anyhow::bail!("stream thread wedged after stop");
             }
         }
-        // Give the client a moment to drain before the close.
+        // Drain window before close.
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         Ok(())
     }
     .await;
 
-    // Teardown on EVERY path (a failed data plane must not leave the connection open with
-    // audio still streaming): stop the audio thread, close, then join both side-plane
-    // threads so the next session starts fresh (closing the connection ends the datagram
-    // task, which drops the input channel, which exits the input thread + its gamepads).
+    // Every path: stop audio, close, join side threads. Close ends the datagram task → input.
     stop.store(true, Ordering::SeqCst);
     conn.close(
         if result.is_ok() { 0u32 } else { 1u32 }.into(),
         if result.is_ok() { b"done" } else { b"error" },
     );
-    // Bounded, for the same reason the stream-thread wait is: the input thread exits only when the
-    // datagram task drops its channel, which the `conn.close()` above forces — but a join is the
-    // last unbounded await in teardown, and one stuck side thread must not hold the session's
-    // permit/admission entry (released when this fn returns) hostage.
+    // Bounded join: a stuck side thread must not hold the permit/admission entry.
     let side_threads = tokio::task::spawn_blocking(move || {
         if let Some(h) = audio_handle {
             let _ = h.join();
@@ -2699,14 +2101,8 @@ async fn serve_session(
         .await
         .is_err()
     {
-        // Name what is still held, not just that a thread was let go. The input thread OWNS this
-        // session's virtual gamepads (`input_thread`'s `Pads`, dropped only when that fn returns),
-        // and on Windows each one holds a `SwDeviceCreate` devnode plus the `Global\pf…-boot-<idx>`
-        // bootstrap mailbox for its pad index. Detaching therefore leaves the pads plugged in and
-        // the index taken: the next session — or a bring-up run beside this host — is denied that
-        // index until this thread finally returns, and *that* failure surfaces somewhere else
-        // entirely (see `pf_inject::pad_slots::PadCreateFault::IndexOwnedElsewhere`). An operator
-        // reading only the later error has no way back to this line unless it says so here.
+        // Input thread still owns the virtual pads (Windows: devnode + pad-index mailbox).
+        // The next create on that index fails as already-owned until this thread returns.
         tracing::warn!(
             grace_s = SIDE_THREAD_JOIN_GRACE.as_secs(),
             "audio/input threads did not exit after the connection closed — detaching them. This \
@@ -2715,28 +2111,21 @@ async fn serve_session(
              already-owned until it returns"
         );
     }
-    // The capture (and our gamescope session's VirtualOutput) are gone by here. If this was the
-    // host-managed gamescope path on a box that autologs into gaming mode (Bazzite default), put the
-    // TV's gaming session back so it's the default when no one is streaming.
+    // Managed gamescope on an autologin box: put the TV's gaming session back.
     crate::vdisplay::restore_managed_session();
     result.map(|()| Served::Session)
 }
 
-/// Backoff between reopen attempts after a host-lifetime service's backend (a capturer) fails
-/// to open or its worker dies, so a persistently-unavailable resource isn't hammered. (The
-/// virtual mic has its own tuning — see [`crate::audio::MicPump`].)
+/// Reopen backoff after a host-lifetime capturer dies. Mic has its own ([`crate::audio::MicPump`]).
 const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Pack a `(width, height, refresh_hz)` mode into one atomic word (w:16|h:16|hz:16) for the live
-/// stats-mode slot — one store/load instead of three racy ones. Every dimension fits: the codec
-/// max dimension caps w/h well under 2^16 (`validate_dimensions`), refresh likewise.
+/// Pack `(w, h, hz)` into one atomic word (16|16|16) — one store, not three racy ones.
 fn pack_mode(width: u32, height: u32, refresh_hz: u32) -> u64 {
     ((width as u64 & 0xffff) << 32)
         | ((height as u64 & 0xffff) << 16)
         | (refresh_hz as u64 & 0xffff)
 }
 
-/// Unpack a [`pack_mode`] word back into `(width, height, refresh_hz)`.
 pub(crate) fn unpack_mode(packed: u64) -> (u32, u32, u32) {
     (
         ((packed >> 32) & 0xffff) as u32,
@@ -2745,23 +2134,13 @@ pub(crate) fn unpack_mode(packed: u64) -> (u32, u32, u32) {
     )
 }
 
-/// Recover the integer refresh rate a pipeline was actually built at from its frame interval
-/// (`interval` is constructed as `1/effective_hz` in `build_pipeline`, so the round-trip is exact).
-/// This is the backend-honored rate — it differs from the requested mode when e.g. KWin caps a
-/// virtual output at 60 Hz.
+/// Integer Hz from `1/effective_hz` (exact). Differs from the request when e.g. KWin caps at 60.
 fn interval_hz(interval: std::time::Duration) -> u32 {
     (1.0 / interval.as_secs_f64()).round() as u32
 }
 
-/// The mode a pipeline is ACTUALLY delivering, for the H2/H3 corrective ack: the captured frame's
-/// real dimensions (`build_pipeline` opens the encoder at `frame.{width,height}`, so this is exactly
-/// what the client decodes) paced at the rate the pipeline achieved ([`interval_hz`]). It diverges
-/// from the requested mode when a backend can't honor it: KWin caps a virtual output's refresh, or —
-/// the case this exists for — Windows pf-vdisplay rejects an in-place `SetMode` to a resolution not
-/// in the running monitor's advertised EDID list and the host falls back to the actual display mode
-/// (`capture::idd_push`: "sizing the ring to the display's actual mode"). Comparing this against the
-/// already-acked request decides whether a corrective `Reconfigured` ack is owed so the client
-/// doesn't believe it got a resolution it never received.
+/// Mode the pipeline is actually delivering, for a corrective `Reconfigured` ack. Diverges
+/// when a backend cannot honor the request (KWin refresh cap; Windows `SetMode` not in EDID).
 fn delivered_mode(
     frame_width: u32,
     frame_height: u32,
@@ -2780,10 +2159,7 @@ mod tests {
 
     #[test]
     fn full_apply_readback_is_the_request_not_the_deflated_roundtrip() {
-        // The 0.32.0 field regression: budget→enc→budget truncates 1–2 kbps, and comparing
-        // that read-back against the raw request minted a phantom encoder ceiling on every
-        // apply (sessions ratcheted 20 → 2.3 Mbps, every climb refused). A read-back equal
-        // to what the request itself derives to must report the FULL request…
+        // A roundtrip that lost only truncation must report the full request, not a phantom ceiling.
         let ed = EncDerive {
             audio_kbps: 576,
             shard_payload: 1408,
@@ -2798,7 +2174,7 @@ mod tests {
             );
             assert_eq!(ed.applied_budget_kbps(budget, asked_enc), budget);
         }
-        // …while a genuine driver short-apply (the ABR-overdrive case) still reports short.
+        // A genuine driver short-apply still reports short.
         let asked_enc = ed.enc_kbps(1_010_000);
         let short = ed.applied_budget_kbps(1_010_000, asked_enc * 3 / 4);
         assert!(short < ed.budget_kbps(ed.enc_kbps(1_010_000)));
@@ -2806,11 +2182,11 @@ mod tests {
 
     #[test]
     fn live_mode_pack_roundtrips_and_interval_recovers_hz() {
-        // The live-stats mode slot (H3): pack → unpack is exact for real modes.
+        // Pack → unpack is exact for real modes.
         for (w, h, hz) in [(1280u32, 720u32, 60u32), (3840, 2160, 144), (320, 200, 24)] {
             assert_eq!(unpack_mode(pack_mode(w, h, hz)), (w, h, hz));
         }
-        // `interval` is built as 1/effective_hz — the round-trip recovers the integer rate.
+        // `interval` is 1/effective_hz — the round-trip recovers the integer rate.
         for hz in [24u32, 30, 60, 75, 90, 120, 144, 165, 240] {
             let interval = std::time::Duration::from_secs_f64(1.0 / hz as f64);
             assert_eq!(interval_hz(interval), hz);
@@ -2826,13 +2202,11 @@ mod tests {
             refresh_hz: 60,
         };
 
-        // Honored: the captured frame matches the request → no corrective ack owed (`== requested`).
+        // Honored: captured frame matches the request → no corrective ack.
         let honored = delivered_mode(2560, 1440, hz60);
         assert_eq!(honored, requested);
 
-        // Resolution fallback (Windows pf-vdisplay rejected the out-of-list SetMode, host stayed at
-        // the actual display mode): the frame's real dims flow through, so the delivered mode differs
-        // from the acked request and a corrective ack IS owed — the exact gap this fixes.
+        // Fallback dims differ from the acked request → a corrective ack is owed.
         let fell_back = delivered_mode(1920, 1080, hz60);
         assert_ne!(fell_back, requested);
         assert_eq!(
@@ -2844,7 +2218,7 @@ mod tests {
             }
         );
 
-        // Refresh cap (KWin) is still caught: same dims, achieved rate recovered from the interval.
+        // Refresh cap: same dims, achieved rate recovered from the interval.
         let capped = delivered_mode(2560, 1440, std::time::Duration::from_secs_f64(1.0 / 30.0));
         assert_ne!(capped, requested);
         assert_eq!(capped.refresh_hz, 30);
@@ -2859,8 +2233,7 @@ mod tests {
             refresh_hz: 60,
         };
         use crate::encode::ChromaFormat;
-        // Automatic (0) on PyroWave → the ~1.6 bpp operating point, not the 20 Mbps H.26x
-        // default (which would turn wavelets to mush — plan §4.6).
+        // Automatic PyroWave → ~1.6 bpp, not the 20 Mbps H.26x default.
         let kbps = resolve_bitrate_kbps_for(
             crate::encode::Codec::PyroWave,
             0,
@@ -2869,7 +2242,7 @@ mod tests {
             8,
         );
         assert_eq!(kbps, 1920 * 1080 * 60 * 16 / 10 / 1000);
-        // 4:4:4 scales the pin to ~2.6 bpp, 10-bit adds 15 % (design/pyrowave-444-hdr.md §2.5).
+        // 4:4:4 ≈ 2.6 bpp; 10-bit adds 15 %. `design/pyrowave-444-hdr.md`.
         assert_eq!(
             resolve_bitrate_kbps_for(
                 crate::encode::Codec::PyroWave,
@@ -2890,8 +2263,7 @@ mod tests {
             ),
             (1920u64 * 1080 * 60 * 26 / 10 * 115 / 100 / 1000) as u32
         );
-        // An explicit client rate is overridden to the same pin — a fixed kbps is ill-defined
-        // for the all-intra codec, and it used to skip the operator ceiling (RFC §5.2)...
+        // Explicit client rate is overridden to the same pin (kbps is ill-defined for all-intra).
         assert_eq!(
             resolve_bitrate_kbps_for(
                 crate::encode::Codec::PyroWave,
@@ -2902,7 +2274,7 @@ mod tests {
             ),
             1920 * 1080 * 60 * 16 / 10 / 1000
         );
-        // ...and the H.26x codecs keep the legacy default.
+        // H.26x codecs keep the 20 Mbps default.
         assert_eq!(
             resolve_bitrate_kbps_for(
                 crate::encode::Codec::H265,
@@ -2919,7 +2291,7 @@ mod tests {
     fn pyrowave_auto_pin_respects_operator_ceiling() {
         use crate::encode::{ChromaFormat, Codec};
         use punktfunk_core::config::Mode;
-        // 5120x1440@240 4:4:4 10-bit pins ~5.29 Gbps open-loop — above a 5 GbE link.
+        // 5120×1440@240 4:4:4 10-bit pins above a 5 GbE link.
         let mode = Mode {
             width: 5120,
             height: 1440,
@@ -2931,15 +2303,15 @@ mod tests {
             uncapped > 5_000_000,
             "expected the open-loop pin, got {uncapped}"
         );
-        // With the operator ceiling set, the Automatic pin is capped to the link rate...
-        // SAFETY: this test is the only writer of this variable in the process, so writers can't
-        // race each other; the only reader is `resolve_bitrate_kbps_for` on this same thread.
+        // Ceiling caps the Automatic pin to the link rate.
+        // SAFETY: this test is the only writer of this variable in the process; the only
+        // reader is `resolve_bitrate_kbps_for` on this same thread.
         unsafe { std::env::set_var("PUNKTFUNK_PYROWAVE_MAX_MBPS", "4500") };
         assert_eq!(
             resolve_bitrate_kbps_for(Codec::PyroWave, 0, &mode, ChromaFormat::Yuv444, 10),
             4_500_000
         );
-        // ...but a pin already under the ceiling is untouched (1080p60 4:2:0 ≈ 199 Mbps)...
+        // A pin already under the ceiling is untouched.
         let small = Mode {
             width: 1920,
             height: 1080,
@@ -2949,45 +2321,36 @@ mod tests {
             resolve_bitrate_kbps_for(Codec::PyroWave, 0, &small, ChromaFormat::Yuv420, 8),
             1920 * 1080 * 60 * 16 / 10 / 1000
         );
-        // ...and an explicit client rate no longer bypasses it: PyroWave resolves through the
-        // pin + ceiling whatever the Hello carried (RFC §5.2 — this bypass was the bug).
+        // Explicit client rate still goes through pin + ceiling.
         assert_eq!(
             resolve_bitrate_kbps_for(Codec::PyroWave, 6_000_000, &mode, ChromaFormat::Yuv444, 10),
             4_500_000
         );
-        // SAFETY: as the set above — single writer, and the readers run on this thread.
+        // SAFETY: same as the set above — single writer; readers run on this thread.
         unsafe { std::env::remove_var("PUNKTFUNK_PYROWAVE_MAX_MBPS") };
     }
 
     #[test]
     fn adapt_fec_maps_loss_to_recovery_band() {
-        // A perfectly clean window (0 loss) lands on the floor.
+        // Clean window (0 loss) is FEC_MIN.
         assert_eq!(adapt_fec(0), FEC_MIN);
-        // Any nonzero loss rounds up past the floor (ceil) — tiny but never below the cushion.
+        // Any nonzero loss rounds up past FEC_MIN.
         assert_eq!(adapt_fec(1), 2);
-        // FEC exceeds the loss it covers (×1.4 + 1pt headroom).
-        assert_eq!(adapt_fec(50_000), 8); // 5% loss → ceil(7)+1 = 8
+        // FEC exceeds the loss it covers (×1.4 + 1 pt).
+        assert_eq!(adapt_fec(50_000), 8); // 5% → ceil(7)+1 = 8
         assert_eq!(adapt_fec(100_000), 15); // 10% → ceil(14)+1 = 15
-                                            // Heavy loss saturates at the ceiling, never beyond.
         assert_eq!(adapt_fec(1_000_000), FEC_MAX); // 100% → clamped
         assert!(adapt_fec(u32::MAX) <= FEC_MAX);
     }
 
-    /// [`FecFloor`] (RFC §2.4): real loss raises the decay floor to 5 % so a static stretch
-    /// can't strip the armor before motion; a long clean run re-earns 1 %; a link that
-    /// re-burns before the step-down has proven itself doubles the next requirement; a
-    /// step-down that survives resets it.
     #[test]
     fn wire_budget_derivation_never_overshoots() {
-        // RFC §5.1 worked example: 20 Mbps budget, a 300 kbps Opus reservation, 10 % FEC,
-        // 1408-byte shards → video = (20000−300) × 1408×100 / (1472×110) = 17 130 kbps.
+        // 20 Mbps budget, 300 kbps audio, 10 % FEC, 1408-byte shards → 17 130 kbps video.
         assert_eq!(encoder_kbps_for_budget(20_000, 300, 10, 1408), 17_130);
-        // …whose wire spend rounds back UNDER the budget, never over.
+        // Wire spend rounds back under the budget, never over.
         assert_eq!(budget_kbps_for_encoder(17_130, 300, 10, 1408), 19_999);
 
-        // The invariant across the operating range: any non-floored derivation's roundtrip
-        // spends within the budget — a short-ack conversion can never report a budget the
-        // wire would exceed.
+        // Non-floored roundtrip spends within the budget.
         for budget in [2_000u32, 5_000, 20_000, 100_000, 1_000_000] {
             for fec in [1u8, 5, 10, 25, 50] {
                 for audio in [0u32, 256, 512, 8_500] {
@@ -3006,15 +2369,13 @@ mod tests {
             }
         }
 
-        // A budget too small for its own audio floors at the encoder minimum and overshoots
-        // HONESTLY — the resolve gates keep audio ≤ ~25 % of the number, so this is
-        // corrupt-input armor, not an operating point.
+        // Budget too small for its audio: floor at MIN and overshoot honestly.
         assert_eq!(
             encoder_kbps_for_budget(500, 8_500, 50, 1408),
             MIN_BITRATE_KBPS
         );
 
-        // FEC reallocation is monotone: more parity ⇒ a lower video rate, same budget.
+        // More parity ⇒ lower video rate, same budget.
         let calm = encoder_kbps_for_budget(20_000, 300, 1, 1408);
         let burned = encoder_kbps_for_budget(20_000, 300, 5, 1408);
         let stormy = encoder_kbps_for_budget(20_000, 300, 50, 1408);
@@ -3024,22 +2385,22 @@ mod tests {
     #[test]
     fn fec_floor_burns_reearns_and_doubles_on_early_reburn() {
         let mut f = FecFloor::default();
-        // Untouched sessions decay to the 1 % floor as ever.
+        // Untouched sessions decay to the 1 % floor.
         assert_eq!(f.on_report(0), FEC_MIN);
-        // One lost shard anywhere = burned: the floor is 5 % and clean windows hold it there.
+        // One lost shard = burned: 5 % floor, clean windows hold it.
         assert_eq!(f.on_report(2_270), FEC_BURNED_MIN); // one packet at 5 Mbps
         for _ in 0..FEC_REEARN_WINDOWS - 1 {
             assert_eq!(f.on_report(0), FEC_BURNED_MIN);
         }
-        // The 160th clean window re-earns the 1 % floor.
+        // The 160th clean window re-earns 1 %.
         assert_eq!(f.on_report(0), FEC_MIN);
-        // A re-burn INSIDE the step-down's probation doubles the next requirement…
+        // Re-burn inside probation doubles the next requirement.
         assert_eq!(f.on_report(500), FEC_BURNED_MIN);
         for _ in 0..2 * FEC_REEARN_WINDOWS - 1 {
             assert_eq!(f.on_report(0), FEC_BURNED_MIN);
         }
         assert_eq!(f.on_report(0), FEC_MIN);
-        // …and the ceiling bounds the doubling ladder.
+        // Ceiling bounds the doubling ladder.
         let mut g = FecFloor {
             reearn: FEC_REEARN_MAX,
             since_stepdown: Some(0),
@@ -3047,7 +2408,7 @@ mod tests {
         };
         g.on_report(1);
         assert_eq!(g.reearn, FEC_REEARN_MAX);
-        // A step-down that survives its probation resets the requirement to base.
+        // Surviving probation resets the requirement to base.
         let mut h = FecFloor::default();
         h.on_report(1);
         for _ in 0..FEC_REEARN_WINDOWS {
@@ -3062,7 +2423,7 @@ mod tests {
             h.since_stepdown.is_none(),
             "probation over — durable recovery"
         );
-        // A burn AFTER a durable recovery is a fresh burn, not a double.
+        // Burn after durable recovery is a fresh burn, not a double.
         h.on_report(1);
         assert_eq!(h.reearn, FEC_REEARN_WINDOWS);
         assert_eq!(h.floor, FEC_BURNED_MIN);
@@ -3070,8 +2431,7 @@ mod tests {
 
     #[test]
     fn data_socket_defaults_to_random_hole_punch() {
-        // No fixed port (and the explicit-0 alias) → a random ephemeral port, and NOT direct: the
-        // caller hole-punches.
+        // No fixed port (and 0) → ephemeral, not direct: the caller hole-punches.
         for req in [None, Some(0)] {
             let (sock, direct) = bind_data_socket(req, None).expect("bind random data socket");
             assert!(!direct, "req={req:?} must hole-punch, not stream direct");
@@ -3081,21 +2441,19 @@ mod tests {
 
     #[test]
     fn data_socket_fixed_binds_direct_then_falls_back_when_busy() {
-        // Learn a currently-free port (bind :0, read it, drop — the same reserve-then-rebind the
-        // host itself uses; a race here would only make the assert below flaky, not wrong).
+        // Reserve-then-rebind like the host. A race here is flaky, not wrong.
         let free = std::net::UdpSocket::bind("0.0.0.0:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
 
-        // A free fixed port binds exactly it, in DIRECT mode (no hole-punch).
+        // Free fixed port binds exactly it, in direct mode.
         let (held, direct) = bind_data_socket(Some(free), None).expect("bind fixed data socket");
         assert!(direct, "a fixed --data-port must stream direct");
         assert_eq!(held.local_addr().unwrap().port(), free);
 
-        // While it's held, a second session on the same fixed port can't bind it → it must fall
-        // back to a random port + hole-punch rather than fail (so concurrency never regresses).
+        // Busy fixed port falls back to ephemeral + punch, not fail.
         let (fallback, direct2) =
             bind_data_socket(Some(free), None).expect("busy fixed port falls back");
         assert!(!direct2, "a busy fixed port must fall back to hole-punch");
@@ -3106,11 +2464,9 @@ mod tests {
         );
     }
 
-    /// The multi-homed black screen: video must egress from the address the client's control
-    /// connection arrived on, because the client's data socket is connected to the host address it
-    /// dialed and its kernel drops every datagram from any other source — silently, before
-    /// userspace, so nothing on either end counts it. A wildcard bind here lets the routing table
-    /// choose a different interface whenever the host has two paths to the client.
+    /// Video must egress from the address the control connection arrived on. The client's
+    /// data socket is connected to the host IP it dialed; any other source is dropped before
+    /// userspace. A wildcard bind lets the routing table pick a different interface.
     #[test]
     fn data_socket_binds_the_address_the_control_plane_arrived_on() {
         let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
@@ -3119,28 +2475,22 @@ mod tests {
         assert!(!direct);
         assert_eq!(sock.local_addr().unwrap().ip(), loopback);
 
-        // An IPv4-mapped v6 local address (a dual-stack QUIC endpoint reports one) has to be
-        // unmapped, or the socket binds v6 and can never `connect` to the v4 client.
+        // Dual-stack reports IPv4-mapped v6; unmap or the socket binds v6 and cannot `connect` v4.
         let mapped = std::net::IpAddr::V6(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped());
         let (sock, _) = bind_data_socket(None, Some(mapped)).expect("bind mapped data socket");
         assert_eq!(sock.local_addr().unwrap().ip(), loopback);
 
-        // No reported local address (platform can't say) keeps the old wildcard behaviour.
+        // No reported local address keeps the wildcard.
         let (sock, _) = bind_data_socket(None, None).expect("bind wildcard data socket");
         assert!(sock.local_addr().unwrap().ip().is_unspecified());
     }
 
-    /// Freeze the gamepad wire contract: every button bit + axis id pinned to its exact value in
-    /// `punktfunk_core::input::gamepad` — the single source both the punktfunk/1 native wire and the
-    /// GameStream/Limelight wire read from (they are one and the same). Renumbering a bit in core
-    /// silently breaks every already-shipped client, so it must fail here first. This is the host
-    /// counterpart to the client-side C-ABI cross-checks in the Apple/Android gamepad tests.
+    /// Pin every button bit and axis id. Native and GameStream share `core::input::gamepad`;
+    /// renumbering a bit silently breaks shipped clients.
     #[test]
     fn gamepad_wire_bits_are_pinned() {
         use punktfunk_core::input::gamepad as pf;
-        // buttonFlags — low 16 bits. The injectors now name these straight from core::input::gamepad
-        // (the GameStream junk-drawer aliases were removed in the pf-inject un-coupling), so this pins
-        // core directly.
+        // buttonFlags — low 16 bits, named from core.
         assert_eq!(pf::BTN_DPAD_UP, 0x0000_0001);
         assert_eq!(pf::BTN_DPAD_DOWN, 0x0000_0002);
         assert_eq!(pf::BTN_DPAD_LEFT, 0x0000_0004);
@@ -3156,8 +2506,7 @@ mod tests {
         assert_eq!(pf::BTN_B, 0x0000_2000);
         assert_eq!(pf::BTN_X, 0x0000_4000);
         assert_eq!(pf::BTN_Y, 0x0000_8000);
-        // buttonFlags2 — high 16 bits: back-grip paddles, plus the touchpad-click / Share bits the
-        // DualSense/DS4 protos consume.
+        // buttonFlags2 — paddles + DualSense/DS4 touchpad-click / Share.
         assert_eq!(pf::BTN_PADDLE1, 0x0001_0000);
         assert_eq!(pf::BTN_PADDLE2, 0x0002_0000);
         assert_eq!(pf::BTN_PADDLE3, 0x0004_0000);
@@ -3182,27 +2531,19 @@ mod tests {
     unsafe fn pull_verified(conn: *mut punktfunk_core::abi::PunktfunkConnection, count: u32) {
         use punktfunk_core::error::PunktfunkStatus;
         let mut got = 0u32;
-        // SAFETY: the inferred type is the `#[repr(C)]` POD `PunktfunkFrame` (a raw `*const u8`, a
-        // `usize`, and integer fields); all-zero is a valid bit pattern for every field (a null
-        // `data`, `len == 0`). It is only ever read after `next_au` below fully overwrites it on `Ok`,
-        // so the zeroed value is never observed.
+        // SAFETY: `PunktfunkFrame` is `#[repr(C)]` POD; all-zero is valid (null `data`, `len == 0`).
+        // Read only after `next_au` overwrites it on `Ok`.
         let mut frame = unsafe { std::mem::zeroed() };
         while got < count {
-            // SAFETY: `conn` is the live, non-null `*mut PunktfunkConnection` from `punktfunk_connect`
-            // (the caller asserts non-null and does not close it until after this returns), meeting the
-            // ABI's "valid handle". `&mut frame` is an exclusive, writable borrow of the local
-            // `PunktfunkFrame` that outlives this synchronous call. This single test thread is the only
-            // video puller, satisfying the one-video-thread rule.
+            // SAFETY: `conn` is the live handle from `punktfunk_connect` (caller asserts non-null,
+            // does not close until after return). `&mut frame` outlives this call. This thread is
+            // the only video puller.
             match unsafe {
                 punktfunk_core::abi::punktfunk_connection_next_au(conn, &mut frame, 2000)
             } {
                 PunktfunkStatus::Ok => {
-                    // SAFETY: on `Ok`, `next_au` set `frame.data`/`frame.len` to the reassembled AU
-                    // buffer the connection owns; per the ABI contract that borrow stays valid until
-                    // the NEXT `next_au` call on this handle. We read the whole slice here (the assert
-                    // + length-checked indexing) before the loop's next `next_au`, and `conn` outlives
-                    // it — so the pointer is live, exactly `len` bytes, read-only, single-threaded (no
-                    // aliasing/use-after-free).
+                    // SAFETY: on `Ok`, `frame.data`/`len` is the connection-owned AU, valid until the
+                    // next `next_au` on this handle. We read the whole slice before that next call.
                     let data = unsafe { std::slice::from_raw_parts(frame.data, frame.len) };
                     let idx = u32::from_le_bytes(data[0..4].try_into().unwrap());
                     assert_eq!(
@@ -3218,18 +2559,12 @@ mod tests {
         }
     }
 
-    /// End-to-end through the C ABI — the exact contract platform clients (Swift) link:
-    /// in-process punktfunk/1 host, `punktfunk_connect` (TOFU → pinned reconnect) →
-    /// `punktfunk_connection_next_au` pulls verified frames → `punktfunk_connection_send_input`
-    /// In-process-host tests each spin up a host on a fixed loopback port and share the process-global
-    /// admission table, so they must NOT run concurrently: a same-identity connection in one test would
-    /// fire the reconnect-preempt (`preempt_same_identity`) against another test's live session and
-    /// close it. Serialize them on this lock. Poison-tolerant (`into_inner`) so a failing test doesn't
-    /// cascade a poison error into the others.
+    /// In-process hosts share the process-global admission table. Concurrent tests would
+    /// `preempt_same_identity` each other. Poison-tolerant so a failing test does not cascade.
     static SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// enqueues → `punktfunk_connection_close`. Three sequential sessions against ONE host
-    /// process prove the persistent listener, and a wrong pin is rejected.
+    /// C ABI: TOFU connect → pull frames → send input → close. Three sequential sessions
+    /// against one host prove the persistent listener; a wrong pin is rejected.
     #[test]
     fn c_abi_connection_roundtrip() {
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -3253,7 +2588,7 @@ mod tests {
                 paired_store: None,
                 data_port: None,
                 idle_timeout: None,
-                mdns: false, // unit tests must not advertise on the LAN
+                mdns: false, // tests must not advertise on the LAN
             })
         });
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -3261,11 +2596,8 @@ mod tests {
         // Session 1: TOFU (no pin) — observe the host fingerprint.
         let addr = std::ffi::CString::new("127.0.0.1").unwrap();
         let mut observed = [0u8; 32];
-        // SAFETY: `addr` is a live `CString` ("127.0.0.1") whose `as_ptr()` is the NUL-terminated
-        // UTF-8 host string the contract requires; `pin_sha256`/cert/key are NULL (all permitted), and
-        // `observed.as_mut_ptr()` is the local `[u8; 32]` — exactly the 32 writable bytes the contract
-        // demands, not aliased during the call. Every pointer references a live local that outlives the
-        // blocking connect.
+        // SAFETY: `addr` is a live NUL-terminated host string; pin/cert/key are NULL (permitted);
+        // `observed` is 32 writable bytes. All locals outlive the blocking connect.
         let conn = unsafe {
             punktfunk_connect(
                 addr.as_ptr(),
@@ -3284,26 +2616,20 @@ mod tests {
         assert_ne!(observed, [0u8; 32], "fingerprint not reported");
 
         let (mut w, mut h, mut hz) = (0u32, 0u32, 0u32);
-        // SAFETY: `conn` is the live, non-null connection handle just asserted above; `&mut w/h/hz` are
-        // exclusive, writable borrows of local `u32`s that outlive this synchronous call — the three
-        // writable out-params the contract names.
+        // SAFETY: `conn` is the live handle; `&mut w/h/hz` outlive this call.
         let st = unsafe { punktfunk_connection_mode(conn, &mut w, &mut h, &mut hz) };
         assert_eq!(st, PunktfunkStatus::Ok);
         assert_eq!((w, h, hz), (1280, 720, 60));
 
-        // Mid-stream renegotiation: request a new mode, the host acks on the control
-        // stream, and punktfunk_connection_mode reflects the switch.
-        // SAFETY: `conn` is the live, non-null connection handle (the only pointer arg); the remaining
-        // arguments are by-value integers. The handle outlives this non-blocking enqueue.
+        // Mid-stream renegotiation: request a new mode; `punktfunk_connection_mode` reflects it.
+        // SAFETY: `conn` is the live handle; remaining args are by-value. Handle outlives enqueue.
         let st = unsafe {
             punktfunk_core::abi::punktfunk_connection_request_mode(conn, 1920, 1080, 144)
         };
         assert_eq!(st, PunktfunkStatus::Ok);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            // SAFETY: same as the earlier `punktfunk_connection_mode` call — `conn` is the live handle
-            // and `&mut w/h/hz` are exclusive writable borrows of locals that outlive this synchronous
-            // call.
+            // SAFETY: same as the earlier `punktfunk_connection_mode` call.
             let st = unsafe { punktfunk_connection_mode(conn, &mut w, &mut h, &mut hz) };
             assert_eq!(st, PunktfunkStatus::Ok);
             if (w, h, hz) == (1920, 1080, 144) {
@@ -3316,8 +2642,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        // SAFETY: `pull_verified` requires a live connection handle it alone pulls video from; `conn` is
-        // the open, non-null handle from `punktfunk_connect` and this is the only thread touching it.
+        // SAFETY: `conn` is the open handle; this thread is the only video puller.
         unsafe { pull_verified(conn, 25) };
 
         let ev = punktfunk_core::input::InputEvent {
@@ -3328,19 +2653,14 @@ mod tests {
             y: 2,
             flags: 0,
         };
-        // SAFETY: `conn` is the live handle; `&ev` borrows the local `InputEvent`, valid and immutable
-        // for this synchronous enqueue — the contract's "valid InputEvent" pointer.
+        // SAFETY: `conn` is live; `&ev` is a valid `InputEvent` for this enqueue.
         let st = unsafe { punktfunk_connection_send_input(conn, &ev) };
         assert_eq!(st, PunktfunkStatus::Ok);
-        // SAFETY: `conn` was returned by `punktfunk_connect` and is never used after this call (session
-        // 2 below uses a fresh `conn2`); `close` takes ownership and frees the handle exactly once.
+        // SAFETY: `conn` is unused after this; `close` frees it once. Session 2 uses `conn2`.
         unsafe { punktfunk_connection_close(conn) };
 
-        // Session 2 (same host process — the listener survived): pin the fingerprint.
-        // SAFETY: as for session 1 — `addr` is the live NUL-terminated host string; here
-        // `observed.as_ptr()` is the 32-byte pin (the fingerprint captured above, a valid `[u8; 32]`),
-        // `observed_sha256_out` is NULL and cert/key are NULL. All pointers reference live locals for
-        // the duration of the blocking connect.
+        // Session 2 (same host process): pin the fingerprint.
+        // SAFETY: as session 1 — `observed.as_ptr()` is the 32-byte pin; out/cert/key are NULL.
         let conn2 = unsafe {
             punktfunk_connect(
                 addr.as_ptr(),
@@ -3356,17 +2676,14 @@ mod tests {
             )
         };
         assert!(!conn2.is_null(), "pinned reconnect failed");
-        // SAFETY: `conn2` is the live, non-null pinned handle, pulled only from this thread —
-        // `pull_verified`'s requirement.
+        // SAFETY: `conn2` is the live pinned handle; this thread is the only puller.
         unsafe { pull_verified(conn2, 25) };
-        // SAFETY: `conn2` came from `punktfunk_connect` and is not used after this; `close` frees it once.
+        // SAFETY: `conn2` is unused after this; `close` frees it once.
         unsafe { punktfunk_connection_close(conn2) };
 
-        // Session 3: a wrong pin must be rejected by the handshake.
+        // Session 3: a wrong pin must be rejected.
         let bad = [0xAAu8; 32];
-        // SAFETY: same shape as the prior connects — `addr` is the live host string, `bad.as_ptr()` is
-        // the 32-byte `[0xAA; 32]` pin, and out/cert/key are NULL; all reference live locals across the
-        // blocking call. (The handshake is expected to fail and return NULL here, which is sound.)
+        // SAFETY: `bad.as_ptr()` is the 32-byte pin; out/cert/key are NULL. Expected to return NULL.
         let conn3 = unsafe {
             punktfunk_connect(
                 addr.as_ptr(),
@@ -3383,11 +2700,9 @@ mod tests {
         };
         assert!(conn3.is_null(), "wrong pin must fail the handshake");
 
-        // The host saw the rejected handshake attempt as session 3? No — a TLS-failed
-        // handshake never yields a connection, so accept() is still waiting. Connect once
-        // more (TOFU) to complete the host's third session and let it exit.
-        // SAFETY: same as session 1's connect — `addr` is the live host string, pin/out/cert/key all
-        // NULL; the pointers reference live locals for the duration of the blocking connect.
+        // TLS-failed handshake never yields a connection, so accept() is still waiting.
+        // One more TOFU connect completes the host's third session.
+        // SAFETY: same as session 1 — pin/out/cert/key all NULL.
         let conn4 = unsafe {
             punktfunk_connect(
                 addr.as_ptr(),
@@ -3403,21 +2718,17 @@ mod tests {
             )
         };
         assert!(!conn4.is_null());
-        // SAFETY: `conn4` is the live, non-null handle, pulled only from this thread.
+        // SAFETY: `conn4` is live; this thread is the only puller.
         unsafe { pull_verified(conn4, 25) };
-        // SAFETY: `conn4` came from `punktfunk_connect` and is unused after this; `close` frees it once.
+        // SAFETY: `conn4` is unused after this; `close` frees it once.
         unsafe { punktfunk_connection_close(conn4) };
 
         host.join().unwrap().unwrap();
     }
 
-    /// Shared clipboard end to end over a real synthetic session
-    /// (`design/clipboard-and-file-transfer.md`): with the operator policy enabled, the host
-    /// advertises the capability, acknowledges an enable with a `ClipState`, and — a synthetic
-    /// session mirrors no compositor, so no clipboard backend binds — declines a fetch with an
-    /// `Error` the client surfaces. Exercises the whole 0x40-0x44 control+fetch path across two real
-    /// endpoints (client `NativeClient` ↔ host `serve_session`). The live-backend paths (a real
-    /// compositor) are covered by the on-glass test against GNOME/Hyprland.
+    /// Clipboard over a synthetic session: host advertises the cap, acks enable with
+    /// `BACKEND_UNAVAILABLE` (no compositor), declines a fetch. Live-backend paths are
+    /// not covered here. `design/clipboard-and-file-transfer.md`.
     #[test]
     fn clipboard_control_and_fetch_decline_over_session() {
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -3427,20 +2738,17 @@ mod tests {
             CLIP_FILE_INDEX_NONE, CLIP_FLAG_FILES, CLIP_POLICY_FILES, HOST_CAP_CLIPBOARD,
         };
 
-        // Restore the env even on a panicking assert (the poisoned lock is recovered above, so a
-        // leaked var could otherwise reach the next session test).
+        // Restore the env even on panic so a leaked var cannot reach the next session test.
         struct EnvGuard(&'static str);
         impl Drop for EnvGuard {
             fn drop(&mut self) {
-                // SAFETY: dropped while SESSION_TEST_LOCK is still held by the owning test, so
-                // env writers stay serialized and only the session path reads this variable.
+                // SAFETY: dropped while SESSION_TEST_LOCK is held; only the session path reads this.
                 unsafe { std::env::remove_var(self.0) };
             }
         }
         let _env = EnvGuard("PUNKTFUNK_CLIPBOARD");
-        // Operator policy on. Session tests serialize on SESSION_TEST_LOCK, and only the session
-        // path (a session test) reads this env, so the mutation is race-free here.
-        // SAFETY: see the serialization argument directly above.
+        // Operator policy on. Serialized on SESSION_TEST_LOCK; only the session path reads this.
+        // SAFETY: writers serialized; only this session path reads the variable.
         unsafe { std::env::set_var("PUNKTFUNK_CLIPBOARD", "1") };
 
         let host = std::thread::spawn(|| {
@@ -3448,7 +2756,7 @@ mod tests {
                 port: 19781,
                 source: Punktfunk1Source::Synthetic,
                 seconds: 0,
-                frames: 600, // keep the session alive well past the control exchange
+                frames: 600, // outlive the control exchange
                 max_sessions: 1,
                 max_concurrent: 1,
                 require_pairing: false,
@@ -3473,18 +2781,18 @@ mod tests {
             mode,
             CompositorPref::Auto,
             GamepadPref::Auto,
-            0,     // bitrate_kbps
-            0,     // video_caps
-            2,     // audio_channels
-            0,     // video_codecs (HEVC-only)
-            0,     // preferred_codec
-            None,  // display_hdr
-            0,     // client_caps
-            false, // frame_parts (whole-AU delivery)
-            None,  // launch
-            None,  // name
-            None,  // pin (TOFU)
-            None,  // identity (host doesn't require pairing)
+            0,
+            0,
+            2,
+            0,
+            0,
+            None,
+            0,
+            false,
+            None,
+            None,
+            None,
+            None,
             std::time::Duration::from_secs(10),
         )
         .expect("client connects to synthetic host");
@@ -3495,7 +2803,7 @@ mod tests {
             "an enabled host advertises HOST_CAP_CLIPBOARD"
         );
 
-        // A bounded poll over the clipboard event plane.
+        // Bounded poll over the clipboard event plane.
         let poll = |pred: &dyn Fn(&ClipEventCore) -> bool| -> Option<ClipEventCore> {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while std::time::Instant::now() < deadline {
@@ -3503,15 +2811,13 @@ mod tests {
                     Ok(ev) if pred(&ev) => return Some(ev),
                     Ok(_) => {}
                     Err(punktfunk_core::PunktfunkError::NoFrame) => {}
-                    Err(_) => break, // session closed
+                    Err(_) => break,
                 }
             }
             None
         };
 
-        // Enable sync (requesting files) → the host acks with a ClipState. A synthetic session
-        // mirrors no compositor, so no clipboard backend binds: the host refuses the enable with
-        // `BACKEND_UNAVAILABLE` while still reporting the operator policy (files permitted).
+        // Enable (files): synthetic has no backend → BACKEND_UNAVAILABLE, policy still reports files.
         client.clip_control(true, CLIP_FLAG_FILES).unwrap();
         let state = poll(&|e| matches!(e, ClipEventCore::State { .. }))
             .expect("host replies with a ClipState ack");
@@ -3536,8 +2842,7 @@ mod tests {
             _ => unreachable!(),
         }
 
-        // Fetch the host clipboard: a synthetic session has no backend, so the host declines and
-        // the client surfaces an Error for that transfer id.
+        // Fetch: no backend → Error for that transfer id.
         let xfer = client
             .clip_fetch(1, "text/plain;charset=utf-8".into(), CLIP_FILE_INDEX_NONE)
             .unwrap();
@@ -3553,11 +2858,7 @@ mod tests {
         std::env::temp_dir().join(format!("punktfunk-paired-test-{}.json", std::process::id()))
     }
 
-    /// Delegated approval (§8b-1) end to end in-process, the SEAMLESS flow: an
-    /// identified-but-unpaired client's knock on a pairing-required host is PARKED (connection held
-    /// open) and shows up as a pending request (fingerprint-derived label — the connector sends no
-    /// Hello name); the operator approves it WHILE the client waits, and the SAME connection is
-    /// admitted to a session with no PIN and no reconnect.
+    /// Unpaired knock is parked; approve while waiting admits the same connection, no reconnect.
     #[test]
     fn delegated_approval_admits_after_knock() {
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -3581,17 +2882,17 @@ mod tests {
                     source: Punktfunk1Source::Synthetic,
                     seconds: 0,
                     frames: 25,
-                    max_sessions: 1, // the single parked-then-approved session (no reconnect)
+                    max_sessions: 1,
                     max_concurrent: 1,
                     require_pairing: true,
                     allow_pairing: false,
                     pairing_pin: None,
-                    paired_store: None, // unused: the shared `np` IS the store handle
+                    paired_store: None,
                     data_port: None,
                     idle_timeout: None,
                     mdns: false,
                 },
-                0, // no mgmt API in this test → advertise no `mgmt` mDNS port
+                0,
                 np_host,
                 StatsRecorder::new(
                     std::env::temp_dir().join(format!("pf-approval-stats-{}", std::process::id())),
@@ -3608,8 +2909,7 @@ mod tests {
             refresh_hz: 60,
         };
 
-        // Approver thread: wait for the parked knock to register, assert its label, then APPROVE it
-        // WHILE the client is still parked — the console "click accept" flow.
+        // Approve while the client is still parked.
         let np_approve = np.clone();
         let expect_fp = expected_fp.clone();
         let approver = std::thread::spawn(move || {
@@ -3639,8 +2939,7 @@ mod tests {
                 .expect("pending id must approve");
         });
 
-        // The knock: a SINGLE connect that parks until approved, then streams — no reconnect. The
-        // timeout is generous (it covers the park + the approver's poll latency).
+        // One connect that parks until approved, then streams. Timeout covers park + approver poll.
         let client = NativeClient::connect(
             "127.0.0.1",
             19779,
@@ -3648,16 +2947,16 @@ mod tests {
             CompositorPref::Auto,
             GamepadPref::Auto,
             0,
-            0,     // video_caps
-            2,     // audio_channels (stereo)
-            0,     // video_codecs (0 → HEVC-only)
-            0,     // preferred_codec (auto)
-            None,  // display_hdr
-            0,     // client_caps
-            false, // frame_parts (whole-AU delivery)
-            None,  // launch
-            None,  // name: absent on purpose — this test asserts the fingerprint-derived label
-            None,  // pin: TOFU — the operator's approval (not a PIN) authorizes this client
+            0,
+            2,
+            0,
+            0,
+            None,
+            0,
+            false,
+            None,
+            None, // no Hello name — assert the fingerprint-derived label
+            None, // TOFU; approval, not a PIN, authorizes this client
             Some((cert, key)),
             std::time::Duration::from_secs(15),
         )
@@ -3673,9 +2972,7 @@ mod tests {
         host.join().unwrap().unwrap();
     }
 
-    /// The PIN pairing ceremony + the --require-pairing gate, end to end in-process:
-    /// wrong PIN rejected; right PIN pairs and returns the host fingerprint; a paired
-    /// identity gets a session on a pairing-required host; an anonymous client does not.
+    /// Right PIN pairs; paired identity gets a session; anonymous does not.
     #[test]
     fn pairing_ceremony_and_gate() {
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -3709,7 +3006,7 @@ mod tests {
             refresh_hz: 60,
         };
 
-        // 1: anonymous session on a pairing-required host → rejected (independent of the PIN window).
+        // 1: anonymous session on a pairing-required host → rejected.
         assert!(
             NativeClient::connect(
                 "127.0.0.1",
@@ -3718,15 +3015,15 @@ mod tests {
                 CompositorPref::Auto,
                 GamepadPref::Auto,
                 0,
-                0,     // video_caps
-                2,     // audio_channels (stereo)
-                0,     // video_codecs
-                0,     // preferred_codec
-                None,  // display_hdr
-                0,     // client_caps
-                false, // frame_parts (whole-AU delivery)
-                None,  // launch
-                None,  // name
+                0,
+                2,
+                0,
+                0,
+                None,
+                0,
+                false,
+                None,
+                None,
                 None,
                 None,
                 timeout
@@ -3735,14 +3032,13 @@ mod tests {
             "anonymous session must be rejected"
         );
 
-        // 2: correct PIN → paired, host fingerprint returned. The ONE online attempt CONSUMES the
-        // arming window (single-use), verified by step 4.
+        // 2: correct PIN → paired. The one online attempt consumes the window (step 4).
         let host_fp =
             NativeClient::pair("127.0.0.1", 19778, identity, "4321", "test-client", timeout)
                 .expect("pairing with the right PIN");
         assert!(test_paired_path().exists());
 
-        // 3: the paired identity gets a session — pinned to the ceremony's fingerprint.
+        // 3: paired identity gets a session, pinned to the ceremony fingerprint.
         let client = NativeClient::connect(
             "127.0.0.1",
             19778,
@@ -3750,49 +3046,41 @@ mod tests {
             CompositorPref::Auto,
             GamepadPref::Auto,
             0,
-            0,     // video_caps
-            2,     // audio_channels (stereo)
-            0,     // video_codecs
-            0,     // preferred_codec
-            None,  // display_hdr
-            0,     // client_caps
-            false, // frame_parts (whole-AU delivery)
-            None,  // launch
-            None,  // name
+            0,
+            2,
+            0,
+            0,
+            None,
+            0,
+            false,
+            None,
+            None,
             Some(host_fp),
             Some((cert.clone(), key.clone())),
             timeout,
         )
         .expect("paired session");
         assert_eq!(client.host_fingerprint, host_fp);
-        // The Welcome always reports a CONCRETE resolved gamepad backend. (Not asserted
-        // against a specific one: resolve_gamepad honors an ambient PUNKTFUNK_GAMEPAD —
-        // a dev box exporting it must not fail the suite.)
+        // Welcome reports a concrete backend. Do not pin which: `PUNKTFUNK_GAMEPAD` may be set.
         assert_ne!(client.resolved_gamepad, GamepadPref::Auto);
         drop(client);
 
-        // 4: SINGLE-USE PIN — the completed ceremony in step 2 consumed the arming window, so a
-        // second pairing attempt (even with the CORRECT PIN) is now rejected. This is the documented
-        // "one online guess" guarantee: an attacker can't brute-force the static 4-digit PIN. (The
-        // operator re-arms via the console / restart for the next device.)
+        // 4: single-use PIN — a second attempt (even correct) is rejected.
         std::thread::sleep(PAIRING_COOLDOWN + std::time::Duration::from_millis(200));
         assert!(
             NativeClient::pair("127.0.0.1", 19778, identity, "4321", "too-late", timeout).is_err(),
             "the PIN window must be single-use (one online guess)"
         );
-        let _ = std::fs::remove_file(test_paired_path()); // tidy /tmp
+        let _ = std::fs::remove_file(test_paired_path());
 
         host.join().unwrap().unwrap();
     }
 
-    // ---- Per-client access (WP3–WP5) -------------------------------------------------------
-
-    /// The access lifecycle's clock/threshold arithmetic (design §4). All pure — the timed task
-    /// itself is exercised end to end by the session tests below.
+    /// Access clock/threshold arithmetic. The timed task is exercised by the session tests below.
     #[test]
     fn access_deadline_math() {
         let now = 1_700_000_000i64;
-        // Wire lifetime: 0 = permanent; a due/past deadline still reads as expiring (floor 1).
+        // Wire: 0 = permanent; a due/past deadline still reads as expiring (floor 1).
         assert_eq!(remaining_secs_wire(None, now), 0);
         assert_eq!(remaining_secs_wire(Some(now + 90), now), 90);
         assert_eq!(remaining_secs_wire(Some(now), now), 1);
@@ -3804,17 +3092,17 @@ mod tests {
         assert_eq!(spent_warnings(Some(now + 120), now), [true, false]);
         assert_eq!(spent_warnings(Some(now + 30), now), [true, true]);
 
-        // Sleep slices: toward the next unfired boundary, 1..=30 s; permanent parks long.
+        // Sleep toward the next unfired boundary, 1..=30 s; permanent parks long.
         assert_eq!(
             access_sleep(None, &[true, true], now),
             std::time::Duration::from_secs(3600)
         );
-        // 400 s out, T−5 m unfired → boundary in 100 s, capped at the 30 s NTP-staleness bound.
+        // 400 s out, T−5 m unfired → 100 s away, capped at the 30 s NTP-staleness bound.
         assert_eq!(
             access_sleep(Some(now + 400), &[false, false], now),
             std::time::Duration::from_secs(30)
         );
-        // 90 s out, only T−1 m left → its boundary is 30 s away.
+        // 90 s out, only T−1 m left → 30 s away.
         assert_eq!(
             access_sleep(Some(now + 90), &[true, false], now),
             std::time::Duration::from_secs(30)
@@ -3824,16 +3112,14 @@ mod tests {
             access_sleep(Some(now + 10), &[true, true], now),
             std::time::Duration::from_secs(10)
         );
-        // Due now → the 1 s floor (the loop head closes; never a busy-spin zero sleep).
+        // Due now → 1 s floor (never a busy-spin zero sleep).
         assert_eq!(
             access_sleep(Some(now), &[true, true], now),
             std::time::Duration::from_secs(1)
         );
     }
 
-    /// The datagram filter's admission matrix (WP4) is `mask & classify(kind).bit()` — pin the
-    /// preset semantics: Controller-only passes pads and ONLY pads; View-only passes nothing.
-    /// (The exhaustive classify itself is pinned in core's access tests.)
+    /// Controller-only passes pads only; View-only passes nothing. Classify is pinned in core.
     #[test]
     fn input_admission_matrix_and_quiet_drop_accounting() {
         use punktfunk_core::quic::{GRANT_PRESET_CONTROLLER_ONLY, GRANT_PRESET_VIEW_ONLY};
@@ -3862,7 +3148,7 @@ mod tests {
         }
         assert!(admitted(GRANT_ALL, InputKind::KeyDown));
 
-        // Quiet-drop accounting (design §5.5): per-class counters, "none" when clean.
+        // Per-class counters; `"none"` when clean.
         let drops = GrantDrops::new();
         assert_eq!(drops.summary(), "none");
         drops.note(GrantClass::Keyboard);
@@ -3871,9 +3157,8 @@ mod tests {
         assert_eq!(drops.summary(), "Keyboard=2 Mic=1");
     }
 
-    /// Spawn a pairing-required synthetic host on `port` sharing `np` (the access tests' shape:
-    /// the test edits the trust store while a session is live). `frames` is generous — the
-    /// paced synthetic stream must outlive every timed assertion; the typed close cuts it.
+    /// Pairing-required synthetic host sharing `np` so the test can edit the store live.
+    /// Generous `frames`; the typed close cuts the stream.
     fn spawn_access_host(
         port: u16,
         max_sessions: u32,
@@ -3890,13 +3175,13 @@ mod tests {
                     port,
                     source: Punktfunk1Source::Synthetic,
                     seconds: 0,
-                    frames: 3000, // ~50 s at the 60 fps pace — the stop flag cuts it long before
+                    frames: 3000, // ~50 s at 60 fps; the stop flag cuts it long before
                     max_sessions,
                     max_concurrent: 1,
                     require_pairing: true,
                     allow_pairing: false,
                     pairing_pin: None,
-                    paired_store: None, // unused: the shared `np` IS the store handle
+                    paired_store: None,
                     data_port: None,
                     idle_timeout: None,
                     mdns: false,
@@ -3912,15 +3197,13 @@ mod tests {
         })
     }
 
-    /// A paired-store temp path per test (the shared-`np` hosts persist through it).
+    /// Paired-store temp path; the shared-`np` hosts persist through it.
     fn access_store_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("pf-access-{tag}-{}.json", std::process::id()))
     }
 
-    /// Minimal RAW punktfunk/1 session (not `NativeClient`): Hello → Welcome → Start, returning
-    /// the streams so a test can read the control plane directly (`AccessUpdate`s) and assert
-    /// the EXACT close code — the typed-close contract `end_reject` builds on client-side.
-    /// The returned `UdpSocket` keeps the advertised video port bound for the session's life.
+    /// Hello → Welcome → Start, returning streams so a test can read `AccessUpdate`s and the
+    /// exact close code. The `UdpSocket` keeps the advertised video port bound.
     async fn raw_session(
         port: u16,
         identity: (&str, &str),
@@ -3958,9 +3241,8 @@ mod tests {
             display_hdr: None,
             client_caps: 0,
             max_shard_payload: 0,
-            // Legacy audio request — this fixture exercises the per-client access grants, not
-            // the audio plane, and the defaults keep its Hello byte-identical to a pre-hi-res
-            // client's.
+            // This fixture is about grants, not audio. Defaults keep Hello byte-identical
+            // to a client that omits hi-res fields.
             audio_rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
             audio_bits: punktfunk_core::audio::pcm::BITS_16,
         };
@@ -3979,8 +3261,7 @@ mod tests {
         (conn, send, recv, welcome, udp)
     }
 
-    /// The application close code a connection ended with (panics on a transport-level end —
-    /// these tests expect a deliberate host close).
+    /// Application close code. Panics on a transport-level end — these tests expect a host close.
     async fn closed_app_code(conn: &quinn::Connection) -> u32 {
         match conn.closed().await {
             quinn::ConnectionError::ApplicationClosed(ac) => {
@@ -3990,9 +3271,7 @@ mod tests {
         }
     }
 
-    /// WP3 acceptance: a session admitted under a short expiry advertises its real grants and
-    /// remaining lifetime in the Welcome, and at the deadline is closed with the TYPED expiry
-    /// code (0x69 → `RejectReason::AccessExpired`) — evaluated against the wall clock at fire.
+    /// Short expiry: Welcome advertises grants + remaining; deadline closes typed (`0x69`).
     #[test]
     fn access_expiry_advertises_and_closes_typed() {
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -4038,17 +3317,14 @@ mod tests {
                 "expiry must close with the typed code"
             );
         });
-        // The row survives expiry (design §4) — only authorization ends.
+        // The row survives expiry — only authorization ends.
         assert!(np.is_paired(&fp_hex));
         assert_eq!(np.effective(&fp_hex, wall_unix_now()), None);
         let _ = std::fs::remove_file(&store);
         host.join().unwrap().unwrap();
     }
 
-    /// WP3/WP4/WP5 acceptance, mid-session: a console grant edit reaches the live session as an
-    /// `AccessUpdate` (the enforcement atomic's push mirror), a deadline set inside the T−1 m
-    /// threshold fires the warning, and "expire now" (a deadline already in the past) closes
-    /// with the same typed code — revocation is a clean typed close, not a lingering stream.
+    /// Mid-session grant edit → `AccessUpdate`; T−1 m warning fires; "expire now" typed-closes.
     #[test]
     fn access_edit_pushes_updates_and_expire_now_closes() {
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -4059,7 +3335,7 @@ mod tests {
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
         let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
-        np.add("Edited Device", &fp_hex).unwrap(); // full control, permanent
+        np.add("Edited Device", &fp_hex).unwrap();
         let host = spawn_access_host(19783, 1, np.clone());
         std::thread::sleep(std::time::Duration::from_millis(500));
 
@@ -4073,8 +3349,7 @@ mod tests {
             assert_eq!(welcome.grants, GRANT_ALL);
             assert_eq!(welcome.expires_in_secs, 0, "permanent access advertises 0");
 
-            // The console edit: controller-only, expiring 62 s out (inside T−5 m, outside
-            // T−1 m — so exactly one warning is still owed, and it fires ~2 s later).
+            // Controller-only, 62 s out (inside T−5 m, outside T−1 m): one warning, ~2 s later.
             let now = wall_unix_now();
             np.set_access(
                 &fp_hex,
@@ -4087,7 +3362,7 @@ mod tests {
             .then_some(())
             .expect("the fingerprint is paired");
 
-            // Update 1 — the edit itself: new mask + remaining lifetime.
+            // Update 1: the edit itself (new mask + remaining).
             let msg =
                 tokio::time::timeout(std::time::Duration::from_secs(5), io::read_msg(&mut recv))
                     .await
@@ -4101,7 +3376,7 @@ mod tests {
                 u.remaining_secs
             );
 
-            // Update 2 — the T−1 m warning, fired as the threshold is crossed live.
+            // Update 2: T−1 m warning, fired as the threshold is crossed live.
             let msg =
                 tokio::time::timeout(std::time::Duration::from_secs(10), io::read_msg(&mut recv))
                     .await
@@ -4114,7 +3389,7 @@ mod tests {
                 u.remaining_secs
             );
 
-            // "Expire now": a deadline in the past → the same typed close, no phantom update.
+            // Expire now: deadline in the past → typed close, no phantom update.
             np.set_access(
                 &fp_hex,
                 crate::native_pairing::Access {
@@ -4133,10 +3408,7 @@ mod tests {
         host.join().unwrap().unwrap();
     }
 
-    /// WP5 acceptance: a Hello asking to LAUNCH without the grant is refused BEFORE the
-    /// handshake with the typed 0x6A close (`RejectReason::LaunchNotPermitted`) — surfaced by
-    /// the stock client as a connect-time rejection — while the same controller-only device
-    /// WITHOUT a launch request gets its session.
+    /// Launch without the grant: typed 0x6A before handshake. Same device without launch is admitted.
     #[test]
     fn launch_refused_without_grant_but_session_admitted() {
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -4157,7 +3429,7 @@ mod tests {
             }),
         )
         .unwrap();
-        // max_sessions counts ACCEPTED connections, and the refused launch connect is one too.
+        // max_sessions counts accepted connections; the refused launch connect is one too.
         let host = spawn_access_host(19784, 2, np.clone());
         std::thread::sleep(std::time::Duration::from_millis(500));
         let timeout = std::time::Duration::from_secs(10);
@@ -4167,8 +3439,7 @@ mod tests {
             refresh_hz: 60,
         };
 
-        // 1: launch requested without the LAUNCH grant → the typed pre-handshake refusal.
-        // (Matched rather than `expect_err`: `NativeClient` has no Debug impl to unwrap around.)
+        // 1: launch without LAUNCH → typed pre-handshake refusal (`NativeClient` has no Debug).
         let refused = NativeClient::connect(
             "127.0.0.1",
             19784,
@@ -4176,16 +3447,16 @@ mod tests {
             CompositorPref::Auto,
             GamepadPref::Auto,
             0,
-            0,     // video_caps
-            2,     // audio_channels
-            0,     // video_codecs
-            0,     // preferred_codec
-            None,  // display_hdr
-            0,     // client_caps
-            false, // frame_parts
+            0,
+            2,
+            0,
+            0,
+            None,
+            0,
+            false,
             Some("steam:570".into()),
             Some("Guest Pad".into()),
-            None, // pin (TOFU)
+            None,
             Some((cert.clone(), key.clone())),
             timeout,
         );
@@ -4199,7 +3470,7 @@ mod tests {
             Err(other) => panic!("expected a typed rejection, got {other:?}"),
         }
 
-        // 2: the same device without a launch request is admitted, Welcome advertising its mask.
+        // 2: same device without a launch is admitted.
         let client = NativeClient::connect(
             "127.0.0.1",
             19784,
@@ -4214,7 +3485,7 @@ mod tests {
             None,
             0,
             false,
-            None, // no launch
+            None,
             Some("Guest Pad".into()),
             None,
             Some((cert, key)),
@@ -4226,10 +3497,7 @@ mod tests {
         host.join().unwrap().unwrap();
     }
 
-    /// WP3 acceptance: an EXPIRED record is "not paired" at admission — the device falls into
-    /// the existing delegated-approval knock (console pending list) instead of a hard reject,
-    /// and re-approval IS the re-grant: the same held-open connection is admitted with the
-    /// fresh access.
+    /// Expired record knocks into pending; re-approval is the re-grant on the held connection.
     #[test]
     fn expired_record_knocks_into_pending_and_reapproval_regrants() {
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -4241,7 +3509,7 @@ mod tests {
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
         let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
-        // Yesterday's guest: still listed, no longer authorized.
+        // Still listed, no longer authorized.
         np.add_with_access(
             "Yesterday's Guest",
             &fp_hex,
@@ -4257,8 +3525,7 @@ mod tests {
         let host = spawn_access_host(19785, 1, np.clone());
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // Re-approver: the expired device's reconnect must appear as a PENDING knock; approve
-        // it with fresh access while it is parked (the one-click re-grant).
+        // Reconnect appears as pending; approve with fresh access while parked.
         let np_approve = np.clone();
         let fp_approve = fp_hex.clone();
         let approver = std::thread::spawn(move || {
@@ -4316,7 +3583,7 @@ mod tests {
         )
         .expect("re-approved mid-park → session admitted with no reconnect");
         approver.join().unwrap();
-        // The re-grant is in force: controller-only, expiring tonight.
+        // Re-grant in force: controller-only.
         assert_eq!(
             np.effective(&fp_hex, wall_unix_now()),
             Some(punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY)

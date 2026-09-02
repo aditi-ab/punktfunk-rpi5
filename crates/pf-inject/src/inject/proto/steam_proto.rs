@@ -1,39 +1,32 @@
-//! Transport-independent Steam Controller / Steam Deck HID contract — the Steam analogue of
-//! [`super::dualsense_proto`]. The report descriptor, the command/feature IDs, the byte-exact
-//! Deck input-report serializer, the `XInput`/rich-input → state mappers, and the rumble-feedback
-//! parser. Pure logic, shared by the Linux UHID backend and (later) a Windows UMDF backend.
+//! Steam Controller / Steam Deck HID contract, shared by UHID and the USB
+//! gadget/usbip backends. Layout is `drivers/hid/hid-steam.c`
+//! (`steam_do_deck_input_event` / `steam_do_deck_sensors_event`); see
+//! `design/steam-controller-deck-support.md`.
 //!
-//! **Layout source of truth:** the kernel `drivers/hid/hid-steam.c` `steam_do_deck_input_event`
-//! (+ `steam_do_deck_sensors_event`) — every offset/bit/sign below is transcribed verbatim from
-//! it and on-box-validated against kernel 7.0 (see `design/steam-controller-deck-support.md`).
-//! M0 proved the device binds + parses; M1 (here) makes the serializer byte-exact.
-//!
-//! Three load-bearing details the DualSense path does NOT have:
-//!   * **report id 0 / unnumbered**: input reports are the raw 64 bytes starting `[0x01,0x00,0x09]`
-//!     (no report-id prefix); FEATURE get/set reports DO carry a leading `0x00` report-id byte
-//!     (`steam_send_report` does `memcpy(buf+1, cmd, …)`, `steam_recv_report` strips `buf[0]`).
-//!   * **`gamepad_mode` gate**: `steam_do_deck_input_event` early-returns when
-//!     `!gamepad_mode && lizard_mode` (the module param, default on). `gamepad_mode` starts false
-//!     and TOGGLES when [`btn::STEAM_MENU_RIGHT`] (`b9.6`, the mode-switch) is held ~450 ms while
-//!     no hidraw client is open. The backend enters gamepad mode at session start (pulse that bit,
-//!     or load `hid_steam lizard_mode=0`) — see the backend, not this module.
-//!   * **the `UHID_SET_REPORT` handshake** must be answered (DualSense omits it).
-#![allow(dead_code)] // Some of the full model is consumed only once the M2 backend + M3 wire land.
+//! Three traps DualSense does not have:
+//! - Input reports are unnumbered (raw 64 bytes, no report-id prefix).
+//!   FEATURE get/set reports carry a leading `0x00` that `steam_recv_report`
+//!   strips.
+//! - `steam_do_deck_input_event` early-returns unless `gamepad_mode` is on
+//!   (`!gamepad_mode && lizard_mode`). The backend enters gamepad mode; this
+//!   module does not.
+//! - `UHID_SET_REPORT` must be answered.
+#![allow(dead_code)]
 
 use punktfunk_core::input::gamepad as gs;
 use punktfunk_core::quic::RichInput;
 
-/// Valve. `hid-steam` matches purely by VID/PID over `BUS_USB`.
+/// `hid-steam` matches VID/PID on `BUS_USB`; no usage-page probe.
 pub const STEAM_VENDOR: u32 = 0x28DE;
-/// Steam Deck built-in controller (same PID on LCD + OLED).
+/// Same PID on LCD and OLED Decks.
 pub const STEAMDECK_PRODUCT: u32 = 0x1205;
-/// Classic Steam Controller, wired (report id 1 / `ID_CONTROLLER_STATE`; a later model).
+/// Wired Steam Controller (`ID_CONTROLLER_STATE`, report id 1).
 pub const STEAMCTRL_WIRED_PRODUCT: u32 = 0x1102;
 
-/// The Steam HID state/command report is a fixed 64-byte, **unnumbered** (report-id-0) frame.
+/// Unnumbered 64-byte frame (report-id 0).
 pub const STEAM_REPORT_LEN: usize = 64;
 
-// Command IDs (drivers/hid/hid-steam.c), confirmed against the kernel source.
+// Command IDs from `drivers/hid/hid-steam.c`.
 pub const ID_CLEAR_DIGITAL_MAPPINGS: u8 = 0x81;
 pub const ID_GET_ATTRIBUTES_VALUES: u8 = 0x83;
 pub const ID_SET_SETTINGS_VALUES: u8 = 0x87;
@@ -41,16 +34,13 @@ pub const ID_LOAD_DEFAULT_SETTINGS: u8 = 0x8E;
 pub const ID_GET_DEVICE_INFO: u8 = 0xA1;
 pub const ID_GET_STRING_ATTRIBUTE: u8 = 0xAE;
 pub const ATTRIB_STR_UNIT_SERIAL: u8 = 0x01;
-/// Host→client feedback: `steam_haptic_rumble` emits report `[0xEB, 9, …]` (FF_RUMBLE → trackpad
-/// actuators / Deck motors). The Deck's rumble path; the classic SC also has `0x8F` pad pulses.
+/// Host rumble: `steam_haptic_rumble` `[0xEB, 9, …]`. Classic SC pad pulses use `0x8F`.
 pub const ID_TRIGGER_RUMBLE_CMD: u8 = 0xEB;
 pub const ID_TRIGGER_HAPTIC_PULSE: u8 = 0x8F;
-/// Input report message types: SC = `ID_CONTROLLER_STATE`, Deck = `ID_CONTROLLER_DECK_STATE`.
 pub const ID_CONTROLLER_STATE: u8 = 0x01;
 pub const ID_CONTROLLER_DECK_STATE: u8 = 0x09;
 
-/// Which Steam device identity to present. M1 implements the Deck fully; the classic Controller
-/// (dual trackpads, report id 1, trackpad-only haptics) is a later identity behind the same path.
+/// Controller is the dual-trackpad, report-id-1 identity on the same path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SteamModel {
     Deck,
@@ -66,10 +56,9 @@ impl SteamModel {
     }
 }
 
-/// Minimal vendor-defined HID report descriptor: one application collection with a 64-byte input
-/// report and a 64-byte feature report, both UNNUMBERED (report id 0). `hid-steam` is a raw-event
-/// driver, so the field layout is cosmetic — but `steam_probe` requires `hid_parse` to succeed AND
-/// a non-empty FEATURE report list (`steam_is_valve_interface`), so the feature item is mandatory.
+/// Unnumbered 64-byte input + feature. Field layout is cosmetic (`hid-steam`
+/// is a raw-event driver) but `steam_probe` needs `hid_parse` plus a non-empty
+/// FEATURE list (`steam_is_valve_interface`).
 #[rustfmt::skip]
 pub const STEAMDECK_RDESC: &[u8] = &[
     0x06, 0x00, 0xFF, // Usage Page (Vendor-Defined 0xFF00)
@@ -87,15 +76,14 @@ pub const STEAMDECK_RDESC: &[u8] = &[
     0xC0,             // End Collection
 ];
 
-/// Deck button bits, indexed in the `u64` packed across report bytes 8..16 — bit `(byte-8)*8 + bit`,
-/// transcribed verbatim from `steam_do_deck_input_event` (bytes 12 + 15 carry no buttons). Naming
-/// follows the physical Deck control; the trailing comment is the kernel `BTN_*` it maps to.
+/// Packed across report bytes 8..16 as bit `(byte-8)*8 + bit`. Bytes 12 and 15
+/// carry no buttons (`steam_do_deck_input_event`).
 pub mod btn {
     // byte 8
-    pub const RT_FULL: u64 = 1 << 0; // BTN_TR2  — right trigger fully pressed
-    pub const LT_FULL: u64 = 1 << 1; // BTN_TL2  — left trigger fully pressed
-    pub const RB: u64 = 1 << 2; //      BTN_TR   — right shoulder
-    pub const LB: u64 = 1 << 3; //      BTN_TL   — left shoulder
+    pub const RT_FULL: u64 = 1 << 0; // BTN_TR2
+    pub const LT_FULL: u64 = 1 << 1; // BTN_TL2
+    pub const RB: u64 = 1 << 2; // BTN_TR
+    pub const LB: u64 = 1 << 3; // BTN_TL
     pub const Y: u64 = 1 << 4;
     pub const B: u64 = 1 << 5;
     pub const X: u64 = 1 << 6;
@@ -105,76 +93,67 @@ pub mod btn {
     pub const DPAD_RIGHT: u64 = 1 << 9;
     pub const DPAD_LEFT: u64 = 1 << 10;
     pub const DPAD_DOWN: u64 = 1 << 11;
-    pub const VIEW: u64 = 1 << 12; //   BTN_SELECT — "menu left" (View / Back)
-    pub const STEAM: u64 = 1 << 13; //  BTN_MODE   — Steam logo button
-    pub const MENU: u64 = 1 << 14; //   BTN_START  — "menu right" (Start / Options)
-    pub const L5: u64 = 1 << 15; //     BTN_GRIPL2 — left BOTTOM back grip
-                                 // byte 10
-    pub const R5: u64 = 1 << 16; //     BTN_GRIPR2 — right BOTTOM back grip
-    pub const LPAD_CLICK: u64 = 1 << 17; // BTN_THUMB  — left pad pressed (click)
-    pub const RPAD_CLICK: u64 = 1 << 18; // BTN_THUMB2 — right pad pressed (click)
-    pub const LPAD_TOUCH: u64 = 1 << 19; // gates ABS_HAT0 (left pad coords)
-    pub const RPAD_TOUCH: u64 = 1 << 20; // gates ABS_HAT1 (right pad coords)
-    pub const L3: u64 = 1 << 22; //     BTN_THUMBL — left joystick click
-                                 // byte 11
-    pub const R3: u64 = 1 << 26; //     BTN_THUMBR — right joystick click
-                                 // byte 13
-    pub const L4: u64 = 1 << 41; //     BTN_GRIPL  — left TOP back grip
-    pub const R4: u64 = 1 << 42; //     BTN_GRIPR  — right TOP back grip
+    pub const VIEW: u64 = 1 << 12; // BTN_SELECT
+    pub const STEAM: u64 = 1 << 13; // BTN_MODE
+    pub const MENU: u64 = 1 << 14; // BTN_START
+    pub const L5: u64 = 1 << 15; // BTN_GRIPL2 (bottom left)
+    // byte 10
+    pub const R5: u64 = 1 << 16; // BTN_GRIPR2 (bottom right)
+    pub const LPAD_CLICK: u64 = 1 << 17; // BTN_THUMB
+    pub const RPAD_CLICK: u64 = 1 << 18; // BTN_THUMB2
+    pub const LPAD_TOUCH: u64 = 1 << 19; // gates ABS_HAT0
+    pub const RPAD_TOUCH: u64 = 1 << 20; // gates ABS_HAT1
+    pub const L3: u64 = 1 << 22; // BTN_THUMBL
+    // byte 11
+    pub const R3: u64 = 1 << 26; // BTN_THUMBR
+    // byte 13
+    pub const L4: u64 = 1 << 41; // BTN_GRIPL (top left)
+    pub const R4: u64 = 1 << 42; // BTN_GRIPR (top right)
     pub const LJOY_TOUCH: u64 = 1 << 46;
     pub const RJOY_TOUCH: u64 = 1 << 47;
     // byte 14
-    pub const QAM: u64 = 1 << 50; //    BTN_BASE   — quick-access (…) button
-    /// `b9.6` doubles as the mode-switch: held ~450 ms (no hidraw client) it toggles `gamepad_mode`.
+    pub const QAM: u64 = 1 << 50; // BTN_BASE
+    /// Held ~450 ms with no hidraw client toggles `gamepad_mode` (byte 9 bit 6).
     pub const STEAM_MENU_RIGHT: u64 = MENU;
 }
 
-/// Full virtual Steam Deck controller state. All analog fields are stored as the RAW little-endian
-/// report values the kernel reads (so [`serialize_deck_state`] is a pure memcpy); the kernel applies
-/// its own sign conventions on top (`ABS_Y = -raw`, etc.) — see [`SteamState::from_gamepad`].
+/// Analog fields are the raw LE values the kernel reads; it then negates Y
+/// (`ABS_Y = -raw`). [`serialize_deck_state`] is a memcpy of these.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SteamState {
-    /// Packed button bits (see [`btn`]); occupies report bytes 8..16.
+    /// Report bytes 8..16.
     pub buttons: u64,
-    /// Left / right joystick, raw s16 (report 48/50/52/54). The kernel negates the Y axes.
+    /// Report 48/50/52/54. Kernel negates Y.
     pub lx: i16,
     pub ly: i16,
     pub rx: i16,
     pub ry: i16,
-    /// Left / right analog trigger, raw u16 (report 44/46 → ABS_HAT2Y/X).
+    /// Report 44/46 → ABS_HAT2Y/X.
     pub lt: u16,
     pub rt: u16,
-    /// Left / right trackpad position, raw s16, centred 0 (report 16/18/20/22). Only surfaced by
-    /// the kernel while the matching `*PAD_TOUCH` button bit is set.
+    /// Report 16/18/20/22, centre 0. Kernel surfaces these only while `*PAD_TOUCH` is set.
     pub lpad_x: i16,
     pub lpad_y: i16,
     pub rpad_x: i16,
     pub rpad_y: i16,
     pub lpad_pressure: u16,
     pub rpad_pressure: u16,
-    /// IMU, raw s16. `accel`/`gyro` are `[X, Y, Z]`; the kernel maps them to ABS_X/Z/Y + ABS_RX/RZ/RY
-    /// (with Z/RZ negated) on the separate sensors evdev.
+    /// `[X, Y, Z]`. Kernel maps to ABS_X/Z/Y + ABS_RX/RZ/RY (Z/RZ negated)
+    /// on the sensors evdev.
     pub accel: [i16; 3],
     pub gyro: [i16; 3],
-    /// Trackpad CLICK from the rich plane ([`apply_rich`]), kept OUTSIDE `buttons` because
-    /// [`SteamControllerManager::handle`](super::super::linux::steam_controller::SteamControllerManager)
-    /// rebuilds `buttons` from the gamepad frame every tick — exactly why DualSense keeps
-    /// `touch_click` separate. Merged into the report's click bits in [`serialize_deck_state`]. The
-    /// DualSense touchpad-click WIRE button still sets `RPAD_CLICK` in `buttons` via
-    /// [`from_gamepad`](Self::from_gamepad); the two sources are OR'd at serialize, so each releases
-    /// independently (a released `BTN_TOUCHPAD` can't strand a rich click, and vice-versa).
+    /// Trackpad clicks from [`apply_rich`]. Kept out of `buttons` because
+    /// the manager rebuilds `buttons` from the gamepad frame every tick.
+    /// [`serialize_deck_state`] ORs them with `from_gamepad`'s `RPAD_CLICK`
+    /// so each source releases independently.
     pub lpad_click: bool,
     pub rpad_click: bool,
 }
 
 impl SteamState {
-    /// A fresh pad — and one that is sitting STILL, not falling.
-    ///
-    /// Acceleration is 1 g up, for the reason spelled out on [`gs::MOTION_NEUTRAL_ACCEL`]: zero is
-    /// free fall, which is a claim about the world that is never true of a controller. It is put
-    /// through [`super::steam_remap::motion_wire_to_deck`] rather than written out in Deck units,
-    /// so the neutral and every real sample can never disagree about what 1 g is — the Deck's
-    /// `hid-steam` resolution lives in exactly one place.
+    /// Still pad: 1 g up, not free-fall zeros. Routed through
+    /// [`super::steam_remap::motion_wire_to_deck`] so 1 g has one definition
+    /// ([`gs::MOTION_NEUTRAL_ACCEL`]).
     pub fn neutral() -> SteamState {
         let (_, accel) = super::steam_remap::motion_wire_to_deck([0; 3], gs::MOTION_NEUTRAL_ACCEL);
         SteamState {
@@ -183,8 +162,7 @@ impl SteamState {
         }
     }
 
-    /// Zero angular velocity, keeping acceleration (gravity is legitimately persistent) and
-    /// everything else. Returns whether anything changed — the host's idle-motion watchdog,
+    /// Zero gyro only (gravity stays). `true` if anything changed —
     /// `PadProto::neutralize_gyro`.
     pub fn neutralize_gyro(&mut self) -> bool {
         let changed = self.gyro != [0; 3];
@@ -192,10 +170,8 @@ impl SteamState {
         changed
     }
 
-    /// Reset the rich-plane fields — both trackpads' position/pressure/click, and motion — to a
-    /// fresh pad's, leaving buttons/sticks/triggers alone. `PadProto::clear_rich`: a controller
-    /// that took over this slot inside the replug grace must not inherit the last one's finger or
-    /// rotation.
+    /// Drop trackpad + motion. A pad that took this slot inside the replug
+    /// grace must not inherit the last finger or rotation (`PadProto::clear_rich`).
     pub fn clear_rich(&mut self) {
         let fresh = SteamState::neutral();
         self.lpad_x = fresh.lpad_x;
@@ -210,7 +186,6 @@ impl SteamState {
         self.accel = fresh.accel;
     }
 
-    /// Set/clear a button (or group) by its [`btn`] mask.
     pub fn press(&mut self, mask: u64, down: bool) {
         if down {
             self.buttons |= mask;
@@ -219,11 +194,9 @@ impl SteamState {
         }
     }
 
-    /// Map an `XInput`/GameStream pad frame (button bitmask + i16 sticks + u8 triggers) into the Deck
-    /// state. Sticks pass through (the kernel negates Y, which yields the conventional direction —
-    /// validated on-box); triggers scale u8 0..255 → u16 0..32767 ([`trigger_u16`]) and set the
-    /// full-pull bit when pressed. Trackpad + motion + the back grips arrive separately
-    /// ([`apply_rich`], the M3 wire).
+    /// XInput frame → Deck. Sticks pass through (kernel negates Y). Triggers
+    /// scale u8 → u16 via [`trigger_u16`] and set the full-pull bit. Trackpad
+    /// and motion arrive via [`apply_rich`].
     pub fn from_gamepad(
         buttons: u32,
         lx: i16,
@@ -266,11 +239,9 @@ impl SteamState {
         set(&mut b, on(gs::BTN_DPAD_DOWN), btn::DPAD_DOWN);
         set(&mut b, on(gs::BTN_DPAD_LEFT), btn::DPAD_LEFT);
         set(&mut b, on(gs::BTN_DPAD_RIGHT), btn::DPAD_RIGHT);
-        // The DualSense touchpad-click wire bit maps to the Deck's RIGHT pad click (the pad that
-        // stands in for the DualSense touchpad — see apply_rich).
+        // DualSense touchpad-click → Deck right-pad click (same pad apply_rich uses).
         set(&mut b, on(gs::BTN_TOUCHPAD), btn::RPAD_CLICK);
-        // Back grips (the whole reason for the Deck identity): the wire paddle bits map to the four
-        // Deck grips — PADDLE1/2/3/4 = R4/L4/R5/L5 (see `input::gamepad`); MISC1 = the QAM '…' button.
+        // PADDLE1/2/3/4 = R4/L4/R5/L5 (`input::gamepad`); MISC1 = QAM.
         set(&mut b, on(gs::BTN_PADDLE1), btn::R4);
         set(&mut b, on(gs::BTN_PADDLE2), btn::L4);
         set(&mut b, on(gs::BTN_PADDLE3), btn::R5);
@@ -280,31 +251,24 @@ impl SteamState {
         s
     }
 
-    /// Apply one rich client→host event into this state, preserving everything else. The single-pad
-    /// wire [`RichInput::Touchpad`] maps to the **right** trackpad (the Deck pad analogous to the
-    /// DualSense touchpad); the left pad arrives via the M3 `TouchpadEx` surface. [`RichInput::Motion`]
-    /// passes gyro/accel straight through (raw i16; cross-device unit scaling is M3).
-    ///
-    /// The wire's touch coordinates are SCREEN convention — +y DOWN, what SDL/Windows/Android
-    /// capture APIs all produce — but the Deck's raw trackpad fields are stick convention
-    /// (+y UP, centre origin), and Steam Input parses our report as real Deck hardware. Y is
-    /// therefore negated here, on the device boundary; leaving it through was the "both
-    /// trackpads inverted" bug the first live Deck-to-Deck session surfaced (2026-07-08).
+    /// One rich event. [`RichInput::Touchpad`] is the right pad (DualSense
+    /// analogue); left pad is [`RichInput::TouchpadEx`]. Wire Y is screen
+    /// convention (+down); Deck raw is stick convention (+up, centre origin)
+    /// so Y is negated here. Leaving it through inverts both trackpads.
     pub fn apply_rich(&mut self, rich: RichInput) {
-        /// Screen-convention (+down) wire Y → Deck raw (+up), saturating (-32768 has no i16 negation).
+        /// Screen +down → Deck +up. Saturating: `-32768` has no i16 negation.
         fn flip_y(y: i16) -> i16 {
             (y as i32).saturating_neg().clamp(-32768, 32767) as i16
         }
         match rich {
             RichInput::Touchpad { active, x, y, .. } => {
                 self.press(btn::RPAD_TOUCH, active);
-                // Normalized 0..=65535 (centre 32768, +y down) → the pad's centred s16 range (+y up).
+                // Wire 0..=65535 (centre 32768, +y down) → centred s16 (+y up).
                 self.rpad_x = ((x as i32) - 32768) as i16;
                 self.rpad_y = (32768 - (y as i32)).min(32767) as i16;
             }
             RichInput::Motion { gyro, accel, .. } => {
-                // The wire carries DualSense-convention units (what every client capture emits); the
-                // Deck's hid-steam report wants 16 LSB/°·s + 16384 LSB/g, so rescale here.
+                // Wire is DualSense units; hid-steam wants 16 LSB/°·s and 16384 LSB/g.
                 let (g, a) = super::steam_remap::motion_wire_to_deck(gyro, accel);
                 self.gyro = g;
                 self.accel = a;
@@ -317,12 +281,10 @@ impl SteamState {
                 y,
                 ..
             } => {
-                // Signed centre-0 x maps straight in; y flips to the Deck's +up. surface 1 =
-                // left pad, anything else (0 single / 2 right) = right pad.
+                // surface 1 = left pad; 0 (single) and 2 = right. Y flipped to +up.
                 if surface == 1 {
                     self.press(btn::LPAD_TOUCH, touch);
-                    // Click lives in its own field, NOT `buttons` — `handle()` rebuilds `buttons`
-                    // every gamepad frame and would otherwise wipe a held click (the bug this fixes).
+                    // Click stays out of `buttons`: `handle()` rebuilds that mask every frame.
                     self.lpad_click = click;
                     self.lpad_x = x;
                     self.lpad_y = flip_y(y);
@@ -333,15 +295,15 @@ impl SteamState {
                     self.rpad_y = flip_y(y);
                 }
             }
-            // Raw as-is passthrough reports belong to the Triton backend, never a Deck/SC state.
+            // HidReport is Triton passthrough, not Deck/SC state.
             RichInput::HidReport { .. } => {}
         }
     }
 }
 
-/// Serialize the full Deck input report (`ID_CONTROLLER_DECK_STATE`) into the 64-byte unnumbered
-/// frame `hid-steam` parses. Pure + byte-exact against `steam_do_deck_input_event`; the report-id
-/// constant is `data[0]=0x01` (NOT a HID report id — this report is unnumbered).
+/// `ID_CONTROLLER_DECK_STATE` into the unnumbered 64-byte frame
+/// `steam_do_deck_input_event` parses. `data[0]=0x01` is a message type, not
+/// a HID report id.
 pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: u32) {
     r.fill(0);
     r[0] = 0x01;
@@ -349,10 +311,9 @@ pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq
     r[2] = ID_CONTROLLER_DECK_STATE;
     r[3] = 0x3C; // payload length; the kernel ignores it
     r[4..8].copy_from_slice(&seq.to_le_bytes());
-    // Rich-plane trackpad clicks live in their own fields (see `SteamState`) so a button-only frame
-    // can't wipe them; merge them into the report's click bits here. RPAD_CLICK may ALSO come from
-    // the DualSense touchpad-click wire button via `from_gamepad` — OR both, so either source lights
-    // it and each releases independently.
+    // Rich clicks live outside `buttons` so a button-only frame cannot wipe
+    // them. OR with `from_gamepad`'s `RPAD_CLICK` so each source releases
+    // independently.
     let mut buttons = st.buttons;
     if st.lpad_click {
         buttons |= btn::LPAD_CLICK;
@@ -360,7 +321,7 @@ pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq
     if st.rpad_click {
         buttons |= btn::RPAD_CLICK;
     }
-    r[8..16].copy_from_slice(&buttons.to_le_bytes()); // bytes 8..16 (12+15 stay 0)
+    r[8..16].copy_from_slice(&buttons.to_le_bytes()); // bytes 12 and 15 stay 0
     r[16..18].copy_from_slice(&st.lpad_x.to_le_bytes());
     r[18..20].copy_from_slice(&st.lpad_y.to_le_bytes());
     r[20..22].copy_from_slice(&st.rpad_x.to_le_bytes());
@@ -371,7 +332,7 @@ pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq
     r[30..32].copy_from_slice(&st.gyro[0].to_le_bytes()); //  gyro X  → IMU ABS_RX
     r[32..34].copy_from_slice(&st.gyro[1].to_le_bytes()); //  gyro Y  → IMU ABS_RZ (kernel negates)
     r[34..36].copy_from_slice(&st.gyro[2].to_le_bytes()); //  gyro Z  → IMU ABS_RY
-                                                          // 36..44 quaternion — left 0 (optional; the kernel does not surface it)
+    // 36..44 quaternion: left 0; kernel does not surface it.
     r[44..46].copy_from_slice(&st.lt.to_le_bytes()); // left trigger  → ABS_HAT2Y
     r[46..48].copy_from_slice(&st.rt.to_le_bytes()); // right trigger → ABS_HAT2X
     r[48..50].copy_from_slice(&st.lx.to_le_bytes()); // left joystick X  → ABS_X
@@ -382,23 +343,15 @@ pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq
     r[58..60].copy_from_slice(&st.rpad_pressure.to_le_bytes());
 }
 
-/// Map an `XInput`/GameStream pad frame into **classic Steam Controller** state. The SC's 24-bit
-/// button field (report bytes 8..10) shares its low-bit layout with the Deck's (face/shoulder/
-/// trigger-full byte 8; dpad/View/Steam/Menu byte 9 bits 0–6), so this reuses the [`btn`] masks —
-/// with the SC-specific tail per the kernel's `ID_CONTROLLER_STATE` table:
-/// - `9.7`/`10.0` are the SC's TWO grips (the bit positions the Deck calls L5/R5): wire
-///   `BTN_PADDLE2`/`BTN_PADDLE1` (L4/R4, the primary pair) land there; fold PADDLE3/4 via
-///   [`super::steam_remap`] BEFORE calling this.
-/// - `10.2` = right-pad clicked (the SC has no right stick): wire `BTN_RS_CLICK` and the
-///   DualSense `BTN_TOUCHPAD` click both land there.
-/// - `10.6` = joystick clicked = wire `BTN_LS_CLICK` (the same bit the Deck calls L3).
-/// - No QAM/misc slot — `BTN_MISC1` is dropped (fold it upstream if a policy wants it).
-///
-/// The wire right STICK drives the right-pad coordinates (`rpad_x/y` + the `10.4` touched bit
-/// while deflected) — the SC's camera surface; the loss of a true second stick is inherent to
-/// the hardware. The left stick rides the joystick fields; a left-pad `TouchpadEx` contact
-/// (via [`SteamState::apply_rich`]) SHADOWS the joystick while touched (the report multiplexes
-/// them at bytes 16..20, exactly like real hardware's `lpad_touched` flag).
+/// Classic Steam Controller mapping. Low 16 button bits match the Deck;
+/// the SC tail (`steam_do_input_event`):
+/// - `9.7`/`10.0` = the two grips (Deck L5/R5). Wire `BTN_PADDLE2`/`BTN_PADDLE1`
+///   land here; fold PADDLE3/4 via [`super::steam_remap`] first.
+/// - `10.2` = right-pad click (no right stick): `BTN_RS_CLICK` and DualSense
+///   `BTN_TOUCHPAD`.
+/// - `10.6` = joystick click = `BTN_LS_CLICK` (Deck L3). No QAM slot.
+/// Right stick drives `rpad_x/y` + `10.4` while deflected. Left-pad
+/// `TouchpadEx` shadows the joystick at bytes 16..20 while touched.
 pub fn sc_from_gamepad(
     buttons: u32,
     lx: i16,
@@ -416,7 +369,6 @@ pub fn sc_from_gamepad(
         ry: 0,
         lt: trigger_u16(lt),
         rt: trigger_u16(rt),
-        // The wire right stick becomes a right-pad contact (see the doc above).
         rpad_x: rx,
         rpad_y: ry,
         ..SteamState::neutral()
@@ -442,28 +394,27 @@ pub fn sc_from_gamepad(
     set(&mut b, on(gs::BTN_DPAD_DOWN), btn::DPAD_DOWN);
     set(&mut b, on(gs::BTN_DPAD_LEFT), btn::DPAD_LEFT);
     set(&mut b, on(gs::BTN_DPAD_RIGHT), btn::DPAD_RIGHT);
-    // SC grips at the Deck's L5/R5 bit positions (9.7 / 10.0): the wire primary pair L4/R4.
-    set(&mut b, on(gs::BTN_PADDLE2), btn::L5); // left grip
-    set(&mut b, on(gs::BTN_PADDLE1), btn::R5); // right grip
-                                               // Joystick click (10.6 — the bit the Deck calls L3) + right-pad click (10.2).
+    // Grips at Deck L5/R5 (9.7 / 10.0): wire L4/R4 (PADDLE2/PADDLE1).
+    set(&mut b, on(gs::BTN_PADDLE2), btn::L5);
+    set(&mut b, on(gs::BTN_PADDLE1), btn::R5);
+    // 10.6 = joystick click (Deck L3); 10.2 = right-pad click.
     set(&mut b, on(gs::BTN_LS_CLICK), btn::L3);
     set(
         &mut b,
         on(gs::BTN_RS_CLICK) || on(gs::BTN_TOUCHPAD),
         btn::RPAD_CLICK,
     );
-    // Right-pad touched (10.4) while the wire stick is deflected — the coords are live then.
+    // 10.4 while the stick is deflected (coords are live then).
     set(&mut b, rx != 0 || ry != 0, btn::RPAD_TOUCH);
     s.buttons = b;
     s
 }
 
-/// Serialize the classic Steam Controller input report (`ID_CONTROLLER_STATE`) into the 64-byte
-/// unnumbered frame `steam_do_input_event` parses. Byte-exact against the kernel's message
-/// table: 24-bit buttons at 8..11, **u8** triggers at 11/12 (the Deck uses u16 at 44/46),
-/// the joystick/left-pad MULTIPLEX at 16..20 (left-pad coords shadow the joystick while the
-/// `10.3` touched bit is set), the right pad at 20..24, and the (kernel-ignored, hidraw-visible)
-/// accel/gyro at 28..39. The kernel negates both Y axes on top of these raw values.
+/// `ID_CONTROLLER_STATE` into the unnumbered 64-byte frame
+/// `steam_do_input_event` parses. 24-bit buttons at 8..11, **u8** triggers
+/// at 11/12 (Deck uses u16 at 44/46), joystick/left-pad multiplex at 16..20
+/// (`10.3` touched → left-pad coords), right pad at 20..24. Accel/gyro at
+/// 28..39 is hidraw-only. Kernel negates both Y axes.
 pub fn serialize_sc_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: u32) {
     r.fill(0);
     r[0] = 0x01;
@@ -471,8 +422,7 @@ pub fn serialize_sc_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: 
     r[2] = ID_CONTROLLER_STATE;
     r[3] = 0x3C;
     r[4..8].copy_from_slice(&seq.to_le_bytes());
-    // Rich-plane pad clicks merge like the Deck path: left-pad clicked = 10.1 (hidraw-only —
-    // the kernel maps no key to it), right-pad clicked = 10.2.
+    // Merge rich clicks: 10.1 left (hidraw-only; no kernel key), 10.2 right.
     let mut buttons = st.buttons;
     if st.lpad_click {
         buttons |= btn::LPAD_CLICK;
@@ -483,9 +433,9 @@ pub fn serialize_sc_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: 
     r[8] = (buttons & 0xFF) as u8;
     r[9] = ((buttons >> 8) & 0xFF) as u8;
     r[10] = ((buttons >> 16) & 0xFF) as u8;
-    r[11] = (st.lt >> 7).min(255) as u8; // left trigger, u8
-    r[12] = (st.rt >> 7).min(255) as u8; // right trigger, u8
-                                         // Bytes 16..20 carry EITHER the joystick OR the left pad, per the 10.3 touched bit.
+    r[11] = (st.lt >> 7).min(255) as u8; // u8; Deck uses u16 at 44/46
+    r[12] = (st.rt >> 7).min(255) as u8;
+    // 16..20: left pad if `10.3`, else joystick.
     let (x, y) = if buttons & btn::LPAD_TOUCH != 0 {
         (st.lpad_x, st.lpad_y)
     } else {
@@ -495,8 +445,7 @@ pub fn serialize_sc_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: 
     r[18..20].copy_from_slice(&y.to_le_bytes());
     r[20..22].copy_from_slice(&st.rpad_x.to_le_bytes());
     r[22..24].copy_from_slice(&st.rpad_y.to_le_bytes());
-    // IMU: present in the frame (28..39) for hidraw readers, but the kernel maps none of it
-    // ("accelerator/gyro is disabled by default" — no sensors evdev for the SC).
+    // 28..39 IMU for hidraw; kernel maps none (no SC sensors evdev).
     r[28..30].copy_from_slice(&st.accel[0].to_le_bytes());
     r[30..32].copy_from_slice(&st.accel[1].to_le_bytes());
     r[32..34].copy_from_slice(&st.accel[2].to_le_bytes());
@@ -505,30 +454,23 @@ pub fn serialize_sc_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: 
     r[38..40].copy_from_slice(&st.gyro[2].to_le_bytes());
 }
 
-/// Scale a wire trigger (u8 `0..=255`) onto the Deck's full axis (u16 `0..=32767`).
-///
-/// This was `v * 128`, which tops out at 32640 — a fully-pulled trigger reported 99.6% and the top
-/// 127 counts of the declared range were unreachable, so a game reading the axis could never see a
-/// true full pull. One multiply gets both ends exact (`0 → 0`, `255 → 32767`) and stays monotonic.
-///
-/// `serialize_report`'s inverse (`>> 7`, for the legacy u8 trigger bytes) still round-trips both
-/// ends against this: `32767 >> 7 == 255`.
+/// Wire u8 `0..=255` → Deck u16 `0..=32767`. `v * 128` tops out at 32640
+/// (full pull never reaches the declared max). Inverse `>> 7` still
+/// round-trips: `32767 >> 7 == 255`.
 fn trigger_u16(v: u8) -> u16 {
     ((v as u32 * 32767) / 255) as u16
 }
 
-/// Build the `steam_get_serial` GET_REPORT reply. The Steam feature path is report-id-0 with a
-/// leading report-id byte the kernel strips (`steam_recv_report` does `memcpy(data, buf+1, …)`), so
-/// the wire is `[0x00, 0xAE, len, 0x01, ascii…]`; the kernel then validates `reply[0]==0xAE`,
-/// `1<=reply[1]<=21`, `reply[2]==0x01`. Non-fatal (a bad reply → the `"XXXXXXXXXX"` fallback).
+/// `steam_get_serial` GET_REPORT. Feature reports are report-id 0 with a
+/// leading byte the kernel strips (`steam_recv_report` copies `buf+1`), so
+/// the wire is `[0x00, 0xAE, len, 0x01, ascii…]`. Kernel checks
+/// `reply[0]==0xAE`, `1<=reply[1]<=21`, `reply[2]==0x01`; else `"XXXXXXXXXX"`.
 pub fn serial_reply(serial: &str) -> [u8; STEAM_REPORT_LEN] {
     let mut buf = [0u8; STEAM_REPORT_LEN];
     let bytes = serial.as_bytes();
-    // `min`, not `clamp(1, 21)`. Clamping the LOW end to 1 and then slicing `bytes[..len]` asks a
-    // zero-byte slice for one byte, which panics — on the service thread, for an input the kernel
-    // already has a graceful answer to. Reporting the true length lets its own validation
-    // (`1 <= reply[1] <= 21`) reject an empty serial and fall back to "XXXXXXXXXX", which is the
-    // documented behaviour for a reply it does not like.
+    // `min`, not `clamp(1, 21)`: clamp then `bytes[..len]` panics on empty
+    // (service thread). A zero length lets the kernel reject and fall back
+    // to `"XXXXXXXXXX"`.
     let len = bytes.len().min(21);
     buf[0] = 0x00; // report id 0 — stripped by steam_recv_report
     buf[1] = ID_GET_STRING_ATTRIBUTE;
@@ -538,82 +480,68 @@ pub fn serial_reply(serial: &str) -> [u8; STEAM_REPORT_LEN] {
     buf
 }
 
-/// One service pass's extracted feedback. Rumble rides the universal 0xCA plane (so any client
-/// feels it); the classic SC's trackpad-pulse haptics (`0x8F`) are a later, model-specific add.
+/// Rumble on the 0xCA plane. Classic SC trackpad pulses (`0x8F`) are not
+/// parsed here.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct SteamFeedback {
-    /// `(low, high)` motor levels (left/strong, right/weak), if a rumble report carried them.
+    /// `(low, high)` = left/strong, right/weak.
     pub rumble: Option<(u16, u16)>,
 }
 
-/// Parse a feature/output report the kernel wrote to our device. The Steam feedback path is a
-/// FEATURE `SET_REPORT` whose wire data is `[0x00 report-id, cmd, len, …]`; `cmd == 0xEB`
-/// (`steam_haptic_rumble`) carries `[…, 0, intensity(2), left_speed(2), right_speed(2), gains(2)]`.
-/// We surface `(left_speed, right_speed)` as `(low, high)` for the 0xCA rumble plane.
+/// FEATURE `SET_REPORT` `[0x00, cmd, len, …]`. `0xEB` (`steam_haptic_rumble`)
+/// is `[…, 0, intensity(2), left_speed(2), right_speed(2), gains(2)]`;
+/// surfaced as `(low, high)` on the 0xCA plane.
 pub fn parse_steam_output(data: &[u8]) -> SteamFeedback {
     let mut fb = SteamFeedback::default();
-    // data[0] is the stripped report-id byte (0); the command id follows.
+    // data[0] is report-id 0 (still present); command id is data[1].
     if data.len() >= 10 && data[1] == ID_TRIGGER_RUMBLE_CMD {
         let le = |o: usize| u16::from_le_bytes([data[o], data[o + 1]]);
-        let left = le(6); // left_speed  (report[5..7])  → low / strong motor
-        let right = le(8); // right_speed (report[7..9]) → high / weak motor
+        let left = le(6); // left_speed → low/strong
+        let right = le(8); // right_speed → high/weak
         fb.rumble = Some((left, right));
     }
     fb
 }
 
-// ===========================================================================================
-// Real-USB Deck device contract (the gadget + usbip transports present a *real* 3-interface USB
-// Deck so Steam Input promotes it; the UHID path above uses the minimal [`STEAMDECK_RDESC`]).
-//
-// These descriptors are captured verbatim from a physical Steam Deck (28DE:1205): mouse =
-// interface 0, keyboard = interface 1, **controller = interface 2** (the interface number Steam's
-// own driver filters on — the reason a UHID Deck, `Interface: -1`, is never promoted). The
-// `0x83`/`0xAE` feature contract is what stops Steam re-probing (the gamepad-evdev churn). Shared
-// by [`super::super::steam_gadget`] (raw_gadget) and [`super::super::steam_usbip`] (usbip/vhci).
-// ===========================================================================================
+// Real-USB Deck (gadget + usbip): captured 3-interface descriptors so Steam
+// Input promotes the device. UHID uses [`STEAMDECK_RDESC`] (`Interface: -1`
+// is never promoted). Controller is interface 2 — Steam's driver filters on
+// that number. Shared by steam_gadget and steam_usbip.
 
-/// Captured Deck **mouse** report descriptor (interface 0, EP 0x81).
+/// Interface 0, EP 0x81 (captured mouse).
 #[rustfmt::skip]
 pub const RDESC_DECK_MOUSE: &[u8] = &[
     0x05,0x01,0x09,0x02,0xa1,0x01,0x09,0x01,0xa1,0x00,0x05,0x09,0x19,0x01,0x29,0x02,
     0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x02,0x81,0x02,0x75,0x06,0x95,0x01,0x81,0x01,
     0x05,0x01,0x09,0x30,0x09,0x31,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x02,0x81,0x06,
     0x95,0x01,0x09,0x38,0x81,0x06,0x05,0x0c,0x0a,0x38,0x02,0x95,0x01,0x81,0x06,0xc0,0xc0];
-/// Captured Deck **keyboard** (boot) report descriptor (interface 1, EP 0x82).
+/// Interface 1, EP 0x82 (captured boot keyboard).
 #[rustfmt::skip]
 pub const RDESC_DECK_KBD: &[u8] = &[
     0x05,0x01,0x09,0x06,0xa1,0x01,0x05,0x07,0x19,0xe0,0x29,0xe7,0x15,0x00,0x25,0x01,
     0x75,0x01,0x95,0x08,0x81,0x02,0x81,0x01,0x19,0x00,0x29,0x65,0x15,0x00,0x25,0x65,
     0x75,0x08,0x95,0x06,0x81,0x00,0xc0];
-/// Captured Deck **controller** report descriptor (interface 2, EP 0x83; Usage Page `0xFFFF`,
-/// `bCountryCode 33`). The vendor-defined report the `hid-steam` driver binds.
+/// Interface 2, EP 0x83 (Usage Page `0xFFFF`, `bCountryCode 33`). Steam filters on this interface.
 #[rustfmt::skip]
 pub const RDESC_DECK_CTRL: &[u8] = &[
     0x06,0xff,0xff,0x09,0x01,0xa1,0x01,0x09,0x02,0x09,0x03,0x15,0x00,0x26,0xff,0x00,
     0x75,0x08,0x95,0x40,0x81,0x02,0x09,0x06,0x09,0x07,0x15,0x00,0x26,0xff,0x00,0x75,
     0x08,0x95,0x40,0xb1,0x02,0xc0];
 
-/// Per-instance Deck unit id stamped into the `0x83` GET_ATTRIBUTES device-id attrs (`0x0a`/`0x04`)
-/// so a virtual Deck never collides with a real one or another instance. `"PF"` high word + index.
+/// Stamped into `0x83` attrs `0x0a`/`0x04`. High word is `"PF"` (`0x5046`)
+/// plus index so two virtual Decks never collide.
 pub fn deck_unit_id(index: u8) -> u32 {
     0x5046_0000 | index as u32
 }
 
-/// A Steam-accepted alphanumeric unit serial (a real Deck's is e.g. `"FVZZ4200469B"`). Steam
-/// validates the serial's FORMAT before accepting it: a `"PF"`-leading serial is REJECTED
-/// ("Invalid or missing unit serial number …") and Steam then substitutes a hash AND mangles the
-/// displayed controller name (observed as "Steam Deck Controllerggg" on Windows). An `'F'`-leading
-/// serial passes, so we keep the PunktFunk marker one slot in (`"FVPF"`) — still distinct from a
-/// real Deck's `"FVZZ"` for the self-detection below while satisfying Steam's format check.
-/// Derived from [`deck_unit_id`] so the `0xAE` serial reply and the `0x83` unit-id attrs stay
-/// consistent. (The Windows UMDF driver mirrors this exact format — see pf-gamepad lib.rs.)
+/// Steam rejects a `"PF"`-leading serial and substitutes a hash. `'F'`-leading
+/// passes, so the marker sits one slot in (`"FVPF"`) — distinct from a real
+/// Deck `"FVZZ"`. Derived from [`deck_unit_id`] so `0xAE` and `0x83` agree.
 pub fn deck_serial(index: u8) -> String {
     format!("FVPF{:08X}", deck_unit_id(index))
 }
 
-/// The neutral 64-byte Deck input report (header only, all controls released) — the report the
-/// real-USB transports stream until the first [`serialize_deck_state`] call updates it.
+/// Header only (controls released). Real-USB transports stream this until the first [`serialize_deck_state`].
 pub fn neutral_deck_report() -> [u8; STEAM_REPORT_LEN] {
     let mut r = [0u8; STEAM_REPORT_LEN];
     r[0] = 0x01;
@@ -622,21 +550,17 @@ pub fn neutral_deck_report() -> [u8; STEAM_REPORT_LEN] {
     r
 }
 
-/// Build the HID feature GET_REPORT reply for the host's last SET_REPORT command, for the *real-USB*
-/// Deck (gadget + usbip). Steam's `GetControllerInfo` reads the `0x83` attributes + the `0xAE`
-/// serial; **serving the real `0x83` blob is what stops Steam re-probing** (the gamepad-evdev churn).
-/// The 9-attribute `0x83` layout + the `0xAE` string format were captured from a physical Deck via
-/// hidraw. `unit_id` (see [`deck_unit_id`]) stamps a per-instance value into the device-id attrs.
-///
-/// Note this is the raw 64-byte EP0 feature payload (command id first, no report-id prefix) — the USB
-/// control path, distinct from [`serial_reply`] which carries the UHID report-id byte the kernel
-/// strips.
+/// HID feature GET_REPORT for the real-USB Deck (gadget + usbip). Serving
+/// the real `0x83` blob stops Steam re-probing (gamepad-evdev churn).
+/// Raw 64-byte EP0 payload (command id first, no report-id prefix) —
+/// unlike [`serial_reply`], which carries the UHID report-id the kernel
+/// strips. `unit_id` stamps [`deck_unit_id`] into the device-id attrs.
 pub fn feature_reply(last_set: &[u8], serial: &str, unit_id: u32) -> [u8; STEAM_REPORT_LEN] {
     let cmd = last_set.first().copied().unwrap_or(ID_GET_STRING_ATTRIBUTE);
     let mut r = [0u8; STEAM_REPORT_LEN];
     match cmd {
         ID_GET_ATTRIBUTES_VALUES => {
-            // GET_ATTRIBUTES_VALUES: [0x83, 0x2d, then 9× (attr-id, value u32-LE)].
+            // [0x83, 0x2d, then 9 × (attr-id, u32-LE)].
             r[0] = ID_GET_ATTRIBUTES_VALUES;
             r[1] = 0x2d;
             let attrs: [(u8, u32); 9] = [
@@ -658,8 +582,8 @@ pub fn feature_reply(last_set: &[u8], serial: &str, unit_id: u32) -> [u8; STEAM_
             }
         }
         ID_GET_STRING_ATTRIBUTE => {
-            // GET_STRING_ATTRIBUTE: [0xAE, len, attr, ascii…]. The kernel validates the serial (attr
-            // 0x01) wants reply[2]==0x01 and 1<=len<=21; for other attrs we echo the requested id.
+            // [0xAE, len, attr, ascii…]. Serial (attr 0x01) wants
+            // `reply[2]==0x01` and `1<=len<=21`; other attrs echo the id.
             let attr = last_set.get(2).copied().unwrap_or(ATTRIB_STR_UNIT_SERIAL);
             let b = serial.as_bytes();
             let len = b.len().clamp(1, 20);
@@ -669,7 +593,7 @@ pub fn feature_reply(last_set: &[u8], serial: &str, unit_id: u32) -> [u8; STEAM_
             r[3..3 + len].copy_from_slice(&b[..len]);
         }
         _ => {
-            // Settings read-back (e.g. 0x87): echo the host's last command + data.
+            // Unknown cmd (e.g. 0x87 settings): echo last SET_REPORT.
             let n = last_set.len().min(STEAM_REPORT_LEN);
             r[..n].copy_from_slice(&last_set[..n]);
         }
@@ -695,9 +619,8 @@ mod tests {
         );
     }
 
-    /// Every analog field lands at the exact offset `steam_do_deck_input_event` reads, the header is
-    /// what `steam_raw_event` requires, and the buttons pack into bytes 8..16 (12+15 zero). A
-    /// one-byte slip here turns the whole controller into noise.
+    /// Offsets match `steam_do_deck_input_event`; buttons pack into 8..16
+    /// (12+15 zero). A one-byte slip is noise.
     #[test]
     fn serialize_is_byte_exact() {
         let mut st = SteamState::neutral();
@@ -719,8 +642,8 @@ mod tests {
         let mut r = [0u8; STEAM_REPORT_LEN];
         serialize_deck_state(&mut r, &st, 0xAABB_CCDD);
         assert_eq!(&r[0..4], &[0x01, 0x00, 0x09, 0x3C]);
-        assert_eq!(&r[4..8], &[0xDD, 0xCC, 0xBB, 0xAA]); // seq LE
-                                                         // buttons: A=bit7 (byte8), L4=bit41 (byte13.1), R5=bit16 (byte10.0), QAM=bit50 (byte14.2).
+        assert_eq!(&r[4..8], &[0xDD, 0xCC, 0xBB, 0xAA]);
+        // A=bit7 (byte8), L4=bit41 (byte13.1), R5=bit16 (byte10.0), QAM=bit50 (byte14.2).
         assert_eq!(r[8], 0x80); // A
         assert_eq!(r[10], 0x01); // R5
         assert_eq!(r[12], 0x00); // unused button byte
@@ -742,8 +665,6 @@ mod tests {
         assert_eq!(&r[58..60], &0x1516u16.to_le_bytes()); // right pad pressure
     }
 
-    /// `from_gamepad` sets the right Deck bits + scales triggers, and a touched flag is merged when
-    /// a trackpad contact arrives via `apply_rich`.
     #[test]
     fn from_gamepad_and_rich_mapping() {
         let s = SteamState::from_gamepad(
@@ -774,9 +695,8 @@ mod tests {
         });
         assert_ne!(s.buttons & btn::RPAD_TOUCH, 0);
         assert_eq!(s.rpad_x, 32767); // 65535-32768
-        assert_eq!(s.rpad_y, 32767); // wire y=0 = TOP (screen conv) → Deck raw +up (clamped)
-                                     // Motion is rescaled from the wire (DualSense) convention into Deck units (gyro ×16/20,
-                                     // accel ×16384/10000) — see steam_remap::motion_wire_to_deck.
+        assert_eq!(s.rpad_y, 32767); // wire y=0 top (screen) → Deck +up
+        // DualSense → Deck: gyro ×16/20, accel ×16384/10000.
         s.apply_rich(RichInput::Motion {
             pad: 0,
             gyro: [1000, -2000, 0],
@@ -786,9 +706,9 @@ mod tests {
         assert_eq!(s.accel, [16384, -8192, 0]);
     }
 
-    /// An empty serial must not panic. `clamp(1, 21)` asked a zero-byte slice for one byte, which
-    /// is an out-of-range slice index — on the service thread. The kernel rejects a zero length by
-    /// its own rule (`1 <= reply[1] <= 21`) and falls back, which is the graceful answer.
+    /// Empty serial must not panic. `clamp(1, 21)` then `bytes[..len]`
+    /// indexes a zero-length slice on the service thread. Kernel rejects
+    /// `len==0` and falls back.
     #[test]
     fn empty_serial_reply_does_not_panic() {
         let r = serial_reply("");
@@ -798,7 +718,6 @@ mod tests {
             "length the kernel will reject, rather than a panic"
         );
 
-        // Normal and over-long serials still behave.
         let r = serial_reply("ABC123");
         assert_eq!(r[2], 6);
         assert_eq!(&r[4..10], b"ABC123");
@@ -810,9 +729,8 @@ mod tests {
         );
     }
 
-    /// M3: the wire back-button bits map to the four Deck grips + QAM, and `TouchpadEx` routes the
-    /// left / right surfaces to the matching pad (x passes straight through; y flips from the
-    /// wire's screen convention (+down) to the Deck's raw +up — the live-verified direction).
+    /// Paddle bits → four grips + QAM. `TouchpadEx` x passes through; y
+    /// flips screen +down → Deck +up.
     #[test]
     fn back_buttons_and_dual_trackpad_mapping() {
         let s = SteamState::from_gamepad(
@@ -842,7 +760,7 @@ mod tests {
             pressure: 100,
         });
         assert_ne!(s.buttons & btn::LPAD_TOUCH, 0);
-        // Click now rides its own field (kept OUT of `buttons`, which handle() rebuilds each frame).
+        // Click is its own field; `handle()` rebuilds `buttons` each frame.
         assert!(s.lpad_click);
         assert_eq!(s.buttons & btn::LPAD_CLICK, 0);
         assert_eq!((s.lpad_x, s.lpad_y), (-5000, -6000));
@@ -857,10 +775,10 @@ mod tests {
             pressure: 0,
         });
         assert_ne!(s.buttons & btn::RPAD_TOUCH, 0);
-        assert!(!s.rpad_click); // click:false → field cleared
+        assert!(!s.rpad_click);
         assert_eq!((s.rpad_x, s.rpad_y), (7000, 8000));
 
-        // The i16 edge: wire y = -32768 (top-most) must clamp, not overflow.
+        // Wire y = -32768 must clamp, not overflow.
         s.apply_rich(RichInput::TouchpadEx {
             pad: 0,
             surface: 2,
@@ -874,9 +792,8 @@ mod tests {
         assert_eq!(s.rpad_y, 32767);
     }
 
-    /// Regression (G2): a held trackpad click set on the rich plane must survive the per-frame
-    /// `buttons` rebuild that `SteamControllerManager::handle` performs via `from_gamepad`. Before
-    /// the fix, click lived in `buttons` and the rebuild wiped it every gamepad frame.
+    /// Rich-plane click must survive `handle`'s per-frame `from_gamepad`
+    /// rebuild of `buttons`.
     #[test]
     fn rich_click_survives_a_buttons_rebuild() {
         let mut held = SteamState::neutral();
@@ -891,24 +808,20 @@ mod tests {
             pressure: 0,
         });
         assert!(held.lpad_click);
-        // A following button-only frame: from_gamepad rebuilds buttons (dropping the click bit),
-        // then handle() carries the rich fields over — the click must still reach the report.
+        // Button-only frame rebuilds `buttons`; handle() must still carry the click.
         let mut merged = SteamState::from_gamepad(0, 0, 0, 0, 0, 0, 0);
-        assert_eq!(merged.buttons & btn::LPAD_CLICK, 0); // the rebuild alone loses it (the old bug)
-        merged.lpad_click = held.lpad_click; // what handle() now preserves
+        assert_eq!(merged.buttons & btn::LPAD_CLICK, 0); // rebuild alone drops the bit
+        merged.lpad_click = held.lpad_click; // what handle() copies across
         let mut r = [0u8; STEAM_REPORT_LEN];
         serialize_deck_state(&mut r, &merged, 0);
         let serialized = u64::from_le_bytes(r[8..16].try_into().unwrap());
-        assert_ne!(serialized & btn::LPAD_CLICK, 0); // click lands in the report despite the rebuild
+        assert_ne!(serialized & btn::LPAD_CLICK, 0);
     }
 
-    /// The classic-SC frame, byte-exact against the kernel's `ID_CONTROLLER_STATE` table: 24-bit
-    /// buttons at 8..11, u8 triggers at 11/12, the joystick/left-pad multiplex at 16..20, right
-    /// pad at 20..24 — and the SC-specific button tail (grips at 9.7/10.0, right-pad click at
-    /// 10.2, joystick click at 10.6).
+    /// SC frame vs `ID_CONTROLLER_STATE`: 24-bit buttons, u8 triggers,
+    /// joystick/left-pad multiplex, SC button tail (9.7/10.0/10.2/10.6).
     #[test]
     fn sc_serialize_and_mapping() {
-        // Full mapping: face + grips + clicks + a deflected right stick.
         let s = sc_from_gamepad(
             gs::BTN_A | gs::BTN_PADDLE1 | gs::BTN_PADDLE2 | gs::BTN_LS_CLICK | gs::BTN_RS_CLICK,
             1000,
@@ -943,8 +856,7 @@ mod tests {
         assert_eq!(&r[20..22], &3000i16.to_le_bytes()); // right pad X
         assert_eq!(&r[22..24], &(-4000i16).to_le_bytes());
 
-        // Left-pad multiplex: a TouchpadEx surface-1 contact shadows the joystick at 16..20
-        // and sets the 10.3 touched bit (+ the 10.1 click bit from the rich field).
+        // Surface-1 contact shadows joystick at 16..20 and sets 10.3 (+ 10.1 click).
         let mut s = sc_from_gamepad(0, 1234, 0, 0, 0, 0, 0);
         s.apply_rich(RichInput::TouchpadEx {
             pad: 0,
@@ -964,8 +876,8 @@ mod tests {
         assert_eq!(&r[18..20], &(-6000i16).to_le_bytes()); // screen +down → raw +up (flip)
     }
 
-    /// The serial reply carries the leading report-id byte the kernel strips, so the *stripped*
-    /// view (`reply[1..]`) is what `steam_get_serial` validates: `[0xAE, len, 0x01, ascii…]`.
+    /// Leading report-id byte the kernel strips; `reply[1..]` is what
+    /// `steam_get_serial` validates: `[0xAE, len, 0x01, ascii…]`.
     #[test]
     fn serial_reply_has_stripped_prefix() {
         let r = serial_reply("PUNKTFUNK01");
@@ -976,7 +888,6 @@ mod tests {
         assert_eq!(&r[4..4 + r[2] as usize], b"PUNKTFUNK01");
     }
 
-    /// A `0xEB` rumble feature report parses to `(left_speed, right_speed)`; other commands don't.
     #[test]
     fn parse_rumble_feedback() {
         // [report-id 0, 0xEB, len 9, 0, intensity(2), left(2), right(2), gains(2)]
@@ -992,10 +903,8 @@ mod tests {
         assert_eq!(parse_steam_output(&d).rumble, None);
     }
 
-    /// The shared real-USB Deck feature contract (gadget + usbip): the `0x83` GET_ATTRIBUTES reply
-    /// carries the 9-attribute blob with the per-instance unit id, and the `0xAE` reply carries the
-    /// Steam-accepted serial — both keyed off the host's last SET_REPORT command. A slip here is the
-    /// gamepad-evdev churn (Steam re-probing).
+    /// Real-USB `0x83` attrs carry the per-instance unit id; `0xAE` carries
+    /// the Steam-accepted serial. A slip is Steam re-probing.
     #[test]
     fn deck_feature_reply_contract() {
         let serial = deck_serial(0);
@@ -1025,7 +934,6 @@ mod tests {
         assert_eq!(r[2], ATTRIB_STR_UNIT_SERIAL);
         assert_eq!(&r[3..3 + serial.len()], serial.as_bytes());
 
-        // Distinct pad indices get distinct unit ids + serials (no collision between virtual Decks).
         assert_ne!(deck_unit_id(0), deck_unit_id(1));
         assert_ne!(deck_serial(0), deck_serial(1));
     }

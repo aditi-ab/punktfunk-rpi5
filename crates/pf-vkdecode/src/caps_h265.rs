@@ -1,22 +1,15 @@
 //! H.265 decode capability query + derivation — [`crate::caps`] one codec over.
 //!
-//! Same split as the H.264 side: `query_h265_caps` is the one THIN function that
-//! talks to the driver and only COPIES facts into [`RawH265Caps`];
-//! [`derive_caps_h265`] is pure over a hand-buildable struct and shares the whole
-//! coincide/distinct/layered decision table with H.264 (`derive_arrangement`, in
-//! [`crate::caps`]).
+//! [`query_h265_caps`] talks to the driver and only copies facts into
+//! [`RawH265Caps`]. [`derive_caps_h265`] is pure over that struct and shares the
+//! coincide/distinct/layered table (`derive_arrangement` in [`crate::caps`]).
 //!
-//! What H.265 adds is that the PICTURE FORMAT is no longer a constant. An H.264
-//! session in this program is 8-bit 4:2:0 by envelope, so NV12 is a compile-time
-//! fact; an H.265 stream carries its own chroma format and bit depth in the SPS
-//! (Main → NV12, Main 10 → P010, RExt 4:4:4 → the two-plane 4:4:4 formats), and
-//! those SAME facts must also be stated in the `VkVideoProfileInfoKHR` the session,
-//! images, buffers and query pool are all created against. Both therefore come off
-//! one [`H265ProfileKey`] built from the stream, and a device that cannot host the
-//! combination is refused BEFORE a session exists — the established
-//! pre-session-refusal posture (the Intel `DST|SAMPLED`-without-`SAMPLED` case):
-//! the ladder demotes to the next decoder rung with a named reason rather than
-//! creating images the driver never advertised.
+//! Picture format is the stream's, not a constant. SPS chroma and bit depth
+//! (Main → NV12, Main 10 → P010, RExt 4:4:4 → the two-plane 4:4:4 formats) also
+//! fill the `VkVideoProfileInfoKHR` every session object is created against.
+//! Both come from one [`H265ProfileKey`]. A device that cannot host the
+//! combination is refused before a session exists, so the ladder demotes with a
+//! named reason rather than creating images the driver never advertised.
 
 use ash::vk;
 use ash::vk::native as hh;
@@ -38,16 +31,14 @@ use crate::device::DecodeDevice;
 use crate::params_h265::profile_to_std;
 use crate::params_h265::H265ParamsError;
 
-/// The stream facts that identify an H.265 decode profile, as Vulkan states them.
+/// Stream facts that fill `VkVideoProfileInfoKHR`.
 ///
-/// Every one of these is a `VkVideoProfileInfoKHR` field, and profile identity in
-/// Vulkan is BY VALUE across the caps query, the session, every profile-listed
-/// image/buffer and the query pool — so this small `Copy` key is what gets passed
-/// around, and each consumer rebuilds a structurally identical chain from it.
+/// Profile identity in Vulkan is by value across the caps query, the session,
+/// every profile-listed image/buffer and the query pool. Each consumer rebuilds
+/// a structurally identical chain from this `Copy` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct H265ProfileKey {
-    /// `StdVideoH265ProfileIdc`: Main (1), Main 10 (2), Main Still Picture (3),
-    /// Format Range Extensions (4) — the four Vulkan expresses.
+    /// The four Vulkan expresses: Main (1), Main 10 (2), Main Still Picture (3), RExt (4).
     pub std_profile_idc: hh::StdVideoH265ProfileIdc,
     pub chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR,
     pub luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR,
@@ -55,17 +46,13 @@ pub struct H265ProfileKey {
 }
 
 impl H265ProfileKey {
-    /// Build the key from one picture's stream facts (the SPS's
-    /// `general_profile_idc`, `chroma_format_idc`, `separate_colour_plane_flag`
-    /// and the two `bit_depth_*_minus8`).
+    /// Build the key from one picture's SPS facts.
     ///
-    /// The envelope gate is the SAME one [`crate::params_h265`] applies to the SPS
-    /// — 4:2:0 or 4:4:4, no separate colour planes, 8 or 10 bits, luma depth ==
-    /// chroma depth — restated here because the profile must be built BEFORE any
-    /// parameter-set conversion runs (the caps query needs it), and a profile that
-    /// disagreed with the converted SPS would be a half-truth handed to the
-    /// driver. Restated in FULL, deliberately: this is a `pub` entry point, and a
-    /// gate that is "the same one, minus a clause" is how the two drift apart.
+    /// The envelope is the same gate [`crate::params_h265`] applies — 4:2:0 or
+    /// 4:4:4, no separate colour planes, 8 or 10 bits, luma depth == chroma depth
+    /// — because the caps query needs a profile before any parameter-set
+    /// conversion runs. A narrower copy here would drift and hand the driver a
+    /// profile the SPS cannot match.
     pub fn from_stream(
         general_profile_idc: u8,
         chroma_format_idc: u8,
@@ -82,9 +69,8 @@ impl H265ProfileKey {
             }
             other => return Err(H265ParamsError::InvalidChromaFormatIdc(other)),
         };
-        // 4:4:4 with separate colour planes is ChromaArrayType 0 in disguise —
-        // three monochrome-coded planes — and `TYPE_444` in the profile would be a
-        // straight lie to the driver about what the bitstream contains.
+        // 4:4:4 with separate colour planes is ChromaArrayType 0: three
+        // monochrome planes. `TYPE_444` would mis-state the bitstream.
         if chroma_format_idc == 3 && separate_colour_plane_flag {
             return Err(H265ParamsError::SeparateColourPlanes);
         }
@@ -109,18 +95,13 @@ impl H265ProfileKey {
         })
     }
 
-    /// The key for a stream whose (chroma format, bit depth) the SESSION already
-    /// negotiated but whose SPS has not arrived yet — the construction-time probe's
-    /// entry point ([`crate::VkH265Decoder::probe_stream_support`]).
+    /// Key for a stream whose chroma/depth the session already negotiated, before
+    /// any SPS ([`crate::VkH265Decoder::probe_stream_support`]).
     ///
-    /// The profile idc is the one thing the negotiation does not carry, so it is
-    /// derived from the pair: 4:2:0 8-bit → Main, 4:2:0 10-bit → Main 10, 4:4:4 →
-    /// Format Range Extensions (4:4:4 is only expressible in RExt, so that leg is
-    /// exact — and it is the leg the probe exists for). A stream that turns out to
-    /// carry a DIFFERENT profile idc for the same pair (RExt 4:2:0, say) simply
-    /// re-queries under its real key at the first AU: [`Self::from_stream`] stays
-    /// the authority once the SPS is in hand, and this one never widens what that
-    /// gate admits — every combination it cannot express is refused here too.
+    /// Profile idc is not in that pair, so it is derived: 4:2:0 8-bit → Main,
+    /// 4:2:0 10-bit → Main 10, 4:4:4 → RExt (4:4:4 is only RExt). Once an SPS
+    /// arrives, [`Self::from_stream`] is the authority; this path never admits a
+    /// combination that gate refuses.
     pub fn from_negotiated(
         chroma_format_idc: u8,
         bit_depth_luma_minus8: u8,
@@ -129,8 +110,8 @@ impl H265ProfileKey {
             (1, 0) => 1,
             (1, 2) => 2,
             (3, _) => 4,
-            // Everything else is outside the envelope; hand it to `from_stream`
-            // with a profile that cannot rescue it so ONE gate produces the error.
+            // Outside the envelope: a profile idc that cannot rescue it, so
+            // `from_stream` is the one gate that produces the error.
             _ => 4,
         };
         Self::from_stream(
@@ -142,9 +123,7 @@ impl H265ProfileKey {
         )
     }
 
-    /// The picture format a session on this profile decodes to, or `None` for a
-    /// combination outside the envelope (unreachable off [`Self::from_stream`],
-    /// which already gated it).
+    /// `None` is outside the envelope [`Self::from_stream`] already refused.
     pub fn output_format(&self) -> Option<vk::Format> {
         let ten_bit = self.luma_bit_depth == vk::VideoComponentBitDepthFlagsKHR::TYPE_10;
         if self.chroma_subsampling == vk::VideoChromaSubsamplingFlagsKHR::TYPE_420 {
@@ -157,8 +136,7 @@ impl H265ProfileKey {
     }
 }
 
-/// The picture format for one stream's (chroma format, bit depth) pair — the same
-/// mapping [`H265ProfileKey::output_format`] applies, reachable without a key.
+/// Same mapping as [`H265ProfileKey::output_format`], without building a key.
 pub fn output_format_for(chroma_format_idc: u8, bit_depth_luma_minus8: u8) -> Option<vk::Format> {
     match (chroma_format_idc, bit_depth_luma_minus8) {
         (1, 0) => Some(NV12),
@@ -169,19 +147,15 @@ pub fn output_format_for(chroma_format_idc: u8, bit_depth_luma_minus8: u8) -> Op
     }
 }
 
-/// A complete H.265 decode profile chain in one movable value —
-/// [`crate::caps::H264ProfileChain`]'s twin, with the stream's chroma format and
-/// bit depths carried through instead of hard-coded.
-///
-/// [`Self::wire`] links `profile.p_next` to this struct's OWN `h265` field; the
-/// value must not move between `wire()` and the last use of the returned reference.
+/// One H.265 decode profile chain. [`Self::wire`] points `profile.p_next` at this
+/// struct's own `h265` field; do not move the value between `wire()` and the last
+/// use of the returned reference.
 pub(crate) struct H265ProfileChain {
     h265: vk::VideoDecodeH265ProfileInfoKHR<'static>,
     profile: vk::VideoProfileInfoKHR<'static>,
 }
 
 impl H265ProfileChain {
-    /// Build the (unwired) chain for one stream profile.
     pub(crate) fn new(key: H265ProfileKey) -> Self {
         Self {
             h265: vk::VideoDecodeH265ProfileInfoKHR::default().std_profile_idc(key.std_profile_idc),
@@ -201,15 +175,12 @@ impl H265ProfileChain {
     }
 }
 
-/// Everything the thin H.265 query copies out of the driver, hand-buildable for
-/// tests. Field-for-field [`crate::caps::RawH264Caps`], except `max_level_idc`
-/// carries an H.265 Std level code point (a separate type so the two can never be
-/// mixed up despite both being `c_uint` underneath).
+/// Driver facts the thin H.265 query copies out, hand-buildable for tests.
+/// `max_level_idc` is an H.265 Std level so it cannot be mixed with H.264's
+/// `c_uint` of the same width.
 #[derive(Debug, Clone, Default)]
 pub struct RawH265Caps {
-    /// `VkVideoCapabilitiesKHR::flags`.
     pub capability_flags: vk::VideoCapabilityFlagsKHR,
-    /// `VkVideoDecodeCapabilitiesKHR::flags` (the coincide/distinct advertisement).
     pub decode_flags: vk::VideoDecodeCapabilityFlagsKHR,
     pub min_bitstream_buffer_offset_alignment: u64,
     pub min_bitstream_buffer_size_alignment: u64,
@@ -218,9 +189,9 @@ pub struct RawH265Caps {
     pub max_coded_extent: vk::Extent2D,
     pub max_dpb_slots: u32,
     pub max_active_reference_pictures: u32,
-    /// `VkVideoDecodeH265CapabilitiesKHR::maxLevelIdc` (index-coded Std level).
+    /// Std H.265 level (index-coded), not a Vulkan enum.
     pub max_level_idc: hh::StdVideoH265LevelIdc,
-    /// `VkVideoCapabilitiesKHR::stdHeaderVersion` — session creation echoes it back.
+    /// Echoed back at session creation (`VkVideoCapabilitiesKHR::stdHeaderVersion`).
     pub std_header_version: vk::ExtensionProperties,
     /// Formats usable for DISTINCT-mode DPB images (queried with [`DPB_USAGE`]).
     pub dpb_formats: Vec<VideoFormat>,
@@ -230,15 +201,12 @@ pub struct RawH265Caps {
     pub coincide_formats: Vec<VideoFormat>,
 }
 
-/// Derive the session-shaping facts from one raw H.265 query, for a stream whose
-/// SPS asks for `wanted` ([`H265ProfileKey::output_format`]).
+/// Session-shaping facts from one raw H.265 query, for a stream whose SPS asks
+/// for `wanted` ([`H265ProfileKey::output_format`]).
 ///
-/// The refusal semantics are the point: a device whose driver advertises H.265
-/// decode but lists no [`P010`] entry under a Main 10 profile — or no 4:4:4 entry
-/// under a RExt profile — yields [`CapsError::NoFormat`] here, with the mode and
-/// the format named, and NOTHING is created. That is a clean pre-session demote to
-/// the next ladder rung, not a mid-stream failure and never a silent fallback to a
-/// format that would lose bits.
+/// Missing `wanted` under the advertised mode is [`CapsError::NoFormat`] with
+/// mode and format named. Nothing is created and there is no fallback to a
+/// shallower format that would lose bits.
 pub fn derive_caps_h265(raw: &RawH265Caps, wanted: vk::Format) -> Result<DecodeCaps, CapsError> {
     let arrangement = derive_arrangement(
         raw.capability_flags,
@@ -261,10 +229,9 @@ pub fn derive_caps_h265(raw: &RawH265Caps, wanted: vk::Format) -> Result<DecodeC
     ))
 }
 
-/// The one function that asks the driver about an H.265 profile: video
-/// capabilities (with the decode + H.265 capability structs chained) plus the
-/// three format-property enumerations. Copies facts out and returns; derivation
-/// happens in [`derive_caps_h265`].
+/// Driver query for one H.265 profile: video capabilities plus the three
+/// format-property enumerations. Copies facts out; derivation is
+/// [`derive_caps_h265`].
 ///
 /// # Safety
 ///
@@ -279,19 +246,9 @@ pub(crate) unsafe fn query_h265_caps(
 
     let mut h265_caps = vk::VideoDecodeH265CapabilitiesKHR::default();
     let mut decode_caps = vk::VideoDecodeCapabilitiesKHR::default();
-    // ⚠ ORDER IS LOAD-BEARING on at least one shipping driver. `push_next` PREPENDS, so
-    // the chain is the reverse of the call order: pushing the codec struct last puts
-    // VkVideoDecodeCapabilitiesKHR FIRST after the base struct, which is the order every
-    // Vulkan sample writes it in.
-    //
-    // Measured on Intel Arc (Windows 101.8724) with the previous order — codec struct
-    // first — the driver filled the two by POSITION rather than by sType and returned
-    // them SWAPPED: `decode_caps.flags` came back 12 (= STD_VIDEO_H265_LEVEL_IDC_6_2)
-    // and `h265_caps.maxLevelIdc` came back 1 (= DPB_AND_OUTPUT_COINCIDE). Reading a
-    // level as a flag bitmask means neither COINCIDE nor DISTINCT appeared set, so the
-    // rung refused a device that in fact supports it, and every Arc fell back to D3D11VA.
-    // NVIDIA and RADV dispatch by sType and are indifferent to the order, which is why
-    // the fleet was green and this survived to the field.
+    // `push_next` prepends. Push the codec struct last so decode-caps sits first
+    // after the base. Do not reverse it: a position-filling driver then reads a
+    // Std level as a flag bitmask, and neither COINCIDE nor DISTINCT appears set.
     let mut caps = vk::VideoCapabilitiesKHR::default()
         .push_next(&mut h265_caps)
         .push_next(&mut decode_caps);
@@ -321,14 +278,9 @@ pub(crate) unsafe fn query_h265_caps(
     let decode_flags = decode_caps.flags;
     let max_level_idc = h265_caps.max_level_idc;
 
-    // What the driver ACTUALLY said, before any of our interpretation. Nothing in this
-    // module logged, so a refusal downstream ("advertises neither COINCIDE nor DISTINCT")
-    // was indistinguishable from our own chain never reaching the struct: both present as
-    // a zero. Printing the BASE capabilities beside the decode ones is the discriminator —
-    // a populated `max_dpb_slots` next to `decode_flags: 0` means the driver filled the
-    // chain and genuinely declared no DPB mode; zeros across both mean the query never
-    // landed. Debug rather than info: one line per profile per session, wanted only when
-    // someone is asking this exact question.
+    // Verbatim driver fill, before interpretation. Populated `max_dpb_slots` next
+    // to `decode_flags` 0 is a real "no DPB mode"; zeros on both mean the query
+    // never landed.
     tracing::debug!(
         codec = "H.265",
         ?capability_flags,
@@ -377,7 +329,6 @@ pub(crate) unsafe fn query_h265_caps(
 mod tests {
     use super::*;
 
-    /// A format entry advertising `usage` plus the mutable-format allowance.
     fn entry(format: vk::Format, usage: vk::ImageUsageFlags) -> VideoFormat {
         VideoFormat {
             format,
@@ -387,8 +338,6 @@ mod tests {
         }
     }
 
-    /// RADV's shape (coincide, separate reference images) advertising exactly the
-    /// formats in `coincide`.
     fn coincide_device(coincide: Vec<VideoFormat>) -> RawH265Caps {
         RawH265Caps {
             capability_flags: vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES,
@@ -417,7 +366,6 @@ mod tests {
 
     #[test]
     fn the_profile_is_built_from_the_streams_chroma_format_and_bit_depth() {
-        // Main: 4:2:0 8-bit → NV12.
         let main = H265ProfileKey::from_stream(1, 1, false, 0, 0).unwrap();
         assert_eq!(
             main.std_profile_idc,
@@ -433,8 +381,6 @@ mod tests {
         );
         assert_eq!(main.output_format(), Some(NV12));
 
-        // Main 10: 4:2:0 10-bit → P010, and the profile SAYS 10-bit (a profile
-        // claiming 8 would have the driver hand back an 8-bit surface).
         let main10 = H265ProfileKey::from_stream(2, 1, false, 2, 2).unwrap();
         assert_eq!(
             main10.std_profile_idc,
@@ -447,7 +393,6 @@ mod tests {
         assert_eq!(main10.chroma_bit_depth, main10.luma_bit_depth);
         assert_eq!(main10.output_format(), Some(P010));
 
-        // RExt 4:4:4, both depths.
         let rext8 = H265ProfileKey::from_stream(4, 3, false, 0, 0).unwrap();
         assert_eq!(
             rext8.chroma_subsampling,
@@ -457,8 +402,6 @@ mod tests {
         let rext10 = H265ProfileKey::from_stream(4, 3, false, 2, 2).unwrap();
         assert_eq!(rext10.output_format(), Some(YUV444_10));
 
-        // The free function agrees with the key's own mapping, combination for
-        // combination.
         for (chroma, depth, format) in [
             (1u8, 0u8, NV12),
             (1, 2, P010),
@@ -470,11 +413,6 @@ mod tests {
         assert_eq!(output_format_for(2, 0), None, "4:2:2 has no output format");
     }
 
-    /// The negotiated-facts constructor: the session knows the chroma format and
-    /// bit depth from the host's Welcome long before the first SPS, and that is
-    /// enough to pick the profile a punktfunk host encodes the pair with — which
-    /// is what lets the client PROBE the device before it commits to the native
-    /// decoder rung.
     #[test]
     fn the_negotiated_pair_picks_the_profile_a_host_encodes_it_with() {
         let main = H265ProfileKey::from_negotiated(1, 0).unwrap();
@@ -491,9 +429,6 @@ mod tests {
         );
         assert_eq!(main10.output_format(), Some(P010));
 
-        // 4:4:4 is only expressible in RExt, so this leg is exact — and it is the
-        // one the probe exists for (a 4:4:4 session on a device with no 4:4:4
-        // decode format used to burn the ladder mid-stream).
         let rext8 = H265ProfileKey::from_negotiated(3, 0).unwrap();
         assert_eq!(
             rext8,
@@ -503,8 +438,6 @@ mod tests {
         let rext10 = H265ProfileKey::from_negotiated(3, 2).unwrap();
         assert_eq!(rext10.output_format(), Some(YUV444_10));
 
-        // It never admits what `from_stream` refuses: outside-envelope pairs come
-        // back typed, so the probe REFUSES rather than guessing a profile.
         assert_eq!(
             H265ProfileKey::from_negotiated(2, 0).unwrap_err(),
             H265ParamsError::UnsupportedChromaFormat(2)
@@ -542,18 +475,14 @@ mod tests {
             H265ProfileKey::from_stream(1, 4, false, 0, 0).unwrap_err(),
             H265ParamsError::InvalidChromaFormatIdc(4)
         );
-        // 4:4:4 with separate colour planes is ChromaArrayType 0 in disguise:
-        // params_h265's check_envelope refuses it, and so must this — building the
-        // key WOULD otherwise put TYPE_444 in the profile and tell the driver the
-        // bitstream carries interleaved 4:4:4 chroma it does not have. (Unreachable
-        // through `decode`, which never gets past the planner; reachable through
-        // this `pub` constructor, which is the point.)
+        // Same envelope as `params_h265`: separate planes at 4:4:4 are
+        // ChromaArrayType 0, not interleaved 4:4:4. This `pub` constructor is
+        // reachable without the planner.
         assert_eq!(
             H265ProfileKey::from_stream(4, 3, true, 0, 0).unwrap_err(),
             H265ParamsError::SeparateColourPlanes
         );
-        // The flag is only meaningful at 4:4:4 (7.4.3.2.1) — it does not disturb
-        // the 4:2:0 path.
+        // The flag is only defined at 4:4:4 (7.4.3.2.1); it must not disturb 4:2:0.
         assert!(H265ProfileKey::from_stream(1, 1, true, 0, 0).is_ok());
         assert_eq!(
             H265ProfileKey::from_stream(4, 1, false, 4, 4).unwrap_err(),
@@ -603,8 +532,7 @@ mod tests {
             hh::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10
         );
 
-        // The type-erased dispatch builds the SAME chain (the H.264/H.265 idc
-        // confusion this enum exists to prevent would show up right here).
+        // Same chain via the type-erased dispatch — an H.264 idc cannot build this.
         let mut erased = DecodeProfile::H265(key).chain();
         let profile = erased.wire();
         assert_eq!(
@@ -631,10 +559,8 @@ mod tests {
 
     #[test]
     fn the_level_ceiling_derived_here_is_tagged_h265_not_h264() {
-        // `StdVideoH264LevelIdc` and `StdVideoH265LevelIdc` are both `c_uint`, so
-        // an H.265 ceiling landing in an H.264-typed field used to compile in
-        // silence — and the two code spaces do NOT agree (H.265 6.2 is 15, H.264
-        // 6.2 is 19). The tag is what makes the decoders' numeric gate honest.
+        // Both Std level types are `c_uint`. H.265 6.2 is 15, H.264 6.2 is 19;
+        // the tag keeps the numeric gate from comparing the wrong code space.
         let raw = coincide_device(vec![entry(NV12, COINCIDE_USAGE)]);
         let caps = derive_caps_h265(&raw, NV12).unwrap();
         assert_eq!(
@@ -655,9 +581,8 @@ mod tests {
 
     #[test]
     fn a_main10_stream_on_an_eight_bit_only_device_is_refused_before_any_session() {
-        // The device decodes H.265 and advertises NV12 — but the stream is 10-bit
-        // and there is no P010 entry. Refuse by name; do NOT fall back to NV12
-        // (that would decode 10-bit content into an 8-bit surface).
+        // NV12 is advertised; the stream is 10-bit and there is no P010. Refuse
+        // by name — falling back to NV12 would decode 10-bit content into 8-bit.
         let raw = coincide_device(vec![entry(NV12, COINCIDE_USAGE)]);
         assert_eq!(
             derive_caps_h265(&raw, P010).unwrap_err(),
@@ -667,7 +592,6 @@ mod tests {
             }
         );
 
-        // With the P010 entry present it derives, plane views and all.
         let raw = coincide_device(vec![
             entry(NV12, COINCIDE_USAGE),
             entry(P010, COINCIDE_USAGE),
@@ -714,8 +638,7 @@ mod tests {
 
     #[test]
     fn a_distinct_device_missing_the_format_on_one_half_names_that_half() {
-        // NVIDIA's shape: distinct only, layered DPB. The DPB half advertises
-        // P010, the OUTPUT half does not — the refusal must say which.
+        // Distinct, layered DPB. P010 on the DPB half only — the error must name output.
         let raw = RawH265Caps {
             capability_flags: vk::VideoCapabilityFlagsKHR::empty(),
             decode_flags: vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_DISTINCT,
@@ -736,8 +659,8 @@ mod tests {
             }
         );
 
-        // With both halves carrying it, distinct derives (the DPB entry needs
-        // neither SAMPLED nor MUTABLE_FORMAT — reference images are never sampled).
+        // DPB references are never sampled, so that half needs neither SAMPLED
+        // nor MUTABLE_FORMAT.
         let raw = RawH265Caps {
             output_formats: vec![entry(P010, OUTPUT_USAGE)],
             ..raw
@@ -750,8 +673,7 @@ mod tests {
 
     #[test]
     fn an_h265_entry_missing_a_creation_usage_bit_is_refused_naming_the_gap() {
-        // The Intel-refusal shape, one codec over: the format is listed but not
-        // for SAMPLED, so the presenter could never read it.
+        // Format listed without SAMPLED: the presenter could never read it.
         let raw = coincide_device(vec![entry(
             P010,
             vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
@@ -765,7 +687,6 @@ mod tests {
             }
         );
 
-        // And a presenter-facing entry without MUTABLE_FORMAT has no plane views.
         let raw = coincide_device(vec![VideoFormat {
             format: P010,
             image_usage: COINCIDE_USAGE,
@@ -790,8 +711,8 @@ mod tests {
             CapsError::NoDecodeMode
         );
 
-        // Coincide with a layered DPB stays unsupported here too (the picture-pool
-        // model needs per-slot images, whatever the codec).
+        // Coincide with a layered DPB is unsupported: the picture pool needs
+        // per-slot images, whatever the codec.
         let mut raw = coincide_device(vec![entry(NV12, COINCIDE_USAGE)]);
         raw.capability_flags = vk::VideoCapabilityFlagsKHR::empty();
         assert_eq!(

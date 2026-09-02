@@ -1,20 +1,16 @@
-//! Runs the C ABI harness under `cargo test`: compiles `tests/c/harness.c`, links it
-//! against the freshly built `libpunktfunk_core.a`, and asserts it round-trips frames
-//! through the lossy loopback. The cross-platform canonical path (querying rustc for
-//! link flags) is `tests/c/run.sh`; this mirrors it so `cargo test` alone covers the
-//! C boundary.
+//! Compiles `tests/c/harness.c`, links it to a freshly built `libpunktfunk_core.a`,
+//! and asserts a lossy-loopback frame round-trip. Canonical path is `tests/c/run.sh`;
+//! this mirrors it so `cargo test` alone covers the C boundary.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Native libs the Rust staticlib needs, minus the ones `cc` already links by default
-/// (`-lSystem`/`-lc`), to avoid duplicate-library linker warnings. See
-/// `rustc --print native-static-libs`.
+/// Extra native libs for the staticlib. Omit `-lSystem`/`-lc` — `cc` already
+/// links them and duplicates warn. See `rustc --print native-static-libs`.
 fn native_libs() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
-        // The workspace build unifies features into the staticlib, and `quic` pulls
-        // rustls's platform verifier → Security/CoreFoundation, plus libopus (the in-core
-        // `next_audio_pcm` decode path) which the `abi.rs` object references.
+        // Workspace `quic` pulls rustls's platform verifier (Security/CoreFoundation)
+        // and in-core Opus decode (`next_audio_pcm`), whose symbols `abi.rs` references.
         &[
             "-lopus",
             "-liconv",
@@ -25,8 +21,7 @@ fn native_libs() -> &'static [&'static str] {
             "CoreFoundation",
         ]
     } else if cfg!(target_os = "linux") {
-        // `-lopus`: the `quic` feature pulls in-core Opus decode (`next_audio_pcm`), whose
-        // symbols the linked `abi.rs` object references. Before `-lm` (opus needs libm).
+        // Opus before `-lm` (libopus needs libm). `quic` pulls in-core `next_audio_pcm`.
         &[
             "-lopus",
             "-lgcc_s",
@@ -42,21 +37,10 @@ fn native_libs() -> &'static [&'static str] {
 }
 
 fn ensure_staticlib(profile_dir: &Path) -> PathBuf {
-    // `cargo test` doesn't always emit the standalone staticlib; build it — WITH `quic`, the
-    // surface the harness declares (`-DPUNKTFUNK_FEATURE_QUIC`) and this test's link line
-    // already pays for (`-lopus`, Security). Unconditional, because a featureless `.a` left by
-    // an earlier plain `cargo build` would otherwise be reused and fail the link on the quic
-    // symbols.
-    //
-    // ⚠ INTO A TARGET DIR OF ITS OWN, and that is the whole point. This runs while the OUTER
-    // `cargo test` is mid-flight, and that run's pending units — the doctests especially —
-    // name `target/<profile>/deps/*.rlib` by explicit `--extern` path. Resolving features for
-    // `-p punktfunk-core` alone is not the workspace union the outer run resolved, so a shared
-    // directory gets that subgraph rebuilt under different metadata and the outer run's paths
-    // stop existing underneath it. That is what made `Doc-tests pf_capture` die with
-    // `E0463: can't find crate for pf_frame` after a green build, green clippy and green tests
-    // — a dependency nothing in the diff had touched. The outer build lock being released
-    // during test execution is why this RUNS; it was never why it is safe.
+    // Nested `CARGO_TARGET_DIR`: this `cargo build --features quic` runs mid outer
+    // `cargo test`. Sharing `target/<profile>` rebuilds the graph under different
+    // metadata and the outer `--extern` rlib paths vanish. A leftover featureless
+    // `.a` from a plain `cargo build` would also fail the quic link.
     let nested = profile_dir
         .parent()
         .expect("target dir")
@@ -71,12 +55,12 @@ fn ensure_staticlib(profile_dir: &Path) -> PathBuf {
 
 #[test]
 fn c_abi_harness_round_trips() {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")); // crates/punktfunk-core
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let harness = manifest.join("tests/c/harness.c");
     let include = manifest.join("../../include");
 
     let exe = std::env::current_exe().expect("current_exe");
-    // .../target/<profile>/deps/c_abi-<hash> -> target/<profile>
+    // current_exe is `.../target/<profile>/deps/c_abi-<hash>`; two parents is the profile dir.
     let profile_dir = exe
         .parent()
         .and_then(Path::parent)
@@ -99,9 +83,7 @@ fn c_abi_harness_round_trips() {
 
     let mut compile = Command::new(&cc);
     compile
-        // `ensure_staticlib` builds it with `quic` (that's what the -lopus / Security link line
-        // below pays for) — so expose the header's quic surface and let the harness exercise it
-        // (the `PunktfunkConnectOpts` layout check).
+        // Match `ensure_staticlib`'s `quic` build so the harness can use that header surface.
         .args([
             "-std=c11",
             "-Wall",
@@ -111,8 +93,7 @@ fn c_abi_harness_round_trips() {
             "-I",
         ])
         .arg(&include);
-    // Apple Silicon: `cc` does not search homebrew's prefix on its own, and `-lopus` lives
-    // there — without this the harness never linked on a Mac dev box at all.
+    // Homebrew on Apple Silicon: `cc` does not search `/opt/homebrew/lib` for `-lopus`.
     if cfg!(target_os = "macos") && Path::new("/opt/homebrew/lib").is_dir() {
         compile.arg("-L/opt/homebrew/lib");
     }
@@ -126,7 +107,7 @@ fn c_abi_harness_round_trips() {
     match compile.status() {
         Ok(s) => assert!(s.success(), "C harness failed to compile/link"),
         Err(e) => {
-            // No C toolchain (unusual) — don't fail the whole suite; run.sh covers CI.
+            // No C toolchain. Skip rather than fail the suite; `tests/c/run.sh` covers CI.
             eprintln!("skipping C ABI test: cannot invoke `{cc}`: {e}");
             return;
         }

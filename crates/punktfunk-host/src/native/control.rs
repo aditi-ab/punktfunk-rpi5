@@ -1,20 +1,25 @@
-//! The native `punktfunk/1` mid-stream control task (plan §W1 — carved out of [`super`]'s
-//! `serve_session`). After the handshake the control stream stays open for renegotiation and
-//! speed tests; this task multiplexes the inbound client requests (`Reconfigure` /
-//! `RequestKeyframe` / `RfiRequest` / `LossReport` / `SetBitrate` / `ProbeRequest` / `ClockProbe`)
-//! with the outbound probe-result and mode-correction channels, handing every validated change to
-//! the data-plane thread over the session's mpsc bridges.
+//! Native `punktfunk/1` mid-stream control task.
+//!
+//! After handshake the control stream stays open. This task is its sole writer:
+//! inbound client requests share a `select!` with outbound probe results, mode
+//! corrections, bitrate retargets, pipeline gaps, shard-payload changes, cursor
+//! shapes, clipboard offers, and access updates. Validated changes go to the
+//! data-plane thread over the session's mpsc bridges.
+//!
+//! `select!` drops the inbound read future whenever a sibling fires, so framing
+//! uses [`io::MsgReader`]. Optional channels whose sender can drop mid-session
+//! (`clip_offer_rx`, `shard_change_rx`, `access_rx`) must disable their branch
+//! on `None` or a closed mpsc busy-spins.
+//!
+//! Evidence: `design/shard-payload-reneg.md`, `design/per-client-access.md`,
+//! `design/clipboard-and-file-transfer.md`, `design/phase-locked-capture.md`.
 
 use super::*;
 use pf_clipboard::ClipCoordCmd;
 use punktfunk_core::quic::{ClipControl, ClipOffer, ClipState};
 
-/// Everything [`run`] owns for one live session — the control streams (`serve_session` hands
-/// them off after negotiation), every channel end that bridges to the data-plane thread, and the
-/// [`pf_clipboard::ClipCoord`] handle bridging to the clipboard coordinator. A named-field
-/// struct rather than the parameter list it grew from: at ~30 positionals the spawn site had
-/// stopped saying anything, and its same-typed neighbours (`retarget_rx` / `gap_rx` both carry
-/// bare `u32`s) were one silent transposition away from a runtime puzzle.
+/// Named fields, not a 30-argument spawn: `retarget_rx` and `gap_rx` are both
+/// bare `u32`, so a positional swap would compile and fail at runtime.
 pub(super) struct Task {
     pub(super) ctrl_send: quinn::SendStream,
     pub(super) ctrl_recv: quinn::RecvStream,
@@ -23,10 +28,9 @@ pub(super) struct Task {
     pub(super) live_reconfig_ok: bool,
     pub(super) adaptive_fec: bool,
     pub(super) session_bitrate_kbps: u32,
-    /// Encoder-truth bridge (data plane → here, §ABR overdrive): the encoder's live applied
-    /// rate, its discovered codec-level ceiling (0 = unknown), and the "encode can't hold
-    /// cadence" flag. Read at `SetBitrate`-resolve time so the ack — the base the client's
-    /// controller climbs from — never promises a rate the encoder won't run at.
+    /// Encoder-applied rate, codec ceiling (`0` = unknown), and cadence-miss
+    /// flag. Read at `SetBitrate` so the ack never exceeds what the encoder
+    /// will actually run.
     pub(super) live_bitrate: Arc<AtomicU32>,
     /// See [`Self::live_bitrate`].
     pub(super) encoder_ceiling_kbps: Arc<AtomicU32>,
@@ -34,13 +38,10 @@ pub(super) struct Task {
     pub(super) cadence_degraded: Arc<AtomicBool>,
     /// See [`Self::live_bitrate`].
     pub(super) cadence_behind_score: Arc<AtomicU32>,
-    /// Delivery truth, published from every `DeliveryReport` for the data plane's stall
-    /// diagnosis: the packets the client says it has received all session (`u32::MAX` = a
-    /// client too old to send one, the pre-seeded value).
+    /// `u32::MAX` is the pre-seed: an old client never sent a `DeliveryReport`.
     pub(super) client_packets_received: Arc<AtomicU32>,
     pub(super) fec_target_ctl: Arc<AtomicU8>,
-    /// Phase-locked capture bridge: client PhaseReports land here latest-wins; the encode
-    /// loop's controller drains at its own ~1 Hz cadence (design/phase-locked-capture.md).
+    /// Encode loop drains at its own cadence (`design/phase-locked-capture.md`).
     pub(super) phase_ctl: Arc<super::stream::PhaseCtl>,
     pub(super) reconfig_tx: std::sync::mpsc::Sender<punktfunk_core::Mode>,
     pub(super) keyframe_tx: std::sync::mpsc::Sender<()>,
@@ -49,16 +50,14 @@ pub(super) struct Task {
     pub(super) probe_tx: std::sync::mpsc::Sender<ProbeRequest>,
     pub(super) probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
     pub(super) reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Reconfigured>,
-    /// Host-initiated bitrate re-target (a rebuild re-resolved an Automatic rate): forwarded to
-    /// the client as a `BitrateChanged` so its controller's climb base tracks the real encoder.
+    /// Host-initiated Automatic re-resolve. Forwarded as `BitrateChanged` so
+    /// the client's climb base tracks the encoder.
     pub(super) retarget_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
-    /// Pipeline-gap announcements (see `gap_tx`): a rebuild that kept the session up stopped
-    /// the stream for this many ms, forwarded to the client as a `PipelineGap` so its bitrate
-    /// controller discards the report window that straddled our own stall.
+    /// Rebuild stall duration in ms. Forwarded as `PipelineGap` so the client
+    /// bitrate controller drops the report window that straddled our stall.
     pub(super) gap_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
-    /// Mid-session shard renegotiation (design/shard-payload-reneg.md): the wire-MTU watcher
-    /// asks for a `ShardPayloadChanged` here (this task is the control stream's sole writer),
-    /// and the client's `ShardPayloadAck`s flow back on `shard_ack_tx` — the grow gate.
+    /// Wire-MTU watcher → `ShardPayloadChanged` (this task is the sole writer).
+    /// Client `ShardPayloadAck`s return on `shard_ack_tx` and gate a grow.
     pub(super) shard_change_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
     pub(super) shard_ack_tx: tokio::sync::mpsc::UnboundedSender<u16>,
     pub(super) cursor_shape_rx:
@@ -66,18 +65,14 @@ pub(super) struct Task {
     pub(super) cursor_client_draws: Arc<AtomicBool>,
     pub(super) clip_enabled: Arc<AtomicBool>,
     pub(super) clip: pf_clipboard::ClipCoord,
-    /// Per-client access (design/per-client-access.md §5): the session's LIVE grant mask — the
-    /// same atomic the datagram filter reads; the deadline/watch task folds console edits into
-    /// it, so a `ClipControl` or `ClipOffer` arriving after a mid-session revoke resolves
-    /// against the new mask.
+    /// LIVE grant mask, same atomic the datagram filter reads. Deadline/watch
+    /// folds console edits in, so a later `ClipControl`/`ClipOffer` sees them.
     pub(super) session_grants: Arc<AtomicU32>,
-    /// `AccessUpdate`s from the session's deadline/watch task (expiry warnings + mid-session
-    /// grant edits) — this task is the control stream's sole writer, so they cross here.
+    /// Sole writer for deadline/watch `AccessUpdate`s (expiry + grant edits).
     pub(super) access_rx: tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::AccessUpdate>,
 }
 
-/// Run the control task for one live session (owning everything in its [`Task`]). Returns when
-/// the control stream closes or a data-plane channel drops.
+/// Ends when the control stream closes or a data-plane channel drops.
 pub(super) async fn run(task: Task) {
     let Task {
         mut ctrl_send,
@@ -117,45 +112,35 @@ pub(super) async fn run(task: Task) {
         cmd_tx: clip_cmd_tx,
         offer_rx: mut clip_offer_rx,
     } = clip;
-    // Set once `clip_offer_rx` closes (coordinator gone / inert handle) so its `select!` branch
-    // stops firing on a perpetually-ready `None`.
+    // Once `clip_offer_rx` closes, disable its `select!` arm — a closed
+    // mpsc is perpetually ready with `None`.
     let mut clip_offer_closed = false;
-    // Per-client-access enforcement drops for the messages this task gates (design §5.5): counted
-    // per class with one `warn!` on the first, so a client spamming a revoked plane can't turn the
-    // log into the DoS.
+    // First-of-class `warn!` for grant drops. A revoked client spamming the
+    // gated messages must not flood the log.
     let denied = GrantDrops::new();
-    // Same discipline for the wire-MTU watcher's channel — its bounded lifetime ends mid-session
-    // on every healthy path.
+    // Same closed-channel discipline as `clip_offer_closed`.
     let mut shard_change_closed = false;
-    // …and for the access-update channel: a session with no fingerprint (an `--open` anonymous
-    // client) never spawns the deadline/watch task, so the sender drops immediately.
+    // `--open` anonymous sessions never spawn deadline/watch; the sender
+    // drops immediately.
     let mut access_closed = false;
     let mut active = initial_mode;
-    // Host-side switch rate limit (a backstop against a hostile/broken client spamming
-    // Reconfigure into pipeline-rebuild churn — the drain-to-newest in the data plane already
-    // coalesces a well-behaved resize drag; compliant clients self-limit to ≥ 1 s).
+    // Backstop against Reconfigure spam. Data-plane drain-to-newest already
+    // coalesces a resize drag; 500 ms is half the client's 1 s self-limit.
     const MIN_SWITCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     let mut last_accepted_switch: Option<std::time::Instant> = None;
-    // Speed-test probes get the same treatment as mode switches, for the same reason.
-    //
-    // Each probe is individually clamped (5 s, 10 Gbps) but nothing capped how many a client could
-    // queue, so one could pause its own video and pin the host's uplink indefinitely by simply
-    // asking again — `Reconfigure` on this very task was rate-limited and `ProbeRequest` was not
-    // (2026-08-05 review L-3). One probe per 10 s is far more than a real client needs (it probes
-    // at session start and on a manual speed test) and makes the channel useless as an amplifier.
+    // One probe per 10 s. Each probe is already clamped (5 s, 10 Gbps);
+    // without a count cap a client can pause video and pin the uplink.
     const MIN_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
     let mut last_probe: Option<std::time::Instant> = None;
-    // Resumable framing: this read is one arm of a `select!` whose siblings fire on every probe
-    // result / reconfigure / clip offer, so the read future is dropped routinely. `io::read_msg`
-    // would lose the partial frame and misalign the stream for the rest of the session.
+    // `select!` drops this future whenever a sibling fires. `io::read_msg`
+    // would lose a partial frame and misalign the rest of the session.
     let mut ctrl_reader = io::MsgReader::new(ctrl_recv);
-    // Burned decay floor for adaptive FEC (RFC §2.4): once this session has reported real
-    // loss, the decay below stops at 5 % instead of 1 % — see `FecFloor`.
+    // After real loss, decay stops at 5 % not 1 % (`FecFloor`).
     let mut fec_floor = FecFloor::default();
     loop {
         tokio::select! {
             msg = ctrl_reader.read_msg() => {
-                let Ok(msg) = msg else { break }; // stream closed
+                let Ok(msg) = msg else { break };
                 if let Ok(req) = Reconfigure::decode(&msg) {
                     let now = std::time::Instant::now();
                     let valid = req.mode.refresh_hz > 0
@@ -168,9 +153,8 @@ pub(super) async fn run(task: Task) {
                     let too_soon = last_accepted_switch
                         .is_some_and(|t| now.duration_since(t) < MIN_SWITCH_INTERVAL);
                     let ok = if !live_reconfig_ok {
-                        // Backend can't live-reconfigure (gamescope / synthetic /
-                        // per-client-mode identity — see the gate above): honest downgrade,
-                        // the client keeps scaling client-side.
+                        // Backend cannot live-reconfigure (gamescope / synthetic
+                        // / per-client-mode identity). Client keeps scaling.
                         tracing::info!(mode = ?req.mode,
                             "mode switch rejected (backend cannot live-reconfigure)");
                         false
@@ -193,58 +177,44 @@ pub(super) async fn run(task: Task) {
                         break;
                     }
                     if ok && reconfig_tx.send(req.mode).is_err() {
-                        break; // data plane gone
+                        break;
                     }
                 } else if RequestKeyframe::decode(&msg).is_ok() {
-                    // Client recovery: its decoder wedged — force the next encoded frame to
-                    // be an IDR. Coalesced in the encode loop (a wedge fires several before
-                    // the IDR lands); a send error just means the data plane is gone.
+                    // Encode loop coalesces: a wedge fires several requests
+                    // before the IDR lands.
                     tracing::debug!("client requested keyframe (decode recovery)");
                     if keyframe_tx.send(()).is_err() {
-                        break; // data plane gone
+                        break;
                     }
                 } else if let Ok(req) = RfiRequest::decode(&msg) {
-                    // Client LTR-RFI recovery: it lost the frame range `[first, last]` and asks
-                    // the encoder to re-reference a known-good older frame instead of paying for
-                    // a full IDR. The encode loop attempts `invalidate_ref_frames`, falling back
-                    // to a coalesced keyframe when the encoder can't (range too old / no RFI).
+                    // Encode loop falls back to a coalesced IDR when the range
+                    // is too old or the encoder has no RFI.
                     tracing::debug!(
                         first = req.first_frame,
                         last = req.last_frame,
                         "client requested reference-frame invalidation (loss recovery)"
                     );
                     if rfi_tx.send((req.first_frame, req.last_frame)).is_err() {
-                        break; // data plane gone
+                        break;
                     }
                 } else if let Ok(rep) = punktfunk_core::quic::DeliveryReport::decode(&msg) {
-                    // What the client has actually RECEIVED — published unconditionally, because it
-                    // is what lets the data plane read `loss_ppm = 0` correctly and must survive
-                    // both the `adaptive_fec` opt-out and a pinned FEC percentage (a host with
-                    // PUNKTFUNK_FEC_PCT set is exactly as blind to a dead data plane otherwise).
-                    // Saturated into the u32 bridge; the value only ever matters near zero.
+                    // Unconditional: stall diagnosis needs `loss_ppm = 0` even
+                    // when FEC is pinned or adaptive FEC is off. Saturate into
+                    // the u32 bridge; the value only matters near zero.
                     client_packets_received.store(
                         rep.packets_received.min(u32::MAX as u64 - 1) as u32,
                         Ordering::Relaxed,
                     );
                 } else if let Ok(rep) = LossReport::decode(&msg) {
-                    // Adaptive FEC: size recovery to the loss the client is seeing. The data-plane
-                    // send loop reads `fec_target_ctl` and applies it per frame. Ignored when FEC
-                    // is pinned via PUNKTFUNK_FEC_PCT.
+                    // Data-plane send loop applies `fec_target_ctl` per frame.
+                    // No-op when FEC is pinned (`PUNKTFUNK_FEC_PCT`).
                     if adaptive_fec {
-                        // Fast attack, slow decay: jump straight to what the reported loss
-                        // needs, but come DOWN only one point per clean report (~750 ms). The
-                        // memoryless controller ping-ponged on periodic burst loss (Wi-Fi
-                        // scans / BT coexistence, a burst every few seconds): a single clean
-                        // window dropped FEC back to the floor, so every next burst hit an
-                        // unprotected stream — an unrecoverable frame, a freeze, and a
-                        // recovery-IDR burst, once per cycle. Decaying over ~10 windows keeps
-                        // the stream covered across the gap while still converging to FEC_MIN
-                        // on a genuinely clean link.
+                        // Jump to what this report needs; decay one point per
+                        // clean ~750 ms window so a burst every few seconds
+                        // does not drop FEC to the floor between hits.
                         let prev = fec_target_ctl.load(Ordering::Relaxed);
-                        // The burned floor (RFC §2.4) binds the decay, not the attack: real
-                        // loss raises it to 5 % for as long as the link keeps proving lossy,
-                        // so a static stretch can no longer strip the armor the first motion
-                        // frame needs. ~2 clean minutes re-earn the 1 % floor.
+                        // Floor binds decay, not attack. Real loss raises it to
+                        // 5 %; ~2 clean minutes re-earn the 1 % floor.
                         let floor = fec_floor.on_report(rep.loss_ppm);
                         let target = adapt_fec(rep.loss_ppm)
                             .max(prev.saturating_sub(1))
@@ -260,15 +230,9 @@ pub(super) async fn run(task: Task) {
                         }
                     }
                 } else if let Ok(req) = SetBitrate::decode(&msg) {
-                    // Mid-stream bitrate renegotiation (adaptive bitrate): clamp exactly like
-                    // the Hello request, ack the resolved value, then hand it to the data-plane
-                    // thread, which rebuilds the encoder in place at the same mode — the fresh
-                    // encoder's first frame is an IDR with in-band parameter sets, so the
-                    // client's decoder follows without a reconnect.
-                    // PyroWave: the rate is PINNED (§4.6 — quality collapses under rate
-                    // descent; recovery pressure is answered by codec fallback, not AIMD).
-                    // Our client controller is off for this codec; this guards older or
-                    // foreign clients by acking the unchanged session rate.
+                    // Data plane rebuilds the encoder in place (first frame is
+                    // an IDR with in-band SPS). PyroWave is pinned: ack the
+                    // session rate so a foreign client cannot AIMD it down.
                     let resolved = if codec == crate::encode::Codec::PyroWave {
                         tracing::info!(
                             requested_kbps = req.bitrate_kbps,
@@ -278,28 +242,22 @@ pub(super) async fn run(task: Task) {
                         session_bitrate_kbps
                     } else {
                         let mut r = resolve_bitrate_kbps(req.bitrate_kbps);
-                        // Encoder truth (§ABR overdrive): the ack below is the base the
-                        // client's controller climbs from, so it must not promise past the
-                        // encoder's discovered codec-level ceiling — the pre-fix path acked
-                        // 1.01 Gbps while the ASIC ran 794 Mbps, and the controller climbed
-                        // from the phantom number forever (a ~0.6 s rebuild + IDR per step).
+                        // Ack is the client's climb base: never promise past
+                        // the encoder's discovered codec ceiling (`0` = none).
                         let ceiling = encoder_ceiling_kbps.load(Ordering::Relaxed);
                         if ceiling != 0 && r > ceiling {
                             r = ceiling;
                         }
-                        // Climb refusal while encode can't hold cadence: on a fat LAN no
-                        // network signal ever stops the climb, and past the compute knee more
-                        // bits only deepen the miss. Resolve a CLIMB to the current applied
-                        // rate (descents pass — they're the cure); the short ack teaches the
-                        // client controller its ceiling.
+                        // On a fat LAN nothing else stops the climb, and past
+                        // the compute knee more bits deepen the miss. Hold a
+                        // climb at the applied rate; descents pass.
                         let live = live_bitrate.load(Ordering::Relaxed);
                         if cadence_degraded.load(Ordering::Relaxed) && live != 0 && r > live {
                             tracing::info!(
                                 requested_kbps = req.bitrate_kbps,
                                 held_kbps = live,
-                                // The refusal's evidence: without it a field log shows WHAT was
-                                // held but never WHY, and a session at the ABR floor is
-                                // indistinguishable from a network problem.
+                                // Why the hold: ABR-floor vs network look the
+                                // same without this score.
                                 behind_score = cadence_behind_score.load(Ordering::Relaxed),
                                 "bitrate climb refused — encode is behind cadence"
                             );
@@ -319,13 +277,11 @@ pub(super) async fn run(task: Task) {
                         break;
                     }
                     if bitrate_tx.send(resolved).is_err() {
-                        break; // data plane gone
+                        break;
                     }
                 } else if let Ok(ack) = punktfunk_core::quic::ShardPayloadAck::decode(&msg) {
-                    // Mid-session shard renegotiation: the client applied (or granted) a
-                    // geometry change. Forward to the wire-MTU watcher — for a grow this IS
-                    // the gate that lets the packetizer go above the old size. A dropped
-                    // send just means the watcher already ended (shrink acks are telemetry).
+                    // Grow gate: packetizer may exceed the old size only after
+                    // this ack. A dropped send means the watcher already ended.
                     tracing::info!(
                         shard_payload = ack.shard_payload,
                         "client acked shard-payload change"
@@ -347,12 +303,10 @@ pub(super) async fn run(task: Task) {
                         "speed-test probe requested"
                     );
                     if probe_tx.send(req).is_err() {
-                        break; // data plane gone
+                        break;
                     }
                 } else if let Ok(probe) = ClockProbe::decode(&msg) {
-                    // Wall-clock skew handshake: echo the client's t1 with our receive (t2) and
-                    // send (t3) stamps, both in the host clock the AU pts_ns uses. Answered
-                    // inline on the control stream — cheap, no data-plane involvement.
+                    // t2/t3 are in the AU pts_ns clock. Inline; no data-plane hop.
                     let t2_ns = now_ns();
                     let echo = ClockEcho {
                         t1_ns: probe.t1_ns,
@@ -363,35 +317,25 @@ pub(super) async fn run(task: Task) {
                         break;
                     }
                 } else if let Ok(pr) = punktfunk_core::quic::PhaseReport::decode(&msg) {
-                    // Phase-locked capture: latest-wins into the bridge — no data-plane hop, the
-                    // encode loop polls on its own cadence. Only vsync-aware presenters send
-                    // these (CLIENT_CAP_PHASE_LOCK), and PUNKTFUNK_PHASE_LOCK=0 host-side leaves
-                    // the stored report undrained/inert.
+                    // Inert when `PUNKTFUNK_PHASE_LOCK=0` (stored, never drained).
                     phase_ctl.store(pr);
                 } else if let Ok(m) = punktfunk_core::quic::CursorRenderMode::decode(&msg) {
-                    // Who renders the pointer (design/remote-desktop-sweep.md §8): the client's
-                    // mouse-model flip. Latest-wins into the shared flag; the data-plane loop
-                    // edge-detects it per tick (forward+exclude vs composite). Inert for
-                    // sessions that never negotiated the cursor cap.
+                    // Data-plane edge-detects per tick (forward+exclude vs
+                    // composite). Inert without the cursor cap.
                     cursor_client_draws.store(m.client_draws, Ordering::Relaxed);
                     tracing::info!(
                         client_draws = m.client_draws,
                         "cursor render mode set by client"
                     );
                 } else if let Ok(ctl) = ClipControl::decode(&msg) {
-                    // Shared clipboard enable/disable (design/clipboard-and-file-transfer.md
-                    // §3.1). Reply with the resolved state; the operator policy is authoritative
-                    // over the client's request, and the device's CLIPBOARD grant is ANDed into
-                    // it (per-client access §5.4). Refusals carry the honest reason so the
-                    // client can say *why*. The resolved `enabled` gates the coordinator.
                     let granted = session_grants.load(Ordering::Relaxed)
                         & punktfunk_core::quic::GRANT_CLIPBOARD
                         != 0;
                     let (enabled, resolved_policy, reason) =
                         resolve_clip_control(pf_clipboard::policy(), granted, clip_available, ctl);
                     clip_enabled.store(enabled, Ordering::SeqCst);
-                    // Drive the coordinator: enable re-announces the current host clipboard,
-                    // disable drops any selection we own. A dropped send (inert handle) is fine.
+                    // Enable re-announces the host clipboard; disable drops
+                    // our selection. Inert handle: dropped send is fine.
                     let _ = clip_cmd_tx.send(ClipCoordCmd::SetEnabled(enabled));
                     tracing::info!(
                         enabled,
@@ -408,12 +352,8 @@ pub(super) async fn run(task: Task) {
                         break;
                     }
                 } else if let Ok(offer) = ClipOffer::decode(&msg) {
-                    // The client copied: hand its lazy format list to the coordinator, which
-                    // installs a host-side source that fetches from the client on host paste.
-                    // Gated like the `ClipControl` above, against the LIVE mask: this is the
-                    // WRITE half of the same permission — it puts a client-owned selection on the
-                    // host's real desktop clipboard — so an offer arriving after a mid-session
-                    // revoke is dropped, not installed.
+                    // WRITE half of CLIPBOARD: installs a client selection on
+                    // the host clipboard.
                     if clip_offer_permitted(
                         session_grants.load(Ordering::Relaxed),
                         clip_enabled.load(Ordering::SeqCst),
@@ -436,18 +376,14 @@ pub(super) async fn run(task: Task) {
                 }
             }
             result = probe_result_rx.recv() => {
-                let Some(result) = result else { break }; // data plane gone
+                let Some(result) = result else { break };
                 if io::write_msg(&mut ctrl_send, &result.encode()).await.is_err() {
                     break;
                 }
             }
             n = shard_change_rx.recv(), if !shard_change_closed => {
-                // Mid-session shard renegotiation: the wire-MTU watcher decided (shrink on a
-                // constrained-path verdict / ack-gated jumbo grow). Only ever fires toward a
-                // client that advertised `Hello::max_shard_payload` — the watcher owns that
-                // gate. `None` = the watcher's bounded lifetime ended (normal, NOT a session
-                // end): disable this branch, exactly the `clip_offer_closed` pattern — a
-                // closed mpsc yields `None` perpetually and would busy-spin the select.
+                // `None` is the watcher's bounded lifetime, not session end:
+                // disable this branch or a closed mpsc busy-spins `select!`.
                 let Some(n) = n else { shard_change_closed = true; continue };
                 let msg = punktfunk_core::quic::ShardPayloadChanged { shard_payload: n };
                 if io::write_msg(&mut ctrl_send, &msg.encode()).await.is_err() {
@@ -455,26 +391,20 @@ pub(super) async fn run(task: Task) {
                 }
             }
             shape = cursor_shape_rx.recv() => {
-                // Cursor-forward bridge (M2): the encode loop diffed a new pointer bitmap.
-                // Rare (shape changes are human-paced); ≤ ~58 KiB fits the u16 frame by
-                // construction (cursor_fwd downscales).
-                let Some(shape) = shape else { break }; // data plane gone
+                // ≤ ~58 KiB fits the u16 frame (`cursor_fwd` downscales).
+                let Some(shape) = shape else { break };
                 if io::write_msg(&mut ctrl_send, &shape.encode()).await.is_err() {
                     break;
                 }
             }
             update = access_rx.recv(), if !access_closed => {
-                // Per-client access: an expiry warning (T−5 m / T−1 m) or a mid-session grant
-                // edit from the session's deadline/watch task — forward to the client
-                // (best-effort, latest-wins; an old client ignores the unknown message). `None`
-                // = the task ended (or never existed for an anonymous session): disable this
-                // branch, the `clip_offer_closed` pattern.
+                // `None` = deadline/watch ended or never existed (`--open`):
+                // disable the branch.
                 match update {
                     Some(u) => {
-                        // An edit that took CLIPBOARD away leaves the session up, so tell the
-                        // coordinator too: the lifecycle task clearing `clip_enabled` only stops
-                        // the host→client direction, while the selection it installed for this
-                        // device stays on the host clipboard until `SetEnabled(false)` drops it.
+                        // Clearing `clip_enabled` only stops host→client. The
+                        // selection this device installed stays on the host
+                        // clipboard until `SetEnabled(false)` drops it.
                         if u.grants & punktfunk_core::quic::GRANT_CLIPBOARD == 0 {
                             let _ = clip_cmd_tx.send(ClipCoordCmd::SetEnabled(false));
                         }
@@ -486,9 +416,8 @@ pub(super) async fn run(task: Task) {
                 }
             }
             offer = clip_offer_rx.recv(), if !clip_offer_closed => {
-                // Host copied → the coordinator minted a `ClipOffer`; forward it to the client
-                // (only while sync is on — a race with a just-received disable would otherwise
-                // leak a stale offer). `None` = coordinator gone; disable this branch.
+                // Forward while sync is on — a race with a just-received
+                // disable would leak a stale offer. `None` = coordinator gone.
                 match offer {
                     Some(offer) => {
                         if clip_enabled.load(Ordering::SeqCst)
@@ -501,15 +430,11 @@ pub(super) async fn run(task: Task) {
                 }
             }
             retarget = retarget_rx.recv() => {
-                // A pipeline rebuild re-resolved the Automatic rate (see `retarget_tx`). Same
-                // message the `SetBitrate` path answers with — the client's controller treats
-                // any `BitrateChanged` as authoritative for what the encoder now targets, which
-                // is exactly right here: it IS what the encoder now targets, we just weren't
-                // asked. PyroWave reaches this too, and should: its rate is pinned against
-                // mid-stream RETARGETS, but a mode switch legitimately re-resolves the pin
-                // (~1.6 bpp for the new pixel rate) and the client's live-rate display is
-                // otherwise stuck on the old one. Its controller is off, so nothing acts on it.
-                let Some(kbps) = retarget else { break }; // data plane gone
+                // Same `BitrateChanged` as `SetBitrate`. PyroWave is pinned
+                // against client retargets, but a mode switch re-resolves the
+                // pin (~1.6 bpp for the new pixel rate) and the live-rate
+                // display otherwise stays on the old number.
+                let Some(kbps) = retarget else { break };
                 tracing::info!(
                     kbps,
                     "encoder re-targeted by a pipeline rebuild — telling the client"
@@ -522,13 +447,10 @@ pub(super) async fn run(task: Task) {
                 }
             }
             gap = gap_rx.recv() => {
-                // A rebuild that kept the session up (a mode switch, or the Windows
-                // exclusive-topology eviction recovery) just finished. Tell the client how long
-                // its stream was stopped so its bitrate controller can throw the straddling
-                // report window away instead of reading our own stall as congestion — see
-                // `PipelineGap`. Sent here because this task is the control stream's sole writer,
-                // and sent AFTER the fact so `gap_ms` is a measurement rather than a promise.
-                let Some(gap_ms) = gap else { break }; // data plane gone
+                // Client bitrate controller must drop the straddling report
+                // window, not read our stall as congestion. After the fact:
+                // `gap_ms` is measured.
+                let Some(gap_ms) = gap else { break };
                 tracing::info!(
                     gap_ms,
                     "pipeline rebuilt in place — telling the client the stream had a gap"
@@ -541,11 +463,10 @@ pub(super) async fn run(task: Task) {
                 }
             }
             correction = reconfig_result_rx.recv() => {
-                // H2 rollback/correction ack: the data plane reports the mode ACTUALLY live
-                // after a rebuild that failed (stayed at the old mode) or that the backend
-                // honored at a different refresh. Track it so a later rejection's
-                // `mode: active` echo is truthful too.
-                let Some(ack) = correction else { break }; // data plane gone
+                // Mode actually live after a failed rebuild or a refresh the
+                // backend honored differently. Keep `active` truthful for
+                // later rejection echoes.
+                let Some(ack) = correction else { break };
                 active = ack.mode;
                 if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
                     break;
@@ -555,14 +476,11 @@ pub(super) async fn run(task: Task) {
     }
 }
 
-/// Resolve a client's [`ClipControl`] against the three authorities, in precedence order:
-/// the operator policy (`None` = clipboard off host-wide), the device's `CLIPBOARD` grant
-/// (per-client access §5.4 — ANDed into the policy, never overriding it), and backend
-/// availability. Returns `(enabled, resolved_policy, reason)` for the [`ClipState`] ack.
+/// Operator policy (`None` = off), then CLIPBOARD grant (AND, never override),
+/// then backend availability. Returns `(enabled, resolved_policy, reason)`.
 ///
-/// The grant refusal still reports the operator policy bits (like the backend refusal): the
-/// client's UI can then say "not permitted for this device" without also greying the file
-/// toggle for the wrong reason.
+/// A grant refusal still reports the operator policy bits so the client can
+/// say "not permitted for this device" without greying the file toggle.
 fn resolve_clip_control(
     policy: Option<u8>,
     granted: bool,
@@ -590,10 +508,8 @@ fn resolve_clip_control(
     }
 }
 
-/// Whether a client's [`ClipOffer`] may be installed on the host's real desktop clipboard: the
-/// device's LIVE `CLIPBOARD` grant, ANDed with the sync state its last [`ClipControl`] resolved
-/// (which already folded in the operator policy and backend availability). Both are read when the
-/// offer arrives, so a revoke mid-session closes this direction as it closes the other one.
+/// LIVE CLIPBOARD grant ANDed with the last resolved sync state. Both are
+/// read at offer time so a mid-session revoke closes this direction too.
 fn clip_offer_permitted(grants: u32, clip_enabled: bool) -> bool {
     grants & punktfunk_core::quic::GRANT_CLIPBOARD != 0 && clip_enabled
 }
@@ -612,15 +528,10 @@ mod tests {
         flags: 0,
     };
 
-    /// The three-way clipboard resolution (per-client access WP5): operator policy off →
-    /// POLICY_DISABLED; policy on but the device's grant unbit → NOT_PERMITTED (grants AND into
-    /// the policy, and the refusal names the device, not the host); granted + policy on →
-    /// today's backend/files resolution unchanged.
     #[test]
     fn clip_resolution_three_way() {
         let both = CLIP_POLICY_TEXT | CLIP_POLICY_FILES;
 
-        // Operator policy off: the host-wide refusal wins over everything, grant included.
         assert_eq!(
             resolve_clip_control(None, false, true, ON),
             (false, 0, CLIP_REASON_POLICY_DISABLED)
@@ -630,19 +541,15 @@ mod tests {
             (false, 0, CLIP_REASON_POLICY_DISABLED)
         );
 
-        // Policy on, grant unbit: refused as not-permitted — even with a live backend, and for
-        // a DISABLE too (an ungranted device can't "resolve" any clipboard state but off).
         assert_eq!(
             resolve_clip_control(Some(both), false, true, ON),
             (false, both, CLIP_REASON_NOT_PERMITTED)
         );
 
-        // Granted: the pre-grants resolution, unchanged — backend gate…
         assert_eq!(
             resolve_clip_control(Some(both), true, false, ON),
             (false, both, CLIP_REASON_BACKEND_UNAVAILABLE)
         );
-        // …files-vs-policy…
         assert_eq!(
             resolve_clip_control(
                 Some(CLIP_POLICY_TEXT),
@@ -655,28 +562,19 @@ mod tests {
             ),
             (true, CLIP_POLICY_TEXT, CLIP_REASON_NO_FILES)
         );
-        // …and the plain enable.
         assert_eq!(
             resolve_clip_control(Some(both), true, true, ON),
             (true, both, CLIP_REASON_OK)
         );
     }
 
-    /// The client→host direction is gated by the same grant as the host→client one: an offer from
-    /// a device that never had CLIPBOARD is dropped, and so is one that arrives after a
-    /// mid-session revoke — the console edit lands in the live mask (and clears the enable flag
-    /// with it), and the very next offer resolves against the new one.
     #[test]
     fn clip_offer_needs_the_live_grant() {
-        // The normal case: granted and sync on.
         assert!(clip_offer_permitted(GRANT_ALL, true));
 
-        // Never granted — nothing to install, whatever the client claims about sync.
         assert!(!clip_offer_permitted(GRANT_ALL & !GRANT_CLIPBOARD, true));
         assert!(!clip_offer_permitted(0, true));
 
-        // Revoked mid-session: the lifecycle task stored the edited mask and cleared the enable
-        // flag; both halves of that state refuse the offer on their own.
         assert!(!clip_offer_permitted(GRANT_ALL & !GRANT_CLIPBOARD, false));
         assert!(!clip_offer_permitted(GRANT_ALL, false));
     }

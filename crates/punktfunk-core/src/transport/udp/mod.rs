@@ -1,12 +1,13 @@
-//! Real UDP datagram transport — native sockets, no async runtime.
+//! Connected UDP datagram transport. Native sockets, no async runtime.
 //!
-//! Send is batched via `sendmmsg` ([`Transport::send_batch`], ≤64/syscall) and recv via `recvmmsg`
-//! ([`Transport::recv_batch`], ≤128/syscall into a reused ring) on Linux AND Android (which is
-//! `target_os = "android"`, not `"linux"` — it needs its own bionic binding, see `android_mmsg`)
-//! — the 1 Gbps+ syscall lever (~125k → a few-k syscalls/sec at line rate). The host additionally
-//! paces each frame's send across the frame interval (see `native.rs::paced_submit`) so a real
-//! NIC doesn't drop a line-rate burst. All three layer on this same [`Transport`] seam (scalar
-//! fallbacks for loopback and the remaining targets).
+//! [`UdpTransport`] implements [`Transport`]: send/recv never block; a full kernel
+//! buffer or a connected-UDP ICMP blip is a lossy drop, never a teardown. Linux and
+//! Android batch with `sendmmsg`/`recvmmsg` (Linux also UDP GSO); Windows uses USO;
+//! Apple/BSD drain into reused buffers. Other targets keep the trait's scalar loop.
+//!
+//! Hole-punch (`PUNCH_MAGIC`) opens the NAT/firewall return path so host→client
+//! video follows the observed source. Pin GSO with `PUNKTFUNK_GSO`; DSCP with
+//! `PUNKTFUNK_DSCP`. Platform bodies live in `linux` / `windows` / `apple`.
 
 use super::Transport;
 use crate::packet::MAX_DATAGRAM_BYTES;
@@ -21,44 +22,22 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::send_uso_all;
 
-/// Receive buffer size. `Config::validate` bounds `shard_payload` so a well-formed
-/// datagram (header + shard + crypto overhead) always fits in [`MAX_DATAGRAM_BYTES`];
-/// the `+ 1` byte lets us detect an oversized datagram (a full read) instead of
-/// silently truncating it.
+/// One past [`MAX_DATAGRAM_BYTES`]. `Config::validate` keeps a well-formed datagram
+/// (header + shard + crypto) inside that bound; a full read is oversized, not truncated.
 const RECV_BUF: usize = MAX_DATAGRAM_BYTES + 1;
 
-/// True for transient socket conditions that must be a lossy drop / "no data this poll" — NOT a
-/// stream teardown. Two cases:
-/// - `WouldBlock`: the kernel send/recv buffer is momentarily full (a frame burst saturated the tx
-///   queue — the dominant condition at 1 Gbps+). Drop the packet; FEC + the next frame recover.
-/// - `ConnectionRefused` / `ConnectionReset`: a *connected* UDP socket received an asynchronous ICMP
-///   port-unreachable / reset for an *earlier* datagram. With data-plane hole-punching the path
-///   blips — the peer's data socket briefly gone, a NAT rebind, or a stale ICMP from punch setup —
-///   so erroring out here kills a stream that the very next packet would resume. If the peer is
-///   genuinely gone, the QUIC control plane times out and ends the session cleanly instead. (This is
-///   the classic connected-UDP "ICMP errors are advisory" rule, doubly true with hole-punching.)
-/// - `ENOBUFS`: a WiFi/wlan driver (e.g. `ath11k` on the Steam Deck) returns this — NOT `EAGAIN`/
-///   `WouldBlock` — when its tx queue is momentarily full. Rust maps `ENOBUFS` to
-///   `ErrorKind::Uncategorized`, so the `WouldBlock` arm misses it; without this a transient
-///   tx-queue burst tears the whole stream down (observed live: the host streamed flawlessly on
-///   loopback / under a debugger — anything slow enough not to fill the small wlan0 buffer — but
-///   died at full rate over WiFi). Same lossy-drop contract as `WouldBlock`; FEC + the next frame
-///   recover. Asynchronous network-path blips (`ENETUNREACH`/`EHOSTUNREACH`/`ENETDOWN`/`EHOSTDOWN`)
-///   are droppable for the same reason a stale ICMP is.
-/// - Windows `WSAENOBUFS` (10055): the exact analogue of unix `ENOBUFS` — a high-bitrate keyframe
-///   burst (one `WSASendMsg` USO super-buffer is up to ~512 segments ≈ 700 KB) momentarily exhausts
-///   the socket send buffer / AFD non-paged pool, and Winsock reports `WSAENOBUFS`, which Rust maps
-///   to `ErrorKind::Uncategorized` (so the `WouldBlock` arm misses it, exactly like unix `ENOBUFS`).
-///   Without treating it as transient a Windows host tears the whole session down under load
-///   (observed live: `native::stream` "send failed — stopping stream" on a paced video burst). Same
-///   lossy-drop contract; FEC + the next frame recover. The `WSAENET*`/`WSAEHOST*` family is the
-///   Windows counterpart of the droppable unix network-path blips above.
+/// Lossy drop, not a stream teardown. `WouldBlock` is a full kernel buffer.
+/// Connected-UDP `ConnectionRefused`/`ConnectionReset` are stale ICMP — a gone
+/// peer is the QUIC control plane's timeout, not this socket. `ENOBUFS`,
+/// `WSAENOBUFS` (10055), and the `ENET*`/`EHOST*` family have no stable
+/// `ErrorKind` (Rust maps them to `Uncategorized`), so they are matched as
+/// raw errno below — same contract as `WouldBlock`.
 fn is_transient_io(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::{ConnectionRefused, ConnectionReset, WouldBlock};
     if matches!(e.kind(), WouldBlock | ConnectionRefused | ConnectionReset) {
         return true;
     }
-    // `ENOBUFS` & friends have no stable `ErrorKind`, so match the raw errno.
+    // No stable `ErrorKind` for these; match the raw errno.
     #[cfg(unix)]
     {
         matches!(
@@ -70,13 +49,12 @@ fn is_transient_io(e: &std::io::Error) -> bool {
                 | Some(libc::EHOSTDOWN)
         )
     }
-    // Windows Winsock codes (WSAE*), raw like the sibling `uso_unsupported`. WSAEWOULDBLOCK (10035)
-    // already maps to `ErrorKind::WouldBlock` above, so it isn't repeated here.
+    // Winsock WSAE* raw codes (WSAEWOULDBLOCK already maps to WouldBlock).
     #[cfg(windows)]
     {
         matches!(
             e.raw_os_error(),
-            Some(10055)   // WSAENOBUFS    — tx queue / send buffer full (the dominant high-bitrate drop)
+            Some(10055)   // WSAENOBUFS
                 | Some(10051) // WSAENETUNREACH
                 | Some(10065) // WSAEHOSTUNREACH
                 | Some(10050) // WSAENETDOWN
@@ -89,21 +67,12 @@ fn is_transient_io(e: &std::io::Error) -> bool {
     }
 }
 
-/// Data-plane NAT/firewall hole-punch marker. The video data plane is a raw UDP socket distinct
-/// from the QUIC control connection; on a flat LAN the host can send straight to the client, but
-/// across a NAT or a stateful inter-VLAN firewall the unsolicited host→client video is rejected
-/// (ICMP port-unreachable). So the client sends these tiny datagrams FROM its data socket TO the
-/// host's data port: that opens the firewall/NAT return path and lets the host learn the client's
-/// *observed* source (the NAT-translated address, not the client's reported private one). It's the
-/// only thing a client ever sends on the data plane (video is host→client), so the host treats any
-/// punch-magic datagram purely as a source-address probe and never as stream data.
+/// Client→host marker on the video data socket. Opens the NAT/firewall return
+/// path and advertises the observed source. Never treated as stream data.
 pub const PUNCH_MAGIC: &[u8] = b"PFpunch1";
 
-/// Spawn the client-side data-plane hole-punch keepalive. `sock` is a clone of the data socket
-/// (already `connect`ed to the host's data port — see [`UdpTransport::try_clone_socket`]). Bursts
-/// fast at first to open the NAT/firewall path before the host's punch-wait expires, then steady
-/// keepalive so a stateful firewall's idle timeout can't close the path during a static, low-bitrate
-/// scene. Stops when `stop` is set (session teardown) or the socket closes. No-op cost on a flat LAN.
+/// Client-side punch keepalive on a clone of the connected data socket.
+/// Stops when `stop` is set or the socket closes.
 pub fn spawn_data_punch(sock: UdpSocket, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     std::thread::Builder::new()
         .name("punktfunk-data-punch".into())
@@ -112,17 +81,15 @@ pub fn spawn_data_punch(sock: UdpSocket, stop: std::sync::Arc<std::sync::atomic:
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 match sock.send(PUNCH_MAGIC) {
                     Ok(_) => {}
-                    // Same contract as `Transport::send`: a momentarily full tx queue, a stale
-                    // ICMP or a network-path blip is a lossy drop, not a reason to stop holding
-                    // the NAT/firewall path open. Breaking here is silent and permanent — the
-                    // path recovers, video keeps flowing, and the stream dies later when the
-                    // idle timer expires the mapping during a static scene.
+                    // Transient: keep the keepalive alive. Breaking here is silent
+                    // and permanent — the mapping then expires during a static scene.
                     Err(e) if is_transient_io(&e) => {}
                     Err(e) => {
                         tracing::debug!(error = %e, "data-plane punch send failed — stopping keepalive");
                         break;
                     }
                 }
+                // 15 × 200 ms ≈ 3 s of bursts (host punch-wait ~2.5 s); then 2 s keepalive.
                 let delay_ms = if i < 15 { 200 } else { 2000 };
                 i = i.saturating_add(1);
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
@@ -139,22 +106,17 @@ pub struct UdpTransport {
 }
 
 impl UdpTransport {
-    /// Bind `local` and `connect` to `peer`, so `send`/`recv` need no address and the
-    /// kernel filters to this peer. Non-blocking, matching the [`Transport`] contract.
     pub fn connect(local: &str, peer: &str) -> std::io::Result<Self> {
         Self::from_socket(UdpSocket::bind(local)?, peer)
     }
 
-    /// Adopt an already-bound socket for the data plane: `connect` it to `peer`, tune buffers +
-    /// QoS, go non-blocking. Lets the host bind the data port up front (e.g. a fixed `--data-port`)
-    /// and keep the *same* socket from handshake through streaming — no drop-then-rebind window in
-    /// which a concurrent session could steal a fixed port.
+    /// Adopt an already-bound socket. The host binds the data port before
+    /// handshake so a concurrent session cannot steal a fixed `--data-port`.
     pub fn from_socket(socket: UdpSocket, peer: &str) -> std::io::Result<Self> {
         socket.connect(peer)?;
         super::qos::grow_socket_buffers(&socket);
-        // The native data plane is video-dominant — tag it as the video class (opt-in via
-        // PUNKTFUNK_DSCP). Each end marks its own egress; the socket is connected by now, as
-        // the Windows qWAVE flow requires.
+        // Video class (opt-in via PUNKTFUNK_DSCP). After `connect`: Windows qWAVE
+        // requires a connected socket.
         let qos_flow = super::qos::set_media_qos(&socket, super::qos::MediaClass::Video);
         socket.set_nonblocking(true)?;
         Ok(UdpTransport {
@@ -163,16 +125,10 @@ impl UdpTransport {
         })
     }
 
-    /// Host side of the data plane for clients that may sit behind NAT / a stateful inter-VLAN
-    /// firewall. Bind `local`, then block up to `punch_timeout` for the client's first
-    /// [`PUNCH_MAGIC`] datagram and `connect` to its *observed* source — so video flows back
-    /// through the path the client just opened, to the address+port the host actually sees (the
-    /// NAT-translated one, which can differ from the client-reported `fallback_peer`). If no punch
-    /// arrives (a client that doesn't hole-punch), fall back to `fallback_peer` — the same flat-LAN
-    /// behaviour as [`connect`](Self::connect). Returns `(transport, punched)`.
-    ///
-    /// `expect_ip` is the *authenticated* peer address (the QUIC connection's remote IP) — see
-    /// [`from_socket_punch`](Self::from_socket_punch) for why only punches from it are honoured.
+    /// Wait up to `punch_timeout` for [`PUNCH_MAGIC`] from `expect_ip`, then
+    /// `connect` to the observed source so video returns through the path the
+    /// client opened. No punch → `fallback_peer` (flat-LAN, same as [`connect`](Self::connect)).
+    /// Returns `(transport, punched)`.
     pub fn connect_via_punch(
         local: &str,
         fallback_peer: &str,
@@ -187,18 +143,11 @@ impl UdpTransport {
         )
     }
 
-    /// [`connect_via_punch`](Self::connect_via_punch) on an already-bound socket — see
-    /// [`from_socket`](Self::from_socket) for why the host binds the data port up front.
+    /// [`connect_via_punch`](Self::connect_via_punch) on an already-bound socket.
     ///
-    /// `expect_ip` binds the data plane to the peer the control plane already authenticated.
-    /// [`PUNCH_MAGIC`] is a fixed public constant carrying no key, nonce or session id, so without
-    /// this check *any* source that lands an 8-byte datagram on the (ephemeral, sprayable) data
-    /// port during the punch wait becomes the video destination — the legitimate client is then
-    /// filtered out by the `connect` below and receives nothing, while QUIC stays healthy so no
-    /// reconnect is triggered. Only the *port* is in question here (that is what a NAT remaps, and
-    /// what the punch exists to discover); the IP is known, because the client binds `0.0.0.0:0`
-    /// and dials the same host IP as its QUIC connection, so the kernel picks the same source IP
-    /// for both planes and any NAT on the path presents one source IP for both.
+    /// `expect_ip` is the QUIC-authenticated peer. `PUNCH_MAGIC` carries no session
+    /// id, so only that IP's punch is adopted — the port is what NAT remaps, and
+    /// the client uses the same source IP on both planes.
     pub fn from_socket_punch(
         socket: UdpSocket,
         fallback_peer: &str,
@@ -209,9 +158,8 @@ impl UdpTransport {
         let mut buf = [0u8; 64];
         let mut observed: Option<std::net::SocketAddr> = None;
         loop {
-            // Budget the read from what's LEFT, not the full window: off-peer datagrams are
-            // discarded below, and a full-window timeout per read would let a stray flood stretch
-            // the punch wait far past `punch_timeout`.
+            // Remaining budget, not a fresh full window: a stray flood must not
+            // stretch the wait past `punch_timeout`.
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 break;
@@ -226,8 +174,7 @@ impl UdpTransport {
                     observed = Some(src);
                     break;
                 }
-                // Stray, or a well-formed punch from someone who isn't the authenticated peer —
-                // keep waiting for a real one.
+                // Off-peer or not PUNCH_MAGIC: keep waiting.
                 Ok(_) => {}
                 Err(e)
                     if matches!(
@@ -256,14 +203,11 @@ impl UdpTransport {
         ))
     }
 
-    /// A second handle to the data socket, for sending hole-punch keepalives ([`PUNCH_MAGIC`])
-    /// while the [`Session`](crate::Session) owns the transport. The socket is already `connect`ed
-    /// to the host's data port, so `clone.send(PUNCH_MAGIC)` reaches it with no address.
+    /// Clone for punch keepalives while [`Session`](crate::Session) owns the transport.
     pub fn try_clone_socket(&self) -> std::io::Result<UdpSocket> {
         self.socket.try_clone()
     }
 
-    /// The bound local address (e.g. to learn the OS-assigned ephemeral port).
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.socket.local_addr()
     }
@@ -273,46 +217,22 @@ impl Transport for UdpTransport {
     fn send(&self, packet: &[u8]) -> std::io::Result<bool> {
         match self.socket.send(packet) {
             Ok(_) => Ok(true),
-            // The kernel UDP send buffer is momentarily full (a frame burst saturated the
-            // tx queue — common right after attaching to an already-running source that
-            // emits at full rate, and the dominant failure mode at 1 Gbps+). Drop this packet
-            // rather than fail the whole stream: the data plane is lossy + FEC-protected and the
-            // next frame/RFI keyframe recovers, whereas blocking would queue stale frames and add
-            // latency, and erroring tears the session down. `Ok(false)` surfaces the drop so the
-            // session counts it (`packets_send_dropped`) instead of it being invisible. Mirrors
-            // the `recv` WouldBlock handling above.
+            // Lossy drop (full tx queue / stale ICMP / path blip); `Ok(false)` is counted.
             Err(e) if is_transient_io(&e) => Ok(false),
             Err(e) => Err(e),
         }
     }
 
-    /// Batched send via `sendmmsg` (up to 64 datagrams per syscall) — the connected socket needs
-    /// no per-message address. The socket is non-blocking, so a full send buffer surfaces as a
-    /// short count (or `EAGAIN` with nothing sent); we stop and report what went out rather than
-    /// block or retry — the data plane is lossy + FEC-protected, and blocking would queue stale
-    /// frames + add latency. Ports the proven GameStream `sendmmsg_all`. Other targets fall back
-    /// to the trait's scalar `send` loop (no `sendmmsg`).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn send_batch(&self, packets: &[&[u8]]) -> std::io::Result<usize> {
         linux::send_batch(self, packets)
     }
 
-    /// UDP GSO send (see [`Transport::send_gso`]). Coalesces the frame's equal-size packets into a
-    /// reused scratch buffer and hands the kernel ≤64-segment super-buffers via `sendmsg(UDP_SEGMENT)`
-    /// — one GSO skb per chunk instead of one per packet, the multi-Gbps lever. Opt-in
-    /// (`PUNKTFUNK_GSO`); falls back to `send_batch` when off, when packets aren't uniform-size, or on
-    /// any GSO error (which also latches it off for the process). Same lossy short-count contract.
     #[cfg(target_os = "linux")]
     fn send_gso(&self, packets: &[&[u8]]) -> std::io::Result<usize> {
         linux::send_gso(self, packets)
     }
 
-    /// UDP USO send (see [`Transport::send_gso`]) — Windows. Coalesces the frame's equal-size packets
-    /// and hands Winsock ≤512-segment super-buffers via `WSASendMsg(UDP_SEND_MSG_SIZE)` — one syscall
-    /// per chunk instead of one `send` per packet, the 1 Gbps+ lever (Windows analogue of Linux GSO).
-    /// On by default (kill: `PUNKTFUNK_GSO=0`); falls back to the scalar `send_batch` when off, when
-    /// packets aren't uniform-size, or on a USO-unsupported error (which latches it off for the
-    /// process). Same lossy short-count contract.
     #[cfg(target_os = "windows")]
     fn send_gso(&self, packets: &[&[u8]]) -> std::io::Result<usize> {
         windows::send_gso(self, packets)
@@ -321,8 +241,7 @@ impl Transport for UdpTransport {
     fn recv(&self) -> std::io::Result<Option<Vec<u8>>> {
         let mut buf = vec![0u8; RECV_BUF];
         match self.socket.recv(&mut buf) {
-            // A read that fills the whole buffer means the datagram was larger than any
-            // valid packet — drop it rather than hand a truncated, corrupt packet up.
+            // Full buffer = larger than any valid packet; drop rather than truncate.
             Ok(n) if n >= RECV_BUF => Ok(None),
             Ok(n) => {
                 buf.truncate(n);
@@ -333,25 +252,11 @@ impl Transport for UdpTransport {
         }
     }
 
-    /// Batched receive via `recvmmsg` — drains up to `out.len()` datagrams in one syscall into the
-    /// caller's reused buffers (no per-packet allocation). `MSG_DONTWAIT` keeps it non-blocking
-    /// (the socket already is); `EAGAIN` → `0`. A datagram larger than a buffer is truncated and
-    /// `lens[i]` reaches the buffer size — the reassembler then rejects it as malformed, matching
-    /// `recv`'s oversized-drop. Android uses the local bionic binding (see `android_mmsg`).
-    /// Apple/BSD use the `recv`-loop override below; other non-unix the trait's scalar default.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn recv_batch(&self, out: &mut [Vec<u8>], lens: &mut [usize]) -> std::io::Result<usize> {
         linux::recv_batch(self, out, lens)
     }
 
-    /// Batched receive for Apple/BSD targets, which have no `recvmmsg(2)`. Drains up to `out.len()`
-    /// datagrams per call with `libc::recv(MSG_DONTWAIT)` straight into the caller's reused `out[i]`
-    /// buffers — eliminating the per-packet 2 KB `vec!` allocation (and its zeroing + a copy) that
-    /// the scalar `recv` + trait-default `recv_batch` incur. THIS is the macOS-client throughput
-    /// fix: at line rate the alloc/free churn — not the syscall — was the single-core wall (Moonlight
-    /// batches; our client per-packet-allocated). It is still one syscall per datagram (a future
-    /// `recvmsg_x` batch would cut that too); `EAGAIN` ends the drain. Oversized datagrams set
-    /// `lens[i] == buf.len()` and the caller (`poll_frame`) drops them — same contract as `recvmmsg`.
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     fn recv_batch(&self, out: &mut [Vec<u8>], lens: &mut [usize]) -> std::io::Result<usize> {
         apple::recv_batch(self, out, lens)
@@ -363,8 +268,6 @@ mod tests {
     use super::*;
     use crate::transport::Transport;
 
-    /// A connected UDP socket's stale ICMP (ECONNREFUSED/RESET) and a full buffer (EAGAIN) must all
-    /// be classified transient — a lossy drop, never a stream teardown. A real error must not be.
     #[test]
     fn transient_io_covers_connected_udp_blips() {
         use std::io::{Error, ErrorKind};
@@ -383,11 +286,7 @@ mod tests {
         }
     }
 
-    /// The raw-errno tx-queue-full / network-blip codes have no stable `ErrorKind` (they surface as
-    /// `Uncategorized`), so they only get caught by the platform `raw_os_error()` arms. A burst that
-    /// momentarily exhausts the send buffer must stay a lossy drop, never a teardown — this is the
-    /// regression guard for the Windows `WSAENOBUFS` (10055) session crash and the unix `ENOBUFS`
-    /// wlan-driver case. Gated per platform because a code is only classified on its own OS.
+    /// Raw errno with no stable `ErrorKind` (they surface as `Uncategorized`).
     #[test]
     fn transient_io_covers_raw_tx_queue_and_path_codes() {
         use std::io::Error;
@@ -406,7 +305,6 @@ mod tests {
                     "unix errno {code} should be transient"
                 );
             }
-            // A genuine failure with no stable ErrorKind must still tear down.
             assert!(
                 !is_transient_io(&Error::from_raw_os_error(libc::EACCES)),
                 "EACCES must stay fatal"
@@ -422,7 +320,6 @@ mod tests {
                     "WSA code {code} should be transient"
                 );
             }
-            // WSAEACCES (10013) — a real failure that must stay fatal.
             assert!(
                 !is_transient_io(&Error::from_raw_os_error(10013)),
                 "WSAEACCES must stay fatal"
@@ -430,9 +327,7 @@ mod tests {
         }
     }
 
-    /// `send_batch` delivers a whole frame's worth of packets over real loopback UDP — exercising
-    /// the `sendmmsg` path on Linux (the scalar-loop default elsewhere). 100 × 200 B = 20 KB fits
-    /// the socket buffer, so loopback is lossless and every packet must arrive intact + in order.
+    /// 100 × 200 B = 20 KB, under the loopback socket buffer, so every packet must arrive.
     #[test]
     fn send_batch_delivers_over_loopback() {
         let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -467,7 +362,7 @@ mod tests {
                     );
                     seen.insert(u32::from_le_bytes(buf[0..4].try_into().unwrap()));
                 }
-                Err(_) => break, // read timeout — stop and let the assert report the shortfall
+                Err(_) => break, // timeout: let the assert report the shortfall
             }
         }
         assert_eq!(
@@ -477,13 +372,9 @@ mod tests {
         );
     }
 
-    /// `recv_batch` drains many datagrams per call over real loopback UDP — exercising `recvmmsg`
-    /// on Linux (the scalar `recv` default elsewhere). Send 50 distinct packets, then drain in
-    /// batches and assert every one arrives intact with the right length.
     #[test]
     fn recv_batch_drains_over_loopback() {
-        // Receiver is the UdpTransport (the thing under test); sender is a raw socket bound to a
-        // known addr so the connected receiver accepts its datagrams.
+        // Transport under test is the receiver; a raw socket sends so the connected filter accepts it.
         let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let tx_addr = tx.local_addr().unwrap().to_string();
         let rx = UdpTransport::connect("127.0.0.1:0", &tx_addr).unwrap();
@@ -521,17 +412,14 @@ mod tests {
         );
     }
 
-    /// The punch discovers the peer's NAT-remapped *port*, so a punch from the authenticated IP on
-    /// a port that differs from the client-reported one must still be adopted — that is the whole
-    /// reason hole-punching exists, and the source-IP check must not break it.
     #[test]
     fn punch_adopts_remapped_port_from_the_authenticated_peer() {
-        // Stands in for the client's post-NAT data socket: same IP as the "QUIC peer", new port.
+        // Post-NAT data socket: same IP as the QUIC peer, new port.
         let puncher = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         puncher
             .set_read_timeout(Some(std::time::Duration::from_millis(500)))
             .unwrap();
-        // The client-*reported* address, which the NAT remapped — video must NOT go here.
+        // Client-reported address; video must not go here once the punch is adopted.
         let reported = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         reported
             .set_read_timeout(Some(std::time::Duration::from_millis(200)))
@@ -562,12 +450,7 @@ mod tests {
         );
     }
 
-    /// Adopting a punch does more than pick a destination: `connect`ing to the *observed source*
-    /// binds the data plane's full 5-tuple, so from that moment the kernel drops everything that
-    /// isn't the punched peer. That is what stops a second source on the same authenticated IP (a
-    /// co-NAT peer, another local process) from re-steering the video plane with a later punch or
-    /// feeding the session's reassembler — the punch race is only ever open until the first
-    /// accepted datagram fixes the tuple.
+    /// `connect` to the observed source binds the 5-tuple; later punches from the same IP must not land.
     #[test]
     fn a_punched_transport_only_accepts_the_punched_five_tuple() {
         let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -586,8 +469,7 @@ mod tests {
         .unwrap();
         assert!(punched, "the peer's punch must be adopted");
 
-        // Same authenticated IP, different port: a punch AND a payload, both after the tuple is
-        // fixed. Neither may be seen; the punched peer's datagram still must be.
+        // Same IP, different port, after the tuple is fixed. Neither datagram may be seen.
         let stray = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         stray.send_to(PUNCH_MAGIC, host_addr).unwrap();
         stray.send_to(b"stray", host_addr).unwrap();
@@ -607,10 +489,6 @@ mod tests {
         );
     }
 
-    /// A punch from any source other than the QUIC-authenticated peer must be ignored: `PUNCH_MAGIC`
-    /// is a fixed public constant with no key or session id, so honouring an off-peer punch lets
-    /// anyone who lands an 8-byte datagram on the ephemeral data port steal (or redirect) the video
-    /// plane while the control plane stays healthy. Falling back to the reported address is correct.
     #[test]
     fn punch_from_an_unauthenticated_source_is_ignored() {
         let attacker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -626,7 +504,7 @@ mod tests {
         let host_addr = host_sock.local_addr().unwrap();
         attacker.send_to(PUNCH_MAGIC, host_addr).unwrap();
 
-        // The authenticated peer is TEST-NET-1, so nothing arriving over loopback is the peer.
+        // TEST-NET-1: nothing arriving over loopback is this peer.
         let (transport, punched) = UdpTransport::from_socket_punch(
             host_sock,
             &legit.local_addr().unwrap().to_string(),

@@ -1,4 +1,7 @@
-//! The presenter-side overlay composite pipeline (premultiplied-alpha quad over the swapchain).
+//! Premultiplied-alpha overlay quad over the swapchain after the video blit.
+//!
+//! Views and framebuffers are per swapchain image: take, destroy after GPU idle,
+//! then rebuild.
 
 use super::gpu::subresource_range;
 use super::OverlayPipe;
@@ -8,8 +11,7 @@ use ash::vk;
 
 impl OverlayPipe {
     pub(super) fn new(device: &ash::Device, format: vk::Format) -> Result<OverlayPipe> {
-        // LOAD the blitted video, blend the overlay, end PRESENT-ready — this pass owns
-        // the swapchain image's final transition on overlay frames.
+        // This pass owns the last layout transition on overlay frames (LOAD, end PRESENT-ready).
         let attachment = [vk::AttachmentDescription::default()
             .format(format)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -32,8 +34,7 @@ impl OverlayPipe {
             .dst_access_mask(
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             )];
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `device` is live; CreateInfo and its borrowed slices outlive the call.
         let render_pass = unsafe {
             device.create_render_pass(
                 &vk::RenderPassCreateInfo::default()
@@ -45,8 +46,7 @@ impl OverlayPipe {
         }
         .context("overlay render pass")?;
 
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `device` is live; CreateInfo is a local that outlives the call.
         let sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -65,8 +65,7 @@ impl OverlayPipe {
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .immutable_samplers(&samplers)];
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `device` is live; `bindings` and `samplers` outlive the call.
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -74,8 +73,7 @@ impl OverlayPipe {
             )
         }?;
         let set_layouts = [set_layout];
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `device` is live; `set_layouts` outlives the call.
         let pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
@@ -85,8 +83,7 @@ impl OverlayPipe {
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)];
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `device` is live; `pool_sizes` outlives the call.
         let desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -95,8 +92,7 @@ impl OverlayPipe {
                 None,
             )
         }?;
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `device` and `desc_pool` are live; `set_layouts` outlives the call.
         let desc_set = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
@@ -109,7 +105,7 @@ impl OverlayPipe {
             render_pass,
             pipeline_layout,
             include_bytes!("../../shaders/overlay.frag.spv"),
-            true, // premultiplied blend over the video
+            true, // overlay.frag writes premultiplied alpha
         )?;
         Ok(OverlayPipe {
             render_pass,
@@ -124,7 +120,7 @@ impl OverlayPipe {
         })
     }
 
-    /// Detach the current per-swapchain-image targets (for deferred destruction).
+    /// Caller destroys these after the GPU is idle.
     pub(super) fn take_targets(&mut self) -> (Vec<vk::ImageView>, Vec<vk::Framebuffer>) {
         (
             std::mem::take(&mut self.views),
@@ -132,8 +128,8 @@ impl OverlayPipe {
         )
     }
 
-    /// Rebuild the per-swapchain-image views + framebuffers (swapchain recreation).
-    /// The caller has already taken the old targets for deferred destruction.
+    /// Caller must have taken the old targets; otherwise `destroy_targets` frees them
+    /// while still in flight.
     pub(super) fn rebuild_targets(
         &mut self,
         device: &ash::Device,
@@ -143,9 +139,7 @@ impl OverlayPipe {
     ) -> Result<()> {
         self.destroy_targets(device); // no-op after take_targets; safety net otherwise
         for &image in images {
-            // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
-            // this type and live for the call, and every builder struct is a local that outlives
-            // it.
+            // SAFETY: `image` is a live swapchain image; CreateInfo outlives the call.
             let view = unsafe {
                 device.create_image_view(
                     &vk::ImageViewCreateInfo::default()
@@ -158,9 +152,7 @@ impl OverlayPipe {
             }?;
             self.views.push(view);
             let attachments = [view];
-            // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
-            // this type and live for the call, and every builder struct is a local that outlives
-            // it.
+            // SAFETY: `view` and `self.render_pass` are live; CreateInfo outlives the call.
             let fb = unsafe {
                 device.create_framebuffer(
                     &vk::FramebufferCreateInfo::default()
@@ -178,8 +170,8 @@ impl OverlayPipe {
     }
 
     fn destroy_targets(&mut self, device: &ash::Device) {
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: these views and framebuffers are owned here; the GPU is idle for them
+        // (fence wait or the swapchain already retired).
         unsafe {
             for fb in self.framebuffers.drain(..) {
                 device.destroy_framebuffer(fb, None);
@@ -192,10 +184,8 @@ impl OverlayPipe {
 
     pub(super) fn destroy(&mut self, device: &ash::Device) {
         self.destroy_targets(device);
-        // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and the
-        // GPU is known idle for them (the fence/queue-wait on the path here, or the swapchain
-        // being retired), which is the obligation that makes a destroy sound rather than the
-        // handle merely being non-null.
+        // SAFETY: these objects are owned here; the GPU is idle for them (fence/queue-wait
+        // on this path, or the swapchain already retired).
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);

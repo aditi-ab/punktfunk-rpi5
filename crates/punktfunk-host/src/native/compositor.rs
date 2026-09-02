@@ -1,15 +1,21 @@
-//! Compositor-preference resolution for the native handshake (plan §W1 — carved out of the
-//! [`super`] module): map the client's [`CompositorPref`] to a concrete `crate::vdisplay::Compositor`
-//! backend, honoring an explicit request when the named backend is live and otherwise auto-detecting
-//! the active graphical session. The pure decision ([`pick_compositor`]) is separated from the I/O
-//! shell ([`resolve_compositor`]) that runs the blocking session probes.
+//! Map a client's [`CompositorPref`] to a live `crate::vdisplay::Compositor`.
+//!
+//! [`pick_compositor`] is pure. [`resolve_compositor`] runs the blocking
+//! session probes — call it off the async reactor (`spawn_blocking`). An
+//! explicit name wins only when that backend is available; `Auto` and a miss
+//! fall back to the detected graphical session.
+//!
+//! Pin with `PUNKTFUNK_COMPOSITOR`. A pin names a backend, not a running
+//! session, and outranks dedicated-launch and auto-follow. Leave it unset
+//! except for CI and single-session appliances.
+//!
+//! Evidence: `design/gamemode-and-dedicated-sessions.md`,
+//! `design/gamescope-multiuser.md`.
 
 use super::*;
 
-/// Pure selection: choose the backend to drive from the client's `pref`, the set `available`
-/// right now, and the auto-`detected` default. A concrete preference wins only if it's available;
-/// otherwise (and for `Auto`) fall back to the detected default. `None` only when nothing is
-/// available *and* nothing was detected — the caller turns that into a handshake error.
+/// `None` only when nothing is available *and* nothing was detected — the
+/// caller turns that into a handshake error.
 fn pick_compositor(
     pref: CompositorPref,
     available: &[crate::vdisplay::Compositor],
@@ -18,10 +24,9 @@ fn pick_compositor(
     use crate::vdisplay::Compositor;
     match Compositor::from_pref(pref) {
         Some(want) if available.contains(&want) => Some(want),
-        // `CompositorPref::Wlroots` names the wlroots *family* (D2): sway/river ([`Wlroots`]) and
-        // Hyprland are distinct backends but mutually-exclusive live sessions, so honor the request
-        // with whichever family member is actually available — the detected one if it's a family
-        // member, else the first available of the two.
+        // `CompositorPref::Wlroots` is the family (sway/river + Hyprland), not
+        // one backend. Honor it with the live family member, else the first
+        // available of the two.
         Some(Compositor::Wlroots) => match detected {
             Some(d @ (Compositor::Wlroots | Compositor::Hyprland)) => Some(d),
             _ => [Compositor::Wlroots, Compositor::Hyprland]
@@ -33,14 +38,9 @@ fn pick_compositor(
     }
 }
 
-/// Is this connect pinned at a compositor that is not actually running?
-///
-/// Pure (the I/O shell passes in the observed liveness) so the interaction is unit-tested, because
-/// it is invisible from the outside: an operator pin puts its backend into
-/// [`crate::vdisplay::available`] unconditionally AND skips `apply_session_env`'s
-/// `XDG_CURRENT_DESKTOP` scrub, so [`pick_compositor`] hands back a compositor that may be a corpse
-/// and its `None` (recover) arm can never fire. [`Compositor::Gamescope`] is exempt — it stands its
-/// own session up, which is the whole reason a headless box pins it.
+/// A pin still appears in [`crate::vdisplay::available`] and skips the
+/// `XDG_CURRENT_DESKTOP` scrub, so [`pick_compositor`]'s `None` arm cannot
+/// fire. [`Compositor::Gamescope`] is exempt: it stands a session up.
 #[cfg(not(target_os = "windows"))]
 fn pinned_at_a_dead_session(
     overridden: bool,
@@ -50,14 +50,10 @@ fn pinned_at_a_dead_session(
     overridden && chosen.needs_live_session() && live == crate::vdisplay::ActiveKind::None
 }
 
-/// The handshake error for "no graphical session is live for this uid" — the state a compositor
-/// crash leaves behind (gnome-shell SIGSEGV → GDM greeter, whose auto-login is once-per-boot, so the
-/// box would otherwise need a walk-up or a reboot).
-///
-/// Fires the operator's recovery hook (debounced) on the way out when one is configured, so the
-/// client's retry a few seconds later lands in a recovered desktop. `pinned` names the
-/// `PUNKTFUNK_COMPOSITOR` value when the pin is what got us here, so the message can say which knob
-/// to change rather than the generic advice to *set* the knob that caused it.
+/// Fires the operator recovery hook (debounced) when configured, so a retry
+/// a few seconds later can land in a recovered desktop. `pinned` is the
+/// `PUNKTFUNK_COMPOSITOR` value when the pin is what got us here, so the
+/// message names the knob to change.
 #[cfg(not(target_os = "windows"))]
 fn no_live_session(pinned: Option<&str>) -> anyhow::Error {
     if crate::vdisplay::try_recover_session() {
@@ -79,30 +75,27 @@ fn no_live_session(pinned: Option<&str>) -> anyhow::Error {
     }
 }
 
-/// Resolve the client's compositor preference to a concrete backend (the I/O shell around
-/// [`pick_compositor`]): enumerate what's available, auto-detect the default, pick, and log
-/// whether the explicit request was honored or fell back. Runs blocking probes — call off the
-/// async reactor (`spawn_blocking`).
-/// Whether a session resolved to `(compositor, route)` runs ISOLATED (`design/
-/// gamescope-multiuser.md`): its own pinned injector, env-routed audio and per-session mic instead
-/// of the shared host-lifetime planes. Only the gamescope BARE SPAWN qualifies — managed/attach
-/// are single-occupant by nature, and the shared-desktop backends *want* shared planes — and the
-/// `PUNKTFUNK_GAMESCOPE_ISOLATE` escape hatch can turn it off. The ONE predicate: the resolve
-/// paths (initial + both mid-stream rebuild sites) and `serve_session`'s plane setup must never
-/// disagree about it.
+/// Isolated planes: own pinned injector, env-routed audio, per-session mic
+/// (`design/gamescope-multiuser.md`).
+///
+/// Only a gamescope bare spawn qualifies — managed/attach are single-occupant,
+/// shared-desktop backends want shared planes. `PUNKTFUNK_GAMESCOPE_ISOLATE`
+/// turns it off. The resolve paths and `serve_session`'s plane setup must
+/// never disagree about this predicate.
 #[cfg(not(target_os = "windows"))]
 pub(super) fn session_is_isolated(
     compositor: crate::vdisplay::Compositor,
     route: Option<&crate::vdisplay::GamescopeRoute>,
 ) -> bool {
-    // Only Linux has the isolated planes (gamescope + PipeWire); the non-Linux dev builds that
-    // compile this resolve path answer the way an off knob does.
+    // Non-Linux builds compile this path; they answer the way an off knob does.
     cfg!(target_os = "linux")
         && compositor == crate::vdisplay::Compositor::Gamescope
         && matches!(route, Some(crate::vdisplay::GamescopeRoute::Spawn))
         && pf_host_config::config().gamescope_isolate
 }
 
+/// Blocking session probes around [`pick_compositor`]. Call off the async
+/// reactor (`spawn_blocking`).
 pub(super) fn resolve_compositor(
     pref: CompositorPref,
     dedicated_launch: bool,
@@ -111,8 +104,8 @@ pub(super) fn resolve_compositor(
     Option<crate::vdisplay::GamescopeRoute>,
 )> {
     use crate::vdisplay::Compositor;
-    // Windows has a single virtual-display backend (pf-vdisplay); vdisplay::open ignores the compositor
-    // arg there, so short-circuit the Linux session-detection state machine with a placeholder.
+    // Windows has one virtual-display backend; `vdisplay::open` ignores the
+    // compositor arg, so skip the Linux session-detection state machine.
     #[cfg(target_os = "windows")]
     {
         let _ = (pref, dedicated_launch);
@@ -120,31 +113,24 @@ pub(super) fn resolve_compositor(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // A client is (re)connecting → cancel any pending TV-session restore so the box stays in the
-        // streamed session (covers the keep-alive REUSE reconnect, which skips create_managed_session's
-        // own cancel — review #3). No-op when nothing is pending.
+        // (Re)connect: drop a pending TV-session restore so the box stays in
+        // the streamed session. Keep-alive REUSE skips `create_managed_session`'s
+        // own cancel.
         crate::vdisplay::cancel_pending_tv_restore();
-        // Explicit operator override (legacy / CI / forcing a backend for a test) wins and is assumed
-        // to come with a hand-set env — don't retarget the process env in that case.
+        // Operator pin: assumed to come with a hand-set env — do not retarget.
         let overridden = pf_host_config::config().compositor.is_some();
-        // Liveness is read on BOTH paths. The auto path retargets the process env at the live
-        // session (below); the PINNED path needs it too, because a pin names a BACKEND, not a
-        // running session — and a pin whose compositor has died used to be indistinguishable from a
-        // healthy one here (it skips `apply_session_env`'s `XDG_CURRENT_DESKTOP` scrub and lands
-        // itself in `available()`, so `pick_compositor` could never return `None`). That combination
-        // marched every client through 8 doomed `create` retries and left the operator's
-        // `PUNKTFUNK_RECOVER_SESSION_CMD` unreachable — see the `needs_live_session` gate below.
+        // Liveness on both paths. Auto retargets env at the live session; a pin
+        // names a backend, not a running session, and skips the
+        // `XDG_CURRENT_DESKTOP` scrub, so [`pick_compositor`] cannot return
+        // `None` for a dead compositor — `needs_live_session` below is the gate.
         let active = crate::vdisplay::detect_active_session();
         let detected = if overridden {
             crate::vdisplay::detect().ok()
         } else {
-            // Auto: detect the LIVE session (Gaming vs Desktop) and retarget the process env at it so
-            // every backend (video capture + input) this connect opens against the active session —
-            // this is the state machine that lets one host follow a Bazzite box across Gaming↔Desktop.
-            //
-            // A4: if the compositor instance changed since the last connect (an idle-time Game↔Desktop
-            // switch), bump the epoch + invalidate the old backend's kept displays so this connect never
-            // reuses a node id from the dead instance.
+            // Detect the live session (Gaming vs Desktop) and retarget process
+            // env at it so capture + input open against the active session.
+            // If the compositor instance changed since last connect, bump the
+            // epoch so this connect never reuses a node id from the dead one.
             crate::vdisplay::observe_session_instance(&active);
             crate::vdisplay::apply_session_env(&active);
             tracing::info!(
@@ -154,21 +140,15 @@ pub(super) fn resolve_compositor(
             );
             crate::vdisplay::compositor_for_kind(active.kind)
         };
-        // Dedicated game session (design/gamemode-and-dedicated-sessions.md B0): a launching session
-        // under `game_session=dedicated` (gamescope confirmed available) forces its OWN headless
-        // gamescope spawn at the client's mode, overriding the detected desktop/game-mode backend. The
-        // env was already retargeted above (for XDG_RUNTIME_DIR / the PipeWire daemon); we just pin the
-        // backend + input to the spawn sub-mode. An explicit operator compositor pin still outranks
-        // it — but says so out loud (below), because a silent veto is indistinguishable from the
-        // feature being broken.
+        // Dedicated launch (`design/gamemode-and-dedicated-sessions.md`): force
+        // a headless gamescope spawn at the client's mode. Env was already
+        // retargeted above; pin the backend + input to the spawn. An operator
+        // compositor pin still outranks — and must say so, not veto silently.
         if dedicated_launch {
             if overridden {
-                // The pin still wins (it is the operator's explicit, hand-configured knob), but it
-                // must NEVER win silently: the console goes on displaying `game_session=dedicated`
-                // while every launch lands in the pinned session instead, and nothing in the log
-                // connects the two. That cost a full triage on a box whose `PUNKTFUNK_COMPOSITOR`
-                // was a forgotten validation leftover — the setting had never once taken effect and
-                // the only evidence was the ABSENCE of the info! line below.
+                // Pin still wins, but never silently: the console still shows
+                // `game_session=dedicated` while launches land in the pinned
+                // session. The warn below is the only evidence of the veto.
                 tracing::warn!(
                     pin = pf_host_config::config()
                         .compositor
@@ -181,9 +161,9 @@ pub(super) fn resolve_compositor(
                 );
             } else {
                 let route = crate::vdisplay::resolve_gamescope_route(Compositor::Gamescope, true);
-                // An ISOLATED session's input goes to its own pinned injector, so it must not
-                // retarget the shared service (last-write-wins — it would steal input from any
-                // concurrent shared-desktop viewer for nothing).
+                // Isolated input goes to its own pinned injector. Do not
+                // retarget the shared last-write-wins slot — that steals
+                // input from a concurrent shared-desktop viewer.
                 if !session_is_isolated(Compositor::Gamescope, route.as_ref()) {
                     crate::inject::set_backend_id(crate::vdisplay::input_backend_id(
                         Compositor::Gamescope,
@@ -200,15 +180,9 @@ pub(super) fn resolve_compositor(
         let available = crate::vdisplay::available();
         let chosen = match pick_compositor(pref, &available, detected) {
             Some(c) => c,
-            // No live session, but the MANAGED gamescope infra exists (SteamOS's
-            // `gamescope-session`, Bazzite's `gamescope-session-plus`): route to the gamescope
-            // backend anyway — its managed path stands the session up from nothing at the
-            // client's mode (drop-in takeover / session relaunch), so a dead gaming session
-            // self-heals on the next connect instead of bouncing every client until someone
-            // restarts it by hand. (The trap that motivated this: a headless SteamOS box whose
-            // gamescope died — every connect failed "no usable compositor" even though the
-            // takeover could rebuild it.) Not under an operator pin: an explicit
-            // `PUNKTFUNK_COMPOSITOR` keeps its exact, hand-configured meaning.
+            // No live session, but managed gamescope infra exists: its path
+            // stands the session up from nothing. Skip under an operator pin —
+            // `PUNKTFUNK_COMPOSITOR` keeps its exact meaning.
             None if !overridden && crate::vdisplay::managed_session_available() => {
                 tracing::info!(
                     "no live graphical session — managed gamescope infra present; routing to \
@@ -218,28 +192,17 @@ pub(super) fn resolve_compositor(
             }
             None => return Err(no_live_session(None)),
         };
-        // Same dead-session exit, reached the other way: a pin puts its backend in `available()`
-        // unconditionally, so `pick_compositor` above can hand back a compositor that is not
-        // actually running and the `None` arm never fires. Check the backend's own requirement
-        // against observed liveness instead of trusting the pin. Gamescope is exempt — it stands
-        // its own session up, which is the whole point of pinning it on a headless box.
         if pinned_at_a_dead_session(overridden, chosen, active.kind) {
             return Err(no_live_session(
                 pf_host_config::config().compositor.as_deref(),
             ));
         }
-        // The gamescope sub-mode (managed where the session infra exists, attach to a foreign
-        // gamescope, else per-session bare spawn). Resolved on BOTH paths and travelling back to the
-        // caller as a value carried on the backend instance: a pin skips the input retarget below
-        // but still needs a route, or `create` falls through to a bare spawn on a box that was
-        // pinned to the managed session. Resolved BEFORE the input publish because the publish now
-        // depends on it (an isolated spawn keeps its hands off the shared injector).
+        // Resolve the gamescope route on both paths, before input publish: a
+        // pin skips the retarget below but still needs a route, and an
+        // isolated spawn must not touch the shared injector.
         let route = crate::vdisplay::resolve_gamescope_route(chosen, false);
-        // Point input at the same backend the video landed on — as a published VALUE, not a
-        // `PUNKTFUNK_INPUT_BACKEND` `set_var`. An operator pin skips this, which is what leaves the
-        // operator's own knob in charge on a pinned box. An ISOLATED session skips it too: its
-        // input goes to its own pinned injector, and retargeting the last-write-wins shared slot
-        // would steal input from any concurrent shared-desktop viewer for nothing.
+        // Publish input as a value, not `PUNKTFUNK_INPUT_BACKEND`. Skip on a
+        // pin (operator knob stays in charge) and on isolated (own injector).
         if !overridden && !session_is_isolated(chosen, route.as_ref()) {
             crate::inject::set_backend_id(crate::vdisplay::input_backend_id(chosen));
         }
@@ -271,35 +234,24 @@ mod tests {
     use super::pick_compositor;
     use punktfunk_core::config::CompositorPref;
 
-    /// A pin at a compositor that ISN'T RUNNING must take the recovery exit rather than march the
-    /// client into a bring-up that can only fail.
-    ///
-    /// The regression this pins down: `PUNKTFUNK_COMPOSITOR=mutter` on a box whose gnome-shell had
-    /// segfaulted. The pin put Mutter in `available()` and suppressed the `XDG_CURRENT_DESKTOP`
-    /// scrub, so every connect "resolved" happily and then spent 8 retries on
-    /// `RemoteDesktop.CreateSession: ServiceUnknown` — while the operator's
-    /// `PUNKTFUNK_RECOVER_SESSION_CMD` sat unreachable behind a `None` arm that could never fire.
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_pin_at_a_dead_session_recovers_instead_of_retrying() {
         use super::pinned_at_a_dead_session as dead;
         use crate::vdisplay::{ActiveKind, Compositor::*};
-        // The bug: pinned to a desktop backend with nothing live for this uid.
         assert!(dead(true, Mutter, ActiveKind::None));
         assert!(dead(true, Kwin, ActiveKind::None));
         assert!(dead(true, Wlroots, ActiveKind::None));
         assert!(dead(true, Hyprland, ActiveKind::None));
-        // Pinned but the session IS up — the ordinary case, must not bail.
         assert!(!dead(true, Mutter, ActiveKind::DesktopGnome));
-        // Gamescope stands its own session up from nothing: pinning it on a headless box is a
-        // SUPPORTED setup, not a dead session. (This is the .21 no-login workaround — never break it.)
+        // Gamescope stands its own session up: pinning it on a headless box
+        // is supported, not a dead session.
         assert!(!dead(true, Gamescope, ActiveKind::None));
-        // Unpinned is untouched: the auto path already reaches `pick_compositor`'s `None` arm via
-        // `compositor_for_kind(ActiveKind::None)`, and it owns the managed-takeover case.
+        // Unpinned: the auto path already reaches `pick_compositor`'s `None`
+        // arm via `compositor_for_kind(ActiveKind::None)`.
         assert!(!dead(false, Mutter, ActiveKind::None));
     }
 
-    /// gamescope is the ONLY backend that can serve a connect with no session already running.
     #[test]
     fn only_gamescope_survives_a_dead_session() {
         use crate::vdisplay::Compositor::*;
@@ -312,43 +264,36 @@ mod tests {
     #[test]
     fn compositor_resolution_precedence() {
         use crate::vdisplay::Compositor::*;
-        // A concrete, available preference is honored.
         assert_eq!(
             pick_compositor(CompositorPref::Gamescope, &[Kwin, Gamescope], Some(Kwin)),
             Some(Gamescope)
         );
-        // A concrete but UNavailable preference falls back to the detected default.
         assert_eq!(
             pick_compositor(CompositorPref::Mutter, &[Kwin, Gamescope], Some(Kwin)),
             Some(Kwin)
         );
-        // Auto always uses the detected default.
         assert_eq!(
             pick_compositor(CompositorPref::Auto, &[Kwin, Gamescope], Some(Kwin)),
             Some(Kwin)
         );
-        // Unavailable preference + nothing detected → None (caller errors the handshake).
         assert_eq!(
             pick_compositor(CompositorPref::Mutter, &[Gamescope], None),
             None
         );
-        // Available preference still wins even when nothing was auto-detected.
         assert_eq!(
             pick_compositor(CompositorPref::Gamescope, &[Gamescope], None),
             Some(Gamescope)
         );
-        // Wlroots family (D2): the shared `Wlroots` pref resolves to whichever of sway/river
-        // (Wlroots) and Hyprland is the live session.
+        // `Wlroots` pref is the family: resolve to whichever of sway/river
+        // and Hyprland is the live session.
         assert_eq!(
             pick_compositor(CompositorPref::Wlroots, &[Hyprland], Some(Hyprland)),
             Some(Hyprland)
         );
-        // …and to Wlroots-proper on a sway/river host.
         assert_eq!(
             pick_compositor(CompositorPref::Wlroots, &[Wlroots], Some(Wlroots)),
             Some(Wlroots)
         );
-        // Family fallback even if detection came back empty but a member is available.
         assert_eq!(
             pick_compositor(CompositorPref::Wlroots, &[Hyprland], None),
             Some(Hyprland)

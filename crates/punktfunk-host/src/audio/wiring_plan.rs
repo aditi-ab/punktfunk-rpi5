@@ -1,70 +1,28 @@
-//! Windows audio endpoint assignment — the PURE planning logic behind
-//! [`audio_control`](super::audio_control), split out so it compiles (and its unit tests run) on
-//! every platform: the precedence rules here encode the hard-won field knowledge, and regressing
-//! them must fail CI on Linux too, not only on a Windows box.
+//! Pure WASAPI render-endpoint assignment for [`audio_control`](super::audio_control).
 //!
-//! Two jobs share the render endpoints and must never collide:
+//! Compiles and tests on every platform so a precedence regression fails CI on Linux too.
 //!
-//! * the **virtual mic** writes the client's decoded mic PCM into a virtual cable's render
-//!   endpoint (its capture side surfaces as a host microphone), and
-//! * the **desktop-audio loopback** captures a render endpoint's mix for the host→client
-//!   audio stream.
+//! Two jobs share the render set and must never land on the same endpoint: WASAPI
+//! loopback recaptures whatever the virtual mic writes (echo). Tier-0 ([`MintedIds`])
+//! is identity, not name — minted instances share Steam's friendly names. Below that
+//! the mic is assigned first (a cable can never be a loopback), except that game audio
+//! outranks the optional mic: the Steam Streaming Microphone render side is also the
+//! only silent client-only sink, so the mic may take it only while the loopback still
+//! gets a preferred pick ([`Wiring::mic_withheld`]). `PUNKTFUNK_MIC_DEVICE` still wins.
 //!
-//! WASAPI loopback captures *everything* an endpoint renders — including what the virtual mic
-//! writes — so if both land on the same device the client's voice echoes straight back into the
-//! client's own audio stream. **Tier-0** avoids the collision by construction: the host mints
-//! its OWN pair from Steam's streaming drivers ([`MintedIds`] — "Punktfunk Microphone" for the
-//! mic, "Punktfunk Speakers" for the loopback, matched by ID because their names are identical
-//! to Steam's primaries). Below tier-0, the name ladder keeps the old discipline: the mic is
-//! assigned FIRST (VB-CABLE was bundled by installers until the audio-substrate change; a
-//! user-installed cable still serves) and the loopback gets a *different* endpoint; when only
-//! the cable exists (headless box, no other output), the MIC wins and the loopback is honestly
-//! unavailable. The old code did the opposite — the mic refused the cable because it was the
-//! default render endpoint — which permanently killed mic passthrough on exactly that box.
-//!
-//! **One exception to mic-first — game audio outranks the mic.** The Steam Streaming
-//! Microphone's render side is ALSO the only silent client-only loopback sink, so the mic may
-//! take it only while the loopback still gets a preferred (non-last-resort) pick without it:
-//! another silent sink, or real hardware. When taking it would leave desktop audio on the
-//! known-silent Speakers or on nothing — the cable-less headless box, the recurring field
-//! failure — the loopback gets the endpoint and the mic falls to a lesser candidate or is
-//! honestly unavailable ([`Wiring::mic_withheld`]), with guidance naming the trade. The
-//! cable-only rule above is untouched (a cable can never be a loopback, so the mic still wins
-//! it), and an operator `PUNKTFUNK_MIC_DEVICE` override also still wins — an explicit choice
-//! beats the trade-off.
-//!
-//! **Loopback preference depends on where the audio should be heard.** The default is
-//! *client-only*: prefer a render endpoint that is silent on the host but has a WORKING loopback
-//! (the Steam Streaming *Microphone*'s render side — validated live; the Steam Streaming
-//! *Speakers*' loopback is silent) so the desktop mix reaches the stream without also blasting
-//! out of the host's speakers. Real hardware is the fallback (audio then plays on both ends).
-//! With `host_audio` (the `PUNKTFUNK_HOST_AUDIO` opt-in) the order flips back: real hardware
-//! first, so the operator hears the stream locally.
-//!
-//! **Last resort, and the honest failure.** When neither a silent sink nor real hardware
-//! survives the mic reservation, the Steam Streaming *Speakers* are taken as a flagged LAST
-//! resort ([`Wiring::loopback_last_resort`]): their loopback is known-silent (validated live) —
-//! a QUALITY risk the capture side warns about and treats as a stopgap — but holding a parked
-//! endpoint beats holding none (2026-08 field case: the display isolate invalidated the only
-//! real render endpoint mid-session, the mic held the Streaming Microphone, and a plan with no
-//! loopback left the session unrecoverable). Cables, VoiceMeeter strips and generically-
-//! "virtual" endpoints are never a last resort — capturing them re-captures what the mic writes,
-//! an echo/feedback CORRECTNESS risk, unlike silence — so with only those left the plan is
-//! honestly unsatisfiable ([`Wiring::loopback_unsatisfiable`]): a pure verdict on the endpoint
-//! set that cannot change until the set does. Callers must wait for an endpoint-set change
-//! ([`fingerprint`]), not retry.
+//! Default loopback prefers a silent working sink (Streaming Microphone, not Speakers);
+//! `host_audio` flips to real hardware. Speakers are a flagged last resort (silent
+//! loopback). Cables / VoiceMeeter / generic "virtual" are never a last resort (echo).
+//! Callers wait on [`fingerprint`], not retry. Pin via the unit tests in this file.
 
-/// A `(friendly_name, endpoint_id)` pair as enumerated from WASAPI.
+/// WASAPI `(friendly_name, endpoint_id)`.
 pub(crate) type Endpoint = (String, String);
 
-/// A render endpoint's ENGINE MIX FORMAT, as `IAudioClient::GetMixFormat` reports it.
+/// Engine mix format from `IAudioClient::GetMixFormat`.
 ///
-/// This is the number the 2026-08-03 field report needed and the log did not have. The capture
-/// side opens with `autoconvert: true` and asks for 48 kHz f32 in the wire layout, so WASAPI
-/// silently converts whatever the endpoint really runs — and the "48 kHz f32 channels=2" we
-/// logged was our REQUEST, not the source. An endpoint that mixes at 24 kHz mono therefore
-/// produced a 48 kHz stereo stream that had already been through a 24 kHz mono bottleneck, with
-/// nothing in any log to say so.
+/// Capture opens with `autoconvert: true` at 48 kHz f32 wire layout, so WASAPI
+/// converts silently. The logged "48 kHz f32 stereo" is the REQUEST, not the
+/// source — a 24 kHz mono mix is already bottlenecked before Opus sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MixFormat {
     pub rate_hz: u32,
@@ -73,9 +31,8 @@ pub(crate) struct MixFormat {
 }
 
 impl MixFormat {
-    /// Why this endpoint would NARROW a `want`-channel desktop mix, or `None` if it carries it
-    /// intact. Bit depth is deliberately not a criterion: 16-bit is ~96 dB of headroom, far below
-    /// Opus's own noise floor, whereas a lost channel or halved bandwidth is plainly audible.
+    /// Why this mix would narrow a `want`-channel desktop stream, or `None`.
+    /// Bit depth is not a criterion: 16-bit is ~96 dB, below Opus's noise floor.
     pub(crate) fn narrowing(&self, want: u8) -> Option<String> {
         if self.rate_hz < 48_000 && self.channels < want as u16 {
             return Some(format!(
@@ -100,47 +57,33 @@ impl MixFormat {
     }
 }
 
-/// Looks up a render endpoint's mix format by endpoint id. `None` = unknown (enumeration failed,
-/// or the caller has no way to ask) — treated as "assume it is fine", so a probe failure can
-/// never make the plan worse than it was before formats existed.
+/// Mix-format lookup. `None` = unknown, treated as intact so a probe failure
+/// cannot make the plan worse than the format-blind path.
 pub(crate) type FormatProbe<'a> = &'a dyn Fn(&Endpoint) -> Option<MixFormat>;
 
-/// A [`FormatProbe`] that knows nothing — the pre-WP2.1 behaviour.
 pub(crate) fn no_formats(_: &Endpoint) -> Option<MixFormat> {
     None
 }
 
-/// The host's own MINTED endpoints — instances of Valve's streaming-audio driver the
-/// [`minted`](super::minted) provider created at startup — by WASAPI endpoint id.
+/// Host-minted Valve streaming-driver instances, keyed by WASAPI endpoint id.
 ///
-/// Tier-0 is an IDENTITY tier, not a name tier: a minted instance is indistinguishable by
-/// friendly name from Steam's own primaries (S1 measured exactly that confusion — the probe's
-/// name match grabbed a stamped instance instead of the primary), so the provider records what
-/// it minted and the plan matches by id. All fields empty when nothing is minted (Steam
-/// absent, provisioning disabled or still running) — every rule then falls back to the
-/// name-based ladder unchanged.
+/// Tier-0 is identity, not name: a minted instance is indistinguishable by
+/// friendly name from Steam's primaries, so the provider records ids and the
+/// plan matches those. Empty fields fall through to the name ladder.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct MintedIds {
-    /// "Punktfunk Speakers" — an SSS-driver instance reserved as the client-only loopback
-    /// sink. Never contended by Steam's own Remote Play, deterministic across re-plans.
+    /// Reserved client-only loopback sink. Steam Remote Play never contends it.
     pub speakers_render: Option<String>,
-    /// "Punktfunk Microphone" render side — the virtual mic's write target.
     pub mic_render: Option<String>,
-    /// "Punktfunk Microphone" capture side — the microphone host apps record.
     pub mic_capture: Option<String>,
 }
 
-/// The one-line runtime answer "does desktop audio work, does the mic work" — the §C4
-/// classification (logged with every plan change; the status API surfaces it later).
+/// Whether desktop audio and the mic both have endpoints after a plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AudioReadiness {
-    /// Both roles have endpoints.
     Full,
-    /// Desktop audio yes, mic passthrough no.
     AudioOnly,
-    /// Mic yes, desktop audio no.
     MicOnly,
-    /// Neither role has an endpoint.
     Nothing,
 }
 
@@ -153,61 +96,46 @@ pub(crate) fn readiness(w: &Wiring) -> AudioReadiness {
     }
 }
 
-/// The coherent endpoint assignment for one wiring pass. Computed fresh on every mic/capture
-/// (re)open — Windows endpoints churn (boot-time registration, hotplug, driver installs), so a
-/// once-per-process plan goes stale.
+/// Endpoint assignment for one wiring pass. Recomputed on every mic/capture
+/// (re)open — Windows endpoints churn, so a once-per-process plan goes stale.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Wiring {
-    /// Render endpoint RESERVED for the virtual mic (the write target). The loopback must never
-    /// capture this device.
+    /// Virtual-mic write target. The loopback must never capture this device.
     pub mic_render: Option<Endpoint>,
-    /// The mic device's CAPTURE side — host apps record this; made the default recording device.
+    /// Capture side of the mic device; parked as the default recording device.
     pub mic_capture: Option<Endpoint>,
-    /// Render endpoint for the desktop-audio loopback; made the default playback device.
+    /// Desktop-audio loopback source; parked as the default playback device.
     pub loopback_render: Option<Endpoint>,
-    /// `loopback_render` is the flagged LAST RESORT (the Steam Streaming Speakers, whose
-    /// loopback is known-silent — validated live), taken only because nothing better survived
-    /// the mic reservation. The capture side treats it as a stopgap: it warns when the silence
-    /// materializes and re-plans on any endpoint-set change instead of riding it out.
+    /// `loopback_render` is the Steam Streaming Speakers (known-silent loopback),
+    /// taken only because nothing better survived. Capture treats it as a stopgap.
     pub loopback_last_resort: bool,
-    /// Set when the chosen loopback endpoint's mix format NARROWS the desktop mix (see
-    /// [`MixFormat::narrowing`]) and the plan took it anyway because nothing better existed. Carries
-    /// the human-readable reason for the capture side to log — a quality risk the operator can act
-    /// on (attach a real output, or set the output mode to prefer hardware), not a failure.
+    /// Chosen loopback's mix format narrows the desktop mix ([`MixFormat::narrowing`]);
+    /// taken because nothing better existed. Quality risk, not a failure.
     pub loopback_narrowing: Option<String>,
-    /// The mic was DENIED the Steam Streaming Microphone because taking it would have left the
-    /// loopback with only the known-silent last resort or nothing — game audio outranks the
-    /// optional mic. (`mic_render` may still hold a lesser candidate; when it is `None` the
-    /// mic open fails with guidance naming the trade — a cable gives the mic its own device
-    /// without costing the loopback.)
+    /// Mic was denied the Streaming Microphone so the loopback could keep a
+    /// preferred pick. `mic_render` may still hold a lesser candidate.
     pub mic_withheld: bool,
 }
 
 impl Wiring {
-    /// This plan has NO loopback endpoint — not even the last resort. Because [`plan`] is pure,
-    /// this is a STRUCTURAL verdict on the endpoint set, not a transient device error:
-    /// reattempting a capture open without an endpoint-set change must fail identically (the
-    /// 2026-08 field case spent 8+ minutes of flat 2 s retries proving exactly that). Callers
-    /// wait for the set's [`fingerprint`] to move instead of retrying.
+    /// No loopback endpoint, not even last resort. [`plan`] is pure, so this is
+    /// structural: retry without a [`fingerprint`] change repeats the same verdict.
     pub(crate) fn loopback_unsatisfiable(&self) -> bool {
         self.loopback_render.is_none()
     }
 }
 
-/// Render-endpoint friendly-name substrings (lowercased) usable as the virtual-mic write target,
-/// ordered by preference — the NAME ladder below the minted tier-0 ([`MintedIds`] outranks all
-/// of these). VB-CABLE first among the names: installers bundled it for the mic until the
-/// audio-substrate change, and a user-installed cable still serves.
+/// Name-ladder mic write targets (lowercased), below minted tier-0. Cable first:
+/// a user-installed VB-CABLE still serves and can never be a loopback.
 const MIC_CANDIDATES: &[&str] = &[
-    "cable input", // VB-Audio Virtual Cable — user-installed / from older bundled installs
+    "cable input", // VB-Audio Virtual Cable
     "steam streaming microphone",
     "voicemeeter input",
     "voicemeeter aux input",
     "virtual",
 ];
 
-/// `(mic render substring, matching capture substring)` — which capture endpoint surfaces the
-/// audio written to a given mic render target.
+/// Capture-side name needles for the audio written into a given mic render.
 fn capture_for(mic_render_lname: &str) -> &'static [&'static str] {
     if mic_render_lname.contains("cable") {
         &["cable output"]
@@ -220,14 +148,10 @@ fn capture_for(mic_render_lname: &str) -> &'static [&'static str] {
     }
 }
 
-/// A render endpoint no loopback should capture: the VB-CABLE (reserved for the mic even when it
-/// isn't the chosen target — capturing a cable someone else feeds echoes too), the Steam
-/// Streaming Speakers, whose loopback is silent (validated live), and any VoiceMeeter or
-/// generically-"virtual" endpoint. VoiceMeeter's strips share one internal mixer: capturing ANY
-/// of its render endpoints re-captures what the mic wrote into another one — a digital feedback
-/// loop with no acoustic path to break it (mic=`Voicemeeter Input`, loopback=`Voicemeeter Aux
-/// Input` used to pass the old name checks). Also the capture-side watchdog's test for "the
-/// operator's new default can never work — snap back to the plan".
+/// Render endpoints a loopback must not capture: cables (echo even if unused),
+/// Steam Streaming Speakers (silent loopback), VoiceMeeter (one shared mixer —
+/// any strip recaptures the mic), and generic "virtual". Also the capture
+/// watchdog's "this new default can never work" test.
 pub(crate) fn excluded_from_loopback(lname: &str) -> bool {
     lname.contains("cable")
         || lname.contains("steam streaming speakers")
@@ -235,15 +159,14 @@ pub(crate) fn excluded_from_loopback(lname: &str) -> bool {
         || lname.contains("virtual")
 }
 
-/// A render endpoint that is SILENT on the host but loopback-capturable — the client-only audio
-/// sink. Only the Steam Streaming Microphone's render side qualifies today (validated live).
+/// Silent on the host but loopback-capturable. Only the Streaming Microphone
+/// render side qualifies (the Speakers' loopback is silent).
 pub(crate) fn silent_sink(lname: &str) -> bool {
     lname.contains("steam streaming microphone")
 }
 
-/// A capture endpoint that surfaces a VIRTUAL device's audio (cables, streaming mics, mixer
-/// strips, the host's own minted "Punktfunk" microphone) rather than a real microphone. The
-/// recording-default hygiene pass must never move the box's default onto one of these.
+/// Capture side of a virtual device. Recording-default hygiene must never
+/// park the box's default on one of these.
 pub(crate) fn virtual_capture(lname: &str) -> bool {
     lname.contains("cable output")
         || lname.contains("steam streaming")
@@ -252,10 +175,8 @@ pub(crate) fn virtual_capture(lname: &str) -> bool {
         || lname.contains("punktfunk")
 }
 
-/// The first REAL capture endpoint (skipping `avoid_id` and every [`virtual_capture`]) — where
-/// the recording-default hygiene sends a default an earlier build left parked on the virtual mic
-/// while the host is idle. `None` on a box with no real microphone: nothing sane to move to, so
-/// the default is left alone.
+/// First real capture endpoint (skip `avoid_id` and every [`virtual_capture`]).
+/// `None` when there is no real microphone: leave the default alone.
 pub(crate) fn real_capture<'a>(
     captures: &'a [Endpoint],
     avoid_id: Option<&str>,
@@ -265,9 +186,7 @@ pub(crate) fn real_capture<'a>(
         .find(|(n, id)| Some(id.as_str()) != avoid_id && !virtual_capture(&n.to_lowercase()))
 }
 
-/// A known-virtual device (cables/streaming endpoints). A render WITHOUT these markers is real
-/// hardware — the best loopback source (apps render there by default and the operator can also
-/// hear it).
+/// Known-virtual render. A name without these markers is real hardware.
 fn virtualish(lname: &str) -> bool {
     lname.contains("virtual")
         || lname.contains("cable")
@@ -275,21 +194,16 @@ fn virtualish(lname: &str) -> bool {
         || lname.contains("voicemeeter")
 }
 
-/// Is this render endpoint id one of the virtual pad's audio endpoints?
+/// Whether this render id is a pad-audio endpoint the provisioner minted.
 ///
-/// Pulled out of [`plan`] because the plan is NOT the only place that must not treat these as
-/// ordinary hardware — see [`excluded_from_loopback`]'s callers. A pad endpoint is deliberately
-/// stamped with the controller's own name ("DualSense Wireless Controller") so games read it as
-/// the pad's speaker, which means no name-based rule can recognise one; the only reliable test is
-/// identity against the ids the pad-endpoint provisioner created.
+/// Pad endpoints are stamped with the controller name so games treat them as
+/// the pad speaker; no name rule can recognise one. Match the provisioner's ids.
 pub(crate) fn is_pad_render(id: &str, pad_renders: &[String]) -> bool {
     pad_renders.iter().any(|p| p == id)
 }
 
-/// Compute the assignment. `mic_want` is the operator override (`PUNKTFUNK_MIC_DEVICE`,
-/// lowercased): when set it beats the built-in candidate order for the mic target. `host_audio`
-/// flips the loopback preference to real hardware (audio audible on the host too); the default
-/// (`false`) prefers the silent sink so audio plays on the client only.
+/// Assign endpoints. `mic_want` (`PUNKTFUNK_MIC_DEVICE`, lowercased) beats the
+/// mic ladder. `host_audio` prefers real hardware; default prefers the silent sink.
 pub(crate) fn plan(
     renders: &[Endpoint],
     captures: &[Endpoint],
@@ -310,21 +224,12 @@ pub(crate) fn plan(
     )
 }
 
-/// [`plan`] with knowledge of each render endpoint's engine mix format, and the channel count the
-/// session wants to carry.
+/// [`plan`] plus each render's engine mix format and the session channel count.
 ///
-/// **The 2026-08-03 field report is this function's reason to exist.** The default client-only
-/// preference takes the "silent sink" — Steam's Streaming *Microphone* render endpoint — over real
-/// hardware unconditionally, because it is silent on the host. But that endpoint exists to carry
-/// remote *voice*, and nothing checked whether it could carry music. On the reporter's box it won
-/// all 31 loopback opens across 25 sessions while a clean AMD HD Audio endpoint sat idle, and the
-/// whole desktop mix went through it before reaching Opus.
-///
-/// So a silent sink now has to EARN its preference: if its mix format narrows the mix (see
-/// [`MixFormat::narrowing`]) it drops below real hardware. It is still taken when nothing better
-/// exists — narrow audio beats no audio — but flagged in [`Wiring::loopback_narrowing`] so the
-/// capture side can say why. An unknown format (probe failed) counts as fine, so this can never
-/// make the plan worse than it was before formats existed.
+/// A silent sink must earn preference: if [`MixFormat::narrowing`] fires it
+/// drops below real hardware. Still taken when nothing better exists (narrow
+/// beats none) and flagged in [`Wiring::loopback_narrowing`]. Unknown format
+/// counts as intact so a probe failure cannot make the plan worse.
 #[allow(clippy::too_many_arguments)] // mirrors the enumeration inputs; a param struct would only rename the problem
 pub(crate) fn plan_with_formats(
     renders: &[Endpoint],
@@ -336,12 +241,9 @@ pub(crate) fn plan_with_formats(
     pad_renders: &[String],
     minted: &MintedIds,
 ) -> Wiring {
-    // 0. Pad-audio endpoints are invisible to the plan: never the mic target (client voice
-    //    would play out of a pad "speaker"), never a loopback source (a game's controller
-    //    audio cues would stream as desktop audio), and — since this shadows `renders` for
-    //    every tier below — never the flagged last resort either. Their names carry no virtual
-    //    marker (they are stamped "DualSense Wireless Controller" on purpose, so games read
-    //    them as the pad's speaker), so the name rules alone would take one for real hardware.
+    // Pad endpoints are invisible: not a mic (voice would play from the pad),
+    // not a loopback (controller cues would stream as desktop), not last resort.
+    // Names look like real hardware ("DualSense Wireless Controller" on purpose).
     let renders: Vec<Endpoint> = renders
         .iter()
         .filter(|(_, id)| !is_pad_render(id, pad_renders))
@@ -355,8 +257,7 @@ pub(crate) fn plan_with_formats(
             .cloned()
     };
 
-    // Tier-0 lookups: the minted ids resolved against THIS enumeration (an id the provider
-    // recorded but audiosrv no longer serves must not produce a phantom assignment).
+    // Resolve minted ids against THIS enumeration; a stale id must not phantom.
     let find_by_id = |id: &Option<String>| -> Option<Endpoint> {
         id.as_deref()
             .and_then(|id| renders.iter().find(|(_, rid)| rid == id).cloned())
@@ -364,25 +265,18 @@ pub(crate) fn plan_with_formats(
     let minted_mic = find_by_id(&minted.mic_render);
     let minted_sink = find_by_id(&minted.speakers_render);
 
-    // 1. Mic target first — it has the narrower requirements (must be a virtual cable). The
-    //    minted "Punktfunk Microphone" outranks every name-based candidate: it exists for
-    //    exactly this role, and taking it can never cost the loopback anything (the minted
-    //    sink is its counterpart). An operator override still beats it.
+    // Mic first (narrower: must be a virtual cable). Minted mic outranks every
+    // name candidate and never costs the loopback (minted sink is its pair).
+    // Operator override still beats it.
     let mic_render = match mic_want {
         Some(w) => find_render(w),
         None => minted_mic
             .clone()
             .or_else(|| MIC_CANDIDATES.iter().find_map(|c| find_render(c))),
     };
-    // Game audio outranks the mic: the Steam Streaming Microphone's render side is also the
-    // only silent client-only loopback sink, so the mic may hold it only while the loopback
-    // still gets a PREFERRED (non-last-resort) pick without it — another silent sink or real
-    // hardware, the same two tiers both preference orders draw from. Otherwise the endpoint
-    // goes to the loopback and the mic falls to a lesser candidate or (honestly) to none.
-    // Before this rule, the cable-less headless Steam box streamed SILENCE: the mic held the
-    // Streaming Microphone and the loopback got the known-silent Speakers (the 2026-08 field
-    // case). An operator override is exempt — an explicit PUNKTFUNK_MIC_DEVICE beats the
-    // trade-off.
+    // Game audio outranks the optional mic: Streaming Microphone render is also
+    // the only silent client-only sink. Keep it only while loopback still gets a
+    // preferred pick without it. Override is exempt (`PUNKTFUNK_MIC_DEVICE`).
     let mut mic_withheld = false;
     let mic_render = match mic_render {
         Some((name, id)) if mic_want.is_none() && silent_sink(&name.to_lowercase()) => {
@@ -395,7 +289,7 @@ pub(crate) fn plan_with_formats(
                 Some((name, id))
             } else {
                 mic_withheld = true;
-                // Skip the silent-sink candidate; a lesser candidate may still serve the mic.
+                // Fall to a lesser candidate; the silent sink goes to loopback.
                 MIC_CANDIDATES
                     .iter()
                     .filter(|c| !silent_sink(c))
@@ -405,10 +299,8 @@ pub(crate) fn plan_with_formats(
         other => other,
     };
 
-    // 2. Its capture side (what host apps record). A minted mic resolves by the provider's
-    //    recorded CAPTURE id — a name search cannot tell the minted microphone from Steam's
-    //    primary (same friendly name), and pairing the minted render with the primary's
-    //    capture would record a mic nothing writes into.
+    // Capture side. A minted mic pairs by recorded CAPTURE id — names cannot
+    // tell it from Steam's primary, and pairing the primary would record silence.
     let mic_capture = mic_render.as_ref().and_then(|(name, id)| {
         if Some(id) == minted.mic_render.as_ref() {
             return minted
@@ -424,10 +316,8 @@ pub(crate) fn plan_with_formats(
         })
     });
 
-    // 3. Loopback from the REMAINING renders. Client-only (default): the silent sink (Steam
-    //    Streaming Microphone — its loopback works, unlike the Speakers') > real hardware
-    //    (audible fallback). `host_audio`: real hardware first. Either order can fall through
-    //    to the flagged last resort below.
+    // Loopback from remaining renders. Default: silent sink > real hardware.
+    // `host_audio`: hardware first. Both can fall through to last resort.
     let not_mic = |id: &str| mic_render.as_ref().is_none_or(|(_, mid)| mid != id);
     let real_hw = || {
         renders.iter().find(|(n, id)| {
@@ -435,8 +325,7 @@ pub(crate) fn plan_with_formats(
             not_mic(id) && !excluded_from_loopback(&ln) && !virtualish(&ln)
         })
     };
-    // A silent sink splits in two: one that carries the mix intact, and one that narrows it. The
-    // first keeps the historical preference; the second falls BELOW real hardware.
+    // Intact silent sink keeps preference; a narrowing one falls below hardware.
     let narrowing_of = |ep: &Endpoint| format_of(ep).and_then(|f| f.narrowing(want_channels));
     let silent_intact = || {
         renders.iter().find(|ep| {
@@ -448,25 +337,17 @@ pub(crate) fn plan_with_formats(
             not_mic(&ep.1) && silent_sink(&ep.0.to_lowercase()) && narrowing_of(ep).is_some()
         })
     };
-    // LAST RESORT — the Steam Streaming Speakers, and ONLY them. Their loopback is known-silent
-    // (validated live): a QUALITY risk, flagged so the capture side can warn when the silence
-    // materializes and re-plan when the endpoint set changes — but a parked endpoint beats none
-    // (2026-08: the display isolate invalidated the only real render endpoint mid-session and a
-    // loopback-less plan left the session unrecoverable). Never a cable, a VoiceMeeter strip, or
-    // a generically-"virtual" endpoint: those re-capture what the mic writes — echo/feedback
-    // CORRECTNESS risks — so "no loopback" stays the honest answer there. NOTE
-    // `excluded_from_loopback` itself stays untouched: it also powers the capture watchdog's
-    // judgement of a NEW operator-chosen default, where admitting the Speakers would change
-    // mid-stream snap-back semantics.
+    // Last resort: Steam Streaming Speakers only. Silent loopback is a quality
+    // risk; a parked endpoint beats none. Never cables/VoiceMeeter/"virtual"
+    // (echo). Leave `excluded_from_loopback` alone — the watchdog uses it for
+    // a NEW operator default, and admitting Speakers would change snap-back.
     let last_resort = || {
         renders
             .iter()
             .find(|(n, id)| not_mic(id) && n.to_lowercase().contains("steam streaming speakers"))
     };
-    // Tier-0 sink: the minted "Punktfunk Speakers". Same quality discipline as every silent
-    // sink — a narrowing minted instance demotes below real hardware rather than silently
-    // costing quality (S2 measured the driver clean at 48 kHz stereo, so this is a guard, not
-    // an expectation).
+    // Minted Speakers: same quality discipline as any silent sink — narrowing
+    // demotes below real hardware rather than silently costing quality.
     let minted_intact = || {
         minted_sink
             .as_ref()
@@ -479,10 +360,8 @@ pub(crate) fn plan_with_formats(
             .filter(|(_, id)| not_mic(id))
             .filter(|ep| narrowing_of(ep).is_some())
     };
-    // A narrowing silent sink sits below real hardware in BOTH modes: preferring silence on the
-    // host is a routing choice, but it must not silently cost audio quality when a clean endpoint
-    // is right there. The minted sink heads its tier in both modes — it is the one endpoint
-    // whose whole purpose is this role.
+    // Narrowing silence sits below hardware in BOTH modes. The minted sink
+    // still heads its tier — that is the endpoint whose purpose is this role.
     let preferred = if host_audio {
         real_hw()
             .or_else(minted_intact)
@@ -503,8 +382,7 @@ pub(crate) fn plan_with_formats(
             None => (None, false),
         },
     };
-    // Report narrowing for whatever we actually chose — including real hardware, which can also
-    // be a 24 kHz mono endpoint (a headset's hands-free profile is exactly that).
+    // Flag whatever we chose, including real hardware (headset hands-free is 16 kHz mono).
     let loopback_narrowing = loopback_render.as_ref().and_then(narrowing_of);
 
     Wiring {
@@ -517,17 +395,16 @@ pub(crate) fn plan_with_formats(
     }
 }
 
-/// Order-independent fingerprint of an enumerated endpoint set. [`plan`] is a pure function of
-/// these inputs (the env knobs are process-stable), so an unchanged fingerprint PROVES an
-/// unchanged verdict: re-planning an unsatisfiable set before the fingerprint moves only repeats
-/// the same answer, with IPolicyConfig default-device writes as the side effect. The capture
-/// loop polls this instead of re-planning, and treats a change as the recovery moment.
+/// Order-independent fingerprint of an enumerated set. [`plan`] is a pure
+/// function of these inputs, so an unchanged fingerprint proves an unchanged
+/// verdict. Capture polls this instead of re-planning (IPolicyConfig writes
+/// are the side effect of a needless re-plan).
 pub(crate) fn fingerprint(renders: &[Endpoint], captures: &[Endpoint]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    // Each direction hashes as a length-prefixed sorted slice, so renders and captures cannot
-    // alias each other and endpoint order (enumeration order churns) never matters.
+    // Hash a sorted Vec per direction so order churn is ignored and renders
+    // cannot alias captures (`Vec`'s hash is length-prefixed).
     for eps in [renders, captures] {
         let mut sorted: Vec<&Endpoint> = eps.iter().collect();
         sorted.sort();
@@ -536,12 +413,9 @@ pub(crate) fn fingerprint(renders: &[Endpoint], captures: &[Endpoint]) -> u64 {
     h.finish()
 }
 
-/// The one-shot diagnosis for a plan with no loopback endpoint: every enumerated render with WHY
-/// it was rejected, then ONLY the remedies not already taken. The static advice this replaces
-/// ("attach one, or let the host install the Steam Streaming pair") was already satisfied in the
-/// 2026-08 field case — the pair WAS installed, its Microphone half reserved by the mic — so the
-/// message pointed at a fix the box already had. Pure, like [`plan`]: callers pass the same
-/// enumeration the plan consumed.
+/// Why every enumerated render was rejected, then only remedies not already
+/// taken. Static "install Steam" advice is wrong when the pair is installed
+/// but reserved. Pure: same enumeration [`plan`] consumed.
 pub(crate) fn describe_no_loopback(renders: &[Endpoint], wiring: &Wiring) -> String {
     debug_assert!(wiring.loopback_unsatisfiable());
     let mic_id = wiring.mic_render.as_ref().map(|(_, id)| id.as_str());
@@ -556,14 +430,12 @@ pub(crate) fn describe_no_loopback(renders: &[Endpoint], wiring: &Wiring) -> Str
             } else if ln.contains("voicemeeter") {
                 "VoiceMeeter strip (shares the mixer the mic writes into — a feedback loop)"
             } else if ln.contains("steam streaming speakers") {
-                // Reachable only when the Speakers ARE the mic target (operator override) —
-                // the last-resort tier takes them otherwise.
+                // Only when Speakers ARE the mic target (override) — last resort takes them otherwise.
                 "known-silent loopback (validated live)"
             } else if ln.contains("virtual") {
                 "unrecognized virtual endpoint (assumed feedback/silence risk)"
             } else {
-                // `plan` accepts any non-virtual render — reaching this arm means a tier
-                // changed without updating this diagnosis.
+                // `plan` accepts any non-virtual render; this arm means a tier drifted.
                 "rejected by the wiring plan"
             };
             format!("{name:?}: {why}")
@@ -580,9 +452,8 @@ pub(crate) fn describe_no_loopback(renders: &[Endpoint], wiring: &Wiring) -> Str
             .any(|(n, _)| n.to_lowercase().contains(needle))
     };
     let mut remedies = vec!["attach any output device (headphones, or a monitor/TV with audio)"];
-    // Only useful when the mic would actually vacate a loopback-capable endpoint: with the mic
-    // on the Steam Streaming Microphone, a cable frees that silent sink for the loopback. A mic
-    // on a VoiceMeeter strip frees nothing capturable, so the advice is withheld there.
+    // Only when a cable would free a loopback-capable endpoint (mic on the
+    // Streaming Microphone). A VoiceMeeter mic frees nothing capturable.
     if !has("cable")
         && wiring
             .mic_render
@@ -614,9 +485,6 @@ mod tests {
         (name.to_string(), format!("id-{}", name.to_lowercase()))
     }
 
-    /// The shipped configuration: real output + VB-CABLE (no Steam pair). Mic gets the cable;
-    /// with no silent sink the loopback falls back to the speakers (audio audible on both
-    /// ends), recording default = CABLE Output.
     #[test]
     fn gaming_pc_with_cable() {
         let renders = [
@@ -639,10 +507,6 @@ mod tests {
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
     }
 
-    /// Client-only (the default): with the full device zoo present — real output, VB-CABLE,
-    /// BOTH Steam endpoints — the loopback prefers the silent sink (Steam Streaming
-    /// Microphone's render side) over real hardware, so the host speakers stay quiet while
-    /// streaming. This is the dissidius/"audio from both PC and phone" configuration.
     #[test]
     fn client_only_prefers_silent_sink_over_hardware() {
         let renders = [
@@ -667,8 +531,6 @@ mod tests {
         );
     }
 
-    /// `PUNKTFUNK_HOST_AUDIO` flips the preference back: real hardware wins the loopback even
-    /// when the silent sink exists (the operator wants to hear the stream locally).
     #[test]
     fn host_audio_prefers_real_hardware() {
         let renders = [
@@ -683,9 +545,8 @@ mod tests {
         );
     }
 
-    /// The multi-render VB-CABLE ("CABLE In 16ch" is a second render endpoint feeding the same
-    /// CABLE Output) must never be the loopback in EITHER mode: it feeds the mic's capture side,
-    /// and capturing it delivers silence (nothing renders there) — the reported no-audio dud.
+    /// "CABLE In 16ch" feeds the same CABLE Output as the mic. Capturing it is
+    /// silence (nothing renders there), never a loopback in either mode.
     #[test]
     fn cable_16ch_never_loopback() {
         let renders = [
@@ -698,9 +559,8 @@ mod tests {
         }
     }
 
-    /// THE historical dead-end: headless box where VB-CABLE is the ONLY render endpoint (and
-    /// therefore the default). The mic must WIN the cable; the loopback is honestly absent.
-    /// (The old anti-echo guard rejected the cable here → mic permanently dead.)
+    /// Cable is the only render (hence the default). Mic wins; loopback absent.
+    /// Rejecting the cable here permanently kills mic passthrough.
     #[test]
     fn headless_cable_only_mic_wins() {
         let renders = [ep("CABLE Input (VB-Audio Virtual Cable)")];
@@ -710,8 +570,6 @@ mod tests {
         assert!(w.loopback_render.is_none(), "no echo-safe loopback exists");
     }
 
-    /// Headless with the Steam pair installed: cable = mic, Steam Streaming Microphone = the
-    /// loopback (its loopback works; the Speakers' is silent — validated live).
     #[test]
     fn headless_with_steam_pair() {
         let renders = [
@@ -742,9 +600,6 @@ mod tests {
         );
     }
 
-    /// No cable: the Steam Streaming Microphone doubles as the mic target — allowed, because
-    /// the loopback still gets real hardware — and the loopback must NOT then pick the same
-    /// endpoint.
     #[test]
     fn steam_mic_as_target_never_doubles_as_loopback() {
         let renders = [
@@ -761,9 +616,6 @@ mod tests {
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
     }
 
-    /// No cable and ONLY the Steam mic: GAME AUDIO wins the endpoint — the loopback takes the
-    /// render side (a working silent sink) and the mic is honestly withheld. The old rule gave
-    /// the mic the endpoint and the stream was silent.
     #[test]
     fn steam_mic_only_audio_wins() {
         let renders = [ep("Speakers (Steam Streaming Microphone)")];
@@ -778,9 +630,6 @@ mod tests {
         assert!(!w.loopback_last_resort);
     }
 
-    /// Cable absent but a VoiceMeeter strip exists: the withheld mic falls to the lesser
-    /// candidate instead of dying — mic on the strip, loopback on the freed Streaming
-    /// Microphone render side. Both features work without a cable.
     #[test]
     fn withheld_mic_falls_to_voicemeeter() {
         let renders = [
@@ -809,10 +658,6 @@ mod tests {
         assert!(!w.loopback_last_resort);
     }
 
-    /// Steam Streaming Speakers are never a PREFERRED loopback (their loopback is silent —
-    /// validated live) — but when they are the only non-mic endpoint they ARE taken, flagged as
-    /// the last resort: a silent loopback the capture side can warn about beats a plan with no
-    /// endpoint at all (which is unrecoverable until the topology changes).
     #[test]
     fn steam_speakers_only_as_last_resort() {
         let renders = [
@@ -830,11 +675,6 @@ mod tests {
         }
     }
 
-    /// THE 2026-08 field case, re-decided: no cable, only the Steam pair left after the display
-    /// isolate invalidated the monitor's DP audio endpoint. Game audio now OUTRANKS the mic —
-    /// the loopback takes the Streaming Microphone's render side (a WORKING silent sink)
-    /// instead of the mic holding it and stranding the loopback on the known-silent Speakers.
-    /// Audio streams; the mic is honestly withheld. Holds in both preference modes.
     #[test]
     fn field_case_steam_pair_only_audio_outranks_mic() {
         let renders = [
@@ -862,9 +702,6 @@ mod tests {
         }
     }
 
-    /// The operator override is exempt from game-audio-outranks-the-mic: pinning the mic to
-    /// the Streaming Microphone strands the loopback on the last resort, and that is the
-    /// operator's explicit call.
     #[test]
     fn env_override_may_strand_the_loopback() {
         let renders = [
@@ -892,8 +729,6 @@ mod tests {
         assert!(w.loopback_last_resort);
     }
 
-    /// The last resort never shadows a real pick: with real hardware present the Speakers stay
-    /// unchosen and the flag stays down, in both preference modes.
     #[test]
     fn last_resort_never_beats_real_hardware() {
         let renders = [
@@ -920,9 +755,6 @@ mod tests {
         }
     }
 
-    /// Cables and VoiceMeeter strips are CORRECTNESS risks (they re-capture what the mic
-    /// writes — echo/feedback), not quality risks: never the loopback, not even as a last
-    /// resort. The plan stays honestly unsatisfiable.
     #[test]
     fn cable_and_voicemeeter_never_last_resort() {
         let renders = [
@@ -946,7 +778,7 @@ mod tests {
         }
     }
 
-    // ---- format-aware loopback selection (WP2.1) -----------------------------------------
+    // ---- format-aware loopback selection ------------------------------------------------
 
     fn fmt(rate_hz: u32, channels: u16) -> MixFormat {
         MixFormat {
@@ -956,8 +788,7 @@ mod tests {
         }
     }
 
-    /// Probe helper: give endpoints whose (lowercased) name contains a needle that format,
-    /// everything else unknown. Owns its table so call sites can pass a literal inline.
+    /// Name-substring → format table, owned so call sites can pass a literal.
     fn probe(table: Vec<(&'static str, MixFormat)>) -> impl Fn(&Endpoint) -> Option<MixFormat> {
         move |ep: &Endpoint| {
             let name = ep.0.to_lowercase();
@@ -967,9 +798,6 @@ mod tests {
         }
     }
 
-    /// THE 2026-08-03 field case, with formats. The reporter's exact endpoint inventory: the plan
-    /// took the Steam Streaming Microphone on all 31 opens while a clean AMD HD Audio endpoint sat
-    /// idle. Once we can see that the silent sink narrows the mix, real hardware must win.
     #[test]
     fn narrowing_silent_sink_loses_to_real_hardware() {
         let renders = [
@@ -983,7 +811,7 @@ mod tests {
             ep("CABLE Output (VB-Audio Virtual Cable)"),
             ep("Microphone (Steam Streaming Microphone)"),
         ];
-        // A voice-carrier endpoint: 24 kHz mono.
+        // Voice-carrier mix: 24 kHz mono.
         let p = probe(vec![
             ("steam streaming microphone", fmt(24_000, 1)),
             ("odyssey", fmt(48_000, 2)),
@@ -1007,15 +835,12 @@ mod tests {
             w.loopback_narrowing.is_none(),
             "the chosen endpoint is intact"
         );
-        // The mic assignment is untouched by any of this.
         assert_eq!(
             w.mic_render.unwrap().0,
             "CABLE Input (VB-Audio Virtual Cable)"
         );
     }
 
-    /// …but a silent sink that carries the mix intact keeps its historical preference: the
-    /// client-only routing default is not being abandoned, only made conditional on quality.
     #[test]
     fn intact_silent_sink_still_wins() {
         let renders = [
@@ -1043,8 +868,6 @@ mod tests {
         );
     }
 
-    /// Narrow audio still beats NO audio: with nothing else available the narrowing sink is taken
-    /// and flagged, not refused.
     #[test]
     fn narrowing_sink_is_taken_when_it_is_all_there_is() {
         let renders = [
@@ -1070,9 +893,7 @@ mod tests {
         assert!(why.contains("16000"), "{why}");
     }
 
-    /// Real hardware can narrow too — a headset in its hands-free profile is 16 kHz mono — and
-    /// must be flagged just the same. The flag is about the CHOSEN endpoint, not about which tier
-    /// it came from.
+    /// Headset hands-free is 16 kHz mono. The flag is about the chosen endpoint.
     #[test]
     fn narrowing_is_reported_for_real_hardware_too() {
         let renders = [ep("Headset (Hands-Free AG Audio)")];
@@ -1094,8 +915,6 @@ mod tests {
         assert!(w.loopback_narrowing.is_some());
     }
 
-    /// An unknown format must never make the plan WORSE than it was before formats existed: a
-    /// probe that answers nothing has to reproduce `plan` exactly.
     #[test]
     fn unknown_formats_reproduce_the_formatless_plan() {
         let renders = [
@@ -1129,8 +948,6 @@ mod tests {
         }
     }
 
-    /// `host_audio` still prefers real hardware, and a narrowing silent sink stays last in that
-    /// mode too.
     #[test]
     fn host_audio_ordering_survives_formats() {
         let renders = [
@@ -1145,25 +962,17 @@ mod tests {
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
     }
 
-    /// The narrowing test is channel-count aware: an endpoint that is fine for stereo narrows a
-    /// 5.1 session.
     #[test]
     fn narrowing_depends_on_the_session_channel_count() {
         let stereo_only = fmt(48_000, 2);
         assert_eq!(stereo_only.narrowing(2), None);
         assert!(stereo_only.narrowing(6).is_some());
-        // Rate is judged independently of channels.
         assert!(fmt(44_100, 8).narrowing(2).is_some());
-        // And an endpoint wider than the session is never "narrowing".
         assert_eq!(fmt(48_000, 8).narrowing(2), None);
-        // Both wrong: the message must name both problems.
         let both = fmt(16_000, 1).narrowing(6).unwrap();
         assert!(both.contains("16000") && both.contains("channel"), "{both}");
     }
 
-    /// The recording-default hygiene picker: skips every virtual capture (cable, streaming mic,
-    /// the minted "Punktfunk" pair, VoiceMeeter) and lands on the real microphone — the exact
-    /// recording-tab zoo of the 2026-08-14 Helldivers 2 field box.
     #[test]
     fn recording_hygiene_picks_the_real_microphone() {
         let captures = [
@@ -1177,14 +986,12 @@ mod tests {
             real_capture(&captures, None).unwrap().0,
             "Desktop Microphone (2- Microsoft LifeCam HD-3000)"
         );
-        // `avoid_id` guards the plan's own mic capture even when its name would pass the
-        // virtual test; with nothing else real, the answer is honestly None.
+        // `avoid_id` still skips the plan's own mic capture if the name would pass.
         let only = [ep("Desk Mic (USB)")];
         assert!(real_capture(&only, Some("id-desk mic (usb)")).is_none());
         assert!(real_capture(&[], None).is_none());
     }
 
-    /// Operator override beats the candidate order.
     #[test]
     fn env_override_wins() {
         let renders = [
@@ -1210,8 +1017,6 @@ mod tests {
         );
     }
 
-    /// No virtual device anywhere: no mic target (open fails with guidance), loopback = the
-    /// real output — desktop audio unaffected.
     #[test]
     fn no_virtual_device() {
         let renders = [ep("Speakers (Realtek HD Audio)")];
@@ -1220,10 +1025,7 @@ mod tests {
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
     }
 
-    /// VoiceMeeter box with real hardware: no cable, so the mic takes `Voicemeeter Input` — and
-    /// the loopback must NEVER be `Voicemeeter Aux Input` (same internal mixer: capturing any
-    /// VoiceMeeter render re-captures what the mic wrote — a digital feedback loop). Real
-    /// hardware wins the loopback in both modes.
+    /// VoiceMeeter strips share one mixer: capturing any strip recaptures the mic.
     #[test]
     fn voicemeeter_aux_never_pairs_with_voicemeeter_mic() {
         let renders = [
@@ -1254,8 +1056,6 @@ mod tests {
         }
     }
 
-    /// Only VoiceMeeter endpoints (headless mixer box): mic wins one, the loopback is honestly
-    /// absent — like the cable-only case, never another strip of the same mixer.
     #[test]
     fn voicemeeter_only_no_loopback() {
         let renders = [
@@ -1269,9 +1069,6 @@ mod tests {
         }
     }
 
-    /// A generically-"virtual" leftover (unknown vendor cable) is refused too: the last resort
-    /// accepts ONLY the Steam Streaming Speakers, so a virtual endpoint that slips past
-    /// `excluded_from_loopback`'s name list still can't become the loopback.
     #[test]
     fn unknown_virtual_never_loopback() {
         let renders = [
@@ -1282,9 +1079,6 @@ mod tests {
         assert!(w.loopback_render.is_none());
     }
 
-    /// The fingerprint keys the capture loop's "wait for an endpoint change" state: it must
-    /// ignore enumeration order (Windows churns it), react to any topology change, and never
-    /// alias the render and capture directions.
     #[test]
     fn fingerprint_order_independent_topology_sensitive() {
         let a = [ep("Speakers (Realtek HD Audio)"), ep("CABLE Input")];
@@ -1295,15 +1089,10 @@ mod tests {
         assert_ne!(fingerprint(&a, &caps), fingerprint(&caps, &a));
     }
 
-    /// The unsatisfiable-plan diagnosis must name what the mic reserved and advise ONLY the
-    /// remedies not already taken: in the field case the Steam pair was installed (so "install
-    /// Steam" would point at a fix the box already had) and the cable was missing (so VB-CABLE
-    /// is the advice that actually frees the silent sink).
     #[test]
     fn describe_no_loopback_skips_satisfied_remedies() {
-        // Mic PINNED to the Streaming Microphone by operator override — the only way the mic
-        // may strand the loopback now that game audio outranks the candidate order — with
-        // nothing else present.
+        // Override pins the mic to Streaming Microphone — the only way it may
+        // strand the loopback now that game audio outranks the candidate order.
         let renders = [ep("Altavoces (Steam Streaming Microphone)")];
         let captures = [ep("Microphone (Steam Streaming Microphone)")];
         let w = plan(
@@ -1320,8 +1109,7 @@ mod tests {
         assert!(msg.contains("VB-Audio Virtual Cable"), "{msg}");
         assert!(!msg.contains("install Steam"), "{msg}");
 
-        // Cable-only headless box: VB-CABLE is already installed (and freeing it wouldn't help
-        // anyway), while the Steam pair is the remedy that adds a capturable sink.
+        // Cable already present; Steam is the remedy that adds a capturable sink.
         let renders = [ep("CABLE Input (VB-Audio Virtual Cable)")];
         let captures = [ep("CABLE Output (VB-Audio Virtual Cable)")];
         let w = plan(&renders, &captures, None, false, &[], &MintedIds::default());
@@ -1331,10 +1119,8 @@ mod tests {
         assert!(!msg.contains("install VB-Audio Virtual Cable"), "{msg}");
     }
 
-    /// A stamped pad endpoint is invisible to the plan. Its name carries NO virtual marker — on
-    /// purpose, games must read it as the pad's speaker — so the name rules alone would classify
-    /// it as real hardware and hand it the loopback; only the id exclusion prevents that.
-    /// Measured fact: the wiring plan on the target box already enumerated a stamped endpoint.
+    /// Pad endpoints carry no virtual marker (games must read them as the pad
+    /// speaker), so only id exclusion stops the name rules treating them as hardware.
     #[test]
     fn pad_endpoints_invisible() {
         let renders = [
@@ -1344,8 +1130,7 @@ mod tests {
         let pads = [renders[0].1.clone()];
         let w = plan(&renders, &[], None, false, &pads, &MintedIds::default());
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
-        // Even an operator mic override matching the pad's name must not claim it; with the
-        // pad as the only render endpoint there is honestly no mic target and no loopback.
+        // Override matching the pad name must not claim it either.
         let w = plan(
             &renders[..1],
             &[],
@@ -1358,15 +1143,11 @@ mod tests {
         assert!(w.loopback_render.is_none());
     }
 
-    /// The exclusion has to survive the LAST RESORT tier, which this merge introduced alongside
-    /// pad audio. `last_resort` matches on the Steam-Speakers name, but it reads the same
-    /// shadowed `renders`, so a pad can never be reached through it either — otherwise the whole
-    /// desktop mix would be routed into the controller's voice coils.
+    /// Last resort matches Steam Speakers by name on the same shadowed `renders`,
+    /// so a pad must not be reachable there either (desktop mix into the coils).
     #[test]
     fn a_pad_is_never_the_last_resort() {
-        // Only the pad and the Steam pair exist, the mic PINNED to the Streaming Microphone by
-        // operator override (game audio otherwise outranks the mic and takes the endpoint), so
-        // the plan falls all the way through to the last resort.
+        // Pad + Steam pair, mic pinned by override so the plan falls to last resort.
         let renders = [
             ep("DualSense Wireless Controller"),
             ep("Speakers (Steam Streaming Microphone)"),
@@ -1389,8 +1170,7 @@ mod tests {
         );
         assert!(w.loopback_last_resort);
 
-        // …and with the pad as the ONLY candidate left, the plan stays honestly unsatisfiable
-        // rather than falling back onto the coils.
+        // Pad alone: honestly unsatisfiable, never the coils.
         let w = plan(
             &renders[..1],
             &captures,
@@ -1407,11 +1187,9 @@ mod tests {
         assert!(w.loopback_unsatisfiable());
     }
 
-    // ---- minted tier-0 (the audio-substrate program) -------------------------------------
+    // ---- minted tier-0 ------------------------------------------------------------------
 
-    /// The minted zoo: both punktfunk instances present alongside the primaries, real
-    /// hardware, AND a cable — deliberately name-identical to the primaries, because that is
-    /// what the driver produces (S1 measured the confusion).
+    /// Primaries plus name-identical minted instances (the driver produces that).
     fn minted_zoo() -> ([Endpoint; 6], [Endpoint; 3], MintedIds) {
         let renders = [
             ep("Speakers (Realtek HD Audio)"),
@@ -1443,9 +1221,6 @@ mod tests {
         (renders, captures, minted)
     }
 
-    /// The end-state: with the minted pair present, the mic takes its own device and the
-    /// loopback takes the minted sink — by ID, ignoring the name-identical primaries, the
-    /// cable, and real hardware. Both features coexist without VB-Cable, client-only silent.
     #[test]
     fn minted_pair_is_tier_zero() {
         let (renders, captures, minted) = minted_zoo();
@@ -1462,8 +1237,6 @@ mod tests {
         assert_eq!(readiness(&w), AudioReadiness::Full);
     }
 
-    /// `host_audio` still prefers real hardware for the loopback; the mic keeps its minted
-    /// device either way.
     #[test]
     fn minted_host_audio_prefers_hardware() {
         let (renders, captures, minted) = minted_zoo();
@@ -1472,7 +1245,6 @@ mod tests {
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
     }
 
-    /// The operator override still beats the minted mic — an explicit choice wins everything.
     #[test]
     fn env_override_beats_minted() {
         let (renders, captures, minted) = minted_zoo();
@@ -1488,12 +1260,9 @@ mod tests {
             w.mic_render.unwrap().0,
             "CABLE Input (VB-Audio Virtual Cable)"
         );
-        // The minted sink still serves the loopback.
         assert_eq!(w.loopback_render.unwrap().1, "id-minted-spk");
     }
 
-    /// Partial mint (speakers only — the SSM leg failed): the mic falls back to the name
-    /// ladder, the loopback keeps the minted sink. Nothing regresses below today's behavior.
     #[test]
     fn minted_speakers_only_mic_uses_ladder() {
         let (renders, captures, mut minted) = minted_zoo();
@@ -1507,8 +1276,6 @@ mod tests {
         assert_eq!(w.loopback_render.unwrap().1, "id-minted-spk");
     }
 
-    /// A minted id the enumeration no longer serves must not produce a phantom assignment —
-    /// the plan falls back to the ladder exactly as if nothing were minted.
     #[test]
     fn stale_minted_ids_fall_back() {
         let renders = [
@@ -1526,8 +1293,6 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// A minted sink that NARROWS the mix demotes below real hardware like any silent sink —
-    /// tier-0 is an identity privilege, not a quality exemption.
     #[test]
     fn minted_sink_narrowing_demotes() {
         let renders = [
@@ -1546,23 +1311,19 @@ mod tests {
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
     }
 
-    /// The readiness classification the log line (and later the status API) carries.
     #[test]
     fn readiness_table() {
         let (renders, captures, minted) = minted_zoo();
         let full = plan(&renders, &captures, None, false, &[], &minted);
         assert_eq!(readiness(&full), AudioReadiness::Full);
-        // Steam-pair-only, no cable: audio yes (withheld mic), mic no.
         let renders = [ep("Altavoces (Steam Streaming Microphone)")];
         let captures = [ep("Microphone (Steam Streaming Microphone)")];
         let w = plan(&renders, &captures, None, false, &[], &MintedIds::default());
         assert_eq!(readiness(&w), AudioReadiness::AudioOnly);
-        // Cable-only headless: mic yes, audio no.
         let renders = [ep("CABLE Input (VB-Audio Virtual Cable)")];
         let captures = [ep("CABLE Output (VB-Audio Virtual Cable)")];
         let w = plan(&renders, &captures, None, false, &[], &MintedIds::default());
         assert_eq!(readiness(&w), AudioReadiness::MicOnly);
-        // Nothing at all.
         let w = plan(&[], &[], None, false, &[], &MintedIds::default());
         assert_eq!(readiness(&w), AudioReadiness::Nothing);
     }

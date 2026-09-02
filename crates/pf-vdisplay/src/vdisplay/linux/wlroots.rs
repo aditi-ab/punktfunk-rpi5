@@ -1,25 +1,19 @@
-//! wlroots/Sway virtual-output backend via sway IPC + the xdg ScreenCast portal
-//! (xdg-desktop-portal-wlr):
+//! wlroots/Sway virtual-output backend via sway IPC + xdg-desktop-portal-wlr.
 //!
-//! 1. `swaymsg create_output` adds a headless output (`HEADLESS-N` — sway must run the
-//!    headless backend, or have it co-loaded; the name is found by diffing
-//!    `swaymsg -t get_outputs` before/after).
-//! 2. `swaymsg output <NAME> mode --custom WxH@HzHz` sets the client's exact mode — a fresh
-//!    headless output also *needs* a real mode for a refresh clock, or it produces no frames.
-//! 3. The ScreenCast portal yields the output's PipeWire node. There is no GUI to pick an
-//!    output headlessly, so xdpw is steered through its chooser hook: a managed config
-//!    (`~/.config/xdg-desktop-portal-wlr/config`, written once + portal restarted on change)
-//!    sets `chooser_type=simple` with a `chooser_cmd` that cats the chooser file, which we
-//!    write per session (`Monitor: <NAME>` — xdpw 0.8 parses that prefix strictly).
-//! 4. Teardown is RAII **and ordered**: drop closes the ScreenCast session and WAITS for the portal
-//!    to confirm it, and only then runs `swaymsg output <NAME> unplug` (headless outputs support
-//!    unplug since sway 1.8). See [`StopGuard`] — and the long root-cause note on `hyprland.rs`'s
-//!    copy, which is where this was measured.
+//! 1. `swaymsg create_output` adds a headless output (`HEADLESS-N`). Sway must run the
+//!    headless backend (or co-load it). The name is the before/after diff of
+//!    `swaymsg -t get_outputs`.
+//! 2. `swaymsg output <NAME> mode --custom WxH@HzHz` sets the client's mode. A fresh
+//!    headless output needs a real mode for a refresh clock or it produces no frames.
+//! 3. The ScreenCast portal yields the PipeWire node. There is no GUI picker, so a
+//!    managed `~/.config/xdg-desktop-portal-wlr/config` sets `chooser_type=simple` and a
+//!    `chooser_cmd` that cats a per-session file (`Monitor: <NAME>` — xdpw 0.8 parses
+//!    that prefix strictly). Written once; the portal restarts on change.
+//! 4. Teardown is ordered: drop closes the ScreenCast session and waits for the portal
+//!    to confirm, then `swaymsg output <NAME> unplug` (sway ≥1.8). See [`StopGuard`].
 //!
-//! Requirements: the host can reach the sway session — `SWAYSOCK` for swaymsg, inherited or
-//! discovered and set on each child ([`swaymsg_command`]), plus the portal activation env
-//! (`WAYLAND_DISPLAY`/`XDG_CURRENT_DESKTOP=sway` imported into `systemctl --user`, see
-//! `scripts/headless/prepare-session.sh`), with the ScreenCast interface routed to xdpw
+//! Requirements: `SWAYSOCK` inherited or discovered per child ([`swaymsg_command`]),
+//! portal env via `scripts/headless/prepare-session.sh`, ScreenCast routed to xdpw
 //! (`scripts/headless/portals.conf`).
 
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
@@ -32,22 +26,18 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// File the xdpw output chooser reads the selected output from (see [`xdpw_config`]); we
-/// write `Monitor: <NAME>\n` here right before the portal handshake selects sources. Lives
-/// under `$XDG_RUNTIME_DIR` (per-user, mode 0700) — NOT a fixed world-writable /tmp path,
-/// where another local user could pre-create it (DoS) or rewrite it between our write and
-/// xdpw's read (steer capture at a different output).
+/// Per-session file xdpw's chooser cats (`Monitor: <NAME>\n`). Under `$XDG_RUNTIME_DIR`
+/// (0700), not a world-writable /tmp another user could pre-create or rewrite between
+/// our write and xdpw's read.
 fn chooser_file() -> String {
     let dir = crate::session::runtime_dir();
     format!("{dir}/punktfunk-xdpw-output")
 }
 
-/// The chooser command xdpw runs via `/bin/sh -c`, reading stdout. The `|| echo` fallback keeps
-/// plain portal capture (`--source portal`) working when no session of ours is mid-handshake — it
-/// is a GUESS at sway's own first headless output, right on a box whose sway loads the headless
-/// backend with one output of its own and wrong (a cast of nothing) otherwise. It is reachable
-/// again: the per-session file is removed with the handshake it steers ([`ChooserFile`]), so it no
-/// longer sits there naming an output we have since unplugged.
+/// xdpw runs this via `/bin/sh -c` and reads stdout. The `|| echo` fallback is a guess
+/// at sway's own first headless output — right only when that backend has one. [`ChooserFile`]
+/// removes the per-session file with the handshake so it cannot name an already-unplugged
+/// output.
 fn chooser_cmd() -> String {
     format!(
         "cat {} 2>/dev/null || echo 'Monitor: HEADLESS-1'",
@@ -55,42 +45,31 @@ fn chooser_cmd() -> String {
     )
 }
 
-/// The wlroots/Sway virtual-display driver. Stateless — each [`create`](VirtualDisplay::create)
-/// adds one headless output and spins up a portal thread owning the cast on it.
+/// wlroots/Sway virtual-display driver. Each [`create`](VirtualDisplay::create) adds one
+/// headless output; a portal thread owns the cast.
 pub struct WlrootsDisplay {
-    /// Out-of-band cursor request (`set_hw_cursor`, the negotiated cursor channel): PREFER portal
-    /// `CursorMode::Metadata` — shapes/positions ride `SPA_META_Cursor` for the channel + the
-    /// composite blend. Off (every non-channel session): prefer `Embedded` — the compositor paints
-    /// the pointer into frames, zero host-side cursor work (the pre-channel default this backend
-    /// always had).
+    /// Out-of-band cursor request: prefer portal `CursorMode::Metadata` (`SPA_META_Cursor`
+    /// for the channel + blend). Off: prefer `Embedded` (compositor paints the pointer).
     ///
-    /// Both are only a PREFERENCE: [`crate::portal_cursor`] settles it against what xdpw actually
-    /// advertises, because requesting an unadvertised mode closes the session outright. xdpw
-    /// refuses metadata by construction (see the portal thread), so on this backend the channel can
-    /// never be served out-of-band: it now degrades to `Embedded` and streams, where it used to
-    /// cancel the cast and hand the client a black screen.
+    /// Preference only: [`crate::portal_cursor`] matches what xdpw advertises — an
+    /// unadvertised mode closes the session. xdpw refuses metadata by construction, so
+    /// this backend always degrades to `Embedded`.
     hw_cursor: bool,
-    /// What the portal actually gave us on the most recent [`create`](VirtualDisplay::create) — see
-    /// [`VirtualDisplay::last_portal_cursor_mode`], which is how the host learns that a cursor
-    /// overlay is never coming instead of inferring it from an absence.
+    /// Last portal-negotiated cursor mode. The host must read this rather than infer
+    /// overlay absence from `hw_cursor`.
     last_cursor_mode: Option<crate::portal_cursor::Mode>,
-    /// The topology-restore action the last `create` prepared (re-enable the heads an `exclusive`
-    /// topology disabled). Written only through
-    /// [`stash_topology_restore`](crate::backend::stash_topology_restore) — first-wins, because one
-    /// instance serves every attempt of the host's pipeline retry loop and only attempt 1 finds
-    /// heads to disable.
+    /// Restore for heads the last `create` disabled (`exclusive`). Written only through
+    /// [`stash_topology_restore`](crate::backend::stash_topology_restore) — first-wins:
+    /// one instance serves the host retry loop and only attempt 1 finds heads to disable.
     ///
-    /// ⚠️ As on the Hyprland twin (and unlike KWin), the registry never picks this up: a sway display
-    /// carries a portal fd, so `registry::acquire` returns it as pass-through before reaching
-    /// `take_topology_restore()`. [`Drop`] is the ONLY thing that runs it, with the same per-session
-    /// caveat for concurrent `exclusive` sessions noted there.
+    /// The registry never takes it: a sway display carries a portal fd, so
+    /// `registry::acquire` returns pass-through before `take_topology_restore()`.
+    /// [`Drop`] is the only runner.
     pending_restore: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Drop for WlrootsDisplay {
     fn drop(&mut self) {
-        // The ONLY path that runs it (see the field docs — the registry never takes a pass-through
-        // display's restore); it is what re-lights the desk when a pipeline build fails.
         if let Some(restore) = self.pending_restore.take() {
             restore();
         }
@@ -106,19 +85,15 @@ impl WlrootsDisplay {
         })
     }
 
-    /// Apply the effective [`crate::policy::Topology`] for the just-created output `ours`, and stash
-    /// the restore this instance runs on drop (see [`Self::pending_restore`] — the registry does not
-    /// take a pass-through display's restore).
+    /// Apply [`crate::policy::Topology`] for `ours` and stash the restore this instance
+    /// runs on drop (the registry does not take a pass-through display's restore).
     ///
-    /// Called at the very END of [`create`](VirtualDisplay::create), on purpose: nothing can fail
-    /// after it, so there is no path that disables the operator's heads and then unwinds past the
-    /// point where the restore is handed over. The cost is that the physical heads stay lit for the
-    /// duration of the portal handshake, which is the pre-existing `extend` behaviour anyway.
+    /// Last step of [`create`](VirtualDisplay::create): nothing fails after it, so no
+    /// path disables heads and then unwinds past the restore hand-off. Physical heads
+    /// stay lit through the portal handshake (same as `extend`).
     fn apply_topology(&mut self, ours: &str) {
         use crate::policy::Topology;
         match crate::effective_topology() {
-            // Nothing to do — the headless output joins the desk as one more head, which is what
-            // `create` has already built.
             Topology::Extend | Topology::Auto => {}
             Topology::Primary => warn_primary_is_not_expressible(),
             Topology::Exclusive => {
@@ -126,28 +101,20 @@ impl WlrootsDisplay {
                 let prepared = (!disabled.is_empty()).then(|| {
                     Box::new(move || restore_heads(&disabled)) as Box<dyn FnOnce() + Send>
                 });
-                // Keep the FIRST restore, never the latest — the same retry-loop trap as the
-                // Hyprland twin, and sway is pass-through (portal fd) too, so this slot is likewise
-                // never drained by the registry. See [`stash_topology_restore`].
+                // First restore wins: retry loops must not replace attempt 1's list, and
+                // the registry never drains this slot (portal fd → pass-through).
                 crate::backend::stash_topology_restore(&mut self.pending_restore, prepared);
             }
         }
     }
 }
 
-/// wlroots/Sway is usable when the host runs inside a Sway session — signalled by an INHERITED
-/// `SWAYSOCK` (the IPC socket `swaymsg create_output` needs). Cheap env check for the enumeration
-/// path.
+/// True when the host inherited `SWAYSOCK` (the IPC socket `swaymsg` needs).
+/// Children get the socket via [`swaymsg_command`], so a `systemd --user` host
+/// never sees it here. [`crate::available`] asks the `/proc` scan first.
 ///
-/// Inherited is now all it can be: `apply_session_env` no longer exports this key (the value goes
-/// to the `swaymsg` children instead — see [`swaymsg_command`]), so this can only ever report what
-/// the host was launched with, never what we ourselves wrote. That is the honest half: a
-/// `systemd --user` host inherits nothing, and [`crate::available`] covers it by asking the `/proc`
-/// scan whether a wlroots session is live BEFORE it consults this probe.
-///
-/// Still under [`crate::with_env_lock`]: it orders the read against this crate's remaining env
-/// writers (`apply_session_env`'s four survivors), which is all that lock has ever been able to do.
-/// No caller holds it — the mutex is not reentrant.
+/// Under [`crate::with_env_lock`] against this crate's remaining env writers. The mutex
+/// is not reentrant; no caller holds it.
 pub fn is_available() -> bool {
     crate::with_env_lock(|| std::env::var_os("SWAYSOCK")).is_some()
 }
@@ -174,12 +141,10 @@ impl VirtualDisplay for WlrootsDisplay {
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
-        // Snapshot → create → identify, all under CREATE_LOCK. sway names the headless output
-        // itself (`HEADLESS-N`), so the only way to know which one is ours is "the name that was not
-        // there before" — and two concurrent creates each picking the other's output is a silent
-        // mis-capture, not a failure (mutter's TOPOLOGY_LOCK exists for exactly this class). The
-        // lock also gives the failure path somewhere safe to unplug from: the output already exists
-        // by the time `wait_new_output` can fail, and nothing else may have created one meanwhile.
+        // Snapshot → create → identify under CREATE_LOCK. Sway names the output
+        // (`HEADLESS-N`); two concurrent creates would each adopt the other's head
+        // (silent mis-capture). The lock also serializes unplug on the failure path:
+        // the output exists before `wait_new_output` can fail.
         let output = {
             let _create = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let before = output_names().context(
@@ -187,14 +152,11 @@ impl VirtualDisplay for WlrootsDisplay {
             )?;
             swaymsg(&["create_output"])
                 .context("swaymsg create_output (sway needs the headless backend loaded)")?;
-            // The output appears synchronously in practice; poll briefly to be safe, and own it
-            // from here on so error unwinding unplugs it.
+            // Own it from here so error unwind unplugs it; the output is usually already listed.
             match wait_new_output(&before, Duration::from_secs(5)) {
                 Ok(name) => OutputGuard(name),
                 Err(e) => {
-                    // `create_output` reported success, so an output very probably exists — it just
-                    // never showed up in time (or showed up a moment after we gave up). Unowned, it
-                    // would sit in the operator's sway layout forever.
+                    // create_output succeeded; an unidentified HEADLESS-* would stay in the layout.
                     unplug_strays(&before);
                     return Err(e);
                 }
@@ -202,7 +164,7 @@ impl VirtualDisplay for WlrootsDisplay {
         };
         let name = output.0.clone();
 
-        // The client's exact mode (also the refresh clock that makes the output produce frames).
+        // Client mode is also the refresh clock; without it the output produces no frames.
         let m = format!(
             "{}x{}@{}Hz",
             mode.width,
@@ -214,21 +176,15 @@ impl VirtualDisplay for WlrootsDisplay {
         swaymsg(&["output", &name, "enable"])
             .with_context(|| format!("swaymsg output {name} enable"))?;
 
-        // Put the compositor's focus on the head we are about to stream, so the windows this
-        // session opens land where the client can see them.
         focus_output(&name);
 
-        // Steer xdpw's headless output chooser at our new output, then run the portal handshake on
-        // its own thread (it parks to keep the cast alive, like the other backends). Serialized:
-        // the chooser is one per-user file, so a concurrent session's write between ours and xdpw's
-        // read would silently capture the wrong output (see `SELECTION_LOCK`).
+        // One chooser file per user: a concurrent write between ours and xdpw's read
+        // captures the wrong output. Handshake holds SELECTION_LOCK, not just the write.
         let (fd, node_id, cursor_mode, stop) = {
             let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             select_and_cast(&name, self.hw_cursor)?
         };
-        // Latched for `last_portal_cursor_mode`: xdpw refuses metadata by construction, so this is
-        // `embedded` whatever we asked for, and the session's whole cursor behaviour follows from
-        // that fact rather than from `hw_cursor`.
+        // xdpw refuses metadata, so this is `embedded` regardless of `hw_cursor`.
         self.last_cursor_mode = Some(cursor_mode);
         tracing::info!(
             node_id,
@@ -239,8 +195,7 @@ impl VirtualDisplay for WlrootsDisplay {
             cursor = cursor_mode.name(),
             "sway headless output ready"
         );
-        // Display-management topology (design §5.2). Last, so no failure path unwinds past the
-        // hand-off of the restore — see [`WlrootsDisplay::apply_topology`].
+        // Last: no failure path unwinds past the restore hand-off.
         self.apply_topology(&name);
         Ok(VirtualOutput {
             node_id,
@@ -250,64 +205,44 @@ impl VirtualDisplay for WlrootsDisplay {
                 _stop: stop,
                 _output: output,
             }),
-            // Owned (the compositor output is ours to tear down), but not registry-poolable: the
-            // portal fd can't be re-opened per attach, so the registry passes it through on
-            // `remote_fd.is_some()` (keep-alive stays off for wlroots until fresh-portal re-attach).
+            // Owned, not poolable: the portal fd cannot reopen per attach, so the
+            // registry pass-throughs on `remote_fd.is_some()`.
             ownership: DisplayOwnership::Owned,
             reused_gen: None,
             pool_gen: None,
             expect_exact_dims: false,
-            // Same EXTEND problem as Hyprland: on a sway session with real heads this `HEADLESS-N`
-            // sits beside them, and absolute input must be aimed at it by name. `swaymsg`'s output
-            // name is the head's `wl_output.name`, which is what the injector matches.
+            // Absolute input aims at this `wl_output.name`; with real heads the
+            // HEADLESS-* sits beside them.
             output_name: Some(name),
         })
     }
 }
 
-/// Drop order matters, and it is the whole fix: [`StopGuard`] **blocks until the ScreenCast session
-/// is actually closed**, and only then does [`OutputGuard`] unplug the output (fields drop in
-/// declaration order). This used to unplug first — see [`StopGuard`].
+/// [`StopGuard`] blocks until the ScreenCast session is closed; [`OutputGuard`] then
+/// unplugs. Fields drop in declaration order.
 struct Keepalive {
     _stop: StopGuard,
     _output: OutputGuard,
 }
 
-/// How long teardown waits for the portal to confirm the ScreenCast session is closed before giving
-/// up and unplugging the output anyway. See `hyprland.rs`'s twin.
+/// 3 s to wait for portal Close before unplugging under a live session.
 const CAST_CLOSE_BUDGET: Duration = Duration::from_secs(3);
 
-/// Ceiling on the whole ScreenCast handshake, under the caller's 20 s wait — see the note at the
-/// handshake, and the longer one on `hyprland.rs`'s copy.
+/// Whole ScreenCast handshake; sits under the caller's 20 s wait.
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
 
-/// Ends the cast: signals the portal thread, then **waits for it to have closed the ScreenCast
-/// session**, so the caller may safely unplug the output afterwards.
+/// Signals the portal thread, then waits until it has closed the ScreenCast session
+/// so the caller may unplug the output.
 ///
-/// 🛑 THE WAIT IS THE POINT. Root-caused on the Hyprland leg (see the long note on `hyprland.rs`'s
-/// `StopGuard`, which carries the measurements); the defect is the same here, and this is NOT an
-/// assumption of symmetry — xdpw was read to confirm it, against `emersion/xdg-desktop-portal-wlr`:
-///
-/// * **Only `Close` tears a session down.** `src/core/session.c` gives the session object exactly
-///   one method — `SD_BUS_METHOD("Close", …, method_close, …)` — and nothing else calls
-///   `xdpw_session_destroy` for a live cast. Like xdph, xdpw has no peer-vanished watcher of its own
-///   and depends entirely on xdg-desktop-portal's `peer_died_cb` calling `Close` for us, which
-///   happens only after our bus name goes away, asynchronously, and therefore after the old
-///   `StopGuard` had already let `OutputGuard` unplug the output.
-/// * **The same unbounded busy-wait is waiting for it.** `src/screencast/screencast.c:599-605`:
-///   `while (cast->node_id == SPA_ID_INVALID) { pw_loop_iterate(state->pw_loop, 0); }` — timeout 0,
-///   i.e. non-blocking, i.e. a hot spin on the portal's only loop with no escape if the stream never
-///   gets a node id. xdph's copy (`Screencopy.cpp:307-313`) is this code; that is the one measured
-///   pinning a core solid until it was restarted.
-///
-/// So sway's `output unplug` yanks a captured output out from under a live session exactly the way
-/// Hyprland's `output remove` did. Whether xdpw wedges *identically* has not been observed on glass
-/// — no sway box was available — but the two preconditions are present in its source, and closing
-/// the session before unplugging is the correct order regardless of what the backend does with it.
+/// Only `Session.Close` tears an xdpw session down (`src/core/session.c`); xdpw has
+/// no peer-vanished watcher and relies on xdg-desktop-portal's `peer_died_cb`, which
+/// runs after our bus name is gone — after an unplug-first Drop would already have
+/// yanked the captured output. `screencast.c` then busy-waits
+/// `while (cast->node_id == SPA_ID_INVALID) pw_loop_iterate(..., 0)` with no timeout.
+/// Close before unplug. Proof also in `hyprland.rs`'s [`StopGuard`].
 struct StopGuard {
     stop: Arc<AtomicBool>,
-    /// Signalled by the portal thread once it has closed the ScreenCast session. `None` when no cast
-    /// was ever established — nothing to close, and nothing worth spending the budget on.
+    /// Signalled once the portal thread has closed the session. `None` if no cast ran.
     closed: Option<std::sync::mpsc::Receiver<()>>,
 }
 
@@ -318,7 +253,6 @@ impl Drop for StopGuard {
             return;
         };
         match closed.recv_timeout(CAST_CLOSE_BUDGET) {
-            // Closed, or the thread is gone without confirming — either way nothing holds the cast.
             Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
                 budget_s = CAST_CLOSE_BUDGET.as_secs(),
@@ -329,28 +263,22 @@ impl Drop for StopGuard {
     }
 }
 
-/// Serializes **snapshot → `create_output` → identify-the-new-name**, process-wide. sway names its
-/// headless outputs itself, so ownership is established by a before/after diff and two concurrent
-/// creates would each adopt the other's output — which does not fail, it silently streams the wrong
-/// one. Mutter's `TOPOLOGY_LOCK` is the same guard for the same reason; Hyprland needs none because
-/// it lets us NAME the output (D6).
+/// Serializes snapshot → `create_output` → identify, process-wide. Sway names the
+/// output; a concurrent pair would each stream the other's head (no error). Mutter's
+/// `TOPOLOGY_LOCK` is the same class; Hyprland names the output itself.
 static CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Could `name` be a headless output a punktfunk host created? sway names these itself, so unlike
-/// Hyprland's `PF-<pid>-<n>` there is nothing in the name to attribute — the prefix is the whole
-/// answer, and a headless output the operator made by hand is indistinguishable. That is why the two
-/// callers are both narrow: [`unplug_strays`] additionally requires the output to have appeared
-/// during our own `create_output`, and [`super::super::focus_streamed_output`] only ever passes the
-/// name of the head this session is streaming.
+/// `HEADLESS-` prefix only: sway names these itself, so an operator-made headless
+/// output is indistinguishable. Callers stay narrow: [`unplug_strays`] also requires
+/// it appeared during our `create_output`; [`super::super::focus_streamed_output`]
+/// only passes the head this session is streaming.
 pub(crate) fn is_managed_output(name: &str) -> bool {
     name.starts_with("HEADLESS-")
 }
 
-/// Unplug any headless output that appeared since `before` and that nothing owns — the cleanup for a
-/// `create_output` whose output we could not identify in time. Only `HEADLESS-*` is touched: a
-/// physical hotplug in the same window is the operator's, not ours, and `unplug` on a real connector
-/// would take their screen away. Best-effort by construction, and it runs with [`CREATE_LOCK`] held
-/// so nothing else in this process can have created the strays it sees.
+/// Unplug `HEADLESS-*` that appeared since `before` and nothing owns. A physical
+/// hotplug in the same window is the operator's; `unplug` on a real connector takes
+/// their screen. Runs with [`CREATE_LOCK`] held.
 fn unplug_strays(before: &[String]) {
     let Ok(now) = output_names() else { return };
     for name in now
@@ -366,17 +294,13 @@ fn unplug_strays(before: &[String]) {
     }
 }
 
-/// Point sway's focus at the head we are about to stream, so the windows this session opens land
-/// where the client can see them.
+/// Focus the head we are about to stream so session windows land where the client
+/// can see them.
 ///
-/// sway opens a new window on the focused workspace, and `create_output` does not focus what it
-/// creates — focus stays on whatever head already had it, which on a box with a physical monitor is
-/// that monitor. Nothing else in the session moves it (the client's pointer is confined to the
-/// streamed output), so without this every app the host launches for the session opens where the
-/// client cannot see it. The Hyprland twin of this is `hyprland::focus_output`; both are the
-/// EXTEND-topology answer to window placement, and neither touches the operator's heads.
-///
-/// Best-effort: a failure costs window placement, not the session.
+/// sway opens a new window on the focused workspace; `create_output` does not move
+/// focus. The client's pointer is confined to the streamed output, so without this
+/// every launch opens on the physical monitor. Best-effort: failure costs placement,
+/// not the session.
 pub(crate) fn focus_output(name: &str) {
     match swaymsg(&focus_argv(name)) {
         Ok(_) => tracing::info!(output = %name, "focused the streamed headless output"),
@@ -388,31 +312,18 @@ pub(crate) fn focus_output(name: &str) {
     }
 }
 
-/// The `swaymsg` argv that focuses `name`, split out so a test pins its SHAPE.
-///
-/// sway's command is `focus output <name>` — the noun comes SECOND, unlike every other call in this
-/// file (`output <name> mode|enable|unplug`), where it comes first. Transposing it yields
-/// `output focus <name>`, which sway rejects, and the field symptom is the very bug this fixes.
-///
-/// ⚠ Unlike the Hyprland twin, this shape is **from sway's documented command surface, not yet
-/// exercised on a live sway** (no box in the fleet runs one — the 2026-08-17 probe had Hyprland
-/// only). It is the safer of the two to get wrong: [`swaymsg`] passes these through `--` as a sway
-/// *command* and rejects a non-zero exit, and sway exits non-zero on an invalid command (the
-/// `Unknown/invalid command` path [`swaymsg_query`] documents), so a bad shape surfaces as the
-/// logged warning rather than as a silent success the way `hyprctl`'s exit-0 rejection would.
+/// `focus output <name>` — noun second, unlike every other call in this file
+/// (`output <name> mode|enable|unplug`). `output focus <name>` is rejected.
+/// [`swaymsg`] passes through `--` and treats a non-zero exit as failure, so a bad
+/// shape logs rather than succeeding silently (`hyprctl` would exit 0).
 fn focus_argv(name: &str) -> [&str; 3] {
     ["focus", "output", name]
 }
 
-/// `topology: primary` has no expression on this compositor, and saying so once per create is the
-/// honest implementation — design §5.2 spells this row out: "**unsupported** (no primary concept)
-/// → log + treat as extend".
-///
-/// Wayland has no primary-output concept, and sway's nearest equivalent is the *focused* output —
-/// which [`focus_output`] already points at the streamed head for every session, whatever the
-/// topology says. So `primary` is not silently dropped so much as already granted, as far as this
-/// compositor can express it; what an operator does NOT get is a persistent designation other
-/// clients can read. Distinct from the `exclusive` path, which really does change the desk.
+/// `topology: primary` has no expression here: Wayland has no primary output, and
+/// sway's nearest equivalent is the focused output, which [`focus_output`] already
+/// points at the streamed head. Log and treat as extend. `exclusive` actually
+/// changes the desk.
 fn warn_primary_is_not_expressible() {
     tracing::info!(
         "wlroots: `topology: primary` has no equivalent here — Wayland has no primary output and \
@@ -421,18 +332,12 @@ fn warn_primary_is_not_expressible() {
     );
 }
 
-/// Which heads an `exclusive` topology should disable: enabled, not ours, and **not managed**.
+/// Enabled, not ours, not managed. Pure so the sibling-spare rule is testable
+/// without a compositor. `managed` is the `HEADLESS-` prefix, so a concurrent
+/// session's output is never blacked out.
 ///
-/// Pure so the group-awareness rule (design §6.1 — "exclusive means the *managed virtual displays*
-/// are the only enabled outputs; never disable a sibling slot") is unit-testable without a
-/// compositor. `managed` comes from [`list_monitors`], i.e. the `HEADLESS-` prefix, so a concurrent
-/// session's output is never blacked out by ours.
-///
-/// ⚠️ That prefix is [deliberately blunt](is_managed_output): sway names its OWN headless outputs
-/// the same way we do, so a sway started on the headless backend has a `HEADLESS-1` of its own that
-/// this filter also spares. The failure that buys is the harmless one — a bootstrap head stays lit
-/// on a box that has no physical screen anyway — whereas the alternative is disabling a live
-/// sibling's output. `ours` is excluded by name too, belt and braces.
+/// The prefix is blunt: sway's own bootstrap `HEADLESS-1` is spared too. Leaving a
+/// headless box's only screen lit is the cheaper failure vs disabling a sibling.
 fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> Vec<String> {
     heads
         .iter()
@@ -441,9 +346,8 @@ fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> V
         .collect()
 }
 
-/// Disable every non-managed head for an `exclusive` session, returning the ones actually disabled
-/// (the input to [`restore_heads`]). Best-effort per head: one that refuses costs exclusivity on
-/// that screen, not the session.
+/// Disable every non-managed head for `exclusive`. Returns those actually disabled
+/// ([`restore_heads`]). One refusal costs that screen, not the session.
 fn disable_other_heads(ours: &str) -> Vec<String> {
     let heads = match list_monitors() {
         Ok(h) => h,
@@ -479,19 +383,16 @@ fn disable_other_heads(ours: &str) -> Vec<String> {
             ?disabled,
             "wlroots: `topology: exclusive` — the streamed output is now the desk"
         );
-        // Disabling outputs moves their workspaces, and sway picks the replacement focus itself.
-        // Re-assert ours so window placement still lands on the stream (the #283 contract).
+        // Disable moves workspaces; sway picks a new focus. Re-assert ours so
+        // launches still land on the stream.
         focus_output(ours);
     }
     disabled
 }
 
-/// Disable one head: `swaymsg output <name> disable`, confirmed by read-back.
-///
-/// The read-back is not ceremony. `swaymsg` does report a rejected command with a non-zero exit
-/// (unlike `hyprctl`, which answers at exit 0 — see the Hyprland twin), so a bad *command* is
-/// caught by [`swaymsg`] itself; what the read-back adds is proof the output actually went
-/// inactive, which is the state teardown will have to undo.
+/// `swaymsg output <name> disable`, then read back. A bad command already fails
+/// [`swaymsg`] (unlike `hyprctl`'s exit 0). The poll proves the output went
+/// inactive — the state teardown must undo.
 fn disable_head(name: &str) -> Result<()> {
     swaymsg(&disable_argv(name)).with_context(|| format!("swaymsg output {name} disable"))?;
     if wait_head_enabled_is(name, false, DISABLE_BUDGET) {
@@ -500,34 +401,24 @@ fn disable_head(name: &str) -> Result<()> {
     bail!("swaymsg accepted `output {name} disable` but the output never went inactive")
 }
 
-/// The `swaymsg` argv that disables `name`, split out so a test pins its SHAPE — the noun comes
-/// FIRST here (`output <name> disable`), the opposite of [`focus_argv`]'s `focus output <name>`.
+/// `output <name> disable` — noun first, opposite of [`focus_argv`]. Test-pinned.
 fn disable_argv(name: &str) -> [&str; 3] {
     ["output", name, "disable"]
 }
 
-/// The `swaymsg` argv that DPMS-es `name` off or on. Same noun-first shape as [`disable_argv`],
-/// and a different axis from it: `dpms off` leaves the output enabled and configured (its
-/// workspaces do not move, no window is re-homed) and merely stops driving the panel.
+/// `output <name> dpms on|off`. Same noun-first shape as [`disable_argv`], different
+/// axis: `dpms off` leaves the output enabled (workspaces stay) and stops the panel.
 fn dpms_argv(name: &str, on: bool) -> [&str; 4] {
     ["output", name, "dpms", if on { "on" } else { "off" }]
 }
 
-/// DPMS every head that is not ours and not a sibling's off (or back on), for a **gamescope**
-/// session honoring `Topology::Exclusive` — see [`crate::panel_dpms`].
+/// DPMS every non-ours, non-sibling head for a **gamescope** `Topology::Exclusive`
+/// ([`crate::panel_dpms`]).
 ///
-/// Distinct from [`disable_other_heads`], which is what the *wlroots backend's own* exclusive
-/// topology does. A gamescope spawn is its own compositor and owns no sway output, so there is
-/// nothing here to promote to "the desk" and nothing to focus — and disabling the operator's
-/// outputs would move their workspaces around for a stream that is not even on this compositor.
-/// DPMS is the honest translation: the desk stays exactly as it is, the panels just go dark.
-///
-/// Reuses [`heads_to_disable`]'s filter with an empty `ours`, so a concurrent wlroots session's
-/// `HEADLESS-*` output is spared for the same reason it is there — blanking it would black out
-/// that client's stream.
-///
-/// Returns the heads actually changed, so the re-light can undo exactly those. Best-effort per
-/// head, like its neighbour: one that refuses costs a lit screen, not the stream.
+/// Not [`disable_other_heads`]: gamescope is its own compositor and owns no sway
+/// output, so disable would move workspaces for a stream that is not on this
+/// compositor. Empty `ours` still spares a concurrent session's `HEADLESS-*`.
+/// Returns the heads actually changed. One refusal costs a lit screen, not the stream.
 pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
     let Ok(heads) = list_monitors() else {
         return Vec::new();
@@ -545,18 +436,15 @@ pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
     changed
 }
 
-/// The `swaymsg` argv that re-enables `name`. sway keeps a disabled output's configuration, so a
-/// bare `enable` restores the mode/position/scale it had — there is no need to replay the rule the
-/// way the Hyprland twin's `reload` does.
+/// `output <name> enable`. Sway keeps a disabled output's config, so this restores
+/// mode/position/scale; Hyprland needs `reload` instead.
 fn enable_argv(name: &str) -> [&str; 3] {
     ["output", name, "enable"]
 }
 
-/// How long a `disable`/`enable` has to show up in `swaymsg -t get_outputs`. Generous next to a
-/// healthy IPC round trip; a miss is reported, never assumed.
+/// 3 s for `disable`/`enable` to show in `get_outputs`. A miss is reported, never assumed.
 const DISABLE_BUDGET: Duration = Duration::from_secs(3);
 
-/// Poll until `name`'s enabled state equals `want`, up to `timeout`. `false` on timeout.
 fn wait_head_enabled_is(name: &str, want: bool, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -570,9 +458,8 @@ fn wait_head_enabled_is(name: &str, want: bool, timeout: Duration) -> bool {
     }
 }
 
-/// Is output `name` currently enabled (sway's `active`)? `None` if it is not present at all.
-/// A disabled output is still listed by `get_outputs`, with `"active": false` — which is what makes
-/// this a usable read-back rather than a presence check.
+/// Sway's `active` for `name`. `None` if absent. A disabled output stays in
+/// `get_outputs` with `"active": false` — that is the read-back, not presence.
 fn head_is_enabled(name: &str) -> Result<Option<bool>> {
     let parsed = swaymsg_query("get_outputs")?;
     let Some(arr) = parsed.as_array() else {
@@ -588,17 +475,10 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
     Ok(None)
 }
 
-/// Re-enable the outputs an `exclusive` session disabled. Run by the REGISTRY when the display
-/// group's last member is torn down (design §6.1) and, critically, **before** that member's output
-/// is unplugged — so sway never sees zero enabled outputs.
-///
-/// ⚠️ **Not exercised on a live sway.** No box in the fleet runs one (the 2026-08-18 probes had
-/// Hyprland only), which is the same gap PR #283's `focus output` half shipped with and which
-/// `design/display-management.md` records as "wlroots `exclusive` (needs a Sway box)". The argv is
-/// sway's documented command surface and is pinned by [`enable_argv`]'s test; the read-back below
-/// turns a wrong guess into a logged warning naming the outputs, rather than a screen that silently
-/// stays dark. Unlike Hyprland — where re-applying a rule provably does NOT undo a disable and only
-/// `hyprctl reload` does — sway's `enable` is the documented inverse of `disable`.
+/// Re-enable heads `exclusive` disabled. The registry runs this when the group's
+/// last member tears down, and **before** that member's output is unplugged — sway
+/// must not see zero enabled outputs. `enable` is the inverse of `disable`
+/// (Hyprland needs `hyprctl reload`). A miss logs the hand command.
 fn restore_heads(disabled: &[String]) {
     for name in disabled {
         match swaymsg(&enable_argv(name)) {
@@ -622,7 +502,6 @@ fn restore_heads(disabled: &[String]) {
     }
 }
 
-/// Owns the created headless output; dropping it unplugs it from sway.
 struct OutputGuard(String);
 
 impl Drop for OutputGuard {
@@ -634,28 +513,17 @@ impl Drop for OutputGuard {
     }
 }
 
-/// Budget for one `swaymsg` call ([`crate::proc`]).
-///
-/// swaymsg is a CLIENT of the compositor it drives: against a wedged sway it blocks in its own
-/// connect to the IPC socket and never returns — and these calls run on the session's stream thread,
-/// whose only way to end a session is to return, so one hung query used to wedge the session
-/// permanently. Generous next to a healthy call (single-digit milliseconds), and every call site
-/// here already has a failed-query path, so a timeout lands on behaviour that already exists.
+/// 5 s per `swaymsg` ([`crate::proc`]). Against a wedged sway the client blocks in
+/// connect forever; these calls run on the stream thread, whose only end is return.
+/// Every call site already has a failed-query path.
 const SWAYMSG_BUDGET: Duration = Duration::from_secs(5);
 
-/// Budget for the one-shot xdpw restart. `systemctl --user try-restart` waits for the unit's job to
-/// settle, so it is the slowest helper on this path — and its result is already ignored.
+/// 10 s for `systemctl --user try-restart` (waits for the job; result is ignored).
 const PORTAL_RESTART_BUDGET: Duration = Duration::from_secs(10);
 
-/// A bare `swaymsg`, with the live sway IPC socket threaded onto the child.
-///
-/// `SWAYSOCK` used to ride the process env: `apply_session_env` `set_var`'d it per connect (and
-/// `remove_var`'d it when nothing sway-shaped was live) so these children inherited it. Nothing
-/// outside pf-vdisplay ever read it, so that bought a per-connect `setenv` — a data race with any
-/// `getenv` on any other thread of a live streaming host — for a value two children need.
-/// `Command::env` gives it to exactly those children, the way `set_launch_command` carries the
-/// launch. `sock` is `None` when there is no sway IPC we can find: leave the child's env alone
-/// then, so an inherited one (host started inside the session) still wins.
+/// Bare `swaymsg` with `SWAYSOCK` on the child only. `Command::env` avoids a process
+/// `setenv` racing every `getenv` on a live host. `sock` is `None` when no IPC is
+/// found: leave the child's env alone so an inherited socket still wins.
 fn swaymsg_command(sock: Option<String>) -> Command {
     let mut cmd = Command::new("swaymsg");
     if let Some(sock) = sock {
@@ -664,9 +532,8 @@ fn swaymsg_command(sock: Option<String>) -> Command {
     cmd
 }
 
-/// Run `swaymsg -- <args>`, returning stdout (`--` so command tokens like `--custom` reach
-/// sway instead of swaymsg's own getopt). swaymsg exits non-zero (with the error on stderr/
-/// stdout) when the command fails, so checking the status covers `{"success": false}` too.
+/// `swaymsg -- <args>` (`--` so `--custom` reaches sway, not swaymsg's getopt).
+/// Non-zero exit covers `{"success": false}` too.
 fn swaymsg(args: &[&str]) -> Result<String> {
     let mut cmd = swaymsg_command(crate::session::sway_socket());
     let out = crate::proc::output_within(cmd.arg("--").args(args), SWAYMSG_BUDGET)
@@ -682,11 +549,8 @@ fn swaymsg(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Run a swaymsg **query** (`-t <kind> --raw`) and parse its JSON.
-///
-/// ⚠️ Deliberately NOT [`swaymsg`]: that helper inserts `--` so its arguments are read as a sway
-/// *command*, which is right for `create_output` and wrong for a query — `-t` after `--` comes back
-/// as `Unknown/invalid command '-t'` (caught on-glass writing the monitor enumeration).
+/// Query (`-t <kind> --raw`) and parse JSON. Not [`swaymsg`]: that helper inserts
+/// `--`, so `-t` is read as a sway command (`Unknown/invalid command '-t'`).
 fn swaymsg_query(kind: &str) -> Result<serde_json::Value> {
     let mut cmd = swaymsg_command(crate::session::sway_socket());
     let out = crate::proc::output_within(cmd.args(["-t", kind, "--raw"]), SWAYMSG_BUDGET)
@@ -701,7 +565,6 @@ fn swaymsg_query(kind: &str) -> Result<serde_json::Value> {
     serde_json::from_str(&raw).with_context(|| format!("parse {kind}"))
 }
 
-/// Current output names from `swaymsg -t get_outputs` (JSON).
 fn output_names() -> Result<Vec<String>> {
     let outputs = swaymsg_query("get_outputs")?;
     Ok(outputs
@@ -712,23 +575,16 @@ fn output_names() -> Result<Vec<String>> {
         .collect())
 }
 
-/// Serializes **write-the-chooser → complete-the-handshake**, process-wide.
-///
-/// The chooser is a single per-user file: whoever writes last before xdpw reads wins. Two sessions
-/// starting at once (or a mirror starting beside a virtual output) would otherwise race, and the
-/// loser doesn't fail — it silently captures the *other* session's output. Held across the portal
-/// handshake, not just the write, because the read happens inside it.
+/// Serializes write-the-chooser → complete-the-handshake, process-wide. One file
+/// per user: last writer before xdpw reads wins, and the loser silently captures
+/// the other session's output. Held across the handshake because the read is inside it.
 static SELECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The per-session chooser file, removed when the handshake it steers is over.
+/// Per-session chooser file, removed when the handshake it steers ends.
 ///
-/// Its lifetime is the HANDSHAKE, not the session: xdpw reads it once, inside
-/// [`select_and_cast`]'s critical section, and everything after that is the cast's own business.
-/// Left behind (as it was) the stale `Monitor: HEADLESS-3` outlives the output `Drop` has since
-/// unplugged, and it permanently shadows [`chooser_cmd`]'s `|| echo` fallback — so a later
-/// `--source portal` capture with no session of ours running steers at a connector that is gone.
-/// Tying removal to the CAST instead would be worse still: the file is one per user, so a session
-/// ending hours later would delete a *sibling's* selection out from under its picker.
+/// Lifetime is the handshake, not the cast: xdpw reads once inside [`select_and_cast`].
+/// A leftover `Monitor: HEADLESS-N` shadows [`chooser_cmd`]'s fallback after Drop
+/// unplugs that output. Tying removal to the cast would delete a sibling's selection.
 struct ChooserFile(String);
 
 impl Drop for ChooserFile {
@@ -741,8 +597,8 @@ impl Drop for ChooserFile {
     }
 }
 
-/// Point xdpw's chooser at `output` and run the ScreenCast handshake, returning the portal fd +
-/// node id and the guard that stops the cast. The caller must hold [`SELECTION_LOCK`].
+/// Point xdpw's chooser at `output` and run the ScreenCast handshake. Caller holds
+/// [`SELECTION_LOCK`].
 fn select_and_cast(
     output: &str,
     hw_cursor: bool,
@@ -751,18 +607,14 @@ fn select_and_cast(
     let chooser = chooser_file();
     std::fs::write(&chooser, format!("Monitor: {output}\n"))
         .with_context(|| format!("write {chooser}"))?;
-    // Owned from the write on: every arm below (and every `?`) leaves the handshake, which is the
-    // only thing that reads it.
+    // Drop removes it; every `?` below leaves the handshake, the only reader.
     let _chooser = ChooserFile(chooser);
-    // The NEGOTIATED cursor mode rides back with the fd and node id: it is decided inside the
-    // portal thread (only there is the proxy to ask), and nothing downstream can re-derive it —
-    // `hw_cursor` is the request, not the answer.
+    // Negotiated inside the portal thread (only there is the proxy). `hw_cursor` is
+    // the request, not the answer.
     let (setup_tx, setup_rx) =
         std::sync::mpsc::channel::<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>();
-    // The teardown handshake: the thread signals this once it has closed the ScreenCast session, and
-    // `StopGuard::drop` waits on it before the output is unplugged (see `StopGuard`). Kept a
-    // SEPARATE channel from the setup one above — it fires at the other end of the cast's life,
-    // long after `setup_rx` has been consumed.
+    // Teardown channel, not setup: it fires after `setup_rx` is consumed, when
+    // `StopGuard::drop` must wait before unplug.
     let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
@@ -770,17 +622,14 @@ fn select_and_cast(
         .name("punktfunk-wlr-cast".into())
         .spawn(move || portal_thread(setup_tx, closed_tx, stop_thread, hw_cursor))
         .context("spawn wlroots portal thread")?;
-    // Built BEFORE the wait so EVERY error arm below sets the flag on its way out — as Mutter's
-    // `create` does. Returning the bare `Arc` and letting the CALLER wrap it left the two failure
-    // arms dropping an un-set flag: the thread's `send` can still LAND in the queue in the window
-    // between `recv_timeout` giving up and `setup_rx` being dropped, so it reports success and then
-    // parks forever on `while !stop`, holding a live ScreenCast session, its zbus connection, an
-    // `OwnedFd` and a 2-worker tokio runtime — one more set per slow-portal connect, for the host's
-    // lifetime, against an output that no longer exists.
+    // Build the guard before the wait so every error arm sets `stop` on the way
+    // out. Wrapping later left failure arms dropping an unset flag: the thread can
+    // still `send` after `recv_timeout`, report success, then park forever on a
+    // live ScreenCast against an output that is gone.
     let mut guard = StopGuard { stop, closed: None };
     match setup_rx.recv_timeout(Duration::from_secs(20)) {
         Ok(Ok((fd, node_id, cursor_mode))) => {
-            // A cast exists now, so teardown has something to close and must wait for it.
+            // Cast is live: teardown must wait for Close.
             guard.closed = Some(closed_rx);
             Ok((fd, node_id, cursor_mode, guard))
         }
@@ -789,12 +638,9 @@ fn select_and_cast(
     }
 }
 
-/// Record an **existing** sway output — the monitor-mirror path
-/// (`design/per-monitor-portal-capture.md` L3). Same chooser mechanism the virtual-output path
-/// uses, pointed at a physical connector instead of a headless one we created, so it inherits the
-/// "no GUI picker" property a background service needs.
-///
-/// The keepalive stops the cast and nothing else: sway keeps the monitor, because we never made it.
+/// Cast an existing sway output (monitor-mirror; see
+/// `design/per-monitor-portal-capture.md`). Same chooser, physical connector, no
+/// GUI picker. Keepalive stops the cast only — we never created the monitor.
 pub(crate) fn stream_existing_output(
     connector: &str,
     hw_cursor: bool,
@@ -809,11 +655,9 @@ pub(crate) fn stream_existing_output(
     })
 }
 
-/// Every head sway reports, for [`crate::monitors::list`].
-///
-/// `swaymsg -t get_outputs` reports `rect` in the logical coordinate space (post-scale,
-/// post-transform) — what `crate::monitors` documents. An inactive output has no `current_mode`, so
-/// its mode reads as zeros rather than a guess.
+/// Every head `get_outputs` reports, for [`crate::monitors::list`]. `rect` is
+/// logical (post-scale, post-transform). Inactive outputs have no `current_mode`;
+/// mode fields read as zeros, not a guess.
 pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
     let parsed = swaymsg_query("get_outputs")?;
     let mut out: Vec<_> = parsed
@@ -858,8 +702,7 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
                     .or_else(|| o.get("focused").and_then(|v| v.as_bool()))
                     .unwrap_or(false),
                 enabled: o.get("active").and_then(|v| v.as_bool()).unwrap_or(true),
-                // Sway auto-names headless outputs `HEADLESS-N` and that is what `create` adds. A
-                // sway started with its own headless output would match too — hence best-effort.
+                // Prefix match only; a sway-owned bootstrap HEADLESS-* counts too.
                 managed: connector.starts_with("HEADLESS-"),
                 connector,
             })
@@ -869,7 +712,7 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
     Ok(out)
 }
 
-/// Wait for the output `create_output` added (the name not in `before` — HEADLESS-N).
+/// The name `create_output` added: present now, absent from `before`.
 fn wait_new_output(before: &[String], timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -886,17 +729,16 @@ fn wait_new_output(before: &[String], timeout: Duration) -> Result<String> {
     }
 }
 
-/// Make sure xdpw uses our output chooser. xdpw reads its config only at startup, so on a
-/// change restart it if running (`try-restart`; if it isn't, D-Bus activation will start it
-/// with the new config). The config itself is static — the *selection* is the chooser file.
+/// Point xdpw at our chooser. It reads config only at startup, so `try-restart` on
+/// change (D-Bus activation starts it later if it is not running). Selection is the
+/// chooser file; this config is static.
 fn ensure_xdpw_config() -> Result<()> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
         .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME set"))?;
     let path = base.join("xdg-desktop-portal-wlr").join("config");
-    // The two keys we own, set IN PLACE. This used to `fs::write` a complete file over whatever the
-    // user had, destroying every other xdpw setting they owned on first connect.
+    // Only the two keys we own, in place. A full-file write would wipe the user's other xdpw settings.
     let mut changed = crate::portal_config::ensure_key(
         &path,
         crate::portal_config::Block::Ini("screencast"),
@@ -913,9 +755,7 @@ fn ensure_xdpw_config() -> Result<()> {
         return Ok(());
     }
     tracing::info!(path = %path.display(), "pointed xdg-desktop-portal-wlr at the managed output chooser");
-    // Bounded: `systemctl --user` blocks on the user manager's job queue, and this runs on the
-    // session's stream thread. Its result was already ignored — a timeout just means the portal
-    // picks the new config up whenever it next starts.
+    // Stream thread: `systemctl --user` blocks on the job queue. Result already ignored.
     let _ = crate::proc::status_within(
         Command::new("systemctl").args(["--user", "try-restart", "xdg-desktop-portal-wlr.service"]),
         PORTAL_RESTART_BUDGET,
@@ -923,9 +763,8 @@ fn ensure_xdpw_config() -> Result<()> {
     Ok(())
 }
 
-/// The ScreenCast portal handshake (same shape as the capture module's portal thread, but it
-/// reports the fd + node id and parks until stopped — the zbus connection is the cast's
-/// lifetime). xdpw answers the source selection via the chooser, no dialog.
+/// ScreenCast handshake: report fd + node id, then park. The zbus connection is the
+/// cast's lifetime. xdpw selects via the chooser, no dialog.
 fn portal_thread(
     setup_tx: Sender<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>,
     closed_tx: Sender<()>,
@@ -936,11 +775,9 @@ fn portal_thread(
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
 
-    // Multi-thread runtime: the zbus background reader must be pumped across the
-    // create_session → select_sources → start handshake (see capture/linux.rs).
-    // The SHARED, never-dropped runtime — see [`crate::portal_rt`] and the long note on
-    // `hyprland.rs`'s copy: a per-cast runtime kills ashpd's process-global cached connection when
-    // the cast ends, and every later handshake in the process then hangs.
+    // Multi-thread: zbus's reader must run across create_session → select_sources →
+    // start. Shared, never dropped ([`crate::portal_rt`]): a per-cast runtime kills
+    // ashpd's process-global cached connection and every later handshake hangs.
     let rt = match crate::portal_rt::portal_runtime() {
         Ok(rt) => rt,
         Err(e) => {
@@ -952,8 +789,7 @@ fn portal_thread(
 
     rt.block_on(async move {
         let result: Result<()> = async {
-            // Bounded, like `hyprland.rs`'s copy: an orphaned cached connection hangs HERE, before
-            // any handshake call, so a bound that starts later never fires.
+            // Orphaned cached connection hangs here, before any handshake call.
             let connect = async {
                 Screencast::new().await.context(
                     "connect ScreenCast portal (is xdg-desktop-portal running with the wlr backend?)",
@@ -966,19 +802,12 @@ fn portal_thread(
                     HANDSHAKE_BUDGET.as_secs()
                 ),
             };
-            // NEGOTIATED against what xdpw advertises, never asserted from `hw_cursor` alone — see
-            // the xdph copy in `hyprland.rs` for the incident. xdpw is the sharper case: its
-            // screencast.c refuses the mode outright —
-            //     if (sess->screencast_data.cursor_mode & METADATA) {
-            //         logprint(ERROR, "dbus: unsupported cursor mode requested, cancelling");
-            // — so EVERY cursor-forward session on this backend asked for a mode that cancelled the
-            // cast. Different wording from xdph's "unavailable cursor mode 4", same dead session.
+            // Negotiate against what xdpw advertises, never from `hw_cursor` alone.
+            // screencast.c cancels the session if METADATA is set.
             let cursor_mode = crate::portal_cursor::negotiate(&proxy, hw_cursor, "xdpw").await;
-            // Bounded for the same reason as `hyprland.rs`'s copy (the long note lives there): an
-            // await on a wedged portal never returns, the `stop` flag is only read by the park loop
-            // further down, so the thread leaks — and a leaked half-handshake poisons every later
-            // portal request from this process. xdpw has the identical unbounded node-id spin as
-            // xdph (`screencast.c`), so it can wedge the same way.
+            // A wedged portal never returns; `stop` is only read in the park loop, so
+            // an unbounded await leaks a half-handshake and poisons later requests.
+            // xdpw has the same unbounded node-id spin as xdph (`screencast.c`).
             let handshake = async {
                 let session = proxy
                     .create_session(Default::default())
@@ -1033,18 +862,15 @@ fn portal_thread(
                 .send(Ok((fd, node_id, cursor_mode)))
                 .map_err(|_| anyhow!("virtual-output opener went away"))?;
 
-            // Park, keeping `proxy` + `session` alive until stopped. Polled at 20 ms rather than the
-            // 200 ms this used to use, because teardown now WAITS on what follows.
+            // Keep `proxy` + `session` alive. 20 ms poll: teardown waits on Close.
             let _keep_alive = (&proxy, &session);
             while !stop.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
 
-            // 🛑 CLOSE THE SESSION, AND CLOSE IT *BEFORE* THE OUTPUT IS UNPLUGGED. `Session.Close` is
-            // the only thing that ends an xdpw session (`src/core/session.c`); dropping the
-            // connection and trusting the peer to notice is not the contract. The caller is blocked
-            // in `StopGuard::drop` on the signal below — see `StopGuard`. Bounded, so an
-            // already-wedged portal cannot hang teardown with it.
+            // Session.Close is the only xdpw teardown (`src/core/session.c`); dropping
+            // the connection is not. `StopGuard::drop` is blocked on the send below.
+            // Bounded so a wedged portal cannot hang unplug.
             match tokio::time::timeout(CAST_CLOSE_BUDGET, session.close()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!(
@@ -1057,7 +883,7 @@ fn portal_thread(
                      already wedged"
                 ),
             }
-            // Release the teardown. Best-effort: the receiver is gone if the caller already gave up.
+            // Best-effort: the receiver is gone if the caller already gave up.
             let _ = closed_tx.send(());
             Ok(())
         }
@@ -1073,28 +899,23 @@ fn portal_thread(
 mod tests {
     use super::*;
 
-    /// sway spells this one `focus output <name>` — noun second, unlike the `output <name> …` shape
-    /// every other call in this file uses. A transposed `output focus <name>` is rejected, and the
-    /// only symptom would be the bug the call exists to fix: apps opening on the operator's monitor
-    /// while the stream shows a bare desktop.
+    /// `focus output <name>` — noun second. `output focus <name>` is rejected, and
+    /// the only symptom is apps opening on the operator's monitor.
     #[test]
     fn focus_names_the_output_after_the_verb() {
         assert_eq!(focus_argv("HEADLESS-2"), ["focus", "output", "HEADLESS-2"]);
     }
 
-    /// The topology pair takes the OTHER shape — `output <name> <verb>`, noun first, like `mode` /
-    /// `unplug` and unlike [`focus_argv`]. Both are pinned because this file legitimately uses both
-    /// orders, which is exactly the condition under which one gets written the wrong way round.
+    /// Topology verbs are `output <name> <verb>` (noun first), unlike [`focus_argv`].
+    /// Both orders are pinned because this file uses both.
     #[test]
     fn disable_and_enable_name_the_output_before_the_verb() {
         assert_eq!(disable_argv("DP-1"), ["output", "DP-1", "disable"]);
         assert_eq!(enable_argv("DP-1"), ["output", "DP-1", "enable"]);
     }
 
-    /// `SWAYSOCK` reaches `swaymsg` as a per-CHILD override, never as a `set_var` on the host's own
-    /// environment — that write was a `getenv` data race with every other thread of a live session
-    /// (security-review 2026-08-25). Pinning both arms: a known socket is set on the child, and an
-    /// unknown one leaves the child's env untouched so an inherited `SWAYSOCK` still reaches sway.
+    /// `SWAYSOCK` is a per-child override, never `set_var` on the host (that write
+    /// races every `getenv`). Known socket is set; unknown leaves the child's env.
     #[test]
     fn the_sway_socket_travels_on_the_child_not_the_process_env() {
         let overrides = |sock: Option<String>| -> Vec<(String, Option<String>)> {
@@ -1136,9 +957,8 @@ mod tests {
         }
     }
 
-    /// The group-awareness rule (design §6.1): `exclusive` disables the operator's outputs and
-    /// **only** those. A sibling session's `HEADLESS-N` must survive, or the second exclusive
-    /// session blacks out the first one's screen — the exact bug KWin's Stage 3 shipped.
+    /// `exclusive` disables the operator's outputs only. A sibling `HEADLESS-N` must
+    /// survive or the second session blacks out the first.
     #[test]
     fn exclusive_disables_the_operators_outputs_and_never_a_headless_sibling() {
         let ours = "HEADLESS-2";
@@ -1146,20 +966,16 @@ mod tests {
             head("DP-1", true),
             head("HDMI-A-1", true),
             head(ours, true),
-            // A concurrent session's output — and, indistinguishably, a headless sway's own
-            // bootstrap output. Both are spared; see `heads_to_disable`.
+            // Sibling session, or sway's own bootstrap headless — both spared.
             head("HEADLESS-1", true),
-            // Already off: nothing to disable, and it must NOT end up in the restore list, or
-            // teardown would switch on an output the operator had deliberately left dark.
+            // Already off: must not enter the restore list or teardown would switch it on.
             head("DP-3", false),
         ];
         assert_eq!(heads_to_disable(&heads, ours), vec!["DP-1", "HDMI-A-1"]);
     }
 
-    /// `dpms` is a different sway verb from `disable`, and the difference is the whole point of
-    /// the gamescope arm: `disable` moves workspaces and re-homes windows on the operator's desk,
-    /// `dpms off` leaves the desk alone and only stops driving the panel. Four tokens, not three —
-    /// sway spells it `output <name> dpms on|off`.
+    /// `dpms` ≠ `disable`: disable moves workspaces; `dpms off` only stops the panel.
+    /// Four tokens: `output <name> dpms on|off`.
     #[test]
     fn dpms_is_a_separate_verb_from_disable() {
         assert_eq!(dpms_argv("DP-1", false), ["output", "DP-1", "dpms", "off"]);
@@ -1167,9 +983,8 @@ mod tests {
         assert_eq!(disable_argv("DP-1"), ["output", "DP-1", "disable"]);
     }
 
-    /// The gamescope DPMS arm reuses the disable filter with an EMPTY `ours`: a gamescope spawn
-    /// owns no sway output, so nothing of ours needs sparing — but a concurrent wlroots session's
-    /// `HEADLESS-*` still must be, or darkening would black out that client's stream.
+    /// Gamescope DPMS reuses the disable filter with empty `ours`: nothing of ours
+    /// to spare, but a concurrent session's `HEADLESS-*` still must not go dark.
     #[test]
     fn the_gamescope_dpms_arm_still_spares_a_sibling_headless() {
         let heads = [
@@ -1180,8 +995,6 @@ mod tests {
         assert_eq!(heads_to_disable(&heads, ""), vec!["DP-1"]);
     }
 
-    /// A box with no physical output (the CI/headless posture) has nothing to disable, so no
-    /// restore is prepared and teardown touches nothing.
     #[test]
     fn exclusive_on_a_headless_box_disables_nothing() {
         let ours = "HEADLESS-1";

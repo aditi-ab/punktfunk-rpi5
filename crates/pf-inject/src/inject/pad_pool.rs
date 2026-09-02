@@ -1,51 +1,24 @@
-//! Host-wide allocation of the OS-level virtual-pad slots ([`PadSlotPool`]), and the per-session
-//! wire-index → slot mapping built on it ([`PadSlotMap`]).
+//! Host-wide OS-level virtual-pad slots ([`PadSlotPool`]) and the per-session
+//! wire-index → slot map ([`PadSlotMap`]).
 //!
-//! # Why this exists
+//! Every OS name a pad needs is derived from a pad index: the
+//! `Global\pfxusb-boot-<i>` / `Global\pfds-boot-<i>` mailboxes, `SwDeviceCreate`
+//! instance ids, DualSense pairing MAC, Deck serial, and Switch Pro MAC.
+//! `hid-playstation` uses the MAC as HID `uniq`; SDL/Steam dedup on that serial.
+//! Clients each number their first pad 0, and the host serves several sessions.
 //!
-//! Every OS-level name a virtual pad needs is derived from a pad index and nothing else:
+//! A session's wire index stays its own; the OS slot is claimed on first frame
+//! and released when the pad (or this map) goes away. Name format is unchanged,
+//! so drivers that parse the index need no change. Lazy claim, not per-session
+//! windows: one session still reaches [`MAX_PADS`]. The pool is process-global
+//! because the names are. A separate live process remains
+//! [`crate::pad_slots::PadCreateFault::IndexOwnedElsewhere`].
 //!
-//! - the bootstrap mailboxes `Global\pfxusb-boot-<i>` and `Global\pfds-boot-<i>`
-//!   (`pf_driver_proto::gamepad::xusb_boot_name` / `pf_driver_proto::gamepad::pad_boot_name`);
-//! - the `SwDeviceCreate` instance ids — `pf_xusb_<i>`, `pf_pad_<i>`, `pf_ds4_<i>`, `pf_xbox_<i>`;
-//! - on Linux the DualSense pairing MAC, the Steam Deck serial and the Switch Pro MAC — the last
-//!   three *explicitly required to be unique per pad*, because `hid-playstation` adopts the MAC as
-//!   the HID `uniq` and SDL/Steam dedup controllers by that serial.
-//!
-//! The host serves several sessions at once (`native::DEFAULT_MAX_CONCURRENT`), each with its own
-//! input thread and its own pad router, and **every client numbers its first controller wire pad
-//! 0**. Those two facts together mean two clients each holding a controller collide on every name
-//! above. On Windows the second session's `Shm::create_named` sees `ERROR_ALREADY_EXISTS` for all
-//! five retries and reports [`crate::pad_slots::PadCreateFault::IndexOwnedElsewhere`] — whose
-//! remedy tells the operator to restart the service, which would kill both sessions, and no other
-//! process is even involved. On Linux there is no error at all: both sessions mint a DualSense
-//! with the same pairing MAC, `hid-playstation` writes it into `HID_UNIQ` for both, and SDL/Steam
-//! merge the two pads into one controller.
-//!
-//! # The fix
-//!
-//! Stop treating the wire index as an OS identity. A session's wire indices are its own business;
-//! the **OS slot is host-wide**, claimed on a pad's first frame and released when that pad goes
-//! away. One translation, performed once in the session's pad router, makes every name above
-//! unique — and because the *format* of those names is unchanged, the drivers (which read the
-//! index back out of `pszDeviceLocation`) need no change at all.
-//!
-//! Slots are claimed lazily rather than handed out as fixed per-session windows, so the common
-//! single-session case still reaches all [`MAX_PADS`] pads; two sessions simply share the range
-//! between them.
-//!
-//! # Why a process-global pool
-//!
-//! The names being protected are process-wide (`Global\…` kernel objects, PnP instance ids), so
-//! the thing that arbitrates them is process-wide too — there is no configuration in which two
-//! pools within one host would be correct. A global also keeps the fix off every session
-//! signature between here and the accept loop. Collisions with a *separate* live process are a
-//! different problem and remain [`crate::pad_slots::PadCreateFault::IndexOwnedElsewhere`]'s.
+//! Tests in this file pin the contract.
 
 use punktfunk_core::input::MAX_PADS;
 use std::sync::Mutex;
 
-/// The set of OS pad slots currently spoken for, host-wide.
 #[derive(Debug)]
 pub struct PadSlotPool {
     /// Bit `i` set = OS slot `i` is claimed. `MAX_PADS <= 16` is asserted in [`crate::pad_slots`].
@@ -65,10 +38,7 @@ impl PadSlotPool {
         }
     }
 
-    /// Claim the lowest free OS slot, or `None` when the host already holds [`MAX_PADS`] pads.
-    ///
-    /// Lowest-free rather than round-robin so a single-session host keeps the slot numbering it
-    /// has always had — pad 0 is slot 0 — and so a field log reads the same as it used to.
+    /// Lowest free slot. Not round-robin: a single session still maps wire 0 → slot 0.
     pub fn claim(&self) -> Option<u8> {
         let mut taken = self.lock();
         (0..MAX_PADS).find_map(|i| {
@@ -79,17 +49,16 @@ impl PadSlotPool {
         })
     }
 
-    /// Hand `slot` back. Releasing a slot that was never claimed is a no-op, so a double release
-    /// on a teardown path cannot free somebody else's pad.
+    /// No-op if `slot` was never claimed, so a double release cannot free another
+    /// session's pad.
     pub fn release(&self, slot: u8) {
         if (slot as usize) < MAX_PADS {
             *self.lock() &= !(1u16 << slot);
         }
     }
 
-    /// A poisoned pool must not wedge every future pad on the host: one session panicking while
-    /// holding the lock says nothing about whether the *bitmap* is usable, and it is — a `u16`
-    /// has no torn state.
+    /// Recover from poison. A `u16` bitmap has no torn state, and a panic in one
+    /// session must not block every future pad on the host.
     fn lock(&self) -> std::sync::MutexGuard<'_, u16> {
         self.taken.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -100,16 +69,15 @@ impl PadSlotPool {
     }
 }
 
-/// The process-wide pool — see the module docs for why this is a global.
 pub fn global() -> &'static PadSlotPool {
     static POOL: PadSlotPool = PadSlotPool::new();
     &POOL
 }
 
-/// One session's wire-index → OS-slot mapping, drawn from a [`PadSlotPool`].
+/// Per-session wire-index → OS-slot map over a [`PadSlotPool`].
 ///
-/// Dropping releases every slot the session still holds, so a session that ends abruptly — a
-/// panicking input thread included — cannot strand an OS name for the life of the host.
+/// Drop releases every slot still held, so a panicking input thread cannot
+/// strand an OS name for the life of the host.
 #[derive(Debug)]
 pub struct PadSlotMap<'a> {
     pool: &'a PadSlotPool,
@@ -117,7 +85,6 @@ pub struct PadSlotMap<'a> {
 }
 
 impl PadSlotMap<'static> {
-    /// A mapping against the process-wide pool — what a real session uses.
     pub fn new() -> Self {
         Self::with_pool(global())
     }
@@ -130,8 +97,7 @@ impl Default for PadSlotMap<'static> {
 }
 
 impl<'a> PadSlotMap<'a> {
-    /// A mapping against a caller-supplied pool. Exists so the allocation policy is testable
-    /// without touching host-wide state.
+    /// Caller-supplied pool so tests do not touch the process-wide bitmap.
     pub fn with_pool(pool: &'a PadSlotPool) -> Self {
         Self {
             pool,
@@ -139,10 +105,6 @@ impl<'a> PadSlotMap<'a> {
         }
     }
 
-    /// This session's OS slot for `wire`, claiming one on first use.
-    ///
-    /// `None` means the wire index is out of range, or the host is already holding [`MAX_PADS`]
-    /// pads across all its sessions — in which case no device may be created for it.
     pub fn claim_for(&mut self, wire: usize) -> Option<u8> {
         if wire >= MAX_PADS {
             return None;
@@ -155,30 +117,24 @@ impl<'a> PadSlotMap<'a> {
         Some(slot)
     }
 
-    /// This session's OS slot for `wire` **without** claiming one.
     pub fn slot_of(&self, wire: usize) -> Option<u8> {
         self.slot.get(wire).copied().flatten()
     }
 
-    /// The wire index this session has mapped to `slot` — the reverse direction, needed because
-    /// every backend reports feedback (rumble, rich HID output) tagged with the OS index it was
-    /// created under, while the client only knows its own wire numbering.
+    /// Reverse map. Backends tag rumble / HID output with the OS slot they
+    /// created; the client only knows its wire index.
     pub fn wire_of(&self, slot: u8) -> Option<usize> {
         self.slot.iter().position(|s| *s == Some(slot))
     }
 
-    /// Release `wire`'s slot back to the pool, if it holds one.
     pub fn release(&mut self, wire: usize) {
         if let Some(slot) = self.slot.get_mut(wire).and_then(Option::take) {
             self.pool.release(slot);
         }
     }
 
-    /// Translate a wire-space active mask into OS-slot space.
-    ///
-    /// The managers' unplug sweep walks this mask against the slots they actually created, so it
-    /// has to speak the same numbering the devices were created under. A wire bit with no slot
-    /// contributes nothing — it names a pad this session never got a device for.
+    /// Wire-space active mask in OS-slot space. The unplug sweep walks created
+    /// slots, so this must use the numbering the devices were created under.
     pub fn os_mask(&self, wire_mask: u16) -> u16 {
         (0..MAX_PADS)
             .filter(|w| wire_mask & (1 << w) != 0)
@@ -199,8 +155,6 @@ impl Drop for PadSlotMap<'_> {
 mod tests {
     use super::*;
 
-    /// The defect this module exists for: two sessions, each numbering its first pad 0, must not
-    /// land on the same OS slot — every pad name on both platforms is derived from that number.
     #[test]
     fn two_sessions_numbering_their_first_pad_zero_get_different_os_slots() {
         let pool = PadSlotPool::new();
@@ -212,12 +166,10 @@ mod tests {
         assert_eq!(a.claim_for(1), Some(2));
         assert_eq!(b.claim_for(1), Some(3));
 
-        // And the claim is stable: asking again is not a second allocation.
         assert_eq!(a.claim_for(0), Some(0));
         assert_eq!(pool.taken_mask(), 0b1111);
     }
 
-    /// A single session still reaches every pad — the fix must not cost the common case.
     #[test]
     fn one_session_still_reaches_every_pad() {
         let pool = PadSlotPool::new();
@@ -238,15 +190,13 @@ mod tests {
         assert_eq!(b.claim_for(0), Some(1));
         a.release(0);
         assert_eq!(a.slot_of(0), None);
-        // The freed slot is the lowest one now, so the next claim takes it.
         assert_eq!(b.claim_for(1), Some(0));
 
-        // Releasing twice must not free a slot somebody else now holds.
+        // Double-release must not clear a slot another session now holds.
         a.release(0);
         assert_eq!(pool.taken_mask(), 0b11);
     }
 
-    /// A session that ends — abruptly included — strands nothing.
     #[test]
     fn dropping_a_session_returns_every_slot_it_held() {
         let pool = PadSlotPool::new();
@@ -264,7 +214,6 @@ mod tests {
         );
     }
 
-    /// An exhausted host refuses honestly instead of handing out a colliding slot.
     #[test]
     fn an_exhausted_pool_refuses_rather_than_colliding() {
         let pool = PadSlotPool::new();
@@ -289,24 +238,20 @@ mod tests {
         );
     }
 
-    /// The sweep mask has to speak the numbering the devices were created under.
     #[test]
     fn the_active_mask_is_translated_into_slot_space() {
         let pool = PadSlotPool::new();
         let mut a = PadSlotMap::with_pool(&pool);
         let mut b = PadSlotMap::with_pool(&pool);
-        a.claim_for(0); // slot 0
-        b.claim_for(0); // slot 1
-        b.claim_for(1); // slot 2
+        a.claim_for(0);
+        b.claim_for(0);
+        b.claim_for(1);
 
-        // B holds wire 0 and 1; in slot space that is bits 1 and 2, never bit 0 (A's pad).
         assert_eq!(b.os_mask(0b11), 0b110);
-        // A wire bit with no device contributes nothing.
         assert_eq!(a.os_mask(0b11), 0b1);
         assert_eq!(a.os_mask(0), 0);
     }
 
-    /// Feedback comes back tagged with the OS slot; it has to reach the right wire pad.
     #[test]
     fn feedback_maps_back_to_the_wire_pad_that_owns_it() {
         let pool = PadSlotPool::new();
