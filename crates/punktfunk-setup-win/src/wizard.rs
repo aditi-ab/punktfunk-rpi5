@@ -1317,6 +1317,19 @@ fn install_page(ctx: &Ctx, log: &[LogLine]) -> Element {
 /// What Done shows in place of the password until Show is pressed.
 pub const PASSWORD_MASK: &str = "••••••••••••";
 
+/// A square, icon-only button; `name` is what UI Automation (and the flow tests) call it.
+fn icon_button(icon: Icon, name: &str, on_click: impl Fn() + 'static) -> Element {
+    Element::from(
+        button("")
+            .icon(icon)
+            .width(32.0)
+            .height(32.0)
+            .on_click(on_click),
+    )
+    .padding(Thickness::uniform(0.0))
+    .automation_name(name)
+}
+
 /// Plain text onto the system clipboard. Best effort: a refused clipboard (another app
 /// holding it, no UI thread in a test host) is not worth an error on the finish page.
 fn copy_to_clipboard(text: &str) {
@@ -1402,20 +1415,32 @@ fn done_page(ctx: &Ctx) -> Element {
                                 .selectable()
                                 .min_width(240.0)
                                 .vertical_alignment(VerticalAlignment::Center),
-                            button(if reveal { "Hide" } else { "Show" })
-                                .min_width(72.0)
-                                .on_click(move || toggle.set_reveal_done.call(!reveal)),
-                            button(if ctx.copied { "Copied" } else { "Copy" })
-                                .min_width(72.0)
-                                .on_click(move || {
+                            icon_button(
+                                if reveal {
+                                    Icon::font("\u{ED1A}") // Segoe Fluent "Hide"
+                                } else {
+                                    Symbol::View.into()
+                                },
+                                if reveal { "Hide" } else { "Show" },
+                                move || toggle.set_reveal_done.call(!reveal),
+                            ),
+                            icon_button(
+                                if ctx.copied {
+                                    Symbol::Accept.into()
+                                } else {
+                                    Symbol::Copy.into()
+                                },
+                                if ctx.copied { "Copied" } else { "Copy" },
+                                move || {
                                     copy_to_clipboard(&text);
                                     copy.set_copied.call(true);
-                                }),
+                                },
+                            ),
                         ))
                         .spacing(6.0)
                         .vertical_alignment(VerticalAlignment::Center),
                         text_block(
-                            r"Generated for you at install and stored (ACL'd) in %ProgramData%\punktfunk\web-password. To change it, edit that file and restart the service from an elevated PowerShell: punktfunk-host service restart",
+                            r"Stored in %ProgramData%\punktfunk\web-password. To change it later, edit that file and run `punktfunk-host service restart` from an elevated PowerShell.",
                         )
                         .wrap()
                         .font_size(12.0)
