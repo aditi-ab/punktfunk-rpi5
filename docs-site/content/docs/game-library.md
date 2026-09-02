@@ -28,6 +28,12 @@ nothing, so an unneeded plugin costs you an empty source and nothing else.
 | **Epic Games Launcher** | — | ✅ | The launcher's install manifests |
 | **GOG** | — | ✅ | The GOG install registry and each game's `.info` file |
 | **Playnite** | — | ✅ | Your Playnite library, whichever stores it aggregates |
+| **Ubisoft Connect** | — | ✅ | The launcher's install registry |
+| **Amazon Games** | — | ✅ | The app's `GameInstallInfo.sqlite` database |
+| **Battle.net** | — | ✅ | The agent's `product.db` |
+| **Desktop entries** | ✅ | — | `.desktop` files in the Game category, Flatpak exports included |
+| **Bottles** | ✅ | — | Each Bottle's `bottle.yml` program list |
+| **itch.io** | ✅ | ✅ | The itch app's `butler.db` |
 | **ROM Manager** | ✅ | ✅ | Your ROM folders, matched against a metadata source |
 
 > Through v0.27.x six of these scanners were built into the host and always on; from **v0.28.0**
