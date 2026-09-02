@@ -429,6 +429,7 @@ fn fake_native_session(
         last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         // Desktop stream: no game row.
         game: None,
+        capture_health: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 

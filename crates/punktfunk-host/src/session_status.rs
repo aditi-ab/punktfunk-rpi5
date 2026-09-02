@@ -396,6 +396,7 @@ mod tests {
             ttff_ms: Arc::new(AtomicU32::new(0)),
             last_resize_ms: Arc::new(AtomicU32::new(0)),
             game: None,
+            capture_health: Arc::new(Mutex::new(None)),
         });
         (guard, stop, quit)
     }
