@@ -181,8 +181,8 @@ impl WinExecutor<'_> {
                         .count();
                     // The dir itself goes last, after its files — Windows replays the list
                     // in order at boot.
-                    let dir_deferred = deferred == locked.len()
-                        && super::sys::delete_on_reboot(Path::new(dir));
+                    let dir_deferred =
+                        deferred == locked.len() && super::sys::delete_on_reboot(Path::new(dir));
                     self.ui.warn(&format!(
                         "{} in-use file(s) under {dir} ({}) go with the next restart{}",
                         locked.len(),
