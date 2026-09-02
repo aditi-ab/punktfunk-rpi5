@@ -10,14 +10,17 @@
 //! re-enables them at teardown before the CCD restore. Selectors are allowlists: third-party
 //! virtual displays are never touched.
 //!
-//! Instance ids are journaled to `<config>/pnp-disabled-monitors.json` before the disable and
-//! cleared after a successful re-enable. [`startup_recover`] re-enables leftovers on host start.
-//! If the host dies and never restarts, the monitor stays disabled until Device Manager.
+//! Every disable is a [`Lease`] (immunity plan WP11), journaled to
+//! `<config>/pnp-disabled-monitors.json` BEFORE the mutation with the node's prior state, the
+//! selector that picked it and the topology generation that owns it; a lease is dropped only after
+//! its node re-enabled. [`startup_recover`] replays leftovers on host start. If the host dies and
+//! never restarts, the monitor stays disabled until Device Manager.
 
 use windows::core::PCWSTR;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Disable_DevNode, CM_Enable_DevNode, CM_Locate_DevNodeW, CM_DISABLE_PERSIST,
-    CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CR_SUCCESS,
+    CM_Disable_DevNode, CM_Enable_DevNode, CM_Get_DevNode_Status, CM_Locate_DevNodeW,
+    CM_DISABLE_PERSIST, CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CM_PROB_DISABLED,
+    CR_SUCCESS, DN_HAS_PROBLEM,
 };
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
@@ -25,30 +28,115 @@ use windows::Win32::Devices::Display::{
 };
 use windows::Win32::Foundation::LUID;
 
-/// Crash-recovery journal of PnP instance ids disabled and not yet re-enabled.
+/// Which selector leased a devnode. `BaselineInactive` is the default automatic treatment (a sink
+/// that was dark before this acquire); `DeactivatedByUs` is the opt-in path over displays the
+/// isolate itself switched off. The split is what keeps automatic treatment to the former.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseSource {
+    BaselineInactive,
+    DeactivatedByUs,
+}
+
+impl LeaseSource {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::BaselineInactive => "baseline_inactive",
+            Self::DeactivatedByUs => "deactivated_by_us",
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "baseline_inactive" => Some(Self::BaselineInactive),
+            "deactivated_by_us" => Some(Self::DeactivatedByUs),
+            _ => None,
+        }
+    }
+}
+
+/// One devnode disabled for a stream. Written before the mutation, dropped after the re-enable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lease {
+    pub id: String,
+    /// The node was enabled before us. Only such nodes are leased at all — a node the operator
+    /// disabled is never touched, so the exact prior state is restored by construction.
+    pub was_enabled: bool,
+    pub source: LeaseSource,
+    /// Topology generation of the acquire transaction that owns the lease.
+    pub generation: u64,
+}
+
 fn journal_path() -> std::path::PathBuf {
     pf_paths::config_dir().join("pnp-disabled-monitors.json")
 }
 
-fn read_journal() -> Vec<String> {
+/// Decode a journal. Rows are lease objects; a bare string is a pre-lease id (an older host's
+/// file) and reads as a lease with unknown provenance, so it is still recovered.
+fn decode_journal(bytes: &[u8]) -> Vec<Lease> {
+    let Ok(serde_json::Value::Array(rows)) = serde_json::from_slice::<serde_json::Value>(bytes)
+    else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| match row {
+            serde_json::Value::String(id) => Some(Lease {
+                id: id.clone(),
+                was_enabled: true,
+                source: LeaseSource::DeactivatedByUs,
+                generation: 0,
+            }),
+            serde_json::Value::Object(o) => Some(Lease {
+                id: o.get("id")?.as_str()?.to_owned(),
+                was_enabled: o
+                    .get("was_enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                source: o
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .and_then(LeaseSource::from_tag)
+                    .unwrap_or(LeaseSource::DeactivatedByUs),
+                generation: o.get("generation").and_then(|v| v.as_u64()).unwrap_or(0),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn encode_journal(leases: &[Lease]) -> Vec<u8> {
+    let rows: Vec<serde_json::Value> = leases
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "id": l.id,
+                "was_enabled": l.was_enabled,
+                "source": l.source.tag(),
+                "generation": l.generation,
+            })
+        })
+        .collect();
+    serde_json::to_vec_pretty(&rows).unwrap_or_default()
+}
+
+fn read_journal() -> Vec<Lease> {
     match std::fs::read(journal_path()) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Ok(bytes) => decode_journal(&bytes),
         Err(_) => Vec::new(),
     }
 }
 
-/// Persist `ids` as the outstanding-disable set (union is the caller's job). Failure is logged, not
+/// Persist `leases` as the outstanding set (union is the caller's job). Failure is logged, not
 /// fatal — the feature degrades to "no crash journal", not "no feature".
-fn write_journal(ids: &[String]) {
+fn write_journal(leases: &[Lease]) {
     let path = journal_path();
-    if ids.is_empty() {
+    if leases.is_empty() {
         let _ = std::fs::remove_file(&path);
         return;
     }
     if let Some(dir) = path.parent() {
         let _ = pf_paths::create_private_dir(dir);
     }
-    if let Err(e) = std::fs::write(&path, serde_json::to_vec_pretty(&ids).unwrap_or_default()) {
+    if let Err(e) = std::fs::write(&path, encode_journal(leases)) {
         tracing::warn!(error = %e, "PnP-disable: could not write the crash-recovery journal");
     }
 }
@@ -79,6 +167,34 @@ fn monitor_instance(adapter: LUID, target_id: u32) -> Option<(String, String)> {
     }
     let id = instance_id_from_interface_path(&utf16z(&req.monitorDevicePath))?;
     Some((id, utf16z(&req.monitorFriendlyDeviceName)))
+}
+
+/// Whether the devnode is currently enabled: `None` when it cannot be located (departed), else
+/// `false` only for a node whose problem code is "disabled" — the operator's own Device Manager
+/// state, which we must not lease.
+fn devnode_enabled(id: &str) -> Option<bool> {
+    let wide: Vec<u16> = id.encode_utf16().chain([0]).collect();
+    let mut devinst = 0u32;
+    // SAFETY: `wide` is a live NUL-terminated UTF-16 instance id outliving the call; `devinst` is
+    // a valid out-param.
+    let cr = unsafe {
+        CM_Locate_DevNodeW(
+            &mut devinst,
+            PCWSTR(wide.as_ptr()),
+            CM_LOCATE_DEVNODE_NORMAL,
+        )
+    };
+    if cr != CR_SUCCESS {
+        return None;
+    }
+    let mut status = Default::default();
+    let mut problem = Default::default();
+    // SAFETY: `devinst` is the devnode the locate above resolved; both out-params are live locals.
+    let cr = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) };
+    if cr != CR_SUCCESS {
+        return None;
+    }
+    Some(!((status.0 & DN_HAS_PROBLEM.0) != 0 && problem == CM_PROB_DISABLED))
 }
 
 fn set_devnode(id: &str, disable: bool) -> bool {
@@ -120,10 +236,12 @@ fn set_devnode(id: &str, disable: bool) -> bool {
     true
 }
 
-/// Journals before disabling. Returns the instance ids to re-enable at teardown.
+/// Journals before disabling. Returns the instance ids to re-enable at teardown. `generation` is
+/// the topology generation of the acquire transaction the leases belong to.
 pub fn disable_for_deactivated(
     saved: &crate::win_display::SavedConfig,
     keep: crate::win_display::CcdTargetKey,
+    generation: u64,
 ) -> Vec<String> {
     const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
     let mut targets: Vec<(String, String)> = Vec::new();
@@ -145,7 +263,7 @@ pub fn disable_for_deactivated(
             ),
         }
     }
-    journal_and_disable(targets)
+    journal_and_disable(targets, LeaseSource::DeactivatedByUs, generation)
 }
 
 /// Disable the devnodes of every EXTERNAL PHYSICAL monitor that is connected but NOT part of the
@@ -166,13 +284,14 @@ pub fn disable_for_deactivated(
 pub fn disable_connected_inactive(
     keep: &[crate::win_display::CcdTargetKey],
     baseline_active: &[crate::win_display::CcdTargetKey],
+    generation: u64,
 ) -> Vec<String> {
     let targets = select_connected_inactive(
         &crate::win_display::target_inventory(),
         keep,
         baseline_active,
     );
-    journal_and_disable(targets)
+    journal_and_disable(targets, LeaseSource::BaselineInactive, generation)
 }
 
 /// The pure selection half of [`disable_connected_inactive`], split from the PnP mutation so the
@@ -204,34 +323,63 @@ fn select_connected_inactive(
     targets
 }
 
-/// Crash-journal first, then disable; return what actually disabled (the teardown re-enable list).
-fn journal_and_disable(targets: Vec<(String, String)>) -> Vec<String> {
+/// Lease, journal, then disable; return what actually disabled (the teardown re-enable list). A
+/// node the operator already disabled is not ours: no lease, no mutation, and the teardown never
+/// enables it — the exact prior PnP state survives the stream.
+fn journal_and_disable(
+    targets: Vec<(String, String)>,
+    source: LeaseSource,
+    generation: u64,
+) -> Vec<String> {
     if targets.is_empty() {
         tracing::debug!("PnP-disable: no physical monitor devnodes to disable");
         return Vec::new();
     }
-    // Journal first (union with outstanding ids): a crash between here and the disable
+    let mut ours = Vec::with_capacity(targets.len());
+    for (id, name) in targets {
+        match devnode_enabled(&id) {
+            Some(true) => ours.push((id, name)),
+            Some(false) => tracing::info!(
+                id,
+                monitor = name,
+                "PnP-disable: devnode is already disabled (operator state) — not leased"
+            ),
+            None => tracing::debug!(id, monitor = name, "PnP-disable: devnode not locatable"),
+        }
+    }
+    // Journal first (union with outstanding leases): a crash between here and the disable
     // over-recovers instead of leaking a disabled monitor.
     let mut journal = read_journal();
-    for (id, _) in &targets {
-        if !journal.contains(id) {
-            journal.push(id.clone());
+    for (id, _) in &ours {
+        if !journal.iter().any(|l| &l.id == id) {
+            journal.push(Lease {
+                id: id.clone(),
+                was_enabled: true,
+                source,
+                generation,
+            });
         }
     }
     write_journal(&journal);
     let mut disabled = Vec::new();
-    for (id, name) in targets {
+    for (id, name) in ours {
         if set_devnode(&id, true) {
-            tracing::info!(id, monitor = name, "PnP-disable: monitor devnode disabled");
+            tracing::info!(
+                id,
+                monitor = name,
+                source = source.tag(),
+                generation,
+                "PnP-disable: monitor devnode disabled"
+            );
             disabled.push(id);
         }
     }
     disabled
 }
 
-/// Re-enable `ids` and drop the ones that actually re-enabled from the journal. A failed re-enable
-/// must keep its journal entry: that is the only record the devnode is still disabled, and the next
-/// [`startup_recover`] is the only retry.
+/// Re-enable `ids` and drop the leases that actually re-enabled. A failed re-enable must keep its
+/// lease: that is the only record the devnode is still disabled, and the next [`startup_recover`]
+/// is the only retry.
 pub fn enable_instances(ids: &[String]) -> u32 {
     let mut ok = 0u32;
     let mut reenabled: Vec<&String> = Vec::with_capacity(ids.len());
@@ -248,16 +396,16 @@ pub fn enable_instances(ids: &[String]) -> u32 {
             );
         }
     }
-    let journal: Vec<String> = read_journal()
+    let journal: Vec<Lease> = read_journal()
         .into_iter()
-        .filter(|j| !reenabled.contains(&j))
+        .filter(|l| !reenabled.contains(&&l.id))
         .collect();
     write_journal(&journal);
     ok
 }
 
-/// Re-enable leftover journaled devnodes from a previous host that crashed, was killed, or lost power.
-/// Call once, early in `serve`.
+/// Replay leftover leases from a previous host that crashed, was killed, or lost power. Call
+/// once, early in `serve`.
 pub fn startup_recover() {
     let leftovers = read_journal();
     if leftovers.is_empty() {
@@ -265,9 +413,11 @@ pub fn startup_recover() {
     }
     tracing::warn!(
         count = leftovers.len(),
+        leases = ?leftovers,
         "PnP-disable: found monitor devnodes a previous host left disabled — re-enabling"
     );
-    enable_instances(&leftovers);
+    let ids: Vec<String> = leftovers.into_iter().map(|l| l.id).collect();
+    enable_instances(&ids);
 }
 
 #[cfg(test)]
@@ -324,5 +474,36 @@ mod tests {
             2,
             "adapter 1's target 100 was NOT in this baseline"
         );
+    }
+
+    /// The lease journal (WP11) round-trips prior state, selector and generation, and an older
+    /// host's bare-id file still reads as recoverable leases.
+    #[test]
+    fn lease_journal_round_trips_and_reads_the_old_id_list() {
+        let leases = vec![
+            Lease {
+                id: r"DISPLAY\ACM0200\5&1&0&UID200".into(),
+                was_enabled: true,
+                source: LeaseSource::BaselineInactive,
+                generation: 7,
+            },
+            Lease {
+                id: r"DISPLAY\ACM0100\5&1&0&UID100".into(),
+                was_enabled: true,
+                source: LeaseSource::DeactivatedByUs,
+                generation: 7,
+            },
+        ];
+        assert_eq!(decode_journal(&encode_journal(&leases)), leases);
+        let legacy = br#"["DISPLAY\\ACM0300\\5&1&0&UID300"]"#;
+        let decoded = decode_journal(legacy);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].id, r"DISPLAY\ACM0300\5&1&0&UID300");
+        assert!(
+            decoded[0].was_enabled,
+            "a bare id is still owed a re-enable"
+        );
+        assert_eq!(decoded[0].generation, 0);
+        assert!(decode_journal(b"not json").is_empty());
     }
 }
