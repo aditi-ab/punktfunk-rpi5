@@ -1433,9 +1433,8 @@ pub fn show_scoped(
     // this screen, not of the host a profile is authored against.
     let osd_row = adw::SpinRow::with_range(0.0, 400.0, 25.0);
     osd_row.set_title("Overlay size");
-    osd_row.set_subtitle(
-        "% · 0 = automatic · sizes the statistics overlay and the quick-action dial",
-    );
+    osd_row
+        .set_subtitle("% · 0 = automatic · sizes the statistics overlay and the quick-action dial");
 
     // ---- Input ----
     let touch_row = ChoiceRow::new(
@@ -1751,7 +1750,9 @@ pub fn show_scoped(
         let dec_i = DECODERS.iter().position(|&d| d == dec_stored).unwrap_or(0);
         decoder_row.set_selected(dec_i as u32);
         stats_row.set_selected(index::stats(s));
-        osd_row.set_value(f64::from(punktfunk_core::osd_scale::to_percent(s.osd_scale)));
+        osd_row.set_value(f64::from(punktfunk_core::osd_scale::to_percent(
+            s.osd_scale,
+        )));
         fullscreen_row.set_active(s.fullscreen_on_stream);
         theme_row.set_active(s.follow_os_theme);
         menu_row.set_active(pf_client_core::omarchy_menu::enabled());

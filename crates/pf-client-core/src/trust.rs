@@ -1407,7 +1407,10 @@ mod tests {
         let s: Settings = serde_json::from_str(old).unwrap();
         assert_eq!(s.osd_scale, punktfunk_core::osd_scale::AUTO);
         assert!(punktfunk_core::osd_scale::is_auto(s.osd_scale));
-        assert_eq!(Settings::default().osd_scale, punktfunk_core::osd_scale::AUTO);
+        assert_eq!(
+            Settings::default().osd_scale,
+            punktfunk_core::osd_scale::AUTO
+        );
         // A stored manual value survives the round trip the dialog does on every close.
         let mut manual = s.clone();
         manual.osd_scale = 1.75;

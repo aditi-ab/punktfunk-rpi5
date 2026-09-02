@@ -3355,7 +3355,10 @@ mod tests {
         assert_eq!(overlay_scale(1.5, 0.0), 1.5);
         assert_eq!(overlay_scale(1.5, f32::NAN), 1.5);
         // Clamped both ways so nothing can hide the OSD or bury the stream under it.
-        assert_eq!(overlay_scale(1.0, 100.0), punktfunk_core::osd_scale::MAX_SCALE as f32);
+        assert_eq!(
+            overlay_scale(1.0, 100.0),
+            punktfunk_core::osd_scale::MAX_SCALE as f32
+        );
         assert_eq!(overlay_scale(1.0, 0.01), 0.5);
     }
 

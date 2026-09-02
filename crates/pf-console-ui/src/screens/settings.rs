@@ -1520,7 +1520,10 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let cur = if punktfunk_core::osd_scale::is_auto(s.osd_scale) {
                 Some(0)
             } else {
-                presets.iter().position(|v| *v == s.osd_scale).map(|i| i + 1)
+                presets
+                    .iter()
+                    .position(|v| *v == s.osd_scale)
+                    .map(|i| i + 1)
             };
             step_option(cur, presets.len() + 1, delta, wrap).map(|i| {
                 s.osd_scale = if i == 0 {
@@ -2582,12 +2585,13 @@ pub(crate) mod tests {
                 seen.push(*id);
             }
         }
-        assert_eq!(seen.len(), 49, "{seen:?}");
+        assert_eq!(seen.len(), 50, "{seen:?}");
         assert!(seen.contains(&RowId::FollowOsTheme));
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::ReduceUiResolution));
         assert!(seen.contains(&RowId::AudioFormat));
+        assert!(seen.contains(&RowId::OsdScale));
         assert!(TABS[PROFILES_TAB].1.is_empty());
         assert_eq!(TABS[PROFILES_TAB].0, "Profiles");
     }
