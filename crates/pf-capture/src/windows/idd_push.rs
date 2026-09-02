@@ -471,6 +471,8 @@ pub struct IddPushCapturer {
     /// Two-strikes debounce: act only when a second consecutive sample agrees,
     /// so a topology re-probe blip never tears the ring down.
     pending_desc: Option<DisplayDescriptor>,
+    /// The topology generation `pending_desc` was sampled under ([`poll_display_hdr`]).
+    pending_desc_gen: u64,
     /// Ring recreate in flight; if still set past the window, `try_consume` drops
     /// the session (recover-or-drop, no DDA).
     recovering_since: Option<Instant>,
@@ -910,9 +912,14 @@ impl IddPushCapturer {
             self.pending_desc = None;
             return;
         }
-        if self.pending_desc != Some(now) {
+        // Samples name the topology generation they were observed under (immunity plan WP10 item
+        // 5): two strikes straddling a finished topology transaction are two different desktops,
+        // never one confirmed change.
+        let topo_gen = pf_win_display::topology_churn::generation();
+        if self.pending_desc != Some(now) || self.pending_desc_gen != topo_gen {
             // First strike — act only when a second consecutive sample agrees.
             self.pending_desc = Some(now);
+            self.pending_desc_gen = topo_gen;
             return;
         }
         self.pending_desc = None;
@@ -2028,6 +2035,18 @@ impl Capturer for IddPushCapturer {
     }
 
     fn recreate_ring_in_place(&mut self) -> bool {
+        // A target with no ACTIVE path cannot be recovered in place (immunity plan WP10 item 7):
+        // a same-mode reset would attach to a known-inactive display. Fail fast — on a FRESH
+        // snapshot only; a last-known-good one is not evidence either way.
+        let snap = pf_win_display::display_events::snapshot_or_query();
+        if snap.is_fresh() && !snap.target(self.ccd).is_some_and(|t| t.active) {
+            tracing::warn!(
+                target = %self.ccd,
+                "IDD push: same-mode recovery refused — the target has no active display path \
+                 (topology removed it); a topology recovery must precede a ring rebuild"
+            );
+            return false;
+        }
         // Same-mode ring recreate (trait doc: swap-chain bounce recovery) — deliberately NOT
         // routed through `resize_output`, whose same-size fast path would no-op exactly the
         // case this exists for. Same recover-or-drop arming as the resize recreate.

@@ -34,6 +34,15 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Added
 
+- **Topology writes are transactions with an observed outcome.** `topology_churn::begin` /
+  `finish` name a mutation, hold descriptor-following for its deadline, and bump a topology
+  generation only when the verification read saw a change; `isolate_displays_ccd_checked`
+  reports Verified / NothingActive / Unverified instead of a snapshot that hides a failed isolate.
+  The exclusive re-assert watchdog bumps the stream's recovery generation only on an observed
+  change, and after four consecutive fights concedes the fixed cadence (2 s doubling to 60 s).
+  Descriptor samples name the generation they were taken under, so two strikes straddling a
+  transaction never pass the debounce, and a same-mode ring recovery refuses a target with no
+  active display path.
 - **`pf_win_display` has a display actor with a cached snapshot.** The display-events pump now
   owns the CCD inventory read for hot paths: every `WM_DISPLAYCHANGE` / device broadcast schedules
   one coalesced refresh (150 ms) instead of querying inside the window procedure, a 15 s safety
