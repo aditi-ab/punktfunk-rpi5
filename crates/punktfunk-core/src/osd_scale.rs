@@ -78,6 +78,28 @@ pub fn resolve(pref: f64, class: DeviceClass) -> f64 {
     }
 }
 
+/// Step the picker ladder one `dir` from `cur`, wrapping. Automatic is rung 0, then
+/// [`PRESETS`]; a value off the ladder (a typed custom entry) has no rung and snaps
+/// to Automatic on the first step.
+pub fn step(cur: f64, dir: i32) -> f64 {
+    let rungs = PRESETS.len() as i32 + 1;
+    let at = if is_auto(cur) {
+        0
+    } else {
+        match PRESETS.iter().position(|&p| p == cur) {
+            Some(i) => i as i32 + 1,
+            // Off the ladder there is no rung to stand on: the step lands on Automatic.
+            None => return AUTO,
+        }
+    };
+    let target = (at + dir).rem_euclid(rungs);
+    if target == 0 {
+        AUTO
+    } else {
+        PRESETS[(target - 1) as usize]
+    }
+}
+
 /// Round-trip helpers for the percentage the pickers speak. `1.25` ↔ `125`.
 pub fn to_percent(scale: f64) -> u32 {
     (sanitize(scale) * 100.0).round() as u32
@@ -177,6 +199,19 @@ mod tests {
             .iter()
             .all(|&p| (MIN_SCALE..=MAX_SCALE).contains(&p)));
         assert!(PRESETS.contains(&1.0));
+    }
+
+    #[test]
+    fn step_walks_automatic_and_the_presets_and_wraps() {
+        assert_eq!(step(1.0, 1), 1.25);
+        assert_eq!(step(1.0, -1), 0.75);
+        assert_eq!(step(1.0, 0), 1.0);
+        assert_eq!(step(AUTO, 1), PRESETS[0]);
+        assert_eq!(step(PRESETS[0], -1), AUTO);
+        assert_eq!(step(*PRESETS.last().unwrap(), 1), AUTO);
+        // A custom entry has no rung; the first step snaps to Automatic.
+        assert_eq!(step(1.6, 1), AUTO);
+        assert_eq!(step(1.6, -1), AUTO);
     }
 
     #[test]

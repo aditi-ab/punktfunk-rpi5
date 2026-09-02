@@ -583,10 +583,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         println!("{{\"ready\":true}}");
     }
 
-    // The client's overlay-size setting, on top of the display DPI. Read once (a
-    // preference, not session state); the DPI part is re-read per frame. The env var is
-    // the override; AUTO from either resolves to this device class's default.
-    let osd_scale_pref = std::env::var("PUNKTFUNK_OSD_SCALE")
+    // The client's overlay-size setting, on top of the display DPI. The DPI part is
+    // re-read per frame. The env var is the launch override; AUTO from either resolves
+    // to this device class's default. The ring's Overlay-size row steps this live and
+    // persists it, so the store is only the starting point.
+    let mut osd_scale_pref = std::env::var("PUNKTFUNK_OSD_SCALE")
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
         .unwrap_or(opts.osd_scale as f32);
@@ -1714,6 +1715,16 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 RingCommand::CycleStats => {
                     bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
                 }
+                RingCommand::AdjustOsdScale { dir } => {
+                    osd_scale_pref =
+                        punktfunk_core::osd_scale::step(f64::from(osd_scale_pref), dir) as f32;
+                    // The GTK dialog and the console home share the store: rebase so a
+                    // write landed elsewhere while the ring was up is not reverted.
+                    let mut s = pf_client_core::trust::Settings::load();
+                    s.osd_scale = f64::from(osd_scale_pref);
+                    s.save();
+                    tracing::info!(scale = f64::from(osd_scale_pref), "ring: overlay size");
+                }
                 RingCommand::Keyboard => ring_keyboard = !ring_keyboard,
                 other => {
                     if let Some(st) = stream.as_mut() {
@@ -1781,7 +1792,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             let ring_facts = stream
                 .as_ref()
                 .filter(|st| st.connector.is_some())
-                .map(|st| ring_facts(st, &opts, stats_verbosity, mic_muted));
+                .map(|st| ring_facts(st, &opts, stats_verbosity, mic_muted, osd_scale_pref));
             let ctx = FrameCtx {
                 width: pw,
                 height: ph,
@@ -2837,6 +2848,7 @@ fn ring_facts(
     opts: &SessionOpts,
     stats: StatsVerbosity,
     mic_muted: bool,
+    osd_pref: f32,
 ) -> RingFacts {
     let c = st.connector.as_ref().expect("filtered on connector");
     let m = c.mode();
@@ -2850,6 +2862,10 @@ fn ring_facts(
             .into(),
         host_accepts_touch: c.host_caps2() & punktfunk_core::quic::HOST_CAP2_TOUCH != 0,
         stats_tier: stats.label().into(),
+        osd_scale: punktfunk_core::osd_scale::label(
+            f64::from(osd_pref),
+            punktfunk_core::osd_scale::DeviceClass::Desktop,
+        ),
         // The mic control answers `toggle` with `None` when no uplink runs; a session
         // with a mic is one whose settings asked for it.
         mic_available: st.params.mic_enabled,
@@ -2928,7 +2944,7 @@ fn ring_command(
                 }
             }
         }
-        RingCommand::CycleStats | RingCommand::Keyboard => {}
+        RingCommand::CycleStats | RingCommand::Keyboard | RingCommand::AdjustOsdScale { .. } => {}
     }
 }
 
