@@ -8,7 +8,7 @@
 //! Placeholders (`<staging>`, `<temp>`, `<version>`) stay literal in a dry run and come from
 //! `Subst` on a real one. Goldens enter through [`render`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::plan::{join_argv, WinAction, WinPlan};
 use super::sys;
@@ -162,15 +162,57 @@ impl WinExecutor<'_> {
                 self.ui.ok(&format!("payload unpacked into {dest}"));
                 Ok(())
             }
+            WinAction::DeleteFiles { paths } => {
+                if self.dry {
+                    self.ui.ok(&format!("would delete {}", paths.join(", ")));
+                    return Ok(());
+                }
+                for path in paths {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => self.ui.ok(&format!("deleted {path}")),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            self.ui.detail(&format!("{path} — already gone"));
+                        }
+                        Err(e) => self.ui.warn(&format!("could not delete {path}: {e}")),
+                    }
+                }
+                Ok(())
+            }
             WinAction::RemoveFiles { dir } => {
                 if self.dry {
                     self.ui.ok(&format!("would remove {dir}"));
                     return Ok(());
                 }
-                // Best-effort: the uninstaller still lives here; a locked file must not fail teardown.
-                match std::fs::remove_dir_all(dir) {
-                    Ok(()) => self.ui.ok(&format!("removed {dir}")),
-                    Err(e) => self.ui.warn(&format!("could not fully remove {dir}: {e}")),
+                // Best-effort: the uninstaller still lives here; a locked file must not fail
+                // teardown, and must not stop the sweep either (`remove_dir_all` aborts at
+                // the first one — WP3.5's VM smoke left 862 files behind that way).
+                let mut locked = Vec::new();
+                sweep(Path::new(dir), &mut locked);
+                if locked.is_empty() {
+                    self.ui.ok(&format!("removed {dir}"));
+                } else {
+                    let deferred = locked
+                        .iter()
+                        .filter(|p| super::sys::delete_on_reboot(p))
+                        .count();
+                    // The dir itself goes last, after its files — Windows replays the list
+                    // in order at boot.
+                    let dir_deferred =
+                        deferred == locked.len() && super::sys::delete_on_reboot(Path::new(dir));
+                    self.ui.warn(&format!(
+                        "{} in-use file(s) under {dir} ({}) go with the next restart{}",
+                        locked.len(),
+                        locked
+                            .iter()
+                            .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        if dir_deferred {
+                            ""
+                        } else {
+                            " - or remove the folder by hand"
+                        }
+                    ));
                 }
                 Ok(())
             }
@@ -610,14 +652,16 @@ fn pids_listening_on(netstat: &str, ports: &[u16]) -> Vec<String> {
 }
 
 /// XML because `schtasks` flags cannot express restart backoff. Boot, LocalService, 999×/1 min,
-/// battery-tolerant.
+/// battery-tolerant. No `<LogonType>`: `schtasks /XML` rejects an explicit `ServiceAccount`
+/// ("value malformed or out of range"), and a bare service SID registers as one anyway —
+/// exactly what `Export-ScheduledTask` prints for the cmdlet-registered task.
 fn scripting_task_xml(app_dir: &str) -> String {
     let cmd = format!("{app_dir}\\scripting\\scripting-run.cmd");
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>
-  <Principals><Principal id="LocalService"><UserId>S-1-5-19</UserId><LogonType>ServiceAccount</LogonType></Principal></Principals>
+  <Principals><Principal id="LocalService"><UserId>S-1-5-19</UserId></Principal></Principals>
   <Settings>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
@@ -628,6 +672,24 @@ fn scripting_task_xml(app_dir: &str) -> String {
 </Task>
 "#
     )
+}
+
+/// Remove everything under `dir` that will go, then `dir` itself; what stays (locked, or a
+/// dir that still holds something locked) lands in `locked`.
+fn sweep(dir: &Path, locked: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            sweep(&path, locked);
+            let _ = std::fs::remove_dir(&path);
+        } else if std::fs::remove_file(&path).is_err() {
+            locked.push(path);
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
 }
 
 fn to_utf16le_bom(text: &str) -> Vec<u8> {
@@ -663,6 +725,7 @@ mod tests {
             vulkan_layer_registered: false,
             web_task: TaskState::Absent,
             scripting_task: TaskState::Absent,
+            inno_uninstaller: false,
         }
     }
 
@@ -861,10 +924,25 @@ mod tests {
     }
 
     #[test]
+    fn the_sweep_takes_the_whole_tree_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(app.join("web/static")).unwrap();
+        std::fs::write(app.join("web/static/a.js"), b"1").unwrap();
+        std::fs::write(app.join("host.exe"), b"2").unwrap();
+        let mut locked = Vec::new();
+        sweep(&app, &mut locked);
+        assert!(locked.is_empty());
+        assert!(!app.exists());
+    }
+
+    #[test]
     fn scripting_task_xml_carries_the_iss_semantics() {
         let xml = scripting_task_xml(r"C:\app");
         assert!(xml.contains(r"C:\app\scripting\scripting-run.cmd"));
         assert!(xml.contains("<UserId>S-1-5-19</UserId>"));
+        // WP3.5's VM smoke: schtasks exits 1 on an explicit ServiceAccount LogonType.
+        assert!(!xml.contains("LogonType"));
         assert!(xml.contains("<Count>999</Count>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false"));
         assert_eq!(to_utf16le_bom("ab"), [0xFF, 0xFE, b'a', 0, b'b', 0]);

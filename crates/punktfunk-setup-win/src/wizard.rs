@@ -214,6 +214,9 @@ struct Ctx {
     custom: bool,
     /// The password row's Show/Hide state.
     reveal: bool,
+    /// Done's password card: masked until Show, and whether Copy has fired.
+    reveal_done: bool,
+    copied: bool,
     /// The install page's progress bar, tweened 0 → 1 across the plan's phases.
     bar: f64,
     /// The Welcome lockup's intro, 0 → 1 once on mount (the website's orbit + slide-in).
@@ -221,6 +224,8 @@ struct Ctx {
     scheme: ColorScheme,
     set_custom: AsyncSetState<bool>,
     set_reveal: AsyncSetState<bool>,
+    set_reveal_done: AsyncSetState<bool>,
+    set_copied: AsyncSetState<bool>,
     set_screen: AsyncSetState<WinScreen>,
     set_step: AsyncSetState<Nav>,
     set_install: AsyncSetState<InstallPhase>,
@@ -267,6 +272,8 @@ impl Component for WizardRoot {
         let (uninstall, set_uninstall) = cx.use_async_state(self.preset.uninstall);
         let (log, set_log) = cx.use_async_state(Vec::<LogLine>::new());
         let (reveal, set_reveal) = cx.use_async_state(false);
+        let (reveal_done, set_reveal_done) = cx.use_async_state(false);
+        let (copied, set_copied) = cx.use_async_state(false);
         let (custom, set_custom) = cx.use_async_state(false);
         let scheme = cx.use_color_scheme();
 
@@ -370,11 +377,15 @@ impl Component for WizardRoot {
             },
             custom,
             reveal,
+            reveal_done,
+            copied,
             bar,
             logo,
             scheme,
             set_custom,
             set_reveal,
+            set_reveal_done,
+            set_copied,
             set_screen,
             set_step,
             set_install,
@@ -1303,6 +1314,34 @@ fn install_page(ctx: &Ctx, log: &[LogLine]) -> Element {
     frame(ctx, WizStep::Install, content, buttons)
 }
 
+/// What Done shows in place of the password until Show is pressed.
+pub const PASSWORD_MASK: &str = "••••••••••••";
+
+/// A square, icon-only button; `name` is what UI Automation (and the flow tests) call it.
+fn icon_button(icon: Icon, name: &str, on_click: impl Fn() + 'static) -> Element {
+    Element::from(
+        button("")
+            .icon(icon)
+            .width(32.0)
+            .height(32.0)
+            .on_click(on_click),
+    )
+    .padding(Thickness::uniform(0.0))
+    .automation_name(name)
+}
+
+/// Plain text onto the system clipboard. Best effort: a refused clipboard (another app
+/// holding it, no UI thread in a test host) is not worth an error on the finish page.
+fn copy_to_clipboard(text: &str) {
+    use windows::ApplicationModel::DataTransfer::{Clipboard, DataPackage};
+    let _ = (|| -> windows::core::Result<()> {
+        let package = DataPackage::new()?;
+        package.SetText(&windows::core::HSTRING::from(text))?;
+        Clipboard::SetContent(&package)?;
+        Clipboard::Flush()
+    })();
+}
+
 /// A follow-up action on Done: what to do, why, and the link that does it.
 fn next_step(title: &str, detail: &str, link: &str, uri: &str) -> Element {
     card(
@@ -1358,16 +1397,50 @@ fn done_page(ctx: &Ctx) -> Element {
             && fresh
             && let Some(pw) = &ctx.screen.choices.web_password
         {
+            // Masked until asked: a finish page can sit on a screen for a while. Copy works
+            // either way. Changing it later is a file edit + service restart (docs:
+            // web-console.md), not a console feature.
+            let reveal = ctx.reveal_done;
+            let toggle = ctx.clone();
+            let copy = ctx.clone();
+            let text = pw.clone();
             children.push(
                 card(
                     vstack((
                         text_block("Your web console password").semibold(),
-                        text_block(pw.clone())
-                            .font_size(22.0)
-                            .font_family(MONO)
-                            .selectable(),
+                        hstack((
+                            text_block(if reveal { pw.clone() } else { PASSWORD_MASK.into() })
+                                .font_size(22.0)
+                                .font_family(MONO)
+                                .selectable()
+                                .min_width(240.0)
+                                .vertical_alignment(VerticalAlignment::Center),
+                            icon_button(
+                                if reveal {
+                                    Icon::font("\u{ED1A}") // Segoe Fluent "Hide"
+                                } else {
+                                    Symbol::View.into()
+                                },
+                                if reveal { "Hide" } else { "Show" },
+                                move || toggle.set_reveal_done.call(!reveal),
+                            ),
+                            icon_button(
+                                if ctx.copied {
+                                    Symbol::Accept.into()
+                                } else {
+                                    Symbol::Copy.into()
+                                },
+                                if ctx.copied { "Copied" } else { "Copy" },
+                                move || {
+                                    copy_to_clipboard(&text);
+                                    copy.set_copied.call(true);
+                                },
+                            ),
+                        ))
+                        .spacing(6.0)
+                        .vertical_alignment(VerticalAlignment::Center),
                         text_block(
-                            r"Generated for you at install. Also stored (ACL'd) in %ProgramData%\punktfunk\web-password — change it any time from the console.",
+                            r"Stored in %ProgramData%\punktfunk\web-password. To change it later, edit that file and run `punktfunk-host service restart` from an elevated PowerShell.",
                         )
                         .wrap()
                         .font_size(12.0)
@@ -1459,15 +1532,26 @@ fn done_page(ctx: &Ctx) -> Element {
     )
 }
 
+const WINDOW_W: f64 = 980.0;
+const WINDOW_H: f64 = 700.0;
+
 /// The real window over a preset (canned or probed) and the seams its install runs on.
 pub fn run(preset: WinPreset, seams: Seams) -> windows_reactor::Result<()> {
     brand::install();
     let root = WizardRoot::new(preset, seams);
     // Self-contained: the runtime DLLs sit beside the exe (build.rs), so there is
     // deliberately NO windows_reactor::bootstrap() call — that is the framework path (S1).
+    // One size: every page is laid out for 980×700 and the presenter exposes no
+    // non-resizable switch, so min = max pins the frame (the maximize box is then inert).
     let mut app = App::new()
         .title("Punktfunk Setup")
-        .inner_size(980.0, 700.0)
+        .inner_size(WINDOW_W, WINDOW_H)
+        .inner_constraints(InnerConstraints {
+            min_width: Some(WINDOW_W),
+            min_height: Some(WINDOW_H),
+            max_width: Some(WINDOW_W),
+            max_height: Some(WINDOW_H),
+        })
         .backdrop(Backdrop::Mica);
     // WinUI ignores the exe's embedded icon for the window; the title bar and taskbar
     // take it from a file.

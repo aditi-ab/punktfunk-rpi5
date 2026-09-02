@@ -4,8 +4,11 @@
 //! - [`win_display`]: CCD/GDI path activation, mode-setting, HDR advanced-colour toggles, and the
 //!   source-desktop geometry the capturer duplicates.
 //! - [`monitor_devnode`]: PnP monitor devnode enable/disable (the parallel-display isolation lever).
-//! - [`display_events`]: `WM_DISPLAYCHANGE` / device-arrival watch so a capture stall can say
-//!   whether an OS display event coincided with it.
+//! - [`display_events`]: the display ACTOR — `WM_DISPLAYCHANGE` / device-arrival watch that
+//!   publishes the cached [`snapshot::DisplaySnapshot`] every hot reader takes instead of the
+//!   display-config lock, and timestamps events so a capture stall can say whether an OS display
+//!   event coincided with it.
+//! - [`snapshot`]: the platform-neutral snapshot types and cache rules (tested everywhere).
 
 #[cfg(target_os = "windows")]
 pub mod adl_emul;
@@ -16,6 +19,8 @@ pub mod display_events;
 mod input_desktop;
 #[cfg(target_os = "windows")]
 pub mod monitor_devnode;
+/// Display identity, inventory and the snapshot cache — pure std, unit-tested on every platform.
+pub mod snapshot;
 /// Cross-crate "topology churn in flight" latch. Pure std — no Windows surface, so compiled and
 /// unit-tested on every platform.
 pub mod topology_churn;
