@@ -20,10 +20,10 @@ pub(crate) async fn get_hooks() -> Json<crate::hooks::HooksConfig> {
     Json(crate::hooks::store().get())
 }
 
-/// Replaces the hook configuration.
+/// Replace the hook configuration
 ///
-/// This is a whole-document PUT and applies from the next event. On Windows a
-/// SYSTEM host runs commands as the signed-in user of its WTS session.
+/// Whole-document PUT, not a patch. Applies from the next event. Commands run as the host
+/// user (the interactive session on Windows).
 #[utoipa::path(
     put,
     path = "/hooks",
