@@ -162,6 +162,22 @@ impl WinExecutor<'_> {
                 self.ui.ok(&format!("payload unpacked into {dest}"));
                 Ok(())
             }
+            WinAction::DeleteFiles { paths } => {
+                if self.dry {
+                    self.ui.ok(&format!("would delete {}", paths.join(", ")));
+                    return Ok(());
+                }
+                for path in paths {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => self.ui.ok(&format!("deleted {path}")),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            self.ui.detail(&format!("{path} — already gone"));
+                        }
+                        Err(e) => self.ui.warn(&format!("could not delete {path}: {e}")),
+                    }
+                }
+                Ok(())
+            }
             WinAction::RemoveFiles { dir } => {
                 if self.dry {
                     self.ui.ok(&format!("would remove {dir}"));
@@ -709,6 +725,7 @@ mod tests {
             vulkan_layer_registered: false,
             web_task: TaskState::Absent,
             scripting_task: TaskState::Absent,
+            inno_uninstaller: false,
         }
     }
 

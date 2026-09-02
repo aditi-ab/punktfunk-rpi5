@@ -12,6 +12,9 @@
   ok would stop the service, every tray, and the console/plugin tasks
 ==> Files → C:\Program Files\punktfunk
   ok would unpack the payload into C:\Program Files\punktfunk
+==> Retiring the Inno Setup uninstaller
+  ok would delete C:\Program Files\punktfunk\unins000.dat, C:\Program Files\punktfunk\unins000.msg
+  ok the Add/Remove Programs entry keeps its key — winget and the updater keep tracking this install
 ==> Registry
   + reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run /v PunktfunkTray /t REG_SZ /d "C:\Program Files\punktfunk\punktfunk-tray.exe" /f
   + reg add HKLM\SOFTWARE\Classes\AppUserModelId\unom.punktfunk.tray /v DisplayName /t REG_SZ /d Punktfunk /f

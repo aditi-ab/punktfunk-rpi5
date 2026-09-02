@@ -163,6 +163,9 @@ pub struct WinFacts {
     pub vulkan_layer_registered: bool,
     pub web_task: TaskState,
     pub scripting_task: TaskState,
+    /// Inno's `unins000.dat` sits in the install dir: the box was installed by the `.iss`, and
+    /// the first upgrade over it retires that data (D6 — never run Inno's uninstaller).
+    pub inno_uninstaller: bool,
 }
 
 impl WinFacts {
@@ -173,6 +176,11 @@ impl WinFacts {
         net: &dyn NetProbe,
     ) -> WinFacts {
         let host_env_text = paths.read(&paths.host_env());
+        let installed = arp_install(run);
+        let inno_uninstaller = installed
+            .as_ref()
+            .and_then(|i| i.location.as_deref())
+            .is_some_and(|dir| std::path::Path::new(dir).join("unins000.dat").is_file());
         WinFacts {
             os_build: reg_value(
                 run,
@@ -182,7 +190,7 @@ impl WinFacts {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
             arch: arch(env),
-            installed: arp_install(run),
+            installed,
             host_env_present: host_env_text.is_some(),
             web_password_present: paths.config.join("punktfunk/web-password").is_file(),
             mgmt_bind_set: mgmt_bind_set(host_env_text.as_deref().unwrap_or_default()),
@@ -200,6 +208,7 @@ impl WinFacts {
                 .is_some_and(|t| t.contains("pf_vkhdr_layer.json")),
             web_task: task_state(run, "PunktfunkWeb"),
             scripting_task: task_state(run, "PunktfunkScripting"),
+            inno_uninstaller,
         }
     }
 
