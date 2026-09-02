@@ -468,7 +468,7 @@ pub type HidKickFn = fn((i32, i32, i32, i32), (i32, i32, i32, i32)) -> bool;
 /// success the driver owns the handles duplicated into WUDFHost.
 #[cfg(target_os = "windows")]
 pub type FrameChannelSender = std::sync::Arc<
-    dyn Fn(&pf_driver_proto::control::SetFrameChannelRequest) -> Result<()> + Send + Sync,
+    dyn Fn(&pf_driver_proto::control::SetFrameChannelRequestV2) -> Result<()> + Send + Sync,
 >;
 
 /// v5 hardware-cursor channel (`IOCTL_SET_CURSOR_CHANNEL`) — same facade

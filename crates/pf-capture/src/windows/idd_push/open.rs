@@ -18,13 +18,13 @@ use super::*;
 /// RAII over the `LocalAlloc` descriptor. `sa.lpSecurityDescriptor` points at
 /// `psd`; [`as_ptr`](Self::as_ptr) only lends a borrow, so the attributes cannot
 /// outlive this value. Moving is fine — the pointer targets the heap, not a field.
-struct SharedObjectSa {
+pub(super) struct SharedObjectSa {
     sa: SECURITY_ATTRIBUTES,
     psd: PSECURITY_DESCRIPTOR,
 }
 
 impl SharedObjectSa {
-    fn new() -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         let mut psd = PSECURITY_DESCRIPTOR::default();
         // SAFETY: the `w!()` literal is the SDDL source; the call writes its
         // `LocalAlloc` descriptor into this live `psd`; `?` rejects failure
@@ -49,7 +49,7 @@ impl SharedObjectSa {
     }
 
     /// Borrowed from this owner; the descriptor must outlive the create call.
-    fn as_ptr(&self) -> *const SECURITY_ATTRIBUTES {
+    pub(super) fn as_ptr(&self) -> *const SECURITY_ATTRIBUTES {
         &self.sa
     }
 }
@@ -73,6 +73,7 @@ impl IddPushCapturer {
         w: u32,
         h: u32,
         format: DXGI_FORMAT,
+        keyed: bool,
     ) -> Result<Vec<HostSlot>> {
         // SAFETY: every D3D11/DXGI call is `?`-checked on the live `device` borrow,
         // over initialized stack descriptors and live out-params. `sa` owns the
@@ -96,9 +97,15 @@ impl IddPushCapturer {
                     Usage: D3D11_USAGE_DEFAULT,
                     BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
                     CPUAccessFlags: 0,
+                    // Keyed-mutex arm: the mutex is the slot handshake. Fence arm (WP7): a plain
+                    // shared NT-handle texture — `NTHANDLE` must pair with `SHARED` (S2 finding);
+                    // the slot table + fences carry the handshake.
                     MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0
-                        | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0)
-                        as u32,
+                        | if keyed {
+                            D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0
+                        } else {
+                            D3D11_RESOURCE_MISC_SHARED.0
+                        }) as u32,
                 };
                 let mut tex: Option<ID3D11Texture2D> = None;
                 device
@@ -114,7 +121,7 @@ impl IddPushCapturer {
                     )
                     .context("CreateSharedHandle(IDD-push ring slot)")?;
                 let shared = OwnedHandle::from_raw_handle(shared.0 as _);
-                let mutex: IDXGIKeyedMutex = tex.cast()?;
+                let mutex: Option<IDXGIKeyedMutex> = if keyed { Some(tex.cast()?) } else { None };
                 let mut srv: Option<ID3D11ShaderResourceView> = None;
                 device
                     .CreateShaderResourceView(&tex, None, Some(&mut srv))
@@ -391,10 +398,19 @@ impl IddPushCapturer {
             let (device, context) = make_device(&adapter).context("make_device for IDD push")?;
 
             let sa = SharedObjectSa::new()?;
-            // The full v3 layout. A v2 driver maps the whole section and reads only its 88-byte
-            // prefix; the v3 tail is reachable to it only through `frame::v3_readable`, which its
-            // version gate fails.
-            let bytes = std::mem::size_of::<SharedHeader>();
+            // WP7: shared fences for this ring generation (None on a pre-D3D11.4 device). The
+            // ring runs the fence protocol only once the driver has proven it opens them —
+            // learned from the first attach on this box and remembered process-wide.
+            let fences = HostFences::create(&device, &context)?;
+            let fence_mode = fences.is_some() && DRIVER_FENCE_CAPABLE.load(Ordering::Acquire) == 1;
+            // The full layout: v4 (slot table) when fences exist, else v3. A v2 driver maps the
+            // whole section and reads only its 88-byte prefix; each tail is reachable only through
+            // its `frame::*_readable` gate, which an older driver's version check fails.
+            let bytes = if fences.is_some() {
+                pf_driver_proto::frame::fence::HEADER_V4_SIZE
+            } else {
+                std::mem::size_of::<SharedHeader>()
+            };
 
             // Unnamed mapping: the driver receives a duplicated handle, not a name.
             let map = CreateFileMappingW(
@@ -422,12 +438,23 @@ impl IddPushCapturer {
             let generation = next_generation();
             let header = section.ptr::<SharedHeader>();
             std::ptr::write_bytes(header.cast::<u8>(), 0, bytes);
-            (*header).version = VERSION;
-            // What THIS host can act on (immunity plan WP4). The fence ring and the swap-chain
-            // reset actuator stay off until WP7/WP13 implement them; a transport activates only
-            // where `frame::negotiate` finds both sides agreeing.
+            // v4 (slot table) when fences ride along, else v3 — `bytes` was sized to match.
+            (*header).version = if fences.is_some() {
+                pf_driver_proto::frame::fence::VERSION_FENCE
+            } else {
+                VERSION
+            };
+            // What THIS host can act on (immunity plan WP4). `CAP_FENCE_RING` only on a ring
+            // BUILT for the fence protocol (textures without a keyed mutex); the first ring on a
+            // box is a keyed-mutex probe that still carries fences so the driver can prove it
+            // opens them. The swap-chain reset actuator stays off until WP13.
             (*header).host_capabilities = pf_driver_proto::frame::CAP_RING_HEALTH_V3
-                | pf_driver_proto::frame::CAP_SOURCE_SEQUENCE_QPC;
+                | pf_driver_proto::frame::CAP_SOURCE_SEQUENCE_QPC
+                | if fence_mode {
+                    pf_driver_proto::frame::CAP_FENCE_RING
+                } else {
+                    0
+                };
             (*header).generation = generation;
             (*header).ring_len = RING_LEN;
             (*header).width = w;
@@ -445,7 +472,7 @@ impl IddPushCapturer {
                 .context("CreateEvent(IDD-push)")?;
             let event = OwnedHandle::from_raw_handle(event.0 as _);
 
-            let slots = Self::create_ring_slots(&device, w, h, ring_fmt)?;
+            let slots = Self::create_ring_slots(&device, w, h, ring_fmt, !fence_mode)?;
 
             // Magic last (Release): the ring is fully initialized before the driver
             // — which receives the channel after this — can observe MAGIC.
@@ -464,6 +491,7 @@ impl IddPushCapturer {
                     HANDLE(section.handle.as_raw_handle()),
                     HANDLE(event.as_raw_handle()),
                     &slots,
+                    fences.as_ref().map(HostFences::handles),
                 )
                 .context("deliver IDD-push frame channel to the driver")?;
 
@@ -559,6 +587,8 @@ impl IddPushCapturer {
                 width: w,
                 height: h,
                 slots,
+                fence_mode,
+                fences,
                 generation,
                 want_hdr,
                 ten_bit_sdr,
@@ -643,6 +673,9 @@ impl IddPushCapturer {
             // Attach + first frame, or fail the open. TEX_FAIL and attach-but-no-frames
             // must not wait for `next_frame`'s 20 s black-then-bail.
             me.wait_for_attach()?;
+            // WP7 negotiation: this attach says whether the driver speaks the fence ring; a probe
+            // ring on a capable driver is rebuilt in fence mode right here, before any frame flows.
+            me.learn_and_upgrade_fence_mode()?;
             Ok(me)
         }
     }
@@ -656,7 +689,7 @@ impl IddPushCapturer {
     /// republishes on attach (`FrameStash` in `frame_transport.rs`), so a healthy
     /// idle desktop clears in milliseconds. Otherwise DWM compose after activate
     /// (~1 s) plus the kick below; no frame in the window is genuinely broken.
-    fn wait_for_attach(&self) -> Result<()> {
+    pub(super) fn wait_for_attach(&self) -> Result<()> {
         // Our stamp; nothing legitimate rewrites it. A mismatch is a host-side
         // stash/capturer cross-wire — the same class the driver refuses from
         // the other end.
