@@ -199,6 +199,9 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   after the disconnect chord; it now holds them all and folds their input into one sample, and
   the in-stream ring reads whichever pad opened it. Nothing to do — a pinned pad still forwards
   alone.
+- **A Deck in Game Mode forwards every controller Steam Input wraps, not only the newest.** When
+  each connected pad is a Steam virtual gamepad none of them shadows a real one, so all are
+  forwarded instead of just the last. Nothing to do.
 
 ### Fixed
 

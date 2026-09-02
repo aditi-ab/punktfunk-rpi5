@@ -885,8 +885,8 @@ impl Worker {
         })
     }
 
-    /// Pin: only that pad. Automatic: every real pad, or the most-recent virtual one when
-    /// that is all Steam Input exposes (Deck game-mode — else gyro/paddles have nowhere to land).
+    /// Pin: only that pad. Automatic: every real pad, or every virtual one when that is all
+    /// Steam Input exposes (Deck game-mode — else gyro/paddles have nowhere to land).
     fn forwarded_ids(&self) -> Vec<u32> {
         if !self.forwarding {
             return Vec::new();
@@ -917,10 +917,12 @@ impl Worker {
             .filter(|&id| self.pad_info(id).is_some_and(|p| !p.steam_virtual))
             .collect();
         if !real.is_empty() {
-            real
-        } else {
-            self.order.last().copied().into_iter().collect()
+            return real;
         }
+        // Every pad is virtual: Steam Input is wrapping all of them, so none is a shadow of
+        // another and forwarding the lot double-counts nothing. Taking only the newest is
+        // what left a Deck with two controllers seeing just one.
+        self.order.clone()
     }
 
     /// The one place that opens (= grabs) hardware. Dropping a handle is `SDL_CloseGamepad`;
