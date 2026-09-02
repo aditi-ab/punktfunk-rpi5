@@ -1,13 +1,13 @@
-//! Off-thread CCD sampler for the virtual target's live HDR flag and active resolution.
+//! Off-thread sampler for the virtual target's live HDR flag and active resolution.
 //!
-//! `QueryDisplayConfig` (twice per sample) serializes on the session-global display-config
-//! lock. A stall of tens of milliseconds on the capture thread misses frames, so
-//! [`DescriptorPoller`] samples on its own thread and publishes a snapshot. The capture
-//! loop's per-frame cost is one uncontended mutex read.
+//! Samples the display actor's cached snapshot (`pf_win_display::display_events::snapshot`,
+//! immunity plan WP9) — no `QueryDisplayConfig` on this thread, so the session-global
+//! display-config lock can no longer stall it; the actor coalesces the query and logs a slow one.
+//! The capture loop's per-frame cost is one uncontended mutex read of the published descriptor.
 //!
-//! Last-known-good per field: a `None` query — the target briefly missing from the active-path
-//! list during a topology re-probe — keeps the previous value. `seq` advances only when at
-//! least one query succeeded, so the consumer's debounce counts observations, never misses.
+//! Last-known-good per field: a sample where the target is missing from the snapshot (briefly
+//! absent during a topology re-probe) keeps the previous value. `seq` advances only when the
+//! target was seen active, so the consumer's debounce counts observations, never misses.
 //!
 //! Pin: [`DescriptorPoller::snapshot`]. Consumer: `poll_display_hdr` in the IDD-push capturer.
 
@@ -29,8 +29,6 @@ pub(super) struct DescriptorPoller {
 impl DescriptorPoller {
     /// 250 ms. Two-strikes debounce in `poll_display_hdr` acts on a real flip in two samples (~½ s).
     const INTERVAL: Duration = Duration::from_millis(250);
-    /// 50 ms. A healthy CCD sample is sub-millisecond; above this the display-config lock is held.
-    const SLOW: Duration = Duration::from_millis(50);
 
     pub(super) fn spawn(
         ccd: pf_win_display::win_display::CcdTargetKey,
@@ -44,31 +42,16 @@ impl DescriptorPoller {
             .spawn(move || {
                 let mut last = initial;
                 let mut seq = 0u64;
-                let mut last_slow_log: Option<Instant> = None;
                 while !stop_t.load(Ordering::Relaxed) {
-                    let t = Instant::now();
-                    let (hdr, res) = (
-                            pf_win_display::win_display::advanced_color_enabled(ccd),
-                            pf_win_display::win_display::active_resolution(ccd),
-                        );
-                    let took = t.elapsed();
-                    if took >= Self::SLOW
-                        && last_slow_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(10))
-                    {
-                        last_slow_log = Some(Instant::now());
-                        tracing::warn!(
-                            took_ms = took.as_millis() as u64,
-                            target = %ccd,
-                            "slow display-descriptor poll — something is holding the Windows \
-                             display-config lock (topology churn / display-poller software); on \
-                             a host with periodic stream hitches, correlate this cadence"
-                        );
-                    }
-                    if hdr.is_some() || res.is_some() {
+                    let seen = pf_win_display::display_events::snapshot()
+                        .target(ccd)
+                        .filter(|t| t.active)
+                        .map(|t| (t.hdr, t.width, t.height));
+                    if let Some((hdr, width, height)) = seen {
                         if let Some(hdr) = hdr {
                             last.hdr = hdr;
                         }
-                        if let Some((width, height)) = res {
+                        if width != 0 && height != 0 {
                             last.width = width;
                             last.height = height;
                         }

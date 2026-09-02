@@ -166,6 +166,27 @@ pub fn refresh_and_wait(timeout: Duration) -> Option<Arc<DisplaySnapshot>> {
     wait_for_change(seen, timeout)
 }
 
+/// The snapshot, or — before the actor has published its first one (generation 0: not spawned
+/// yet, or bring-up failed) — a one-off inventory read on the CALLER's thread, unpublished. For
+/// the cold, non-hot readers (management listing, pre-mutation baselines, probe retargeting)
+/// that must answer even when no session ever started the actor.
+pub fn snapshot_or_query() -> Arc<DisplaySnapshot> {
+    let snap = snapshot();
+    if snap.generation > 0 {
+        return snap;
+    }
+    let now = Instant::now();
+    match crate::win_display::target_inventory_checked() {
+        Ok(targets) => Arc::new(DisplaySnapshot {
+            generation: 0,
+            taken_at: now,
+            failures: 0,
+            targets: Arc::from(targets),
+        }),
+        Err(_) => snap,
+    }
+}
+
 pub fn events_between(from: Instant, to: Instant) -> Vec<DisplayEvent> {
     let st = lock();
     st.events
@@ -224,8 +245,26 @@ fn push_event(kind: DisplayEventKind, detail: Option<String>) {
 /// included); on failure keeps the last-known-good, stamps the failure, and re-arms the coalesce
 /// timer with the backoff delay so the retry never storms a display-config lock that is busy.
 fn refresh_inventory(hwnd: HWND) {
+    let started = Instant::now();
     let result = crate::win_display::target_inventory_checked();
     let now = Instant::now();
+    // The display-config lock diagnostic the descriptor poller used to carry: a healthy inventory
+    // read is sub-millisecond; tens of milliseconds means something holds the lock (topology
+    // churn, display-poller software). Rate-limited to one line per 10 s.
+    static LAST_SLOW: Mutex<Option<Instant>> = Mutex::new(None);
+    let took = now.saturating_duration_since(started);
+    if took >= Duration::from_millis(50) {
+        let mut last = LAST_SLOW.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+            *last = Some(now);
+            tracing::warn!(
+                took_ms = took.as_millis() as u64,
+                "slow display-descriptor poll — something is holding the Windows display-config \
+                 lock (topology churn / display-poller software); on a host with periodic stream \
+                 hitches, correlate this cadence"
+            );
+        }
+    }
     let (m, cv) = state();
     let mut st = m.lock().unwrap_or_else(|e| e.into_inner());
     match result {
