@@ -355,6 +355,9 @@ const UNPRIVILEGED_LAUNCH_KINDS: &[&str] = &[
     "aumid",
     "xbox",
     "playnite",
+    "uplay",
+    "amazon",
+    "battlenet",
     "plugin",
 ];
 
@@ -456,6 +459,25 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
             if launch.kind == "xbox" && !valid_aumid(&launch.value) {
                 return Err(format!(
                     "entries[{i}]: `launch.value` for kind `xbox` must be `<Identity>!<AppId>`"
+                ));
+            }
+            // Store ids interpolated into a protocol URI or a launcher argv: charset-checked
+            // here, where the author sees it, and again at launch.
+            if launch.kind == "uplay" && !valid_uplay_id(&launch.value) {
+                return Err(format!(
+                    "entries[{i}]: `launch.value` for kind `uplay` must be a numeric game id"
+                ));
+            }
+            if launch.kind == "amazon" && !valid_amazon_id(&launch.value) {
+                return Err(format!(
+                    "entries[{i}]: `launch.value` for kind `amazon` must be a product id \
+                     (`amzn1.adg.product.…`)"
+                ));
+            }
+            if launch.kind == "battlenet" && !valid_battlenet_code(&launch.value) {
+                return Err(format!(
+                    "entries[{i}]: `launch.value` for kind `battlenet` must be a launch code \
+                     of [A-Za-z0-9_]"
                 ));
             }
             // Opaque key in the owning plugin's namespace, handed back at launch
@@ -1043,6 +1065,9 @@ mod tests {
                 "aumid",
                 "xbox",
                 "playnite",
+                "uplay",
+                "amazon",
+                "battlenet",
                 "plugin",
             ],
             "widening this set hands the plugin lane a new launch kind — do it on purpose"

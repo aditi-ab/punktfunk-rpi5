@@ -163,6 +163,11 @@ pub struct WinFacts {
     pub vulkan_layer_registered: bool,
     pub web_task: TaskState,
     pub scripting_task: TaskState,
+    /// Inno's `unins000.dat` sits in the install dir: the box was installed by the `.iss`, and
+    /// the first upgrade over it retires that data (D6 — never run Inno's uninstaller).
+    pub inno_uninstaller: bool,
+    /// The client artifact's own ARP key (per user, HKCU). `installed` above is the host's.
+    pub client_installed: Option<WinInstall>,
 }
 
 impl WinFacts {
@@ -173,6 +178,11 @@ impl WinFacts {
         net: &dyn NetProbe,
     ) -> WinFacts {
         let host_env_text = paths.read(&paths.host_env());
+        let installed = arp_install(run);
+        let inno_uninstaller = installed
+            .as_ref()
+            .and_then(|i| i.location.as_deref())
+            .is_some_and(|dir| std::path::Path::new(dir).join("unins000.dat").is_file());
         WinFacts {
             os_build: reg_value(
                 run,
@@ -182,7 +192,7 @@ impl WinFacts {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
             arch: arch(env),
-            installed: arp_install(run),
+            installed,
             host_env_present: host_env_text.is_some(),
             web_password_present: paths.config.join("punktfunk/web-password").is_file(),
             mgmt_bind_set: mgmt_bind_set(host_env_text.as_deref().unwrap_or_default()),
@@ -200,11 +210,26 @@ impl WinFacts {
                 .is_some_and(|t| t.contains("pf_vkhdr_layer.json")),
             web_task: task_state(run, "PunktfunkWeb"),
             scripting_task: task_state(run, "PunktfunkScripting"),
+            inno_uninstaller,
+            client_installed: arp_install_at(run, plan::CLIENT_ARP_KEY),
         }
     }
 
+    /// The install this artifact upgrades or removes: the host's under HKLM, the client's
+    /// under HKCU — two products, two keys (D1).
+    pub fn installed_for(&self, artifact: plan::Artifact) -> Option<&WinInstall> {
+        match artifact {
+            plan::Artifact::Host => self.installed.as_ref(),
+            plan::Artifact::Client => self.client_installed.as_ref(),
+        }
+    }
+
+    /// The bound-port signal counts only on a box without punktfunk: on an upgrade the
+    /// running host owns :47990 itself (WP3.5's VM smoke moved a lone host to :47991), and a
+    /// named competitor is caught by the service probe regardless.
     pub fn needs_coexistence(&self) -> bool {
-        (!self.competing_hosts.is_empty() || self.mgmt_port_in_use) && !self.mgmt_bind_set
+        let foreign_port = self.mgmt_port_in_use && self.installed.is_none();
+        (!self.competing_hosts.is_empty() || foreign_port) && !self.mgmt_bind_set
     }
 
     /// Networks whose Public category leaves the default firewall rules inert.
@@ -227,9 +252,11 @@ fn arch(env: &Env) -> String {
 }
 
 fn arp_install(run: &dyn CommandRunner) -> Option<WinInstall> {
-    let out = run
-        .probe("reg", &["query", HOST_ARP_KEY])
-        .filter(|o| o.ok())?;
+    arp_install_at(run, HOST_ARP_KEY)
+}
+
+fn arp_install_at(run: &dyn CommandRunner, key: &str) -> Option<WinInstall> {
+    let out = run.probe("reg", &["query", key]).filter(|o| o.ok())?;
     Some(WinInstall {
         version: parse_reg_value(&out.stdout, "DisplayVersion"),
         location: parse_reg_value(&out.stdout, "InstallLocation"),
@@ -460,6 +487,27 @@ mod tests {
     }
 
     #[test]
+    fn the_client_key_is_probed_apart_from_the_hosts() {
+        let (mut run, env, net, tmp) = fresh_box();
+        run = run.answer(
+            &format!("reg query {}", plan::CLIENT_ARP_KEY),
+            0,
+            &reg_out(plan::CLIENT_ARP_KEY, "DisplayVersion", "REG_SZ", "0.33.1"),
+        );
+        let facts = probe(&run, &env, &net, tmp.path());
+        assert!(facts.installed.is_none());
+        assert_eq!(
+            facts
+                .installed_for(plan::Artifact::Client)
+                .unwrap()
+                .version
+                .as_deref(),
+            Some("0.33.1")
+        );
+        assert!(facts.installed_for(plan::Artifact::Host).is_none());
+    }
+
+    #[test]
     fn the_real_box_reads_host_env_under_program_data() {
         let paths = base_paths(&Env::of(&[("ProgramData", r"D:\PD")]));
         assert!(paths.host_env().starts_with(r"D:\PD"));
@@ -551,6 +599,24 @@ mod tests {
         let facts = probe(&run, &env, &net, tmp.path());
         assert!(facts.competing_hosts.is_empty());
         assert!(facts.needs_coexistence());
+    }
+
+    // WP3.5's VM smoke: on an upgrade the bound port is our own running host.
+    #[test]
+    fn an_upgrades_own_host_on_the_mgmt_port_is_no_conflict() {
+        let (mut run, env, _, tmp) = fresh_box();
+        let body = format!(
+            "\r\n{HOST_ARP_KEY}\r\n    DisplayVersion    REG_SZ    0.35.16661\r\n    InstallLocation    REG_SZ    C:\\Program Files\\punktfunk\\\r\n\r\n"
+        );
+        run = run.answer(&format!("reg query {HOST_ARP_KEY}"), 0, &body);
+        let net = FakeNet {
+            ports_in_use: vec![MGMT_PORT],
+            ..FakeNet::default()
+        };
+        let facts = probe(&run, &env, &net, tmp.path());
+        assert!(facts.installed.is_some());
+        assert!(facts.mgmt_port_in_use);
+        assert!(!facts.needs_coexistence());
     }
 
     #[test]

@@ -1126,7 +1126,7 @@
           "events"
         ],
         "summary": "Stream host lifecycle events (SSE)",
-        "description": "`id:` is `seq`, `event:` is kind, `data:` is HostEvent JSON. Resume with `Last-Event-ID`\nor `?since=`; `event: dropped` means the ring no longer has that cursor — resync from REST.",
+        "description": "`id:` is `seq`, `event:` is kind, `data:` is HostEvent JSON. Resume with `Last-Event-ID`\nor `?since=`; `event: dropped` means the ring no longer has that cursor — resync from REST.\n`event: live` follows the catch-up; frames after it happened after you connected.",
         "operationId": "streamEvents",
         "parameters": [
           {
@@ -4997,6 +4997,141 @@
           }
         }
       },
+      "CaptureEpisode": {
+        "type": "object",
+        "description": "One closed staged-recovery episode.",
+        "required": [
+          "stall_class",
+          "recovered",
+          "took_ms",
+          "stages",
+          "consecutive_failures",
+          "cooldown_ms"
+        ],
+        "properties": {
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "cooldown_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "recovered": {
+            "type": "boolean"
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CaptureStage"
+            },
+            "description": "The rungs run, in ladder order."
+          },
+          "stall_class": {
+            "type": "string"
+          },
+          "took_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "CaptureHealth": {
+        "type": "object",
+        "description": "Per-session capture health (Windows IDD-push): the live classifier verdict, the ring's\nself-report and the last staged-recovery episode.",
+        "required": [
+          "class",
+          "source_gap_ms",
+          "fence_ring",
+          "published_total",
+          "dropped_total",
+          "episodes_suppressed"
+        ],
+        "properties": {
+          "class": {
+            "type": "string",
+            "description": "`healthy` / `idle` / `suspect` / `stalled` / `recovering` / `rebuilding` / `secure_desktop`.",
+            "example": "healthy"
+          },
+          "cooldown_remaining_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Time left in the post-failure cooldown, while one is in force.",
+            "minimum": 0
+          },
+          "current_stage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The recovery stage running now, while an episode is open."
+          },
+          "dropped_total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "episodes_suppressed": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Stalled verdicts refused for budget or cooldown since the last episode.",
+            "minimum": 0
+          },
+          "evidence": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Activity evidence behind the verdict: `recent_source` / `input` / `canary` / `presents`."
+          },
+          "fence_ring": {
+            "type": "boolean",
+            "description": "The shared-fence ring protocol is negotiated on the current ring."
+          },
+          "last_episode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CaptureEpisode",
+                "description": "The last closed recovery episode."
+              }
+            ]
+          },
+          "published_total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ring_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The ring's own state word; absent on a driver without the health tail."
+          },
+          "source_gap_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Time since the last real source frame.",
+            "minimum": 0
+          },
+          "stall_class": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When `class` is `stalled`: `worker` / `transport` / `conversion` / `presentation`."
+          }
+        }
+      },
       "CaptureMeta": {
         "type": "object",
         "description": "Filename stem plus negotiated mode/codec/client. On-disk head;\n[`StatsRecorder::list`] returns this without the sample body.",
@@ -5065,6 +5200,30 @@
           "width": {
             "type": "integer",
             "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "CaptureStage": {
+        "type": "object",
+        "description": "One recovery rung of an episode.",
+        "required": [
+          "stage",
+          "outcome",
+          "took_ms"
+        ],
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "description": "`applied` / `failed` / `unsupported` / `timed_out`."
+          },
+          "stage": {
+            "type": "string",
+            "description": "`encoder_reset` / `ring_reset` / `swap_chain_reset` / `presentation_reset` / `monitor_cycle` / `driver_cycle` / `capture_fallback`."
+          },
+          "took_ms": {
+            "type": "integer",
+            "format": "int64",
             "minimum": 0
           }
         }
@@ -5578,6 +5737,39 @@
           "timeout",
           "error"
         ]
+      },
+      "DisplayHealth": {
+        "type": "object",
+        "description": "Host-wide Windows display health: the topology transaction log and the leases the stream holds.",
+        "required": [
+          "topology_generation",
+          "pnp_leases"
+        ],
+        "properties": {
+          "last_transaction": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TopologyTransaction",
+                "description": "The most recent topology transaction, if any."
+              }
+            ]
+          },
+          "pnp_leases": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Monitor devnodes disabled for a stream and not yet re-enabled (a leftover here after a\ncrash is what the next host start replays).",
+            "minimum": 0
+          },
+          "topology_generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Count of topology transactions that observed a change since the host started.",
+            "minimum": 0
+          }
+        }
       },
       "DisplayLayoutRequest": {
         "type": "object",
@@ -8199,6 +8391,17 @@
           "audio_streaming": {
             "type": "boolean"
           },
+          "display": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DisplayHealth",
+                "description": "Windows display state: topology transactions and outstanding device leases. Absent off-Windows."
+              }
+            ]
+          },
           "games": {
             "type": "array",
             "items": {
@@ -8348,6 +8551,17 @@
           "fps"
         ],
         "properties": {
+          "capture": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CaptureHealth",
+                "description": "Live capture health (Windows IDD-push, native plane). Absent on GameStream, on Linux,\nand until the video loop's first publish."
+              }
+            ]
+          },
           "fps": {
             "type": "integer",
             "format": "int32",
@@ -8838,6 +9052,30 @@
           "primary",
           "exclusive"
         ]
+      },
+      "TopologyTransaction": {
+        "type": "object",
+        "description": "One topology transaction as the display actor recorded it.",
+        "required": [
+          "reason",
+          "outcome",
+          "took_ms"
+        ],
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "description": "`changed` / `unchanged` / `unknown`."
+          },
+          "reason": {
+            "type": "string",
+            "description": "`acquire-isolate` / `exclusive-reassert` / …"
+          },
+          "took_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
       },
       "UiCredential": {
         "type": "object",

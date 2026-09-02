@@ -34,6 +34,11 @@ export type Artwork = typeof Artwork.Type;
  * | `epic` | `<namespace>:<catalogItemId>:<appName>` or a bare appName | windows |
  * | `gog` | `exe \t args \t workdir` | windows |
  * | `aumid` | `<PFN>!<AppId>` | windows |
+ * | `xbox` | `<Identity>!<AppId>` from `MicrosoftGame.config`; the host completes the AUMID | windows |
+ * | `playnite` | a Playnite game GUID | windows |
+ * | `uplay` | digits — a Ubisoft Connect game id | windows |
+ * | `amazon` | an Amazon Games product id (`amzn1.adg.product.…`) | windows |
+ * | `battlenet` | a Battle.net launch code (`WTCG`, `Pro`, `Fen`, …), case kept | windows |
  * | `plugin` | an opaque key in THIS plugin's namespace — see below | both |
  *
  * `plugin` is the escape hatch for a tile the host cannot name on its own (a ROM through whichever

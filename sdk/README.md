@@ -136,6 +136,7 @@ through an SSH tunnel).
 - `on()` patterns: exact kinds (`"stream.started"`, typed callback), `"domain.*"` prefixes,
   `"*"`, plus `"dropped"` (your cursor fell off the ring — resync via REST) and `"unknown"`
   (an event kind newer than this SDK — the additive-only wire at work).
+- The host's `live` frame (end of its replay) is swallowed on both surfaces except `eventsRaw()`.
 - Effect surface: `events()` is a `Stream<HostEvent, EventStreamError>`; `eventsRaw()` carries
   every SSE frame verbatim.
 

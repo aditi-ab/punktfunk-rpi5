@@ -18,7 +18,7 @@ use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
 use pf_driver_proto::{control, frame};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, Interface, PCWSTR, PWSTR};
@@ -144,11 +144,100 @@ impl Drop for MappedSection {
 
 struct HostSlot {
     tex: ID3D11Texture2D,
-    mutex: IDXGIKeyedMutex,
+    /// The keyed-mutex arm's lock; `None` on a fence-mode ring (immunity plan WP7).
+    mutex: Option<IDXGIKeyedMutex>,
     /// Unnamed NT handle: keeps the resource alive and is the only duplication source for the driver.
     shared: OwnedHandle,
     /// HDR samples the FP16 slot directly (no slot→scratch copy) while the keyed mutex is held.
     srv: ID3D11ShaderResourceView,
+}
+
+/// The fence ring's host half (immunity plan WP7, D5): two shared `ID3D11Fence`s per ring
+/// generation — the driver signals `ready` after its copy, we signal `retire` after our read —
+/// and the `ID3D11DeviceContext4` that queues the GPU-side waits. Fresh fences per generation
+/// keep both value sequences starting at zero on both sides.
+struct HostFences {
+    ctx4: ID3D11DeviceContext4,
+    ready: ID3D11Fence,
+    retire: ID3D11Fence,
+    /// Unnamed NT handles the broker duplicates into WUDFHost; closed when the ring is rebuilt.
+    ready_h: OwnedHandle,
+    retire_h: OwnedHandle,
+    /// Our consumer-retire value, monotonic per ring generation.
+    retire_value: u64,
+}
+
+impl HostFences {
+    /// `Ok(None)` when the device predates D3D11.4 (no fences — the keyed-mutex arm it is).
+    fn create(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<Option<Self>> {
+        let (Ok(dev5), Ok(ctx4)) = (
+            device.cast::<ID3D11Device5>(),
+            context.cast::<ID3D11DeviceContext4>(),
+        ) else {
+            return Ok(None);
+        };
+        // The same SYSTEM-only, protected DACL as every other frame object: unnamed, reachable
+        // only through the broker's duplicate (`design/idd-push-security.md` invariant 7/10).
+        let sa = open::SharedObjectSa::new()?;
+        let mk = || -> Result<(ID3D11Fence, OwnedHandle)> {
+            let mut f: Option<ID3D11Fence> = None;
+            // SAFETY: `dev5` is the live device; `f` is a valid out-param, checked below; `sa`
+            // outlives the call. The shared handle is a fresh NT handle this process owns
+            // (adopted by `OwnedHandle`).
+            unsafe {
+                dev5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut f)
+                    .context("CreateFence(D3D11_FENCE_FLAG_SHARED)")?;
+                let f = f.context("null D3D11 fence")?;
+                let h: HANDLE = f
+                    .CreateSharedHandle(Some(sa.as_ptr()), 0x1000_0000, PCWSTR::null())
+                    .context("ID3D11Fence::CreateSharedHandle")?;
+                Ok((f, OwnedHandle::from_raw_handle(h.0 as _)))
+            }
+        };
+        let (ready, ready_h) = mk()?;
+        let (retire, retire_h) = mk()?;
+        Ok(Some(Self {
+            ctx4,
+            ready,
+            retire,
+            ready_h,
+            retire_h,
+            retire_value: 0,
+        }))
+    }
+
+    /// The two handle values the broker duplicates into WUDFHost.
+    fn handles(&self) -> (HANDLE, HANDLE) {
+        (
+            HANDLE(self.ready_h.as_raw_handle()),
+            HANDLE(self.retire_h.as_raw_handle()),
+        )
+    }
+}
+
+/// What the driver told us about the fence ring, process-wide: 0 unknown, 1 capable, 2 not.
+/// The first ring on a box is a keyed-mutex probe carrying fences; the attach teaches this, and
+/// every later ring is built in the negotiated mode from the start.
+static DRIVER_FENCE_CAPABLE: AtomicU8 = AtomicU8::new(0);
+
+/// Puts a READING slot back to FREE if the consume path unwinds before its retire signal — a
+/// leaked READING slot would be dead to the producer forever.
+struct FenceSlotGuard(*const AtomicU32);
+
+impl FenceSlotGuard {
+    /// The steady-path release (after the retire signal); skips the Drop store.
+    fn release(self) {
+        // SAFETY: the pointer names a slot-state word in the live header mapping.
+        unsafe { (*self.0).store(frame::fence::FREE, Ordering::Release) };
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for FenceSlotGuard {
+    fn drop(&mut self) {
+        // SAFETY: as `release`.
+        unsafe { (*self.0).store(frame::fence::FREE, Ordering::Release) };
+    }
 }
 
 /// Encode-input texture plus, for P010, the two plane RTVs.
@@ -205,39 +294,6 @@ enum AcquireClass {
     Abandoned,
     Busy,
     Fatal,
-}
-
-/// What the stale-source watchdog does this tick (see
-/// [`IddPushCapturer::stale_source_watchdog`]) — pure over its inputs so the floor/evidence/
-/// budget rules are testable without a ring.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StaleAction {
-    None,
-    Rebuild,
-    Fail,
-}
-
-fn stale_source_action(
-    gap: Duration,
-    floor: Duration,
-    cursor_px: u32,
-    evidence_px: u32,
-    offered_delta: u64,
-    trips: u32,
-) -> StaleAction {
-    if gap < floor {
-        return StaleAction::None;
-    }
-    // Activity evidence: the user's input moved the cursor over the frozen image, or the driver
-    // kept offering frames the ring never delivered. Neither = plain idle = no recovery.
-    if cursor_px < evidence_px && offered_delta == 0 {
-        return StaleAction::None;
-    }
-    if trips == 0 {
-        StaleAction::Rebuild
-    } else {
-        StaleAction::Fail
-    }
 }
 
 fn classify_acquire(hr: i32) -> AcquireClass {
@@ -358,6 +414,9 @@ mod dxgkrnl_etw;
 mod probes;
 #[path = "idd_push/stall.rs"]
 mod stall;
+// Live health classification + the staged-recovery ladder (immunity plan WP12/WP13).
+#[path = "idd_push/recovery.rs"]
+mod recovery;
 use channel::ChannelBroker;
 use descriptor::{DescriptorPoller, DisplayDescriptor};
 use stall::{StallEvidence, StallWatch};
@@ -375,10 +434,10 @@ pub struct IddPushCapturer {
     /// provenance sequence. Survives ring recreates by construction: it lives on the capturer,
     /// not the ring.
     source_seq: u64,
-    /// Consecutive stale-source watchdog trips (WP3b): 1 = the one in-place rebuild ran; a
-    /// second trip is terminal. Reset only when CONTINUOUS source flow resumes — a single stash
-    /// republish after the rebuild must not re-arm another silent stale floor.
-    stale_trips: u32,
+    /// Health classifier + staged-recovery ladder over this capturer's clocks (WP12/WP13).
+    recovery: recovery::Supervisor,
+    /// A closed episode's measured outage, until the stream loop takes it (WP14).
+    recovered_outage: Option<Duration>,
     /// Owns the shared-header file mapping + its mapped view (RAII unmap-then-close). Declared BEFORE
     /// `header`, which is a raw pointer borrowed into this view via [`MappedSection::ptr`]. Also the
     /// duplication source for the driver's header handle on every [`ChannelBroker::send`].
@@ -431,6 +490,12 @@ pub struct IddPushCapturer {
     width: u32,
     height: u32,
     slots: Vec<HostSlot>,
+    /// This ring runs the fence protocol (textures without a keyed mutex, `CAP_FENCE_RING`
+    /// advertised); `false` = the keyed-mutex arm. Decided per generation.
+    fence_mode: bool,
+    /// The shared fences delivered with this generation (`None` on a pre-D3D11.4 device). Present
+    /// on a keyed-mutex probe ring too, so the driver can prove it opens them.
+    fences: Option<HostFences>,
     /// Bumped on recreate; stamped so the driver re-attaches and stale publishes die.
     generation: u32,
     /// Handshake advertised `VIDEO_CAP_HDR` (not merely 10-bit). Pins composition
@@ -471,6 +536,8 @@ pub struct IddPushCapturer {
     /// Two-strikes debounce: act only when a second consecutive sample agrees,
     /// so a topology re-probe blip never tears the ring down.
     pending_desc: Option<DisplayDescriptor>,
+    /// The topology generation `pending_desc` was sampled under ([`poll_display_hdr`]).
+    pending_desc_gen: u64,
     /// Ring recreate in flight; if still set past the window, `try_consume` drops
     /// the session (recover-or-drop, no DDA).
     recovering_since: Option<Instant>,
@@ -766,7 +833,14 @@ impl IddPushCapturer {
     fn recreate_ring(&mut self, new_display_hdr: bool, new_w: u32, new_h: u32) -> Result<()> {
         // Build first, commit after. `create_ring_slots` is fallible (VRAM at a large mode).
         let fmt = Self::ring_format_for(new_display_hdr);
-        let new_slots = Self::create_ring_slots(&self.device, new_w, new_h, fmt)?;
+        let new_slots = Self::create_ring_slots(&self.device, new_w, new_h, fmt, !self.fence_mode)?;
+        // Fresh fences per generation (WP7): both value sequences restart at zero on both sides,
+        // so a new endpoint's first `ready` can never be satisfied by the old ring's signals.
+        let new_fences = if self.fences.is_some() {
+            HostFences::create(&self.device, &self.context)?
+        } else {
+            None
+        };
         self.display_hdr = new_display_hdr;
         self.width = new_w;
         self.height = new_h;
@@ -780,6 +854,25 @@ impl IddPushCapturer {
             // publish still carries the old generation and is dropped.
             (*(std::ptr::addr_of!((*self.header).latest) as *const AtomicU64))
                 .store(0, Ordering::Relaxed);
+            if new_fences.is_some() {
+                // Every slot back to FREE for the new generation. A record a racing old publish
+                // leaves behind carries its (old) generation in the packed token; `fence_pick`
+                // frees it rather than consuming it.
+                std::ptr::write_bytes(
+                    self.header
+                        .cast::<u8>()
+                        .add(frame::fence::SLOT_TABLE_OFFSET),
+                    0,
+                    RING_LEN as usize * frame::fence::SLOT_RECORD_SIZE,
+                );
+                let caps = std::ptr::addr_of_mut!((*self.header).host_capabilities);
+                let bit = frame::CAP_FENCE_RING;
+                *caps = if self.fence_mode {
+                    *caps | bit
+                } else {
+                    *caps & !bit
+                };
+            }
             (*self.header).dxgi_format = fmt.0 as u32;
             (*self.header).width = new_w;
             (*self.header).height = new_h;
@@ -794,9 +887,11 @@ impl IddPushCapturer {
         // Let `log_driver_status_once` report this generation's attach.
         self.status_logged = false;
         self.slots = new_slots;
+        self.fences = new_fences;
         self.generation = new_gen;
         // Driver sees the bump (`is_stale`), drops, re-attaches.
-        // SAFETY: `broker.send` borrows live `self.section.handle`/`self.event` for this call.
+        // SAFETY: `broker.send` borrows live `self.section.handle`/`self.event`/the fence
+        // handles for this call.
         if let Err(e) = unsafe {
             self.broker.send(
                 self.target_id,
@@ -804,12 +899,14 @@ impl IddPushCapturer {
                 HANDLE(self.section.handle.as_raw_handle()),
                 HANDLE(self.event.as_raw_handle()),
                 &self.slots,
+                self.fences.as_ref().map(HostFences::handles),
             )
         } {
-            tracing::warn!(
-                error = %format!("{e:#}"),
-                "IDD push: frame-channel re-delivery failed after ring recreate"
-            );
+            // The driver never received the new ring: nothing will ever publish into it, so the
+            // recreate FAILED — a recovery rung must escalate now, not wait out its deadline
+            // (measured on `.173`: the WUDFHost died mid-recreate and the stage still read
+            // "Applied" from a swallowed delivery error).
+            return Err(e.context("IDD-push: frame-channel re-delivery failed after ring recreate"));
         }
         // Monitor re-arrival can kill the cursor worker; re-deliver the surviving section.
         if let (Some(cs), Some(send)) = (self.cursor_shared.as_ref(), self.cursor_sender.as_ref()) {
@@ -831,6 +928,111 @@ impl IddPushCapturer {
         self.pyro_last = None;
         self.out_idx = 0;
         self.last_present = None;
+        Ok(())
+    }
+
+    /// Pointer to slot `i`'s `state` word in the v4 slot table (fence mode only).
+    fn slot_atomic_u32(&self, i: usize) -> *const AtomicU32 {
+        // SAFETY: pointer arithmetic inside our own live mapping, sized `HEADER_V4_SIZE` whenever
+        // fences exist; the record's `state` is a naturally-aligned u32.
+        unsafe {
+            self.header
+                .cast::<u8>()
+                .add(
+                    frame::fence::slot_offset(i)
+                        + std::mem::offset_of!(frame::fence::SlotRecord, state),
+                )
+                .cast::<AtomicU32>()
+        }
+    }
+
+    /// Pointer to a `u64` field (`off` = `offset_of!(SlotRecord, ..)`) of slot `i`'s record.
+    fn slot_atomic_u64(&self, i: usize, off: usize) -> *const AtomicU64 {
+        // SAFETY: as `slot_atomic_u32`, for an 8-aligned u64 field.
+        unsafe {
+            self.header
+                .cast::<u8>()
+                .add(frame::fence::slot_offset(i) + off)
+                .cast::<AtomicU64>()
+        }
+    }
+
+    /// Fence arm: the newest PUBLISHED slot above the last delivery, as `(slot, seq)`. Older
+    /// publishes are freed (newest-wins), and so is any PUBLISHED record whose packed token names
+    /// another ring generation — a leftover of a superseded publisher, never pixels of ours.
+    fn fence_pick(&self) -> Option<(usize, u64)> {
+        let n = self.slots.len();
+        let mut view = [(frame::fence::FREE, 0u64); RING_LEN as usize];
+        for (i, v) in view.iter_mut().enumerate().take(n) {
+            // SAFETY: both pointers name aligned fields of slot `i`'s record in the live mapping.
+            let (state, rec) = unsafe {
+                (
+                    &*self.slot_atomic_u32(i),
+                    (*self.slot_atomic_u64(i, std::mem::offset_of!(frame::fence::SlotRecord, seq)))
+                        .load(Ordering::Acquire),
+                )
+            };
+            let st = state.load(Ordering::Acquire);
+            let tok = frame::FrameToken::unpack(rec);
+            if st == frame::fence::PUBLISHED && tok.generation != self.generation {
+                let _ = state.compare_exchange(
+                    frame::fence::PUBLISHED,
+                    frame::fence::FREE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                *v = (frame::fence::FREE, 0);
+                continue;
+            }
+            *v = (st, u64::from(tok.seq));
+        }
+        let pick = frame::fence::consumer_pick(&view[..n], self.last_seq);
+        for i in pick.stale {
+            // SAFETY: as above.
+            let _ = unsafe { &*self.slot_atomic_u32(i) }.compare_exchange(
+                frame::fence::PUBLISHED,
+                frame::fence::FREE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        pick.take
+    }
+
+    /// WP7 negotiation, right after the open-time attach: the driver's capability word says
+    /// whether it opened our fences. Remember it process-wide; a keyed-mutex probe ring on a
+    /// capable driver is rebuilt in fence mode now. A fence-mode attach that fails falls back to
+    /// the mutex arm (and remembers that), so the session never dies on the negotiation.
+    fn learn_and_upgrade_fence_mode(&mut self) -> Result<()> {
+        let Some(h) = self.ring_health() else {
+            return Ok(()); // pre-v3 driver: nothing to learn, mutex arm stays
+        };
+        let capable = h.capabilities & frame::CAP_FENCE_RING != 0;
+        DRIVER_FENCE_CAPABLE.store(if capable { 1 } else { 2 }, Ordering::Release);
+        if !capable || self.fence_mode || self.fences.is_none() {
+            return Ok(());
+        }
+        tracing::info!(
+            target = %self.ccd,
+            "IDD push: driver opened the shared fences — rebuilding this ring on the fence protocol"
+        );
+        self.fence_mode = true;
+        self.recovering_since = Some(Instant::now());
+        let upgraded = self
+            .recreate_ring(self.display_hdr, self.width, self.height)
+            .and_then(|()| self.wait_for_attach());
+        if let Err(e) = upgraded {
+            tracing::warn!(
+                target = %self.ccd,
+                error = %format!("{e:#}"),
+                "IDD push: fence-mode ring did not attach — staying on the keyed-mutex arm"
+            );
+            DRIVER_FENCE_CAPABLE.store(2, Ordering::Release);
+            self.fence_mode = false;
+            self.recreate_ring(self.display_hdr, self.width, self.height)?;
+            self.wait_for_attach()?;
+        }
+        self.recovering_since = None;
         Ok(())
     }
 
@@ -910,9 +1112,14 @@ impl IddPushCapturer {
             self.pending_desc = None;
             return;
         }
-        if self.pending_desc != Some(now) {
+        // Samples name the topology generation they were observed under (immunity plan WP10 item
+        // 5): two strikes straddling a finished topology transaction are two different desktops,
+        // never one confirmed change.
+        let topo_gen = pf_win_display::topology_churn::generation();
+        if self.pending_desc != Some(now) || self.pending_desc_gen != topo_gen {
             // First strike — act only when a second consecutive sample agrees.
             self.pending_desc = Some(now);
+            self.pending_desc_gen = topo_gen;
             return;
         }
         self.pending_desc = None;
@@ -1331,10 +1538,7 @@ impl IddPushCapturer {
         if self.cursor_shared.is_none() && !self.composite_forced {
             return;
         }
-        let secure = self
-            .cursor_poll
-            .as_ref()
-            .is_some_and(|p| p.secure_desktop());
+        let secure = pf_win_display::secure_desktop();
         if secure == self.secure_active {
             return;
         }
@@ -1401,77 +1605,119 @@ impl IddPushCapturer {
         }
     }
 
-    /// Stale floor for the interim stale-source watchdog (WP3b). Anchored ABOVE the recorded
-    /// benign vendor-hole envelope — field holes run 1.6–10 s during link/power/modeset servicing
-    /// (vdisplay-disturbance-immunity §1), and a transient adapter pause must never trigger
-    /// recovery. The staged-recovery classifier (WP12) inherits this value as its starting floor.
-    const STALE_SOURCE_FLOOR: Duration = Duration::from_secs(15);
-    /// Cursor motion across the gap that counts as ACTIVITY evidence — a couple of real mouse
-    /// movements, comfortably above sub-pixel jitter.
-    const STALE_EVIDENCE_PX: u32 = 64;
-
-    /// Interim stale-source watchdog (immunity plan WP3b; retired when the WP13 recovery ladder
-    /// owns the decision). A wedged-but-ALIVE presentation path answers `Ok(None)` forever — the
-    /// 20 s `next_frame` bail is unreachable after a first frame, and the driver-death watch only
-    /// catches an EXITED WUDFHost — so a known-active display could stream one stale texture
-    /// indefinitely (F1). When no fresh driver frame has arrived through the floor while activity
-    /// evidence exists (the user's cursor moved over the frozen image, or the driver kept
-    /// offering frames the ring never delivered), run ONE same-mode in-place rebuild; a second
-    /// expiry is terminal (typed `RingFault::SourceStalled`). No evidence = plain idle = no
-    /// recovery: a static desktop composes nothing, and that is healthy.
-    fn stale_source_watchdog(&mut self) -> Result<()> {
-        if self.recovering_since.is_some() {
-            return Ok(()); // a recreate is in flight — its own 3 s recover-or-drop governs
-        }
-        let gap = self.last_fresh.elapsed();
-        let offered_delta = self.telemetry().map_or(0, |(_, offered)| {
-            offered.saturating_sub(self.offered_at_fresh)
-        });
-        match stale_source_action(
-            gap,
-            Self::STALE_SOURCE_FLOOR,
-            self.cursor_gap_px,
-            Self::STALE_EVIDENCE_PX,
-            offered_delta,
-            self.stale_trips,
-        ) {
-            StaleAction::None => Ok(()),
-            StaleAction::Rebuild => {
-                self.stale_trips += 1;
-                tracing::warn!(
-                    target = %self.ccd,
-                    gap_s = gap.as_secs(),
-                    cursor_moved_px = self.cursor_gap_px,
-                    offered_delta,
-                    "IDD push: no source frame through the stale floor with activity evidence — \
-                     one same-mode ring rebuild (interim stale-source watchdog)"
-                );
-                if !self.recreate_ring_in_place() {
+    /// Staged recovery (immunity plan WP12/WP13). A wedged-but-ALIVE presentation path answers
+    /// `Ok(None)` forever — the 20 s `next_frame` bail is unreachable after a first frame, and
+    /// the driver-death watch only catches an EXITED WUDFHost — so a known-active display could
+    /// stream one stale texture indefinitely (F1). The classifier names the gap from the clocks
+    /// this capturer keeps (worker heartbeat, driver acquires, ring publish, source frames,
+    /// cursor travel, an unanswered canary); the coordinator walks the ladder from that class,
+    /// one rung at a time under a deadline, and proves each rung with NEW source frames. No
+    /// evidence = plain idle = no recovery: a static desktop composes nothing, and that is
+    /// healthy. An exhausted ladder ends the plane with the typed `RingFault::SourceStalled`; the
+    /// host's pipeline rebuild is the rung above.
+    fn recovery_tick(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let telemetry = self.telemetry();
+        let health = self.ring_health();
+        let inputs = recovery::Inputs {
+            now,
+            last_source: self.last_fresh,
+            source_seq: self.source_seq,
+            heartbeat_age: telemetry.map(|(hb, _)| Duration::from_micros(Self::qpc_age_us(hb))),
+            // Re-attach restarts `offered_total` near zero (same guard as the stall evidence).
+            offered_undelivered: telemetry.map(|(_, offered)| {
+                if offered >= self.offered_at_fresh {
+                    offered - self.offered_at_fresh
+                } else {
+                    offered
+                }
+            }),
+            publish_age: health
+                .as_ref()
+                .filter(|h| h.last_publish_qpc != 0)
+                .map(|h| Duration::from_micros(Self::qpc_age_us(h.last_publish_qpc))),
+            cursor_gap_px: self.cursor_gap_px,
+            ring: health.map(|h| h.state),
+            recreating: self.recovering_since.is_some(),
+            secure_desktop: self.secure_active,
+            topology_held: pf_win_display::topology_churn::held(),
+        };
+        let mut step = self.recovery.tick(inputs);
+        loop {
+            match step {
+                recovery::Step::Nothing => return Ok(()),
+                recovery::Step::Canary => {
+                    tracing::info!(
+                        target = %self.ccd,
+                        "IDD push: source suspect on weak evidence — presenting the compose canary"
+                    );
+                    kick_dwm_compose(self.ccd);
+                    return Ok(());
+                }
+                recovery::Step::Run(stage) => {
+                    let outcome = self.run_stage(stage);
+                    tracing::warn!(
+                        target = %self.ccd,
+                        ?stage,
+                        ?outcome,
+                        "IDD push: recovery stage"
+                    );
+                    step = self.recovery.stage_done(Instant::now(), stage, outcome);
+                }
+                recovery::Step::Recovered(summary) => {
+                    tracing::info!(
+                        target = %self.ccd,
+                        ?summary,
+                        "IDD push: recovery episode closed"
+                    );
+                    return Ok(());
+                }
+                recovery::Step::Failed { gap, summary } => {
                     let fault = crate::RingFault::SourceStalled {
                         secs: gap.as_secs() as u32,
                     };
+                    tracing::error!(
+                        target = %self.ccd,
+                        %fault,
+                        ?summary,
+                        "IDD push: recovery ladder exhausted"
+                    );
                     return Err(anyhow::Error::new(fault).context(
-                        "IDD-push: stale-source rebuild failed — ending the video plane",
+                        "IDD-push: a known-active display delivered no source frame through the \
+                         recovery ladder — ending the video plane with a typed error",
                     ));
                 }
-                Ok(())
             }
-            StaleAction::Fail => {
-                self.stale_trips += 1;
-                let fault = crate::RingFault::SourceStalled {
-                    secs: gap.as_secs() as u32,
-                };
-                tracing::error!(
-                    target = %self.ccd,
-                    %fault,
-                    trips = self.stale_trips,
-                    "IDD push: stale-source watchdog exhausted its one rebuild"
-                );
-                Err(anyhow::Error::new(fault).context(
-                    "IDD-push: a known-active display delivered no source frame through the \
-                     stale floor and a rebuild — ending the video plane with a typed error",
-                ))
+        }
+    }
+
+    /// Run one ladder rung. Only the capture-thread actuators exist yet; the rest report
+    /// `Unsupported` and the ladder moves on without penalty.
+    fn run_stage(&mut self, stage: pf_frame::recovery::Stage) -> pf_frame::recovery::StageOutcome {
+        use pf_frame::recovery::{Stage, StageOutcome};
+        match stage {
+            Stage::RingReset => {
+                self.recovering_since.get_or_insert_with(Instant::now);
+                match self.recreate_ring(self.display_hdr, self.width, self.height) {
+                    Ok(()) => StageOutcome::Applied,
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "IDD push: ring reset failed");
+                        StageOutcome::Failed
+                    }
+                }
             }
+            Stage::PresentationReset => {
+                if self.recreate_ring_in_place() {
+                    StageOutcome::Applied
+                } else {
+                    StageOutcome::Failed
+                }
+            }
+            Stage::EncoderReset
+            | Stage::SwapChainReset
+            | Stage::MonitorCycle
+            | Stage::DriverCycle
+            | Stage::CaptureFallback => StageOutcome::Unsupported,
         }
     }
 
@@ -1485,7 +1731,8 @@ impl IddPushCapturer {
         self.poll_display_hdr();
         // Recover-or-drop: a recreate that never resumes a fresh frame ends the session.
         if let Some(since) = self.recovering_since {
-            if since.elapsed() > Duration::from_secs(3) {
+            // Under a recovery episode the ladder's stage deadlines govern instead.
+            if since.elapsed() > Duration::from_secs(3) && !self.recovery.owns_episode() {
                 // `recreate_ring` cleared these; whatever they hold is this generation's re-attach.
                 let (st, detail, lo, hi) = self.driver_diag();
                 bail!(
@@ -1525,9 +1772,9 @@ impl IddPushCapturer {
                 );
             }
         }
-        // Interim stale-source watchdog (WP3b) — after the driver-death watch, so a trip means
-        // the WUDFHost is ALIVE and the presentation path is what stopped.
-        self.stale_source_watchdog()?;
+        // Staged recovery — after the driver-death watch, so an episode means the WUDFHost is
+        // ALIVE and the presentation path is what stopped.
+        self.recovery_tick()?;
         // Stall-attribution evidence (v2 telemetry): record the STALEST the driver's drain
         // heartbeat ever reads between fresh frames. A heartbeat that goes quiet for the hole
         // convicts our worker (starved/dead WUDFHost); one that stays fresh through it acquits the
@@ -1542,9 +1789,19 @@ impl IddPushCapturer {
         if tok.generation != self.generation {
             return Ok(None);
         }
-        let seq = u64::from(tok.seq);
-        let mut slot = tok.slot as usize;
-        let fresh = seq != self.last_seq && slot < self.slots.len();
+        // Slot + seq: the token names them on the keyed-mutex arm; on the fence arm the slot
+        // table does (newest PUBLISHED above the last delivery, older and foreign-generation
+        // records freed — D5, the S2 newest-wins finding).
+        let (mut slot, seq, fresh) = if self.fence_mode {
+            match self.fence_pick() {
+                Some((i, s)) => (i, s, true),
+                None => (0usize, self.last_seq, false),
+            }
+        } else {
+            let seq = u64::from(tok.seq);
+            let slot = tok.slot as usize;
+            (slot, seq, seq != self.last_seq && slot < self.slots.len())
+        };
         let mut regen = false;
         if !fresh {
             // Pointer-only motion publishes nothing; regenerate from the last slot.
@@ -1602,29 +1859,84 @@ impl IddPushCapturer {
             // SAFETY: D3D11 resource creation on the owning thread's device; no slot is held.
             unsafe { self.ensure_blend_scratch() };
         }
-        // Acquire the slot's keyed mutex via a RAII guard, scoped to JUST the convert/copy below so it
-        // releases at the same point as the old hand-written `ReleaseSync` (the driver gets the slot back
-        // immediately, NOT held across the rest of `try_consume`) — but now leak-proof on any early return.
+        // Own the slot for JUST the convert/copy below — the keyed mutex on that arm, a
+        // READING claim on the fence arm — so the driver gets it back immediately, NOT held across
+        // the rest of `try_consume`, and leak-proof on any early return (RAII either way).
         {
-            let lock = match KeyedMutexGuard::acquire(&slot_mutex, 0, 8) {
-                SlotAcquire::Acquired(l) => l,
-                // The driver holds the slot mid-copy — an ordinary tick, retry is correct.
-                SlotAcquire::Busy => return Ok(None),
-                // FATAL outcomes are typed errors now, never an `Ok(None)` repeat (F4): the ring
-                // generation is dead and only a rebuild (or a clean session error) helps.
-                SlotAcquire::Abandoned => {
-                    let fault = crate::RingFault::Abandoned;
-                    tracing::error!(target = %self.ccd, %fault, "IDD push: ring poisoned");
-                    return Err(anyhow::Error::new(fault)
-                        .context("IDD-push ring generation poisoned (rebuild required)"));
+            let lock = if self.fence_mode {
+                None
+            } else {
+                let m = slot_mutex
+                    .as_ref()
+                    .expect("keyed-mutex ring slot carries a mutex");
+                Some(match KeyedMutexGuard::acquire(m, 0, 8) {
+                    SlotAcquire::Acquired(l) => l,
+                    // The driver holds the slot mid-copy — an ordinary tick, retry is correct.
+                    SlotAcquire::Busy => return Ok(None),
+                    // FATAL outcomes are typed errors now, never an `Ok(None)` repeat (F4): the
+                    // ring generation is dead and only a rebuild (or a clean session error) helps.
+                    SlotAcquire::Abandoned => {
+                        let fault = crate::RingFault::Abandoned;
+                        tracing::error!(target = %self.ccd, %fault, "IDD push: ring poisoned");
+                        return Err(anyhow::Error::new(fault)
+                            .context("IDD-push ring generation poisoned (rebuild required)"));
+                    }
+                    SlotAcquire::Fatal(hr) => {
+                        let removed = self.device_removed_reason();
+                        let fault = crate::RingFault::DeviceLost { hr, removed };
+                        tracing::error!(target = %self.ccd, %fault, "IDD push: fatal slot acquire");
+                        return Err(anyhow::Error::new(fault)
+                            .context("IDD-push slot acquire failed fatally (rebuild required)"));
+                    }
+                })
+            };
+            // Fence arm: a fresh pick goes PUBLISHED -> READING (a lost CAS means the producer
+            // overwrote it first — rescan next tick); a regen re-reads the last slot only while
+            // it is FREE. Then order our GPU work after the producer's copy (never a CPU wait).
+            let claimed = if self.fence_mode {
+                let from = if regen {
+                    frame::fence::FREE
+                } else {
+                    frame::fence::PUBLISHED
+                };
+                let state = self.slot_atomic_u32(slot);
+                // SAFETY: `state` names a slot-state word inside the live header mapping.
+                let state_cell = unsafe { &*state };
+                if state_cell
+                    .compare_exchange(
+                        from,
+                        frame::fence::READING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    return Ok(None);
                 }
-                SlotAcquire::Fatal(hr) => {
+                let guard = FenceSlotGuard(state);
+                // SAFETY: the record's ready value is an aligned u64 in the live mapping.
+                let ready_cell = unsafe {
+                    &*self.slot_atomic_u64(
+                        slot,
+                        std::mem::offset_of!(frame::fence::SlotRecord, ready_value),
+                    )
+                };
+                let ready_v = ready_cell.load(Ordering::Acquire);
+                let f = self.fences.as_ref().expect("fence mode carries fences");
+                // SAFETY: GPU-queued wait on the owning thread's live context.
+                if let Err(e) = unsafe { f.ctx4.Wait(&f.ready, ready_v) } {
                     let removed = self.device_removed_reason();
-                    let fault = crate::RingFault::DeviceLost { hr, removed };
-                    tracing::error!(target = %self.ccd, %fault, "IDD push: fatal slot acquire");
+                    let fault = crate::RingFault::DeviceLost {
+                        hr: e.code().0,
+                        removed,
+                    };
+                    tracing::error!(target = %self.ccd, %fault, "IDD push: fence wait failed");
                     return Err(anyhow::Error::new(fault)
-                        .context("IDD-push slot acquire failed fatally (rebuild required)"));
+                        .context("IDD-push producer-ready fence wait failed (rebuild required)"));
                 }
+                Some(guard)
+            } else {
+                None
             };
             // SAFETY: convert on the owning (encode) thread's immediate context, holding the slot lock.
             // A `?` here is leak-safe: `lock` (the KeyedMutexGuard) drops on the early return, releasing
@@ -1681,12 +1993,44 @@ impl IddPushCapturer {
             }
             // CHECKED release on the steady path (the Drop release only backs the `?` returns
             // above): a failed release wedges the slot for the driver and poisons the generation.
-            if let Err(hr) = lock.release() {
-                let removed = self.device_removed_reason();
-                let fault = crate::RingFault::ReleaseFailed { hr, removed };
-                tracing::error!(target = %self.ccd, %fault, "IDD push: fatal slot release");
-                return Err(anyhow::Error::new(fault)
-                    .context("IDD-push slot release failed (rebuild required)"));
+            if let Some(lock) = lock {
+                if let Err(hr) = lock.release() {
+                    let removed = self.device_removed_reason();
+                    let fault = crate::RingFault::ReleaseFailed { hr, removed };
+                    tracing::error!(target = %self.ccd, %fault, "IDD push: fatal slot release");
+                    return Err(anyhow::Error::new(fault)
+                        .context("IDD-push slot release failed (rebuild required)"));
+                }
+            }
+            // Fence arm: retire AFTER our read is queued — signal a new value, publish it in the
+            // record, then FREE (Release). The producer GPU-waits that value before it may
+            // overwrite the slot, which is the whole consumer-retire contract.
+            if let Some(guard) = claimed {
+                let f = self.fences.as_mut().expect("fence mode carries fences");
+                f.retire_value += 1;
+                let rv = f.retire_value;
+                // SAFETY: GPU-queued signal on the owning thread's live context.
+                if let Err(e) = unsafe { f.ctx4.Signal(&f.retire, rv) } {
+                    drop(guard); // the slot goes back to FREE; the generation is done
+                    let removed = self.device_removed_reason();
+                    let fault = crate::RingFault::ReleaseFailed {
+                        hr: e.code().0,
+                        removed,
+                    };
+                    tracing::error!(target = %self.ccd, %fault, "IDD push: fence signal failed");
+                    return Err(anyhow::Error::new(fault).context(
+                        "IDD-push consumer-retire fence signal failed (rebuild required)",
+                    ));
+                }
+                // SAFETY: the record's retire value is an aligned u64 in the live mapping.
+                let retire_cell = unsafe {
+                    &*self.slot_atomic_u64(
+                        slot,
+                        std::mem::offset_of!(frame::fence::SlotRecord, retire_value),
+                    )
+                };
+                retire_cell.store(rv, Ordering::Release);
+                guard.release();
             }
         }
         self.out_idx = (i + 1) % ring_len;
@@ -1752,11 +2096,16 @@ impl IddPushCapturer {
                      above cover at most its first hole"
                 );
             }
-            // The stale-source watchdog's episode ends only when CONTINUOUS flow resumes: one
-            // stash republish after its rebuild arrives as a lone fresh frame at the end of a
-            // long gap and must NOT re-arm another silent stale floor over a frozen image.
-            if self.last_fresh.elapsed() < Duration::from_secs(5) {
-                self.stale_trips = 0;
+            // A recovery episode closes only on the budgeted count of NEW source frames: one
+            // stash republish after a rebuild is one frame, never proof.
+            if let Some((summary, outage)) = self.recovery.source_frame(now) {
+                tracing::info!(
+                    target = %self.ccd,
+                    ?summary,
+                    outage_ms = outage.as_millis() as u64,
+                    "IDD push: recovery episode closed"
+                );
+                self.recovered_outage = Some(outage);
             }
             // A fresh driver frame: feed the driver-death watch and roll the stall-evidence
             // trackers (a regen re-encodes OLD content — it is not evidence of driver progress).
@@ -2027,7 +2376,28 @@ impl Capturer for IddPushCapturer {
         true
     }
 
+    fn take_recovered_outage(&mut self) -> Option<Duration> {
+        self.recovered_outage.take()
+    }
+
+    fn health(&self) -> Option<crate::CaptureHealth> {
+        let ring = self.ring_health();
+        Some(self.recovery.report(Instant::now(), ring.as_ref()))
+    }
+
     fn recreate_ring_in_place(&mut self) -> bool {
+        // A target with no ACTIVE path cannot be recovered in place (immunity plan WP10 item 7):
+        // a same-mode reset would attach to a known-inactive display. Fail fast — on a FRESH
+        // snapshot only; a last-known-good one is not evidence either way.
+        let snap = pf_win_display::display_events::snapshot_or_query();
+        if snap.is_fresh() && !snap.target(self.ccd).is_some_and(|t| t.active) {
+            tracing::warn!(
+                target = %self.ccd,
+                "IDD push: same-mode recovery refused — the target has no active display path \
+                 (topology removed it); a topology recovery must precede a ring rebuild"
+            );
+            return false;
+        }
         // Same-mode ring recreate (trait doc: swap-chain bounce recovery) — deliberately NOT
         // routed through `resize_output`, whose same-size fast path would no-op exactly the
         // case this exists for. Same recover-or-drop arming as the resize recreate.
@@ -2089,43 +2459,6 @@ impl Drop for IddPushCapturer {
 mod tests {
     use super::stall::Stall;
     use super::*;
-
-    /// The stale-source watchdog's whole contract (WP3b): under the floor nothing happens; over
-    /// it, NO evidence stays idle (a static desktop is healthy), evidence buys exactly one
-    /// rebuild, and the next expiry is terminal — never an indefinite repeat.
-    #[test]
-    fn stale_source_watchdog_is_one_rebuild_then_terminal() {
-        let (floor, px) = (Duration::from_secs(15), 64u32);
-        let s = Duration::from_secs;
-        // Under the floor: nothing, whatever the evidence says.
-        assert_eq!(
-            stale_source_action(s(14), floor, 999, px, 5, 0),
-            StaleAction::None
-        );
-        // Over the floor with no activity evidence: plain idle — no recovery.
-        assert_eq!(
-            stale_source_action(s(60), floor, 0, px, 0, 0),
-            StaleAction::None
-        );
-        assert_eq!(
-            stale_source_action(s(60), floor, px - 1, px, 0, 0),
-            StaleAction::None
-        );
-        // Cursor motion over a frozen image, or undelivered driver offers: one rebuild…
-        assert_eq!(
-            stale_source_action(s(16), floor, px, px, 0, 0),
-            StaleAction::Rebuild
-        );
-        assert_eq!(
-            stale_source_action(s(16), floor, 0, px, 1, 0),
-            StaleAction::Rebuild
-        );
-        // …and the second expiry is terminal.
-        assert_eq!(
-            stale_source_action(s(16), floor, px, px, 0, 1),
-            StaleAction::Fail
-        );
-    }
 
     /// Every `AcquireSync` HRESULT class routes to a DISTINCT consequence (F4): timeout retries,
     /// abandoned poisons, negative fails typed — none may collapse into an ordinary no-frame.

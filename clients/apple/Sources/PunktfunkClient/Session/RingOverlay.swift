@@ -258,6 +258,13 @@ private func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> Slo
     }
 }
 
+/// The second-press prompt for a destructive slot, in the words of the input that reaches it.
+#if os(iOS)
+private let againHint = "Tap again"
+#else
+private let againHint = "Press again"
+#endif
+
 private let ringRadius: CGFloat = 120
 private let slotSize: CGFloat = 56
 private let centreSize: CGFloat = 64
@@ -520,7 +527,7 @@ struct RingOverlay: View {
         if s.armed, state.armed != s.id {
             state.warnTick &+= 1
             state.armed = s.id
-            state.hint = "\(s.label)? Tap again"
+            state.hint = "\(s.label)? \(againHint)"
             return
         }
         state.pressTick &+= 1
@@ -600,29 +607,37 @@ struct RingOverlay: View {
     }
     #endif
 
-    /// One round glass button — the exit disc's primitive, at ring size.
+    /// One round glass button — the exit disc's primitive, at ring size. On tvOS it is a plain
+    /// disc, not a Button: in-stream every press stays on the GameController path (the pad's
+    /// and the remote's `RingNav`), and a focusable Button only parked the engine's idle focus
+    /// on one slot, drawing the system platter behind it next to the pad's own highlight.
     private func slotButton(_ s: SlotSpec?, size: CGFloat, scale: CGFloat, alpha: CGFloat, armed: Bool,
                             highlighted: Bool = false, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Group {
-                if let keys = s?.keys {
-                    ChordKeycap(keys: keys)
-                } else {
-                    Image(systemName: s?.icon ?? "circle.dashed")
-                        .font(.system(size: size * 0.4, weight: .semibold))
-                }
+        let face = Group {
+            if let keys = s?.keys {
+                ChordKeycap(keys: keys)
+            } else {
+                Image(systemName: s?.icon ?? "circle.dashed")
+                    .font(.system(size: size * 0.4, weight: .semibold))
             }
-            .foregroundStyle(armed ? Color.red : (s?.enabled ?? false ? Color.white : Color.white.opacity(0.35)))
-            .frame(width: size, height: size)
-            .glassBackground(Circle(), interactive: true)
-            .overlay(Circle().strokeBorder(
-                Color.white.opacity(highlighted ? 0.85 : (armed ? 0.6 : 0.18)),
-                lineWidth: highlighted ? 2 : 1))
-            .contentShape(Circle())
         }
-        .buttonStyle(.plain)
-        // An empty slot is inert in-stream and a pick target in the editor.
-        .disabled(s == nil && editing == nil)
+        .foregroundStyle(armed ? Color.red : (s?.enabled ?? false ? Color.white : Color.white.opacity(0.35)))
+        .frame(width: size, height: size)
+        .glassBackground(Circle(), interactive: true)
+        .overlay(Circle().strokeBorder(
+            Color.white.opacity(highlighted ? 0.85 : (armed ? 0.6 : 0.18)),
+            lineWidth: highlighted ? 2 : 1))
+        .contentShape(Circle())
+        return Group {
+            #if os(tvOS)
+            face
+            #else
+            Button(action: action) { face }
+                .buttonStyle(.plain)
+                // An empty slot is inert in-stream and a pick target in the editor.
+                .disabled(s == nil && editing == nil)
+            #endif
+        }
         .scaleEffect(scale)
         .opacity(alpha)
         .accessibilityLabel(s?.label ?? "Empty slot")
@@ -715,7 +730,7 @@ extension RingOverlay {
             UserDefaults.standard.double(forKey: DefaultsKey.osdScale), for: OsdScale.deviceClass)
         var rows: [SheetRowSpec] = []
         rows.append(SheetRowSpec(header: "Session", label: "End stream",
-                                 value: state.armed == "end_stream" ? "tap again" : "") { [state] in
+                                 value: state.armed == "end_stream" ? againHint : "") { [state] in
             if state.armed == "end_stream" { state.close(); a.endStream() } else { state.warnTick &+= 1; state.armed = "end_stream" }
         })
         rows.append(SheetRowSpec(label: "Disconnect, keep the game running") { [state] in state.close(); a.disconnectLinger() })
@@ -745,7 +760,7 @@ extension RingOverlay {
                                  enabled: mic.enabled) { if mic.enabled { a.toggleMic() } })
         for (i, act) in a.hostActions().enumerated() {
             let id = "host:\(act.id)"
-            let value = !act.available ? (act.unavailableReason ?? "") : (state.armed == id ? "tap again" : "")
+            let value = !act.available ? (act.unavailableReason ?? "") : (state.armed == id ? againHint : "")
             rows.append(SheetRowSpec(header: i == 0 ? "Host" : nil, label: act.label, value: value,
                                      enabled: act.available) { [state] in
                 guard act.available else { state.refuseTick &+= 1; return }
@@ -772,37 +787,56 @@ private struct RingSheet: View {
     let rows: [SheetRowSpec]
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(rows.indices, id: \.self) { i in
-                    let r = rows[i]
-                    if let h = r.header { header(h) }
-                    Button {
-                        state.touch()
-                        state.sheetCursor = i
-                        if r.enabled { state.pressTick &+= 1 } else { state.refuseTick &+= 1 }
-                        r.tap()
-                    } label: {
-                        HStack {
-                            Text(r.label).font(.geist(15, .regular)).foregroundStyle(.white)
-                            Spacer()
-                            if !r.value.isEmpty {
-                                Text(r.value).font(.geist(15, .regular)).foregroundStyle(.white.opacity(0.7))
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(rows.indices, id: \.self) { i in
+                        let r = rows[i]
+                        if let h = r.header { header(h) }
+                        // tvOS: rows, not Buttons — the pad's cursor is the only navigation in-stream
+                        // (see `slotButton`), and a Button's idle focus drew the platter on row 0.
+                        Group {
+                            #if os(tvOS)
+                            row(r, at: i)
+                            #else
+                            Button {
+                                state.touch()
+                                state.sheetCursor = i
+                                if r.enabled { state.pressTick &+= 1 } else { state.refuseTick &+= 1 }
+                                r.tap()
+                            } label: {
+                                row(r, at: i)
                             }
+                            .buttonStyle(.plain)
+                            #endif
                         }
-                        .padding(.horizontal, 20).padding(.vertical, 12)
-                        .background(state.sheetCursor == i ? Color.white.opacity(0.12) : Color.clear)
-                        .contentShape(Rectangle())
+                        .opacity(r.enabled ? 1 : 0.45)
+                        .id(i)
                     }
-                    .buttonStyle(.plain)
-                    .opacity(r.enabled ? 1 : 0.45)
                 }
+                .padding(.vertical, 8)
             }
-            .padding(.vertical, 8)
+            // The pad walks rows the 60 % panel cannot show; the sheet follows its cursor.
+            .onChange(of: state.sheetCursor) { _, i in
+                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(i) }
+            }
         }
         .frame(maxWidth: 520)
         .glassBackground(RoundedRectangle(cornerRadius: 16))
         .padding(.horizontal, 16)
+    }
+
+    private func row(_ r: SheetRowSpec, at i: Int) -> some View {
+        HStack {
+            Text(r.label).font(.geist(15, .regular)).foregroundStyle(.white)
+            Spacer()
+            if !r.value.isEmpty {
+                Text(r.value).font(.geist(15, .regular)).foregroundStyle(.white.opacity(0.7))
+            }
+        }
+        .padding(.horizontal, 20).padding(.vertical, 12)
+        .background(state.sheetCursor == i ? Color.white.opacity(0.12) : Color.clear)
+        .contentShape(Rectangle())
     }
 
     private func header(_ text: String) -> some View {

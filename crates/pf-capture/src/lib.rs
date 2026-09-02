@@ -27,9 +27,8 @@ pub enum RingFault {
     /// producer, so the generation cannot be trusted either.
     ReleaseFailed { hr: i32, removed: i32 },
     /// A known-ACTIVE display (input/cursor moving, or the driver still offering frames)
-    /// delivered no new source frame through the stale floor and one in-place rebuild — the
-    /// interim stale-source watchdog's terminal verdict (immunity plan WP3b; retired when the
-    /// staged recovery ladder owns the decision).
+    /// delivered no new source frame through the stale floor and the staged recovery ladder
+    /// (immunity plan WP13) — its terminal verdict; `secs` is the source gap at that point.
     SourceStalled { secs: u32 },
 }
 
@@ -54,6 +53,50 @@ impl std::fmt::Display for RingFault {
 }
 
 impl std::error::Error for RingFault {}
+
+/// The capturer's live health for the operator surface (immunity plan WP18): the classifier's
+/// last verdict, the ring's self-report, and the last recovery episode. Plain data, no I/O —
+/// the management layer maps it into its wire shape. Names are the classifier's own, lowercased.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureHealth {
+    /// `healthy` / `idle` / `suspect` / `stalled` / `recovering` / `rebuilding` / `secure_desktop`.
+    pub class: &'static str,
+    /// The stall class when `class == "stalled"`: `worker` / `transport` / `conversion` /
+    /// `presentation`.
+    pub stall_class: Option<&'static str>,
+    /// Time since the last real source frame.
+    pub source_gap: std::time::Duration,
+    /// The evidence the verdict rests on: `recent_source` / `input` / `canary` / `presents`.
+    pub evidence: Option<&'static str>,
+    /// The ring's own state word (`active` / `rebuilding` / `dead` / `initializing`); `None` on a
+    /// pre-v3 driver.
+    pub ring_state: Option<&'static str>,
+    /// The fence protocol is negotiated on the current ring.
+    pub fence_ring: bool,
+    pub published_total: u64,
+    pub dropped_total: u64,
+    /// The recovery stage running now, if an episode is open.
+    pub current_stage: Option<&'static str>,
+    /// The last closed episode.
+    pub last_episode: Option<CaptureEpisode>,
+    /// Stalled verdicts refused for budget or cooldown since the last episode.
+    pub episodes_suppressed: u32,
+    /// Time left in the post-failure cooldown.
+    pub cooldown_remaining: Option<std::time::Duration>,
+}
+
+/// One closed recovery episode, as [`CaptureHealth`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureEpisode {
+    pub stall_class: &'static str,
+    pub recovered: bool,
+    pub took: std::time::Duration,
+    /// `(stage, outcome, took)` in ladder order; `outcome` is `applied` / `failed` /
+    /// `unsupported` / `timed_out`.
+    pub stages: Vec<(&'static str, &'static str, std::time::Duration)>,
+    pub consecutive_failures: u32,
+    pub cooldown: std::time::Duration,
+}
 // The Linux capturer reaches `DmabufFrame` through `super::`; `CursorOverlay` it names directly as
 // `pf_frame::CursorOverlay`, so only `DmabufFrame` needs to sit in this crate root's scope.
 #[cfg(target_os = "linux")]
@@ -173,6 +216,20 @@ pub trait Capturer: Send {
     /// so the two-strike debounce never trips. `true` handled; `false` unrecoverable.
     fn recreate_ring_in_place(&mut self) -> bool {
         false
+    }
+
+    /// A staged-recovery episode closed on new source frames since the last
+    /// call: the measured local outage, from the last source frame before the
+    /// stall to the frame that proved recovery. The stream loop forces an IDR
+    /// and announces the gap. `None` = nothing recovered.
+    fn take_recovered_outage(&mut self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Live capture health for the operator surface (WP18). `None` = this
+    /// capturer does not classify (Linux portal, synthetic sources).
+    fn health(&self) -> Option<CaptureHealth> {
+        None
     }
 }
 
@@ -461,7 +518,7 @@ pub type HidKickFn = fn((i32, i32, i32, i32), (i32, i32, i32, i32)) -> bool;
 /// success the driver owns the handles duplicated into WUDFHost.
 #[cfg(target_os = "windows")]
 pub type FrameChannelSender = std::sync::Arc<
-    dyn Fn(&pf_driver_proto::control::SetFrameChannelRequest) -> Result<()> + Send + Sync,
+    dyn Fn(&pf_driver_proto::control::SetFrameChannelRequestV2) -> Result<()> + Send + Sync,
 >;
 
 /// v5 hardware-cursor channel (`IOCTL_SET_CURSOR_CHANNEL`) — same facade

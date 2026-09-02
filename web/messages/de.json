@@ -90,6 +90,8 @@
 	"stream_fps": "Bildrate",
 	"stream_first_frame": "Erstes Bild",
 	"stream_last_resize": "Letzte Größenänderung",
+	"stream_capture_health": "Aufnahmezustand",
+	"stream_last_recovery": "Letzte Wiederherstellung",
 	"stream_packet_size": "Paketgröße",
 	"stream_min_fec": "FEC-Minimum",
 	"stream_bitrate": "Bitrate",

@@ -16,19 +16,8 @@
     "displayName": "Punktfunk",
     "description": "One bar icon and one panel: what is streaming, who is asking to pair, and which devices are trusted.",
     "category": "System",
+    "defaultSection": "right",
     "aliases": ["punktfunk", "streaming"],
-    "allowMultiple": false,
-    "defaults": {
-      "toasts": true
-    },
-    "schema": [
-      {
-        "key": "toasts",
-        "type": "boolean",
-        "label": "Notify on pairing requests",
-        "defaultValue": true,
-        "description": "Pop an Omarchy notification when a device asks to pair. The panel is where you approve it either way."
-      }
-    ]
+    "allowMultiple": false
   }
 }

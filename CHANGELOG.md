@@ -53,6 +53,84 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   authored against — surfaced in the GTK dialog and the console home, with
   `PUNKTFUNK_OSD_SCALE` demoted to an override. A store written before this loads as Automatic.
   Nothing crosses the wire; the host never sees it.
+- **Capture health on the Status page and in `GET /api/v1/status`.** A native Windows session's
+  `session.capture` block carries the live capture-health class (`healthy`, `idle`, `suspect`,
+  `stalled` with its class, `recovering`, `rebuilding`, `secure_desktop`), the evidence behind
+  it, the ring's own state and whether the fence-ring protocol is negotiated, the stage running
+  now, and the last staged-recovery episode (stall class, recovered or not, each rung's outcome
+  and time, cooldown). A host-wide `display` block reports the topology generation, the last
+  topology transaction and the outstanding monitor-devnode leases. The console's session card
+  shows the class and the last recovery line, so a freeze is read there instead of grepped
+  out of the logs.
+- **Windows connector and PnP mutations are leases.** Every monitor devnode the stream disables
+  is journaled before the mutation as a lease naming the node, its prior state, which selector
+  picked it (the default standby-sink treatment stays limited to displays that were dark before
+  the acquire; the opt-in path over displays the isolate switched off is tagged apart) and the
+  topology generation of the acquire transaction that owns it; a node the operator had already
+  disabled is never touched. The AMD EDID lock records the connectors it pinned and unlocks only
+  those, leaving a pre-existing emulation pin alone. The acquire isolate itself now runs as a
+  topology transaction. Older journals from a previous host still recover.
+- **Three Windows launch kinds: `uplay`, `amazon` and `battlenet`.** A library plugin publishes
+  a validated store id and the host builds the launch itself: `explorer.exe "uplay://launch/<id>/0"`,
+  `explorer.exe "amazon-games://play/<id>"`, and `Battle.net.exe --exec="launch <code>"`. All three
+  are open to the plugin lane; nothing to do unless you write a plugin. A cold Battle.net client
+  only opens itself on the first launch, so keep it running or pick the tile twice.
+- **`defineLibraryPlugin` takes a `launch` resolver** (`@punktfunk/plugin-kit` 0.4.5). A library
+  plugin can publish `kind: "plugin"` tiles and answer the host's launch-time ask without composing
+  its own UI server; plugins on 0.4.4 are unaffected.
+- **Six new library sources ship as plugins**: Ubisoft Connect, Amazon Games and Battle.net on
+  Windows; desktop entries and Flatpak, Bottles and itch.io on Linux, itch.io on Windows too.
+  Install them from the console's Game sources once they reach the catalog.
+- **Topology writes are transactions with an observed outcome.** `topology_churn::begin` /
+  `finish` name a mutation, hold descriptor-following for its deadline, and bump a topology
+  generation only when the verification read saw a change; `isolate_displays_ccd_checked`
+  reports Verified / NothingActive / Unverified instead of a snapshot that hides a failed isolate.
+  The exclusive re-assert watchdog bumps the stream's recovery generation only on an observed
+  change, and after four consecutive fights concedes the fixed cadence (2 s doubling to 60 s).
+  Descriptor samples name the generation they were taken under, so two strikes straddling a
+  transaction never pass the debounce, and a same-mode ring recovery refuses a target with no
+  active display path.
+- **`pf_frame::recovery` sequences staged recovery.** A pure coordinator opens one episode per
+  `Stalled` verdict and walks the ladder EncoderReset, RingReset, SwapChainReset,
+  PresentationReset, MonitorCycle, DriverCycle, CaptureFallback from the class's first actuator,
+  running each stage once under a deadline; a stage that applied still has to prove itself with
+  three new source sequences (republishes and cursor regens never count). Four episodes per ten
+  minutes, a doubling cooldown after failed ones (10 s to 5 min), one summary per episode, and
+  `owns_episode` so passive descriptor reactions stand down. Actuators wire in with WP6/WP7/WP14.
+- **IDD-push fence-ring protocol layer (`pf_driver_proto::frame::fence`).** A v4 header appends
+  a 32-byte per-slot record (state, seq, producer-ready and consumer-retire fence values) after
+  the v3 tail; `SetFrameChannelRequestV2` carries the two shared fence handles behind the v1
+  request as an exact prefix, on the same IOCTL. Pure claim/pick rules (free, else oldest
+  published, else drop; newest-wins consume with older publishes freed) and a randomized
+  two-party trace test. The pf-vdisplay driver implements its arm: it opens delivered fences
+  with `ID3D11Device5::OpenSharedFence`, advertises `CAP_FENCE_RING` when that succeeds, and
+  runs the fence protocol only where the host advertised it too (CAS claim, GPU `Wait` on the
+  consumer-retire value, copy, `Signal` producer-ready, then PUBLISHED); the v2 request is told
+  from v1 by input length. The host arm: every ring carries two fresh shared fences per
+  generation; the first ring on a box is a keyed-mutex probe, the attach teaches whether the driver
+  opened the fences (remembered process-wide), and a capable driver's probe ring is rebuilt on the
+  fence protocol before the first frame flows. The consumer takes the newest published slot from
+  the table, frees older and foreign-generation records, GPU-waits producer-ready, converts, and
+  signals consumer-retire before freeing the slot. A pre-D3D11.4 device or a driver without fences
+  keeps the keyed-mutex arm.
+  from v1 by input length. The host arm follows; until then every ring stays on the keyed mutex.
+  two-party trace test. Both sides still run the keyed-mutex ring; the driver and host arms
+  that negotiate `CAP_FENCE_RING` follow.
+- **`pf_win_display` has a display actor with a cached snapshot.** The display-events pump now
+  owns the CCD inventory read for hot paths: every `WM_DISPLAYCHANGE` / device broadcast schedules
+  one coalesced refresh (150 ms) instead of querying inside the window procedure, a 15 s safety
+  timer covers a missed broadcast, and a failed query keeps the last-known-good snapshot labelled
+  with its age and backs off (1 s doubling to 15 s). `display_events::{snapshot, request_refresh,
+  wait_for_change, refresh_and_wait}` are the API; `TargetInventory` gains `hdr`, `source_id` and
+  `source_adapter_luid`, and `CcdTargetKey` / `TargetInventory` move to the platform-neutral
+  `snapshot` module (re-exported from `win_display`).
+- **Hot display readers take the snapshot, not the display-config lock.** The descriptor poller
+  (HDR flag + active mode), the cursor poller's target rect, the compose kick's geometry, the
+  absolute-input stream rect, the scanline probe's retarget, the exclusive re-assert watchdog and
+  the management monitor listing all read `display_events::snapshot`; the watchdog wakes on a
+  topology generation instead of polling. At rest a session makes zero CCD reads beyond the
+  actor's 15 s safety refresh. The host starts the actor at `serve`, and a not-yet-started actor
+  falls back to one direct read (`snapshot_or_query`).
 - **IDD-push shared header v3 carries ring health.** The 88-byte header grows a 64-byte tail:
   a health state (`Initializing`/`Active`/`Rebuilding`/`Dead`), driver and host capability
   words negotiated by intersection, assignment and D3D-device epochs, a source sequence that
@@ -125,6 +203,16 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **`inhibit_shortcuts` applies under the desktop mouse model on the Apple client.** It gated the
   ⌘-chord passthrough and the system-shortcut tap on the capture model only, unlike the SDL
   clients; turn the setting off to keep the chords local.
+- **Pairing toasts fire once, on a live knock only.** The event stream closes its ring replay
+  with one `event: live` frame, the console and `ctl watch` stay quiet before it, and the Omarchy
+  panel leaves the toast to the `pairing-pending` hook. A `ctl watch` consumer that wants the
+  replay passes `--since 0`.
+- **Menu backs out of every tvOS screen: the Shortcuts page, the connect takeover and a drilled
+  library shelf, and the quick-action ring shows one highlight.** Nothing to do; the Siri Remote
+  now drives the ring too (swipe steps, click fires, Play/Pause recentres, Back closes).
+- **The Siri Remote pointer no longer jumps toward wherever the surface is touched.** Contact
+  and lift now come from the surface's touch report and the first 60 ms after contact are
+  dropped, so only a swipe moves the host cursor; nothing to do.
 
 ### Fixed
 

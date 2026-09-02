@@ -142,6 +142,7 @@ impl ChannelBroker {
         header: HANDLE,
         event: HANDLE,
         slots: &[HostSlot],
+        fences: Option<(HANDLE, HANDLE)>,
     ) -> Result<()> {
         // Error, not `debug_assert`: a release-build panic inside `duplicate_and_deliver`
         // unwinds past the reap below and leaks every planted WUDFHost duplicate. Refuse
@@ -153,26 +154,36 @@ impl ChannelBroker {
                 control::RING_LEN_USIZE
             );
         }
-        let mut req = control::SetFrameChannelRequest {
-            target_id,
-            generation,
-            ring_len: slots.len() as u32,
-            // The section really is this large (open.rs allocates `size_of::<SharedHeader>()`), which
-            // is what lets a v3 driver touch the ring-health tail (`frame::v3_readable`).
-            header_bytes: pf_driver_proto::frame::HEADER_V3_SIZE as u32,
-            header_handle: 0,
-            event_handle: 0,
-            texture_handles: [0; control::RING_LEN_USIZE],
+        let mut req = control::SetFrameChannelRequestV2 {
+            v1: control::SetFrameChannelRequest {
+                target_id,
+                generation,
+                ring_len: slots.len() as u32,
+                // The declared section size: the v4 layout (slot table) when fences ride along,
+                // else v3 — the driver gates every tail access on version AND this.
+                header_bytes: if fences.is_some() {
+                    pf_driver_proto::frame::fence::HEADER_V4_SIZE as u32
+                } else {
+                    pf_driver_proto::frame::HEADER_V3_SIZE as u32
+                },
+                header_handle: 0,
+                event_handle: 0,
+                texture_handles: [0; control::RING_LEN_USIZE],
+            },
+            ready_fence_handle: 0,
+            retire_fence_handle: 0,
         };
-        // SAFETY: `header`/`event` are live per this fn's contract; each slot's `shared` is
-        // the live `OwnedHandle` the slot keeps for this duplication.
-        let result = unsafe { self.duplicate_and_deliver(&mut req, header, event, slots) };
+        // SAFETY: `header`/`event`/`fences` are live per this fn's contract; each slot's `shared`
+        // is the live `OwnedHandle` the slot keeps for this duplication.
+        let result = unsafe { self.duplicate_and_deliver(&mut req, header, event, slots, fences) };
         if result.is_err() {
-            self.close_remote(req.header_handle);
-            self.close_remote(req.event_handle);
-            for v in req.texture_handles {
+            self.close_remote(req.v1.header_handle);
+            self.close_remote(req.v1.event_handle);
+            for v in req.v1.texture_handles {
                 self.close_remote(v);
             }
+            self.close_remote(req.ready_fence_handle);
+            self.close_remote(req.retire_fence_handle);
         }
         result
     }
@@ -184,19 +195,25 @@ impl ChannelBroker {
     /// As [`Self::send`].
     unsafe fn duplicate_and_deliver(
         &self,
-        req: &mut control::SetFrameChannelRequest,
+        req: &mut control::SetFrameChannelRequestV2,
         header: HANDLE,
         event: HANDLE,
         slots: &[HostSlot],
+        fences: Option<(HANDLE, HANDLE)>,
     ) -> Result<()> {
-        // SAFETY: forwarded from the caller — `header`/`event`/each `slot.shared` are live
-        // handles of this process. `sender`'s live control-handle precondition is upheld by
+        // SAFETY: forwarded from the caller — `header`/`event`/each `slot.shared`/the fences are
+        // live handles of this process. `sender`'s live control-handle precondition is upheld by
         // the host facade that built it.
         unsafe {
-            req.header_handle = self.dup_into(header, Some(SECTION_MAP_RW))?;
-            req.event_handle = self.dup_into(event, Some(EVENT_MODIFY_STATE))?;
+            req.v1.header_handle = self.dup_into(header, Some(SECTION_MAP_RW))?;
+            req.v1.event_handle = self.dup_into(event, Some(EVENT_MODIFY_STATE))?;
             for (k, s) in slots.iter().enumerate() {
-                req.texture_handles[k] = self.dup_into(HANDLE(s.shared.as_raw_handle()), None)?;
+                req.v1.texture_handles[k] =
+                    self.dup_into(HANDLE(s.shared.as_raw_handle()), None)?;
+            }
+            if let Some((ready, retire)) = fences {
+                req.ready_fence_handle = self.dup_into(ready, None)?;
+                req.retire_fence_handle = self.dup_into(retire, None)?;
             }
             (self.sender)(req)
         }

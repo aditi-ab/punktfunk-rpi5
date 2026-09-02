@@ -57,45 +57,9 @@ use windows::Win32::Graphics::Gdi::{
 
 use punktfunk_core::Mode;
 
-/// Complete Windows display-target identity. Target ids are only unique PER ADAPTER, so a helper
-/// that selects a path from a bare `u32` can resolve, isolate, move, or change HDR on a different
-/// adapter's same-numbered target on a hybrid box. Every public helper in this module that picks
-/// a path takes this key. The packed LUID matches `pf_frame::dxgi::pack_luid` (asserted by a
-/// cross-crate test in pf-capture).
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CcdTargetKey {
-    /// Packed adapter LUID (`(HighPart << 32) | (LowPart & 0xffff_ffff)`).
-    pub adapter_luid: i64,
-    pub target_id: u32,
-}
-
-impl CcdTargetKey {
-    pub fn new(adapter_luid: i64, target_id: u32) -> Self {
-        Self {
-            adapter_luid,
-            target_id,
-        }
-    }
-
-    /// Build from the split LUID the OS structs carry.
-    pub fn from_luid_parts(low: u32, high: i32, target_id: u32) -> Self {
-        Self {
-            adapter_luid: pack_luid_parts(low, high),
-            target_id,
-        }
-    }
-}
-
-impl std::fmt::Display for CcdTargetKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{:x}", self.target_id, self.adapter_luid)
-    }
-}
-
-/// The LUID packing every key uses — one formula, identical to `pf_frame::dxgi::pack_luid`.
-pub fn pack_luid_parts(low: u32, high: i32) -> i64 {
-    ((high as i64) << 32) | (low as i64 & 0xffff_ffff)
-}
+// The identity + inventory types live in the platform-neutral `snapshot` module (WP8) so the
+// cache rules test everywhere; re-exported here so every existing `win_display::` path still works.
+pub use crate::snapshot::{pack_luid_parts, CcdTargetKey, TargetInventory};
 
 /// The key of the TARGET side of a CCD path.
 pub(crate) fn path_target_key(p: &DISPLAYCONFIG_PATH_INFO) -> CcdTargetKey {
@@ -834,42 +798,6 @@ pub fn count_other_active(keep: &[CcdTargetKey]) -> Option<u32> {
     )
 }
 
-/// One connected target from a `QDC_ALL_PATHS` sweep. `external_physical` and
-/// `internal_panel` are the disturbance suspects (standby TV link-probe, dark
-/// eDP servicing). Indirect/virtual targets, including ours, are never suspects.
-pub struct TargetInventory {
-    /// Complete identity — target ids are only unique per adapter, so every selector keys on this.
-    pub key: CcdTargetKey,
-    /// The bare target id, for LOGS and display only — never select a path from it.
-    pub target_id: u32,
-    pub active: bool,
-    /// HDMI/DP/DVI/… — candidate for standby link-probe churn.
-    pub external_physical: bool,
-    /// eDP/LVDS/embedded — candidate for dark-head servicing when exclusive
-    /// isolate leaves the laptop panel connected-but-inactive.
-    pub internal_panel: bool,
-    pub tech: &'static str,
-    /// Empty when the EDID carries none.
-    pub friendly: String,
-    /// Maps to the PnP instance id (`monitor_devnode`).
-    pub monitor_device_path: String,
-    /// Ours ([`is_our_virtual_display`]) — the connector class cannot tell.
-    pub ours: bool,
-    /// Empty when inactive (no source).
-    pub gdi_name: String,
-    /// Pixels. All zero when inactive: CCD mode indices are only valid for
-    /// active paths.
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-    /// mHz (60000 = 60 Hz) from the path's `refreshRate` rational. 0 when
-    /// the path reports no rate.
-    pub refresh_mhz: u32,
-    /// Desktop origin sits on this head — Windows' "primary".
-    pub primary: bool,
-}
-
 /// EDID manufacturer id as it appears in the CCD path (`\\?\DISPLAY#PNK…`).
 /// Driver stamps `"PNK"` into EDID bytes 8-9 (`pf-vdisplay` `edid.rs`).
 const PF_EDID_MANUFACTURER: &str = "PNK";
@@ -912,11 +840,17 @@ fn utf16z_str(buf: &[u16]) -> String {
 }
 
 /// Connected targets (`QDC_ALL_PATHS`, unique by adapter+id). Read-only CCD;
-/// can serialize on the display-config lock — keep it off the capture thread.
+/// can serialize on the display-config lock — keep it off the capture thread. Empty on a failed
+/// query; the actor ([`crate::display_events`]) uses [`target_inventory_checked`] to tell that
+/// apart from an empty topology.
 pub fn target_inventory() -> Vec<TargetInventory> {
-    let Ok((paths, modes)) = query_display_config(QDC_ALL_PATHS) else {
-        return Vec::new();
-    };
+    target_inventory_checked().unwrap_or_default()
+}
+
+/// [`target_inventory`] with the query failure kept distinct from "no targets" (`Err`) — the
+/// display actor keeps its last-known-good snapshot on `Err` and publishes an empty one on `Ok`.
+pub fn target_inventory_checked() -> Result<Vec<TargetInventory>, CcdError> {
+    let (paths, modes) = query_display_config(QDC_ALL_PATHS)?;
     // Targets driven by an ACTIVE path, by complete key (target ids are only unique per adapter).
     let active: Vec<CcdTargetKey> = paths
         .iter()
@@ -956,7 +890,25 @@ pub fn target_inventory() -> Vec<TargetInventory> {
         // Inactive paths have INVALID modeInfoIdx — stay zeroed, do not index 0xffffffff.
         let (mut gdi_name, mut x, mut y, mut width, mut height) =
             (String::new(), 0i32, 0i32, 0u32, 0u32);
+        let (mut hdr, mut source_id, mut source_adapter_luid) = (None, 0u32, 0i64);
         if is_active {
+            source_id = p.sourceInfo.id;
+            source_adapter_luid = pack_luid_parts(
+                p.sourceInfo.adapterId.LowPart,
+                p.sourceInfo.adapterId.HighPart,
+            );
+            let mut ac = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
+            ac.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+            ac.header.size = size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
+            ac.header.adapterId = t.adapterId;
+            ac.header.id = t.id;
+            // SAFETY: `header.size` is this struct's size_of; the OS may touch that many bytes.
+            // The local outlives this synchronous call.
+            if unsafe { DisplayConfigGetDeviceInfo(&mut ac.header) } == 0 {
+                // SAFETY: POD union — `value` overlays a same-sized bitfield. Bit 1 =
+                // advancedColorEnabled (the same read as `advanced_color_enabled`).
+                hdr = Some((unsafe { ac.Anonymous.value } & 0x2) != 0);
+            }
             // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
             // every bit pattern is valid. Bounds-checked index below.
             let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
@@ -1004,9 +956,12 @@ pub fn target_inventory() -> Vec<TargetInventory> {
             width,
             height,
             refresh_mhz,
+            hdr,
+            source_id,
+            source_adapter_luid,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Crash-recovery journal for exclusive isolate: a marker so a fresh host can
@@ -1235,6 +1190,30 @@ pub mod isolate_journal {
 // pub so vdisplay::pf_vdisplay can reuse this backend-neutral CCD isolation helper
 // (it operates on real OS target ids — a pf-vdisplay monitor's target_id qualifies).
 pub fn isolate_displays_ccd(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
+    isolate_displays_ccd_checked(keep).map(|(saved, _)| saved)
+}
+
+/// What [`isolate_displays_ccd_checked`] observed — the truthful input a re-assert watchdog or a
+/// recovery generation needs (immunity plan WP10 item 4: a recovery generation moves only after
+/// an OBSERVED change, never because a `SetDisplayConfig` was attempted).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsolateOutcome {
+    /// The verification read showed only the keep set active. `deactivated` is how many paths
+    /// THIS call switched off on the successful attempt (0 = the desktop already matched).
+    Verified { attempts: u32, deactivated: u32 },
+    /// No display path was active at all — nothing to isolate.
+    NothingActive,
+    /// Every attempt left a non-keep path active or its verification read failed: state UNKNOWN.
+    Unverified { attempts: u32 },
+}
+
+/// [`isolate_displays_ccd`] with the outcome kept distinct from the restore snapshot: `None` only
+/// when the initial CCD read failed (nothing was attempted); otherwise the pre-isolate config plus
+/// what the verification observed. Callers that mutate on the strength of the result (the
+/// exclusive re-assert watchdog) read the outcome; acquire keeps the `Option<SavedConfig>` shape.
+pub fn isolate_displays_ccd_checked(
+    keep: &[CcdTargetKey],
+) -> Option<(SavedConfig, IsolateOutcome)> {
     // Snapshot the ORIGINAL active config ONCE for restore-on-teardown, before any changes.
     let saved = query_active_config()?;
 
@@ -1245,7 +1224,7 @@ pub fn isolate_displays_ccd(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
             "display isolate (CCD): no display path is active — nothing to isolate for target set \
              {keep:?} (every panel off/standby, or a headless host)"
         );
-        return Some(saved);
+        return Some((saved, IsolateOutcome::NothingActive));
     }
 
     // Journal what we are about to switch off BEFORE the first apply, not after a verified one: the
@@ -1341,7 +1320,13 @@ pub fn isolate_displays_ccd(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
                 tracing::info!(
                     "display isolate (CCD): target set {keep:?} is the SOLE active desktop (attempt {attempt}/4, deactivated {others}, rc={rc:#x})"
                 );
-                return Some(saved);
+                return Some((
+                    saved,
+                    IsolateOutcome::Verified {
+                        attempts: attempt,
+                        deactivated: others,
+                    },
+                ));
             }
             Some(survivors) => tracing::warn!(
                 "display isolate (CCD): {survivors} display(s) STILL active after attempt {attempt}/4 (deactivated {others}, rc={rc:#x}) — re-querying + retrying"
@@ -1362,7 +1347,7 @@ pub fn isolate_displays_ccd(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
         "display isolate (CCD): failed to isolate target set {keep:?} after 4 attempts — still active or unverifiable: [{}] (field-reported exclusive-mode bug)",
         survivors.join(", ")
     );
-    Some(saved)
+    Some((saved, IsolateOutcome::Unverified { attempts: 4 }))
 }
 
 // Do not add an eviction without SDC_FORCE_MODE_ENUMERATION: a topology change
@@ -1974,6 +1959,40 @@ mod live_tests {
              makes isolate_displays_ccd yield None on a perfectly healthy machine",
         );
         tracing::info!("live CCD query: {n} active display path(s)");
+    }
+
+    /// LIVE (console session, `PUNKTFUNK_CONFIG_DIR` at a journal a killed host left behind):
+    /// the isolate journal's startup leg relights the desktop — afterwards an external physical
+    /// panel is active and the marker is gone. The S4/WP11 kill-recovery gate; a box with no
+    /// leftover passes on the panel check alone.
+    #[test]
+    #[ignore = "hardware: writes the live display topology; needs a console session"]
+    fn live_startup_recover_relights_the_desktop_after_a_kill() {
+        let pending = isolate_journal::pending();
+        eprintln!("isolate journal before: {pending:?}");
+        isolate_journal::startup_recover();
+        assert!(
+            isolate_journal::pending().is_none(),
+            "the isolate marker must be cleared by the replay"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let inv = target_inventory();
+            let lit: Vec<_> = inv
+                .iter()
+                .filter(|t| t.active && t.external_physical)
+                .map(|t| (t.target_id, t.friendly.clone()))
+                .collect();
+            if !lit.is_empty() {
+                eprintln!("physical panel(s) active after the replay: {lit:?}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no external physical panel came back within 8 s of the replay: {inv:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
     }
 }
 

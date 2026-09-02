@@ -1,36 +1,45 @@
-//! OS display-event listener for capture-stall attribution.
+//! The display ACTOR (vdisplay immunity plan WP8, decision D6) and the OS display-event listener.
 //!
-//! The IDD-push capturer can report that DWM stopped composing on a period, not why. This thread
-//! timestamps the three user-mode signals Windows exposes:
+//! One thread owns the hidden window that receives the three user-mode display signals Windows
+//! exposes, and it is the only place that reads the CCD inventory for the hot paths:
 //!
 //! - `WM_DEVICECHANGE` + `RegisterDeviceNotificationW(GUID_DEVINTERFACE_MONITOR)`: monitor
 //!   interface arrival/removal, including devnode churn that leaves topology unchanged.
 //! - `DBT_DEVNODES_CHANGED`: PnP-tree churn with no payload.
 //! - `WM_DISPLAYCHANGE`: a mode/topology commit reached the desktop. Absence is a signal: a
 //!   probe with no mode delta does not fire this.
+//! - `EVENT_SYSTEM_DESKTOPSWITCH` (WinEvent): the input desktop moved (UAC / lock / logon and
+//!   back). Not logged; it refreshes [`crate::secure_desktop`] for the capturer's cursor guard.
 //!
 //! A driver-internal probe (EDID/DDC, DP retrain) emits none of these. Pair that silence with
 //! metronomic stalls to tell a KMD-below-OS sink from a Windows re-enumeration.
 //!
-//! CCD inventory is cached on each event and a slow timer so the capture thread can name
-//! connected-but-inactive physicals without taking the display-config lock (that lock is what
-//! stalls during churn).
+//! Every event schedules ONE coalesced refresh ([`snapshot::COALESCE`]) rather than querying
+//! inside the window procedure; a slow safety timer covers a missed broadcast; a failed query
+//! keeps the last-known-good [`DisplaySnapshot`] labelled with its age and backs off. Readers take
+//! [`snapshot`] (an `Arc`, never the display-config lock) or wait on [`wait_for_change`]; a
+//! caller that just mutated the topology asks for [`refresh_and_wait`].
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, Once, OnceLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Devices::Display::GUID_DEVINTERFACE_MONITOR;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
-    RegisterDeviceNotificationW, SetTimer, DBT_DEVICEARRIVAL, DBT_DEVICEREMOVECOMPLETE,
-    DBT_DEVNODES_CHANGED, DBT_DEVTYP_DEVICEINTERFACE, DEVICE_NOTIFY_WINDOW_HANDLE,
-    DEV_BROADCAST_DEVICEINTERFACE_W, DEV_BROADCAST_HDR, MSG, WINDOW_EX_STYLE, WM_DEVICECHANGE,
-    WM_DISPLAYCHANGE, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostMessageW,
+    RegisterClassW, RegisterDeviceNotificationW, SetTimer, DBT_DEVICEARRIVAL,
+    DBT_DEVICEREMOVECOMPLETE, DBT_DEVNODES_CHANGED, DBT_DEVTYP_DEVICEINTERFACE,
+    DEVICE_NOTIFY_WINDOW_HANDLE, DEV_BROADCAST_DEVICEINTERFACE_W, DEV_BROADCAST_HDR,
+    EVENT_SYSTEM_DESKTOPSWITCH, MSG, WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT, WM_APP,
+    WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
+
+use crate::snapshot::{self, DisplaySnapshot, SnapshotCache};
 
 #[derive(Clone)]
 pub struct DisplayEvent {
@@ -62,23 +71,40 @@ impl DisplayEventKind {
 
 struct State {
     events: VecDeque<DisplayEvent>,
-    inventory: Vec<crate::win_display::TargetInventory>,
+    cache: SnapshotCache,
 }
 
 /// 128 ≈ 1 min at a 2 s probe cycle with ≤4 events each. The correlator only reads the last gap.
 const RING_CAP: usize = 128;
 
-fn state() -> &'static Mutex<State> {
-    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+/// The slow safety refresh (timer 1) and the coalescing one-shot (timer 2) — see `snapshot`.
+const TIMER_SAFETY: usize = 1;
+const TIMER_COALESCE: usize = 2;
+/// Posted by [`request_refresh`] from any thread; the pump coalesces it like an OS event.
+const WM_PF_REFRESH: u32 = WM_APP + 0x50;
+
+/// The pump's window, once created (0 until then / if bring-up failed).
+static HWND_CELL: AtomicIsize = AtomicIsize::new(0);
+
+fn state() -> &'static (Mutex<State>, Condvar) {
+    static STATE: OnceLock<(Mutex<State>, Condvar)> = OnceLock::new();
     STATE.get_or_init(|| {
-        Mutex::new(State {
-            events: VecDeque::with_capacity(RING_CAP),
-            inventory: Vec::new(),
-        })
+        (
+            Mutex::new(State {
+                events: VecDeque::with_capacity(RING_CAP),
+                cache: SnapshotCache::new(Instant::now()),
+            }),
+            Condvar::new(),
+        )
     })
 }
 
-/// Window or registration failure leaves the ring empty; streaming continues.
+fn lock() -> std::sync::MutexGuard<'static, State> {
+    state().0.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Window or registration failure leaves the ring empty and the snapshot at generation 0;
+/// streaming continues on the legacy direct readers.
 pub fn spawn_once() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -94,8 +120,79 @@ pub fn spawn_once() {
     });
 }
 
+/// The current snapshot — the hot read. Generation 0 (empty) until the actor's first query lands;
+/// check [`DisplaySnapshot::is_fresh`] / [`DisplaySnapshot::age`] before treating it as a
+/// verification.
+pub fn snapshot() -> Arc<DisplaySnapshot> {
+    lock().cache.current()
+}
+
+/// Ask the actor for a refresh (coalesced with any pending event). Fire-and-forget; pair with
+/// [`wait_for_change`] or use [`refresh_and_wait`] to observe the result. No-op before the
+/// window exists.
+pub fn request_refresh() {
+    let hwnd = HWND_CELL.load(Ordering::Acquire);
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: `hwnd` is the pump's live window (stored after creation, never destroyed while the
+    // process runs); PostMessageW only queues a message for that thread.
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(hwnd as *mut core::ffi::c_void)),
+            WM_PF_REFRESH,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
+/// Block until a snapshot with a generation above `seen` is published, or `timeout` elapses.
+/// Returns the newest snapshot either way (`None` only if the actor never started).
+pub fn wait_for_change(seen: u64, timeout: Duration) -> Option<Arc<DisplaySnapshot>> {
+    if HWND_CELL.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let (m, cv) = state();
+    let guard = m.lock().unwrap_or_else(|e| e.into_inner());
+    let (guard, _) = cv
+        .wait_timeout_while(guard, timeout, |st| st.cache.generation() <= seen)
+        .unwrap_or_else(|e| e.into_inner());
+    Some(guard.cache.current())
+}
+
+/// Refresh now and return the resulting snapshot (or the newest one if `timeout` elapses first).
+/// The call a topology MUTATOR makes after its `SetDisplayConfig`, so its verification reads the
+/// post-commit state without touching the display-config lock itself.
+pub fn refresh_and_wait(timeout: Duration) -> Option<Arc<DisplaySnapshot>> {
+    let seen = lock().cache.generation();
+    request_refresh();
+    wait_for_change(seen, timeout)
+}
+
+/// The snapshot, or — before the actor has published its first one (generation 0: not spawned
+/// yet, or bring-up failed) — a one-off inventory read on the CALLER's thread, unpublished. For
+/// the cold, non-hot readers (management listing, pre-mutation baselines, probe retargeting)
+/// that must answer even when no session ever started the actor.
+pub fn snapshot_or_query() -> Arc<DisplaySnapshot> {
+    let snap = snapshot();
+    if snap.generation > 0 {
+        return snap;
+    }
+    let now = Instant::now();
+    match crate::win_display::target_inventory_checked() {
+        Ok(targets) => Arc::new(DisplaySnapshot {
+            generation: 0,
+            taken_at: now,
+            failures: 0,
+            targets: Arc::from(targets),
+        }),
+        Err(_) => snap,
+    }
+}
+
 pub fn events_between(from: Instant, to: Instant) -> Vec<DisplayEvent> {
-    let st = state().lock().unwrap();
+    let st = lock();
     st.events
         .iter()
         .filter(|e| e.at >= from && e.at <= to)
@@ -130,26 +227,14 @@ pub fn summarize(events: &[DisplayEvent]) -> String {
     out.join(", ")
 }
 
-/// External standby sinks and the laptop panel Exclusive isolate deactivated. Both get the same
-/// ~2 s driver-level probe. Virtual/indirect targets stay out. Never takes the CCD lock.
+/// External standby sinks and the laptop panel Exclusive isolate deactivated, from the cached
+/// snapshot. Never takes the CCD lock.
 pub fn connected_inactive_physicals() -> Vec<String> {
-    let st = state().lock().unwrap();
-    st.inventory
-        .iter()
-        .filter(|t| (t.external_physical || t.internal_panel) && !t.active)
-        .map(|t| {
-            let name = if t.friendly.is_empty() && t.internal_panel {
-                "laptop panel"
-            } else {
-                &t.friendly
-            };
-            format!("{} ({})", name, t.tech)
-        })
-        .collect()
+    snapshot().connected_inactive_physicals()
 }
 
 fn push_event(kind: DisplayEventKind, detail: Option<String>) {
-    let mut st = state().lock().unwrap();
+    let mut st = lock();
     if st.events.len() >= RING_CAP {
         st.events.pop_front();
     }
@@ -160,15 +245,65 @@ fn push_event(kind: DisplayEventKind, detail: Option<String>) {
     });
 }
 
-fn refresh_inventory() {
-    let inv = crate::win_display::target_inventory();
-    if !inv.is_empty() {
-        state().lock().unwrap().inventory = inv;
+/// The one live inventory read. Publishes a fresh snapshot on success (an empty topology
+/// included); on failure keeps the last-known-good, stamps the failure, and re-arms the coalesce
+/// timer with the backoff delay so the retry never storms a display-config lock that is busy.
+fn refresh_inventory(hwnd: HWND) {
+    let started = Instant::now();
+    let result = crate::win_display::target_inventory_checked();
+    let now = Instant::now();
+    // The display-config lock diagnostic the descriptor poller used to carry: a healthy inventory
+    // read is sub-millisecond; tens of milliseconds means something holds the lock (topology
+    // churn, display-poller software). Rate-limited to one line per 10 s.
+    static LAST_SLOW: Mutex<Option<Instant>> = Mutex::new(None);
+    let took = now.saturating_duration_since(started);
+    if took >= Duration::from_millis(50) {
+        let mut last = LAST_SLOW.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+            *last = Some(now);
+            tracing::warn!(
+                took_ms = took.as_millis() as u64,
+                "slow display-descriptor poll — something is holding the Windows display-config \
+                 lock (topology churn / display-poller software); on a host with periodic stream \
+                 hitches, correlate this cadence"
+            );
+        }
     }
+    let (m, cv) = state();
+    let mut st = m.lock().unwrap_or_else(|e| e.into_inner());
+    match result {
+        Ok(targets) => {
+            st.cache.publish(targets, now);
+        }
+        Err(e) => {
+            let retry = st.cache.fail();
+            tracing::debug!(
+                ?e,
+                retry_ms = retry.as_millis() as u64,
+                "display snapshot: CCD query failed — keeping last-known-good"
+            );
+            // SAFETY: `hwnd` is the pump's live window; a repeated SetTimer on the same id resets it.
+            unsafe {
+                SetTimer(Some(hwnd), TIMER_COALESCE, retry.as_millis() as u32, None);
+            }
+        }
+    }
+    drop(st);
+    cv.notify_all();
 }
 
-/// 15 s keeps the suspect list fresher than the 30 s warn rate-limit, without extra CCD traffic.
-const INVENTORY_TIMER_MS: u32 = 15_000;
+/// Coalesce: (re)arm the one-shot so a burst of broadcasts costs one query after it settles.
+fn schedule_refresh(hwnd: HWND) {
+    // SAFETY: `hwnd` is the pump's live window; SetTimer with an existing id resets its period.
+    unsafe {
+        SetTimer(
+            Some(hwnd),
+            TIMER_COALESCE,
+            snapshot::COALESCE.as_millis() as u32,
+            None,
+        );
+    }
+}
 
 /// `DBT_DEVNODES_CHANGED` arrives as `wParam` on `WM_DEVICECHANGE` without a registration; interface
 /// arrival/removal needs `RegisterDeviceNotificationW` below.
@@ -186,14 +321,14 @@ unsafe extern "system" fn wnd_proc(
                 ((lparam.0 >> 16) & 0xffff) as u32,
             );
             push_event(DisplayEventKind::DisplayChange, Some(format!("{w}x{h}")));
-            refresh_inventory();
+            schedule_refresh(hwnd);
             LRESULT(0)
         }
         WM_DEVICECHANGE => {
             let event = wparam.0 as u32;
             if event == DBT_DEVNODES_CHANGED {
                 push_event(DisplayEventKind::DevNodesChanged, None);
-                refresh_inventory();
+                schedule_refresh(hwnd);
             } else if event == DBT_DEVICEARRIVAL || event == DBT_DEVICEREMOVECOMPLETE {
                 let kind = if event == DBT_DEVICEARRIVAL {
                     DisplayEventKind::MonitorArrival
@@ -222,12 +357,24 @@ unsafe extern "system" fn wnd_proc(
                     }
                 };
                 push_event(kind, detail);
-                refresh_inventory();
+                schedule_refresh(hwnd);
             }
             LRESULT(0)
         }
+        WM_PF_REFRESH => {
+            schedule_refresh(hwnd);
+            LRESULT(0)
+        }
         WM_TIMER => {
-            refresh_inventory();
+            if wparam.0 == TIMER_COALESCE {
+                // One-shot: kill before the query so a query slower than the period cannot
+                // re-enter us, then refresh (a failure re-arms with its backoff).
+                // SAFETY: `hwnd` is the pump's live window and the id is ours.
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), TIMER_COALESCE);
+                }
+            }
+            refresh_inventory(hwnd);
             LRESULT(0)
         }
         // SAFETY: default handling for everything else — the standard wndproc tail call.
@@ -237,8 +384,6 @@ unsafe extern "system" fn wnd_proc(
 
 /// Message-only windows receive neither `WM_DISPLAYCHANGE` nor broadcast `WM_DEVICECHANGE`.
 fn pump() {
-    refresh_inventory();
-
     let class: Vec<u16> = "pf-display-events\0".encode_utf16().collect();
     // SAFETY: Win32 window bring-up on this thread. `class` outlives every pointer use (lives to
     // fn end; the pump loops forever). Handles are the preceding calls' returns; any failure
@@ -297,13 +442,53 @@ fn pump() {
             // DBT_DEVNODES_CHANGED and WM_DISPLAYCHANGE still arrive — partial attribution.
             tracing::warn!(error = %e, "display-event listener: monitor-interface registration failed — arrival/removal detail unavailable");
         }
-        SetTimer(Some(hwnd), 1, INVENTORY_TIMER_MS, None);
+        SetTimer(
+            Some(hwnd),
+            TIMER_SAFETY,
+            snapshot::SAFETY_REFRESH.as_millis() as u32,
+            None,
+        );
+        // The first snapshot, on the actor thread (never in a caller's), before anyone can post.
+        HWND_CELL.store(hwnd.0 as isize, Ordering::Release);
+        refresh_inventory(hwnd);
+        // Out-of-context WinEvents are delivered through this thread's message loop, so the
+        // hook lives here and for the process lifetime (never unhooked). Failure leaves the
+        // cursor poller's 250 ms refresh as the only secure-desktop signal.
+        let hook = SetWinEventHook(
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            None,
+            Some(on_desktop_switch),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        if hook.0.is_null() {
+            tracing::warn!(
+                "display-event listener: desktop-switch hook failed — secure-desktop detection \
+                 stays on the cursor poller's cadence"
+            );
+        }
+        crate::input_desktop::refresh_secure_desktop();
         tracing::debug!(
-            "display-event listener running (monitor hot-plug + display-change attribution)"
+            "display actor running (cached snapshot + monitor hot-plug / display-change attribution)"
         );
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             DispatchMessageW(&msg);
         }
     }
+}
+
+/// `EVENT_SYSTEM_DESKTOPSWITCH` carries no direction; classify the input desktop instead.
+unsafe extern "system" fn on_desktop_switch(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    _object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    crate::input_desktop::refresh_secure_desktop();
 }

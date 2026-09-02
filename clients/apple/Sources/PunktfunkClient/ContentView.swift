@@ -919,16 +919,22 @@ struct ContentView: View {
         // still `home`, so it covers the whole dial → wake → online → connect sequence): instant
         // "Connecting…" feedback on any dial, flowing seamlessly into the "Waking…" wait if the host
         // turns out to be asleep.
-        homeBase.overlay {
-            ConnectOverlay(
-                connectingHostName: connectingOverlayName,
-                waker: waker,
-                gamepadUI: gamepadUIActive,
-                onCancelConnect: { model.disconnect() })
-                // The takeover mounts OUTSIDE the gamepad screens (it covers the whole home), so
-                // it publishes the palette's ink itself rather than inheriting it.
-                .gamepadPaletteInk()
-        }
+        homeBase
+            #if os(tvOS)
+            // The focus engine only enters the takeover once nothing under it can hold focus;
+            // then Menu reaches the overlay's `.onExitCommand` instead of the launcher — or the app.
+            .disabled(connectingOverlayName != nil || waker.waking != nil)
+            #endif
+            .overlay {
+                ConnectOverlay(
+                    connectingHostName: connectingOverlayName,
+                    waker: waker,
+                    gamepadUI: gamepadUIActive,
+                    onCancelConnect: { model.disconnect() })
+                    // The takeover mounts OUTSIDE the gamepad screens (it covers the whole home),
+                    // so it publishes the palette's ink itself rather than inheriting it.
+                    .gamepadPaletteInk()
+            }
     }
 
     /// The host label for the connect takeover's "Connecting…" phase — a plain dial in flight. Nil

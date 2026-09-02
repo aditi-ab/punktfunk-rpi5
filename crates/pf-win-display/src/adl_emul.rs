@@ -526,6 +526,18 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
                     if !real && connector_filter.is_none() {
                         continue; // unoccupied and unfiltered: pinning empty is a different experiment
                     }
+                    // Emulation already pinned before us is the operator's (or a vendor tool's):
+                    // never leased, never unlocked by our teardown (immunity plan WP11).
+                    if state.iEmulationMode == ADL_EMUL_MODE_ALWAYS && connector_filter.is_none() {
+                        rec(
+                            "adl-lock-skip-preexisting",
+                            &ctarget,
+                            0,
+                            ADL_OK,
+                            format!("mode={}", state.iEmulationMode),
+                        );
+                        continue;
+                    }
                     // SAFETY: as in Probe — zeroed then driver-filled.
                     let mut data: ADLConnectionData = unsafe { std::mem::zeroed() };
                     let t = Instant::now();
@@ -605,10 +617,37 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
     RunOutcome::Done(recs)
 }
 
-/// Marker that a lock was applied and not yet unlocked. Pinned emulation outlives
-/// the process and can outlive a reboot; [`startup_recover`] clears leftovers.
+/// Marker that a lock was applied and not yet unlocked, plus the connector indices it pinned
+/// (the lease, immunity plan WP11). Pinned emulation outlives the process and can outlive a
+/// reboot; [`startup_recover`] clears leftovers.
 fn journal_path() -> std::path::PathBuf {
     pf_paths::config_dir().join("edid-lock-active.json")
+}
+
+fn encode_journal(connectors: &[i32]) -> Vec<u8> {
+    serde_json::json!({ "locked": true, "connectors": connectors })
+        .to_string()
+        .into_bytes()
+}
+
+/// The leased connector indices in a marker. An older host's bare `{"locked":true}` (or an
+/// unreadable marker) decodes as an empty list, which unlocks every connector as it always did.
+fn decode_journal(bytes: &[u8]) -> Vec<i32> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|v| v.get("connectors")?.as_array().cloned())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c.as_i64().and_then(|c| i32::try_from(c).ok()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The connector index a lock record names: `adapterN.connectorM[TYPE]` → `M`.
+fn connector_of(target: &str) -> Option<i32> {
+    let rest = target.split("connector").nth(1)?;
+    rest.split('[').next()?.parse().ok()
 }
 
 /// Mode-off `ADL_ERR_NOT_SUPPORTED` is a documented no-op, not a failure.
@@ -660,22 +699,40 @@ pub fn lock_for_stream() -> bool {
         let _ = std::fs::remove_file(journal_path());
         return false;
     }
-    let locked = outcome
+    let leased: Vec<i32> = outcome
         .records()
         .iter()
         .filter(|r| r.op == "adl-lock-mode-always" && r.ok())
-        .count();
+        .filter_map(|r| connector_of(&r.target))
+        .collect();
+    // The lease: only these connectors are ours to unlock. Written after the fact — the bare
+    // marker above already covers a crash in between (it unlocks everything, as before).
+    if let Err(e) = std::fs::write(journal_path(), encode_journal(&leased)) {
+        tracing::warn!(error = %format!("{e:#}"), "edid_lock: lease write failed");
+    }
     tracing::info!(
-        connectors = locked,
+        connectors = ?leased,
         "edid_lock: connector emulation pinned (software HPD dummy) — unlocked at stream teardown"
     );
     true
 }
 
-/// Undo [`lock_for_stream`]: mode off, remove pinned EDID, clear the journal. Idempotent.
+/// Undo [`lock_for_stream`]: mode off + remove pinned EDID on the LEASED connectors only, then
+/// clear the journal. A marker with no lease (an older host, or a crash before the lease was
+/// written) unlocks every connector. Idempotent.
 pub fn unlock_after_stream() {
-    let outcome = run(EmulAction::Unlock, None);
-    tracing_log("edid_lock", &outcome);
+    let leased = std::fs::read(journal_path())
+        .map(|b| decode_journal(&b))
+        .unwrap_or_default();
+    if leased.is_empty() {
+        let outcome = run(EmulAction::Unlock, None);
+        tracing_log("edid_lock", &outcome);
+    } else {
+        for c in leased {
+            let outcome = run(EmulAction::Unlock, Some(c));
+            tracing_log("edid_lock", &outcome);
+        }
+    }
     let _ = std::fs::remove_file(journal_path());
 }
 
@@ -689,4 +746,20 @@ pub fn startup_recover() {
         "edid_lock: a previous host left connector emulation pinned (crash/kill) — unlocking"
     );
     unlock_after_stream();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lease round-trips; an older bare marker (or garbage) means "unlock everything", the
+    /// pre-lease behaviour; the connector index comes out of the lock record's target name.
+    #[test]
+    fn edid_lock_lease_round_trips_and_reads_the_bare_marker() {
+        assert_eq!(decode_journal(&encode_journal(&[2, 5])), vec![2, 5]);
+        assert!(decode_journal(br#"{"locked":true}"#).is_empty());
+        assert!(decode_journal(b"garbage").is_empty());
+        assert_eq!(connector_of("adapter0.connector3[HDMI]"), Some(3));
+        assert_eq!(connector_of("adapter0"), None);
+    }
 }

@@ -1663,6 +1663,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         })
         .context("spawn send thread")?;
 
+    let capture_health: Arc<std::sync::Mutex<Option<pf_capture::CaptureHealth>>> =
+        Arc::new(std::sync::Mutex::new(None));
     let _live_session = crate::session_status::register(crate::session_status::Registration {
         mode: live_mode.clone(),
         bitrate_kbps: live_bitrate.clone(),
@@ -1676,7 +1678,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         ttff_ms: bringup.total_slot(),
         last_resize_ms: resize_ms.clone(),
         game: game_shared,
+        capture_health: capture_health.clone(),
     });
+    // Capture-health publish cadence (WP18): `/status` polls at 2 s; twice a second is plenty
+    // and keeps the report's clone off the per-frame path.
+    let mut health_published_at = std::time::Instant::now();
 
     let mut compositor = compositor;
     let (session_tx, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
@@ -2142,6 +2148,25 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             }
         }
         let mut want_kf = false;
+        // Staged recovery closed on real source frames (WP14): the client held the last image
+        // through the hole, so the next AU is an IDR, owed in-flight records are invalid, and
+        // the measured local outage is announced so the straddling window is not scored as
+        // congestion.
+        if health_published_at.elapsed() >= std::time::Duration::from_millis(500) {
+            health_published_at = std::time::Instant::now();
+            *capture_health.lock().unwrap_or_else(|e| e.into_inner()) = capturer.health();
+        }
+        if let Some(outage) = capturer.take_recovered_outage() {
+            let outage_ms = outage.as_millis().min(u32::MAX as u128) as u32;
+            tracing::info!(
+                outage_ms,
+                "capture recovered from a source stall — forcing an IDR, announcing the gap"
+            );
+            want_kf = true;
+            inflight.clear();
+            last_forced_idr = Some(std::time::Instant::now());
+            announce_pipeline_gap(&gap_tx, outage_ms);
+        }
         while keyframe.try_recv().is_ok() {
             want_kf = true;
         }

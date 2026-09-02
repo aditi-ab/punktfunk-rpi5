@@ -179,6 +179,36 @@ export const DashboardView: FC<{
 													value={`${fmtNumber(s.stream.last_resize_ms)} ms`}
 												/>
 											)}
+											{/* Windows IDD-push only: the capturer's live verdict and its last
+											    staged-recovery episode, so a freeze is read here instead of
+											    grepped out of the logs. */}
+											{s.session?.capture != null && (
+												<Field
+													label={m.stream_capture_health()}
+													value={
+														s.session.capture.class +
+														(s.session.capture.stall_class
+															? ` (${s.session.capture.stall_class})`
+															: "") +
+														(s.session.capture.fence_ring ? " · fence ring" : "")
+													}
+												/>
+											)}
+											{s.session?.capture?.last_episode != null && (
+												<Field
+													label={m.stream_last_recovery()}
+													value={`${s.session.capture.last_episode.stall_class}: ${
+														s.session.capture.last_episode.recovered
+															? "recovered"
+															: "failed"
+													} after ${s.session.capture.last_episode.stages
+														.map((st) => `${st.stage}=${st.outcome}`)
+														.join(", ")} (${fmtNumber(
+														s.session.capture.last_episode.took_ms / 1000,
+														1,
+													)} s)`}
+												/>
+											)}
 											<Field
 												label={m.stream_packet_size()}
 												value={`${fmtNumber(s.stream.packet_size)} B`}

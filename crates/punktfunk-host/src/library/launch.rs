@@ -300,6 +300,30 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
                 spec.value
             ))
         }),
+        // Ubisoft Connect and Amazon Games register a protocol handler and nothing else;
+        // explorer.exe resolves it as the user, the `epic` shape. Ids are charset-guarded.
+        "uplay" => valid_uplay_id(&spec.value).then(|| {
+            WinRecipe::handoff(format!("explorer.exe \"uplay://launch/{}/0\"", spec.value))
+        }),
+        "amazon" => valid_amazon_id(&spec.value).then(|| {
+            WinRecipe::handoff(format!(
+                "explorer.exe \"amazon-games://play/{}\"",
+                spec.value
+            ))
+        }),
+        // `battlenet://<code>` only opens the game's page; `--exec="launch <code>"` on the
+        // client's exe starts it. No exe found refuses the launch rather than opening a page.
+        "battlenet" => {
+            if !valid_battlenet_code(&spec.value) {
+                return None;
+            }
+            let exe = battlenet_exe()?;
+            Some(WinRecipe::handoff(format!(
+                "\"{}\" --exec=\"launch {}\"",
+                exe.display(),
+                spec.value
+            )))
+        }
         // Playnite Fullscreen (design D4). `playnite://` opens the desktop app, so spawn the exe.
         // Workdir is the install dir; a .NET app expects it.
         "launcher_ui" => match spec.value.as_str() {
@@ -325,6 +349,35 @@ fn steam_exe() -> Option<std::path::PathBuf> {
     for var in ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"] {
         if let Some(pf) = std::env::var_os(var) {
             let p = std::path::PathBuf::from(pf).join("Steam").join("steam.exe");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// The Battle.net client's exe: the machine-wide `battlenet://` handler registration first
+/// (it follows a non-default install), else the default under Program Files (x86).
+#[cfg(windows)]
+fn battlenet_exe() -> Option<std::path::PathBuf> {
+    use winreg::enums::{HKEY_CLASSES_ROOT, KEY_READ};
+    use winreg::RegKey;
+
+    let registered = RegKey::predef(HKEY_CLASSES_ROOT)
+        .open_subkey_with_flags(r"battlenet\shell\open\command", KEY_READ)
+        .and_then(|k| k.get_value::<String, _>(""))
+        .ok()
+        .and_then(|c| exe_from_shell_command(&c).map(std::path::PathBuf::from))
+        .filter(|p| p.is_file());
+    if registered.is_some() {
+        return registered;
+    }
+    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Some(pf) = std::env::var_os(var) {
+            let p = std::path::PathBuf::from(pf)
+                .join("Battle.net")
+                .join("Battle.net.exe");
             if p.is_file() {
                 return Some(p);
             }
@@ -412,6 +465,31 @@ pub(crate) fn valid_playnite_id(value: &str) -> bool {
         }
     }
     parts.next().is_none()
+}
+
+/// Ubisoft Connect game id, interpolated into `uplay://launch/<id>/0`: digits only.
+pub(crate) fn valid_uplay_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 16 && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Amazon Games product id (`amzn1.adg.product.<uuid>`), interpolated into
+/// `amazon-games://play/<id>`: alphanumerics, `.`, `_`, `-`.
+pub(crate) fn valid_amazon_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Battle.net launch code (`WTCG`, `Pro`, `wow_classic`), handed to the client as
+/// `--exec="launch <code>"`: word characters, case kept — the client matches exactly.
+pub(crate) fn valid_battlenet_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// `launcher_ui` values this OS can open (design D4). One kind; a value names
@@ -1142,6 +1220,22 @@ mod tests {
         assert_eq!(id & 0xFFFF_FFFF, 0x0200_0000, "low dword is the marker");
     }
 
+    #[test]
+    fn store_ids_are_charset_guarded() {
+        assert!(valid_uplay_id("5595"));
+        assert!(!valid_uplay_id(""));
+        assert!(!valid_uplay_id("5595/0"));
+        assert!(valid_amazon_id(
+            "amzn1.adg.product.1f2a3b4c-5d6e-7f80-9a1b-2c3d4e5f6a7b"
+        ));
+        assert!(!valid_amazon_id("amzn1.adg.product.x\" & calc"));
+        assert!(!valid_amazon_id(""));
+        assert!(valid_battlenet_code("WTCG"));
+        assert!(valid_battlenet_code("wow_classic"));
+        assert!(!valid_battlenet_code("Pro\" & calc"));
+        assert!(!valid_battlenet_code(""));
+    }
+
     #[cfg(windows)]
     #[test]
     fn epic_launch_uri_triple_bare_and_guard() {
@@ -1253,6 +1347,32 @@ mod tests {
         assert!(windows_launch_for(&LaunchSpec {
             kind: "wat".into(),
             value: "x".into()
+        })
+        .is_none());
+        let uplay = windows_launch_for(&LaunchSpec {
+            kind: "uplay".into(),
+            value: "5595".into(),
+        })
+        .unwrap();
+        assert_eq!(uplay.cmdline, "explorer.exe \"uplay://launch/5595/0\"");
+        assert!(!uplay.owns_game, "a protocol hand-off is not the game");
+        let amazon = windows_launch_for(&LaunchSpec {
+            kind: "amazon".into(),
+            value: "amzn1.adg.product.abc-123".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            amazon.cmdline,
+            "explorer.exe \"amazon-games://play/amzn1.adg.product.abc-123\""
+        );
+        assert!(windows_launch_for(&LaunchSpec {
+            kind: "uplay".into(),
+            value: "5595\" & calc".into()
+        })
+        .is_none());
+        assert!(windows_launch_for(&LaunchSpec {
+            kind: "battlenet".into(),
+            value: "WTCG\" & calc".into()
         })
         .is_none());
     }

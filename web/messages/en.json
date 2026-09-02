@@ -90,6 +90,8 @@
 	"stream_fps": "Frame rate",
 	"stream_first_frame": "First frame",
 	"stream_last_resize": "Last resize",
+	"stream_capture_health": "Capture health",
+	"stream_last_recovery": "Last recovery",
 	"stream_packet_size": "Packet size",
 	"stream_min_fec": "FEC floor",
 	"stream_bitrate": "Bitrate",

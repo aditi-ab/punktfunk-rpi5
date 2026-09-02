@@ -297,11 +297,15 @@ unsafe fn set_render_adapter(h: HANDLE, luid: LUID) -> Result<()> {
 }
 
 /// Deliver a monitor's sealed frame channel. On IOCTL success the driver owns the handles
-/// duplicated into WUDFHost; the caller reaps remote duplicates on failure so none leak.
+/// duplicated into WUDFHost; the caller reaps remote duplicates on failure so none leak. Always
+/// the v2 shape (WP7): a pre-fence driver reads the v1 prefix of the longer buffer unchanged.
 ///
 /// # Safety
 /// `dev` must be a live pf-vdisplay control handle (see [`super::manager::control_device_handle`]).
-pub unsafe fn send_frame_channel(dev: HANDLE, req: &control::SetFrameChannelRequest) -> Result<()> {
+pub unsafe fn send_frame_channel(
+    dev: HANDLE,
+    req: &control::SetFrameChannelRequestV2,
+) -> Result<()> {
     let mut none: [u8; 0] = [];
     // SAFETY: `dev` is the live control handle by this fn's contract. `bytes_of(req)` borrows the
     // caller's request for this synchronous call; `none` is empty, so there is no output buffer.
@@ -1196,10 +1200,14 @@ mod tests {
         }
     }
 
-    /// Hardware round trip (`#[ignore]`): open → create → hold → drop (REMOVE).
+    /// Hardware round trip (`#[ignore]`): open → create → hold → drop (REMOVE). Under the
+    /// guard so the drop tears down NOW: with the box's real keep-alive the teardown lingers
+    /// 10 s and the next case in the file starts on a still-isolated desktop (measured on .173:
+    /// `live_force_extend` red on its precondition, the desktop restored seconds later).
     #[test]
     #[ignore = "needs the pf-vdisplay driver on real hardware; run with --ignored"]
     fn live_create_drop() {
+        let _policy = ExclusiveTopology::force();
         let mut vd = PfVdisplayDisplay::new().expect("open pf-vdisplay");
         let vout = vd
             .create(Mode {
