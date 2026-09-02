@@ -1,55 +1,41 @@
-//! The console library's model and math — everything about the coverflow that isn't
-//! Skia: the shared binary↔overlay state (games, phase, incoming art bytes), the
-//! spring-driven motion and cursor arithmetic (ported verbatim from the GTK launcher,
-//! tests included), and the geometry constants. Rendering lives in `skia_overlay`.
+//! Library model and coverflow math — everything the overlay shares that is not Skia.
+//!
+//! Games, phase, incoming art, generation and fetch epoch live in [`LibraryShared`].
+//! Fetch threads write; the renderer drains per frame. Cursor and grid arithmetic are
+//! ported from the GTK launcher and tested here. Geometry, the 4×4 card transform, and
+//! the mesh-gradient palettes sit alongside.
+//!
+//! Rendering is `skia_overlay`. Palette ids and the derived 16-cell meshes are pinned by
+//! `clients/shared/console-vectors.json`, and by `GamepadPalette.kt` / `.swift`.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-// --- Geometry (the GTK launcher's constants — Apple coverflow parity) --------------------
+// --- Geometry (GTK launcher / Apple coverflow parity) ---
 
-/// Poster geometry: 2:3 covers, sized so the focused poster + detail panel + hint bar
-/// fit a Deck's 1280×800 with air. Scaled uniformly for other window sizes.
+/// 2:3 covers. Sized so the focused poster, detail panel and hint bar fit 1280×800 with air.
 pub const POSTER_W: f64 = 220.0;
 pub const POSTER_H: f64 = 330.0;
-/// Center of the focused card to the center of its first neighbor.
 pub const FOCUS_GAP: f64 = 230.0;
-/// Center-to-center distance between successive SIDE cards — much tighter than their
-/// projected width, so the side stacks overlap like the classic coverflow shelf.
+/// Center-to-center between successive side cards; tighter than projected width so they overlap.
 pub const SIDE_SPACING: f64 = 104.0;
-/// Cards farther than this from the eased position aren't drawn at all.
 pub const VISIBLE_RANGE: f64 = 5.5;
-/// Neighbors recede to this scale…
 pub const RECEDE_SCALE: f64 = 0.24;
-/// …and swing this many degrees about their own vertical axis under perspective, side
-/// cards facing the corridor (their inner edge recedes behind the focus).
+/// Side-card yaw about its own vertical axis; inner edge recedes behind the focus.
 pub const ROTATE_DEG: f64 = 38.0;
 /// Perspective depth for the tilt, px (CSS `perspective()` semantics).
 pub const PERSPECTIVE: f64 = 800.0;
-/// The recede veil's max opacity (side cards stay opaque — they overlap). Cut twice: first
-/// when the colour recede landed and this stopped having to carry the whole "further away"
-/// reading on its own, and again when the three stacked mechanisms turned out to be summing
-/// to literal black on a receded card. It is left doing the one job a flat wash is good at —
-/// separating cards that overlap. See `theme::recede_matrix`.
-///
-/// No longer necessarily a DARKENING: the call site washes toward `theme::shade`, which is
-/// black on a dark palette and white on a pale one, so this reinforces the matrix's direction
-/// at both poles instead of greying out the lift on the six pale ones.
+/// Recede-veil max opacity — overlap separator, not distance. Washes toward `theme::shade`.
 pub const RECEDE_DIM: f64 = 0.10;
-/// Boundary recoil: a refused move deflects the strip this many px against the push.
+/// Refused-move recoil, px against the push.
 pub const BUMP_PX: f64 = 16.0;
-/// Mount entrance (see [`crate::anim::Entrance`]): a card arrives at this scale, this many
-/// design units below its berth, and — where the surface can turn a card at all — this many
-/// degrees away from the viewer. Shared by the home carousel and the library coverflow so
-/// the two read as one console arriving, not two widgets each with its own idea.
+/// Mount entrance ([`crate::anim::Entrance`]): arrival scale, rise (design units), yaw. Shared with the home carousel.
 pub const ENTER_SCALE: f64 = 0.74;
 pub const ENTER_RISE: f64 = 34.0;
 pub const ENTER_TURN_DEG: f64 = 62.0;
-/// L1/R1 jump distance.
 pub const JUMP: i32 = 5;
 
-// The motion is spring-driven (semi-implicit Euler), not eased — velocity carries across
-// retargets, so holding a direction glides and a release settles like a detent.
+// Semi-implicit Euler, not eased: velocity carries across retargets.
 /// Cursor chase: ζ ≈ 0.85 — settles in ~0.3 s with a whisker of overshoot.
 pub const SPRING_K: f64 = 200.0;
 pub const SPRING_C: f64 = 24.0;
@@ -57,15 +43,12 @@ pub const SPRING_C: f64 = 24.0;
 pub const BUMP_K: f64 = 600.0;
 pub const BUMP_C: f64 = 27.0;
 
-/// One semi-implicit-Euler step of a damped spring toward `target`.
 fn spring_step(pos: f64, vel: f64, target: f64, k: f64, c: f64, dt: f64) -> (f64, f64) {
     let vel = vel + (k * (target - pos) - c * vel) * dt;
     (pos + vel * dt, vel)
 }
 
-/// Advance a damped spring by a whole frame, integrating in ≤ 8 ms substeps — a stalled
-/// frame stays far inside the integrator's stability bound, so the motion feels
-/// identical at any frame rate.
+/// One frame of a damped spring, in ≤ 8 ms substeps so a stalled frame stays inside the integrator's stability bound.
 pub fn spring_advance(
     mut pos: f64,
     mut vel: f64,
@@ -82,8 +65,7 @@ pub fn spring_advance(
     (pos, vel)
 }
 
-/// Pure cursor arithmetic for a move/jump: `clamp` lands jumps on the ends, a plain
-/// step refuses to leave them.
+/// `clamp` lands jumps on the ends; a plain step refuses to leave them.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StepResult {
     Moved(i32),
@@ -107,11 +89,6 @@ pub fn step_cursor(cursor: i32, len: usize, delta: i32, clamp: bool) -> StepResu
     }
 }
 
-/// Which arrangement the library draws in.
-///
-/// The shelf is a browsing surface — one title at a time, big, with its artwork doing the
-/// talking. The grid is a FINDING surface: ~18 covers at once instead of the coverflow's
-/// legible three, for the moment you know what you want and just need to see it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum LibraryView {
     #[default]
@@ -120,8 +97,7 @@ pub enum LibraryView {
 }
 
 impl LibraryView {
-    /// Parse the persisted `library_view` value, leniently — an unknown string is a newer
-    /// client's, and the right answer to one is the shelf everyone already has.
+    /// Persisted `library_view`. Unknown → [`LibraryView::Shelf`] (a newer client's name).
     pub fn parse(s: &str) -> LibraryView {
         match s {
             "grid" => LibraryView::Grid,
@@ -146,14 +122,11 @@ impl LibraryView {
     pub const ALL: [LibraryView; 2] = [LibraryView::Shelf, LibraryView::Grid];
 }
 
-/// Grid cell geometry: the same 2:3 as the coverflow poster at roughly two-thirds the size,
-/// which is what puts three rows on a Deck's 800-tall panel with the detail band still
-/// readable underneath.
+/// Grid cell: same 2:3 as the poster at ~⅔ size, so three rows plus a readable detail band at 800-tall.
 pub const GRID_W: f64 = 150.0;
 pub const GRID_H: f64 = 225.0;
 pub const GRID_GAP: f64 = 16.0;
 
-/// Which way a grid cursor is being pushed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridDir {
     Left,
@@ -164,34 +137,25 @@ pub enum GridDir {
     PageForward,
 }
 
-/// How many rows a shoulder press jumps.
+/// Shoulder jump, rows (≈ one screen).
 pub const GRID_PAGE_ROWS: i32 = 3;
 
-/// The grid's layout, in the one place both the cursor arithmetic and the renderer read it.
+/// Layout both cursor math and the renderer read.
 ///
-/// A field of covers is not a uniform grid: the launcher prefix (design D4) is given rows of
-/// its own and the games section restarts at column 0 underneath it. While navigation did
-/// that sum for itself — index modulo `cols` — the two models agreed only when the launcher
-/// count happened to be a multiple of the column count, which with a Deck's seven columns and
-/// the usual two launchers means never. Down out of a launcher landed five columns to the
-/// right of the tile it sat under, Up out of the games band slid sideways instead of leaving
-/// it, and a row end refused mid-row. Sharing the shape is the fix; the arithmetic below is
-/// only its consequence.
+/// The launcher prefix occupies its own rows; the games section restarts at column 0.
+/// A uniform `index % cols` grid only agrees when `launchers` is a multiple of `cols`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridShape {
-    /// Cells per row. A RENDER fact — it depends on the window — so the shape is built from
-    /// what the last frame actually drew rather than derived twice from two widths.
+    /// Cells per row, from the last frame actually drawn — not derived twice from two widths.
     pub cols: usize,
-    /// How many cells there are: the FILTERED count, the one the cursor indexes.
+    /// Filtered count; the cursor indexes this.
     pub len: usize,
     /// Where the games section starts, or 0 when the field is one continuous run.
     pub split: usize,
 }
 
 impl GridShape {
-    /// `launchers` is the leading launcher run. The section only exists when BOTH halves do —
-    /// an all-launcher or launcher-less field is a plain grid, and giving it a heading band
-    /// and a gap it has no second group for would be a rule showing off.
+    /// `launchers` is the leading run. Split only when both halves exist; otherwise a plain grid.
     pub fn new(len: usize, cols: usize, launchers: usize) -> GridShape {
         let split = if launchers > 0 && launchers < len {
             launchers
@@ -201,12 +165,11 @@ impl GridShape {
         GridShape { cols, len, split }
     }
 
-    /// The first row of the games section (meaningless when there is no split).
+    /// First row of the games section; ignore when `split == 0`.
     pub fn split_row(&self) -> usize {
         self.split.div_ceil(self.cols.max(1))
     }
 
-    /// Which cell an index is drawn in.
     pub fn cell_of(&self, i: usize) -> (usize, usize) {
         let cols = self.cols.max(1);
         if self.split > 0 && i >= self.split {
@@ -226,7 +189,6 @@ impl GridShape {
         }
     }
 
-    /// The index of a row's first cell.
     pub fn row_start(&self, row: usize) -> usize {
         let cols = self.cols.max(1);
         if self.split > 0 && row >= self.split_row() {
@@ -236,8 +198,7 @@ impl GridShape {
         }
     }
 
-    /// How many cells a row actually holds — the launcher section's last row stops where the
-    /// games section begins, and the field's last row stops at the end of the library.
+    /// Cells this row holds. The last launcher row ends at `split`; the last field row at `len`.
     pub fn row_len(&self, row: usize) -> usize {
         let start = self.row_start(row);
         let end = if self.split > 0 && row + 1 == self.split_row() {
@@ -249,28 +210,18 @@ impl GridShape {
     }
 }
 
-/// Cursor arithmetic for the grid, against the shape the renderer is drawing.
+/// Grid cursor against the shape the renderer is drawing.
 ///
-/// ONE rule, because an accretion of special cases is how this broke: horizontal moves walk
-/// the row and refuse at THAT ROW's true ends; vertical moves and pages change row only,
-/// carrying `col_hint` and clamping it into the target row's length. The only boundary is a
-/// move that would leave the grid.
-///
-/// Left/right refusing rather than wrapping is the shelf's rule and the one a thumb already
-/// knows — a held Right that wrapped would scan the whole library, and there are shoulders
-/// for that. Vertical moves clamp instead of refusing because a short row is a layout
-/// accident, not a boundary anyone chose to hit: Down from above the gap should land on the
-/// last title, not thud.
-///
-/// `col_hint` is the column the user last CHOSE (see [`grid_col_hint`]) rather than the one
-/// they happen to be standing in, so crossing a two-wide launcher row and coming back returns
-/// to the column the crossing started from.
+/// Horizontal: walk the row, refuse at that row's true ends (no wrap). Vertical and page:
+/// change row only, carrying `col_hint` clamped into the target row. Only leaving the
+/// grid is a boundary. A short row is a layout accident — Down clamps onto the last title.
+/// `col_hint` is the column last chosen ([`grid_col_hint`]), so a two-wide launcher row
+/// is reversible.
 pub fn grid_step(cursor: i32, shape: GridShape, col_hint: usize, dir: GridDir) -> StepResult {
     if shape.len == 0 || shape.cols == 0 {
         return StepResult::Boundary;
     }
-    // A cursor outside the field is a stale one (the library shortened under us); reading it
-    // as the nearest real cell makes the next press heal it instead of compounding it.
+    // Outside the field: library shortened. Nearest real cell, so the next press heals it.
     let (row, col) = shape.cell_of((cursor.max(0) as usize).min(shape.len - 1));
     let moved = |i: usize| {
         if i as i32 == cursor {
@@ -303,9 +254,7 @@ pub fn grid_step(cursor: i32, shape: GridShape, col_hint: usize, dir: GridDir) -
             };
             let target = (row as i32 + d).clamp(0, shape.rows() as i32 - 1) as usize;
             if target == row {
-                // A STEP at the edge refuses. A PAGE is a "take me there", so it lands on the
-                // end of the row it is already on — the same reading `step_cursor`'s clamped
-                // mode has, and the one the shoulders have always had here.
+                // Step at the edge refuses. Page is clamped `step_cursor`: land on this row's end.
                 if !paging {
                     return StepResult::Boundary;
                 }
@@ -318,11 +267,7 @@ pub fn grid_step(cursor: i32, shape: GridShape, col_hint: usize, dir: GridDir) -
     }
 }
 
-/// The remembered column after a move.
-///
-/// A horizontal step CHOOSES a column; a vertical one only borrows it. Keeping the rule here
-/// rather than at the call site is what stops the screen from holding a cursor and a column
-/// that disagree — the same reason the layout itself is one shared shape.
+/// Remembered column after a move: a horizontal step chooses it; a vertical step only borrows it.
 pub fn grid_col_hint(shape: GridShape, prev: usize, dir: GridDir, landed: i32) -> usize {
     match dir {
         GridDir::Left | GridDir::Right => shape.cell_of(landed.max(0) as usize).1,
@@ -330,12 +275,10 @@ pub fn grid_col_hint(shape: GridShape, prev: usize, dir: GridDir, landed: i32) -
     }
 }
 
-// --- 4×4 matrix (row-major) — the coverflow card transform ------------------------------
+// --- 4×4 matrix (row-major) — coverflow card transform ---
 
-/// `T(cx,cy) · P(depth) · Ry(angle) · S(s) · T(-w/2,-h/2)`: card-local (0..w, 0..h) →
-/// screen, rotated about the card's own vertical center axis under perspective — the
-/// GSK transform chain from the GTK launcher, as one row-major matrix for
-/// `Canvas::concat_44`.
+/// `T(cx,cy) · P(depth) · Ry(angle) · S(s) · T(-w/2,-h/2)`: card-local (0..w, 0..h) → screen.
+/// Rotation is about the card's vertical centre. Row-major for `Canvas::concat_44`.
 #[allow(clippy::too_many_arguments)]
 pub fn card_matrix(
     cx: f64,
@@ -404,11 +347,9 @@ fn mat_mul(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
     out
 }
 
-// --- Mesh-gradient background (the Swift `GamepadScreenBackground` MeshGradient, ported) --
+// --- Mesh-gradient background (Swift `GamepadScreenBackground` MeshGradient) ---
 
-/// The 16 mesh colours, row-major 4×4 (sRGB) — a verbatim port of the Swift client's
-/// `meshColors`: dark-violet corners sink the frame, the edges carry mid-tone violets, and
-/// the four interior points hold the bright brand family (warm pools left, cool right).
+/// 16 mesh colours, row-major 4×4 sRGB. Verbatim Swift `meshColors`.
 pub const MESH_COLORS: [(f64, f64, f64); 16] = [
     (0.075, 0.060, 0.160),
     (0.34, 0.27, 0.72),
@@ -428,12 +369,9 @@ pub const MESH_COLORS: [(f64, f64, f64); 16] = [
     (0.075, 0.060, 0.160),
 ];
 
-/// The four interior control points that wander; the 12 boundary points stay pinned to the
-/// frame (a drifting edge point would shrink the field and expose the black behind it). Each
-/// row is `(base_ux, base_uy, amplitude, speed_x, speed_y, phase)` in unit UV / rad·s⁻¹ —
-/// the exact `wob()` parameters from the Swift `meshPoints(at:)`. Their live displacement
-/// `(amp·sin(t·sx+ph), amp·cos(t·sy+ph·1.3))` drives a domain warp, so the bright colour
-/// pools follow the points as they breathe (periods ~90–130 s, out of phase so it never loops).
+/// Four interior control points; the 12 boundary points stay pinned (a drifting edge exposes black).
+/// Each row is `(base_ux, base_uy, amplitude, speed_x, speed_y, phase)` in UV / rad·s⁻¹ —
+/// Swift `meshPoints(at:)` `wob()`. Periods ~90–130 s, out of phase so the warp does not loop.
 pub const MESH_INTERIOR: [(f64, f64, f64, f64, f64, f64); 4] = [
     (0.333, 0.333, 0.11, 0.049, 0.063, 0.4),
     (0.667, 0.333, 0.10, 0.055, 0.052, 2.1),
@@ -443,39 +381,25 @@ pub const MESH_INTERIOR: [(f64, f64, f64, f64, f64, f64); 4] = [
 
 // --- Background palettes -------------------------------------------------------------------
 
-/// One background colour family for the gamepad UI's living backdrop.
+/// One background colour family.
 ///
-/// A palette is a short ordered ramp of [`Palette::stops`] — several DISTINCT hues, not one hue
-/// at several brightnesses. The 4×4 mesh samples that ramp diagonally with a per-cell offset
-/// ([`CELL_RAMP`]), so neighbouring cells land on different parts of it and the colours pool and
-/// swirl the way a real gradient poster does; the interior points' existing domain warp then
-/// drifts those pools around. An earlier version rotated ONE field's hue per palette, which is
-/// why every non-default palette read as flat and monotone.
-///
-/// A palette also owns the UI it sits under: [`Palette::accent`] is the focus wash / selected
-/// pill / switch colour, and [`Palette::light`] flips the ink (see [`crate::theme::Ink`]) so a
-/// pale field gets dark text instead of white. The Apple and Android clients carry the same
-/// table under the same ids, so one `ui_palette` value is one look everywhere.
+/// `stops` is several distinct hues, not one hue at several brightnesses. The 4×4 mesh
+/// samples that ramp diagonally with [`CELL_RAMP`]. [`Palette::accent`] is the focus wash;
+/// [`Palette::light`] flips ink ([`crate::theme::Ink`]). Apple and Android tables share these ids.
 pub struct Palette {
     /// The stored `ui_palette` value (see `trust::Settings::ui_palette`).
     pub id: &'static str,
-    /// What the settings row shows.
     pub name: &'static str,
-    /// The colour ramp, dark end first. `None` = use [`MESH_COLORS`] verbatim (the brand
-    /// default, kept bit-identical to what every install already sees).
+    /// Colour ramp, dark end first. `None` = [`MESH_COLORS`] verbatim.
     pub stops: Option<&'static [(f64, f64, f64)]>,
     /// The field's ground — what the corners settle onto and what the calm mix lifts toward.
     pub ground: (f64, f64, f64),
-    /// The UI accent: focus wash, selected tab pill, switch track, caret.
     pub accent: (f64, f64, f64),
-    /// A pale field: the UI flips to dark ink and the legibility scrims go white.
+    /// Pale field: dark ink, white scrims.
     pub light: bool,
 }
 
-/// Where each of the 16 mesh cells samples the ramp. The base is the diagonal
-/// `0.5·(x + y)` — top-left is the ramp's dark end, bottom-right its bright one, like both
-/// reference gradients — and the per-cell nudges break the banding that a pure diagonal would
-/// give, so hues pool instead of striping.
+/// Per-cell ramp offset on top of the diagonal `0.5·(x + y)`. Nudges stop a pure diagonal from banding.
 #[rustfmt::skip]
 const CELL_RAMP: [f64; 16] = [
      0.10, -0.06,  0.04, -0.12,
@@ -484,10 +408,8 @@ const CELL_RAMP: [f64; 16] = [
     -0.10,  0.08, -0.06,  0.12,
 ];
 
-/// The thirteen shipped palettes: the brand default, six more dark fields, then six pale ones.
-/// Cycling order runs dark → light, so stepping the row walks the whole range in one direction.
-/// Adding one here adds it to every console settings screen; the Apple and Android tables must
-/// gain the same entry to keep the `ui_palette` key portable.
+/// Brand default, six dark fields, then six pale. Dark → light is cycle order.
+/// Adding a row here is not enough: Apple and Android tables must gain the same `ui_palette` id.
 #[rustfmt::skip]
 pub const PALETTES: [Palette; 13] = [
     // --- dark fields (white ink) ---
@@ -496,18 +418,8 @@ pub const PALETTES: [Palette; 13] = [
         ground: (0.075, 0.060, 0.160), accent: (0.525, 0.471, 0.961), light: false,
     },
     Palette {
-        // For OLED and AMOLED panels, where a black pixel is a pixel switched off — no glow,
-        // no power. The ramp's first two stops are literally (0,0,0), so the whole shaded half
-        // of the field is genuinely off rather than "very dark grey", and the ground is pure
-        // black too: the calm mix on the form screens lifts toward nothing, so settings and
-        // pairing sit on an unlit panel. What is left is a faint indigo→violet ember in the
-        // bright corner, dim enough to stay under a tenth of the other dark fields' mean
-        // luminance while keeping the backdrop a field with somewhere to go rather than a
-        // dead rectangle. The accent stays the brand violet — focus has to be findable on
-        // black.
-        // Named for the look, not the panel technology — black with a thin violet corona belongs
-        // beside Nebula and Abyss. ⚠ The ID stays "oled": it is the stored `ui_palette` value and
-        // the cross-client key, so renaming it would orphan saved choices and desync the clients.
+        // First two stops are (0,0,0): OLED pixels off, not dark grey. Ground is black so calm lifts to nothing.
+        // Id stays `"oled"` — stored `ui_palette` key; renaming orphans saved choices.
         id: "oled", name: "Eclipse",
         stops: Some(&[
             (0.000, 0.000, 0.000), (0.000, 0.000, 0.000), (0.010, 0.020, 0.100),
@@ -516,7 +428,6 @@ pub const PALETTES: [Palette; 13] = [
         ground: (0.0, 0.0, 0.0), accent: (0.525, 0.471, 0.961), light: false,
     },
     Palette {
-        // Deep indigo climbing through violet into a hot magenta.
         id: "nebula", name: "Nebula",
         stops: Some(&[
             (0.07, 0.05, 0.20), (0.26, 0.14, 0.54), (0.52, 0.20, 0.72),
@@ -525,7 +436,6 @@ pub const PALETTES: [Palette; 13] = [
         ground: (0.055, 0.040, 0.135), accent: (0.95, 0.42, 0.72), light: false,
     },
     Palette {
-        // Ink-blue water: teal → cerulean → a violet undertow.
         id: "abyss", name: "Abyss",
         stops: Some(&[
             (0.02, 0.10, 0.17), (0.04, 0.28, 0.42), (0.07, 0.46, 0.63),
@@ -534,7 +444,6 @@ pub const PALETTES: [Palette; 13] = [
         ground: (0.018, 0.070, 0.130), accent: (0.26, 0.76, 0.92), light: false,
     },
     Palette {
-        // Banked coals: plum embers → crimson → burnt orange → gold.
         id: "ember", name: "Ember",
         stops: Some(&[
             (0.16, 0.03, 0.10), (0.45, 0.06, 0.12), (0.72, 0.18, 0.06),
@@ -543,7 +452,6 @@ pub const PALETTES: [Palette; 13] = [
         ground: (0.090, 0.035, 0.040), accent: (0.98, 0.62, 0.26), light: false,
     },
     Palette {
-        // Forest floor into moss and a lime break.
         id: "moss", name: "Moss",
         stops: Some(&[
             (0.03, 0.11, 0.09), (0.06, 0.27, 0.20), (0.09, 0.45, 0.31),
@@ -552,8 +460,6 @@ pub const PALETTES: [Palette; 13] = [
         ground: (0.025, 0.085, 0.070), accent: (0.48, 0.86, 0.46), light: false,
     },
     Palette {
-        // Neutral, but never flat: barely-there saturation that still travels from a cool
-        // charcoal to a warm stone, so even the restrained option has somewhere to go.
         id: "graphite", name: "Graphite",
         stops: Some(&[
             (0.06, 0.07, 0.11), (0.15, 0.18, 0.25), (0.30, 0.31, 0.35),
@@ -563,7 +469,6 @@ pub const PALETTES: [Palette; 13] = [
     },
     // --- pale fields (dark ink) ---
     Palette {
-        // The holographic foil: rose → lilac → periwinkle → aqua, with a white bloom.
         id: "holo", name: "Holo",
         stops: Some(&[
             (0.99, 0.72, 0.90), (0.80, 0.60, 0.98), (0.58, 0.62, 0.99),
@@ -572,7 +477,6 @@ pub const PALETTES: [Palette; 13] = [
         ground: (0.96, 0.92, 0.99), accent: (0.42, 0.28, 0.86), light: true,
     },
     Palette {
-        // The poster sunset: periwinkle → magenta → scarlet → tangerine → gold.
         id: "sunset", name: "Sunset",
         stops: Some(&[
             (0.55, 0.45, 0.92), (0.86, 0.31, 0.66), (0.97, 0.26, 0.34),
@@ -581,7 +485,6 @@ pub const PALETTES: [Palette; 13] = [
         ground: (0.98, 0.74, 0.34), accent: (0.64, 0.13, 0.44), light: true,
     },
     Palette {
-        // Peach into blush and lilac — the softest of the set.
         id: "bloom", name: "Bloom",
         stops: Some(&[
             (1.00, 0.86, 0.72), (0.99, 0.73, 0.79), (0.95, 0.65, 0.89),
@@ -590,7 +493,6 @@ pub const PALETTES: [Palette; 13] = [
         ground: (0.99, 0.90, 0.89), accent: (0.72, 0.24, 0.55), light: true,
     },
     Palette {
-        // First light: pale gold → coral → lilac.
         id: "dawn", name: "Dawn",
         stops: Some(&[
             (1.00, 0.92, 0.70), (1.00, 0.80, 0.62), (0.99, 0.66, 0.62),
@@ -599,7 +501,6 @@ pub const PALETTES: [Palette; 13] = [
         ground: (1.00, 0.93, 0.82), accent: (0.82, 0.33, 0.28), light: true,
     },
     Palette {
-        // Sea glass: mint → aqua → a pale sky.
         id: "mint", name: "Mint",
         stops: Some(&[
             (0.82, 0.98, 0.90), (0.62, 0.94, 0.88), (0.55, 0.88, 0.95),
@@ -608,7 +509,6 @@ pub const PALETTES: [Palette; 13] = [
         ground: (0.90, 0.98, 0.96), accent: (0.04, 0.42, 0.40), light: true,
     },
     Palette {
-        // Near-white, but iridescent rather than flat — rose, sky, mint and cream in turn.
         id: "opal", name: "Opal",
         stops: Some(&[
             (0.98, 0.92, 0.96), (0.87, 0.93, 0.99), (0.91, 0.99, 0.95),
@@ -618,15 +518,12 @@ pub const PALETTES: [Palette; 13] = [
     },
 ];
 
-/// The palette stored under `id`, falling back to the brand default — an unknown name is a
-/// palette a newer client shipped, not a reason to draw nothing.
+/// Palette for `id`, or the brand default. Unknown is a newer client's name, not an empty draw.
 pub fn palette(id: &str) -> &'static Palette {
     PALETTES.iter().find(|p| p.id == id).unwrap_or(&PALETTES[0])
 }
 
-/// Sample an ordered colour ramp at `t` ∈ [0, 1] (linear between neighbouring stops). Ported
-/// verbatim to Swift and Kotlin — keep the three copies in step or a palette drifts between
-/// clients.
+/// Sample a ramp at `t` ∈ [0, 1], linear between neighbouring stops. Swift and Kotlin copies must match.
 pub fn ramp(stops: &[(f64, f64, f64)], t: f64) -> (f64, f64, f64) {
     match stops.len() {
         0 => (0.0, 0.0, 0.0),
@@ -646,8 +543,6 @@ pub fn ramp(stops: &[(f64, f64, f64)], t: f64) -> (f64, f64, f64) {
 }
 
 impl Palette {
-    /// The 16 mesh colours for this palette: the ramp sampled per cell (see [`CELL_RAMP`]), or
-    /// [`MESH_COLORS`] verbatim for the brand default.
     pub fn mesh_colors(&self) -> [(f64, f64, f64); 16] {
         let Some(stops) = self.stops else {
             return MESH_COLORS;
@@ -655,16 +550,14 @@ impl Palette {
         mesh_colors_of(stops)
     }
 
-    /// Four drifting blob colours, for the clients that approximate the mesh with a blob field
-    /// (Android). Spread across the ramp so the field still shows several hues at once.
+    /// Four blob colours for Android's mesh approximation, spread across the ramp.
     pub fn blob_colors(&self) -> [(f64, f64, f64); 4] {
         let stops = self.stops.unwrap_or(&VIOLET_BLOBS);
         core::array::from_fn(|i| ramp(stops, 0.15 + 0.25 * i as f64))
     }
 }
 
-/// The 16 mesh cells from any 5-stop ramp — [`Palette::mesh_colors`] for the curated ramps,
-/// and the follow-system field, whose stops exist only at runtime (see `shell::build_mesh_os`).
+/// 16 mesh cells from any 5-stop ramp, including the runtime OS field (`shell::build_mesh_os`).
 pub(crate) fn mesh_colors_of(stops: &[(f64, f64, f64)]) -> [(f64, f64, f64); 16] {
     core::array::from_fn(|i| {
         let (x, y) = ((i % 4) as f64 / 3.0, (i / 4) as f64 / 3.0);
@@ -672,8 +565,7 @@ pub(crate) fn mesh_colors_of(stops: &[(f64, f64, f64)]) -> [(f64, f64, f64); 16]
     })
 }
 
-/// The brand default's blob ramp — the four colours the pre-palette Android/legacy-Apple field
-/// used, kept so `violet` is unchanged there too.
+/// Pre-palette Android / legacy-Apple blob colours, so `violet` stays bit-identical there.
 const VIOLET_BLOBS: [(f64, f64, f64); 5] = [
     (0.53, 0.47, 0.96),
     (0.24, 0.20, 0.72),
@@ -682,27 +574,21 @@ const VIOLET_BLOBS: [(f64, f64, f64); 5] = [
     (0.53, 0.47, 0.96),
 ];
 
-/// The mesh gradient as SkSL, palette + motion baked into the source (resolution, time and
-/// the calm mix are uniforms). A smooth bicubic blend of the 16 colours — a separable
-/// cubic-Bézier basis in x then y, C∞ and edge-to-edge, the fragment-shader analogue of
-/// SwiftUI's `MeshGradient(smoothsColors: true)`. The four interior points drive a
-/// bounded (weighted-average) domain warp so the bright pools drift; then the whole field
-/// gets the ±8°/~5-min hue sway, an elliptical vignette, and the vertical legibility scrim,
-/// all matching the Swift `composite(at:)`. Runs on the GPU at full rate.
+/// Mesh gradient as SkSL: palette and motion baked in; resolution, time and calm are uniforms.
 ///
-/// `u_tc.y` is the CALM mix, 0 → 1: at 1 the same living field is flattened toward its own
-/// corner colour (`u_lift`), which is how the form screens (settings, add-host, pair) stay
-/// restful while still drifting — the motion never changes speed, only the contrast, so the
-/// crossfade between a launcher screen and a form screen can't make the field jump.
+/// Bicubic 16-colour blend (SwiftUI `MeshGradient(smoothsColors: true)`). Interior points
+/// drive a bounded domain warp; then ±8° / ~5 min hue sway, elliptical vignette, vertical scrim
+/// — Swift `composite(at:)`.
+///
+/// `u_tc.y` is the calm mix (0 launcher, 1 form): flatten toward `u_lift` so a screen
+/// crossfade never jumps the field. Motion speed is unchanged.
 pub fn mesh_sksl(colors: &[(f64, f64, f64); 16]) -> String {
-    // Colours as `float3(r, g, b)` literals, indices 0..15 (row-major 4×4).
     let c = |i: usize| {
         let (r, g, b) = colors[i];
         format!("float3({r}, {g}, {b})")
     };
-    // The four interior-point domain-warp accumulators. Displacement matches Swift `wob()`:
-    // x uses sin(t·sx+ph), y uses cos(t·sy+ph·1.3). SIG sets how far each point's pull
-    // reaches; the warp is the weight-normalised average displacement, so |warp| ≤ max|amp|.
+    // Interior domain-warp, matching Swift `wob()`: x = sin(t·sx+ph), y = cos(t·sy+ph·1.3).
+    // Weight-normalised average, so |warp| ≤ max|amp|.
     let mut warp = String::new();
     for (bx, by, amp, sx, sy, ph) in MESH_INTERIOR {
         warp.push_str(&format!(
@@ -799,7 +685,6 @@ pub enum LibraryPhase {
         can_retry: bool,
     },
     Empty,
-    /// Games are loaded — the carousel.
     Ready,
 }
 
@@ -808,55 +693,34 @@ pub struct LibraryGame {
     pub id: String,
     pub title: String,
     pub store: String,
-    /// This entry opens the launcher itself (Steam Big Picture, Heroic, Lutris) rather than a
-    /// title — design D4. The host's `role` field, already reduced to a boolean by
-    /// [`pf_client_core::library::GameEntry::is_launcher`] so the "anything that isn't
-    /// `launcher` is a game" rule lives in exactly one place.
+    /// Opens the launcher itself, not a title. Host `role`, reduced by [`pf_client_core::library::GameEntry::is_launcher`].
     pub launcher: bool,
-    /// The token for this entry's brand mark (`"steam"`, `"heroic"`), already validated by
-    /// [`pf_client_core::library::GameEntry::icon_token`]. Empty when the entry names no mark;
-    /// a token we ship no art for simply draws nothing and the tile falls back to its name.
+    /// Brand mark token, already validated by [`pf_client_core::library::GameEntry::icon_token`]. Empty or unknown draws nothing.
     pub icon: String,
-    /// The system this title runs on (`"PC"`, `"PS2"`, …) — the host's own free-form display
-    /// string, passed through untouched. `None` for a store-front game whose host said
-    /// nothing, which is the common case: the rom-manager plugin populates this, Steam does
-    /// not. [`crate::collate`] is where that `None` is given a meaning.
+    /// Host free-form display string (`"PC"`, `"PS2"`, …). `None` until [`crate::collate`] assigns a bucket.
     pub platform: Option<String>,
-    /// This title is already up on the host, so picking it RESUMES rather than starts — read
-    /// from `/api/v1/status` and applied by [`LibraryShared::set_running`].
+    /// Already up on the host — pick resumes. From `/api/v1/status` via [`LibraryShared::set_running`].
     ///
-    /// Host state, never catalog state. It is deliberately not part of what the catalog cache
-    /// persists (that stores `pf_client_core::library::GameEntry`, which has no such field), so
-    /// a shelf served from disk can never claim a game is running because it was running the
-    /// last time anyone looked.
-    ///
-    /// `false` for every older host and while the `/status` read is still in flight — the
-    /// degradation is a Resume badge that appears a moment late, which is why the read is
-    /// allowed to lag the catalog rather than hold it back.
+    /// Host state, not catalog state: not on `GameEntry`, not persisted. A disk shelf cannot
+    /// claim a title is running because it was last time. `false` on older hosts and while
+    /// `/status` is in flight; the badge may appear a frame late rather than hold the catalog.
     pub running: bool,
 }
 
-/// Whether the shelf on screen is an observation or a memory — and, if a memory, whether
-/// anything is still being done about it.
+/// Observation vs memory, and whether a memory is still being fetched.
 ///
-/// Three states rather than a flag because the two cached ones want different words. "Waking the
-/// host…" says a shelf is about to become current; "Last known library" says it isn't going to.
-/// Telling a player the first thing while nothing is happening is the kind of lie a progress
-/// indicator tells, and it is worth one extra variant to never tell it.
+/// Three states because Waking and Offline need different shelf copy. A boolean would
+/// say "waking" while nothing is happening.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Stale {
-    /// These titles came from the host just now.
     No,
     /// Served from the disk cache while the host is being woken and re-asked.
     Waking,
-    /// Served from the disk cache, and the host never answered. Not an error phase: the titles
-    /// are still the right ones to choose from, and replacing them with a red message because a
-    /// box is asleep is precisely what the cache exists to prevent.
+    /// Disk cache; the host never answered. Not an error: these are still the titles to pick from.
     Offline,
 }
 
 impl Stale {
-    /// The line the shelf shows, or `None` when there is nothing to say.
     pub(crate) fn note(self) -> Option<&'static str> {
         match self {
             Stale::No => None,
@@ -869,32 +733,20 @@ impl Stale {
 struct Shared {
     phase: LibraryPhase,
     games: Vec<LibraryGame>,
-    /// Whether these titles came off the disk cache rather than off the host, and what the shelf
-    /// should say about it. Reset to [`Stale::No`] by the live [`LibraryShared::set_games`] that
-    /// reconciles a cached render.
+    /// Disk cache vs live host. Live [`LibraryShared::set_games`] resets this to [`Stale::No`].
     stale: Stale,
     /// Fetched poster bytes the renderer hasn't decoded yet (id, encoded image).
     art_in: VecDeque<(String, Vec<u8>)>,
     /// Bumped on phase/games changes so the renderer re-syncs its snapshot.
     generation: u64,
-    /// Bumped once per FETCH, by [`LibraryShared::begin_fetch`].
+    /// Bumped once per fetch, by [`LibraryShared::begin_fetch`].
     ///
-    /// Exists so a shelf can tell "the list in this model is the one MY fetch produced" from
-    /// "it is the previous host's, still sitting here" — WITHOUT having to catch a transient
-    /// phase in the act. That used to be inferred by observing a non-`Ready` phase from the
-    /// render loop, which held only because the first thing a fetch did was block on the network
-    /// for hundreds of milliseconds. The catalog cache broke it: a warm cache publishes `Ready`
-    /// a millisecond after `Loading`, well inside one 60 Hz frame, so a shelf could go from the
-    /// previous host's `Ready` straight to its own and never see the `Loading` between them.
-    /// A counter cannot be missed the way a passing state can.
+    /// Distinguishes "this shelf's list" from "the previous host's, still here" without
+    /// catching `Loading`. A warm cache publishes `Ready` inside one 60 Hz frame, so a
+    /// phase edge can be missed; a counter cannot.
     fetch_epoch: u64,
 }
 
-/// One consistent read of the shared model.
-///
-/// A struct rather than the tuple this used to be: `stale` made it a four-tuple, and by then
-/// every call site was destructuring positionally into names it chose itself, which is how a
-/// caller ends up reading the generation as the phase.
 pub(crate) struct LibrarySnapshot {
     pub phase: LibraryPhase,
     pub games: Vec<LibraryGame>,
@@ -902,8 +754,7 @@ pub(crate) struct LibrarySnapshot {
     pub generation: u64,
 }
 
-/// The binary's write handle / the overlay's read handle — fetch threads push into it,
-/// the renderer drains per frame. Cheap locks, no rendering data inside.
+/// Binary write handle / overlay read handle. Fetch threads push; the renderer drains per frame.
 #[derive(Clone)]
 pub struct LibraryShared(Arc<Mutex<Shared>>);
 
@@ -921,26 +772,20 @@ impl Default for LibraryShared {
 }
 
 impl LibraryShared {
-    /// A fetch for a host is starting: the model goes to `Loading` and the epoch advances.
+    /// A fetch is starting: `Loading`, and the epoch advances.
     ///
-    /// Every fetch must come through here rather than through `set_phase(Loading)`, because the
-    /// epoch is what tells a freshly-pushed shelf that the titles it is looking at are its own —
-    /// see `Shared::fetch_epoch`. A fetch that only set the phase would be invisible to a shelf
-    /// whose disk cache answered before the next frame.
+    /// Must go through here, not `set_phase(Loading)`. A cache that answers before the next
+    /// frame would otherwise leave the epoch unchanged and the shelf on the previous host.
     pub fn begin_fetch(&self) {
         let mut s = self.0.lock().unwrap();
         s.phase = LibraryPhase::Loading;
-        // The previous host's staleness is not this fetch's: a cached render re-declares it a
-        // moment from now, and until then the shelf must not carry a note about a library it is
-        // no longer showing.
+        // Previous host's stale note is not this fetch's; a cached render re-declares it.
         s.stale = Stale::No;
         s.fetch_epoch += 1;
         s.generation += 1;
     }
 
-    /// Which fetch the model is on. A shelf records this when it is pushed and compares later;
-    /// any difference means a fetch has begun since, so what is in the model now belongs to it
-    /// rather than to the host it replaced.
+    /// Fetch the model is on. A shelf records this at push; a later difference means a new fetch owns the list.
     pub(crate) fn fetch_epoch(&self) -> u64 {
         self.0.lock().unwrap().fetch_epoch
     }
@@ -951,31 +796,21 @@ impl LibraryShared {
         s.generation += 1;
     }
 
-    /// Loaded games → the carousel (empty = the empty scene). The titles came from the HOST, so
-    /// whatever staleness a cached render declared is over.
+    /// Host titles → carousel (empty = empty scene). Clears cached staleness.
     ///
-    /// **Launcher entries are moved to the front, keeping the host's title order within each
-    /// group.** Grouping here rather than in the renderer means the carousel's cursor arithmetic,
-    /// the art pump and every future consumer of this model all inherit the invariant for free —
-    /// a launcher tile is never buried in the middle of a 400-title shelf.
+    /// Launchers move to the front, host title order kept within each group. Grouping here
+    /// so cursor math, the art pump, and [`GridShape`] all see the same prefix.
     pub fn set_games(&self, games: Vec<LibraryGame>) {
         self.put_games(games, Stale::No);
     }
 
-    /// The same, for a catalog served from the on-disk cache while the host is still being
-    /// asked. Identical in every way except that the shelf knows to say these titles are
-    /// remembered rather than observed.
-    ///
-    /// Not an error state and not a lesser one: a cached library is a working library, and a host
-    /// that is still waking is the case the cache exists to serve. The live fetch is always in
-    /// flight behind it.
+    /// Disk-cache catalog while the host is still being asked. Live fetch stays in flight.
     pub fn set_games_cached(&self, games: Vec<LibraryGame>) {
         self.put_games(games, Stale::Waking);
     }
 
-    /// Update what the shelf says about a cached catalog without disturbing the catalog itself —
-    /// the retry window closing on a host that never answered. A no-op on a live shelf, so a late
-    /// give-up from an abandoned fetch can never mark a freshly-fetched library stale.
+    /// Shelf copy about a cached catalog, catalog unchanged. No-op on a live shelf, so a late
+    /// abandoned-fetch give-up cannot mark a fresh library stale.
     pub fn set_stale(&self, stale: Stale) {
         let mut s = self.0.lock().unwrap();
         if s.stale == stale || s.stale == Stale::No {
@@ -998,16 +833,10 @@ impl LibraryShared {
         s.generation += 1;
     }
 
-    /// Mark which titles the host currently has up, by library id, and re-order accordingly.
+    /// Titles currently up, by library id; re-order. `/status` is read after the catalog.
+    /// Empty set clears every badge (older or unreachable host).
     ///
-    /// Separate from [`set_games`] because it arrives separately: `/status` is read AFTER the
-    /// catalog so a slow answer can't hold the titles back, and it is re-read when a stream ends
-    /// (the player has just quit something, which is exactly when this changes). Called with an
-    /// empty set on an older host or an unreachable one, which correctly clears every badge.
-    ///
-    /// A no-op — no generation bump, so no re-sync and no cursor disturbance — when nothing
-    /// actually changed. That matters: this is polled, and a shelf that re-sorted every few
-    /// seconds on identical data would be a shelf that flickers.
+    /// No-op — no generation bump — when nothing changed. This is polled.
     pub fn set_running(&self, up: &std::collections::HashSet<String>) {
         let mut s = self.0.lock().unwrap();
         let mut changed = false;
@@ -1031,7 +860,6 @@ impl LibraryShared {
         self.0.lock().unwrap().art_in.push_back((id, bytes));
     }
 
-    /// Renderer side: the generation stamp (re-snapshot on change).
     pub(crate) fn generation(&self) -> u64 {
         self.0.lock().unwrap().generation
     }
@@ -1046,27 +874,20 @@ impl LibraryShared {
         }
     }
 
-    /// Take at most `max` newly fetched posters, leaving the rest queued.
+    /// At most `max` newly fetched posters; the rest stay queued.
     ///
-    /// Bounded because the renderer DECODES what this hands it, on the render thread. A
-    /// library whose art all lands at once — the fake-library dev hook reads it off local
-    /// disk, and a warm host proxy is nearly as fast — would otherwise put two hundred JPEG
-    /// decodes in one frame. What stays behind costs the queue its ENCODED bytes, two orders
-    /// of magnitude smaller than the raster they become.
+    /// Bounded: the renderer decodes on the render thread. Encoded bytes left behind are
+    /// two orders smaller than the rasters they become.
     pub(crate) fn drain_art(&self, max: usize) -> Vec<(String, Vec<u8>)> {
         let mut s = self.0.lock().unwrap();
         let n = max.min(s.art_in.len());
         s.art_in.drain(..n).collect()
     }
 
-    /// Take at most `max` queued posters FROM `want`, leaving every other one where it is.
+    /// At most `max` queued posters in `want`; every other entry stays.
     ///
-    /// The collections screen is the caller, and it is the only screen that draws a handful
-    /// of named covers rather than whatever arrives. Draining the queue wholesale there
-    /// would be a quiet disaster: the bytes are pushed once per fetch and never re-sent, so
-    /// everything it took and could not fan would be gone before the shelf a tile opens ever
-    /// asked — a library of monograms, one screen further in. This takes the dozen covers
-    /// that tile the collections and leaves the other four hundred queued for the shelf.
+    /// Bytes are pushed once per fetch and never re-sent. A wholesale drain on collections
+    /// would drop covers the shelf still needs.
     pub(crate) fn take_art_for(
         &self,
         want: &std::collections::HashSet<String>,
@@ -1086,20 +907,10 @@ impl LibraryShared {
     }
 }
 
-/// The shelf's display order, in the one place every writer of the model goes through.
+/// Shelf display order, the one path every writer uses.
 ///
-/// Two rules, in this order:
-/// 1. **Launcher entries lead** (design D4). Non-negotiable and applied FIRST, because the grid's
-///    layout is built on it: [`GridShape`] is told a launcher COUNT and treats those entries as a
-///    prefix, giving them rows of their own. Let a running game jump ahead of a launcher and the
-///    cursor arithmetic and the renderer would be laying out two different fields.
-/// 2. **Running titles lead within their group.** Getting back into what is already up should be
-///    the first thing on the shelf rather than something to scroll for — and a launcher that is
-///    up still belongs with the launchers, which is what makes the two rules compose instead of
-///    fighting.
-///
-/// `sort_by_key` is stable, so this is a pair of partitions that preserves the host's own title
-/// order inside each of the four resulting bands.
+/// Launchers first (the [`GridShape`] prefix). Running titles lead within their group.
+/// `sort_by_key` is stable, so host title order survives inside each band.
 fn order(games: &mut [LibraryGame]) {
     games.sort_by_key(|g| (!g.launcher, !g.running));
 }
@@ -1118,7 +929,6 @@ pub fn store_label(store: &str) -> &'static str {
     }
 }
 
-/// Monogram for the placeholder tile: the first letters of the first two words.
 pub fn initials(title: &str) -> String {
     title
         .split_whitespace()
@@ -1132,15 +942,10 @@ pub fn initials(title: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The shared console parity vectors — `clients/shared/console-vectors.json`, the sibling of
-    /// `deeplink-vectors.json` and read the same way (`include_str!`, so a missing file is a
-    /// compile error rather than a skipped test).
+    /// Parity with `clients/shared/console-vectors.json` (`include_str!`: missing file fails compile).
     ///
-    /// This table lives in THREE hand-written copies — here, `GamepadPalette.kt` and
-    /// `GamepadPalette.swift` — and until now nothing but prose held them together. What the file
-    /// pins is not only the 13 palette definitions but the DERIVED 16-cell mesh each one produces,
-    /// which is the half that actually reaches the screen and the half a transcription slip would
-    /// change invisibly.
+    /// Three copies: here, `GamepadPalette.kt`, `GamepadPalette.swift`. The file pins the
+    /// 13 palettes and the derived 16-cell mesh each one produces.
     #[test]
     fn shared_console_vectors() {
         let raw = include_str!("../../../clients/shared/console-vectors.json");
@@ -1188,7 +993,6 @@ mod tests {
             close(&format!("{id} accent.g"), p.accent.1, a[1]);
             close(&format!("{id} accent.b"), p.accent.2, a[2]);
 
-            // The derived tables — the ones that reach the shader and the fallback field.
             let mesh = p.mesh_colors();
             let wm = w["mesh"].as_array().expect("mesh");
             assert_eq!(wm.len(), mesh.len(), "{id} mesh cells");
@@ -1210,10 +1014,6 @@ mod tests {
         }
     }
 
-    /// The art queue hands the renderer a BOUNDED batch and keeps the rest, in arrival
-    /// order. The renderer decodes what it takes, on the render thread, so an unbounded
-    /// drain is a frame as long as the library is big — and the first frame after a fast
-    /// host answered is exactly when the whole library lands at once.
     #[test]
     fn art_drains_in_bounded_batches_and_keeps_the_order() {
         let shared = LibraryShared::default();
@@ -1231,10 +1031,7 @@ mod tests {
         assert!(shared.drain_art(2).is_empty());
     }
 
-    /// A selective take is the collections screen's whole art story: it takes the few covers
-    /// it fans and LEAVES everything else queued, in order, for the shelf that opens next.
-    /// The property is what stays behind — the poster bytes are pushed once per fetch and
-    /// never re-sent, so anything taken by a screen that cannot draw it is lost for good.
+    /// Poster bytes are pushed once per fetch and never re-sent; anything taken and not drawn is gone.
     #[test]
     fn a_selective_take_leaves_everything_it_did_not_ask_for() {
         let shared = LibraryShared::default();
@@ -1258,8 +1055,6 @@ mod tests {
         assert_eq!(rest, ["g0", "g2", "g3", "g5"], "the rest is untouched");
     }
 
-    /// …and it is bounded the same way the plain drain is: the caller DECODES what it takes,
-    /// on the render thread, so a library that lands all at once must not become one frame.
     #[test]
     fn a_selective_take_is_bounded_too() {
         let shared = LibraryShared::default();
@@ -1276,7 +1071,6 @@ mod tests {
         );
     }
 
-    /// The GTK launcher's cursor tests, ported with the math.
     #[test]
     fn step_refuses_the_ends() {
         assert_eq!(step_cursor(0, 5, -1, false), StepResult::Boundary);
@@ -1285,9 +1079,7 @@ mod tests {
         assert_eq!(step_cursor(0, 0, 1, false), StepResult::Boundary);
     }
 
-    /// Every shape the grid can take: the launcher-less field, a Deck's seven columns with
-    /// the usual two launchers, a launcher run that fills a row and a half, the degenerate
-    /// two-cell sections, and a single column.
+    /// Launcher-less, prefix, partial launcher row, degenerate two-cell, and single-column fields.
     const SHAPES: [(usize, usize, usize); 9] = [
         (11, 4, 0),
         (40, 5, 0),
@@ -1300,10 +1092,7 @@ mod tests {
         (13, 1, 2),
     ];
 
-    /// The invariant the two old layout models broke: a cell's coordinates and its row's
-    /// start have to be the same statement. Rows tile `0..len` in order, no index is in two
-    /// of them, and none is in none — which is what makes "the ring is where the scroll
-    /// says it is" true by construction rather than by coincidence.
+    /// Rows tile `0..len` once: `cell_of` and `row_start` agree; no index in two rows or in none.
     #[test]
     fn grid_rows_tile_the_field_exactly_once() {
         for (len, cols, launchers) in SHAPES {
@@ -1323,10 +1112,7 @@ mod tests {
         }
     }
 
-    /// The grid's two different boundary rules, which is the whole subtlety of the
-    /// horizontal step: a row END refuses (like the shelf), and it is the row's TRUE end —
-    /// not `cols`, which is a different number in every partial row and in the whole games
-    /// section under a launcher prefix.
+    /// Horizontal step refuses at the row's true end, not at `cols` (partial rows, launcher prefix).
     #[test]
     fn grid_horizontal_moves_walk_the_row_and_refuse_its_true_ends() {
         for (len, cols, launchers) in SHAPES {
@@ -1341,8 +1127,7 @@ mod tests {
                     }
                 };
                 let i = i as i32;
-                // The hint must not reach a horizontal move: it is the column you WOULD
-                // return to, not the one you are walking out of.
+                // Hint is the column you would return to, not the one a horizontal step walks out of.
                 for hint in 0..cols {
                     assert_eq!(
                         grid_step(i, s, hint, GridDir::Left),
@@ -1359,10 +1144,6 @@ mod tests {
         }
     }
 
-    /// Vertical moves change the ROW and nothing else. A move that has a row to go to always
-    /// goes there — never sideways within the row it is already in, which is what crossing
-    /// the launcher/games boundary used to do — and it arrives in the remembered column,
-    /// clamped into whatever that row can hold.
     #[test]
     fn grid_vertical_moves_change_row_and_carry_the_column() {
         const VERTICAL: [(GridDir, i32); 4] = [
@@ -1387,9 +1168,7 @@ mod tests {
                                     assert_eq!(c, hint.min(s.row_len(r) - 1), "{what} column");
                                 }
                             }
-                            // Only the field's own edges refuse; a page already at the edge
-                            // still travels along the row it is on, so it refuses only from
-                            // that row's end.
+                            // Field edges refuse. A page already at the edge travels the current row.
                             StepResult::Boundary => assert_eq!(want_row, row, "{what} refused"),
                         }
                     }
@@ -1398,9 +1177,6 @@ mod tests {
         }
     }
 
-    /// Both sections stay reachable from anywhere in the other, in a bounded number of
-    /// presses. This is the user's actual complaint — a launcher row you could see but not
-    /// get back into — stated as a property.
     #[test]
     fn every_row_is_reachable_by_stepping() {
         for (len, cols, launchers) in SHAPES {
@@ -1421,37 +1197,31 @@ mod tests {
         }
     }
 
-    /// The Deck, exactly: 1280×800 gives seven columns, and a host with the usual two
-    /// launchers puts them alone on row 0 with the games restarting at column 0 under them.
-    /// Every value here is one the uniform-grid arithmetic got wrong.
+    /// Two launchers on seven columns: alone on row 0, games restart at column 0.
     #[test]
     fn the_launcher_row_sits_squarely_above_the_games() {
         let s = GridShape::new(30, 7, 2);
         assert_eq!(s.rows(), 5);
         assert_eq!((s.row_len(0), s.row_len(1)), (2, 7));
-        // Down from a launcher lands on the cover UNDER it, not five columns to the right.
+        // Down from a launcher lands on the cover under it, not five columns right.
         assert_eq!(grid_step(0, s, 0, GridDir::Down), StepResult::Moved(2));
         assert_eq!(grid_step(1, s, 1, GridDir::Down), StepResult::Moved(3));
-        // …and Up out of the games band leaves it, rather than sliding along it.
+        // Up out of the games band leaves it, rather than sliding along it.
         assert_eq!(grid_step(2, s, 0, GridDir::Up), StepResult::Moved(0));
         assert_eq!(grid_step(3, s, 1, GridDir::Up), StepResult::Moved(1));
         assert_eq!(grid_step(6, s, 4, GridDir::Up), StepResult::Moved(1));
-        // The games row's true ends are 2 and 8 — 6 and 7 are mid-row, and 8 is the end.
+        // Games row true ends are 2 and 8 — 6 and 7 are mid-row.
         assert_eq!(grid_step(6, s, 4, GridDir::Right), StepResult::Moved(7));
         assert_eq!(grid_step(7, s, 5, GridDir::Left), StepResult::Moved(6));
         assert_eq!(grid_step(8, s, 6, GridDir::Right), StepResult::Boundary);
         assert_eq!(grid_step(2, s, 0, GridDir::Left), StepResult::Boundary);
     }
 
-    /// The remembered column is what makes a crossing reversible: stepping down through a
-    /// two-wide launcher row and back must return to the column you set out from, not pin
-    /// you to the column the narrow row could hold.
     #[test]
     fn a_crossing_returns_to_the_column_it_started_from() {
         use GridDir::{Down, Right, Up};
         let s = GridShape::new(30, 7, 2);
-        // The screen's own rule, in one place: `LibraryScreen::grid_move` steps the cursor
-        // and re-reads the hint through exactly these two calls.
+        // Mirrors `LibraryScreen::grid_move`: step, then `grid_col_hint`.
         let walk = |start: i32, dirs: &[GridDir]| {
             let (mut cursor, mut hint) = (start, s.cell_of(start.max(0) as usize).1);
             for &dir in dirs {
@@ -1463,9 +1233,8 @@ mod tests {
             cursor
         };
         assert_eq!(walk(0, &[Down, Right, Right, Right, Right]), 6);
-        // Up parks in the launcher row's only reachable column…
         assert_eq!(walk(0, &[Down, Right, Right, Right, Right, Up]), 1);
-        // …and Down restores the column, twice over — a vertical move never spends it.
+        // A vertical move never spends the hint.
         assert_eq!(walk(0, &[Down, Right, Right, Right, Right, Up, Down]), 6);
         assert_eq!(
             walk(0, &[Down, Right, Right, Right, Right, Up, Down, Up, Down]),
@@ -1480,8 +1249,7 @@ mod tests {
             grid_step(0, s, 0, GridDir::PageForward),
             StepResult::Moved(15)
         );
-        // A page past the end lands ON the end rather than refusing — a jump is a
-        // "take me there", the same reading `step_cursor`'s clamped mode has.
+        // Page past the end lands on the end (clamped `step_cursor`), it does not refuse.
         assert_eq!(
             grid_step(35, s, 0, GridDir::PageForward),
             StepResult::Moved(39)
@@ -1494,30 +1262,24 @@ mod tests {
         assert_eq!(grid_step(0, s, 0, GridDir::PageBack), StepResult::Boundary);
     }
 
-    /// The launcher-less grid, unchanged: this is the field the old arithmetic got right,
-    /// and the proof that sharing the shape did not move it.
     #[test]
     fn grid_rows_refuse_at_their_ends_but_the_tail_row_clamps() {
         // 11 items, 4 columns: rows of 4, 4, 3.
         let s = GridShape::new(11, 4, 0);
         assert_eq!(grid_step(1, s, 1, GridDir::Right), StepResult::Moved(2));
         assert_eq!(grid_step(2, s, 2, GridDir::Left), StepResult::Moved(1));
-        // At a row's ends: refused, NOT wrapped onto the neighbouring row.
+        // At a row's ends: refused, not wrapped onto the neighbouring row.
         assert_eq!(grid_step(3, s, 3, GridDir::Right), StepResult::Boundary);
         assert_eq!(grid_step(4, s, 0, GridDir::Left), StepResult::Boundary);
-        // Down from the top row lands directly below.
         assert_eq!(grid_step(1, s, 1, GridDir::Down), StepResult::Moved(5));
-        // Down into the SHORT tail row clamps to the last item rather than thudding —
-        // column 3 does not exist down there.
+        // Down into the short tail row clamps to the last item — column 3 does not exist there.
         assert_eq!(grid_step(7, s, 3, GridDir::Down), StepResult::Moved(10));
-        // …and once there, Down really is the end.
         assert_eq!(grid_step(10, s, 3, GridDir::Down), StepResult::Boundary);
         assert_eq!(grid_step(2, s, 2, GridDir::Up), StepResult::Boundary);
         assert_eq!(grid_step(6, s, 2, GridDir::Up), StepResult::Moved(2));
     }
 
-    /// The persisted view name is a FILE FORMAT, and an unknown one must land on the shelf
-    /// — a newer client writing `"coverwall"` must not leave this one with no arrangement.
+    /// Persisted view name is a file format. Unknown → shelf.
     #[test]
     fn library_view_parses_leniently() {
         assert_eq!(LibraryView::parse("grid"), LibraryView::Grid);
@@ -1543,16 +1305,13 @@ mod tests {
         let thin = GridShape::new(5, 1, 0);
         assert_eq!(grid_step(1, thin, 0, GridDir::Right), StepResult::Boundary);
         assert_eq!(grid_step(1, thin, 0, GridDir::Down), StepResult::Moved(2));
-        // A cursor the library outgrew reads as the nearest real cell, so the next press
-        // heals it rather than compounding it.
+        // A cursor the library outgrew reads as the nearest real cell; the next press heals it.
         let s = GridShape::new(6, 3, 2);
         assert_eq!(grid_step(99, s, 0, GridDir::Up), StepResult::Moved(2));
         assert_eq!(grid_step(-4, s, 0, GridDir::Right), StepResult::Moved(1));
     }
 
-    /// Design D4: launcher entries lead the shelf, and the host's title order survives within
-    /// each group. The renderer's `launcher_count()` reads the launcher group as the prefix
-    /// `0..n`, so an interleaved list would silently mislabel the group heading.
+    /// Launchers lead; host title order survives within each group. `launcher_count()` is prefix `0..n`.
     #[test]
     fn set_games_groups_launchers_first_and_keeps_title_order() {
         let g = |title: &str, launcher: bool| LibraryGame {
@@ -1579,9 +1338,7 @@ mod tests {
         assert_eq!(snap.games.iter().take_while(|g| g.launcher).count(), 2);
     }
 
-    /// Running titles lead — but WITHIN their group, so the launcher prefix the grid's
-    /// [`GridShape`] is built on survives. A running game jumping ahead of a launcher would put
-    /// the cursor arithmetic and the renderer on two different fields.
+    /// Running titles lead within their group; the launcher prefix [`GridShape`] counts stays intact.
     #[test]
     fn running_titles_lead_without_breaking_the_launcher_prefix() {
         let g = |title: &str, launcher: bool| LibraryGame {
@@ -1601,7 +1358,6 @@ mod tests {
             g("Heroic", true),
             g("Tunic", false),
         ]);
-        // Portal 2 and Heroic are up — one of each group.
         let up: std::collections::HashSet<String> = ["steam:Portal 2", "steam:Heroic"]
             .iter()
             .map(|s| s.to_string())
@@ -1621,21 +1377,18 @@ mod tests {
         );
         assert!(snap.games[0].running && snap.games[2].running);
 
-        // Re-applying the SAME set changes nothing and must not bump the generation — this is
-        // polled, and a shelf that re-synced on identical data would be a shelf that flickers.
+        // Same set: no generation bump. This is polled.
         let gen_before = snap.generation;
         shared.set_running(&up);
         assert_eq!(shared.snapshot().generation, gen_before);
 
-        // The game quit: the badge clears and the shelf re-sorts back.
         shared.set_running(&std::collections::HashSet::new());
         let after = shared.snapshot();
         assert!(after.games.iter().all(|g| !g.running));
         assert!(after.generation > gen_before, "a real change does re-sync");
     }
 
-    /// A cached catalog is a normal `Ready` shelf that merely knows it is a memory — never an
-    /// error, and never a lesser phase. The live fetch reconciling it clears the flag.
+    /// Cached catalog is `Ready` + stale, never an error. Live `set_games` clears the flag.
     #[test]
     fn a_cached_catalog_is_ready_and_stale_until_the_host_answers() {
         let g = |t: &str| LibraryGame {
@@ -1670,8 +1423,6 @@ mod tests {
         assert_eq!(shared.snapshot().stale, Stale::No);
     }
 
-    /// A library with no launcher entries is untouched — the whole point of the grouping being
-    /// invisible until a plugin actually publishes a launcher tile.
     #[test]
     fn set_games_leaves_a_launcher_less_library_alone() {
         let shared = LibraryShared::default();
@@ -1705,7 +1456,7 @@ mod tests {
         assert_eq!(step_cursor(0, 5, -JUMP, true), StepResult::Boundary);
     }
 
-    /// Springs converge onto the target and stay finite through a stalled frame.
+    /// Stay finite through a stalled frame (0.05 s).
     #[test]
     fn springs_converge() {
         let (mut pos, mut vel) = (0.0, 0.0);
@@ -1720,7 +1471,7 @@ mod tests {
         );
     }
 
-    /// The focused card (angle 0, scale 1) maps its center to (cx, cy) exactly.
+    /// Focused card (angle 0, scale 1) maps its centre to (cx, cy) exactly.
     #[test]
     fn card_matrix_centers_the_focused_card() {
         let m = card_matrix(640.0, 400.0, 0.0, 1.0, POSTER_W, POSTER_H, PERSPECTIVE);
@@ -1733,8 +1484,7 @@ mod tests {
         assert!((py / pw - 400.0).abs() < 0.01, "{}", py / pw);
     }
 
-    /// A right-side card's INNER (left) edge recedes: its projected x compresses toward
-    /// the center relative to the flat card — the coverflow corridor.
+    /// Right-side card: inner (left) edge recedes; projected x compresses toward the centre.
     #[test]
     fn side_card_inner_edge_recedes() {
         let flat = card_matrix(900.0, 400.0, 0.0, 1.0, POSTER_W, POSTER_H, PERSPECTIVE);
@@ -1768,8 +1518,7 @@ mod tests {
         assert_eq!(initials("half-life"), "H");
     }
 
-    /// The generated SkSL parses as far as syntax we control (sanity: balanced braces, all
-    /// 16 colours baked in, the five bicubic evals and four interior warp terms present).
+    /// Generated SkSL: 16 colours baked, five bicubic evals, four interior warp terms, braces balanced.
     #[test]
     fn mesh_sksl_shape() {
         let src = mesh_sksl(&MESH_COLORS);
@@ -1779,9 +1528,6 @@ mod tests {
         assert_eq!(src.matches('{').count(), src.matches('}').count());
     }
 
-    /// The brand default must still be the SHIPPED field, colour for colour. Every install
-    /// already sees it, and a palette table that quietly restyled the default would be a
-    /// regression dressed as a feature.
     #[test]
     fn violet_is_the_untouched_shipped_field() {
         assert_eq!(PALETTES[0].id, "violet");
@@ -1814,9 +1560,7 @@ mod tests {
         Some((h + 360.0) % 360.0)
     }
 
-    /// A palette must read as SEVERAL hues, not one hue at several brightnesses — that was
-    /// exactly the complaint about the hue-rotation model this replaced. Measured as the
-    /// widest gap between any two of the 16 mesh colours' hue angles.
+    /// A palette is several hues, measured as the widest gap among the 16 mesh colours' hue angles.
     #[test]
     fn every_palette_is_multi_tone() {
         for p in &PALETTES {
@@ -1831,8 +1575,7 @@ mod tests {
                     })
                 })
                 .fold(0.0f64, f64::max);
-            // Graphite and Opal are deliberately near-neutral; everything else must carry a
-            // real hue journey.
+            // Graphite and Opal are deliberately near-neutral.
             let floor = if matches!(p.id, "graphite" | "opal") {
                 20.0
             } else {
@@ -1863,9 +1606,7 @@ mod tests {
         assert_eq!(first_light, 7);
     }
 
-    /// OLED is the one palette whose selling point is measurable: it has to be genuinely
-    /// black, not merely the darkest of the dark fields. Pure black corners, a mean well
-    /// under every other field's, and a ground that lifts to nothing on the form screens.
+    /// `oled` is genuinely black: pure-black corners, mean under every other field, ground lifts to nothing.
     #[test]
     fn oled_is_actually_black() {
         let luma = |c: (f64, f64, f64)| 0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2;
@@ -1911,8 +1652,7 @@ mod tests {
                 assert!(mean < 0.45, "{} is flagged dark but means {mean:.2}", p.id);
                 assert!(luma(p.ground) < 0.2, "{}'s ground is light", p.id);
             }
-            // The accent tints glass of the OPPOSITE polarity to the field, so it has to be
-            // legible there: dark accents on white frost, bright ones on dark glass.
+            // Accent tints glass of the opposite polarity: dark on white frost, bright on dark glass.
             let a = luma(p.accent);
             if p.light {
                 assert!(a < 0.45, "{}'s accent is too pale for white glass", p.id);

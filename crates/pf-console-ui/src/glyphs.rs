@@ -1,11 +1,12 @@
-//! Controller button glyphs and the hint bar — the "controls legend" pill every console
-//! screen pins bottom-leading (the Apple client resolves real SF glyphs per pad via
-//! `sfSymbolsName`; here the shapes are drawn). The style follows WHAT IS DRIVING the
-//! console (see `Shell::glyph_style`): PlayStation controllers read ✕/○/□/△, Nintendo
-//! pads read their own letter positions, everything else reads ABXY letters — and when
-//! the last input came from keys, the legend swaps to keyboard keycaps on the desktop or
-//! to TV-remote marks (OK, the back arrow, the D-pad) on Android, where key-driven input
-//! IS a remote. The console stays fully drivable in every one of them.
+//! Face-button glyphs and the bottom-leading hint-bar pill.
+//!
+//! Style is the last driver (`Shell::glyph_style`): PlayStation shapes, Nintendo
+//! engravings, ABXY letters, desktop keycaps, or Android TV-remote marks. A
+//! remote has no Y/X/shoulders; those hints resolve to `None` and take no layout.
+//! Apple draws SF Symbols via `sfSymbolsName`; this crate draws the shapes.
+//!
+//! Pin pads with [`GlyphStyle::from_pref`]. Keyboard vs Remote is the shell
+//! (platform). Tests in this file cover the Nintendo swap and the remote hide-set.
 
 use crate::theme::{fg, fill, stroke, Fonts, W};
 use punktfunk_core::config::GamepadPref;
@@ -13,28 +14,22 @@ use skia_safe::{Canvas, PathBuilder, Point, RRect, Rect};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GlyphStyle {
-    /// ABXY letter badges (Xbox / Steam Deck / generic).
+    /// Xbox / Steam Deck / generic.
     Letters,
-    /// PlayStation face shapes (DualSense / DualShock 4).
+    /// DualSense / DualShock 4.
     Shapes,
-    /// Nintendo letter badges: the same positional buttons, labelled the way the pad in
-    /// the user's hands is — south reads B, east A, west Y, north X. Without this a
-    /// Switch pad's legend says "A Select" over the button engraved B.
+    /// Switch: south is B, east is A. Without this the legend says "A Select"
+    /// over the engraved B.
     Nintendo,
-    /// Keys drive, on a desktop — keyboard keycaps.
+    /// Desktop keys: keycaps, not a remote.
     Keyboard,
-    /// Keys drive, on Android — a TV remote: OK, the back arrow, and the D-pad. A remote
-    /// has no Y/X and no shoulders, so hints that need them resolve to nothing and the
-    /// section hint points at the D-pad path instead.
+    /// Android keys: TV remote. No Y/X/shoulders — those hints resolve to `None`.
     Remote,
 }
 
 impl GlyphStyle {
-    /// The style a PAD speaks in, from the family its `Auto` virtual pad resolves to
-    /// ([`PadInfo::pref`](pf_client_core::menu_nav::PadInfo) — DualSense stays DualSense,
-    /// Switch Pro stays Switch Pro, everything else lands on an Xbox class). The keys-drive
-    /// styles are picked by the shell, which knows the platform; `None` (no pad) falls to
-    /// keycaps as the neutral default.
+    /// Pad family from [`PadInfo::pref`](pf_client_core::menu_nav::PadInfo).
+    /// `None` is Keyboard. Keyboard vs Remote is the shell (platform).
     pub(crate) fn from_pref(pref: Option<GamepadPref>) -> GlyphStyle {
         match pref {
             Some(GamepadPref::DualSense | GamepadPref::DualSenseEdge | GamepadPref::DualShock4) => {
@@ -47,9 +42,7 @@ impl GlyphStyle {
     }
 }
 
-/// A compact mark for WHAT is driving the console, drawn from `(x, cy)` across `w`: a
-/// controller silhouette, or a keycap when there is no pad and the keyboard is doing the
-/// work. Says at a glance which glyph set the legend below is speaking in.
+/// Keyboard and Remote are outlined; pads are filled.
 pub(crate) fn pad_mark(
     canvas: &Canvas,
     style: GlyphStyle,
@@ -61,7 +54,6 @@ pub(crate) fn pad_mark(
 ) {
     let mut p = fill(ink);
     if style == GlyphStyle::Keyboard {
-        // A keycap: the same shape the hint bar draws for a key, at chip size.
         let h = w * 0.72;
         let r = Rect::from_xywh(x as f32, (cy - h / 2.0) as f32, w as f32, h as f32);
         p.set_style(skia_safe::PaintStyle::Stroke);
@@ -73,8 +65,7 @@ pub(crate) fn pad_mark(
         return;
     }
     if style == GlyphStyle::Remote {
-        // A remote: a slim upright wand with its select ring near the top. Outlined like
-        // the keycap — the filled marks are for things with a body to fill.
+        // Outline, not fill — same as the keycap; filled marks are for a pad body.
         let rw = w * 0.42;
         let rh = w * 0.98;
         let body = Rect::from_xywh(
@@ -96,8 +87,7 @@ pub(crate) fn pad_mark(
         );
         return;
     }
-    // A gamepad: a wide rounded body with a grip under each end. Detail beyond the
-    // silhouette is invisible at 15 dp, so there is none — the outline IS the glyph.
+    // 15 dp: silhouette only; extra detail is invisible.
     let h = w * 0.52;
     let body = Rect::from_xywh(x as f32, (cy - h / 2.0) as f32, w as f32, h as f32);
     canvas.draw_rrect(
@@ -109,15 +99,11 @@ pub(crate) fn pad_mark(
     canvas.draw_circle(((x + w * 0.8) as f32, (cy + h * 0.36) as f32), grip, &p);
 }
 
-/// A four-segment charge pip, drawn from `(x, cy)` across `w`. Filled segments are the
-/// charge; the outline is always the full cell, so "one bar" and "four bars" occupy the
-/// same width and the chip never reflows as the pad drains.
+/// Outline is always the full cell so the chip never reflows as bars drop.
 ///
-/// Three states, in priority order. CHARGING takes the palette's accent and outranks the
-/// low warning, because a pad at 4 % on the cable is not the problem a pad at 4 % off it
-/// is. Otherwise under 20 % goes red — a fixed red, not the accent, for the same reason the
-/// error toast uses one: on a `moss` or `mint` field the accent is a colour that means
-/// "fine". Everything else is plain foreground.
+/// Charging uses accent and outranks the low warning (4 % on the cable is
+/// not 4 % off it). Under 20 % is a fixed red, not accent: on `moss`/`mint`
+/// the accent means "fine".
 pub(crate) fn battery_pip(
     canvas: &Canvas,
     x: f64,
@@ -138,7 +124,7 @@ pub(crate) fn battery_pip(
     let outline = stroke(ink, (1.2 * k) as f32);
     let r = (2.0 * k) as f32;
     canvas.draw_rrect(RRect::new_rect_xy(cell, r, r), &outline);
-    // The terminal nub, so the cell reads as a battery and not as a text field.
+    // Terminal nub — without it the cell reads as a text field.
     canvas.draw_rrect(
         RRect::new_rect_xy(
             Rect::from_xywh(
@@ -152,8 +138,7 @@ pub(crate) fn battery_pip(
         ),
         &fill(ink),
     );
-    // Four segments, rounded UP so a pad with any charge left always shows at least one —
-    // an empty-looking cell on a pad that still works reads as broken.
+    // Ceil so any remaining charge shows at least one bar; empty-looking-but-alive reads as broken.
     let filled = ((f32::from(b.percent) / 100.0) * 4.0)
         .ceil()
         .clamp(0.0, 4.0) as i32;
@@ -173,8 +158,7 @@ pub(crate) fn battery_pip(
     }
 }
 
-/// What a hint's glyph depicts. `Key` renders a literal keycap chip in any style (used
-/// for keyboard fallbacks and the Deck's "Steam + X" keyboard chord).
+/// `Key` is a literal keycap in any style (Deck "Steam + X").
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HintKey {
     Confirm,
@@ -182,15 +166,12 @@ pub(crate) enum HintKey {
     Secondary,
     Tertiary,
     Shoulders,
-    /// ◀ ▶ — left/right adjusts the focused value.
     Adjust,
-    /// ▲ — up raises the focused item's context menu, on a screen with up to spare. Where
-    /// there isn't (the library grid spends up on rows) the same menu hangs off
-    /// [`HintKey::Tertiary`] instead; the button differs, the word "Options" does not.
+    /// Context menu when up is spare. The library grid spends up on rows, so
+    /// Options hangs off [`HintKey::Tertiary`] there.
     Up,
-    /// ▼ — the home carousel's other spare direction, which opens Settings. Advertised in
-    /// place of [`HintKey::Tertiary`] where no pad is attached, because that is exactly the
-    /// device that has no X to press: a TV remote is a D-pad, OK and Back.
+    /// Settings on the home carousel. Shown instead of [`HintKey::Tertiary`]
+    /// when no pad — a remote has no X.
     Down,
     Key(&'static str),
 }
@@ -210,19 +191,15 @@ impl Hint {
 }
 
 const LABEL_SIZE: f64 = 14.0;
-const BADGE_D: f64 = 22.0; // face-button badge diameter
+const BADGE_D: f64 = 22.0; // dp
 
-/// What a drawn hint bar left behind.
 pub(crate) struct HintBar {
-    /// The pill's `(width, height)`.
     pub size: (f64, f64),
-    /// One hit box per hint, in the order they were given. The legend is also the console's
-    /// only on-screen list of what the face buttons do, so for a pointer — which has no
-    /// face buttons — it doubles as the button bar itself.
+    /// Pointers have no face buttons, so this is the button bar.
     pub rects: Vec<(HintKey, Rect)>,
 }
 
-/// The hint bar pill, anchored at its BOTTOM-LEFT corner.
+/// Anchored at its bottom-left.
 pub(crate) fn hint_bar(
     canvas: &Canvas,
     fonts: &Fonts,
@@ -241,8 +218,7 @@ pub(crate) fn hint_bar(
     let pad = 13.0 * k;
     let gap_hint = 18.0 * k;
     let gap_glyph = 7.0 * k;
-    // Hints with no honest glyph in this style (a remote's missing Y/X) are dropped
-    // here, before layout — they take no width, draw nothing and get no hit box.
+    // Drop unresolvable hints before layout so they take no width or hit box.
     let shown: Vec<&Hint> = hints
         .iter()
         .filter(|h| resolved(h.key, style).is_some())
@@ -267,11 +243,8 @@ pub(crate) fn hint_bar(
     let h = BADGE_D * k + 2.0 * pad;
     let w = content_w + 2.0 * pad;
     let rect = Rect::from_xywh((x) as f32, (bottom - h) as f32, w as f32, h as f32);
-    // A scrim under the glass, then the SHARED glass recipe — the legend used to mix its
-    // own (a flat `fg(0.06)` wash and a hand-rolled stroke), which meant it was the one
-    // floating surface in the console that didn't pick up the palette's glass. The scrim
-    // stays because this pill sits over the aurora at full contrast, where glass alone has
-    // little to separate it from the field. Same construction as the toast.
+    // Scrim then shared glass. The pill sits on the aurora at full contrast; glass
+    // alone does not separate it. Same construction as the toast.
     let corner = (h / 2.0 / k) as f32;
     canvas.draw_rrect(
         RRect::new_rect_xy(rect, (h / 2.0) as f32, (h / 2.0) as f32),
@@ -285,16 +258,14 @@ pub(crate) fn hint_bar(
         crate::theme::PanelStroke::Plain(0.12),
         k as f32,
     );
-    // One lit edge per frame for the whole legend — the cost discipline the highlight is
-    // rationed by counts ROWS, and this is chrome.
+    // One highlight for the whole pill: the ration counts rows, and this is chrome.
     crate::theme::panel_highlight(canvas, rect, corner, k as f32);
 
     let cy = bottom - h / 2.0;
     let mut pen = x + pad;
     let mut rects = Vec::with_capacity(shown.len());
     for (hint, (gw, lw)) in shown.iter().zip(&widths) {
-        // Glyph + label + half the gap to the next hint, full pill height: a comfortable
-        // target without stealing the neighbour's.
+        // Half the gap to the neighbour so the hit box is generous without overlapping.
         rects.push((
             hint.key,
             Rect::from_xywh(
@@ -306,7 +277,7 @@ pub(crate) fn hint_bar(
         ));
         draw_glyph(canvas, fonts, hint.key, style, pen, cy, k);
         pen += gw + gap_glyph;
-        // Baseline centered on the badge (cap height ≈ 0.72 em for Geist).
+        // +0.36 em ≈ half Geist cap-height (0.72 em), centering on the badge.
         fonts.draw(
             canvas,
             &hint.label,
@@ -324,7 +295,7 @@ pub(crate) fn hint_bar(
     }
 }
 
-/// `None` = the hint resolves to nothing in this style and takes no space (see [`resolved`]).
+/// `None` when the style has no glyph; the hint takes no space.
 fn glyph_width(fonts: &Fonts, key: HintKey, style: GlyphStyle, k: f64) -> Option<f64> {
     Some(match resolved(key, style)? {
         Resolved::Badge(_) | Resolved::Adjust => BADGE_D * k,
@@ -342,21 +313,15 @@ fn keycap_w(fonts: &Fonts, text: &str, k: f64) -> f64 {
     fonts.measure(text, W::SemiBold, 11.0 * k) as f64 + 14.0 * k
 }
 
-/// A hint key resolved against the glyph style.
 enum Resolved {
-    /// A face-button badge: the letter (Letters/Nintendo) or shape (Shapes).
     Badge(Face),
     Shoulders,
     Adjust,
-    /// The d-pad's up — drawn the same in every style, because it is a direction rather
-    /// than a button whose label changes with the pad.
+    /// Style-free: a direction, not a pad-labelled button.
     Up,
-    /// The d-pad's down — the same triangle stood on its head, and style-free for the
-    /// same reason [`Resolved::Up`] is.
+    /// Style-free, same reason as [`Resolved::Up`].
     Down,
-    /// A TV remote's select — a round badge that simply says OK.
     Ok,
-    /// A TV remote's back — the ↩ return arrow in a badge.
     BackArrow,
     Key(&'static str),
 }
@@ -369,11 +334,10 @@ enum Face {
     Y,
 }
 
-/// `None` = this hint has no honest glyph in this style and is not drawn at all: a TV
-/// remote has no Y/X, and advertising a button the device cannot press is worse than
-/// silence. (The touch path loses those two bar buttons in Remote style with it —
-/// acceptable: Remote only rules while KEYS drove last, and every such action still has
-/// an on-screen path.)
+/// `None` when the style has no glyph (a remote has no Y/X). Advertising a
+/// missing button is worse than silence. Touch loses those two bar buttons
+/// in Remote too; Remote only rules while keys drove last, and each action
+/// still has an on-screen path.
 fn resolved(key: HintKey, style: GlyphStyle) -> Option<Resolved> {
     if style == GlyphStyle::Keyboard {
         return Some(match key {
@@ -381,8 +345,7 @@ fn resolved(key: HintKey, style: GlyphStyle) -> Option<Resolved> {
             HintKey::Back => Resolved::Key("Esc"),
             HintKey::Secondary => Resolved::Key("Y"),
             HintKey::Tertiary => Resolved::Key("X"),
-            // Tab is the key a keyboard reaches for to change section; PgUp/PgDn still
-            // work, but naming both here makes the legend wider than the hint is worth.
+            // Tab, not PgUp/PgDn: naming both makes the legend wider than the hint is worth.
             HintKey::Shoulders => Resolved::Key("Tab"),
             HintKey::Adjust => Resolved::Adjust,
             HintKey::Up => Resolved::Up,
@@ -394,12 +357,8 @@ fn resolved(key: HintKey, style: GlyphStyle) -> Option<Resolved> {
         return match key {
             HintKey::Confirm => Some(Resolved::Ok),
             HintKey::Back => Some(Resolved::BackArrow),
-            // A remote has no Y and no X. The screens' Y/X features stay reachable the
-            // ways their screens already provide; the legend just stops naming buttons
-            // that are not in the user's hand.
             HintKey::Secondary | HintKey::Tertiary => None,
-            // No shoulders either — the D-pad path to the strip (Up from the top row) is
-            // the section switcher a remote actually has, so the hint points up.
+            // No shoulders: Up from the top row is the remote's section switcher.
             HintKey::Shoulders => Some(Resolved::Up),
             HintKey::Adjust => Some(Resolved::Adjust),
             HintKey::Up => Some(Resolved::Up),
@@ -420,8 +379,7 @@ fn resolved(key: HintKey, style: GlyphStyle) -> Option<Resolved> {
     })
 }
 
-/// The letter a face badge shows: positional buttons, labelled the way the ACTIVE pad
-/// is engraved. Nintendo swaps both pairs — its south is B and its east is A.
+/// Nintendo swaps both pairs (south is B, east is A).
 fn face_letter(face: Face, style: GlyphStyle) -> &'static str {
     match (style, face) {
         (GlyphStyle::Nintendo, Face::A) => "B",
@@ -435,7 +393,7 @@ fn face_letter(face: Face, style: GlyphStyle) -> &'static str {
     }
 }
 
-/// Draw one glyph with its LEFT edge at `x`, vertically centered on `cy`.
+/// One glyph, left edge at `x`, vertically centered on `cy`.
 fn draw_glyph(
     canvas: &Canvas,
     fonts: &Fonts,
@@ -472,8 +430,6 @@ fn draw_glyph(
             }
         }
         Resolved::Ok => {
-            // The remote's select: the same badge as a face button, saying OK — the word
-            // printed on the remote itself.
             let r = BADGE_D * k / 2.0;
             let center = Point::new((x + r) as f32, cy as f32);
             canvas.draw_circle(center, r as f32, &fill(fg(0.10)));
@@ -491,13 +447,11 @@ fn draw_glyph(
             );
         }
         Resolved::BackArrow => {
-            // The remote's back: the ↩ return arrow in the same badge — a shaft curving
-            // home with an arrowhead at its left end.
             let r = BADGE_D * k / 2.0;
             let center = Point::new((x + r) as f32, cy as f32);
             canvas.draw_circle(center, r as f32, &fill(fg(0.10)));
             canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (1.2 * k) as f32));
-            // The set's return arrow, sized to sit inside the badge.
+            // 12.5 dp sits inside the 22 dp badge.
             crate::icons::draw_icon(
                 canvas,
                 crate::icons::CORNER_DOWN_LEFT,
@@ -517,7 +471,7 @@ fn draw_glyph(
                     RRect::new_rect_xy(rect, (4.0 * k) as f32, (4.0 * k) as f32),
                     &fill(fg(0.10)),
                 );
-                // The keycaps' hairline, so every container on the bar wears the same edge.
+                // Same hairline as the keycaps so every container shares one edge.
                 canvas.draw_rrect(
                     RRect::new_rect_xy(rect, (4.0 * k) as f32, (4.0 * k) as f32),
                     &stroke(fg(0.28), (1.2 * k) as f32),
@@ -537,8 +491,7 @@ fn draw_glyph(
             }
         }
         g @ (Resolved::Up | Resolved::Down) => {
-            // ▲ / ▼ as the set's chevron, stroked like every other mark — a direction is
-            // not a button, so it wears no badge.
+            // Direction, not a button: chevron, no badge.
             let r = BADGE_D * k / 2.0;
             let icon = if matches!(g, Resolved::Down) {
                 crate::icons::CHEVRON_DOWN
@@ -555,7 +508,6 @@ fn draw_glyph(
             );
         }
         Resolved::Adjust => {
-            // ◀ ▶ — the set's chevrons, one either side of the slot's centre.
             let r = BADGE_D * k / 2.0;
             let (cx, cyf) = ((x + r) as f32, cy as f32);
             let b = (20.0 * k) as f32;
@@ -586,8 +538,7 @@ fn draw_glyph(
             );
             canvas.draw_rrect(
                 RRect::new_rect_xy(rect, (5.0 * k) as f32, (5.0 * k) as f32),
-                // Scaled: an unscaled hairline read thinner than every other edge on a
-                // HiDPI screen.
+                // 1.2 * k: an unscaled hairline reads thinner than every other edge on HiDPI.
                 &stroke(fg(0.28), (1.2 * k) as f32),
             );
             let size = 11.0 * k;
@@ -605,8 +556,7 @@ fn draw_glyph(
     }
 }
 
-/// The PlayStation face shapes, stroked inside the badge: Confirm=✕, Back=○, X-position
-/// =□, Y-position=△ (the DualSense's physical layout).
+/// DualSense layout: Confirm=✕, Back=○, X-position=□, Y-position=△.
 fn draw_ps_shape(canvas: &Canvas, face: Face, center: Point, r: f32, width: f32) {
     let mut p = stroke(fg(0.92), width);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
@@ -614,20 +564,16 @@ fn draw_ps_shape(canvas: &Canvas, face: Face, center: Point, r: f32, width: f32)
     let (cx, cy) = (center.x, center.y);
     match face {
         Face::A => {
-            // ✕
             canvas.draw_line((cx - r, cy - r), (cx + r, cy + r), &p);
             canvas.draw_line((cx - r, cy + r), (cx + r, cy - r), &p);
         }
         Face::B => {
-            // ○
             canvas.draw_circle(center, r * 1.1, &p);
         }
         Face::X => {
-            // □
             canvas.draw_rect(Rect::from_xywh(cx - r, cy - r, 2.0 * r, 2.0 * r), &p);
         }
         Face::Y => {
-            // △
             let mut tri = PathBuilder::new();
             tri.move_to((cx, cy - r * 1.2));
             tri.line_to((cx + r * 1.15, cy + r * 0.85));
@@ -659,8 +605,6 @@ mod tests {
         assert_eq!(GlyphStyle::from_pref(None), GlyphStyle::Keyboard);
     }
 
-    /// Nintendo's badges carry the pad's OWN engravings: the positional confirm (south) is
-    /// the button a Switch pad labels B. Everything non-Nintendo keeps the Xbox letters.
     #[test]
     fn nintendo_badges_read_the_pads_own_letters() {
         assert_eq!(face_letter(Face::A, GlyphStyle::Nintendo), "B");
@@ -670,9 +614,6 @@ mod tests {
         assert_eq!(face_letter(Face::A, GlyphStyle::Letters), "A");
     }
 
-    /// A remote has no Y/X, so those hints resolve to nothing — the legend must not
-    /// advertise a button the device in the user's hand cannot press. Confirm and Back
-    /// resolve to the remote's own marks, and the section hint points at the D-pad path.
     #[test]
     fn remote_hides_the_buttons_a_remote_does_not_have() {
         assert!(resolved(HintKey::Secondary, GlyphStyle::Remote).is_none());
@@ -689,7 +630,7 @@ mod tests {
             resolved(HintKey::Shoulders, GlyphStyle::Remote),
             Some(Resolved::Up)
         ));
-        // Every other style resolves every hint — nothing else went silent.
+        // Every other style still resolves every hint.
         for style in [
             GlyphStyle::Letters,
             GlyphStyle::Shapes,
