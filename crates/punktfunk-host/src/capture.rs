@@ -379,4 +379,232 @@ mod live_tests {
         drop(cap);
         drop(vd);
     }
+
+    /// `SeDebugPrivilege` on our token: attaching to a service process (WUDFHost runs as
+    /// LocalService) needs it even from an elevated console session.
+    fn enable_debug_privilege() -> bool {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+        use windows::Win32::Security::{
+            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME,
+            SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        // SAFETY: plain token FFI on our own process; the handle is closed here.
+        unsafe {
+            let mut tok = HANDLE::default();
+            if OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                &mut tok,
+            )
+            .is_err()
+            {
+                return false;
+            }
+            let mut luid = LUID::default();
+            let ok = LookupPrivilegeValueW(PCWSTR::null(), SE_DEBUG_NAME, &mut luid).is_ok() && {
+                let tp = TOKEN_PRIVILEGES {
+                    PrivilegeCount: 1,
+                    Privileges: [LUID_AND_ATTRIBUTES {
+                        Luid: luid,
+                        Attributes: SE_PRIVILEGE_ENABLED,
+                    }],
+                };
+                AdjustTokenPrivileges(tok, false, Some(&tp), 0, None, None).is_ok()
+            };
+            let _ = CloseHandle(tok);
+            ok
+        }
+    }
+
+    /// Freeze `pid` for `hold` by debugger attach (every thread stops at the attach event and
+    /// stays stopped until the SAME thread detaches), on a helper thread. `attached` flips once
+    /// the freeze took; kill-on-exit is off so a test panic never takes the debuggee down.
+    fn freeze_for(
+        pid: u32,
+        hold: Duration,
+        attached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        use windows::Win32::System::Diagnostics::Debug::{
+            DebugActiveProcess, DebugActiveProcessStop, DebugSetProcessKillOnExit,
+        };
+        std::thread::spawn(move || {
+            // SAFETY: plain debug-API FFI on a pid the caller owns for the test's life.
+            unsafe {
+                let _ = DebugSetProcessKillOnExit(false);
+                if DebugActiveProcess(pid).is_err() {
+                    return;
+                }
+                attached.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(hold);
+                let _ = DebugActiveProcessStop(pid);
+            }
+        })
+    }
+
+    /// LIVE gate for WP13/WP14 — a live-but-stale capture. The driver's host process (WUDFHost)
+    /// is frozen by debugger attach for `PF_LIVE_FREEZE_SECS` (default 18 s): alive to the
+    /// death watch, publishing nothing, while the desktop keeps composing. The supervisor must
+    /// open an episode past the 15 s floor, a rung must land once the process thaws, real frames
+    /// must resume, and the capturer must hand back the measured outage (WP14) — all on the SAME
+    /// capturer object, i.e. no reconnect.
+    ///
+    /// What a WHOLE-process freeze produces (measured on `.173`): the classifier names
+    /// `Stalled(Worker)` at the floor, the ladder skips the unsupported swap-chain reset and
+    /// issues the presentation reset, and the UMDF framework terminates the unresponsive host
+    /// process at that mode-set — so the plane ends with the typed driver-died fault and the
+    /// host loop's pipeline rebuild is the DriverCycle rung. That is the contract asserted here:
+    /// no hang, no silent frozen frame, a typed end (or a recovery) within a bounded window,
+    /// and never before the ladder had its chance. A wedge that keeps the host alive (one stuck
+    /// worker thread) needs WP6's bounded worker stop before the presentation reset is safe.
+    #[test]
+    #[ignore = "live: freezes the pf-vdisplay WUDFHost for ~18 s; elevated console session, host service stopped"]
+    fn live_frozen_driver_host_ends_the_plane_with_a_typed_fault() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info,pf_capture=debug"))
+            .with_test_writer()
+            .try_init();
+        let hold = Duration::from_secs(
+            std::env::var("PF_LIVE_FREEZE_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(18),
+        );
+        let mut vd = crate::vdisplay::open(crate::vdisplay::Compositor::Kwin)
+            .expect("open the pf-vdisplay backend");
+        let vout = vd
+            .create(punktfunk_core::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            })
+            .expect("create a virtual display");
+        let pid = vout
+            .win_capture
+            .as_ref()
+            .expect("the virtual display carries its capture target")
+            .wudf_pid;
+        assert_ne!(pid, 0, "the driver reported no WUDFHost pid");
+        let want = OutputFormat {
+            gpu: true,
+            hdr: false,
+            ten_bit_sdr: false,
+            chroma_444: false,
+            pyrowave: false,
+            nv12_native: false,
+            hw_cursor: false,
+        };
+        let mut cap = capture_virtual_output(
+            vout,
+            want,
+            crate::session_plan::CaptureBackend::IddPush,
+            false,
+        )
+        .expect("open the IDD-push capturer");
+        let mut x = 100i32;
+        let mut step = |cap: &mut Box<dyn Capturer>| -> Result<bool> {
+            x = 100 + ((x - 100 + 7) % 600);
+            // SAFETY: plain FFI; the pointer is parked on the operator's desktop for the test.
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetCursorPos(x, 100 + x / 3);
+            }
+            if cap.supports_arrival_wait() {
+                cap.wait_arrival(Instant::now() + Duration::from_millis(40));
+            }
+            match cap.try_latest()? {
+                Some(f) => Ok(f.provenance.origin == pf_frame::FrameOrigin::Source),
+                None => {
+                    std::thread::sleep(Duration::from_millis(8));
+                    Ok(false)
+                }
+            }
+        };
+        // Warm: the ring must be delivering before anything is broken.
+        let warm_until = Instant::now() + Duration::from_secs(3);
+        let mut warm = 0u32;
+        while Instant::now() < warm_until {
+            if step(&mut cap).expect("capture before the fault") {
+                warm += 1;
+            }
+        }
+        assert!(warm >= 10, "no steady source before the fault (got {warm})");
+        assert!(
+            enable_debug_privilege(),
+            "SeDebugPrivilege could not be enabled"
+        );
+        let attached = Arc::new(AtomicBool::new(false));
+        let freezer = freeze_for(pid, hold, attached.clone());
+        let t_freeze = Instant::now();
+        while !attached.load(Ordering::SeqCst) && t_freeze.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            attached.load(Ordering::SeqCst),
+            "debugger attach to WUDFHost pid {pid} did not take"
+        );
+        eprintln!("WUDFHost {pid} frozen for {hold:?}");
+        let (mut during, mut after, mut outage, mut error) = (0u32, 0u32, None, None);
+        let mut first_after: Option<Duration> = None;
+        while t_freeze.elapsed() < hold + Duration::from_secs(60) {
+            match step(&mut cap) {
+                Ok(true) if t_freeze.elapsed() < hold => during += 1,
+                Ok(true) => {
+                    after += 1;
+                    first_after.get_or_insert(t_freeze.elapsed());
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    error = Some(format!("{e:#}"));
+                    break;
+                }
+            }
+            if let Some(o) = cap.take_recovered_outage() {
+                outage = Some(o);
+                break;
+            }
+        }
+        let ended = t_freeze.elapsed();
+        let _ = freezer.join();
+        eprintln!(
+            "frozen driver host: source during={during} after={after} first_after={first_after:?} \
+             outage={outage:?} error={error:?} ended_after={ended:?}"
+        );
+        // A frame the worker published just before the freeze is still in the ring and is
+        // consumed after it (measured: one); anything beyond an in-flight slot or two is a
+        // worker that is not frozen.
+        assert!(
+            during <= 2,
+            "a frozen worker cannot keep publishing: {during} source frames during the freeze"
+        );
+        match (outage, &error) {
+            (Some(outage), _) => {
+                assert!(
+                    outage >= Duration::from_secs(15),
+                    "a recovered outage must span the stall floor, got {outage:?}"
+                );
+                assert!(after >= 3, "real source frames must resume after the thaw");
+            }
+            (None, Some(e)) => {
+                // The framework may terminate the frozen host at any topology write — on a
+                // box whose exclusive watchdog is re-asserting, that can be before the floor —
+                // so the end time is reported, not bounded from below.
+                // The two typed ends: the death watch ("WUDFHost … exited") or the ladder's
+                // `RingFault::SourceStalled` ("no source frame for Ns …").
+                assert!(
+                    e.contains("WUDFHost") || e.contains("no source frame"),
+                    "the plane must end with a typed driver/source fault, got: {e}"
+                );
+            }
+            (None, None) => panic!(
+                "neither a recovery nor a typed end within {:?} — the stale plane is exactly \
+                 what must never happen",
+                hold + Duration::from_secs(60)
+            ),
+        }
+        drop(cap);
+        drop(vd);
+    }
 }

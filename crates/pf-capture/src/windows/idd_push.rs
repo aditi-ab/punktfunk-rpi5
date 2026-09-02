@@ -902,10 +902,11 @@ impl IddPushCapturer {
                 self.fences.as_ref().map(HostFences::handles),
             )
         } {
-            tracing::warn!(
-                error = %format!("{e:#}"),
-                "IDD push: frame-channel re-delivery failed after ring recreate"
-            );
+            // The driver never received the new ring: nothing will ever publish into it, so the
+            // recreate FAILED — a recovery rung must escalate now, not wait out its deadline
+            // (measured on `.173`: the WUDFHost died mid-recreate and the stage still read
+            // "Applied" from a swallowed delivery error).
+            return Err(e.context("IDD-push: frame-channel re-delivery failed after ring recreate"));
         }
         // Monitor re-arrival can kill the cursor worker; re-deliver the surviving section.
         if let (Some(cs), Some(send)) = (self.cursor_shared.as_ref(), self.cursor_sender.as_ref()) {
