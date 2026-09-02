@@ -34,6 +34,13 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Added
 
+- **IDD-push fence-ring protocol layer (`pf_driver_proto::frame::fence`).** A v4 header appends
+  a 32-byte per-slot record (state, seq, producer-ready and consumer-retire fence values) after
+  the v3 tail; `SetFrameChannelRequestV2` carries the two shared fence handles behind the v1
+  request as an exact prefix, on the same IOCTL. Pure claim/pick rules (free, else oldest
+  published, else drop; newest-wins consume with older publishes freed) and a randomized
+  two-party trace test. Both sides still run the keyed-mutex ring; the driver and host arms
+  that negotiate `CAP_FENCE_RING` follow.
 - **`pf_win_display` has a display actor with a cached snapshot.** The display-events pump now
   owns the CCD inventory read for hot paths: every `WM_DISPLAYCHANGE` / device broadcast schedules
   one coalesced refresh (150 ms) instead of querying inside the window procedure, a 15 s safety
