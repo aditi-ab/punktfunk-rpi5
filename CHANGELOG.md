@@ -48,7 +48,14 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   with its age and backs off (1 s doubling to 15 s). `display_events::{snapshot, request_refresh,
   wait_for_change, refresh_and_wait}` are the API; `TargetInventory` gains `hdr`, `source_id` and
   `source_adapter_luid`, and `CcdTargetKey` / `TargetInventory` move to the platform-neutral
-  `snapshot` module (re-exported from `win_display`). Readers migrate in the next step.
+  `snapshot` module (re-exported from `win_display`).
+- **Hot display readers take the snapshot, not the display-config lock.** The descriptor poller
+  (HDR flag + active mode), the cursor poller's target rect, the compose kick's geometry, the
+  absolute-input stream rect, the scanline probe's retarget, the exclusive re-assert watchdog and
+  the management monitor listing all read `display_events::snapshot`; the watchdog wakes on a
+  topology generation instead of polling. At rest a session makes zero CCD reads beyond the
+  actor's 15 s safety refresh. The host starts the actor at `serve`, and a not-yet-started actor
+  falls back to one direct read (`snapshot_or_query`).
 - **IDD-push shared header v3 carries ring health.** The 88-byte header grows a 64-byte tail:
   a health state (`Initializing`/`Active`/`Rebuilding`/`Dead`), driver and host capability
   words negotiated by intersection, assignment and D3D-device epochs, a source sequence that
