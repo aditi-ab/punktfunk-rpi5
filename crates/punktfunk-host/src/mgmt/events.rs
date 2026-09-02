@@ -3,8 +3,9 @@
 //! One frame per event: `id:` is `seq`, `event:` is the kind, `data:` is
 //! [`crate::events::HostEvent`] JSON. Resume with `Last-Event-ID` or `?since=`.
 //! A cursor that fell off the ring gets `event: dropped` first and must resync
-//! from REST snapshots. `?kinds=` filters server-side (exact names or `domain.*`,
-//! comma-separated).
+//! from REST snapshots. `event: live` closes the catch-up: everything after it
+//! happened after the consumer connected. `?kinds=` filters server-side (exact
+//! names or `domain.*`, comma-separated).
 //!
 //! At most [`MAX_EVENT_STREAMS`] concurrent streams (503 beyond). A consumer too
 //! slow for the live tail is disconnected, not buffered; reconnect reads the ring.
@@ -91,6 +92,7 @@ struct StreamState {
 ///
 /// `id:` is `seq`, `event:` is kind, `data:` is HostEvent JSON. Resume with `Last-Event-ID`
 /// or `?since=`; `event: dropped` means the ring no longer has that cursor — resync from REST.
+/// `event: live` follows the catch-up; frames after it happened after you connected.
 #[utoipa::path(
     get,
     path = "/events",
@@ -139,6 +141,9 @@ pub(crate) async fn stream_events(Query(q): Query<EventsQuery>, headers: HeaderM
             .filter(|ev| filter.matches(ev.kind.name()))
             .map(sse_event),
     );
+    // Where history ends. A fresh page load replays the whole ring, and a consumer that
+    // announces knocks must not re-announce one from an hour ago.
+    pending.push_back(Event::default().event("live").data(r#"{"live":true}"#));
 
     let state = StreamState {
         pending,

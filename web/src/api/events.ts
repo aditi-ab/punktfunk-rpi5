@@ -19,6 +19,9 @@
 //   - The host sends a keep-alive comment every 15 s; the Bun entry's idle timeout is set above
 //     that (nitro-entry/bun-https.mjs) so we don't sever our own stream.
 //   - An `event: dropped` frame means we fell off the ring and must resync — invalidate everything.
+//   - A connection with no cursor replays the host's whole ring (that is what fills the activity
+//     feed on a page load), then `event: live`. Only a knock after that marker toasts: a replayed
+//     one is history the pending list already shows, or a device paired an hour ago.
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
 import { useEffect, useSyncExternalStore } from "react";
@@ -209,16 +212,26 @@ let client: QueryClient | null = null;
 /** How long the stream survives with no subscribers, so a hydration blip doesn't reconnect. */
 const CLOSE_GRACE_MS = 10_000;
 
+/** False until the host's `live` marker: frames before it are ring replay, not news. */
+let live = false;
+
 function attach(): void {
 	if (source) return;
 	source = new EventSource("/api/v1/events");
+	// Every (re)connect replays first; `open` fires before any frame, on auto-reconnect too.
+	source.addEventListener("open", () => {
+		live = false;
+	});
+	source.addEventListener("live", () => {
+		live = true;
+	});
 	for (const kind of KINDS) {
 		source.addEventListener(kind, (ev) => {
 			// Record it first: the feed should show an event even for a kind we invalidate nothing for.
 			const entry = recordActivity(kind, ev);
 			// A knock needs someone to act on it, and it can land on any page — so it is the one
 			// event that interrupts rather than waiting to be noticed on the Pairing page.
-			if (kind === "pairing.pending") announceKnock(entry);
+			if (kind === "pairing.pending" && live) announceKnock(entry);
 			if (!client) return;
 			// The installed set changed — but the runner is probably still restarting, so keep
 			// checking for a while rather than trusting this one refetch (see boostPluginPolling).

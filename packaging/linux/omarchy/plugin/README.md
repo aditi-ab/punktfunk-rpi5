@@ -12,8 +12,8 @@ Omarchy bar, without opening a browser.
   - *Displays* — pick the virtual-display preset, and read the policy it puts in force.
   - *Stats* — the live stream, sparkline charts of how it is moving, and frame timings while a
     capture is recording.
-- **service** — one long-lived event stream that drives both of the above and pops an Omarchy toast
-  when a device asks to pair.
+- **service** — one long-lived event stream that drives both of the above. The pairing toast is
+  the `pairing-pending` hook's (it carries Approve / Deny); the panel only updates its badge.
 
 ### Why tabs
 

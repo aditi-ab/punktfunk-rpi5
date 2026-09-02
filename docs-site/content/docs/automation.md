@@ -280,6 +280,8 @@ request comes back 401. The runner's `plugin-token` file has the same shape.
 - Reconnect with the standard `Last-Event-ID` header (or `?since=<seq>`) and the host replays
   what you missed from its in-memory ring (~1024 events); if you fell off the ring you get one
   `event: dropped` frame first — resync from the REST snapshots (`/status`, `/clients`, …).
+- No cursor replays the whole ring. One `event: live` frame closes the replay: what follows it
+  happened after you connected, so a notifier should stay quiet until it arrives.
 - `?kinds=` filters server-side: exact kinds or `domain.*` prefixes, comma-separated.
 
 ## Scripts, plugins, and the runner

@@ -2710,6 +2710,12 @@ async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
         }
     }
     drop(body);
+    // The `live` marker closes the catch-up: it must come after m1, never before it.
+    let all = format!("{seen}{tail}");
+    let live_at = all
+        .find("event: live")
+        .unwrap_or_else(|| panic!("no live marker: {all}"));
+    assert!(live_at > all.find(&m1).unwrap(), "live before catch-up: {all}");
 
     let resp = app
         .clone()

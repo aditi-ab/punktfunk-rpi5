@@ -86,6 +86,10 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **`inhibit_shortcuts` applies under the desktop mouse model on the Apple client.** It gated the
   ⌘-chord passthrough and the system-shortcut tap on the capture model only, unlike the SDL
   clients; turn the setting off to keep the chords local.
+- **Pairing toasts fire once, on a live knock only.** The event stream closes its ring replay
+  with one `event: live` frame, the console and `ctl watch` stay quiet before it, and the Omarchy
+  panel leaves the toast to the `pairing-pending` hook. A `ctl watch` consumer that wants the
+  replay passes `--since 0`.
 
 ### Fixed
 
