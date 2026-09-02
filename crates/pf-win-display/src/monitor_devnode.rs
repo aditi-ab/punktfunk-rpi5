@@ -125,6 +125,11 @@ fn read_journal() -> Vec<Lease> {
     }
 }
 
+/// The outstanding leases (devnodes disabled and not yet re-enabled), for the operator surface.
+pub fn leases() -> Vec<Lease> {
+    read_journal()
+}
+
 /// Persist `leases` as the outstanding set (union is the caller's job). Failure is logged, not
 /// fatal — the feature degrades to "no crash journal", not "no feature".
 fn write_journal(leases: &[Lease]) {

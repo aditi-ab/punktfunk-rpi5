@@ -11,11 +11,33 @@
 
 use std::time::{Duration, Instant};
 
+use crate::{CaptureEpisode, CaptureHealth};
 use pf_driver_proto::frame::HealthState;
 use pf_frame::health::{
-    Activity, ActivityKind, Classifier, HealthClass, RingState, Snapshot, Thresholds,
+    Activity, ActivityKind, Classifier, HealthClass, RingState, Snapshot, StallClass, Thresholds,
 };
 use pf_frame::recovery::{Action, Budget, Coordinator, Event, Stage, StageOutcome, Summary};
+
+fn stall_name(c: StallClass) -> &'static str {
+    match c {
+        StallClass::Worker => "worker",
+        StallClass::Transport => "transport",
+        StallClass::Conversion => "conversion",
+        StallClass::Presentation => "presentation",
+    }
+}
+
+fn stage_name(s: Stage) -> &'static str {
+    match s {
+        Stage::EncoderReset => "encoder_reset",
+        Stage::RingReset => "ring_reset",
+        Stage::SwapChainReset => "swap_chain_reset",
+        Stage::PresentationReset => "presentation_reset",
+        Stage::MonitorCycle => "monitor_cycle",
+        Stage::DriverCycle => "driver_cycle",
+        Stage::CaptureFallback => "capture_fallback",
+    }
+}
 
 /// Cursor travel over a frozen image that counts as INPUT evidence — a couple of real mouse
 /// movements, comfortably above sub-pixel jitter (the WP3b value).
@@ -99,6 +121,69 @@ impl Supervisor {
     /// An episode is open: the capturer's own recover-or-drop timers stand down.
     pub(super) fn owns_episode(&self) -> bool {
         self.coordinator.owns_episode()
+    }
+
+    /// The operator-surface report (WP18): the last verdict, the ring's self-report, and the
+    /// last closed episode, with every enum spelled as its lowercase name.
+    pub(super) fn report(&self, now: Instant, ring: Option<&super::RingHealth>) -> CaptureHealth {
+        let verdict = self.classifier.last();
+        let (class, stall_class) = match verdict.map(|v| v.class) {
+            None => ("healthy", None),
+            Some(HealthClass::Healthy) => ("healthy", None),
+            Some(HealthClass::Idle) => ("idle", None),
+            Some(HealthClass::Suspect) => ("suspect", None),
+            Some(HealthClass::Stalled(c)) => ("stalled", Some(stall_name(c))),
+            Some(HealthClass::Recovering) => ("recovering", None),
+            Some(HealthClass::Rebuilding) => ("rebuilding", None),
+            Some(HealthClass::SecureDesktop) => ("secure_desktop", None),
+        };
+        CaptureHealth {
+            class,
+            stall_class,
+            source_gap: verdict.map_or(Duration::ZERO, |v| v.source_gap),
+            evidence: verdict.and_then(|v| v.evidence).map(|k| match k {
+                ActivityKind::RecentSource => "recent_source",
+                ActivityKind::Input => "input",
+                ActivityKind::Canary => "canary",
+                ActivityKind::Presents => "presents",
+            }),
+            ring_state: ring.map(|r| match r.state {
+                HealthState::Initializing => "initializing",
+                HealthState::Active => "active",
+                HealthState::Rebuilding => "rebuilding",
+                HealthState::Dead => "dead",
+            }),
+            fence_ring: ring
+                .is_some_and(|r| r.negotiated & pf_driver_proto::frame::CAP_FENCE_RING != 0),
+            published_total: ring.map_or(0, |r| r.published_total),
+            dropped_total: ring.map_or(0, |r| r.dropped_total),
+            current_stage: self.coordinator.current_stage().map(stage_name),
+            last_episode: self.coordinator.last_summary().map(|s| CaptureEpisode {
+                stall_class: stall_name(s.class),
+                recovered: s.recovered,
+                took: s.took,
+                stages: s
+                    .stages
+                    .iter()
+                    .map(|r| {
+                        let outcome = match r.outcome {
+                            Some(StageOutcome::Applied) => "applied",
+                            Some(StageOutcome::Failed) => "failed",
+                            Some(StageOutcome::Unsupported) => "unsupported",
+                            None => "timed_out",
+                        };
+                        (stage_name(r.stage), outcome, r.took)
+                    })
+                    .collect(),
+                consecutive_failures: s.consecutive_failures,
+                cooldown: s.cooldown,
+            }),
+            episodes_suppressed: self.coordinator.suppressed(),
+            cooldown_remaining: self
+                .coordinator
+                .cooldown_until()
+                .and_then(|t| t.checked_duration_since(now)),
+        }
     }
 
     /// One tick of the classifier and coordinator over `i`.

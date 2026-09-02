@@ -580,6 +580,16 @@ A freeze that comes back on a **rhythm** — every few seconds, every minute, al
 not a bandwidth problem, and lowering the bitrate won't touch it. The Windows capture path detects
 that pattern itself and writes the cause and the cure into the log.
 
+Start on the **Status** page: while a session runs, its card shows **Capture health** — the
+capturer's own verdict, refreshed twice a second. `healthy` and `idle` need no action (an idle
+desktop composes nothing, and that is fine). `suspect` means the source stopped while the desktop
+still shows signs of life; `stalled (worker)` / `(transport)` / `(conversion)` / `(presentation)`
+names the leg that lost the frames, and **Last recovery** shows what the host did about it: the
+stall class, each rung it ran with its outcome, and whether real frames came back. A `failed`
+episode ends the video plane with a typed error and the session rebuilds its capture; repeated
+failures back off (the cooldown is in the same block of `GET /api/v1/status`). Only when that
+line does not explain the rhythm, go to the log:
+
 Open the web console's **Logs** page and search for `METRONOMIC`. You'll get one of two lines:
 
 - **…and coincide with Windows monitor hot-plug/re-enumeration events** — a display (or its

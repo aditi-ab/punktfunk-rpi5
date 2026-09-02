@@ -113,6 +113,146 @@ pub(crate) struct RuntimeStatus {
     /// Windows audio-wiring verdict; absent off-Windows and before the first pass. Present while idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     audio: Option<AudioWiring>,
+    /// Windows display state: topology transactions and outstanding device leases. Absent off-Windows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display: Option<DisplayHealth>,
+}
+
+/// Host-wide Windows display health: the topology transaction log and the leases the stream holds.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct DisplayHealth {
+    /// Count of topology transactions that observed a change since the host started.
+    topology_generation: u64,
+    /// The most recent topology transaction, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_transaction: Option<TopologyTransaction>,
+    /// Monitor devnodes disabled for a stream and not yet re-enabled (a leftover here after a
+    /// crash is what the next host start replays).
+    pnp_leases: u32,
+}
+
+/// One topology transaction as the display actor recorded it.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct TopologyTransaction {
+    /// `acquire-isolate` / `exclusive-reassert` / …
+    reason: String,
+    /// `changed` / `unchanged` / `unknown`.
+    outcome: String,
+    took_ms: u64,
+}
+
+/// Per-session capture health (Windows IDD-push): the live classifier verdict, the ring's
+/// self-report and the last staged-recovery episode.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CaptureHealth {
+    /// `healthy` / `idle` / `suspect` / `stalled` / `recovering` / `rebuilding` / `secure_desktop`.
+    #[schema(example = "healthy")]
+    class: String,
+    /// When `class` is `stalled`: `worker` / `transport` / `conversion` / `presentation`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stall_class: Option<String>,
+    /// Time since the last real source frame.
+    source_gap_ms: u64,
+    /// Activity evidence behind the verdict: `recent_source` / `input` / `canary` / `presents`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<String>,
+    /// The ring's own state word; absent on a driver without the health tail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ring_state: Option<String>,
+    /// The shared-fence ring protocol is negotiated on the current ring.
+    fence_ring: bool,
+    published_total: u64,
+    dropped_total: u64,
+    /// The recovery stage running now, while an episode is open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_stage: Option<String>,
+    /// The last closed recovery episode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_episode: Option<CaptureEpisode>,
+    /// Stalled verdicts refused for budget or cooldown since the last episode.
+    episodes_suppressed: u32,
+    /// Time left in the post-failure cooldown, while one is in force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cooldown_remaining_ms: Option<u64>,
+}
+
+/// One closed staged-recovery episode.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CaptureEpisode {
+    stall_class: String,
+    recovered: bool,
+    took_ms: u64,
+    /// The rungs run, in ladder order.
+    stages: Vec<CaptureStage>,
+    consecutive_failures: u32,
+    cooldown_ms: u64,
+}
+
+/// One recovery rung of an episode.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CaptureStage {
+    /// `encoder_reset` / `ring_reset` / `swap_chain_reset` / `presentation_reset` / `monitor_cycle` / `driver_cycle` / `capture_fallback`.
+    stage: String,
+    /// `applied` / `failed` / `unsupported` / `timed_out`.
+    outcome: String,
+    took_ms: u64,
+}
+
+fn api_capture_health(h: &pf_capture::CaptureHealth) -> CaptureHealth {
+    let ms = |d: std::time::Duration| d.as_millis().min(u64::MAX as u128) as u64;
+    CaptureHealth {
+        class: h.class.into(),
+        stall_class: h.stall_class.map(Into::into),
+        source_gap_ms: ms(h.source_gap),
+        evidence: h.evidence.map(Into::into),
+        ring_state: h.ring_state.map(Into::into),
+        fence_ring: h.fence_ring,
+        published_total: h.published_total,
+        dropped_total: h.dropped_total,
+        current_stage: h.current_stage.map(Into::into),
+        last_episode: h.last_episode.as_ref().map(|e| CaptureEpisode {
+            stall_class: e.stall_class.into(),
+            recovered: e.recovered,
+            took_ms: ms(e.took),
+            stages: e
+                .stages
+                .iter()
+                .map(|&(stage, outcome, took)| CaptureStage {
+                    stage: stage.into(),
+                    outcome: outcome.into(),
+                    took_ms: ms(took),
+                })
+                .collect(),
+            consecutive_failures: e.consecutive_failures,
+            cooldown_ms: ms(e.cooldown),
+        }),
+        episodes_suppressed: h.episodes_suppressed,
+        cooldown_remaining_ms: h.cooldown_remaining.map(ms),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn display_health() -> Option<DisplayHealth> {
+    use pf_win_display::topology_churn;
+    Some(DisplayHealth {
+        topology_generation: topology_churn::generation(),
+        last_transaction: topology_churn::last().map(|t| TopologyTransaction {
+            reason: t.reason.into(),
+            outcome: match t.outcome {
+                topology_churn::Outcome::Changed => "changed",
+                topology_churn::Outcome::Unchanged => "unchanged",
+                topology_churn::Outcome::Unknown => "unknown",
+            }
+            .into(),
+            took_ms: t.took.as_millis().min(u64::MAX as u128) as u64,
+        }),
+        pnp_leases: pf_win_display::monitor_devnode::leases().len() as u32,
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn display_health() -> Option<DisplayHealth> {
+    None
 }
 
 /// Windows audio wiring: which endpoint carries each role. Names are the Sound-settings friendly names.
@@ -184,6 +324,10 @@ pub(crate) struct SessionInfo {
     width: u32,
     height: u32,
     fps: u32,
+    /// Live capture health (Windows IDD-push, native plane). Absent on GameStream, on Linux,
+    /// and until the video loop's first publish.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture: Option<CaptureHealth>,
 }
 
 /// Negotiated stream parameters (RTSP on GameStream; live mode on native).
@@ -380,12 +524,14 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
             width: l.width,
             height: l.height,
             fps: l.fps,
+            capture: None,
         })
         .or_else(|| {
             native.first().map(|s| SessionInfo {
                 width: s.width,
                 height: s.height,
                 fps: s.fps,
+                capture: s.capture_health.as_ref().map(api_capture_health),
             })
         });
     #[cfg(feature = "gamestream")]
@@ -432,6 +578,7 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
         active_sessions: native.len() as u32 + u32::from(gs_video),
         session,
         stream,
+        display: display_health(),
         games: crate::session_status::games()
             .into_iter()
             .map(|g| ActiveGame {
@@ -475,12 +622,14 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
             width: l.width,
             height: l.height,
             fps: l.fps,
+            capture: None,
         })
         .or_else(|| {
             native.first().map(|s| SessionInfo {
                 width: s.width,
                 height: s.height,
                 fps: s.fps,
+                capture: s.capture_health.as_ref().map(api_capture_health),
             })
         });
     let (native_paired_clients, pending_approvals) = st
