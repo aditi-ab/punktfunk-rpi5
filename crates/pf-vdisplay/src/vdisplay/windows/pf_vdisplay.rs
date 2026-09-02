@@ -1200,10 +1200,14 @@ mod tests {
         }
     }
 
-    /// Hardware round trip (`#[ignore]`): open → create → hold → drop (REMOVE).
+    /// Hardware round trip (`#[ignore]`): open → create → hold → drop (REMOVE). Under the
+    /// guard so the drop tears down NOW: with the box's real keep-alive the teardown lingers
+    /// 10 s and the next case in the file starts on a still-isolated desktop (measured on .173:
+    /// `live_force_extend` red on its precondition, the desktop restored seconds later).
     #[test]
     #[ignore = "needs the pf-vdisplay driver on real hardware; run with --ignored"]
     fn live_create_drop() {
+        let _policy = ExclusiveTopology::force();
         let mut vd = PfVdisplayDisplay::new().expect("open pf-vdisplay");
         let vout = vd
             .create(Mode {
