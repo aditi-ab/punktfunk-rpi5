@@ -1096,10 +1096,10 @@ fn consume_frame(
         )
     };
     let Some(fmt) = ud.format else { return }; // unsupported/not negotiated
-    // This de-pad assumes one packed plane. `bytes_per_pixel` reports 4 for NV12, so a
-    // native NV12 buffer (`stride ≈ w`, two planes) always trips `stride < row` and blames
-    // the producer. The second plane is not in `datas[0]`; arriving here is a host bug
-    // (NV12 offer without the raw-dmabuf passthrough that consumes it).
+                                               // This de-pad assumes one packed plane. `bytes_per_pixel` reports 4 for NV12, so a
+                                               // native NV12 buffer (`stride ≈ w`, two planes) always trips `stride < row` and blames
+                                               // the producer. The second plane is not in `datas[0]`; arriving here is a host bug
+                                               // (NV12 offer without the raw-dmabuf passthrough that consumes it).
     if matches!(fmt, PixelFormat::Nv12) {
         warn_once(
             "negotiated producer-native NV12 but this capture fell back to the CPU de-pad path, \
@@ -1133,9 +1133,9 @@ fn consume_frame(
         None
     };
     let _mapping; // keeps a manual mmap alive for the copy below
-    // Prefer our fstat-sized mmap; else PipeWire's MAP_BUFFERS slice. `fd_len` is required:
-    // falling back to `offset + needed` maps a producer-invented length and can SIGBUS past
-    // the object. Without a real length, decline to self-map.
+                  // Prefer our fstat-sized mmap; else PipeWire's MAP_BUFFERS slice. `fd_len` is required:
+                  // falling back to `offset + needed` maps a producer-invented length and can SIGBUS past
+                  // the object. Without a real length, decline to self-map.
     let self_mapped: Option<&[u8]> = if raw_fd > 0 {
         match fd_len.and_then(|map_len| DmabufMap::new(raw_fd as i32, map_len)) {
             Some(m) => {

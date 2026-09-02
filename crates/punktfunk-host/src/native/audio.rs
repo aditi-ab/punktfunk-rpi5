@@ -345,8 +345,8 @@ pub(super) fn audio_thread(
                     capturer = Some(c);
                     last_failed = None;
                     acc.clear(); // drop the partial frame straddling the gap
-                    // Predecessor is invalid across the gap: the client would splice pre-gap
-                    // audio onto the new stream.
+                                 // Predecessor is invalid across the gap: the client would splice pre-gap
+                                 // audio onto the new stream.
                     prev_frame.clear();
                 }
                 Err(e) => {

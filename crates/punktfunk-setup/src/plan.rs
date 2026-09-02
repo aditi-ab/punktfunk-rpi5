@@ -37,12 +37,19 @@ pub enum Phase {
 pub enum StepAction {
     Run(String),
     /// Replaced or appended in `host.env`.
-    SetEnv { key: String, value: String },
+    SetEnv {
+        key: String,
+        value: String,
+    },
     Note(Level, String),
     /// apt will not walk back to a lower candidate; madison after the repo rewrite.
-    AptSwitch { pkgs: Vec<String> },
+    AptSwitch {
+        pkgs: Vec<String>,
+    },
     /// Split `-Rdd` / `-S` from `pacman -Si` against the repo the previous step just added.
-    PacmanSwitch { pkgs: Vec<String> },
+    PacmanSwitch {
+        pkgs: Vec<String>,
+    },
     /// Dry-run renders this even when `program` is missing: the Omarchy hand-off is
     /// planned before the install that ships the binary.
     RunIfPresent {
@@ -53,7 +60,9 @@ pub enum StepAction {
     /// No-op with a warning where systemd is not PID 1: a container has no logind.
     Linger,
     /// Re-probes the user manager linger may have just created.
-    StartUnits { units: Vec<String> },
+    StartUnits {
+        units: Vec<String>,
+    },
     /// Files the console's certificate in the user's NSS store. Resolved in `exec`: the host
     /// mints the certificate on its first start, so the step has to wait for the file.
     TrustCert,

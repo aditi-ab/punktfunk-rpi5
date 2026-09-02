@@ -1685,8 +1685,7 @@ impl VirtualDisplayManager {
                 let _ = set_virtual_primary_ccd(new_target);
                 inner.group.ccd_saved = keep_saved;
             }
-            Topology::Extend | Topology::Auto => {
-            }
+            Topology::Extend | Topology::Auto => {}
         }
     }
 

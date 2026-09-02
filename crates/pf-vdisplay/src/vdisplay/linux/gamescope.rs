@@ -485,8 +485,8 @@ impl VirtualDisplay for GamescopeDisplay {
             });
         }
         check_gamescope_version(); // diagnostic only — warns on known-deadlock-prone versions
-        // Resolve once before the gate and hand the same answer to [`spawn`]. Gating on `self.cmd`
-        // alone while spawn fell back to `PUNKTFUNK_GAMESCOPE_APP` would pass `--steam` with no instance free.
+                                   // Resolve once before the gate and hand the same answer to [`spawn`]. Gating on `self.cmd`
+                                   // alone while spawn fell back to `PUNKTFUNK_GAMESCOPE_APP` would pass `--steam` with no instance free.
         let app = resolved_spawn_app(self.cmd.as_deref());
         let steam = app.as_deref().is_some_and(is_steam_launch);
         if steam {
@@ -2144,7 +2144,7 @@ fn honor_session_select_switch(adopted_dm: Option<String>) {
     clear_takeover();
     *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     stop_session(SESSION_UNIT); // switch already killed Steam — clear the unit
-    // A switch is not a disconnect; skip this and "Return to Gaming Mode" starts a sleep.
+                                // A switch is not a disconnect; skip this and "Return to Gaming Mode" starts a sleep.
     if remove_idle_dropin() {
         tracing::info!(
             "gamescope: removed the takeover's idle drop-in — the box's own Game Mode runs for \
@@ -4003,7 +4003,7 @@ fn spawn(
         .map(|i| i.ei_relay.clone())
         .unwrap_or_else(ei_socket_file);
     let _ = std::fs::remove_file(&relay); // stale socket path from a previous session
-    // `--steam` when launching Steam; the global knob still forces it on for every spawn.
+                                          // `--steam` when launching Steam; the global knob still forces it on for every spawn.
     let steam_mode = pf_host_config::config().gamescope_steam || is_steam_launch(&app);
     // Default off: forces relative mode, which would break absolute-pointer games/menus.
     let grab_cursor = game_launch && pf_host_config::config().gamescope_grab_cursor;

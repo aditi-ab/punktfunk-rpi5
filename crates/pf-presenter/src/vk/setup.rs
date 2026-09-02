@@ -1037,7 +1037,7 @@ fn pick_present_mode(
         .copied()
         .find(|m| modes.contains(m))
         .unwrap_or(vk::PresentModeKHR::FIFO); // always available per spec
-    // A request the surface cannot serve is a driver fact; do not present it as our choice.
+                                              // A request the surface cannot serve is a driver fact; do not present it as our choice.
     if chosen != chain[0] {
         tracing::info!(
             requested = ?chain[0],

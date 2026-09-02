@@ -74,7 +74,7 @@ pub(crate) struct CollectionsScreen {
     art_k: f64,
     /// Opened as the host's library, not from a shelf's Y. Pumps the poster queue
     /// itself and offers Y as the way to the whole library — there is no shelf beneath.
-    root: bool;
+    root: bool,
     geom: Vec<Rect>,
     entrance: Option<Entrance>,
     entrance_armed: bool,

@@ -57,13 +57,13 @@ mod identity;
 mod inject {
     pub(crate) use pf_inject::*;
 }
+mod client_logs;
 #[cfg(target_os = "windows")]
 #[path = "windows/install.rs"]
 mod install;
 #[cfg(target_os = "windows")]
 #[path = "windows/interactive.rs"]
 mod interactive;
-mod client_logs;
 // Re-`Hello::launch` must not start a second copy — design/session-game-lifetime.md.
 mod launchreg;
 mod library;

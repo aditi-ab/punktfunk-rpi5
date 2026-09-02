@@ -45,8 +45,8 @@ pub(crate) fn fourcc_to_vk(fourcc: u32) -> Option<vk::Format> {
     const XB24: u32 = 0x3432_4258; // XBGR8888
     const AB24: u32 = 0x3432_4241; // ABGR8888
     const NV12: u32 = 0x3231_564e; // DRM_FORMAT_NV12
-    // DRM word layout == Vulkan PACK32 (not a byte swizzle). A2R10G10B10 is
-    // optional; a reject means drop XR30 from the capture offer, not convert here.
+                                   // DRM word layout == Vulkan PACK32 (not a byte swizzle). A2R10G10B10 is
+                                   // optional; a reject means drop XR30 from the capture offer, not convert here.
     const XR30: u32 = 0x3033_5258; // DRM_FORMAT_XRGB2101010
     const XB30: u32 = 0x3033_4258; // DRM_FORMAT_XBGR2101010
     match fourcc {

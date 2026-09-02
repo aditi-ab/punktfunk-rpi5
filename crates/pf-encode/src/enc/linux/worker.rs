@@ -182,8 +182,12 @@ pub(crate) enum ToWorker {
     },
     /// `Encoder::set_wire_chunking`. Crosses because it changes AU bytes and the
     /// rate budget; streamed-AU cutting stays host-side.
-    SetWireChunking { shard_payload: usize },
-    Reconfigure { bitrate_bps: u64 },
+    SetWireChunking {
+        shard_payload: usize,
+    },
+    Reconfigure {
+        bitrate_bps: u64,
+    },
     /// `Encoder::reset` inside the worker so the priority-elevated device survives.
     /// Why a message, not a respawn: [`super::pyrowave_remote::RemotePyroWave::reset`].
     Reset,
@@ -206,7 +210,9 @@ pub(crate) enum FromWorker {
         blends_cursor: bool,
     },
     /// Open failed — an answer, not a crash. Host falls back in-process.
-    InitErr { message: String },
+    InitErr {
+        message: String,
+    },
     /// One access unit at offset 0 of the AU memfd. Also the buffer-release
     /// signal: 1:1 with `Encoder::submit`'s lifetime (caller holds the frame
     /// until its AU returns from `poll`).
@@ -221,8 +227,12 @@ pub(crate) enum FromWorker {
     /// No cached fd for `key`. Host forgets "already sent" and retries once with the fd.
     NeedFd,
     /// This frame failed; the worker is still alive.
-    EncodeErr { message: String },
-    Ack { ok: bool },
+    EncodeErr {
+        message: String,
+    },
+    Ack {
+        ok: bool,
+    },
 }
 
 /// [`ipc::recv_fds`] that survives a signal.

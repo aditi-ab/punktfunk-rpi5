@@ -97,16 +97,16 @@ pub mod btn {
     pub const STEAM: u64 = 1 << 13; // BTN_MODE
     pub const MENU: u64 = 1 << 14; // BTN_START
     pub const L5: u64 = 1 << 15; // BTN_GRIPL2 (bottom left)
-    // byte 10
+                                 // byte 10
     pub const R5: u64 = 1 << 16; // BTN_GRIPR2 (bottom right)
     pub const LPAD_CLICK: u64 = 1 << 17; // BTN_THUMB
     pub const RPAD_CLICK: u64 = 1 << 18; // BTN_THUMB2
     pub const LPAD_TOUCH: u64 = 1 << 19; // gates ABS_HAT0
     pub const RPAD_TOUCH: u64 = 1 << 20; // gates ABS_HAT1
     pub const L3: u64 = 1 << 22; // BTN_THUMBL
-    // byte 11
+                                 // byte 11
     pub const R3: u64 = 1 << 26; // BTN_THUMBR
-    // byte 13
+                                 // byte 13
     pub const L4: u64 = 1 << 41; // BTN_GRIPL (top left)
     pub const R4: u64 = 1 << 42; // BTN_GRIPR (top right)
     pub const LJOY_TOUCH: u64 = 1 << 46;
@@ -332,7 +332,7 @@ pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq
     r[30..32].copy_from_slice(&st.gyro[0].to_le_bytes()); //  gyro X  → IMU ABS_RX
     r[32..34].copy_from_slice(&st.gyro[1].to_le_bytes()); //  gyro Y  → IMU ABS_RZ (kernel negates)
     r[34..36].copy_from_slice(&st.gyro[2].to_le_bytes()); //  gyro Z  → IMU ABS_RY
-    // 36..44 quaternion: left 0; kernel does not surface it.
+                                                          // 36..44 quaternion: left 0; kernel does not surface it.
     r[44..46].copy_from_slice(&st.lt.to_le_bytes()); // left trigger  → ABS_HAT2Y
     r[46..48].copy_from_slice(&st.rt.to_le_bytes()); // right trigger → ABS_HAT2X
     r[48..50].copy_from_slice(&st.lx.to_le_bytes()); // left joystick X  → ABS_X
@@ -696,7 +696,7 @@ mod tests {
         assert_ne!(s.buttons & btn::RPAD_TOUCH, 0);
         assert_eq!(s.rpad_x, 32767); // 65535-32768
         assert_eq!(s.rpad_y, 32767); // wire y=0 top (screen) → Deck +up
-        // DualSense → Deck: gyro ×16/20, accel ×16384/10000.
+                                     // DualSense → Deck: gyro ×16/20, accel ×16384/10000.
         s.apply_rich(RichInput::Motion {
             pad: 0,
             gyro: [1000, -2000, 0],

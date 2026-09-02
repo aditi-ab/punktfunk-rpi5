@@ -685,8 +685,8 @@ mod tests {
     #[test]
     fn cadence_probe_separates_grid_locked_from_variable() {
         const P: u64 = 8_333_333; // 120 Hz
-        // CADENCE_STABLE_ROUNDS full rounds: a verdict publishes only after consecutive
-        // rounds agree.
+                                  // CADENCE_STABLE_ROUNDS full rounds: a verdict publishes only after consecutive
+                                  // rounds agree.
         const ROUNDS: u64 = (CADENCE_MIN_SAMPLES as u64) * (CADENCE_STABLE_ROUNDS as u64) + 4;
 
         let mut probe = CadenceProbe::new();

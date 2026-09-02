@@ -498,8 +498,8 @@ pub fn set_advanced_color(key: CcdTargetKey, enable: bool) -> bool {
             s.header.adapterId = p.targetInfo.adapterId;
             s.header.id = p.targetInfo.id;
             s.Anonymous.value = enable as u32; // bit 0 = enableAdvancedColor
-            // SAFETY: `header.size` is this struct's size_of; adapterId/id copied
-            // from the matched path. The OS reads that many bytes and retains nothing.
+                                               // SAFETY: `header.size` is this struct's size_of; adapterId/id copied
+                                               // from the matched path. The OS reads that many bytes and retains nothing.
             let rc = unsafe { DisplayConfigSetDeviceInfo(&s.header) };
             tracing::debug!(
                 target = %key,

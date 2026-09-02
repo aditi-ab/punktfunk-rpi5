@@ -424,8 +424,8 @@ pub fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8,
     r[28..32].copy_from_slice(&ts.to_le_bytes()); // sensor_timestamp (struct off 27)
     pack_touch(&mut r[33..37], &st.touch[0]); // touch point 1 (struct off 32)
     pack_touch(&mut r[37..41], &st.touch[1]); // touch point 2
-    // Battery at struct off 52 → r[53]: low nibble = capacity (×10+5 %), high = charge state
-    // (0 = discharging). 0x0A = discharging/full (100 %). Zero reads as ~5 % and SteamOS warns.
+                                              // Battery at struct off 52 → r[53]: low nibble = capacity (×10+5 %), high = charge state
+                                              // (0 = discharging). 0x0A = discharging/full (100 %). Zero reads as ~5 % and SteamOS warns.
     r[53] = 0x0A;
 }
 
@@ -783,8 +783,8 @@ mod tests {
         assert_eq!(&r[16..22], &[0x22, 0x11, 0x44, 0x33, 0x66, 0x55]); // gyro LE
         assert_eq!(&r[22..28], &[0x78, 0x07, 0x9A, 0x09, 0xBC, 0x0B]); // accel LE
         assert_eq!(&r[28..32], &[0xDD, 0xCC, 0xBB, 0xAA]); // sensor_timestamp LE
-        // Touch point 1 at struct off 32 = r[33..37]: contact byte (active → bit7 clear),
-        // then 12-bit x / 12-bit y packed.
+                                                           // Touch point 1 at struct off 32 = r[33..37]: contact byte (active → bit7 clear),
+                                                           // then 12-bit x / 12-bit y packed.
         assert_eq!(r[33], 5);
         assert_eq!(r[34], 0x23);
         assert_eq!(r[35], 0x61); // x_hi nibble 0x1 | (y & 0xF) << 4 (y=0x356 → 0x6 << 4)

@@ -220,10 +220,10 @@ impl Hello {
         b.push(self.compositor.to_u8()); // offset 20; older hosts read [0..20]
         b.push(self.gamepad.to_u8()); // offset 21
         b.extend_from_slice(&self.bitrate_kbps.to_le_bytes()); // offset 22..26
-        // name at 26: `len u8 || UTF-8`. Omitted when None and no later field, so a Hello
-        // with neither name nor launch stays 26 bytes. A later non-default field forces
-        // every earlier placeholder (0-length name/launch, default trailing bytes) so
-        // that field lands at a deterministic offset.
+                                                               // name at 26: `len u8 || UTF-8`. Omitted when None and no later field, so a Hello
+                                                               // with neither name nor launch stays 26 bytes. A later non-default field forces
+                                                               // every earlier placeholder (0-length name/launch, default trailing bytes) so
+                                                               // that field lands at a deterministic offset.
         let ac_present = self.audio_channels != 2;
         let vcodecs_present = self.video_codecs != 0;
         let pref_present = self.preferred_codec != 0;
@@ -437,8 +437,8 @@ impl Welcome {
         b.push(self.audio_channels); // offset 65; omit → stereo
         b.push(self.codec); // offset 66; omit → HEVC
         b.push(self.host_caps); // offset 67; omit → 0
-        // Cipher at 68 + ChaCha key at 69..101, emitted only when non-AES so an AES
-        // Welcome stays byte-identical. Host only sets cipher toward VIDEO_CAP_CHACHA20.
+                                // Cipher at 68 + ChaCha key at 69..101, emitted only when non-AES so an AES
+                                // Welcome stays byte-identical. Host only sets cipher toward VIDEO_CAP_CHACHA20.
         debug_assert_eq!(
             self.cipher == CIPHER_CHACHA20_POLY1305,
             self.key_chacha.is_some(),
@@ -1247,7 +1247,7 @@ mod tests {
         assert_eq!(pre_chroma_w.color, ColorInfo::HDR10_BT2020_PQ);
         assert_eq!(pre_chroma_w.chroma_format, CHROMA_IDC_420);
         assert_eq!(pre_chroma_w.audio_channels, 2); // offset 65 absent → stereo
-        // 65-byte Welcome: chroma, no audio → 4:4:4 + stereo.
+                                                    // 65-byte Welcome: chroma, no audio → 4:4:4 + stereo.
         let pre_audio_w = Welcome::decode(&wenc[..65]).unwrap();
         assert_eq!(pre_audio_w.chroma_format, CHROMA_IDC_444);
         assert_eq!(pre_audio_w.audio_channels, 2);

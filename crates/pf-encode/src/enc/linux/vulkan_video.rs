@@ -612,7 +612,7 @@ pub struct VulkanVideoEncoder {
     /// (`VUID-vkCmdBeginVideoCodingKHR-pBeginInfo-08253`). Set on install; cleared only by a
     /// new session.
     rc_installed: bool,
-    force_kf: bool,            // request_keyframe / non-recoverable loss → next frame is IDR
+    force_kf: bool, // request_keyframe / non-recoverable loss → next frame is IDR
     pending_loss: Option<i64>, // invalidate_ref_frames(first) → recover on next frame
     pending: VecDeque<EncodedFrame>,
 }

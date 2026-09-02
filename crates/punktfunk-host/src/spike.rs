@@ -147,10 +147,10 @@ pub fn run(opts: Options) -> Result<()> {
         opts.fps,
         opts.bitrate_bps,
         first.is_cuda(),
-        8,                            // 8-bit; spike has no HDR client
+        8, // 8-bit; spike has no HDR client
         encode::ChromaFormat::Yuv420,
-        false,                        // no cursor to blend
-        4,                            // no client decoder; keep the backend multi-slice default
+        false, // no cursor to blend
+        4,     // no client decoder; keep the backend multi-slice default
     )
     .context("open encoder")?;
 
