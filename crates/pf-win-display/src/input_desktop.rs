@@ -12,6 +12,11 @@
 //! the bind is scoped: [`InputDesktopBinding`] restores the original desktop on drop. A thread
 //! left on a `Winlogon` desktop that is later destroyed (prompt dismissed) would fail every
 //! later display write for the process lifetime.
+//!
+//! Also home of the process-wide secure-desktop verdict ([`secure_desktop`]), refreshed by the
+//! display-events pump on every desktop-switch WinEvent and by the cursor poller as a fallback.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::StationsAndDesktops::{
@@ -92,6 +97,23 @@ pub(crate) fn input_desktop_name() -> Option<String> {
         let name = desktop_name(h);
         let _ = CloseDesktop(h);
         name
+    }
+}
+
+/// The input desktop is `Winlogon` (UAC / lock / logon) or a screen-saver desktop. Written only
+/// by [`refresh_secure_desktop`]; read by the capturer's hardware-cursor guard every tick.
+static SECURE_DESKTOP: AtomicBool = AtomicBool::new(false);
+
+/// `true` while the input desktop is secure, as of the last [`refresh_secure_desktop`].
+pub fn secure_desktop() -> bool {
+    SECURE_DESKTOP.load(Ordering::Relaxed)
+}
+
+/// Re-classify the input desktop into [`secure_desktop`]. An unopenable desktop keeps the last
+/// verdict: flapping would stand the hardware-cursor declare down and up for nothing.
+pub fn refresh_secure_desktop() {
+    if let Some(name) = input_desktop_name() {
+        SECURE_DESKTOP.store(!name.eq_ignore_ascii_case("Default"), Ordering::Relaxed);
     }
 }
 

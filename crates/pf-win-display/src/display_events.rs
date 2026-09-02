@@ -8,6 +8,8 @@
 //! - `DBT_DEVNODES_CHANGED`: PnP-tree churn with no payload.
 //! - `WM_DISPLAYCHANGE`: a mode/topology commit reached the desktop. Absence is a signal: a
 //!   probe with no mode delta does not fire this.
+//! - `EVENT_SYSTEM_DESKTOPSWITCH` (WinEvent): the input desktop moved (UAC / lock / logon and
+//!   back). Not logged; it refreshes [`crate::secure_desktop`] for the capturer's cursor guard.
 //!
 //! A driver-internal probe (EDID/DDC, DP retrain) emits none of these. Pair that silence with
 //! metronomic stalls to tell a KMD-below-OS sink from a Windows re-enumeration.
@@ -27,12 +29,14 @@ use windows::core::PCWSTR;
 use windows::Win32::Devices::Display::GUID_DEVINTERFACE_MONITOR;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostMessageW,
     RegisterClassW, RegisterDeviceNotificationW, SetTimer, DBT_DEVICEARRIVAL,
     DBT_DEVICEREMOVECOMPLETE, DBT_DEVNODES_CHANGED, DBT_DEVTYP_DEVICEINTERFACE,
-    DEVICE_NOTIFY_WINDOW_HANDLE, DEV_BROADCAST_DEVICEINTERFACE_W, DEV_BROADCAST_HDR, MSG,
-    WINDOW_EX_STYLE, WM_APP, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    DEVICE_NOTIFY_WINDOW_HANDLE, DEV_BROADCAST_DEVICEINTERFACE_W, DEV_BROADCAST_HDR,
+    EVENT_SYSTEM_DESKTOPSWITCH, MSG, WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT, WM_APP,
+    WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::snapshot::{self, DisplaySnapshot, SnapshotCache};
@@ -447,6 +451,25 @@ fn pump() {
         // The first snapshot, on the actor thread (never in a caller's), before anyone can post.
         HWND_CELL.store(hwnd.0 as isize, Ordering::Release);
         refresh_inventory(hwnd);
+        // Out-of-context WinEvents are delivered through this thread's message loop, so the
+        // hook lives here and for the process lifetime (never unhooked). Failure leaves the
+        // cursor poller's 250 ms refresh as the only secure-desktop signal.
+        let hook = SetWinEventHook(
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            None,
+            Some(on_desktop_switch),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        if hook.0.is_null() {
+            tracing::warn!(
+                "display-event listener: desktop-switch hook failed — secure-desktop detection \
+                 stays on the cursor poller's cadence"
+            );
+        }
+        crate::input_desktop::refresh_secure_desktop();
         tracing::debug!(
             "display actor running (cached snapshot + monitor hot-plug / display-change attribution)"
         );
@@ -455,4 +478,17 @@ fn pump() {
             DispatchMessageW(&msg);
         }
     }
+}
+
+/// `EVENT_SYSTEM_DESKTOPSWITCH` carries no direction; classify the input desktop instead.
+unsafe extern "system" fn on_desktop_switch(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    _object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    crate::input_desktop::refresh_secure_desktop();
 }

@@ -18,6 +18,8 @@ pub mod display_events;
 #[cfg(target_os = "windows")]
 mod input_desktop;
 #[cfg(target_os = "windows")]
+pub use input_desktop::{refresh_secure_desktop, secure_desktop};
+#[cfg(target_os = "windows")]
 pub mod monitor_devnode;
 /// Display identity, inventory and the snapshot cache — pure std, unit-tested on every platform.
 pub mod snapshot;
