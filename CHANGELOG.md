@@ -39,8 +39,11 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   the v3 tail; `SetFrameChannelRequestV2` carries the two shared fence handles behind the v1
   request as an exact prefix, on the same IOCTL. Pure claim/pick rules (free, else oldest
   published, else drop; newest-wins consume with older publishes freed) and a randomized
-  two-party trace test. Both sides still run the keyed-mutex ring; the driver and host arms
-  that negotiate `CAP_FENCE_RING` follow.
+  two-party trace test. The pf-vdisplay driver implements its arm: it opens delivered fences
+  with `ID3D11Device5::OpenSharedFence`, advertises `CAP_FENCE_RING` when that succeeds, and
+  runs the fence protocol only where the host advertised it too (CAS claim, GPU `Wait` on the
+  consumer-retire value, copy, `Signal` producer-ready, then PUBLISHED); the v2 request is told
+  from v1 by input length. The host arm follows; until then every ring stays on the keyed mutex.
 - **IDD-push shared header v3 carries ring health.** The 88-byte header grows a 64-byte tail:
   a health state (`Initializing`/`Active`/`Rebuilding`/`Dead`), driver and host capability
   words negotiated by intersection, assignment and D3D-device epochs, a source sequence that

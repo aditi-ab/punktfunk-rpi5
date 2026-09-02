@@ -795,7 +795,10 @@ pub mod frame {
         pub struct SlotRecord {
             pub state: u32,
             pub _pad: u32,
-            /// The publish sequence this slot's pixels belong to (the token `seq`, full width).
+            /// The PACKED [`FrameToken`](super::FrameToken) of the publish these pixels belong to
+            /// (generation, seq, slot). The generation is what lets a consumer free a record a
+            /// superseded ring left behind instead of consuming it by sequence number; the pure
+            /// rules below compare the unpacked `seq` the caller hands them.
             pub seq: u64,
             /// Producer-ready fence value the consumer must GPU-wait before sampling.
             pub ready_value: u64,
