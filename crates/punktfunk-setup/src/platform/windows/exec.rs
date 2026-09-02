@@ -191,7 +191,11 @@ impl WinExecutor<'_> {
                             .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
                             .collect::<Vec<_>>()
                             .join(", "),
-                        if dir_deferred { "" } else { " - or remove the folder by hand" }
+                        if dir_deferred {
+                            ""
+                        } else {
+                            " - or remove the folder by hand"
+                        }
                     ));
                 }
                 Ok(())
