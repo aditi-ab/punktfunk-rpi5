@@ -224,7 +224,7 @@ struct GamepadHomeView: View {
         // X, and historically tvOS maps a pad's X to this same press — the poll and this command
         // double-firing just sets the same Bool twice.
         #if os(tvOS)
-        .onPlayPauseCommand { showSettings = true }
+        .onPlayPauseCommand { if homeOwnsController { showSettings = true } }
         #endif
         // The settings / add-host screens take over the controller (the carousel's `isActive`
         // gate above). macOS has no fullScreenCover — they are generously sized sheets over the
@@ -650,7 +650,12 @@ struct GamepadHomeView: View {
                 hostOptionsTarget = nil
                 editTarget = host
             },
-            onWake: { wakeOnly(host) },
+            onWake: {
+                #if os(tvOS)
+                hostOptionsTarget = nil // the wake takeover sits UNDER a tvOS cover
+                #endif
+                wakeOnly(host)
+            },
             onForgetPairing: { store.forgetIdentity(host) },
             onRemove: { store.remove(host) },
             onUnpin: {

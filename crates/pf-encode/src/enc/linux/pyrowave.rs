@@ -506,9 +506,9 @@ fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
 
 impl PyroWaveEncoder {
     /// `PUNKTFUNK_PERF`: record one encode duration and summarise on a slow cadence.
-    /// Sample is stamped when `submit` starts and taken when the AU is readable (CSC
-    /// + encode + fence wait + packetize). At depth > 1 this grows by about one loop
-    /// period: N's AU is not retrieved until after N+1 has been submitted.
+    /// Sample is stamped when `submit` starts and taken when the AU is readable
+    /// (CSC + encode + fence wait + packetize). At depth > 1 this grows by about one
+    /// loop period: N's AU is not retrieved until after N+1 has been submitted.
     fn note_encode_us(&mut self, us: u32) {
         if !pf_host_config::config().perf {
             return;

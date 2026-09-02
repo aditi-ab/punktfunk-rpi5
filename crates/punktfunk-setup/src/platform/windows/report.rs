@@ -21,7 +21,7 @@ pub fn detected(ui: &dyn Reporter, facts: &WinFacts, artifact: Artifact) {
         "Detected Windows (build {}), {} — {what} installer",
         facts.os_build, facts.arch
     ));
-    if let Some(installed) = &facts.installed {
+    if let Some(installed) = facts.installed_for(artifact) {
         ui.ok(&format!(
             "existing install: {} at {}",
             installed.version.as_deref().unwrap_or("unknown version"),

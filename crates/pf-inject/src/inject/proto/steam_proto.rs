@@ -350,6 +350,7 @@ pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq
 /// - `10.2` = right-pad click (no right stick): `BTN_RS_CLICK` and DualSense
 ///   `BTN_TOUCHPAD`.
 /// - `10.6` = joystick click = `BTN_LS_CLICK` (Deck L3). No QAM slot.
+///
 /// Right stick drives `rpad_x/y` + `10.4` while deflected. Left-pad
 /// `TouchpadEx` shadows the joystick at bytes 16..20 while touched.
 pub fn sc_from_gamepad(

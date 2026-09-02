@@ -16,5 +16,8 @@
   + netsh advfirewall firewall delete rule "name=Punktfunk plugin UIs (TCP 47993)"
   ok would remove C:\Program Files\punktfunk from the machine PATH (entry-by-entry, never a substring delete)
   ok would remove the Add/Remove Programs entry (HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{7C9E6A52-1F4B-4E8D-A3C7-2B5D8F1E0A93}_is1)
+  + reg delete HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run /v PunktfunkTray /f
+  + reg delete HKLM\SOFTWARE\Classes\AppUserModelId\unom.punktfunk.tray /f
+  + reg delete HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers /v "C:\Program Files\punktfunk\vklayer\pf_vkhdr_layer.json" /f
   ok would remove C:\Program Files\punktfunk
   ok kept on purpose: %ProgramData%\punktfunk (identity, passwords, update cache) and any VB-CABLE install

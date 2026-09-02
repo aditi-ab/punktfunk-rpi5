@@ -21,6 +21,23 @@ pub fn attach_parent_console() -> Option<std::fs::File> {
     None
 }
 
+/// Queue `path` for deletion at the next boot (`PendingFileRenameOperations`): the way out
+/// for a file the uninstaller cannot delete now — its own running exe above all.
+#[cfg(windows)]
+pub fn delete_on_reboot(path: &std::path::Path) -> bool {
+    use ::windows::core::{HSTRING, PCWSTR};
+    use ::windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+    let wide = HSTRING::from(path.as_os_str());
+    // SAFETY: a null destination with DELAY_UNTIL_REBOOT is the documented delete form;
+    // the source string outlives the call.
+    unsafe { MoveFileExW(&wide, PCWSTR::null(), MOVEFILE_DELAY_UNTIL_REBOOT).is_ok() }
+}
+
+#[cfg(not(windows))]
+pub fn delete_on_reboot(_path: &std::path::Path) -> bool {
+    false
+}
+
 #[cfg(windows)]
 pub fn stop_service_wait(name: &str) -> Result<(), String> {
     use ::windows::core::HSTRING;

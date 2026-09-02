@@ -29,9 +29,9 @@ use windows::Win32::System::Threading::{
 
 use super::{DisplayOwnership, Mode, VirtualOutput};
 use pf_win_display::win_display::{
-    count_other_active, force_extend_topology, isolate_displays_ccd, resolve_gdi_name,
-    restore_displays_ccd, set_active_mode, set_virtual_primary_ccd, wait_mode_settled,
-    wait_target_departed, CcdTargetKey, SavedConfig,
+    count_other_active, force_extend_topology, isolate_displays_ccd, isolate_displays_ccd_checked,
+    resolve_gdi_name, restore_displays_ccd, set_active_mode, set_virtual_primary_ccd,
+    wait_mode_settled, wait_target_departed, CcdTargetKey, IsolateOutcome, SavedConfig,
 };
 
 #[path = "manager/driver.rs"]
@@ -239,6 +239,42 @@ fn isolate_displays_ccd_seam(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
         }
     }
     isolate_displays_ccd(keep)
+}
+
+/// [`isolate_displays_ccd_checked`] behind the same test seam — the re-assert watchdog's variant,
+/// whose recovery generation must follow the OBSERVED outcome (immunity plan WP10 item 4).
+fn isolate_displays_ccd_checked_seam(keep: &[CcdTargetKey]) -> Option<IsolateOutcome> {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        if FAIL_NEXT_ISOLATES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return None;
+        }
+    }
+    isolate_displays_ccd_checked(keep).map(|(_, outcome)| outcome)
+}
+
+/// Consecutive re-assert rounds before the watchdog CONCEDES the fixed cadence (immunity plan
+/// WP10 item 6): past this, something on the host demonstrably restores the path every cycle,
+/// and re-fighting it every two seconds only multiplies swap-chain bounces for the stream.
+const REASSERT_BREAKER_ROUNDS: u32 = 4;
+/// Longest pause between re-asserts once conceded.
+const REASSERT_BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// Extra pause the watchdog inserts after re-assert round `fighting`: nothing up to the breaker,
+/// then the cadence doubles per round (`base`, `2·base`, …) up to [`REASSERT_BACKOFF_CAP`]. A
+/// clean cycle resets `fighting`, and with it the cadence.
+fn reassert_backoff(fighting: u32, base: Duration) -> Duration {
+    if fighting <= REASSERT_BREAKER_ROUNDS {
+        return Duration::ZERO;
+    }
+    let shift = (fighting - REASSERT_BREAKER_ROUNDS - 1).min(8);
+    (base * (1u32 << shift)).min(REASSERT_BACKOFF_CAP)
 }
 
 /// [`ShrinkAction`] a non-last-member teardown owes the group.
@@ -966,13 +1002,21 @@ impl VirtualDisplayManager {
                 // so a rare re-add WARNs each time; a fighter escalates once.
                 let mut fighting = 0u32;
                 'watch: loop {
+                    // Subscribe to the display actor's topology generation (immunity plan WP9):
+                    // wake early when a snapshot lands, else at the interval — sliced so stop+join
+                    // stays bounded by ~250 ms. No CCD query on this thread any more.
+                    let seen = pf_win_display::display_events::snapshot().generation;
                     let mut slept = Duration::ZERO;
                     while slept < interval {
                         if stop_t.load(Ordering::Relaxed) {
                             break 'watch;
                         }
                         let slice = Duration::from_millis(250).min(interval - slept);
-                        thread::sleep(slice);
+                        match pf_win_display::display_events::wait_for_change(seen, slice) {
+                            Some(s) if s.generation > seen => break,
+                            Some(_) => {}
+                            None => thread::sleep(slice), // actor not running: plain cadence
+                        }
                         slept += slice;
                     }
                     let Ok(inner) = vdm().state.try_lock() else {
@@ -985,19 +1029,20 @@ impl VirtualDisplayManager {
                     if keep.is_empty() {
                         continue;
                     }
-                    // A FAILED verification query is UNKNOWN, not "stable": back off to the next
-                    // cycle and mutate nothing (the old `unwrap_or(0)` silently called an unknown
-                    // topology successfully exclusive).
-                    let survivors = match count_other_active(&keep) {
-                        Some(n) => n,
-                        None => {
-                            tracing::debug!(
-                                "exclusive re-assert watchdog: CCD verification query failed — \
-                                 topology state unknown this cycle, mutating nothing"
-                            );
-                            continue;
-                        }
-                    };
+                    // A snapshot that is not FRESH (the actor's last query failed, or it never
+                    // published) is UNKNOWN, not "stable": back off to the next cycle and mutate
+                    // nothing (the old `unwrap_or(0)` silently called an unknown topology
+                    // successfully exclusive).
+                    let snap = pf_win_display::display_events::snapshot_or_query();
+                    if !snap.is_fresh() && snap.generation > 0 {
+                        tracing::debug!(
+                            failures = snap.failures,
+                            "exclusive re-assert watchdog: display snapshot is last-known-good — \
+                             topology state unknown this cycle, mutating nothing"
+                        );
+                        continue;
+                    }
+                    let survivors = snap.count_other_active(&keep);
                     if survivors == 0 {
                         if fighting > 0 {
                             tracing::info!(
@@ -1012,11 +1057,15 @@ impl VirtualDisplayManager {
                         continue;
                     }
                     fighting += 1;
-                    // Announce churn before evicting: descriptors the capturer
-                    // samples until "stable again" are the transient eviction
-                    // state. Acting on them would recreate the ring at a mode
-                    // the recovery is about to undo. Window = interval + 3 s.
-                    pf_win_display::topology_churn::hold(interval + Duration::from_secs(3));
+                    // The re-assert is a topology TRANSACTION (immunity plan WP10): it holds
+                    // descriptor-following (samples until "stable again" are the transient
+                    // eviction state) for interval + 3 s, swap-chain bounce included, and is
+                    // finished with what the verification read OBSERVED — the recovery
+                    // generation moves only on a real change.
+                    let txn = pf_win_display::topology_churn::begin(
+                        "exclusive-reassert",
+                        interval + Duration::from_secs(3),
+                    );
                     match fighting {
                         1..=3 => tracing::warn!(
                             survivors,
@@ -1025,11 +1074,12 @@ impl VirtualDisplayManager {
                              the verified isolate (hybrid-GPU driver / display-poller software \
                              restoring the saved layout?); re-asserting the isolate"
                         ),
-                        4 => tracing::error!(
+                        REASSERT_BREAKER_ROUNDS => tracing::error!(
                             survivors,
                             "exclusive topology keeps being re-activated (4 consecutive \
                              re-asserts) — something on this host is fighting the isolate; \
-                             continuing to re-assert every cycle, further rounds log at DEBUG"
+                             conceding the fixed cadence: further re-asserts back off (2 s \
+                             doubling to 60 s) and log at DEBUG"
                         ),
                         _ => tracing::debug!(
                             survivors,
@@ -1037,11 +1087,39 @@ impl VirtualDisplayManager {
                             "re-asserting exclusive topology"
                         ),
                     }
-                    let _ = isolate_displays_ccd_seam(&keep);
-                    // Forced re-commit hands the IDD path a fresh swap-chain.
-                    // Bump so the session re-attaches capture instead of
-                    // streaming a frozen frame.
-                    TOPOLOGY_REASSERT_GEN.fetch_add(1, Ordering::Relaxed);
+                    let outcome = isolate_displays_ccd_checked_seam(&keep);
+                    let changed = matches!(
+                        outcome,
+                        Some(IsolateOutcome::Verified { deactivated, .. }) if deactivated > 0
+                    );
+                    pf_win_display::topology_churn::finish(
+                        txn,
+                        match outcome {
+                            Some(IsolateOutcome::Verified { .. }) if changed => {
+                                pf_win_display::topology_churn::Outcome::Changed
+                            }
+                            Some(
+                                IsolateOutcome::Verified { .. } | IsolateOutcome::NothingActive,
+                            ) => pf_win_display::topology_churn::Outcome::Unchanged,
+                            Some(IsolateOutcome::Unverified { .. }) | None => {
+                                pf_win_display::topology_churn::Outcome::Unknown
+                            }
+                        },
+                    );
+                    // Forced re-commit hands the IDD path a fresh swap-chain: bump so the session
+                    // re-attaches capture instead of streaming a frozen frame — but only when the
+                    // verification read saw the topology change (an attempted-but-unverified
+                    // write is not a recovery incident for the stream to react to).
+                    if changed {
+                        TOPOLOGY_REASSERT_GEN.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Circuit breaker: past the breaker rounds, pause before the next round.
+                    let mut pause = reassert_backoff(fighting, interval);
+                    while !pause.is_zero() && !stop_t.load(Ordering::Relaxed) {
+                        let slice = Duration::from_millis(250).min(pause);
+                        thread::sleep(slice);
+                        pause -= slice;
+                    }
                 }
             });
         // Not `.expect()`: this holds `exclusive_watch` and (via the caller)
@@ -1194,7 +1272,11 @@ impl VirtualDisplayManager {
         // pre-dark sink from a display we switched off (or lit) ourselves.
         let baseline_active: Vec<CcdTargetKey> =
             if inner.slots.is_empty() && crate::policy::prefs().standby_sink_neutralise() {
-                pf_win_display::win_display::target_inventory()
+                // A FRESH read through the display actor (it runs the query, off this thread),
+                // falling back to the newest snapshot if the actor is slow or not running.
+                pf_win_display::display_events::refresh_and_wait(Duration::from_millis(500))
+                    .unwrap_or_else(pf_win_display::display_events::snapshot_or_query)
+                    .targets
                     .iter()
                     .filter(|t| t.active)
                     .map(|t| t.key)
@@ -2192,6 +2274,38 @@ mod tests {
     #[test]
     fn exclusivity_decides_without_a_snapshot() {
         assert_eq!(shrink_action(true, false), ShrinkAction::Reisolate);
+    }
+
+    /// The re-assert circuit breaker (immunity plan WP10 item 6): fixed cadence up to the breaker
+    /// round, then a doubling pause capped at a minute — and nothing at all once a cycle is clean.
+    #[test]
+    fn reassert_backoff_concedes_the_fixed_cadence_after_the_breaker() {
+        let base = Duration::from_secs(2);
+        for round in 0..=REASSERT_BREAKER_ROUNDS {
+            assert_eq!(
+                reassert_backoff(round, base),
+                Duration::ZERO,
+                "round {round}"
+            );
+        }
+        assert_eq!(reassert_backoff(REASSERT_BREAKER_ROUNDS + 1, base), base);
+        assert_eq!(
+            reassert_backoff(REASSERT_BREAKER_ROUNDS + 2, base),
+            base * 2
+        );
+        assert_eq!(
+            reassert_backoff(REASSERT_BREAKER_ROUNDS + 5, base),
+            base * 16
+        );
+        assert_eq!(
+            reassert_backoff(REASSERT_BREAKER_ROUNDS + 6, base),
+            REASSERT_BACKOFF_CAP
+        );
+        assert_eq!(
+            reassert_backoff(u32::MAX, base),
+            REASSERT_BACKOFF_CAP,
+            "no overflow"
+        );
     }
 
     /// Session re-asks the negotiated rate on every rebuild; that must join

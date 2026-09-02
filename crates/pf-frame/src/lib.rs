@@ -12,6 +12,7 @@
 pub mod hdr;
 pub mod health;
 pub mod metronome;
+pub mod recovery;
 pub mod session_tuning;
 pub mod thread_qos;
 

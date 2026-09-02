@@ -8,10 +8,11 @@
 //! closed-loop correction, so a miss-scale is visible.
 //!
 //! The host publishes the CCD target id at capture bring-up
-//! ([`set_stream_target`]). Sites resolve the live rect through
-//! [`pf_win_display::win_display::source_desktop_rect`] — same resolver as
-//! cursor-readback — TTL-cached because a layout rearrange moves a live
-//! origin. No target / unresolved: whole virtual desktop.
+//! ([`set_stream_target`]). Sites resolve the live rect from the display actor's
+//! snapshot (`pf_win_display::display_events::snapshot`, the same source as
+//! cursor-readback) — no display-config query on the input path — TTL-cached so
+//! a layout rearrange is seen mid-session without re-reading per sample. No
+//! target / unresolved: whole virtual desktop.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -63,7 +64,7 @@ fn stream_rect() -> Option<Rect> {
     let fresh = st.queried.is_some_and(|at| at.elapsed() < RECT_TTL);
     if !fresh {
         st.queried = Some(Instant::now());
-        match pf_win_display::win_display::source_desktop_rect(target) {
+        match pf_win_display::display_events::snapshot().source_rect(target) {
             Some(r) => {
                 if st.rect != Some(r) {
                     tracing::info!(target = %target, rect = ?r, "stream-target desktop rect resolved");

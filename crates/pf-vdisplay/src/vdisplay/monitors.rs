@@ -136,9 +136,12 @@ pub fn list(compositor: Compositor) -> Result<Vec<PhysicalMonitor>> {
 /// * `refresh_mhz` comes from the path's own rational rate (59.94 stays distinct from 60).
 #[cfg(windows)]
 pub fn list_windows() -> Result<Vec<PhysicalMonitor>> {
-    // `Ok` on an empty inventory, matching [`list`]: every panel off is a real state.
+    // `Ok` on an empty inventory, matching [`list`]: every panel off is a real state. The display
+    // actor's cached snapshot (immunity plan WP9) — a direct read only before its first publish.
     Ok(from_inventory(
-        pf_win_display::win_display::target_inventory(),
+        pf_win_display::display_events::snapshot_or_query()
+            .targets
+            .to_vec(),
     ))
 }
 
@@ -303,6 +306,9 @@ mod windows_tests {
             height: 1080,
             refresh_mhz: 59940,
             primary: active,
+            hdr: active.then_some(false),
+            source_id: target_id,
+            source_adapter_luid: 0,
         }
     }
 

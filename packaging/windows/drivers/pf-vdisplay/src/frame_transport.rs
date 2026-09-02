@@ -27,17 +27,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
-use pf_driver_proto::control::SetFrameChannelRequest;
+use pf_driver_proto::control::{SetFrameChannelRequest, SetFrameChannelRequestV2};
+use pf_driver_proto::frame::fence::{self, Claim, SlotRecord};
 use pf_driver_proto::frame::{
-    AttachReject, CAP_RING_HEALTH_V3, CAP_SOURCE_SEQUENCE_QPC, DRV_STATUS_BIND_FAIL,
-    DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED, DRV_STATUS_TEX_FAIL, ERR_DOMAIN_TRANSPORT,
-    FrameToken, HealthState, RING_LEN, SharedHeader, VERSION_TELEMETRY, check_attach,
-    pack_opened_detail, v3_readable,
+    AttachReject, CAP_FENCE_RING, CAP_RING_HEALTH_V3, CAP_SOURCE_SEQUENCE_QPC,
+    DRV_STATUS_BIND_FAIL, DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED, DRV_STATUS_TEX_FAIL,
+    ERR_DOMAIN_DEVICE, ERR_DOMAIN_TRANSPORT, FrameToken, HealthState, RING_LEN, SharedHeader,
+    VERSION_TELEMETRY, check_attach, negotiate, pack_opened_detail, v3_readable,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11Device1, ID3D11DeviceContext,
-    ID3D11Texture2D,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11Device1, ID3D11Device5,
+    ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
@@ -52,8 +53,9 @@ use windows::core::Interface;
 /// SUCCESS-severity (positive), so the windows-rs `Result` wrapper can never surface it (`.ok()` maps
 /// every non-negative HRESULT to `Ok(())`) — the publish loop reads the raw vtable HRESULT instead.
 const WAIT_TIMEOUT_HRESULT: i32 = 0x0000_0102;
-/// The capability bits this driver advertises (`frame::CAP_*`). Fence ring, endpoint survival and
-/// the swap-chain reset actuator arrive with WP7/WP5/WP13 and stay unadvertised until then.
+/// The capability bits this driver ALWAYS advertises (`frame::CAP_*`). `CAP_FENCE_RING` is added
+/// per endpoint once its shared fences opened on the worker's device ([`FramePublisher::open`]);
+/// endpoint survival and the swap-chain reset actuator arrive with the WP5 live gate / WP13.
 const DRIVER_CAPABILITIES: u32 = CAP_RING_HEALTH_V3 | CAP_SOURCE_SEQUENCE_QPC;
 
 /// The current QPC tick (0 if the counter is unavailable — it cannot be on any OS we load on).
@@ -84,6 +86,10 @@ pub struct FrameChannel {
     header: u64,
     event: u64,
     textures: [u64; RING_LEN as usize],
+    /// Shared `ID3D11Fence` handles from a v2 request (WP7); both 0 from a v1 request or a host
+    /// that negotiated the keyed-mutex arm.
+    ready_fence: u64,
+    retire_fence: u64,
 }
 
 impl FrameChannel {
@@ -107,7 +113,21 @@ impl FrameChannel {
             header: req.header_handle,
             event: req.event_handle,
             textures: req.texture_handles,
+            ready_fence: 0,
+            retire_fence: 0,
         })
+    }
+
+    /// [`Self::from_request`] for the v2 request: the fences come as a pair or not at all (one of
+    /// two is malformed — nothing adopted).
+    pub fn from_request_v2(req: &SetFrameChannelRequestV2) -> Option<Self> {
+        if (req.ready_fence_handle == 0) != (req.retire_fence_handle == 0) {
+            return None;
+        }
+        let mut me = Self::from_request(&req.v1)?;
+        me.ready_fence = req.ready_fence_handle;
+        me.retire_fence = req.retire_fence_handle;
+        Some(me)
     }
 
     /// Move a handle value out of the channel: the caller now owns it; `Drop` skips the zeroed slot.
@@ -122,14 +142,21 @@ impl FrameChannel {
         self.header = 0;
         self.event = 0;
         self.textures = [0; RING_LEN as usize];
+        self.ready_fence = 0;
+        self.retire_fence = 0;
     }
 }
 
 impl Drop for FrameChannel {
     fn drop(&mut self) {
-        for v in [&mut self.header, &mut self.event]
-            .into_iter()
-            .chain(self.textures.iter_mut())
+        for v in [
+            &mut self.header,
+            &mut self.event,
+            &mut self.ready_fence,
+            &mut self.retire_fence,
+        ]
+        .into_iter()
+        .chain(self.textures.iter_mut())
         {
             if *v != 0 {
                 let h = Self::take(v);
@@ -167,6 +194,14 @@ pub struct RingEndpoint {
     telemetry: bool,
     /// The v3 ring-health tail may be touched (`frame::v3_readable` over version AND declared size).
     v3: bool,
+    /// The v4 slot table exists AND the host delivered both shared fences (`fence::v4_readable`
+    /// plus the handles). Whether the FENCE PROTOCOL runs is decided per open, by negotiation.
+    v4: bool,
+    /// Retained shared-fence NT handles (0 = none); each worker opens them on its own device.
+    ready_fence: u64,
+    retire_fence: u64,
+    /// Producer-ready fence value, monotonic per ring generation across worker re-opens.
+    ready_value: AtomicU64,
     /// Publish-token sequence, monotonic per ring generation across worker re-opens.
     seq: AtomicU64,
     /// Publishes that landed / frames dropped, mirrored into the v3 tail (monotonic per ring).
@@ -222,6 +257,10 @@ impl RingEndpoint {
             generation: 0,
             telemetry: false,
             v3: false,
+            v4: false,
+            ready_fence: core::mem::take(&mut channel.ready_fence),
+            retire_fence: core::mem::take(&mut channel.retire_fence),
+            ready_value: AtomicU64::new(0),
             seq: AtomicU64::new(0),
             published_total: AtomicU64::new(0),
             dropped_total: AtomicU64::new(0),
@@ -276,15 +315,20 @@ impl RingEndpoint {
             }
         }
         let v3 = v3_readable(header_version, channel.header_bytes);
+        let v4 = fence::v4_readable(header_version, channel.header_bytes)
+            && me.ready_fence != 0
+            && me.retire_fence != 0;
         dbglog!(
-            "[pf-vd] frame-push(driver): ring endpoint mapped for gen {header_gen} ({} slots, target {target_id}, v3_tail={v3})",
+            "[pf-vd] frame-push(driver): ring endpoint mapped for gen {header_gen} ({} slots, target {target_id}, v3_tail={v3}, fences={v4})",
             me.ring_len
         );
         me.generation = header_gen;
         me.telemetry = header_version >= VERSION_TELEMETRY;
         me.v3 = v3;
+        me.v4 = v4;
         // v3: advertise what this driver can do. The state word follows from `stamp_epochs`
-        // (Release, after the epochs) on each worker open.
+        // (Release, after the epochs) on each worker open; `CAP_FENCE_RING` joins once a worker
+        // actually opened the fences (`FramePublisher::open`).
         me.v3_store_u32(offset_of!(SharedHeader, capabilities), DRIVER_CAPABILITIES);
         Ok(me)
     }
@@ -292,6 +336,57 @@ impl RingEndpoint {
     /// The ring generation this endpoint attached to.
     pub fn generation(&self) -> u32 {
         self.generation
+    }
+
+    /// Whether the fence protocol is NEGOTIATED for this ring: the host built a v4 ring with fences
+    /// and advertised `CAP_FENCE_RING`, and this driver advertised it back (fences opened).
+    fn fence_negotiated(&self) -> bool {
+        if !self.v4 {
+            return false;
+        }
+        // SAFETY: the v4 gate implies the v3 tail; both words are naturally-aligned u32s in it.
+        let (host, drv) = unsafe {
+            (
+                (*self
+                    .header
+                    .cast::<u8>()
+                    .add(offset_of!(SharedHeader, host_capabilities))
+                    .cast::<AtomicU32>())
+                .load(Ordering::Acquire),
+                (*self
+                    .header
+                    .cast::<u8>()
+                    .add(offset_of!(SharedHeader, capabilities))
+                    .cast::<AtomicU32>())
+                .load(Ordering::Acquire),
+            )
+        };
+        negotiate(host, drv) & CAP_FENCE_RING != 0
+    }
+
+    /// Atomic view of slot `i`'s `state` word in the v4 slot table.
+    fn slot_state(&self, i: usize) -> &AtomicU32 {
+        // SAFETY: `v4` (checked by every caller's mode) proves the host built + declared the v4
+        // layout; `slot_offset(i) + offset_of!(state)` is a naturally-aligned u32 inside it.
+        unsafe {
+            &*self
+                .header
+                .cast::<u8>()
+                .add(fence::slot_offset(i) + offset_of!(SlotRecord, state))
+                .cast::<AtomicU32>()
+        }
+    }
+
+    /// Atomic view of a `u64` field of slot `i`'s record (`off` = `offset_of!(SlotRecord, ..)`).
+    fn slot_u64(&self, i: usize, off: usize) -> &AtomicU64 {
+        // SAFETY: as `slot_state`, for an 8-aligned u64 field.
+        unsafe {
+            &*self
+                .header
+                .cast::<u8>()
+                .add(fence::slot_offset(i) + off)
+                .cast::<AtomicU64>()
+        }
     }
 
     /// True once the host has recreated the ring (bumped the header generation) — e.g. the display's
@@ -399,7 +494,11 @@ impl Drop for RingEndpoint {
             });
             let _ = CloseHandle(self.event);
             let _ = CloseHandle(self.map);
-            for v in self.textures.iter_mut() {
+            for v in self
+                .textures
+                .iter_mut()
+                .chain([&mut self.ready_fence, &mut self.retire_fence])
+            {
                 if *v != 0 {
                     let _ = CloseHandle(FrameChannel::take(v));
                 }
@@ -410,7 +509,16 @@ impl Drop for RingEndpoint {
 
 struct Slot {
     tex: ID3D11Texture2D,
-    mutex: IDXGIKeyedMutex,
+    /// The keyed-mutex arm's lock; `None` on a fence-mode ring (the host creates those textures
+    /// without `SHARED_KEYEDMUTEX`).
+    mutex: Option<IDXGIKeyedMutex>,
+}
+
+/// The worker's opened fence objects (fence mode only).
+struct Fences {
+    ctx4: ID3D11DeviceContext4,
+    ready: ID3D11Fence,
+    retire: ID3D11Fence,
 }
 
 /// The driver-retained copy of the most recent composed frame — the FIRST-FRAME GUARANTEE.
@@ -562,6 +670,9 @@ pub struct FramePublisher {
     ep: Arc<RingEndpoint>,
     context: ID3D11DeviceContext,
     slots: Vec<Slot>,
+    /// `Some` = the fence protocol is negotiated for this ring and the fences opened on this
+    /// worker's device; `None` = the keyed-mutex arm.
+    fences: Option<Fences>,
     next: u32,
     /// The host-created ring textures' DXGI format (from the shared header). A swap-chain surface whose
     /// format differs (e.g. an FP16 HDR frame vs a BGRA ring) is dropped in `publish` — `CopyResource`
@@ -617,6 +728,22 @@ impl FramePublisher {
                 return Err(e);
             }
         };
+        // WP7: open the shared fences when the host delivered them. Success is what advertises
+        // `CAP_FENCE_RING`; the protocol then runs only if the HOST advertised it too (a v4 host
+        // that built a keyed-mutex probe ring delivers fences but leaves the bit clear, so the
+        // first ring stays on the mutex arm while the capability is learned).
+        let fences = ep
+            .v4
+            .then(|| Self::open_fences(&ep, device, context))
+            .flatten();
+        let fail_tex = |e: windows::core::Error| {
+            // SAFETY: status writes within the mapped header.
+            unsafe {
+                (*header).driver_status = DRV_STATUS_TEX_FAIL;
+                (*header).driver_status_detail = e.code().0 as u32;
+            }
+            e
+        };
         let mut slots = Vec::with_capacity(ep.ring_len as usize);
         // The NT handles stay RETAINED on the endpoint (closed only by its Drop): the next
         // assignment opens them again on its own device.
@@ -626,20 +753,30 @@ impl FramePublisher {
             // this ring texture, alive for the endpoint's lifetime.
             let opened: windows::core::Result<ID3D11Texture2D> =
                 unsafe { device1.OpenSharedResource1(h) };
-            match opened.and_then(|tex| {
-                tex.cast::<IDXGIKeyedMutex>()
-                    .map(|mutex| Slot { tex, mutex })
-            }) {
-                Ok(slot) => slots.push(slot),
-                Err(e) => {
-                    // SAFETY: status writes within the mapped header (the opened slots drop with `slots`).
-                    unsafe {
-                        (*header).driver_status = DRV_STATUS_TEX_FAIL;
-                        (*header).driver_status_detail = e.code().0 as u32;
-                    }
-                    return Err(e);
-                }
-            }
+            let tex = opened.map_err(fail_tex)?;
+            // A fence-mode texture carries no keyed mutex; a mutex-mode one must.
+            slots.push(Slot {
+                mutex: tex.cast::<IDXGIKeyedMutex>().ok(),
+                tex,
+            });
+        }
+        if fences.is_some() {
+            ep.v3_store_u32(
+                offset_of!(SharedHeader, capabilities),
+                DRIVER_CAPABILITIES | CAP_FENCE_RING,
+            );
+        }
+        let fence_mode = fences.is_some() && ep.fence_negotiated();
+        if !fence_mode && slots.iter().any(|s| s.mutex.is_none()) {
+            // The host built a fence ring but the protocol did not negotiate (no fences on this
+            // device): there is no lock to run the mutex arm with. Fail the open loudly; the host
+            // reads the cleared capability and rebuilds on the mutex arm.
+            dbglog!(
+                "[pf-vd] frame-push(driver): fence-mode ring without a negotiated fence protocol — refusing (host rebuilds on the keyed-mutex arm)"
+            );
+            return Err(fail_tex(
+                windows::core::HRESULT(0x8007_0032u32 as i32).into(),
+            ));
         }
         // Stamp the LIVE diagnostic word BEFORE the status flip, so a host that reads OPENED can
         // trust the detail field is ours (zero counters = "attached, nothing offered yet" — the
@@ -654,9 +791,14 @@ impl FramePublisher {
         // knowing which device/assignment its frames come from.
         ep.stamp_epochs(assignment_epoch, device_epoch);
         dbglog!(
-            "[pf-vd] frame-push(driver): opened ring gen {} on device epoch {device_epoch} (assignment {assignment_epoch}, {} slots)",
+            "[pf-vd] frame-push(driver): opened ring gen {} on device epoch {device_epoch} (assignment {assignment_epoch}, {} slots, {})",
             ep.generation,
-            slots.len()
+            slots.len(),
+            if fence_mode {
+                "fence protocol"
+            } else {
+                "keyed-mutex arm"
+            }
         );
         Ok(Self {
             // SAFETY: `header` is the mapped host header; `dxgi_format` lives within it.
@@ -664,6 +806,7 @@ impl FramePublisher {
             ep,
             context: context.clone(),
             slots,
+            fences: fence_mode.then_some(fences).flatten(),
             next: 0,
             mismatch_logged: false,
             offered: 0,
@@ -671,6 +814,46 @@ impl FramePublisher {
             offered_total: 0,
             last_published: None,
         })
+    }
+
+    /// Open the endpoint's shared fences on this device (`ID3D11Device5::OpenSharedFence`) and the
+    /// `ID3D11DeviceContext4` the GPU-side waits/signals need. `None` — logged — when the device
+    /// predates D3D11.4 or either open fails; the ring then runs on the keyed-mutex arm.
+    fn open_fences(
+        ep: &RingEndpoint,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+    ) -> Option<Fences> {
+        let (Ok(dev5), Ok(ctx4)) = (
+            device.cast::<ID3D11Device5>(),
+            context.cast::<ID3D11DeviceContext4>(),
+        ) else {
+            dbglog!(
+                "[pf-vd] frame-push(driver): no ID3D11Device5/DeviceContext4 — fence ring unavailable on this device"
+            );
+            return None;
+        };
+        let open = |h: u64| -> windows::core::Result<ID3D11Fence> {
+            let mut f: Option<ID3D11Fence> = None;
+            // SAFETY: `dev5` is a live ID3D11Device5; `h` is the duplicated shared-fence NT handle,
+            // alive for the endpoint's lifetime; `f` is a valid out-param checked below.
+            unsafe { dev5.OpenSharedFence(HANDLE(h as usize as *mut core::ffi::c_void), &mut f)? };
+            f.ok_or_else(|| windows::core::HRESULT(0x8000_4005u32 as i32).into())
+        };
+        match (open(ep.ready_fence), open(ep.retire_fence)) {
+            (Ok(ready), Ok(retire)) => Some(Fences {
+                ctx4,
+                ready,
+                retire,
+            }),
+            (r, t) => {
+                let code = r.err().or(t.err()).map_or(0, |e| e.code().0);
+                dbglog!(
+                    "[pf-vd] frame-push(driver): OpenSharedFence failed rc={code:#x} — fence ring unavailable on this device"
+                );
+                None
+            }
+        }
     }
 
     /// The endpoint this publisher writes into.
@@ -750,11 +933,33 @@ impl FramePublisher {
         let Some(s) = self.slots.get(slot as usize) else {
             return;
         };
-        // SAFETY: `s.mutex` is the live keyed mutex on this ring slot's shared texture; an 8 ms
+        if self.fences.is_some() {
+            // Fence protocol: own the slot for the copy by CASing it out of PUBLISHED (a slot the
+            // host is READING, or already freed, is left alone — the stash keeps what it had). Our
+            // copy is ordered after our own publish copy on this context, and the state goes back
+            // to PUBLISHED so the host may still consume it.
+            let state = self.ep.slot_state(slot as usize);
+            if state
+                .compare_exchange(
+                    fence::PUBLISHED,
+                    fence::WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                stash.store(device, &self.context, &s.tex, at);
+                state.store(fence::PUBLISHED, Ordering::Release);
+            }
+            return;
+        }
+        let Some(mutex) = s.mutex.as_ref() else {
+            return;
+        };
+        // SAFETY: `mutex` is the live keyed mutex on this ring slot's shared texture; an 8 ms
         // try-acquire of key 0. Raw vtable call for the same reason as `publish` below: the `Result`
         // wrapper erases the success-severity WAIT_TIMEOUT/WAIT_ABANDONED codes.
-        let hr =
-            unsafe { (Interface::vtable(&s.mutex).AcquireSync)(Interface::as_raw(&s.mutex), 0, 8) };
+        let hr = unsafe { (Interface::vtable(mutex).AcquireSync)(Interface::as_raw(mutex), 0, 8) };
         match hr.0 {
             // Acquired cleanly — harvest the last-published image.
             0 => {
@@ -763,7 +968,7 @@ impl FramePublisher {
                 stash.store(device, &self.context, &s.tex, at);
                 // SAFETY: the keyed mutex is held (acquired above); release it exactly once.
                 unsafe {
-                    let _ = s.mutex.ReleaseSync(0);
+                    let _ = mutex.ReleaseSync(0);
                 }
             }
             // WAIT_ABANDONED: the host died holding the slot, so the surface's consistency is
@@ -772,7 +977,7 @@ impl FramePublisher {
             WAIT_ABANDONED_HRESULT => {
                 // SAFETY: abandoned still transfers the lock; release it exactly once.
                 unsafe {
-                    let _ = s.mutex.ReleaseSync(0);
+                    let _ = mutex.ReleaseSync(0);
                 }
             }
             // Busy or a genuine error — keep whatever the stash had.
@@ -827,19 +1032,24 @@ impl FramePublisher {
         }
         self.mismatch_logged = false;
         self.write_opened_detail();
+        if self.fences.is_some() {
+            return self.publish_fence(surface, display_qpc);
+        }
         let start = self.next;
         for attempt in 0..ring_len {
             let slot = (start + attempt) % ring_len;
             let s = &self.slots[slot as usize];
-            // SAFETY: `s.mutex` is the live keyed mutex on this ring slot's shared texture; a 0 ms
+            let Some(mutex) = s.mutex.as_ref() else {
+                continue; // cannot happen on the mutex arm (open refuses such a ring)
+            };
+            // SAFETY: `mutex` is the live keyed mutex on this ring slot's shared texture; a 0 ms
             // try-acquire of key 0 (released below; on WAIT_TIMEOUT it's never held). Raw vtable
             // call, NOT the `Result` wrapper: `.ok()` erases success codes, so through `Result` a
             // WAIT_TIMEOUT (host holds the slot) is indistinguishable from a real acquire — the
             // wrapper made the busy-skip arm below dead code and had us copying into (and
             // publishing) a slot the host was still reading.
-            let hr = unsafe {
-                (Interface::vtable(&s.mutex).AcquireSync)(Interface::as_raw(&s.mutex), 0, 0)
-            };
+            let hr =
+                unsafe { (Interface::vtable(mutex).AcquireSync)(Interface::as_raw(mutex), 0, 0) };
             match hr.0 {
                 // WAIT_ABANDONED: the host died (or a host thread crashed) holding the slot — the
                 // surface's consistency is unknown and this generation is DEAD. No pixel action;
@@ -849,7 +1059,7 @@ impl FramePublisher {
                 WAIT_ABANDONED_HRESULT => {
                     // SAFETY: abandoned still transfers the lock; best-effort release, once.
                     unsafe {
-                        let _ = s.mutex.ReleaseSync(0);
+                        let _ = mutex.ReleaseSync(0);
                     }
                     dbglog!(
                         "[pf-vd] frame-push FATAL: slot {slot} keyed mutex ABANDONED (host died holding it) — poisoning this ring generation"
@@ -871,7 +1081,7 @@ impl FramePublisher {
                     // textures on `self.context`'s device; the mutex is held, released once.
                     let released = unsafe {
                         self.context.CopyResource(&s.tex, surface);
-                        s.mutex.ReleaseSync(0)
+                        mutex.ReleaseSync(0)
                     };
                     if let Err(e) = released {
                         dbglog!(
@@ -882,52 +1092,8 @@ impl FramePublisher {
                         self.ep.mark_dead(ERR_DOMAIN_TRANSPORT, e.code().0);
                         return PublishOutcome::Fatal;
                     }
-                    let ep = &*self.ep;
-                    let seq = ep.seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                    // `latest` = (generation << 40) | (seq << 8) | slot, packed by the proto's `FrameToken`
-                    // (single source of truth — the host unpacks with the same type). Stamping the generation
-                    // lets the host REJECT a publish from a stale ring (an old-generation publisher racing the
-                    // host's mid-session ring recreate) so it never consumes an unwritten new-ring slot.
-                    let latest = FrameToken {
-                        generation: ep.generation,
-                        seq: seq as u32,
-                        slot: slot as u8,
-                    }
-                    .pack();
-                    // Provenance stamp BEFORE the Release publish of `latest`: a host that reads
-                    // it after loading the token sees this frame's stamp or a newer one —
-                    // monotonic either way, and best-effort like the telemetry tail.
-                    // SAFETY: the header stays mapped for the endpoint's lifetime; `qpc_pts` is an
-                    // 8-aligned u64 within it (the `latest_cell` pattern).
-                    unsafe {
-                        (*(core::ptr::addr_of!((*ep.header).qpc_pts) as *const AtomicU64))
-                            .store(display_qpc, Ordering::Relaxed);
-                    }
-                    ep.latest_cell().store(latest, Ordering::Release);
-                    // v3 tail: a NEW source frame (the OS stamped a present time) advances the
-                    // MONITOR's source sequence; a stash republish (qpc 0) does not. Counters +
-                    // publish QPC are best-effort Relaxed like the telemetry tail.
-                    if display_qpc != 0 {
-                        let n = ep
-                            .source_seq
-                            .fetch_add(1, Ordering::Relaxed)
-                            .wrapping_add(1);
-                        ep.v3_store_u64(offset_of!(SharedHeader, source_sequence), n);
-                    }
-                    let n = ep
-                        .published_total
-                        .fetch_add(1, Ordering::Relaxed)
-                        .wrapping_add(1);
-                    ep.v3_store_u64(offset_of!(SharedHeader, published_total), n);
-                    ep.v3_store_u64(offset_of!(SharedHeader, last_publish_qpc), qpc_now());
-                    // SAFETY: `ep.event` is the live host-created frame-ready event, duplicated into
-                    // this process with the creator's access; signalling it wakes the host consumer.
-                    unsafe {
-                        let _ = SetEvent(ep.event);
-                    }
-                    self.next = (slot + 1) % ring_len;
-                    self.last_published = Some((slot, Instant::now()));
-                    return PublishOutcome::Published;
+                    let seq = self.ep.seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                    return self.published(slot, seq, display_qpc);
                 }
                 // Busy — the host holds this slot (the designed backpressure): try the next one.
                 WAIT_TIMEOUT_HRESULT => continue,
@@ -963,5 +1129,159 @@ impl FramePublisher {
         // from the fatal outcomes: the host is alive and behind, retrying next compose is correct.
         self.ep.note_drop();
         PublishOutcome::AllSlotsBusy
+    }
+
+    /// The fence-protocol publish (immunity plan D5; the S2-proven shape). One scan, one CAS
+    /// claim, GPU-ordered copy — the producer never CPU-waits on the reader: it takes a FREE
+    /// slot, else overwrites the OLDEST PUBLISHED one, else drops the frame; READING and WRITING
+    /// slots are never touched.
+    fn publish_fence(&mut self, surface: &ID3D11Texture2D, display_qpc: u64) -> PublishOutcome {
+        let ring_len = self.slots.len();
+        let ep = self.ep.clone();
+        // A superseded generation must not touch the slot table the host is rebuilding — the
+        // worker retires this publisher on its next pass; this closes the last publish before it.
+        if ep.is_stale() {
+            return PublishOutcome::Dropped;
+        }
+        let mut view = [(fence::FREE, 0u64); RING_LEN as usize];
+        for (i, v) in view.iter_mut().enumerate().take(ring_len) {
+            *v = (
+                ep.slot_state(i).load(Ordering::Acquire),
+                ep.slot_u64(i, offset_of!(SlotRecord, seq))
+                    .load(Ordering::Acquire),
+            );
+        }
+        let (slot, from) = match fence::producer_claim(&view[..ring_len]) {
+            Claim::Free(i) => (i, fence::FREE),
+            Claim::Overwrite(i) => (i, fence::PUBLISHED),
+            Claim::Drop => {
+                ep.note_drop();
+                return PublishOutcome::AllSlotsBusy;
+            }
+        };
+        // The claim CAS: a lost race (the host took the slot READING, or freed it) is the
+        // designed race — drop this frame and rescan on the next compose rather than spin.
+        if ep
+            .slot_state(slot)
+            .compare_exchange(from, fence::WRITING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            ep.note_drop();
+            return PublishOutcome::AllSlotsBusy;
+        }
+        let Some(f) = self.fences.as_ref() else {
+            return PublishOutcome::Dropped;
+        };
+        let retire_v = ep
+            .slot_u64(slot, offset_of!(SlotRecord, retire_value))
+            .load(Ordering::Acquire);
+        let ready_v = ep
+            .ready_value
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        // SAFETY: GPU-queued calls over live COM objects on this worker's immediate context: the
+        // retire Wait orders our copy after the host's last read of this slot on the GPU timeline
+        // (never a CPU block), the copy is format-matched (checked by the caller), and the ready
+        // Signal orders it before the host's consume.
+        let queued = unsafe {
+            f.ctx4.Wait(&f.retire, retire_v).and_then(|()| {
+                self.context.CopyResource(&self.slots[slot].tex, surface);
+                f.ctx4.Signal(&f.ready, ready_v)
+            })
+        };
+        if let Err(e) = queued {
+            // Give the slot back (its pixels are unknown, so FREE — the consumer never reads a FREE
+            // slot) and poison the generation: a failed fence op is a device-class fatal.
+            ep.slot_state(slot).store(fence::FREE, Ordering::Release);
+            // SAFETY: `self.context` is the live immediate context; a read-only status query.
+            let removed = unsafe {
+                self.context.GetDevice().map_or(0, |d| {
+                    d.GetDeviceRemovedReason()
+                        .map_or_else(|e| e.code().0, |()| 0)
+                })
+            };
+            dbglog!(
+                "[pf-vd] frame-push FATAL: fence Wait/Signal failed rc={:#x} (device-removed reason {removed:#x}) — poisoning this ring generation",
+                e.code().0
+            );
+            ep.note_drop();
+            ep.mark_dead(
+                if removed != 0 {
+                    ERR_DOMAIN_DEVICE
+                } else {
+                    ERR_DOMAIN_TRANSPORT
+                },
+                if removed != 0 { removed } else { e.code().0 },
+            );
+            return PublishOutcome::Fatal;
+        }
+        let seq = ep.seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        // Stamp the record, then release PUBLISHED: a consumer that Acquire-loads PUBLISHED sees
+        // the seq and ready value that belong to these pixels. The record carries the PACKED
+        // token (generation included), so a record a superseded generation left behind is
+        // recognisable to the host and freed, never consumed by sequence number.
+        let record_seq = FrameToken {
+            generation: ep.generation,
+            seq: seq as u32,
+            slot: slot as u8,
+        }
+        .pack();
+        ep.slot_u64(slot, offset_of!(SlotRecord, seq))
+            .store(record_seq, Ordering::Release);
+        ep.slot_u64(slot, offset_of!(SlotRecord, ready_value))
+            .store(ready_v, Ordering::Release);
+        ep.slot_state(slot)
+            .store(fence::PUBLISHED, Ordering::Release);
+        self.published(slot as u32, seq, display_qpc)
+    }
+
+    /// The publish tail both arms share once a slot's pixels are in place: the token, the
+    /// provenance stamp, the v3 counters and the host wake-up.
+    fn published(&mut self, slot: u32, seq: u64, display_qpc: u64) -> PublishOutcome {
+        let ep = &*self.ep;
+        // `latest` = (generation << 40) | (seq << 8) | slot, packed by the proto's `FrameToken`
+        // (single source of truth — the host unpacks with the same type). Stamping the generation
+        // lets the host REJECT a publish from a stale ring (an old-generation publisher racing the
+        // host's mid-session ring recreate) so it never consumes an unwritten new-ring slot.
+        let latest = FrameToken {
+            generation: ep.generation,
+            seq: seq as u32,
+            slot: slot as u8,
+        }
+        .pack();
+        // Provenance stamp BEFORE the Release publish of `latest`: a host that reads it after
+        // loading the token sees this frame's stamp or a newer one — monotonic either way, and
+        // best-effort like the telemetry tail.
+        // SAFETY: the header stays mapped for the endpoint's lifetime; `qpc_pts` is an 8-aligned
+        // u64 within it (the `latest_cell` pattern).
+        unsafe {
+            (*(core::ptr::addr_of!((*ep.header).qpc_pts) as *const AtomicU64))
+                .store(display_qpc, Ordering::Relaxed);
+        }
+        ep.latest_cell().store(latest, Ordering::Release);
+        // v3 tail: a NEW source frame (the OS stamped a present time) advances the MONITOR's
+        // source sequence; a stash republish (qpc 0) does not. Counters + publish QPC are
+        // best-effort Relaxed like the telemetry tail.
+        if display_qpc != 0 {
+            let n = ep
+                .source_seq
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            ep.v3_store_u64(offset_of!(SharedHeader, source_sequence), n);
+        }
+        let n = ep
+            .published_total
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        ep.v3_store_u64(offset_of!(SharedHeader, published_total), n);
+        ep.v3_store_u64(offset_of!(SharedHeader, last_publish_qpc), qpc_now());
+        // SAFETY: `ep.event` is the live host-created frame-ready event, duplicated into this
+        // process with the creator's access; signalling it wakes the host consumer.
+        unsafe {
+            let _ = SetEvent(ep.event);
+        }
+        self.next = (slot + 1) % self.slots.len() as u32;
+        self.last_published = Some((slot, Instant::now()));
+        PublishOutcome::Published
     }
 }

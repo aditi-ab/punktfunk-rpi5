@@ -201,6 +201,8 @@ mod tests {
             vulkan_layer_registered: false,
             web_task: super::super::TaskState::Absent,
             scripting_task: super::super::TaskState::Absent,
+            inno_uninstaller: false,
+            client_installed: None,
         }
     }
 
