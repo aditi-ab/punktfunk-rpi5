@@ -86,6 +86,9 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **`inhibit_shortcuts` applies under the desktop mouse model on the Apple client.** It gated the
   ⌘-chord passthrough and the system-shortcut tap on the capture model only, unlike the SDL
   clients; turn the setting off to keep the chords local.
+- **Menu backs out of every tvOS screen: the Shortcuts page, the connect takeover and a drilled
+  library shelf, and the quick-action ring shows one highlight.** Nothing to do; the Siri Remote
+  now drives the ring too (swipe steps, click fires, Play/Pause recentres, Back closes).
 
 ### Fixed
 

@@ -72,6 +72,26 @@ public final class SiriRemotePointer {
     /// quick-action ring's opener on tvOS (design/touch-client-overlay.md §2.5). A long hold
     /// still exits.
     public var onShortBack: (() -> Void)?
+    /// A remote gesture while the ring owns the remote (`ringOpen`): a swipe steps the
+    /// highlight, a click fires it, Play/Pause recentres, a short Back closes.
+    public var onRingNav: ((RingNav) -> Void)?
+    /// The ring is up: gestures drive it (`onRingNav`) and nothing reaches the host — a click
+    /// already sent down is lifted now, GamepadCapture's own `ringOpen` rule.
+    public var ringOpen = false {
+        didSet {
+            guard ringOpen != oldValue else { return }
+            swipeAnchor = nil
+            if ringOpen {
+                cancelPlayPause()
+                releaseHeld()
+            }
+        }
+    }
+    /// The finger position the next ring step is measured from; nil = lifted.
+    private var swipeAnchor: (x: Float, y: Float)?
+    /// Finger travel that steps the ring once (axes span ±1): about a quarter of the surface,
+    /// so a held swipe walks several slots.
+    private static let swipeStep: Float = 0.45
 
     public init(connection: PunktfunkConnection) {
         self.connection = connection
@@ -135,7 +155,7 @@ public final class SiriRemotePointer {
         // Surface click = left button; Play/Pause = right (the remote's only spare face button),
         // or — held — the stats-overlay cycle. See `playPauseChanged`.
         micro.buttonA.pressedChangedHandler = { [weak self] _, _, pressed in
-            MainActor.assumeIsolated { self?.setButton(1, down: pressed) }
+            MainActor.assumeIsolated { self?.clickChanged(pressed: pressed) }
         }
         micro.buttonX.pressedChangedHandler = { [weak self] _, _, pressed in
             MainActor.assumeIsolated { self?.playPauseChanged(pressed: pressed) }
@@ -150,22 +170,54 @@ public final class SiriRemotePointer {
         // gesture instead of a jump-delta from the old position.
         guard x != 0 || y != 0 else {
             lastTouch = nil
+            swipeAnchor = nil
             return
         }
         defer { lastTouch = (x, y) }
-        guard let last = lastTouch else { return } // first contact anchors, moves nothing
+        guard let last = lastTouch else { // first contact anchors, moves nothing
+            swipeAnchor = (x, y)
+            return
+        }
         let stepX = x - last.x
         let stepY = y - last.y
         // The release tail (and any tracking glitch) shows up as a single impossible jump —
         // see `maxStep`. Skip the emission; the deferred anchor update above still follows the
         // reported position, so the gesture cleanly re-anchors instead of retracing.
-        guard abs(stepX) < Self.maxStep, abs(stepY) < Self.maxStep else { return }
+        guard abs(stepX) < Self.maxStep, abs(stepY) < Self.maxStep else {
+            swipeAnchor = (x, y)
+            return
+        }
+        if ringOpen { return ringSwipe(x: x, y: y) }
         let dx = stepX * Self.pointerScale / 2 // axes span ±1 → full swipe = 2.0
         let dy = -stepY * Self.pointerScale / 2 // GC +y is up; mouse +y is down
         let ix = Int32(dx.rounded())
         let iy = Int32(dy.rounded())
         guard ix != 0 || iy != 0 else { return }
         connection.send(.mouseMove(dx: ix, dy: iy))
+    }
+
+    /// A ring step per `swipeStep` of travel from the anchor, along the dominant axis; the
+    /// anchor moves with each step so a long swipe keeps walking.
+    private func ringSwipe(x: Float, y: Float) {
+        guard let a = swipeAnchor else {
+            swipeAnchor = (x, y)
+            return
+        }
+        let dx = x - a.x
+        let dy = y - a.y
+        guard abs(dx) >= Self.swipeStep || abs(dy) >= Self.swipeStep else { return }
+        swipeAnchor = (x, y)
+        onRingNav?(abs(dx) >= abs(dy) ? (dx > 0 ? .right : .left) : (dy > 0 ? .up : .down))
+    }
+
+    /// Surface click: the left button — or, with the ring up, its confirm. A release after the
+    /// ring closed lifts a button the host never saw down, which is harmless.
+    private func clickChanged(pressed: Bool) {
+        if ringOpen {
+            if pressed { onRingNav?(.confirm) }
+            return
+        }
+        setButton(1, down: pressed)
     }
 
     private func setButton(_ button: UInt32, down: Bool) {
@@ -181,6 +233,11 @@ public final class SiriRemotePointer {
     /// is the hold-Select gesture's (`GamepadCapture.gestureFiltered`) — suppress, then deliver a
     /// tap on release or the gesture past the threshold — so the two behave alike.
     private func playPauseChanged(pressed: Bool) {
+        // With the ring up the spare button is the pad's Y: back to the centre.
+        if ringOpen {
+            if pressed { onRingNav?(.centre) }
+            return
+        }
         if pressed {
             statsHoldFired = false
             let timer = Timer(timeInterval: Self.statsHold, repeats: false) { [weak self] _ in
@@ -252,10 +309,13 @@ public final class SiriRemotePointer {
         menuDownAt = nil
         if heldFor >= Self.disconnectHold {
             onDisconnectRequest?()
+        } else if ringOpen {
+            // Back inside the ring is the pad's B: out of the sheet, else close.
+            onRingNav?(.back)
         } else {
-            // A short press opens (or closes) the quick-action ring. It is never forwarded as
-            // a host key — that would make trackpad fumbles type — and the accompanying UIKit
-            // menu press is swallowed in ContentView.
+            // A short press opens the quick-action ring. It is never forwarded as a host key —
+            // that would make trackpad fumbles type — and the accompanying UIKit menu press is
+            // swallowed in ContentView.
             onShortBack?()
         }
     }
