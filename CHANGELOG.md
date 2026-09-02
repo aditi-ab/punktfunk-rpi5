@@ -34,6 +34,17 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Added
 
+- **Three Windows launch kinds: `uplay`, `amazon` and `battlenet`.** A library plugin publishes
+  a validated store id and the host builds the launch itself: `explorer.exe "uplay://launch/<id>/0"`,
+  `explorer.exe "amazon-games://play/<id>"`, and `Battle.net.exe --exec="launch <code>"`. All three
+  are open to the plugin lane; nothing to do unless you write a plugin. A cold Battle.net client
+  only opens itself on the first launch, so keep it running or pick the tile twice.
+- **`defineLibraryPlugin` takes a `launch` resolver** (`@punktfunk/plugin-kit` 0.4.5). A library
+  plugin can publish `kind: "plugin"` tiles and answer the host's launch-time ask without composing
+  its own UI server; plugins on 0.4.4 are unaffected.
+- **Six new library sources ship as plugins**: Ubisoft Connect, Amazon Games and Battle.net on
+  Windows; desktop entries and Flatpak, Bottles and itch.io on Linux, itch.io on Windows too.
+  Install them from the console's Game sources once they reach the catalog.
 - **Topology writes are transactions with an observed outcome.** `topology_churn::begin` /
   `finish` name a mutation, hold descriptor-following for its deadline, and bump a topology
   generation only when the verification read saw a change; `isolate_displays_ccd_checked`

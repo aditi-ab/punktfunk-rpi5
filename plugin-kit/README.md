@@ -63,7 +63,7 @@ share is published here rather than sitting adjacent to them:
 
 | Export | What it saves you writing |
 | --- | --- |
-| `defineLibraryPlugin` | the whole plugin except the scan: store claim, sync engine (poll + fs-watch + debounce), launcher entries, `__config`, `category: "library"` registration, and the `detect` / `scan` / `parity` / `uninstall` CLI verbs |
+| `defineLibraryPlugin` | the whole plugin except the scan: store claim, sync engine (poll + fs-watch + debounce), launcher entries, `__config`, `category: "library"` registration, the `detect` / `scan` / `parity` / `uninstall` CLI verbs, and the `__launch` answer for `kind: "plugin"` tiles (pass `launch(cfg, entry)`) |
 | `parsers/*` | text VDF + `.acf`, binary `shortcuts.vdf` (with the CRC-32 appid and the 64-bit `rungameid` composition), read-only SQLite, `reg.exe`, capped readers, a confined path join, Steam root/library discovery, art location helpers, an anti-SSRF fetch |
 | `diffParity` + the `parity` verb | the acceptance gate below |
 

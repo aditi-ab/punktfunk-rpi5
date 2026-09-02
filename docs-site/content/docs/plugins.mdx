@@ -19,8 +19,17 @@ install the one for each launcher you use.
 | **Epic Games Store** | Windows | Your installed Epic titles, from the launcher's own manifests. |
 | **GOG** | Windows | Your installed GOG games, launched directly — Galaxy is never involved. |
 | **Playnite** | Windows | Mirrors your [Playnite](https://playnite.link) library — every store and emulator it manages — into the library, launched back through Playnite. |
+| **Ubisoft Connect** | Windows | Your installed Ubisoft titles, from the launcher's install registry, launched back through Ubisoft Connect. |
+| **Amazon Games** | Windows | Your installed Amazon Games titles, from the app's own database, launched back through Amazon Games. |
+| **Battle.net** | Windows | Your installed Blizzard titles, from the Battle.net agent's product database, launched through the Battle.net client, which must already be running. |
+| **Desktop entries** | Linux | Every application menu entry in the Game category, Flatpak included, that no other source already lists. |
+| **Bottles** | Linux | The programs you added to each Bottle, launched through `bottles-cli`. |
+| **itch.io** | Linux, Windows | Games installed by the itch app, with their itch.io covers, launched directly. |
 | **ROM Manager** | Linux, Windows | Scans your ROM directories, matches each platform to an installed emulator, and syncs them into the library with box art. |
 | **VirtualHere** | Linux, Windows | Hands a real USB device on the couch — wheel, HOTAS, pad — to the host while you play, and gives it back after. Needs [VirtualHere](https://www.virtualhere.com/), sold separately. |
+
+Amazon Games and the itch app keep their databases under your user profile, which the Windows
+plugin runner cannot read by default. Each plugin's README carries the one-line `icacls` grant.
 
 ## Installing from the console
 

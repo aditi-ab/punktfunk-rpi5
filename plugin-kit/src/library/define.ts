@@ -19,7 +19,7 @@ import {
 	DEFAULT_FS_CHANGE_MIN_INTERVAL,
 	makeSyncEngine,
 } from "../sync-engine.js";
-import { serveUi } from "../ui-server.js";
+import { type PluginLaunchTarget, serveUi } from "../ui-server.js";
 import type { ProviderEntry } from "../wire.js";
 import {
 	diffParity,
@@ -74,6 +74,16 @@ export interface LibraryPluginDef<S extends Schema.Top> {
 	 * blandest thing in the grid.
 	 */
 	readonly launchers?: (cfg: S["Type"]) => ReadonlyArray<ProviderEntry>;
+	/**
+	 * Answer the host's launch-time ask for an entry published as `launch: {kind: "plugin",
+	 * value: <key>}` — a title the host cannot name itself (a `.desktop` Exec line, a Bottles
+	 * program). Resolve against your own scan and answer `null` for any key you never published:
+	 * that 404 is what keeps a forged entry inert. See `serveUi`'s `launch`.
+	 */
+	readonly launch?: (
+		cfg: S["Type"],
+		entry: string,
+	) => Effect.Effect<PluginLaunchTarget | null>;
 	/** Launcher data dirs to watch, so a newly installed game appears without waiting for a poll. */
 	readonly watchDirs?: (cfg: S["Type"]) => ReadonlyArray<string>;
 	/** How often to re-scan regardless of watches. Default `Duration.minutes(15)`. */
@@ -216,10 +226,22 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 		// The UI server exists ONLY to serve `__config` (and the SDK's `__health`): no `staticDir`,
 		// no API. That is the whole "settings without an SPA" story (design D7, closing G8), and the
 		// `library` category is what keeps six installed scanners out of the console's sidebar.
+		const launch = def.launch;
 		yield* serveUi({
 			title: def.title ?? def.name,
 			category: "library",
 			config: { schema: def.configSchema, service: cfgService },
+			// An unreadable config answers "not mine": the settings drawer shows the parse error,
+			// and a 404 is the one reply that cannot start the wrong program.
+			...(launch
+				? {
+						launch: (entry: string) =>
+							cfgService.load.pipe(
+								Effect.flatMap((cfg) => launch(cfg, entry)),
+								Effect.catch(() => Effect.succeed(null)),
+							),
+					}
+				: {}),
 		});
 
 		yield* engine.start;
