@@ -134,7 +134,9 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
             let inset = max(0, (geo.size.width - itemWidth) / 2)
             ScrollViewReader { proxy in
                 ScrollView(.horizontal) {
-                    HStack(spacing: spacing) {
+                    // Lazy: a several-hundred-title coverflow mounted (and decoded) every cover
+                    // at once, which on an Apple TV was seconds of stall and a memory warning.
+                    LazyHStack(spacing: spacing) {
                         // Enumerated for the entrance stagger only — identity stays `item.id`,
                         // which is what `.scrollTargetLayout()` and `scrollPosition` key on.
                         ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
@@ -148,6 +150,9 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
                                     .frame(width: itemWidth)
                             }
                             .buttonStyle(ConsoleBareButtonStyle())
+                            // Unfocusable while a tray, a cover or the connect takeover owns
+                            // the pad — the engine otherwise kept stepping the strip behind it.
+                            .disabled(!isActive)
                             .focused($focusedID, equals: item.id)
                             .id(item.id)
                             #else
@@ -202,6 +207,9 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
                 .onChange(of: items.map(\.id)) { _, _ in
                     if let id = focusedID { proxy.scrollTo(id, anchor: .center) }
                 }
+                // Menu pops a place / dismisses the library from the strip itself, instead of
+                // bubbling to the cover and closing the whole library from a drilled shelf.
+                .gamepadExitCommand(onBack)
                 #endif
             }
         }
@@ -242,6 +250,13 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
             if active {
                 wire()
                 input.start()
+                #if os(tvOS)
+                // The cards were disabled meanwhile, so the engine dropped focus: seat it back
+                // on the cursor's card once they are enabled again (next pass, hence the hop).
+                DispatchQueue.main.async {
+                    if cursor < items.count { focusedID = items[cursor].id }
+                }
+                #endif
             } else {
                 input.stop()
                 haptics.stop()
