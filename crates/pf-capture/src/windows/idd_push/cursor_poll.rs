@@ -158,13 +158,12 @@ fn run(
         if last_attach.elapsed() >= CursorPoller::REATTACH {
             last_attach = Instant::now();
             publish_secure(secure, desktop.reattach());
-            // …and re-read the target's desktop rect on the same cadence: a mid-session resize (or
-            // an HDR recreate, or the user moving this display in the desktop arrangement) changes
-            // BOTH the origin the position is made relative to and the extent `in_rect` tests
-            // against, and this poller outlives all of them. `None` keeps the last good value — a
-            // transient CCD failure must not park the pointer at a `(0, 0, 0, 0)` rect, which would
-            // report every position invisible.
-            let fresh = pf_win_display::win_display::source_desktop_rect(ccd);
+            // …and re-read the target's desktop rect from the display actor's snapshot (no CCD
+            // call here): a resize, an HDR recreate or the user moving this display changes BOTH
+            // the origin positions are made relative to and the extent `in_rect` tests against,
+            // and this poller outlives all of them. `None` keeps the last good value — a target
+            // briefly absent must not park the pointer at a `(0, 0, 0, 0)` rect (all invisible).
+            let fresh = pf_win_display::display_events::snapshot().source_rect(ccd);
             if let Some(fresh) = fresh {
                 if fresh != rect {
                     tracing::info!(

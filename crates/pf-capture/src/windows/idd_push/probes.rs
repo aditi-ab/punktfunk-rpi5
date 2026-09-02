@@ -501,8 +501,10 @@ fn scanline_loop(inner: &Inner) {
                 // successful open below and is closed exactly once here.
                 unsafe { close(&mut req) };
             }
+            // From the display actor's snapshot (immunity plan WP9): the retarget no longer takes
+            // the display-config lock on this probe thread every 2 s.
             if let Some((lo, hi, source, physical)) =
-                pf_win_display::win_display::active_scanline_target()
+                pf_win_display::display_events::snapshot_or_query().scanline_target()
             {
                 let mut req = D3dkmtOpenAdapterFromLuid {
                     adapter_luid: LUID {

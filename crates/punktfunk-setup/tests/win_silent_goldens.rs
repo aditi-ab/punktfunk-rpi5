@@ -42,6 +42,7 @@ fn fresh() -> WinFacts {
         web_task: TaskState::Absent,
         scripting_task: TaskState::Absent,
         inno_uninstaller: false,
+        client_installed: None,
     }
 }
 

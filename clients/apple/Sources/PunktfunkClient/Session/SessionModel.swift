@@ -320,6 +320,9 @@ final class SessionModel: ObservableObject {
     func setRingOpen(_ open: Bool) {
         gamepadCapture?.ringOpen = open
         virtualPad?.masked = open
+        #if os(tvOS)
+        remotePointer?.ringOpen = open
+        #endif
     }
 
     /// The virtual on-screen controller (design/touch-client-overlay.md §4): shown from the
@@ -1215,6 +1218,7 @@ final class SessionModel: ObservableObject {
         // The remote's short Back is the ring's opener on tvOS — the same hook the pad chord
         // uses, so the view wires one closure for both.
         pointer.onShortBack = { [weak self] in self?.onRingChord?() }
+        pointer.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
         pointer.start()
         remotePointer = pointer
         #endif
