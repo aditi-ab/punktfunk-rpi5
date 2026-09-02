@@ -1,71 +1,57 @@
-//! Apply-job bookkeeping: the in-memory job snapshot the console polls, and the two on-disk
-//! records that let an update **report its own outcome across its own restart** (design §4.2,
-//! plan U1.1):
+//! Apply-job bookkeeping: the snapshot the console polls, and two on-disk records
+//! so an update can report its outcome across its own restart.
 //!
-//! - the **intent record** (`update-intent.json`) — written just before anything irreversible
-//!   (spawning the installer). It is the only witness once the installer kills this process.
-//! - the **result record** (`update-result.json`) — the durable outcome of the *last* apply,
-//!   written either by the failing stage itself or by boot-time reconciliation.
+//! - Intent (`update-intent.json`): written just before anything irreversible.
+//!   It is the only witness once the installer kills this process.
+//! - Result (`update-result.json`): durable outcome of the last apply, written
+//!   by a failing stage or by boot-time reconciliation.
 //!
-//! Reconciliation ([`reconcile`]) runs once per boot: intent + running-the-target-version ⇒
-//! success; intent + still the old version after the grace window ⇒ failure with the installer
-//! log path attached; a fresh intent ⇒ the apply is still in flight (the installer may not have
-//! stopped us yet). Pure over its inputs so every branch is table-testable.
+//! [`reconcile`] once per boot: intent + running the target version ⇒ success;
+//! intent + still the old version after the grace window ⇒ failure with the
+//! installer log; a fresh intent ⇒ still in flight. Pure over its inputs.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// How long after intent-write we still call the apply "in flight" when the running version is
-/// unchanged. Beyond it, the host restarting *without* the new version is a failed apply
-/// (installer aborted, rolled back, or never ran) — surfaced, never silent.
+/// Seconds after intent-write that an unchanged running version is still "in flight".
+/// Past this, a restart without the new version is a failed apply — never silent.
 pub(crate) const APPLY_GRACE_SECS: u64 = 10 * 60;
 
-/// Written immediately before the point of no return.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct IntentRecord {
-    /// The version that started the apply (us, at write time).
     pub from: String,
-    /// The version being installed.
     pub to: String,
-    /// The manifest serial that announced it.
     pub serial: u64,
-    /// Unix seconds at write.
     pub started_unix: u64,
-    /// SHA-256 of the verified installer (diagnostics — ties a result to exact bytes).
+    /// Ties a result to exact installer bytes.
     pub installer_sha256: String,
-    /// Where the installer was told to log (`/LOG=`).
     pub log_path: String,
-    /// A source rebuild (Steam Deck `update.sh`), where version equality proves nothing —
-    /// the workspace version only moves on bumps. The flow's own ordering carries the
-    /// proof instead: the script restarts the host ONLY after a successful build+install,
-    /// and its failure path is reported live (the host survives a failed build). So an
-    /// intent with this flag still present at boot ⟹ the rebuild succeeded.
+    /// Source rebuild (Steam Deck `update.sh`). Version equality proves nothing —
+    /// the workspace version only moves on bumps. Presence of this intent at boot
+    /// is the success signal: the script restarts the host only after install.
     #[serde(default)]
     pub source_build: bool,
 }
 
-/// The durable outcome of the most recent apply attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ResultRecord {
     pub ok: bool,
     pub from: String,
     pub to: String,
     pub finished_unix: u64,
-    /// The stage that failed (`downloading` | `verifying` | `applying` | `restarting`);
-    /// absent on success.
+    /// Failed stage: `downloading` | `verifying` | `applying` | `restarting`. Absent on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// The installer log, when one was in play by the time it failed (or succeeded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
-    /// The update is applied but activates on the next reboot (rpm-ostree).
+    /// Applied, but activates on the next reboot (rpm-ostree).
     #[serde(default)]
     pub staged: bool,
 }
 
-/// The live job the console polls, mirrored into `GET /update/status`.
+/// Live job the console polls (`GET /update/status`).
 #[derive(Debug, Clone)]
 pub(crate) struct JobSnapshot {
     pub target_version: String,
@@ -86,8 +72,7 @@ pub(crate) fn result_path() -> PathBuf {
 
 pub(crate) fn read_intent(path: &Path) -> Option<IntentRecord> {
     let bytes = std::fs::read(path).ok()?;
-    // An unparseable intent (half-written before atomic-rename existed, disk fault) must not
-    // crash reconcile — it reads as "no intent" and the stale file is swept.
+    // Unparseable intent is "no intent". Reconcile must not crash on a disk fault.
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -96,7 +81,7 @@ pub(crate) fn read_result(path: &Path) -> Option<ResultRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Atomic tmp+rename JSON write (the intent/result records must never be half-written — R12).
+/// Temp + rename. Intent and result records must never be half-written.
 pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -108,21 +93,17 @@ pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io
     std::fs::rename(&tmp, path)
 }
 
-/// What boot-time reconciliation decided.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Reconciled {
-    /// No intent on disk — nothing to close out.
     None,
-    /// Intent is fresh and we still run the old version: the installer likely hasn't stopped
-    /// us yet (or is mid-copy). Leave the intent in place; status shows the apply in flight.
+    /// Fresh intent, still the old version: installer may not have stopped us yet.
     StillApplying,
-    /// We came back at the target version.
     Success(ResultRecord),
-    /// We came back at the wrong version after the grace window.
+    /// Wrong version after the grace window.
     Failed(ResultRecord),
 }
 
-/// Pure reconcile: current version + wall clock vs. the intent record.
+/// No I/O: current version and wall clock versus the intent.
 pub(crate) fn reconcile(
     intent: Option<IntentRecord>,
     current_version: &str,
@@ -132,8 +113,7 @@ pub(crate) fn reconcile(
         return Reconciled::None;
     };
     if intent.source_build {
-        // See `IntentRecord::source_build`: presence at boot IS the success signal; the
-        // running version is the truthful "to" (a rebuild can legitimately keep it).
+        // Presence at boot is success. `to` is the running version; a rebuild may keep it.
         return Reconciled::Success(ResultRecord {
             ok: true,
             from: intent.from,
@@ -192,8 +172,6 @@ mod tests {
         }
     }
 
-    /// An intent written by a host from before the tray-relaunch field must still load, and read
-    /// as "no tray to put back" — the behaviour that shipped before it existed.
     #[test]
     fn an_intent_without_the_tray_field_deserializes_as_false() {
         let json = r#"{"from":"0.23.100","to":"0.23.200","serial":42,"started_unix":1000,
@@ -206,8 +184,7 @@ mod tests {
     fn source_build_intent_is_success_with_the_running_version() {
         let mut i = intent(0);
         i.source_build = true;
-        // Same version as `from` (a rebuild without a bump) — still success, and `to` is
-        // what actually runs, not the manifest's label.
+        // Rebuild without a bump: still success, and `to` is what runs, not the manifest label.
         match reconcile(Some(i), "0.23.100", 10_000_000) {
             Reconciled::Success(r) => {
                 assert!(r.ok);
@@ -264,7 +241,6 @@ mod tests {
         let ip = dir.join("update-intent.json");
         write_json_atomic(&ip, &intent(7)).unwrap();
         assert_eq!(read_intent(&ip).unwrap().started_unix, 7);
-        // Corrupt bytes read as "no intent", never a crash.
         std::fs::write(&ip, b"{half").unwrap();
         assert!(read_intent(&ip).is_none());
         let _ = std::fs::remove_dir_all(&dir);

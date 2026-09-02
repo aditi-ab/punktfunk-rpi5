@@ -1,16 +1,12 @@
-//! Session-tagged management endpoints: stop the active session, force an IDR. Split out of the
-//! `mgmt` facade (plan §W5).
+//! Session-tagged management HTTP handlers: stop, IDR, end-game, session⇄game lifetime.
+//!
+//! `DELETE /session` is a deliberate stop: skip keep-alive linger and apply
+//! `game_on_session_end`. Policy: `design/session-game-lifetime.md`.
 
 use super::shared::*;
 use std::sync::atomic::Ordering;
 
-/// Stop the active session
-///
-/// Kicks the connected client: stops the video/audio stream threads and clears the launch
-/// state. Idempotent — succeeds even when nothing is streaming.
-///
-/// Counts as a **deliberate** stop, exactly like a client pressing Stop: the display skips its
-/// keep-alive linger, and the end-game-on-session-end policy (if the operator enabled one) applies.
+/// Deliberate stop: skip keep-alive linger and apply `game_on_session_end`.
 #[utoipa::path(
     delete,
     path = "/session",
@@ -23,8 +19,7 @@ use std::sync::atomic::Ordering;
 )]
 pub(crate) async fn stop_session(State(st): State<Arc<MgmtState>>) -> StatusCode {
     let was_streaming = st.app.quit_session("management API stop");
-    // Native plane: the GameStream teardown above doesn't reach it (it runs its own loops off the shared
-    // session registry), so signal every live native session to tear down too.
+    // Native sessions run off the GameStream registry; `quit_session` does not reach them.
     let native = crate::session_status::count();
     crate::session_status::stop_all_quit();
     tracing::info!(
@@ -35,14 +30,8 @@ pub(crate) async fn stop_session(State(st): State<Arc<MgmtState>>) -> StatusCode
     StatusCode::NO_CONTENT
 }
 
-/// End a launched game
-///
-/// Ends a game whose session has already gone and which is waiting out its reconnect window — the
-/// console's "End now" for a game the host is about to close anyway. `app_id` picks one title; omit it
-/// to end every waiting game.
-///
-/// This does **not** touch a game whose session is still live: ending that is session management
-/// (`DELETE /session`), and how the game is treated then follows the operator's policy.
+/// End games waiting out the reconnect window. Does not touch a live session
+/// (`DELETE /session` plus `game_on_session_end`).
 #[utoipa::path(
     post,
     path = "/game/end",
@@ -64,30 +53,25 @@ pub(crate) async fn end_game(ApiJson(req): ApiJson<EndGameRequest>) -> Response 
     Json(EndGameResult { ended }).into_response()
 }
 
-/// Request body for `endGame`.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct EndGameRequest {
-    /// Store-qualified library id (`steam:570`) to end; omit to end every waiting game.
+    /// Store-qualified id (`steam:570`); omit to end every waiting game.
     #[serde(default)]
     pub app_id: Option<String>,
 }
 
-/// Result of an `endGame`.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct EndGameResult {
-    /// How many waiting games were ended.
     ended: usize,
 }
 
-/// The session⇄game lifetime settings, plus which axes this build acts on.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct SessionSettingsState {
-    /// The stored settings (or the built-in defaults when this host has never been configured).
     settings: crate::session_settings::SessionSettings,
-    /// Whether an operator has ever saved these settings (`false` ⇒ `settings` are the defaults).
+    /// `false` means `settings` are the built-in defaults.
     configured: bool,
-    /// Which fields this build actually enforces. Empty on a platform with no launch path (macOS),
-    /// so the console can say so instead of offering a switch that does nothing.
+    /// Axes this build enforces. Empty with no launch path (macOS) so the console
+    /// does not offer a no-op switch.
     enforced: Vec<String>,
 }
 
@@ -100,11 +84,6 @@ fn session_settings_state() -> SessionSettingsState {
     }
 }
 
-/// Session⇄game lifetime settings
-///
-/// Whether a launched game's exit ends the streaming session, and whether a session ending ends the
-/// game (with the reconnect window that protects a dropped client's unsaved progress). See
-/// `design/session-game-lifetime.md`.
 #[utoipa::path(
     get,
     path = "/session/settings",
@@ -119,10 +98,8 @@ pub(crate) async fn get_session_settings() -> Json<SessionSettingsState> {
     Json(session_settings_state())
 }
 
-/// Set the session⇄game lifetime settings
-///
-/// Persists the settings (clamped) and applies them from the next decision — including to a session
-/// that is already streaming, since the policy is read when a session ends rather than when it starts.
+/// Persist (clamped). Takes effect on the next decision, including a session
+/// already streaming — policy is read at session end, not start.
 #[utoipa::path(
     put,
     path = "/session/settings",
@@ -155,10 +132,6 @@ pub(crate) async fn set_session_settings(
     Json(state).into_response()
 }
 
-/// Force a keyframe
-///
-/// Asks the encoder for an IDR frame on the active video stream (what a client requests
-/// after unrecoverable loss — exposed for debugging).
 #[utoipa::path(
     post,
     path = "/session/idr",
@@ -179,7 +152,7 @@ pub(crate) async fn request_idr(State(st): State<Arc<MgmtState>>) -> Response {
     if gs {
         st.app.force_idr.store(true, Ordering::SeqCst);
     }
-    // Native sessions get the keyframe request through their registry flag (see `session_status`).
+    // Native sessions take IDR from the registry flag, not `app.force_idr`.
     crate::session_status::force_idr_all();
     StatusCode::ACCEPTED.into_response()
 }

@@ -1,72 +1,56 @@
-//! Backend-agnostic de-jitter for the client-mic uplink. The pump feeds every received `0xCB`
-//! frame (with its datagram sequence — see [`MicFrame`]) through [`MicDejitter`], which puts a
-//! two-frame reorder window in front of the Opus decoder, asks for libopus concealment on true
-//! sequence gaps (so a lost datagram doesn't drain the backend ring into a silence + re-prime
-//! cycle), and measures inter-arrival jitter into the adaptive target depth the backend rings
-//! prime against. Mirrors the client downlink's `AudioGapTracker` (punktfunk-core `audio.rs`):
-//! the same wrapping-sequence gap rules, grown the reorder hold and the jitter estimator the
-//! uplink needs — the downlink's jitter rings own their depth; the uplink's live in the
-//! backends and take their target from here.
+//! Backend-agnostic de-jitter for the client-mic uplink.
+//!
+//! The pump feeds every received `0xCB` frame (datagram sequence in [`MicFrame`])
+//! through [`MicDejitter`]: a two-frame reorder window in front of Opus, libopus
+//! concealment on true sequence gaps (so a lost datagram does not drain the
+//! backend ring into silence + re-prime), and inter-arrival jitter into the
+//! adaptive target depth the backend rings prime against.
+//!
+//! Same wrapping-sequence gap rules as the client downlink's `AudioGapTracker`
+//! (punktfunk-core `audio.rs`). Downlink jitter rings own their depth; uplink
+//! rings live in the backends and take their target from here.
 
 use super::MicFrame;
 use std::time::{Duration, Instant};
 
-/// What the pump should do next, in playback order. `Frame` is a real frame to decode;
-/// `Conceal` is one frame of libopus packet-loss concealment (`decode_float(&[], …)`, sized to
-/// the last real frame) standing in for a lost one.
+/// Playback-ordered work. `Conceal` is one libopus PLC frame
+/// (`decode_float(&[], …)`), sized to the last real frame.
 pub(super) enum Deliver {
     Frame(MicFrame),
     Conceal,
 }
 
-/// Most concealment frames one gap may synthesize. libopus PLC fades to silence after a few
-/// frames anyway; past the cap the ring's underrun/re-prime path takes over, as before.
-///
-/// ⚠ **A COUNT, and the downlink this was copied from no longer has one to be scaled against.**
-/// The old wording — "the client downlink's `AudioGapTracker` cap, scaled to the uplink's bigger
-/// frames" — described a core that capped at a flat ten packets; core now states that bound in
-/// TIME (`MAX_CONCEAL_MS` = 50 ms) and derives the packet count from the frame length each session
-/// actually resolved, precisely because a fixed count silently retunes when the frame does. Same
-/// defect family as the drought fuse and the near-miss margin.
-///
-/// This constant is not the same number by another name, and never was: five frames is ~100 ms at
-/// the uplink's common 20 ms Opus frame — twice the downlink's bound, not a scaling of it. It is
-/// left as a count because the uplink cannot be told its frame length: the client encodes it and
-/// nothing announces it, so [`MicDejitter`] can only *measure* it, from consecutive frames' pts
-/// deltas (`frame_ms`). That measurement is the material a time-stated cap would be derived from
-/// if this is ever retuned — and the reason to retune it is a client that drops to 10 ms frames,
-/// where the same five frames become 50 ms of cover instead of 100.
+/// Cap on PLC frames for one gap. Five ≈ 100 ms at 20 ms Opus. A count, not
+/// a time: the client never announces frame length, so we only measure it
+/// from consecutive pts deltas (`frame_ms`). Past this, the ring re-primes.
 const MAX_CONCEAL_FRAMES: u32 = 5;
 
-/// How long one out-of-order frame may wait for its missing predecessor before the gap is
-/// concealed and the held frame plays: ~one 20 ms frame interval plus scheduling slack. With
-/// the incoming frame that is a two-frame window — anything needing more is treated as loss,
-/// exactly like the client downlink (which holds nothing at all).
+/// How long an out-of-order frame may wait for its predecessor: ~one 20 ms
+/// frame plus scheduling slack. With the incoming frame that is a two-frame
+/// window; anything needing more is treated as loss.
 const HOLD_MAX: Duration = Duration::from_millis(30);
 
 /// Arrival gaps above this are talk-spurt pauses (DTX, mute), not network jitter — folding
 /// them into the estimate would balloon the target after every pause.
 const PAUSE_GAP: Duration = Duration::from_millis(250);
 
-/// The sliding jitter window: [`BUCKETS`] × [`BUCKET_LEN`] of per-bucket max inter-arrival gap.
-/// Long enough that the old bursty Mac cadence (~two 20 ms frames every ~42 ms — the 2026-07-03
-/// "crackling mic", see `wasapi_mic.rs`) is always represented; short enough that a one-off
-/// spike ages out in a few seconds.
+/// Sliding window: [`BUCKETS`] × [`BUCKET_LEN`] of per-bucket max gap.
+/// Long enough to represent a two-frame ~42 ms burst cadence; short enough
+/// that a one-off spike ages out in a few seconds.
 const BUCKETS: usize = 4;
 const BUCKET_LEN: Duration = Duration::from_millis(1000);
 
-/// Target before the estimator has a full [`WARMUP`] of evidence: roughly the old fixed 48 ms
-/// prime minus the one consumer quantum the backends add — the crackle-safe assumption that
-/// the client might be an old bursty one. Modern 10 ms-cadence clients drop to ~15–25 ms once
-/// measured (after their first talk pause re-primes the ring at the lower target).
+/// Target before a full [`WARMUP`] of evidence: historical 48 ms prime minus
+/// the one consumer quantum backends add. Floor until measured — an unmeasured
+/// client might still burst two frames every ~42 ms.
 const DEFAULT_TARGET_MS: u32 = 40;
 /// Headroom over the measured worst burst gap.
 const TARGET_PAD_MS: u32 = 5;
-/// How long the estimator distrusts its own (young) window and keeps the default as a floor.
+/// How long the estimator distrusts its young window and floors at default.
 const WARMUP: Duration = Duration::from_secs(1);
 
-/// Reset-on-read snapshot for the pump's telemetry line. Counters cover the window since the
-/// last read; `cadence_ms`/`frame_ms` are gauges (EWMAs).
+/// Reset-on-read snapshot for the pump's telemetry. Counters are the window
+/// since last read; `cadence_ms`/`frame_ms` are gauges (EWMAs).
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct DejitterStats {
     pub seq_gaps: u64,
@@ -83,21 +67,18 @@ pub(super) struct MicDejitter {
     /// Sequence the uplink owes next; `None` before the first frame / after
     /// [`reset_stream`](Self::reset_stream).
     expected: Option<u32>,
-    /// The reorder window: at most ONE newer frame parked ≤ [`HOLD_MAX`] for its predecessor.
+    /// Reorder window: at most one newer frame parked ≤ [`HOLD_MAX`].
     held: Option<(Instant, MicFrame)>,
-    // --- adaptive target (inter-arrival jitter) ---
     first_arrival: Option<Instant>,
     last_arrival: Option<Instant>,
     bucket_start: Option<Instant>,
     bucket_idx: usize,
     gap_max: [f32; BUCKETS],
     ewma_gap_ms: f32,
-    // --- pts bookkeeping ---
-    /// `(seq, pts_ns)` of the newest ingested frame — a pts delta over exactly one seq step is
+    /// Newest ingested `(seq, pts_ns)` — a pts delta over one seq step is
     /// the client's true frame duration.
     last_pts: Option<(u32, u64)>,
     frame_ms: f32,
-    // --- counters (reset on read) ---
     seq_gaps: u64,
     concealed: u64,
     reorders: u64,
@@ -124,7 +105,6 @@ impl MicDejitter {
         }
     }
 
-    /// Feed one received frame; playback-ordered work is appended to `out`.
     pub(super) fn ingest(&mut self, now: Instant, frame: MicFrame, out: &mut Vec<Deliver>) {
         self.record_arrival(now, frame.seq, frame.pts_ns);
         self.accept(now, frame, out);
@@ -132,7 +112,6 @@ impl MicDejitter {
 
     fn accept(&mut self, now: Instant, frame: MicFrame, out: &mut Vec<Deliver>) {
         let Some(expected) = self.expected else {
-            // First frame (or first after a reset): the chain starts here.
             self.expected = Some(frame.seq.wrapping_add(1));
             out.push(Deliver::Frame(frame));
             return;
@@ -143,15 +122,15 @@ impl MicDejitter {
             out.push(Deliver::Frame(frame));
             self.release_held_in_order(out);
         } else if delta > u32::MAX / 2 {
-            // Duplicate of, or older than, something already played — the window moved on.
+            // wrapping_sub > MAX/2: duplicate or older than already-played.
             self.late_drops += 1;
         } else if let Some(held_seq) = self.held.as_ref().map(|(_, h)| h.seq) {
             if held_seq == frame.seq {
                 self.late_drops += 1; // duplicate of the held frame
                 return;
             }
-            // Two newer-than-expected frames in hand — waiting longer can't fill the gap
-            // within the window. Play them in order, concealing what's genuinely missing.
+            // Two newer-than-expected frames in hand — waiting longer cannot
+            // fill the gap. Play in order, concealing what is genuinely missing.
             let (_, held) = self.held.take().expect("checked above");
             let (first, second) = if frame.seq.wrapping_sub(held.seq) > u32::MAX / 2 {
                 (frame, held)
@@ -161,11 +140,11 @@ impl MicDejitter {
             self.give_up_and_play(first, out);
             self.accept(now, second, out); // depth ≤ 1: `held` is None here
         } else {
-            self.held = Some((now, frame)); // wait ≤ HOLD_MAX for the predecessor
+            self.held = Some((now, frame));
         }
     }
 
-    /// If the held frame's predecessor just played, the hold is over — the reorder repaired.
+    /// If the held frame's predecessor just played, emit it (reorder repaired).
     fn release_held_in_order(&mut self, out: &mut Vec<Deliver>) {
         if let Some((_, h)) = &self.held {
             if Some(h.seq) == self.expected {
@@ -194,13 +173,12 @@ impl MicDejitter {
         out.push(Deliver::Frame(frame));
     }
 
-    /// When the current hold (if any) must be given up — the pump's next wake deadline.
+    /// When the current hold (if any) must be given up — the pump's next wake.
     pub(super) fn hold_deadline(&self) -> Option<Instant> {
         self.held.as_ref().map(|(t, _)| *t + HOLD_MAX)
     }
 
-    /// Give up an expired hold (the predecessor never came): conceal + play. Called on the
-    /// pump's timeout wakes.
+    /// Give up an expired hold (predecessor never came): conceal + play.
     pub(super) fn flush_expired_hold(&mut self, now: Instant, out: &mut Vec<Deliver>) {
         if self.hold_deadline().is_some_and(|d| now >= d) {
             let (_, h) = self.held.take().expect("deadline implies held");
@@ -208,15 +186,13 @@ impl MicDejitter {
         }
     }
 
-    /// Uplink pause / backend reopen: whatever is parked predates the gap, and the next frame
-    /// restarts the chain (a pause is not loss — it must not conceal or count a gap).
+    /// Uplink pause / backend reopen: parked frames predate the gap; the next
+    /// frame restarts the chain. A pause is not loss — do not conceal it.
     pub(super) fn reset_stream(&mut self) {
         self.expected = None;
         self.held = None;
         self.last_pts = None;
     }
-
-    // ---- adaptive target -------------------------------------------------------------------
 
     fn record_arrival(&mut self, now: Instant, seq: u32, pts_ns: u64) {
         if let Some(last) = self.last_arrival {
@@ -261,7 +237,7 @@ impl MicDejitter {
             start += BUCKET_LEN;
             advanced += 1;
             if advanced >= BUCKETS {
-                // Everything aged out (long pause) — snap the window to now.
+                // Long pause aged the whole window out — snap it to now.
                 self.gap_max = [0.0; BUCKETS];
                 start = now;
                 break;
@@ -270,11 +246,9 @@ impl MicDejitter {
         self.bucket_start = Some(start);
     }
 
-    /// The jitter component of the backend ring's prime depth, in ms — the worst burst gap in
-    /// the window plus a pad, clamped to [10, 60]. Backends add ONE consumer quantum on top
-    /// (see [`VirtualMic::set_target_depth`](super::VirtualMic::set_target_depth)). Old bursty
-    /// clients measure ~42 ms and land near the historical 48 ms prime; modern 10 ms-cadence
-    /// clients settle at ~15–25 ms.
+    /// Jitter component of the backend ring's prime depth, in ms: worst burst
+    /// gap in the window plus a pad, clamped to [10, 60]. Backends add one
+    /// consumer quantum ([`VirtualMic::set_target_depth`](super::VirtualMic::set_target_depth)).
     pub(super) fn target_ms(&self, now: Instant) -> u32 {
         let measured =
             self.gap_max.iter().fold(0f32, |a, &b| a.max(b)).ceil() as u32 + TARGET_PAD_MS;
@@ -289,7 +263,6 @@ impl MicDejitter {
         t.clamp(10, 60)
     }
 
-    /// Reset-on-read counters + gauges for the pump's telemetry line.
     pub(super) fn take_stats(&mut self) -> DejitterStats {
         let s = DejitterStats {
             seq_gaps: self.seq_gaps,
@@ -319,7 +292,7 @@ mod tests {
         }
     }
 
-    /// Compact delivery shape: frame seqs as-is, concealment as -1.
+    /// Delivery shape: frame seqs as-is, concealment as -1.
     fn seqs(out: &[Deliver]) -> Vec<i64> {
         out.iter()
             .map(|d| match d {
@@ -351,9 +324,9 @@ mod tests {
         let t = Instant::now();
         let mut out = Vec::new();
         dj.ingest(t, f(5), &mut out);
-        dj.ingest(t, f(7), &mut out); // held, waiting for 6
+        dj.ingest(t, f(7), &mut out);
         assert_eq!(seqs(&out), [5]);
-        dj.ingest(t, f(6), &mut out); // the missing one arrives late → both play, in order
+        dj.ingest(t, f(6), &mut out);
         assert_eq!(seqs(&out), [5, 6, 7]);
         let st = dj.take_stats();
         assert_eq!(st.reorders, 1);
@@ -366,8 +339,8 @@ mod tests {
         let t = Instant::now();
         let mut out = Vec::new();
         dj.ingest(t, f(5), &mut out);
-        dj.ingest(t, f(7), &mut out); // held, waiting for 6
-        dj.ingest(t, f(8), &mut out); // 6 is lost: one PLC frame, then 7 and 8
+        dj.ingest(t, f(7), &mut out);
+        dj.ingest(t, f(8), &mut out);
         assert_eq!(seqs(&out), [5, -1, 7, 8]);
         let st = dj.take_stats();
         assert_eq!(st.seq_gaps, 1);
@@ -393,7 +366,7 @@ mod tests {
         let t = Instant::now();
         let mut out = Vec::new();
         dj.ingest(t, f(5), &mut out);
-        dj.ingest(t, f(100), &mut out); // held
+        dj.ingest(t, f(100), &mut out);
         dj.flush_expired_hold(t + HOLD_MAX, &mut out);
         let conceals = out.iter().filter(|d| matches!(d, Deliver::Conceal)).count();
         assert_eq!(conceals, MAX_CONCEAL_FRAMES as usize);
@@ -407,10 +380,10 @@ mod tests {
         let mut out = Vec::new();
         dj.ingest(t, f(5), &mut out);
         dj.ingest(t, f(6), &mut out);
-        dj.ingest(t, f(6), &mut out); // duplicate
-        dj.ingest(t, f(3), &mut out); // ancient
-        dj.ingest(t, f(8), &mut out); // held
-        dj.ingest(t, f(8), &mut out); // duplicate of the held frame
+        dj.ingest(t, f(6), &mut out);
+        dj.ingest(t, f(3), &mut out);
+        dj.ingest(t, f(8), &mut out);
+        dj.ingest(t, f(8), &mut out);
         assert_eq!(seqs(&out), [5, 6]);
         assert_eq!(dj.take_stats().late_drops, 3);
     }
@@ -421,7 +394,7 @@ mod tests {
         let t = Instant::now();
         let mut out = Vec::new();
         dj.ingest(t, f(u32::MAX), &mut out);
-        dj.ingest(t, f(0), &mut out); // in order across the wrap
+        dj.ingest(t, f(0), &mut out);
         assert_eq!(seqs(&out), [i64::from(u32::MAX), 0]);
         dj.ingest(t, f(u32::MAX), &mut out); // pre-wrap replay: late, not a 2^31 gap
         assert_eq!(dj.take_stats().late_drops, 1);
@@ -441,7 +414,7 @@ mod tests {
 
     #[test]
     fn bursty_uplink_grows_the_target_modern_uplink_shrinks_it() {
-        // Old Mac cadence: two frames back-to-back every ~42 ms.
+        // Two frames back-to-back every ~42 ms.
         let mut dj = MicDejitter::new();
         let t0 = Instant::now();
         let mut out = Vec::new();
@@ -457,7 +430,7 @@ mod tests {
         let target = dj.target_ms(now);
         assert!((42..=60).contains(&target), "bursty target {target}");
 
-        // Modern 10 ms cadence: past warmup the target follows the small gaps down.
+        // Steady 10 ms cadence: past warmup the target follows the small gaps down.
         let mut dj = MicDejitter::new();
         let mut now = t0;
         for i in 0u64..200 {

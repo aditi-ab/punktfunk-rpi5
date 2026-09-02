@@ -1,76 +1,56 @@
-//! The plugin-store **index**: the catalog document a source serves, and the ed25519 signature
-//! that makes it trustworthy (design `plugin-store.md` §3.2).
+//! Signed plugin-store catalog: one exact version plus tarball hash per entry
+//! (design `plugin-store.md` §3.2).
 //!
-//! The index is the verification gate. Each entry pins **one exact version plus that version's
-//! tarball integrity hash** — so "verified on every release" is a property of the data, not a
-//! promise about process: upstream can publish a newer version, but nothing in this host will
-//! offer it until a re-reviewed entry lands in a signed index. There is deliberately no way to
-//! express "track latest" for a catalogued plugin.
+//! There is no "track latest". A newer upstream release is not offered until a
+//! re-reviewed entry lands in a signed index.
 //!
-//! Two rules keep parsing safe:
-//! 1. **Signature before parse.** [`verify_signature`] runs over the exact bytes; only then does
-//!    anything here look at a field. A source with a pinned key whose signature fails is an
-//!    error, never a fallback to "unsigned".
-//! 2. **Validate every field, drop what fails.** A malformed *entry* is dropped with a warning
-//!    (one bad row shouldn't blind the operator to the rest of the shelf); a malformed
-//!    *document* — unknown schema, non-JSON, oversized — is rejected whole.
+//! [`verify_signature`] runs over the exact bytes first; a failed signature is
+//! an error, never a fallback to unsigned. Then every field is validated. A
+//! malformed entry is dropped with a warning; a malformed document (unknown
+//! schema, non-JSON, oversized) is rejected whole.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// The only index schema this host understands. A future breaking change bumps this and old
-/// hosts report the source as unreadable rather than guessing at unknown semantics.
+/// Only schema this host parses. A bump makes older hosts refuse the source.
 pub(crate) const SCHEMA: u32 = 1;
 
-/// Hard cap on a fetched index body. Generous for a text catalog (the seed index is ~2 KB) and
-/// small enough that a hostile or broken source can't exhaust memory.
+/// Cap on a fetched index body so a hostile source cannot exhaust memory.
 pub(crate) const MAX_INDEX_BYTES: usize = 5 * 1024 * 1024;
 
-/// Caps on how much of a (validly signed) index we'll keep. A curated shelf is small; these exist
-/// so a compromised signing key can't turn the console into an unbounded list.
+/// Caps so a compromised signing key cannot grow the console list without bound.
 const MAX_PLUGINS: usize = 500;
 const MAX_ADVISORIES: usize = 200;
 
-// ---------------------------------------------------------------- the document
-
-/// A source's catalog document, as served (and signed).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Index {
-    /// Document schema — must equal [`SCHEMA`].
     pub schema: u32,
-    /// Human-readable name of the catalog ("unom official"). Display only.
+    /// Display only.
     #[serde(default)]
     pub name: String,
-    /// RFC-3339 build timestamp. Display only — freshness is decided by our own fetch clock,
-    /// never by a field the source controls.
+    /// Display only. Freshness is our fetch clock, never this source-controlled field.
     #[serde(default)]
     pub generated: String,
-    /// The shelf.
     #[serde(default)]
     pub plugins: Vec<Entry>,
-    /// Revocations/advisories, checked against **installed** packages as well as catalog rows.
+    /// Revocations, matched against installed packages as well as catalog rows.
     #[serde(default)]
     pub security: Vec<Advisory>,
 }
 
-/// One catalogued plugin: exactly one installable version, pinned by integrity hash.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// One installable version, pinned by integrity hash.
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Entry {
-    /// The plugin's `definePlugin` id (`[a-z][a-z0-9-]*`) — also how a running plugin appears in
-    /// the lease registry, so the console can tell "catalogued" from "running".
+    /// `definePlugin` id; also the lease-registry key, so catalogued vs running is comparable.
     pub id: String,
-    /// npm package name. **Must be scoped** (`@scope/name`): the scope is what maps the package
-    /// to [`Entry::registry`] in bun's `bunfig.toml`, so an unscoped name would be ambiguous
-    /// about where it installs from (design D8).
+    /// Scoped npm name (`@scope/name`). The scope is the `bunfig.toml` key for [`Entry::registry`].
     pub pkg: String,
-    /// The npm registry this package installs from. `https://` only.
+    /// `https://` only.
     pub registry: String,
     pub title: String,
     #[serde(default)]
     pub description: String,
-    /// Lucide icon name for the console card (`[a-z0-9-]{1,48}`), matched against the console's
-    /// curated set; anything unknown falls back to a generic puzzle piece.
+    /// Lucide name; unknown values fall back in the console, not here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     #[serde(default)]
@@ -79,43 +59,27 @@ pub(crate) struct Entry {
     pub homepage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
-    /// **The** installable version — exact, never a range. One version per entry: the index is a
-    /// curated shelf, not a version archive (older releases live in the index repo's git history).
+    /// Exact semver, never a range.
     pub version: String,
-    /// npm integrity of that version's tarball (`sha512-<base64>`). Checked against the registry's
-    /// own advertised integrity before any install runs — a republish under the same version with
-    /// different content cannot pass.
+    /// Tarball SRI. A republish of the same version with different bytes cannot pass install.
     pub integrity: String,
-    /// Present when a human reviewed this exact tarball. Only meaningful in the built-in source's
-    /// index; a third-party source can write it, which is why it never grants the "Verified" badge
-    /// (design D6).
+    /// Review of this tarball. A third-party source can set it, so it never grants Verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Verification>,
-    /// Minimum host version this plugin supports (semver). Incompatible rows still list, greyed.
+    /// Incompatible rows still list, greyed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_host: Option<String>,
-    /// Host platforms this plugin works on (`linux`/`windows`/`macos`). Empty ⇒ all.
+    /// Empty means all.
     #[serde(default)]
     pub platforms: Vec<String>,
-    /// What kinds of plugin this is (`[a-z][a-z0-9-]{0,31}`, ≤4). The console filters Browse by
-    /// these, and the Game sources surface's "Add a source" rail lists exactly the entries carrying
-    /// `library` (design D5/D6). Additive: an older host ignores the field, a newer one just sees no
-    /// categories on an older index.
     #[serde(default)]
     pub categories: Vec<String>,
-    /// Optional per-platform "is this launcher installed here?" probes (design D8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect: Option<DetectProbes>,
 }
 
-/// Existence probes that let the console badge a catalog row "detected on this host" **without the
-/// host re-growing per-store knowledge** — the whole point of extracting the scanners. Store
-/// knowledge lives in the updatable, signed index; the host stays generic and only evaluates.
-///
-/// Deliberately anaemic: a probe is a path or an `HKLM\…` registry key, checked for EXISTENCE only.
-/// No reads, no content matching, no globbing beyond a single `*` segment. The index is
-/// operator-trusted but remotely updatable, so a probe must never be able to exfiltrate anything or
-/// cost more than a stat.
+/// Existence-only probes (path or `HKLM\…`). No reads, no content match, at most one `*`
+/// segment. The index is remotely updatable, so a probe is a stat, never exfil.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub(crate) struct DetectProbes {
     #[serde(default)]
@@ -127,37 +91,26 @@ pub(crate) struct DetectProbes {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Verification {
-    /// ISO date the review landed. Display only.
+    /// Display only.
     pub reviewed_at: String,
 }
 
-/// A revocation: "this package at these versions is known-bad". Checked against what's *installed*,
-/// not just what's listed — the whole point is to reach plugins already on the box.
+/// Matched against installed packages, not only catalog rows.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Advisory {
     pub pkg: String,
-    /// A semver requirement (`<0.3.2`, `>=1.0.0, <1.2.0`, `*`). Unparseable ⇒ the advisory is
-    /// dropped rather than applied to everything.
+    /// Unparseable means drop the advisory, never apply it to everything.
     pub versions: String,
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
 
-// ---------------------------------------------------------------- signature
-
-// Ed25519 verification moved to `pf-update-check` when the Linux client grew its own update
-// check: the host's plugin-store index and both products' update manifests are all "verify a
-// detached signature over exact bytes against pinned keys", and that rule must exist once.
-// Re-exported under the old path so every call site here is unchanged.
+// Shared with update manifests: detached ed25519 over exact bytes against pinned keys.
 pub(crate) use pf_update_check::sig::{verify_signature, PublicKey};
 
-// ---------------------------------------------------------------- parse + validate
-
 impl Index {
-    /// Parse and validate an index document. Rejects the whole document on a structural problem;
-    /// drops individual entries/advisories that fail validation (with a warning) so one bad row
-    /// can't hide the rest of the catalog.
+    /// Reject the document on a structural problem; drop a bad entry or advisory with a warning.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Index> {
         if bytes.len() > MAX_INDEX_BYTES {
             bail!("index is larger than the {MAX_INDEX_BYTES}-byte cap");
@@ -180,7 +133,7 @@ impl Index {
                 false
             }
             Ok(()) => {
-                // Duplicate ids would make "install this one" ambiguous; first wins.
+                // Duplicate ids make install ambiguous; first wins.
                 if seen.iter().any(|s| s == &e.id) {
                     tracing::warn!(id = %e.id, "dropping duplicate catalog entry");
                     false
@@ -229,7 +182,7 @@ impl Entry {
         }
         if let Some(icon) = &self.icon {
             if !valid_icon(icon) {
-                self.icon = None; // cosmetic — drop it rather than the whole entry
+                self.icon = None; // drop the icon, not the entry
             }
         }
         if let Some(h) = &self.homepage {
@@ -247,15 +200,13 @@ impl Entry {
         }
         if let Some(m) = &self.min_host {
             if semver::Version::parse(m).is_err() {
-                self.min_host = None; // unusable constraint ⇒ no constraint
+                self.min_host = None; // unusable constraint means no constraint
             }
         }
         self.platforms
             .retain(|p| matches!(p.as_str(), "linux" | "windows" | "macos"));
         self.platforms.truncate(4);
-        // Categories and probes are cosmetic/advisory: a malformed one is dropped, never fatal to
-        // the entry — a plugin must stay installable even if a future index writes a category this
-        // host build has never heard of.
+        // Unknown or malformed categories/probes drop those fields, never the entry.
         self.categories.retain(|c| valid_category(c));
         self.categories.truncate(4);
         if let Some(d) = &mut self.detect {
@@ -270,8 +221,7 @@ impl Entry {
         Ok(())
     }
 
-    /// Does this entry's platform probe match on the running host? `None` = the entry declares no
-    /// probes for this platform, i.e. "unknown", which the console renders differently from "no".
+    /// `None` means no probes for this platform (unknown), not "not detected".
     pub(crate) fn detected(&self) -> Option<bool> {
         let probes = self.detect.as_ref()?;
         let list = if cfg!(windows) {
@@ -287,7 +237,6 @@ impl Entry {
         Some(list.iter().any(|p| probe_matches(p)))
     }
 
-    /// Is this entry installable on the running host? Returns the operator-facing reason when not.
     pub(crate) fn incompatible_reason(&self) -> Option<String> {
         if !self.platforms.is_empty() && !self.platforms.iter().any(|p| p == HOST_PLATFORM) {
             return Some(format!("requires {}", self.platforms.join(" or ")));
@@ -323,7 +272,6 @@ impl Advisory {
         Ok(())
     }
 
-    /// Does this advisory cover `pkg@version`?
     pub(crate) fn matches(&self, pkg: &str, version: &str) -> bool {
         if self.pkg != pkg {
             return false;
@@ -338,9 +286,6 @@ impl Advisory {
     }
 }
 
-// ---------------------------------------------------------------- small helpers
-
-/// This host's platform token, as used in [`Entry::platforms`].
 pub(crate) const HOST_PLATFORM: &str = if cfg!(target_os = "windows") {
     "windows"
 } else if cfg!(target_os = "macos") {
@@ -349,13 +294,12 @@ pub(crate) const HOST_PLATFORM: &str = if cfg!(target_os = "windows") {
     "linux"
 };
 
-/// The running host's version — the left-hand side of every `minHost` comparison.
+/// Left-hand side of every `minHost` comparison.
 pub(crate) fn host_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Strip control characters (a catalog string ends up in a log line and in the console UI) and
-/// clamp to `max` characters.
+/// Catalog strings land in logs and the console.
 fn sanitize(s: &str, max: usize) -> String {
     s.chars()
         .filter(|c| !c.is_control())
@@ -374,8 +318,7 @@ pub(crate) fn valid_plugin_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// `@scope/name` with npm's safe alphabet. Deliberately stricter than npm: no URL-ish characters
-/// can survive into a `bun add` argument or a `bunfig.toml` scope key.
+/// `@scope/name`, stricter than npm: no URL-ish characters into `bun add` or `bunfig.toml`.
 pub(crate) fn valid_scoped_pkg(pkg: &str) -> bool {
     let Some(rest) = pkg.strip_prefix('@') else {
         return false;
@@ -395,7 +338,7 @@ pub(crate) fn valid_scoped_pkg(pkg: &str) -> bool {
     ok(scope) && ok(name)
 }
 
-/// The `@scope` half of a scoped package name — the key `bunfig.toml` maps to a registry.
+/// `bunfig.toml` registry key for a scoped package.
 pub(crate) fn scope_of(pkg: &str) -> Option<String> {
     let rest = pkg.strip_prefix('@')?;
     let (scope, _) = rest.split_once('/')?;
@@ -409,7 +352,6 @@ fn valid_icon(icon: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// npm's Subresource-Integrity spelling: `<alg>-<base64>`.
 fn valid_integrity(s: &str) -> bool {
     if s.len() > 200 {
         return false;
@@ -428,8 +370,7 @@ fn is_https(url: &str) -> bool {
     url.starts_with("https://") && url.len() > "https://".len()
 }
 
-/// A plugin category (design D5): same shape the registration API accepts, so a plugin's declared
-/// category and its catalog row can never disagree about spelling.
+/// Same spelling the registration API accepts, so a catalog row cannot disagree with a plugin.
 fn valid_category(c: &str) -> bool {
     (1..=32).contains(&c.len())
         && c.starts_with(|ch: char| ch.is_ascii_lowercase())
@@ -437,17 +378,11 @@ fn valid_category(c: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// How many probes one platform may declare — a handful of well-chosen paths covers any launcher,
-/// and the cap bounds the stat cost of rendering the catalog.
+/// Per-platform probe cap; bounds the stat cost of rendering the catalog.
 const MAX_PROBES: usize = 8;
 
-/// Is this a probe the host will evaluate? An **absolute** filesystem path with at most one `*`
-/// segment, or an `HKLM\…` registry key. Everything else is dropped.
-///
-/// The restrictions are the security model (D8). Absolute: a relative path would resolve against
-/// whatever the host's cwd happens to be. One `*` segment: bounded fan-out, so a probe can't walk a
-/// tree. `HKLM` only: `HKCU` is unreadable as LocalService anyway, and pointing the host at an
-/// arbitrary hive is not something a remote index should be able to ask for.
+/// Absolute path with at most one `*` segment, or `HKLM\…`. Relative would follow cwd.
+/// One `*` bounds fan-out. `HKCU` is unreadable as LocalService; other hives are not for a remote index.
 fn valid_probe(p: &str) -> bool {
     if p.is_empty() || p.len() > 260 {
         return false;
@@ -461,18 +396,16 @@ fn valid_probe(p: &str) -> bool {
     }
     let b = p.as_bytes();
     let absolute = p.starts_with('/') || (b.len() >= 3 && b[1] == b':' && b[2] == b'\\');
-    // No traversal, and at most ONE wildcard segment (`~` is not expanded — the host runs as a
-    // service account whose home means nothing to a user's launcher install).
+    // `~` is not expanded: the service account's home is not the user's launcher install.
     absolute && !p.contains("..") && p.matches('*').count() <= 1
 }
 
-/// Evaluate one probe: does the path (or registry key) exist? Existence only — never a read.
+/// Existence only — never a read.
 fn probe_matches(p: &str) -> bool {
     #[cfg(windows)]
     if let Some(key) = p.strip_prefix("HKLM\\") {
         use std::os::windows::process::CommandExt;
-        // `reg.exe query` rather than a registry crate: dependency-free, and it is exactly what a
-        // library plugin will use for the same job under LocalService.
+        // `reg.exe query`, not a registry crate — no extra dep under LocalService.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         return std::process::Command::new("reg.exe")
             .args(["query", &format!("HKLM\\{key}")])
@@ -485,16 +418,15 @@ fn probe_matches(p: &str) -> bool {
     }
     #[cfg(not(windows))]
     if p.starts_with("HKLM\\") {
-        return false; // a Windows probe on a POSIX host is simply not a match
+        return false;
     }
     match p.split_once('*') {
         None => std::path::Path::new(p).exists(),
-        // One wildcard: list the parent of the wildcard segment and match the fixed prefix/suffix
-        // around it. Bounded to a single directory read.
+        // One `*`: one directory read, match prefix/suffix around that segment.
         Some((before, after)) => {
             let (dir, prefix) = match before.rfind(['/', '\\']) {
                 Some(i) => (&before[..=i], &before[i + 1..]),
-                None => return false, // a wildcard with no directory to anchor it
+                None => return false,
             };
             let (suffix, rest) = match after.find(['/', '\\']) {
                 Some(i) => (&after[..i], &after[i..]),
@@ -545,18 +477,14 @@ mod tests {
         assert!(Index::parse(b"not json").is_err());
     }
 
-    /// WP2.8 is additive on purpose — SCHEMA stays 1. An index written by a newer curator must load
-    /// on an older host (unknown fields ignored) and vice versa (absent fields default), or the
-    /// signed-index rollout would need a flag day.
+    /// SCHEMA stays 1: unknown fields ignored, absent fields default. No flag day.
     #[test]
     fn categories_and_probes_are_additive_and_sanitized() {
-        // An entry with NEITHER field — every index in the wild today.
         let e = &Index::parse(&doc(GOOD)).unwrap().plugins[0];
         assert!(e.categories.is_empty());
         assert!(e.detect.is_none());
         assert_eq!(e.detected(), None, "no probes ⇒ unknown, not `false`");
 
-        // With both, including rows that must be dropped rather than fail the entry.
         let rich = GOOD.trim_end_matches('}').to_string()
             + r#","categories":["library","Bad Cat","x","y","z","w"],
                  "detect":{"linux":["/usr/bin/steam","relative/path","/etc/../etc/passwd"],
@@ -585,7 +513,6 @@ mod tests {
         );
         assert!(valid_probe(r"C:\Program Files (x86)\Steam\steam.exe"));
         assert!(valid_probe(r"HKLM\SOFTWARE\WOW6432Node\Valve\Steam"));
-        // Rejected: relative, traversal, more than one wildcard, other hives, absurd length.
         assert!(!valid_probe("steam"));
         assert!(!valid_probe("/usr/../etc/passwd"));
         assert!(!valid_probe("/home/*/games/*/steam"));
@@ -594,7 +521,6 @@ mod tests {
         assert!(!valid_probe(&"/x".repeat(200)));
     }
 
-    /// The evaluator does existence checks only, against real paths, and never reads a byte.
     #[test]
     fn probes_evaluate_against_the_filesystem() {
         let dir = std::env::temp_dir().join(format!("pf-probe-{}", std::process::id()));
@@ -604,7 +530,6 @@ mod tests {
 
         assert!(probe_matches(&format!("{d}/SteamLibrary-42")));
         assert!(!probe_matches(&format!("{d}/nope")));
-        // One wildcard segment, with and without a trailing fixed component.
         assert!(probe_matches(&format!("{d}/SteamLibrary-*")));
         assert!(probe_matches(&format!("{d}/SteamLibrary-*/steamapps")));
         assert!(!probe_matches(&format!("{d}/SteamLibrary-*/nope")));
@@ -686,13 +611,8 @@ mod tests {
         assert!(!valid_integrity("sha512"));
     }
 
-    /// The real published index must parse here, field for field.
-    ///
-    /// This fixture is a snapshot of `unom/punktfunk-plugin-index`'s `v1/index.json`. The index
-    /// repo's validator reimplements this module's rules in TypeScript (it has to — it gates PRs
-    /// before anything is signed), and two hand-written parsers of the same grammar drift. This
-    /// test is the seam that catches the drift from our side: if a document the publisher accepts
-    /// stops being one we accept, an entry silently disappears from every operator's store.
+    /// Snapshot of the published `v1/index.json`. The index repo's TypeScript validator
+    /// reimplements these rules; drift here silently drops entries from every operator's store.
     #[test]
     fn the_published_seed_index_parses() {
         let bytes = include_bytes!("testdata/seed-index.json");
@@ -722,7 +642,7 @@ mod tests {
         );
         assert_eq!(scope_of(&rom.pkg).unwrap(), "@punktfunk");
 
-        // A windows-only entry is listed everywhere but only *installable* where it can run.
+        // Listed everywhere; installable only on a matching platform.
         let playnite = idx
             .plugins
             .iter()
@@ -740,6 +660,6 @@ mod tests {
     fn public_key_parsing_rejects_junk() {
         assert!(PublicKey::parse("nope").is_err());
         assert!(PublicKey::parse("ed25519:!!!").is_err());
-        assert!(PublicKey::parse("ed25519:AAAA").is_err()); // wrong length
+        assert!(PublicKey::parse("ed25519:AAAA").is_err());
     }
 }

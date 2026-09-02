@@ -1,11 +1,10 @@
-//! Client log bundles: the upload endpoint paired devices POST to, and the admin list/fetch/
-//! delete surface the web console reads. See `crate::client_logs` for why this is a file store.
+//! Client log bundles: paired devices POST uploads; the console lists, fetches, and deletes.
+//! See `crate::client_logs` for why this is a file store.
 //!
-//! Lane split (see `auth`): the UPLOAD is the one write a paired streaming cert may perform —
-//! it is write-only (a device can never read anything back, not even its own bundle), size-capped,
-//! and quota-bounded per device. Listing/fetching/deleting are operator business: bundles can
-//! contain whatever the client logged (addresses, host names), so reading them stays on the
-//! loopback-only bearer lane with the host's own logs.
+//! Upload is the one write a paired streaming cert may perform — write-only (the device
+//! cannot read anything back, not even its own bundle), size-capped, quota-bounded per
+//! device. List/fetch/delete stay on the loopback bearer: bundles can hold addresses and
+//! host names, same lane as the host's own logs.
 
 use super::shared::*;
 use crate::client_logs::{ClientLogMeta, MAX_BUNDLE_BYTES};
@@ -13,19 +12,15 @@ use crate::gamestream::tls::PeerCertFingerprint;
 use axum::body::Bytes;
 use axum::Extension;
 
-/// Response to a successful upload.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ClientLogUploaded {
-    /// The stored bundle's id.
     pub id: String,
 }
 
 /// Upload a client log bundle
 ///
-/// A PAIRED DEVICE posts its recent client log as plain text, authenticated by its streaming
-/// certificate (the same mTLS identity it pairs and streams with) — no bearer token. Bundles are
-/// capped at 1 MiB and only the newest few per device are kept. The operator downloads them from
-/// the console's Logs page. This is deliberately write-only for devices: uploading grants no read.
+/// A paired device posts plain text under its streaming cert — no bearer. Cap 1 MiB, newest
+/// few per device kept. Write-only: uploading grants no read.
 #[utoipa::path(
     post,
     path = "/client-logs",
@@ -46,9 +41,8 @@ pub(crate) async fn client_logs_upload(
     fp: Option<Extension<PeerCertFingerprint>>,
     body: Bytes,
 ) -> Response {
-    // The auth middleware admits this route for paired certs AND (like everything) the admin
-    // bearer token — but an upload without a device identity has no owner to file it under, so
-    // the bearer path is a caller error, not a second way in.
+    // Auth admits this route for paired certs and the admin bearer, but an upload with no
+    // device identity has no owner to file it under — bearer here is a caller error.
     let Some(Extension(PeerCertFingerprint(Some(fp)))) = fp else {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -64,13 +58,9 @@ pub(crate) async fn client_logs_upload(
             "log bundle exceeds the 1 MiB cap — send the tail",
         );
     }
-    // Per-client access (design/per-client-access.md): the auth gate's `is_paired` is
-    // EXPIRY-BLIND by design — right for the read-only status GETs (an expired guest still
-    // appears in rosters), wrong for this lane's one WRITE. `effective` is the authorization
-    // verb: `None` = unpaired or expired ⇒ a lapsed guest can't keep writing bundles to the
-    // operator's disk. No specific grant BIT is required — uploading one's own logs is not an
-    // input capability, and a view-only guest mid-session is exactly who a debug bundle is
-    // wanted from.
+    // The gate's `is_paired` is expiry-blind (right for roster GETs). This WRITE uses
+    // `effective`: a lapsed guest must not keep writing to disk. No grant bit — a view-only
+    // guest mid-session is who a debug bundle is wanted from.
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -86,8 +76,8 @@ pub(crate) async fn client_logs_upload(
             "this device's access has expired — ask the host's operator to approve it again",
         );
     }
-    // Resolve the device's display name from the paired roster (the auth gate already proved
-    // membership; a race with an unpair between the gate and here just falls back to the prefix).
+    // Auth already proved membership; a race with unpair between the gate and here falls
+    // back to the fingerprint prefix.
     let device_name = st
         .native
         .as_ref()
@@ -116,8 +106,6 @@ pub(crate) async fn client_logs_upload(
 }
 
 /// List uploaded client log bundles
-///
-/// Every stored bundle's metadata, newest first.
 #[utoipa::path(
     get,
     path = "/client-logs",
@@ -133,8 +121,6 @@ pub(crate) async fn client_logs_list(State(st): State<Arc<MgmtState>>) -> Json<V
 }
 
 /// Download a client log bundle
-///
-/// The bundle body as plain text, for saving or attaching to a report.
 #[utoipa::path(
     get,
     path = "/client-logs/{id}",
@@ -173,7 +159,7 @@ pub(crate) async fn client_logs_get(
 
 /// Delete a client log bundle
 ///
-/// Removes the bundle `id` from disk. `404` if there is no such bundle.
+/// `404` if there is no such bundle.
 #[utoipa::path(
     delete,
     path = "/client-logs/{id}",

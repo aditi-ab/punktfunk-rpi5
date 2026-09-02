@@ -1,38 +1,37 @@
 //! Refcounted, session-scoped Linux suspend inhibition for passive streams.
 //!
-//! After [`QUIET_BEFORE_VETO`] without client input, the host holds a logind `sleep:idle` block
-//! so an idle timer cannot suspend the machine. [`note_input`] releases it synchronously because
-//! the same logind inhibitor would otherwise reject an intentional Sleep action; silence re-arms
-//! it later. A local suspend request during a passive stream remains indistinguishable from idle
-//! suspension and is therefore still blocked.
+//! After [`QUIET_BEFORE_VETO`] without client input, the host holds a logind
+//! `sleep:idle` block so an idle timer cannot suspend the machine.
+//! [`note_input`] releases it synchronously: the same inhibitor would refuse
+//! an intentional Sleep. Silence re-arms it. A local Sleep during a passive
+//! stream is indistinguishable from idle and stays blocked.
 //!
-//! Acquisition is best-effort, shared by native and GameStream sessions, and a no-op off Linux.
+//! Acquisition is best-effort, shared by native and GameStream sessions, and
+//! a no-op off Linux.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// How long a stream must go without client input before the host vetoes suspend on its behalf.
-/// Comfortably under every idle-suspend timer worth catching (Steam's shortest offer is 5 min,
-/// KDE's default 10), and long enough that a menu press followed by a slow "are you sure?" cannot
-/// re-arm the veto mid-decision.
+/// Quiet window before the host vetoes suspend. Under Steam's 5 min and KDE's
+/// 10 min idle timers, and long enough that a Sleep confirmation cannot re-arm
+/// mid-click.
 const QUIET_BEFORE_VETO: Duration = Duration::from_secs(30);
 
-/// How often [`watch`] re-checks the quiet time. Only the RE-ARM edge waits for a tick — the
-/// release edge is synchronous in [`note_input`] — so this bounds nothing a user can feel.
+/// [`watch`] poll interval. Only re-arm waits for a tick; [`note_input`] releases synchronously.
 #[cfg(target_os = "linux")]
 const WATCH_TICK: Duration = Duration::from_secs(5);
 
-/// RAII share of the host-wide inhibitor — hold one per live session/stream.
+/// One RAII share of the host-wide inhibitor. Hold one per live session.
 pub struct StreamHold(());
 
 struct State {
     count: u32,
-    /// Whether [`watch`] is running. Its exit is the 1→0 edge, so without this flag a session that
-    /// ends and restarts inside one tick would leave two watchers racing for the same fd slot.
+    /// True while [`watch`] is running. Exit is the 1→0 edge; without this flag a
+    /// session that ends and restarts inside one tick would spawn a second watcher.
     #[cfg(target_os = "linux")]
     watching: bool,
-    /// The logind inhibitor pipe fd — inhibition lasts exactly as long as it stays open.
+    /// Logind inhibitor pipe. Inhibition lasts exactly as long as this fd stays open.
     #[cfg(target_os = "linux")]
     fd: Option<ashpd::zbus::zvariant::OwnedFd>,
 }
@@ -50,28 +49,22 @@ fn state() -> &'static Mutex<State> {
     })
 }
 
-/// Monotonic ms since first use — a plain `AtomicU64` clock the input path can stamp with one
-/// relaxed store, which `Instant` itself is too fat to be.
+/// `Instant` is too fat for one relaxed store on the input path.
 fn now_ms() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
-/// Whether a veto is standing right now. Read once per input event, so it is what keeps
-/// [`note_input`] off the mutex on the hot path.
+/// One relaxed load per input event keeps [`note_input`] off the mutex.
 static VETOING: AtomicBool = AtomicBool::new(false);
 
-/// Whether the stream has been quiet long enough to veto suspend on the viewer's behalf.
 fn quiet_for(last_input_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(last_input_ms) >= QUIET_BEFORE_VETO.as_millis() as u64
 }
 
-/// Client input arrived on any plane — the person at the other end is driving this box, so no
-/// suspend veto may be standing when their next button press is "Sleep".
-///
-/// Called per decoded input event (keyboard, pointer, pad, pen, motion): one relaxed store, plus a
-/// relaxed load that only ever takes the lock on the rare edge where a veto is actually standing.
+/// Stamp last client input. Releases a standing veto so an intentional Sleep is
+/// not refused by our own block.
 pub fn note_input() {
     LAST_INPUT_MS.store(now_ms(), Ordering::Relaxed);
     if VETOING.load(Ordering::Relaxed) {
@@ -79,11 +72,10 @@ pub fn note_input() {
     }
 }
 
-/// Take a share. The underlying inhibitor is NOT acquired here: the `watch` thread takes it once
-/// the stream has been quiet for [`QUIET_BEFORE_VETO`], and never while someone is driving the box.
+/// Take a share. The inhibitor is not acquired here: [`watch`] takes it after
+/// [`QUIET_BEFORE_VETO`] of quiet, never while someone is driving the box.
 pub fn hold() -> StreamHold {
-    // A fresh stream gets the full quiet window before anything is vetoed, so an ordinary connect
-    // costs zero D-Bus round trips.
+    // Seed the quiet clock so a connect never vetoes and costs no D-Bus round trip.
     LAST_INPUT_MS.store(now_ms(), Ordering::Relaxed);
     let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
     st.count += 1;
@@ -117,8 +109,7 @@ impl Drop for StreamHold {
     }
 }
 
-/// Drop any standing veto. Closing the fd is all it takes — no D-Bus, so this is safe to call from
-/// the input path.
+/// Drop a standing veto. Closing the fd is enough — no D-Bus, so the input path can call this.
 #[cfg(target_os = "linux")]
 fn release(why: &str) {
     let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
@@ -128,11 +119,10 @@ fn release(why: &str) {
 #[cfg(not(target_os = "linux"))]
 fn release(_why: &str) {}
 
-/// Drop any standing veto RIGHT NOW — the host-power path (`design/host-actions.md` §6): an
-/// explicit `power.sleep` must not be refused by our own block inhibitor (we deliberately never
-/// hold `-ignore-inhibit` rights). The session teardown that precedes it drops the holds too,
-/// but via the video loops' next stop-flag check — this is the synchronous belt so the
-/// `Suspend()` call can never race a veto that is already on its way out.
+/// Drop a standing veto before an explicit `power.sleep` (`design/host-actions.md`).
+/// We never hold `-ignore-inhibit`, so our own block would refuse Sleep. Session
+/// Drop also releases, but only on the next stop-flag check; this is the sync
+/// path so `Suspend()` cannot race a still-open fd.
 pub fn release_now() {
     release("a host power action is suspending/stopping this machine");
 }
@@ -145,11 +135,10 @@ fn release_locked(st: &mut State, why: &str) {
     }
 }
 
-/// Own the veto's arm/disarm edges for as long as any session lives.
+/// Own the veto's arm/disarm edges while any session lives.
 ///
-/// Acquiring is the only expensive edge (a thread spawn + a D-Bus round trip), so it happens here
-/// rather than on the input path, and outside the lock — a `note_input` on a hot input stream must
-/// never queue behind a logind call.
+/// Acquire is the expensive edge (thread spawn + D-Bus). It happens here,
+/// outside the lock, so a hot `note_input` never queues behind a logind call.
 #[cfg(target_os = "linux")]
 fn watch() {
     loop {
@@ -161,9 +150,8 @@ fn watch() {
                 return;
             }
             if st.fd.is_some() {
-                // Belt for the nanosecond window in which input lands after the re-check below but
-                // before `VETOING` is published: that press releases nothing, so catch it here
-                // rather than leave a veto standing over a live viewer.
+                // Input can land after the quiet re-check below and before `VETOING`
+                // is stored; that press would not call `release`, so catch it here.
                 if !quiet_for(LAST_INPUT_MS.load(Ordering::Relaxed), now_ms()) {
                     release_locked(&mut st, "the client is sending input again");
                 }
@@ -174,11 +162,11 @@ fn watch() {
             }
         }
         let Some(fd) = acquire() else {
-            continue; // no logind / refused — `acquire` said so once, don't spin on it
+            continue; // no logind / refused — `acquire` logged once; do not spin
         };
         let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
         if st.count == 0 || !quiet_for(LAST_INPUT_MS.load(Ordering::Relaxed), now_ms()) {
-            drop(fd); // raced: the stream ended, or the viewer came back — never veto for those
+            drop(fd); // raced: stream ended or viewer returned — do not store the fd
             continue;
         }
         st.fd = Some(fd);
@@ -186,15 +174,15 @@ fn watch() {
     }
 }
 
-/// One logind `Inhibit` call on a dedicated plain thread — zbus's blocking API must not run on
-/// a tokio worker (its internal `block_on` panics there), and callers of [`hold`] may be either.
-/// The join blocks the caller for the D-Bus round-trip (~ms), which every call site tolerates.
+/// One logind `Inhibit` on a dedicated plain thread. zbus's blocking API panics
+/// on a tokio worker (`block_on` nested), and [`hold`] callers may be either.
+/// The join waits the D-Bus round-trip (~ms); every call site tolerates that.
 #[cfg(target_os = "linux")]
 fn acquire() -> Option<ashpd::zbus::zvariant::OwnedFd> {
     let fd = std::thread::spawn(|| -> Option<ashpd::zbus::zvariant::OwnedFd> {
         use ashpd::zbus;
-        // zbus's blocking API is configured out by ashpd's feature set — drive the async API on
-        // a private current-thread runtime instead (still on this plain thread; see fn doc).
+        // ashpd disables zbus's blocking API. Drive the async API on a private
+        // current-thread runtime, still on this plain thread (see fn doc).
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -240,8 +228,6 @@ fn acquire() -> Option<ashpd::zbus::zvariant::OwnedFd> {
 mod tests {
     use super::*;
 
-    /// The whole fix in one assertion: a stream that is being driven must never be vetoing, or the
-    /// "Sleep" the viewer just picked in Steam's power menu is refused with no visible reason.
     #[test]
     fn a_driven_stream_is_never_vetoed_but_a_quiet_one_is() {
         let quiet_ms = QUIET_BEFORE_VETO.as_millis() as u64;
@@ -254,8 +240,8 @@ mod tests {
             quiet_for(1_000, 1_000 + quiet_ms),
             "the window elapsed — a passive viewer gets the veto"
         );
-        // The clock starts at zero, so an un-stamped stream would look infinitely quiet: `hold`
-        // seeds it precisely so a connect never vetoes before anyone could have pressed anything.
+        // The clock starts at zero, so an unstamped stream looks infinitely quiet.
+        // `hold` seeds it so a connect never vetoes before anyone could have pressed.
         assert!(quiet_for(0, quiet_ms), "an unseeded clock reads as quiet");
     }
 

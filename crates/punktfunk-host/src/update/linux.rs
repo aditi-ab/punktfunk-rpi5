@@ -1,15 +1,12 @@
-//! The Linux apply leg (design §7, plan U2.3): ask systemd to run the `pf-update` root
-//! oneshot, read its result record, and — when the on-disk binary actually changed — hand
-//! the outcome across our own restart via the same intent/reconcile machinery the Windows
-//! leg uses.
+//! Linux apply: start the `pf-update` root oneshot, read its result, and when the
+//! on-disk binary changed, persist intent and restart. Boot reconciliation records
+//! the outcome.
 //!
-//! Privilege model: this process is unprivileged; `systemctl start punktfunk-update.service`
-//! is authorized by polkit for members of the `punktfunk-update` group (an explicit,
-//! auditable opt-in — the packaged group is empty). The request we send carries **nothing**:
-//! the unit's ExecStart is fixed, and the helper derives everything from root-owned state.
-//! polkit resolves group membership via NSS at request time, so a fresh
-//! `usermod -aG punktfunk-update` counts without re-login (the *hint* probe in
-//! [`opted_in`] uses the same NSS route for the same reason).
+//! This process is unprivileged. polkit authorizes `systemctl start
+//! punktfunk-update.service` for the `punktfunk-update` group (packaged empty).
+//! The request carries nothing: ExecStart is fixed and the helper reads
+//! root-owned state. polkit uses NSS at request time, so a fresh `usermod -aG`
+//! counts without re-login; [`opted_in`] uses the same NSS route.
 
 #![cfg(target_os = "linux")]
 
@@ -18,17 +15,16 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// Where the root helper writes its outcome (mirrors `pf-update`'s `HelperResult`).
+/// Root helper outcome. Same shape as `pf-update`'s `HelperResult`.
 const HELPER_RESULT: &str = "/var/lib/punktfunk/update-result.json";
 
-/// The unit the polkit rule scopes to. Its presence is the "helper is installed" probe.
+/// Unit the polkit rule scopes to. Presence means the helper is installed.
 const UNIT_PATH: &str = "/usr/lib/systemd/system/punktfunk-update.service";
 
-/// The pacman escape hatch (root-owned; see the design's §5 pacman stance).
+/// Pacman full-sysupgrade opt-in. Root-owned.
 const PACMAN_OPTIN_CONF: &str = "/etc/punktfunk/update.conf";
 
-/// Wall-clock cap on one helper run (a full `pacman -Syu` on a stale box is slow; a stuck
-/// package manager should still surface as an error eventually).
+/// Cap on one helper run. `pacman -Syu` on a stale box is slow; a stuck manager must still error.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(serde::Deserialize)]
@@ -48,21 +44,18 @@ struct HelperResult {
     finished_unix: u64,
 }
 
-/// The root helper (+ its unit) is installed on this box.
 pub(super) fn helper_installed() -> bool {
     Path::new(UNIT_PATH).exists()
 }
 
-/// The pacman full-sysupgrade escape hatch is explicitly enabled (root-owned config).
 pub(super) fn pacman_opted_in() -> bool {
     std::fs::read_to_string(PACMAN_OPTIN_CONF)
         .map(|c| c.lines().any(|l| l.trim() == "PACMAN_FULL_SYSUPGRADE=1"))
         .unwrap_or(false)
 }
 
-/// Is this process's user in the `punktfunk-update` group, **by NSS** (matching how polkit
-/// will decide) — not by our (possibly stale) process credentials. Cached briefly; the
-/// status endpoint polls this.
+/// Group membership via NSS, matching polkit — not this process's (possibly stale)
+/// credentials. Cached; the status endpoint polls this.
 pub(super) fn opted_in() -> bool {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(Instant, bool)>>> =
         std::sync::OnceLock::new();
@@ -93,20 +86,15 @@ fn capture(cmd: &mut Command) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The console-facing opt-in instruction, shown instead of an Apply button.
+/// Shown instead of an Apply button.
 pub(super) fn opt_in_hint() -> String {
     "sudo usermod -aG punktfunk-update $USER   # enables web-triggered updates for this host"
         .to_string()
 }
 
-/// The Steam Deck source-rebuild leg (plan U3.1): run `~/punktfunk/scripts/steamdeck/update.sh
-/// --pull` in a TRANSIENT user unit — `systemd-run`, because the script ends by restarting
-/// `punktfunk-host.service`, and a child inside our own cgroup would be killed by that restart
-/// mid-run. No root involved (the Deck install is user-owned). Outcome plumbing:
-/// - build FAILS → the script exits without restarting us → the poll below sees the unit fail
-///   and reports it live, log attached;
-/// - build SUCCEEDS → the script restarts us → we die mid-poll; the `source_build` intent at
-///   next boot IS the success signal (`jobs::reconcile`).
+/// Deck source rebuild via `systemd-run` so the script's host restart cannot
+/// kill a child in our cgroup. Fail: we survive, the unit fails. Success: we
+/// die mid-poll; the `source_build` intent at next boot is the signal.
 pub(super) fn run_apply_steamos(
     target_version: &str,
     serial: u64,
@@ -167,8 +155,7 @@ pub(super) fn run_apply_steamos(
     }
     stage("applying");
 
-    // Follow the transient unit. A successful build restarts this process before the unit
-    // goes inactive, so leaving this loop alive means either "still building" or "failed".
+    // Success restarts us before the unit goes inactive. Surviving this loop is fail or still-building.
     let deadline = Instant::now() + Duration::from_secs(90 * 60);
     loop {
         std::thread::sleep(Duration::from_secs(5));
@@ -178,8 +165,7 @@ pub(super) fn run_apply_steamos(
         match state.as_str() {
             "active" | "activating" | "deactivating" | "reloading" => {
                 if Instant::now() > deadline {
-                    // Leave the build running (killing a half-linked build helps nobody) but
-                    // stop claiming it; the intent stays for reconcile if it ever finishes.
+                    // Leave the build running. The intent stays for reconcile if it finishes.
                     return Err((
                         "applying",
                         format!(
@@ -190,8 +176,8 @@ pub(super) fn run_apply_steamos(
                     ));
                 }
             }
-            // The unit ended and we are STILL ALIVE ⇒ the script never reached its restart
-            // step ⇒ the build failed (an up-to-date tree still rebuilds+restarts).
+            // Unit ended and we are still alive: the script never restarted us. An
+            // up-to-date tree still rebuilds and restarts, so this is a failed build.
             _ => {
                 let _ = std::fs::remove_file(jobs::intent_path());
                 return Err((
@@ -203,9 +189,8 @@ pub(super) fn run_apply_steamos(
     }
 }
 
-/// Run the whole Linux apply: start the oneshot, wait, interpret its result record, and for
-/// an in-place binary change, write the intent and restart ourselves (boot reconciliation
-/// reports the outcome). Blocking — run on a blocking thread.
+/// Blocking; run on a blocking thread. An in-place binary change writes intent
+/// and restarts us.
 pub(super) fn run_apply(
     target_version: &str,
     serial: u64,
@@ -266,8 +251,7 @@ pub(super) fn run_apply(
         ));
     }
 
-    // The unit succeeded; its record is the ground truth. Refuse a stale record (an old run's
-    // leftovers with a fresh exit 0 would mean the helper never wrote — surface that).
+    // Unit exit 0 is not enough: a leftover record from an old run must not count.
     let result: HelperResult = std::fs::read(HELPER_RESULT)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -296,7 +280,7 @@ pub(super) fn run_apply(
 
     let current = env!("PUNKTFUNK_VERSION");
     if result.staged {
-        // rpm-ostree: the new deployment activates on reboot — durable outcome now, no restart.
+        // rpm-ostree: new deployment activates on reboot. Durable now; do not restart.
         let _ = jobs::write_json_atomic(
             &jobs::result_path(),
             &jobs::ResultRecord {
@@ -313,8 +297,7 @@ pub(super) fn run_apply(
         return Ok(());
     }
     if !result.changed {
-        // The channel had nothing newer than what's installed (announce leads the mirrors) —
-        // a real answer, not an error. from == to renders as "already up to date".
+        // Nothing newer on the channel (announce leads the mirrors). Not an error.
         let _ = jobs::write_json_atomic(
             &jobs::result_path(),
             &jobs::ResultRecord {
@@ -331,8 +314,7 @@ pub(super) fn run_apply(
         return Ok(());
     }
 
-    // The on-disk binary changed (and the helper's run-the-binary gate already proved it
-    // runs). Cross the restart on the intent record, exactly like the Windows leg.
+    // On-disk binary changed and the helper already proved it runs. Intent crosses the restart.
     let to = result
         .after_version
         .split_whitespace()
@@ -354,8 +336,7 @@ pub(super) fn run_apply(
     .map_err(|e| ("restarting", format!("write intent record: {e}")))?;
 
     stage("restarting");
-    // Web console first (its own unit; a brief console blip the frontend rides out), then
-    // ourselves — --no-block, because this very process is what's being restarted.
+    // Web console first (own unit), then us. `--no-block`: this process is the one restarting.
     let _ = Command::new("systemctl")
         .args(["--user", "--no-block", "restart", "punktfunk-web.service"])
         .status();

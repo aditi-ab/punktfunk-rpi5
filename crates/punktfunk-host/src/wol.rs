@@ -1,38 +1,28 @@
-//! Host-side Wake-on-LAN / Wake-on-Wireless-LAN support.
+//! Host-side Wake-on-LAN / Wake-on-Wireless-LAN.
 //!
-//! Two jobs, both best-effort (a failure here never affects streaming):
-//!  1. [`wake_macs`] — report the host's wake-capable NIC MAC(s) so a client can persist them
-//!     (from the mDNS `mac` TXT record, [`crate::discovery`]) and wake this host later, once it's
-//!     asleep and no longer advertising. Wired and Wi-Fi NICs alike: a magic packet is the same
-//!     packet either way, and an associated station in WoWLAN sleep receives the broadcast the
-//!     AP buffers for it.
-//!  2. [`warn_if_not_armed`] — *detect & warn only* whether the NIC is actually armed to wake on a
-//!     magic packet. We never change NIC settings (that's the user's call); we just surface the
-//!     single most common reason WoL silently fails.
+//! Two jobs, both best-effort (failure never affects streaming):
+//!  1. [`wake_macs`] — advertise wake-capable NIC MACs so a client can persist
+//!     them (mDNS `mac` TXT, [`crate::discovery`]) and wake this host once it
+//!     is asleep. Wired and Wi-Fi: a magic packet is the same packet; an
+//!     associated station in WoWLAN sleep receives the broadcast the AP buffers.
+//!  2. [`warn_if_not_armed`] — detect and warn only. Never change NIC settings.
 //!
-//! Wired and wireless are armed through completely different interfaces, so the check follows the
-//! NIC: `ethtool <iface>` reports the wired `Wake-on: g` bit, while a Wi-Fi NIC's magic-packet
-//! trigger lives in nl80211's WoWLAN state and is read with `iw phy <phy> wowlan show`. Asking
-//! ethtool about a Wi-Fi NIC is what the previous version did, and it is actively misleading:
-//! most wireless drivers print `Wake-on: d` whether or not WoWLAN is armed, so an armed host got
-//! warned that it wasn't — with a fix command (`ethtool -s wlan0 wol g`) that its driver rejects.
+//! Wired and wireless arm through different interfaces: `ethtool <iface>`
+//! reports the wired `Wake-on: g` bit; a Wi-Fi NIC's trigger lives in nl80211
+//! (`iw phy <phy> wowlan show`). Most wireless drivers print `Wake-on: d`
+//! whether or not WoWLAN is armed, so ethtool on Wi-Fi is actively misleading.
 
 use std::net::IpAddr;
 
-/// Upper bound on advertised MACs — keeps the mDNS TXT record small. A host has at most a couple
-/// of wake-capable NICs; the routed one is always first.
+/// Cap advertised MACs so the mDNS TXT record stays small. The routed NIC is always first.
 const MAX_MACS: usize = 4;
 
-/// MAC(s) of the host's wake-capable NIC(s), lowercase `aa:bb:cc:dd:ee:ff`, with the NIC that
-/// bears `primary_ip` (the address clients reach us on) FIRST, then other non-loopback NICs as
-/// fallbacks. Best-effort — an empty list just means clients can't auto-wake (they fall back to
-/// manual MAC entry). Deduped; all-zero MACs skipped; capped at [`MAX_MACS`].
+/// Wake-capable NIC MACs, lowercase `aa:bb:cc:dd:ee:ff`. The NIC that bears `primary_ip` is first.
+/// Empty means clients cannot auto-wake. All-zero MACs skipped; capped at [`MAX_MACS`].
 pub fn wake_macs(primary_ip: IpAddr) -> Vec<String> {
     let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
 
-    // Interface names in priority order: the one holding `primary_ip` first, then every other
-    // non-loopback interface that has an IP, de-duplicated by name (an iface has one MAC but may
-    // appear once per address).
+    // One MAC per iface, but `get_if_addrs` yields one row per address — de-dupe by name.
     let mut names: Vec<String> = Vec::new();
     if let Some(primary) = ifaces.iter().find(|i| i.ip() == primary_ip) {
         names.push(primary.name.clone());
@@ -69,9 +59,8 @@ pub fn wake_macs(primary_ip: IpAddr) -> Vec<String> {
     out
 }
 
-/// Log whether the host NIC bearing `primary_ip` is armed to wake on a magic packet. Detect &
-/// warn only — never modifies settings. Linux-only (shells out to `iw`/`ethtool`); a no-op
-/// elsewhere and silent when it can't tell (tool missing, insufficient privilege).
+/// Warn if the NIC bearing `primary_ip` is not armed for a magic packet. Never changes settings.
+/// Linux-only (`iw`/`ethtool`); silent when it cannot tell.
 #[cfg(target_os = "linux")]
 pub fn warn_if_not_armed(primary_ip: IpAddr) {
     let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
@@ -83,7 +72,7 @@ pub fn warn_if_not_armed(primary_ip: IpAddr) {
         return;
     };
 
-    // A NIC with an nl80211 phy is wireless: ask nl80211 about WoWLAN, not ethtool about WoL.
+    // nl80211 phy ⇒ wireless: ask WoWLAN, not ethtool.
     if let Some(phy) = wireless_phy(&iface) {
         match wowlan_has_magic(phy.as_deref(), &iface) {
             Some(true) => tracing::info!(
@@ -93,8 +82,7 @@ pub fn warn_if_not_armed(primary_ip: IpAddr) {
             ),
             Some(false) => {
                 let phy = phy.as_deref().unwrap_or("phy0");
-                // A device the kernel won't arm can't wake on anything, so name that separately
-                // — enabling a WoWLAN trigger alone would not fix it.
+                // Kernel wakeup off blocks any network wake; enabling WoWLAN alone would not fix it.
                 let extra = if device_wakeup_enabled(&iface) == Some(false) {
                     " The kernel also has wake-up switched off for this device \
                      (/sys/class/net/<iface>/device/power/wakeup reads `disabled`), which blocks \
@@ -112,7 +100,7 @@ pub fn warn_if_not_armed(primary_ip: IpAddr) {
                      be allowed to wake the machine in BIOS/UEFI.{extra}",
                 )
             }
-            None => {} // couldn't determine — stay quiet rather than cry wolf
+            None => {} // unknown: stay quiet
         }
         return;
     }
@@ -127,17 +115,15 @@ pub fn warn_if_not_armed(primary_ip: IpAddr) {
              Enable it with: sudo ethtool -s {iface} wol g  (and turn on 'Wake on LAN'/'Wake on \
              PCIe' in BIOS).",
         ),
-        None => {} // couldn't determine — stay quiet rather than cry wolf
+        None => {} // unknown: stay quiet
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn warn_if_not_armed(_primary_ip: IpAddr) {}
 
-/// Is `iface` a Wi-Fi NIC, and if so which nl80211 phy backs it? `Some(Some("phy0"))` = wireless
-/// and we know the phy (so we can query and name it); `Some(None)` = wireless but the phy name
-/// couldn't be read; `None` = wired (or sysfs is unavailable, which reads the same way — the
-/// ethtool path then applies, exactly as before).
+/// Nested option: `Some(Some("phy0"))` = wireless with a phy name; `Some(None)` = wireless,
+/// phy unread; `None` = wired (or sysfs missing — the ethtool path then applies).
 #[cfg(target_os = "linux")]
 fn wireless_phy(iface: &str) -> Option<Option<String>> {
     let dir = format!("/sys/class/net/{iface}/phy80211");
@@ -151,19 +137,14 @@ fn wireless_phy(iface: &str) -> Option<Option<String>> {
     Some(name)
 }
 
-/// Whether a Wi-Fi NIC is armed for a magic-packet wake. `iw` is authoritative — it reads the
-/// live nl80211 WoWLAN state, which is where the trigger actually lives.
+/// Whether a Wi-Fi NIC is armed for a magic-packet wake. `iw` reads the live nl80211 state.
 ///
-/// Two fallbacks for when `iw` can't answer (binary missing, driver without the WoWLAN command,
-/// no phy name, or a kernel that wants privilege we don't have — the host runs as a plain user
-/// service, so that last one is not hypothetical):
-///  * a *positive* ethtool reading counts, a negative one never does — a handful of drivers
-///    (brcmfmac and friends, i.e. most Raspberry Pi / SoC Wi-Fi) really do expose the
-///    magic-packet bit through ethtool, while the far more common `Wake-on: d` from a wireless
-///    driver means nothing at all;
-///  * failing that, sysfs `device/power/wakeup` — world-readable, and a `disabled` there is
-///    conclusive in the negative direction: the kernel will not arm this device to wake the
-///    machine, so whatever WoWLAN triggers the firmware holds can never fire.
+/// Fallbacks when `iw` cannot answer (missing binary, no WoWLAN command, no phy, no privilege —
+/// the host runs as a user service):
+///  * a *positive* ethtool reading counts; a negative one never does — some drivers expose the
+///    bit, but `Wake-on: d` from a wireless driver means nothing;
+///  * then sysfs `device/power/wakeup`: `disabled` is conclusive in the negative — the kernel
+///    will not arm this device, so firmware WoWLAN triggers can never fire.
 #[cfg(target_os = "linux")]
 fn wowlan_has_magic(phy: Option<&str>, iface: &str) -> Option<bool> {
     if let Some(v) = phy.and_then(iw_wowlan_has_magic) {
@@ -172,17 +153,15 @@ fn wowlan_has_magic(phy: Option<&str>, iface: &str) -> Option<bool> {
     if let Some(true) = ethtool_wol_has_magic(iface) {
         return Some(true);
     }
-    // Only the negative is meaningful: `enabled` says the device may wake the machine, not that a
-    // magic packet is one of the things that will do it.
+    // Only the negative is meaningful: `enabled` does not mean a magic packet is a wake source.
     match device_wakeup_enabled(iface) {
         Some(false) => Some(false),
         _ => None,
     }
 }
 
-/// sysfs `/sys/class/net/<iface>/device/power/wakeup` — `enabled`/`disabled`, i.e. whether the
-/// kernel will arm this device to wake the system at all. `None` when the attribute isn't there
-/// (platform/SDIO devices often have none) or can't be read.
+/// `/sys/class/net/<iface>/device/power/wakeup`: whether the kernel will arm this device at all.
+/// `None` if the attribute is missing (platform/SDIO often have none) or unreadable.
 #[cfg(target_os = "linux")]
 fn device_wakeup_enabled(iface: &str) -> Option<bool> {
     let text =
@@ -194,8 +173,7 @@ fn device_wakeup_enabled(iface: &str) -> Option<bool> {
     }
 }
 
-/// Ask nl80211 (via `iw phy <phy> wowlan show`) whether the magic-packet trigger is enabled.
-/// `None` if `iw` is missing or the driver doesn't implement WoWLAN.
+/// `iw phy <phy> wowlan show`: is the magic-packet trigger on? `None` if `iw` is missing or the driver has no WoWLAN.
 #[cfg(target_os = "linux")]
 fn iw_wowlan_has_magic(phy: &str) -> Option<bool> {
     let out = std::process::Command::new("iw")
@@ -208,8 +186,7 @@ fn iw_wowlan_has_magic(phy: &str) -> Option<bool> {
     parse_iw_wowlan(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Parse `ethtool <iface>` for the *current* Wake-on setting and report whether it includes `g`
-/// (wake on MagicPacket). Returns `None` if ethtool is missing/failed or the field is absent.
+/// `ethtool <iface>`: does the current Wake-on setting include `g`? `None` if the tool or field is missing.
 #[cfg(target_os = "linux")]
 fn ethtool_wol_has_magic(iface: &str) -> Option<bool> {
     let out = std::process::Command::new("ethtool")
@@ -222,14 +199,11 @@ fn ethtool_wol_has_magic(iface: &str) -> Option<bool> {
     parse_ethtool_wol(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// `ethtool <iface>` output → does the *current* Wake-on setting include `g` (MagicPacket)?
-/// `None` when the field is absent. Split out from the command so it can be unit-tested on any
-/// platform.
+/// Does the current Wake-on setting include `g` (MagicPacket)? `None` if the field is absent.
 fn parse_ethtool_wol(text: &str) -> Option<bool> {
     for line in text.lines() {
         let t = line.trim();
-        // The current setting is "Wake-on: <flags>"; skip the "Supports Wake-on: ..." capability
-        // line. `g` = MagicPacket, `d` = disabled.
+        // Current setting is "Wake-on: <flags>"; skip "Supports Wake-on: ...". `g` = MagicPacket.
         if let Some(flags) = t.strip_prefix("Wake-on:") {
             return Some(flags.trim().contains('g'));
         }
@@ -237,21 +211,11 @@ fn parse_ethtool_wol(text: &str) -> Option<bool> {
     None
 }
 
-/// `iw phy <phy> wowlan show` output → is the magic-packet trigger enabled? The two shapes are
+/// `iw phy <phy> wowlan show` → is the magic-packet trigger on?
 ///
-/// ```text
-/// WoWLAN is disabled
-/// ```
-/// ```text
-/// WoWLAN is enabled:
-///  * wake up on magic packet
-///  * wake up on pattern match, up to 20 patterns of 16 - 128 bytes
-/// ```
-///
-/// `* wake up on anything` (the nl80211 `any` trigger) counts too — that NIC wakes on every frame
-/// it receives, magic packets included. Enabled with only other triggers reads as NOT armed,
-/// which is the honest answer: a magic packet won't wake it. `None` when the output says nothing
-/// about WoWLAN at all. Split out from the command so it can be unit-tested on any platform.
+/// `WoWLAN is disabled` / `WoWLAN is enabled:` plus `* wake up on magic packet`.
+/// `* wake up on anything` counts too (every frame, magic included). Enabled with
+/// only other triggers is not armed. `None` when the output says nothing about WoWLAN.
 fn parse_iw_wowlan(text: &str) -> Option<bool> {
     let mut seen = false;
     let mut magic = false;

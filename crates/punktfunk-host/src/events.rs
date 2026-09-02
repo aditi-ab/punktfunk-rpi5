@@ -1,24 +1,15 @@
-//! Host lifecycle event bus (scripting-and-hooks RFC §4, phase 0).
+//! Host lifecycle event bus: process-wide broadcast plus a bounded catch-up ring.
 //!
-//! A process-wide broadcast bus + bounded catch-up ring for **lifecycle events**: client
-//! connect/disconnect, session and stream start/end, pairing decisions, virtual-display
-//! create/release, library mutations, host start/stop. Fire sites on BOTH planes call
-//! [`emit`]; consumers ([`EventBus::subscribe`]) get a ring-backed catch-up plus a live
-//! tail — the shape `GET /api/v1/events` (SSE, phase 1) and the hook runner (phase 2)
-//! consume. Until those land, the bus is host-internal.
+//! Fire sites on both planes call [`emit`]. [`EventBus::subscribe`] returns ring catch-up
+//! plus a live tail — the shape `GET /api/v1/events` (SSE) and the hook runner consume.
+//! Same ring shape as [`crate::log_capture`].
 //!
-//! Design notes (mirrors [`crate::log_capture`], the shipped ring precedent):
-//! - Events carry a monotonically increasing `seq` (1-based) and a wall-clock `ts_ms`.
-//!   A consumer resumes with `since = last seen seq`; one that fell off the ring gets
-//!   `dropped = true` and should resync via the REST snapshots.
-//! - The wire shape is **versioned and additive-only** within a major ([`SCHEMA_VERSION`]):
-//!   fields and kinds may be added, never removed or renamed. The JSON snapshot tests below
-//!   are the review gate — a failing snapshot IS a schema change.
-//! - **Payload hygiene: events never carry secrets** — no PINs, no tokens, no key material.
-//!   Client names and fingerprints are fine (already exposed via the management API).
-//! - Emission is fire-and-forget and cheap (a mutex push + a non-blocking broadcast send);
-//!   nothing here sits in a streaming hot path. Slow consumers lag (`RecvError::Lagged`)
-//!   rather than buffering unboundedly; the SSE layer disconnects them.
+//! Resume with `since = last seen seq` (1-based). A consumer that fell off the ring gets
+//! `dropped = true` and resyncs via REST snapshots. Wire shape is additive-only within
+//! [`SCHEMA_VERSION`]; the JSON snapshot tests below are the review gate.
+//!
+//! Emission is fire-and-forget (mutex push + non-blocking broadcast). Slow consumers lag
+//! (`RecvError::Lagged`) rather than buffering unboundedly.
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -27,43 +18,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
-/// Wire-shape major version, carried on every event. Additive-only within a major; removing
-/// or renaming a field is a new major (and, at the API layer, a new endpoint negotiation).
+/// Additive-only within a major. Removing or renaming a field is a new major.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Catch-up ring capacity. Events are small (a few hundred bytes) and low-rate (lifecycle,
-/// not per-frame), so 1024 spans hours of ordinary host activity.
+/// Events are small and low-rate (lifecycle, not per-frame); 1024 spans hours of ordinary host activity.
 const RING_CAPACITY: usize = 1024;
-/// Live-tail channel depth per subscriber before a slow consumer starts lagging.
+/// Per-subscriber live-tail depth before a slow consumer starts lagging.
 const BROADCAST_CAPACITY: usize = 256;
 
-/// One host lifecycle event, as it will appear on the wire (`data:` of one SSE frame).
+/// One lifecycle event as it appears on the wire (`data:` of one SSE frame).
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct HostEvent {
-    /// Monotonic sequence number (1-based) — a consumer resumes with `since = last seen`.
+    /// 1-based; a consumer resumes with `since = last seen`.
     pub seq: u64,
-    /// Unix timestamp in milliseconds (the [`crate::log_capture::LogEntry`] convention).
+    /// Unix milliseconds — the [`crate::log_capture::LogEntry`] convention.
     pub ts_ms: u64,
-    /// Wire-shape version ([`SCHEMA_VERSION`]).
     pub schema: u32,
-    /// The event kind + payload, flattened: `"kind": "stream.started", …payload…`.
+    /// Flattened as `"kind": "stream.started"` plus payload fields.
     #[serde(flatten)]
     pub kind: EventKind,
 }
 
-/// Which protocol plane an event originated from. Hooks and scripts filter on it — a hook
-/// that fires for native clients but not Moonlight clients is a bug, not a v2 feature.
+/// Origin plane. Both planes must emit; filtering is the consumer's job.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Plane {
-    /// The native punktfunk/1 plane (QUIC).
     Native,
-    /// The GameStream/Moonlight compat plane (`--gamestream`).
     Gamestream,
 }
 
-/// Why a client went away. `Quit` is a deliberate user "stop" (the typed close code);
-/// `Timeout` is a transport idle timeout (the client vanished); `Error` is everything else.
+/// `Quit` is the typed close; `Timeout` is transport idle; `Error` is everything else.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DisconnectReason {
@@ -72,83 +56,71 @@ pub enum DisconnectReason {
     Error,
 }
 
-/// The connecting/disconnecting client's identity.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct ClientRef {
-    /// Client-supplied device name; may be empty (an anonymous or compat-plane client).
+    /// Client-supplied; empty for anonymous or compat-plane clients.
     pub name: String,
-    /// Hex SHA-256 certificate fingerprint, when the client presented one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
     pub plane: Plane,
 }
 
-/// A live A/V session (the plane-neutral notion the Dashboard shows).
+/// Plane-neutral A/V session (distinct from a video [`StreamRef`]).
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct SessionRef {
-    /// Host-local session id (unique within this host process).
     pub id: u64,
-    /// Short client label (cert-fingerprint prefix, or peer IP for an anonymous client).
+    /// Cert-fingerprint prefix, or peer IP for an anonymous client — not [`ClientRef::name`].
     pub client: String,
-    /// Negotiated mode, `WxH@Hz` (e.g. `"3840x2160@120"`).
+    /// `WxH@Hz`, e.g. `"3840x2160@120"`.
     pub mode: String,
     pub hdr: bool,
 }
 
-/// A live video stream (what the stream marker file reflects).
+/// Live video stream (what the stream marker file reflects).
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct StreamRef {
-    /// Negotiated mode, `WxH@Hz`.
+    /// `WxH@Hz`.
     pub mode: String,
     pub hdr: bool,
-    /// Client-supplied device name; may be empty.
     pub client: String,
-    /// The launched app/title for this stream, when one was requested (store-qualified id on
-    /// the native plane, app title on the GameStream plane).
+    /// Store-qualified id on the native plane, app title on GameStream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
     pub plane: Plane,
 }
 
-/// A launched game, as the `game.*` events see it.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct GameRefPayload {
-    /// Store-qualified library id (`steam:570`). Absent for an operator-typed GameStream
-    /// `apps.json` command, which has no library entry behind it.
+    /// Store-qualified id (`steam:570`). Absent for an operator-typed GameStream `apps.json` command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
-    /// Display title.
     pub title: String,
-    /// Which store surfaced it (`steam`, `heroic`, `custom`, …), when known.
+    /// `steam`, `heroic`, `custom`, … when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
-    /// Client-supplied device name of the session that launched it; may be empty.
     pub client: String,
     pub plane: Plane,
 }
 
-/// Why a launched game is no longer running.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GameEndReason {
-    /// The player quit it (or it crashed) — the host did not ask.
+    /// The player quit or it crashed — the host did not ask.
     Exited,
     /// The host ended it, per the session⇄game lifetime policy.
     Terminated,
 }
 
-/// A device in the pairing flow.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct DeviceRef {
-    /// Sanitized device name (the pairing store's copy).
+    /// Pairing-store copy, already sanitized.
     pub name: String,
-    /// Hex certificate fingerprint.
     pub fingerprint: String,
     pub plane: Plane,
 }
 
-/// The event catalog (RFC §4). Serialized internally tagged as `"kind": "<domain>.<verb>"`,
-/// flattened into [`HostEvent`]. **Additive-only** within [`SCHEMA_VERSION`].
+/// Internally tagged `"kind": "<domain>.<verb>"`, flattened into [`HostEvent`].
+/// Additive-only within [`SCHEMA_VERSION`].
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 #[serde(tag = "kind")]
 pub enum EventKind {
@@ -167,12 +139,9 @@ pub enum EventKind {
     StreamStarted { stream: StreamRef },
     #[serde(rename = "stream.stopped")]
     StreamStopped { stream: StreamRef },
-    /// A launched game was confirmed running — fires once per launch, after the host has actually
-    /// seen the game's process (not merely spawned its launcher).
+    /// Fires once the host has seen the game process, not merely spawned its launcher.
     #[serde(rename = "game.running")]
     GameRunning { game: GameRefPayload },
-    /// A launched game is gone. `reason` distinguishes the player quitting from the host ending it
-    /// per the lifetime policy.
     #[serde(rename = "game.exited")]
     GameExited {
         game: GameRefPayload,
@@ -184,21 +153,18 @@ pub enum EventKind {
     PairingCompleted { device: DeviceRef },
     #[serde(rename = "pairing.denied")]
     PairingDenied { device: DeviceRef },
-    /// A device was granted access with an explicit operator choice — the approve dialog, the
-    /// arm window's carried choice, or any other `add_with_access(Some)` path
-    /// (design/per-client-access.md §6). A plain pairing with no choice emits only
-    /// `pairing.completed` (its access is the preserved/default record, nothing was *chosen*).
+    /// Explicit operator choice (`add_with_access(Some)`). A pairing with no choice
+    /// emits only `pairing.completed` — see `design/per-client-access.md`.
     #[serde(rename = "access.granted")]
     AccessGranted {
         device: DeviceRef,
-        /// The granted mask (the `GRANT_*` bit vocabulary), reserved bits already cleared.
+        /// `GRANT_*` bits; reserved bits already cleared.
         grants: u32,
-        /// Absolute expiry, host wall clock unix seconds; absent = permanent.
+        /// Host wall-clock unix seconds; absent = permanent.
         #[serde(skip_serializing_if = "Option::is_none")]
         expires_unix: Option<i64>,
     },
-    /// A paired device's access was edited after the fact (the console edit sheet / extend /
-    /// "expire now") — the owner's hook can say "the TV is view-only now".
+    /// Post-pairing edit (console sheet / extend / expire-now), not the original grant.
     #[serde(rename = "access.changed")]
     AccessChanged {
         device: DeviceRef,
@@ -206,14 +172,12 @@ pub enum EventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         expires_unix: Option<i64>,
     },
-    /// A device's temporary access reached its deadline and its live session was closed — "guest
-    /// access ended". Emitted at deadline fire by the expiring session (a device with no live
-    /// session expires silently; the console row flips to "Expired" either way).
+    /// Deadline fire on a live session. A device with no session expires silently.
     #[serde(rename = "access.expired")]
     AccessExpired { device: DeviceRef },
     #[serde(rename = "display.created")]
     DisplayCreated {
-        /// The virtual-display backend that minted it (`VirtualDisplay::name`).
+        /// `VirtualDisplay::name` of the backend that minted it.
         backend: String,
         /// `WxH@Hz`.
         mode: String,
@@ -225,58 +189,44 @@ pub enum EventKind {
     },
     #[serde(rename = "library.changed")]
     LibraryChanged {
-        /// What mutated the library: `"manual"` today; a provider id once the provider
-        /// API (RFC §8) lands.
+        /// `"manual"`, or a provider id.
         source: String,
     },
-    /// A verified update manifest announced a release newer than the running host. Emitted
-    /// once per discovered version (a steady-state "newer exists" doesn't re-fire on every
-    /// refresh).
+    /// Once per discovered version; a steady "newer exists" does not re-fire on every refresh.
     #[serde(rename = "update.available")]
     UpdateAvailable {
-        /// The newer release's version string.
         version: String,
-        /// The channel it was announced on (`stable` | `canary`).
+        /// `stable` or `canary`.
         channel: String,
-        /// This host's install kind (`apt`, `windows-installer`, …) — lets a hook or the
-        /// tray render the right "how to update" hint without a second call.
+        /// `apt`, `windows-installer`, … so a hook can hint how to update without a second call.
         install_kind: String,
     },
-    /// A host update completed: emitted by boot-time reconciliation, i.e. by the NEW binary's
-    /// first start after a successful apply.
+    /// Boot-time reconciliation by the NEW binary after a successful apply.
     #[serde(rename = "update.applied")]
     UpdateApplied { from: String, to: String },
     #[serde(rename = "plugins.changed")]
     PluginsChanged {
-        /// The plugin whose registration changed (registered, restarted, deregistered, or
-        /// lease-expired). A consumer re-reads `GET /api/v1/plugins` for the new set.
+        /// Plugin that registered, restarted, deregistered, or lease-expired. Re-read `GET /api/v1/plugins`.
         id: String,
     },
     #[serde(rename = "store.changed")]
-    /// The set of installed plugins, or what the store knows about them, changed — an install or
-    /// uninstall finished, or a catalog refresh brought in new rows. A consumer re-reads
-    /// `GET /api/v1/store/catalog` / `…/installed`. Deliberately payload-free: the store's answer
-    /// is a join over several sources of truth, so "go look again" is the only honest signal.
+    /// Payload-free: the store is a join. Re-read `GET /api/v1/store/catalog` / `…/installed`.
     StoreChanged,
-    /// A host action was invoked (`design/host-actions.md` §3.3) — v1: the `power.*` verbs.
-    /// Emitted on ACCEPT (`outcome: "accepted"`), and again if the executor later fails
-    /// (`outcome: "failed: …"`) — a succeeded power action ends this process, so "accepted with
-    /// no failure after it" is the success signal a hook can act on ("the host is going down").
+    /// Emitted on ACCEPT, and again if the executor later fails. A succeeded power
+    /// action ends this process, so "accepted with no later failure" is success.
     #[serde(rename = "action.invoked")]
     ActionInvoked {
-        /// The invoked action id (`power.sleep`, `power.reboot`, `power.shutdown`).
+        /// `power.sleep`, `power.reboot`, `power.shutdown`.
         id: String,
-        /// The invoking paired device, when the cert lane invoked it; absent for the
-        /// operator's console (admin lane).
+        /// Cert-lane invoker; absent for the operator console (admin lane).
         #[serde(skip_serializing_if = "Option::is_none")]
         device: Option<DeviceRef>,
-        /// `accepted`, or `failed: <the executor's error>`.
+        /// `accepted`, or `failed: <executor error>`.
         outcome: String,
     },
     #[serde(rename = "host.started")]
     HostStarted {
         version: String,
-        /// Whether the GameStream/Moonlight compat plane is enabled.
         gamestream: bool,
     },
     #[serde(rename = "host.stopping")]
@@ -284,7 +234,6 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// The wire kind string (`"stream.started"`, …) — for filters and log lines.
     pub fn name(&self) -> &'static str {
         match self {
             EventKind::ClientConnected { .. } => "client.connected",
@@ -316,9 +265,8 @@ impl EventKind {
 }
 
 impl EventKind {
-    /// The client/device name this event carries, if any — the `filter.client` axis of hooks
-    /// and scripts. (For `session.*` this is the short client *label* the Dashboard shows —
-    /// cert-fingerprint prefix or peer IP — since that is what the event carries.)
+    /// `filter.client` axis. For `session.*` this is the short label (fingerprint prefix or
+    /// peer IP), not [`ClientRef::name`].
     pub fn client_name(&self) -> Option<&str> {
         match self {
             EventKind::ClientConnected { client }
@@ -343,7 +291,6 @@ impl EventKind {
         }
     }
 
-    /// The certificate fingerprint this event carries, if any.
     pub fn fingerprint(&self) -> Option<&str> {
         match self {
             EventKind::ClientConnected { client }
@@ -361,7 +308,6 @@ impl EventKind {
         }
     }
 
-    /// The protocol plane this event carries, if any.
     pub fn plane(&self) -> Option<Plane> {
         match self {
             EventKind::ClientConnected { client }
@@ -382,14 +328,12 @@ impl EventKind {
         }
     }
 
-    /// The launched app id/title this event carries, if any.
     pub fn app(&self) -> Option<&str> {
         match self {
             EventKind::StreamStarted { stream } | EventKind::StreamStopped { stream } => {
                 stream.app.as_deref()
             }
-            // A `game.*` event without a library id came from an operator-typed command; its title
-            // is the only handle a hook filter has, so fall back to it rather than matching nothing.
+            // No library id: operator-typed command; title is the only hook-filter handle.
             EventKind::GameRunning { game } | EventKind::GameExited { game, .. } => {
                 game.app.as_deref().or(Some(&game.title))
             }
@@ -398,9 +342,8 @@ impl EventKind {
     }
 }
 
-/// Does `pattern` select `kind`? Exact kind names (`stream.started`) or `domain.*` prefixes
-/// matched on the dot boundary (`stream.*` matches `stream.started`, never `streamx.started`).
-/// One vocabulary for the SSE `?kinds=` filter and the hooks `on:` field.
+/// Exact kind (`stream.started`) or `domain.*` on the dot boundary (`stream.*` never
+/// matches `streamx.started`). Shared by SSE `?kinds=` and hooks `on:`.
 pub fn kind_matches(pattern: &str, kind: &str) -> bool {
     match pattern.strip_suffix(".*") {
         Some(prefix) => kind
@@ -410,25 +353,21 @@ pub fn kind_matches(pattern: &str, kind: &str) -> bool {
     }
 }
 
-/// Formats a mode as the wire's `WxH@Hz` string.
 pub fn mode_str(width: u32, height: u32, hz: u32) -> String {
     format!("{width}x{height}@{hz}")
 }
 
-/// One consumer's view: the ring-backed catch-up plus a live-tail receiver, taken atomically
-/// (no event can fall between `catch_up` and the first `rx.recv()`, and none is in both).
+/// Catch-up plus live tail, taken atomically: no event falls between `catch_up` and
+/// the first `rx.recv()`, and none is in both.
 pub struct Subscription {
-    /// Events with `seq > since`, oldest first.
+    /// `seq > since`, oldest first.
     pub catch_up: Vec<HostEvent>,
-    /// True when events between `since` and the first caught-up one were already evicted —
-    /// the consumer should resync via the REST snapshots (the `LogPage.dropped` contract).
+    /// Events between `since` and the first caught-up one were evicted; resync via REST.
     pub dropped: bool,
-    /// The live tail. A consumer that can't keep up sees `RecvError::Lagged`.
+    /// Live tail. A slow consumer sees `RecvError::Lagged`.
     pub rx: broadcast::Receiver<HostEvent>,
 }
 
-/// The process-wide event bus: a bounded seq-numbered ring (catch-up) + a broadcast channel
-/// (live tail).
 pub struct EventBus {
     inner: Mutex<Ring>,
     tx: broadcast::Sender<HostEvent>,
@@ -451,8 +390,7 @@ impl EventBus {
         }
     }
 
-    /// Stamp, ring-buffer, and broadcast one event. Fire-and-forget: no receivers is fine
-    /// (the ring still records it for a later subscriber's catch-up).
+    /// Fire-and-forget. No receivers is fine — the ring still records for later catch-up.
     pub fn emit(&self, kind: EventKind) {
         let ts_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -470,20 +408,19 @@ impl EventBus {
             ring.events.pop_front();
         }
         ring.events.push_back(ev.clone());
-        // Send while still holding the ring lock: it serializes with `subscribe` (which also
-        // takes the lock), so an event lands either in a subscriber's catch-up or on its live
-        // tail — never both, never neither. `send` is non-blocking, the hold is trivial.
+        // Hold the ring lock across `send` so it serializes with `subscribe`: an event
+        // lands in catch-up or on the live tail — never both, never neither. `send` is
+        // non-blocking, so the hold is trivial.
         let _ = self.tx.send(ev);
     }
 
-    /// A live-tail-only subscription (no catch-up, no cursor) — for host-internal consumers
-    /// like the hook runner that only care about events from now on.
+    /// Live tail only (no catch-up, no cursor) — for consumers that care from now on.
     pub fn subscribe_live(&self) -> broadcast::Receiver<HostEvent> {
         self.tx.subscribe()
     }
 
-    /// Subscribe with a resume cursor: events with `seq > since` come back as catch-up, the
-    /// returned receiver carries everything after. `since = 0` means "from the ring start".
+    /// Events with `seq > since` as catch-up; the receiver carries everything after.
+    /// `since = 0` means from the ring start.
     pub fn subscribe(&self, since: u64) -> Subscription {
         let ring = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let rx = self.tx.subscribe();
@@ -503,15 +440,14 @@ impl EventBus {
     }
 }
 
-/// The process-wide bus — a `OnceLock` singleton (the [`crate::log_capture::ring`] shape) so
-/// fire sites across both planes and the API layer share it without threading an `Arc`.
+/// Process-wide `OnceLock` (the [`crate::log_capture::ring`] shape) so fire sites
+/// share it without threading an `Arc`.
 pub fn bus() -> &'static EventBus {
     static BUS: OnceLock<EventBus> = OnceLock::new();
     BUS.get_or_init(EventBus::new)
 }
 
-/// Emit one lifecycle event on the process-wide bus. Cheap and non-blocking — safe from any
-/// thread, including RAII `Drop` paths.
+/// Non-blocking; safe from any thread, including RAII `Drop` paths.
 pub fn emit(kind: EventKind) {
     bus().emit(kind);
 }
@@ -540,7 +476,6 @@ mod tests {
         assert!(!sub.dropped);
         assert!(sub.catch_up.iter().all(|e| e.schema == SCHEMA_VERSION));
 
-        // Resume from a cursor mid-ring.
         let sub = bus.subscribe(3);
         assert_eq!(
             sub.catch_up.iter().map(|e| e.seq).collect::<Vec<_>>(),
@@ -560,7 +495,6 @@ mod tests {
         for i in 0..(RING_CAPACITY + 50) {
             bus.emit(ev(&format!("m{i}")));
         }
-        // Seqs 1..=50 were evicted; a cursor inside the gap must flag it.
         let sub = bus.subscribe(10);
         assert!(sub.dropped);
         assert_eq!(sub.catch_up.first().map(|e| e.seq), Some(51));
@@ -577,18 +511,14 @@ mod tests {
         bus.emit(ev("before-2"));
         let mut sub = bus.subscribe(0);
         assert_eq!(sub.catch_up.len(), 2);
-        // Emitted after subscribe → on the live tail only, starting at exactly seq 3.
         bus.emit(ev("after"));
         let live = sub.rx.recv().await.expect("live event");
         assert_eq!(live.seq, 3);
         assert_eq!(live.kind.name(), "library.changed");
-        // Nothing duplicated: the tail holds only what wasn't in the catch-up.
         assert!(sub.rx.try_recv().is_err());
     }
 
-    /// The wire shape IS the contract (additive-only, RFC §4): these snapshots are the review
-    /// gate — if one fails, the change renames/removes a field and needs a schema-version bump,
-    /// not a test update.
+    /// Additive-only wire contract: a failing snapshot is a schema-version bump, not a test update.
     #[test]
     fn wire_shape_snapshots() {
         let ev = HostEvent {
@@ -671,8 +601,7 @@ mod tests {
             r#"{"seq":5,"ts_ms":1700000000000,"schema":1,"kind":"game.running","game":{"app":"steam:570","title":"Dota 2","store":"steam","client":"Living Room TV","plane":"native"}}"#
         );
 
-        // A game the host ended itself, and one with no library entry behind it (an operator-typed
-        // GameStream command) — the optional ids are omitted, not nulled.
+        // Optional ids omitted, not nulled — host-ended game with no library entry.
         let ev = HostEvent {
             seq: 6,
             ts_ms: 1_700_000_000_000,
@@ -694,8 +623,6 @@ mod tests {
         );
     }
 
-    /// The `access.*` wire shapes (per-client access, design §6): additive-only like the rest of
-    /// the catalog, and reachable by the same hook/SSE filters (`access.*`).
     #[test]
     fn access_event_wire_shapes_and_filters() {
         let device = DeviceRef {
@@ -718,7 +645,7 @@ mod tests {
             r#"{"seq":8,"ts_ms":1700000000000,"schema":1,"kind":"access.granted","device":{"name":"Guest Deck","fingerprint":"ab12","plane":"native"},"grants":1,"expires_unix":1700000400}"#
         );
 
-        // A permanent grant omits the expiry (not nulled) — the optional-field convention.
+        // Permanent grant omits expiry (not nulled).
         let ev = HostEvent {
             seq: 9,
             ts_ms: 1_700_000_000_000,
@@ -743,8 +670,7 @@ mod tests {
         assert_eq!(expired.plane(), Some(Plane::Native));
     }
 
-    /// The `action.invoked` wire shape (host actions design §3.3): a cert-lane invoke carries the
-    /// device; the console's (admin) invoke omits the field entirely — the optional convention.
+    /// Cert-lane invoke carries the device; the admin/console invoke omits the field, not null.
     #[test]
     fn action_invoked_wire_shapes_and_filters() {
         let ev = HostEvent {
@@ -795,8 +721,6 @@ mod tests {
         assert_eq!(cert.kind.fingerprint(), Some("ab12"));
     }
 
-    /// The `game.*` events must be reachable by the same hook/SSE filters as every other kind — a
-    /// filterable event nobody can select is not a feature.
     #[test]
     fn game_events_are_filterable() {
         let running = EventKind::GameRunning {
@@ -816,8 +740,7 @@ mod tests {
         assert_eq!(running.plane(), Some(Plane::Native));
         assert_eq!(running.app(), Some("steam:570"));
 
-        // With no library id, the title is the filterable handle — otherwise an `apps.json` launch
-        // would be unmatchable by app.
+        // No library id: the title is the filterable handle (operator-typed `apps.json` launch).
         let exited = EventKind::GameExited {
             game: GameRefPayload {
                 app: None,

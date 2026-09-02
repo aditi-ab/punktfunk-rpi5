@@ -1,49 +1,38 @@
-//! Catalog **fetch + cache**: pulling a source's signed index over HTTPS and keeping the last good
-//! copy on disk (design `plugin-store.md` §4.1).
+//! Catalog fetch and disk cache for a source's signed index (`plugin-store.md`).
 //!
-//! Two properties matter more than freshness here:
+//! Fetch is HTTPS-only, size/timeout/redirect bounded, and never attaches credentials.
+//! A pinned-key document that does not verify is an error: keep the last good copy and
+//! report it; never fall back to unsigned. A host that cannot reach the network still
+//! browses and installs from cache, because the pin travelled with the entry.
 //!
-//! - **Fail closed on signatures, fail soft on the network.** A source with a pinned key whose
-//!   document doesn't verify is an *error* — we keep serving the last good copy and say so, and we
-//!   never fall back to "well, unsigned then". But a box that simply can't reach the internet
-//!   (LAN-only, common for a streaming host) keeps a working store: the cached shelf still browses,
-//!   and installs off it still pin and integrity-check, because the pin travelled with the entry.
-//! - **Bounded everything.** Size cap, timeout, redirect cap, https-only, no credentials ever
-//!   attached. A source URL is operator config, not request-time input, so there is no lever here
-//!   for a browser to aim the host at an arbitrary address.
+//! Pin: `ureq_returns_304_as_ok` (304 is `Ok`, not an error).
 
 use super::index::{Index, MAX_INDEX_BYTES};
 use super::sources::Source;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Wall-clock budget for one index (or signature) fetch.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// What a refresh attempt produced.
 pub(crate) enum Fetched {
-    /// A new, verified, parsed document.
     Fresh {
         index: Box<Index>,
         etag: Option<String>,
     },
-    /// The source says our cached copy is still current (HTTP 304).
+    /// HTTP 304: the cached copy is still current.
     NotModified,
-    /// Nothing usable arrived. The caller keeps whatever it had and marks the source stale.
+    /// Caller keeps the last good copy and marks the source stale.
     Failed(String),
 }
 
-/// Fetch, verify and parse a source's index.
-///
-/// Blocking (`ureq`) — callers run this on a blocking thread, never on the async runtime.
+/// Blocking (`ureq`). Callers run this on a blocking thread, never on the async runtime.
 pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
     if !source.url.starts_with("https://") {
         return Fetched::Failed("source url must be https".into());
     }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(FETCH_TIMEOUT))
-        // A signed document doesn't need many hops to reach us; a redirect chain is a good way to
-        // waste a host's time.
+        // Three hops is enough for a signed document; more is a stall.
         .max_redirects(3)
         .user_agent(format!("punktfunk-host/{}", super::index::host_version()))
         .build()
@@ -54,11 +43,8 @@ pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
         req = req.header("If-None-Match", tag);
     }
     let mut resp = match req.call() {
-        // `ureq` only turns status >= 400 into `Err(Status)`, so a conditional request's 304
-        // arrives here as **Ok with an empty body** — not as an error. Reading it as an error arm
-        // (the intuitive reading) means every refresh after the first one verifies a signature
-        // over zero bytes and "fails"; the catalog then sits permanently stale, serving cache and
-        // never picking up a new entry. Found on-glass; pinned by `ureq_returns_304_as_ok`.
+        // ureq reports only status >= 400 as Err. A 304 is Ok with an empty body; treating it as
+        // an error verifies a signature over zero bytes. Pin: `ureq_returns_304_as_ok`.
         Ok(r) if r.status() == 304 => return Fetched::NotModified,
         Ok(r) => r,
         Err(ureq::Error::StatusCode(code)) => {
@@ -76,7 +62,7 @@ pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
         Err(e) => return Fetched::Failed(e),
     };
 
-    // Signature FIRST — nothing below may look at a field before this passes (design §6.3).
+    // Verify before parse. Nothing below may look at a field until this passes.
     let keys = source.keys();
     if !keys.is_empty() {
         let sig = match agent.get(&source.sig_url()).call() {
@@ -108,12 +94,9 @@ pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
     }
 }
 
-/// Read a response body, refusing anything past the cap without buffering it.
 fn read_capped(resp: &mut ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, String> {
-    // Limit is cap+1 so a body of exactly cap+1 comes back intact and is rejected by the length
-    // check below with our own message; anything larger trips ureq's own limit error. Either way it
-    // is an Err — unlike ureq 2's `take()`, which truncated silently and then failed the signature
-    // check with a message that pointed at the wrong thing.
+    // cap+1 so an oversize-by-one body returns intact and is rejected below with our message;
+    // anything larger trips ureq's own limit. Either way this is Err, not a truncated body.
     let buf = resp
         .body_mut()
         .with_config()
@@ -126,10 +109,7 @@ fn read_capped(resp: &mut ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, S
     Ok(buf)
 }
 
-// ---------------------------------------------------------------- disk cache
-
-/// `<config_dir>/store-cache` — the last good copy of every source's index, so a host that boots
-/// without a network still has a browsable store.
+/// `<config_dir>/store-cache`. Last good copy of each source, so a host can boot without a network.
 pub(crate) fn cache_dir() -> PathBuf {
     pf_paths::config_dir().join("store-cache")
 }
@@ -151,11 +131,8 @@ pub(crate) struct CacheMeta {
     pub fetched_at: u64,
 }
 
-/// The cached index for a source, if one is on disk and still parses. Re-validated on read: a
-/// cache file is just as untrusted as the wire (it lives in a directory an admin can write).
-///
-/// NOTE the signature is **not** re-checked here — it was checked when the bytes were accepted,
-/// and the cache directory is inside the host's own private config tree.
+/// Signature is not re-checked: it was checked when the bytes were accepted, and the cache
+/// lives in the host's private config tree.
 pub(crate) fn read_cache(dir: &Path, source: &str) -> Option<(Index, CacheMeta)> {
     let body = std::fs::read(body_path(dir, source)).ok()?;
     let index = Index::parse(&body).ok()?;
@@ -166,7 +143,6 @@ pub(crate) fn read_cache(dir: &Path, source: &str) -> Option<(Index, CacheMeta)>
     Some((index, meta))
 }
 
-/// Persist a freshly verified index as the new last-good copy.
 pub(crate) fn write_cache(dir: &Path, source: &str, index: &Index, meta: &CacheMeta) {
     if let Err(e) = pf_paths::create_private_dir(dir) {
         tracing::warn!("could not create the store cache dir: {e}");
@@ -187,7 +163,7 @@ pub(crate) fn write_cache(dir: &Path, source: &str, index: &Index, meta: &CacheM
     }
 }
 
-/// Drop a removed source's cache files so a later re-add can't be served a stale shelf.
+/// Drop a removed source's files so a later re-add is not served a stale shelf.
 pub(crate) fn drop_cache(dir: &Path, source: &str) {
     let _ = std::fs::remove_file(body_path(dir, source));
     let _ = std::fs::remove_file(meta_path(dir, source));
@@ -240,7 +216,6 @@ mod tests {
 
     #[test]
     fn cache_is_revalidated_on_read() {
-        // A tampered cache file (schema bumped by hand) must not be served.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("x.json"), br#"{"schema":99,"plugins":[]}"#).unwrap();
         assert!(read_cache(dir.path(), "x").is_none());
@@ -256,14 +231,8 @@ mod tests {
         assert!(!meta_path(dir.path(), "s").exists());
     }
 
-    /// Pins the HTTP-client assumption that [`fetch`]'s conditional-request handling rests on.
-    ///
-    /// `ureq` converts only status >= 400 into `Err(Status)`. A 304 — which is exactly what a
-    /// successful `If-None-Match` produces, i.e. the *steady state* of a healthy catalog — comes
-    /// back as `Ok` with an empty body. Treating it as an error arm compiles, looks right, and
-    /// silently breaks every refresh after the first: the empty body fails the signature check and
-    /// the source sits stale forever. If a `ureq` upgrade ever changes this, fail here rather than
-    /// on someone's host.
+    /// ureq reports only status >= 400 as Err. A 304 (If-None-Match hit) is Ok with an empty body.
+    /// If an upgrade changes that, fail here so [`fetch`] can be updated.
     #[test]
     fn ureq_returns_304_as_ok() {
         use std::io::{Read as _, Write as _};
@@ -271,11 +240,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             if let Ok((mut sock, _)) = listener.accept() {
-                // Drain the request BEFORE answering. Closing a socket that still has unread
-                // received data makes Windows send an RST rather than a FIN, which destroys the
-                // response we just wrote — the client then sees a transport error (os error 10053)
-                // instead of the 304 this test exists to pin. A GET has no body, so the header
-                // terminator is the whole request.
+                // Drain the request before answering. On Windows, closing with unread data sends
+                // RST instead of FIN and the client never sees the 304. A GET has no body, so the
+                // header terminator is the whole request.
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 1024];
                 while let Ok(n) = sock.read(&mut chunk) {

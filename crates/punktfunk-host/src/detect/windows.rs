@@ -1,6 +1,6 @@
-//! Windows conflicting-host facts: a Toolhelp process snapshot for what's running, the SCM for
-//! registered services, and `%ProgramFiles%` for on-disk installs. All best-effort — any failing
-//! query (no privilege, API error) yields no evidence rather than aborting startup.
+//! Windows facts for conflicting-host detection: Toolhelp for running processes,
+//! the SCM for registered services, `%ProgramFiles%` for on-disk installs.
+//! Best-effort — privilege or API failure yields no evidence, never aborts startup.
 
 use super::{Evidence, Known};
 use windows::Win32::Foundation::CloseHandle;
@@ -10,18 +10,17 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows_service::service::{ServiceAccess, ServiceStartType};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-/// Lowercased executable basenames (without `.exe`) of every running process, via a Toolhelp
-/// snapshot. `szExeFile` is the module base name (e.g. `sunshine.exe`), not a full path.
+/// Lowercased executable basenames (no `.exe`) from a Toolhelp snapshot.
+/// `szExeFile` is the module base name, not a full path.
 pub fn running_processes() -> Vec<String> {
     let mut out = Vec::new();
-    // SAFETY: standard Toolhelp snapshot walk. The snapshot handle is closed on every exit path;
-    // `entry` is fully initialized (dwSize set) before Process32FirstW reads it.
+    // SAFETY: the snapshot handle is closed on every exit path; `entry` is fully
+    // initialized (`dwSize` set) before Process32FirstW reads it.
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return out;
         };
-        // Zeroed then dwSize set — the canonical Toolhelp init (no reliance on a Default impl for
-        // the 260-wide szExeFile array).
+        // Zeroed then `dwSize` set. Toolhelp reads `szExeFile` from this; there is no useful Default.
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..std::mem::zeroed()
@@ -45,7 +44,6 @@ pub fn running_processes() -> Vec<String> {
     out
 }
 
-/// SCM service registration + `%ProgramFiles%` install dirs — the "installed" evidence.
 pub fn static_evidence(known: &Known) -> Vec<Evidence> {
     let mut ev = Vec::new();
     for svc in known.win_services {
@@ -64,15 +62,11 @@ pub fn static_evidence(known: &Known) -> Vec<Evidence> {
     ev
 }
 
-/// `Some(autostart)` if a service by this name is registered with the SCM (running or stopped),
-/// `None` if it does not exist. Opening it fails cleanly when it doesn't exist.
+/// `Some(autostart)` if the SCM has this service, `None` if it does not.
 ///
-/// `autostart` mirrors the installer's `StreamHostEnabled` (start type <= 2): only boot/system/auto
-/// come up on their own, and only a host that comes up can take the GameStream ports. A disabled or
-/// manual service is dormant — see the module docs on `super`. When the start type cannot be read
-/// (no `QUERY_CONFIG` right) we report the service as dormant rather than guessing it autostarts:
-/// the false-alarm this whole split exists to kill is worse than a missed warning, and a host that
-/// is genuinely up is caught by the process scan regardless of what its service config says.
+/// `autostart` is boot/system/auto only — those come up alone and can take the
+/// GameStream ports. Missing `QUERY_CONFIG` reports dormant, not autostart:
+/// a false alarm is worse than a miss, and a live host still hits the process scan.
 fn service_start_type(name: &str) -> Option<bool> {
     let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
     let svc = mgr
@@ -80,8 +74,7 @@ fn service_start_type(name: &str) -> Option<bool> {
             name,
             ServiceAccess::QUERY_CONFIG | ServiceAccess::QUERY_STATUS,
         )
-        // Fall back to a status-only handle so a service we may not configure still registers as
-        // present (dormant) instead of vanishing from the report entirely.
+        // Status-only if `QUERY_CONFIG` is denied: still present (dormant), not absent.
         .or_else(|_| mgr.open_service(name, ServiceAccess::QUERY_STATUS))
         .ok()?;
     let autostart = svc.query_config().is_ok_and(|c| {
@@ -95,7 +88,7 @@ fn service_start_type(name: &str) -> Option<bool> {
     Some(autostart)
 }
 
-/// The install directory under any of the Program Files roots, if it exists.
+/// Under `ProgramFiles`, `ProgramW6432`, or `ProgramFiles(x86)` — WOW64 vs 32-bit hosts differ.
 fn program_files_dir(dir: &str) -> Option<String> {
     for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
         if let Some(base) = std::env::var_os(var) {
