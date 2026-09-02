@@ -390,5 +390,12 @@ fn recommended_installs_the_defaults_and_done_shows_the_password_and_next_steps(
     wiz.wait_for_done();
     assert!(wiz.has_text("--gamestream=off"), "the defaults ran");
     assert!(wiz.has_text("Your web console password"));
+    // Masked until Show; Copy is there either way and reports back.
+    assert!(wiz.has_text(punktfunk_setup_win::wizard::PASSWORD_MASK));
+    wiz.click("Show");
+    assert!(!wiz.has_text(punktfunk_setup_win::wizard::PASSWORD_MASK));
+    assert!(wiz.has_text("Hide"));
+    wiz.click("Copy");
+    assert!(wiz.has_text("Copied"));
     assert!(wiz.has_text("Open the web console") && wiz.has_text("Install a client"));
 }
