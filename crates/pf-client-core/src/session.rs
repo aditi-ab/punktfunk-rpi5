@@ -559,13 +559,15 @@ fn parse_audio_format(raw: &str) -> AudioRequest {
     }
 }
 
-fn pump(
-    params: SessionParams,
-    ev_tx: async_channel::Sender<SessionEvent>,
-    frame_tx: async_channel::Sender<DecodedFrame>,
-    stop: Arc<AtomicBool>,
-    mic: MicControl,
-) {
+struct ConnectPlan {
+    preferred: u8,
+    pad_speaker_on: bool,
+    pad_audio_on: bool,
+    advertised_codecs: u8,
+    bitrate_kbps: u32,
+}
+
+fn connect_plan(params: &SessionParams) -> ConnectPlan {
     // `PUNKTFUNK_PREFER_PYROWAVE=1`: the host only ever picks PyroWave when the
     // client names it as `preferred_codec`.
     #[allow(unused_mut)]
@@ -617,6 +619,154 @@ fn pump(
             "retrying with reduced decode caps"
         );
     }
+    ConnectPlan {
+        preferred,
+        pad_speaker_on,
+        pad_audio_on,
+        advertised_codecs,
+        bitrate_kbps,
+    }
+}
+
+fn open_decoder(
+    decoder: &str,
+    vulkan: Option<&crate::video::VulkanDecodeDevice>,
+    connector: &NativeClient,
+) -> anyhow::Result<Decoder> {
+    // Decoder for the host-resolved codec and picture shape (never assume HEVC).
+    // Native rungs probe the device at construction, so a 4:4:4 or Main 10 this GPU
+    // cannot decode refuses before the rung is chosen instead of error-streaking.
+    let stream_format = crate::video::StreamFormat {
+        chroma_format_idc: connector.chroma_format,
+        bit_depth: connector.bit_depth,
+    };
+    tracing::info!(
+        codec = crate::video::wire_codec_name(connector.codec),
+        welcome_codec = connector.codec,
+        "negotiated video codec"
+    );
+    // A negotiated PyroWave session decodes on the presenter's device — reachable
+    // only through the explicit preference above, so failing here is failing an
+    // opted-in experiment.
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
+    let built = if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
+        let mode = connector.mode();
+        // Wavelet bitstream has no VUI: Welcome colour signalling is the session's
+        // colour contract, and the resolved chroma sizes the plane ring.
+        let color = crate::video::ColorDesc {
+            primaries: connector.color.primaries,
+            transfer: connector.color.transfer,
+            matrix: connector.color.matrix,
+            full_range: connector.color.full_range != 0,
+        };
+        match vulkan {
+            Some(vk) => Decoder::new_pyrowave(
+                vk,
+                mode.width,
+                mode.height,
+                connector.shard_payload as usize,
+                connector.chroma_format == punktfunk_core::quic::CHROMA_IDC_444,
+                color,
+                connector.bit_depth >= 10,
+            ),
+            None => Err(anyhow::anyhow!(
+                "pyrowave session without a presenter device"
+            )),
+        }
+    } else {
+        Decoder::new(connector.codec, decoder, vulkan, stream_format)
+    };
+    #[cfg(not(all(any(target_os = "linux", windows), feature = "pyrowave")))]
+    let built = Decoder::new(connector.codec, decoder, vulkan, stream_format);
+    built
+}
+
+struct PlaneThreads {
+    audio_thread: Option<std::thread::JoinHandle<()>>,
+    pad_audio_thread: Option<std::thread::JoinHandle<()>>,
+    clipboard_thread: Option<std::thread::JoinHandle<()>>,
+    mic_uplink: Option<audio::MicStreamer>,
+}
+
+struct PlaneSettings {
+    pad_audio_on: bool,
+    pad_speaker_on: bool,
+    pad_haptics: bool,
+    clipboard: bool,
+    mic_enabled: bool,
+    echo_cancel: bool,
+}
+
+fn spawn_plane_threads(
+    connector: &Arc<NativeClient>,
+    stop: &Arc<AtomicBool>,
+    access: crate::access::SessionAccess,
+    mic: &MicControl,
+    settings: PlaneSettings,
+) -> PlaneThreads {
+    // Audio is best-effort: a session without it still streams. Gamepads are the
+    // app-lifetime service. Audio runs on its own thread (one puller per plane).
+    let audio_thread = spawn_audio(connector.clone(), stop.clone());
+    // Own drain thread. The output device opens lazily once frames arrive — a
+    // session without a wired DualSense costs one idle 10 ms poll loop.
+    let pad_audio_thread = settings
+        .pad_audio_on
+        .then(|| {
+            crate::pad_audio::spawn(
+                connector.clone(),
+                stop.clone(),
+                settings.pad_haptics,
+                settings.pad_speaker_on,
+            )
+        })
+        .flatten();
+    // Own thread: `next_clip` blocks and OS clipboard calls can wait on other apps.
+    // Host without clipboard capability returns immediately. Also gated by the
+    // session's CLIPBOARD grant — without it the host coordinator never starts.
+    let clipboard_thread = (settings.clipboard
+        && access.allows(punktfunk_core::quic::GRANT_CLIPBOARD))
+    .then(|| {
+        let c = connector.clone();
+        let s = stop.clone();
+        std::thread::Builder::new()
+            .name("pf-clipboard".into())
+            .spawn(move || crate::clipboard::run(c, s))
+            .ok()
+    })
+    .flatten();
+    // `set_live` makes the chord real: mic off in Settings, capture failed, or no
+    // MIC grant (host would drop the datagrams) leaves it false. `mut` because a
+    // mid-session AccessUpdate moves the grant and the uplink follows it live.
+    let mic_uplink = (settings.mic_enabled && access.allows(punktfunk_core::quic::GRANT_MIC))
+        .then(|| {
+            audio::MicStreamer::spawn(connector.clone(), mic.flag(), settings.echo_cancel)
+                .map_err(|e| tracing::warn!(error = %e, "mic uplink disabled"))
+                .ok()
+        })
+        .flatten();
+    mic.set_live(mic_uplink.is_some());
+    PlaneThreads {
+        audio_thread,
+        pad_audio_thread,
+        clipboard_thread,
+        mic_uplink,
+    }
+}
+
+fn pump(
+    params: SessionParams,
+    ev_tx: async_channel::Sender<SessionEvent>,
+    frame_tx: async_channel::Sender<DecodedFrame>,
+    stop: Arc<AtomicBool>,
+    mic: MicControl,
+) {
+    let ConnectPlan {
+        preferred,
+        pad_speaker_on,
+        pad_audio_on,
+        advertised_codecs,
+        bitrate_kbps,
+    } = connect_plan(&params);
     // Lossless opt-in, filtered by what this box can play. `CLIENT_CAP_AUDIO_HIRES`
     // means capable *and* the user turned it on — advertising without being able to
     // render spends 1.5–4.6 Mbps ABR cannot reclaim. `Some` past this block is
@@ -726,62 +876,7 @@ fn pump(
         notice: None,
     });
 
-    // Decoder for the host-resolved codec and picture shape (never assume HEVC).
-    // Native rungs probe the device at construction, so a 4:4:4 or Main 10 this GPU
-    // cannot decode refuses before the rung is chosen instead of error-streaking.
-    let stream_format = crate::video::StreamFormat {
-        chroma_format_idc: connector.chroma_format,
-        bit_depth: connector.bit_depth,
-    };
-    tracing::info!(
-        codec = crate::video::wire_codec_name(connector.codec),
-        welcome_codec = connector.codec,
-        "negotiated video codec"
-    );
-    // A negotiated PyroWave session decodes on the presenter's device — reachable
-    // only through the explicit preference above, so failing here is failing an
-    // opted-in experiment.
-    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-    let built = if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
-        let mode = connector.mode();
-        // Wavelet bitstream has no VUI: Welcome colour signalling is the session's
-        // colour contract, and the resolved chroma sizes the plane ring.
-        let color = crate::video::ColorDesc {
-            primaries: connector.color.primaries,
-            transfer: connector.color.transfer,
-            matrix: connector.color.matrix,
-            full_range: connector.color.full_range != 0,
-        };
-        match params.vulkan.as_ref() {
-            Some(vk) => Decoder::new_pyrowave(
-                vk,
-                mode.width,
-                mode.height,
-                connector.shard_payload as usize,
-                connector.chroma_format == punktfunk_core::quic::CHROMA_IDC_444,
-                color,
-                connector.bit_depth >= 10,
-            ),
-            None => Err(anyhow::anyhow!(
-                "pyrowave session without a presenter device"
-            )),
-        }
-    } else {
-        Decoder::new(
-            connector.codec,
-            &params.decoder,
-            params.vulkan.as_ref(),
-            stream_format,
-        )
-    };
-    #[cfg(not(all(any(target_os = "linux", windows), feature = "pyrowave")))]
-    let built = Decoder::new(
-        connector.codec,
-        &params.decoder,
-        params.vulkan.as_ref(),
-        stream_format,
-    );
-    let mut decoder = match built {
+    let mut decoder = match open_decoder(&params.decoder, params.vulkan.as_ref(), &connector) {
         Ok(d) => d,
         Err(e) => {
             // No rung for this codec at all (no hardware HEVC, or pinned software on
@@ -812,46 +907,25 @@ fn pump(
     let auto_rate = connector.wants_decode_latency();
     let chroma_444 = connector.chroma_format == punktfunk_core::quic::CHROMA_IDC_444;
     let asked_444 = params.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
-    // Audio is best-effort: a session without it still streams. Gamepads are the
-    // app-lifetime service. Audio runs on its own thread (one puller per plane).
-    let audio_thread = spawn_audio(connector.clone(), stop.clone());
-    // Own drain thread. The output device opens lazily once frames arrive — a
-    // session without a wired DualSense costs one idle 10 ms poll loop.
-    let pad_audio_thread = pad_audio_on
-        .then(|| {
-            crate::pad_audio::spawn(
-                connector.clone(),
-                stop.clone(),
-                params.pad_haptics,
-                pad_speaker_on,
-            )
-        })
-        .flatten();
-    // Own thread: `next_clip` blocks and OS clipboard calls can wait on other apps.
-    // Host without clipboard capability returns immediately. Also gated by the
-    // session's CLIPBOARD grant — without it the host coordinator never starts.
-    let clipboard_thread = (params.clipboard
-        && access.allows(punktfunk_core::quic::GRANT_CLIPBOARD))
-    .then(|| {
-        let c = connector.clone();
-        let s = stop.clone();
-        std::thread::Builder::new()
-            .name("pf-clipboard".into())
-            .spawn(move || crate::clipboard::run(c, s))
-            .ok()
-    })
-    .flatten();
-    // `set_live` makes the chord real: mic off in Settings, capture failed, or no
-    // MIC grant (host would drop the datagrams) leaves it false. `mut` because a
-    // mid-session AccessUpdate moves the grant and the uplink follows it live.
-    let mut mic_uplink = (params.mic_enabled && access.allows(punktfunk_core::quic::GRANT_MIC))
-        .then(|| {
-            audio::MicStreamer::spawn(connector.clone(), mic.flag(), params.echo_cancel)
-                .map_err(|e| tracing::warn!(error = %e, "mic uplink disabled"))
-                .ok()
-        })
-        .flatten();
-    mic.set_live(mic_uplink.is_some());
+    let PlaneThreads {
+        audio_thread,
+        pad_audio_thread,
+        clipboard_thread,
+        mut mic_uplink,
+    } = spawn_plane_threads(
+        &connector,
+        &stop,
+        access,
+        &mic,
+        PlaneSettings {
+            pad_audio_on,
+            pad_speaker_on,
+            pad_haptics: params.pad_haptics,
+            clipboard: params.clipboard,
+            mic_enabled: params.mic_enabled,
+            echo_cancel: params.echo_cancel,
+        },
+    );
 
     // Live host↔client clock offset, loaded per frame so mid-stream re-syncs keep
     // capture-clock latency honest — never cached at session start.
