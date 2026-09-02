@@ -39,6 +39,7 @@ pub(crate) struct Index {
 }
 
 /// One installable version, pinned by integrity hash.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Entry {
     /// `definePlugin` id; also the lease-registry key, so catalogued vs running is comparable.
