@@ -455,6 +455,48 @@ jobs:
           & packaging/windows/pack-host-installer.ps1 `
             -Version $env:HOST_VERSION -TargetDir C:\t\release -OutDir C:\t\out
 
+      # WP3.1/WP3.3 (design/installer-v2-windows-implementation-plan.md): the engine packer as a
+      # PARALLEL gate — same staging inputs, its own OutDir, so the artifact published below stays
+      # the ISCC one until the M5 swap. GITHUB_ENV is withheld from this run so HOST_SETUP_PATH
+      # keeps pointing at that artifact. Then the runner smoke: the sandwich inspects, the file
+      # carries a signature, and the packed exe's silent dry-run — the exact fielded updater spawn
+      # plus --dry-run, no mutation on the shared runner — writes the expected plan into /LOG=.
+      - name: Pack with the engine + smoke (parallel gate)
+        shell: pwsh
+        env:
+          AZURE_CODESIGNING_ENDPOINT: https://neu.codesigning.azure.net/
+          AZURE_CODESIGNING_ACCOUNT: unomsigning
+          AZURE_CODESIGNING_PROFILE: unom-io
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+          DRIVER_CERT_PFX_B64: ${{ secrets.DRIVER_CERT_PFX_B64 }}
+          DRIVER_CERT_PASSWORD: ${{ secrets.DRIVER_CERT_PASSWORD }}
+        run: |
+          Remove-Item Env:GITHUB_ENV -ErrorAction SilentlyContinue
+          & packaging/windows/pack-host-installer.ps1 `
+            -Version $env:HOST_VERSION -TargetDir C:\t\release -OutDir C:\t\out-engine -Engine
+          $setup = "C:\t\out-engine\punktfunk-host-setup-$env:HOST_VERSION.exe"
+          $packer = 'C:\t\out-engine\wizard-target\release\punktfunk-setup-pack.exe'
+          & $packer inspect $setup
+          if ($LASTEXITCODE -ne 0) { throw "inspect failed ($LASTEXITCODE)" }
+          $sig = Get-AuthenticodeSignature $setup
+          Write-Output "engine installer Authenticode: $($sig.Status) ($($sig.SignerCertificate.Subject))"
+          if (-not $sig.SignerCertificate) { throw "engine installer is unsigned" }
+          $log = 'C:\t\out-engine\smoke.log'
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath $setup -PassThru -Wait `
+            -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=$log", '--dry-run'
+          if ($p.ExitCode -ne 0) { throw "silent dry-run exited $($p.ExitCode)" }
+          $text = Get-Content $log -Raw
+          foreach ($line in @('==> Detected Windows', 'punktfunk-host.exe" service install', 'web setup', 'Done. Next:')) {
+            if (-not $text.Contains($line)) { throw "smoke transcript lacks: $line" }
+          }
+          Get-Content $log
+          Write-Output "engine installer: $([math]::Round((Get-Item $setup).Length / 1MB, 1)) MB; ISCC: $([math]::Round((Get-Item C:\t\out\punktfunk-host-setup-$env:HOST_VERSION.exe).Length / 1MB, 1)) MB"
+
       - name: Report stable Authenticode identity
         if: startsWith(gitea.ref, 'refs/tags/v')
         shell: pwsh

@@ -966,13 +966,21 @@ impl VirtualDisplayManager {
                 // so a rare re-add WARNs each time; a fighter escalates once.
                 let mut fighting = 0u32;
                 'watch: loop {
+                    // Subscribe to the display actor's topology generation (immunity plan WP9):
+                    // wake early when a snapshot lands, else at the interval — sliced so stop+join
+                    // stays bounded by ~250 ms. No CCD query on this thread any more.
+                    let seen = pf_win_display::display_events::snapshot().generation;
                     let mut slept = Duration::ZERO;
                     while slept < interval {
                         if stop_t.load(Ordering::Relaxed) {
                             break 'watch;
                         }
                         let slice = Duration::from_millis(250).min(interval - slept);
-                        thread::sleep(slice);
+                        match pf_win_display::display_events::wait_for_change(seen, slice) {
+                            Some(s) if s.generation > seen => break,
+                            Some(_) => {}
+                            None => thread::sleep(slice), // actor not running: plain cadence
+                        }
                         slept += slice;
                     }
                     let Ok(inner) = vdm().state.try_lock() else {
@@ -985,19 +993,20 @@ impl VirtualDisplayManager {
                     if keep.is_empty() {
                         continue;
                     }
-                    // A FAILED verification query is UNKNOWN, not "stable": back off to the next
-                    // cycle and mutate nothing (the old `unwrap_or(0)` silently called an unknown
-                    // topology successfully exclusive).
-                    let survivors = match count_other_active(&keep) {
-                        Some(n) => n,
-                        None => {
-                            tracing::debug!(
-                                "exclusive re-assert watchdog: CCD verification query failed — \
-                                 topology state unknown this cycle, mutating nothing"
-                            );
-                            continue;
-                        }
-                    };
+                    // A snapshot that is not FRESH (the actor's last query failed, or it never
+                    // published) is UNKNOWN, not "stable": back off to the next cycle and mutate
+                    // nothing (the old `unwrap_or(0)` silently called an unknown topology
+                    // successfully exclusive).
+                    let snap = pf_win_display::display_events::snapshot_or_query();
+                    if !snap.is_fresh() && snap.generation > 0 {
+                        tracing::debug!(
+                            failures = snap.failures,
+                            "exclusive re-assert watchdog: display snapshot is last-known-good — \
+                             topology state unknown this cycle, mutating nothing"
+                        );
+                        continue;
+                    }
+                    let survivors = snap.count_other_active(&keep);
                     if survivors == 0 {
                         if fighting > 0 {
                             tracing::info!(
@@ -1194,7 +1203,11 @@ impl VirtualDisplayManager {
         // pre-dark sink from a display we switched off (or lit) ourselves.
         let baseline_active: Vec<CcdTargetKey> =
             if inner.slots.is_empty() && crate::policy::prefs().standby_sink_neutralise() {
-                pf_win_display::win_display::target_inventory()
+                // A FRESH read through the display actor (it runs the query, off this thread),
+                // falling back to the newest snapshot if the actor is slow or not running.
+                pf_win_display::display_events::refresh_and_wait(Duration::from_millis(500))
+                    .unwrap_or_else(pf_win_display::display_events::snapshot_or_query)
+                    .targets
                     .iter()
                     .filter(|t| t.active)
                     .map(|t| t.key)

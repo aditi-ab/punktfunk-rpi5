@@ -142,6 +142,37 @@ impl Wiz {
         self.fire_unit(ControlKind::Button, label);
     }
 
+    /// An icon-only button carries no text: find it by its automation name.
+    fn click_named(&self, name: &str) {
+        let id = self.host.with_reconciler(|r| {
+            r.backend
+                .ops
+                .iter()
+                .rev()
+                .find_map(|op| match op {
+                    Op::SetAccessibility { id, accessibility }
+                        if accessibility.automation_name.as_deref() == Some(name) =>
+                    {
+                        Some(*id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no control is named '{name}'"))
+        });
+        let event = self.attached_event(id);
+        self.host.with_reconciler(|r| r.backend.fire(id, event));
+        self.settle();
+    }
+
+    fn has_name(&self, name: &str) -> bool {
+        self.host.with_reconciler(|r| {
+            r.backend.ops.iter().any(|op| {
+                matches!(op, Op::SetAccessibility { accessibility, .. }
+                    if accessibility.automation_name.as_deref() == Some(name))
+            })
+        })
+    }
+
     /// Check a radio button by its label (Welcome's Recommended / Custom).
     fn choose(&self, label: &str) {
         self.fire_unit(ControlKind::RadioButton, label);
@@ -390,5 +421,13 @@ fn recommended_installs_the_defaults_and_done_shows_the_password_and_next_steps(
     wiz.wait_for_done();
     assert!(wiz.has_text("--gamestream=off"), "the defaults ran");
     assert!(wiz.has_text("Your web console password"));
+    // Masked until Show (the op log is append-only, so "Hide" appearing is the flip);
+    // Copy is there either way and reports back.
+    assert!(wiz.has_text(punktfunk_setup_win::wizard::PASSWORD_MASK));
+    assert!(!wiz.has_name("Hide"));
+    wiz.click_named("Show");
+    assert!(wiz.has_name("Hide"));
+    wiz.click_named("Copy");
+    assert!(wiz.has_name("Copied"));
     assert!(wiz.has_text("Open the web console") && wiz.has_text("Install a client"));
 }

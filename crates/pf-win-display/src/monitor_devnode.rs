@@ -293,6 +293,9 @@ mod tests {
             height: 0,
             refresh_mhz: 0,
             primary: false,
+            hdr: None,
+            source_id: 0,
+            source_adapter_luid: 0,
         }
     }
 

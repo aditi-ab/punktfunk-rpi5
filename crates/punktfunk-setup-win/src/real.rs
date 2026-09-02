@@ -44,9 +44,17 @@ pub fn subst(root: Option<&Path>, version: &str) -> Subst {
         }
         None => (PathBuf::from("<staging>"), std::env::temp_dir()),
     };
+    let env = punktfunk_setup::seam::Env::from_env();
+    let var = |k: &str| env.get(k).unwrap_or_default().to_string();
     Subst {
         version: version.to_string(),
         staging: staging.display().to_string(),
         temp: temp.display().to_string(),
+        local_app_data: var("LOCALAPPDATA"),
+        start_menu: format!(
+            "{}\\Microsoft\\Windows\\Start Menu\\Programs",
+            var("APPDATA")
+        ),
+        desktop: format!("{}\\Desktop", var("USERPROFILE")),
     }
 }

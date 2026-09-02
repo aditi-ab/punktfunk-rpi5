@@ -80,7 +80,7 @@ impl WinScreen {
     }
 
     pub fn fresh(&self) -> bool {
-        self.facts.installed.is_none()
+        self.facts.installed_for(self.artifact).is_none()
     }
 
     /// This run's real path (D9): the Network step exists only while its trigger holds.
@@ -316,6 +316,8 @@ mod tests {
             vulkan_layer_registered: false,
             web_task: TaskState::Absent,
             scripting_task: TaskState::Absent,
+            inno_uninstaller: false,
+            client_installed: None,
         }
     }
 
