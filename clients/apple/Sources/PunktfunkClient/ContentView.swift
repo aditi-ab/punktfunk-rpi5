@@ -1178,7 +1178,6 @@ struct ContentView: View {
                             StreamHUDView(
                                 model: model, connection: conn, placement: placement,
                                 verbosity: statsVerbosity)
-                                .osdScaled(anchor: placement.unitPoint)
                                 .transition(
                                     .scale(scale: 0.8, anchor: placement.unitPoint)
                                         .combined(with: .opacity))
@@ -1325,8 +1324,7 @@ struct ContentView: View {
                 // the disc above. Mounted only while open — a closed overlay costs nothing.
                 .overlay {
                     if captureEnabled, ring.visible {
-                        RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn),
-                                    scale: OsdScale.current)
+                        RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn))
                     }
                 }
                 .onChange(of: ring.committed) { _, open in model.setRingOpen(open) }
@@ -1335,8 +1333,7 @@ struct ContentView: View {
                 // The ring on the Apple TV and the Mac: mounted only while open, like iOS.
                 .overlay {
                     if captureEnabled, ring.visible {
-                        RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn),
-                                    scale: OsdScale.current)
+                        RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn))
                     }
                 }
                 .onChange(of: ring.committed) { _, open in

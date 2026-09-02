@@ -14,8 +14,7 @@ import org.robolectric.annotation.Config
 
 /**
  * The overlay scale is derived, not stored, so what is worth pinning is the derivation: a TV gets
- * [TV_OSD_SCALE] and nothing else does, and [OsdScaled] actually reaches the `dp` inside it. The
- * Apple twin is `OsdScaleTests`.
+ * [TV_OSD_SCALE] and nothing else does, and [OsdScaled] actually reaches the `dp` inside it.
  *
  * `sdk = [36]` for the same reason as the screenshot tests: Robolectric ships android-all jars only
  * up to API 36 while the app's compileSdk is 37.

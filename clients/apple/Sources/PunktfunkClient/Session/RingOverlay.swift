@@ -278,16 +278,6 @@ struct RingOverlay: View {
     let actions: RingActions
     /// Set by the settings editor; nil in-stream.
     var editing: RingEditing? = nil
-    /// Overlay-scale multiplier (`OsdScale.current`). The radial metrics below are scaled by hand
-    /// because the ring centres on wherever the twist happened, and a `scaleEffect` about a fixed
-    /// anchor would walk an off-centre ring across the screen. The two blocks with metrics of their
-    /// own — the sheet and the chord keycap — take the multiplier as a transform instead. 1 in the
-    /// settings editor, which always draws at design size.
-    var scale: CGFloat = 1
-
-    private var scaledRadius: CGFloat { ringRadius * scale }
-    private var scaledSlot: CGFloat { slotSize * scale }
-    private var scaledCentre: CGFloat { centreSize * scale }
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// The disc under an editing drag and how far it has been carried.
     @State private var drag: (k: Int, offset: CGSize)?
@@ -343,7 +333,7 @@ struct RingOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
-            let margin = scaledRadius + scaledSlot / 2 + 16 * scale
+            let margin = ringRadius + slotSize / 2 + 16
             // Clamped so the whole ring stays on screen; a stage narrower than two margins
             // (the editor's) centres it instead of pinning it to one side.
             let cx = state.centred || geo.size.width < 2 * margin
@@ -377,7 +367,7 @@ struct RingOverlay: View {
                     let rad = deg * .pi / 180
                     let slot = cfg.ring[k]
                     let s = slot.map { spec($0, cfg, actions) }
-                    slotButton(s, size: scaledSlot, scale: 0.6 + 0.4 * q, alpha: q,
+                    slotButton(s, size: slotSize, scale: 0.6 + 0.4 * q, alpha: q,
                                armed: s != nil && state.armed == s?.id,
                                highlighted: state.highlight == k) {
                         if let editing {
@@ -387,7 +377,7 @@ struct RingOverlay: View {
                         }
                     }
                     .offset(drag?.k == k ? drag?.offset ?? .zero : .zero)
-                    .position(x: cx + scaledRadius * q * cos(rad), y: cy + scaledRadius * q * sin(rad))
+                    .position(x: cx + ringRadius * q * cos(rad), y: cy + ringRadius * q * sin(rad))
                     .allowsHitTesting(q > 0)
                     #if os(iOS) || os(macOS)
                     // Editing: one gesture owns the disc, so a drag never also fires the tap.
@@ -401,7 +391,7 @@ struct RingOverlay: View {
                 // dimmed and inert rather than offering a preview nobody asked for.
                 let cq = discQ(6)
                 slotButton(SlotSpec(id: "more", label: "More", icon: "ellipsis"),
-                           size: scaledCentre, scale: 0.6 + 0.4 * cq,
+                           size: centreSize, scale: 0.6 + 0.4 * cq,
                            alpha: cq * (editing == nil ? 1 : 0.45), armed: false,
                            highlighted: state.highlight == 6) {
                     state.touch()
@@ -417,21 +407,17 @@ struct RingOverlay: View {
                 }
                 if let hint = label {
                     Text(hint)
-                        .font(.geist(13 * scale, .medium, relativeTo: .caption))
+                        .font(.geist(13, .medium, relativeTo: .caption))
                         .foregroundStyle(.white.opacity(0.9))
-                        .padding(.horizontal, 14 * scale).padding(.vertical, 8 * scale)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
                         .glassBackground(Capsule())
-                        .position(x: cx, y: cy + scaledRadius + scaledSlot)
+                        .position(x: cx, y: cy + ringRadius + slotSize)
                 }
                 if state.sheet {
                     RingSheet(state: state, rows: sheetRows())
-                        // Grows upward off its own edge, so a scaled sheet cannot walk off screen.
-                        // `scaleEffect` leaves the layout box alone, so the cap is divided by the
-                        // multiplier to keep the DRAWN sheet inside its 60 % of the stage.
-                        .scaleEffect(scale, anchor: .bottom)
-                        .frame(maxHeight: geo.size.height * 0.6 / scale)
+                        .frame(maxHeight: geo.size.height * 0.6)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                        .padding(.bottom, 16 * scale)
+                        .padding(.bottom, 16)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
@@ -585,9 +571,9 @@ struct RingOverlay: View {
                     return
                 }
                 let rad = (-90 + 60 * CGFloat(k)) * .pi / 180
-                let dx = scaledRadius * cos(rad) + v.translation.width
-                let dy = scaledRadius * sin(rad) + v.translation.height
-                guard hypot(dx, dy) > scaledRadius / 2 else { return }
+                let dx = ringRadius * cos(rad) + v.translation.width
+                let dy = ringRadius * sin(rad) + v.translation.height
+                guard hypot(dx, dy) > ringRadius / 2 else { return }
                 let deg = atan2(dy, dx) * 180 / .pi + 90
                 let target = ((Int((deg / 60).rounded()) % 6) + 6) % 6
                 guard target != k, order == Array(0..<OverlayConfig.ringSlots) else { return }
@@ -620,7 +606,7 @@ struct RingOverlay: View {
                             highlighted: Bool = false, action: @escaping () -> Void) -> some View {
         let face = Group {
             if let keys = s?.keys {
-                ChordKeycap(keys: keys).scaleEffect(size / slotSize)
+                ChordKeycap(keys: keys)
             } else {
                 Image(systemName: s?.icon ?? "circle.dashed")
                     .font(.system(size: size * 0.4, weight: .semibold))

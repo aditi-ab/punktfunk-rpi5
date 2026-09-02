@@ -15,7 +15,8 @@ import androidx.compose.ui.unit.Density
  * the 10-foot legibility floor without walling off the game.
  *
  * Physical screen size is deliberately not an input: `DisplayMetrics.xdpi` is invented on many TV
- * boxes, so a screen-inch rule would mis-size the very case this exists for.
+ * boxes, so a screen-inch rule would mis-size the very case this exists for. Android only — the
+ * Apple TV client sizes its own chrome (`StreamHUDView`'s tvOS padding and inset).
  */
 const val TV_OSD_SCALE = 1.75f
 
