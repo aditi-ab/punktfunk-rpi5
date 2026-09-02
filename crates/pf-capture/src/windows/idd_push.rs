@@ -70,9 +70,30 @@ use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
 // `DRV_STATUS_*` codes and the channel-delivery struct — lives in `pf_driver_proto`; both sides
 // `use` it, so a layout/code drift is a compile error (the proto has `const` size asserts).
 use frame::{
-    unpack_opened_detail, SharedHeader, DRV_STATUS_BIND_FAIL, DRV_STATUS_NONE,
+    unpack_opened_detail, HealthState, SharedHeader, DRV_STATUS_BIND_FAIL, DRV_STATUS_NONE,
     DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED, DRV_STATUS_TEX_FAIL, MAGIC, RING_LEN, VERSION,
 };
+
+/// One consistent read of the v3 ring-health tail ([`IddPushCapturer::ring_health`]). Consumers
+/// (WP5 endpoint, WP8 display actor) reason over THIS, never the raw header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // the attach log reads a subset today; WP5/WP8 read the rest
+pub(crate) struct RingHealth {
+    pub state: HealthState,
+    /// What the driver advertised (`frame::CAP_*`).
+    pub capabilities: u32,
+    /// `frame::negotiate(host, driver)` — the only bits either side may act on.
+    pub negotiated: u32,
+    pub assignment_epoch: u32,
+    pub device_epoch: u32,
+    /// `(frame::ERR_DOMAIN_*, code)`; meaningful only when `state == Dead`.
+    pub terminal_error: (u32, i32),
+    /// Advances only on NEW source frames (a stash republish does not count).
+    pub source_sequence: u64,
+    pub last_publish_qpc: u64,
+    pub published_total: u64,
+    pub dropped_total: u64,
+}
 
 /// `DXGI_SHARED_RESOURCE_READ | _WRITE` for `CreateSharedHandle`/`OpenSharedResourceByName`. Local (not
 /// part of the proto contract — it is a DXGI sharing-API arg, mirrored on the driver side).
@@ -765,6 +786,51 @@ impl IddPushCapturer {
         (hb != 0).then_some((hb, offered))
     }
 
+    /// The v3 ring-health tail (immunity plan WP4), `None` on a pre-v3 driver: this host always
+    /// builds the 152-byte layout, and a driver stamps `capabilities` only after ITS
+    /// `frame::v3_readable` gate passed, so a zero capability word is the "v2 driver" tell. The
+    /// state word is read Acquire before AND after the body (`frame::snapshot_consistent`); one
+    /// retry, then the torn read is dropped rather than acted on.
+    pub(crate) fn ring_health(&self) -> Option<RingHealth> {
+        for _ in 0..2 {
+            // SAFETY: `self.header` is our own live 152-byte mapping; every read is a
+            // naturally-aligned atomic view of one field (the `driver_diag` pattern).
+            let snap = unsafe {
+                let h = self.header;
+                let u32_at = |p: *const u32| (*(p as *const AtomicU32)).load(Ordering::Acquire);
+                let u64_at = |p: *const u64| (*(p as *const AtomicU64)).load(Ordering::Relaxed);
+                let before = u32_at(std::ptr::addr_of!((*h).health_state));
+                let capabilities = u32_at(std::ptr::addr_of!((*h).capabilities));
+                let snap = RingHealth {
+                    state: HealthState::from_u32(before),
+                    capabilities,
+                    negotiated: frame::negotiate(
+                        u32_at(std::ptr::addr_of!((*h).host_capabilities)),
+                        capabilities,
+                    ),
+                    assignment_epoch: u32_at(std::ptr::addr_of!((*h).assignment_epoch)),
+                    device_epoch: u32_at(std::ptr::addr_of!((*h).device_epoch)),
+                    terminal_error: (
+                        u32_at(std::ptr::addr_of!((*h).terminal_error_domain)),
+                        u32_at(std::ptr::addr_of!((*h).terminal_error_code).cast::<u32>()) as i32,
+                    ),
+                    source_sequence: u64_at(std::ptr::addr_of!((*h).source_sequence)),
+                    last_publish_qpc: u64_at(std::ptr::addr_of!((*h).last_publish_qpc)),
+                    published_total: u64_at(std::ptr::addr_of!((*h).published_total)),
+                    dropped_total: u64_at(std::ptr::addr_of!((*h).dropped_total)),
+                };
+                let after = u32_at(std::ptr::addr_of!((*h).health_state));
+                frame::snapshot_consistent(before, after).then_some(snap)
+            };
+            match snap {
+                Some(s) if s.capabilities == 0 => return None,
+                Some(s) => return Some(s),
+                None => continue,
+            }
+        }
+        None
+    }
+
     /// Log the driver's status once it first reports (the only driver-visibility channel we have).
     fn log_driver_status_once(&mut self) {
         if self.status_logged {
@@ -777,10 +843,21 @@ impl IddPushCapturer {
         self.status_logged = true;
         let render_luid = format!("{hi:08x}:{lo:08x}");
         match status {
-            DRV_STATUS_OPENED => tracing::info!(
-                render_luid,
-                "IDD push: driver attached to the shared ring"
-            ),
+            DRV_STATUS_OPENED => match self.ring_health() {
+                Some(h) => tracing::info!(
+                    render_luid,
+                    driver_caps = format!("{:#x}", h.capabilities),
+                    negotiated = format!("{:#x}", h.negotiated),
+                    state = ?h.state,
+                    assignment_epoch = h.assignment_epoch,
+                    device_epoch = h.device_epoch,
+                    "IDD push: driver attached to the shared ring (v3 health tail live)"
+                ),
+                None => tracing::info!(
+                    render_luid,
+                    "IDD push: driver attached to the shared ring (pre-v3 driver, no health tail)"
+                ),
+            },
             DRV_STATUS_TEX_FAIL => tracing::error!(
                 render_luid,
                 detail = format!("0x{detail:08x}"),

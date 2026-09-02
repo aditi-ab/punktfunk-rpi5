@@ -298,7 +298,11 @@ pub mod control {
         pub generation: u32,
         /// How many leading entries of `texture_handles` are valid (`1..=`[`RING_LEN`]).
         pub ring_len: u32,
-        pub _pad: u32,
+        /// Bytes the host allocated for the shared header section (v3; the former `_pad`, same
+        /// offset — a pre-v3 host leaves it 0, which every v3 gate reads as "v2 prefix only").
+        /// Together with the header's stamped `version` this is the ONLY permission to touch the
+        /// v3 tail: see [`frame::v3_readable`](crate::frame::v3_readable).
+        pub header_bytes: u32,
         /// The shared-header file-mapping handle (the driver maps it and writes status/publish tokens).
         pub header_handle: u64,
         /// The frame-ready auto-reset event handle (the driver signals it after each publish).
@@ -537,9 +541,94 @@ pub mod frame {
     /// only attaches to a fully-published ring.
     pub const MAGIC: u32 = 0x4456_4650;
     /// Frame-plane version (independent bump of the header layout). v2 appended the stall-attribution
-    /// telemetry tail (`drain_heartbeat_qpc`/`last_acquire_qpc`/`offered_total`); see
-    /// [`VERSION_TELEMETRY`] for the compatibility contract.
-    pub const VERSION: u32 = 2;
+    /// telemetry tail (`drain_heartbeat_qpc`/`last_acquire_qpc`/`offered_total`); v3 appended the
+    /// ring-health tail (state, capabilities, epochs, source sequence, terminal error, counters) —
+    /// see [`VERSION_TELEMETRY`] and [`VERSION_HEALTH`] for the two compatibility gates.
+    pub const VERSION: u32 = 3;
+    /// The header version that grew the ring-health tail (immunity plan WP4). Reading or writing
+    /// past [`HEADER_V2_SIZE`] needs BOTH gates — see [`v3_readable`]: the host-stamped `version`
+    /// says the layout exists, the delivery's `header_bytes` says the section is that large. A v2
+    /// section is never touched past byte 88; a v3 host may allocate the larger section for a v2
+    /// driver, which reads only the prefix and writes no v3 field.
+    pub const VERSION_HEALTH: u32 = 3;
+    /// The v2 (telemetry-tail) header size — the prefix every driver since v2 understands.
+    pub const HEADER_V2_SIZE: usize = 88;
+    /// The v3 (ring-health-tail) header size — the section a v3 host allocates.
+    pub const HEADER_V3_SIZE: usize = 152;
+
+    /// Both endpoints may read/write the v3 tail only when the host stamped a v3 layout AND the
+    /// delivery declared a section at least that large. One gate, shared, so neither side can
+    /// guess: an old host leaves `header_bytes` zero (its request `_pad`), which fails here.
+    #[must_use]
+    pub const fn v3_readable(version: u32, header_bytes: u32) -> bool {
+        version >= VERSION_HEALTH && header_bytes as usize >= HEADER_V3_SIZE
+    }
+
+    // Capability bits, stamped by each side into its own header word (`host_capabilities` /
+    // `capabilities`). A transport or actuator activates only where BOTH sides agree
+    // ([`negotiate`]); a mismatch never selects a protocol by guesswork.
+    /// Understands the v3 ring-health tail.
+    pub const CAP_RING_HEALTH_V3: u32 = 1 << 0;
+    /// The driver keeps the ring endpoint across a swap-chain assignment (WP5).
+    pub const CAP_ENDPOINT_SURVIVES_ASSIGNMENT: u32 = 1 << 1;
+    /// CAS + shared-fence slot transport (WP7).
+    pub const CAP_FENCE_RING: u32 = 1 << 2;
+    /// The driver accepts a swap-chain reset actuator (WP13).
+    pub const CAP_SWAPCHAIN_RESET: u32 = 1 << 3;
+    /// The driver stamps `source_sequence` and `qpc_pts` (source present QPC) per real frame.
+    pub const CAP_SOURCE_SEQUENCE_QPC: u32 = 1 << 4;
+
+    /// The capabilities both sides advertise — the only ones either may act on.
+    #[must_use]
+    pub const fn negotiate(host: u32, driver: u32) -> u32 {
+        host & driver
+    }
+
+    /// `SharedHeader::health_state` values (v3). The driver stores the state LAST, with Release,
+    /// after the epoch/sequence fields it describes; a reader loads it with Acquire before
+    /// trusting them, and re-reads it after to detect a torn snapshot ([`snapshot_consistent`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u32)]
+    pub enum HealthState {
+        /// Header created, no publisher attached yet (also what a pre-v3 driver leaves: 0).
+        Initializing = 0,
+        /// A publisher is attached and the ring is live.
+        Active = 1,
+        /// The publisher retired its attachment (generation superseded / worker exit); a fresh
+        /// attach is expected.
+        Rebuilding = 2,
+        /// The generation is poisoned (abandoned slot, fatal sync/device result). `terminal_error_*`
+        /// name the cause. Only a rebuild helps.
+        Dead = 3,
+    }
+
+    impl HealthState {
+        /// Decode a stored word; unknown values read as [`Self::Dead`] — an unrecognised state is
+        /// not one to keep streaming on.
+        #[must_use]
+        pub const fn from_u32(v: u32) -> Self {
+            match v {
+                0 => Self::Initializing,
+                1 => Self::Active,
+                2 => Self::Rebuilding,
+                _ => Self::Dead,
+            }
+        }
+    }
+
+    /// `terminal_error_domain` values (v3), paired with a raw `terminal_error_code`.
+    pub const ERR_DOMAIN_NONE: u32 = 0;
+    /// Slot synchronization: an abandoned or failed keyed-mutex/fence operation (code = HRESULT).
+    pub const ERR_DOMAIN_TRANSPORT: u32 = 1;
+    /// The D3D device: removed/reset (code = `GetDeviceRemovedReason`).
+    pub const ERR_DOMAIN_DEVICE: u32 = 2;
+
+    /// Torn-read resistance for a v3 snapshot: the state word read before and after the epoch/
+    /// sequence fields must match, or the snapshot spans a driver transition and is discarded.
+    #[must_use]
+    pub const fn snapshot_consistent(state_before: u32, state_after: u32) -> bool {
+        state_before == state_after
+    }
     /// The header version that grew the telemetry tail. Compatibility is gated on the HOST-stamped
     /// `version` field, not on mapping sizes: a v2 driver writes the tail only when
     /// `version >= VERSION_TELEMETRY` (a v1 host created a 64-byte layout — never write past it),
@@ -658,6 +747,31 @@ pub mod frame {
         /// delta'd over a stall window). The host snapshots it per consumed frame; the delta
         /// across a stall says whether frames existed that never reached the ring.
         pub offered_total: u64,
+        // ---- v3 ring-health tail (offset 88..152). Every write is gated on `v3_readable`. ----
+        /// [`HealthState`], driver-written with Release AFTER the fields below it describes.
+        pub health_state: u32,
+        /// Driver capability bits (`CAP_*`), stamped at attach.
+        pub capabilities: u32,
+        /// Host capability bits (`CAP_*`), stamped before the magic.
+        pub host_capabilities: u32,
+        /// Bumped by the driver on every swap-chain assignment it attaches under.
+        pub assignment_epoch: u32,
+        /// Bumped by the driver on every D3D device creation — even on the same LUID (a TDR
+        /// recreate mints a new epoch; LUID equality is never device-compatibility proof).
+        pub device_epoch: u32,
+        /// `ERR_DOMAIN_*` for a [`HealthState::Dead`] generation.
+        pub terminal_error_domain: u32,
+        /// Raw code for `terminal_error_domain` (HRESULT / removed reason).
+        pub terminal_error_code: i32,
+        pub _pad_v3: u32,
+        /// Monotonic count of NEW source frames published (a stash republish does not advance it)
+        /// — the driver-side twin of the host's provenance sequence.
+        pub source_sequence: u64,
+        /// QPC of the most recent successful publish.
+        pub last_publish_qpc: u64,
+        /// Wrapping counts of publishes that landed and frames dropped (busy/mismatch/fatal).
+        pub published_total: u64,
+        pub dropped_total: u64,
     }
 
     /// Why the driver's publisher must NOT attach a delivered channel to its monitor's ring — the
@@ -734,7 +848,18 @@ pub mod frame {
     const _: () = {
         use core::mem::{offset_of, size_of};
 
-        assert!(size_of::<SharedHeader>() == 88);
+        assert!(size_of::<SharedHeader>() == HEADER_V3_SIZE);
+        assert!(offset_of!(SharedHeader, health_state) == HEADER_V2_SIZE);
+        assert!(offset_of!(SharedHeader, capabilities) == 92);
+        assert!(offset_of!(SharedHeader, host_capabilities) == 96);
+        assert!(offset_of!(SharedHeader, assignment_epoch) == 100);
+        assert!(offset_of!(SharedHeader, device_epoch) == 104);
+        assert!(offset_of!(SharedHeader, terminal_error_domain) == 108);
+        assert!(offset_of!(SharedHeader, terminal_error_code) == 112);
+        assert!(offset_of!(SharedHeader, source_sequence) == 120);
+        assert!(offset_of!(SharedHeader, last_publish_qpc) == 128);
+        assert!(offset_of!(SharedHeader, published_total) == 136);
+        assert!(offset_of!(SharedHeader, dropped_total) == 144);
         assert!(offset_of!(SharedHeader, magic) == 0);
         assert!(offset_of!(SharedHeader, version) == 4);
         assert!(offset_of!(SharedHeader, generation) == 8);
@@ -1871,16 +1996,85 @@ mod tests {
         assert_eq!(unpack_opened_detail(0x7FFF_FFFF), None);
     }
 
+    /// The v3 tail is reachable only when BOTH the stamped layout and the declared section say so
+    /// — every old/new pairing from the plan's compatibility contract, pinned.
     #[test]
-    fn shared_header_is_pod_and_88_bytes() {
+    fn v3_tail_gate_covers_every_pairing() {
+        use frame::{v3_readable, HEADER_V2_SIZE, HEADER_V3_SIZE};
+        let (v2, v3) = (HEADER_V2_SIZE as u32, HEADER_V3_SIZE as u32);
+        // new host + new driver: the only pairing that opens the tail.
+        assert!(v3_readable(3, v3));
+        // old host (v2 header, request `_pad` = 0) + new driver: prefix only.
+        assert!(!v3_readable(2, 0));
+        // new host that stamped v3 but a short section (a bug, or a truncated mapping): refused.
+        assert!(!v3_readable(3, v2));
+        assert!(!v3_readable(3, v3 - 1));
+        // a section large enough but a v2 layout stamp: refused — the stamp is the contract.
+        assert!(!v3_readable(2, v3));
+        // a future host: still readable as v3 (additive versions).
+        assert!(v3_readable(4, v3 + 64));
+    }
+
+    /// Capabilities activate only where both sides agree; an unknown bit on one side is inert.
+    #[test]
+    fn capabilities_negotiate_by_intersection() {
+        use frame::*;
+        let host = CAP_RING_HEALTH_V3 | CAP_FENCE_RING | CAP_SOURCE_SEQUENCE_QPC;
+        let old_driver = 0;
+        assert_eq!(
+            negotiate(host, old_driver),
+            0,
+            "a pre-v3 driver advertises nothing"
+        );
+        let driver = CAP_RING_HEALTH_V3 | CAP_SOURCE_SEQUENCE_QPC | CAP_SWAPCHAIN_RESET;
+        let n = negotiate(host, driver);
+        assert_eq!(n, CAP_RING_HEALTH_V3 | CAP_SOURCE_SEQUENCE_QPC);
+        assert_eq!(n & CAP_FENCE_RING, 0, "fence transport needs BOTH sides");
+        assert_eq!(
+            n & CAP_SWAPCHAIN_RESET,
+            0,
+            "an actuator the host did not ask for stays off"
+        );
+    }
+
+    /// State words decode exactly; anything unrecognised is Dead, never Active by accident.
+    #[test]
+    fn health_state_decodes_conservatively() {
+        use frame::HealthState;
+        assert_eq!(HealthState::from_u32(0), HealthState::Initializing);
+        assert_eq!(HealthState::from_u32(1), HealthState::Active);
+        assert_eq!(HealthState::from_u32(2), HealthState::Rebuilding);
+        assert_eq!(HealthState::from_u32(3), HealthState::Dead);
+        assert_eq!(HealthState::from_u32(0xdead_beef), HealthState::Dead);
+        assert!(frame::snapshot_consistent(1, 1));
+        assert!(
+            !frame::snapshot_consistent(1, 2),
+            "a state flip mid-read tears the snapshot"
+        );
+    }
+
+    #[test]
+    fn shared_header_is_pod_and_152_bytes() {
         let mut h = frame::SharedHeader::zeroed();
         h.magic = frame::MAGIC;
         h.width = 5120;
         h.height = 1440;
         h.target_id = 262;
         h.drain_heartbeat_qpc = 0x1234_5678_9abc_def0;
+        h.source_sequence = 77;
         let bytes = bytemuck::bytes_of(&h);
-        assert_eq!(bytes.len(), 88);
+        assert_eq!(bytes.len(), frame::HEADER_V3_SIZE);
+        // The v2 prefix is byte-identical: a v2 driver mapping the first 88 bytes sees its layout.
+        assert_eq!(
+            bytes[80..88],
+            0u64.to_le_bytes(),
+            "offered_total sits at the v2 tail end"
+        );
+        assert_eq!(
+            bytes[120..128],
+            77u64.to_le_bytes(),
+            "source_sequence is v3-only, at 120"
+        );
         let back: frame::SharedHeader = *bytemuck::from_bytes(bytes);
         assert_eq!(back.magic, frame::MAGIC);
         assert_eq!(back.width, 5120);
@@ -1999,7 +2193,7 @@ mod tests {
             target_id: 262,
             generation: 3,
             ring_len: frame::RING_LEN,
-            _pad: 0,
+            header_bytes: frame::HEADER_V3_SIZE as u32,
             header_handle: 0x0000_0000_0000_1a2c,
             event_handle: 0x0000_0000_0000_1b30,
             texture_handles: [0; control::RING_LEN_USIZE],

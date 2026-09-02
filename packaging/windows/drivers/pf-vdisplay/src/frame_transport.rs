@@ -25,14 +25,16 @@
 //! to dirty the display (the first-frame guarantee; see the type docs). Purely driver-internal
 //! behavior — no proto change: the host just sees a normal `seq = 1` publish right after attach.
 
+use std::mem::offset_of;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use pf_driver_proto::control::SetFrameChannelRequest;
 use pf_driver_proto::frame::{
-    AttachReject, DRV_STATUS_BIND_FAIL, DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED,
-    DRV_STATUS_TEX_FAIL, FrameToken, RING_LEN, SharedHeader, VERSION_TELEMETRY, check_attach,
-    pack_opened_detail,
+    AttachReject, CAP_RING_HEALTH_V3, CAP_SOURCE_SEQUENCE_QPC, DRV_STATUS_BIND_FAIL,
+    DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED, DRV_STATUS_TEX_FAIL, ERR_DOMAIN_TRANSPORT,
+    FrameToken, HealthState, RING_LEN, SharedHeader, VERSION_TELEMETRY, check_attach,
+    pack_opened_detail, v3_readable,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
@@ -52,6 +54,20 @@ use windows::core::Interface;
 /// SUCCESS-severity (positive), so the windows-rs `Result` wrapper can never surface it (`.ok()` maps
 /// every non-negative HRESULT to `Ok(())`) — the publish loop reads the raw vtable HRESULT instead.
 const WAIT_TIMEOUT_HRESULT: i32 = 0x0000_0102;
+/// The capability bits this driver advertises (`frame::CAP_*`). Fence ring, endpoint survival and
+/// the swap-chain reset actuator arrive with WP7/WP5/WP13 and stay unadvertised until then.
+const DRIVER_CAPABILITIES: u32 = CAP_RING_HEALTH_V3 | CAP_SOURCE_SEQUENCE_QPC;
+
+/// The current QPC tick (0 if the counter is unavailable — it cannot be on any OS we load on).
+fn qpc_now() -> u64 {
+    let mut qpc = 0i64;
+    // SAFETY: plain FFI; `qpc` is a valid local out-param.
+    match unsafe { QueryPerformanceCounter(&mut qpc) } {
+        Ok(()) => qpc as u64,
+        Err(_) => 0,
+    }
+}
+
 /// `WAIT_ABANDONED` as an HRESULT — the host died while holding the slot's keyed mutex. Also
 /// SUCCESS-severity, and ownership DID transfer to the caller.
 const WAIT_ABANDONED_HRESULT: i32 = 0x0000_0080;
@@ -65,6 +81,8 @@ pub struct FrameChannel {
     /// The ring generation these textures belong to (checked against the header at attach).
     generation: u32,
     ring_len: u32,
+    /// Section size the host declared (v3; 0 from a pre-v3 host) — half of the v3-tail gate.
+    header_bytes: u32,
     header: u64,
     event: u64,
     textures: [u64; RING_LEN as usize],
@@ -87,6 +105,7 @@ impl FrameChannel {
         Some(Self {
             generation: req.generation,
             ring_len: req.ring_len,
+            header_bytes: req.header_bytes,
             header: req.header_handle,
             event: req.event_handle,
             textures: req.texture_handles,
@@ -320,6 +339,14 @@ pub struct FramePublisher {
     /// cross-device); see [`Self::render_adapter`] + `swap_chain_processor::run_core`.
     render_luid_low: u32,
     render_luid_high: i32,
+    /// Whether the v3 ring-health tail may be touched — `frame::v3_readable` over the host's
+    /// stamped version AND the delivery's declared section size (never one alone).
+    v3: bool,
+    /// v3 counters mirrored into the tail: NEW source frames published (a stash republish does not
+    /// count), publishes that landed, frames dropped for any reason.
+    source_sequence: u64,
+    published_total: u64,
+    dropped_total: u64,
 }
 
 // SAFETY: created and used only on the swap-chain processor thread.
@@ -517,10 +544,11 @@ impl FramePublisher {
             (*header).driver_status_detail = pack_opened_detail(0, 0);
             (*header).driver_status = DRV_STATUS_OPENED;
         }
+        let v3 = v3_readable(header_version, channel.header_bytes);
         dbglog!(
-            "[pf-vd] frame-push(driver): attached to host ring gen {header_gen} ({ring_len} slots, sealed channel)"
+            "[pf-vd] frame-push(driver): attached to host ring gen {header_gen} ({ring_len} slots, sealed channel, v3_tail={v3})"
         );
-        Ok(Self {
+        let me = Self {
             context: context.clone(),
             map,
             header,
@@ -539,7 +567,84 @@ impl FramePublisher {
             last_published: None,
             render_luid_low,
             render_luid_high,
-        })
+            v3,
+            source_sequence: 0,
+            published_total: 0,
+            dropped_total: 0,
+        };
+        // v3: advertise what this driver can do. The state word is stamped by `stamp_epochs`
+        // (Release, after the epochs) — the worker calls it right after this attach.
+        me.v3_store_u32(offset_of!(SharedHeader, capabilities), DRIVER_CAPABILITIES);
+        Ok(me)
+    }
+
+    /// Store one v3 tail `u32` at byte offset `off` (Relaxed; the state word carries the Release) —
+    /// a no-op unless the v3 gate passed, so a v2 section is never touched past byte 88.
+    fn v3_store_u32(&self, off: usize, v: u32) {
+        if !self.v3 {
+            return;
+        }
+        // SAFETY: the v3 gate proves the host built and declared the 152-byte layout; `off` is an
+        // `offset_of!` of a naturally-aligned u32 inside it (the `latest_cell` pattern).
+        unsafe {
+            (*self.header.cast::<u8>().add(off).cast::<AtomicU32>()).store(v, Ordering::Relaxed)
+        }
+    }
+
+    /// Store one v3 tail `u64` — same contract as [`Self::v3_store_u32`].
+    fn v3_store_u64(&self, off: usize, v: u64) {
+        if !self.v3 {
+            return;
+        }
+        // SAFETY: as `v3_store_u32`, for a naturally-aligned u64 field.
+        unsafe {
+            (*self.header.cast::<u8>().add(off).cast::<AtomicU64>()).store(v, Ordering::Relaxed)
+        }
+    }
+
+    /// Publish a [`HealthState`] LAST, with Release, so a host that Acquire-loads it sees every
+    /// epoch/sequence/error field written before it (the v3 snapshot contract).
+    fn v3_set_state(&self, state: HealthState) {
+        if !self.v3 {
+            return;
+        }
+        // SAFETY: as `v3_store_u32`; Release is the ordering the contract names.
+        unsafe {
+            (*self
+                .header
+                .cast::<u8>()
+                .add(offset_of!(SharedHeader, health_state))
+                .cast::<AtomicU32>())
+            .store(state as u32, Ordering::Release);
+        }
+    }
+
+    /// Stamp the epochs this attachment runs under and mark the ring ACTIVE. Called by the worker
+    /// right after a successful attach; `assignment` changes per swap-chain assignment,
+    /// `device` per D3D device creation (`direct_3d_device::device_epoch`).
+    pub fn stamp_epochs(&self, assignment: u32, device: u32) {
+        self.v3_store_u32(offset_of!(SharedHeader, assignment_epoch), assignment);
+        self.v3_store_u32(offset_of!(SharedHeader, device_epoch), device);
+        self.v3_set_state(HealthState::Active);
+    }
+
+    /// The worker is retiring this attachment (generation superseded / worker exit) and a fresh
+    /// attach is expected — tell the host so a quiet ring reads as REBUILDING, not stalled.
+    pub fn mark_rebuilding(&self) {
+        self.v3_set_state(HealthState::Rebuilding);
+    }
+
+    /// The generation is poisoned: record the cause, then DEAD (Release, last).
+    fn v3_mark_dead(&self, domain: u32, code: i32) {
+        self.v3_store_u32(offset_of!(SharedHeader, terminal_error_domain), domain);
+        self.v3_store_u32(offset_of!(SharedHeader, terminal_error_code), code as u32);
+        self.v3_set_state(HealthState::Dead);
+    }
+
+    /// One more frame dropped (busy / mismatch / fatal) — the v3 counter the host deltas.
+    fn v3_note_drop(&mut self) {
+        self.dropped_total = self.dropped_total.wrapping_add(1);
+        self.v3_store_u64(offset_of!(SharedHeader, dropped_total), self.dropped_total);
     }
 
     /// v2 telemetry tail, drain side (stall attribution): stamp the heartbeat on EVERY drain-loop
@@ -708,6 +813,7 @@ impl FramePublisher {
                     self.ring_format
                 );
             }
+            self.v3_note_drop();
             return PublishOutcome::DescMismatch;
         }
         self.mismatch_logged = false;
@@ -739,6 +845,8 @@ impl FramePublisher {
                     dbglog!(
                         "[pf-vd] frame-push FATAL: slot {slot} keyed mutex ABANDONED (host died holding it) — poisoning this ring generation"
                     );
+                    self.v3_note_drop();
+                    self.v3_mark_dead(ERR_DOMAIN_TRANSPORT, WAIT_ABANDONED_HRESULT);
                     return PublishOutcome::HostAbandoned;
                 }
                 // Acquired cleanly.
@@ -760,6 +868,8 @@ impl FramePublisher {
                             "[pf-vd] frame-push FATAL: slot {slot} ReleaseSync failed rc={:#x} — NOT publishing `latest`; poisoning this ring generation",
                             e.code().0
                         );
+                        self.v3_note_drop();
+                        self.v3_mark_dead(ERR_DOMAIN_TRANSPORT, e.code().0);
                         return PublishOutcome::Fatal;
                     }
                     self.seq = self.seq.wrapping_add(1);
@@ -783,6 +893,22 @@ impl FramePublisher {
                             .store(display_qpc, Ordering::Relaxed);
                     }
                     self.latest_cell().store(latest, Ordering::Release);
+                    // v3 tail: a NEW source frame (the OS stamped a present time) advances the
+                    // source sequence; a stash republish (qpc 0) does not. Counters + publish QPC
+                    // are best-effort Relaxed like the telemetry tail.
+                    if display_qpc != 0 {
+                        self.source_sequence = self.source_sequence.wrapping_add(1);
+                        self.v3_store_u64(
+                            offset_of!(SharedHeader, source_sequence),
+                            self.source_sequence,
+                        );
+                    }
+                    self.published_total = self.published_total.wrapping_add(1);
+                    self.v3_store_u64(
+                        offset_of!(SharedHeader, published_total),
+                        self.published_total,
+                    );
+                    self.v3_store_u64(offset_of!(SharedHeader, last_publish_qpc), qpc_now());
                     // SAFETY: `self.event` is the live host-created frame-ready event, duplicated into
                     // this process with the creator's access; signalling it wakes the host consumer.
                     unsafe {
@@ -809,12 +935,22 @@ impl FramePublisher {
                         "[pf-vd] frame-push FATAL: slot {slot} AcquireSync rc={:#x} (device-removed reason {removed:#x}) — poisoning this ring generation",
                         hr.0
                     );
+                    self.v3_note_drop();
+                    self.v3_mark_dead(
+                        if removed != 0 {
+                            pf_driver_proto::frame::ERR_DOMAIN_DEVICE
+                        } else {
+                            ERR_DOMAIN_TRANSPORT
+                        },
+                        if removed != 0 { removed } else { hr.0 },
+                    );
                     return PublishOutcome::Fatal;
                 }
             }
         }
         // All slots busy — the designed backpressure (never block the swap-chain thread). Distinct
         // from the fatal outcomes: the host is alive and behind, retrying next compose is correct.
+        self.v3_note_drop();
         PublishOutcome::AllSlotsBusy
     }
 }
