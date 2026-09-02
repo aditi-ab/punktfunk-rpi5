@@ -60,6 +60,10 @@ pub enum WinAction {
     RemoveFiles {
         dir: String,
     },
+    /// Delete specific files; absent is fine (the WP3.2 Inno leftovers).
+    DeleteFiles {
+        paths: Vec<String>,
+    },
     /// The surgical PATH edit: containment-checked append / entry-by-entry rebuild,
     /// `REG_EXPAND_SZ`, never a substring delete. HKLM when `machine`, else HKCU.
     PathAdd {
@@ -235,6 +239,27 @@ fn host_install(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
         format!("Files → {app}"),
         vec![WinAction::DeployFiles { dest: app.clone() }],
     );
+
+    // WP3.2: the first upgrade over an Inno install. Our unins000.exe already replaced
+    // Inno's in the files phase; its data files go, and the ARP entry below is rewritten in
+    // place under the same key — never Inno's uninstaller (D6).
+    if upgrade && facts.inno_uninstaller {
+        plan.push(
+            "Retiring the Inno Setup uninstaller",
+            vec![
+                WinAction::DeleteFiles {
+                    paths: vec![
+                        format!("{app}\\unins000.dat"),
+                        format!("{app}\\unins000.msg"),
+                    ],
+                },
+                note(
+                    Level::Ok,
+                    "the Add/Remove Programs entry keeps its key — winget and the updater keep tracking this install",
+                ),
+            ],
+        );
+    }
 
     plan.push("Registry", registry_steps(facts, choices, &app));
     plan.push("Network", network_steps(facts, choices));

@@ -66,6 +66,7 @@ fn fresh_box() -> WinFacts {
         vulkan_layer_registered: false,
         web_task: TaskState::Absent,
         scripting_task: TaskState::Absent,
+        inno_uninstaller: false,
     }
 }
 
@@ -81,6 +82,7 @@ fn installed_box(location: String) -> WinFacts {
         vulkan_layer_registered: true,
         web_task: TaskState::Enabled,
         scripting_task: TaskState::Enabled,
+        inno_uninstaller: true,
         ..fresh_box()
     }
 }
