@@ -236,8 +236,8 @@ pub fn capture_virtual_output(
         ) as pf_capture::CursorChannelSender
     });
     // Secure-desktop actuator (`IOCTL_SET_CURSOR_FORWARD`): drop the hardware
-    // cursor declare while UAC/Winlogon is up. Stand-down needs a same-mode
-    // re-commit under the vdisplay manager lock, which pf-capture cannot take.
+    // cursor declare while UAC/Winlogon is up. Stand-down needs a real mode-set
+    // under the vdisplay manager lock, which pf-capture cannot take.
 
     // Built for every session: a channel-less reuse can still have a live cursor
     // worker from an earlier session. Never-declared targets answer NOT_FOUND,
@@ -260,7 +260,7 @@ pub fn capture_virtual_output(
                 )?;
             }
             if !enable {
-                crate::vdisplay::manager::force_recommit();
+                crate::vdisplay::manager::force_recommit(target_id);
             }
             Ok(())
         }) as pf_capture::CursorForwardSender
