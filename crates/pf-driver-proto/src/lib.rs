@@ -215,6 +215,21 @@ pub mod control {
     /// [`RING_LEN`] as usize. The array is sized at the compile-time max; `ring_len` is live count.
     pub const RING_LEN_USIZE: usize = RING_LEN as usize;
 
+    /// `IOCTL_SET_FRAME_CHANNEL` input from a fence-ring host (immunity plan WP7): the v1 request
+    /// verbatim as a prefix, then the two shared `ID3D11Fence` handle values (duplicated into
+    /// WUDFHost like the textures). Same IOCTL code — the driver tells the two apart by input
+    /// length (`>= size_of::<SetFrameChannelRequestV2>()`), and a pre-fence driver reads the v1
+    /// prefix of a v2 request unchanged (the ownership contract covers the fence handles too: the
+    /// host reaps them on error, the driver closes them on success). Zero fence handles = no fences
+    /// (a v2-shaped request from a host that negotiated the keyed-mutex arm).
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
+    pub struct SetFrameChannelRequestV2 {
+        pub v1: SetFrameChannelRequest,
+        pub ready_fence_handle: u64,
+        pub retire_fence_handle: u64,
+    }
+
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
     pub struct SetCursorChannelRequest {
@@ -722,6 +737,294 @@ pub mod frame {
         assert!(offset_of!(SharedHeader, last_acquire_qpc) == 72);
         assert!(offset_of!(SharedHeader, offered_total) == 80);
     };
+
+    /// The CAS + shared-fence slot transport (immunity plan WP7, decision D5; S2 GO on both
+    /// vendors). Replaces the keyed mutex as the slot handshake — the sealed handle broker, the
+    /// header and the textures stay as they are.
+    ///
+    /// Layout: a v4 header appends a [`SlotRecord`] table (one per [`RING_LEN`] slot) at
+    /// [`SLOT_TABLE_OFFSET`]; the delivery carries two shared `ID3D11Fence` handles
+    /// (`producer-ready`, `consumer-retire`) in [`SetFrameChannelRequestV2`](crate::control::
+    /// SetFrameChannelRequestV2). Both endpoints may run the fence protocol only when
+    /// [`v4_readable`] passes AND [`negotiate`] contains [`CAP_FENCE_RING`]; otherwise the ring is
+    /// the keyed-mutex one (WP2 poison rules), which stays negotiable for one compatibility release.
+    ///
+    /// Protocol (`FREE -> WRITING -> PUBLISHED -> READING -> FREE`, every transition a CAS):
+    /// the producer claims a FREE slot, else the OLDEST PUBLISHED (drop-oldest), else drops the
+    /// frame — it never touches READING/WRITING and never CPU-waits. It GPU-waits the slot's
+    /// `retire_value` on the retire fence, copies, signals `ready` with a new value, stamps
+    /// `seq`/`ready_value`, then releases PUBLISHED. The consumer takes the NEWEST PUBLISHED by
+    /// `seq` (dropping older ones — newest-wins, the S2 finding), CASes it READING, GPU-waits
+    /// `ready_value`, queues its read, signals `retire` with a new value, stamps `retire_value`,
+    /// then releases FREE. The pure claim/pick rules live here and are model-tested below.
+    pub mod fence {
+        use bytemuck::{Pod, Zeroable};
+
+        use super::HEADER_V3_SIZE;
+
+        const RING_LEN_USIZE: usize = super::RING_LEN as usize;
+
+        /// The header version that appends the slot table.
+        pub const VERSION_FENCE: u32 = 4;
+        /// Where the slot table starts: right after the v3 tail (8-aligned).
+        pub const SLOT_TABLE_OFFSET: usize = HEADER_V3_SIZE;
+        /// One [`SlotRecord`] per slot.
+        pub const SLOT_RECORD_SIZE: usize = 32;
+        /// The v4 header size — a v4 host allocates this.
+        pub const HEADER_V4_SIZE: usize = SLOT_TABLE_OFFSET + RING_LEN_USIZE * SLOT_RECORD_SIZE;
+
+        /// Both endpoints may touch the slot table only when the host stamped a v4 layout AND the
+        /// delivery declared a section at least that large (the v3 gate's shape, one version up).
+        #[must_use]
+        pub const fn v4_readable(version: u32, header_bytes: u32) -> bool {
+            version >= VERSION_FENCE && header_bytes as usize >= HEADER_V4_SIZE
+        }
+
+        /// Slot states (`SlotRecord::state`).
+        pub const FREE: u32 = 0;
+        pub const WRITING: u32 = 1;
+        pub const PUBLISHED: u32 = 2;
+        pub const READING: u32 = 3;
+
+        /// Per-slot protocol record in the shared header, accessed through atomic views like the
+        /// rest of the header. The producer stamps `seq` and `ready_value` before its
+        /// `WRITING -> PUBLISHED` release; the consumer stamps `retire_value` before its
+        /// `READING -> FREE` release.
+        #[repr(C)]
+        #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
+        pub struct SlotRecord {
+            pub state: u32,
+            pub _pad: u32,
+            /// The publish sequence this slot's pixels belong to (the token `seq`, full width).
+            pub seq: u64,
+            /// Producer-ready fence value the consumer must GPU-wait before sampling.
+            pub ready_value: u64,
+            /// Consumer-retire fence value the producer must GPU-wait before overwriting.
+            pub retire_value: u64,
+        }
+
+        const _: () = {
+            use core::mem::size_of;
+            assert!(size_of::<SlotRecord>() == SLOT_RECORD_SIZE);
+            assert!(SLOT_TABLE_OFFSET % 8 == 0);
+            assert!(HEADER_V4_SIZE == 152 + 6 * 32);
+        };
+
+        /// Byte offset of slot `i`'s record inside the header section.
+        #[must_use]
+        pub const fn slot_offset(i: usize) -> usize {
+            SLOT_TABLE_OFFSET + i * SLOT_RECORD_SIZE
+        }
+
+        /// What the producer does with the next frame, from one scan of `(state, seq)` per slot.
+        /// Pure: the CAS that commits the claim is the caller's (a lost race rescans).
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Claim {
+            /// Take this FREE slot.
+            Free(usize),
+            /// No FREE slot: overwrite this OLDEST PUBLISHED one (drop-oldest).
+            Overwrite(usize),
+            /// Everything is READING/WRITING: drop the frame, never wait.
+            Drop,
+        }
+
+        /// Producer claim rule: first FREE slot; else the PUBLISHED slot with the lowest `seq`;
+        /// else drop. READING and WRITING slots are never candidates.
+        #[must_use]
+        pub fn producer_claim(slots: &[(u32, u64)]) -> Claim {
+            if let Some(i) = slots.iter().position(|&(s, _)| s == FREE) {
+                return Claim::Free(i);
+            }
+            slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.0 == PUBLISHED)
+                .min_by_key(|(_, slot)| slot.1)
+                .map_or(Claim::Drop, |(i, _)| Claim::Overwrite(i))
+        }
+
+        /// What the consumer does, from one scan: take the newest PUBLISHED slot whose `seq` is
+        /// above `last_delivered`, and name every PUBLISHED slot at or below it as stale (to be
+        /// CASed straight to FREE — a stream must never show an older frame after a newer one).
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct Pick {
+            pub take: Option<(usize, u64)>,
+            pub stale: alloc::vec::Vec<usize>,
+        }
+
+        #[must_use]
+        pub fn consumer_pick(slots: &[(u32, u64)], last_delivered: u64) -> Pick {
+            let mut take: Option<(usize, u64)> = None;
+            let mut stale = alloc::vec::Vec::new();
+            for (i, &(s, seq)) in slots.iter().enumerate() {
+                if s != PUBLISHED {
+                    continue;
+                }
+                if seq <= last_delivered {
+                    stale.push(i);
+                } else if take.is_none_or(|(_, t)| seq > t) {
+                    take = Some((i, seq));
+                }
+            }
+            Pick { take, stale }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::control::{SetFrameChannelRequest, SetFrameChannelRequestV2};
+            use alloc::vec::Vec;
+
+            #[test]
+            fn v4_layout_and_gate() {
+                assert_eq!(HEADER_V4_SIZE, 344);
+                assert_eq!(slot_offset(0), 152);
+                assert_eq!(slot_offset(5), 152 + 5 * 32);
+                assert!(v4_readable(4, 344));
+                assert!(!v4_readable(3, 344), "a v3 host never stamped a slot table");
+                assert!(
+                    !v4_readable(4, 152),
+                    "a v4 version on a v3-sized section is not enough"
+                );
+                assert!(v4_readable(5, 4096));
+                // The v2 request is the v1 request as an exact prefix.
+                assert_eq!(core::mem::offset_of!(SetFrameChannelRequestV2, v1), 0);
+                assert_eq!(
+                    core::mem::offset_of!(SetFrameChannelRequestV2, ready_fence_handle),
+                    core::mem::size_of::<SetFrameChannelRequest>()
+                );
+                assert_eq!(
+                    core::mem::size_of::<SetFrameChannelRequestV2>(),
+                    core::mem::size_of::<SetFrameChannelRequest>() + 16
+                );
+            }
+
+            #[test]
+            fn producer_prefers_free_then_oldest_published_and_never_reading() {
+                assert_eq!(producer_claim(&[(PUBLISHED, 9), (FREE, 0)]), Claim::Free(1));
+                assert_eq!(
+                    producer_claim(&[(PUBLISHED, 9), (READING, 3), (PUBLISHED, 7)]),
+                    Claim::Overwrite(2)
+                );
+                assert_eq!(producer_claim(&[(READING, 1), (WRITING, 2)]), Claim::Drop);
+                assert_eq!(producer_claim(&[]), Claim::Drop);
+            }
+
+            #[test]
+            fn consumer_takes_newest_and_names_older_publishes_stale() {
+                let p = consumer_pick(
+                    &[(PUBLISHED, 5), (READING, 6), (PUBLISHED, 8), (FREE, 0)],
+                    5,
+                );
+                assert_eq!(p.take, Some((2, 8)));
+                assert_eq!(p.stale, alloc::vec![0], "seq 5 was already delivered");
+                let p = consumer_pick(&[(PUBLISHED, 3)], 7);
+                assert_eq!((p.take, p.stale), (None, alloc::vec![0]));
+                assert_eq!(consumer_pick(&[(FREE, 0); 6], 0).take, None);
+            }
+
+            /// Randomized two-party trace over the pure rules with a pixel model: the producer
+            /// writes `seq` into the slot's pixels between its WRITING and PUBLISHED steps, the
+            /// consumer reads them after READING. Proves the D5 invariants the driver/host arms
+            /// inherit: a READING slot is never selected, a delivered frame's pixels always carry
+            /// the seq the record names (no relabel), delivery is monotonic, and the producer never
+            /// waits (every step makes progress or drops).
+            #[test]
+            fn interleaved_trace_never_relabels_or_touches_a_reading_slot() {
+                struct Model {
+                    state: [u32; 6],
+                    seq: [u64; 6],
+                    pixels: [u64; 6],
+                    writing: Option<usize>,
+                    reading: Option<(usize, u64)>,
+                    next_seq: u64,
+                    last_delivered: u64,
+                    delivered: u64,
+                    dropped: u64,
+                    overwritten: u64,
+                }
+                let mut m = Model {
+                    state: [FREE; 6],
+                    seq: [0; 6],
+                    pixels: [0; 6],
+                    writing: None,
+                    reading: None,
+                    next_seq: 0,
+                    last_delivered: 0,
+                    delivered: 0,
+                    dropped: 0,
+                    overwritten: 0,
+                };
+                let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+                let mut next = || {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng
+                };
+                for _ in 0..200_000 {
+                    let r = next();
+                    let view: Vec<(u32, u64)> = (0..6).map(|i| (m.state[i], m.seq[i])).collect();
+                    match r % 4 {
+                        // Producer step 1: claim.
+                        0 if m.writing.is_none() => match producer_claim(&view) {
+                            Claim::Free(i) | Claim::Overwrite(i) => {
+                                assert_ne!(m.state[i], READING, "claimed a READING slot");
+                                assert_ne!(m.state[i], WRITING, "claimed a WRITING slot");
+                                if m.state[i] == PUBLISHED {
+                                    m.overwritten += 1;
+                                }
+                                m.state[i] = WRITING;
+                                m.writing = Some(i);
+                            }
+                            Claim::Drop => m.dropped += 1,
+                        },
+                        // Producer step 2: copy + publish.
+                        0 | 1 => {
+                            if let Some(i) = m.writing.take() {
+                                m.next_seq += 1;
+                                m.pixels[i] = m.next_seq;
+                                m.seq[i] = m.next_seq;
+                                m.state[i] = PUBLISHED;
+                            }
+                        }
+                        // Consumer step 1: pick + claim.
+                        2 if m.reading.is_none() => {
+                            let p = consumer_pick(&view, m.last_delivered);
+                            for i in p.stale {
+                                assert_eq!(m.state[i], PUBLISHED);
+                                m.state[i] = FREE;
+                            }
+                            if let Some((i, seq)) = p.take {
+                                assert!(seq > m.last_delivered, "non-monotonic pick");
+                                m.state[i] = READING;
+                                m.reading = Some((i, seq));
+                            }
+                        }
+                        // Consumer step 2: read pixels + release.
+                        _ => {
+                            if let Some((i, seq)) = m.reading.take() {
+                                assert_eq!(m.state[i], READING, "someone touched a READING slot");
+                                assert_eq!(
+                                    m.pixels[i], seq,
+                                    "pixels relabelled under the consumer"
+                                );
+                                m.last_delivered = seq;
+                                m.delivered += 1;
+                                m.state[i] = FREE;
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    m.delivered > 10_000,
+                    "the trace must actually deliver frames"
+                );
+                assert!(m.overwritten > 0, "drop-oldest must have exercised");
+                assert!(m.dropped < m.next_seq, "the producer must not be starved");
+            }
+        }
+    }
 }
 
 /// Gamepad shared-memory layouts (host ↔ UMDF drivers `pf_xusb` / `pf_gamepad`).
