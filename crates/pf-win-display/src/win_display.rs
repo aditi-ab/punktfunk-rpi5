@@ -1960,6 +1960,40 @@ mod live_tests {
         );
         tracing::info!("live CCD query: {n} active display path(s)");
     }
+
+    /// LIVE (console session, `PUNKTFUNK_CONFIG_DIR` at a journal a killed host left behind):
+    /// the isolate journal's startup leg relights the desktop — afterwards an external physical
+    /// panel is active and the marker is gone. The S4/WP11 kill-recovery gate; a box with no
+    /// leftover passes on the panel check alone.
+    #[test]
+    #[ignore = "hardware: writes the live display topology; needs a console session"]
+    fn live_startup_recover_relights_the_desktop_after_a_kill() {
+        let pending = isolate_journal::pending();
+        eprintln!("isolate journal before: {pending:?}");
+        isolate_journal::startup_recover();
+        assert!(
+            isolate_journal::pending().is_none(),
+            "the isolate marker must be cleared by the replay"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let inv = target_inventory();
+            let lit: Vec<_> = inv
+                .iter()
+                .filter(|t| t.active && t.external_physical)
+                .map(|t| (t.target_id, t.friendly.clone()))
+                .collect();
+            if !lit.is_empty() {
+                eprintln!("physical panel(s) active after the replay: {lit:?}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no external physical panel came back within 8 s of the replay: {inv:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
 }
 
 #[cfg(test)]
