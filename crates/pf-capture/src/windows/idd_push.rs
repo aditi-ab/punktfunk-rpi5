@@ -1624,7 +1624,14 @@ impl IddPushCapturer {
             last_source: self.last_fresh,
             source_seq: self.source_seq,
             heartbeat_age: telemetry.map(|(hb, _)| Duration::from_micros(Self::qpc_age_us(hb))),
-            offered: telemetry.map(|(_, offered)| offered),
+            // Re-attach restarts `offered_total` near zero (same guard as the stall evidence).
+            offered_undelivered: telemetry.map(|(_, offered)| {
+                if offered >= self.offered_at_fresh {
+                    offered - self.offered_at_fresh
+                } else {
+                    offered
+                }
+            }),
             publish_age: health
                 .as_ref()
                 .filter(|h| h.last_publish_qpc != 0)

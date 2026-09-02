@@ -58,8 +58,11 @@ pub(super) struct Inputs {
     pub source_seq: u64,
     /// Age of the driver worker's drain heartbeat (v2 telemetry); `None` before the first one.
     pub heartbeat_age: Option<Duration>,
-    /// The driver's `offered_total` (composed frames it acquired); `None` on a pre-v2 driver.
-    pub offered: Option<u64>,
+    /// Composed frames the driver acquired that the ring has NOT delivered: `offered_total`
+    /// minus its value at the last source frame. `None` on a pre-v2 driver. The raw counter is
+    /// unusable here — read one tick after a delivered frame it is "newer than the source" on
+    /// every desktop pause, and a static desktop became a 15 s transport stall.
+    pub offered_undelivered: Option<u64>,
     /// Age of the ring's last publish (v3 health tail); `None` when unknown.
     pub publish_age: Option<Duration>,
     /// Cursor travel since the last source frame.
@@ -94,8 +97,9 @@ pub(super) struct Supervisor {
     last_gap: Duration,
     /// The source gap when the open episode began, and when: together they measure the outage.
     opened: Option<(Duration, Instant)>,
-    offered_last: u64,
-    /// When `offered_total` last advanced (the driver acquired a composed frame).
+    undelivered_last: u64,
+    /// When the undelivered-offer count last grew (the driver acquired a composed frame the
+    /// ring did not deliver).
     offered_at: Option<Instant>,
     /// When cursor travel first crossed the evidence bar in this gap.
     input_at: Option<Instant>,
@@ -111,7 +115,7 @@ impl Supervisor {
             last_tick: now,
             last_gap: Duration::ZERO,
             opened: None,
-            offered_last: 0,
+            undelivered_last: 0,
             offered_at: None,
             input_at: None,
             canary_at: None,
@@ -192,10 +196,10 @@ impl Supervisor {
             return Step::Nothing;
         }
         self.last_tick = i.now;
-        if let Some(offered) = i.offered {
-            if offered != self.offered_last {
-                self.offered_last = offered;
-                self.offered_at = Some(i.now);
+        if let Some(undelivered) = i.offered_undelivered {
+            if undelivered != self.undelivered_last {
+                self.undelivered_last = undelivered;
+                self.offered_at = (undelivered > 0).then_some(i.now);
             }
         }
         if i.cursor_gap_px >= INPUT_EVIDENCE_PX && self.input_at.is_none() {
@@ -308,6 +312,12 @@ impl Supervisor {
     }
 }
 
+/// Undelivered offers count as "presents continue" only while they keep coming: a single
+/// trailing frame the ring dropped (slot busy, descriptor mismatch) before the desktop went
+/// static is a stale image, not a stalled transport, and a ring reset would cost more than it
+/// returns. A stalled transport under a changing desktop grows the count every tick.
+const PRESENTS_CONTINUE: Duration = Duration::from_secs(3);
+
 /// The strongest activity evidence newer than the last source frame. An unanswered canary and
 /// driver-side acquire progress are strong; cursor travel alone is weak (a hardware-cursor
 /// desktop composes nothing while the pointer moves).
@@ -325,7 +335,8 @@ fn evidence(
             kind: ActivityKind::Input,
         });
     }
-    if let Some(at) = offered_at {
+    if let Some(at) = offered_at.filter(|t| now.saturating_duration_since(*t) <= PRESENTS_CONTINUE)
+    {
         all.push(Activity {
             at,
             kind: ActivityKind::Presents,
@@ -356,13 +367,13 @@ fn ring_state(state: Option<HealthState>, recreating: bool) -> RingState {
 mod tests {
     use super::*;
 
-    fn inputs(now: Instant, last_source: Instant, cursor_gap_px: u32, offered: u64) -> Inputs {
+    fn inputs(now: Instant, last_source: Instant, cursor_gap_px: u32, undelivered: u64) -> Inputs {
         Inputs {
             now,
             last_source,
             source_seq: 1,
             heartbeat_age: Some(Duration::from_millis(5)),
-            offered: Some(offered),
+            offered_undelivered: Some(undelivered),
             publish_age: None,
             cursor_gap_px,
             ring: Some(HealthState::Active),
@@ -411,5 +422,23 @@ mod tests {
         // The outage is the whole hole: 16 s of missed source before the episode plus 1 s in it.
         assert_eq!(outage, Duration::from_secs(17));
         assert!(!sv.owns_episode());
+    }
+
+    /// One undelivered offer left behind by a dropped frame, then a static desktop: the evidence
+    /// goes stale and the gap is idle — no ring reset for a stale image. Offers that keep coming
+    /// past the floor are the transport stall they always were.
+    #[test]
+    fn single_trailing_undelivered_offer_is_idle_not_a_transport_stall() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let mut sv = Supervisor::new(t0);
+        assert_eq!(sv.tick(inputs(s(1), t0, 0, 1)), Step::Nothing);
+        assert_eq!(sv.tick(inputs(s(16), t0, 0, 1)), Step::Nothing);
+        assert_eq!(sv.tick(inputs(s(30), t0, 0, 1)), Step::Nothing);
+        assert!(!sv.owns_episode());
+        assert_eq!(
+            sv.tick(inputs(s(31), t0, 0, 2)),
+            Step::Run(Stage::RingReset)
+        );
     }
 }
