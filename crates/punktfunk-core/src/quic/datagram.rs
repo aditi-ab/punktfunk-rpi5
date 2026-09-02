@@ -429,11 +429,23 @@ pub const HID_RAW_FEATURE: u8 = 1;
 /// Wire: `[0xCD][kind][pad][fields…]`. Rumble stays on [`RUMBLE_MAGIC`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HidOutput {
-    Led { pad: u8, r: u8, g: u8, b: u8 },
+    Led {
+        pad: u8,
+        r: u8,
+        g: u8,
+        b: u8,
+    },
     /// Low 5 bits of the player-indicator LEDs.
-    PlayerLeds { pad: u8, bits: u8 },
+    PlayerLeds {
+        pad: u8,
+        bits: u8,
+    },
     /// Adaptive trigger. `which` 0 = L2, 1 = R2; `effect` is the DualSense parameter block.
-    Trigger { pad: u8, which: u8, effect: Vec<u8> },
+    Trigger {
+        pad: u8,
+        which: u8,
+        effect: Vec<u8>,
+    },
     /// Steam Controller voice-coil pulse. `side` 0 = right, 1 = left; `period` is µs off-time.
     /// A client without coils drops it. The tag is allocated on a shipped wire — keep the
     /// decoder even while nothing produces or renders this variant.
@@ -448,13 +460,21 @@ pub enum HidOutput {
     /// `kind` is [`HID_RAW_OUTPUT`] or [`HID_RAW_FEATURE`]; `data` is the full report,
     /// id first, ≤ [`HID_REPORT_MAX`]. Triton rumble re-sends every ~40 ms against a
     /// ~50 ms hardware timeout; settings refresh every ~3 s — a lost datagram heals.
-    HidRaw { pad: u8, kind: u8, data: Vec<u8> },
+    HidRaw {
+        pad: u8,
+        kind: u8,
+        data: Vec<u8>,
+    },
     /// DS5 output-report `0x02` audio-control region (samples ride [`PAD_AUDIO_MAGIC`]).
     /// `raw` is bytes 5..=10 (volumes + routing). `flags`: bit0 = haptics-select
     /// (`valid_flag0` bit1), bits1..4 = `valid_flag0` bits 4..7. Wire:
     /// `[0xCD][0x06][u16 pad LE][u8 flags][6 raw]`. Change-only; a rumbling pad would
     /// otherwise re-send unchanged audio state on every output report.
-    AudioCtl { pad: u16, flags: u8, raw: [u8; 6] },
+    AudioCtl {
+        pad: u16,
+        flags: u8,
+        raw: [u8; 6],
+    },
 }
 
 impl HidOutput {

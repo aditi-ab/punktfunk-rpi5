@@ -883,9 +883,9 @@ impl DmabufInner {
                 ffi::AV_BUFFERSRC_FLAG_KEEP_REF as c_int,
             );
             drop(drm); // KEEP_REF: drop our ref after the push so descriptor timing is unchanged.
-            // Import is this push + the pull below. Failure means this driver will not take
-            // this dmabuf — latch it; capture falls back to CPU next session. Do not count
-            // `avcodec_send_frame`: that stall is what the in-place rebuild recovers.
+                       // Import is this push + the pull below. Failure means this driver will not take
+                       // this dmabuf — latch it; capture falls back to CPU next session. Do not count
+                       // `avcodec_send_frame`: that stall is what the in-place rebuild recovers.
             if r < 0 {
                 let e = format!("av_buffersrc_add_frame failed ({r})");
                 pf_zerocopy::note_raw_dmabuf_import_failure(&e);

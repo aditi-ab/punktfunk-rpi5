@@ -1769,8 +1769,8 @@ impl Encoder for AmfEncoder {
         inner.pending.clear();
         inner.ready.clear(); // owed AUs forfeited; rebuilt stream restarts at IDR
         inner.hdr_pushed = None; // re-Init'd component needs HDR metadata again
-        // SAFETY: live component, encode thread, no AMF call in flight. Flush/Terminate are
-        // legal on a wedge (results ignored); apply_static_props + init rebuild it.
+                                 // SAFETY: live component, encode thread, no AMF call in flight. Flush/Terminate are
+                                 // legal on a wedge (results ignored); apply_static_props + init rebuild it.
         let rebuilt = unsafe {
             let comp = inner.comp.0;
             ((*(*comp).vtbl).flush)(comp);

@@ -49,7 +49,9 @@ impl DiscoveredHost {
 pub enum DiscoveryEvent {
     /// Appeared or refreshed (new address, pairing, …).
     Resolved(DiscoveredHost),
-    Removed { fullname: String },
+    Removed {
+        fullname: String,
+    },
 }
 
 /// Cheap-to-clone flag: force an immediate re-query. A request after the

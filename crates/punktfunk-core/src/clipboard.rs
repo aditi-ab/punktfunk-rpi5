@@ -37,7 +37,10 @@ const FETCH_STALL_SECS: u64 = 60;
 #[derive(Clone, Debug)]
 pub enum ClipEventCore {
     /// Host copied. Fetch lazily — only when a local app actually pastes.
-    RemoteOffer { seq: u32, kinds: Vec<ClipKind> },
+    RemoteOffer {
+        seq: u32,
+        kinds: Vec<ClipKind>,
+    },
     /// Host ack / unsolicited policy or backend update, for the toggle UI.
     State {
         enabled: bool,
@@ -59,9 +62,14 @@ pub enum ClipEventCore {
         bytes: Vec<u8>,
         last: bool,
     },
-    Cancelled { id: u32 },
+    Cancelled {
+        id: u32,
+    },
     /// A transfer failed; `code` is a [`PunktfunkStatus`] value (negative).
-    Error { id: u32, code: i32 },
+    Error {
+        id: u32,
+        code: i32,
+    },
 }
 
 /// Embedder → clipboard task. `ClipControl`/`ClipOffer` are not here — they ride the

@@ -15,9 +15,9 @@ pub use pf_frame::{CapturedFrame, OutputFormat};
 pub use pf_frame::PixelFormat;
 // `capturer_supports_hdr` is not re-exported: on Linux that name is the platform
 // floor and would silently miss the gamescope arm. Use [`capturer_supports_hdr_for`].
-pub use pf_capture::{capturer_supports_444, Capturer, SyntheticCapturer};
 #[cfg(feature = "gamestream")]
 pub use pf_capture::FastSyntheticCapturer;
+pub use pf_capture::{capturer_supports_444, Capturer, SyntheticCapturer};
 #[cfg(target_os = "windows")]
 pub use pf_capture::{dxgi, synthetic_nv12};
 

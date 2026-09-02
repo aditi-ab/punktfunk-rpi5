@@ -30,7 +30,9 @@ use std::sync::Arc;
 
 pub enum ClipEvent {
     /// Empty `mimes` means cleared; bytes wait for a client fetch.
-    Selection { mimes: Vec<String> },
+    Selection {
+        mimes: Vec<String>,
+    },
     /// Host app pasting the client's offer; coordinator fetches then `responder`.
     Paste {
         mime: String,

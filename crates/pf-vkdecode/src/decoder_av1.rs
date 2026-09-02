@@ -87,10 +87,17 @@ const OBU_FRAME: u8 = 6;
 /// and `tile_size_minus_1` as entropy data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Av1TileError {
-    Truncated { obu: usize },
-    NotAnObu { obu: usize },
+    Truncated {
+        obu: usize,
+    },
+    NotAnObu {
+        obu: usize,
+    },
     /// Only `OBU_TILE_GROUP` and `OBU_FRAME` carry tiles.
-    UnexpectedObu { obu: usize, obu_type: u8 },
+    UnexpectedObu {
+        obu: usize,
+        obu_type: u8,
+    },
     NoTiles,
     /// `obu_size` disagrees with the plan range. Last-tile size is implicit
     /// (whatever remains), so this is the only independent end-of-payload check.
@@ -101,7 +108,9 @@ pub enum Av1TileError {
     },
     Overflow,
     /// More tiles than [`AV1_MAX_NUM_TILES`] (the submission arrays).
-    TooManyTiles { tiles: usize },
+    TooManyTiles {
+        tiles: usize,
+    },
 }
 
 impl std::fmt::Display for Av1TileError {

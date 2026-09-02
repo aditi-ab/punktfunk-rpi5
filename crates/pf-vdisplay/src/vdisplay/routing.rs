@@ -419,8 +419,13 @@ pub enum TakeoverInapplicable {
 /// database's answer, matching `pf-dm-helper`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TakeoverVerdict {
-    Inapplicable { why: TakeoverInapplicable },
-    Ok { user: String, group: &'static str },
+    Inapplicable {
+        why: TakeoverInapplicable,
+    },
+    Ok {
+        user: String,
+        group: &'static str,
+    },
     /// Takeover applies and the user is **not** a member — every takeover
     /// degrades silently to mirroring the box's own session.
     MissingMembership {

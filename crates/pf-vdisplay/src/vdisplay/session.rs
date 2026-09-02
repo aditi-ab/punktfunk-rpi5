@@ -82,7 +82,9 @@ enum InstanceChange {
     Nothing,
     /// Bump the epoch. `invalidate` is the outgoing desktop whose kept nodes died with it;
     /// `None` when the outgoing session was gamescope / nothing (no pooled displays).
-    NewInstance { invalidate: Option<ActiveKind> },
+    NewInstance {
+        invalidate: Option<ActiveKind>,
+    },
 }
 
 /// Epoch rules, in one place so they can be unit-tested:

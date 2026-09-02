@@ -73,11 +73,7 @@ use super::steam_proto::{
 
 // USB device descriptor: Valve 28DE:1205, bcdUSB 2.00, bcdDevice 3.00.
 const DEV_DESC: [u8; 18] = [
-    18, 1, 0x00, 0x02,
-    0, 0, 0, 64,
-    0xDE, 0x28, 0x05, 0x12,
-    0x00, 0x03,
-    1, 2, 3, 1,
+    18, 1, 0x00, 0x02, 0, 0, 0, 64, 0xDE, 0x28, 0x05, 0x12, 0x00, 0x03, 1, 2, 3, 1,
 ];
 
 const HID_DT: u8 = 0x21;
@@ -467,9 +463,7 @@ fn handle_control(
                         1 => RDESC_KBD.to_vec(),
                         _ => RDESC_CTRL.to_vec(),
                     },
-                    HID_DT => {
-                        hid_desc_for(cfg, idx)
-                    },
+                    HID_DT => hid_desc_for(cfg, idx),
                     _ => {
                         ep0_stall(raw);
                         return;

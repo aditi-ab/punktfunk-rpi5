@@ -62,7 +62,7 @@ pub fn ask_plugin_launch(plugin: &str, key: &str) -> Option<PluginLaunch> {
              nothing to launch"
         );
         return None;
-    }
+    };
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(ASK_TIMEOUT))
         .build()

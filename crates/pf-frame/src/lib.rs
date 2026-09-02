@@ -10,6 +10,7 @@
 //! identity + D3D11 device).
 
 pub mod hdr;
+pub mod health;
 pub mod metronome;
 pub mod session_tuning;
 pub mod thread_qos;
