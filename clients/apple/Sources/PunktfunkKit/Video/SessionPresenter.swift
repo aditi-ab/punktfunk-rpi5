@@ -17,6 +17,8 @@ import QuartzCore
 import UIKit
 #endif
 
+private let presentLog = ClientLog(category: "present")
+
 /// Weak-target wrapper for CADisplayLink. The link retains its target, so targeting a view or
 /// presenter directly makes a `owner → link → owner` cycle that only `invalidate()` breaks — if a
 /// teardown is ever missed the owner leaks and keeps ticking. The proxy is what the link retains;
@@ -219,6 +221,12 @@ final class SessionPresenter {
     private var surfaceLayer: CALayer?
     #endif
     private var connection: PunktfunkConnection?
+    /// Re-runs this session's `start` with its own arguments — the wedged-presenter cure
+    /// (see `rebuildPresentation`). Set by `start`, cleared by `stop`. Main-thread only.
+    private var restart: (() -> Void)?
+    /// The last `layout` call, replayed after a rebuild so the new sublayer has a frame
+    /// before its first present. Main-thread only.
+    private var lastLayout: (bounds: CGRect, contentsScale: CGFloat)?
     /// The decoded frame's REAL pixel dimensions (ground truth, pushed by the view from the pump's
     /// `onDecodedSize` new-mode-IDR callback). Used for the aspect-fit in `layout` in preference to
     /// `connection.currentMode()`, which (a) lags a mid-stream resize — it only updates on the
@@ -244,13 +252,20 @@ final class SessionPresenter {
         decodeMeter: LatencyMeter? = nil,
         displayMeter: LatencyMeter? = nil,
         presentFloorMeter: LatencyMeter? = nil,
-        makeDisplayLink: (AnyObject, Selector) -> CADisplayLink,
+        makeDisplayLink: @escaping (AnyObject, Selector) -> CADisplayLink,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         stop()
         self.connection = connection
+        restart = { [weak self] in
+            self?.start(
+                connection: connection, baseLayer: baseLayer, endToEndMeter: endToEndMeter,
+                decodeMeter: decodeMeter, displayMeter: displayMeter,
+                presentFloorMeter: presentFloorMeter, makeDisplayLink: makeDisplayLink,
+                onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize)
+        }
 
         // Explicit decode stays default so loss recovery and decode metering survive. Presentation
         // is deadline Metal on iOS, the decoded video plane on tvOS, and arrival Metal on macOS.
@@ -295,6 +310,9 @@ final class SessionPresenter {
                    env: ProcessInfo.processInfo.environment["PUNKTFUNK_GATE_DEPTH"]),
                storePolicy: priority.storePolicy,
                vsyncPaced: vsyncPaced) {
+            pipeline.onPresentWedged = { [weak self] in
+                DispatchQueue.main.async { self?.rebuildPresentation() }
+            }
             let metal = pipeline.layer
             // Metal pacing overlays the idle video layer. The decoded path leaves the backing
             // video layer exposed and submits VideoToolbox output directly to its renderer.
@@ -396,6 +414,7 @@ final class SessionPresenter {
     ///
     /// No-op before a connection starts and for stage-1 beyond the harmless timing update.
     func layout(in bounds: CGRect, contentsScale: CGFloat) {
+        lastLayout = (bounds, contentsScale)
         guard let connection else { return }
         let mode = connection.currentMode()
         syncFrameRate(hz: mode.refreshHz)
@@ -492,10 +511,25 @@ final class SessionPresenter {
     }
     #endif
 
+    /// The pipeline's `onPresentWedged` cure, hopped to MAIN: rebuild the presentation the way
+    /// a reconnect does — fresh pipeline, presenter and CAMetalLayer — on the SAME connection.
+    /// The old pipeline stops (its `token` silences its `onSessionEnd`), the new pump asks the
+    /// host for an IDR because it starts without a format, and the replayed layout gives the
+    /// new sublayer its frame before the first vend. Field 2026-09-01 (iPad Pro / iOS 27):
+    /// a relink alone presented one frame and froze again; only this cured it. ~1 s of
+    /// freeze plus one IDR, against a session that otherwise never moves again.
+    private func rebuildPresentation() {
+        guard let restart else { return }
+        presentLog.error("presenter wedged — rebuilding pipeline, presenter and layer")
+        restart()
+        if let lastLayout { layout(in: lastLayout.bounds, contentsScale: lastLayout.contentsScale) }
+    }
+
     /// Stop the active pump/pipeline (≤ one poll timeout; stage-2 joins its pump) and detach the
     /// stage-2 layer + link. Does not close the connection — that stays with whoever owns it.
     /// Idempotent.
     func stop() {
+        restart = nil
         contentSize = nil // a new session re-derives it from its first frame
         pump?.stop()
         pump = nil

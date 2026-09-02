@@ -171,6 +171,19 @@ final class PresentPacingTests: XCTestCase {
         XCTAssertEqual(store.take(), 2)
     }
 
+    // MARK: - LinkStallPolicy (stage-4's stale-link ladder)
+
+    /// First stall relinks; a stall inside the window after that relink rebuilds (the field
+    /// shape: one vend, then silence); a link that ran clean past the window relinks afresh.
+    func testLinkStallPolicyRelinksOnceThenRebuilds() {
+        var policy = LinkStallPolicy(rebuildWindow: 2)
+        XCTAssertEqual(policy.onStall(now: 10), .relink, "the first stall gets a relink")
+        XCTAssertEqual(policy.onStall(now: 10.3), .rebuild, "a stall right after it rebuilds")
+        XCTAssertEqual(policy.onStall(now: 11.9), .rebuild, "still inside the window")
+        XCTAssertEqual(policy.onStall(now: 12.5), .relink, "a clean run past the window resets")
+        XCTAssertEqual(policy.onStall(now: 12.8), .rebuild)
+    }
+
     // MARK: - LatestBox (stage-4's drawable hand-off)
 
     /// Newest-wins hand-off: `put` replaces (an unpresented older drawable returns to the
