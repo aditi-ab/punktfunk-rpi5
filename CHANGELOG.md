@@ -41,6 +41,14 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   three new source sequences (republishes and cursor regens never count). Four episodes per ten
   minutes, a doubling cooldown after failed ones (10 s to 5 min), one summary per episode, and
   `owns_episode` so passive descriptor reactions stand down. Actuators wire in with WP6/WP7/WP14.
+- **`pf_win_display` has a display actor with a cached snapshot.** The display-events pump now
+  owns the CCD inventory read for hot paths: every `WM_DISPLAYCHANGE` / device broadcast schedules
+  one coalesced refresh (150 ms) instead of querying inside the window procedure, a 15 s safety
+  timer covers a missed broadcast, and a failed query keeps the last-known-good snapshot labelled
+  with its age and backs off (1 s doubling to 15 s). `display_events::{snapshot, request_refresh,
+  wait_for_change, refresh_and_wait}` are the API; `TargetInventory` gains `hdr`, `source_id` and
+  `source_adapter_luid`, and `CcdTargetKey` / `TargetInventory` move to the platform-neutral
+  `snapshot` module (re-exported from `win_display`). Readers migrate in the next step.
 - **IDD-push shared header v3 carries ring health.** The 88-byte header grows a 64-byte tail:
   a health state (`Initializing`/`Active`/`Rebuilding`/`Dead`), driver and host capability
   words negotiated by intersection, assignment and D3D-device epochs, a source sequence that

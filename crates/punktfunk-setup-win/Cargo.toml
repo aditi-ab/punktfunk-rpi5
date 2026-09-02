@@ -48,6 +48,8 @@ windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5
 windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = [
     # `UISettings.AnimationsEnabled` — the D9 slide honours the system animation switch.
     "UI_ViewManagement",
+    # Done's Copy button: the password onto the clipboard.
+    "ApplicationModel_DataTransfer",
     # The admin-only extract dir (WP3.1): an SDDL-built descriptor handed to CreateDirectoryW,
     # so the dir passes the host's `ensure_admin_only_source` by construction.
     "fileapi",

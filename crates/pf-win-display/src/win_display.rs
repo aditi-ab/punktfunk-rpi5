@@ -57,45 +57,9 @@ use windows::Win32::Graphics::Gdi::{
 
 use punktfunk_core::Mode;
 
-/// Complete Windows display-target identity. Target ids are only unique PER ADAPTER, so a helper
-/// that selects a path from a bare `u32` can resolve, isolate, move, or change HDR on a different
-/// adapter's same-numbered target on a hybrid box. Every public helper in this module that picks
-/// a path takes this key. The packed LUID matches `pf_frame::dxgi::pack_luid` (asserted by a
-/// cross-crate test in pf-capture).
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CcdTargetKey {
-    /// Packed adapter LUID (`(HighPart << 32) | (LowPart & 0xffff_ffff)`).
-    pub adapter_luid: i64,
-    pub target_id: u32,
-}
-
-impl CcdTargetKey {
-    pub fn new(adapter_luid: i64, target_id: u32) -> Self {
-        Self {
-            adapter_luid,
-            target_id,
-        }
-    }
-
-    /// Build from the split LUID the OS structs carry.
-    pub fn from_luid_parts(low: u32, high: i32, target_id: u32) -> Self {
-        Self {
-            adapter_luid: pack_luid_parts(low, high),
-            target_id,
-        }
-    }
-}
-
-impl std::fmt::Display for CcdTargetKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{:x}", self.target_id, self.adapter_luid)
-    }
-}
-
-/// The LUID packing every key uses — one formula, identical to `pf_frame::dxgi::pack_luid`.
-pub fn pack_luid_parts(low: u32, high: i32) -> i64 {
-    ((high as i64) << 32) | (low as i64 & 0xffff_ffff)
-}
+// The identity + inventory types live in the platform-neutral `snapshot` module (WP8) so the
+// cache rules test everywhere; re-exported here so every existing `win_display::` path still works.
+pub use crate::snapshot::{pack_luid_parts, CcdTargetKey, TargetInventory};
 
 /// The key of the TARGET side of a CCD path.
 pub(crate) fn path_target_key(p: &DISPLAYCONFIG_PATH_INFO) -> CcdTargetKey {
@@ -834,42 +798,6 @@ pub fn count_other_active(keep: &[CcdTargetKey]) -> Option<u32> {
     )
 }
 
-/// One connected target from a `QDC_ALL_PATHS` sweep. `external_physical` and
-/// `internal_panel` are the disturbance suspects (standby TV link-probe, dark
-/// eDP servicing). Indirect/virtual targets, including ours, are never suspects.
-pub struct TargetInventory {
-    /// Complete identity — target ids are only unique per adapter, so every selector keys on this.
-    pub key: CcdTargetKey,
-    /// The bare target id, for LOGS and display only — never select a path from it.
-    pub target_id: u32,
-    pub active: bool,
-    /// HDMI/DP/DVI/… — candidate for standby link-probe churn.
-    pub external_physical: bool,
-    /// eDP/LVDS/embedded — candidate for dark-head servicing when exclusive
-    /// isolate leaves the laptop panel connected-but-inactive.
-    pub internal_panel: bool,
-    pub tech: &'static str,
-    /// Empty when the EDID carries none.
-    pub friendly: String,
-    /// Maps to the PnP instance id (`monitor_devnode`).
-    pub monitor_device_path: String,
-    /// Ours ([`is_our_virtual_display`]) — the connector class cannot tell.
-    pub ours: bool,
-    /// Empty when inactive (no source).
-    pub gdi_name: String,
-    /// Pixels. All zero when inactive: CCD mode indices are only valid for
-    /// active paths.
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-    /// mHz (60000 = 60 Hz) from the path's `refreshRate` rational. 0 when
-    /// the path reports no rate.
-    pub refresh_mhz: u32,
-    /// Desktop origin sits on this head — Windows' "primary".
-    pub primary: bool,
-}
-
 /// EDID manufacturer id as it appears in the CCD path (`\\?\DISPLAY#PNK…`).
 /// Driver stamps `"PNK"` into EDID bytes 8-9 (`pf-vdisplay` `edid.rs`).
 const PF_EDID_MANUFACTURER: &str = "PNK";
@@ -912,11 +840,17 @@ fn utf16z_str(buf: &[u16]) -> String {
 }
 
 /// Connected targets (`QDC_ALL_PATHS`, unique by adapter+id). Read-only CCD;
-/// can serialize on the display-config lock — keep it off the capture thread.
+/// can serialize on the display-config lock — keep it off the capture thread. Empty on a failed
+/// query; the actor ([`crate::display_events`]) uses [`target_inventory_checked`] to tell that
+/// apart from an empty topology.
 pub fn target_inventory() -> Vec<TargetInventory> {
-    let Ok((paths, modes)) = query_display_config(QDC_ALL_PATHS) else {
-        return Vec::new();
-    };
+    target_inventory_checked().unwrap_or_default()
+}
+
+/// [`target_inventory`] with the query failure kept distinct from "no targets" (`Err`) — the
+/// display actor keeps its last-known-good snapshot on `Err` and publishes an empty one on `Ok`.
+pub fn target_inventory_checked() -> Result<Vec<TargetInventory>, CcdError> {
+    let (paths, modes) = query_display_config(QDC_ALL_PATHS)?;
     // Targets driven by an ACTIVE path, by complete key (target ids are only unique per adapter).
     let active: Vec<CcdTargetKey> = paths
         .iter()
@@ -956,7 +890,25 @@ pub fn target_inventory() -> Vec<TargetInventory> {
         // Inactive paths have INVALID modeInfoIdx — stay zeroed, do not index 0xffffffff.
         let (mut gdi_name, mut x, mut y, mut width, mut height) =
             (String::new(), 0i32, 0i32, 0u32, 0u32);
+        let (mut hdr, mut source_id, mut source_adapter_luid) = (None, 0u32, 0i64);
         if is_active {
+            source_id = p.sourceInfo.id;
+            source_adapter_luid = pack_luid_parts(
+                p.sourceInfo.adapterId.LowPart,
+                p.sourceInfo.adapterId.HighPart,
+            );
+            let mut ac = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
+            ac.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+            ac.header.size = size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
+            ac.header.adapterId = t.adapterId;
+            ac.header.id = t.id;
+            // SAFETY: `header.size` is this struct's size_of; the OS may touch that many bytes.
+            // The local outlives this synchronous call.
+            if unsafe { DisplayConfigGetDeviceInfo(&mut ac.header) } == 0 {
+                // SAFETY: POD union — `value` overlays a same-sized bitfield. Bit 1 =
+                // advancedColorEnabled (the same read as `advanced_color_enabled`).
+                hdr = Some((unsafe { ac.Anonymous.value } & 0x2) != 0);
+            }
             // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
             // every bit pattern is valid. Bounds-checked index below.
             let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
@@ -1004,9 +956,12 @@ pub fn target_inventory() -> Vec<TargetInventory> {
             width,
             height,
             refresh_mhz,
+            hdr,
+            source_id,
+            source_adapter_luid,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Crash-recovery journal for exclusive isolate: a marker so a fresh host can
