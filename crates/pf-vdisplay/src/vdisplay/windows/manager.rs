@@ -297,19 +297,6 @@ fn rounds_in_window(
     }
     recent.len() as u32
 }
-/// Longest pause between re-asserts once conceded.
-const REASSERT_BACKOFF_CAP: Duration = Duration::from_secs(60);
-
-/// Extra pause the watchdog inserts after re-assert round `fighting`: nothing up to the breaker,
-/// then the cadence doubles per round (`base`, `2·base`, …) up to [`REASSERT_BACKOFF_CAP`]. A
-/// clean cycle resets `fighting`, and with it the cadence.
-fn reassert_backoff(fighting: u32, base: Duration) -> Duration {
-    if fighting <= REASSERT_BREAKER_ROUNDS {
-        return Duration::ZERO;
-    }
-    let shift = (fighting - REASSERT_BREAKER_ROUNDS - 1).min(8);
-    (base * (1u32 << shift)).min(REASSERT_BACKOFF_CAP)
-}
 
 /// [`ShrinkAction`] a non-last-member teardown owes the group.
 ///
@@ -1040,6 +1027,12 @@ impl VirtualDisplayManager {
                 let mut fighting = 0u32;
                 // Every re-assert's stamp for the rolling count (the alternating fight).
                 let mut recent = std::collections::VecDeque::<Instant>::new();
+                // The breaker tripped: this group's isolate is CONCEDED. The desktop stays as
+                // the other actor keeps restoring it, the stream continues on it, and no further
+                // write (nor stream rebuild) is issued for the group's life. Measured live on
+                // `.173` with a real client: a doubling back-off still cost the client a
+                // capture+encoder rebuild per re-assert, every 2, 4, 8 s.
+                let mut conceded = false;
                 'watch: loop {
                     // Subscribe to the display actor's topology generation (immunity plan WP9):
                     // wake early when a snapshot lands, else at the interval — sliced so stop+join
@@ -1095,6 +1088,14 @@ impl VirtualDisplayManager {
                         fighting = 0;
                         continue;
                     }
+                    if conceded {
+                        tracing::debug!(
+                            survivors,
+                            "exclusive topology conceded — a non-managed display is active and \
+                             stays so; not re-asserting"
+                        );
+                        continue;
+                    }
                     fighting += 1;
                     recent.push_back(Instant::now());
                     let rounds = fighting.max(rounds_in_window(
@@ -1102,6 +1103,19 @@ impl VirtualDisplayManager {
                         Instant::now(),
                         REASSERT_WINDOW,
                     ));
+                    if rounds >= REASSERT_BREAKER_ROUNDS {
+                        tracing::error!(
+                            survivors,
+                            rounds,
+                            "exclusive topology keeps being re-activated (4 re-asserts in a row \
+                             or within a minute) — something on this host is fighting the \
+                             isolate; CONCEDING for this session: the display stays active, the \
+                             stream continues on the shared desktop, no further re-assert"
+                        );
+                        pf_win_display::topology_churn::release();
+                        conceded = true;
+                        continue;
+                    }
                     // The re-assert is a topology TRANSACTION (immunity plan WP10): it holds
                     // descriptor-following (samples until "stable again" are the transient
                     // eviction state) for interval + 3 s, swap-chain bounce included, and is
@@ -1111,27 +1125,13 @@ impl VirtualDisplayManager {
                         "exclusive-reassert",
                         interval + Duration::from_secs(3),
                     );
-                    match rounds {
-                        1..=3 => tracing::warn!(
-                            survivors,
-                            round = rounds,
-                            "exclusive topology lost — a non-managed display re-activated after \
-                             the verified isolate (hybrid-GPU driver / display-poller software \
-                             restoring the saved layout?); re-asserting the isolate"
-                        ),
-                        REASSERT_BREAKER_ROUNDS => tracing::error!(
-                            survivors,
-                            "exclusive topology keeps being re-activated (4 re-asserts in a \
-                             row or within a minute) — something on this host is fighting the \
-                             isolate; conceding the fixed cadence: further re-asserts back off \
-                             (2 s doubling to 60 s) and log at DEBUG"
-                        ),
-                        _ => tracing::debug!(
-                            survivors,
-                            round = rounds,
-                            "re-asserting exclusive topology"
-                        ),
-                    }
+                    tracing::warn!(
+                        survivors,
+                        round = rounds,
+                        "exclusive topology lost — a non-managed display re-activated after the \
+                         verified isolate (hybrid-GPU driver / display-poller software restoring \
+                         the saved layout?); re-asserting the isolate"
+                    );
                     let outcome = isolate_displays_ccd_checked_seam(&keep).map(|(_, o)| o);
                     let changed = matches!(
                         outcome,
@@ -1157,13 +1157,6 @@ impl VirtualDisplayManager {
                     // write is not a recovery incident for the stream to react to).
                     if changed {
                         TOPOLOGY_REASSERT_GEN.fetch_add(1, Ordering::Relaxed);
-                    }
-                    // Circuit breaker: past the breaker rounds, pause before the next round.
-                    let mut pause = reassert_backoff(rounds, interval);
-                    while !pause.is_zero() && !stop_t.load(Ordering::Relaxed) {
-                        let slice = Duration::from_millis(250).min(pause);
-                        thread::sleep(slice);
-                        pause -= slice;
                     }
                 }
             });
@@ -2308,8 +2301,8 @@ pub(crate) fn force_release(slot: Option<u64>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        needs_resize, reassert_backoff, rounds_in_window, shrink_action, Mode, ShrinkAction,
-        REASSERT_BACKOFF_CAP, REASSERT_BREAKER_ROUNDS, REASSERT_WINDOW,
+        needs_resize, rounds_in_window, shrink_action, Mode, ShrinkAction, REASSERT_BREAKER_ROUNDS,
+        REASSERT_WINDOW,
     };
     use std::time::{Duration, Instant};
 
@@ -2331,7 +2324,6 @@ mod tests {
             rounds, REASSERT_BREAKER_ROUNDS,
             "four rounds in 16 s trip the breaker"
         );
-        assert!(!reassert_backoff(rounds + 1, Duration::from_secs(2)).is_zero());
         // A minute later the window has drained and a lone re-add is a lone re-add again.
         let later = t0 + REASSERT_WINDOW + Duration::from_secs(20);
         recent.push_back(later);
@@ -2365,38 +2357,6 @@ mod tests {
     #[test]
     fn exclusivity_decides_without_a_snapshot() {
         assert_eq!(shrink_action(true, false), ShrinkAction::Reisolate);
-    }
-
-    /// The re-assert circuit breaker (immunity plan WP10 item 6): fixed cadence up to the breaker
-    /// round, then a doubling pause capped at a minute — and nothing at all once a cycle is clean.
-    #[test]
-    fn reassert_backoff_concedes_the_fixed_cadence_after_the_breaker() {
-        let base = Duration::from_secs(2);
-        for round in 0..=REASSERT_BREAKER_ROUNDS {
-            assert_eq!(
-                reassert_backoff(round, base),
-                Duration::ZERO,
-                "round {round}"
-            );
-        }
-        assert_eq!(reassert_backoff(REASSERT_BREAKER_ROUNDS + 1, base), base);
-        assert_eq!(
-            reassert_backoff(REASSERT_BREAKER_ROUNDS + 2, base),
-            base * 2
-        );
-        assert_eq!(
-            reassert_backoff(REASSERT_BREAKER_ROUNDS + 5, base),
-            base * 16
-        );
-        assert_eq!(
-            reassert_backoff(REASSERT_BREAKER_ROUNDS + 6, base),
-            REASSERT_BACKOFF_CAP
-        );
-        assert_eq!(
-            reassert_backoff(u32::MAX, base),
-            REASSERT_BACKOFF_CAP,
-            "no overflow"
-        );
     }
 
     /// Session re-asks the negotiated rate on every rebuild; that must join
