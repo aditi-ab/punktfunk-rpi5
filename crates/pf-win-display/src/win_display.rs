@@ -1190,6 +1190,30 @@ pub mod isolate_journal {
 // pub so vdisplay::pf_vdisplay can reuse this backend-neutral CCD isolation helper
 // (it operates on real OS target ids — a pf-vdisplay monitor's target_id qualifies).
 pub fn isolate_displays_ccd(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
+    isolate_displays_ccd_checked(keep).map(|(saved, _)| saved)
+}
+
+/// What [`isolate_displays_ccd_checked`] observed — the truthful input a re-assert watchdog or a
+/// recovery generation needs (immunity plan WP10 item 4: a recovery generation moves only after
+/// an OBSERVED change, never because a `SetDisplayConfig` was attempted).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsolateOutcome {
+    /// The verification read showed only the keep set active. `deactivated` is how many paths
+    /// THIS call switched off on the successful attempt (0 = the desktop already matched).
+    Verified { attempts: u32, deactivated: u32 },
+    /// No display path was active at all — nothing to isolate.
+    NothingActive,
+    /// Every attempt left a non-keep path active or its verification read failed: state UNKNOWN.
+    Unverified { attempts: u32 },
+}
+
+/// [`isolate_displays_ccd`] with the outcome kept distinct from the restore snapshot: `None` only
+/// when the initial CCD read failed (nothing was attempted); otherwise the pre-isolate config plus
+/// what the verification observed. Callers that mutate on the strength of the result (the
+/// exclusive re-assert watchdog) read the outcome; acquire keeps the `Option<SavedConfig>` shape.
+pub fn isolate_displays_ccd_checked(
+    keep: &[CcdTargetKey],
+) -> Option<(SavedConfig, IsolateOutcome)> {
     // Snapshot the ORIGINAL active config ONCE for restore-on-teardown, before any changes.
     let saved = query_active_config()?;
 
@@ -1200,7 +1224,7 @@ pub fn isolate_displays_ccd(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
             "display isolate (CCD): no display path is active — nothing to isolate for target set \
              {keep:?} (every panel off/standby, or a headless host)"
         );
-        return Some(saved);
+        return Some((saved, IsolateOutcome::NothingActive));
     }
 
     // Journal what we are about to switch off BEFORE the first apply, not after a verified one: the
@@ -1296,7 +1320,13 @@ pub fn isolate_displays_ccd(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
                 tracing::info!(
                     "display isolate (CCD): target set {keep:?} is the SOLE active desktop (attempt {attempt}/4, deactivated {others}, rc={rc:#x})"
                 );
-                return Some(saved);
+                return Some((
+                    saved,
+                    IsolateOutcome::Verified {
+                        attempts: attempt,
+                        deactivated: others,
+                    },
+                ));
             }
             Some(survivors) => tracing::warn!(
                 "display isolate (CCD): {survivors} display(s) STILL active after attempt {attempt}/4 (deactivated {others}, rc={rc:#x}) — re-querying + retrying"
@@ -1317,7 +1347,7 @@ pub fn isolate_displays_ccd(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
         "display isolate (CCD): failed to isolate target set {keep:?} after 4 attempts — still active or unverifiable: [{}] (field-reported exclusive-mode bug)",
         survivors.join(", ")
     );
-    Some(saved)
+    Some((saved, IsolateOutcome::Unverified { attempts: 4 }))
 }
 
 // Do not add an eviction without SDC_FORCE_MODE_ENUMERATION: a topology change
