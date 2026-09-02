@@ -174,6 +174,25 @@ else
   printf '  FAIL setup_webapp aborted before the menu on a clean box\n'; fails=$((fails + 1))
 fi
 
+echo "bar widget"
+
+# The shell registers a freshly copied plugin asynchronously, so `plugin_known` must poll the
+# list rather than trust the first answer. The stub lists punktfunk from its third call on.
+mkdir -p "$WORK/om/bin"
+cat > "$WORK/om/bin/omarchy" <<'EOF'
+#!/bin/sh
+n=$(cat "$OM_CALLS" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$OM_CALLS"
+[ "$1 $2" = "plugin list" ] && [ "$n" -ge 3 ] && echo "punktfunk   enabled   third-party bar-widget   Punktfunk"
+exit 0
+EOF
+chmod +x "$WORK/om/bin/omarchy"
+if OM_CALLS="$WORK/om/calls" PATH="$WORK/om/bin:$PATH" plugin_known >/dev/null 2>&1 &&
+   [[ "$(cat "$WORK/om/calls")" -ge 3 ]]; then
+  printf '  ok   plugin_known waits for the shell to list the plugin\n'
+else
+  printf '  FAIL plugin_known gave up before the shell listed the plugin\n'; fails=$((fails + 1))
+fi
+
 echo "setup options"
 
 # The installer asks for every optional step on its own screen and passes the answers here, so
