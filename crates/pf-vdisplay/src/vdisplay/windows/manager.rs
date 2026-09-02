@@ -2312,10 +2312,9 @@ mod tests {
     fn an_alternating_fight_reaches_the_breaker_through_the_window() {
         let t0 = Instant::now();
         let mut recent = std::collections::VecDeque::new();
-        let mut consecutive = 0u32;
         let mut rounds = 0;
         for i in 0..REASSERT_BREAKER_ROUNDS {
-            consecutive = 1; // a clean cycle in between reset it
+            let consecutive = 1u32; // a clean cycle in between reset it
             let now = t0 + Duration::from_secs(4 * u64::from(i));
             recent.push_back(now);
             rounds = consecutive.max(rounds_in_window(&mut recent, now, REASSERT_WINDOW));
