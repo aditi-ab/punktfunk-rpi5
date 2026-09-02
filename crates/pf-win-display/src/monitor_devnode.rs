@@ -506,4 +506,29 @@ mod tests {
         assert_eq!(decoded[0].generation, 0);
         assert!(decode_journal(b"not json").is_empty());
     }
+
+    /// LIVE (elevated console session, `PUNKTFUNK_CONFIG_DIR` pointing at a journal a previous
+    /// run left behind): the replay re-enables every leased devnode and empties the journal —
+    /// the WP11 restart gate. A box with no leftover passes trivially.
+    #[test]
+    #[ignore = "live: needs an elevated console session and a leftover journal"]
+    fn live_startup_recover_replays_the_lease_journal() {
+        let before = read_journal();
+        eprintln!("leftover leases before: {before:?}");
+        startup_recover();
+        let after = read_journal();
+        eprintln!("leftover leases after: {after:?}");
+        assert!(
+            after.is_empty(),
+            "every leftover lease must re-enable on replay: {after:?}"
+        );
+        for lease in before {
+            assert_eq!(
+                devnode_enabled(&lease.id),
+                Some(true),
+                "{} must read enabled after the replay",
+                lease.id
+            );
+        }
+    }
 }
