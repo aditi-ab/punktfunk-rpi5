@@ -1118,10 +1118,10 @@ impl VirtualDisplayManager {
                         ),
                         REASSERT_BREAKER_ROUNDS => tracing::error!(
                             survivors,
-                            "exclusive topology keeps being re-activated (4 consecutive \
-                             re-asserts) — something on this host is fighting the isolate; \
-                             conceding the fixed cadence: further re-asserts back off (2 s \
-                             doubling to 60 s) and log at DEBUG"
+                            "exclusive topology keeps being re-activated (4 re-asserts in a \
+                             row or within a minute) — something on this host is fighting the \
+                             isolate; conceding the fixed cadence: further re-asserts back off \
+                             (2 s doubling to 60 s) and log at DEBUG"
                         ),
                         _ => tracing::debug!(
                             survivors,
