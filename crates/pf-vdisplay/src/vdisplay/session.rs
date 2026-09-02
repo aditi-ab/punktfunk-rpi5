@@ -1,68 +1,55 @@
-//! Live graphical-session detection + session-epoch + process-env retargeting (plan §W3 — the
-//! self-contained subsystem carved out of [`super`]). Detects the active compositor/session
-//! ([`detect_active_session`]), tracks the session epoch so pooled displays never outlive their
-//! compositor instance, and retargets the process env at the live session ([`apply_session_env`],
-//! [`settle_desktop_portal`]) under `super::ENV_LOCK`.
+//! Live graphical-session detection, session epoch, and process-env retargeting.
+//!
+//! [`detect_active_session`] names the compositor running for this uid.
+//! [`observe_session_instance`] bumps the session epoch when that compositor
+//! *instance* changes, so the registry cannot reuse a PipeWire node id from a
+//! dead desktop. [`apply_session_env`] writes the live session into the process
+//! env under [`super::ENV_LOCK`]; [`settle_desktop_portal`] pushes it into
+//! systemd `--user` / D-Bus activation so a mid-stream switch does not leave
+//! the portal talking to the old socket.
+//!
+//! Evidence: `design/gamemode-and-dedicated-sessions.md`,
+//! `design/hyprland-support.md`.
 
 use super::*;
 
-/// Budget for one `systemctl --user` / `dbus-update-activation-environment` call.
-///
-/// These talk to the session bus, and a bus that is itself restarting or wedged answers nothing —
-/// unbounded, that pinned the caller (on the host, the session's stream thread) forever. A restart
-/// of the portal units is the slowest legitimate case, hence the generous window; missing it just
-/// means the portal env settles late, which the callers already treat as best-effort.
+/// Upper bound for one `systemctl --user` / `dbus-update-activation-environment`.
+/// A restarting session bus never answers; unbounded that hangs the stream thread.
+/// 10 s covers a portal-unit restart; a miss means settle late (callers are best-effort).
 #[cfg(target_os = "linux")]
 const SYSTEMD_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The **session epoch** — bumped whenever session detection observes a different compositor
-/// *instance*: an [`ActiveKind`] change, **or** a new compositor PID for the same kind (the
-/// Desktop→Game→Desktop bounce that brings up a fresh KWin/gamescope with an unrelated node-id space).
-/// Pooled displays stamp the epoch at creation; the registry only reuses an entry whose epoch still
-/// matches, and its linger timer reaps entries from dead epochs — so a switch can never hand back a
-/// node id that now means nothing (`design/gamemode-and-dedicated-sessions.md` A4).
+/// Bumped when detection sees a different compositor instance (kind change, or same kind new PID).
+/// Pooled displays stamp this at create; the registry reuses only a matching epoch and reaps the
+/// rest, so a Desktop→Game→Desktop bounce cannot hand back a node id from the dead compositor.
 static SESSION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// The current [session epoch](SESSION_EPOCH). Read by the registry at acquire (to stamp new entries
-/// and gate reuse) and by its linger timer (to reap dead-epoch zombies).
 pub fn session_epoch() -> u64 {
     SESSION_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Bump the [session epoch](SESSION_EPOCH) — call when session detection sees a new compositor
-/// instance (kind change, or same-kind new PID). Returns the new value.
 pub fn bump_session_epoch() -> u64 {
     SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
-/// The last-observed compositor instance `(kind, pid)`, so [`observe_session_instance`] can tell a
-/// genuine instance change from a stable re-detect.
+/// Last observed `(kind, pid)`, so [`observe_session_instance`] can tell a restart from a re-detect.
 static LAST_INSTANCE: std::sync::Mutex<Option<(ActiveKind, Option<u32>)>> =
     std::sync::Mutex::new(None);
 
-/// Observe the freshly-[detected](detect_active_session) live session and, if the compositor
-/// *instance* changed since the last observation — a different [`ActiveKind`], **or** the same kind
-/// with a new PID (a compositor restart / Desktop→Game→Desktop bounce) — bump the [session
-/// epoch](SESSION_EPOCH) and [invalidate](registry::invalidate_backend) the previous backend's kept
-/// displays, so a reconnect can never reuse a node id from the dead instance (A4). Idempotent per
-/// instance; the first observation just records the baseline. Cheap on the steady state (one mutex
-/// read); the registry lock is taken only on an actual change. Call from every site that detects the
-/// session (the per-connect resolve, the mid-stream watcher, the capture-loss re-detect).
+/// If the live compositor instance changed — different [`ActiveKind`], or same kind new PID —
+/// bump [`SESSION_EPOCH`] and drop the previous backend's kept displays.
+/// Idempotent per instance. Call from every site that detects the session.
 pub fn observe_session_instance(active: &ActiveSession) {
     let cur = (active.kind, active.compositor_pid);
-    // DECIDE under the lock, ACT outside it. The action below drops keep-alive displays through the
-    // registry lock and shells out to `systemctl` on a 10 s budget; holding a process-wide mutex
-    // across that blocks every other detector — and this runs from the per-connect resolve, the
-    // mid-stream switch watcher AND the capture-loss re-detect. The baseline is advanced inside the
-    // lock too, so a concurrent observer sees the new instance and cannot run the action twice.
+    // Decide under the lock, act outside it. The action takes the registry lock and shells out
+    // to `systemctl` on a 10 s budget; holding LAST_INSTANCE across that blocks every detector.
+    // Advance the baseline inside the lock so a concurrent observer cannot run the action twice.
     let changed = {
         let mut last = LAST_INSTANCE.lock().unwrap_or_else(|e| e.into_inner());
         let prev = *last;
-        // A `None` scan result is NOT an observation (see [`classify_instance_change`]), so it must
-        // not become the baseline either: recording it would make the NEXT poll — the one that sees
-        // the still-running desktop again — read as `None → DesktopKde`, i.e. a fresh instance, and
-        // bump the epoch out from under every pooled display. Leave the baseline on the last REAL
-        // instance and a transient miss is fully inert, in both directions.
+        // `None` is not an observation ([`classify_instance_change`]). Recording it as the
+        // baseline would make the next real desktop look like `None → Desktop` and bump the
+        // epoch under live pooled displays. Leave the last real instance; a miss is inert.
         if cur.0 != ActiveKind::None {
             *last = Some(cur);
         }
@@ -70,17 +57,12 @@ pub fn observe_session_instance(active: &ActiveSession) {
     };
     if let Some(prev) = changed {
         if let InstanceChange::NewInstance { invalidate } = classify_instance_change(prev, cur) {
-            // Invalidate only the OLD backend, and only if it was a desktop compositor (never gamescope).
             if let Some(old_kind) = invalidate {
                 if let Some(old) = compositor_for_kind(old_kind) {
                     registry::invalidate_backend(old.id());
                 }
-                // The dead desktop's socket vars may still sit in the systemd --user manager env
-                // ([`settle_desktop_portal`]'s import-environment) — scrub them NOW, or the next
-                // `gamescope-session.target` start inherits a stale WAYLAND_DISPLAY and gamescope
-                // runs NESTED against the dead desktop socket instead of becoming the display
-                // server ("Failed to connect to wayland socket: wayland-0" — kept a Deck's Game
-                // Mode from starting at all, observed live 2026-07-21).
+                // Dead desktop WAYLAND_DISPLAY may still sit in systemd --user. Scrub now or
+                // the next `gamescope-session.target` starts nested on the dead socket.
                 scrub_desktop_manager_env();
             }
             let epoch = bump_session_epoch();
@@ -94,39 +76,25 @@ pub fn observe_session_instance(active: &ActiveSession) {
     }
 }
 
-/// What a `prev` → `cur` observation means for the session epoch — the pure core of
-/// [`observe_session_instance`], so the (surprisingly load-bearing) rules below are unit-tested
-/// without the process-global baseline.
+/// Pure `prev` → `cur` classification, unit-tested without the process-global baseline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InstanceChange {
-    /// The same instance, or a change the epoch does not track — do nothing.
     Nothing,
-    /// A new compositor instance: bump the epoch. `invalidate` names the OUTGOING desktop
-    /// compositor whose kept displays must be dropped (its PipeWire nodes died with it); `None`
-    /// when the outgoing session was gamescope / nothing, which owns no pooled displays.
+    /// Bump the epoch. `invalidate` is the outgoing desktop whose kept nodes died with it;
+    /// `None` when the outgoing session was gamescope / nothing (no pooled displays).
     NewInstance { invalidate: Option<ActiveKind> },
 }
 
-/// The epoch's rules, in one place:
+/// Epoch rules, in one place so they can be unit-tested:
 ///
-/// * A `cur` of [`ActiveKind::None`] is **never** a change. `detect_active_session` answers `None`
-///   both for "no graphical session is running" and for a scan that simply saw nothing — its whole
-///   probe hangs off `if let Ok(entries) = std::fs::read_dir("/proc")`, and every per-PID rung
-///   (`metadata`, `match_name`) can lose a race with a re-exec. Treating that as "the desktop
-///   changed" ran `registry::invalidate_backend`, which removes pool entries in ANY lifecycle state
-///   — Active ones included — so one unlucky `/proc` read tore down displays that were mid-stream,
-///   and scrubbed the live session's socket vars out of the systemd `--user` manager on the way.
-///   A real logout is picked up by the NEXT real observation (a different kind, or the same kind at
-///   a new PID), which is the evidence-carrying end of the same transition.
-/// * Only a **desktop** compositor (KWin / Mutter / wlroots) instance change counts. A **gamescope**
-///   session ([`ActiveKind::Gaming`]) is not the epoch's subject: the box's game-mode / managed
-///   gamescope isn't pooled, and dedicated **spawns** are independent nested sessions whose nodes
-///   outlive any active-session change. So a game-mode gamescope restart, a Gaming↔Gaming
-///   winning-PID flap (e.g. B1 stopping the autologin before a dedicated spawn), or a
-///   coexisting-gamescope set change must NOT bump/invalidate — that would tear down a live/kept
-///   dedicated session (review findings #6/#7/#10).
-/// * A same-kind PID change IS a change: a fresh KWin's node-id space is unrelated to the dead
-///   one's (A4).
+/// * [`ActiveKind::None`] is never a change. Detection answers `None` both for
+///   "no session" and for a `/proc` race; treating that as a logout dropped live
+///   pool entries and scrubbed the live session's socket vars. A real logout is
+///   the next real observation.
+/// * Only a **desktop** compositor instance change counts. Gamescope is not
+///   pooled, and a dedicated spawn's nodes outlive any active-session change, so
+///   Gaming↔Gaming flaps must not bump or invalidate.
+/// * A same-kind PID change is a change: a fresh KWin's node-id space is unrelated.
 fn classify_instance_change(
     prev: (ActiveKind, Option<u32>),
     cur: (ActiveKind, Option<u32>),
@@ -142,13 +110,9 @@ fn classify_instance_change(
     }
 }
 
-/// Counterpart to [`settle_desktop_portal`]'s `import-environment`: drop the desktop session's
-/// socket vars from the systemd `--user` manager env once that desktop instance is GONE. They
-/// persist in the manager otherwise, and every later user unit inherits them — including
-/// `gamescope-session.target`, whose gamescope then aborts trying to attach to the dead desktop
-/// socket. Best-effort; the D-Bus activation env has no unset op, but gamescope-session is
-/// systemd-started, so the manager scrub is the one that matters. (A desktop restart re-imports
-/// via the next [`settle_desktop_portal`], so scrubbing on a bounce is harmless.)
+/// Drop the dead desktop's socket vars from systemd `--user` so a later `gamescope-session.target`
+/// does not inherit them and nest against the dead socket. Best-effort; D-Bus activation has no
+/// unset. A desktop restart re-imports via [`settle_desktop_portal`].
 #[cfg(target_os = "linux")]
 fn scrub_desktop_manager_env() {
     let _ = crate::proc::status_within(
@@ -165,9 +129,7 @@ fn scrub_desktop_manager_env() {
 #[cfg(not(target_os = "linux"))]
 fn scrub_desktop_manager_env() {}
 
-/// Is `kind` a **desktop** compositor (KWin / Mutter / wlroots) — one whose kept PipeWire outputs die
-/// with the compositor instance, so the session epoch tracks it? `Gaming` (gamescope) and `None` are
-/// not (gamescope spawns are independent nested sessions — see [`observe_session_instance`]).
+/// Desktop compositor whose kept PipeWire outputs die with the instance. `Gaming` / `None` are not.
 fn is_desktop_kind(kind: ActiveKind) -> bool {
     matches!(
         kind,
@@ -178,74 +140,53 @@ fn is_desktop_kind(kind: ActiveKind) -> bool {
     )
 }
 
-/// The kind of graphical session live for our uid *right now* — the basis for per-connect backend
-/// selection on a box that flips between Steam Gaming Mode and a KDE/GNOME desktop (Bazzite,
-/// SteamOS). Detected by probing which compositor process is actually running, not by a static
-/// env var, so the host follows the box as the user switches sessions.
+/// Graphical session live for this uid right now. Probed from the running compositor, not a static
+/// env var, so the host follows a box that flips between Steam Gaming Mode and a desktop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveKind {
-    /// A `gamescope` session is live (Steam Gaming Mode / `gamescope-session-plus`).
     Gaming,
-    /// A KWin / Plasma desktop is live.
     DesktopKde,
-    /// A GNOME / Mutter desktop is live.
     DesktopGnome,
-    /// A wlroots-proper (Sway / River) desktop is live.
     DesktopWlroots,
-    /// A Hyprland desktop is live (distinct from [`DesktopWlroots`](ActiveKind::DesktopWlroots):
-    /// its own `hyprctl` IPC + xdph portal, though it shares the wlr virtual-input path).
+    /// Distinct from [`DesktopWlroots`](ActiveKind::DesktopWlroots): own `hyprctl` IPC + xdph
+    /// portal, though it shares the wlr virtual-input path.
     DesktopHyprland,
-    /// No recognized graphical session is running for our uid.
     None,
 }
 
-/// The session environment that points a backend at the [detected](detect_active_session) active
-/// session: the Wayland socket (for the Wayland-protocol backends), the runtime dir + session bus
-/// (for PipeWire capture + D-Bus / portal input), and the desktop name (for portal routing). The
-/// host serves one session at a time, so [`apply_session_env`] writes the first four into the
-/// process env per connect and every backend that reads them then opens against the live session.
-/// The last two are a *description* of the session, not something exported — their readers are
-/// `hyprctl` and `swaymsg`, which get them per spawn (see [`hypr_signature`] / [`sway_socket`]).
+/// Env that points a backend at the detected session. [`apply_session_env`] writes the first four
+/// into the process env; `hyprland_signature` / `sway_socket` are per-spawn (`Command::env`) because
+/// `hyprctl` / `swaymsg` are children we launch, not process-wide readers.
 #[derive(Clone, Debug, Default)]
 pub struct SessionEnv {
-    /// `WAYLAND_DISPLAY` of the live compositor (`None` for Gaming-attach / Mutter, which are
-    /// PipeWire-node / D-Bus driven and don't talk Wayland to us).
+    /// `WAYLAND_DISPLAY` of the live compositor. `None` for Gaming-attach / Mutter (PipeWire /
+    /// D-Bus; they never talk Wayland to us).
     pub wayland_display: Option<String>,
-    /// `/run/user/<uid>` — the trustworthy anchor (the default PipeWire daemon + bus live here).
+    /// Per-user runtime dir (PipeWire + session bus). Never a world-writable `/tmp`.
     pub xdg_runtime_dir: String,
-    /// `DBUS_SESSION_BUS_ADDRESS` (defaults to `unix:path=<runtime>/bus`).
     pub dbus_session_bus_address: String,
-    /// `XDG_CURRENT_DESKTOP` to advertise (KDE/GNOME/sway/Hyprland/gamescope) — drives portal/EIS
-    /// routing (xdph keys its Hyprland-specific behavior off `Hyprland`).
+    /// `XDG_CURRENT_DESKTOP` (KDE/GNOME/sway/Hyprland/gamescope). Drives portal/EIS routing;
+    /// xdph keys Hyprland-specific behavior off `Hyprland`.
     pub xdg_current_desktop: Option<String>,
-    /// `HYPRLAND_INSTANCE_SIGNATURE` of the live Hyprland instance (`Some` only for
-    /// [`ActiveKind::DesktopHyprland`]). `hyprctl` needs it to reach the right instance socket, and
-    /// it is handed to that child directly ([`hypr_signature`]) so the systemd-`--user` host works
-    /// without inheriting the session env. `None` for every other compositor.
+    /// `HYPRLAND_INSTANCE_SIGNATURE` (`Some` only for [`ActiveKind::DesktopHyprland`]).
+    /// Handed to `hyprctl` per spawn ([`hypr_signature`]) so a systemd `--user` host need not
+    /// inherit the session env.
     pub hyprland_signature: Option<String>,
-    /// `SWAYSOCK` of the live sway instance (`Some` only for a sway [`ActiveKind::DesktopWlroots`]).
-    /// `swaymsg` needs it, and it was the LAST session variable the host could not derive: a
-    /// `systemd --user` host that never inherited the login shell's environment had no sway IPC at
-    /// all, so output enumeration and the chooser both failed. Derived from the detected compositor
-    /// PID like the Hyprland signature above, and likewise handed straight to the child
-    /// ([`sway_socket`]). `None` on river (wlroots, but no sway IPC) and every other compositor.
+    /// `SWAYSOCK` (`Some` only for sway [`ActiveKind::DesktopWlroots`]). Same per-spawn handoff
+    /// as [`hypr_signature`]. `None` on river (wlroots, no sway IPC).
     pub sway_socket: Option<String>,
 }
 
-/// The live session: its [`ActiveKind`] plus the [`SessionEnv`] to target it.
 pub struct ActiveSession {
     pub kind: ActiveKind,
     pub env: SessionEnv,
-    /// PID of the winning compositor process (`None` when nothing live). The session watcher compares
-    /// it across polls so a **same-kind** compositor restart (Desktop→Game→Desktop) bumps the session
-    /// epoch — a fresh instance's node-id space is unrelated to the old one's (A4).
+    /// Winning compositor PID (`None` if nothing live). Compared across polls so a same-kind restart
+    /// bumps the epoch — a fresh instance's node-id space is unrelated.
     pub compositor_pid: Option<u32>,
 }
 
 impl ActiveSession {
-    /// A "nothing live" result carrying just the runtime-dir anchor.
-    // Only the non-Linux `detect_active_session` calls this (below); Linux always has a real
-    // session to describe.
+    // Linux always has a real session to describe; only the non-Linux stub calls this.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     fn none() -> ActiveSession {
         let probe = EnvProbe::sample();
@@ -261,7 +202,6 @@ impl ActiveSession {
     }
 }
 
-/// The concrete backend that drives a given live-session kind. `None` for [`ActiveKind::None`].
 pub fn compositor_for_kind(kind: ActiveKind) -> Option<Compositor> {
     match kind {
         ActiveKind::Gaming => Some(Compositor::Gamescope),
@@ -273,20 +213,12 @@ pub fn compositor_for_kind(kind: ActiveKind) -> Option<Compositor> {
     }
 }
 
-/// The session-scoped variables detection reads, sampled ONCE under [`ENV_LOCK`].
+/// Session-scoped vars, sampled once under [`ENV_LOCK`].
 ///
-/// Detection used to call `std::env::var` at five points spread across a `/proc` scan, none of them
-/// holding the lock its own writers take — the getenv/setenv data race [`crate::ENV_LOCK`]'s doc
-/// describes as UB that "could crash the host" (glibc `setenv` can realloc `environ` and free the
-/// old value string under a concurrent reader). Sampling up front closes that.
-///
-/// Sampling rather than simply taking the lock for the whole of [`detect_active_session`] is
-/// deliberate: that function runs every second from the host's session watcher and scans `/proc`,
-/// and holding a process-wide lock across a directory walk trades one problem for another. The
-/// snapshot costs one acquisition and five reads with no syscalls in between.
-///
-/// It also makes the readers below pure functions of their inputs, which is what lets the tests
-/// exercise them without mutating process-global state.
+/// Detection must not call `std::env::var` mid-scan: writers take this lock, and glibc `setenv`
+/// can realloc `environ` under a concurrent reader. Sampling up front is one acquisition; holding
+/// the lock across the `/proc` walk would stall every other env reader for a directory walk that
+/// the session watcher runs every second. Readers below are then pure in their inputs.
 #[derive(Clone, Debug, Default)]
 struct EnvProbe {
     xdg_runtime_dir: Option<String>,
@@ -297,8 +229,8 @@ struct EnvProbe {
 }
 
 impl EnvProbe {
-    /// Every var is `filter`ed non-empty: `Ok("")` is not a usable runtime dir or socket path, and
-    /// treating it as one is how an empty `XDG_RUNTIME_DIR` used to yield a *relative* path.
+    /// Drop `Ok("")`: an empty `XDG_RUNTIME_DIR` is not a path, and treating it as one yields a
+    /// relative path off CWD.
     fn sample() -> EnvProbe {
         fn v(k: &str) -> Option<String> {
             std::env::var(k).ok().filter(|s| !s.is_empty())
@@ -313,14 +245,8 @@ impl EnvProbe {
     }
 }
 
-/// The per-user runtime directory, resolved ONCE for callers outside detection.
-///
-/// The rule is the one [`default_runtime_dir`] applies, and the point is what it is NOT: several
-/// callers used to spell it `std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())`,
-/// while their own doc comments promised "per-user, 0700 — NOT a world-writable /tmp path another
-/// local user could pre-create or rewrite". One of those paths is an executable that
-/// xdg-desktop-portal-hyprland then RUNS. `Ok("")` was the second half of the same defect: it
-/// yielded a path relative to the process's CWD rather than any runtime dir at all.
+/// Per-user runtime dir. Never `/tmp`: world-writable, and one caller hands the path to
+/// xdg-desktop-portal-hyprland as an executable location.
 #[cfg(target_os = "linux")]
 pub(crate) fn runtime_dir() -> String {
     default_runtime_dir(&EnvProbe::sample())
@@ -345,34 +271,22 @@ fn default_bus(env: &EnvProbe, runtime: &str) -> String {
         .unwrap_or_else(|| format!("unix:path={runtime}/bus"))
 }
 
-/// Detect the graphical session live for our uid right now (cheap, side-effect-free: a `/proc`
-/// scan plus a runtime-dir socket scan — well under the handshake timeout). The authority is the
-/// running compositor process; a desktop compositor outranks a lingering gamescope. Used to route
-/// each connect to the correct backend, and to derive the [`SessionEnv`] that targets it.
+/// Graphical session live for this uid. Authority is the running compositor; a desktop outranks a
+/// lingering gamescope. Cheap (`/proc` + socket scan).
 #[cfg(target_os = "linux")]
 pub fn detect_active_session() -> ActiveSession {
     use std::os::unix::fs::MetadataExt;
     let uid = crate::proc::current_uid();
-    // ONE sample of the session-scoped env, before any scanning — see [`EnvProbe`]. Everything
-    // below reads this snapshot, never the process env.
+    // One snapshot before any scan — see [`EnvProbe`]. Everything below reads this, never the env.
     let env = EnvProbe::sample();
     let xdg_runtime_dir = default_runtime_dir(&env);
     let dbus = default_bus(&env, &xdg_runtime_dir);
 
-    // Process probe: the running graphical compositor of THIS uid decides the kind. Priority lets
-    // a real desktop (kwin/gnome/sway) win over a leftover gamescope child. Names are matched
-    // exactly, `pkill -x` style — but resolved through [`crate::proc::match_name`], NOT a raw
-    // `comm` read: on NixOS every one of these binaries is a nixpkgs wrapper whose real ELF is
-    // `.<name>-wrapped`, so a raw `comm` says `.kwin_wayland-w` and this whole probe answered
-    // `None` on a running KDE desktop. ⚠ Nor is `/proc/<pid>/exe` alone enough to undo that: NixOS
-    // caps KWin (`security.wrappers.kwin_wayland`, `cap_sys_nice+ep`) and the kernel refuses that
-    // link to an uncapped reader — see `match_name`, which falls through to `argv[0]` for exactly
-    // this box. The uid filter below is unaffected: a capped process's `/proc/<pid>` keeps its
-    // real owner (measured).
+    // Names go through [`crate::proc::match_name`], not raw `comm`: NixOS wrappers report
+    // `.<name>-wrapped`, and a cap_sys_nice KWin refuses `/proc/<pid>/exe` to an uncapped reader.
     let mut kind = ActiveKind::None;
     let mut best = 0u8;
-    // The winning compositor's PID — kept so a same-kind compositor RESTART (a new PID) bumps the
-    // session epoch (A4), not just a kind change.
+    // So a same-kind restart (new PID) bumps the epoch, not just a kind change.
     let mut winning_pid: Option<u32> = None;
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for e in entries.flatten() {
@@ -395,8 +309,7 @@ pub fn detect_active_session() -> ActiveSession {
                 "gamescope" | "gamescope-wl" => (ActiveKind::Gaming, 1),
                 "kwin_wayland" => (ActiveKind::DesktopKde, 4),
                 "gnome-shell" => (ActiveKind::DesktopGnome, 4),
-                // Hyprland is its own backend (hyprctl + xdph) — split it out of the sway/river
-                // wlroots-proper family (design/hyprland-support.md D1).
+                // Own backend (hyprctl + xdph), not the sway/river wlroots family.
                 "Hyprland" | "hyprland" => (ActiveKind::DesktopHyprland, 4),
                 "sway" | "river" => (ActiveKind::DesktopWlroots, 4),
                 _ => continue,
@@ -407,10 +320,8 @@ pub fn detect_active_session() -> ActiveSession {
                 kind = k;
                 winning_pid = pid;
             } else if prio == best {
-                // Deterministic tie-break among same-top-priority processes: keep the LOWEST pid, so a
-                // duplicate same-kind compositor (two `kwin_wayland`) can't make `winning_pid` flap with
-                // `/proc` enumeration order — which `observe_session_instance` would misread as a
-                // compositor restart and tear a live display down (re-review low-severity note).
+                // Lowest pid among same-priority hits, so `/proc` order cannot flap `winning_pid`
+                // and look like a compositor restart.
                 if let (Some(p), Some(w)) = (pid, winning_pid) {
                     if p < w {
                         kind = k;
@@ -421,9 +332,6 @@ pub fn detect_active_session() -> ActiveSession {
         }
     }
 
-    // Wayland-protocol backends (KWin, wlroots, Hyprland) need the live socket for input (the wlr
-    // virtual pointer/keyboard client connects to it); Gaming-attach and Mutter are node/D-Bus
-    // driven and don't.
     let wayland_display = match kind {
         ActiveKind::DesktopKde | ActiveKind::DesktopWlroots | ActiveKind::DesktopHyprland => {
             find_wayland_socket(&env, &xdg_runtime_dir, uid)
@@ -434,20 +342,15 @@ pub fn detect_active_session() -> ActiveSession {
         ActiveKind::DesktopKde => Some("KDE".to_string()),
         ActiveKind::DesktopGnome => Some("GNOME".to_string()),
         ActiveKind::DesktopWlroots => Some("sway".to_string()),
-        // G4: advertise the real desktop so portal routing (portals.conf `[Hyprland]`) and xdph's
-        // own Hyprland checks work — NOT the old blanket `sway`.
+        // Real desktop name so portal routing (`[Hyprland]`) and xdph's own checks fire.
         ActiveKind::DesktopHyprland => Some("Hyprland".to_string()),
         ActiveKind::Gaming => Some("gamescope".to_string()),
         ActiveKind::None => None,
     };
-    // Discover the Hyprland instance signature so `hyprctl` can reach the compositor even when the
-    // host runs as a systemd `--user` service that never inherited the session env.
     let hyprland_signature = match kind {
         ActiveKind::DesktopHyprland => find_hypr_signature(&env, &xdg_runtime_dir, uid),
         _ => None,
     };
-    // Same idea for sway's IPC socket: without it `swaymsg` has nothing to talk to, and a
-    // `systemd --user` host never inherited it.
     let sway_socket = match kind {
         ActiveKind::DesktopWlroots => find_sway_socket(&env, &xdg_runtime_dir, uid, winning_pid),
         _ => None,
@@ -466,12 +369,8 @@ pub fn detect_active_session() -> ActiveSession {
     }
 }
 
-/// Find the live Hyprland instance signature (`HYPRLAND_INSTANCE_SIGNATURE`) for our uid. Trust a
-/// valid inherited value first (the host launched inside the session); otherwise pick the
-/// newest-mtime instance directory under `$XDG_RUNTIME_DIR/hypr/` that we own and that still has a
-/// live `.socket.sock` — the same "newest wins" heuristic as [`find_wayland_socket`]. A desktop
-/// normally exposes exactly one. (Phase-2 refinement: match the instance to `compositor_pid` via
-/// `hyprctl instances` when several coexist — `design/hyprland-support.md` §Phase-1.1.)
+/// Live Hyprland instance signature for this uid. Trust a valid inherited value; else the newest
+/// owned instance dir under `$XDG_RUNTIME_DIR/hypr/` that still has `.socket.sock`.
 #[cfg(target_os = "linux")]
 fn find_hypr_signature(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -498,14 +397,10 @@ fn find_hypr_signature(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String
     cands.into_iter().next().map(|(_, n)| n)
 }
 
-/// Find the live sway IPC socket (`SWAYSOCK`) for our uid. Trust a valid inherited value first (the
-/// host launched inside the session); then the exact `sway-ipc.<uid>.<pid>.sock` for the compositor
-/// PID detection already picked — a name sway builds from those two numbers, so it is an identity
-/// match rather than a guess; then the newest-mtime `sway-ipc.<uid>.*.sock` we own, for the case
-/// where the socket name does not match the PID we saw (sway re-exec, a wrapper process).
-///
-/// `None` on river: it is the other [`ActiveKind::DesktopWlroots`] compositor and has no sway IPC —
-/// which is the honest answer, since the wlroots backend drives sway through `swaymsg`.
+/// Live sway IPC socket for this uid. Inherited path if it still exists; else
+/// `sway-ipc.<uid>.<pid>.sock` for the detected compositor PID (identity, not a guess); else newest
+/// owned `sway-ipc.<uid>.*.sock` (re-exec / wrapper). `None` on river: no sway IPC, and the wlroots
+/// backend talks through `swaymsg`.
 #[cfg(target_os = "linux")]
 fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -538,14 +433,10 @@ fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -
     cands.into_iter().next().map(|(_, p)| p)
 }
 
-/// The `HYPRLAND_INSTANCE_SIGNATURE` to hand a `hyprctl` child, resolved at spawn time.
+/// `HYPRLAND_INSTANCE_SIGNATURE` for a `hyprctl` child, resolved at spawn.
 ///
-/// [`apply_session_env`] used to export this so `hyprctl` inherited it — a `setenv` on the connect
-/// path for a variable nothing outside this crate reads, i.e. a `getenv` race with every other
-/// thread bought for nothing. The reader takes it by argument now (`Command::env`), the way
-/// `set_launch_command` took the launch off the env before it. Resolving per spawn is also the more
-/// truthful answer: a Hyprland↔sway switch cannot leave a stale export pointing `hyprctl` at a dead
-/// instance, because there is no export.
+/// Handed via `Command::env`, not process `setenv`: nothing outside this crate reads it, and a
+/// Hyprland↔sway switch must not leave a stale export.
 #[cfg(target_os = "linux")]
 pub(crate) fn hypr_signature() -> Option<String> {
     let probe = EnvProbe::sample();
@@ -553,13 +444,10 @@ pub(crate) fn hypr_signature() -> Option<String> {
     find_hypr_signature(&probe, &runtime, crate::proc::current_uid())
 }
 
-/// The `SWAYSOCK` to hand a `swaymsg` child, resolved at spawn time — the sway counterpart of
-/// [`hypr_signature`], off the process env for the same reason.
+/// `SWAYSOCK` for a `swaymsg` child — sway counterpart of [`hypr_signature`].
 ///
-/// No compositor PID to match against here (detection's `/proc` scan is far too expensive to repeat
-/// per `swaymsg`), so this takes [`find_sway_socket`]'s other two arms: a valid inherited value, else
-/// the newest sway IPC socket we own. `None` on river (wlroots, no sway IPC) and when nothing
-/// sway-shaped is listening — which is what keeps `swaymsg` from being aimed at a dead socket.
+/// No compositor PID here (detection's `/proc` scan is too expensive per spawn), so this uses
+/// [`find_sway_socket`]'s inherited / newest-owned arms. `None` on river and when nothing listens.
 #[cfg(target_os = "linux")]
 pub(crate) fn sway_socket() -> Option<String> {
     let probe = EnvProbe::sample();
@@ -572,9 +460,8 @@ pub fn detect_active_session() -> ActiveSession {
     ActiveSession::none()
 }
 
-/// Find the live `wayland-*` socket in `runtime` for our uid (skipping `.lock` sidecars). Trust a
-/// valid inherited `WAYLAND_DISPLAY` first; otherwise take the newest-mtime socket we own (a
-/// desktop session normally exposes exactly one).
+/// Live `wayland-*` socket in `runtime` for this uid. Inherited `WAYLAND_DISPLAY` if it still exists;
+/// else newest-mtime owned socket (skip `.lock`).
 #[cfg(target_os = "linux")]
 fn find_wayland_socket(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -607,32 +494,20 @@ fn find_wayland_socket(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String
     cands.into_iter().next().map(|(_, n)| n)
 }
 
-/// Write a detected session's [`SessionEnv`] into the process env so every backend (video capture
-/// and input alike) that reads `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` /
-/// `XDG_CURRENT_DESKTOP` at open time targets the live session; the next connect re-detects and
-/// re-applies.
+/// Write the live session into the process env so backends that can only read
+/// `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` / `XDG_CURRENT_DESKTOP`
+/// (wayland-client, zbus, libpipewire, Mesa, [`settle_desktop_portal`]) open against it.
 ///
-/// Those four are what remains because their readers can only take them from the process env:
-/// wayland-client's `connect_to_env`, zbus's address lookup, libpipewire and the Mesa loader — plus
-/// [`settle_desktop_portal`], which imports them into the systemd / D-Bus activation environment BY
-/// NAME out of ours. Everything whose reader is code we own travels as a value instead: `hyprctl`'s
-/// instance signature and `swaymsg`'s socket are handed to those children with `Command::env`
-/// ([`hypr_signature`] / [`sway_socket`]), the launch command rides `set_launch_command`, and the
-/// gamescope sub-mode rides `set_gamescope_route`.
-///
-/// [`ENV_LOCK`] orders these writes against this crate's own env readers. It does **not** make them
-/// sound — see its doc — so shortening this list is the only thing that moves the needle.
+/// [`ENV_LOCK`] orders these writes against this crate's own readers. It does not make `setenv`
+/// sound — see its doc — so the list stays these four.
 #[cfg(target_os = "linux")]
 pub fn apply_session_env(active: &ActiveSession) {
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let e = &active.env;
     // SAFETY: PARTIAL, and deliberately not a proof. `_env_guard` holds [`ENV_LOCK`], which orders
-    // this against every env reader and writer *inside pf-vdisplay*, and steady-state streaming
-    // threads read cached config rather than the environment. Nothing else in the process takes
-    // that lock — not glibc, not zbus, not wayland-client, not the Mesa ICD loader — so each write
-    // below is still a race with a concurrent `getenv` elsewhere, as `setenv(3)` always is. These
-    // four survive only because their readers cannot be handed a value; every variable whose
-    // readers are ours has been moved off (security-review 2026-06-28 #7, 2026-08-25).
+    // this against every env reader and writer *inside pf-vdisplay*; streaming threads read cached
+    // config, not the environment. Nothing else in the process takes that lock — not glibc, not
+    // zbus, not wayland-client, not Mesa — so each write is still a race with a concurrent `getenv`.
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", &e.xdg_runtime_dir);
         std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &e.dbus_session_bus_address);
@@ -642,42 +517,22 @@ pub fn apply_session_env(active: &ActiveSession) {
         if let Some(d) = &e.xdg_current_desktop {
             std::env::set_var("XDG_CURRENT_DESKTOP", d);
         }
-        // `HYPRLAND_INSTANCE_SIGNATURE` and `SWAYSOCK` were exported here too. Their only readers
-        // are `hyprctl` and `swaymsg`, both spawned by this crate, so they travel to those children
-        // as `Command::env` values now ([`hypr_signature`] / [`sway_socket`]): two fewer
-        // `setenv`/`unsetenv` calls per connect, and nothing left to go stale across a Hyprland↔sway
-        // switch — a child that is not spawned inherits no signature to be wrong about.
-        // NOTHING live ⇒ every session-scoped var still in the env is a leftover from a previous
-        // connect's retarget, and the availability probes read them: after a gnome-shell crash
-        // (observed 2026-07-10: SIGSEGV → GDM greeter) a stale `XDG_CURRENT_DESKTOP=GNOME` kept
-        // `mutter::is_available()` true, so a client's explicit backend request routed into the
-        // dead session — 45 s create timeouts and a libei error loop instead of the crisp "no
-        // live graphical session" handshake error. Clear them so `available()` reports the truth
-        // and the client fails fast (and, when configured, `try_recover_session` can bring the
-        // desktop back).
+        // Nothing live: leftover session vars keep `available()` true (stale
+        // `XDG_CURRENT_DESKTOP=GNOME` after a compositor crash). Clear them so the
+        // handshake fails fast instead of routing into a dead session.
         if active.kind == ActiveKind::None {
             std::env::remove_var("XDG_CURRENT_DESKTOP");
             std::env::remove_var("WAYLAND_DISPLAY");
         }
     }
-    // Topology (Stage 2): the per-compositor backends (KWin/Mutter) now read
-    // [`effective_topology`] directly at create time — the console policy, else the legacy
-    // `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` env, else the Auto default (exclusive on the
-    // auto-desktop path). So this connect-path no longer writes that env (one fewer process-env
-    // mutation on the `ENV_LOCK` surface); `effective_topology()` computes the identical result.
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn apply_session_env(_active: &ActiveSession) {}
 
-/// Fire the operator's session-recovery hook (`PUNKTFUNK_RECOVER_SESSION_CMD`) because a client
-/// connected while NO graphical session is live for this uid — the state a compositor crash
-/// leaves behind (gnome-shell SIGSEGV → GDM greeter, whose auto-login only fires once per boot,
-/// so the box would otherwise sit headless until a walk-up login or a reboot). The command runs
-/// detached via `sh -c` (typically a display-manager restart — see the config docs) and is
-/// debounced to one launch per minute so a retrying client can't stack restarts. Returns whether
-/// a recovery is underway (just launched, or launched within the debounce window), letting the
-/// handshake error tell the client to simply retry.
+/// Operator session-recovery hook (`PUNKTFUNK_RECOVER_SESSION_CMD`) when a client connects with
+/// no live graphical session. Detached `sh -c`; one launch per minute so a retrying client cannot
+/// stack restarts. Returns whether a recovery is underway so the handshake can tell the client to retry.
 #[cfg(target_os = "linux")]
 pub fn try_recover_session() -> bool {
     let Some(cmd) = pf_host_config::config().recover_session_cmd.clone() else {
@@ -687,7 +542,7 @@ pub fn try_recover_session() -> bool {
     const DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
     let mut last = LAST_LAUNCH.lock().unwrap_or_else(|e| e.into_inner());
     if last.is_some_and(|t| t.elapsed() < DEBOUNCE) {
-        return true; // a launch is already in flight — the retry lands in the recovered session
+        return true;
     }
     match std::process::Command::new("/bin/sh")
         .arg("-c")
@@ -720,13 +575,9 @@ pub fn try_recover_session() -> bool {
     false
 }
 
-/// On a **mid-stream** switch to a desktop, the xdg-desktop-portal (D-Bus-activated) and the systemd
-/// `--user` environment can still point at the OLD session, so the host's RemoteDesktop portal opens
-/// against a half-stale env — it accepts events but they don't reach the compositor until a
-/// reconnect. Push the live session env into the systemd/D-Bus activation environment and (for KWin,
-/// whose input rides the xdg RemoteDesktop portal) restart the portal so it re-reads it — the same
-/// settling a fresh desktop login does. Best-effort; mirrors the wlroots portal restart. GNOME uses
-/// Mutter's *direct* EIS (no xdg portal), so it only needs the env push.
+/// Mid-stream switch to a desktop: push the live session env into systemd `--user` / D-Bus
+/// activation and restart the portal so it re-reads it. Best-effort. GNOME uses Mutter's direct
+/// EIS (no xdg portal), so it only needs the env push.
 #[cfg(target_os = "linux")]
 pub fn settle_desktop_portal(chosen: Compositor) {
     const VARS: &[&str] = &[
@@ -735,8 +586,6 @@ pub fn settle_desktop_portal(chosen: Compositor) {
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_RUNTIME_DIR",
     ];
-    // Push our (correct) env into the systemd --user manager + the D-Bus activation environment so a
-    // re-activated portal/backend inherits the live session.
     let _ = crate::proc::status_within(
         std::process::Command::new("systemctl")
             .args(["--user", "import-environment"])
@@ -749,9 +598,8 @@ pub fn settle_desktop_portal(chosen: Compositor) {
             .args(VARS),
         SYSTEMD_BUDGET,
     );
-    // KWin input goes through the xdg RemoteDesktop portal; the frontend routes RemoteDesktop to a
-    // backend by its OWN startup XDG_CURRENT_DESKTOP, so restart it (+ the KDE backend) to re-read
-    // the now-live session, then let it settle before the injector reopens against it.
+    // KWin input rides the xdg RemoteDesktop portal, which keys the backend off its *startup*
+    // `XDG_CURRENT_DESKTOP`. Restart, then wait 600 ms for it to re-read before the injector reopens.
     if chosen == Compositor::Kwin {
         let _ = crate::proc::status_within(
             std::process::Command::new("systemctl").args([
@@ -764,9 +612,7 @@ pub fn settle_desktop_portal(chosen: Compositor) {
         );
         std::thread::sleep(std::time::Duration::from_millis(600));
     }
-    // Hyprland capture rides the xdg ScreenCast portal serviced by xdph (G5): on a mid-stream switch
-    // xdph may still hold the old session's Wayland/instance env, so restart it (+ the frontend) to
-    // re-read the now-live session, mirroring the KWin settling above.
+    // xdph ScreenCast may still hold the old Wayland/instance env; restart it the same way.
     if chosen == Compositor::Hyprland {
         let _ = crate::proc::status_within(
             std::process::Command::new("systemctl").args([
@@ -788,15 +634,12 @@ pub fn settle_desktop_portal(chosen: Compositor) {
 #[cfg(not(target_os = "linux"))]
 pub fn settle_desktop_portal(_chosen: Compositor) {}
 
-/// The epoch rules are platform-neutral (they are pure over [`ActiveKind`] + PID), so — unlike the
-/// `/proc`-and-socket tests below — these run on every host this crate builds on.
+/// Epoch rules are pure over [`ActiveKind`] + PID, so these run on every host this crate builds on.
 #[cfg(test)]
 mod instance_change_tests {
     use super::*;
 
-    /// The 10.9 regression: a scan that answered `None` while KDE was in fact still up used to
-    /// satisfy `is_desktop_kind(prev)` and run the full invalidate — which drops pool entries in
-    /// ANY state, live streaming ones included.
+    /// A `None` scan while a desktop is still up must not invalidate — that drops live pool entries.
     #[test]
     fn a_none_observation_is_never_a_change() {
         for prev in [
@@ -824,7 +667,6 @@ mod instance_change_tests {
                 invalidate: Some(ActiveKind::DesktopKde)
             }
         );
-        // Desktop → gamescope (Game Mode): the dead KWin's kept displays go with it.
         assert_eq!(
             classify_instance_change(
                 (ActiveKind::DesktopKde, Some(1)),
@@ -834,7 +676,6 @@ mod instance_change_tests {
                 invalidate: Some(ActiveKind::DesktopKde)
             }
         );
-        // gamescope → desktop: a new epoch, but gamescope owns no pooled entries to invalidate.
         assert_eq!(
             classify_instance_change(
                 (ActiveKind::Gaming, Some(1)),
@@ -846,7 +687,6 @@ mod instance_change_tests {
 
     #[test]
     fn a_same_kind_restart_is_a_new_instance_but_a_gamescope_flap_is_not() {
-        // A fresh KWin (new PID) has an unrelated node-id space — A4.
         assert_eq!(
             classify_instance_change(
                 (ActiveKind::DesktopKde, Some(1)),
@@ -856,7 +696,6 @@ mod instance_change_tests {
                 invalidate: Some(ActiveKind::DesktopKde)
             }
         );
-        // The same instance re-detected: inert.
         assert_eq!(
             classify_instance_change(
                 (ActiveKind::DesktopKde, Some(1)),
@@ -864,7 +703,6 @@ mod instance_change_tests {
             ),
             InstanceChange::Nothing
         );
-        // Gaming↔Gaming winning-PID flap: never the epoch's business (findings #6/#7/#10).
         assert_eq!(
             classify_instance_change((ActiveKind::Gaming, Some(1)), (ActiveKind::Gaming, Some(2))),
             InstanceChange::Nothing
@@ -876,8 +714,6 @@ mod instance_change_tests {
 mod tests {
     use super::*;
 
-    /// A scratch runtime dir with the sway-ipc sockets named in `pids`, plus the uid the names are
-    /// built from. Removed on drop.
     struct FakeRuntime {
         dir: std::path::PathBuf,
         uid: u32,
@@ -906,16 +742,12 @@ mod tests {
         }
     }
 
-    /// A probe with nothing inherited, so the "trust what we inherited" rung can't decide the test.
-    /// The readers take this by argument, so — unlike the `set_var`/`remove_var` dance this replaced
-    /// — the tests no longer mutate process-global state to steer them.
+    /// Empty probe so the inherited-value rung cannot decide the test. Argument, not `set_var`.
     fn no_inherited_env() -> EnvProbe {
         EnvProbe::default()
     }
 
-    /// The point of deriving it: the socket that belongs to the compositor detection actually found,
-    /// not merely *a* sway socket. A stale socket from a previous sway (crash, re-login) sitting in
-    /// the same runtime dir must not win.
+    /// The socket that belongs to the compositor PID detection found, not merely *a* sway socket.
     #[test]
     fn the_socket_matching_the_detected_pid_wins() {
         let rt = FakeRuntime::new("exact", &[4242, 9999]);
@@ -926,8 +758,7 @@ mod tests {
         );
     }
 
-    /// sway re-exec (or a wrapper) can leave the socket named for a PID we didn't see. One socket in
-    /// the dir is still unambiguous — better to hand `swaymsg` the real thing than nothing.
+    /// sway re-exec / wrapper can name the socket for a PID we did not see. One socket is unambiguous.
     #[test]
     fn an_unmatched_pid_falls_back_to_the_socket_that_is_there() {
         let rt = FakeRuntime::new("fallback", &[777]);
@@ -938,9 +769,7 @@ mod tests {
         );
     }
 
-    /// river is the other wlroots desktop and ships no sway IPC. Reporting `None` is what keeps
-    /// [`sway_socket`] from handing `swaymsg` a `SWAYSOCK` that points at nothing — a made-up
-    /// socket would turn "no sway IPC here" into a connect that hangs or fails obscurely.
+    /// river has no sway IPC. `None` keeps [`sway_socket`] from handing `swaymsg` a dead path.
     #[test]
     fn no_sway_ipc_socket_reports_none() {
         let rt = FakeRuntime::new("none", &[]);
@@ -948,11 +777,7 @@ mod tests {
         assert_eq!(got, None);
     }
 
-    /// A socket NAMED for another uid is not ours to talk to. This covers the filename filter
-    /// (`sway-ipc.<uid>.` prefix) and nothing more — it was previously called
-    /// `another_uids_socket_is_ignored`, which claimed the ownership guard below it. It never
-    /// reached that guard: the prefix test `continue`s first, so the assertion held even with
-    /// `md.uid() != uid` deleted. See `another_uids_owned_socket_is_ignored` for the real leg.
+    /// Filename filter only (`sway-ipc.<uid>.` prefix). The ownership guard is the next test.
     #[test]
     fn another_uids_socket_name_is_ignored() {
         let rt = FakeRuntime::new("otheruid", &[]);
@@ -962,20 +787,14 @@ mod tests {
         assert_eq!(got, None);
     }
 
-    /// The ownership guard proper: a socket named as ours but OWNED by someone else must be
-    /// rejected on its metadata. That is the case that matters — a hostile local user can pick the
-    /// filename, so the name is not evidence.
-    ///
-    /// Ignored by default because it needs to `chown` a file to another uid, i.e. root. Run it
-    /// where that is true (a container, or CI as root):
-    ///     cargo test -p pf-vdisplay -- --ignored another_uids_owned
+    /// A socket named as ours but owned by someone else must fail the metadata check — the name
+    /// is attacker-chosen. Ignored by default: needs root to `chown`.
     #[test]
     #[ignore = "needs root to chown the socket to another uid"]
     fn another_uids_owned_socket_is_ignored() {
         use std::os::unix::fs::MetadataExt;
         let rt = FakeRuntime::new("ownedbyother", &[]);
-        // Named exactly as one of OURS, so the prefix filter admits it and the metadata check is
-        // the only thing that can reject it.
+        // Prefix admits it; only the metadata check can reject it.
         let path = rt.dir.join(format!("sway-ipc.{}.500.sock", rt.uid));
         std::fs::write(&path, b"").unwrap();
         let target_uid = rt.uid.wrapping_add(1);
@@ -987,9 +806,8 @@ mod tests {
         assert_eq!(rc, 0, "chown failed — this test needs root");
         assert_eq!(std::fs::metadata(&path).unwrap().uid(), target_uid);
 
-        // Query with a pid that does NOT match the filename: the exact-path shortcut earlier in
-        // `find_sway_socket` returns before the ownership guard, so hitting it would make this
-        // test vacuous in the same way the one above was.
+        // Pid that does not match the filename, or the exact-path shortcut returns before the
+        // ownership guard and this test is vacuous.
         let got = find_sway_socket(&no_inherited_env(), rt.path(), rt.uid, Some(999));
         assert_eq!(got, None, "a socket owned by another uid must be rejected");
     }
