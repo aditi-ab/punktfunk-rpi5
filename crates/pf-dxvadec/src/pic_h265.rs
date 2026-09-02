@@ -3,48 +3,20 @@
 //! `ID3D11VideoContext::SubmitDecoderBuffers` takes — [`crate::pic`] one codec
 //! over, and the DXVA twin of [`pf_vkdecode::pic_h265`].
 //!
-//! The codec difference that shapes this module is the same one that shapes the
-//! Vulkan H.265 converter: HEVC decode takes NO per-slice reference lists. The
-//! hardware re-derives 8.3.4's lists itself from the slice bits, keyed by the
-//! picture-level RPS index arrays (`RefPicSetStCurrBefore`/`StCurrAfter`/
-//! `LtCurr`), which are INDICES INTO `RefPicList` — so nothing here expresses
-//! per-slice list ORDER, unlike H.264. The per-slice lists still exist and are
-//! used as a cross-check: every entry must be a member of the current sets, or
-//! the conversion fails closed.
+//! HEVC decode takes no per-slice reference lists. Hardware re-derives 8.3.4
+//! from the slice bits, keyed by `RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr`
+//! — indices into `RefPicList`. Per-slice lists are a closed check: every entry
+//! must be in the current sets.
 //!
-//! **Surfaces are slots** carries over verbatim from [`crate::pic`] and is
-//! documented there rather than repeated: a `DXVA_PicEntry_HEVC` carries the decode
-//! texture array's `ArraySlice`, which is what lets this module drive the Vulkan
-//! rung's [`SlotMap`] unchanged.
+//! `RefPicList` is the marked DPB ([`pf_bitstream::h265::AuPlan::dpb_refs`]):
+//! current sets first (so the index arrays stay identical), then 8.3.2's *Foll*
+//! pictures. Binding only the current sets would drop a long-term anchor
+//! between pin and use; a driver may treat that gap as retirement. Vulkan's
+//! `pReferenceSlots` is the slots this decode uses, so that rung is right to
+//! bind the current sets. Surfaces are slots: see [`crate::pic`].
 //!
-//! # `RefPicList` is the MARKED DPB, indexed by the RPS arrays
-//!
-//! `RefPicList` holds every picture currently marked used for reference —
-//! libavcodec's DXVA HEVC path walks its whole DPB for
-//! `HEVC_FRAME_FLAG_{LONG,SHORT}_REF` — and the `RefPicSetStCurrBefore`/
-//! `StCurrAfter`/`LtCurr` arrays are INDICES into it. The two questions are
-//! therefore separate: which pictures the hardware may hold (the array), and which
-//! of them THIS picture uses (the indices).
-//!
-//! The union of the three current sets is not the same thing, and the gap is
-//! 8.3.2's *Foll* sets: a long-term anchor pinned for a later picture is marked in
-//! the DPB while no current set names it. Binding only the current sets would drop
-//! it from `RefPicList` for exactly the pictures between the pin and its use, and a
-//! driver keeping per-reference state may treat that absence as a retirement — the
-//! RFI failure shape. So the array is the plan's
-//! [`dpb_refs`](pf_bitstream::h265::AuPlan::dpb_refs) snapshot, laid out with the
-//! current sets first (which keeps the index arrays' values identical to what the
-//! sets alone produced) and the remaining marked pictures appended.
-//!
-//! Vulkan's `pReferenceSlots` asks the other question — the slots THIS decode
-//! operation uses — so the native Vulkan rung binds the current sets and is right
-//! to; the two rungs differ here because the two specifications do.
-//!
-//! Concealment note: a lost reference is ABSENT from the plan's RPS sets (flagged
-//! upstream via `PlanWarning::MissingReference`), so the index arrays compact past
-//! it. That is deliberate — there is no surface to point at, `0xFF` padding keeps
-//! the arrays well-formed, and the session layer has already been told to request
-//! recovery. Fabricating an entry is the one thing this crate never does.
+//! A lost reference is absent from the RPS (`PlanWarning::MissingReference`);
+//! the index arrays compact past it. There is no surface to point at.
 
 use std::ops::Range;
 
@@ -66,81 +38,64 @@ use crate::dxva::QmatrixHevc;
 use crate::dxva::SliceHevcShort;
 use crate::dxva::UNUSED_ENTRY;
 
-/// `RefPicList`'s length in `DXVA_PicParams_HEVC`. Fifteen, not sixteen: the
-/// current picture is named separately by `CurrPic`, so the array only ever
-/// holds the other DPB members.
+/// `RefPicList` length in `DXVA_PicParams_HEVC`. Fifteen: `CurrPic` is named
+/// separately, so the array holds only the other DPB members.
 const REF_PIC_LIST_LEN: usize = 15;
 
-/// Each `RefPicSet*` index array holds eight entries — the hard ceiling on how
-/// many CURRENT references one set may carry through DXVA (H.265 itself allows
-/// more; beyond eight is unexpressible here and rejected).
+/// Each `RefPicSet*` index array holds eight entries — H.265 allows more;
+/// beyond eight is unexpressible here and refused.
 pub const RPS_LIST_SIZE: usize = 8;
 
-/// One active reference of the AU: its surface index and the planner id it
-/// resolves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DxvaRefH265 {
-    /// The DPB slot, which is the decode texture array's `ArraySlice`.
+    /// Decode texture array `ArraySlice` — the DPB slot.
     pub slot: u8,
     pub id: PicId,
     pub is_long_term: bool,
     pub pic_order_cnt: i32,
 }
 
-/// Everything CPU-derivable of one AU's DXVA submission.
+/// CPU-derivable half of one AU's DXVA submission.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodePlanDxvaH265 {
-    /// The picture parameters. Their `RefPicSetStCurrBefore`/`StCurrAfter`/
-    /// `LtCurr` arrays hold INDICES INTO [`Self::refs`] (`0xFF` = unused), which
-    /// is exactly how they index `RefPicList` — the two are laid out in the same
-    /// order by construction.
+    /// Picture parameters. `RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr` are
+    /// indices into [`Self::refs`] (`0xFF` unused), laid out in the same order.
     pub pic_params: PicParamsHevc,
-    /// The inverse-quantization matrices, or `None` when the sequence does not
-    /// enable scaling lists — in which case the buffer is NOT SUBMITTED AT ALL.
-    ///
-    /// That is libavcodec's own condition: `dxva2_hevc_end_frame` passes the
-    /// qmatrix buffer only when `dwCodingParamToolFlags & 1`
-    /// (`scaling_list_enabled_flag`). Submitting it unconditionally is not the
-    /// harmless belt-and-braces it looks like — with scaling lists disabled the
-    /// hardware is told to ignore the matrices, and any driver that honours a
-    /// buffer it was handed anyway would dequantize every residual against
-    /// whatever the buffer holds. Every punktfunk HEVC stream is in exactly that
-    /// shape.
+    /// Inverse-quantization matrices, or `None` when scaling lists are off — the
+    /// buffer is then not submitted. libavcodec's `dxva2_hevc_end_frame` passes
+    /// it only when `dwCodingParamToolFlags & 1`. Submitting anyway is not
+    /// harmless: with lists disabled the hardware is told to ignore the
+    /// matrices, and a driver that honours a buffer it was handed dequantizes
+    /// against its contents.
     pub qmatrix: Option<QmatrixHevc>,
-    /// Byte ranges of the AU's slice segment NALUs, start code included, in plan
+    /// Byte ranges of the AU's slice-segment NALUs, start code included, in plan
     /// order — what [`crate::pack::pack`] takes.
     pub slice_ranges: Vec<Range<usize>>,
-    /// The surface the decoded picture is written into.
     pub setup_slot: u8,
     pub setup_id: PicId,
-    /// Whether later pictures may reference the decoded picture (false for
-    /// sub-layer non-reference NALU types).
+    /// Whether later pictures may reference the decoded picture. False for
+    /// sub-layer non-reference NALU types.
     pub setup_is_reference: bool,
-    /// The marked DPB, resolved to surfaces and laid out identically in
-    /// `pic_params.RefPicList`: the plan's three current RPS sets first, in set
-    /// order (StCurrBefore, StCurrAfter, LtCurr) and first appearance first, then
-    /// every other marked picture the DPB holds (module docs).
+    /// Marked DPB, same order as `pic_params.RefPicList`: the three current RPS
+    /// sets first (StCurrBefore, StCurrAfter, LtCurr, first appearance first),
+    /// then every other marked picture.
     pub refs: Vec<DxvaRefH265>,
 }
 
-/// Conversion failures. Stream damage never lands here — pf-bitstream degrades it
-/// to [`pf_bitstream::h265::PlanWarning`]s upstream. (`PlanError::RaslSkipped`
-/// also never reaches this layer: it is an error OF planning, handled as an
-/// Ok-skip by the client wiring, and no plan exists to convert.)
+/// Conversion failures. Stream damage never lands here — pf-bitstream degrades
+/// it to [`pf_bitstream::h265::PlanWarning`]s. `PlanError::RaslSkipped` is an
+/// error of planning (Ok-skip upstream); no plan exists to convert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanToDxvaH265Error {
-    /// The plan holds no slices; there is nothing to submit.
     NoSlices,
-    /// The plan's `DpbUpdate.stored` is `None`.
     NoStoredId,
     /// An RPS entry's id holds no slot: an earlier plan never went through this
     /// [`SlotMap`].
     UnresolvedReference(PicId),
-    /// A slice reference-list entry names a picture outside the plan's current
-    /// RPS sets. 8.3.4 builds every list FROM those sets, so this is a planner
-    /// contract violation — and no amount of `RefPicList` residency fixes it,
-    /// because the hardware derives its lists from the RPS INDEX ARRAYS, which
-    /// only the current sets populate.
+    /// A slice list names a picture outside the current RPS sets. 8.3.4 builds
+    /// every list from those sets; `RefPicList` residency does not fix it,
+    /// because hardware derives lists from the RPS index arrays, which only the
+    /// current sets populate.
     ReferenceOutsideRps(PicId),
     Slot(SlotError),
     /// A current RPS set holds more entries than the index arrays' eight.
@@ -150,19 +105,19 @@ pub enum PlanToDxvaH265Error {
     },
     /// The AU references more distinct pictures than `RefPicList` holds (15).
     TooManyReferences(usize),
-    /// The first slice's inline `st_ref_pic_set()` predicts from an SPS
-    /// candidate that does not exist — `ucNumDeltaPocsOfRefRpsIdx` cannot be
-    /// derived, and the hardware would misparse the slice header.
+    /// The first slice's inline `st_ref_pic_set()` predicts from a missing SPS
+    /// candidate — `ucNumDeltaPocsOfRefRpsIdx` cannot be derived, and hardware
+    /// would misparse the slice header.
     InvalidRefRpsIdx {
         curr_rps_idx: u8,
         delta_idx_minus1: u8,
     },
-    /// The inline `st_ref_pic_set()`'s bit count exceeds `u16`
+    /// Inline `st_ref_pic_set()` bit count exceeds `u16`
     /// (`wNumBitsForShortTermRPSInSlice`) — a header that large is corrupt.
     StRpsBitsOverflow(u32),
-    /// The predicted-from candidate's `NumDeltaPocs` exceeds `u8`. Impossible
-    /// off a real parse (≤ 32); an error rather than a clamp, because a clamped
-    /// count makes the hardware misparse the slice header.
+    /// Predicted-from candidate `NumDeltaPocs` exceeds `u8`. Impossible off a
+    /// real parse (≤ 32); an error rather than a clamp, because a clamped count
+    /// makes hardware misparse the slice header.
     NumDeltaPocsOverflow(u32),
     /// The map was built for a different DPB depth than this plan's
     /// `max_dpb_frames` — an SPS renegotiation resized the DPB; rebuild decoder,
@@ -178,8 +133,7 @@ pub enum PlanToDxvaH265Error {
         height: u32,
     },
     /// `separate_colour_plane_flag`. Refused upstream by pf-bitstream's envelope
-    /// gate; checked again because the picture layout for it is a different
-    /// shape entirely.
+    /// gate; checked again because the picture layout is a different shape.
     SeparateColourPlanes,
 }
 
@@ -251,15 +205,13 @@ impl From<SlotError> for PlanToDxvaH265Error {
 }
 
 /// `ucNumDeltaPocsOfRefRpsIdx`: when the first slice's inline `st_ref_pic_set()`
-/// uses inter-RPS prediction, the hardware re-parses those slice bits and needs
-/// `NumDeltaPocs[RefRpsIdx]` of the SOURCE candidate to size the
+/// uses inter-RPS prediction, hardware re-parses those slice bits and needs
+/// `NumDeltaPocs[RefRpsIdx]` of the source candidate to size the
 /// `used_by_curr_pic_flag`/`use_delta_flag` loop (7.4.8); otherwise 0.
 ///
 /// Byte-for-byte the derivation `pf_vkdecode::pic_h265` makes for Vulkan's
-/// `NumDeltaPocsOfRefRpsIdx` — the same field under a different name. It is
-/// duplicated rather than shared because it is private there and the two crates
-/// have no business exporting each other's internals; if it ever changes, both
-/// copies' tests plan the same vendored vector and will disagree.
+/// `NumDeltaPocsOfRefRpsIdx`. Duplicated because it is private there; both
+/// copies' tests plan the same vendored vector and will disagree if they drift.
 fn num_delta_pocs_of_ref_rps_idx(plan: &AuPlan) -> Result<u8, PlanToDxvaH265Error> {
     let hdr = &plan
         .slices
@@ -274,7 +226,7 @@ fn num_delta_pocs_of_ref_rps_idx(plan: &AuPlan) -> Result<u8, PlanToDxvaH265Erro
         return Ok(0);
     }
     // RefRpsIdx = stRpsIdx - (delta_idx_minus1 + 1), stRpsIdx = CurrRpsIdx here
-    // (equation 7-59). u16 arithmetic so a hostile delta cannot wrap.
+    // (equation 7-59). u16 so a hostile delta cannot wrap.
     let delta = hdr.short_term_ref_pic_set.delta_idx_minus1;
     let source = u16::from(hdr.curr_rps_idx)
         .checked_sub(u16::from(delta) + 1)
@@ -287,7 +239,6 @@ fn num_delta_pocs_of_ref_rps_idx(plan: &AuPlan) -> Result<u8, PlanToDxvaH265Erro
         .map_err(|_| PlanToDxvaH265Error::NumDeltaPocsOverflow(source.num_delta_pocs))
 }
 
-/// One marked DPB picture, resolved to its surface.
 fn dxva_ref(slot: u8, rp: &RefPic) -> DxvaRefH265 {
     DxvaRefH265 {
         slot,
@@ -299,27 +250,22 @@ fn dxva_ref(slot: u8, rp: &RefPic) -> DxvaRefH265 {
 
 /// `DXVA_Qmatrix_HEVC` for a sequence that enables scaling lists.
 ///
-/// # Which lists
-///
-/// 7.4.5's activation, in the order the spec resolves it:
+/// 7.4.5 activation, in the order the spec resolves it:
 ///
 /// 1. the PPS's, when it codes scaling list data;
-/// 2. otherwise the SPS's, when IT codes scaling list data;
-/// 3. otherwise the Table 7-5/7-6 DEFAULT lists.
+/// 2. otherwise the SPS's, when it codes scaling list data;
+/// 3. otherwise the Table 7-5/7-6 default lists.
 ///
-/// libavcodec writes the first two legs as one ternary and stops, because its own
-/// parser seeds an SPS that codes nothing with the defaults — so leg 3 never has to
-/// be spelled out there. The vendored cros-codecs parser does NOT: `ScalingLists`
-/// defaults to all zeros and an SPS only ever fills it under
-/// `scaling_list_enabled_flag && sps_scaling_list_data_present_flag`. Copying
-/// libavcodec's ternary verbatim therefore hands the driver 64 zeros per list on a
-/// stream that says "enabled, nothing coded, use the defaults" — a legal and
-/// entirely ordinary shape — and every residual dequantizes to nothing.
+/// libavcodec folds 1 and 2 into a ternary and stops: its parser seeds an SPS
+/// that codes nothing with the defaults, so leg 3 never has to be spelled out.
+/// cros-codecs does not — `ScalingLists` defaults to zeros and an SPS only
+/// fills under `scaling_list_enabled_flag && sps_scaling_list_data_present_flag`.
+/// Copying the ternary hands the driver 64 zeros per list on a legal "enabled,
+/// nothing coded" stream, and every residual dequantizes to nothing.
 ///
-/// Leg 3 is served by the PPS's lists, which the same parser DOES default-fill
-/// (Table 7-5/7-6 plus a DC of 8 + 8 = 16) whenever the PPS codes none. So:
-/// SPS-coded data wins only when the PPS coded none, and the PPS's copy carries
-/// both leg 1 and leg 3.
+/// Leg 3 is the PPS lists, which this parser default-fills (Table 7-5/7-6 plus
+/// DC of 16) whenever the PPS codes none. SPS-coded data wins only when the
+/// PPS coded none; the PPS copy carries both leg 1 and leg 3.
 fn quantization_matrices(sps: &Sps, pps: &Pps) -> QmatrixHevc {
     let sl = if sps.scaling_list_data_present_flag && !pps.scaling_list_data_present_flag {
         &sps.scaling_list
@@ -330,13 +276,13 @@ fn quantization_matrices(sps: &Sps, pps: &Pps) -> QmatrixHevc {
     qm.ucScalingLists0 = sl.scaling_list_4x4;
     qm.ucScalingLists1 = sl.scaling_list_8x8;
     qm.ucScalingLists2 = sl.scaling_list_16x16;
-    // sizeId 3 codes only matrixId 0 and 3 (its loop steps by three), and DXVA
-    // carries exactly those two — so index k here is the parser's k * 3.
+    // sizeId 3 codes only matrixId 0 and 3 (its loop steps by three); DXVA
+    // carries exactly those two — index k here is the parser's k * 3.
     qm.ucScalingLists3[0] = sl.scaling_list_32x32[0];
     qm.ucScalingLists3[1] = sl.scaling_list_32x32[3];
-    // The DC entries are the ScalingFactor DC VALUE (`…_minus8 + 8`), not the
-    // coded delta. Clamped rather than wrapped: the parser bounds the coded
-    // value to -7..=247, so the sum is 1..=255 and the clamp is unreachable.
+    // DC entries are the ScalingFactor DC value (`…_minus8 + 8`), not the coded
+    // delta. Clamped rather than wrapped: the parser bounds the coded value to
+    // -7..=247, so the sum is 1..=255 and the clamp is unreachable.
     for (dst, src) in qm
         .ucScalingListDCCoefSizeID2
         .iter_mut()
@@ -355,8 +301,8 @@ fn quantization_matrices(sps: &Sps, pps: &Pps) -> QmatrixHevc {
 ///
 /// `status_id` becomes `StatusReportFeedbackNumber` — see [`crate::pic::plan_to_dxva`].
 ///
-/// Atomicity contract (identical to the H.264 module): every fallible step runs
-/// before any mutation of `slots`, so an error leaves the map exactly as it was.
+/// Atomicity: every fallible step runs before any mutation of `slots`, so an
+/// error leaves the map exactly as it was.
 pub fn plan_to_dxva_h265(
     plan: &AuPlan,
     slots: &mut SlotMap,
@@ -382,8 +328,6 @@ pub fn plan_to_dxva_h265(
         });
     }
 
-    // The AU-level binding set: the union of the three current RPS sets, first
-    // appearance first, plus the index arrays that point into it.
     let mut refs: Vec<DxvaRefH265> = Vec::new();
     let mut index_arrays = [[UNUSED_ENTRY; RPS_LIST_SIZE]; 3];
     let sets: [(&'static str, &[RefPic]); 3] = [
@@ -400,19 +344,17 @@ pub fn plan_to_dxva_h265(
         }
         for (position, rp) in set.iter().enumerate() {
             let index = match refs.iter().position(|existing| existing.id == rp.id) {
-                // A picture that appears in two sets binds ONCE and both index
-                // arrays point at that one entry.
+                // A picture that appears in two sets binds once; both index arrays
+                // point at that one entry.
                 Some(index) => index,
                 None => {
                     let slot = slots
                         .slot_of(rp.id)
                         .ok_or(PlanToDxvaH265Error::UnresolvedReference(rp.id))?;
-                    // The DPB snapshot is the authority for the marking: an
+                    // DPB snapshot is the authority for the marking: an
                     // `RefPicSetLtCurr` index into a short-term-marked entry is an
-                    // inconsistent DPB, and hardware treats the two differently.
-                    // The set's own copy is the fallback and cannot be reached off
-                    // a real plan (8.3.2 marks every set member before the sets
-                    // are reported).
+                    // inconsistent DPB. The set's own copy is the fallback and
+                    // cannot be reached off a real plan (8.3.2).
                     let marked = plan.dpb_refs.iter().find(|d| d.id == rp.id);
                     if marked.is_none() {
                         trace!(
@@ -429,17 +371,13 @@ pub fn plan_to_dxva_h265(
             array[position] = index as u8;
         }
     }
-    // The current sets are what the index arrays MUST be able to name, so their
-    // overflow is a refusal.
     if refs.len() > REF_PIC_LIST_LEN {
         return Err(PlanToDxvaH265Error::TooManyReferences(refs.len()));
     }
 
-    // Cross-check, against the CURRENT sets alone — which is what `refs` holds at
-    // this exact point, and why the check runs before the *Foll* pictures are
-    // appended. 8.3.4 builds every slice list from the current sets, so an entry
-    // outside them is a planner-contract violation: the hardware re-derives its
-    // lists from the RPS INDEX ARRAYS, and a picture merely present in
+    // Cross-check against the current sets alone — what `refs` holds at this
+    // point, and why the check runs before *Foll* pictures are appended. 8.3.4
+    // builds every slice list from the current sets; a picture merely in
     // `RefPicList` is not reachable by that derivation.
     let current_set_refs = refs.len();
     for slice in &plan.slices {
@@ -453,12 +391,10 @@ pub fn plan_to_dxva_h265(
         }
     }
 
-    // Then the rest of the marked DPB — the *Foll* pictures (module docs) — in the
-    // planner's DPB order, which is libavcodec's. Overflow past the array is
-    // dropped rather than refused: nothing here is referenced by this picture, so
-    // the decode is unaffected and refusing would cost the whole frame. `RefPicList`
-    // holds fifteen while the DPB holds up to sixteen, so this is reachable, if
-    // only on a stream that has filled its DPB entirely with references.
+    // Rest of the marked DPB (*Foll* pictures) in planner DPB order. Overflow
+    // past the array is dropped, not refused: nothing here is referenced by this
+    // picture, so the decode is unaffected. `RefPicList` holds 15 while the DPB
+    // holds up to 16, so this is reachable.
     for rp in &plan.dpb_refs {
         if refs.len() == REF_PIC_LIST_LEN {
             trace!(
@@ -505,9 +441,9 @@ pub fn plan_to_dxva_h265(
         log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_pic_order_cnt_lsb_minus4,
     }
     .pack();
-    // The DPB depth of the HIGHEST temporal sub-layer — the only one whose
-    // buffering covers the whole stream. `max_sub_layers_minus1` indexes a
-    // seven-entry array, so the read cannot go out of bounds off any parse.
+    // DPB depth of the highest temporal sub-layer — the only one whose buffering
+    // covers the whole stream. `max_sub_layers_minus1` indexes a seven-entry
+    // array, so the read cannot go out of bounds off any parse.
     pp.sps_max_dec_pic_buffering_minus1 = sps
         .max_dec_pic_buffering_minus1
         .get(usize::from(sps.max_sub_layers_minus1))
@@ -525,8 +461,8 @@ pub fn plan_to_dxva_h265(
     pp.num_ref_idx_l1_default_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
     pp.init_qp_minus26 = pps.init_qp_minus26;
     pp.ucNumDeltaPocsOfRefRpsIdx = num_delta_pocs;
-    // 0 when the RPS came from the SPS by index — exactly DXVA's convention for
-    // this field, and pf-bitstream's for the value it derives from.
+    // 0 when the RPS came from the SPS by index — DXVA's convention for this
+    // field, and pf-bitstream's for the value it derives.
     pp.wNumBitsForShortTermRPSInSlice = st_rps_bits;
     pp.dwCodingParamToolFlags = HevcToolFlags {
         scaling_list_enabled_flag: sps.scaling_list_enabled_flag,
@@ -569,9 +505,8 @@ pub fn plan_to_dxva_h265(
             .slice_segment_header_extension_present_flag,
         irap_pic_flag: pic.is_irap,
         idr_pic_flag: pic.is_idr,
-        // HEVC states intra-ness at the picture level: an IRAP picture is
-        // intra-only by definition, and nothing else is guaranteed to be. Same
-        // derivation libavcodec's DXVA HEVC path makes.
+        // HEVC states intra-ness at picture level: an IRAP is intra-only by
+        // definition, and nothing else is guaranteed to be.
         intra_pic_flag: pic.is_irap,
     }
     .pack();
@@ -582,10 +517,9 @@ pub fn plan_to_dxva_h265(
         pp.num_tile_rows_minus1 = pps.num_tile_rows_minus1;
         if !pps.uniform_spacing_flag {
             // Only the non-uniform case codes explicit widths; the uniform case
-            // leaves them zero and the hardware derives its own grid.
-            // `saturating_as` on each: a tile edge past 65535 min-CBs cannot
-            // come off a real PPS, and a clamp here is strictly better than a
-            // panic on a corrupt one.
+            // leaves them zero and hardware derives its own grid. `try_from` +
+            // `u16::MAX`: a tile edge past 65535 min-CBs cannot come off a real
+            // PPS; a clamp is better than a panic on a corrupt one.
             for (dst, src) in pp
                 .column_width_minus1
                 .iter_mut()
@@ -620,19 +554,18 @@ pub fn plan_to_dxva_h265(
         pp.RefPicSetLtCurr,
     ] = index_arrays;
 
-    // The quantization matrices — built ONLY when the sequence enables scaling
-    // lists, because that is the only case in which the buffer is submitted (see
-    // `DecodePlanDxvaH265::qmatrix`).
+    // Built only when scaling lists are enabled; that is the only case the
+    // buffer is submitted (see `DecodePlanDxvaH265::qmatrix`).
     let qm = sps
         .scaling_list_enabled_flag
         .then(|| quantization_matrices(sps, pps));
 
     let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.data.clone()).collect();
 
-    // Mutations LAST, after every fallible step above. Removals first — they were
-    // real regardless of this AU's fate — then the setup assignment, released
-    // immediately when this very plan already evicted the stored picture (the
-    // surface must still exist for the decode itself).
+    // Mutations last, after every fallible step. Removals first — they were real
+    // regardless of this AU's fate — then the setup assignment, released
+    // immediately when this plan already evicted the stored picture (the surface
+    // must still exist for the decode itself).
     let setup_evicted = plan.dpb.removed.contains(&setup_id);
     for &id in &plan.dpb.removed {
         if id == setup_id {
@@ -659,7 +592,7 @@ pub fn plan_to_dxva_h265(
     })
 }
 
-/// The slice-control records for a packed AU — [`crate::pic::slice_control`]'s
+/// Slice-control records for a packed AU — [`crate::pic::slice_control`]'s
 /// HEVC twin.
 pub fn slice_control_h265(records: &[crate::pack::SliceRecord]) -> Vec<SliceHevcShort> {
     records
@@ -681,8 +614,8 @@ mod tests {
 
     use super::*;
 
-    /// The same vendored vectors pf-bitstream's and pf-vkdecode's h265 tests
-    /// plan, included from the same path.
+    /// Vendored vectors pf-bitstream's and pf-vkdecode's h265 tests plan, included
+    /// from the same path.
     const TEST_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
     );
@@ -690,15 +623,11 @@ mod tests {
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/64x64-I-P-B-P.h265"
     );
 
-    /// **Our own host's HEVC**, and the only stream in this repository that reaches
-    /// the DPB pressure HEVC's exemption is claimed against: low-delay IPPP, 120
-    /// pictures of 640x480, `sps_max_num_reorder_pics = 0`, and a five-picture DPB
-    /// against the four pictures 8.3.2 keeps marked.
-    ///
-    /// Vendored beside the goldens the GPU legs decode it against (that file's header
-    /// carries the `punktfunk-host spike` command and the ffmpeg cross-check), the
-    /// same way `lowdelay-640x480.h264` is, and read from the same path by all three
-    /// crates that need it.
+    /// Host HEVC: the only stream in this repository that reaches the DPB pressure
+    /// HEVC's no-aliasing exemption is claimed against — low-delay IPPP,
+    /// `sps_max_num_reorder_pics = 0`, five-picture DPB against the four pictures
+    /// 8.3.2 keeps marked. Vendored beside the goldens the GPU legs decode it
+    /// against, same path as `lowdelay-640x480.h264`.
     const LOWDELAY_640X480_H265: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h265");
 
@@ -770,9 +699,6 @@ mod tests {
                     match set.get(position) {
                         Some(rp) => {
                             let index = usize::from(*entry);
-                            // The index array points into RefPicList, and
-                            // RefPicList is laid out in `refs` order — so both
-                            // must agree about the picture.
                             assert_eq!(dxva.refs[index].id, rp.id);
                             assert_eq!(dxva.pic_params.PicOrderCntValList[index], rp.pic_order_cnt);
                             assert_eq!(
@@ -787,7 +713,7 @@ mod tests {
         }
     }
 
-    /// The unique pictures the plan's three CURRENT sets name, in the order this
+    /// Unique pictures the plan's three current sets name, in the order this
     /// conversion binds them (set order, first appearance first).
     fn current_set_ids(plan: &AuPlan) -> Vec<PicId> {
         let mut ids = Vec::new();
@@ -813,7 +739,7 @@ mod tests {
             listed.sort_unstable();
             marked.sort_unstable();
             assert_eq!(listed, marked, "RefPicList must be the marked DPB");
-            // The current sets lead, so the index arrays never point past them —
+            // Current sets lead, so the index arrays never point past them —
             // which is what makes appending the rest of the DPB safe.
             let current = current_set_ids(&plan);
             assert_eq!(
@@ -829,12 +755,10 @@ mod tests {
 
     #[test]
     fn a_marked_picture_no_current_set_names_is_appended_after_them() {
-        // 8.3.2's *Foll* shape, which the vendored vectors never produce (their RPS
-        // names every marked picture they hold) and which every long-term anchor
-        // lives in: a picture the DPB keeps marked for a LATER picture. Injected
-        // into the plan's snapshot rather than synthesised as a bitstream, because
-        // the thing under test is what this conversion does with a snapshot wider
-        // than the current sets.
+        // 8.3.2 *Foll* shape: a picture the DPB keeps marked for a later picture.
+        // Injected into the snapshot rather than synthesised as a bitstream — the
+        // conversion, not the planner, is under test. Vendored vectors never produce
+        // this (their RPS names every marked picture they hold).
         let aus = split_into_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let plans: Vec<AuPlan> = aus
@@ -852,8 +776,6 @@ mod tests {
         let current_sets = last.refs.len();
         assert!(current_sets > 0, "the third AU must reference something");
 
-        // Re-plan and re-convert with the third AU's snapshot widened by one marked
-        // picture that no current set names.
         let mut planner = H265Planner::new();
         let mut plans: Vec<AuPlan> = aus
             .iter()
@@ -895,15 +817,14 @@ mod tests {
         assert_eq!(appended.id, foll);
         assert!(appended.is_long_term);
         assert_eq!(appended.pic_order_cnt, -4242);
-        // …and it reaches the wire as a long-term entry with its own POC.
         assert_eq!(
             dxva.pic_params.RefPicList[current_sets],
             PicEntry::new(appended.slot, true)
         );
         assert_eq!(dxva.pic_params.PicOrderCntValList[current_sets], -4242);
-        // The index arrays are untouched by the append: every live index still
-        // points inside the current sets, which is the property that makes the
-        // whole-DPB `RefPicList` a safe superset.
+        // Index arrays are untouched by the append: every live index still points
+        // inside the current sets, which is what makes the whole-DPB `RefPicList`
+        // a safe superset.
         for array in [
             dxva.pic_params.RefPicSetStCurrBefore,
             dxva.pic_params.RefPicSetStCurrAfter,
@@ -928,32 +849,23 @@ mod tests {
         }
     }
 
-    /// HEVC's freedom from the aliasing that cost AV1 and H.264 a deferral, and the
-    /// PLANNER property that grants it.
+    /// HEVC is free of the slot aliasing that cost AV1 and H.264 a deferral.
     ///
-    /// Both other codecs release a removed picture's slot and then let
-    /// [`SlotMap::assign`] hand it straight back to the decode target, so `CurrPic`
-    /// and a `RefPicList` entry name one surface. This conversion still releases its
-    /// whole `removed` list inline, and is safe doing so for one reason: `H265Planner`
-    /// snapshots `dpb_refs` AFTER `decode_rps` has updated the DPB, so a picture this
-    /// AU's RPS dropped is never in the set `RefPicList` is built from, and nothing
-    /// later in the AU unmarks anything. `H264Planner` and `Av1Planner` both snapshot
-    /// BEFORE their marking, and both needed the deferral.
+    /// Those codecs release a removed picture's slot and then let
+    /// [`SlotMap::assign`] hand it to the decode target, so `CurrPic` and a
+    /// `RefPicList` entry name one surface. This conversion still releases its
+    /// whole `removed` list inline, and is safe because `H265Planner` snapshots
+    /// `dpb_refs` after `decode_rps` has updated the DPB: a picture this AU's RPS
+    /// dropped is never in the set `RefPicList` is built from. `H264Planner` and
+    /// `Av1Planner` snapshot before their marking, and both needed the deferral.
     ///
-    /// The second assertion is that argument made falsifiable. The first is only the
-    /// consequence, and on this vector the consequence would hold even if the argument
-    /// stopped being true — the vendored H.264 vector taught that lesson expensively
-    /// (it measured zero aliasing for two milestones while every stream we ship
-    /// aliased on 99% of its frames). Moving `dpb_snapshot()` above `decode_rps` would
-    /// leave the first assertion passing and break the second on the first AU whose
-    /// RPS drops a picture, which on this vector is most of them.
+    /// The second assertion makes that argument falsifiable. The first is only
+    /// the consequence — it would hold even if the snapshot moved. Moving
+    /// `dpb_snapshot()` above `decode_rps` would leave the first passing and break
+    /// the second on the first AU whose RPS drops a picture.
     ///
-    /// This test covers the VENDORED VECTOR only, which reorders and therefore cannot
-    /// reach the DPB pressure the exemption is really claimed against. The stream that
-    /// can is [`LOWDELAY_640X480_H265`], and it carries its own pair of tests below —
-    /// [`the_low_delay_stream_reaches_the_dpb_pressure_and_hevc_still_does_not_alias`]
-    /// and [`the_low_delay_stream_would_alias_if_the_snapshot_moved_ahead_of_the_rps`],
-    /// the second of which drives the alias through this very conversion.
+    /// This vector reorders and cannot reach the DPB pressure the exemption is
+    /// claimed against. The stream that can is [`LOWDELAY_640X480_H265`].
     #[test]
     fn the_current_picture_is_named_by_curr_pic_and_never_aliases_a_reference() {
         let mut aus_with_removals = 0usize;
@@ -994,19 +906,18 @@ mod tests {
         );
     }
 
-    /// The marked DPB as an access unit's `decode_rps` FINDS it — the set
+    /// Marked DPB as an access unit's `decode_rps` finds it — the set
     /// `dpb_snapshot()` would return from the other side of that call.
     ///
-    /// Exact, not approximate. `H265Planner::begin_picture` runs `decode_rps` →
-    /// `update_dpb_before_decoding` → `dpb_snapshot`, and the only thing between AU
-    /// N-1's snapshot and AU N's `decode_rps` is `finish_picture(N-1)` storing its
-    /// picture marked "used for short-term reference". So the pre-RPS marked set is
-    /// exactly `dpb_refs(N-1) ∪ {stored(N-1)}` — no DPB replay needed, and no
-    /// dependence on the planner internals staying reachable from a test.
+    /// `H265Planner::begin_picture` runs `decode_rps` →
+    /// `update_dpb_before_decoding` → `dpb_snapshot`. Between AU N-1's snapshot
+    /// and AU N's `decode_rps` only `finish_picture(N-1)` stores its picture
+    /// marked used for short-term reference. So the pre-RPS marked set is exactly
+    /// `dpb_refs(N-1) ∪ {stored(N-1)}` — no DPB replay, no dependence on planner
+    /// internals staying reachable from a test.
     ///
-    /// A sub-layer non-reference picture is stored but NOT marked, so it is excluded;
-    /// the callers assert their streams contain none, which keeps the reconstruction
-    /// honest rather than merely defensive.
+    /// A sub-layer non-reference picture is stored but not marked, so it is
+    /// excluded; callers assert their streams contain none.
     fn pre_rps_marked(prev: Option<&AuPlan>) -> Vec<RefPic> {
         let Some(prev) = prev else {
             return Vec::new();
@@ -1024,27 +935,18 @@ mod tests {
         marked
     }
 
-    /// The exemption, measured on the stream that can actually falsify it.
+    /// The exemption, measured on the stream that can falsify it.
     ///
-    /// [`the_current_picture_is_named_by_curr_pic_and_never_aliases_a_reference`] runs
-    /// over `test-25fps.h265`, which REORDERS — a picture the RPS drops stays alive for
-    /// output past the access unit that dropped it, so the eviction and the unmarking
-    /// never land together and the vector cannot reach the precondition however hard it
-    /// is run. That is the same blindness that let the H.264 defect survive two
-    /// milestones behind a 250/250 green vector.
+    /// [`the_current_picture_is_named_by_curr_pic_and_never_aliases_a_reference`]
+    /// runs over `test-25fps.h265`, which reorders: a picture the RPS drops stays
+    /// alive for output past the access unit that dropped it, so eviction and
+    /// unmarking never land together. This stream reaches the precondition.
     ///
-    /// This stream reaches it. Three numbers, and the third is what gives the second
-    /// its meaning:
-    ///
-    /// - **115 of 120** access units retire a picture (a five-picture DPB against four
-    ///   marked references and `sps_max_num_reorder_pics = 0`);
-    /// - **0** of those retirements intersect the access unit's own `dpb_refs` — the
-    ///   exemption, measured on our own encoder's output rather than argued;
-    /// - **115** of them intersect the PRE-RPS marked set, so a snapshot taken one call
-    ///   earlier would alias on every single one.
-    ///
-    /// [`the_low_delay_stream_would_alias_if_the_snapshot_moved_ahead_of_the_rps`]
-    /// then drives that counterfactual through the conversion itself.
+    /// Three numbers: nearly every AU retires a picture; none of those
+    /// retirements intersect the AU's own `dpb_refs`; all of them intersect the
+    /// pre-RPS marked set, so a snapshot one call earlier would alias on every
+    /// one. [`the_low_delay_stream_would_alias_if_the_snapshot_moved_ahead_of_the_rps`]
+    /// drives that counterfactual through the conversion.
     #[test]
     fn the_low_delay_stream_reaches_the_dpb_pressure_and_hevc_still_does_not_alias() {
         let converted = convert_stream(LOWDELAY_640X480_H265);
@@ -1054,8 +956,6 @@ mod tests {
         let mut both = 0usize;
         let mut would_alias = 0usize;
         for (i, (plan, dxva)) in converted.iter().enumerate() {
-            // The consequence, over every access unit of the stream: the decode target
-            // is `CurrPic` and appears in no reference entry.
             assert_eq!(dxva.pic_params.CurrPic.index(), dxva.setup_slot);
             assert!(!dxva.pic_params.CurrPic.associated());
             for r in &dxva.refs {
@@ -1112,21 +1012,15 @@ mod tests {
         );
     }
 
-    /// The counterfactual driven through the CONVERSION, not just the planner's
+    /// Counterfactual driven through the conversion, not just the planner's
     /// arithmetic.
     ///
-    /// `H265Planner` snapshotting one call earlier is a plausible refactor — it is
-    /// where `H264Planner` and `Av1Planner` both snapshot, and both needed
-    /// `release_after_decode` because of it. This test simulates exactly that by
-    /// handing `plan_to_dxva_h265` the PRE-RPS marked set as `dpb_refs` and nothing
-    /// else changed, then asserts the alias appears: the dropped picture enters
-    /// `RefPicList` as a *Foll* entry with its slot resolved BEFORE the removals are
-    /// released, `SlotMap::assign` hands that freed slot straight to `CurrPic`, and one
-    /// surface is named as both the decode target and a picture the frame predicts from.
-    ///
-    /// So the guarantee is not "we looked and it was fine". It is: this stream reaches
-    /// the shape, this conversion breaks on it under the other snapshot ordering, and
-    /// the ordering we ship is why it does not.
+    /// `H265Planner` snapshotting one call earlier is where `H264Planner` and
+    /// `Av1Planner` both snapshot, and both needed `release_after_decode`. This
+    /// test hands `plan_to_dxva_h265` the pre-RPS marked set as `dpb_refs` and
+    /// nothing else changed, then asserts the alias: the dropped picture enters
+    /// `RefPicList` as a *Foll* entry with its slot resolved before the removals
+    /// are released, and `SlotMap::assign` hands that freed slot to `CurrPic`.
     #[test]
     fn the_low_delay_stream_would_alias_if_the_snapshot_moved_ahead_of_the_rps() {
         let mut planner = H265Planner::new();
@@ -1142,16 +1036,14 @@ mod tests {
             let plan = planner.plan_au(au).expect("the low-delay stream plans");
             let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
 
-            // The ONE mutation: the marked DPB as it stood before this AU's RPS ran.
+            // The one mutation: the marked DPB as it stood before this AU's RPS ran.
             let mut as_if = plan.clone();
             as_if.dpb_refs = pre_rps_marked(plans.last());
 
-            // The reconstruction validates itself, so a planner change that broke the
-            // reasoning behind `pre_rps_marked` fails HERE with its reason rather than
-            // quietly turning the count below into a different measurement. Marking
-            // only ever grows between two access units' RPS derivations (the previous
-            // picture is stored marked; C.5.2.2's removal takes only already-unmarked
-            // pictures), so the pre-RPS set is a strict SUPERSET of the post-RPS one.
+            // Reconstruction validates itself: a planner change that broke
+            // `pre_rps_marked` fails here rather than quietly turning the count
+            // below into a different measurement. Marking only ever grows between
+            // two AUs' RPS derivations, so the pre-RPS set is a strict superset.
             for rp in plan.dpb_refs.iter().chain(
                 as_if
                     .rps
@@ -1293,14 +1185,14 @@ mod tests {
         assert_eq!(dxva.pic_params.wFormatAndSequenceInfoFlags >> 6 & 0x7, 0);
     }
 
-    /// H.265 Table 7-6's default 8x8 list for INTRA prediction (matrixId 0..2), in
-    /// the up-right diagonal order both the coded syntax and DXVA use.
+    /// H.265 Table 7-6's default 8x8 list for intra prediction (matrixId 0..2),
+    /// in the up-right diagonal order both the coded syntax and DXVA use.
     ///
     /// Transcribed from the specification rather than imported from the vendored
     /// parser's own constant: a test that reads the same array the code reads
-    /// cannot tell "the defaults" from "whatever that array happens to hold", and
-    /// the shape this guards — an enabled sequence that codes no list anywhere — is
-    /// exactly the one where a wrong default is a picture drifting to flat grey.
+    /// cannot tell the defaults from whatever that array happens to hold, and the
+    /// shape this guards — enabled, nothing coded — is where a wrong default
+    /// drifts the picture to flat grey.
     const DEFAULT_INTRA_8X8: [u8; 64] = [
         16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 16, 17, 16, 17, 18, 17, 18, 18, 17, 18, 21, 19,
         20, 21, 20, 19, 21, 24, 22, 22, 24, 24, 22, 22, 24, 25, 25, 27, 30, 27, 25, 25, 29, 31, 35,
@@ -1316,12 +1208,11 @@ mod tests {
     /// The vector's first plan with its parameter sets rewritten to a chosen
     /// scaling-list shape.
     ///
-    /// The parameter sets are the REAL ones the parser produced and only the
-    /// scaling-list fields move, which is what makes the "coded nowhere" shape
-    /// meaningful: `pps.scaling_list` then still holds the parser's own default
-    /// fill, and `sps.scaling_list` still holds the all-zero `ScalingLists::
-    /// default()` an uncoded SPS is left with. Synthesising a whole HEVC parameter
-    /// set would only put those two facts back by hand.
+    /// The parameter sets are the real ones the parser produced; only the
+    /// scaling-list fields move. That is what makes the "coded nowhere" shape
+    /// meaningful: `pps.scaling_list` still holds the parser's default fill, and
+    /// `sps.scaling_list` still holds the all-zero `ScalingLists::default()` an
+    /// uncoded SPS is left with.
     fn plan_with_scaling_lists(
         enabled: bool,
         sps_coded: Option<u8>,
@@ -1362,8 +1253,8 @@ mod tests {
 
     #[test]
     fn a_sequence_that_disables_scaling_lists_submits_no_quantization_matrix_at_all() {
-        // The shape every punktfunk HEVC stream is in, and the vendored vector
-        // with it. libavcodec's `dxva2_hevc_end_frame` passes the buffer only when
+        // The shape every punktfunk HEVC stream is in. libavcodec's
+        // `dxva2_hevc_end_frame` passes the buffer only when
         // `dwCodingParamToolFlags & 1`; handing a driver a matrix it was told to
         // ignore is a bet on the driver ignoring it.
         let converted = convert_stream(TEST_25FPS);
@@ -1379,10 +1270,9 @@ mod tests {
     #[test]
     fn an_enabled_sequence_that_codes_no_list_anywhere_gets_the_table_7_5_and_7_6_defaults() {
         // The bug this guards: the vendored parser leaves an SPS that codes no
-        // scaling list data with an ALL-ZERO `ScalingLists` (unlike libavcodec's,
+        // scaling list data with an all-zero `ScalingLists` (unlike libavcodec's,
         // which seeds the defaults), so selecting the SPS here would dequantize
-        // every residual to nothing while bit 0 of dwCodingParamToolFlags tells the
-        // driver the matrix is authoritative.
+        // every residual to nothing.
         let (plan, dxva) = plan_with_scaling_lists(true, None, None);
         assert!(plan.sps.scaling_list.scaling_list_4x4[0]
             .iter()
@@ -1392,12 +1282,9 @@ mod tests {
             .qmatrix
             .expect("an enabled sequence submits the matrix");
 
-        // Table 7-5: every 4x4 list is flat 16.
         for list in qm.ucScalingLists0 {
             assert_eq!(list, [16u8; 16]);
         }
-        // Table 7-6: matrixId 0..2 are the intra default, 3..5 the inter one, at
-        // every size from 8x8 up.
         for (m, list) in qm.ucScalingLists1.iter().enumerate() {
             let want = if m < 3 {
                 DEFAULT_INTRA_8X8
@@ -1414,17 +1301,16 @@ mod tests {
             };
             assert_eq!(*list, want, "16x16 matrixId {m}");
         }
-        // sizeId 3 carries only matrixId 0 (intra) and 3 (inter).
         assert_eq!(qm.ucScalingLists3[0], DEFAULT_INTRA_8X8);
         assert_eq!(qm.ucScalingLists3[1], DEFAULT_INTER_8X8);
-        // The inferred DC is 8, and DXVA takes the VALUE — 8 + 8.
+        // The inferred DC is 8, and DXVA takes the value — 8 + 8.
         assert_eq!(qm.ucScalingListDCCoefSizeID2, [16u8; 6]);
         assert_eq!(qm.ucScalingListDCCoefSizeID3, [16u8; 2]);
     }
 
     #[test]
     fn a_coded_pps_list_wins_and_a_coded_sps_list_is_taken_only_when_the_pps_codes_none() {
-        // 7.4.5's activation order, with a distinct fill per source so the
+        // 7.4.5 activation order, with a distinct fill per source so the
         // selection is visible rather than inferred.
         let (_, pps_wins) = plan_with_scaling_lists(true, Some(7), Some(9));
         let qm = pps_wins.qmatrix.expect("enabled");
@@ -1433,8 +1319,8 @@ mod tests {
         assert_eq!(qm.ucScalingLists2[5], [9u8; 64]);
         assert_eq!(qm.ucScalingLists3[0], [9u8; 64]);
         assert_eq!(qm.ucScalingLists3[1], [9u8; 64]);
-        // The DC entries are the coded delta plus 8, and sizeId 3 takes the
-        // parser's matrixId 0 and 3 rather than 0 and 1.
+        // DC entries are the coded delta plus 8, and sizeId 3 takes the parser's
+        // matrixId 0 and 3 rather than 0 and 1.
         assert_eq!(qm.ucScalingListDCCoefSizeID2, [17u8; 6]);
         assert_eq!(qm.ucScalingListDCCoefSizeID3, [17u8; 2]);
 
@@ -1444,15 +1330,15 @@ mod tests {
         assert_eq!(qm.ucScalingLists1[2], [7u8; 64]);
         assert_eq!(qm.ucScalingListDCCoefSizeID2, [15u8; 6]);
 
-        // …and neither source reaches the driver when the sequence disables
-        // scaling lists, however much data the parameter sets carry.
+        // Neither source reaches the driver when the sequence disables scaling
+        // lists, however much data the parameter sets carry.
         let (_, disabled) = plan_with_scaling_lists(false, Some(7), Some(9));
         assert_eq!(disabled.qmatrix, None);
     }
 
     #[test]
     fn the_sizeid_3_entries_take_the_parsers_matrix_ids_0_and_3() {
-        // The index arithmetic (`k * 3`) that would otherwise be invisible: with
+        // Index arithmetic (`k * 3`) that would otherwise be invisible: with
         // matrixId 0 and 3 given different values, taking 0 and 1 reads the wrong
         // matrix for the inter slot.
         let (_, dxva) = {
@@ -1494,8 +1380,6 @@ mod tests {
         });
         assert!(both, "the I-P-B-P vector must exercise bidirectional RPS");
         for (plan, dxva) in &converted {
-            // Everything the slices name is bound; that is the cross-check the
-            // conversion enforces, asserted here from the outside.
             for slice in &plan.slices {
                 for rp in slice.ref_list0.iter().chain(&slice.ref_list1) {
                     assert!(dxva.refs.iter().any(|r| r.id == rp.id));
@@ -1566,15 +1450,15 @@ mod tests {
             },
         ];
         let control = slice_control_h265(&records);
-        // Read by VALUE, in braces: the record is `#[repr(C, packed)]` (ten bytes),
+        // Read by value, in braces: the record is `#[repr(C, packed)]` (ten bytes),
         // so a reference to a `u32` member would be unaligned — and `assert_eq!`
         // takes references. See `dxva.rs`'s alignment section.
         assert_eq!({ control[0].BSNALunitDataLocation }, 0);
         assert_eq!({ control[0].SliceBytesInBuffer }, 128);
         assert_eq!({ control[0].wBadSliceChopping }, 0);
-        // A SECOND record, because the ten-vs-twelve byte defect is invisible on a
+        // A second record, because the ten-vs-twelve byte defect is invisible on a
         // single-record buffer — the vendored HEVC vector is one slice segment per
-        // picture, which is precisely the shape that hid it.
+        // picture, which is the shape that hid it.
         assert_eq!({ control[1].BSNALunitDataLocation }, 128);
         let bytes = crate::dxva::slice_bytes(&control);
         assert_eq!(bytes.len(), 20);
