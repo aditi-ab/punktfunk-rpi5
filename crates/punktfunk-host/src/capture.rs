@@ -449,9 +449,18 @@ mod live_tests {
     /// open an episode past the 15 s floor, a rung must land once the process thaws, real frames
     /// must resume, and the capturer must hand back the measured outage (WP14) — all on the SAME
     /// capturer object, i.e. no reconnect.
+    ///
+    /// What a WHOLE-process freeze produces (measured on `.173`): the classifier names
+    /// `Stalled(Worker)` at the floor, the ladder skips the unsupported swap-chain reset and
+    /// issues the presentation reset, and the UMDF framework terminates the unresponsive host
+    /// process at that mode-set — so the plane ends with the typed driver-died fault and the
+    /// host loop's pipeline rebuild is the DriverCycle rung. That is the contract asserted here:
+    /// no hang, no silent frozen frame, a typed end (or a recovery) within a bounded window,
+    /// and never before the ladder had its chance. A wedge that keeps the host alive (one stuck
+    /// worker thread) needs WP6's bounded worker stop before the presentation reset is safe.
     #[test]
     #[ignore = "live: freezes the pf-vdisplay WUDFHost for ~18 s; elevated console session, host service stopped"]
-    fn live_wedged_driver_host_recovers_through_the_ladder() {
+    fn live_frozen_driver_host_ends_the_plane_with_a_typed_fault() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         let _ = tracing_subscriber::fmt()
@@ -557,22 +566,37 @@ mod live_tests {
                 break;
             }
         }
+        let ended = t_freeze.elapsed();
         let _ = freezer.join();
         eprintln!(
-            "wedged worker: source during={during} after={after} first_after={first_after:?} \
-             outage={outage:?} error={error:?} elapsed={:?}",
-            t_freeze.elapsed()
+            "frozen driver host: source during={during} after={after} first_after={first_after:?} \
+             outage={outage:?} error={error:?} ended_after={ended:?}"
         );
-        assert!(
-            error.is_none(),
-            "the plane ended instead of recovering on the same capturer: {error:?}"
-        );
-        let outage = outage.expect("the supervisor must close an episode and hand back the outage");
-        assert!(
-            outage >= Duration::from_secs(15),
-            "the outage must span the stall floor, got {outage:?}"
-        );
-        assert!(after >= 3, "real source frames must resume after the thaw");
+        assert_eq!(during, 0, "no source frame can come from a frozen worker");
+        match (outage, &error) {
+            (Some(outage), _) => {
+                assert!(
+                    outage >= Duration::from_secs(15),
+                    "a recovered outage must span the stall floor, got {outage:?}"
+                );
+                assert!(after >= 3, "real source frames must resume after the thaw");
+            }
+            (None, Some(e)) => {
+                assert!(
+                    e.contains("WUDFHost") || e.contains("SourceStalled") || e.contains("stale"),
+                    "the plane must end with a typed driver/source fault, got: {e}"
+                );
+                assert!(
+                    ended >= Duration::from_secs(15),
+                    "the plane ended before the ladder had its chance: {ended:?}"
+                );
+            }
+            (None, None) => panic!(
+                "neither a recovery nor a typed end within {:?} — the stale plane is exactly \
+                 what must never happen",
+                hold + Duration::from_secs(60)
+            ),
+        }
         drop(cap);
         drop(vd);
     }
