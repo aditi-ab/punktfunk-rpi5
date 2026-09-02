@@ -550,7 +550,7 @@ impl IddPushCapturer {
                 target_id: target.target_id,
                 ccd,
                 source_seq: 0,
-                stale_trips: 0,
+                recovery: super::recovery::Supervisor::new(Instant::now()),
                 section,
                 header,
                 event,
