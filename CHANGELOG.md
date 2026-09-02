@@ -41,6 +41,12 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   terminal error. `SetFrameChannelRequest` spends its padding word on `header_bytes`; the driver
   touches the tail only when the version AND the declared size both allow it, so any v2/v3
   pairing keeps working on the 88-byte prefix.
+- **The pf-vdisplay monitor owns its ring endpoint.** A frame-channel delivery becomes a
+  monitor-scoped `RingEndpoint` (header mapping, retained sealed handles, generation, publish and
+  source sequences); every swap-chain assignment opens its own device-bound textures on it and
+  drops them on exit, so no D3D object crosses a device epoch. The D3D device pool is a bounded
+  per-adapter map with per-device epochs and a removal flag every worker honours. The first-frame
+  stash no longer survives a swap-chain reassignment; the next compose refills it.
 - **`--host` / `--client` choose what to install.** `--client` installs `punktfunk-client` from
   the family repo, or a user-scope flatpak where the family has none, so a distro with no
   punktfunk repo can run the client.

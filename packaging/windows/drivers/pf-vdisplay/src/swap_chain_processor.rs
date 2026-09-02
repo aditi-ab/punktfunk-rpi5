@@ -60,7 +60,7 @@ use windows::{
 
 use crate::{
     direct_3d_device::Direct3DDevice,
-    frame_transport::{FramePublisher, FrameStash, PublishOutcome},
+    frame_transport::{FramePublisher, FrameStash, PublishOutcome, RingEndpoint},
 };
 
 /// E_PENDING — `ReleaseAndAcquireBuffer2` returns this (HRESULT-shaped) when the swap-chain is valid but
@@ -319,7 +319,7 @@ impl SwapChainProcessor {
         render_luid_low: u32,
         render_luid_high: i32,
     ) {
-        ASSIGNMENT_EPOCH.fetch_add(1, Ordering::AcqRel);
+        let assignment_epoch = ASSIGNMENT_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
         // SetDevice fails (0x887A0026, FACILITY_DXGI) when the monitor briefly flaps INACTIVE during
         // topology activation — the OS unassigns + re-assigns the swap-chain, and a fresh run_core thread
         // can lose the race to the unassign. Retry briefly so a stable re-assign binds the device instead
@@ -402,44 +402,44 @@ impl SwapChainProcessor {
             return;
         }
 
-        // STEP 6 IDD-push: lazily ATTACH to the HOST-created shared ring over the SEALED channel. The
-        // frame objects are unnamed — the host duplicates their handles into this process and delivers
-        // the values via IOCTL_SET_FRAME_CHANNEL, which the control plane stashes on our monitor
-        // (`monitor::take_frame_channel`). Until a delivery lands we just drain — exactly the STEP-5
-        // behaviour — so a non-IDD-push session never stalls. The frame-channel stash is polled every
-        // iteration (attach latency = first-frame latency, since attach republishes the FrameStash).
-        // STEP 6 sibling-join fix: re-adopt a FramePublisher PRESERVED across a swap-chain
-        // unassign→reassign flap. When a SIBLING display churns the desktop topology (a second client
-        // joining / leaving / resizing), the OS reassigns THIS monitor's swap-chain and the previous
-        // worker exited — but the host-owned ring it published into is still live, and the host only
-        // re-delivers the frame channel on a ring RECREATE (a descriptor change). Without this the
-        // fresh worker has nothing to attach to and the first client's stream freezes (repeat frames
-        // forever). Re-adopt ONLY when the freshly-assigned swap-chain renders on the SAME adapter as
-        // the preserved publisher (same pooled Direct3DDevice → its immediate context + opened ring
-        // textures are valid); a mismatch drops it and falls back to a fresh channel delivery. A
-        // preserved publisher that the host superseded meanwhile (ring recreate → is_stale, or a
-        // pending delivery) is dropped + replaced by the existing re-attach logic at the loop top.
+        // STEP 6 IDD-push: publish into the HOST-created shared ring over the SEALED channel (the
+        // control plane stashes the delivered handle values on our monitor). Until a delivery lands
+        // we just drain — exactly the STEP-5 behaviour — so a non-IDD-push session never stalls.
+        let open = |ep: Arc<RingEndpoint>| {
+            FramePublisher::open(
+                ep,
+                render_luid_low,
+                render_luid_high,
+                &device.device,
+                &device.device_context,
+                assignment_epoch,
+                device.epoch(),
+            )
+        };
+        // The MONITOR owns the ring (D4 / WP5): every worker opens its OWN device-bound publisher
+        // on the monitor's endpoint, so a swap-chain flap (a SIBLING display churning the topology)
+        // resumes the same host ring without any COM object crossing device epochs — a TDR
+        // recreate or adapter move just makes the open fail, reported in the header.
         let mut publisher: Option<FramePublisher> =
-            crate::monitor::take_preserved_publisher(target_id).and_then(|p| {
-                if p.render_adapter() == (render_luid_low, render_luid_high) {
+            crate::monitor::endpoint(target_id).and_then(|ep| match open(ep) {
+                Ok(p) => {
                     dbglog!(
-                        "[pf-vd] swap-chain run_core: re-adopted preserved publisher (target={target_id}) — resuming the host ring across the swap-chain flap"
+                        "[pf-vd] swap-chain run_core: re-opened the monitor's ring endpoint (target={target_id}) — resuming across the swap-chain flap"
                     );
                     Some(p)
-                } else {
+                }
+                Err(e) => {
                     dbglog!(
-                        "[pf-vd] swap-chain run_core: preserved publisher's render adapter changed (target={target_id}) — dropping it, will re-attach from a fresh channel"
+                        "[pf-vd] swap-chain run_core: re-open of the ring endpoint failed ({e:?}, target={target_id}) — waiting for a fresh delivery"
                     );
                     None
                 }
             });
         // The FIRST-FRAME stash (see `FrameStash`): the retained last composed frame, republished
         // into every fresh ring at attach so a session opening onto an idle desktop is never black.
-        // Re-adopted across a swap-chain flap on the same adapter (`take_preserved_stash` drops a
-        // cross-adapter one — its texture lives on the other adapter's pooled device).
-        let mut stash: FrameStash =
-            crate::monitor::take_preserved_stash(target_id, render_luid_low, render_luid_high)
-                .unwrap_or_default();
+        // Worker-local (D4): its texture lives on THIS device, so it never crosses an assignment —
+        // a reassigned worker starts empty and the first compose refills it.
+        let mut stash = FrameStash::new();
 
         let mut logged_pending = false;
         let mut logged_frame = false;
@@ -466,6 +466,16 @@ impl SwapChainProcessor {
             if terminate.load(Ordering::Relaxed) {
                 break;
             }
+            // A sibling worker (or the pool at checkout) saw this device REMOVED: every worker on
+            // the entry stops — the swap-chain would fail on it anyway, and the OS reassigns onto a
+            // fresh device (immunity plan WP5 item 6).
+            if device.is_removed() {
+                dbglog!(
+                    "[pf-vd] swap-chain run_core: device epoch {} removed (target={target_id}) — exiting for reassignment",
+                    device.epoch()
+                );
+                break;
+            }
 
             // The lock-free delivery gate: `chan_pending` is true only when a `set_frame_channel`
             // landed since the last pass — the two mutex-taking checks below (`has_frame_channel`,
@@ -474,15 +484,11 @@ impl SwapChainProcessor {
             // steady state takes no lock at all.
             let chan_gen = crate::monitor::frame_channel_gen();
             let chan_pending = chan_gen != seen_chan_gen;
-            // Re-attach triggers, either of:
-            // * `is_stale` — the host recreated the ring mid-session (HDR flip): it bumps OUR header's
-            //   generation and re-delivers; without dropping here we'd keep CopyResource'ing into the
-            //   stale ring, whose format now mismatches the surface → the publish() format-guard drops
-            //   every frame and the stream freezes until the next swap-chain recreate.
-            // * a PENDING delivery (newest-wins) — a host build-retry creates a whole NEW ring with a
-            //   DIFFERENT header mapping; the old publisher's header never changes, so `is_stale` can't
-            //   fire. The host only delivers after fully (re)creating a ring, so a pending delivery
-            //   always supersedes whatever we're attached to.
+            // Re-attach triggers: `is_stale` (the host recreated the ring mid-session — HDR flip —
+            // and bumped OUR header's generation; publishing on would mismatch every frame and
+            // freeze the stream), or a PENDING delivery (newest-wins: a host build-retry makes a
+            // whole NEW ring with a different header mapping, which `is_stale` can never see; the
+            // host only delivers after fully creating a ring, so a pending delivery supersedes).
             if publisher.as_ref().is_some_and(FramePublisher::is_stale)
                 || (publisher.is_some()
                     && chan_pending
@@ -495,50 +501,51 @@ impl SwapChainProcessor {
                 if let Some(p) = publisher.take() {
                     // v3: tell the host this generation is being superseded, so a quiet ring reads
                     // REBUILDING rather than stalled (the fresh attach below marks ACTIVE again).
-                    p.mark_rebuilding();
+                    p.endpoint().mark_rebuilding();
                     p.harvest_into(&device.device, &mut stash);
                 }
             }
-            // Lazy-attach at the loop TOP so we keep trying even while the display is idle (E_PENDING /
-            // no frames presented yet), not only when a frame is acquired — gated by `chan_pending`
-            // (a delivery can only appear via `set_frame_channel`, which bumps the generation):
-            // attach latency is still first-frame latency, since the attach itself republishes the
-            // stash. A taken delivery is consumed whether the attach succeeds or not (on failure its
-            // handles are closed inside from_channel, the host's wait-for-attach reads the status
-            // code, and any retry is a NEW delivery — with its own bump). `target_id` binds the
-            // attach: the mapped ring must name THIS monitor (proto v3 validation inside
-            // from_channel — a cross-delivered ring is refused, never published into).
+            // Lazy-attach at the loop TOP so we keep trying while the display is idle (E_PENDING),
+            // gated by `chan_pending` — attach latency is first-frame latency, since the attach
+            // republishes the stash. A taken delivery is consumed whether it succeeds or not (its
+            // handles close with the endpoint; the host reads the status code; a retry is a NEW
+            // delivery). `from_channel` refuses a ring that does not name THIS monitor.
             if publisher.is_none()
                 && chan_pending
                 && let Some(channel) = crate::monitor::take_frame_channel(target_id)
-                && let Ok(mut p) = FramePublisher::from_channel(
-                    channel,
-                    target_id,
-                    render_luid_low,
-                    render_luid_high,
-                    &device.device,
-                    &device.device_context,
-                )
             {
-                // v3 epochs go in BEFORE the first publish, so the host never reads an ACTIVE
-                // ring without knowing which device/assignment its frames come from.
-                p.stamp_epochs(
-                    ASSIGNMENT_EPOCH.load(Ordering::Acquire),
-                    crate::direct_3d_device::device_epoch(),
-                );
-                // FIRST-FRAME GUARANTEE: republish the retained desktop image into the fresh ring
-                // immediately. On an idle desktop DWM composes nothing, so without this the host
-                // would wait (and kick synthetic input) for a frame that may never come. A
-                // stale-descriptor stash (e.g. pre-HDR-flip) is rejected by publish()'s guard —
-                // at worst the old wait-for-compose path.
-                if let Some(t) = stash.texture()
-                    && p.publish(t, 0) == PublishOutcome::Published
-                {
-                    dbglog!(
-                        "[pf-vd] frame-push(driver): republished the retained frame into the fresh ring (target={target_id}) — instant first frame, no compose needed"
-                    );
+                let source_seq = crate::monitor::source_seq(target_id).unwrap_or_default();
+                if let Ok(ep) = RingEndpoint::from_channel(channel, target_id, source_seq) {
+                    let ep = Arc::new(ep);
+                    // Install BEFORE opening: the endpoint is the monitor's whatever this worker's
+                    // device makes of it.
+                    crate::monitor::set_endpoint(target_id, ep.clone());
+                    match open(ep.clone()) {
+                        Ok(mut p) => {
+                            // FIRST-FRAME GUARANTEE: republish the retained desktop image into the
+                            // fresh ring immediately — on an idle desktop DWM composes nothing, so
+                            // the host would otherwise wait (and kick synthetic input) for a frame
+                            // that may never come. A stale-descriptor stash (pre-HDR-flip) is
+                            // rejected by publish()'s guard: at worst the old wait-for-compose path.
+                            if let Some(t) = stash.texture()
+                                && p.publish(t, 0) == PublishOutcome::Published
+                            {
+                                dbglog!(
+                                    "[pf-vd] frame-push(driver): republished the retained frame into the fresh ring (target={target_id}) — instant first frame, no compose needed"
+                                );
+                            }
+                            publisher = Some(p);
+                        }
+                        Err(e) => {
+                            // Terminal for THIS delivery (pre-WP5 semantics): the host reads the
+                            // status and fails the open; a retry is a new delivery.
+                            dbglog!(
+                                "[pf-vd] frame-push(driver): open of the fresh ring failed ({e:?}, target={target_id}) — retiring the endpoint"
+                            );
+                            crate::monitor::clear_endpoint(target_id, ep.generation());
+                        }
+                    }
                 }
-                publisher = Some(p);
             }
             // The pending generation was serviced above — whichever branch ran, a lock-taking
             // check happened (`has_frame_channel` and/or `take_frame_channel`), so this pass has
@@ -705,6 +712,13 @@ impl SwapChainProcessor {
                                         Instant::now(),
                                     );
                                     publisher = None;
+                                    // A device-removal fatal poisons the DEVICE, not just the
+                                    // ring: flag the pool entry so every worker on it stops and
+                                    // the next assignment gets a fresh device (WP5 item 6).
+                                    // SAFETY: plain status query on the worker's live device.
+                                    if unsafe { device.device.GetDeviceRemovedReason() }.is_err() {
+                                        device.mark_removed();
+                                    }
                                 }
                             }
                         }
@@ -785,20 +799,15 @@ impl SwapChainProcessor {
             }
         }
 
-        // STEP 6 sibling-join fix: the drain loop exited (the OS unassigned this swap-chain — typically
-        // because a SIBLING display churned the desktop topology — or it errored), but the host-owned
-        // ring the publisher holds is still live. Hand it to the monitor so the NEXT worker assigned to
-        // this monitor resumes publishing into the same ring instead of freezing (the host re-delivers
-        // the channel only on a ring recreate). If the monitor is GONE (a genuine teardown, not a flap),
-        // `preserve_publisher` hands the publisher back inside the `Err` and dropping the returned
-        // `Result` closes the ring handles here — no leak, no stale ring left behind.
+        // Worker exit (the OS unassigned this swap-chain — typically a SIBLING display churned the
+        // topology — or it errored): the endpoint stays on the MONITOR for the next worker to
+        // re-open on its own device; the opened slots and the stash drop here. Tell the host the
+        // quiet ring is REBUILDING, not stalled. If the monitor is gone, this worker's `Arc` was
+        // the endpoint's last holder and dropping it closes the ring handles — no leak.
         if let Some(p) = publisher.take() {
-            let _ = crate::monitor::preserve_publisher(target_id, p);
+            p.endpoint().mark_rebuilding();
         }
-        // Preserve the first-frame stash alongside (dropped inside if empty or the monitor is gone
-        // — it owns no handles, just a driver-private texture). The next worker on this adapter
-        // re-adopts it, so the retained frame survives the flap too.
-        crate::monitor::preserve_stash(target_id, render_luid_low, render_luid_high, stash);
+        drop(stash);
     }
 }
 
