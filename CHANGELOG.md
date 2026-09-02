@@ -205,6 +205,14 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **The Siri Remote pointer no longer jumps toward wherever the surface is touched.** Contact
   and lift now come from the surface's touch report and the first 60 ms after contact are
   dropped, so only a swipe moves the host cursor; nothing to do.
+- **Every connected controller drives the desktop launcher, not just the newest one.** Menu mode
+  held one pad open, so a second controller was dead until a session attached and stayed dark
+  after the disconnect chord; it now holds them all and folds their input into one sample, and
+  the in-stream ring reads whichever pad opened it. Nothing to do — a pinned pad still forwards
+  alone.
+- **A Deck in Game Mode forwards every controller Steam Input wraps, not only the newest.** When
+  each connected pad is a Steam virtual gamepad none of them shadows a real one, so all are
+  forwarded instead of just the last. Nothing to do.
 
 ### Fixed
 
