@@ -31,8 +31,10 @@ SCCACHE_VERSION="${SCCACHE_VERSION:-0.10.0}"
 disable_sccache_wrappers() {
     shim_dir="${RUNNER_TEMP:-$(mktemp -d)}/sccache-passthrough"
     mkdir -p "$shim_dir"
+    # bash, not sh: dash drops environment names it cannot parse, and cargo's
+    # `CARGO_BIN_EXE_punktfunk-setup` has a hyphen, so `env!` in that test fails.
     printf '%s\n' \
-        '#!/bin/sh' \
+        '#!/bin/bash' \
         'case "$1" in' \
         '--version|--show-stats|--start-server|--stop-server) exit 0 ;;' \
         'esac' \

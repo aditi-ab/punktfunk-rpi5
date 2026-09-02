@@ -11,11 +11,9 @@ use std::io::Read as _;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// A failing connect must still produce a contract line. Port 1 on loopback refuses
-/// instantly and the all-zero pin keeps trust logic out of the way; whatever fails first
-/// on this machine — presenter init on a headless runner, the dial on a box with a
-/// display — the contract requires one `{"error"…}` JSON line on stdout saying so. (On a
-/// desktop this may flash a window for under a second; the connect refuses immediately.)
+/// A refused loopback connect emits one `{"error"…}` line on stdout. Presenter
+/// initialization may fail first on a headless runner, but either path satisfies
+/// the same contract before the deadline.
 #[test]
 fn a_failing_connect_still_speaks_the_contract() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_punktfunk-session"))

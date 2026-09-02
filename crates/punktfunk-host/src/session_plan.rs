@@ -289,3 +289,57 @@ fn resolve_encoder() -> EncoderBackend {
         _ => EncoderBackend::PlatformAuto,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::{ChromaFormat, Codec};
+
+    #[test]
+    fn resolve_limits_single_slice_clients() {
+        let plan = SessionPlan::resolve(
+            8,
+            false,
+            ChromaFormat::Yuv420,
+            Codec::H264,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(plan.max_slices, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cursor_forward_forces_blend_on_linux() {
+        assert!(cursor_blend_for(true, false, Codec::H264, 8));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gamescope_cursor_reader_matches_blend_rule() {
+        let cursor_blend = cursor_blend_for(false, true, Codec::H265, 10);
+        let gamescope_cursor = gamescope_cursor_for(true);
+
+        assert_eq!(cursor_blend, gamescope_cursor);
+        assert_eq!(cursor_blend, gamescope_needs_host_cursor(true));
+        assert!(!gamescope_cursor_for(false));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cursor_rules_are_disabled_on_windows() {
+        for cursor_forward in [false, true] {
+            for gamescope in [false, true] {
+                assert!(!cursor_blend_for(
+                    cursor_forward,
+                    gamescope,
+                    Codec::H265,
+                    10
+                ));
+                assert!(!gamescope_cursor_for(gamescope));
+            }
+        }
+    }
+}

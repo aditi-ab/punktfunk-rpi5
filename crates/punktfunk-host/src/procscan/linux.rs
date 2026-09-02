@@ -543,17 +543,19 @@ mod tests {
         assert!(s.alive(&[gone]).is_empty());
     }
 
-    /// Live `/proc`: spawn a process and find it. Fixture tests cannot catch a wrong `stat` field
-    /// order, uid filter, or uptime clock on this kernel.
+    /// Spawn a real process to cover kernel `/proc` fields, the uid filter, and uptime matching.
+    /// Fixture tests cannot prove those values agree with the running kernel.
     #[test]
     fn finds_a_real_process_it_just_started() {
-        // Copy a long-running binary *into* the install dir and run it from there: a wrapper that
-        // `exec`s something outside leaves no install-dir trace in image or argv.
-        // Keep the name `sleep`. Multi-call coreutils dispatches on `argv[0]`; any other name exits
-        // immediately and the matcher looks broken.
+        // Run a copied binary from the install dir; a wrapper leaves no trace there.
+        // Keep the basename because multi-call coreutils dispatches on `argv[0]`.
         let td = tempfile::tempdir().expect("tempdir");
         let game = td.path().join("sleep");
-        std::fs::copy("/bin/sleep", &game).expect("copy a stand-in game binary");
+        let sleep = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+            .map(|dir| dir.join("sleep"))
+            .find(|path| path.is_file())
+            .expect("sleep is on PATH");
+        std::fs::copy(sleep, &game).expect("copy a stand-in game binary");
         let s = Scanner::system();
         let before = s.now_stamp().expect("real /proc/uptime is readable");
 

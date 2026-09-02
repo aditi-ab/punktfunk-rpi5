@@ -4,7 +4,9 @@
 .DS_Store
 # generated C header is checked in (see include/), build artifacts are not
 /crates/*/target
+/crates/*/vendor/*/target
 /tools/*/target
+/packaging/windows/pf-vkhdr-layer/target
 node_modules/
 dist/
 # Swift package build artifacts + the locally-built xcframework (rebuild via scripts/build-xcframework.sh)

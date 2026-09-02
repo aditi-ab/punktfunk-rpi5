@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # shellcheck shell=bash
 # Does this box already have every Flathub dep a flatpak manifest declares?
 #   bash scripts/ci/flatpak-deps-present.sh <manifest.yml>   -> exit 0 = yes, 1 = no
