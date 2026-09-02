@@ -1131,7 +1131,7 @@
           "events"
         ],
         "summary": "Stream host lifecycle events (SSE)",
-        "description": "Server-Sent Events stream of the host's lifecycle events: client connect/disconnect, session\nand stream start/end, pairing decisions, display create/release, library changes, host\nstart/stop — both protocol planes. Frames carry `id:` = the event's monotonic `seq`,\n`event:` = its kind, and `data:` = the event JSON (schema-versioned, additive-only).\n\nResume: standard `Last-Event-ID` (or `?since=`) replays from the in-memory ring; a consumer\nthat fell off the ring receives an `event: dropped` frame first and should resync via the\nREST snapshots. Keep-alive comments are sent every 15 s.",
+        "description": "`id:` is `seq`, `event:` is kind, `data:` is HostEvent JSON. Resume with `Last-Event-ID`\nor `?since=`; `event: dropped` means the ring no longer has that cursor — resync from REST.\n`event: live` follows the catch-up; frames after it happened after you connected.",
         "operationId": "streamEvents",
         "parameters": [
           {
