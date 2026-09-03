@@ -54,6 +54,10 @@ dependencies plus:
 - Vulkan, Wayland, DRM/GBM, SDL3, PipeWire and Opus development files;
 - Rust 1.96.0, Clang/libclang, CMake, NASM and `pkg-config`.
 
+The fork enables SDL3's `build-from-source` Cargo feature for Linux. This matches
+the prior StreamOS ARM64 builder and removes an otherwise undeclared dependency on
+a sufficiently new system SDL3 package.
+
 Point `PKG_CONFIG_PATH` and the runtime loader at the Raspberry Pi FFmpeg prefix. For
 the StreamOS layout this is:
 
