@@ -6,7 +6,7 @@ on:
       tag:
         description: Existing draft-release tag to build
         required: true
-        default: v0.34.0-rpi5.2
+        default: v0.34.0-rpi5.3
 
 permissions:
   contents: write
@@ -28,7 +28,8 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential ca-certificates clang cmake gh git libasound2-dev \
             libclang-dev libdbus-1-dev libdecor-0-dev libdrm-dev libgbm-dev \
-            libopus-dev libpipewire-0.3-dev libpulse-dev libudev-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libopus-dev \
+            libpipewire-0.3-dev libpulse-dev libudev-dev \
             liburing-dev libva-dev libvulkan-dev libwayland-dev libxcursor-dev \
             libxext-dev libxfixes-dev libxi-dev libxinerama-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev libxss-dev \

@@ -1,0 +1,46 @@
+FROM rust:1.96.0-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        gh \
+        git \
+        libasound2-dev \
+        libclang-dev \
+        libdbus-1-dev \
+        libdecor-0-dev \
+        libdrm-dev \
+        libegl1-mesa-dev \
+        libgbm-dev \
+        libgl1-mesa-dev \
+        libgles2-mesa-dev \
+        libopus-dev \
+        libpipewire-0.3-dev \
+        libpulse-dev \
+        libudev-dev \
+        liburing-dev \
+        libva-dev \
+        libvulkan-dev \
+        libwayland-dev \
+        libxcursor-dev \
+        libxext-dev \
+        libxfixes-dev \
+        libxi-dev \
+        libxinerama-dev \
+        libxkbcommon-dev \
+        libxkbcommon-x11-dev \
+        libxrandr-dev \
+        libxss-dev \
+        libxtst-dev \
+        llvm-dev \
+        nasm \
+        patchelf \
+        pkg-config \
+        python3 \
+        wayland-protocols \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
