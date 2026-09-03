@@ -28,6 +28,8 @@ mod present_timing;
 mod reconfig;
 mod resources;
 mod setup;
+#[cfg(target_os = "linux")]
+mod wayland_frame;
 
 pub use setup::{list_adapters, probe_decode, AdapterDecode, PresentPref};
 
@@ -231,6 +233,10 @@ pub struct Presenter {
     video_fit: punktfunk_core::video_fit::VideoFit,
     /// Extent, frame size and draw path of the last logged placement.
     placement_logged: Option<(vk::Extent2D, u32, u32, &'static str)>,
+    /// Weston repaint-clock gate used when immediate Wayland WSI cannot expose
+    /// VK_KHR_present_wait. Boxed so listener data remains stable.
+    #[cfg(target_os = "linux")]
+    wayland_frame: Option<Box<wayland_frame::WaylandFramePacer>>,
 }
 
 impl Presenter {
@@ -267,6 +273,30 @@ impl Presenter {
     /// defers e2e/display windows to [`Presenter::take_presented_samples`].
     pub(crate) fn present_timing_active(&self) -> bool {
         self.present_timer.is_some()
+    }
+
+    /// True when Weston has opened the next compositor repaint. Non-Wayland
+    /// and present-wait paths remain unconditionally ready.
+    pub(crate) fn compositor_frame_ready(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(pacer) = &self.wayland_frame {
+            return pacer.ready();
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_compositor_wake(&self, cb: Box<dyn Fn() + Send>) {
+        if let Some(pacer) = &self.wayland_frame {
+            pacer.set_wake(cb);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn arm_compositor_frame(&self) {
+        if let Some(pacer) = &self.wayland_frame {
+            pacer.arm();
+        }
     }
 
     /// Claim the just-submitted present for on-glass timing. Call right after a
