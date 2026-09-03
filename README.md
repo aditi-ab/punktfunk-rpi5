@@ -11,6 +11,10 @@
 > [Raspberry Pi 5 fork notes](docs/streamos-rpi5.md) for the exact changes,
 > rationale, build and test commands, hardware-validation checklist, and upstream
 > rebase policy. General Punktfunk documentation below remains upstream's.
+>
+> The ARM64 release bundle also runs on a regular 64-bit Raspberry Pi OS system;
+> StreamOS is a consumer, not a runtime dependency. See
+> [Raspberry Pi 5 installation](docs/raspberry-pi-5.md).
 
 Run the host on a Linux machine or a Windows PC, connect from a Mac, PC, phone, tablet, or TV, and
 stream your desktop or games — each device at its **own native resolution and refresh rate**, over

@@ -1,0 +1,46 @@
+name: Raspberry Pi 5 release assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft-release tag to build
+        required: true
+        default: v0.34.0-rpi5.1
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates clang cmake git libasound2-dev \
+            libclang-dev libdbus-1-dev libdecor-0-dev libdrm-dev libgbm-dev \
+            libopus-dev libpipewire-0.3-dev libpulse-dev libudev-dev \
+            liburing-dev libva-dev libvulkan-dev libwayland-dev libxcursor-dev \
+            libxext-dev libxfixes-dev libxi-dev libxinerama-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev libxss-dev \
+            libxtst-dev llvm-dev nasm patchelf pkg-config python3
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - name: Build the portable ARM64 bundle
+        run: packaging/rpi5/build-release.sh "${{ inputs.tag }}" dist
+
+      - name: Upload assets to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ inputs.tag }}" >/dev/null
+          gh release upload "${{ inputs.tag }}" dist/*
