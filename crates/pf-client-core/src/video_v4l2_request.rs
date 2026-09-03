@@ -108,7 +108,13 @@ impl V4l2RequestDecoder {
                 bail!("could not allocate FFmpeg packet/frame storage");
             }
             (*planar).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
-            Ok(Self { ctx, _hw_device: hw_device, packet, frame, planar })
+            Ok(Self {
+                ctx,
+                _hw_device: hw_device,
+                packet,
+                frame,
+                planar,
+            })
         }
     }
 
@@ -164,7 +170,10 @@ impl V4l2RequestDecoder {
             }
             let status = ffi::av_frame_make_writable(self.planar);
             if status < 0 {
-                return Err(av_error("making the planar transfer frame writable", status));
+                return Err(av_error(
+                    "making the planar transfer frame writable",
+                    status,
+                ));
             }
             let status = ffi::av_hwframe_transfer_data(self.planar, self.frame, 0);
             if status < 0 {
@@ -174,7 +183,11 @@ impl V4l2RequestDecoder {
             let width = (*self.planar).width as u32;
             let height = (*self.planar).height as u32;
             let (chroma_width, chroma_height) = CpuPlanarFrame::chroma_dims(width, height);
-            let dimensions = [(width, height), (chroma_width, chroma_height), (chroma_width, chroma_height)];
+            let dimensions = [
+                (width, height),
+                (chroma_width, chroma_height),
+                (chroma_width, chroma_height),
+            ];
             let mut planes: [&[u8]; 3] = [&[]; 3];
             let mut strides = [0usize; 3];
             for index in 0..3 {
@@ -200,8 +213,7 @@ impl V4l2RequestDecoder {
                     primaries: (*self.frame).color_primaries as u8,
                     transfer: (*self.frame).color_trc as u8,
                     matrix: (*self.frame).colorspace as u8,
-                    full_range: (*self.frame).color_range
-                        == ffi::AVColorRange::AVCOL_RANGE_JPEG,
+                    full_range: (*self.frame).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG,
                 },
                 flags & ffi::AV_FRAME_FLAG_KEY != 0
                     || (*self.frame).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I,
@@ -226,7 +238,9 @@ fn av_error(operation: &str, status: i32) -> anyhow::Error {
     let mut buffer = [0u8; 128];
     let message = unsafe {
         if ffi::av_strerror(status, buffer.as_mut_ptr(), buffer.len()) == 0 {
-            CStr::from_ptr(buffer.as_ptr()).to_string_lossy().into_owned()
+            CStr::from_ptr(buffer.as_ptr())
+                .to_string_lossy()
+                .into_owned()
         } else {
             format!("FFmpeg error {status}")
         }
