@@ -127,7 +127,7 @@ if ldd "${bundle}/punktfunk" "${bundle}/punktfunk-session" | grep -q 'not found'
 fi
 
 archive=${output}/${bundle_name}.tar.gz
-tar --sort=name --mtime="@$(git -C "${repo_root}" show -s --format=%ct "${tag}")" \
+tar --sort=name --mtime="@$(git -C "${repo_root}" show -s --format=%ct "${tag}^{commit}")" \
     --owner=0 --group=0 --numeric-owner -C "${work}" -czf "${archive}" "${bundle_name}"
 (
     cd "${output}"

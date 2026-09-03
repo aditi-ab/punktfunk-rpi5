@@ -62,9 +62,10 @@ git tag -a v0.34.0-rpi5.3-local.1 -m "Local Raspberry Pi 5 release test"
 ```
 
 The container runs as ARM64 even on an x86-64 workstation and mirrors the
-Debian Bookworm build environment used by GitHub Actions. On an ARM64 Linux
-host, install the packages listed in `.github/workflows/rpi5-release.yml` and
-run:
+Debian Bookworm build environment used by GitHub Actions. Named Docker volumes
+retain Cargo downloads and compiled dependencies between isolated test runs. On
+an ARM64 Linux host, install the packages listed in
+`.github/workflows/rpi5-release.yml` and run:
 
 ```sh
 packaging/rpi5/build-release.sh v0.34.0-rpi5.3 dist
