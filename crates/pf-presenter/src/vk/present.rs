@@ -528,7 +528,10 @@ impl Presenter {
                         .render_pass(self.overlay_pipe.render_pass)
                         .framebuffer(self.overlay_pipe.framebuffers[index as usize])
                         .render_area(vk::Rect2D {
-                            offset: vk::Offset2D { x: 0, y: o.scissor_y as i32 },
+                            offset: vk::Offset2D {
+                                x: 0,
+                                y: o.scissor_y as i32,
+                            },
                             extent: vk::Extent2D {
                                 width: self.extent.width,
                                 height: o.scissor_height,
@@ -557,7 +560,10 @@ impl Presenter {
                     self.cmd_buf,
                     0,
                     &[vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: o.scissor_y as i32 },
+                        offset: vk::Offset2D {
+                            x: 0,
+                            y: o.scissor_y as i32,
+                        },
                         extent: vk::Extent2D {
                             width: self.extent.width,
                             height: o.scissor_height,

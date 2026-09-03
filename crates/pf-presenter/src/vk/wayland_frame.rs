@@ -33,7 +33,7 @@ unsafe extern "C" {
         interface: *const WlInterface,
         version: c_uint,
         flags: c_uint,
-        ...,
+        ...
     ) -> *mut WlProxy;
     fn wl_proxy_add_listener(
         proxy: *mut WlProxy,

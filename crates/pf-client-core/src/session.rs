@@ -1629,11 +1629,7 @@ fn codec_fallback_event(
 /// Reconcile timeline positions already emitted by drought PLC with the next received packet.
 /// Returns `(still_missing, discard_received_packet)`. PLC already advances decoder state, so a
 /// delayed packet in a covered timeline position must not be decoded or queued a second time.
-fn reconcile_drought(
-    covered_arrivals: &mut u32,
-    drought_frames: u32,
-    missing: u32,
-) -> (u32, bool) {
+fn reconcile_drought(covered_arrivals: &mut u32, drought_frames: u32, missing: u32) -> (u32, bool) {
     *covered_arrivals = (*covered_arrivals).saturating_add(drought_frames);
     let covered_missing = (*covered_arrivals).min(missing);
     *covered_arrivals -= covered_missing;
@@ -1809,11 +1805,8 @@ fn spawn_audio(
                         // Sequence gaps consume concealed timeline positions first. Any gap
                         // beyond those positions still needs ordinary decoder concealment. A
                         // received packet already emitted by PLC is skipped entirely.
-                        let (missing_to_conceal, discard_packet) = reconcile_drought(
-                            &mut covered_arrivals,
-                            drought_frames,
-                            missing,
-                        );
+                        let (missing_to_conceal, discard_packet) =
+                            reconcile_drought(&mut covered_arrivals, drought_frames, missing);
                         if drought_frames > 0 {
                             tracing::debug!(
                                 drought_frames,
@@ -1919,11 +1912,8 @@ mod tests {
         let mut covered = 0;
         // Four synthesized frames followed by the same four delayed packets.
         for expected_remaining in (0..4).rev() {
-            let (missing, discard) = reconcile_drought(
-                &mut covered,
-                if expected_remaining == 3 { 4 } else { 0 },
-                0,
-            );
+            let (missing, discard) =
+                reconcile_drought(&mut covered, if expected_remaining == 3 { 4 } else { 0 }, 0);
             assert_eq!(missing, 0);
             assert!(discard);
             assert_eq!(covered, expected_remaining);
