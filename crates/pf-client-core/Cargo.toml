@@ -112,6 +112,8 @@ rav1d = { version = "1", default-features = false, features = ["bitdepth_8"], op
 # 123 on Windows, and rav1d re-exports only `Dav1dResult`, so the typed enum that would
 # otherwise name it is out of reach. Already in the tree (rav1d's own dependency).
 libc = { version = "0.2", optional = true }
+# StreamOS Raspberry Pi 5 HEVC V4L2 Request decoder.
+ffmpeg-sys-next = { version = "9", optional = true }
 
 # Opus for the audio planes. The VIDEO side has no FFmpeg at all since M10: every decode
 # rung is native (pf-vkdecode / pf-dxvadec / pf-vaapi / openh264+rav1d) and the codec
@@ -286,6 +288,8 @@ desktop = [
     "dep:pipewire", "dep:sdl3", "dep:zbus", "dep:pf-vaapi", "dep:pf-libva", "dep:libloading", "dep:x11rb",
     "dep:wasapi", "dep:pf-dxvadec", "dep:winreg", "dep:windows",
 ]
+# StreamOS Raspberry Pi 5 HEVC decode through the downstream FFmpeg V4L2 Request API.
+rpi5-v4l2-request = ["desktop", "dep:ffmpeg-sys-next"]
 # PyroWave client decode ships in every default build (flatpak included; pyrowave-sys is a
 # vendored in-repo tree, offline-safe, and an empty stub off Linux/Windows). The codec is
 # still strictly per-session opt-in (Settings codec pick / PUNKTFUNK_PREFER_PYROWAVE=1).

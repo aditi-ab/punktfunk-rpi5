@@ -189,6 +189,14 @@ pub mod video_csc_spv;
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 mod video_software;
 // Native VAAPI: pf-vaapi plans into dlopen'd libva, DRM-PRIME dmabufs for the presenter.
+// StreamOS Raspberry Pi 5 HEVC decoder: FFmpeg V4L2 Request with NEON SAND detiling.
+// Kept as a separately pinned backend because upstream Punktfunk has no V4L2 rung.
+#[cfg(all(
+    feature = "rpi5-v4l2-request",
+    feature = "desktop",
+    target_os = "linux"
+))]
+pub mod video_v4l2_request;
 // Only VAAPI rung; `auto` reaches it when vendor order puts VAAPI first, or pin `PUNKTFUNK_DECODER=native-vaapi`. Evidence: `video`.
 #[cfg(all(feature = "desktop", target_os = "linux"))]
 pub mod video_vaapi_native;

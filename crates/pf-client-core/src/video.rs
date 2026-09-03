@@ -54,6 +54,9 @@ pub enum DecodedImage {
     /// `stats:` decode-path tag; renaming it would rename that.
     #[cfg(target_os = "linux")]
     NativeDmabuf(DmabufFrame),
+    /// Raspberry Pi HEVC V4L2 Request output after NEON SAND detiling.
+    #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+    V4l2Planar(CpuPlanarFrame),
     /// D3D11VA shareable NT-handle texture the presenter imports
     /// (`VK_KHR_external_memory_win32`) on GPUs without Vulkan Video.
     #[cfg(windows)]
@@ -268,6 +271,8 @@ impl DecodedImage {
             DecodedImage::Cpu(f) => f.keyframe,
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => f.keyframe,
+            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+            DecodedImage::V4l2Planar(f) => f.keyframe,
             #[cfg(windows)]
             DecodedImage::D3d11(f) => f.keyframe,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
@@ -324,6 +329,8 @@ impl DecodedImage {
             DecodedImage::Cpu(f) => (f.width, f.height),
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => (f.width, f.height),
+            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+            DecodedImage::V4l2Planar(f) => (f.width, f.height),
             #[cfg(windows)]
             DecodedImage::D3d11(f) => (f.width, f.height),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
@@ -484,6 +491,8 @@ enum Backend {
     /// Native VAAPI (`pf-vaapi`). Pinnable as `native-vaapi`; `auto` reaches it
     /// in vendor order. Unverified ([`native_evidence`]), so `auto` yields to
     /// proven Vulkan ([`native_rung_admitted`]). Boxed: two planners + pools.
+    #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+    V4l2Request(Box<crate::video_v4l2_request::V4l2RequestDecoder>),
     #[cfg(target_os = "linux")]
     NativeVaapi(Box<crate::video_vaapi_native::NativeVaapiDecoder>),
     /// Native D3D11VA (`pf-dxvadec`): plans into the shareable-RGBA hand-off ring.
@@ -1085,6 +1094,8 @@ fn log_rung(backend: &Backend, wire: u8) {
             NativeRung::D3d11va.name(),
             Some(native_evidence(NativeRung::D3d11va, wire)),
         ),
+        #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+        Backend::V4l2Request(_) => ("v4l2-request", None),
         #[cfg(target_os = "linux")]
         Backend::NativeVaapi(_) => (
             NativeRung::Vaapi.name(),
@@ -1218,6 +1229,19 @@ impl Decoder {
                     "PUNKTFUNK_DECODER=native-d3d11va refused (the presenter's device lacks \
                      the win32 external-memory import extensions) — standard ladder"
                 ),
+            }
+            choice = "auto".to_string();
+        }
+        #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+        if choice == crate::video_v4l2_request::DECODER_PIN {
+            match crate::video_v4l2_request::V4l2RequestDecoder::new(wire) {
+                Ok(d) => {
+                    tracing::info!(codec = codec_name, decoder = d.name(),
+                        "Raspberry Pi V4L2 Request HEVC hardware decode active (NEON SAND transfer)");
+                    return done(Backend::V4l2Request(Box::new(d)));
+                }
+                Err(e) => tracing::warn!(reason = %format!("{e:#}"),
+                    "V4L2 Request init failed — demoting to the standard ladder"),
             }
             choice = "auto".to_string();
         }
@@ -1627,6 +1651,11 @@ impl Decoder {
                 }
                 r
             }
+            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+            Backend::V4l2Request(v) => {
+                debug_assert!(complete, "partial AUs are pyrowave-only");
+                v.decode(au).map(|f| f.map(DecodedImage::V4l2Planar))
+            }
             #[cfg(target_os = "linux")]
             Backend::NativeVaapi(v) => {
                 debug_assert!(complete, "partial AUs are pyrowave-only");
@@ -1674,6 +1703,8 @@ impl Decoder {
                     Backend::NativeVulkan(_) => "native Vulkan Video",
                     #[cfg(windows)]
                     Backend::NativeD3d11va(_) => "native D3D11VA",
+                    #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+                    Backend::V4l2Request(_) => "V4L2 Request",
                     #[cfg(target_os = "linux")]
                     Backend::NativeVaapi(_) => "native VAAPI",
                     // PyroWave returns above and software never reaches here.
