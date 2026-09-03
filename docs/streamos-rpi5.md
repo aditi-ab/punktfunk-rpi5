@@ -87,6 +87,19 @@ decoder or optimized SAND transfer path.
 
 ## Verification
 
+The fork integration was checked on 2026-09-03 with:
+
+```sh
+cargo test --locked -p pf-client-core -p pf-presenter -p pf-console-ui
+```
+
+This passed 277 `pf-client-core`, 64 `pf-presenter`, and 231 `pf-console-ui`
+tests (with the existing hardware-dependent ignored tests left ignored), plus their
+documentation tests. A native `aarch64-unknown-linux-gnu` release build of those
+three affected crates also passed under a `linux/arm64` container using the StreamOS
+Raspberry Pi FFmpeg prefix. This records integration coverage, not a substitute for
+the physical acceptance run below.
+
 Run the complete Rust test suite after every downstream or upstream change:
 
 ```sh
