@@ -1183,6 +1183,8 @@ fn pump(
                             DecodedImage::Cpu(_) => "software",
                             #[cfg(target_os = "linux")]
                             DecodedImage::NativeDmabuf(_) => "native-vaapi",
+                            #[cfg(target_os = "linux")]
+                            DecodedImage::V4l2Planar(_) => "v4l2-request",
                             #[cfg(windows)]
                             DecodedImage::D3d11(_) => "native-d3d11va",
                             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
@@ -1195,6 +1197,10 @@ fn pump(
                                 #[cfg(target_os = "linux")]
                                 DecodedImage::NativeDmabuf(d) => {
                                     (d.width, d.height, "native-vaapi-dmabuf")
+                                }
+                                #[cfg(target_os = "linux")]
+                                DecodedImage::V4l2Planar(d) => {
+                                    (d.width, d.height, "v4l2-request-planar")
                                 }
                                 #[cfg(windows)]
                                 DecodedImage::D3d11(d) => (d.width, d.height, "native-d3d11va"),

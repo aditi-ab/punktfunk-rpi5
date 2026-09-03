@@ -1986,7 +1986,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             }
                         }
                     }
-                    DecodedImage::Cpu(c) => {
+                    DecodedImage::Cpu(c) | DecodedImage::V4l2Planar(c) => {
                         st.hdr = c.color.is_pq();
                         // Software lane uploads planes into the same planar CSC pass as
                         // hardware, so PQ is tone-mapped there too.

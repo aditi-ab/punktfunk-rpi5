@@ -100,6 +100,8 @@ rav1d = { version = "1", default-features = false, features = ["bitdepth_8"] }
 # 123 on Windows, and rav1d re-exports only `Dav1dResult`, so the typed enum that would
 # otherwise name it is out of reach. Already in the tree (rav1d's own dependency).
 libc = "0.2"
+# StreamOS Raspberry Pi 5 HEVC V4L2 Request decoder.
+ffmpeg-sys-next = "9"
 
 # Opus for the audio planes. The VIDEO side has no FFmpeg at all since M10: every decode
 # rung is native (pf-vkdecode / pf-dxvadec / pf-vaadec / openh264+rav1d) and the codec
