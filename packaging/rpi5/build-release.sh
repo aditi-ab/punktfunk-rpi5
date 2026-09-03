@@ -65,34 +65,6 @@ git -C "${ffmpeg_source}" checkout --detach "${ffmpeg_ref}"
     make install
 )
 
-# Cargo resolves every workspace member before applying target cfgs. Keep the
-# release source immutable and remove non-Linux members only in the archive copy.
-python3 - "${source_tree}" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-root = Path(sys.argv[1])
-workspace = root / "Cargo.toml"
-text = workspace.read_text(encoding="utf-8")
-text = text.replace('    "clients/windows",\n', "")
-text = text.replace('    "crates/punktfunk-setup-win",\n', "")
-workspace.write_text(text, encoding="utf-8")
-
-core = root / "crates/pf-client-core/Cargo.toml"
-text = core.read_text(encoding="utf-8")
-text, count = re.subn(
-    r"\n\[target\.'cfg\(windows\)'\.dependencies\]\n.*?(?=\n\[target\.)",
-    "\n",
-    text,
-    count=1,
-    flags=re.DOTALL,
-)
-if count != 1:
-    raise SystemExit("Windows-only pf-client-core dependency block not found")
-core.write_text(text, encoding="utf-8")
-PY
-
 (
     cd "${source_tree}"
     export CARGO_TARGET_DIR="${target_dir}"
