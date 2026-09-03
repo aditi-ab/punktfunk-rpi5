@@ -76,7 +76,6 @@ root = Path(sys.argv[1])
 workspace = root / "Cargo.toml"
 text = workspace.read_text(encoding="utf-8")
 text = text.replace('    "clients/windows",\n', "")
-text = text.replace('    "clients/android/native",\n', "")
 text = text.replace('    "crates/punktfunk-setup-win",\n', "")
 workspace.write_text(text, encoding="utf-8")
 
