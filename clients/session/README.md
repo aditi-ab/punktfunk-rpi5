@@ -91,7 +91,7 @@ session names the rung it landed on with its evidence state,
 rung/codec pair the session chose. `pf-client-core`'s `video.rs` module docs carry the full
 table; read any field report about M10 against it.
 
-Debug/bisect knobs: `PUNKTFUNK_DECODER=native-vulkan|native-vaapi|native-d3d11va|software`
+Debug/bisect knobs: `PUNKTFUNK_DECODER=native-vulkan|native-vaapi|native-d3d11va|v4l2-request|software`
 (a pin skips the vendor order, which is how a lab run reaches a rung `auto` will not pick
 on this device; a pinned rung that cannot open still falls through to the standard ladder,
 loudly; `native-vaapi` also takes `PUNKTFUNK_VAAPI_DEVICE=/dev/dri/renderDNNN` to choose
