@@ -26,7 +26,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates clang cmake git libasound2-dev \
+            build-essential ca-certificates clang cmake gh git libasound2-dev \
             libclang-dev libdbus-1-dev libdecor-0-dev libdrm-dev libgbm-dev \
             libopus-dev libpipewire-0.3-dev libpulse-dev libudev-dev \
             liburing-dev libva-dev libvulkan-dev libwayland-dev libxcursor-dev \
