@@ -94,6 +94,22 @@ cp -a \
     "${bundle}/lib/"
 install -m 0644 "${target_dir}/release/libSDL3.so.0" "${bundle}/lib/libSDL3.so.0"
 
+SDL3_LIBRARY="${bundle}/lib/libSDL3.so.0" python3 <<'PY'
+import ctypes
+import os
+
+sdl = ctypes.CDLL(os.environ["SDL3_LIBRARY"])
+sdl.SDL_GetNumVideoDrivers.restype = ctypes.c_int
+sdl.SDL_GetVideoDriver.argtypes = [ctypes.c_int]
+sdl.SDL_GetVideoDriver.restype = ctypes.c_char_p
+drivers = {
+    sdl.SDL_GetVideoDriver(index).decode("utf-8")
+    for index in range(sdl.SDL_GetNumVideoDrivers())
+}
+if "wayland" not in drivers:
+    raise SystemExit(f"release SDL3 has no Wayland video driver: {sorted(drivers)}")
+PY
+
 patchelf --set-rpath "\$ORIGIN/lib" "${bundle}/punktfunk" "${bundle}/punktfunk-session"
 install -m 0755 "${repo_root}/packaging/rpi5/install.sh" "${bundle}/install.sh"
 install -m 0644 "${repo_root}/packaging/rpi5/README.bundle.md" "${bundle}/README.md"
