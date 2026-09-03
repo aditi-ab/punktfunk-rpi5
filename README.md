@@ -9,6 +9,10 @@
 > the Pi 5 V4L2 Request decoder and the StreamOS presentation and audio fixes.
 > See [Raspberry Pi 5 fork notes](docs/streamos-rpi5.md) for the maintained
 > downstream delta, release process, validation record, and update procedure.
+>
+> The ARM64 release bundle also runs on a regular 64-bit Raspberry Pi OS system;
+> StreamOS is a consumer, not a runtime dependency. See
+> [Raspberry Pi 5 installation](docs/raspberry-pi-5.md).
 
 Run the host on a Linux or Windows PC and stream your desktop or games to a Mac, PC, phone, tablet
 or TV. Each client gets **its own virtual display at its own native resolution and refresh rate**,
