@@ -8,9 +8,11 @@
 > This is the Aditi/StreamOS Raspberry Pi 5 fork. It tracks Punktfunk v0.34.0-era
 > upstream code at commit `90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2` and permanently
 > integrates the four Pi 5 client patches used by StreamOS. See
-> [Raspberry Pi 5 fork notes](docs/streamos-rpi5.md) for the exact changes,
-> rationale, build and test commands, hardware-validation checklist, and upstream
-> rebase policy. General Punktfunk documentation below remains upstream's.
+> [Raspberry Pi 5 fork notes](docs/streamos-rpi5.md) for the build contract,
+> validation record, and upstream-rebase procedure, and the
+> [patch rationale](docs/streamos-rpi5-patch-rationale.md) for the exact commit
+> map, observed failures, causes, and upstream applicability. General Punktfunk
+> documentation below remains upstream's.
 >
 > The ARM64 release bundle also runs on a regular 64-bit Raspberry Pi OS system;
 > StreamOS is a consumer, not a runtime dependency. See

@@ -12,6 +12,8 @@ That commit is a descendant of the annotated `v0.34.0` release tag. The fork kee
 the Raspberry Pi changes as four separate commits, in the same order as the former
 StreamOS patch series. This makes each downstream concern reviewable and allows an
 upstream update to fail visibly at the exact change that needs a deliberate rebase.
+The detailed symptom, cause, implementation, classification, and exact commit map
+is maintained in [the patch rationale](streamos-rpi5-patch-rationale.md).
 
 ## Integrated changes and rationale
 
