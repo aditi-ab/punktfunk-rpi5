@@ -56,10 +56,21 @@ impl Presenter {
             // and land back here once the window has a size.
             return Ok(());
         }
-        let mut min_images = caps.min_image_count + 1;
+        let requested_images = std::env::var("PUNKTFUNK_SWAPCHAIN_IMAGES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let mut min_images = (caps.min_image_count + 1).max(requested_images);
         if caps.max_image_count > 0 {
             min_images = min_images.min(caps.max_image_count);
         }
+        tracing::info!(
+            surface_min_images = caps.min_image_count,
+            surface_max_images = caps.max_image_count,
+            requested_images,
+            swapchain_images = min_images,
+            "swapchain image count"
+        );
 
         // Drain before create: `oldSwapchain` is externally synchronised, so
         // the driver may retire it under a parked `vkWaitForPresentKHR`.

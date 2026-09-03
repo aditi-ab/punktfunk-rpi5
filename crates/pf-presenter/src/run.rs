@@ -574,6 +574,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             let _ = sender.push_custom_event(FrameWake);
         }));
     }
+    #[cfg(target_os = "linux")]
+    {
+        let sender = events.event_sender();
+        presenter.set_compositor_wake(Box::new(move || {
+            let _ = sender.push_custom_event(FrameWake);
+        }));
+    }
     // Browse is "ready" the moment the library window presents — there may never be a
     // stream. Single mode announces on the first video frame instead.
     if opts.json_status && matches!(mode, ModeCtl::Browse(_)) {
@@ -1910,7 +1917,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             // smoothness serves the frame whose due time has come.
             let now_ns = session::now_ns();
             st.pacer.follow(st.cadence.verdict());
-            let mut to_present = if st.store.is_smoothing() {
+            let mut to_present = if !presenter.compositor_frame_ready() {
+                None
+            } else if st.store.is_smoothing() {
                 if st.pacer.free_running() {
                     // Variable refresh, measured: the panel refreshes when we present, so
                     // there is no grid to aim at and the due time is the target.

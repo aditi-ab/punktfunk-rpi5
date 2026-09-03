@@ -242,7 +242,7 @@ impl Presenter {
 
         // SAFETY: `swapchain` and `acquire_sem` are owned here. Fence wait above
         // completed the last submit that waited `acquire_sem`, so it is not pending.
-        let (index, _suboptimal) = match unsafe {
+        let (index, acquire_suboptimal) = match unsafe {
             self.swap_d.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
@@ -681,15 +681,27 @@ impl Presenter {
             }
             // Same queue external-sync as the submit. Scoped tightly: OUT_OF_DATE
             // re-enters the lock via `recreate_swapchain`'s queue drain.
+            // The Wayland frame request becomes part of the wl_surface state
+            // committed by this WSI present. Its done event opens the next slot.
+            #[cfg(target_os = "linux")]
+            self.arm_compositor_frame();
             let present_res = {
                 let _q = self.queue_lock.guard();
                 self.swap_d.queue_present(self.queue, &present_info)
             };
             match present_res {
-                Ok(_) => {
+                Ok(present_suboptimal) => {
                     // A failed present's id may never signal — claim it only on Ok.
                     if self.present_timer.is_some() {
                         self.last_presented = Some((self.swapchain, self.next_present_id));
+                    }
+                    if acquire_suboptimal || present_suboptimal {
+                        tracing::info!(
+                            acquire_suboptimal,
+                            present_suboptimal,
+                            "swapchain suboptimal after compositor feedback; recreating"
+                        );
+                        self.recreate_swapchain(window)?;
                     }
                     Ok(true)
                 }

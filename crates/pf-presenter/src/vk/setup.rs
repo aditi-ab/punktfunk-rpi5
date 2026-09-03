@@ -586,6 +586,12 @@ impl Presenter {
             )
         }?;
 
+        #[cfg(target_os = "linux")]
+        let wayland_frame = (present_mode == vk::PresentModeKHR::IMMEDIATE
+            && present_timer.is_none())
+            .then(|| super::wayland_frame::WaylandFramePacer::new(window))
+            .flatten();
+
         let mut p = Presenter {
             entry,
             instance,
@@ -630,6 +636,8 @@ impl Presenter {
             present_timer,
             next_present_id: 0,
             last_presented: None,
+            #[cfg(target_os = "linux")]
+            wayland_frame,
         };
         p.recreate_swapchain(window)?;
         Ok(p)
