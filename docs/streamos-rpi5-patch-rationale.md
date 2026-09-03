@@ -218,6 +218,9 @@ runtime bug patches:
 | [`d078c848`](https://github.com/aditi-ab/punktfunk-rpi5/commit/d078c8482d88e2917129aa98d9f27fa1063b7d37) | Bundles the SDL3 runtime required by the standalone binaries. |
 | [`06445740`](https://github.com/aditi-ab/punktfunk-rpi5/commit/0644574049680b0d9e37e8b6d137f4119bdf4b9c) | Installs the release uploader in CI. |
 | [`a360a44e`](https://github.com/aditi-ab/punktfunk-rpi5/commit/a360a44e841a40450cdf1c9b5e38afaf0f4f84a3) | Requires Wayland support in the SDL3 runtime and verifies it before publishing. |
+| [`3477efa2`](https://github.com/aditi-ab/punktfunk-rpi5/commit/3477efa2) | Restores SDL's Wayland prerequisites and adds the local ARM64 release preflight. |
+| [`823e072d`](https://github.com/aditi-ab/punktfunk-rpi5/commit/823e072d) | Dereferences annotated tags when normalizing archive timestamps. |
+| [`2a8c48c4`](https://github.com/aditi-ab/punktfunk-rpi5/commit/2a8c48c4) | Keeps local release output outside version control. |
 
 Documentation and repository-identification commits are intentionally omitted
 from that implementation table but remain visible in the base-to-tag Git log.
