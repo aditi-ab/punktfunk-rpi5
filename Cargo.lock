@@ -3139,6 +3139,7 @@ dependencies = [
  "anyhow",
  "ash",
  "async-channel",
+ "ffmpeg-sys-next",
  "libc",
  "libloading 0.9.0",
  "log",
