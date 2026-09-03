@@ -8,8 +8,8 @@ libraries.
 
 Release bundles are built natively on ARM64 Ubuntu 22.04 to keep the glibc floor
 compatible with 64-bit Raspberry Pi OS Bookworm and newer Ubuntu/Debian systems.
-They include `punktfunk`, `punktfunk-session`, and the matching Raspberry Pi
-FFmpeg shared libraries. SDL3 and Skia are built into the client; Vulkan,
+They include `punktfunk`, `punktfunk-session`, SDL3, and the matching Raspberry
+Pi FFmpeg shared libraries. Skia is built into the client; Vulkan,
 Wayland, PipeWire, DRM, input and the graphics driver come from the target OS.
 
 The bundle expects:

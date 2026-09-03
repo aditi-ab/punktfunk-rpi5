@@ -92,6 +92,7 @@ cp -a \
     "${ffmpeg_prefix}"/lib/libswresample.so* \
     "${ffmpeg_prefix}"/lib/libswscale.so* \
     "${bundle}/lib/"
+install -m 0644 "${target_dir}/release/libSDL3.so.0" "${bundle}/lib/libSDL3.so.0"
 
 patchelf --set-rpath "\$ORIGIN/lib" "${bundle}/punktfunk" "${bundle}/punktfunk-session"
 install -m 0755 "${repo_root}/packaging/rpi5/install.sh" "${bundle}/install.sh"
