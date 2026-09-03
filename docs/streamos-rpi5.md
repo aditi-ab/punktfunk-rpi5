@@ -151,26 +151,80 @@ StreamOS services which own them.
 
 ## Updating from upstream
 
-Keep `upstream` pointed at the canonical repository:
+Update against a named upstream tag or reviewed commit. Do not rebase onto a moving
+branch without first recording the exact commit selected. Keep `upstream` pointed at
+the canonical repository:
 
 ```sh
 git remote add upstream https://git.unom.io/unom/punktfunk.git  # first time only
 git fetch upstream --tags
+git fetch origin
 ```
 
-Create a temporary rebase branch, move the four downstream commits onto the chosen
-upstream commit, and validate before updating `main`:
+Start from the current fork tip and create a temporary integration branch. For
+example, when updating to upstream v0.35.0:
 
 ```sh
-git switch -c rebase/upstream-<date> main
-git rebase --onto <new-upstream-commit> 90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2
+git switch main
+git pull --ff-only origin main
+git switch -c update/v0.35.0-rpi5
+git show upstream/v0.35.0
+git rebase --reapply-cherry-picks --empty=stop \
+  --onto upstream/v0.35.0 \
+  90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2
+```
+
+The rebase replays all fork commits after the old upstream base. This includes the
+four runtime patches, their tests, and the supporting build, packaging, and
+documentation commits. For later releases, replace the old base SHA with the
+upstream base recorded for the previous fork release.
+
+If Git stops, inspect and resolve that commit deliberately:
+
+```sh
+git status
+# Edit the conflicted files and review the result.
+git add <resolved-files>
+git rebase --continue
+```
+
+Never use `git rebase --skip`. `--reapply-cherry-picks` prevents Git from omitting a
+matching change without attempting it, while `--empty=stop` requires a decision when
+upstream has made a downstream commit unnecessary. Abort an unsuitable attempt with
+`git rebase --abort`.
+
+Compare the old and new series before testing:
+
+```sh
+git range-diff \
+  90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2..v0.34.0-rpi5.1 \
+  upstream/v0.35.0..HEAD
+git log --oneline upstream/v0.35.0..HEAD
 cargo test --workspace
 ```
 
-For subsequent rebases, replace the old base in that command with the fork's previously
-recorded upstream base. Resolve every conflict intentionally and review the resulting
-diff. Never use a strategy that silently drops a commit or hunk. Do not update `main`
-until tests, the ARM64 release build, and the physical Pi 5 1080p60 checklist pass.
+Run the ARM64 release workflow and the physical Pi 5 1080p60 checklist before updating
+`main`. If review passes, publish the integration branch and update `main` with a
+guarded force push:
+
+```sh
+git push origin update/v0.35.0-rpi5
+git push --force-with-lease origin update/v0.35.0-rpi5:main
+```
+
+Rebasing changes downstream commit IDs. `--force-with-lease` prevents overwriting
+unexpected remote work. Never move an existing published release tag; create and push
+a new annotated tag instead:
+
+```sh
+git tag -a v0.35.0-rpi5.1 \
+  -m "Punktfunk v0.35.0 for Raspberry Pi 5 - revision 1"
+git push origin v0.35.0-rpi5.1
+```
+
+Update the recorded upstream base, patch rationale, release notes, StreamOS version,
+download URL, and checksum for the new tag. Existing release tags retain the prior
+tested history.
 
 ## Upstream and licensing
 
