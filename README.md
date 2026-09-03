@@ -9,6 +9,8 @@
 > the Pi 5 V4L2 Request decoder and the StreamOS presentation and audio fixes.
 > See [Raspberry Pi 5 fork notes](docs/streamos-rpi5.md) for the maintained
 > downstream delta, release process, validation record, and update procedure.
+> The [patch rationale](docs/streamos-rpi5-patch-rationale.md) records why each
+> downstream change exists and whether it remains a candidate for upstreaming.
 >
 > The ARM64 release bundle also runs on a regular 64-bit Raspberry Pi OS system;
 > StreamOS is a consumer, not a runtime dependency. See
