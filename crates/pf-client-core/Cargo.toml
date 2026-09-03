@@ -153,15 +153,15 @@ tracing-log = "0.2"
 rand = "0.9"
 
 # Gamepads: capture + feedback (full DualSense fidelity — touchpad/motion/triggers/LEDs
-# need the hidapi driver). Linux links the system SDL3; Windows builds it from source
-# (no system SDL3 there — same choice as clients/windows).
+# need the hidapi driver). This Raspberry Pi fork builds SDL3 from source on Linux as
+# well, so appliance and CI builds do not depend on a distribution SDL3 package.
 [target.'cfg(target_os = "linux")'.dependencies]
 # `v0_3_49` for `Buffer::requested` — the graph's per-cycle frame ask, without which the
 # playback callback can only size writes from the buffer CEILING (quantum-limit, ~170 ms).
 # Pure cfg gate; needs libpipewire ≥ 0.3.49 (2022-03) at runtime, which every ship target
 # (SteamOS, flatpak runtimes, Arch, Ubuntu ≥ 22.10) clears.
 pipewire = { version = "0.9", features = ["v0_3_49"] }
-sdl3 = { version = "0.18", features = ["hidapi"] }
+sdl3 = { version = "0.18", features = ["hidapi", "build-from-source"] }
 # Audio-thread priority (`audio_rt`): one blocking D-Bus call per boosted thread — the Realtime
 # PORTAL (session bus) inside a flatpak, where the sandbox's PID namespace makes a direct rtkit
 # call unresolvable, and rtkit (system bus) outside one. The same zbus, features and backend
