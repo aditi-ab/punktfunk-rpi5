@@ -74,7 +74,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 authors = ["unom"]
-repository = "https://git.unom.io/unom/punktfunk"
+repository = "https://github.com/aditi-ab/punktfunk-rpi5"
 
 # The `unsafe` discipline the `packaging/windows/drivers/*` crates already run, extended to the
 # workspace. `unsafe fn` marks a CONTRACT the caller must uphold; it is not a licence for the whole
