@@ -32,7 +32,8 @@ jobs:
             liburing-dev libva-dev libvulkan-dev libwayland-dev libxcursor-dev \
             libxext-dev libxfixes-dev libxi-dev libxinerama-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev libxss-dev \
-            libxtst-dev llvm-dev nasm patchelf pkg-config python3
+            libxtst-dev llvm-dev nasm patchelf pkg-config python3 \
+            wayland-protocols
 
       - name: Build the portable ARM64 bundle
         run: |
