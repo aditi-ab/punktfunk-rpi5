@@ -5,10 +5,10 @@ fork, the failure that motivated each runtime patch, and whether the change is
 Pi-specific or a candidate for upstream Punktfunk. Read it before rebasing the
 fork, changing the Raspberry Pi release build, or proposing a fix upstream.
 
-The fork base for release `v0.34.0-rpi5.2` is upstream commit
+The fork base for release `v0.34.0-rpi5.3` is upstream commit
 [`90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2`](https://git.unom.io/unom/punktfunk/commit/90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2).
 The four original StreamOS patches are preserved as individual Git commits. Git
-history is authoritative; use `git diff 90ce7249..v0.34.0-rpi5.2` to inspect the
+history is authoritative; use `git diff 90ce7249..v0.34.0-rpi5.3` to inspect the
 complete release delta.
 
 ## Runtime patch map
@@ -174,18 +174,28 @@ silence.
 
 ## Release SDL Wayland capability
 
-Release `v0.34.0-rpi5.1` built SDL3 from source without the Wayland protocol
-definitions installed in its container. The resulting standalone bundle passed
+Release `v0.34.0-rpi5.1` built SDL3 from source without all of SDL's Wayland
+build prerequisites. In particular, the container lacked the `egl` pkg-config
+metadata supplied by `libegl1-mesa-dev`. The resulting standalone bundle passed
 linkage checks but SDL exposed no Wayland video driver, so StreamOS launch failed
 immediately with `presenter: SDL video: wayland not available` and exit code 4.
 
 Commit [`a360a44e`](https://github.com/aditi-ab/punktfunk-rpi5/commit/a360a44e841a40450cdf1c9b5e38afaf0f4f84a3)
 installs `wayland-protocols` in the ARM64 release job. The bundle builder now asks
 SDL for its compiled video drivers and rejects the artifact unless `wayland` is
-present. This is a release-packaging fix; it does not change Punktfunk runtime
-behavior or the four downstream source patches.
+present. That guard intentionally rejected the `v0.34.0-rpi5.2` build and kept
+the invalid binary out of the release assets. The next release also installs
+Mesa's EGL, OpenGL, and OpenGL ES development packages, matching SDL's documented
+Linux video prerequisites.
 
-## Supporting fork changes in `v0.34.0-rpi5.2`
+Before a release tag is pushed, `packaging/rpi5/build-release-local.ps1` builds
+the same Debian Bookworm toolchain container for ARM64 with Docker and runs the
+normal bundle builder. The bundle's SDL driver check and linkage checks therefore
+run locally against the exact archive that will be published. This is a
+release-packaging fix; it does not change Punktfunk runtime behavior or the four
+downstream source patches.
+
+## Supporting fork changes in `v0.34.0-rpi5.3`
 
 The following commits are part of the release delta but are not additional
 runtime bug patches:

@@ -197,7 +197,7 @@ Compare the old and new series before testing:
 
 ```sh
 git range-diff \
-  90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2..v0.34.0-rpi5.2 \
+  90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2..v0.34.0-rpi5.3 \
   upstream/v0.35.0..HEAD
 git log --oneline upstream/v0.35.0..HEAD
 cargo test --workspace

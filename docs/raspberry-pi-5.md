@@ -53,11 +53,21 @@ PUNKTFUNK_DECODER=v4l2-request RUST_LOG=info punktfunk stream HOST
 
 ## Build locally
 
-Install the packages listed in `.github/workflows/rpi5-release.yml`, then run on
-an ARM64 Linux host:
+On Windows with Docker Desktop, create a local candidate tag at the commit to be
+tested and run the ARM64 release container:
+
+```powershell
+git tag -a v0.34.0-rpi5.3-local.1 -m "Local Raspberry Pi 5 release test"
+./packaging/rpi5/build-release-local.ps1 v0.34.0-rpi5.3-local.1
+```
+
+The container runs as ARM64 even on an x86-64 workstation and mirrors the
+Debian Bookworm build environment used by GitHub Actions. On an ARM64 Linux
+host, install the packages listed in `.github/workflows/rpi5-release.yml` and
+run:
 
 ```sh
-packaging/rpi5/build-release.sh v0.34.0-rpi5.2 dist
+packaging/rpi5/build-release.sh v0.34.0-rpi5.3 dist
 ```
 
 The script checks out the tag into a temporary tree, builds the pinned Raspberry
