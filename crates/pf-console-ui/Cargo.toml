@@ -22,7 +22,7 @@ vulkan-overlay = ["dep:pf-presenter", "dep:ash", "dep:sdl3", "skia-safe/vulkan"]
 
 # Same Linux+Windows gating as the rest of the client stack.
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
-pf-presenter = { path = "../pf-presenter", optional = true }
+pf-presenter = { path = "../pf-presenter", optional = true, default-features = false }
 # MenuEvent/MenuPulse (the gamepad service's menu mode drives the library).
 # `default-features = false` like every other consumer (pf-presenter, cli, session, clients/windows):
 # pf-client-core's default is `pyrowave`, which compiles the vendored PyroWave C++ — fatal on

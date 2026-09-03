@@ -56,7 +56,9 @@ dependencies plus:
 
 The fork enables SDL3's `build-from-source` Cargo feature for Linux. This matches
 the prior StreamOS ARM64 builder and removes an otherwise undeclared dependency on
-a sufficiently new system SDL3 package.
+a sufficiently new system SDL3 package. It also disables `pf-presenter` default
+features on the console UI's optional presenter edge so the appliance `ui` build
+does not pull in the unrelated experimental PyroWave codec stack.
 
 Point `PKG_CONFIG_PATH` and the runtime loader at the Raspberry Pi FFmpeg prefix. For
 the StreamOS layout this is:
