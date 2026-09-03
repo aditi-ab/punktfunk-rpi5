@@ -35,7 +35,9 @@ jobs:
             libxtst-dev llvm-dev nasm patchelf pkg-config python3
 
       - name: Build the portable ARM64 bundle
-        run: packaging/rpi5/build-release.sh "${{ inputs.tag }}" dist
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          packaging/rpi5/build-release.sh "${{ inputs.tag }}" dist
 
       - name: Upload assets to the draft release
         env:
