@@ -414,6 +414,8 @@ impl Overlay for SkiaOverlay {
                 view: slot.view,
                 width: slot.width,
                 height: slot.height,
+                scissor_y: 0,
+                scissor_height: slot.height,
             }));
         }
 
@@ -462,12 +464,29 @@ impl Overlay for SkiaOverlay {
             resize_step,
             ring: ring_key,
         };
+        // Most stream chrome occupies only the top (stats/badges) or bottom
+        // (hint/banner) of the output. Keep a generous band around it; a
+        // resize scrim, quick ring, or simultaneous top+bottom chrome still
+        // requests the full surface.
+        let top = want.stats.is_some() || want.access.is_some() || want.mic_muted;
+        let bottom = want.hint.is_some() || want.notice.is_some() || banner_step > 0;
+        let full = ctx.resizing || ring_key != 0 || (top && bottom);
+        let band = ((384.0 * scale).ceil() as u32).min(ctx.height);
+        let (scissor_y, scissor_height) = if full {
+            (0, ctx.height)
+        } else if top {
+            (0, band)
+        } else {
+            (ctx.height.saturating_sub(band), band)
+        };
         if want == self.drawn {
             return Ok(self.slots[self.current].as_ref().map(|s| OverlayFrame {
                 image: s.image,
                 view: s.view,
                 width: s.width,
                 height: s.height,
+                scissor_y,
+                scissor_height,
             }));
         }
 
@@ -549,6 +568,8 @@ impl Overlay for SkiaOverlay {
             view: slot.view,
             width: slot.width,
             height: slot.height,
+            scissor_y,
+            scissor_height,
         }))
     }
 }

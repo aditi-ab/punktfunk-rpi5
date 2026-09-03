@@ -68,6 +68,9 @@ pub struct OverlayFrame {
     pub view: vk::ImageView,
     pub width: u32,
     pub height: u32,
+    /// Vertical pixel band containing non-transparent overlay content.
+    pub scissor_y: u32,
+    pub scissor_height: u32,
 }
 
 // Shared with the Android GL host; lives in `pf_client_core::console`
