@@ -27,9 +27,9 @@ Download the archive and its `.sha256` file from the GitHub release. Verify it
 before extracting:
 
 ```sh
-sha256sum --check punktfunk-0.34.0-rpi5.1-linux-arm64.tar.gz.sha256
-tar -xzf punktfunk-0.34.0-rpi5.1-linux-arm64.tar.gz
-cd punktfunk-0.34.0-rpi5.1-linux-arm64
+sha256sum --check punktfunk-0.34.0-rpi5.2-linux-arm64.tar.gz.sha256
+tar -xzf punktfunk-0.34.0-rpi5.2-linux-arm64.tar.gz
+cd punktfunk-0.34.0-rpi5.2-linux-arm64
 sudo ./install.sh
 ```
 
@@ -57,13 +57,14 @@ Install the packages listed in `.github/workflows/rpi5-release.yml`, then run on
 an ARM64 Linux host:
 
 ```sh
-packaging/rpi5/build-release.sh v0.34.0-rpi5.1 dist
+packaging/rpi5/build-release.sh v0.34.0-rpi5.2 dist
 ```
 
 The script checks out the tag into a temporary tree, builds the pinned Raspberry
 Pi FFmpeg fork, builds the CLI and Vulkan session renderer, applies relative
-runtime paths, checks dynamic dependencies, and emits a reproducible archive plus
-SHA-256 file. Building requires no StreamOS checkout.
+runtime paths, verifies that bundled SDL exposes the Wayland video driver, checks
+dynamic dependencies, and emits a reproducible archive plus SHA-256 file. Building
+requires no StreamOS checkout.
 
 ## StreamOS consumption
 

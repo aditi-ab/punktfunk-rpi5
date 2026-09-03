@@ -6,7 +6,7 @@ on:
       tag:
         description: Existing draft-release tag to build
         required: true
-        default: v0.34.0-rpi5.1
+        default: v0.34.0-rpi5.2
 
 permissions:
   contents: write

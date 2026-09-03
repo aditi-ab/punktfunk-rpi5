@@ -5,10 +5,10 @@ fork, the failure that motivated each runtime patch, and whether the change is
 Pi-specific or a candidate for upstream Punktfunk. Read it before rebasing the
 fork, changing the Raspberry Pi release build, or proposing a fix upstream.
 
-The fork base for release `v0.34.0-rpi5.1` is upstream commit
+The fork base for release `v0.34.0-rpi5.2` is upstream commit
 [`90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2`](https://git.unom.io/unom/punktfunk/commit/90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2).
 The four original StreamOS patches are preserved as individual Git commits. Git
-history is authoritative; use `git diff 90ce7249..v0.34.0-rpi5.1` to inspect the
+history is authoritative; use `git diff 90ce7249..v0.34.0-rpi5.2` to inspect the
 complete release delta.
 
 ## Runtime patch map
@@ -172,7 +172,20 @@ This is a general Punktfunk correctness fix and a strong candidate for an
 upstream issue and pull request. It does not claim to fix every form of HDMI
 silence.
 
-## Supporting fork changes in `v0.34.0-rpi5.1`
+## Release SDL Wayland capability
+
+Release `v0.34.0-rpi5.1` built SDL3 from source without the Wayland protocol
+definitions installed in its container. The resulting standalone bundle passed
+linkage checks but SDL exposed no Wayland video driver, so StreamOS launch failed
+immediately with `presenter: SDL video: wayland not available` and exit code 4.
+
+Commit [`a360a44e`](https://github.com/aditi-ab/punktfunk-rpi5/commit/a360a44e841a40450cdf1c9b5e38afaf0f4f84a3)
+installs `wayland-protocols` in the ARM64 release job. The bundle builder now asks
+SDL for its compiled video drivers and rejects the artifact unless `wayland` is
+present. This is a release-packaging fix; it does not change Punktfunk runtime
+behavior or the four downstream source patches.
+
+## Supporting fork changes in `v0.34.0-rpi5.2`
 
 The following commits are part of the release delta but are not additional
 runtime bug patches:
@@ -189,6 +202,7 @@ runtime bug patches:
 | [`605d4a66`](https://github.com/aditi-ab/punktfunk-rpi5/commit/605d4a667cf2748b62cef114125db3e549c1f48d) | Builds the committed workspace without release-time manifest rewriting. |
 | [`d078c848`](https://github.com/aditi-ab/punktfunk-rpi5/commit/d078c8482d88e2917129aa98d9f27fa1063b7d37) | Bundles the SDL3 runtime required by the standalone binaries. |
 | [`06445740`](https://github.com/aditi-ab/punktfunk-rpi5/commit/0644574049680b0d9e37e8b6d137f4119bdf4b9c) | Installs the release uploader in CI. |
+| [`a360a44e`](https://github.com/aditi-ab/punktfunk-rpi5/commit/a360a44e841a40450cdf1c9b5e38afaf0f4f84a3) | Requires Wayland support in the SDL3 runtime and verifies it before publishing. |
 
 Documentation and repository-identification commits are intentionally omitted
 from that implementation table but remain visible in the base-to-tag Git log.
