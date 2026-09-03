@@ -18,6 +18,9 @@ docker build `
 docker run --rm `
     --platform linux/arm64 `
     --volume "${repository}:/workspace" `
+    --volume punktfunk-rpi5-cargo-git:/usr/local/cargo/git `
+    --volume punktfunk-rpi5-cargo-registry:/usr/local/cargo/registry `
+    --volume punktfunk-rpi5-target:/tmp/punktfunk-target `
     --workdir /workspace `
     --env CARGO_TARGET_DIR=/tmp/punktfunk-target `
     $image `

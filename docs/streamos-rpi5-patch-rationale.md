@@ -195,6 +195,11 @@ run locally against the exact archive that will be published. This is a
 release-packaging fix; it does not change Punktfunk runtime behavior or the four
 downstream source patches.
 
+The same preflight exposed an annotated-tag timestamp bug in the archive step.
+The builder now dereferences the tag to its commit before reading the commit
+timestamp, so every archive member receives a valid, reproducible modification
+time.
+
 ## Supporting fork changes in `v0.34.0-rpi5.3`
 
 The following commits are part of the release delta but are not additional
