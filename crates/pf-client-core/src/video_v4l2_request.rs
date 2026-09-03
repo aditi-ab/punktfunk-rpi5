@@ -9,10 +9,15 @@ use crate::video_color::ColorDesc;
 use anyhow::{bail, Result};
 use ffmpeg_sys_next as ffi;
 use std::ffi::CStr;
+use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
 
 pub const DECODER_PIN: &str = "v4l2-request";
+// FFmpeg 6 exposed this as AV_FRAME_FLAG_KEY. Keep the ABI-stable bit value
+// locally so the client still compiles against older development headers used
+// for non-Pi test builds.
+const FRAME_FLAG_KEY: i32 = 1 << 1;
 
 struct AvBuffer(*mut ffi::AVBufferRef);
 
@@ -215,7 +220,7 @@ impl V4l2RequestDecoder {
                     matrix: (*self.frame).colorspace as u8,
                     full_range: (*self.frame).color_range == ffi::AVColorRange::AVCOL_RANGE_JPEG,
                 },
-                flags & ffi::AV_FRAME_FLAG_KEY != 0
+                flags & FRAME_FLAG_KEY != 0
                     || (*self.frame).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I,
                 punktfunk_core::reanchor::LocalRecovery::NONE,
             )
@@ -235,7 +240,7 @@ impl Drop for V4l2RequestDecoder {
 }
 
 fn av_error(operation: &str, status: i32) -> anyhow::Error {
-    let mut buffer = [0u8; 128];
+    let mut buffer = [0 as c_char; 128];
     let message = unsafe {
         if ffi::av_strerror(status, buffer.as_mut_ptr(), buffer.len()) == 0 {
             CStr::from_ptr(buffer.as_ptr())
