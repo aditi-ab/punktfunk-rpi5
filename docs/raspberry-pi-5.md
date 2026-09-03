@@ -6,8 +6,9 @@ libraries.
 
 ## Supported baseline
 
-Release bundles are built natively on ARM64 Ubuntu 22.04 to keep the glibc floor
-compatible with 64-bit Raspberry Pi OS Bookworm and newer Ubuntu/Debian systems.
+Release bundles are built natively on ARM64 in a Debian Bookworm container to
+match 64-bit Raspberry Pi OS Bookworm and remain compatible with newer
+Ubuntu/Debian systems.
 They include `punktfunk`, `punktfunk-session`, SDL3, and the matching Raspberry
 Pi FFmpeg shared libraries. Skia is built into the client; Vulkan,
 Wayland, PipeWire, DRM, input and the graphics driver come from the target OS.
