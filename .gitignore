@@ -21,6 +21,7 @@ xcuserdata/
 
 # Debian package build output
 /dist/
+/dist-local/
 
 # Windows App SDK staging by windows-reactor build.rs
 /temp/
