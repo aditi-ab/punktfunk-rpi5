@@ -31,8 +31,9 @@ dependency tree.
 
 `auto` walks native rungs in device-specific order: NVIDIA/AMD try pf-vkdecode over Vulkan
 Video first; Intel/unknown try the platform rung first (pf-dxvadec on Windows, pf-vaapi on Linux).
-Admission may skip a rung before the CPU fallback (openh264/rav1d). **There is no FFmpeg in this
-binary.**
+Admission may skip a rung before the CPU fallback (openh264/rav1d). Standard upstream-compatible
+builds contain no FFmpeg. The Raspberry Pi 5 release enables the downstream
+`rpi5-v4l2-request` feature and bundles its matching FFmpeg runtime.
 
 The confidence used to prioritize rung/codec pairs lives in
 `pf_client_core::video::native_evidence`. Its note names the hardware evidence and remaining gap;

@@ -4,6 +4,12 @@
 
 <p align="center"><b>Low-latency desktop and game streaming with first-class Linux and Windows hosts.</b></p>
 
+> [!IMPORTANT]
+> This is the Aditi/StreamOS Raspberry Pi 5 fork of Punktfunk v0.39.0. It adds
+> the Pi 5 V4L2 Request decoder and the StreamOS presentation and audio fixes.
+> See [Raspberry Pi 5 fork notes](docs/streamos-rpi5.md) for the maintained
+> downstream delta, release process, validation record, and update procedure.
+
 Run the host on a Linux or Windows PC and stream your desktop or games to a Mac, PC, phone, tablet
 or TV. Each client gets **its own virtual display at its own native resolution and refresh rate**,
 so a laptop at 1080p60 and a TV at 4K can stream from one box at once without rearranging your real
