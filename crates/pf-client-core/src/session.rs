@@ -1626,6 +1626,23 @@ fn codec_fallback_event(
     }
 }
 
+/// Reconcile timeline positions already emitted by drought PLC with the next received packet.
+/// Returns `(still_missing, discard_received_packet)`. PLC already advances decoder state, so a
+/// delayed packet in a covered timeline position must not be decoded or queued a second time.
+fn reconcile_drought(
+    covered_arrivals: &mut u32,
+    drought_frames: u32,
+    missing: u32,
+) -> (u32, bool) {
+    *covered_arrivals = (*covered_arrivals).saturating_add(drought_frames);
+    let covered_missing = (*covered_arrivals).min(missing);
+    *covered_arrivals -= covered_missing;
+    let still_missing = missing - covered_missing;
+    let discard_received_packet = *covered_arrivals > 0;
+    *covered_arrivals = (*covered_arrivals).saturating_sub(u32::from(discard_received_packet));
+    (still_missing, discard_received_packet)
+}
+
 /// Dedicated audio thread: owns decoder, scratch, and PipeWire player, and blocks
 /// on `next_audio` (the plane's single consumer). Decoded chunks are Vecs recycled
 /// from the player's pool — steady state allocates nothing. Best-effort: setup
@@ -1739,6 +1756,11 @@ fn spawn_audio(
                 audio::TUNING.plc_max_ms(),
                 frame_us,
             );
+            // Drought PLC advances the decoder/playout timeline while packets are absent.
+            // If those packets were merely delayed (rather than lost), they must not be
+            // decoded or queued a second time: PLC already advanced Opus state and playout.
+            // Otherwise every delivery stall advances the decoder and audio timeline twice.
+            let mut covered_arrivals = 0u32;
             let mut last_packet = std::time::Instant::now();
             // Playback vitals ~every 10 s on wall clock, plus a one-shot quantum
             // line the first time the callback has published one.
@@ -1782,13 +1804,34 @@ fn spawn_audio(
                 let wait_ms = if frame_samples > 0 { frame_ms } else { 100 };
                 match connector.next_audio(Duration::from_millis(wait_ms)) {
                     Ok(pkt) => {
+                        let missing = gaps.missing_before(pkt.seq);
+                        let drought_frames = drought.packet();
+                        // Sequence gaps consume concealed timeline positions first. Any gap
+                        // beyond those positions still needs ordinary decoder concealment. A
+                        // received packet already emitted by PLC is skipped entirely.
+                        let (missing_to_conceal, discard_packet) = reconcile_drought(
+                            &mut covered_arrivals,
+                            drought_frames,
+                            missing,
+                        );
+                        if drought_frames > 0 {
+                            tracing::debug!(
+                                drought_frames,
+                                missing,
+                                late_frames = covered_arrivals + u32::from(discard_packet),
+                                "reconciling delayed audio after drought concealment"
+                            );
+                        }
+
                         // Place this frame against the picture before it is queued:
                         // `buffered_ahead` is everything that must still play first.
                         let depth = sync_cell.depth();
                         // Published even with sync off — ring depth is what makes a
                         // "too much latency" report triageable.
                         buffer_ms_out.store((depth / per_ms) as u32, Ordering::Relaxed);
-                        if av_sync_enabled {
+                        // A delayed packet whose timeline position was already concealed is
+                        // not going to play, so it is not an A/V-sync observation either.
+                        if av_sync_enabled && !discard_packet {
                             let ve2e = video_e2e.load(Ordering::Relaxed);
                             let o = punktfunk_core::audio::AvSyncObservation {
                                 pts_ns: pkt.pts_ns,
@@ -1803,14 +1846,10 @@ fn spawn_audio(
                             av_offset_out.store(av.offset_ms() as i64, Ordering::Relaxed);
                         }
                         last_packet = std::time::Instant::now();
-                        // Anything the drought path already covered is audio the stream
-                        // now has; concealing it again would insert samples it never
-                        // carried and push everything after them later.
-                        let already = drought.packet();
                         // Conceal a seq gap before decoding the arrival. Opus interpolates
                         // from decoder state; PCM repeats-and-fades — lossless has nothing
                         // to interpolate from. Gap arithmetic is codec-independent.
-                        for _ in 0..gaps.missing_before(pkt.seq).saturating_sub(already) {
+                        for _ in 0..missing_to_conceal {
                             if frame_samples == 0 {
                                 break;
                             }
@@ -1819,6 +1858,9 @@ fn spawn_audio(
                                 buf.extend_from_slice(&pcm[..n]);
                                 player.push(buf);
                             }
+                        }
+                        if discard_packet {
+                            continue;
                         }
                         match dec.decode(&pkt.data, &mut pcm) {
                             Some(n) => {
@@ -1871,6 +1913,37 @@ fn parse_debug_reconfigure(s: &str) -> Option<(Mode, Duration)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_audio_covered_by_drought_plc_is_not_queued_twice() {
+        let mut covered = 0;
+        // Four synthesized frames followed by the same four delayed packets.
+        for expected_remaining in (0..4).rev() {
+            let (missing, discard) = reconcile_drought(
+                &mut covered,
+                if expected_remaining == 3 { 4 } else { 0 },
+                0,
+            );
+            assert_eq!(missing, 0);
+            assert!(discard);
+            assert_eq!(covered, expected_remaining);
+        }
+        // The first packet beyond the concealed span is playable again.
+        assert_eq!(reconcile_drought(&mut covered, 0, 0), (0, false));
+    }
+
+    #[test]
+    fn sequence_gaps_consume_concealed_timeline_before_new_plc() {
+        let mut covered = 0;
+        // Three of five concealed positions were truly lost. The arriving packet and the
+        // following packet occupy the remaining two positions and must be discarded.
+        assert_eq!(reconcile_drought(&mut covered, 5, 3), (0, true));
+        assert_eq!(covered, 1);
+        assert_eq!(reconcile_drought(&mut covered, 0, 0), (0, true));
+        assert_eq!(covered, 0);
+        // A gap larger than the concealed span still asks the decoder for the remainder.
+        assert_eq!(reconcile_drought(&mut covered, 2, 5), (3, false));
+    }
 
     /// Every spelling the env-var doc promises has to land on the right side of
     /// `CLIENT_CAP_AUDIO_HIRES`.
