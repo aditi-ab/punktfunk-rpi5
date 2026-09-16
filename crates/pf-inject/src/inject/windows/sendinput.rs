@@ -19,11 +19,12 @@ use windows::Win32::System::StationsAndDesktops::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardLayout, MapVirtualKeyExW, SendInput, HKL, INPUT, INPUT_0, INPUT_KEYBOARD,
-    INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
-    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+    KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, SystemParametersInfoW, SPI_GETWHEELSCROLLLINES,
@@ -307,6 +308,21 @@ impl InputInjector for SendInputInjector {
                 let down = event.kind == InputKind::KeyDown;
                 let vk = (event.code & 0xff) as u16;
                 let semantic = (event.flags & crate::KEY_FLAG_SEMANTIC_VK) != 0;
+                // Pause make is E1 1D 45. Scan 0x45 is NumLock; KEYEVENTF_EXTENDEDKEY invents E0+45.
+                if vk == crate::keymap::VK_PAUSE {
+                    let ki = KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk),
+                        wScan: 0,
+                        dwFlags: if down {
+                            KEYBD_EVENT_FLAGS(0)
+                        } else {
+                            KEYEVENTF_KEYUP
+                        },
+                        time: 0,
+                        dwExtraInfo: 0,
+                    };
+                    return self.send(&[key(ki)]);
+                }
                 // Positional VKs: US table for the layout-variant typing area; everything
                 // else falls through to `MapVirtualKeyExW` (layout-invariant, extended bit).
                 // Semantic VKs skip the table and use the foreground app's layout.
@@ -316,7 +332,7 @@ impl InputInjector for SendInputInjector {
                     positional_vk_to_scan(vk)
                 };
                 let (scan, extended) = match table {
-                    Some(scan) => (scan, forced_extended(vk)), // typing area: never E0-extended
+                    Some(scan) => (scan, crate::keymap::vk_forced_extended(vk)), // typing area: never E0-extended
                     None => {
                         let hkl = if semantic { foreground_hkl() } else { None };
                         // SAFETY: `MapVirtualKeyExW` is a pure value translation (VK → scancode);
@@ -329,7 +345,7 @@ impl InputInjector for SendInputInjector {
                         }
                         (
                             (sc_ex & 0xff) as u16,
-                            (sc_ex & 0xe000) == 0xe000 || forced_extended(vk),
+                            (sc_ex & 0xe000) == 0xe000 || crate::keymap::vk_forced_extended(vk),
                         )
                     }
                 };
@@ -416,17 +432,6 @@ fn key(ki: KEYBDINPUT) -> INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki },
     }
-}
-
-// VKs Windows wants flagged extended even when the scancode high bits aren't set: the editing
-// cluster (Ins/Del/Home/End/PgUp/PgDn = 0x21..0x28, 0x2D, 0x2E), the Win keys (0x5B/0x5C/0x5D),
-// RCtrl (0xA3), RAlt (0xA5), Pause (0x90). MAPVK_VK_TO_VSC_EX already encodes E0 for most; this is a
-// thin safety net.
-fn forced_extended(vk: u16) -> bool {
-    matches!(
-        vk,
-        0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0x5D | 0xA3 | 0xA5 | 0x90
-    )
 }
 
 /// US-positional VK → set-1 make scancode for the layout-variant typing area (letters,
@@ -553,7 +558,7 @@ mod tests {
         assert_eq!(checked, 57, "typing-area coverage changed unexpectedly");
     }
 
-    /// US-position VKs for physical Y/Z/ö/ü must resolve to those positions, not a layout.
+    /// US Y/Z/ö/ü stay on those positions. Pause and NumLock stay out — they share scan 0x45.
     #[test]
     fn positional_pins_for_the_qwertz_scramble() {
         assert_eq!(positional_vk_to_scan(0x59), Some(0x15)); // VK_Y → US-Y position (QWERTZ: Z key)
@@ -564,5 +569,11 @@ mod tests {
         assert_eq!(positional_vk_to_scan(0x70), None); // VK_F1
         assert_eq!(positional_vk_to_scan(0x0D), None); // VK_RETURN
         assert_eq!(positional_vk_to_scan(0xA0), None); // VK_LSHIFT
+
+        // Pause/NumLock share scan 0x45; the table must not claim either.
+        assert_eq!(positional_vk_to_scan(crate::keymap::VK_PAUSE), None);
+        assert_eq!(positional_vk_to_scan(0x90), None); // VK_NUMLOCK
+        assert!(!crate::keymap::vk_forced_extended(0x90));
+        assert!(!crate::keymap::vk_forced_extended(crate::keymap::VK_PAUSE));
     }
 }

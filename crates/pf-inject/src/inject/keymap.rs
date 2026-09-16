@@ -10,6 +10,18 @@
 /// The punktfunk/1 ingest strips this bit from wire events.
 pub const KEY_FLAG_SEMANTIC_VK: u32 = 0x8000_0000;
 
+/// Win32 `VK_PAUSE`. Shares set-1 scan 0x45 with NumLock; SendInput uses `wVk` (E1, not E0).
+pub(crate) const VK_PAUSE: u16 = 0x13;
+
+/// VKs whose set-1 make is E0-prefixed when `MapVirtualKeyExW` leaves the high bits
+/// clear. NumLock (0x90) is plain 0x45. Pause ([`VK_PAUSE`]) is E1 — not this list.
+pub(crate) fn vk_forced_extended(vk: u16) -> bool {
+    matches!(
+        vk,
+        0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0x5D | 0xA3 | 0xA5
+    )
+}
+
 pub fn vk_to_evdev(vk: u8) -> Option<u16> {
     match vk {
         0x08 => Some(14),  // VK_BACK     -> KEY_BACKSPACE
@@ -171,4 +183,29 @@ pub(crate) fn gs_button_to_evdev(b: u32) -> Option<u32> {
         5 => 0x114, // BTN_EXTRA (X2)
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pause is 0x13, NumLock is 0x90. Flagging NumLock KEYEVENTF_EXTENDEDKEY invents E0+45.
+    #[test]
+    fn num_lock_is_not_forced_extended() {
+        assert_eq!(vk_to_evdev(VK_PAUSE as u8), Some(119)); // KEY_PAUSE
+        assert_eq!(vk_to_evdev(0x90), Some(69)); // VK_NUMLOCK → KEY_NUMLOCK
+        assert!(
+            !vk_forced_extended(0x90),
+            "NumLock make is 0x45 with no E0 prefix"
+        );
+        assert!(
+            !vk_forced_extended(VK_PAUSE),
+            "Pause is E1 1D 45, not KEYEVENTF_EXTENDEDKEY"
+        );
+        assert!(vk_forced_extended(0x26)); // VK_UP
+        assert!(vk_forced_extended(0x2D)); // VK_INSERT
+        assert!(vk_forced_extended(0x5B)); // VK_LWIN
+        assert!(vk_forced_extended(0xA3)); // VK_RCONTROL
+        assert!(vk_forced_extended(0xA5)); // VK_RMENU
+    }
 }
