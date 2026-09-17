@@ -10,7 +10,7 @@ use super::host::{ContentPhase, HostCfg};
 use super::link::LinkCfg;
 use super::{run, Scenario, SessionCfg};
 use crate::abr::stream_ceiling_kbps;
-use crate::quic::CODEC_HEVC;
+use crate::quic::{CODEC_H264, CODEC_HEVC};
 
 /// 4K165 HEVC 8-bit — the G5 sessions' mode.
 fn cap_4k165() -> u32 {
@@ -251,6 +251,247 @@ pub(super) fn wan_wg_12(seed: u64, duration_ms: u64) -> Scenario {
     }
 }
 
+/// A wired session: the link is never the limit.
+fn lan(name: &'static str, capacity_kbps: u32, refresh_hz: u32) -> Scenario {
+    let cap = stream_ceiling_kbps(3840, 2160, refresh_hz, CODEC_HEVC, 8, 0);
+    Scenario {
+        name,
+        seed: 0x7A_5600,
+        duration_ms: 60_000,
+        link: LinkCfg {
+            capacity: vec![(0, capacity_kbps)],
+            buffer_ms: 20,
+            base_delay_ms: 1,
+            ..LinkCfg::default()
+        },
+        sessions: vec![SessionCfg {
+            join_ms: 0,
+            host: HostCfg {
+                fps: refresh_hz,
+                audio_kbps: 512,
+                content: full(),
+                ..HostCfg::default()
+            },
+            client: ClientCfg {
+                start_kbps: 20_000,
+                refresh_hz,
+                stream_cap_kbps: cap,
+                audio_kbps: 512,
+                ceiling_at: Some((1_000, (capacity_kbps as u64 * 7 / 10) as u32)),
+                ..ClientCfg::default()
+            },
+        }],
+        achievable_kbps: cap.min(capacity_kbps * 7 / 10),
+        blip_at_ms: Some(30_000),
+    }
+}
+
+pub(super) fn lan_10g() -> Scenario {
+    lan("lan_10g", 10_000_000, 120)
+}
+
+pub(super) fn lan_1g() -> Scenario {
+    lan("lan_1g", 1_000_000, 120)
+}
+
+/// A cell that moves between 2 and 50 Mbps with handover stalls.
+pub(super) fn lte_variable() -> Scenario {
+    let mut s = wg_session();
+    s.client.start_kbps = 20_000;
+    s.client.ceiling_at = Some((1_000, 21_000));
+    Scenario {
+        name: "lte_variable",
+        seed: 0x7A_5700,
+        duration_ms: 180_000,
+        link: LinkCfg {
+            capacity: vec![
+                (0, 30_000),
+                (40_000, 8_000),
+                (75_000, 50_000),
+                (110_000, 2_500),
+                (140_000, 18_000),
+            ],
+            wander_pct: 20,
+            wander_ms: 20_000,
+            buffer_ms: 250,
+            base_delay_ms: 30,
+            loss_ppm: 3_000,
+            burst_in_ppm: 400,
+            burst_out_ppm: 300_000,
+            burst_shards: 14,
+            stall_every_ms: 30_000,
+            stall_ms: 250,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 18_000,
+        blip_at_ms: None,
+    }
+}
+
+/// Two sessions over one tunnel. `join_ms` decides which of the three
+/// shared-path cases this is.
+fn shared(name: &'static str, second_join_ms: u64, second_fixed: bool) -> Scenario {
+    let mut first = wg_session();
+    first.client.start_kbps = 20_000;
+    let mut second = wg_session();
+    second.join_ms = second_join_ms;
+    second.client.automatic = !second_fixed;
+    second.client.start_kbps = if second_fixed { 8_000 } else { 20_000 };
+    Scenario {
+        name,
+        seed: 0x7A_5800,
+        duration_ms: 150_000,
+        link: LinkCfg {
+            capacity: vec![(0, 18_000)],
+            buffer_ms: 450,
+            base_delay_ms: 10,
+            loss_ppm: 5_000,
+            ..LinkCfg::default()
+        },
+        sessions: vec![first, second],
+        achievable_kbps: 9_000,
+        blip_at_ms: None,
+    }
+}
+
+pub(super) fn shared_two_auto() -> Scenario {
+    shared("shared_two_auto", 0, false)
+}
+
+pub(super) fn shared_newcomer() -> Scenario {
+    shared("shared_newcomer", 60_000, false)
+}
+
+pub(super) fn shared_fixed_plus_auto() -> Scenario {
+    shared("shared_fixed_plus_auto", 0, true)
+}
+
+/// August's Phase 3 cases: a still desktop that starts moving, and a source
+/// that never fills the wall-clock target.
+pub(super) fn static_then_motion() -> Scenario {
+    let mut s = tv_session(20_000, Some((1_000, 171_294)), full());
+    s.host.content = vec![
+        ContentPhase {
+            until_ms: 20_000,
+            ..ContentPhase::default()
+        },
+        ContentPhase {
+            until_ms: 40_000,
+            idle: true,
+            ..ContentPhase::default()
+        },
+        ContentPhase {
+            cut_every_ms: 10_000,
+            cut_pct: 500,
+            ..ContentPhase::default()
+        },
+    ];
+    Scenario {
+        name: "static_then_motion",
+        seed: 0x7A_5900,
+        duration_ms: 70_000,
+        link: LinkCfg {
+            capacity: vec![(0, 400_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 171_294,
+        blip_at_ms: None,
+    }
+}
+
+pub(super) fn frame_driven_35fps() -> Scenario {
+    let mut s = tv_session(
+        20_000,
+        Some((1_000, 171_294)),
+        vec![ContentPhase {
+            active_pct: 21,
+            ..ContentPhase::default()
+        }],
+    );
+    s.host.fps = 165;
+    Scenario {
+        name: "frame_driven_35fps",
+        seed: 0x7A_5A00,
+        duration_ms: 70_000,
+        link: LinkCfg {
+            capacity: vec![(0, 400_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 171_294,
+        blip_at_ms: None,
+    }
+}
+
+/// A host that never flags idle repeats: every window is wall-clock.
+pub(super) fn old_host() -> Scenario {
+    let mut s = tv_session(20_000, Some((1_000, 171_294)), full());
+    s.host.marks_repeats = false;
+    s.client.marks_repeats = false;
+    s.host.content = vec![
+        ContentPhase {
+            until_ms: 25_000,
+            ..ContentPhase::default()
+        },
+        ContentPhase {
+            idle: true,
+            ..ContentPhase::default()
+        },
+    ];
+    Scenario {
+        name: "old_host",
+        seed: 0x7A_5B00,
+        duration_ms: 60_000,
+        link: LinkCfg {
+            capacity: vec![(0, 400_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 171_294,
+        blip_at_ms: None,
+    }
+}
+
+/// The probe declined or refused: no ceiling was ever learned, so the
+/// negotiated start is the whole authority.
+pub(super) fn no_ramp() -> Scenario {
+    Scenario {
+        name: "no_ramp",
+        seed: 0x7A_5C00,
+        duration_ms: 60_000,
+        link: LinkCfg {
+            capacity: vec![(0, 400_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![SessionCfg {
+            join_ms: 0,
+            host: HostCfg {
+                fps: 60,
+                content: full(),
+                ..HostCfg::default()
+            },
+            client: ClientCfg {
+                start_kbps: 20_000,
+                refresh_hz: 60,
+                stream_cap_kbps: stream_ceiling_kbps(1920, 1080, 60, CODEC_H264, 8, 0),
+                ..ClientCfg::default()
+            },
+        }],
+        achievable_kbps: 20_000,
+        blip_at_ms: None,
+    }
+}
+
 /// Ten minutes of 5120×1440@240 on a 2 GbE path: the cost model's worst
 /// case, ~144 000 frames of ~490 shards each. Not in the baseline table — it
 /// exists to bound the simulator's own runtime.
@@ -286,6 +527,27 @@ pub(super) fn fat_pipe_10min() -> Scenario {
         achievable_kbps: 1_300_000,
         blip_at_ms: None,
     }
+}
+
+/// Every scenario the baseline pins, in table order.
+pub(super) fn all() -> Vec<Scenario> {
+    vec![
+        lan_10g(),
+        lan_1g(),
+        wifi_good(),
+        wifi_tv(),
+        wan_wg_12(0x7A_5500, 180_000),
+        lte_variable(),
+        shared_two_auto(),
+        shared_newcomer(),
+        shared_fixed_plus_auto(),
+        gpu_saturated(),
+        static_then_motion(),
+        frame_driven_35fps(),
+        old_host(),
+        no_ramp(),
+        slow_start_spent(),
+    ]
 }
 
 #[cfg(test)]
@@ -521,5 +783,21 @@ mod tests {
             );
         }
         println!("metrics {:?}", r.metrics);
+    }
+
+    /// Every scenario in the plan's table runs from its fixed seed, and a run
+    /// is the same run twice.
+    #[test]
+    fn every_scenario_runs_and_repeats_itself() {
+        for sc in all() {
+            let a = run(&sc);
+            let b = run(&sc);
+            assert_eq!(a.metrics, b.metrics, "{} is not reproducible", sc.name);
+            assert!(
+                !a.windows[0].is_empty(),
+                "{} produced no report window",
+                sc.name
+            );
+        }
     }
 }
