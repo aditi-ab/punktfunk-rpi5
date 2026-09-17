@@ -161,6 +161,19 @@ struct Ramp {
     outcome: Option<Ramped>,
 }
 
+/// What one step proves, kbps: its delivered bytes over the interval they
+/// arrived in, and never more than the step asked for.
+///
+/// The clamp is the whole of what a short step can honestly say. A 5 Mbps
+/// step is a dozen packets; whether the last one lands 6 ms or 15 ms after
+/// the first swings the implied rate 2.5× (rig, every profile), and an
+/// unclamped reading opened sessions on a rate no step ever offered.
+fn step_rate_kbps(step: &Step, r: &ProbeReport) -> u32 {
+    let interval = u64::from(r.client_interval_ms.max(1));
+    let rate = (r.delivered_bytes.saturating_mul(8) / interval) as u32;
+    rate.min(step.target_kbps)
+}
+
 /// Step length for a rate: the step's own duration, shortened when the byte
 /// cap binds first.
 fn step_ms(target_kbps: u32) -> u32 {
@@ -219,7 +232,7 @@ impl Ramp {
                 proven_kbps: self.proven_kbps,
             });
         }
-        let delivered_kbps = (r.delivered_bytes.saturating_mul(8) / interval) as u32;
+        let delivered_kbps = step_rate_kbps(step, r);
         // The SENDER could not offer the rate: what it managed is a floor
         // under the link, never a wall (the link was never asked).
         if r.send_dropped > 0 || r.host_bytes_sent * 100 < step.asked_bytes * 90 {
@@ -291,8 +304,7 @@ impl Ramp {
                 None
             }
             None => {
-                let interval = u64::from(report.client_interval_ms.max(1));
-                self.proven_kbps = (report.delivered_bytes.saturating_mul(8) / interval) as u32;
+                self.proven_kbps = step_rate_kbps(&step, &report);
                 if step.target_kbps >= self.max_kbps {
                     // The ramp asked for everything this stream can use and
                     // got it. Capacity above that is not this session's
@@ -835,6 +847,47 @@ mod tests {
         assert!(
             rig.p.poll(at, 0, 0).is_some(),
             "and once they stop, the next step goes out"
+        );
+    }
+
+    /// A short step's implied rate is noise: the rig measured the same 24
+    /// packets arriving over 6 ms and over 15 ms, 2.5× apart. Whatever the
+    /// arithmetic says, a step cannot have proved more than it offered — and
+    /// one step alone must never open a session above the 20 000 it would
+    /// have opened at with no measurement at all.
+    #[test]
+    fn a_step_cannot_prove_more_than_it_asked_for() {
+        let mut rig = Rig::new(46_656, None);
+        let (target, duration_ms) = rig.p.poll(rig.now, 0, 0).expect("the first step");
+        assert_eq!(target, RAMP_START_KBPS);
+        // The rig's own numbers: a 5 Mbps step's bytes, all of them, in 6 ms.
+        let r = ProbeReport {
+            delivered_bytes: 15_624,
+            delivered_packets: 24,
+            window_ms: 6,
+            host_duration_ms: duration_ms,
+            client_interval_ms: 6,
+            host_bytes_sent: u64::from(target) * u64::from(duration_ms) / 8,
+            wire_packets_sent: 24,
+            send_dropped: 0,
+        };
+        let at = rig.at(6);
+        rig.p.on_result(r, at);
+        let at = rig.at(RAMP_DRAIN_MS + 1);
+        rig.p.poll(at, 0, 0);
+        // Video arrives before step two can answer: one step is all there is.
+        let at = rig.at(1);
+        assert!(rig.p.poll(at, 0, 1).is_none());
+        let Some(Ramped::NoWall { proven_kbps }) = rig.p.take_ramped() else {
+            panic!("one step, cut short by video, proves no wall")
+        };
+        assert_eq!(
+            proven_kbps, RAMP_START_KBPS,
+            "20 Mbps of arithmetic from a 5 Mbps step"
+        );
+        assert!(
+            ramp_start_kbps(proven_kbps, 46_656) < 20_000,
+            "a one-step ramp must not open a session above the unmeasured rate"
         );
     }
 
