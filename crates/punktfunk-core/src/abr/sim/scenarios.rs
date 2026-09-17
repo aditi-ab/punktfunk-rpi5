@@ -1579,6 +1579,36 @@ mod tests {
         );
     }
 
+    /// The tunnel's delay reading survives its own cascade.
+    ///
+    /// Four windows of Klos54's run carried no completed AU at all, so the
+    /// detector went blind exactly where the queue was deepest. A shard
+    /// arrives whether or not its frame does: every window that received
+    /// video now has a delay reading, ramp or no ramp.
+    #[test]
+    fn the_tunnel_never_goes_delay_blind_again() {
+        for sc in [
+            wan_wg_12(0x7A_5500, 180_000),
+            with_ramp(wan_wg_12(0x7A_5500, 180_000)),
+        ] {
+            let audio_kbps = sc.sessions[0].client.audio_kbps;
+            let r = run(&sc);
+            let blind: Vec<u64> = r.windows[0]
+                .iter()
+                .filter(|w| !w.discarded && w.actual_kbps > audio_kbps && w.delay.is_none())
+                .map(|w| w.t_ms)
+                .collect();
+            assert!(blind.is_empty(), "{}: blind windows at {blind:?}", sc.name);
+            // And the reading is a trend, not a single point: the windows that
+            // carry a cascade carry several samples each.
+            let thin = r.windows[0]
+                .iter()
+                .filter(|w| w.delay.is_some_and(|d| d.samples < 2))
+                .count();
+            assert!(thin <= 1, "{}: {thin} windows with one sample", sc.name);
+        }
+    }
+
     /// `SIM_DUMP=c3 cargo test … dump -- --ignored --nocapture`: one
     /// scenario's window trail, for reading a calibration by eye.
     #[test]
@@ -1591,6 +1621,8 @@ mod tests {
             "c5" => wan_wg_12(0x5000, 720_000),
             "cutwifi" => ramp_cut_short_wifi(),
             "cutwan" => ramp_cut_short_wan(),
+            "wan" => wan_wg_12(0x7A_5500, 180_000),
+            "lte" => lte_variable(),
             "newcomer" => shared_newcomer(),
             "c6" => wifi_tv_probe_damage(),
             "knee" => decoder_knee(),
@@ -1615,7 +1647,8 @@ mod tests {
         }
         for w in &r.windows[0] {
             println!(
-                "t={:6} rate={:7} actual={:7} drop={} kf={} cut={:?} disc={} dis={}",
+                "t={:6} rate={:7} actual={:7} drop={} kf={} cut={:?} disc={} dis={} \
+                 delay={:?}",
                 w.t_ms,
                 w.rate_kbps,
                 w.actual_kbps,
@@ -1623,7 +1656,8 @@ mod tests {
                 w.recovery_kf,
                 w.cut_from_kbps,
                 w.discarded,
-                w.encode_disarmed
+                w.encode_disarmed,
+                w.delay,
             );
         }
         println!("metrics {:?}", r.metrics);

@@ -9,7 +9,7 @@
 //! A burst's freeze outlives that window, so its keyframe asks are disowned
 //! for as long as it lasts.
 
-use super::sample::{WindowActivity, WindowSample, WINDOW};
+use super::sample::{DelayTrend, WindowActivity, WindowSample, WINDOW};
 use crate::stats::Stats;
 use std::time::Instant;
 
@@ -50,6 +50,13 @@ pub(crate) struct WindowAccumulator {
     stats: Stats,
     owd_sum_ns: i128,
     owd_frames: u32,
+    /// First-shard delay, µs: the count, the sum, and `Σ(ordinal × sample)` —
+    /// the least-squares fit needs no more than that, and none of it grows
+    /// with the window.
+    shard_owd_count: u32,
+    shard_owd_sum_us: i64,
+    shard_owd_xy_us: i64,
+    shard_owd_last_us: i64,
     au_frames: u32,
     au_repeats: u32,
     decode_sum_us: u64,
@@ -80,6 +87,10 @@ impl WindowAccumulator {
             stats: Stats::default(),
             owd_sum_ns: 0,
             owd_frames: 0,
+            shard_owd_count: 0,
+            shard_owd_sum_us: 0,
+            shard_owd_xy_us: 0,
+            shard_owd_last_us: 0,
             au_frames: 0,
             au_repeats: 0,
             decode_sum_us: 0,
@@ -119,6 +130,20 @@ impl WindowAccumulator {
     pub(crate) fn on_owd(&mut self, ns: i128) {
         self.owd_sum_ns += ns;
         self.owd_frames += 1;
+    }
+
+    /// Capture → first-shard arrival for one frame. Frames that never complete
+    /// have one of these and nothing else, so this is the delay reading a
+    /// cascade cannot silence. `x` is the sample's ordinal: the trend is a fit
+    /// over the window's own order, never against a remembered floor.
+    pub(crate) fn on_shard_owd(&mut self, ns: i128) {
+        let us = (ns / 1_000) as i64;
+        self.shard_owd_xy_us = self
+            .shard_owd_xy_us
+            .saturating_add(i64::from(self.shard_owd_count).saturating_mul(us));
+        self.shard_owd_sum_us = self.shard_owd_sum_us.saturating_add(us);
+        self.shard_owd_last_us = us;
+        self.shard_owd_count += 1;
     }
 
     /// The window's client decode-stage accumulator, however the embedder
@@ -223,6 +248,16 @@ impl WindowAccumulator {
             loss_ppm,
             owd_mean_us: (self.owd_frames > 0)
                 .then(|| (self.owd_sum_ns / i128::from(self.owd_frames) / 1_000) as i64),
+            delay: (self.shard_owd_count > 0).then(|| DelayTrend {
+                samples: self.shard_owd_count,
+                mean_us: self.shard_owd_sum_us / i64::from(self.shard_owd_count),
+                rise_us: fitted_rise_us(
+                    self.shard_owd_count,
+                    self.shard_owd_sum_us,
+                    self.shard_owd_xy_us,
+                ),
+                last_us: self.shard_owd_last_us,
+            }),
             decode_mean_us: mean(self.decode_sum_us, self.decode_count),
             encode_mean_us: mean(self.encode_sum_us, self.encode_count),
             actual_kbps,
@@ -264,6 +299,10 @@ impl WindowAccumulator {
         self.last_report = now;
         self.owd_sum_ns = 0;
         self.owd_frames = 0;
+        self.shard_owd_count = 0;
+        self.shard_owd_sum_us = 0;
+        self.shard_owd_xy_us = 0;
+        self.shard_owd_last_us = 0;
         self.au_frames = 0;
         self.au_repeats = 0;
         self.decode_sum_us = 0;
@@ -311,6 +350,26 @@ fn probe_aftermath(windows_left: &mut u32, asked: bool) -> bool {
         *windows_left = 0;
     }
     asked
+}
+
+/// Least-squares delay rise across one window, µs: the fitted line's first
+/// sample to its last.
+///
+/// `x` is the sample ordinal, so `Σx` and `Σx²` are closed forms of `n` and
+/// the window only has to carry `Σy` and `Σxy`. Fewer than two samples is no
+/// line. i128 because `n·Σxy` outgrows i64 on a long window at a deep queue.
+fn fitted_rise_us(n: u32, sum_us: i64, xy_us: i64) -> i64 {
+    if n < 2 {
+        return 0;
+    }
+    let n = i128::from(n);
+    let sx = n * (n - 1) / 2;
+    let sxx = (n - 1) * n * (2 * n - 1) / 6;
+    let den = n * sxx - sx * sx;
+    if den == 0 {
+        return 0;
+    }
+    ((i128::from(xy_us) * n - sx * i128::from(sum_us)) * (n - 1) / den) as i64
 }
 
 /// Wire measure: every received media-plane byte (headers, seals and FEC

@@ -36,7 +36,7 @@ mod window;
 pub use cap::LearnedCap;
 use controller::BitrateController;
 pub use probe::ProbeReport;
-pub use sample::{WindowActivity, WindowSample, WINDOW};
+pub use sample::{DelayTrend, WindowActivity, WindowSample, WINDOW};
 pub use verdict::Reason;
 
 use std::time::Instant;
@@ -192,6 +192,14 @@ impl Driver {
     /// Capture → received for one AU, ns.
     pub fn on_owd(&mut self, ns: i128) {
         self.window.on_owd(ns);
+    }
+
+    /// Capture → first-shard arrival for one frame, ns, clock offset already
+    /// applied. Fed from [`crate::session::Session::take_shard_delays`]: a
+    /// frame that never completes has one of these, so the window's delay
+    /// reading survives the overload that produced it.
+    pub fn on_shard_owd(&mut self, ns: i128) {
+        self.window.on_shard_owd(ns);
     }
 
     /// The window's client decode-stage total and its sample count.

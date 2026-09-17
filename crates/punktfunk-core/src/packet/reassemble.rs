@@ -150,6 +150,12 @@ pub(super) const IN_FLIGHT_BUF_FACTOR: usize = 4;
 /// Jumbo sessions keep larger entries but need ~6× fewer buffers per block.
 const RECOVERY_POOL_MAX: usize = 512;
 
+/// First-shard delay samples held between drains ([`Reassembler::take_shard_delays`]).
+/// One per video frame and the pump drains every iteration, so this bounds only a
+/// consumer that stopped reading: at the cap a frame costs one comparison and no
+/// clock read.
+const SHARD_DELAY_SAMPLES: usize = 256;
+
 /// Bytes a [`BlockState`] charges the in-flight budget. Vectors size from header
 /// fields, so a slice-streamed frame can mint thousands of blocks while `buf` stays
 /// near zero — they must meter like the buffer. `pub(super)` so budget tests read
@@ -206,6 +212,11 @@ pub struct Reassembler {
     recovery_pool: Vec<Vec<u8>>,
     /// In-flight `buf` bytes plus per-block [`block_state_bytes`], both windows.
     in_flight_bytes: usize,
+    /// `first shard arrival − pts_ns`, ns, one per video frame that opened, oldest
+    /// first. Raw: the reader adds the clock offset. A frame parity never recovers
+    /// is timed here and nowhere else, which is what keeps the delay signal alive
+    /// while the queue is deepest.
+    shard_delay_ns: Vec<i64>,
 }
 
 impl Reassembler {
@@ -219,7 +230,15 @@ impl Reassembler {
             probe: ReassemblyWindow::default(),
             recovery_pool: Vec::new(),
             in_flight_bytes: 0,
+            shard_delay_ns: Vec::with_capacity(SHARD_DELAY_SAMPLES),
         }
+    }
+
+    /// The first-shard delays since the last call, oldest first. Raw
+    /// `arrival − pts_ns`: the caller applies the clock offset, as it does for a
+    /// completed AU.
+    pub fn take_shard_delays(&mut self) -> std::vec::Drain<'_, i64> {
+        self.shard_delay_ns.drain(..)
     }
 
     pub fn set_deliver_partial(&mut self, on: bool) {
@@ -269,6 +288,7 @@ impl Reassembler {
             probe,
             recovery_pool,
             in_flight_bytes,
+            shard_delay_ns,
         } = self;
         let deliver_parts = *deliver_parts;
         let lim = *limits;
@@ -460,6 +480,11 @@ impl Reassembler {
                     return Ok(None);
                 }
                 *in_flight_bytes += buf_len;
+                // This packet is the frame's first: timed before the frame's own
+                // pacing spread, and before FEC knows whether it will ever complete.
+                if !is_probe && shard_delay_ns.len() < SHARD_DELAY_SAMPLES {
+                    shard_delay_ns.push(crate::stats::now_realtime_ns() as i64 - hdr.pts_ns as i64);
+                }
                 e.insert(FrameBuf {
                     shard_bytes,
                     // Slice sentinel `frame_bytes` is the block base, not AU size.
@@ -841,6 +866,9 @@ impl Reassembler {
         // A parked partial is from the discarded past too; leaving it would hand it
         // up as the first frame after jump-to-live.
         self.pending_partial = None;
+        // Samples of the backlog that was just thrown away describe a queue the
+        // session no longer has.
+        self.shard_delay_ns.clear();
     }
 
     /// Test-only in-flight byte commitment. Mixed-geometry tests assert it returns

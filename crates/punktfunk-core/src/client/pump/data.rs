@@ -195,6 +195,16 @@ impl DataPump {
             // produced frame — a total-loss drought completes no AU.
             let st = session.stats();
             abr.on_stats(&st);
+            // One delay sample per frame that opened since the last iteration,
+            // whether or not it ever completed. Same offset and same sign test
+            // as a completed AU's; without an offset there is no delay to read,
+            // but the samples are still drained.
+            for raw_ns in session.take_shard_delays() {
+                let owd_ns = i128::from(raw_ns) + i128::from(clock_offset_ns);
+                if clock_offset_ns != 0 && owd_ns > 0 {
+                    abr.on_shard_owd(owd_ns);
+                }
+            }
             if let Some(g) = rx_gap.observe(Instant::now(), st.packets_received) {
                 tracing::warn!(
                     silence_ms = g.silence_ms,

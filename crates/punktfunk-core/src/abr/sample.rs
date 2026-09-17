@@ -41,18 +41,41 @@ impl WindowActivity {
     }
 }
 
+/// One-way delay as the window's first-shard samples saw it.
+///
+/// A shard arrives whether or not its frame ever completes, so this survives
+/// the overload a completed-AU reading goes blind in. [`rise_us`](Self::rise_us)
+/// is the signal the rate reads: a queue that is still filling against one
+/// that is draining.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelayTrend {
+    /// Frames that opened this window. One sample each.
+    pub samples: u32,
+    pub mean_us: i64,
+    /// Least-squares fit from the window's first sample to its last, µs.
+    /// Negative = the queue is draining.
+    pub rise_us: i64,
+    pub last_us: i64,
+}
+
 /// What one closed report window carries into the controller.
 ///
 /// `actual_kbps` is the wire rate (headers, seals and FEC parity included,
 /// probe filler netted out, audio reservation added) so it lives in the same
 /// domain as the target. `dropped` counts unrecoverable frames, `flushed` is
 /// a jump-to-live, `recovery_kf` the decode-recovery keyframe asks.
+///
+/// `owd_mean_us` is the completed-AU delay the rolling baseline is built from;
+/// `delay` is the same quantity over arriving shards, which stays present when
+/// no frame completes at all.
 #[derive(Clone, Copy, Debug)]
 pub struct WindowSample {
     pub now: std::time::Instant,
     pub dropped: u64,
     pub loss_ppm: u32,
     pub owd_mean_us: Option<i64>,
+    /// `None` = no frame opened this window.
+    pub delay: Option<DelayTrend>,
     pub decode_mean_us: Option<i64>,
     pub encode_mean_us: Option<i64>,
     pub actual_kbps: u32,
@@ -71,6 +94,7 @@ impl WindowSample {
             dropped: 0,
             loss_ppm: 0,
             owd_mean_us: None,
+            delay: None,
             decode_mean_us: None,
             encode_mean_us: None,
             actual_kbps: 0,

@@ -118,6 +118,8 @@ pub(super) struct WindowRec {
     pub discarded: bool,
     /// The encode down-driver's stand-down, sampled after the verdict.
     pub encode_disarmed: bool,
+    /// First-shard delay for this window. `None` = no frame opened in it.
+    pub delay: Option<crate::abr::DelayTrend>,
 }
 
 struct InFlight {
@@ -129,6 +131,8 @@ struct InFlight {
     encode_us: u32,
     repeat: bool,
     idr: bool,
+    /// Some of this frame has arrived: its first shard is already timed.
+    seen: bool,
     /// Scenario-injected unrecoverable frame.
     forced: bool,
 }
@@ -268,6 +272,7 @@ impl Client {
             encode_us: f.encode_us,
             repeat: f.repeat,
             idr: f.idr,
+            seen: false,
             forced,
         });
     }
@@ -283,10 +288,20 @@ impl Client {
 
     /// Bytes arrived. `Some(shards)` when this was the frame's tail and the
     /// link owes it a loss draw.
-    pub(super) fn deliver(&mut self, frame: u32, bytes: u64) -> Option<u32> {
+    ///
+    /// The first bytes of a frame are its first shard, which the reassembler
+    /// times whatever becomes of the rest.
+    pub(super) fn deliver(&mut self, frame: u32, bytes: u64, now_ms: u64) -> Option<u32> {
         let f = self.flight.iter_mut().find(|f| f.id == frame)?;
+        let first = !std::mem::replace(&mut f.seen, true);
+        let capture_ms = f.capture_ms;
         f.remaining = f.remaining.saturating_sub(bytes);
-        (f.remaining == 0).then(|| f.shape.shards())
+        let tail = (f.remaining == 0).then(|| f.shape.shards());
+        if first {
+            self.abr
+                .on_shard_owd(i128::from(now_ms.saturating_sub(capture_ms)) * 1_000_000);
+        }
+        tail
     }
 
     /// Close one frame: repair what parity covers, count the rest.
@@ -564,6 +579,7 @@ impl Client {
             cut_from_kbps: request.filter(|&k| k < was).map(|_| was),
             discarded: w.discarded,
             encode_disarmed: self.abr.abr.encode_down.disarmed(),
+            delay: w.sample.delay,
         });
     }
 }
@@ -722,12 +738,12 @@ mod tests {
             if let Some(f) = host.tick(t) {
                 c.expect(&f, t);
                 let burst = host.burst_of(&f);
-                if c.deliver(f.id, burst).is_some() {
+                if c.deliver(f.id, burst, t).is_some() {
                     c.complete(f.id, LossDraw::default(), t);
                 }
             }
             let (id, bytes) = host.release(t);
-            if bytes > 0 && c.deliver(id, bytes).is_some() {
+            if bytes > 0 && c.deliver(id, bytes, t).is_some() {
                 c.complete(id, LossDraw::default(), t);
             }
             c.tick(t, base, &mut out);

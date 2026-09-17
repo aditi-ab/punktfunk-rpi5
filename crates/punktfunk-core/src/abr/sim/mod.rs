@@ -211,7 +211,8 @@ fn run(sc: &Scenario) -> Run {
             let s = &mut sessions[id as usize];
             if frame == PROBE_FRAME {
                 s.client.deliver_probe(bytes, now + link.base_delay_ms());
-            } else if let Some(shards) = s.client.deliver(frame, bytes) {
+            } else if let Some(shards) = s.client.deliver(frame, bytes, now + link.base_delay_ms())
+            {
                 let draw = link.draw_loss(shards);
                 s.client.complete(frame, draw, now + link.base_delay_ms());
             }
