@@ -12,6 +12,10 @@ use super::{run, Scenario, SessionCfg};
 use crate::abr::stream_ceiling_kbps;
 use crate::quic::{CODEC_H264, CODEC_HEVC};
 
+/// `PUNKTFUNK_ABR_PROBE_KBPS` on the webOS client: the burst target it pins
+/// so a 2 Gbps default does not take the picture with it.
+const WEBOS_PROBE_KBPS: u32 = 320_000;
+
 /// 4K165 HEVC 8-bit — the G5 sessions' mode.
 fn cap_4k165() -> u32 {
     stream_ceiling_kbps(3840, 2160, 165, CODEC_HEVC, 8, 0)
@@ -59,6 +63,9 @@ fn tv_session(
             stream_cap_kbps: cap_4k165(),
             audio_kbps: 512,
             decode: g5_decode(),
+            // A scenario that injects the ceiling is replaying a host that
+            // paused video for the burst; it runs no probe of its own.
+            probe: ceiling_at.is_none(),
             ceiling_at,
             ..ClientCfg::default()
         },
@@ -122,7 +129,7 @@ pub(super) fn wifi_good() -> Scenario {
         },
         sessions: vec![tv_session(
             171_294,
-            None,
+            Some((1_000, 171_294)),
             vec![ContentPhase {
                 fill_pct: 80,
                 active_pct: 88,
@@ -132,6 +139,68 @@ pub(super) fn wifi_good() -> Scenario {
         achievable_kbps: 171_294,
         blip_at_ms: Some(30_000),
     }
+}
+
+/// C6 — the 0.39 regression: the burst takes the picture with it.
+///
+/// The burst runs beside live video (#1146), so on a link it overdrives the
+/// video frames beside it die. The client freezes and asks for a keyframe
+/// every 100 ms until one lands; the host answers most asks with an
+/// intra-refresh wave (`host173` 09-17 09:53–09:54: `keyframe_req=9 idr=2
+/// rfi=8`), which does not unfreeze a client that lost its reference. The
+/// asks that outlive the discarded tail window are the first thing the
+/// controller judges, and four of them are severe.
+pub(super) fn wifi_tv_probe_damage() -> Scenario {
+    let mut s = tv_session(
+        20_000,
+        None,
+        vec![
+            ContentPhase {
+                until_ms: 10_000,
+                fill_pct: 68,
+                active_pct: 88,
+                ..ContentPhase::default()
+            },
+            ContentPhase {
+                fill_pct: 78,
+                active_pct: 88,
+                ..ContentPhase::default()
+            },
+        ],
+    );
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.host.recovery_ms = 1_200;
+    Scenario {
+        name: "wifi_tv_probe_damage",
+        seed: 0x7A_5E00,
+        duration_ms: 60_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            // A consumer AP's aggregation queue, not the 60 ms a switch
+            // holds. Under 180 ms every ask lands in the discarded tail;
+            // over 320 ms the queue swallows the whole burst and no frame
+            // dies at all.
+            buffer_ms: 250,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
+/// The same burst on the same link, with the recovery the 09-16 client log
+/// measured (690 ms and 896 ms): the freeze ends just past the discarded
+/// tail window, so the asks that reach a judged window are two or three —
+/// enough to mark it bad, not enough to be severe — and slow start survives,
+/// which is what those two sessions did.
+pub(super) fn wifi_tv_probe_survived() -> Scenario {
+    let mut sc = wifi_tv_probe_damage();
+    sc.name = "wifi_tv_probe_survived";
+    sc.seed = 0x7A_6500;
+    sc.sessions[0].host.recovery_ms = 1_050;
+    sc
 }
 
 /// C3 — one severe window inside the first 10 s, then the +6 % crawl.
@@ -148,7 +217,7 @@ pub(super) fn slow_start_spent() -> Scenario {
         },
         sessions: vec![tv_session(
             20_000,
-            Some((1_000, 171_294)),
+            None,
             vec![
                 // Nine seconds of content that does not fill three quarters
                 // of the target authorises no climb — the session was still
@@ -181,18 +250,19 @@ pub(super) fn gpu_saturated() -> Scenario {
     s.host.loaded_from_ms = 12_000;
     s.host.encode_swing_us = 4_500;
     s.host.encode_swing_ms = 1_500;
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
     Scenario {
         name: "gpu_saturated",
         seed: 0x7A_5400,
-        duration_ms: 80_000,
+        duration_ms: 110_000,
         link: LinkCfg {
-            capacity: vec![(0, 400_000)],
+            capacity: vec![(0, 245_000)],
             buffer_ms: 60,
             base_delay_ms: 3,
             ..LinkCfg::default()
         },
         sessions: vec![s],
-        achievable_kbps: 40_000,
+        achievable_kbps: 168_000,
         blip_at_ms: None,
     }
 }
@@ -277,7 +347,6 @@ fn lan(name: &'static str, capacity_kbps: u32, refresh_hz: u32) -> Scenario {
                 refresh_hz,
                 stream_cap_kbps: cap,
                 audio_kbps: 512,
-                ceiling_at: Some((1_000, (capacity_kbps as u64 * 7 / 10) as u32)),
                 ..ClientCfg::default()
             },
         }],
@@ -298,7 +367,6 @@ pub(super) fn lan_1g() -> Scenario {
 pub(super) fn lte_variable() -> Scenario {
     let mut s = wg_session();
     s.client.start_kbps = 20_000;
-    s.client.ceiling_at = Some((1_000, 21_000));
     Scenario {
         name: "lte_variable",
         seed: 0x7A_5700,
@@ -370,7 +438,7 @@ pub(super) fn shared_fixed_plus_auto() -> Scenario {
 /// August's Phase 3 cases: a still desktop that starts moving, and a source
 /// that never fills the wall-clock target.
 pub(super) fn static_then_motion() -> Scenario {
-    let mut s = tv_session(20_000, Some((1_000, 171_294)), full());
+    let mut s = tv_session(20_000, None, full());
     s.host.content = vec![
         ContentPhase {
             until_ms: 20_000,
@@ -406,7 +474,7 @@ pub(super) fn static_then_motion() -> Scenario {
 pub(super) fn frame_driven_35fps() -> Scenario {
     let mut s = tv_session(
         20_000,
-        Some((1_000, 171_294)),
+        None,
         vec![ContentPhase {
             active_pct: 21,
             ..ContentPhase::default()
@@ -431,7 +499,7 @@ pub(super) fn frame_driven_35fps() -> Scenario {
 
 /// A host that never flags idle repeats: every window is wall-clock.
 pub(super) fn old_host() -> Scenario {
-    let mut s = tv_session(20_000, Some((1_000, 171_294)), full());
+    let mut s = tv_session(20_000, None, full());
     s.host.marks_repeats = false;
     s.client.marks_repeats = false;
     s.host.content = vec![
@@ -460,6 +528,243 @@ pub(super) fn old_host() -> Scenario {
     }
 }
 
+/// Wi-Fi interference: bursts of loss parity still covers, so no frame dies
+/// and the whole signal is the repaired share. `ppm` names it.
+fn wifi_loss(name: &'static str, loss_ppm: u32) -> Scenario {
+    let mut s = tv_session(
+        20_000,
+        None,
+        vec![ContentPhase {
+            fill_pct: 78,
+            active_pct: 88,
+            ..ContentPhase::default()
+        }],
+    );
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    Scenario {
+        name,
+        seed: 0x7A_5F00 + u64::from(loss_ppm),
+        duration_ms: 60_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            loss_ppm,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
+/// Above `HEAVY_LOSS_PPM`: two windows of it are congestion.
+pub(super) fn wifi_loss_heavy() -> Scenario {
+    wifi_loss("wifi_loss_heavy", 25_000)
+}
+
+/// Above `SEVERE_LOSS_PPM`: one window of it is visible damage.
+pub(super) fn wifi_loss_severe() -> Scenario {
+    wifi_loss("wifi_loss_severe", 70_000)
+}
+
+/// A decoder whose latency rises with the rate until the cap latches, then
+/// the hold and retreat bands take over. 4K165 on a fragile SoC: 6 060 µs of
+/// budget, and past 60 Mbps every extra megabit costs 55 µs.
+pub(super) fn decoder_knee() -> Scenario {
+    let mut s = tv_session(
+        20_000,
+        None,
+        vec![ContentPhase {
+            fill_pct: 90,
+            ..ContentPhase::default()
+        }],
+    );
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.client.decode = DecodeCfg {
+        base_us: 1_200,
+        jitter_us: 200,
+        knee_kbps: 60_000,
+        us_per_mbps: 55,
+    };
+    Scenario {
+        name: "decoder_knee",
+        seed: 0x7A_6000,
+        duration_ms: 240_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
+/// A decoder that is slow at every rate: its latency never rises far enough
+/// over its own floor to read as congestion, so the headroom bands are what
+/// judge it — park at 80 % of the frame budget, retreat a notch at 90 %, and
+/// the retreat stands only if the latency follows the rate down.
+pub(super) fn decoder_headroom() -> Scenario {
+    let mut sc = decoder_knee();
+    sc.name = "decoder_headroom";
+    sc.seed = 0x7A_6600;
+    sc.sessions[0].client.decode = DecodeCfg {
+        base_us: 4_900,
+        jitter_us: 60,
+        knee_kbps: 100_000,
+        us_per_mbps: 10,
+    };
+    sc
+}
+
+/// A link that falls out from under the session: 245 Mbps to 2.5, with a
+/// 400 ms buffer in front of it. Every window after it is starved, and the
+/// frames that do arrive arrive late.
+pub(super) fn starved_client() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    Scenario {
+        name: "starved_client",
+        seed: 0x7A_6100,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000), (10_000, 2_500)],
+            buffer_ms: 400,
+            base_delay_ms: 20,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 2_500,
+        blip_at_ms: None,
+    }
+}
+
+/// An encoder taking 60 ms a frame on a link with room to spare: delivery is
+/// a tenth of the target with nothing lost, which is the case the starvation
+/// guard exists for — `encode_us` averaged over sixteen frames a second
+/// describes the interruption, not the rate.
+pub(super) fn encoder_stalled() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.host.loaded_encode_us = 60_000;
+    s.host.loaded_from_ms = 15_000;
+    s.host.encode_swing_us = 12_000;
+    Scenario {
+        name: "encoder_stalled",
+        seed: 0x7A_6700,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
+/// A cut, then a still desktop, then motion: the first active window after
+/// four repeat-only ones re-arms slow start.
+pub(super) fn idle_then_motion() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.host.content = vec![
+        ContentPhase {
+            until_ms: 20_000,
+            ..ContentPhase::default()
+        },
+        // Long enough that a shorter proven bucket would forget the rate
+        // this session had already held.
+        ContentPhase {
+            until_ms: 45_000,
+            idle: true,
+            ..ContentPhase::default()
+        },
+        ContentPhase::default(),
+    ];
+    Scenario {
+        name: "idle_then_motion",
+        seed: 0x7A_6200,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: Some(15_000),
+    }
+}
+
+/// A host that never answers a `SetBitrate`: after `MAX_UNACKED` unanswered
+/// requests the controller goes quiet for the session.
+pub(super) fn host_never_acks() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.host.acks = false;
+    Scenario {
+        name: "host_never_acks",
+        seed: 0x7A_6300,
+        duration_ms: 60_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
+/// A session whose refresh the host never named. Encode and decode
+/// thresholds fall back to their absolute durations instead of frame
+/// budgets, which is the only way those four constants are reached.
+pub(super) fn unknown_refresh() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.refresh_hz = 0;
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.client.decode = DecodeCfg {
+        base_us: 4_000,
+        jitter_us: 500,
+        knee_kbps: 40_000,
+        us_per_mbps: 1_800,
+    };
+    Scenario {
+        name: "unknown_refresh",
+        seed: 0x7A_6400,
+        duration_ms: 120_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
+/// The same session with a decoder that falls off a cliff instead of a
+/// slope: without a frame budget the severe tier is an absolute 45 ms, and
+/// this is the only way to reach it.
+pub(super) fn unknown_refresh_knee() -> Scenario {
+    let mut sc = unknown_refresh();
+    sc.name = "unknown_refresh_knee";
+    sc.seed = 0x7A_6800;
+    sc.sessions[0].client.decode.us_per_mbps = 4_000;
+    sc
+}
+
 /// The probe declined or refused: no ceiling was ever learned, so the
 /// negotiated start is the whole authority.
 pub(super) fn no_ramp() -> Scenario {
@@ -484,6 +789,7 @@ pub(super) fn no_ramp() -> Scenario {
                 start_kbps: 20_000,
                 refresh_hz: 60,
                 stream_cap_kbps: stream_ceiling_kbps(1920, 1080, 60, CODEC_H264, 8, 0),
+                probe: false,
                 ..ClientCfg::default()
             },
         }],
@@ -520,7 +826,6 @@ pub(super) fn fat_pipe_10min() -> Scenario {
                 refresh_hz: 240,
                 stream_cap_kbps: cap,
                 audio_kbps: 512,
-                ceiling_at: Some((1_000, 1_300_000)),
                 ..ClientCfg::default()
             },
         }],
@@ -547,6 +852,18 @@ pub(super) fn all() -> Vec<Scenario> {
         old_host(),
         no_ramp(),
         slow_start_spent(),
+        wifi_tv_probe_damage(),
+        wifi_loss_heavy(),
+        wifi_loss_severe(),
+        decoder_knee(),
+        starved_client(),
+        idle_then_motion(),
+        host_never_acks(),
+        unknown_refresh(),
+        wifi_tv_probe_survived(),
+        decoder_headroom(),
+        encoder_stalled(),
+        unknown_refresh_knee(),
     ]
 }
 
@@ -559,6 +876,23 @@ mod tests {
         25_247, 35_059, 41_852, 48_443, 56_240, 65_434, 74_038, 88_523, 103_536, 131_763, 166_388,
         171_294,
     ];
+
+    /// The startup burst measures the link and nothing else: the ceiling it
+    /// leaves is 0.7 × what the client received, bounded by the stream shape.
+    #[test]
+    fn the_startup_probe_sets_a_ceiling_from_what_it_delivered() {
+        let sc = lan_1g();
+        let cap = stream_ceiling_kbps(3840, 2160, 120, CODEC_HEVC, 8, 0);
+        let target = super::super::client::probe_target_kbps(cap);
+        assert_eq!(target, 1_492_992, "twice the 4K120 stream cap");
+        let want = (1_000_000u64.min(u64::from(target)) * 7 / 10).min(u64::from(cap)) as u32;
+        let r = run(&sc);
+        let ceiling = r.steps().into_iter().max().expect("the session climbs");
+        assert!(
+            ceiling * 10 >= want * 9 && ceiling <= want,
+            "{ceiling} kbps against 0.7 × the 1 GbE link's {want}"
+        );
+    }
 
     /// C1: the G5 reaches its measured ceiling in one climb, no cut on the
     /// way, and every step lands where the trace put it.
@@ -649,10 +983,54 @@ mod tests {
         assert!(took_s >= 150, "14 000 → 170 000 took {took_s} s");
     }
 
-    /// C4: host encode over its budget cuts twice more, then the down-driver
-    /// stands down and nothing cuts until it re-arms 16 windows later.
+    /// C6: the startup burst overdrives the link, video dies beside it, and
+    /// the keyframe asks that outlive the discarded tail are read as severe.
+    /// The deciding window has no unrecoverable frame of its own — it is the
+    /// recovery signal that cuts, which is why the host saw `loss_windows=0`
+    /// through the whole minute it happened in.
     #[test]
-    fn c4_a_saturated_encoder_cuts_twice_then_stands_down() {
+    fn c6_the_startup_burst_cuts_the_session_it_measures() {
+        let r = run(&wifi_tv_probe_damage());
+        let probe_end = r.windows[0]
+            .iter()
+            .find(|w| w.discarded)
+            .expect("the burst's tail window is discarded")
+            .t_ms;
+        let cut = r
+            .cuts()
+            .first()
+            .copied()
+            .expect("and the session backs off");
+        assert!(
+            cut.t_ms - probe_end <= 10_000,
+            "the cut landed {} ms after the burst",
+            cut.t_ms - probe_end
+        );
+        assert_eq!(cut.cut_from_kbps, Some(20_000), "from the negotiated start");
+        assert_eq!(
+            cut.dropped, 0,
+            "no unrecoverable frame in the deciding window"
+        );
+        assert!(
+            cut.recovery_kf >= 4,
+            "{} keyframe asks — under four nothing is severe",
+            cut.recovery_kf
+        );
+        let after = r.windows[0]
+            .iter()
+            .find(|w| w.t_ms > cut.t_ms && w.rate_kbps < 20_000)
+            .expect("the cut lands");
+        assert_eq!(
+            after.rate_kbps, 14_000,
+            "0.7 × the start, as the host log has it"
+        );
+    }
+
+    /// C4: host encode over its budget cuts, twice more without bringing it
+    /// down, then the down-driver stands down and nothing cuts until it
+    /// re-arms 16 windows later — three cuts, as the 09-16 trace has them.
+    #[test]
+    fn c4_a_saturated_encoder_cuts_three_times_then_stands_down() {
         let r = run(&gpu_saturated());
         let w = &r.windows[0];
         let disarm = w
@@ -751,6 +1129,7 @@ mod tests {
             .map(|(_, r)| u64::from(r.metrics.under5_pct))
             .sum::<u64>()
             / 10;
+        println!("under 5 Mbps: {under5} %");
         assert!(
             (10..=35).contains(&under5),
             "{under5} % of the time under 5 Mbps (the field saw 22.7 %)"
@@ -767,16 +1146,23 @@ mod tests {
             "c3" => slow_start_spent(),
             "c4" => gpu_saturated(),
             "c5" => wan_wg_12(0x5000, 720_000),
+            "c6" => wifi_tv_probe_damage(),
+            "knee" => decoder_knee(),
+            "starved" => starved_client(),
+            "unknown" => unknown_refresh(),
+            "idle" => idle_then_motion(),
+            "survived" => wifi_tv_probe_survived(),
             _ => wifi_tv(),
         };
         let r = run(&sc);
         for w in &r.windows[0] {
             println!(
-                "t={:6} rate={:7} actual={:7} drop={} cut={:?} disc={} dis={}",
+                "t={:6} rate={:7} actual={:7} drop={} kf={} cut={:?} disc={} dis={}",
                 w.t_ms,
                 w.rate_kbps,
                 w.actual_kbps,
                 w.dropped,
+                w.recovery_kf,
                 w.cut_from_kbps,
                 w.discarded,
                 w.encode_disarmed

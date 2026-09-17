@@ -17,7 +17,7 @@ mod host;
 mod link;
 mod scenarios;
 
-use client::{Action, Client, ClientCfg, WindowRec};
+use client::{Action, Client, ClientCfg, WindowRec, PROBE_FRAME};
 use host::{Host, HostCfg};
 use link::{Link, LinkCfg};
 use std::time::Instant;
@@ -85,6 +85,10 @@ struct Metrics {
     pub over_cap_kb_10s: u32,
     pub blip_recover_s: u32,
     pub fairness_x1000: u32,
+    /// FNV-1a over every session's `(window index, requested kbps)`. Eight
+    /// coarse metrics cannot see a retarget that moved by one window; this
+    /// can, so "bit-identical" means the whole decision sequence.
+    pub decisions_fnv1a: u32,
 }
 
 /// A metric that never happened. Visible in the table rather than silent.
@@ -173,6 +177,12 @@ fn run(sc: &Scenario) -> Run {
                     }
                 }
             };
+            // Filler first: the burst pumps between AUs, so a video frame
+            // lands on a queue the filler has just refilled. Offering video
+            // first would hand it the whole of each tick's drain and the
+            // burst would cost the session nothing.
+            let filler = s.host.probe_release(now);
+            offer(&mut link, &mut s.client, PROBE_FRAME, filler);
             if let Some(f) = s.host.tick(now) {
                 s.client.expect(&f, now);
                 if let Some((tail, bytes)) = s.host.take_flush() {
@@ -188,7 +198,9 @@ fn run(sc: &Scenario) -> Run {
         link.tick(now, &mut drained);
         for &(id, frame, bytes) in &drained {
             let s = &mut sessions[id as usize];
-            if let Some(shards) = s.client.deliver(frame, bytes) {
+            if frame == PROBE_FRAME {
+                s.client.deliver_probe(bytes, now + link.base_delay_ms());
+            } else if let Some(shards) = s.client.deliver(frame, bytes) {
                 let draw = link.draw_loss(shards);
                 s.client.complete(frame, draw, now + link.base_delay_ms());
             }
@@ -202,9 +214,16 @@ fn run(sc: &Scenario) -> Run {
             for a in &actions {
                 match *a {
                     Action::SetBitrate(kbps) => s.host.on_set_bitrate(now, kbps),
-                    Action::Keyframe => s.host.on_keyframe_request(),
+                    Action::Keyframe => s.host.on_keyframe_request(now),
                     Action::Loss { ppm, unrecovered } => s.host.on_loss_report(ppm, unrecovered),
+                    Action::Probe {
+                        target_kbps,
+                        duration_ms,
+                    } => s.host.on_probe_request(now, target_kbps, duration_ms),
                 }
+            }
+            if let Some(host_ms) = s.host.probe_done(now) {
+                s.client.on_probe_result(now, host_ms);
             }
             if let Some(kbps) = s.host.apply_pending(now) {
                 s.client.push_ack(kbps);
@@ -216,6 +235,24 @@ fn run(sc: &Scenario) -> Run {
         metrics,
         windows: sessions.into_iter().map(|s| s.client.windows).collect(),
     }
+}
+
+/// FNV-1a over the decisions every session made, in order.
+fn decision_checksum(sessions: &[Session]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for s in sessions {
+        for (i, w) in s.client.windows.iter().enumerate() {
+            let Some(kbps) = w.request_kbps else { continue };
+            for b in (i as u32)
+                .to_le_bytes()
+                .into_iter()
+                .chain(kbps.to_le_bytes())
+            {
+                h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+            }
+        }
+    }
+    h
 }
 
 fn percentile(samples: &mut [u32], pct: usize) -> u32 {
@@ -300,6 +337,7 @@ fn measure(
         over_cap_kb_10s: over_cap_kb_10s as u32,
         blip_recover_s,
         fairness_x1000,
+        decisions_fnv1a: decision_checksum(sessions),
     }
 }
 

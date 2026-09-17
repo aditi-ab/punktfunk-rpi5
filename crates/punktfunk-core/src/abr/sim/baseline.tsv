@@ -1,16 +1,28 @@
-scenario	under5_pct	to90_s	cuts_10min	lost_10min	queue_p95_ms	over_cap_kb_10s	blip_recover_s	fairness_x1000
-lan_10g	0	15	10	10	1	0	28	1000
-lan_1g	0	13	10	20	6	0	28	1000
-wifi_good	0	0	8	8	2	0	28	1000
-wifi_tv	0	20	0	0	3	0	0	1000
-wan_wg_12	2	0	26	396	56	4832	0	1000
-lte_variable	74	0	33	2550	249	0	0	1000
-shared_two_auto	22	0	32	548	52	14737	0	1000
-shared_newcomer	49	0	36	760	118	0	0	909
-shared_fixed_plus_auto	51	0	32	624	63	18506	0	964
-gpu_saturated	0	0	22	0	0	0	0	1000
-static_then_motion	0	9	0	0	3	0	0	1000
-frame_driven_35fps	0	7	0	0	3	0	0	1000
-old_host	0	9	0	0	3	0	0	1000
-no_ramp	0	0	0	0	1	0	0	1000
-slow_start_spent	0	186	2	2	2	0	27	1000
+scenario	under5_pct	to90_s	cuts_10min	lost_10min	queue_p95_ms	over_cap_kb_10s	blip_recover_s	fairness_x1000	decisions_fnv1a
+lan_10g	0	17	10	10	1	0	28	1000	b568b6a9
+lan_1g	0	15	10	20	6	0	28	1000	15df014a
+wifi_good	0	0	8	8	2	0	28	1000	ad273bfb
+wifi_tv	0	20	0	0	3	0	0	1000	7ab0d754
+wan_wg_12	2	0	26	400	56	20117	0	1000	c9b8f7ee
+lte_variable	75	0	36	2526	249	1141	0	1000	40738750
+shared_two_auto	22	0	32	560	53	45704	0	1000	57e31b2d
+shared_newcomer	57	0	40	672	238	14419	0	977	027c753b
+shared_fixed_plus_auto	52	0	32	532	67	40891	0	963	e266fcd3
+gpu_saturated	0	9	27	0	4	0	0	1000	6ef00794
+static_then_motion	0	11	0	0	5	0	0	1000	3663f398
+frame_driven_35fps	0	9	0	0	5	0	0	1000	baf45490
+old_host	0	11	0	0	4	0	0	1000	dc842130
+no_ramp	0	0	0	0	1	0	0	1000	811c9dc5
+slow_start_spent	0	187	2	2	3	0	28	1000	d25a0913
+wifi_tv_probe_damage	0	99999	10	0	0	0	0	1000	791998b2
+wifi_loss_heavy	89	99999	70	0	0	0	0	1000	41898378
+wifi_loss_severe	90	99999	70	0	0	0	0	1000	3ed39c85
+decoder_knee	0	99999	12	0	3	0	0	1000	f43012d4
+starved_client	73	0	86	24166	399	0	0	1000	5f612dd0
+idle_then_motion	0	11	6	6	4	0	31	1000	1777d4e9
+host_never_acks	0	99999	0	0	0	0	0	1000	f91aeb39
+unknown_refresh	0	99999	25	0	1	0	0	1000	3805d19b
+wifi_tv_probe_survived	0	99999	0	0	0	0	0	1000	2de1b7fa
+decoder_headroom	0	219	2	0	3	0	0	1000	1c4aee62
+encoder_stalled	0	11	6	0	4	0	0	1000	cd4fe556
+unknown_refresh_knee	0	99999	25	0	1	0	0	1000	af8cb644

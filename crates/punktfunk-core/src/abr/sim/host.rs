@@ -201,9 +201,16 @@ pub(super) struct HostCfg {
     pub encode_swing_ms: u64,
     /// A keyframe is this many times an ordinary frame.
     pub idr_pct: u32,
+    /// How long after a keyframe ask a decodable recovery point reaches the
+    /// wire. `0` = the next frame is an IDR. Larger where the host answers
+    /// with an intra-refresh wave instead: the client stays frozen through it.
+    pub recovery_ms: u64,
     pub content: Vec<ContentPhase>,
     /// Older host: never marks idle repeats.
     pub marks_repeats: bool,
+    /// `false` = a host that predates renegotiation: it applies nothing and
+    /// answers nothing, and the controller retires itself.
+    pub acks: bool,
 }
 
 impl Default for HostCfg {
@@ -221,10 +228,20 @@ impl Default for HostCfg {
             encode_swing_us: 0,
             encode_swing_ms: 1_500,
             idr_pct: 400,
+            recovery_ms: 0,
             content: vec![ContentPhase::default()],
             marks_repeats: true,
+            acks: true,
         }
     }
+}
+
+/// A speed-test burst in flight (`stream.rs` `ProbeBurst`).
+struct ProbeBurst {
+    target_kbps: u32,
+    start_ms: u64,
+    end_ms: u64,
+    bytes_sent: u64,
 }
 
 /// One frame on its way to the client.
@@ -249,8 +266,11 @@ pub(super) struct Host {
     unrecovered_run: u32,
     next_id: u32,
     next_frame_us: u64,
-    /// Keyframe owed to the client, and the pacer's remainder.
+    /// Keyframe owed to the client, when it comes due, and the burst in
+    /// flight.
     idr_owed: bool,
+    idr_due_ms: Option<u64>,
+    probe: Option<ProbeBurst>,
     swing_us: u32,
     swing_until_ms: u64,
     pace_left: u64,
@@ -275,6 +295,8 @@ impl Host {
             next_id: 1,
             next_frame_us: 0,
             idr_owed: true,
+            idr_due_ms: None,
+            probe: None,
             swing_us: 0,
             swing_until_ms: 0,
             pace_left: 0,
@@ -289,12 +311,53 @@ impl Host {
     /// A `SetBitrate` landed. The ack the client gets back is what the encoder
     /// can apply, not what was asked.
     pub(super) fn on_set_bitrate(&mut self, now_ms: u64, kbps: u32) {
+        if !self.cfg.acks {
+            return;
+        }
         let applied = kbps.min(self.cfg.encoder_ceiling_kbps.unwrap_or(u32::MAX));
         self.pending = Some((now_ms + self.cfg.retarget_ms, applied));
     }
 
-    pub(super) fn on_keyframe_request(&mut self) {
-        self.idr_owed = true;
+    /// Coalesced, as the control task coalesces it: asks while one is already
+    /// due do not move the due time.
+    pub(super) fn on_keyframe_request(&mut self, now_ms: u64) {
+        self.idr_due_ms.get_or_insert(now_ms + self.cfg.recovery_ms);
+    }
+
+    /// Arm a speed-test burst (`stream.rs` `ProbeBurst::begin`).
+    pub(super) fn on_probe_request(&mut self, now_ms: u64, target_kbps: u32, duration_ms: u32) {
+        self.probe = Some(ProbeBurst {
+            target_kbps,
+            start_ms: now_ms,
+            end_ms: now_ms + u64::from(duration_ms),
+            bytes_sent: 0,
+        });
+    }
+
+    /// Filler the burst may put on the wire this millisecond: elapsed × rate
+    /// minus what has gone (`stream.rs` `allowed_bytes`). The host's 64 KiB
+    /// `PROBE_PUMP_BYTES` slice is one send-loop pass, not a rate limit — the
+    /// loop passes many times a millisecond — so it does not bind here.
+    pub(super) fn probe_release(&mut self, now_ms: u64) -> u64 {
+        let Some(p) = self.probe.as_mut() else {
+            return 0;
+        };
+        let elapsed = now_ms.min(p.end_ms) - p.start_ms;
+        let allowed = elapsed * u64::from(p.target_kbps) * 125 / 1_000;
+        let take = allowed.saturating_sub(p.bytes_sent);
+        p.bytes_sent += take;
+        take
+    }
+
+    /// The burst's own duration once it expires — the host's `ProbeResult`.
+    pub(super) fn probe_done(&mut self, now_ms: u64) -> Option<u32> {
+        let p = self.probe.as_ref()?;
+        if now_ms < p.end_ms {
+            return None;
+        }
+        let ms = (p.end_ms - p.start_ms) as u32;
+        self.probe = None;
+        Some(ms)
     }
 
     /// Host adaptive FEC closes on the client's loss report.
@@ -376,7 +439,11 @@ impl Host {
         // Per-frame allowance is the session fps, not the rate the source
         // manages: a frame-driven source spends a slice of the budget.
         let frame_bytes = enc_kbps as u64 * 1_000 / 8 / self.cfg.fps.max(1) as u64;
-        let idr = std::mem::take(&mut self.idr_owed);
+        let idr =
+            std::mem::take(&mut self.idr_owed) || matches!(self.idr_due_ms, Some(t) if now_ms >= t);
+        if idr {
+            self.idr_due_ms = None;
+        }
         let cut = phase.cut_every_ms > 0 && now_ms >= self.next_cut_ms;
         if cut {
             self.next_cut_ms = now_ms + phase.cut_every_ms;

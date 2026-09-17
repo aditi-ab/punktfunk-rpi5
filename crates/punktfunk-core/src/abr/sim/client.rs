@@ -24,6 +24,15 @@ const STANDING_MS: u64 = 250;
 /// The webOS client's recovery throttle: one ask per 100 ms until a keyframe
 /// lands.
 const KEYFRAME_ASK_MS: u64 = 100;
+/// `data.rs`: the startup burst fires 2 s after video flows and lasts 800 ms.
+const PROBE_DELAY_MS: u64 = 2_000;
+const PROBE_MS: u32 = 800;
+/// Header plus shard, the plaintext the reassembler counts per probe packet —
+/// not the sealed datagram. The field's `delivered_kbps` is in these bytes.
+const PROBE_PACKET_BYTES: u64 = 40 + 1408;
+/// The probe's own id in the link queue. Filler never reaches the decoder and
+/// never counts toward `actual_kbps` (`wire_bytes` nets it out).
+pub(super) const PROBE_FRAME: u32 = u32::MAX;
 
 /// Decode latency: a floor plus a rise past the rate the decoder is happy at.
 #[derive(Clone, Copy, Debug, Default)]
@@ -44,8 +53,14 @@ pub(super) struct ClientCfg {
     /// Older host: repeats are not flagged, so no window is ever idle.
     pub marks_repeats: bool,
     pub decode: DecodeCfg,
-    /// Startup probe result, injected as the pump injects it: `(at_ms, kbps)`.
-    /// The window it lands in is discarded, as the probe tail is.
+    /// Run the startup capacity probe. `false` replays a host that declined
+    /// it, or a scenario that injects the ceiling instead.
+    pub probe: bool,
+    /// `PUNKTFUNK_ABR_PROBE_KBPS`. `None` = `probe_target_kbps(stream_cap)`.
+    pub probe_target_kbps: Option<u32>,
+    /// Ceiling injected directly, for a scenario that replays a host which
+    /// paused video for the burst. The window it lands in is discarded, as
+    /// the probe tail is.
     pub ceiling_at: Option<(u64, u32)>,
     /// `false` = an explicit bitrate, so no controller.
     pub automatic: bool,
@@ -61,6 +76,8 @@ impl Default for ClientCfg {
             shard_payload: 1408,
             marks_repeats: true,
             decode: DecodeCfg::default(),
+            probe: true,
+            probe_target_kbps: None,
             ceiling_at: None,
             automatic: true,
         }
@@ -73,6 +90,12 @@ pub(super) enum Action {
     SetBitrate(u32),
     Keyframe,
     Loss { ppm: u32, unrecovered: bool },
+    Probe { target_kbps: u32, duration_ms: u32 },
+}
+
+/// `data.rs` `probe_target_kbps`: twice the stream cap, held at 2 Gbps.
+pub(super) fn probe_target_kbps(stream_cap_kbps: u32) -> u32 {
+    stream_cap_kbps.saturating_mul(2).min(2_000_000)
 }
 
 /// One closed report window, kept for the metrics.
@@ -83,6 +106,9 @@ pub(super) struct WindowRec {
     pub rate_kbps: u32,
     pub actual_kbps: u32,
     pub dropped: u64,
+    /// Keyframe asks this window — the recovery signal.
+    pub recovery_kf: u32,
+    pub request_kbps: Option<u32>,
     pub cut_from_kbps: Option<u32>,
     pub discarded: bool,
     /// The encode down-driver's stand-down, sampled after the verdict.
@@ -135,6 +161,14 @@ pub(super) struct Client {
     awaiting_idr: bool,
     kf_next_ms: u64,
     force_loss_at_ms: Option<u64>,
+    /// Startup probe: when it fires, whether it is in flight, and what the
+    /// filler delivered while it was.
+    probe_at_ms: Option<u64>,
+    probing: bool,
+    probe_bytes: u64,
+    probe_first_ms: u64,
+    probe_last_ms: u64,
+    probe_video_frames: u32,
     pub(super) windows: Vec<WindowRec>,
     pub(super) owd_samples: Vec<u32>,
 }
@@ -176,6 +210,12 @@ impl Client {
             awaiting_idr: false,
             kf_next_ms: 0,
             force_loss_at_ms: None,
+            probe_at_ms: cfg.probe.then_some(PROBE_DELAY_MS),
+            probing: false,
+            probe_bytes: 0,
+            probe_first_ms: 0,
+            probe_last_ms: 0,
+            probe_video_frames: 0,
             windows: Vec::new(),
             owd_samples: Vec::new(),
             cfg,
@@ -292,6 +332,9 @@ impl Client {
             return;
         }
         self.au_frames = self.au_frames.saturating_add(1);
+        if self.probing {
+            self.probe_video_frames = self.probe_video_frames.saturating_add(1);
+        }
         if f.repeat && self.cfg.marks_repeats {
             self.au_repeats = self.au_repeats.saturating_add(1);
         }
@@ -356,13 +399,64 @@ impl Client {
         }
     }
 
+    /// Probe filler arrived. It never reaches the decoder and `wire_bytes`
+    /// nets it out of the window, so it teaches the controller nothing
+    /// directly — only the damage it does to video beside it.
+    pub(super) fn deliver_probe(&mut self, bytes: u64, now_ms: u64) {
+        if self.probe_first_ms == 0 {
+            self.probe_first_ms = now_ms;
+        }
+        self.probe_last_ms = now_ms;
+        self.probe_bytes += bytes;
+    }
+
+    /// The host's `ProbeResult` landed: ceiling from what the client received
+    /// over its own receive interval, every window anchor rebased past the
+    /// burst, and the window in flight discarded (`data.rs`).
+    pub(super) fn on_probe_result(&mut self, now_ms: u64, host_duration_ms: u32) {
+        self.probing = false;
+        let packets = self.probe_bytes / (self.cfg.shard_payload as u64 + SHARD_WIRE_OVERHEAD);
+        let delivered = packets * PROBE_PACKET_BYTES;
+        let interval_ms = if packets >= 2 && self.probe_last_ms > self.probe_first_ms {
+            self.probe_last_ms - self.probe_first_ms
+        } else {
+            u64::from(host_duration_ms)
+        };
+        if delivered > 0 && interval_ms > 0 {
+            let delivered_kbps = (delivered * 8 / interval_ms) as u32;
+            self.abr.set_ceiling(delivered_kbps.saturating_mul(7) / 10);
+        }
+        // No frame survived the burst: one keyframe ask to re-anchor.
+        if self.probe_video_frames == 0 {
+            self.awaiting_idr = true;
+        }
+        self.reset_window();
+        self.next_window_ms = now_ms + ADAPT_REPORT_INTERVAL.as_millis() as u64;
+        self.discard = true;
+    }
+
     /// One millisecond: the keyframe throttle, then the report window when it
-    /// comes due.
+    /// comes due. No window closes while the burst is in flight — the pump
+    /// suppresses the whole report tick for it.
     pub(super) fn tick(&mut self, now_ms: u64, base: Instant, out: &mut Vec<Action>) {
         if self.awaiting_idr && now_ms >= self.kf_next_ms {
             self.kf_next_ms = now_ms + KEYFRAME_ASK_MS;
             self.recovery_kf += 1;
             out.push(Action::Keyframe);
+        }
+        if let Some(at) = self.probe_at_ms {
+            if now_ms >= at {
+                self.probe_at_ms = None;
+                self.probing = true;
+                self.probe_video_frames = 0;
+                out.push(Action::Probe {
+                    target_kbps: self
+                        .cfg
+                        .probe_target_kbps
+                        .unwrap_or_else(|| probe_target_kbps(self.cfg.stream_cap_kbps)),
+                    duration_ms: PROBE_MS,
+                });
+            }
         }
         if let Some((at, kbps)) = self.cfg.ceiling_at {
             if now_ms >= at {
@@ -372,7 +466,7 @@ impl Client {
                 self.discard = true;
             }
         }
-        if now_ms < self.next_window_ms {
+        if self.probing || now_ms < self.next_window_ms {
             return;
         }
         let window_ms = ADAPT_REPORT_INTERVAL.as_millis() as u64;
@@ -427,10 +521,18 @@ impl Client {
             rate_kbps: was,
             actual_kbps,
             dropped: self.dropped,
+            recovery_kf: self.recovery_kf,
+            request_kbps: request,
             cut_from_kbps: request.filter(|&k| k < was).map(|_| was),
             discarded: discard,
             encode_disarmed: self.abr.encode_disarmed,
         });
+        self.reset_window();
+    }
+
+    /// Drop this window's accumulators. The probe rebases them too, so the
+    /// first window after the burst counts nothing the burst produced.
+    fn reset_window(&mut self) {
         self.received_packets = 0;
         self.repaired = 0;
         self.received_bytes = 0;

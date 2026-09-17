@@ -10,11 +10,12 @@ use super::{run, scenarios, Metrics};
 const BASELINE: &str = include_str!("baseline.tsv");
 
 const HEADER: &str = "scenario\tunder5_pct\tto90_s\tcuts_10min\tlost_10min\t\
-                      queue_p95_ms\tover_cap_kb_10s\tblip_recover_s\tfairness_x1000";
+                      queue_p95_ms\tover_cap_kb_10s\tblip_recover_s\tfairness_x1000\t\
+                      decisions_fnv1a";
 
 fn row(name: &str, m: &Metrics) -> String {
     format!(
-        "{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:08x}",
         m.under5_pct,
         m.to90_s,
         m.cuts_per_10min,
@@ -22,7 +23,8 @@ fn row(name: &str, m: &Metrics) -> String {
         m.queue_p95_ms,
         m.over_cap_kb_10s,
         m.blip_recover_s,
-        m.fairness_x1000
+        m.fairness_x1000,
+        m.decisions_fnv1a
     )
 }
 
