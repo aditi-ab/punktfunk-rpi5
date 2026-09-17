@@ -88,10 +88,13 @@ ip netns exec c iperf3 -c $HOST_IP -u -b "${RATE_KBIT}k" -t 3 -f k 2>&1 | tail -
 wait %2 2>/dev/null || true
 
 # ---- the session ------------------------------------------------------------
-say "host: --content $CONTENT --fill $FILL --recovery-ms $RECOVERY_MS --keyframe-answer $KEYFRAME_ANSWER"
+NO_RAMP_ARG=""
+if [ "$NO_RAMP" = 1 ]; then NO_RAMP_ARG="--no-ramp"; fi
+say "host: --content $CONTENT --fill $FILL --recovery-ms $RECOVERY_MS --keyframe-answer $KEYFRAME_ANSWER --bringup-ms $BRINGUP_MS $NO_RAMP_ARG"
 ip netns exec h "$BIN/punktfunk-host" punktfunk1-host \
   --port $PORT --source synthetic-abr --content "$CONTENT" --fill "$FILL" \
   --recovery-ms "$RECOVERY_MS" --keyframe-answer "$KEYFRAME_ANSWER" \
+  --bringup-ms "$BRINGUP_MS" $NO_RAMP_ARG \
   --seconds $(( SECONDS_RUN + 30 )) --pairing-pin "$PIN" --no-mdns \
   > "$OUT/$PROFILE-host.log" 2>&1 &
 HOST_PID=$!

@@ -34,6 +34,11 @@ profile() {
   # Hold the picture after a lost frame until one re-anchors it, as a real
   # decoder must. Off by default: it is a model, not a decoder.
   DECODER_HOLD=${PF_RIG_DECODER_HOLD:-0}
+  # How long the host holds its first frame back, as a pipeline build does.
+  # The client's bring-up ramp runs inside this window.
+  BRINGUP_MS=${PF_RIG_BRINGUP_MS:-2500}
+  # 1 = do not offer the ramp, so the client takes the legacy in-session burst.
+  NO_RAMP=${PF_RIG_NO_RAMP:-0}
 
   case "$1" in
     lan_1g)

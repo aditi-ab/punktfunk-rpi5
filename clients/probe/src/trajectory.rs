@@ -142,6 +142,53 @@ fn window_json(w: &WindowRecord, held_ms: u64) -> String {
     )
 }
 
+/// The bring-up ramp as JSON: one object per step, then what it came to.
+///
+/// Written before the window lines, because that is the order it happened in:
+/// the ramp measures the link before a frame exists.
+fn ramp_json(r: &punktfunk_core::abr::RampRecord) -> String {
+    let mut out = String::new();
+    for s in &r.steps {
+        out.push_str(&format!(
+            concat!(
+                r#"{{"ramp_step":{},"t_ms":{},"asked_kbps":{},"asked_bytes":{},"#,
+                r#""host_bytes_sent":{},"offered_packets":{},"delivered_packets":{},"#,
+                r#""delivered_bytes":{},"client_interval_ms":{},"host_duration_ms":{},"#,
+                r#""send_dropped":{},"verdict":"{:?}"}}"#,
+                "
+"
+            ),
+            out.lines().count() + 1,
+            s.t_ms,
+            s.target_kbps,
+            s.asked_bytes,
+            s.host_bytes_sent,
+            s.wire_packets_sent,
+            s.delivered_packets,
+            s.delivered_bytes,
+            s.client_interval_ms,
+            s.host_duration_ms,
+            s.send_dropped,
+            s.end,
+        ));
+    }
+    out.push_str(&format!(
+        concat!(
+            r#"{{"ramp":"done","wall":{},"proven_kbps":{},"steps":{},"asked_bytes":{},"#,
+            r#""took_ms":{},"opening_kbps":{}}}"#,
+            "
+"
+        ),
+        r.outcome.wall,
+        r.outcome.proven_kbps,
+        r.outcome.steps,
+        r.outcome.asked_bytes,
+        r.outcome.took_ms,
+        r.opening_kbps,
+    ));
+    out
+}
+
 /// Score a finished run the way `abr/sim` scores a modelled one.
 ///
 /// Two inputs the session cannot see are approximated and named here rather
@@ -283,7 +330,17 @@ pub fn run(
     let duration_ms = started.elapsed().as_millis() as u64;
 
     let out = std::fs::File::create(path).with_context(|| format!("create {path}"))?;
-    let row = write_trajectory(out, &windows, &held, profile, duration_ms, frames, link)?;
+    let ramp = client.abr_ramp();
+    let row = write_trajectory(
+        out,
+        ramp.as_ref(),
+        &windows,
+        &held,
+        profile,
+        duration_ms,
+        frames,
+        link,
+    )?;
     println!("{}", metrics::HEADER);
     println!("{row}");
     Ok(())
@@ -293,6 +350,7 @@ pub fn run(
 /// [`metrics::HEADER`] row.
 fn write_trajectory(
     mut out: impl Write,
+    ramp: Option<&punktfunk_core::abr::RampRecord>,
     windows: &[WindowRecord],
     held: &[u64],
     profile: &str,
@@ -300,6 +358,9 @@ fn write_trajectory(
     frames: u64,
     link: Link,
 ) -> Result<String> {
+    if let Some(r) = ramp {
+        write!(out, "{}", ramp_json(r)).context("write the ramp")?;
+    }
     for (w, held_ms) in windows.iter().zip(held.iter().chain(std::iter::repeat(&0))) {
         writeln!(out, "{}", window_json(w, *held_ms)).context("write a window")?;
     }
@@ -387,11 +448,11 @@ mod tests {
         };
         let path = std::env::temp_dir().join("pf-abr-rig-trajectory-test.jsonl");
         let file = std::fs::File::create(&path).expect("create the trajectory");
-        write_trajectory(file, &ws, &[], "wan_wg_12", 6_000, 400, link).expect("write it");
+        write_trajectory(file, None, &ws, &[], "wan_wg_12", 6_000, 400, link).expect("write it");
         let text = std::fs::read_to_string(&path).expect("read it back");
         let _ = std::fs::remove_file(&path);
 
-        let mut lines: Vec<&str> = text.lines().collect();
+        let mut lines: Vec<&str> = text.lines().filter(|l| !l.contains("\"ramp")).collect();
         let summary_line = lines.pop().expect("the summary is the last line");
         let reread: Vec<metrics::MetricWindow> = lines
             .iter()
