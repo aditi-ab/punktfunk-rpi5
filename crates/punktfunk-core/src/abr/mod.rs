@@ -411,6 +411,111 @@ pub(crate) fn stream_ceiling_kbps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stats::Stats;
+
+    /// Video that arrives after the startup burst is what the window
+    /// measures.
+    ///
+    /// The embedder mirrors a finished probe's state for as long as it
+    /// stands, so the pump hands the driver the same `ProbeResult` on every
+    /// iteration — thousands of times a second. Only the first is the
+    /// measurement: treating the rest as fresh would re-base the byte anchor
+    /// each time, every window after the burst would read as nothing
+    /// delivered, and the session would never climb again.
+    #[test]
+    fn delivery_after_the_burst_is_what_the_window_reports() {
+        // 1 250 wire bytes a millisecond is 10 Mbps exactly over any window.
+        const BYTES_PER_MS: u64 = 1_250;
+        let base = Instant::now();
+        let at = |ms: u64| base + std::time::Duration::from_millis(ms);
+        let mut d = Driver::new(
+            DriverConfig {
+                start_kbps: 20_000,
+                ceiling_cap_kbps: None,
+                stream_cap_kbps: 200_000,
+                refresh_hz: 60,
+                codec: crate::quic::CODEC_HEVC,
+                bit_depth: 8,
+                chroma_format: crate::quic::CHROMA_IDC_420,
+                audio_reserved_kbps: 0,
+                marks_repeats: true,
+                probe: true,
+                probe_target_kbps: Some(400_000),
+            },
+            base,
+        );
+        let mut st = Stats::default();
+        let deliver = |st: &mut Stats, ms: u64| {
+            st.bytes_received += BYTES_PER_MS;
+            st.packets_received += 1;
+            if ms % 16 == 0 {
+                st.frames_completed += 1;
+            }
+        };
+        // Two seconds of video, then the burst fires.
+        let mut fired = None;
+        for ms in 0..=2_000 {
+            deliver(&mut st, ms);
+            d.on_stats(&st);
+            if ms % 16 == 0 {
+                d.on_au(false);
+            }
+            for a in d.tick(at(ms)).actions {
+                if let Action::Probe { duration_ms, .. } = a {
+                    fired = Some((ms, duration_ms));
+                }
+            }
+        }
+        let (fired_ms, burst_ms) = fired.expect("the startup probe fires once video flows");
+        // The burst: filler in the counters, never in the decoder.
+        for ms in fired_ms + 1..=fired_ms + u64::from(burst_ms) {
+            deliver(&mut st, ms);
+            st.bytes_received += 40_000;
+            st.probe_bytes_received += 40_000;
+            d.on_stats(&st);
+            d.on_probe_active(true, burst_ms, at(ms));
+            d.tick(at(ms));
+        }
+        // The host's report, and then the same report for as long as the
+        // embedder's probe state stands.
+        let done_ms = fired_ms + u64::from(burst_ms) + 1;
+        let report = ProbeReport {
+            delivered_bytes: 32_000_000,
+            window_ms: burst_ms,
+            host_duration_ms: burst_ms,
+            client_interval_ms: burst_ms,
+        };
+        let mut windows = Vec::new();
+        for ms in done_ms..done_ms + 2_000 {
+            deliver(&mut st, ms);
+            d.on_stats(&st);
+            d.on_probe_active(false, burst_ms, at(ms));
+            d.on_probe_result(report);
+            if ms % 16 == 0 {
+                d.on_au(false);
+            }
+            let tick = d.tick(at(ms));
+            if let Some(w) = tick.window {
+                windows.push((w.discarded, w.sample.actual_kbps));
+            }
+        }
+        assert!(
+            windows.len() >= 2,
+            "two seconds must close at least two windows, closed {}",
+            windows.len()
+        );
+        assert!(
+            windows[0].0,
+            "the window the burst's tail landed in is discarded"
+        );
+        let (discarded, actual_kbps) = windows[1];
+        assert!(!discarded, "the window after the tail is the link's own");
+        assert_eq!(
+            actual_kbps, 10_000,
+            "the window must report the 10 Mbps the stats delivered, not a byte anchor \
+             re-based under it"
+        );
+    }
 
     /// Bound cuts an absurd probe ceiling and must not trim a session anyone runs.
     #[test]

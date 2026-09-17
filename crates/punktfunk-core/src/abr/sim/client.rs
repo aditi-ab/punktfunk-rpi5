@@ -151,6 +151,10 @@ pub(super) struct Client {
     probe_bytes: u64,
     probe_first_ms: u64,
     probe_last_ms: u64,
+    /// The finished burst's report. The embedder's probe state keeps saying
+    /// "done" until the next burst overwrites it, so the pump hands the same
+    /// report over on every iteration — and so does this.
+    probe_report: Option<ProbeReport>,
     pub(super) windows: Vec<WindowRec>,
     pub(super) owd_samples: Vec<u32>,
 }
@@ -193,6 +197,7 @@ impl Client {
             probe_bytes: 0,
             probe_first_ms: 0,
             probe_last_ms: 0,
+            probe_report: None,
             windows: Vec::new(),
             owd_samples: Vec::new(),
             cfg,
@@ -397,9 +402,7 @@ impl Client {
         } else {
             0
         };
-        let now = self.base + Duration::from_millis(now_ms);
-        self.abr.on_probe_active(false, self.probe_duration_ms, now);
-        self.abr.on_probe_result(ProbeReport {
+        let report = ProbeReport {
             delivered_bytes: delivered,
             window_ms: if client_interval_ms > 0 {
                 client_interval_ms
@@ -408,7 +411,11 @@ impl Client {
             },
             host_duration_ms,
             client_interval_ms,
-        });
+        };
+        let now = self.base + Duration::from_millis(now_ms);
+        self.abr.on_probe_active(false, self.probe_duration_ms, now);
+        self.abr.on_probe_result(report);
+        self.probe_report = Some(report);
     }
 
     /// One millisecond of client: the keyframe throttle, then the driver,
@@ -431,6 +438,11 @@ impl Client {
         self.abr.on_stats(&self.stats);
         self.abr
             .on_probe_active(self.probing, self.probe_duration_ms, now);
+        // The pump re-presents a finished burst's report for as long as the
+        // probe state stands. Only the first is the measurement.
+        if let Some(r) = self.probe_report {
+            self.abr.on_probe_result(r);
+        }
         let unrecovered = self.lost_frames > 0;
         let tick = self.abr.tick(now);
         let mut request = None;
@@ -447,6 +459,8 @@ impl Client {
                 } => {
                     self.probing = true;
                     self.probe_duration_ms = duration_ms;
+                    // A new burst overwrites the old state, report included.
+                    self.probe_report = None;
                     self.probe_bytes = 0;
                     self.probe_first_ms = 0;
                     self.probe_last_ms = 0;
