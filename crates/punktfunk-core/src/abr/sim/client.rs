@@ -5,7 +5,7 @@
 //! capacity probe are the shipped code, driven the way
 //! `client/pump/data.rs` drives them: counters in, actions out.
 
-use super::host::{Frame, FrameShape, ProbeDone, SHARD_WIRE_OVERHEAD};
+use super::host::{probe_chunk_bytes, Frame, FrameShape, ProbeDone, SHARD_WIRE_OVERHEAD};
 use super::link::LossDraw;
 use super::Rng;
 use crate::abr::{Driver, DriverConfig, ProbeReport};
@@ -162,6 +162,11 @@ pub(super) struct Client {
     probe_bytes: u64,
     probe_first_ms: u64,
     probe_last_ms: u64,
+    /// Filler packets and AUs this burst has completed, so the session
+    /// counters they feed are bumped once each.
+    probe_packets: u64,
+    probe_aus: u64,
+    probe_chunk_bytes: u64,
     /// The host's end-of-burst report. The embedder's probe state keeps
     /// saying "done" until the next burst overwrites it, so the pump hands a
     /// report over on every iteration — and so does this. Its delivered
@@ -215,6 +220,9 @@ impl Client {
             probe_bytes: 0,
             probe_first_ms: 0,
             probe_last_ms: 0,
+            probe_packets: 0,
+            probe_aus: 0,
+            probe_chunk_bytes: 1,
             probe_done: None,
             windows: Vec::new(),
             owd_samples: Vec::new(),
@@ -407,13 +415,27 @@ impl Client {
         self.probe_bytes += bytes;
         self.stats.bytes_received += bytes;
         self.stats.probe_bytes_received += bytes;
+        // A probe datagram is an accepted datagram: `session.rs` counts it in
+        // `packets_received` with every other, and `packet/reassemble.rs`
+        // adds the probe pair at the routing decision.
+        let wire = self.cfg.shard_payload as u64 + SHARD_WIRE_OVERHEAD;
+        let packets = self.probe_bytes / wire;
+        self.stats.packets_received += packets - self.probe_packets;
+        self.stats.probe_packets_received += packets - self.probe_packets;
+        self.probe_packets = packets;
+        // And a completed filler AU moves `frames_completed` like any other:
+        // the reassembler splits probe from video, `session.rs`'s completion
+        // count does not.
+        let aus = self.probe_bytes / self.probe_chunk_bytes;
+        self.stats.frames_completed += aus - self.probe_aus;
+        self.probe_aus = aus;
     }
 
     /// What the pump would hand the driver right now: the host's report plus
     /// whatever has arrived since, which is still growing while the
     /// bottleneck queue drains.
     fn probe_report(&self, done: ProbeDone) -> ProbeReport {
-        let packets = self.probe_bytes / (self.cfg.shard_payload as u64 + SHARD_WIRE_OVERHEAD);
+        let packets = self.probe_packets;
         // Client receive interval: first to last filler arrival. Under two
         // packets there is no interval and the host's window stands.
         let client_interval_ms = if packets >= 2 && self.probe_last_ms > self.probe_first_ms {
@@ -505,6 +527,9 @@ impl Client {
                     self.probe_bytes = 0;
                     self.probe_first_ms = 0;
                     self.probe_last_ms = 0;
+                    self.probe_packets = 0;
+                    self.probe_aus = 0;
+                    self.probe_chunk_bytes = probe_chunk_bytes(target_kbps);
                     out.push(Action::Probe {
                         target_kbps,
                         duration_ms,

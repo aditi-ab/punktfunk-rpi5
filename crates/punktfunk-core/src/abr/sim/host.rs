@@ -33,6 +33,13 @@ pub(super) fn auto_burst_bytes(pace_rate_bps: u64, wire_bytes: usize) -> usize {
         .clamp(BURST_MIN, BURST_MAX)
 }
 
+/// Filler bytes per probe AU (`stream.rs` `ProbeBurst::begin`): a 240th of a
+/// second at the burst's rate, clamped. The client completes one AU per
+/// chunk, and every completion moves `Stats::frames_completed`.
+pub(super) fn probe_chunk_bytes(target_kbps: u32) -> u64 {
+    (u64::from(target_kbps) * 125 / 240).clamp(1_200, 16 * 1_024)
+}
+
 /// Per-block FEC geometry of one frame. Every block but the last holds
 /// [`MAX_DATA_PER_BLOCK`] data shards; parity follows all the data on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

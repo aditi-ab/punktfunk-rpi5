@@ -35,7 +35,7 @@ wifi_tv_legacy	0	20	0	0	3	0	0	1000	a510e60b
 wifi_good_legacy	0	1	0	8	2	0	0	1000	811c9dc5
 slow_start_spent_legacy	0	19	2	2	5	0	7	1000	1ef06aa8
 gpu_saturated_legacy	0	9	27	0	4	0	0	1000	3e661c75
-wan_wg_12_legacy	2	0	13	393	40	20186	0	1000	7be3047e
+wan_wg_12_legacy	2	0	13	400	40	20117	0	1000	7be3047e
 wifi_tv_probe_damage_legacy	0	20	0	0	3	0	0	1000	f419fe3f
 wifi_tv_probe_stalled_legacy	0	20	0	0	3	0	0	1000	8e422cdf
 host_rebuild_stall_legacy	0	1	15	0	2	0	0	1000	325d140c
