@@ -1,0 +1,99 @@
+#!/bin/sh
+# Mutation sweep over the Automatic-bitrate controller's constants.
+#
+# For each constant: change it, run `abr::sim`, restore. A constant whose
+# mutation leaves every test GREEN is a decision the baseline cannot see, so
+# a later package could change it silently. Exits non-zero on the first such
+# constant; the list at the bottom of the output is what to cover.
+#
+# `ENCODE_RISE_US` and `ENCODE_SEVERE_US` only apply when the session's
+# refresh is unknown, and `LOW_RATE_WARN_KBPS` only logs, so neither is in
+# the table. `PROVEN_BUCKET_WINDOWS` is in it and expected green: see
+# `KNOWN_GREEN`.
+set -u
+cd "$(dirname "$0")/.." || exit 2
+
+FILE=crates/punktfunk-core/src/abr/mod.rs
+TEST="cargo test -p punktfunk-core --features quic --lib abr::sim"
+BACKUP=$(mktemp)
+cp "$FILE" "$BACKUP"
+trap 'cp "$BACKUP" "$FILE"; rm -f "$BACKUP" "$FILE.bak"' EXIT INT TERM
+
+# Constants whose mutation the simulator cannot see, with the reason.
+# `proven_cur_kbps` is refreshed from the deciding window before the climb
+# gate reads it, and the utilisation gate guarantees that refreshed value
+# already licenses a step, so the bucket period only changes a step's size
+# in a window that is clean enough to climb and delivering less than the
+# buckets remember. No scenario produces one.
+KNOWN_GREEN="PROVEN_BUCKET_WINDOWS"
+
+fail=0
+
+# name | line as it stands | line as it becomes
+MUTATIONS=$(cat <<'EOF'
+FLOOR_KBPS|const FLOOR_KBPS: u32 = 2_000;|const FLOOR_KBPS: u32 = 500;
+IDLE_WINDOWS_TO_REARM|const IDLE_WINDOWS_TO_REARM: u32 = 4;|const IDLE_WINDOWS_TO_REARM: u32 = 40;
+MIN_ACTIVE_FRAMES_TO_CLIMB|const MIN_ACTIVE_FRAMES_TO_CLIMB: u32 = 4;|const MIN_ACTIVE_FRAMES_TO_CLIMB: u32 = 40;
+PROVEN_BUCKET_WINDOWS|const PROVEN_BUCKET_WINDOWS: u32 = 40;|const PROVEN_BUCKET_WINDOWS: u32 = 10;
+BAD_WINDOWS_TO_DECREASE|const BAD_WINDOWS_TO_DECREASE: u32 = 2;|const BAD_WINDOWS_TO_DECREASE: u32 = 4;
+SEVERE_LOSS_PPM|const SEVERE_LOSS_PPM: u32 = 60_000;|const SEVERE_LOSS_PPM: u32 = 200_000;
+CLEAN_WINDOWS_TO_INCREASE|const CLEAN_WINDOWS_TO_INCREASE: u32 = 6;|const CLEAN_WINDOWS_TO_INCREASE: u32 = 3;
+CHANGE_COOLDOWN|const CHANGE_COOLDOWN: Duration = Duration::from_millis(1500);|const CHANGE_COOLDOWN: Duration = Duration::from_millis(3000);
+HEAVY_LOSS_PPM|const HEAVY_LOSS_PPM: u32 = 20_000;|const HEAVY_LOSS_PPM: u32 = 55_000;
+RECOVERY_KF_BAD|const RECOVERY_KF_BAD: u32 = 2;|const RECOVERY_KF_BAD: u32 = 7;
+RECOVERY_KF_SEVERE|const RECOVERY_KF_SEVERE: u32 = 4;|const RECOVERY_KF_SEVERE: u32 = 9;
+OWD_RISE_US|const OWD_RISE_US: i64 = 25_000;|const OWD_RISE_US: i64 = 50_000;
+DECODE_RISE_US|const DECODE_RISE_US: i64 = 15_000;|const DECODE_RISE_US: i64 = 60_000;
+DECODE_SEVERE_US|const DECODE_SEVERE_US: i64 = 45_000;|const DECODE_SEVERE_US: i64 = 180_000;
+DECODE_HOLD_PCT|const DECODE_HOLD_PCT: i64 = 80;|const DECODE_HOLD_PCT: i64 = 99;
+DECODE_RETREAT_PCT|const DECODE_RETREAT_PCT: i64 = 90;|const DECODE_RETREAT_PCT: i64 = 45;
+DECODE_ANSWER_PCT|const DECODE_ANSWER_PCT: i64 = 5;|const DECODE_ANSWER_PCT: i64 = 50;
+DECODE_VERDICT_WINDOWS|const DECODE_VERDICT_WINDOWS: u32 = 2;|const DECODE_VERDICT_WINDOWS: u32 = 4;
+DECODE_PROBE_MAX_AGE|const DECODE_PROBE_MAX_AGE: u32 = 16;|const DECODE_PROBE_MAX_AGE: u32 = 2;
+DECODE_FULL_RATE_NUM|const DECODE_FULL_RATE_NUM: i64 = 3;|const DECODE_FULL_RATE_NUM: i64 = 6;
+UTILIZATION_NUM|const UTILIZATION_NUM: u64 = 3;|const UTILIZATION_NUM: u64 = 6;
+PROVEN_HEADROOM_NUM|const PROVEN_HEADROOM_NUM: u32 = 3;|const PROVEN_HEADROOM_NUM: u32 = 6;
+ENCODE_NOOP_BACKOFFS_TO_DISARM|const ENCODE_NOOP_BACKOFFS_TO_DISARM: u32 = 2;|const ENCODE_NOOP_BACKOFFS_TO_DISARM: u32 = 4;
+CAP_REPROBE_WINDOWS_MIN|const CAP_REPROBE_WINDOWS_MIN: u32 = 16;|const CAP_REPROBE_WINDOWS_MIN: u32 = 4;
+CAP_REPROBE_WINDOWS_MAX|const CAP_REPROBE_WINDOWS_MAX: u32 = 128;|const CAP_REPROBE_WINDOWS_MAX: u32 = 32;
+DECODE_CAP_SIMILAR_DIV|const DECODE_CAP_SIMILAR_DIV: u32 = 8;|const DECODE_CAP_SIMILAR_DIV: u32 = 16;
+STARVED_DELIVERY_DIV|const STARVED_DELIVERY_DIV: u32 = 4;|const STARVED_DELIVERY_DIV: u32 = 40;
+BASELINE_WINDOWS|const BASELINE_WINDOWS: usize = 40;|const BASELINE_WINDOWS: usize = 10;
+BASELINE_MIN_WINDOWS|const BASELINE_MIN_WINDOWS: usize = 4;|const BASELINE_MIN_WINDOWS: usize = 12;
+MAX_UNACKED|const MAX_UNACKED: u32 = 3;|const MAX_UNACKED: u32 = 6;
+EOF
+)
+
+printf '%s\n' "$MUTATIONS" | while IFS='|' read -r name from to; do
+    [ -n "$name" ] || continue
+    cp "$BACKUP" "$FILE"
+    # `from` and `to` are whole lines, so the only metacharacters sed sees are
+    # the ones already in the source: none.
+    sed "s|^$from\$|$to|" "$BACKUP" > "$FILE"
+    if ! grep -qxF "$to" "$FILE"; then
+        printf '::error::%-31s the mutation did not apply — the constant moved\n' "$name"
+        echo "APPLY-FAILED $name" >> "$BACKUP.green"
+        continue
+    fi
+    out=$($TEST 2>&1)
+    failed=$(printf '%s\n' "$out" | sed -n 's/^test \(abr::sim[^ ]*\) \.\.\. FAILED$/\1/p' | tr '\n' ' ')
+    if [ -n "$failed" ]; then
+        printf 'RED   %-31s %s\n' "$name" "$failed"
+    elif echo " $KNOWN_GREEN " | grep -q " $name "; then
+        printf 'GREEN %-31s nothing noticed (known, see KNOWN_GREEN)\n' "$name"
+    else
+        printf 'GREEN %-31s nothing noticed\n' "$name"
+        echo "$name" >> "$BACKUP.green"
+    fi
+done
+
+cp "$BACKUP" "$FILE"
+if [ -s "$BACKUP.green" ]; then
+    echo
+    echo "::error::these constants are invisible to abr::sim:"
+    sed 's/^/  /' "$BACKUP.green"
+    rm -f "$BACKUP.green"
+    fail=1
+fi
+rm -f "$BACKUP.green"
+exit $fail
