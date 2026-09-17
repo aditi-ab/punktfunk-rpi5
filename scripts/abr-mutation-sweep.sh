@@ -13,11 +13,14 @@
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
-FILE=crates/punktfunk-core/src/abr/mod.rs
+# One constant per concern file. The table below names declarations without
+# their visibility, so a constant another module reads still matches.
+DIR=crates/punktfunk-core/src/abr
 TEST="cargo test -p punktfunk-core --features quic --lib abr::sim"
-BACKUP=$(mktemp)
-cp "$FILE" "$BACKUP"
-trap 'cp "$BACKUP" "$FILE"; rm -f "$BACKUP" "$FILE.bak"' EXIT INT TERM
+BACKUP=$(mktemp -d)
+cp "$DIR"/*.rs "$BACKUP/"
+restore() { cp "$BACKUP"/*.rs "$DIR/"; }
+trap 'restore; rm -rf "$BACKUP"' EXIT INT TERM
 
 # Constants whose mutation the simulator cannot see, with the reason.
 # `proven_cur_kbps` is refreshed from the deciding window before the climb
@@ -66,11 +69,12 @@ EOF
 
 printf '%s\n' "$MUTATIONS" | while IFS='|' read -r name from to; do
     [ -n "$name" ] || continue
-    cp "$BACKUP" "$FILE"
-    # `from` and `to` are whole lines, so the only metacharacters sed sees are
-    # the ones already in the source: none.
-    sed "s|^$from\$|$to|" "$BACKUP" > "$FILE"
-    if ! grep -qxF "$to" "$FILE"; then
+    restore
+    # The declaration is a substring of its line (the visibility prefix is
+    # not in the table), and carries no sed metacharacter.
+    file=$(grep -lF "$from" "$DIR"/*.rs | head -1)
+    [ -n "$file" ] && sed "s|$from|$to|" "$BACKUP/$(basename "$file")" > "$file"
+    if [ -z "$file" ] || ! grep -qF "$to" "$file"; then
         printf '::error::%-31s the mutation did not apply — the constant moved\n' "$name"
         echo "APPLY-FAILED $name" >> "$BACKUP.green"
         continue
@@ -87,7 +91,7 @@ printf '%s\n' "$MUTATIONS" | while IFS='|' read -r name from to; do
     fi
 done
 
-cp "$BACKUP" "$FILE"
+restore
 if [ -s "$BACKUP.green" ]; then
     echo
     echo "::error::these constants are invisible to abr::sim:"
