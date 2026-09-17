@@ -72,6 +72,16 @@ profile() {
       WANDER_PCT=20; WANDER_S=20
       MODE=1920x1080x30; ACHIEVABLE_KBPS=18000
       ;;
+    # The no-wall case: a link netem shapes cleanly (245 Mbps — 1 Gbps it
+    # cannot) carrying a mode whose stream cap / 0.7 is far below it, so the
+    # bring-up ramp runs out of things to prove before the link refuses
+    # anything. `lan_1g` is NOT this case: its cap / 0.7 is above what the VM
+    # can shape, and the ramp reads the two hosts' packet paths instead.
+    nowall_720p)
+      RATE_KBIT=245000; DELAY_MS=3; BUFFER_MS=60
+      MODE=1280x720x60; ACHIEVABLE_KBPS=25000
+      ;;
+
     # F: two Automatic sessions over one tunnel, one host. Each probe scores
     # only itself, so both rows read fairness 1000 — the Jain share needs both
     # sessions' windows in one run, which nothing merges yet.
@@ -82,7 +92,7 @@ profile() {
       ;;
     *)
       echo "unknown profile '$1' (lan_1g wifi_tv wifi_tv_probe_damage wan_wg_12 \
-lte_variable shared_two_auto)" >&2
+lte_variable nowall_720p shared_two_auto)" >&2
       return 1
       ;;
   esac
