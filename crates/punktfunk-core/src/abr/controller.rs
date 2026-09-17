@@ -16,6 +16,7 @@
 //! proven mark. Tests in this module pin the contract.
 
 use super::cap::{LearnedCap, StandDown};
+use super::growth::{self, Proven, CLEAN_WINDOWS_TO_INCREASE};
 use super::sample::{self, WindowActivity, WindowSample};
 use super::verdict::{
     encode_thresholds, Baselines, Reason, Verdict, HEAVY_LOSS_PPM, RECOVERY_KF_BAD,
@@ -32,19 +33,9 @@ const LOW_RATE_WARN_KBPS: u32 = 5_000;
 /// Fully-idle windows (every AU a host-marked repeat) before the next active
 /// window re-arms slow start. 4 × 750 ms ≈ 3 s of stillness.
 const IDLE_WINDOWS_TO_REARM: u32 = 4;
-/// Fewest active frames before the fps-normalized utilization gate may climb.
-/// Two stray frames would prorate the target to almost nothing.
-const MIN_ACTIVE_FRAMES_TO_CLIMB: u32 = 4;
-/// Windows per proven-throughput bucket (~30 s). The mark is the max of the
-/// current and previous buckets so a regime minutes gone cannot license a
-/// doubling.
-const PROVEN_BUCKET_WINDOWS: u32 = 40;
 /// Consecutive ordinary-bad windows before a decrease. One 750 ms window can
 /// be a scheduler blip; 1.5 s is a condition. Severe skips the wait.
 const BAD_WINDOWS_TO_DECREASE: u32 = 2;
-/// Clean windows before an additive climb (~4.5 s). Slow start ignores this
-/// and doubles on every cooled clean window.
-const CLEAN_WINDOWS_TO_INCREASE: u32 = 6;
 /// Minimum gap between requests. Each accepted change rebuilds the encoder
 /// and opens with an IDR; back-to-back steps outrun the ack RTT.
 const CHANGE_COOLDOWN: Duration = Duration::from_millis(1500);
@@ -68,14 +59,6 @@ const DECODE_PROBE_MAX_AGE: u32 = 16;
 /// overstates the full-rate load.
 const DECODE_FULL_RATE_NUM: i64 = 3;
 const DECODE_FULL_RATE_DEN: i64 = 4;
-/// Climb credit requires `actual × DEN ≥ target × NUM` (¾ of target). Below
-/// that the encoder was not constrained, so the window proves nothing.
-const UTILIZATION_NUM: u64 = 3;
-const UTILIZATION_DEN: u64 = 4;
-/// Climb may step at most ×1.5 past proven throughput. Utilization guarantees
-/// `proven ≥ ¾ × current`, so the two gates cannot deadlock.
-const PROVEN_HEADROOM_NUM: u32 = 3;
-const PROVEN_HEADROOM_DEN: u32 = 2;
 /// Consecutive encode-attributed backoffs that did not bring host encode time
 /// down, after which the encode down-driver stands down.
 ///
@@ -186,12 +169,9 @@ pub(crate) struct BitrateController {
     /// Decode latency did not follow the rate: hold and retreat stand down
     /// until a clean run re-probes them.
     decode_headroom: StandDown,
-    /// Highest clean delivered rate of the current/previous
-    /// [`PROVEN_BUCKET_WINDOWS`] buckets. Shrinking capacity is the reactive
-    /// decode signal's job.
-    proven_cur_kbps: u32,
-    proven_prev_kbps: u32,
-    proven_bucket_windows: u32,
+    /// Highest clean delivered rate of the recent buckets. Shrinking capacity
+    /// is the reactive decode signal's job.
+    proven: Proven,
     /// Consecutive fully-idle windows. First active window after
     /// [`IDLE_WINDOWS_TO_REARM`] re-arms slow start. Empty windows do not count.
     idle_windows: u32,
@@ -245,9 +225,7 @@ impl BitrateController {
             climb_since_backoff: true,
             decode_probe: None,
             decode_headroom: StandDown::new(),
-            proven_cur_kbps: 0,
-            proven_prev_kbps: 0,
-            proven_bucket_windows: 0,
+            proven: Proven::new(),
             idle_windows: 0,
             low_rate_warned: false,
             bad_windows: 0,
@@ -511,15 +489,8 @@ impl BitrateController {
         self.encode_down = StandDown::new();
         self.encode_backoff_us = 0;
         self.encode_noop_backoffs = 0;
-        self.proven_cur_kbps = 0;
-        self.proven_prev_kbps = 0;
-        self.proven_bucket_windows = 0;
+        self.proven.clear();
         self.idle_windows = 0;
-    }
-
-    /// Max clean delivered rate of the current and previous buckets (~30–60 s).
-    fn proven(&self) -> u32 {
-        self.proven_cur_kbps.max(self.proven_prev_kbps)
     }
 
     /// Decide whether this 750 ms window should ask for a new encoder rate.
@@ -580,24 +551,19 @@ impl BitrateController {
                 self.last_change = None;
                 tracing::debug!(
                     idle_windows = self.idle_windows,
-                    proven_kbps = self.proven(),
+                    proven_kbps = self.proven.mark(),
                     "adaptive bitrate: motion onset after an idle stretch — slow start re-armed"
                 );
             }
             self.idle_windows = 0;
         }
         // Bucket clock ticks on idle windows too: decay is about time.
-        self.proven_bucket_windows += 1;
-        if self.proven_bucket_windows >= PROVEN_BUCKET_WINDOWS {
-            self.proven_bucket_windows = 0;
-            self.proven_prev_kbps = self.proven_cur_kbps;
-            self.proven_cur_kbps = 0;
-        }
+        self.proven.tick();
         // Proven mark: scored after the verdict, gated on the whole of it.
         // Damaged windows overstate delivered (stall drain, flush queue, FEC
         // surge); those bytes arriving is not climb authority.
-        if !bad && actual_kbps > self.proven_cur_kbps {
-            self.proven_cur_kbps = actual_kbps;
+        if !bad {
+            self.proven.note(actual_kbps);
         }
         if bad {
             self.bad_windows += 1;
@@ -800,31 +766,8 @@ impl BitrateController {
             }
         }
         // Climbs need a utilized clean window and stay within ×1.5 of proven.
-        // Frame-driven sources never reach ¾ of the wall-clock target, so the
-        // ¾ gate is prorated by active/expected, floored at
-        // [`MIN_ACTIVE_FRAMES_TO_CLIMB`]. Older host: wall-clock arithmetic.
-        let legacy_utilized =
-            actual_kbps as u64 * UTILIZATION_DEN >= self.current_kbps as u64 * UTILIZATION_NUM;
-        // Prorate utilization AND proven-headroom together or they deadlock
-        // (a 35 fps source's wall-clock wire rate never exceeds ~39 % of target).
-        let proration = match (activity, self.frame_budget_us) {
-            (WindowActivity::Active(n), Some(budget_us))
-                if budget_us > 0 && n > 0 && (n as i64) < sample::WINDOW_US / budget_us =>
-            {
-                Some((n as u64, ((sample::WINDOW_US / budget_us).max(1)) as u64))
-            }
-            _ => None,
-        };
-        let utilized = match (activity, proration) {
-            (WindowActivity::Active(0) | WindowActivity::Empty, _) => false,
-            (_, Some((n, expected))) => {
-                n >= MIN_ACTIVE_FRAMES_TO_CLIMB as u64
-                    && actual_kbps as u64 * UTILIZATION_DEN * expected
-                        >= self.current_kbps as u64 * UTILIZATION_NUM * n
-            }
-            // Full-rate source, older host, or unknown refresh: wall-clock.
-            _ => legacy_utilized,
-        };
+        let proration = growth::proration(activity, self.frame_budget_us);
+        let utilized = growth::utilized(activity, proration, actual_kbps, self.current_kbps);
         // Probe = link, short acks = encoder, decode cap = client decoder.
         let eff_ceiling = self
             .ceiling_kbps
@@ -842,27 +785,13 @@ impl BitrateController {
             self.ceiling_ask_kbps = ceiling_target;
             return self.request(ceiling_target, now);
         }
-        // Proven bounds projected wire rate at ×1.5. Frame-driven: invert the
-        // same proration so a utilized window still has ≥ ~12 % climb room.
-        let proven_wire_cap =
-            self.proven().saturating_mul(PROVEN_HEADROOM_NUM) / PROVEN_HEADROOM_DEN;
-        let proven_target_cap = match proration {
-            Some((n, expected)) => {
-                u32::try_from(proven_wire_cap as u64 * expected / n).unwrap_or(u32::MAX)
-            }
-            None => proven_wire_cap,
-        };
-        let cap = eff_ceiling.min(proven_target_cap);
+        // Proven bounds the projected wire rate at ×1.5, in the same domain
+        // the proration took it out of.
+        let cap = eff_ceiling.min(growth::proven_target_cap(self.proven.mark(), proration));
         if self.current_kbps < eff_ceiling && utilized && cap > self.current_kbps {
-            // Slow start: double every cooled clean window. Else +~6 % after
-            // a sustained clean run.
-            if self.probing && self.clean_windows >= 1 {
-                let next = self.current_kbps.saturating_mul(2).min(cap);
-                self.clean_windows = 0;
-                return self.request(next, now);
-            }
-            if self.clean_windows >= CLEAN_WINDOWS_TO_INCREASE {
-                let next = (self.current_kbps + self.current_kbps / 16 + 1).min(cap);
+            let slow_start = self.probing && self.clean_windows >= 1;
+            if slow_start || self.clean_windows >= CLEAN_WINDOWS_TO_INCREASE {
+                let next = growth::climb_step(self.current_kbps, cap, slow_start);
                 self.clean_windows = 0;
                 return self.request(next, now);
             }
@@ -892,7 +821,6 @@ impl BitrateController {
 mod tests {
     use super::super::cap::CAP_REPROBE_WINDOWS_MIN;
     use super::super::harness::*;
-    use super::super::verdict::BASELINE_MIN_WINDOWS;
     use super::*;
 
     #[test]
@@ -1056,90 +984,6 @@ mod tests {
     }
 
     #[test]
-    fn sustained_clean_recovers_toward_ceiling_only() {
-        let mut c = BitrateController::new(20_000);
-        let start = Instant::now();
-        assert_eq!(
-            c.on_window(&WindowSample {
-                dropped: 1,
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            Some(14_000)
-        );
-        c.on_ack(14_000);
-        // Slow start is over: 6 clean windows → +~6 % (14000 + 14000/16 + 1 = 14876).
-        let up = run_clean(&mut c, start, 2, 7);
-        assert_eq!(up, Some(14_876));
-        c.on_ack(14_876);
-        // At the ceiling, clean windows stay quiet.
-        c.on_ack(20_000);
-        assert_eq!(run_clean(&mut c, start, 40, 20), None);
-    }
-
-    #[test]
-    fn slow_start_doubles_to_a_probed_ceiling_then_stops() {
-        let mut c = BitrateController::new(20_000);
-        // Probe measured ~430 Mbps delivered → ×0.7 ceiling.
-        c.set_ceiling(300_000);
-        let start = Instant::now();
-        // Cooled clean windows double until the ceiling, then quiet.
-        let mut got = Vec::new();
-        for i in 0..14 {
-            if let Some(k) = c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, i))
-            }) {
-                c.on_ack(k);
-                got.push(k);
-            }
-        }
-        assert_eq!(got, vec![40_000, 80_000, 160_000, 300_000]);
-    }
-
-    #[test]
-    fn first_congestion_ends_slow_start_for_good() {
-        let mut c = BitrateController::new(20_000);
-        c.set_ceiling(300_000);
-        let start = Instant::now();
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            Some(40_000)
-        );
-        c.on_ack(40_000);
-        // Severe: immediate ×0.7, slow start over.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                dropped: 1,
-                owd_mean_us: Some(10_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 2))
-            }),
-            Some(28_000)
-        );
-        c.on_ack(28_000);
-        // Next climb is additive, after 6 clean windows.
-        let mut next = None;
-        for i in 3..12 {
-            next = c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, i))
-            });
-            if next.is_some() {
-                assert!(i >= 8, "additive climb must wait for the clean run");
-                break;
-            }
-        }
-        assert_eq!(next, Some(29_751)); // 28000 + 28000/16 + 1
-    }
-
-    #[test]
     fn set_ceiling_is_ignored_when_disabled_and_never_lowers() {
         let mut c = BitrateController::new(0);
         c.set_ceiling(1_000_000);
@@ -1226,339 +1070,6 @@ mod tests {
         assert_eq!(d.ceiling_kbps, 0);
     }
 
-    #[test]
-    fn decode_latency_caps_the_slow_start_climb() {
-        // Fat link, decoder saturates below it.
-        let mut c = BitrateController::new(20_000);
-        c.set_ceiling(300_000);
-        let start = Instant::now();
-        // First [`BASELINE_MIN_WINDOWS`] teach the decode baseline.
-        let mut last = 0;
-        for i in 0..BASELINE_MIN_WINDOWS as u32 {
-            if let Some(k) = c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(8_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, i * 2))
-            }) {
-                last = k;
-                c.on_ack(k);
-            }
-        }
-        assert_eq!(last, 300_000, "slow start should reach the probed ceiling");
-        // +30 ms decode: climb stops.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(38_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 20))
-            }),
-            None
-        );
-        // Second backed-up window: ×0.7, not park at the link ceiling.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(40_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 22))
-            }),
-            Some(210_000)
-        );
-    }
-
-    #[test]
-    fn unloaded_clean_windows_never_authorize_a_climb() {
-        // Calm, under-target delivery: no climb credit.
-        let mut c = BitrateController::new(20_000);
-        c.set_ceiling(300_000);
-        let start = Instant::now();
-        for i in 0..12 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(10_000),
-                    decode_mean_us: Some(8_000),
-                    actual_kbps: 2_000,
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-        // First utilized window: ×1.5 over proven 18 000 → 27 000, not 2× to 40 000.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(8_000),
-                actual_kbps: 18_000,
-                ..WindowSample::at(ticks(start, 12))
-            }),
-            Some(27_000)
-        );
-        // Zero active frames never authorizes a climb, whatever delivered claims.
-        let mut c = BitrateController::new(20_000);
-        c.set_ceiling(300_000);
-        c.set_frame_budget(60);
-        for i in 0..12 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(10_000),
-                    decode_mean_us: Some(8_000),
-                    actual_kbps: 18_000,
-                    activity: WindowActivity::Active(0),
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None,
-                "an idle window must never climb"
-            );
-        }
-    }
-
-    /// Frame-driven source: utilization and proven-headroom prorate together
-    /// so a 35 fps source on 90 Hz is not stuck in a wall-clock dead band.
-    #[test]
-    fn a_frame_driven_source_climbs_at_its_own_fps() {
-        let mut c = BitrateController::new(20_000);
-        c.set_stream_cap(100_000);
-        c.set_ceiling(60_000);
-        c.set_frame_budget(90); // 11 111 µs budget → 67 expected frames / window
-        let start = Instant::now();
-        // 26/67 frames, 8 000 kbps vs prorated 7 761: utilized. Proven headroom
-        // 8 000×1.5×67/26 = 30 923, not wall-clock 12 000.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                actual_kbps: 8_000,
-                activity: WindowActivity::Active(26),
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            Some(30_923)
-        );
-        // Under [`MIN_ACTIVE_FRAMES_TO_CLIMB`]: not utilized.
-        let mut d = BitrateController::new(20_000);
-        d.set_stream_cap(100_000);
-        d.set_ceiling(60_000);
-        d.set_frame_budget(90);
-        assert_eq!(
-            d.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                actual_kbps: 900,
-                activity: WindowActivity::Active(3),
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            None,
-            "three stray frames are not a utilized window"
-        );
-    }
-
-    /// Motion onset after a real idle stretch re-arms slow start, bounded by
-    /// ×1.5 over the windowed proven mark.
-    #[test]
-    fn motion_onset_rearms_slow_start_bounded_by_the_windowed_proven() {
-        let mut c = BitrateController::new(20_000);
-        c.set_stream_cap(100_000);
-        c.set_ceiling(60_000);
-        c.set_frame_budget(60);
-        let start = Instant::now();
-        // Severe window ends slow start…
-        assert_eq!(
-            c.on_window(&WindowSample {
-                dropped: 1,
-                actual_kbps: 18_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            Some(14_000)
-        );
-        c.on_ack(14_000);
-        // …one clean window proves 14 000…
-        assert_eq!(
-            c.on_window(&WindowSample {
-                actual_kbps: 14_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 1))
-            }),
-            None
-        );
-        // …then ≥ [`IDLE_WINDOWS_TO_REARM`] idle windows.
-        for i in 2..6 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    actual_kbps: 200,
-                    activity: WindowActivity::Active(0),
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-        // Onset: ×1.5 over proven 14 000 → 21 000, not additive 14 876.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                actual_kbps: 14_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 6))
-            }),
-            Some(21_000)
-        );
-    }
-
-    /// Five empty windows are not an idle stretch. [`CLEAN_WINDOWS_TO_INCREASE`]
-    /// is 6, so five quiet windows plus one active would additive-climb if
-    /// Empty were credited as clean (the older-host `None` path).
-    #[test]
-    fn empty_windows_do_not_rearm_abr_slow_start() {
-        let mut c = BitrateController::new(20_000);
-        c.set_stream_cap(100_000);
-        c.set_ceiling(60_000);
-        c.set_frame_budget(60);
-        let start = Instant::now();
-        assert_eq!(
-            c.on_window(&WindowSample {
-                dropped: 1,
-                actual_kbps: 18_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            Some(14_000)
-        );
-        c.on_ack(14_000);
-        for i in 1..=5 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    actual_kbps: 200,
-                    activity: WindowActivity::Empty,
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-        assert_eq!(
-            c.on_window(&WindowSample {
-                actual_kbps: 14_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 6))
-            }),
-            None,
-            "a blackout is not stillness and cannot authorize a climb"
-        );
-    }
-
-    /// Empty is neutral on the idle counter: it neither fills nor clears it.
-    #[test]
-    fn empty_windows_do_not_count_toward_idle_rearm() {
-        let mut c = BitrateController::new(20_000);
-        c.set_stream_cap(100_000);
-        c.set_ceiling(60_000);
-        c.set_frame_budget(60);
-        let start = Instant::now();
-        assert_eq!(
-            c.on_window(&WindowSample {
-                dropped: 1,
-                actual_kbps: 18_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            Some(14_000)
-        );
-        c.on_ack(14_000);
-        assert_eq!(
-            c.on_window(&WindowSample {
-                actual_kbps: 14_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 1))
-            }),
-            None
-        );
-        for i in 2..6 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    actual_kbps: 200,
-                    activity: WindowActivity::Active(0),
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-        assert_eq!(
-            c.on_window(&WindowSample {
-                actual_kbps: 200,
-                activity: WindowActivity::Empty,
-                ..WindowSample::at(ticks(start, 6))
-            }),
-            None,
-            "empty is not motion onset"
-        );
-        assert_eq!(
-            c.on_window(&WindowSample {
-                actual_kbps: 14_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 7))
-            }),
-            Some(21_000),
-            "empty must not clear a real idle stretch"
-        );
-    }
-
-    /// Idle stretch outlives both proven buckets: onset doubles over what it
-    /// just delivered, not the stale pre-idle mark.
-    #[test]
-    fn the_proven_mark_decays_with_its_buckets() {
-        let mut c = BitrateController::new(20_000);
-        c.set_stream_cap(100_000);
-        c.set_ceiling(60_000);
-        c.set_frame_budget(60);
-        let start = Instant::now();
-        // Prove 20 000; slow start asks for the bounded double (mark matters)…
-        assert_eq!(
-            c.on_window(&WindowSample {
-                actual_kbps: 20_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            Some(30_000)
-        );
-        // Severe inside cooldown scores but decides nothing; second backs off.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                dropped: 1,
-                actual_kbps: 20_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 1))
-            }),
-            None
-        );
-        assert_eq!(
-            c.on_window(&WindowSample {
-                dropped: 1,
-                actual_kbps: 20_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 2))
-            }),
-            Some(14_000)
-        );
-        c.on_ack(14_000);
-        // Idle 2 × [`PROVEN_BUCKET_WINDOWS`]: both buckets rotate away.
-        for i in 3..3 + 2 * PROVEN_BUCKET_WINDOWS {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    actual_kbps: 200,
-                    activity: WindowActivity::Active(0),
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-        // Onset delivers 14 000 → 21 000, not 28 000 off the stale 20 000 mark.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                actual_kbps: 14_000,
-                activity: WindowActivity::Active(45),
-                ..WindowSample::at(ticks(start, 3 + 2 * PROVEN_BUCKET_WINDOWS))
-            }),
-            Some(21_000)
-        );
-    }
-
     /// One-shot warning on first descent below the old 5 Mbps floor.
     #[test]
     fn the_low_rate_warning_fires_once_below_the_old_floor() {
@@ -1585,65 +1096,6 @@ mod tests {
             Some(2_940)
         );
         assert!(c.low_rate_warned, "…exactly once");
-    }
-
-    #[test]
-    fn slow_start_steps_stay_within_proven_headroom() {
-        // Each slow-start step is ×1.5 over delivered, not a blind 2×.
-        let mut c = BitrateController::new(20_000);
-        c.set_ceiling(300_000);
-        let start = Instant::now();
-        // Full-target delivery: proven 20 000 → cap 30 000.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(8_000),
-                actual_kbps: 20_000,
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            Some(30_000)
-        );
-        c.on_ack(30_000);
-        // Delivers 30 000 → next step 45 000, not 60 000.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(8_000),
-                actual_kbps: 30_000,
-                ..WindowSample::at(ticks(start, 2))
-            }),
-            Some(45_000)
-        );
-    }
-
-    #[test]
-    fn calm_period_keeps_the_validated_target() {
-        // Validated target is not surrendered when the scene goes calm.
-        let mut c = BitrateController::new(20_000);
-        c.set_ceiling(300_000);
-        let start = Instant::now();
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(8_000),
-                actual_kbps: 20_000,
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            Some(30_000)
-        );
-        c.on_ack(30_000);
-        // Long calm stretch (2 % utilization): stay silent. Keep proven headroom.
-        for i in 2..30 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(10_000),
-                    decode_mean_us: Some(4_000),
-                    actual_kbps: 600,
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
     }
 
     #[test]
