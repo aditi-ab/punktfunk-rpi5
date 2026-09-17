@@ -9,6 +9,7 @@ use super::client::{ClientCfg, DecodeCfg};
 use super::host::{ContentPhase, HostCfg};
 use super::link::LinkCfg;
 use super::{run, Scenario, SessionCfg};
+use crate::abr::probe::wall_ceiling_kbps;
 use crate::abr::stream_ceiling_kbps;
 use crate::quic::{CODEC_H264, CODEC_HEVC};
 
@@ -41,6 +42,21 @@ fn with_ramp(mut sc: Scenario) -> Scenario {
 fn legacy(mut sc: Scenario, name: &'static str) -> Scenario {
     sc.name = name;
     sc
+}
+
+/// What a session that respects a measured wall holds here: the ceiling the
+/// ramp leaves under `measured_kbps`, split between the sessions sharing the
+/// path and bounded by the stream's own shape.
+///
+/// `to90_s` is read against this. The link's nominal capacity is the wrong
+/// yardstick — a session parked under its wall by design would read as one
+/// that never arrived, which is the program's best rows reporting as its
+/// worst. Derived from the ceiling rule, so both move together.
+///
+/// `measured_kbps` is what the ramp reads on this link, which is the capacity
+/// unless a deep queue stretches the step that trips the wall.
+fn wall_respecting_kbps(measured_kbps: u32, sessions: u32, stream_cap_kbps: u32) -> u32 {
+    wall_ceiling_kbps(measured_kbps / sessions.max(1)).min(stream_cap_kbps)
 }
 
 /// 4K165 HEVC 8-bit — the G5 sessions' mode.
@@ -405,7 +421,9 @@ pub(super) fn wan_wg_12(seed: u64, duration_ms: u64) -> Scenario {
             ..LinkCfg::default()
         },
         sessions: vec![wg_session()],
-        achievable_kbps: 12_000,
+        // The ramp reads 10 811 here, not 12 500: the step that trips the
+        // wall drains through 450 ms of the queue it is measuring.
+        achievable_kbps: wall_respecting_kbps(10_811, 1, cap_1080p30()),
         blip_at_ms: None,
     }
 }
@@ -439,7 +457,7 @@ fn lan(name: &'static str, capacity_kbps: u32, refresh_hz: u32) -> Scenario {
                 ..ClientCfg::default()
             },
         }],
-        achievable_kbps: cap.min(capacity_kbps * 7 / 10),
+        achievable_kbps: wall_respecting_kbps(capacity_kbps, 1, cap),
         blip_at_ms: Some(30_000),
     }
 }
@@ -481,7 +499,9 @@ pub(super) fn lte_variable() -> Scenario {
             ..LinkCfg::default()
         },
         sessions: vec![s],
-        achievable_kbps: 18_000,
+        // The trace's last and longest leg; the cell is elsewhere for half
+        // the run, and one number cannot describe both.
+        achievable_kbps: wall_respecting_kbps(18_000, 1, cap_1080p30()),
         blip_at_ms: None,
     }
 }
@@ -507,7 +527,8 @@ fn shared(name: &'static str, second_join_ms: u64, second_fixed: bool) -> Scenar
             ..LinkCfg::default()
         },
         sessions: vec![first, second],
-        achievable_kbps: 9_000,
+        // Two sessions, one tunnel: half the path each.
+        achievable_kbps: wall_respecting_kbps(18_000, 2, cap_1080p30()),
         blip_at_ms: None,
     }
 }
@@ -726,7 +747,8 @@ pub(super) fn starved_client() -> Scenario {
             ..LinkCfg::default()
         },
         sessions: vec![s],
-        achievable_kbps: 2_500,
+        // What is left after the link falls out from under the session.
+        achievable_kbps: wall_respecting_kbps(2_500, 1, cap_4k165()),
         blip_at_ms: None,
     }
 }

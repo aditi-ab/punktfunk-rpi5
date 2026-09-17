@@ -3,9 +3,9 @@ lan_10g	0	7	0	10	1	0	0	1000	301534a8
 lan_1g	0	7	10	20	7	0	28	1000	e1a354a5
 wifi_good	0	1	0	8	4	0	0	1000	c74cf3dd
 wifi_tv	0	3	0	0	4	0	0	1000	ea6b71af
-wan_wg_12	0	99999	0	0	29	0	0	1000	b3d0ca72
+wan_wg_12	0	3	0	0	29	0	0	1000	b3d0ca72
 lte_variable	64	3	43	2503	249	0	0	1000	6ad35a6a
-shared_two_auto	1	99999	0	0	27	0	0	1000	1d1aca25
+shared_two_auto	1	3	0	0	27	0	0	1000	1d1aca25
 shared_newcomer	0	1	0	0	35	0	0	782	f2f11c50
 shared_fixed_plus_auto	47	1	24	380	97	3151	0	966	8f2d562a
 gpu_saturated	0	3	38	0	5	0	0	1000	e85c3a0f
