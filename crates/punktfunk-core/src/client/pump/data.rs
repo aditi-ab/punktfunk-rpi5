@@ -8,7 +8,7 @@
 
 use super::super::*;
 use super::*;
-use crate::abr::WindowActivity;
+use crate::abr::{WindowActivity, WindowSample};
 
 /// Data-plane pump on a blocking thread. `try_send` drops the newest frame
 /// when the embedder lags. [`FLAG_PROBE`] filler goes to the probe accumulator,
@@ -551,18 +551,18 @@ impl DataPump {
                 let verdict = if discard {
                     None
                 } else {
-                    abr.on_window(
-                        Instant::now(),
-                        window_dropped,
+                    abr.on_window(&WindowSample {
+                        dropped: window_dropped,
                         loss_ppm,
                         owd_mean_us,
                         decode_mean_us,
                         encode_mean_us,
                         actual_kbps,
-                        flush_in_window,
-                        recovery_kf_reqs,
+                        flushed: flush_in_window,
+                        recovery_kf: recovery_kf_reqs,
                         activity,
-                    )
+                        ..WindowSample::at(Instant::now())
+                    })
                 };
                 if let Some(kbps) = verdict {
                     // Log window signals with the decision so decode-/

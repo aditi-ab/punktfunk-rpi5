@@ -26,6 +26,10 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 mod sim;
 
+mod sample;
+
+pub(crate) use sample::{WindowActivity, WindowSample};
+
 /// Floor so a mis-measured window cannot crater the session. 2 Mbps: a thin
 /// link is better served soft than lossy. First descent below
 /// [`LOW_RATE_WARN_KBPS`] logs once.
@@ -39,8 +43,6 @@ const IDLE_WINDOWS_TO_REARM: u32 = 4;
 /// Fewest active frames before the fps-normalized utilization gate may climb.
 /// Two stray frames would prorate the target to almost nothing.
 const MIN_ACTIVE_FRAMES_TO_CLIMB: u32 = 4;
-/// One report window, in µs — the pump's 750 ms `ADAPT_REPORT_INTERVAL`.
-const WINDOW_US: i64 = 750_000;
 /// Windows per proven-throughput bucket (~30 s). The mark is the max of the
 /// current and previous buckets so a regime minutes gone cannot license a
 /// doubling.
@@ -260,45 +262,6 @@ struct DecodeProbe {
 enum DecodeProbeKind {
     Retreat,
     Lift,
-}
-
-/// New-content evidence for one report window.
-///
-/// [`Active`]`(0)` is observed stillness (every arrived AU a host-marked
-/// repeat) and counts toward idle re-arm. [`Empty`] is the same neutrality
-/// for climb and baselines, but no AU arrived, so it does not count.
-/// [`Unmarked`] is an older host that never flags repeats: wall-clock
-/// arithmetic, never idle. The pump never maps an empty receive window
-/// onto [`Unmarked`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WindowActivity {
-    /// Host does not mark repeats. Wall-clock; never idle.
-    Unmarked,
-    /// No AU completed. Quiet like idle; does not count toward re-arm.
-    Empty,
-    /// New-content AU count. `0` = every arrived AU was a host-marked repeat.
-    Active(u32),
-}
-
-impl WindowActivity {
-    /// Every arrived AU was a host-marked repeat.
-    fn idle(self) -> bool {
-        matches!(self, Self::Active(0))
-    }
-
-    /// No new-content evidence: skip climb, baselines, re-probe.
-    fn quiet(self) -> bool {
-        matches!(self, Self::Empty | Self::Active(0))
-    }
-}
-
-impl From<Option<u32>> for WindowActivity {
-    fn from(frames: Option<u32>) -> Self {
-        match frames {
-            Some(n) => Self::Active(n),
-            None => Self::Unmarked,
-        }
-    }
 }
 
 /// One decision per report window; `Some(kbps)` = send a [`crate::quic::SetBitrate`].
@@ -793,20 +756,19 @@ impl BitrateController {
     /// (older host, wall-clock), [`WindowActivity::Empty`] (no AU arrived;
     /// quiet like idle, does not count toward re-arm), and
     /// [`WindowActivity::Active`] including `0` for observed stillness.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn on_window(
-        &mut self,
-        now: Instant,
-        dropped: u64,
-        loss_ppm: u32,
-        owd_mean_us: Option<i64>,
-        decode_mean_us: Option<i64>,
-        encode_mean_us: Option<i64>,
-        actual_kbps: u32,
-        flushed: bool,
-        recovery_kf: u32,
-        activity: impl Into<WindowActivity>,
-    ) -> Option<u32> {
+    pub(crate) fn on_window(&mut self, w: &WindowSample) -> Option<u32> {
+        let WindowSample {
+            now,
+            dropped,
+            loss_ppm,
+            owd_mean_us,
+            decode_mean_us,
+            encode_mean_us,
+            actual_kbps,
+            flushed,
+            recovery_kf,
+            activity,
+        } = *w;
         if !self.enabled {
             return None;
         }
@@ -816,7 +778,6 @@ impl BitrateController {
             tracing::info!("adaptive bitrate off — host never acked a SetBitrate (older host)");
             return None;
         }
-        let activity = activity.into();
         // Repeat-only: stillness. Empty: no AU, same neutrality, not a
         // re-arm count. Unmarked (older host) is never idle.
         let quiet = activity.quiet();
@@ -1127,7 +1088,7 @@ impl BitrateController {
         let full_rate = match (activity, self.frame_budget_us) {
             (WindowActivity::Active(n), Some(budget_us)) if budget_us > 0 => {
                 i64::from(n) * DECODE_FULL_RATE_DEN
-                    >= (WINDOW_US / budget_us) * DECODE_FULL_RATE_NUM
+                    >= (sample::WINDOW_US / budget_us) * DECODE_FULL_RATE_NUM
             }
             _ => true,
         };
@@ -1148,9 +1109,9 @@ impl BitrateController {
         // (a 35 fps source's wall-clock wire rate never exceeds ~39 % of target).
         let proration = match (activity, self.frame_budget_us) {
             (WindowActivity::Active(n), Some(budget_us))
-                if budget_us > 0 && n > 0 && (n as i64) < WINDOW_US / budget_us =>
+                if budget_us > 0 && n > 0 && (n as i64) < sample::WINDOW_US / budget_us =>
             {
-                Some((n as u64, ((WINDOW_US / budget_us).max(1)) as u64))
+                Some((n as u64, ((sample::WINDOW_US / budget_us).max(1)) as u64))
             }
             _ => None,
         };
@@ -1242,18 +1203,11 @@ mod tests {
     fn run_clean(c: &mut BitrateController, start: Instant, from: u32, n: u32) -> Option<u32> {
         let mut out = None;
         for i in from..from + n {
-            out = c.on_window(
-                ticks(start, i),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            );
+            out = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, i))
+            });
             if out.is_some() {
                 return out;
             }
@@ -1267,18 +1221,14 @@ mod tests {
         let mut c = BitrateController::new(0);
         let now = Instant::now();
         assert_eq!(
-            c.on_window(
-                now,
-                5,
-                900_000,
-                Some(500_000),
-                None,
-                None,
-                1_000_000,
-                true,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                dropped: 5,
+                loss_ppm: 900_000,
+                owd_mean_us: Some(500_000),
+                actual_kbps: 1_000_000,
+                flushed: true,
+                ..WindowSample::at(now)
+            }),
             None
         );
     }
@@ -1289,66 +1239,38 @@ mod tests {
         let start = Instant::now();
         // 2–6 % loss is ordinary: one window is a blip.
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                0,
-                25_000,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                loss_ppm: 25_000,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             None
         );
         // Second consecutive ordinary-bad window: ×0.7.
         assert_eq!(
-            c.on_window(
-                ticks(start, 1),
-                0,
-                25_000,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                loss_ppm: 25_000,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 1))
+            }),
             Some(14_000)
         );
         c.on_ack(14_000);
         // Still bad after cooldown: another ×0.7 from the acked rate.
         assert_eq!(
-            c.on_window(
-                ticks(start, 6),
-                0,
-                25_000,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                loss_ppm: 25_000,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 6))
+            }),
             None
         );
         assert_eq!(
-            c.on_window(
-                ticks(start, 7),
-                0,
-                25_000,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                loss_ppm: 25_000,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 7))
+            }),
             Some(9_800)
         );
     }
@@ -1359,52 +1281,31 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                1,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(14_000)
         );
         // …and so does a jump-to-live flush.
         let mut c = BitrateController::new(20_000);
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                0,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                true,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                actual_kbps: 1_000_000,
+                flushed: true,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(14_000)
         );
         // …and ≥6 % window loss.
         let mut c = BitrateController::new(20_000);
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                0,
-                80_000,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                loss_ppm: 80_000,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(14_000)
         );
     }
@@ -1414,50 +1315,29 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                1,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(14_000)
         );
         c.on_ack(14_000);
         // Tick 1 = 750 ms, inside cooldown; tick 2 = 1.5 s, fires.
         assert_eq!(
-            c.on_window(
-                ticks(start, 1),
-                1,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 1))
+            }),
             None
         );
         assert_eq!(
-            c.on_window(
-                ticks(start, 2),
-                1,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 2))
+            }),
             Some(9_800)
         );
     }
@@ -1468,50 +1348,29 @@ mod tests {
         let start = Instant::now();
         // ×0.7 of 2500 = 1750 < floor → 2000.
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                1,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(2_000)
         );
         c.on_ack(2_000);
         // At the floor, further bad windows request nothing.
         assert_eq!(
-            c.on_window(
-                ticks(start, 6),
-                1,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 6))
+            }),
             None
         );
         assert_eq!(
-            c.on_window(
-                ticks(start, 7),
-                1,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 7))
+            }),
             None
         );
     }
@@ -1521,18 +1380,11 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                1,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(14_000)
         );
         c.on_ack(14_000);
@@ -1554,18 +1406,11 @@ mod tests {
         // Cooled clean windows double until the ceiling, then quiet.
         let mut got = Vec::new();
         for i in 0..14 {
-            if let Some(k) = c.on_window(
-                ticks(start, i),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ) {
+            if let Some(k) = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, i))
+            }) {
                 c.on_ack(k);
                 got.push(k);
             }
@@ -1579,53 +1424,33 @@ mod tests {
         c.set_ceiling(300_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(40_000)
         );
         c.on_ack(40_000);
         // Severe: immediate ×0.7, slow start over.
         assert_eq!(
-            c.on_window(
-                ticks(start, 2),
-                1,
-                0,
-                Some(10_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 2))
+            }),
             Some(28_000)
         );
         c.on_ack(28_000);
         // Next climb is additive, after 6 clean windows.
         let mut next = None;
         for i in 3..12 {
-            next = c.on_window(
-                ticks(start, i),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            );
+            next = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, i))
+            });
             if next.is_some() {
                 assert!(i >= 8, "additive climb must wait for the clean run");
                 break;
@@ -1639,18 +1464,10 @@ mod tests {
         let mut c = BitrateController::new(0);
         c.set_ceiling(1_000_000);
         assert_eq!(
-            c.on_window(
-                Instant::now(),
-                0,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(Instant::now())
+            }),
             None
         );
         let mut c = BitrateController::new(20_000);
@@ -1779,50 +1596,29 @@ mod tests {
         // ~10 ms OWD baseline.
         for i in 0..4 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    None,
-                    None,
-                    1_000_000,
-                    false,
-                    0,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    actual_kbps: 1_000_000,
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
         // +40 ms OWD, zero loss: two windows → back off.
         assert_eq!(
-            c.on_window(
-                ticks(start, 4),
-                0,
-                0,
-                Some(50_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(50_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 4))
+            }),
             None
         );
         assert_eq!(
-            c.on_window(
-                ticks(start, 5),
-                0,
-                0,
-                Some(52_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(52_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 5))
+            }),
             Some(14_000)
         );
     }
@@ -1835,50 +1631,32 @@ mod tests {
         // ~8 ms decode baseline.
         for i in 0..4 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    Some(8_000),
-                    None,
-                    1_000_000,
-                    false,
-                    0,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    decode_mean_us: Some(8_000),
+                    actual_kbps: 1_000_000,
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
         // +30 ms decode, zero loss, flat OWD: two windows → ×0.7.
         assert_eq!(
-            c.on_window(
-                ticks(start, 4),
-                0,
-                0,
-                Some(10_000),
-                Some(38_000),
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(38_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 4))
+            }),
             None
         );
         assert_eq!(
-            c.on_window(
-                ticks(start, 5),
-                0,
-                0,
-                Some(10_000),
-                Some(40_000),
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(40_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 5))
+            }),
             Some(14_000)
         );
     }
@@ -1889,33 +1667,21 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                2,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                recovery_kf: 2,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             None
         );
         assert_eq!(
-            c.on_window(
-                ticks(start, 1),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                2,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                recovery_kf: 2,
+                ..WindowSample::at(ticks(start, 1))
+            }),
             Some(14_000)
         );
     }
@@ -1926,18 +1692,12 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                4,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                recovery_kf: 4,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(14_000)
         );
     }
@@ -1949,18 +1709,12 @@ mod tests {
         let start = Instant::now();
         for i in 0..4 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    None,
-                    None,
-                    1_000_000,
-                    false,
-                    1,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    actual_kbps: 1_000_000,
+                    recovery_kf: 1,
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
@@ -1975,18 +1729,12 @@ mod tests {
         // First [`BASELINE_MIN_WINDOWS`] teach the decode baseline.
         let mut last = 0;
         for i in 0..BASELINE_MIN_WINDOWS as u32 {
-            if let Some(k) = c.on_window(
-                ticks(start, i * 2),
-                0,
-                0,
-                Some(10_000),
-                Some(8_000),
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ) {
+            if let Some(k) = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(8_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, i * 2))
+            }) {
                 last = k;
                 c.on_ack(k);
             }
@@ -1994,34 +1742,22 @@ mod tests {
         assert_eq!(last, 300_000, "slow start should reach the probed ceiling");
         // +30 ms decode: climb stops.
         assert_eq!(
-            c.on_window(
-                ticks(start, 20),
-                0,
-                0,
-                Some(10_000),
-                Some(38_000),
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(38_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 20))
+            }),
             None
         );
         // Second backed-up window: ×0.7, not park at the link ceiling.
         assert_eq!(
-            c.on_window(
-                ticks(start, 22),
-                0,
-                0,
-                Some(10_000),
-                Some(40_000),
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(40_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 22))
+            }),
             Some(210_000)
         );
     }
@@ -2035,36 +1771,24 @@ mod tests {
         for i in 0..BASELINE_MIN_WINDOWS as u32 {
             let mean = if i == 0 { 3_000 } else { 12_000 };
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    None,
-                    Some(mean),
-                    1_000_000,
-                    false,
-                    0,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    encode_mean_us: Some(mean),
+                    actual_kbps: 1_000_000,
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None,
                 "window {i} fired off a baseline of fewer than {BASELINE_MIN_WINDOWS} samples"
             );
         }
         // With 4 samples, a sustained rise still backs off.
         assert_eq!(
-            c.on_window(
-                ticks(start, 8),
-                0,
-                0,
-                Some(10_000),
-                None,
-                Some(20_000),
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                encode_mean_us: Some(20_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 8))
+            }),
             Some(70_000)
         );
     }
@@ -2077,35 +1801,23 @@ mod tests {
         let start = Instant::now();
         for i in 0..12 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    Some(8_000),
-                    None,
-                    2_000,
-                    false,
-                    0,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    decode_mean_us: Some(8_000),
+                    actual_kbps: 2_000,
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
         // First utilized window: ×1.5 over proven 18 000 → 27 000, not 2× to 40 000.
         assert_eq!(
-            c.on_window(
-                ticks(start, 12),
-                0,
-                0,
-                Some(10_000),
-                Some(8_000),
-                None,
-                18_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(8_000),
+                actual_kbps: 18_000,
+                ..WindowSample::at(ticks(start, 12))
+            }),
             Some(27_000)
         );
         // Zero active frames never authorizes a climb, whatever delivered claims.
@@ -2114,18 +1826,13 @@ mod tests {
         c.set_frame_budget(60);
         for i in 0..12 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    Some(8_000),
-                    None,
-                    18_000,
-                    false,
-                    0,
-                    Some(0),
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    decode_mean_us: Some(8_000),
+                    actual_kbps: 18_000,
+                    activity: WindowActivity::Active(0),
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None,
                 "an idle window must never climb"
             );
@@ -2144,18 +1851,12 @@ mod tests {
         // 26/67 frames, 8 000 kbps vs prorated 7 761: utilized. Proven headroom
         // 8 000×1.5×67/26 = 30 923, not wall-clock 12 000.
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                8_000,
-                false,
-                0,
-                Some(26),
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 8_000,
+                activity: WindowActivity::Active(26),
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(30_923)
         );
         // Under [`MIN_ACTIVE_FRAMES_TO_CLIMB`]: not utilized.
@@ -2164,18 +1865,12 @@ mod tests {
         d.set_ceiling(60_000);
         d.set_frame_budget(90);
         assert_eq!(
-            d.on_window(
-                ticks(start, 0),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                900,
-                false,
-                0,
-                Some(3),
-            ),
+            d.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 900,
+                activity: WindowActivity::Active(3),
+                ..WindowSample::at(ticks(start, 0))
+            }),
             None,
             "three stray frames are not a utilized window"
         );
@@ -2190,54 +1885,45 @@ mod tests {
             let mut c = BitrateController::new(20_000);
             c.set_ceiling(300_000);
             c.set_frame_budget(60);
+            // A host that marks repeats reports the new-content count; an
+            // older one reports nothing but arrivals.
+            let act = |n: u32| {
+                if marking {
+                    WindowActivity::Active(n)
+                } else {
+                    WindowActivity::Unmarked
+                }
+            };
             let mut decision = None;
             // Four active windows at 30 ms OWD.
             for i in 0..4 {
-                let r = c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(30_000),
-                    None,
-                    None,
-                    2_000,
-                    false,
-                    0,
-                    marking.then_some(45),
-                );
+                let r = c.on_window(&WindowSample {
+                    owd_mean_us: Some(30_000),
+                    actual_kbps: 2_000,
+                    activity: act(45),
+                    ..WindowSample::at(ticks(start, i))
+                });
                 assert_eq!(r, None);
             }
             // Keepalive at 1 ms OWD: marking host trains nothing; legacy trains min to 1 ms.
             for i in 4..10 {
-                let r = c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(1_000),
-                    None,
-                    None,
-                    200,
-                    false,
-                    0,
-                    marking.then_some(0),
-                );
+                let r = c.on_window(&WindowSample {
+                    owd_mean_us: Some(1_000),
+                    actual_kbps: 200,
+                    activity: act(0),
+                    ..WindowSample::at(ticks(start, i))
+                });
                 assert_eq!(r, None);
             }
             // Motion at the warmup's 30 ms OWD. First decision is the verdict
             // (cooldown silences the second).
             for i in 10..12 {
-                let r = c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(30_000),
-                    None,
-                    None,
-                    18_000,
-                    false,
-                    0,
-                    marking.then_some(45),
-                );
+                let r = c.on_window(&WindowSample {
+                    owd_mean_us: Some(30_000),
+                    actual_kbps: 18_000,
+                    activity: act(45),
+                    ..WindowSample::at(ticks(start, i))
+                });
                 decision = decision.or(r);
             }
             decision
@@ -2259,69 +1945,42 @@ mod tests {
         let start = Instant::now();
         // Severe window ends slow start…
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                1,
-                0,
-                None,
-                None,
-                None,
-                18_000,
-                false,
-                0,
-                Some(45)
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 18_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(14_000)
         );
         c.on_ack(14_000);
         // …one clean window proves 14 000…
         assert_eq!(
-            c.on_window(
-                ticks(start, 1),
-                0,
-                0,
-                None,
-                None,
-                None,
-                14_000,
-                false,
-                0,
-                Some(45),
-            ),
+            c.on_window(&WindowSample {
+                actual_kbps: 14_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 1))
+            }),
             None
         );
         // …then ≥ [`IDLE_WINDOWS_TO_REARM`] idle windows.
         for i in 2..6 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    None,
-                    None,
-                    None,
-                    200,
-                    false,
-                    0,
-                    Some(0)
-                ),
+                c.on_window(&WindowSample {
+                    actual_kbps: 200,
+                    activity: WindowActivity::Active(0),
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
         // Onset: ×1.5 over proven 14 000 → 21 000, not additive 14 876.
         assert_eq!(
-            c.on_window(
-                ticks(start, 6),
-                0,
-                0,
-                None,
-                None,
-                None,
-                14_000,
-                false,
-                0,
-                Some(45),
-            ),
+            c.on_window(&WindowSample {
+                actual_kbps: 14_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 6))
+            }),
             Some(21_000)
         );
     }
@@ -2337,51 +1996,31 @@ mod tests {
         c.set_frame_budget(60);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                1,
-                0,
-                None,
-                None,
-                None,
-                18_000,
-                false,
-                0,
-                WindowActivity::Active(45),
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 18_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(14_000)
         );
         c.on_ack(14_000);
         for i in 1..=5 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    None,
-                    None,
-                    None,
-                    200,
-                    false,
-                    0,
-                    WindowActivity::Empty,
-                ),
+                c.on_window(&WindowSample {
+                    actual_kbps: 200,
+                    activity: WindowActivity::Empty,
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
         assert_eq!(
-            c.on_window(
-                ticks(start, 6),
-                0,
-                0,
-                None,
-                None,
-                None,
-                14_000,
-                false,
-                0,
-                WindowActivity::Active(45),
-            ),
+            c.on_window(&WindowSample {
+                actual_kbps: 14_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 6))
+            }),
             None,
             "a blackout is not stillness and cannot authorize a climb"
         );
@@ -2396,82 +2035,48 @@ mod tests {
         c.set_frame_budget(60);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                1,
-                0,
-                None,
-                None,
-                None,
-                18_000,
-                false,
-                0,
-                WindowActivity::Active(45),
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 18_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(14_000)
         );
         c.on_ack(14_000);
         assert_eq!(
-            c.on_window(
-                ticks(start, 1),
-                0,
-                0,
-                None,
-                None,
-                None,
-                14_000,
-                false,
-                0,
-                WindowActivity::Active(45),
-            ),
+            c.on_window(&WindowSample {
+                actual_kbps: 14_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 1))
+            }),
             None
         );
         for i in 2..6 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    None,
-                    None,
-                    None,
-                    200,
-                    false,
-                    0,
-                    WindowActivity::Active(0),
-                ),
+                c.on_window(&WindowSample {
+                    actual_kbps: 200,
+                    activity: WindowActivity::Active(0),
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
         assert_eq!(
-            c.on_window(
-                ticks(start, 6),
-                0,
-                0,
-                None,
-                None,
-                None,
-                200,
-                false,
-                0,
-                WindowActivity::Empty,
-            ),
+            c.on_window(&WindowSample {
+                actual_kbps: 200,
+                activity: WindowActivity::Empty,
+                ..WindowSample::at(ticks(start, 6))
+            }),
             None,
             "empty is not motion onset"
         );
         assert_eq!(
-            c.on_window(
-                ticks(start, 7),
-                0,
-                0,
-                None,
-                None,
-                None,
-                14_000,
-                false,
-                0,
-                WindowActivity::Active(45),
-            ),
+            c.on_window(&WindowSample {
+                actual_kbps: 14_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 7))
+            }),
             Some(21_000),
             "empty must not clear a real idle stretch"
         );
@@ -2488,84 +2093,51 @@ mod tests {
         let start = Instant::now();
         // Prove 20 000; slow start asks for the bounded double (mark matters)…
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                0,
-                0,
-                None,
-                None,
-                None,
-                20_000,
-                false,
-                0,
-                Some(45),
-            ),
+            c.on_window(&WindowSample {
+                actual_kbps: 20_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(30_000)
         );
         // Severe inside cooldown scores but decides nothing; second backs off.
         assert_eq!(
-            c.on_window(
-                ticks(start, 1),
-                1,
-                0,
-                None,
-                None,
-                None,
-                20_000,
-                false,
-                0,
-                Some(45)
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 20_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 1))
+            }),
             None
         );
         assert_eq!(
-            c.on_window(
-                ticks(start, 2),
-                1,
-                0,
-                None,
-                None,
-                None,
-                20_000,
-                false,
-                0,
-                Some(45)
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 20_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 2))
+            }),
             Some(14_000)
         );
         c.on_ack(14_000);
         // Idle 2 × [`PROVEN_BUCKET_WINDOWS`]: both buckets rotate away.
         for i in 3..3 + 2 * PROVEN_BUCKET_WINDOWS {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    None,
-                    None,
-                    None,
-                    200,
-                    false,
-                    0,
-                    Some(0)
-                ),
+                c.on_window(&WindowSample {
+                    actual_kbps: 200,
+                    activity: WindowActivity::Active(0),
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
         // Onset delivers 14 000 → 21 000, not 28 000 off the stale 20 000 mark.
         assert_eq!(
-            c.on_window(
-                ticks(start, 3 + 2 * PROVEN_BUCKET_WINDOWS),
-                0,
-                0,
-                None,
-                None,
-                None,
-                14_000,
-                false,
-                0,
-                Some(45),
-            ),
+            c.on_window(&WindowSample {
+                actual_kbps: 14_000,
+                activity: WindowActivity::Active(45),
+                ..WindowSample::at(ticks(start, 3 + 2 * PROVEN_BUCKET_WINDOWS))
+            }),
             Some(21_000)
         );
     }
@@ -2578,35 +2150,21 @@ mod tests {
         assert!(!c.low_rate_warned);
         // 6000 × 0.7 = 4200: under the old floor, over the new one.
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                1,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(4_200)
         );
         assert!(c.low_rate_warned, "the descent below 5 000 warns");
         c.on_ack(4_200);
         assert_eq!(
-            c.on_window(
-                ticks(start, 6),
-                1,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 6))
+            }),
             Some(2_940)
         );
         assert!(c.low_rate_warned, "…exactly once");
@@ -2620,35 +2178,23 @@ mod tests {
         let start = Instant::now();
         // Full-target delivery: proven 20 000 → cap 30 000.
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                0,
-                0,
-                Some(10_000),
-                Some(8_000),
-                None,
-                20_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(8_000),
+                actual_kbps: 20_000,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(30_000)
         );
         c.on_ack(30_000);
         // Delivers 30 000 → next step 45 000, not 60 000.
         assert_eq!(
-            c.on_window(
-                ticks(start, 2),
-                0,
-                0,
-                Some(10_000),
-                Some(8_000),
-                None,
-                30_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(8_000),
+                actual_kbps: 30_000,
+                ..WindowSample::at(ticks(start, 2))
+            }),
             Some(45_000)
         );
     }
@@ -2660,36 +2206,24 @@ mod tests {
         c.set_ceiling(300_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(
-                ticks(start, 0),
-                0,
-                0,
-                Some(10_000),
-                Some(8_000),
-                None,
-                20_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(8_000),
+                actual_kbps: 20_000,
+                ..WindowSample::at(ticks(start, 0))
+            }),
             Some(30_000)
         );
         c.on_ack(30_000);
         // Long calm stretch (2 % utilization): stay silent. Keep proven headroom.
         for i in 2..30 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    Some(4_000),
-                    None,
-                    600,
-                    false,
-                    0,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    decode_mean_us: Some(4_000),
+                    actual_kbps: 600,
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
@@ -2702,35 +2236,23 @@ mod tests {
         let start = Instant::now();
         for i in 0..4 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    Some(8_000),
-                    None,
-                    1_000_000,
-                    false,
-                    0,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    decode_mean_us: Some(8_000),
+                    actual_kbps: 1_000_000,
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
         // 52 ms over 8 ms baseline: immediate ×0.7. 30 ms still takes two.
         assert_eq!(
-            c.on_window(
-                ticks(start, 4),
-                0,
-                0,
-                Some(10_000),
-                Some(60_000),
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(60_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 4))
+            }),
             Some(14_000)
         );
     }
@@ -2798,18 +2320,11 @@ mod tests {
         // First re-probe is the fast interval.
         assert_eq!(c.cap_reprobe_after, CAP_REPROBE_WINDOWS_MIN);
         for i in 0..CAP_REPROBE_WINDOWS_MIN {
-            let _ = c.on_window(
-                ticks(start, 20 + i),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            );
+            let _ = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 20 + i))
+            });
         }
         assert_eq!(c.host_cap_kbps, Some(794_000 + 794_000 / 8));
     }
@@ -2832,18 +2347,11 @@ mod tests {
         assert_eq!(c.host_cap_kbps, Some(20_000));
         // Host recovered; grant whatever the re-probe asks.
         while c.current_kbps < 150_000 && windows_pinned < 400 {
-            if let Some(k) = c.on_window(
-                ticks(start, tick),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ) {
+            if let Some(k) = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, tick))
+            }) {
                 c.on_ack(k);
             }
             tick += 1;
@@ -2898,18 +2406,11 @@ mod tests {
         for round in 0..3 {
             let before = c.cap_reprobe_after;
             for _ in 0..before {
-                let _ = c.on_window(
-                    ticks(start, tick),
-                    0,
-                    0,
-                    Some(10_000),
-                    None,
-                    None,
-                    1_000_000,
-                    false,
-                    0,
-                    None,
-                );
+                let _ = c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    actual_kbps: 1_000_000,
+                    ..WindowSample::at(ticks(start, tick))
+                });
                 tick += 1;
             }
             let lifted = c.host_cap_kbps.expect("cap should still be latched");
@@ -2932,49 +2433,31 @@ mod tests {
         let start = Instant::now();
         for i in 0..4 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    None,
-                    Some(7_000),
-                    1_000_000,
-                    false,
-                    0,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    encode_mean_us: Some(7_000),
+                    actual_kbps: 1_000_000,
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
         assert_eq!(
-            c.on_window(
-                ticks(start, 4),
-                0,
-                0,
-                Some(10_000),
-                None,
-                Some(11_500),
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                encode_mean_us: Some(11_500),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 4))
+            }),
             None
         );
         assert_eq!(
-            c.on_window(
-                ticks(start, 6),
-                0,
-                0,
-                Some(10_000),
-                None,
-                Some(12_000),
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                encode_mean_us: Some(12_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 6))
+            }),
             Some(14_000)
         );
     }
@@ -2986,34 +2469,22 @@ mod tests {
         let start = Instant::now();
         for i in 0..4 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    None,
-                    Some(7_000),
-                    1_000_000,
-                    false,
-                    0,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    encode_mean_us: Some(7_000),
+                    actual_kbps: 1_000_000,
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
         assert_eq!(
-            c.on_window(
-                ticks(start, 4),
-                0,
-                0,
-                Some(10_000),
-                None,
-                Some(20_000),
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                encode_mean_us: Some(20_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 4))
+            }),
             Some(14_000)
         );
     }
@@ -3024,62 +2495,38 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         for i in 0..4 {
-            let _ = c.on_window(
-                ticks(start, i),
-                0,
-                0,
-                Some(10_000),
-                None,
-                Some(7_000),
-                1_000_000,
-                false,
-                0,
-                None,
-            );
+            let _ = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                encode_mean_us: Some(7_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, i))
+            });
         }
-        let _ = c.on_window(
-            ticks(start, 4),
-            0,
-            0,
-            Some(10_000),
-            None,
-            Some(12_000),
-            1_000_000,
-            false,
-            0,
-            None,
-        );
+        let _ = c.on_window(&WindowSample {
+            owd_mean_us: Some(10_000),
+            encode_mean_us: Some(12_000),
+            actual_kbps: 1_000_000,
+            ..WindowSample::at(ticks(start, 4))
+        });
         assert_eq!(
-            c.on_window(
-                ticks(start, 6),
-                0,
-                0,
-                Some(10_000),
-                None,
-                Some(12_500),
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                encode_mean_us: Some(12_500),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, 6))
+            }),
             Some(14_000)
         );
         // After rebase, 15 ms against the old 7 ms floor must read clean.
         c.on_ack(14_000);
         for i in 8..11 {
             assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    None,
-                    Some(15_000),
-                    1_000_000,
-                    false,
-                    0,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    encode_mean_us: Some(15_000),
+                    actual_kbps: 1_000_000,
+                    ..WindowSample::at(ticks(start, i))
+                }),
                 None
             );
         }
@@ -3097,35 +2544,23 @@ mod tests {
             let at = ticks(start, *tick);
             *tick += 1;
             // Ack a climb if taken so tests with headroom still work.
-            if let Some(k) = c.on_window(
-                at,
-                0,
-                0,
-                Some(10_000),
-                None,
-                Some(7_000),
-                1_000_000,
-                false,
-                0,
-                None,
-            ) {
+            if let Some(k) = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                encode_mean_us: Some(7_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(at)
+            }) {
                 c.on_ack(k);
             }
         }
         let at = ticks(start, *tick);
         *tick += 1;
-        c.on_window(
-            at,
-            0,
-            0,
-            Some(10_000),
-            None,
-            Some(level),
-            1_000_000,
-            false,
-            0,
-            None,
-        )
+        c.on_window(&WindowSample {
+            owd_mean_us: Some(10_000),
+            encode_mean_us: Some(level),
+            actual_kbps: 1_000_000,
+            ..WindowSample::at(at)
+        })
     }
 
     /// `n` clean windows with no encode sample; ack any climb.
@@ -3133,18 +2568,11 @@ mod tests {
         for _ in 0..n {
             let at = ticks(start, *tick);
             *tick += 1;
-            if let Some(k) = c.on_window(
-                at,
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ) {
+            if let Some(k) = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(at)
+            }) {
                 c.on_ack(k);
             }
         }
@@ -3205,7 +2633,12 @@ mod tests {
         tick += 1;
         // Flush: severe ×0.7 and resets the clean run.
         assert!(c
-            .on_window(at, 0, 0, Some(10_000), None, None, 1_000_000, true, 0, None)
+            .on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                flushed: true,
+                ..WindowSample::at(at)
+            })
             .is_some());
         clean_run(&mut c, start, &mut tick, CAP_REPROBE_WINDOWS_MIN - 1);
         assert!(c.encode_disarmed, "the spoiled window must restart the run");
@@ -3239,18 +2672,12 @@ mod tests {
         // Second window still backs off: re-scaled, not weakened.
         let at = ticks(start, tick + 1);
         assert_eq!(
-            hz60.on_window(
-                at,
-                0,
-                0,
-                Some(10_000),
-                None,
-                Some(excursion),
-                1_000_000,
-                false,
-                0,
-                None,
-            ),
+            hz60.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                encode_mean_us: Some(excursion),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(at)
+            }),
             Some(14_000)
         );
     }
@@ -3314,36 +2741,25 @@ mod tests {
             let at = ticks(start, tick);
             tick += 1;
             assert_eq!(
-                c.on_window(
-                    at,
-                    0,
-                    0,
-                    Some(10_000),
-                    None,
-                    Some(7_000),
-                    1_000_000,
-                    false,
-                    0,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    encode_mean_us: Some(7_000),
+                    actual_kbps: 1_000_000,
+                    ..WindowSample::at(at)
+                }),
                 None
             );
         }
         // Encode excursion + flush: flush is the explanation, streak resets.
         let at = ticks(start, tick);
         assert_eq!(
-            c.on_window(
-                at,
-                0,
-                0,
-                Some(10_000),
-                None,
-                Some(20_000),
-                1_000_000,
-                true,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                encode_mean_us: Some(20_000),
+                actual_kbps: 1_000_000,
+                flushed: true,
+                ..WindowSample::at(at)
+            }),
             Some(9_800)
         );
         assert_eq!(c.encode_backoff_us, 0);
@@ -3390,18 +2806,12 @@ mod tests {
     fn calm_window(c: &mut BitrateController, at: Instant) {
         // Calm, unutilized: seed baselines, decide nothing.
         assert_eq!(
-            c.on_window(
-                at,
-                0,
-                0,
-                Some(10_000),
-                Some(8_000),
-                None,
-                2_000,
-                false,
-                0,
-                None
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(8_000),
+                actual_kbps: 2_000,
+                ..WindowSample::at(at)
+            }),
             None
         );
     }
@@ -3412,18 +2822,12 @@ mod tests {
             if c.current_kbps >= target {
                 return;
             }
-            if let Some(k) = c.on_window(
-                ticks(start, *tick),
-                0,
-                0,
-                Some(10_000),
-                Some(8_000),
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ) {
+            if let Some(k) = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(8_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, *tick))
+            }) {
                 c.on_ack(k);
             }
             *tick += 1;
@@ -3437,18 +2841,12 @@ mod tests {
     /// One decode-severe window at the current rate. Steps past cooldown first.
     fn choke(c: &mut BitrateController, start: Instant, tick: &mut u32) -> Option<u32> {
         *tick += 2;
-        let r = c.on_window(
-            ticks(start, *tick),
-            0,
-            0,
-            Some(10_000),
-            Some(60_000),
-            None,
-            c.current_kbps,
-            false,
-            0,
-            None,
-        );
+        let r = c.on_window(&WindowSample {
+            owd_mean_us: Some(10_000),
+            decode_mean_us: Some(60_000),
+            actual_kbps: c.current_kbps,
+            ..WindowSample::at(ticks(start, *tick))
+        });
         *tick += 1;
         r
     }
@@ -3474,18 +2872,12 @@ mod tests {
     /// Stall-shaped: current/10 delivered, flush + kf-storm. Severe, but starved.
     fn stall_choke(c: &mut BitrateController, start: Instant, tick: &mut u32) -> Option<u32> {
         *tick += 2;
-        let r = c.on_window(
-            ticks(start, *tick),
-            0,
-            0,
-            None,
-            None,
-            None,
-            c.current_kbps / 10,
-            true,
-            RECOVERY_KF_SEVERE,
-            None,
-        );
+        let r = c.on_window(&WindowSample {
+            actual_kbps: c.current_kbps / 10,
+            flushed: true,
+            recovery_kf: RECOVERY_KF_SEVERE,
+            ..WindowSample::at(ticks(start, *tick))
+        });
         *tick += 1;
         r
     }
@@ -3570,18 +2962,13 @@ mod tests {
         // Half-utilized: encode samples count, no climb, `current_kbps` stays.
         for _ in 0..BASELINE_MIN_WINDOWS {
             assert_eq!(
-                c.on_window(
-                    ticks(start, t),
-                    0,
-                    0,
-                    Some(3_500),
-                    Some(200),
-                    Some(2_800),
-                    10_000,
-                    false,
-                    0,
-                    None,
-                ),
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(3_500),
+                    decode_mean_us: Some(200),
+                    encode_mean_us: Some(2_800),
+                    actual_kbps: 10_000,
+                    ..WindowSample::at(ticks(start, t))
+                }),
                 None
             );
             t += 1;
@@ -3591,18 +2978,13 @@ mod tests {
             "slow start is still armed going into the rebuild"
         );
 
-        let verdict = c.on_window(
-            ticks(start, t),
-            0,
-            0,
-            Some(15_711),
-            Some(129),
-            Some(15_063),
-            390,
-            false,
-            0,
-            None,
-        );
+        let verdict = c.on_window(&WindowSample {
+            owd_mean_us: Some(15_711),
+            decode_mean_us: Some(129),
+            encode_mean_us: Some(15_063),
+            actual_kbps: 390,
+            ..WindowSample::at(ticks(start, t))
+        });
         t += 1;
         assert_eq!(
             verdict, None,
@@ -3615,18 +2997,13 @@ mod tests {
         );
 
         // Same encode excursion at full delivery is still severe.
-        let verdict = c.on_window(
-            ticks(start, t),
-            0,
-            0,
-            Some(3_600),
-            Some(210),
-            Some(15_063),
-            20_000,
-            false,
-            0,
-            None,
-        );
+        let verdict = c.on_window(&WindowSample {
+            owd_mean_us: Some(3_600),
+            decode_mean_us: Some(210),
+            encode_mean_us: Some(15_063),
+            actual_kbps: 20_000,
+            ..WindowSample::at(ticks(start, t))
+        });
         assert!(
             verdict.is_some_and(|k| k < 20_000),
             "a real encode excursion at full delivery still backs off, got {verdict:?}"
@@ -3644,18 +3021,12 @@ mod tests {
         // Climbs must stop at the knee, not the 900 Mbps link ceiling.
         let mut max_req = 0;
         for _ in 0..62 {
-            if let Some(k) = c.on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(10_000),
-                Some(8_000),
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            ) {
+            if let Some(k) = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(8_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, t))
+            }) {
                 // Cap in force at decision time. Re-probe may lift it; the link
                 // ceiling must not.
                 assert!(
@@ -3681,18 +3052,11 @@ mod tests {
         let start = Instant::now();
         let mut t = 0;
         let r1 = c
-            .on_window(
-                ticks(start, t),
-                0,
-                0,
-                None,
-                None,
-                None,
-                490_000,
-                true,
-                0,
-                None,
-            )
+            .on_window(&WindowSample {
+                actual_kbps: 490_000,
+                flushed: true,
+                ..WindowSample::at(ticks(start, t))
+            })
             .expect("flush must back off");
         assert_eq!(r1, 350_000);
         assert!(c.decode_cap_kbps.is_none());
@@ -3701,18 +3065,11 @@ mod tests {
         climb_to(&mut c, start, &mut t, 460_000);
         t += 2;
         let r2 = c
-            .on_window(
-                ticks(start, t),
-                1,
-                0,
-                None,
-                None,
-                None,
-                c.current_kbps,
-                false,
-                0,
-                None,
-            )
+            .on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: c.current_kbps,
+                ..WindowSample::at(ticks(start, t))
+            })
             .expect("loss must back off");
         t += 1;
         assert!(c.decode_cap_kbps.is_none());
@@ -3725,18 +3082,11 @@ mod tests {
         climb_to(&mut c, start, &mut t, 460_000);
         t += 2;
         let r3 = c
-            .on_window(
-                ticks(start, t),
-                0,
-                0,
-                None,
-                None,
-                None,
-                c.current_kbps,
-                true,
-                0,
-                None,
-            )
+            .on_window(&WindowSample {
+                actual_kbps: c.current_kbps,
+                flushed: true,
+                ..WindowSample::at(ticks(start, t))
+            })
             .expect("flush must back off");
         t += 1;
         assert!(c.decode_cap_kbps.is_none());
@@ -3746,18 +3096,11 @@ mod tests {
         climb_to(&mut c, start, &mut t, dissimilar_target);
         t += 2;
         let _ = c
-            .on_window(
-                ticks(start, t),
-                0,
-                0,
-                None,
-                None,
-                None,
-                c.current_kbps,
-                true,
-                0,
-                None,
-            )
+            .on_window(&WindowSample {
+                actual_kbps: c.current_kbps,
+                flushed: true,
+                ..WindowSample::at(ticks(start, t))
+            })
             .expect("flush must back off");
         assert!(c.decode_cap_kbps.is_none());
     }
@@ -3773,18 +3116,12 @@ mod tests {
         // Host parks at the knee (unsolicited re-target).
         c.on_ack(knee);
         for _ in 0..CAP_REPROBE_WINDOWS_MIN {
-            let _ = c.on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(10_000),
-                Some(8_000),
-                None,
-                490_000,
-                false,
-                0,
-                None,
-            );
+            let _ = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(8_000),
+                actual_kbps: 490_000,
+                ..WindowSample::at(ticks(start, t))
+            });
             t += 1;
         }
         assert_eq!(c.decode_cap_kbps, Some(knee + knee / 8));
@@ -3815,36 +3152,27 @@ mod tests {
             t += 1;
         }
         // One heavy-loss window ends slow start so the climb is additive.
-        let _ = c.on_window(
-            ticks(start, t),
-            0,
-            HEAVY_LOSS_PPM,
-            Some(10_000),
-            Some(8_000),
-            None,
-            15_000,
-            false,
-            0,
-            None,
-        );
+        let _ = c.on_window(&WindowSample {
+            loss_ppm: HEAVY_LOSS_PPM,
+            owd_mean_us: Some(10_000),
+            decode_mean_us: Some(8_000),
+            actual_kbps: 15_000,
+            ..WindowSample::at(ticks(start, t))
+        });
         t += 1;
         // First sample: flush + 40 ms decode.
         climb_to(&mut c, start, &mut t, 417_277);
         let first = c.current_kbps;
         t += 2;
         let r1 = c
-            .on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(8_313),
-                Some(40_087),
-                None,
-                first,
-                true,
-                1,
-                None,
-            )
+            .on_window(&WindowSample {
+                owd_mean_us: Some(8_313),
+                decode_mean_us: Some(40_087),
+                actual_kbps: first,
+                flushed: true,
+                recovery_kf: 1,
+                ..WindowSample::at(ticks(start, t))
+            })
             .expect("flush choke must back off");
         t += 1;
         assert!(c.decode_cap_kbps.is_none());
@@ -3855,35 +3183,23 @@ mod tests {
         let second = c.current_kbps;
         t += 2;
         assert_eq!(
-            c.on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(6_877),
-                Some(26_474),
-                None,
-                second,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(6_877),
+                decode_mean_us: Some(26_474),
+                actual_kbps: second,
+                ..WindowSample::at(ticks(start, t))
+            }),
             None,
             "the first bad window must not decide"
         );
         t += 1;
         assert_eq!(
-            c.on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(6_877),
-                Some(26_474),
-                None,
-                second,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(6_877),
+                decode_mean_us: Some(26_474),
+                actual_kbps: second,
+                ..WindowSample::at(ticks(start, t))
+            }),
             Some(((second as u64 * 7 / 10) as u32).max(FLOOR_KBPS))
         );
         assert_eq!(
@@ -3910,18 +3226,14 @@ mod tests {
         c.on_ack(r1);
         t += 2;
         let r2 = c
-            .on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(10_000),
-                Some(43_305),
-                None,
-                r1,
-                true,
-                1,
-                None,
-            )
+            .on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(43_305),
+                actual_kbps: r1,
+                flushed: true,
+                recovery_kf: 1,
+                ..WindowSample::at(ticks(start, t))
+            })
             .expect("drain flush must back off");
         t += 1;
         assert!(
@@ -3952,18 +3264,12 @@ mod tests {
         }
         t += 2;
         let r1 = c
-            .on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                300_000,
-                false,
-                RECOVERY_KF_SEVERE,
-                None,
-            )
+            .on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 300_000,
+                recovery_kf: RECOVERY_KF_SEVERE,
+                ..WindowSample::at(ticks(start, t))
+            })
             .expect("keyframe storm must back off");
         t += 1;
         assert!(c.decode_cap_kbps.is_none());
@@ -3972,18 +3278,12 @@ mod tests {
         let rate = c.current_kbps;
         t += 2;
         let _ = c
-            .on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                rate,
-                false,
-                RECOVERY_KF_SEVERE,
-                None,
-            )
+            .on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: rate,
+                recovery_kf: RECOVERY_KF_SEVERE,
+                ..WindowSample::at(ticks(start, t))
+            })
             .expect("second storm must back off");
         assert_eq!(c.decode_cap_kbps, Some(rate - rate / 16));
     }
@@ -4001,18 +3301,12 @@ mod tests {
         }
         t += 2;
         let r1 = c
-            .on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(10_000),
-                None,
-                None,
-                300_000,
-                false,
-                RECOVERY_KF_SEVERE,
-                None,
-            )
+            .on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 300_000,
+                recovery_kf: RECOVERY_KF_SEVERE,
+                ..WindowSample::at(ticks(start, t))
+            })
             .expect("clean storm must back off");
         t += 1;
         assert_eq!(c.decode_backoff_kbps, 300_000);
@@ -4020,18 +3314,13 @@ mod tests {
         climb_to(&mut c, start, &mut t, 280_000);
         t += 2;
         let _ = c
-            .on_window(
-                ticks(start, t),
-                0,
-                SEVERE_LOSS_PPM,
-                Some(10_000),
-                None,
-                None,
-                c.current_kbps,
-                false,
-                RECOVERY_KF_SEVERE,
-                None,
-            )
+            .on_window(&WindowSample {
+                loss_ppm: SEVERE_LOSS_PPM,
+                owd_mean_us: Some(10_000),
+                actual_kbps: c.current_kbps,
+                recovery_kf: RECOVERY_KF_SEVERE,
+                ..WindowSample::at(ticks(start, t))
+            })
             .expect("lossy storm must back off");
         assert!(c.decode_cap_kbps.is_none());
         assert_eq!(
@@ -4053,35 +3342,23 @@ mod tests {
         }
         t += 2;
         assert_eq!(
-            c.on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(40_000),
-                Some(8_000),
-                None,
-                490_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(40_000),
+                decode_mean_us: Some(8_000),
+                actual_kbps: 490_000,
+                ..WindowSample::at(ticks(start, t))
+            }),
             None,
             "one OWD-bad window must not decide"
         );
         t += 1;
         assert_eq!(
-            c.on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(10_000),
-                Some(26_000),
-                None,
-                490_000,
-                false,
-                0,
-                None,
-            ),
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(26_000),
+                actual_kbps: 490_000,
+                ..WindowSample::at(ticks(start, t))
+            }),
             Some(350_000)
         );
         assert!(c.decode_cap_kbps.is_none());
@@ -4099,18 +3376,11 @@ mod tests {
         let mut i = 0;
         // Never ack: exactly [`MAX_UNACKED`] requests, then silence.
         while i < 60 {
-            if c.on_window(
-                ticks(start, i),
-                1,
-                0,
-                None,
-                None,
-                None,
-                1_000_000,
-                false,
-                0,
-                None,
-            )
+            if c.on_window(&WindowSample {
+                dropped: 1,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, i))
+            })
             .is_some()
             {
                 sent += 1;
@@ -4121,18 +3391,13 @@ mod tests {
     }
     /// One clean, utilized, full-rate 120 Hz window with a given decode mean.
     fn loaded(c: &mut BitrateController, at: Instant, decode_us: i64) -> Option<u32> {
-        c.on_window(
-            at,
-            0,
-            0,
-            Some(10_000),
-            Some(decode_us),
-            None,
-            c.current_kbps,
-            false,
-            0,
-            Some(90),
-        )
+        c.on_window(&WindowSample {
+            owd_mean_us: Some(10_000),
+            decode_mean_us: Some(decode_us),
+            actual_kbps: c.current_kbps,
+            activity: WindowActivity::Active(90),
+            ..WindowSample::at(at)
+        })
     }
 
     /// A 120 Hz controller with room to climb and seeded baselines.
@@ -4274,18 +3539,13 @@ mod tests {
         // says nothing about the full-rate load. Climbs are still allowed.
         let (mut c, start, mut t) = seeded_120(100_000);
         for _ in 0..6 {
-            let r = c.on_window(
-                ticks(start, t),
-                0,
-                0,
-                Some(10_000),
-                Some(7_800),
-                None,
-                c.current_kbps,
-                false,
-                0,
-                Some(30),
-            );
+            let r = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                decode_mean_us: Some(7_800),
+                actual_kbps: c.current_kbps,
+                activity: WindowActivity::Active(30),
+                ..WindowSample::at(ticks(start, t))
+            });
             t += 1;
             if let Some(k) = r {
                 assert!(k > c.current_kbps, "only climbs, never a retreat");

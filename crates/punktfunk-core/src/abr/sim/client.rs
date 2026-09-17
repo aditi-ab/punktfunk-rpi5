@@ -9,7 +9,7 @@
 use super::host::{Frame, FrameShape, SHARD_WIRE_OVERHEAD};
 use super::link::LossDraw;
 use super::Rng;
-use crate::abr::{BitrateController, WindowActivity};
+use crate::abr::{BitrateController, WindowActivity, WindowSample};
 use crate::client::{ADAPT_REPORT_INTERVAL, FLUSH_COOLDOWN};
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -499,18 +499,18 @@ impl Client {
             ((self.received_bytes * 8 / window_ms) as u32).saturating_add(self.cfg.audio_kbps);
         let was = self.rate_kbps();
         let verdict = (!discard).then(|| {
-            self.abr.on_window(
-                base + std::time::Duration::from_millis(now_ms),
-                self.dropped,
+            self.abr.on_window(&WindowSample {
+                dropped: self.dropped,
                 loss_ppm,
                 owd_mean_us,
                 decode_mean_us,
                 encode_mean_us,
                 actual_kbps,
-                self.flushed,
-                self.recovery_kf,
+                flushed: self.flushed,
+                recovery_kf: self.recovery_kf,
                 activity,
-            )
+                ..WindowSample::at(base + std::time::Duration::from_millis(now_ms))
+            })
         });
         let request = verdict.flatten();
         if let Some(kbps) = request {
