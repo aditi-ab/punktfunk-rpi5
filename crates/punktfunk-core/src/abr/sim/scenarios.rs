@@ -190,14 +190,19 @@ pub(super) fn wifi_tv_probe_damage() -> Scenario {
     }
 }
 
-/// The same burst on the same link, with the recovery the 09-16 client log
-/// measured (690 ms and 896 ms): the freeze ends just past the discarded
-/// tail window, so the asks that reach a judged window are two or three —
-/// enough to mark it bad, not enough to be severe — and slow start survives,
-/// which is what those two sessions did.
-pub(super) fn wifi_tv_probe_survived() -> Scenario {
+/// C7 — the same burst, the quieter half of the regression: the freeze is
+/// short enough that only two or three asks reach a judged window. Two is
+/// under the severe bar but at `RECOVERY_KF_BAD`, so the window is bad, and
+/// a bad window ends slow start for the session. Nothing cuts, so nothing in
+/// any log marks it; the session simply crawls at +6 % for the rest of its
+/// life.
+///
+/// The second field session of 09-17 (`host173` 10:03): probe complete
+/// 10:03:20.3, then 25 955 · 27 578 · 29 302 · 31 134, no cut anywhere, and
+/// 31 134 held for three and a half minutes.
+pub(super) fn wifi_tv_probe_stalled() -> Scenario {
     let mut sc = wifi_tv_probe_damage();
-    sc.name = "wifi_tv_probe_survived";
+    sc.name = "wifi_tv_probe_stalled";
     sc.seed = 0x7A_6500;
     sc.sessions[0].host.recovery_ms = 1_050;
     sc
@@ -860,7 +865,7 @@ pub(super) fn all() -> Vec<Scenario> {
         idle_then_motion(),
         host_never_acks(),
         unknown_refresh(),
-        wifi_tv_probe_survived(),
+        wifi_tv_probe_stalled(),
         decoder_headroom(),
         encoder_stalled(),
         unknown_refresh_knee(),
@@ -1026,6 +1031,50 @@ mod tests {
         );
     }
 
+    /// C7: two keyframe asks are enough to end slow start, and nothing cuts,
+    /// so the session spends the rest of its life at +6 % a step with no
+    /// entry in any log to say why.
+    ///
+    /// Two numbers of the 09-17 10:03 session the model does not reproduce
+    /// and is not tuned for: its first step was ×1.30 at +1.6 s where this
+    /// climbs +6 % like every other, and it stopped at 31 134 for three and a
+    /// half minutes where this keeps stepping. What C7 pins is the shape they
+    /// share — no cut, no doubling, and a rate still far under the ceiling
+    /// the burst had just measured.
+    #[test]
+    fn c7_two_keyframe_asks_end_slow_start_without_a_cut() {
+        let r = run(&wifi_tv_probe_stalled());
+        assert!(r.cuts().is_empty(), "nothing in this session backs off");
+        let tail = r.windows[0]
+            .iter()
+            .position(|w| w.discarded)
+            .expect("the burst's tail window is discarded");
+        let judged = r.windows[0][tail + 1];
+        assert_eq!(judged.dropped, 0, "no unrecoverable frame to explain it");
+        assert!(
+            (2..=3).contains(&judged.recovery_kf),
+            "{} keyframe asks — two is bad, four would be severe",
+            judged.recovery_kf
+        );
+        let steps = r.steps();
+        assert!(steps.len() >= 8, "{} climbs", steps.len());
+        for pair in steps.windows(2) {
+            let pct = u64::from(pair[1]) * 100 / u64::from(pair[0]);
+            assert!(
+                (106..=107).contains(&pct),
+                "{} → {} is {pct} % of the last rate, not an additive step",
+                pair[0],
+                pair[1]
+            );
+        }
+        let last = r.windows[0].last().expect("the session ran");
+        assert!(
+            last.rate_kbps < 42_000,
+            "{} kbps a minute in, against a measured ceiling of 168 000",
+            last.rate_kbps
+        );
+    }
+
     /// C4: host encode over its budget cuts, twice more without bringing it
     /// down, then the down-driver stands down and nothing cuts until it
     /// re-arms 16 windows later — three cuts, as the 09-16 trace has them.
@@ -1151,7 +1200,7 @@ mod tests {
             "starved" => starved_client(),
             "unknown" => unknown_refresh(),
             "idle" => idle_then_motion(),
-            "survived" => wifi_tv_probe_survived(),
+            "stalled" => wifi_tv_probe_stalled(),
             _ => wifi_tv(),
         };
         let r = run(&sc);

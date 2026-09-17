@@ -22,7 +22,7 @@ starved_client	73	0	86	24166	399	0	0	1000	5f612dd0
 idle_then_motion	0	11	6	6	4	0	31	1000	1777d4e9
 host_never_acks	0	99999	0	0	0	0	0	1000	f91aeb39
 unknown_refresh	0	99999	25	0	1	0	0	1000	3805d19b
-wifi_tv_probe_survived	0	99999	0	0	0	0	0	1000	2de1b7fa
+wifi_tv_probe_stalled	0	99999	0	0	0	0	0	1000	2de1b7fa
 decoder_headroom	0	219	2	0	3	0	0	1000	1c4aee62
 encoder_stalled	0	11	6	0	4	0	0	1000	cd4fe556
 unknown_refresh_knee	0	99999	25	0	1	0	0	1000	af8cb644
