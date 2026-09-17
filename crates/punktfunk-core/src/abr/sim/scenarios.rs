@@ -938,6 +938,17 @@ pub(super) fn no_ramp() -> Scenario {
     }
 }
 
+/// A host that advertises the ramp and then answers no step: the client
+/// waits out the step deadline, learns nothing, and opens on the authority
+/// that no measurement leaves it.
+pub(super) fn ramp_unanswered() -> Scenario {
+    let mut sc = wifi_tv();
+    sc.name = "ramp_unanswered";
+    sc.seed = 0x7A_7100;
+    sc.sessions[0].host.answers_probes = false;
+    sc
+}
+
 /// Ten minutes of 5120×1440@240 on a 2 GbE path: the cost model's worst
 /// case, ~144 000 frames of ~490 shards each. Not in the baseline table — it
 /// exists to bound the simulator's own runtime.
@@ -1012,6 +1023,7 @@ pub(super) fn all() -> Vec<Scenario> {
         host_rebuild_wave(),
         encoder_weak(),
         host_cadence_refusal(),
+        ramp_unanswered(),
     ]
     .into_iter()
     // `old_host` is the host that has none of this: it stays as it is.
@@ -1036,6 +1048,18 @@ pub(super) fn all() -> Vec<Scenario> {
         wifi_tv_probe_stalled(),
         "wifi_tv_probe_stalled_legacy",
     ));
+    // Four more in both shapes: a measured session runs where the rebuild's
+    // asks stay under the severe bar and has no slow start left to re-arm, so
+    // the old-host shape is the only witness the mutation sweep has for
+    // `RECOVERY_KF_SEVERE`, `DECODE_SEVERE_US`, `DECODE_CAP_SIMILAR_DIV` and
+    // `IDLE_WINDOWS_TO_REARM`.
+    table.push(legacy(host_rebuild_stall(), "host_rebuild_stall_legacy"));
+    table.push(legacy(decoder_knee(), "decoder_knee_legacy"));
+    table.push(legacy(
+        unknown_refresh_knee(),
+        "unknown_refresh_knee_legacy",
+    ));
+    table.push(legacy(idle_then_motion(), "idle_then_motion_legacy"));
     table
 }
 

@@ -515,7 +515,10 @@ impl Client {
                     self.abr.on_keyframe_asks(1);
                     out.push(Action::Keyframe);
                 }
-                crate::abr::Action::Delivery(_) | crate::abr::Action::AbandonProbe => {}
+                // As the pump does: a burst nobody answered is let go, or the
+                // report tick stays suppressed for the rest of the session.
+                crate::abr::Action::AbandonProbe => self.probing = false,
+                crate::abr::Action::Delivery(_) => {}
             }
         }
         if self.ramp_done.is_none() {

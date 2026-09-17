@@ -180,6 +180,8 @@ pub(super) struct HostCfg {
     /// Display, capture and encoder bring-up: the gap between the punch and
     /// the first video frame, which is what the ramp measures the link in.
     pub bringup_ms: u64,
+    /// `false` = a host that advertises the ramp and then answers no step.
+    pub answers_probes: bool,
     /// `false` = a host that predates renegotiation: it applies nothing and
     /// answers nothing, and the controller retires itself.
     pub acks: bool,
@@ -208,6 +210,7 @@ impl Default for HostCfg {
             marks_repeats: true,
             ramp: false,
             bringup_ms: 0,
+            answers_probes: true,
             acks: true,
         }
     }
@@ -334,6 +337,9 @@ impl Host {
     /// spacing refuses it. Bring-up is exempt on a host that serves the ramp:
     /// there is no pipeline yet, so a step costs the session nothing.
     pub(super) fn on_probe_request(&mut self, now_ms: u64, target_kbps: u32, duration_ms: u32) {
+        if !self.cfg.answers_probes {
+            return;
+        }
         let ramping = self.cfg.ramp && now_ms < self.cfg.bringup_ms;
         let spaced = self
             .last_probe_ms

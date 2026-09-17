@@ -30,6 +30,7 @@ host_rebuild_stall	0	1	0	0	5	0	0	1000	0987801e
 host_rebuild_wave	0	1	0	0	5	0	0	1000	e05f7cfd
 encoder_weak	0	4	0	0	6	0	0	1000	dd6a4c5e
 host_cadence_refusal	0	3	0	0	6	0	0	1000	13d3403c
+ramp_unanswered	0	18	15	1140	7	0	0	1000	6dba61ae
 wifi_tv_legacy	0	20	0	0	3	0	0	1000	a510e60b
 wifi_good_legacy	0	1	0	8	2	0	0	1000	811c9dc5
 slow_start_spent_legacy	0	19	2	2	5	0	7	1000	1ef06aa8
@@ -37,3 +38,7 @@ gpu_saturated_legacy	0	9	27	0	4	0	0	1000	3e661c75
 wan_wg_12_legacy	2	0	13	393	40	20186	0	1000	7be3047e
 wifi_tv_probe_damage_legacy	0	20	0	0	3	0	0	1000	f419fe3f
 wifi_tv_probe_stalled_legacy	0	20	0	0	3	0	0	1000	8e422cdf
+host_rebuild_stall_legacy	0	1	15	0	2	0	0	1000	325d140c
+decoder_knee_legacy	0	99999	12	0	3	0	0	1000	f43012d4
+unknown_refresh_knee_legacy	0	99999	25	0	1	0	0	1000	af8cb644
+idle_then_motion_legacy	0	11	6	6	4	0	31	1000	1777d4e9
