@@ -173,6 +173,13 @@ pub(super) struct HostCfg {
     pub content: Vec<ContentPhase>,
     /// Older host: never marks idle repeats.
     pub marks_repeats: bool,
+    /// Host serves probe requests during bring-up, without the 10 s spacing
+    /// (`HOST_CAP2_RAMP`). An older host answers the first one and rejects
+    /// every step behind it.
+    pub ramp: bool,
+    /// Display, capture and encoder bring-up: the gap between the punch and
+    /// the first video frame, which is what the ramp measures the link in.
+    pub bringup_ms: u64,
     /// `false` = a host that predates renegotiation: it applies nothing and
     /// answers nothing, and the controller retires itself.
     pub acks: bool,
@@ -199,6 +206,8 @@ impl Default for HostCfg {
             recovery_ms: 0,
             content: vec![ContentPhase::default()],
             marks_repeats: true,
+            ramp: false,
+            bringup_ms: 0,
             acks: true,
         }
     }
@@ -210,6 +219,20 @@ struct ProbeBurst {
     start_ms: u64,
     end_ms: u64,
     bytes_sent: u64,
+}
+
+/// `native/control.rs` `MIN_PROBE_INTERVAL`: one burst per 10 s, lifted for
+/// the bring-up ramp.
+const MIN_PROBE_INTERVAL_MS: u64 = 10_000;
+
+/// What the host tells the client about a finished burst
+/// (`quic::ProbeResult`), in the two domains the wire carries: payload bytes
+/// offered, and the wire packets they became.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ProbeDone {
+    pub duration_ms: u32,
+    pub bytes_sent: u64,
+    pub wire_packets_sent: u32,
 }
 
 /// One frame on its way to the client.
@@ -240,6 +263,7 @@ pub(super) struct Host {
     idr_owed: bool,
     idr_due_ms: Option<u64>,
     probe: Option<ProbeBurst>,
+    last_probe_ms: Option<u64>,
     swing_us: u32,
     swing_until_ms: u64,
     pace_left: u64,
@@ -266,6 +290,7 @@ impl Host {
             idr_owed: true,
             idr_due_ms: None,
             probe: None,
+            last_probe_ms: None,
             swing_us: 0,
             swing_until_ms: 0,
             pace_left: 0,
@@ -305,8 +330,18 @@ impl Host {
         self.idr_due_ms.get_or_insert(now_ms + self.cfg.recovery_ms);
     }
 
-    /// Arm a speed-test burst (`stream.rs` `ProbeBurst::begin`).
+    /// Arm a speed-test burst (`stream.rs` `ProbeBurst::begin`), unless the
+    /// spacing refuses it. Bring-up is exempt on a host that serves the ramp:
+    /// there is no pipeline yet, so a step costs the session nothing.
     pub(super) fn on_probe_request(&mut self, now_ms: u64, target_kbps: u32, duration_ms: u32) {
+        let ramping = self.cfg.ramp && now_ms < self.cfg.bringup_ms;
+        let spaced = self
+            .last_probe_ms
+            .is_none_or(|t| now_ms - t >= MIN_PROBE_INTERVAL_MS);
+        if !ramping && !spaced {
+            return;
+        }
+        self.last_probe_ms = Some(now_ms);
         self.probe = Some(ProbeBurst {
             target_kbps,
             start_ms: now_ms,
@@ -330,15 +365,22 @@ impl Host {
         take
     }
 
-    /// The burst's own duration once it expires — the host's `ProbeResult`.
-    pub(super) fn probe_done(&mut self, now_ms: u64) -> Option<u32> {
+    /// The burst's own report once it expires. `bytes_sent` is the payload
+    /// the filler carried; the wire packets are those bytes plus their
+    /// headers, which is the domain the client counts arrivals in.
+    pub(super) fn probe_done(&mut self, now_ms: u64) -> Option<ProbeDone> {
         let p = self.probe.as_ref()?;
         if now_ms < p.end_ms {
             return None;
         }
-        let ms = (p.end_ms - p.start_ms) as u32;
+        let wire = self.cfg.shard_payload as u64 + SHARD_WIRE_OVERHEAD;
+        let done = ProbeDone {
+            duration_ms: (p.end_ms - p.start_ms) as u32,
+            bytes_sent: p.bytes_sent * self.cfg.shard_payload as u64 / wire,
+            wire_packets_sent: (p.bytes_sent / wire) as u32,
+        };
         self.probe = None;
-        Some(ms)
+        Some(done)
     }
 
     /// Host adaptive FEC closes on the client's loss report.
@@ -396,8 +438,13 @@ impl Host {
 
     /// Produce this millisecond's frame, if the frame clock fired. A loaded
     /// encoder caps the rate at one frame per `encode_us`, which is what turns
-    /// GPU contention into a short window.
+    /// GPU contention into a short window. Nothing leaves before the pipeline
+    /// exists.
     pub(super) fn tick(&mut self, now_ms: u64) -> Option<Frame> {
+        if now_ms < self.cfg.bringup_ms {
+            self.next_frame_us = self.cfg.bringup_ms * 1_000;
+            return None;
+        }
         if now_ms * 1_000 < self.next_frame_us {
             return None;
         }

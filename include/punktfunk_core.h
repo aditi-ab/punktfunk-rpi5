@@ -761,6 +761,13 @@
 // bit — Hello is first contact, with no host capability known yet, and stays frozen.
 #define PUNKTFUNK_HOST_CAP2_EXT 4
 
+// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host serves
+// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is punched,
+// before its pipeline exists and without the one-per-10 s spacing, until the first video
+// frame leaves. That window is what the client's bring-up ramp measures the link in; a
+// client that does not see the bit bursts beside live video as before.
+#define PUNKTFUNK_HOST_CAP2_RAMP 8
+
 // [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
 // that wants to stream from a GPU-less host must advertise this.
 #define PUNKTFUNK_CODEC_H264 1

@@ -44,6 +44,9 @@ pub(crate) struct ProbeState {
     /// `ProbeRequest` would latch `active` and suppress the whole report tick
     /// (loss, ABR, standing-latency, clock re-sync) for the rest of the session.
     pub(crate) duration_ms: u32,
+    /// A bring-up ramp step. Its delivered figures keep moving after the host
+    /// report lands — see [`refresh_delivered`](Self::refresh_delivered).
+    pub(crate) ramp: bool,
 }
 
 impl ProbeState {
@@ -62,6 +65,29 @@ impl ProbeState {
         }
         let ms = ((last_ns - first_ns) / 1_000_000).max(1);
         Some(u32::try_from(ms).unwrap_or(u32::MAX))
+    }
+
+    /// Re-read the probe counters into a finished ramp step's figures.
+    ///
+    /// The host's report closes its SEND window; the bottleneck queue is
+    /// still draining toward us. Counting on lets the bring-up ramp time the
+    /// drain — the bytes stop moving when the receive buffer is empty, which
+    /// is the only honest denominator (`abr::probe`). Probe-scoped counters,
+    /// so video beside the burst cannot inflate them. The 800 ms burst keeps
+    /// the figures the control task froze: its tail is a thousandth of them.
+    pub(crate) fn refresh_delivered(&mut self, st: &crate::stats::Stats) {
+        let base_p = self.base_packets.unwrap_or(st.probe_packets_received);
+        let base_b = self.base_bytes.unwrap_or(st.probe_bytes_received);
+        self.delivered_packets = st.probe_packets_received.saturating_sub(base_p);
+        self.delivered_bytes = st.probe_bytes_received.saturating_sub(base_b);
+        self.first_arrival_ns = st.probe_first_arrival_ns;
+        self.last_arrival_ns = st.probe_last_arrival_ns;
+        self.client_interval_ms = Self::measured_interval_ms(
+            self.first_arrival_ns,
+            self.last_arrival_ns,
+            self.delivered_packets,
+        )
+        .unwrap_or(0);
     }
 
     /// Throughput denominator, ms: client receive interval when the burst

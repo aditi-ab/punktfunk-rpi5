@@ -5,7 +5,7 @@
 //! capacity probe are the shipped code, driven the way
 //! `client/pump/data.rs` drives them: counters in, actions out.
 
-use super::host::{Frame, FrameShape, SHARD_WIRE_OVERHEAD};
+use super::host::{Frame, FrameShape, ProbeDone, SHARD_WIRE_OVERHEAD};
 use super::link::LossDraw;
 use super::Rng;
 use crate::abr::{Driver, DriverConfig, ProbeReport};
@@ -56,8 +56,11 @@ pub(super) struct ClientCfg {
     /// Run the startup capacity probe. `false` replays a host that declined
     /// it, or a scenario that injects the ceiling instead.
     pub probe: bool,
-    /// `PUNKTFUNK_ABR_PROBE_KBPS`. `None` = `probe_target_kbps(stream_cap)`.
+    /// `PUNKTFUNK_ABR_PROBE_KBPS`. `None` = `probe_target_kbps(stream_cap)`;
+    /// with `ramp`, the ramp's maximum instead.
     pub probe_target_kbps: Option<u32>,
+    /// Host advertises `HOST_CAP2_RAMP`: measure the link during bring-up.
+    pub ramp: bool,
     /// Ceiling injected directly, for a scenario that replays a host which
     /// paused video for the burst. The window it lands in is discarded, as
     /// the probe tail is.
@@ -81,6 +84,7 @@ impl Default for ClientCfg {
             decode: DecodeCfg::default(),
             probe: true,
             probe_target_kbps: None,
+            ramp: false,
             ceiling_at: None,
             rebuild_at_ms: None,
             automatic: true,
@@ -158,12 +162,18 @@ pub(super) struct Client {
     probe_bytes: u64,
     probe_first_ms: u64,
     probe_last_ms: u64,
-    /// The finished burst's report. The embedder's probe state keeps saying
-    /// "done" until the next burst overwrites it, so the pump hands the same
-    /// report over on every iteration — and so does this.
-    probe_report: Option<ProbeReport>,
+    /// The host's end-of-burst report. The embedder's probe state keeps
+    /// saying "done" until the next burst overwrites it, so the pump hands a
+    /// report over on every iteration — and so does this. Its delivered
+    /// figures keep growing while the queue drains, which is what the ramp
+    /// times (`ProbeState::refresh_delivered`).
+    probe_done: Option<ProbeDone>,
     pub(super) windows: Vec<WindowRec>,
     pub(super) owd_samples: Vec<u32>,
+    /// Every bring-up ramp step: when it went out and what it asked for.
+    pub(super) ramp_asks: Vec<(u64, u32)>,
+    /// When the ramp stopped, and what it came to.
+    pub(super) ramp_done: Option<(u64, crate::abr::probe::RampSummary)>,
 }
 
 impl Client {
@@ -181,6 +191,7 @@ impl Client {
                 marks_repeats: cfg.marks_repeats,
                 probe: cfg.probe,
                 probe_target_kbps: cfg.probe_target_kbps,
+                ramp: cfg.ramp,
             },
             base,
         );
@@ -204,9 +215,11 @@ impl Client {
             probe_bytes: 0,
             probe_first_ms: 0,
             probe_last_ms: 0,
-            probe_report: None,
+            probe_done: None,
             windows: Vec::new(),
             owd_samples: Vec::new(),
+            ramp_asks: Vec::new(),
+            ramp_done: None,
             cfg,
         }
     }
@@ -396,12 +409,11 @@ impl Client {
         self.stats.probe_bytes_received += bytes;
     }
 
-    /// The host's `ProbeResult` landed: the burst's trailing edge, then the
-    /// measurement, in the order one pump iteration sees them.
-    pub(super) fn on_probe_result(&mut self, now_ms: u64, host_duration_ms: u32) {
-        self.probing = false;
+    /// What the pump would hand the driver right now: the host's report plus
+    /// whatever has arrived since, which is still growing while the
+    /// bottleneck queue drains.
+    fn probe_report(&self, done: ProbeDone) -> ProbeReport {
         let packets = self.probe_bytes / (self.cfg.shard_payload as u64 + SHARD_WIRE_OVERHEAD);
-        let delivered = packets * PROBE_PACKET_BYTES;
         // Client receive interval: first to last filler arrival. Under two
         // packets there is no interval and the host's window stands.
         let client_interval_ms = if packets >= 2 && self.probe_last_ms > self.probe_first_ms {
@@ -409,20 +421,30 @@ impl Client {
         } else {
             0
         };
-        let report = ProbeReport {
-            delivered_bytes: delivered,
+        ProbeReport {
+            delivered_bytes: packets * PROBE_PACKET_BYTES,
+            delivered_packets: packets,
             window_ms: if client_interval_ms > 0 {
                 client_interval_ms
             } else {
-                host_duration_ms
+                done.duration_ms
             },
-            host_duration_ms,
+            host_duration_ms: done.duration_ms,
             client_interval_ms,
-        };
+            host_bytes_sent: done.bytes_sent,
+            wire_packets_sent: done.wire_packets_sent,
+            send_dropped: 0,
+        }
+    }
+
+    /// The host's `ProbeResult` landed: the burst's trailing edge, then the
+    /// measurement, in the order one pump iteration sees them.
+    pub(super) fn on_probe_result(&mut self, now_ms: u64, done: ProbeDone) {
+        self.probing = false;
         let now = self.base + Duration::from_millis(now_ms);
         self.abr.on_probe_active(false, self.probe_duration_ms, now);
-        self.abr.on_probe_result(report);
-        self.probe_report = Some(report);
+        self.abr.on_probe_result(self.probe_report(done), now);
+        self.probe_done = Some(done);
     }
 
     /// One millisecond of client: the host rebuild and the keyframe throttle,
@@ -453,9 +475,10 @@ impl Client {
         self.abr
             .on_probe_active(self.probing, self.probe_duration_ms, now);
         // The pump re-presents a finished burst's report for as long as the
-        // probe state stands. Only the first is the measurement.
-        if let Some(r) = self.probe_report {
-            self.abr.on_probe_result(r);
+        // probe state stands. Only the first is the measurement — except for
+        // a ramp step, which is over when its bytes stop arriving.
+        if let Some(done) = self.probe_done {
+            self.abr.on_probe_result(self.probe_report(done), now);
         }
         let unrecovered = self.lost_frames > 0;
         let tick = self.abr.tick(now);
@@ -470,11 +493,15 @@ impl Client {
                 crate::abr::Action::Probe {
                     target_kbps,
                     duration_ms,
+                    ramp,
                 } => {
+                    if ramp {
+                        self.ramp_asks.push((now_ms, target_kbps));
+                    }
                     self.probing = true;
                     self.probe_duration_ms = duration_ms;
                     // A new burst overwrites the old state, report included.
-                    self.probe_report = None;
+                    self.probe_done = None;
                     self.probe_bytes = 0;
                     self.probe_first_ms = 0;
                     self.probe_last_ms = 0;
@@ -489,6 +516,11 @@ impl Client {
                     out.push(Action::Keyframe);
                 }
                 crate::abr::Action::Delivery(_) | crate::abr::Action::AbandonProbe => {}
+            }
+        }
+        if self.ramp_done.is_none() {
+            if let Some(s) = self.abr.ramp_summary() {
+                self.ramp_done = Some((now_ms, s));
             }
         }
         let Some(w) = tick.window else { return };

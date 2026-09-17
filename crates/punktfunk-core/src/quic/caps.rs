@@ -161,6 +161,13 @@ pub const HOST_CAP2_TOUCH: u8 = 0x02;
 /// bit — Hello is first contact, with no host capability known yet, and stays frozen.
 pub const HOST_CAP2_EXT: u8 = 0x04;
 
+/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host serves
+/// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is punched,
+/// before its pipeline exists and without the one-per-10 s spacing, until the first video
+/// frame leaves. That window is what the client's bring-up ramp measures the link in; a
+/// client that does not see the bit bursts beside live video as before.
+pub const HOST_CAP2_RAMP: u8 = 0x08;
+
 /// [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
 /// that wants to stream from a GPU-less host must advertise this.
 pub const CODEC_H264: u8 = 0x01;

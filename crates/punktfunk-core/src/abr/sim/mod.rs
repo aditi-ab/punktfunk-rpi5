@@ -94,9 +94,17 @@ struct Metrics {
 /// A metric that never happened. Visible in the table rather than silent.
 const NEVER: u32 = 99_999;
 
+/// One session's bring-up ramp: every step it asked for, and what it came
+/// to (`None` = it never stopped, or never ran).
+struct RampTrace {
+    pub asks: Vec<(u64, u32)>,
+    pub done: Option<(u64, crate::abr::probe::RampSummary)>,
+}
+
 struct Run {
     pub metrics: Metrics,
     pub windows: Vec<Vec<WindowRec>>,
+    pub ramps: Vec<RampTrace>,
 }
 
 impl Run {
@@ -225,8 +233,8 @@ fn run(sc: &Scenario) -> Run {
                     } => s.host.on_probe_request(now, target_kbps, duration_ms),
                 }
             }
-            if let Some(host_ms) = s.host.probe_done(now) {
-                s.client.on_probe_result(now, host_ms);
+            if let Some(done) = s.host.probe_done(now) {
+                s.client.on_probe_result(now, done);
             }
             if let Some((kbps, why)) = s.host.apply_pending(now) {
                 s.client.push_ack(kbps, why);
@@ -234,9 +242,23 @@ fn run(sc: &Scenario) -> Run {
         }
     }
     let metrics = measure(sc, &sessions, &mut link, offered_10s, capacity_10s);
+    let (windows, ramps) = sessions
+        .into_iter()
+        .map(|s| {
+            let c = s.client;
+            (
+                c.windows,
+                RampTrace {
+                    asks: c.ramp_asks,
+                    done: c.ramp_done,
+                },
+            )
+        })
+        .unzip();
     Run {
         metrics,
-        windows: sessions.into_iter().map(|s| s.client.windows).collect(),
+        windows,
+        ramps,
     }
 }
 

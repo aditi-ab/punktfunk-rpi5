@@ -99,6 +99,9 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // Host marks idle-keepalive repeats (`USER_FLAG_REPEAT`). Only then is an
     // unflagged AU new content; older hosts keep the legacy window arithmetic.
     let marks_repeats = negotiated.host_caps2 & crate::quic::HOST_CAP2_REPEAT_MARK != 0;
+    // Host serves probe requests during its own bring-up: measure the link
+    // before the first frame instead of bursting beside it.
+    let serves_ramp = negotiated.host_caps2 & crate::quic::HOST_CAP2_RAMP != 0;
     // Wire budgets: `actual` is wire bytes plus this audio reservation, spent
     // whether video flows or not. PCM is exact; Opus uses the default-tier ladder
     // (a pinned tier skews a few hundred kbps, inside the ¾ utilization gate).
@@ -316,6 +319,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         bit_depth,
         chroma_format,
         marks_repeats,
+        serves_ramp,
         audio_reserved_kbps,
         stream_cap_kbps,
         refresh_hz,

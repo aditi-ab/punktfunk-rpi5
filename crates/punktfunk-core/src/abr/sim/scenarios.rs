@@ -16,6 +16,33 @@ use crate::quic::{CODEC_H264, CODEC_HEVC};
 /// so a 2 Gbps default does not take the picture with it.
 const WEBOS_PROBE_KBPS: u32 = 320_000;
 
+/// Display, capture and encoder bring-up. Windows measured
+/// `punch_done+1848 … first_packet+4815`; the ramp lives in that gap.
+const BRINGUP_MS: u64 = 2_500;
+
+/// The same scenario against a host that serves the bring-up ramp: video
+/// waits for the pipeline, and the client measures the link in that gap.
+fn with_ramp(mut sc: Scenario) -> Scenario {
+    for s in &mut sc.sessions {
+        s.host.ramp = true;
+        s.host.bringup_ms = s.join_ms + BRINGUP_MS;
+        s.client.ramp = true;
+        // An injected ceiling replayed a host that paused video for its
+        // burst. The ramp is that measurement now, so it runs instead.
+        if s.client.ceiling_at.take().is_some() {
+            s.client.probe = true;
+        }
+    }
+    sc
+}
+
+/// A calibration kept as it was recorded: an old host, no ramp, video from
+/// the first millisecond.
+fn legacy(mut sc: Scenario, name: &'static str) -> Scenario {
+    sc.name = name;
+    sc
+}
+
 /// 4K165 HEVC 8-bit — the G5 sessions' mode.
 fn cap_4k165() -> u32 {
     stream_ceiling_kbps(3840, 2160, 165, CODEC_HEVC, 8, 0)
@@ -946,8 +973,12 @@ pub(super) fn fat_pipe_10min() -> Scenario {
 }
 
 /// Every scenario the baseline pins, in table order.
+///
+/// Every row but `old_host` runs against a host that serves the ramp; the
+/// seven calibrations run a second time against one that does not, because
+/// what they replay are field sessions from before it existed.
 pub(super) fn all() -> Vec<Scenario> {
-    vec![
+    let mut table: Vec<Scenario> = vec![
         lan_10g(),
         lan_1g(),
         wifi_good(),
@@ -980,6 +1011,30 @@ pub(super) fn all() -> Vec<Scenario> {
         encoder_weak(),
         host_cadence_refusal(),
     ]
+    .into_iter()
+    // `old_host` is the host that has none of this: it stays as it is.
+    .map(|sc| {
+        if sc.name == "old_host" {
+            sc
+        } else {
+            with_ramp(sc)
+        }
+    })
+    .collect();
+    table.push(legacy(wifi_tv(), "wifi_tv_legacy"));
+    table.push(legacy(wifi_good(), "wifi_good_legacy"));
+    table.push(legacy(slow_start_spent(), "slow_start_spent_legacy"));
+    table.push(legacy(gpu_saturated(), "gpu_saturated_legacy"));
+    table.push(legacy(wan_wg_12(0x7A_5500, 180_000), "wan_wg_12_legacy"));
+    table.push(legacy(
+        wifi_tv_probe_damage(),
+        "wifi_tv_probe_damage_legacy",
+    ));
+    table.push(legacy(
+        wifi_tv_probe_stalled(),
+        "wifi_tv_probe_stalled_legacy",
+    ));
+    table
 }
 
 #[cfg(test)]
@@ -1008,6 +1063,60 @@ mod tests {
             ceiling * 10 >= want * 9 && ceiling <= want,
             "{ceiling} kbps against 0.7 × the 1 GbE link's {want}"
         );
+    }
+
+    /// The bring-up ramp's arithmetic, on three links whose answers differ:
+    /// a 1 GbE wall above what the stream can use, a 12.5 Mbps wall three
+    /// steps in, and the G5's Wi-Fi, where the measurement used to cost a
+    /// 900 ms freeze.
+    ///
+    /// Steps, bytes and milliseconds are pinned here rather than in the
+    /// baseline, which cannot see them: what the measurement costs the link
+    /// is the whole point of replacing the burst.
+    #[test]
+    fn the_bring_up_ramp_measures_each_link_and_stops() {
+        // Scenario · wall · steps · rates asked · payload KB · ms.
+        for (sc, wall, steps, first, last, max_kb, max_ms) in [
+            (with_ramp(lan_1g()), false, 9, 5_000, 1_066_423, 7_200, 900),
+            (
+                with_ramp(wan_wg_12(0x7A_5500, 180_000)),
+                true,
+                3,
+                5_000,
+                20_000,
+                110,
+                300,
+            ),
+            (
+                with_ramp(wifi_tv_probe_damage()),
+                true,
+                7,
+                5_000,
+                320_000,
+                2_100,
+                700,
+            ),
+        ] {
+            let name = sc.name;
+            let r = run(&sc);
+            let t = &r.ramps[0];
+            let (at_ms, s) = t.done.expect("the ramp stops on its own");
+            assert_eq!(s.wall, wall, "{name}: wall={}", s.wall);
+            assert_eq!(s.steps, steps, "{name}: {:?}", t.asks);
+            assert_eq!(t.asks.first().map(|a| a.1), Some(first), "{name}");
+            assert_eq!(t.asks.last().map(|a| a.1), Some(last), "{name}");
+            assert!(
+                s.asked_bytes / 1_000 <= max_kb,
+                "{name}: the ramp asked for {} KB",
+                s.asked_bytes / 1_000
+            );
+            assert!(at_ms <= max_ms, "{name}: the ramp took {at_ms} ms");
+            // L4: all of it is over before the first frame exists.
+            assert!(
+                at_ms < BRINGUP_MS,
+                "{name}: the ramp ran {at_ms} ms into a {BRINGUP_MS} ms bring-up"
+            );
+        }
     }
 
     /// C1: the G5 reaches its measured ceiling in one climb, no cut on the
@@ -1404,6 +1513,12 @@ mod tests {
             "wave" => host_rebuild_wave(),
             "weak" => encoder_weak(),
             _ => wifi_tv(),
+        };
+        // As the table has it. `SIM_LEGACY=1` reads the calibration instead.
+        let sc = if std::env::var("SIM_LEGACY").is_ok() {
+            sc
+        } else {
+            with_ramp(sc)
         };
         let r = run(&sc);
         for w in &r.windows[0] {

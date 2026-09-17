@@ -27,7 +27,7 @@ mod controller;
 mod growth;
 #[cfg(test)]
 mod harness;
-mod probe;
+pub(crate) mod probe;
 mod sample;
 mod verdict;
 mod window;
@@ -65,8 +65,13 @@ pub struct DriverConfig {
     pub marks_repeats: bool,
     /// Run the startup capacity probe (`PUNKTFUNK_ABR_PROBE`).
     pub probe: bool,
-    /// `PUNKTFUNK_ABR_PROBE_KBPS`. `None` = twice the stream-shape cap.
+    /// `PUNKTFUNK_ABR_PROBE_KBPS`. `None` = twice the stream-shape cap; with
+    /// [`ramp`](Self::ramp) it is the ramp's maximum instead.
     pub probe_target_kbps: Option<u32>,
+    /// Host serves probe requests during bring-up
+    /// ([`HOST_CAP2_RAMP`](crate::quic::HOST_CAP2_RAMP)): measure the link
+    /// before the first frame instead of bursting beside it.
+    pub ramp: bool,
 }
 
 /// What the embedder has to do for the controller. Everything else it does
@@ -80,8 +85,14 @@ pub enum Action {
     Delivery(u64),
     /// Ask the host for a new encoder rate.
     SetBitrate(u32),
-    /// Ask for a capacity burst beside the video.
-    Probe { target_kbps: u32, duration_ms: u32 },
+    /// Ask for a capacity burst. `ramp` = a bring-up step, before any video
+    /// exists: the embedder keeps counting its bytes after the host's report
+    /// lands, because the queue is still draining toward it.
+    Probe {
+        target_kbps: u32,
+        duration_ms: u32,
+        ramp: bool,
+    },
     /// Ask for a keyframe: the picture needs re-anchoring.
     Keyframe,
     /// Let the in-flight probe go — it was never answered. Reports resume.
@@ -141,6 +152,7 @@ impl Driver {
             // A pinned or explicit rate has nothing to measure for.
             probe: probe::CapacityProbe::new(
                 cfg.probe && cfg.start_kbps > 0,
+                cfg.ramp,
                 cfg.probe_target_kbps,
                 cfg.stream_cap_kbps,
                 now,
@@ -254,7 +266,9 @@ impl Driver {
             return;
         };
         self.window.rebase(now);
-        if frames_completed == frames_at_start {
+        // A ramp step runs before any picture exists, so there is no
+        // reference for it to have taken.
+        if frames_at_start > 0 && frames_completed == frames_at_start {
             self.pending.push(Action::Keyframe);
             tracing::warn!(
                 "no frame survived the capacity probe — requested a keyframe to re-anchor"
@@ -262,9 +276,10 @@ impl Driver {
         }
     }
 
-    /// The host's end-of-burst report.
-    pub fn on_probe_result(&mut self, r: ProbeReport) {
-        match self.probe.on_result(r) {
+    /// The host's end-of-burst report. A ramp step is still draining when it
+    /// lands, so the ramp folds every re-presentation in until the bytes stop.
+    pub fn on_probe_result(&mut self, r: ProbeReport, now: Instant) {
+        match self.probe.on_result(r, now) {
             probe::Measured::NotOurs => return,
             probe::Measured::Declined => {}
             probe::Measured::Ceiling(kbps) => self.set_ceiling(kbps),
@@ -272,6 +287,12 @@ impl Driver {
         // Skips video that landed under a suppressed report tick; `rebase`
         // already netted the filler out.
         self.window.rebase_bytes();
+    }
+
+    /// What the bring-up ramp came to, once it has stopped.
+    #[cfg(test)]
+    pub(crate) fn ramp_summary(&self) -> Option<probe::RampSummary> {
+        self.probe.ramp_summary()
     }
 
     /// What the last judged window was, and so what named the last rate
@@ -292,6 +313,24 @@ impl Driver {
         self.window.discard();
     }
 
+    /// What the bring-up ramp proved, applied once.
+    ///
+    /// A wall is a measured link capacity and binds like any other. No wall
+    /// means the ramp asked for everything this stream can use and the link
+    /// gave it: the stream shape is the only bound left, so authority goes
+    /// there. Nothing measured at all licenses nothing.
+    fn on_ramped(&mut self, ramped: probe::Ramped) {
+        match ramped {
+            probe::Ramped::Wall { delivered_kbps } => {
+                self.set_ceiling(probe::wall_ceiling_kbps(delivered_kbps));
+            }
+            probe::Ramped::NoWall { proven_kbps } if proven_kbps > 0 => {
+                self.set_ceiling(u32::MAX);
+            }
+            probe::Ramped::NoWall { .. } => {}
+        }
+    }
+
     /// Everything the session owes right now. Called every embedder
     /// iteration; the report window closes inside it, on its own cadence.
     pub fn tick(&mut self, now: Instant) -> Tick {
@@ -299,13 +338,18 @@ impl Driver {
         if self.probe.expired(now) {
             actions.push(Action::AbandonProbe);
         }
+        let ramping = self.probe.ramping();
         if let Some((target_kbps, duration_ms)) =
             self.probe.poll(now, self.window.stats().frames_completed)
         {
             actions.push(Action::Probe {
                 target_kbps,
                 duration_ms,
+                ramp: ramping,
             });
+        }
+        if let Some(ramped) = self.probe.take_ramped() {
+            self.on_ramped(ramped);
         }
         if !self.window.due(now, self.probe.active()) {
             return Tick {
@@ -444,6 +488,7 @@ mod tests {
                 marks_repeats: true,
                 probe: true,
                 probe_target_kbps: Some(400_000),
+                ramp: false,
             },
             base,
         );
@@ -487,13 +532,14 @@ mod tests {
             window_ms: burst_ms,
             host_duration_ms: burst_ms,
             client_interval_ms: burst_ms,
+            ..ProbeReport::default()
         };
         let mut windows = Vec::new();
         for ms in done_ms..done_ms + 2_000 {
             deliver(&mut st, ms);
             d.on_stats(&st);
             d.on_probe_active(false, burst_ms, at(ms));
-            d.on_probe_result(report);
+            d.on_probe_result(report, at(ms));
             if ms % 16 == 0 {
                 d.on_au(false);
             }

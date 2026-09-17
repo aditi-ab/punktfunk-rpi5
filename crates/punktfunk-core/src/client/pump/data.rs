@@ -55,6 +55,10 @@ pub(super) struct DataPump {
     /// Host marks idle-keepalive repeats (`USER_FLAG_REPEAT` / Welcome
     /// [`crate::quic::HOST_CAP2_REPEAT_MARK`]).
     pub(super) marks_repeats: bool,
+    /// Host serves probe requests during its own bring-up
+    /// ([`crate::quic::HOST_CAP2_RAMP`]): the link is measured before the
+    /// first frame instead of burst at beside it.
+    pub(super) serves_ramp: bool,
     /// Audio-plane wire reservation, spent whether video flows or not.
     pub(super) audio_reserved_kbps: u32,
     /// Mode+codec ceiling ([`crate::abr::stream_ceiling_kbps`]) for the
@@ -93,6 +97,7 @@ impl DataPump {
             bit_depth,
             chroma_format,
             marks_repeats,
+            serves_ramp,
             audio_reserved_kbps,
             stream_cap_kbps,
             refresh_hz,
@@ -131,6 +136,7 @@ impl DataPump {
                 marks_repeats,
                 probe: std::env::var("PUNKTFUNK_ABR_PROBE").map_or(true, |v| v != "0"),
                 probe_target_kbps: env_u32("PUNKTFUNK_ABR_PROBE_KBPS"),
+                ramp: serves_ramp,
             },
             Instant::now(),
         );
@@ -234,18 +240,28 @@ impl DataPump {
                     };
                     p.base_packets.get_or_insert(st.probe_packets_received);
                     p.base_bytes.get_or_insert(st.probe_bytes_received);
+                } else if p.done && p.ramp {
+                    // The host's report rides the control stream and the
+                    // filler rides the data plane, so it can arrive while the
+                    // bottleneck queue is still handing us the step. Keep
+                    // counting: the ramp reads the drain, not the send window.
+                    p.refresh_delivered(&st);
                 }
                 let report = p.done.then(|| ProbeReport {
                     delivered_bytes: p.delivered_bytes,
+                    delivered_packets: p.delivered_packets,
                     window_ms: p.throughput_window_ms(p.delivered_packets),
                     host_duration_ms: p.host_duration_ms,
                     client_interval_ms: p.client_interval_ms,
+                    host_bytes_sent: p.host_goodput_bytes,
+                    wire_packets_sent: p.host_wire_packets,
+                    send_dropped: p.host_send_dropped,
                 });
                 (p.active && !p.done, p.duration_ms, report)
             };
             abr.on_probe_active(probe_active, probe_duration_ms, Instant::now());
             if let Some(r) = probe_report {
-                abr.on_probe_result(r);
+                abr.on_probe_result(r, Instant::now());
             }
             let mg = pump_mode_gen.load(Ordering::Relaxed);
             if mg != seen_mode_gen {
@@ -296,12 +312,14 @@ impl DataPump {
                     Action::Probe {
                         target_kbps,
                         duration_ms,
+                        ramp,
                     } => {
                         // One ProbeState, no correlation id — do not clobber
                         // an embedder speed test.
                         *pump_probe.lock().unwrap() = ProbeState {
                             active: true,
                             duration_ms,
+                            ramp,
                             ..Default::default()
                         };
                         if ctrl_tx
@@ -723,6 +741,7 @@ mod tests {
             bit_depth: 8,
             chroma_format: 0,
             marks_repeats: false,
+            serves_ramp: false,
             audio_reserved_kbps: 256,
             stream_cap_kbps: 100_000,
             refresh_hz: 60,
