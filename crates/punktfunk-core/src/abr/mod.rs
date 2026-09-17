@@ -138,6 +138,11 @@ pub struct Driver {
     pending: Vec<Action>,
     /// Acks since the last window closed, with the reason each carried.
     acks: Vec<(u32, Option<crate::quic::AckReason>)>,
+    /// Picture AUs the embedder has forwarded. `Stats::frames_completed`
+    /// cannot answer "has video started": it counts the measurement's own
+    /// filler AUs too (`session.rs` completes an AU without asking whose
+    /// index space it is in).
+    video_aus: u64,
 }
 
 impl Driver {
@@ -166,6 +171,7 @@ impl Driver {
             chroma_format: cfg.chroma_format,
             pending: Vec::new(),
             acks: Vec::new(),
+            video_aus: 0,
         }
     }
 
@@ -175,7 +181,10 @@ impl Driver {
     }
 
     /// One completed access unit; `repeat` is the host's idle keepalive mark.
+    /// The embedder calls this for picture only — filler never reaches it —
+    /// which is what makes it the ramp's "video has started" signal.
     pub fn on_au(&mut self, repeat: bool) {
+        self.video_aus += 1;
         self.window.on_au(repeat);
     }
 
@@ -271,9 +280,9 @@ impl Driver {
             return;
         };
         self.window.rebase(now);
-        // A ramp step runs before any picture exists, so there is no
-        // reference for it to have taken.
-        if frames_at_start > 0 && frames_completed == frames_at_start {
+        // A ramp session never bursts beside video: its steps run before a
+        // picture exists, so none of them can have taken a reference.
+        if !self.probe.has_ramp() && frames_completed == frames_at_start {
             self.pending.push(Action::Keyframe);
             tracing::warn!(
                 "no frame survived the capacity probe — requested a keyframe to re-anchor"
@@ -355,7 +364,8 @@ impl Driver {
         }
         let ramping = self.probe.ramping();
         if let Some((target_kbps, duration_ms)) =
-            self.probe.poll(now, self.window.stats().frames_completed)
+            self.probe
+                .poll(now, self.window.stats().frames_completed, self.video_aus)
         {
             actions.push(Action::Probe {
                 target_kbps,
@@ -479,6 +489,171 @@ pub(crate) fn stream_ceiling_kbps(
 mod tests {
     use super::*;
     use crate::stats::Stats;
+
+    /// The bring-up ramp, driven the way the pump drives it: the step's own
+    /// filler AUs complete and move `Stats::frames_completed`, the host's
+    /// report lands after the bytes it describes, and picture arrives as
+    /// [`Driver::on_au`].
+    ///
+    /// The counter is the trap this pins. `frames_completed` cannot mean
+    /// "video has started" — the reassembler completes a filler AU without
+    /// asking whose index space it is in (`session.rs`), so a 5 Mbps step
+    /// moves it six times inside 25 ms. Reading it that way ended the ramp
+    /// one tick after its first step, before that step's own report arrived:
+    /// 40 of 40 runs on the rig, every profile, `proven_kbps=0`.
+    #[test]
+    fn the_ramp_steps_until_video_arrives() {
+        /// Header plus shard, as the reassembler counts a filler packet.
+        const WIRE: u64 = 1_448;
+        /// The host chunks filler into AUs; six of them make a 5 Mbps step.
+        const PACKETS_PER_AU: u64 = 2;
+        /// The report rides the control stream and lands after the burst.
+        const REPORT_LAG_MS: u64 = 5;
+
+        struct Step {
+            target_kbps: u32,
+            duration_ms: u64,
+            last_filler_ms: u64,
+            report_at_ms: u64,
+            packets: u64,
+            first_ms: u64,
+        }
+
+        let base = Instant::now();
+        let at = |ms: u64| base + std::time::Duration::from_millis(ms);
+        let mut d = Driver::new(
+            DriverConfig {
+                start_kbps: 20_000,
+                ceiling_cap_kbps: None,
+                stream_cap_kbps: 200_000,
+                refresh_hz: 60,
+                codec: crate::quic::CODEC_HEVC,
+                bit_depth: 8,
+                chroma_format: crate::quic::CHROMA_IDC_420,
+                audio_reserved_kbps: 0,
+                marks_repeats: true,
+                probe: true,
+                probe_target_kbps: None,
+                ramp: true,
+            },
+            base,
+        );
+        let mut st = Stats::default();
+        let mut step: Option<Step> = None;
+        let mut asked: Vec<(u64, u32)> = Vec::new();
+        let mut opened_at: Option<(u64, u32)> = None;
+        let mut completed_when_asked: Vec<u64> = Vec::new();
+        // Video starts once two steps are done — a bring-up the ramp fits in.
+        let mut video_from_ms = u64::MAX;
+        let mut first_au_ms = u64::MAX;
+
+        for ms in 0..600 {
+            // The link hands the filler over while the step runs.
+            if let Some(s) = step.as_mut() {
+                if ms <= s.last_filler_ms {
+                    s.packets += 1;
+                    if s.first_ms == 0 {
+                        s.first_ms = ms;
+                    }
+                    st.packets_received += 1;
+                    st.probe_packets_received += 1;
+                    st.bytes_received += WIRE;
+                    st.probe_bytes_received += WIRE;
+                    if s.packets % PACKETS_PER_AU == 0 {
+                        st.frames_completed += 1;
+                    }
+                }
+            }
+            d.on_stats(&st);
+            let probing = step.as_ref().is_some_and(|s| ms < s.report_at_ms);
+            d.on_probe_active(probing, 25, at(ms));
+            if let Some(s) = step.as_ref() {
+                if ms >= s.report_at_ms {
+                    let interval = ms.min(s.last_filler_ms).saturating_sub(s.first_ms).max(1);
+                    d.on_probe_result(
+                        ProbeReport {
+                            delivered_bytes: s.packets * WIRE,
+                            delivered_packets: s.packets,
+                            window_ms: interval as u32,
+                            host_duration_ms: s.duration_ms as u32,
+                            client_interval_ms: interval as u32,
+                            host_bytes_sent: u64::from(s.target_kbps) * s.duration_ms / 8,
+                            wire_packets_sent: s.packets as u32,
+                            send_dropped: 0,
+                        },
+                        at(ms),
+                    );
+                }
+            }
+            for action in d.tick(at(ms)).actions {
+                match action {
+                    Action::Probe {
+                        target_kbps,
+                        duration_ms,
+                        ramp,
+                    } => {
+                        assert!(ramp, "a bring-up step must be marked as one");
+                        asked.push((ms, target_kbps));
+                        completed_when_asked.push(st.frames_completed);
+                        step = Some(Step {
+                            target_kbps,
+                            duration_ms: u64::from(duration_ms),
+                            last_filler_ms: ms + u64::from(duration_ms),
+                            report_at_ms: ms + u64::from(duration_ms) + REPORT_LAG_MS,
+                            packets: 0,
+                            first_ms: 0,
+                        });
+                        if asked.len() == 2 {
+                            video_from_ms = ms + u64::from(duration_ms) + 60;
+                        }
+                    }
+                    Action::SetBitrate(kbps) => opened_at = Some((ms, kbps)),
+                    _ => {}
+                }
+            }
+            // Picture, which is the only thing that reaches `on_au`.
+            if ms >= video_from_ms && ms % 16 == 0 {
+                first_au_ms = first_au_ms.min(ms);
+                d.on_au(false);
+            }
+        }
+
+        assert!(
+            asked.len() >= 2,
+            "the ramp took {} step(s): {asked:?}",
+            asked.len()
+        );
+        assert_eq!(asked[1].1, asked[0].1 * 2, "each step doubles the rate");
+        let first = step_report_time(&asked, 0);
+        assert!(
+            asked[1].0 > first,
+            "step two went out at {} ms, before step one's report at {first} ms",
+            asked[1].0
+        );
+        assert!(
+            completed_when_asked[1] > 0,
+            "the filler must have completed AUs by then, or this pins nothing"
+        );
+        let (opened_ms, opened_kbps) = opened_at.expect("the ramp opens the session");
+        assert!(
+            opened_kbps > 0 && opened_kbps != 20_000,
+            "the session opens at what was measured, not the negotiated rate"
+        );
+        assert!(
+            asked.iter().all(|&(ms, _)| ms <= first_au_ms),
+            "no step may go out once picture has started: {asked:?}"
+        );
+        assert!(
+            opened_ms <= first_au_ms + 2,
+            "the ramp's verdict is spent at once: opened at {opened_ms} ms, first \
+             picture at {first_au_ms} ms"
+        );
+    }
+
+    /// When step `i`'s report reached the client, in the test above.
+    fn step_report_time(asked: &[(u64, u32)], i: usize) -> u64 {
+        asked[i].0 + 25 + 5
+    }
 
     /// Video that arrives after the startup burst is what the window
     /// measures.

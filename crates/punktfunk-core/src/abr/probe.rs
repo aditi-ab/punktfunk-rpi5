@@ -405,9 +405,22 @@ impl CapacityProbe {
     /// Fire what is due: the next ramp step, or the legacy burst once video
     /// is actually flowing. A slow host bring-up is still emitting its first
     /// IDR, so the burst waits another delay.
-    pub(crate) fn poll(&mut self, now: Instant, frames_completed: u64) -> Option<(u32, u32)> {
+    ///
+    /// Two counts, deliberately. `frames_completed` is the session's, which
+    /// includes the burst's own filler AUs — the reassembler has no
+    /// probe/video split at the completion (`session.rs`). `video_aus` is what
+    /// the embedder forwarded as picture. The legacy burst reads the first
+    /// because that is what it has always read and no filler exists before it;
+    /// the ramp must read the second, because its own filler would otherwise
+    /// end it one tick after its first step.
+    pub(crate) fn poll(
+        &mut self,
+        now: Instant,
+        frames_completed: u64,
+        video_aus: u64,
+    ) -> Option<(u32, u32)> {
         if self.ramp.is_some() {
-            return self.poll_ramp(now, frames_completed);
+            return self.poll_ramp(now, video_aus);
         }
         let due = self.fire_at.is_some_and(|at| now >= at);
         if !due {
@@ -430,12 +443,12 @@ impl CapacityProbe {
     /// One ramp step per call: the first, or the next once the last drained.
     /// The first video frame ends the ramp wherever it stands — from then on
     /// nothing the controller does may cost a frame.
-    fn poll_ramp(&mut self, now: Instant, frames_completed: u64) -> Option<(u32, u32)> {
+    fn poll_ramp(&mut self, now: Instant, video_aus: u64) -> Option<(u32, u32)> {
         let r = self.ramp.as_mut()?;
         if r.done {
             return None;
         }
-        if frames_completed > 0 {
+        if video_aus > 0 {
             r.no_wall();
             return None;
         }
@@ -512,6 +525,11 @@ impl CapacityProbe {
     /// The next burst this fires would be a ramp step.
     pub(crate) fn ramping(&self) -> bool {
         self.ramp.as_ref().is_some_and(|r| !r.done)
+    }
+
+    /// This session measures with a ramp, so it never bursts beside video.
+    pub(crate) fn has_ramp(&self) -> bool {
+        self.ramp.is_some()
     }
 
     /// The host's end-of-burst report. A ramp step folds it in (the bytes are
@@ -609,6 +627,9 @@ mod tests {
         asked: Vec<u32>,
         /// The step `settle` armed while answering the last one.
         pending: Option<(u32, u32)>,
+        /// `Stats::frames_completed`, which the filler moves like any other
+        /// AU. The ramp must not read it as video.
+        completed: u64,
     }
 
     impl Rig {
@@ -619,6 +640,7 @@ mod tests {
                 now,
                 asked: Vec::new(),
                 pending: None,
+                completed: 0,
             }
         }
 
@@ -631,7 +653,11 @@ mod tests {
         /// sender that manages `sender_kbps` of what was asked.
         fn step(&mut self, capacity_kbps: u32, sender_kbps: u32) -> Option<Ramped> {
             let now = self.now;
-            let Some((target, duration_ms)) = self.pending.take().or_else(|| self.p.poll(now, 0))
+            let completed = self.completed;
+            let Some((target, duration_ms)) = self
+                .pending
+                .take()
+                .or_else(|| self.p.poll(now, completed, 0))
             else {
                 return self.p.take_ramped();
             };
@@ -653,9 +679,12 @@ mod tests {
                 send_dropped: 0,
             };
             let at = self.at(u64::from(interval));
+            // Every filler AU completes, exactly as the session counts it.
+            self.completed += packets;
             self.p.on_result(r, at);
             let at = self.at(RAMP_DRAIN_MS + 1);
-            self.pending = self.p.poll(at, 0);
+            let completed = self.completed;
+            self.pending = self.p.poll(at, completed, 0);
             self.p.take_ramped()
         }
 
@@ -747,8 +776,11 @@ mod tests {
         let mut rig = Rig::new(1_000_000, None);
         assert_eq!(rig.step(1_000_000, u32::MAX), None);
         assert!(rig.pending.is_some(), "a second step went out");
-        let now = rig.now;
-        assert!(rig.p.poll(now, 1).is_none(), "no step once video is here");
+        let (now, completed) = (rig.now, rig.completed);
+        assert!(
+            rig.p.poll(now, completed, 1).is_none(),
+            "no step once video is here"
+        );
         let Some(Ramped::NoWall { proven_kbps }) = rig.p.take_ramped() else {
             panic!("the first frame ends the ramp with what it had")
         };
@@ -760,7 +792,7 @@ mod tests {
     #[test]
     fn an_unanswered_step_ends_the_ramp() {
         let mut rig = Rig::new(100_000, None);
-        rig.p.poll(rig.now, 0).expect("the first step goes out");
+        rig.p.poll(rig.now, 0, 0).expect("the first step goes out");
         let at = rig.at(RAMP_STEP_TIMEOUT.as_millis() as u64 + 1);
         assert!(rig.p.expired(at), "the pump's probe state must be released");
         assert_eq!(
@@ -776,7 +808,7 @@ mod tests {
     #[test]
     fn a_step_ends_on_the_clients_drain() {
         let mut rig = Rig::new(1_000_000, None);
-        let (target, duration_ms) = rig.p.poll(rig.now, 0).expect("the first step");
+        let (target, duration_ms) = rig.p.poll(rig.now, 0, 0).expect("the first step");
         let mut r = ProbeReport {
             delivered_packets: 2,
             delivered_bytes: 2 * 1_448,
@@ -794,14 +826,14 @@ mod tests {
             r.delivered_bytes += 2 * 1_448;
             rig.p.on_result(r, at);
             assert!(
-                rig.p.poll(at, 0).is_none(),
+                rig.p.poll(at, 0, 0).is_none(),
                 "a step whose bytes are still arriving is not over"
             );
         }
         let at = rig.at(RAMP_DRAIN_MS + 1);
         rig.p.on_result(r, at);
         assert!(
-            rig.p.poll(at, 0).is_some(),
+            rig.p.poll(at, 0, 0).is_some(),
             "and once they stop, the next step goes out"
         );
     }
@@ -812,7 +844,7 @@ mod tests {
     #[test]
     fn a_step_still_in_the_queue_is_not_a_step_that_delivered_nothing() {
         let mut rig = Rig::new(46_656, None);
-        let (target, duration_ms) = rig.p.poll(rig.now, 0).expect("the first step");
+        let (target, duration_ms) = rig.p.poll(rig.now, 0, 0).expect("the first step");
         // The host says it is done; not one byte has reached us yet.
         let empty = ProbeReport {
             window_ms: duration_ms,
@@ -824,7 +856,7 @@ mod tests {
         for _ in 0..8 {
             let at = rig.at(RAMP_DRAIN_MS * 2);
             rig.p.on_result(empty, at);
-            assert!(rig.p.poll(at, 0).is_none(), "the step is not over");
+            assert!(rig.p.poll(at, 0, 0).is_none(), "the step is not over");
             assert_eq!(rig.p.take_ramped(), None, "and the ramp has no verdict");
         }
         // The queue hands them over, late and stretched: that is the wall.
@@ -839,7 +871,7 @@ mod tests {
             at,
         );
         let at = rig.at(RAMP_DRAIN_MS + 1);
-        rig.p.poll(at, 0);
+        rig.p.poll(at, 0, 0);
         assert!(
             matches!(rig.p.take_ramped(), Some(Ramped::Wall { .. })),
             "a step that took four times its window is a wall"
@@ -854,7 +886,7 @@ mod tests {
     fn a_finished_burst_is_measured_exactly_once() {
         let now = Instant::now();
         let mut p = CapacityProbe::new(true, false, Some(400_000), 100_000, now);
-        assert_eq!(p.poll(now + PROBE_DELAY, 1), Some((400_000, PROBE_MS)));
+        assert_eq!(p.poll(now + PROBE_DELAY, 1, 1), Some((400_000, PROBE_MS)));
         // 1 MB over 800 ms is 10 Mbps; the ceiling keeps 70 % of it.
         assert_eq!(
             p.on_result(report(1_000_000, 800), now),
@@ -873,10 +905,16 @@ mod tests {
     fn an_old_host_still_gets_the_legacy_burst() {
         let now = Instant::now();
         let mut p = CapacityProbe::new(true, false, None, 100_000, now);
-        assert!(p.poll(now, 0).is_none(), "nothing goes out during bring-up");
-        assert!(p.poll(now + PROBE_DELAY, 0).is_none(), "nor before video");
+        assert!(
+            p.poll(now, 0, 0).is_none(),
+            "nothing goes out during bring-up"
+        );
+        assert!(
+            p.poll(now + PROBE_DELAY, 0, 0).is_none(),
+            "nor before video"
+        );
         assert_eq!(
-            p.poll(now + 2 * PROBE_DELAY, 1),
+            p.poll(now + 2 * PROBE_DELAY, 1, 1),
             Some((probe_target_kbps(100_000), PROBE_MS))
         );
         assert_eq!(p.take_ramped(), None, "no ramp ran, so none has a verdict");
@@ -887,8 +925,8 @@ mod tests {
     fn a_disabled_probe_neither_ramps_nor_bursts() {
         let now = Instant::now();
         let mut p = CapacityProbe::new(false, true, None, 100_000, now);
-        assert!(p.poll(now, 0).is_none());
-        assert!(p.poll(now + PROBE_DELAY, 1).is_none());
+        assert!(p.poll(now, 0, 0).is_none());
+        assert!(p.poll(now + PROBE_DELAY, 1, 1).is_none());
         assert_eq!(p.take_ramped(), None);
         assert!(!p.ramping());
     }
