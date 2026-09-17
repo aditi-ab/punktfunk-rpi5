@@ -62,7 +62,7 @@ pub(super) const BASELINE_MIN_WINDOWS: usize = 4;
 /// A window nothing flagged is [`Clean`](Self::Clean), or [`Quiet`](Self::Quiet)
 /// when there was no new content to judge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Reason {
+pub enum Reason {
     Clean,
     Quiet,
     LostFrame,

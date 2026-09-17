@@ -7,7 +7,7 @@
 
 /// One report window: the pump's tick, the controller's unit of time, and
 /// the cadence the host reads a missing loss report against.
-pub(crate) const WINDOW: std::time::Duration = std::time::Duration::from_micros(WINDOW_US as u64);
+pub const WINDOW: std::time::Duration = std::time::Duration::from_micros(WINDOW_US as u64);
 /// The same, in µs, where the arithmetic is integer.
 pub(crate) const WINDOW_US: i64 = 750_000;
 
@@ -20,7 +20,7 @@ pub(crate) const WINDOW_US: i64 = 750_000;
 /// flags repeats: wall-clock arithmetic, never idle. The pump never maps an
 /// empty receive window onto [`Unmarked`](Self::Unmarked).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WindowActivity {
+pub enum WindowActivity {
     /// Host does not mark repeats. Wall-clock; never idle.
     Unmarked,
     /// No AU completed. Quiet like idle; does not count toward re-arm.
@@ -31,12 +31,12 @@ pub(crate) enum WindowActivity {
 
 impl WindowActivity {
     /// Every arrived AU was a host-marked repeat.
-    pub(crate) fn idle(self) -> bool {
+    pub fn idle(self) -> bool {
         matches!(self, Self::Active(0))
     }
 
     /// No new-content evidence: skip climb, baselines, re-probe.
-    pub(crate) fn quiet(self) -> bool {
+    pub fn quiet(self) -> bool {
         matches!(self, Self::Empty | Self::Active(0))
     }
 }
@@ -48,7 +48,7 @@ impl WindowActivity {
 /// domain as the target. `dropped` counts unrecoverable frames, `flushed` is
 /// a jump-to-live, `recovery_kf` the decode-recovery keyframe asks.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct WindowSample {
+pub struct WindowSample {
     pub now: std::time::Instant,
     pub dropped: u64,
     pub loss_ppm: u32,

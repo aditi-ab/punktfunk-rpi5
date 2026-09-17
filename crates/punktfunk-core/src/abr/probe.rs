@@ -22,7 +22,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What the burst delivered, as the pump's probe state froze it.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ProbeReport {
+pub struct ProbeReport {
     /// Wire bytes (header plus shard) the burst delivered. `0` = declined.
     pub delivered_bytes: u64,
     /// Throughput denominator: the client receive interval when the burst
