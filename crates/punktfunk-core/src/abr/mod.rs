@@ -126,6 +126,9 @@ pub struct Driver {
     abr: BitrateController,
     window: window::WindowAccumulator,
     probe: probe::CapacityProbe,
+    /// What this mode can use. A mode switch recomputes it; the ramp's start
+    /// rate is a share of it.
+    stream_cap_kbps: u32,
     /// A mode switch changes the geometry, not these.
     codec: u8,
     bit_depth: u8,
@@ -157,6 +160,7 @@ impl Driver {
                 cfg.stream_cap_kbps,
                 now,
             ),
+            stream_cap_kbps: cfg.stream_cap_kbps,
             codec: cfg.codec,
             bit_depth: cfg.bit_depth,
             chroma_format: cfg.chroma_format,
@@ -240,15 +244,16 @@ impl Driver {
     pub fn on_mode_switch(&mut self, width: u32, height: u32, refresh_hz: u32) {
         self.abr.on_mode_switch();
         self.abr.set_frame_budget(refresh_hz);
-        // Rebinds an already-learned ceiling downward for the new geometry.
-        self.abr.set_stream_cap(stream_ceiling_kbps(
+        self.stream_cap_kbps = stream_ceiling_kbps(
             width,
             height,
             refresh_hz,
             self.codec,
             self.bit_depth,
             self.chroma_format,
-        ));
+        );
+        // Rebinds an already-learned ceiling downward for the new geometry.
+        self.abr.set_stream_cap(self.stream_cap_kbps);
     }
 
     /// A burst went in or out of flight — ours or an embedder speed test.
@@ -313,22 +318,27 @@ impl Driver {
         self.window.discard();
     }
 
-    /// What the bring-up ramp proved, applied once.
+    /// What the bring-up ramp proved, applied once: the authority first, then
+    /// the rate the session opens at.
     ///
     /// A wall is a measured link capacity and binds like any other. No wall
     /// means the ramp asked for everything this stream can use and the link
     /// gave it: the stream shape is the only bound left, so authority goes
     /// there. Nothing measured at all licenses nothing.
-    fn on_ramped(&mut self, ramped: probe::Ramped) {
-        match ramped {
+    fn on_ramped(&mut self, ramped: probe::Ramped, now: Instant) -> Option<u32> {
+        let proven_kbps = match ramped {
             probe::Ramped::Wall { delivered_kbps } => {
                 self.set_ceiling(probe::wall_ceiling_kbps(delivered_kbps));
+                delivered_kbps
             }
             probe::Ramped::NoWall { proven_kbps } if proven_kbps > 0 => {
-                self.set_ceiling(u32::MAX);
+                self.set_ceiling(self.stream_cap_kbps);
+                proven_kbps
             }
-            probe::Ramped::NoWall { .. } => {}
-        }
+            probe::Ramped::NoWall { .. } => return None,
+        };
+        let start = probe::ramp_start_kbps(proven_kbps, self.stream_cap_kbps);
+        self.abr.start_from_measurement(start, now)
     }
 
     /// Everything the session owes right now. Called every embedder
@@ -349,7 +359,9 @@ impl Driver {
             });
         }
         if let Some(ramped) = self.probe.take_ramped() {
-            self.on_ramped(ramped);
+            if let Some(kbps) = self.on_ramped(ramped, now) {
+                actions.push(Action::SetBitrate(kbps));
+            }
         }
         if !self.window.due(now, self.probe.active()) {
             return Tick {

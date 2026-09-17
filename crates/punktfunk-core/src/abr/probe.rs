@@ -41,6 +41,11 @@ const RAMP_STEP_BYTES: u64 = 3_000_000;
 const RAMP_WALL_PCT: u64 = 90;
 /// What a wall licenses: the ceiling sits under what the link delivered.
 const RAMP_CEILING_PCT: u32 = 85;
+/// The session opens at this share of what the ramp proved.
+const RAMP_START_PCT: u32 = 50;
+/// What a clean picture wants, as a divisor of the stream-shape cap: 0.15 bpp
+/// against the cap's 0.75.
+const MODE_RATE_DIV: u32 = 5;
 /// Arrivals quiet this long mean the step has drained out of the receive
 /// buffer and the next step measures its own bytes, not the last one's.
 const RAMP_DRAIN_MS: u64 = 20;
@@ -552,6 +557,17 @@ fn ramp_max_kbps(stream_cap_kbps: u32, env_kbps: Option<u32>) -> u32 {
     env_kbps.map_or(by_stream, |k| k.min(by_stream))
 }
 
+/// What the session opens at, given what the ramp proved: half of it, and
+/// never more than a clean picture at this mode wants. The caller floors it.
+///
+/// A wire budget, like `SetBitrate` and the measurement itself — at the
+/// bottom of the range the two-shard parity floor puts ~25 % of it on FEC,
+/// and mixing the two domains would open every weak link over its wall.
+pub(crate) fn ramp_start_kbps(proven_kbps: u32, stream_cap_kbps: u32) -> u32 {
+    let mode_rate = stream_cap_kbps / MODE_RATE_DIV;
+    mode_rate.min(proven_kbps / (100 / RAMP_START_PCT))
+}
+
 /// The ceiling a wall licenses: under what the link actually delivered.
 pub(crate) fn wall_ceiling_kbps(delivered_kbps: u32) -> u32 {
     (u64::from(delivered_kbps) * u64::from(RAMP_CEILING_PCT) / 100) as u32
@@ -913,10 +929,19 @@ mod tests {
         }
     }
 
-    /// A wall licenses a ceiling under what the link actually delivered.
+    /// A wall licenses a ceiling under what the link actually delivered, and
+    /// the session opens at the smaller of half that and what the mode wants.
     #[test]
     fn a_wall_licenses_less_than_it_delivered() {
         assert_eq!(wall_ceiling_kbps(12_500), 10_625);
         assert_eq!(wall_ceiling_kbps(1_000_000), 850_000);
+
+        let cap_1080p60 =
+            super::super::stream_ceiling_kbps(1920, 1080, 60, CODEC_HEVC, 8, CHROMA_IDC_420);
+        // A fat link: the mode's own want binds, at ~0.15 bpp.
+        assert_eq!(ramp_start_kbps(400_000, cap_1080p60), cap_1080p60 / 5);
+        assert!((18_000..20_000).contains(&ramp_start_kbps(400_000, cap_1080p60)));
+        // A 12.5 Mbps wall: half of what was delivered binds instead.
+        assert_eq!(ramp_start_kbps(12_500, cap_1080p60), 6_250);
     }
 }

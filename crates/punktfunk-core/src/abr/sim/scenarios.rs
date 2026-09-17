@@ -1503,6 +1503,7 @@ mod tests {
             "c3" => slow_start_spent(),
             "c4" => gpu_saturated(),
             "c5" => wan_wg_12(0x5000, 720_000),
+            "newcomer" => shared_newcomer(),
             "c6" => wifi_tv_probe_damage(),
             "knee" => decoder_knee(),
             "starved" => starved_client(),
@@ -1521,6 +1522,9 @@ mod tests {
             with_ramp(sc)
         };
         let r = run(&sc);
+        for (i, t) in r.ramps.iter().enumerate() {
+            println!("session {i} ramp {:?} asks={:?}", t.done, t.asks);
+        }
         for w in &r.windows[0] {
             println!(
                 "t={:6} rate={:7} actual={:7} drop={} kf={} cut={:?} disc={} dis={}",

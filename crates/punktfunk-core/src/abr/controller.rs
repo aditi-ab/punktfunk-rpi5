@@ -262,6 +262,28 @@ impl BitrateController {
         }
     }
 
+    /// Open the session at what the bring-up ramp measured, instead of the
+    /// rate the Welcome resolved blind. `None` = nothing to ask for.
+    ///
+    /// Floored and clamped like any other ask. The caller sets the ceiling
+    /// first, so a measured start is never above the authority that measured
+    /// it.
+    pub(crate) fn start_from_measurement(&mut self, kbps: u32, now: Instant) -> Option<u32> {
+        let kbps = kbps
+            .max(self.floor_kbps)
+            .min(self.ceiling_cap_kbps.unwrap_or(u32::MAX))
+            .min(self.ceiling_kbps);
+        if !self.enabled || kbps == self.current_kbps {
+            return None;
+        }
+        tracing::info!(
+            from_kbps = self.current_kbps,
+            to_kbps = kbps,
+            "adaptive bitrate: opening the session at what the ramp measured"
+        );
+        self.request(kbps, now)
+    }
+
     /// Bound future learned ceilings (same funnel as the env cap). The first
     /// set leaves a negotiated start above it standing. A re-set is a mode
     /// switch: a drop in pixel rate rebinds the standing ceiling because
