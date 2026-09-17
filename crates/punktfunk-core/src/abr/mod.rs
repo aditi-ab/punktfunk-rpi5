@@ -11,7 +11,8 @@
 //! One module per concern: [`window`] assembles a report window, [`sample`]
 //! is the closed window, [`verdict`] scores it, [`cap`] holds the learned
 //! bounds, [`growth`] the climb law, [`probe`] the startup capacity burst,
-//! and [`controller`] the state they all move. `sim/` drives this same
+//! and [`controller`] the state they all move. [`budget`] is the wire
+//! arithmetic the host shares. `sim/` drives this same
 //! `Driver` against modelled links and pins every decision in a checked-in
 //! baseline.
 
@@ -19,6 +20,7 @@
 #[cfg(test)]
 mod sim;
 
+pub mod budget;
 mod cap;
 mod controller;
 mod growth;

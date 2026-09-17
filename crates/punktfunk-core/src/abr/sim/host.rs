@@ -1,24 +1,14 @@
 //! Host model: frames at the session fps, the wire-budget arithmetic the host
 //! runs, adaptive FEC, and the send pacer.
 //!
-//! [`encoder_kbps_for_budget`], [`adapt_fec`], [`fec_target`] and
-//! [`auto_burst_bytes`] are copies of the host crate's functions, each naming
-//! its source. WP1 replaces the copies with a shared module.
+//! The budget arithmetic is the shipped [`crate::abr::budget`]; only
+//! [`auto_burst_bytes`] is still a copy of the host's, naming its source.
 
 use super::Rng;
+pub(super) use crate::abr::budget::{
+    adapt_fec, encoder_kbps_for_budget, fec_target, FEC_ADAPTIVE_START, SHARD_WIRE_OVERHEAD,
+};
 
-/// 40-byte header + 24-byte seal in each datagram (`native.rs`
-/// `SHARD_WIRE_OVERHEAD`).
-pub(super) const SHARD_WIRE_OVERHEAD: u64 = 64;
-/// `native.rs` `MIN_BITRATE_KBPS`.
-const MIN_BITRATE_KBPS: u32 = 500;
-/// `native.rs` FEC band, step, and the percent a session opens at before the
-/// first loss report resizes it.
-const FEC_MIN: u8 = 5;
-const FEC_MAX: u8 = 50;
-const FEC_STEP: u8 = 3;
-const FEC_STEP_WINDOWS: u32 = 4;
-const FEC_ADAPTIVE_START: u8 = 10;
 /// `config.rs` `MIN_RECOVERY_SHARDS`, and the `max_data_per_block` the host
 /// negotiates (`native/handshake.rs`). 4 096 means an ordinary frame is one
 /// block, so its whole parity pool covers loss anywhere in it.
@@ -28,42 +18,6 @@ const MAX_DATA_PER_BLOCK: u32 = 4_096;
 const PACE_FACTOR: u64 = 3;
 /// `send_pacing.rs` `MAX_PACE_SPREAD`.
 const MAX_PACE_SPREAD_MS: u64 = 100;
-
-/// Wire budget → encoder rate (`native.rs` `encoder_kbps_for_budget`).
-pub(super) fn encoder_kbps_for_budget(
-    budget_kbps: u32,
-    audio_kbps: u32,
-    fec_percent: u8,
-    shard_payload: u16,
-) -> u32 {
-    let payload = shard_payload.max(1) as u64;
-    let video_wire = budget_kbps.saturating_sub(audio_kbps) as u64;
-    let video =
-        video_wire * payload * 100 / ((payload + SHARD_WIRE_OVERHEAD) * (100 + fec_percent as u64));
-    u32::try_from(video)
-        .unwrap_or(u32::MAX)
-        .max(MIN_BITRATE_KBPS)
-}
-
-/// Loss ppm → recovery percent (`native.rs` `adapt_fec`). Integer here, `f64`
-/// there: `ceil(pct × 1.4) + 1` is `(ppm × 14).div_ceil(100_000) + 1`.
-pub(super) fn adapt_fec(loss_ppm: u32) -> u8 {
-    let target = (loss_ppm as u64 * 14).div_ceil(100_000) as u32 + 1;
-    target.clamp(FEC_MIN as u32, FEC_MAX as u32) as u8
-}
-
-/// One window's FEC target (`native.rs` `fec_target`).
-pub(super) fn fec_target(loss_ppm: u32, prev: u8, unrecovered_run: u32) -> u8 {
-    let step = if (1..=FEC_STEP_WINDOWS).contains(&unrecovered_run) {
-        FEC_STEP
-    } else {
-        0
-    };
-    adapt_fec(loss_ppm)
-        .saturating_add(step)
-        .min(FEC_MAX)
-        .max(prev.saturating_sub(1))
-}
 
 /// Bytes that leave unpaced (`send_pacing.rs` `auto_burst_bytes`).
 pub(super) fn auto_burst_bytes(pace_rate_bps: u64, wire_bytes: usize) -> usize {
