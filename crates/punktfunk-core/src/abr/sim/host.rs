@@ -153,6 +153,11 @@ pub(super) struct HostCfg {
     pub loaded_from_ms: u64,
     pub encode_swing_us: u32,
     pub encode_swing_ms: u64,
+    /// A weak encoder: past `encode_knee_kbps` every extra Mbps of budget
+    /// costs `encode_us_per_mbps` more encode time. Here the rate really is
+    /// the lever, and a notch that keeps it shows up in the next window.
+    pub encode_knee_kbps: u32,
+    pub encode_us_per_mbps: u32,
     /// A keyframe is this many times an ordinary frame.
     pub idr_pct: u32,
     /// How long after a keyframe ask a decodable recovery point reaches the
@@ -181,6 +186,8 @@ impl Default for HostCfg {
             loaded_from_ms: u64::MAX,
             encode_swing_us: 0,
             encode_swing_ms: 1_500,
+            encode_knee_kbps: u32::MAX,
+            encode_us_per_mbps: 0,
             idr_pct: 400,
             recovery_ms: 0,
             content: vec![ContentPhase::default()],
@@ -357,10 +364,13 @@ impl Host {
             self.swing_until_ms = now_ms + self.cfg.encode_swing_ms;
         }
         let swing = if loaded { self.swing_us } else { 0 };
+        // What the rate itself costs this encoder, past where it keeps up.
+        let over_mbps = self.budget_kbps.saturating_sub(self.cfg.encode_knee_kbps) / 1_000;
+        let rate_us = over_mbps.saturating_mul(self.cfg.encode_us_per_mbps);
         if self.cfg.encode_jitter_us == 0 {
-            return base + swing;
+            return base + swing + rate_us;
         }
-        base + swing + self.rng.below(u64::from(self.cfg.encode_jitter_us) + 1) as u32
+        base + swing + rate_us + self.rng.below(u64::from(self.cfg.encode_jitter_us) + 1) as u32
     }
 
     /// Produce this millisecond's frame, if the frame clock fired. A loaded

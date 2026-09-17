@@ -5,9 +5,7 @@
 //! [`on_window`](BitrateController::on_window), so a test reads as the
 //! session it describes rather than as a list of windows.
 
-use super::controller::{
-    BitrateController, DECODE_CAP_SIMILAR_DIV, ENCODE_NOOP_BACKOFFS_TO_DISARM,
-};
+use super::controller::{BitrateController, DECODE_CAP_SIMILAR_DIV};
 use super::sample::{WindowActivity, WindowSample};
 use super::verdict::{BASELINE_MIN_WINDOWS, RECOVERY_KF_SEVERE};
 use std::time::{Duration, Instant};
@@ -86,13 +84,42 @@ pub(super) fn clean_run(c: &mut BitrateController, start: Instant, tick: &mut u3
     }
 }
 
-/// Encode-attributed backoffs at a level ×0.7 never moves, until stand-down.
+/// One notch at a level the rate does not move, then the windows that tell
+/// the driver so: the rate comes back and the driver stands down.
 pub(super) fn disarm_encode(c: &mut BitrateController, start: Instant, tick: &mut u32) {
-    for _ in 0..=ENCODE_NOOP_BACKOFFS_TO_DISARM {
-        let verdict = encode_choke(c, start, tick, 20_000);
-        c.on_ack(verdict.expect("an unanswered encode rise must back off"));
-    }
+    let notch = encode_choke(c, start, tick, 20_000).expect("an encode rise must cost a notch");
+    c.on_ack(notch);
+    let restore = encode_windows(c, start, tick, 20_000, 8).expect("the notch must be judged");
+    assert!(
+        restore > notch,
+        "the rate the encoder never answered comes back"
+    );
+    c.on_ack(restore);
     assert!(c.encode_down.disarmed());
+}
+
+/// Windows carrying `level` until one asks for a rate, at most `n`. Contention
+/// that holds its level whatever the rate looks exactly like this.
+pub(super) fn encode_windows(
+    c: &mut BitrateController,
+    start: Instant,
+    tick: &mut u32,
+    level: i64,
+    n: u32,
+) -> Option<u32> {
+    for _ in 0..n {
+        let at = ticks(start, *tick);
+        *tick += 1;
+        if let Some(k) = c.on_window(&WindowSample {
+            owd_mean_us: Some(10_000),
+            encode_mean_us: Some(level),
+            actual_kbps: 1_000_000,
+            ..WindowSample::at(at)
+        }) {
+            return Some(k);
+        }
+    }
+    None
 }
 
 pub(super) fn calm_window(c: &mut BitrateController, at: Instant) {

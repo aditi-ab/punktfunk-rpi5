@@ -6,6 +6,8 @@
 //! standing limit costs one probe every few minutes, a transient one clears
 //! in twelve seconds. [`StandDown`] is the same clock without a number —
 //! a signal that stopped answering the rate, re-armed by a clean run.
+//! [`StepProbe`] is how a driver finds that out: take one notch, then read
+//! the signal at the new rate before believing the rate was the lever.
 
 /// Clean windows parked at a learned cap before re-probing above it, and the
 /// ceiling that interval backs off to.
@@ -107,6 +109,60 @@ impl LearnedCap {
             self.kbps = Some(lifted);
             (cap, lifted)
         })
+    }
+}
+
+/// Windows at the new rate a step is judged over. Two: one can be the
+/// rebuild's own, and the signal is a mean over a whole window already.
+pub(super) const VERDICT_WINDOWS: u32 = 2;
+/// Windows a step may wait for its rate before the verdict is dropped.
+pub(super) const PROBE_MAX_AGE: u32 = 16;
+
+/// A rate step taken on one signal, waiting for that signal's answer at the
+/// new rate.
+///
+/// The driver that took the step says what the answer means; this holds the
+/// reference, averages the windows that reached the new rate, and bounds the
+/// wait. Both retreats — decode headroom and host encode — are judged on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StepProbe {
+    /// Rate before the step; restored when the step proves nothing.
+    pub(super) from_kbps: u32,
+    /// The signal's mean at `from_kbps`.
+    pub(super) ref_us: i64,
+    windows: u32,
+    sum_us: i64,
+    /// Windows since the step, at any rate.
+    age: u32,
+}
+
+impl StepProbe {
+    pub(super) fn new(from_kbps: u32, ref_us: i64) -> Self {
+        StepProbe {
+            from_kbps,
+            ref_us,
+            windows: 0,
+            sum_us: 0,
+            age: 0,
+        }
+    }
+
+    /// One more window. `mean_us` is the signal at the new rate, or `None`
+    /// when this window says nothing about it — time still passes.
+    /// `Some(mean)` is the verdict, averaged over [`VERDICT_WINDOWS`].
+    pub(super) fn note(&mut self, mean_us: Option<i64>) -> Option<i64> {
+        self.age += 1;
+        if let Some(mean) = mean_us {
+            self.windows += 1;
+            self.sum_us += mean;
+        }
+        (self.windows >= VERDICT_WINDOWS).then(|| self.sum_us / i64::from(self.windows))
+    }
+
+    /// The step never reached its rate: drop the verdict rather than judge a
+    /// rate the session left long ago.
+    pub(super) fn expired(&self) -> bool {
+        self.age >= PROBE_MAX_AGE
     }
 }
 
@@ -396,24 +452,20 @@ mod tests {
     }
 
     #[test]
-    fn unactuatable_encode_rises_disarm_the_down_driver() {
-        // GPU contention holds encode time up; `on_ack` re-seeds the baseline,
-        // so only the firing level notices the backoffs are no-ops.
+    fn an_unanswered_encode_notch_is_given_back_and_disarms_the_driver() {
+        // GPU contention holds encode time up whatever the rate: one notch,
+        // the rate back, and the driver stood down — not three ×0.7 cuts.
         let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         let mut tick = 0;
-
-        // First choke is a legitimate knee sample.
-        assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(14_000));
-        c.on_ack(14_000);
-        // Fires again no lower. One no-op is not a verdict: a real knee looks like this.
-        assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(9_800));
-        c.on_ack(9_800);
-        assert_eq!(c.encode_noop_backoffs, 1);
-        assert!(!c.encode_down.disarmed());
-        // Twice: rate is not the lever. This backoff still lands; then stand-down.
-        assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(6_860));
-        c.on_ack(6_860);
+        assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(17_500));
+        c.on_ack(17_500);
+        assert_eq!(
+            encode_windows(&mut c, start, &mut tick, 20_000, 8),
+            Some(20_000),
+            "the encoder did not follow, so the notch is given back"
+        );
+        c.on_ack(20_000);
         assert!(c.encode_down.disarmed());
 
         // Same excursion no longer moves the rate…
@@ -421,35 +473,40 @@ mod tests {
         // …and the session climbs out instead of parking.
         c.set_ceiling(200_000);
         assert!(
-            run_clean(&mut c, start, tick, 8).is_some_and(|k| k > 6_860),
+            run_clean(&mut c, start, tick, 8).is_some_and(|k| k > 20_000),
             "a disarmed encode signal must not keep the session pinned"
         );
     }
 
     #[test]
-    fn an_encode_backoff_that_helps_keeps_the_down_driver_armed() {
-        // ×0.7 that actually drops encode time must not disarm.
+    fn an_encode_notch_the_encoder_answers_is_kept_and_may_be_followed() {
+        // Encode time that falls with the rate is a real knee: keep the notch,
+        // and let the next rise take another until the encoder keeps up.
         let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         let mut tick = 0;
-        assert_eq!(encode_choke(&mut c, start, &mut tick, 40_000), Some(14_000));
-        c.on_ack(14_000);
-        assert_eq!(encode_choke(&mut c, start, &mut tick, 22_000), Some(9_800));
-        c.on_ack(9_800);
-        assert_eq!(c.encode_noop_backoffs, 0);
+        assert_eq!(encode_choke(&mut c, start, &mut tick, 40_000), Some(17_500));
+        c.on_ack(17_500);
+        // Five windows: the verdict lands on the third, before a climb can.
+        assert_eq!(
+            encode_windows(&mut c, start, &mut tick, 22_000, 5),
+            None,
+            "a notch the encoder answered asks for nothing back"
+        );
         assert!(!c.encode_down.disarmed());
+        assert!(c.encode_probe.is_none(), "and the step is settled");
+        let next = encode_choke(&mut c, start, &mut tick, 40_000)
+            .expect("the next rise takes the next notch");
+        assert_eq!(next, c.current_kbps - c.current_kbps / 8);
     }
 
     #[test]
-    fn a_network_driven_backoff_breaks_the_encode_streak() {
-        // Network distress with elevated encode time must not count toward disarm.
+    fn a_network_driven_backoff_is_not_the_encoder_s() {
+        // Encode time is elevated, but a flush explains the window: ×0.7 on
+        // the link's evidence, and no notch to judge.
         let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         let mut tick = 0;
-        assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(14_000));
-        c.on_ack(14_000);
-        assert_eq!(c.encode_backoff_us, 20_000);
-        // Re-seed the encode baseline…
         for _ in 0..BASELINE_MIN_WINDOWS {
             let at = ticks(start, tick);
             tick += 1;
@@ -463,7 +520,6 @@ mod tests {
                 None
             );
         }
-        // Encode excursion + flush: flush is the explanation, streak resets.
         let at = ticks(start, tick);
         assert_eq!(
             c.on_window(&WindowSample {
@@ -473,10 +529,9 @@ mod tests {
                 flushed: true,
                 ..WindowSample::at(at)
             }),
-            Some(9_800)
+            Some(14_000)
         );
-        assert_eq!(c.encode_backoff_us, 0);
-        assert_eq!(c.encode_noop_backoffs, 0);
+        assert!(c.encode_probe.is_none());
         assert!(!c.encode_down.disarmed());
     }
 

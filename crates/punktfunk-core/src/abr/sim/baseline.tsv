@@ -8,7 +8,7 @@ lte_variable	75	0	36	2526	249	1141	0	1000	40738750
 shared_two_auto	22	0	32	560	53	45843	0	1000	57e31b2d
 shared_newcomer	57	0	36	2348	473	14419	0	951	33dfabb0
 shared_fixed_plus_auto	52	0	32	532	67	31585	0	963	e266fcd3
-gpu_saturated	0	9	27	0	4	0	0	1000	2c88e252
+gpu_saturated	0	9	27	0	4	0	0	1000	3e661c75
 static_then_motion	0	11	0	0	5	0	0	1000	3663f398
 frame_driven_35fps	0	9	0	0	5	0	0	1000	baf45490
 old_host	0	11	0	0	4	0	0	1000	dc842130
@@ -24,7 +24,8 @@ host_never_acks	0	99999	0	0	0	0	0	1000	f91aeb39
 unknown_refresh	0	99999	25	0	1	0	0	1000	3805d19b
 wifi_tv_probe_stalled	0	20	0	0	3	0	0	1000	8e422cdf
 decoder_headroom	0	219	2	0	3	0	0	1000	1c4aee62
-encoder_stalled	0	11	6	0	4	0	0	1000	b0025a81
+encoder_stalled	0	11	6	0	4	0	0	1000	1b8d0e03
 unknown_refresh_knee	0	99999	25	0	1	0	0	1000	af8cb644
 host_rebuild_stall	0	0	15	0	2	0	0	1000	325d140c
 host_rebuild_wave	0	20	0	0	2	0	0	1000	d0ed7523
+encoder_weak	0	99999	32	0	2	0	0	1000	6e3e7ae2

@@ -272,6 +272,33 @@ pub(super) fn gpu_saturated() -> Scenario {
     }
 }
 
+/// An encoder whose time really is a function of the rate: past 60 Mbps
+/// every extra megabit costs 40 µs against a 6 060 µs budget.
+///
+/// The notch is answered here, so it is kept and the next rise takes another:
+/// the session must walk down to where the encoder keeps up instead of
+/// standing the driver down.
+pub(super) fn encoder_weak() -> Scenario {
+    let mut s = tv_session(40_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.host.encode_knee_kbps = 40_000;
+    s.host.encode_us_per_mbps = 200;
+    Scenario {
+        name: "encoder_weak",
+        seed: 0x7A_7100,
+        duration_ms: 110_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
 /// One 1080p30 Automatic session over Klos54's WireGuard path.
 fn wg_session() -> SessionCfg {
     SessionCfg {
@@ -922,6 +949,7 @@ pub(super) fn all() -> Vec<Scenario> {
         unknown_refresh_knee(),
         host_rebuild_stall(),
         host_rebuild_wave(),
+        encoder_weak(),
     ]
 }
 
@@ -1124,11 +1152,15 @@ mod tests {
         );
     }
 
-    /// C4: host encode over its budget cuts, twice more without bringing it
-    /// down, then the down-driver stands down and nothing cuts until it
-    /// re-arms 16 windows later — three cuts, as the 09-16 trace has them.
+    /// C4: host encode over its budget costs one notch. The encoder does not
+    /// answer it, so the rate comes straight back and the down-driver stands
+    /// down until a clean run re-probes it 16 windows later.
+    ///
+    /// Before: three ×0.7 cuts before the stand-down — 164 418 → 115 092 →
+    /// 80 564 → 56 394, a third of the picture for nothing, and the same
+    /// cascade on every re-arm (`.21` gamescope 4K165, 40 → 14 Mbps).
     #[test]
-    fn c4_a_saturated_encoder_cuts_three_times_then_stands_down() {
+    fn c4_a_saturated_encoder_costs_one_notch_not_three_cuts() {
         let r = run(&gpu_saturated());
         let w = &r.windows[0];
         let disarm = w
@@ -1139,19 +1171,26 @@ mod tests {
             .iter()
             .filter(|w| w.cut_from_kbps.is_some())
             .count();
-        assert_eq!(
-            cuts_before, 3,
-            "the first verdict plus the two no-op backoffs"
-        );
-        for c in w[..=disarm].iter().filter(|w| w.cut_from_kbps.is_some()) {
+        assert_eq!(cuts_before, 1, "one notch, and the encoder's answer to it");
+        for c in w.iter().filter(|w| w.cut_from_kbps.is_some()) {
             let from = c.cut_from_kbps.unwrap();
             let to = w
                 .iter()
                 .find(|x| x.t_ms > c.t_ms && x.rate_kbps < from)
                 .map(|x| x.rate_kbps)
                 .unwrap_or(from);
-            assert_eq!(to, (from as u64 * 7 / 10) as u32, "every cut is ×0.7");
+            assert_eq!(to, from - from / 8, "every step down is one notch");
         }
+        // The contention arrives at 12 s; from there the rate never loses
+        // more than the notch it gives back.
+        let loaded = w.iter().filter(|w| w.t_ms >= 12_000);
+        let (peak, floor) = loaded.fold((0, u32::MAX), |(hi, lo), w| {
+            (hi.max(w.rate_kbps), lo.min(w.rate_kbps))
+        });
+        assert!(
+            u64::from(floor) * 100 >= u64::from(peak) * 80,
+            "{floor} kbps against a peak of {peak}"
+        );
         let rearm = w[disarm..]
             .iter()
             .position(|w| !w.encode_disarmed)
@@ -1165,6 +1204,41 @@ mod tests {
                 .iter()
                 .all(|w| w.cut_from_kbps.is_none()),
             "a stood-down driver cuts nothing"
+        );
+    }
+
+    /// The other half of the same rule: an encoder whose time really is a
+    /// function of the rate. Every notch is answered, so it is kept and the
+    /// next one may follow — the session walks down to where the encoder
+    /// keeps up instead of standing the driver down.
+    #[test]
+    fn a_weak_encoder_keeps_its_notches_and_walks_down() {
+        let r = run(&encoder_weak());
+        let w = &r.windows[0];
+        assert!(
+            w.iter().all(|w| !w.encode_disarmed),
+            "an encoder that answers the rate never stands the driver down"
+        );
+        let cuts = r.cuts();
+        assert!(cuts.len() >= 3, "{} notches", cuts.len());
+        for c in &cuts {
+            let from = c.cut_from_kbps.unwrap();
+            let to = w
+                .iter()
+                .find(|x| x.t_ms > c.t_ms && x.rate_kbps < from)
+                .map(|x| x.rate_kbps)
+                .unwrap_or(from);
+            assert_eq!(to, from - from / 8, "every step down is one notch");
+        }
+        // 3 550 µs plus 200 µs a megabit past 40 000. The second half of the
+        // session averages a little over half of the 164 000 the link offers:
+        // the notches took it down there, and the +6 % climb keeps testing
+        // the wall between them.
+        let tail = &w[w.len() / 2..];
+        let mean = tail.iter().map(|w| u64::from(w.rate_kbps)).sum::<u64>() / tail.len() as u64;
+        assert!(
+            (60_000..110_000).contains(&mean),
+            "settled around {mean} kbps"
         );
     }
 
@@ -1252,6 +1326,7 @@ mod tests {
             "stalled" => wifi_tv_probe_stalled(),
             "rebuild" => host_rebuild_stall(),
             "wave" => host_rebuild_wave(),
+            "weak" => encoder_weak(),
             _ => wifi_tv(),
         };
         let r = run(&sc);

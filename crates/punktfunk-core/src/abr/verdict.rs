@@ -518,7 +518,7 @@ mod tests {
                 actual_kbps: 1_000_000,
                 ..WindowSample::at(ticks(start, 8))
             }),
-            Some(70_000)
+            Some(87_500)
         );
     }
 
@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn host_encode_latency_rise_backs_off() {
-        // Only host encode time moves: two risen windows → ×0.7.
+        // Only host encode time moves: two risen windows → one notch.
         let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         for i in 0..4 {
@@ -640,7 +640,7 @@ mod tests {
                 actual_kbps: 1_000_000,
                 ..WindowSample::at(ticks(start, 6))
             }),
-            Some(14_000)
+            Some(17_500)
         );
     }
 
@@ -667,7 +667,7 @@ mod tests {
                 actual_kbps: 1_000_000,
                 ..WindowSample::at(ticks(start, 4))
             }),
-            Some(14_000)
+            Some(17_500)
         );
     }
 
@@ -684,18 +684,14 @@ mod tests {
                 ..WindowSample::at(ticks(start, i))
             });
         }
-        let _ = c.on_window(&WindowSample {
-            owd_mean_us: Some(10_000),
-            encode_mean_us: Some(12_000),
-            actual_kbps: 1_000_000,
-            ..WindowSample::at(ticks(start, 4))
-        });
+        // A decrease the encoder had no part in: severe loss, ×0.7.
         assert_eq!(
             c.on_window(&WindowSample {
                 owd_mean_us: Some(10_000),
-                encode_mean_us: Some(12_500),
+                encode_mean_us: Some(7_000),
+                loss_ppm: SEVERE_LOSS_PPM,
                 actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 6))
+                ..WindowSample::at(ticks(start, 4))
             }),
             Some(14_000)
         );
@@ -725,7 +721,7 @@ mod tests {
         let start = Instant::now();
         assert_eq!(
             encode_choke(&mut hz120, start, &mut tick, excursion),
-            Some(14_000),
+            Some(17_500),
             "at 120 Hz that is ~2.8 frame budgets over baseline — severe, one window"
         );
 
@@ -746,7 +742,7 @@ mod tests {
                 actual_kbps: 1_000_000,
                 ..WindowSample::at(at)
             }),
-            Some(14_000)
+            Some(17_500)
         );
     }
 
