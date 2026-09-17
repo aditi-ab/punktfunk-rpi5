@@ -237,7 +237,9 @@ impl StandDown {
 
 #[cfg(test)]
 mod tests {
-    use super::super::controller::{BitrateController, DECODE_CAP_SIMILAR_DIV, FLOOR_KBPS};
+    use super::super::controller::{
+        BitrateController, CLEAN_WINDOWS_TO_REARM, DECODE_CAP_SIMILAR_DIV, FLOOR_KBPS,
+    };
     use super::super::harness::*;
     use super::super::sample::WindowSample;
     use super::super::verdict::{
@@ -246,6 +248,133 @@ mod tests {
     use super::*;
     use crate::quic::AckReason;
     use std::time::Instant;
+
+    /// One link-attributed cut, at a rate the session had climbed to.
+    fn link_choke(
+        c: &mut BitrateController,
+        start: Instant,
+        tick: &mut u32,
+        delivered_kbps: u32,
+    ) -> Option<u32> {
+        let at = ticks(start, *tick);
+        *tick += 3;
+        c.on_window(&WindowSample {
+            dropped: 4,
+            actual_kbps: delivered_kbps,
+            ..WindowSample::at(at)
+        })
+    }
+
+    /// Two deliveries at the same rate are a wall; the cap sits a tenth under
+    /// it, which is where the session then rides. Two that disagree are a link
+    /// that moved, and teach no cap.
+    #[test]
+    fn two_deliveries_at_the_same_rate_latch_the_link_cap() {
+        let start = Instant::now();
+        let latched = |second: u32| -> Option<u32> {
+            let mut c = BitrateController::new(20_000, None);
+            c.set_ceiling(300_000);
+            let mut t = 0;
+            let k = link_choke(&mut c, start, &mut t, 12_000).expect("the link fell short");
+            c.on_ack(k, None);
+            assert!(c.link_cap.kbps().is_none(), "one mark is not a wall");
+            // A granted climb: the next choke samples a rate we reached.
+            c.on_ack(18_000, None);
+            link_choke(&mut c, start, &mut t, second);
+            c.link_cap.kbps()
+        };
+        assert_eq!(latched(11_500), Some(11_500 - 1_150));
+        assert_eq!(latched(5_000), None, "half the rate is a different wall");
+    }
+
+    /// A wall that moved down is not the old one standing again: the cap
+    /// follows it and its clock starts over, so a link that degrades twice is
+    /// not re-tested minutes after it recovers. A wall that re-asserts itself
+    /// at the same rate does back the clock off.
+    #[test]
+    fn a_wall_that_moved_down_restarts_the_caps_clock() {
+        let mut c = BitrateController::new(20_000, None);
+        c.set_ceiling(300_000);
+        c.note_link_mark(12_000);
+        c.note_link_mark(11_500);
+        assert_eq!(c.link_cap.reprobe_after(), CAP_REPROBE_WINDOWS_MIN);
+        c.note_link_mark(11_000);
+        assert_eq!(
+            c.link_cap.reprobe_after(),
+            CAP_REPROBE_WINDOWS_MIN * 2,
+            "the same wall again is a standing limit"
+        );
+        // A third of the rate: a different wall.
+        c.note_link_mark(4_000);
+        assert_eq!(c.link_cap.kbps(), Some(3_600));
+        assert_eq!(c.link_cap.reprobe_after(), CAP_REPROBE_WINDOWS_MIN);
+    }
+
+    /// The wall is a property of the link, not of the mode: a resolution
+    /// change drops the encoder and decoder knees and keeps this.
+    #[test]
+    fn a_mode_switch_keeps_the_link_cap() {
+        let mut c = BitrateController::new(20_000, None);
+        c.set_ceiling(300_000);
+        let start = Instant::now();
+        let mut t = 0;
+        let k = link_choke(&mut c, start, &mut t, 12_000).expect("a cut");
+        c.on_ack(k, None);
+        c.on_ack(18_000, None);
+        link_choke(&mut c, start, &mut t, 11_500);
+        let cap = c.link_cap.kbps().expect("latched");
+        c.on_mode_switch();
+        assert_eq!(c.link_cap.kbps(), Some(cap));
+        assert!(c.decode_cap.kbps().is_none());
+    }
+
+    /// The climb holds under a latched wall instead of walking into it.
+    #[test]
+    fn the_climb_holds_under_the_link_cap() {
+        let mut c = BitrateController::new(20_000, None);
+        c.set_ceiling(300_000);
+        let start = Instant::now();
+        let mut t = 0;
+        let k = link_choke(&mut c, start, &mut t, 12_000).expect("a cut");
+        c.on_ack(k, None);
+        c.on_ack(18_000, None);
+        link_choke(&mut c, start, &mut t, 11_500);
+        let cap = c.link_cap.kbps().expect("latched");
+        c.on_ack(cap, None);
+        // Clean, fully utilised windows for the whole re-probe interval bar
+        // one: nothing may ask for more than the cap.
+        for _ in 0..CAP_REPROBE_WINDOWS_MIN - 1 {
+            if let Some(k) = run_clean(&mut c, start, t, 1) {
+                assert!(k <= cap, "asked {k} above a {cap} kbps wall");
+                c.on_ack(k, None);
+            }
+            t += 1;
+        }
+        assert_eq!(c.current_kbps, cap);
+    }
+
+    /// A link verdict is held to today because nothing knows where the wall
+    /// is. A latched cap does, and the doubling cannot pass it — so a session
+    /// left far under it comes back in seconds.
+    #[test]
+    fn a_known_wall_gives_slow_start_back_under_it() {
+        let mut c = BitrateController::new(20_000, None);
+        c.set_ceiling(300_000);
+        let start = Instant::now();
+        let mut t = 0;
+        let k = link_choke(&mut c, start, &mut t, 12_000).expect("a cut");
+        c.on_ack(k, None);
+        c.on_ack(18_000, None);
+        link_choke(&mut c, start, &mut t, 11_500);
+        assert!(!c.probing, "the link's verdict ended slow start");
+        // A cascade left the session far under the wall it knows about.
+        c.on_ack(3_000, None);
+        clean_run(&mut c, start, &mut t, CLEAN_WINDOWS_TO_REARM);
+        assert!(
+            c.probing,
+            "a session under a known wall must double back to it"
+        );
+    }
 
     #[test]
     fn two_identical_short_acks_latch_the_host_cap() {

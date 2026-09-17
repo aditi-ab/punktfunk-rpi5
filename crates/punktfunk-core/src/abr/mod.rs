@@ -347,6 +347,9 @@ impl Driver {
         let proven_kbps = match ramped {
             probe::Ramped::Wall { delivered_kbps } => {
                 self.set_ceiling(probe::wall_ceiling_kbps(delivered_kbps));
+                // One mark toward the link cap: the ramp refused a step here,
+                // and a later window that delivers the same rate is the second.
+                self.abr.note_link_mark(delivered_kbps);
                 delivered_kbps
             }
             probe::Ramped::NoWall { proven_kbps } if proven_kbps > 0 => {

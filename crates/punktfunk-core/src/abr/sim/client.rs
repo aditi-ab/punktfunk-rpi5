@@ -120,6 +120,10 @@ pub(super) struct WindowRec {
     pub encode_disarmed: bool,
     /// First-shard delay for this window. `None` = no frame opened in it.
     pub delay: Option<crate::abr::DelayTrend>,
+    /// The learned link cap after this window, if one stands.
+    pub link_cap: Option<u32>,
+    /// The last delivered rate the link was marked at (`0` = none).
+    pub link_mark_kbps: u32,
 }
 
 struct InFlight {
@@ -580,6 +584,8 @@ impl Client {
             discarded: w.discarded,
             encode_disarmed: self.abr.abr.encode_down.disarmed(),
             delay: w.sample.delay,
+            link_cap: self.abr.abr.link_cap.kbps(),
+            link_mark_kbps: self.abr.abr.link_mark_kbps,
         });
     }
 }

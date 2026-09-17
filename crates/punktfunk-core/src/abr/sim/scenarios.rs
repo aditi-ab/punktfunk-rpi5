@@ -1222,6 +1222,14 @@ mod tests {
                 s.asked_bytes / 1_000
             );
             assert!(at_ms <= max_ms, "{name}: the ramp took {at_ms} ms");
+            // A wall is one mark toward the link cap; nothing else is.
+            let marked = r.windows[0].first().map(|w| w.link_mark_kbps);
+            assert_eq!(
+                marked == Some(s.proven_kbps),
+                wall,
+                "{name}: ramp marked {marked:?} of {}",
+                s.proven_kbps
+            );
             // L4: all of it is over before the first frame exists.
             assert!(
                 at_ms < BRINGUP_MS,
@@ -1634,6 +1642,41 @@ mod tests {
         }
     }
 
+    /// A cell that gets better: the cap it taught has to get out of the way.
+    ///
+    /// `lte_variable` steps 8 → 50 Mbps at 75 s with a cap latched at 4 736.
+    /// The re-probe clock lifts it, the link carries the lift, a second
+    /// unanswered lift drops the cap, and slow start doubles after the wall
+    /// that moved instead of crawling +6 % a step.
+    #[test]
+    fn a_wall_that_moved_up_is_found_and_followed() {
+        let r = run(&with_ramp(lte_variable()));
+        let at = |t: u64| -> &super::super::client::WindowRec {
+            r.windows[0]
+                .iter()
+                .find(|w| w.t_ms >= t)
+                .expect("a window there")
+        };
+        let held = at(70_000);
+        assert!(
+            held.link_cap.is_some_and(|c| held.rate_kbps <= c),
+            "the session should be riding a learned wall at 70 s: {held:?}"
+        );
+        let followed = r.windows[0]
+            .iter()
+            .find(|w| w.t_ms > 75_000 && w.rate_kbps >= 15_000)
+            .expect("the session never followed the link up");
+        assert!(
+            followed.t_ms - 75_000 <= 60_000,
+            "{} s to follow a wall that moved up",
+            (followed.t_ms - 75_000) / 1_000
+        );
+        assert!(
+            followed.link_cap.is_none(),
+            "a wall the link stopped answering must be dropped, not laddered"
+        );
+    }
+
     /// `SIM_DUMP=c3 cargo test … dump -- --ignored --nocapture`: one
     /// scenario's window trail, for reading a calibration by eye.
     #[test]
@@ -1674,7 +1717,7 @@ mod tests {
         for w in &r.windows[0] {
             println!(
                 "t={:6} rate={:7} actual={:7} drop={} kf={} cut={:?} disc={} dis={} \
-                 delay={:?}",
+                 cap={:?} delay={:?}",
                 w.t_ms,
                 w.rate_kbps,
                 w.actual_kbps,
@@ -1683,6 +1726,7 @@ mod tests {
                 w.cut_from_kbps,
                 w.discarded,
                 w.encode_disarmed,
+                w.link_cap,
                 w.delay,
             );
         }

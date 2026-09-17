@@ -42,7 +42,7 @@ const IDLE_WINDOWS_TO_REARM: u32 = 4;
 /// verdict left: long enough to be a run, short enough that recovering from
 /// a false verdict costs seconds instead of the three minutes +6 % a step
 /// takes from 14 to 170 Mbps.
-const CLEAN_WINDOWS_TO_REARM: u32 = 8;
+pub(super) const CLEAN_WINDOWS_TO_REARM: u32 = 8;
 /// Consecutive ordinary-bad windows before a decrease. One 750 ms window can
 /// be a scheduler blip; 1.5 s is a condition. Severe skips the wait.
 const BAD_WINDOWS_TO_DECREASE: u32 = 2;
@@ -95,6 +95,15 @@ const LINK_DRAIN_WINDOWS: u32 = 4;
 /// 750 ms is past the fit's own noise on a jittery link and well under one
 /// frame period at any refresh.
 const DRAIN_FALL_US: i64 = 5_000;
+/// How far under the wall it measured the link cap sits, as a divisor. A
+/// tenth is the room a link that moves by a few percent needs to move in
+/// without the queue answering; climbs stop at the cap, so this is also where
+/// the session rides.
+const LINK_HOLD_DIV: u32 = 10;
+/// Two delivered rates this close are the same wall (±1/5). Wider than the
+/// decode cap's ±1/8 because a wall is a moving physical thing — Wi-Fi and a
+/// cell both wander further than that inside a minute.
+const LINK_MARK_SIMILAR_DIV: u32 = 5;
 
 /// A headroom step awaiting the decoder's answer at its new rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,6 +163,21 @@ pub(crate) struct BitrateController {
     /// Windows left in which a falling delay reading is the last
     /// link-attributed cut working. `0` = nothing to drain.
     drain_windows: u32,
+    /// Where the link stopped carrying what it was asked for. Latched from
+    /// two deliveries at the same rate (the ramp's wall counts as one), it
+    /// holds the climb a tenth under that rate and is re-tested on the same
+    /// clock the other two caps use.
+    pub(super) link_cap: LearnedCap,
+    /// Previous delivered mark (`0` = none). Two within ±1/5 are a wall.
+    pub(super) link_mark_kbps: u32,
+    /// The last bad window was the link's. Wider than
+    /// [`link_verdict`](Self::link_verdict): a session sitting exactly on its
+    /// wall is getting what it asks for and still has to learn where it is.
+    link_evidence: bool,
+    /// A lift the wall has not answered. A second one means the session held
+    /// the lifted rate for a whole re-probe interval: the wall moved, and the
+    /// cap goes rather than crawl after it at +12.5 % a time.
+    link_lifted: bool,
     /// Rolling minima the relative signals are scored against.
     baselines: Baselines,
     /// One refresh interval, µs. `None` = the 120 Hz [`ENCODE_RISE_US`] defaults.
@@ -236,6 +260,10 @@ impl BitrateController {
             rearm_windows: 0,
             link_verdict: false,
             drain_windows: 0,
+            link_cap: LearnedCap::new(),
+            link_mark_kbps: 0,
+            link_evidence: false,
+            link_lifted: false,
             baselines: Baselines::new(),
             frame_budget_us: None,
             encode_probe: None,
@@ -629,7 +657,9 @@ impl BitrateController {
     /// Drop mode-scoped learned state. Encoder/decoder knees and rolling
     /// baselines are properties of the mode; a baseline from the old mode is a
     /// floor the new one clears on the first window. Probe-measured
-    /// `ceiling_kbps` (a link property) survives. Proven throughput re-earns.
+    /// `ceiling_kbps` and the link cap are link properties and survive — the
+    /// wall does not move because the client changed resolution. Proven
+    /// throughput re-earns.
     pub(crate) fn on_mode_switch(&mut self) {
         self.host_cap.drop_cap();
         self.short_acks = 0;
@@ -728,18 +758,65 @@ impl BitrateController {
 
     /// Did the link hand over less than the rate it was running at?
     ///
-    /// The climb's own bar, prorated by the frames that arrived — content that
+    /// The climb's own bar, prorated by the frames that arrived: content that
     /// never filled the target is not the link falling short, and reading it
-    /// as one would land the rate on a still picture. A standing queue breaks
-    /// that denominator, because the frames it is holding are missing for the
-    /// link's own reasons: when delay says so, the wall clock is the honest
-    /// measure of what was asked for.
+    /// as one would land the rate on a still picture.
     fn short_of_offered(&self, w: &WindowSample, owd_bad: bool) -> bool {
         let proration = growth::proration(w.activity, self.frame_budget_us);
         if !growth::utilized(w.activity, proration, w.actual_kbps, self.current_kbps) {
             return true;
         }
+        // A standing queue breaks that denominator: the frames it is holding
+        // are missing for the link's own reasons, so the wall clock is the
+        // honest measure of what was asked for.
         owd_bad && !growth::delivered_the_rate(w.actual_kbps, self.current_kbps)
+    }
+
+    /// What a link-attributed cut delivered: one mark toward the wall.
+    ///
+    /// Two marks at the same rate are a wall, and the bring-up ramp's own wall
+    /// is the first of them. The cap sits a tenth under what was delivered —
+    /// the rate the session then rides — so the re-probe ladder's +12.5 %
+    /// lands just above the wall and asks it again. Once a cap stands, one
+    /// mark re-latches it: that mark is the wall's answer to a lift.
+    pub(crate) fn note_link_mark(&mut self, delivered_kbps: u32) {
+        if !self.enabled || delivered_kbps == 0 {
+            return;
+        }
+        let similar = self.link_mark_kbps > 0
+            && delivered_kbps.abs_diff(self.link_mark_kbps)
+                <= self.link_mark_kbps / LINK_MARK_SIMILAR_DIV;
+        let previous = std::mem::replace(&mut self.link_mark_kbps, delivered_kbps);
+        if !similar && self.link_cap.kbps().is_none() {
+            tracing::debug!(
+                delivered_kbps,
+                previous_kbps = previous,
+                "adaptive bitrate: one mark toward the link's wall"
+            );
+            return;
+        }
+        let hold = delivered_kbps.saturating_sub(delivered_kbps / LINK_HOLD_DIV);
+        // A wall a fifth below the one already learned is a different wall,
+        // not the same one standing again: start its clock over rather than
+        // back it off, or a link that degrades twice is re-tested minutes
+        // after it recovers.
+        if self
+            .link_cap
+            .kbps()
+            .is_some_and(|c| hold < c.saturating_sub(c / LINK_MARK_SIMILAR_DIV))
+        {
+            self.link_cap.drop_cap();
+        }
+        if self.link_cap.latch(hold, self.floor_kbps) {
+            self.link_lifted = false;
+            tracing::info!(
+                cap_kbps = hold,
+                delivered_kbps,
+                reprobe_after_windows = self.link_cap.reprobe_after(),
+                "adaptive bitrate: link cap learned — the climb holds under this wall until \
+                 the re-probe clock tests it again"
+            );
+        }
     }
 
     /// Is this window the last link-attributed cut draining the queue it
@@ -808,10 +885,16 @@ impl BitrateController {
             // A decoder past its budget is a rate verdict but not a link one:
             // the link delivered, the client could not decode it.
             self.rate_verdict = link || v.decode_bad;
-            // What makes it the link's number to land on is the shortfall:
-            // a link with room hands over what it was asked for, so this can
-            // never fire where there is no wall (L2).
-            self.link_verdict = link && self.short_of_offered(w, v.owd_bad);
+            // The link showed itself in one of two ways: a queue filling on
+            // this session's own delay floor, or a window that carried less
+            // than it was asked for. A link with room shows neither, so
+            // neither branch can fire where there is no wall (L2).
+            let short = self.short_of_offered(w, v.owd_bad);
+            self.link_evidence = link && (v.owd_bad || short);
+            // Only a shortfall makes what was delivered the number to land
+            // on. At the wall itself the session is already getting what it
+            // asks for, and the blind step is what drains the queue.
+            self.link_verdict = link && short;
             self.bad_windows += 1;
             if v.decode_bad {
                 // Counted here: backoff only sees the final window, and the
@@ -836,6 +919,8 @@ impl BitrateController {
             self.clean_windows += 1;
             self.bad_windows = 0;
             self.streak_decode_windows = 0;
+            // A window the link did not damage is what the cap's clock runs on.
+            self.link_evidence = false;
         }
     }
 
@@ -850,10 +935,17 @@ impl BitrateController {
     /// the lever for is held to instead: doubling back into a wall saws it,
     /// and the decode cap latches only on two chokes at a similar rate.
     fn note_rearm(&mut self, w: &WindowSample, v: &Verdict) {
-        // A backoff that recorded a knee reference is not refuted by a clean
-        // run either: the decode cap latches on two chokes at a similar rate,
-        // and a doubling in between samples a different one.
-        if self.probing || self.rate_verdict || self.decode_backoff_kbps > 0 {
+        // A knee reference is not refuted by a clean run either. A latched
+        // link cap is: the wall is known and the doubling cannot pass it, so
+        // a session left far under it comes back in seconds.
+        let far_under_the_wall = self
+            .link_cap
+            .kbps()
+            .is_some_and(|c| self.current_kbps < c.saturating_sub(c / LINK_HOLD_DIV));
+        if self.probing
+            || (self.rate_verdict && !far_under_the_wall)
+            || self.decode_backoff_kbps > 0
+        {
             return;
         }
         let proration = growth::proration(w.activity, self.frame_budget_us);
@@ -903,6 +995,32 @@ impl BitrateController {
                 step: StepProbe::new(from, ref_us),
             });
         }
+        // Only the wall itself breaks the link cap's park, and it does that by
+        // re-latching. A damaged window does not: a cell drops a frame every
+        // few seconds, and a clock that waits for sixteen unbroken clean ones
+        // there is a bound with no expiry (L1).
+        if let Some((from, to)) = self.link_cap.on_window(false, quiet, rate, ceiling) {
+            if std::mem::replace(&mut self.link_lifted, true) {
+                self.link_cap.drop_cap();
+                self.link_lifted = false;
+                // The link just carried a rate the cap said it could not.
+                // Doubling back to what it now holds is what makes coming
+                // back cost about what the cut cost.
+                self.probing = true;
+                self.rate_verdict = false;
+                tracing::info!(
+                    was_kbps = from,
+                    "adaptive bitrate: the link carried a lifted cap for a whole re-probe \
+                     interval — the wall moved, dropping it and doubling after it"
+                );
+            } else {
+                tracing::info!(
+                    from_kbps = from,
+                    to_kbps = to,
+                    "adaptive bitrate: asking the link's wall again — lifting the cap"
+                );
+            }
+        }
         // GPU contention ends; a too-eager re-arm costs one ×0.7, a permanent
         // silence costs the knee protection.
         if self.encode_down.disarmed() {
@@ -940,6 +1058,11 @@ impl BitrateController {
             return self.retreat_encode(w);
         }
         self.learn_knee(w, v);
+        // A backoff with no climb behind it is draining the previous one, not
+        // meeting the wall: the same reference the decode cap keeps.
+        if self.link_evidence && self.climb_since_backoff {
+            self.note_link_mark(w.actual_kbps);
+        }
         self.climb_since_backoff = false;
         let next = if self.link_verdict {
             let next = self.link_cut_kbps(w.actual_kbps);
@@ -1141,11 +1264,13 @@ impl BitrateController {
     fn climb(&mut self, w: &WindowSample) -> Option<u32> {
         let proration = growth::proration(w.activity, self.frame_budget_us);
         let utilized = growth::utilized(w.activity, proration, w.actual_kbps, self.current_kbps);
-        // Probe = link, short acks = encoder, decode cap = client decoder.
+        // Probe = link, short acks = encoder, decode cap = client decoder,
+        // link cap = the wall this session walked into.
         let eff_ceiling = self
             .ceiling_kbps
             .min(self.host_cap.kbps().unwrap_or(u32::MAX))
-            .min(self.decode_cap.kbps().unwrap_or(u32::MAX));
+            .min(self.decode_cap.kbps().unwrap_or(u32::MAX))
+            .min(self.link_cap.kbps().unwrap_or(u32::MAX));
         // Above the env/policy ceiling with no congestion: step down once per
         // distinct target. A host that answers higher cannot go there.
         let ceiling_target = eff_ceiling.max(self.floor_kbps);
