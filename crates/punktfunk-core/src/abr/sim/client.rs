@@ -30,6 +30,9 @@ const PROBE_PACKET_BYTES: u64 = 40 + 1408;
 /// The probe's own id in the link queue. Filler never reaches the decoder and
 /// never counts toward `actual_kbps` (`wire_bytes` nets it out).
 pub(super) const PROBE_FRAME: u32 = u32::MAX;
+/// Stall the client reports with a host pipeline rebuild. ABR only logs it;
+/// what the rebuild costs is the discarded window and the lost reference.
+const REBUILD_GAP_MS: u32 = 400;
 
 /// Decode latency: a floor plus a rise past the rate the decoder is happy at.
 #[derive(Clone, Copy, Debug, Default)]
@@ -59,6 +62,9 @@ pub(super) struct ClientCfg {
     /// paused video for the burst. The window it lands in is discarded, as
     /// the probe tail is.
     pub ceiling_at: Option<(u64, u32)>,
+    /// The host rebuilds its pipeline here: the window in flight describes the
+    /// gap, and the client is left without a reference to decode against.
+    pub rebuild_at_ms: Option<u64>,
     /// `false` = an explicit bitrate, so no controller.
     pub automatic: bool,
 }
@@ -76,6 +82,7 @@ impl Default for ClientCfg {
             probe: true,
             probe_target_kbps: None,
             ceiling_at: None,
+            rebuild_at_ms: None,
             automatic: true,
         }
     }
@@ -418,10 +425,17 @@ impl Client {
         self.probe_report = Some(report);
     }
 
-    /// One millisecond of client: the keyframe throttle, then the driver,
-    /// which closes the report window when it comes due.
+    /// One millisecond of client: the host rebuild and the keyframe throttle,
+    /// then the driver, which closes the report window when it comes due.
     pub(super) fn tick(&mut self, now_ms: u64, base: Instant, out: &mut Vec<Action>) {
         let now = base + Duration::from_millis(now_ms);
+        if self.cfg.rebuild_at_ms.is_some_and(|at| now_ms >= at) {
+            self.cfg.rebuild_at_ms = None;
+            self.abr.on_pipeline_gap(REBUILD_GAP_MS);
+            // The rebuilt encoder opens on a reference this client does not
+            // have, so it asks until a recovery point lands.
+            self.awaiting_idr = true;
+        }
         if self.awaiting_idr && now_ms >= self.kf_next_ms {
             self.kf_next_ms = now_ms + KEYFRAME_ASK_MS;
             self.abr.on_keyframe_asks(1);

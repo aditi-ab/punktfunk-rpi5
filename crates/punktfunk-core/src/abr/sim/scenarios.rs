@@ -770,6 +770,57 @@ pub(super) fn unknown_refresh_knee() -> Scenario {
     sc
 }
 
+/// A host pipeline rebuild mid-session, answered with an intra-refresh wave
+/// instead of an IDR.
+///
+/// The window the stall lands in is discarded; the client is left without a
+/// reference and asks every 100 ms until a recovery point lands 600 ms later.
+/// Nothing on the link moved, so those asks are the whole of the next window's
+/// evidence — the case `RECOVERY_KF_BAD` and `RECOVERY_KF_SEVERE` judge,
+/// outside any capacity burst. Where in its window the stall falls decides how
+/// much of the wave the discarded one swallows.
+fn host_rebuild(name: &'static str, seed: u64, start_kbps: u32, rebuild_at_ms: u64) -> Scenario {
+    let mut s = tv_session(
+        start_kbps,
+        Some((1_000, 171_294)),
+        vec![ContentPhase {
+            fill_pct: 80,
+            active_pct: 88,
+            ..ContentPhase::default()
+        }],
+    );
+    s.host.recovery_ms = 600;
+    s.client.rebuild_at_ms = Some(rebuild_at_ms);
+    Scenario {
+        name,
+        seed,
+        duration_ms: 40_000,
+        link: LinkCfg {
+            capacity: vec![(0, 400_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 171_294,
+        blip_at_ms: None,
+    }
+}
+
+/// A stall 100 ms before the window boundary: five asks land in the judged
+/// window, which is severe on one window.
+pub(super) fn host_rebuild_stall() -> Scenario {
+    host_rebuild("host_rebuild_stall", 0x7A_6900, 171_294, 20_150)
+}
+
+/// The same stall 400 ms earlier in its window, on a session still climbing:
+/// the discarded window swallows most of the wave and two asks reach the
+/// judged one. Under the severe bar, at `RECOVERY_KF_BAD` — enough to end
+/// slow start, which is the whole of what it costs.
+pub(super) fn host_rebuild_wave() -> Scenario {
+    host_rebuild("host_rebuild_wave", 0x7A_7000, 20_000, 4_850)
+}
+
 /// The probe declined or refused: no ceiling was ever learned, so the
 /// negotiated start is the whole authority.
 pub(super) fn no_ramp() -> Scenario {
@@ -869,6 +920,8 @@ pub(super) fn all() -> Vec<Scenario> {
         decoder_headroom(),
         encoder_stalled(),
         unknown_refresh_knee(),
+        host_rebuild_stall(),
+        host_rebuild_wave(),
     ]
 }
 
@@ -988,88 +1041,76 @@ mod tests {
         assert!(took_s >= 150, "14 000 → 170 000 took {took_s} s");
     }
 
-    /// C6: the startup burst overdrives the link, video dies beside it, and
-    /// the keyframe asks that outlive the discarded tail are read as severe.
-    /// The deciding window has no unrecoverable frame of its own — it is the
-    /// recovery signal that cuts, which is why the host saw `loss_windows=0`
-    /// through the whole minute it happened in.
+    /// C6: the startup burst overdrives the link and video dies beside it, so
+    /// the keyframe asks that outlive the discarded tail are the burst's own.
+    /// They are not judged, and the session climbs on the ceiling it just
+    /// measured instead of cutting.
+    ///
+    /// Before: four asks in the window after the tail were severe, the session
+    /// went 20 000 → 14 000 with `dropped=0` and `loss_windows=0`, and never
+    /// reached 90 % of the measured ceiling in the minute it ran.
     #[test]
-    fn c6_the_startup_burst_cuts_the_session_it_measures() {
+    fn c6_the_startup_burst_no_longer_cuts_the_session_it_measures() {
         let r = run(&wifi_tv_probe_damage());
-        let probe_end = r.windows[0]
+        let tail = r.windows[0]
             .iter()
-            .find(|w| w.discarded)
-            .expect("the burst's tail window is discarded")
-            .t_ms;
-        let cut = r
-            .cuts()
-            .first()
-            .copied()
-            .expect("and the session backs off");
+            .position(|w| w.discarded)
+            .expect("the burst's tail window is discarded");
         assert!(
-            cut.t_ms - probe_end <= 10_000,
-            "the cut landed {} ms after the burst",
-            cut.t_ms - probe_end
+            r.cuts().is_empty(),
+            "the burst's own damage must not move the rate: {:?}",
+            r.cuts().first().map(|w| (w.t_ms, w.recovery_kf))
         );
-        assert_eq!(cut.cut_from_kbps, Some(20_000), "from the negotiated start");
         assert_eq!(
-            cut.dropped, 0,
-            "no unrecoverable frame in the deciding window"
+            r.windows[0][tail + 1].recovery_kf,
+            0,
+            "the asks in the window after the tail belong to the burst"
         );
-        assert!(
-            cut.recovery_kf >= 4,
-            "{} keyframe asks — under four nothing is severe",
-            cut.recovery_kf
-        );
-        let after = r.windows[0]
+        let at_ceiling = r.windows[0]
             .iter()
-            .find(|w| w.t_ms > cut.t_ms && w.rate_kbps < 20_000)
-            .expect("the cut lands");
-        assert_eq!(
-            after.rate_kbps, 14_000,
-            "0.7 × the start, as the host log has it"
+            .find(|w| w.rate_kbps >= 151_200)
+            .expect("the session reaches 90 % of the measured ceiling");
+        assert!(
+            at_ceiling.t_ms <= 25_000,
+            "90 % of the ceiling at {} ms",
+            at_ceiling.t_ms
         );
     }
 
-    /// C7: two keyframe asks are enough to end slow start, and nothing cuts,
-    /// so the session spends the rest of its life at +6 % a step with no
-    /// entry in any log to say why.
+    /// C7: the quieter half — two or three asks, under the severe bar but at
+    /// `RECOVERY_KF_BAD`. Disowned with the rest of the burst's aftermath,
+    /// they leave slow start armed and the session doubles to its ceiling.
     ///
-    /// Two numbers of the 09-17 10:03 session the model does not reproduce
-    /// and is not tuned for: its first step was ×1.30 at +1.6 s where this
-    /// climbs +6 % like every other, and it stopped at 31 134 for three and a
-    /// half minutes where this keeps stepping. What C7 pins is the shape they
-    /// share — no cut, no doubling, and a rate still far under the ceiling
-    /// the burst had just measured.
+    /// Before: that one window ended slow start with no cut and no entry in
+    /// any log, and the session crawled +6 % a step — 31 134 kbps a minute in,
+    /// against a ceiling of 168 000 (`host173` 09-17 10:03).
     #[test]
-    fn c7_two_keyframe_asks_end_slow_start_without_a_cut() {
+    fn c7_the_quiet_ask_pair_no_longer_ends_slow_start() {
         let r = run(&wifi_tv_probe_stalled());
         assert!(r.cuts().is_empty(), "nothing in this session backs off");
         let tail = r.windows[0]
             .iter()
             .position(|w| w.discarded)
             .expect("the burst's tail window is discarded");
-        let judged = r.windows[0][tail + 1];
-        assert_eq!(judged.dropped, 0, "no unrecoverable frame to explain it");
-        assert!(
-            (2..=3).contains(&judged.recovery_kf),
-            "{} keyframe asks — two is bad, four would be severe",
-            judged.recovery_kf
+        assert_eq!(
+            r.windows[0][tail + 1].recovery_kf,
+            0,
+            "the asks in the window after the tail belong to the burst"
         );
         let steps = r.steps();
         assert!(steps.len() >= 8, "{} climbs", steps.len());
-        for pair in steps.windows(2) {
+        for pair in steps.windows(2).take(8) {
             let pct = u64::from(pair[1]) * 100 / u64::from(pair[0]);
             assert!(
-                (106..=107).contains(&pct),
-                "{} → {} is {pct} % of the last rate, not an additive step",
+                pct >= 112,
+                "{} → {} is {pct} % of the last rate — an additive step, not slow start",
                 pair[0],
                 pair[1]
             );
         }
         let last = r.windows[0].last().expect("the session ran");
         assert!(
-            last.rate_kbps < 42_000,
+            last.rate_kbps >= 151_200,
             "{} kbps a minute in, against a measured ceiling of 168 000",
             last.rate_kbps
         );
@@ -1201,6 +1242,8 @@ mod tests {
             "unknown" => unknown_refresh(),
             "idle" => idle_then_motion(),
             "stalled" => wifi_tv_probe_stalled(),
+            "rebuild" => host_rebuild_stall(),
+            "wave" => host_rebuild_wave(),
             _ => wifi_tv(),
         };
         let r = run(&sc);

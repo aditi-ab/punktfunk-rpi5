@@ -9,7 +9,9 @@
 # `ENCODE_RISE_US` and `ENCODE_SEVERE_US` only apply when the session's
 # refresh is unknown, and `LOW_RATE_WARN_KBPS` only logs, so neither is in
 # the table. `PROVEN_BUCKET_WINDOWS` is in it and expected green: see
-# `KNOWN_GREEN`.
+# `KNOWN_GREEN`. `PROBE_AFTERMATH_WINDOWS` is mutated to 0 rather than to
+# another count: its budget binds only for a client that never gets its
+# picture back, and no scenario models one.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
@@ -43,6 +45,7 @@ SEVERE_LOSS_PPM|const SEVERE_LOSS_PPM: u32 = 60_000;|const SEVERE_LOSS_PPM: u32 
 CLEAN_WINDOWS_TO_INCREASE|const CLEAN_WINDOWS_TO_INCREASE: u32 = 6;|const CLEAN_WINDOWS_TO_INCREASE: u32 = 3;
 CHANGE_COOLDOWN|const CHANGE_COOLDOWN: Duration = Duration::from_millis(1500);|const CHANGE_COOLDOWN: Duration = Duration::from_millis(3000);
 HEAVY_LOSS_PPM|const HEAVY_LOSS_PPM: u32 = 20_000;|const HEAVY_LOSS_PPM: u32 = 55_000;
+PROBE_AFTERMATH_WINDOWS|const PROBE_AFTERMATH_WINDOWS: u32 = 8;|const PROBE_AFTERMATH_WINDOWS: u32 = 0;
 RECOVERY_KF_BAD|const RECOVERY_KF_BAD: u32 = 2;|const RECOVERY_KF_BAD: u32 = 7;
 RECOVERY_KF_SEVERE|const RECOVERY_KF_SEVERE: u32 = 4;|const RECOVERY_KF_SEVERE: u32 = 9;
 OWD_RISE_US|const OWD_RISE_US: i64 = 25_000;|const OWD_RISE_US: i64 = 50_000;

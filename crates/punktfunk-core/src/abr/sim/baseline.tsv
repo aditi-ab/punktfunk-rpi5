@@ -14,7 +14,7 @@ frame_driven_35fps	0	9	0	0	5	0	0	1000	baf45490
 old_host	0	11	0	0	4	0	0	1000	dc842130
 no_ramp	0	0	0	0	1	0	0	1000	811c9dc5
 slow_start_spent	0	187	2	2	3	0	28	1000	d25a0913
-wifi_tv_probe_damage	0	99999	10	0	0	0	0	1000	791998b2
+wifi_tv_probe_damage	0	20	0	0	3	0	0	1000	f419fe3f
 wifi_loss_heavy	89	99999	70	0	0	0	0	1000	41898378
 wifi_loss_severe	90	99999	70	0	0	0	0	1000	3ed39c85
 decoder_knee	0	99999	12	0	3	0	0	1000	f43012d4
@@ -22,7 +22,9 @@ starved_client	73	0	86	24166	399	0	0	1000	5f612dd0
 idle_then_motion	0	11	6	6	4	0	31	1000	1777d4e9
 host_never_acks	0	99999	0	0	0	0	0	1000	f91aeb39
 unknown_refresh	0	99999	25	0	1	0	0	1000	3805d19b
-wifi_tv_probe_stalled	0	99999	0	0	0	0	0	1000	2de1b7fa
+wifi_tv_probe_stalled	0	20	0	0	3	0	0	1000	8e422cdf
 decoder_headroom	0	219	2	0	3	0	0	1000	1c4aee62
 encoder_stalled	0	11	6	0	4	0	0	1000	cd4fe556
 unknown_refresh_knee	0	99999	25	0	1	0	0	1000	af8cb644
+host_rebuild_stall	0	0	15	0	2	0	0	1000	325d140c
+host_rebuild_wave	0	99999	0	0	0	0	0	1000	4cd9d753

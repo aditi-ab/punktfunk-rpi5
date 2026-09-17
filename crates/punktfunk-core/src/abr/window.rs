@@ -6,10 +6,17 @@
 //! embedders gather. A window whose numbers describe something other than the
 //! link — the tail of a capacity burst, a host pipeline rebuild — is
 //! discarded whole: one bogus congestion verdict ends slow start for good.
+//! A burst's freeze outlives that window, so its keyframe asks are disowned
+//! for as long as it lasts.
 
 use super::sample::{WindowActivity, WindowSample, WINDOW};
 use crate::stats::Stats;
 use std::time::Instant;
+
+/// Windows after a capacity burst whose keyframe asks still belong to it.
+/// 8 × 750 ms = 6 s: a freeze's asks (one per 100 ms on webOS) plus a lost
+/// IDR's retry.
+pub(super) const PROBE_AFTERMATH_WINDOWS: u32 = 8;
 
 /// A closed report window: the controller's input, plus what the embedder
 /// still owes the host for it.
@@ -50,6 +57,8 @@ pub(crate) struct WindowAccumulator {
     encode_sum_us: u64,
     encode_count: u32,
     recovery_kf: u32,
+    /// Windows whose keyframe asks are still the burst's ([`probe_aftermath`]).
+    aftermath_left: u32,
     flushed: bool,
     discard: bool,
     /// [`crate::quic::DeliveryReport`] cadence: every window while nothing has
@@ -78,6 +87,7 @@ impl WindowAccumulator {
             encode_sum_us: 0,
             encode_count: 0,
             recovery_kf: 0,
+            aftermath_left: 0,
             flushed: false,
             discard: false,
             delivery_confirmed: false,
@@ -150,11 +160,13 @@ impl WindowAccumulator {
         !probing && now.duration_since(self.last_report) >= WINDOW
     }
 
-    /// Every anchor forward to now, dropping what the window held.
+    /// Every anchor forward to now, dropping what the window held, and the
+    /// burst's aftermath armed.
     ///
     /// The capacity burst lands in the packet and byte counters but never in
     /// the decoder, so without this the first window after it reads as a
-    /// throughput that never happened.
+    /// throughput that never happened. The freeze it can leave behind outlives
+    /// this one window, which is what [`probe_aftermath`] covers.
     pub(crate) fn rebase(&mut self, now: Instant) {
         let st = self.stats;
         self.recovered = st.fec_recovered_shards;
@@ -164,6 +176,7 @@ impl WindowAccumulator {
         self.bytes = wire_bytes(&st);
         self.last_report = now;
         self.discard = true;
+        self.aftermath_left = PROBE_AFTERMATH_WINDOWS;
         self.flushed = false;
     }
 
@@ -192,6 +205,18 @@ impl WindowAccumulator {
             as u32)
             .saturating_add(self.audio_reserved_kbps);
         let mean = |sum: u64, count: u32| (count > 0).then(|| (sum / u64::from(count)) as i64);
+        // The forced tail window neither spends nor ends the aftermath: its
+        // asks may not have surfaced yet.
+        let recovery_kf =
+            if !discarded && probe_aftermath(&mut self.aftermath_left, self.recovery_kf > 0) {
+                tracing::debug!(
+                    recovery_kf = self.recovery_kf,
+                    "keyframe asks in the capacity burst's aftermath — not judged as congestion"
+                );
+                0
+            } else {
+                self.recovery_kf
+            };
         let sample = WindowSample {
             now,
             dropped,
@@ -202,7 +227,7 @@ impl WindowAccumulator {
             encode_mean_us: mean(self.encode_sum_us, self.encode_count),
             actual_kbps,
             flushed: self.flushed,
-            recovery_kf: self.recovery_kf,
+            recovery_kf,
             activity: activity(self.marks_repeats, self.au_frames, self.au_repeats),
         };
         // A discarded window stays silent, so it also owes no delivery count.
@@ -267,6 +292,27 @@ fn activity(marks_repeats: bool, frames: u32, repeats: u32) -> WindowActivity {
     }
 }
 
+/// Whether this window's keyframe asks still belong to the capacity burst.
+///
+/// The burst runs beside live video, so a link it overdrives drops frames too
+/// and the client asks for keyframes until one lands — past the one discarded
+/// tail window. Two asks in a judged window end slow start and four cut the
+/// rate, yet they say nothing about the link after the burst. Only the asks
+/// are disowned: drops, loss and a flush in the same window are still judged,
+/// which is what keeps a link the start rate overloads from hiding here. Each
+/// window with asks spends one of `windows_left`; the first without ends it.
+fn probe_aftermath(windows_left: &mut u32, asked: bool) -> bool {
+    if *windows_left == 0 {
+        return false;
+    }
+    if asked {
+        *windows_left -= 1;
+    } else {
+        *windows_left = 0;
+    }
+    asked
+}
+
 /// Wire measure: every received media-plane byte (headers, seals and FEC
 /// parity spend the budget) minus speed-test filler.
 fn wire_bytes(st: &Stats) -> u64 {
@@ -305,6 +351,28 @@ mod tests {
             assert!(w.owes_delivery(0));
             assert!(!w.delivery_confirmed);
         }
+    }
+
+    /// The burst's keyframe asks are disowned until a window has none, never
+    /// past the budget.
+    #[test]
+    fn probe_keyframe_asks_are_disowned_until_the_stream_recovers() {
+        let mut left = PROBE_AFTERMATH_WINDOWS;
+        assert!(probe_aftermath(&mut left, true));
+        assert!(probe_aftermath(&mut left, true));
+        assert!(!probe_aftermath(&mut left, false), "no asks ends it");
+        assert!(
+            !probe_aftermath(&mut left, true),
+            "asks after recovery are congestion"
+        );
+
+        let mut left = 2;
+        assert!(probe_aftermath(&mut left, true));
+        assert!(probe_aftermath(&mut left, true));
+        assert!(
+            !probe_aftermath(&mut left, true),
+            "a client that never recovers is judged once the budget is spent"
+        );
     }
 
     #[test]
