@@ -17,8 +17,9 @@
 //! `Driver` against modelled links and pins every decision in a checked-in
 //! baseline.
 
-/// The link simulator and the checked-in baseline (`abr/sim/`).
-#[cfg(test)]
+/// The link simulator and the checked-in baseline (`abr/sim/`). It drives the
+/// client's frame channel constants, so it builds with the client.
+#[cfg(all(test, feature = "quic"))]
 mod sim;
 
 pub mod budget;
