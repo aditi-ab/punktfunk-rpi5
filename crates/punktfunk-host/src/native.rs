@@ -22,8 +22,8 @@ use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, 
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
-    classify, endpoint, io, AccessUpdate, BitrateChanged, ClockEcho, ClockProbe, ColorInfo,
-    GrantClass, Hello, LossReport, PairRequest, PipelineGap, ProbeRequest, ProbeResult,
+    classify, endpoint, io, AccessUpdate, AckReason, BitrateChanged, ClockEcho, ClockProbe,
+    ColorInfo, GrantClass, Hello, LossReport, PairRequest, PipelineGap, ProbeRequest, ProbeResult,
     Reconfigure, Reconfigured, RequestKeyframe, RfiRequest, SetBitrate, Start, Welcome, GRANT_ALL,
     GRANT_CLIPBOARD, GRANT_GAMEPAD, GRANT_LAUNCH, GRANT_MIC, GRANT_POINTER,
 };
@@ -1405,6 +1405,7 @@ pub(crate) async fn run_admitted(
         data_sock,
         start,
         client_label,
+        abr_features,
         compositor,
         gamescope_route,
         prep,
@@ -1498,7 +1499,7 @@ pub(crate) async fn run_admitted(
         tokio::sync::mpsc::unbounded_channel::<Reconfigured>();
     // Rebuild can re-resolve Automatic (1080p client mirroring a 4K panel). Tell the client
     // (`BitrateChanged`); otherwise ABR's first climb is from a stale lower base.
-    let (retarget_tx, retarget_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let (retarget_tx, retarget_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, AckReason)>();
     // Rebuild gap (ms) → `PipelineGap` so the client discards that ABR window as congestion.
     let (gap_tx, gap_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     // Encode loop diffs cursor serial; control task is the sole writer. Wired even if unused.
@@ -1613,6 +1614,7 @@ pub(crate) async fn run_admitted(
         live_reconfig_ok,
         adaptive_fec,
         session_bitrate_kbps,
+        ack_reason: abr_features & punktfunk_core::quic::EXT_ABR_ACK_REASON != 0,
         live_bitrate: live_bitrate.clone(),
         encoder_ceiling_kbps: encoder_ceiling_kbps.clone(),
         cadence_degraded: cadence_degraded.clone(),

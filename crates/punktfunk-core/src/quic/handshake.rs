@@ -149,6 +149,47 @@ pub fn client_label(s: &str) -> String {
     out
 }
 
+/// Extension tag `3` on `Start`: one byte of ABR protocol features the client understands,
+/// as a bitfield ([`EXT_ABR_ACK_REASON`] is bit 0). A later feature takes another bit here
+/// rather than a tag of its own, so the host reads one byte and answers what it recognises.
+/// An absent tag, an empty value or a zero byte is a client that understands none of them —
+/// which is every client shipped so far.
+pub const EXT_TAG_ABR: u16 = 3;
+
+/// [`EXT_TAG_ABR`] bit 0: the client reads the reason byte on
+/// [`BitrateChanged`](super::control::BitrateChanged). The host sends that tenth byte only
+/// toward this bit, because every client without it rejects an ack of any other length.
+/// Core sets it for every embedder that links the controller reading it, not the embedder.
+pub const EXT_ABR_ACK_REASON: u8 = 0x01;
+
+/// The extension entries a client appends to its `Start`, label before features.
+///
+/// Empty toward a host without [`HOST_CAP2_EXT`](super::HOST_CAP2_EXT): that host reads
+/// `Start`'s six frozen bytes and nothing else, so it never learns the ABR features and
+/// never lengthens an ack — today's behaviour, reached by never being told. An empty label
+/// says nothing rather than saying nothing at length.
+pub(crate) fn start_ext<'a>(host_caps2: u8, label: &'a str, abr: &'a [u8]) -> Vec<(u16, &'a [u8])> {
+    if host_caps2 & super::HOST_CAP2_EXT == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<(u16, &[u8])> = Vec::with_capacity(2);
+    if !label.is_empty() {
+        out.push((EXT_TAG_CLIENT, label.as_bytes()));
+    }
+    out.push((EXT_TAG_ABR, abr));
+    out
+}
+
+/// The ABR feature byte of a decoded extension block; `0` when the tag is absent or empty.
+/// Both ends read the byte through this so a missing tag and a zero byte cannot diverge.
+pub fn ext_abr_features(entries: &[(u16, &[u8])]) -> u8 {
+    entries
+        .iter()
+        .find(|(tag, _)| *tag == EXT_TAG_ABR)
+        .and_then(|(_, v)| v.first().copied())
+        .unwrap_or(0)
+}
+
 /// Largest extension block on the wire, its `ext_len` header included. The block is read
 /// before the peer is trusted, so this bounds what one message makes the other side hold.
 pub const EXT_MAX_BYTES: usize = 4096;
@@ -2517,6 +2558,43 @@ mod tests {
         assert!(encode_ext_block(&[(EXT_TAG_PADDING, &[0u8; EXT_MAX_BYTES][..])]).is_err());
         let flood: Vec<(u16, &[u8])> = (0..=EXT_MAX_ENTRIES as u16).map(|t| (t, &[][..])).collect();
         assert!(encode_ext_block(&flood).is_err());
+    }
+
+    /// New client → old host: a host that does not parse the block is told
+    /// nothing, so its acks stay nine bytes and its behaviour stays today's.
+    #[test]
+    fn an_old_host_is_told_nothing_and_answers_as_it_always_did() {
+        let abr = [EXT_ABR_ACK_REASON];
+        assert!(start_ext(0, "android 0.38.0", &abr).is_empty());
+        assert!(start_ext(HOST_CAP2_REPEAT_MARK | HOST_CAP2_TOUCH, "x", &abr).is_empty());
+        // A host that does parse it hears both, the log label first.
+        let ext = start_ext(HOST_CAP2_EXT, "android 0.38.0", &abr);
+        assert_eq!(ext.len(), 2);
+        assert_eq!(ext[0].0, EXT_TAG_CLIENT);
+        assert_eq!(ext_abr_features(&ext), EXT_ABR_ACK_REASON);
+        // No label is still a tag: the feature byte does not ride on a log line.
+        let ext = start_ext(HOST_CAP2_EXT, "", &abr);
+        assert_eq!(ext, vec![(EXT_TAG_ABR, &abr[..])]);
+    }
+
+    /// New client → new host: the tag is one byte of features, and a bit this
+    /// host does not know is a bit it ignores — bit 0 is still served.
+    #[test]
+    fn an_abr_tag_with_unknown_bits_still_asks_for_the_ack_reason() {
+        let one = [EXT_ABR_ACK_REASON];
+        let block = encode_ext_block(&[(EXT_TAG_ABR, &one[..])]).unwrap();
+        let got = decode_ext_block(&block).unwrap();
+        assert_eq!(ext_abr_features(&got) & EXT_ABR_ACK_REASON, 1);
+        // A client from a later package setting bits this build never heard of.
+        let future = [EXT_ABR_ACK_REASON | 0xF0];
+        let block = encode_ext_block(&[(EXT_TAG_ABR, &future[..])]).unwrap();
+        let got = decode_ext_block(&block).unwrap();
+        assert_eq!(ext_abr_features(&got) & EXT_ABR_ACK_REASON, 1);
+        // Absent, empty, or zero: a client that reads no ABR feature at all.
+        assert_eq!(ext_abr_features(&[]), 0);
+        assert_eq!(ext_abr_features(&[(EXT_TAG_ABR, &[][..])]), 0);
+        assert_eq!(ext_abr_features(&[(EXT_TAG_ABR, &[0][..])]), 0);
+        assert_eq!(ext_abr_features(&[(EXT_TAG_CLIENT, &[1][..])]), 0);
     }
 
     #[test]

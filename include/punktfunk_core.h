@@ -1075,6 +1075,19 @@
 // Longest [`EXT_TAG_CLIENT`] value in UTF-8 bytes. A log field, so short.
 #define PUNKTFUNK_EXT_CLIENT_MAX 96
 
+// Extension tag `3` on `Start`: one byte of ABR protocol features the client understands,
+// as a bitfield ([`EXT_ABR_ACK_REASON`] is bit 0). A later feature takes another bit here
+// rather than a tag of its own, so the host reads one byte and answers what it recognises.
+// An absent tag, an empty value or a zero byte is a client that understands none of them —
+// which is every client shipped so far.
+#define PUNKTFUNK_EXT_TAG_ABR 3
+
+// [`EXT_TAG_ABR`] bit 0: the client reads the reason byte on
+// [`BitrateChanged`](super::control::BitrateChanged). The host sends that tenth byte only
+// toward this bit, because every client without it rejects an ack of any other length.
+// Core sets it for every embedder that links the controller reading it, not the embedder.
+#define PUNKTFUNK_EXT_ABR_ACK_REASON 1
+
 // Largest extension block on the wire, its `ext_len` header included. The block is read
 // before the peer is trusted, so this bounds what one message makes the other side hold.
 #define PUNKTFUNK_EXT_MAX_BYTES 4096

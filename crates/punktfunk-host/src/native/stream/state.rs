@@ -202,7 +202,7 @@ pub(super) struct StreamState {
     pub(super) bitrate_rx: std::sync::mpsc::Receiver<u32>,
     pub(super) session_rx: std::sync::mpsc::Receiver<SessionSwitch>,
     pub(super) reconfig_result_tx: tokio::sync::mpsc::UnboundedSender<Reconfigured>,
-    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
     pub(super) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
 }
 
@@ -1063,7 +1063,7 @@ pub(super) fn adopt_built_bitrate(
     current: &mut u32,
     built: u32,
     live: &Arc<AtomicU32>,
-    retarget: &tokio::sync::mpsc::UnboundedSender<u32>,
+    retarget: &tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
 ) {
     if built == *current {
         return;
@@ -1075,7 +1075,8 @@ pub(super) fn adopt_built_bitrate(
     );
     *current = built;
     live.store(built, Ordering::Relaxed);
-    let _ = retarget.send(built);
+    // The host re-resolved what it encodes; nothing refused the client a rate.
+    let _ = retarget.send((built, AckReason::Granted));
 }
 
 /// What this session's launch came to, in the client's vocabulary.
@@ -1170,14 +1171,15 @@ mod tests {
     #[test]
     fn adopting_a_rebuilt_rate_tells_the_client() {
         let live = Arc::new(AtomicU32::new(20_000));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, AckReason)>();
         let mut current = 20_000;
         adopt_built_bitrate(&mut current, 20_000, &live, &tx);
         assert_eq!(rx.try_recv().ok(), None);
         adopt_built_bitrate(&mut current, 60_000, &live, &tx);
         assert_eq!(current, 60_000);
         assert_eq!(live.load(Ordering::Relaxed), 60_000);
-        assert_eq!(rx.try_recv().ok(), Some(60_000));
+        // Nobody refused the client anything: the host re-resolved its own rate.
+        assert_eq!(rx.try_recv().ok(), Some((60_000, AckReason::Granted)));
     }
 
     /// The registry's liveness vocabulary and the wire's are one set, mapped here

@@ -454,7 +454,7 @@ pub(super) struct SessionContext {
     pub(super) probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     /// Corrective `Reconfigured` when a rebuild stayed at the old mode or honored a different refresh.
     pub(super) reconfig_result_tx: tokio::sync::mpsc::UnboundedSender<Reconfigured>,
-    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
     pub(super) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
     pub(super) fec_target: Arc<AtomicU8>,
     pub(super) conn: super::link::SessionLink,

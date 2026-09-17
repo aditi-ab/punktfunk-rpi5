@@ -326,6 +326,8 @@ pub(super) async fn negotiate(
     // What the client calls itself (`EXT_TAG_CLIENT` on `Start`); `None` from one that sent no
     // block. Log only: two dialers from one device are told apart by that line.
     Option<String>,
+    // `EXT_TAG_ABR` on `Start` (`0` = absent): the ABR wire features this client reads.
+    u8,
     Option<crate::vdisplay::Compositor>,
     // Gamescope sub-mode as a value, not process env — a concurrent connect would overwrite env.
     Option<crate::vdisplay::GamescopeRoute>,
@@ -782,14 +784,19 @@ pub(super) async fn negotiate(
 
     let start_msg = io::read_msg(recv).await?;
     let start = Start::decode(&start_msg).map_err(|e| anyhow!("Start decode: {e:?}"))?;
-    // What the client calls itself, when it sent one. A label for the log: a bad block fails the
-    // handshake (`decode_ext`'s rule), an unknown tag is skipped, and absence says nothing.
-    let client_label = Start::decode_ext(&start_msg)
-        .map_err(|e| anyhow!("Start extensions: {e:?}"))?
-        .into_iter()
+    // The block the client appended, decoded once. A bad block fails the handshake
+    // (`decode_ext`'s rule), an unknown tag is skipped, and absence says nothing.
+    let start_ext =
+        Start::decode_ext(&start_msg).map_err(|e| anyhow!("Start extensions: {e:?}"))?;
+    // What the client calls itself, when it sent one. A label for the log.
+    let client_label = start_ext
+        .iter()
         .find(|(tag, _)| *tag == punktfunk_core::quic::EXT_TAG_CLIENT)
         .map(|(_, v)| punktfunk_core::quic::client_label(&String::from_utf8_lossy(v)))
         .filter(|s| !s.is_empty());
+    // Which ABR wire features this client understands. Bits it does not set are bits it
+    // cannot read, and bits this host does not know are ignored.
+    let abr_features = punktfunk_core::quic::ext_abr_features(&start_ext);
     bringup.mark("start");
     // `wire_mtu::spawn_watch` is started by `serve_session` once the control-task channels
     // exist; it also drives mid-session shard renegotiation (needs the control writer).
@@ -800,6 +807,7 @@ pub(super) async fn negotiate(
         data_sock,
         start,
         client_label,
+        abr_features,
         compositor,
         gamescope_route,
         prep,

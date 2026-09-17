@@ -19,7 +19,17 @@
 
 use super::*;
 use pf_clipboard::ClipCoordCmd;
-use punktfunk_core::quic::{ClipControl, ClipOffer, ClipState};
+use punktfunk_core::quic::{AckReason, ClipControl, ClipOffer, ClipState};
+
+/// The ack this client can read. The reason byte goes only to a client that
+/// asked for it (`EXT_ABR_ACK_REASON`); every other client gets the nine bytes
+/// it has always got, whatever the host knows.
+fn bitrate_ack(kbps: u32, why: AckReason, client_reads_reason: bool) -> BitrateChanged {
+    BitrateChanged {
+        bitrate_kbps: kbps,
+        reason: client_reads_reason.then_some(why),
+    }
+}
 
 /// Named fields, not a 30-argument spawn: `retarget_rx` and `gap_rx` are both
 /// bare `u32`, so a positional swap would compile and fail at runtime.
@@ -31,6 +41,10 @@ pub(super) struct Task {
     pub(super) live_reconfig_ok: bool,
     pub(super) adaptive_fec: bool,
     pub(super) session_bitrate_kbps: u32,
+    /// Client set `EXT_ABR_ACK_REASON` in its `Start` block: its `BitrateChanged`
+    /// may carry the reason byte. Clear for every shipped client, which rejects
+    /// a longer ack, and for every client behind a host without `HOST_CAP2_EXT`.
+    pub(super) ack_reason: bool,
     /// Encoder-applied rate, codec ceiling (`0` = unknown), and cadence-miss
     /// flag. Read at `SetBitrate` so the ack never exceeds what the encoder
     /// will actually run.
@@ -53,9 +67,10 @@ pub(super) struct Task {
     pub(super) probe_tx: std::sync::mpsc::Sender<ProbeRequest>,
     pub(super) probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
     pub(super) reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Reconfigured>,
-    /// Host-initiated Automatic re-resolve. Forwarded as `BitrateChanged` so
-    /// the client's climb base tracks the encoder.
-    pub(super) retarget_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
+    /// The rate the encoder settled on, with what settled it. Forwarded as
+    /// `BitrateChanged` so the client's climb base tracks the encoder: a
+    /// rebuild's own re-resolve is `Granted`, a short apply an `EncoderLimit`.
+    pub(super) retarget_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, AckReason)>,
     /// Rebuild stall duration in ms. Forwarded as `PipelineGap` so the client
     /// bitrate controller drops the report window that straddled our stall.
     pub(super) gap_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
@@ -104,6 +119,7 @@ pub(super) async fn run(task: Task) {
         live_reconfig_ok,
         adaptive_fec,
         session_bitrate_kbps,
+        ack_reason,
         live_bitrate,
         encoder_ceiling_kbps,
         cadence_degraded,
@@ -282,24 +298,28 @@ pub(super) async fn run(task: Task) {
                     // Data plane rebuilds the encoder in place (first frame is
                     // an IDR with in-band SPS). PyroWave is pinned: ack the
                     // session rate so a foreign client cannot AIMD it down.
-                    let resolved = if codec == crate::encode::Codec::PyroWave {
+                    let (resolved, why) = if codec == crate::encode::Codec::PyroWave {
                         tracing::info!(
                             requested_kbps = req.bitrate_kbps,
                             pinned_kbps = session_bitrate_kbps,
                             "PyroWave session: mid-stream bitrate retarget refused (pinned)"
                         );
-                        session_bitrate_kbps
+                        (session_bitrate_kbps, AckReason::Pinned)
                     } else {
                         let mut r = resolve_bitrate_kbps(req.bitrate_kbps);
+                        let mut why = AckReason::Granted;
                         // Ack is the client's climb base: never promise past
                         // the encoder's discovered codec ceiling (`0` = none).
                         let ceiling = encoder_ceiling_kbps.load(Ordering::Relaxed);
                         if ceiling != 0 && r > ceiling {
                             r = ceiling;
+                            why = AckReason::EncoderLimit;
                         }
                         // On a fat LAN nothing else stops the climb, and past
                         // the compute knee more bits deepen the miss. Hold a
-                        // climb at the applied rate; descents pass.
+                        // climb at the applied rate; descents pass. Named
+                        // after the ceiling: whichever binds tighter is the
+                        // one the client is entitled to hear.
                         let live = live_bitrate.load(Ordering::Relaxed);
                         if cadence_degraded.load(Ordering::Relaxed) && live != 0 && r > live {
                             tracing::info!(
@@ -311,17 +331,16 @@ pub(super) async fn run(task: Task) {
                                 "bitrate climb refused — encode is behind cadence"
                             );
                             r = live;
+                            why = AckReason::Cadence;
                         }
-                        r
+                        (r, why)
                     };
                     tracing::debug!(
                         requested_kbps = req.bitrate_kbps,
                         resolved_kbps = resolved,
                         "mid-stream bitrate change requested"
                     );
-                    let ack = BitrateChanged {
-                        bitrate_kbps: resolved,
-                    };
+                    let ack = bitrate_ack(resolved, why, ack_reason);
                     if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
                         break;
                     }
@@ -516,15 +535,13 @@ pub(super) async fn run(task: Task) {
                 // against client retargets, but a mode switch re-resolves the
                 // pin (~1.6 bpp for the new pixel rate) and the live-rate
                 // display otherwise stays on the old number.
-                let Some(kbps) = retarget else { break };
+                let Some((kbps, why)) = retarget else { break };
                 tracing::info!(
                     kbps,
                     "encoder re-targeted by a pipeline rebuild — telling the client"
                 );
-                if io::write_msg(&mut ctrl_send, &BitrateChanged { bitrate_kbps: kbps }.encode())
-                    .await
-                    .is_err()
-                {
+                let ack = bitrate_ack(kbps, why, ack_reason);
+                if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
                     break;
                 }
             }
@@ -645,6 +662,27 @@ mod tests {
         enabled: true,
         flags: 0,
     };
+
+    /// Old client → new host: a client whose `Start` carried no `EXT_TAG_ABR`
+    /// gets the ack it has always got — nine bytes, whatever the host knows
+    /// about the refusal.
+    #[test]
+    fn a_client_that_did_not_ask_still_gets_a_nine_byte_ack() {
+        for why in [
+            AckReason::Granted,
+            AckReason::EncoderLimit,
+            AckReason::Cadence,
+            AckReason::Pinned,
+        ] {
+            let old = bitrate_ack(41_852, why, false);
+            assert_eq!(old.reason, None);
+            assert_eq!(old.encode().len(), 9);
+            let new = bitrate_ack(41_852, why, true);
+            assert_eq!(new.reason, Some(why));
+            assert_eq!(new.encode().len(), 10);
+            assert_eq!(new.bitrate_kbps, old.bitrate_kbps);
+        }
+    }
 
     #[test]
     fn clip_resolution_three_way() {

@@ -73,7 +73,9 @@ impl StreamState {
             if applied_kbps < new_kbps {
                 self.encoder_ceiling_kbps
                     .store(applied_kbps, Ordering::Relaxed);
-                let _ = self.retarget_tx.send(applied_kbps);
+                let _ = self
+                    .retarget_tx
+                    .send((applied_kbps, AckReason::EncoderLimit));
             }
             if applied_kbps < self.bitrate_kbps {
                 self.behind_score = 0;
@@ -113,7 +115,9 @@ impl StreamState {
                 if applied_kbps < new_kbps {
                     self.encoder_ceiling_kbps
                         .store(applied_kbps, Ordering::Relaxed);
-                    let _ = self.retarget_tx.send(applied_kbps);
+                    let _ = self
+                        .retarget_tx
+                        .send((applied_kbps, AckReason::EncoderLimit));
                 }
                 self.counters.note_bitrate(applied_kbps);
                 self.bitrate_kbps = applied_kbps;
@@ -133,7 +137,9 @@ impl StreamState {
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
                     "bitrate-change encoder rebuild failed — keeping the current rate");
-                let _ = self.retarget_tx.send(self.bitrate_kbps);
+                let _ = self
+                    .retarget_tx
+                    .send((self.bitrate_kbps, AckReason::EncoderLimit));
             }
         }
     }
