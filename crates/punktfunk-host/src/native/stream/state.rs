@@ -318,7 +318,7 @@ impl StreamState {
         plan.reframe_to = ctx.reframe_to;
         tracing::info!(?plan, "resolved session plan");
         let SessionContext {
-            session,
+            session: punched_session,
             mode,
             seconds,
             stop,
@@ -347,6 +347,7 @@ impl StreamState {
             codec: _,
             probe_rx,
             probe_result_tx,
+            ramp_open,
             reconfig_result_tx,
             retarget_tx,
             gap_tx,
@@ -385,6 +386,17 @@ impl StreamState {
             #[cfg(target_os = "linux")]
             inj_session_tx,
         } = ctx;
+        // The data plane is punched and idle until the send thread starts.
+        // Answer the client's bring-up ramp on it meanwhile: it measures the
+        // link with no video to damage, and hands both back below.
+        let ramp = ramp::RampServer::start(
+            punched_session,
+            probe_rx,
+            probe_result_tx.clone(),
+            probe_seq,
+            stop.clone(),
+            ramp_open,
+        );
         // Stamp before the display exists: a reading after launch would reject the process it is meant to find.
         let fresh_stamp = crate::gamelease::launch_clock();
         // Re-dial re-sends `Hello::launch` verbatim. Adopt against the original stamp or procscan refuses it.
@@ -804,6 +816,9 @@ impl StreamState {
             driver_dropped: driver_dropped.clone(),
             counters: counters.clone(),
         };
+        // Pipeline, launch and lease are up: take the data plane back. A step
+        // in flight finishes first, which is ≤ 50 ms.
+        let (session, probe_rx) = ramp.finish();
         let send_thread = std::thread::Builder::new()
             .name("punktfunk-send".into())
             .spawn({

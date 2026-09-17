@@ -1603,6 +1603,14 @@ pub(crate) async fn run_admitted(
     let client_packets_received = Arc::new(AtomicU32::new(u32::MAX));
     let client_packets_received_ctl = client_packets_received.clone();
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
+    // The bring-up ramp's window: probe requests are served on the punched
+    // data plane without the control task's spacing until the send thread
+    // takes it. Open from the handshake, because the client asks as soon as
+    // it has punched — before this host has built anything.
+    let ramp_open = Arc::new(AtomicBool::new(
+        welcome.host_caps2 & punktfunk_core::quic::HOST_CAP2_RAMP != 0,
+    ));
+    let ramp_open_ctl = ramp_open.clone();
     let (probe_result_tx, probe_result_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
     // Accept ack is written before the rebuild; a failed or differently-honored rebuild must
     // correct the client's mode slot with a second `Reconfigured { accepted: true, mode }`.
@@ -1739,6 +1747,7 @@ pub(crate) async fn run_admitted(
         bitrate_tx,
         probe_tx,
         probe_result_rx,
+        ramp_open: ramp_open_ctl,
         reconfig_result_rx,
         retarget_rx,
         gap_rx,
@@ -2430,6 +2439,7 @@ pub(crate) async fn run_admitted(
                         codec,
                         probe_rx,
                         probe_result_tx,
+                        ramp_open,
                         reconfig_result_tx,
                         retarget_tx,
                         gap_tx,

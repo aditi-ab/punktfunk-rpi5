@@ -838,6 +838,32 @@ mod tests {
         );
     }
 
+    /// A host without `HOST_CAP2_RAMP` gets exactly today's session: no
+    /// steps, and the 800 ms burst two seconds after video flows.
+    #[test]
+    fn an_old_host_still_gets_the_legacy_burst() {
+        let now = Instant::now();
+        let mut p = CapacityProbe::new(true, false, None, 100_000, now);
+        assert!(p.poll(now, 0).is_none(), "nothing goes out during bring-up");
+        assert!(p.poll(now + PROBE_DELAY, 0).is_none(), "nor before video");
+        assert_eq!(
+            p.poll(now + 2 * PROBE_DELAY, 1),
+            Some((probe_target_kbps(100_000), PROBE_MS))
+        );
+        assert_eq!(p.take_ramped(), None, "no ramp ran, so none has a verdict");
+    }
+
+    /// `PUNKTFUNK_ABR_PROBE=0` measures nothing, whatever the host serves.
+    #[test]
+    fn a_disabled_probe_neither_ramps_nor_bursts() {
+        let now = Instant::now();
+        let mut p = CapacityProbe::new(false, true, None, 100_000, now);
+        assert!(p.poll(now, 0).is_none());
+        assert!(p.poll(now + PROBE_DELAY, 1).is_none());
+        assert_eq!(p.take_ramped(), None);
+        assert!(!p.ramping());
+    }
+
     /// An embedder speed test finishes too, and its numbers are not the
     /// controller's to learn from.
     #[test]

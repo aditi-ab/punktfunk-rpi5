@@ -16,6 +16,7 @@ mod cursor;
 mod encode;
 mod phase_lock;
 mod pipeline;
+mod ramp;
 mod rebuild;
 mod recovery;
 #[cfg(target_os = "windows")]
@@ -27,6 +28,8 @@ use self::phase_lock::{phase_lock_enabled, PhaseController};
 // `native.rs` builds it and `control.rs` holds it: the 0xCF ACK hold crosses the module.
 pub(crate) use self::phase_lock::PhaseCtl;
 pub(super) use self::pipeline::{prepare_display, PrepHandle, PreparedDisplay};
+// `control.rs` bounds its spacing exemption by the same step length.
+pub(crate) use self::ramp::RAMP_STEP_MAX_MS;
 use self::send::{send_loop, ChunkMsg, FrameMsg, SendMsg, SendStats};
 // `native.rs` asks before offering a mid-stream reconfig.
 pub(crate) use self::send::reconfig_allowed;
@@ -468,6 +471,10 @@ pub(super) struct SessionContext {
         tokio::sync::watch::Sender<Option<punktfunk_core::quic::CursorShape>>,
     /// Without this, a mid-session probe consumes video indexes the gap detector cannot see.
     pub(super) probe_seq: bool,
+    /// The client's bring-up ramp may be served on the idle data plane
+    /// (`HOST_CAP2_RAMP`). Cleared when the send thread takes the session,
+    /// which is where the control task's probe spacing comes back.
+    pub(super) ramp_open: Arc<AtomicBool>,
     pub(super) streamed_au: bool,
     /// `false` = single-slice. TV-SoC decoders (Amlogic) wedge on multi-slice.
     pub(super) multi_slice: bool,

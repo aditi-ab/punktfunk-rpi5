@@ -31,6 +31,16 @@ fn bitrate_ack(kbps: u32, why: AckReason, client_reads_reason: bool) -> BitrateC
     }
 }
 
+/// Whether this probe request skips the one-per-10 s spacing: a bring-up ramp
+/// step, which is short and lands on a data plane with no video on it.
+///
+/// The length bound is the exemption's own limit. Without it a client could
+/// hold the window open with 5 s bursts at the probe ceiling, which is the
+/// uplink-pinning the spacing exists against.
+fn is_ramp_step(req: &ProbeRequest, ramp_open: bool) -> bool {
+    ramp_open && req.duration_ms <= super::stream::RAMP_STEP_MAX_MS
+}
+
 /// Named fields, not a 30-argument spawn: `retarget_rx` and `gap_rx` are both
 /// bare `u32`, so a positional swap would compile and fail at runtime.
 pub(super) struct Task {
@@ -66,6 +76,11 @@ pub(super) struct Task {
     pub(super) rfi_tx: std::sync::mpsc::Sender<(u32, u32)>,
     pub(super) bitrate_tx: std::sync::mpsc::Sender<u32>,
     pub(super) probe_tx: std::sync::mpsc::Sender<ProbeRequest>,
+    /// The client's bring-up ramp may still be running: its steps are served
+    /// on the punched-but-idle data plane, and the spacing below would let
+    /// one step through and refuse the rest. Cleared when the send thread
+    /// takes the session over (`stream::ramp`).
+    pub(super) ramp_open: Arc<AtomicBool>,
     pub(super) probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
     pub(super) reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Reconfigured>,
     /// The rate the encoder settled on, with what settled it. Forwarded as
@@ -134,6 +149,7 @@ pub(super) async fn run(task: Task) {
         bitrate_tx,
         probe_tx,
         mut probe_result_rx,
+        ramp_open,
         mut reconfig_result_rx,
         mut retarget_rx,
         mut gap_rx,
@@ -362,7 +378,10 @@ pub(super) async fn run(task: Task) {
                     let _ = shard_ack_tx.send(ack.shard_payload);
                 } else if let Ok(req) = ProbeRequest::decode(&msg) {
                     let now = std::time::Instant::now();
-                    if last_probe.is_some_and(|t| now.duration_since(t) < MIN_PROBE_INTERVAL) {
+                    let ramping = is_ramp_step(&req, ramp_open.load(Ordering::SeqCst));
+                    if !ramping
+                        && last_probe.is_some_and(|t| now.duration_since(t) < MIN_PROBE_INTERVAL)
+                    {
                         tracing::warn!(
                             target_kbps = req.target_kbps,
                             "speed-test probe rejected (rate-limited)"
@@ -738,5 +757,24 @@ mod tests {
 
         assert!(!clip_offer_permitted(GRANT_ALL & !GRANT_CLIPBOARD, false));
         assert!(!clip_offer_permitted(GRANT_ALL, false));
+    }
+
+    /// The bring-up exemption is bounded twice: the window has to be open,
+    /// and the step short. An 800 ms burst or a 5 s one is spaced like any
+    /// other, open window or not.
+    #[test]
+    fn only_a_short_step_inside_the_window_skips_the_spacing() {
+        let req = |duration_ms| ProbeRequest {
+            target_kbps: 40_000,
+            duration_ms,
+        };
+        assert!(is_ramp_step(&req(25), true));
+        assert!(is_ramp_step(&req(super::stream::RAMP_STEP_MAX_MS), true));
+        assert!(!is_ramp_step(
+            &req(super::stream::RAMP_STEP_MAX_MS + 1),
+            true
+        ));
+        assert!(!is_ramp_step(&req(800), true));
+        assert!(!is_ramp_step(&req(25), false));
     }
 }
