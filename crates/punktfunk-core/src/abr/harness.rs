@@ -92,7 +92,7 @@ pub(super) fn disarm_encode(c: &mut BitrateController, start: Instant, tick: &mu
         let verdict = encode_choke(c, start, tick, 20_000);
         c.on_ack(verdict.expect("an unanswered encode rise must back off"));
     }
-    assert!(c.encode_disarmed);
+    assert!(c.encode_down.disarmed());
 }
 
 pub(super) fn calm_window(c: &mut BitrateController, at: Instant) {
@@ -151,12 +151,12 @@ pub(super) fn latch_knee(c: &mut BitrateController, start: Instant, tick: &mut u
     }
     let knee = c.current_kbps;
     let r1 = choke(c, start, tick).expect("first choke must back off");
-    assert!(c.decode_cap_kbps.is_none(), "one event must not latch");
+    assert!(c.decode_cap.kbps().is_none(), "one event must not latch");
     c.on_ack(r1);
     climb_to(c, start, tick, knee - knee / DECODE_CAP_SIMILAR_DIV);
     let rate = c.current_kbps;
     let r2 = choke(c, start, tick).expect("re-climb choke must back off");
-    assert_eq!(c.decode_cap_kbps, Some(rate - rate / 16));
+    assert_eq!(c.decode_cap.kbps(), Some(rate - rate / 16));
     c.on_ack(r2);
     rate - rate / 16
 }

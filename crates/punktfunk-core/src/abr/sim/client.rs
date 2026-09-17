@@ -525,7 +525,7 @@ impl Client {
             request_kbps: request,
             cut_from_kbps: request.filter(|&k| k < was).map(|_| was),
             discarded: discard,
-            encode_disarmed: self.abr.encode_disarmed,
+            encode_disarmed: self.abr.encode_down.disarmed(),
         });
         self.reset_window();
     }
