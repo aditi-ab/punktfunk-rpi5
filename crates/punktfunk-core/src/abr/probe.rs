@@ -90,8 +90,13 @@ pub(crate) enum Measured {
     NotOurs,
     /// The host declined the burst: the negotiated ceiling stands.
     Declined,
-    /// Link capacity, headroom already taken off.
-    Ceiling(u32),
+    /// Link capacity, headroom already taken off. `wall_kbps` is `Some` when
+    /// the link refused what the burst offered — the same test a ramp step is
+    /// judged by, so it is the same kind of evidence about the same wall.
+    Ceiling {
+        ceiling_kbps: u32,
+        wall_kbps: Option<u32>,
+    },
 }
 
 /// What the ramp proved by the time it stopped.
@@ -187,6 +192,22 @@ fn step_rate_kbps(step: &Step, r: &ProbeReport) -> u32 {
     rate.min(step.target_kbps)
 }
 
+/// Did the link refuse what was offered? Delivered ÷ offered as packets a
+/// millisecond on each side: the host sent `wire_packets_sent` over its
+/// window, we received `delivered_packets` over ours. A queue that stretches
+/// the arrivals and loss that thins them both land here.
+///
+/// A sender that could not offer the rate is not a refusal: the link was
+/// never asked.
+fn link_refused(r: &ProbeReport) -> bool {
+    let interval = u64::from(r.client_interval_ms);
+    if interval == 0 || r.delivered_packets < 2 || r.wire_packets_sent == 0 || r.send_dropped > 0 {
+        return false;
+    }
+    r.delivered_packets * u64::from(r.host_duration_ms) * 100
+        < u64::from(r.wire_packets_sent) * interval * RAMP_WALL_PCT
+}
+
 /// Step length for a rate: the step's own duration, shortened when the byte
 /// cap binds first.
 fn step_ms(target_kbps: u32) -> u32 {
@@ -271,13 +292,7 @@ impl Ramp {
             // link would take.
             return Some(Verdict::Sender(delivered_kbps));
         }
-        // Delivered ÷ offered as packets a millisecond on each side: the host
-        // sent `wire_packets_sent` over its window, we received
-        // `delivered_packets` over ours. A queue that stretches the arrivals
-        // and loss that thins them both land here.
-        let delivered = r.delivered_packets * u64::from(r.host_duration_ms);
-        let offered = u64::from(r.wire_packets_sent) * interval;
-        if delivered * 100 < offered * RAMP_WALL_PCT {
+        if link_refused(r) {
             tracing::info!(
                 target_kbps = step.target_kbps,
                 delivered_kbps,
@@ -617,14 +632,22 @@ impl CapacityProbe {
         let delivered_kbps =
             (r.delivered_bytes.saturating_mul(8) / u64::from(r.window_ms.max(1))) as u32;
         let ceiling = delivered_kbps.saturating_mul(7) / 10;
+        // The burst asks for twice what the stream can use, so a link that
+        // hands over much less than it was offered has a wall and this is
+        // where it is. A link that kept up refused nothing and says nothing.
+        let wall_kbps = link_refused(&r).then_some(delivered_kbps);
         tracing::info!(
             delivered_kbps,
             ceiling_kbps = ceiling,
+            wall = wall_kbps.is_some(),
             client_interval_ms = r.client_interval_ms,
             host_duration_ms = r.host_duration_ms,
             "adaptive bitrate: link-capacity probe done — climb ceiling set"
         );
-        Measured::Ceiling(ceiling)
+        Measured::Ceiling {
+            ceiling_kbps: ceiling,
+            wall_kbps,
+        }
     }
 }
 
@@ -967,8 +990,46 @@ mod tests {
         // And its answer binds, as an old host's always has.
         assert_eq!(
             rig.p.on_result(report(30_000_000, 800), at),
-            Measured::Ceiling(210_000)
+            Measured::Ceiling {
+                ceiling_kbps: 210_000,
+                wall_kbps: None
+            }
         );
+    }
+
+    /// The legacy burst measures the link the way a ramp step does, so a
+    /// burst the link refused is the same kind of mark toward the link cap.
+    /// A burst the link kept up with refused nothing and marks nothing, and
+    /// neither does one the host could not fill.
+    #[test]
+    fn a_burst_the_link_refused_reports_the_wall_it_found() {
+        let refused = |delivered_packets: u64, wire_packets_sent: u32, send_dropped: u32| {
+            let now = Instant::now();
+            let mut p = CapacityProbe::new(true, false, Some(400_000), 100_000, now);
+            assert!(p.poll(now + PROBE_DELAY, 1, 1).is_some(), "the burst fires");
+            let r = ProbeReport {
+                delivered_bytes: delivered_packets * 1_448,
+                delivered_packets,
+                window_ms: 800,
+                host_duration_ms: 800,
+                client_interval_ms: 800,
+                host_bytes_sent: 40_000_000,
+                wire_packets_sent,
+                send_dropped,
+            };
+            match p.on_result(r, now) {
+                Measured::Ceiling { wall_kbps, .. } => wall_kbps,
+                other => panic!("the burst must measure: {other:?}"),
+            }
+        };
+        // A tenth of what was offered came back: the link refused the rest.
+        assert_eq!(refused(2_000, 20_000, 0), Some(28_960));
+        // Everything offered came back: nothing was refused.
+        assert_eq!(refused(20_000, 20_000, 0), None);
+        // The host never put it on the wire, so the link was never asked.
+        assert_eq!(refused(2_000, 20_000, 7), None);
+        // One packet is no interval and no rate.
+        assert_eq!(refused(1, 20_000, 0), None);
     }
 
     /// A ramp that finished has nothing left to ask: no burst is armed, and
@@ -1040,7 +1101,10 @@ mod tests {
         // 1 MB over 800 ms is 10 Mbps; the ceiling keeps 70 % of it.
         assert_eq!(
             p.on_result(report(1_000_000, 800), now),
-            Measured::Ceiling(7_000)
+            Measured::Ceiling {
+                ceiling_kbps: 7_000,
+                wall_kbps: None
+            }
         );
         assert_eq!(
             p.on_result(report(1_000_000, 800), now),

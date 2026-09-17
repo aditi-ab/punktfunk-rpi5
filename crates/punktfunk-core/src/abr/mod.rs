@@ -305,7 +305,19 @@ impl Driver {
         match self.probe.on_result(r, now) {
             probe::Measured::NotOurs => return,
             probe::Measured::Declined => {}
-            probe::Measured::Ceiling(kbps) => self.set_ceiling(kbps),
+            probe::Measured::Ceiling {
+                ceiling_kbps,
+                wall_kbps,
+            } => {
+                self.set_ceiling(ceiling_kbps);
+                // A burst the link refused measured the same wall a ramp step
+                // would have, so it is one mark toward the link cap. One-shot
+                // at the source: a finished burst is answered once, however
+                // often the pump re-presents its report.
+                if let Some(kbps) = wall_kbps {
+                    self.abr.note_link_mark(kbps);
+                }
+            }
         }
         // Skips video that landed under a suppressed report tick; `rebase`
         // already netted the filler out.
