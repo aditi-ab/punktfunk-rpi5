@@ -120,8 +120,8 @@ pub struct Driver {
     /// Raised between ticks (a probe ended, a burst was abandoned) and sent
     /// on the next one, microseconds later.
     pending: Vec<Action>,
-    /// Acks since the last window closed.
-    acks: Vec<u32>,
+    /// Acks since the last window closed, with the reason each carried.
+    acks: Vec<(u32, Option<crate::quic::AckReason>)>,
 }
 
 impl Driver {
@@ -200,9 +200,10 @@ impl Driver {
 
     /// Host [`crate::quic::BitrateChanged`], in arrival order. Applied when
     /// the window closes: the rate the controller judges a window against is
-    /// the one that was running for it.
-    pub fn on_ack(&mut self, kbps: u32) {
-        self.acks.push(kbps);
+    /// the one that was running for it. `why` is `None` from a host that does
+    /// not name its limits.
+    pub fn on_ack(&mut self, kbps: u32, why: Option<crate::quic::AckReason>) {
+        self.acks.push((kbps, why));
     }
 
     /// A [`Action::SetBitrate`] that never reached the host.
@@ -313,8 +314,8 @@ impl Driver {
         let closed = self.window.close(now);
         // The host's answers to what this window's predecessors asked for,
         // learned before the controller judges this one.
-        for kbps in std::mem::take(&mut self.acks) {
-            self.abr.on_ack(kbps);
+        for (kbps, why) in std::mem::take(&mut self.acks) {
+            self.abr.on_ack(kbps, why);
         }
         let w = &closed.sample;
         if closed.discarded {

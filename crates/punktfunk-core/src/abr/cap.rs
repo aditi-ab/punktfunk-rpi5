@@ -236,6 +236,7 @@ mod tests {
         BASELINE_MIN_WINDOWS, HEAVY_LOSS_PPM, RECOVERY_KF_SEVERE, SEVERE_LOSS_PPM,
     };
     use super::*;
+    use crate::quic::AckReason;
     use std::time::Instant;
 
     #[test]
@@ -246,11 +247,11 @@ mod tests {
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
         // One short ack is not a cap.
-        c.on_ack(794_000);
+        c.on_ack(794_000, None);
         assert!(c.host_cap.kbps().is_none());
         // Second identical short ack: latch.
         assert_eq!(run_clean(&mut c, start, 10, 1), Some(1_400_000));
-        c.on_ack(794_000);
+        c.on_ack(794_000, None);
         assert_eq!(c.host_cap.kbps(), Some(794_000));
         // Parked at the cap: no more requests.
         assert_eq!(run_clean(&mut c, start, 20, 12), None);
@@ -263,12 +264,67 @@ mod tests {
         c.set_ceiling(1_400_000);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
-        c.on_ack(400_000); // failed rebuild kept the old rate
+        c.on_ack(400_000, None); // failed rebuild kept the old rate
         assert!(c.host_cap.kbps().is_none());
         // Full grant: streak broken, no cap.
         assert_eq!(run_clean(&mut c, start, 10, 1), Some(800_000));
-        c.on_ack(800_000);
+        c.on_ack(800_000, None);
         assert!(c.host_cap.kbps().is_none());
+    }
+
+    /// *Encoder limit* is the reason today's nameless short ack always meant,
+    /// so it must latch exactly as an unnamed one does.
+    #[test]
+    fn an_encoder_limit_latches_the_cap_like_an_unnamed_short_ack() {
+        let mut named = BitrateController::new(400_000, None);
+        let mut unnamed = BitrateController::new(400_000, None);
+        let start = Instant::now();
+        for (c, why) in [
+            (&mut named, Some(AckReason::EncoderLimit)),
+            (&mut unnamed, None),
+        ] {
+            c.set_ceiling(1_400_000);
+            assert_eq!(run_clean(c, start, 0, 1), Some(800_000));
+            c.on_ack(794_000, why);
+            assert_eq!(run_clean(c, start, 10, 1), Some(1_400_000));
+            c.on_ack(794_000, why);
+        }
+        assert_eq!(named.host_cap.kbps(), Some(794_000));
+        assert_eq!(named.host_cap.kbps(), unnamed.host_cap.kbps());
+        assert_eq!(named.current_kbps, unnamed.current_kbps);
+    }
+
+    /// A cadence refusal is the host's GPU, not a rate its encoder cannot
+    /// hold: no cap, and climbs wait on the stand-down clock instead of a
+    /// re-probe ladder.
+    #[test]
+    fn a_cadence_refusal_holds_climbs_and_latches_nothing() {
+        let mut c = BitrateController::new(400_000, None);
+        c.set_ceiling(1_400_000);
+        let start = Instant::now();
+        assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
+        c.on_ack(794_000, Some(AckReason::Cadence));
+        c.on_ack(794_000, Some(AckReason::Cadence));
+        assert!(c.host_cap.kbps().is_none(), "a busy GPU is not a cap");
+        assert_eq!(c.current_kbps, 794_000, "the clamp is still authoritative");
+        // Held for the clean run, then asked again — no cap to crawl past.
+        let held = CAP_REPROBE_WINDOWS_MIN - 1;
+        assert_eq!(run_clean(&mut c, start, 10, held), None);
+        assert!(run_clean(&mut c, start, 10 + held, 4).is_some_and(|k| k > 794_000));
+    }
+
+    /// PyroWave is per-frame CBR: there is no rate to control, so the
+    /// controller retires the way an unanswered host retires it.
+    #[test]
+    fn a_pinned_session_turns_the_controller_off() {
+        let mut c = BitrateController::new(400_000, None);
+        c.set_ceiling(1_400_000);
+        let start = Instant::now();
+        assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
+        c.on_ack(400_000, Some(AckReason::Pinned));
+        assert_eq!(c.current_kbps, 400_000);
+        assert_eq!(run_clean(&mut c, start, 10, 40), None);
+        assert!(c.host_cap.kbps().is_none(), "nothing to learn from a pin");
     }
 
     #[test]
@@ -277,9 +333,9 @@ mod tests {
         c.set_ceiling(1_400_000);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
-        c.on_ack(794_000);
+        c.on_ack(794_000, None);
         assert_eq!(run_clean(&mut c, start, 10, 1), Some(1_400_000));
-        c.on_ack(794_000);
+        c.on_ack(794_000, None);
         assert_eq!(c.host_cap.kbps(), Some(794_000));
         // Mode-scoped cap drops; probe-measured link ceiling survives.
         c.on_mode_switch();
@@ -294,9 +350,9 @@ mod tests {
         c.set_ceiling(1_400_000);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
-        c.on_ack(794_000);
+        c.on_ack(794_000, None);
         assert_eq!(run_clean(&mut c, start, 10, 1), Some(1_400_000));
-        c.on_ack(794_000);
+        c.on_ack(794_000, None);
         assert_eq!(c.host_cap.kbps(), Some(794_000));
         // First re-probe is the fast interval.
         assert_eq!(c.host_cap.reprobe_after(), CAP_REPROBE_WINDOWS_MIN);
@@ -323,7 +379,7 @@ mod tests {
             let k = run_clean(&mut c, start, tick, 4).expect("slow start should ask to climb");
             tick += 4;
             assert!(k > 20_000);
-            c.on_ack(20_000);
+            c.on_ack(20_000, None);
         }
         assert_eq!(c.host_cap.kbps(), Some(20_000));
         // Host recovered; grant whatever the re-probe asks.
@@ -333,7 +389,7 @@ mod tests {
                 actual_kbps: 1_000_000,
                 ..WindowSample::at(ticks(start, tick))
             }) {
-                c.on_ack(k);
+                c.on_ack(k, None);
             }
             tick += 1;
             windows_pinned += 1;
@@ -360,9 +416,9 @@ mod tests {
         c.set_ceiling(1_400_000);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
-        c.on_ack(794_000);
+        c.on_ack(794_000, None);
         assert_eq!(run_clean(&mut c, start, 10, 1), Some(1_400_000));
-        c.on_ack(794_000);
+        c.on_ack(794_000, None);
         assert_eq!(c.host_cap.reprobe_after(), CAP_REPROBE_WINDOWS_MIN);
         // Park, lift, refuse at the same value: standing, so the clock doubles.
         let mut tick = 20;
@@ -380,7 +436,7 @@ mod tests {
             assert!(lifted > 794_000, "round {round}: the re-probe never lifted");
             // Host clamps the lift back to its real ceiling.
             c.last_requested_kbps = Some(lifted);
-            c.on_ack(794_000);
+            c.on_ack(794_000, None);
             assert_eq!(c.host_cap.kbps(), Some(794_000));
             assert_eq!(
                 c.host_cap.reprobe_after(),
@@ -459,13 +515,13 @@ mod tests {
         let start = Instant::now();
         let mut tick = 0;
         assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(17_500));
-        c.on_ack(17_500);
+        c.on_ack(17_500, None);
         assert_eq!(
             encode_windows(&mut c, start, &mut tick, 20_000, 8),
             Some(20_000),
             "the encoder did not follow, so the notch is given back"
         );
-        c.on_ack(20_000);
+        c.on_ack(20_000, None);
         assert!(c.encode_down.disarmed());
 
         // Same excursion no longer moves the rate…
@@ -486,7 +542,7 @@ mod tests {
         let start = Instant::now();
         let mut tick = 0;
         assert_eq!(encode_choke(&mut c, start, &mut tick, 40_000), Some(17_500));
-        c.on_ack(17_500);
+        c.on_ack(17_500, None);
         // Five windows: the verdict lands on the third, before a climb can.
         assert_eq!(
             encode_windows(&mut c, start, &mut tick, 22_000, 5),
@@ -557,10 +613,10 @@ mod tests {
             c.decode_backoff_kbps, 0,
             "a starved window is not a knee sample — no reference recorded"
         );
-        c.on_ack(r1);
+        c.on_ack(r1, None);
         climb_to(&mut c, start, &mut t, at - at / DECODE_CAP_SIMILAR_DIV);
         let r2 = stall_choke(&mut c, start, &mut t).expect("second stall edge backs off too");
-        c.on_ack(r2);
+        c.on_ack(r2, None);
         assert!(
             c.decode_cap.kbps().is_none(),
             "a starved pair at the same rate must not latch a phantom knee"
@@ -584,7 +640,7 @@ mod tests {
             c.decode_backoff_kbps, knee,
             "real choke records the reference"
         );
-        c.on_ack(r1);
+        c.on_ack(r1, None);
         climb_to(&mut c, start, &mut t, knee - knee / DECODE_CAP_SIMILAR_DIV);
         let r2 = stall_choke(&mut c, start, &mut t).expect("stall edge backs off");
         assert_eq!(
@@ -595,7 +651,7 @@ mod tests {
             c.decode_cap.kbps().is_none(),
             "and must not latch against it"
         );
-        c.on_ack(r2);
+        c.on_ack(r2, None);
         climb_to(&mut c, start, &mut t, knee - knee / DECODE_CAP_SIMILAR_DIV);
         let rate = c.current_kbps;
         choke(&mut c, start, &mut t).expect("genuine re-climb choke backs off");
@@ -630,7 +686,7 @@ mod tests {
                     "climb past the decode cap: {k}"
                 );
                 max_req = max_req.max(k);
-                c.on_ack(k);
+                c.on_ack(k, None);
             }
             t += 1;
         }
@@ -656,7 +712,7 @@ mod tests {
             .expect("flush must back off");
         assert_eq!(r1, 350_000);
         assert!(c.decode_cap.kbps().is_none());
-        c.on_ack(r1);
+        c.on_ack(r1, None);
         // …loss-driven backoff at the re-climbed rate breaks the streak…
         climb_to(&mut c, start, &mut t, 460_000);
         t += 2;
@@ -673,7 +729,7 @@ mod tests {
             c.decode_backoff_kbps, 0,
             "a climbed-to non-decode backoff must reset the knee reference"
         );
-        c.on_ack(r2);
+        c.on_ack(r2, None);
         // …next flush is a first decode event again — still no latch…
         climb_to(&mut c, start, &mut t, 460_000);
         t += 2;
@@ -686,7 +742,7 @@ mod tests {
             .expect("flush must back off");
         t += 1;
         assert!(c.decode_cap.kbps().is_none());
-        c.on_ack(r3);
+        c.on_ack(r3, None);
         // …dissimilar climbed-to rates share no knee.
         let dissimilar_target = c.current_kbps + 20_000;
         climb_to(&mut c, start, &mut t, dissimilar_target);
@@ -710,7 +766,7 @@ mod tests {
         let mut t = 0;
         let knee = latch_knee(&mut c, start, &mut t);
         // Host parks at the knee (unsolicited re-target).
-        c.on_ack(knee);
+        c.on_ack(knee, None);
         for _ in 0..CAP_REPROBE_WINDOWS_MIN {
             let _ = c.on_window(&WindowSample {
                 owd_mean_us: Some(10_000),
@@ -773,7 +829,7 @@ mod tests {
         t += 1;
         assert!(c.decode_cap.kbps().is_none());
         assert_eq!(c.decode_backoff_kbps, first);
-        c.on_ack(r1);
+        c.on_ack(r1, None);
         // Two consecutive ~26 ms decode-bad windows: ordinary path, latch.
         climb_to(&mut c, start, &mut t, 440_000);
         let second = c.current_kbps;
@@ -819,7 +875,7 @@ mod tests {
         }
         let r1 = choke(&mut c, start, &mut t).expect("knee choke must back off");
         assert_eq!(c.decode_backoff_kbps, 500_000);
-        c.on_ack(r1);
+        c.on_ack(r1, None);
         t += 2;
         let r2 = c
             .on_window(&WindowSample {
@@ -840,7 +896,7 @@ mod tests {
             c.decode_backoff_kbps, 500_000,
             "…nor erase the knee reference"
         );
-        c.on_ack(r2);
+        c.on_ack(r2, None);
         climb_to(&mut c, start, &mut t, 460_000);
         let rate = c.current_kbps;
         choke(&mut c, start, &mut t).expect("re-climb choke must back off");
@@ -869,7 +925,7 @@ mod tests {
             .expect("keyframe storm must back off");
         t += 1;
         assert!(c.decode_cap.kbps().is_none());
-        c.on_ack(r1);
+        c.on_ack(r1, None);
         climb_to(&mut c, start, &mut t, 280_000);
         let rate = c.current_kbps;
         t += 2;
@@ -906,7 +962,7 @@ mod tests {
             .expect("clean storm must back off");
         t += 1;
         assert_eq!(c.decode_backoff_kbps, 300_000);
-        c.on_ack(r1);
+        c.on_ack(r1, None);
         climb_to(&mut c, start, &mut t, 280_000);
         t += 2;
         let _ = c

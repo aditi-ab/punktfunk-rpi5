@@ -56,7 +56,7 @@ pub(super) fn encode_choke(
             actual_kbps: 1_000_000,
             ..WindowSample::at(at)
         }) {
-            c.on_ack(k);
+            c.on_ack(k, None);
         }
     }
     let at = ticks(start, *tick);
@@ -79,7 +79,7 @@ pub(super) fn clean_run(c: &mut BitrateController, start: Instant, tick: &mut u3
             actual_kbps: 1_000_000,
             ..WindowSample::at(at)
         }) {
-            c.on_ack(k);
+            c.on_ack(k, None);
         }
     }
 }
@@ -88,13 +88,13 @@ pub(super) fn clean_run(c: &mut BitrateController, start: Instant, tick: &mut u3
 /// the driver so: the rate comes back and the driver stands down.
 pub(super) fn disarm_encode(c: &mut BitrateController, start: Instant, tick: &mut u32) {
     let notch = encode_choke(c, start, tick, 20_000).expect("an encode rise must cost a notch");
-    c.on_ack(notch);
+    c.on_ack(notch, None);
     let restore = encode_windows(c, start, tick, 20_000, 8).expect("the notch must be judged");
     assert!(
         restore > notch,
         "the rate the encoder never answered comes back"
     );
-    c.on_ack(restore);
+    c.on_ack(restore, None);
     assert!(c.encode_down.disarmed());
 }
 
@@ -147,7 +147,7 @@ pub(super) fn climb_to(c: &mut BitrateController, start: Instant, tick: &mut u32
             actual_kbps: 1_000_000,
             ..WindowSample::at(ticks(start, *tick))
         }) {
-            c.on_ack(k);
+            c.on_ack(k, None);
         }
         *tick += 1;
     }
@@ -179,12 +179,12 @@ pub(super) fn latch_knee(c: &mut BitrateController, start: Instant, tick: &mut u
     let knee = c.current_kbps;
     let r1 = choke(c, start, tick).expect("first choke must back off");
     assert!(c.decode_cap.kbps().is_none(), "one event must not latch");
-    c.on_ack(r1);
+    c.on_ack(r1, None);
     climb_to(c, start, tick, knee - knee / DECODE_CAP_SIMILAR_DIV);
     let rate = c.current_kbps;
     let r2 = choke(c, start, tick).expect("re-climb choke must back off");
     assert_eq!(c.decode_cap.kbps(), Some(rate - rate / 16));
-    c.on_ack(r2);
+    c.on_ack(r2, None);
     rate - rate / 16
 }
 
@@ -242,7 +242,7 @@ pub(super) fn until_request(
         let r = loaded(c, ticks(start, *t), decode_us);
         *t += 1;
         if let Some(k) = r {
-            c.on_ack(k);
+            c.on_ack(k, None);
             return Some(k);
         }
     }

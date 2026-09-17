@@ -24,6 +24,7 @@ use super::sample::{self, WindowActivity, WindowSample};
 use super::verdict::{
     encode_thresholds, Baselines, Reason, Verdict, HEAVY_LOSS_PPM, RECOVERY_KF_BAD,
 };
+use crate::quic::AckReason;
 use std::time::{Duration, Instant};
 
 /// Floor so a mis-measured window cannot crater the session. 2 Mbps: a thin
@@ -135,6 +136,10 @@ pub(crate) struct BitrateController {
     /// Encode rises are not answering the rate. Lifted by a clean run or a
     /// mode switch — never permanent.
     pub(super) encode_down: StandDown,
+    /// The host refused a climb because its encode is behind cadence. Holds
+    /// climbs on the same clock, latches no cap: a busy GPU is not a rate the
+    /// encoder cannot hold, and a cap here would cost a re-probe ladder.
+    pub(super) cadence_hold: StandDown,
     /// Two identical short acks latch this. Kept apart from `ceiling_kbps` so a
     /// mode switch does not drop probe-measured link authority.
     pub(super) host_cap: LearnedCap,
@@ -205,6 +210,7 @@ impl BitrateController {
             frame_budget_us: None,
             encode_probe: None,
             encode_down: StandDown::new(),
+            cadence_hold: StandDown::new(),
             host_cap: LearnedCap::new(),
             last_requested_kbps: None,
             short_ack_kbps: 0,
@@ -421,12 +427,26 @@ impl BitrateController {
     /// Host [`crate::quic::BitrateChanged`]: the clamp is authoritative, and any
     /// ack proves the host renegotiates. Two identical short acks latch
     /// [`host_cap_kbps`](Self::host_cap_kbps); one can be a failed rebuild.
-    pub(crate) fn on_ack(&mut self, kbps: u32) {
+    ///
+    /// [`AckReason`] says which limit answered. A pinned session has no rate to
+    /// control; a cadence refusal is a busy GPU, held on a clock and never
+    /// latched. An ack with no reason is an older host, read as today.
+    pub(crate) fn on_ack(&mut self, kbps: u32, why: Option<AckReason>) {
+        if why == Some(AckReason::Pinned) {
+            self.on_pinned(kbps);
+            return;
+        }
         if kbps > 0 {
             if kbps < self.current_kbps {
                 self.baselines.clear_encode();
             }
-            if let Some(req) = self.last_requested_kbps.take() {
+            if why == Some(AckReason::Cadence) {
+                // Not evidence about a rate: the encoder is behind, and the
+                // same fact the encode driver already handles. No cut, no cap.
+                self.last_requested_kbps = None;
+                self.short_acks = 0;
+                self.hold_for_cadence(kbps);
+            } else if let Some(req) = self.last_requested_kbps.take() {
                 if kbps < req {
                     if self.short_ack_kbps == kbps {
                         self.short_acks += 1;
@@ -470,6 +490,42 @@ impl BitrateController {
         self.unacked = 0;
     }
 
+    /// The host will not negotiate this session's rate (PyroWave: per-frame
+    /// CBR). Nothing to control, so retire quietly — an unanswered host is
+    /// already retired the same way.
+    fn on_pinned(&mut self, kbps: u32) {
+        self.last_requested_kbps = None;
+        self.unacked = 0;
+        if kbps > 0 {
+            self.current_kbps = kbps;
+        }
+        if self.enabled {
+            self.enabled = false;
+            tracing::info!(
+                pinned_kbps = kbps,
+                "adaptive bitrate off — the host pins this session's rate"
+            );
+        }
+    }
+
+    /// The host's encode is behind its frame cadence. Hold climbs on the
+    /// stand-down clock: a clean loaded run lifts the hold, and a refusal after
+    /// one backs the clock off. The rate stands — every other signal still
+    /// drives it down.
+    fn hold_for_cadence(&mut self, kbps: u32) {
+        if self.cadence_hold.disarmed() {
+            self.cadence_hold.note_bad();
+            return;
+        }
+        self.cadence_hold.disarm();
+        tracing::info!(
+            held_kbps = kbps,
+            lift_after_windows = self.cadence_hold.reprobe_after(),
+            "adaptive bitrate: the host is behind its encode cadence — climbs hold here \
+             until a clean run, and no cap is learned"
+        );
+    }
+
     /// Drop mode-scoped learned state. Encoder/decoder knees and rolling
     /// baselines are properties of the mode; a baseline from the old mode is a
     /// floor the new one clears on the first window. Probe-measured
@@ -487,6 +543,7 @@ impl BitrateController {
         // Encode work per frame changed with the mode. Re-arm; the caller
         // re-sizes the frame budget alongside this.
         self.encode_down = StandDown::new();
+        self.cadence_hold = StandDown::new();
         self.encode_probe = None;
         self.proven.clear();
         self.idle_windows = 0;
@@ -709,6 +766,18 @@ impl BitrateController {
                 );
             }
         }
+        // The host's refusal expires the same way. Stillness proves nothing
+        // about a GPU that had nothing to encode.
+        if self.cadence_hold.disarmed() {
+            if bad {
+                self.cadence_hold.note_bad();
+            } else if !quiet && self.cadence_hold.note_clean() {
+                tracing::debug!(
+                    after_windows = self.cadence_hold.reprobe_after(),
+                    "adaptive bitrate: asking the host to climb again after a clean run"
+                );
+            }
+        }
     }
 
     /// The ×0.7 step, and what this window taught on the way down: a decoder
@@ -921,6 +990,11 @@ impl BitrateController {
             self.ceiling_ask_kbps = ceiling_target;
             return self.request(ceiling_target, w.now);
         }
+        // The host said its encoder is behind. Asking for more bits deepens the
+        // miss; the step-down above still passes.
+        if self.cadence_hold.disarmed() {
+            return None;
+        }
         // Proven bounds the projected wire rate at ×1.5, in the same domain
         // the proration took it out of.
         let cap = eff_ceiling.min(growth::proven_target_cap(self.proven.mark(), proration));
@@ -999,7 +1073,7 @@ mod tests {
             }),
             Some(14_000)
         );
-        c.on_ack(14_000);
+        c.on_ack(14_000, None);
         // Still bad after cooldown: another ×0.7 from the acked rate.
         assert_eq!(
             c.on_window(&WindowSample {
@@ -1071,7 +1145,7 @@ mod tests {
                     actual_kbps: at_kbps,
                     ..WindowSample::at(ticks(start, i))
                 }) {
-                    c.on_ack(k);
+                    c.on_ack(k, None);
                 }
             }
             c.probing
@@ -1109,7 +1183,7 @@ mod tests {
             }),
             Some(14_000)
         );
-        c.on_ack(14_000);
+        c.on_ack(14_000, None);
         // Tick 1 = 750 ms, inside cooldown; tick 2 = 1.5 s, fires.
         assert_eq!(
             c.on_window(&WindowSample {
@@ -1142,7 +1216,7 @@ mod tests {
             }),
             Some(2_000)
         );
-        c.on_ack(2_000);
+        c.on_ack(2_000, None);
         // At the floor, further bad windows request nothing.
         assert_eq!(
             c.on_window(&WindowSample {
@@ -1265,7 +1339,7 @@ mod tests {
             Some(4_200)
         );
         assert!(c.low_rate_warned, "the descent below 5 000 warns");
-        c.on_ack(4_200);
+        c.on_ack(4_200, None);
         assert_eq!(
             c.on_window(&WindowSample {
                 dropped: 1,
@@ -1282,7 +1356,7 @@ mod tests {
         // Unsolicited host re-target above the negotiated rate must raise the ceiling.
         let mut c = BitrateController::new(20_000, None);
         assert_eq!(c.ceiling_kbps, 20_000);
-        c.on_ack(60_000); // unsolicited, no request outstanding
+        c.on_ack(60_000, None); // unsolicited, no request outstanding
         assert_eq!(c.current_kbps, 60_000);
         assert_eq!(c.ceiling_kbps, 60_000);
         let start = Instant::now();
@@ -1290,7 +1364,7 @@ mod tests {
         assert_eq!(run_clean(&mut c, start, 0, 4), None);
         // Env cap still outranks the host retarget.
         let mut c = BitrateController::new(20_000, Some(50_000));
-        c.on_ack(60_000);
+        c.on_ack(60_000, None);
         assert_eq!(c.ceiling_kbps, 50_000);
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(50_000));
     }
@@ -1310,9 +1384,9 @@ mod tests {
         c.set_ceiling(886_312);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(40_000));
-        c.on_ack(40_000);
+        c.on_ack(40_000, None);
         assert_eq!(run_clean(&mut c, start, 2, 1), Some(50_000));
-        c.on_ack(50_000);
+        c.on_ack(50_000, None);
         assert_eq!(run_clean(&mut c, start, 4, 20), None);
     }
 
@@ -1324,7 +1398,7 @@ mod tests {
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(50_000));
         // Host answers higher: cannot go there; do not re-ask every cooldown.
-        c.on_ack(80_000);
+        c.on_ack(80_000, None);
         assert_eq!(run_clean(&mut c, start, 2, 20), None);
         // Same clamped target: no new ask.
         c.set_ceiling(90_000);
@@ -1411,7 +1485,7 @@ mod tests {
         t += 1;
         assert_eq!(r, 87_500);
         assert_eq!(c.decode_cap.kbps(), Some(87_500));
-        c.on_ack(r);
+        c.on_ack(r, None);
         // Latency followed (−1 300 µs): the retreat stands, nothing else moves.
         assert_eq!(until_request(&mut c, start, &mut t, 6_500, 8), None);
         assert_eq!(c.current_kbps, 87_500);
@@ -1423,7 +1497,7 @@ mod tests {
         let (mut c, start, mut t) = seeded_120(100_000);
         let r = loaded(&mut c, ticks(start, t), 7_800).expect("retreat");
         t += 1;
-        c.on_ack(r);
+        c.on_ack(r, None);
         // Same latency at the lower rate: not a function of the rate.
         let restore = until_request(&mut c, start, &mut t, 7_800, 6).expect("restore");
         assert_eq!(restore, 100_000);
@@ -1450,7 +1524,7 @@ mod tests {
             t += 1;
             if let Some(k) = r {
                 assert!(k > c.current_kbps, "only climbs, never a retreat");
-                c.on_ack(k);
+                c.on_ack(k, None);
             }
         }
         assert_eq!(c.decode_cap.kbps(), None);

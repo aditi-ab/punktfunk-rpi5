@@ -8,6 +8,7 @@ use super::Rng;
 pub(super) use crate::abr::budget::{
     adapt_fec, encoder_kbps_for_budget, fec_target, FEC_ADAPTIVE_START, SHARD_WIRE_OVERHEAD,
 };
+use crate::quic::AckReason;
 
 /// `config.rs` `MIN_RECOVERY_SHARDS`, and the `max_data_per_block` the host
 /// negotiates (`native/handshake.rs`). 4 096 means an ordinary frame is one
@@ -138,8 +139,13 @@ pub(super) struct HostCfg {
     pub fps: u32,
     pub audio_kbps: u32,
     pub shard_payload: u16,
-    /// Rate the encoder can actually apply; an ask above it acks short.
+    /// Rate the encoder can actually apply; an ask above it acks short with
+    /// [`AckReason::EncoderLimit`].
     pub encoder_ceiling_kbps: Option<u32>,
+    /// While `now_ms` is inside this half-open range the host refuses every
+    /// climb at its live rate, naming the cadence — its GPU is behind, and the
+    /// rate is not the lever. Empty range = never.
+    pub cadence_refusal_ms: (u64, u64),
     /// Ack and rebuild latency for one retarget.
     pub retarget_ms: u64,
     /// Encode time per frame, µs, plus its spread. The rate a saturated GPU
@@ -179,6 +185,7 @@ impl Default for HostCfg {
             audio_kbps: 256,
             shard_payload: 1408,
             encoder_ceiling_kbps: None,
+            cadence_refusal_ms: (u64::MAX, u64::MAX),
             retarget_ms: 120,
             encode_us: 3_500,
             encode_jitter_us: 0,
@@ -220,9 +227,10 @@ pub(super) struct Frame {
 pub(super) struct Host {
     cfg: HostCfg,
     rng: Rng,
-    /// Wire budget the encoder is running at, and the ask in flight.
+    /// Wire budget the encoder is running at, and the ask in flight: when it
+    /// lands, at what rate, and what the ack will name.
     budget_kbps: u32,
-    pending: Option<(u64, u32)>,
+    pending: Option<(u64, u32, AckReason)>,
     fec_percent: u8,
     unrecovered_run: u32,
     next_id: u32,
@@ -270,13 +278,25 @@ impl Host {
     }
 
     /// A `SetBitrate` landed. The ack the client gets back is what the encoder
-    /// can apply, not what was asked.
+    /// can apply, not what was asked, and it names what held it short
+    /// (`native/control.rs`: the ceiling clamp, then the cadence hold).
     pub(super) fn on_set_bitrate(&mut self, now_ms: u64, kbps: u32) {
         if !self.cfg.acks {
             return;
         }
-        let applied = kbps.min(self.cfg.encoder_ceiling_kbps.unwrap_or(u32::MAX));
-        self.pending = Some((now_ms + self.cfg.retarget_ms, applied));
+        let ceiling = self.cfg.encoder_ceiling_kbps.unwrap_or(u32::MAX);
+        let mut applied = kbps.min(ceiling);
+        let mut why = if applied < kbps {
+            AckReason::EncoderLimit
+        } else {
+            AckReason::Granted
+        };
+        let (from, until) = self.cfg.cadence_refusal_ms;
+        if (from..until).contains(&now_ms) && applied > self.budget_kbps {
+            applied = self.budget_kbps;
+            why = AckReason::Cadence;
+        }
+        self.pending = Some((now_ms + self.cfg.retarget_ms, applied, why));
     }
 
     /// Coalesced, as the control task coalesces it: asks while one is already
@@ -331,13 +351,14 @@ impl Host {
         self.fec_percent = fec_target(loss_ppm, self.fec_percent, self.unrecovered_run);
     }
 
-    /// The rate the encoder is now running at, `Some` on the tick it changes.
-    pub(super) fn apply_pending(&mut self, now_ms: u64) -> Option<u32> {
+    /// The rate the encoder is now running at, `Some` on the tick it changes,
+    /// with the reason the ack carries.
+    pub(super) fn apply_pending(&mut self, now_ms: u64) -> Option<(u32, AckReason)> {
         match self.pending {
-            Some((at, kbps)) if now_ms >= at => {
+            Some((at, kbps, why)) if now_ms >= at => {
                 self.pending = None;
                 self.budget_kbps = kbps;
-                Some(kbps)
+                Some((kbps, why))
             }
             _ => None,
         }

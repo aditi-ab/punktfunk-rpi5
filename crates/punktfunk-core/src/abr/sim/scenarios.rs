@@ -242,6 +242,34 @@ pub(super) fn slow_start_spent() -> Scenario {
     }
 }
 
+/// A host that refuses climbs for ten seconds mid-session, naming its encode
+/// cadence. The link is fine and the encoder holds every rate it is at, so
+/// nothing but the refusal stops the climb.
+///
+/// The refusal is the same short ack an encoder ceiling sends. Read as a
+/// ceiling it costs a learned cap and a 12 s re-probe ladder on a limit that
+/// clears on its own; read as cadence it costs the climbs inside the window
+/// and one clean run.
+pub(super) fn host_cadence_refusal() -> Scenario {
+    let mut s = tv_session(20_000, None, full());
+    s.client.probe_target_kbps = Some(WEBOS_PROBE_KBPS);
+    s.host.cadence_refusal_ms = (8_000, 18_000);
+    Scenario {
+        name: "host_cadence_refusal",
+        seed: 0x7A_7200,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
 /// C4 — .21's saturated GPU: encode 16.5–21 ms against a 6 060 µs budget.
 ///
 /// Contention swings over seconds, so the window means swing with it — that
@@ -950,11 +978,13 @@ pub(super) fn all() -> Vec<Scenario> {
         host_rebuild_stall(),
         host_rebuild_wave(),
         encoder_weak(),
+        host_cadence_refusal(),
     ]
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Run, WindowRec};
     use super::*;
 
     /// Field steps from the 09-16 trace, 19:55:46–19:56:08.
@@ -1074,6 +1104,52 @@ mod tests {
         assert_eq!(
             rearmed[0], 14_876,
             "one additive step at 14 000, then the verdict is refuted"
+        );
+    }
+
+    /// A cadence refusal costs the ten seconds it lasts, not the session.
+    ///
+    /// Inside the refusal the controller asks for nothing above what it has;
+    /// afterwards it climbs at climb-law steps, not the +12.5 % crawl above a
+    /// learned cap, and lands where the same session lands with no refusal.
+    #[test]
+    fn a_cadence_refusal_holds_climbs_without_learning_a_cap() {
+        let sc = host_cadence_refusal();
+        let (from_ms, until_ms) = sc.sessions[0].host.cadence_refusal_ms;
+        let r = run(&sc);
+        let held: Vec<&WindowRec> = r.windows[0]
+            .iter()
+            .filter(|w| (from_ms..until_ms).contains(&w.t_ms))
+            .collect();
+        assert!(held.len() > 8, "the refusal covers {} windows", held.len());
+        // One ask learns the refusal; the rest of the ten seconds is quiet.
+        let asked_up = held
+            .iter()
+            .filter(|w| w.request_kbps.is_some_and(|k| k > w.rate_kbps))
+            .count();
+        assert_eq!(asked_up, 1, "kept asking a host that said it was behind");
+        // Nothing was learned: the first step after the refusal is the climb
+        // law's, which is never a cap lift's eighth.
+        let after = r.windows[0]
+            .iter()
+            .filter(|w| w.t_ms >= until_ms)
+            .filter_map(|w| Some((w.rate_kbps, w.request_kbps?)))
+            .find(|(at, want)| want > at)
+            .expect("it climbs again once the refusal lifts");
+        assert!(
+            u64::from(after.1) * 100 / u64::from(after.0) > 115,
+            "{} → {} kbps is a cap lift, not a climb",
+            after.0,
+            after.1
+        );
+        // And it ends where an unrefused session ends.
+        let mut clear = host_cadence_refusal();
+        clear.sessions[0].host.cadence_refusal_ms = (u64::MAX, u64::MAX);
+        let end = |r: &Run| r.windows[0].last().expect("windows").rate_kbps;
+        let (refused, never) = (end(&r), end(&run(&clear)));
+        assert!(
+            u64::from(refused) * 100 / u64::from(never) >= 90,
+            "the refusal cost the session: {refused} kbps against {never}"
         );
     }
 

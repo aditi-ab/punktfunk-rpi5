@@ -228,8 +228,8 @@ fn run(sc: &Scenario) -> Run {
             if let Some(host_ms) = s.host.probe_done(now) {
                 s.client.on_probe_result(now, host_ms);
             }
-            if let Some(kbps) = s.host.apply_pending(now) {
-                s.client.push_ack(kbps);
+            if let Some((kbps, why)) = s.host.apply_pending(now) {
+                s.client.push_ack(kbps, why);
             }
         }
     }

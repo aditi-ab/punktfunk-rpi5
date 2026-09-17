@@ -156,13 +156,13 @@ mod tests {
             }),
             Some(14_000)
         );
-        c.on_ack(14_000);
+        c.on_ack(14_000, None);
         // Slow start is over: 6 clean windows → +~6 % (14000 + 14000/16 + 1 = 14876).
         let up = run_clean(&mut c, start, 2, 7);
         assert_eq!(up, Some(14_876));
-        c.on_ack(14_876);
+        c.on_ack(14_876, None);
         // At the ceiling, clean windows stay quiet.
-        c.on_ack(20_000);
+        c.on_ack(20_000, None);
         assert_eq!(run_clean(&mut c, start, 40, 20), None);
     }
 
@@ -180,7 +180,7 @@ mod tests {
                 actual_kbps: 1_000_000,
                 ..WindowSample::at(ticks(start, i))
             }) {
-                c.on_ack(k);
+                c.on_ack(k, None);
                 got.push(k);
             }
         }
@@ -200,7 +200,7 @@ mod tests {
             }),
             Some(40_000)
         );
-        c.on_ack(40_000);
+        c.on_ack(40_000, None);
         // Severe: immediate ×0.7, slow start over.
         assert_eq!(
             c.on_window(&WindowSample {
@@ -211,7 +211,7 @@ mod tests {
             }),
             Some(28_000)
         );
-        c.on_ack(28_000);
+        c.on_ack(28_000, None);
         // Next climb is additive, after 6 clean windows.
         let mut next = None;
         for i in 3..12 {
@@ -244,7 +244,7 @@ mod tests {
                 ..WindowSample::at(ticks(start, i * 2))
             }) {
                 last = k;
-                c.on_ack(k);
+                c.on_ack(k, None);
             }
         }
         assert_eq!(last, 300_000, "slow start should reach the probed ceiling");
@@ -372,7 +372,7 @@ mod tests {
             }),
             Some(14_000)
         );
-        c.on_ack(14_000);
+        c.on_ack(14_000, None);
         // …one clean window proves 14 000…
         assert_eq!(
             c.on_window(&WindowSample {
@@ -423,7 +423,7 @@ mod tests {
             }),
             Some(14_000)
         );
-        c.on_ack(14_000);
+        c.on_ack(14_000, None);
         for i in 1..=5 {
             assert_eq!(
                 c.on_window(&WindowSample {
@@ -462,7 +462,7 @@ mod tests {
             }),
             Some(14_000)
         );
-        c.on_ack(14_000);
+        c.on_ack(14_000, None);
         assert_eq!(
             c.on_window(&WindowSample {
                 actual_kbps: 14_000,
@@ -538,7 +538,7 @@ mod tests {
             }),
             Some(14_000)
         );
-        c.on_ack(14_000);
+        c.on_ack(14_000, None);
         // Idle 2 × [`PROVEN_BUCKET_WINDOWS`]: both buckets rotate away.
         for i in 3..3 + 2 * PROVEN_BUCKET_WINDOWS {
             assert_eq!(
@@ -577,7 +577,7 @@ mod tests {
             }),
             Some(30_000)
         );
-        c.on_ack(30_000);
+        c.on_ack(30_000, None);
         // Delivers 30 000 → next step 45 000, not 60 000.
         assert_eq!(
             c.on_window(&WindowSample {
@@ -605,7 +605,7 @@ mod tests {
             }),
             Some(30_000)
         );
-        c.on_ack(30_000);
+        c.on_ack(30_000, None);
         // Long calm stretch (2 % utilization): stay silent. Keep proven headroom.
         for i in 2..30 {
             assert_eq!(

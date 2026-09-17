@@ -26,6 +26,10 @@ mod handshake;
 mod input_task;
 mod rx_gap;
 
+/// Host bitrate acks the control task parked for the pump, each with the
+/// reason it carried (`None` from a host that does not name its limits).
+type AckQueue = std::collections::VecDeque<(u32, Option<crate::quic::AckReason>)>;
+
 pub(super) async fn run_pump(args: WorkerArgs) {
     let hs = match handshake::connect_and_handshake(&args).await {
         Ok(hs) => hs,
@@ -203,8 +207,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
 
     // BitrateChanged queue, drained in order. Not latest-wins: host-cap learning
     // needs two consecutive short acks in the same 750 ms window.
-    let bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>> =
-        Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let bitrate_ack: Arc<Mutex<AckQueue>> = Arc::new(Mutex::new(AckQueue::new()));
     // Outbound `CtrlRequest::Keyframe` count (the one choke point). Pump drains per report window.
     let recovery_kf = Arc::new(AtomicU32::new(0));
     // Host `PipelineGap` length. A local rebuild starves a window without the

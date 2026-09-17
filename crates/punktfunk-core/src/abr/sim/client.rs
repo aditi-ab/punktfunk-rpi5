@@ -228,8 +228,8 @@ impl Client {
 
     /// A host `BitrateChanged`. The driver queues it to the window close, as
     /// the pump's ack queue does.
-    pub(super) fn push_ack(&mut self, kbps: u32) {
-        self.abr.on_ack(kbps);
+    pub(super) fn push_ack(&mut self, kbps: u32, why: crate::quic::AckReason) {
+        self.abr.on_ack(kbps, Some(why));
     }
 
     /// A frame left the host: the client now knows what to wait for.

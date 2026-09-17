@@ -696,7 +696,7 @@ mod tests {
             Some(14_000)
         );
         // After rebase, 15 ms against the old 7 ms floor must read clean.
-        c.on_ack(14_000);
+        c.on_ack(14_000, None);
         for i in 8..11 {
             assert_eq!(
                 c.on_window(&WindowSample {

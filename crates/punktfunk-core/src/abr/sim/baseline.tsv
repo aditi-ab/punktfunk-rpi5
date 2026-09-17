@@ -29,3 +29,4 @@ unknown_refresh_knee	0	99999	25	0	1	0	0	1000	af8cb644
 host_rebuild_stall	0	0	15	0	2	0	0	1000	325d140c
 host_rebuild_wave	0	20	0	0	2	0	0	1000	d0ed7523
 encoder_weak	0	99999	32	0	2	0	0	1000	6e3e7ae2
+host_cadence_refusal	0	23	0	0	4	0	0	1000	14fe82c3

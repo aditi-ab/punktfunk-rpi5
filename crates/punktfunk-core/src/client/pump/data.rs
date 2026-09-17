@@ -37,7 +37,7 @@ pub(super) struct DataPump {
     /// Host `BitrateChanged` acks, drained in arrival order. A queue so a
     /// corrective short retarget cannot be clobbered by a full resolve ack
     /// in the same window (host-cap learning needs two consecutive shorts).
-    pub(super) bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>>,
+    pub(super) bitrate_ack: Arc<Mutex<AckQueue>>,
     /// Decode-recovery keyframe asks, counted at the control-task send choke.
     pub(super) recovery_kf: Arc<AtomicU32>,
     /// Host pipeline-rebuild gap in ms ([`crate::quic::PipelineGap`]); `0` =
@@ -253,8 +253,8 @@ impl DataPump {
                 let m = *pump_mode_slot.lock().unwrap();
                 abr.on_mode_switch(m.width, m.height, m.refresh_hz);
             }
-            for acked in bitrate_ack.lock().unwrap().drain(..) {
-                abr.on_ack(acked);
+            for (acked, why) in bitrate_ack.lock().unwrap().drain(..) {
+                abr.on_ack(acked, why);
             }
             // Drain even when the controller is off, so the accumulators
             // stay bounded and no count leaks into a later window.
@@ -675,7 +675,7 @@ mod tests {
                     refresh_hz: 60,
                 })),
                 probe: Arc::new(Mutex::new(ProbeState::default())),
-                bitrate_ack: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                bitrate_ack: Arc::new(Mutex::new(AckQueue::new())),
                 live_bitrate: Arc::new(AtomicU32::new(0)),
                 recovery_kf: Arc::new(AtomicU32::new(0)),
                 pipeline_gap: pipeline_gap.clone(),
@@ -714,7 +714,7 @@ mod tests {
             frames_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             unsustainable_pin_kbps: Arc::new(AtomicU32::new(0)),
             fec_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            bitrate_ack: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            bitrate_ack: Arc::new(Mutex::new(AckQueue::new())),
             recovery_kf: Arc::new(AtomicU32::new(0)),
             pipeline_gap: pipeline_gap.clone(),
             bitrate_kbps: 20_000,
