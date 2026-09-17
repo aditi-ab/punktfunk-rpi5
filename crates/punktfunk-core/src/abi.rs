@@ -6246,11 +6246,11 @@ mod log_sink_tests {
         // SAFETY: NULL callback detaches; no pointer is retained.
         let detached = unsafe { punktfunk_set_log_callback(3, None, ptr::null_mut()) };
         assert_eq!(detached, PunktfunkStatus::Ok);
-        let before = lock_recover(&LINES).len();
+        // By this line, not by a count: the sink is process-wide, so any
+        // other test emitting while it was attached grows the same vector.
         log::error!(target: "quinn::connection", "after detach");
-        assert_eq!(
-            lock_recover(&LINES).len(),
-            before,
+        assert!(
+            !lock_recover(&LINES).iter().any(|l| l.2 == "after detach"),
             "a detached sink hears nothing"
         );
     }
