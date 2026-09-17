@@ -5,12 +5,13 @@
 //! scenario, so a run is bit-identical on macOS arm64 and Linux x86_64 and
 //! survives a `rand` bump. Time is a 1 ms tick and an `Instant` is
 //! `base + Duration`. [`scenarios`] holds the scenario table and the field
-//! calibration.
+//! calibration; [`baseline`] pins what today's controller does on each one.
 //!
 //! Nothing here changes production behaviour: the controller is the fixed
 //! point, and a behaviour that will not reproduce is a finding about the
 //! model, not licence to tune the controller.
 
+mod baseline;
 mod client;
 mod host;
 mod link;

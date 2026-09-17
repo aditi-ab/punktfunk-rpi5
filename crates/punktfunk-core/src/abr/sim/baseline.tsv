@@ -1,0 +1,16 @@
+scenario	under5_pct	to90_s	cuts_10min	lost_10min	queue_p95_ms	over_cap_kb_10s	blip_recover_s	fairness_x1000
+lan_10g	0	15	10	10	1	0	28	1000
+lan_1g	0	13	10	20	6	0	28	1000
+wifi_good	0	0	8	8	2	0	28	1000
+wifi_tv	0	20	0	0	3	0	0	1000
+wan_wg_12	2	0	26	396	56	4832	0	1000
+lte_variable	74	0	33	2550	249	0	0	1000
+shared_two_auto	22	0	32	548	52	14737	0	1000
+shared_newcomer	49	0	36	760	118	0	0	909
+shared_fixed_plus_auto	51	0	32	624	63	18506	0	964
+gpu_saturated	0	0	22	0	0	0	0	1000
+static_then_motion	0	9	0	0	3	0	0	1000
+frame_driven_35fps	0	7	0	0	3	0	0	1000
+old_host	0	9	0	0	3	0	0	1000
+no_ramp	0	0	0	0	1	0	0	1000
+slow_start_spent	0	186	2	2	2	0	27	1000
