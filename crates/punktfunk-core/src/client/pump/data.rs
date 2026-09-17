@@ -71,7 +71,15 @@ pub(super) struct DataPump {
     pub(super) mode_slot: Arc<Mutex<crate::config::Mode>>,
     /// Published each window from [`crate::abr::Driver::last_cut`].
     pub(super) rate_cut: Arc<std::sync::atomic::AtomicU8>,
+    /// Closed windows for an embedder recording a trajectory
+    /// ([`crate::client::NativeClient::take_abr_windows`]).
+    pub(super) abr_windows: Arc<Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>>,
 }
+
+/// Closed windows held for an embedder that has not read them. Forty-eight
+/// seconds at the report cadence: enough that a client polling once a second
+/// never loses one, small enough that one which never polls costs nothing.
+pub(crate) const ABR_TRAJECTORY_WINDOWS: usize = 64;
 
 impl DataPump {
     pub(super) fn run(self) {
@@ -105,6 +113,7 @@ impl DataPump {
             refresh_hz,
             mode_slot: pump_mode_slot,
             rate_cut,
+            abr_windows,
         } = self;
         pin_thread_user_interactive(); // frame channel → user-interactive video pump
         register_hot_tid(&pump_hot_tids); // UDP receive + FEC reassembly
@@ -121,6 +130,7 @@ impl DataPump {
         frames.set_all_intra(negotiated_codec == crate::quic::CODEC_PYROWAVE);
         // The three environment overrides, read once. Automatic is a session
         // with no embedder rate and a host that echoed one.
+        let session_start = Instant::now();
         let mut abr = crate::abr::Driver::new(
             DriverConfig {
                 start_kbps: if bitrate_kbps == 0 && !rate_pinned {
@@ -141,7 +151,7 @@ impl DataPump {
                 probe_target_kbps: env_u32("PUNKTFUNK_ABR_PROBE_KBPS"),
                 ramp: serves_ramp,
             },
-            Instant::now(),
+            session_start,
         );
         // Jump-to-live: clock-based over-bound run (`stale_since`, needs
         // skew handshake), clock-free queue run (`standing_since`), shared
@@ -304,6 +314,9 @@ impl DataPump {
             abr.on_encode_latency(sum, count);
             abr.on_keyframe_asks(pump_recovery_kf.swap(0, Ordering::Relaxed));
             let tick = abr.tick(Instant::now());
+            // The rate this window asked for, recorded beside the window it
+            // came out of.
+            let mut request_kbps = None;
             for action in tick.actions {
                 match action {
                     Action::Loss(loss_ppm) => {
@@ -314,6 +327,7 @@ impl DataPump {
                             .try_send(CtrlRequest::Delivery(DeliveryReport { packets_received }));
                     }
                     Action::SetBitrate(kbps) => {
+                        request_kbps = Some(kbps);
                         if ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps)).is_err() {
                             // Never reached the control task. Three of these
                             // retire the controller as "the host never acked".
@@ -351,6 +365,22 @@ impl DataPump {
                 }
             }
             if let Some(window) = tick.window {
+                {
+                    let mut q = abr_windows.lock().unwrap_or_else(|e| e.into_inner());
+                    if q.len() == ABR_TRAJECTORY_WINDOWS {
+                        q.pop_front();
+                    }
+                    q.push_back(crate::abr::WindowRecord {
+                        t_ms: window.sample.now.duration_since(session_start).as_millis() as u64,
+                        // The rate the window ran at: the ask has not been
+                        // acked yet, so it is not this window's rate.
+                        rate_kbps: abr.target_kbps(),
+                        request_kbps,
+                        sample: window.sample,
+                        discarded: window.discarded,
+                        reason: abr.reason(),
+                    });
+                }
                 // No-op clock flush suspected a wall-clock step: re-sync
                 // once. The 60 s periodic covers everything else.
                 if resync_wanted {

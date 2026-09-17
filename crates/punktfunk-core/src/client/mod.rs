@@ -351,6 +351,8 @@ pub struct NativeClient {
     live_bitrate_kbps: Arc<AtomicU32>,
     /// [`crate::hud::RateCut`] code the pump publishes each window; `0` = no standing cut.
     rate_cut: Arc<AtomicU8>,
+    /// Closed ABR windows waiting to be read ([`NativeClient::take_abr_windows`]).
+    abr_windows: Arc<Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>>,
     /// ABR armed (Automatic, not rate-pinned PyroWave). Skip per-frame decode measurement when
     /// false ([`wants_decode_latency`](Self::wants_decode_latency)).
     wants_decode: bool,
@@ -723,6 +725,7 @@ impl NativeClient {
         let launch_outcome = Arc::new(Mutex::new(None));
         let rtt_us = Arc::new(AtomicU32::new(0));
         let decode_lat = Arc::new(Mutex::new(DecodeLatAcc::default()));
+        let abr_windows = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         // Pump seeds from Welcome before ready_tx, then follows every ack.
         let live_bitrate = Arc::new(AtomicU32::new(0));
         let rate_cut = Arc::new(AtomicU8::new(0));
@@ -749,6 +752,7 @@ impl NativeClient {
         let clock_offset_w = clock_offset.clone();
         let rtt_us_w = rtt_us.clone();
         let decode_lat_w = decode_lat.clone();
+        let abr_windows_w = abr_windows.clone();
         let live_bitrate_w = live_bitrate.clone();
         let rate_cut_w = rate_cut.clone();
         let pad_audio_caps_w = pad_audio_caps.clone();
@@ -835,6 +839,7 @@ impl NativeClient {
                     clock_offset: clock_offset_w,
                     rtt_us: rtt_us_w,
                     decode_lat: decode_lat_w,
+                    abr_windows: abr_windows_w,
                     live_bitrate: live_bitrate_w,
                     rate_cut: rate_cut_w,
                     audio_mute: audio_mute_w,
@@ -923,6 +928,7 @@ impl NativeClient {
             rtt_us,
             hud,
             decode_lat,
+            abr_windows,
             live_bitrate_kbps: live_bitrate,
             rate_cut,
             // Match the pump: Automatic, not rate-pinned PyroWave, AND host echoed a rate.
@@ -1263,6 +1269,19 @@ impl NativeClient {
 
     /// Live encoder target (kbps), follows `BitrateChanged`. [`resolved_bitrate_kbps`] is the
     /// frozen session-start value. `0` = old host that never reported one.
+    /// The ABR windows that closed since the last call, oldest first.
+    ///
+    /// The controller's own record of what it judged and asked for, not a
+    /// re-derivation. The queue holds [`ABR_TRAJECTORY_WINDOWS`] and sheds the
+    /// oldest, so an embedder that never calls this costs a few kilobytes.
+    pub fn take_abr_windows(&self) -> Vec<crate::abr::WindowRecord> {
+        self.abr_windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
+    }
+
     pub fn current_bitrate_kbps(&self) -> u32 {
         self.live_bitrate_kbps.load(Ordering::Relaxed)
     }
