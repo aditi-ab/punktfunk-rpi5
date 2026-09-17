@@ -317,16 +317,6 @@ impl DataPump {
             };
             abr.on_encode_latency(sum, count);
             abr.on_keyframe_asks(pump_recovery_kf.swap(0, Ordering::Relaxed));
-            if let Some(outcome) = abr.ramp_outcome() {
-                let mut slot = abr_ramp.lock().unwrap_or_else(|e| e.into_inner());
-                if slot.is_none() {
-                    *slot = Some(crate::abr::RampRecord {
-                        steps: abr.ramp_steps().to_vec(),
-                        outcome,
-                        opening_kbps: abr.target_kbps(),
-                    });
-                }
-            }
             let tick = abr.tick(Instant::now());
             // The rate this window asked for, recorded beside the window it
             // came out of.
@@ -379,6 +369,19 @@ impl DataPump {
                 }
             }
             if let Some(window) = tick.window {
+                // Published at the first window, not the moment the ramp
+                // stopped: the rate it opened at is the one the host acked,
+                // and that ack is still in flight while the ramp finishes.
+                if let Some(outcome) = abr.ramp_outcome() {
+                    let mut slot = abr_ramp.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(crate::abr::RampRecord {
+                            steps: abr.ramp_steps().to_vec(),
+                            outcome,
+                            opening_kbps: abr.target_kbps(),
+                        });
+                    }
+                }
                 {
                     let mut q = abr_windows.lock().unwrap_or_else(|e| e.into_inner());
                     if q.len() == ABR_TRAJECTORY_WINDOWS {
