@@ -608,8 +608,19 @@ fn real_main() -> Result<()> {
                         Some(a) => a,
                         None => bail!("--keyframe-answer takes idr or wave:<n>"),
                     };
+                    let bringup = std::time::Duration::from_millis(
+                        get("--bringup-ms")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(2_500),
+                    );
                     match native::Content::parse(spec, fill) {
-                        Some(c) => native::Punktfunk1Source::SyntheticAbr(c, recovery, answer),
+                        Some(c) => native::Punktfunk1Source::SyntheticAbr(native::SynthAbrShape {
+                            content: c,
+                            recovery,
+                            answer,
+                            bringup,
+                            serve_ramp: !args.iter().any(|a| a == "--no-ramp"),
+                        }),
                         None => {
                             bail!("--content takes steady, idle-then-motion or frame-driven:<fps>")
                         }
@@ -1033,6 +1044,12 @@ PUNKTFUNK1-HOST OPTIONS:
     --keyframe-answer <KIND>     what synthetic-abr answers a keyframe request with: idr
                                  (the default), or wave:<n> to answer only every n-th ask
                                  with one, as a host that prefers an intra-refresh wave does
+    --bringup-ms <MS>            how long synthetic-abr holds its first frame back, the way
+                                 a display session's pipeline build does (default: 2500).
+                                 The client measures the link over this window
+    --no-ramp                    do not offer to measure the link before the first frame.
+                                 The client falls back to the in-session test burst, which
+                                 is what it does against a host that predates the ramp
     --seconds <N>                per-session stream duration, virtual and synthetic-abr
                                  sources (default: 30)
     --frames <N>                 per-session frame count, synthetic source (default: 300)

@@ -109,6 +109,23 @@ impl KeyframeAnswer {
     }
 }
 
+/// How a `synthetic-abr` session behaves, as the command line sets it.
+///
+/// One value on [`Punktfunk1Source`](crate::native::Punktfunk1Source) rather
+/// than four: the source is the only thing that reads any of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SynthAbrShape {
+    pub content: Content,
+    /// How long a keyframe ask takes to reach the wire.
+    pub recovery: std::time::Duration,
+    pub answer: KeyframeAnswer,
+    /// How long the first frame is held back, as a pipeline build holds it.
+    pub bringup: std::time::Duration,
+    /// Advertise `HOST_CAP2_RAMP`. `false` is the old-host control: the client
+    /// falls back to the legacy in-session burst.
+    pub serve_ramp: bool,
+}
+
 /// What one tick puts on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shot {
@@ -155,6 +172,12 @@ pub(crate) struct SynthAbrContext {
     /// that pile up in the meantime are what a report window reads as damage.
     pub(crate) recovery: std::time::Duration,
     pub(crate) answer: KeyframeAnswer,
+    /// How long the first frame is held back, the way a display session's
+    /// pipeline build holds it. The client's bring-up ramp is served on the
+    /// idle data plane for exactly this long.
+    pub(crate) bringup_delay: std::time::Duration,
+    /// The ramp window's flag, cleared on hand-over.
+    pub(crate) ramp_open: Arc<AtomicBool>,
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) counters: Arc<crate::session_status::SessionCounters>,
     pub(crate) keyframe: std::sync::mpsc::Receiver<()>,
@@ -188,6 +211,8 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         content,
         recovery,
         answer,
+        bringup_delay,
+        ramp_open,
         stop,
         counters,
         keyframe,
@@ -212,6 +237,27 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
     let fps = mode.refresh_hz.max(1);
     let mut budget_kbps = bitrate_kbps;
     live_bitrate.store(budget_kbps, Ordering::Relaxed);
+
+    // The bring-up a display session spends on its pipeline, without one. The
+    // client measures the link here, on a data plane with no video to damage,
+    // and the session below opens at what it found.
+    let ramp = ramp::RampServer::start(
+        session,
+        probe_rx,
+        probe_result_tx.clone(),
+        probe_seq,
+        stop.clone(),
+        ramp_open,
+    );
+    let build_until = std::time::Instant::now() + bringup_delay;
+    while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < build_until {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let (session, probe_rx) = ramp.finish();
+    tracing::info!(
+        bringup_ms = bringup_delay.as_millis() as u64,
+        "synthetic-abr bring-up done — the ramp window is closed"
+    );
 
     // Depth 3, as the virtual path: encode blocks on a slow send rather than dropping a frame.
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<SendMsg>(3);
@@ -260,6 +306,22 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
 
     let interval = std::time::Duration::from_nanos(1_000_000_000 / u64::from(fps));
     let started = std::time::Instant::now();
+    // The ramp's opening `SetBitrate` lands while the pipeline is still
+    // building, so the first frame must already be sized by it.
+    let mut opening = None;
+    while let Ok(k) = bitrate_rx.try_recv() {
+        opening = Some(k);
+    }
+    if let Some(k) = opening.filter(|&k| k != budget_kbps) {
+        tracing::info!(
+            from_kbps = budget_kbps,
+            to_kbps = k,
+            "encoder opened at the bring-up ramp's rate"
+        );
+        counters.note_bitrate(k);
+        budget_kbps = k;
+        live_bitrate.store(budget_kbps, Ordering::Relaxed);
+    }
     let deadline = (seconds > 0).then(|| started + std::time::Duration::from_secs(seconds.into()));
     let mut due = started;
     let (mut au_seq, mut tick, mut asks) = (0u32, 0u64, 0u32);

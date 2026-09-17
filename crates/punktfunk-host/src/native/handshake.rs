@@ -713,11 +713,15 @@ pub(super) async fn negotiate(
             | punktfunk_core::quic::HOST_CAP2_EXT
             // The virtual path punches its data plane two to three seconds before its
             // pipeline exists, and serves the client's bring-up ramp in that gap. The
-            // protocol-test sources have no such gap: video leaves at once.
-            | if source == Punktfunk1Source::Virtual {
-                punktfunk_core::quic::HOST_CAP2_RAMP
-            } else {
-                0
+            // rate-following source holds its first frame back for the same span
+            // (`--bringup-ms`) so the rig measures the ramp the way a display session
+            // runs it. The byte-pattern source has no such gap: video leaves at once.
+            | match source {
+                Punktfunk1Source::Virtual => punktfunk_core::quic::HOST_CAP2_RAMP,
+                Punktfunk1Source::SyntheticAbr(shape) if shape.serve_ramp => {
+                    punktfunk_core::quic::HOST_CAP2_RAMP
+                }
+                _ => 0,
             },
     };
     io::write_msg(send, &welcome.encode()).await?;

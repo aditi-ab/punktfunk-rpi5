@@ -74,7 +74,7 @@ use stream::{
     reconfig_allowed, software_stream, synthetic_abr_stream, synthetic_stream, virtual_stream,
     SessionContext, SynthAbrContext,
 };
-pub use stream::{Content, KeyframeAnswer};
+pub use stream::{Content, KeyframeAnswer, SynthAbrShape};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Punktfunk1Source {
@@ -82,9 +82,9 @@ pub enum Punktfunk1Source {
     Synthetic,
     /// Frames sized from the live wire budget, on the real paced send path. No display and no
     /// GPU: what the netem rig streams so Automatic can be judged on a shaped link. The
-    /// duration is how long a keyframe ask takes to reach the wire, and the answer is what
-    /// reaches it.
-    SyntheticAbr(Content, std::time::Duration, KeyframeAnswer),
+    /// [`SynthAbrShape`] is what it encodes, how long it holds the first frame back, and
+    /// what it answers a keyframe ask with.
+    SyntheticAbr(SynthAbrShape),
     /// Virtual display at the requested mode → NVENC.
     Virtual,
     /// A moving test picture through the software H.264 encoder, unbounded. No display and no
@@ -2411,14 +2411,16 @@ pub(crate) async fn run_admitted(
                     timing_conn.as_ref(),
                     probe_seq,
                 ),
-                Punktfunk1Source::SyntheticAbr(content, recovery, answer) => {
+                Punktfunk1Source::SyntheticAbr(shape) => {
                     synthetic_abr_stream(SynthAbrContext {
                     session,
                     mode,
                     seconds,
-                    content,
-                    recovery,
-                    answer,
+                    content: shape.content,
+                    recovery: shape.recovery,
+                    answer: shape.answer,
+                    bringup_delay: shape.bringup,
+                    ramp_open,
                     stop: stop_stream,
                     counters: counters_stream,
                     keyframe: keyframe_rx,
