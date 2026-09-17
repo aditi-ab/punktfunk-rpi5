@@ -232,6 +232,9 @@ struct Ramp {
     /// from `outcome`, which the driver takes: a consumed verdict must not
     /// look like an unfinished ramp.
     done: bool,
+    /// Wall clock from the first step to the stop, frozen there: a reader that
+    /// asked later would otherwise be told how long it waited to ask.
+    stopped_ms: u64,
     wall: bool,
     /// A lossless refusal waiting on its repeat, and whether this ramp has
     /// spent the one repeat it gets.
@@ -297,6 +300,7 @@ impl Ramp {
             steps: 0,
             started: now,
             done: false,
+            stopped_ms: 0,
             wall: false,
             confirming: None,
             re_ask_spent: false,
@@ -332,6 +336,7 @@ impl Ramp {
         self.step = None;
         if !self.done {
             self.done = true;
+            self.stopped_ms = self.started.elapsed().as_millis() as u64;
             self.wall = matches!(outcome, Ramped::Wall { .. });
             self.proven_kbps = outcome.proven_kbps();
             tracing::info!(
@@ -339,7 +344,7 @@ impl Ramp {
                 wall = matches!(outcome, Ramped::Wall { .. }),
                 steps = self.steps,
                 asked_kb = self.spent_bytes / 1_000,
-                took_ms = self.started.elapsed().as_millis() as u64,
+                took_ms = self.stopped_ms,
                 "adaptive bitrate: bring-up ramp done"
             );
             self.outcome = Some(outcome);
@@ -779,7 +784,7 @@ impl CapacityProbe {
             proven_kbps: r.proven_kbps,
             steps: r.steps,
             asked_bytes: r.spent_bytes,
-            took_ms: r.started.elapsed().as_millis() as u64,
+            took_ms: r.stopped_ms,
         })
     }
 
