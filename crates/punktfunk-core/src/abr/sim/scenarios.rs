@@ -91,7 +91,9 @@ fn tv_session(
             audio_kbps: 512,
             decode: g5_decode(),
             // A scenario that injects the ceiling is replaying a host that
-            // paused video for the burst; it runs no probe of its own.
+            // paused video for the burst; it runs no probe of its own, and
+            // must hand the measurement over before the first window closes
+            // — an unmeasured session climbs toward its stream shape.
             probe: ceiling_at.is_none(),
             ceiling_at,
             ..ClientCfg::default()
@@ -120,7 +122,7 @@ pub(super) fn wifi_tv() -> Scenario {
         },
         sessions: vec![tv_session(
             20_000,
-            Some((1_000, 171_294)),
+            Some((0, 171_294)),
             vec![
                 ContentPhase {
                     until_ms: 10_000,
@@ -156,7 +158,7 @@ pub(super) fn wifi_good() -> Scenario {
         },
         sessions: vec![tv_session(
             171_294,
-            Some((1_000, 171_294)),
+            Some((0, 171_294)),
             vec![ContentPhase {
                 fill_pct: 80,
                 active_pct: 88,
@@ -864,7 +866,7 @@ pub(super) fn unknown_refresh_knee() -> Scenario {
 fn host_rebuild(name: &'static str, seed: u64, start_kbps: u32, rebuild_at_ms: u64) -> Scenario {
     let mut s = tv_session(
         start_kbps,
-        Some((1_000, 171_294)),
+        Some((0, 171_294)),
         vec![ContentPhase {
             fill_pct: 80,
             active_pct: 88,

@@ -115,6 +115,10 @@ pub(crate) struct BitrateController {
     /// `PUNKTFUNK_ABR_MAX_MBPS` in kbps, injected so tests never touch the env.
     /// `None` = no cap.
     ceiling_cap_kbps: Option<u32>,
+    /// The ceiling is still the rate the Welcome resolved blind — nothing has
+    /// been measured and nothing has ruled a measurement out. The first of
+    /// either settles it, and the first measurement binds, up or down.
+    blind: bool,
     /// [`stream_ceiling_kbps`] for this mode/codec. Bounds only what
     /// [`set_ceiling`](Self::set_ceiling) learns; the negotiated start stands.
     stream_cap_kbps: Option<u32>,
@@ -201,6 +205,7 @@ impl BitrateController {
             // the clamp-down step in [`on_window`](Self::on_window).
             ceiling_kbps: start_kbps.min(ceiling_cap_kbps.unwrap_or(u32::MAX)),
             ceiling_cap_kbps,
+            blind: true,
             stream_cap_kbps: None,
             floor_kbps: FLOOR_KBPS.min(start_kbps.max(1)),
             probing: true,
@@ -240,16 +245,26 @@ impl BitrateController {
         self.last_reason
     }
 
-    /// Raise the climb ceiling to a measured link capacity (caller already
-    /// subtracted headroom). Never lowers: a congested-moment measurement must
-    /// not shrink authority below what was negotiated. The env cap clamps here
-    /// — the one funnel every learned ceiling passes through.
+    /// The climb ceiling from a measured link capacity (caller already
+    /// subtracted headroom). The env cap and the stream shape clamp here —
+    /// the one funnel every learned ceiling passes through.
+    ///
+    /// The FIRST measurement binds, up or down: the rate the Welcome resolved
+    /// is not evidence about the link, so a reading under it is the wall, not
+    /// noise to discard (#1131). Later ones only raise — a congested-moment
+    /// measurement must not shrink what an earlier one proved.
     pub(crate) fn set_ceiling(&mut self, kbps: u32) {
         let measured = kbps;
         let kbps = kbps
             .min(self.ceiling_cap_kbps.unwrap_or(u32::MAX))
             .min(self.stream_cap_kbps.unwrap_or(u32::MAX));
-        if self.enabled && kbps < measured {
+        if !self.enabled {
+            return;
+        }
+        // A clamped reading is the stream shape or the operator's cap talking,
+        // not the link: it may raise the ceiling, never bind it downward.
+        let clamped = kbps < measured;
+        if clamped {
             // Log both numbers when it binds; a silent trim is undiagnosable.
             tracing::info!(
                 measured_kbps = measured,
@@ -257,6 +272,44 @@ impl BitrateController {
                 "adaptive bitrate: link ceiling bounded by what this stream can use"
             );
         }
+        if (self.blind && !clamped) || kbps > self.ceiling_kbps {
+            self.ceiling_kbps = kbps.max(self.floor_kbps);
+        }
+        self.blind = false;
+    }
+
+    /// Nothing will be measured this session: the probe is off, the host
+    /// declined it, or it timed out.
+    ///
+    /// No measurement is not no authority. What the stream can use is a bound
+    /// on the absurd, not a claim about the link (L1), and the growth law
+    /// still has to earn every step up to it — so it becomes the ceiling
+    /// instead of the rate the Welcome guessed, which bounded nothing and
+    /// pinned every un-probed session at 20 Mbps (#1175).
+    pub(crate) fn no_link_evidence(&mut self, stream_cap_kbps: u32) {
+        if !self.blind || !self.enabled {
+            return;
+        }
+        self.blind = false;
+        let kbps = stream_cap_kbps
+            .min(self.ceiling_cap_kbps.unwrap_or(u32::MAX))
+            .max(self.ceiling_kbps);
+        if kbps > self.ceiling_kbps {
+            tracing::info!(
+                ceiling_kbps = kbps,
+                "adaptive bitrate: nothing measured the link — the stream's own shape is the \
+                 bound, and every step up to it still has to be earned"
+            );
+            self.ceiling_kbps = kbps;
+        }
+    }
+
+    /// The host granted a rate above the ceiling we thought we had. Not a link
+    /// measurement: it raises, and leaves a later measurement free to bind.
+    fn raise_ceiling(&mut self, kbps: u32) {
+        let kbps = kbps
+            .min(self.ceiling_cap_kbps.unwrap_or(u32::MAX))
+            .min(self.stream_cap_kbps.unwrap_or(u32::MAX));
         if self.enabled && kbps > self.ceiling_kbps {
             self.ceiling_kbps = kbps;
         }
@@ -287,7 +340,7 @@ impl BitrateController {
     /// Bound future learned ceilings (same funnel as the env cap). The first
     /// set leaves a negotiated start above it standing. A re-set is a mode
     /// switch: a drop in pixel rate rebinds the standing ceiling because
-    /// [`set_ceiling`](Self::set_ceiling) never lowers.
+    /// [`set_ceiling`](Self::set_ceiling) never lowers below what it learned.
     pub(crate) fn set_stream_cap(&mut self, kbps: u32) {
         let mode_switch = self.stream_cap_kbps.is_some();
         self.stream_cap_kbps = Some(kbps);
@@ -507,7 +560,7 @@ impl BitrateController {
             // Unsolicited `BitrateChanged` can sit above our ceiling (host
             // re-resolved Automatic for what it encodes). Follow it; env cap
             // still binds. Without this, the step-down drags the host back.
-            self.set_ceiling(kbps);
+            self.raise_ceiling(kbps);
         }
         self.unacked = 0;
     }
@@ -1258,8 +1311,12 @@ mod tests {
         );
     }
 
+    /// A disabled controller learns nothing, and the FIRST measurement binds
+    /// whichever way it points: a 10 Mbps wall under a blind 20 Mbps start is
+    /// the tunnel case, and discarding it is what left #1131 climbing into it.
+    /// Later measurements only raise.
     #[test]
-    fn set_ceiling_is_ignored_when_disabled_and_never_lowers() {
+    fn set_ceiling_is_ignored_when_disabled_and_the_first_one_binds() {
         let mut c = BitrateController::new(0, None);
         c.set_ceiling(1_000_000);
         assert_eq!(
@@ -1270,8 +1327,12 @@ mod tests {
             None
         );
         let mut c = BitrateController::new(20_000, None);
-        c.set_ceiling(10_000); // below the negotiated start → ignored
-        assert_eq!(c.ceiling_kbps, 20_000);
+        c.set_ceiling(10_000);
+        assert_eq!(c.ceiling_kbps, 10_000, "the wall is what was measured");
+        c.set_ceiling(6_000);
+        assert_eq!(c.ceiling_kbps, 10_000, "a second, worse reading is not");
+        c.set_ceiling(30_000);
+        assert_eq!(c.ceiling_kbps, 30_000, "a better one still raises");
     }
 
     /// Stream bound clamps learned ceilings only; a host-resolved start stands.

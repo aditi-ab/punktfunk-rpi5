@@ -341,6 +341,9 @@ pub(crate) struct CapacityProbe {
     /// `frames_completed` when the burst started: "did any frame survive",
     /// not "has one ever arrived".
     frames_at_start: u64,
+    /// Nothing is going to measure this link: no probe was armed, the host
+    /// declined it, it timed out, or the ramp ended with nothing. Taken once.
+    no_evidence: bool,
 }
 
 impl CapacityProbe {
@@ -365,6 +368,7 @@ impl CapacityProbe {
             active: false,
             watchdog: None,
             frames_at_start: 0,
+            no_evidence: !armed,
         }
     }
 
@@ -471,12 +475,18 @@ impl CapacityProbe {
         }
         if self.result_by.is_some_and(|at| now >= at) {
             self.result_by = None;
+            self.no_evidence = true;
             tracing::info!(
-                "adaptive bitrate: capacity probe timed out (old host?) — keeping negotiated ceiling"
+                "adaptive bitrate: capacity probe timed out — nothing measured the link"
             );
             return true;
         }
         false
+    }
+
+    /// Nothing measured the link and nothing will. Taken once.
+    pub(crate) fn take_no_evidence(&mut self) -> bool {
+        std::mem::take(&mut self.no_evidence)
     }
 
     /// The ramp's verdict, once. `Some` exactly one tick after it stopped.
@@ -514,9 +524,8 @@ impl CapacityProbe {
             return Measured::NotOurs;
         }
         if r.host_duration_ms == 0 || r.delivered_bytes == 0 {
-            tracing::info!(
-                "adaptive bitrate: capacity probe declined — keeping negotiated ceiling"
-            );
+            tracing::info!("adaptive bitrate: capacity probe declined — nothing measured it");
+            self.no_evidence = true;
             return Measured::Declined;
         }
         // Over the CLIENT receive interval: the host send window closes while
