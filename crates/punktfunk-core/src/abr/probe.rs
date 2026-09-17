@@ -34,6 +34,18 @@ pub struct ProbeReport {
     pub client_interval_ms: u32,
 }
 
+/// What a burst's report was worth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Measured {
+    /// Not the burst this client asked for — an embedder speed test, or a
+    /// report already consumed. Nothing is learned, nothing is rebased.
+    NotOurs,
+    /// The host declined the burst: the negotiated ceiling stands.
+    Declined,
+    /// Link capacity, headroom already taken off.
+    Ceiling(u32),
+}
+
 /// The startup burst's whole life: armed, in flight, answered or abandoned.
 pub(crate) struct CapacityProbe {
     /// Burst target. `PUNKTFUNK_ABR_PROBE_KBPS`, or twice the stream cap.
@@ -146,17 +158,18 @@ impl CapacityProbe {
         false
     }
 
-    /// The host's end-of-burst report. `Some(kbps)` is the climb ceiling it
-    /// measured; `None` is a decline, and the negotiated ceiling stands.
-    /// A report we are not waiting for (an embedder speed test) teaches
-    /// nothing.
-    pub(crate) fn on_result(&mut self, r: ProbeReport) -> Option<u32> {
-        self.result_by.take()?;
+    /// The host's end-of-burst report. Answered once: the embedder mirrors a
+    /// finished probe's state for as long as it stands, so the same report
+    /// arrives again on the next iteration.
+    pub(crate) fn on_result(&mut self, r: ProbeReport) -> Measured {
+        if self.result_by.take().is_none() {
+            return Measured::NotOurs;
+        }
         if r.host_duration_ms == 0 || r.delivered_bytes == 0 {
             tracing::info!(
                 "adaptive bitrate: capacity probe declined — keeping negotiated ceiling"
             );
-            return None;
+            return Measured::Declined;
         }
         // Over the CLIENT receive interval: the host send window closes while
         // the bottleneck queue is still draining, so its duration overstates.
@@ -170,7 +183,7 @@ impl CapacityProbe {
             host_duration_ms = r.host_duration_ms,
             "adaptive bitrate: link-capacity probe done — climb ceiling set"
         );
-        Some(ceiling)
+        Measured::Ceiling(ceiling)
     }
 }
 
@@ -189,6 +202,45 @@ pub(crate) fn probe_target_kbps(stream_cap_kbps: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::quic::{CHROMA_IDC_420, CODEC_H264, CODEC_HEVC};
+
+    fn report(delivered_bytes: u64, window_ms: u32) -> ProbeReport {
+        ProbeReport {
+            delivered_bytes,
+            window_ms,
+            host_duration_ms: 800,
+            client_interval_ms: window_ms,
+        }
+    }
+
+    /// The embedder's probe state keeps saying "done" until the next burst
+    /// overwrites it, so the same report arrives on every iteration. Reading
+    /// it twice would re-base the byte anchor forever, and the session would
+    /// never see a window it could climb on.
+    #[test]
+    fn a_finished_burst_is_measured_exactly_once() {
+        let now = Instant::now();
+        let mut p = CapacityProbe::new(true, Some(400_000), 100_000, now);
+        assert_eq!(p.poll(now + PROBE_DELAY, 1), Some((400_000, PROBE_MS)));
+        // 1 MB over 800 ms is 10 Mbps; the ceiling keeps 70 % of it.
+        assert_eq!(
+            p.on_result(report(1_000_000, 800)),
+            Measured::Ceiling(7_000)
+        );
+        assert_eq!(
+            p.on_result(report(1_000_000, 800)),
+            Measured::NotOurs,
+            "the same report must not be read twice"
+        );
+    }
+
+    /// An embedder speed test finishes too, and its numbers are not the
+    /// controller's to learn from.
+    #[test]
+    fn a_probe_nobody_asked_for_teaches_nothing() {
+        let now = Instant::now();
+        let mut p = CapacityProbe::new(false, None, 100_000, now);
+        assert_eq!(p.on_result(report(9_000_000, 800)), Measured::NotOurs);
+    }
 
     /// Burst must prove the stream cap and no more. Above `cap / 0.7`
     /// is discarded by `set_ceiling` (see

@@ -261,8 +261,10 @@ impl Driver {
 
     /// The host's end-of-burst report.
     pub fn on_probe_result(&mut self, r: ProbeReport) {
-        if let Some(kbps) = self.probe.on_result(r) {
-            self.set_ceiling(kbps);
+        match self.probe.on_result(r) {
+            probe::Measured::NotOurs => return,
+            probe::Measured::Declined => {}
+            probe::Measured::Ceiling(kbps) => self.set_ceiling(kbps),
         }
         // Skips video that landed under a suppressed report tick; `rebase`
         // already netted the filler out.
