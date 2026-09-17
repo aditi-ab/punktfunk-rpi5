@@ -39,8 +39,11 @@ const RAMP_START_KBPS: u32 = 5_000;
 const RAMP_STEP_BYTES: u64 = 3_000_000;
 /// Delivered ÷ offered under this is a wall.
 const RAMP_WALL_PCT: u64 = 90;
-/// What a wall licenses: the ceiling sits under what the link delivered.
-const RAMP_CEILING_PCT: u32 = 85;
+/// What a wall licenses. A wall measured once is a snapshot of a link that
+/// moves — Wi-Fi by ±30 % — and the 30 % held back is what a 100 ms airtime
+/// stall spends instead of frames. It is also what the in-session burst has
+/// always kept, so the top of the range is no worse than what people like.
+const RAMP_CEILING_PCT: u32 = 70;
 /// The session opens at this share of what the ramp proved.
 const RAMP_START_PCT: u32 = 50;
 /// What a clean picture wants, as a divisor of the stream-shape cap: 0.15 bpp
@@ -577,7 +580,8 @@ pub(crate) fn ramp_start_kbps(proven_kbps: u32, stream_cap_kbps: u32) -> u32 {
     mode_rate.min(proven_kbps / (100 / RAMP_START_PCT))
 }
 
-/// The ceiling a wall licenses: under what the link actually delivered.
+/// The ceiling a wall licenses: well under what the link actually delivered,
+/// because the reading is one moment of it.
 pub(crate) fn wall_ceiling_kbps(delivered_kbps: u32) -> u32 {
     (u64::from(delivered_kbps) * u64::from(RAMP_CEILING_PCT) / 100) as u32
 }
@@ -942,8 +946,8 @@ mod tests {
     /// the session opens at the smaller of half that and what the mode wants.
     #[test]
     fn a_wall_licenses_less_than_it_delivered() {
-        assert_eq!(wall_ceiling_kbps(12_500), 10_625);
-        assert_eq!(wall_ceiling_kbps(1_000_000), 850_000);
+        assert_eq!(wall_ceiling_kbps(12_500), 8_750);
+        assert_eq!(wall_ceiling_kbps(1_000_000), 700_000);
 
         let cap_1080p60 =
             super::super::stream_ceiling_kbps(1920, 1080, 60, CODEC_HEVC, 8, CHROMA_IDC_420);
