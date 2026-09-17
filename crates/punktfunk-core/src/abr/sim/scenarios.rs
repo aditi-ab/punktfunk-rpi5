@@ -982,43 +982,35 @@ mod tests {
         }
     }
 
-    /// C2: one unrecoverable frame is one cut to 0.7×, and the climb back is
-    /// six additive steps — the 09-16 sawtooth.
+    /// C2: at the ceiling with nothing else wrong, one unrecoverable frame is
+    /// a blip. The rate does not move and the session holds 171 294 kbps for
+    /// the rest of its run.
+    ///
+    /// Before: ×0.7 to 119 905 on that one window, then six additive steps —
+    /// 127 400 · 135 363 · 143 824 · 152 814 · 162 365 · 171 294 — and 28 s at
+    /// 30 % less picture. The 09-16 sawtooth, once every minute or two.
     #[test]
-    fn c2_one_lost_frame_costs_a_cut_and_half_a_minute() {
+    fn c2_one_lost_frame_after_a_clean_run_is_not_a_cut() {
         let r = run(&wifi_good());
-        let cuts = r.cuts();
-        assert_eq!(cuts.len(), 1, "one lost frame, one cut");
-        let cut = cuts[0];
-        assert_eq!(cut.cut_from_kbps, Some(171_294));
-        let after = r.windows[0]
-            .iter()
-            .find(|w| w.t_ms > cut.t_ms && w.rate_kbps < 171_294)
-            .expect("the cut lands");
-        assert_eq!(after.rate_kbps, 119_905, "0.7 × the ceiling");
-        let back = r.windows[0]
-            .iter()
-            .find(|w| w.t_ms > cut.t_ms && w.rate_kbps >= 171_294)
-            .expect("and it climbs back");
-        let took = back.t_ms - cut.t_ms;
         assert!(
-            (24_000..=32_000).contains(&took),
-            "back at the ceiling after {took} ms"
+            r.cuts().is_empty(),
+            "one lost frame on a clean link must not move the rate: {:?}",
+            r.cuts().first().map(|w| (w.t_ms, w.dropped, w.recovery_kf))
         );
-        let steps = r.windows[0]
+        let blip = r.windows[0]
             .iter()
-            .filter(|w| w.t_ms > cut.t_ms && w.t_ms <= back.t_ms)
-            .fold((0u32, 119_905u32), |(n, last), w| {
-                if w.rate_kbps > last {
-                    (n + 1, w.rate_kbps)
-                } else {
-                    (n, last)
-                }
-            })
-            .0;
-        assert_eq!(
-            steps, 6,
-            "127 400 · 135 363 · 143 824 · 152 814 · 162 365 · 171 294"
+            .find(|w| w.dropped > 0)
+            .expect("the frame does die");
+        assert!(
+            (30_000..=31_500).contains(&blip.t_ms),
+            "the injected frame died at {} ms",
+            blip.t_ms
+        );
+        assert!(
+            r.windows[0]
+                .iter()
+                .all(|w| w.rate_kbps == 171_294 || w.discarded),
+            "the session holds the ceiling throughout"
         );
     }
 

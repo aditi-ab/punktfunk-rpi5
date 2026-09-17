@@ -1,10 +1,12 @@
 //! What one window is: severe, bad, quiet, starved — and which signal said so.
 //!
-//! Loss, an unrecoverable frame and a flush are absolute; one-way delay,
-//! client decode and host encode are relative, each scored against the
-//! rolling minimum of the last [`BASELINE_WINDOWS`] windows that carried the
-//! signal. Severe decides on one window, ordinary on two. Quiet windows teach
-//! no baseline, and a starved window withholds the host-encode signal.
+//! Loss and a flush are absolute; one-way delay, client decode and host
+//! encode are relative, each scored against the rolling minimum of the last
+//! [`BASELINE_WINDOWS`] windows that carried the signal. An unrecoverable
+//! frame is absolute too unless it is the only damage behind a long clean run
+//! at this rate, which makes it a blip and moves nothing. Severe decides on
+//! one window, ordinary on two. Quiet windows teach no baseline, and a starved
+//! window withholds the host-encode signal.
 
 use super::sample::WindowSample;
 use std::collections::VecDeque;
@@ -22,6 +24,10 @@ pub(super) const RECOVERY_KF_BAD: u32 = 2;
 /// Keyframe asks that make one window severe. Emitters throttle at 100 ms, so
 /// 4+ in 750 ms means most of the window produced no pictures.
 pub(super) const RECOVERY_KF_SEVERE: u32 = 4;
+/// Clean windows at the current rate behind a lone lost frame before it reads
+/// as a blip. 8 × 750 ms = 6 s: long enough that the rate it held is proven,
+/// short enough that a link dropping a frame every few seconds still cuts.
+pub(super) const BLIP_CLEAN_WINDOWS: u32 = 8;
 /// One-way-delay rise above the rolling baseline that counts as queue growth.
 /// 25 ms is far beyond jitter at any streamable frame rate.
 const OWD_RISE_US: i64 = 25_000;
@@ -60,11 +66,13 @@ pub(super) const BASELINE_MIN_WINDOWS: usize = 4;
 ///
 /// Severe signals rank ahead of ordinary ones, in the order they are scored.
 /// A window nothing flagged is [`Clean`](Self::Clean), or [`Quiet`](Self::Quiet)
-/// when there was no new content to judge.
+/// when there was no new content to judge. [`Blip`](Self::Blip) moves no rate:
+/// it is a lost frame a long clean run says the link did not cause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     Clean,
     Quiet,
+    Blip,
     LostFrame,
     Flush,
     Loss,
@@ -123,14 +131,17 @@ impl Baselines {
     /// Score one window, then record what it taught.
     ///
     /// `current_kbps` is the acked rate starvation is measured against,
-    /// `frame_budget_us` sizes the decode and encode thresholds, and
-    /// `encode_disarmed` withholds the host-encode signal entirely.
+    /// `frame_budget_us` sizes the decode and encode thresholds,
+    /// `encode_disarmed` withholds the host-encode signal entirely, and
+    /// `clean_run` is the undamaged windows this rate has already held —
+    /// what tells a blip from the first window of congestion.
     pub(crate) fn score(
         &mut self,
         w: &WindowSample,
         current_kbps: u32,
         frame_budget_us: Option<i64>,
         encode_disarmed: bool,
+        clean_run: u32,
     ) -> Verdict {
         let quiet = w.activity.quiet();
         // Keepalive OWD/decode would train the rolling min on the quietest
@@ -162,19 +173,33 @@ impl Baselines {
             encode_rise_us,
             encode_severe_us,
         );
+        // A lost frame and nothing else, behind a long clean run at this rate:
+        // the recovery plane's business (RFI, FEC), not the rate's. The run is
+        // what makes it isolated — during a climb or at session start the same
+        // window is the first of a cascade.
+        let blip = w.dropped > 0
+            && clean_run >= BLIP_CLEAN_WINDOWS
+            && w.loss_ppm < HEAVY_LOSS_PPM
+            && !w.flushed
+            && !owd_bad
+            && !decode_bad
+            && !encode_bad
+            && w.recovery_kf < RECOVERY_KF_BAD;
         // Severe: one window. Ordinary congestion: two consecutive.
-        let severe = w.dropped > 0
-            || w.flushed
-            || w.loss_ppm >= SEVERE_LOSS_PPM
-            || decode_severe
-            || encode_severe
-            || w.recovery_kf >= RECOVERY_KF_SEVERE;
+        let severe = !blip
+            && (w.dropped > 0
+                || w.flushed
+                || w.loss_ppm >= SEVERE_LOSS_PPM
+                || decode_severe
+                || encode_severe
+                || w.recovery_kf >= RECOVERY_KF_SEVERE);
         let bad = severe
-            || w.loss_ppm >= HEAVY_LOSS_PPM
-            || owd_bad
-            || decode_bad
-            || encode_bad
-            || w.recovery_kf >= RECOVERY_KF_BAD;
+            || (!blip
+                && (w.loss_ppm >= HEAVY_LOSS_PPM
+                    || owd_bad
+                    || decode_bad
+                    || encode_bad
+                    || w.recovery_kf >= RECOVERY_KF_BAD));
         let mut v = Verdict {
             severe,
             bad,
@@ -187,7 +212,11 @@ impl Baselines {
             decode_mean_us,
             reason: Reason::Clean,
         };
-        v.reason = reason(w, owd_bad, &v);
+        v.reason = if blip {
+            Reason::Blip
+        } else {
+            reason(w, owd_bad, &v)
+        };
         v
     }
 }
@@ -390,6 +419,51 @@ mod tests {
                 actual_kbps: 1_000_000,
                 recovery_kf: 4,
                 ..WindowSample::at(ticks(start, 0))
+            }),
+            Some(14_000)
+        );
+    }
+
+    /// A clean run at the rate is what makes one lost frame isolated: without
+    /// it, and for the next one inside it, the window cuts as it always did.
+    #[test]
+    fn one_lost_frame_after_a_clean_run_is_a_blip() {
+        // Start at the ceiling, so no climb interrupts the run.
+        let mut c = BitrateController::new(20_000, None);
+        let start = Instant::now();
+        let held = |at: u32| WindowSample {
+            owd_mean_us: Some(10_000),
+            actual_kbps: 20_000,
+            ..WindowSample::at(ticks(start, at))
+        };
+        for i in 0..BLIP_CLEAN_WINDOWS {
+            assert_eq!(c.on_window(&held(i)), None);
+        }
+        assert_eq!(
+            c.on_window(&WindowSample {
+                dropped: 1,
+                ..held(BLIP_CLEAN_WINDOWS)
+            }),
+            None,
+            "one lost frame, nothing else, after six seconds at this rate"
+        );
+        assert_eq!(c.last_reason(), Reason::Blip);
+        assert!(c.probing, "and slow start is not spent on it");
+        assert_eq!(
+            c.on_window(&WindowSample {
+                dropped: 1,
+                ..held(BLIP_CLEAN_WINDOWS + 1)
+            }),
+            Some(14_000),
+            "a second one inside the next run is congestion"
+        );
+
+        // Same window with no run behind it: the first window of a cascade.
+        let mut c = BitrateController::new(20_000, None);
+        assert_eq!(
+            c.on_window(&WindowSample {
+                dropped: 1,
+                ..held(0)
             }),
             Some(14_000)
         );

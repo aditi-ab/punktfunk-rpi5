@@ -514,6 +514,7 @@ impl BitrateController {
             self.current_kbps,
             self.frame_budget_us,
             self.encode_down.disarmed(),
+            self.clean_windows,
         );
         self.last_reason = v.reason;
         self.note_activity(w.activity, v.quiet);
@@ -571,6 +572,20 @@ impl BitrateController {
     fn note_verdict(&mut self, w: &WindowSample, v: &Verdict) {
         // Bucket clock ticks on idle windows too: decay is about time.
         self.proven.tick();
+        if v.reason == Reason::Blip {
+            // The rate stands and slow start with it, but the clean run that
+            // vouched for this window starts over: a second lost frame inside
+            // the next one is judged like any other damage.
+            self.clean_windows = 0;
+            tracing::info!(
+                dropped = w.dropped,
+                loss_ppm = w.loss_ppm,
+                owd_mean_us = w.owd_mean_us.unwrap_or(-1),
+                at_kbps = self.current_kbps,
+                "adaptive bitrate: one lost frame after a clean run — a blip, not the link"
+            );
+            return;
+        }
         if !v.bad {
             self.proven.note(w.actual_kbps);
         }

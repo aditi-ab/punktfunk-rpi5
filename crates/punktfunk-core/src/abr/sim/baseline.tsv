@@ -1,7 +1,7 @@
 scenario	under5_pct	to90_s	cuts_10min	lost_10min	queue_p95_ms	over_cap_kb_10s	blip_recover_s	fairness_x1000	decisions_fnv1a
-lan_10g	0	17	10	10	1	0	28	1000	b568b6a9
+lan_10g	0	17	0	10	1	0	0	1000	e89442bd
 lan_1g	0	15	10	20	6	0	28	1000	15df014a
-wifi_good	0	0	8	8	2	0	28	1000	ad273bfb
+wifi_good	0	0	0	8	2	0	0	1000	811c9dc5
 wifi_tv	0	20	0	0	3	0	0	1000	7ab0d754
 wan_wg_12	2	0	26	393	56	20186	0	1000	c9b8f7ee
 lte_variable	75	0	36	2526	249	1141	0	1000	40738750
