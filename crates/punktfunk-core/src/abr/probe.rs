@@ -125,6 +125,16 @@ pub(crate) struct RampSummary {
     pub asked_bytes: u64,
 }
 
+/// What one settled step says.
+enum Verdict {
+    /// The link refused it at this delivered rate.
+    Wall(u32),
+    /// The host could not offer the rate; what it managed is a floor.
+    Sender(u32),
+    /// Too few packets, or no interval: nothing can be read from it.
+    Unreadable,
+}
+
 /// One step in flight.
 struct Step {
     target_kbps: u32,
@@ -158,6 +168,9 @@ struct Ramp {
     /// look like an unfinished ramp.
     done: bool,
     wall: bool,
+    /// Stopped before it had asked everything it meant to: video arrived, or
+    /// a step went unanswered. Capacity above `proven_kbps` is unmeasured.
+    cut_short: bool,
     outcome: Option<Ramped>,
 }
 
@@ -193,6 +206,7 @@ impl Ramp {
             started: now,
             done: false,
             wall: false,
+            cut_short: false,
             outcome: None,
         }
     }
@@ -217,20 +231,29 @@ impl Ramp {
         }
     }
 
+    /// Stop with nothing above `proven_kbps` measured: video arrived, a step
+    /// went unanswered, or one came back unreadable. The link's wall, if it
+    /// has one, is still out there.
     fn no_wall(&mut self) {
+        self.cut_short = true;
+        self.stop(Ramped::NoWall {
+            proven_kbps: self.proven_kbps,
+        });
+    }
+
+    /// The ramp asked everything it meant to and nothing refused it.
+    fn finished(&mut self) {
         self.stop(Ramped::NoWall {
             proven_kbps: self.proven_kbps,
         });
     }
 
     /// Judge a settled step. `None` = it proved the rate and the ramp goes on.
-    fn judge(&self, step: &Step, r: &ProbeReport) -> Option<Ramped> {
+    fn judge(&self, step: &Step, r: &ProbeReport) -> Option<Verdict> {
         let interval = u64::from(r.client_interval_ms);
         // Under two packets there is no interval, so there is no rate either.
         if interval == 0 || r.delivered_packets < 2 || r.wire_packets_sent == 0 {
-            return Some(Ramped::NoWall {
-                proven_kbps: self.proven_kbps,
-            });
+            return Some(Verdict::Unreadable);
         }
         let delivered_kbps = step_rate_kbps(step, r);
         // The SENDER could not offer the rate: what it managed is a floor
@@ -244,9 +267,9 @@ impl Ramp {
                 asked_bytes = step.asked_bytes,
                 "adaptive bitrate: ramp step limited by the sender, not the link"
             );
-            return Some(Ramped::NoWall {
-                proven_kbps: self.proven_kbps.max(delivered_kbps),
-            });
+            // A complete answer: this host cannot send faster, whatever the
+            // link would take.
+            return Some(Verdict::Sender(delivered_kbps));
         }
         // Delivered ÷ offered as packets a millisecond on each side: the host
         // sent `wire_packets_sent` over its window, we received
@@ -262,7 +285,7 @@ impl Ramp {
                 host_duration_ms = r.host_duration_ms,
                 "adaptive bitrate: ramp found the link's wall"
             );
-            return Some(Ramped::Wall { delivered_kbps });
+            return Some(Verdict::Wall(delivered_kbps));
         }
         None
     }
@@ -299,8 +322,18 @@ impl Ramp {
             return None;
         };
         match self.judge(&step, &report) {
-            Some(end) => {
-                self.stop(end);
+            Some(Verdict::Wall(delivered_kbps)) => {
+                self.stop(Ramped::Wall { delivered_kbps });
+                None
+            }
+            Some(Verdict::Sender(delivered_kbps)) => {
+                self.stop(Ramped::NoWall {
+                    proven_kbps: self.proven_kbps.max(delivered_kbps),
+                });
+                None
+            }
+            Some(Verdict::Unreadable) => {
+                self.no_wall();
                 None
             }
             None => {
@@ -309,7 +342,7 @@ impl Ramp {
                     // The ramp asked for everything this stream can use and
                     // got it. Capacity above that is not this session's
                     // business.
-                    self.no_wall();
+                    self.finished();
                     return None;
                 }
                 self.next_kbps = step.target_kbps.saturating_mul(2).min(self.max_kbps);
@@ -431,7 +464,7 @@ impl CapacityProbe {
         frames_completed: u64,
         video_aus: u64,
     ) -> Option<(u32, u32)> {
-        if self.ramp.is_some() {
+        if self.ramping() {
             return self.poll_ramp(now, video_aus);
         }
         let due = self.fire_at.is_some_and(|at| now >= at);
@@ -518,8 +551,21 @@ impl CapacityProbe {
     }
 
     /// The ramp's verdict, once. `Some` exactly one tick after it stopped.
-    pub(crate) fn take_ramped(&mut self) -> Option<Ramped> {
-        self.ramp.as_mut()?.outcome.take()
+    ///
+    /// A ramp that did not finish leaves the link's wall unmeasured, and a
+    /// session that treats "no wall seen" as "no wall" climbs into it: on the
+    /// rig, 38 % over a 237 Mbps link and 19 cuts in ten minutes. So the
+    /// legacy burst is armed to finish the job the moment video flows. It
+    /// costs the picture what it has always cost, in the only case that needs
+    /// it, and it is a measurement rather than a guess.
+    pub(crate) fn take_ramped(&mut self, now: Instant) -> Option<Ramped> {
+        let r = self.ramp.as_mut()?;
+        let out = r.outcome.take()?;
+        if r.cut_short {
+            self.fire_at = Some(now + PROBE_DELAY);
+            self.no_evidence = false;
+        }
+        Some(out)
     }
 
     /// What the ramp proved, once it has stopped.
@@ -539,6 +585,11 @@ impl CapacityProbe {
         self.ramp.as_ref().is_some_and(|r| !r.done)
     }
 
+    /// The ramp stopped before it had measured what it meant to.
+    pub(crate) fn ramp_cut_short(&self) -> bool {
+        self.ramp.as_ref().is_some_and(|r| r.cut_short)
+    }
+
     /// This session measures with a ramp, so it never bursts beside video.
     pub(crate) fn has_ramp(&self) -> bool {
         self.ramp.is_some()
@@ -549,8 +600,8 @@ impl CapacityProbe {
     /// embedder mirrors a finished probe's state for as long as it stands and
     /// the same report arrives again on the next iteration.
     pub(crate) fn on_result(&mut self, r: ProbeReport, now: Instant) -> Measured {
-        if let Some(ramp) = self.ramp.as_mut() {
-            ramp.on_report(r, now);
+        if self.ramping() {
+            self.ramp.as_mut().expect("ramping").on_report(r, now);
             return Measured::NotOurs;
         }
         if self.result_by.take().is_none() {
@@ -671,7 +722,7 @@ mod tests {
                 .take()
                 .or_else(|| self.p.poll(now, completed, 0))
             else {
-                return self.p.take_ramped();
+                return self.p.take_ramped(self.now);
             };
             self.asked.push(target);
             let sent_kbps = target.min(sender_kbps);
@@ -697,7 +748,7 @@ mod tests {
             let at = self.at(RAMP_DRAIN_MS + 1);
             let completed = self.completed;
             self.pending = self.p.poll(at, completed, 0);
-            self.p.take_ramped()
+            self.p.take_ramped(self.now)
         }
 
         /// Run until the ramp stops, or the step budget runs out.
@@ -793,7 +844,7 @@ mod tests {
             rig.p.poll(now, completed, 1).is_none(),
             "no step once video is here"
         );
-        let Some(Ramped::NoWall { proven_kbps }) = rig.p.take_ramped() else {
+        let Some(Ramped::NoWall { proven_kbps }) = rig.p.take_ramped(rig.now) else {
             panic!("the first frame ends the ramp with what it had")
         };
         assert!(proven_kbps >= 4_000, "step one still counts: {proven_kbps}");
@@ -808,7 +859,7 @@ mod tests {
         let at = rig.at(RAMP_STEP_TIMEOUT.as_millis() as u64 + 1);
         assert!(rig.p.expired(at), "the pump's probe state must be released");
         assert_eq!(
-            rig.p.take_ramped(),
+            rig.p.take_ramped(rig.now),
             Some(Ramped::NoWall { proven_kbps: 0 }),
             "nothing was measured, and nothing is claimed"
         );
@@ -878,7 +929,7 @@ mod tests {
         // Video arrives before step two can answer: one step is all there is.
         let at = rig.at(1);
         assert!(rig.p.poll(at, 0, 1).is_none());
-        let Some(Ramped::NoWall { proven_kbps }) = rig.p.take_ramped() else {
+        let Some(Ramped::NoWall { proven_kbps }) = rig.p.take_ramped(rig.now) else {
             panic!("one step, cut short by video, proves no wall")
         };
         assert_eq!(
@@ -888,6 +939,48 @@ mod tests {
         assert!(
             ramp_start_kbps(proven_kbps, 46_656) < 20_000,
             "a one-step ramp must not open a session above the unmeasured rate"
+        );
+    }
+
+    /// A ramp cut short by video hands the job to the legacy burst: it leaves
+    /// the wall unmeasured, and a session that reads "no wall seen" as "no
+    /// wall" climbs into it.
+    #[test]
+    fn an_unfinished_ramp_falls_back_to_the_burst() {
+        let mut rig = Rig::new(1_026_432, None);
+        assert_eq!(rig.step(245_000, u32::MAX), None);
+        let now = rig.now;
+        assert!(rig.p.poll(now, 0, 1).is_none(), "video ends the ramp");
+        assert!(matches!(
+            rig.p.take_ramped(now),
+            Some(Ramped::NoWall { .. })
+        ));
+        assert!(
+            !rig.p.take_no_evidence(),
+            "a burst is coming, so the link is not unmeasurable"
+        );
+        // Two seconds after video, the burst the ramp could not replace.
+        let at = rig.at(PROBE_DELAY.as_millis() as u64);
+        let (target, duration_ms) = rig.p.poll(at, 40, 40).expect("the burst fires");
+        assert_eq!(duration_ms, PROBE_MS);
+        assert_eq!(target, probe_target_kbps(1_026_432));
+        // And its answer binds, as an old host's always has.
+        assert_eq!(
+            rig.p.on_result(report(30_000_000, 800), at),
+            Measured::Ceiling(210_000)
+        );
+    }
+
+    /// A ramp that finished has nothing left to ask: no burst is armed, and
+    /// the picture is never touched.
+    #[test]
+    fn a_finished_ramp_never_bursts() {
+        let mut rig = Rig::new(46_656, None);
+        assert!(matches!(rig.run(12_500, u32::MAX), Ramped::Wall { .. }));
+        let at = rig.at(2 * PROBE_DELAY.as_millis() as u64);
+        assert!(
+            rig.p.poll(at, 40, 40).is_none(),
+            "the ramp measured the link; nothing may burst beside the picture"
         );
     }
 
@@ -910,7 +1003,11 @@ mod tests {
             let at = rig.at(RAMP_DRAIN_MS * 2);
             rig.p.on_result(empty, at);
             assert!(rig.p.poll(at, 0, 0).is_none(), "the step is not over");
-            assert_eq!(rig.p.take_ramped(), None, "and the ramp has no verdict");
+            assert_eq!(
+                rig.p.take_ramped(rig.now),
+                None,
+                "and the ramp has no verdict"
+            );
         }
         // The queue hands them over, late and stretched: that is the wall.
         let at = rig.at(1);
@@ -926,7 +1023,7 @@ mod tests {
         let at = rig.at(RAMP_DRAIN_MS + 1);
         rig.p.poll(at, 0, 0);
         assert!(
-            matches!(rig.p.take_ramped(), Some(Ramped::Wall { .. })),
+            matches!(rig.p.take_ramped(rig.now), Some(Ramped::Wall { .. })),
             "a step that took four times its window is a wall"
         );
     }
@@ -970,7 +1067,11 @@ mod tests {
             p.poll(now + 2 * PROBE_DELAY, 1, 1),
             Some((probe_target_kbps(100_000), PROBE_MS))
         );
-        assert_eq!(p.take_ramped(), None, "no ramp ran, so none has a verdict");
+        assert_eq!(
+            p.take_ramped(now),
+            None,
+            "no ramp ran, so none has a verdict"
+        );
     }
 
     /// `PUNKTFUNK_ABR_PROBE=0` measures nothing, whatever the host serves.
@@ -980,7 +1081,7 @@ mod tests {
         let mut p = CapacityProbe::new(false, true, None, 100_000, now);
         assert!(p.poll(now, 0, 0).is_none());
         assert!(p.poll(now + PROBE_DELAY, 1, 1).is_none());
-        assert_eq!(p.take_ramped(), None);
+        assert_eq!(p.take_ramped(now), None);
         assert!(!p.ramping());
     }
 

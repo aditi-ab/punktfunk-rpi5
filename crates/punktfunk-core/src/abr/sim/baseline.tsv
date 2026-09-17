@@ -30,9 +30,9 @@ host_rebuild_stall	0	1	0	0	4	0	0	1000	c74cf3dd
 host_rebuild_wave	0	1	0	0	4	0	0	1000	c74cf3dd
 encoder_weak	0	4	0	0	5	0	0	1000	bf986cee
 host_cadence_refusal	0	3	0	0	5	0	0	1000	ea6b71af
-ramp_unanswered	0	18	15	1140	7	0	0	1000	6dba61ae
-ramp_cut_short_wifi	0	21	20	0	46	0	0	1000	44c91866
-ramp_cut_short_wan	25	16	23	230	58	0	0	1000	1402b349
+ramp_unanswered	0	32	0	0	5	0	0	1000	fe07926d
+ramp_cut_short_wifi	0	34	10	0	7	0	0	1000	fa945ea5
+ramp_cut_short_wan	28	18	10	110	31	0	0	1000	8a546a16
 wifi_tv_legacy	0	20	0	0	3	0	0	1000	a510e60b
 wifi_good_legacy	0	1	0	8	2	0	0	1000	811c9dc5
 slow_start_spent_legacy	0	19	2	2	5	0	7	1000	1ef06aa8

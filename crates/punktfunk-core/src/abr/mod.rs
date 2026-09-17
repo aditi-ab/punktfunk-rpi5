@@ -341,13 +341,17 @@ impl Driver {
                 delivered_kbps
             }
             probe::Ramped::NoWall { proven_kbps } if proven_kbps > 0 => {
-                self.set_ceiling(self.stream_cap_kbps);
+                if !self.probe.ramp_cut_short() {
+                    self.set_ceiling(self.stream_cap_kbps);
+                }
                 proven_kbps
             }
             // The ramp stopped before it proved anything: the link is as
             // unmeasured as if it had never run.
             probe::Ramped::NoWall { .. } => {
-                self.abr.no_link_evidence(self.stream_cap_kbps);
+                if !self.probe.ramp_cut_short() {
+                    self.abr.no_link_evidence(self.stream_cap_kbps);
+                }
                 return None;
             }
         };
@@ -376,7 +380,7 @@ impl Driver {
         if self.probe.take_no_evidence() {
             self.abr.no_link_evidence(self.stream_cap_kbps);
         }
-        if let Some(ramped) = self.probe.take_ramped() {
+        if let Some(ramped) = self.probe.take_ramped(now) {
             if let Some(kbps) = self.on_ramped(ramped, now) {
                 actions.push(Action::SetBitrate(kbps));
             }
