@@ -36,7 +36,7 @@ mod window;
 
 pub use cap::LearnedCap;
 use controller::BitrateController;
-pub use probe::ProbeReport;
+pub use probe::{ProbeReport, RampStep, RampStepEnd, RampSummary};
 pub use sample::{DelayTrend, WindowActivity, WindowSample, WINDOW};
 pub use verdict::Reason;
 
@@ -140,6 +140,16 @@ pub struct WindowRecord {
     pub discarded: bool,
     /// What the window was judged to be, and so what named any rate change.
     pub reason: Reason,
+}
+
+/// What the bring-up ramp measured, for a client writing it down.
+#[derive(Clone, Debug)]
+pub struct RampRecord {
+    /// Every settled step, oldest first.
+    pub steps: Vec<RampStep>,
+    pub outcome: RampSummary,
+    /// The rate the session opened at, from the measurement.
+    pub opening_kbps: u32,
 }
 
 impl WindowRecord {
@@ -383,6 +393,17 @@ impl Driver {
     /// Welcome rate before one. What a window is judged against.
     pub fn target_kbps(&self) -> u32 {
         self.abr.current_kbps
+    }
+
+    /// Every bring-up ramp step that settled, oldest first, and what the ramp
+    /// came to once it stopped. Read-only: a rig writes the measurement down
+    /// from here rather than re-deriving it from the wire.
+    pub fn ramp_steps(&self) -> &[RampStep] {
+        self.probe.ramp_steps()
+    }
+
+    pub fn ramp_outcome(&self) -> Option<RampSummary> {
+        self.probe.ramp_summary()
     }
 
     /// A measured link capacity. Never lowers the climb ceiling: a

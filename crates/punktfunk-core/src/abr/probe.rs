@@ -122,15 +122,62 @@ impl Ramped {
     }
 }
 
-/// What the ramp came to, for a test that pins its arithmetic.
-#[cfg(test)]
+/// One settled ramp step, as a client recording the measurement sees it.
+///
+/// The numbers the step was judged on and what it came to — nothing derived,
+/// so a rig reading this and the controller cannot disagree about what the
+/// ramp measured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RampSummary {
+pub struct RampStep {
+    /// Milliseconds from the ramp's start to this step settling.
+    pub t_ms: u64,
+    /// This step re-asked a rate a previous one was refused at.
+    pub repeat: bool,
+    pub target_kbps: u32,
+    pub asked_bytes: u64,
+    pub host_bytes_sent: u64,
+    pub wire_packets_sent: u32,
+    pub delivered_packets: u64,
+    pub delivered_bytes: u64,
+    pub client_interval_ms: u32,
+    pub host_duration_ms: u32,
+    pub send_dropped: u32,
+    /// What this step decided.
+    pub end: RampStepEnd,
+}
+
+/// What a settled step came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RampStepEnd {
+    /// Proved its rate; the ramp doubled and went on.
+    Continued,
+    /// Delivered under the bar: the link's wall.
+    Wall { delivered_kbps: u32 },
+    /// The sender could not offer the rate: a floor under the link, never a
+    /// wall, because the link was never asked.
+    SenderLimit { proven_kbps: u32 },
+    /// Too little arrived to read a rate over — the ramp keeps what it had.
+    Unreadable,
+    /// Refused with nothing lost: asked again at the same rate before the
+    /// refusal is allowed to be a wall.
+    RefusedReAsking { delivered_kbps: u32 },
+    /// Proved the most this stream can use; capacity above it is not the
+    /// session's business.
+    ReachedMax { proven_kbps: u32 },
+    /// The report never arrived, so nothing judged it.
+    NoReport,
+}
+
+/// What the ramp came to, for a test that pins its arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RampSummary {
     pub wall: bool,
     pub proven_kbps: u32,
     pub steps: u32,
     /// Payload bytes asked for over every step.
     pub asked_bytes: u64,
+    /// Wall clock from the first step to the last settling.
+    pub took_ms: u64,
 }
 
 /// What one settled step says.
@@ -147,6 +194,8 @@ enum Verdict {
 /// One step in flight.
 struct Step {
     target_kbps: u32,
+    /// Re-asking a rate that was refused without loss.
+    repeat: bool,
     /// How long the host was asked to send for, microseconds. The offered
     /// side of the ratio is measured against this rather than against the
     /// host's own `duration_ms`: that is a wire field it rounds down to whole
@@ -192,6 +241,10 @@ struct Ramp {
     /// a step went unanswered. Capacity above `proven_kbps` is unmeasured.
     cut_short: bool,
     outcome: Option<Ramped>,
+    /// Every settled step, for a client writing the measurement down. Bounded
+    /// by the ramp itself: it doubles from 5 Mbps and stops at the stream's
+    /// need, so this is a handful of entries.
+    history: Vec<RampStep>,
 }
 
 /// What one step proves, kbps: its delivered bytes over the interval they
@@ -249,7 +302,28 @@ impl Ramp {
             re_ask_spent: false,
             cut_short: false,
             outcome: None,
+            history: Vec::new(),
         }
+    }
+
+    /// Write a settled step down. Records what was judged, never a judgement.
+    fn note(&mut self, step: &Step, r: Option<&ProbeReport>, end: RampStepEnd, now: Instant) {
+        let d = ProbeReport::default();
+        let r = r.unwrap_or(&d);
+        self.history.push(RampStep {
+            t_ms: now.duration_since(self.started).as_millis() as u64,
+            repeat: step.repeat,
+            target_kbps: step.target_kbps,
+            asked_bytes: step.asked_bytes,
+            host_bytes_sent: r.host_bytes_sent,
+            wire_packets_sent: r.wire_packets_sent,
+            delivered_packets: r.delivered_packets,
+            delivered_bytes: r.delivered_bytes,
+            client_interval_ms: r.client_interval_ms,
+            host_duration_ms: r.host_duration_ms,
+            send_dropped: r.send_dropped,
+            end,
+        });
     }
 
     /// Stop here. The first stop wins: a later one would overwrite evidence
@@ -405,6 +479,7 @@ impl Ramp {
         }
         let step = self.step.take().expect("present on this branch");
         let Some(report) = step.last else {
+            self.note(&step, None, RampStepEnd::NoReport, now);
             self.no_wall();
             return None;
         };
@@ -412,14 +487,35 @@ impl Ramp {
             Some(Verdict::Refused {
                 delivered_kbps,
                 lossless,
-            }) => self.on_refusal(delivered_kbps, lossless, now),
+            }) => {
+                // What the repeat was credited against, before the refusal
+                // consumes it: the record reproduces the decision, never
+                // makes it.
+                let first = self.confirming;
+                let again = self.on_refusal(delivered_kbps, lossless, now);
+                let end = if self.confirming.is_some() {
+                    RampStepEnd::RefusedReAsking { delivered_kbps }
+                } else {
+                    RampStepEnd::Wall {
+                        delivered_kbps: first.map_or(delivered_kbps, |f| delivered_kbps.max(f)),
+                    }
+                };
+                self.note(&step, Some(&report), end, now);
+                again
+            }
             Some(Verdict::Sender(delivered_kbps)) => {
-                self.stop(Ramped::NoWall {
-                    proven_kbps: self.proven_kbps.max(delivered_kbps),
-                });
+                let proven_kbps = self.proven_kbps.max(delivered_kbps);
+                self.note(
+                    &step,
+                    Some(&report),
+                    RampStepEnd::SenderLimit { proven_kbps },
+                    now,
+                );
+                self.stop(Ramped::NoWall { proven_kbps });
                 None
             }
             Some(Verdict::Unreadable) => {
+                self.note(&step, Some(&report), RampStepEnd::Unreadable, now);
                 self.no_wall();
                 None
             }
@@ -431,9 +527,18 @@ impl Ramp {
                     // The ramp asked for everything this stream can use and
                     // got it. Capacity above that is not this session's
                     // business.
+                    self.note(
+                        &step,
+                        Some(&report),
+                        RampStepEnd::ReachedMax {
+                            proven_kbps: self.proven_kbps,
+                        },
+                        now,
+                    );
                     self.finished();
                     return None;
                 }
+                self.note(&step, Some(&report), RampStepEnd::Continued, now);
                 self.next_kbps = step.target_kbps.saturating_mul(2).min(self.max_kbps);
                 Some(self.begin(now))
             }
@@ -450,6 +555,8 @@ impl Ramp {
         self.steps += 1;
         self.step = Some(Step {
             target_kbps,
+            // `on_refusal` arms the repeat just before it asks again.
+            repeat: self.confirming.is_some(),
             asked_us,
             asked_bytes,
             seen_bytes: 0,
@@ -659,8 +766,12 @@ impl CapacityProbe {
         Some(out)
     }
 
+    /// Every step the ramp settled, oldest first.
+    pub(crate) fn ramp_steps(&self) -> &[RampStep] {
+        self.ramp.as_ref().map_or(&[], |r| r.history.as_slice())
+    }
+
     /// What the ramp proved, once it has stopped.
-    #[cfg(test)]
     pub(crate) fn ramp_summary(&self) -> Option<RampSummary> {
         let r = self.ramp.as_ref().filter(|r| r.done)?;
         Some(RampSummary {
@@ -668,6 +779,7 @@ impl CapacityProbe {
             proven_kbps: r.proven_kbps,
             steps: r.steps,
             asked_bytes: r.spent_bytes,
+            took_ms: r.started.elapsed().as_millis() as u64,
         })
     }
 

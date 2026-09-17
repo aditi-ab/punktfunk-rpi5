@@ -74,6 +74,9 @@ pub(super) struct DataPump {
     /// Closed windows for an embedder recording a trajectory
     /// ([`crate::client::NativeClient::take_abr_windows`]).
     pub(super) abr_windows: Arc<Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>>,
+    /// The bring-up ramp's steps and outcome, published once it stops
+    /// ([`crate::client::NativeClient::abr_ramp`]).
+    pub(super) abr_ramp: Arc<Mutex<Option<crate::abr::RampRecord>>>,
 }
 
 /// Closed windows held for an embedder that has not read them. Forty-eight
@@ -114,6 +117,7 @@ impl DataPump {
             mode_slot: pump_mode_slot,
             rate_cut,
             abr_windows,
+            abr_ramp,
         } = self;
         pin_thread_user_interactive(); // frame channel → user-interactive video pump
         register_hot_tid(&pump_hot_tids); // UDP receive + FEC reassembly
@@ -313,6 +317,16 @@ impl DataPump {
             };
             abr.on_encode_latency(sum, count);
             abr.on_keyframe_asks(pump_recovery_kf.swap(0, Ordering::Relaxed));
+            if let Some(outcome) = abr.ramp_outcome() {
+                let mut slot = abr_ramp.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.is_none() {
+                    *slot = Some(crate::abr::RampRecord {
+                        steps: abr.ramp_steps().to_vec(),
+                        outcome,
+                        opening_kbps: abr.target_kbps(),
+                    });
+                }
+            }
             let tick = abr.tick(Instant::now());
             // The rate this window asked for, recorded beside the window it
             // came out of.
@@ -787,6 +801,7 @@ mod tests {
             bitrate_ack: Arc::new(Mutex::new(AckQueue::new())),
             recovery_kf: Arc::new(AtomicU32::new(0)),
             abr_windows: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            abr_ramp: Arc::new(Mutex::new(None)),
             pipeline_gap: pipeline_gap.clone(),
             bitrate_kbps: 20_000,
             resolved_bitrate_kbps: 20_000,

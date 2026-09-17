@@ -85,6 +85,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         live_bitrate,
         rate_cut,
         abr_windows,
+        abr_ramp,
         audio_mute,
         pad_slots,
         launch_outcome,
@@ -328,6 +329,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         mode_slot: mode_slot_pump,
         rate_cut,
         abr_windows,
+        abr_ramp,
     };
     let _ = tokio::task::spawn_blocking(move || pump.run()).await;
 

@@ -353,6 +353,8 @@ pub struct NativeClient {
     rate_cut: Arc<AtomicU8>,
     /// Closed ABR windows waiting to be read ([`NativeClient::take_abr_windows`]).
     abr_windows: Arc<Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>>,
+    /// What the bring-up ramp measured ([`NativeClient::abr_ramp`]).
+    abr_ramp: Arc<Mutex<Option<crate::abr::RampRecord>>>,
     /// ABR armed (Automatic, not rate-pinned PyroWave). Skip per-frame decode measurement when
     /// false ([`wants_decode_latency`](Self::wants_decode_latency)).
     wants_decode: bool,
@@ -726,6 +728,7 @@ impl NativeClient {
         let rtt_us = Arc::new(AtomicU32::new(0));
         let decode_lat = Arc::new(Mutex::new(DecodeLatAcc::default()));
         let abr_windows = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let abr_ramp = Arc::new(Mutex::new(None));
         // Pump seeds from Welcome before ready_tx, then follows every ack.
         let live_bitrate = Arc::new(AtomicU32::new(0));
         let rate_cut = Arc::new(AtomicU8::new(0));
@@ -753,6 +756,7 @@ impl NativeClient {
         let rtt_us_w = rtt_us.clone();
         let decode_lat_w = decode_lat.clone();
         let abr_windows_w = abr_windows.clone();
+        let abr_ramp_w = abr_ramp.clone();
         let live_bitrate_w = live_bitrate.clone();
         let rate_cut_w = rate_cut.clone();
         let pad_audio_caps_w = pad_audio_caps.clone();
@@ -840,6 +844,7 @@ impl NativeClient {
                     rtt_us: rtt_us_w,
                     decode_lat: decode_lat_w,
                     abr_windows: abr_windows_w,
+                    abr_ramp: abr_ramp_w,
                     live_bitrate: live_bitrate_w,
                     rate_cut: rate_cut_w,
                     audio_mute: audio_mute_w,
@@ -929,6 +934,7 @@ impl NativeClient {
             hud,
             decode_lat,
             abr_windows,
+            abr_ramp,
             live_bitrate_kbps: live_bitrate,
             rate_cut,
             // Match the pump: Automatic, not rate-pinned PyroWave, AND host echoed a rate.
@@ -1280,6 +1286,15 @@ impl NativeClient {
             .unwrap_or_else(|e| e.into_inner())
             .drain(..)
             .collect()
+    }
+
+    /// What the bring-up ramp measured, or `None` while it is still running,
+    /// was declined, or never ran.
+    pub fn abr_ramp(&self) -> Option<crate::abr::RampRecord> {
+        self.abr_ramp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn current_bitrate_kbps(&self) -> u32 {

@@ -105,6 +105,8 @@ pub(crate) struct WorkerArgs {
     pub(crate) rate_cut: Arc<AtomicU8>,
     /// Closed ABR windows, newest last, for an embedder recording a trajectory.
     pub(crate) abr_windows: Arc<Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>>,
+    /// What the bring-up ramp measured, once it stopped.
+    pub(crate) abr_ramp: Arc<Mutex<Option<crate::abr::RampRecord>>>,
     /// Mute mask the control task ORs [`crate::client::AUDIO_MUTE_HOST`] into on every
     /// `AudioState`. The embedder's own bit rides the same cell.
     pub(crate) audio_mute: Arc<AtomicU8>,
