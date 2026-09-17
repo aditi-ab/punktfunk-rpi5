@@ -802,11 +802,11 @@ const QUIT_CODE: u32 = punktfunk_core::quic::QUIT_CLOSE_CODE;
 
 /// Fallback when `Hello::bitrate_kbps == 0` (20 Mbps). A client that knows its link asks.
 const DEFAULT_BITRATE_KBPS: u32 = 20_000;
-/// Floor keeps the stream usable; ceiling is headroom over the 1 Gbps+ Leopard target
-/// (5K@240 with margin). Echoed in `Welcome::bitrate_kbps`.
-
-// 8 Gbps: encoder is pixel-rate bound (~1 Gpix/s per NVENC, ~2 with 2-way split). The
-// real ceiling is the transport send path, not this number.
+/// Ceiling on a resolved rate: headroom over the 1 Gbps+ Leopard target
+/// (5K@240 with margin), echoed in `Welcome::bitrate_kbps`. The encoder is
+/// pixel-rate bound (~1 Gpix/s per NVENC, ~2 with a 2-way split), so the real
+/// ceiling is the transport send path, not this number. The floor lives with
+/// the derivation it floors ([`MIN_BITRATE_KBPS`]).
 const MAX_BITRATE_KBPS: u32 = 8_000_000;
 
 /// `0` → host default; anything else clamped into `[MIN, MAX]`.

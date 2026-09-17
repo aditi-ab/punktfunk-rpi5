@@ -54,7 +54,7 @@ impl ProbeState {
     ///
     /// The host `duration_ms` is the SEND window: it closes while the
     /// bottleneck queue still drains, so client bytes / host window overstates
-    /// the link. [`set_ceiling`](crate::abr::BitrateController::set_ceiling)
+    /// the link. [`crate::abr::Driver::set_ceiling`]
     /// never lowers, so a high reading sticks for the session.
     pub(crate) fn measured_interval_ms(first_ns: u64, last_ns: u64, packets: u64) -> Option<u32> {
         if packets < 2 || first_ns == 0 || last_ns <= first_ns {
