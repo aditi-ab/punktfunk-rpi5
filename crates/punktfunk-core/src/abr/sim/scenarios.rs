@@ -1014,10 +1014,15 @@ mod tests {
         );
     }
 
-    /// C3: one severe window inside the first 10 s ends slow start for the
-    /// session, and the crawl back costs minutes.
+    /// C3: one severe window inside the first 10 s still cuts and still ends
+    /// slow start — the lost frame comes too early for a clean run to vouch
+    /// for it. Eight clean utilised windows then refute the verdict, and the
+    /// session doubles back instead of crawling.
+    ///
+    /// Before: +6 % a step from 14 000, 158 s to pass 170 000, and a `to90_s`
+    /// of 187 for the scenario.
     #[test]
-    fn c3_one_early_verdict_spends_slow_start_for_good() {
+    fn c3_a_refuted_early_verdict_gives_slow_start_back() {
         let r = run(&slow_start_spent());
         let cut = r.cuts()[0];
         assert!(cut.t_ms <= 10_000, "the blip lands at {} ms", cut.t_ms);
@@ -1030,7 +1035,18 @@ mod tests {
             .find(|w| w.t_ms > from.t_ms && w.rate_kbps >= 170_000)
             .expect("and it does get back");
         let took_s = (to.t_ms - from.t_ms) / 1_000;
-        assert!(took_s >= 150, "14 000 → 170 000 took {took_s} s");
+        assert!(took_s <= 20, "14 000 → 170 000 took {took_s} s");
+        // The re-arm, not a faster additive step: six seconds of clean
+        // windows first, then doublings.
+        let steps = r.steps();
+        let rearmed = steps
+            .windows(2)
+            .find(|p| u64::from(p[1]) * 100 / u64::from(p[0]) >= 150)
+            .expect("a doubling after the cut");
+        assert_eq!(
+            rearmed[0], 14_876,
+            "one additive step at 14 000, then the verdict is refuted"
+        );
     }
 
     /// C6: the startup burst overdrives the link and video dies beside it, so

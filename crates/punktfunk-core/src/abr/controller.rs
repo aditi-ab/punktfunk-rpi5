@@ -4,8 +4,9 @@
 //! encode rise, keyframe storm) back off ×0.7 immediately. Ordinary
 //! congestion needs two consecutive bad windows. Recovery is slow start
 //! (double, bounded by proven-throughput headroom) then additive (+~6 % after
-//! ~4.5 s). Each change rebuilds the encoder (IDR); silence after
-//! [`MAX_UNACKED`] unanswered requests.
+//! ~4.5 s). Slow start comes back on an idle stretch, and on a clean run that
+//! refutes a verdict the link never authorised. Each change rebuilds the
+//! encoder (IDR); silence after [`MAX_UNACKED`] unanswered requests.
 //!
 //! Caps are learned: two identical short host acks latch `host_cap_kbps`; two
 //! similar decode-driven backoffs latch `decode_cap_kbps`, and so does decode
@@ -33,6 +34,12 @@ const LOW_RATE_WARN_KBPS: u32 = 5_000;
 /// Fully-idle windows (every AU a host-marked repeat) before the next active
 /// window re-arms slow start. 4 × 750 ms ≈ 3 s of stillness.
 const IDLE_WINDOWS_TO_REARM: u32 = 4;
+/// Clean utilised windows that refute a verdict the link never authorised,
+/// after which slow start comes back. 8 × 750 ms = 6 s at the rate the
+/// verdict left: long enough to be a run, short enough that recovering from
+/// a false verdict costs seconds instead of the three minutes +6 % a step
+/// takes from 14 to 170 Mbps.
+const CLEAN_WINDOWS_TO_REARM: u32 = 8;
 /// Consecutive ordinary-bad windows before a decrease. One 750 ms window can
 /// be a scheduler blip; 1.5 s is a condition. Severe skips the wait.
 const BAD_WINDOWS_TO_DECREASE: u32 = 2;
@@ -117,6 +124,12 @@ pub(crate) struct BitrateController {
     floor_kbps: u32,
     /// Slow start until the first congestion signal.
     pub(super) probing: bool,
+    /// The last bad window named something the rate is the lever for: the
+    /// link, or a decoder past its budget. Slow start is not given back over
+    /// one of those — doubling into a real wall is what sawed the tunnel.
+    rate_verdict: bool,
+    /// Clean utilised windows since a verdict the rate did not cause.
+    rearm_windows: u32,
     /// Rolling minima the relative signals are scored against.
     baselines: Baselines,
     /// One refresh interval, µs. `None` = the 120 Hz [`ENCODE_RISE_US`] defaults.
@@ -192,6 +205,8 @@ impl BitrateController {
             stream_cap_kbps: None,
             floor_kbps: FLOOR_KBPS.min(start_kbps.max(1)),
             probing: true,
+            rate_verdict: false,
+            rearm_windows: 0,
             baselines: Baselines::new(),
             frame_budget_us: None,
             encode_backoff_us: 0,
@@ -519,6 +534,7 @@ impl BitrateController {
         self.last_reason = v.reason;
         self.note_activity(w.activity, v.quiet);
         self.note_verdict(w, &v);
+        self.note_rearm(w, &v);
         self.tick_caps(&v);
         let cooled = self
             .last_change
@@ -590,6 +606,16 @@ impl BitrateController {
             self.proven.note(w.actual_kbps);
         }
         if v.bad {
+            // What the rate is the lever for, read before the streaks move:
+            // loss share, a delay rise, a flush, drops the clean run does not
+            // vouch for, and a decoder past its budget. Keyframe asks, host
+            // encode and one lost frame behind a clean window are not.
+            let repeated_drops = w.dropped > 1 || (w.dropped == 1 && self.clean_windows == 0);
+            self.rate_verdict = w.loss_ppm >= HEAVY_LOSS_PPM
+                || v.owd_bad
+                || w.flushed
+                || repeated_drops
+                || v.decode_bad;
             self.bad_windows += 1;
             if v.decode_bad {
                 // Counted here: backoff only sees the final window, and the
@@ -612,6 +638,46 @@ impl BitrateController {
             self.clean_windows += 1;
             self.bad_windows = 0;
             self.streak_decode_windows = 0;
+        }
+    }
+
+    /// Give slow start back to a session that lost it to something other than
+    /// the link.
+    ///
+    /// Host encode overload, keyframe asks and one lost frame say nothing
+    /// about capacity, and the +6 % crawl they leave behind takes three
+    /// minutes to undo. [`CLEAN_WINDOWS_TO_REARM`] clean utilised windows
+    /// refute one, and the doubling comes back inside its usual bounds — the
+    /// proven mark, the utilisation gate and every cap. A verdict the rate is
+    /// the lever for is held to instead: doubling back into a wall saws it,
+    /// and the decode cap latches only on two chokes at a similar rate.
+    fn note_rearm(&mut self, w: &WindowSample, v: &Verdict) {
+        // A backoff that recorded a knee reference is not refuted by a clean
+        // run either: the decode cap latches on two chokes at a similar rate,
+        // and a doubling in between samples a different one.
+        if self.probing || self.rate_verdict || self.decode_backoff_kbps > 0 {
+            return;
+        }
+        let proration = growth::proration(w.activity, self.frame_budget_us);
+        if v.bad
+            || v.quiet
+            || v.reason == Reason::Blip
+            || !growth::utilized(w.activity, proration, w.actual_kbps, self.current_kbps)
+        {
+            self.rearm_windows = 0;
+            return;
+        }
+        self.rearm_windows += 1;
+        if self.rearm_windows >= CLEAN_WINDOWS_TO_REARM {
+            self.rearm_windows = 0;
+            self.probing = true;
+            tracing::info!(
+                at_kbps = self.current_kbps,
+                actual_kbps = w.actual_kbps,
+                proven_kbps = self.proven.mark(),
+                windows = CLEAN_WINDOWS_TO_REARM,
+                "adaptive bitrate: the verdict that ended slow start is refuted — re-armed"
+            );
         }
     }
 
@@ -944,6 +1010,49 @@ mod tests {
                 ..WindowSample::at(ticks(start, 0))
             }),
             Some(14_000)
+        );
+    }
+
+    /// A clean run refutes a verdict the rate never caused and slow start
+    /// comes back; the link's own verdict is held to.
+    #[test]
+    fn a_clean_run_re_arms_slow_start_only_for_a_refutable_verdict() {
+        let start = Instant::now();
+        let re_armed = |ender: WindowSample| -> bool {
+            let mut c = BitrateController::new(20_000, None);
+            c.set_ceiling(300_000);
+            assert_eq!(c.on_window(&ender), None, "one bad window cuts nothing");
+            assert!(!c.probing, "but it does end slow start");
+            for i in 1..=CLEAN_WINDOWS_TO_REARM {
+                let at_kbps = c.current_kbps;
+                if let Some(k) = c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    actual_kbps: at_kbps,
+                    ..WindowSample::at(ticks(start, i))
+                }) {
+                    c.on_ack(k);
+                }
+            }
+            c.probing
+        };
+        let base = WindowSample {
+            owd_mean_us: Some(10_000),
+            actual_kbps: 20_000,
+            ..WindowSample::at(ticks(start, 0))
+        };
+        assert!(
+            re_armed(WindowSample {
+                recovery_kf: RECOVERY_KF_BAD,
+                ..base
+            }),
+            "keyframe asks say nothing about what the link can carry"
+        );
+        assert!(
+            !re_armed(WindowSample {
+                loss_ppm: HEAVY_LOSS_PPM,
+                ..base
+            }),
+            "a loss share is the link's own — doubling back into it saws"
         );
     }
 

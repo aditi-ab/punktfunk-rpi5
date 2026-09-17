@@ -90,6 +90,9 @@ pub(crate) struct Verdict {
     pub bad: bool,
     pub quiet: bool,
     pub starved: bool,
+    /// One-way delay over its rolling baseline. The link's own signal, and so
+    /// what tells a queue that is filling from a fault the rate cannot fix.
+    pub owd_bad: bool,
     pub decode_bad: bool,
     pub decode_severe: bool,
     pub encode_bad: bool,
@@ -205,6 +208,7 @@ impl Baselines {
             bad,
             quiet,
             starved,
+            owd_bad,
             decode_bad,
             decode_severe,
             encode_bad,
