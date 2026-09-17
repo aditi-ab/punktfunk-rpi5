@@ -34,6 +34,7 @@ mod window;
 use controller::BitrateController;
 pub use probe::ProbeReport;
 pub use sample::{WindowActivity, WindowSample, WINDOW};
+pub use verdict::Reason;
 
 use std::time::Instant;
 
@@ -268,6 +269,13 @@ impl Driver {
         self.window.rebase_bytes();
     }
 
+    /// What the last judged window was, and so what named the last rate
+    /// change. A cut nobody can attribute is a bug; this is what an overlay
+    /// shows and a field report quotes.
+    pub fn reason(&self) -> Reason {
+        self.abr.last_reason()
+    }
+
     /// A measured link capacity. Never lowers the climb ceiling: a
     /// congested-moment measurement must not shrink what was negotiated.
     pub fn set_ceiling(&mut self, kbps: u32) {
@@ -335,7 +343,7 @@ impl Driver {
                     actual_kbps = w.actual_kbps,
                     flushed = w.flushed,
                     recovery_kf = w.recovery_kf,
-                    reason = ?self.abr.last_reason(),
+                    reason = ?self.reason(),
                     "adaptive bitrate: requesting encoder re-target"
                 );
                 actions.push(Action::SetBitrate(kbps));
