@@ -23,7 +23,7 @@ pub(super) const CAP_REPROBE_WINDOWS_MAX: u32 = 128;
 /// A rate this session has evidence it cannot hold, and the clock that tests
 /// that evidence again.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct LearnedCap {
+pub struct LearnedCap {
     kbps: Option<u32>,
     /// Clean loaded windows parked at the cap.
     probe_windows: u32,
@@ -31,8 +31,14 @@ pub(super) struct LearnedCap {
     reprobe_after: u32,
 }
 
+impl Default for LearnedCap {
+    fn default() -> Self {
+        LearnedCap::new()
+    }
+}
+
 impl LearnedCap {
-    pub(super) fn new() -> Self {
+    pub fn new() -> Self {
         LearnedCap {
             kbps: None,
             probe_windows: 0,
@@ -40,11 +46,13 @@ impl LearnedCap {
         }
     }
 
-    pub(super) fn kbps(&self) -> Option<u32> {
+    pub fn kbps(&self) -> Option<u32> {
         self.kbps
     }
 
-    pub(super) fn reprobe_after(&self) -> u32 {
+    /// Report windows the park lasts before the cap is tested again. The host
+    /// spends it as time; the client counts the windows.
+    pub fn reprobe_after(&self) -> u32 {
         self.reprobe_after
     }
 
@@ -52,7 +60,7 @@ impl LearnedCap {
     /// than what is already learned; re-learning after a lift means the limit
     /// is standing, so the clock backs off. Evidence under `floor_kbps` still
     /// latches, at the floor: the session goes no lower either way.
-    pub(super) fn latch(&mut self, kbps: u32, floor_kbps: u32) -> bool {
+    pub fn latch(&mut self, kbps: u32, floor_kbps: u32) -> bool {
         if self.kbps.is_some_and(|c| kbps >= c) {
             return false;
         }
@@ -70,13 +78,13 @@ impl LearnedCap {
 
     /// Park at `kbps` and restart the clock, without judging the evidence.
     /// The headroom driver moves its cap both ways as one step is answered.
-    pub(super) fn park(&mut self, kbps: u32) {
+    pub fn park(&mut self, kbps: u32) {
         self.kbps = Some(kbps);
         self.probe_windows = 0;
     }
 
     /// The limit has lifted: drop it and start the clock over.
-    pub(super) fn drop_cap(&mut self) {
+    pub fn drop_cap(&mut self) {
         *self = LearnedCap::new();
     }
 

@@ -175,7 +175,7 @@ pub(super) struct StreamState {
     pub(super) phase: Arc<PhaseCtl>,
     pub(super) fec_target: Arc<AtomicU8>,
     pub(super) live_bitrate: Arc<AtomicU32>,
-    pub(super) encoder_ceiling_kbps: Arc<AtomicU32>,
+    pub(super) encoder_ceiling: Arc<std::sync::Mutex<super::EncoderCeiling>>,
     pub(super) cadence_degraded: Arc<AtomicBool>,
     pub(super) cadence_behind_score: Arc<AtomicU32>,
     pub(super) client_packets_received: Arc<AtomicU32>,
@@ -225,6 +225,17 @@ impl StreamState {
     /// Swap the built pipeline in and forget every owed AU. The caller retires the old lease,
     /// re-arms the IDR clock, and re-reads `enc_src` as its path requires.
     pub(super) fn adopt_pipeline(&mut self, p: Pipeline) {
+        // A ceiling was learned from the encoder this one replaces. It survives
+        // a rebuild that opens on the same source; a different geometry or
+        // format is a different encoder, whose limits are unknown again.
+        if (p.frame.format, p.frame.width, p.frame.height)
+            != (self.frame.format, self.frame.width, self.frame.height)
+        {
+            self.encoder_ceiling
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
         self.adopt_reframe(p.reframe);
         self.capturer = p.capturer;
         self.enc = p.enc;
@@ -325,7 +336,7 @@ impl StreamState {
             audio_reserved_kbps,
             shard_payload,
             live_bitrate,
-            encoder_ceiling_kbps,
+            encoder_ceiling,
             cadence_degraded,
             cadence_behind_score,
             client_packets_received,
@@ -875,7 +886,7 @@ impl StreamState {
             phase,
             fec_target: fec_target.clone(),
             live_bitrate,
-            encoder_ceiling_kbps,
+            encoder_ceiling,
             cadence_degraded,
             cadence_behind_score,
             client_packets_received,

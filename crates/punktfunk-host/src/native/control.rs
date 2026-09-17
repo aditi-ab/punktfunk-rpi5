@@ -49,8 +49,9 @@ pub(super) struct Task {
     /// flag. Read at `SetBitrate` so the ack never exceeds what the encoder
     /// will actually run.
     pub(super) live_bitrate: Arc<AtomicU32>,
-    /// See [`Self::live_bitrate`].
-    pub(super) encoder_ceiling_kbps: Arc<AtomicU32>,
+    /// See [`Self::live_bitrate`]. The sole place a ceiling decides an ask:
+    /// the data plane learns it, this task spends it.
+    pub(super) encoder_ceiling: Arc<std::sync::Mutex<super::EncoderCeiling>>,
     /// See [`Self::live_bitrate`].
     pub(super) cadence_degraded: Arc<AtomicBool>,
     /// See [`Self::live_bitrate`].
@@ -121,7 +122,7 @@ pub(super) async fn run(task: Task) {
         session_bitrate_kbps,
         ack_reason,
         live_bitrate,
-        encoder_ceiling_kbps,
+        encoder_ceiling,
         cadence_degraded,
         cadence_behind_score,
         client_packets_received,
@@ -306,22 +307,15 @@ pub(super) async fn run(task: Task) {
                         );
                         (session_bitrate_kbps, AckReason::Pinned)
                     } else {
-                        let mut r = resolve_bitrate_kbps(req.bitrate_kbps);
+                        let mut want = resolve_bitrate_kbps(req.bitrate_kbps);
                         let mut why = AckReason::Granted;
-                        // Ack is the client's climb base: never promise past
-                        // the encoder's discovered codec ceiling (`0` = none).
-                        let ceiling = encoder_ceiling_kbps.load(Ordering::Relaxed);
-                        if ceiling != 0 && r > ceiling {
-                            r = ceiling;
-                            why = AckReason::EncoderLimit;
-                        }
                         // On a fat LAN nothing else stops the climb, and past
                         // the compute knee more bits deepen the miss. Hold a
-                        // climb at the applied rate; descents pass. Named
-                        // after the ceiling: whichever binds tighter is the
-                        // one the client is entitled to hear.
+                        // climb at the applied rate; descents pass. Held first
+                        // because a rate the encoder never sees must not spend
+                        // the ceiling's re-test.
                         let live = live_bitrate.load(Ordering::Relaxed);
-                        if cadence_degraded.load(Ordering::Relaxed) && live != 0 && r > live {
+                        if cadence_degraded.load(Ordering::Relaxed) && live != 0 && want > live {
                             tracing::info!(
                                 requested_kbps = req.bitrate_kbps,
                                 held_kbps = live,
@@ -330,8 +324,19 @@ pub(super) async fn run(task: Task) {
                                 behind_score = cadence_behind_score.load(Ordering::Relaxed),
                                 "bitrate climb refused — encode is behind cadence"
                             );
-                            r = live;
+                            want = live;
                             why = AckReason::Cadence;
+                        }
+                        // Ack is the client's climb base: never promise past a
+                        // ceiling the encoder taught, unless its wait has run
+                        // out and this ask is the re-test. A ceiling under the
+                        // held rate binds tighter, and names the ack instead.
+                        let (r, ceiling_why) = encoder_ceiling
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .resolve(want);
+                        if r < want {
+                            why = ceiling_why;
                         }
                         (r, why)
                     };

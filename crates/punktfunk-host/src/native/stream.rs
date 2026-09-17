@@ -436,7 +436,7 @@ pub(super) struct SessionContext {
     /// ASIC-applied rate, not the request. Shared with pacer, console, mgmt, and climb acks.
     pub(super) live_bitrate: Arc<AtomicU32>,
     /// 0 = none discovered. A request already at the ceiling costs nothing to apply.
-    pub(super) encoder_ceiling_kbps: Arc<AtomicU32>,
+    pub(super) encoder_ceiling: Arc<std::sync::Mutex<super::EncoderCeiling>>,
     /// While set, refuse bitrate climbs — the network is not the bottleneck.
     pub(super) cadence_degraded: Arc<AtomicBool>,
     pub(super) cadence_behind_score: Arc<AtomicU32>,

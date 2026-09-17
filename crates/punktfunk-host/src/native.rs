@@ -809,6 +809,117 @@ const DEFAULT_BITRATE_KBPS: u32 = 20_000;
 /// the derivation it floors ([`MIN_BITRATE_KBPS`]).
 const MAX_BITRATE_KBPS: u32 = 8_000_000;
 
+/// A rate this session's encoder was seen to refuse, and the clock that tests
+/// that refusal again.
+///
+/// One transient short apply used to cap the session for good. This is the
+/// client's own learned-cap lifecycle on the host side: cleared when the
+/// encoder opens at a different configuration, and re-tested once the wait has
+/// run out — the wait doubles each time the refusal is still there, so an
+/// encoder that means it costs one ask every few minutes.
+pub(super) struct EncoderCeiling {
+    cap: punktfunk_core::abr::LearnedCap,
+    /// When the cap was last written. The wait is `reprobe_after` report
+    /// windows of real time, the same 12 s → 96 s ladder the client re-probes
+    /// its own caps on.
+    written_at: std::time::Instant,
+}
+
+impl EncoderCeiling {
+    pub(super) fn new() -> Self {
+        EncoderCeiling {
+            cap: punktfunk_core::abr::LearnedCap::new(),
+            written_at: std::time::Instant::now(),
+        }
+    }
+
+    /// The rate to hand the encoder for an ask of `want`, and what the client
+    /// is told held it there.
+    ///
+    /// Past the wait the ask goes through: the encoder's answer is the only
+    /// evidence that the ceiling still stands. The cap moves up an eighth
+    /// first, exactly as the client's re-probe does, so a refusal that is still
+    /// there re-latches under the lift and backs the clock off.
+    pub(super) fn resolve(&mut self, want: u32) -> (u32, AckReason) {
+        let Some(cap) = self.cap.kbps() else {
+            return (want, AckReason::Granted);
+        };
+        if want <= cap {
+            return (want, AckReason::Granted);
+        }
+        if self.written_at.elapsed() < self.wait() {
+            tracing::info!(
+                requested_kbps = want,
+                ceiling_kbps = cap,
+                "bitrate request clamped to the known encoder ceiling"
+            );
+            return (cap, AckReason::EncoderLimit);
+        }
+        self.write(cap.saturating_add(cap / 8));
+        tracing::info!(
+            requested_kbps = want,
+            ceiling_kbps = cap,
+            "re-testing the encoder ceiling — letting the request reach the encoder"
+        );
+        (want, AckReason::Granted)
+    }
+
+    /// What the encoder made of an ask of `want`. Short is the ceiling, again;
+    /// taking the whole ask is the ceiling gone.
+    pub(super) fn note_applied(&mut self, want: u32, applied: u32) {
+        if applied >= want {
+            if self.cap.kbps().is_some() {
+                tracing::info!(
+                    applied_kbps = applied,
+                    "the encoder took the whole rate — dropping the ceiling it refused before"
+                );
+                self.cap.drop_cap();
+            }
+            return;
+        }
+        // `latch` backs the clock off only for a cap that binds tighter; an
+        // encoder that took more than the ceiling remembered has moved it up,
+        // and that is not evidence of a standing refusal.
+        if !self.cap.latch(applied, MIN_BITRATE_KBPS) {
+            self.cap.park(applied);
+        }
+        self.written_at = std::time::Instant::now();
+        tracing::info!(
+            requested_kbps = want,
+            ceiling_kbps = self.cap.kbps().unwrap_or(applied),
+            retest_in_s = self.wait().as_secs(),
+            "the encoder applied less than the rate asked — ceiling learned"
+        );
+    }
+
+    /// The encoder opened at a different configuration. Whatever it refused was
+    /// refused by an encoder that no longer exists.
+    pub(super) fn clear(&mut self) {
+        if self.cap.kbps().is_some() {
+            tracing::info!("encoder rebuilt at a new configuration — its learned ceiling is gone");
+            self.cap.drop_cap();
+        }
+    }
+
+    fn write(&mut self, kbps: u32) {
+        self.cap.park(kbps);
+        self.written_at = std::time::Instant::now();
+    }
+
+    fn wait(&self) -> std::time::Duration {
+        punktfunk_core::abr::WINDOW * self.cap.reprobe_after()
+    }
+
+    /// Spend the whole wait at once, so a test is not twelve seconds long.
+    #[cfg(test)]
+    fn spend_the_wait(&mut self) {
+        self.written_at = self
+            .written_at
+            .checked_sub(self.wait())
+            .expect("a monotonic clock older than one wait");
+    }
+}
+
 /// `0` → host default; anything else clamped into `[MIN, MAX]`.
 fn resolve_bitrate_kbps(requested: u32) -> u32 {
     if requested == 0 {
@@ -1480,10 +1591,10 @@ pub(crate) async fn run_admitted(
     // LTR-RFI: encode loop prefers `invalidate_ref_frames` over a full IDR when the encoder can.
     let (rfi_tx, rfi_rx) = std::sync::mpsc::channel::<(u32, u32)>();
     let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
-    // Encoder truth for `SetBitrate` resolve: applied rate, discovered ceiling (`0` = none),
-    // cadence-degraded (climb refused — more bits are not the fix). Atomics: freshest only.
+    // Encoder truth for `SetBitrate` resolve: applied rate, a ceiling the encoder taught and
+    // re-tests, cadence-degraded (climb refused — more bits are not the fix).
     let live_bitrate = Arc::new(AtomicU32::new(welcome.bitrate_kbps));
-    let encoder_ceiling_kbps = Arc::new(AtomicU32::new(0));
+    let encoder_ceiling = Arc::new(std::sync::Mutex::new(EncoderCeiling::new()));
     let cadence_degraded = Arc::new(AtomicBool::new(false));
     // Behind-cadence score for the climb-refusal log (the flag alone has no evidence).
     let cadence_behind_score = Arc::new(AtomicU32::new(0));
@@ -1616,7 +1727,7 @@ pub(crate) async fn run_admitted(
         session_bitrate_kbps,
         ack_reason: abr_features & punktfunk_core::quic::EXT_ABR_ACK_REASON != 0,
         live_bitrate: live_bitrate.clone(),
-        encoder_ceiling_kbps: encoder_ceiling_kbps.clone(),
+        encoder_ceiling: encoder_ceiling.clone(),
         cadence_degraded: cadence_degraded.clone(),
         cadence_behind_score: cadence_behind_score.clone(),
         client_packets_received: client_packets_received_ctl,
@@ -2308,7 +2419,7 @@ pub(crate) async fn run_admitted(
                         audio_reserved_kbps,
                         shard_payload: welcome.shard_payload,
                         live_bitrate,
-                        encoder_ceiling_kbps,
+                        encoder_ceiling,
                         cadence_degraded,
                         cadence_behind_score,
                         client_packets_received,
@@ -2613,6 +2724,46 @@ mod tests {
         let asked_enc = ed.enc_kbps(1_010_000);
         let short = ed.applied_budget_kbps(1_010_000, asked_enc * 3 / 4);
         assert!(short < ed.budget_kbps(ed.enc_kbps(1_010_000)));
+    }
+
+    /// One short apply is a ceiling, not a life sentence: it holds for its wait,
+    /// then the next ask reaches the encoder. A full apply there drops it; a
+    /// short one puts it back with twice the wait.
+    #[test]
+    fn a_learned_encoder_ceiling_is_re_tested_and_backs_off() {
+        let mut c = EncoderCeiling::new();
+        assert_eq!(c.resolve(400_000), (400_000, AckReason::Granted));
+        c.note_applied(400_000, 300_000);
+        let first_wait = c.wait();
+        // Under the ceiling nothing is refused; above it, the ack says why.
+        assert_eq!(c.resolve(200_000), (200_000, AckReason::Granted));
+        assert_eq!(c.resolve(400_000), (300_000, AckReason::EncoderLimit));
+        // Past the wait, one ask reaches the encoder.
+        c.spend_the_wait();
+        assert_eq!(c.resolve(400_000), (400_000, AckReason::Granted));
+        // Still there: re-learned, and the next wait is twice as long.
+        c.note_applied(400_000, 300_000);
+        assert_eq!(c.wait(), first_wait * 2);
+        assert_eq!(c.resolve(400_000), (300_000, AckReason::EncoderLimit));
+        // Gone: the ceiling goes with it, and nothing is clamped again.
+        c.spend_the_wait();
+        assert_eq!(c.resolve(400_000), (400_000, AckReason::Granted));
+        c.note_applied(400_000, 400_000);
+        assert_eq!(c.resolve(8_000_000), (8_000_000, AckReason::Granted));
+    }
+
+    /// The encoder that refused a rate is gone (a mode switch, a rebuild on a
+    /// new source), and so is what it taught.
+    #[test]
+    fn a_rebuilt_encoder_starts_with_no_ceiling() {
+        let mut c = EncoderCeiling::new();
+        c.note_applied(400_000, 300_000);
+        assert_eq!(c.resolve(400_000), (300_000, AckReason::EncoderLimit));
+        c.clear();
+        assert_eq!(c.resolve(400_000), (400_000, AckReason::Granted));
+        // And the clock starts over rather than carrying the old backoff.
+        c.note_applied(400_000, 300_000);
+        assert_eq!(c.wait(), punktfunk_core::abr::WINDOW * 16);
     }
 
     #[test]

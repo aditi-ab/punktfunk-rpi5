@@ -29,8 +29,12 @@ impl StreamState {
         }
     }
 
-    /// The client's latest bitrate ask, clamped to a known encoder ceiling: reconfigure in place
-    /// when the encoder can, else rebuild it at the new rate.
+    /// The client's latest bitrate ask: reconfigure in place when the encoder can, else rebuild
+    /// it at the new rate, and tell the ceiling what the encoder made of it.
+    ///
+    /// The ask arrives already resolved against the ceiling — the control task spends it there so
+    /// the ack and the encoder never disagree. Clamping again here would make an ack the client
+    /// already holds a promise the encoder was never given.
     pub(super) fn on_bitrate_request(&mut self) {
         let mut want_kbps = None;
         while let Ok(k) = self.bitrate_rx.try_recv() {
@@ -38,17 +42,6 @@ impl StreamState {
         }
         self.enc
             .set_send_spread_us(self.send_spread_us.load(Ordering::Relaxed));
-        if let Some(k) = want_kbps.as_mut() {
-            let ceiling = self.encoder_ceiling_kbps.load(Ordering::Relaxed);
-            if ceiling != 0 && *k > ceiling {
-                tracing::info!(
-                    requested_kbps = *k,
-                    ceiling_kbps = ceiling,
-                    "bitrate request clamped to the known encoder ceiling"
-                );
-                *k = ceiling;
-            }
-        }
         let Some(new_kbps) = want_kbps.filter(|&k| k != self.bitrate_kbps) else {
             return;
         };
@@ -70,13 +63,7 @@ impl StreamState {
                 requested_kbps = new_kbps,
                 "encoder bitrate reconfigured in place (adaptive bitrate — no IDR)"
             );
-            if applied_kbps < new_kbps {
-                self.encoder_ceiling_kbps
-                    .store(applied_kbps, Ordering::Relaxed);
-                let _ = self
-                    .retarget_tx
-                    .send((applied_kbps, AckReason::EncoderLimit));
-            }
+            self.note_applied_rate(new_kbps, applied_kbps);
             if applied_kbps < self.bitrate_kbps {
                 self.behind_score = 0;
             }
@@ -112,13 +99,7 @@ impl StreamState {
                     "encoder rebuilt at new bitrate (adaptive bitrate)"
                 );
                 self.enc = new_enc;
-                if applied_kbps < new_kbps {
-                    self.encoder_ceiling_kbps
-                        .store(applied_kbps, Ordering::Relaxed);
-                    let _ = self
-                        .retarget_tx
-                        .send((applied_kbps, AckReason::EncoderLimit));
-                }
+                self.note_applied_rate(new_kbps, applied_kbps);
                 self.counters.note_bitrate(applied_kbps);
                 self.bitrate_kbps = applied_kbps;
                 self.live_bitrate.store(applied_kbps, Ordering::Relaxed);
@@ -137,10 +118,23 @@ impl StreamState {
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
                     "bitrate-change encoder rebuild failed — keeping the current rate");
-                let _ = self
-                    .retarget_tx
-                    .send((self.bitrate_kbps, AckReason::EncoderLimit));
+                self.note_applied_rate(new_kbps, self.bitrate_kbps);
             }
+        }
+    }
+
+    /// What the encoder made of `want`: the ceiling learns it, and a client that
+    /// was promised `want` is corrected.
+    ///
+    /// A failed rebuild reports the rate it kept, so a refusal that costs no
+    /// encoder at all still teaches the ceiling.
+    fn note_applied_rate(&mut self, want: u32, applied: u32) {
+        self.encoder_ceiling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_applied(want, applied);
+        if applied < want {
+            let _ = self.retarget_tx.send((applied, AckReason::EncoderLimit));
         }
     }
 

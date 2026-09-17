@@ -184,6 +184,13 @@ impl StreamState {
         if !rebuilt {
             return;
         }
+        // The pixel rate changed, so what the encoder can hold changed with it.
+        // The in-place Windows resize swaps the encoder without `adopt_pipeline`,
+        // so this covers both halves.
+        self.encoder_ceiling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.adopt_built_bitrate(built_bitrate);
         self.cur_mode = new_mode;
         self.next = std::time::Instant::now();
