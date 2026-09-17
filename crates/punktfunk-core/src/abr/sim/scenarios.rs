@@ -25,6 +25,9 @@ const BRINGUP_MS: u64 = 2_500;
 /// waits for the pipeline, and the client measures the link in that gap.
 fn with_ramp(mut sc: Scenario) -> Scenario {
     for s in &mut sc.sessions {
+        if s.host.ramp {
+            continue; // already a ramp scenario, with a bring-up of its own
+        }
         s.host.ramp = true;
         s.host.bringup_ms = s.join_ms + BRINGUP_MS;
         s.client.ramp = true;
@@ -960,6 +963,39 @@ pub(super) fn no_ramp() -> Scenario {
     }
 }
 
+/// A bring-up faster than the ramp: video arrives with the measurement two
+/// or three steps in, so the client holds a floor under the link and nothing
+/// about its wall. Both of these links have one.
+fn ramp_cut_short(name: &'static str, seed: u64, mut sc: Scenario, bringup_ms: u64) -> Scenario {
+    sc = with_ramp(sc);
+    sc.name = name;
+    sc.seed = seed;
+    for s in &mut sc.sessions {
+        s.host.bringup_ms = s.join_ms + bringup_ms;
+    }
+    sc
+}
+
+/// The G5's AP, measured two steps in: a 245 Mbps wall the ramp never saw.
+pub(super) fn ramp_cut_short_wifi() -> Scenario {
+    ramp_cut_short(
+        "ramp_cut_short_wifi",
+        0x7A_7200,
+        wifi_tv_probe_damage(),
+        120,
+    )
+}
+
+/// Klos54's tunnel, measured two steps in: a 12.5 Mbps wall, unseen.
+pub(super) fn ramp_cut_short_wan() -> Scenario {
+    ramp_cut_short(
+        "ramp_cut_short_wan",
+        0x7A_7300,
+        wan_wg_12(0x7A_5500, 180_000),
+        90,
+    )
+}
+
 /// A host that advertises the ramp and then answers no step: the client
 /// waits out the step deadline, learns nothing, and opens on the authority
 /// that no measurement leaves it.
@@ -1046,6 +1082,8 @@ pub(super) fn all() -> Vec<Scenario> {
         encoder_weak(),
         host_cadence_refusal(),
         ramp_unanswered(),
+        ramp_cut_short_wifi(),
+        ramp_cut_short_wan(),
     ]
     .into_iter()
     // `old_host` is the host that has none of this: it stays as it is.
@@ -1551,6 +1589,8 @@ mod tests {
             "c3" => slow_start_spent(),
             "c4" => gpu_saturated(),
             "c5" => wan_wg_12(0x5000, 720_000),
+            "cutwifi" => ramp_cut_short_wifi(),
+            "cutwan" => ramp_cut_short_wan(),
             "newcomer" => shared_newcomer(),
             "c6" => wifi_tv_probe_damage(),
             "knee" => decoder_knee(),
