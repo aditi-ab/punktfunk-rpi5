@@ -111,8 +111,15 @@ pub(super) fn utilized(
                     >= current_kbps as u64 * UTILIZATION_NUM * n
         }
         // Full-rate source, older host, or unknown refresh: wall-clock.
-        _ => actual_kbps as u64 * UTILIZATION_DEN >= current_kbps as u64 * UTILIZATION_NUM,
+        _ => delivered_the_rate(actual_kbps, current_kbps),
     }
+}
+
+/// Did the link hand over the rate the session is running at? The same ¾ bar
+/// on the wall clock, with no proration — for the caller that already knows
+/// the missing frames are sitting in a queue rather than never made.
+pub(super) fn delivered_the_rate(actual_kbps: u32, current_kbps: u32) -> bool {
+    actual_kbps as u64 * UTILIZATION_DEN >= current_kbps as u64 * UTILIZATION_NUM
 }
 
 /// The target a climb may not pass: ×1.5 of the proven wire rate, put back

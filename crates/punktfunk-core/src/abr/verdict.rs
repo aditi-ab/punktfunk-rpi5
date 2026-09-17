@@ -135,9 +135,13 @@ impl Baselines {
     ///
     /// `current_kbps` is the acked rate starvation is measured against,
     /// `frame_budget_us` sizes the decode and encode thresholds,
-    /// `encode_disarmed` withholds the host-encode signal entirely, and
+    /// `encode_disarmed` withholds the host-encode signal entirely,
     /// `clean_run` is the undamaged windows this rate has already held —
-    /// what tells a blip from the first window of congestion.
+    /// what tells a blip from the first window of congestion — and
+    /// `draining` says the last link cut is still emptying the queue it
+    /// caused, which is the one thing a delay rise can mean that the rate
+    /// must not answer again.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn score(
         &mut self,
         w: &WindowSample,
@@ -145,6 +149,7 @@ impl Baselines {
         frame_budget_us: Option<i64>,
         encode_disarmed: bool,
         clean_run: u32,
+        draining: bool,
     ) -> Verdict {
         let quiet = w.activity.quiet();
         // Keepalive OWD/decode would train the rolling min on the quietest
@@ -153,7 +158,12 @@ impl Baselines {
         let decode_mean_us = w.decode_mean_us.filter(|_| !quiet);
         // No severe OWD tier: a standing queue is congestion, not visible
         // damage, so it always takes the two-window path.
-        let (owd_bad, _) = score_baseline(&mut self.owd, owd_mean_us, OWD_RISE_US, i64::MAX);
+        let (owd_rise, _) = score_baseline(&mut self.owd, owd_mean_us, OWD_RISE_US, i64::MAX);
+        // Delay over a queue the last cut is still draining is that cut
+        // working. The baseline still learns the window: only the verdict is
+        // withheld, and only for delay — loss, drops and a flush keep full
+        // power.
+        let owd_bad = owd_rise && !draining;
         // Decode rise ends slow start immediately; a far-past-baseline
         // excursion is severe (one window). Sized in frame budgets.
         let (decode_rise_us, decode_severe_us) = decode_thresholds(frame_budget_us);

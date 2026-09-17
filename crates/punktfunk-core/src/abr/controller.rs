@@ -78,6 +78,23 @@ pub(super) const DECODE_CAP_SIMILAR_DIV: u32 = 8;
 /// Unacked [`crate::quic::SetBitrate`] requests before the host is treated as
 /// predating renegotiation and the controller goes quiet.
 const MAX_UNACKED: u32 = 3;
+/// Where a link-attributed cut lands: this share of what the window actually
+/// delivered. The 15 % held back is what drains the queue the overshoot
+/// built; ×0.7 of a rate the link never carried drains nothing.
+const LINK_CUT_PCT: u32 = 85;
+/// The furthest one link-attributed cut may go. A window that delivered
+/// almost nothing measured an interruption, not a capacity, and ×0.7 never
+/// moved more than this in one step either.
+const LINK_CUT_FLOOR_PCT: u32 = 50;
+/// Windows a link-attributed cut is given to drain what it queued, while the
+/// delay it left behind is still falling. 4 × 750 ms covers the deepest queue
+/// this controller can have caused; the first window that stops falling ends
+/// it sooner, so it composes with the change cooldown instead of adding to it.
+const LINK_DRAIN_WINDOWS: u32 = 4;
+/// Delay fall across a window that counts as a queue emptying. 5 ms over
+/// 750 ms is past the fit's own noise on a jittery link and well under one
+/// frame period at any refresh.
+const DRAIN_FALL_US: i64 = 5_000;
 
 /// A headroom step awaiting the decoder's answer at its new rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +148,12 @@ pub(crate) struct BitrateController {
     rate_verdict: bool,
     /// Clean utilised windows since a verdict the rate did not cause.
     rearm_windows: u32,
+    /// The last bad window was the link's, and the link handed over less than
+    /// it was asked for. Only then does the rate land on what was delivered.
+    link_verdict: bool,
+    /// Windows left in which a falling delay reading is the last
+    /// link-attributed cut working. `0` = nothing to drain.
+    drain_windows: u32,
     /// Rolling minima the relative signals are scored against.
     baselines: Baselines,
     /// One refresh interval, µs. `None` = the 120 Hz [`ENCODE_RISE_US`] defaults.
@@ -211,6 +234,8 @@ impl BitrateController {
             probing: true,
             rate_verdict: false,
             rearm_windows: 0,
+            link_verdict: false,
+            drain_windows: 0,
             baselines: Baselines::new(),
             frame_budget_us: None,
             encode_probe: None,
@@ -640,12 +665,14 @@ impl BitrateController {
             tracing::info!("adaptive bitrate off — host never acked a SetBitrate (older host)");
             return None;
         }
+        let draining = self.note_drain(w);
         let v = self.baselines.score(
             w,
             self.current_kbps,
             self.frame_budget_us,
             self.encode_down.disarmed(),
             self.clean_windows,
+            draining,
         );
         self.last_reason = v.reason;
         self.note_activity(w.activity, v.quiet);
@@ -699,6 +726,53 @@ impl BitrateController {
         self.idle_windows = 0;
     }
 
+    /// Did the link hand over less than the rate it was running at?
+    ///
+    /// The climb's own bar, prorated by the frames that arrived — content that
+    /// never filled the target is not the link falling short, and reading it
+    /// as one would land the rate on a still picture. A standing queue breaks
+    /// that denominator, because the frames it is holding are missing for the
+    /// link's own reasons: when delay says so, the wall clock is the honest
+    /// measure of what was asked for.
+    fn short_of_offered(&self, w: &WindowSample, owd_bad: bool) -> bool {
+        let proration = growth::proration(w.activity, self.frame_budget_us);
+        if !growth::utilized(w.activity, proration, w.actual_kbps, self.current_kbps) {
+            return true;
+        }
+        owd_bad && !growth::delivered_the_rate(w.actual_kbps, self.current_kbps)
+    }
+
+    /// Is this window the last link-attributed cut draining the queue it
+    /// caused?
+    ///
+    /// Only a falling delay counts, and only while the guard lasts: the first
+    /// window that stops falling ends it, so a wall that did not move is
+    /// answered again on the next window rather than after a timer.
+    fn note_drain(&mut self, w: &WindowSample) -> bool {
+        if self.drain_windows == 0 {
+            return false;
+        }
+        if w.delay.is_none_or(|d| d.rise_us > -DRAIN_FALL_US) {
+            self.drain_windows = 0;
+            return false;
+        }
+        self.drain_windows -= 1;
+        true
+    }
+
+    /// Where a link-attributed cut lands: what the window delivered, less the
+    /// margin that drains the queue, and never further than one ×0.7-sized
+    /// step from the rate the session is running at.
+    fn link_cut_kbps(&self, delivered_kbps: u32) -> u32 {
+        let share = |kbps: u32, pct: u32| (u64::from(kbps) * u64::from(pct) / 100) as u32;
+        share(delivered_kbps, LINK_CUT_PCT)
+            .clamp(
+                share(self.current_kbps, LINK_CUT_FLOOR_PCT),
+                share(self.current_kbps, LINK_CUT_PCT),
+            )
+            .max(self.floor_kbps)
+    }
+
     /// Fold the window into the streaks the decrease and the climb read.
     ///
     /// The proven mark is scored after the verdict and gated on the whole of
@@ -730,11 +804,14 @@ impl BitrateController {
             // vouch for, and a decoder past its budget. Keyframe asks, host
             // encode and one lost frame behind a clean window are not.
             let repeated_drops = w.dropped > 1 || (w.dropped == 1 && self.clean_windows == 0);
-            self.rate_verdict = w.loss_ppm >= HEAVY_LOSS_PPM
-                || v.owd_bad
-                || w.flushed
-                || repeated_drops
-                || v.decode_bad;
+            let link = w.loss_ppm >= HEAVY_LOSS_PPM || v.owd_bad || w.flushed || repeated_drops;
+            // A decoder past its budget is a rate verdict but not a link one:
+            // the link delivered, the client could not decode it.
+            self.rate_verdict = link || v.decode_bad;
+            // What makes it the link's number to land on is the shortfall:
+            // a link with room hands over what it was asked for, so this can
+            // never fire where there is no wall (L2).
+            self.link_verdict = link && self.short_of_offered(w, v.owd_bad);
             self.bad_windows += 1;
             if v.decode_bad {
                 // Counted here: backoff only sees the final window, and the
@@ -864,7 +941,23 @@ impl BitrateController {
         }
         self.learn_knee(w, v);
         self.climb_since_backoff = false;
-        let next = ((self.current_kbps as u64 * 7 / 10) as u32).max(self.floor_kbps);
+        let next = if self.link_verdict {
+            let next = self.link_cut_kbps(w.actual_kbps);
+            // The queue this overshoot built is the reason the next window
+            // still reads badly; a delay that is falling in it says so.
+            self.drain_windows = LINK_DRAIN_WINDOWS;
+            tracing::info!(
+                from_kbps = self.current_kbps,
+                to_kbps = next,
+                delivered_kbps = w.actual_kbps,
+                reason = ?v.reason,
+                "adaptive bitrate: the link carried less than it was asked for — down to what \
+                 it delivered, and a falling delay while it drains is not a second verdict"
+            );
+            next
+        } else {
+            ((self.current_kbps as u64 * 7 / 10) as u32).max(self.floor_kbps)
+        };
         self.warn_low_rate(next);
         self.bad_windows = 0;
         self.streak_decode_windows = 0;
@@ -1106,6 +1199,7 @@ impl BitrateController {
 mod tests {
     use super::super::cap::CAP_REPROBE_WINDOWS_MIN;
     use super::super::harness::*;
+    use super::super::verdict::BASELINE_MIN_WINDOWS;
     use super::*;
 
     #[test]
@@ -1123,6 +1217,144 @@ mod tests {
                 ..WindowSample::at(now)
             }),
             None
+        );
+    }
+
+    /// A link that carried a third of what it was asked for: the rate lands on
+    /// what it delivered, not on a fraction of a rate it never carried. A link
+    /// with room keeps the blind step, whatever damaged the window.
+    #[test]
+    fn a_link_short_of_offered_is_cut_to_what_it_delivered() {
+        let start = Instant::now();
+        let cut = |delivered: u32| -> Option<u32> {
+            let mut c = BitrateController::new(20_000, None);
+            c.on_window(&WindowSample {
+                dropped: 4,
+                actual_kbps: delivered,
+                ..WindowSample::at(ticks(start, 0))
+            })
+        };
+        // 0.85 x 12 000, inside the bounds.
+        assert_eq!(cut(12_000), Some(10_200));
+        // 0.85 x 4 000 is under half the rate: one cut goes no further.
+        assert_eq!(cut(4_000), Some(10_000));
+        // A window that delivered nothing measured no capacity at all.
+        assert_eq!(cut(0), Some(10_000));
+        // The link handed over what it was asked for: today's arithmetic.
+        assert_eq!(cut(20_000), Some(14_000));
+    }
+
+    /// A decoder past its budget is not the link: the rate may be the lever,
+    /// but what the link delivered is not the number to land on.
+    #[test]
+    fn a_decode_verdict_never_lands_on_the_delivered_rate() {
+        let mut c = BitrateController::new(20_000, None);
+        c.set_frame_budget(60);
+        let start = Instant::now();
+        for i in 0..BASELINE_MIN_WINDOWS as u32 {
+            assert_eq!(loaded(&mut c, ticks(start, i), 2_000), None);
+        }
+        // Deep decode excursion, and delivery a third of the target.
+        let at = ticks(start, BASELINE_MIN_WINDOWS as u32);
+        assert_eq!(
+            c.on_window(&WindowSample {
+                decode_mean_us: Some(40_000),
+                actual_kbps: 7_000,
+                activity: WindowActivity::Unmarked,
+                ..WindowSample::at(at)
+            }),
+            Some(14_000),
+            "the decoder's verdict keeps the blind step"
+        );
+    }
+
+    /// The queue a link cut caused is what makes the next window read badly.
+    /// While the delay it left is falling, that is the cut working; the first
+    /// window that stops falling is judged again.
+    #[test]
+    fn a_falling_delay_after_a_link_cut_is_not_a_second_verdict() {
+        let start = Instant::now();
+        let after = |falling: bool| -> Option<u32> {
+            let mut c = BitrateController::new(20_000, None);
+            for i in 0..BASELINE_MIN_WINDOWS as u32 {
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    actual_kbps: 20_000,
+                    ..WindowSample::at(ticks(start, i))
+                });
+            }
+            let mut t = BASELINE_MIN_WINDOWS as u32;
+            // A link-attributed cut: delivery a third of the rate.
+            let cut = c.on_window(&WindowSample {
+                dropped: 4,
+                owd_mean_us: Some(400_000),
+                actual_kbps: 7_000,
+                ..WindowSample::at(ticks(start, t))
+            });
+            assert_eq!(cut, Some(10_000), "the cut lands on what was delivered");
+            c.on_ack(10_000, None);
+            // Two windows of standing delay and nothing else: without the
+            // guard that is a second verdict.
+            let mut out = None;
+            for _ in 0..2 {
+                t += 1;
+                out = out.or(c.on_window(&WindowSample {
+                    owd_mean_us: Some(300_000),
+                    actual_kbps: 9_500,
+                    delay: Some(crate::abr::DelayTrend {
+                        samples: 20,
+                        mean_us: 300_000,
+                        rise_us: if falling { -60_000 } else { 0 },
+                        last_us: 280_000,
+                    }),
+                    ..WindowSample::at(ticks(start, t))
+                }));
+            }
+            out
+        };
+        assert_eq!(
+            after(true),
+            None,
+            "a draining queue is not fresh congestion"
+        );
+        assert_eq!(
+            after(false),
+            Some(7_000),
+            "a queue that stopped emptying is judged again"
+        );
+    }
+
+    /// The guard is a run of falling windows, not a timer: it ends at the
+    /// first one that is not, and never outlasts its budget.
+    #[test]
+    fn the_drain_guard_ends_with_the_fall_or_with_its_budget() {
+        let mut c = BitrateController::new(20_000, None);
+        let now = Instant::now();
+        let falling = |rise_us: i64| WindowSample {
+            delay: Some(crate::abr::DelayTrend {
+                samples: 20,
+                mean_us: 300_000,
+                rise_us,
+                last_us: 280_000,
+            }),
+            ..WindowSample::at(now)
+        };
+        c.drain_windows = LINK_DRAIN_WINDOWS;
+        for _ in 0..LINK_DRAIN_WINDOWS {
+            assert!(c.note_drain(&falling(-DRAIN_FALL_US)));
+        }
+        assert!(!c.note_drain(&falling(-DRAIN_FALL_US)), "budget spent");
+
+        c.drain_windows = LINK_DRAIN_WINDOWS;
+        assert!(
+            !c.note_drain(&falling(-DRAIN_FALL_US + 1)),
+            "barely falling"
+        );
+        assert_eq!(c.drain_windows, 0, "and the guard is over");
+        c.drain_windows = LINK_DRAIN_WINDOWS;
+        assert!(
+            !c.note_drain(&WindowSample::at(now)),
+            "no delay reading is no evidence of draining"
         );
     }
 

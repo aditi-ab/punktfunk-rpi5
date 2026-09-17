@@ -4,7 +4,7 @@ lan_1g	0	7	10	20	7	0	28	1000	e1a354a5
 wifi_good	0	1	0	8	4	0	0	1000	c74cf3dd
 wifi_tv	0	3	0	0	4	0	0	1000	ea6b71af
 wan_wg_12	0	3	0	0	29	0	0	1000	b3d0ca72
-lte_variable	64	3	43	2503	249	0	0	1000	6ad35a6a
+lte_variable	64	3	40	2363	249	0	0	1000	f71e8b87
 shared_two_auto	1	3	0	0	27	0	0	1000	1d1aca25
 shared_newcomer	0	1	0	0	35	0	0	782	f2f11c50
 shared_fixed_plus_auto	47	1	24	380	97	3151	0	966	8f2d562a
@@ -16,9 +16,9 @@ no_ramp	0	0	0	0	6	0	0	1000	7d8eaf70
 slow_start_spent	0	1	2	2	5	0	10	1000	e36792be
 wifi_tv_probe_damage	0	3	0	0	4	0	0	1000	ea6b71af
 wifi_loss_heavy	75	99999	120	0	1	0	0	1000	44babe0e
-wifi_loss_severe	76	99999	120	0	1	0	0	1000	5e50d09a
+wifi_loss_severe	76	99999	110	0	1	0	0	1000	4aa917f8
 decoder_knee	0	3	15	0	3	0	0	1000	0a161eab
-starved_client	73	1	86	23446	399	0	0	1000	2a49bf71
+starved_client	80	1	46	14540	399	0	0	1000	523cb97a
 idle_then_motion	0	3	0	6	5	0	0	1000	ea6b71af
 host_never_acks	0	99999	0	0	0	0	0	1000	366ba9c1
 unknown_refresh	0	99999	35	0	1	0	0	1000	3a46bed2
@@ -31,13 +31,14 @@ host_rebuild_wave	0	1	0	0	4	0	0	1000	c74cf3dd
 encoder_weak	0	4	0	0	5	0	0	1000	bf986cee
 host_cadence_refusal	0	3	0	0	5	0	0	1000	ea6b71af
 ramp_unanswered	0	32	0	0	5	0	0	1000	fe07926d
-ramp_cut_short_wifi	0	34	10	0	7	0	0	1000	fa945ea5
+ramp_cut_short_wifi	0	34	10	0	6	0	0	1000	cd50f2f4
 ramp_cut_short_wan	28	18	10	110	31	0	0	1000	8a546a16
+wan_brownout	61	3	33	146	1257	0	0	1000	e9b352e8
 wifi_tv_legacy	0	20	0	0	3	0	0	1000	a510e60b
 wifi_good_legacy	0	1	0	8	2	0	0	1000	811c9dc5
 slow_start_spent_legacy	0	19	2	2	5	0	7	1000	1ef06aa8
 gpu_saturated_legacy	0	9	27	0	4	0	0	1000	3e661c75
-wan_wg_12_legacy	2	0	13	400	40	20117	0	1000	7be3047e
+wan_wg_12_legacy	5	0	13	373	34	19253	0	1000	6364dfcf
 wifi_tv_probe_damage_legacy	0	20	0	0	3	0	0	1000	f419fe3f
 wifi_tv_probe_stalled_legacy	0	20	0	0	3	0	0	1000	8e422cdf
 host_rebuild_stall_legacy	0	1	15	0	2	0	0	1000	325d140c

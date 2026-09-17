@@ -1,10 +1,14 @@
 #!/bin/sh
 # Mutation sweep over the Automatic-bitrate controller's constants.
 #
-# For each constant: change it, run `abr::sim`, restore. A constant whose
-# mutation leaves every test GREEN is a decision the baseline cannot see, so
-# a later package could change it silently. Exits non-zero on the first such
+# For each constant: change it, run the `abr::` tests, restore. A constant
+# whose mutation leaves every test GREEN is a decision nothing holds, so a
+# later package could change it silently. Exits non-zero on the first such
 # constant; the list at the bottom of the output is what to cover.
+#
+# The run is the whole module, not only `abr::sim`: a rule the scenario table
+# cannot reach on any modelled link still has to be pinned somewhere, and a
+# unit test that pins it is coverage.
 #
 # `ENCODE_RISE_US` and `ENCODE_SEVERE_US` only apply when the session's
 # refresh is unknown, and `LOW_RATE_WARN_KBPS` only logs, so neither is in
@@ -18,7 +22,7 @@ cd "$(dirname "$0")/.." || exit 2
 # One constant per concern file. The table below names declarations without
 # their visibility, so a constant another module reads still matches.
 DIR=crates/punktfunk-core/src/abr
-TEST="cargo test -p punktfunk-core --features quic --lib abr::sim"
+TEST="cargo test -p punktfunk-core --features quic --lib abr::"
 BACKUP=$(mktemp -d)
 cp "$DIR"/*.rs "$BACKUP/"
 restore() { cp "$BACKUP"/*.rs "$DIR/"; }
@@ -78,6 +82,10 @@ RAMP_START_PCT|const RAMP_START_PCT: u32 = 50;|const RAMP_START_PCT: u32 = 25;
 MODE_RATE_DIV|const MODE_RATE_DIV: u32 = 5;|const MODE_RATE_DIV: u32 = 2;
 RAMP_DRAIN_MS|const RAMP_DRAIN_MS: u64 = 20;|const RAMP_DRAIN_MS: u64 = 200;
 RAMP_STEP_TIMEOUT|const RAMP_STEP_TIMEOUT: Duration = Duration::from_millis(1_500);|const RAMP_STEP_TIMEOUT: Duration = Duration::from_millis(100);
+LINK_CUT_PCT|const LINK_CUT_PCT: u32 = 85;|const LINK_CUT_PCT: u32 = 40;
+LINK_CUT_FLOOR_PCT|const LINK_CUT_FLOOR_PCT: u32 = 50;|const LINK_CUT_FLOOR_PCT: u32 = 10;
+LINK_DRAIN_WINDOWS|const LINK_DRAIN_WINDOWS: u32 = 4;|const LINK_DRAIN_WINDOWS: u32 = 0;
+DRAIN_FALL_US|const DRAIN_FALL_US: i64 = 5_000;|const DRAIN_FALL_US: i64 = 500_000;
 EOF
 )
 
@@ -94,7 +102,7 @@ printf '%s\n' "$MUTATIONS" | while IFS='|' read -r name from to; do
         continue
     fi
     out=$($TEST 2>&1)
-    failed=$(printf '%s\n' "$out" | sed -n 's/^test \(abr::sim[^ ]*\) \.\.\. FAILED$/\1/p' | tr '\n' ' ')
+    failed=$(printf '%s\n' "$out" | sed -n 's/^test \(abr::[^ ]*\) \.\.\. FAILED$/\1/p' | tr '\n' ' ')
     if [ -n "$failed" ]; then
         printf 'RED   %-31s %s\n' "$name" "$failed"
     elif echo " $KNOWN_GREEN " | grep -q " $name "; then
@@ -108,7 +116,7 @@ done
 restore
 if [ -s "$BACKUP.green" ]; then
     echo
-    echo "::error::these constants are invisible to abr::sim:"
+    echo "::error::these constants are invisible to the abr tests:"
     sed 's/^/  /' "$BACKUP.green"
     rm -f "$BACKUP.green"
     fail=1

@@ -431,6 +431,30 @@ pub(super) fn wan_wg_12(seed: u64, duration_ms: u64) -> Scenario {
     }
 }
 
+/// A tunnel that browns out for ten seconds after a clean run, then comes
+/// back — the case a delivered-rate cut has to leave alone once it lands.
+///
+/// The clean run is what makes it: the rolling delay minimum still remembers
+/// the uncongested floor, so the queue the overshoot built reads as a rise for
+/// as long as it takes to empty. Every one of those windows would otherwise
+/// be a second verdict on a rate that is already under the wall.
+pub(super) fn wan_brownout() -> Scenario {
+    Scenario {
+        name: "wan_brownout",
+        seed: 0x7A_6E00,
+        duration_ms: 90_000,
+        link: LinkCfg {
+            capacity: vec![(0, 20_000), (30_000, 9_000), (60_000, 20_000)],
+            buffer_ms: 2_000,
+            base_delay_ms: 30,
+            ..LinkCfg::default()
+        },
+        sessions: vec![wg_session()],
+        achievable_kbps: wall_respecting_kbps(20_000, 1, cap_1080p30()),
+        blip_at_ms: None,
+    }
+}
+
 /// A wired session: the link is never the limit.
 fn lan(name: &'static str, capacity_kbps: u32, refresh_hz: u32) -> Scenario {
     let cap = stream_ceiling_kbps(3840, 2160, refresh_hz, CODEC_HEVC, 8, 0);
@@ -1084,6 +1108,7 @@ pub(super) fn all() -> Vec<Scenario> {
         ramp_unanswered(),
         ramp_cut_short_wifi(),
         ramp_cut_short_wan(),
+        wan_brownout(),
     ]
     .into_iter()
     // `old_host` is the host that has none of this: it stays as it is.
@@ -1623,6 +1648,7 @@ mod tests {
             "cutwan" => ramp_cut_short_wan(),
             "wan" => wan_wg_12(0x7A_5500, 180_000),
             "lte" => lte_variable(),
+            "brownout" => wan_brownout(),
             "newcomer" => shared_newcomer(),
             "c6" => wifi_tv_probe_damage(),
             "knee" => decoder_knee(),
