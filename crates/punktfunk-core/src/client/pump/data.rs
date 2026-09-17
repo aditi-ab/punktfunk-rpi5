@@ -576,6 +576,7 @@ impl DataPump {
                         actual_kbps,
                         flushed = flush_in_window,
                         recovery_kf = recovery_kf_reqs,
+                        reason = ?abr.last_reason(),
                         "adaptive bitrate: requesting encoder re-target"
                     );
                     if ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps)).is_err() {

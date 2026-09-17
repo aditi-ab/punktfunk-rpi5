@@ -16,7 +16,9 @@
 //! proven mark. Tests in this module pin the contract.
 
 use super::sample::{self, WindowActivity, WindowSample};
-use std::collections::VecDeque;
+use super::verdict::{
+    encode_thresholds, Baselines, Reason, Verdict, HEAVY_LOSS_PPM, RECOVERY_KF_BAD,
+};
 use std::time::{Duration, Instant};
 
 /// Floor so a mis-measured window cannot crater the session. 2 Mbps: a thin
@@ -39,35 +41,12 @@ const PROVEN_BUCKET_WINDOWS: u32 = 40;
 /// Consecutive ordinary-bad windows before a decrease. One 750 ms window can
 /// be a scheduler blip; 1.5 s is a condition. Severe skips the wait.
 const BAD_WINDOWS_TO_DECREASE: u32 = 2;
-/// Shard loss at which one window backs off. 6 % is past any retry tail;
-/// 750 ms spent there is visible damage.
-const SEVERE_LOSS_PPM: u32 = 60_000;
 /// Clean windows before an additive climb (~4.5 s). Slow start ignores this
 /// and doubles on every cooled clean window.
 const CLEAN_WINDOWS_TO_INCREASE: u32 = 6;
 /// Minimum gap between requests. Each accepted change rebuilds the encoder
 /// and opens with an IDR; back-to-back steps outrun the ack RTT.
 const CHANGE_COOLDOWN: Duration = Duration::from_millis(1500);
-/// Shard loss that marks a window bad without an unrecoverable frame. 2 %
-/// sustained is congestion, not the random tail FEC exists for.
-const HEAVY_LOSS_PPM: u32 = 20_000;
-/// Decode-recovery keyframe asks that mark a window bad. Two asks in 750 ms
-/// means the decoder is overdriven, whatever `loss_ppm` says. RFI asks are
-/// not counted — `loss_ppm` already prices them.
-const RECOVERY_KF_BAD: u32 = 2;
-/// Keyframe asks that make one window severe. Emitters throttle at 100 ms, so
-/// 4+ in 750 ms means most of the window produced no pictures.
-const RECOVERY_KF_SEVERE: u32 = 4;
-/// One-way-delay rise above the rolling baseline that counts as queue growth.
-/// 25 ms is far beyond jitter at any streamable frame rate.
-const OWD_RISE_US: i64 = 25_000;
-/// Decode-stage rise (received → decoded) that marks the decoder falling
-/// behind, when no frame budget is known. With one, half a budget: the stage
-/// includes the queue, so that is half a frame of standing backlog.
-const DECODE_RISE_US: i64 = 15_000;
-/// Severe decode rise without a frame budget. With one, 1.5 budgets: several
-/// frames of backlog, and a second window is 750 ms more of visible damage.
-const DECODE_SEVERE_US: i64 = 45_000;
 /// Decode headroom, judged on clean full-rate windows against the frame
 /// budget. Received → decoded includes the queue wait, so a mean near the
 /// period is a decoder with no slack: the next jitter is a missed vsync. At
@@ -96,14 +75,6 @@ const UTILIZATION_DEN: u64 = 4;
 /// `proven ≥ ¾ × current`, so the two gates cannot deadlock.
 const PROVEN_HEADROOM_NUM: u32 = 3;
 const PROVEN_HEADROOM_DEN: u32 = 2;
-/// Host-encode rise (`0xCF` `encode_us`) that marks the encoder past its
-/// compute knee. Relative, not absolute: an escalated host inflates
-/// `encode_us` by ~a frame of retrieve-queue. 4 ms ≈ half a 120 Hz frame
-/// until [`BitrateController::set_frame_budget`] supplies the session budget.
-const ENCODE_RISE_US: i64 = 4_000;
-/// Host-encode rise that is severe (≈1.5 × a 120 Hz budget). Scaled with
-/// [`ENCODE_RISE_US`] once a frame budget is known.
-const ENCODE_SEVERE_US: i64 = 12_000;
 /// Consecutive encode-attributed backoffs that did not bring host encode time
 /// down, after which the encode down-driver stands down.
 ///
@@ -113,7 +84,7 @@ const ENCODE_SEVERE_US: i64 = 12_000;
 /// rate looks like a single pair. Same shape as
 /// [`crate::client::frame_channel::NOOP_CLOCK_FLUSHES_TO_DISARM`]. A clean
 /// run re-arms on the [`CAP_REPROBE_WINDOWS_MIN`] ladder.
-const ENCODE_NOOP_BACKOFFS_TO_DISARM: u32 = 2;
+pub(super) const ENCODE_NOOP_BACKOFFS_TO_DISARM: u32 = 2;
 /// Clean windows parked at a learned cap before re-probing above it, and the
 /// ceiling that interval backs off to.
 ///
@@ -128,22 +99,7 @@ const CAP_REPROBE_WINDOWS_MAX: u32 = 128;
 /// pre-backoff rates agree within ±1/8. A cascade's second backoff sits at
 /// ×0.7 of the first — outside the band by construction — so only a
 /// climbed-to rate (`climb_since_backoff`) can sample the knee.
-const DECODE_CAP_SIMILAR_DIV: u32 = 8;
-/// A deciding window that delivered under `current / 4` is starved: the
-/// stream barely flowed, so distress is stall-shaped, not rate-shaped. It
-/// may still back off on what the client saw, but it must not sample a decode
-/// knee and must not carry host-encode (`encode_us` averaged over almost no
-/// AUs describes the interruption). Far below the ×¾ climb bar; the band
-/// between them stays ambiguous on purpose.
-const STARVED_DELIVERY_DIV: u32 = 4;
-/// Rolling window (~30 s at 750 ms) whose minimum mean is the latency
-/// baseline. Long enough to remember the uncongested floor.
-const BASELINE_WINDOWS: usize = 40;
-/// Samples a rolling-min baseline must hold before its signal may fire. One
-/// sample *is* the min; a calm seed plus ordinary variance reads as rise.
-/// [`on_ack`](BitrateController::on_ack) clears the encode baseline after
-/// every decrease we asked for, so four windows (3 s) is the floor.
-const BASELINE_MIN_WINDOWS: usize = 4;
+pub(super) const DECODE_CAP_SIMILAR_DIV: u32 = 8;
 /// Unacked [`crate::quic::SetBitrate`] requests before the host is treated as
 /// predating renegotiation and the controller goes quiet.
 const MAX_UNACKED: u32 = 3;
@@ -159,33 +115,6 @@ fn ceiling_cap_from_env() -> Option<u32> {
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|&m| m > 0)
         .map(|m| m.saturating_mul(1_000))
-}
-
-/// Score one window's latency against its rolling-min baseline, then record it.
-///
-/// Shared by OWD, client decode, and host encode. `mean` is `None` when nobody
-/// reports the signal — absent, not clean, so it neither marks bad nor teaches
-/// a baseline. Compared against PRIOR windows before recording, and only after
-/// [`BASELINE_MIN_WINDOWS`]. Pass `i64::MAX` for `severe_us` on a signal with
-/// no severe tier.
-fn score_baseline(
-    means: &mut VecDeque<i64>,
-    mean: Option<i64>,
-    rise_us: i64,
-    severe_us: i64,
-) -> (bool, bool) {
-    let Some(mean) = mean else {
-        return (false, false);
-    };
-    let base = (means.len() >= BASELINE_MIN_WINDOWS)
-        .then(|| means.iter().min().copied())
-        .flatten();
-    let over = |t: i64| base.is_some_and(|b| mean > b.saturating_add(t));
-    if means.len() == BASELINE_WINDOWS {
-        means.pop_front();
-    }
-    means.push_back(mean);
-    (over(rise_us), over(severe_us))
 }
 
 /// A headroom step awaiting the decoder's answer at its new rate.
@@ -226,13 +155,9 @@ pub(crate) struct BitrateController {
     stream_cap_kbps: Option<u32>,
     floor_kbps: u32,
     /// Slow start until the first congestion signal.
-    probing: bool,
-    owd_means: VecDeque<i64>,
-    /// Empty when the embedder does not report decode latency (signal absent).
-    decode_means: VecDeque<i64>,
-    /// Cleared on our own rate decrease ([`on_ack`](Self::on_ack)) and on a
-    /// mode switch — the encode regime changed.
-    encode_means: VecDeque<i64>,
+    pub(super) probing: bool,
+    /// Rolling minima the relative signals are scored against.
+    baselines: Baselines,
     /// One refresh interval, µs. `None` = the 120 Hz [`ENCODE_RISE_US`] defaults.
     frame_budget_us: Option<i64>,
     /// Mean encode_us that drove the last encode-attributed backoff; `0` = none
@@ -265,7 +190,7 @@ pub(crate) struct BitrateController {
     /// Two consecutive decode-driven backoffs at a similar rate. Without it a
     /// decoder knee below the link ceiling is a 30–60 s sawtooth. Re-probed on
     /// the [`CAP_REPROBE_WINDOWS_MIN`] clock.
-    decode_cap_kbps: Option<u32>,
+    pub(super) decode_cap_kbps: Option<u32>,
     /// Previous decode-driven backoff's pre-backoff rate (`0` = last backoff
     /// was not decode-driven). One spurious flush teaches nothing.
     decode_backoff_kbps: u32,
@@ -304,6 +229,8 @@ pub(crate) struct BitrateController {
     /// Last ceiling-clamp target asked (`0` = none). Asked once per distinct
     /// target: a host that answers higher cannot go there.
     ceiling_ask_kbps: u32,
+    /// What the last window was scored as. Named on every re-target.
+    last_reason: Reason,
 }
 
 impl BitrateController {
@@ -326,9 +253,7 @@ impl BitrateController {
             stream_cap_kbps: None,
             floor_kbps: FLOOR_KBPS.min(start_kbps.max(1)),
             probing: true,
-            owd_means: VecDeque::with_capacity(BASELINE_WINDOWS),
-            decode_means: VecDeque::with_capacity(BASELINE_WINDOWS),
-            encode_means: VecDeque::with_capacity(BASELINE_WINDOWS),
+            baselines: Baselines::new(),
             frame_budget_us: None,
             encode_backoff_us: 0,
             encode_noop_backoffs: 0,
@@ -365,7 +290,13 @@ impl BitrateController {
             last_change: None,
             unacked: 0,
             ceiling_ask_kbps: 0,
+            last_reason: Reason::Clean,
         }
+    }
+
+    /// The signal that decided the last window — what named this re-target.
+    pub(crate) fn last_reason(&self) -> Reason {
+        self.last_reason
     }
 
     /// Raise the climb ceiling to a measured link capacity (caller already
@@ -412,27 +343,6 @@ impl BitrateController {
     pub(crate) fn set_frame_budget(&mut self, refresh_hz: u32) {
         if refresh_hz > 0 {
             self.frame_budget_us = Some(1_000_000 / refresh_hz as i64);
-        }
-    }
-
-    /// `(rise, severe)`: half a frame budget and 1.5 of them, against this
-    /// session's refresh. Not the source's delivered fps — inferring that from
-    /// arrival cadence is the jitter the signal is trying to read through.
-    /// Residue is [`ENCODE_NOOP_BACKOFFS_TO_DISARM`].
-    fn encode_thresholds(&self) -> (i64, i64) {
-        match self.frame_budget_us {
-            Some(budget) => (budget / 2, budget * 3 / 2),
-            None => (ENCODE_RISE_US, ENCODE_SEVERE_US),
-        }
-    }
-
-    /// Decode `(rise, severe)` in the same budgets. The stage includes the
-    /// queue, so half a budget of rise is half a frame of standing backlog at
-    /// any refresh; the absolute defaults stand until a budget is known.
-    fn decode_thresholds(&self) -> (i64, i64) {
-        match self.frame_budget_us {
-            Some(budget) => (budget / 2, budget * 3 / 2),
-            None => (DECODE_RISE_US, DECODE_SEVERE_US),
         }
     }
 
@@ -591,9 +501,7 @@ impl BitrateController {
     pub(crate) fn on_ack(&mut self, kbps: u32) {
         if kbps > 0 {
             if kbps < self.current_kbps {
-                // Our own decrease changes the encode-time regime. Judging the
-                // new regime against the old baseline would train-fire.
-                self.encode_means.clear();
+                self.baselines.clear_encode();
             }
             if let Some(req) = self.last_requested_kbps.take() {
                 if kbps < req {
@@ -672,9 +580,7 @@ impl BitrateController {
         self.decode_headroom_clean_windows = 0;
         self.decode_headroom_reprobe_after = CAP_REPROBE_WINDOWS_MIN;
         self.decode_headroom_rearmed = false;
-        self.owd_means.clear();
-        self.decode_means.clear();
-        self.encode_means.clear();
+        self.baselines.clear();
         // Encode work per frame changed with the mode. Re-arm; the caller
         // re-sizes the frame budget alongside this.
         self.encode_disarmed = false;
@@ -706,13 +612,12 @@ impl BitrateController {
             now,
             dropped,
             loss_ppm,
-            owd_mean_us,
-            decode_mean_us,
             encode_mean_us,
             actual_kbps,
             flushed,
             recovery_kf,
             activity,
+            ..
         } = *w;
         if !self.enabled {
             return None;
@@ -723,9 +628,26 @@ impl BitrateController {
             tracing::info!("adaptive bitrate off — host never acked a SetBitrate (older host)");
             return None;
         }
+        let Verdict {
+            severe,
+            bad,
+            quiet,
+            starved,
+            decode_bad,
+            decode_severe,
+            encode_bad,
+            encode_severe,
+            decode_mean_us,
+            reason,
+        } = self.baselines.score(
+            w,
+            self.current_kbps,
+            self.frame_budget_us,
+            self.encode_disarmed,
+        );
+        self.last_reason = reason;
         // Repeat-only: stillness. Empty: no AU, same neutrality, not a
         // re-arm count. Unmarked (older host) is never idle.
-        let quiet = activity.quiet();
         if activity.idle() {
             self.idle_windows = self.idle_windows.saturating_add(1);
         } else if !quiet {
@@ -749,51 +671,6 @@ impl BitrateController {
             self.proven_prev_kbps = self.proven_cur_kbps;
             self.proven_cur_kbps = 0;
         }
-        // Keepalive OWD/decode would train the rolling min on the quietest
-        // traffic, so the first motion window reads as congestion.
-        let owd_mean_us = owd_mean_us.filter(|_| !quiet);
-        let decode_mean_us = decode_mean_us.filter(|_| !quiet);
-        // No severe OWD tier: a standing queue is congestion, not visible
-        // damage, so it always takes the two-window path.
-        let (owd_bad, _) = score_baseline(&mut self.owd_means, owd_mean_us, OWD_RISE_US, i64::MAX);
-        // Decode rise ends slow start immediately; a far-past-baseline
-        // excursion is severe (one window). Sized in frame budgets.
-        let (decode_rise_us, decode_severe_us) = self.decode_thresholds();
-        let (decode_bad, decode_severe) = score_baseline(
-            &mut self.decode_means,
-            decode_mean_us,
-            decode_rise_us,
-            decode_severe_us,
-        );
-        // Starved: encode_us is not a measurement here. `current_kbps` does
-        // not move in this function, so the backoff block reads the same value.
-        let starved =
-            (actual_kbps as u64) * (STARVED_DELIVERY_DIV as u64) < self.current_kbps as u64;
-        // Encode: the only signal that can descend on a clean LAN. Withheld
-        // when starved (mean describes the interruption), disarmed, or quiet.
-        // Passed as absent so it cannot teach the baseline either. Loss,
-        // flush, and drop keep full power.
-        let (encode_rise_us, encode_severe_us) = self.encode_thresholds();
-        let encode_usable = !starved && !self.encode_disarmed && !quiet;
-        let (encode_bad, encode_severe) = score_baseline(
-            &mut self.encode_means,
-            encode_mean_us.filter(|_| encode_usable),
-            encode_rise_us,
-            encode_severe_us,
-        );
-        // Severe: one window. Ordinary congestion: two consecutive.
-        let severe = dropped > 0
-            || flushed
-            || loss_ppm >= SEVERE_LOSS_PPM
-            || decode_severe
-            || encode_severe
-            || recovery_kf >= RECOVERY_KF_SEVERE;
-        let bad = severe
-            || loss_ppm >= HEAVY_LOSS_PPM
-            || owd_bad
-            || decode_bad
-            || encode_bad
-            || recovery_kf >= RECOVERY_KF_BAD;
         // Proven mark: scored after the verdict, gated on the whole of it.
         // Damaged windows overstate delivered (stall drain, flush queue, FEC
         // surge); those bytes arriving is not climb authority.
@@ -894,7 +771,7 @@ impl BitrateController {
                     // Fresh baseline, no streak: the old firing level is stale.
                     self.encode_backoff_us = 0;
                     self.encode_noop_backoffs = 0;
-                    self.encode_means.clear();
+                    self.baselines.clear_encode();
                     tracing::debug!(
                         after_windows = self.encode_reprobe_after,
                         "adaptive bitrate: re-arming the encode down-driver after a clean run"
@@ -975,6 +852,7 @@ impl BitrateController {
                 && dropped == 0
                 && !flushed
                 && loss_ppm < HEAVY_LOSS_PPM;
+            let (encode_rise_us, _) = encode_thresholds(self.frame_budget_us);
             if let Some(mean) = encode_mean_us.filter(|_| encode_attributed) {
                 if self.encode_backoff_us > 0
                     && mean >= self.encode_backoff_us.saturating_sub(encode_rise_us)
@@ -993,7 +871,7 @@ impl BitrateController {
                         };
                         self.encode_disarmed = true;
                         self.encode_disarm_clean_windows = 0;
-                        self.encode_means.clear();
+                        self.baselines.clear_encode();
                         tracing::info!(
                             at_kbps = self.current_kbps,
                             encode_mean_us = mean,
@@ -1135,30 +1013,9 @@ impl BitrateController {
 
 #[cfg(test)]
 mod tests {
+    use super::super::harness::*;
+    use super::super::verdict::{BASELINE_MIN_WINDOWS, RECOVERY_KF_SEVERE, SEVERE_LOSS_PPM};
     use super::*;
-
-    /// Pump's 750 ms tick; 5× is past [`CHANGE_COOLDOWN`].
-    const TICK: Duration = Duration::from_millis(750);
-
-    fn ticks(start: Instant, n: u32) -> Instant {
-        start + TICK * n
-    }
-
-    /// `n` clean fully-loaded windows (1 Gb/s) so utilization and proven never bind.
-    fn run_clean(c: &mut BitrateController, start: Instant, from: u32, n: u32) -> Option<u32> {
-        let mut out = None;
-        for i in from..from + n {
-            out = c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, i))
-            });
-            if out.is_some() {
-                return out;
-            }
-        }
-        out
-    }
 
     #[test]
     fn disabled_when_not_automatic_or_old_host() {
@@ -1492,137 +1349,6 @@ mod tests {
     }
 
     #[test]
-    fn owd_rise_alone_is_a_congestion_signal() {
-        let mut c = BitrateController::new(20_000);
-        let start = Instant::now();
-        // ~10 ms OWD baseline.
-        for i in 0..4 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(10_000),
-                    actual_kbps: 1_000_000,
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-        // +40 ms OWD, zero loss: two windows → back off.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(50_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 4))
-            }),
-            None
-        );
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(52_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 5))
-            }),
-            Some(14_000)
-        );
-    }
-
-    #[test]
-    fn decode_latency_rise_alone_is_a_congestion_signal() {
-        // Pristine link; only decode latency is rising.
-        let mut c = BitrateController::new(20_000);
-        let start = Instant::now();
-        // ~8 ms decode baseline.
-        for i in 0..4 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(10_000),
-                    decode_mean_us: Some(8_000),
-                    actual_kbps: 1_000_000,
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-        // +30 ms decode, zero loss, flat OWD: two windows → ×0.7.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(38_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 4))
-            }),
-            None
-        );
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(40_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 5))
-            }),
-            Some(14_000)
-        );
-    }
-
-    #[test]
-    fn keyframe_ask_storm_alone_is_a_congestion_signal() {
-        // Pristine link, no latency signal, two kf asks per window: ordinary-bad.
-        let mut c = BitrateController::new(20_000);
-        let start = Instant::now();
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                actual_kbps: 1_000_000,
-                recovery_kf: 2,
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            None
-        );
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                actual_kbps: 1_000_000,
-                recovery_kf: 2,
-                ..WindowSample::at(ticks(start, 1))
-            }),
-            Some(14_000)
-        );
-    }
-
-    #[test]
-    fn keyframe_ask_saturation_is_severe() {
-        // Emitters throttle at 100 ms: 4+ asks in 750 ms is severe.
-        let mut c = BitrateController::new(20_000);
-        let start = Instant::now();
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                actual_kbps: 1_000_000,
-                recovery_kf: 4,
-                ..WindowSample::at(ticks(start, 0))
-            }),
-            Some(14_000)
-        );
-    }
-
-    #[test]
-    fn a_single_keyframe_ask_is_not_congestion() {
-        // One kf ask is not congestion, even in a row.
-        let mut c = BitrateController::new(20_000);
-        let start = Instant::now();
-        for i in 0..4 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(10_000),
-                    actual_kbps: 1_000_000,
-                    recovery_kf: 1,
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-    }
-
-    #[test]
     fn decode_latency_caps_the_slow_start_climb() {
         // Fat link, decoder saturates below it.
         let mut c = BitrateController::new(20_000);
@@ -1661,37 +1387,6 @@ mod tests {
                 ..WindowSample::at(ticks(start, 22))
             }),
             Some(210_000)
-        );
-    }
-
-    #[test]
-    fn one_calm_window_is_not_a_baseline() {
-        // Our own decrease clears the encode baseline. One sample must not arm.
-        let mut c = BitrateController::new(100_000);
-        let start = Instant::now();
-        // One 3 ms seed, then 12 ms: past [`ENCODE_RISE_US`], but no baseline yet.
-        for i in 0..BASELINE_MIN_WINDOWS as u32 {
-            let mean = if i == 0 { 3_000 } else { 12_000 };
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(10_000),
-                    encode_mean_us: Some(mean),
-                    actual_kbps: 1_000_000,
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None,
-                "window {i} fired off a baseline of fewer than {BASELINE_MIN_WINDOWS} samples"
-            );
-        }
-        // With 4 samples, a sustained rise still backs off.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                encode_mean_us: Some(20_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 8))
-            }),
-            Some(70_000)
         );
     }
 
@@ -1776,64 +1471,6 @@ mod tests {
             None,
             "three stray frames are not a utilized window"
         );
-    }
-
-    /// Same history: non-marking host trains OWD on keepalive and backs off
-    /// at motion; marking host trains nothing and climbs.
-    #[test]
-    fn idle_windows_train_no_baselines() {
-        let start = Instant::now();
-        let run = |marking: bool| -> Option<u32> {
-            let mut c = BitrateController::new(20_000);
-            c.set_ceiling(300_000);
-            c.set_frame_budget(60);
-            // A host that marks repeats reports the new-content count; an
-            // older one reports nothing but arrivals.
-            let act = |n: u32| {
-                if marking {
-                    WindowActivity::Active(n)
-                } else {
-                    WindowActivity::Unmarked
-                }
-            };
-            let mut decision = None;
-            // Four active windows at 30 ms OWD.
-            for i in 0..4 {
-                let r = c.on_window(&WindowSample {
-                    owd_mean_us: Some(30_000),
-                    actual_kbps: 2_000,
-                    activity: act(45),
-                    ..WindowSample::at(ticks(start, i))
-                });
-                assert_eq!(r, None);
-            }
-            // Keepalive at 1 ms OWD: marking host trains nothing; legacy trains min to 1 ms.
-            for i in 4..10 {
-                let r = c.on_window(&WindowSample {
-                    owd_mean_us: Some(1_000),
-                    actual_kbps: 200,
-                    activity: act(0),
-                    ..WindowSample::at(ticks(start, i))
-                });
-                assert_eq!(r, None);
-            }
-            // Motion at the warmup's 30 ms OWD. First decision is the verdict
-            // (cooldown silences the second).
-            for i in 10..12 {
-                let r = c.on_window(&WindowSample {
-                    owd_mean_us: Some(30_000),
-                    actual_kbps: 18_000,
-                    activity: act(45),
-                    ..WindowSample::at(ticks(start, i))
-                });
-                decision = decision.or(r);
-            }
-            decision
-        };
-        // Legacy: 30 ms vs 1 ms baseline → ×0.7.
-        assert_eq!(run(false), Some(14_000));
-        // Marking: 30 ms is normal; first utilized window climbs to 27 000.
-        assert_eq!(run(true), Some(27_000));
     }
 
     /// Motion onset after a real idle stretch re-arms slow start, bounded by
@@ -2132,34 +1769,6 @@ mod tests {
     }
 
     #[test]
-    fn deep_decode_excursion_is_severe() {
-        // Decode rise >45 ms is already overload: one window.
-        let mut c = BitrateController::new(20_000);
-        let start = Instant::now();
-        for i in 0..4 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(10_000),
-                    decode_mean_us: Some(8_000),
-                    actual_kbps: 1_000_000,
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-        // 52 ms over 8 ms baseline: immediate ×0.7. 30 ms still takes two.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(60_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 4))
-            }),
-            Some(14_000)
-        );
-    }
-
-    #[test]
     fn two_identical_short_acks_latch_the_host_cap() {
         // Two identical short acks latch the host cap; climbs stop poking it.
         let mut c = BitrateController::new(400_000);
@@ -2329,167 +1938,6 @@ mod tests {
     }
 
     #[test]
-    fn host_encode_latency_rise_backs_off() {
-        // Only host encode time moves: two risen windows → ×0.7.
-        let mut c = BitrateController::new(20_000);
-        let start = Instant::now();
-        for i in 0..4 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(10_000),
-                    encode_mean_us: Some(7_000),
-                    actual_kbps: 1_000_000,
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                encode_mean_us: Some(11_500),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 4))
-            }),
-            None
-        );
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                encode_mean_us: Some(12_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 6))
-            }),
-            Some(14_000)
-        );
-    }
-
-    #[test]
-    fn deep_encode_excursion_is_severe() {
-        // ≈1.5 frame budgets over baseline: severe, one window.
-        let mut c = BitrateController::new(20_000);
-        let start = Instant::now();
-        for i in 0..4 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(10_000),
-                    encode_mean_us: Some(7_000),
-                    actual_kbps: 1_000_000,
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                encode_mean_us: Some(20_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 4))
-            }),
-            Some(14_000)
-        );
-    }
-
-    #[test]
-    fn rate_decrease_rebases_the_encode_baseline() {
-        // Our own decrease must rebase encode; old baseline would train-fire.
-        let mut c = BitrateController::new(20_000);
-        let start = Instant::now();
-        for i in 0..4 {
-            let _ = c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                encode_mean_us: Some(7_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, i))
-            });
-        }
-        let _ = c.on_window(&WindowSample {
-            owd_mean_us: Some(10_000),
-            encode_mean_us: Some(12_000),
-            actual_kbps: 1_000_000,
-            ..WindowSample::at(ticks(start, 4))
-        });
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                encode_mean_us: Some(12_500),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, 6))
-            }),
-            Some(14_000)
-        );
-        // After rebase, 15 ms against the old 7 ms floor must read clean.
-        c.on_ack(14_000);
-        for i in 8..11 {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(10_000),
-                    encode_mean_us: Some(15_000),
-                    actual_kbps: 1_000_000,
-                    ..WindowSample::at(ticks(start, i))
-                }),
-                None
-            );
-        }
-    }
-
-    /// Re-seed the baseline `on_ack` cleared, then present `level`. Four seed
-    /// windows stay under [`CLEAN_WINDOWS_TO_INCREASE`].
-    fn encode_choke(
-        c: &mut BitrateController,
-        start: Instant,
-        tick: &mut u32,
-        level: i64,
-    ) -> Option<u32> {
-        for _ in 0..BASELINE_MIN_WINDOWS {
-            let at = ticks(start, *tick);
-            *tick += 1;
-            // Ack a climb if taken so tests with headroom still work.
-            if let Some(k) = c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                encode_mean_us: Some(7_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(at)
-            }) {
-                c.on_ack(k);
-            }
-        }
-        let at = ticks(start, *tick);
-        *tick += 1;
-        c.on_window(&WindowSample {
-            owd_mean_us: Some(10_000),
-            encode_mean_us: Some(level),
-            actual_kbps: 1_000_000,
-            ..WindowSample::at(at)
-        })
-    }
-
-    /// `n` clean windows with no encode sample; ack any climb.
-    fn clean_run(c: &mut BitrateController, start: Instant, tick: &mut u32, n: u32) {
-        for _ in 0..n {
-            let at = ticks(start, *tick);
-            *tick += 1;
-            if let Some(k) = c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(at)
-            }) {
-                c.on_ack(k);
-            }
-        }
-    }
-
-    /// Encode-attributed backoffs at a level ×0.7 never moves, until stand-down.
-    fn disarm_encode(c: &mut BitrateController, start: Instant, tick: &mut u32) {
-        for _ in 0..=ENCODE_NOOP_BACKOFFS_TO_DISARM {
-            let verdict = encode_choke(c, start, tick, 20_000);
-            c.on_ack(verdict.expect("an unanswered encode rise must back off"));
-        }
-        assert!(c.encode_disarmed);
-    }
-
-    #[test]
     fn a_stood_down_encode_signal_re_arms_after_a_clean_run() {
         // Stand-down is evidence: a clean run must re-arm the encode signal.
         let mut c = BitrateController::new(20_000);
@@ -2546,42 +1994,6 @@ mod tests {
         assert!(c.encode_disarmed, "the spoiled window must restart the run");
         clean_run(&mut c, start, &mut tick, 1);
         assert!(!c.encode_disarmed);
-    }
-
-    #[test]
-    fn the_encode_thresholds_follow_the_session_frame_budget() {
-        // Same physical hiccup: severe at 120 Hz, ordinary at 60 Hz when
-        // thresholds follow the session frame budget.
-        let excursion = 23_700; // 7 ms baseline + ~one 60 Hz frame
-        let mut hz120 = BitrateController::new(20_000);
-        hz120.set_frame_budget(120);
-        let mut tick = 0;
-        let start = Instant::now();
-        assert_eq!(
-            encode_choke(&mut hz120, start, &mut tick, excursion),
-            Some(14_000),
-            "at 120 Hz that is ~2.8 frame budgets over baseline — severe, one window"
-        );
-
-        let mut hz60 = BitrateController::new(20_000);
-        hz60.set_frame_budget(60);
-        let mut tick = 0;
-        assert_eq!(
-            encode_choke(&mut hz60, start, &mut tick, excursion),
-            None,
-            "the same excursion is ~1 frame budget at 60 Hz — bad, but not severe"
-        );
-        // Second window still backs off: re-scaled, not weakened.
-        let at = ticks(start, tick + 1);
-        assert_eq!(
-            hz60.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                encode_mean_us: Some(excursion),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(at)
-            }),
-            Some(14_000)
-        );
     }
 
     #[test]
@@ -2705,85 +2117,6 @@ mod tests {
         assert_eq!(run_clean(&mut c, start, 24, 20), None);
     }
 
-    fn calm_window(c: &mut BitrateController, at: Instant) {
-        // Calm, unutilized: seed baselines, decide nothing.
-        assert_eq!(
-            c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(8_000),
-                actual_kbps: 2_000,
-                ..WindowSample::at(at)
-            }),
-            None
-        );
-    }
-
-    /// Climb to `target` on fully-utilized windows, acking each step. 600-window bound.
-    fn climb_to(c: &mut BitrateController, start: Instant, tick: &mut u32, target: u32) {
-        for _ in 0..600 {
-            if c.current_kbps >= target {
-                return;
-            }
-            if let Some(k) = c.on_window(&WindowSample {
-                owd_mean_us: Some(10_000),
-                decode_mean_us: Some(8_000),
-                actual_kbps: 1_000_000,
-                ..WindowSample::at(ticks(start, *tick))
-            }) {
-                c.on_ack(k);
-            }
-            *tick += 1;
-        }
-        panic!(
-            "no climb to {target} within 600 windows (stuck at {})",
-            c.current_kbps
-        );
-    }
-
-    /// One decode-severe window at the current rate. Steps past cooldown first.
-    fn choke(c: &mut BitrateController, start: Instant, tick: &mut u32) -> Option<u32> {
-        *tick += 2;
-        let r = c.on_window(&WindowSample {
-            owd_mean_us: Some(10_000),
-            decode_mean_us: Some(60_000),
-            actual_kbps: c.current_kbps,
-            ..WindowSample::at(ticks(start, *tick))
-        });
-        *tick += 1;
-        r
-    }
-
-    /// Choke, ack the ×0.7, re-climb, choke inside ±1/8. Returns the latched cap.
-    fn latch_knee(c: &mut BitrateController, start: Instant, tick: &mut u32) -> u32 {
-        for _ in 0..4 {
-            calm_window(c, ticks(start, *tick));
-            *tick += 1;
-        }
-        let knee = c.current_kbps;
-        let r1 = choke(c, start, tick).expect("first choke must back off");
-        assert!(c.decode_cap_kbps.is_none(), "one event must not latch");
-        c.on_ack(r1);
-        climb_to(c, start, tick, knee - knee / DECODE_CAP_SIMILAR_DIV);
-        let rate = c.current_kbps;
-        let r2 = choke(c, start, tick).expect("re-climb choke must back off");
-        assert_eq!(c.decode_cap_kbps, Some(rate - rate / 16));
-        c.on_ack(r2);
-        rate - rate / 16
-    }
-
-    /// Stall-shaped: current/10 delivered, flush + kf-storm. Severe, but starved.
-    fn stall_choke(c: &mut BitrateController, start: Instant, tick: &mut u32) -> Option<u32> {
-        *tick += 2;
-        let r = c.on_window(&WindowSample {
-            actual_kbps: c.current_kbps / 10,
-            flushed: true,
-            recovery_kf: RECOVERY_KF_SEVERE,
-            ..WindowSample::at(ticks(start, *tick))
-        });
-        *tick += 1;
-        r
-    }
-
     #[test]
     fn capture_stall_windows_never_latch_a_decode_cap() {
         // Repeated stall-shaped backoffs at the same rate must not latch a knee.
@@ -2849,66 +2182,6 @@ mod tests {
             c.decode_cap_kbps,
             Some(rate - rate / 16),
             "the genuine pair still latches around the starved interruption"
-        );
-    }
-
-    /// Starved window: encode_us is not a measurement of encode cost. Withheld;
-    /// the window decides nothing. The same excursion at full delivery still
-    /// backs off.
-    #[test]
-    fn a_starved_window_cannot_back_off_on_host_encode_time_alone() {
-        let mut c = BitrateController::new(20_000);
-        c.set_ceiling(657_000);
-        let start = Instant::now();
-        let mut t = 0;
-        // Half-utilized: encode samples count, no climb, `current_kbps` stays.
-        for _ in 0..BASELINE_MIN_WINDOWS {
-            assert_eq!(
-                c.on_window(&WindowSample {
-                    owd_mean_us: Some(3_500),
-                    decode_mean_us: Some(200),
-                    encode_mean_us: Some(2_800),
-                    actual_kbps: 10_000,
-                    ..WindowSample::at(ticks(start, t))
-                }),
-                None
-            );
-            t += 1;
-        }
-        assert!(
-            c.probing,
-            "slow start is still armed going into the rebuild"
-        );
-
-        let verdict = c.on_window(&WindowSample {
-            owd_mean_us: Some(15_711),
-            decode_mean_us: Some(129),
-            encode_mean_us: Some(15_063),
-            actual_kbps: 390,
-            ..WindowSample::at(ticks(start, t))
-        });
-        t += 1;
-        assert_eq!(
-            verdict, None,
-            "a host-local rebuild must not move the rate: nothing was lost and nothing was slow"
-        );
-        assert_eq!(c.current_kbps, 20_000, "and the rate is untouched");
-        assert!(
-            c.probing,
-            "nor may it retire slow start — recovery would crawl at +6 % per six windows"
-        );
-
-        // Same encode excursion at full delivery is still severe.
-        let verdict = c.on_window(&WindowSample {
-            owd_mean_us: Some(3_600),
-            decode_mean_us: Some(210),
-            encode_mean_us: Some(15_063),
-            actual_kbps: 20_000,
-            ..WindowSample::at(ticks(start, t))
-        });
-        assert!(
-            verdict.is_some_and(|k| k < 20_000),
-            "a real encode excursion at full delivery still backs off, got {verdict:?}"
         );
     }
 
@@ -3291,50 +2564,6 @@ mod tests {
         }
         assert_eq!(sent, MAX_UNACKED);
     }
-    /// One clean, utilized, full-rate 120 Hz window with a given decode mean.
-    fn loaded(c: &mut BitrateController, at: Instant, decode_us: i64) -> Option<u32> {
-        c.on_window(&WindowSample {
-            owd_mean_us: Some(10_000),
-            decode_mean_us: Some(decode_us),
-            actual_kbps: c.current_kbps,
-            activity: WindowActivity::Active(90),
-            ..WindowSample::at(at)
-        })
-    }
-
-    /// A 120 Hz controller with room to climb and seeded baselines.
-    fn seeded_120(start_kbps: u32) -> (BitrateController, Instant, u32) {
-        let mut c = BitrateController::new(start_kbps);
-        c.set_ceiling(400_000);
-        c.set_frame_budget(120);
-        let start = Instant::now();
-        let mut t = 0;
-        for _ in 0..4 {
-            calm_window(&mut c, ticks(start, t));
-            t += 1;
-        }
-        (c, start, t)
-    }
-
-    /// Clean windows at `decode_us` until the controller asks for a rate, acked.
-    fn until_request(
-        c: &mut BitrateController,
-        start: Instant,
-        t: &mut u32,
-        decode_us: i64,
-        max: u32,
-    ) -> Option<u32> {
-        for _ in 0..max {
-            let r = loaded(c, ticks(start, *t), decode_us);
-            *t += 1;
-            if let Some(k) = r {
-                c.on_ack(k);
-                return Some(k);
-            }
-        }
-        None
-    }
-
     #[test]
     fn decode_headroom_parks_a_clean_climb() {
         // 7 000 µs of 8 333: 84 % — inside the hold band. No climb, cap at the rate.
@@ -3415,24 +2644,6 @@ mod tests {
         // Stood down: the same 93 % no longer retreats.
         assert_eq!(until_request(&mut c, start, &mut t, 7_800, 10), None);
         assert_eq!(c.current_kbps, 100_000);
-    }
-
-    #[test]
-    fn decode_thresholds_follow_the_frame_budget() {
-        // +6 000 µs over the baseline: half a 120 Hz budget (4 166) is a rise,
-        // the 15 ms no-budget default is not.
-        let mut hz120 = BitrateController::new(100_000);
-        hz120.set_frame_budget(120);
-        let mut plain = BitrateController::new(100_000);
-        let start = Instant::now();
-        for i in 0..5 {
-            assert_eq!(loaded(&mut hz120, ticks(start, i), 3_000), None);
-            assert_eq!(loaded(&mut plain, ticks(start, i), 3_000), None);
-        }
-        loaded(&mut hz120, ticks(start, 5), 9_000);
-        loaded(&mut plain, ticks(start, 5), 9_000);
-        assert!(!hz120.probing, "a budget-sized rise ends slow start");
-        assert!(plain.probing, "below the absolute default it is not a rise");
     }
 
     #[test]

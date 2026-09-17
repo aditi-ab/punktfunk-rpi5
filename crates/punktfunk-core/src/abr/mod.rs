@@ -6,7 +6,8 @@
 //! [`crate::quic::SetBitrate`] when congestion persists.
 //!
 //! One module per concern: [`sample`] is one closed report window,
-//! [`controller`] the state it moves. `sim/` drives the real controller
+//! [`verdict`] scores it, [`controller`] holds the state it moves. `sim/`
+//! drives the real controller
 //! against modelled links and pins every decision in a checked-in baseline.
 
 /// The link simulator and the checked-in baseline (`abr/sim/`).
@@ -14,7 +15,10 @@
 mod sim;
 
 mod controller;
+#[cfg(test)]
+mod harness;
 mod sample;
+mod verdict;
 
 pub(crate) use controller::BitrateController;
 pub(crate) use sample::{WindowActivity, WindowSample};
