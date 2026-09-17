@@ -306,7 +306,6 @@ impl BitrateController {
     /// step in flight, then the bands: park at [`DECODE_HOLD_PCT`], retreat a
     /// notch at [`DECODE_RETREAT_PCT`]. `Some` is a rate to request.
     fn judge_decode_headroom(&mut self, mean_us: i64, budget_us: i64, now: Instant) -> Option<u32> {
-        let answer_us = budget_us * DECODE_ANSWER_PCT / 100;
         if let Some(mut p) = self.decode_probe {
             let at_new_rate = match p.kind {
                 DecodeProbeKind::Retreat => self.current_kbps < p.from_kbps,
@@ -326,50 +325,8 @@ impl BitrateController {
             }
             self.decode_probe = None;
             let mean = p.sum_us / i64::from(p.windows);
-            match p.kind {
-                DecodeProbeKind::Retreat if p.ref_us - mean >= answer_us => {
-                    tracing::info!(
-                        from_kbps = p.from_kbps,
-                        at_kbps = self.current_kbps,
-                        decode_us = mean,
-                        was_us = p.ref_us,
-                        "adaptive bitrate: decode latency followed the rate down — retreat kept"
-                    );
-                    // Fresh evidence; the bands below judge this window too.
-                }
-                DecodeProbeKind::Retreat => {
-                    // Latency is not a function of the rate here: pipelined
-                    // decoder, or something else on the SoC. Give the rate
-                    // back and stand down; the cap ladder still probes up.
-                    self.decode_headroom.disarm();
-                    self.decode_cap.park(p.from_kbps);
-                    tracing::info!(
-                        restore_kbps = p.from_kbps,
-                        decode_us = mean,
-                        was_us = p.ref_us,
-                        rearm_after_windows = self.decode_headroom.reprobe_after(),
-                        "adaptive bitrate: decode latency did not follow the rate — restoring it \
-                         and standing the headroom driver down (a pipelined decoder sits above \
-                         the period with no queue)"
-                    );
-                    self.ceiling_ask_kbps = p.from_kbps;
-                    return self.request(p.from_kbps, now);
-                }
-                DecodeProbeKind::Lift => {
-                    let worse = mean - p.ref_us >= answer_us
-                        || mean * 100 / budget_us >= DECODE_RETREAT_PCT;
-                    if worse {
-                        self.undo_decode_lift(p, mean);
-                        self.ceiling_ask_kbps = p.from_kbps;
-                        return self.request(p.from_kbps, now);
-                    }
-                    tracing::info!(
-                        at_kbps = self.current_kbps,
-                        decode_us = mean,
-                        was_us = p.ref_us,
-                        "adaptive bitrate: decode cap lift held — the decoder kept its headroom"
-                    );
-                }
+            if let Some(kbps) = self.settle_decode_step(p, mean, budget_us, now) {
+                return Some(kbps);
             }
         }
         if self.decode_headroom.disarmed() {
@@ -416,6 +373,65 @@ impl BitrateController {
             );
         }
         None
+    }
+
+    /// The decoder's answer to a step, averaged over its clean windows at the
+    /// new rate. `Some` gives the rate back; `None` keeps the step, and this
+    /// window is fresh evidence for the bands.
+    fn settle_decode_step(
+        &mut self,
+        p: DecodeProbe,
+        mean: i64,
+        budget_us: i64,
+        now: Instant,
+    ) -> Option<u32> {
+        let answer_us = budget_us * DECODE_ANSWER_PCT / 100;
+        match p.kind {
+            DecodeProbeKind::Retreat if p.ref_us - mean >= answer_us => {
+                tracing::info!(
+                    from_kbps = p.from_kbps,
+                    at_kbps = self.current_kbps,
+                    decode_us = mean,
+                    was_us = p.ref_us,
+                    "adaptive bitrate: decode latency followed the rate down — retreat kept"
+                );
+                None
+            }
+            DecodeProbeKind::Retreat => {
+                // Latency is not a function of the rate here: pipelined
+                // decoder, or something else on the SoC. Give the rate
+                // back and stand down; the cap ladder still probes up.
+                self.decode_headroom.disarm();
+                self.decode_cap.park(p.from_kbps);
+                tracing::info!(
+                    restore_kbps = p.from_kbps,
+                    decode_us = mean,
+                    was_us = p.ref_us,
+                    rearm_after_windows = self.decode_headroom.reprobe_after(),
+                    "adaptive bitrate: decode latency did not follow the rate — restoring it \
+                     and standing the headroom driver down (a pipelined decoder sits above \
+                     the period with no queue)"
+                );
+                self.ceiling_ask_kbps = p.from_kbps;
+                self.request(p.from_kbps, now)
+            }
+            DecodeProbeKind::Lift => {
+                let worse =
+                    mean - p.ref_us >= answer_us || mean * 100 / budget_us >= DECODE_RETREAT_PCT;
+                if worse {
+                    self.undo_decode_lift(p, mean);
+                    self.ceiling_ask_kbps = p.from_kbps;
+                    return self.request(p.from_kbps, now);
+                }
+                tracing::info!(
+                    at_kbps = self.current_kbps,
+                    decode_us = mean,
+                    was_us = p.ref_us,
+                    "adaptive bitrate: decode cap lift held — the decoder kept its headroom"
+                );
+                None
+            }
+        }
     }
 
     /// Host [`crate::quic::BitrateChanged`]: the clamp is authoritative, and any
@@ -495,23 +511,11 @@ impl BitrateController {
 
     /// Decide whether this 750 ms window should ask for a new encoder rate.
     ///
-    /// `Some(kbps)` is the request. OWD, decode, and encode `None` mean that
-    /// signal is absent. Activity is three-way: [`WindowActivity::Unmarked`]
-    /// (older host, wall-clock), [`WindowActivity::Empty`] (no AU arrived;
-    /// quiet like idle, does not count toward re-arm), and
-    /// [`WindowActivity::Active`] including `0` for observed stillness.
+    /// `Some(kbps)` is the request. Score the window, fold it into the
+    /// streaks and the clocks, then — once the cooldown allows a change —
+    /// take the first of the three moves it licenses: back off, give the
+    /// decoder headroom, or climb.
     pub(crate) fn on_window(&mut self, w: &WindowSample) -> Option<u32> {
-        let WindowSample {
-            now,
-            dropped,
-            loss_ppm,
-            encode_mean_us,
-            actual_kbps,
-            flushed,
-            recovery_kf,
-            activity,
-            ..
-        } = *w;
         if !self.enabled {
             return None;
         }
@@ -521,53 +525,74 @@ impl BitrateController {
             tracing::info!("adaptive bitrate off — host never acked a SetBitrate (older host)");
             return None;
         }
-        let Verdict {
-            severe,
-            bad,
-            quiet,
-            starved,
-            decode_bad,
-            decode_severe,
-            encode_bad,
-            encode_severe,
-            decode_mean_us,
-            reason,
-        } = self.baselines.score(
+        let v = self.baselines.score(
             w,
             self.current_kbps,
             self.frame_budget_us,
             self.encode_down.disarmed(),
         );
-        self.last_reason = reason;
-        // Repeat-only: stillness. Empty: no AU, same neutrality, not a
-        // re-arm count. Unmarked (older host) is never idle.
+        self.last_reason = v.reason;
+        self.note_activity(w.activity, v.quiet);
+        self.note_verdict(w, &v);
+        self.tick_caps(&v);
+        let cooled = self
+            .last_change
+            .is_none_or(|t| w.now.duration_since(t) >= CHANGE_COOLDOWN);
+        if !cooled {
+            return None;
+        }
+        if (self.bad_windows >= BAD_WINDOWS_TO_DECREASE || (v.severe && self.bad_windows >= 1))
+            && self.current_kbps > self.floor_kbps
+        {
+            return self.back_off(w, &v);
+        }
+        if let Some(kbps) = self.judge_headroom(w, &v) {
+            return Some(kbps);
+        }
+        self.climb(w)
+    }
+
+    /// Stillness, and the motion that ends it.
+    ///
+    /// Repeat-only is idle; empty is the same neutrality but proves nothing,
+    /// so it does not count; an older host that marks no repeats is never
+    /// idle. A long enough idle stretch re-arms slow start on the next
+    /// window that carries content.
+    fn note_activity(&mut self, activity: WindowActivity, quiet: bool) {
         if activity.idle() {
             self.idle_windows = self.idle_windows.saturating_add(1);
-        } else if !quiet {
-            // First active window after a real idle stretch: re-arm slow
-            // start and clear the cooldown so this window can climb.
-            if self.idle_windows >= IDLE_WINDOWS_TO_REARM && !self.probing {
-                self.probing = true;
-                self.last_change = None;
-                tracing::debug!(
-                    idle_windows = self.idle_windows,
-                    proven_kbps = self.proven.mark(),
-                    "adaptive bitrate: motion onset after an idle stretch — slow start re-armed"
-                );
-            }
-            self.idle_windows = 0;
+            return;
         }
+        if quiet {
+            return;
+        }
+        // Clear the cooldown with it so this window can climb.
+        if self.idle_windows >= IDLE_WINDOWS_TO_REARM && !self.probing {
+            self.probing = true;
+            self.last_change = None;
+            tracing::debug!(
+                idle_windows = self.idle_windows,
+                proven_kbps = self.proven.mark(),
+                "adaptive bitrate: motion onset after an idle stretch — slow start re-armed"
+            );
+        }
+        self.idle_windows = 0;
+    }
+
+    /// Fold the window into the streaks the decrease and the climb read.
+    ///
+    /// The proven mark is scored after the verdict and gated on the whole of
+    /// it: a damaged window overstates delivery (stall drain, flush queue,
+    /// FEC surge), and those bytes arriving is not climb authority.
+    fn note_verdict(&mut self, w: &WindowSample, v: &Verdict) {
         // Bucket clock ticks on idle windows too: decay is about time.
         self.proven.tick();
-        // Proven mark: scored after the verdict, gated on the whole of it.
-        // Damaged windows overstate delivered (stall drain, flush queue, FEC
-        // surge); those bytes arriving is not climb authority.
-        if !bad {
-            self.proven.note(actual_kbps);
+        if !v.bad {
+            self.proven.note(w.actual_kbps);
         }
-        if bad {
+        if v.bad {
             self.bad_windows += 1;
-            if decode_bad {
+            if v.decode_bad {
                 // Counted here: backoff only sees the final window, and the
                 // cooldown eats the first ordinary-bad window.
                 self.streak_decode_windows += 1;
@@ -577,45 +602,40 @@ impl BitrateController {
             // A lift that ran into damage failed; a retreat learns nothing here.
             match self.decode_probe.take() {
                 Some(p) if p.kind == DecodeProbeKind::Lift && self.current_kbps > p.from_kbps => {
-                    self.undo_decode_lift(p, decode_mean_us.unwrap_or(p.ref_us));
+                    self.undo_decode_lift(p, v.decode_mean_us.unwrap_or(p.ref_us));
                 }
                 _ => {}
             }
             // Any congestion ends slow start until a later idle-onset re-arm.
             self.probing = false;
-        } else if quiet {
-            // Neutral: stillness and empty are neither climb credit nor a cleared streak.
-        } else {
+        } else if !v.quiet {
+            // Stillness is neither climb credit nor a cleared streak.
             self.clean_windows += 1;
             self.bad_windows = 0;
             self.streak_decode_windows = 0;
         }
-        // Host-cap re-probe: after a clean run parked at the cap, lift +12.5 %.
-        // A still-standing limit re-latches from the next short-ack pair.
-        let ceiling = self.ceiling_kbps;
-        if let Some((from, to)) = self
-            .host_cap
-            .on_window(bad, quiet, self.current_kbps, ceiling)
-        {
+    }
+
+    /// One window on each re-probe clock: the two learned caps and the encode
+    /// stand-down. A lift above the decode cap starts the probe whose answer
+    /// decides whether it holds.
+    fn tick_caps(&mut self, v: &Verdict) {
+        let (bad, quiet, rate, ceiling) = (v.bad, v.quiet, self.current_kbps, self.ceiling_kbps);
+        if let Some((from, to)) = self.host_cap.on_window(bad, quiet, rate, ceiling) {
             tracing::debug!(
                 from_kbps = from,
                 to_kbps = to,
                 "adaptive bitrate: re-probing above the learned host cap"
             );
         }
-        // Decode cap: same clock. Knee is content/thermals evidence; a
-        // still-standing knee re-latches from the next decode-driven pair.
-        if let Some((from, to)) = self
-            .decode_cap
-            .on_window(bad, quiet, self.current_kbps, ceiling)
-        {
+        if let Some((from, to)) = self.decode_cap.on_window(bad, quiet, rate, ceiling) {
             tracing::debug!(
                 from_kbps = from,
                 to_kbps = to,
                 "adaptive bitrate: re-probing above the learned decode cap"
             );
             // The decoder's answer above the cap decides the lift.
-            self.decode_probe = decode_mean_us.map(|ref_us| DecodeProbe {
+            self.decode_probe = v.decode_mean_us.map(|ref_us| DecodeProbe {
                 kind: DecodeProbeKind::Lift,
                 from_kbps: from,
                 ref_us,
@@ -624,9 +644,8 @@ impl BitrateController {
                 age: 0,
             });
         }
-        // Encode stand-down re-probes on the same clock. GPU contention ends;
-        // a too-eager re-arm costs one ×0.7, a permanent silence costs the
-        // knee protection.
+        // GPU contention ends; a too-eager re-arm costs one ×0.7, a permanent
+        // silence costs the knee protection.
         if self.encode_down.disarmed() {
             if bad {
                 self.encode_down.note_bad();
@@ -642,132 +661,143 @@ impl BitrateController {
                 );
             }
         }
-        let cooled = self
-            .last_change
-            .is_none_or(|t| now.duration_since(t) >= CHANGE_COOLDOWN);
-        if !cooled {
-            return None;
+    }
+
+    /// The ×0.7 step, and what this window taught on the way down: a decoder
+    /// knee when the evidence is the decoder's, a host-encode level when the
+    /// encoder is the only explanation.
+    fn back_off(&mut self, w: &WindowSample, v: &Verdict) -> Option<u32> {
+        self.learn_knee(w, v);
+        self.judge_encode_attribution(w, v);
+        self.climb_since_backoff = false;
+        let next = ((self.current_kbps as u64 * 7 / 10) as u32).max(self.floor_kbps);
+        // First descent below the old 5 Mbps floor: log once.
+        if next < LOW_RATE_WARN_KBPS && !self.low_rate_warned {
+            self.low_rate_warned = true;
+            tracing::warn!(
+                at_kbps = next,
+                "adaptive bitrate: the link sustains only a very low rate — expect \
+                 visibly soft video until it recovers (floor: 2 Mbps)"
+            );
         }
-        if (self.bad_windows >= BAD_WINDOWS_TO_DECREASE || (severe && self.bad_windows >= 1))
-            && self.current_kbps > self.floor_kbps
-        {
-            // Decode evidence: severe in this window; every window in the
-            // ordinary streak was decode-flagged; kf-storm without heavy loss;
-            // flush only if decode is bad or the signal is absent (flat decode
-            // + flush is a network event).
-            let decode_evidence = decode_severe
-                || self.streak_decode_windows >= BAD_WINDOWS_TO_DECREASE
-                || (recovery_kf >= RECOVERY_KF_BAD && loss_ppm < HEAVY_LOSS_PPM)
-                || (flushed && (decode_bad || decode_mean_us.is_none()));
-            if !self.climb_since_backoff {
-                // Drain after ×0.7 (~100 ms ack): not a knee sample. Neither
-                // latch nor erase the reference.
-                tracing::debug!(
-                    at_kbps = self.current_kbps,
-                    reference_kbps = self.decode_backoff_kbps,
-                    "adaptive bitrate: backoff without an intervening climb — draining the \
-                     previous choke, not a knee sample"
-                );
-            } else if starved {
-                // Starved: same as drain — neither latch nor erase.
-                tracing::debug!(
-                    at_kbps = self.current_kbps,
-                    actual_kbps,
-                    reference_kbps = self.decode_backoff_kbps,
-                    "adaptive bitrate: backoff in a starved window (delivery a fraction of \
-                     the target) — starvation-shaped distress, not a knee sample"
-                );
-            } else if decode_evidence {
-                let rate = self.current_kbps;
-                let similar = self.decode_backoff_kbps > 0
-                    && rate.abs_diff(self.decode_backoff_kbps)
-                        <= self.decode_backoff_kbps / DECODE_CAP_SIMILAR_DIV;
-                // Latch just under the choke rate: a cap on the knee authorizes
-                // climbing straight back into it. 1/16 is inside the ±1/8 band.
-                let knee = rate.saturating_sub(rate / 16).max(self.floor_kbps);
-                if similar && self.decode_cap.latch(knee, self.floor_kbps) {
-                    tracing::info!(
-                        cap_kbps = knee,
-                        choked_at_kbps = rate,
-                        reprobe_after_windows = self.decode_cap.reprobe_after(),
-                        "adaptive bitrate: decode cap learned (decoder knee) — climbs stop \
-                         here until it lifts"
-                    );
-                }
-                self.decode_backoff_kbps = rate;
-            } else {
-                self.decode_backoff_kbps = 0;
-            }
-            // Encode attribution: judged from this firing level, not the
-            // baseline (`on_ack` re-seeded it). Loss/flush/drop explain the
-            // backoff without the encoder.
-            let encode_attributed = (encode_severe || encode_bad)
-                && dropped == 0
-                && !flushed
-                && loss_ppm < HEAVY_LOSS_PPM;
-            let (encode_rise_us, _) = encode_thresholds(self.frame_budget_us);
-            if let Some(mean) = encode_mean_us.filter(|_| encode_attributed) {
-                if self.encode_backoff_us > 0
-                    && mean >= self.encode_backoff_us.saturating_sub(encode_rise_us)
-                {
-                    // Fired again no lower: the ×0.7 in between did nothing.
-                    self.encode_noop_backoffs += 1;
-                    if self.encode_noop_backoffs >= ENCODE_NOOP_BACKOFFS_TO_DISARM {
-                        self.encode_down.disarm();
-                        self.baselines.clear_encode();
-                        tracing::info!(
-                            at_kbps = self.current_kbps,
-                            encode_mean_us = mean,
-                            noop_backoffs = self.encode_noop_backoffs,
-                            rearm_after_windows = self.encode_down.reprobe_after(),
-                            "adaptive bitrate: host encode time is not answering the rate — \
-                             standing the encode down-driver down until a clean run re-probes it \
-                             (loss, OWD, decode and keyframe signals keep driving)"
-                        );
-                    }
-                } else {
-                    self.encode_noop_backoffs = 0;
-                }
-                self.encode_backoff_us = mean;
-            } else {
-                // Something else drove this one: encode streak is broken.
-                self.encode_backoff_us = 0;
-                self.encode_noop_backoffs = 0;
-            }
-            self.climb_since_backoff = false;
-            let next = ((self.current_kbps as u64 * 7 / 10) as u32).max(self.floor_kbps);
-            // First descent below the old 5 Mbps floor: log once.
-            if next < LOW_RATE_WARN_KBPS && !self.low_rate_warned {
-                self.low_rate_warned = true;
-                tracing::warn!(
-                    at_kbps = next,
-                    "adaptive bitrate: the link sustains only a very low rate — expect \
-                     visibly soft video until it recovers (floor: 2 Mbps)"
+        self.bad_windows = 0;
+        self.streak_decode_windows = 0;
+        self.request(next, w.now)
+    }
+
+    /// Two decode-driven backoffs at a similar rate are a knee; a drained or
+    /// starved one samples nothing, and neither erases the reference.
+    fn learn_knee(&mut self, w: &WindowSample, v: &Verdict) {
+        // Decode evidence: severe in this window; every window in the
+        // ordinary streak was decode-flagged; kf-storm without heavy loss;
+        // flush only if decode is bad or the signal is absent (flat decode
+        // + flush is a network event).
+        let decode_evidence = v.decode_severe
+            || self.streak_decode_windows >= BAD_WINDOWS_TO_DECREASE
+            || (w.recovery_kf >= RECOVERY_KF_BAD && w.loss_ppm < HEAVY_LOSS_PPM)
+            || (w.flushed && (v.decode_bad || v.decode_mean_us.is_none()));
+        if !self.climb_since_backoff {
+            // Drain after ×0.7 (~100 ms ack): not a knee sample.
+            tracing::debug!(
+                at_kbps = self.current_kbps,
+                reference_kbps = self.decode_backoff_kbps,
+                "adaptive bitrate: backoff without an intervening climb — draining the \
+                 previous choke, not a knee sample"
+            );
+        } else if v.starved {
+            tracing::debug!(
+                at_kbps = self.current_kbps,
+                actual_kbps = w.actual_kbps,
+                reference_kbps = self.decode_backoff_kbps,
+                "adaptive bitrate: backoff in a starved window (delivery a fraction of \
+                 the target) — starvation-shaped distress, not a knee sample"
+            );
+        } else if decode_evidence {
+            let rate = self.current_kbps;
+            let similar = self.decode_backoff_kbps > 0
+                && rate.abs_diff(self.decode_backoff_kbps)
+                    <= self.decode_backoff_kbps / DECODE_CAP_SIMILAR_DIV;
+            // Latch just under the choke rate: a cap on the knee authorizes
+            // climbing straight back into it. 1/16 is inside the ±1/8 band.
+            let knee = rate.saturating_sub(rate / 16).max(self.floor_kbps);
+            if similar && self.decode_cap.latch(knee, self.floor_kbps) {
+                tracing::info!(
+                    cap_kbps = knee,
+                    choked_at_kbps = rate,
+                    reprobe_after_windows = self.decode_cap.reprobe_after(),
+                    "adaptive bitrate: decode cap learned (decoder knee) — climbs stop \
+                     here until it lifts"
                 );
             }
-            self.bad_windows = 0;
-            self.streak_decode_windows = 0;
-            return self.request(next, now);
+            self.decode_backoff_kbps = rate;
+        } else {
+            self.decode_backoff_kbps = 0;
         }
-        // Decode headroom: a clean, loaded, full-rate window with the signal.
-        // Loss, flush and starvation are the link's story, not the decoder's.
-        let full_rate = match (activity, self.frame_budget_us) {
-            (WindowActivity::Active(n), Some(budget_us)) if budget_us > 0 => {
+    }
+
+    /// Host encode time is treated as a function of the rate. Two backoffs it
+    /// did not answer break that assumption, and the driver stands down.
+    ///
+    /// Judged from the last firing level, not the baseline — `on_ack`
+    /// re-seeded that. Loss, flush and a lost frame explain a backoff without
+    /// the encoder, so they break the streak instead of extending it.
+    fn judge_encode_attribution(&mut self, w: &WindowSample, v: &Verdict) {
+        let attributed = (v.encode_severe || v.encode_bad)
+            && w.dropped == 0
+            && !w.flushed
+            && w.loss_ppm < HEAVY_LOSS_PPM;
+        let (rise_us, _) = encode_thresholds(self.frame_budget_us);
+        let Some(mean) = w.encode_mean_us.filter(|_| attributed) else {
+            self.encode_backoff_us = 0;
+            self.encode_noop_backoffs = 0;
+            return;
+        };
+        if self.encode_backoff_us > 0 && mean >= self.encode_backoff_us.saturating_sub(rise_us) {
+            // Fired again no lower: the ×0.7 in between did nothing.
+            self.encode_noop_backoffs += 1;
+            if self.encode_noop_backoffs >= ENCODE_NOOP_BACKOFFS_TO_DISARM {
+                self.encode_down.disarm();
+                self.baselines.clear_encode();
+                tracing::info!(
+                    at_kbps = self.current_kbps,
+                    encode_mean_us = mean,
+                    noop_backoffs = self.encode_noop_backoffs,
+                    rearm_after_windows = self.encode_down.reprobe_after(),
+                    "adaptive bitrate: host encode time is not answering the rate — \
+                     standing the encode down-driver down until a clean run re-probes it \
+                     (loss, OWD, decode and keyframe signals keep driving)"
+                );
+            }
+        } else {
+            self.encode_noop_backoffs = 0;
+        }
+        self.encode_backoff_us = mean;
+    }
+
+    /// Decode headroom, on a clean loaded full-rate window that carries the
+    /// signal. Loss, flush and starvation are the link's story, not the
+    /// decoder's, and a low-fps window's decode mean overstates the load.
+    fn judge_headroom(&mut self, w: &WindowSample, v: &Verdict) -> Option<u32> {
+        let budget_us = self.frame_budget_us?;
+        let mean_us = v.decode_mean_us?;
+        let full_rate = match w.activity {
+            WindowActivity::Active(n) if budget_us > 0 => {
                 i64::from(n) * DECODE_FULL_RATE_DEN
                     >= (sample::WINDOW_US / budget_us) * DECODE_FULL_RATE_NUM
             }
             _ => true,
         };
-        if let (Some(mean_us), Some(budget_us)) = (decode_mean_us, self.frame_budget_us) {
-            if budget_us > 0 && !bad && !quiet && !starved && full_rate {
-                if let Some(kbps) = self.judge_decode_headroom(mean_us, budget_us, now) {
-                    return Some(kbps);
-                }
-            }
+        if budget_us <= 0 || v.bad || v.quiet || v.starved || !full_rate {
+            return None;
         }
-        // Climbs need a utilized clean window and stay within ×1.5 of proven.
-        let proration = growth::proration(activity, self.frame_budget_us);
-        let utilized = growth::utilized(activity, proration, actual_kbps, self.current_kbps);
+        self.judge_decode_headroom(mean_us, budget_us, w.now)
+    }
+
+    /// A clean window under the ceilings: come down to a ceiling this session
+    /// is already above, or climb toward it.
+    fn climb(&mut self, w: &WindowSample) -> Option<u32> {
+        let proration = growth::proration(w.activity, self.frame_budget_us);
+        let utilized = growth::utilized(w.activity, proration, w.actual_kbps, self.current_kbps);
         // Probe = link, short acks = encoder, decode cap = client decoder.
         let eff_ceiling = self
             .ceiling_kbps
@@ -783,7 +813,7 @@ impl BitrateController {
                 "adaptive bitrate: session rate is above the configured ceiling — stepping down"
             );
             self.ceiling_ask_kbps = ceiling_target;
-            return self.request(ceiling_target, now);
+            return self.request(ceiling_target, w.now);
         }
         // Proven bounds the projected wire rate at ×1.5, in the same domain
         // the proration took it out of.
@@ -793,7 +823,7 @@ impl BitrateController {
             if slow_start || self.clean_windows >= CLEAN_WINDOWS_TO_INCREASE {
                 let next = growth::climb_step(self.current_kbps, cap, slow_start);
                 self.clean_windows = 0;
-                return self.request(next, now);
+                return self.request(next, w.now);
             }
         }
         None
