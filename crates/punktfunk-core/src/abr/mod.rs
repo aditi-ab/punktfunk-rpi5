@@ -22,6 +22,10 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// The link simulator and the checked-in baseline (`abr/sim/`).
+#[cfg(test)]
+mod sim;
+
 /// Floor so a mis-measured window cannot crater the session. 2 Mbps: a thin
 /// link is better served soft than lossy. First descent below
 /// [`LOW_RATE_WARN_KBPS`] logs once.
