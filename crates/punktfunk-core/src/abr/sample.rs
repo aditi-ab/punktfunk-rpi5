@@ -5,7 +5,10 @@
 //! consumes it. `None` on a latency field means nobody reports that signal —
 //! absent, not clean.
 
-/// One report window, in µs — the pump's 750 ms `ADAPT_REPORT_INTERVAL`.
+/// One report window: the pump's tick, the controller's unit of time, and
+/// the cadence the host reads a missing loss report against.
+pub(crate) const WINDOW: std::time::Duration = std::time::Duration::from_micros(WINDOW_US as u64);
+/// The same, in µs, where the arithmetic is integer.
 pub(crate) const WINDOW_US: i64 = 750_000;
 
 /// New-content evidence for one report window.
@@ -59,7 +62,9 @@ pub(crate) struct WindowSample {
 }
 
 impl WindowSample {
-    /// An undamaged, signal-free window at `now`. Fill what the window has.
+    /// An undamaged, signal-free window at `now`: the base a test fills in.
+    /// The accumulator builds its samples whole.
+    #[cfg(test)]
     pub(crate) fn at(now: std::time::Instant) -> Self {
         WindowSample {
             now,

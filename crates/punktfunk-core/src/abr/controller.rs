@@ -78,19 +78,6 @@ pub(super) const DECODE_CAP_SIMILAR_DIV: u32 = 8;
 /// predating renegotiation and the controller goes quiet.
 const MAX_UNACKED: u32 = 3;
 
-/// `PUNKTFUNK_ABR_MAX_MBPS` (megabits/second) caps the climb ceiling however
-/// it is learned. [`set_ceiling`](BitrateController::set_ceiling) never
-/// lowers, so one inflated probe is otherwise permanent.
-/// `PUNKTFUNK_ABR_PROBE_KBPS` only shrinks the burst target, not the
-/// conclusion. Unset/0/garbage → no cap. Read once, at construction.
-fn ceiling_cap_from_env() -> Option<u32> {
-    std::env::var("PUNKTFUNK_ABR_MAX_MBPS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&m| m > 0)
-        .map(|m| m.saturating_mul(1_000))
-}
-
 /// A headroom step awaiting the decoder's answer at its new rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DecodeProbe {
@@ -191,12 +178,9 @@ pub(crate) struct BitrateController {
 impl BitrateController {
     /// `start_kbps` is the Welcome-resolved Automatic rate, or `0` for a
     /// permanently-disabled controller (explicit bitrate / old host).
-    pub(crate) fn new(start_kbps: u32) -> Self {
-        Self::with_ceiling_cap(start_kbps, ceiling_cap_from_env())
-    }
-
-    /// [`new`](Self::new) with the env cap injected so tests never touch the process env.
-    pub(super) fn with_ceiling_cap(start_kbps: u32, ceiling_cap_kbps: Option<u32>) -> Self {
+    /// `ceiling_cap_kbps` is the operator's ceiling, read from the
+    /// environment once by the embedder.
+    pub(crate) fn new(start_kbps: u32, ceiling_cap_kbps: Option<u32>) -> Self {
         BitrateController {
             enabled: start_kbps > 0,
             current_kbps: start_kbps,
@@ -856,7 +840,7 @@ mod tests {
     #[test]
     fn disabled_when_not_automatic_or_old_host() {
         // start 0 = explicit bitrate or a host that didn't echo one.
-        let mut c = BitrateController::new(0);
+        let mut c = BitrateController::new(0, None);
         let now = Instant::now();
         assert_eq!(
             c.on_window(&WindowSample {
@@ -873,7 +857,7 @@ mod tests {
 
     #[test]
     fn two_ordinary_bad_windows_step_down_multiplicatively() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         // 2–6 % loss is ordinary: one window is a blip.
         assert_eq!(
@@ -916,7 +900,7 @@ mod tests {
     #[test]
     fn severe_window_backs_off_immediately() {
         // Unrecoverable frame skips the two-window wait…
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         assert_eq!(
             c.on_window(&WindowSample {
@@ -927,7 +911,7 @@ mod tests {
             Some(14_000)
         );
         // …and so does a jump-to-live flush.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         assert_eq!(
             c.on_window(&WindowSample {
                 actual_kbps: 1_000_000,
@@ -937,7 +921,7 @@ mod tests {
             Some(14_000)
         );
         // …and ≥6 % window loss.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         assert_eq!(
             c.on_window(&WindowSample {
                 loss_ppm: 80_000,
@@ -950,7 +934,7 @@ mod tests {
 
     #[test]
     fn cooldown_blocks_back_to_back_steps() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         assert_eq!(
             c.on_window(&WindowSample {
@@ -982,7 +966,7 @@ mod tests {
 
     #[test]
     fn floor_is_never_crossed() {
-        let mut c = BitrateController::new(2_500);
+        let mut c = BitrateController::new(2_500, None);
         let start = Instant::now();
         // ×0.7 of 2500 = 1750 < floor → 2000.
         assert_eq!(
@@ -1015,7 +999,7 @@ mod tests {
 
     #[test]
     fn set_ceiling_is_ignored_when_disabled_and_never_lowers() {
-        let mut c = BitrateController::new(0);
+        let mut c = BitrateController::new(0, None);
         c.set_ceiling(1_000_000);
         assert_eq!(
             c.on_window(&WindowSample {
@@ -1024,7 +1008,7 @@ mod tests {
             }),
             None
         );
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_ceiling(10_000); // below the negotiated start → ignored
         assert_eq!(c.ceiling_kbps, 20_000);
     }
@@ -1032,18 +1016,18 @@ mod tests {
     /// Stream bound clamps learned ceilings only; a host-resolved start stands.
     #[test]
     fn the_stream_bound_clamps_a_learned_ceiling_only() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_stream_cap(100_000);
         c.set_ceiling(657_000);
         assert_eq!(c.ceiling_kbps, 100_000, "a learned ceiling is bounded");
 
         // Never set: no stream bound.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_ceiling(657_000);
         assert_eq!(c.ceiling_kbps, 657_000);
 
         // Negotiated start above the bound stands.
-        let mut c = BitrateController::new(300_000);
+        let mut c = BitrateController::new(300_000, None);
         c.set_stream_cap(100_000);
         assert_eq!(c.ceiling_kbps, 300_000);
         c.set_ceiling(657_000);
@@ -1053,7 +1037,7 @@ mod tests {
         );
 
         // Tighter of env and stream caps wins.
-        let mut c = BitrateController::with_ceiling_cap(20_000, Some(50_000));
+        let mut c = BitrateController::new(20_000, Some(50_000));
         c.set_stream_cap(100_000);
         c.set_ceiling(657_000);
         assert_eq!(
@@ -1067,7 +1051,7 @@ mod tests {
     #[test]
     fn a_mode_switch_reteaches_the_stream_cap_both_ways() {
         // 1080p on a fat link: ceiling bound at the 1080p shape.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_stream_cap(100_000);
         c.set_ceiling(657_000);
         assert_eq!(c.ceiling_kbps, 100_000);
@@ -1094,7 +1078,7 @@ mod tests {
         );
 
         // Disabled controller (explicit bitrate) is untouched.
-        let mut d = BitrateController::new(0);
+        let mut d = BitrateController::new(0, None);
         d.set_stream_cap(100_000);
         d.set_stream_cap(42_000);
         assert_eq!(d.ceiling_kbps, 0);
@@ -1103,7 +1087,7 @@ mod tests {
     /// One-shot warning on first descent below the old 5 Mbps floor.
     #[test]
     fn the_low_rate_warning_fires_once_below_the_old_floor() {
-        let mut c = BitrateController::new(6_000);
+        let mut c = BitrateController::new(6_000, None);
         let start = Instant::now();
         assert!(!c.low_rate_warned);
         // 6000 × 0.7 = 4200: under the old floor, over the new one.
@@ -1131,7 +1115,7 @@ mod tests {
     #[test]
     fn a_host_retarget_above_the_ceiling_raises_it() {
         // Unsolicited host re-target above the negotiated rate must raise the ceiling.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         assert_eq!(c.ceiling_kbps, 20_000);
         c.on_ack(60_000); // unsolicited, no request outstanding
         assert_eq!(c.current_kbps, 60_000);
@@ -1140,7 +1124,7 @@ mod tests {
         // No step-down.
         assert_eq!(run_clean(&mut c, start, 0, 4), None);
         // Env cap still outranks the host retarget.
-        let mut c = BitrateController::with_ceiling_cap(20_000, Some(50_000));
+        let mut c = BitrateController::new(20_000, Some(50_000));
         c.on_ack(60_000);
         assert_eq!(c.ceiling_kbps, 50_000);
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(50_000));
@@ -1149,15 +1133,15 @@ mod tests {
     #[test]
     fn env_max_mbps_caps_every_learned_ceiling() {
         // Injected 50 Mbps env cap outranks an 886 Mbps probe.
-        let mut c = BitrateController::with_ceiling_cap(20_000, Some(50_000));
+        let mut c = BitrateController::new(20_000, Some(50_000));
         c.set_ceiling(886_312);
         assert_eq!(c.ceiling_kbps, 50_000);
         // Measurement under the cap stands.
-        let mut c = BitrateController::with_ceiling_cap(20_000, Some(50_000));
+        let mut c = BitrateController::new(20_000, Some(50_000));
         c.set_ceiling(40_000);
         assert_eq!(c.ceiling_kbps, 40_000);
         // Climb honors it: 20→40→50, then quiet.
-        let mut c = BitrateController::with_ceiling_cap(20_000, Some(50_000));
+        let mut c = BitrateController::new(20_000, Some(50_000));
         c.set_ceiling(886_312);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(40_000));
@@ -1170,7 +1154,7 @@ mod tests {
     #[test]
     fn a_session_above_the_env_cap_steps_down_to_it_once() {
         // Env cap binds the negotiated start, not only probe-learned ceilings.
-        let mut c = BitrateController::with_ceiling_cap(100_000, Some(50_000));
+        let mut c = BitrateController::new(100_000, Some(50_000));
         assert_eq!(c.ceiling_kbps, 50_000);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(50_000));
@@ -1184,7 +1168,7 @@ mod tests {
 
     #[test]
     fn ack_silence_disables_the_controller() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         let mut sent = 0;
         let mut i = 0;

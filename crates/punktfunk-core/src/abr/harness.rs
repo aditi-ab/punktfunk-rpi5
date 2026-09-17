@@ -191,7 +191,7 @@ pub(super) fn loaded(c: &mut BitrateController, at: Instant, decode_us: i64) -> 
 
 /// A 120 Hz controller with room to climb and seeded baselines.
 pub(super) fn seeded_120(start_kbps: u32) -> (BitrateController, Instant, u32) {
-    let mut c = BitrateController::new(start_kbps);
+    let mut c = BitrateController::new(start_kbps, None);
     c.set_ceiling(400_000);
     c.set_frame_budget(120);
     let start = Instant::now();

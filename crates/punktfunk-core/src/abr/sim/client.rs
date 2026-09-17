@@ -1,18 +1,18 @@
-//! Client model: FEC repair, keyframe asks, decode time, and the report
-//! window the real [`BitrateController`] is driven from.
+//! Client model: FEC repair, keyframe asks, decode time, and the session
+//! counters the real [`Driver`] assembles its window from.
 //!
-//! The window is assembled the way `client/pump/data.rs` assembles it — see
-//! the table in `abr-wp0-simulator-handoff.md`. Only the wire is a model: the
-//! controller, [`window_loss_ppm`](crate::quic::window_loss_ppm) and the
-//! activity classification are the shipped code.
+//! Only the wire is a model. The window, the verdict, the controller and the
+//! capacity probe are the shipped code, driven the way
+//! `client/pump/data.rs` drives them: counters in, actions out.
 
 use super::host::{Frame, FrameShape, SHARD_WIRE_OVERHEAD};
 use super::link::LossDraw;
 use super::Rng;
-use crate::abr::{BitrateController, WindowActivity, WindowSample};
-use crate::client::{ADAPT_REPORT_INTERVAL, FLUSH_COOLDOWN};
+use crate::abr::{Driver, DriverConfig, ProbeReport};
+use crate::client::FLUSH_COOLDOWN;
+use crate::stats::Stats;
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Jump-to-live's thresholds (`client/frame_channel.rs`, private there):
 /// delay past `FLUSH_LATENCY` held for `FLUSH_AFTER`, or `QUEUE_HIGH` frames
@@ -24,9 +24,6 @@ const STANDING_MS: u64 = 250;
 /// The webOS client's recovery throttle: one ask per 100 ms until a keyframe
 /// lands.
 const KEYFRAME_ASK_MS: u64 = 100;
-/// `data.rs`: the startup burst fires 2 s after video flows and lasts 800 ms.
-const PROBE_DELAY_MS: u64 = 2_000;
-const PROBE_MS: u32 = 800;
 /// Header plus shard, the plaintext the reassembler counts per probe packet —
 /// not the sealed datagram. The field's `delivered_kbps` is in these bytes.
 const PROBE_PACKET_BYTES: u64 = 40 + 1408;
@@ -84,18 +81,15 @@ impl Default for ClientCfg {
     }
 }
 
-/// What the client sends the host in one tick.
+/// What the client sends the host in one tick. The driver's own
+/// [`crate::abr::Action`]s become these; `unrecovered` is what the client
+/// model knows and the real wire carries as a keyframe ask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
     SetBitrate(u32),
     Keyframe,
     Loss { ppm: u32, unrecovered: bool },
     Probe { target_kbps: u32, duration_ms: u32 },
-}
-
-/// `data.rs` `probe_target_kbps`: twice the stream cap, held at 2 Gbps.
-pub(super) fn probe_target_kbps(stream_cap_kbps: u32) -> u32 {
-    stream_cap_kbps.saturating_mul(2).min(2_000_000)
 }
 
 /// One closed report window, kept for the metrics.
@@ -131,27 +125,16 @@ struct InFlight {
 pub(super) struct Client {
     cfg: ClientCfg,
     rng: Rng,
-    pub(super) abr: BitrateController,
+    /// The scenario's zero, so a millisecond can become an `Instant`.
+    base: Instant,
+    pub(super) abr: Driver,
     flight: VecDeque<InFlight>,
-    acks: Vec<u32>,
     lost_blocks: Vec<u32>,
-    /// Window accumulators, in the pump's order.
-    received_packets: u64,
-    repaired: u64,
-    received_bytes: u64,
-    owd_sum_us: i64,
-    owd_frames: u32,
-    decode_sum_us: i64,
-    decode_count: u32,
-    encode_sum_us: i64,
-    encode_count: u32,
-    au_frames: u32,
-    au_repeats: u32,
-    dropped: u64,
-    recovery_kf: u32,
-    flushed: bool,
-    discard: bool,
-    next_window_ms: u64,
+    /// The session counters the driver differences its windows from.
+    stats: Stats,
+    /// Unrecoverable frames since the last window closed. The host's adaptive
+    /// FEC is told; on the real wire the keyframe ask tells it.
+    lost_frames: u64,
     /// Jump-to-live detectors and their shared cooldown.
     owd_over_since: Option<u64>,
     queue_over_since: Option<u64>,
@@ -161,48 +144,43 @@ pub(super) struct Client {
     awaiting_idr: bool,
     kf_next_ms: u64,
     force_loss_at_ms: Option<u64>,
-    /// Startup probe: when it fires, whether it is in flight, and what the
-    /// filler delivered while it was.
-    probe_at_ms: Option<u64>,
+    /// A burst is in flight, how long it lasts, and what its filler
+    /// delivered while it was.
     probing: bool,
+    probe_duration_ms: u32,
     probe_bytes: u64,
     probe_first_ms: u64,
     probe_last_ms: u64,
-    probe_video_frames: u32,
     pub(super) windows: Vec<WindowRec>,
     pub(super) owd_samples: Vec<u32>,
 }
 
 impl Client {
-    pub(super) fn new(cfg: ClientCfg, seed: u64) -> Self {
-        let mut abr = BitrateController::with_ceiling_cap(
-            if cfg.automatic { cfg.start_kbps } else { 0 },
-            None,
+    pub(super) fn new(cfg: ClientCfg, seed: u64, base: Instant) -> Self {
+        let abr = Driver::new(
+            DriverConfig {
+                start_kbps: if cfg.automatic { cfg.start_kbps } else { 0 },
+                ceiling_cap_kbps: None,
+                stream_cap_kbps: cfg.stream_cap_kbps,
+                refresh_hz: cfg.refresh_hz,
+                codec: crate::quic::CODEC_HEVC,
+                bit_depth: 8,
+                chroma_format: crate::quic::CHROMA_IDC_420,
+                audio_reserved_kbps: cfg.audio_kbps,
+                marks_repeats: cfg.marks_repeats,
+                probe: cfg.probe,
+                probe_target_kbps: cfg.probe_target_kbps,
+            },
+            base,
         );
-        abr.set_stream_cap(cfg.stream_cap_kbps);
-        abr.set_frame_budget(cfg.refresh_hz);
         Client {
             rng: Rng::new(seed),
+            base,
             abr,
             flight: VecDeque::new(),
-            acks: Vec::new(),
             lost_blocks: Vec::new(),
-            received_packets: 0,
-            repaired: 0,
-            received_bytes: 0,
-            owd_sum_us: 0,
-            owd_frames: 0,
-            decode_sum_us: 0,
-            decode_count: 0,
-            encode_sum_us: 0,
-            encode_count: 0,
-            au_frames: 0,
-            au_repeats: 0,
-            dropped: 0,
-            recovery_kf: 0,
-            flushed: false,
-            discard: false,
-            next_window_ms: ADAPT_REPORT_INTERVAL.as_millis() as u64,
+            stats: Stats::default(),
+            lost_frames: 0,
             owd_over_since: None,
             queue_over_since: None,
             last_flush_ms: None,
@@ -210,12 +188,11 @@ impl Client {
             awaiting_idr: false,
             kf_next_ms: 0,
             force_loss_at_ms: None,
-            probe_at_ms: cfg.probe.then_some(PROBE_DELAY_MS),
             probing: false,
+            probe_duration_ms: 0,
             probe_bytes: 0,
             probe_first_ms: 0,
             probe_last_ms: 0,
-            probe_video_frames: 0,
             windows: Vec::new(),
             owd_samples: Vec::new(),
             cfg,
@@ -226,7 +203,7 @@ impl Client {
     /// controller, so its rate is the one it negotiated.
     pub(super) fn rate_kbps(&self) -> u32 {
         if self.cfg.automatic {
-            self.abr.current_kbps
+            self.abr.abr.current_kbps
         } else {
             self.cfg.start_kbps
         }
@@ -237,8 +214,10 @@ impl Client {
         self.force_loss_at_ms = Some(at_ms);
     }
 
+    /// A host `BitrateChanged`. The driver queues it to the window close, as
+    /// the pump's ack queue does.
     pub(super) fn push_ack(&mut self, kbps: u32) {
-        self.acks.push(kbps);
+        self.abr.on_ack(kbps);
     }
 
     /// A frame left the host: the client now knows what to wait for.
@@ -323,33 +302,26 @@ impl Client {
             }
         }
         let arrived = shards.saturating_sub(lost.min(shards));
-        self.received_packets += u64::from(arrived);
-        self.received_bytes += u64::from(arrived) * shard_wire;
-        self.repaired += u64::from(repaired);
+        self.stats.packets_received += u64::from(arrived);
+        self.stats.bytes_received += u64::from(arrived) * shard_wire;
+        self.stats.fec_recovered_shards += u64::from(repaired);
         if unrecoverable {
-            self.dropped += 1;
+            self.stats.frames_dropped += 1;
+            self.lost_frames += 1;
             self.awaiting_idr = true;
             return;
         }
-        self.au_frames = self.au_frames.saturating_add(1);
-        if self.probing {
-            self.probe_video_frames = self.probe_video_frames.saturating_add(1);
-        }
-        if f.repeat && self.cfg.marks_repeats {
-            self.au_repeats = self.au_repeats.saturating_add(1);
-        }
+        self.stats.frames_completed += 1;
+        self.abr.on_au(f.repeat && self.cfg.marks_repeats);
         if f.idr {
             self.awaiting_idr = false;
         }
         let owd_us = (now_ms.saturating_sub(f.capture_ms) * 1_000) as i64;
-        self.owd_sum_us += owd_us;
-        self.owd_frames += 1;
+        self.abr.on_owd(i128::from(owd_us) * 1_000);
         self.owd_samples.push((owd_us / 1_000) as u32);
-        self.encode_sum_us += i64::from(f.encode_us);
-        self.encode_count += 1;
+        self.abr.on_encode_latency(u64::from(f.encode_us), 1);
         let decode_us = self.decode_us();
-        self.decode_sum_us += i64::from(decode_us);
-        self.decode_count += 1;
+        self.abr.on_decode_latency(u64::from(decode_us), 1);
         self.decode_free_at_ms =
             self.decode_free_at_ms.max(now_ms) + u64::from(decode_us).div_ceil(1_000);
         self.note_latency(owd_us / 1_000, now_ms);
@@ -357,7 +329,7 @@ impl Client {
 
     fn decode_us(&mut self) -> u32 {
         let d = self.cfg.decode;
-        let over = self.abr.current_kbps.saturating_sub(d.knee_kbps) / 1_000;
+        let over = self.abr.abr.current_kbps.saturating_sub(d.knee_kbps) / 1_000;
         let jitter = if d.jitter_us == 0 {
             0
         } else {
@@ -394,7 +366,7 @@ impl Client {
             self.queue_over_since = None;
             self.last_flush_ms = Some(now_ms);
             self.decode_free_at_ms = now_ms;
-            self.flushed = true;
+            self.abr.on_flush();
             self.awaiting_idr = true;
         }
     }
@@ -408,145 +380,103 @@ impl Client {
         }
         self.probe_last_ms = now_ms;
         self.probe_bytes += bytes;
+        self.stats.bytes_received += bytes;
+        self.stats.probe_bytes_received += bytes;
     }
 
-    /// The host's `ProbeResult` landed: ceiling from what the client received
-    /// over its own receive interval, every window anchor rebased past the
-    /// burst, and the window in flight discarded (`data.rs`).
+    /// The host's `ProbeResult` landed: the burst's trailing edge, then the
+    /// measurement, in the order one pump iteration sees them.
     pub(super) fn on_probe_result(&mut self, now_ms: u64, host_duration_ms: u32) {
         self.probing = false;
         let packets = self.probe_bytes / (self.cfg.shard_payload as u64 + SHARD_WIRE_OVERHEAD);
         let delivered = packets * PROBE_PACKET_BYTES;
-        let interval_ms = if packets >= 2 && self.probe_last_ms > self.probe_first_ms {
-            self.probe_last_ms - self.probe_first_ms
+        // Client receive interval: first to last filler arrival. Under two
+        // packets there is no interval and the host's window stands.
+        let client_interval_ms = if packets >= 2 && self.probe_last_ms > self.probe_first_ms {
+            (self.probe_last_ms - self.probe_first_ms) as u32
         } else {
-            u64::from(host_duration_ms)
+            0
         };
-        if delivered > 0 && interval_ms > 0 {
-            let delivered_kbps = (delivered * 8 / interval_ms) as u32;
-            self.abr.set_ceiling(delivered_kbps.saturating_mul(7) / 10);
-        }
-        // No frame survived the burst: one keyframe ask to re-anchor.
-        if self.probe_video_frames == 0 {
-            self.awaiting_idr = true;
-        }
-        self.reset_window();
-        self.next_window_ms = now_ms + ADAPT_REPORT_INTERVAL.as_millis() as u64;
-        self.discard = true;
+        let now = self.base + Duration::from_millis(now_ms);
+        self.abr.on_probe_active(false, self.probe_duration_ms, now);
+        self.abr.on_probe_result(ProbeReport {
+            delivered_bytes: delivered,
+            window_ms: if client_interval_ms > 0 {
+                client_interval_ms
+            } else {
+                host_duration_ms
+            },
+            host_duration_ms,
+            client_interval_ms,
+        });
     }
 
-    /// One millisecond: the keyframe throttle, then the report window when it
-    /// comes due. No window closes while the burst is in flight — the pump
-    /// suppresses the whole report tick for it.
+    /// One millisecond of client: the keyframe throttle, then the driver,
+    /// which closes the report window when it comes due.
     pub(super) fn tick(&mut self, now_ms: u64, base: Instant, out: &mut Vec<Action>) {
+        let now = base + Duration::from_millis(now_ms);
         if self.awaiting_idr && now_ms >= self.kf_next_ms {
             self.kf_next_ms = now_ms + KEYFRAME_ASK_MS;
-            self.recovery_kf += 1;
+            self.abr.on_keyframe_asks(1);
             out.push(Action::Keyframe);
-        }
-        if let Some(at) = self.probe_at_ms {
-            if now_ms >= at {
-                self.probe_at_ms = None;
-                self.probing = true;
-                self.probe_video_frames = 0;
-                out.push(Action::Probe {
-                    target_kbps: self
-                        .cfg
-                        .probe_target_kbps
-                        .unwrap_or_else(|| probe_target_kbps(self.cfg.stream_cap_kbps)),
-                    duration_ms: PROBE_MS,
-                });
-            }
         }
         if let Some((at, kbps)) = self.cfg.ceiling_at {
             if now_ms >= at {
                 self.cfg.ceiling_at = None;
                 self.abr.set_ceiling(kbps);
                 // The burst's tail is still draining into this window.
-                self.discard = true;
+                self.abr.discard_window();
             }
         }
-        if self.probing || now_ms < self.next_window_ms {
-            return;
+        self.abr.on_stats(&self.stats);
+        self.abr
+            .on_probe_active(self.probing, self.probe_duration_ms, now);
+        let unrecovered = self.lost_frames > 0;
+        let tick = self.abr.tick(now);
+        let mut request = None;
+        for action in tick.actions {
+            match action {
+                crate::abr::Action::Loss(ppm) => out.push(Action::Loss { ppm, unrecovered }),
+                crate::abr::Action::SetBitrate(kbps) => {
+                    request = Some(kbps);
+                    out.push(Action::SetBitrate(kbps));
+                }
+                crate::abr::Action::Probe {
+                    target_kbps,
+                    duration_ms,
+                } => {
+                    self.probing = true;
+                    self.probe_duration_ms = duration_ms;
+                    self.probe_bytes = 0;
+                    self.probe_first_ms = 0;
+                    self.probe_last_ms = 0;
+                    out.push(Action::Probe {
+                        target_kbps,
+                        duration_ms,
+                    });
+                }
+                // Counted where the control task counts every ask.
+                crate::abr::Action::Keyframe => {
+                    self.abr.on_keyframe_asks(1);
+                    out.push(Action::Keyframe);
+                }
+                crate::abr::Action::Delivery(_) | crate::abr::Action::AbandonProbe => {}
+            }
         }
-        let window_ms = ADAPT_REPORT_INTERVAL.as_millis() as u64;
-        self.next_window_ms += window_ms;
-        let discard = std::mem::take(&mut self.discard);
-        let loss_ppm = crate::quic::window_loss_ppm(self.repaired, 0, self.received_packets);
-        if !discard {
-            out.push(Action::Loss {
-                ppm: loss_ppm,
-                unrecovered: self.dropped > 0,
-            });
-        }
-        for kbps in self.acks.drain(..) {
-            self.abr.on_ack(kbps);
-        }
-        let owd_mean_us =
-            (self.owd_frames > 0).then(|| self.owd_sum_us / i64::from(self.owd_frames));
-        let decode_mean_us =
-            (self.decode_count > 0).then(|| self.decode_sum_us / i64::from(self.decode_count));
-        let encode_mean_us =
-            (self.encode_count > 0).then(|| self.encode_sum_us / i64::from(self.encode_count));
-        let activity = if self.au_frames == 0 {
-            WindowActivity::Empty
-        } else if self.cfg.marks_repeats {
-            WindowActivity::Active(self.au_frames.saturating_sub(self.au_repeats))
-        } else {
-            WindowActivity::Unmarked
-        };
-        let actual_kbps =
-            ((self.received_bytes * 8 / window_ms) as u32).saturating_add(self.cfg.audio_kbps);
+        let Some(w) = tick.window else { return };
+        self.lost_frames = 0;
         let was = self.rate_kbps();
-        let verdict = (!discard).then(|| {
-            self.abr.on_window(&WindowSample {
-                dropped: self.dropped,
-                loss_ppm,
-                owd_mean_us,
-                decode_mean_us,
-                encode_mean_us,
-                actual_kbps,
-                flushed: self.flushed,
-                recovery_kf: self.recovery_kf,
-                activity,
-                ..WindowSample::at(base + std::time::Duration::from_millis(now_ms))
-            })
-        });
-        let request = verdict.flatten();
-        if let Some(kbps) = request {
-            out.push(Action::SetBitrate(kbps));
-        }
         self.windows.push(WindowRec {
             t_ms: now_ms,
             rate_kbps: was,
-            actual_kbps,
-            dropped: self.dropped,
-            recovery_kf: self.recovery_kf,
+            actual_kbps: w.sample.actual_kbps,
+            dropped: w.sample.dropped,
+            recovery_kf: w.sample.recovery_kf,
             request_kbps: request,
             cut_from_kbps: request.filter(|&k| k < was).map(|_| was),
-            discarded: discard,
-            encode_disarmed: self.abr.encode_down.disarmed(),
+            discarded: w.discarded,
+            encode_disarmed: self.abr.abr.encode_down.disarmed(),
         });
-        self.reset_window();
-    }
-
-    /// Drop this window's accumulators. The probe rebases them too, so the
-    /// first window after the burst counts nothing the burst produced.
-    fn reset_window(&mut self) {
-        self.received_packets = 0;
-        self.repaired = 0;
-        self.received_bytes = 0;
-        self.owd_sum_us = 0;
-        self.owd_frames = 0;
-        self.decode_sum_us = 0;
-        self.decode_count = 0;
-        self.encode_sum_us = 0;
-        self.encode_count = 0;
-        self.au_frames = 0;
-        self.au_repeats = 0;
-        self.dropped = 0;
-        self.recovery_kf = 0;
-        self.flushed = false;
     }
 }
 
@@ -567,8 +497,12 @@ mod tests {
         }
     }
 
-    fn client() -> Client {
-        Client::new(ClientCfg::default(), 11)
+    fn client(base: Instant) -> Client {
+        Client::new(ClientCfg::default(), 11, base)
+    }
+
+    fn loss_ppm(c: &Client) -> u32 {
+        crate::quic::window_loss_ppm(c.stats.fec_recovered_shards, 0, c.stats.packets_received)
     }
 
     /// Parity covers its block's losses or the frame dies; either way
@@ -576,7 +510,7 @@ mod tests {
     /// `loss_ppm=0` beside a lost frame.
     #[test]
     fn parity_repairs_its_block_and_an_unrecoverable_frame_reports_no_loss() {
-        let mut c = client();
+        let mut c = client(Instant::now());
         // 45 000 bytes = 32 data shards, 4 parity at 10 %.
         let f = frame(1, 45_000, 10);
         assert_eq!(f.shape.data, 32);
@@ -591,11 +525,11 @@ mod tests {
             },
             10,
         );
-        assert_eq!(c.dropped, 0, "four shards, four parity");
-        assert_eq!(c.repaired, 4);
-        assert!(crate::quic::window_loss_ppm(c.repaired, 0, c.received_packets) > 0);
+        assert_eq!(c.stats.frames_dropped, 0, "four shards, four parity");
+        assert_eq!(c.stats.fec_recovered_shards, 4);
+        assert!(loss_ppm(&c) > 0);
 
-        let mut c = client();
+        let mut c = client(Instant::now());
         c.expect(&frame(2, 45_000, 10), 0);
         c.complete(
             2,
@@ -606,9 +540,12 @@ mod tests {
             },
             10,
         );
-        assert_eq!(c.dropped, 1, "one shard past the parity loses the frame");
         assert_eq!(
-            crate::quic::window_loss_ppm(c.repaired, 0, c.received_packets),
+            c.stats.frames_dropped, 1,
+            "one shard past the parity loses the frame"
+        );
+        assert_eq!(
+            loss_ppm(&c),
             0,
             "an unrecoverable frame teaches loss_ppm nothing"
         );
@@ -629,13 +566,13 @@ mod tests {
                 burst_len: 22,
             },
         ] {
-            let mut c = client();
+            let mut c = client(Instant::now());
             c.expect(&frame(1, 300_000, 10), 0);
             c.complete(1, draw, 5);
-            assert_eq!(c.dropped, 0, "22 of 22 parity shards");
-            assert_eq!(c.repaired, 22);
+            assert_eq!(c.stats.frames_dropped, 0, "22 of 22 parity shards");
+            assert_eq!(c.stats.fec_recovered_shards, 22);
         }
-        let mut c = client();
+        let mut c = client(Instant::now());
         c.expect(&frame(2, 300_000, 10), 0);
         c.complete(
             2,
@@ -645,21 +582,25 @@ mod tests {
             },
             5,
         );
-        assert_eq!(c.dropped, 1, "one shard past the pool loses the frame");
+        assert_eq!(
+            c.stats.frames_dropped, 1,
+            "one shard past the pool loses the frame"
+        );
     }
 
     /// The window the ceiling injection lands in is discarded, exactly as the
     /// pump discards the probe tail: no report, no verdict.
     #[test]
     fn the_probe_window_is_discarded() {
+        let base = Instant::now();
         let mut c = Client::new(
             ClientCfg {
                 ceiling_at: Some((100, 170_000)),
                 ..ClientCfg::default()
             },
             1,
+            base,
         );
-        let base = Instant::now();
         let mut out = Vec::new();
         for t in 0..=750 {
             c.tick(t, base, &mut out);
@@ -686,8 +627,8 @@ mod tests {
             20_000,
             2,
         );
-        let mut c = client();
         let base = Instant::now();
+        let mut c = client(base);
         let mut out = Vec::new();
         for t in 0..=750 {
             if let Some(f) = host.tick(t) {

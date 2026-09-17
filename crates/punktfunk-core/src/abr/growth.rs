@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn sustained_clean_recovers_toward_ceiling_only() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         assert_eq!(
             c.on_window(&WindowSample {
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn slow_start_doubles_to_a_probed_ceiling_then_stops() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         // Probe measured ~430 Mbps delivered → ×0.7 ceiling.
         c.set_ceiling(300_000);
         let start = Instant::now();
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn first_congestion_ends_slow_start_for_good() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_ceiling(300_000);
         let start = Instant::now();
         assert_eq!(
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn decode_latency_caps_the_slow_start_climb() {
         // Fat link, decoder saturates below it.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_ceiling(300_000);
         let start = Instant::now();
         // First [`BASELINE_MIN_WINDOWS`] teach the decode baseline.
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn unloaded_clean_windows_never_authorize_a_climb() {
         // Calm, under-target delivery: no climb credit.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_ceiling(300_000);
         let start = Instant::now();
         for i in 0..12 {
@@ -298,7 +298,7 @@ mod tests {
             Some(27_000)
         );
         // Zero active frames never authorizes a climb, whatever delivered claims.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_ceiling(300_000);
         c.set_frame_budget(60);
         for i in 0..12 {
@@ -320,7 +320,7 @@ mod tests {
     /// so a 35 fps source on 90 Hz is not stuck in a wall-clock dead band.
     #[test]
     fn a_frame_driven_source_climbs_at_its_own_fps() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_stream_cap(100_000);
         c.set_ceiling(60_000);
         c.set_frame_budget(90); // 11 111 µs budget → 67 expected frames / window
@@ -337,7 +337,7 @@ mod tests {
             Some(30_923)
         );
         // Under [`MIN_ACTIVE_FRAMES_TO_CLIMB`]: not utilized.
-        let mut d = BitrateController::new(20_000);
+        let mut d = BitrateController::new(20_000, None);
         d.set_stream_cap(100_000);
         d.set_ceiling(60_000);
         d.set_frame_budget(90);
@@ -357,7 +357,7 @@ mod tests {
     /// ×1.5 over the windowed proven mark.
     #[test]
     fn motion_onset_rearms_slow_start_bounded_by_the_windowed_proven() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_stream_cap(100_000);
         c.set_ceiling(60_000);
         c.set_frame_budget(60);
@@ -409,7 +409,7 @@ mod tests {
     /// Empty were credited as clean (the older-host `None` path).
     #[test]
     fn empty_windows_do_not_rearm_abr_slow_start() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_stream_cap(100_000);
         c.set_ceiling(60_000);
         c.set_frame_budget(60);
@@ -448,7 +448,7 @@ mod tests {
     /// Empty is neutral on the idle counter: it neither fills nor clears it.
     #[test]
     fn empty_windows_do_not_count_toward_idle_rearm() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_stream_cap(100_000);
         c.set_ceiling(60_000);
         c.set_frame_budget(60);
@@ -505,7 +505,7 @@ mod tests {
     /// just delivered, not the stale pre-idle mark.
     #[test]
     fn the_proven_mark_decays_with_its_buckets() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_stream_cap(100_000);
         c.set_ceiling(60_000);
         c.set_frame_budget(60);
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn slow_start_steps_stay_within_proven_headroom() {
         // Each slow-start step is ×1.5 over delivered, not a blind 2×.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_ceiling(300_000);
         let start = Instant::now();
         // Full-target delivery: proven 20 000 → cap 30 000.
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn calm_period_keeps_the_validated_target() {
         // Validated target is not surrendered when the scene goes calm.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_ceiling(300_000);
         let start = Instant::now();
         assert_eq!(

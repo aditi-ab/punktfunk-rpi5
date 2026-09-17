@@ -1,14 +1,19 @@
 //! Adaptive bitrate: the controller behind the Automatic bitrate setting.
 //!
-//! Runs in [`crate::client`]'s data-plane pump on the 750 ms cadence shared
-//! with [`crate::quic::LossReport`]. FEC absorbs short random loss; the
-//! controller asks the host for a different encoder rate via
-//! [`crate::quic::SetBitrate`] when congestion persists.
+//! [`Driver`] is the whole of it: events in — a completed AU, a stats
+//! snapshot, a latency sample, an ack — and actions out of [`Driver::tick`].
+//! An embedder owns no policy, so two clients cannot drift apart. The pump
+//! runs it on the 750 ms cadence it shares with [`crate::quic::LossReport`];
+//! FEC absorbs short random loss, and the controller asks the host for a
+//! different encoder rate via [`crate::quic::SetBitrate`] when congestion
+//! persists.
 //!
-//! One module per concern: [`sample`] is one closed report window,
-//! [`verdict`] scores it, [`cap`] holds the learned bounds, [`growth`] the
-//! climb law, and [`controller`] the state they move. `sim/` drives the real controller
-//! against modelled links and pins every decision in a checked-in baseline.
+//! One module per concern: [`window`] assembles a report window, [`sample`]
+//! is the closed window, [`verdict`] scores it, [`cap`] holds the learned
+//! bounds, [`growth`] the climb law, [`probe`] the startup capacity burst,
+//! and [`controller`] the state they all move. `sim/` drives this same
+//! `Driver` against modelled links and pins every decision in a checked-in
+//! baseline.
 
 /// The link simulator and the checked-in baseline (`abr/sim/`).
 #[cfg(test)]
@@ -19,11 +24,333 @@ mod controller;
 mod growth;
 #[cfg(test)]
 mod harness;
+mod probe;
 mod sample;
 mod verdict;
+mod window;
 
 pub(crate) use controller::BitrateController;
-pub(crate) use sample::{WindowActivity, WindowSample};
+pub(crate) use probe::ProbeReport;
+pub(crate) use sample::{WindowSample, WINDOW};
+
+use std::time::Instant;
+
+/// What the session negotiated, plus the three environment overrides. Read
+/// once, by the embedder, so nothing below the constructor touches the env.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DriverConfig {
+    /// Welcome-resolved Automatic rate, kbps. `0` = the embedder pinned a
+    /// rate or the host predates renegotiation: the controller stays off.
+    pub start_kbps: u32,
+    /// `PUNKTFUNK_ABR_MAX_MBPS` as kbps. `None` = no cap.
+    pub ceiling_cap_kbps: Option<u32>,
+    /// Stream-shape bound on every learned ceiling, for the negotiated
+    /// geometry. A mode switch recomputes it from the new one.
+    pub stream_cap_kbps: u32,
+    /// Negotiated refresh: the frame budget the latency thresholds are
+    /// sized in.
+    pub refresh_hz: u32,
+    /// Codec and sample shape, which a mode switch does not change.
+    pub codec: u8,
+    pub bit_depth: u8,
+    pub chroma_format: u8,
+    /// Audio's wire reservation, spent whether video flows or not.
+    pub audio_reserved_kbps: u32,
+    /// Host marks idle-keepalive repeats (`HOST_CAP2_REPEAT_MARK`).
+    pub marks_repeats: bool,
+    /// Run the startup capacity probe (`PUNKTFUNK_ABR_PROBE`).
+    pub probe: bool,
+    /// `PUNKTFUNK_ABR_PROBE_KBPS`. `None` = twice the stream-shape cap.
+    pub probe_target_kbps: Option<u32>,
+}
+
+/// What the embedder has to do for the controller. Everything else it does
+/// with a window — jump-to-live, standing latency, the frame hand-off — is
+/// its own business.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// Shard loss this window, ppm: the host's adaptive-FEC input.
+    Loss(u32),
+    /// Session total packets received. The host escalates on a dead plane.
+    Delivery(u64),
+    /// Ask the host for a new encoder rate.
+    SetBitrate(u32),
+    /// Ask for a capacity burst beside the video.
+    Probe { target_kbps: u32, duration_ms: u32 },
+    /// Ask for a keyframe: the picture needs re-anchoring.
+    Keyframe,
+    /// Let the in-flight probe go — it was never answered. Reports resume.
+    AbandonProbe,
+}
+
+/// One pump iteration's worth of decisions.
+pub(crate) struct Tick {
+    /// In the order they should go out.
+    pub actions: Vec<Action>,
+    /// `Some` when the report window closed on this tick.
+    pub window: Option<ClosedWindow>,
+}
+
+/// The report window that just closed, for an embedder that has its own
+/// per-window duties.
+pub(crate) struct ClosedWindow {
+    /// What the controller judged — or would have, had the window stood.
+    pub sample: WindowSample,
+    /// The window described a burst tail or a host rebuild, not the link.
+    pub discarded: bool,
+    /// It delivered everything the link was asked for: no loss, no lost
+    /// frame, and not discarded. A standing-latency detector needs exactly
+    /// that.
+    pub loss_free: bool,
+}
+
+/// Automatic bitrate, whole: the window the embedder feeds, the controller
+/// that judges it, and the startup capacity probe.
+pub(crate) struct Driver {
+    abr: BitrateController,
+    window: window::WindowAccumulator,
+    probe: probe::CapacityProbe,
+    /// A mode switch changes the geometry, not these.
+    codec: u8,
+    bit_depth: u8,
+    chroma_format: u8,
+    /// Raised between ticks (a probe ended, a burst was abandoned) and sent
+    /// on the next one, microseconds later.
+    pending: Vec<Action>,
+    /// Acks since the last window closed.
+    acks: Vec<u32>,
+}
+
+impl Driver {
+    pub(crate) fn new(cfg: DriverConfig, now: Instant) -> Self {
+        let mut abr = BitrateController::new(cfg.start_kbps, cfg.ceiling_cap_kbps);
+        // Bound the probe by stream shape, not raw link capacity: a fat LAN
+        // otherwise licenses rates no inter-coded stream can use.
+        abr.set_stream_cap(cfg.stream_cap_kbps);
+        // Encode thresholds in this session's frame budgets, not the 120 Hz
+        // durations they were calibrated at.
+        abr.set_frame_budget(cfg.refresh_hz);
+        Driver {
+            abr,
+            window: window::WindowAccumulator::new(cfg.audio_reserved_kbps, cfg.marks_repeats, now),
+            // A pinned or explicit rate has nothing to measure for.
+            probe: probe::CapacityProbe::new(
+                cfg.probe && cfg.start_kbps > 0,
+                cfg.probe_target_kbps,
+                cfg.stream_cap_kbps,
+                now,
+            ),
+            codec: cfg.codec,
+            bit_depth: cfg.bit_depth,
+            chroma_format: cfg.chroma_format,
+            pending: Vec::new(),
+            acks: Vec::new(),
+        }
+    }
+
+    /// The session counters, once per embedder iteration.
+    pub(crate) fn on_stats(&mut self, st: &crate::stats::Stats) {
+        self.window.on_stats(st);
+    }
+
+    /// One completed access unit; `repeat` is the host's idle keepalive mark.
+    pub(crate) fn on_au(&mut self, repeat: bool) {
+        self.window.on_au(repeat);
+    }
+
+    /// Capture → received for one AU, ns.
+    pub(crate) fn on_owd(&mut self, ns: i128) {
+        self.window.on_owd(ns);
+    }
+
+    /// The window's client decode-stage total and its sample count.
+    pub(crate) fn on_decode_latency(&mut self, sum_us: u64, count: u32) {
+        self.window.on_decode_latency(sum_us, count);
+    }
+
+    /// The window's host encode-stage total and its sample count.
+    pub(crate) fn on_encode_latency(&mut self, sum_us: u64, count: u32) {
+        self.window.on_encode_latency(sum_us, count);
+    }
+
+    /// Decode-recovery keyframe asks that went out.
+    pub(crate) fn on_keyframe_asks(&mut self, n: u32) {
+        self.window.on_keyframe_asks(n);
+    }
+
+    /// A jump-to-live: the client could not hold the rate.
+    pub(crate) fn on_flush(&mut self) {
+        self.window.on_flush();
+    }
+
+    /// The host rebuilt its pipeline. The window in flight describes the gap,
+    /// not the link — drop it. A gap that straddled a boundary already fed the
+    /// previous window; holding every window back would be a permanent lag.
+    pub(crate) fn on_pipeline_gap(&mut self, gap_ms: u32) {
+        self.discard_window();
+        tracing::debug!(
+            gap_ms,
+            window_ms = self.window.open_ms(),
+            "host pipeline gap — the report window in flight is discarded"
+        );
+    }
+
+    /// Host [`crate::quic::BitrateChanged`], in arrival order. Applied when
+    /// the window closes: the rate the controller judges a window against is
+    /// the one that was running for it.
+    pub(crate) fn on_ack(&mut self, kbps: u32) {
+        self.acks.push(kbps);
+    }
+
+    /// A [`Action::SetBitrate`] that never reached the host.
+    pub(crate) fn on_request_dropped(&mut self, kbps: u32) {
+        self.abr.on_request_dropped();
+        tracing::warn!(
+            kbps,
+            "adaptive bitrate: control queue full — re-target dropped"
+        );
+    }
+
+    /// A [`Action::Probe`] that never reached the host.
+    pub(crate) fn on_probe_dropped(&mut self) {
+        self.probe.on_dropped();
+    }
+
+    /// The accepted mode changed. Encoder and decoder knees and the rolling
+    /// baselines are properties of the mode; the probe-measured link ceiling
+    /// is not, and survives.
+    pub(crate) fn on_mode_switch(&mut self, width: u32, height: u32, refresh_hz: u32) {
+        self.abr.on_mode_switch();
+        self.abr.set_frame_budget(refresh_hz);
+        // Rebinds an already-learned ceiling downward for the new geometry.
+        self.abr.set_stream_cap(stream_ceiling_kbps(
+            width,
+            height,
+            refresh_hz,
+            self.codec,
+            self.bit_depth,
+            self.chroma_format,
+        ));
+    }
+
+    /// A burst went in or out of flight — ours or an embedder speed test.
+    ///
+    /// The burst lands in the packet and byte counters but never in the
+    /// decoder, so its end rebases every anchor past it and the window it
+    /// straddled is discarded. A burst that took the keyframe with it is
+    /// followed by an ask for a new one.
+    pub(crate) fn on_probe_active(&mut self, active: bool, duration_ms: u32, now: Instant) {
+        let frames_completed = self.window.stats().frames_completed;
+        let Some(frames_at_start) =
+            self.probe
+                .on_active(active, duration_ms, frames_completed, now)
+        else {
+            return;
+        };
+        self.window.rebase(now);
+        if frames_completed == frames_at_start {
+            self.pending.push(Action::Keyframe);
+            tracing::warn!(
+                "no frame survived the capacity probe — requested a keyframe to re-anchor"
+            );
+        }
+    }
+
+    /// The host's end-of-burst report.
+    pub(crate) fn on_probe_result(&mut self, r: ProbeReport) {
+        if let Some(kbps) = self.probe.on_result(r) {
+            self.set_ceiling(kbps);
+        }
+        // Skips video that landed under a suppressed report tick; `rebase`
+        // already netted the filler out.
+        self.window.rebase_bytes();
+    }
+
+    /// A measured link capacity. Never lowers the climb ceiling: a
+    /// congested-moment measurement must not shrink what was negotiated.
+    pub(crate) fn set_ceiling(&mut self, kbps: u32) {
+        self.abr.set_ceiling(kbps);
+    }
+
+    /// This window describes something other than the link.
+    pub(crate) fn discard_window(&mut self) {
+        self.window.discard();
+    }
+
+    /// Everything the session owes right now. Called every embedder
+    /// iteration; the report window closes inside it, on its own cadence.
+    pub(crate) fn tick(&mut self, now: Instant) -> Tick {
+        let mut actions = std::mem::take(&mut self.pending);
+        if self.probe.expired(now) {
+            actions.push(Action::AbandonProbe);
+        }
+        if let Some((target_kbps, duration_ms)) =
+            self.probe.poll(now, self.window.stats().frames_completed)
+        {
+            actions.push(Action::Probe {
+                target_kbps,
+                duration_ms,
+            });
+        }
+        if !self.window.due(now, self.probe.active()) {
+            return Tick {
+                actions,
+                window: None,
+            };
+        }
+        let closed = self.window.close(now);
+        // The host's answers to what this window's predecessors asked for,
+        // learned before the controller judges this one.
+        for kbps in std::mem::take(&mut self.acks) {
+            self.abr.on_ack(kbps);
+        }
+        let w = &closed.sample;
+        if closed.discarded {
+            // The loss report goes with the window: a probe tail would spike
+            // host FEC off deliberate overload, and a rebuild window has a
+            // near-zero denominator.
+            tracing::debug!(
+                loss_ppm = w.loss_ppm,
+                window_dropped = w.dropped,
+                "discarding this ABR window (probe tail or a host pipeline gap)"
+            );
+        } else {
+            actions.push(Action::Loss(w.loss_ppm));
+            // Delivery rides the loss report so `loss_ppm = 0` is readable:
+            // flawless, or delivering nothing.
+            if let Some(packets_received) = closed.delivery {
+                actions.push(Action::Delivery(packets_received));
+            }
+            if let Some(kbps) = self.abr.on_window(w) {
+                // Log the window's signals with the decision, so decode- and
+                // encode-driven retargets are separable from network ones.
+                tracing::info!(
+                    kbps,
+                    loss_ppm = w.loss_ppm,
+                    owd_mean_us = w.owd_mean_us.unwrap_or(-1),
+                    decode_mean_us = w.decode_mean_us.unwrap_or(-1),
+                    encode_mean_us = w.encode_mean_us.unwrap_or(-1),
+                    actual_kbps = w.actual_kbps,
+                    flushed = w.flushed,
+                    recovery_kf = w.recovery_kf,
+                    reason = ?self.abr.last_reason(),
+                    "adaptive bitrate: requesting encoder re-target"
+                );
+                actions.push(Action::SetBitrate(kbps));
+            }
+        }
+        Tick {
+            actions,
+            window: Some(ClosedWindow {
+                // A discarded window is NOT loss-free: probe residue is not
+                // evidence of anything.
+                loss_free: !closed.discarded && w.loss_ppm == 0 && w.dropped == 0,
+                sample: closed.sample,
+                discarded: closed.discarded,
+            }),
+        }
+    }
+}
 
 /// Upper bound on bitrate this stream's shape could use, in kbps.
 ///

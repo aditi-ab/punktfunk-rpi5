@@ -888,7 +888,7 @@ mod tests {
     fn the_startup_probe_sets_a_ceiling_from_what_it_delivered() {
         let sc = lan_1g();
         let cap = stream_ceiling_kbps(3840, 2160, 120, CODEC_HEVC, 8, 0);
-        let target = super::super::client::probe_target_kbps(cap);
+        let target = crate::abr::probe::probe_target_kbps(cap);
         assert_eq!(target, 1_492_992, "twice the 4K120 stream cap");
         let want = (1_000_000u64.min(u64::from(target)) * 7 / 10).min(u64::from(cap)) as u32;
         let r = run(&sc);

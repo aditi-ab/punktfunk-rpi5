@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn two_identical_short_acks_latch_the_host_cap() {
         // Two identical short acks latch the host cap; climbs stop poking it.
-        let mut c = BitrateController::new(400_000);
+        let mut c = BitrateController::new(400_000, None);
         c.set_ceiling(1_400_000);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn one_short_ack_is_a_transient_not_a_cap() {
         // One short ack (failed rebuild) must not latch.
-        let mut c = BitrateController::new(400_000);
+        let mut c = BitrateController::new(400_000, None);
         c.set_ceiling(1_400_000);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn mode_switch_clears_the_learned_cap() {
-        let mut c = BitrateController::new(400_000);
+        let mut c = BitrateController::new(400_000, None);
         c.set_ceiling(1_400_000);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn learned_cap_reprobes_after_a_sustained_clean_run() {
         // After a clean run parked at the cap, lift one step.
-        let mut c = BitrateController::new(400_000);
+        let mut c = BitrateController::new(400_000, None);
         c.set_ceiling(1_400_000);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn a_transient_refusal_does_not_pin_the_session() {
         // Transient cadence refusal at the start rate must not pin the session.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_ceiling(300_000);
         let start = Instant::now();
         let mut tick = 0u32;
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn a_standing_cap_backs_its_reprobe_clock_off() {
         // Standing encoder ceiling: each re-learn doubles the re-probe interval.
-        let mut c = BitrateController::new(400_000);
+        let mut c = BitrateController::new(400_000, None);
         c.set_ceiling(1_400_000);
         let start = Instant::now();
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn a_stood_down_encode_signal_re_arms_after_a_clean_run() {
         // Stand-down is evidence: a clean run must re-arm the encode signal.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         let mut tick = 0;
         disarm_encode(&mut c, start, &mut tick);
@@ -356,7 +356,7 @@ mod tests {
     fn a_standing_contention_backs_the_re_arm_clock_off() {
         // Re-silenced after re-arm: standing, so the clock doubles. Start
         // high enough that two ratchets stay above [`FLOOR_KBPS`].
-        let mut c = BitrateController::new(200_000);
+        let mut c = BitrateController::new(200_000, None);
         let start = Instant::now();
         let mut tick = 0;
         disarm_encode(&mut c, start, &mut tick);
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn a_bad_window_restarts_the_re_arm_run() {
         // A spoiled window says nothing about the encoder; restart the run.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         let mut tick = 0;
         disarm_encode(&mut c, start, &mut tick);
@@ -399,7 +399,7 @@ mod tests {
     fn unactuatable_encode_rises_disarm_the_down_driver() {
         // GPU contention holds encode time up; `on_ack` re-seeds the baseline,
         // so only the firing level notices the backoffs are no-ops.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         let mut tick = 0;
 
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn an_encode_backoff_that_helps_keeps_the_down_driver_armed() {
         // ×0.7 that actually drops encode time must not disarm.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         let mut tick = 0;
         assert_eq!(encode_choke(&mut c, start, &mut tick, 40_000), Some(14_000));
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn a_network_driven_backoff_breaks_the_encode_streak() {
         // Network distress with elevated encode time must not count toward disarm.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         let mut tick = 0;
         assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(14_000));
@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn capture_stall_windows_never_latch_a_decode_cap() {
         // Repeated stall-shaped backoffs at the same rate must not latch a knee.
-        let mut c = BitrateController::new(240_000);
+        let mut c = BitrateController::new(240_000, None);
         c.set_ceiling(900_000);
         let start = Instant::now();
         let mut t = 0;
@@ -515,7 +515,7 @@ mod tests {
     #[test]
     fn starved_window_preserves_the_knee_reference() {
         // Real knee, then stall, then re-climb choke: stall neither latches nor erases.
-        let mut c = BitrateController::new(500_000);
+        let mut c = BitrateController::new(500_000, None);
         c.set_ceiling(900_000);
         let start = Instant::now();
         let mut t = 0;
@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn decode_cap_latches_when_the_reclimb_chokes_at_the_same_knee() {
         // Choke, recover, re-climb, choke inside the band: latch.
-        let mut c = BitrateController::new(500_000);
+        let mut c = BitrateController::new(500_000, None);
         c.set_ceiling(900_000);
         let start = Instant::now();
         let mut t = 0;
@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn a_single_flush_or_dissimilar_backoffs_never_latch_a_decode_cap() {
         // Lone flush at a climbed-to rate backs off but teaches nothing…
-        let mut c = BitrateController::new(500_000);
+        let mut c = BitrateController::new(500_000, None);
         c.set_ceiling(900_000);
         let start = Instant::now();
         let mut t = 0;
@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn decode_cap_reprobes_after_a_sustained_clean_run() {
         // After a clean run parked at the cap, lift +12.5 %.
-        let mut c = BitrateController::new(500_000);
+        let mut c = BitrateController::new(500_000, None);
         c.set_ceiling(900_000);
         let start = Instant::now();
         let mut t = 0;
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn mode_switch_clears_the_decode_cap() {
         // Decode cap is mode-scoped; probe-measured link ceiling survives.
-        let mut c = BitrateController::new(500_000);
+        let mut c = BitrateController::new(500_000, None);
         c.set_ceiling(900_000);
         let start = Instant::now();
         let mut t = 0;
@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn ordinary_decode_bad_window_pairs_latch_the_knee_field_trace() {
         // Ordinary two-window decode rise (15–45 ms) must latch, not reset the streak.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_ceiling(657_788);
         let start = Instant::now();
         let mut t = 0;
@@ -754,7 +754,7 @@ mod tests {
     fn cascade_backoffs_neither_sample_nor_erase_the_knee_reference() {
         // Drain backoff at the already-reduced rate must neither latch nor
         // erase; the re-climb choke latches against the original sample.
-        let mut c = BitrateController::new(500_000);
+        let mut c = BitrateController::new(500_000, None);
         c.set_ceiling(900_000);
         let start = Instant::now();
         let mut t = 0;
@@ -795,7 +795,7 @@ mod tests {
     #[test]
     fn keyframe_storms_on_a_clean_link_latch_the_knee() {
         // Kf-storm on a clean link (no decode latency) is decode evidence.
-        let mut c = BitrateController::new(300_000);
+        let mut c = BitrateController::new(300_000, None);
         c.set_ceiling(900_000);
         let start = Instant::now();
         let mut t = 0;
@@ -832,7 +832,7 @@ mod tests {
     #[test]
     fn keyframe_storms_with_real_loss_teach_no_knee() {
         // Same storm with heavy loss is network-attributed: reset, no latch.
-        let mut c = BitrateController::new(300_000);
+        let mut c = BitrateController::new(300_000, None);
         c.set_ceiling(900_000);
         let start = Instant::now();
         let mut t = 0;
@@ -873,7 +873,7 @@ mod tests {
     #[test]
     fn a_mixed_streak_without_decode_attribution_is_no_knee_evidence() {
         // Mixed streak (one OWD, one decode): not a knee sample.
-        let mut c = BitrateController::new(500_000);
+        let mut c = BitrateController::new(500_000, None);
         c.set_ceiling(900_000);
         let start = Instant::now();
         let mut t = 0;

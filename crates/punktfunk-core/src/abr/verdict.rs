@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn owd_rise_alone_is_a_congestion_signal() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         // ~10 ms OWD baseline.
         for i in 0..4 {
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn decode_latency_rise_alone_is_a_congestion_signal() {
         // Pristine link; only decode latency is rising.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         // ~8 ms decode baseline.
         for i in 0..4 {
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn keyframe_ask_storm_alone_is_a_congestion_signal() {
         // Pristine link, no latency signal, two kf asks per window: ordinary-bad.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         assert_eq!(
             c.on_window(&WindowSample {
@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn keyframe_ask_saturation_is_severe() {
         // Emitters throttle at 100 ms: 4+ asks in 750 ms is severe.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         assert_eq!(
             c.on_window(&WindowSample {
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn a_single_keyframe_ask_is_not_congestion() {
         // One kf ask is not congestion, even in a row.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         for i in 0..4 {
             assert_eq!(
@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn one_calm_window_is_not_a_baseline() {
         // Our own decrease clears the encode baseline. One sample must not arm.
-        let mut c = BitrateController::new(100_000);
+        let mut c = BitrateController::new(100_000, None);
         let start = Instant::now();
         // One 3 ms seed, then 12 ms: past [`ENCODE_RISE_US`], but no baseline yet.
         for i in 0..BASELINE_MIN_WINDOWS as u32 {
@@ -450,7 +450,7 @@ mod tests {
     fn idle_windows_train_no_baselines() {
         let start = Instant::now();
         let run = |marking: bool| -> Option<u32> {
-            let mut c = BitrateController::new(20_000);
+            let mut c = BitrateController::new(20_000, None);
             c.set_ceiling(300_000);
             c.set_frame_budget(60);
             // A host that marks repeats reports the new-content count; an
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn deep_decode_excursion_is_severe() {
         // Decode rise >45 ms is already overload: one window.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         for i in 0..4 {
             assert_eq!(
@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn host_encode_latency_rise_backs_off() {
         // Only host encode time moves: two risen windows → ×0.7.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         for i in 0..4 {
             assert_eq!(
@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn deep_encode_excursion_is_severe() {
         // ≈1.5 frame budgets over baseline: severe, one window.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         for i in 0..4 {
             assert_eq!(
@@ -596,7 +596,7 @@ mod tests {
     #[test]
     fn rate_decrease_rebases_the_encode_baseline() {
         // Our own decrease must rebase encode; old baseline would train-fire.
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         let start = Instant::now();
         for i in 0..4 {
             let _ = c.on_window(&WindowSample {
@@ -641,7 +641,7 @@ mod tests {
         // Same physical hiccup: severe at 120 Hz, ordinary at 60 Hz when
         // thresholds follow the session frame budget.
         let excursion = 23_700; // 7 ms baseline + ~one 60 Hz frame
-        let mut hz120 = BitrateController::new(20_000);
+        let mut hz120 = BitrateController::new(20_000, None);
         hz120.set_frame_budget(120);
         let mut tick = 0;
         let start = Instant::now();
@@ -651,7 +651,7 @@ mod tests {
             "at 120 Hz that is ~2.8 frame budgets over baseline — severe, one window"
         );
 
-        let mut hz60 = BitrateController::new(20_000);
+        let mut hz60 = BitrateController::new(20_000, None);
         hz60.set_frame_budget(60);
         let mut tick = 0;
         assert_eq!(
@@ -676,9 +676,9 @@ mod tests {
     fn decode_thresholds_follow_the_frame_budget() {
         // +6 000 µs over the baseline: half a 120 Hz budget (4 166) is a rise,
         // the 15 ms no-budget default is not.
-        let mut hz120 = BitrateController::new(100_000);
+        let mut hz120 = BitrateController::new(100_000, None);
         hz120.set_frame_budget(120);
-        let mut plain = BitrateController::new(100_000);
+        let mut plain = BitrateController::new(100_000, None);
         let start = Instant::now();
         for i in 0..5 {
             assert_eq!(loaded(&mut hz120, ticks(start, i), 3_000), None);
@@ -695,7 +695,7 @@ mod tests {
     /// backs off.
     #[test]
     fn a_starved_window_cannot_back_off_on_host_encode_time_alone() {
-        let mut c = BitrateController::new(20_000);
+        let mut c = BitrateController::new(20_000, None);
         c.set_ceiling(657_000);
         let start = Instant::now();
         let mut t = 0;

@@ -136,7 +136,10 @@ fn run(sc: &Scenario) -> Run {
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let mut client = Client::new(s.client.clone(), sc.seed ^ (0x51_u64 << (i * 8)));
+            // A session's clock starts when it joins, not when the run does:
+            // its first report window is 750 ms after its first frame.
+            let joined = base + std::time::Duration::from_millis(s.join_ms);
+            let mut client = Client::new(s.client.clone(), sc.seed ^ (0x51_u64 << (i * 8)), joined);
             if let Some(at) = sc.blip_at_ms {
                 if i == 0 {
                     client.inject_lost_frame(at);

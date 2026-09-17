@@ -3,11 +3,11 @@ lan_10g	0	17	10	10	1	0	28	1000	b568b6a9
 lan_1g	0	15	10	20	6	0	28	1000	15df014a
 wifi_good	0	0	8	8	2	0	28	1000	ad273bfb
 wifi_tv	0	20	0	0	3	0	0	1000	7ab0d754
-wan_wg_12	2	0	26	400	56	20117	0	1000	c9b8f7ee
+wan_wg_12	2	0	26	393	56	20186	0	1000	c9b8f7ee
 lte_variable	75	0	36	2526	249	1141	0	1000	40738750
-shared_two_auto	22	0	32	560	53	45704	0	1000	57e31b2d
-shared_newcomer	57	0	40	672	238	14419	0	977	027c753b
-shared_fixed_plus_auto	52	0	32	532	67	40891	0	963	e266fcd3
+shared_two_auto	22	0	32	560	53	45843	0	1000	57e31b2d
+shared_newcomer	57	0	36	2348	473	14419	0	951	33dfabb0
+shared_fixed_plus_auto	52	0	32	532	67	31585	0	963	e266fcd3
 gpu_saturated	0	9	27	0	4	0	0	1000	6ef00794
 static_then_motion	0	11	0	0	5	0	0	1000	3663f398
 frame_driven_35fps	0	9	0	0	5	0	0	1000	baf45490

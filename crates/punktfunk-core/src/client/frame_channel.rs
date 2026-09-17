@@ -66,7 +66,7 @@ pub const NO_VIDEO_RETRY: Duration = Duration::from_millis(2600);
 /// One adaptive-FEC / ABR report window. A window the client discards (probe
 /// tail, host pipeline gap) sends no [`crate::quic::LossReport`], so the host
 /// reads a report later than this by a window as a discard, not jitter.
-pub const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
+pub const ADAPT_REPORT_INTERVAL: Duration = crate::abr::WINDOW;
 
 /// A clock-triggered jump that discarded fewer datagrams than this (and no queued
 /// AUs) found no local backlog. Flushing helps neither a wall-clock step (NTP
