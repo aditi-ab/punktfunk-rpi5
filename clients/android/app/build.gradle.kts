@@ -12,6 +12,9 @@ plugins {
 android {
     namespace = "io.unom.punktfunk"
     compileSdk = 37 // Android 17 — required by androidx.core 1.19.0.
+    // The NDK whose llvm-strip strips the packaged .so. Unset, AGP looks for its own default
+    // NDK and packages the library unstripped when that one is not installed.
+    ndkVersion = providers.gradleProperty("punktfunk.ndkVersion").get()
 
     defaultConfig {
         // Load from .env if it exists (local dev), otherwise from System.getenv (CI)
@@ -82,6 +85,9 @@ android {
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.getByName("release")
+            // The stripped .symtab rides in the AAB for Play and in native-debug-symbols.zip.
+            // FULL keeps all of it without the code; the release profile emits no DWARF.
+            ndk { debugSymbolLevel = "FULL" }
         }
     }
 
@@ -107,6 +113,11 @@ android {
 }
 
 kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_21) } }
+
+// Debug APKs keep the .so symbol table, so a dev build's tombstone names its frames.
+androidComponents {
+    onVariants(selector().withBuildType("debug")) { it.packaging.jniLibs.keepDebugSymbols.add("**/*.so") }
+}
 
 dependencies {
     implementation(project(":kit"))

@@ -9,7 +9,7 @@ plugins {
     id("com.android.library")
 }
 
-val ndkVer = "30.0.14904198" // r30-beta1 — matches the SDK NDK installed for cargo-ndk
+val ndkVer = providers.gradleProperty("punktfunk.ndkVersion").get() // gradle.properties
 
 android {
     namespace = "io.unom.punktfunk.kit"
