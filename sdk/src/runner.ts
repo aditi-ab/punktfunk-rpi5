@@ -29,7 +29,7 @@ import type { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { PunktfunkHost } from "./client.js";
 import { layer as hostLayer } from "./effect.js";
-import { type ConnectOptions, configDir, publishedMgmtUrl } from "./config.js";
+import { type ConnectOptions, configDir, hostFetch, publishedMgmtUrl } from "./config.js";
 import { connect, type PluginDef } from "./index.js";
 import {
 	bwrapArgv,
@@ -493,10 +493,15 @@ const runSandboxed = (
 		}
 		const runtime = process.env.XDG_RUNTIME_DIR ?? "/tmp";
 		const socket = path.join(runtime, "punktfunk", `plugin-${id}.sock`);
+		const url = options.connect?.url ?? publishedMgmtUrl() ?? "https://127.0.0.1:47990";
+		// The host's cert is self-signed: a bare `fetch` fails TLS and every plugin 502s at connect.
+		const pinned = options.sandboxFetch
+			? Promise.resolve(options.sandboxFetch)
+			: hostFetch(url, options.connect);
 		const proxy = serveHostProxy({
 			socket,
-			url: options.connect?.url ?? publishedMgmtUrl() ?? "https://127.0.0.1:47990",
-			fetch: options.sandboxFetch ?? fetch,
+			url,
+			fetch: ((input, init) => pinned.then((f) => f(input, init))) as typeof fetch,
 		});
 		const argv = [
 			...bwrapArgv(
