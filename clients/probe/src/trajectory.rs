@@ -151,7 +151,7 @@ fn ramp_json(r: &punktfunk_core::abr::RampRecord) -> String {
     for s in &r.steps {
         out.push_str(&format!(
             concat!(
-                r#"{{"ramp_step":{},"t_ms":{},"asked_kbps":{},"asked_bytes":{},"#,
+                r#"{{"ramp_step":{},"t_ms":{},"repeat":{},"asked_kbps":{},"asked_bytes":{},"#,
                 r#""host_bytes_sent":{},"offered_packets":{},"delivered_packets":{},"#,
                 r#""delivered_bytes":{},"client_interval_ms":{},"host_duration_ms":{},"#,
                 r#""send_dropped":{},"verdict":"{:?}"}}"#,
@@ -160,6 +160,7 @@ fn ramp_json(r: &punktfunk_core::abr::RampRecord) -> String {
             ),
             out.lines().count() + 1,
             s.t_ms,
+            s.repeat,
             s.target_kbps,
             s.asked_bytes,
             s.host_bytes_sent,
