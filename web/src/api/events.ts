@@ -38,6 +38,7 @@ import {
 	getListPendingDevicesQueryKey,
 } from "@/api/gen/native/native";
 import { getGetPairingStatusQueryKey } from "@/api/gen/pairing/pairing";
+import { getGetPluginAccessQueryKey } from "@/api/gen/plugin-access/plugin-access";
 import { getGetRecentSessionsQueryKey } from "@/api/gen/session/session";
 import { getGetUpdateStatusQueryKey } from "@/api/gen/update/update";
 import { boostPluginPolling, PLUGINS_KEY } from "@/api/plugins";
@@ -47,8 +48,8 @@ import { type ActivityEntry, mergeActivity } from "./activity-ring";
 
 export type { ActivityEntry } from "./activity-ring";
 
-/** Which query keys a given event kind invalidates. Unknown kinds are ignored on purpose.
- * (The generated key helpers return `readonly` tuples, which is what React Query wants.) */
+/** Snapshots invalidated by one event kind. `plugins.changed` also refreshes folder access;
+ * unknown kinds stay ignored, and generated helpers supply React Query's readonly keys. */
 function keysFor(kind: string): readonly (readonly unknown[])[] {
 	const status = [getGetStatusQueryKey()];
 	switch (kind) {
@@ -93,8 +94,15 @@ function keysFor(kind: string): readonly (readonly unknown[])[] {
 		case "update.available":
 		case "update.applied":
 			return [getGetUpdateStatusQueryKey()];
-		// A plugin install/uninstall moves the nav, the catalog, and the installed list.
+		// Registration and folder-access changes move plugin views; store changes move packages.
 		case "plugins.changed":
+			return [
+				PLUGINS_KEY,
+				storeKeys.catalog,
+				storeKeys.installed,
+				storeKeys.runtime,
+				getGetPluginAccessQueryKey(),
+			];
 		case "store.changed":
 			return [
 				PLUGINS_KEY,

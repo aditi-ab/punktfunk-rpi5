@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot";
 import { GameForm } from "@/sections/Library/GameForm";
 import { LibraryGrid } from "@/sections/Library/LibraryGrid";
 import { MigrationBanner, SourcesCard } from "@/sections/Library/Sources";
@@ -150,6 +151,37 @@ const sourcesArgs = {
 	onInstall: noop,
 };
 
+const STEAM_SOURCE = {
+	id: "steam",
+	label: "Steam",
+	enabled: true,
+	origin: "plugin" as const,
+	provider: "steam",
+	entries: 7,
+};
+
+const steamAccess = (write = false): PluginAccessSnapshot[] => [
+	{
+		plugin: "steam",
+		grants: [],
+		pending: [
+			{
+				path: "/mnt/games1",
+				write,
+				reason: "Steam library folder",
+				at: "2026-09-18T12:00:00Z",
+			},
+			{
+				path: "/mnt/games2",
+				write: false,
+				reason: "Steam library folder",
+				at: "2026-09-18T12:00:01Z",
+			},
+		],
+		denied: [],
+	},
+];
+
 /** The bridge-release shape: built-in scanners only, one turned off. */
 export const Sources: Story = {
 	render: () => (
@@ -202,6 +234,30 @@ export const SourcesWithPlugins: Story = {
 			available={[
 				catalogEntry({ pkg: "@punktfunk/plugin-heroic", title: "Heroic" }),
 			]}
+		/>
+	),
+};
+
+export const SourcePendingReadAccess: Story = {
+	render: () => (
+		<SourcesCard
+			{...sourcesArgs}
+			sources={[STEAM_SOURCE]}
+			running={new Set(["steam"])}
+			access={steamAccess()}
+			accessInitiallyOpen
+		/>
+	),
+};
+
+export const SourcePendingWriteAccess: Story = {
+	render: () => (
+		<SourcesCard
+			{...sourcesArgs}
+			sources={[STEAM_SOURCE]}
+			running={new Set(["steam"])}
+			access={steamAccess(true)}
+			accessInitiallyOpen
 		/>
 	),
 };

@@ -17,6 +17,7 @@ import {
 	useListLibraryScanners,
 	useSetLibraryScanner,
 } from "@/api/gen/library/library";
+import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot";
 import type { ScannerInfo } from "@/api/gen/model/scannerInfo";
 import { usePlugins } from "@/api/plugins";
 import {
@@ -31,24 +32,14 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { apiErrorMessage } from "@/lib/errors";
 import { m } from "@/paraglide/messages";
+import { PendingAccess, usePluginAccess } from "@/sections/PluginAccess";
 import { SourceSettingsDialog } from "./SourceSettings";
 
 /**
- * **Game sources** — the single surface for "where do my games come from", merging what used to be
- * two cards (the scanner toggles and the "synced by plugins" list).
- *
- * They were split because they were different things: scanners were compiled into the host and
- * plugins were an afterthought. After the extraction they are the *same* thing — the host reports
- * one list of sources whose ids match whether they came from a built-in scanner or the plugin that
- * replaced it — so one surface is both simpler and the only honest presentation (design D6).
- *
- * A host from v0.28.0 on has no built-in scanners left and reports every source as `plugin`. The
- * `builtin` handling below is kept deliberately: the console ships as its own package and is
- * expected to drive an N-1 host, which still reports them.
- *
- * Deliberately kept under the existing "Game sources" label rather than a new "Plugins" heading:
- * `store_title` and `nav_plugins` are both already "Plugins", and a third would be worse than the
- * merge is good.
+ * Game sources: enablement, liveness, counts, actions, and pending folder access in one list.
+ * A pending request appears here because this is where missing games are visible; decisions update
+ * the shared access snapshot. N-1 hosts may still report built-in scanners, so migration controls
+ * remain beside plugin sources until those hosts age out.
  */
 export const SourcesSection: FC<{
 	/** The provider currently filtered to in the grid, or null for "everything". */
@@ -63,6 +54,7 @@ export const SourcesSection: FC<{
 	const plugins = usePlugins();
 	const catalog = useStoreCatalog();
 	const install = useInstallPlugin();
+	const access = usePluginAccess();
 	const [settingsFor, setSettingsFor] = useState<ScannerInfo | null>(null);
 	const nameOf = useSourceNames();
 
@@ -181,6 +173,9 @@ export const SourcesSection: FC<{
 				onSettings={setSettingsFor}
 				onPurge={onPurge}
 				onInstall={onInstall}
+				access={access.access.data}
+				accessBusy={access.busy}
+				onAccessDecision={access.onDecide}
 			/>
 			{settingsFor && (
 				<SourceSettingsDialog
@@ -235,7 +230,7 @@ export const MigrationBanner: FC<{
 	</Card>
 );
 
-/** The sources card itself — presentational, so Storybook can drive every state. */
+/** Presentational source list, including deterministic pending-access states for Storybook. */
 export const SourcesCard: FC<{
 	sources: ScannerInfo[];
 	/** Catalog rows offering a library source that isn't installed yet. */
@@ -251,6 +246,14 @@ export const SourcesCard: FC<{
 	onSettings: (source: ScannerInfo) => void;
 	onPurge: (source: ScannerInfo) => void;
 	onInstall: (entry: StoreEntry) => void;
+	access?: PluginAccessSnapshot[];
+	accessBusy?: boolean;
+	accessInitiallyOpen?: boolean;
+	onAccessDecision?: (
+		plugin: string,
+		paths: string[],
+		decision: "allow" | "deny" | "forget",
+	) => void;
 }> = ({
 	sources,
 	available,
@@ -263,6 +266,10 @@ export const SourcesCard: FC<{
 	onSettings,
 	onPurge,
 	onInstall,
+	access = [],
+	accessBusy = false,
+	accessInitiallyOpen = false,
+	onAccessDecision = () => {},
 }) => (
 	<Card>
 		<CardHeader className="pb-3">
@@ -278,6 +285,12 @@ export const SourcesCard: FC<{
 						key={source.id}
 						source={source}
 						running={running.has(source.provider ?? source.id)}
+						access={access.find(
+							(row) => row.plugin === (source.provider ?? source.id),
+						)}
+						accessBusy={accessBusy}
+						accessInitiallyOpen={accessInitiallyOpen}
+						onAccessDecision={onAccessDecision}
 						busy={busyId === source.id}
 						filtered={
 							activeFilter !== null &&
@@ -329,11 +342,19 @@ export const SourcesCard: FC<{
 	</Card>
 );
 
-/** One source row: enable toggle, provenance, counts, and its per-source actions. */
+/** One source row with its controls and the expandable folder requests that explain missing games. */
 const SourceRow: FC<{
 	source: ScannerInfo;
 	/** The plugin backing this source is currently registered (its lease is live). */
 	running: boolean;
+	access?: PluginAccessSnapshot;
+	accessBusy: boolean;
+	accessInitiallyOpen: boolean;
+	onAccessDecision: (
+		plugin: string,
+		paths: string[],
+		decision: "allow" | "deny" | "forget",
+	) => void;
 	busy: boolean;
 	filtered: boolean;
 	onToggle: () => void;
@@ -343,6 +364,10 @@ const SourceRow: FC<{
 }> = ({
 	source,
 	running,
+	access,
+	accessBusy,
+	accessInitiallyOpen,
+	onAccessDecision,
 	busy,
 	filtered,
 	onToggle,
@@ -351,6 +376,7 @@ const SourceRow: FC<{
 	onPurge,
 }) => {
 	const isPlugin = source.origin === "plugin";
+	const [accessOpen, setAccessOpen] = useState(accessInitiallyOpen);
 	return (
 		<motion.div
 			variants={ROW}
@@ -408,6 +434,29 @@ const SourceRow: FC<{
 					</>
 				)}
 			</div>
+			{access && access.pending.length > 0 && (
+				<div className="basis-full border-t pt-2">
+					<button
+						type="button"
+						className="text-left text-sm font-medium text-amber-600 hover:underline dark:text-amber-500"
+						onClick={() => setAccessOpen((open) => !open)}
+					>
+						{m.library_source_access_pending({
+							title: source.label,
+							count: access.pending.length,
+						})}
+					</button>
+					{accessOpen && (
+						<PendingAccess
+							access={access}
+							busy={accessBusy}
+							onDecide={(paths, decision) =>
+								onAccessDecision(access.plugin, paths, decision)
+							}
+						/>
+					)}
+				</div>
+			)}
 		</motion.div>
 	);
 };
