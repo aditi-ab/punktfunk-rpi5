@@ -62,6 +62,22 @@ pub fn audio_mute_label(mask: u8) -> Option<&'static str> {
     }
 }
 
+/// How long a mute the player made themselves names itself on screen.
+pub const LOCAL_MUTE_NOTICE: Duration = Duration::from_secs(5);
+
+/// [`audio_mute_label`] with the badge's lifetime applied, `since` the mask last changed.
+///
+/// A host mute stands for the whole session: an operator silencing a client must not be
+/// able to hide behind a local unmute. A local mute is the player's own press from the dial
+/// that still shows its state, so it says so long enough to read and then leaves the picture
+/// alone — a standing badge over the game is the operator's language, not the player's.
+pub fn audio_mute_notice(mask: u8, since: Duration) -> Option<&'static str> {
+    if mask & AUDIO_MUTE_HOST == 0 && since >= LOCAL_MUTE_NOTICE {
+        return None;
+    }
+    audio_mute_label(mask)
+}
+
 /// Set or clear one bit of a mute mask. Read-modify-write on the atomic: the embedder and
 /// the control task own different bits and never wait on each other.
 pub(crate) fn set_mute_bit(cell: &AtomicU8, bit: u8, on: bool) {
@@ -81,7 +97,7 @@ use self::planes::{
 };
 use self::probe::ProbeState;
 use self::pump::run_pump;
-use self::recovery::{RecoveryAsk, RfiRecovery};
+use self::recovery::{RecentRfis, RecoveryAsk, RfiRecovery};
 use self::worker::WorkerArgs;
 
 /// What this client calls itself in the host's `handshake complete` line: build plus the shell
@@ -322,6 +338,8 @@ pub struct NativeClient {
     /// OS pad slots the host gave this session, one bit each. Slot `n` is player
     /// `n + 1`; `0` until a pad of ours has a device on the host.
     pad_slots: Arc<AtomicU16>,
+    /// Latest launch verdict from the host; `None` until one arrives.
+    launch_outcome: Arc<Mutex<Option<crate::quic::LaunchOutcome>>>,
     /// Smoothed QUIC round trip (µs), sampled by the worker. `0` until the first sample.
     rtt_us: Arc<AtomicU32>,
     /// The stats overlay window. Receipt and 0xCF timings land in it as they are pulled.
@@ -331,6 +349,10 @@ pub struct NativeClient {
     /// Live encoder target (kbps), follows `BitrateChanged`. [`resolved_bitrate_kbps`] is the
     /// frozen session-start value. `0` = old host that never reported a rate.
     live_bitrate_kbps: Arc<AtomicU32>,
+    /// [`crate::hud::RateCut`] code the pump publishes each window; `0` = no standing cut.
+    rate_cut: Arc<AtomicU8>,
+    /// RFIs the control task sent, aged at each overlay read.
+    recent_rfis: Arc<Mutex<RecentRfis>>,
     /// ABR armed (Automatic, not rate-pinned PyroWave). Skip per-frame decode measurement when
     /// false ([`wants_decode_latency`](Self::wants_decode_latency)).
     wants_decode: bool,
@@ -700,10 +722,13 @@ impl NativeClient {
         let audio_buffer_ms = Arc::new(AtomicU32::new(0));
         let audio_mute = Arc::new(AtomicU8::new(0));
         let pad_slots = Arc::new(AtomicU16::new(0));
+        let launch_outcome = Arc::new(Mutex::new(None));
         let rtt_us = Arc::new(AtomicU32::new(0));
         let decode_lat = Arc::new(Mutex::new(DecodeLatAcc::default()));
         // Pump seeds from Welcome before ready_tx, then follows every ack.
         let live_bitrate = Arc::new(AtomicU32::new(0));
+        let rate_cut = Arc::new(AtomicU8::new(0));
+        let recent_rfis = Arc::new(Mutex::new(RecentRfis::default()));
         // Same seeding: Welcome before ready_tx, then every AccessUpdate. GRANT_ALL /
         // permanent here is the pre-handshake placeholder.
         let access_grants = Arc::new(AtomicU32::new(crate::quic::GRANT_ALL));
@@ -728,10 +753,13 @@ impl NativeClient {
         let rtt_us_w = rtt_us.clone();
         let decode_lat_w = decode_lat.clone();
         let live_bitrate_w = live_bitrate.clone();
+        let rate_cut_w = rate_cut.clone();
+        let recent_rfis_w = recent_rfis.clone();
         let pad_audio_caps_w = pad_audio_caps.clone();
         let pad_mouse_w = pad_mouse.clone();
         let audio_mute_w = audio_mute.clone();
         let pad_slots_w = pad_slots.clone();
+        let launch_outcome_w = launch_outcome.clone();
         let access_grants_w = access_grants.clone();
         let access_deadline_w = access_deadline_unix.clone();
         let end_reject_w = end_reject_code.clone();
@@ -812,8 +840,11 @@ impl NativeClient {
                     rtt_us: rtt_us_w,
                     decode_lat: decode_lat_w,
                     live_bitrate: live_bitrate_w,
+                    rate_cut: rate_cut_w,
+                    recent_rfis: recent_rfis_w,
                     audio_mute: audio_mute_w,
                     pad_slots: pad_slots_w,
+                    launch_outcome: launch_outcome_w,
                     access_grants: access_grants_w,
                     access_deadline_unix: access_deadline_w,
                     access_tx,
@@ -863,6 +894,7 @@ impl NativeClient {
             access: Mutex::new(access_rx),
             audio_mute,
             pad_slots,
+            launch_outcome,
             access_grants,
             access_deadline_unix,
             end_reject_code,
@@ -897,6 +929,8 @@ impl NativeClient {
             hud,
             decode_lat,
             live_bitrate_kbps: live_bitrate,
+            rate_cut,
+            recent_rfis,
             // Match the pump: Automatic, not rate-pinned PyroWave, AND host echoed a rate.
             // Dropping the last term over-advertises against an old host that reports no rate.
             wants_decode: bitrate_kbps == 0
@@ -1180,6 +1214,8 @@ impl NativeClient {
                 .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
             rtt_us: self.rtt_us(),
             target_kbps: self.current_bitrate_kbps(),
+            rate_cut: self.rate_cut.load(Ordering::Relaxed),
+            rfis_last_min: self.recent_rfis.lock().unwrap().count(Instant::now()),
             pad_slots: self.pad_slots(),
         }
     }
@@ -1392,6 +1428,16 @@ impl NativeClient {
     /// send [`crate::quic::PadSlots`]. [`crate::hud::player_label`] is the wording.
     pub fn pad_slots(&self) -> u16 {
         self.pad_slots.load(Ordering::Relaxed)
+    }
+
+    /// What became of this session's library launch, latest verdict first. `None` before the
+    /// host sends one, on a session that launched nothing, and on a host too old to say.
+    /// [`crate::quic::LaunchOutcome::notice`] is the line to show.
+    pub fn launch_outcome(&self) -> Option<crate::quic::LaunchOutcome> {
+        self.launch_outcome
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// `(pad, low, high)`; TTL of a v2 envelope is dropped. Use
@@ -1642,18 +1688,6 @@ impl NativeClient {
         Ok(())
     }
 
-    /// Replace the controller-mouse layout — plain buttons, chords, and the pointer, scroll,
-    /// deadzone and long-press tunables — from a JSON document. `None` restores the shipped
-    /// table. A pad already in controller mouse keeps the layout it entered with.
-    pub fn set_pad_mouse_layout(&self, doc: Option<&str>) -> Result<()> {
-        let layout = match doc {
-            Some(json) => pad_mouse::Layout::parse(json)?,
-            None => pad_mouse::Layout::default(),
-        };
-        self.pad_mouse.set_layout(layout);
-        Ok(())
-    }
-
     /// Pads the embedder switched to controller mouse and that are still connected.
     pub fn pad_mouse(&self) -> u16 {
         self.pad_mouse.active(self.access_grants())
@@ -1837,5 +1871,28 @@ mod mute_tests {
 
         set_mute_bit(&m, AUDIO_MUTE_HOST, false);
         assert_eq!(audio_mute_label(m.load(Ordering::Relaxed)), None);
+    }
+
+    /// The badge's lifetime, not its wording: the player's own mute says itself once and
+    /// gets out of the picture; the operator's stands for as long as it does.
+    #[test]
+    fn only_the_players_own_mute_stops_naming_itself() {
+        let old = LOCAL_MUTE_NOTICE + Duration::from_secs(1);
+        assert_eq!(
+            audio_mute_notice(AUDIO_MUTE_LOCAL, Duration::ZERO),
+            Some("Muted on this device")
+        );
+        assert_eq!(audio_mute_notice(AUDIO_MUTE_LOCAL, old), None);
+
+        // Anything the host muted keeps the badge, however long it has stood.
+        assert_eq!(
+            audio_mute_notice(AUDIO_MUTE_HOST, old),
+            Some("Muted by the host")
+        );
+        assert_eq!(
+            audio_mute_notice(AUDIO_MUTE_HOST | AUDIO_MUTE_LOCAL, old),
+            Some("Muted by the host and on this device")
+        );
+        assert_eq!(audio_mute_notice(0, Duration::ZERO), None);
     }
 }

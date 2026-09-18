@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Fri, 18 Sep 2026 14:20:59 +0200
+Subject: [PATCH] pipewire: keep dmabuf capture buffers in device memory
+
+stream_handle_add_buffer marks every capture texture bMappable, and a
+mappable texture is allocated HOST_VISIBLE | HOST_COHERENT | HOST_CACHED.
+On a discrete GPU that memory type is system RAM. Only copy_buffer's
+MemFd branch reads the texture through its mapping; the DmaBuf branch
+hands out tex->dmabuf() and never touches it.
+
+So on a discrete GPU every capture composite writes the whole frame
+across PCIe, and a consumer that imports the dmabuf for a hardware
+encoder reads it back across PCIe. The compositor blocks in vulkan_wait
+on each one, and whatever is rendering gets the GPU time that is left.
+An APU shares one memory, which is why it goes unnoticed there.
+
+Measured on an RTX 5070 Ti, headless 5120x1440 at 240 Hz, vkcube, a
+PipeWire consumer feeding NVENC: 23 captured frames a second at 100% GPU
+and 9.6 GB/s of PCIe traffic before, 240 a second at 12% and 0.06 GB/s
+after. 3840x2160 at 120 Hz goes from 49 to 120.
+
+Ask for the mapping only when the buffer is not a dmabuf. The texture
+stays LINEAR and exportable; its stride comes from the subresource
+layout, not from the mapping.
+---
+ src/meson.build  | 3 ++-
+ src/pipewire.cpp | 5 ++++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/meson.build b/src/meson.build
+index 37a78aa4..9dd5090a 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -200,7 +200,8 @@ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+ #   +pfhdr17 — …and a capture push never drops a buffer the PipeWire thread has not taken
+ #   +pfhdr18 — …and the capture stream is reliable and cycles while it waits for its consumer
+ #   +pfhdr19 — …and GAMESCOPE_SET_OUTPUT_MODE changes a headless output's mode at runtime
+-version_tag = vcs_tag + '+pfhdr19' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr20 — …and dmabuf capture buffers live in device memory, not system RAM
++version_tag = vcs_tag + '+pfhdr20' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/pipewire.cpp b/src/pipewire.cpp
+index f5f2ac38..674faed1 100644
+--- a/src/pipewire.cpp
++++ b/src/pipewire.cpp
+@@ -655,7 +655,10 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
+ 
+ 	buffer->texture = new CVulkanTexture();
+ 	CVulkanTexture::createFlags screenshotImageFlags;
+-	screenshotImageFlags.bMappable = true;
++	// Only the MemFd path reads the texture through its mapping (copy_buffer). A mappable
++	// image is HOST_CACHED memory: system RAM on a discrete GPU, so every capture composite
++	// would cross PCIe and the consumer's import would cross it back.
++	screenshotImageFlags.bMappable = !is_dmabuf;
+ 	screenshotImageFlags.bTransferDst = true;
+ 	screenshotImageFlags.bStorage = true;
+ 	if (is_dmabuf || drmFormat == DRM_FORMAT_NV12 || drmFormat == DRM_FORMAT_P010)

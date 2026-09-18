@@ -56,6 +56,9 @@ public final class GamepadFeedback {
     /// drain thread is safe — only the map lookup needs the lock.
     private let routingLock = NSLock()
     private var rumbleByPad: [UInt8: RumbleRenderer] = [:]
+    /// Another window's session owns the pads: rumble drops, and lightbar, player-LED and trigger
+    /// writes are only cached until `setSilenced(false)` replays them. Guarded by `routingLock`.
+    private var silenced = false
 
     /// The raw-report sink for `.hidRaw` events — the Steam Controller 2 capture's
     /// `Sc2Capture.onHidRaw(pad:kind:data:)`, registered by the session owner. Guarded by
@@ -243,8 +246,8 @@ public final class GamepadFeedback {
     private func routeRumble(
         pad: UInt8, low: UInt16, high: UInt16, leftTrigger: UInt16, rightTrigger: UInt16
     ) {
-        let renderer = withRouting { rumbleByPad[pad] }
-        renderer?.apply(low: low, high: high, leftTrigger: leftTrigger, rightTrigger: rightTrigger)
+        guard let renderer = withRouting({ silenced ? nil : rumbleByPad[pad] }) else { return }
+        renderer.apply(low: low, high: high, leftTrigger: leftTrigger, rightTrigger: rightTrigger)
         // The opt-in device mirror follows controller 1 unconditionally — the pads it exists for
         // have no motors (their renderer above no-ops), and mirroring deliberately isn't gated on
         // that: capability probing can't see a motor-less MFi pad, and the user opted in.
@@ -256,6 +259,18 @@ public final class GamepadFeedback {
         // never requested. Dropping them matches the core engine's policy for every pad without
         // trigger motors.
         if pad == 0 { deviceRumble?.apply(low: low, high: high) }
+    }
+
+    /// Quiet this session's feedback while another capture owns the pads, and put its lightbar,
+    /// player LEDs and triggers back when it takes them again.
+    @MainActor
+    public func setSilenced(_ on: Bool) {
+        let playing = withRouting { () -> [RumbleRenderer] in
+            silenced = on
+            return on ? Array(rumbleByPad.values) : []
+        }
+        for renderer in playing { renderer.apply(low: 0, high: 0, leftTrigger: 0, rightTrigger: 0) }
+        if !on { for slot in slots.values { replay(slot) } }
     }
 
     private func withRouting<R>(_ body: () -> R) -> R {
@@ -292,17 +307,19 @@ public final class GamepadFeedback {
         case let .led(pad, r, g, b):
             guard let slot = slots[pad] else { return }
             slot.lastLight = (r, g, b)
+            guard !withRouting({ silenced }) else { return }
             slot.controller?.light?.color = GCColor(
                 red: Float(r) / 255, green: Float(g) / 255, blue: Float(b) / 255)
         case let .playerLEDs(pad, bits):
             guard let slot = slots[pad] else { return }
             slot.lastPlayerBits = bits
+            guard !withRouting({ silenced }) else { return }
             slot.controller?.playerIndex = Self.playerIndex(forBits: bits)
         case let .triggerEffect(pad, which, effect):
             guard which < 2, let slot = slots[pad] else { return }
             let parsed = DualSenseTriggerEffect.parse(effect)
             slot.lastTrigger[Int(which)] = parsed
-            if let trigger = adaptiveTrigger(slot.controller, which) {
+            if !withRouting({ silenced }), let trigger = adaptiveTrigger(slot.controller, which) {
                 parsed.apply(to: trigger)
             }
         case .hidRaw:

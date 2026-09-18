@@ -57,10 +57,9 @@ double-click upgrade path:
   installer put up a modal and failed the install instead, which under `/VERYSILENT` was an
   unattended run blocking on an invisible dialog.
 - **The GameStream flag is fresh-install-only.** On an upgrade the flag is omitted entirely, which
-  `service install` reads as "keep host.env as-is". Passing an explicit on/off would rewrite
-  `PUNKTFUNK_HOST_CMD` whenever it still holds either canonical value — so a silent upgrade, where
-  no wizard carries the old choice forward, would flip a user's GameStream setting with nothing on
-  screen.
+  `service install` reads as "keep the stored setting". Passing an explicit on/off would overwrite
+  it — so a silent upgrade, where no wizard carries the old choice forward, would flip a user's
+  GameStream setting with nothing on screen.
 - **The Public-firewall flag is fresh-install-only too**, and `--allow-public-network` is tri-state
   (`=on` / `=off` / absent → keep the recorded choice, resolved from the `fw-allow-public` marker in
   `windows/service.rs`). This task is default-*unchecked*, so without the change a silent upgrade

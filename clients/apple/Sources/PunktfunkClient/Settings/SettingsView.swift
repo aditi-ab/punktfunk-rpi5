@@ -125,6 +125,8 @@ struct SettingsView: View {
         case category(SettingsCategory)
     }
 
+    /// The system keyboard is up for the Custom bitrate row.
+    @State var typingBitrate = false
     /// Focus on a sidebar row picks what the pane shows, as on a tab bar.
     @State private var tvPane: TVPane = .category(.general)
     @FocusState private var tvFocusedPane: TVPane?

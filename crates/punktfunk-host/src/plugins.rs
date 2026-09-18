@@ -17,12 +17,11 @@
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 
+pub mod manifest;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
 use self::windows as plat;
-#[cfg(all(target_os = "windows", not(test)))]
-pub(crate) use self::windows::listener_is_runner;
 #[cfg(not(target_os = "windows"))]
 mod posix;
 #[cfg(not(target_os = "windows"))]
@@ -56,13 +55,45 @@ pub fn main(args: &[String]) -> Result<()> {
             plat::disable()
         }
         Some("status") => status(),
-        Some("grant") => plat::grant(args.get(1).map(String::as_str)),
+        Some("grant") => grant(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
         Some("-h") | Some("--help") | Some("help") | None => {
             print_usage();
             Ok(())
         }
         Some(other) => bail!("unknown plugins command '{other}' (try `plugins --help`)"),
     }
+}
+
+/// `plugins grant <plugin> <dir>` — the operator's answer to "this package may also reach here".
+///
+/// A package declares the standard locations it knows; where someone keeps their ROMs or installs
+/// their games is not something it can know, and this is how that path becomes usable without the
+/// package asking for the home directory.
+fn grant(plugin: Option<&str>, dir: Option<&str>) -> Result<()> {
+    let (Some(plugin), Some(dir)) = (
+        plugin.map(str::trim).filter(|s| !s.is_empty()),
+        dir.map(str::trim).filter(|s| !s.is_empty()),
+    ) else {
+        bail!("usage: punktfunk-host plugins grant <plugin> <dir>");
+    };
+    let path = std::path::Path::new(dir);
+    // A typo must not report success: the grant would name a directory nothing ever reads.
+    if !path.is_dir() {
+        bail!("'{dir}' is not a directory (grant the folder, not a file inside it)");
+    }
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let roots = manifest::grant_root(plugin, &path)
+        .with_context(|| format!("record the grant for '{plugin}'"))?;
+    plat::grant(Some(dir))?;
+    println!("{plugin} may now reach:");
+    for root in roots {
+        println!("  {root}");
+    }
+    println!("Re-run the plugin's scan (or restart the runner) to pick it up.");
+    Ok(())
 }
 
 fn print_usage() {
@@ -76,7 +107,10 @@ USAGE:
     punktfunk-host plugins enable            enable + start the plugin runner (opt-in)
     punktfunk-host plugins disable           stop + disable the plugin runner
     punktfunk-host plugins status            is the runner enabled/running?
-    punktfunk-host plugins grant <dir>       let the runner read one of YOUR directories
+    punktfunk-host plugins grant <plugin> <dir>
+                                             let one plugin reach a directory of yours (a ROM
+                                             library, a game install dir) — nothing else on
+                                             this box changes
 
 NAMES:
     A bare first-party name resolves into the @punktfunk scope: `playnite` installs

@@ -1,4 +1,5 @@
-//! Win32 half of [`crate::gamelease`]'s termination ladder: `WM_CLOSE`, then `TerminateProcess`.
+//! Win32 half of [`crate::gamelease`]: the termination ladder (`WM_CLOSE`, then `TerminateProcess`),
+//! and whether the game's window is on the input desktop yet ([`visible_window`]).
 //!
 //! Kept out of `procscan` (read-only) and `gamelease` (platform-neutral).
 //!
@@ -10,14 +11,16 @@
 //!
 //! Pin: [`request_close`], [`kill`]. Evidence: [`crate::gamelease`].
 
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
-    HDESK,
+    CloseDesktop, EnumDesktopWindows, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS,
+    DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, HDESK,
 };
 use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
+    EnumWindows, GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindowVisible, PostMessageW, GW_OWNER, WM_CLOSE,
 };
 
 /// Non-zero so a reader can tell a kill from a clean quit.
@@ -117,6 +120,68 @@ unsafe extern "system" fn enum_close(hwnd: HWND, lparam: LPARAM) -> windows::cor
         }
     }
     true.into() // keep enumerating — a game can own several windows
+}
+
+/// `EnumDesktopWindows` `LPARAM` for [`visible_window`].
+struct FindCtx {
+    pids: Vec<u32>,
+    title: Option<String>,
+}
+
+/// Title of a visible, unowned, non-empty top-level window of one of `pids` on the input desktop —
+/// the one the player sees. `None` when there is none yet, or that desktop cannot be read.
+///
+/// Enumerates the desktop by handle instead of binding this thread to it: the lease watcher asks
+/// every second, and a desktop a thread is bound to cannot be closed.
+pub fn visible_window(pids: &[u32]) -> Option<String> {
+    if pids.is_empty() {
+        return None;
+    }
+    // SAFETY: `OpenInputDesktop` yields an owned `HDESK` only on `Ok`, closed once below. The
+    // enumeration calls `enum_find` synchronously, so `&mut ctx` in `LPARAM` stays valid and
+    // unaliased for the whole call.
+    unsafe {
+        let desk = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS).ok()?;
+        let mut ctx = FindCtx {
+            pids: pids.to_vec(),
+            title: None,
+        };
+        let _ = EnumDesktopWindows(
+            Some(desk),
+            Some(enum_find),
+            LPARAM(&mut ctx as *mut FindCtx as isize),
+        );
+        let _ = CloseDesktop(desk);
+        ctx.title
+    }
+}
+
+/// Stops at the first match. Owned windows (dialogs, splash tool windows) and zero-size ones are
+/// not the game's main window.
+unsafe extern "system" fn enum_find(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+    // SAFETY: `lparam` is the `&mut FindCtx` from `visible_window`, valid for the enumeration;
+    // the callback runs synchronously on the same thread, so this is the only live reference.
+    let ctx = unsafe { &mut *(lparam.0 as *mut FindCtx) };
+    let mut pid = 0u32;
+    let mut rect = RECT::default();
+    // SAFETY: `hwnd` is the window the enumeration handed us; `pid`, `rect` and `buf` are live
+    // locals we own, and `GetWindowTextW` writes at most `buf.len()` units.
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let candidate = ctx.pids.contains(&pid)
+            && IsWindowVisible(hwnd).as_bool()
+            && GetWindow(hwnd, GW_OWNER).is_err()
+            && GetWindowRect(hwnd, &mut rect).is_ok()
+            && rect.right > rect.left
+            && rect.bottom > rect.top;
+        if !candidate {
+            return true.into();
+        }
+        let mut buf = [0u16; 256];
+        let len = GetWindowTextW(hwnd, &mut buf).max(0) as usize;
+        ctx.title = Some(String::from_utf16_lossy(&buf[..len]));
+    }
+    false.into()
 }
 
 /// Whether `pid` runs in this process's session. A pid a plugin reported may name anything;

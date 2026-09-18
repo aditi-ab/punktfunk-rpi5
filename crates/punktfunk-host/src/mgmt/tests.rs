@@ -86,6 +86,13 @@ fn test_state() -> Arc<AppState> {
     }
 }
 
+/// One identified plugin, so the id-scoped routes have something to accept and something to
+/// refuse. `demo` owns its own registration; the runner's shared `plugin-secret` is the
+/// unidentified lane beside it.
+fn test_plugin_tokens() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([("demo".to_string(), "demo-secret".to_string())])
+}
+
 // `None` installs "test-secret" (`send` attaches the matching bearer). An explicit token
 // is for mismatch cases such as `bearer_token_is_enforced`.
 fn test_app(state: Arc<AppState>, token: Option<&str>) -> Router {
@@ -94,6 +101,7 @@ fn test_app(state: Arc<AppState>, token: Option<&str>) -> Router {
         state,
         Some(token.unwrap_or("test-secret").to_string()),
         Some("plugin-secret".to_string()),
+        test_plugin_tokens(),
         DEFAULT_PORT,
         None,
         stats,
@@ -113,6 +121,7 @@ fn test_app_browser(state: Arc<AppState>) -> Router {
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
+        test_plugin_tokens(),
         DEFAULT_PORT,
         None,
         stats,
@@ -130,6 +139,7 @@ fn test_app_native(state: Arc<AppState>, np: Arc<crate::native_pairing::NativePa
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
+        test_plugin_tokens(),
         DEFAULT_PORT,
         Some(np),
         stats,
@@ -223,7 +233,7 @@ async fn host_actions_follow_the_power_grant() {
     let (status, body) = send(&app, discover(guest_fp)).await;
     assert_eq!(status, StatusCode::OK);
     let rows = body["actions"].as_array().unwrap();
-    assert_eq!(rows.len(), 3, "{body}");
+    assert_eq!(rows.len(), 4, "{body}");
     assert!(
         rows.iter().all(|a| a["permitted"] == false),
         "a controller-only guest must not be offered power: {body}"
@@ -452,6 +462,7 @@ fn fake_native_session(
         quit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         force_idr: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         client: "test-client".into(),
+        plane: crate::events::Plane::Native,
         client_name: Some("studio-deck".into()),
         hdr: false,
         ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -465,6 +476,7 @@ fn fake_native_session(
         chroma: crate::encode::ChromaFormat::Yuv420,
         end_reason: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         counters: Arc::new(crate::session_status::SessionCounters::default()),
+        peer: None,
     })
 }
 
@@ -502,6 +514,7 @@ fn fake_session_with_flags(
         force_idr: idr.clone(),
         client: client.into(),
         client_name: None,
+        plane: crate::events::Plane::Native,
         hdr: false,
         ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -513,6 +526,7 @@ fn fake_session_with_flags(
         chroma: crate::encode::ChromaFormat::Yuv420,
         end_reason: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         counters: Arc::new(crate::session_status::SessionCounters::default()),
+        peer: None,
     });
     (guard, stop, quit, idr)
 }
@@ -1059,6 +1073,7 @@ async fn host_info_publishes_the_hosts_own_fingerprint() {
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
+        test_plugin_tokens(),
         DEFAULT_PORT,
         None,
         stats,
@@ -1483,6 +1498,93 @@ async fn submit_pin_validates_and_requires_pending_pairing() {
     assert!(body["error"].is_string(), "media type: {body}");
 }
 
+/// The hole per-plugin tokens close: with one shared token, any plugin could overwrite another's
+/// registration — and then answer for its tiles. A plugin that proved which plugin it is may
+/// write its own id and nothing else.
+#[tokio::test]
+async fn a_plugin_may_write_only_its_own_id() {
+    let app = test_app(test_state(), None);
+    let put = |id: &str, token: &str| {
+        axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/api/v1/plugins/{id}"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({ "title": "Demo" }).to_string(),
+            ))
+            .unwrap()
+    };
+    // Its own id: accepted.
+    let (status, _) = send(&app, put("demo", "demo-secret")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Another plugin's: refused, whatever the payload says.
+    let (status, body) = send(&app, put("rom-manager", "demo-secret")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // Deregistering someone else is the same question.
+    let (status, _) = send(
+        &app,
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/plugins/rom-manager")
+            .header("authorization", "Bearer demo-secret")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Same rule on the library side: a provider's entries belong to the plugin that owns the id.
+#[tokio::test]
+async fn a_plugin_may_reconcile_only_its_own_provider() {
+    let app = test_app(test_state(), None);
+    let (status, body) = send(
+        &app,
+        axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/v1/library/provider/steam")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer demo-secret")
+            .body(Body::from("[]"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _) = send(
+        &app,
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/library/provider/steam")
+            .header("authorization", "Bearer demo-secret")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The runner's shared token keeps the older, unowned behaviour — a loose script has no plugin
+/// identity to check — so upgrading a host does not strand one.
+#[tokio::test]
+async fn the_shared_runner_token_stays_unowned() {
+    let app = test_app(test_state(), None);
+    let (status, _) = send(
+        &app,
+        axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/v1/plugins/anything")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer plugin-secret")
+            .body(Body::from(
+                serde_json::json!({ "title": "Demo" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
 /// A blank token is no token: `run` refuses to start unauthenticated, even on loopback.
 #[tokio::test]
 async fn blank_token_rejected() {
@@ -1490,6 +1592,7 @@ async fn blank_token_rejected() {
         bind: "127.0.0.1:0".parse().unwrap(),
         token: Some("   ".into()),
         plugin_token: None,
+        ..Default::default()
     };
     let err = run(
         test_state(),
@@ -1866,20 +1969,9 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         // Finished sessions: the same facts `/status` already shows a plugin about a live
         // one. Not the cert lane — it names every other client that streamed here.
         ("GET", "/api/v1/session/last", true, false),
-        // Window list and verbs: console lane only. A window list names titles on
-        // the operator's desk, like the rosters the cert lane withholds, and a cert
-        // caller is not bound to a session id — it could spend another session's
-        // grants. The client's own switcher needs a session-bound lane, not this.
-        ("GET", "/api/v1/session/{id}/windows", false, false),
-        (
-            "POST",
-            "/api/v1/session/{id}/windows/{window}",
-            false,
-            false,
-        ),
-        // Live pad feed: console lane only, for the same reason as the window list —
-        // a cert caller is not bound to a session id, so it could watch another
-        // session's controller. A plugin has no use for a 250 Hz input tap.
+        // Live pad feed: console lane only. A cert caller is not bound to a session
+        // id, so it could watch another session's controller. A plugin has no use
+        // for a 250 Hz input tap.
         ("GET", "/api/v1/session/{id}/pads", false, false),
         ("GET", "/api/v1/session/settings", true, false),
         ("PUT", "/api/v1/session/settings", true, false),
@@ -1938,6 +2030,10 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/store/runtime", false, false),
         ("POST", "/api/v1/store/runtime", false, false),
         // Updates: `apply` runs an installer / the root helper.
+        // Host settings: operator only. A plugin or a device must not reopen GameStream.
+        ("GET", "/api/v1/host/settings", false, false),
+        ("PATCH", "/api/v1/host/settings", false, false),
+        ("GET", "/api/v1/host/audio/apps", false, false),
         ("GET", "/api/v1/update/status", false, false),
         ("POST", "/api/v1/update/check", false, false),
         ("POST", "/api/v1/update/apply", false, false),
@@ -2280,6 +2376,91 @@ async fn display_settings_surface() {
         !enforced.contains(&"game_session") || cfg!(target_os = "linux"),
         "a dedicated game session is a headless gamescope spawn"
     );
+}
+
+/// `/host/settings`: a PATCH stores, `null` resets, and a refused value writes nothing and names
+/// the setting. Env beating the store is `pf-host-config`'s test, against a fake environment.
+/// Uses only restart-class rows, so a concurrent session test never sees a changed value.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn host_settings_surface() {
+    let dir = ConfigDirOverride::new();
+    pf_host_config::reload();
+    let app = test_app(test_state(), None);
+    let patch = |body: serde_json::Value| {
+        axum::http::Request::patch("/api/v1/host/settings")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let row = |body: &serde_json::Value, id: &str| {
+        body["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {id} row"))
+    };
+
+    let (status, body) = send(&app, get_req("/api/v1/host/settings")).await;
+    assert_eq!(status, StatusCode::OK);
+    let name = row(&body, "host_name");
+    assert_eq!(name["source"], "default");
+    assert_eq!(name["kind"], "text");
+    assert_eq!(name["apply"], "restart");
+    assert_eq!(name["env"], "PUNKTFUNK_HOST_NAME");
+    let ids: Vec<&str> = body["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids.contains(&"max_fps"),
+        cfg!(target_os = "linux"),
+        "a row this host does not act on is absent, not disabled"
+    );
+
+    let (status, body) = send(
+        &app,
+        patch(serde_json::json!({"host_name": "Den", "webtransport": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row(&body, "host_name")["value"], "Den");
+    assert_eq!(row(&body, "host_name")["source"], "store");
+    let file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("host-settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(file["webtransport"], true);
+
+    let (status, err) = send(
+        &app,
+        patch(serde_json::json!({"webtransport": false, "host_name": "x".repeat(64)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(err["error"].as_str().unwrap().contains("host_name"));
+    let (status, _) = send(&app, patch(serde_json::json!({"no_such_setting": 1}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, body) = send(&app, get_req("/api/v1/host/settings")).await;
+    assert_eq!(
+        row(&body, "webtransport")["value"],
+        true,
+        "a refused patch writes nothing"
+    );
+
+    let (status, body) = send(
+        &app,
+        patch(serde_json::json!({"host_name": null, "webtransport": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row(&body, "host_name")["source"], "default");
+    assert!(row(&body, "webtransport")["stored"].is_null());
+    drop(dir);
+    pf_host_config::reload();
 }
 
 /// The per-device overlay routes (`design/web-console-overhaul.md` §6.1).
@@ -3607,9 +3788,11 @@ fn a_recorded_launch_credits_its_run_to_the_library_stats() {
                 title: "Stats Run".into(),
             },
             client: "test".into(),
+            fingerprint: None,
             plane: crate::events::Plane::Native,
             spec: crate::library::DetectSpec::dir(tmp.path()),
             nested: false,
+            scope_pid: None,
             launcher: false,
             child: Some((child, true)),
             spawned: None,
@@ -3618,8 +3801,7 @@ fn a_recorded_launch_credits_its_run_to_the_library_stats() {
             procs: Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
             #[cfg(target_os = "linux")]
             workspace: None,
-            #[cfg(target_os = "linux")]
-            window_stage: None,
+            window: None,
             outcome: None,
         },
         Box::new(|| {}),
@@ -3692,6 +3874,26 @@ async fn provider_reconcile_validation() {
         .unwrap();
     let (s, _) = send(&app, del).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+/// The plugin runner starts every store at once, so their first syncs land together.
+#[test]
+fn concurrent_provider_syncs_keep_every_row() {
+    let _dir = ConfigDirOverride::new();
+    std::thread::scope(|s| {
+        for p in 0..8 {
+            s.spawn(move || {
+                for _ in 0..20 {
+                    let row = serde_json::json!({"external_id": "a", "title": "A"});
+                    let inputs = vec![serde_json::from_value(row).unwrap()];
+                    crate::library::reconcile_provider(&format!("p{p}"), None, inputs)
+                        .expect("sync saved");
+                }
+            });
+        }
+    });
+    let rows = crate::library::load_custom();
+    assert_eq!(rows.len(), 8, "one row per provider: {rows:?}");
 }
 
 /// Unknown titles are counted, not refused: a report races its own reconcile, and 400-ing

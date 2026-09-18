@@ -88,6 +88,20 @@ object NativeBridge {
     external fun nativeRenderLogs(header: String): String
 
     /**
+     * One `pf.wifi` line in the log ring above: why it was written, then the Wi-Fi link's signal
+     * (dBm), transmit and receive rates (Mb/s), channel frequency (MHz) and
+     * `WifiInfo.getWifiStandard()`. `-1` is unknown; a frequency ≤ 0 means off Wi-Fi.
+     */
+    external fun nativeLogWifiLink(
+        reason: String,
+        rssiDbm: Int,
+        txMbps: Int,
+        rxMbps: Int,
+        freqMhz: Int,
+        standard: Int,
+    )
+
+    /**
      * The machine token of the most recent failed [nativeConnect]/[nativePair], cleared on read
      * (`""` when none) — call right after a `0` handle / `""` fingerprint. A typed host rejection
      * yields its wire token ("not-armed", "denied", "approval-timeout", "superseded", "busy",

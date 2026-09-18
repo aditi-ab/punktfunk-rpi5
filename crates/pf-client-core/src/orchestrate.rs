@@ -12,7 +12,10 @@ use crate::presets::{PresetsFile, Resolution, StreamPreset};
 use crate::trust::{KnownHost, KnownHosts, Settings};
 use serde::{Deserialize, Serialize};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 /// Dial target as values. A plan-holder has no [`KnownHost`] in hand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -578,23 +581,30 @@ const SESSION_BIN: &str = "punktfunk-session.exe";
 #[cfg(not(windows))]
 const SESSION_BIN: &str = "punktfunk-session";
 
-/// Kills the spawned session child. Safe any time; a child that already exited
-/// is a no-op.
+/// Records cancellation and kills the spawned session child. Cancellation remains
+/// visible when it arrives before the child is armed or after an event is queued.
 #[derive(Clone, Debug, Default)]
-pub struct CancelHandle(Arc<Mutex<Option<Child>>>);
+pub struct CancelHandle {
+    child: Arc<Mutex<Option<Child>>>,
+    cancelled: Arc<AtomicBool>,
+}
 
 impl CancelHandle {
     pub fn kill(&self) {
-        if let Some(child) = self.0.lock().unwrap().as_mut() {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(child) = self.child.lock().unwrap().as_mut() {
             let _ = child.kill();
         }
     }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
 }
 
-/// Spawn the session for this plan and supervise its stdout on a reader thread,
-/// handing each event to `on_event`. [`SessionEvent::Exited`] always arrives.
-/// `cancel` lets a front-end hold the abort handle before the child exists
-/// (request-access arms Cancel first, then spawns); `None` returns a fresh one.
+/// Spawns the session and supervises stdout on a reader thread. `cancel` accepts
+/// cancellation before or after the child is armed. [`SessionEvent::Exited`] always
+/// arrives, and `None` creates a fresh handle.
 pub fn spawn_session(
     plan: &ConnectPlan,
     cancel: Option<CancelHandle>,
@@ -643,7 +653,10 @@ pub fn spawn_session(
     );
     let stdout = child.stdout.take().expect("piped stdout");
     let slot = cancel.unwrap_or_default();
-    *slot.0.lock().unwrap() = Some(child);
+    *slot.child.lock().unwrap() = Some(child);
+    if slot.is_cancelled() {
+        slot.kill();
+    }
 
     let reader_slot = slot.clone();
     let mut on_event = on_event;
@@ -672,7 +685,7 @@ pub fn spawn_session(
             }
             // Reap. A cancel-killed child lands here too; -1 = died on a signal.
             let code = reader_slot
-                .0
+                .child
                 .lock()
                 .unwrap()
                 .take()

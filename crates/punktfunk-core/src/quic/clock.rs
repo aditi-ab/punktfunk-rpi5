@@ -30,7 +30,8 @@ pub struct ClockSkew {
 
 /// Client-side skew handshake: `ROUNDS` [`ClockProbe`]/[`ClockEcho`] round-trips.
 /// `None` if the host never answers (pre-skew host) — caller assumes a shared
-/// clock. Each read is bounded so a silent host cannot wedge session start.
+/// clock. Each round is bounded so a silent host cannot wedge session start.
+/// Any other message the host sends meanwhile goes back on `recv` for the control task.
 ///
 /// Takes a quinn stream, so it needs the feature; the [`ClockProbe`]/[`ClockEcho`] codecs above
 /// do not, and a browser drives the same rounds over its own stream.
@@ -44,21 +45,27 @@ pub async fn clock_sync(
     const ROUNDS: usize = 8;
     let read_timeout = Duration::from_secs(2);
     let mut samples: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
+    let mut aside = Vec::new();
+    'rounds: for _ in 0..ROUNDS {
         let t1 = wall_clock_ns();
         let probe = ClockProbe { t1_ns: t1 }.encode();
         if io::write_msg(send, &probe).await.is_err() {
             break;
         }
-        let read = tokio::time::timeout(read_timeout, recv.read_msg()).await;
-        let echo = match read {
-            Ok(Ok(b)) => match ClockEcho::decode(&b) {
-                Ok(e) => e,
-                Err(_) => break,
-            },
-            _ => break, // timeout / stream error: pre-skew host
+        let deadline = tokio::time::Instant::now() + read_timeout;
+        let echo = loop {
+            match tokio::time::timeout_at(deadline, recv.read_msg()).await {
+                Ok(Ok(b)) => match ClockEcho::decode(&b) {
+                    Ok(e) => break e,
+                    Err(_) => aside.push(b),
+                },
+                _ => break 'rounds, // timeout / stream error: pre-skew host
+            }
         };
         samples.push((echo.t1_ns, echo.t2_ns, echo.t3_ns, wall_clock_ns()));
+    }
+    for msg in aside {
+        recv.hold(msg);
     }
     clock_offset_ns(&samples).map(|(offset_ns, rtt_ns)| ClockSkew {
         offset_ns,
@@ -358,5 +365,48 @@ mod tests {
         // Inclusive bound.
         assert!(accept_resync(2_000_000, 0));
         assert!(accept_resync(15_000_000, 10_000_000));
+    }
+
+    /// A message the host sends during the rounds neither ends them nor is lost: the
+    /// control task reads it next.
+    #[cfg(feature = "quic")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clock_sync_keeps_a_message_that_arrives_mid_rounds() {
+        let server = endpoint::server("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let host = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (mut send, recv) = conn.accept_bi().await.unwrap();
+            let mut recv = io::MsgReader::new(recv);
+            let early = AudioState { muted: true };
+            for round in 0..8 {
+                let probe = ClockProbe::decode(&recv.read_msg().await.unwrap()).unwrap();
+                if round == 2 {
+                    io::write_msg(&mut send, &early.encode()).await.unwrap();
+                }
+                let t = wall_clock_ns();
+                let echo = ClockEcho {
+                    t1_ns: probe.t1_ns,
+                    t2_ns: t,
+                    t3_ns: t,
+                };
+                io::write_msg(&mut send, &echo.encode()).await.unwrap();
+            }
+            (server, conn, send)
+        });
+        let client = endpoint::client_insecure().unwrap();
+        let conn = client.connect(addr, "punktfunk").unwrap().await.unwrap();
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        let mut recv = io::MsgReader::new(recv);
+        let skew = clock_sync(&mut send, &mut recv)
+            .await
+            .expect("host answered");
+        assert_eq!(skew.rounds, 8);
+        let _host = host.await.unwrap();
+        let next = recv.read_msg().await.unwrap();
+        assert_eq!(
+            AudioState::decode(&next).unwrap(),
+            AudioState { muted: true }
+        );
     }
 }

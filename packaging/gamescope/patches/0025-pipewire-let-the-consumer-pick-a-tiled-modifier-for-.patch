@@ -1,0 +1,339 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Fri, 18 Sep 2026 14:50:35 +0200
+Subject: [PATCH] pipewire: let the consumer pick a tiled modifier for packed
+ RGB
+
+The capture node offers its dmabufs as DRM_FORMAT_MOD_LINEAR and nothing
+else, as a one-value choice. A consumer whose importer prefers the
+device's tiled layouts has to take a pitch-linear image, and one that
+lists a tiled modifier first fails the link outright: without
+DONT_FIXATE the filter fixates the consumer's default against our single
+value.
+
+List what the device can really do. vulkan_get_capture_modifiers keeps
+the modifiers of the format that have one memory plane, support storage
+images and can be exported as a dmabuf, which is the usage a capture
+texture is created with. They go out ahead of LINEAR with
+SPA_POD_PROP_FLAG_DONT_FIXATE. When the negotiated format still carries
+that flag, param_changed settles on the first of ours the consumer kept
+and republishes that one pod ahead of the full list, which is the
+two-step handshake Mutter and KWin already use. A consumer that lists
+LINEAR alone still gets LINEAR, and every third round in a row settles
+on LINEAR so a consumer that never converges still gets a stream.
+
+CVulkanTexture::createFlags gains ulDrmModifier: allocate with exactly
+that modifier, in device memory, and export it. The planar formats stay
+LINEAR because the dmabuf path exports a single plane.
+---
+ src/meson.build      |  3 +-
+ src/pipewire.cpp     | 97 +++++++++++++++++++++++++++++++++++++++++---
+ src/pipewire.hpp     |  2 +
+ src/rendervulkan.cpp | 62 ++++++++++++++++++++++++++--
+ src/rendervulkan.hpp |  7 ++++
+ 5 files changed, 161 insertions(+), 10 deletions(-)
+
+diff --git a/src/meson.build b/src/meson.build
+index 9dd5090a..4df3bfe0 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -201,7 +201,8 @@ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+ #   +pfhdr18 — …and the capture stream is reliable and cycles while it waits for its consumer
+ #   +pfhdr19 — …and GAMESCOPE_SET_OUTPUT_MODE changes a headless output's mode at runtime
+ #   +pfhdr20 — …and dmabuf capture buffers live in device memory, not system RAM
+-version_tag = vcs_tag + '+pfhdr20' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr21 — …and a packed RGB capture dmabuf takes a tiled modifier its consumer accepts
++version_tag = vcs_tag + '+pfhdr21' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/pipewire.cpp b/src/pipewire.cpp
+index 674faed1..d6d2cc7f 100644
+--- a/src/pipewire.cpp
++++ b/src/pipewire.cpp
+@@ -61,6 +61,17 @@ static bool is_planar_video_format(uint32_t format)
+ 	return format == SPA_VIDEO_FORMAT_NV12 || format == SPA_VIDEO_FORMAT_P010_10LE;
+ }
+ 
++uint32_t spa_format_to_drm(uint32_t spa_format);
++
++// What a packed RGB capture texture can take besides LINEAR. Planar formats stay LINEAR: the
++// dmabuf path exports one plane.
++static std::vector<uint64_t> capture_modifiers(uint32_t format)
++{
++	if (is_planar_video_format(format))
++		return {};
++	return vulkan_get_capture_modifiers(spa_format_to_drm(format));
++}
++
+ static struct pipewire_state pipewire_state = { .stream_node_id = SPA_ID_INVALID };
+ static int nudgePipe[2] = { -1, -1 };
+ 
+@@ -204,7 +215,9 @@ static void add_format_color_params(struct spa_pod_builder *builder, spa_video_f
+ #endif
+ }
+ 
+-static void build_format_params(struct spa_pod_builder *builder, spa_video_format format, std::vector<const struct spa_pod *> &params) {
++// `pFixated` builds the one pod that answers a DONT_FIXATE negotiation: the dmabuf offer with the
++// modifier this stream settled on, and no SHM twin.
++static void build_format_params(struct spa_pod_builder *builder, spa_video_format format, std::vector<const struct spa_pod *> &params, const uint64_t *pFixated = nullptr) {
+ 	struct spa_rectangle size = SPA_RECTANGLE(s_nCaptureWidth, s_nCaptureHeight);
+ 	struct spa_rectangle min_requested_size = { 0, 0 };
+ 	struct spa_rectangle max_requested_size = { UINT32_MAX, UINT32_MAX };
+@@ -223,9 +236,21 @@ static void build_format_params(struct spa_pod_builder *builder, spa_video_forma
+ 		SPA_FORMAT_VIDEO_gamescope_focus_appid, SPA_POD_CHOICE_RANGE_Long( 0ll, INT64_MIN, INT64_MAX ),
+ 		0);
+ 	add_format_color_params(builder, format);
+-	spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
++	if (pFixated != nullptr) {
++		spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
++		spa_pod_builder_long(builder, *pFixated);
++		params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
++		return;
++	}
++	// More than LINEAR on offer: the consumer narrows the list and param_changed fixates it.
++	// A consumer that lists LINEAR alone still gets LINEAR.
++	const std::vector<uint64_t> tiled = capture_modifiers(format);
++	spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier,
++		SPA_POD_PROP_FLAG_MANDATORY | (tiled.empty() ? 0 : SPA_POD_PROP_FLAG_DONT_FIXATE));
+ 	spa_pod_builder_push_choice(builder, &choice_frame, SPA_CHOICE_Enum, 0);
+-	spa_pod_builder_long(builder, modifier); // default
++	spa_pod_builder_long(builder, tiled.empty() ? modifier : tiled[0]); // default
++	for (uint64_t tiledModifier : tiled)
++		spa_pod_builder_long(builder, tiledModifier);
+ 	spa_pod_builder_long(builder, modifier);
+ 	spa_pod_builder_pop(builder, &choice_frame);
+ 	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
+@@ -414,7 +439,7 @@ static void dispatch_nudge(struct pipewire_state *state, int fd)
+ 	if (s_nCaptureWidth != state->video_info.size.width || s_nCaptureHeight != state->video_info.size.height) {
+ 		pwr_log.debugf("renegotiating stream params (size: %dx%d)", s_nCaptureWidth, s_nCaptureHeight);
+ 
+-		uint8_t buf[8192];
++		uint8_t buf[16384];
+ 		struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+ 		std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
+ 		int ret = pw_stream_update_params(state->stream, format_params.data(), format_params.size());
+@@ -475,6 +500,48 @@ static void stream_handle_state_changed(void *data, enum pw_stream_state old_str
+ 	}
+ }
+ 
++static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_builder *builder);
++
++// The consumer left several modifiers standing. Settle on ours-first order among them and offer
++// that one pod ahead of the full list; PipeWire renegotiates and param_changed runs again with a
++// plain modifier. Every third round in a row settles on LINEAR, so a consumer that never
++// converges still gets a stream.
++static int s_nFixateRounds = 0;
++
++static void fixate_modifier(struct pipewire_state *state, const struct spa_pod_prop *prop)
++{
++	const spa_video_format format = state->video_info.format;
++
++	uint64_t chosen = DRM_FORMAT_MOD_LINEAR;
++	const struct spa_pod *pod = &prop->value;
++	if (spa_pod_is_choice(pod) && ++s_nFixateRounds < 3) {
++		// Values are the default first, then the alternatives (which repeat it).
++		const uint32_t nValues = SPA_POD_CHOICE_N_VALUES(pod);
++		const uint64_t *pValues = (const uint64_t *) SPA_POD_CHOICE_VALUES(pod);
++		bool bFound = false;
++		for (uint64_t ours : capture_modifiers(format)) {
++			for (uint32_t i = 0; i < nValues && !bFound; i++)
++				bFound = pValues[i] == ours;
++			if (bFound) {
++				chosen = ours;
++				break;
++			}
++		}
++	}
++
++	uint8_t buf[16384];
++	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
++	std::vector<const struct spa_pod *> params;
++	build_format_params(&builder, format, params, &chosen);
++	const std::vector<const struct spa_pod *> offers = build_format_params(&builder);
++	params.insert(params.end(), offers.begin(), offers.end());
++
++	pwr_log.infof("fixating the dmabuf modifier: 0x%llx", (unsigned long long) chosen);
++	if (pw_stream_update_params(state->stream, params.data(), params.size()) < 0) {
++		pwr_log.errorf("pw_stream_update_params failed");
++	}
++}
++
+ static void stream_handle_param_changed(void *data, uint32_t id, const struct spa_pod *param)
+ {
+ 	struct pipewire_state *state = (struct pipewire_state *) data;
+@@ -507,6 +574,20 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
+ 
+ 	const struct spa_pod_prop *modifier_prop = spa_pod_find_prop(param, nullptr, SPA_FORMAT_VIDEO_modifier);
+ 	state->dmabuf = modifier_prop != nullptr;
++	if (modifier_prop != nullptr && (modifier_prop->flags & SPA_POD_PROP_FLAG_DONT_FIXATE)) {
++		fixate_modifier(state, modifier_prop);
++		return;
++	}
++	s_nFixateRounds = 0;
++	state->modifier = DRM_FORMAT_MOD_LINEAR;
++	if (modifier_prop != nullptr) {
++		int64_t nModifier = 0;
++		if (spa_pod_get_long(&modifier_prop->value, &nModifier) == 0) {
++			state->modifier = uint64_t(nModifier);
++		} else if (spa_pod_is_choice(&modifier_prop->value) && SPA_POD_CHOICE_N_VALUES(&modifier_prop->value) > 0) {
++			state->modifier = *(const uint64_t *) SPA_POD_CHOICE_VALUES(&modifier_prop->value);
++		}
++	}
+ 
+ 	uint8_t buf[1024];
+ 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+@@ -664,7 +745,11 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
+ 	if (is_dmabuf || drmFormat == DRM_FORMAT_NV12 || drmFormat == DRM_FORMAT_P010)
+ 	{
+ 		screenshotImageFlags.bExportable = true;
+-		screenshotImageFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
++		// TODO: support multi-planar DMA-BUF export via PipeWire
++		if (is_dmabuf && !is_planar_video_format(state->video_info.format) && state->modifier != DRM_FORMAT_MOD_LINEAR)
++			screenshotImageFlags.ulDrmModifier = state->modifier;
++		else
++			screenshotImageFlags.bLinear = true;
+ 	}
+ 	bool bImageInitSuccess = buffer->texture->BInit( s_nCaptureWidth, s_nCaptureHeight, 1u, drmFormat, screenshotImageFlags );
+ 	if ( !bImageInitSuccess )
+@@ -883,7 +968,7 @@ bool init_pipewire(void)
+ 	s_nOutputHeight = g_nOutputHeight;
+ 	calculate_capture_size();
+ 
+-	uint8_t buf[8192];
++	uint8_t buf[16384];
+ 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+ 	std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
+ 
+diff --git a/src/pipewire.hpp b/src/pipewire.hpp
+index 378b33a7..5ec3c1dd 100644
+--- a/src/pipewire.hpp
++++ b/src/pipewire.hpp
+@@ -20,6 +20,8 @@ struct pipewire_state {
+ 	struct spa_gamescope gamescope_info;
+ 	uint64_t focus_appid;
+ 	bool dmabuf;
++	// The fixated dmabuf modifier. LINEAR until a consumer agrees to a tiled one.
++	uint64_t modifier;
+ 	int shm_stride;
+ 	uint64_t seq;
+ };
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index a1084cd6..c5defd95 100644
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -2066,6 +2066,51 @@ static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
+ 	}
+ }
+ 
++std::vector<uint64_t> vulkan_get_capture_modifiers( uint32_t drmFormat )
++{
++	std::vector<uint64_t> modifiers;
++	if ( !g_device.supportsModifiers() )
++		return modifiers;
++
++	const VkFormat format = DRMFormatToVulkan( drmFormat, false );
++	const auto iter = DRMModifierProps.find( format );
++	if ( format == VK_FORMAT_UNDEFINED || iter == DRMModifierProps.end() )
++		return modifiers;
++
++	// The usage a PipeWire capture texture is created with.
++	const VkImageCreateInfo imageInfo = {
++		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++		.imageType = VK_IMAGE_TYPE_2D,
++		.format = format,
++		.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++		.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++	};
++
++	for ( const auto &[ modifier, props ] : iter->second )
++	{
++		if ( modifier == DRM_FORMAT_MOD_LINEAR || modifier == DRM_FORMAT_MOD_INVALID )
++			continue;
++		// The PipeWire dmabuf path exports one plane.
++		if ( props.drmFormatModifierPlaneCount != 1 )
++			continue;
++		if ( !( props.drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT ) )
++			continue;
++
++		VkExternalImageFormatProperties externalFormatProps = {
++			.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
++		};
++		if ( getModifierProps( &imageInfo, modifier, &externalFormatProps ) != VK_SUCCESS )
++			continue;
++		if ( !( externalFormatProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ) )
++			continue;
++
++		modifiers.push_back( modifier );
++	}
++
++	return modifiers;
++}
++
+ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
+ {
+ 	m_pBackendFb = std::move( pBackendFb );
+@@ -2210,7 +2255,9 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+ 
+ 	std::vector<uint64_t> modifiers = {};
+ 	// TODO(JoshA): Move this code to backend for making flippable image.
+-	if ( GetBackend()->UsesModifiers() && flags.bFlippable && g_device.supportsModifiers() && !pDMA )
++	// A capture buffer names the one modifier its consumer agreed to.
++	const bool bExplicitModifier = flags.ulDrmModifier != DRM_FORMAT_MOD_INVALID && flags.bExportable && g_device.supportsModifiers() && !pDMA;
++	if ( ( GetBackend()->UsesModifiers() && flags.bFlippable && g_device.supportsModifiers() && !pDMA ) || bExplicitModifier )
+ 	{
+ 		assert( drmFormat != DRM_FORMAT_INVALID );
+ 
+@@ -2218,7 +2265,12 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+ 
+ 		const uint64_t *possibleModifiers;
+ 		size_t numPossibleModifiers;
+-		if ( flags.bLinear )
++		if ( bExplicitModifier )
++		{
++			possibleModifiers = &flags.ulDrmModifier;
++			numPossibleModifiers = 1;
++		}
++		else if ( flags.bLinear )
+ 		{
+ 			possibleModifiers = &linear;
+ 			numPossibleModifiers = 1;
+@@ -2252,7 +2304,11 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+ 			modifiers.push_back( modifier );
+ 		}
+ 
+-		assert( modifiers.size() > 0 );
++		if ( modifiers.empty() )
++		{
++			vk_log.errorf( "no exportable DRM format modifier for this image" );
++			return false;
++		}
+ 
+ 		modifierListInfo = {
+ 			.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+diff --git a/src/rendervulkan.hpp b/src/rendervulkan.hpp
+index 1e7b3685..616123f1 100644
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -125,6 +125,10 @@ inline GamescopeAppTextureColorspace VkColorSpaceToGamescopeAppTextureColorSpace
+ 	}
+ }
+ 
++// Modifiers other than LINEAR that a single-plane, exportable storage image of this format can
++// take. Empty without VK_EXT_image_drm_format_modifier.
++std::vector<uint64_t> vulkan_get_capture_modifiers( uint32_t drmFormat );
++
+ class CVulkanTexture : public gamescope::RcObject
+ {
+ public:
+@@ -156,6 +160,9 @@ public:
+ 		bool bOutputImage : 1;
+ 		bool bColorAttachment : 1;
+ 		VkImageType imageType;
++		// Allocate with exactly this DRM format modifier, in device memory, and export it.
++		// INVALID leaves the choice to bLinear or the backend's list.
++		uint64_t ulDrmModifier = DRM_FORMAT_MOD_INVALID;
+ 	};
+ 
+ 	bool BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0, CVulkanTexture *pExistingImageToReuseMemory = nullptr, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = nullptr );

@@ -255,6 +255,12 @@ impl GamepadManager {
         }
     }
 
+    /// Show this session's pads to one seat alone
+    /// ([`PadSlots::expose_in`](crate::pad_slots::PadSlots::expose_in)).
+    pub fn expose_in(&mut self, dir: Option<std::path::PathBuf>) {
+        self.slots.expose_in(dir);
+    }
+
     /// Pads actually built. Harness-only; see [`crate::uhid_manager::UhidManager::live_pads`].
     pub fn live_pads(&self) -> usize {
         self.slots.live()

@@ -9,18 +9,20 @@
 //! The SCM supervisor in [`crate::service`] separately selects the active
 //! console session when it starts the ordinary host.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetCurrentProcessId, CREATE_BREAKAWAY_FROM_JOB,
-    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, GetCurrentProcessId, GetExitCodeProcess, WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 /// Resolves one process through an injected WTS session query. A failed query
@@ -82,6 +84,48 @@ fn exe_dir(cmdline: &str) -> Option<PathBuf> {
 /// process's session has no signed-in user. `workdir` defaults to the
 /// executable's own directory ([`exe_dir`]) — never this process's.
 pub fn spawn_as_current_session_user(cmdline: &str, workdir: Option<&Path>) -> Result<u32> {
+    let pi = launch(cmdline, workdir, PROCESS_CREATION_FLAGS(0))?;
+    let pid = pi.dwProcessId;
+    // SAFETY: `launch` returned two owned handles; each is closed exactly once here and never
+    // used after. Closing them does not terminate the child, which owns its own lifetime.
+    unsafe {
+        let _ = CloseHandle(pi.hProcess);
+        let _ = CloseHandle(pi.hThread);
+    }
+    Ok(pid)
+}
+
+/// [`spawn_as_current_session_user`] for a console helper of our own: no window on the
+/// user's desktop, and the caller learns the exit code. Errs when the helper is still
+/// running after `timeout`; it keeps running on its own then.
+pub fn run_hidden_as_current_session_user(cmdline: &str, timeout: Duration) -> Result<u32> {
+    let pi = launch(cmdline, None, CREATE_NO_WINDOW)?;
+    // SAFETY: `pi.hThread` is an owned handle this function does not need; closed once here.
+    let _ = unsafe { CloseHandle(pi.hThread) };
+    let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    // SAFETY: `pi.hProcess` is a live owned handle for both calls and `code` a live out-param;
+    // the handle is closed exactly once below, after its last use.
+    let (waited, got, code) = unsafe {
+        let waited = WaitForSingleObject(pi.hProcess, millis);
+        let mut code = 0u32;
+        let got = GetExitCodeProcess(pi.hProcess, &mut code);
+        let _ = CloseHandle(pi.hProcess);
+        (waited, got, code)
+    };
+    if waited != WAIT_OBJECT_0 {
+        bail!("helper still running after {timeout:?}");
+    }
+    got.context("GetExitCodeProcess")?;
+    Ok(code)
+}
+
+/// The `CreateProcessAsUserW` core both launchers share. `extra` joins the creation flags.
+/// Returns the live process and thread handles; the caller closes both.
+fn launch(
+    cmdline: &str,
+    workdir: Option<&Path>,
+    extra: PROCESS_CREATION_FLAGS,
+) -> Result<PROCESS_INFORMATION> {
     let session = current_process_session_id()?;
     let mut user_token = HANDLE::default();
     // SAFETY: `session` is a plain id and `user_token` a live local out-param; on `Ok` the call
@@ -145,7 +189,7 @@ pub fn spawn_as_current_session_user(cmdline: &str, workdir: Option<&Path>) -> R
     let mut pi = PROCESS_INFORMATION::default();
     // The streaming host sits in a kill-on-close job that permits breakaway. A detached user
     // process must outlive that host; retry inside the job when policy refuses breakaway.
-    let mut flags = CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB;
+    let mut flags = CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB | extra;
     let created = loop {
         // SAFETY: `primary` is the live primary token; `cmd`, `desktop` (via `si.lpDesktop`),
         // `workdir_w` (via `cwd`) and `merged_env` are locals that outlive the call, each
@@ -175,15 +219,7 @@ pub fn spawn_as_current_session_user(cmdline: &str, workdir: Option<&Path>) -> R
     // SAFETY: `primary` is live and owned here, closed exactly once and not used after.
     let _ = unsafe { CloseHandle(primary) };
     created.context("CreateProcessAsUserW (current-session user launch)")?;
-
-    let pid = pi.dwProcessId;
-    // SAFETY: `created` was `Ok`, so `pi` holds two owned handles; each is closed exactly once here
-    // and never used after. Closing them does not terminate the child, which owns its own lifetime.
-    unsafe {
-        let _ = CloseHandle(pi.hProcess);
-        let _ = CloseHandle(pi.hThread);
-    }
-    Ok(pid)
+    Ok(pi)
 }
 
 /// UTF-16, double-null-terminated block for `CREATE_UNICODE_ENVIRONMENT`:

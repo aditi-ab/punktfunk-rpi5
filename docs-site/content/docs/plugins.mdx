@@ -124,14 +124,69 @@ plugin from **Browse** and it carries its catalog badge instead.
 | `punktfunk-host plugins enable` | Enable + start the runner. |
 | `punktfunk-host plugins disable` | Stop + disable the runner. |
 | `punktfunk-host plugins status` | Is the runner enabled and running? |
-| `punktfunk-host plugins grant <dir>` | Let the runner read one of your own directories (Windows). |
+| `punktfunk-host plugins grant <plugin> <dir>` | Let one plugin reach a directory of yours — a ROM library, a game install dir. |
 
 A bare name resolves to the first-party package — `playnite` installs `@punktfunk/plugin-playnite`
 from Punktfunk's own registry. Any other name installs from the **public npm registry** and is
 refused unless you add `--allow-public-registry` — a guard against typos and look-alike packages.
 
-> Plugins are operator-installed code with operator privileges — they can launch games and run
-> commands. Install only plugins you trust, from a registry you control.
+## Where a plugin runs
+
+On Linux each plugin runs in its own sandbox — a separate process with an empty home, no network
+unless it asked for one, and access to just the paths it declared (plus what you granted it). It
+reaches the host through a socket the runner holds, with a token of its own, so it can publish its
+own library entries and nothing else's. The sandbox is built from the `punktfunk` block in the
+plugin's `package.json` (below), so a plugin without one does not start; update it.
+
+That needs **bubblewrap** (`bwrap`), which the packages depend on. If a host cannot build a sandbox
+— no bwrap, or a kernel with unprivileged user namespaces switched off — no plugin runs at all, and
+Troubleshooting says which of the two it is. `PUNKTFUNK_PLUGIN_SANDBOX=off` in `host.env` runs them
+in the runner's own process instead: that is your whole account, and the console says so while it
+is set.
+
+On **Windows** the runner is a low-privilege account (`NT AUTHORITY\LocalService`) rather than a
+sandbox, and plugins share it.
+
+Scripts you drop in `~/.config/punktfunk/scripts/` are your own code and are not sandboxed — the
+same as anything else you run yourself.
+
+> Plugins are operator-installed code. Install only plugins you trust, from a registry you control.
+
+## What a plugin may run
+
+A plugin never hands the host a command line. Each package declares, in its own `package.json`, the
+paths it reads and the **programs** the host may run for it — the program and the shape of its
+arguments, with a placeholder for each value:
+
+```jsonc
+"punktfunk": {
+  "schema": 1,
+  "id": "rom-manager",
+  "reads": ["~/.var/app/org.libretro.RetroArch"],
+  "exec": {
+    "retroarch": {
+      "exe": "retroarch",
+      "args": ["-f", "-L", "{core}", "{rom}"],
+      "params": { "core": "id", "rom": "path" }
+    }
+  }
+}
+```
+
+A library entry then names the template and supplies the values. The host checks each against the
+character class the template declares, refuses a path outside the directories that plugin may
+reach, and builds the argv itself — so a value is always one argument, never syntax. That
+declaration ships inside the reviewed, hash-pinned tarball; nothing the plugin says while running
+can widen it.
+
+**Your own directories.** A package cannot know where you keep your ROMs or install your games, so
+those are yours to grant:
+
+```sh
+punktfunk-host plugins grant rom-manager /mnt/games/roms
+```
+
+The plugin may then read that directory and launch from it, and nothing else on the box changes.
 
 ## Windows: a plugin that says "not installed"
 
@@ -142,7 +197,7 @@ invisible to it and reads exactly like one that isn't installed.
 When a plugin reports a path it can see but not read, grant it that one directory:
 
 ```powershell
-punktfunk-host plugins grant "C:\Users\you\AppData\Roaming\Ryujinx"
+punktfunk-host plugins grant rom-manager "C:\Users\you\AppData\Roaming\Ryujinx"
 ```
 
 That adds read-only access to that folder and everything under it; the rest of your profile stays

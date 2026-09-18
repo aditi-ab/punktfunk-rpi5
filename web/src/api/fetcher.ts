@@ -5,7 +5,8 @@
 //
 // Auth: requests are same-origin to `/api/...`; the browser sends only the session cookie
 // (the server-side proxy injects the management bearer token — the token never lives in the
-// browser). A 401 means the session is gone → bounce to /login.
+// browser). The auth middleware's 401 body means the session is gone → bounce to /login.
+// Password-confirmed actions also use 401, but leave the valid session in place.
 
 /** A failed API call. `status` is the HTTP code; `data` is the parsed `ApiError` body if any. */
 export class ApiError extends Error {
@@ -34,9 +35,19 @@ export async function apiFetch<T>(
 
 	const text = await res.text();
 	const body = text ? safeJson(text) : undefined;
-	if (res.status === 401) redirectToLogin();
+	if (res.status === 401 && isSessionUnauthorized(body)) redirectToLogin();
 	if (!res.ok) throw new ApiError(res.status, body, res.statusText);
 	return body as T;
+}
+
+/** The auth middleware's exact refusal, distinct from a wrong password confirmation. */
+function isSessionUnauthorized(body: unknown): boolean {
+	return (
+		typeof body === "object" &&
+		body !== null &&
+		"error" in body &&
+		body.error === "unauthorized"
+	);
 }
 
 /**

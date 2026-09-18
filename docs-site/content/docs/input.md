@@ -122,7 +122,7 @@ watching for the chord either way.
 
 ### Statistics with a controller
 
-The **Apple** apps reserve a second chord: **Select + X**, which cycles the
+Every client reserves a second chord: **Select + X**, which cycles the
 [stats overlay](/docs/stats) one level each time you complete it — for a pad with no keyboard and
 no free screen for the three-finger tap; on **Apple TV** it is the only way there with a pad. Both
 buttons still reach the game; only the overlay changes locally.
@@ -236,7 +236,10 @@ host would drop.
 
 On Android, iPhone and iPad a **two-finger twist** on the stream opens a dial of six buttons under
 your fingers: about 10° starts it opening, 30° commits it, and lifting short of that winds it back
-in and sends nothing. The centre button opens a sheet with the whole catalogue and the resolution
+in and sends nothing. In the **Touch** model on iPhone and iPad the twist is gone — every finger
+belongs to the host there — so the dial opens on a **two-finger pull from either side edge**
+instead: both fingers land on the bezel and come inward together. It takes nothing from the game
+until the pull finishes, and a pull that stops short was simply two touches. The centre button opens a sheet with the whole catalogue and the resolution
 presets. On Android the **Back** gesture opens the same dial at the screen centre instead of ending
 the session; on iPhone and iPad the corner disc does; on Apple TV a short press of the remote's
 Back; on Android, macOS, Linux and Windows **Ctrl+Alt+Shift+O** (**⌃⌥⇧O** on a Mac, also the
@@ -250,8 +253,12 @@ aims**: the dial highlights whatever slot your thumb points at, and letting go r
 centre — the D-pad is what steps disc by disc. **A** fires the highlight, the centre one opens the
 sheet, **Y** returns to the centre and **B** closes.
 
-A Mac hands your pointer back for as long as the dial is up, so you can click a button, and takes
-capture again when it closes. Buttons a platform cannot serve are dimmed and say why: **Touch
+On a keyboard, **Tab** steps through the six buttons and then the centre, the **arrows** aim (up is
+the top button, down the bottom, and again from either lands on the centre), **Enter** fires and
+**Esc** closes. The dial opens with the centre lit, so a first Enter opens the sheet.
+
+Every desktop hands your pointer back for as long as the dial is up, so you can click a button, and
+takes capture again when it closes. Buttons a platform cannot serve are dimmed and say why: **Touch
 mode**, **Virtual controller** and **Keyboard** on a Mac, which has no touch screen and no software
 keyboard. **Guide button** and **Quick access menu** are dimmed wherever controller input is not
 forwarded — they ride the same wire pad.
@@ -282,51 +289,6 @@ Select stays with the dial, so **Select+A** still opens it. Pointer speed follow
 resolution, so it feels the same at 1080p and 4K. For a combination the table lacks, such as
 Alt+F4, add a shortcut to the dial. The button is dimmed when no controller is connected, or when
 the host lets this device send controller input only.
-
-#### Chords
-
-A **chord** is a set of controller buttons that sends a keyboard shortcut. Hold **RB** and press
-**B** and the host gets Alt+F4; nothing sends B's own Escape, because while every button of a chord
-is down none of them acts on its own. Each chord picks when it fires:
-
-| Fires | |
-|---|---|
-| On press | The moment the last button of the chord goes down |
-| On a tap | On release, if you held it for less than the long-press time |
-| On a hold | Once, when you reach the long-press time |
-| Held | The keys go down at the long-press time and stay down until you let the chord go |
-
-The same buttons can carry a tap chord and a hold chord at once — that is how **RB+B** closes a
-window on a tap and force-quits it on a hold. **Held** is the one for desktop work: put Super on a
-bumper, hold it and push the left stick to drag a window where you want it. A button borrowed by a
-chord you did not hold long enough still sends what it normally sends, so a bumper can be Ctrl on a
-tap and Super on a hold.
-
-#### Customising the layout
-
-Every button above is a starting point, not a fixed wiring. The whole table — which button sends
-what, the chords, pointer and scroll speed, the stick deadzone and the long-press time — is one
-document your client hands to the host:
-
-```json
-{
-  "settings": { "pointer": 1.0, "scroll": 1.0, "deadzone": 0.2, "long_press_ms": 400 },
-  "buttons": { "A": "mouse:left", "RT": "key:Meta", "B": "key:Escape" },
-  "chords": [
-    { "name": "Close window", "buttons": ["RB", "B"], "press": "short", "keys": ["Alt", "F4"] }
-  ]
-}
-```
-
-Buttons are named `A B X Y LB RB LT RT LS RS Guide Start Back Up Down Left Right`. An output is
-`mouse:left`, `mouse:middle`, `mouse:right`, or `key:` and a key name — the same names the dial's
-shortcut editor takes, so `key:Escape`, `key:F4` and `key:Meta` all work. `press` is `any`, `short`,
-`long` or `hold`, matching the table above. `pointer` and `scroll` multiply the shipped speeds, so
-`2.0` is twice as fast. Two buttons may share one output: `A` and `RT` both send the left click, and
-holding either keeps it down.
-
-A change takes effect the next time you switch that controller into Controller mouse — a drag in
-progress is never re-wired under your thumb — and clearing the layout puts the shipped table back.
 
 ### Virtual controller
 

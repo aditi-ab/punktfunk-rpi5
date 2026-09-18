@@ -124,6 +124,11 @@ public final class VideoDecoder: @unchecked Sendable {
     /// bitstream framing (H.264/HEVC NAL parsing vs AV1 OBU repack). Read under `lock`.
     private var codec: VideoCodec = .hevc
 
+    /// The negotiated encode depth (`connection.bitDepth`), set once at session start. 10 asks
+    /// the decoder for a 10-bit buffer whether or not the stream is HDR: 10-bit SDR is Main10
+    /// under BT.709. Read inside `createSessionLocked` under `lock`.
+    private var bitDepth: UInt8 = 8
+
     public init(
         onDecoded: @escaping @Sendable (ReadyFrame) -> Void,
         onDecodeError: @escaping @Sendable (OSStatus) -> Void = { _ in }
@@ -148,6 +153,15 @@ public final class VideoDecoder: @unchecked Sendable {
     public func setCodec(_ c: VideoCodec) {
         lock.lock()
         codec = c
+        lock.unlock()
+    }
+
+    /// Select the decode bit depth from the session's negotiated depth (`connection.bitDepth`,
+    /// 8 or 10). Call once at session start, before decoding. Takes effect on the next session
+    /// (re)build. Thread-safe.
+    public func setBitDepth(_ bits: UInt8) {
+        lock.lock()
+        bitDepth = bits
         lock.unlock()
     }
 
@@ -246,6 +260,18 @@ public final class VideoDecoder: @unchecked Sendable {
             || s == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
     }
 
+    /// PQ/HLG verdict from a decoded buffer's own transfer attachment, or `nil` when it carries
+    /// none. Same rule as `isHDRFormat`, read per frame on the VT thread where the session's
+    /// format is not ours to touch.
+    static func transferIsHDR(_ buffer: CVImageBuffer) -> Bool? {
+        guard let att = CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil),
+            CFGetTypeID(att) == CFStringGetTypeID()
+        else { return nil }
+        let s = unsafeDowncast(att, to: CFString.self)
+        return CFEqual(s, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ)
+            || CFEqual(s, kCVImageBufferTransferFunction_ITU_R_2100_HLG)
+    }
+
     /// Replace the session for `newFormat` while `lock` is held.
     ///
     /// Chroma and HDR signaling choose the biplanar output format. Every output is both Metal-
@@ -262,12 +288,13 @@ public final class VideoDecoder: @unchecked Sendable {
         session = nil
         format = nil
 
-        // Decode pixel format is a 2×2 of (chroma, depth/HDR), both biplanar so the presenter binds
+        // Decode pixel format is a 2×2 of (chroma, depth), both biplanar so the presenter binds
         // plane 0 = luma, plane 1 = interleaved chroma uniformly — 4:4:4 just delivers a full-size
-        // chroma plane. 10-bit (P010 / `x444`) for HDR (PQ/HLG), 8-bit (NV12 / `444v`) otherwise.
-        let hdr = Self.isHDRFormat(newFormat)
+        // chroma plane. Depth is its own axis: HDR is always 10-bit, and a 10-bit SDR session
+        // (Main10 under BT.709) takes the same P010 / `x444` buffer without being HDR.
+        let tenBit = Self.isHDRFormat(newFormat) || bitDepth >= 10
         let pixelFormat: OSType = {
-            switch (chroma444, hdr) {
+            switch (chroma444, tenBit) {
             case (false, false): return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange // NV12
             case (false, true): return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange // P010
             case (true, false): return kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange // 444v
@@ -332,17 +359,16 @@ public final class VideoDecoder: @unchecked Sendable {
         // pts was stamped at timescale 1e9 (AnnexB.sampleBuffer); normalize defensively.
         let p = CMTimeConvertScale(pts, timescale: 1_000_000_000, method: .default)
         let ptsNs = p.value > 0 ? UInt64(p.value) : 0
-        // HDR iff the decoder produced a 10-bit buffer (we only request a 10-bit format for PQ/HLG
-        // streams). Covers 4:2:0 (P010) and 4:4:4 (`x444`), video- and full-range, so a 10-bit 4:4:4
-        // HDR frame isn't misclassified as SDR. (The mastering metadata is applied to the presenter's
-        // CAMetalLayer via CAEDRMetadata, not to this source buffer — a separate-drawable presenter
-        // never composites the source buffer's attachments, so attaching them here would be dead.)
+        // HDR is the transfer function, never the depth: 10-bit SDR decodes to P010 too, and
+        // calling that HDR paints the layer PQ and blows the picture out. A buffer carrying no
+        // transfer attachment falls back to depth, as this did before.
         let fmt = CVPixelBufferGetPixelFormatType(imageBuffer)
-        let isHDR =
+        let tenBitBuffer =
             fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             || fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
             || fmt == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange
             || fmt == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange
+        let isHDR = Self.transferIsHDR(imageBuffer) ?? tenBitBuffer
         onDecoded(
             ReadyFrame(
                 ptsNs: ptsNs, receivedNs: receivedNs, decodedNs: decodedNs,

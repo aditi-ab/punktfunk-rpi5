@@ -7,10 +7,11 @@ import AppKit
 /// Drives the hosting window in/out of native fullscreen from SwiftUI state, and mirrors the
 /// window's ACTUAL fullscreen state back into `isFullscreen` (the user can also toggle it with the
 /// green button / ⌃⌘F — ContentView keys the session view's safe-area handling off the real state,
-/// not the setting). Mounted invisibly in the view tree; on each `active` change it captures the
-/// window and toggles fullscreen only when the current state differs (so it never fights a toggle
-/// already in flight, and never touches a window the user fullscreened manually unless `active`
-/// says otherwise).
+/// not the setting). It toggles only on an `active` edge, and leaves only a fullscreen it entered.
+///
+/// SwiftUI rebuilds this view at every home ⇄ stream switch, and the old instance's pending pass
+/// still runs. So the edge and the ownership live in `edge`, which the window's root view owns
+/// and every instance shares: the first pass to see an edge acts on it, the rest see no edge.
 struct FullscreenController: NSViewRepresentable {
     let active: Bool
     @Binding var isFullscreen: Bool
@@ -18,18 +19,22 @@ struct FullscreenController: NSViewRepresentable {
     /// user fullscreened themselves is not ours to leave, and an alert deferred on "fullscreen"
     /// alone would never show there, since nothing is going to flip it back.
     @Binding var appDriven: Bool
+    let edge: Edge
+
+    /// One per window, held in `@State` by the view that mounts the controller.
+    final class Edge {
+        /// The last `active` value acted on. A mismatch alone never toggles, so a mid-session
+        /// ⌃⌘F or green-button toggle stays put.
+        var lastActive: Bool?
+        /// Did WE put this window into fullscreen? Only then may we take it out.
+        var droveEntry = false
+    }
 
     /// Holds the window's fullscreen-transition observers so they're rebound on a window change
     /// and removed on dismantle.
     final class Coordinator {
         var observers: [NSObjectProtocol] = []
         weak var observedWindow: NSWindow?
-        /// The last `active` value we DROVE the window to. We toggle only when `active` itself
-        /// changes (stream start/end) — never to correct a mismatch — so a deliberate mid-session
-        /// toggle (⌃⌘F / the green button) isn't snapped back on the next SwiftUI update.
-        var lastActive: Bool?
-        /// Did WE put this window into fullscreen? Only then may we take it out.
-        var droveEntry = false
         deinit { observers.forEach(NotificationCenter.default.removeObserver(_:)) }
     }
 
@@ -41,30 +46,27 @@ struct FullscreenController: NSViewRepresentable {
         let want = active
         let isFullscreen = $isFullscreen
         let appDriven = $appDriven
+        let edge = edge
         let coordinator = context.coordinator
         DispatchQueue.main.async {
             guard let window = view.window else { return }
             observeTransitions(of: window, coordinator: coordinator)
             let isFull = window.styleMask.contains(.fullScreen)
             if isFullscreen.wrappedValue != isFull { isFullscreen.wrappedValue = isFull }
-            // Drive the window only on an `active` EDGE (stream start/end), not to close a mismatch —
-            // so a user's ⌃⌘F / green-button toggle stays put. First pass (lastActive == nil) just
-            // records the state without toggling, so mounting never yanks a window into fullscreen.
-            if coordinator.lastActive != want {
-                coordinator.lastActive = want
-                if want, !isFull {
-                    window.toggleFullScreen(nil)
-                    coordinator.droveEntry = true
-                } else if !want, isFull, coordinator.droveEntry {
-                    window.toggleFullScreen(nil)
-                    coordinator.droveEntry = false
-                } else if !want {
-                    // The session ended in a fullscreen the USER chose — leave the window in it.
-                    coordinator.droveEntry = false
-                }
-                if appDriven.wrappedValue != coordinator.droveEntry {
-                    appDriven.wrappedValue = coordinator.droveEntry
-                }
+            guard edge.lastActive != want else { return }
+            edge.lastActive = want
+            if want, !isFull {
+                window.toggleFullScreen(nil)
+                edge.droveEntry = true
+            } else if !want, isFull, edge.droveEntry {
+                window.toggleFullScreen(nil)
+                edge.droveEntry = false
+            } else if !want {
+                // The session ended in a fullscreen the USER chose — leave the window in it.
+                edge.droveEntry = false
+            }
+            if appDriven.wrappedValue != edge.droveEntry {
+                appDriven.wrappedValue = edge.droveEntry
             }
         }
     }

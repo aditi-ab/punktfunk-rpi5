@@ -30,12 +30,10 @@ public enum TouchInputMode: String, CaseIterable, Sendable {
     case pointer
     case touch
 
-    /// The persisted setting, defaulting to trackpad when unset/unknown — unless the ring's
-    /// Touch mode slot cycled it for this session (`sessionOverride`, cleared at session end).
-    public static var current: TouchInputMode {
-        sessionOverride ?? TouchInputMode(
-            rawValue: SessionSettings.current.touchMode
-        ) ?? .trackpad
+    /// The session's setting, defaulting to trackpad when unknown — unless the ring's Touch mode
+    /// slot cycled it for this session (`sessionOverride`, cleared at session end).
+    public static func current(_ settings: EffectiveSettings) -> TouchInputMode {
+        sessionOverride ?? TouchInputMode(rawValue: settings.touchMode) ?? .trackpad
     }
 
     /// A mid-stream switch from the quick-action ring: session-scoped, never persisted, and
@@ -94,6 +92,8 @@ final class TouchMouse {
 
     /// Wire events out (the owner gates them on its capture state).
     var send: ((PunktfunkInputEvent) -> Void)?
+    /// The session's invert-scroll setting, for the two-finger scroll that sends directly.
+    var invertScroll = false
     /// View-space point → host-mode pixels through the letterbox (pointer mode's moves).
     var hostPoint: ((CGPoint) -> StreamLayerUIView.HostPoint?)?
     /// Three-finger vertical swipe crossed the threshold: `true` = show the local soft
@@ -381,9 +381,8 @@ final class TouchMouse {
             scrolling = true
             scrollAnchor = dial?.anchor ?? CGPoint(x: cx, y: cy)
         }
-        // Read live, like `InputCapture.sendScroll`: this path sends straight to the
-        // connection, so the invert setting is applied here.
-        let gain = Tuning.scrollUnitsPerPt * (SessionSettings.current.invertScroll ? -1 : 1)
+        // This path sends straight to the connection, so the invert setting is applied here.
+        let gain = Tuning.scrollUnitsPerPt * (invertScroll ? -1 : 1)
         scrollCarry.y += (scrollAnchor.y - cy) * gain
         scrollCarry.x += (cx - scrollAnchor.x) * gain
         scrollAnchor = CGPoint(x: cx, y: cy)
@@ -485,11 +484,10 @@ final class TouchMouse {
         }
     }
 
-    /// Three-finger tap cycles the stats overlay tiers (off → compact → normal → detailed) —
-    /// through the shared `statsVerbosity` default, which the app's HUD views observe via
-    /// @AppStorage (so this needs no wiring to them). Same cycle as Android's triple-tap.
+    /// Three-finger tap cycles the stats overlay tiers (off → compact → normal → detailed). Same
+    /// cycle as Android's triple-tap.
     private static func cycleStats() {
-        StatsVerbosity.cycle()
+        StatsVerbosity.requestCycle(for: nil)
     }
 }
 #endif

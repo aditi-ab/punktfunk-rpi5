@@ -458,10 +458,14 @@ pub(crate) struct ReconcileQuery {
 )]
 pub(crate) async fn reconcile_provider_entries(
     Extension(lane): Extension<AuthLane>,
+    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
     Path(provider): Path<String>,
     Query(q): Query<ReconcileQuery>,
     ApiJson(mut inputs): ApiJson<Vec<crate::library::ProviderEntryInput>>,
 ) -> Response {
+    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &provider) {
+        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
+    }
     if let Err(e) = crate::library::validate_provider_name(&provider) {
         return api_error(StatusCode::BAD_REQUEST, &e);
     }
@@ -471,7 +475,7 @@ pub(crate) async fn reconcile_provider_entries(
             return api_error(StatusCode::BAD_REQUEST, &e);
         }
     }
-    if let Err(e) = crate::library::validate_provider_payload(&inputs) {
+    if let Err(e) = crate::library::validate_provider_payload(&provider, &inputs) {
         return api_error(StatusCode::BAD_REQUEST, &e);
     }
     // Check every entry: one privileged field anywhere is one command the host would run.
@@ -562,7 +566,13 @@ pub(crate) async fn reconcile_provider_entries(
         (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the catalog", body = ApiError),
     )
 )]
-pub(crate) async fn delete_provider_entries(Path(provider): Path<String>) -> Response {
+pub(crate) async fn delete_provider_entries(
+    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
+    Path(provider): Path<String>,
+) -> Response {
+    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &provider) {
+        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
+    }
     if let Err(e) = crate::library::validate_provider_name(&provider) {
         return api_error(StatusCode::BAD_REQUEST, &e);
     }

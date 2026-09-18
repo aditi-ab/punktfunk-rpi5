@@ -365,11 +365,20 @@ fn open_video_backend_linux(
         // the open makes). Gamescope has no embedded cursor — CSC blend is the
         // only pointer path. A `no` goes to VAAPI here, not a failed open.
         #[cfg(feature = "vulkan-encode")]
-        let ten_bit_session = bit_depth == 10 && format.is_hdr_rgb10();
+        let is_hdr = format.is_hdr();
+        // 10-bit SDR (8-bit capture, depth 10). HEVC stays on VAAPI (Main10 under BT.709); AV1 has
+        // no VAAPI path, so it takes Vulkan with the depth forced (Vulkan gets `bit_depth`) and the
+        // BT.709 colour axis (`rgb2yuv10_709.comp`).
         #[cfg(feature = "vulkan-encode")]
-        if matches!(codec, Codec::H265 | Codec::Av1)
+        let sdr10 = bit_depth == 10 && !is_hdr;
+        // Depth Vulkan opens at: HDR-10, or AV1 10-bit SDR; else 8-bit.
+        #[cfg(feature = "vulkan-encode")]
+        let vk_ten_bit = bit_depth == 10 && (is_hdr || codec == Codec::Av1);
+        #[cfg(feature = "vulkan-encode")]
+        if !(sdr10 && codec == Codec::H265)
+            && matches!(codec, Codec::H265 | Codec::Av1)
             && vulkan_encode_enabled()
-            && vulkan_encode_available_at(codec, ten_bit_session)
+            && vulkan_encode_available_at(codec, vk_ten_bit)
         {
             match vulkan_video::VulkanVideoEncoder::open(
                 codec,
@@ -379,6 +388,7 @@ fn open_video_backend_linux(
                 fps,
                 bitrate_bps,
                 cursor_blend,
+                bit_depth,
             ) {
                 Ok(e) => {
                     tracing::info!(
@@ -395,8 +405,8 @@ fn open_video_backend_linux(
             }
         }
         // The native session takes every capture shape, NV12 dmabufs included.
-        // H.264 and HEVC; AV1 on AMD/Intel is Vulkan Video's.
-        let _ = format;
+        // H.264 and HEVC; AV1 on AMD/Intel is Vulkan Video's. HDR is the packed 10-bit or P010
+        // capture; 10-bit SDR arrives as an 8-bit surface at depth 10.
         vaapi_native::NativeVaapiEncoder::open(
             codec,
             width,
@@ -405,6 +415,7 @@ fn open_video_backend_linux(
             bitrate_bps,
             bit_depth,
             chroma,
+            format.is_hdr(),
         )
         .map(|e| (Box::new(e) as Box<dyn Encoder>, "vaapi-native"))
     };
@@ -444,6 +455,7 @@ fn open_video_backend_linux(
                     fps,
                     bitrate_bps,
                     cursor_blend,
+                    bit_depth,
                 )
                 .map(|e| (Box::new(e) as Box<dyn Encoder>, "vulkan"))
             }
@@ -665,33 +677,41 @@ fn open_nvenc(
 /// A failed open falls back to VAAPI. See `design/linux-vulkan-video-encode.md`.
 #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
 fn vulkan_encode_enabled() -> bool {
-    std::env::var("PUNKTFUNK_VULKAN_ENCODE")
+    pf_host_config::knob("PUNKTFUNK_VULKAN_ENCODE")
         .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
         .unwrap_or(true)
 }
 
-/// Whether this session can ingest producer-native NV12. Only Vulkan Video
-/// can; the VAAPI session takes RGB from the compositor.
-///
-/// Once the producer has been asked for two-plane NV12 there is **no
-/// fallback**. [`open_video`] makes a failed Vulkan open fatal rather than
-/// degrade to VAAPI (silent garbage). A wrong `true` kills the session at
-/// its first frame. Conjuncts are cheapest-first; the device probe runs last.
+/// Whether this session can ingest a producer's own NV12 without a host pass. Both AMD/Intel
+/// lanes can: Vulkan Video imports it as its picture, the native libva session encodes it as
+/// imported. AV1 is Vulkan Video's alone. The NVENC lane's fused convert reads RGB only.
 #[cfg(target_os = "linux")]
 pub fn linux_native_nv12_ok(codec: Codec) -> bool {
-    #[cfg(feature = "vulkan-encode")]
-    {
-        matches!(codec, Codec::H265 | Codec::Av1)
-            && vulkan_encode_enabled()
-            // Same auto+pref decision `open_video` makes. A denylist of explicit
-            // skip prefs misses `""` → `auto` → NVENC on NVIDIA.
-            && linux_zero_copy_is_vaapi()
-            // Last: this opens a Vulkan instance.
-            && vulkan_encode_available(codec)
+    if !linux_zero_copy_is_vaapi() {
+        return false;
     }
-    #[cfg(not(feature = "vulkan-encode"))]
+    match codec {
+        Codec::H264 | Codec::H265 => true,
+        #[cfg(feature = "vulkan-encode")]
+        Codec::Av1 => vulkan_encode_enabled() && vulkan_encode_available(codec),
+        _ => false,
+    }
+}
+
+/// May the capture hand the NVENC lane its held dmabufs? The encoder's zero-copy worker then
+/// converts each straight into a registered input slot (`PUNKTFUNK_NVENC_RAW`). Off without
+/// direct-SDK NVENC, on the VAAPI plane, or once the raw-dmabuf latch tripped.
+#[cfg(target_os = "linux")]
+pub fn linux_nvenc_raw_dmabuf_ok() -> bool {
+    #[cfg(feature = "nvenc")]
     {
-        let _ = codec;
+        !linux_zero_copy_is_vaapi()
+            && pf_zerocopy::nvenc_raw_enabled()
+            && !pf_zerocopy::raw_dmabuf_import_disabled()
+            && pf_zerocopy::fused_convert_available()
+    }
+    #[cfg(not(feature = "nvenc"))]
+    {
         false
     }
 }
@@ -1408,6 +1428,57 @@ pub fn resolved_backend_ingests_rgb_444() -> bool {
 }
 #[cfg(not(target_os = "windows"))]
 pub fn resolved_backend_ingests_rgb_444() -> bool {
+    false
+}
+
+/// Encoder half of the 10-bit SDR gate: this backend writes a 10-bit stream from the 8-bit
+/// surface an SDR desktop captures.
+///
+/// Windows direct-NVENC ingests the IDD packed `Rgb10a2Sdr`; Windows AMF takes a BT.709 P010 the
+/// driver's video processor produces (HEVC only). Linux direct-NVENC takes the plain 8-bit surface
+/// and asks NVENC for 10-bit output. Linux VAAPI carries HEVC and Vulkan Video carries AV1, both
+/// with the RGB→YUV matrix following the BT.709 colour, not depth. The GPU still has to pass
+/// `can_encode_10bit`.
+#[cfg(target_os = "windows")]
+pub fn backend_carries_sdr10(codec: Codec) -> bool {
+    // NVENC widens 8→10 from packed RGB for HEVC + AV1. AMF takes a BT.709 P010 the driver's video
+    // processor produces (`EncodeInput::P010Sdr`) for HEVC Main10 only — AV1 10-bit SDR on AMF is
+    // unbuilt. `can_encode_10bit` still gates on the real probe.
+    match windows_resolved_backend() {
+        WindowsBackend::Nvenc => true,
+        WindowsBackend::Amf => codec == Codec::H265,
+        _ => false,
+    }
+}
+/// Can Vulkan Video encode `codec` at 10-bit on the selected GPU, and is it enabled? The AV1
+/// 10-bit SDR path on AMD/Intel routes here; the probe is cached per (GPU, codec).
+#[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
+fn vulkan_sdr10_available(codec: Codec) -> bool {
+    vulkan_encode_enabled() && vulkan_encode_available_at(codec, true)
+}
+#[cfg(all(target_os = "linux", not(feature = "vulkan-encode")))]
+fn vulkan_sdr10_available(_codec: Codec) -> bool {
+    false
+}
+#[cfg(target_os = "linux")]
+pub fn backend_carries_sdr10(codec: Codec) -> bool {
+    // Direct NVENC (HEVC + AV1) widens 8→10 from packed RGB. On AMD/Intel, VAAPI carries HEVC
+    // Main10 under BT.709, and Vulkan Video carries AV1 10-bit SDR (`rgb2yuv10_709.comp`) where the
+    // device offers a 10-bit AV1 profile. The encoder degrades a planar surface to 8-bit if some
+    // path delivers one.
+    match linux_resolved_backend() {
+        LinuxBackend::Nvenc => cfg!(feature = "nvenc"),
+        LinuxBackend::AmdIntel => {
+            codec == Codec::H265 || (codec == Codec::Av1 && vulkan_sdr10_available(codec))
+        }
+        LinuxBackend::Vulkan => {
+            matches!(codec, Codec::H265 | Codec::Av1) && vulkan_sdr10_available(codec)
+        }
+        _ => false,
+    }
+}
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn backend_carries_sdr10(_codec: Codec) -> bool {
     false
 }
 

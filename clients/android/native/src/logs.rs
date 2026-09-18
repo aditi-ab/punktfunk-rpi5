@@ -7,6 +7,7 @@
 
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JObject, JString};
+use jni::sys::jint;
 use jni::EnvUnowned;
 
 /// `NativeBridge.nativeRenderLogs(header): String` — the ring as one text bundle, oldest
@@ -24,4 +25,44 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRenderLogs<
         env.new_string(pf_client_core::logring::render(&header))
     })
     .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeLogWifiLink(reason, rssiDbm, txMbps, rxMbps, freqMhz, standard)` — one
+/// `pf.wifi` line in the ring. Kotlin reads the link and decides when (`WifiLinkLog`); its own
+/// `Log` reaches logcat but never a "Send logs" bundle. `-1` is unknown; `freqMhz` ≤ 0 is off Wi-Fi.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeLogWifiLink<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    reason: JString<'local>,
+    rssi_dbm: jint,
+    tx_mbps: jint,
+    rx_mbps: jint,
+    freq_mhz: jint,
+    standard: jint,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let reason = reason.try_to_string(env)?;
+        log::info!(
+            target: "pf.wifi",
+            "link reason={reason} rssiDbm={rssi_dbm} txMbps={tx_mbps} rxMbps={rx_mbps} \
+             freqMhz={freq_mhz} standard={}",
+            wifi_standard(standard)
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `WifiInfo.getWifiStandard()` by its IEEE name (`ScanResult.WIFI_STANDARD_*`).
+fn wifi_standard(code: jint) -> &'static str {
+    match code {
+        1 => "legacy",
+        4 => "11n",
+        5 => "11ac",
+        6 => "11ax",
+        7 => "11ad",
+        8 => "11be",
+        _ => "?",
+    }
 }

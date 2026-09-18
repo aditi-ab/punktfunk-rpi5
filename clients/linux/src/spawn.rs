@@ -67,16 +67,15 @@ fn plan_for(req: &ConnectRequest, fp_hex: &str, tofu: bool, opts: &SpawnOpts) ->
     plan
 }
 
-/// Spawn the session binary for a connect with `fp_hex` pinned and translate its
-/// lifecycle into [`AppMsg`]s. `tofu` = the fingerprint came from the host's advert
-/// rather than the store — the app persists it once the child reports ready (the child
-/// connects pinned to it, so ready proves the host really holds that identity).
+/// Spawns the session with `fp_hex` pinned and translates its lifecycle into
+/// [`AppMsg`]s. A ready event carries the request's cancel handle so the main loop
+/// rejects approval that was queued while Cancel ran.
 ///
-/// Settings are NOT a parameter: the plan resolves them (including the fullscreen policy,
-/// which is a presetable field — a shell-read global would override a preset that set it).
+/// `tofu` persists an advertised fingerprint only after ready proves the host owns it.
+/// The plan supplies all effective settings, including preset fullscreen policy.
 ///
-/// The caller has already taken `busy`; [`AppMsg::SessionExited`] releases it. `Err` =
-/// the spawn itself failed (binary missing?) — surfaced as a connect error.
+/// The caller takes `busy`; [`AppMsg::SessionExited`] releases it. `Err` reports a
+/// spawn failure before supervision starts.
 pub fn spawn_session(
     sender: relm4::Sender<AppMsg>,
     req: ConnectRequest,
@@ -86,6 +85,7 @@ pub fn spawn_session(
 ) -> Result<(), String> {
     let plan = plan_for(&req, &fp_hex, tofu, &opts);
     let persist_paired = opts.persist_paired;
+    let cancel = opts.cancel.clone();
     let (mut error, mut ended) = (None::<(String, bool)>, None::<String>);
     orchestrate::spawn_session(&plan, opts.cancel, move |ev| match ev {
         SessionEvent::Ready => {
@@ -94,6 +94,7 @@ pub fn spawn_session(
                 fp_hex: fp_hex.clone(),
                 tofu,
                 persist_paired,
+                cancel: cancel.clone(),
             });
         }
         SessionEvent::Error {

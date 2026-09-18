@@ -48,7 +48,7 @@ Remove the setting while you stream from nearby, or turn the host's volume down.
 
 Friends streaming in while you talk on Discord on the host hear **themselves** a beat late: the
 stream captures Discord's playback along with the game. Keep the voice app out of the stream with
-`PUNKTFUNK_AUDIO_VOICE_CHAT=host` on a Linux host — the full recipe is in
+`PUNKTFUNK_AUDIO_VOICE_CHAT=host` — the full recipe, for Linux and Windows, is in
 [Friends over the internet](/docs/friends-over-the-internet#voice-chat-while-they-play).
 
 ## Virtual mixers (VoiceMeeter and friends)

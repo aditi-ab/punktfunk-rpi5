@@ -139,6 +139,13 @@ public final class InputCapture {
     /// absolute-vs-relative forwarding lives entirely in StreamLayerView. Main queue.
     public var onToggleMouseMode: (() -> Void)?
 
+    #if os(macOS)
+    /// Whether a key event belongs to this capture's window. Every capture's key monitor sees
+    /// every key the app receives, so one that swallowed a chord for another window would
+    /// leave that window's stream without it. nil = every event.
+    public var ownsEvent: ((NSEvent) -> Bool)?
+    #endif
+
     /// The cross-client combos (Windows/Linux parity: Ctrl+Alt+Shift+Q/D/S), fired from the macOS
     /// keyDown monitor only WHILE FORWARDING — that's the state in which the app's menu (which
     /// carries the same key equivalents for discoverability) can't see them, so the monitor is the
@@ -292,7 +299,7 @@ public final class InputCapture {
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.keyDown]
         ) { [weak self] event in
-            guard let self else { return event }
+            guard let self, self.ownsEvent?(event) ?? true else { return event }
             let flags = Self.chordFlags(event)
             if event.keyCode == 53 /* Esc */, flags == .command {
                 self.suppressedVK = 0x1B // VK_ESC — its keyUp still reaches the responder chain
@@ -351,25 +358,12 @@ public final class InputCapture {
                 self.onToggleFullscreen?()
                 return nil
             }
-            // Every OTHER ⌘ chord belongs to the HOST while captured — the cross-client "capture
-            // system shortcuts" setting, which the Apple client had no answer to because SDL's
-            // keyboard grab is what implements it everywhere else. Without this the app menu's key
-            // equivalents fire first, so ⌘Q quits the client instead of reaching the compositor as
-            // Super+Q — one of the most-bound chords on a Linux desktop, and the reported break.
-            //
-            // It has to SEND from here: returning nil is what keeps the menu out, and it takes
-            // StreamLayerView's keyDown — the host's only key path on macOS — out with it.
-            // Chords with no host VK are swallowed but not sent: doing nothing beats a menu
-            // opening under a captured stream. The ⌘ itself needs no handling — modifiers arrive
-            // as flagsChanged, which this monitor never sees, so it was already forwarded as
-            // VK_LWIN/VK_RWIN (or Alt, under the Windows modifier layout) when it went down.
-            //
-            // The two cheap conditions are repeated in front of the call on purpose: off-session,
-            // `SessionSettings.current` re-reads the whole defaults suite, and this monitor sees
-            // every keystroke the app receives — including the ones typed into the host list.
+            // Every OTHER ⌘ chord is the HOST's while captured, or the menu takes ⌘Q first. It is
+            // sent from here, since returning nil also skips StreamLayerView's keyDown; a chord
+            // with no host VK is swallowed. The ⌘ itself already went out as a flagsChanged.
             if self.forwarding, flags.contains(.command), Self.forwardsCommandChord(
                 keyCode: event.keyCode, flags: flags, forwarding: self.forwarding,
-                inhibitShortcuts: SessionSettings.current.inhibitShortcuts
+                inhibitShortcuts: self.connection.settings.inhibitShortcuts
             ) {
                 if let vk = Self.keyCodeToVK[event.keyCode] { self.sendCommandChordKey(vk) }
                 return nil
@@ -501,10 +495,10 @@ public final class InputCapture {
     /// The single wire boundary for a key event. Every `.key` send funnels through here so the
     /// active location-based modifier layout is applied in exactly one place while all internal
     /// press/release bookkeeping (`pressedVKs`, `cmdKeysDown`, `resolveModifier`'s `isDown`) stays on
-    /// the physical VK. Read live from the setting so a mid-session change (rare) takes on the next
-    /// key without re-arming capture. Non-modifier VKs pass through untouched.
+    /// the physical VK. The layout is the session's. Non-modifier VKs pass through untouched.
     private func emitKey(_ vk: UInt32, down: Bool) {
-        connection.send(.key(Self.applyModifierLayout(vk, ModifierLayout.current), down: down))
+        let layout = ModifierLayout(rawValue: connection.settings.modifierLayout) ?? .mac
+        connection.send(.key(Self.applyModifierLayout(vk, layout), down: down))
     }
 
     /// Release any held MOUSE buttons host-side, leaving keyboard state untouched. Used when
@@ -754,7 +748,7 @@ public final class InputCapture {
     /// failure mode to design against. Installed on the main run loop on purpose: a hung main thread
     /// trips the tap's timeout and macOS disables it, handing the keyboard back.
     private func installSystemKeyTap() {
-        guard systemKeyTap == nil, SessionSettings.current.inhibitShortcuts, AXIsProcessTrusted()
+        guard systemKeyTap == nil, connection.settings.inhibitShortcuts, AXIsProcessTrusted()
         else { return }
         let mask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
         let callback: CGEventTapCallBack = { _, type, event, userInfo in
@@ -968,7 +962,7 @@ public final class InputCapture {
         // which sends straight to the connection and reads the same setting itself. Residuals are
         // accumulated AFTER inversion so a direction change between events doesn't strand a
         // fractional remainder of the old sign.
-        let invert = SessionSettings.current.invertScroll
+        let invert = connection.settings.invertScroll
         let dx = invert ? -rawDx : rawDx
         let dy = invert ? -rawDy : rawDy
         let fy = dy + residualScrollY

@@ -62,6 +62,10 @@ fn cadence_budget(
 
 /// The wire flags for one access unit: picture, keyframe, and the recovery marks the client
 /// lifts its post-loss freeze on.
+///
+/// The single point where the encoder's answer to an RFI is visible, so the per-minute link
+/// line is counted here: a clean anchor P, or the start of a wave (`recovery_point` without
+/// `recovery_close`). The host's own periodic boundary marking is not a wave start.
 #[allow(clippy::too_many_arguments)]
 fn au_flags(
     caps: &crate::encode::EncoderCaps,
@@ -71,7 +75,9 @@ fn au_flags(
     recovery_close: bool,
     recovery_anchor: bool,
     chunk_aligned: bool,
+    link: &crate::link_health::LinkCounters,
 ) -> u32 {
+    link.note_recovery_au(recovery_anchor, recovery_point && !recovery_close);
     let mut flags = if keyframe {
         (FLAG_PIC | FLAG_SOF) as u32
     } else {
@@ -440,6 +446,7 @@ impl StreamState {
                     c.recovery_close,
                     c.recovery_anchor,
                     c.chunk_aligned,
+                    &self.counters.link,
                 );
                 self.send_hdr_meta(c.keyframe, resend_meta);
                 self.bringup.mark("first_au");
@@ -532,6 +539,7 @@ impl StreamState {
             au.recovery_close,
             au.recovery_anchor,
             au.chunk_aligned,
+            &self.counters.link,
         );
         self.send_hdr_meta(au.keyframe, resend_meta);
         // As in the chunked arm: the driver's stamps, not a host submit that never happened.

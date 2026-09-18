@@ -164,8 +164,8 @@ virtual output at exactly this client's resolution and refresh rate — no scali
 %package web
 Summary:        punktfunk management web console (Nitro SSR on bun + React)
 # Runtime is BUN (the console uses Nitro's `bun` preset + a Bun.serve TLS entry — node can't
-# run it). Bun isn't in Fedora repos, so we VENDOR a bun binary into the package, which makes this
-# subpackage arch-specific (it can no longer be noarch). No system nodejs/bun dependency.
+# run it), from punktfunk-bun, pinned to this exact build. No system nodejs/bun dependency.
+Requires:       %{name}-bun%{?_isa} = %{version}-%{release}
 
 %description web
 The browser console for a punktfunk streaming host: status, paired devices, and the SPAKE2
@@ -173,26 +173,40 @@ PIN pairing flow every client needs. Runs as a systemd --user service on port 30
 (HTTP/1.1 over TLS, with the host's own identity cert), login-gated (a password generated on first
 start), proxying the host's loopback HTTPS management API with a bearer token injected server-side
 (never sent to the browser). Auto-wired to the host on a packaged install — it sources the host's
-mgmt token, identity cert, and a generated login password, no env editing. Bundles its own bun
-runtime. Enable with `systemctl --user enable --now punktfunk-web`.
+mgmt token, identity cert, and a generated login password, no env editing. Runs on the bun from
+punktfunk-bun. Enable with `systemctl --user enable --now punktfunk-web`.
 %endif
 
 %if %{with scripting}
 %package scripting
 Summary:        punktfunk plugin/script runner (Effect SDK on bun)
-# Runtime is BUN — the runner import()s the operator's .ts plugin files, which only bun can do. bun
-# isn't in Fedora repos, so we VENDOR it into the package (arch-specific, not noarch). The runner
-# itself is bundled to ONE self-contained JS (effect + SDK inlined), so no node_modules ship.
+# Each plugin runs in its own bwrap sandbox; without it the runner starts no plugin at all.
+Requires:       bubblewrap
+# Runtime is BUN — the runner import()s the operator's .ts plugin files, which only bun can do —
+# from punktfunk-bun, pinned to this exact build. The runner itself is bundled to ONE
+# self-contained JS (effect + SDK inlined), so no node_modules ship.
+Requires:       %{name}-bun%{?_isa} = %{version}-%{release}
 
 %description scripting
 The plugin/script runner for a punktfunk streaming host: it discovers loose scripts under
 ~/.config/punktfunk/scripts and installed punktfunk-plugin-* packages under ~/.config/punktfunk/
 plugins, and supervises each as an Effect fiber (capped-jittered restart; SIGTERM shuts the whole
 tree down structurally so plugin finalizers run). A plugin auto-wires to the host's mgmt token +
-identity cert on the same box — no env editing. Bundles its own bun runtime. ON BY DEFAULT: the
-systemd --user unit is enabled for every user (systemctl --global). The game-library scanners ship
-as plugins, so a host without the runner has an empty library. Opt out per user with
+identity cert on the same box — no env editing. Runs on the bun from punktfunk-bun. ON BY
+DEFAULT: the systemd --user unit is enabled for every user (systemctl --global). The game-library
+scanners ship as plugins, so a host without the runner has an empty library. Opt out per user with
 `systemctl --user mask punktfunk-scripting`.
+%endif
+
+%if %{with web} || %{with scripting}
+%package bun
+Summary:        Bun runtime for punktfunk-web and punktfunk-scripting
+# Bun isn't in the Fedora repos, so the build env's bun is vendored here once for both consumers.
+# A private libexec dir, never on PATH, so it never collides with a system-wide bun. Arch-specific.
+
+%description bun
+The bun runtime the punktfunk web console and plugin runner run on, installed once at
+/usr/libexec/punktfunk-bun/bun. It is not on PATH and does not replace a system-wide bun.
 %endif
 
 %prep
@@ -501,14 +515,10 @@ install -Dm0644 packaging/linux/punktfunk-web.xml \
 install -d %{buildroot}%{_datadir}/punktfunk-web/.output
 cp -r web/.output/server %{buildroot}%{_datadir}/punktfunk-web/.output/server
 cp -r web/.output/public %{buildroot}%{_datadir}/punktfunk-web/.output/public
-# Vendor the bun runtime (the build env's bun — the CI rpm image) into
-# a private libexec dir so it never collides with a system-wide bun on PATH. This is why the web
-# subpackage is arch-specific (above): bun is a native binary.
-install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-web/bun
-# PATH-stable launcher (matches the .deb's /usr/bin/punktfunk-web-server) — runs on the vendored bun.
+# PATH-stable launcher (matches the .deb's /usr/bin/punktfunk-web-server) — runs on punktfunk-bun.
 cat > %{buildroot}%{_bindir}/punktfunk-web-server <<'WRAP'
 #!/bin/sh
-exec /usr/libexec/punktfunk-web/bun /usr/share/punktfunk-web/.output/server/index.mjs "$@"
+exec /usr/libexec/punktfunk-bun/bun /usr/share/punktfunk-web/.output/server/index.mjs "$@"
 WRAP
 chmod 0755 %{buildroot}%{_bindir}/punktfunk-web-server
 # systemd --user units: the console runs per-user; web-init generates the login password.
@@ -521,17 +531,20 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %if %{with scripting}
 # --- plugin/script runner subpackage (punktfunk-scripting) ---
 install -Dm0644 runner-cli.js %{buildroot}%{_datadir}/punktfunk-scripting/runner-cli.js
-# Vendor the build env's bun (arch-specific, like the web subpackage) into a private libexec dir.
-install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-scripting/bun
-# PATH-stable launcher (matches the .deb's /usr/bin/punktfunk-scripting) — runs the bundle on bun.
+# PATH-stable launcher (matches the .deb's) — runs the bundle on punktfunk-bun.
 cat > %{buildroot}%{_bindir}/punktfunk-scripting <<'WRAP'
 #!/bin/sh
-exec /usr/libexec/punktfunk-scripting/bun /usr/share/punktfunk-scripting/runner-cli.js "$@"
+exec /usr/libexec/punktfunk-bun/bun /usr/share/punktfunk-scripting/runner-cli.js "$@"
 WRAP
 chmod 0755 %{buildroot}%{_bindir}/punktfunk-scripting
 # systemd --user unit — installed but NOT auto-enabled (opt-in; the runner is inert until you add
 # scripts/plugins). Enable with `systemctl --user enable --now punktfunk-scripting`.
 install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/punktfunk-scripting.service
+%endif
+
+%if %{with web} || %{with scripting}
+# --- vendored bun runtime (punktfunk-bun), the build env's bun: the CI rpm image's pin ---
+install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-bun/bun
 %endif
 
 %if %{with host}
@@ -647,8 +660,6 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %files web
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %{_bindir}/punktfunk-web-server
-%dir %{_libexecdir}/punktfunk-web
-%{_libexecdir}/punktfunk-web/bun
 %dir %{_datadir}/punktfunk-web
 %{_datadir}/punktfunk-web/.output
 %{_datadir}/punktfunk-web/web-init.sh
@@ -661,11 +672,15 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %files scripting
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %{_bindir}/punktfunk-scripting
-%dir %{_libexecdir}/punktfunk-scripting
-%{_libexecdir}/punktfunk-scripting/bun
 %dir %{_datadir}/punktfunk-scripting
 %{_datadir}/punktfunk-scripting/runner-cli.js
 %{_userunitdir}/punktfunk-scripting.service
+%endif
+
+%if %{with web} || %{with scripting}
+%files bun
+%dir %{_libexecdir}/punktfunk-bun
+%{_libexecdir}/punktfunk-bun/bun
 %endif
 
 %post client
@@ -762,14 +777,7 @@ echo "A login password is generated on first start. Read it once, before you sig
 echo "    sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' \${XDG_CONFIG_HOME:-\$HOME/.config}/punktfunk/web-password"
 echo "After that the console keeps only a salted hash, so a forgotten password is reset: put a"
 echo "PUNKTFUNK_UI_PASSWORD=<your-password> line in that file and restart punktfunk-web."
-echo "Then open https://127.0.0.1:47992"
-# $1 > 1 is an upgrade. The console used to answer on every interface with no setting for it, so
-# say where that reach now lives before anyone restarts it.
-if [ "$1" -gt 1 ]; then
-echo "The console now listens on this machine only unless PUNKTFUNK_UI_BIND says otherwise."
-echo "Yours already served the network, so the next start writes PUNKTFUNK_UI_BIND=0.0.0.0 into"
-echo "host.env and keeps it that way. Change it to 127.0.0.1 and restart punktfunk-web to close it."
-fi
+echo "Then open https://<host-ip>:47992"
 %endif
 
 %if %{with scripting}

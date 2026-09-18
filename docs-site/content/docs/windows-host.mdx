@@ -28,8 +28,8 @@ desktop (UAC prompts, the lock screen).
   21H2 are **not supported**: the virtual-display driver needs the IddCx 1.10 driver framework,
   which first shipped in Windows 11 22H2. On older Windows the driver installs but can't start
   ("Punktfunk Virtual Display" shows **Code 10** in Device Manager and streaming fails); the
-  installer therefore refuses to run there. ARM64 is not built either (no ARM64 NVIDIA driver, and
-  the virtual-display driver is x64-only).
+  installer therefore refuses to run there. ARM64 ships only as a canary build — video only, with
+  Media Foundation as the sole encoder and no host audio.
 - **A GPU for hardware encode** — the host auto-detects the vendor:
   - **NVIDIA** → NVENC
   - **AMD** → AMF
@@ -200,20 +200,20 @@ The service reads `%ProgramData%\punktfunk\host.env`. The defaults work out of t
   On a multi-GPU box the [web console's GPU preference](/docs/web-console)
   wins: a forced backend whose vendor doesn't match the selected GPU is ignored (the host logs a
   warning) — remove the stale line rather than fighting it.
-- `PUNKTFUNK_HOST_CMD` — what the service runs. A fresh install from the setup `.exe` writes `serve`:
-  the **secure native-only** host, Punktfunk clients only. **Moonlight/GameStream compatibility is
-  opt-in** — tick *Enable GameStream (Moonlight) compatibility* in the installer (unattended:
-  `/MERGETASKS=gamestream`), or turn it on afterwards from an elevated prompt:
+- `PUNKTFUNK_HOST_CMD` — what the service runs, `serve`. **Moonlight/GameStream compatibility is
+  opt-in** and not part of this line: tick *Enable GameStream (Moonlight) compatibility* in the
+  installer (unattended: `/MERGETASKS=gamestream`), switch **GameStream** on under **Host → Settings**
+  in the web console, or from an elevated prompt:
 
   ```powershell
   punktfunk-host service install --gamestream=on
   punktfunk-host service restart
   ```
 
-  That writes `PUNKTFUNK_HOST_CMD=serve --gamestream` (native punktfunk/1 **plus** the
-  GameStream/Moonlight-compat planes); `--gamestream=off` puts it back to `serve`. GameStream pairs
-  over plain HTTP and uses weaker legacy encryption — trusted LAN only. An upgrade never changes your
-  choice, and a hand-edited `PUNKTFUNK_HOST_CMD` is left alone.
+  `--gamestream=off` turns it off again. GameStream pairs over plain HTTP and uses weaker legacy
+  encryption — trusted LAN only. An upgrade never changes your choice. A `serve --gamestream` line
+  from an older install becomes `serve` with GameStream kept on; any other hand-edited command is
+  left alone.
 
 Edit the file, then `punktfunk-host service restart` (it stops, waits for the service to actually
 reach *Stopped*, and starts again); `punktfunk-host service status` shows the current state. See the
@@ -319,8 +319,10 @@ label can outrun the picture, and what to check when a stream comes out SDR.
 - **AMD / Intel encode is newer.** All three encoders ship in the installer and all three have been
   validated on real hardware — AMF on a Ryzen 7000 iGPU (1080p120 HDR P010), QSV on Arc. NVENC still
   has much the most field time, and several of QSV's newer arms are marked unvalidated in the code.
-  Software H.264 is the GPU-less fallback.
-- **x64-only.** No ARM64 build — no ARM64 NVIDIA driver, and the virtual-display driver is x64-only.
+  There is no software fallback on Windows: the virtual-display driver encodes, so a host needs a
+  render adapter.
+- **x64 for stable.** ARM64 exists only as a canary build: Media Foundation encode, no host audio,
+  and neither winget nor the stable feed carries it.
 - **Newer than the Linux host.** The Linux host is the most battle-tested path; the Windows host is
   more recent, with the virtual-mic and AMD/Intel encode backends the youngest pieces.
 

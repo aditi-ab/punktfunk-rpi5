@@ -139,6 +139,10 @@ impl Executor<'_> {
                 self.set_env(key, value);
                 Ok(true)
             }
+            StepAction::SetSetting { id, value } => {
+                self.set_setting(id, value);
+                Ok(true)
+            }
             StepAction::AptSwitch { pkgs } => self.apt_switch(pkgs, facts, choices).map(|()| true),
             StepAction::PacmanSwitch { pkgs } => self.pacman_switch(pkgs, facts).map(|()| true),
             StepAction::Linger => self.linger(facts),
@@ -325,6 +329,33 @@ impl Executor<'_> {
         body.push('\n');
         if std::fs::write(&path, body).is_ok() {
             self.ui.ok(&format!("{key}={value} → {shown}"));
+        } else {
+            self.ui.warn(&format!("couldn't write {shown}"));
+        }
+    }
+
+    /// Merge one key into `host-settings.json`, keeping every other key the file holds.
+    fn set_setting(&self, id: &str, value: &serde_json::Value) {
+        let path = self.paths.host_settings();
+        let shown = path.display().to_string().replace('\\', "/");
+        if self.opts.dry {
+            self.ui.ok(&format!("would set {id}={value} in {shown}"));
+            return;
+        }
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut file = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| {
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&t).ok()
+            })
+            .unwrap_or_default();
+        file.insert(id.to_string(), value.clone());
+        file.insert("version".to_string(), serde_json::Value::from(1));
+        let body = serde_json::to_vec_pretty(&file).unwrap_or_default();
+        if std::fs::write(&path, body).is_ok() {
+            self.ui.ok(&format!("{id}={value} → {shown}"));
         } else {
             self.ui.warn(&format!("couldn't write {shown}"));
         }

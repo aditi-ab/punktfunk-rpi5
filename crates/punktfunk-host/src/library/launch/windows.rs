@@ -114,10 +114,10 @@ pub fn launch_title(id: &str) -> Result<WindowsLaunch> {
         .filter(|g| g.launch.is_some())
         .ok_or_else(|| anyhow::anyhow!("no launchable library entry '{id}'"))?;
     let spec = entry.launch.clone().expect("filtered to Some above");
-    // Plugin recipe is the same (cmdline, cwd) shape; `windows_launch_for` has
-    // no `plugin` arm, so a failed ask falls through to "no recipe" below.
-    let recipe = plugin_recipe(&entry)
-        .map(|l| WinRecipe::game(l.command, l.cwd))
+    // An `exec` entry is built from the publishing plugin's manifest; `windows_launch_for` has
+    // no `exec` arm, so an entry that fails validation falls through to "no recipe" below.
+    let recipe = exec_recipe(&entry)
+        .map(|r| WinRecipe::game(r.command_line(), r.cwd))
         .or_else(|| windows_launch_for(&spec))
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -145,7 +145,7 @@ pub fn launch_title(id: &str) -> Result<WindowsLaunch> {
 /// Pure map from [`LaunchSpec`] to a spawn recipe. `None` = no Windows recipe.
 ///
 /// CreateProcessAsUserW does no shell or protocol resolution: URI/flags go to
-/// a concrete EXE as argv. `plugin` is absent; [`plugin_recipe`] resolves it.
+/// a concrete EXE as argv. `exec` is absent; [`exec_recipe`] builds it from the manifest.
 fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
     match spec.kind.as_str() {
         "steam_appid" => {
@@ -654,6 +654,7 @@ mod tests {
             windows_launch_for(&LaunchSpec {
                 kind: "launcher_ui".into(),
                 value: v.into(),
+                ..Default::default()
             })
         };
         if let Some(r) = ui("xbox") {
@@ -703,6 +704,7 @@ mod tests {
             windows_launch_for(&LaunchSpec {
                 kind: "launcher_ui".into(),
                 value: v.into(),
+                ..Default::default()
             })
         };
         assert!(ui("lutris").is_none());
@@ -726,6 +728,7 @@ mod tests {
             windows_launch_for(&LaunchSpec {
                 kind: "steam_ui".into(),
                 value: v.into(),
+                ..Default::default()
             })
         };
         let bp = ui("bigpicture").expect("bigpicture recipe");
@@ -806,6 +809,7 @@ mod tests {
         let steam = LaunchSpec {
             kind: "steam_appid".into(),
             value: "570".into(),
+            ..Default::default()
         };
         let steam_r = windows_launch_for(&steam).expect("steam recipe");
         let line = &steam_r.cmdline;
@@ -814,11 +818,13 @@ mod tests {
         let evil = LaunchSpec {
             kind: "steam_appid".into(),
             value: "570\" & calc".into(),
+            ..Default::default()
         };
         assert!(windows_launch_for(&evil).is_none());
         let cmd = LaunchSpec {
             kind: "command".into(),
             value: "notepad.exe".into(),
+            ..Default::default()
         };
         let cmd_r = windows_launch_for(&cmd).unwrap();
         assert_eq!(cmd_r.cmdline, "cmd.exe /c notepad.exe");
@@ -829,6 +835,7 @@ mod tests {
         let aumid = LaunchSpec {
             kind: "aumid".into(),
             value: "Microsoft.X_8wekyb3d8bbwe!Game".into(),
+            ..Default::default()
         };
         assert_eq!(
             windows_launch_for(&aumid).unwrap().cmdline,
@@ -852,6 +859,7 @@ mod tests {
         let uplay = windows_launch_for(&LaunchSpec {
             kind: "uplay".into(),
             value: "5595".into(),
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(uplay.cmdline, "explorer.exe \"uplay://launch/5595/0\"");
@@ -859,6 +867,7 @@ mod tests {
         let amazon = windows_launch_for(&LaunchSpec {
             kind: "amazon".into(),
             value: "amzn1.adg.product.abc-123".into(),
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(

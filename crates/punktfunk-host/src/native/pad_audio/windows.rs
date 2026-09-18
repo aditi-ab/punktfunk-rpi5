@@ -10,7 +10,7 @@ pub(super) fn host_cap(asked: bool) -> bool {
         crate::audio::pad_endpoint::ensure_provisioned();
     }
     asked
-        && std::env::var_os("PUNKTFUNK_PAD_AUDIO").is_none_or(|v| v != "0")
+        && pf_host_config::knob("PUNKTFUNK_PAD_AUDIO").is_none_or(|v| v != "0")
         && crate::audio::pad_endpoint::provisioned_endpoints().is_some_and(|eps| !eps.is_empty())
 }
 

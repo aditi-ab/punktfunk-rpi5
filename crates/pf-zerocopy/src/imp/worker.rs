@@ -13,11 +13,13 @@
 use super::cuda::{self, CUdeviceptr, DeviceBuffer};
 use super::egl::{DmabufPlane, EglImporter};
 use super::ipc;
-use super::proto::{BufferDesc, ImportKind, Reply, Request, PROTO_VERSION};
+use super::proto::{
+    BufferDesc, ConvertOut, ConvertSrc, CursorRect, ImportKind, Reply, Request, PROTO_VERSION,
+};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 /// PipeWire pools are ≤ ~16; 64 only applies if a producer churns fds without renegotiating.
 const FD_CACHE_CAP: usize = 64;
@@ -90,6 +92,48 @@ fn run(sock: OwnedFd) -> Result<()> {
 /// Import surface for [`serve`]. Split out so the dispatch loop is unit-testable without a GPU.
 pub(crate) trait ImportBackend {
     fn modifiers(&mut self, fourcc: u32) -> Vec<u64>;
+    /// The fused-convert lane; a backend without one answers `Err` and the host keeps importing.
+    fn register_slot(&mut self, _id: u32, _size: u64, _fd: Option<OwnedFd>) -> Reply {
+        Reply::Err {
+            message: "no convert lane".into(),
+        }
+    }
+    fn forget_slots(&mut self) {}
+    fn set_cursor(
+        &mut self,
+        _serial: u64,
+        _w: u32,
+        _h: u32,
+        _len: u32,
+        _fd: Option<OwnedFd>,
+    ) -> Reply {
+        Reply::Err {
+            message: "no convert lane".into(),
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn convert(
+        &mut self,
+        _key: u64,
+        _has_fd: bool,
+        _src: ConvertSrc,
+        _slot: u32,
+        _out: ConvertOut,
+        _cursor: Option<CursorRect>,
+        _fd: Option<OwnedFd>,
+    ) -> Reply {
+        Reply::Err {
+            message: "no convert lane".into(),
+        }
+    }
+    fn convert_timeline(&mut self) -> (Reply, Option<OwnedFd>) {
+        (
+            Reply::Err {
+                message: "no convert lane".into(),
+            },
+            None,
+        )
+    }
     /// Desc only on first delivery of that id. [`Reply::NeedFd`]: host resends the fd once.
     fn import(&mut self, req: &ImportReq, fd: Option<OwnedFd>) -> Reply;
     fn release(&mut self, id: u32);
@@ -122,7 +166,7 @@ pub(crate) fn serve(sock: &OwnedFd, backend: &mut dyn ImportBackend) -> Result<(
                 let reply = Reply::Modifiers {
                     modifiers: backend.modifiers(fourcc),
                 };
-                if send_or_eof(sock, &reply)? {
+                if send_or_eof(sock, &reply, None)? {
                     return Ok(());
                 }
             }
@@ -149,19 +193,56 @@ pub(crate) fn serve(sock: &OwnedFd, backend: &mut dyn ImportBackend) -> Result<(
                     has_fd,
                 };
                 let reply = backend.import(&req, fd);
-                if send_or_eof(sock, &reply)? {
+                if send_or_eof(sock, &reply, None)? {
                     return Ok(());
                 }
             }
             Request::Release { id } => backend.release(id),
             Request::ClearCache => backend.clear_cache(),
+            Request::RegisterSlot { id, size } => {
+                let reply = backend.register_slot(id, size, fd);
+                if send_or_eof(sock, &reply, None)? {
+                    return Ok(());
+                }
+            }
+            Request::ForgetSlots => backend.forget_slots(),
+            Request::SetCursor {
+                serial,
+                width,
+                height,
+                len,
+            } => {
+                let reply = backend.set_cursor(serial, width, height, len, fd);
+                if send_or_eof(sock, &reply, None)? {
+                    return Ok(());
+                }
+            }
+            Request::Convert {
+                key,
+                has_fd,
+                src,
+                slot,
+                out,
+                cursor,
+            } => {
+                let reply = backend.convert(key, has_fd, src, slot, out, cursor, fd);
+                if send_or_eof(sock, &reply, None)? {
+                    return Ok(());
+                }
+            }
+            Request::ConvertTimeline => {
+                let (reply, fd) = backend.convert_timeline();
+                if send_or_eof(sock, &reply, fd.as_ref().map(|f| f.as_fd()))? {
+                    return Ok(());
+                }
+            }
         }
     }
 }
 
 /// `Ok(true)`: host is gone (EPIPE); the loop should end quietly.
-fn send_or_eof(sock: &OwnedFd, reply: &Reply) -> Result<bool> {
-    match ipc::send(sock.as_fd(), reply, None) {
+fn send_or_eof(sock: &OwnedFd, reply: &Reply, fd: Option<BorrowedFd>) -> Result<bool> {
+    match ipc::send(sock.as_fd(), reply, fd) {
         Ok(()) => Ok(false),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(true),
         Err(e) => Err(e).context("worker send"),
@@ -264,6 +345,117 @@ impl ImportBackend for EglBackend {
         // old id would name a mapping the host just closed. `next_id` only counts up, so
         // fresh ids cannot collide with retired ones.
         self.ids.clear();
+    }
+    fn register_slot(&mut self, id: u32, size: u64, fd: Option<OwnedFd>) -> Reply {
+        let Some(fd) = fd else {
+            return Reply::Err {
+                message: "RegisterSlot without an fd".into(),
+            };
+        };
+        match self.importer.register_slot(id, fd, size) {
+            Ok(()) => Reply::Done,
+            Err(e) => Reply::Err {
+                message: format!("{e:#}"),
+            },
+        }
+    }
+    fn forget_slots(&mut self) {
+        self.importer.forget_slots();
+    }
+    fn set_cursor(&mut self, serial: u64, w: u32, h: u32, len: u32, fd: Option<OwnedFd>) -> Reply {
+        let Some(fd) = fd else {
+            return Reply::Err {
+                message: "SetCursor without a memfd".into(),
+            };
+        };
+        let r = MappedFd::new(fd.as_raw_fd(), len as usize)
+            .and_then(|m| self.importer.set_cursor(serial, w, h, m.bytes()));
+        match r {
+            Ok(()) => Reply::Done,
+            Err(e) => Reply::Err {
+                message: format!("{e:#}"),
+            },
+        }
+    }
+    fn convert(
+        &mut self,
+        key: u64,
+        has_fd: bool,
+        mut src: ConvertSrc,
+        slot: u32,
+        out: ConvertOut,
+        cursor: Option<CursorRect>,
+        fd: Option<OwnedFd>,
+    ) -> Reply {
+        if let Some(fd) = fd {
+            self.store_fd(key, fd);
+        } else if has_fd {
+            return Reply::Err {
+                message: "Convert said has_fd but no fd arrived".into(),
+            };
+        }
+        let Some(raw) = self.fds.get(&key).map(|f| f.as_raw_fd()) else {
+            return Reply::NeedFd;
+        };
+        src.fd = raw;
+        match self.importer.convert(&src, slot, &out, cursor) {
+            Ok(value) => Reply::Converted { value },
+            Err(e) => Reply::Err {
+                message: format!("{e:#}"),
+            },
+        }
+    }
+    fn convert_timeline(&mut self) -> (Reply, Option<OwnedFd>) {
+        match self.importer.convert_timeline_fd() {
+            Ok(fd) => (Reply::Timeline, Some(fd)),
+            Err(e) => (
+                Reply::Err {
+                    message: format!("{e:#}"),
+                },
+                None,
+            ),
+        }
+    }
+}
+
+/// A read-only mapping of a memfd for the cursor bytes; unmapped on drop.
+struct MappedFd {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+impl MappedFd {
+    fn new(fd: i32, len: usize) -> Result<MappedFd> {
+        if len == 0 {
+            bail!("empty cursor memfd");
+        }
+        // SAFETY: a fresh read-only private mapping of `len` bytes of `fd`; the pointer is
+        // checked below and unmapped in `Drop`.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            bail!("mmap(cursor memfd)");
+        }
+        Ok(MappedFd { ptr, len })
+    }
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `ptr` maps `len` readable bytes for the mapping's lifetime.
+        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
+    }
+}
+impl Drop for MappedFd {
+    fn drop(&mut self) {
+        // SAFETY: `ptr`/`len` are the live mapping from `new`.
+        unsafe {
+            libc::munmap(self.ptr, self.len);
+        }
     }
 }
 

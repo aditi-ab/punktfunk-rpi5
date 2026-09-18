@@ -258,6 +258,45 @@ enum DecodeProbeKind {
     Lift,
 }
 
+/// New-content evidence for one report window.
+///
+/// [`Active`]`(0)` is observed stillness (every arrived AU a host-marked
+/// repeat) and counts toward idle re-arm. [`Empty`] is the same neutrality
+/// for climb and baselines, but no AU arrived, so it does not count.
+/// [`Unmarked`] is an older host that never flags repeats: wall-clock
+/// arithmetic, never idle. The pump never maps an empty receive window
+/// onto [`Unmarked`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowActivity {
+    /// Host does not mark repeats. Wall-clock; never idle.
+    Unmarked,
+    /// No AU completed. Quiet like idle; does not count toward re-arm.
+    Empty,
+    /// New-content AU count. `0` = every arrived AU was a host-marked repeat.
+    Active(u32),
+}
+
+impl WindowActivity {
+    /// Every arrived AU was a host-marked repeat.
+    fn idle(self) -> bool {
+        matches!(self, Self::Active(0))
+    }
+
+    /// No new-content evidence: skip climb, baselines, re-probe.
+    fn quiet(self) -> bool {
+        matches!(self, Self::Empty | Self::Active(0))
+    }
+}
+
+impl From<Option<u32>> for WindowActivity {
+    fn from(frames: Option<u32>) -> Self {
+        match frames {
+            Some(n) => Self::Active(n),
+            None => Self::Unmarked,
+        }
+    }
+}
+
 /// One decision per report window; `Some(kbps)` = send a [`crate::quic::SetBitrate`].
 pub(crate) struct BitrateController {
     /// `false` = permanently off (explicit bitrate, old host, or ack silence).
@@ -303,6 +342,11 @@ pub(crate) struct BitrateController {
     /// Last [`request`](Self::request). Taken (not kept) by the ack, so one
     /// request is judged at most once.
     last_requested_kbps: Option<u32>,
+    /// What made the latest bad window bad. A backoff can fire on a quiet
+    /// window after the streak, so the cause is kept from the bad one.
+    streak_cut: Option<crate::hud::RateCut>,
+    /// Why the last backoff happened; cleared by the next acked climb.
+    last_cut: Option<crate::hud::RateCut>,
     /// Two identical short acks latch [`host_cap_kbps`](Self::host_cap_kbps).
     /// One can be a failed rebuild keeping the old rate.
     short_ack_kbps: u32,
@@ -342,7 +386,7 @@ pub(crate) struct BitrateController {
     proven_prev_kbps: u32,
     proven_bucket_windows: u32,
     /// Consecutive fully-idle windows. First active window after
-    /// [`IDLE_WINDOWS_TO_REARM`] re-arms slow start.
+    /// [`IDLE_WINDOWS_TO_REARM`] re-arms slow start. Empty windows do not count.
     idle_windows: u32,
     low_rate_warned: bool,
     bad_windows: u32,
@@ -387,6 +431,8 @@ impl BitrateController {
             encode_rearmed: false,
             host_cap_kbps: None,
             last_requested_kbps: None,
+            streak_cut: None,
+            last_cut: None,
             short_ack_kbps: 0,
             short_acks: 0,
             cap_probe_windows: 0,
@@ -691,6 +737,7 @@ impl BitrateController {
                 // Rate rose: next choke is at a climbed-to rate. An acked
                 // decrease does not arm this — drain is not a knee encounter.
                 self.climb_since_backoff = true;
+                self.last_cut = None;
             }
             self.current_kbps = kbps;
             // Unsolicited `BitrateChanged` can sit above our ceiling (host
@@ -743,9 +790,13 @@ impl BitrateController {
         self.proven_cur_kbps.max(self.proven_prev_kbps)
     }
 
-    /// One report window; `Some(kbps)` is the rate to request. `None` on an
-    /// argument means that signal is absent (`active_frames: None` = older host,
-    /// legacy wall-clock arithmetic).
+    /// Decide whether this 750 ms window should ask for a new encoder rate.
+    ///
+    /// `Some(kbps)` is the request. OWD, decode, and encode `None` mean that
+    /// signal is absent. Activity is three-way: [`WindowActivity::Unmarked`]
+    /// (older host, wall-clock), [`WindowActivity::Empty`] (no AU arrived;
+    /// quiet like idle, does not count toward re-arm), and
+    /// [`WindowActivity::Active`] including `0` for observed stillness.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_window(
         &mut self,
@@ -758,7 +809,7 @@ impl BitrateController {
         actual_kbps: u32,
         flushed: bool,
         recovery_kf: u32,
-        active_frames: Option<u32>,
+        activity: impl Into<WindowActivity>,
     ) -> Option<u32> {
         if !self.enabled {
             return None;
@@ -769,15 +820,15 @@ impl BitrateController {
             tracing::info!("adaptive bitrate off — host never acked a SetBitrate (older host)");
             return None;
         }
-        // Repeat-only window: stillness, not this rate. Skip baselines, climb
-        // credit, re-probe, encode. Loss/flush/drop keep full power. `None`
-        // (older host) is never idle.
-        let idle = active_frames == Some(0);
-        if idle {
+        let activity = activity.into();
+        // Repeat-only: stillness. Empty: no AU, same neutrality, not a
+        // re-arm count. Unmarked (older host) is never idle.
+        let quiet = activity.quiet();
+        if activity.idle() {
             self.idle_windows = self.idle_windows.saturating_add(1);
-        } else {
-            // First active window after a real idle stretch: re-arm slow start
-            // and clear the cooldown so this window can climb.
+        } else if !quiet {
+            // First active window after a real idle stretch: re-arm slow
+            // start and clear the cooldown so this window can climb.
             if self.idle_windows >= IDLE_WINDOWS_TO_REARM && !self.probing {
                 self.probing = true;
                 self.last_change = None;
@@ -798,8 +849,8 @@ impl BitrateController {
         }
         // Keepalive OWD/decode would train the rolling min on the quietest
         // traffic, so the first motion window reads as congestion.
-        let owd_mean_us = owd_mean_us.filter(|_| !idle);
-        let decode_mean_us = decode_mean_us.filter(|_| !idle);
+        let owd_mean_us = owd_mean_us.filter(|_| !quiet);
+        let decode_mean_us = decode_mean_us.filter(|_| !quiet);
         // No severe OWD tier: a standing queue is congestion, not visible
         // damage, so it always takes the two-window path.
         let (owd_bad, _) = score_baseline(&mut self.owd_means, owd_mean_us, OWD_RISE_US, i64::MAX);
@@ -817,11 +868,11 @@ impl BitrateController {
         let starved =
             (actual_kbps as u64) * (STARVED_DELIVERY_DIV as u64) < self.current_kbps as u64;
         // Encode: the only signal that can descend on a clean LAN. Withheld
-        // when starved (mean describes the interruption), disarmed, or idle.
+        // when starved (mean describes the interruption), disarmed, or quiet.
         // Passed as absent so it cannot teach the baseline either. Loss,
         // flush, and drop keep full power.
         let (encode_rise_us, encode_severe_us) = self.encode_thresholds();
-        let encode_usable = !starved && !self.encode_disarmed && !idle;
+        let encode_usable = !starved && !self.encode_disarmed && !quiet;
         let (encode_bad, encode_severe) = score_baseline(
             &mut self.encode_means,
             encode_mean_us.filter(|_| encode_usable),
@@ -849,6 +900,12 @@ impl BitrateController {
         }
         if bad {
             self.bad_windows += 1;
+            self.streak_cut = Some(cut_cause(
+                dropped > 0 || flushed || loss_ppm >= HEAVY_LOSS_PPM,
+                recovery_kf >= RECOVERY_KF_BAD,
+                decode_bad || decode_severe,
+                encode_bad || encode_severe,
+            ));
             if decode_bad {
                 // Counted here: backoff only sees the final window, and the
                 // cooldown eats the first ordinary-bad window.
@@ -865,8 +922,8 @@ impl BitrateController {
             }
             // Any congestion ends slow start until a later idle-onset re-arm.
             self.probing = false;
-        } else if idle {
-            // Neutral: stillness is neither climb credit nor a cleared streak.
+        } else if quiet {
+            // Neutral: stillness and empty are neither climb credit nor a cleared streak.
         } else {
             self.clean_windows += 1;
             self.bad_windows = 0;
@@ -878,7 +935,7 @@ impl BitrateController {
             if bad {
                 self.cap_probe_windows = 0;
             // Re-probe accrues from clean loaded windows, not stillness.
-            } else if !idle && self.current_kbps >= cap.saturating_sub(cap / 16) {
+            } else if !quiet && self.current_kbps >= cap.saturating_sub(cap / 16) {
                 self.cap_probe_windows += 1;
                 if self.cap_probe_windows >= self.cap_reprobe_after {
                     self.cap_probe_windows = 0;
@@ -899,8 +956,8 @@ impl BitrateController {
         if let Some(cap) = self.decode_cap_kbps {
             if bad {
                 self.decode_cap_probe_windows = 0;
-            // Same `!idle` rule as the host-cap clock.
-            } else if !idle && self.current_kbps >= cap.saturating_sub(cap / 16) {
+            // Same `!quiet` rule as the host-cap clock.
+            } else if !quiet && self.current_kbps >= cap.saturating_sub(cap / 16) {
                 self.decode_cap_probe_windows += 1;
                 if self.decode_cap_probe_windows >= self.decode_cap_reprobe_after {
                     self.decode_cap_probe_windows = 0;
@@ -932,7 +989,7 @@ impl BitrateController {
             if bad {
                 self.encode_disarm_clean_windows = 0;
             // Quiet because nothing needed encoding proves nothing about the knee.
-            } else if !idle {
+            } else if !quiet {
                 self.encode_disarm_clean_windows += 1;
                 if self.encode_disarm_clean_windows >= self.encode_reprobe_after {
                     self.encode_disarmed = false;
@@ -1073,19 +1130,20 @@ impl BitrateController {
             }
             self.bad_windows = 0;
             self.streak_decode_windows = 0;
+            self.last_cut = self.streak_cut;
             return self.request(next, now);
         }
         // Decode headroom: a clean, loaded, full-rate window with the signal.
         // Loss, flush and starvation are the link's story, not the decoder's.
-        let full_rate = match (active_frames, self.frame_budget_us) {
-            (Some(n), Some(budget_us)) if budget_us > 0 => {
+        let full_rate = match (activity, self.frame_budget_us) {
+            (WindowActivity::Active(n), Some(budget_us)) if budget_us > 0 => {
                 i64::from(n) * DECODE_FULL_RATE_DEN
                     >= (WINDOW_US / budget_us) * DECODE_FULL_RATE_NUM
             }
             _ => true,
         };
         if let (Some(mean_us), Some(budget_us)) = (decode_mean_us, self.frame_budget_us) {
-            if budget_us > 0 && !bad && !idle && !starved && full_rate {
+            if budget_us > 0 && !bad && !quiet && !starved && full_rate {
                 if let Some(kbps) = self.judge_decode_headroom(mean_us, budget_us, now) {
                     return Some(kbps);
                 }
@@ -1099,16 +1157,16 @@ impl BitrateController {
             actual_kbps as u64 * UTILIZATION_DEN >= self.current_kbps as u64 * UTILIZATION_NUM;
         // Prorate utilization AND proven-headroom together or they deadlock
         // (a 35 fps source's wall-clock wire rate never exceeds ~39 % of target).
-        let proration = match (active_frames, self.frame_budget_us) {
-            (Some(n), Some(budget_us))
+        let proration = match (activity, self.frame_budget_us) {
+            (WindowActivity::Active(n), Some(budget_us))
                 if budget_us > 0 && n > 0 && (n as i64) < WINDOW_US / budget_us =>
             {
                 Some((n as u64, ((WINDOW_US / budget_us).max(1)) as u64))
             }
             _ => None,
         };
-        let utilized = match (active_frames, proration) {
-            (Some(0), _) => false,
+        let utilized = match (activity, proration) {
+            (WindowActivity::Active(0) | WindowActivity::Empty, _) => false,
             (_, Some((n, expected))) => {
                 n >= MIN_ACTIVE_FRAMES_TO_CLIMB as u64
                     && actual_kbps as u64 * UTILIZATION_DEN * expected
@@ -1170,6 +1228,11 @@ impl BitrateController {
         Some(kbps)
     }
 
+    /// Why the rate was last cut, while it has not climbed since.
+    pub(crate) fn last_cut(&self) -> Option<crate::hud::RateCut> {
+        self.last_cut
+    }
+
     /// Control queue was full: undo request bookkeeping. [`MAX_UNACKED`]
     /// detects a host that doesn't answer; counting a message never sent
     /// retires the controller. Also keeps a later unsolicited ack from being
@@ -1177,6 +1240,23 @@ impl BitrateController {
     pub(crate) fn on_request_dropped(&mut self) {
         self.unacked = self.unacked.saturating_sub(1);
         self.last_requested_kbps = None;
+    }
+}
+
+/// A bad window's cause, most concrete first: loss and repairs are visible
+/// damage, decode and encode are an end's own limit, delay is what remains.
+fn cut_cause(loss: bool, repairs: bool, decode: bool, encode: bool) -> crate::hud::RateCut {
+    use crate::hud::RateCut;
+    if loss {
+        RateCut::Loss
+    } else if repairs {
+        RateCut::Repairs
+    } else if decode {
+        RateCut::Decoder
+    } else if encode {
+        RateCut::Encoder
+    } else {
+        RateCut::Delay
     }
 }
 
@@ -1360,6 +1440,7 @@ mod tests {
             ),
             Some(14_000)
         );
+        assert_eq!(c.last_cut(), Some(crate::hud::RateCut::Loss));
     }
 
     #[test]
@@ -1778,6 +1859,12 @@ mod tests {
             ),
             Some(14_000)
         );
+        assert_eq!(c.last_cut(), Some(crate::hud::RateCut::Delay));
+        // A climb the host grants clears it; a cut it grants does not.
+        c.on_ack(14_000);
+        assert_eq!(c.last_cut(), Some(crate::hud::RateCut::Delay));
+        c.on_ack(15_000);
+        assert_eq!(c.last_cut(), None);
     }
 
     #[test]
@@ -2276,6 +2363,157 @@ mod tests {
                 Some(45),
             ),
             Some(21_000)
+        );
+    }
+
+    /// Five empty windows are not an idle stretch. [`CLEAN_WINDOWS_TO_INCREASE`]
+    /// is 6, so five quiet windows plus one active would additive-climb if
+    /// Empty were credited as clean (the older-host `None` path).
+    #[test]
+    fn empty_windows_do_not_rearm_abr_slow_start() {
+        let mut c = BitrateController::new(20_000);
+        c.set_stream_cap(100_000);
+        c.set_ceiling(60_000);
+        c.set_frame_budget(60);
+        let start = Instant::now();
+        assert_eq!(
+            c.on_window(
+                ticks(start, 0),
+                1,
+                0,
+                None,
+                None,
+                None,
+                18_000,
+                false,
+                0,
+                WindowActivity::Active(45),
+            ),
+            Some(14_000)
+        );
+        c.on_ack(14_000);
+        for i in 1..=5 {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    None,
+                    None,
+                    None,
+                    200,
+                    false,
+                    0,
+                    WindowActivity::Empty,
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            c.on_window(
+                ticks(start, 6),
+                0,
+                0,
+                None,
+                None,
+                None,
+                14_000,
+                false,
+                0,
+                WindowActivity::Active(45),
+            ),
+            None,
+            "a blackout is not stillness and cannot authorize a climb"
+        );
+    }
+
+    /// Empty is neutral on the idle counter: it neither fills nor clears it.
+    #[test]
+    fn empty_windows_do_not_count_toward_idle_rearm() {
+        let mut c = BitrateController::new(20_000);
+        c.set_stream_cap(100_000);
+        c.set_ceiling(60_000);
+        c.set_frame_budget(60);
+        let start = Instant::now();
+        assert_eq!(
+            c.on_window(
+                ticks(start, 0),
+                1,
+                0,
+                None,
+                None,
+                None,
+                18_000,
+                false,
+                0,
+                WindowActivity::Active(45),
+            ),
+            Some(14_000)
+        );
+        c.on_ack(14_000);
+        assert_eq!(
+            c.on_window(
+                ticks(start, 1),
+                0,
+                0,
+                None,
+                None,
+                None,
+                14_000,
+                false,
+                0,
+                WindowActivity::Active(45),
+            ),
+            None
+        );
+        for i in 2..6 {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    None,
+                    None,
+                    None,
+                    200,
+                    false,
+                    0,
+                    WindowActivity::Active(0),
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            c.on_window(
+                ticks(start, 6),
+                0,
+                0,
+                None,
+                None,
+                None,
+                200,
+                false,
+                0,
+                WindowActivity::Empty,
+            ),
+            None,
+            "empty is not motion onset"
+        );
+        assert_eq!(
+            c.on_window(
+                ticks(start, 7),
+                0,
+                0,
+                None,
+                None,
+                None,
+                14_000,
+                false,
+                0,
+                WindowActivity::Active(45),
+            ),
+            Some(21_000),
+            "empty must not clear a real idle stretch"
         );
     }
 

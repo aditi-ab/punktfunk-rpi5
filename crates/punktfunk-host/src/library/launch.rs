@@ -11,6 +11,12 @@
 
 use super::*;
 
+#[cfg(not(windows))]
+mod desktop;
+#[cfg(not(windows))]
+pub use desktop::valid_desktop_id;
+mod exec;
+pub use exec::{publishable as exec_spec_is_publishable, ExecRecipe};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -55,29 +61,14 @@ pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
     plat::launch_target(entry, game)
 }
 
-/// Recipe for a `plugin`-kind entry from the plugin that owns it. `None` for
-/// every other kind, with no I/O, so both OS resolvers try this first.
+/// Recipe for an `exec`-kind entry, built from the owning plugin's manifest. `None` for every
+/// other kind, so both OS resolvers try this first.
 ///
-/// Lives here rather than in `command_for` / `windows_launch_for` because it
-/// needs `provider` (stamped from `PUT /library/provider/{provider}`). A plant
-/// under someone else's provider 404s at that other plugin, not a launch.
-///
-/// Blocking: [`ask_plugin_launch`]. Async callers use `spawn_blocking`; the
-/// handshake probe is [`launch_is_resolvable`], which never asks.
-fn plugin_recipe(entry: &GameEntry) -> Option<PluginLaunch> {
-    let spec = entry.launch.as_ref()?;
-    if spec.kind != "plugin" {
-        return None;
-    }
-    let Some(provider) = entry.provider.as_deref() else {
-        // Unreachable unless library.json was hand-edited; warn rather than silent None.
-        tracing::warn!(
-            id = %entry.id,
-            "plugin launch: entry carries no provider, so no plugin can answer for it"
-        );
-        return None;
-    };
-    ask_plugin_launch(provider, &spec.value)
+/// Lives here rather than in `command_for` / `windows_launch_for` because it needs `provider`
+/// (stamped from `PUT /library/provider/{provider}`): the manifest that may be used is the one
+/// belonging to the plugin that published the entry.
+fn exec_recipe(entry: &GameEntry) -> Option<ExecRecipe> {
+    exec::recipe(entry)
 }
 
 // Per-kind launch values. Scanners supply the VALUE; the host builds the URI.

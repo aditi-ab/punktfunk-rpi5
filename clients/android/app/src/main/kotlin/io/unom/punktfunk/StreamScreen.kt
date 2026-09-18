@@ -31,7 +31,11 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.absolutePadding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.Spacer
@@ -565,11 +569,10 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     var padSize by remember { mutableStateOf(IntSize.Zero) }
     val hinge = rememberFoldHinge()
     val split = if (padShown) hinge?.let { foldSplit(it, rootSize) } else null
-    // A safe-area mode asked the host for a picture narrower than the panel by the housing on each
-    // side, so the box it lands in is the safe rectangle rather than the whole width: a hole on one
-    // side would otherwise sit over a picture centred in the other. Absolute, not start/end — the
-    // cutout's sides are physical, and an RTL layout must not swap them.
-    val safe = if (initialSettings.width == SAFE_AREA_MODE) displaySafeInsets(context, initialSettings) else null
+    // A safe-area mode asked the host for a picture narrower than the panel by the housing, so the
+    // box it lands in is the window's live cutout-safe width: it follows a flip to the other
+    // landscape. Left and right are physical sides, so an RTL layout cannot swap them.
+    val safe = initialSettings.width == SAFE_AREA_MODE
     Column(modifier = Modifier.fillMaxSize().background(Color.Black).onSizeChanged { rootSize = it }) {
         Box(
             modifier = Modifier
@@ -582,11 +585,8 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                     },
                 )
                 .then(
-                    if (safe != null) {
-                        Modifier.absolutePadding(
-                            left = with(density) { safe.left.toDp() },
-                            right = with(density) { safe.right.toDp() },
-                        )
+                    if (safe) {
+                        Modifier.windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
                     } else {
                         Modifier
                     },

@@ -4,7 +4,13 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { authConfigured, safeNextPath, verifyUiPassword } from "./auth";
+import {
+	authConfigured,
+	csrfRequestOrigin,
+	isCrossSiteMutation,
+	safeNextPath,
+	verifyUiPassword,
+} from "./auth";
 
 describe("safeNextPath", () => {
 	test("keeps a same-origin path with its query and hash", () => {
@@ -93,5 +99,87 @@ describe("verifyUiPassword", () => {
 
 	test("no key at all fails closed", () => {
 		expect(authConfigured()).toBe(false);
+	});
+});
+
+// The CSRF gate. Plugin UIs are another port on the same host, so SameSite=Lax
+// still sends the session cookie. Fetch-Site decides when present; Origin
+// covers a browser that omits it.
+const CONSOLE = "https://192.168.1.21:47992";
+const PLUGIN = "https://192.168.1.21:47993";
+
+describe("isCrossSiteMutation", () => {
+	const post = (
+		rest: Partial<Parameters<typeof isCrossSiteMutation>[0]> = {},
+	) =>
+		isCrossSiteMutation({
+			method: "POST",
+			requestOrigin: CONSOLE,
+			...rest,
+		});
+
+	test("a plugin-origin POST with Origin and no Fetch-Site is refused", () => {
+		// The hole: Fetch-Site-only allowed this, and Lax attaches the cookie.
+		expect(post({ origin: PLUGIN })).toBe(true);
+	});
+
+	test("Fetch-Site same-site is still refused", () => {
+		expect(post({ fetchSite: "same-site", origin: PLUGIN })).toBe(true);
+	});
+
+	test("a console POST is allowed", () => {
+		expect(post({ fetchSite: "same-origin", origin: CONSOLE })).toBe(false);
+		expect(post({ origin: CONSOLE })).toBe(false);
+	});
+
+	test("curl — no Origin, no Fetch-Site — is allowed", () => {
+		expect(post({})).toBe(false);
+	});
+
+	test("Origin null is refused", () => {
+		expect(post({ origin: "null" })).toBe(true);
+	});
+
+	test("Fetch-Site same-origin wins over Origin", () => {
+		// no-referrer makes a same-origin form POST send Origin: null; a proxy
+		// that rewrites Host makes the Origin mismatch the request.
+		expect(post({ fetchSite: "same-origin", origin: "null" })).toBe(false);
+		expect(
+			post({ fetchSite: "same-origin", origin: "https://console.example" }),
+		).toBe(false);
+	});
+
+	test("GET is never a CSRF mutation", () => {
+		expect(
+			isCrossSiteMutation({
+				method: "GET",
+				origin: PLUGIN,
+				fetchSite: "cross-site",
+				requestOrigin: CONSOLE,
+			}),
+		).toBe(false);
+	});
+});
+
+describe("csrfRequestOrigin", () => {
+	test("uses the listener scheme, not the synthetic request scheme", () => {
+		expect(
+			csrfRequestOrigin({
+				requestScheme: "http:",
+				listenerScheme: "https",
+				host: "192.168.1.21:47992",
+			}),
+		).toBe(CONSOLE);
+	});
+
+	test("x-forwarded-proto wins, and default ports drop", () => {
+		expect(
+			csrfRequestOrigin({
+				forwardedProto: "https",
+				requestScheme: "http:",
+				listenerScheme: "http",
+				host: "console.lan:443",
+			}),
+		).toBe("https://console.lan");
 	});
 });

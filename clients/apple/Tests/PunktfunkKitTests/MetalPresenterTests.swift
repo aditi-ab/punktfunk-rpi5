@@ -44,6 +44,56 @@ final class MetalPresenterTests: XCTestCase {
         XCTAssertNil(presenter.layer.edrMetadata)
     }
 
+    /// A 10-bit SDR session presents through the 10-bit SDR drawable: sRGB-tagged like 8-bit SDR,
+    /// no EDR, no metadata — and the layer must actually vend that format, which is the one thing
+    /// the SDK's stale "two supported values" comment cannot tell us. HDR outranks the depth flag,
+    /// and an 8-bit session keeps the 8-bit drawable.
+    func testConfigureTenBitSDRWidensTheDrawable() throws {
+        guard let presenter = MetalVideoPresenter.make() else {
+            throw XCTSkip("no Metal device available in this environment")
+        }
+        presenter.configure(hdr: false, tenBitSDR: true)
+        XCTAssertEqual(
+            presenter.layer.pixelFormat, .bgr10a2Unorm, "10-bit SDR uses the 10-bit unorm drawable")
+        XCTAssertNotNil(presenter.layer.colorspace, "10-bit SDR stays sRGB-tagged like 8-bit SDR")
+        XCTAssertFalse(presenter.layer.wantsExtendedDynamicRangeContent, "10-bit SDR is not EDR")
+        XCTAssertNil(presenter.layer.edrMetadata)
+        presenter.layer.drawableSize = CGSize(width: 64, height: 64)
+        if let drawable = presenter.layer.nextDrawable() {
+            XCTAssertEqual(
+                drawable.texture.pixelFormat, .bgr10a2Unorm,
+                "the layer must vend the 10-bit format rather than fall back")
+        }
+        presenter.configure(hdr: true, tenBitSDR: true)
+        XCTAssertEqual(presenter.layer.pixelFormat, .rgba16Float, "HDR outranks the depth flag")
+        presenter.configure(hdr: false, tenBitSDR: false)
+        XCTAssertEqual(
+            presenter.layer.pixelFormat, .bgra8Unorm, "an 8-bit session keeps the 8-bit drawable")
+    }
+
+    /// `render` of a 10-bit SDR buffer reconciles the layer to the 10-bit drawable by itself — the
+    /// per-frame path, not only the session-start configure — and presents without trapping.
+    func testRenderTenBitSDRFrameWidensTheDrawable() throws {
+        guard let presenter = MetalVideoPresenter.make() else {
+            throw XCTSkip("no Metal device available in this environment")
+        }
+        presenter.configure(hdr: false)
+        XCTAssertEqual(presenter.layer.pixelFormat, .bgra8Unorm)
+        var pb: CVPixelBuffer?
+        let attrs: [CFString: Any] = [kCVPixelBufferMetalCompatibilityKey: true]
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault, 256, 256, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            attrs as CFDictionary, &pb)
+        guard status == kCVReturnSuccess, let pixelBuffer = pb else {
+            throw XCTSkip("couldn't allocate a P010 test pixel buffer")
+        }
+        XCTAssertTrue(MetalVideoPresenter.tenBitBuffer(pixelBuffer))
+        _ = presenter.render(pixelBuffer, isHDR: false)
+        XCTAssertEqual(
+            presenter.layer.pixelFormat, .bgr10a2Unorm,
+            "a 10-bit SDR frame reconciles the layer to the 10-bit drawable")
+    }
+
     /// `render` with a freshly-allocated NV12 buffer must present without crashing or hanging — the
     /// main-thread present path is the highest-risk part of the stage-2 rewrite. (A headless CI with no
     /// display can still allocate a drawable from a CAMetalLayer; if it can't, render returns false,

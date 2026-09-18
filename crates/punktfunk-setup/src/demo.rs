@@ -21,7 +21,7 @@ use crate::seam::{BasePaths, CommandRunner, Output, RunFailed, Stdin};
 
 /// Demo mode's filesystem root.
 ///
-/// A `SetEnv` step edits host.env with `std::fs`, not a spawn, so a fake runner would still
+/// `SetEnv` and `SetSetting` steps write with `std::fs`, not a spawn, so a fake runner would still
 /// reach `~/.config/punktfunk`. `BasePaths` is the seam that covers filesystem reach.
 pub fn sandbox_paths() -> BasePaths {
     let root = std::env::temp_dir().join(format!("punktfunk-setup-demo-{}", std::process::id()));

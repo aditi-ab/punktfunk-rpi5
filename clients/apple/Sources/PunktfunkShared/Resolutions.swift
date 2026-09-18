@@ -9,6 +9,12 @@ import Foundation
 public enum Resolutions {
     /// One family of sizes with the same shape.
     public struct Aspect {
+        public init(label: String, shape: Double, sizes: [(w: Int, h: Int)]) {
+            self.label = label
+            self.shape = shape
+            self.sizes = sizes
+        }
+
         /// The switch label: "16:9".
         public let label: String
         /// Width over height of the shape.
@@ -50,7 +56,50 @@ public enum Resolutions {
     /// The size in family `aspect` nearest in height to `h`; a native `0` looks for 1080. Ties go
     /// to the smaller size.
     public static func nearest(_ aspect: Int, height h: Int) -> (w: Int, h: Int) {
+        nearestIn(aspects[aspect], height: h)
+    }
+
+    /// The size in `family` nearest in height to `h`; a native `0` looks for 1080.
+    public static func nearestIn(_ family: Aspect, height h: Int) -> (w: Int, h: Int) {
         let h = h == 0 ? 1080 : h
-        return aspects[aspect].sizes.min { abs($0.h - h) < abs($1.h - h) }!
+        return family.sizes.min { abs($0.h - h) < abs($1.h - h) }!
+    }
+
+    public static let screenLabel = "Screen"
+    public static let safeAreaLabel = "Safe area"
+
+    /// Heights a device entry offers below the screen's own.
+    static let deviceHeights = [720, 1080, 1440, 2160]
+
+    /// A device entry's sizes sit within this of its shape, tight enough to part a phone's screen
+    /// from its safe area.
+    static let deviceTolerance = 0.01
+
+    /// The aspect switch on this device: "Screen", then "Safe area", then `aspects`. Each device
+    /// entry appears only when no standard family has its shape, and the safe area only when it
+    /// differs from the screen. Twin of `punktfunk_core::resolutions::families`.
+    public static func families(screen: (w: Int, h: Int)?, safe: (w: Int, h: Int)?) -> [Aspect] {
+        var own: [Aspect] = []
+        for (label, dims) in [(screenLabel, screen), (safeAreaLabel, safe)] {
+            guard let dims, dims.w > 0, dims.h > 0 else { continue }
+            let (w, h) = (dims.w, dims.h)
+            if label == safeAreaLabel, let screen, screen.w == w, screen.h == h { continue }
+            if aspectOf(w, h) != nil { continue }
+            let sizes = deviceHeights.filter { $0 < h }.map { (w: w * $0 / h / 2 * 2, h: $0) }
+                + [(w: w / 2 * 2, h: h / 2 * 2)]
+            own.append(Aspect(label: label, shape: Double(w) / Double(h), sizes: sizes))
+        }
+        return own + aspects
+    }
+
+    /// The entry of `families` `w`×`h` belongs to by shape: a device entry first, then a standard
+    /// one. `nil` for a zero side or a shape none has.
+    public static func familyOf(_ families: [Aspect], _ w: Int, _ h: Int) -> Int? {
+        guard w > 0, h > 0 else { return nil }
+        let shape = Double(w) / Double(h)
+        func within(_ a: Aspect, _ tol: Double) -> Bool { abs(shape / a.shape - 1) < tol }
+        func device(_ a: Aspect) -> Bool { a.label == screenLabel || a.label == safeAreaLabel }
+        return families.firstIndex { device($0) && within($0, deviceTolerance) }
+            ?? families.firstIndex { !device($0) && within($0, tolerance) }
     }
 }

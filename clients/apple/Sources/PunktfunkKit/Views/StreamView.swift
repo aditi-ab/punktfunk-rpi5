@@ -670,7 +670,8 @@ public final class StreamLayerView: NSView {
               let provider = CGDataProvider(data: ev.rgba as CFData),
               let cg = CGImage(
                   width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
-                  bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                  bytesPerRow: w * 4,
+                  space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
                   provider: provider, decode: nil, shouldInterpolate: false,
                   intent: .defaultIntent)
@@ -721,12 +722,12 @@ public final class StreamLayerView: NSView {
     /// the pixel drawn there.
     private func videoPlacement()
         -> (placement: VideoPlacement, box: CGRect, scale: CGFloat, width: UInt32, height: UInt32)? {
-        guard connection != nil else { return nil }
+        guard let connection else { return nil }
         let content = hostContentSize()
         let box = videoBounds
         let scale = window?.backingScaleFactor ?? 1
         guard content.width > 0, content.height > 0, box.width > 0, box.height > 0 else { return nil }
-        let p = VideoFit(name: SessionSettings.current.videoFit).place(
+        let p = VideoFit(name: connection.settings.videoFit).place(
             view: (Int((box.width * scale).rounded()), Int((box.height * scale).rounded())),
             frame: (Int(content.width), Int(content.height)))
         return p.isEmpty ? nil : (p, box, scale, content.width, content.height)
@@ -895,6 +896,7 @@ public final class StreamLayerView: NSView {
         // The view owns the session's input capture: handlers attach now, but nothing is
         // forwarded until capture engages (captureEnabled + auto-engage or a click).
         let capture = InputCapture(connection: connection)
+        capture.ownsEvent = { [weak self] event in event.window === self?.window }
         capture.onToggleCapture = { [weak self] in
             // The ⌘⎋ monitor is app-wide — only the key window's stream owns the toggle
             // (two stream windows would otherwise flip each other's capture).
@@ -946,24 +948,21 @@ public final class StreamLayerView: NSView {
             NotificationCenter.default.post(name: .punktfunkToggleFullscreen, object: nil)
         }
         capture.onToggleMicMute = { [weak self] in
-            // Session-level state the view doesn't own — post to the app (same routing as the
-            // fullscreen chord), so the captured and released paths end at one toggle.
-            guard self?.window?.isKeyWindow == true else { return }
-            NotificationCenter.default.post(name: .punktfunkToggleMicMute, object: nil)
+            // Session-level state the view doesn't own — post to this session's window, so the
+            // captured and released paths end at one toggle.
+            guard let self, self.window?.isKeyWindow == true else { return }
+            NotificationCenter.default.post(name: .punktfunkToggleMicMute, object: self.connection)
         }
         capture.onQuickActions = { [weak self] in
             // The quick-action ring is the session VIEW's, not this layer's — post it (the same
             // routing as the fullscreen and mic chords), so the captured chord and the Stream
             // menu's identical equivalent end at one toggle.
-            guard self?.window?.isKeyWindow == true else { return }
-            NotificationCenter.default.post(name: .punktfunkToggleQuickActions, object: nil)
+            guard let self, self.window?.isKeyWindow == true else { return }
+            NotificationCenter.default.post(name: .punktfunkToggleQuickActions, object: self.connection)
         }
         capture.onCycleStats = { [weak self] in
-            guard self?.window?.isKeyWindow == true else { return }
-            // Advance the shared tier setting directly — every @AppStorage reader (the HUD's
-            // visibility/content, the Settings pickers) observes UserDefaults, so this is the
-            // same as the menu path.
-            StatsVerbosity.cycle()
+            guard let self, self.window?.isKeyWindow == true else { return }
+            StatsVerbosity.requestCycle(for: self.connection)
         }
         capture.start()
         inputCapture = capture
@@ -972,9 +971,7 @@ public final class StreamLayerView: NSView {
         // setting, gated by the host's compositor: gamescope's input socket (EIS) grants
         // only a relative pointer, so absolute sends would be silently dropped there
         // (pointer stuck = "all input dead") — pinned to capture. ⌃⌥⇧M flips it live.
-        let mode = MouseInputMode(
-            rawValue: SessionSettings.current.mouseMode
-        ) ?? .capture
+        let mode = MouseInputMode(rawValue: connection.settings.mouseMode) ?? .capture
         let absOK = connection.resolvedCompositor != .gamescope
         desktopMouse = mode == .desktop && absOK
         if mode == .desktop && !absOK {
@@ -1017,10 +1014,9 @@ public final class StreamLayerView: NSView {
         // default keeps the explicit mode.
         let follower = MatchWindowFollower(
             connection: connection,
-            enabled: SessionSettings.current.matchWindow,
-            renderScale: SessionSettings.current.renderScale,
-            maxDimension: RenderScale.maxDimension(
-                codec: SessionSettings.current.codec))
+            enabled: connection.settings.matchWindow,
+            renderScale: connection.settings.renderScale,
+            maxDimension: RenderScale.maxDimension(codec: connection.settings.codec))
         follower.onResizeTarget = onResizeTarget // resize overlay START signal (instant, on the follower)
         matchFollower = follower
         layoutPresenter()
@@ -1037,7 +1033,7 @@ public final class StreamLayerView: NSView {
         // `videoBounds` is read on every mouse event — that belongs on layout, not on input.
         safeModePixels = window?.screen?.notchSafePixelSize
         presenter.layout(in: videoBounds, contentsScale: window?.backingScaleFactor ?? 1)
-        displayLayer.videoGravity = SessionPresenter.gravity
+        displayLayer.videoGravity = SessionPresenter.gravity(VideoFit(name: connection?.settings.videoFit))
         // Present routing tracks the window's composited state (fullscreen transitions always
         // re-layout, so this stays current): a windowed session presents through a Core Animation
         // transaction — the DCP swapID kernel-panic mitigation (see SessionPresenter.setComposited).

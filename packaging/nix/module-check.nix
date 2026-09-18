@@ -269,16 +269,20 @@ let
         && !(has appliance "punktfunk-web" "Restart=on-failure");
     }
     {
-      # The one unit here that runs arbitrary operator TypeScript by design.
-      name = "the plugin runner is sandboxed like the deb/rpm unit";
+      # Unit hardening for the supervisor and the operator's own scripts. What confines a PLUGIN
+      # is its own bwrap sandbox — these directives are a mount namespace, which does not hold
+      # against a process of the same uid.
+      name = "the plugin runner is hardened like the deb/rpm unit";
       ok =
         has appliance "punktfunk-scripting" "NoNewPrivileges=true"
         && has appliance "punktfunk-scripting" "ProtectSystem=strict"
         && has appliance "punktfunk-scripting" "ReadWritePaths=/tmp"
         && has appliance "punktfunk-scripting" "RestrictAddressFamilies=AF_UNIX"
-        && has appliance "punktfunk-scripting" "ProtectKernelTunables=true"
+        # bwrap needs netlink and a fresh /proc; the sandbox takes both back from the plugin.
+        && !(has appliance "punktfunk-scripting" "ProtectKernelTunables=true")
+        && has appliance "punktfunk-scripting" "AF_NETLINK"
         && has appliance "punktfunk-scripting" "ProtectControlGroups=true"
-        && has appliance "punktfunk-scripting" "RestrictNamespaces=true"
+        && has appliance "punktfunk-scripting" "RestrictNamespaces=user mnt pid net ipc uts cgroup"
         && has appliance "punktfunk-scripting" "SystemCallArchitectures=native"
         && has appliance "punktfunk-scripting" "CapabilityBoundingSet=";
     }
@@ -304,6 +308,9 @@ let
         # $XDG_RUNTIME_DIR: the host's live-stream marker, the session bus, compositor sockets.
         && has appliance "punktfunk-scripting" "BindPaths=%t"
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/plugin-token"
+        # The supervisor reads these per sandbox; without them no plugin with a manifest starts.
+        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/plugin-tokens.json"
+        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/plugin-grants.json"
         # The TLS pin is native-cert.pem after the identity split, cert.pem before it.
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/native-cert.pem"
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/cert.pem"
@@ -311,6 +318,13 @@ let
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/mgmt-endpoint"
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/scripts"
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.local/share/Steam";
+    }
+    {
+      # Without bwrap on its PATH the runner starts no plugin at all, and the library is empty.
+      name = "the plugin runner can build a sandbox";
+      ok = builtins.any (p: lib.hasInfix "bubblewrap" (toString p)) (
+        appliance.systemd.user.services.punktfunk-scripting.path or [ ]
+      );
     }
     {
       # PrivateTmp is OFF on purpose (the VirtualHere field report: a private /tmp hides

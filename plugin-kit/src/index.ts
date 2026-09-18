@@ -54,8 +54,6 @@ export {
 	deriveConfigJsonSchema,
 	httpApiEnv,
 	makeConfigHandler,
-	makeLaunchHandler,
-	type PluginLaunchTarget,
 	type ServeUiConfig,
 	type ServeUiOptions,
 	serveUi,

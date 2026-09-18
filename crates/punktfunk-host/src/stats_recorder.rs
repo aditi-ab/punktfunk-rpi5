@@ -124,6 +124,11 @@ pub struct CaptureMeta {
 pub struct Capture {
     pub meta: CaptureMeta,
     pub samples: Vec<StatsSample>,
+    /// One row per minute of link health per native session, so a freeze report carries the
+    /// loss, recovery and ABR history instead of a log ring that holds 45 minutes. Empty on a
+    /// GameStream capture and on recordings older than this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link: Vec<crate::link_health::LinkMinute>,
 }
 
 /// In-progress capture, as the management API reports it.
@@ -161,6 +166,8 @@ struct Live {
     /// Seeded once, on the first session registration.
     meta: Option<MetaSeed>,
     samples: Vec<StatsSample>,
+    /// One row a minute per session; the same cap bounds it.
+    link: Vec<crate::link_health::LinkMinute>,
     /// Sample cap was hit; further samples are dropped.
     truncated: bool,
 }
@@ -262,6 +269,7 @@ impl StatsRecorder {
                 started_unix_ms: unix_ms_now(),
                 meta: None,
                 samples: Vec::new(),
+                link: Vec::new(),
                 truncated: false,
             });
             self.generation.fetch_add(1, Ordering::Relaxed);
@@ -326,6 +334,16 @@ impl StatsRecorder {
         live.samples.push(sample);
     }
 
+    /// Append one closed link-health minute. Same cap and the same no-op-when-unarmed rule as
+    /// [`Self::push_sample`]; the control task checks [`Self::is_armed`] before building one.
+    pub fn push_link(&self, minute: crate::link_health::LinkMinute) {
+        let mut guard = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(live) = guard.as_mut() else { return };
+        if live.link.len() < MAX_SAMPLES {
+            live.link.push(minute);
+        }
+    }
+
     /// Disarm, write `<dir>/<id>.json` (temp + rename), return meta. `Ok(None)` if idle.
     pub fn stop(&self) -> std::io::Result<Option<CaptureMeta>> {
         // Clear the gate first so frame threads stop building samples immediately.
@@ -337,6 +355,7 @@ impl StatsRecorder {
         let capture = Capture {
             meta: meta.clone(),
             samples: live.samples,
+            link: live.link,
         };
         let bytes = serde_json::to_vec(&capture).map_err(std::io::Error::other)?;
         // Sibling temp then rename: a crash mid-write cannot leave a half file.
@@ -360,6 +379,7 @@ impl StatsRecorder {
         Some(Capture {
             meta: meta_of(live),
             samples: live.samples.clone(),
+            link: live.link.clone(),
         })
     }
 

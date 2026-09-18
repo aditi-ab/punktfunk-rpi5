@@ -51,3 +51,12 @@ The host says no, with the reason, instead of pretending:
 
 Moonlight/GameStream clients have no vocabulary for this — host power is a native-protocol (and
 console) feature.
+
+## Restart Punktfunk
+
+**Restart Punktfunk** restarts the host service, not the machine. It ends every stream the same
+way, then the service comes straight back. The console offers it when a
+[setting](/docs/configuration#settings-in-the-web-console) only applies after a restart.
+
+It needs something to start the host again: the `punktfunk-host` user service on Linux, the
+Punktfunk service on Windows. A host started by hand from a terminal lists it as unavailable.

@@ -66,6 +66,9 @@ const CSC_SPV: &[u8] = include_bytes!("rgb2yuv.spv");
 /// 10-bit HDR twin (`rgb2yuv10.comp`): 2:10:10:10 PQ/BT.2020 RGB → 10-bit 4:2:0, BT.2020 NCL.
 /// Separate module: storage-image FORMAT (`r8`/`rg8` vs `r16`/`rg16`) is layout, not specializable.
 const CSC10_SPV: &[u8] = include_bytes!("rgb2yuv10.spv");
+/// 10-bit SDR twin (`rgb2yuv10_709.comp`): same 10-bit store as [`CSC10_SPV`], BT.709 matrix. For a
+/// Main10 / AV1-10 session that stays SDR — an 8-bit RGB capture widened to a 10-bit 709 stream.
+const CSC10_709_SPV: &[u8] = include_bytes!("rgb2yuv10_709.spv");
 /// Cursor-overlay texture (px). Larger than any pointer; actual `w×h` uploads top-left and the
 /// shader push-constant bounds sampling, so one allocation covers every cursor.
 const CURSOR_MAX: u32 = 256;
@@ -126,6 +129,12 @@ fn parse_rgb_request(raw: Option<&str>) -> Option<bool> {
 /// Mesa ≥ 26, where `codedExtent`-driven `session_init` is guaranteed.
 fn rgb_true_extent_request() -> bool {
     std::env::var("PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT").as_deref() != Ok("0")
+}
+
+/// `PUNKTFUNK_VULKAN_DIRECT_PLANES=0`: keep the scratch-plane copies even where the driver lists
+/// the picture format as a storage target (the A/B for a driver that lists it and misrenders).
+fn direct_planes_request() -> bool {
+    std::env::var("PUNKTFUNK_VULKAN_DIRECT_PLANES").as_deref() != Ok("0")
 }
 
 /// `VK_KHR_video_encode_intra_refresh` latched at open (see [`intra_refresh_caps`]).
@@ -550,6 +559,8 @@ struct Frame {
     nv12_src: vk::Image,
     nv12_mem: vk::DeviceMemory,
     nv12_view: vk::ImageView,
+    /// The CSC writes `nv12_src`'s planes through `y_view`/`uv_view`; `y_img`/`uv_img` are null.
+    direct_planes: bool,
     // CPU staging, keyed on (format, width, height) — not format alone. CSC sizes the image
     // to the SOURCE frame; a format-only key copies past the allocation on a size change.
     cpu_img: Option<(
@@ -606,6 +617,8 @@ pub struct VulkanVideoEncoder {
     header: Vec<u8>,
     // Empty for HEVC; AV1 = a temporal-delimiter OBU (Vulkan emits only the frame OBU).
     frame_prefix: Vec<u8>,
+    // HDR10 static metadata keyframes carry in-band (HEVC SEI, AV1 metadata OBUs).
+    hdr_meta: Option<pf_frame::HdrMeta>,
 
     dpb_image: vk::Image,
     dpb_mem: vk::DeviceMemory,
@@ -661,9 +674,12 @@ pub struct VulkanVideoEncoder {
     /// read past its extent. CSC/RGB paths keep app-aligned SPS (coded extent 64×16); an
     /// undersized direct source on those paths is an OOB-read class.
     native_nv12: bool,
-    /// 10-bit (HDR) session. Every profile chain rebuilt after `open` must present the same
-    /// depth, so it is carried here rather than re-derived.
+    /// 10-bit session (HDR or 10-bit SDR). Every profile chain rebuilt after `open` must present
+    /// the same depth, so it is carried here rather than re-derived.
     ten_bit: bool,
+    /// HDR colour (BT.2020 PQ) vs BT.709 (SDR at either depth). Independent of `ten_bit`: a 10-bit
+    /// SDR session has `ten_bit` set and `is_hdr` clear. A rebuilt session must keep the colour.
+    is_hdr: bool,
     /// Row-based intra refresh is enabled on the session and its device. `None` = unavailable.
     intra_refresh: Option<IntraRefreshCaps>,
     /// Wave in flight, if any. Set at frame-build, read by the record paths for that same
@@ -711,11 +727,17 @@ impl VulkanVideoEncoder {
         fps: u32,
         bitrate_bps: u64,
         cursor_blend: bool,
+        // Negotiated depth. A 10-bit SDR session captures an 8-bit surface, so `format` is not
+        // 10-bit and the depth must come from here; HDR is 10-bit by its packed/P010 format.
+        bit_depth: u8,
     ) -> Result<Self> {
-        let native_nv12 = format == PixelFormat::Nv12;
-        // Packed 10-bit PQ/BT.2020. Dispatcher already consulted `probe_encode_caps`; the
-        // profile query inside open re-checks.
-        let ten_bit = format.is_hdr_rgb10();
+        // A producer's own planar picture: NV12 at eight bits, P010 at ten.
+        let native_nv12 = matches!(format, PixelFormat::Nv12 | PixelFormat::P010);
+        // Colour: HDR is BT.2020 PQ, keyed on the packed-10/P010 capture format. Dispatcher already
+        // consulted `probe_encode_caps`; the profile query inside open re-checks.
+        let is_hdr = format.is_hdr();
+        // Depth: HDR, or a 10-bit SDR session on an 8-bit capture (`bit_depth == 10`, BT.709).
+        let ten_bit = is_hdr || bit_depth >= 10;
         // RGB-direct needs the captured format as the session picture format. BGRA default is
         // only for CPU-only layouts, which never reach that arm.
         let src_rgb_fmt = pixel_to_vk(format).unwrap_or(vk::Format::B8G8R8A8_UNORM);
@@ -737,6 +759,7 @@ impl VulkanVideoEncoder {
             want_rgb,
             native_nv12,
             ten_bit,
+            is_hdr,
             src_rgb_fmt,
         )
     }
@@ -752,11 +775,21 @@ impl VulkanVideoEncoder {
         bitrate_bps: u64,
         want_rgb: bool,
     ) -> Result<Self> {
-        Self::open_opts_depth(codec, width, height, fps, bitrate_bps, want_rgb, false)
+        Self::open_opts_depth(
+            codec,
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            want_rgb,
+            false,
+            false,
+        )
     }
 
-    /// [`open_opts`](Self::open_opts) with bit depth explicit. A 10-bit session takes the packed
-    /// 2:10:10:10 source the HDR capture negotiates (`xRGB_210LE` → `A2R10G10B10_UNORM_PACK32`).
+    /// [`open_opts`](Self::open_opts) with depth and colour explicit. HDR takes the packed
+    /// 2:10:10:10 source the capture negotiates (`xRGB_210LE` → `A2R10G10B10_UNORM_PACK32`); SDR
+    /// (8- or 10-bit) takes the 8-bit BGRA source and, at ten bits, encodes Main10/AV1-10 as 709.
     #[cfg(test)]
     pub(crate) fn open_opts_depth(
         codec: Codec,
@@ -766,6 +799,7 @@ impl VulkanVideoEncoder {
         bitrate_bps: u64,
         want_rgb: bool,
         ten_bit: bool,
+        is_hdr: bool,
     ) -> Result<Self> {
         Self::open_opts_inner(
             codec,
@@ -776,7 +810,8 @@ impl VulkanVideoEncoder {
             want_rgb,
             false,
             ten_bit,
-            if ten_bit {
+            is_hdr,
+            if is_hdr {
                 vk::Format::A2R10G10B10_UNORM_PACK32
             } else {
                 vk::Format::B8G8R8A8_UNORM
@@ -794,6 +829,7 @@ impl VulkanVideoEncoder {
         want_rgb: bool,
         native_nv12: bool,
         ten_bit: bool,
+        is_hdr: bool,
         src_rgb_fmt: vk::Format,
     ) -> Result<Self> {
         if !matches!(codec, Codec::H265 | Codec::Av1) {
@@ -818,6 +854,7 @@ impl VulkanVideoEncoder {
                 want_rgb,
                 native_nv12,
                 ten_bit,
+                is_hdr,
                 src_rgb_fmt,
             )
         }
@@ -834,8 +871,10 @@ impl VulkanVideoEncoder {
         bitrate: u64,
         want_rgb: bool,
         native_nv12: bool,
-        // Not `hdr`: this fn already binds that name to the parameter-set header bytes below.
         ten_bit: bool,
+        // Colour axis (BT.2020 PQ vs BT.709). Named `is_hdr`, not `hdr`: this fn binds `hdr` to the
+        // parameter-set header bytes below, which would shadow it at the CSC-shader pick.
+        is_hdr: bool,
         src_rgb_fmt: vk::Format,
     ) -> Result<Self> {
         use super::vk_av1_encode as av1b;
@@ -890,7 +929,16 @@ impl VulkanVideoEncoder {
         let rgb_probe = if native_nv12 {
             Err("not-probed(native NV12 source selected)")
         } else {
-            probe_rgb_direct(&instance, &vq_inst, pd, codec_op, av1, ten_bit, src_rgb_fmt)
+            probe_rgb_direct(
+                &instance,
+                &vq_inst,
+                pd,
+                codec_op,
+                av1,
+                ten_bit,
+                is_hdr,
+                src_rgb_fmt,
+            )
         };
         let rgb_cfg: Option<RgbDirect> = match (&rgb_probe, want_rgb) {
             (Ok((x, y)), true) => {
@@ -1213,7 +1261,7 @@ impl VulkanVideoEncoder {
         let mut rgb_sci = vrgb::VideoEncodeSessionRgbConversionCreateInfoVALVE {
             s_type: vrgb::stype(vrgb::ST_SESSION_CREATE_INFO),
             p_next: std::ptr::null(),
-            rgb_model: rgb_model_for(ten_bit),
+            rgb_model: rgb_model_for(is_hdr),
             rgb_range: vrgb::RANGE_NARROW,
             x_chroma_offset: rgb_cfg.as_ref().map_or(0, |c| c.x_offset),
             y_chroma_offset: rgb_cfg.as_ref().map_or(0, |c| c.y_offset),
@@ -1325,6 +1373,7 @@ impl VulkanVideoEncoder {
                 av1_superblock128,
                 quality_level,
                 ten_bit,
+                is_hdr,
             )?
         } else {
             let (p, hdr) = build_parameters_h265(
@@ -1338,6 +1387,7 @@ impl VulkanVideoEncoder {
                 rh,
                 quality_level,
                 ten_bit,
+                is_hdr,
             )?;
             (p, hdr, Vec::new())
         };
@@ -1380,10 +1430,11 @@ impl VulkanVideoEncoder {
             None,
         )?;
         guard.sampler = sampler;
-        let spv = ash::util::read_spv(&mut std::io::Cursor::new(if ten_bit {
-            CSC10_SPV
-        } else {
-            CSC_SPV
+        // 8-bit is 709; 10-bit splits by colour — BT.2020 PQ for HDR, BT.709 for SDR-10.
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(match (ten_bit, is_hdr) {
+            (true, true) => CSC10_SPV,
+            (true, false) => CSC10_709_SPV,
+            (false, _) => CSC_SPV,
         }))?;
         let shader =
             device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)?;
@@ -1470,6 +1521,18 @@ impl VulkanVideoEncoder {
         )?;
         guard.compute_pool = compute_pool;
 
+        // The CSC targets the picture's planes where the driver allows a storage view on them;
+        // otherwise it writes scratch planes copied into the picture (two extra 4K copies).
+        let csc = rgb_cfg.is_none() && !native_nv12;
+        let direct_planes = csc
+            && direct_planes_request()
+            && probe_yuv_storage_planes(&vq_inst, pd, &profile, yuv_format(ten_bit));
+        if csc {
+            tracing::info!(
+                direct_planes,
+                "vulkan-encode: compute CSC writes the picture planes"
+            );
+        }
         for _ in 0..nframes {
             // Pre-push a null Frame and build in place so a mid-`make_frame` failure leaves
             // the partial handles in the guard rather than losing them with the Err.
@@ -1491,12 +1554,13 @@ impl VulkanVideoEncoder {
                 ts_period_ns > 0.0
                     && ((rgb_cfg.is_none() && !native_nv12)
                         || rgb_cfg.as_ref().is_some_and(|c| c.padded)),
-                rgb_cfg.is_none() && !native_nv12,
+                csc,
                 rgb_cfg
                     .as_ref()
                     .is_some_and(|c| c.padded)
                     .then_some(src_rgb_fmt),
                 ten_bit,
+                direct_planes,
                 guard.frames.last_mut().expect("frame just pushed"),
             )?;
         }
@@ -1526,6 +1590,7 @@ impl VulkanVideoEncoder {
             params,
             header,
             frame_prefix,
+            hdr_meta: None,
             dpb_image,
             dpb_mem,
             dpb_views,
@@ -1557,6 +1622,7 @@ impl VulkanVideoEncoder {
             reframe: None,
             native_nv12,
             ten_bit,
+            is_hdr,
             intra_refresh,
             wave: None,
             pending_bitrate: None,
@@ -1624,15 +1690,21 @@ impl VulkanVideoEncoder {
                 let cw = c.w.min(CURSOR_MAX);
                 let ch = c.h.min(CURSOR_MAX);
                 if self.frames[slot].cursor_serial != c.serial {
+                    // A PQ session blends the cursor re-encoded as PQ, not its sRGB bytes.
+                    let rgba = if self.is_hdr {
+                        c.pq_rgba()
+                    } else {
+                        c.rgba.clone()
+                    };
                     let stage = self.frames[slot].cursor_stage;
                     let stage_mem = self.frames[slot].cursor_stage_mem;
                     let bytes = (cw as usize) * (ch as usize) * 4;
                     let ptr =
                         dev.map_memory(stage_mem, 0, bytes as u64, vk::MemoryMapFlags::empty())?;
                     std::ptr::copy_nonoverlapping(
-                        c.rgba.as_ptr(),
+                        rgba.as_ptr(),
                         ptr as *mut u8,
-                        bytes.min(c.rgba.len()),
+                        bytes.min(rgba.len()),
                     );
                     dev.unmap_memory(stage_mem);
                     let old = if ready {
@@ -2034,6 +2106,7 @@ impl VulkanVideoEncoder {
         let uv_img = self.frames[slot].uv_img;
         let nv12_src = self.frames[slot].nv12_src;
         let nv12_view = self.frames[slot].nv12_view;
+        let direct_planes = self.frames[slot].direct_planes;
 
         // Pending rate retarget stays pending through recording: record fns declare the
         // session's current state at begin-coding and install via ENCODE_RATE_CONTROL; bookkeeping
@@ -2290,7 +2363,8 @@ impl VulkanVideoEncoder {
         };
         self.bind_rgb(csc_set, rgb_view);
 
-        // Y/UV → GENERAL (shader write); nv12_src → GENERAL (transfer dst, discard prior).
+        // GENERAL for the CSC's targets, prior contents discarded: the picture itself when its
+        // planes are written directly, else Y/UV scratch plus the picture as the copies' dst.
         let to_general = |img, dst_stage, dst_access| {
             vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::NONE)
@@ -2304,23 +2378,31 @@ impl VulkanVideoEncoder {
                 .image(img)
                 .subresource_range(color_range(0))
         };
-        let pre = [
-            to_general(
-                y_img,
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_WRITE,
-            ),
-            to_general(
-                uv_img,
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_WRITE,
-            ),
-            to_general(
+        let pre = if direct_planes {
+            vec![to_general(
                 nv12_src,
-                vk::PipelineStageFlags2::ALL_TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-        ];
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+            )]
+        } else {
+            vec![
+                to_general(
+                    y_img,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_WRITE,
+                ),
+                to_general(
+                    uv_img,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_WRITE,
+                ),
+                to_general(
+                    nv12_src,
+                    vk::PipelineStageFlags2::ALL_TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                ),
+            ]
+        };
         dev.cmd_pipeline_barrier2(
             compute_cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&pre),
@@ -2348,68 +2430,71 @@ impl VulkanVideoEncoder {
         );
         dev.cmd_dispatch(compute_cmd, (w / 2).div_ceil(8), (h_px / 2).div_ceil(8), 1);
 
-        // Y/UV shader-write → transfer-read (stay GENERAL); then copy into nv12 planes.
-        let yuv_rd = |img| {
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(img)
-                .subresource_range(color_range(0))
-        };
-        dev.cmd_pipeline_barrier2(
-            compute_cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&[yuv_rd(y_img), yuv_rd(uv_img)]),
-        );
-        let plane_copy = |src_aspect, dst_aspect, ew, eh| {
-            vk::ImageCopy::default()
-                .src_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(src_aspect)
-                        .layer_count(1),
-                )
-                .dst_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(dst_aspect)
-                        .layer_count(1),
-                )
-                .extent(vk::Extent3D {
-                    width: ew,
-                    height: eh,
-                    depth: 1,
-                })
-        };
-        dev.cmd_copy_image(
-            compute_cmd,
-            y_img,
-            vk::ImageLayout::GENERAL,
-            nv12_src,
-            vk::ImageLayout::GENERAL,
-            &[plane_copy(
-                vk::ImageAspectFlags::COLOR,
-                vk::ImageAspectFlags::PLANE_0,
-                w,
-                h_px,
-            )],
-        );
-        dev.cmd_copy_image(
-            compute_cmd,
-            uv_img,
-            vk::ImageLayout::GENERAL,
-            nv12_src,
-            vk::ImageLayout::GENERAL,
-            &[plane_copy(
-                vk::ImageAspectFlags::COLOR,
-                vk::ImageAspectFlags::PLANE_1,
-                w / 2,
-                h_px / 2,
-            )],
-        );
+        if !direct_planes {
+            // Y/UV shader-write → transfer-read (stay GENERAL); then copy into nv12 planes.
+            let yuv_rd = |img| {
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(img)
+                    .subresource_range(color_range(0))
+            };
+            dev.cmd_pipeline_barrier2(
+                compute_cmd,
+                &vk::DependencyInfo::default()
+                    .image_memory_barriers(&[yuv_rd(y_img), yuv_rd(uv_img)]),
+            );
+            let plane_copy = |src_aspect, dst_aspect, ew, eh| {
+                vk::ImageCopy::default()
+                    .src_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(src_aspect)
+                            .layer_count(1),
+                    )
+                    .dst_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(dst_aspect)
+                            .layer_count(1),
+                    )
+                    .extent(vk::Extent3D {
+                        width: ew,
+                        height: eh,
+                        depth: 1,
+                    })
+            };
+            dev.cmd_copy_image(
+                compute_cmd,
+                y_img,
+                vk::ImageLayout::GENERAL,
+                nv12_src,
+                vk::ImageLayout::GENERAL,
+                &[plane_copy(
+                    vk::ImageAspectFlags::COLOR,
+                    vk::ImageAspectFlags::PLANE_0,
+                    w,
+                    h_px,
+                )],
+            );
+            dev.cmd_copy_image(
+                compute_cmd,
+                uv_img,
+                vk::ImageLayout::GENERAL,
+                nv12_src,
+                vk::ImageLayout::GENERAL,
+                &[plane_copy(
+                    vk::ImageAspectFlags::COLOR,
+                    vk::ImageAspectFlags::PLANE_1,
+                    w / 2,
+                    h_px / 2,
+                )],
+            );
+        }
         if self.ts_period_ns > 0.0 {
             dev.cmd_write_timestamp2(
                 compute_cmd,
@@ -3669,6 +3754,13 @@ impl VulkanVideoEncoder {
         };
         let mut data = Vec::with_capacity(prefix.len() + len);
         data.extend_from_slice(prefix);
+        // Parameter sets / sequence header first, then the HDR volume, then the picture.
+        if let Some(m) = self.hdr_meta.filter(|_| f.keyframe && self.is_hdr) {
+            match self.codec {
+                Codec::Av1 => data.extend_from_slice(&pf_frame::hdr::av1_hdr_metadata_obus(&m)),
+                _ => data.extend_from_slice(&pf_frame::hdr::hevc_hdr_sei_nal(&m)),
+            }
+        }
         data.extend_from_slice(std::slice::from_raw_parts(p.add(off), len));
         Ok(EncodedFrame {
             data,
@@ -3748,6 +3840,10 @@ impl Encoder for VulkanVideoEncoder {
 
     fn request_keyframe(&mut self) {
         self.force_kf = true;
+    }
+
+    fn set_hdr_meta(&mut self, meta: Option<pf_frame::HdrMeta>) {
+        self.hdr_meta = meta;
     }
 
     fn invalidate_ref_frames(&mut self, first_frame: i64, last_frame: i64) -> bool {
@@ -3938,6 +4034,7 @@ impl Encoder for VulkanVideoEncoder {
                 false,
                 false,
                 self.ten_bit,
+                self.is_hdr,
                 vk::Format::B8G8R8A8_UNORM,
             )?;
         }
@@ -4173,7 +4270,7 @@ mod reframe_stage;
 mod build;
 use self::build::{
     align_up, build_parameters_av1, build_parameters_h265, make_frame, make_video_image,
-    probe_rgb_direct, rgb_model_for,
+    probe_rgb_direct, probe_yuv_storage_planes, rgb_model_for,
 };
 
 #[cfg(test)]
@@ -4592,7 +4689,8 @@ mod tests {
         };
         let (w, h) = (env_dim("PF_SMOKE_W", 256), env_dim("PF_SMOKE_H", 256));
         let mut enc =
-            match VulkanVideoEncoder::open_opts_depth(codec, w, h, 60, 10_000_000, rgb, true) {
+            match VulkanVideoEncoder::open_opts_depth(codec, w, h, 60, 10_000_000, rgb, true, true)
+            {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("run_smoke_10bit({codec:?}, rgb={rgb}): open declined — {e:#}");
@@ -4660,6 +4758,74 @@ mod tests {
     fn vulkan_smoke_rgb_10bit() {
         if let Some(aus) = run_smoke_10bit(Codec::H265, true) {
             dump_smoke(&aus, "rgb.10bit.h265");
+        }
+    }
+
+    /// 10-bit SDR twin of [`run_smoke_10bit`]: a Main10 / AV1-10 session fed an 8-bit BGRA capture
+    /// (`bit_depth == 10`, HDR off) — `rgb2yuv10_709.comp` widens 8→10 under BT.709. `None` = the
+    /// device declined the 10-bit profile.
+    fn run_smoke_10bit_sdr(codec: Codec) -> Option<Vec<crate::EncodedFrame>> {
+        let env_dim = |k: &str, d: u32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (w, h) = (env_dim("PF_SMOKE_W", 256), env_dim("PF_SMOKE_H", 256));
+        // ten_bit + SDR: an 8-bit capture at depth 10. want_rgb=false forces the compute CSC (the
+        // 709 10-bit shader), the path a composited-cursor desktop always takes.
+        let mut enc = match VulkanVideoEncoder::open_opts_depth(
+            codec, w, h, 60, 10_000_000, false, true, false,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("run_smoke_10bit_sdr({codec:?}): open declined — {e:#}");
+                return None;
+            }
+        };
+        assert!(enc.ten_bit, "a 10-bit session must report 10-bit");
+        let colors = [
+            [40u8, 40, 200, 255],
+            [40, 200, 40, 255],
+            [200, 40, 40, 255],
+            [200, 200, 40, 255],
+            [40, 200, 200, 255],
+            [200, 40, 200, 255],
+            [120, 200, 80, 255],
+            [80, 120, 200, 255],
+        ];
+        let mut aus: Vec<crate::EncodedFrame> = Vec::new();
+        for (i, c) in colors.iter().enumerate() {
+            enc.submit_indexed(&cpu_frame(w, h, i as u64 * 16_666_667, *c), i as u32)
+                .expect("submit");
+            while let Some(au) = enc.poll().expect("poll") {
+                aus.push(au);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("poll") {
+            aus.push(au);
+        }
+        assert_eq!(aus.len(), colors.len(), "one AU per submitted frame");
+        assert!(aus[0].keyframe, "frame 0 must be IDR");
+        Some(aus)
+    }
+
+    /// HEVC Main10 SDR through the compute CSC (BT.709 at ten bits).
+    #[test]
+    #[ignore = "needs a real VK_KHR_video_encode_h265 device with a 10-bit profile"]
+    fn vulkan_smoke_10bit_sdr() {
+        if let Some(aus) = run_smoke_10bit_sdr(Codec::H265) {
+            dump_smoke(&aus, "10bit.sdr.h265");
+        }
+    }
+
+    /// AV1 10-bit SDR — the AMD/Intel path VAAPI cannot serve.
+    #[test]
+    #[ignore = "needs a real VK_KHR_video_encode_av1 device with a 10-bit profile"]
+    fn vulkan_smoke_10bit_sdr_av1() {
+        if let Some(aus) = run_smoke_10bit_sdr(Codec::Av1) {
+            dump_smoke(&aus, "10bit.sdr.obu");
         }
     }
 

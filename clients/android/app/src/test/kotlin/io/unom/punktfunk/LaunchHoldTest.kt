@@ -1,7 +1,9 @@
 package io.unom.punktfunk
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -22,6 +24,15 @@ class LaunchHoldTest {
         assertNull(launchGaveUp("Quail", "grace", 300.0))
         // A word the host adds later is not a failure either.
         assertNull(launchGaveUp("Quail", "window", 300.0))
+    }
+
+    @Test
+    fun aRunningGameHoldsOnlyWhileItsWindowIsStillToCome() {
+        assertTrue(launchStillHeld("running", awaitingWindow = true, elapsed = 60.0))
+        assertFalse(launchStillHeld("running", awaitingWindow = false, elapsed = 1.0))
+        assertFalse(launchStillHeld("window", awaitingWindow = false, elapsed = 1.0))
+        // No window by the cap: show the stream rather than hold forever.
+        assertFalse(launchStillHeld("running", awaitingWindow = true, elapsed = 120.0))
     }
 
     @Test

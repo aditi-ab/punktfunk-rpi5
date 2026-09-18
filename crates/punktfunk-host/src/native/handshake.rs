@@ -263,6 +263,38 @@ pub(super) fn cursor_forward(
     }
 }
 
+/// [`Hello::preferred_codec`] for the negotiation line. `none` is auto; a byte this build
+/// does not know is `unknown` rather than blank.
+fn codec_pref_label(preferred: u8) -> &'static str {
+    match preferred {
+        0 => "none",
+        p => match punktfunk_core::hud::codec_label(p) {
+            "" => "unknown",
+            label => label,
+        },
+    }
+}
+
+/// The line under a negotiation whose preference lost, naming the side that lacks the codec.
+/// `preferred` and `picked` are [`punktfunk_core::hud::codec_label`]s.
+fn codec_miss_note(miss: punktfunk_core::quic::CodecMiss, preferred: &str, picked: &str) -> String {
+    use punktfunk_core::quic::CodecMiss;
+    match miss {
+        CodecMiss::Client => format!(
+            "client prefers {preferred} but does not advertise it (no decoder) — \
+             {picked} picked from the shared set"
+        ),
+        CodecMiss::Host => format!(
+            "client prefers {preferred} but this host cannot encode it — \
+             {picked} picked from the shared set"
+        ),
+        CodecMiss::Both => format!(
+            "neither the client nor this host does {preferred} — \
+             {picked} picked from the shared set"
+        ),
+    }
+}
+
 /// Hello → Welcome → Start. Borrows the control streams; the caller keeps them for mid-stream
 /// renegotiation. `first` is the already-read first control message.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -330,12 +362,26 @@ pub(super) async fn negotiate(
                 )
             })?;
     let codec = crate::encode::codec_from_wire(codec_bit);
+    // `preferred=` is the answer to "why not AV1?": the pick alone never says whether the
+    // client asked for something else, and this is the line an operator greps.
+    let preferred = codec_pref_label(hello.preferred_codec);
     tracing::info!(
         ?codec,
+        preferred,
         client_codecs = format_args!("0x{:02x}", hello.video_codecs),
         host_codecs = format_args!("0x{host_codecs:02x}"),
         "video codec negotiated"
     );
+    if let Some(miss) = punktfunk_core::quic::codec_preference_miss(
+        hello.video_codecs,
+        host_codecs,
+        hello.preferred_codec,
+    ) {
+        tracing::info!(
+            "{}",
+            codec_miss_note(miss, preferred, punktfunk_core::hud::codec_label(codec_bit))
+        );
+    }
 
     // The operator's cap for this device, applied BEFORE mode-conflict and before Welcome
     // — the client is then told the mode it actually gets, rather than asking for 4K120,
@@ -453,7 +499,7 @@ pub(super) async fn negotiate(
     );
 
     let (bit_depth, session_hdr, chroma) =
-        negotiate_video_format(&hello, codec, compositor).await?;
+        negotiate_video_format(&hello, codec, compositor, gamescope_route.as_ref()).await?;
 
     // After depth + chroma: PyroWave Automatic is a ~bpp pin that scales with both.
     let bitrate_kbps =
@@ -803,6 +849,7 @@ async fn negotiate_video_format(
     hello: &Hello,
     codec: crate::encode::Codec,
     compositor: Option<crate::vdisplay::Compositor>,
+    gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
 ) -> Result<(u8, bool, crate::encode::ChromaFormat)> {
     // 10-bit only when host, client, codec, capture, and GPU all allow it. Resolved before
     // Welcome so `color` matches the stream (a can't-10-bit GPU yields 8-bit SDR).
@@ -813,12 +860,12 @@ async fn negotiate_video_format(
     // Source-aware: Linux HDR depends on the compositor just resolved. Gamescope folds in
     // `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no twin here because
     // that latch is per-source and this gate already used this session's source.
-    let capture_supports_hdr = crate::capture::capturer_supports_hdr_for(compositor);
-    // SDR-10: Windows IDD expands BGRA 8→10 (`Rgb10a2Sdr`); only direct-NVENC ingests that
-    // packed RGB. Linux has no SDR-10 chain (`resolved_backend_ingests_rgb_444` is false off
-    // Windows).
-    let sdr10_chain_ok =
-        codec_carries_sdr10(codec) && crate::encode::resolved_backend_ingests_rgb_444();
+    let capture_supports_hdr =
+        crate::capture::capturer_supports_hdr_for(compositor, gamescope_route);
+    // SDR-10 needs a backend that writes 10 bits from an SDR desktop's 8-bit capture:
+    // direct-NVENC (`backend_carries_sdr10`). A Linux 4:4:4 session is clamped to 8-bit
+    // separately at the resolved-chroma gate below, so depth needs no chroma input here.
+    let sdr10_chain_ok = codec_carries_sdr10(codec) && crate::encode::backend_carries_sdr10(codec);
     let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
     // Probe may open a tiny encoder; spawn_blocking, short-circuited behind the cheap gates.
     let gpu_can_10bit =
@@ -948,8 +995,8 @@ fn linux_chroma_under_hdr(
     crate::encode::ChromaFormat::Yuv420
 }
 
-/// Codecs that carry 10-bit SDR off the packed-RGB capture. PyroWave is out: that capture path
-/// hands it NV12 under SDR, so a 10-bit label would outrun the stream.
+/// Codecs that carry 10-bit SDR off the packed-RGB capture. PyroWave is out: its capture path
+/// hands NV12 under SDR, so a 10-bit label would outrun the stream.
 fn codec_carries_sdr10(codec: crate::encode::Codec) -> bool {
     matches!(
         codec,
@@ -1024,6 +1071,50 @@ mod tests {
         assert_eq!(linux_chroma_under_hdr(Yuv444, true), Yuv420);
         assert_eq!(linux_chroma_under_hdr(Yuv444, false), Yuv444);
         assert_eq!(linux_chroma_under_hdr(Yuv420, true), Yuv420);
+    }
+
+    /// The negotiation line names the preference, and a preference that lost says which
+    /// side lacks it — the reporter's 0x0b client against a 0x0f host, and the reverse.
+    #[test]
+    fn a_lost_codec_preference_names_the_missing_side() {
+        use punktfunk_core::quic::{
+            codec_preference_miss, CodecMiss, CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE,
+        };
+        let client = CODEC_H264 | CODEC_HEVC | CODEC_PYROWAVE;
+        let host = client | CODEC_AV1;
+        assert_eq!(codec_pref_label(CODEC_AV1), "AV1");
+        assert_eq!(codec_pref_label(0), "none");
+        assert_eq!(codec_pref_label(0x40), "unknown");
+
+        // No hardware AV1 decode: the host encodes it, the Hello never asked for it.
+        let miss = codec_preference_miss(client, host, CODEC_AV1).expect("preference lost");
+        assert_eq!(miss, CodecMiss::Client);
+        let client_note = codec_miss_note(miss, "AV1", "HEVC");
+        assert_eq!(
+            client_note,
+            "client prefers AV1 but does not advertise it (no decoder) — HEVC picked from \
+             the shared set"
+        );
+
+        // The other direction: a software-encode host against an AV1-capable client.
+        let miss = codec_preference_miss(host, client, CODEC_AV1).expect("preference lost");
+        assert_eq!(miss, CodecMiss::Host);
+        let host_note = codec_miss_note(miss, "AV1", "HEVC");
+        assert!(host_note.contains("this host cannot encode it"));
+        assert_ne!(client_note, host_note);
+
+        // Neither side, and the two honoured cases that must stay silent.
+        assert_eq!(
+            codec_preference_miss(client, client, CODEC_AV1),
+            Some(CodecMiss::Both)
+        );
+        assert_eq!(codec_preference_miss(client, host, CODEC_HEVC), None);
+        assert_eq!(codec_preference_miss(client, host, 0), None);
+        // A pre-negotiation client (no codec byte) decodes HEVC only.
+        assert_eq!(
+            codec_preference_miss(0, host, CODEC_AV1),
+            Some(CodecMiss::Client)
+        );
     }
 
     /// AV1 carries 10-bit SDR like HEVC; PyroWave captures NV12 under SDR, so it must not.

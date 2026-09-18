@@ -1,0 +1,137 @@
+#version 450
+// The fused convert for the direct-SDK NVENC path: the compositor's dmabuf (tiled or linear,
+// 8- or 10-bit RGB) sampled once, the cursor blended in, the NVENC input slot written — one
+// pass per frame and no staging. It runs in the zero-copy worker on slot memory the host
+// registered with NVENC (OPAQUE_FD on both sides), so this shader writes the bytes NVENC
+// encodes.
+//
+// MODE (push): 0 = packed ARGB 8-bit (NVENC byte order B,G,R,A), 1 = NV12 (Y plane +
+// interleaved half-res UV at row plane_rows), 2 = planar YUV444 (3 full-res planes stacked at
+// pitch_w*plane_rows), 3 = packed 10-bit x:R:G:B 2:10:10:10 LE (NVENC ARGB10), 4 = packed
+// 10-bit x:B:G:R (NVENC ABGR10). BT.709 limited range for the YUV modes — the same
+// coefficients as rgb2nv12_buf.comp and cursor_blend.comp. The 10-bit modes carry PQ-encoded
+// samples through untouched (NVENC does the BT.2020 CSC).
+//
+// One invocation owns a 4x2 block of output pixels: every store is a whole u32 word and no two
+// invocations share one (word-granular byte planes without 8-bit storage). The cursor is a
+// straight-alpha RGBA8 bitmap blended at the source pixel in the source's own encoding, as
+// cursor_blend.comp does. Output is 1:1 with the source; even dimensions.
+//
+// Rebuild: glslangValidator -V convert_img.comp -o convert_img.spv (CI diffs the disassembly
+// against this source, tolerating only the generator header).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src; // the dmabuf as imported, any modifier; normalized
+layout(std430, binding = 1) writeonly buffer Dst { uint dw[]; };
+layout(std430, binding = 2) readonly buffer Cur { uint cur[]; }; // RGBA8, tight rows
+
+layout(push_constant) uniform Push {
+    uint mode;
+    uint width;      // output = source pixels
+    uint height;
+    uint pitch_w;    // slot row pitch, in words
+    uint plane_rows; // luma rows: the plane stride multiplier
+    uint cur_w;      // 0 = no cursor
+    uint cur_h;
+    int cur_x;       // cursor top-left in source pixels (may be negative)
+    int cur_y;
+} pc;
+
+// Edge-clamped source texel with the cursor blended over it.
+vec3 fetch(uint x, uint y) {
+    x = min(x, pc.width - 1u);
+    y = min(y, pc.height - 1u);
+    vec3 c = texelFetch(src, ivec2(int(x), int(y)), 0).rgb;
+    if (pc.cur_w != 0u) {
+        int cx = int(x) - pc.cur_x;
+        int cy = int(y) - pc.cur_y;
+        if (cx >= 0 && cy >= 0 && cx < int(pc.cur_w) && cy < int(pc.cur_h)) {
+            uint w = cur[uint(cy) * pc.cur_w + uint(cx)];
+            vec4 k = vec4(float(w & 0xFFu), float((w >> 8) & 0xFFu), float((w >> 16) & 0xFFu),
+                          float((w >> 24) & 0xFFu)) / 255.0;
+            c = mix(c, k.rgb, k.a);
+        }
+    }
+    return c;
+}
+
+uint q8(float v) { return uint(clamp(v * 255.0 + 0.5, 0.0, 255.0)); }
+uint q10(float v) { return uint(clamp(v * 1023.0 + 0.5, 0.0, 1023.0)); }
+uint lumaB(vec3 c) {
+    return uint(clamp(16.0 + 255.0 * (0.1826 * c.r + 0.6142 * c.g + 0.0620 * c.b) + 0.5, 0.0, 255.0));
+}
+uint cbB(vec3 c) {
+    return uint(clamp(128.0 + 255.0 * (-0.1006 * c.r - 0.3386 * c.g + 0.4392 * c.b) + 0.5, 0.0, 255.0));
+}
+uint crB(vec3 c) {
+    return uint(clamp(128.0 + 255.0 * (0.4392 * c.r - 0.3989 * c.g - 0.0403 * c.b) + 0.5, 0.0, 255.0));
+}
+
+void main() {
+    uint bx = gl_GlobalInvocationID.x;
+    uint by = gl_GlobalInvocationID.y;
+    uint x0 = bx * 4u;
+    uint y0 = by * 2u;
+    if (x0 >= pc.width || y0 >= pc.height) {
+        return;
+    }
+    if (pc.mode == 0u || pc.mode == 3u || pc.mode == 4u) {
+        // Packed: one word per pixel.
+        for (uint row = 0u; row < 2u; row++) {
+            uint y = y0 + row;
+            if (y >= pc.height) {
+                break;
+            }
+            for (uint i = 0u; i < 4u; i++) {
+                uint x = x0 + i;
+                if (x >= pc.width) {
+                    break;
+                }
+                vec3 c = fetch(x, y);
+                uint w;
+                if (pc.mode == 0u) {
+                    w = q8(c.b) | (q8(c.g) << 8) | (q8(c.r) << 16) | 0xFF000000u;
+                } else if (pc.mode == 3u) {
+                    w = q10(c.b) | (q10(c.g) << 10) | (q10(c.r) << 20);
+                } else {
+                    w = q10(c.r) | (q10(c.g) << 10) | (q10(c.b) << 20);
+                }
+                dw[y * pc.pitch_w + x] = w;
+            }
+        }
+        return;
+    }
+    // Byte planes: four luma (or 444 chroma) bytes per word; NV12 chroma one word per two 2x2 pairs.
+    for (uint row = 0u; row < 2u; row++) {
+        uint y = y0 + row;
+        if (y >= pc.height) {
+            break;
+        }
+        vec3 c0 = fetch(x0, y);
+        vec3 c1 = fetch(x0 + 1u, y);
+        vec3 c2 = fetch(x0 + 2u, y);
+        vec3 c3 = fetch(x0 + 3u, y);
+        dw[y * pc.pitch_w + bx] =
+            lumaB(c0) | (lumaB(c1) << 8) | (lumaB(c2) << 16) | (lumaB(c3) << 24);
+        if (pc.mode == 2u) {
+            uint u_off = pc.pitch_w * pc.plane_rows;
+            uint v_off = 2u * u_off;
+            dw[u_off + y * pc.pitch_w + bx] =
+                cbB(c0) | (cbB(c1) << 8) | (cbB(c2) << 16) | (cbB(c3) << 24);
+            dw[v_off + y * pc.pitch_w + bx] =
+                crB(c0) | (crB(c1) << 8) | (crB(c2) << 16) | (crB(c3) << 24);
+        }
+    }
+    if (pc.mode == 1u) {
+        uint uvw = 0u;
+        for (uint s = 0u; s < 2u; s++) {
+            // Left-sited (H.273 type 0): [1 2 1] across columns cx-1..cx+1 over both rows.
+            uint cx = x0 + s * 2u;
+            uint xl = cx == 0u ? 0u : cx - 1u;
+            vec3 a = (fetch(xl, y0) + 2.0 * fetch(cx, y0) + fetch(cx + 1u, y0)
+                + fetch(xl, y0 + 1u) + 2.0 * fetch(cx, y0 + 1u) + fetch(cx + 1u, y0 + 1u)) * 0.125;
+            uvw |= (cbB(a) | (crB(a) << 8)) << (16u * s);
+        }
+        dw[pc.pitch_w * pc.plane_rows + by * pc.pitch_w + bx] = uvw;
+    }
+}

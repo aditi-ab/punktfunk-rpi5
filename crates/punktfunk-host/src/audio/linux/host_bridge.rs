@@ -93,9 +93,13 @@ impl HostBridge {
                     return;
                 };
                 let voice = props.get("media.class") == Some("Stream/Output/Audio")
-                    && is_voice_app(
-                        props.get("application.name"),
-                        props.get("application.process.binary"),
+                    && pf_host_config::voice_app_matches(
+                        [
+                            props.get("application.name"),
+                            props.get("application.process.binary"),
+                        ]
+                        .into_iter()
+                        .flatten(),
                         &self.voice_apps,
                     );
                 self.nodes.insert(
@@ -271,37 +275,5 @@ impl HostBridge {
             md.set_property(id, "target.object", None, None);
         }
         wrote
-    }
-}
-
-/// Whether an output stream belongs to a voice-chat app: any listed fragment
-/// inside the lowercased `application.name` or process binary.
-fn is_voice_app(name: Option<&str>, binary: Option<&str>, apps: &[String]) -> bool {
-    [name, binary]
-        .into_iter()
-        .flatten()
-        .map(str::to_ascii_lowercase)
-        .any(|s| apps.iter().any(|a| s.contains(a.as_str())))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn voice_apps_match_on_name_or_binary_fragments() {
-        let apps = pf_host_config::parse_voice_apps(None);
-        assert!(is_voice_app(Some("Discord"), None, &apps));
-        assert!(is_voice_app(
-            Some("WEBRTC VoiceEngine"),
-            Some("DiscordCanary"),
-            &apps
-        ));
-        assert!(is_voice_app(None, Some("/usr/bin/vesktop"), &apps));
-        assert!(!is_voice_app(Some("Firefox"), Some("firefox"), &apps));
-        assert!(!is_voice_app(None, None, &apps));
-        let own = pf_host_config::parse_voice_apps(Some("firefox"));
-        assert!(is_voice_app(Some("Firefox"), None, &own));
-        assert!(!is_voice_app(Some("Discord"), None, &own));
     }
 }

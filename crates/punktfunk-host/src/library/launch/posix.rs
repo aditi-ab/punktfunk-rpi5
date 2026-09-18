@@ -14,8 +14,8 @@ pub(super) fn launch_target(
     entry: GameEntry,
     game: crate::gamelease::GameRef,
 ) -> Option<LaunchTarget> {
-    let command = plugin_recipe(&entry)
-        .map(|l| l.command)
+    let command = exec_recipe(&entry)
+        .map(|r| r.shell_command())
         .or_else(|| entry.launch.as_ref().and_then(command_for))?;
     Some(LaunchTarget {
         game,
@@ -39,9 +39,8 @@ pub(super) fn launcher_ui_installed(value: &str) -> bool {
     true
 }
 
-/// Cheap "will this launch" bit for handshake routing. Async path: never asks
-/// a plugin. For `plugin` kind, a live provider plus a well-formed key is
-/// enough; a later refuse fails like any other unresolvable entry.
+/// Cheap "will this launch" bit for handshake routing. An `exec` entry resolves against the
+/// installed manifest, which is on disk and needs no running plugin.
 pub fn launch_is_resolvable(id: &str) -> bool {
     let Some(entry) = all_games().into_iter().find(|g| g.id == id) else {
         return false;
@@ -49,18 +48,14 @@ pub fn launch_is_resolvable(id: &str) -> bool {
     let Some(spec) = entry.launch.as_ref() else {
         return false;
     };
-    if spec.kind == "plugin" {
-        return valid_plugin_entry_key(&spec.value)
-            && entry
-                .provider
-                .as_deref()
-                .is_some_and(|p| crate::mgmt::ui_credential(p).is_some());
+    if spec.kind == "exec" {
+        return exec_recipe(&entry).is_some();
     }
     command_for(spec).is_some()
 }
 
-/// Pure map from [`LaunchSpec`] to a shell command. `plugin` is absent: that
-/// answer is another process, resolved by [`plugin_recipe`] first.
+/// Pure map from [`LaunchSpec`] to a shell command. `exec` is absent: it is built from the
+/// publishing plugin's manifest by [`exec_recipe`] first.
 fn command_for(spec: &LaunchSpec) -> Option<String> {
     match spec.kind.as_str() {
         "steam_appid" => valid_steam_appid(&spec.value)
@@ -92,6 +87,8 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
             "lutris" => Some("lutris".into()),
             _ => None,
         },
+        // The plugin sends an id; the command is whatever the installed entry says (`desktop.rs`).
+        "desktop_id" => super::desktop::desktop_command(&spec.value).map(|(cmd, _)| cmd),
         "command" => (!spec.value.trim().is_empty()).then(|| spec.value.clone()),
         _ => None,
     }
@@ -99,9 +96,9 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
 
 /// `<runner>:<appName>` → Heroic command, nested in gamescope.
 ///
-/// Heroic is single-instance Electron. Fresh gamescope: boot, launch, stay
-/// hidden (`--no-gui`). An already-running GUI forwards the URI and exits,
-/// which would tear the session — validated only for the fresh-session case.
+/// Heroic is single-instance Electron. A fresh gamescope keeps its hidden
+/// process alive; an existing GUI forwards the URI and exits, which tears the
+/// session. Quote the URI: every launch route runs this value as a shell command.
 #[cfg(target_os = "linux")]
 pub(crate) fn heroic_command(value: &str) -> Option<String> {
     let (runner, app) = value.split_once(':')?;
@@ -117,9 +114,8 @@ pub(crate) fn heroic_command(value: &str) -> Option<String> {
         return None;
     }
     let prefix = heroic_launch_prefix()?;
-    // No quotes: gamescope splits on whitespace. URI has no spaces; `&` is exec'd, not a shell.
     Some(format!(
-        "{prefix} --no-gui heroic://launch?appName={app}&runner={runner}"
+        "{prefix} --no-gui 'heroic://launch?appName={app}&runner={runner}'"
     ))
 }
 
@@ -198,13 +194,15 @@ pub fn adopt_launch_workspace(
 ///   steam://…` also forwards over Steam's pipe.
 /// * **gamescope (bare spawn)** — only after a keep-alive reuse, which spawned
 ///   nothing. A fresh spawn nests via `set_launch_command`
-///   ([`crate::vdisplay::launch_is_nested`]).
+///   ([`crate::vdisplay::launch_is_nested`]). `steam_home` is the seat's, so
+///   the forwarder reaches the Steam that reuse kept, not the box's.
 #[cfg(target_os = "linux")]
 pub fn launch_session_command(
     compositor: crate::vdisplay::Compositor,
     cmd: &str,
     seat: Option<&str>,
     own_workspace: bool,
+    steam_home: Option<&std::path::Path>,
 ) -> Result<SpawnedLaunch> {
     use std::os::unix::process::CommandExt;
     let cmd = cmd.trim();
@@ -214,7 +212,7 @@ pub fn launch_session_command(
     let workspace = focus_and_claim(compositor, own_workspace, None);
     let (child, group_leader) = match compositor {
         crate::vdisplay::Compositor::Gamescope => (
-            crate::vdisplay::launch_into_gamescope_session(cmd, seat)?,
+            crate::vdisplay::launch_into_gamescope_session(cmd, seat, steam_home)?,
             false,
         ),
         _ => {
@@ -292,6 +290,7 @@ mod tests {
         let steam = LaunchSpec {
             kind: "steam_appid".into(),
             value: "570".into(),
+            ..Default::default()
         };
         assert_eq!(
             command_for(&steam).as_deref(),
@@ -300,24 +299,28 @@ mod tests {
         let evil = LaunchSpec {
             kind: "steam_appid".into(),
             value: "570; rm -rf ~".into(),
+            ..Default::default()
         };
         assert_eq!(command_for(&evil), None);
         let custom = LaunchSpec {
             kind: "command".into(),
             value: "dolphin-emu --batch".into(),
+            ..Default::default()
         };
         assert_eq!(command_for(&custom).as_deref(), Some("dolphin-emu --batch"));
         assert_eq!(
             command_for(&LaunchSpec {
                 kind: "command".into(),
-                value: "  ".into()
+                value: "  ".into(),
+                ..Default::default()
             }),
             None
         );
         assert_eq!(
             command_for(&LaunchSpec {
                 kind: "wat".into(),
-                value: "x".into()
+                value: "x".into(),
+                ..Default::default()
             }),
             None
         );
@@ -328,7 +331,8 @@ mod tests {
         assert_eq!(
             command_for(&LaunchSpec {
                 kind: "lutris_id".into(),
-                value: "42".into()
+                value: "42".into(),
+                ..Default::default()
             })
             .as_deref(),
             Some("lutris lutris:rungameid/42")
@@ -336,7 +340,8 @@ mod tests {
         assert_eq!(
             command_for(&LaunchSpec {
                 kind: "lutris_id".into(),
-                value: "42; rm -rf ~".into()
+                value: "42; rm -rf ~".into(),
+                ..Default::default()
             }),
             None
         );
@@ -356,6 +361,7 @@ mod tests {
             command_for(&LaunchSpec {
                 kind: "launcher_ui".into(),
                 value: v.into(),
+                ..Default::default()
             })
         };
         // Bare `lutris` opens the window; the URI form is `lutris_id` and launches a game.
@@ -376,8 +382,6 @@ mod tests {
             assert!(cmd.contains("--console"), "{cmd:?}");
             assert!(cmd.contains("--fullscreen"), "{cmd:?}");
             assert!(!cmd.contains("--no-gui"), "the GUI is the point: {cmd:?}");
-            // Gamescope spawns by `split_whitespace`, so every token must stand alone.
-            assert!(cmd.split_whitespace().any(|t| t == "--console"), "{cmd:?}");
         }
         assert_eq!(ui("nonsense"), None);
         assert_eq!(ui(""), None);
@@ -388,6 +392,7 @@ mod tests {
             command_for(&LaunchSpec {
                 kind: "steam_ui".into(),
                 value: v.into(),
+                ..Default::default()
             })
         };
         // The flag covers a cold Steam; the URI is all a running desktop Steam acts on.

@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unom <packages@unom.io>
+Date: Wed, 16 Sep 2026 00:51:43 +0200
+Subject: [PATCH] pipewire: pace the capture push to the consumer's
+ maxFramerate
+
+With adaptive sync a headless gamescope paints on every game commit, and paint_pipewire composites and pushes a frame each time. A consumer that encodes at its own rate throws the surplus away, so a game at 190 fps costs the box two extra 4K composites per wire frame for nothing.
+
+The consumer's negotiated maxFramerate names the rate it can use. Skip the push when the last one is less than an interval old, before the commit-id statics update, so the skipped change stays pending and the next vblank pushes the newest content. Half an interval of slack keeps a game at exactly the wire rate from losing every other frame to jitter; the schedule clamp stops a burst after a quiet stretch.
+
+Stamp pfhdr12 so a box upgrades to it. No new capability the host has to gate on: an older build ignores the property.
+---
+ src/meson.build      |  3 ++-
+ src/steamcompmgr.cpp | 18 ++++++++++++++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/src/meson.build b/src/meson.build
+index da7d5b0..a37eadb 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -191,7 +191,8 @@ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+ #   +pfhdr9 — …and the headless connector supports adaptive sync (paint on game commit)
+ #   +pfhdr10 — …and the CLI framerate limit persists across paints without switching refresh
+ #   +pfhdr11 — …and the Steam overlay repaints the capture on its own commits (no new capability)
+-version_tag = vcs_tag + '+pfhdr11' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr12 — …and the capture push honours the consumer's maxFramerate
++version_tag = vcs_tag + '+pfhdr12' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index fb2f1e6..2ce4eab 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -2477,6 +2477,24 @@ static void paint_pipewire()
+ 	     nCursorX == s_nLastCursorX && nCursorY == s_nLastCursorY )
+ 		return;
+ 
++	// The consumer's `maxFramerate` is the rate it can use; with adaptive sync every game commit
++	// would otherwise composite and push a frame the consumer throws away. Returning before the
++	// statics update leaves the change pending, so the next vblank pushes the newest content.
++	// Half an interval of slack keeps a game at exactly that rate from losing every other frame
++	// to jitter; the clamp stops a burst after a quiet stretch.
++	{
++		const struct spa_fraction &maxFramerate = s_pPipewireBuffer->video_info.max_framerate;
++		if ( maxFramerate.num > 0 && maxFramerate.denom > 0 )
++		{
++			static uint64_t s_ulNextPushNs = 0;
++			const uint64_t ulIntervalNs = ( 1'000'000'000ull * maxFramerate.denom ) / maxFramerate.num;
++			const uint64_t ulNow = get_time_in_nanos();
++			if ( ulNow + ulIntervalNs / 2 < s_ulNextPushNs )
++				return;
++			s_ulNextPushNs = std::max( s_ulNextPushNs, ulNow - std::min( ulNow, ulIntervalNs ) ) + ulIntervalNs;
++		}
++	}
++
+ 	s_ulLastFocusCommitId = ulFocusCommitId;
+ 	s_ulLastOverrideCommitId = ulOverrideCommitId;
+ 	s_ulLastExternalOverlayCommitId = ulExternalOverlayCommitId;
+-- 
+2.54.0 (Apple Git-157)
+

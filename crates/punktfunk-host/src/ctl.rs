@@ -505,6 +505,7 @@ fn stats(args: &[&str], json: bool) -> Result<()> {
                 "video_streaming": status["video_streaming"],
                 "active_sessions": status["active_sessions"],
                 "session": status["session"],
+                "sessions": status["sessions"],
                 "stream": status["stream"],
                 "games": status["games"],
                 "capture": capture,
@@ -530,6 +531,55 @@ fn dur_us(us: f64) -> String {
     }
 }
 
+/// Per session: other sessions on its client address, then the last closed link-health minute —
+/// the same counters as the host log's `link health` line, silent until a full minute has run.
+fn render_link(v: &Value) {
+    let Some(sessions) = v["sessions"].as_array() else {
+        return;
+    };
+    for s in sessions {
+        if let Some(others) = s["shared_path_with"].as_array() {
+            let ids: Vec<String> = others.iter().map(|o| o.to_string()).collect();
+            println!(
+                "path      session {} shares its client address with session {}",
+                s["id"],
+                ids.join(", ")
+            );
+        }
+        let l = &s["link"];
+        if l.is_null() {
+            continue;
+        }
+        let n = |k: &str| l[k].as_i64().unwrap_or(0);
+        println!(
+            "link      session {} · {} report windows, {} with loss (max {:.2} %)",
+            n("session_id"),
+            n("windows"),
+            n("loss_windows"),
+            l["loss_max_ppm"].as_f64().unwrap_or(0.0) / 10_000.0,
+        );
+        // Recovery is what a freeze costs; the bands say what the link was asked to carry.
+        println!(
+            "          {} keyframe asks · {} IDR · {} RFI ({} declined) · {} anchor · {} intra refresh",
+            n("keyframe_req"),
+            n("idr"),
+            n("rfi"),
+            n("rfi_declined"),
+            n("anchor_p"),
+            n("intra_refresh"),
+        );
+        println!(
+            "          FEC {}–{} % · {:.1}–{:.1} Mbps target, {} retargets · {:.1} Mbps sent",
+            n("fec_min_pct"),
+            n("fec_max_pct"),
+            n("abr_min_kbps") as f64 / 1000.0,
+            n("abr_max_kbps") as f64 / 1000.0,
+            n("retargets"),
+            n("egress_kbps") as f64 / 1000.0,
+        );
+    }
+}
+
 fn render_stats(v: &Value) {
     let s = &v["stream"];
     if s.is_null() {
@@ -551,6 +601,7 @@ fn render_stats(v: &Value) {
             println!("bring-up  {ms} ms to first frame");
         }
     }
+    render_link(v);
     if let Some(backend) = v["meta"]["encoder_backend"].as_str() {
         println!(
             "encoder   {backend}{}",

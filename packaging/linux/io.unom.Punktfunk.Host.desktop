@@ -11,9 +11,10 @@ NoDisplay=true
 # grants only the interfaces listed here (the same mechanism krfb-virtualmonitor / krdpserver use):
 #   * zkde_screencast_unstable_v1 — create the per-session virtual output at the client's mode.
 #   * org_kde_kwin_fake_input     — inject input directly (no RemoteDesktop portal dialog).
+#   * org_kde_plasma_window_management — see when a launched game's window is up (launch hold).
 # Comma-separated, per KWin's parser. Without this file KWin never advertises these to the host and
 # desktop-mode streaming fails with "KWin does not expose zkde_screencast_unstable_v1". Gaming Mode
 # (gamescope) does not use this path. NOTE: KWin caches the per-executable grant on first connect,
 # so this must be installed *before* the host first connects (a package install satisfies that; an
 # already-running KWin session needs a re-login to pick it up).
-X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1,org_kde_kwin_fake_input
+X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1,org_kde_kwin_fake_input,org_kde_plasma_window_management

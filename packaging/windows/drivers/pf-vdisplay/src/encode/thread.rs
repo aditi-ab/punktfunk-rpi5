@@ -58,7 +58,9 @@ pub fn hdr_meta(bytes: &[u8; 28]) -> HdrMeta {
 /// own caps already say 4:2:0) — never a P010 pick under a reply promising full chroma.
 pub fn spec_for(req: &SetEncodeRequest, backend: u32) -> Result<OpenSpec, Fail> {
     let (hdr, chroma444) = (req.hdr == 1, req.chroma == 1);
-    let kind = InputKind::choose(backend, hdr, chroma444);
+    // 10-bit SDR (depth 10, HDR off) picks a BT.709 P010 input on AMF; `choose` ignores it elsewhere.
+    let ten_bit = req.bit_depth >= 10;
+    let kind = InputKind::choose(backend, hdr, ten_bit, chroma444);
     Ok(OpenSpec {
         backend,
         codec: codec_from_wire(req.codec).ok_or((-4, "codec"))?,
@@ -321,6 +323,9 @@ pub fn open_backend(
     let (w, h, fps, bps) = (spec.width, spec.height, spec.fps, spec.bitrate_bps);
     let (depth, chroma) = (spec.bit_depth, spec.chroma);
     let format = pixel_format(spec.kind);
+    // P010 serves both HDR and 10-bit SDR; the kind is the only thing that tells them apart, so
+    // the backend's colour signalling follows it, not the (identical) P010 pixel label.
+    let hdr = matches!(spec.kind, InputKind::P010 | InputKind::Rgb10);
     let luid = Some(adapter.luid62());
     // NVENC, QSV and PyroWave are x86-64 only (see Cargo.toml); an ARM64 driver refuses their
     // ids here and the host falls through to Media Foundation.
@@ -342,7 +347,7 @@ pub fn open_backend(
             Ok(Box::new(e) as Box<dyn Encoder>)
         }),
         backend::AMF => pf_encode_win::amf::AmfEncoder::open(
-            spec.codec, format, w, h, fps, bps, depth, chroma, luid,
+            spec.codec, format, w, h, fps, bps, depth, chroma, hdr, luid,
         )
         .and_then(|mut e| {
             e.prepare(device)?;

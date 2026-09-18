@@ -84,7 +84,6 @@ import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.library.LibraryResult
 import io.unom.punktfunk.kit.library.LibraryCache
 import io.unom.punktfunk.kit.library.RunningGame
-import io.unom.punktfunk.kit.library.mtlsHttpClient
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.IdentityStore
 import io.unom.punktfunk.kit.security.KnownHost
@@ -202,9 +201,11 @@ fun LibraryScreen(
      */
     pinnedPresetId: String? = null,
     /**
-     * Stream this host's desktop as soon as the shelf can dial (`start_in = stream`). One attempt,
-     * once per screen: a refusal leaves the shelf on screen and nothing retries. Goes through the
-     * same [launch] every tap does, so the auto-start and a tap on the Desktop tile cannot drift.
+     * Stream this host's desktop as soon as the shelf can dial (`start_in = stream`). One attempt
+     * per app start: a refusal leaves the shelf on screen and nothing retries, and [onLaunched]
+     * disarms the caller's flag, so a shelf composed again after a stream stays a shelf. Goes
+     * through the same [launch] every tap does, so the auto-start and a tap on the Desktop tile
+     * cannot drift.
      */
     autoStream: Boolean = false,
 ) {
@@ -429,11 +430,8 @@ private suspend fun loadLibrary(context: Context, host: KnownHost, set: (LibStat
 private suspend fun prepareLoader(context: Context, host: KnownHost): Pair<ClientIdentity, ImageLoader>? =
     withContext(Dispatchers.IO) {
         val id = runCatching { obtainIdentity(IdentityStore(context)) }.getOrNull() ?: return@withContext null
-        val loader = runCatching {
-            ImageLoader.Builder(context)
-                .okHttpClient(mtlsHttpClient(id.certPem, id.privateKeyPem, host.address, host.fpHex))
-                .build()
-        }.getOrNull() ?: return@withContext null
+        val loader = runCatching { posterLoader(context, id, host.address, host.fpHex) }.getOrNull()
+            ?: return@withContext null
         id to loader
     }
 

@@ -224,8 +224,19 @@ public final class Sc2Capture {
 
     /// Begin acquisition (main actor: it registers the app-lifecycle observers). Wire slots
     /// are claimed later, on each source's first state report.
+    /// The one capture that holds the controller: a second would open the same link twice.
+    @MainActor private static weak var running: Sc2Capture?
+
     @MainActor
     public func start() {
+        guard Self.running == nil || Self.running === self else {
+            log.info("SC2: passthrough already runs in another window's session")
+            lock.lock()
+            stopped = true
+            lock.unlock()
+            return
+        }
+        Self.running = self
         lock.lock()
         stopped = false
         suspended = false
@@ -323,6 +334,7 @@ public final class Sc2Capture {
         stopped = true
         lock.unlock()
         guard !wasStopped else { return }
+        if Self.running === self { Self.running = nil }
         manager.steamController2Claims = 0
         manager.holdSc2Hardware(false)
         observers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -405,9 +417,7 @@ public final class Sc2Capture {
                     switch event {
                     case .ringChord: self.onRingChord?()
                     case .nav(let nav): self.onRingNav?(nav)
-                    // Straight to the shared tier default, like GamepadCapture: every reader
-                    // observes `StatsVerbosity` through @AppStorage, so nothing wires back.
-                    case .statsChord: StatsVerbosity.cycle()
+                    case .statsChord: StatsVerbosity.requestCycle(for: self.connection)
                     }
                 }
             }

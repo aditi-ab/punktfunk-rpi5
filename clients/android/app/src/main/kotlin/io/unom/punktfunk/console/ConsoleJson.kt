@@ -287,7 +287,10 @@ internal object ConsoleJson {
         val out = JSONArray()
         for (g in games) {
             val id = g.appId ?: continue
-            out.put(JSONObject().put("app_id", id).put("state", g.state))
+            out.put(
+                JSONObject().put("app_id", id).put("state", g.state)
+                    .put("awaiting_window", g.awaitingWindow),
+            )
         }
         return out.toString()
     }

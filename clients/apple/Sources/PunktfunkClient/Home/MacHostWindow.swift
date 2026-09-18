@@ -13,12 +13,25 @@ final class MacHostRouter: ObservableObject {
     static let shared = MacHostRouter()
     @Published private(set) var pending: HostPageRequest?
     var mainWindows = 0
+    /// A busy window is opening a window for `pending`.
+    private var opening = false
 
     func send(_ request: HostPageRequest) { pending = request }
 
     func take() -> HostPageRequest? {
-        defer { pending = nil }
+        defer {
+            pending = nil
+            opening = false
+        }
         return pending
+    }
+
+    /// Whether a busy window should open a window for `request`: nobody took it and no window
+    /// is opening for it yet.
+    func claimOpening(_ request: HostPageRequest) -> Bool {
+        guard pending == request, !opening else { return false }
+        opening = true
+        return true
     }
 }
 

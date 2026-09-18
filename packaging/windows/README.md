@@ -61,9 +61,10 @@ The task list, the silent-install flags and the uninstall behaviour are on the
 here, because nothing else records them:
 
 - **Upgrades never overwrite `host.env`.** A default is written only if absent, and a hand-edited
-  `PUNKTFUNK_HOST_CMD` survives — on an upgrade the GameStream task is inert entirely (the flag is
-  omitted), so change an installed host with `punktfunk-host service install --gamestream=on|off`
-  plus a restart, not by re-running the wizard.
+  `PUNKTFUNK_HOST_CMD` survives. The one rewrite is `serve --gamestream` (or no line) to `serve`
+  with the GameStream setting kept on. On an upgrade the GameStream task is inert (the flag is
+  omitted), so change an installed host in the web console or with
+  `punktfunk-host service install --gamestream=on|off`, not by re-running the wizard.
 - **A driver failure warns, never aborts.** The host degrades to a physical display without
   pf-vdisplay, so a partial install is better than none.
 - **A VB-CABLE from an older install is deliberately not removed.** It is a third-party shared

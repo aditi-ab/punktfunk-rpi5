@@ -972,7 +972,6 @@ pub(crate) fn window_action(verb: crate::toplevels::WindowVerb, address: &str) -
             hyprctl_dispatch(&["dispatch", "focuswindow", &target])?;
             hyprctl_dispatch(&["dispatch", "fullscreen", "1"])
         }
-        WindowVerb::Close => hyprctl_dispatch(&["dispatch", "closewindow", &target]),
     }
 }
 

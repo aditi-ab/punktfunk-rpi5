@@ -281,8 +281,8 @@ const ApplyPanel: FC<{
 		setBusy(true);
 		setError(null);
 		try {
-			// Plain fetch on purpose: apiFetch treats ANY 401 as "session expired → /login",
-			// but here a 401 is just a wrong password confirmation.
+			// Keep confirmation handling local. apiFetch now redirects only the auth middleware's
+			// `{ error: "unauthorized" }` 401, while this 401 means the password was wrong.
 			const res = await fetch("/api/v1/update/apply", {
 				method: "POST",
 				headers: { "content-type": "application/json" },

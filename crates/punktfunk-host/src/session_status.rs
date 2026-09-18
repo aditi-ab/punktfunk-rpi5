@@ -51,6 +51,8 @@ struct LiveSession {
     client: String,
     /// Display name (trust-store, else sanitized Hello). `None` if nameless.
     client_name: Option<String>,
+    /// Which plane serves it. Both register here, so a stop or a keyframe reaches either.
+    plane: crate::events::Plane,
     hdr: bool,
     /// Bring-up total (hello → first packet), ms. 0 until the first packet left.
     ttff_ms: Arc<AtomicU32>,
@@ -79,6 +81,8 @@ struct LiveSession {
     tally: Option<SessionTally>,
     /// Totals the input, audio and encode paths bump while the session runs.
     counters: Arc<SessionCounters>,
+    /// Client address, so sessions from one NAT or tunnel can be told apart.
+    peer: Option<std::net::IpAddr>,
 }
 
 /// The video loop's own totals, handed over as it finishes.
@@ -112,10 +116,6 @@ pub struct SessionControls {
     pub access_tx: Option<tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::AccessUpdate>>,
     /// The control task's audio lane. `None` on a session with no control task (tests).
     pub audio_tx: Option<tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::AudioState>>,
-    /// Head the window routes read and act on ([`SessionControls::set_head`]).
-    /// Latched per session: the injector's slot is one per process, and a second
-    /// session's bring-up would otherwise re-point this one at its head.
-    pub head: Arc<Mutex<Option<StreamedHead>>>,
     /// OS pad slots this session holds, one bit each — the player numbers a local
     /// co-op game reads. Published by the input thread.
     pub pad_slots: Arc<AtomicU16>,
@@ -136,7 +136,8 @@ pub struct SessionControls {
 /// slot: `MAX_PADS` is 16.
 pub const NO_PAD_SLOT: u8 = u8::MAX;
 
-/// The compositor head one session streams — what its window list names.
+/// The compositor head one session streams — where its launch's window stage
+/// places the game.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamedHead {
     pub compositor: crate::vdisplay::Compositor,
@@ -155,7 +156,6 @@ impl SessionControls {
             deadline_unix: Arc::new(AtomicI64::new(0)),
             access_tx: None,
             audio_tx: None,
-            head: Arc::new(Mutex::new(None)),
             pad_slots: Arc::new(AtomicU16::new(0)),
             fingerprint: None,
             pad_owner: crate::inject::pad_pool::owner_key(None),
@@ -196,17 +196,6 @@ impl SessionControls {
         (0..punktfunk_core::input::MAX_PADS as u8)
             .filter(|n| mask & (1 << n) != 0)
             .collect()
-    }
-
-    /// Latch the head this session streams, once the capture pipeline names it.
-    /// A backend that names no output leaves it `None` and lists nothing.
-    pub fn set_head(&self, head: Option<StreamedHead>) {
-        *self.head.lock().unwrap_or_else(|e| e.into_inner()) = head;
-    }
-
-    /// This session's head, or `None` before capture is up.
-    pub fn head(&self) -> Option<StreamedHead> {
-        self.head.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Re-point the live mask, clamped to the pairing's ceiling, and tell the client
@@ -270,11 +259,29 @@ pub struct SessionCounters {
     bitrate_max_kbps: AtomicU32,
     bitrate_sum_kbps: AtomicU64,
     bitrate_notes: AtomicU32,
+    /// Last rate noted, so a rebuild at the same number is not a move.
+    bitrate_last_kbps: AtomicU32,
+    /// Per-minute link health ([`crate::link_health`]). Drained by the control task, not by
+    /// the summary: these are window deltas, the rest of this block is session totals.
+    pub link: crate::link_health::LinkCounters,
 }
 
 impl SessionCounters {
     /// One motion arrival. `stalled` is [`crate::native::motion_cadence`]'s own verdict, so
     /// what counts as a break in the feed is defined in exactly one place.
+    /// Zero the per-session tallies. For a plane that keeps one counter block across
+    /// sessions (the compat plane's, which its control loop bumps without a session handle).
+    pub fn reset(&self) {
+        for c in [
+            &self.input_events,
+            &self.input_mic,
+            &self.input_rich,
+            &self.input_dropped,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
     pub fn note_motion(&self, stalled: bool) {
         self.motion_samples.fetch_add(1, Ordering::Relaxed);
         if stalled {
@@ -310,6 +317,9 @@ impl SessionCounters {
     pub fn note_bitrate(&self, kbps: u32) {
         if kbps == 0 {
             return;
+        }
+        if self.bitrate_last_kbps.swap(kbps, Ordering::Relaxed) != kbps {
+            self.link.note_retarget();
         }
         self.bitrate_min_kbps
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
@@ -374,7 +384,11 @@ static AUDIO_POLICY: Mutex<Option<AudioPolicy>> = Mutex::new(None);
 pub fn apply_audio_policy(sessions: AudioSessions, launcher: &str) -> AudioPolicyGuard {
     let mut muted = Vec::new();
     for s in registry().lock().unwrap().iter() {
-        if policy_mutes(sessions, launcher, &s.client, s.join) {
+        // Compat sessions have no per-session mute, and marking one muted without muting it
+        // would put a Muted badge on a session the operator can still hear.
+        if s.plane == crate::events::Plane::Native
+            && policy_mutes(sessions, launcher, &s.client, s.join)
+        {
             s.controls.set_muted(true);
             muted.push(s.id);
         }
@@ -424,6 +438,8 @@ pub struct SessionSnapshot {
     pub codec: Codec,
     /// Display name (trust-store, else sanitized Hello). `None` if nameless.
     pub client_name: Option<String>,
+    /// Which plane serves it.
+    pub plane: crate::events::Plane,
     /// The capturer's live health, if it classifies.
     pub capture_health: Option<pf_capture::CaptureHealth>,
     /// Bring-up total (hello → first packet), ms. 0 while still bringing up.
@@ -434,6 +450,11 @@ pub struct SessionSnapshot {
     pub pads: Vec<u8>,
     /// Player slot the operator picked, 0-based. `None` = lazy claim.
     pub preferred_pad_slot: Option<u8>,
+    /// Last closed link-health minute ([`crate::link_health`]). `None` in a session's first
+    /// minute, before one has closed.
+    pub link: Option<crate::link_health::LinkMinute>,
+    /// Other live sessions from the same client address.
+    pub shared_path_with: Vec<u64>,
 }
 
 fn registry() -> &'static Mutex<Vec<LiveSession>> {
@@ -452,6 +473,9 @@ fn session_ref(s: &LiveSession) -> crate::events::SessionRef {
     crate::events::SessionRef {
         id: s.id,
         client: s.client.clone(),
+        // `controls` already carries the device key this session was admitted by.
+        fingerprint: s.controls.fingerprint.clone(),
+        plane: s.plane,
         mode: crate::events::mode_str(width, height, fps),
         hdr: s.hdr,
     }
@@ -549,6 +573,8 @@ pub struct Registration {
     pub client: String,
     /// Display name (trust-store, else sanitized Hello). `None` if nameless.
     pub client_name: Option<String>,
+    /// Which plane serves it.
+    pub plane: crate::events::Plane,
     pub hdr: bool,
     /// Bring-up total slot (hello → first packet), ms. 0 until first packet.
     pub ttff_ms: Arc<AtomicU32>,
@@ -570,6 +596,8 @@ pub struct Registration {
     pub end_reason: Arc<AtomicU8>,
     /// The session's shared counter block, already being bumped by its side threads.
     pub counters: Arc<SessionCounters>,
+    /// Client address. `None` only where there is no connection (tests).
+    pub peer: Option<std::net::IpAddr>,
 }
 
 /// Publish a live native session. The guard removes it on drop and pairs
@@ -584,6 +612,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         force_idr,
         client,
         client_name,
+        plane,
         hdr,
         ttff_ms,
         last_resize_ms,
@@ -595,11 +624,14 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         chroma,
         end_reason,
         counters,
+        peer,
     } = reg;
     let id = next_id();
     // A standing title policy reaches a session that arrives under it.
     if let Some(p) = AUDIO_POLICY.lock().unwrap().as_mut() {
-        if policy_mutes(p.sessions, &p.launcher, &client, join) {
+        if plane == crate::events::Plane::Native
+            && policy_mutes(p.sessions, &p.launcher, &client, join)
+        {
             controls.set_muted(true);
             p.muted.push(id);
         }
@@ -614,6 +646,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         force_idr,
         client,
         client_name,
+        plane,
         hdr,
         ttff_ms,
         last_resize_ms,
@@ -628,16 +661,31 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         end_reason,
         tally: None,
         counters,
+        peer: peer.map(|ip| ip.to_canonical()),
     };
     // The opening rate, so the span has a floor before adaptive bitrate moves it. Registration
     // is after the encoder opened, so this is what it actually runs at.
     session
         .counters
         .note_bitrate(session.bitrate_kbps.load(Ordering::Relaxed));
+    // The link-health lines carry this id, so a line ties to a `/status` row.
+    session.counters.link.set_session_id(id);
     crate::events::emit(crate::events::EventKind::SessionStarted {
         session: session_ref(&session),
     });
-    registry().lock().unwrap().push(session);
+    let mut reg = registry().lock().unwrap();
+    let sharing = shared_path(&reg, session.id, session.peer);
+    if !sharing.is_empty() {
+        // Same address is one NAT or tunnel, not proof of one bottleneck — so an observation.
+        tracing::warn!(
+            session = session.id,
+            peer = ?session.peer,
+            others = ?sharing,
+            "sessions share one client address — each adapts its bitrate on its own"
+        );
+    }
+    reg.push(session);
+    drop(reg);
     LiveSessionGuard {
         id,
         _sleep: crate::sleep_inhibit::hold(),
@@ -720,16 +768,25 @@ pub fn record_tally(id: u64, tally: SessionTally) {
     }
 }
 
+/// Ids of the other live sessions from `peer`, oldest first.
+fn shared_path(reg: &[LiveSession], id: u64, peer: Option<std::net::IpAddr>) -> Vec<u64> {
+    let Some(peer) = peer else {
+        return Vec::new();
+    };
+    reg.iter()
+        .filter(|s| s.id != id && s.peer == Some(peer))
+        .map(|s| s.id)
+        .collect()
+}
+
 pub fn count() -> usize {
     registry().lock().unwrap().len()
 }
 
 /// Snapshot of every live native session; mode/bitrate read live. Newest last.
 pub fn snapshot() -> Vec<SessionSnapshot> {
-    registry()
-        .lock()
-        .unwrap()
-        .iter()
+    let reg = registry().lock().unwrap();
+    reg.iter()
         .map(|s| {
             let (width, height, fps) = crate::native::unpack_mode(s.mode.load(Ordering::Relaxed));
             SessionSnapshot {
@@ -746,6 +803,7 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
                 bitrate_kbps: s.bitrate_kbps.load(Ordering::Relaxed),
                 codec: s.codec,
                 client_name: s.client_name.clone(),
+                plane: s.plane,
                 capture_health: s
                     .capture_health
                     .lock()
@@ -755,6 +813,8 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
                 last_resize_ms: s.last_resize_ms.load(Ordering::Relaxed),
                 pads: s.controls.pads(),
                 preferred_pad_slot: s.controls.player(),
+                link: s.counters.link.last(),
+                shared_path_with: shared_path(&reg, s.id, s.peer),
             }
         })
         .collect()
@@ -770,9 +830,11 @@ pub struct GameSnapshot {
     pub title: String,
     pub store: Option<String>,
     pub plane: crate::events::Plane,
-    /// `launching` / `running` / `exited` / `untracked`, or `grace` on the
-    /// reconnect window.
+    /// `launching` / `running` / `window` / `exited` / `untracked`, or `grace`
+    /// on the reconnect window.
     pub state: &'static str,
+    /// `running`, and `window` will follow once the game's window is up.
+    pub awaiting_window: bool,
     /// Seconds left before the game is ended. Set only on a `grace` row.
     pub grace_remaining_s: Option<u64>,
 }
@@ -824,6 +886,7 @@ pub fn games() -> Vec<GameSnapshot> {
                 store: g.game.store.clone(),
                 plane: g.plane,
                 state: g.state().as_str(),
+                awaiting_window: g.awaits_window(),
                 grace_remaining_s: None,
             })
         })
@@ -843,6 +906,7 @@ pub fn games() -> Vec<GameSnapshot> {
                 store: g.game.store.clone(),
                 plane: g.plane,
                 state: g.state().as_str(),
+                awaiting_window: g.awaits_window(),
                 grace_remaining_s: None,
             }),
     );
@@ -857,6 +921,7 @@ pub fn games() -> Vec<GameSnapshot> {
                 store: g.game.store.clone(),
                 plane: g.plane,
                 state: "grace",
+                awaiting_window: false,
                 grace_remaining_s: Some(remaining),
             }),
     );
@@ -972,6 +1037,18 @@ pub fn force_idr(id: u64) -> bool {
         })
 }
 
+/// Whether this session is served by the plane whose per-session mute, access and player
+/// lanes exist. `None` = no such session. The compat plane registers (so it has an id, a
+/// stop and a keyframe) but carries none of those three.
+pub fn has_native_lanes(id: u64) -> Option<bool> {
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| s.plane == crate::events::Plane::Native)
+}
+
 /// This session's management handles, cloned out so the caller acts without the
 /// registry lock. `None` = no such session (the routes' 404).
 pub fn controls(id: u64) -> Option<SessionControls> {
@@ -994,6 +1071,53 @@ pub fn force_idr_all() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A compat-plane session is a registry entry like any other, which is what gives the
+    /// console an id to stop — before, a Moonlight session could only be ended host-wide.
+    #[test]
+    fn a_compat_session_is_stoppable_by_its_own_id() {
+        // No serializing lock: the registry is shared, but this is its only compat session.
+        let stop = Arc::new(AtomicBool::new(false));
+        let quit = Arc::new(AtomicBool::new(false));
+        let _guard = register(Registration {
+            mode: Arc::new(AtomicU64::new(0)),
+            bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
+            codec: Codec::H265,
+            stop: stop.clone(),
+            quit: quit.clone(),
+            force_idr: Arc::new(AtomicBool::new(false)),
+            client: "9f86d0818840".into(),
+            client_name: Some("Living Room TV".into()),
+            plane: crate::events::Plane::Gamestream,
+            hdr: true,
+            ttff_ms: Arc::new(AtomicU32::new(0)),
+            last_resize_ms: Arc::new(AtomicU32::new(0)),
+            game: None,
+            capture_health: Arc::new(Mutex::new(None)),
+            join: false,
+            controls: SessionControls::open(),
+            bit_depth: 10,
+            chroma: ChromaFormat::Yuv420,
+            end_reason: Arc::new(AtomicU8::new(0)),
+            counters: Arc::new(SessionCounters::default()),
+            peer: None,
+        });
+        let row = snapshot()
+            .into_iter()
+            .find(|s| s.plane == crate::events::Plane::Gamestream)
+            .expect("the compat session is listed like a native one");
+        assert_eq!(row.client_name.as_deref(), Some("Living Room TV"));
+        assert!(stop_quit(row.id), "its id addresses it");
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "the stream loop is told to end"
+        );
+        assert!(
+            quit.load(Ordering::SeqCst),
+            "and that the end was deliberate"
+        );
+        assert!(!stop_quit(u64::MAX), "an id nothing holds stops nothing");
+    }
 
     fn fake_session(client: &str) -> (LiveSessionGuard, Arc<AtomicBool>, Arc<AtomicBool>) {
         fake_session_with_reason(
@@ -1019,6 +1143,7 @@ mod tests {
             force_idr: Arc::new(AtomicBool::new(false)),
             client: client.into(),
             client_name: None,
+            plane: crate::events::Plane::Native,
             hdr: false,
             ttff_ms: Arc::new(AtomicU32::new(0)),
             last_resize_ms: Arc::new(AtomicU32::new(0)),
@@ -1030,11 +1155,20 @@ mod tests {
             chroma: ChromaFormat::Yuv420,
             end_reason,
             counters,
+            peer: None,
         });
         (guard, stop, quit)
     }
 
     fn fake_joiner(client: &str, join: bool) -> (LiveSessionGuard, SessionControls) {
+        fake_at(client, join, None)
+    }
+
+    fn fake_at(
+        client: &str,
+        join: bool,
+        peer: Option<std::net::IpAddr>,
+    ) -> (LiveSessionGuard, SessionControls) {
         let controls = SessionControls::open();
         let guard = register(Registration {
             mode: Arc::new(AtomicU64::new(0)),
@@ -1045,6 +1179,7 @@ mod tests {
             force_idr: Arc::new(AtomicBool::new(false)),
             client: client.into(),
             client_name: None,
+            plane: crate::events::Plane::Native,
             hdr: false,
             ttff_ms: Arc::new(AtomicU32::new(0)),
             last_resize_ms: Arc::new(AtomicU32::new(0)),
@@ -1056,8 +1191,38 @@ mod tests {
             chroma: ChromaFormat::Yuv420,
             end_reason: Arc::new(AtomicU8::new(0)),
             counters: Arc::new(SessionCounters::default()),
+            peer,
         });
         (guard, controls)
+    }
+
+    /// One address is one NAT or tunnel: each session names the others there, and an
+    /// IPv4-mapped IPv6 peer is the same address.
+    #[test]
+    fn sessions_from_one_address_name_each_other() {
+        let v4: std::net::IpAddr = "203.0.113.77".parse().unwrap();
+        let mapped: std::net::IpAddr = "::ffff:203.0.113.77".parse().unwrap();
+        let (a, _) = fake_at("phone", false, Some(v4));
+        let (b, _) = fake_at("pc", false, Some(mapped));
+        let (c, _) = fake_at("tv", false, Some("203.0.113.78".parse().unwrap()));
+        let rows = snapshot();
+        let with = |id| {
+            rows.iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .shared_path_with
+                .clone()
+        };
+        assert_eq!(with(a.id), vec![b.id]);
+        assert_eq!(with(b.id), vec![a.id]);
+        assert!(with(c.id).is_empty());
+        drop(b);
+        assert!(snapshot()
+            .iter()
+            .find(|s| s.id == a.id)
+            .unwrap()
+            .shared_path_with
+            .is_empty());
     }
 
     #[test]
@@ -1155,10 +1320,12 @@ mod tests {
                     title: "Test Title".into(),
                 },
                 client: "192.0.2.7".into(),
+                fingerprint: None,
                 plane: crate::events::Plane::Gamestream,
                 // No signals: inert lease, so no watcher thread races the assertions.
                 spec: crate::library::DetectSpec::default(),
                 nested: false,
+                scope_pid: None,
                 launcher: false,
                 child: None,
                 spawned: None,
@@ -1166,8 +1333,7 @@ mod tests {
                 procs: None,
                 #[cfg(target_os = "linux")]
                 workspace: None,
-                #[cfg(target_os = "linux")]
-                window_stage: None,
+                window: None,
                 outcome: None,
             },
             Box::new(|| {}),

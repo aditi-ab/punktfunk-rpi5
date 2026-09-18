@@ -118,6 +118,9 @@ public final class GamepadManager: ObservableObject {
     /// controller attached, and `GamepadMenuInput` reads the same two sources.
     public var uiPadConnected: Bool { active != nil || sc2MenuAttached }
 
+    /// A stream's `GamepadCapture` owns the physical controllers, so menus leave the pad alone.
+    public internal(set) var streamOwnsPads = false
+
     /// The user's pinned controller fingerprint ("" = automatic). Persisted; updating it
     /// reselects immediately, so a Settings Picker can bind straight to this.
     @Published public var preferredID: String {

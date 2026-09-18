@@ -5,7 +5,7 @@
 //! `update`. Every stream runs in the `punktfunk-session` Vulkan binary — the shell
 //! never touches video.
 
-use crate::spawn::{self, SpawnOpts};
+use crate::spawn::{self, CancelHandle, SpawnOpts};
 use crate::trust::{self, Settings};
 use crate::ui_hosts::{self, ConnectRequest, HostsMsg, HostsOutput, HostsPage};
 use adw::prelude::*;
@@ -161,12 +161,14 @@ pub enum AppMsg {
         tofu: bool,
         opts: SpawnOpts,
     },
-    /// The child presented its first frame.
+    /// The child presented its first frame. `cancel` remains live across the reader-to-main
+    /// queue so a Cancel that overtakes this message still wins.
     SessionReady {
         req: ConnectRequest,
         fp_hex: String,
         tofu: bool,
         persist_paired: bool,
+        cancel: Option<CancelHandle>,
     },
     /// The child exited (the session is over, or the connect failed).
     SessionExited {
@@ -206,6 +208,25 @@ pub enum AppMsg {
     ShowAbout,
     ShowAddHost,
     Toast(String),
+}
+
+fn ready_was_cancelled(cancel: Option<&CancelHandle>) -> bool {
+    cancel.is_some_and(CancelHandle::is_cancelled)
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_request_rejects_late_ready() {
+        let cancel = CancelHandle::default();
+        assert!(!ready_was_cancelled(Some(&cancel)));
+
+        cancel.kill();
+
+        assert!(ready_was_cancelled(Some(&cancel)));
+    }
 }
 
 pub struct AppInit {
@@ -640,7 +661,11 @@ impl SimpleComponent for AppModel {
                 fp_hex,
                 tofu,
                 persist_paired,
+                cancel,
             } => {
+                if ready_was_cancelled(cancel.as_ref()) {
+                    return;
+                }
                 self.close_waiting();
                 self.hosts.emit(HostsMsg::SetConnecting(None));
                 // A child that reported ready proves the host answered — the exact condition

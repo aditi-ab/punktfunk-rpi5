@@ -15,6 +15,7 @@ description = "punktfunk host shared clipboard: per-OS session-clipboard backend
 publish = false
 
 [dependencies]
+pf-host-config = { path = "../pf-host-config" }
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 anyhow = "1"
 tracing = "0.1"

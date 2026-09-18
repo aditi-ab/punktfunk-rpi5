@@ -401,7 +401,8 @@ impl DsState {
 
 /// Report `0x01`. Offsets match kernel `struct dualsense_input_report` (id at `r[0]`, so
 /// struct offset N is `r[N + 1]`): x..rz 0–5, seq 6, buttons[4] 7–10, reserved[4] 11–14,
-/// gyro[3] 15–20, accel[3] 21–26, sensor_timestamp 27–30, reserved2 31, points[2] 32–39.
+/// gyro[3] 15–20, accel[3] 21–26, sensor_timestamp 27–30, IMU temperature 31, points[2] 32–39,
+/// status 52–53. The trigger status (41–42) is [`DsTriggers::stamp`]'s.
 pub fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8, ts: u32) {
     r[0] = 0x01;
     r[1] = st.lx;
@@ -424,9 +425,13 @@ pub fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8,
     r[28..32].copy_from_slice(&ts.to_le_bytes()); // sensor_timestamp (struct off 27)
     pack_touch(&mut r[33..37], &st.touch[0]); // touch point 1 (struct off 32)
     pack_touch(&mut r[37..41], &st.touch[1]); // touch point 2
-                                              // Battery at struct off 52 → r[53]: low nibble = capacity (×10+5 %), high = charge state
-                                              // (0 = discharging). 0x0A = discharging/full (100 %). Zero reads as ~5 % and SteamOS warns.
-    r[53] = 0x0A;
+
+    // IMU temperature: a real pad reads 0x0b–0x14 indoors.
+    r[32] = 0x14;
+    // A USB pad runs on cable power: charge complete (a zero battery reads ~5 % and SteamOS
+    // warns), and the plug byte says USB data + power with no headset in the jack.
+    r[53] = 0x2A;
+    r[54] = 0x18;
 }
 
 /// Adaptive-trigger status the game reads back: report `0x01` struct offsets 41 (R2) and 42
@@ -501,10 +506,11 @@ impl DsTriggers {
 }
 
 impl TriggerFb {
-    /// Status nibble over stop zone for the current trigger position.
+    /// Status nibble over stop zone for the current trigger position. With no effect armed a
+    /// real pad reports zone 9, the end of travel.
     fn status_byte(&mut self, pos: u8) -> u8 {
         if self.zones == 0 {
-            return 0;
+            return 0x09;
         }
         // Ten equal zones across the travel; the effect parameters are named in the same units.
         let zone = (u16::from(pos) * 10 / 256) as u8;
@@ -856,32 +862,45 @@ mod tests {
             t.stamp(&mut r, 0, r2);
             (r[42], r[43])
         };
-        assert_eq!(byte(&mut trig, 0), (0x08, 0), "released: before the effect");
-        assert_eq!(byte(&mut trig, 0x60), (0x18, 0), "held inside the effect");
+        assert_eq!(
+            byte(&mut trig, 0),
+            (0x08, 0x09),
+            "released: before the effect"
+        );
+        assert_eq!(
+            byte(&mut trig, 0x60),
+            (0x18, 0x09),
+            "held inside the effect"
+        );
         assert_eq!(
             byte(&mut trig, 0xFF),
-            (0x28, 0),
+            (0x28, 0x09),
             "past the stop: shot fired"
         );
-        assert_eq!(byte(&mut trig, 0x60), (0x28, 0), "eased off: still fired");
-        assert_eq!(byte(&mut trig, 0x10), (0x08, 0), "released: re-armed");
+        assert_eq!(
+            byte(&mut trig, 0x60),
+            (0x28, 0x09),
+            "eased off: still fired"
+        );
+        assert_eq!(byte(&mut trig, 0x10), (0x08, 0x09), "released: re-armed");
         // Re-arming the same effect every frame must not clear the latch mid-pull.
         let _ = byte(&mut trig, 0xFF);
         trig.observe(&fb.hidout);
         assert_eq!(
             byte(&mut trig, 0x60),
-            (0x28, 0),
+            (0x28, 0x09),
             "re-sent effect keeps the shot"
         );
     }
 
-    /// No effect armed, or a mode the firmware does not report on, leaves both bytes zero.
+    /// No effect armed reads the end-of-travel rest value a real pad sends; a mode the firmware
+    /// does not report on reads zero.
     #[test]
     fn only_the_official_modes_move_the_status_nibble() {
         let mut r = [0u8; DS_INPUT_REPORT_LEN];
         serialize_state(&mut r, &DsState::neutral(), 0, 0);
         DsTriggers::default().stamp(&mut r, 0xFF, 0xFF);
-        assert_eq!((r[42], r[43]), (0, 0), "nothing armed");
+        assert_eq!((r[42], r[43]), (0x09, 0x09), "nothing armed");
 
         let mut trig = DsTriggers::default();
         trig.observe(&[HidOutput::Trigger {
@@ -983,7 +1002,12 @@ mod tests {
         assert_eq!(r[35], 0x61); // x_hi nibble 0x1 | (y & 0xF) << 4 (y=0x356 → 0x6 << 4)
         assert_eq!(r[36], 0x35); // y >> 4
         assert_eq!(r[37] & 0x80, 0x80); // touch point 2 inactive
-        assert_eq!(r[53], 0x0A); // discharging + full (100 %), not the ~5 % zero reads as
+        assert_eq!(r[32], 0x14, "IMU temperature");
+        assert_eq!(
+            (r[53], r[54]),
+            (0x2A, 0x18),
+            "charge complete, USB data + power"
+        );
     }
 
     /// Centre encodes as `DsState::neutral` on both axes. `255 - v` after quantise puts Y at

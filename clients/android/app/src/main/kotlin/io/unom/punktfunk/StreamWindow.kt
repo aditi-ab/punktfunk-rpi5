@@ -5,16 +5,20 @@ import android.content.pm.ActivityInfo
 import android.hardware.display.DisplayManager
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.view.WindowManager
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import io.unom.punktfunk.kit.NativeBridge
 
 /**
  * Everything a stream does to the activity's WINDOW, and how to put it back: the wake and Wi-Fi
- * locks, the panel's refresh pin, HDMI ALLM, the soft-keyboard and cutout modes, the landscape lock,
- * unbuffered pointer dispatch and the render-rate vote.
+ * locks, the Wi-Fi link log, the panel's refresh pin, HDMI ALLM, the soft-keyboard and cutout
+ * modes, the landscape lock, unbuffered pointer dispatch and the render-rate vote.
  *
  * It is one object because it is one obligation — every field below is a prior value captured on the
  * way in, and [detach] is the only thing that ever restores one. Held in [StreamScreen]'s session
@@ -36,6 +40,8 @@ internal class StreamWindow(
 ) {
     private val window = activity?.window
     private val controller = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+    private val wifiManager =
+        context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
 
     /**
      * Wi-Fi locks held for the stream's duration — BOTH of them, unconditionally (Moonlight does
@@ -50,8 +56,7 @@ internal class StreamWindow(
      * Non-reference-counted: one explicit acquire/release each.
      */
     private val wifiLocks: List<WifiManager.WifiLock> = run {
-        val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            ?: return@run emptyList()
+        val wm = wifiManager ?: return@run emptyList()
         buildList {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "punktfunk:stream-ll")
@@ -83,6 +88,26 @@ internal class StreamWindow(
         Log.i("pf.display", "panel $why mode=${d.mode.refreshRate} render=${d.refreshRate}")
     }
 
+    /**
+     * The Wi-Fi link read once a second on the main thread, logged through the native ring
+     * ([WifiLinkLog]) so a field bundle can tell a radio problem from a stream one. Stops in [detach].
+     */
+    private val wifiLinkLog = WifiLinkLog()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val pollWifiLink = object : Runnable {
+        override fun run() {
+            val link = wifiManager?.readLink() ?: return
+            wifiLinkLog.reason(link, SystemClock.elapsedRealtime())?.let { why ->
+                runCatching {
+                    NativeBridge.nativeLogWifiLink(
+                        why, link.rssiDbm, link.txMbps, link.rxMbps, link.freqMhz, link.standard,
+                    )
+                }
+            }
+            mainHandler.postDelayed(this, 1_000)
+        }
+    }
+
     private var priorSoftInput = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_UNSPECIFIED
     private var priorCutout: Int? = null
     private var priorOrientation: Int? = null
@@ -98,6 +123,7 @@ internal class StreamWindow(
                 Log.w("punktfunk", "WifiLock acquire failed — power save stays ON: $lock", e)
             }
         }
+        mainHandler.post(pollWifiLink)
         // HDMI Auto Low-Latency Mode: ask the display to drop its post-processing (game mode) —
         // the biggest panel-side latency win on the TV boxes. No-op where ALLM isn't supported. API
         // 30+. Part of the experimental low-latency stack.
@@ -203,6 +229,7 @@ internal class StreamWindow(
             window?.setPreferMinimalPostProcessing(false)
         }
         wifiLocks.forEach { runCatching { if (it.isHeld) it.release() } }
+        mainHandler.removeCallbacks(pollWifiLink)
         // Release the landscape lock so the rest of the app follows the device/system again.
         activity?.requestedOrientation =
             priorOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED

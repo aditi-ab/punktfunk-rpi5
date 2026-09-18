@@ -27,7 +27,8 @@ status) and **`punktfunk-client`** (the native GTK4/libadwaita Linux client). `p
 `punktfunk-web`, so a default `apt install punktfunk-host` pulls the console too (alongside the
 udev/sysctl bits) unless you've disabled weak deps; `punktfunk-client` is independent — install it
 on the box you stream *to*. (`punktfunk-probe` is the headless reference/test tool, not packaged
-here.)
+here.) `punktfunk-web` and `punktfunk-scripting` both depend on **`punktfunk-bun`**, the one pinned
+bun they run on, at `/usr/lib/punktfunk-bun/bun`, never on PATH.
 
 Package layout mirrors the Fedora RPM (`../rpm/punktfunk.spec`): the host binary, the `/dev/uinput`
 udev rule, the systemd **user** unit, headless session helpers, the example config, and the OpenAPI

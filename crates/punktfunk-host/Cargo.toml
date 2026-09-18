@@ -326,6 +326,9 @@ windows = { version = "0.62", features = [
     # (src/windows/crash.rs); Kernel gates the CONTEXT type EXCEPTION_POINTERS embeds.
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
+    # RoGetActivationFactory(AudioPolicyConfig) — the per-app output pin that keeps voice-chat
+    # apps on the operator's speakers (audio/windows/voice_route.rs).
+    "Win32_System_WinRT",
     # CreateToolhelp32Snapshot/Process32*W — the conflicting-streaming-host process scan
     # (src/detect/windows.rs): is Sunshine/Apollo/... running alongside us?
     "Win32_System_Diagnostics_ToolHelp",

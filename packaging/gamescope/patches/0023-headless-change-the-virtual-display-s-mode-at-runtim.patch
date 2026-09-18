@@ -1,0 +1,226 @@
+From d095ba24469be8302b5bb6bb7b773b7ef54de6db Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Fri, 18 Sep 2026 12:00:00 +0200
+Subject: [PATCH] headless: change the virtual display's mode at runtime
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A headless gamescope resolves -W/-H/-r once, in Init(), and nothing can move
+them afterwards. A caller whose display IS the session — a streaming host
+handing a game the screen a client arrived with — therefore has to kill the
+compositor and start another one whenever that size changes, losing whatever
+was running inside it.
+
+Nothing about this mode is hardware. The output globals are plain variables;
+steamcompmgr already reacts to them changing, remaking the output images and
+nudging the PipeWire capture, which renegotiates on the spot; and the
+connector's mode list is built from the same three numbers. Only a way in was
+missing.
+
+GAMESCOPE_SET_OUTPUT_MODE on the root window is that way in: three cardinals,
+width, height and refresh in mHz. The headless backend takes them, re-advertises
+its modes and its valid dynamic refresh rates, and leaves its state dirty so the
+next PollState() republishes the mode atoms. A backend whose mode is a property
+of a real connector refuses through IBackend's default and is untouched.
+
+Two things follow the mode in steamcompmgr. The nested resolution, when it was
+derived from the output at startup rather than pinned with -w/-h — otherwise the
+session keeps rendering at the old size and is merely scaled to the new one. And
+a framerate cap that still equals the refresh just left behind, which would
+otherwise pace the game to a rate the display no longer runs at; one Steam chose
+keeps its value.
+
+GAMESCOPE_OUTPUT_MODE_FEEDBACK carries the mode actually in effect, published
+from the pass that remade the output rather than from the one that accepted the
+request, so a caller can tell the two apart. Stamp pfhdr17.
+---
+ src/Backends/HeadlessBackend.cpp | 26 ++++++++++++++-
+ src/backend.h                    |  6 ++++
+ src/meson.build                  |  3 +-
+ src/steamcompmgr.cpp             | 56 ++++++++++++++++++++++++++++++++
+ src/xwayland_ctx.hpp             |  3 ++
+ 5 files changed, 92 insertions(+), 2 deletions(-)
+
+diff --git a/src/Backends/HeadlessBackend.cpp b/src/Backends/HeadlessBackend.cpp
+index 48af2e9..1466c97 100644
+--- a/src/Backends/HeadlessBackend.cpp
++++ b/src/Backends/HeadlessBackend.cpp
+@@ -4,6 +4,7 @@
+ #include "refresh_rate.h"
+ 
+ #include <algorithm>
++#include <utility>
+ #include <vector>
+ 
+ extern int g_nPreferredOutputWidth;
+@@ -256,9 +257,30 @@ namespace gamescope
+ 		{
+ 		}
+ 
++		// A virtual display's mode is the caller's to change, so accept a new one at runtime:
++		// update the output globals, re-advertise the connector's mode and refresh lists, and
++		// leave the state dirty so steamcompmgr republishes the mode atoms on its next pass.
++		virtual bool SetVirtualOutputMode( uint32_t uWidth, uint32_t uHeight, uint32_t uRefresh ) override
++		{
++			// A zero here would resolve to Init()'s defaults, which is not what any caller means.
++			if ( !uWidth || !uHeight || !uRefresh )
++				return false;
++
++			if ( g_nOutputWidth == uWidth && g_nOutputHeight == uHeight && uint32_t( g_nOutputRefresh ) == uRefresh )
++				return true;
++
++			g_nOutputWidth = uWidth;
++			g_nOutputHeight = uHeight;
++			g_nOutputRefresh = int( uRefresh );
++
++			m_Connector.SetVirtualMode( uWidth, uHeight, ConvertmHzToHz( uRefresh ), g_customRefreshRates );
++			m_bStateDirty = true;
++			return true;
++		}
++
+ 		virtual bool PollState() override
+ 		{
+-			return false;
++			return std::exchange( m_bStateDirty, false );
+ 		}
+ 
+ 		virtual std::shared_ptr<BackendBlob> CreateBackendBlob( const std::type_info &type, std::span<const uint8_t> data ) override
+@@ -352,6 +374,8 @@ namespace gamescope
+ 	private:
+ 
+         CHeadlessConnector m_Connector;
++        // Consumed by PollState(): one republish of the mode atoms per accepted mode change.
++        bool m_bStateDirty = false;
+ 	};
+ 
+ 	/////////////////////////
+diff --git a/src/backend.h b/src/backend.h
+index ef8a632..06e13c3 100644
+--- a/src/backend.h
++++ b/src/backend.h
+@@ -331,6 +331,12 @@ namespace gamescope
+         virtual void DirtyState( bool bForce = false, bool bForceModeset = false ) = 0;
+         virtual bool PollState() = 0;
+ 
++        // Change the output mode of a backend whose display is a fiction (headless), where the
++        // mode is whatever the caller asked for rather than a panel's. `uRefresh` is in mHz.
++        // `false` means this backend's mode is a property of real hardware and cannot be set;
++        // a caller must then restart gamescope, as it always had to.
++        virtual bool SetVirtualOutputMode( uint32_t uWidth, uint32_t uHeight, uint32_t uRefresh ) { return false; }
++
+         virtual std::shared_ptr<BackendBlob> CreateBackendBlob( const std::type_info &type, std::span<const uint8_t> data ) = 0;
+         template <typename T>
+         std::shared_ptr<BackendBlob> CreateBackendBlob( const T& thing )
+diff --git a/src/meson.build b/src/meson.build
+index ce37037..37a78aa 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -199,7 +199,8 @@ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+ #   +pfhdr16 — …and capture maps SDR into BT.2020 colorimetrically at the live SDR-on-HDR nits
+ #   +pfhdr17 — …and a capture push never drops a buffer the PipeWire thread has not taken
+ #   +pfhdr18 — …and the capture stream is reliable and cycles while it waits for its consumer
+-version_tag = vcs_tag + '+pfhdr18' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr19 — …and GAMESCOPE_SET_OUTPUT_MODE changes a headless output's mode at runtime
++version_tag = vcs_tag + '+pfhdr19' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index e5bbccd..f20edad 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -6563,6 +6563,51 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
+ 		GetBackend()->DirtyState( true );
+ 		XDeleteProperty( ctx->dpy, ctx->root, ctx->atoms.gamescopeDisplayModeNudge );
+ 	}
++	// A virtual display's mode belongs to whoever started the session, so it can change without
++	// a restart: three cardinals — width, height, refresh in mHz — on the root window. A backend
++	// whose mode is a property of real hardware refuses, and nothing below runs.
++	if ( ev->atom == ctx->atoms.gamescopeSetOutputMode )
++	{
++		std::vector< uint32_t > vecMode;
++		get_prop( ctx, ctx->root, ctx->atoms.gamescopeSetOutputMode, vecMode );
++
++		const int nOldWidth = int( g_nOutputWidth );
++		const int nOldHeight = int( g_nOutputHeight );
++		const int nOldRefresh = g_nOutputRefresh;
++
++		if ( vecMode.size() == 3 &&
++		     GetBackend()->SetVirtualOutputMode( vecMode[ 0 ], vecMode[ 1 ], vecMode[ 2 ] ) )
++		{
++			// The nested resolution followed the output at startup (no -w/-h given), so it
++			// follows it now. One the caller pinned is theirs, and is left alone.
++			if ( g_nNestedWidth == nOldWidth && g_nNestedHeight == nOldHeight )
++			{
++				g_nNestedWidth = int( g_nOutputWidth );
++				g_nNestedHeight = int( g_nOutputHeight );
++				if ( g_nNestedRefresh == nOldRefresh )
++					g_nNestedRefresh = g_nOutputRefresh;
++
++				wlserver_lock();
++				wlserver_set_xwayland_server_mode( 0, g_nNestedWidth, g_nNestedHeight,
++					g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh );
++				wlserver_unlock();
++			}
++
++			// A cap seeded from the refresh the display has just left would pace the game to a
++			// rate that no longer exists. One Steam chose is Steam's, and keeps its value.
++			const int nOldRefreshHz = gamescope::ConvertmHzToHz( nOldRefresh );
++			const int nNewRefreshHz = gamescope::ConvertmHzToHz( g_nOutputRefresh );
++			for ( int i = 0; i < gamescope::GAMESCOPE_SCREEN_TYPE_COUNT; i++ )
++			{
++				if ( g_nCombinedAppRefreshCycleOverride[ i ] == nOldRefreshHz )
++					g_nCombinedAppRefreshCycleOverride[ i ] = nNewRefreshHz;
++			}
++			// The connector's valid rates are new, so the dynamic-refresh pick is re-derived too.
++			update_app_target_refresh_cycle();
++
++			hasRepaint = true;
++		}
++	}
+ 	if ( ev->atom == ctx->atoms.gamescopeNewScalingFilter )
+ 	{
+ 		GamescopeUpscaleFilter nScalingFilter = ( GamescopeUpscaleFilter ) get_prop( ctx, ctx->root, ctx->atoms.gamescopeNewScalingFilter, 0 );
+@@ -8107,6 +8152,9 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
+ 	ctx->atoms.gamescopeDisplayIsExternal = XInternAtom( ctx->dpy, "GAMESCOPE_DISPLAY_IS_EXTERNAL", false );
+ 	ctx->atoms.gamescopeDisplayModeListExternal = XInternAtom( ctx->dpy, "GAMESCOPE_DISPLAY_MODE_LIST_EXTERNAL", false );
+ 
++	ctx->atoms.gamescopeSetOutputMode = XInternAtom( ctx->dpy, "GAMESCOPE_SET_OUTPUT_MODE", false );
++	ctx->atoms.gamescopeOutputModeFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_OUTPUT_MODE_FEEDBACK", false );
++
+ 	ctx->atoms.gamescopeCursorVisibleFeedback = XInternAtom( ctx->dpy, "GAMESCOPE_CURSOR_VISIBLE_FEEDBACK", false );
+ 
+ 	ctx->atoms.gamescopeSteamMaxHeight = XInternAtom( ctx->dpy, "GAMESCOPE_STEAM_MAX_HEIGHT", false );
+@@ -9004,6 +9052,14 @@ steamcompmgr_main(int argc, char **argv)
+ 					XChangeProperty(server->ctx->dpy, server->ctx->root, server->ctx->atoms.gamescopeHDROutputFeedback, XA_CARDINAL, 32, PropModeReplace,
+ 						(unsigned char *)&hdr_value, 1 );
+ 
++					// The mode now in effect, for a caller that asked for one: published from
++					// here because this is the pass that remade the output images and nudged
++					// the capture, not merely the one that accepted the request.
++					// `unsigned long` per element is Xlib's format-32 contract, not uint32_t.
++					unsigned long mode_value[3] = { g_nOutputWidth, g_nOutputHeight, (unsigned long)g_nOutputRefresh };
++					XChangeProperty(server->ctx->dpy, server->ctx->root, server->ctx->atoms.gamescopeOutputModeFeedback, XA_CARDINAL, 32, PropModeReplace,
++						(unsigned char *)mode_value, 3 );
++
+ 					server->ctx->cursor->setDirty();
+ 
+ 					if (server->ctx.get() == root_ctx)
+diff --git a/src/xwayland_ctx.hpp b/src/xwayland_ctx.hpp
+index d6ce90f..3fe8f7c 100644
+--- a/src/xwayland_ctx.hpp
++++ b/src/xwayland_ctx.hpp
+@@ -186,6 +186,9 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
+ 		Atom gamescopeDisplayIsExternal;
+ 		Atom gamescopeDisplayModeListExternal;
+ 
++		Atom gamescopeSetOutputMode;
++		Atom gamescopeOutputModeFeedback;
++
+ 		Atom gamescopeCursorVisibleFeedback;
+ 
+ 		Atom gamescopeSteamMaxHeight;
+-- 
+2.55.0
+

@@ -11,6 +11,7 @@
 
 use super::shared::*;
 use crate::events::{emit, EventKind};
+use axum::Extension;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -396,9 +397,13 @@ fn validate_ui(u: PluginUi) -> Result<StoredUi, String> {
     )
 )]
 pub(crate) async fn register_plugin(
+    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
     Path(id): Path<String>,
     ApiJson(reg): ApiJson<PluginRegistration>,
 ) -> Response {
+    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &id) {
+        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
+    }
     if !valid_plugin_id(&id) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -524,7 +529,13 @@ pub(crate) async fn get_ui_credential(Path(id): Path<String>) -> Response {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn delete_plugin(Path(id): Path<String>) -> Response {
+pub(crate) async fn delete_plugin(
+    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
+    Path(id): Path<String>,
+) -> Response {
+    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &id) {
+        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
+    }
     if registry().remove(&id) {
         tracing::info!(plugin = %id, "plugin deregistered");
         emit(EventKind::PluginsChanged { id });

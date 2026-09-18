@@ -37,6 +37,7 @@ export const EVENT_KINDS = [
 	"host.stopping",
 	"plugins.changed",
 	"store.changed",
+	"settings.changed",
 ] as const;
 
 const CONCRETE: Record<string, () => string> = {
@@ -58,6 +59,7 @@ const CONCRETE: Record<string, () => string> = {
 	"update.applied": () => m.activity_update_applied(),
 	"plugins.changed": () => m.activity_plugins_changed(),
 	"store.changed": () => m.activity_store_changed(),
+	"settings.changed": () => m.activity_settings_changed(),
 	"host.started": () => m.activity_host_started(),
 	"host.stopping": () => m.activity_host_stopping(),
 };

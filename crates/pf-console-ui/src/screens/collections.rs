@@ -865,10 +865,12 @@ mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &[],
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "test",
             t: 0.0,
         };

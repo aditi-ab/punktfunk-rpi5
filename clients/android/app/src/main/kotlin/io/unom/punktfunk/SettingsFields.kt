@@ -19,22 +19,13 @@ internal object SettingsFields {
 
     val ALL: List<Field<*>> = listOf(
         field("width", "width", IntKind, { it.width }, { s, v -> s.copy(width = v) },
-            overlay({ it.width }, { o, v -> o.copy(width = v) })),
+            overlay({ it.width }, { o, v -> o.copy(width = v) }), console = Console(ConsoleSizeKind)),
         field("height", "height", IntKind, { it.height }, { s, v -> s.copy(height = v) },
-            overlay({ it.height }, { o, v -> o.copy(height = v) })),
+            overlay({ it.height }, { o, v -> o.copy(height = v) }), console = Console(ConsoleSizeKind)),
         field("hz", "refresh_hz", IntKind, { it.hz }, { s, v -> s.copy(hz = v) },
             overlay({ it.hz }, { o, v -> o.copy(hz = v) }), prefsKey = "hz"),
         // Qualifiers on the safe-area resolution. `android.` keys, so they ride the console
         // document's `Settings::extra` rather than needing a row in the shared shell.
-        field("safeAreaClearCorners", "android.safe_area_clear_corners", BoolKind,
-            { it.safeAreaClearCorners }, { s, v -> s.copy(safeAreaClearCorners = v) },
-            prefsKey = "safe_area_clear_corners"),
-        field("safeAreaLeftPx", "android.safe_area_left_px", IntKind,
-            { it.safeAreaLeftPx }, { s, v -> s.copy(safeAreaLeftPx = v) },
-            prefsKey = "safe_area_left_px"),
-        field("safeAreaRightPx", "android.safe_area_right_px", IntKind,
-            { it.safeAreaRightPx }, { s, v -> s.copy(safeAreaRightPx = v) },
-            prefsKey = "safe_area_right_px"),
         field("bitrateKbps", "bitrate_kbps", IntKind, { it.bitrateKbps }, { s, v -> s.copy(bitrateKbps = v) },
             overlay({ it.bitrateKbps }, { o, v -> o.copy(bitrateKbps = v) })),
         field("renderScale", "render_scale", DoubleKind, { it.renderScale }, { s, v -> s.copy(renderScale = v) },
@@ -202,6 +193,23 @@ internal object SettingsFields {
         override fun write(e: SharedPreferences.Editor, k: String, v: Int) { e.putInt(k, v) }
         override fun read(j: JSONObject, k: String): Int? = if (j.has(k)) j.optInt(k) else null
         override fun write(j: JSONObject, k: String, v: Int) { j.put(k, v) }
+    }
+
+    /**
+     * `width`/`height` on the console, whose sizes are unsigned: one negative value fails the
+     * whole document. [SAFE_AREA_MODE] travels as `0` plus `android.safe_area_mode`.
+     */
+    object ConsoleSizeKind : Kind<Int> {
+        const val SAFE_AREA_KEY = "android.safe_area_mode"
+        override fun read(p: SharedPreferences, k: String, def: Int) = p.getInt(k, def)
+        override fun write(e: SharedPreferences.Editor, k: String, v: Int) { e.putInt(k, v) }
+        override fun read(j: JSONObject, k: String): Int? = if (!j.has(k)) null else j.optInt(k).let {
+            if (it == 0 && j.optBoolean(SAFE_AREA_KEY)) SAFE_AREA_MODE else it
+        }
+        override fun write(j: JSONObject, k: String, v: Int) {
+            j.put(k, v.coerceAtLeast(0))
+            j.put(SAFE_AREA_KEY, v == SAFE_AREA_MODE)
+        }
     }
 
     object BoolKind : Kind<Boolean> {

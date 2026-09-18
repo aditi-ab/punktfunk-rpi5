@@ -193,15 +193,19 @@ public struct RunningGame: Codable, Hashable, Sendable {
     /// Absent for an operator-typed GameStream command, which has no catalog entry behind it.
     public var appID: String?
     public var title: String
-    /// `launching` | `running` | `exited` | `untracked` | `grace`. A plain String on purpose: the
-    /// host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an unknown value
-    /// must never fail the decode of the whole list.
+    /// `launching` | `running` | `window` | `exited` | `untracked` | `grace`. A plain String on
+    /// purpose: the host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an
+    /// unknown value must never fail the decode of the whole list.
     public var state: String
+    /// `running`, and the host will report `window` once the game's window is up. Absent from a
+    /// host that cannot see windows, or predates them.
+    public var awaitingWindow: Bool?
 
     private enum CodingKeys: String, CodingKey {
         case appID = "app_id"
         case title
         case state
+        case awaitingWindow = "awaiting_window"
     }
 
     /// Is this title *up on the host right now* — i.e. would picking it take the player back into

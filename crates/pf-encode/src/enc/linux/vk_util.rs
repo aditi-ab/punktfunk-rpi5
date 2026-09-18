@@ -45,6 +45,7 @@ pub(crate) fn fourcc_to_vk(fourcc: u32) -> Option<vk::Format> {
     const XB24: u32 = 0x3432_4258; // XBGR8888
     const AB24: u32 = 0x3432_4241; // ABGR8888
     const NV12: u32 = 0x3231_564e; // DRM_FORMAT_NV12
+    const P010: u32 = 0x3031_3050; // DRM_FORMAT_P010
                                    // DRM word layout == Vulkan PACK32 (not a byte swizzle). A2R10G10B10 is
                                    // optional; a reject means drop XR30 from the capture offer, not convert here.
     const XR30: u32 = 0x3033_5258; // DRM_FORMAT_XRGB2101010
@@ -55,6 +56,7 @@ pub(crate) fn fourcc_to_vk(fourcc: u32) -> Option<vk::Format> {
         XR30 => Some(vk::Format::A2R10G10B10_UNORM_PACK32),
         XB30 => Some(vk::Format::A2B10G10R10_UNORM_PACK32),
         NV12 => Some(vk::Format::G8_B8R8_2PLANE_420_UNORM),
+        P010 => Some(vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16),
         _ => None,
     }
 }
@@ -182,7 +184,12 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
     // `allocate_memory`; `vkFreeMemory` then closes it. Close-after-success
     // is a double-close of a recycled number.
     let dup = d.fd.try_clone().context("dup dmabuf fd")?;
-    let planes: Vec<vk::SubresourceLayout> = if fmt == vk::Format::G8_B8R8_2PLANE_420_UNORM {
+    let two_plane = matches!(
+        fmt,
+        vk::Format::G8_B8R8_2PLANE_420_UNORM
+            | vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
+    );
+    let planes: Vec<vk::SubresourceLayout> = if two_plane {
         let (uv_offset, uv_stride) = d.plane1.map(|(o, s)| (o as u64, s as u64)).unwrap_or((
             d.offset as u64 + d.stride as u64 * ch as u64,
             d.stride as u64,

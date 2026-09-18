@@ -257,6 +257,13 @@ pub fn open_virtual_mic_named(channels: u32, source: Option<&str>) -> Result<Box
 
 #[cfg(target_os = "windows")]
 mod windows;
+
+/// `punktfunk-host voice-route …`: writes the per-app output pins in whatever user context
+/// it runs in — the capture thread spawns it as the console user ([`windows::voice_route`]).
+#[cfg(target_os = "windows")]
+pub(crate) fn voice_route_cli(args: &[String]) -> anyhow::Result<()> {
+    windows::voice_route::cli(args)
+}
 #[cfg(target_os = "windows")]
 use self::windows as plat;
 // Flat names for the session, the devtests and the installer: `crate::audio::pad_endpoint`.
@@ -322,6 +329,18 @@ pub(crate) mod capture_policy;
 mod mic_jitter;
 mod mic_pump;
 pub use mic_pump::{MicFrame, MicPump};
+
+/// Apps playing audio on the host right now, lowercased. Empty where the host cannot list them.
+/// Blocks on a PipeWire round trip; call it off the async runtime.
+pub(crate) fn playing_apps() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    return linux::playing_apps().unwrap_or_else(|e| {
+        tracing::debug!(error = %format!("{e:#}"), "playing apps not listed");
+        Vec::new()
+    });
+    #[cfg(not(target_os = "linux"))]
+    Vec::new()
+}
 
 /// Last wiring-pass assignment on Windows; `None` elsewhere or before the first pass.
 /// Read-only for the status API — never triggers a pass.

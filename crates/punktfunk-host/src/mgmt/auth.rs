@@ -35,6 +35,23 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug)]
 pub(crate) struct PairedDevice(pub String);
 
+/// Which plugin a request came from, when it presented that plugin's own token rather than the
+/// runner's shared one. Stamped like [`PairedDevice`], for the same reason: the routes that care
+/// ask "whose is this", not "how did it prove it".
+///
+/// Absent on the shared runner token — a loose script has no plugin identity — and the id-scoped
+/// routes then fall back to the older, unowned behaviour.
+#[derive(Clone, Debug)]
+pub(crate) struct PluginIdentity(pub String);
+
+/// May a request carrying `identity` write the registration or provider named `id`?
+///
+/// One rule, in one place, for `PUT/DELETE /plugins/{id}` and the provider routes: a plugin that
+/// proved which plugin it is may write only its own id.
+pub(crate) fn plugin_owns(identity: Option<&PluginIdentity>, id: &str) -> bool {
+    identity.is_none_or(|who| who.0 == id)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthLane {
     /// Operator admin bearer (loopback): everything, including privileged fields.
@@ -85,6 +102,25 @@ pub(crate) async fn require_auth(
     async fn forward_device(mut req: Request, next: Next, fp: String) -> Response {
         req.extensions_mut().insert(PairedDevice(fp));
         forward(req, next, AuthLane::Cert).await
+    }
+
+    /// The plugin lane: the route allowlist, and the caller's identity when it has one.
+    async fn forward_plugin(
+        mut req: Request,
+        next: Next,
+        identity: Option<PluginIdentity>,
+    ) -> Response {
+        if !plugin_may_access(req.method(), req.uri().path()) {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "this route is not authorized for the plugin token — it requires the \
+                 operator's admin token",
+            );
+        }
+        if let Some(identity) = identity {
+            req.extensions_mut().insert(identity);
+        }
+        forward(req, next, AuthLane::Plugin).await
     }
 
     if req.uri().path() == "/api/v1/health" {
@@ -182,17 +218,24 @@ pub(crate) async fn require_auth(
                 .as_deref()
                 .is_some_and(|pt| token_eq(token, pt)) =>
         {
-            if plugin_may_access(req.method(), req.uri().path()) {
-                forward(req, next, AuthLane::Plugin).await
-            } else {
-                api_error(
-                    StatusCode::FORBIDDEN,
-                    "this route is not authorized for the plugin token — it requires the \
-                     operator's admin token",
-                )
+            forward_plugin(req, next, None).await
+        }
+        // A plugin's OWN token: the same routes, plus the identity that makes them its own.
+        Some(token) => {
+            let who = st
+                .plugin_tokens
+                .iter()
+                .find(|(_, pt)| token_eq(token, pt))
+                .map(|(id, _)| id.clone());
+            match who {
+                Some(id) => forward_plugin(req, next, Some(PluginIdentity(id))).await,
+                None => api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "missing or invalid credentials (a paired device, or a bearer token)",
+                ),
             }
         }
-        _ => api_error(
+        None => api_error(
             StatusCode::UNAUTHORIZED,
             "missing or invalid credentials (a paired device, or a bearer token)",
         ),
@@ -216,10 +259,10 @@ fn bearer(req: &Request) -> Option<&str> {
 /// Library writes are in because a provider reconciles its own entries; `prep` and
 /// `launch.kind == "command"` are refused in the handlers via [`AuthLane`].
 ///
-/// Route reachability is not launch isolation. `PUT /plugins/{}` lets this lane register any
-/// id with the loopback port the host will dial, and `launch.kind == "plugin"` runs whatever
-/// that listener answers. The runner is one process on one token, so this gate cannot tell
-/// which plugin is calling. See [`crate::library::ask_plugin_launch`].
+/// Route reachability is not plugin identity: the runner is one process on one token, so this
+/// gate cannot tell which plugin is calling and any holder may write another's registration.
+/// What that no longer buys is a command — an `exec` entry resolves against the manifest of the
+/// package that declared the provider id (`plugins::manifest`), not against the caller.
 pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
     // (method, path); `{}` is exactly one segment. Grouped as the route table is.
     const ALLOWED: &[(&Method, &str)] = &[

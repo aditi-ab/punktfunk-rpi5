@@ -144,6 +144,16 @@ enum Sc2Device {
         return b
     }()
 
+    /// The same settings write with `LIZARD_MODE` back ON — what both links send on stop, before
+    /// they let the pad go. Without it the controller stays in Steam-Input HID until the firmware
+    /// watchdog times out, so for those seconds it drives nothing: no keyboard, no mouse, no
+    /// focus. The keep-alive is cancelled first, or its next disable would land after this.
+    static let enableLizard: [UInt8] = {
+        var b = disableLizard
+        b[4] = 1 // LIZARD_MODE_ON, low half of the u16
+        return b
+    }()
+
     /// Force firmware-calibrated signed i16 stick coordinates (`SETTING_ENABLE_RAW_JOYSTICK`
     /// 0x2e, value 0) — Steam sends this during physical-controller initialization. Without it a
     /// controller previously opened in raw mode reports ADC coordinates around 0…3200, which a

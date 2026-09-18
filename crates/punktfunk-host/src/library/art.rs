@@ -46,11 +46,11 @@ enum Fetch {
     Refused,
 }
 
-/// Fetch one cover. `data:` decodes inline (Lutris inlines art); `http(s)` is a GET with
-/// [`MAX_ART_BYTES`] enforced while the body streams, a declared `image/*` type, and 200 only.
-/// A `3xx` is refused rather than chased: a plugin or a typed entry supplies this URL, and it
-/// must not aim the privileged host at an internal endpoint. Sniffing decides the type that is
-/// stored. `etag` makes it conditional. Blocking (`ureq`) — call off the async runtime.
+/// Fetch one cover. `data:` decodes inline; `http(s)` streams at most [`MAX_ART_BYTES`] and
+/// accepts a declared image on 200 only. Sniffing decides the stored type; `etag` makes it
+/// conditional. Redirects are refused so an artwork URL cannot aim the host at an internal
+/// endpoint. Logs carry only the origin: userinfo, paths and queries can hold CDN credentials.
+/// Blocking (`ureq`) — call off the async runtime.
 fn fetch_art(url: &str, etag: Option<&str>) -> Fetch {
     use base64::Engine as _;
     if let Some(rest) = url.strip_prefix("data:") {
@@ -78,6 +78,7 @@ fn fetch_art(url: &str, etag: Option<&str>) -> Fetch {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Fetch::Refused;
     }
+    let log_url = crate::hooks::webhook_origin(url);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(10)))
         .max_redirects(0)
@@ -90,7 +91,7 @@ fn fetch_art(url: &str, etag: Option<&str>) -> Fetch {
         req = req.header("If-None-Match", tag);
     }
     let Ok(mut resp) = req.call() else {
-        tracing::debug!(url, "art store: cover fetch did not complete");
+        tracing::debug!(url = %log_url, "art store: cover fetch did not complete");
         return Fetch::Keep;
     };
     let status = resp.status().as_u16();
@@ -101,11 +102,11 @@ fn fetch_art(url: &str, etag: Option<&str>) -> Fetch {
         // 5xx and 429 are the CDN having a bad minute, not a bad URL. Refusing would leave a
         // marker behind and keep this cover out of the store until someone clears it by hand.
         if status >= 500 || status == 429 {
-            tracing::debug!(url, status, "art store: cover fetch deferred");
+            tracing::debug!(url = %log_url, status, "art store: cover fetch deferred");
             return Fetch::Keep;
         }
         tracing::debug!(
-            url,
+            url = %log_url,
             status,
             "art store: refusing a cover the CDN did not serve"
         );
@@ -130,7 +131,7 @@ fn fetch_art(url: &str, etag: Option<&str>) -> Fetch {
         .to_ascii_lowercase()
         .starts_with("image/")
     {
-        tracing::debug!(url, ctype = %declared, "art store: refusing a cover that is not an image");
+        tracing::debug!(url = %log_url, ctype = %declared, "art store: refusing a cover that is not an image");
         return Fetch::Refused;
     }
     match resp
@@ -149,7 +150,7 @@ fn fetch_art(url: &str, etag: Option<&str>) -> Fetch {
             None => Fetch::Refused,
         },
         Err(ureq::Error::BodyExceedsLimit(_)) => {
-            tracing::debug!(url, "art store: refusing a cover over the size ceiling");
+            tracing::debug!(url = %log_url, "art store: refusing a cover over the size ceiling");
             Fetch::Refused
         }
         // A cut transfer is the network, not the URL: leave the URL usable.
@@ -714,13 +715,20 @@ pub(crate) fn resolve_art_bytes(v: &str) -> Option<(Vec<u8>, String)> {
 /// (a client cannot reach `C:\…`) and a remote URL (the host stores it once, for all of them).
 /// A URL a fetch already refused stays verbatim so the client can still try it, and an
 /// already-proxied path is left alone.
+///
+/// Each path carries `?v=`, the head of the source value's own hash. Without it the path stayed
+/// the same when the operator pointed an entry at a different cover, and nothing in front of the
+/// host — a browser holding `max-age`, a client's disk cache keyed by URL — ever asked again. It
+/// costs no I/O and moves exactly when the source does; the same source serving new bytes is
+/// still the ETag's job.
 pub fn proxy_art(id: &str, art: &mut Artwork) {
     let rw = |field: &mut Option<String>, kind: &str| {
-        let servable = field.as_deref().is_some_and(|v| {
-            is_local_art_path(v) || (is_remote_art_url(v) && !remote_art_refused(v))
-        });
-        if servable {
-            *field = Some(format!("/api/v1/library/art/{id}/{kind}"));
+        let proxied = field
+            .as_deref()
+            .filter(|v| is_local_art_path(v) || (is_remote_art_url(v) && !remote_art_refused(v)))
+            .map(|v| format!("/api/v1/library/art/{id}/{kind}?v={}", &art_key(v)[..16]));
+        if let Some(path) = proxied {
+            *field = Some(path);
         }
     };
     rw(&mut art.portrait, "portrait");
@@ -842,12 +850,13 @@ mod tests {
             header: Some("/api/v1/library/art/custom:x/header".into()),
         };
         proxy_art("custom:abc", &mut art);
+        let path = |v: Option<&str>| v.and_then(|s| s.split('?').next()).map(str::to_owned);
         assert_eq!(
-            art.portrait.as_deref(),
+            path(art.portrait.as_deref()).as_deref(),
             Some("/api/v1/library/art/custom:abc/portrait")
         );
         assert_eq!(
-            art.hero.as_deref(),
+            path(art.hero.as_deref()).as_deref(),
             Some("/api/v1/library/art/custom:abc/hero"),
             "the host stores a CDN cover once for every client"
         );
@@ -855,6 +864,37 @@ mod tests {
         assert_eq!(
             art.header.as_deref(),
             Some("/api/v1/library/art/custom:x/header")
+        );
+    }
+
+    /// The whole point of the version tag: point the entry at a different cover and every cache
+    /// in front of the host is looking at a URL it has never seen. A cover that did not change
+    /// keeps its URL, so a warm cache stays warm.
+    #[test]
+    fn a_replaced_cover_gets_a_url_no_cache_is_holding() {
+        let store = tempfile::tempdir().expect("temp store");
+        let _env = store_in(store.path());
+        let proxied = |url: &str| {
+            let mut art = Artwork {
+                portrait: Some(url.into()),
+                hero: None,
+                logo: None,
+                header: None,
+            };
+            proxy_art("custom:b0f3c03f8a50", &mut art);
+            art.portrait.expect("a servable cover is proxied")
+        };
+        let first = proxied("https://cdn2.steamgriddb.com/thumb/585a84e4.jpg");
+        let second = proxied("https://cdn2.steamgriddb.com/thumb/b109fe84.jpg");
+        assert!(
+            first.starts_with("/api/v1/library/art/custom:b0f3c03f8a50/portrait?v="),
+            "{first}"
+        );
+        assert_ne!(first, second, "a new cover has to be a new URL");
+        assert_eq!(
+            first,
+            proxied("https://cdn2.steamgriddb.com/thumb/585a84e4.jpg"),
+            "and an unchanged one must not move, or every shelf refetches on every listing"
         );
     }
 
@@ -878,17 +918,18 @@ mod tests {
         };
         assert!(is_local_art_path(&path));
         proxy_art("lutris:42", &mut art);
+        let route = |v: Option<&str>| v.and_then(|s| s.split('?').next()).map(str::to_owned);
         assert_eq!(
-            art.portrait.as_deref(),
+            route(art.portrait.as_deref()).as_deref(),
             Some("/api/v1/library/art/lutris:42/portrait")
         );
         assert_eq!(
-            art.hero.as_deref(),
+            route(art.hero.as_deref()).as_deref(),
             Some("/api/v1/library/art/lutris:42/hero"),
             "a file:// value is local art too"
         );
         assert_eq!(
-            art.logo.as_deref(),
+            route(art.logo.as_deref()).as_deref(),
             Some("/api/v1/library/art/lutris:42/logo")
         );
 
@@ -1299,9 +1340,12 @@ mod tests {
             ..Default::default()
         };
         proxy_art("custom:abc", &mut art);
-        assert_eq!(
-            art.portrait.as_deref(),
-            Some("/api/v1/library/art/custom:abc/portrait")
+        assert!(
+            art.portrait
+                .as_deref()
+                .is_some_and(|v| v.starts_with("/api/v1/library/art/custom:abc/portrait?v=")),
+            "{:?}",
+            art.portrait
         );
     }
 

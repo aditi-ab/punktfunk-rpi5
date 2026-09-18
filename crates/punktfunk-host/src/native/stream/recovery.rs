@@ -93,6 +93,7 @@ impl StreamState {
             hz,
             |_, _| ed.enc_kbps(new_kbps) as u64 * 1000,
             self.bit_depth,
+            self.client_hdr,
             self.au_seq,
         ) {
             Ok((new_enc, reframe)) => {
@@ -203,6 +204,7 @@ impl StreamState {
                 } else {
                     want_kf = true;
                     rfi_declined = true;
+                    self.counters.link.note_rfi_declined();
                 }
             }
         }
@@ -261,6 +263,7 @@ impl StreamState {
                     self.enc.distrust_references();
                 }
                 self.enc.request_keyframe();
+                self.counters.link.note_idr();
                 self.last_forced_idr = Some(now);
                 if unhealed == IDR_STORM {
                     tracing::warn!(

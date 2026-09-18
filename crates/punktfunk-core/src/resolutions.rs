@@ -5,7 +5,9 @@
 //! A picker shows one family at a time behind an aspect switch, plus its own
 //! native / match-window rows. Picking a family moves to its size nearest the
 //! current height ([`nearest`]), so the switch and the list always agree
-//! without any picker-side state. Pure; tested here.
+//! without any picker-side state. A device whose screen is none of these
+//! shapes (a phone) leads the switch with its own two ([`families`]). Pure;
+//! tested here.
 
 /// One family of sizes with the same shape.
 pub struct Aspect {
@@ -81,6 +83,105 @@ pub fn aspect_of(w: u32, h: u32) -> Option<usize> {
     })
 }
 
+/// One entry of a device's aspect switch: a standard family, or this screen's
+/// own shape ([`families`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Family {
+    pub label: &'static str,
+    /// Width over height.
+    pub shape: f64,
+    /// Ascending, all sides even.
+    pub sizes: Vec<(u32, u32)>,
+}
+
+pub const SCREEN_LABEL: &str = "Screen";
+pub const SAFE_AREA_LABEL: &str = "Safe area";
+
+/// Heights a device family offers below the screen's own.
+const DEVICE_HEIGHTS: [u32; 4] = [720, 1080, 1440, 2160];
+
+/// A device family's sizes sit within this of its shape (even-flooring costs
+/// under 0.3 %), tight enough to part a phone's screen from its safe area.
+const DEVICE_TOLERANCE: f64 = 0.01;
+
+/// The aspect switch on a device with `screen` and a `safe` area (landscape
+/// `(w, h)`): "Screen", then "Safe area", then [`ASPECTS`]. Each device entry
+/// appears only when no standard family already has its shape, and the safe
+/// area only when it differs from the screen.
+pub fn families(screen: Option<(u32, u32)>, safe: Option<(u32, u32)>) -> Vec<Family> {
+    let mut out = Vec::new();
+    let screen = screen.filter(|&(w, h)| w > 0 && h > 0);
+    for (label, dims) in [(SCREEN_LABEL, screen), (SAFE_AREA_LABEL, safe)] {
+        let Some((w, h)) = dims.filter(|&(w, h)| w > 0 && h > 0) else {
+            continue;
+        };
+        if label == SAFE_AREA_LABEL && Some((w, h)) == screen {
+            continue;
+        }
+        if aspect_of(w, h).is_some() {
+            continue;
+        }
+        out.push(Family {
+            label,
+            shape: f64::from(w) / f64::from(h),
+            sizes: device_sizes(w, h),
+        });
+    }
+    out.extend(ASPECTS.iter().map(|a| Family {
+        label: a.label,
+        shape: f64::from(a.ratio.0) / f64::from(a.ratio.1),
+        sizes: a.sizes.to_vec(),
+    }));
+    out
+}
+
+/// `w`×`h` at the standard heights below it, then itself; widths even-floored.
+fn device_sizes(w: u32, h: u32) -> Vec<(u32, u32)> {
+    let mut sizes: Vec<(u32, u32)> = DEVICE_HEIGHTS
+        .iter()
+        .filter(|&&dh| dh < h)
+        .map(|&dh| {
+            (
+                (u64::from(w) * u64::from(dh) / u64::from(h)) as u32 / 2 * 2,
+                dh,
+            )
+        })
+        .collect();
+    sizes.push((w / 2 * 2, h / 2 * 2));
+    sizes
+}
+
+/// The entry of `families` that `w`×`h` belongs to by shape: a device family
+/// first, within [`DEVICE_TOLERANCE`], then a standard one. `None` for a zero
+/// side or a shape none has.
+pub fn family_of(families: &[Family], w: u32, h: u32) -> Option<usize> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let shape = f64::from(w) / f64::from(h);
+    let within = |f: &Family, tol: f64| (shape / f.shape - 1.0).abs() < tol;
+    let device = |f: &Family| f.label == SCREEN_LABEL || f.label == SAFE_AREA_LABEL;
+    families
+        .iter()
+        .position(|f| device(f) && within(f, DEVICE_TOLERANCE))
+        .or_else(|| {
+            families
+                .iter()
+                .position(|f| !device(f) && within(f, TOLERANCE))
+        })
+}
+
+/// The size in `family` nearest in height to `h`; a native `0` looks for 1080.
+/// Ties go to the smaller size.
+pub fn nearest_in(family: &Family, h: u32) -> (u32, u32) {
+    let h = if h == 0 { 1080 } else { h };
+    *family
+        .sizes
+        .iter()
+        .min_by_key(|(_, sh)| sh.abs_diff(h))
+        .expect("every family lists a size")
+}
+
 /// The size in family `aspect` nearest in height to `h`; a native `0`
 /// looks for 1080. Ties go to the smaller size.
 pub fn nearest(aspect: usize, h: u32) -> (u32, u32) {
@@ -122,6 +223,43 @@ mod tests {
         assert_eq!(aspect_of(2556, 1179), None, "a phone panel is nobody's");
         assert_eq!(aspect_of(0, 0), None, "native");
         assert_eq!(aspect_of(1920, 0), None);
+    }
+
+    /// A OnePlus 9 Pro: 3216×1440, 127 px of cutout on one side.
+    #[test]
+    fn a_phone_leads_with_its_screen_and_safe_area() {
+        let f = families(Some((3216, 1440)), Some((3088, 1440)));
+        assert_eq!(f.len(), ASPECTS.len() + 2);
+        assert_eq!(
+            (f[0].label, f[1].label, f[2].label),
+            ("Screen", "Safe area", "16:9")
+        );
+        assert_eq!(f[0].sizes, [(1608, 720), (2412, 1080), (3216, 1440)]);
+        assert_eq!(f[1].sizes, [(1544, 720), (2316, 1080), (3088, 1440)]);
+        assert_eq!(family_of(&f, 2412, 1080), Some(0));
+        assert_eq!(family_of(&f, 2316, 1080), Some(1));
+        assert_eq!(family_of(&f, 1920, 1080), Some(2));
+        assert_eq!(nearest_in(&f[1], 1080), (2316, 1080));
+        for fam in &f {
+            assert!(fam.sizes.iter().all(|&(w, h)| w % 2 == 0 && h % 2 == 0));
+        }
+    }
+
+    #[test]
+    fn a_standard_screen_adds_nothing() {
+        let plain = families(None, None);
+        assert_eq!(families(Some((1920, 1080)), Some((1920, 1080))), plain);
+        assert_eq!(
+            families(Some((2560, 1600)), Some((2560, 1500))),
+            plain,
+            "both standard shapes"
+        );
+        let no_cutout = families(Some((2556, 1179)), Some((2556, 1179)));
+        assert_eq!(
+            no_cutout.len(),
+            ASPECTS.len() + 1,
+            "safe area equal to the screen"
+        );
     }
 
     #[test]

@@ -22,13 +22,9 @@ BUILD_TVOS="${BUILD_TVOS:-0}" # BUILD_TVOS=1 adds tvOS slices — TIER-3 Rust ta
 NIGHTLY=nightly-2026-08-11
 
 # Toolchain resolution. Cargo's HOST artifacts (proc-macros, build scripts) are loaded by
-# the RUNNING OS, so their linker must not be newer than it: a beta Xcode's ld emits
-# LINKEDIT layouts the current dyld rejects ("mis-aligned LINKEDIT string pool"), and
-# every proc-macro then dies with a misleading E0463 "can't find crate" — with the bad
-# artifacts cached (cargo doesn't fingerprint the linker; rm -rf target after fixing).
-# CLT is always dyld-safe but ships no iOS/tvOS SDKs. Resolution: a NON-BETA full Xcode
-# for everything; with only a beta installed, macOS slices build against CLT and
-# iOS/tvOS slices are refused.
+# the RUNNING OS, so a beta Xcode's ld must not link them. CLT ships no iOS/tvOS SDKs.
+# Resolution: a NON-BETA full Xcode for everything; with only a beta installed, macOS
+# slices build against CLT and iOS/tvOS slices are refused.
 pick_nonbeta_xcode() {
     local app
     for app in /Applications/Xcode.app /Applications/Xcode*.app; do
@@ -59,6 +55,21 @@ if [[ -z "${DEVELOPER_DIR:-}" ]]; then
         ;;
     esac # a non-beta xcode-select default is fine as-is
 fi
+
+# Proc-macros are dylibs the running OS loads. With chained fixups — on at any deployment
+# target >= 12, which the mac slices set — Xcode 27's ld writes one macOS 27 refuses
+# ("mis-aligned LINKEDIT string pool", reported by cargo as E0463), so host links go without.
+# The linker file lives in the target dir and changes only on edit: cargo rebuilds when it does.
+HOST_LINKER="$(mkdir -p "$TARGET_DIR" && cd "$TARGET_DIR" && pwd)/proc-macro-linker"
+HOST_LINKER_SH='#!/bin/sh
+exec cc -Wl,-no_fixup_chains "$@"'
+if [[ "$(cat "$HOST_LINKER" 2>/dev/null)" != "$HOST_LINKER_SH" ]]; then
+    printf '%s\n' "$HOST_LINKER_SH" > "$HOST_LINKER"
+    chmod +x "$HOST_LINKER"
+fi
+# Both host triples. On the same-triple slice it also links the cdylib, which is not shipped.
+export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="$HOST_LINKER"
+export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$HOST_LINKER"
 
 # Hermetic Opus: never let audiopus_sys link a Homebrew libopus via pkg-config. A brew lib
 # is built for the RUNNING macOS (its objects carry that minos, tripping the version guard

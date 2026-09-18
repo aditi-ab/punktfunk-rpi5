@@ -527,6 +527,13 @@ async fn session(args: Args) -> Result<()> {
                 if std::env::var_os("PUNKTFUNK_CLIENT_444").is_some() {
                     caps |= punktfunk_core::quic::VIDEO_CAP_444;
                 }
+                // PUNKTFUNK_CLIENT_HDR=1 advertises VIDEO_CAP_HDR (BT.2020 PQ), and 10-bit
+                // with it — the host needs both for an HDR session. Pairs with
+                // PUNKTFUNK_CLIENT_PEAK_NITS, which carries the panel's ST.2086 volume.
+                if std::env::var_os("PUNKTFUNK_CLIENT_HDR").is_some() {
+                    caps |=
+                        punktfunk_core::quic::VIDEO_CAP_HDR | punktfunk_core::quic::VIDEO_CAP_10BIT;
+                }
                 // PUNKTFUNK_CLIENT_CHACHA20=1 advertises VIDEO_CAP_CHACHA20 — drives the
                 // host's ChaCha20-Poly1305 session-cipher resolution (the soft-AES armv7
                 // negotiation, design/chacha20-session-cipher.md §7) without a webOS build;

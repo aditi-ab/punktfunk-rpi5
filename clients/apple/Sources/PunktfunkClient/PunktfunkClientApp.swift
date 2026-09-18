@@ -104,6 +104,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // window fronts and receives keyboard/mouse focus (GameController needs focus).
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        // A second window opened over a fullscreen one would join it as a tab: hidden behind
+        // the first stream, and AppKit throws when that tab enters fullscreen on its own.
+        NSWindow.allowsAutomaticWindowTabbing = false
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

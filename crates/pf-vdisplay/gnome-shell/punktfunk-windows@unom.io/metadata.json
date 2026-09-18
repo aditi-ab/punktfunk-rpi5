@@ -1,0 +1,7 @@
+{
+  "uuid": "punktfunk-windows@unom.io",
+  "name": "punktfunk window list",
+  "description": "Tells the punktfunk host which windows are open, so a game launched from a streaming client can wait for the game's own window.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://git.unom.io/unom/punktfunk"
+}

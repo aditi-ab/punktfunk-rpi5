@@ -28,9 +28,10 @@ pub(super) fn align_up(v: u64, a: u64) -> u64 {
 /// `Ok((x_offset, y_offset))` is the chroma-siting bits the session must be created with
 /// (preferred available bit per axis). `Err` is the first missing requirement.
 ///
-/// `ten_bit` + `src_fmt` describe the planned session: HDR needs the BT.2020 model and the
-/// 10-bit packed-RGB `src_fmt` as an encode-source format. An EFC that cannot do HDR returns
-/// `Err` and the session takes the compute CSC.
+/// `ten_bit` (depth) + `hdr` (colour) + `src_fmt` describe the planned session: HDR wants the
+/// BT.2020 model, SDR the BT.709 one at either depth; the 10-bit packed-RGB `src_fmt` is HDR's
+/// encode source. An EFC that cannot serve the wanted model returns `Err` and the session takes
+/// the compute CSC.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn probe_rgb_direct(
     instance: &ash::Instance,
@@ -39,6 +40,7 @@ pub(super) unsafe fn probe_rgb_direct(
     codec_op: vk::VideoCodecOperationFlagsKHR,
     av1: bool,
     ten_bit: bool,
+    hdr: bool,
     src_fmt: vk::Format,
 ) -> Result<(u32, u32), &'static str> {
     use crate::vk_av1_encode as av1b;
@@ -62,8 +64,8 @@ pub(super) unsafe fn probe_rgb_direct(
     if feat.video_encode_rgb_conversion == vk::FALSE {
         return Err("no-feature");
     }
-    // Caps under the rgb-chained profile: colour math must match the compute CSC
-    // (`rgb2yuv.comp` 709-narrow / `rgb2yuv10.comp` 2020-narrow). Same chain every consumer presents.
+    // Caps under the rgb-chained profile: colour math must match the compute CSC (`rgb2yuv.comp`
+    // 709 / `rgb2yuv10.comp` 2020 / `rgb2yuv10_709.comp` 709 at ten bits). Depth-only profile here.
     let mut ps = RgbProfileStack::new(codec_op, ten_bit);
     let profile = *ps.wire(av1);
     let mut rgb_caps = vrgb::VideoEncodeRgbConversionCapabilitiesVALVE {
@@ -103,9 +105,9 @@ pub(super) unsafe fn probe_rgb_direct(
             None
         }
     };
-    let want_model = rgb_model_for(ten_bit);
+    let want_model = rgb_model_for(hdr);
     if rgb_caps.rgb_models & want_model == 0 || rgb_caps.rgb_ranges & vrgb::RANGE_NARROW == 0 {
-        return Err(if ten_bit {
+        return Err(if hdr {
             "no-2020-narrow"
         } else {
             "no-709-narrow"
@@ -139,20 +141,128 @@ pub(super) unsafe fn probe_rgb_direct(
         .iter()
         .any(|p| p.format == src_fmt && p.image_tiling == vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
     {
-        return Err(if ten_bit {
-            "no-rgb10-modifier-tiling"
-        } else {
+        return Err(if src_fmt == vk::Format::B8G8R8A8_UNORM {
             "no-bgra-modifier-tiling"
+        } else {
+            "no-rgb10-modifier-tiling"
         });
     }
     Ok((x_offset, y_offset))
 }
 
-/// EFC colour model for this depth (709 SDR / 2020 HDR) — the same matrices the compute-CSC
-/// shaders use, so encode-src and SPS/sequence-header colour signalling stay interchangeable.
-pub(super) fn rgb_model_for(ten_bit: bool) -> u32 {
+/// One plane of a multi-planar image as a storage image; the image carries `MUTABLE_FORMAT`.
+unsafe fn make_plane_view(
+    device: &ash::Device,
+    image: vk::Image,
+    fmt: vk::Format,
+    plane: vk::ImageAspectFlags,
+) -> Result<vk::ImageView> {
+    Ok(device.create_image_view(
+        &vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(fmt)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(plane)
+                    .level_count(1)
+                    .layer_count(1),
+            ),
+        None,
+    )?)
+}
+
+/// Can the compute CSC write the encode source's planes directly? True when this profile
+/// lists `pic` for `ENCODE_SRC | STORAGE` with the create flags a plane view needs. A driver
+/// that lists it and still misrenders is what `PUNKTFUNK_VULKAN_DIRECT_PLANES=0` is for.
+pub(super) unsafe fn probe_yuv_storage_planes(
+    vq_inst: &ash::khr::video_queue::Instance,
+    pd: vk::PhysicalDevice,
+    profile: &vk::VideoProfileInfoKHR,
+    pic: vk::Format,
+) -> bool {
+    let profile_arr = [*profile];
+    let plist = vk::VideoProfileListInfoKHR::default().profiles(&profile_arr);
+    let mut fmt_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+        .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::STORAGE);
+    fmt_info.p_next = &plist as *const _ as *const c_void;
+    let get_fmt = vq_inst.fp().get_physical_device_video_format_properties_khr;
+    let mut count = 0u32;
+    if get_fmt(pd, &fmt_info, &mut count, std::ptr::null_mut()) != vk::Result::SUCCESS || count == 0
+    {
+        return false;
+    }
+    let mut props = vec![vk::VideoFormatPropertiesKHR::default(); count as usize];
+    let r = get_fmt(pd, &fmt_info, &mut count, props.as_mut_ptr());
+    if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
+        return false;
+    }
+    planes_writable(&props[..count as usize], pic)
+}
+
+/// Pure half of [`probe_yuv_storage_planes`].
+pub(super) fn planes_writable(props: &[vk::VideoFormatPropertiesKHR], pic: vk::Format) -> bool {
+    let flags = vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE;
+    props.iter().any(|p| {
+        p.format == pic
+            && p.image_tiling == vk::ImageTiling::OPTIMAL
+            && p.image_usage_flags.contains(vk::ImageUsageFlags::STORAGE)
+            && p.image_create_flags.contains(flags)
+    })
+}
+
+#[cfg(test)]
+mod direct_planes_tests {
+    use super::*;
+
+    fn listed(
+        usage: vk::ImageUsageFlags,
+        flags: vk::ImageCreateFlags,
+    ) -> vk::VideoFormatPropertiesKHR<'static> {
+        vk::VideoFormatPropertiesKHR::default()
+            .format(NV12)
+            .image_tiling(vk::ImageTiling::OPTIMAL)
+            .image_usage_flags(usage)
+            .image_create_flags(flags)
+    }
+
+    /// Storage on the picture format plus both create flags, or the scratch path stays.
+    #[test]
+    fn direct_planes_need_storage_and_the_view_flags_on_the_picture_format() {
+        let full = vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE;
+        let src = vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR;
+        assert!(planes_writable(
+            &[listed(src | vk::ImageUsageFlags::STORAGE, full)],
+            NV12
+        ));
+        assert!(
+            !planes_writable(&[listed(src, full)], NV12),
+            "no storage usage"
+        );
+        assert!(
+            !planes_writable(
+                &[listed(
+                    src | vk::ImageUsageFlags::STORAGE,
+                    vk::ImageCreateFlags::MUTABLE_FORMAT
+                )],
+                NV12
+            ),
+            "no extended usage"
+        );
+        assert!(
+            !planes_writable(&[listed(src | vk::ImageUsageFlags::STORAGE, full)], P010),
+            "other format"
+        );
+        assert!(!planes_writable(&[], NV12));
+    }
+}
+
+/// EFC colour model for this session (2020 HDR / 709 SDR, at either depth) — the same matrices the
+/// compute-CSC shaders use, so encode-src and SPS/sequence-header colour signalling stay
+/// interchangeable. Keyed on colour, not depth: 10-bit SDR is BT.709 (`rgb2yuv10_709.comp`).
+pub(super) fn rgb_model_for(hdr: bool) -> u32 {
     use crate::vk_valve_rgb as vrgb;
-    if ten_bit {
+    if hdr {
         vrgb::MODEL_YCBCR_2020
     } else {
         vrgb::MODEL_YCBCR_709
@@ -170,7 +280,36 @@ pub(super) unsafe fn make_video_image(
     profile_list: &mut vk::VideoProfileListInfoKHR,
     concurrent: &[u32],
 ) -> Result<(vk::Image, vk::DeviceMemory)> {
+    make_video_image_flags(
+        device,
+        mp,
+        fmt,
+        w,
+        h,
+        layers,
+        usage,
+        vk::ImageCreateFlags::empty(),
+        profile_list,
+        concurrent,
+    )
+}
+
+/// [`make_video_image`] with image create flags (`MUTABLE_FORMAT` for plane views).
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn make_video_image_flags(
+    device: &ash::Device,
+    mp: &vk::PhysicalDeviceMemoryProperties,
+    fmt: vk::Format,
+    w: u32,
+    h: u32,
+    layers: u32,
+    usage: vk::ImageUsageFlags,
+    flags: vk::ImageCreateFlags,
+    profile_list: &mut vk::VideoProfileListInfoKHR,
+    concurrent: &[u32],
+) -> Result<(vk::Image, vk::DeviceMemory)> {
     let mut ci = vk::ImageCreateInfo::default()
+        .flags(flags)
         .image_type(vk::ImageType::TYPE_2D)
         .format(fmt)
         .extent(vk::Extent3D {
@@ -242,6 +381,7 @@ pub(super) unsafe fn make_frame(
     csc: bool,
     pad_fmt: Option<vk::Format>,
     hdr: bool,
+    direct_planes: bool,
     f: &mut Frame,
 ) -> Result<()> {
     // "no cursor uploaded yet" sentinel — a real serial may be 0 (see `prep_cursor`).
@@ -278,6 +418,7 @@ pub(super) unsafe fn make_frame(
             csc_pool,
             sampler,
             hdr,
+            direct_planes,
             f,
         )?;
     }
@@ -294,7 +435,8 @@ pub(super) unsafe fn make_frame(
     )
 }
 
-/// CSC half of [`make_frame`]: NV12 encode-src, Y/UV scratch, cursor, descriptors.
+/// CSC half of [`make_frame`]: the NV12/P010 encode-src, what the CSC writes (its planes, or
+/// Y/UV scratch copied in afterwards), cursor, descriptors.
 #[allow(clippy::too_many_arguments)]
 unsafe fn make_frame_csc(
     device: &ash::Device,
@@ -307,45 +449,72 @@ unsafe fn make_frame_csc(
     csc_pool: vk::DescriptorPool,
     sampler: vk::Sampler,
     hdr: bool,
+    direct_planes: bool,
     f: &mut Frame,
 ) -> Result<()> {
     let pic = yuv_format(hdr);
-    (f.nv12_src, f.nv12_mem) = make_video_image(
-        device,
-        mem_props,
-        pic,
-        w,
-        h,
-        1,
-        vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::TRANSFER_DST,
-        profile_list,
-        fams,
-    )?;
-    f.nv12_view = make_view(device, f.nv12_src, pic, 0)?;
-    // Scratch is a storage-image format size-compatible with the picture planes (`vkCmdCopyImage`
-    // needs equal texel-block size). 10-bit ycbcr planes are not storage formats, so R16/RG16
-    // and `rgb2yuv10.comp` writes the value into the high bits.
+    // The CSC's plane formats, size-compatible with the picture planes. 10-bit ycbcr planes
+    // are not storage formats, so R16/RG16 and `rgb2yuv10.comp` writes the value into the
+    // high bits.
     let (y_fmt, uv_fmt) = if hdr {
         (vk::Format::R16_UNORM, vk::Format::R16G16_UNORM)
     } else {
         (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM)
     };
-    (f.y_img, f.y_mem, f.y_view) = make_plain_image(
-        device,
-        mem_props,
-        y_fmt,
-        w,
-        h,
-        vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-    )?;
-    (f.uv_img, f.uv_mem, f.uv_view) = make_plain_image(
-        device,
-        mem_props,
-        uv_fmt,
-        w / 2,
-        h / 2,
-        vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-    )?;
+    f.direct_planes = direct_planes;
+    if direct_planes {
+        // The CSC writes the picture's planes through plane views: no scratch, no copies.
+        // MUTABLE_FORMAT allows a plane view; EXTENDED_USAGE lets STORAGE be a view-format
+        // capability the picture format itself lacks.
+        (f.nv12_src, f.nv12_mem) = make_video_image_flags(
+            device,
+            mem_props,
+            pic,
+            w,
+            h,
+            1,
+            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR
+                | vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
+            profile_list,
+            fams,
+        )?;
+        f.nv12_view = make_view(device, f.nv12_src, pic, 0)?;
+        f.y_view = make_plane_view(device, f.nv12_src, y_fmt, vk::ImageAspectFlags::PLANE_0)?;
+        f.uv_view = make_plane_view(device, f.nv12_src, uv_fmt, vk::ImageAspectFlags::PLANE_1)?;
+    } else {
+        (f.nv12_src, f.nv12_mem) = make_video_image(
+            device,
+            mem_props,
+            pic,
+            w,
+            h,
+            1,
+            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::TRANSFER_DST,
+            profile_list,
+            fams,
+        )?;
+        f.nv12_view = make_view(device, f.nv12_src, pic, 0)?;
+        // Scratch planes, copied into the picture after the CSC (`vkCmdCopyImage` needs equal
+        // texel-block size).
+        (f.y_img, f.y_mem, f.y_view) = make_plain_image(
+            device,
+            mem_props,
+            y_fmt,
+            w,
+            h,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+        )?;
+        (f.uv_img, f.uv_mem, f.uv_view) = make_plain_image(
+            device,
+            mem_props,
+            uv_fmt,
+            w / 2,
+            h / 2,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+        )?;
+    }
     // Cursor overlay: CURSOR_MAX² RGBA8 + host staging. View/descriptor stay bound;
     // only the image content changes (`prep_cursor`).
     (f.cursor_img, f.cursor_mem, f.cursor_view) = make_plain_image(
@@ -499,9 +668,11 @@ pub(super) unsafe fn build_parameters_h265(
     rw: u32,
     rh: u32,
     quality_level: u32,
-    // Main10 + BT.2020/PQ. Must match the profile the session was created with
+    // Depth (Main vs Main10). Must match the profile the session was created with
     // (`open_inner`'s `ten_bit`); a Main SPS on a Main10 session mislabels the samples.
     ten_bit: bool,
+    // Colour (BT.709 vs BT.2020 PQ), independent of depth: 10-bit SDR is Main10 under BT.709.
+    hdr: bool,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>)> {
     use ash::vk::native as hh;
     let mut ptl: hh::StdVideoH265ProfileTierLevel = std::mem::zeroed();
@@ -549,8 +720,8 @@ pub(super) unsafe fn build_parameters_h265(
         sps.conf_win_bottom_offset = (h - rh) / 2; // 4:2:0 SubHeightC = 2
     }
 
-    // VUI names the CSC: 709 limited 8-bit, or 2020-NCL + PQ 10-bit (samples arrive PQ;
-    // the matrix does not touch transfer). Omit it and decoders guess colorimetry.
+    // VUI names the CSC: 709 limited (SDR at either depth), or 2020-NCL + PQ (HDR; samples arrive
+    // PQ, the matrix does not touch transfer). Omit it and decoders guess colorimetry.
     // `vui` must outlive `create_video_session_parameters_khr` — `sps_arr` copies the pointer.
     let mut vui: hh::StdVideoH265SequenceParameterSetVui = std::mem::zeroed();
     vui.flags.set_video_signal_type_present_flag(1);
@@ -558,7 +729,7 @@ pub(super) unsafe fn build_parameters_h265(
     vui.flags.set_colour_description_present_flag(1);
     vui.video_format = 5; // unspecified — the CICP triplet below is what matters
                           // CICP: 1 = BT.709, 9 = BT.2020 primaries / 2020-NCL matrix, 16 = SMPTE 2084.
-    let (prim, trc, mat) = if ten_bit { (9, 16, 9) } else { (1, 1, 1) };
+    let (prim, trc, mat) = if hdr { (9, 16, 9) } else { (1, 1, 1) };
     vui.colour_primaries = prim;
     vui.transfer_characteristics = trc;
     vui.matrix_coeffs = mat;
@@ -716,6 +887,7 @@ fn av1_sequence_header_obu(
     order_hint_bits_minus_1: u32,
     seq_level_idx: u32,
     ten_bit: bool,
+    hdr: bool,
 ) -> Vec<u8> {
     let mut w = Av1BitWriter::new();
     w.put(0, 3); // seq_profile = MAIN
@@ -757,11 +929,7 @@ fn av1_sequence_header_obu(
     w.bit(ten_bit as u32); // high_bitdepth -> BitDepth = 10
     w.bit(0); // mono_chrome
     w.bit(1); // color_description_present_flag
-    let (prim, trc, mat) = if ten_bit {
-        (9u32, 16u32, 9u32)
-    } else {
-        (1, 1, 1)
-    };
+    let (prim, trc, mat) = if hdr { (9u32, 16u32, 9u32) } else { (1, 1, 1) };
     w.put(prim, 8); // color_primaries         (1 = BT.709, 9 = BT.2020)
     w.put(trc, 8); // transfer_characteristics (1 = BT.709, 16 = SMPTE 2084)
     w.put(mat, 8); // matrix_coefficients      (1 = BT.709, 9 = BT.2020 NCL)
@@ -795,9 +963,11 @@ pub(super) unsafe fn build_parameters_av1(
     max_level: ash::vk::native::StdVideoAV1Level,
     sb128: bool,
     quality_level: u32,
-    // Must match the profile the session was created with (`open_inner`'s `ten_bit`)
+    // Depth. Must match the profile the session was created with (`open_inner`'s `ten_bit`)
     // and the OBU packed below.
     ten_bit: bool,
+    // Colour (BT.709 vs BT.2020 PQ), independent of depth: 10-bit SDR is AV1 10-bit under BT.709.
+    hdr: bool,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>, Vec<u8>)> {
     use crate::vk_av1_encode as av1;
     use ash::vk::native as hh;
@@ -817,7 +987,7 @@ pub(super) unsafe fn build_parameters_av1(
     cc.BitDepth = if ten_bit { 10 } else { 8 };
     cc.subsampling_x = 1;
     cc.subsampling_y = 1;
-    let (prim, trc, mat) = if ten_bit {
+    let (prim, trc, mat) = if hdr {
         (
             hh::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_2020,
             hh::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_SMPTE_2084,
@@ -901,6 +1071,7 @@ pub(super) unsafe fn build_parameters_av1(
         order_hint_bits_minus_1,
         seq_level_idx,
         ten_bit,
+        hdr,
     );
     let mut keyframe_prefix = td.clone();
     keyframe_prefix.extend_from_slice(&seq_obu);
@@ -1005,7 +1176,7 @@ mod tests {
         // 1920×1080 → 10/10 frame-size bits. Level 8 exercises seq_tier; sb128 both ways
         // because it sits above color_config.
         for (sb128, level) in [(false, 8u32), (true, 5u32)] {
-            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, false);
+            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, false, false);
             let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
             assert_eq!(depth10, 0, "high_bitdepth (8-bit session)");
             assert_eq!(
@@ -1021,12 +1192,12 @@ mod tests {
         }
     }
 
-    /// 10-bit session must signal BT.2020 + PQ with `high_bitdepth` set. That bit sits
+    /// 10-bit HDR must signal BT.2020 + PQ with `high_bitdepth` set. That bit sits
     /// before the CICP bytes in `color_config()`, so a miss phases every field after it.
     #[test]
     fn av1_sequence_header_signals_bt2020_pq_at_10_bit() {
         for (sb128, level) in [(false, 8u32), (true, 5u32)] {
-            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true);
+            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true, true);
             let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
             assert_eq!(depth10, 1, "high_bitdepth (sb128={sb128})");
             assert_eq!(described, 1, "color_description_present_flag");
@@ -1034,6 +1205,24 @@ mod tests {
                 (cp, tc, mc),
                 (9, 16, 9),
                 "CICP BT.2020 primaries / SMPTE 2084 transfer / BT.2020-NCL matrix"
+            );
+            assert_eq!(range, 0, "color_range = studio/limited swing");
+        }
+    }
+
+    /// 10-bit SDR: `high_bitdepth` set but BT.709 CICP, not BT.2020/PQ. The colour axis is
+    /// independent of depth (`rgb2yuv10_709.comp` performs the 709 matrix at ten bits).
+    #[test]
+    fn av1_sequence_header_signals_bt709_at_10_bit() {
+        for (sb128, level) in [(false, 8u32), (true, 5u32)] {
+            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true, false);
+            let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
+            assert_eq!(depth10, 1, "high_bitdepth (sb128={sb128})");
+            assert_eq!(described, 1, "color_description_present_flag");
+            assert_eq!(
+                (cp, tc, mc),
+                (1, 1, 1),
+                "CICP BT.709 primaries/transfer/matrix at 10-bit"
             );
             assert_eq!(range, 0, "color_range = studio/limited swing");
         }

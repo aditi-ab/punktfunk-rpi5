@@ -45,7 +45,8 @@ its own mechanism — see [Windows](#windows).
 ## The browser client (preview)
 
 Punktfunk can also accept a browser over WebTransport. It is **off** by default and still a
-preview — it connects and carries no session yet — so turn it on only if you are trying it out:
+preview — a browser that connects now runs a full session — so turn it on only if you are trying
+it out:
 
 ```ini
 PUNKTFUNK_WEBTRANSPORT=1
@@ -201,19 +202,13 @@ Prefer the CLI? `punktfunk-host service install` from an elevated prompt — see
 Intel (QSV); the host falls back to software H.264 without one.
 
 **GameStream on Windows.** The installer leaves Moonlight compatibility **off** — a checkbox in the
-wizard (`/MERGETASKS="gamestream"` to select it unattended). There's no `ExecStart` to edit: the
-service launches whatever `PUNKTFUNK_HOST_CMD` in `%ProgramData%\punktfunk\host.env` says, which is
-also where the rest of the Windows host's configuration lives. To change it later, from an elevated
-prompt:
+wizard (`/MERGETASKS="gamestream"` to select it unattended). Change it later on the web console's
+**Host → Settings** page, or from an elevated prompt:
 
 ```powershell
 punktfunk-host service install --gamestream=on   # or --gamestream=off
 punktfunk-host service restart
 ```
-
-Registering the service by hand is the exception. A bare `punktfunk-host service install` writes a
-fresh `host.env` with `PUNKTFUNK_HOST_CMD` commented out, and with no value set the service falls
-back to `serve --gamestream` — add `--gamestream=off` to that command for the native-only host.
 
 > **Firewall scope.** The installer opens the streaming + console ports on **Private and Domain**
 > networks only — not **Public**. If your LAN is (mis)classified Public, clients won't connect until

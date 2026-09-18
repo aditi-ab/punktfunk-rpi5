@@ -1,5 +1,6 @@
 //! Blocking sleep / reboot / shutdown for `power.*` (`design/host-actions.md`),
-//! plus the per-verb probe the discovery route reports.
+//! the host's own restart for `host.restart`, and the per-verb probe the
+//! discovery route reports.
 //!
 //! Linux drives logind over zbus, authorized for group `punktfunk` by
 //! `packaging/linux/49-punktfunk-power.rules`. Calls omit `-ignore-inhibit`
@@ -18,6 +19,58 @@ pub enum PowerVerb {
     Sleep,
     Reboot,
     Shutdown,
+    /// Restart the Punktfunk host process, not the machine.
+    Restart,
+}
+
+/// Exit status that asks the Windows service supervisor for an immediate relaunch.
+pub const RESTART_EXIT_CODE: u32 = 75;
+
+/// The `punktfunk-host*.service` user unit a `/proc/self/cgroup` places this process in.
+/// `None` outside one: a terminal, a system unit, or another app's scope.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn host_unit(cgroup: &str) -> Option<String> {
+    cgroup.lines().find_map(|line| {
+        let path = line.rsplit(':').next()?;
+        let unit = path.rsplit('/').next()?;
+        (path.contains("/user@")
+            && unit.starts_with("punktfunk-host")
+            && unit.ends_with(".service"))
+        .then(|| unit.to_string())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn restart_probe() -> Availability {
+    match std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .as_deref()
+        .and_then(host_unit)
+    {
+        Some(_) => Availability::yes(),
+        None => Availability::no(
+            "the host is not running as its user service, so nothing would start it again",
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restart_act() -> Result<(), String> {
+    let unit = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .as_deref()
+        .and_then(host_unit)
+        .ok_or("the host is not running as its user service")?;
+    // `--no-block`: this process is the one systemd stops.
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "--no-block", "restart", &unit])
+        .status()
+        .map_err(|e| format!("systemctl: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("systemctl restart {unit}: {status}"))
+    }
 }
 
 /// Discovery publishes `reason` as `unavailable_reason` when `available` is
@@ -91,6 +144,7 @@ pub fn probe(verb: PowerVerb) -> Availability {
         PowerVerb::Sleep => "CanSuspend",
         PowerVerb::Reboot => "CanReboot",
         PowerVerb::Shutdown => "CanPowerOff",
+        PowerVerb::Restart => return restart_probe(),
     };
     match logind_call::<String, ()>(method, ()) {
         Ok(ans) if ans == "yes" => Availability::yes(),
@@ -113,6 +167,7 @@ pub fn act(verb: PowerVerb) -> Result<(), String> {
         PowerVerb::Sleep => "Suspend",
         PowerVerb::Reboot => "Reboot",
         PowerVerb::Shutdown => "PowerOff",
+        PowerVerb::Restart => return restart_act(),
     };
     logind_call::<(), (bool,)>(method, (false,))
 }
@@ -131,6 +186,12 @@ pub fn probe(verb: PowerVerb) -> Availability {
             }
         }
         PowerVerb::Reboot | PowerVerb::Shutdown => Availability::yes(),
+        PowerVerb::Restart if std::env::var_os("PUNKTFUNK_SERVICE_CHILD").is_some() => {
+            Availability::yes()
+        }
+        PowerVerb::Restart => Availability::no(
+            "the host is not running under the Punktfunk service, so nothing would start it again",
+        ),
     }
 }
 
@@ -149,6 +210,11 @@ pub fn act(verb: PowerVerb) -> Result<(), String> {
         SHTDN_REASON_MINOR_OTHER,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    if verb == PowerVerb::Restart {
+        // The service supervisor relaunches on this code without a crash backoff.
+        std::process::exit(RESTART_EXIT_CODE as i32);
+    }
 
     // SAFETY: privilege-enable on our own process token; CloseHandle on every path.
     unsafe {
@@ -188,6 +254,7 @@ pub fn act(verb: PowerVerb) -> Result<(), String> {
                 ))
             }
         }
+        PowerVerb::Restart => unreachable!("handled above"),
         PowerVerb::Reboot | PowerVerb::Shutdown => {
             let reason = windows::core::HSTRING::from(
                 "Requested from a Punktfunk client (host power action)",
@@ -235,4 +302,25 @@ pub fn closing_rx() -> tokio::sync::watch::Receiver<bool> {
 
 pub fn set_closing(closing: bool) {
     let _ = power_closing().send(closing);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_unit;
+
+    #[test]
+    fn restart_needs_the_host_user_unit() {
+        let unit =
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/punktfunk-host.service\n";
+        assert_eq!(host_unit(unit).as_deref(), Some("punktfunk-host.service"));
+        // A terminal, a system unit, or a session unit that merely starts the host.
+        for other in [
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foot.scope",
+            "0::/system.slice/punktfunk-host.service",
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/punktfunk-kde-session.service",
+            "",
+        ] {
+            assert_eq!(host_unit(other), None, "{other}");
+        }
+    }
 }

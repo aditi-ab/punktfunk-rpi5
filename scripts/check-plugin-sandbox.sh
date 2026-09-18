@@ -1,0 +1,96 @@
+#!/bin/bash
+# What a sandboxed plugin can actually reach — driven through the REAL runner, against a real
+# kernel, rather than asserted.
+#
+# This script used to re-declare bwrap's flags by hand. A flag the copy omitted was a flag no
+# check ever ran, which is how `--disable-userns` shipped needing an `--unshare-user` nothing
+# supplied (bwrap refused every plugin), and how `--clearenv` shipped discarding the whole
+# environment the plugin needs. So: no copy. It builds the runner, installs a probe plugin, and
+# reads what that plugin reports from inside its own sandbox.
+#
+#   docker run --rm --privileged -v "$PWD":/w -v "$PWD/scripts":/s oven/bun:1 \
+#     bash /s/check-plugin-sandbox.sh
+#
+# Needs bubblewrap and unprivileged user namespaces, so it runs on Linux only.
+set -u
+W=${PUNKTFUNK_REPO:-/w}
+apt-get update -qq >/dev/null 2>&1
+apt-get install -y -qq bubblewrap iproute2 >/dev/null 2>&1 || { echo "FAIL: no bubblewrap"; exit 1; }
+
+cd "$W/sdk" || { echo "FAIL: no $W/sdk — mount the repo at /w"; exit 1; }
+bun install --ignore-scripts >/dev/null 2>&1
+# The sandbox binds ONE runner file, so the shipped runner is a bundle. Test what ships.
+bun build src/runner-cli.ts --target=bun --outfile /runner.js >/dev/null || { echo "FAIL: bundle"; exit 1; }
+
+export HOME=/root
+CFG=$HOME/.config/punktfunk
+P=$CFG/plugins/node_modules/punktfunk-plugin-probe
+mkdir -p "$P" "$HOME/.ssh" "$HOME/steamlike"
+echo "secret-admin-token"  > "$CFG/mgmt-token"
+echo "private key"         > "$HOME/.ssh/id_ed25519"
+echo "library-data"        > "$HOME/steamlike/marker"
+echo '{"probe":"testtoken"}' > "$CFG/plugin-tokens.json"
+printf '{"dependencies":{"punktfunk-plugin-probe":"*"}}' > "$CFG/plugins/package.json"
+printf '{"name":"punktfunk-plugin-probe","version":"1.0.0","main":"index.js","punktfunk":{"schema":1,"id":"probe","reads":["~/steamlike"]}}' > "$P/package.json"
+
+cat > "$P/index.js" <<'JS'
+import fs from "node:fs";
+const say = (k, v) => `${k}=${v}`;
+const o = [];
+let home = "UNSET";
+try { home = (await import("node:os")).homedir(); } catch (e) { home = "THREW"; }
+o.push(say("homedir", home));
+const gone = (f) => { try { f(); return "READABLE"; } catch { return "blocked"; } };
+o.push(say("mgmt", gone(() => fs.readFileSync("/root/.config/punktfunk/mgmt-token", "utf8"))));
+o.push(say("ssh", gone(() => fs.readFileSync("/root/.ssh/id_ed25519", "utf8"))));
+o.push(say("declared", (() => { try { return fs.readFileSync(home + "/steamlike/marker", "utf8").trim(); } catch { return "UNREACHABLE"; } })()));
+o.push(say("declared_ro", (() => { try { fs.writeFileSync(home + "/steamlike/w", "x"); return "WRITABLE"; } catch { return "readonly"; } })()));
+o.push(say("state", (() => { try { fs.writeFileSync("/run/punktfunk/plugin-state/w", "x"); return "writable"; } catch { return "UNWRITABLE"; } })()));
+o.push(say("owntoken", (() => { try { fs.readFileSync("/run/punktfunk/plugin-token", "utf8"); return "present"; } catch { return "MISSING"; } })()));
+o.push(say("procs", fs.readdirSync("/proc").filter((d) => /^\d+$/.test(d)).length));
+const ip = (await import("node:child_process")).spawnSync("ip", ["-o", "link"]);
+o.push(say("netlink", ip.error ? "NO_IP" : ip.status === 0 ? "OPEN" : "refused"));
+o.push(say("tunables", (() => { try { fs.writeFileSync("/proc/sys/kernel/sysrq", "1"); return "WRITABLE"; } catch (e) { return e.code; } })()));
+o.push(say("cfgdir", process.env.PUNKTFUNK_CONFIG_DIR ?? "UNSET"));
+o.push(say("sock", process.env.PUNKTFUNK_MGMT_UNIX ?? "UNSET"));
+console.log("PROBE " + o.join(" "));
+JS
+
+chmod -R go-w "$CFG"
+LOG=$(mktemp)
+timeout 60 bun /runner.js --plugins "$CFG/plugins" --scripts /nonexistent > "$LOG" 2>&1
+line=$(grep -m1 '^PROBE ' "$LOG")
+[ -n "$line" ] || { echo "FAIL: the plugin never started"; tail -20 "$LOG"; exit 1; }
+
+pass=0; fail=0
+want() { # label, key, expected
+  got=$(echo "$line" | tr ' ' '\n' | grep "^$2=" | cut -d= -f2-)
+  if [ "$got" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1));
+  else echo "  FAIL $1 -> $2=$got (want $3)"; fail=$((fail+1)); fi
+}
+
+echo "== what a sandboxed plugin can reach"
+want "the admin token is not there"      mgmt        blocked
+want "~/.ssh is not there"               ssh         blocked
+want "the declared root IS there"        declared    library-data
+want "the declared root is READ-ONLY"    declared_ro readonly
+want "its own state dir IS writable"     state       writable
+want "its own token IS there"            owntoken    present
+want "HOME is the real home"             homedir     /root
+want "the config dir is set"             cfgdir      /run/punktfunk
+want "the host socket is set"            sock        /run/punktfunk/host.sock
+echo "== the namespace holds"
+# Exactly two: bwrap's own init as pid 1, the plugin as pid 2. The point is the count does not
+# grow with the host's process list — a shared /proc here would be hundreds.
+want "only the sandbox's own processes"  procs       2
+# The runner's unit allows both for bwrap's own setup; the plugin inside gets neither.
+want "netlink is refused"                netlink     refused
+want "kernel tunables are read-only"     tunables    EROFS
+
+echo "== the capability probe agrees with reality"
+if grep -q 'cannot be sandboxed' "$LOG"; then
+  echo "  FAIL the probe called this box incapable while the sandbox worked"; fail=$((fail+1))
+else echo "  ok   the probe called this box capable"; pass=$((pass+1)); fi
+
+echo "$pass passed, $fail failed"
+[ "$fail" -eq 0 ]

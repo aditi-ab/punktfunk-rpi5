@@ -101,12 +101,18 @@ pub(crate) struct WorkerArgs {
     pub(crate) decode_lat: Arc<Mutex<DecodeLatAcc>>,
     /// Encoder-target mirror. Seeded from Welcome; updated on every `BitrateChanged` ack.
     pub(crate) live_bitrate: Arc<AtomicU32>,
+    /// Why Automatic last cut the rate ([`crate::hud::RateCut`] code), for the overlay.
+    pub(crate) rate_cut: Arc<AtomicU8>,
+    /// RFIs sent in the last minute, for the overlay. The control task notes each one.
+    pub(crate) recent_rfis: Arc<Mutex<RecentRfis>>,
     /// Mute mask the control task ORs [`crate::client::AUDIO_MUTE_HOST`] into on every
     /// `AudioState`. The embedder's own bit rides the same cell.
     pub(crate) audio_mute: Arc<AtomicU8>,
     /// OS pad slots this session holds, one bit each ([`crate::quic::PadSlots`]).
     /// The player number the overlay names; `0` until the first pad has a device.
     pub(crate) pad_slots: Arc<AtomicU16>,
+    /// Latest launch verdict the host sent ([`crate::quic::LaunchOutcome`]).
+    pub(crate) launch_outcome: Arc<Mutex<Option<crate::quic::LaunchOutcome>>>,
     /// Live grants. Seeded from the Welcome advert; every `AccessUpdate` overwrites
     /// (latest wins).
     pub(crate) access_grants: Arc<AtomicU32>,

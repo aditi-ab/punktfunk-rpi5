@@ -1,5 +1,13 @@
+import { Link } from "@tanstack/react-router";
 import Section from "@unom/ui/section";
-import { Film, IdCard, Layers, Network } from "lucide-react";
+import {
+	ArrowRight,
+	Film,
+	IdCard,
+	Layers,
+	Network,
+	SlidersHorizontal,
+} from "lucide-react";
 import { motion } from "motion/react";
 import type { FC, ReactNode } from "react";
 import type { AvailableCompositor } from "@/api/gen/model/availableCompositor";
@@ -8,6 +16,7 @@ import { OsIcon } from "@/components/os-icon";
 import { QueryState } from "@/components/query-state";
 import { ROW, ROW_GAP, Stagger, staggerProps } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
@@ -33,6 +42,24 @@ export const HostView: FC<{
 				<h1 className="text-2xl font-semibold">{m.nav_host()}</h1>
 
 				{conflicts}
+
+				<Card>
+					<CardContent className="flex flex-wrap items-center gap-3">
+						<SlidersHorizontal className="size-4 text-muted-foreground" />
+						<div className="min-w-0 flex-1">
+							<h2 className="font-medium">{m.host_settings_title()}</h2>
+							<p className="text-sm text-muted-foreground">
+								{m.host_settings_card_hint()}
+							</p>
+						</div>
+						<Button asChild size="sm" variant="outline">
+							<Link to="/host/settings">
+								{m.host_settings_open()}
+								<ArrowRight className="size-4" />
+							</Link>
+						</Button>
+					</CardContent>
+				</Card>
 
 				<QueryState
 					isLoading={host.isLoading}

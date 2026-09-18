@@ -132,6 +132,8 @@ jobs:
       # Line tables keep file:line in panics and shrink target/ and every link. The value is
       # part of each sccache key, so changing it means bumping the target key's -vN- too.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # Prebuilt Skia from disk, never github.com; see ci/skia-binaries.sh.
+      SKIA_BINARIES_URL: file:///opt/skia-binaries/skia-binaries-{key}.tar.gz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -167,10 +169,12 @@ jobs:
           apt-get install -y --no-install-recommends glslang-tools spirv-tools
           for p in crates/pf-zerocopy/src/imp/rgb2nv12_buf \
                    crates/pf-zerocopy/src/imp/cursor_blend \
+                   crates/pf-zerocopy/src/imp/convert_img \
                    crates/pf-zerocopy/src/imp/reframe_buf \
                    crates/pf-encode/src/enc/linux/reframe \
                    crates/pf-encode/src/enc/linux/rgb2yuv \
                    crates/pf-encode/src/enc/linux/rgb2yuv10 \
+                   crates/pf-encode/src/enc/linux/rgb2yuv10_709 \
                    crates/pf-encode/src/enc/linux/rgb2yuv444; do
             s=${p##*/}
             glslangValidator -V "$p.comp" -o "/tmp/$s.spv" >/dev/null
@@ -184,11 +188,13 @@ jobs:
       # registry/git are download caches, target/ the incremental build. The target key
       # carries the rustc version — resolved via `rustc --version` (below) rather than parsed
       # from rust-toolchain.toml, so a pin bump there invalidates stale incremental state too.
-      # `pf-console-ui` pulls skia-safe, so a target-cache miss makes this job download a prebuilt
-      # Skia from the same no-retry build-script fetch that took the android job out on
-      # 2026-08-22, over the same load-shedding runner network. Cheap insurance; see the script.
-      - name: curl with retries (skia-bindings' prebuilt fetch has none)
+      # Build scripts fetch with a bare curl over a runner network that drops packets under load.
+      - name: curl with retries (build-script fetches have none)
         run: sh scripts/ci/install-retrying-curl.sh
+
+      # Baked into the image; this fetches the pins while the running :latest predates them.
+      - name: Prebuilt Skia (no-op once the image bakes it)
+        run: sh ci/skia-binaries.sh x86_64-unknown-linux-gnu
 
       - name: Cache keys
         run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
@@ -210,11 +216,13 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          # The prefix carries the version: bump it, never a suffix, to drop a bad cache, because
-          # restore-keys falls back to the old prefix. `-debug-` keeps this apart from deb.yml's
-          # release tree; an exact key is first-saver-wins, so sharing one starves the slower job.
+          # `-debug-` keeps this apart from deb.yml's release tree: a job that hits a shared key
+          # exactly never saves its own. A corrupt entry needs no prefix bump: the next step drops
+          # its debris and a push replaces it.
           key: cargo-target-debug-v4-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-target-debug-v4-${{ env.rustc }}-
+      - name: Drop a partial target restore
+        run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-debug-v4-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
 
       - name: Format
         run: cargo fmt --all --check
@@ -225,6 +233,12 @@ jobs:
       # Both failure modes were demonstrated before this became blocking (planted instances).
       - name: Unsafe-hygiene grep gates
         run: sh scripts/ci/check-unsafe-hygiene.sh
+
+      # The plugin runner's unit replaces the home with a tmpfs, so a config file it reads and the
+      # unit does not bind is ENOENT at runtime — which is how plugin-tokens.json shipped unbound
+      # and no Linux plugin could start. Reads the names out of the SDK, not a second list.
+      - name: Plugin-runner bind gate
+        run: sh scripts/ci/check-runner-binds.sh
 
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -245,6 +259,7 @@ jobs:
             echo "native-only build still depends on rsa"; exit 1; fi
 
       - name: Build
+        id: build
         run: cargo build --workspace --locked
 
       - name: Test (unit + loopback + proptest + C ABI harness)
@@ -363,8 +378,10 @@ jobs:
             /usr/local/cargo/registry
             /usr/local/cargo/git
           key: cargo-home-ci-${{ hashFiles('Cargo.lock') }}
+      # Saves once Build passed, even when a later step failed, so a corrupt or missing entry is
+      # replaced by the first push that compiles. A cancelled job saves nothing.
       - name: Save target
-        if: github.event_name == 'push' && steps.target.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.build.outcome == 'success' && steps.target.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
@@ -386,6 +403,8 @@ jobs:
     container:
       image: 192.168.1.58:5010/punktfunk-rust-ci-arm64cross:latest
     timeout-minutes: 60
+    env:
+      SKIA_BINARIES_URL: file:///opt/skia-binaries/skia-binaries-{key}.tar.gz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -394,11 +413,12 @@ jobs:
       - name: sccache (no-op once the image bakes it)
         run: sh scripts/ci/ensure-sccache.sh
 
-      # `pf-console-ui` pulls skia-safe, so a target-cache miss makes this job download a prebuilt
-      # Skia from the same no-retry build-script fetch that took the android job out on
-      # 2026-08-22, over the same load-shedding runner network. Cheap insurance; see the script.
-      - name: curl with retries (skia-bindings' prebuilt fetch has none)
+      # Build scripts fetch with a bare curl over a runner network that drops packets under load.
+      - name: curl with retries (build-script fetches have none)
         run: sh scripts/ci/install-retrying-curl.sh
+
+      - name: Prebuilt Skia (no-op once the image bakes it)
+        run: sh ci/skia-binaries.sh aarch64-unknown-linux-gnu
 
       - name: Cache keys
         run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
@@ -421,9 +441,12 @@ jobs:
         with:
           path: target
           # Own prefix: aarch64 artifacts never share the amd64 target cache. `-debug-` keeps it
-          # apart from deb.yml's arm64 release tree, since an exact key is first-saver-wins.
+          # apart from deb.yml's arm64 release tree: a job that hits a shared key exactly never
+          # saves its own.
           key: cargo-target-arm64-debug-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-target-arm64-debug-v1-${{ env.rustc }}-
+      - name: Drop a partial target restore
+        run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-arm64-debug-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
 
       - name: Clippy for aarch64 (deny warnings)
         run: |

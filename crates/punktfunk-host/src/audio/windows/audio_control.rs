@@ -129,11 +129,31 @@ fn list_endpoints(dir: Direction) -> Vec<Endpoint> {
     out
 }
 
-/// True when the loopback plan must prefer real hardware over the silent sink.
+/// True when the loopback plan must prefer real hardware over the silent sink. With voice
+/// chat kept on the host, `host_and_client` keeps the silent sink and the host renders the
+/// mix to the operator's output instead ([`playthrough_requested`]).
 pub(crate) fn host_audio_requested() -> bool {
-    pf_host_config::config()
-        .audio_output_mode
-        .prefers_host_hardware()
+    let cfg = pf_host_config::config();
+    cfg.audio_output_mode.prefers_host_hardware()
+        && cfg.audio_voice_chat != pf_host_config::VoiceChatRoute::Host
+}
+
+/// `host_and_client` with voice chat on the host: capture stays on the silent sink and a
+/// render stream on the parked output lets the operator hear the mix.
+pub(crate) fn playthrough_requested() -> bool {
+    let cfg = pf_host_config::config();
+    cfg.audio_output_mode.prefers_host_hardware()
+        && cfg.audio_voice_chat == pf_host_config::VoiceChatRoute::Host
+}
+
+/// The output the operator heard before this capture parked the default on the plan's
+/// sink; `None` while nothing is parked. The voice-chat pin and playthrough target.
+pub(crate) fn parked_previous_render() -> Option<String> {
+    PARKED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(prev, _)| prev.clone())
 }
 
 /// Skip default-device writes: `follow_default` mode, a session's keep-host-audio
@@ -473,6 +493,8 @@ fn recover_orphaned_default() {
                     "restore the default {what} device left by a previous run"),
             }
         }
+        // Same idea for the per-app voice-chat pins a crash left behind.
+        super::voice_route::recover_orphaned();
     });
 }
 

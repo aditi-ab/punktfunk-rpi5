@@ -10,7 +10,7 @@
 //! `pad_haptics` and `pad_speaker` gate capability advertisement. Speaker `"mix"`
 //! is not implemented and behaves as `"off"`.
 
-use punktfunk_core::audio::AudioGapTracker;
+use punktfunk_core::audio::{AudioGapTracker, SAMPLE_RATE_HZ};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::quic::{PAD_AUDIO_KIND_HAPTICS, PAD_AUDIO_KIND_SPEAKER};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1193,15 +1193,16 @@ struct KindStream {
     frame_samples: usize,
 }
 
-/// Concealment frames before `seq`. 0 until a first decode (`frame_samples == 0`); the tracker
-/// is always fed so a pre-first gap cannot replay later.
+/// Concealment frames before `seq`, capped at 50 ms of `frame_samples` (speaker frames are
+/// 10 ms, haptics 5 ms). 0 until a first decode (`frame_samples == 0`); the tracker is always
+/// fed so a pre-first gap cannot replay later.
 fn plc_frames(gaps: &mut AudioGapTracker, seq: u32, frame_samples: usize) -> u32 {
-    let missing = gaps.missing_before(seq);
     if frame_samples == 0 {
-        0
-    } else {
-        missing
+        gaps.missing_before(seq);
+        return 0;
     }
+    gaps.set_frame_us((frame_samples as u64 * 1_000_000 / SAMPLE_RATE_HZ as u64) as u32);
+    gaps.missing_before(seq)
 }
 
 /// Pad-audio renderer: 0xD1 consumer. Opens the device on the first frame so a session without
@@ -2150,7 +2151,7 @@ mod tests {
         assert_eq!(m.ready_frames(), 0);
     }
 
-    /// Seq-gap PLC: 0 for first/in-order, exact gap for a loss, tracker cap for a burst.
+    /// Seq-gap PLC: 0 for first/in-order, exact gap for a loss, 50 ms of frames for a burst.
     /// `frame_samples == 0` still consumes the gap so it cannot replay.
     #[test]
     fn plc_counts_gaps_like_the_session_audio_path() {
@@ -2160,7 +2161,8 @@ mod tests {
         assert_eq!(plc_frames(&mut gaps, 5, 480), 3); // 2,3,4 lost
         assert_eq!(plc_frames(&mut gaps, 5, 480), 0);
         assert_eq!(plc_frames(&mut gaps, 4, 480), 0);
-        assert_eq!(plc_frames(&mut gaps, 1000, 480), 10); // burst, capped
+        assert_eq!(plc_frames(&mut gaps, 1000, 480), 5); // 10 ms speaker burst, capped
+        assert_eq!(plc_frames(&mut gaps, 2000, 240), 10); // 5 ms haptics burst, capped
         let mut gaps = AudioGapTracker::new();
         assert_eq!(plc_frames(&mut gaps, 7, 0), 0);
         assert_eq!(plc_frames(&mut gaps, 12, 0), 0); // gap consumed silently

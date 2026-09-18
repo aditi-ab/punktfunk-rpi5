@@ -25,27 +25,38 @@ struct Builtin {
     title: &'static str,
     /// Two-press confirm hint. Reboot/shutdown lose state; sleep is reversible.
     danger: bool,
+    group: &'static str,
     verb: PowerVerb,
 }
 
-const BUILTINS: [Builtin; 3] = [
+const BUILTINS: [Builtin; 4] = [
     Builtin {
         id: "power.sleep",
         title: "Sleep host",
         danger: false,
+        group: "power",
         verb: PowerVerb::Sleep,
     },
     Builtin {
         id: "power.reboot",
         title: "Restart host",
         danger: true,
+        group: "power",
         verb: PowerVerb::Reboot,
     },
     Builtin {
         id: "power.shutdown",
         title: "Shut down host",
         danger: true,
+        group: "power",
         verb: PowerVerb::Shutdown,
+    },
+    Builtin {
+        id: "host.restart",
+        title: "Restart Punktfunk",
+        danger: true,
+        group: "host",
+        verb: PowerVerb::Restart,
     },
 ];
 
@@ -128,7 +139,7 @@ pub(crate) async fn list_actions(
         .map(|(b, avail)| ActionInfo {
             id: b.id.into(),
             title: b.title.into(),
-            group: "power".into(),
+            group: b.group.into(),
             danger: b.danger,
             available: crate::power::supported() && avail.available,
             unavailable_reason: if crate::power::supported() {
@@ -178,7 +189,7 @@ fn log_denial_once(fp: &str, action: &str, device: &str) {
     path = "/actions/{id}",
     tag = "actions",
     operation_id = "invokeAction",
-    params(("id" = String, Path, description = "Action id (`power.sleep`, `power.reboot`, `power.shutdown`)")),
+    params(("id" = String, Path, description = "Action id (`power.sleep`, `power.reboot`, `power.shutdown`, `host.restart`)")),
     responses(
         (status = ACCEPTED, description = "Accepted — sessions are being ended and the action follows in about a second"),
         (status = FORBIDDEN, description = "This caller's access does not include this action (no Host power grant)", body = ApiError),

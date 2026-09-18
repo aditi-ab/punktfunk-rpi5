@@ -112,6 +112,12 @@ impl Scanner {
             .unwrap_or_else(|| "?".into())
     }
 
+    /// `(pid, parent)` for every process. A parent pid can outlive its process and be reused, so
+    /// only roots already known to be live are followed.
+    pub fn parents(&self) -> Vec<(u32, u32)> {
+        snapshot_parents()
+    }
+
     /// Pid still present **and** creation time unchanged (rule 2). Windows reuses
     /// pids quickly; without this, signalling a remembered pid is unsafe.
     pub fn alive(&self, procs: &[ProcRef]) -> Vec<ProcRef> {
@@ -168,6 +174,32 @@ fn snapshot_pids() -> Vec<u32> {
         if Process32FirstW(snap, &mut entry).is_ok() {
             loop {
                 out.push(entry.th32ProcessID);
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    out
+}
+
+/// `(pid, parent)` for every process in one Toolhelp snapshot.
+fn snapshot_parents() -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    // SAFETY: as in `snapshot_pids` — `entry` is zeroed with `dwSize` set before the first read,
+    // and the snapshot handle is closed on every exit path.
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return out;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..std::mem::zeroed()
+        };
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                out.push((entry.th32ProcessID, entry.th32ParentProcessID));
                 if Process32NextW(snap, &mut entry).is_err() {
                     break;
                 }

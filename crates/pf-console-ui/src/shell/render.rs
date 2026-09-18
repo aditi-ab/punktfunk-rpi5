@@ -102,6 +102,7 @@ impl Shell {
             full_h - f64::from(ins.top) - f64::from(ins.bottom),
         );
         self.last_insets = (ins.left, ins.top);
+        self.last_full = (full_w as f32, full_h as f32);
         self.last_k = k;
         let t = self.t();
 
@@ -161,10 +162,12 @@ impl Shell {
             settings: &mut self.settings,
             store: &*self.store,
             platform: self.platform,
+            screen: self.screen,
             pads: &self.pads,
             deck: self.deck,
             fallback_ui: self.fallback_ui,
             pyrowave_ok: self.pyrowave_ok,
+            av1_ok: self.av1_ok,
             device_name: &self.device_name,
             t,
             glyphs: self.glyphs,
@@ -302,10 +305,12 @@ struct LayerEnv<'a> {
     settings: &'a mut trust::Settings,
     store: &'a dyn crate::store::SettingsStore,
     platform: crate::platform::Platform,
+    screen: Option<crate::shell::DeviceScreen>,
     pads: &'a [PadInfo],
     deck: bool,
     fallback_ui: bool,
     pyrowave_ok: bool,
+    av1_ok: bool,
     device_name: &'a str,
     t: f64,
     glyphs: GlyphStyle,
@@ -346,10 +351,12 @@ impl LayerEnv<'_> {
             settings: self.settings,
             store: self.store,
             platform: self.platform,
+            screen: self.screen,
             pads: self.pads,
             deck: self.deck,
             fallback_ui: self.fallback_ui,
             pyrowave_ok: self.pyrowave_ok,
+            av1_ok: self.av1_ok,
             device_name: self.device_name,
             t: self.t,
         };

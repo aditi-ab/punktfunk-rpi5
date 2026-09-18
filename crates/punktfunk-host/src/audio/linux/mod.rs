@@ -21,6 +21,8 @@ mod host_bridge;
 mod monitor_rate;
 mod pad_card_volume;
 pub(crate) mod pad_sink;
+mod playing_apps;
+pub(crate) use playing_apps::playing_apps;
 pub(crate) mod pad_usb;
 mod stream_sink;
 

@@ -1273,6 +1273,9 @@ pub mod encode {
         Nv12,
         /// Shader FP16 scRGB→P010 PQ, 10-bit 4:2:0.
         P010,
+        /// Video-engine BGRA→P010, 10-bit 4:2:0 BT.709 (10-bit SDR): an 8-bit capture widened to a
+        /// Main10 stream under BT.709, no HDR volume. AMF only — NVENC widens from `Bgra` itself.
+        P010Sdr,
         /// Shader FP16 scRGB→packed `R10G10B10A2` PQ BT.2020; the backend CSCs to 4:4:4 itself.
         Rgb10,
         /// Shareable Y + CbCr planes plus a fence, as PyroWave's own Vulkan device imports them.
@@ -1281,18 +1284,20 @@ pub mod encode {
 
     impl EncodeInput {
         /// The input for `backend` (the [`SetEncodeRequest::backends`] numbering) under the
-        /// request's HDR and 4:4:4 flags. Only NVENC ingests packed RGB, so only it can pair
-        /// HDR with full chroma; AMF and QSV take P010 and encode 4:2:0. Media Foundation
-        /// takes NV12 whatever was asked for — no vendor's MFT accepts P010, so an HDR
-        /// request that reaches it encodes 8-bit rather than failing the open.
+        /// request's HDR, depth and 4:4:4 flags. Only NVENC ingests packed RGB, so only it can
+        /// pair HDR with full chroma; AMF and QSV take P010 and encode 4:2:0. `ten_bit` without
+        /// `hdr` is 10-bit SDR: NVENC still widens from `Bgra`, AMF takes a BT.709 P010
+        /// (`P010Sdr`). Media Foundation takes NV12 whatever was asked for — no vendor's MFT
+        /// accepts P010, so an HDR request that reaches it encodes 8-bit rather than failing.
         #[must_use]
-        pub const fn choose(backend: u32, hdr: bool, chroma444: bool) -> Self {
+        pub const fn choose(backend: u32, hdr: bool, ten_bit: bool, chroma444: bool) -> Self {
             match (backend, hdr, chroma444) {
                 (backend::PYROWAVE, _, _) => Self::Planar { hdr, chroma444 },
                 (backend::MEDIA_FOUNDATION, _, _) => Self::Nv12,
                 (backend::NVENC, true, true) => Self::Rgb10,
                 (_, true, _) => Self::P010,
                 (backend::NVENC, false, _) => Self::Bgra,
+                (backend::AMF, false, _) if ten_bit => Self::P010Sdr,
                 _ => Self::Nv12,
             }
         }
@@ -2264,6 +2269,70 @@ pub mod gamepad {
         assert!(offset_of!(PadBootstrap, handle_pid) == 24);
         assert!(offset_of!(PadBootstrap, handle_seq) == 28);
     };
+
+    /// How often a real pad on USB sends an input report: `DualSense`, DualShock 4 and the Deck
+    /// (its 4 ms connection interval) alike. Every identity but the Triton is served at this rate.
+    ///
+    /// A game polls the stream, not the state: Sony's libScePad hands a frame no sample when no
+    /// report arrived since its last read, so a pad slower than the game's frame rate reads as a
+    /// held input released and pressed again.
+    pub const REPORT_PERIOD_US: u64 = 4_000;
+
+    /// Whether a report is due at `now_us`, given the slot `due_us` it was scheduled for.
+    ///
+    /// `Some(next)` means serve now and schedule the next slot one period on. A tick more than a
+    /// period late restarts the schedule from now rather than catching up, since a burst of
+    /// back-dated reports is exactly the cadence a game must not see.
+    pub fn serve_due(now_us: u64, due_us: u64) -> Option<u64> {
+        if now_us < due_us {
+            return None;
+        }
+        let from = if now_us - due_us >= REPORT_PERIOD_US {
+            now_us
+        } else {
+            due_us
+        };
+        Some(from + REPORT_PERIOD_US)
+    }
+
+    /// Write the pad's own clocks into a Sony report about to be served.
+    ///
+    /// A USB `DualSense` advances four every report: the 8-bit counter (byte 7), a 32-bit packet
+    /// sequence (12–15), `sensor_timestamp` (28–31) and a second 32-bit timer (49–52) about 2 ms
+    /// after it. Motion code integrates gyro over `sensor_timestamp`, so it has to advance by the
+    /// real time between the reports a game receives. The host publishes at its client's rate and
+    /// the driver serves at the hardware's, so the driver owns every clock. `serial` is this
+    /// report's index, `elapsed_us` the time since the first report; every field wraps as hardware
+    /// does. Returns `false`, and leaves the report alone, for an identity that has no such fields.
+    pub fn stamp_sony_clock(
+        device_type: u8,
+        report: &mut [u8; 64],
+        serial: u32,
+        elapsed_us: u64,
+    ) -> bool {
+        match device_type {
+            DEVTYPE_DUALSENSE | DEVTYPE_DUALSENSE_EDGE => {
+                report[7] = serial as u8;
+                report[12..16].copy_from_slice(&serial.to_le_bytes());
+                // 1/3 µs ticks (hid-playstation's DIV_ROUND_CLOSEST(delta, 3)).
+                let ticks = elapsed_us * 3;
+                report[28..32].copy_from_slice(&(ticks as u32).to_le_bytes());
+                // A real pad stamps this ~5 900 ticks (≈2 ms) after the sensor sample.
+                report[49..53].copy_from_slice(&((ticks + 5_900) as u32).to_le_bytes());
+                true
+            }
+            DEVTYPE_DUALSHOCK4 => {
+                // The counter is the top six bits; the low two are PS and touchpad click.
+                report[7] = (report[7] & 0x03) | (((serial as u8) & 0x3F) << 2);
+                // 16/3 µs ticks, mirrored into the one touch frame's own timestamp byte.
+                let ts = (elapsed_us * 3 / 16) as u16;
+                report[10..12].copy_from_slice(&ts.to_le_bytes());
+                report[34] = ts as u8;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Steam Controller 2 (Triton) wire tables: UMDF driver (answers Steam synchronously) and
@@ -2717,6 +2786,85 @@ pub mod cursor {
 mod tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    /// A pad served at the hardware cadence advances its counter by one and its timestamps by the
+    /// real period per report.
+    #[test]
+    fn sony_clock_advances_like_hardware() {
+        use gamepad::*;
+        let mut ds = [0xAAu8; 64];
+        assert!(stamp_sony_clock(DEVTYPE_DUALSENSE, &mut ds, 5, 8_000));
+        assert_eq!(ds[7], 5);
+        let le = |r: &[u8; 64], at: usize| u32::from_le_bytes(r[at..at + 4].try_into().unwrap());
+        assert_eq!(le(&ds, 12), 5, "packet sequence");
+        assert_eq!(le(&ds, 28), 24_000);
+        assert_eq!(le(&ds, 49), 29_900, "second timer");
+        assert_eq!(
+            ds[27], 0xAA,
+            "the gyro/accel bytes before the timestamp stay the host's"
+        );
+        assert_eq!(ds[53], 0xAA, "battery byte stays the host's");
+
+        // Every clock advances on every report, as on hardware.
+        let mut next = ds;
+        stamp_sony_clock(DEVTYPE_DUALSENSE, &mut next, 6, 12_000);
+        for at in [12, 28, 49] {
+            assert!(le(&next, at) > le(&ds, at), "field at {at} did not advance");
+        }
+
+        let mut edge = [0u8; 64];
+        assert!(stamp_sony_clock(
+            DEVTYPE_DUALSENSE_EDGE,
+            &mut edge,
+            256 + 3,
+            4_000
+        ));
+        assert_eq!(edge[7], 3, "the counter wraps at a byte");
+
+        let mut ds4 = [0u8; 64];
+        ds4[7] = 0x03; // PS + touchpad click held
+        assert!(stamp_sony_clock(
+            DEVTYPE_DUALSHOCK4,
+            &mut ds4,
+            64 + 2,
+            16_000
+        ));
+        assert_eq!(
+            ds4[7],
+            0x03 | (2 << 2),
+            "counter wraps at six bits, buttons survive"
+        );
+        assert_eq!(u16::from_le_bytes([ds4[10], ds4[11]]), 3_000);
+        assert_eq!(ds4[34], 3_000u16 as u8);
+
+        let mut xbox = [0x11u8; 64];
+        assert!(!stamp_sony_clock(DEVTYPE_XBOX, &mut xbox, 1, 4_000));
+        assert_eq!(xbox, [0x11u8; 64]);
+    }
+
+    /// Serves land one period apart on a fine timer, and a coarse timer restarts the schedule
+    /// instead of bursting reports to catch up.
+    #[test]
+    fn serves_at_the_hardware_period() {
+        use gamepad::*;
+        let p = REPORT_PERIOD_US;
+        assert_eq!(serve_due(0, 0), Some(p));
+        assert_eq!(
+            serve_due(2_000, p),
+            None,
+            "a 2 ms tick between slots serves nothing"
+        );
+        assert_eq!(
+            serve_due(p + 100, p),
+            Some(2 * p),
+            "a slightly late tick keeps the grid"
+        );
+        assert_eq!(
+            serve_due(p + 15_600, p),
+            Some(p + 15_600 + p),
+            "a coarse tick restarts it"
+        );
+    }
 
     #[test]
     fn dtd_encodes_the_session_mode() {
@@ -3757,31 +3905,40 @@ mod tests {
     /// the client's Welcome — still said 4:4:4.
     #[test]
     fn a_444_request_picks_a_full_chroma_input() {
-        use encode::EncodeInput::{self, Bgra, Nv12, Planar, Rgb10, P010};
+        use encode::EncodeInput::{self, Bgra, Nv12, P010Sdr, Planar, Rgb10, P010};
 
+        // (backend, hdr, ten_bit, chroma444) -> input. HDR implies ten_bit; 10-bit SDR is
+        // ten_bit without hdr.
         let table = [
-            ((1, false, false), Bgra),
-            ((1, false, true), Bgra),
-            ((1, true, false), P010),
-            ((1, true, true), Rgb10),
-            ((2, true, true), P010),
-            ((3, false, true), Nv12),
+            ((1, false, false, false), Bgra),
+            ((1, false, true, false), Bgra), // NVENC widens SDR-10 from BGRA itself
+            ((1, false, false, true), Bgra),
+            ((1, true, true, false), P010),
+            ((1, true, true, true), Rgb10),
+            ((2, true, true, true), P010),
+            ((2, false, true, false), P010Sdr), // AMF 10-bit SDR: BT.709 P010
+            ((2, false, false, false), Nv12),   // AMF 8-bit SDR
+            ((3, false, false, true), Nv12),
+            ((3, false, true, true), Nv12), // QSV 10-bit SDR not wired: 8-bit NV12
             (
-                (4, true, true),
+                (4, true, true, true),
                 Planar {
                     hdr: true,
                     chroma444: true,
                 },
             ),
         ];
-        for ((backend, hdr, chroma444), want) in table {
-            let got = EncodeInput::choose(backend, hdr, chroma444);
-            assert_eq!(got, want, "backend {backend} hdr {hdr} 444 {chroma444}");
+        for ((backend, hdr, ten_bit, chroma444), want) in table {
+            let got = EncodeInput::choose(backend, hdr, ten_bit, chroma444);
+            assert_eq!(
+                got, want,
+                "backend {backend} hdr {hdr} 10bit {ten_bit} 444 {chroma444}"
+            );
         }
         for backend in [1, 4] {
             for hdr in [false, true] {
                 assert!(
-                    EncodeInput::choose(backend, hdr, true).full_chroma(),
+                    EncodeInput::choose(backend, hdr, hdr, true).full_chroma(),
                     "backend {backend} hdr {hdr} asked 4:4:4 and got a subsampled input"
                 );
             }

@@ -145,6 +145,8 @@ struct GamepadSettingsView: View {
     }
 
     @State private var aboutPage: AboutPage?
+    /// The Custom bitrate row's text while its keyboard is up; nil ⇒ the row list owns the pad.
+    @State private var typingBitrate: String?
 
     var body: some View {
         GamepadMenuList(
@@ -154,7 +156,7 @@ struct GamepadSettingsView: View {
             onActivate: { activate(id: $0.id) },
             onBack: { back() },
             onShoulder: { step(tabBy: $0) },
-            isActive: controllerActive,
+            isActive: controllerActive && typingBitrate == nil,
             focusOutside: stripHasFocus
         ) { row, focused in
             rowView(row, focused: focused)
@@ -181,12 +183,15 @@ struct GamepadSettingsView: View {
         }
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
-                Text(focusedDetail)
-                    .font(.geist(metrics.detailFont, relativeTo: .caption))
-                    .foregroundStyle(ink.fg(0.55))
-                    .lineLimit(2, reservesSpace: true)
-                    .animation(.smooth(duration: 0.2), value: focusID)
-                GamepadHintBar(hints: hints)
+                #if !os(tvOS)
+                if typingBitrate != nil {
+                    bitrateKeyboard
+                } else {
+                    legend
+                }
+                #else
+                legend
+                #endif
             }
             // Equal distance from the left and bottom edges for the legend pill (see GamepadHomeView).
             .padding(.leading, compact ? 12 : 18)
@@ -219,15 +224,68 @@ struct GamepadSettingsView: View {
         // The visible close ✕ is gone (a gamepad UI exits with B) — this keeps a hardware
         // keyboard's Esc and the macOS sheet's cancel working without chrome.
         .background {
-            Button("Close") { performClose() }
-                .keyboardShortcut(.cancelAction)
-                .buttonStyle(.plain)
-                .frame(width: 0, height: 0)
-                .opacity(0)
-                .accessibilityHidden(true)
+            // Not while the keyboard tray is up: Esc is the tray's Done then.
+            if typingBitrate == nil {
+                Button("Close") { performClose() }
+                    .keyboardShortcut(.cancelAction)
+                    .buttonStyle(.plain)
+                    .frame(width: 0, height: 0)
+                    .opacity(0)
+                    .accessibilityHidden(true)
+            }
+        }
+        // Each keystroke that makes a rate stores it, like the add-host fields.
+        .onChange(of: typingBitrate) { _, text in
+            guard let text else { return }
+            if text.count > 4 { typingBitrate = String(text.prefix(4)) }
+            if let kbps = SettingsOptions.customBitrateKbps(text) { bitrateKbps = kbps }
+        }
+        #else
+        // tvOS types with the system fullscreen keyboard, as GamepadAddHostView does.
+        .fullScreenCover(isPresented: Binding(
+            get: { typingBitrate != nil },
+            set: { if !$0 { typingBitrate = nil } })
+        ) {
+            TVTextEntry(title: "Bitrate (Mbps)", text: "", keyboardType: .numberPad) {
+                if let kbps = SettingsOptions.customBitrateKbps($0) { bitrateKbps = kbps }
+                typingBitrate = nil
+            }
         }
         #endif
     }
+
+    /// The focused row's detail line over the controls legend.
+    @ViewBuilder private var legend: some View {
+        Text(focusedDetail)
+            .font(.geist(metrics.detailFont, relativeTo: .caption))
+            .foregroundStyle(ink.fg(0.55))
+            .lineLimit(2, reservesSpace: true)
+            .animation(.smooth(duration: 0.2), value: focusID)
+        GamepadHintBar(hints: hints)
+    }
+
+    #if !os(tvOS)
+    /// The Custom bitrate row's tray: the rate so far, digits, and the keyboard's own legend.
+    @ViewBuilder private var bitrateKeyboard: some View {
+        Text(typingBitrate?.isEmpty == false ? "\(typingBitrate ?? "") Mbps" : "Type a rate in Mbps")
+            .font(.geistFixed(metrics.valueFont, .medium))
+            .foregroundStyle(ink.fg)
+            .frame(maxWidth: .infinity)
+        GamepadKeyboard(
+            text: Binding(get: { typingBitrate ?? "" }, set: { typingBitrate = $0 }),
+            allowed: .decimalDigits,
+            onDone: { typingBitrate = nil })
+        GamepadHintBar(hints: [
+            .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Type"),
+            .init(
+                glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Delete",
+                action: { if typingBitrate?.isEmpty == false { typingBitrate?.removeLast() } }),
+            .init(
+                glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
+                action: { typingBitrate = nil }),
+        ])
+    }
+    #endif
 
     /// The section switcher. Horizontally scrollable so a narrow phone in landscape never has to
     /// squeeze six pills — the selected one is always scrolled into view, whether it was reached
@@ -857,10 +915,11 @@ struct GamepadSettingsView: View {
                 label: "Aspect ratio",
                 detail: "Which shapes the Resolution row offers. Picking one moves to its size "
                     + "nearest the current height.",
-                options: Resolutions.aspects.enumerated().map { (label: $0.element.label, tag: $0.offset) },
+                options: SettingsOptions.families().enumerated()
+                    .map { (label: $0.element.label, tag: $0.offset) },
                 current: family
             ) { i in
-                let mode = Resolutions.nearest(i, height: height)
+                let mode = Resolutions.nearestIn(SettingsOptions.families()[i], height: height)
                 width = mode.w
                 height = mode.h
             },
@@ -889,6 +948,16 @@ struct GamepadSettingsView: View {
                     : "Automatic uses the host's default, 20 Mbps.",
                 options: bitrate, current: bitrateKbps, enabled: !pyroWaveSelected
             ) { bitrateKbps = $0 },
+            Row(
+                id: "bitrateCustom", tab: .stream, icon: "keyboard", label: "Custom bitrate",
+                value: SettingsOptions.isCustomBitrate(bitrateKbps)
+                    ? SpeedTestView.mbpsLabel(kbps: bitrateKbps) : "Type a rate",
+                detail: pyroWaveSelected
+                    ? "PyroWave sets its own rate per mode; this is ignored."
+                    : "Any fixed rate, in Mbps.",
+                field: "bitrate_kbps", adjustable: false, enabled: !pyroWaveSelected,
+                adjust: { _ in false },
+                activate: { typingBitrate = "" }),
             choiceRow(
                 id: "compositor", tab: .stream, field: "compositor", icon: "macwindow", label: "Compositor",
                 detail: "Which compositor drives the virtual output — honored only if available.",
@@ -897,7 +966,7 @@ struct GamepadSettingsView: View {
             choiceRow(
                 id: "codec", tab: .video, field: "codec", icon: "film", label: "Video codec",
                 detail: "A preference — the host falls back if it can't encode it.",
-                options: SettingsOptions.codecs, current: codec
+                options: SettingsOptions.codecs(current: codec), current: codec
             ) { codec = $0 },
             toggleRow(
                 id: "hdr", tab: .video, field: "hdr_enabled", icon: "sun.max", label: "10-bit HDR",

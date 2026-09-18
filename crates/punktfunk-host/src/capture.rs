@@ -60,6 +60,8 @@ fn zero_copy_policy(
         // Only the direct-SDK NVENC backend takes a packed 10-bit PQ CUDA payload.
         // Without it HDR capture stays on the CPU path.
         hdr_cuda_ok: pf_encode::linux_hdr_cuda_ok(),
+        nvenc_raw_dmabuf: pf_encode::linux_nvenc_raw_dmabuf_ok(),
+        gamescope_tiled: false,
     }
 }
 
@@ -114,9 +116,9 @@ pub fn capture_virtual_output(
     _capture: crate::session_plan::CaptureBackend,
     // The output's compositor is KWin, derived from the backend that created
     // `vout` (a pooled display only ever matches its own backend). KWin rewrites
-    // `SPA_META_Cursor` on every buffer, so id-0 is an authoritative hide, serves
-    // a 3-buffer pool unless asked for `KWIN_POOL_MIN`, and paces delivery on a
-    // millisecond-rounded timer unless offered no `maxFramerate` ceiling.
+    // `SPA_META_Cursor` on every buffer (id-0 is an authoritative hide), serves a pool
+    // of `KWIN_POOL_MIN..=KWIN_POOL_MAX`, and paces delivery on a millisecond-rounded
+    // timer unless offered no `maxFramerate` ceiling.
     kwin: bool,
     // Gamescope omits cursor metadata and exports LINEAR-only dmabufs.
     gamescope: bool,
@@ -171,7 +173,12 @@ pub fn capture_virtual_output(
         want.gpu,
         want.chroma_444,
         want.hdr,
-        zero_copy_policy(want.pyrowave, want.nv12_native),
+        want.ten_bit_sdr,
+        pf_capture::ZeroCopyPolicy {
+            // No route here. A wrong "foreign" only keeps the LINEAR offer.
+            gamescope_tiled: gamescope && pf_vdisplay::gamescope_tiled_capture(None),
+            ..zero_copy_policy(want.pyrowave, want.nv12_native)
+        },
         vout.expect_exact_dims,
         kwin,
         gamescope,
@@ -180,6 +187,7 @@ pub fn capture_virtual_output(
         } else {
             pf_capture::POOL_MIN
         },
+        kwin.then_some(pf_capture::KWIN_POOL_MAX),
         kwin && pf_capture::unpaced_capture(),
     )
 }
@@ -248,16 +256,19 @@ impl Capturer for KeptAlive {
 /// spawned (not attached-foreign) sub-mode, and no earlier virtual-output HDR
 /// downgrade latched. Anything else on Linux is 8-bit; GNOME 50+ portal HDR is
 /// the GameStream plane (`gamestream::host_hdr_capable` + live monitor probe).
-pub fn capturer_supports_hdr_for(compositor: Option<crate::vdisplay::Compositor>) -> bool {
+pub fn capturer_supports_hdr_for(
+    compositor: Option<crate::vdisplay::Compositor>,
+    gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
+) -> bool {
     #[cfg(target_os = "linux")]
     {
         if compositor == Some(crate::vdisplay::Compositor::Gamescope) {
             return pf_host_config::config().gamescope_hdr
-                && pf_vdisplay::gamescope_hdr_available()
+                && pf_vdisplay::gamescope_hdr_available(gamescope_route)
                 && !pf_capture::hdr_capture_failed(pf_capture::HdrSource::VirtualOutput);
         }
     }
-    let _ = compositor;
+    let _ = (compositor, gamescope_route);
     pf_capture::capturer_supports_hdr()
 }
 
@@ -364,8 +375,10 @@ pub fn capture_virtual_output(
 /// Open the in-driver encoder for an IDD-push session: the plan as the driver numbers it, the
 /// resolved Windows backend ahead of any fallback rung, the two IOCTL senders over the
 /// manager's control handle, and the `pf_gpu` session record. The heap is sized from the
-/// opening rate; ABR climbs past twice it eat the burst margin.
+/// opening rate; ABR climbs past twice it eat the burst margin. `client_hdr` replaces the
+/// capturer's HDR baseline, as the stream loop does, so the first IDR carries the client's panel.
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 pub fn open_driver_encoder(
     plan: &crate::session_plan::SessionPlan,
     capturer: &dyn Capturer,
@@ -373,6 +386,7 @@ pub fn open_driver_encoder(
     fps: u32,
     bitrate_bps: u64,
     bit_depth: u8,
+    client_hdr: Option<pf_frame::HdrMeta>,
     wire_seq_base: u32,
 ) -> Result<Box<dyn crate::encode::Encoder>> {
     use crate::encode::{Codec, WindowsBackend};
@@ -444,7 +458,7 @@ pub fn open_driver_encoder(
         fps,
         bitrate_kbps: (bitrate_bps / 1000).min(u64::from(u32::MAX)) as u32,
         hdr: plan.hdr,
-        hdr_meta: capturer.hdr_meta(),
+        hdr_meta: capturer.hdr_meta().map(|m| client_hdr.unwrap_or(m)),
         wire_chunk_bytes: plan.wire_chunk.unwrap_or(0) as u32,
         backends: [backend, fallback, 0, 0],
         wire_seq_base,

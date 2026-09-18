@@ -37,10 +37,15 @@ pub enum Phase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepAction {
     Run(String),
-    /// Replaced or appended in `host.env`.
+    /// Replaced or appended in `host.env`: a pin the console cannot change.
     SetEnv {
         key: String,
         value: String,
+    },
+    /// Merged into `host-settings.json`: a default the operator can change in the console.
+    SetSetting {
+        id: String,
+        value: serde_json::Value,
     },
     Note(Level, String),
     /// apt will not walk back to a lower candidate; madison after the repo rewrite.
@@ -100,6 +105,16 @@ impl Step {
         Step {
             action: StepAction::SetEnv {
                 key: key.to_string(),
+                value: value.into(),
+            },
+            ends_run: false,
+        }
+    }
+
+    pub fn set_setting(id: &str, value: impl Into<serde_json::Value>) -> Step {
+        Step {
+            action: StepAction::SetSetting {
+                id: id.to_string(),
                 value: value.into(),
             },
             ends_run: false,
@@ -200,7 +215,7 @@ pub fn build(facts: &Facts, choices: &Choices) -> Plan {
         );
         plan.push(
             Phase::Options,
-            "Options (host.env — everything here is off by default and reversible)",
+            "Options (each one can be changed later)",
             option_steps(facts, choices),
         );
         // Linger is configuration, not start, so --no-start still honours it. It also creates
@@ -441,10 +456,10 @@ fn option_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
                 "with another GameStream host running, only one can bind the Moonlight ports — stop the other first or skip this",
             ));
         }
-        steps.push(Step::set_env("PUNKTFUNK_GAMESTREAM", "1"));
+        steps.push(Step::set_setting("gamestream", true));
     }
     if choices.clipboard {
-        steps.push(Step::set_env("PUNKTFUNK_CLIPBOARD", "on"));
+        steps.push(Step::set_setting("clipboard", "files"));
     }
     // A box with no desktop installed cannot stand a session up for the host; gamescope
     // brings its own. A seat that is merely not logged in (ssh) keeps the host's detection.

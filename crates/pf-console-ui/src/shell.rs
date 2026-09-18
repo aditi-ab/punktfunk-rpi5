@@ -14,7 +14,9 @@ use crate::model::{
     ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, SpeedPhase, SpeedStatus, WakeStatus,
 };
 use crate::platform::Platform;
-use crate::pointer::{Pointer, PointerKind};
+#[cfg(test)]
+use crate::pointer::DRAG_TICK_DP;
+use crate::pointer::{Pointer, PointerKind, Touch};
 use crate::screens::{Bg, ConnectIntent, Ctx, Nav, Outbox, Screen};
 use crate::store::SettingsStore;
 use anyhow::{anyhow, Result};
@@ -51,31 +53,6 @@ const NAV_INPUT_OPENS: f64 = 0.85;
 /// Chrome bands, design units: pinned title above, hints below.
 const TOP_BAND: f64 = 64.0;
 const BOTTOM_BAND: f64 = 86.0;
-
-/// Max finger wander (design units × `k`) that still counts as a tap. 12 dp is
-/// classic touch slop; in device pixels it matches Android ViewConfiguration.
-const TOUCH_SLOP_DP: f64 = 12.0;
-/// Dominant-axis travel (design units × `k`) per synthetic scroll tick. 56 is
-/// the menu row pitch (`widgets::ROW_H` + gap), so the list tracks the finger.
-const DRAG_TICK_DP: f64 = 56.0;
-
-/// Live touch gesture, from [`Shell::pointer_input`] when `touch` is set.
-/// A mouse never enters: its press acts immediately. A second finger is ignored.
-#[derive(Clone, Copy, Debug)]
-enum TouchGesture {
-    /// Finger down, still within slop. A lift is a tap: Press lands at the
-    /// *anchor*, not the lift point — the focused item scrolls toward centre
-    /// and widgets hit-test last frame's rects.
-    Armed { x: f64, y: f64 },
-    /// Slop exceeded. Axis-locked from the first exit so diagonal jitter cannot
-    /// alternate a carousel with a list. `last` is the last tick's dominant-axis pos.
-    Drag {
-        x: f64,
-        y: f64,
-        horizontal: bool,
-        last: f64,
-    },
-}
 
 /// Paint recipe for a transition. Distinct from spring direction: a reversed
 /// push still paints as a push.
@@ -202,6 +179,30 @@ struct Launching {
     base_gen: u64,
     /// `status_gen` when the last poll went out — the next waits for it to move.
     poll_gen: u64,
+    /// The game is up and the host is waiting for its window.
+    window_wait: bool,
+    /// Why the hold gave up, once it has. Latched: the hold holds the screen and says this
+    /// instead of sliding away onto a desktop nobody asked for.
+    failed: Option<String>,
+}
+
+/// Why the hold is giving up, in one sentence, or `None` while it should keep waiting.
+///
+/// `state` is the host's own `games[]` word for this title, `None` when the host lists nothing
+/// for it at all — which is what a refused launch looks like from here. The touch shell's
+/// `launchGaveUp` says the same three sentences, so a report quotes one line whichever shell
+/// it came from. `running`, `untracked` and `grace` keep waiting or reveal: those launches worked.
+fn launch_gave_up(title: &str, state: Option<&str>, elapsed: f64) -> Option<String> {
+    match state {
+        None if elapsed >= LAUNCH_NO_LEASE => Some(format!(
+            "The host didn't start {title} — nothing is running for it."
+        )),
+        Some("launching") if elapsed >= LAUNCH_HOLD_MAX => {
+            Some(format!("{title} is still starting after 2 minutes."))
+        }
+        Some("exited") => Some(format!("{title} closed right after starting.")),
+        _ => None,
+    }
 }
 
 /// Poll interval for the launch hold, and the retry when an answer never lands.
@@ -210,9 +211,9 @@ const LAUNCH_POLL_STALL: f64 = 5.0;
 /// The host lists nothing for the title: the launch did not resolve
 /// (no recipe, launcher missing). The host logs it and streams on; so do we.
 const LAUNCH_NO_LEASE: f64 = 15.0;
-/// A game the host still calls `launching` this long is one the player wants
-/// to see for themselves — a cold Steam boot with shader work runs to minutes,
-/// and the host waits five for it.
+/// A game still `launching`, or `running` without its window, this long is one
+/// the player wants to see for themselves — a cold Steam boot with shader work
+/// runs to minutes, and the host waits five for it.
 const LAUNCH_HOLD_MAX: f64 = 120.0;
 
 /// Host-supplied construction options.
@@ -228,6 +229,10 @@ pub struct ConsoleOptions {
     /// client's `CODEC_PYROWAVE` advertisement: a row that offers what the Hello never
     /// asks for is a setting that silently does nothing.
     pub pyrowave_ok: bool,
+    /// This device decodes AV1 in hardware — the same answer that gates the client's
+    /// `CODEC_AV1` advertisement (`pf_client_core::video::av1_hardware_decodable`). A host
+    /// that learns it only once its GPU exists starts `true` and corrects it.
+    pub av1_ok: bool,
     /// Settings and preset catalog. `None` uses the desktop file store
     /// (`pf_client_core::trust`); every other host must supply one.
     pub store: Option<Arc<dyn SettingsStore>>,
@@ -237,6 +242,16 @@ pub struct ConsoleOptions {
     /// [`DEFAULT_GPU_CACHE_BYTES`]; a memory-tight box may go down to
     /// [`MIN_GPU_CACHE_BYTES`] but never below it.
     pub gpu_cache_bytes: usize,
+    /// This device's own screen, for the Aspect row. `None` where streams go to a window or a
+    /// TV: only a panel of an unusual shape (a phone) changes what the row offers.
+    pub screen: Option<DeviceScreen>,
+}
+
+/// A built-in screen in landscape pixels, whole and clear of its cutout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceScreen {
+    pub full: (u32, u32),
+    pub safe: (u32, u32),
 }
 
 impl ConsoleOptions {
@@ -248,9 +263,13 @@ impl ConsoleOptions {
             // The desktop probe reads the session's Vulkan device, which the console does
             // not own yet. A GPU that runs this shell is a Vulkan 1.3 one, so it is yes.
             pyrowave_ok: true,
+            // AV1 is not that safe an assumption, so the overlay corrects this from the
+            // presenter's device (`SkiaOverlay::init`) before the first frame.
+            av1_ok: true,
             store: None,
             platform: Platform::Desktop,
             gpu_cache_bytes: DEFAULT_GPU_CACHE_BYTES,
+            screen: None,
         }
     }
 }
@@ -283,12 +302,14 @@ pub(crate) struct Shell {
     settings: trust::Settings,
     store: Arc<dyn SettingsStore>,
     pub(crate) platform: Platform,
+    screen: Option<DeviceScreen>,
     hosts: Vec<HostRow>,
     hosts_gen: u64,
     device_name: String,
     deck: bool,
     fallback_ui: bool,
     pyrowave_ok: bool,
+    pub(crate) av1_ok: bool,
     pub(crate) in_stream: bool,
     connecting: Option<Connecting>,
     launching: Option<Launching>,
@@ -344,9 +365,13 @@ pub(crate) struct Shell {
     /// (left, top) inset of the last layout. Pointer coords arrive in surface
     /// pixels; hit boxes were published in this space.
     last_insets: (f32, f32),
+    /// Full surface of the last layout, insets included. A backdrop paints here,
+    /// not in the safe rect, or it seams at the cutout edge.
+    last_full: (f32, f32),
     /// Design-unit scale of the last frame. Touch slop and drag ticks grow with it.
     last_k: f64,
-    gesture: Option<TouchGesture>,
+    /// Finger state. The stream overlay resets it while the ring owns the pointer.
+    pub(crate) touch: Touch,
     pub(crate) gpu_cache_bytes: usize,
     t0: Instant,
     last_frame: Option<Instant>,
@@ -396,12 +421,14 @@ impl Shell {
             settings,
             store,
             platform: opts.platform,
+            screen: opts.screen,
             hosts: Vec::new(),
             hosts_gen: u64::MAX,
             device_name: opts.device_name,
             deck: opts.deck,
             fallback_ui: opts.fallback_ui,
             pyrowave_ok: opts.pyrowave_ok,
+            av1_ok: opts.av1_ok,
             in_stream: false,
             connecting: None,
             launching: None,
@@ -423,8 +450,9 @@ impl Shell {
             pads: Vec::new(),
             hint_rects: Vec::new(),
             last_insets: (0.0, 0.0),
+            last_full: (0.0, 0.0),
             last_k: 1.0,
-            gesture: None,
+            touch: Touch::default(),
             gpu_cache_bytes: opts.gpu_cache_bytes,
             t0: Instant::now(),
             last_frame: None,
@@ -457,135 +485,13 @@ impl Shell {
         };
     }
 
-    /// Host pointer events. Secondary-down is Back; its release is dropped
-    /// or a right-click would pop two screens. Wheel is discrete scroll.
-    ///
-    /// A touch primary down defers the press: lift is a tap (Press at the
-    /// anchor) or a drag (ticks already emitted). A press-on-contact made
-    /// every swipe across a settings list flip a value.
+    /// Host pointer events through the shared touch model ([`Touch`]): a finger acts
+    /// on its lift or scrolls, a mouse acts on press.
     pub(crate) fn pointer_input(&mut self, input: pf_client_core::console::PointerInput) -> bool {
-        use pf_client_core::console::{PointerButton, PointerInput};
-        let (x, y, kind) = match input {
-            PointerInput::Move { x, y } => {
-                if self.gesture.is_some() {
-                    return self.gesture_move(f64::from(x), f64::from(y));
-                }
-                (x, y, PointerKind::Move)
-            }
-            PointerInput::Down {
-                x,
-                y,
-                button: PointerButton::Primary,
-                touch,
-            } => {
-                if touch {
-                    if self.gesture.is_none() {
-                        self.gesture = Some(TouchGesture::Armed {
-                            x: f64::from(x),
-                            y: f64::from(y),
-                        });
-                    }
-                    return true;
-                }
-                (x, y, PointerKind::Press)
-            }
-            PointerInput::Down {
-                x,
-                y,
-                button: PointerButton::Secondary,
-                ..
-            } => (x, y, PointerKind::Back),
-            PointerInput::Up {
-                x,
-                y,
-                button: PointerButton::Primary,
-            } => match self.gesture.take() {
-                Some(TouchGesture::Armed { x, y }) => {
-                    let consumed = self.pointer(Pointer {
-                        x,
-                        y,
-                        kind: PointerKind::Press,
-                    });
-                    self.pointer(Pointer {
-                        x,
-                        y,
-                        kind: PointerKind::Release,
-                    });
-                    return consumed;
-                }
-                // Drag: lift acts on nothing; ticks already fired.
-                Some(TouchGesture::Drag { .. }) => return true,
-                None => (x, y, PointerKind::Release),
-            },
-            PointerInput::Up { .. } => return true,
-            PointerInput::Wheel { x, y, dy } => {
-                if dy == 0.0 {
-                    return true;
-                }
-                (x, y, PointerKind::Scroll { up: dy > 0.0 })
-            }
-            PointerInput::Cancel => {
-                self.gesture = None;
-                (0.0, 0.0, PointerKind::Cancel)
-            }
-        };
-        self.pointer(Pointer {
-            x: f64::from(x),
-            y: f64::from(y),
-            kind,
-        })
-    }
-
-    /// Advance a touch Move. Past slop, lock to the dominant axis; every
-    /// [`DRAG_TICK_DP`]·k of travel is one scroll tick at the anchor.
-    /// Down/right = previous (wheel-up); up/left = next.
-    fn gesture_move(&mut self, x: f64, y: f64) -> bool {
-        let Some(gesture) = self.gesture else {
-            return false;
-        };
-        match gesture {
-            TouchGesture::Armed { x: ax, y: ay } => {
-                let (dx, dy) = (x - ax, y - ay);
-                if dx.hypot(dy) >= TOUCH_SLOP_DP * self.last_k {
-                    let horizontal = dx.abs() > dy.abs();
-                    self.gesture = Some(TouchGesture::Drag {
-                        x: ax,
-                        y: ay,
-                        horizontal,
-                        // Ticks start where slop was left, not at the anchor.
-                        last: if horizontal { x } else { y },
-                    });
-                }
-                true
-            }
-            TouchGesture::Drag {
-                x: ax,
-                y: ay,
-                horizontal,
-                last,
-            } => {
-                let pos = if horizontal { x } else { y };
-                let tick = DRAG_TICK_DP * self.last_k;
-                let steps = ((pos - last) / tick).trunc();
-                if steps != 0.0 {
-                    self.gesture = Some(TouchGesture::Drag {
-                        x: ax,
-                        y: ay,
-                        horizontal,
-                        last: last + steps * tick,
-                    });
-                    let up = steps > 0.0;
-                    for _ in 0..steps.abs() as u32 {
-                        self.pointer(Pointer {
-                            x: ax,
-                            y: ay,
-                            kind: PointerKind::Scroll { up },
-                        });
-                    }
-                }
-                true
-            }
-        }
+        let mut touch = std::mem::take(&mut self.touch);
+        let consumed = touch.feed(input, self.last_k, |p| self.pointer(p));
+        self.touch = touch;
+        consumed
     }
 
     /// Host session edge. `Connecting` is a no-op: the shell already showed
@@ -640,10 +546,12 @@ impl Shell {
             settings: &mut self.settings,
             store: &*self.store,
             platform: self.platform,
+            screen: self.screen,
             pads: &self.pads,
             deck: self.deck,
             fallback_ui: self.fallback_ui,
             pyrowave_ok: self.pyrowave_ok,
+            av1_ok: self.av1_ok,
             device_name: &self.device_name,
             t,
         };
@@ -735,6 +643,8 @@ impl Shell {
             last_poll: t - LAUNCH_POLL_STALL,
             base_gen: reads,
             poll_gen: reads,
+            window_wait: false,
+            failed: None,
         })
     }
 
@@ -757,18 +667,31 @@ impl Shell {
         // Nothing to ask about yet: the lease is the SESSION's, and a title that was
         // already up would otherwise read as "running" and reveal a stream that does
         // not exist.
-        if !l.connected {
+        if !l.connected || l.failed.is_some() {
             return;
         }
         let state = (reads > l.base_gen)
             .then(|| self.library.launch_state(&l.host.id))
             .flatten();
         let elapsed = t - l.since;
-        let done = match state.as_deref() {
-            Some("launching") => elapsed >= LAUNCH_HOLD_MAX,
-            // running, exited, untracked, grace: the host has said all it will.
+        let window_wait = matches!(&state, Some((s, true)) if s == "running");
+        let word = state.as_ref().map(|(s, _)| s.as_str());
+        // A launch that produced no game ends with a sentence, not by sliding away: a bare
+        // desktop reads the same whether the host refused it or the game is merely slow.
+        if let Some(why) = launch_gave_up(&l.title, word, elapsed) {
+            if let Some(l) = &mut self.launching {
+                l.failed = Some(why);
+            }
+            return;
+        }
+        let done = match word {
+            // Both handled above, once they run out of patience.
+            Some("launching") => false,
+            // A Proton prefix or a splash can sit behind a running process for a minute.
+            Some("running") if window_wait => elapsed >= LAUNCH_HOLD_MAX,
+            // window, running, untracked, grace: the host has said all it will.
             Some(_) => true,
-            None => elapsed >= LAUNCH_NO_LEASE,
+            None => false,
         };
         if done {
             self.reveal_stream();
@@ -786,6 +709,9 @@ impl Shell {
                 l.poll_gen = reads;
             }
             self.bus.send(poll);
+        }
+        if let Some(l) = &mut self.launching {
+            l.window_wait = window_wait;
         }
     }
 
@@ -1154,10 +1080,12 @@ impl Shell {
                 settings: &mut self.settings,
                 store: &*self.store,
                 platform: self.platform,
+                screen: self.screen,
                 pads: &self.pads,
                 deck: self.deck,
                 fallback_ui: self.fallback_ui,
                 pyrowave_ok: self.pyrowave_ok,
+                av1_ok: self.av1_ok,
                 device_name: &self.device_name,
                 t: self.t0.elapsed().as_secs_f64(),
             };
@@ -1244,10 +1172,12 @@ impl Shell {
                 settings: &mut self.settings,
                 store: &*self.store,
                 platform: self.platform,
+                screen: self.screen,
                 pads: &self.pads,
                 deck: self.deck,
                 fallback_ui: self.fallback_ui,
                 pyrowave_ok: self.pyrowave_ok,
+                av1_ok: self.av1_ok,
                 device_name: &self.device_name,
                 t: self.t0.elapsed().as_secs_f64(),
             };
@@ -1278,10 +1208,12 @@ impl Shell {
                 settings: &mut self.settings,
                 store: &*self.store,
                 platform: self.platform,
+                screen: self.screen,
                 pads: &self.pads,
                 deck: self.deck,
                 fallback_ui: self.fallback_ui,
                 pyrowave_ok: self.pyrowave_ok,
+                av1_ok: self.av1_ok,
                 device_name: &self.device_name,
                 t: self.t0.elapsed().as_secs_f64(),
             };
@@ -1320,9 +1252,7 @@ impl Shell {
         }
     }
 
-    /// Push a command with no screen (in-stream ring host actions). The Vulkan overlay's
-    /// only; every GL host draws the ring as the settings editor.
-    #[cfg_attr(not(feature = "vulkan-overlay"), allow(dead_code))]
+    /// Push a command with no screen: in-stream ring host actions, a re-rooted shelf's fetch.
     pub(crate) fn send_cmd(&self, cmd: ConsoleCmd) {
         self.bus.send(cmd);
     }

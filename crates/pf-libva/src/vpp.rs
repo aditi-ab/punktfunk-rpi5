@@ -1,10 +1,9 @@
 //! The VideoProc context: ingest colour conversion into the encoder's input surface.
 //!
-//! One context per session, sized to the encoder's visible picture. Every capture
-//! shape — a packed-RGB dmabuf, CPU RGB on a staging surface, a producer's own NV12 —
-//! goes through it, so the encoder sees one kind of input; the copy an NV12 source
-//! pays is the price of one path. A larger source — a mirrored head — is scaled down
-//! on the same pass.
+//! One context per session, sized to the encoder's visible picture. A packed-RGB
+//! dmabuf and CPU RGB on a staging surface go through it; a producer's own NV12/P010
+//! at the session's size is encoded as imported instead (`Encoder::submit_dmabuf`).
+//! A larger source — a mirrored head — is scaled down on the same pass.
 
 use std::os::raw::c_int;
 
@@ -88,7 +87,7 @@ impl Vpp {
         source: VaSurfaceId,
         source_size: (u32, u32),
         source_is_rgb: bool,
-        ten_bit: bool,
+        colour: [u8; 3],
         target: VaSurfaceId,
     ) -> Result<()> {
         let [x, y, width, height] = self.crop.unwrap_or([0, 0, source_size.0, source_size.1]);
@@ -104,7 +103,7 @@ impl Vpp {
             width: self.width as u16,
             height: self.height as u16,
         };
-        let mut params = VaProcPipelineParameterBuffer::convert(source, source_is_rgb, ten_bit);
+        let mut params = VaProcPipelineParameterBuffer::convert(source, source_is_rgb, colour);
         params.surface_region = &source_region;
         params.output_region = &output_region;
         if (width, height) != (self.width, self.height) {

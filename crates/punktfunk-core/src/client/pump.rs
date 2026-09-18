@@ -80,8 +80,11 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         rtt_us,
         decode_lat,
         live_bitrate,
+        rate_cut,
+        recent_rfis,
         audio_mute,
         pad_slots,
+        launch_outcome,
         access_grants,
         access_deadline_unix,
         access_tx,
@@ -229,6 +232,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             bitrate_ack: bitrate_ack.clone(),
             live_bitrate,
             recovery_kf: recovery_kf.clone(),
+            recent_rfis,
             pipeline_gap: pipeline_gap.clone(),
             clock_offset: clock_offset.clone(),
             clock_gen: clock_gen.clone(),
@@ -237,6 +241,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             mode_gen: mode_gen.clone(),
             audio_mute,
             pad_slots,
+            launch_outcome,
             access_grants,
             access_deadline_unix,
             access_tx,
@@ -316,6 +321,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         stream_cap_kbps,
         refresh_hz,
         mode_slot: mode_slot_pump,
+        rate_cut,
     };
     let _ = tokio::task::spawn_blocking(move || pump.run()).await;
 

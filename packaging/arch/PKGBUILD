@@ -53,7 +53,8 @@ makedepends=('rust' 'cargo' 'clang' 'cmake' 'nasm' 'pkgconf' 'git'
              'gtk4' 'libadwaita' 'sdl3' 'pipewire' 'wayland' 'libxkbcommon' 'opus' 'libei')
 
 # Opt-in punktfunk-web / punktfunk-scripting: only then is bun (the build tool AND the vendored
-# runtime) required. Adding bun twice is harmless (makepkg dedups makedepends).
+# runtime) required. Adding bun twice is harmless (makepkg dedups makedepends). Either one also
+# builds punktfunk-bun, the one runtime both run on.
 if [ "${PF_WITH_WEB:-0}" = 1 ]; then
   pkgname+=('punktfunk-web')
   makedepends+=('bun')   # `bun-bin` from the AUR if bun isn't in your configured repos
@@ -61,6 +62,9 @@ fi
 if [ "${PF_WITH_SCRIPTING:-0}" = 1 ]; then
   pkgname+=('punktfunk-scripting')
   makedepends+=('bun')
+fi
+if [ "${PF_WITH_WEB:-0}" = 1 ] || [ "${PF_WITH_SCRIPTING:-0}" = 1 ]; then
+  pkgname+=('punktfunk-bun')
 fi
 
 # AUR source (a tagged release). For an in-tree CI build, set PF_SRCDIR to the repo root —
@@ -414,20 +418,18 @@ package_punktfunk-icons() {
 
 package_punktfunk-web() {
   pkgdesc="punktfunk management web console (Nitro SSR on bun, HTTPS/HTTP-1.1 over TLS) — pairing + status in the browser"
-  # bun is the runtime (Bun.serve), and it's a native binary we vendor, so this package is
-  # arch-specific (not 'any'). Auto-wired to the host's mgmt token + identity cert via the systemd
-  # --user units; enable with `systemctl --user enable --now punktfunk-web`. No nodejs/bun dependency.
+  # Runs on punktfunk-bun's private bun (Bun.serve), pinned to this exact build. Auto-wired to the
+  # host's mgmt token + identity cert via the systemd --user units; enable with
+  # `systemctl --user enable --now punktfunk-web`. No nodejs or system bun dependency.
+  depends=("punktfunk-bun=${pkgver}-${pkgrel}")
   local R; R="$(_repo)"
 
   # Pre-built bun-preset bundle (from build()) + a PATH-stable launcher (matches the .deb/.rpm).
   install -d "$pkgdir/usr/share/punktfunk-web/.output"
   cp -r "$R/web/.output/server" "$pkgdir/usr/share/punktfunk-web/.output/server"
   cp -r "$R/web/.output/public" "$pkgdir/usr/share/punktfunk-web/.output/public"
-  # Vendor the build env's bun into a private dir so it never collides with a
-  # system-wide bun on PATH.
-  install -Dm0755 "$(command -v bun)" "$pkgdir/usr/lib/punktfunk-web/bun"
   install -d "$pkgdir/usr/bin"
-  printf '%s\n' '#!/bin/sh' 'exec /usr/lib/punktfunk-web/bun /usr/share/punktfunk-web/.output/server/index.mjs "$@"' \
+  printf '%s\n' '#!/bin/sh' 'exec /usr/lib/punktfunk-bun/bun /usr/share/punktfunk-web/.output/server/index.mjs "$@"' \
     > "$pkgdir/usr/bin/punktfunk-web-server"
   chmod 0755 "$pkgdir/usr/bin/punktfunk-web-server"
   # systemd USER units: the console runs per-user; web-init generates the login password on first start.
@@ -441,17 +443,15 @@ package_punktfunk-web() {
 
 package_punktfunk-scripting() {
   pkgdesc="punktfunk plugin/script runner (Effect SDK on bun) — supervises host automation scripts + punktfunk-plugin-* packages"
-  # bun is the runtime (it import()s the operator's .ts plugins), a vendored native binary, so this
-  # package is arch-specific (not 'any'). OPT-IN: the systemd --user unit ships disabled (the runner
-  # is inert until you add scripts/plugins). No nodejs/bun dependency.
+  # bubblewrap builds each plugin's sandbox; the runner starts no plugin without it. The runtime is
+  # punktfunk-bun's private bun (it import()s the operator's .ts plugins), pinned to this build.
+  depends=('bubblewrap' "punktfunk-bun=${pkgver}-${pkgrel}")
   local R; R="$(_repo)"
 
   # Pre-built self-contained bundle (from build()) + a PATH-stable launcher (matches the .deb/.rpm).
   install -Dm0644 "$srcdir/runner-cli.js" "$pkgdir/usr/share/punktfunk-scripting/runner-cli.js"
-  # Vendor the build env's bun into a private dir so it never collides with a system-wide bun.
-  install -Dm0755 "$(command -v bun)" "$pkgdir/usr/lib/punktfunk-scripting/bun"
   install -d "$pkgdir/usr/bin"
-  printf '%s\n' '#!/bin/sh' 'exec /usr/lib/punktfunk-scripting/bun /usr/share/punktfunk-scripting/runner-cli.js "$@"' \
+  printf '%s\n' '#!/bin/sh' 'exec /usr/lib/punktfunk-bun/bun /usr/share/punktfunk-scripting/runner-cli.js "$@"' \
     > "$pkgdir/usr/bin/punktfunk-scripting"
   chmod 0755 "$pkgdir/usr/bin/punktfunk-scripting"
   # systemd USER unit — installed but NOT auto-enabled (opt-in). Enable once you have automation:
@@ -459,4 +459,12 @@ package_punktfunk-scripting() {
   install -Dm0644 "$R/scripts/punktfunk-scripting.service" "$pkgdir/usr/lib/systemd/user/punktfunk-scripting.service"
   install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-scripting/LICENSE-MIT"
   install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-scripting/LICENSE-APACHE"
+}
+
+# The build env's bun, vendored once for web and scripting. A private dir, never on PATH, so it
+# never collides with a system-wide bun. A native binary, so the package is arch-specific.
+package_punktfunk-bun() {
+  pkgdesc="Bun runtime for punktfunk-web and punktfunk-scripting (private, not on PATH)"
+  depends=()
+  install -Dm0755 "$(command -v bun)" "$pkgdir/usr/lib/punktfunk-bun/bun"
 }

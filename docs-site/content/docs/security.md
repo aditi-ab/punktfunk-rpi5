@@ -91,19 +91,19 @@ pinned. The layers, from the outside in:
   paired clients over the LAN (authenticated by their certificate), but every state-changing action —
   arming pairing, removing devices, session control — is honored **only from the host machine
   itself**.
-- **The web console is your LAN-facing admin surface.** It serves on `https://<host-ip>:47992` so you
-  can administer the host from another machine, and it performs those local-only actions on your
-  behalf, over loopback, once you've logged in. So treat anyone who can reach port 47992 as a
-  candidate administrator, and restrict that port at the host firewall if your LAN is shared.
+- **The web console is the admin surface, and it stays on your network.** It answers peers on the
+  local network or a VPN (private and link-local addresses, Tailscale's `100.64.0.0/10`) and
+  refuses the internet, because it performs those local-only actions on your behalf once you have
+  logged in. Treat anyone who can reach port 47992 as a candidate administrator. To keep it to the
+  host machine, set `PUNKTFUNK_UI_BIND=127.0.0.1` in `host.env`; the installers ask.
 - **The web console has its own password**, on every platform — which makes it the real remote-admin
-  credential. Linux packages generate a random one on first start into
-  `~/.config/punktfunk/web-password`; the SteamOS installer writes it to
-  `~/.config/punktfunk/web.env` and points you at that file when it finishes; on Windows the wizard
-  lets you choose it (a strong random default is pre-filled) while a silent install generates one,
-  and either way it is stored readable only by Administrators and SYSTEM. On the first sign-in the
-  console replaces the clear line with a salted argon2id hash, so the file stops being a copy of
-  your password. Pick a strong one and keep it out of shared documents; repeated wrong guesses are
-  rate-limited per IP. To reset it, see [Forgot your Password?](/docs/forgot-password).
+  credential. Linux packages and the SteamOS installer generate a random one into
+  `~/.config/punktfunk/web-password`; on Windows the wizard lets you choose it (a strong random
+  default is pre-filled) while a silent install generates one, stored readable only by
+  Administrators and SYSTEM. After the first sign-in the console keeps only an argon2id hash, and
+  the console process never holds the password or the management token in its environment. Pick a
+  strong one; repeated wrong guesses are rate-limited per IP. To change or reset it, see
+  [Forgot your Password?](/docs/forgot-password).
 - **The [shared clipboard](/docs/clipboard) is opt-in at both ends.** The host never advertises it
   until an operator adds a line to `host.env`, and on your side it is a switch per *saved host*
   rather than a global one — because letting a machine read and write what you copy is a decision
@@ -147,13 +147,16 @@ upgrade switches them to native-only until you set the knob.)
 The host doesn't hide it: whenever the compat planes come up, it logs a warning at startup naming
 exactly this risk.
 
-**To turn it off**, if you don't use Moonlight clients:
+**To turn it off**, if a box already has it on (you set the knob, or an install from before the
+opt-in change never dropped it):
 
-- **Linux** — override the unit's `ExecStart` with a drop-in, so a package upgrade doesn't undo it:
-  see [What the unit starts](/docs/running-as-a-service#what-the-unit-starts).
+- **Linux** — delete `PUNKTFUNK_GAMESTREAM=1` from `host.env` and drop any `ExecStart` drop-in that
+  still passes `--gamestream`, then `systemctl --user restart punktfunk-host`. See [What the unit
+  starts](/docs/running-as-a-service#what-the-unit-starts).
 - **Windows** — from an elevated prompt, `punktfunk-host service install --gamestream=off`, then
   `punktfunk-host service restart`.
-- **SteamOS** — re-run the Deck installer with `--no-gamestream`.
+- **SteamOS** — re-run the Deck installer without `--gamestream`, and delete `PUNKTFUNK_GAMESTREAM=1`
+  from `host.env` if you set it.
 - **NixOS** — set `services.punktfunk.host.gamestream = false;` (this also drops the GameStream
   firewall ports).
 
@@ -191,8 +194,8 @@ We mitigate this deliberately:
 - **Sealed internal channels.** The desktop-frame ring and the gamepad input/output channels are
   passed between the host and its drivers as duplicated handles to unnamed objects, so another local
   service can't open them by name to read your screen or forge controller input.
-- **Secrets are locked down.** The management token, the host identity key, and the console
-  password hash are stored with Administrators/SYSTEM-only permissions.
+- **Secrets are locked down.** The management token, the host identity key, and the console password
+  are stored with Administrators/SYSTEM-only permissions.
 
 **The honest floor still applies.** None of this defends against an attacker who is *already* an
 administrator or SYSTEM on the box — at that level they own the machine regardless of Punktfunk. And a
@@ -237,17 +240,26 @@ machine. Punktfunk narrows it as far as it can:
 - **Adding a catalog source is a one-time trust decision** — every plugin in that catalog becomes
   installable on this host. You can paste the source's `ed25519:` public key when you add it, and
   the host will then refuse any index from it that isn't correctly signed.
-- **The runner is not the host.** Plugins run in a separate scripting runner process holding a
-  capability-limited `plugin-token`, not the full-admin `mgmt-token` — so a plugin can't register
-  hooks or admit new devices. On Windows the runner's scheduled task runs as
-  `NT AUTHORITY\LocalService`, **not** SYSTEM, and is granted read on exactly two files (that token
-  and the TLS pin). On Linux it runs as your desktop user, so the systemd unit draws the same line
-  a different way: the runner starts with an empty home, and the only things mounted back into it
-  are that same token, that same pin, and the directories plugins actually work in — their own
-  packages, their own saved state, your scripts, and the game libraries a scanner reads. The
-  host's `mgmt-token` and its identity key are not among them. A plugin that needs to reach
-  somewhere else needs you to grant it, with
-  `systemctl --user edit punktfunk-scripting`.
+- **A plugin does not choose what runs.** Its package declares which programs the host may start
+  for it, and with what shape of arguments; a library entry only fills in values, which the host
+  checks and turns into one argument each. Paths outside what that package declares — or what you
+  granted it with `plugins grant` — are refused. So a plugin publishing a tile cannot publish a
+  command.
+- **Each plugin runs in its own sandbox.** On Linux every plugin is a separate process in its own
+  [bubblewrap](https://github.com/containers/bubblewrap) sandbox: an empty home, no network unless
+  its manifest asked for one, and read access to exactly the paths it declared plus the ones you
+  granted it. Your `~/.ssh`, your browser profile and the host's own credentials are not in it. Nor
+  is the host's process — the sandbox has its own PID namespace, which is what makes this a
+  boundary rather than a curtain: a plugin cannot reach the host through `/proc`, read its
+  environment, or signal it. A box that cannot build a sandbox runs **no** plugins and says so on
+  the Troubleshooting page.
+- **Each plugin has its own token.** A plugin can register itself and reconcile its own library
+  entries; using another plugin's id is refused. None of them is the full-admin `mgmt-token`, so no
+  plugin can register hooks or admit devices.
+- **On Windows the runner is a different account.** Its scheduled task runs as
+  `NT AUTHORITY\LocalService`, **not** SYSTEM, granted read on exactly the token files and the TLS
+  pin. Plugins there share that account, so a malicious one can still interfere with another
+  plugin's files while both run — the per-plugin sandbox is Linux-only for now.
 
 Install plugins only from sources you trust, and prefer Verified catalog entries. See
 [Plugins](/docs/plugins) for the install flow and the CLI.

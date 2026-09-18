@@ -136,29 +136,22 @@ export const resolveConfig = async (
 		publishedMgmtUrl() ??
 		"https://127.0.0.1:47990"
 	).replace(/\/+$/, "");
+	// Never falls back to the admin `mgmt-token` file. On Linux the runner shares the operator's
+	// uid, so reading it is one line away — and a zero-config `connect()` that silently picked it
+	// up handed every plugin full admin on any host whose plugin token was missing.
 	const token =
 		options?.token ??
 		process.env.PUNKTFUNK_MGMT_TOKEN ??
 		process.env.PUNKTFUNK_PLUGIN_TOKEN ??
-		parseTokenFile(readIfExists(path.join(configDir(), "plugin-token")) ?? "") ??
-		parseTokenFile(readIfExists(path.join(configDir(), "mgmt-token")) ?? "");
+		parseTokenFile(readIfExists(path.join(configDir(), "plugin-token")) ?? "");
 	if (!token) {
 		throw new Error(
-			"no management token: set PUNKTFUNK_PLUGIN_TOKEN (or PUNKTFUNK_MGMT_TOKEN), pass " +
-				"{ token }, or run where the host's token files exist " +
-				`(${path.join(configDir(), "plugin-token")})`,
+			"no plugin token: the host writes one to " +
+				`${path.join(configDir(), "plugin-token")} once the runner is installed. Pass ` +
+				"{ token }, or set PUNKTFUNK_MGMT_TOKEN for a script that needs the admin API.",
 		);
 	}
-	const caPath = process.env.PUNKTFUNK_MGMT_CA;
-	const ca =
-		options?.ca ??
-		(caPath ? readIfExists(caPath) : undefined) ??
-		(url.startsWith("https://")
-			? // The mgmt API presents the NATIVE identity when one exists (the host's identity
-				// split); `cert.pem` is the legacy identity, still served on hosts that predate it.
-				(readIfExists(path.join(configDir(), "native-cert.pem")) ??
-				readIfExists(path.join(configDir(), "cert.pem")))
-			: undefined);
+	const ca = resolveCa(url, options);
 	return {
 		url,
 		token,
@@ -167,6 +160,25 @@ export const resolveConfig = async (
 		fetch: await makeFetch(ca),
 	};
 };
+
+/** The certificate to pin for `url`: explicit, then `PUNKTFUNK_MGMT_CA`, then the host's own. */
+const resolveCa = (url: string, options?: ConnectOptions): string | undefined => {
+	const caPath = process.env.PUNKTFUNK_MGMT_CA;
+	return (
+		options?.ca ??
+		(caPath ? readIfExists(caPath) : undefined) ??
+		(url.startsWith("https://")
+			? // The mgmt API presents the NATIVE identity when one exists (the host's identity
+				// split); `cert.pem` is the legacy identity, still served on hosts that predate it.
+				(readIfExists(path.join(configDir(), "native-cert.pem")) ??
+				readIfExists(path.join(configDir(), "cert.pem")))
+			: undefined)
+	);
+};
+
+/** The pinned fetch for `url`, for a caller that forwards requests and holds no token of its own. */
+export const hostFetch = (url: string, options?: ConnectOptions): Promise<typeof fetch> =>
+	makeFetch(resolveCa(url, options));
 
 /**
  * A fetch that PINS `ca` — the host's self-signed identity cert — on this runtime.
@@ -178,6 +190,13 @@ export const resolveConfig = async (
  * already admits only the one pinned cert.
  */
 const makeFetch = async (ca: string | undefined): Promise<typeof fetch> => {
+	// Inside a sandbox there is no route to the host's port: the supervisor listens on this
+	// socket and forwards over its own pinned connection, so there is nothing to pin in here.
+	const unix = process.env.PUNKTFUNK_MGMT_UNIX?.trim();
+	if (unix) {
+		return ((input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+			fetch(input, { ...init, unix } as RequestInit)) as typeof fetch;
+	}
 	if (!ca) return fetch;
 	const skipHostname = { checkServerIdentity: () => undefined };
 	// Bun: fetch takes node-compatible `tls` options.

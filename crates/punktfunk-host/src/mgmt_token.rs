@@ -1,9 +1,12 @@
 //! Management-API bearer token resolution.
 //!
-//! HTTPS always, auth always (including loopback). Precedence: env (operator
-//! override, not persisted) → `<config-dir>` file → generate 32-byte hex and
-//! persist. Files are `KEY=<hex>` at 0600 so the console can source them as a
-//! systemd `EnvironmentFile`.
+//! HTTPS always, auth always (including loopback). Precedence: env (an operator
+//! override, persisted so every reader agrees) → `<config-dir>` file → generate
+//! 32-byte hex and persist. Files are `KEY=<hex>` at 0600.
+//!
+//! [`take_env_credentials`] empties those variables out of this process before
+//! anything can inherit them: hooks, games and the plugin runner are our
+//! children, and none of them has business with the admin API.
 //!
 //! Two tokens:
 //! - **`mgmt-token`** (`PUNKTFUNK_MGMT_TOKEN`) — full admin.
@@ -13,18 +16,83 @@
 
 use anyhow::{Context, Result};
 use rand::RngCore;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
+
+/// What the environment carried at startup, for [`load_or_generate_impl`] to persist.
+static ENV_TOKENS: OnceLock<[Option<String>; 2]> = OnceLock::new();
+
+/// The variables `main` takes out of the environment before anything can inherit them. The
+/// console password is here because no child of ours may see it either.
+pub const CREDENTIAL_ENV_VARS: [&str; 3] = [ENV_VAR, PLUGIN_ENV_VAR, "PUNKTFUNK_UI_PASSWORD"];
+
+/// Remember what the environment carried, once, before `main` empties it.
+///
+/// The values are not lost by that removal — every reader goes through [`load_or_generate`],
+/// which persists an operator's pinned token to the file the other readers use.
+pub fn adopt_env_tokens(mgmt: Option<String>, plugin: Option<String>) {
+    let _ = ENV_TOKENS.set([mgmt, plugin]);
+}
+
+fn env_token(env_var: &str) -> Option<String> {
+    let tokens = ENV_TOKENS.get()?;
+    let slot = if env_var == PLUGIN_ENV_VAR { 1 } else { 0 };
+    tokens[slot].clone()
+}
 
 const ENV_VAR: &str = "PUNKTFUNK_MGMT_TOKEN";
 const FILE: &str = "mgmt-token";
 const PLUGIN_ENV_VAR: &str = "PUNKTFUNK_PLUGIN_TOKEN";
 const PLUGIN_FILE: &str = "plugin-token";
+/// `{ "<plugin id>": "<token>" }` — see [`load_or_generate_per_plugin`].
+const PER_PLUGIN_FILE: &str = "plugin-tokens.json";
 
 /// Admin token: env > file > generate+persist. Hex so `KEY=VALUE` is safe
 /// to source from a shell or systemd `EnvironmentFile`.
 pub fn load_or_generate() -> Result<String> {
     load_or_generate_impl(ENV_VAR, FILE)
+}
+
+/// One token per installed plugin, by plugin id, in `plugin-tokens.json`.
+///
+/// The shared [`load_or_generate_plugin`] token authenticates the RUNNER; these authenticate a
+/// PLUGIN, which is what lets the management API refuse a plugin writing another's registration.
+/// Ids that disappear (an uninstall) lose their token on the next `serve`.
+pub fn load_or_generate_per_plugin(ids: &[String]) -> Result<BTreeMap<String, String>> {
+    let dir = pf_paths::config_dir();
+    let path = dir.join(PER_PLUGIN_FILE);
+    let planted = crate::planted::quarantine_planted_secret(&path);
+    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let mut tokens: BTreeMap<String, String> = if planted {
+        BTreeMap::new()
+    } else {
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    };
+    let before = tokens.clone();
+    tokens.retain(|id, _| ids.contains(id));
+    for id in ids {
+        tokens.entry(id.clone()).or_insert_with(|| {
+            let mut buf = [0u8; 32];
+            rand::rng().fill_bytes(&mut buf);
+            hex::encode(buf)
+        });
+    }
+    if tokens != before {
+        let body = serde_json::to_string_pretty(&tokens)?;
+        pf_paths::write_secret_file(&path, body.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+        tracing::info!(
+            path = %path.display(),
+            plugins = tokens.len(),
+            "minted per-plugin API tokens (owner-only)"
+        );
+    }
+    Ok(tokens)
 }
 
 /// Plugin-lane token, same precedence as [`load_or_generate`].
@@ -46,14 +114,18 @@ pub(crate) fn read_persisted(dir: &Path) -> Option<String> {
 }
 
 fn load_or_generate_impl(env_var: &str, file: &str) -> Result<String> {
-    if let Ok(v) = std::env::var(env_var) {
-        let v = v.trim();
-        if !v.is_empty() {
-            return Ok(v.to_string());
-        }
-    }
     let dir = pf_paths::config_dir();
     let path = dir.join(file);
+    // An operator override is PERSISTED rather than kept in memory: the console, `ctl`, the tray
+    // and the plugin runner all read the file, and a token only this process knew locked them out.
+    if let Some(pinned) = env_token(env_var) {
+        if parse_token(&fs::read_to_string(&path).unwrap_or_default(), env_var).as_deref()
+            != Some(pinned.as_str())
+        {
+            write_token(&path, env_var, &pinned)?;
+        }
+        return Ok(pinned);
+    }
     // Locking the dir does not disown a file already in it. Read the owner first: a token a
     // local user planted before the first elevated run is theirs, and adopting it would hand
     // them host admin. `create_private_dir` re-owns contents, so this must come before it.

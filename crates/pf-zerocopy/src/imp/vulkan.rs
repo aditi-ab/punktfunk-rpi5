@@ -71,6 +71,8 @@ struct Csc {
 /// RGB→NV12 SPIR-V. Rebuild: `glslangValidator -V rgb2nv12_buf.comp -o rgb2nv12_buf.spv`. CI gates drift.
 const CSC_SPV: &[u8] = include_bytes!("rgb2nv12_buf.spv");
 
+mod convert;
+
 pub struct VkBridge {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -85,6 +87,14 @@ pub struct VkBridge {
     dst: Option<DstBuf>,
     /// Built on first [`import_linear_nv12`](Self::import_linear_nv12).
     csc: Option<Csc>,
+    /// The queue family the command buffer runs on; the convert acquire names it.
+    qf: u32,
+    /// `VK_EXT_image_drm_format_modifier` + `VK_KHR_image_format_list` are on: dmabufs of any
+    /// modifier import as sampled images (`convert.rs`). Off → the copy/CSC lanes only.
+    modifier_import: bool,
+    /// Timeline semaphores export as OPAQUE_FD: the fused convert's hand-off to CUDA.
+    timeline_export: bool,
+    conv: Option<convert::ConvertState>,
 }
 
 // SAFETY: owns unsynchronized Vulkan handles, a CUDA mapping, and an fd→buffer cache. A single
@@ -175,6 +185,24 @@ impl VkBridge {
                 ash::khr::external_memory_fd::NAME.as_ptr(),
                 ash::ext::external_memory_dma_buf::NAME.as_ptr(),
             ];
+            let dev_exts = instance
+                .enumerate_device_extension_properties(phys)
+                .unwrap_or_default();
+            let has = |name: &std::ffi::CStr| {
+                dev_exts
+                    .iter()
+                    .any(|p| p.extension_name_as_c_str() == Ok(name))
+            };
+            let modifier_import = has(ash::ext::image_drm_format_modifier::NAME)
+                && has(ash::khr::image_format_list::NAME);
+            let timeline_export = has(ash::khr::timeline_semaphore::NAME)
+                && has(ash::khr::external_semaphore_fd::NAME)
+                && {
+                    let mut tl = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+                    let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut tl);
+                    instance.get_physical_device_features2(phys, &mut f2);
+                    tl.timeline_semaphore == vk::TRUE
+                };
             let mut try_priority = gp_ext.map(|(_, want)| want);
             let device = loop {
                 let prio = [1.0f32];
@@ -184,18 +212,28 @@ impl VkBridge {
                     .queue_family_index(qf)
                     .queue_priorities(&prio);
                 let mut exts: Vec<*const std::ffi::c_char> = base_exts.to_vec();
+                if modifier_import {
+                    exts.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
+                    exts.push(ash::khr::image_format_list::NAME.as_ptr());
+                }
+                if timeline_export {
+                    exts.push(ash::khr::timeline_semaphore::NAME.as_ptr());
+                    exts.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
+                }
+                let mut tl_enable =
+                    vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
                 if try_priority.is_some() {
                     qci0 = qci0.push_next(&mut gp_info);
                     exts.push(gp_ext.expect("try_priority implies gp_ext").0.as_ptr());
                 }
                 let qci = [qci0];
-                match instance.create_device(
-                    phys,
-                    &vk::DeviceCreateInfo::default()
-                        .queue_create_infos(&qci)
-                        .enabled_extension_names(&exts),
-                    None,
-                ) {
+                let mut dci = vk::DeviceCreateInfo::default()
+                    .queue_create_infos(&qci)
+                    .enabled_extension_names(&exts);
+                if timeline_export {
+                    dci = dci.push_next(&mut tl_enable);
+                }
+                match instance.create_device(phys, &dci, None) {
                     Ok(d) => {
                         if let Some(p) = try_priority {
                             tracing::info!(
@@ -245,6 +283,10 @@ impl VkBridge {
                 src_cache: HashMap::new(),
                 dst: None,
                 csc: None,
+                qf,
+                modifier_import,
+                timeline_export,
+                conv: None,
             };
             me.cmd_pool = me
                 .device
@@ -847,6 +889,9 @@ impl Drop for VkBridge {
             if let Some(d) = self.dst.take() {
                 self.device.destroy_buffer(d.buffer, None);
                 self.device.free_memory(d.memory, None);
+            }
+            if let Some(mut c) = self.conv.take() {
+                c.destroy(&self.device, self.cmd_pool);
             }
             if let Some(c) = self.csc.take() {
                 self.device.destroy_pipeline(c.pipeline, None);

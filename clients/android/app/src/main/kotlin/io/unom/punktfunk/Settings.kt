@@ -5,6 +5,8 @@ import android.hardware.display.DisplayManager
 import android.os.Build
 import android.util.Log
 import android.view.Display
+import android.view.WindowInsets
+import android.view.WindowManager
 
 /**
  * User-tunable stream settings, persisted in `SharedPreferences`. A `0` resolution/refresh means
@@ -16,19 +18,6 @@ data class Settings(
     val width: Int = 0,
     val height: Int = 0,
     val hz: Int = 0,
-    /**
-     * Fold the rounded corners into the [SAFE_AREA_MODE] inset. Off: a corner of radius `r` clips a
-     * quarter-circle out of each end of the top and bottom rows, and clearing it costs `r` on every
-     * row. On is for a HUD that lives in a corner.
-     */
-    val safeAreaClearCorners: Boolean = false,
-    /**
-     * Replace the probed left/right inset of [SAFE_AREA_MODE] with this many pixels;
-     * [SafeArea.AUTO_INSET] (the default) keeps what the display reports. The escape hatch for a
-     * phone whose [DisplayCutout] does not describe what the glass actually covers.
-     */
-    val safeAreaLeftPx: Int = SafeArea.AUTO_INSET,
-    val safeAreaRightPx: Int = SafeArea.AUTO_INSET,
     val bitrateKbps: Int = 0,
     /**
      * Render-resolution multiplier: the client asks the host to render/encode at `chosen mode ×
@@ -455,115 +444,63 @@ const val SAFE_AREA_MODE = -2
  *    why the fixed presets have always "just worked", at 20 % of the width.
  *  * The NATIVE mode has the panel's own aspect, so it fills every pixel, housing included.
  *
- * Asking the host for a mode narrower by the unsafe insets is the fix, and the picture then sits at
- * [offsetX] rather than centred: a hole on one side must not be paid for on both. Pointer mapping
- * follows for free — the input lanes derive the picture rect from the live placement.
+ * Asking the host for a mode narrower by the unsafe insets is the fix, and the stream screen places
+ * the picture between the window's live cutout insets rather than centred: a hole on one side must
+ * not be paid for on both. Pointer mapping follows for free — the input lanes derive the picture
+ * rect from the live placement.
  */
 object SafeArea {
     /** The host rejects odd dimensions and anything under 320 px wide (`validate_dimensions`). */
     const val MIN_WIDTH = 320
 
-    /** A stored per-side override meaning "whatever the display reports" — the default. */
-    const val AUTO_INSET = -1
+    /**
+     * The width a landscape stream loses to the housing, from cutout insets read in either rotation.
+     * Portrait's top and bottom become landscape's two sides, so the sum does not depend on when the
+     * probe ran. The larger pair wins, which also covers a probe that raced a rotation.
+     */
+    fun landscapeInset(left: Int, top: Int, right: Int, bottom: Int): Int = maxOf(
+        left.coerceAtLeast(0) + right.coerceAtLeast(0),
+        top.coerceAtLeast(0) + bottom.coerceAtLeast(0),
+    )
 
     /**
-     * [nativeWidth] less [left] and [right], even-floored and clamped to the host's floor. A hole
-     * on one side costs the picture that side only: charging both spends 127 px of a OnePlus 9 Pro
-     * on an edge nothing covers. Height is untouched — under aspect-fit only the horizontal axis
-     * binds on a landscape phone, so insetting it would shrink the picture uncovering nothing.
+     * [nativeWidth] less [inset], even-floored and clamped to the host's floor. Height is untouched —
+     * under aspect-fit only the horizontal axis binds on a landscape phone, so insetting it would
+     * shrink the picture uncovering nothing.
      */
-    fun insetWidth(nativeWidth: Int, left: Int, right: Int): Int =
-        (nativeWidth - left.coerceAtLeast(0) - right.coerceAtLeast(0))
-            .coerceAtLeast(MIN_WIDTH) / 2 * 2
-
-    /**
-     * Where that picture starts, so it sits under neither edge: the left inset, pulled back when
-     * the floor above made the picture wider than the room between the two.
-     */
-    fun offsetX(nativeWidth: Int, left: Int, right: Int): Int =
-        left.coerceAtLeast(0)
-            .coerceAtMost((nativeWidth - insetWidth(nativeWidth, left, right)).coerceAtLeast(0))
-
-    /**
-     * The two sides to clear, from what the display reported and what [s] says about it: the
-     * corner radius joins only on the opt-in, and a typed override replaces its own side outright.
-     */
-    fun resolve(cutLeft: Int, cutRight: Int, corner: Int, s: Settings): SafeInsets {
-        var left = cutLeft
-        var right = cutRight
-        if (s.safeAreaClearCorners) {
-            left = maxOf(left, corner)
-            right = maxOf(right, corner)
-        }
-        if (s.safeAreaLeftPx >= 0) left = s.safeAreaLeftPx
-        if (s.safeAreaRightPx >= 0) right = s.safeAreaRightPx
-        return SafeInsets(left, right, corner)
-    }
+    fun insetWidth(nativeWidth: Int, inset: Int): Int =
+        (nativeWidth - inset.coerceAtLeast(0)).coerceAtLeast(MIN_WIDTH) / 2 * 2
 }
 
 /**
- * What a landscape stream must clear on this display, in the window's own pixels.
+ * The housing a landscape stream must clear on this display, in pixels ([SafeArea.landscapeInset]).
  *
- * [left]/[right] are the cutout's two sides, read separately whenever the rotation in hand is a
- * landscape one and as one symmetric value otherwise — a portrait probe knows how big the housing
- * is but not which side it will land on. [corner] is the largest rounded-corner radius, reported
- * whether or not it is folded in: it is what "Clear rounded corners" would add to each side.
+ * Read from the window manager's inset state, the one the stream window is laid out against, so the
+ * mode and the placement agree. [Display.getCutout] adjusts for the calling context's rotation and
+ * can read wider than the window does. Rounded corners are not charged: clearing a corner of radius
+ * `r` costs `r` on every row to uncover two small arcs.
  */
-data class SafeInsets(val left: Int, val right: Int, val corner: Int)
-
-/**
- * What this display's housing costs a landscape stream, per side, under [s].
- *
- * [DisplayCutout] is rotation-aware: in a landscape rotation the housing sits on `left`/`right` and
- * the two are read as they are. A portrait probe reports the same housing on `top`/`bottom` with
- * both horizontal insets zero — that says how big it is, not which side it will land on, so the
- * reading goes on both sides as it always did.
- *
- * Rounded corners are reported but NOT folded in unless [Settings.safeAreaClearCorners] asks. A
- * full-height picture needs exactly `r` of clearance at a corner of radius `r`, and paying that on
- * every row for two small arcs is a trade only some HUDs want.
- * [Settings.safeAreaLeftPx]/[Settings.safeAreaRightPx] replace a side outright, for a phone this
- * probe reads wrong.
- */
-fun displaySafeInsets(context: Context, s: Settings): SafeInsets {
-    val display = probeDisplay(context)
-    var left = 0
-    var right = 0
-    var corner = 0
-    if (display != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        display.cutout?.let { cut ->
-            if (maxOf(cut.safeInsetLeft, cut.safeInsetRight) > 0) {
-                left = cut.safeInsetLeft
-                right = cut.safeInsetRight
-            } else {
-                val vertical = maxOf(cut.safeInsetTop, cut.safeInsetBottom)
-                left = vertical
-                right = vertical
-            }
-        }
+fun displayCutoutInset(context: Context): Int {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val i = runCatching {
+            context.getSystemService(WindowManager::class.java).currentWindowMetrics.windowInsets
+                .getInsets(WindowInsets.Type.displayCutout())
+        }.getOrNull() ?: return 0
+        return SafeArea.landscapeInset(i.left, i.top, i.right, i.bottom)
     }
-    if (display != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        for (position in intArrayOf(
-            android.view.RoundedCorner.POSITION_TOP_LEFT,
-            android.view.RoundedCorner.POSITION_TOP_RIGHT,
-            android.view.RoundedCorner.POSITION_BOTTOM_LEFT,
-            android.view.RoundedCorner.POSITION_BOTTOM_RIGHT,
-        )) {
-            display.getRoundedCorner(position)?.let { corner = maxOf(corner, it.radius) }
-        }
-    }
-    return SafeArea.resolve(left, right, corner, s)
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+    val c = probeDisplay(context)?.cutout ?: return 0
+    return SafeArea.landscapeInset(c.safeInsetLeft, c.safeInsetTop, c.safeInsetRight, c.safeInsetBottom)
 }
 
 /**
  * The native mode narrowed to clear this display's housing — the [SAFE_AREA_MODE] resolution, as a
  * landscape `(width, height, hz)`. Same height and refresh as [nativeDisplayMode]; only the width
- * moves, and the stream screen places the narrower picture at the left inset rather than centred.
+ * moves, and the stream screen places the narrower picture at the window's left cutout inset.
  */
-fun safeDisplayMode(context: Context, s: Settings): Triple<Int, Int, Int> {
+fun safeDisplayMode(context: Context): Triple<Int, Int, Int> {
     val (w, h, hz) = nativeDisplayMode(context)
-    val i = displaySafeInsets(context, s)
-    return Triple(SafeArea.insetWidth(w, i.left, i.right), h, hz)
+    return Triple(SafeArea.insetWidth(w, displayCutoutInset(context)), h, hz)
 }
 
 /**
@@ -608,7 +545,7 @@ fun displaySupportsHdr(context: Context): Boolean {
  */
 fun Settings.effectiveMode(context: Context): Triple<Int, Int, Int> {
     val base = if (width == SAFE_AREA_MODE && height == SAFE_AREA_MODE) {
-        safeDisplayMode(context, this)
+        safeDisplayMode(context)
     } else {
         nativeDisplayMode(context)
     }
@@ -707,9 +644,50 @@ object Resolutions {
 
     /** The size in family [aspect] nearest in height to [h]; native (`0` or a sentinel) looks for
      * 1080. Ties go to the smaller size. */
-    fun nearest(aspect: Int, h: Int): Pair<Int, Int> {
+    fun nearest(aspect: Int, h: Int): Pair<Int, Int> = nearestIn(ASPECTS[aspect], h)
+
+    /** The size in [family] nearest in height to [h]; native looks for 1080. */
+    fun nearestIn(family: Aspect, h: Int): Pair<Int, Int> {
         val want = if (h <= 0) 1080 else h
-        return ASPECTS[aspect].sizes.minBy { kotlin.math.abs(it.second - want) }
+        return family.sizes.minBy { kotlin.math.abs(it.second - want) }
+    }
+
+    const val SCREEN = "Screen"
+    const val SAFE_AREA = "Safe area"
+
+    /** Heights a device entry offers below the screen's own. */
+    private val DEVICE_HEIGHTS = listOf(720, 1080, 1440, 2160)
+
+    /** A device entry's sizes sit within this of its shape, tight enough to part a phone's
+     * screen from its safe area. */
+    private const val DEVICE_TOLERANCE = 0.01
+
+    /**
+     * The aspect switch on this device: "Screen", then "Safe area", then [ASPECTS]. Each device
+     * entry appears only when no standard family has its shape, and the safe area only when it
+     * differs from the screen. Twin of `punktfunk_core::resolutions::families`.
+     */
+    fun families(screen: Pair<Int, Int>?, safe: Pair<Int, Int>?): List<Aspect> {
+        val own = listOf(SCREEN to screen, SAFE_AREA to safe).mapNotNull { (label, dims) ->
+            val (w, h) = dims?.takeIf { it.first > 0 && it.second > 0 } ?: return@mapNotNull null
+            if (label == SAFE_AREA && dims == screen) return@mapNotNull null
+            if (aspectOf(w, h) != null) return@mapNotNull null
+            val sizes = DEVICE_HEIGHTS.filter { it < h }.map { dh -> (w.toLong() * dh / h).toInt() / 2 * 2 to dh } +
+                (w / 2 * 2 to h / 2 * 2)
+            Aspect(label, w.toDouble() / h, sizes)
+        }
+        return own + ASPECTS
+    }
+
+    /** The entry of [families] `w`×`h` belongs to by shape: a device entry first, then a standard
+     * one. `null` for a non-positive side or a shape none has. */
+    fun familyOf(families: List<Aspect>, w: Int, h: Int): Int? {
+        if (w <= 0 || h <= 0) return null
+        val shape = w.toDouble() / h
+        fun within(a: Aspect, tol: Double) = kotlin.math.abs(shape / a.shape - 1) < tol
+        fun device(a: Aspect) = a.label == SCREEN || a.label == SAFE_AREA
+        return families.indexOfFirst { device(it) && within(it, DEVICE_TOLERANCE) }.takeIf { it >= 0 }
+            ?: families.indexOfFirst { !device(it) && within(it, TOLERANCE) }.takeIf { it >= 0 }
     }
 }
 
@@ -721,18 +699,26 @@ val NATIVE_RESOLUTION_OPTIONS = listOf(
 )
 
 /** The Resolution picker's rows for one family: the native rows, then that family's sizes. */
-fun resolutionOptions(family: Int): List<Triple<Int, Int, String>> =
-    NATIVE_RESOLUTION_OPTIONS + Resolutions.ASPECTS[family].sizes.map { (w, h) -> Triple(w, h, "$w × $h") }
+fun resolutionOptions(family: Resolutions.Aspect): List<Triple<Int, Int, String>> =
+    NATIVE_RESOLUTION_OPTIONS + family.sizes.map { (w, h) -> Triple(w, h, "$w × $h") }
 
-/** The family the Resolution picker lists for the stored size: its shape, or 16:9 while the size is
- * native or a shape no family has. */
-fun Settings.resolutionFamily(): Int = Resolutions.aspectOf(width, height) ?: 0
+/** The entry the Resolution picker lists for the stored size: its shape. Native and the safe-area
+ * mode read as this device's own entries where it has them; otherwise, and for a shape none has,
+ * the first entry. */
+fun Settings.resolutionFamily(families: List<Resolutions.Aspect>): Int {
+    fun own(label: String) = families.indexOfFirst { it.label == label }.takeIf { it >= 0 }
+    return when {
+        width == 0 -> own(Resolutions.SCREEN)
+        width == SAFE_AREA_MODE -> own(Resolutions.SAFE_AREA) ?: own(Resolutions.SCREEN)
+        else -> Resolutions.familyOf(families, width, height)
+    } ?: 0
+}
 
 /** True when the stored size is none of the presets its family lists — a custom resolution typed
  * in the touch settings. Detected from the size itself rather than a persisted flag, so it can
  * never disagree with what's actually stored (mirrors the Apple client). */
-fun Settings.isCustomResolution(): Boolean =
-    resolutionOptions(resolutionFamily()).none { (w, h, _) -> w == width && h == height }
+fun Settings.isCustomResolution(families: List<Resolutions.Aspect> = Resolutions.families(null, null)): Boolean =
+    resolutionOptions(families[resolutionFamily(families)]).none { (w, h, _) -> w == width && h == height }
 
 /** (hz, label). `0` = native refresh. */
 val REFRESH_OPTIONS = listOf(
@@ -893,17 +879,26 @@ val CODEC_OPTIONS = listOf(
  * advertises is a setting that does nothing. [stored] is the currently persisted value, which is
  * always kept selectable so the selection can be rendered (the don't-clobber rule: a codec chosen
  * on another device, or by a newer build, must survive being looked at here).
+ *
+ * A kept row says why it is not in effect. Reading plain "AV1" while every session streams HEVC
+ * is the whole of #1138: the picker is the only place that can say the Hello never asked for it.
  */
 fun codecOptionsFor(
     stored: String,
     av1Capable: Boolean,
     pyrowaveCapable: Boolean,
 ): List<Pair<String, String>> =
-    CODEC_OPTIONS.filter { (v, _) ->
-        when (v) {
-            "av1" -> av1Capable || stored == "av1"
-            "pyrowave" -> pyrowaveCapable || stored == "pyrowave"
+    CODEC_OPTIONS.mapNotNull { (v, label) ->
+        val capable = when (v) {
+            "av1" -> av1Capable
+            "pyrowave" -> pyrowaveCapable
             else -> true
+        }
+        when {
+            capable -> v to label
+            stored != v -> null
+            v == "av1" -> v to "AV1 — no hardware decoder here; HEVC is used"
+            else -> v to "PyroWave — this GPU can't decode it; HEVC is used"
         }
     }
 
@@ -938,6 +933,19 @@ val BITRATE_OPTIONS = listOf(
     300_000 to "300 Mbps",
     500_000 to "500 Mbps",
 )
+
+/** The Bitrate menu's "Custom…" entry. Never stored: picking it opens the Mbps field. */
+const val CUSTOM_BITRATE = -1
+
+/** The typed field's ceiling, the console shell's on Android: 2 Gbps. The host takes up to 8. */
+const val CUSTOM_BITRATE_MAX_MBPS = 2_000
+
+/** True when the stored rate is none of [BITRATE_OPTIONS] — typed, or written by the speed test. */
+fun Settings.isCustomBitrate(): Boolean = BITRATE_OPTIONS.none { it.first == bitrateKbps }
+
+/** "14 Mbps" or "14.9 Mbps": any stored rate, so an off-menu one never reads as Automatic. */
+fun bitrateLabel(kbps: Int): String =
+    if (kbps % 1000 == 0) "${kbps / 1000} Mbps" else "%.1f Mbps".format(kbps / 1000.0)
 
 /** (CompositorPref wire byte, label). Byte 6, a Windows host's echo, is never a choice. */
 val COMPOSITOR_OPTIONS = listOf(

@@ -23,6 +23,20 @@ final class ResolutionsTests: XCTestCase {
         XCTAssertNil(Resolutions.aspectOf(0, 0), "native")
     }
 
+    /// A OnePlus-shaped phone: 3216×1440, 127 px of cutout on one side. Twin of the core test.
+    func testAPhoneLeadsWithItsScreenAndSafeArea() {
+        let f = Resolutions.families(screen: (3216, 1440), safe: (3088, 1440))
+        XCTAssertEqual(f.prefix(3).map(\.label), ["Screen", "Safe area", "16:9"])
+        XCTAssertEqual(f[0].sizes.map { "\($0.w)x\($0.h)" }, ["1608x720", "2412x1080", "3216x1440"])
+        XCTAssertEqual(f[1].sizes.map { "\($0.w)x\($0.h)" }, ["1544x720", "2316x1080", "3088x1440"])
+        XCTAssertEqual(Resolutions.familyOf(f, 2412, 1080), 0)
+        XCTAssertEqual(Resolutions.familyOf(f, 2316, 1080), 1)
+        XCTAssertEqual(Resolutions.familyOf(f, 1920, 1080), 2)
+        XCTAssertEqual(
+            Resolutions.families(screen: (1920, 1080), safe: (1920, 1080)).count,
+            Resolutions.aspects.count, "a standard screen adds nothing")
+    }
+
     func testNearestFollowsHeightAndNativeMeans1080() {
         XCTAssertTrue(Resolutions.nearest(0, height: 0) == (1920, 1080))
         XCTAssertTrue(Resolutions.nearest(1, height: 1080) == (1920, 1200))

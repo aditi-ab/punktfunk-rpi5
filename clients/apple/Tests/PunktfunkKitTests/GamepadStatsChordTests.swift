@@ -64,8 +64,8 @@ final class GamepadStatsChordTests: XCTestCase {
             GamepadCapture.escapeChordElements.count + GamepadCapture.statsChordElements.count - 1)
     }
 
-    /// A cycle is a pure rotation through the four tiers — the chord fires `StatsVerbosity.cycle`,
-    /// and a tier that dead-ended would strand a tvOS user with no other way back.
+    /// A cycle is a pure rotation through the four tiers — the chord asks its session for the next
+    /// one, and a tier that dead-ended would strand a tvOS user with no other way back.
     func testCycleReachesEveryTierAndReturns() {
         var tier = StatsVerbosity.off
         var seen: [StatsVerbosity] = []

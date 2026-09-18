@@ -31,6 +31,8 @@ pub struct MsgReader<R> {
     buf: Vec<u8>,
     /// Target length: 2 while reading the prefix, then `2 + payload`.
     need: usize,
+    /// Messages handed back by [`hold`](Self::hold), returned before anything new.
+    held: std::collections::VecDeque<Vec<u8>>,
 }
 
 impl<R: AsyncRead + Unpin> MsgReader<R> {
@@ -39,11 +41,21 @@ impl<R: AsyncRead + Unpin> MsgReader<R> {
             recv,
             buf: Vec::new(),
             need: 2,
+            held: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Give `msg` back to whoever reads next. For a phase that meets a message meant for
+    /// the reader after it.
+    pub fn hold(&mut self, msg: Vec<u8>) {
+        self.held.push_back(msg);
     }
 
     /// Read one framed message. Cancel-safe: drop keeps the partial frame.
     pub async fn read_msg(&mut self) -> std::io::Result<Vec<u8>> {
+        if let Some(msg) = self.held.pop_front() {
+            return Ok(msg);
+        }
         loop {
             while self.buf.len() < self.need {
                 let mut chunk = [0u8; 2048];

@@ -8,19 +8,17 @@
 //! * `"Rich Text Format"` (raw RTF) ↔ `text/rtf`
 //! * `"PNG"` (raw PNG) ↔ `image/png` — identity, handled by the backend.
 
-/// `CF_UNICODETEXT` HGLOBAL → UTF-8. `raw` is the `GlobalSize` buffer:
-/// little-endian UTF-16 with one trailing `0x0000`.
+/// `CF_UNICODETEXT` HGLOBAL → UTF-8. `raw` is the `GlobalSize` buffer: little-endian
+/// UTF-16. The first `0x0000` ends the string; `GlobalSize` can exceed that terminator.
 pub fn text_from_utf16(raw: &[u8]) -> Vec<u8> {
     // Odd trailing byte (invalid CF_UNICODETEXT) is dropped by `chunks_exact`.
-    let mut units: Vec<u16> = raw
+    let units: Vec<u16> = raw
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    // One trailing NUL only — a real U+0000 code unit must survive.
-    if units.last() == Some(&0) {
-        units.pop();
-    }
-    String::from_utf16_lossy(&units).into_bytes()
+    // CF_UNICODETEXT is a C string. Padding or garbage past the first NUL is not payload.
+    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end]).into_bytes()
 }
 
 /// UTF-8 → `CF_UNICODETEXT` (UTF-16LE + required `0x0000` terminator).
@@ -250,6 +248,16 @@ mod tests {
 
         assert_eq!(text_to_utf16(b""), vec![0, 0]);
         assert_eq!(text_from_utf16(&[0, 0]), b"");
+    }
+
+    #[test]
+    fn text_from_utf16_stops_at_the_first_terminator() {
+        // GlobalSize is the allocation, not the string. Extra zero units and
+        // uninitialized tail bytes sit past the required NUL on real HGLOBALs.
+        let mut padded: Vec<u8> = "hi".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        padded.extend_from_slice(&[0, 0]); // terminator
+        padded.extend_from_slice(&[0, 0, 0, 0, 0xFF, 0xEE]);
+        assert_eq!(text_from_utf16(&padded), b"hi");
     }
 
     #[test]

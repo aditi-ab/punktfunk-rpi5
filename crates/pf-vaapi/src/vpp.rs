@@ -155,11 +155,11 @@ pub struct VaProcPipelineParameterBuffer {
 
 impl VaProcPipelineParameterBuffer {
     /// Whole-picture conversion of `source`, with the colour facts `swscale` used to
-    /// be told: RGB is full range in and limited range out, BT.709 at eight bits and
-    /// BT.2020 PQ at ten — the same primaries and transfer on both sides, so the
-    /// only arithmetic is the matrix. A YUV source is copied.
-    pub fn convert(source: u32, source_is_rgb: bool, ten_bit: bool) -> Self {
-        let (primaries, transfer, matrix) = if ten_bit { (9, 16, 9) } else { (1, 1, 1) };
+    /// be told: RGB is full range in and limited range out, and the `colour` H.273 triple
+    /// (BT.709 for SDR at either depth, BT.2020 PQ for HDR) on the YUV side — the same
+    /// primaries and transfer on both sides, so the only arithmetic is the matrix. YUV in is copied.
+    pub fn convert(source: u32, source_is_rgb: bool, colour: [u8; 3]) -> Self {
+        let (primaries, transfer, matrix) = (colour[0], colour[1], colour[2]);
         let (in_range, in_matrix) = if source_is_rgb {
             (VA_SOURCE_RANGE_FULL, 0)
         } else {
@@ -268,7 +268,7 @@ mod tests {
     /// that decodes fine and is the wrong red.
     #[test]
     fn rgb_ingest_states_both_sides_explicitly() {
-        let p = VaProcPipelineParameterBuffer::convert(7, true, false);
+        let p = VaProcPipelineParameterBuffer::convert(7, true, crate::hevc::COLOUR_BT709);
         assert_eq!(p.surface, 7);
         assert_eq!(p.surface_color_standard, VA_PROC_COLOR_STANDARD_EXPLICIT);
         assert_eq!(p.output_color_standard, VA_PROC_COLOR_STANDARD_EXPLICIT);
@@ -287,7 +287,7 @@ mod tests {
         assert_eq!(i.matrix_coefficients, 0, "RGB source: identity");
         assert!(p.surface_region.is_null() && p.filters.is_null());
 
-        let p = VaProcPipelineParameterBuffer::convert(7, false, true);
+        let p = VaProcPipelineParameterBuffer::convert(7, false, crate::hevc::COLOUR_BT2020_PQ);
         let (i, o) = (&p.input_color_properties, &p.output_color_properties);
         assert_eq!(i.color_range, VA_SOURCE_RANGE_REDUCED);
         assert_eq!(

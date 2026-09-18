@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Thu, 17 Sep 2026 12:00:00 +0200
+Subject: [PATCH] headless: report HDR10 under --hdr-debug-force-support
+
+Steam offers its HDR setting only on a display that says it has HDR:
+GAMESCOPE_DISPLAY_SUPPORTS_HDR, written from the connector's SupportsHDR(),
+and the gamescope_control SUPPORTS_HDR flag, taken from
+GetHDRInfo().bExposeHDRSupport. CHeadlessConnector hardcodes both to false.
+--hdr-debug-force-support only forces GAMESCOPE_HDR_OUTPUT_FEEDBACK, so a
+headless HDR session hands games an HDR swapchain while Steam shows HDR as
+unavailable, and titles that follow Steam's setting cannot turn HDR on.
+
+With --hdr-debug-force-support, report an HDR10 connector the way the SDL
+and Wayland backends do: bExposeHDRSupport with a PQ output encoding, and
+SupportsHDR() = GetHDRInfo().IsHDR10(). The flag is parsed in
+steamcompmgr_main, after the backend's Init(), so the connector reads it
+on each call.
+
+The composite does not change. Output images take their format from
+GetPreferredOutputFormat(), and the headless GetNativeColorimetry ignores
+bHDR10, so g_bOutputHDREnabled turning true alters only what Steam and
+the WSI layer are told. Without the flag nothing changes.
+---
+ src/Backends/HeadlessBackend.cpp | 14 ++++++++++++--
+ src/meson.build                  |  3 ++-
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/src/Backends/HeadlessBackend.cpp b/src/Backends/HeadlessBackend.cpp
+--- a/src/Backends/HeadlessBackend.cpp
++++ b/src/Backends/HeadlessBackend.cpp
+@@ -12,6 +12,8 @@
+ extern std::vector<uint32_t> g_customRefreshRates;
+ // `--adaptive-sync` / Steam's gamescope_control toggle (steamcompmgr.cpp).
+ extern gamescope::ConVar<bool> cv_adaptive_sync;
++// `--hdr-debug-force-support` (steamcompmgr.cpp). Parsed after Init(), so read it live.
++extern bool g_bForceHDRSupportDebug;
+ 
+ namespace gamescope
+ {
+@@ -20,6 +22,8 @@
+     public:
+         CHeadlessConnector()
+         {
++            m_ForcedHDRInfo.bExposeHDRSupport = true;
++            m_ForcedHDRInfo.eOutputEncodingEOTF = EOTF_PQ;
+         }
+         virtual ~CHeadlessConnector()
+         {
+@@ -40,9 +44,14 @@
+         {
+             return GAMESCOPE_PANEL_ORIENTATION_0;
+         }
++        // Steam enables its HDR setting only on a display that reports HDR: the
++        // GAMESCOPE_DISPLAY_SUPPORTS_HDR atom (SupportsHDR) and the gamescope_control
++        // SUPPORTS_HDR flag (bExposeHDRSupport). With `--hdr-debug-force-support` this
++        // virtual display reports HDR10. Headless GetNativeColorimetry ignores bHDR10, so
++        // the composite itself is unchanged.
+         virtual bool SupportsHDR() const override
+         {
+-            return false;
++            return GetHDRInfo().IsHDR10();
+         }
+         virtual bool IsHDRActive() const override
+         {
+@@ -50,7 +59,7 @@
+         }
+         virtual const BackendConnectorHDRInfo &GetHDRInfo() const override
+         {
+-            return m_HDRInfo;
++            return g_bForceHDRSupportDebug ? m_ForcedHDRInfo : m_HDRInfo;
+         }
+ 		virtual bool IsVRRActive() const override
+ 		{
+@@ -156,6 +165,7 @@
+ 
+     private:
+         BackendConnectorHDRInfo m_HDRInfo{};
++        BackendConnectorHDRInfo m_ForcedHDRInfo{};
+         std::vector<BackendMode> m_Modes;
+         std::vector<uint32_t> m_ValidDynamicRefreshRates;
+     };
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -194,7 +194,8 @@
+ #   +pfhdr11 — …and the Steam overlay repaints the capture on its own commits (no new capability)
+ #   +pfhdr12 — …and the capture push honours the consumer's maxFramerate
+ #   +pfhdr13 — …and a P010 capture format (BT.2020 PQ, 4:2:0)
+-version_tag = vcs_tag + '+pfhdr13' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr14 — …and the headless connector reports HDR10 under --hdr-debug-force-support
++version_tag = vcs_tag + '+pfhdr14' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)

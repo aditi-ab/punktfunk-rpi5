@@ -117,6 +117,21 @@ final class Sc2FramingTests: XCTestCase {
             [0x87, 0x03, 0x09, 0x00, 0x00]) // SET_SETTINGS len=3 {LIZARD_MODE, OFF u16}
     }
 
+    func testLizardOnRestoreIsTheDisableFrameWithTheValueSet() {
+        // What both links write on stop, before they let the pad go: the same
+        // ID_SET_SETTINGS_VALUES / SETTING_LIZARD_MODE report, u16 value 1. Without it the pad
+        // stays in Steam-Input HID until the firmware watchdog fires and drives nothing
+        // meanwhile.
+        let write = Sc2Device.featurePayload(frame: Sc2Device.enableLizard)
+        XCTAssertEqual(
+            Array(write?.prefix(5) ?? []),
+            [0x87, 0x03, 0x09, 0x01, 0x00]) // SET_SETTINGS len=3 {LIZARD_MODE, ON u16 LE}
+        XCTAssertEqual(write?.count, 63) // the 64-byte frame minus the channel id, padding kept
+        // One byte apart from the disable frame — the value's low half, nothing else.
+        XCTAssertEqual(
+            zip(Sc2Device.enableLizard, Sc2Device.disableLizard).filter { $0 != $1 }.count, 1)
+    }
+
     // MARK: - Wire-constant pins against the regenerated C header (ABI v27)
 
     func testWireConstantsMatchTheCABIVerbatim() {

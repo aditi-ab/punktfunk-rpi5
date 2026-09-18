@@ -60,6 +60,8 @@ pub type RfiSlot = Arc<std::sync::Mutex<Option<(i64, i64)>>>;
 pub struct GameLifetime {
     /// [`super::AppState::quit`]: a decision may end the game; a drop gets a reconnect window.
     pub quit: Arc<AtomicBool>,
+    /// [`super::AppState::preempted`]: the stop flag admission raises on a steal.
+    pub preempted: Arc<AtomicBool>,
     /// Paired client's cert fingerprint; only it can reclaim the launch. `None` if unread.
     pub fingerprint: Option<String>,
     /// Launching peer's source IP ([`super::LaunchSession::peer_ip`]). Bound when the video
@@ -68,6 +70,14 @@ pub struct GameLifetime {
     /// Session A/V ping payload — the half of the endpoint guard a shared-address peer cannot forge.
     pub av_ping: [u8; super::AV_PING_LEN],
     pub on_game_exit: super::OnSessionLost,
+}
+
+/// The registry handles this session's loop keeps current: what `GET /status` and the
+/// console's cards read while it streams. Snapshotting them at launch would freeze the
+/// bitrate at the client's ask and leave the capture card empty.
+struct LiveTelemetry {
+    bitrate_kbps: Arc<std::sync::atomic::AtomicU32>,
+    capture_health: Arc<std::sync::Mutex<Option<pf_capture::CaptureHealth>>>,
 }
 
 /// Spawn the video stream thread (idempotent via `running`). Stops when `running` clears.
@@ -81,6 +91,7 @@ pub fn start(
     force_idr: Arc<AtomicBool>,
     rfi_range: RfiSlot,
     loss: Arc<super::GsLossStats>,
+    video_hdr: super::VideoHdr,
     // Session rikey, only when `cfg.encrypt_video`. Not a `StreamConfig` field: that
     // struct is `Debug`-logged at stream start.
     gcm_key: Option<[u8; 16]>,
@@ -89,6 +100,9 @@ pub fn start(
     on_lost: super::OnSessionLost,
     // Last act of this thread — `/resume` waits on this counter (`AppState::media_exited`).
     media_exited: Arc<std::sync::atomic::AtomicU64>,
+    // Input tallies the control loop bumps; this thread clears them and hands them to the
+    // registry, which is what `session.ended` reports.
+    counters: Arc<crate::session_status::SessionCounters>,
     life: GameLifetime,
 ) {
     let _ = std::thread::Builder::new()
@@ -99,24 +113,85 @@ pub fn start(
             let _sleep = crate::sleep_inhibit::hold();
             tracing::info!(?cfg, "video stream starting");
             // Before `run`: `run` launches the app, and the title's wrapper keys on this marker.
-            // RTSP carries no device name, so `client` is empty; hooks key on `plane`.
+            // RTSP carries no device name, so the console's label for the paired certificate
+            // is the only name there is; empty for a device nobody has named.
+            let client_label = life
+                .fingerprint
+                .as_deref()
+                .and_then(|fp| crate::gamestream::load_client_labels().get(fp).cloned())
+                .unwrap_or_default();
             let stream_marker = crate::stream_marker::announce(crate::stream_marker::StreamInfo {
                 width: cfg.width,
                 height: cfg.height,
                 refresh_hz: cfg.fps,
                 hdr: cfg.hdr,
-                client: String::new(),
+                client: client_label.clone(),
+                fingerprint: life.fingerprint.clone(),
                 launch: app.as_ref().map(|a| a.title.clone()),
                 plane: crate::events::Plane::Gamestream,
             });
             let event_client = crate::events::ClientRef {
-                name: String::new(),
-                fingerprint: None,
+                name: client_label.clone(),
+                fingerprint: life.fingerprint.clone(),
                 plane: crate::events::Plane::Gamestream,
             };
             crate::events::emit(crate::events::EventKind::ClientConnected {
                 client: event_client.clone(),
             });
+            // This plane's session in the registry the management API acts on: it is what
+            // gives the console a session id, and with it a per-session stop and keyframe
+            // instead of only the host-wide one. `stop` is read by the loop below.
+            let stop = Arc::new(AtomicBool::new(false));
+            let live = LiveTelemetry {
+                bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(cfg.bitrate_kbps)),
+                capture_health: Arc::new(std::sync::Mutex::new(None)),
+            };
+            let end_reason = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            // The control loop bumps these without a session handle, so they are cleared
+            // here rather than made fresh: the summary must not carry the last session's input.
+            counters.reset();
+            let live_session =
+                crate::session_status::register(crate::session_status::Registration {
+                    mode: Arc::new(std::sync::atomic::AtomicU64::new(crate::native::pack_mode(
+                        cfg.width, cfg.height, cfg.fps,
+                    ))),
+                    bitrate_kbps: live.bitrate_kbps.clone(),
+                    codec: cfg.codec,
+                    stop: stop.clone(),
+                    // Already this plane's "the end was deliberate" flag, so an operator stop
+                    // reads here exactly as `/cancel` does.
+                    quit: life.quit.clone(),
+                    force_idr: force_idr.clone(),
+                    // The 12-hex prefix native uses, so one device reads the same on both planes
+                    // — and unpairing it mid-stream finds this session too.
+                    client: life
+                        .fingerprint
+                        .as_deref()
+                        .map(|fp| fp[..12.min(fp.len())].to_string())
+                        .or_else(|| life.owner_ip.map(|ip| ip.to_string()))
+                        .unwrap_or_default(),
+                    client_name: (!client_label.is_empty()).then(|| client_label.clone()),
+                    plane: crate::events::Plane::Gamestream,
+                    hdr: cfg.hdr,
+                    ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    // The compat plane publishes its launched game separately
+                    // (`session_status::publish_gamestream_game`).
+                    game: None,
+                    capture_health: live.capture_health.clone(),
+                    join: false,
+                    controls: crate::session_status::SessionControls {
+                        fingerprint: life.fingerprint.clone(),
+                        ..crate::session_status::SessionControls::open()
+                    },
+                    bit_depth: if cfg.hdr { 10 } else { 8 },
+                    chroma: crate::encode::ChromaFormat::Yuv420,
+                    end_reason: end_reason.clone(),
+                    counters: counters.clone(),
+                    // The launch owner's address: what the console pairs with a native
+                    // session sharing the same client.
+                    peer: life.owner_ip,
+                });
             // Released when the closure exits so idle clocks are not pinned between sessions.
             #[cfg(target_os = "linux")]
             let _clock_pin = crate::gpuclocks::session_pin();
@@ -124,13 +199,16 @@ pub fn start(
                 cfg,
                 app.as_ref(),
                 &running,
+                &stop,
                 &force_idr,
                 &rfi_range,
                 &loss,
+                &video_hdr,
                 gcm_key,
                 &video_cap,
                 &stats,
                 &on_lost,
+                &live,
                 &life,
             );
             // Clean return is a stop; error is `error`. Compat has no typed close code.
@@ -138,10 +216,20 @@ pub fn start(
                 Ok(()) => crate::events::DisconnectReason::Quit,
                 Err(_) => crate::events::DisconnectReason::Error,
             };
+            // Why `session.ended` says it ended. First writer wins, so an operator stop (which
+            // latches `stopped_by_operator` before it raises the flag) keeps its reason.
+            match &result {
+                Ok(()) => crate::events::SessionEndReason::HostEnded,
+                Err(_) => crate::events::SessionEndReason::HostError,
+            }
+            .latch(&end_reason);
             if let Err(e) = result {
                 tracing::error!(error = %format!("{e:#}"), "video stream failed");
             }
+            // `session.ended` before the stream and client events, as the native loop orders them.
+            drop(live_session);
             running.store(false, Ordering::SeqCst);
+            *video_hdr.lock().unwrap() = None;
             // Before `client.disconnected` — native loop event order.
             drop(stream_marker);
             crate::events::emit(crate::events::EventKind::ClientDisconnected {
@@ -159,13 +247,17 @@ fn run(
     cfg: StreamConfig,
     app: Option<&super::apps::AppEntry>,
     running: &Arc<AtomicBool>,
+    // Set by `DELETE /session/{id}`: this one session, not the whole host.
+    stop: &AtomicBool,
     force_idr: &AtomicBool,
     rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
     loss: &super::GsLossStats,
+    video_hdr: &std::sync::Mutex<Option<pf_frame::HdrMeta>>,
     gcm_key: Option<[u8; 16]>,
     video_cap: &std::sync::Mutex<Option<PooledCapturer>>,
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
     on_lost: &super::OnSessionLost,
+    live: &LiveTelemetry,
     life: &GameLifetime,
 ) -> Result<()> {
     pf_frame::session_tuning::on_hot_thread();
@@ -248,7 +340,7 @@ fn run(
         let _admission_guard = crate::vdisplay::admission::register(
             None,
             (cfg.width, cfg.height, cfg.fps),
-            life.quit.clone(),
+            life.preempted.clone(),
             "gamestream".to_string(),
             crate::vdisplay::admission::LiveDisplay {
                 compositor: Some(compositor),
@@ -333,7 +425,7 @@ fn run(
             }
             Some(cmd) => {
                 let own = target.as_ref().is_some_and(|t| t.own_workspace);
-                match crate::library::launch_session_command(compositor, cmd, None, own) {
+                match crate::library::launch_session_command(compositor, cmd, None, own, None) {
                     Ok(mut spawned) => {
                         spawned_now = true;
                         launch_workspace = spawned.workspace.take();
@@ -396,13 +488,16 @@ fn run(
                     game: t.game.clone(),
                     // RTSP carries no device name; peer IP is the stats-capture label too.
                     client: client_label.clone(),
+                    fingerprint: life.fingerprint.clone(),
                     plane: crate::events::Plane::Gamestream,
                     spec: t.detect.clone(),
                     // Native plane only: this one has no per-session head to
                     // watch, so a Moonlight launch keeps the `running` stage.
-                    #[cfg(target_os = "linux")]
-                    window_stage: None,
+                    window: None,
                     nested,
+                    // No pool generation on this plane, and a GameStream session never isolates,
+                    // so there is no sibling seat to be confused with.
+                    scope_pid: None,
                     launcher: t.launcher,
                     child,
                     spawned: spawned_pid,
@@ -443,13 +538,16 @@ fn run(
             &sock,
             cfg,
             running,
+            stop,
             force_idr,
             rfi_range,
             loss,
+            video_hdr,
             gcm_key,
             stats,
             &client_label,
             on_lost,
+            live,
         );
     }
 
@@ -525,13 +623,16 @@ fn run(
         &sock,
         cfg,
         running,
+        stop,
         force_idr,
         rfi_range,
         loss,
+        video_hdr,
         gcm_key,
         stats,
         &client_label,
         on_lost,
+        live,
     );
     capturer.set_active(false);
     // Portal terminal states are sticky and this path has no rebuild. Re-pooling a dead
@@ -793,6 +894,7 @@ fn gs_open_encoder(
             cfg.fps,
             enc_bps,
             gs_bit_depth(frame.format),
+            None,
             wire_seq_base,
         );
     }
@@ -1063,14 +1165,19 @@ fn stream_body(
     sock: &UdpSocket,
     cfg: StreamConfig,
     running: &Arc<AtomicBool>,
+    // Set by `DELETE /session/{id}`: this one session, not the whole host.
+    stop: &AtomicBool,
     force_idr: &AtomicBool,
     rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
     // Client 0x0201 loss counters — 1 Hz adaptation reads deltas.
     loss: &super::GsLossStats,
+    // What this loop encodes, for the control thread's HDR-mode cue.
+    video_hdr: &std::sync::Mutex<Option<pf_frame::HdrMeta>>,
     gcm_key: Option<[u8; 16]>,
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
     client_label: &str,
     on_lost: &super::OnSessionLost,
+    live: &LiveTelemetry,
 ) -> Result<()> {
     let mut frame = capturer.next_frame().context("capture first frame")?;
     // A mirror is sized by `open_encoder_fitted`. A virtual display was created at the
@@ -1209,11 +1316,28 @@ fn stream_body(
     // invalidate is never rate-limited.
     let keyframe_coalesce = keyframe_coalesce_window(frame_interval);
     let mut last_keyframe: Option<Instant> = None;
+    let mut published_hdr: Option<pf_frame::HdrMeta> = None;
     // A pipeline-head drop consumes no frameIndex; the client cannot see the gap. Arm an IDR
     // through the same coalesce gate so a burst of drops cannot become an IDR storm.
     let mut recover_after_drop = false;
+    // Same 500 ms cadence the native loop publishes on.
+    let mut health_published_at = Instant::now();
 
     while running.load(Ordering::SeqCst) {
+        if health_published_at.elapsed() >= Duration::from_millis(500) {
+            health_published_at = Instant::now();
+            *live
+                .capture_health
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = capturer.health();
+        }
+        // An operator stop ends the session the way a lost client does — `on_lost` clears the
+        // launch and the audio plane too, so nothing is left claiming the host is busy.
+        if stop.load(Ordering::SeqCst) {
+            tracing::info!("gamestream: stopping this session — the operator asked");
+            on_lost();
+            break;
+        }
         let tick = Instant::now();
         let measure = perf || stats.is_armed();
         let mut fresh = false;
@@ -1378,7 +1502,14 @@ fn stream_body(
             }
         }
         // Stock Moonlight tone-maps from in-band mastering/CLL SEI on keyframes. `None` is a no-op.
-        enc.set_hdr_meta(capturer.hdr_meta());
+        let hdr_meta = capturer
+            .hdr_meta()
+            .filter(|_| gs_bit_depth(frame.format) == 10);
+        enc.set_hdr_meta(hdr_meta);
+        if hdr_meta != published_hdr {
+            published_hdr = hdr_meta;
+            *video_hdr.lock().unwrap() = hdr_meta;
+        }
         // An encoder the loop does not feed (the Windows driver) already holds the access units
         // it owes — waited for after a fresh frame, never on a repeat; every other backend
         // takes this tick's frame.
@@ -1615,6 +1746,8 @@ fn stream_body(
                 };
                 let queue_drops = dropped_batches.saturating_sub(last_dropped_batches);
                 let pool_drops = driver_dropped.saturating_sub(last_driver_dropped);
+                live.bitrate_kbps
+                    .store(adapt.budget_kbps, Ordering::Relaxed);
                 let sample = crate::stats_recorder::StatsSample {
                     t_ms: 0,
                     session_id,
@@ -1730,7 +1863,7 @@ fn gs_encoder_bps(bitrate_kbps: u32, fec_pct: u8, packet_size: usize) -> u64 {
 /// wire budget stay at their configured values for the whole session (the A/B lever).
 fn gs_adapt_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PUNKTFUNK_GS_ADAPT").as_deref() != Ok("0"))
+    *ON.get_or_init(|| pf_host_config::knob("PUNKTFUNK_GAMESTREAM_ADAPT").as_deref() != Some("0"))
 }
 
 /// Loss-driven FEC percent and wire budget, stepped ~1 s from client `0x0201` reports.
@@ -1909,18 +2042,14 @@ mod tests {
         }
         assert_eq!(got, 3 * PER_FRAME);
         assert!(running.load(Ordering::SeqCst), "no spurious client-gone");
-        let mut recycled = 0;
-        while pool_rx.try_recv().is_ok() {
-            recycled += 1;
+        // The sender records spread and recycles after its last send returns, so the final
+        // datagram can land first. Recycling follows the spread push in the same iteration.
+        for _ in 0..3 {
+            pool_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("sender must return spent batches to the pool");
         }
-        assert!(
-            recycled >= 1,
-            "sender must return spent batches to the pool"
-        );
-        assert!(
-            spread.lock().unwrap().len() >= 3,
-            "per-frame spread recorded"
-        );
+        assert_eq!(spread.lock().unwrap().len(), 3, "per-frame spread recorded");
     }
 
     /// Framing (32 B per 1376 B payload) and FEC parity fit inside the configured wire budget.

@@ -34,11 +34,12 @@ use super::{max_forced_split_mode, resolve_split_mode};
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use pf_encode_win::rfi::{Wave, WaveMark};
-use pf_frame::{CapturedFrame, FramePayload};
+use pf_frame::{CapturedFrame, DmabufFrame, FramePayload};
 use pf_zerocopy::cuda::{self, InputSurface};
 use pf_zerocopy::vkslot::{SlotFormat, VkSlotBlend, VkSlotRef};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::c_void;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::ptr;
 use std::sync::mpsc;
 
@@ -383,6 +384,32 @@ fn stream_ordered_requested() -> bool {
         .unwrap_or(true)
 }
 
+/// A dead convert worker waits this long before the lane spawns another. A crash loop would
+/// otherwise cost a process and a CUDA context on every frame; three deaths trip the raw lane's
+/// degrade latch, and the next session negotiates the import path instead.
+const WORKER_RESPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The raw frame the fused pass last converted, and the ring slot holding the result.
+/// `cursor` is what the pass baked in — see [`cursor_mark`].
+#[derive(Clone, Copy)]
+struct LastRaw {
+    pts_ns: u64,
+    fd: i32,
+    slot: usize,
+    cursor: Option<(u64, i32, i32)>,
+}
+
+/// The cursor state the fused pass burns into a slot: the bitmap's serial and where it landed.
+/// `serial` bumps only when the bitmap changes, so a position-only move needs `x`/`y` too.
+/// `None` when nothing is drawn — same gate the convert uses.
+fn cursor_mark(captured: &CapturedFrame) -> Option<(u64, i32, i32)> {
+    captured
+        .cursor
+        .as_ref()
+        .filter(|ov| ov.visible && ov.w > 0 && ov.h > 0 && !ov.rgba.is_empty())
+        .map(|ov| (ov.serial, ov.x, ov.y))
+}
+
 /// In-flight bitstream for the retrieve thread. Pointer as `usize`; the thread is joined
 /// before the session is destroyed.
 struct RetrieveJob {
@@ -511,6 +538,27 @@ fn buffer_format(buf: &cuda::DeviceBuffer, fmt: pf_frame::PixelFormat) -> nv::NV
     }
 }
 
+/// Encode depth and HDR verdict for one capture format.
+///
+/// Packed 10-bit input is the compositor's HDR surface: BT.2020 PQ. An 8-bit capture reaches a
+/// 10-bit SDR stream only through NVENC's 8→10, which takes PACKED RGB (`ARGB`); a planar 8-bit
+/// surface (NV12/YUV444) fails `register_resource` in a 10-bit session, so it stays 8-bit. HDR
+/// never follows depth alone.
+fn depth_and_hdr(fmt: nv::NV_ENC_BUFFER_FORMAT, depth_asked: u8) -> (u8, bool) {
+    if is_ten_bit_input(fmt) {
+        return (10, true);
+    }
+    let packed_rgb8 = fmt == nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB;
+    (
+        if depth_asked >= 10 && packed_rgb8 {
+            10
+        } else {
+            8
+        },
+        false,
+    )
+}
+
 /// Packed 10-bit RGB input. Bit depth and HDR follow the capture format, not negotiation.
 fn is_ten_bit_input(fmt: nv::NV_ENC_BUFFER_FORMAT) -> bool {
     matches!(
@@ -521,6 +569,14 @@ fn is_ten_bit_input(fmt: nv::NV_ENC_BUFFER_FORMAT) -> bool {
 }
 
 /// Encoder-owned input surface + NVENC registration (once at init, unregistered at teardown).
+/// What a submit carries: a CUDA buffer the encoder copies into a ring slot, or the held
+/// dmabuf the zero-copy worker's fused pass writes into the slot directly.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Cuda(&'a cuda::DeviceBuffer),
+    Dmabuf(&'a DmabufFrame),
+}
+
 struct RingSlot {
     surface: SlotSurface,
     reg: nv::NV_ENC_REGISTERED_PTR,
@@ -657,15 +713,19 @@ pub struct NvencCudaEncoder {
     fps: u32,
     bitrate_bps: u64,
     buffer_fmt: nv::NV_ENC_BUFFER_FORMAT,
-    /// Encoded bit depth. Derived from the captured input ([`is_ten_bit_input`]), not
-    /// negotiation. 10-bit rides packed RGB so NVENC does the BT.2020 CSC; the NV12/YUV444
-    /// converts write 8-bit planes.
+    /// Encoded bit depth. Packed 10-bit input pins 10 ([`is_ten_bit_input`]); an 8-bit
+    /// capture takes [`Self::depth_asked`], which NVENC writes as a 10-bit stream from the
+    /// 8-bit surface. The NV12/YUV444 converts write 8-bit planes.
     bit_depth: u8,
+    /// Depth the session negotiated. Held because [`Self::bit_depth`] follows the capture:
+    /// an 8-bit surface under a 10-bit session is SDR-10, not a downgrade.
+    depth_asked: u8,
     /// HEVC 4:4:4: planar-YUV444 input *and* GPU YUV444 encode.
     chroma_444: bool,
     /// `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE`.
     yuv444_supported: bool,
-    /// HDR (BT.2020 PQ). Follows packed 10-bit input, same as `bit_depth`.
+    /// HDR (BT.2020 PQ). Packed 10-bit input only — depth alone never implies it, or an
+    /// SDR-10 stream would carry a PQ VUI over BT.709 samples.
     hdr: bool,
     hdr_meta: Option<pf_frame::HdrMeta>,
     /// Device copy of the last CPU frame, reused while the size and layout hold.
@@ -730,6 +790,19 @@ pub struct NvencCudaEncoder {
     /// Blend-warn latch: once per failure streak. A warn on every cursor frame would evict
     /// the log ring.
     cursor_blend_warned: bool,
+    /// The fused convert lane (`PUNKTFUNK_NVENC_RAW`): the zero-copy worker writes held
+    /// dmabufs straight into the ring. `worker_slots` are the ring ids it has imported.
+    raw_wanted: bool,
+    worker: Option<pf_zerocopy::Importer>,
+    worker_slots: HashSet<usize>,
+    worker_cursor_serial: u64,
+    /// The last raw frame the fused pass converted, and where it landed.
+    last_raw: Option<LastRaw>,
+    /// The worker's convert timeline in CUDA: each pass's value is waited on the copy stream
+    /// before NVENC maps the slot.
+    convert_sem: Option<cuda::ExternalSemaphore>,
+    /// Earliest the lane may spawn another convert worker ([`WORKER_RESPAWN_BACKOFF`]).
+    worker_retry_at: Option<std::time::Instant>,
     /// One-shot [`diagnose_failed_open`](Self::diagnose_failed_open) — a reset burst logs once.
     diagnosed: bool,
     /// Two-thread retrieve. `None` in sync mode. Lives `init_session`→`teardown`.
@@ -825,6 +898,7 @@ impl NvencCudaEncoder {
             buffer_fmt: nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
             // Provisional until the first frame names the real input (`submit` sets both).
             bit_depth,
+            depth_asked: bit_depth,
             // HEVC-only; confirmed against frame layout + GPU at init.
             chroma_444: chroma.is_444() && codec == Codec::H265,
             yuv444_supported: false,
@@ -849,6 +923,16 @@ impl NvencCudaEncoder {
             cursor_tried: false,
             cursor_serial: u64::MAX,
             cursor_blend_warned: false,
+            // Same terms capture negotiated its arm on, sampled once here: a latch that
+            // tripped in an earlier session must not re-arm the lane behind capture's back.
+            raw_wanted: pf_zerocopy::nvenc_raw_enabled()
+                && !pf_zerocopy::raw_dmabuf_import_disabled(),
+            worker: None,
+            worker_slots: HashSet::new(),
+            worker_cursor_serial: u64::MAX,
+            last_raw: None,
+            convert_sem: None,
+            worker_retry_at: None,
             diagnosed: false,
             inited: false,
             rfi_supported: false,
@@ -938,6 +1022,16 @@ impl NvencCudaEncoder {
         for slot in &self.ring {
             let _ = (api().unregister_resource)(self.encoder, slot.reg);
         }
+        if let Some(w) = self.worker.as_mut() {
+            w.forget_slots();
+            // The ring is retired, so every dmabuf the worker cached against it is stale.
+            // This releases the held fds and the Vulkan images they imported; without it a
+            // renegotiation leaves the old pool's imports sitting under the new one's.
+            w.clear_cache();
+        }
+        self.worker_slots.clear();
+        self.last_raw = None;
+        self.convert_sem = None;
         for &bs in &self.bitstreams {
             let _ = (api().destroy_bitstream_buffer)(self.encoder, bs);
         }
@@ -1224,6 +1318,7 @@ impl NvencCudaEncoder {
                     0
                 },
                 hdr: self.hdr,
+                full_range: yuv444_input && pf_zerocopy::egl::yuv444_full_range(),
                 rfi_supported: self.rfi_supported,
                 intra_refresh_cnt: self.wave_cycle(),
                 slices: self.slices,
@@ -1293,7 +1388,7 @@ impl NvencCudaEncoder {
         }
     }
 
-    /// Lazy session + ring, keyed off the first frame's format.
+    /// Opens the lazy session and input ring after the first frame fixes their format.
     fn init_session(&mut self) -> Result<()> {
         // SAFETY: NVENC calls go through `api()` (gated in `open`). `try_open_session`/
         // `query_caps` return a live handle or `Err`; `destroy_encoder` only on a handle just
@@ -1414,6 +1509,7 @@ impl NvencCudaEncoder {
                             }
                         }
                     }
+                    let mut floor_dropped_split = false;
                     if best.is_null() {
                         let no_split =
                             nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
@@ -1424,6 +1520,7 @@ impl NvencCudaEncoder {
                                     "NVENC initialize_encoder rejected even at the floor bitrate",
                                 )?;
                                 used_split = no_split;
+                                floor_dropped_split = true;
                                 e
                             }
                         };
@@ -1434,7 +1531,9 @@ impl NvencCudaEncoder {
                         clamped_mbps = best_bps / 1_000_000,
                         "NVENC (Linux): requested bitrate above the GPU codec-level ceiling — clamped"
                     );
-                    store_ceiling(self.ceiling_key(used_split), best_bps);
+                    if let Some(ceiling) = proven_bitrate_ceiling(best_bps, floor_dropped_split) {
+                        store_ceiling(self.ceiling_key(used_split), ceiling);
+                    }
                     self.bitrate_bps = best_bps;
                     best
                 }
@@ -1455,7 +1554,7 @@ impl NvencCudaEncoder {
 
             // Ring: register once, map per submit. Prefer Vulkan-imported slots so the cursor
             // blend writes the bytes NVENC encodes; any failure falls back to pitched CUDA.
-            if !self.cursor_tried && self.blend_wanted {
+            if !self.cursor_tried && (self.blend_wanted || self.raw_wanted) {
                 self.cursor_tried = true;
                 match VkSlotBlend::new() {
                     Ok(v) => self.vk_blend = Some(v),
@@ -1766,6 +1865,202 @@ impl NvencCudaEncoder {
         }
     }
 
+    /// The slot layout a raw dmabuf session encodes: YUV444 for a 4:4:4 session, NVENC's
+    /// packed 10-bit for an HDR capture, else NV12 (`PUNKTFUNK_NV12`) or packed ARGB.
+    fn raw_buffer_format(&self, fmt: pf_frame::PixelFormat) -> nv::NV_ENC_BUFFER_FORMAT {
+        use nv::NV_ENC_BUFFER_FORMAT as F;
+        if self.chroma_444 {
+            return F::NV_ENC_BUFFER_FORMAT_YUV444;
+        }
+        match fmt {
+            pf_frame::PixelFormat::X2Rgb10 => F::NV_ENC_BUFFER_FORMAT_ARGB10,
+            pf_frame::PixelFormat::X2Bgr10 => F::NV_ENC_BUFFER_FORMAT_ABGR10,
+            _ if pf_zerocopy::nv12_enabled() => F::NV_ENC_BUFFER_FORMAT_NV12,
+            _ => F::NV_ENC_BUFFER_FORMAT_ARGB,
+        }
+    }
+
+    /// The fused convert: the worker writes `d`, cursor included, into ring slot `slot` — or
+    /// into the reframe staging slot, which the Lanczos pass then scales into the ring. One
+    /// GPU pass, no copy. A failure feeds the raw-dmabuf latch, so the next capture falls back
+    /// to the import path instead of looping here.
+    /// The raw lane: the held dmabuf goes through the worker's fused pass into the slot (or
+    /// the staging slot of a reframing session). `ordered`: the copy stream carries the
+    /// hand-off to NVENC; otherwise the CPU waits it here.
+    fn convert_raw(
+        &mut self,
+        captured: &CapturedFrame,
+        d: &DmabufFrame,
+        slot: usize,
+        ordered: bool,
+    ) -> Result<()> {
+        let fmt = slot_fmt_of(self.buffer_fmt);
+        let SlotSurface::Vk(dst) = &self.ring[slot].surface else {
+            bail!("NVENC (Linux): a raw dmabuf submit needs Vulkan input slots");
+        };
+        let dst = *dst;
+        let (target, src_size) = match &self.reframe {
+            Some(r) => (r.staging[slot], r.src),
+            None => (dst, (self.width, self.height)),
+        };
+        // A repeat of the frame just converted (the source produced nothing new) is cloned
+        // from its slot: one copy, no second worker round trip. The pass bakes the pointer in,
+        // so a cursor that moved over a still source is a different picture and must convert.
+        let mark = LastRaw {
+            pts_ns: captured.pts_ns,
+            fd: d.fd.as_raw_fd(),
+            slot,
+            cursor: cursor_mark(captured),
+        };
+        if let Some(last) = self.last_raw {
+            if last.pts_ns == mark.pts_ns
+                && last.fd == mark.fd
+                && last.cursor == mark.cursor
+                && last.slot != slot
+                && last.slot < self.ring.len()
+            {
+                let rows = fmt.rows(self.height) as usize;
+                let (src, dst_s) = (&self.ring[last.slot].surface, &self.ring[slot].surface);
+                cuda::copy_surface_to_surface(
+                    src.ptr(),
+                    dst_s.ptr(),
+                    dst_s.pitch(),
+                    rows,
+                    !ordered,
+                )
+                .context("NVENC (Linux): clone the repeat slot")?;
+                self.last_raw = Some(mark);
+                return Ok(());
+            }
+        }
+        let value = match self.convert_raw_inner(captured, d, fmt, target, src_size) {
+            Ok(v) => {
+                pf_zerocopy::note_raw_dmabuf_import_ok();
+                v
+            }
+            Err(e) => {
+                pf_zerocopy::note_raw_dmabuf_import_failure("nvenc convert");
+                return Err(e).context("NVENC (Linux): fused convert");
+            }
+        };
+        // A worker that died after replying may never signal the value we are about to wait on,
+        // and a CUDA external-semaphore wait has no timeout — refuse the frame while the failure
+        // is still an error rather than a hang.
+        if self.worker.as_ref().is_none_or(|w| w.dead()) {
+            pf_zerocopy::note_raw_dmabuf_import_failure("convert worker died mid-pass");
+            bail!("NVENC (Linux): the convert worker died before its pass could be waited on");
+        }
+        // The pass lands on the GPU; its value gates the copy stream, which is NVENC's input
+        // stream. An unordered submit, or a reframe reading the staging slot on another queue,
+        // waits here instead.
+        self.convert_sem
+            .as_ref()
+            .ok_or_else(|| anyhow!("convert timeline not imported"))?
+            .wait(value)
+            .context("NVENC (Linux): wait the fused pass")?;
+        if !ordered || self.reframe.is_some() {
+            // Bounded: the value came from another process, so a lost signal must cost this
+            // frame, not the encode thread. Generous against a slow 4K pass under load.
+            cuda::copy_stream_sync_deadline(std::time::Duration::from_secs(2))
+                .inspect_err(|_| pf_zerocopy::note_raw_dmabuf_import_failure("fused pass stalled"))
+                .context("NVENC (Linux): sync the fused pass")?;
+        }
+        if let Some(r) = &self.reframe {
+            let (crop, out) = (r.crop, r.out);
+            self.vk_blend
+                .as_mut()
+                .expect("a Vk ring implies the slot device")
+                .reframe(&target, &dst, fmt, crop, out)
+                .context("NVENC (Linux): reframe")?;
+        }
+        self.last_raw = Some(mark);
+        Ok(())
+    }
+
+    fn convert_raw_inner(
+        &mut self,
+        captured: &CapturedFrame,
+        d: &DmabufFrame,
+        fmt: SlotFormat,
+        target: VkSlotRef,
+        src_size: (u32, u32),
+    ) -> Result<u64> {
+        if self.worker.as_ref().is_none_or(|w| w.dead()) {
+            // A corpse, not a first spawn: its death is the lane's to count.
+            if self.worker.take().is_some() {
+                pf_zerocopy::note_raw_dmabuf_import_failure("convert worker died");
+            }
+            // The timeline and the slot registrations belonged to that process.
+            self.worker_slots.clear();
+            self.worker_cursor_serial = u64::MAX;
+            self.convert_sem = None;
+            let now = std::time::Instant::now();
+            if self.worker_retry_at.is_some_and(|at| now < at) {
+                bail!("NVENC (Linux): the convert worker is restarting");
+            }
+            self.worker_retry_at = Some(now + WORKER_RESPAWN_BACKOFF);
+            self.worker =
+                Some(pf_zerocopy::Importer::new_for_capture().context("spawn the convert worker")?);
+        }
+        let vk = self
+            .vk_blend
+            .as_mut()
+            .ok_or_else(|| anyhow!("no Vulkan slot device"))?;
+        let worker = self.worker.as_mut().expect("ensured above");
+        if self.convert_sem.is_none() {
+            let fd = worker
+                .convert_timeline()
+                .context("export the convert timeline")?;
+            self.convert_sem = Some(
+                cuda::ExternalSemaphore::import_owned_timeline_fd(fd.into_raw_fd())
+                    .context("import the convert timeline")?,
+            );
+        }
+        if !self.worker_slots.contains(&target.id) {
+            let (fd, size) = vk.slot_fd(target.id)?;
+            worker.register_slot(target.id as u32, fd, size)?;
+            self.worker_slots.insert(target.id);
+        }
+        let cursor = match &captured.cursor {
+            Some(ov) if ov.visible && ov.w > 0 && ov.h > 0 && !ov.rgba.is_empty() => {
+                if self.worker_cursor_serial != ov.serial {
+                    // A PQ frame takes the cursor re-encoded as PQ; sRGB bytes would be read as PQ.
+                    let rgba = if captured.format.is_hdr() {
+                        ov.pq_rgba()
+                    } else {
+                        ov.rgba.clone()
+                    };
+                    worker.set_cursor(ov.serial, ov.w, ov.h, &rgba)?;
+                    self.worker_cursor_serial = ov.serial;
+                }
+                Some(pf_zerocopy::CursorRect {
+                    x: ov.x,
+                    y: ov.y,
+                    w: ov.w,
+                    h: ov.h,
+                })
+            }
+            _ => None,
+        };
+        let src = pf_zerocopy::ConvertSrc {
+            fd: d.fd.as_raw_fd(),
+            fourcc: d.fourcc,
+            modifier: d.modifier,
+            offset: d.offset,
+            stride: d.stride,
+            width: captured.width,
+            height: captured.height,
+        };
+        let out = pf_zerocopy::ConvertOut {
+            mode: fmt.mode(),
+            width: src_size.0,
+            height: src_size.1,
+            pitch_w: (target.pitch / 4) as u32,
+            plane_rows: target.height,
+        };
+        worker.convert(&src, target.id as u32, &out, cursor)
+    }
+
     /// Device→device copy into the ring slot. `sync` blocks; `!sync` enqueues on the copy
     /// stream (stream-ordered submit — gate in [`Encoder::submit`]).
     fn copy_into_slot(&self, buf: &cuda::DeviceBuffer, slot: usize, sync: bool) -> Result<()> {
@@ -1806,6 +2101,19 @@ impl NvencCudaEncoder {
         }
     }
 
+    /// AV1 keyframes carry the HDR volume as metadata OBUs after the sequence header; NVENC
+    /// writes none itself.
+    fn av1_hdr_obus(&self, mut data: Vec<u8>, keyframe: bool) -> Vec<u8> {
+        if let Some(m) = self
+            .hdr_meta
+            .filter(|_| keyframe && self.hdr && self.codec == Codec::Av1)
+        {
+            let obus = pf_frame::hdr::av1_hdr_metadata_obus(&m);
+            pf_frame::hdr::av1_insert_before_frame(&mut data, &obus);
+        }
+        data
+    }
+
     /// Absorb one retrieve completion: FIFO-check, unmap on the encode thread (retrieve never
     /// touches input resources), queue the AU.
     fn absorb_done(&mut self, done: RetrieveDone) -> Result<()> {
@@ -1823,6 +2131,7 @@ impl NvencCudaEncoder {
             }
         }
         let (data, keyframe) = done.result.map_err(|e| anyhow!("{e}"))?;
+        let data = self.av1_hdr_obus(data, keyframe);
         self.async_rt
             .as_mut()
             .expect("absorb_done is only reachable in two-thread mode")
@@ -1893,11 +2202,14 @@ impl NvencCudaEncoder {
 
     /// One frame from a device buffer: session (re)init on a size or layout change, the copy
     /// into a ring slot, the cursor, then the encode call.
-    fn submit_device(&mut self, captured: &CapturedFrame, buf: &cuda::DeviceBuffer) -> Result<()> {
+    fn submit_device(&mut self, captured: &CapturedFrame, src: Source<'_>) -> Result<()> {
         self.maybe_engage_async();
         self.maybe_disengage_async();
         // Size or format change (NV12↔YUV444) re-inits.
-        let new_fmt = buffer_format(buf, captured.format);
+        let new_fmt = match src {
+            Source::Cuda(b) => buffer_format(b, captured.format),
+            Source::Dmabuf(_) => self.raw_buffer_format(captured.format),
+        };
         let input = (captured.width, captured.height);
         let size_changed = self.inited
             && match &self.reframe {
@@ -1930,20 +2242,25 @@ impl NvencCudaEncoder {
                 (self.width, self.height) = r.out;
             }
             self.buffer_fmt = new_fmt;
-            // Depth + HDR follow the input, not negotiation — keeps the label and bitstream
-            // in step when capture disagrees.
-            let ten_bit_in = is_ten_bit_input(new_fmt);
-            if self.bit_depth >= 10 && !ten_bit_in {
+            // Depth and HDR from the capture format: a packed-RGB 8-bit surface reaches a
+            // 10-bit SDR stream; a planar 8-bit one (NV12/YUV444) stays 8-bit rather than
+            // failing the 10-bit session.
+            let (depth, hdr) = depth_and_hdr(new_fmt, self.depth_asked);
+            if self.depth_asked >= 10 && depth < 10 {
                 tracing::warn!(
                     format = ?captured.format,
-                    "Linux direct-NVENC: 10-bit negotiated but the capture delivered an 8-bit \
-                     format — encoding 8-bit SDR (the stream is labelled to match)"
+                    "Linux direct-NVENC: 10-bit negotiated but the capture is a planar 8-bit \
+                     surface NVENC can't feed a 10-bit session — encoding 8-bit SDR (the stream \
+                     is labelled to match)"
                 );
             }
-            self.bit_depth = if ten_bit_in { 10 } else { 8 };
-            self.hdr = ten_bit_in;
+            (self.bit_depth, self.hdr) = (depth, hdr);
             // FREXT only on genuine YUV444; NV12/RGB cannot reconstruct full chroma.
-            self.chroma_444 = self.chroma_444 && buf.yuv444;
+            self.chroma_444 = self.chroma_444
+                && match src {
+                    Source::Cuda(b) => b.yuv444,
+                    Source::Dmabuf(_) => true,
+                };
             // `init_session` publishes `encoder` before later fallible steps. A failure leaves
             // a live session with `inited == false`; the next submit would skip teardown and
             // leak. `teardown` keys off `encoder.is_null()`, so it cleans this half-built state.
@@ -1995,28 +2312,41 @@ impl NvencCudaEncoder {
         let ordered = base_ordered && (captured.cursor.is_none() || cursor_ordered);
         let t0 = std::time::Instant::now();
 
-        match &self.reframe {
-            // A reframe reads the staging slot on the Vulkan queue: the copy must have landed.
-            Some(r) => {
-                let (stage, fmt) = (r.staging[slot], slot_fmt_of(self.buffer_fmt));
-                self.copy_into(buf, stage.ptr, stage.pitch, u64::from(stage.height), true)?;
-                let (crop, out) = (r.crop, r.out);
-                let (vk, SlotSurface::Vk(dst)) = (self.vk_blend.as_mut(), &self.ring[slot].surface)
-                else {
-                    bail!("NVENC (Linux): a reframing session without Vulkan slots");
-                };
-                vk.expect("a Vk ring implies the slot device")
-                    .reframe(&stage, dst, fmt, crop, out)
-                    .context("NVENC (Linux): reframe")?;
+        // A held dmabuf goes through the worker's fused pass (cursor included); a CUDA buffer
+        // is copied in, reframed when the session scales, and the cursor blended after.
+        let fused_cursor = if let Source::Dmabuf(d) = src {
+            self.convert_raw(captured, d, slot, ordered)?;
+            true
+        } else {
+            let Source::Cuda(buf) = src else {
+                unreachable!("the dmabuf arm returned above")
+            };
+            match &self.reframe {
+                // A reframe reads the staging slot on the Vulkan queue: the copy must have landed.
+                Some(r) => {
+                    let (stage, fmt) = (r.staging[slot], slot_fmt_of(self.buffer_fmt));
+                    self.copy_into(buf, stage.ptr, stage.pitch, u64::from(stage.height), true)?;
+                    let (crop, out) = (r.crop, r.out);
+                    let (vk, SlotSurface::Vk(dst)) =
+                        (self.vk_blend.as_mut(), &self.ring[slot].surface)
+                    else {
+                        bail!("NVENC (Linux): a reframing session without Vulkan slots");
+                    };
+                    vk.expect("a Vk ring implies the slot device")
+                        .reframe(&stage, dst, fmt, crop, out)
+                        .context("NVENC (Linux): reframe")?;
+                }
+                None => self.copy_into_slot(buf, slot, !ordered)?,
             }
-            None => self.copy_into_slot(buf, slot, !ordered)?,
-        }
+            false
+        };
         let t_copy = t0.elapsed();
 
         // Blend into this slot's owned surface (cursor rect, never the compositor dmabuf).
         // Ordered: copy/dispatch/encode on-device via timeline. Else CUDA copy then
         // fence-waited dispatch, then encode. Failure drops the cursor, never the frame.
-        if let Some(ov) = &captured.cursor {
+        // A fused convert already carries the cursor.
+        if let (false, Some(ov)) = (fused_cursor, &captured.cursor) {
             // A reframed picture takes the pointer scaled and moved with it.
             let (cw, ch, cx, cy) = match &mut self.reframe {
                 Some(r) => {
@@ -2028,7 +2358,12 @@ impl NvencCudaEncoder {
                     if r.cursor.as_ref().map(|c| c.0) != Some(ov.serial) {
                         let tw = (u64::from(ov.w) * u64::from(ow) / u64::from(w)).max(1) as u32;
                         let th = (u64::from(ov.h) * u64::from(oh) / u64::from(h)).max(1) as u32;
-                        let scaled = shrink_rgba(&ov.rgba, ov.w, ov.h, tw, th);
+                        let src = if captured.format.is_hdr() {
+                            ov.pq_rgba()
+                        } else {
+                            ov.rgba.clone()
+                        };
+                        let scaled = shrink_rgba(&src, ov.w, ov.h, tw, th);
                         r.cursor = Some((ov.serial, scaled, tw, th));
                     }
                     let (_, _, tw, th) = r.cursor.as_ref().expect("set above");
@@ -2046,9 +2381,10 @@ impl NvencCudaEncoder {
             {
                 if self.cursor_serial != ov.serial {
                     // Quiesces in-flight ordered blends before touching staging.
+                    let pq = captured.format.is_hdr().then(|| ov.pq_rgba());
                     let bitmap = match &self.reframe {
                         Some(r) => r.cursor.as_ref().map_or(&[][..], |c| c.1.as_slice()),
-                        None => ov.rgba.as_slice(),
+                        None => pq.as_deref().unwrap_or(&ov.rgba).as_slice(),
                     };
                     vk.upload_cursor(bitmap, cw, ch);
                     self.cursor_serial = ov.serial;
@@ -2280,16 +2616,16 @@ impl NvencCudaEncoder {
 impl Encoder for NvencCudaEncoder {
     fn submit(&mut self, captured: &CapturedFrame) -> Result<()> {
         let uploaded = match &captured.payload {
-            FramePayload::Cuda(_) => None,
             FramePayload::Cpu(pixels) => Some(self.upload_cpu(captured, pixels)?),
+            _ => None,
+        };
+        let src = match (&captured.payload, &uploaded) {
+            (FramePayload::Cuda(b), _) => Source::Cuda(b),
+            (_, Some(b)) => Source::Cuda(b),
+            (FramePayload::Dmabuf(d), _) if self.raw_wanted => Source::Dmabuf(d),
             _ => bail!("Linux direct-NVENC needs a CUDA or CPU frame; got a dmabuf"),
         };
-        let buf = match (&captured.payload, &uploaded) {
-            (FramePayload::Cuda(b), _) => b,
-            (_, Some(b)) => b,
-            _ => unreachable!("the match above took every other payload"),
-        };
-        let result = self.submit_device(captured, buf);
+        let result = self.submit_device(captured, src);
         if let Some(b) = uploaded {
             self.upload = Some(b);
         }
@@ -2489,6 +2825,7 @@ impl Encoder for NvencCudaEncoder {
             if let Some(us) = encode_us {
                 self.feed_split_arbiter(us);
             }
+            let data = self.av1_hdr_obus(data, keyframe);
             Ok(Some(EncodedFrame {
                 data,
                 pts_ns,
@@ -2742,6 +3079,11 @@ impl Encoder for NvencCudaEncoder {
     }
 }
 
+/// A floor that opens only after dropping split proves nothing about the no-split bitrate limit.
+fn proven_bitrate_ceiling(bps: u64, floor_dropped_split: bool) -> Option<u64> {
+    (!floor_dropped_split).then_some(bps)
+}
+
 impl Drop for NvencCudaEncoder {
     fn drop(&mut self) {
         // SAFETY: exclusive owner on the encode thread. `teardown` no-ops a null session;
@@ -2756,6 +3098,15 @@ mod tests {
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
     use pf_zerocopy::cuda::DeviceBuffer;
 
+    #[test]
+    fn split_fallback_does_not_poison_the_no_split_ceiling() {
+        assert_eq!(proven_bitrate_ceiling(10_000_000, true), None);
+        assert_eq!(
+            proven_bitrate_ceiling(620_000_000, false),
+            Some(620_000_000)
+        );
+    }
+
     /// Env helper for ignored hardware tests. Run `--test-threads=1` — they mutate process env.
     fn set_env(key: &str, val: impl AsRef<std::ffi::OsStr>) {
         // SAFETY: `--test-threads=1` hardware tests only — no concurrent env access.
@@ -2768,7 +3119,26 @@ mod tests {
         unsafe { std::env::remove_var(key) };
     }
 
-    /// Wrong NVENC format for packed 2:10:10:10 is silently 8-bit `ARGB` with channels shifted.
+    /// SDR-10 rides NVENC's 8→10, which takes packed RGB (`ARGB`) only. A planar 8-bit surface
+    /// (NV12/YUV444) stays 8-bit — feeding it a 10-bit session fails `register_resource`, the
+    /// real-capture regression this guards. Packed 10-bit input is HDR (BT.2020 PQ) regardless.
+    #[test]
+    fn depth_and_hdr_needs_packed_rgb_for_ten_bit() {
+        use nv::NV_ENC_BUFFER_FORMAT as F;
+        assert_eq!(depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ARGB, 10), (10, false));
+        assert_eq!(depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ARGB, 8), (8, false));
+        assert_eq!(depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_NV12, 10), (8, false));
+        assert_eq!(
+            depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_YUV444, 10),
+            (8, false)
+        );
+        assert_eq!(depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ARGB10, 8), (10, true));
+        assert_eq!(
+            depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ABGR10, 10),
+            (10, true)
+        );
+    }
+
     #[test]
     fn ten_bit_rgb_maps_to_the_matching_nvenc_format_and_blend_mode() {
         use nv::NV_ENC_BUFFER_FORMAT as F;
@@ -3406,6 +3776,134 @@ mod tests {
             "the direct-SDK path must still report a cursor blend at 10-bit"
         );
         println!("nvenc_cuda HDR10 cursor blend: {aus} AUs, slot fmt X2Rgb10");
+    }
+
+    /// Hardware: a packed-RGB 8-bit capture under a 10-bit session encodes a 10-bit stream,
+    /// BT.709, no PQ (the `.obu`/`.h265` land in `PUNKTFUNK_SMOKE_DIR` for `ffprobe`: each must
+    /// read `yuv420p10le` bt709). The planar arms are the regression guard: real Linux capture
+    /// is NV12 (and 4:4:4 is planar YUV444), which NVENC refuses in a 10-bit session — the
+    /// encoder must degrade those to 8-bit rather than fail `register_resource`.
+    ///
+    /// `cargo test -p pf-encode --features nvenc --lib nvenc_cuda_sdr10 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_sdr10_from_eight_bit_capture() {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        let dir = std::env::var("PUNKTFUNK_SMOKE_DIR").unwrap_or_else(|_| ".".into());
+        let cpu_frame = |i: u32| CapturedFrame {
+            provenance: Default::default(),
+            width: W,
+            height: H,
+            pts_ns: u64::from(i) * 16_666_667,
+            format: PixelFormat::Bgra,
+            payload: FramePayload::Cpu(crate::smoke_pattern::scroll_pattern(
+                W as usize, H as usize, i as usize,
+            )),
+            cursor: None,
+        };
+        for (codec, tag, ext) in [(Codec::Av1, "av1", "obu"), (Codec::H265, "hevc", "h265")] {
+            pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+            let mut enc = NvencCudaEncoder::open(
+                codec,
+                PixelFormat::Bgra,
+                W,
+                H,
+                60,
+                40_000_000,
+                true,
+                10,
+                ChromaFormat::Yuv420,
+                false,
+                4,
+            )
+            .expect("open NVENC CUDA SDR-10 session");
+            let mut stream = Vec::new();
+            for i in 0..12u32 {
+                enc.submit_indexed(&cpu_frame(i), i).expect("submit SDR-10");
+                while let Some(au) = enc.poll().expect("poll") {
+                    stream.extend_from_slice(&au.data);
+                }
+            }
+            enc.flush().ok();
+            assert!(!stream.is_empty(), "{tag}: no AUs produced");
+            assert_eq!(
+                enc.bit_depth, 10,
+                "{tag}: an 8-bit capture must still encode 10-bit"
+            );
+            assert!(
+                !enc.hdr,
+                "{tag}: 10-bit SDR must not claim HDR — that stamps a PQ VUI"
+            );
+            let path = format!("{dir}/nvenc-cuda-sdr10-{tag}.{ext}");
+            std::fs::write(&path, &stream).expect("write");
+            println!(
+                "nvenc_cuda SDR-10 {tag}: {} bytes, depth={} hdr={} -> {path}",
+                stream.len(),
+                enc.bit_depth,
+                enc.hdr
+            );
+        }
+
+        // Regression guard: a planar 8-bit capture (real Linux default is NV12; 4:4:4 is
+        // planar YUV444) under a 10-bit-negotiated session must degrade to 8-bit and encode,
+        // never fail register_resource and end the video.
+        for (label, fmt, chroma, alloc) in [
+            (
+                "nv12",
+                PixelFormat::Nv12,
+                ChromaFormat::Yuv420,
+                DeviceBuffer::alloc_nv12 as fn(u32, u32) -> anyhow::Result<DeviceBuffer>,
+            ),
+            (
+                "yuv444",
+                PixelFormat::Yuv444,
+                ChromaFormat::Yuv444,
+                DeviceBuffer::alloc_yuv444 as fn(u32, u32) -> anyhow::Result<DeviceBuffer>,
+            ),
+        ] {
+            pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+            let mut enc = NvencCudaEncoder::open(
+                Codec::H265,
+                fmt,
+                W,
+                H,
+                60,
+                40_000_000,
+                true,
+                10,
+                chroma,
+                false,
+                4,
+            )
+            .expect("open planar SDR-10 session");
+            let mut aus = 0usize;
+            for i in 0..4u32 {
+                let frame = CapturedFrame {
+                    provenance: Default::default(),
+                    width: W,
+                    height: H,
+                    pts_ns: u64::from(i) * 16_666_667,
+                    format: fmt,
+                    payload: FramePayload::Cuda(alloc(W, H).expect("alloc planar device buffer")),
+                    cursor: None,
+                };
+                enc.submit_indexed(&frame, i).unwrap_or_else(|e| {
+                    panic!("{label}: planar submit must degrade, not fail: {e:#}")
+                });
+                while let Some(_au) = enc.poll().expect("poll") {
+                    aus += 1;
+                }
+            }
+            enc.flush().ok();
+            assert_eq!(
+                enc.bit_depth, 8,
+                "{label}: a planar 8-bit capture must degrade to 8-bit"
+            );
+            assert!(!enc.hdr, "{label}: SDR");
+            assert!(aus > 0, "{label}: no AUs");
+            println!("nvenc_cuda SDR-10 {label}: degraded to 8-bit, {aus} AUs (no crash)");
+        }
     }
 
     /// Hardware: HEVC FREXT YUV444 (stacked-plane copy NV12 does not exercise).

@@ -1,0 +1,472 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unom <packages@unom.io>
+Date: Wed, 16 Sep 2026 09:33:08 +0200
+Subject: [PATCH] pipewire: offer a P010 capture format (BT.2020 PQ, 4:2:0)
+
+An HDR consumer whose encoder takes 4:2:0 directly (VAAPI Main 10, Vulkan Video) had two 10-bit choices, both packed RGB, so it paid a colour conversion of its own on every frame after this compositor had already composited the picture once. The NV12 offer covers that for SDR; nothing covered it at ten bits.
+
+P010 is NV12 with 16-bit samples, the 10-bit code in the high bits. The offer carries the same MANDATORY PQ + BT.2020 description as the packed 10-bit formats plus a MANDATORY BT.2020 limited-range matrix, so a consumer that wants anything else cannot land on it. The composite takes the HDR route the packed formats take, into the pooled 10-bit RGB texture, and a new pass writes the planes: the PQ codes go through the BT.2020 matrix as they are, never linearised, with the legal 10-bit range folded in. The planes are written through R16 / R16G16 views, so the image carries the mutable-format flag; the buffer geometry code treats NV12 and P010 as one planar family.
+
+Listed last, after the packed 10-bit formats: a consumer that prefers it names it first in its own offer.
+
+Stamp pfhdr13 so a host can tell the format is there before it commits a session.
+---
+ src/meson.build                 |  4 +-
+ src/pipewire.cpp                | 38 +++++++++++----
+ src/rendervulkan.cpp            | 37 +++++++++++----
+ src/rendervulkan.hpp            |  9 +++-
+ src/shaders/cs_rgb_to_p010.comp | 82 +++++++++++++++++++++++++++++++++
+ src/shaders/descriptor_set.h    |  7 +++
+ src/steamcompmgr.cpp            |  9 ++--
+ 7 files changed, 164 insertions(+), 22 deletions(-)
+ create mode 100644 src/shaders/cs_rgb_to_p010.comp
+
+diff --git a/src/meson.build b/src/meson.build
+index a37eadb..67039f4 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -70,6 +70,7 @@ shader_src = [
+   'shaders/cs_nis.comp',
+   'shaders/cs_nis_fp16.comp',
+   'shaders/cs_rgb_to_nv12.comp',
++  'shaders/cs_rgb_to_p010.comp',
+ ]
+ 
+ spirv_shaders = glsl_generator.process(shader_src)
+@@ -192,7 +193,8 @@ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+ #   +pfhdr10 — …and the CLI framerate limit persists across paints without switching refresh
+ #   +pfhdr11 — …and the Steam overlay repaints the capture on its own commits (no new capability)
+ #   +pfhdr12 — …and the capture push honours the consumer's maxFramerate
+-version_tag = vcs_tag + '+pfhdr12' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr13 — …and a P010 capture format (BT.2020 PQ, 4:2:0)
++version_tag = vcs_tag + '+pfhdr13' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/pipewire.cpp b/src/pipewire.cpp
+index 3c727e9..0ba573a 100644
+--- a/src/pipewire.cpp
++++ b/src/pipewire.cpp
+@@ -49,10 +49,17 @@ static constexpr uint32_t kSpaVideoColorPrimariesBt2020 = 7;
+ #if GAMESCOPE_PIPEWIRE_HDR
+ static bool is_hdr_video_format(uint32_t format)
+ {
+-	return format == SPA_VIDEO_FORMAT_xRGB_210LE || format == SPA_VIDEO_FORMAT_xBGR_210LE;
++	return format == SPA_VIDEO_FORMAT_xRGB_210LE || format == SPA_VIDEO_FORMAT_xBGR_210LE ||
++	       format == SPA_VIDEO_FORMAT_P010_10LE;
+ }
+ #endif
+ 
++// Two planes on one buffer: luma rows, then half as many interleaved chroma rows.
++static bool is_planar_video_format(uint32_t format)
++{
++	return format == SPA_VIDEO_FORMAT_NV12 || format == SPA_VIDEO_FORMAT_P010_10LE;
++}
++
+ static struct pipewire_state pipewire_state = { .stream_node_id = SPA_ID_INVALID };
+ static int nudgePipe[2] = { -1, -1 };
+ 
+@@ -76,7 +83,7 @@ static void destroy_buffer(struct pipewire_buffer *buffer) {
+ 	case SPA_DATA_MemFd:
+ 	{
+ 		off_t size = buffer->shm.stride * buffer->video_info.size.height;
+-		if (buffer->video_info.format == SPA_VIDEO_FORMAT_NV12) {
++		if (is_planar_video_format(buffer->video_info.format)) {
+ 			size += buffer->shm.stride * ((buffer->video_info.size.height + 1) / 2);
+ 		}
+ 		munmap(buffer->shm.data, size);
+@@ -180,6 +187,14 @@ static void add_format_color_params(struct spa_pod_builder *builder, spa_video_f
+ 	}
+ #if GAMESCOPE_PIPEWIRE_HDR
+ 	else if (is_hdr_video_format(format)) {
++		if (format == SPA_VIDEO_FORMAT_P010_10LE) {
++			// The 4:2:0 container fixes its matrix as well: BT.2020 limited is what the P010
++			// pass writes, so a consumer that wants anything else must not land here.
++			spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_colorMatrix, SPA_POD_PROP_FLAG_MANDATORY);
++			spa_pod_builder_id(builder, SPA_VIDEO_COLOR_MATRIX_BT2020);
++			spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_colorRange, SPA_POD_PROP_FLAG_MANDATORY);
++			spa_pod_builder_id(builder, SPA_VIDEO_COLOR_RANGE_16_235);
++		}
+ 		spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_transferFunction, SPA_POD_PROP_FLAG_MANDATORY);
+ 		spa_pod_builder_id(builder, kSpaVideoTransferSmpte2084);
+ 		spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_colorPrimaries, SPA_POD_PROP_FLAG_MANDATORY);
+@@ -254,6 +269,9 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
+ 	// on AMD or Intel. xRGB_210LE stays as the second pod for a consumer that only speaks it.
+ 	build_format_params(builder, SPA_VIDEO_FORMAT_xBGR_210LE, params);
+ 	build_format_params(builder, SPA_VIDEO_FORMAT_xRGB_210LE, params);
++	// P010 last: the same PQ/BT.2020 container already subsampled to 4:2:0 for a consumer whose
++	// encoder takes it as is. A consumer that prefers it names it first in its own offer.
++	build_format_params(builder, SPA_VIDEO_FORMAT_P010_10LE, params);
+ #endif
+ 
+ 	return params;
+@@ -314,7 +332,7 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
+ 	case SPA_DATA_MemFd:
+ 		chunk->offset = 0;
+ 		chunk->size = state->video_info.size.height * buffer->shm.stride;
+-		if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
++		if (is_planar_video_format(state->video_info.format)) {
+ 			chunk->size += ((state->video_info.size.height + 1)/2 * buffer->shm.stride);
+ 		}
+ 		chunk->stride = buffer->shm.stride;
+@@ -322,7 +340,7 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
+ 		if (!needs_reneg) {
+ 			uint8_t *pMappedData = tex->mappedData();
+ 
+-			if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
++			if (is_planar_video_format(state->video_info.format)) {
+ 				for (uint32_t i = 0; i < tex->height(); i++) {
+ 					const uint32_t lumaPwOffset = 0;
+ 					memcpy(
+@@ -356,7 +374,7 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
+ 		chunk->offset = dmabuf.offset[0];
+ 		chunk->stride = dmabuf.stride[0];
+ 		chunk->size = dmabuf.height * chunk->stride;
+-		if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
++		if (is_planar_video_format(state->video_info.format)) {
+ 			chunk->size += ((dmabuf.height + 1)/2 * chunk->stride);
+ 		}
+ 		break;
+@@ -459,9 +477,12 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
+ 
+ 	state->gamescope_info = gamescope_info;
+ 
++	// Bytes per sample of the first plane: packed RGB 4, NV12 1, P010 2.
+ 	int bpp = 4;
+ 	if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
+ 		bpp = 1;
++	} else if (state->video_info.format == SPA_VIDEO_FORMAT_P010_10LE) {
++		bpp = 2;
+ 	}
+ 
+ 	state->shm_stride = SPA_ROUND_UP_N(state->video_info.size.width * bpp, 4);
+@@ -474,7 +495,7 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
+ 
+ 	int buffers = 4;
+ 	int shm_size = state->shm_stride * state->video_info.size.height;
+-	if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
++	if (is_planar_video_format(state->video_info.format)) {
+ 		shm_size += ((state->video_info.size.height + 1) / 2) * state->shm_stride;
+ 	}
+ 	int data_type = state->dmabuf ? (1 << SPA_DATA_DmaBuf) : (1 << SPA_DATA_MemFd);
+@@ -556,6 +577,7 @@ uint32_t spa_format_to_drm(uint32_t spa_format)
+ 		// Same texture machinery the HDR AVIF screenshot path already uses.
+ 		case SPA_VIDEO_FORMAT_xRGB_210LE: return DRM_FORMAT_XRGB2101010;
+ 		case SPA_VIDEO_FORMAT_xBGR_210LE: return DRM_FORMAT_XBGR2101010;
++		case SPA_VIDEO_FORMAT_P010_10LE: return DRM_FORMAT_P010;
+ #endif
+ 		default:
+ 		case SPA_VIDEO_FORMAT_BGR: return DRM_FORMAT_XRGB8888;
+@@ -618,7 +640,7 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
+ 	screenshotImageFlags.bMappable = true;
+ 	screenshotImageFlags.bTransferDst = true;
+ 	screenshotImageFlags.bStorage = true;
+-	if (is_dmabuf || drmFormat == DRM_FORMAT_NV12)
++	if (is_dmabuf || drmFormat == DRM_FORMAT_NV12 || drmFormat == DRM_FORMAT_P010)
+ 	{
+ 		screenshotImageFlags.bExportable = true;
+ 		screenshotImageFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
+@@ -661,7 +683,7 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
+ 		}
+ 
+ 		off_t size = state->shm_stride * state->video_info.size.height;
+-		if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
++		if (is_planar_video_format(state->video_info.format)) {
+ 			size += state->shm_stride * ((state->video_info.size.height + 1) / 2);
+ 		}
+ 		if (ftruncate(fd, size) != 0) {
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index 0382a4b..a1084cd 100644
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -47,6 +47,7 @@
+ #include "cs_nis.h"
+ #include "cs_nis_fp16.h"
+ #include "cs_rgb_to_nv12.h"
++#include "cs_rgb_to_p010.h"
+ 
+ #define A_CPU
+ #include "shaders/ffx_a.h"
+@@ -81,6 +82,14 @@ static constexpr mat3x4 g_rgb2yuv_srgb_to_bt709_full = {{
+   { 0.5000f, -0.4542f, -0.0458f, 0.5f },
+ }};
+ 
++// P010 capture: BT.2020 limited range applied to PQ codes as they are, never linearised, with
++// the 10-bit legal range (64..940 luma, 64..960 chroma) folded in.
++static constexpr mat3x4 g_rgb2yuv_pq_to_bt2020_limited = {{
++  { 0.2250f, 0.5806f, 0.0508f, 0.0626f },
++  { -0.1223f, -0.3156f, 0.4379f, 0.5005f },
++  { 0.4379f, -0.4027f, -0.0352f, 0.5005f },
++}};
++
+ static const mat3x4& colorspace_to_conversion_from_srgb_matrix(EStreamColorspace colorspace) {
+ 	switch (colorspace) {
+ 		default:
+@@ -248,6 +257,7 @@ struct {
+ 	{ DRM_FORMAT_XBGR8888, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB, 4, false, false },
+ 	{ DRM_FORMAT_RGB565, VK_FORMAT_R5G6B5_UNORM_PACK16, VK_FORMAT_R5G6B5_UNORM_PACK16, 1, false, false },
+ 	{ DRM_FORMAT_NV12, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, 0, false, false },
++	{ DRM_FORMAT_P010, VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16, VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16, 0, false, false },
+ 	{ DRM_FORMAT_ABGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, 8, true, false },
+ 	{ DRM_FORMAT_XBGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, 8, false, false },
+ 	{ DRM_FORMAT_ABGR16161616, VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_UNORM, 8, true, false },
+@@ -995,6 +1005,7 @@ bool CVulkanDevice::createShaders()
+ 		SHADER(NIS, cs_nis);
+ 	}
+ 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
++	SHADER(RGB_TO_P010, cs_rgb_to_p010);
+ #undef SHADER
+ 
+ 	for (uint32_t i = 0; i < shaderInfos.size(); i++)
+@@ -1225,6 +1236,7 @@ void CVulkanDevice::compileAllPipelines(std::stop_token st)
+ 	SHADER(EASU, 1, 1, 1);
+ 	SHADER(NIS, 1, 1, 1);
+ 	SHADER(RGB_TO_NV12, 1, 1, 1);
++	SHADER(RGB_TO_P010, 1, 1, 1);
+ #undef SHADER
+ 
+ 	for (auto& info : pipelineInfos) {
+@@ -2152,6 +2164,11 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+ 		formatList.pNext = std::exchange(imageInfo.pNext, &formatList);
+ 		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+ 	}
++	else if ( imageInfo.format == VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 )
++	{
++		// The planes are written through R16 / R16G16 views, not the packed-10 plane formats.
++		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++	}
+ 
+ 	if ( pDMA != nullptr )
+ 	{
+@@ -2580,7 +2597,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+ 		if ( isYcbcr() )
+ 		{
+ 			createInfo.pNext = NULL;
+-			createInfo.format = VK_FORMAT_R8_UNORM;
++			createInfo.format = isYcbcr10() ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
+ 
+ 			createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
+ 			res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_lumaView);
+@@ -2590,7 +2607,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+ 			}
+ 
+ 			createInfo.pNext = NULL;
+-			createInfo.format = VK_FORMAT_R8G8_UNORM;
++			createInfo.format = isYcbcr10() ? VK_FORMAT_R16G16_UNORM : VK_FORMAT_R8G8_UNORM;
+ 			createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
+ 			res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_chromaView);
+ 			if ( res != VK_SUCCESS ) {
+@@ -4009,7 +4026,10 @@ std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo,
+ 	{
+ 		float scale = (float)pScreenshotTexture->width() / pYUVOutTexture->width();
+ 
+-		CaptureConvertBlitData_t constants( scale, colorspace_to_conversion_from_srgb_matrix( pYUVOutTexture->streamColorspace() ) );
++		// P010 takes the PQ codes as the composite stored them; NV12 linearises through the
++		// sRGB view and re-encodes gamma inside its matrix.
++		const bool bTenBit = pYUVOutTexture->isYcbcr10();
++		CaptureConvertBlitData_t constants( scale, bTenBit ? g_rgb2yuv_pq_to_bt2020_limited : colorspace_to_conversion_from_srgb_matrix( pYUVOutTexture->streamColorspace() ) );
+ 		constants.halfExtent[0] = pYUVOutTexture->width() / 2.0f;
+ 		constants.halfExtent[1] = pYUVOutTexture->height() / 2.0f;
+ 		cmdBuffer->uploadConstants<CaptureConvertBlitData_t>(constants);
+@@ -4017,9 +4037,9 @@ std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo,
+ 		for (uint32_t i = 0; i < EOTF_Count; i++)
+ 			cmdBuffer->bindColorMgmtLuts(i, nullptr, nullptr);
+ 
+-		cmdBuffer->bindPipeline(g_device.pipeline( SHADER_TYPE_RGB_TO_NV12, 1, 0, 0, GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB, EOTF_Count ));
++		cmdBuffer->bindPipeline(g_device.pipeline( bTenBit ? SHADER_TYPE_RGB_TO_P010 : SHADER_TYPE_RGB_TO_NV12, 1, 0, 0, GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB, EOTF_Count ));
+ 		cmdBuffer->bindTexture(0, pScreenshotTexture);
+-		cmdBuffer->setTextureSrgb(0, true);
++		cmdBuffer->setTextureSrgb(0, !bTenBit);
+ 		cmdBuffer->setSamplerNearest(0, false);
+ 		cmdBuffer->setSamplerUnnormalized(0, true);
+ 		for (uint32_t i = 1; i < VKR_SAMPLER_SLOTS; i++)
+@@ -4230,11 +4250,12 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
+ 			cmdBuffer->copyImage(compositeImage, pPipewireTexture);
+ 		} else {
+ 			const bool ycbcr = pPipewireTexture->isYcbcr();
++			const bool bTenBit = pPipewireTexture->isYcbcr10();
+ 
+ 			float scale = (float)compositeImage->width() / pPipewireTexture->width();
+ 			if ( ycbcr )
+ 			{
+-				CaptureConvertBlitData_t constants( scale, colorspace_to_conversion_from_srgb_matrix( pPipewireTexture->streamColorspace() ) );
++				CaptureConvertBlitData_t constants( scale, bTenBit ? g_rgb2yuv_pq_to_bt2020_limited : colorspace_to_conversion_from_srgb_matrix( pPipewireTexture->streamColorspace() ) );
+ 				constants.halfExtent[0] = pPipewireTexture->width() / 2.0f;
+ 				constants.halfExtent[1] = pPipewireTexture->height() / 2.0f;
+ 				cmdBuffer->uploadConstants<CaptureConvertBlitData_t>(constants);
+@@ -4248,9 +4269,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
+ 			for (uint32_t i = 0; i < EOTF_Count; i++)
+ 				cmdBuffer->bindColorMgmtLuts(i, nullptr, nullptr);
+ 
+-			cmdBuffer->bindPipeline(g_device.pipeline( ycbcr ? SHADER_TYPE_RGB_TO_NV12 : SHADER_TYPE_BLIT, 1, 0, 0, GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB, EOTF_Count ));
++			cmdBuffer->bindPipeline(g_device.pipeline( bTenBit ? SHADER_TYPE_RGB_TO_P010 : ycbcr ? SHADER_TYPE_RGB_TO_NV12 : SHADER_TYPE_BLIT, 1, 0, 0, GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB, EOTF_Count ));
+ 			cmdBuffer->bindTexture(0, compositeImage);
+-			cmdBuffer->setTextureSrgb(0, true);
++			cmdBuffer->setTextureSrgb(0, !bTenBit);
+ 			cmdBuffer->setSamplerNearest(0, false);
+ 			cmdBuffer->setSamplerUnnormalized(0, true);
+ 			for (uint32_t i = 1; i < VKR_SAMPLER_SLOTS; i++)
+diff --git a/src/rendervulkan.hpp b/src/rendervulkan.hpp
+index ee98b38..1e7b368 100644
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -197,7 +197,13 @@ public:
+ 
+ 	inline bool isYcbcr() const
+ 	{
+-		return format() == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
++		return format() == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM || isYcbcr10();
++	}
++
++	// P010: 16-bit planes carrying a 10-bit code in the high bits.
++	inline bool isYcbcr10() const
++	{
++		return format() == VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+ 	}
+ 
+ 	int memoryFence();
+@@ -561,6 +567,7 @@ enum ShaderType {
+ 	SHADER_TYPE_RCAS,
+ 	SHADER_TYPE_NIS,
+ 	SHADER_TYPE_RGB_TO_NV12,
++	SHADER_TYPE_RGB_TO_P010,
+ 
+ 	SHADER_TYPE_COUNT
+ };
+diff --git a/src/shaders/cs_rgb_to_p010.comp b/src/shaders/cs_rgb_to_p010.comp
+new file mode 100644
+index 0000000..ed6ea1c
+--- /dev/null
++++ b/src/shaders/cs_rgb_to_p010.comp
+@@ -0,0 +1,82 @@
++#version 450
++
++#extension GL_GOOGLE_include_directive : require
++#extension GL_EXT_scalar_block_layout : require
++
++#define DST_LUMA_FORMAT r16
++#define DST_CHROMA_FORMAT rg16
++#include "descriptor_set.h"
++
++layout(
++  local_size_x = 8,
++  local_size_y = 8,
++  local_size_z = 1) in;
++
++// P010 is NV12 with 16-bit samples, the 10-bit code in the high bits:
++// YYYYYYYYYYYYYYY...
++// YYYYYYYYYYYYYYY...
++// UVUVUVUVUVUVUVU...
++//
++// The source is the PQ-encoded BT.2020 composite, fetched as the codes it holds (no sRGB
++// view, no re-encode); u_outputCTM is the limited-range BT.2020 matrix on those codes.
++
++const uint u_frameId = 0;
++const uint u_shaderFilter = filter_linear_emulated;
++const uint u_alphaMode = 0;
++const float u_linearToNits = 400.0f;
++const float u_nitsToLinear = 1.0f / 100.0f;
++const float u_itmSdrNits = 100.f;
++const float u_itmTargetNits = 1000.f;
++
++layout(binding = 0, scalar)
++uniform layers_t {
++    vec2 u_scale[1];
++    vec2 u_offset[1];
++    float u_opacity[1];
++    mat3x4 u_ctm[1];
++    mat3x4 u_outputCTM;
++    uint u_borderMask;
++    uvec2 u_halfExtent;
++};
++
++#include "composite.h"
++
++vec3 fetchLayer(vec2 uv) {
++  ivec2 coord = ivec2((uv + u_offset[0]) * u_scale[0]);
++  ivec2 maxCoord = textureSize(s_samplers[0], 0) - ivec2(1);
++  return texelFetch(s_samplers[0], clamp(coord, ivec2(0), maxCoord), 0).rgb;
++}
++
++// A 10-bit code lands in the top bits of the 16-bit sample; the low six stay zero.
++vec3 toCodes(vec3 yuv) {
++  return vec3(uvec3(round(clamp(yuv, 0.0f, 1.0f) * 1023.0f)) << 6) / 65535.0f;
++}
++
++void main() {
++  ivec3 thread_id = ivec3(gl_GlobalInvocationID);
++
++  if (all(lessThan(thread_id.xy, ivec2(u_halfExtent.x, u_halfExtent.y)))) {
++    vec2 offset_table[4] = {
++      vec2(0, 0), vec2(1, 0), vec2(0, 1), vec2(1, 1),
++    };
++
++    ivec2 chroma_uv = thread_id.xy;
++    vec2 luma_uv = vec2(thread_id.xy * 2);
++
++    vec3 color[4] = {
++      fetchLayer(luma_uv + offset_table[0]),
++      fetchLayer(luma_uv + offset_table[1]),
++      fetchLayer(luma_uv + offset_table[2]),
++      fetchLayer(luma_uv + offset_table[3]),
++    };
++
++    vec3 avg_color = (color[0] + color[1] + color[2] + color[3]) / 4.0f;
++    vec3 uv = toCodes(vec4(avg_color, 1.0f) * u_outputCTM);
++    imageStore(dst_chroma, chroma_uv, vec4(uv.yz, 0.0f, 1.0f));
++
++    for (int i = 0; i < 4; i++) {
++      vec3 y = toCodes(vec4(color[i], 1.0f) * u_outputCTM);
++      imageStore(dst_luma, ivec2(luma_uv + offset_table[i]), vec4(y.x, 0.0f, 0.0f, 1.0f));
++    }
++  }
++}
+diff --git a/src/shaders/descriptor_set.h b/src/shaders/descriptor_set.h
+index f2b8527..db9941b 100644
+--- a/src/shaders/descriptor_set.h
++++ b/src/shaders/descriptor_set.h
+@@ -44,10 +44,17 @@ uint get_layer_colorspace(uint layerIdx) {
+     return bitfieldExtract(c_colorspaceMask, int(layerIdx) * colorspace_max_bits, colorspace_max_bits);
+ }
+ 
++#ifndef DST_LUMA_FORMAT
+ layout(binding = 1, rgba8) writeonly uniform image2D dst;
+ // alias
+ layout(binding = 1, rgba8) writeonly uniform image2D dst_luma;
+ layout(binding = 2, rgba8) writeonly uniform image2D dst_chroma;
++#else
++// A 16-bit planar target (cs_rgb_to_p010) names its plane formats before the include.
++layout(binding = 1, DST_LUMA_FORMAT) writeonly uniform image2D dst;
++layout(binding = 1, DST_LUMA_FORMAT) writeonly uniform image2D dst_luma;
++layout(binding = 2, DST_CHROMA_FORMAT) writeonly uniform image2D dst_chroma;
++#endif
+ 
+ layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
+ layout(binding = 4) uniform sampler2D s_ycbcr_samplers[VKR_SAMPLER_SLOTS];
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 2ce4eab..7ee2520 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -2350,9 +2350,9 @@ static void paint_pipewire()
+ 		return;
+ 
+ 	// The negotiated stream format decides the composite's colorimetry. A 10-bit target (the
+-	// xRGB_210LE / xBGR_210LE offer, whose SPA props say BT.2020 + PQ) gets the same fixed
+-	// BT.2020/PQ container the HDR AVIF screenshot path uses; everything else keeps the SDR
+-	// Gamma-2.2 composite it always had.
++	// xRGB_210LE / xBGR_210LE / P010 offers, whose SPA props say BT.2020 + PQ) gets the same
++	// fixed BT.2020/PQ container the HDR AVIF screenshot path uses; everything else keeps the
++	// SDR Gamma-2.2 composite it always had.
+ 	//
+ 	// Deliberately NOT conditional on the focused app being HDR, unlike bHDRScreenshot: the
+ 	// stream's colorimetry is fixed for the lifetime of the negotiation, so it must not follow
+@@ -2361,7 +2361,8 @@ static void paint_pipewire()
+ 	// --hdr-sdr-content-nits, HDR content passes through, and mixed scenes composite correctly.
+ 	const uint32_t uStreamDrmFormat = s_pPipewireBuffer->texture->drmFormat();
+ 	const bool bHDRStream = uStreamDrmFormat == DRM_FORMAT_XRGB2101010 ||
+-	                        uStreamDrmFormat == DRM_FORMAT_XBGR2101010;
++	                        uStreamDrmFormat == DRM_FORMAT_XBGR2101010 ||
++	                        uStreamDrmFormat == DRM_FORMAT_P010;
+ 
+ 	struct FrameInfo_t frameInfo = {};
+ 	frameInfo.applyOutputColorMgmt = true;

@@ -25,7 +25,7 @@
 // Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 // Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
 // in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 34
+#define PUNKTFUNK_ABI_VERSION 36
 
 // punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 //
@@ -1547,6 +1547,12 @@ typedef struct {
     uint8_t preferred_codec;
     // `PUNKTFUNK_CLIENT_CAP_*` bits ([`punktfunk_connect_ex9`]).
     uint8_t client_caps;
+    // Always `0`, ignored. Held so the struct keeps its v35 size.
+    uint32_t reserved1;
+    // Always `0`. Fills what would otherwise be tail padding: C leaves padding
+    // unspecified even under `= {0}`, so the next appended field would read a
+    // caller's garbage. Spend this before growing the struct again.
+    uint32_t reserved0;
 } PunktfunkConnectOpts;
 #endif
 
@@ -2578,20 +2584,6 @@ PunktfunkStatus punktfunk_connection_set_pad_mouse(PunktfunkConnection *c, uint1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Replace the controller-mouse layout from a JSON document: `settings` (the `pointer` and
-// `scroll` multipliers, `deadzone`, `long_press_ms`), a `buttons` table of pad button to
-// `mouse:left` / `key:Escape`, and a `chords` array of `buttons` + `press`
-// (`any` / `short` / `long` / `hold`) + `keys`. NULL restores the shipped table. A pad already
-// in controller mouse keeps the layout it entered with. `InvalidArg` on a document that does
-// not parse, and the live layout is left alone.
-//
-// # Safety
-// `c` is a valid connection handle; `json` is a NUL-terminated UTF-8 string or NULL.
-// Callable from any thread.
-PunktfunkStatus punktfunk_connection_set_pad_mouse_layout(PunktfunkConnection *c, const char *json);
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Pads in controller mouse now. A removed pad or a lost pointer grant clears its bit.
 //
 // # Safety
@@ -2975,6 +2967,18 @@ PunktfunkStatus punktfunk_connection_end_reject_said(const PunktfunkConnection *
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// The host's sentence when this session's launch did not give the player their game,
+// NUL-terminated, into the caller's buffer; empty otherwise. The latest verdict wins, so
+// poll it. A 256-byte buffer is ample: the wire caps this at 200.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable for `cap` bytes.
+PunktfunkStatus punktfunk_connection_launch_notice(const PunktfunkConnection *c,
+                                                   char *out,
+                                                   uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Mid-session typed rejection (`PUNKTFUNK_STATUS_REJECTED_*`); `0` = none.
 // Ask after `Closed`, before free. Connect-time rejections come from connect.
 //
@@ -3312,8 +3316,11 @@ PunktfunkH265Concealer *punktfunk_h265_concealer_new(void);
 // `c` was returned by [`punktfunk_h265_concealer_new`] and is not used after this call.
 void punktfunk_h265_concealer_free(PunktfunkH265Concealer *c);
 
-// Fold one Annex-B access unit. `out_kind` says what to decode; for `Rewritten`,
-// `out_buf`/`out_len` hold the bytes until [`punktfunk_h265_concealer_release`].
+// Fold one Annex-B access unit.
+//
+// `out_kind` says what to decode. For `Rewritten`, `out_buf` and `out_len`
+// hold the bytes until [`punktfunk_h265_concealer_release`]. A length that
+// cannot fit a Rust slice returns [`PunktfunkStatus::InvalidArg`].
 //
 // # Safety
 // `c` is a valid handle; `au` points to `len` readable bytes; the out pointers are writable.

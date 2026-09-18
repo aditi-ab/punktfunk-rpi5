@@ -143,6 +143,9 @@ pub mod ring;
 // DualSense voice-coil + speaker on the pad's 4-ch device (0xD1 plane): correlation, per-session renderer, tier-A registry the gamepad worker feeds.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 pub mod pad_audio;
+// Steam Controller 2 raw passthrough beside its SDL slot.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+mod sc2_capture;
 // Override catalog + connect-time resolver (`design/client-settings-profiles.md`). Bindings live on `trust`'s host records.
 #[cfg(any(
     target_os = "linux",

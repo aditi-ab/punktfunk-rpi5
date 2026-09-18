@@ -57,6 +57,7 @@ pub struct NativeVaapiEncoder {
 }
 
 impl NativeVaapiEncoder {
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         codec: Codec,
         width: u32,
@@ -65,6 +66,8 @@ impl NativeVaapiEncoder {
         bitrate_bps: u64,
         bit_depth: u8,
         chroma: ChromaFormat,
+        // BT.2020 PQ vs BT.709. Independent of depth: 10-bit SDR is Main10 under BT.709.
+        hdr: bool,
     ) -> Result<Self> {
         ensure!(!chroma.is_444(), "the native VAAPI encoder is 4:2:0 only");
         let ten_bit = bit_depth == 10;
@@ -78,11 +81,7 @@ impl NativeVaapiEncoder {
             }
             Codec::H265 => CodecParams::Hevc {
                 ten_bit,
-                colour: if ten_bit {
-                    COLOUR_BT2020_PQ
-                } else {
-                    COLOUR_BT709
-                },
+                colour: if hdr { COLOUR_BT2020_PQ } else { COLOUR_BT709 },
             },
             Codec::Av1 | Codec::PyroWave => {
                 bail!("the native VAAPI encoder does not encode {codec:?}")
@@ -225,10 +224,11 @@ impl Encoder for NativeVaapiEncoder {
                     offset: d.offset,
                     stride: d.stride,
                 }];
-                // NV12's chroma: named, or contiguous below the luma rows.
+                // NV12/P010 chroma: named by the producer, or contiguous below the luma
+                // rows. Both are two-plane; a single-plane import is refused by the driver.
                 if let Some((offset, stride)) = d.plane1 {
                     planes.push(ExportedPlane { fd, offset, stride });
-                } else if d.fourcc == vpp::DRM_FORMAT_NV12 {
+                } else if d.fourcc == vpp::DRM_FORMAT_NV12 || d.fourcc == vpp::DRM_FORMAT_P010 {
                     planes.push(ExportedPlane {
                         fd,
                         offset: d.offset + d.stride * frame.height,
@@ -495,9 +495,17 @@ mod tests {
     #[ignore = "needs a real VAAPI device"]
     fn native_vaapi_smoke() {
         let (w, h) = (320u32, 240u32);
-        let mut enc =
-            NativeVaapiEncoder::open(Codec::H264, w, h, 60, 4_000_000, 8, ChromaFormat::Yuv420)
-                .expect("open");
+        let mut enc = NativeVaapiEncoder::open(
+            Codec::H264,
+            w,
+            h,
+            60,
+            4_000_000,
+            8,
+            ChromaFormat::Yuv420,
+            false,
+        )
+        .expect("open");
         assert!(enc.caps().supports_rfi);
         let frame = |i: u32| {
             let mut buf = vec![0u8; (w * h * 4) as usize];
@@ -568,8 +576,9 @@ mod tests {
     /// `cargo test -p pf-encode native_vaapi_wave -- --ignored --nocapture`
     fn run_wave_smoke(codec: Codec, ext: &str) {
         let (w, h) = (256u32, 256u32);
-        let mut enc = NativeVaapiEncoder::open(codec, w, h, 60, 4_000_000, 8, ChromaFormat::Yuv420)
-            .expect("open");
+        let mut enc =
+            NativeVaapiEncoder::open(codec, w, h, 60, 4_000_000, 8, ChromaFormat::Yuv420, false)
+                .expect("open");
         const WAVE_START: usize = 3;
         // `PF_WAVE_SPOIL=1`: two frames into the wave a frame inside its sweep is lost, so
         // it closes unmarked and the wave queued behind it carries the start and close.

@@ -308,12 +308,11 @@ public final class SiriRemotePointer {
     }
 
     /// The threshold passed with Play/Pause still down → cycle the overlay and consume the press.
-    /// Writes the shared `statsVerbosity` default every reader observes through @AppStorage — the
-    /// same cycle as ⌃⌥⇧S, the three-finger tap and the controller's Select + X.
+    /// The same cycle as ⌃⌥⇧S, the three-finger tap and the controller's Select + X.
     private func statsHoldElapsed() {
         playPauseTimer = nil
         statsHoldFired = true
-        StatsVerbosity.cycle()
+        StatsVerbosity.requestCycle(for: connection)
     }
 
     /// A Play/Pause tap, delivered now that it resolved as one: the right button down, its

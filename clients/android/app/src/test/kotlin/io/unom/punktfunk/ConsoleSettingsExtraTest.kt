@@ -49,6 +49,21 @@ class ConsoleSettingsExtraTest {
         assertFalse(next.dsCapture)
     }
 
+    /** The console's sizes are unsigned: a raw `-2` fails the whole document and the console never starts. */
+    @Test
+    fun theSafeAreaModeCrossesAsNativePlusAFlag() {
+        val j = ConsoleJson.settings(Settings(width = SAFE_AREA_MODE, height = SAFE_AREA_MODE), null)
+        assertEquals(0, j.getInt("width"))
+        assertEquals(0, j.getInt("height"))
+        assertTrue(j.getBoolean("android.safe_area_mode"))
+        val back = ConsoleJson.applySettings(Settings(), j)
+        assertEquals(SAFE_AREA_MODE, back.width)
+        assertEquals(SAFE_AREA_MODE, back.height)
+        assertEquals(0, ConsoleJson.applySettings(back, JSONObject(j.toString()).put("android.safe_area_mode", false)).width)
+        val sized = JSONObject(j.toString()).put("width", 1280).put("height", 720)
+        assertEquals("a size ignores a stale flag", 1280, ConsoleJson.applySettings(back, sized).width)
+    }
+
     /** Both halves against each other — the shape only holds if they agree. */
     @Test
     fun theRoundTripKeepsEveryAndroidRow() {

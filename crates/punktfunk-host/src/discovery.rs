@@ -30,7 +30,7 @@ pub const NATIVE_SERVICE: &str = "_punktfunk._udp.local.";
 /// same knob. Multicast-dead environments (bridged Docker, CI netns) otherwise abort the
 /// GameStream plane; clients can still dial a manually-added host.
 pub(crate) fn mdns_enabled() -> bool {
-    !std::env::var("PUNKTFUNK_MDNS")
+    !pf_host_config::knob("PUNKTFUNK_MDNS")
         .map(|s| mdns_off_value(&s))
         .unwrap_or(false)
 }

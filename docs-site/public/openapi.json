@@ -57,7 +57,7 @@
           {
             "name": "id",
             "in": "path",
-            "description": "Action id (`power.sleep`, `power.reboot`, `power.shutdown`)",
+            "description": "Action id (`power.sleep`, `power.reboot`, `power.shutdown`, `host.restart`)",
             "required": true,
             "schema": {
               "type": "string"
@@ -1716,6 +1716,130 @@
           },
           "401": {
             "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/host/audio/apps": {
+      "get": {
+        "tags": [
+          "host"
+        ],
+        "summary": "List apps playing audio",
+        "description": "Audio output streams on the host right now, by app. Empty on a host that cannot list them.",
+        "operationId": "getPlayingApps",
+        "responses": {
+          "200": {
+            "description": "Apps playing audio now",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlayingApps"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/host/settings": {
+      "get": {
+        "tags": [
+          "host"
+        ],
+        "summary": "Get the host settings",
+        "description": "Every setting this host acts on, with the value in force and what set it.",
+        "operationId": "getHostSettings",
+        "responses": {
+          "200": {
+            "description": "The settings, in page order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostSettingsState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "host"
+        ],
+        "summary": "Change host settings",
+        "description": "Partial: only the named settings change, and `null` resets one. Every value is checked\nbefore anything is written. Applies per setting's `apply`: the next session, or a restart.",
+        "operationId": "patchHostSettings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostSettingsPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored; the new state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An unknown setting or a value it does not accept",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The settings file could not be written",
             "content": {
               "application/json": {
                 "schema": {
@@ -3682,7 +3806,7 @@
             }
           },
           "500": {
-            "description": "Settings could not be persisted",
+            "description": "Couldn't save the session settings",
             "content": {
               "application/json": {
                 "schema": {
@@ -3928,7 +4052,7 @@
           "session"
         ],
         "summary": "Watch this session's pads (SSE)",
-        "description": "One frame per pad state the host applies — what it injects, not what the client\nsays it sent — so a controller question is answered from the host's own hand\ninstead of an evdev dump. `data:` is a [`PadFrame`]; `event:` is `pad.state`.\nAttaching replays every live pad, so a button already held draws at once.\n\nConsole lane only, like the window routes: a paired certificate is not bound to\na session id, and this is the operator's own machine watching its own input.\n\nNothing is published while nobody is attached, so a console on another page —\nor none at all — costs the input thread one atomic load per pad event.",
+        "description": "One frame per pad state the host applies — what it injects, not what the client\nsays it sent — so a controller question is answered from the host's own hand\ninstead of an evdev dump. `data:` is a [`PadFrame`]; `event:` is `pad.state`.\nAttaching replays every live pad, so a button already held draws at once.\n\nConsole lane only: a paired certificate is not bound to a session id, and this\nis the operator's own machine watching its own input.\n\nNothing is published while nobody is attached, so a console on another page —\nor none at all — costs the input thread one atomic load per pad event.",
         "operationId": "streamSessionPads",
         "parameters": [
           {
@@ -4051,151 +4175,6 @@
           },
           "404": {
             "description": "No live session with that id",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/session/{id}/windows": {
-      "get": {
-        "tags": [
-          "session"
-        ],
-        "summary": "List this session's windows",
-        "description": "The toplevels on the head this session streams, so a client in a full-screen\ngame can see what is behind it. Free to every session: those windows are\nalready in the pixels it receives. The operator's other monitors are not in\nthe payload, whatever the caller's access.",
-        "operationId": "getSessionWindows",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Session id from `GET /status`",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64",
-              "minimum": 0
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Windows on this session's head",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/Toplevel"
-                  }
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid bearer token",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No live session with that id",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/session/{id}/windows/{window}": {
-      "post": {
-        "tags": [
-          "session"
-        ],
-        "summary": "Act on one of this session's windows",
-        "description": "Focus, full-screen or close by id, gated on the session's LIVE grants — the\nsame mask the input thread checks every event against. A view-only guest is\nrefused all three; a controller-only guest raises a window but never closes\none. An id this session's head does not currently hold is a 404, so a stale\nid cannot act on whatever now answers to it.",
-        "operationId": "actOnSessionWindow",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Session id from `GET /status`",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64",
-              "minimum": 0
-            }
-          },
-          {
-            "name": "window",
-            "in": "path",
-            "description": "Window id from `GET /session/{id}/windows`",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/WindowActionRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "The compositor accepted the verb"
-          },
-          "401": {
-            "description": "Missing or invalid bearer token",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "This session's access does not cover the verb",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No such session, or no such window on its head",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          },
-          "502": {
-            "description": "The compositor refused the verb",
             "content": {
               "application/json": {
                 "schema": {
@@ -5413,6 +5392,10 @@
             ],
             "description": "Store-qualified library id (`steam:570`); matches `GET /library`. Absent for a typed GameStream command."
           },
+          "awaiting_window": {
+            "type": "boolean",
+            "description": "Present and true while `running` on a host that will report `window` next. A launch hold\nwaits for that instead of revealing a game that is still loading."
+          },
           "client": {
             "type": "string",
             "description": "Client-supplied device name of the session that launched it; may be empty."
@@ -5438,7 +5421,7 @@
           },
           "state": {
             "type": "string",
-            "description": "`launching` | `running` | `exited` | `untracked` (exit will never be seen) | `grace` (reconnect window).",
+            "description": "`launching` | `running` | `window` (its window is on the streamed screen) | `exited` |\n`untracked` (exit will never be seen) | `grace` (reconnect window).",
             "example": "running"
           },
           "store": {
@@ -6021,6 +6004,13 @@
           "samples"
         ],
         "properties": {
+          "link": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LinkMinute"
+            },
+            "description": "One row per minute of link health per native session, so a freeze report carries the\nloss, recovery and ABR history instead of a log ring that holds 45 minutes. Empty on a\nGameStream capture and on recordings older than this field."
+          },
           "meta": {
             "$ref": "#/components/schemas/CaptureMeta"
           },
@@ -6619,7 +6609,7 @@
           },
           "name": {
             "type": "string",
-            "description": "Client-supplied; empty for anonymous or compat-plane clients."
+            "description": "Display name: the trust-store name (a console rename wins), else the name the client\nsent. On the compat plane it is the name the operator gave the device, since Moonlight\nsends none. Empty when there is no name at all."
           },
           "plane": {
             "$ref": "#/components/schemas/Plane"
@@ -7402,7 +7392,7 @@
             "properties": {
               "app_id": {
                 "type": "string",
-                "description": "Wayland `app_id`, or the X11 class on an Xwayland window."
+                "description": "Wayland `app_id` or X11 class; `steam_app_<id>` under gamescope; empty on Windows."
               },
               "game": {
                 "$ref": "#/components/schemas/GameRefPayload"
@@ -7415,7 +7405,7 @@
               },
               "title": {
                 "type": "string",
-                "description": "Title the compositor reports for that window."
+                "description": "Title the compositor or the desktop reports for that window."
               }
             }
           },
@@ -7732,6 +7722,29 @@
           },
           {
             "type": "object",
+            "description": "The operator changed host settings. Re-read `GET /api/v1/host/settings`.",
+            "required": [
+              "ids",
+              "kind"
+            ],
+            "properties": {
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Setting ids the write named."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "settings.changed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "Emitted on ACCEPT, and again if the executor later fails. A succeeded power\naction ends this process, so \"accepted with no later failure\" is success.",
             "required": [
               "id",
@@ -7752,7 +7765,7 @@
               },
               "id": {
                 "type": "string",
-                "description": "`power.sleep`, `power.reboot`, `power.shutdown`."
+                "description": "`power.sleep`, `power.reboot`, `power.shutdown`, `host.restart`."
               },
               "kind": {
                 "type": "string",
@@ -7992,6 +8005,13 @@
           },
           "client": {
             "type": "string"
+          },
+          "fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stable id of the device that launched it; the filter handle a name cannot be."
           },
           "plane": {
             "$ref": "#/components/schemas/Plane"
@@ -8507,6 +8527,47 @@
           }
         }
       },
+      "HostSettingsPatch": {
+        "type": "object",
+        "description": "Setting id → new value; `null` returns a setting to its default.",
+        "additionalProperties": {},
+        "propertyNames": {
+          "type": "string"
+        },
+        "example": {
+          "clipboard": "text",
+          "max_fps": null
+        }
+      },
+      "HostSettingsState": {
+        "type": "object",
+        "required": [
+          "settings",
+          "restart_pending",
+          "env_file"
+        ],
+        "properties": {
+          "env_file": {
+            "type": "string",
+            "description": "The file an operator edits to pin a setting.",
+            "example": "/home/me/.config/punktfunk/host.env"
+          },
+          "restart_pending": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Setting ids waiting for a restart."
+          },
+          "settings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SettingState"
+            },
+            "description": "Rows this host acts on, in page order."
+          }
+        }
+      },
       "HostTheme": {
         "type": "object",
         "description": "The desktop's appearance, as far as this host can see it.",
@@ -8804,6 +8865,23 @@
         ],
         "description": "Linger after the last client detaches. Tagged on `mode` so the web form\nand OpenAPI stay `{\"mode\":\"off\"}` / `{\"mode\":\"duration\",\"seconds\":N}` /\n`{\"mode\":\"forever\"}`. On gamescope's bare spawn this also keeps the\nnested session and its game."
       },
+      "LaunchArg": {
+        "type": "object",
+        "description": "One `{param}` value for an `exec` template.",
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The parameter's name in the template."
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
       "LaunchSpec": {
         "type": "object",
         "description": "How the host launches a title. Open-ended so new stores slot in:\n`steam_appid` → `steam steam://rungameid/<value>`; `command` → run `<value>`\nnested in a gamescope session.",
@@ -8812,6 +8890,16 @@
           "value"
         ],
         "properties": {
+          "args": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/LaunchArg"
+            },
+            "description": "Values for an `exec` template's parameters. Each is checked against the character class\nthe manifest declares for it, and a path must sit inside the paths that manifest names.\nA list rather than a map: a map of strings generates as an untyped object in the SDK."
+          },
           "kind": {
             "type": "string",
             "description": "`\"steam_appid\"` or `\"command\"`.",
@@ -8819,7 +8907,7 @@
           },
           "value": {
             "type": "string",
-            "description": "Appid for `steam_appid`, or the shell command for `command`."
+            "description": "Appid for `steam_appid`, the shell command for `command`, or — for `exec` — the name of a\ntemplate in the publishing plugin's manifest."
           }
         }
       },
@@ -8848,6 +8936,152 @@
           "auto-row",
           "manual"
         ]
+      },
+      "LinkMinute": {
+        "type": "object",
+        "description": "One minute of link health for one session. Every field is a delta for the window except\nthe bands, which are min..max over it.",
+        "required": [
+          "session_id",
+          "secs",
+          "windows",
+          "loss_windows",
+          "loss_max_ppm",
+          "loss_mean_ppm",
+          "unrecovered",
+          "rfi",
+          "rfi_declined",
+          "anchor_p",
+          "intra_refresh",
+          "keyframe_req",
+          "idr",
+          "fec_min_pct",
+          "fec_max_pct",
+          "abr_min_kbps",
+          "abr_max_kbps",
+          "abr_backoffs",
+          "retargets",
+          "gaps",
+          "egress_kbps"
+        ],
+        "properties": {
+          "abr_backoffs": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Client bitrate asks below the rate the encoder was running. The host cannot see which\nof loss, delay or decode drove them — only that the client's controller retreated.",
+            "minimum": 0
+          },
+          "abr_max_kbps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "abr_min_kbps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "anchor_p": {
+            "type": "integer",
+            "format": "int32",
+            "description": "What the encoder answered an RFI with: a clean P against a surviving reference, or a\nwave that recodes the picture over ~0.5 s.",
+            "minimum": 0
+          },
+          "egress_kbps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Sealed wire throughput over the window.",
+            "minimum": 0
+          },
+          "fec_max_pct": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "fec_min_pct": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "gaps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pipeline gaps this host announced: its own stalls, not the network's.",
+            "minimum": 0
+          },
+          "idr": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "intra_refresh": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "keyframe_req": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Client decode-recovery asks, and the IDRs actually forced (the cooldown coalesces).",
+            "minimum": 0
+          },
+          "loss_max_ppm": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "loss_mean_ppm": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "loss_windows": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Of `windows`, those that reported any loss.",
+            "minimum": 0
+          },
+          "retargets": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Times the encoder's rate actually moved.",
+            "minimum": 0
+          },
+          "rfi": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Client reference-frame invalidation asks, and those the encoder refused (each refusal\ncosts an IDR).",
+            "minimum": 0
+          },
+          "rfi_declined": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "secs": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds this line covers. 60, except the last line of a session.",
+            "minimum": 0
+          },
+          "session_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The `/status` session id, so a line ties to a row.",
+            "minimum": 0
+          },
+          "unrecovered": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Windows that closed with frames parity could not repair.",
+            "minimum": 0
+          },
+          "windows": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Client loss reports that closed here. 0 = the client sent none, which is itself a fault.",
+            "minimum": 0
+          }
+        }
       },
       "LocalSummary": {
         "type": "object",
@@ -9458,6 +9692,25 @@
           "native",
           "gamestream"
         ]
+      },
+      "PlayingApps": {
+        "type": "object",
+        "required": [
+          "apps"
+        ],
+        "properties": {
+          "apps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Lowercased app names, as the voice-chat app list matches them.",
+            "example": [
+              "discord",
+              "firefox"
+            ]
+          }
+        }
       },
       "PluginLogBatch": {
         "type": "object",
@@ -10321,12 +10574,20 @@
           "id",
           "client",
           "mode",
-          "hdr"
+          "hdr",
+          "plane"
         ],
         "properties": {
           "client": {
             "type": "string",
             "description": "Cert-fingerprint prefix, or peer IP for an anonymous client — not [`ClientRef::name`]."
+          },
+          "fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The device's full stable id, for a hook filter. Absent for an anonymous client."
           },
           "hdr": {
             "type": "boolean"
@@ -10339,6 +10600,10 @@
           "mode": {
             "type": "string",
             "description": "`WxH@Hz`, e.g. `\"3840x2160@120\"`."
+          },
+          "plane": {
+            "$ref": "#/components/schemas/Plane",
+            "description": "Which plane serves it, as `stream.*` and `game.*` also report."
           }
         }
       },
@@ -10387,6 +10652,17 @@
             "type": "boolean",
             "description": "Sharing another session's display rather than owning one. Which session it joined\nis not reported yet — the two registries do not share ids (issue #1095)."
           },
+          "link": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LinkMinute",
+                "description": "The last closed minute of link health: loss, the recovery frames it cost, and the FEC\nand bitrate bands. `null` in a session's first minute, and on the compat plane."
+              }
+            ]
+          },
           "mode": {
             "type": "string",
             "description": "`WxH@Hz`.",
@@ -10413,6 +10689,15 @@
             "format": "int32",
             "description": "Player slot the operator picked for this session, 0-based (`PUT\n/session/{id}/player`). `null` = the slot is whichever comes free.",
             "minimum": 0
+          },
+          "shared_path_with": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "description": "Other live sessions from this client's address — one NAT or tunnel, so most likely one\nnetwork path. Their bitrates adapt independently. Absent when there are none."
           },
           "uptime_s": {
             "type": "integer",
@@ -10632,6 +10917,157 @@
             "type": "string",
             "description": "`auto` (env pin, else max dedicated VRAM) or `manual`.",
             "example": "manual"
+          }
+        }
+      },
+      "SettingApply": {
+        "type": "string",
+        "enum": [
+          "now",
+          "next_session",
+          "restart"
+        ]
+      },
+      "SettingGroup": {
+        "type": "string",
+        "enum": [
+          "streaming",
+          "video",
+          "audio",
+          "input",
+          "network",
+          "game_mode",
+          "session",
+          "system"
+        ]
+      },
+      "SettingKind": {
+        "type": "string",
+        "enum": [
+          "bool",
+          "int",
+          "enum",
+          "text",
+          "list"
+        ]
+      },
+      "SettingSource": {
+        "type": "string",
+        "enum": [
+          "default",
+          "store",
+          "env",
+          "flag"
+        ]
+      },
+      "SettingState": {
+        "type": "object",
+        "description": "One setting as the console renders it.",
+        "required": [
+          "id",
+          "group",
+          "kind",
+          "default",
+          "value",
+          "source",
+          "env",
+          "apply",
+          "advanced",
+          "title",
+          "docs",
+          "restart_pending"
+        ],
+        "properties": {
+          "advanced": {
+            "type": "boolean"
+          },
+          "apply": {
+            "$ref": "#/components/schemas/SettingApply"
+          },
+          "default": {},
+          "docs": {
+            "type": "string",
+            "description": "docs-site page slug under `/docs/`."
+          },
+          "env": {
+            "type": "string",
+            "description": "The name to set in `host.env` to pin this setting."
+          },
+          "group": {
+            "$ref": "#/components/schemas/SettingGroup"
+          },
+          "id": {
+            "type": "string",
+            "description": "Store key; the console's copy key is `setting_<id>`."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SettingKind"
+          },
+          "max": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`int` only."
+          },
+          "max_len": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`text` only.",
+            "minimum": 0
+          },
+          "min": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`int` only."
+          },
+          "options": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "`enum` only, canonical spellings in display order."
+          },
+          "origin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The env var or CLI flag that set `value` (`source` `env` or `flag`)."
+          },
+          "restart_pending": {
+            "type": "boolean",
+            "description": "Changed since the host started, and applies only after a restart."
+          },
+          "source": {
+            "$ref": "#/components/schemas/SettingSource"
+          },
+          "stored": {
+            "description": "The console's value, even while an env var or flag overrides it."
+          },
+          "title": {
+            "type": "string",
+            "description": "English label, for a setting the console has no copy for."
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`int` only, e.g. `fps`."
+          },
+          "value": {
+            "description": "The value in force."
           }
         }
       },
@@ -10988,6 +11424,13 @@
           "client": {
             "type": "string"
           },
+          "fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The device's stable id — what a hook filter should key on, since a display name is\nneither unique nor fixed. Absent for an anonymous client."
+          },
           "hdr": {
             "type": "boolean"
           },
@@ -11012,6 +11455,14 @@
         "properties": {
           "fingerprint": {
             "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Name for this device, scrubbed like `PATCH /clients/{fp}` and stored once the pairing\ncompletes. Every Moonlight client names itself the same, so without one the device is\nlisted by fingerprint until somebody renames it.",
+            "example": "Living Room TV"
           },
           "peer_ip": {
             "type": "string"
@@ -11068,52 +11519,6 @@
           "signature": {
             "type": "string",
             "description": "Base64 ECDSA-P256-SHA256 signature, ASN.1 DER, over the same message the control stream\nuses: context, the host's identity fingerprint, then the nonce."
-          }
-        }
-      },
-      "Toplevel": {
-        "type": "object",
-        "description": "One compositor toplevel, as every backend reports it.\n\n`id` is the backend's own handle (a Hyprland address, a sway con id) and is\nopaque above this module: it goes back to the backend that minted it and\nnowhere else. Defined on every platform — the management route and its\nschema exist on a Windows host too, which simply lists nothing.",
-        "required": [
-          "id",
-          "title",
-          "app_id",
-          "focused",
-          "fullscreen",
-          "workspace",
-          "output"
-        ],
-        "properties": {
-          "app_id": {
-            "type": "string",
-            "description": "Wayland `app_id`, or the X11 class on an Xwayland window."
-          },
-          "focused": {
-            "type": "boolean"
-          },
-          "fullscreen": {
-            "type": "boolean"
-          },
-          "id": {
-            "type": "string",
-            "description": "Backend handle. Never parsed above the backend, never reused across one."
-          },
-          "output": {
-            "type": "string",
-            "description": "The head this window is on — always the streamed one, by construction."
-          },
-          "pid": {
-            "type": "integer",
-            "format": "int32",
-            "description": "`None` where the compositor does not report one (some Xwayland cons).",
-            "minimum": 0
-          },
-          "title": {
-            "type": "string"
-          },
-          "workspace": {
-            "type": "string",
-            "description": "Workspace name as the compositor spells it, not its id."
           }
         }
       },
@@ -11498,27 +11903,6 @@
             "minimum": 0
           }
         }
-      },
-      "WindowActionRequest": {
-        "type": "object",
-        "required": [
-          "action"
-        ],
-        "properties": {
-          "action": {
-            "$ref": "#/components/schemas/WindowVerb",
-            "description": "`focus` | `fullscreen` | `close`."
-          }
-        }
-      },
-      "WindowVerb": {
-        "type": "string",
-        "description": "What a client may ask of one window.\n\nDefined on every platform: the management route decodes it before any\nbackend is consulted.",
-        "enum": [
-          "focus",
-          "fullscreen",
-          "close"
-        ]
       },
       "WorkspacePlacement": {
         "type": "string",

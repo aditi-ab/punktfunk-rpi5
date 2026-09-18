@@ -32,14 +32,15 @@ static PunktfunkConfig make_config(uint32_t role, uint32_t drop_period) {
 int main(void) {
     printf("punktfunk-core C ABI harness (abi_version=%u)\n", punktfunk_abi_version());
 
-    /* PunktfunkConnectOpts (v26): the C compiler must agree with Rust's const-asserted layout —
-     * 96 bytes on 64-bit / 68 on 32-bit, NO tail padding (the growth contract: an appended field
-     * may never land in bytes an older caller's sizeof already covered) — and the size-prefix
-     * guard must reject an undersized struct as a status, not a read. The declaration sits
-     * behind the header's quic guard; the staticlib this harness links always carries quic
-     * (see the -lopus/Security link line), so the check only needs the define. */
+    /* PunktfunkConnectOpts (v35): the C compiler must agree with Rust's const-asserted layout —
+     * 104 bytes on 64-bit / 76 on 32-bit, NO tail padding (the growth contract: an appended field
+     * may never land in bytes an older caller's sizeof already covered, and C leaves padding
+     * unspecified, which is what `reserved0` exists to prevent) — and the size-prefix guard must
+     * reject an undersized struct as a status, not a read. The declaration sits behind the
+     * header's quic guard; the staticlib this harness links always carries quic (see the
+     * -lopus/Security link line), so the check only needs the define. */
 #ifdef PUNKTFUNK_FEATURE_QUIC
-    if (sizeof(PunktfunkConnectOpts) != (sizeof(void *) == 8 ? 96u : 68u)) {
+    if (sizeof(PunktfunkConnectOpts) != (sizeof(void *) == 8 ? 104u : 76u)) {
         fprintf(stderr, "FAIL: PunktfunkConnectOpts is %zu bytes\n", sizeof(PunktfunkConnectOpts));
         return 1;
     }
@@ -54,6 +55,22 @@ int main(void) {
         }
     }
 #endif
+
+    {
+        PunktfunkH265Concealer *concealer = punktfunk_h265_concealer_new();
+        PunktfunkConcealment kind = PUNKTFUNK_CONCEALMENT_INTACT;
+        uint8_t byte = 0;
+        uint8_t *out = NULL;
+        uintptr_t out_len = 0;
+        PunktfunkStatus status = punktfunk_h265_concealer_conceal(
+            concealer, &byte, SIZE_MAX, &kind, &out, &out_len);
+        if (status != PUNKTFUNK_STATUS_INVALID_ARG) {
+            fprintf(stderr, "FAIL: unrepresentable concealer input accepted (st=%d)\n",
+                    (int)status);
+            return 1;
+        }
+        punktfunk_h265_concealer_free(concealer);
+    }
 
     const uint32_t DROP_PERIOD = 8;   /* drop 1 of every 8 packets */
     PunktfunkConfig host_cfg = make_config(0, DROP_PERIOD);

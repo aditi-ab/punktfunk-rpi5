@@ -523,7 +523,6 @@ pub(crate) fn window_action(verb: crate::toplevels::WindowVerb, id: &str) -> Res
     let argv = match verb {
         WindowVerb::Focus => vec![sel.as_str(), "focus"],
         WindowVerb::Fullscreen => vec![sel.as_str(), "fullscreen", "enable"],
-        WindowVerb::Close => vec![sel.as_str(), "kill"],
     };
     swaymsg(&argv).map(|_| ())
 }
@@ -1240,7 +1239,7 @@ mod tests {
     #[test]
     fn a_window_verb_refuses_an_id_that_is_not_a_con_number() {
         use crate::toplevels::WindowVerb;
-        assert!(window_action(WindowVerb::Close, "12] kill; [con_id=99").is_err());
+        assert!(window_action(WindowVerb::Fullscreen, "12] kill; [con_id=99").is_err());
         assert!(window_action(WindowVerb::Focus, "").is_err());
     }
 

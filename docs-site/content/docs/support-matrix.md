@@ -186,7 +186,7 @@ newer on AMD, Arc and newer on Intel).
 | Windows · AMD | AMF (native) | probed | ✅ probed | ❌ ³ |
 | Windows · Intel | QSV (native) | probed | ⚠️ ⁴ | ❌ |
 | Windows · any | PyroWave | wavelet ⁵ | ✅ | ✅ |
-| Windows · none | software H.264 | H.264 only | ❌ | ❌ |
+| Windows · none | no encode path | — | ❌ | ❌ |
 | Linux · NVIDIA | NVENC (direct SDK) | probed ¹ | ✅ ⁶ | ⚠️ ² |
 | Linux · AMD, Intel | Vulkan Video | HEVC, AV1 ⁷ | ⚠️ probed | ❌ |
 | Linux · AMD, Intel | VAAPI | probed | ⚠️ probed | ❌ ⁹ |
@@ -216,17 +216,17 @@ newer on AMD, Arc and newer on Intel).
 7. H.264 never uses this backend, and it exists only in a build carrying the Vulkan-encode feature
    (every shipped Linux package does). Even then the device is asked, per codec and per bit depth,
    whether it can open that encode profile; a "no" routes to VAAPI before a session is burned. A
-   Vulkan open that fails also falls back to VAAPI — with one deliberate exception: if the capture
-   already negotiated producer-native NV12 (gamescope), there is no fallback and the session fails
-   loudly, because VAAPI would misread that two-plane buffer as packed RGB and stream silent
-   garbage.
+   Vulkan open that fails falls back to the native VAAPI session, which takes a producer's
+   NV12 as it is (no conversion pass), so a gamescope session that negotiated NV12 keeps
+   streaming either way.
 8. PyroWave is 8-bit on Linux. The 10-bit path exists only on Windows.
 9. Not a hardware limit — the VAAPI backend simply has no 4:4:4 path yet, so the probe declines
    unconditionally and the session is negotiated as 4:2:0.
 10. Explicit-only on Linux. `auto` never resolves here — a box with no usable GPU driver fails the
     session at encoder open rather than quietly encoding on the CPU, so set
-    `PUNKTFUNK_ENCODER=software` deliberately if that is what you want. On Windows, by contrast, an
-    unrecognised adapter does resolve to software on its own.
+    `PUNKTFUNK_ENCODER=software` deliberately if that is what you want. Windows has no software
+    encoder at all — the pf-vdisplay driver encodes, so a host without a usable render adapter
+    fails at encoder open.
 
 **4:4:4 across the whole project:** only HEVC and PyroWave can carry it, and only NVENC and
 PyroWave can produce it — so on the HEVC side full chroma means an NVIDIA host. Asking for it is a
@@ -557,7 +557,7 @@ capability.
 | **Protocol core** — `punktfunk-core`, the C ABI, FEC and crypto | Stable. Both the wire format and the embeddable C surface are versioned contracts (see below) and are changed reluctantly. |
 | **Linux host** | The oldest and most exercised surface. What differs is not the host but the desktop under it — each compositor gets its own capture, virtual-display and input backend, and they are not equally capable. |
 | **Windows host** | Newest large surface, shipping as an installer with its own virtual-display driver — both signed with Punktfunk's own certificates rather than a publicly trusted one, so Windows warns on install (see [Windows host](/docs/windows-host#about-the-signatures)). NVENC is well trodden; the AMD (AMF) path was validated on real hardware in mid-2026 (Ryzen 7000 iGPU, 1080p120 HDR P010) and the Intel (QSV) path on Arc, but both see far less field time than NVENC — several of QSV's newer arms are still marked unvalidated in the code. One structural constraint that catches people: it must run in the interactive console session, not session 0. |
-| **GameStream / Moonlight plane** | Works, and whether it is on depends on how you installed. Every Linux package (deb, RPM, Arch, the Bazzite sysext) and the SteamOS installer ship the unit as `serve --gamestream`, so GameStream is **on** there; NixOS defaults it on too. The Windows installer's checkbox is unticked, so it is **off** unless you asked for it, and a bare `punktfunk-host serve` is off. It pairs over plain HTTP with weaker legacy encryption — trusted LAN only, and worth turning off if you don't use Moonlight (see [Security](/docs/security#gamestream--moonlight-compatibility-is-the-weak-crypto-path)). It is a compatibility surface, so Punktfunk-only features (presets, links, clipboard, microphone) are not on it. |
+| **GameStream / Moonlight plane** | Works, and is **off** until you ask. Every install route is native-only: Linux packages run `serve` and take `PUNKTFUNK_GAMESTREAM=1` in `host.env`; SteamOS takes `--gamestream`; NixOS takes `services.punktfunk.host.gamestream = true`; Windows leaves the installer checkbox unticked. A bare `punktfunk-host serve` is off. It pairs over plain HTTP with weaker legacy encryption — trusted LAN only (see [Security](/docs/security#gamestream--moonlight-compatibility-is-the-weak-crypto-path)). It is a compatibility surface, so Punktfunk-only features (presets, links, clipboard, microphone) are not on it. |
 | **Linux and Windows desktop clients** | Packaged and current. They are one codebase: the same session binary streams for both, and for the Decky plugin and the `punktfunk` CLI. |
 | **Apple client** (macOS · iOS · iPadOS · tvOS) | One universal build, distributed as a **TestFlight beta**; the Mac also has a notarized DMG. Feature-complete apart from the platform gaps named above (no microphone or clipboard on tvOS). |
 | **Android client** (phone · TV) | Published on **Google Play** as a public listing for releases, with an invite-only Internal testing track for canary, plus a sideloadable APK. The same app in leanback mode is the TV client. |

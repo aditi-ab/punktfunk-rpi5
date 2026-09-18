@@ -182,13 +182,7 @@ pub const CODEC_PYROWAVE: u8 = 0x08;
 /// ladder — only the preferred path can return it. `None` when nothing the ladder may pick
 /// is shared; the caller refuses the session rather than emit an undecodable stream.
 pub fn resolve_codec(client_codecs: u8, host_capable: u8, preferred: u8) -> Option<u8> {
-    // `0` is a missing codec byte: every pre-negotiation build decoded HEVC.
-    let client = if client_codecs == 0 {
-        CODEC_HEVC
-    } else {
-        client_codecs
-    };
-    let shared = client & host_capable;
+    let shared = advertised(client_codecs) & host_capable;
     if shared == 0 {
         return None;
     }
@@ -202,6 +196,49 @@ pub fn resolve_codec(client_codecs: u8, host_capable: u8, preferred: u8) -> Opti
     [CODEC_HEVC, CODEC_AV1, CODEC_H264]
         .into_iter()
         .find(|&c| shared & c != 0)
+}
+
+/// What the client can decode. `0` is a missing codec byte: every pre-negotiation build
+/// decoded HEVC. Spelled once so the pick and [`codec_preference_miss`] cannot disagree.
+fn advertised(client_codecs: u8) -> u8 {
+    if client_codecs == 0 {
+        CODEC_HEVC
+    } else {
+        client_codecs
+    }
+}
+
+/// Which side lacks the codec the client asked for, when [`resolve_codec`] could not honour
+/// [`Hello::preferred_codec`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodecMiss {
+    /// The client named a codec it never advertised — no decoder on that device.
+    Client,
+    /// The client decodes it; this host's encoders cannot emit it.
+    Host,
+    /// Neither side has it.
+    Both,
+}
+
+/// Why the preference lost, for the operator line beside the negotiated codec. `None` when
+/// there is no preference or it won — including [`CODEC_PYROWAVE`], which only a preference
+/// can select. The pick stands either way; this only names the missing side.
+pub fn codec_preference_miss(
+    client_codecs: u8,
+    host_capable: u8,
+    preferred: u8,
+) -> Option<CodecMiss> {
+    let client = advertised(client_codecs);
+    if preferred == 0 || client & host_capable & preferred != 0 {
+        return None;
+    }
+    Some(
+        match (client & preferred != 0, host_capable & preferred != 0) {
+            (false, true) => CodecMiss::Client,
+            (true, false) => CodecMiss::Host,
+            _ => CodecMiss::Both,
+        },
+    )
 }
 
 /// HEVC `chroma_format_idc` 4:2:0. Default when a peer omits [`Welcome::chroma_format`].

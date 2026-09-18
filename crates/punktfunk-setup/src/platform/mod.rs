@@ -484,11 +484,11 @@ impl PkgBackend for Steamos {
         } else {
             build.clone()
         }));
-        // host.env AFTER the build, never before: that script writes its defaults only when the
-        // file is absent, and one of them (RADV_PERFTEST=video_encode) is what turns Vulkan
-        // encode on for Van Gogh. Creating host.env first would silently cost the Deck it.
+        // After the build, never before: that script writes host.env defaults only when the
+        // file is absent, and one of them (RADV_PERFTEST=video_encode) turns Vulkan encode on
+        // for Van Gogh. The port move below still lands in host.env.
         if choices.clipboard {
-            steps.push(Step::set_env("PUNKTFUNK_CLIPBOARD", "on"));
+            steps.push(Step::set_setting("clipboard", "files"));
         }
         // This step ends the run, so the conflict phase never gets to move the port.
         if choices.move_mgmt_port {

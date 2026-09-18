@@ -31,6 +31,159 @@ pub(crate) fn register_all(reg: &Diagnostics) {
     reg.register(omarchy_updates);
     reg.register(vdisplay_driver);
     reg.register(pad_audio);
+    reg.register(plugin_sandbox);
+    reg.register(restart_pending);
+}
+
+/// Host settings changed that only a restart applies. Pushed again after every settings write.
+pub(crate) fn restart_pending() -> HostCheck {
+    let id = ids::RESTART_PENDING;
+    let names: Vec<&str> = pf_host_config::restart_pending()
+        .into_iter()
+        .map(|id| pf_host_config::registry::find(id).map_or(id, |s| s.title))
+        .collect();
+    if names.is_empty() {
+        return HostCheck::ok(id, "Every host setting is in effect.");
+    }
+    HostCheck::problem(
+        id,
+        CheckStatus::Warn,
+        Severity::Warning,
+        format!("Restart the host to apply: {}", names.join(", ")),
+        "Until then the host runs with the values it started with.",
+    )
+    .with_remedy(Remedy {
+        text: "Restart it from Host → Settings in the web console.".into(),
+        command: None,
+        relogin_required: false,
+    })
+    .with_param("settings", names.join(", "))
+}
+
+/// Plugins run in their own sandbox, or they do not run: a box that cannot build one says so
+/// here rather than quietly running third-party code with the operator's whole account.
+#[cfg(target_os = "linux")]
+fn plugin_sandbox() -> HostCheck {
+    let id = ids::PLUGIN_SANDBOX;
+    if !crate::plugins::runtime_status().installed {
+        return HostCheck::inapplicable(id, "The plugin runner is not installed on this host.");
+    }
+    if std::env::var("PUNKTFUNK_PLUGIN_SANDBOX")
+        .is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false"))
+    {
+        return HostCheck::problem(
+            id,
+            CheckStatus::Warn,
+            Severity::Critical,
+            "Plugin sandboxing is turned off",
+            "Every installed plugin runs with your account's access: your files, your session, \
+             and the host's own credentials."
+                .to_string(),
+        )
+        .with_remedy(Remedy {
+            text: "Remove PUNKTFUNK_PLUGIN_SANDBOX from host.env and restart the plugin runner."
+                .into(),
+            command: Some("systemctl --user restart punktfunk-scripting".into()),
+            relogin_required: false,
+        });
+    }
+    let (reason, fix) = match bwrap_probe() {
+        Ok(()) => return HostCheck::ok(id, "Each plugin runs in its own sandbox."),
+        Err(None) => (
+            "bubblewrap (bwrap) is not installed".to_string(),
+            "Install bubblewrap (bwrap) with your package manager, then restart the plugin runner.",
+        ),
+        Err(Some(why)) => (
+            format!("bubblewrap refused the sandbox — {why}"),
+            "Allow unprivileged user namespaces and use bubblewrap 0.8 or newer, then restart \
+             the plugin runner.",
+        ),
+    };
+    HostCheck::problem(
+        id,
+        CheckStatus::Fail,
+        Severity::Critical,
+        "Plugins can't be sandboxed here",
+        format!("No plugin will start, so the game library stays empty: {reason}"),
+    )
+    .with_remedy(Remedy {
+        text: fix.into(),
+        command: Some("systemctl --user restart punktfunk-scripting".into()),
+        relogin_required: false,
+    })
+}
+
+/// The namespaces and minimal root of every plugin sandbox: `BASE_ARGV` in `sdk/src/sandbox.ts`,
+/// held equal by a test. Without the loader symlinks every exec fails, which reads as a refused
+/// namespace.
+#[cfg(target_os = "linux")]
+const SANDBOX_BASE_ARGV: &[&str] = &[
+    "--unshare-all",
+    "--unshare-user",
+    "--disable-userns",
+    "--die-with-parent",
+    "--new-session",
+    "--clearenv",
+    "--proc",
+    "/proc",
+    "--ro-bind",
+    "/proc/sys",
+    "/proc/sys",
+    "--dev",
+    "/dev",
+    "--tmpfs",
+    "/tmp",
+    "--ro-bind",
+    "/usr",
+    "/usr",
+    "--ro-bind-try",
+    "/etc/ssl",
+    "/etc/ssl",
+    "--ro-bind-try",
+    "/etc/resolv.conf",
+    "/etc/resolv.conf",
+    "--symlink",
+    "usr/lib",
+    "/lib",
+    "--symlink",
+    "usr/lib64",
+    "/lib64",
+    "--symlink",
+    "usr/bin",
+    "/bin",
+    "--symlink",
+    "usr/sbin",
+    "/sbin",
+];
+
+/// Can bwrap build the sandbox a plugin gets? `Err(None)` when bwrap is missing, else bwrap's
+/// own first stderr line.
+#[cfg(target_os = "linux")]
+fn bwrap_probe() -> Result<(), Option<String>> {
+    let out = Command::new("bwrap")
+        .args(SANDBOX_BASE_ARGV)
+        .arg("/bin/true")
+        .output()
+        .map_err(|_| None)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr.lines().next().unwrap_or_default().trim();
+    Err(Some(if line.is_empty() {
+        format!("bwrap exited with {}", out.status)
+    } else {
+        line.to_string()
+    }))
+}
+
+/// Windows de-privileges the runner with its own account instead.
+#[cfg(not(target_os = "linux"))]
+fn plugin_sandbox() -> HostCheck {
+    HostCheck::inapplicable(
+        ids::PLUGIN_SANDBOX,
+        "The plugin runner here runs as its own low-privilege account rather than in a sandbox.",
+    )
 }
 
 /// The controller speaker endpoint takes the host's 4-channel open, or DualSense titles fall
@@ -577,6 +730,25 @@ fn capture(cmd: &mut Command) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The doctor must probe the sandbox the runner actually builds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_probe_matches_the_runner() {
+        let ts = include_str!("../../../../sdk/src/sandbox.ts");
+        let body = ts
+            .split_once("const BASE_ARGV: readonly string[] = [")
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .expect("BASE_ARGV in sdk/src/sandbox.ts")
+            .0;
+        let runner: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with('"'))
+            .map(|l| l.trim_end_matches(',').trim_matches('"'))
+            .collect();
+        assert_eq!(runner, SANDBOX_BASE_ARGV);
+    }
 
     /// This machine may not reach every arm; a `NotWritable` row is still Fail+Warning and
     /// always carries a remedy.

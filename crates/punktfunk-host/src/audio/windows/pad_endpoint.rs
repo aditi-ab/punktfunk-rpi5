@@ -947,7 +947,7 @@ fn compute_is_pad_endpoint(endpoint_id: &str) -> bool {
 }
 
 fn pad_audio_enabled() -> bool {
-    std::env::var_os("PUNKTFUNK_PAD_AUDIO").is_none_or(|v| v != "0")
+    pf_host_config::knob("PUNKTFUNK_PAD_AUDIO").is_none_or(|v| v != "0")
 }
 
 fn pad_audio_slots() -> u8 {

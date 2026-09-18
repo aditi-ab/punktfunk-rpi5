@@ -31,7 +31,6 @@ class SettingsFieldsTest {
     /** A value that differs from the default in every row, so a dropped row shows as a mismatch. */
     private fun moved(): Settings = Settings(
         width = 3840, height = 2160, hz = 120,
-        safeAreaClearCorners = true, safeAreaLeftPx = 127, safeAreaRightPx = 0,
         bitrateKbps = 40_000, renderScale = 0.5, videoFit = "crop",
         hdrEnabled = false, tenBitSdr = true, compositor = 2, gamepad = 3, gamepadForwarding = false,
         systemButtons = "host", guideGesture = "off", audioChannels = 6, audioFormat = AUDIO_FORMAT_LOSSLESS_96,
@@ -49,6 +48,25 @@ class SettingsFieldsTest {
     fun everyRowMovesInTheProbe() {
         val a = Settings(); val b = moved()
         for (f in SettingsFields.ALL) assertNotEquals(f.name, f.get(a), f.get(b))
+    }
+
+    /**
+     * A codec this device can't decode is dropped from the picker, and the one case where it
+     * can't be dropped — it is the stored value — says why it is not in effect (#1138).
+     */
+    @Test
+    fun anUndecodableStoredCodecSaysSo() {
+        val capable = codecOptionsFor("av1", av1Capable = true, pyrowaveCapable = true)
+        assertEquals(CODEC_OPTIONS, capable)
+
+        val bare = codecOptionsFor("hevc", av1Capable = false, pyrowaveCapable = false)
+        assertEquals(listOf("auto", "hevc", "h264"), bare.map { it.first })
+
+        val kept = codecOptionsFor("av1", av1Capable = false, pyrowaveCapable = false)
+        assertEquals(listOf("auto", "hevc", "h264", "av1"), kept.map { it.first })
+        val label = kept.first { it.first == "av1" }.second
+        assertNotEquals("AV1", label)
+        assert(label.contains("no hardware decoder")) { label }
     }
 
     @Test

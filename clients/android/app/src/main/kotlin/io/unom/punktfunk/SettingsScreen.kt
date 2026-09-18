@@ -729,19 +729,20 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
 private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: android.content.Context) {
     val (nw, nh, nhz) = nativeDisplayMode(context)
     // The safe-area row carries its resolved size the same way the native row does. On a display with
-    // no cutout and square corners this equals the native mode — the row stays, honestly showing that
-    // it changes nothing here, rather than silently vanishing on some devices and not others.
-    val insets = displaySafeInsets(context, s)
-    val (sw, sh, _) = safeDisplayMode(context, s)
+    // no cutout this equals the native mode — the row stays, honestly showing that it changes nothing
+    // here, rather than silently vanishing on some devices and not others.
+    val (sw, sh, _) = safeDisplayMode(context)
     // "Custom…" picked while the stored size is still a preset — keeps the size fields visible
     // until an edit actually makes it custom (or a preset is re-picked). Custom itself is detected
     // from the stored size, never flagged (see [isCustomResolution]), so nothing new persists.
     var customPicked by remember { mutableStateOf(false) }
-    val showCustom = customPicked || s.isCustomResolution()
+    val families = remember(nw, nh, sw, sh) { Resolutions.families(nw to nh, sw to sh) }
+    val showCustom = customPicked || s.isCustomResolution(families)
+    var customBitratePicked by remember { mutableStateOf(false) }
     SettingsGroup("Resolution") {
         // The family the dropdown lists. A chip writes that family's size nearest the current
         // height, so the dropdown always holds a row of the family it shows.
-        val family = s.resolutionFamily()
+        val family = s.resolutionFamily(families)
         Text(
             "Aspect ratio",
             style = MaterialTheme.typography.bodySmall,
@@ -751,12 +752,12 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             modifier = Modifier.horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Resolutions.ASPECTS.forEachIndexed { i, a ->
+            families.forEachIndexed { i, a ->
                 FilterChip(
                     selected = i == family,
                     onClick = {
                         customPicked = false
-                        val (w, h) = Resolutions.nearest(i, s.height)
+                        val (w, h) = Resolutions.nearestIn(a, s.height)
                         update(s.copy(width = w, height = h))
                     },
                     label = { Text(a.label) },
@@ -765,7 +766,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
         }
         SettingDropdown(
             label = "Resolution",
-            options = resolutionOptions(family).map { (w, h, lbl) ->
+            options = resolutionOptions(families[family]).map { (w, h, lbl) ->
                 (w to h) to when (w) {
                     0 -> "$lbl ($nw × $nh)"
                     SAFE_AREA_MODE -> "$lbl ($sw × $sh)"
@@ -774,7 +775,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             } +
                 // The (-1, -1) sentinel can't collide with a real size; once a custom size is
                 // stored its label carries the live value, like the native row carries ($nw × $nh).
-                ((-1 to -1) to if (s.isCustomResolution()) "Custom (${s.width} × ${s.height})" else "Custom…"),
+                ((-1 to -1) to if (s.isCustomResolution(families)) "Custom (${s.width} × ${s.height})" else "Custom…"),
             selected = if (showCustom) -1 to -1 else s.width to s.height,
             field = SettingsOverlay.FIELD_RESOLUTION,
             caption = "The host makes a display exactly this size — no scaling. Native follows " +
@@ -803,40 +804,6 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                 }
             }
         }
-        // The safe area is the one row whose number nobody can check by eye, and the report it came
-        // from was a measured screenshot. Shown only while it is the mode in play.
-        if (s.width == SAFE_AREA_MODE) {
-            Text(
-                "Cutout ${insets.left} px left, ${insets.right} px right; corner radius " +
-                    "${insets.corner} px. This panel reads $nw × $nh, so the stream is $sw × $sh, " +
-                    "placed ${SafeArea.offsetX(nw, insets.left, insets.right)} px in. The two sides " +
-                    "are read apart only while the device is in landscape.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            ToggleRow(
-                title = "Clear rounded corners",
-                subtitle = "Pull the picture in by the corner radius too. It costs that width on " +
-                    "every row to uncover two small arcs — worth it for a HUD that lives in a corner.",
-                checked = s.safeAreaClearCorners,
-                onCheckedChange = { on -> update(s.copy(safeAreaClearCorners = on)) },
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                InsetField("Left inset", s.safeAreaLeftPx, Modifier.weight(1f)) { v ->
-                    update(s.copy(safeAreaLeftPx = v))
-                }
-                InsetField("Right inset", s.safeAreaRightPx, Modifier.weight(1f)) { v ->
-                    update(s.copy(safeAreaRightPx = v))
-                }
-            }
-            Text(
-                "Leave the two fields empty to follow the display. Type a number when the panel " +
-                    "covers more glass than it reports.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-
         SettingDropdown(
             label = "Refresh rate",
             options = REFRESH_OPTIONS.map { (hz, lbl) -> hz to (if (hz == 0) "$lbl ($nhz Hz)" else lbl) },
@@ -868,13 +835,23 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                 "distorts it.",
         ) { fit -> update(s.copy(videoFit = fit)) }
 
+        // Custom is read from the stored rate, like the resolution above; the flag only keeps the
+        // field open between picking "Custom…" and typing a number.
+        val showCustomBitrate = customBitratePicked || s.isCustomBitrate()
         SettingDropdown(
             label = "Bitrate",
-            options = BITRATE_OPTIONS,
-            selected = s.bitrateKbps,
+            options = BITRATE_OPTIONS + (CUSTOM_BITRATE to
+                if (s.isCustomBitrate()) "Custom (${bitrateLabel(s.bitrateKbps)})" else "Custom…"),
+            selected = if (showCustomBitrate) CUSTOM_BITRATE else s.bitrateKbps,
             field = "bitrate_kbps",
             caption = "Automatic lets the host decide.",
-        ) { kbps -> update(s.copy(bitrateKbps = kbps)) }
+        ) { kbps ->
+            customBitratePicked = kbps == CUSTOM_BITRATE
+            if (kbps != CUSTOM_BITRATE) update(s.copy(bitrateKbps = kbps))
+        }
+        if (showCustomBitrate) {
+            BitrateField(s.bitrateKbps) { kbps -> update(s.copy(bitrateKbps = kbps)) }
+        }
 
         // Only codecs this device can actually decode are offered — a preference the client never
         // advertises would be a dead setting (see [codecOptionsFor]).
@@ -1449,26 +1426,23 @@ private fun ResolutionField(
     )
 }
 
-/** One safe-area override. Digits only, empty = [SafeArea.AUTO_INSET] (follow the display), and
- * capped at 999 px — an inset past that is a typo, not a phone. */
+/** A fixed bitrate in whole Mbps. Digits only; each keystroke commits, capped at
+ * [CUSTOM_BITRATE_MAX_MBPS]. Empty or `0` commits nothing — Automatic is the menu's first entry. */
 @Composable
-private fun InsetField(
-    label: String,
-    value: Int,
-    modifier: Modifier = Modifier,
-    onCommit: (Int) -> Unit,
-) {
-    var text by remember { mutableStateOf(if (value >= 0) value.toString() else "") }
+private fun BitrateField(kbps: Int, onCommit: (Int) -> Unit) {
+    val shown = if (kbps > 0) ((kbps + 500) / 1000).toString() else ""
+    var text by remember { mutableStateOf(shown) }
     OutlinedTextField(
         value = text,
         onValueChange = { raw ->
-            text = raw.filter { it.isDigit() }.take(3)
-            onCommit(text.toIntOrNull() ?: SafeArea.AUTO_INSET)
+            text = raw.filter { it.isDigit() }.take(4)
+            val mbps = (text.toIntOrNull() ?: 0).coerceAtMost(CUSTOM_BITRATE_MAX_MBPS)
+            if (mbps > 0) onCommit(mbps * 1000)
         },
-        label = { Text(label) },
+        label = { Text("Bitrate (Mbps)") },
         singleLine = true,
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-        modifier = modifier.onFocusChanged { if (!it.isFocused) text = if (value >= 0) value.toString() else "" },
+        modifier = Modifier.fillMaxWidth().onFocusChanged { if (!it.isFocused) text = shown },
     )
 }
 

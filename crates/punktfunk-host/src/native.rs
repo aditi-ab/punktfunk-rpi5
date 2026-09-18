@@ -33,6 +33,9 @@ pub(crate) use pf_frame::thread_qos::boost_thread_priority;
 mod compositor;
 // The session's control connection, whichever transport carries it (quinn or WebTransport).
 pub(crate) mod link;
+/// A seat's Steam, up before its client asks (`design/steam-seats-warm-launch-implementation-plan.md`).
+#[cfg(target_os = "linux")]
+pub(crate) mod prewarm;
 use compositor::resolve_compositor;
 
 /// GameStream presents the same virtual pad and must pick `windows_xbox_hid` from this definition.
@@ -52,6 +55,8 @@ mod pad_audio;
 mod input;
 /// Per-pad motion inter-arrival ([`motion_cadence::MotionCadence`]), logged at session end.
 mod motion_cadence;
+/// Controller updates reaching the host ([`pad_uplink::PadUplink`]): the client → host link.
+mod pad_uplink;
 use input::{input_thread, ClientInput};
 
 mod handshake;
@@ -150,9 +155,9 @@ fn bind_data_socket(
             tracing::warn!(
                 local_ip = ?local_ip,
                 error = %e,
-                "could not bind the data plane to the address the control connection arrived on \
-                 — falling back to the wildcard. On a multi-homed host video may now egress from \
-                 a different interface than the client dialed, which it silently drops."
+                "data plane did not bind to the control-connection address — falling back to the \
+                 wildcard; on a multi-homed host video may egress from a different interface than \
+                 the client dialed, which it silently drops"
             );
             Ok(std::net::UdpSocket::bind("0.0.0.0:0")?)
         }
@@ -266,8 +271,7 @@ pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 4;
 /// `PUNKTFUNK_IDLE_TIMEOUT_MS`; `None` (unset/invalid/zero) = core default (8 s). Clamped
 /// downstream to ≥1 s with a keep-alive that scales, so a live session never false-closes.
 pub(crate) fn idle_timeout_from_env() -> Option<std::time::Duration> {
-    std::env::var("PUNKTFUNK_IDLE_TIMEOUT_MS")
-        .ok()
+    pf_host_config::knob("PUNKTFUNK_IDLE_TIMEOUT_MS")
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&ms| ms > 0)
         .map(std::time::Duration::from_millis)
@@ -433,6 +437,10 @@ pub(crate) async fn serve(
         max_concurrent = opts.max_concurrent,
         "accepting sessions (concurrent)"
     );
+    // Once the host serves: a seat's Steam takes half a minute to boot, and the point is that it
+    // has already booted when its device connects.
+    #[cfg(target_os = "linux")]
+    prewarm::spawn_run("host start");
 
     loop {
         let incoming = tokio::select! {
@@ -521,6 +529,10 @@ pub(crate) async fn serve(
                     tracing::warn!(%peer, error = %detail, "session ended with error")
                 }
             }
+            // After `serve_session` returns: the stream thread is joined and this session's
+            // display lease is gone, so a pre-warm can adopt or replace what it left.
+            #[cfg(target_os = "linux")]
+            prewarm::spawn_run("session end");
         });
     }
     // Drain in-flight sessions (max_sessions reached or endpoint closed).
@@ -546,8 +558,8 @@ fn install_shutdown_restore() {
             signal(SignalKind::interrupt()),
         ) else {
             tracing::warn!(
-                "could not install shutdown signal handlers — a host stopped mid-takeover will \
-                 leave the box's own session down until it is restarted"
+                "shutdown signal handlers did not install — a host stopped mid-takeover leaves \
+                 the box's own session down until it is restarted"
             );
             return;
         };
@@ -979,8 +991,7 @@ fn audio_reserved_kbps(welcome: &punktfunk_core::quic::Welcome) -> u32 {
 /// `PUNKTFUNK_PYROWAVE_MAX_MBPS` (Mb/s) → kbps. `None` when unset/zero/invalid (no cap).
 /// Every PyroWave session, including an explicit client rate, goes through the pin.
 fn pyrowave_auto_pin_ceiling_kbps() -> Option<u32> {
-    std::env::var("PUNKTFUNK_PYROWAVE_MAX_MBPS")
-        .ok()
+    pf_host_config::knob("PUNKTFUNK_PYROWAVE_MAX_MBPS")
         .and_then(|s| s.trim().parse::<u32>().ok())
         .filter(|&m| m > 0)
         .map(|m| m.saturating_mul(1000))
@@ -1668,8 +1679,6 @@ pub(crate) async fn run_admitted(
         )),
         access_tx: Some(access_tx.clone()),
         audio_tx: Some(audio_tx),
-        // Filled by the stream thread once capture names the head.
-        head: Arc::new(std::sync::Mutex::new(None)),
         pad_slots: pad_slots.clone(),
         fingerprint: session_fp_hex.clone(),
         pad_owner: pad_id.owner,
@@ -1714,23 +1723,32 @@ pub(crate) async fn run_admitted(
         audio_rx,
         pad_slots_rx,
         launch_outcome_rx,
+        peer: peer.ip(),
+        counters: counters.clone(),
+        stats: stats.clone(),
     }));
+    // Trust-store name (a console rename wins), else the sanitized Hello name. `None` if
+    // nameless. Events, hook filters, the stream marker and the tray all show this one.
+    let client_name = session_fp_hex
+        .as_deref()
+        .and_then(|fp| np.list().into_iter().find(|c| c.fingerprint == fp))
+        .map(|c| c.name)
+        .or_else(|| {
+            let raw = hello.name.as_deref().unwrap_or("").trim();
+            (!raw.is_empty()).then(|| {
+                crate::native_pairing::sanitize_device_name(
+                    raw,
+                    session_fp_hex.as_deref().unwrap_or(""),
+                )
+            })
+        });
     // Only a fingerprint has a record to watch; with no record there is nothing to expire.
     match (session_fp_hex.clone(), access_watch) {
         (Some(fp_hex), Some(watch_rx)) => {
-            // Trust-store name (rename at approval wins), else the sanitized Hello name.
             let device = crate::events::DeviceRef {
-                name: np
-                    .list()
-                    .into_iter()
-                    .find(|c| c.fingerprint == fp_hex)
-                    .map(|c| c.name)
-                    .unwrap_or_else(|| {
-                        crate::native_pairing::sanitize_device_name(
-                            hello.name.as_deref().unwrap_or(""),
-                            &fp_hex,
-                        )
-                    }),
+                name: client_name
+                    .clone()
+                    .unwrap_or_else(|| crate::native_pairing::sanitize_device_name("", &fp_hex)),
                 fingerprint: fp_hex,
                 plane: crate::events::Plane::Native,
             };
@@ -1773,19 +1791,24 @@ pub(crate) async fn run_admitted(
             .map(|_| {
                 // `--open` has no fingerprint; a per-accept sequence isolates at the cost of keep-alive.
                 static ANON_SEQ: AtomicU64 = AtomicU64::new(0);
-                let id = session_fp_hex
-                    .as_deref()
-                    .map(|fp| fp[..fp.len().min(8)].to_string())
+                let paired = session_fp_hex.as_deref().map(seat_id);
+                let id = paired
+                    .clone()
                     .unwrap_or_else(|| format!("anon{}", ANON_SEQ.fetch_add(1, Ordering::Relaxed)));
-                // Monitor-mode has no per-session sink — audio stays shared; input/mic still isolate.
-                let sink = crate::audio::per_session_sink_possible()
-                    .then(|| format!("punktfunk-speaker-iso-{id}"));
-                let mic_source = Some(format!("punktfunk-mic-{id}"));
-                tracing::info!(%id, sink = sink.as_deref().unwrap_or("-"),
+                let iso = session_isolation(&id, paired.is_some());
+                tracing::info!(%id, sink = iso.sink.as_deref().unwrap_or("-"),
                 "isolated gamescope session — per-session input/audio/mic planes");
-                crate::vdisplay::SessionIsolation::new(id, sink, mic_source)
+                iso
             }),
     };
+    // Where this session's virtual pads are exposed, so its seat's Steam opens those and no
+    // other seat's. `None` on every host without the filter, which is today's box-wide pads.
+    #[cfg(target_os = "linux")]
+    let seat_dev = isolation
+        .as_ref()
+        .and_then(crate::vdisplay::seat_device_dir);
+    #[cfg(not(target_os = "linux"))]
+    let seat_dev: Option<std::path::PathBuf> = None;
     // Pinned injector + swappable route. Drop at session end closes the EIS connection.
     #[cfg(target_os = "linux")]
     let session_injector = isolation
@@ -1845,6 +1868,7 @@ pub(crate) async fn run_admitted(
                         grants,
                         frame_map,
                         pad_feed,
+                        seat_dev,
                         stop,
                         counters,
                     )
@@ -1941,8 +1965,8 @@ pub(crate) async fn run_admitted(
 
     // Handshake complete: CONNECTED. A client rejected earlier never emits either.
     let event_client = crate::events::ClientRef {
-        name: hello.name.clone().unwrap_or_default(),
-        fingerprint: conn.peer_fingerprint().map(|fp| fingerprint_hex(&fp)),
+        name: client_name.clone().unwrap_or_default(),
+        fingerprint: session_fp_hex.clone(),
         plane: crate::events::Plane::Native,
     };
     crate::events::emit(crate::events::EventKind::ClientConnected {
@@ -2108,7 +2132,8 @@ pub(crate) async fn run_admitted(
         height: mode.height,
         refresh_hz: mode.refresh_hz,
         hdr: welcome.color.is_hdr(),
-        client: hello.name.clone().unwrap_or_default(),
+        client: client_name.clone().unwrap_or_default(),
+        fingerprint: session_fp_hex.clone(),
         launch: hello.launch.clone(),
         plane: crate::events::Plane::Native,
     });
@@ -2223,21 +2248,6 @@ pub(crate) async fn run_admitted(
         .as_deref()
         .and_then(crate::library::audio_sessions_for)
         .map(|policy| crate::session_status::apply_audio_policy(policy, &client_label));
-    // Tray toast: trust-store name (rename at approval wins), else sanitized Hello. `None` if nameless.
-    let client_name = conn
-        .peer_fingerprint()
-        .map(|fp| fingerprint_hex(&fp))
-        .and_then(|fp_hex| {
-            np.list()
-                .into_iter()
-                .find(|c| c.fingerprint == fp_hex)
-                .map(|c| c.name)
-                .or_else(|| {
-                    let raw = hello.name.as_deref().unwrap_or("").trim();
-                    (!raw.is_empty())
-                        .then(|| crate::native_pairing::sanitize_device_name(raw, &fp_hex))
-                })
-        });
     // Punch + virtual-stream stages on the same trace; resizes write into the shared slot.
     let bringup_dp = bringup.clone();
     let resize_ms_dp = resize_ms.clone();
@@ -2526,7 +2536,7 @@ impl Drop for GamescopeHold {
 const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Pack `(w, h, hz)` into one atomic word (16|16|16) — one store, not three racy ones.
-fn pack_mode(width: u32, height: u32, refresh_hz: u32) -> u64 {
+pub(crate) fn pack_mode(width: u32, height: u32, refresh_hz: u32) -> u64 {
     ((width as u64 & 0xffff) << 32)
         | ((height as u64 & 0xffff) << 16)
         | (refresh_hz as u64 & 0xffff)
@@ -2559,9 +2569,58 @@ fn delivered_mode(
     }
 }
 
+/// This session's Steam home, or `None` for the box's own.
+///
+/// A seat is a fingerprint: an `anon<seq>` id is minted per accept, so a Steam signed in under
+/// one would never be found again.
+#[cfg(target_os = "linux")]
+fn seat_home_for(paired: Option<&str>, on: bool) -> Option<std::path::PathBuf> {
+    paired.filter(|_| on).map(pf_paths::seat_home)
+}
+
+/// The seat a device streams on: the head of its fingerprint. Short enough for a socket name,
+/// wide enough that two paired devices do not collide. One function, because the pre-warm has to
+/// name the same seat this session does or the registry hands its parked display to nobody.
+#[cfg(target_os = "linux")]
+fn seat_id(fp_hex: &str) -> String {
+    fp_hex[..fp_hex.len().min(8)].to_string()
+}
+
+/// The isolated planes `id` streams on. `paired` says the id is a seat rather than an
+/// `anon<seq>`, which is what earns a Steam home.
+///
+/// The registry's reuse key is `id` plus that home, so [`prewarm`] builds this value for a seat
+/// before its client connects and the connect lands on the display already standing.
+#[cfg(target_os = "linux")]
+fn session_isolation(id: &str, paired: bool) -> crate::vdisplay::SessionIsolation {
+    // Monitor-mode has no per-session sink — audio stays shared; input/mic still isolate.
+    let sink =
+        crate::audio::per_session_sink_possible().then(|| format!("punktfunk-speaker-iso-{id}"));
+    let steam_home = seat_home_for(
+        paired.then_some(id),
+        pf_host_config::config().steam_seat_home,
+    );
+    crate::vdisplay::SessionIsolation::new(
+        id.to_string(),
+        sink,
+        Some(format!("punktfunk-mic-{id}")),
+        steam_home,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The knob is the only way in, and an unpaired session never gets a seat home.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_paired_client_with_the_knob_on_gets_a_seat_home() {
+        let seat = seat_home_for(Some("cafe0123"), true).expect("a paired seat has a home");
+        assert!(seat.ends_with("seats/cafe0123"), "{}", seat.display());
+        assert_eq!(seat_home_for(Some("cafe0123"), false), None, "knob off");
+        assert_eq!(seat_home_for(None, true), None, "anon<seq> has no identity");
+    }
 
     /// The accept loop's address-validation gate. A first contact is unvalidated; a Retry turns
     /// it into a second, validated arrival, and the client completes anyway. Pins the quinn
@@ -2811,6 +2870,7 @@ mod tests {
         // SAFETY: this test is the only writer of this variable in the process; the only
         // reader is `resolve_bitrate_kbps_for` on this same thread.
         unsafe { std::env::set_var("PUNKTFUNK_PYROWAVE_MAX_MBPS", "4500") };
+        pf_host_config::reload();
         assert_eq!(
             resolve_bitrate_kbps_for(Codec::PyroWave, 0, &mode, ChromaFormat::Yuv444, 10),
             4_500_000
@@ -2832,6 +2892,7 @@ mod tests {
         );
         // SAFETY: same as the set above — single writer; readers run on this thread.
         unsafe { std::env::remove_var("PUNKTFUNK_PYROWAVE_MAX_MBPS") };
+        pf_host_config::reload();
     }
 
     #[test]
@@ -2985,6 +3046,16 @@ mod tests {
 
         // No reported local address keeps the wildcard.
         let sock = bind_data_socket(None, None).expect("bind wildcard data socket");
+        assert!(sock.local_addr().unwrap().ip().is_unspecified());
+    }
+
+    /// A pinned address that this host cannot own still has to yield a socket. 192.0.2.1
+    /// is TEST-NET-1, so the bind miss is the live fallback, not a mock.
+    #[test]
+    fn data_socket_falls_back_to_wildcard_when_the_control_address_cannot_bind() {
+        let unroutable = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+        let sock = bind_data_socket(None, Some(unroutable))
+            .expect("wildcard fallback after a pinned bind miss");
         assert!(sock.local_addr().unwrap().ip().is_unspecified());
     }
 
@@ -3250,12 +3321,14 @@ mod tests {
             fn drop(&mut self) {
                 // SAFETY: dropped while SESSION_TEST_LOCK is held; only the session path reads this.
                 unsafe { std::env::remove_var(self.0) };
+                pf_host_config::reload();
             }
         }
         let _env = EnvGuard("PUNKTFUNK_CLIPBOARD");
         // Operator policy on. Serialized on SESSION_TEST_LOCK; only the session path reads this.
         // SAFETY: writers serialized; only this session path reads the variable.
         unsafe { std::env::set_var("PUNKTFUNK_CLIPBOARD", "1") };
+        pf_host_config::reload();
 
         let host = std::thread::spawn(|| {
             run_ephemeral(Punktfunk1Options {
@@ -3475,6 +3548,31 @@ mod tests {
             "approval must pin the knocking fingerprint"
         );
         assert_eq!(np.list()[0].name, "Approved Device");
+        // Hook filters match `client.connected` by name, so it must carry the approval rename.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let connected_name = loop {
+            let found = crate::events::bus()
+                .subscribe(0)
+                .catch_up
+                .into_iter()
+                .find_map(|e| match e.kind {
+                    crate::events::EventKind::ClientConnected { client }
+                        if client.fingerprint.as_deref() == Some(expected_fp.as_str()) =>
+                    {
+                        Some(client.name)
+                    }
+                    _ => None,
+                });
+            if let Some(name) = found {
+                break name;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "client.connected must fire for the approved device"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        };
+        assert_eq!(connected_name, "Approved Device");
         drop(client);
         let _ = std::fs::remove_file(&store);
         host.join().unwrap().unwrap();
@@ -4007,6 +4105,65 @@ mod tests {
             timeout,
         )
         .expect("controller-only session without a launch must be admitted");
+        drop(client);
+        let _ = std::fs::remove_file(&store);
+        host.join().unwrap().unwrap();
+    }
+
+    /// A launch the host cannot resolve streams on, and the client learns why from the
+    /// control message.
+    #[test]
+    fn unknown_launch_reaches_the_client_as_a_refusal() {
+        let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::quic::{endpoint, LaunchOutcomeKind};
+
+        let store = access_store_path("launch-outcome");
+        let _ = std::fs::remove_file(&store);
+        let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
+        let (cert, key) = endpoint::generate_identity().unwrap();
+        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        np.add_with_access("Launcher", &fp_hex, None).unwrap();
+        let host = spawn_access_host(19786, 1, np);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let client = NativeClient::connect(
+            "127.0.0.1",
+            19786,
+            punktfunk_core::Mode {
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+            },
+            CompositorPref::Auto,
+            GamepadPref::Auto,
+            0,
+            0,
+            2,
+            0,
+            0,
+            None,
+            0,
+            false,
+            Some("pf-test:no-such-title".into()),
+            Some("Launcher".into()),
+            None,
+            Some((cert, key)),
+            std::time::Duration::from_secs(10),
+        )
+        .expect("an unresolvable launch still admits the session");
+        // A cold library scan decides the refusal; it can take seconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let outcome = loop {
+            if let Some(o) = client.launch_outcome() {
+                break o;
+            }
+            assert!(std::time::Instant::now() < deadline, "no launch outcome");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(outcome.kind, LaunchOutcomeKind::Refused);
+        assert!(outcome
+            .notice()
+            .is_some_and(|n| n.starts_with("Couldn't start")));
         drop(client);
         let _ = std::fs::remove_file(&store);
         host.join().unwrap().unwrap();

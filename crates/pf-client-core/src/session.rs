@@ -924,6 +924,8 @@ fn pump(
     let mut window_start = Instant::now();
     // The pin-unsustainable notice goes out once per session.
     let mut pin_noticed = false;
+    // The last launch verdict turned into a notice: each verdict is said once.
+    let mut launch_told: Option<punktfunk_core::quic::LaunchOutcome> = None;
     // One fence-waited decode sample per window on the async rung: a per-frame wait
     // would serialize decode to 1/latency.
     let mut fence_sampled = false;
@@ -1384,6 +1386,14 @@ fn pump(
                     pin_kbps / 1000
                 )));
             }
+            if let Some(outcome) = connector.launch_outcome() {
+                if launch_told.as_ref() != Some(&outcome) {
+                    if let Some(n) = outcome.notice() {
+                        let _ = ev_tx.try_send(SessionEvent::Notice(n.to_string()));
+                    }
+                    launch_told = Some(outcome);
+                }
+            }
             // ~1 Hz phase-lock report, riding the stats window. Quiet until the
             // presenter has a grid (period 0) or the window is thin (< 8 arrivals).
             // 1 ms uncertainty.
@@ -1609,7 +1619,7 @@ fn spawn_audio(
                 }
                 player.push(buf);
             };
-            let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
+            let mut gaps = punktfunk_core::audio::AudioGapTracker::new_at_frame_us(frame_us);
             let mut frame_samples = 0usize;
             let mut av = punktfunk_core::audio::AvSync::new_at_rate(channels, rate_hz);
             if !av_sync_enabled {

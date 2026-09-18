@@ -94,9 +94,9 @@ enum LaunchedEntry {
     }
 }
 
-/// How long the launch hold waits on a title the host still calls `launching` (a cold Steam boot
-/// with shader work runs to minutes), and on one the host never lists at all (the launch did not
-/// resolve; the host logs it and streams on).
+/// How long the launch hold waits on a title the host still calls `launching`, or `running` without
+/// its window (a cold Steam boot with shader work runs to minutes), and on one the host never lists
+/// at all (the launch did not resolve; the host logs it and streams on).
 private let launchHoldMax: TimeInterval = 120
 private let launchNoLease: TimeInterval = 15
 /// The demo host's pretend start: the cover's 0.75 s flight, its details, then a beat of
@@ -126,6 +126,8 @@ final class SessionModel: ObservableObject {
     /// the only moment the cover has somewhere to fly FROM, and holding from there means one
     /// unbroken screen from the tap to the game rather than a stream of the launcher in between.
     @Published private(set) var launchHold: LaunchHoldTarget?
+    /// The launched game is up and the host is waiting for its window.
+    @Published private(set) var launchWindowWait = false
     private var launchWatch: Task<Void, Never>?
     /// Counts launches, so each hold is a view of its own — see `LaunchHoldTarget.seq`.
     private var launchSeq = 0
@@ -134,7 +136,12 @@ final class SessionModel: ObservableObject {
     /// satisfies both and the abandoned attempt can land first.
     private var connectSeq = 0
     /// The host this session is for (a value copy; identity = id).
-    @Published private(set) var activeHost: StoredHost?
+    @Published private(set) var activeHost: StoredHost? {
+        didSet { Self.activeHosts[ObjectIdentifier(self)] = activeHost?.id }
+    }
+    /// Every window's dialing or live host. A host replaces a second session from this device,
+    /// so a connect to one already live elsewhere would end that window's stream.
+    private static var activeHosts: [ObjectIdentifier: StoredHost.ID] = [:]
     /// The library entry this session was launched with (`connect(launchID:)`), or nil if the user
     /// just connected to the host's desktop. Kept because where the client should go when the
     /// session ends depends on where it came FROM: a title launched out of the library belongs back
@@ -149,8 +156,8 @@ final class SessionModel: ObservableObject {
     /// shelf to reopen. The view layer consumes it and sets it back to nil.
     @Published var returnToLibrary: LibraryTarget?
     /// The settings THIS session runs on — the globals with its preset overlaid, resolved once at
-    /// connect (design/client-settings-profiles.md §4.2). Also mirrored into `SessionSettings` for
-    /// the readers that live in PunktfunkKit and can't see this model.
+    /// connect (design/client-settings-profiles.md §4.2). The connection carries the same value
+    /// for the readers that live in PunktfunkKit and can't see this model.
     @Published private(set) var settings = EffectiveSettings()
     /// The stats-overlay tier for this session: the resolved one at connect, then whatever the
     /// live cycle surfaces (⌃⌥⇧S, the three-finger tap) move it to. Separate from the @AppStorage
@@ -314,6 +321,13 @@ final class SessionModel: ObservableObject {
     private var accessWarned1m = false
     /// Auto-dismiss for `accessWarning` — held so a newer warning replaces a pending clear.
     private var accessWarningTimer: Task<Void, Never>?
+    /// The host's line for a launch that did not give the player their game, up for
+    /// `launchNoticeSeconds`. `launchNoticeShown` keeps one verdict from re-raising it.
+    @Published private(set) var launchNotice: String?
+    private var launchNoticeShown: String?
+    private var launchNoticeTimer: Task<Void, Never>?
+    /// Long enough to read a sentence with its cause.
+    private static let launchNoticeSeconds: UInt64 = 10
     #if os(tvOS)
     /// Siri Remote → host pointer while streaming (touch surface moves, press = left click,
     /// Play/Pause = right click) + the remote's deliberate exit (hold Back ≥ 1 s). See
@@ -357,9 +371,9 @@ final class SessionModel: ObservableObject {
     /// its own instructions.
     /// `effective` is the whole stream mode + input/audio configuration for this session, already
     /// resolved from the globals and the session's preset by the caller — the ONE place that
-    /// resolution happens (§4.4). It is latched into `SessionSettings` here so the kit-side
-    /// readers (the presenter, the input paths, the match-window follower) see the same values
-    /// this connect asked the host for, instead of re-reading the globals mid-session.
+    /// resolution happens (§4.4). The connection carries it, so the kit-side readers (the
+    /// presenter, the input paths, the match-window follower) see the values this connect asked
+    /// the host for, instead of re-reading the globals mid-session.
     func connect(to host: StoredHost, effective: EffectiveSettings,
                  gamepad: PunktfunkConnection.GamepadType = .auto,
                  launchID: String? = nil,
@@ -372,6 +386,11 @@ final class SessionModel: ObservableObject {
                  requestAccess: Bool = false,
                  onUnreachable: (@MainActor () -> Void)? = nil) {
         guard phase == .idle else { return }
+        guard !Self.activeHosts.contains(where: { $0.key != ObjectIdentifier(self) && $0.value == host.id })
+        else {
+            errorMessage = "\(host.displayName) is already streaming in another window."
+            return
+        }
         connectSeq += 1
         let attempt = connectSeq
         phase = .connecting
@@ -382,10 +401,10 @@ final class SessionModel: ObservableObject {
         launchSeq += 1
         launchHold = launchID.flatMap { LaunchedEntry.take($0, seq: launchSeq) }
             .flatMap { $0.entry.isLauncher ? nil : $0 }
+        launchWindowWait = false
         errorMessage = nil
         settings = effective
         statsVerbosity = StatsVerbosity(rawValue: effective.statsVerbosity) ?? .normal
-        SessionSettings.begin(effective)
         #if os(iOS)
         // An attached monitor shows the picture (StreamViewController), so its size and rate win.
         let mode = ExternalDisplay.streamMode(effective) ?? effective.streamMode
@@ -522,7 +541,8 @@ final class SessionModel: ObservableObject {
                 // Delegated approval: the host holds this connect open until the operator approves
                 // it (~180 s) — outwait that window so a slow approval still lands here. Normal
                 // connects keep the snappy default.
-                timeoutMs: requestAccess ? 185_000 : 10_000) }
+                timeoutMs: requestAccess ? 185_000 : 10_000,
+                settings: effective) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 // The user may have abandoned this attempt (window closed, another host
@@ -535,9 +555,6 @@ final class SessionModel: ObservableObject {
                     if case .success(let conn) = result {
                         Task.detached { conn.close() } // joins Rust threads — off-main
                     }
-                    // A LATER connect has already latched its own settings; only release the
-                    // latch when nothing took over, or this would blank the live session's.
-                    if self.phase == .idle { SessionSettings.end() }
                     return
                 }
                 switch result {
@@ -571,7 +588,6 @@ final class SessionModel: ObservableObject {
                         self.phase = .idle
                         self.activeHost = nil
                         self.revealStream() // no stream is coming; the hold must not outlive the dial
-                        SessionSettings.end() // no session, so nothing may keep its settings latched
                         self.errorMessage = "\(host.displayName) is not paired yet. "
                             + "Pair with its PIN before streaming."
                     }
@@ -584,7 +600,6 @@ final class SessionModel: ObservableObject {
                     // otherwise nothing here does. It would sit over the home screen until the
                     // next session, and on tvOS it makes the host grid unfocusable behind it.
                     self.revealStream()
-                    SessionSettings.end() // the dial failed — back to the plain globals
                     if case PunktfunkClientError.rejected(let rejection) = error {
                         // The host answered and stated its reason (declined / approval timed
                         // out / busy / versions differ) — show that, and never wake-retry a
@@ -702,7 +717,7 @@ final class SessionModel: ObservableObject {
     /// injection — the same fallback `StreamLayerUIView` applies to the fingers themselves.
     private func noteTouchFallback(_ conn: PunktfunkConnection) {
         #if os(iOS)
-        guard TouchInputMode.current == .touch, !conn.hostSupportsTouch else { return }
+        guard TouchInputMode.current(conn.settings) == .touch, !conn.hostSupportsTouch else { return }
         touchFallbackNotice = true
         touchHintTimer?.cancel()
         touchHintTimer = Task { [weak self] in
@@ -808,6 +823,18 @@ final class SessionModel: ObservableObject {
         }
     }
 
+    /// Same transient contract as `showAccessWarning`, on its own timer so neither hides the other.
+    private func showLaunchNotice(_ text: String) {
+        launchNoticeShown = text
+        launchNotice = text
+        launchNoticeTimer?.cancel()
+        launchNoticeTimer = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.launchNoticeSeconds))
+            guard !Task.isCancelled else { return }
+            self?.launchNotice = nil
+        }
+    }
+
     /// "1 h 58 m" / "12 m" / "45 s" — the countdown wording the chip and the warnings share.
     static func accessCountdown(_ secs: UInt32) -> String {
         let s = Int(secs)
@@ -816,16 +843,20 @@ final class SessionModel: ObservableObject {
         return "\(s) s"
     }
 
-    /// Follow a live stats-overlay cycle (⌃⌥⇧S, the three-finger tap, the Stream menu). Those
-    /// surfaces write the GLOBAL setting as they always have; this moves the session's own tier
-    /// with it, so cycling still works in a session a preset put on a different tier.
+    /// Move this session's overlay tier: a Settings change to the stored tier, or `cycleStats`.
+    /// The stored tier stays what the next session starts at.
     func setStatsVerbosity(_ tier: StatsVerbosity) {
         guard statsVerbosity != tier else { return }
         statsVerbosity = tier
         settings.statsVerbosity = tier.rawValue
-        SessionSettings.setStatsVerbosity(tier.rawValue)
         renderHud()
     }
+
+    /// Advance this session's overlay one tier (⌃⌥⇧S, the three-finger tap, the Stream menu).
+    func cycleStats() { setStatsVerbosity(statsVerbosity.next()) }
+
+    /// Take the physical controllers for this session (its window came to the front).
+    func claimControllers() { gamepadCapture?.claim() }
 
     /// The user confirmed the fingerprint: returns it for pinning and enters streaming.
     func confirmTrust() -> Data? {
@@ -851,9 +882,6 @@ final class SessionModel: ObservableObject {
         // What this host has up is about to change, so the cards must ask again rather than wait
         // out the cache's TTL naming the game the user just left.
         if let host = activeHost { NowPlayingStore.shared.invalidate(host) }
-        // Release the session's resolved settings: from here every reader falls back to the plain
-        // globals, which is exactly what they saw before presets existed.
-        SessionSettings.end()
         // No-op when this session never reached `.streaming` (a refused/aborted connect).
         displaySleepGuard.release()
         // Drop any armed background keep-alive (incl. the timeout that just fired us).
@@ -877,6 +905,10 @@ final class SessionModel: ObservableObject {
         accessWarningTimer?.cancel()
         accessWarningTimer = nil
         accessWarning = nil
+        launchNoticeTimer?.cancel()
+        launchNoticeTimer = nil
+        launchNotice = nil
+        launchNoticeShown = nil
         accessLevel = .fullControl
         accessRemainingSecs = 0
         accessLimited = false
@@ -1041,6 +1073,7 @@ final class SessionModel: ObservableObject {
         launchWatch?.cancel()
         launchWatch = nil
         launchHold = nil
+        launchWindowWait = false
     }
 
     /// Poll the host once a second for the launched title's state, and reveal when it has
@@ -1070,12 +1103,16 @@ final class SessionModel: ObservableObject {
                     address: host.address, port: port,
                     certPEM: identity.certPEM, keyPEM: identity.keyPEM,
                     hostFingerprint: host.pinnedSHA256)
-                let state = games.first { $0.appID == hold.id }?.state
+                let game = games.first { $0.appID == hold.id }
+                let state = game?.state
                 let elapsed = Date().timeIntervalSince(began)
+                let windowWait = state == "running" && game?.awaitingWindow == true
                 let done: Bool
                 switch state {
                 case "launching": done = elapsed >= launchHoldMax
-                // running, exited, untracked, grace: the host has said all it will.
+                // A Proton prefix or a splash can sit behind a running process for a minute.
+                case "running" where windowWait: done = elapsed >= launchHoldMax
+                // window, running, exited, untracked, grace: the host has said all it will.
                 case .some: done = true
                 case nil: done = elapsed >= launchNoLease
                 }
@@ -1083,6 +1120,7 @@ final class SessionModel: ObservableObject {
                     self?.revealStream()
                     return
                 }
+                self?.launchWindowWait = windowWait
                 try? await Task.sleep(nanoseconds: NSEC_PER_SEC)
             }
         }
@@ -1144,6 +1182,7 @@ final class SessionModel: ObservableObject {
         let feedback = GamepadFeedback(connection: conn, manager: .shared)
         feedback.start()
         gamepadFeedback = feedback
+        capture.onOwnershipChange = { [weak feedback] owned in feedback?.setSilenced(!owned) }
         // Steam Controller 2 as-is passthrough (opt-in): capture an OS-paired SC2's vendor GATT
         // service and forward its raw reports — the host mirrors a real 28DE:1302 that its
         // Steam drives directly, and Steam's rumble/settings writes come back through the
@@ -1244,6 +1283,9 @@ final class SessionModel: ObservableObject {
                 // readout also walks the countdown and picks up mid-session grant edits.
                 self.updateAccessState()
                 guard let conn = self.connection else { return }
+                if let notice = conn.launchNotice, notice != self.launchNoticeShown {
+                    self.showLaunchNotice(notice)
+                }
                 let (frames, _) = self.meter.drain()
                 // Host timings (0xCF) feed the core, which matches each to its frame. Bounded: a
                 // 240 fps window is ~240 reports; a throw (closed) just ends the drain.

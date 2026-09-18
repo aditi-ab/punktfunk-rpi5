@@ -174,7 +174,7 @@ pub fn host_hdr_capable() -> bool {
             // the session will pick, and it is cached downstream.
             _ => crate::vdisplay::detect()
                 .ok()
-                .is_some_and(|c| crate::capture::capturer_supports_hdr_for(Some(c))),
+                .is_some_and(|c| crate::capture::capturer_supports_hdr_for(Some(c), None)),
         };
         // Any 10-bit encoder makes the host HDR-capable. Which bits get advertised is
         // `serverinfo::apply_hdr`; whether this session can carry it is the RTSP honor.
@@ -187,6 +187,9 @@ pub fn host_hdr_capable() -> bool {
         false
     }
 }
+
+/// See [`AppState::video_hdr`].
+pub type VideoHdr = std::sync::Arc<std::sync::Mutex<Option<pf_frame::HdrMeta>>>;
 
 /// Cumulative client-loss telemetry from the control stream's periodic `0x0201` loss-stats.
 /// Control thread adds; video thread's 1 Hz step reads deltas — no lock, no reset.
@@ -290,6 +293,10 @@ pub struct AppState {
     /// leaves it clear. Virtual-display linger and end-game policy both read it. Cleared
     /// by `/launch`.
     pub quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The display's admission stop flag: raised when another client steals it.
+    /// Read by [`AppState::end_if_preempted`].
+    #[cfg(feature = "gamestream")]
+    pub preempted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Audio thread running, and its keep-running flag.
     pub audio_streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Bumped by each media thread as the last thing it does on exit, after teardown.
@@ -303,6 +310,14 @@ pub struct AppState {
     pub rfi_range: std::sync::Arc<std::sync::Mutex<Option<(i64, i64)>>>,
     /// Cumulative `0x0201` loss-stats from [`control`]. Video thread's 1 Hz step reads window deltas.
     pub loss_stats: std::sync::Arc<GsLossStats>,
+    /// Mastering metadata of the frames the video thread encodes, `None` while they are SDR.
+    /// [`control`] tells the client each change (`0x010e`).
+    #[cfg(feature = "gamestream")]
+    pub video_hdr: VideoHdr,
+    /// This session's input tallies, bumped by [`control`] and read by the summary. One
+    /// session at a time on this plane, so the video thread clears them at stream start —
+    /// without that, `session.ended` would report zeros nobody counted.
+    pub counters: Arc<crate::session_status::SessionCounters>,
     /// Persistent screen capturer, reused across streams. The slot's `bool` is whether it was
     /// opened with the HDR offer; a stream whose negotiated `hdr` differs drops it and opens
     /// a fresh session at the right depth.
@@ -361,6 +376,20 @@ impl AppState {
         self.end_session(reason)
     }
 
+    /// End the session if another client stole its display since the last call. A steal is
+    /// a drop, not a quit: the display lingers for the stealer, as a native victim's does.
+    #[cfg(feature = "gamestream")]
+    pub(crate) fn end_if_preempted(&self) -> bool {
+        if !self
+            .preempted
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        self.end_session("another client took the display");
+        true
+    }
+
     /// Mint a fresh A/V ping for `/launch` or `/resume`. Must run before the client's RTSP SETUP.
     #[cfg(feature = "gamestream")]
     pub fn mint_av_ping(&self) -> [u8; AV_PING_LEN] {
@@ -400,10 +429,13 @@ impl AppState {
             audio_params: std::sync::Mutex::new(audio::AudioParams::default()),
             streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             quit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            preempted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
             loss_stats: std::sync::Arc::new(GsLossStats::default()),
+            video_hdr: VideoHdr::default(),
+            counters: Arc::new(crate::session_status::SessionCounters::default()),
             media_exited: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             video_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -426,6 +458,7 @@ impl AppState {
             force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
             loss_stats: std::sync::Arc::new(GsLossStats::default()),
+            counters: Arc::new(crate::session_status::SessionCounters::default()),
             media_exited: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stats,

@@ -1,0 +1,92 @@
+# Dispatch-only proof that a corrupt target cache entry heals itself on this cache server.
+# `plant` saves a truncated archive, `heal` must drop the partial restore and save a replacement
+# under the same key, `verify` must restore that replacement whole. No cargo.
+name: target-cache-selftest
+
+on:
+  workflow_dispatch:
+
+env:
+  KEY: cargo-target-selftest-${{ github.run_id }}
+
+jobs:
+  plant:
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 15
+    steps:
+      # actions/cache resolves tar on PATH, so this shim halves every archive the save writes.
+      - name: A target/ and a tar that truncates its archive
+        run: |
+          mkdir -p target "$RUNNER_TEMP/bad-tar"
+          for i in 1 2 3 4 5 6 7 8; do head -c 4194304 /dev/urandom > "target/blob$i"; done
+          echo planted > target/marker
+          cat > "$RUNNER_TEMP/bad-tar/tar" <<'EOF'
+          #!/bin/sh
+          /usr/bin/tar "$@" || exit
+          prev=
+          for a in "$@"; do
+            if [ "$prev" = -cf ]; then
+              truncate -s $(( $(stat -c %s "$a") / 2 )) "$a"
+              echo "truncated $a"
+            fi
+            prev=$a
+          done
+          EOF
+          chmod +x "$RUNNER_TEMP/bad-tar/tar"
+          echo "$RUNNER_TEMP/bad-tar" >> "$GITHUB_PATH"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ env.KEY }}
+
+  heal:
+    needs: plant
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ env.KEY }}
+      - name: The restore failed but left a partial target/
+        run: |
+          test -z "${{ steps.target.outputs.cache-hit }}"
+          ls -la target
+      - name: Drop a partial target restore
+        run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "${{ env.KEY }}"
+      - name: Build
+        id: build
+        run: |
+          test ! -e target
+          mkdir target
+          echo healed > target/marker
+      # The same condition as ci.yml's `rust` job, less the push filter.
+      - name: Save target
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.target.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ env.KEY }}
+
+  verify:
+    needs: heal
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 15
+    steps:
+      - id: target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ env.KEY }}
+      - name: The replacement restored whole
+        run: |
+          test "${{ steps.target.outputs.cache-hit }}" = true
+          grep -qx healed target/marker

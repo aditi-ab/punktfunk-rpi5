@@ -680,9 +680,8 @@ fn trap_the_omarchy_hand_off_ends_the_run() {
 }
 
 /// The on-device build does groups, linger, tuning and the unit start itself; nothing generic
-/// runs after it. The clipboard line is the one thing that has to land AFTER, because that
-/// script writes host.env only when the file is absent and its defaults carry the Deck's
-/// `RADV_PERFTEST=video_encode`.
+/// runs after it. The clipboard setting lands AFTER, because that script writes host.env only
+/// when the config dir is fresh and its defaults carry the Deck's `RADV_PERFTEST=video_encode`.
 #[test]
 fn trap_the_steamos_build_ends_the_run_and_sets_host_env_after_it() {
     let plan = plan_for(&fresh("steamos", Family::Steamos), &pins());
@@ -693,7 +692,7 @@ fn trap_the_steamos_build_ends_the_run_and_sets_host_env_after_it() {
         .expect("the on-device build step");
     let env = steps
         .iter()
-        .position(|a| matches!(a, StepAction::SetEnv { key, .. } if key == "PUNKTFUNK_CLIPBOARD"))
+        .position(|a| matches!(a, StepAction::SetSetting { id, .. } if id == "clipboard"))
         .expect("the clipboard step");
     assert!(build < env, "host.env would swallow the encoder default");
 
@@ -702,7 +701,7 @@ fn trap_the_steamos_build_ends_the_run_and_sets_host_env_after_it() {
         .find(|s| s.ends_run)
         .expect("a step that ends the run");
     assert!(
-        matches!(&last.action, StepAction::SetEnv { key, .. } if key == "PUNKTFUNK_CLIPBOARD"),
+        matches!(&last.action, StepAction::SetSetting { id, .. } if id == "clipboard"),
         "the run must end on the last step of the hand-off, not before it: {:?}",
         last.action
     );

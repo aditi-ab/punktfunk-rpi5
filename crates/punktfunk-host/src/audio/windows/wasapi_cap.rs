@@ -17,7 +17,7 @@
 //! Pin: `design/hi-res-audio.md`, [`super::wiring_plan`], [`super::audio_control`].
 
 use super::capture_policy::{CaptureStats, FightDamper, FIGHT_BACKOFF, STATS_EVERY};
-use super::{audio_control, wiring_plan, AudioCapturer, SAMPLE_RATE};
+use super::{audio_control, voice_route, wiring_plan, AudioCapturer, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -219,6 +219,8 @@ fn capture_thread(
     let mut backoff = REOPEN_BACKOFF_START;
     // Plan is pure in the endpoint set: log the unsatisfiable diagnosis once per fingerprint.
     let mut unsat_logged: Option<u64> = None;
+    // Outlives every reopen: the pins stay while the capture re-plans, and go at the end.
+    let mut voice = voice_route::VoiceRoute::default();
     while !stop.load(Ordering::Relaxed) {
         match capture_once(
             &tx,
@@ -229,6 +231,7 @@ fn capture_thread(
             mode,
             &active,
             &opened_rate,
+            &mut voice,
         ) {
             Ok(Next::Stopped) => break,
             Ok(Next::Reopen(m)) => {
@@ -295,8 +298,9 @@ fn capture_thread(
             }
         }
     }
-    // Restore both parked defaults (no-op if never parked, or if the operator moved them), then
-    // the sink's speaker layout. Recording restore keeps the parked mic session-scoped.
+    // Voice apps back on the default first, then both parked defaults (no-op if never parked,
+    // or if the operator moved them), then the sink's speaker layout.
+    voice.clear();
     audio_control::restore_default_playback();
     audio_control::restore_default_recording();
     audio_control::restore_endpoint_channels();
@@ -391,6 +395,7 @@ fn capture_once(
     mode: TargetMode,
     active: &AtomicBool,
     opened_rate: &AtomicU32,
+    voice: &mut voice_route::VoiceRoute,
 ) -> Result<Next> {
     // 4 bytes per f32 sample, interleaved.
     let block_align = channels as usize * 4;
@@ -594,6 +599,30 @@ fn capture_once(
             "capturing an endpoint that {why} — the stream cannot sound better than this source");
     }
 
+    // The operator's own output, while this capture owns the defaults: voice apps get pinned
+    // to it, and `host_and_client` renders the mix to it (the plan kept the silent sink).
+    let host_out = (bind_plan && !keep_default)
+        .then(audio_control::parked_previous_render)
+        .flatten()
+        .filter(|id| *id != dev_id);
+    if let Some(id) = &host_out {
+        voice.arm(id);
+    }
+    // Only when the capture is silent on the host: a plan that fell back to real hardware
+    // is already audible, and a second render would play the mix twice.
+    let mut playthrough = match &host_out {
+        Some(id) if audio_control::playthrough_requested() => {
+            if silent_loopback(&dev_name, &dev_id) {
+                Playthrough::open(id, channels, open_hz)
+            } else {
+                tracing::info!(device = %dev_name,
+                    "host playthrough not needed — the captured endpoint is audible on the host");
+                None
+            }
+        }
+        _ => None,
+    };
+
     // Seed is the default right after open. If Assert's park did not stick, converge: follow a
     // capturable default, warn once on a dud. Only a later CHANGE of that id reacts, so a
     // permanently-denied default set cannot reopen-loop.
@@ -642,6 +671,7 @@ fn capture_once(
         }
         // Events fire only while audio renders; finite timeout keeps `stop` and the watchdog alive.
         let _ = h_event.wait_for_event(100);
+        voice.tick();
         loop {
             match capture_client.get_next_packet_size() {
                 Ok(Some(0)) | Ok(None) => break,
@@ -697,6 +727,9 @@ fn capture_once(
                 samples.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
             stats.observe(&samples, channels);
+            if let Some(p) = playthrough.as_mut() {
+                p.write(&samples);
+            }
             // Lossy, non-blocking. Count only while a session is reading: a full channel under
             // a live consumer is encode lag (click + permanent shift). A parked capturer fills
             // once and then refuses everything ([`WasapiLoopbackCapturer::active`]).
@@ -810,6 +843,99 @@ fn capture_once(
                 );
                 return Ok(Next::Reopen(TargetMode::Assert));
             }
+        }
+    }
+}
+
+/// `host_and_client` with voice chat on the host: the capture stays on the silent sink and
+/// this render stream on the operator's output is how the host hears the mix. Polled from
+/// the capture loop; a full buffer drops the excess rather than stalling the capture.
+struct Playthrough {
+    client: wasapi::AudioClient,
+    render: wasapi::AudioRenderClient,
+    channels: usize,
+    dropped_frames: u64,
+}
+
+impl Playthrough {
+    /// `None` on any failure, logged once: the stream keeps going without the host hearing it.
+    fn open(device_id: &str, channels: u32, rate_hz: u32) -> Option<Playthrough> {
+        match Self::try_open(device_id, channels, rate_hz) {
+            Ok((p, name)) => {
+                tracing::info!(device = %name, "host playthrough: rendering the stream mix to the operator's output");
+                Some(p)
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"),
+                    "host playthrough not opened — the host will not hear the stream mix");
+                None
+            }
+        }
+    }
+
+    fn try_open(device_id: &str, channels: u32, rate_hz: u32) -> Result<(Playthrough, String)> {
+        let device = super::pad_endpoint::open_wasapi_device(device_id)?;
+        let name = device.get_friendlyname().unwrap_or_default();
+        let mut client = device.get_iaudioclient().context("IAudioClient")?;
+        // Same layout the capture delivers; autoconvert matches the device's engine format.
+        let mask = punktfunk_core::audio::wasapi_channel_mask(channels as u8);
+        let desired = WaveFormat::new(
+            32,
+            32,
+            &SampleType::Float,
+            rate_hz as usize,
+            channels as usize,
+            Some(mask),
+        );
+        let (default_period, _) = client.get_device_period().context("device period")?;
+        // Three engine periods (~30 ms): room for one late capture wake without a hole.
+        let mode = StreamMode::PollingShared {
+            autoconvert: true,
+            buffer_duration_hns: default_period * 3,
+        };
+        client
+            .initialize_client(&desired, &Direction::Render, &mode)
+            .context("initialize playthrough render client")?;
+        let render = client
+            .get_audiorenderclient()
+            .context("IAudioRenderClient")?;
+        let frames = client.get_buffer_size().context("buffer size")? as usize;
+        let _ = render.write_to_device(frames, &vec![0u8; frames * channels as usize * 4], None);
+        client.start_stream().context("start playthrough stream")?;
+        Ok((
+            Playthrough {
+                client,
+                render,
+                channels: channels as usize,
+                dropped_frames: 0,
+            },
+            name,
+        ))
+    }
+
+    fn write(&mut self, samples: &[f32]) {
+        let frames = samples.len() / self.channels;
+        let space = self.client.get_available_space_in_frames().unwrap_or(0) as usize;
+        let n = frames.min(space);
+        self.dropped_frames += (frames - n) as u64;
+        if n == 0 {
+            return;
+        }
+        let bytes: Vec<u8> = samples[..n * self.channels]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        if let Err(e) = self.render.write_to_device(n, &bytes, None) {
+            tracing::debug!(error = %e, "playthrough write");
+        }
+    }
+}
+
+impl Drop for Playthrough {
+    fn drop(&mut self) {
+        let _ = self.client.stop_stream();
+        if self.dropped_frames > 0 {
+            tracing::debug!(dropped_frames = self.dropped_frames, "playthrough ended");
         }
     }
 }

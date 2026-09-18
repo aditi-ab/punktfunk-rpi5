@@ -88,6 +88,7 @@ impl StreamState {
                 None,
                 8,
                 None,
+                self.client_hdr,
                 self.au_seq,
             )?;
             Ok((new_vd, pipe))
@@ -162,6 +163,7 @@ impl StreamState {
                 self.cur_display_gen,
                 None,
                 Some(resize_trace.as_ref()),
+                self.client_hdr,
                 self.au_seq,
             ) {
                 Ok(next_pipe) => {
@@ -246,6 +248,7 @@ impl StreamState {
                 self.cur_display_gen,
                 None,
                 Some(trace.as_ref()),
+                self.client_hdr,
                 self.au_seq,
             ) {
                 Ok(next_pipe) => {
@@ -346,6 +349,7 @@ impl StreamState {
                 self.cur_display_gen,
                 1,
                 None,
+                self.client_hdr,
                 self.au_seq,
             ) {
                 Ok(p) => break p,
@@ -431,9 +435,12 @@ impl StreamState {
                         gamescope,
                         self.plan.codec,
                         self.plan.bit_depth,
+                        rebuilt_route.as_ref(),
                     );
-                    self.plan.gamescope_cursor =
-                        crate::session_plan::gamescope_cursor_for(gamescope);
+                    self.plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(
+                        gamescope,
+                        rebuilt_route.as_ref(),
+                    );
                     (self.gamescope_composite, self.metadata_composite) =
                         composite_plan(&self.plan, self.cursor_fwd.is_some(), gamescope);
                     self.vd
@@ -476,6 +483,7 @@ impl StreamState {
             actual.refresh_hz,
             |_, _| src_kbps as u64 * 1000,
             self.bit_depth,
+            self.client_hdr,
             self.au_seq,
         )
         .with_context(|| {

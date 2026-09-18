@@ -710,7 +710,7 @@ pub fn find_usb_topology() -> Option<UsbTopology> {
 /// Opt-in: this mints a real ALSA card that supersedes the pad-audio sinks.
 pub fn usbip_preferred() -> bool {
     matches!(
-        std::env::var("PUNKTFUNK_DUALSENSE_USBIP").ok().as_deref(),
+        pf_host_config::knob("PUNKTFUNK_DUALSENSE_USBIP").as_deref(),
         Some("1") | Some("true")
     )
 }

@@ -6,9 +6,8 @@
 // (the Linux client has its GTK Shortcuts window, Windows its start-of-stream banner). While
 // input is CAPTURED these key equivalents never reach the menu (the stream view swallows
 // keys); InputCapture's monitor detects the same combos there and performs the same actions —
-// the menu covers the released state and discoverability. The stats item cycles the shared
-// `statsVerbosity` tier (off → compact → normal → detailed → off); ContentView reads the same
-// @AppStorage and reacts.
+// the menu covers the released state and discoverability. The stats item cycles the focused
+// window's session tier (off → compact → normal → detailed → off).
 //
 // tvOS has no menu bar / hardware-keyboard command surface (disconnect there is the Siri
 // Remote's Menu button, handled by ContentView's `.onExitCommand`), so this whole file is
@@ -33,6 +32,8 @@ struct SessionFocus {
     /// The user's mic mute is engaged — drives the item's Mute/Unmute title.
     var micMuted: Bool
     var toggleMicMute: () -> Void
+    var cycleStats: () -> Void
+    var toggleQuickActions: () -> Void
     var disconnect: () -> Void
 }
 
@@ -52,11 +53,11 @@ struct StreamCommands: Commands {
 
     var body: some Commands {
         CommandMenu("Stream") {
-            // Through the shared cycle so it advances from the LIVE session's tier — a preset
-            // that starts a session on Detailed must cycle to Off from here, not from whatever
-            // the global default happens to be.
-            Button("Cycle Statistics") { StatsVerbosity.cycle() }
+            // From the focused session's own tier: a preset that starts a session on Detailed
+            // cycles to Off from here, whatever the global default is.
+            Button("Cycle Statistics") { session?.cycleStats() }
             .keyboardShortcut("s", modifiers: [.control, .option, .shift])
+            .disabled(session?.isStreaming != true)
             // Reaches the key window's stream view via NotificationCenter — capture is view
             // state the Scene can't touch directly. (Captured, the combo is handled by
             // InputCapture's monitor before menus see it; this item is the released-state
@@ -87,10 +88,8 @@ struct StreamCommands: Commands {
             // The quick-action ring (design/touch-client-overlay.md §2). A Mac has no two-finger
             // twist, so this menu item and its ⌃⌥⇧O — the desktop clients' own chord for the ring
             // — are how it opens; a pad opens it with Select+A. Captured, InputCapture's monitor
-            // catches the combo and posts the same notification, so both states end at one toggle.
-            Button("Quick Actions") {
-                NotificationCenter.default.post(name: .punktfunkToggleQuickActions, object: nil)
-            }
+            // catches the combo and toggles the same ring.
+            Button("Quick Actions") { session?.toggleQuickActions() }
             .keyboardShortcut("o", modifiers: [.control, .option, .shift])
             .disabled(session?.isStreaming != true)
             // Toggle the window's fullscreen. ⌃⌘F is the macOS-standard fullscreen combo; here it's

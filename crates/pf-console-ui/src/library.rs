@@ -798,9 +798,10 @@ struct Shared {
     /// catching `Loading`. A warm cache publishes `Ready` inside one 60 Hz frame, so a
     /// phase edge can be missed; a counter cannot.
     fetch_epoch: u64,
-    /// Each launched title's host-side state string (`launching`, `running`, …), by library
-    /// id — the launch hold's answer. Replaced whole on every `/status` read.
-    states: std::collections::HashMap<String, String>,
+    /// Each launched title's host-side state string (`launching`, `running`, …) and whether a
+    /// `window` is still to come, by library id — the launch hold's answer. Replaced whole on
+    /// every `/status` read.
+    states: std::collections::HashMap<String, (String, bool)>,
     /// Bumped on every `/status` read, changed or not: the launch hold paces its next poll
     /// on an answer landing, not on the answer being different.
     status_gen: u64,
@@ -941,7 +942,7 @@ impl LibraryShared {
         s.status_gen += 1;
         s.states = games
             .iter()
-            .filter_map(|g| Some((g.app_id.clone()?, g.state.clone())))
+            .filter_map(|g| Some((g.app_id.clone()?, (g.state.clone(), g.awaiting_window))))
             .collect();
         let mut changed = false;
         for g in &mut s.games {
@@ -962,9 +963,10 @@ impl LibraryShared {
         s.generation += 1;
     }
 
-    /// The host's state string for one launched title, from the last `/status` read; `None`
-    /// when the host lists nothing for it (no lease yet, or the launch never resolved).
-    pub(crate) fn launch_state(&self, id: &str) -> Option<String> {
+    /// The host's state string for one launched title, and whether it will report `window`
+    /// next, from the last `/status` read; `None` when the host lists nothing for it (no lease
+    /// yet, or the launch never resolved).
+    pub(crate) fn launch_state(&self, id: &str) -> Option<(String, bool)> {
         self.0.lock().unwrap().states.get(id).cloned()
     }
 
@@ -1567,6 +1569,7 @@ mod tests {
                 app_id: Some((*id).to_string()),
                 title: String::new(),
                 state: state.to_string(),
+                awaiting_window: false,
             })
             .collect()
     }
@@ -1594,7 +1597,10 @@ mod tests {
         shared.set_running(&running(&["steam:Celeste"], "launching"));
         assert_eq!(shared.status_gen(), 1);
         assert_eq!(
-            shared.launch_state("steam:Celeste").as_deref(),
+            shared
+                .launch_state("steam:Celeste")
+                .map(|(s, _)| s)
+                .as_deref(),
             Some("launching")
         );
         assert!(
@@ -1606,7 +1612,10 @@ mod tests {
         assert_eq!(shared.status_gen(), 2);
         assert_eq!(shared.snapshot().generation, badges, "no badge moved");
         assert_eq!(
-            shared.launch_state("steam:Celeste").as_deref(),
+            shared
+                .launch_state("steam:Celeste")
+                .map(|(s, _)| s)
+                .as_deref(),
             Some("running")
         );
         shared.set_running(&[]);

@@ -382,10 +382,12 @@ mod tests {
             settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads,
             deck,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         }

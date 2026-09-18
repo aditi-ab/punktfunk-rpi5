@@ -214,10 +214,16 @@ final class Sc2UsbLink {
 
     /// Close every collection and tear the manager down. Idempotent; safe from any thread. Does
     /// not fire `onSourceClosed` — the caller is the one tearing down.
+    ///
+    /// Lizard mode goes back on first: without it the pad stays in Steam-Input HID until the
+    /// firmware watchdog fires, driving neither keyboard nor mouse for those seconds.
     func stop() {
         queue.async { [self] in
             started = false
+            // Keep-alive first, so no disable can land after the restore; the restore before the
+            // cancels, so it reaches a collection that is still open.
             stopKeepAlive()
+            sendFeature([Sc2Device.enableLizard])
             for (id, dev) in open { cancel(id: id, device: dev) }
             open.removeAll()
             denied.removeAll()
@@ -491,8 +497,14 @@ final class Sc2UsbLink {
     /// Both initialization features, to EVERY open collection — before the first report there is
     /// no known target, and on a Puck the bonded slot is exactly what we are trying to discover.
     private func sendInitFeatures() {
+        sendFeature([Sc2Device.disableLizard, Sc2Device.normalizeJoysticks])
+    }
+
+    /// Write id-first feature frames to every open collection, in order. `IOHIDDeviceSetReport`
+    /// is synchronous, so a frame sent here has landed before the next line runs.
+    private func sendFeature(_ frames: [[UInt8]]) {
         for (_, dev) in open {
-            for frame in [Sc2Device.disableLizard, Sc2Device.normalizeJoysticks] {
+            for frame in frames {
                 _ = frame.withUnsafeBufferPointer { buf in
                     IOHIDDeviceSetReport(
                         dev, kIOHIDReportTypeFeature, CFIndex(frame[0]), buf.baseAddress!,

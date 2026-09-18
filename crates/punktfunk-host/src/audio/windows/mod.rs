@@ -24,6 +24,9 @@ pub(crate) mod pad_capture;
 // DualSense pad-audio endpoint + loopback (design: pad haptics/audio). Session
 // queries by pad index; CLI `pad-endpoint`.
 pub(crate) mod pad_endpoint;
+// Voice-chat apps pinned to the operator's output while the stream captures the silent
+// sink; also the `voice-route` subcommand that writes the pins as the console user.
+pub(crate) mod voice_route;
 mod wasapi_cap;
 mod wasapi_mic;
 

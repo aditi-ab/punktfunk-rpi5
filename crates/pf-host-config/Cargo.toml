@@ -1,15 +1,17 @@
 # The process-wide host configuration global (HostConfig + the config() OnceLock), extracted into a
 # leaf crate so every subsystem crate (pf-encode, pf-capture, pf-vdisplay, pf-gpu) can read config
-# WITHOUT depending on the orchestrator (plan §W6 — config parked above its consumers). Pure std.
+# WITHOUT depending on the orchestrator (plan §W6 — config parked above its consumers).
 [package]
 name = "pf-host-config"
 version.workspace = true
 edition.workspace = true
 license = "MIT OR Apache-2.0"
-description = "Process-wide punktfunk host configuration (env-parsed HostConfig behind a OnceLock)."
+description = "Process-wide punktfunk host configuration: the settings registry, its store, and the env knobs."
 publish = false
 
 [dependencies]
+pf-paths = { path = "../pf-paths" }
+serde_json = "1"
 
 [lints]
 workspace = true

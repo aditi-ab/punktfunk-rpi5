@@ -81,6 +81,7 @@ const GAMEPADS: &[(&str, &str)] = &[
     // Kept in lockstep with the GTK picker: this row was missing here, so a Windows
     // user could not ask the host for the Deck-shaped pad (trackpads, back grips).
     ("steamdeck", "Steam Deck"),
+    ("steamcontroller2", "Steam Controller 2"),
 ];
 /// System-button routing: `(stored value, display label)` — where the guide (Xbox/PS)
 /// and quick-access presses land while streaming. The cross-client `system_buttons` key;

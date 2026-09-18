@@ -17,6 +17,7 @@
 // Phase 1 formats only (text / RTF / HTML / PNG / JPEG / GIF). Files ride Phase 2.
 #if !os(tvOS)
 import Foundation
+import os
 
 /// One live session's clipboard bridge. Created by the session model when streaming begins on a
 /// host that advertises `HOST_CAP_CLIPBOARD` and whose per-host toggle is on; `stop()` before the
@@ -57,6 +58,9 @@ public final class ClipboardSync: NSObject {
     // Read by the drain thread, and written by the thread tearing the sync down too, so it is all
     // under one lock. Nothing here is held across a fetch or a pasteboard read.
     private let stateLock = NSLock()
+    /// The changeCount of the last host offer ANY session wrote. Another window's host clipboard
+    /// is not a local copy, so no session announces it to its own host.
+    private static let hostWrite = OSAllocatedUnfairLock(initialState: -1)
     private var offerSeq: UInt32 = 0
     private var lastSeenChangeCount = 0
     /// The changeCount of the last pasteboard write WE made (echo suppression, and "do we still
@@ -233,8 +237,9 @@ public final class ClipboardSync: NSObject {
             stateLock.unlock() // our own write (a remote offer) — never echo
             return
         }
-        installedRemote = nil // a local copy replaced the host's offer
+        installedRemote = nil // a local copy, or another session's host, replaced the offer
         stateLock.unlock()
+        guard count != Self.hostWrite.withLock({ $0 }) else { return }
 
         guard let kinds = pasteboard.offerKinds else { return } // concealed — never announced
         stateLock.lock()
@@ -295,6 +300,7 @@ public final class ClipboardSync: NSObject {
                 let after = pasteboard.clear()
                 ownedChangeCount = after
                 lastSeenChangeCount = after
+                Self.hostWrite.withLock { $0 = after }
             }
             stateLock.unlock()
             return
@@ -317,6 +323,7 @@ public final class ClipboardSync: NSObject {
         if after != before {
             ownedChangeCount = after
             lastSeenChangeCount = after
+            Self.hostWrite.withLock { $0 = after }
         }
         stateLock.unlock()
     }
@@ -409,6 +416,7 @@ public final class ClipboardSync: NSObject {
         resolvedSeq = offer.seq
         ownedChangeCount = after
         lastSeenChangeCount = after
+        Self.hostWrite.withLock { $0 = after }
     }
 
     // MARK: - Host paste of our data (serve)

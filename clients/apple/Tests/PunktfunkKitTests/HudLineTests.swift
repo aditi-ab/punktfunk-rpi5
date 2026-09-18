@@ -1,5 +1,5 @@
 // The core formats the stats overlay; these pin the Swift half: the line decode, and a live tier
-// cycle that must never move the stored default.
+// cycle that names its session and never moves the stored default.
 
 import PunktfunkShared
 import XCTest
@@ -15,7 +15,7 @@ final class HudLineTests: XCTestCase {
         XCTAssertEqual(PunktfunkConnection.HudLine.decode(""), [])
     }
 
-    func testCycleMovesOnlyTheLiveSession() {
+    func testCycleRequestNamesItsSession() {
         let key = DefaultsKey.statsVerbosity
         let saved = UserDefaults.standard.string(forKey: key)
         defer {
@@ -24,14 +24,12 @@ final class HudLineTests: XCTestCase {
             } else {
                 UserDefaults.standard.removeObject(forKey: key)
             }
-            SessionSettings.end()
         }
         UserDefaults.standard.set("detailed", forKey: key)
-        var live = EffectiveSettings()
-        live.statsVerbosity = "compact"
-        SessionSettings.begin(live)
-        StatsVerbosity.cycle()
-        XCTAssertEqual(SessionSettings.current.statsVerbosity, "normal")
+        let session = NSObject()
+        let posted = expectation(forNotification: .punktfunkStatsCycled, object: session)
+        StatsVerbosity.requestCycle(for: session)
+        wait(for: [posted], timeout: 1)
         XCTAssertEqual(UserDefaults.standard.string(forKey: key), "detailed", "the stored tier moved")
     }
 }

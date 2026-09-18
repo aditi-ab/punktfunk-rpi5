@@ -51,8 +51,8 @@ const SERVICE_DISPLAY: &str = "Punktfunk Host";
 const SERVICE_DESCRIPTION: &str =
     "Low-latency desktop/game streaming host. Launches the ordinary host into the active console session.";
 
-/// Default `PUNKTFUNK_HOST_CMD`. `--gamestream` adds Moonlight compat (plain-HTTP pairing).
-/// Drop it for a native-only host.
+/// `PUNKTFUNK_HOST_CMD` when host.env names none. Only a host.env from before the setting has no
+/// line; `service install` moves its GameStream into the settings store and writes `serve`.
 const DEFAULT_HOST_CMD: &str = "serve --gamestream";
 
 /// Manual-reset STOP and SESSION events. `OnceLock` so the SCM handler stays `'static` (`HANDLE` is
@@ -80,7 +80,7 @@ pub fn main(args: &[String]) -> Result<()> {
                  USAGE:\n\
                  \x20   punktfunk-host service install [--gamestream=on|off] [--web-bind=ADDR]\n\
                  \x20                                      register the auto-start service + firewall rules\n\
-                 \x20                                      (--gamestream sets host.env's PUNKTFUNK_HOST_CMD;\n\
+                 \x20                                      (--gamestream sets the console's GameStream setting;\n\
                  \x20                                       --web-bind sets PUNKTFUNK_UI_BIND, the console's\n\
                  \x20                                       address: 127.0.0.1, 0.0.0.0, or one of yours)\n\
                  \x20   punktfunk-host service uninstall   stop + remove the service + firewall rules\n\
@@ -181,7 +181,10 @@ fn load_host_env() {
             // Allow-list matches `interactive::merged_env_block`. A planted host.env must not
             // override `SystemRoot` — `icacls_path` / the powershell warner resolve through it.
             // `PUNKTFUNK_HOST_CMD` still passes; a non-admin-owned host.env is rejected at install.
-            let allowed = k.starts_with("PUNKTFUNK_") || k == "RUST_LOG";
+            // Credentials are excluded outright: they live in their own owner-only files, and an
+            // environment copy is what every child process inherits.
+            let secret = k.contains("TOKEN") || k.contains("PASSWORD");
+            let allowed = (k.starts_with("PUNKTFUNK_") || k == "RUST_LOG") && !secret;
             if !k.is_empty() && allowed {
                 // SAFETY: no other thread yet. The network-profile warner and the host child both
                 // start after `load_host_env` returns, so nothing reads the environment concurrently.
@@ -420,8 +423,18 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
                 continue;
             }
             _ => {
+                let mut code: u32 = 0;
+                // SAFETY: `proc_h` copies the still-live `child.process` OwnedHandle (dropped only at
+                // end of iteration); `code` is a live local out-param.
+                let _ = unsafe { GetExitCodeProcess(proc_h, &mut code) };
+                if code == crate::power::RESTART_EXIT_CODE {
+                    tracing::info!(pid = child.pid, "host restarting on request — relaunching");
+                    restarts = 0;
+                    continue;
+                }
                 tracing::warn!(
                     pid = child.pid,
+                    exit_code = format!("{code:#x}"),
                     "host process exited on its own — relaunching"
                 );
             }
@@ -554,7 +567,13 @@ unsafe fn spawn_host(
     let _ = unsafe { CreateEnvironmentBlock(&mut env_block, Some(primary), false) };
     // SAFETY: `env_block` is either still null (the call above failed) or the double-null-terminated
     // UTF-16 block `CreateEnvironmentBlock` just wrote — exactly the two states the helper accepts.
-    let merged = unsafe { crate::interactive::merged_env_block(env_block as *const u16, false) };
+    let mut merged =
+        unsafe { crate::interactive::merged_env_block(env_block as *const u16, false) };
+    // Tells the host a restart request is answered (`crate::power::RESTART_EXIT_CODE`). The block
+    // ends in its terminating NUL; the entry goes before it.
+    merged.pop();
+    merged.extend("PUNKTFUNK_SERVICE_CHILD=1".encode_utf16());
+    merged.extend([0, 0]);
     if !env_block.is_null() {
         // SAFETY: `env_block` is the live block from the call above, destroyed exactly once and not
         // read after — `merged` owns its own copy of the parsed entries.
@@ -1102,7 +1121,7 @@ fn install(args: &[String]) -> Result<()> {
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-    // `None` = flag absent: leave host.env as-is.
+    // `None` = flag absent: the store keeps its value.
     let gamestream = match args.iter().find_map(|a| a.strip_prefix("--gamestream=")) {
         Some("on") => Some(true),
         Some("off") => Some(false),
@@ -1200,9 +1219,7 @@ fn install(args: &[String]) -> Result<()> {
     }
 
     ensure_default_host_env()?;
-    if let Some(on) = gamestream {
-        apply_gamestream_choice(on);
-    }
+    apply_gamestream_choice(gamestream);
     // Before the rules below: the mgmt rule reads its port back from host.env.
     if let Some(addr) = mgmt_bind {
         set_host_env_line("PUNKTFUNK_MGMT_BIND", &addr.to_string())?;
@@ -1318,7 +1335,7 @@ fn ensure_default_host_env() -> Result<()> {
         // Re-lock the file: an owner can rewrite the DACL it inherited. `planted` files fall
         // through and are overwritten even if the rename-aside failed.
         pf_paths::restrict_existing_secret_file(&path);
-        keep_web_console_reach(&path);
+        name_web_console_bind(&path);
         return Ok(());
     }
     let default = "# punktfunk host configuration (read by the Windows service).\n\
@@ -1334,17 +1351,17 @@ fn ensure_default_host_env() -> Result<()> {
         # other capture path, and the secure desktop (UAC / lock / login) is always captured.\n\
         RUST_LOG=info\n\
         \n\
-        # The host subcommand the service launches (default: serve --gamestream = native + Moonlight\n\
-        # compat). Use `serve` for a SECURE native-only host (no GameStream #5/#9 surface).\n\
-        # PUNKTFUNK_HOST_CMD=serve --gamestream\n\
+        # The host subcommand the service launches. GameStream (Moonlight) is a setting in the web\n\
+        # console; `serve --gamestream` here would lock it on.\n\
+        PUNKTFUNK_HOST_CMD=serve\n\
         \n\
         # The web management console (https://<this-PC>:47992) runs as a child of the service.\n\
         # Set to off to disable it:\n\
         # PUNKTFUNK_WEB_CONSOLE=off\n\
         \n\
-        # Where that console listens: 127.0.0.1 (this PC), 0.0.0.0 (your network), or one address,\n\
-        # e.g. a VPN interface. The plugin-UI origin on 47993 follows it.\n\
-        PUNKTFUNK_UI_BIND=127.0.0.1\n\
+        # Where that console listens: 0.0.0.0 (your network, never the internet), 127.0.0.1 (this\n\
+        # PC only), or one address, e.g. a VPN interface. The plugin-UI origin on 47993 follows it.\n\
+        PUNKTFUNK_UI_BIND=0.0.0.0\n\
         \n\
         # Force a specific render GPU by name substring (multi-GPU boxes only):\n\
         # PUNKTFUNK_RENDER_ADAPTER=4090\n\
@@ -1359,13 +1376,11 @@ fn ensure_default_host_env() -> Result<()> {
     Ok(())
 }
 
-/// Name the console's bind in an existing host.env, once.
+/// Name the console's bind in a host.env that predates `PUNKTFUNK_UI_BIND`, once.
 ///
-/// This file predates `PUNKTFUNK_UI_BIND`, and the console it configures answered on every
-/// interface. The new default is loopback, so an upgrade that said nothing would take the console
-/// off the LAN of every box already using it from another device. Write down the reach it has;
-/// `--web-bind` (applied after this) is how an operator changes it in the same run.
-fn keep_web_console_reach(path: &Path) {
+/// The value is the default the console already runs with, so nothing moves; the line is there so
+/// the operator finds the setting. `--web-bind` (applied after this) changes it in the same run.
+fn name_web_console_bind(path: &Path) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
@@ -1377,27 +1392,25 @@ fn keep_web_console_reach(path: &Path) {
     }
     let mut next = text;
     next.push_str(concat!(
-        "\n# Where the web console listens. This PC already served it on every interface, so that\n",
-        "# is preserved here. 127.0.0.1 keeps the console to this machine.\n",
+        "\n# Where the web console listens: 0.0.0.0 (your network, never the internet), 127.0.0.1\n",
+        "# (this PC only), or one address, e.g. a VPN interface.\n",
         "PUNKTFUNK_UI_BIND=0.0.0.0\n",
     ));
     match pf_paths::write_secret_file(path, next.as_bytes()) {
-        Ok(()) => println!("PUNKTFUNK_UI_BIND=0.0.0.0 (kept) → {}", path.display()),
+        Ok(()) => println!("PUNKTFUNK_UI_BIND=0.0.0.0 → {}", path.display()),
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "name the console bind in host.env")
         }
     }
 }
 
-/// Write `PUNKTFUNK_HOST_CMD`. Only an absent line or `serve` / `serve --gamestream` is rewritten;
-/// a custom command stays. Best-effort.
-fn apply_gamestream_choice(enable: bool) {
+/// Record the GameStream choice in the settings store, where the console reads and changes it.
+///
+/// A host command of `serve --gamestream`, or none (which ran that), becomes `serve` plus a stored
+/// `true`: the flag would lock the console's toggle. The store is written before host.env, so a
+/// failed write never turns GameStream off. A custom command stays. Best-effort.
+fn apply_gamestream_choice(choice: Option<bool>) {
     let path = host_env_path();
-    let desired = if enable {
-        "serve --gamestream"
-    } else {
-        "serve"
-    };
     let Ok(text) = std::fs::read_to_string(&path) else {
         eprintln!(
             "warning: {} not read, so the GameStream choice is unapplied",
@@ -1405,39 +1418,50 @@ fn apply_gamestream_choice(enable: bool) {
         );
         return;
     };
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let current = lines.iter().position(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.starts_with("PUNKTFUNK_HOST_CMD=")
-    });
-    match current {
-        Some(i) => {
-            let value = lines[i].trim_start()["PUNKTFUNK_HOST_CMD=".len()..].trim();
-            if value == desired {
-                return;
-            }
-            if value != "serve" && value != "serve --gamestream" {
-                println!(
-                    "host.env has a customized PUNKTFUNK_HOST_CMD ({value}) - leaving it \
-                     (installer GameStream choice not applied)"
-                );
-                return;
-            }
-            lines[i] = format!("PUNKTFUNK_HOST_CMD={desired}");
+    let (store, host_env, pinned) = gamestream_migration(&text, choice);
+    if let Some(on) = store {
+        let patch = serde_json::Map::from_iter([("gamestream".into(), on.into())]);
+        if let Err(e) = pf_host_config::save(&patch) {
+            eprintln!("warning: the GameStream choice was not saved: {e}");
+            return;
         }
-        None => lines.push(format!("PUNKTFUNK_HOST_CMD={desired}")),
+        println!(
+            "GameStream (Moonlight) compatibility: {}",
+            if on { "on" } else { "off" }
+        );
     }
-    let mut out = lines.join("\n");
-    out.push('\n');
-    // `write_secret_file` re-asserts the SYSTEM/Administrators DACL.
-    if let Err(e) = pf_paths::write_secret_file(&path, out.as_bytes()) {
-        eprintln!("warning: {} not written: {e}", path.display());
-        return;
+    if let Some(next) = host_env {
+        // `write_secret_file` re-asserts the SYSTEM/Administrators DACL.
+        match pf_paths::write_secret_file(&path, next.as_bytes()) {
+            Ok(()) => println!("PUNKTFUNK_HOST_CMD=serve → {}", path.display()),
+            Err(e) => eprintln!("warning: {} not written: {e}", path.display()),
+        }
     }
-    println!(
-        "GameStream (Moonlight) compatibility: {} (PUNKTFUNK_HOST_CMD={desired})",
-        if enable { "enabled" } else { "disabled" }
-    );
+    if pinned && choice == Some(false) {
+        println!("host.env's PUNKTFUNK_HOST_CMD passes --gamestream, which keeps GameStream on");
+    }
+}
+
+/// `(store value, host.env rewrite, custom command passes --gamestream)` for `service install`.
+fn gamestream_migration(text: &str, choice: Option<bool>) -> (Option<bool>, Option<String>, bool) {
+    let cmd = text
+        .lines()
+        .rev()
+        .find_map(|l| l.trim_start().strip_prefix("PUNKTFUNK_HOST_CMD="))
+        .map(|v| v.trim().trim_matches('"'));
+    match cmd {
+        None | Some("serve --gamestream") => (
+            choice.or(Some(true)),
+            Some(with_env_line(text, "PUNKTFUNK_HOST_CMD", "serve")),
+            false,
+        ),
+        Some(cmd) => (
+            choice,
+            None,
+            cmd.split_whitespace()
+                .any(|a| a == "--gamestream" || a == "--moonlight"),
+        ),
+    }
 }
 
 /// `text` with its last live `key=` line set to `value`, else one appended. Last wins, as
@@ -1947,6 +1971,43 @@ mod firewall_tests {
         assert_eq!(
             with_env_line("A=1\n# K=0\nK=2\n", "K", "3"),
             "A=1\n# K=0\nK=3\n"
+        );
+    }
+
+    /// The installer's `--gamestream` moves to the store without turning GameStream off.
+    #[test]
+    fn gamestream_moves_from_the_host_command_to_the_store() {
+        let legacy = "# PUNKTFUNK_HOST_CMD=serve\nPUNKTFUNK_HOST_CMD=serve --gamestream\n";
+        let (store, text, pinned) = gamestream_migration(legacy, None);
+        assert_eq!(store, Some(true));
+        assert_eq!(
+            text.as_deref(),
+            Some("# PUNKTFUNK_HOST_CMD=serve\nPUNKTFUNK_HOST_CMD=serve\n")
+        );
+        assert!(!pinned);
+        // No line ran `serve --gamestream`.
+        let (store, text, _) = gamestream_migration("RUST_LOG=info\n", None);
+        assert_eq!(store, Some(true));
+        assert_eq!(
+            text.as_deref(),
+            Some("RUST_LOG=info\nPUNKTFUNK_HOST_CMD=serve\n")
+        );
+        assert_eq!(gamestream_migration(legacy, Some(false)).0, Some(false));
+        // `serve` keeps whatever the store holds unless the installer chose.
+        assert_eq!(
+            gamestream_migration("PUNKTFUNK_HOST_CMD=serve\n", None),
+            (None, None, false)
+        );
+        assert_eq!(
+            gamestream_migration("PUNKTFUNK_HOST_CMD=serve\n", Some(true)),
+            (Some(true), None, false)
+        );
+        assert_eq!(
+            gamestream_migration(
+                "PUNKTFUNK_HOST_CMD=serve --gamestream --open\n",
+                Some(false)
+            ),
+            (Some(false), None, true)
         );
     }
 }

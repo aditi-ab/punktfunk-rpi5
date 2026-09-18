@@ -342,7 +342,7 @@ pub fn touch_supported() -> bool {
 /// `PUNKTFUNK_PEN=0`. Welcome-time; clients without the bit fold pen into touch/pointer.
 #[cfg(target_os = "linux")]
 pub fn pen_supported() -> bool {
-    if std::env::var("PUNKTFUNK_PEN").as_deref() == Ok("0") {
+    if pf_host_config::knob("PUNKTFUNK_PEN").as_deref() == Some("0") {
         return false;
     }
     // SAFETY: 'static NUL-terminated path literal; `open` returns a fresh fd (or -1) and
@@ -366,7 +366,7 @@ pub fn pen_supported() -> bool {
 /// in 1809).
 #[cfg(target_os = "windows")]
 pub fn pen_supported() -> bool {
-    if std::env::var("PUNKTFUNK_PEN").as_deref() == Ok("0") {
+    if pf_host_config::knob("PUNKTFUNK_PEN").as_deref() == Some("0") {
         return false;
     }
     pen::synthetic_pen_available()
@@ -613,6 +613,13 @@ pub mod pad_pool;
 /// everywhere or nowhere.
 #[path = "inject/pad_slots.rs"]
 pub mod pad_slots;
+/// Per-seat device visibility ([`seat_dev::SeatDev`]): the symlinks a sandboxed seat's Steam
+/// resolves its pads through, and the host-wide lock every create takes.
+///
+/// Built on every target like [`pad_gate`]: only a Linux seat ever sets a directory, but the
+/// window arithmetic and the cross-seat rule are what a test pins, everywhere or nowhere.
+#[path = "inject/seat_dev.rs"]
+pub mod seat_dev;
 /// `sensor_timestamp` every virtual Sony pad stamps into its input reports
 /// ([`sensor_clock::SensorClock`]) — elapsed time in DualSense 1/3 µs and DualShock 4
 /// 5.33 µs units, shared by all four backends.
@@ -728,6 +735,8 @@ pub mod gamepad {
         }
         pub fn handle(&mut self, _ev: &punktfunk_core::input::GamepadEvent) {}
         pub fn pump_rumble(&mut self, _send: impl FnMut(u16, u16, u16, u16, u16)) {}
+        /// No pad is ever made here, so there is nothing to show a seat.
+        pub fn expose_in(&mut self, _dir: Option<std::path::PathBuf>) {}
     }
 }
 /// "Punktfunk Pen" uinput virtual tablet — per-session stylus the native pen plane injects

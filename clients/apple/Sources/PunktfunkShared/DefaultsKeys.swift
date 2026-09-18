@@ -351,8 +351,8 @@ extension Notification.Name {
     public static let punktfunkReleaseCapture = Notification.Name("io.unom.punktfunk.release-capture")
     /// The quick-action ring's Keyboard slot: summon the stream view's soft keyboard (iOS).
     public static let punktfunkShowSoftKeyboard = Notification.Name("io.unom.punktfunk.show-soft-keyboard")
-    /// The live stats tier moved (`userInfo["tier"]`, a `StatsVerbosity` raw value). Posted by
-    /// `StatsVerbosity.cycle`; the session view follows it without touching the stored default.
+    /// Asks a session to advance its stats tier; `object` is its connection, nil for every session.
+    /// Posted by `StatsVerbosity.requestCycle`. The stored default does not move.
     public static let punktfunkStatsCycled = Notification.Name("io.unom.punktfunk.stats-cycled")
 
     /// Posted by the session view when the quick-action ring opens (`object` is a Bool `NSNumber`).
@@ -385,8 +385,8 @@ extension Notification.Name {
     /// the intent lives in PunktfunkShared and can't reach the app's `SessionModel` directly.
     public static let punktfunkEndActiveSession = Notification.Name("io.unom.punktfunk.end-active-session")
 
-    /// Posted by the Connect App Intent (Siri/Shortcuts) with a `punktfunk://` URL as `object`:
-    /// the app routes it through the SAME `.onOpenURL` handler a widget tap uses (one router, one
-    /// set of guards). The intent uses `openAppWhenRun`, so the app is foregrounded to receive it.
+    /// Posted by the Connect App Intent (Siri/Shortcuts) with a `punktfunk://` URL as an `NSURL`
+    /// `object`: one window routes it through the SAME `.onOpenURL` handler a widget tap uses. The
+    /// intent uses `openAppWhenRun`, so the app is foregrounded to receive it.
     public static let punktfunkOpenDeepLink = Notification.Name("io.unom.punktfunk.open-deep-link")
 }

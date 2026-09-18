@@ -51,12 +51,12 @@ git clone https://git.unom.io/unom/punktfunk ~/punktfunk
 bash ~/punktfunk/scripts/steamdeck/install.sh            # PIN pairing required (secure default)
 bash ~/punktfunk/scripts/steamdeck/install.sh --open     # trusted LAN: accept unpaired clients
 bash ~/punktfunk/scripts/steamdeck/install.sh --no-web   # host only, no web console
-bash ~/punktfunk/scripts/steamdeck/install.sh --no-gamestream  # native punktfunk/1 only, no Moonlight surface
+bash ~/punktfunk/scripts/steamdeck/install.sh --gamestream     # also serve stock Moonlight (trusted LAN)
 bash ~/punktfunk/scripts/steamdeck/update.sh             # after pulling new source
 ```
 
-Note: unlike a bare `serve` (native-only by default), the Deck install enables `--gamestream` by
-default so stock Moonlight clients work out of the box; `--no-gamestream` turns that surface off.
+Note: the Deck install matches a bare `serve` — native-only, PIN pairing required. Pass `--gamestream`
+to also serve stock Moonlight clients; `--no-gamestream` is kept for old command lines / re-runs.
 
 Env overrides: `PUNKTFUNK_SRC` (source dir, default `~/punktfunk`), `PUNKTFUNK_BOX` (container name,
 default `pf2`), `PUNKTFUNK_MGMT_PORT` (47990), `PUNKTFUNK_WEB_PORT` (47992).
@@ -67,9 +67,9 @@ default `pf2`), `PUNKTFUNK_MGMT_PORT` (47990), `PUNKTFUNK_WEB_PORT` (47992).
 - **Config:** `~/.config/punktfunk/host.env` (encoder/compositor) and `web.env` (generated web login
   password + session secret). Trust material (`cert.pem`, `mgmt-token`, `punktfunk1-paired.json`) lives
   here too and persists across updates.
-- **Services:** `~/.config/systemd/user/punktfunk-host.service` (runs `serve --gamestream --mgmt-bind
-  0.0.0.0:47990`, `+ --open` if chosen — `--gamestream` adds the Moonlight-compat planes so the Deck's
-  Game Mode also streams to stock Moonlight; the native `punktfunk/1` plane is always on),
+- **Services:** `~/.config/systemd/user/punktfunk-host.service` (runs `serve --mgmt-bind
+  0.0.0.0:47990`, `+ --gamestream` / `+ --open` if chosen — the native `punktfunk/1` plane is always
+  on; `--gamestream` adds the Moonlight-compat planes so Game Mode also streams to stock Moonlight),
   `punktfunk-web.service`, `punktfunk-rebuild-check.service` (post-OS-update self-heal, enabled), and
   `punktfunk-scripting.service` (plugin runner, **opt-in** — enable it once you use plugins/scripts).
   Linger is enabled so they run without a login session.

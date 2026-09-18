@@ -16,6 +16,8 @@ import {
 } from "h3";
 import {
 	authConfigured,
+	csrfRequestOrigin,
+	isCrossSiteMutation,
 	isPublicPath,
 	SESSION_NAME,
 	type SessionData,
@@ -32,7 +34,8 @@ import {
 } from "../util/pluginOrigin";
 
 export default defineEventHandler(async (event) => {
-	const { pathname } = getRequestURL(event);
+	const url = getRequestURL(event);
+	const { pathname } = url;
 	const listener = listenerOf(event);
 	const isPluginPath = isPluginUiPath(pathname);
 
@@ -81,21 +84,25 @@ export default defineEventHandler(async (event) => {
 		`frame-ancestors ${listener === "plugin" ? consoleFrameAncestor(event) : "'self'"}; object-src 'none'; base-uri 'self'`,
 	);
 
-	// Same-origin check for every MUTATING request (defense in depth beyond SameSite=Lax,
-	// added with the update-apply route where CSRF ≈ code execution — design
-	// host-update-from-web-console.md §4.3). `Sec-Fetch-Site` is browser-set and unforgeable
-	// from a page; absent (curl, very old browsers) ⇒ allowed — the console's threat here is
-	// a BROWSER being ridden cross-site, and every riding browser sends the header.
-	// `same-site` is rejected too: with an IP-address origin, another port on the same box
-	// counts as same-site, and nothing on another port has business mutating the console.
-	// Applies to public paths as well (login CSRF), before any session logic.
+	// Mutating requests must be same-origin. Origin covers browsers that omit
+	// Sec-Fetch-Site; Fetch-Site still rejects `same-site` (another port).
+	// Applies to public paths too (login CSRF), before any session logic.
 	const method = event.method?.toUpperCase?.() ?? "GET";
-	if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
-		const site = getRequestHeader(event, "sec-fetch-site")?.toLowerCase();
-		if (site && site !== "same-origin" && site !== "none") {
-			setResponseStatus(event, 403);
-			return { error: "cross-site request refused" };
-		}
+	if (
+		isCrossSiteMutation({
+			method,
+			fetchSite: getRequestHeader(event, "sec-fetch-site"),
+			origin: getRequestHeader(event, "origin"),
+			requestOrigin: csrfRequestOrigin({
+				forwardedProto: getRequestHeader(event, "x-forwarded-proto"),
+				listenerScheme: consoleOriginScheme(),
+				requestScheme: url.protocol,
+				host: url.host,
+			}),
+		})
+	) {
+		setResponseStatus(event, 403);
+		return { error: "cross-site request refused" };
 	}
 
 	// A signed-in visitor on the login page is sent on to `next`. This is also what makes a login

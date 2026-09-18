@@ -2356,15 +2356,21 @@ pub struct PunktfunkConnectOpts {
     pub preferred_codec: u8,
     /// `PUNKTFUNK_CLIENT_CAP_*` bits ([`punktfunk_connect_ex9`]).
     pub client_caps: u8,
+    /// Always `0`, ignored. Held so the struct keeps its v35 size.
+    pub reserved1: u32,
+    /// Always `0`. Fills what would otherwise be tail padding: C leaves padding
+    /// unspecified even under `= {0}`, so the next appended field would read a
+    /// caller's garbage. Spend this before growing the struct again.
+    pub reserved0: u32,
 }
 
 // No tail padding (append contract). On grow: freeze `CONNECT_OPTS_MIN_SIZE`, update these sizes.
 #[cfg(feature = "quic")]
 const _: () = {
     #[cfg(target_pointer_width = "64")]
-    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 96);
+    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 104);
     #[cfg(target_pointer_width = "32")]
-    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 68);
+    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 76);
 };
 
 /// Minimum `struct_size` [`punktfunk_connect_opts`] accepts. Frozen: when the
@@ -3262,40 +3268,6 @@ pub unsafe extern "C" fn punktfunk_connection_set_pad_mouse(
             None => return PunktfunkStatus::NullPointer,
         };
         match c.inner.set_pad_mouse(mask) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
-    })
-}
-
-/// Replace the controller-mouse layout from a JSON document: `settings` (the `pointer` and
-/// `scroll` multipliers, `deadzone`, `long_press_ms`), a `buttons` table of pad button to
-/// `mouse:left` / `key:Escape`, and a `chords` array of `buttons` + `press`
-/// (`any` / `short` / `long` / `hold`) + `keys`. NULL restores the shipped table. A pad already
-/// in controller mouse keeps the layout it entered with. `InvalidArg` on a document that does
-/// not parse, and the live layout is left alone.
-///
-/// # Safety
-/// `c` is a valid connection handle; `json` is a NUL-terminated UTF-8 string or NULL.
-/// Callable from any thread.
-#[cfg(feature = "quic")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn punktfunk_connection_set_pad_mouse_layout(
-    c: *mut PunktfunkConnection,
-    json: *const std::os::raw::c_char,
-) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: caller C string or null, borrowed for this call only.
-        let doc = match unsafe { opt_cstr(json) } {
-            Ok(d) => d,
-            Err(()) => return PunktfunkStatus::InvalidArg,
-        };
-        match c.inner.set_pad_mouse_layout(doc) {
             Ok(()) => PunktfunkStatus::Ok,
             Err(e) => e.status(),
         }
@@ -4625,6 +4597,46 @@ pub unsafe extern "C" fn punktfunk_connection_end_reject_said(
     })
 }
 
+/// The host's sentence when this session's launch did not give the player their game,
+/// NUL-terminated, into the caller's buffer; empty otherwise. The latest verdict wins, so
+/// poll it. A 256-byte buffer is ample: the wire caps this at 200.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable for `cap` bytes.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_launch_notice(
+    c: *const PunktfunkConnection,
+    out: *mut c_char,
+    cap: usize,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: caller handle or null; `as_ref` never dereferences null.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if out.is_null() || cap == 0 {
+            return PunktfunkStatus::NullPointer;
+        }
+        let outcome = c.inner.launch_outcome();
+        let notice = outcome
+            .as_ref()
+            .and_then(|o| o.notice())
+            .unwrap_or_default();
+        if notice.len() + 1 > cap {
+            return PunktfunkStatus::InvalidArg;
+        }
+        // SAFETY: `out` is non-null and holds `cap` >= notice.len() + 1 bytes.
+        unsafe {
+            // `.cast()`: `c_char` is i8 on x86_64 and u8 on aarch64.
+            std::ptr::copy_nonoverlapping(notice.as_ptr(), out.cast::<u8>(), notice.len());
+            *out.add(notice.len()) = 0;
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// Mid-session typed rejection (`PUNKTFUNK_STATUS_REJECTED_*`); `0` = none.
 /// Ask after `Closed`, before free. Connect-time rejections come from connect.
 ///
@@ -5649,8 +5661,11 @@ pub unsafe extern "C" fn punktfunk_h265_concealer_free(c: *mut PunktfunkH265Conc
     });
 }
 
-/// Fold one Annex-B access unit. `out_kind` says what to decode; for `Rewritten`,
-/// `out_buf`/`out_len` hold the bytes until [`punktfunk_h265_concealer_release`].
+/// Fold one Annex-B access unit.
+///
+/// `out_kind` says what to decode. For `Rewritten`, `out_buf` and `out_len`
+/// hold the bytes until [`punktfunk_h265_concealer_release`]. A length that
+/// cannot fit a Rust slice returns [`PunktfunkStatus::InvalidArg`].
 ///
 /// # Safety
 /// `c` is a valid handle; `au` points to `len` readable bytes; the out pointers are writable.
@@ -5676,10 +5691,13 @@ pub unsafe extern "C" fn punktfunk_h265_concealer_conceal(
         if au.is_null() && len != 0 {
             return PunktfunkStatus::NullPointer;
         }
+        if ffi_slice_bytes::<u8>(len).is_none() {
+            return PunktfunkStatus::InvalidArg;
+        }
         let bytes: &[u8] = if len == 0 {
             &[]
         } else {
-            // SAFETY: `au` is non-null here and points to `len` readable bytes per the contract.
+            // SAFETY: `au` is non-null and `ffi_slice_bytes` proved the extent fits a Rust slice.
             unsafe { std::slice::from_raw_parts(au, len) }
         };
         *out_buf = std::ptr::null_mut();
@@ -6106,8 +6124,8 @@ mod abi_version_tests {
     #[test]
     fn abi_version_is_pinned() {
         // Current ABI. A bump must update this pin.
-        assert_eq!(crate::ABI_VERSION, 34);
-        assert_eq!(super::punktfunk_abi_version(), 34);
+        assert_eq!(crate::ABI_VERSION, 36);
+        assert_eq!(super::punktfunk_abi_version(), 36);
     }
 
     #[test]

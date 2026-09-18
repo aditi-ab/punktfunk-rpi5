@@ -143,7 +143,10 @@ Nine destinations in the sidebar (a **More** tab on a phone holds the last five)
 - **Host** — this host's identity (hostname, OS, local IP, version, unique id), the codecs it
   advertises, its ports, the **Updates** card (see [Updating the Host](/docs/updating)), the
   **GPUs** card — Automatic, or prefer one GPU for capture and encode, applied to the next session
-  — and the compositor backends it found.
+  — and the compositor backends it found. **Host → Settings** changes how the host behaves:
+  GameStream, the shared clipboard, video and audio policy. Each change applies to the next stream,
+  or after a restart where the setting says so. A setting pinned in `host.env` shows as locked. See
+  [Configuration](/docs/configuration#settings-in-the-web-console).
 - **Virtual displays** — the policy for the display each session gets, and the Streamed screen
   picker. See [Virtual displays](/docs/virtual-displays).
 - **Library** — the games every client sees: turn a launcher source on or off, add or edit a custom

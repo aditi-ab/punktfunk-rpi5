@@ -48,9 +48,10 @@ mkdir -p "$shim_dir"
 # --retry-all-errors is what makes this cover error 18: a truncated transfer is a *transfer*
 # failure, not an HTTP status, so plain --retry (which only retries transient HTTP codes and
 # connection errors) would let it through. Needs curl >= 7.71; the CI images are well past it.
+# 10 × 10 s rides out a runner DNS drop (error 6), which lasts longer than 5 × 3 s.
 cat > "$shim_dir/curl" <<EOF
 #!/bin/sh
-exec $real_curl --retry 5 --retry-delay 3 --retry-all-errors "\$@"
+exec $real_curl --retry 10 --retry-delay 10 --retry-all-errors "\$@"
 EOF
 chmod +x "$shim_dir/curl"
 

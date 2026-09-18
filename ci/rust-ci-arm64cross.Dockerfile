@@ -51,6 +51,10 @@ WORKDIR /opt/pf-toolchain
 RUN rustup target add aarch64-unknown-linux-gnu && rustup show
 WORKDIR /
 
+# Prebuilt aarch64 Skia next to the base image's x86_64 one, checked by SHA-256 (see the script).
+COPY ci/skia-binaries.sh /tmp/
+RUN sh /tmp/skia-binaries.sh aarch64-unknown-linux-gnu && rm /tmp/skia-binaries.sh
+
 # 4. Cross wiring. Everything in this image is a cross build, so the plain (un-suffixed)
 #    variables are safe and cover the crates that roll their own pkg-config/bindgen calls
 #    instead of going through the target-scoped lookups.

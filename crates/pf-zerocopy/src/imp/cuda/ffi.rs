@@ -23,6 +23,10 @@ pub type CUgraphicsResource = *mut c_void;
 pub type CUarray = *mut c_void;
 pub type CUexternalMemory = *mut c_void; // opaque CUextMemory_st*
 pub type CUexternalSemaphore = *mut c_void; // opaque CUextSemaphore_st*
+pub type CUevent = *mut c_void; // opaque CUevent_st*
+
+/// `CUDA_ERROR_NOT_READY` (cuda.h): the queried work has not finished yet.
+pub const CUDA_ERROR_NOT_READY: CUresult = 600;
 
 /// `CUmemorytype` (cuda.h): HOST=1, DEVICE=2, ARRAY=3, UNIFIED=4.
 pub const CU_MEMORYTYPE_DEVICE: c_uint = 2;
@@ -203,6 +207,10 @@ pub(crate) struct CudaApi {
     cuMemFree_v2: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
     cuMemcpy2DAsync_v2: unsafe extern "C" fn(*const CUDA_MEMCPY2D, CUstream) -> CUresult,
     cuStreamSynchronize: unsafe extern "C" fn(CUstream) -> CUresult,
+    cuEventCreate: unsafe extern "C" fn(*mut CUevent, c_uint) -> CUresult,
+    cuEventRecord: unsafe extern "C" fn(CUevent, CUstream) -> CUresult,
+    cuEventQuery: unsafe extern "C" fn(CUevent) -> CUresult,
+    cuEventDestroy_v2: unsafe extern "C" fn(CUevent) -> CUresult,
     cuCtxGetStreamPriorityRange: unsafe extern "C" fn(*mut c_int, *mut c_int) -> CUresult,
     cuStreamCreateWithPriority: unsafe extern "C" fn(*mut CUstream, c_uint, c_int) -> CUresult,
     cuGraphicsGLRegisterImage:
@@ -281,6 +289,10 @@ pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
                 cuMemFree_v2: *lib.get(b"cuMemFree_v2\0").ok()?,
                 cuMemcpy2DAsync_v2: *lib.get(b"cuMemcpy2DAsync_v2\0").ok()?,
                 cuStreamSynchronize: *lib.get(b"cuStreamSynchronize\0").ok()?,
+                cuEventCreate: *lib.get(b"cuEventCreate\0").ok()?,
+                cuEventRecord: *lib.get(b"cuEventRecord\0").ok()?,
+                cuEventQuery: *lib.get(b"cuEventQuery\0").ok()?,
+                cuEventDestroy_v2: *lib.get(b"cuEventDestroy_v2\0").ok()?,
                 cuCtxGetStreamPriorityRange: *lib.get(b"cuCtxGetStreamPriorityRange\0").ok()?,
                 cuStreamCreateWithPriority: *lib.get(b"cuStreamCreateWithPriority\0").ok()?,
                 cuGraphicsGLRegisterImage: *lib.get(b"cuGraphicsGLRegisterImage\0").ok()?,
@@ -407,6 +419,42 @@ pub(crate) unsafe fn cuStreamSynchronize(stream: CUstream) -> CUresult {
         // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
         // with the site-specific proof at each call site.
         Some(a) => unsafe { (a.cuStreamSynchronize)(stream) },
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+pub(crate) unsafe fn cuEventCreate(event: *mut CUevent, flags: c_uint) -> CUresult {
+    match cuda_api() {
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuEventCreate)(event, flags) },
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+pub(crate) unsafe fn cuEventRecord(event: CUevent, stream: CUstream) -> CUresult {
+    match cuda_api() {
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuEventRecord)(event, stream) },
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+pub(crate) unsafe fn cuEventQuery(event: CUevent) -> CUresult {
+    match cuda_api() {
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuEventQuery)(event) },
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+pub(crate) unsafe fn cuEventDestroy_v2(event: CUevent) -> CUresult {
+    match cuda_api() {
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuEventDestroy_v2)(event) },
         None => CU_ERROR_NOT_LOADED,
     }
 }

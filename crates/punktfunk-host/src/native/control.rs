@@ -6,6 +6,9 @@
 //! shapes, clipboard offers, and access updates. Validated changes go to the
 //! data-plane thread over the session's mpsc bridges.
 //!
+//! Every loss report, RFI and keyframe ask lands here, so the per-minute `link health` line
+//! ([`crate::link_health`]) is counted and emitted here too.
+//!
 //! `select!` drops the inbound read future whenever a sibling fires, so framing
 //! uses [`io::MsgReader`]. Optional channels whose sender can drop mid-session
 //! (`clip_offer_rx`, `shard_change_rx`, `access_rx`) must disable their branch
@@ -83,6 +86,12 @@ pub(super) struct Task {
     /// from the lease when the game dies on the spot.
     pub(super) launch_outcome_rx:
         tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::LaunchOutcome>,
+    /// Named on the per-minute `link health` line, so a journal sorts by client.
+    pub(super) peer: std::net::IpAddr,
+    /// Shared block the encode and send threads bump; this task drains its link half.
+    pub(super) counters: Arc<crate::session_status::SessionCounters>,
+    /// Armed capture the per-minute line is also written into, so a bug report is one file.
+    pub(super) stats: Arc<crate::stats_recorder::StatsRecorder>,
 }
 
 /// Ends when the control stream closes or a data-plane channel drops.
@@ -122,6 +131,9 @@ pub(super) async fn run(task: Task) {
         mut audio_rx,
         mut pad_slots_rx,
         mut launch_outcome_rx,
+        peer,
+        counters,
+        stats,
     } = task;
     let pf_clipboard::ClipCoord {
         available: clip_available,
@@ -157,6 +169,13 @@ pub(super) async fn run(task: Task) {
     // An RFI ask is a frame parity could not repair; the LossReport that
     // closes the window carries only what parity did repair.
     let mut unrecovered = UnrecoveredRun::default();
+    // One `link health` line a minute, ticking whether or not anything arrived: a reader must
+    // be able to tell a clean minute from a host that stopped logging.
+    let mut link = crate::link_health::LinkWindow::new(&counters.link);
+    let mut link_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+    link_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` fires immediately; the first tick would close an empty window at 0 s.
+    link_tick.tick().await;
     // `select!` drops this future whenever a sibling fires. `io::read_msg`
     // would lose a partial frame and misalign the rest of the session.
     let mut ctrl_reader = io::MsgReader::new(ctrl_recv);
@@ -207,6 +226,7 @@ pub(super) async fn run(task: Task) {
                     // Encode loop coalesces: a wedge fires several requests
                     // before the IDR lands.
                     tracing::debug!("client requested keyframe (decode recovery)");
+                    link.note_keyframe_req();
                     if keyframe_tx.send(()).is_err() {
                         break;
                     }
@@ -219,6 +239,7 @@ pub(super) async fn run(task: Task) {
                         "client requested reference-frame invalidation (loss recovery)"
                     );
                     unrecovered.rfi();
+                    link.note_rfi();
                     if rfi_tx.send((req.first_frame, req.last_frame)).is_err() {
                         break;
                     }
@@ -232,6 +253,11 @@ pub(super) async fn run(task: Task) {
                     );
                 } else if let Ok(rep) = LossReport::decode(&msg) {
                     let unrecovered_run = unrecovered.report(std::time::Instant::now());
+                    link.note_loss(rep.loss_ppm, unrecovered_run);
+                    link.sample_bands(
+                        fec_target_ctl.load(Ordering::Relaxed),
+                        live_bitrate.load(Ordering::Relaxed),
+                    );
                     // Data-plane send loop applies `fec_target_ctl` per frame.
                     // No-op when FEC is pinned (`PUNKTFUNK_FEC_PCT`).
                     if adaptive_fec {
@@ -249,6 +275,10 @@ pub(super) async fn run(task: Task) {
                         }
                     }
                 } else if let Ok(req) = SetBitrate::decode(&msg) {
+                    link.note_bitrate_ask(
+                        req.bitrate_kbps,
+                        live_bitrate.load(Ordering::Relaxed),
+                    );
                     // Data plane rebuilds the encoder in place (first frame is
                     // an IDR with in-band SPS). PyroWave is pinned: ack the
                     // session rate so a foreign client cannot AIMD it down.
@@ -503,6 +533,7 @@ pub(super) async fn run(task: Task) {
                 // window, not read our stall as congestion. After the fact:
                 // `gap_ms` is measured.
                 let Some(gap_ms) = gap else { break };
+                link.note_gap();
                 tracing::info!(
                     gap_ms,
                     "pipeline rebuilt in place — telling the client the stream had a gap"
@@ -513,6 +544,9 @@ pub(super) async fn run(task: Task) {
                 {
                     break;
                 }
+            }
+            _ = link_tick.tick() => {
+                emit_link(&mut link, &counters, &fec_target_ctl, &live_bitrate, &stats, peer);
             }
             correction = reconfig_result_rx.recv() => {
                 // Mode actually live after a failed rebuild or a refresh the
@@ -525,6 +559,38 @@ pub(super) async fn run(task: Task) {
                 }
             }
         }
+    }
+    // A session that ends mid-minute still reports what it had.
+    emit_link(
+        &mut link,
+        &counters,
+        &fec_target_ctl,
+        &live_bitrate,
+        &stats,
+        peer,
+    );
+}
+
+/// Close the window, log it, and append it to an armed capture.
+///
+/// The FEC and ABR bands are sampled here as well as per report window, so the line names the
+/// rates a silent minute ran at rather than a zero it never measured.
+fn emit_link(
+    link: &mut crate::link_health::LinkWindow,
+    counters: &crate::session_status::SessionCounters,
+    fec_target_ctl: &AtomicU8,
+    live_bitrate: &AtomicU32,
+    stats: &crate::stats_recorder::StatsRecorder,
+    peer: std::net::IpAddr,
+) {
+    let m = link.close(
+        &counters.link,
+        fec_target_ctl.load(Ordering::Relaxed),
+        live_bitrate.load(Ordering::Relaxed),
+    );
+    crate::link_health::emit(&m, peer);
+    if stats.is_armed() {
+        stats.push_link(m);
     }
 }
 

@@ -269,7 +269,7 @@ struct Nv12Blit {
     y_tex: u32,
     /// Immutable `GL_RG8` chroma, W/2 × H/2.
     uv_tex: u32,
-    /// Retargeted per frame. `GL_LINEAR` so the UV pass averages 2×2.
+    /// Retargeted per frame. `GL_LINEAR` so the UV pass's two taps each average two texels.
     src_tex: u32,
     width: u32,
     height: u32,
@@ -433,6 +433,12 @@ impl Drop for Nv12Blit {
     }
 }
 
+/// `PUNKTFUNK_444_FULLRANGE=1`: the YUV444 convert writes full range. The encoder signals the
+/// same answer in the VUI, so both read it here.
+pub fn yuv444_full_range() -> bool {
+    std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1")
+}
+
 /// Per-size planar YUV444 convert (BT.709; studio or full range via `PUNKTFUNK_444_FULLRANGE`).
 /// Three full-res `GL_R8` passes share `src_tex`. The pool is one stacked allocation
 /// (`BufferPool::new_yuv444`) so the worker↔host wire stays single-plane.
@@ -460,8 +466,7 @@ impl Yuv444Blit {
                 width % 2 == 0 && height % 2 == 0,
                 "YUV444 convert needs even dimensions (got {width}x{height})"
             );
-            let full_range =
-                std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1");
+            let full_range = yuv444_full_range();
             let (y_src, u_src, v_src) = yuv444_frag_sources(full_range);
             // Guard first so it drops last on unwind, after CUDA unregisters.
             let mut guard = GlNameGuard::default();
@@ -771,6 +776,46 @@ impl EglImporter {
         })
     }
 
+    /// The Vulkan bridge, brought up on first use.
+    fn vk_bridge(&mut self) -> Result<&mut super::vulkan::VkBridge> {
+        if self.vk.is_none() {
+            self.vk = Some(super::vulkan::VkBridge::new()?);
+        }
+        Ok(self.vk.as_mut().expect("set above"))
+    }
+
+    /// The fused convert lane (`vulkan/convert.rs`): the host's NVENC slot, imported once.
+    pub fn register_slot(&mut self, id: u32, fd: std::os::fd::OwnedFd, size: u64) -> Result<()> {
+        self.vk_bridge()?.register_slot(id, fd, size)
+    }
+
+    pub fn forget_slots(&mut self) {
+        if let Some(vk) = self.vk.as_mut() {
+            vk.forget_slots();
+        }
+    }
+
+    pub fn set_cursor(&mut self, serial: u64, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+        self.vk_bridge()?.set_cursor(serial, width, height, rgba)
+    }
+
+    /// One fused pass: dmabuf (any modifier) + cursor → the registered slot. Returns the
+    /// timeline value the pass signals.
+    pub fn convert(
+        &mut self,
+        src: &super::proto::ConvertSrc,
+        slot: u32,
+        out: &super::proto::ConvertOut,
+        cursor: Option<super::proto::CursorRect>,
+    ) -> Result<u64> {
+        self.vk_bridge()?.convert(src, slot, out, cursor)
+    }
+
+    /// The convert timeline as an OPAQUE_FD for the host's CUDA import.
+    pub fn convert_timeline_fd(&mut self) -> Result<std::os::fd::OwnedFd> {
+        self.vk_bridge()?.convert_timeline_fd()
+    }
+
     /// Import a LINEAR dmabuf via the Vulkan bridge. NVIDIA EGL cannot sample LINEAR; CUDA
     /// rejects raw dmabuf fds. See [`super::vulkan`].
     pub fn import_linear(
@@ -836,6 +881,7 @@ impl EglImporter {
     pub fn forget_linear_fd(&mut self, fd: i32) {
         if let Some(vk) = self.vk.as_mut() {
             vk.forget_fd(fd);
+            vk.forget_src_image(fd);
         }
     }
 

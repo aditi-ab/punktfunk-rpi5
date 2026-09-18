@@ -18,19 +18,15 @@ use punktfunk_core::quic::ClipOffer;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod host;
 
-/// `PUNKTFUNK_CLIPBOARD` as a `CLIP_POLICY_*` bitfield. Empty / `off` is `None`
+/// The host's clipboard setting as a `CLIP_POLICY_*` bitfield. `Off` is `None`
 /// (default): the host neither advertises the cap nor starts [`host::session`].
 pub fn policy() -> Option<u8> {
+    use pf_host_config::ClipboardPolicy;
     use punktfunk_core::quic::{CLIP_POLICY_FILES, CLIP_POLICY_TEXT};
-    match std::env::var("PUNKTFUNK_CLIPBOARD")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "" | "0" | "off" | "false" => None,
-        "text-only" | "no-files" | "text" => Some(CLIP_POLICY_TEXT),
-        _ => Some(CLIP_POLICY_TEXT | CLIP_POLICY_FILES), // "on" / "1" / anything truthy
+    match pf_host_config::config().clipboard {
+        ClipboardPolicy::Off => None,
+        ClipboardPolicy::Text => Some(CLIP_POLICY_TEXT),
+        ClipboardPolicy::Files => Some(CLIP_POLICY_TEXT | CLIP_POLICY_FILES),
     }
 }
 

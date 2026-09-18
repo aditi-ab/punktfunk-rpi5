@@ -53,7 +53,6 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.library.LibraryClient
-import io.unom.punktfunk.kit.library.mtlsHttpClient
 import io.unom.punktfunk.kit.security.IdentityStore
 import io.unom.punktfunk.kit.security.obtainIdentity
 import io.unom.punktfunk.models.LaunchHold
@@ -64,8 +63,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * How long the hold waits on a title the host still calls `launching` (a cold Steam boot with
- * shader work runs to minutes), and on one the host never lists (the launch did not resolve).
+ * How long the hold waits on a title the host still calls `launching`, or `running` without its
+ * window (a cold Steam boot with shader work runs to minutes), and on one the host never lists
+ * (the launch did not resolve).
  */
 private const val LAUNCH_HOLD_MAX_S = 120.0
 private const val LAUNCH_NO_LEASE_S = 15.0
@@ -86,6 +86,14 @@ internal fun launchGaveUp(title: String, state: String?, elapsed: Double): Strin
     state == "exited" -> "$title closed right after starting."
     else -> null
 }
+
+/**
+ * Keep holding: the host lists nothing yet, still calls it `launching`, or has it `running` with a
+ * window still to come. Past [LAUNCH_HOLD_MAX_S] a running game is shown as it is.
+ */
+internal fun launchStillHeld(state: String?, awaitingWindow: Boolean, elapsed: Double): Boolean =
+    state == null || state == "launching" ||
+        (state == "running" && awaitingWindow && elapsed < LAUNCH_HOLD_MAX_S)
 
 /** The cover's flight: `response ≈ 0.75 s`, loose enough that the turn reads on the way. */
 private const val FLIGHT_STIFFNESS = 70f
@@ -128,6 +136,7 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
     // Non-null replaces the spinner with the message and its actions; the hold stops polling then.
     var gaveUp by remember(hold) { mutableStateOf<String?>(null) }
     var ending by remember(hold) { mutableStateOf<String?>(null) }
+    var windowWait by remember(hold) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(hold) {
@@ -137,16 +146,16 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
         )
     }
     LaunchedEffect(hold) {
-        val id = withContext(Dispatchers.IO) {
-            runCatching { obtainIdentity(IdentityStore(context)) }.getOrNull()
-        }
-        if (id == null) {
+        val (id, art) = withContext(Dispatchers.IO) {
+            runCatching {
+                val me = obtainIdentity(IdentityStore(context))
+                me to posterLoader(context, me, hold.address, hold.fpHex)
+            }.getOrNull()
+        } ?: run {
             onShow()
             return@LaunchedEffect
         }
-        loader = ImageLoader.Builder(context)
-            .okHttpClient(mtlsHttpClient(id.certPem, id.privateKeyPem, hold.address, hold.fpHex))
-            .build()
+        loader = art
         val began = SystemClock.elapsedRealtime()
         while (isActive) {
             val games = withContext(Dispatchers.IO) {
@@ -154,19 +163,20 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
                     hold.address, hold.mgmtPort, id.certPem, id.privateKeyPem, hold.fpHex,
                 )
             }
-            val state = games.firstOrNull { it.appId == hold.game.id }?.state
+            val game = games.firstOrNull { it.appId == hold.game.id }
+            val state = game?.state
             val elapsed = (SystemClock.elapsedRealtime() - began) / 1000.0
             val said = launchGaveUp(hold.game.title, state, elapsed)
             if (said != null) {
                 gaveUp = said
                 return@LaunchedEffect
             }
-            // Anything else the host names is a launch that worked; only `launching` and a host
-            // that lists nothing yet are still worth waiting on.
-            if (state != null && state != "launching") {
+            // Anything else the host names is a launch that worked.
+            if (!launchStillHeld(state, game?.awaitingWindow == true, elapsed)) {
                 onShow()
                 return@LaunchedEffect
             }
+            windowWait = state == "running"
             delay(1_000)
         }
     }
@@ -328,7 +338,7 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
                         strokeWidth = 2.dp,
                     )
                     Text(
-                        "Connecting\u2026",
+                        if (windowWait) "Waiting for the game's window\u2026" else "Connecting\u2026",
                         color = Color.White.copy(alpha = 0.5f),
                         fontSize = 13.sp,
                         modifier = Modifier.padding(start = 9.dp),

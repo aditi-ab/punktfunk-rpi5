@@ -105,7 +105,7 @@ pub enum GameState {
     /// Distinct from [`Running`](Self::Running) — that would claim liveness
     /// the host cannot back up, and `session_on_game_exit` can never fire.
     Untracked = 3,
-    /// The game's own window is on the streamed head. Follows
+    /// The game's own window is on screen. Follows
     /// [`Running`](Self::Running), often far later: the process is up while
     /// Proton builds a prefix or a splash sits on a black window.
     Window = 4,
@@ -138,6 +138,8 @@ impl GameState {
 pub struct LeaseShared {
     pub game: GameRef,
     pub client: String,
+    /// Stable id of the device that launched it, for the game events' hook filter.
+    pub fingerprint: Option<String>,
     pub plane: crate::events::Plane,
     kind: LeaseKind,
     state: AtomicU8,
@@ -145,6 +147,8 @@ pub struct LeaseShared {
     cancel: Arc<AtomicBool>,
     /// Recognition. Empty for [`LeaseKind::Nested`] / [`LeaseKind::Untracked`].
     spec: DetectSpec,
+    /// Process tree recognition may look in ([`LeaseRequest::scope_pid`]).
+    scope_pid: Option<u32>,
     /// Seconds-since-boot at launch: adopt floor. `None` = no uptime clock,
     /// so only detect signals are used.
     launch_stamp: Option<f64>,
@@ -168,6 +172,9 @@ pub struct LeaseShared {
     last_seen_ms: AtomicU64,
     /// Client to tell when this launch dies on the spot ([`LeaseRequest::outcome`]).
     outcome: Option<OutcomeTx>,
+    /// The window stage is watching a compositor that lists windows, and has
+    /// not found the game's yet. A launch hold waits on it past `running`.
+    awaiting_window: AtomicBool,
 }
 
 impl LeaseShared {
@@ -185,6 +192,37 @@ impl LeaseShared {
 
     pub fn is_trackable(&self) -> bool {
         !matches!(self.kind, LeaseKind::Untracked)
+    }
+
+    /// Everything this lease's signals match, inside its scope if it has one.
+    #[cfg(any(target_os = "linux", windows))]
+    fn find_procs(&self, scanner: &crate::procscan::Scanner) -> Vec<crate::procscan::ProcRef> {
+        let live = scanner.find(&self.spec, self.launch_stamp);
+        match self.scope_pid {
+            Some(root) => crate::procscan::under(&live, root),
+            None => live,
+        }
+    }
+
+    /// Stop every client holding this title's cover: report `running` now, and wait for no
+    /// window.
+    ///
+    /// For a launch whose stream already shows what the player has to act on — a seat's Steam
+    /// at its sign-in screen. Only out of `launching`: the watcher owns every state after it,
+    /// so a game the player then starts is followed as any other.
+    pub fn launch_hold_ends(&self) {
+        let _ = self.state.compare_exchange(
+            GameState::Launching as u8,
+            GameState::Running as u8,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.awaiting_window.store(false, Ordering::Relaxed);
+    }
+
+    /// Running, and this host will say `window` once the game's window is up.
+    pub fn awaits_window(&self) -> bool {
+        self.awaiting_window.load(Ordering::Relaxed) && self.state() == GameState::Running
     }
 
     fn set_state(&self, s: GameState) {
@@ -242,14 +280,32 @@ impl Drop for GameLease {
     }
 }
 
+/// The process tree a lease may narrow its scan to ([`LeaseRequest::scope_pid`]).
+///
+/// Only where the game is guaranteed to descend from `gamescope`: the launch is that
+/// compositor's own primary child, or it goes through the Steam running inside it. Anything else
+/// a keep-alive reuse starts is spawned by the host, beside gamescope rather than under it, and a
+/// scoped scan would never find it.
+pub fn scan_scope(nested_spawn: bool, steam_launch: bool, gamescope: Option<u32>) -> Option<u32> {
+    (nested_spawn || steam_launch)
+        .then_some(gamescope)
+        .flatten()
+}
+
 /// Inputs for [`open`]. Only the launch site has all of them.
 pub struct LeaseRequest {
     pub game: GameRef,
     pub client: String,
+    /// Stable id of the device that launched it. `None` for an anonymous client.
+    pub fingerprint: Option<String>,
     pub plane: crate::events::Plane,
     pub spec: DetectSpec,
     /// `true` when a bare-spawn gamescope owns the game.
     pub nested: bool,
+    /// That gamescope's pid, so recognition stays inside this seat's process tree
+    /// ([`crate::procscan::under`]). `None` scans the whole uid, as every other lease does.
+    /// [`scan_scope`] owns when it may be set.
+    pub scope_pid: Option<u32>,
     /// Opens a launcher, not a game: always [`LeaseKind::Untracked`].
     ///
     /// A launcher has no exit to detect (Big Picture is a mode of Steam, not
@@ -275,11 +331,9 @@ pub struct LeaseRequest {
     /// ([`crate::library::adopt_launch_workspace`]). Released with the lease.
     #[cfg(target_os = "linux")]
     pub workspace: Option<crate::vdisplay::WorkspaceClaim>,
-    /// Head to watch for this game's window, and what to do with it.
-    /// `None` on a backend that reports no toplevels — the lease then runs
-    /// exactly as it did before the window stage existed.
-    #[cfg(target_os = "linux")]
-    pub window_stage: Option<WindowStage>,
+    /// Where to look for this game's window. `None` where there is no source: the
+    /// lease never reports `window`, and a launch hold ends at `running`.
+    pub window: Option<WindowSource>,
     /// Where to say this launch died on the spot. `None` leaves the finding in
     /// the log, as it was before the client could be told.
     pub outcome: Option<OutcomeTx>,
@@ -292,6 +346,24 @@ pub struct LeaseRequest {
 pub struct WindowStage {
     pub head: crate::session_status::StreamedHead,
     pub on_window: crate::library::OnWindow,
+}
+
+/// Where the watcher looks for the game's window.
+pub enum WindowSource {
+    /// The compositor's own window list: Hyprland and sway over IPC, KWin over
+    /// `org_kde_plasma_window_management`, GNOME through punktfunk's shell extension. `stage`
+    /// places the first window, where a head is known and the compositor allows it.
+    #[cfg(target_os = "linux")]
+    Toplevels {
+        compositor: crate::vdisplay::Compositor,
+        stage: Option<WindowStage>,
+    },
+    /// This seat's gamescope presenting Steam `appid`, per its focused-app control atom.
+    #[cfg(target_os = "linux")]
+    Gamescope { seat: Option<String>, appid: u32 },
+    /// The interactive desktop's top-level windows.
+    #[cfg(windows)]
+    Desktop,
 }
 
 /// Seconds since boot for adopt-against. Call **before** spawn
@@ -338,9 +410,11 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
     let LeaseRequest {
         game,
         client,
+        fingerprint,
         plane,
         spec,
         nested,
+        scope_pid,
         launcher,
         child,
         spawned,
@@ -348,8 +422,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         procs,
         #[cfg(target_os = "linux")]
         workspace,
-        #[cfg(target_os = "linux")]
-        window_stage,
+        window,
         outcome,
     } = req;
 
@@ -384,11 +457,13 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
     let shared = Arc::new(LeaseShared {
         game,
         client,
+        fingerprint,
         plane,
         kind: kind.clone(),
         state: AtomicU8::new(GameState::Launching as u8),
         cancel: Arc::new(AtomicBool::new(false)),
         spec,
+        scope_pid,
         launch_stamp,
         child: Mutex::new(owned),
         spawned,
@@ -398,6 +473,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         was_running: AtomicBool::new(false),
         last_seen_ms: AtomicU64::new(0),
         outcome,
+        awaiting_window: AtomicBool::new(false),
     });
 
     if launcher {
@@ -423,15 +499,13 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         );
     }
 
-    let watcher = spawn_watcher(
-        shared.clone(),
-        child,
-        procs,
-        on_exit,
-        #[cfg(target_os = "linux")]
-        window_stage,
-    );
+    // Set before the watcher runs, so a window it finds on its first tick stays found.
+    shared
+        .awaiting_window
+        .store(window.is_some(), Ordering::Relaxed);
+    let watcher = spawn_watcher(shared.clone(), child, procs, on_exit, window);
     if watcher.is_none() {
+        shared.awaiting_window.store(false, Ordering::Relaxed);
         // No watcher: Nested still reports Running (gamescope node-death
         // watches it). Everything else, including spawn failure and no
         // matcher, is Untracked — keyed on Nested so those land honest too.
@@ -456,7 +530,7 @@ fn spawn_watcher(
     child: Option<std::process::Child>,
     procs: Option<crate::launchreg::LiveProcs>,
     on_exit: OnExit,
-    #[cfg(target_os = "linux")] window_stage: Option<WindowStage>,
+    window: Option<WindowSource>,
 ) -> Option<std::thread::JoinHandle<()>> {
     // Untracked: nothing to observe. Nested with a spec: watch the game;
     // node-death misses a Steam launch that nests the resident client.
@@ -470,90 +544,150 @@ fn spawn_watcher(
     // No matcher (macOS has no launch path): status lease, no poll.
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        let _ = (child, procs, on_exit);
+        let _ = (child, procs, on_exit, window);
         None
     }
     #[cfg(any(target_os = "linux", windows))]
     {
         std::thread::Builder::new()
             .name("pf1-gamelease".into())
-            .spawn(move || {
-                watch(
-                    shared,
-                    child,
-                    procs,
-                    on_exit,
-                    #[cfg(target_os = "linux")]
-                    window_stage,
-                )
-            })
+            .spawn(move || watch(shared, child, procs, on_exit, window))
             .ok()
     }
 }
 
 /// Looks for the game's own window each poll, until it finds one.
 ///
-/// Shares phase 2's tick rather than a thread of its own. The compositor's
-/// change token keeps an idle desk from spawning `hyprctl` every second; a
-/// backend with no token is read each time.
-#[cfg(target_os = "linux")]
+/// Shares phase 2's tick rather than a thread of its own. A compositor with a change token keeps
+/// an idle desk from being re-read every second; every other source is read each time.
+#[cfg(any(target_os = "linux", windows))]
 struct WindowWatch {
-    stage: WindowStage,
-    /// Last token seen. `None` re-reads: either nothing has been read yet, or
-    /// this backend cannot say when its windows moved.
+    source: WindowSource,
+    /// Last toplevels token seen. `None` re-reads.
     token: Option<u64>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl WindowWatch {
-    fn new(stage: WindowStage) -> Self {
-        WindowWatch { stage, token: None }
+    fn new(source: WindowSource) -> Self {
+        WindowWatch {
+            source,
+            token: None,
+        }
     }
 
-    /// One tick. `true` once the window is found and the stage is spent —
-    /// placement is applied exactly once, on the first window.
+    /// One tick. `true` once the stage is spent: the window was found (placed once), or this
+    /// source cannot list windows.
     fn poll(&mut self, shared: &Arc<LeaseShared>, live: &[crate::procscan::ProcRef]) -> bool {
-        let now = crate::vdisplay::toplevels_token(self.stage.head.compositor);
-        // A token that has not moved means no window opened, closed or was
-        // retitled since the last read, so the answer cannot have changed.
-        if now.is_some() && now == self.token {
-            return false;
-        }
-        self.token = now;
-        let all = crate::vdisplay::list_all_toplevels(self.stage.head.compositor);
-        let Some(win) = all.iter().find(|w| is_game_window(w, live, &shared.spec)) else {
+        let roots = window_roots(
+            &shared.spec,
+            live,
+            shared.owned_child().map(|c| c.pid),
+            shared.spawned.map(|s| s.pid),
+        );
+        let found: Option<(String, String)> = match &self.source {
+            #[cfg(target_os = "linux")]
+            WindowSource::Toplevels { compositor, stage } => {
+                let now = crate::vdisplay::toplevels_token(*compositor);
+                // A token that has not moved means no window opened, closed or was
+                // retitled since the last read, so the answer cannot have changed.
+                if now.is_some() && now == self.token {
+                    return false;
+                }
+                self.token = now;
+                let pids = crate::procscan::with_descendants(&roots);
+                let Some(all) = crate::vdisplay::list_all_toplevels(*compositor) else {
+                    // KWin without the grant, GNOME before the extension loads: waiting would hold
+                    // the cover up to the client's cap on a game that is already playing.
+                    shared.awaiting_window.store(false, Ordering::Relaxed);
+                    tracing::debug!(
+                        title = %shared.game.title,
+                        compositor = compositor.id(),
+                        "this compositor lists no windows yet — the launch hold ends at running"
+                    );
+                    return true;
+                };
+                let Some(win) = all.iter().find(|w| is_game_window(w, &pids, &shared.spec)) else {
+                    return false;
+                };
+                on_screen(shared, &win.title, &win.app_id);
+                if let Some(stage) = stage {
+                    apply_on_window(stage, win);
+                }
+                return true;
+            }
+            #[cfg(target_os = "linux")]
+            WindowSource::Gamescope { seat, appid } => {
+                // Steam's own launch screen is its client's appid, so the game's shows only
+                // once it is up.
+                crate::vdisplay::gamescope_presenting(*appid, seat.as_deref())
+                    .then(|| (shared.game.title.clone(), format!("steam_app_{appid}")))
+            }
+            #[cfg(windows)]
+            WindowSource::Desktop => {
+                let pids = crate::procscan::with_descendants(&roots);
+                crate::game_term::visible_window(&pids).map(|title| (title, String::new()))
+            }
+        };
+        let Some((title, class)) = found else {
             return false;
         };
-        shared.set_state(GameState::Window);
-        crate::events::emit(crate::events::EventKind::GameWindow {
-            game: game_event_ref(shared),
-            title: win.title.clone(),
-            app_id: win.app_id.clone(),
-        });
-        tracing::info!(
-            title = %shared.game.title,
-            window = %win.title,
-            app_id = %win.app_id,
-            output = %win.output,
-            "the launched game is on screen"
-        );
-        apply_on_window(&self.stage, win);
+        on_screen(shared, &title, &class);
         true
     }
+}
+
+/// Processes whose subtree may own the game's window.
+///
+/// The ones the lease matched, always: the entry's own rule says those are the game. What the
+/// host spawned counts only when the entry names nothing to match — a launcher command
+/// (`steam steam://rungameid/…`) starts the launcher when it is not already up, and every
+/// window the launcher draws would otherwise end the hold before the game drew anything.
+#[cfg(any(target_os = "linux", windows))]
+fn window_roots(
+    spec: &crate::library::DetectSpec,
+    live: &[crate::procscan::ProcRef],
+    owned: Option<u32>,
+    spawned: Option<u32>,
+) -> Vec<u32> {
+    let mut roots: Vec<u32> = live.iter().map(|r| r.pid).collect();
+    if spec.is_empty() {
+        roots.extend(owned);
+        roots.extend(spawned);
+    }
+    roots
+}
+
+/// The game's window is up: say so on `/status`, the event bus and the log.
+#[cfg(any(target_os = "linux", windows))]
+fn on_screen(shared: &LeaseShared, title: &str, class: &str) {
+    shared.set_state(GameState::Window);
+    shared.awaiting_window.store(false, Ordering::Relaxed);
+    crate::events::emit(crate::events::EventKind::GameWindow {
+        game: game_event_ref(shared),
+        title: title.to_string(),
+        app_id: class.to_string(),
+    });
+    tracing::info!(
+        title = %shared.game.title,
+        window = %title,
+        app_id = %class,
+        "the launched game is on screen"
+    );
 }
 
 /// Is this toplevel the game's, rather than the launcher that opened it?
 ///
 /// Pid first — that is the distinction the lease already makes, and Steam or
-/// Faugus opening before the game is not in `live`. Class is the fallback for
+/// Faugus opening before the game is not in `pids`. Class is the fallback for
 /// a game whose window belongs to a pid the scan never adopted.
 #[cfg(target_os = "linux")]
 fn is_game_window(
     win: &crate::vdisplay::Toplevel,
-    live: &[crate::procscan::ProcRef],
+    pids: &[u32],
     spec: &crate::library::DetectSpec,
 ) -> bool {
-    if win.pid.is_some_and(|p| live.iter().any(|r| r.pid == p)) {
+    if win.pid.is_some_and(|p| pids.contains(&p)) {
         return true;
     }
     // Steam names an Xwayland game's class for its appid; a Wayland-native one
@@ -571,7 +705,8 @@ fn is_game_window(
     })
 }
 
-/// Place the game's first window per the entry's `on_window`.
+/// Place the game's first window per the entry's `on_window`, on a compositor
+/// the host can place windows on.
 ///
 /// Best-effort and once: every step is a log line on refusal, and none of them
 /// is worth failing a launch that is already on screen.
@@ -579,6 +714,9 @@ fn is_game_window(
 fn apply_on_window(stage: &WindowStage, win: &crate::vdisplay::Toplevel) {
     let head = &stage.head;
     let on = &stage.on_window;
+    if !crate::vdisplay::places_windows(head.compositor) {
+        return;
+    }
     if on.wants_stream_output() && win.output != head.output {
         match crate::vdisplay::move_toplevel_to_output(head.compositor, &win.id, &head.output) {
             Ok(()) => tracing::info!(
@@ -646,7 +784,7 @@ fn watch(
     mut child: Option<std::process::Child>,
     procs: Option<crate::launchreg::LiveProcs>,
     on_exit: OnExit,
-    #[cfg(target_os = "linux")] window_stage: Option<WindowStage>,
+    window: Option<WindowSource>,
 ) {
     let scanner = crate::procscan::Scanner::system();
     let cancelled = || shared.cancel.load(Ordering::Relaxed);
@@ -804,7 +942,7 @@ fn watch(
         let child_alive = matches!(kind, LeaseKind::Child)
             && (child.is_some() || spawned.is_some())
             && spawned_at.elapsed() >= SHIM_WINDOW;
-        let live = scanner.find(&shared.spec, shared.launch_stamp);
+        let live = shared.find_procs(&scanner);
         // Same window for a scan hit: a pre-launch tree (Steam shader
         // reaper) carries the game's signals. One poll would latch into
         // phase 2 (`EXIT_CONFIRM` then ends the session). A window, not a
@@ -852,8 +990,7 @@ fn watch(
     // Phase 2: wait for the window, then for it to stay gone across
     // [`EXIT_CONFIRM`]. The window watch shares this poll: a game that never
     // shows one must still be exit-watched.
-    #[cfg(target_os = "linux")]
-    let mut stage = window_stage.map(WindowWatch::new);
+    let mut stage = window.map(WindowWatch::new);
     let mut run = credit.map(|id| RunClock::since(id, Instant::now()));
     let mut gone_since: Option<Instant> = None;
     let mut vetoed = false;
@@ -892,12 +1029,11 @@ fn watch(
         let live = {
             let still = scanner.alive(&known);
             if still.is_empty() {
-                scanner.find(&shared.spec, shared.launch_stamp)
+                shared.find_procs(&scanner)
             } else {
                 still
             }
         };
-        #[cfg(target_os = "linux")]
         if let Some(w) = stage.as_mut() {
             if w.poll(&shared, &live) {
                 stage = None;
@@ -1044,6 +1180,7 @@ pub fn game_event_ref(shared: &LeaseShared) -> crate::events::GameRefPayload {
         title: shared.game.title.clone(),
         store: shared.game.store.clone(),
         client: shared.client.clone(),
+        fingerprint: shared.fingerprint.clone(),
         plane: shared.plane,
     }
 }
@@ -1100,6 +1237,13 @@ fn terminate_blocking(shared: &LeaseShared) {
                 title = %shared.game.title,
                 "released the nested session's kept display to end its game"
             );
+            // That release takes every kept display, a pre-warmed seat included, and nothing
+            // else stands one back up before the next session ends — which is the player who
+            // left a game running, the one the warm launch is for.
+            #[cfg(target_os = "linux")]
+            if released > 0 {
+                crate::native::prewarm::spawn_run("game ended");
+            }
         }
         LeaseKind::Child | LeaseKind::Matched | LeaseKind::Reported => {
             // A claim that lands while the ladder runs starts the title afresh; the
@@ -1225,7 +1369,7 @@ fn unix_term_ladder(shared: &LeaseShared) {
     // once: a process that starts after this point belongs to a session that
     // claimed the title while the ladder ran, and must outlive it.
     let targets = {
-        let mut procs = scanner.find(&shared.spec, shared.launch_stamp);
+        let mut procs = shared.find_procs(&scanner);
         if let Some(p) = reported_proc(shared) {
             if !procs.iter().any(|q| q.pid == p.pid) {
                 procs.push(p);
@@ -1286,7 +1430,7 @@ fn unix_term_ladder(shared: &LeaseShared) {
 fn windows_term_ladder(shared: &LeaseShared) {
     let scanner = crate::procscan::Scanner::system();
     let live = || {
-        let mut procs = scanner.alive(&scanner.find(&shared.spec, shared.launch_stamp));
+        let mut procs = scanner.alive(&shared.find_procs(&scanner));
         // Re-verify and de-dupe. `spawned` and `reported_proc` join on the
         // same terms; Reported has only the latter.
         let mut fold = |p: crate::procscan::ProcRef| {
@@ -1685,9 +1829,11 @@ mod tests {
                 title: format!("Test Title {id}"),
             },
             client: "Deck".into(),
+            fingerprint: None,
             plane: crate::events::Plane::Native,
             spec,
             nested,
+            scope_pid: None,
             launcher: false,
             child: None,
             spawned: None,
@@ -1697,10 +1843,47 @@ mod tests {
             procs: None,
             #[cfg(target_os = "linux")]
             workspace: None,
-            #[cfg(target_os = "linux")]
-            window_stage: None,
+            window: None,
             outcome: None,
         }
+    }
+
+    /// Scoping is safe only where the game must descend from that gamescope.
+    #[test]
+    fn only_a_nested_spawn_or_a_steam_launch_narrows_the_scan() {
+        // gamescope's own primary child, and anything Steam starts inside it.
+        assert_eq!(scan_scope(true, false, Some(42)), Some(42));
+        assert_eq!(scan_scope(false, true, Some(42)), Some(42));
+        // A kept session's Lutris/Heroic/custom launch is the host's child, beside gamescope.
+        assert_eq!(scan_scope(false, false, Some(42)), None);
+        // No compositor of ours: every other backend keeps the scan it has today.
+        assert_eq!(scan_scope(true, true, None), None);
+    }
+
+    /// The state a client's launch hold ends on, and the one it never overwrites.
+    ///
+    /// `running` with no window owed is what every client reads as "the host has said all it
+    /// will" — a seat at Steam's sign-in screen needs that within seconds, not after two
+    /// minutes of cover.
+    #[test]
+    fn a_launch_with_nothing_to_wait_for_reports_running_at_once() {
+        // Recognized by a name no process has: the scan leaves this lease `launching`.
+        let spec = DetectSpec {
+            process_name: Some("pf-no-such-game".into()),
+            ..DetectSpec::default()
+        };
+        let lease = open(req("steam:signin", spec, false), Box::new(|| {}));
+        let shared = lease.shared();
+        assert_eq!(shared.state(), GameState::Launching);
+        shared.awaiting_window.store(true, Ordering::Relaxed);
+        shared.launch_hold_ends();
+        assert_eq!(shared.state(), GameState::Running);
+        assert!(!shared.awaits_window(), "no client waits for a window here");
+
+        // The watcher owns every state after `launching`: a window already found stays found.
+        shared.set_state(GameState::Window);
+        shared.launch_hold_ends();
+        assert_eq!(shared.state(), GameState::Window);
     }
 
     /// A launcher entry is Untracked regardless of how it was started.
@@ -2063,10 +2246,12 @@ mod tests {
                     title: "Handoff".into(),
                 },
                 client: "test".into(),
+                fingerprint: None,
                 plane: crate::events::Plane::Native,
                 // Real signal nothing will match: the game never shows up.
                 spec: DetectSpec::steam(999_001),
                 nested: false,
+                scope_pid: None,
                 launcher: false,
                 child: Some((child, false)),
                 spawned: None,
@@ -2074,8 +2259,7 @@ mod tests {
                 procs: None,
                 #[cfg(target_os = "linux")]
                 workspace: None,
-                #[cfg(target_os = "linux")]
-                window_stage: None,
+                window: None,
                 outcome: None,
             },
             Box::new(|| {
@@ -2309,9 +2493,11 @@ mod tests {
                     title: "Live Child".into(),
                 },
                 client: "test".into(),
+                fingerprint: None,
                 plane: crate::events::Plane::Native,
                 spec: DetectSpec::dir(td.path()),
                 nested: false,
+                scope_pid: None,
                 launcher: false,
                 child: Some((child, true)),
                 spawned: None,
@@ -2319,8 +2505,7 @@ mod tests {
                 procs: None,
                 #[cfg(target_os = "linux")]
                 workspace: None,
-                #[cfg(target_os = "linux")]
-                window_stage: None,
+                window: None,
                 outcome: None,
             },
             Box::new(|| {
@@ -2404,10 +2589,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn a_launchers_window_is_never_mistaken_for_the_games() {
-        let live = [crate::procscan::ProcRef {
-            pid: 4242,
-            start: 1,
-        }];
+        let live = [4242];
         let spec = crate::library::DetectSpec::steam(570);
         // The game: its pid was adopted by the scan.
         assert!(is_game_window(
@@ -2503,5 +2685,26 @@ mod tests {
         // SAFETY: probing our own dead child with WNOHANG; ECHILD (reaped) is the pass.
         let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
         assert_eq!(r, -1, "the child must have been reaped");
+    }
+
+    /// A Steam title is launched with `steam steam://rungameid/…`, and with Steam not already
+    /// up that process becomes the Steam client. Sweeping its subtree made every Steam window
+    /// the game's, so the hold ended on the library window rather than on the game.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn the_launcher_the_host_started_is_not_the_game_when_the_entry_names_one() {
+        let live = [crate::procscan::ProcRef {
+            pid: 4242,
+            start: 0,
+        }];
+        let named = window_roots(&DetectSpec::steam(570), &live, Some(88), Some(99));
+        assert_eq!(
+            named,
+            vec![4242],
+            "the entry says which process is the game; the launcher's is not it"
+        );
+        // Nothing to match on: the command the host ran is the only handle there is.
+        let bare = window_roots(&DetectSpec::default(), &live, Some(88), Some(99));
+        assert_eq!(bare, vec![4242, 88, 99]);
     }
 }

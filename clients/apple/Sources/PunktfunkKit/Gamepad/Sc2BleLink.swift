@@ -17,7 +17,8 @@
 // `maximumWriteValueLength` census line is a sanity log only. The link itself sends
 // DISABLE_LIZARD on ready and re-sends it every ~3 s (Android's cadence — SDL's): the host's
 // virtual pad only relays what Steam sends AFTER it claims the pad, so until then nothing else
-// would feed the firmware watchdog and the controller would fall back to lizard mode. The client
+// would feed the firmware watchdog and the controller would fall back to lizard mode. `stop()`
+// writes lizard back ON before it disconnects, so the pad drives the OS again at once. The client
 // NEVER self-enables the gyro — Steam's own forwarded write drives `Sc2ImuGate`.
 
 import CoreBluetooth
@@ -30,6 +31,9 @@ final class Sc2BleLink: NSObject {
     /// milestones (acquire/connect/census/ready/disconnect) always log; flip this only to debug
     /// the BLE seam.
     private static let verbose = false
+
+    /// How long `stop()` holds the connection open for the lizard restore to land.
+    private static let restoreWait: DispatchTimeInterval = .milliseconds(150)
 
     private let serviceCB = CBUUID(string: Sc2Device.serviceUUID)
     private let inputCB = CBUUID(string: Sc2Device.inputCharUUID)
@@ -65,6 +69,8 @@ final class Sc2BleLink: NSObject {
     private var polling = false
     private var ready = false
     private var lizardTimer: DispatchSourceTimer?
+    /// `stop()` wrote the lizard restore and is waiting for it to land — see `finishStop`.
+    private var pendingStop = false
     private var lizardSends = 0
     private var sweepCounter = 0
     private var inCounter = 0
@@ -87,6 +93,9 @@ final class Sc2BleLink: NSObject {
     /// the central reports poweredOn.
     func start() {
         queue.async { [self] in
+            // A restart never waits out the lizard restore below — finish that teardown first,
+            // or this returns early on the central it was about to drop.
+            if pendingStop { finishStop() }
             guard central == nil else { return }
             scanning = false
             polling = false
@@ -96,11 +105,47 @@ final class Sc2BleLink: NSObject {
         }
     }
 
-    /// Stop notifications, disconnect, and tear the central down. Idempotent; safe from any
-    /// thread. Does not fire `onClosed` — the caller is the one tearing down.
+    /// Hand lizard mode back, then disconnect and tear the central down. Idempotent; safe from
+    /// any thread. Does not fire `onClosed` — the caller is the one tearing down.
+    ///
+    /// Order is the point. The keep-alive dies first, so no disable can land after the restore;
+    /// the restore goes out before the cancel, which drops whatever is still queued.
     func stop() {
         queue.async { [self] in
             stopLizardTimer()
+            // A second stop rides the first one's window rather than cutting it short: the
+            // teardown below is already scheduled, and the restore still needs its ack.
+            if pendingStop { return }
+            guard let controller, let reportChar,
+                  let payload = Sc2Device.featurePayload(frame: Sc2Device.enableLizard)
+            else {
+                finishStop()
+                return
+            }
+            pendingStop = true
+            let type: CBCharacteristicWriteType =
+                reportChar.properties.contains(.write) ? .withResponse : .withoutResponse
+            controller.writeValue(Data(payload), for: reportChar, type: type)
+            // 150 ms ≈ several BLE connection intervals. A pad that went out of range mid-write
+            // never acks, so the wait has to end on its own. `pendingStop` is what a `start()`
+            // in the meantime clears — this must not tear down the central it built.
+            // Strong: the owner drops its reference right after stop(), and a freed central
+            // cancels the connection before the restore lands.
+            queue.asyncAfter(deadline: .now() + Self.restoreWait) { [self] in
+                guard pendingStop else { return }
+                finishStop()
+            }
+        }
+    }
+
+    /// The teardown itself, once the restore has had its window. Idempotent.
+    private func finishStop() {
+        pendingStop = false
+        // CoreBluetooth takes these three only while the radio is on. A teardown lands before
+        // that whenever the session ends with the permission alert still up, and the frameworks
+        // then log "API MISUSE ... powered on state". Dropping the state clears everything below
+        // anyway, and a central that never powered on holds no connection to cancel.
+        if central?.state == .poweredOn {
             if let inputChar, let controller {
                 controller.setNotifyValue(false, for: inputChar)
             }
@@ -108,16 +153,16 @@ final class Sc2BleLink: NSObject {
                 central?.cancelPeripheralConnection(controller)
             }
             central?.stopScan()
-            controller = nil
-            inputChar = nil
-            reportChar = nil
-            allChars.removeAll()
-            candidateChars.removeAll()
-            scanning = false
-            polling = false
-            ready = false
-            central = nil
         }
+        controller = nil
+        inputChar = nil
+        reportChar = nil
+        allChars.removeAll()
+        candidateChars.removeAll()
+        scanning = false
+        polling = false
+        ready = false
+        central = nil
     }
 
     /// Replay one raw host report on the physical controller. `kind` is the C ABI's

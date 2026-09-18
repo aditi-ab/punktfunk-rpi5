@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped on any wire change. Echoed in [`Reply::Ready`]; the host refuses a mismatch.
 /// Same binary (`/proc/self/exe`) — trips only a stale re-exec.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 3;
 
 /// Mirrors the `EglImporter` entry points. Append-only: a worker can outlive a replaced host,
 /// so an unknown variant must fail decode, not remap.
@@ -52,6 +52,62 @@ pub enum Request {
     Release { id: u32 },
     /// Format renegotiation: drop cached per-`key` fds and Vulkan imports. Fire-and-forget.
     ClearCache,
+    /// The host's NVENC input slot `id`, an OPAQUE_FD export of `size` bytes (the fd rides along).
+    RegisterSlot { id: u32, size: u64 },
+    /// The host rebuilt its ring: drop every slot import. No reply.
+    ForgetSlots,
+    /// A straight-alpha RGBA8 cursor bitmap of `len` bytes in the memfd that rides along.
+    SetCursor {
+        serial: u64,
+        width: u32,
+        height: u32,
+        len: u32,
+    },
+    /// One fused pass of the dmabuf `key` into slot `slot` (fd rides along when `has_fd`).
+    Convert {
+        key: u64,
+        has_fd: bool,
+        src: ConvertSrc,
+        slot: u32,
+        out: ConvertOut,
+        cursor: Option<CursorRect>,
+    },
+    /// The convert timeline as OPAQUE_FD; it rides back on [`Reply::Timeline`].
+    ConvertTimeline,
+}
+
+/// A dmabuf as the fused convert reads it. `fd` is process-local and never on the wire: the
+/// worker fills it from its cache.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvertSrc {
+    #[serde(skip)]
+    pub fd: i32,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub offset: u32,
+    pub stride: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The slot layout the pass writes: `mode` as `convert_img.comp` numbers it (0 ARGB, 1 NV12,
+/// 2 YUV444 planar, 3 ARGB10, 4 ABGR10), row pitch in words, luma rows.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvertOut {
+    pub mode: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pitch_w: u32,
+    pub plane_rows: u32,
+}
+
+/// Where the uploaded cursor lands, in source pixels.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
 }
 
 /// worker → host.
@@ -81,6 +137,14 @@ pub enum Reply {
     Err {
         message: String,
     },
+    /// The request completed (slot registered, cursor stored).
+    Done,
+    /// The pass is submitted; it signals `value` on the convert timeline.
+    Converted {
+        value: u64,
+    },
+    /// The convert timeline's fd rides along.
+    Timeline,
 }
 
 /// Sent once per pooled buffer; later frames cite it by `Frame.id`.

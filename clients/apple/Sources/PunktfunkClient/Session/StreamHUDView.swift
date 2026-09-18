@@ -327,10 +327,11 @@ struct AccessChipBadge: View {
 /// "the evening's access ended, ask for more").
 struct AccessWarningBadge: View {
     let text: String
+    var icon = "clock.badge.exclamationmark"
 
     var body: some View {
         HStack(spacing: 7) {
-            Image(systemName: "clock.badge.exclamationmark")
+            Image(systemName: icon)
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(.yellow)
             Text(text)

@@ -41,13 +41,4 @@ public enum ModifierLayout: String, CaseIterable, Sendable {
             return "The key beside the space bar sends Alt, the next sends Windows — like a PC keyboard."
         }
     }
-
-    /// The persisted layout (default `.mac` when unset).
-    public static var current: ModifierLayout {
-        guard let raw = SessionSettings.active?.modifierLayout
-            ?? UserDefaults.standard.string(forKey: DefaultsKey.modifierLayout) else {
-            return .mac
-        }
-        return ModifierLayout(rawValue: raw) ?? .mac
-    }
 }

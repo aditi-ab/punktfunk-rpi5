@@ -50,7 +50,8 @@ parity, packet framing and the audio plane's share all fit inside it, so "20 Mbp
 your network. For H.264, HEVC and AV1, Automatic is the host's default **20 Mbps** plus two things
 an explicit rate switches off: adaptive bitrate, and a link-capacity probe about two seconds in that
 lets the rate climb past 20 Mbps. Automatic never descends below **2 Mbps**; an explicit rate is
-fixed for the session, clamped to **500 kbps – 8 Gbps**. A host card's menu has **Test network
+fixed for the session, clamped to **500 kbps – 8 Gbps**. Every client takes a rate that isn't on
+its list: type it, or slide to it on iPhone, iPad and Mac. A host card's menu has **Test network
 speed…** to suggest a value.
 
 PyroWave is **always Automatic**: a fixed per-pixel budget for the negotiated mode (hundreds of
@@ -92,10 +93,11 @@ that can encode it; if any gate fails the host says 4:2:0 before your decoder is
 
 **10-bit SDR** — *default: off.* Encodes at 10-bit precision without HDR: gradients that band under
 an 8-bit encode — skies, fog, dark scenes — come through smooth, and the displays keep their colour
-settings. It's the *encoder's* precision, not a 10-bit capture — the desktop stays 8-bit. Needs a
-Windows host on an NVIDIA GPU and HEVC; anywhere else the session stays 8-bit and the handshake
-says so. When HDR engages it takes over and the row dims. Every client except the TV apps: unlike
-HDR it asks nothing of your display.
+settings. It's the *encoder's* precision, not a 10-bit capture — the desktop stays 8-bit. Needs
+an NVIDIA or AMD host, or Intel under Linux, on HEVC; AV1 works too except on AMD under Windows.
+Anywhere else the session stays 8-bit and the handshake says so. When HDR engages it takes over and
+the row dims. Unlike HDR it asks nothing of your display, so the TV apps offer it too; on webOS it
+needs HEVC.
 
 **Prioritize** — *default: Lowest latency.* **Lowest latency** shows every frame the moment the
 display can take it — a network hiccup becomes an occasional repeated or skipped frame.
@@ -212,7 +214,8 @@ punktfunk — with it on, Steam hands the app its own virtual Xbox pad.
 
 **Forwarded controller** (*Use controller* on Apple and the console home) — *default: Automatic*,
 which forwards *every* connected controller, each as its own player. Pinning one restricts the
-session to that controller alone. Linux, Windows, Apple, console home; not Android.
+session to that controller alone. Linux, Windows, Apple, the desktop console home; not Android or
+webOS.
 
 **Steam / guide button** (*Guide button* on Apple and Android) — *default: Automatic*, everywhere.
 Where guide (Xbox/PS/Steam) and quick-access presses go while streaming: **Send to host** forwards

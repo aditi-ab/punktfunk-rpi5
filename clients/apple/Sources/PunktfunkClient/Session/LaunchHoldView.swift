@@ -24,6 +24,8 @@ struct LaunchHoldView: View {
     let host: StoredHost?
     /// The dial is still in flight — the status line says so until frames are coming.
     var connecting = false
+    /// The game is up and the host is waiting for its window.
+    var windowWait = false
     /// The shelf tile's rect in global coordinates, when there is a tile to fly out of.
     var sourceRect: CGRect?
     /// Screenshot harness: canned art in place of the paired host's loader.
@@ -35,13 +37,14 @@ struct LaunchHoldView: View {
     @State private var landed = false
 
     init(
-        entry: GameEntry, host: StoredHost?, connecting: Bool = false,
+        entry: GameEntry, host: StoredHost?, connecting: Bool = false, windowWait: Bool = false,
         sourceRect: CGRect? = nil, artOverride: (any LibraryArtSource)? = nil,
         onShow: @escaping () -> Void
     ) {
         self.entry = entry
         self.host = host
         self.connecting = connecting
+        self.windowWait = windowWait
         self.sourceRect = sourceRect
         self.artOverride = artOverride
         self.onShow = onShow
@@ -266,7 +269,10 @@ struct LaunchHoldView: View {
             }
             HStack(spacing: 9) {
                 ProgressView().controlSize(.small).tint(.white)
-                Text(connecting ? "Connecting…" : "Starting the game…")
+                Text(
+                    connecting
+                        ? "Connecting…"
+                        : windowWait ? "Waiting for the game's window…" : "Starting the game…")
                     .font(.geist(13, .regular, relativeTo: .footnote))
                     .foregroundStyle(.white.opacity(0.5))
             }

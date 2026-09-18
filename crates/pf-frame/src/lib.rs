@@ -67,6 +67,26 @@ impl PixelFormat {
     pub fn is_hdr_rgb10(self) -> bool {
         matches!(self, PixelFormat::X2Rgb10 | PixelFormat::X2Bgr10)
     }
+
+    /// BT.2020 PQ capture: packed 10-bit RGB or the producer's `P010`. Encoder colour and
+    /// HDR metadata key on this, not on the packed-RGB layout.
+    pub fn is_hdr(self) -> bool {
+        self.is_hdr_rgb10() || self == PixelFormat::P010
+    }
+}
+
+#[cfg(test)]
+mod pixel_format_tests {
+    use super::PixelFormat;
+
+    #[test]
+    fn p010_is_hdr_but_not_packed_rgb() {
+        assert!(PixelFormat::P010.is_hdr());
+        assert!(!PixelFormat::P010.is_hdr_rgb10());
+        assert!(PixelFormat::X2Bgr10.is_hdr());
+        assert!(!PixelFormat::Nv12.is_hdr());
+        assert!(!PixelFormat::Bgrx.is_hdr());
+    }
 }
 
 /// DRM FourCC from a 4-byte name, little-endian (`b"XR24"`).
@@ -89,10 +109,12 @@ pub fn drm_fourcc(format: PixelFormat) -> Option<u32> {
         Nv12 => drm_fourcc_code(b"NV12"),
         X2Rgb10 => drm_fourcc_code(b"XR30"), // DRM_FORMAT_XRGB2101010
         X2Bgr10 => drm_fourcc_code(b"XB30"), // DRM_FORMAT_XBGR2101010
+        // NV12 at 16 bits per sample, the 10-bit code high (`DRM_FORMAT_P010`).
+        P010 => drm_fourcc_code(b"P010"),
         // 24-bit packed RGB/BGR have no dmabuf import here; use the CPU path.
-        // Rgb10a2/Rgb10a2Sdr/P010 are Windows formats; Yuv444 is convert output, never a
+        // Rgb10a2/Rgb10a2Sdr are Windows formats; Yuv444 is convert output, never a
         // capture source.
-        Rgb | Bgr | Rgb10a2 | Rgb10a2Sdr | P010 | Yuv444 => return None,
+        Rgb | Bgr | Rgb10a2 | Rgb10a2Sdr | Yuv444 => return None,
     })
 }
 
@@ -107,8 +129,9 @@ pub struct OutputFormat {
     /// 10-bit HDR: IDD-push FP16 → `P010` (or `Rgb10a2` for 4:4:4). `false` = 8-bit SDR.
     pub hdr: bool,
     /// 10-bit SDR (`bit_depth == 10`, HDR off). Windows IDD-push expands BGRA 8→10 into
-    /// [`PixelFormat::Rgb10a2Sdr`] so NVENC encodes Main10 under BT.709 VUI. Mutually
-    /// exclusive with `hdr`. Ignored on Linux (no SDR-10 chain; handshake never offers it).
+    /// [`PixelFormat::Rgb10a2Sdr`]; on Linux it makes the pipewire capturer keep packed RGB
+    /// (skip the NV12 convert) so direct-NVENC can widen 8→10. NVENC encodes Main10 under
+    /// BT.709 VUI. Mutually exclusive with `hdr`.
     pub ten_bit_sdr: bool,
     /// Full-chroma 4:4:4: capturer must not subsample. Windows IDD-push passes BGRA through
     /// (skip BGRA→NV12) so NVENC CSCs to 4:4:4 under the VUI matrix. Linux forces CPU RGB
@@ -169,6 +192,13 @@ pub struct CursorOverlay {
     /// Compositor pointer visibility. `false` = host app hid the pointer. The encode loop
     /// strips invisible overlays before any blend, so encoders may treat `Some` as "draw it".
     pub visible: bool,
+}
+
+impl CursorOverlay {
+    /// The bitmap to blend into a BT.2020 PQ frame ([`hdr::srgb_rgba_to_pq`]), cached per bitmap.
+    pub fn pq_rgba(&self) -> std::sync::Arc<Vec<u8>> {
+        hdr::pq_rgba_cached(&self.rgba)
+    }
 }
 
 /// Where a captured frame's pixels came from. Host wall-clock PTS advances on every delivered

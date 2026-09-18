@@ -3,11 +3,12 @@
 //!
 //! Dedicated user-interactive thread. Newest-frame drop on embedder lag.
 //! [`FLAG_PROBE`] filler never enters the decoder. Tests here pin the
-//! delivery-report cadence, the probe-target derivation, and the pipeline-gap
-//! window discard.
+//! delivery-report cadence, ABR window activity, probe targets, and
+//! pipeline-gap window discard.
 
 use super::super::*;
 use super::*;
+use crate::abr::WindowActivity;
 
 /// Data-plane pump on a blocking thread. `try_send` drops the newest frame
 /// when the embedder lags. [`FLAG_PROBE`] filler goes to the probe accumulator,
@@ -53,8 +54,8 @@ pub(super) struct DataPump {
     pub(super) bit_depth: u8,
     pub(super) chroma_format: u8,
     /// Host marks idle-keepalive repeats (`USER_FLAG_REPEAT` / Welcome
-    /// [`crate::quic::HOST_CAP2_REPEAT_MARK`]). Older hosts get `None` and
-    /// legacy ABR window arithmetic.
+    /// [`crate::quic::HOST_CAP2_REPEAT_MARK`]). Older hosts are
+    /// [`crate::abr::WindowActivity::Unmarked`].
     pub(super) marks_repeats: bool,
     /// Audio-plane wire reservation. Added to window `actual` so the
     /// controller's domain matches the budget its targets are in.
@@ -68,6 +69,8 @@ pub(super) struct DataPump {
     /// Accepted mode, written by the control task. Read when `mode_gen`
     /// moves so the frame budget follows the new refresh.
     pub(super) mode_slot: Arc<Mutex<crate::config::Mode>>,
+    /// Published each window from [`crate::abr::BitrateController::last_cut`].
+    pub(super) rate_cut: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl DataPump {
@@ -100,6 +103,7 @@ impl DataPump {
             stream_cap_kbps,
             refresh_hz,
             mode_slot: pump_mode_slot,
+            rate_cut,
         } = self;
         pin_thread_user_interactive(); // frame channel → user-interactive video pump
         register_hot_tid(&pump_hot_tids); // UDP receive + FEC reassembly
@@ -204,6 +208,7 @@ impl DataPump {
         let mut standing_lat = StandingLatency::new();
         // A hole's two causes told apart: silence at the socket vs. this thread away from it.
         let mut rx_gap = super::rx_gap::RxGap::new(Instant::now());
+        let mut ingress_since = (Instant::now(), session.stats());
         while !pump_shutdown.load(Ordering::SeqCst) {
             // Reloaded every iteration so a mid-stream re-sync hits the
             // next frame's latency math.
@@ -247,6 +252,20 @@ impl DataPump {
                      this thread's longest absence from the socket meanwhile. Near-equal = \
                      this client stalled; unpolled small = nothing arrived, the path or the host"
                 );
+            }
+            let elapsed = ingress_since.0.elapsed();
+            if elapsed >= super::rx_gap::IngressWindow::PERIOD {
+                let w = super::rx_gap::IngressWindow::between(&ingress_since.1, &st, elapsed);
+                tracing::info!(
+                    packets = w.packets,
+                    video_kbps = w.video_kbps,
+                    fec_repaired = w.fec_repaired,
+                    frames_dropped = w.frames_dropped,
+                    rejected = w.rejected,
+                    max_gap_ms = rx_gap.take_max_silence().as_millis() as u64,
+                    "wire ingress"
+                );
+                ingress_since = (Instant::now(), st);
             }
             frames_dropped.store(st.frames_dropped, Ordering::Relaxed);
             fec_recovered.store(st.fec_recovered_shards, Ordering::Relaxed);
@@ -500,13 +519,9 @@ impl DataPump {
                 let owd_mean_us =
                     (owd_frames > 0).then(|| (owd_sum_ns / owd_frames as i128 / 1000) as i64);
                 (owd_sum_ns, owd_frames) = (0, 0);
-                // Active = new content this window. `None` on an older
-                // host: "no flags" is not "all active".
-                let active_frames = if marks_repeats {
-                    Some(au_frames.saturating_sub(au_repeats))
-                } else {
-                    None
-                };
+                // Active = new content this window. Empty ≠ unmarked: no AU
+                // is not an older host, and cannot prove repeat-only idle.
+                let activity = abr_window_activity(marks_repeats, au_frames, au_repeats);
                 (au_frames, au_repeats) = (0, 0);
                 // Drain even when ABR is off so the accumulator stays
                 // bounded. `None` = nothing reported this window.
@@ -549,9 +564,10 @@ impl DataPump {
                         actual_kbps,
                         flush_in_window,
                         recovery_kf_reqs,
-                        active_frames,
+                        activity,
                     )
                 };
+                rate_cut.store(abr.last_cut().map_or(0, |c| c as u8), Ordering::Relaxed);
                 if let Some(kbps) = verdict {
                     // Log window signals with the decision so decode-/
                     // encode-driven retargets are separable from network.
@@ -810,6 +826,24 @@ fn probe_target_kbps(stream_cap_kbps: u32) -> u32 {
     stream_cap_kbps.saturating_mul(2).min(2_000_000)
 }
 
+/// Classify this window's new-content evidence for ABR.
+///
+/// No arrivals are [`WindowActivity::Empty`]: quiet like idle, not an
+/// older-host unmarked window. Repeat-only (every arrived AU a host-marked
+/// repeat) is [`WindowActivity::Active`]`(0)` and counts toward re-arm.
+/// Arrivals on a host that does not mark repeats are
+/// [`WindowActivity::Unmarked`]. The controller never infers stillness
+/// from a blackout.
+fn abr_window_activity(marks_repeats: bool, frames: u32, repeats: u32) -> WindowActivity {
+    if frames == 0 {
+        WindowActivity::Empty
+    } else if marks_repeats {
+        WindowActivity::Active(frames.saturating_sub(repeats))
+    } else {
+        WindowActivity::Unmarked
+    }
+}
+
 /// Wire measure: every received media-plane byte (headers, seals, FEC
 /// parity spend the budget) minus speed-test filler.
 fn wire_bytes(st: &crate::stats::Stats) -> u64 {
@@ -873,6 +907,15 @@ mod tests {
         }
         assert_eq!(probe_target_kbps(u32::MAX), 2_000_000);
         assert_eq!(probe_target_kbps(1_500_000), 2_000_000);
+    }
+
+    #[test]
+    fn only_observed_repeats_make_an_idle_abr_window() {
+        assert_eq!(abr_window_activity(true, 45, 45), WindowActivity::Active(0));
+        assert_eq!(abr_window_activity(true, 45, 40), WindowActivity::Active(5));
+        assert_eq!(abr_window_activity(true, 0, 0), WindowActivity::Empty);
+        assert_eq!(abr_window_activity(false, 45, 0), WindowActivity::Unmarked);
+        assert_eq!(abr_window_activity(false, 0, 0), WindowActivity::Empty);
     }
 
     #[test]
@@ -963,6 +1006,7 @@ mod tests {
                 bitrate_ack: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 live_bitrate: Arc::new(AtomicU32::new(0)),
                 recovery_kf: Arc::new(AtomicU32::new(0)),
+                recent_rfis: Default::default(),
                 pipeline_gap: pipeline_gap.clone(),
                 clock_offset: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 clock_gen: Arc::new(AtomicU32::new(0)),
@@ -974,6 +1018,7 @@ mod tests {
                 access_tx,
                 audio_mute: Arc::new(std::sync::atomic::AtomicU8::new(0)),
                 pad_slots: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+                launch_outcome: Arc::new(Mutex::new(None)),
             }
             .run(),
         );
@@ -1015,6 +1060,7 @@ mod tests {
                 height: 1080,
                 refresh_hz: 60,
             })),
+            rate_cut: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
         let started = Instant::now();
         let pump_thread = std::thread::spawn(move || pump.run());

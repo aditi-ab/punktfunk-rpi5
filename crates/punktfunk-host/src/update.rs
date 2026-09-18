@@ -43,8 +43,8 @@ const STALE_AFTER: Duration = Duration::from_secs(45 * 24 * 60 * 60);
 
 pub(crate) fn check_disabled() -> bool {
     matches!(
-        std::env::var("PUNKTFUNK_UPDATE_CHECK").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
+        pf_host_config::knob("PUNKTFUNK_UPDATE_CHECK").as_deref(),
+        Some("0") | Some("false") | Some("off")
     )
 }
 
@@ -52,8 +52,8 @@ pub(crate) fn check_disabled() -> bool {
 /// one-click leg exists. Check is unaffected.
 pub(crate) fn apply_disabled() -> bool {
     matches!(
-        std::env::var("PUNKTFUNK_UPDATE_APPLY").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
+        pf_host_config::knob("PUNKTFUNK_UPDATE_APPLY").as_deref(),
+        Some("0") | Some("false") | Some("off")
     )
 }
 

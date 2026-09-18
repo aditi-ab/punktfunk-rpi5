@@ -8,7 +8,9 @@
 use super::cuda::{self, CUdeviceptr, DeviceBuffer, CU_IPC_HANDLE_SIZE};
 use super::egl::DmabufPlane;
 use super::ipc;
-use super::proto::{BufferDesc, ImportKind, Reply, Request, PROTO_VERSION};
+use super::proto::{
+    BufferDesc, ConvertOut, ConvertSrc, CursorRect, ImportKind, Reply, Request, PROTO_VERSION,
+};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -361,6 +363,132 @@ impl RemoteImporter {
     /// IPC mappings. The worker replaces its pool; live host mappings would pin
     /// VA to peer memory already freed. Unreferenced close now; in-flight wait
     /// for release.
+    /// Send one request and wait for its reply; a transport failure marks the worker dead.
+    fn call(&mut self, req: &Request, fd: Option<BorrowedFd>) -> Result<Reply> {
+        self.call_fd(req, fd).map(|(reply, _)| reply)
+    }
+
+    /// [`call`](Self::call), keeping the descriptor the reply carries.
+    fn call_fd(
+        &mut self,
+        req: &Request,
+        fd: Option<BorrowedFd>,
+    ) -> Result<(Reply, Option<OwnedFd>)> {
+        if self.dead() {
+            bail!("zerocopy worker is dead");
+        }
+        if let Err(e) = ipc::send(self.shared.sock.as_fd(), req, fd) {
+            self.mark_dead();
+            return Err(e).context("zerocopy worker died (send)");
+        }
+        match ipc::recv::<Reply>(self.shared.sock.as_fd(), &mut self.rbuf) {
+            Ok(reply) => Ok(reply),
+            Err(e) => {
+                self.mark_dead();
+                Err(e).context("zerocopy worker died (no reply)")
+            }
+        }
+    }
+
+    /// Hand the worker the host's NVENC slot `id` (an OPAQUE_FD export of `size` bytes).
+    pub fn register_slot(&mut self, id: u32, fd: BorrowedFd, size: u64) -> Result<()> {
+        match self.call(&Request::RegisterSlot { id, size }, Some(fd))? {
+            Reply::Done => Ok(()),
+            Reply::Err { message } => bail!("register slot: {message}"),
+            other => {
+                self.mark_dead();
+                bail!("unexpected reply to RegisterSlot: {other:?}")
+            }
+        }
+    }
+
+    /// The host rebuilt its ring. Fire-and-forget, like `ClearCache`.
+    pub fn forget_slots(&mut self) {
+        if self.dead() {
+            return;
+        }
+        if ipc::send(self.shared.sock.as_fd(), &Request::ForgetSlots, None).is_err() {
+            self.mark_dead();
+        }
+    }
+
+    /// Ship a straight-alpha RGBA8 cursor bitmap through a memfd (pixels never ride the socket).
+    pub fn set_cursor(&mut self, serial: u64, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+        let len = u32::try_from(rgba.len()).context("cursor bitmap too large")?;
+        let memfd = memfd_with(rgba)?;
+        match self.call(
+            &Request::SetCursor {
+                serial,
+                width,
+                height,
+                len,
+            },
+            Some(memfd.as_fd()),
+        )? {
+            Reply::Done => Ok(()),
+            Reply::Err { message } => bail!("set cursor: {message}"),
+            other => {
+                self.mark_dead();
+                bail!("unexpected reply to SetCursor: {other:?}")
+            }
+        }
+    }
+
+    /// One fused pass of `src` into slot `slot`; returns the timeline value it signals. The
+    /// dmabuf fd crosses once per key, like an import; a worker that lost it asks again.
+    pub fn convert(
+        &mut self,
+        src: &ConvertSrc,
+        slot: u32,
+        out: &ConvertOut,
+        cursor: Option<CursorRect>,
+    ) -> Result<u64> {
+        let key = dmabuf_key(src.fd)?;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let has_fd = self.sent_keys.insert(key);
+            // SAFETY: `src.fd` is the caller's live dmabuf for the duration of this call.
+            let pass = has_fd.then(|| unsafe { BorrowedFd::borrow_raw(src.fd) });
+            let req = Request::Convert {
+                key,
+                has_fd,
+                src: *src,
+                slot,
+                out: *out,
+                cursor,
+            };
+            match self.call(&req, pass)? {
+                Reply::Converted { value } => return Ok(value),
+                Reply::NeedFd if attempts == 1 => {
+                    self.sent_keys.remove(&key);
+                    continue;
+                }
+                Reply::NeedFd => {
+                    self.mark_dead();
+                    bail!("zerocopy worker still lacks the fd after a resend (desync)");
+                }
+                Reply::Err { message } => bail!("convert: {message}"),
+                other => {
+                    self.mark_dead();
+                    bail!("unexpected reply to Convert: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// The worker's convert timeline as an OPAQUE_FD, for the host's CUDA import.
+    pub fn convert_timeline(&mut self) -> Result<OwnedFd> {
+        match self.call_fd(&Request::ConvertTimeline, None)? {
+            (Reply::Timeline, Some(fd)) => Ok(fd),
+            (Reply::Err { message }, _) => bail!("convert timeline: {message}"),
+            (other, _) => {
+                self.mark_dead();
+                bail!("unexpected reply to ConvertTimeline: {other:?}")
+            }
+        }
+    }
+
     pub fn clear_cache(&mut self) {
         self.sent_keys.clear();
         {
@@ -446,6 +574,21 @@ fn open_mapping(desc: &BufferDesc) -> Result<Mapping> {
         width: desc.width,
         height: desc.height,
     })
+}
+
+/// A sealed memfd holding `bytes`, for a bitmap that must not ride the socket.
+fn memfd_with(bytes: &[u8]) -> Result<OwnedFd> {
+    use std::io::Write as _;
+    // SAFETY: a NUL-terminated literal name; the flags are plain constants.
+    let raw = unsafe { libc::memfd_create(c"punktfunk-cursor".as_ptr(), libc::MFD_CLOEXEC) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error()).context("memfd_create(cursor)");
+    }
+    // SAFETY: `raw` is a fresh descriptor this function owns.
+    let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+    let mut f = std::fs::File::from(fd);
+    f.write_all(bytes).context("write cursor memfd")?;
+    Ok(OwnedFd::from(f))
 }
 
 #[cfg(test)]

@@ -496,6 +496,63 @@ export function safeNextPath(next: string | undefined): string {
 	}
 }
 
+/**
+ * The origin the browser's address bar shows, for CSRF comparison.
+ *
+ * `getRequestURL().origin` is the wrong source: Nitro's localFetch builds a
+ * synthetic request with no TLS socket, so it reports `http:` on an HTTPS
+ * listener. Same trap as `frame-ancestors`. Scheme precedence matches that
+ * helper: forwarded proto, then the stamped listener scheme, then the request.
+ */
+export function csrfRequestOrigin(o: {
+	forwardedProto?: string | null;
+	listenerScheme?: "http" | "https" | null;
+	requestScheme: string;
+	host: string;
+}): string {
+	const forwarded = o.forwardedProto?.split(",")[0]?.trim().toLowerCase();
+	const scheme =
+		forwarded === "https" || forwarded === "http"
+			? forwarded
+			: (o.listenerScheme ?? o.requestScheme.replace(/:$/, ""));
+	try {
+		return new URL(`${scheme}://${o.host}`).origin;
+	} catch {
+		return `${scheme}://${o.host}`;
+	}
+}
+
+/**
+ * Whether a mutating request came from another origin and must be refused.
+ *
+ * SameSite=Lax still attaches the session cookie to another port on the same
+ * host (the plugin-UI origin). A browser that sends `Sec-Fetch-Site` is judged
+ * by it alone: the console answers with `Referrer-Policy: no-referrer`, so its
+ * own form POSTs carry `Origin: null`. Without Fetch-Site, `Origin` decides; a
+ * missing one is curl and is allowed, `null` is an opaque document and is not.
+ */
+export function isCrossSiteMutation(o: {
+	method: string;
+	fetchSite?: string | null;
+	origin?: string | null;
+	requestOrigin: string;
+}): boolean {
+	const method = o.method.toUpperCase();
+	if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+		return false;
+	}
+	const site = o.fetchSite?.toLowerCase();
+	if (site) return site !== "same-origin" && site !== "none";
+	const origin = o.origin?.trim();
+	if (!origin) return false;
+	if (origin === "null") return true;
+	try {
+		return new URL(origin).origin !== o.requestOrigin;
+	} catch {
+		return true;
+	}
+}
+
 export interface SessionData {
 	authenticated?: boolean;
 	/** The epoch this session was sealed under — see `sessionEpoch`. */

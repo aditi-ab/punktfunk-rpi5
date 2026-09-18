@@ -16,9 +16,11 @@ use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 pub const POOL_MIN: i32 = 2;
 /// KWin ≥ 6.2 offers `Range(3, 2, 4)` as a driver stream, so its default 3 wins any
 /// intersection that contains it, and a pool of 3 spares one hold while the encoder keeps
-/// two frames in flight. A minimum of 4 is the only ask that moves it; above 4 fails
-/// negotiation outright.
+/// two frames in flight. A minimum of 4 is the only ask that moves it.
 pub const KWIN_POOL_MIN: i32 = 4;
+/// The deepest pool KWin serves. A minimum above it fails negotiation outright
+/// (`error alloc buffers: Invalid argument`).
+pub const KWIN_POOL_MAX: i32 = 4;
 
 /// Whether to ask a KWin output for unpaced delivery (`maxFramerate = 0/1`).
 ///
@@ -462,6 +464,13 @@ pub struct ZeroCopyPolicy {
     /// direct-SDK NVENC only). No other arm reads those 2:10:10:10 words as
     /// anything but garbage, so do not produce them unless this holds.
     pub hdr_cuda_ok: bool,
+    /// The NVENC encoder takes held dmabufs and lets its zero-copy worker convert them
+    /// straight into its input slots (`pf_encode::linux_nvenc_raw_dmabuf_ok`). The capture
+    /// then imports nothing; a producer that cannot be held keeps the import path.
+    pub nvenc_raw_dmabuf: bool,
+    /// The gamescope producer fixates a tiled modifier (`pf_vdisplay::gamescope_tiled_capture`).
+    /// Off, its offer stays LINEAR-only.
+    pub gamescope_tiled: bool,
 }
 
 /// Discovers gamescope's nested Xwayland cursor targets — `(DISPLAY, XAUTHORITY)`,
@@ -706,7 +715,8 @@ pub fn open_portal_monitor(
 /// virtual output is SDR, and a desktop that refuses the offer would latch gamescope's SDR.
 /// `cursor_id0_hides` selects KWin's rewritten cursor-meta contract.
 /// `producer_is_gamescope` selects its no-meta, LINEAR-only contract.
-/// KWin also needs [`KWIN_POOL_MIN`] and [`unpaced_capture`].
+/// KWin also needs [`KWIN_POOL_MIN`], [`KWIN_POOL_MAX`] as `pool_max`, and [`unpaced_capture`].
+/// `pool_max` is the deepest pool the producer serves; `None` when it serves any depth asked.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 pub fn open_virtual_output(
@@ -717,11 +727,13 @@ pub fn open_virtual_output(
     allow_zerocopy: bool,
     want_444: bool,
     want_hdr: bool,
+    ten_bit_sdr: bool,
     policy: ZeroCopyPolicy,
     expect_exact_dims: bool,
     cursor_id0_hides: bool,
     producer_is_gamescope: bool,
     pool_min: i32,
+    pool_max: Option<i32>,
     unpaced: bool,
 ) -> Result<Box<dyn Capturer>> {
     linux::PortalCapturer::from_virtual_output(
@@ -732,11 +744,13 @@ pub fn open_virtual_output(
         allow_zerocopy,
         want_444,
         want_hdr && producer_is_gamescope && !hdr_capture_failed(HdrSource::VirtualOutput),
+        ten_bit_sdr,
         policy,
         expect_exact_dims,
         cursor_id0_hides,
         producer_is_gamescope,
         pool_min,
+        pool_max,
         unpaced,
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)

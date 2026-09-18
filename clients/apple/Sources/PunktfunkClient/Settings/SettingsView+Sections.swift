@@ -107,8 +107,8 @@ extension SettingsView {
                 .font(.geist(15, relativeTo: .subheadline))
                 .foregroundStyle(.secondary)
             Picker("Aspect ratio", selection: aspectSelection) {
-                ForEach(Resolutions.aspects.indices, id: \.self) { i in
-                    Text(Resolutions.aspects[i].label).tag(i)
+                ForEach(Array(SettingsOptions.families().enumerated()), id: \.offset) { i, family in
+                    Text(family.label).tag(i)
                 }
             }
             .labelsHidden()
@@ -194,7 +194,8 @@ extension SettingsView {
             get: { family },
             set: { i in
                 customMode = false
-                let mode = Resolutions.nearest(i, height: effective.height)
+                let mode = Resolutions.nearestIn(
+                    SettingsOptions.families()[i], height: effective.height)
                 setResolution(width: mode.w, height: mode.h)
             })
     }
@@ -316,7 +317,8 @@ extension SettingsView {
             described("A preference — the host falls back if it can't encode it.",
                       field: "codec") {
                 settingPicker(
-                    "Video codec", options: SettingsOptions.codecs,
+                    "Video codec",
+                    options: SettingsOptions.codecs(current: scoped(SettingsFields.codec).wrappedValue),
                     selection: scoped(SettingsFields.codec))
             }
             described("HDR10 when the host sends it and this display supports it. HEVC only.",
@@ -402,8 +404,8 @@ extension SettingsView {
         }
     }
     #else
-    /// The TV's bitrate: a list of steps, where the touch and desktop forms have a switch and a
-    /// slider. PyroWave sets its own rate, so it shows none.
+    /// The TV's bitrate: a list of steps plus a typed rate, where the touch and desktop forms have
+    /// a switch and a slider. PyroWave sets its own rate, so it shows none.
     @ViewBuilder private var tvBitrateRow: some View {
         if effective.codec == "pyrowave", MetalWaveletDecoder.supported {
             described("PyroWave sets its own rate from the stream mode — a fixed bitrate "
@@ -418,6 +420,22 @@ extension SettingsView {
                     title: "Bitrate",
                     options: SettingsOptions.bitrateOptions(current: effective.bitrateKbps),
                     selection: scoped(SettingsFields.bitrateKbps))
+            }
+            described("Any fixed rate, in Mbps.", field: "bitrate_kbps") {
+                TVFieldRow(
+                    label: "Custom bitrate",
+                    value: SettingsOptions.isCustomBitrate(effective.bitrateKbps)
+                        ? SpeedTestView.mbpsLabel(kbps: effective.bitrateKbps) : "",
+                    placeholder: "Type a rate"
+                ) { typingBitrate = true }
+                .fullScreenCover(isPresented: $typingBitrate) {
+                    TVTextEntry(title: "Bitrate (Mbps)", text: "", keyboardType: .numberPad) {
+                        if let kbps = SettingsOptions.customBitrateKbps($0) {
+                            scoped(SettingsFields.bitrateKbps).wrappedValue = kbps
+                        }
+                        typingBitrate = false
+                    }
+                }
             }
         }
     }

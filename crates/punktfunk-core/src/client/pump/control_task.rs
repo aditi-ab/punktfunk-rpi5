@@ -23,6 +23,8 @@ pub(super) struct ControlTask {
     /// `note_frame_index`, pump) funnels through this choke point. The pump
     /// drains the count per report window as the ABR recovery signal.
     pub(super) recovery_kf: Arc<AtomicU32>,
+    /// Outbound RFIs, noted at the same choke point for the overlay's per-minute count.
+    pub(super) recent_rfis: Arc<Mutex<RecentRfis>>,
     /// Last host pipeline gap in ms ([`crate::quic::PipelineGap`]); `0` = none.
     /// Pump drains it and discards the in-flight report window — a host-local
     /// rebuild is not congestion. Atomic because the pump only ever swaps it.
@@ -52,6 +54,9 @@ pub(super) struct ControlTask {
     /// Live pad-slot mask ([`NativeClient::pad_slots`]). Latest wins — the host
     /// resends the whole set whenever one of this session's pads comes or goes.
     pub(super) pad_slots: Arc<std::sync::atomic::AtomicU16>,
+    /// Latest [`crate::quic::LaunchOutcome`] ([`NativeClient::launch_outcome`]). Latest
+    /// wins: the host sends a second verdict when a spawned game dies on the spot.
+    pub(super) launch_outcome: Arc<std::sync::Mutex<Option<crate::quic::LaunchOutcome>>>,
 }
 
 impl ControlTask {
@@ -66,6 +71,7 @@ impl ControlTask {
             bitrate_ack,
             live_bitrate,
             recovery_kf,
+            recent_rfis,
             pipeline_gap,
             clock_offset,
             clock_gen,
@@ -77,6 +83,7 @@ impl ControlTask {
             access_tx,
             audio_mute,
             pad_slots,
+            launch_outcome,
         } = self;
         // Mid-stream clock re-sync ([`ClockResync`]): a batch every
         // CLOCK_RESYNC_INTERVAL and when the pump asks (CtrlRequest::ClockResync
@@ -106,7 +113,10 @@ impl ControlTask {
                             recovery_kf.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             RequestKeyframe.encode()
                         }
-                        CtrlRequest::Rfi(r) => r.encode(),
+                        CtrlRequest::Rfi(r) => {
+                            recent_rfis.lock().unwrap().note(std::time::Instant::now());
+                            r.encode()
+                        }
                         CtrlRequest::Loss(r) => r.encode(),
                         CtrlRequest::Delivery(r) => r.encode(),
                         CtrlRequest::SetBitrate(k) => SetBitrate { bitrate_kbps: k }.encode(),
@@ -324,6 +334,13 @@ impl ControlTask {
                         // wire indices are per client, the OS slots are host-wide.
                         tracing::info!(slots = p.slots, "host assigned this session's pad slots");
                         pad_slots.store(p.slots, Ordering::Relaxed);
+                    } else if let Ok(o) = crate::quic::LaunchOutcome::decode(&msg) {
+                        tracing::info!(
+                            kind = o.kind.as_str(),
+                            message = %o.message,
+                            "host reported this session's launch"
+                        );
+                        *launch_outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(o);
                     } else if let Ok(shape) = crate::quic::CursorShape::decode(&msg) {
                         // Pointer bitmap changed. try_send: overflow drops newest;
                         // the next shape change resends.

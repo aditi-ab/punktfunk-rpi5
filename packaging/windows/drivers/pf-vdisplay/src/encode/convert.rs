@@ -215,7 +215,11 @@ pub fn pixel_format(kind: InputKind) -> PixelFormat {
     match kind {
         InputKind::Bgra => PixelFormat::Bgra,
         InputKind::Nv12 | InputKind::Planar { hdr: false, .. } => PixelFormat::Nv12,
-        InputKind::P010 | InputKind::Planar { hdr: true, .. } => PixelFormat::P010,
+        // P010Sdr rides the same P010 label so the AMF submit check (`format == P010`) passes;
+        // the encoder's `hdr` flag, not the label, decides BT.709 vs BT.2020.
+        InputKind::P010 | InputKind::P010Sdr | InputKind::Planar { hdr: true, .. } => {
+            PixelFormat::P010
+        }
         InputKind::Rgb10 => PixelFormat::Rgb10a2,
     }
 }
@@ -239,6 +243,12 @@ enum Planes {
     P010 {
         conv: HdrP010Converter,
         out: Vec<(Tex, Rtv, Rtv)>,
+    },
+    /// 10-bit SDR: the same video-engine BGRA→YUV as [`Self::Nv12`], but a P010 target — the
+    /// VideoProcessor writes BT.709 studio at ten bits (`YCBCR_STUDIO_G22_LEFT_P709`).
+    P010Sdr {
+        conv: VideoConverter,
+        out: Vec<Tex>,
     },
     Rgb10 {
         conv: HdrRgb10Converter,
@@ -313,6 +323,14 @@ impl Targets {
                     .map(|_| make_tex62(dev, (w, h), dxgi::DXGI_FORMAT_NV12, rt, 0))
                     .collect::<Result<_, _>>()?;
                 Planes::Nv12 { conv, out }
+            }
+            InputKind::P010Sdr => {
+                // 8-bit BGRA in, P010 out: the video engine studio-swings BT.709 at ten bits.
+                let conv = VideoConverter::new(dev, ctx, w, h, false).map_err(convert_err)?;
+                let out = (0..slots)
+                    .map(|_| make_tex62(dev, (w, h), dxgi::DXGI_FORMAT_P010, rt, 0))
+                    .collect::<Result<_, _>>()?;
+                Planes::P010Sdr { conv, out }
             }
             InputKind::P010 => {
                 let conv = HdrP010Converter::new(dev, w, h).map_err(convert_err)?;
@@ -532,6 +550,7 @@ impl Targets {
         match &self.planes {
             Planes::Bgra(_) => {}
             Planes::Nv12 { conv, out } => conv.convert(src, &out[i]).map_err(convert_err)?,
+            Planes::P010Sdr { conv, out } => conv.convert(src, &out[i]).map_err(convert_err)?,
             Planes::P010 { conv, out } => conv
                 .convert(
                     &self.ctx,
@@ -646,6 +665,7 @@ impl Targets {
         let (texture, pyro) = match &mut self.planes {
             Planes::Bgra(slots) => (slots[i].clone(), None),
             Planes::Nv12 { out, .. } => (out[i].clone(), None),
+            Planes::P010Sdr { out, .. } => (out[i].clone(), None),
             Planes::P010 { out, .. } => (out[i].0.clone(), None),
             Planes::Rgb10 { out, .. } => (out[i].0.clone(), None),
             Planes::Planar {

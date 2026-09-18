@@ -755,6 +755,7 @@ const GAMEPADS: &[&str] = &[
     "xboxone",
     "dualshock4",
     "steamdeck",
+    "steamcontroller2",
 ];
 /// System-button routing values (persisted under the cross-client `system_buttons` key):
 /// where the guide (Xbox/PS/Steam) and quick-access presses land while streaming. Auto =
@@ -1851,6 +1852,7 @@ pub fn show_scoped(
             "Xbox One",
             "DualShock 4",
             "Steam Deck",
+            "Steam Controller 2",
         ],
     );
     // Where the guide (Xbox/PS/Steam) + quick-access presses land, and the hold-Select

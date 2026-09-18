@@ -4,11 +4,8 @@
 //     effective = overlay(preset).apply(globals)
 //     preset   = one-off pick (Connect with ▸)  ??  host.presetID  ??  none
 //
-// Before this existed, ~10 sites scattered across the app AND the kit read `UserDefaults` directly
-// mid-session — a per-host preset would have applied to some of them and not others, which is
-// worse than not shipping the feature. They now read `SessionSettings.current`: the live session's
-// resolution while one is up, the plain globals otherwise (byte-for-byte today's behaviour when no
-// preset is involved).
+// Session readers read their own session's copy: `PunktfunkConnection.settings` in the kit,
+// `SessionModel.settings` in the app. Never the globals mid-session, and never another window's.
 //
 // Only SESSION-CONSUMED values live here. Pure app-level preferences — the library toggle, the
 // gamepad-UI switch, HUD placement, auto-wake, background keep-alive — stay plain `@AppStorage`
@@ -380,63 +377,5 @@ extension EffectiveSettings {
             baseWidth: width, baseHeight: height, scale: renderScale,
             maxDimension: RenderScale.maxDimension(codec: codec))
         return (mode.width, mode.height, UInt32(clamping: refreshHz))
-    }
-}
-
-// MARK: - The live session's resolution
-
-/// What a session-scoped reader should read instead of `UserDefaults`.
-///
-/// A plain `static var` would be the obvious shape, but these are read from the decode pump and
-/// the presenter's display-link callback as well as the main actor, so the value sits behind a
-/// lock — the `FrameMeter` pattern used elsewhere in the client.
-public enum SessionSettings {
-    private final class Box: @unchecked Sendable {
-        private let lock = NSLock()
-        private var value: EffectiveSettings?
-
-        var active: EffectiveSettings? {
-            get { lock.withLock { value } }
-            set { lock.withLock { value = newValue } }
-        }
-    }
-
-    private static let box = Box()
-
-    /// The live session's resolution, or nil while idle.
-    public static var active: EffectiveSettings? { box.active }
-
-    /// What every session-scoped reader uses: the live session's resolution while one is up, the
-    /// plain globals otherwise. Reading it off-session is exactly what those sites did before.
-    public static var current: EffectiveSettings {
-        box.active ?? EffectiveSettings(defaults: .standard)
-    }
-
-    /// Latch the settings a starting session resolved. Called once per connect, before the
-    /// connection exists, so nothing reads a half-applied mix.
-    public static func begin(_ settings: EffectiveSettings) {
-        box.active = settings
-    }
-
-    /// Release the latch when the session ends — later reads fall back to the globals.
-    public static func end() {
-        box.active = nil
-    }
-
-    /// The one value that legitimately moves mid-session: the stats tier, which every client
-    /// cycles live (⌃⌥⇧S, the three-finger tap). Only the session's value moves; the global stays
-    /// the tier the next session starts at.
-    public static func setStatsVerbosity(_ raw: String) {
-        guard var s = box.active else { return }
-        s.statsVerbosity = raw
-        box.active = s
-    }
-}
-
-private extension NSLock {
-    func withLock<T>(_ body: () -> T) -> T {
-        lock()
-        defer { unlock() }
-        return body()
     }
 }

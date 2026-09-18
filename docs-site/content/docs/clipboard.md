@@ -8,7 +8,7 @@ streaming, in both directions — copy a URL on your laptop, paste it on the hos
 
 **Two separate switches have to be on:**
 
-1. The **host** operator has to allow it, with a line in `host.env` and a host restart. Off by
+1. The **host** operator has to allow it, in the web console under **Host → Settings**. Off by
    default.
 2. **You** have to turn it on for that one host, in that host's edit sheet on your client. Off by
    default on the macOS, Windows and Linux clients — **on by default on Android**.
@@ -17,24 +17,27 @@ Flipping one and not the other looks exactly like the feature not existing. Chec
 
 ## 1. Allow it on the host
 
-Add a `PUNKTFUNK_CLIPBOARD` line to the host's `host.env` — `~/.config/punktfunk/host.env` on
-Linux, `%ProgramData%\punktfunk\host.env` on Windows.
+Open the web console, go to **Host → Settings**, and set **Shared clipboard** to **Text** or
+**Text and files**. It applies to the next stream; no restart.
+
+On a host nobody opens the console on, add a `PUNKTFUNK_CLIPBOARD` line to its `host.env` instead —
+`~/.config/punktfunk/host.env` on Linux, `%ProgramData%\punktfunk\host.env` on Windows. A value set
+there wins over the console, which then shows the setting as locked.
 
 ```ini
-PUNKTFUNK_CLIPBOARD=on
+PUNKTFUNK_CLIPBOARD=files
 ```
 
 The accepted values:
 
 | Value | Effect |
 |---|---|
-| unset, empty, `0`, `off`, `false` | **Off (the default).** The host never advertises the clipboard capability and never accepts a clipboard transfer. |
-| `text-only`, `no-files`, `text` | On for text, HTML, rich text and images. File transfer is refused. |
-| `on`, `1` | On, and file transfer is permitted by policy. |
+| unset, empty, `off`, `0`, `false`, `no` | **Off (the default).** The host never advertises the clipboard capability and never accepts a clipboard transfer. |
+| `text` (also `text-only`, `no-files`) | On for text, HTML, rich text and images. File transfer is refused. |
+| `files` (also `on`, `1`, `true`, `yes`) | On, and file transfer is permitted by policy. |
 
-Values are trimmed and compared case-insensitively. **Anything the host doesn't recognise is
-treated as `on`** — a typo like `PUNKTFUNK_CLIPBOARD=yes` or `no-file` enables the permissive
-policy rather than failing, so check the spelling if you meant `text-only`.
+Values are trimmed and compared case-insensitively. A value the host doesn't recognise is ignored
+with a warning in the host log, and the console's setting applies instead.
 
 The file is only read at startup, so restart the host. On Linux:
 
@@ -51,8 +54,8 @@ punktfunk-host service restart
 See [Configuration](/docs/configuration) for the rest of `host.env`.
 
 > **About the file mode.** No client shipping today asks for file transfer, and no host clipboard
-> backend offers file formats yet, so `on` and `text-only` behave the same in practice — `text-only`
-> makes that explicit and keeps it that way.
+> backend offers file formats yet, so `files` and `text` behave the same in practice — `text` makes
+> that explicit and keeps it that way.
 
 ## 2. Turn it on for that host, in your client
 

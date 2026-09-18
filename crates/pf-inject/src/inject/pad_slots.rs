@@ -91,9 +91,14 @@ pub struct Sweep {
 /// [`sweep`](Self::sweep) returns and on a `true` from [`ensure`](Self::ensure).
 pub struct PadSlots<P> {
     pads: Vec<Option<P>>,
+    /// Links that put slot `i`'s pad in its seat's view. Declared after `pads` so the device
+    /// goes before the links that named it. `None` on every unfiltered host.
+    exposed: Vec<Option<crate::seat_dev::PadLinks>>,
     /// First instant an allocated slot's `active_mask` bit was seen clear.
     /// `None` = the bit is set, or the slot is empty.
     inactive_since: Vec<Option<Instant>>,
+    /// This session's seat: the only directory its pads are exposed in.
+    seat: Option<crate::seat_dev::SeatDev>,
     gate: PadGate,
     /// Backend tag in shared lifecycle log lines, e.g. `"DualSense/Windows"`.
     label: &'static str,
@@ -107,7 +112,9 @@ impl<P> PadSlots<P> {
     pub fn new(label: &'static str, device: &'static str, hint: &'static str) -> PadSlots<P> {
         PadSlots {
             pads: (0..MAX_PADS).map(|_| None).collect(),
+            exposed: (0..MAX_PADS).map(|_| None).collect(),
             inactive_since: (0..MAX_PADS).map(|_| None).collect(),
+            seat: None,
             gate: PadGate::new(),
             label,
             device,
@@ -117,6 +124,13 @@ impl<P> PadSlots<P> {
 
     pub fn label(&self) -> &'static str {
         self.label
+    }
+
+    /// Show this session's pads to one seat alone (WP-S3 of
+    /// `design/steam-seats-warm-launch-implementation-plan.md`). `None` — the default, and every
+    /// Windows host — leaves them where every process of the user sees them.
+    pub fn expose_in(&mut self, dir: Option<std::path::PathBuf>) {
+        self.seat = dir.map(crate::seat_dev::SeatDev::new);
     }
 
     /// Fold one frame's `active_mask` into the grace clocks, then drop whatever
@@ -177,6 +191,7 @@ impl<P> PadSlots<P> {
             if now.duration_since(since) >= SWEEP_GRACE {
                 tracing::info!(index = i, "controller unplugged ({})", self.label);
                 self.pads[i] = None;
+                self.exposed[i] = None; // the pad went; so does its seat's view of it
                 self.inactive_since[i] = None;
                 swept |= 1 << i;
             }
@@ -190,9 +205,19 @@ impl<P> PadSlots<P> {
         if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return false;
         }
-        match open(idx as u8) {
-            Ok(p) => {
+        // Serialised host-wide: a seat learns which nodes its pad took from what appeared while
+        // it was being made, so no second create may land inside that answer.
+        let _serial = crate::seat_dev::create_lock();
+        let made = match &self.seat {
+            Some(seat) => seat
+                .create(|| open(idx as u8))
+                .map(|(pad, links)| (pad, Some(links))),
+            None => open(idx as u8).map(|pad| (pad, None)),
+        };
+        match made {
+            Ok((p, links)) => {
                 self.pads[idx] = Some(p);
+                self.exposed[idx] = links;
                 self.inactive_since[idx] = None; // unarmed: a new pad is active
                 self.gate.on_success();
                 true

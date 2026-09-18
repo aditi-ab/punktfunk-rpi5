@@ -108,6 +108,9 @@ struct ContentView: View {
     @State private var macDestination: MacDestination = .hosts
     /// What a host window hands over: this window streams, browses, wakes and pairs for it.
     @ObservedObject private var hostRouter = MacHostRouter.shared
+    @Environment(\.openWindow) private var openWindow
+    /// `.key` while this window is the one in front.
+    @Environment(\.controlActiveState) private var controlActiveState
     #endif
     /// Wakes a sleeping host and waits for it to come back online before connecting (drives the
     /// "Waking…" phase of the connect overlay). Available on every platform now that the iOS/tvOS
@@ -119,6 +122,8 @@ struct ContentView: View {
     /// edge-to-edge (behind the notch); windowed respects the top inset so the title bar
     /// never covers the video.
     @State private var isFullscreen = false
+    /// The fullscreen edge and ownership, outliving the controller views SwiftUI rebuilds.
+    @State private var fullscreenEdge = FullscreenController.Edge()
     #endif
     #if os(iOS)
     /// The stats-OFF tier's touch-exit disc window (see the overlay in `stream(captureEnabled:)`
@@ -135,11 +140,11 @@ struct ContentView: View {
     /// one; a configured blob overrides each.
     private var ringConfig: OverlayConfig {
         #if os(macOS)
-        OverlayConfig.parse(SessionSettings.current.overlayActions, platform: .desktop)
+        OverlayConfig.parse(model.settings.overlayActions, platform: .desktop)
         #elseif os(tvOS)
-        OverlayConfig.parse(SessionSettings.current.overlayActions, platform: .tv)
+        OverlayConfig.parse(model.settings.overlayActions, platform: .tv)
         #else
-        OverlayConfig.parse(SessionSettings.current.overlayActions)
+        OverlayConfig.parse(model.settings.overlayActions)
         #endif
     }
     #if !os(macOS)
@@ -166,10 +171,14 @@ struct ContentView: View {
     /// Which host that is, when several are paired. Empty until somebody picks one; with exactly
     /// one paired host the default is derived and this stays empty.
     @AppStorage(DefaultsKey.defaultHost) private var defaultHostID = ""
-    /// The start screen is a once-per-process decision. Set by `applyStartScreen` and by
-    /// `handleDeepLink`, so whichever of the two fires first on a cold start wins and the other
-    /// stands down.
-    @State private var startApplied = false
+    /// The start screen is a once-per-process decision, so a second window never re-runs it. Set
+    /// by `applyStartScreen` and by `handleDeepLink`, so whichever fires first on a cold start
+    /// wins and the other stands down.
+    @MainActor private static var startApplied = false
+    #if os(macOS)
+    /// The intent link a window already took, so every other window lets it be.
+    @MainActor private static weak var takenLink: NSURL?
+    #endif
     /// Background keep-alive (Settings → General, iOS-only). Default OFF (today's freeze-on-background
     /// is the default). When on, backgrounding a live session keeps audio + the connection alive and
     /// drops video, auto-disconnecting after `backgroundTimeoutMinutes`.
@@ -333,7 +342,8 @@ struct ContentView: View {
             if let hold = model.launchHold {
                 LaunchHoldView(
                     entry: hold.entry, host: model.activeHost,
-                    connecting: model.connection == nil, sourceRect: hold.sourceRect,
+                    connecting: model.connection == nil, windowWait: model.launchWindowWait,
+                    sourceRect: hold.sourceRect,
                     onShow: { model.revealStream() })
                     // Its own view per launch — a reused one keeps the last flight's state.
                     .id(hold.seq)
@@ -358,11 +368,12 @@ struct ContentView: View {
         .onChange(of: statsVerbosityRaw) { _, raw in
             model.setStatsVerbosity(StatsVerbosity(rawValue: raw) ?? .normal)
         }
-        // The in-stream cycle (⌃⌥⇧S, the three-finger tap, the Stream menu) is session-local:
-        // it moves only this session's tier, never the stored one.
+        // The in-stream cycle (⌃⌥⇧S, the three-finger tap, a pad chord) moves only the session
+        // it names, never the stored tier.
         .onReceive(NotificationCenter.default.publisher(for: .punktfunkStatsCycled)) { note in
-            guard let raw = note.userInfo?["tier"] as? String else { return }
-            model.setStatsVerbosity(StatsVerbosity(rawValue: raw) ?? .normal)
+            guard let conn = model.connection, note.object == nil || note.object as AnyObject === conn
+            else { return }
+            model.cycleStats()
         }
         #if os(iOS) || os(tvOS)
         // Coming back to the app re-arms the LAN browse. The home's `onAppear`/`onDisappear` do
@@ -443,7 +454,18 @@ struct ContentView: View {
         // tvOS too, and an intent that posts to nobody would be a shortcut that silently does
         // nothing.
         .onReceive(NotificationCenter.default.publisher(for: .punktfunkOpenDeepLink)) { note in
-            if let url = note.object as? URL { handleDeepLink(url) }
+            guard let link = note.object as? NSURL else { return }
+            #if os(macOS)
+            // Every window hears it: the front one takes it now, another only if none did.
+            let wait: TimeInterval = controlActiveState == .key ? 0 : 0.25
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
+                guard Self.takenLink !== link else { return }
+                Self.takenLink = link
+                handleDeepLink(link as URL)
+            }
+            #else
+            handleDeepLink(link as URL)
+            #endif
         }
         .onChange(of: model.phase) { _, phase in
             switch phase {
@@ -515,10 +537,14 @@ struct ContentView: View {
             micAvailable: model.micAvailable,
             micMuted: model.micMuted,
             toggleMicMute: { model.toggleMicMute() },
+            cycleStats: { model.cycleStats() },
+            toggleQuickActions: { if model.phase == .streaming { ring.toggleCentred() } },
             disconnect: { model.disconnect() }))
         // ⌃⌥⇧A fired while input was CAPTURED (InputCapture's chord path posts it — the menu's
-        // identical equivalent can't reach a captured stream). Same toggle either way.
-        .onReceive(NotificationCenter.default.publisher(for: .punktfunkToggleMicMute)) { _ in
+        // identical equivalent can't reach a captured stream). Same toggle either way. It names
+        // its session; iOS's one scene posts none.
+        .onReceive(NotificationCenter.default.publisher(for: .punktfunkToggleMicMute)) { note in
+            guard note.object == nil || note.object as AnyObject === model.connection else { return }
             model.toggleMicMute()
         }
         #endif
@@ -530,7 +556,7 @@ struct ContentView: View {
         // safe-area handling below.
         .background(FullscreenController(
             active: fullscreenForSession && model.connection != nil,
-            isFullscreen: $isFullscreen, appDriven: $appDrivenFullscreen))
+            isFullscreen: $isFullscreen, appDriven: $appDrivenFullscreen, edge: fullscreenEdge))
         #endif
         // A game launched from the library just exited, so the session ended on purpose: put the
         // player back in that host's library rather than on host selection. Set on the outer Group
@@ -551,6 +577,15 @@ struct ContentView: View {
             takeHostRequest()
         }
         .onDisappear { hostRouter.mainWindows -= 1 }
+        // The controllers follow the front window: its stream takes them, or its menus do.
+        .onChange(of: controlActiveState) { _, state in
+            guard state == .key else { return }
+            if model.phase == .streaming {
+                model.claimControllers()
+            } else {
+                GamepadCapture.releaseControllers()
+            }
+        }
         #endif
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
@@ -742,19 +777,33 @@ struct ContentView: View {
         Binding(get: { gamepadUIActive ? libraryTarget : nil }, set: { libraryTarget = $0 })
     }
 
-    /// Run a host window's pending request here, unless another main window took it first.
+    /// Run a host window's pending request here, unless another main window took it first. A
+    /// connect or a pairing needs an idle window: a busy one leaves it to an idle one, then opens
+    /// a window of its own for it.
     private func takeHostRequest() {
-        guard let request = hostRouter.take() else { return }
+        guard let request = hostRouter.pending else { return }
+        switch request {
+        case .connect, .pair:
+            guard !model.isBusy else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    if hostRouter.claimOpening(request) { openWindow(id: PunktfunkClientApp.mainSceneID) }
+                }
+                return
+            }
+        case .browse, .wake:
+            break
+        }
+        _ = hostRouter.take()
         func saved(_ id: StoredHost.ID) -> StoredHost? { store.hosts.first { $0.id == id } }
         switch request {
         case .connect(let id, let selection):
-            if let host = saved(id), !model.isBusy { connect(host, preset: selection) }
+            if let host = saved(id) { connect(host, preset: selection) }
         case .browse(let id):
             if let host = saved(id) { libraryTarget = LibraryTarget(host: host) }
         case .wake(let id):
             if let host = saved(id) { wakeOnly(host) }
         case .pair(let id):
-            if let host = saved(id), !model.isBusy { pairingTarget = host }
+            if let host = saved(id) { pairingTarget = host }
         }
     }
     #endif
@@ -841,7 +890,7 @@ struct ContentView: View {
         // `.onOpenURL` and `.onAppear` have no guaranteed order. Claiming the once-per-process
         // slot here is symmetric with `applyStartScreen`, so either order is benign — if the
         // start already opened a shelf, the link's own rules take over from there.
-        startApplied = true
+        Self.startApplied = true
         let link: DeepLink
         do {
             link = try DeepLink(url: url)
@@ -1284,6 +1333,11 @@ struct ContentView: View {
                             AccessWarningBadge(text: warning)
                                 .transition(.opacity.combined(with: .scale(scale: 0.9)))
                         }
+                        // The host's word on a launch that did not give the player their game.
+                        if captureEnabled, let notice = model.launchNotice {
+                            AccessWarningBadge(text: notice, icon: "exclamationmark.triangle")
+                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                        }
                         #if !os(tvOS)
                         // The access chip — up for a LIMITED session ("Controller only ·
                         // ends in 1 h 58 m") while the stats overlay is on. It rides the
@@ -1318,6 +1372,7 @@ struct ContentView: View {
                     .padding(.bottom, 24)
                     .animation(.easeOut(duration: 0.2), value: model.micMuted)
                     .animation(.easeOut(duration: 0.2), value: model.accessWarning)
+                    .animation(.easeOut(duration: 0.2), value: model.launchNotice)
                     .animation(.easeOut(duration: 0.2), value: model.accessLimited)
                     // The access chip now rides the stats tier, so the tier is a visibility
                     // driver for this stack too — without it the chip pops on the toggle.
@@ -1381,7 +1436,7 @@ struct ContentView: View {
                 // scrim owns every finger while it is up. Mounted only while shown (tenet 1).
                 .overlay {
                     if captureEnabled, model.virtualPadShown, let pad = model.virtualPad {
-                        VirtualPadLayer(config: OverlayConfig.parse(SessionSettings.current.overlayActions).pad,
+                        VirtualPadLayer(config: OverlayConfig.parse(model.settings.overlayActions).pad,
                                         wire: pad)
                     }
                 }
@@ -1413,14 +1468,13 @@ struct ContentView: View {
                 }
                 #endif
                 #if os(macOS)
-                // ⌃⌥⇧O and the Stream menu's Quick Actions item, which post the same notification
-                // whether input is captured (InputCapture's monitor sees the chord first) or not
-                // (the menu's key equivalent fires). Guarded on the phase: the menu item is
-                // disabled off-session, but the chord's monitor is app-wide.
+                // ⌃⌥⇧O while input is captured (InputCapture's monitor sees the chord first). It
+                // names its session; the Stream menu's item goes through `sessionFocus` instead.
                 .onReceive(NotificationCenter.default.publisher(
                     for: .punktfunkToggleQuickActions
-                )) { _ in
-                    guard captureEnabled, model.phase == .streaming else { return }
+                )) { note in
+                    guard captureEnabled, model.phase == .streaming,
+                          note.object as AnyObject === conn else { return }
                     ring.toggleCentred()
                 }
                 #endif
@@ -1439,16 +1493,16 @@ struct ContentView: View {
         RingActions(
             endStream: { [weak model] in model?.disconnect() },
             disconnectLinger: { [weak model] in model?.disconnect(deliberate: false) },
-            touchMode: { TouchInputMode.current },
+            touchMode: { TouchInputMode.current(conn.settings) },
             cycleTouchMode: {
                 // Passthrough is skipped toward a host that drops contacts (§5.4).
                 let order: [TouchInputMode] = conn.hostSupportsTouch ? [.trackpad, .pointer, .touch] : [.trackpad, .pointer]
-                let i = order.firstIndex(of: TouchInputMode.current) ?? 0
+                let i = order.firstIndex(of: TouchInputMode.current(conn.settings)) ?? 0
                 TouchInputMode.sessionOverride = order[(i + 1) % order.count]
             },
             keyboard: { NotificationCenter.default.post(name: .punktfunkShowSoftKeyboard, object: nil) },
             stats: { [model] in model.statsVerbosity },
-            cycleStats: { StatsVerbosity.cycle() },
+            cycleStats: { [model] in model.cycleStats() },
             micAvailable: { [model] in model.micAvailable },
             micMuted: { [model] in model.micMuted },
             toggleMic: { [model] in model.toggleMicMute() },
@@ -1795,9 +1849,9 @@ struct ContentView: View {
     /// auto-connect or any live session (`phase`), a library already open, or a confirmation
     /// waiting for an answer.
     private func applyStartScreen() {
-        guard !startApplied, model.phase == .idle, libraryTarget == nil, deepLinkConfirm == nil
+        guard !Self.startApplied, model.phase == .idle, libraryTarget == nil, deepLinkConfirm == nil
         else { return }
-        startApplied = true
+        Self.startApplied = true
         let start = StartScreen.resolve(
             startIn: startInRaw, defaultHost: defaultHostID, hosts: store.hosts)
         guard let host = start.host else { return }

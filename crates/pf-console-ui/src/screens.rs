@@ -56,6 +56,8 @@ pub struct Ctx<'a> {
     /// mutation (rebase), then `save`.
     pub store: &'a dyn crate::store::SettingsStore,
     pub platform: crate::platform::Platform,
+    /// This device's own screen ([`crate::shell::ConsoleOptions::screen`]).
+    pub screen: Option<crate::shell::DeviceScreen>,
     pub pads: &'a [PadInfo],
     /// Steam Deck: never draw our keyboard — Steam's types via SDL text input.
     pub deck: bool,
@@ -65,6 +67,9 @@ pub struct Ctx<'a> {
     /// This device decodes PyroWave ([`crate::shell::ConsoleOptions::pyrowave_ok`]).
     /// False marks the codec row's PyroWave value unsupported.
     pub pyrowave_ok: bool,
+    /// This device decodes AV1 in hardware ([`crate::shell::ConsoleOptions::av1_ok`]).
+    /// False marks the codec row's AV1 value unsupported: the Hello never asks for it.
+    pub av1_ok: bool,
     /// Name the host stores this client under when pairing.
     pub device_name: &'a str,
     /// Shell clock in seconds (spinners, pulses).

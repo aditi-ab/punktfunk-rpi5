@@ -79,23 +79,19 @@ jobs:
             /usr/local/cargo/git
           key: cargo-home-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - id: target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          # This job builds RELEASE (see the build step) in the same image and target layout as
-          # deb.yml's `build-publish`, so it wants THAT tree — it used to name ci.yml's key, which
-          # holds a debug build and gave it nothing. (Third participant in the collision documented
-          # on ci.yml's `cargo-target-debug-v3-` key.)
-          #
-          # Its OWN exact key with deb's prefix as a FALLBACK restore-key, deliberately: both
-          # workflows run on a v* tag, and an exact-key match would make them race for the single
-          # save slot — this job builds one crate, so if it won that race it would replace deb's
-          # full release tree with a nearly empty one for the rest of the lockfile's life. This way
-          # it always READS the warm tree and never blocks the job that fills it.
+          # A release build in deb.yml's image and layout, so deb's warm tree is the fallback.
+          # Its own exact key: saved under deb's, this one-crate tree would become the newest
+          # entry deb.yml restores.
           key: cargo-target-shots-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-target-shots-release-v1-${{ env.rustc }}-
             cargo-target-release-v3-${{ env.rustc }}-
+      - name: Drop a partial target restore
+        run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-shots-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
 
       - name: Build client
         run: cargo build --release -p punktfunk-client-linux --locked

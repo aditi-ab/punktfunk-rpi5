@@ -285,19 +285,20 @@ struct KindStream {
     frame_samples: usize,
 }
 
-/// Concealment frames to synthesise before decoding `seq`.
+/// Concealment frames to synthesise before decoding `seq`, capped at 50 ms of `frame_samples`
+/// (speaker frames are 10 ms, haptics 5 ms).
 ///
 /// Zero until something has decoded, because there is nothing to size the PLC from yet. The
 /// tracker is fed regardless, so a gap seen before the first real frame cannot resurface later as
 /// a phantom. Pure, and unit-tested.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn plc_frames(gaps: &mut AudioGapTracker, seq: u32, frame_samples: usize) -> u32 {
-    let missing = gaps.missing_before(seq);
     if frame_samples == 0 {
-        0
-    } else {
-        missing
+        gaps.missing_before(seq);
+        return 0;
     }
+    gaps.set_frame_us((frame_samples as u64 * 1_000_000 / SAMPLE_RATE as u64) as u32);
+    gaps.missing_before(seq)
 }
 
 // ---- the USB sink ------------------------------------------------------------------------------
@@ -1051,5 +1052,14 @@ mod tests {
         assert_eq!(plc_frames(&mut g, 1, 480), 0);
         // Sequence 2 and 3 never arrived.
         assert_eq!(plc_frames(&mut g, 4, 480), 2);
+    }
+
+    /// The cap is 50 ms of the stream's own frames, not of the session plane's 5 ms default.
+    #[test]
+    fn plc_caps_a_burst_at_fifty_ms_of_the_decoded_frame() {
+        let mut g = AudioGapTracker::default();
+        assert_eq!(plc_frames(&mut g, 0, 480), 0);
+        assert_eq!(plc_frames(&mut g, 1000, 480), 5, "10 ms speaker frames");
+        assert_eq!(plc_frames(&mut g, 2000, 240), 10, "5 ms haptics frames");
     }
 }

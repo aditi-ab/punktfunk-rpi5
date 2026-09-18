@@ -1,10 +1,18 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { HostView } from "@/sections/Host/view";
 import { compositors, hostInfo } from "./lib/fixtures";
+import { Routed } from "./lib/routed";
 
 const meta = {
 	title: "Pages/Host",
 	component: HostView,
+	decorators: [
+		(Story) => (
+			<Routed>
+				<Story />
+			</Routed>
+		),
+	],
 	args: {
 		host: { data: hostInfo, isLoading: false, error: null },
 		compositors: { data: compositors, isLoading: false, error: null },

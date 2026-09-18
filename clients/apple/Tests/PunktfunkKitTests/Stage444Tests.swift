@@ -21,6 +21,47 @@ final class Stage444Tests: XCTestCase {
         XCTAssertEqual(Stage444Probe.hwDecode444_10bit, Stage444Probe.hwDecode444_10bit)
     }
 
+    /// A 10-bit SDR stream decodes to a 10-bit buffer and stays SDR. The probe blob is plain
+    /// libx265 with no PQ/HLG, which is exactly the shape of a host's 10-bit SDR session
+    /// (Main10 under BT.709): depth comes from the negotiated session, HDR from the transfer
+    /// function. Before the depth axis existed this decoded into an 8-bit buffer.
+    func testVideoDecoderDecodes10BitSdrAsTenBitAndNotHDR() throws {
+        try XCTSkipUnless(
+            Stage444Probe.hwDecode444_10bit, "no hardware 10-bit 4:4:4 decode on this device")
+        let data = Data(Probe444Blobs.au444_10bit)
+        let format = try XCTUnwrap(
+            AnnexB.formatDescription(fromIDR: data, codec: .hevc),
+            "the 10-bit blob must yield a format description")
+        XCTAssertFalse(
+            VideoDecoder.isHDRFormat(format), "the probe blob carries no PQ/HLG transfer")
+        let au = AccessUnit(data: data, ptsNs: 9_000_000, frameIndex: 0, flags: 0, receivedNs: 0)
+
+        let box = FrameBox()
+        let done = DispatchSemaphore(value: 0)
+        let decoder = VideoDecoder(
+            onDecoded: { f in box.lock.lock(); box.frame = f; box.lock.unlock(); done.signal() },
+            onDecodeError: { s in box.lock.lock(); box.error = s; box.lock.unlock(); done.signal() })
+        decoder.setChroma444(true)
+        decoder.setBitDepth(10)
+
+        XCTAssertTrue(decoder.decode(au: au, format: format), "10-bit frame submit should succeed")
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success, "the decode callback must fire")
+        decoder.reset()
+
+        box.lock.lock(); let frame = box.frame; let error = box.error; box.lock.unlock()
+        XCTAssertNil(error.map { "decode error \($0)" })
+        let ready = try XCTUnwrap(frame, "a 10-bit ReadyFrame must be delivered")
+        guard case .video(let buffer, let isHDR) = ready.image else {
+            return XCTFail("a VideoToolbox decode must deliver a .video frame")
+        }
+        let pf = CVPixelBufferGetPixelFormatType(buffer)
+        XCTAssertTrue(
+            pf == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange
+                || pf == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange,
+            "a 10-bit session must decode to a 10-bit buffer, got \(fourCCString(pf))")
+        XCTAssertFalse(isHDR, "10-bit alone is not HDR — this is Main10 under BT.709")
+    }
+
     /// A real 8-bit 4:4:4 HEVC keyframe (the embedded probe blob) decodes through `VideoDecoder` with
     /// `setChroma444(true)` to a 256×256 biplanar 4:4:4 (`444v`/`444f`) buffer classified SDR.
     /// (4:4:4 sessions require a hardware decoder — skip where there isn't one, which is exactly where

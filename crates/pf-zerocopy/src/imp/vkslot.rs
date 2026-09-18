@@ -48,7 +48,8 @@ pub enum SlotFormat {
 }
 
 impl SlotFormat {
-    fn mode(self) -> u32 {
+    /// The layout's number in `cursor_blend.comp` and `convert_img.comp`.
+    pub fn mode(self) -> u32 {
         match self {
             SlotFormat::Argb => 0,
             SlotFormat::Nv12 => 1,
@@ -83,7 +84,9 @@ impl SlotFormat {
             _ => unreachable!("packed formats returned above"),
         }
     }
-    fn rows(self, height: u32) -> u64 {
+    /// Rows the layout holds for `height` luma rows (NV12 adds its chroma rows, YUV444 its
+    /// two extra planes).
+    pub fn rows(self, height: u32) -> u64 {
         if self.is_packed32() {
             return height as u64;
         }
@@ -117,6 +120,8 @@ pub struct VkSlotRef {
 struct SlotAlloc {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    /// Allocation size, what a second OPAQUE_FD import ([`VkSlotBlend::slot_fd`]) must cover.
+    size: u64,
     /// CUDA import of the exported OPAQUE_FD — drop before the Vulkan memory is freed.
     cuda: cuda::ExternalDmabuf,
     cmd: vk::CommandBuffer,
@@ -739,6 +744,7 @@ impl VkSlotBlend {
             self.slots.push(SlotAlloc {
                 buffer,
                 memory,
+                size: reqs.size,
                 cuda: ext,
                 cmd,
                 desc,
@@ -749,6 +755,29 @@ impl VkSlotBlend {
 
     /// Free every slot (encoder teardown). CUDA mappings drop first — `SlotAlloc.cuda`'s `Drop`
     /// runs before the Vulkan objects are freed below.
+    /// A fresh OPAQUE_FD of slot `id`'s memory plus its size, for the zero-copy worker to
+    /// import: its fused convert then writes the very bytes NVENC encodes.
+    pub fn slot_fd(&self, id: usize) -> Result<(std::os::fd::OwnedFd, u64)> {
+        let s = self
+            .slots
+            .get(id)
+            .ok_or_else(|| anyhow!("bad slot id {id}"))?;
+        // SAFETY: `s.memory` is a live exportable allocation of this device.
+        let fd = unsafe {
+            self.ext_fd.get_memory_fd(
+                &vk::MemoryGetFdInfoKHR::default()
+                    .memory(s.memory)
+                    .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
+            )
+        }
+        .context("vkGetMemoryFdKHR(slot, worker)")?;
+        // SAFETY: a fresh descriptor the call just returned; nothing else owns it.
+        Ok((
+            unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) },
+            s.size,
+        ))
+    }
+
     pub fn free_slots(&mut self) {
         // Ordered blends (and fence-wait timeouts) can still be on the queue.
         // `device_wait_idle`, not a timeline wait: a submit whose CUDA copy-done

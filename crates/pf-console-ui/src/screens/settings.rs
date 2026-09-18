@@ -125,6 +125,9 @@ mod android_keys {
     pub const SC2: &str = "android.sc2_capture";
     pub const DS_CAPTURE: &str = "android.ds_capture";
     pub const REDUCE_UI_RES: &str = "android.reduce_ui_resolution";
+    /// With `width`/`height` 0: Native narrowed to clear the cutout. Kotlin's `-2`
+    /// sentinel, which an unsigned size cannot carry.
+    pub const SAFE_AREA_MODE: &str = "android.safe_area_mode";
 }
 
 /// The `Settings::extra` keys the webOS rows share with that client (`services::store::shared`),
@@ -283,12 +286,40 @@ const PRESETS_TAB: usize = TABS.len() - 1;
 pub(crate) const TAB_COUNT: usize = TABS.len();
 
 /// Sizes by family; the Resolution row lists one family at a time.
-use punktfunk_core::resolutions::{aspect_of, nearest, ASPECTS};
+use punktfunk_core::resolutions::{family_of, nearest_in, Family, SAFE_AREA_LABEL, SCREEN_LABEL};
 
-/// The family the Resolution row lists: the stored size's shape, or 16:9 while
-/// the size is Native / Match window / a shape no family has.
-fn family(s: &pf_client_core::trust::Settings) -> usize {
-    aspect_of(s.width, s.height).unwrap_or(0)
+/// The Aspect row's entries: this device's screen and safe area first when no
+/// standard shape has them, then the standard families.
+fn families(screen: Option<crate::shell::DeviceScreen>) -> Vec<Family> {
+    punktfunk_core::resolutions::families(screen.map(|s| s.full), screen.map(|s| s.safe))
+}
+
+/// The entry the Resolution row lists: the stored size's shape. Native (safe
+/// area) and Native read as the device's own entries where it has them;
+/// otherwise, and for a shape none has, the first entry.
+fn family(
+    s: &pf_client_core::trust::Settings,
+    fams: &[Family],
+    platform: crate::platform::Platform,
+) -> usize {
+    let own = |label| fams.iter().position(|f| f.label == label);
+    if s.width == 0 && !s.match_window {
+        let native = if safe_area(s, platform) {
+            own(SAFE_AREA_LABEL).or_else(|| own(SCREEN_LABEL))
+        } else {
+            own(SCREEN_LABEL)
+        };
+        return native.unwrap_or(0);
+    }
+    family_of(fams, s.width, s.height).unwrap_or(0)
+}
+
+/// Android's Native (safe area) resolution. The flag only counts on a native size.
+fn safe_area(s: &pf_client_core::trust::Settings, platform: crate::platform::Platform) -> bool {
+    platform == crate::platform::Platform::Android
+        && s.width == 0
+        && !s.match_window
+        && extra_bool(s, android_keys::SAFE_AREA_MODE, false)
 }
 /// `0` = the panel's native refresh, resolved at connect. Must cover every value the desktop
 /// shells can write: on Linux both write the same client-gtk-settings.json, so a box that set
@@ -390,13 +421,14 @@ const SMOOTH_BUFFERS: [(u8, &str); 4] = [
     (2, "2 frames"),
     (3, "3 frames"),
 ];
-const PAD_TYPES: [(&str, &str); 6] = [
+const PAD_TYPES: [(&str, &str); 7] = [
     ("auto", "Automatic"),
     ("xbox360", "Xbox 360"),
     ("xboxone", "Xbox One"),
     ("dualsense", "DualSense"),
     ("dualshock4", "DualShock 4"),
     ("steamdeck", "Steam Deck"),
+    ("steamcontroller2", "Steam Controller 2"),
 ];
 /// Shared `system_buttons` key. Auto sends to the host except in Gaming Mode,
 /// where Steam on this device would open a second overlay on the same press.
@@ -991,16 +1023,15 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         // DualSense capture — the pad reaches webOS over Bluetooth HID, not hidraw, so the
         // concept is real there too (punktfunk-webos docs/NOTES.md).
         RowId::DsCapture => &[Android, WebOS],
-        // Which pad is player 1 — a question only a client that forwards ONE pad has to answer.
-        // Android's router and the browser's Gamepad API both give every controller its own wire
-        // slot, so there is nothing to pick; webOS is still single-pad and keeps the row.
-        RowId::Pad => &[Desktop, WebOS],
+        // Which pad is player 1 — a question only a client that can narrow forwarding to one pad
+        // has to answer. Android's router, webOS's slot table and the browser's Gamepad API give
+        // every controller its own wire slot, so there is nothing to pick.
+        RowId::Pad => &[Desktop],
         // That client's own audio plane and its remote's missing second button.
         RowId::AudioRoute | RowId::CursorGestures => &[WebOS],
-        // Main10 at BT.709 asks nothing of the panel, and MediaCodec decodes it from the SPS, so
-        // Android obeys this one. The TV does not: NDL decodes what it is given and exposes no
-        // bit-depth ask.
-        RowId::TenBitSdr => &[Desktop, Android],
+        // Main10 at BT.709 asks nothing of the panel, and MediaCodec and NDL both decode it from
+        // the SPS.
+        RowId::TenBitSdr => &[Desktop, Android, WebOS],
         // Decoder choice, chroma and the window-manager knobs: the TV decodes through NDL and has
         // no window manager, so none of these is a control it could obey. The browser is out for
         // the same shape of reason — WebCodecs picks the decoder, a page binds no system chord,
@@ -1071,10 +1102,12 @@ pub fn row_spec(
             settings: &mut resolved,
             store: ctx.store,
             platform: ctx.platform,
+            screen: None,
             pads: ctx.pads,
             deck: ctx.deck,
             fallback_ui: ctx.fallback_ui,
             pyrowave_ok: ctx.pyrowave_ok,
+            av1_ok: ctx.av1_ok,
             device_name: ctx.device_name,
             t: ctx.t,
         };
@@ -1209,13 +1242,22 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Resolution",
             if s.match_window {
                 "Match window".into()
+            } else if safe_area(s, ctx.platform) {
+                "Native (safe area)".into()
             } else if s.width == 0 {
                 "Native".into()
             } else {
                 format!("{} × {}", s.width, s.height)
             },
         ),
-        RowId::Aspect => (None, "Aspect ratio", ASPECTS[family(s)].label.into()),
+        RowId::Aspect => {
+            let fams = families(ctx.screen);
+            (
+                None,
+                "Aspect ratio",
+                fams[family(s, &fams, ctx.platform)].label.into(),
+            )
+        }
         RowId::Refresh => (
             None,
             "Refresh rate",
@@ -1260,6 +1302,8 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Video codec",
             if s.codec == "pyrowave" && !ctx.pyrowave_ok {
                 "PyroWave (unsupported)".into()
+            } else if s.codec == "av1" && !ctx.av1_ok {
+                "AV1 (unsupported)".into()
             } else {
                 label_for(codecs(ctx.platform), &s.codec).into()
             },
@@ -1512,6 +1556,10 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             "This device can't decode PyroWave — it needs a Vulkan 1.3 GPU, which most TV \
              boxes don't have. The session streams HEVC instead."
         }
+        RowId::Codec if ctx.settings.codec == "av1" && !ctx.av1_ok => {
+            "This device has no hardware AV1 decoder, so the client never asks for AV1 — \
+             the session streams HEVC instead."
+        }
         RowId::Codec => "A preference — the host falls back if it can't encode this one.",
         RowId::Decoder => "Automatic picks the best hardware decoder for this GPU, then software.",
         RowId::Hdr => {
@@ -1524,7 +1572,8 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
         }
         RowId::TenBitSdr => {
             "Smoother gradients without HDR — the picture is encoded at 10-bit \
-             precision. Needs an NVIDIA host; HDR takes over when it engages."
+             precision. Needs an NVIDIA or AMD host, or Intel on Linux; HDR takes over \
+             when it engages."
         }
         RowId::PresentPriority => {
             "Lowest latency shows each frame the moment the display can take it — a \
@@ -1784,13 +1833,18 @@ fn audio_format_label(value: &str) -> &'static str {
 /// Toggles: left = off, right = on. A no-op is a boundary.
 pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
     let platform = ctx.platform;
+    let fams = families(ctx.screen);
     let s = &mut *ctx.settings;
     match id {
         RowId::Resolution => {
-            // Native, Match window, then the current family's sizes. Match window
-            // is virtual index 1 (`match_window` flag, w/h cleared).
-            let sizes = ASPECTS[family(s)].sizes;
+            // Native, Native (safe area) on Android, Match window, then the current
+            // family's sizes. The policies before the sizes all clear w/h.
+            let sizes = &fams[family(s, &fams, platform)].sizes;
+            let android = platform == crate::platform::Platform::Android;
+            let matching = if android { 2 } else { 1 };
             let cur = if s.match_window {
+                Some(matching)
+            } else if safe_area(s, platform) {
                 Some(1)
             } else if s.width == 0 {
                 Some(0)
@@ -1798,19 +1852,26 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 sizes
                     .iter()
                     .position(|&wh| wh == (s.width, s.height))
-                    .map(|i| i + 2)
+                    .map(|i| i + matching + 1)
             };
-            step_option(cur, sizes.len() + 2, delta, wrap).map(|i| {
-                s.match_window = i == 1;
-                (s.width, s.height) = if i <= 1 { (0, 0) } else { sizes[i - 2] };
+            step_option(cur, sizes.len() + matching + 1, delta, wrap).map(|i| {
+                s.match_window = i == matching;
+                if android {
+                    set_extra_bool(s, android_keys::SAFE_AREA_MODE, i == 1);
+                }
+                (s.width, s.height) = if i <= matching {
+                    (0, 0)
+                } else {
+                    sizes[i - matching - 1]
+                };
             })
         }
         RowId::Aspect => {
-            // Steps from the family shown, so Native (listed as 16:9) moves on
-            // to 16:10 rather than restating 16:9.
-            step_option(Some(family(s)), ASPECTS.len(), delta, wrap).map(|i| {
+            // Steps from the entry shown, so Native (listed under its own entry)
+            // moves on to the next shape rather than restating the one it reads as.
+            step_option(Some(family(s, &fams, platform)), fams.len(), delta, wrap).map(|i| {
                 s.match_window = false;
-                (s.width, s.height) = nearest(i, s.height);
+                (s.width, s.height) = nearest_in(&fams[i], s.height);
             })
         }
         RowId::Refresh => {
@@ -2116,10 +2177,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2223,10 +2286,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2259,10 +2324,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2321,10 +2388,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2366,10 +2435,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2399,10 +2470,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2428,6 +2501,49 @@ pub(crate) mod tests {
         assert!(!ctx.settings.match_window);
     }
 
+    /// Android's safe-area mode is its own slot after Native: shown by name, and a nudge
+    /// moves off it by one step instead of snapping to Native.
+    #[test]
+    fn android_resolution_row_carries_the_safe_area_mode() {
+        let (mut settings, pads) = ctx_parts();
+        settings
+            .extra
+            .insert(android_keys::SAFE_AREA_MODE.into(), true.into());
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Android,
+            screen: None,
+            pads: &pads,
+            deck: false,
+            fallback_ui: true,
+            pyrowave_ok: true,
+            av1_ok: true,
+            device_name: "t",
+            t: 0.0,
+        };
+        let value = |ctx: &Ctx| row_spec(RowId::Resolution, ctx, &[], &Default::default()).value;
+        let safe = |ctx: &Ctx| extra_bool(ctx.settings, android_keys::SAFE_AREA_MODE, false);
+        assert_eq!(value(&ctx).as_deref(), Some("Native (safe area)"));
+        assert!(adjust(RowId::Resolution, 1, false, &mut ctx));
+        assert!(ctx.settings.match_window, "safe area → Match window");
+        assert!(!safe(&ctx));
+        assert!(adjust(RowId::Resolution, -1, false, &mut ctx));
+        assert!(
+            safe(&ctx) && !ctx.settings.match_window,
+            "back to safe area"
+        );
+        assert!(adjust(RowId::Resolution, -1, false, &mut ctx));
+        assert_eq!((ctx.settings.width, safe(&ctx)), (0, false), "Native");
+        assert_eq!(value(&ctx).as_deref(), Some("Native"));
+        set_extra_bool(ctx.settings, android_keys::SAFE_AREA_MODE, true);
+        (ctx.settings.width, ctx.settings.height) = (1280, 720);
+        assert_eq!(value(&ctx).as_deref(), Some("1280 × 720"), "a size wins");
+    }
+
     /// The Aspect row moves between families at the nearest height; the
     /// Resolution row then steps inside that family only.
     #[test]
@@ -2440,10 +2556,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2474,6 +2592,52 @@ pub(crate) mod tests {
         assert!(!ctx.settings.match_window, "a size clears the policy");
     }
 
+    /// A phone leads the Aspect row with its own screen and safe area, and Native
+    /// (safe area) reads as the latter.
+    #[test]
+    fn a_phone_leads_the_aspect_row_with_its_own_shapes() {
+        let (mut settings, pads) = ctx_parts();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Android,
+            screen: Some(crate::shell::DeviceScreen {
+                full: (3216, 1440),
+                safe: (3088, 1440),
+            }),
+            pads: &pads,
+            deck: false,
+            fallback_ui: false,
+            pyrowave_ok: true,
+            av1_ok: true,
+            device_name: "t",
+            t: 0.0,
+        };
+        let aspect = |ctx: &Ctx| {
+            row_spec(RowId::Aspect, ctx, &[], &Default::default())
+                .value
+                .unwrap_or_default()
+        };
+        assert_eq!(aspect(&ctx), "Screen", "Native lists the screen");
+        set_extra_bool(ctx.settings, android_keys::SAFE_AREA_MODE, true);
+        assert_eq!(aspect(&ctx), "Safe area");
+        assert!(adjust(RowId::Aspect, -1, false, &mut ctx));
+        assert_eq!(
+            (ctx.settings.width, ctx.settings.height),
+            (2412, 1080),
+            "Screen nearest 1080"
+        );
+        assert!(adjust(RowId::Resolution, 1, false, &mut ctx));
+        assert_eq!((ctx.settings.width, ctx.settings.height), (3216, 1440));
+        assert!(adjust(RowId::Aspect, 1, false, &mut ctx));
+        assert_eq!(aspect(&ctx), "Safe area");
+        assert!(adjust(RowId::Aspect, 1, false, &mut ctx));
+        assert_eq!(aspect(&ctx), "16:9");
+    }
+
     #[test]
     fn toggles_read_left_off_right_on() {
         let (mut settings, pads) = ctx_parts();
@@ -2485,10 +2649,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2514,10 +2680,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2549,10 +2717,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::WebOS,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: true,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2577,10 +2747,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Android,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: false,
+            av1_ok: false,
             device_name: "t",
             t: 0.0,
         };
@@ -2609,6 +2781,54 @@ pub(crate) mod tests {
         );
     }
 
+    /// A device with no hardware AV1 decoder never advertises AV1, so the row that still
+    /// says "AV1" is the bug (#1138): the value and the line under it both say it lost.
+    #[test]
+    fn av1_reads_unsupported_without_a_hardware_decoder() {
+        let (mut settings, pads) = ctx_parts();
+        settings.codec = "av1".into();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
+            screen: None,
+            pads: &pads,
+            deck: false,
+            fallback_ui: false,
+            pyrowave_ok: true,
+            av1_ok: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        let value = row_spec(RowId::Codec, &ctx, &[], &Default::default())
+            .value
+            .unwrap();
+        assert_eq!(value, "AV1 (unsupported)");
+        assert!(detail(RowId::Codec, &ctx).contains("no hardware AV1 decoder"));
+
+        // The other codecs keep the plain row and the plain line.
+        ctx.settings.codec = "hevc".into();
+        assert_eq!(
+            row_spec(RowId::Codec, &ctx, &[], &Default::default())
+                .value
+                .unwrap(),
+            "HEVC"
+        );
+        assert!(!detail(RowId::Codec, &ctx).contains("AV1"));
+
+        ctx.settings.codec = "av1".into();
+        ctx.av1_ok = true;
+        assert_eq!(
+            row_spec(RowId::Codec, &ctx, &[], &Default::default())
+                .value
+                .unwrap(),
+            "AV1"
+        );
+    }
+
     #[test]
     fn bitrate_dims_under_pyrowave() {
         let (mut settings, pads) = ctx_parts();
@@ -2621,10 +2841,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2652,10 +2874,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2722,10 +2946,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2755,10 +2981,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2786,10 +3014,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2816,10 +3046,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2847,10 +3079,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: &store,
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2935,10 +3169,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -2986,10 +3222,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -3017,10 +3255,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -3077,7 +3317,7 @@ pub(crate) mod tests {
                 RowId::Decoder,
                 RowId::Chroma444,
                 // TenBitSdr is NOT here: MediaCodec decodes Main10 from the SPS and the depth
-                // asks nothing of the panel, so Android obeys it. webOS still does not.
+                // asks nothing of the panel, so Android obeys it.
                 RowId::Vsync,
                 RowId::AllowVrr,
                 RowId::AudioRoute,
@@ -3283,10 +3523,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -3324,10 +3566,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -3360,10 +3604,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -3400,10 +3646,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -3474,10 +3722,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: crate::store::file_store(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };
@@ -3529,10 +3779,12 @@ pub(crate) mod tests {
             settings: &mut settings,
             store: store.as_ref(),
             platform: crate::platform::Platform::Desktop,
+            screen: None,
             pads: &pads,
             deck: false,
             fallback_ui: false,
             pyrowave_ok: true,
+            av1_ok: true,
             device_name: "t",
             t: 0.0,
         };

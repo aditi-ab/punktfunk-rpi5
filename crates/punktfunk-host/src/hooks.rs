@@ -303,6 +303,28 @@ fn entry_key(h: &HookEntry) -> u64 {
     hasher.finish()
 }
 
+/// The kind matched but the name did not, so this hook stayed silent — say so once per
+/// wanted/seen pair. A display name is neither unique nor fixed (renaming a device changes
+/// it), which is why the console writes `fingerprint`; a hand-written name filter has only
+/// this line to go on. Capped: one event carries one pair, and a host sees few devices.
+fn note_client_mismatch(h: &HookEntry, ev: &crate::events::EventKind, kind: &str) {
+    let Some(want) = h.filter.as_ref().and_then(|f| f.client.as_deref()) else {
+        return;
+    };
+    let Some(got) = ev.client_name().filter(|got| *got != want) else {
+        return;
+    };
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> = OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    if seen.len() < 64 && seen.insert((want.to_string(), got.to_string())) {
+        tracing::info!(
+            on = %h.on, kind, want, got,
+            "hook filtered on a client name the event does not carry — filter on the device's \
+             fingerprint instead"
+        );
+    }
+}
+
 fn dispatch(
     ev: &crate::events::HostEvent,
     sem: &std::sync::Arc<tokio::sync::Semaphore>,
@@ -320,6 +342,7 @@ fn dispatch(
             .unwrap_or(&HookFilter::default())
             .matches(&ev.kind)
         {
+            note_client_mismatch(h, &ev.kind, kind);
             continue;
         }
         if h.debounce_ms > 0 {
@@ -831,14 +854,18 @@ fn webhook_authority(url: &str) -> &str {
         .unwrap_or(authority)
 }
 
-/// Log `url`: `scheme://host[:port]` + [`short_id`]. Path, query, and userinfo dropped —
-/// the token is often a path segment, and `GET /api/v1/logs` serves the ring verbatim.
-fn webhook_origin(url: &str) -> String {
+/// Log `url`: `scheme://host[:port]` + [`short_id`]. Path, query, userinfo and control
+/// characters dropped — the token is often a path segment, and `GET /api/v1/logs` serves the
+/// ring verbatim. Artwork fetches log through this too.
+pub(crate) fn webhook_origin(url: &str) -> String {
     let scheme = url
         .split_once("://")
         .map(|(s, _)| format!("{s}://"))
         .unwrap_or_default();
     format!("{scheme}{} {}", webhook_authority(url), short_id(url))
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
 }
 
 fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
@@ -989,6 +1016,7 @@ mod tests {
                     mode: "2560x1440@120".into(),
                     hdr: true,
                     client: "Living Room TV".into(),
+                    fingerprint: Some("9f86d081".into()),
                     app: Some("steam:570".into()),
                     plane: Plane::Native,
                 },
@@ -1114,6 +1142,20 @@ mod tests {
 
         let f = HookFilter {
             client: Some("Bedroom".into()),
+            ..Default::default()
+        };
+        assert!(!f.matches(&ev.kind));
+
+        // What the console writes: the device's certificate, which a rename leaves alone.
+        // `stream.*` carries it, so the filter that survives a rename works on this kind too.
+        let f = HookFilter {
+            fingerprint: Some("9F86D081".into()),
+            ..Default::default()
+        };
+        assert!(f.matches(&ev.kind), "fingerprint match ignores hex case");
+
+        let f = HookFilter {
+            fingerprint: Some("dead".into()),
             ..Default::default()
         };
         assert!(!f.matches(&ev.kind));
@@ -1398,6 +1440,8 @@ mod tests {
         for secret in ["pw", "zzz", "qqq"] {
             assert!(!creds.contains(secret), "{secret} leaked: {creds}");
         }
+        let forged = webhook_origin("https://cdn.example\r\nforged line/x.png");
+        assert!(!forged.contains(['\r', '\n']), "{forged:?}");
 
         let cmd = "/usr/local/bin/notify.sh --token=SEKRIT-zz 'Living Room'";
         let label = cmd_label(cmd);

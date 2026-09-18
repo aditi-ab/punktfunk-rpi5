@@ -81,6 +81,10 @@ RUN curl -fsSL -o /tmp/sccache.tar.gz \
     && rm -f /tmp/sccache.tar.gz \
     && sccache --version
 
+# Prebuilt Skia for the jobs' SKIA_BINARIES_URL=file:///opt/skia-binaries/…, checked by SHA-256.
+COPY skia-binaries.sh /tmp/
+RUN sh /tmp/skia-binaries.sh x86_64-unknown-linux-gnu && rm /tmp/skia-binaries.sh
+
 # Link x86_64 with mold (see the file's own header for the rustflags-precedence traps).
 #
 # The assertion is the point: an image carrying the flag but NOT the linker would fail every cargo

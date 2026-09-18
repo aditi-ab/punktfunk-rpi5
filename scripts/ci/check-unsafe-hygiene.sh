@@ -164,6 +164,8 @@ fi
 # Baseline: per-file count of process-global-API mentions (call sites AND comments — the grep is
 # the contract; keep it dumb and stable). Regenerate a line with:
 #   grep -c 'env::set_var\|env::remove_var\|sigaction\|setlocale\|set_current_dir' <file>
+# A startup scrub of our OWN credentials is the one shape that belongs here rather than at a
+# spawn site: Command::env_remove leaves them in /proc/self/environ for every same-uid reader.
 cat > "$tmp/gate_c_baseline" <<'BASELINE'
 clients/linux/src/app.rs:1
 clients/linux/src/spawn.rs:1
@@ -182,6 +184,7 @@ crates/pf-win-display/src/win_display.rs:2
 crates/punktfunk-core/src/quic/endpoint.rs:2
 crates/punktfunk-host/src/identity.rs:3
 crates/punktfunk-host/src/library/art.rs:2
+crates/punktfunk-host/src/main.rs:1
 crates/punktfunk-host/src/mgmt/tests.rs:3
 crates/punktfunk-host/src/native.rs:4
 crates/punktfunk-host/src/windows/service.rs:1

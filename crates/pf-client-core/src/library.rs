@@ -256,10 +256,14 @@ pub struct RunningGame {
     pub app_id: Option<String>,
     #[serde(default)]
     pub title: String,
-    /// `launching` | `running` | `exited` | `untracked` | `grace`. A String so an
-    /// unknown host value cannot fail the whole list decode.
+    /// `launching` | `running` | `window` | `exited` | `untracked` | `grace`. A
+    /// String so an unknown host value cannot fail the whole list decode.
     #[serde(default)]
     pub state: String,
+    /// `running`, and the host will report `window` once the game's window is up.
+    /// False from a host that cannot see windows, or predates them.
+    #[serde(default)]
+    pub awaiting_window: bool,
 }
 
 impl RunningGame {

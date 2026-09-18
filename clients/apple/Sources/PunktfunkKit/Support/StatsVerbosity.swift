@@ -1,9 +1,9 @@
 // The stats overlay's tier: Off → Compact → Normal → Detailed, the four every client cycles.
 // `DefaultsKey.statsVerbosity` stores the tier a session STARTS at; the in-stream cycle (⌃⌥⇧S,
-// the three-finger tap, Select + X) moves only the live session.
+// the three-finger tap, Select + X) moves only the session it was pressed in.
 //
 // Lives in PunktfunkKit (not the app) because the kit's input paths (TouchMouse's three-finger
-// tap, InputCapture's captured-state ⌃⌥⇧S) cycle it directly.
+// tap, InputCapture's captured-state ⌃⌥⇧S) ask for the cycle directly.
 
 import Foundation
 import PunktfunkShared
@@ -46,23 +46,12 @@ public enum StatsVerbosity: String, CaseIterable, Sendable {
         UserDefaults.standard.set(tier.rawValue, forKey: DefaultsKey.statsVerbosity)
     }
 
-    /// The tier the LIVE session is showing — its preset's, if one overrode it — falling back to
-    /// the persisted global while idle. What the in-stream cycle advances FROM: cycling in a
-    /// session a preset put on Detailed must go to Off, not to whatever the global happens to be.
-    public static var session: StatsVerbosity {
-        StatsVerbosity(rawValue: SessionSettings.current.statsVerbosity) ?? .normal
-    }
-
-    /// Advance the live session's overlay one tier (⌃⌥⇧S, the three-finger tap, the Stream menu).
-    /// Session-local, as on every client: the stored default stays the tier the next session
-    /// starts at. The app follows `.punktfunkStatsCycled`.
-    public static func cycle() {
-        let next = session.next()
-        SessionSettings.setStatsVerbosity(next.rawValue)
+    /// Ask `connection`'s session to advance its overlay one tier. nil asks every session, for
+    /// the touch and remote paths, which run one session and hold no connection.
+    public static func requestCycle(for connection: AnyObject?) {
         // Observers are views; the gamepad surfaces call from their own queues.
         DispatchQueue.main.async {
-            NotificationCenter.default.post(
-                name: .punktfunkStatsCycled, object: nil, userInfo: ["tier": next.rawValue])
+            NotificationCenter.default.post(name: .punktfunkStatsCycled, object: connection)
         }
     }
 }

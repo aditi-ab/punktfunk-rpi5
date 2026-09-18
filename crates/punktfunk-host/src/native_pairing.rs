@@ -33,12 +33,10 @@ pub use approval::{classify_source, KnockSource, PairingDecision, PendingRequest
 pub use arming::PinAttempt;
 pub use store::{Access, PairedClient};
 
-/// Counts one live session for as long as it is held. Dropping the last one for a device
-/// whose record says "this session" schedules the record's removal, after
-/// [`RECONNECT_GRACE`] and only if nothing reconnected.
-///
-/// A guard, not a pair of calls: a session can end through a return, an error or a task
-/// cancellation, and a count that leaks one of those never falls back to zero.
+/// Counts one live session while held. Last-out for a "this session" record
+/// starts [`RECONNECT_GRACE`]; a later last-out invalidates that waiter so the
+/// window is always from the latest drop. Drop, not a pair of calls: return,
+/// error, or cancel all release the count.
 ///
 /// Named apart from `gamelease::SessionGuard` and `session_status::LiveSessionGuard`, which
 /// count different things in the same binary.
@@ -49,17 +47,16 @@ pub struct SessionCountGuard {
 
 impl Drop for SessionCountGuard {
     fn drop(&mut self) {
-        if self.np.session_ended(&self.fp_hex) > 0 {
+        let Some(last_out) = self.np.session_ended(&self.fp_hex) else {
             return;
-        }
-        // Last one out. The grace has to be waited on somewhere, and Drop cannot await — so
-        // hand it to the runtime this session ran on. Without one (shutdown) the record simply
-        // waits for the next session to end, which is the same state a crash would leave.
+        };
+        // Last one out. Drop cannot await; the runtime this session ran on waits
+        // the grace. No runtime (shutdown): the record stays until the next last-out.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let (np, fp_hex) = (self.np.clone(), self.fp_hex.clone());
-        handle.spawn(async move { np.drop_session_only_after_grace(&fp_hex).await });
+        handle.spawn(async move { np.drop_session_only_after_grace(&fp_hex, last_out).await });
     }
 }
 
@@ -132,9 +129,18 @@ pub struct NativePairing {
     /// Fingerprint (lowercased) → live-session channel. Senders stay after unpair so a
     /// late subscriber cannot race a close; a re-pair publishes on the same channel.
     access_watch: Mutex<HashMap<String, watch::Sender<AccessState>>>,
-    /// Fingerprint (lowercased) → live sessions right now. Only "this session" records read
-    /// it, but every admitted session counts: the guard is what makes the count honest.
-    live: Mutex<HashMap<String, u32>>,
+    /// Live session counts plus last-out generation, keyed by lowercased fingerprint.
+    /// Every admitted session counts; only a "this session" record reads the total.
+    live: Mutex<Live>,
+}
+
+/// Session counts and last-out generations behind one lock so a reconnect cannot
+/// land between "still live?" and "remove the record".
+struct Live {
+    counts: HashMap<String, u32>,
+    /// Bumped when a fingerprint's count hits zero. A grace waiter drops the
+    /// record only if this still matches the generation it started with.
+    last_out: HashMap<String, u64>,
 }
 
 pub struct NativePairingStatus {
@@ -159,7 +165,10 @@ impl NativePairing {
             store: store::TrustStore::open(store_path)?,
             approval: approval::ApprovalQueue::new(),
             access_watch: Mutex::new(HashMap::new()),
-            live: Mutex::new(HashMap::new()),
+            live: Mutex::new(Live {
+                counts: HashMap::new(),
+                last_out: HashMap::new(),
+            }),
         };
         np.drop_session_only_records();
         Ok(np)
@@ -397,13 +406,14 @@ impl NativePairing {
         self.store.set_pad_slot(fp_hex, slot)
     }
 
-    /// Count a live session for `fp_hex` until the returned guard drops. Every admitted session
-    /// counts; only a "this session" record reads the total.
+    /// Hold a live-session count for `fp_hex` until the guard drops. Every admitted
+    /// session counts; only a "this session" record reads the total.
     pub fn session_started(self: &std::sync::Arc<Self>, fp_hex: &str) -> SessionCountGuard {
         *self
             .live
             .lock()
             .unwrap()
+            .counts
             .entry(fp_hex.to_ascii_lowercase())
             .or_insert(0) += 1;
         SessionCountGuard {
@@ -412,41 +422,46 @@ impl NativePairing {
         }
     }
 
-    /// Sessions live for `fp_hex` right now.
+    /// Live sessions for `fp_hex` right now.
     pub fn live_sessions(&self, fp_hex: &str) -> u32 {
         self.live
             .lock()
             .unwrap()
+            .counts
             .get(&fp_hex.to_ascii_lowercase())
             .copied()
             .unwrap_or(0)
     }
 
-    /// Drop one live session, returning how many remain.
-    fn session_ended(&self, fp_hex: &str) -> u32 {
+    /// Drop one live session. `Some(n)` is last-out: the grace waiter must
+    /// carry that generation so a later flap owns the window.
+    fn session_ended(&self, fp_hex: &str) -> Option<u64> {
         let mut live = self.live.lock().unwrap();
         let key = fp_hex.to_ascii_lowercase();
-        let Some(n) = live.get_mut(&key) else {
-            return 0;
-        };
+        let n = live.counts.get_mut(&key)?;
         *n = n.saturating_sub(1);
-        let remaining = *n;
-        if remaining == 0 {
-            live.remove(&key);
+        if *n > 0 {
+            return None;
         }
-        remaining
+        live.counts.remove(&key);
+        let last_out = live.last_out.entry(key).or_insert(0);
+        *last_out += 1;
+        Some(*last_out)
     }
 
-    /// Wait out [`RECONNECT_GRACE`], then remove a "this session" record if the device did not
-    /// come back. Counting and removing share the `live` lock, which [`Self::session_started`]
-    /// is the only other taker of: a device that reconnects inside the grace therefore cannot
-    /// land between the two and be revoked by its own predecessor's cleanup. Lock order is
-    /// live → store → watch and never the reverse.
-    async fn drop_session_only_after_grace(&self, fp_hex: &str) {
+    /// Wait [`RECONNECT_GRACE`], then drop a "this session" record if this last-out
+    /// is still the latest and the device did not come back. `session_started` and
+    /// this waiter share the `live` lock so a reconnect cannot land between the live
+    /// check and the remove. Lock order is live → store → watch.
+    async fn drop_session_only_after_grace(&self, fp_hex: &str, last_out: u64) {
         tokio::time::sleep(RECONNECT_GRACE).await;
         let removed = {
             let live = self.live.lock().unwrap();
-            if live.contains_key(&fp_hex.to_ascii_lowercase()) {
+            let key = fp_hex.to_ascii_lowercase();
+            if live.counts.contains_key(&key) {
+                return;
+            }
+            if live.last_out.get(&key).copied() != Some(last_out) {
                 return;
             }
             match self.store.get(fp_hex) {
@@ -960,6 +975,52 @@ mod tests {
                 "the record goes with the last session"
             );
             assert_eq!(np.effective("dd11", wall_now()), None);
+        });
+    }
+
+    /// A this-session guest who reconnects and drops again gets a full grace from
+    /// the latest drop. The first last-out's timer must not revoke them at the
+    /// original deadline — a Wi-Fi flap that recovers then dies again.
+    #[test]
+    fn this_session_grace_restarts_from_the_latest_drop() {
+        use punktfunk_core::quic::GRANT_GAMEPAD;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_temp, path) = temp();
+            let np =
+                std::sync::Arc::new(NativePairing::load_with(Some(path), None, false).unwrap());
+            np.add_with_access(
+                "Friend's Deck",
+                "aa33",
+                Some(Access {
+                    grants: GRANT_GAMEPAD,
+                    expires_unix: None,
+                    until_disconnect: true,
+                }),
+            )
+            .unwrap();
+
+            let first = np.session_started("aa33");
+            drop(first);
+            // Hold the reconnect across a slice of the first window so that window's
+            // waiter is in flight when this drop starts a second one.
+            let reconnect = np.session_started("aa33");
+            tokio::time::sleep(RECONNECT_GRACE / 2).await;
+            drop(reconnect);
+            // First waiter is due; second still has a slice of grace left.
+            tokio::time::sleep(RECONNECT_GRACE * 3 / 4).await;
+            assert!(
+                np.is_paired("aa33"),
+                "grace is measured from the latest drop, not the first last-out"
+            );
+            tokio::time::sleep(RECONNECT_GRACE * 2).await;
+            assert!(
+                !np.is_paired("aa33"),
+                "the record goes once the latest window closes"
+            );
         });
     }
 

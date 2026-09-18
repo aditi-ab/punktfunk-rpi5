@@ -817,6 +817,9 @@ pub struct AmfEncoder {
     fps: u32,
     bitrate_bps: u64,
     ten_bit: bool,
+    /// BT.2020 PQ (HDR) vs BT.709 (SDR). Independent of `ten_bit`: 10-bit SDR is Main10 under
+    /// BT.709. P010 is the ring for both, so the colour signalling follows this, not the format.
+    hdr: bool,
     /// Lazy from the first frame's device; rebuilt on capturer-device change.
     inner: Option<Inner>,
     bound_device: isize,
@@ -867,6 +870,9 @@ impl AmfEncoder {
         bitrate_bps: u64,
         bit_depth: u8,
         chroma: ChromaFormat,
+        // BT.2020 PQ vs BT.709. Independent of depth: 10-bit SDR is a P010 ring under BT.709. The
+        // caller sets it — P010 is the input for both HDR and 10-bit SDR, so `format` cannot.
+        hdr: bool,
         // Selected render adapter (`None` = OS default); the AV1 probe opens on it.
         adapter_luid: Option<LUID>,
     ) -> Result<Self> {
@@ -910,6 +916,7 @@ impl AmfEncoder {
             fps,
             bitrate_bps,
             ten_bit,
+            hdr,
             inner: None,
             bound_device: 0,
             frame_idx: 0,
@@ -1132,8 +1139,10 @@ impl AmfEncoder {
             }
             Codec::PyroWave => unreachable!("PyroWave never opens the AMF backend"),
         }
-        // BT.709 limited (SDR) or BT.2020 PQ (HDR). Required for HDR — missing PQ washes out.
-        let (profile, transfer, primaries) = if self.ten_bit {
+        // BT.709 limited (SDR, either depth) or BT.2020 PQ (HDR). Keyed on colour, not depth:
+        // 10-bit SDR is Main10 under BT.709. Required for HDR — missing PQ washes out; for SDR the
+        // set is best-effort (the 8-bit arm always was), so the fatal flag is `hdr`, not `ten_bit`.
+        let (profile, transfer, primaries) = if self.hdr {
             (COLOR_PROFILE_2020, TRANSFER_SMPTE2084, PRIMARIES_BT2020)
         } else {
             (COLOR_PROFILE_709, TRANSFER_BT709, PRIMARIES_BT709)
@@ -1142,19 +1151,19 @@ impl AmfEncoder {
             comp,
             p.out_color_profile,
             AmfVariant::from_i64(profile),
-            self.ten_bit,
+            self.hdr,
         )?;
         set_prop(
             comp,
             p.out_transfer,
             AmfVariant::from_i64(transfer),
-            self.ten_bit,
+            self.hdr,
         )?;
         set_prop(
             comp,
             p.out_primaries,
             AmfVariant::from_i64(primaries),
-            self.ten_bit,
+            self.hdr,
         )?;
         Ok((ir_active, ltr_active))
     }
@@ -1675,7 +1684,7 @@ impl AmfEncoder {
         let inner = self.inner.as_mut().expect("ensure_inner succeeded");
         // Re-push HDR metadata on change or rebuild. Best-effort: reject leaves the 0xCE datagram.
         if let Some(name) = self.props.hdr_metadata {
-            if self.ten_bit && inner.hdr_pushed != self.hdr_meta {
+            if self.hdr && inner.hdr_pushed != self.hdr_meta {
                 if let Some(m) = self.hdr_meta {
                     // SAFETY: live context/component pair, encode thread (`push_hdr_metadata`).
                     match unsafe { push_hdr_metadata(inner.ctx.0, inner.comp.0, name, &m) } {
@@ -2311,6 +2320,7 @@ mod tests {
             2_000_000,
             8,
             ChromaFormat::Yuv420,
+            false,
             None,
         ) {
             Ok(e) => e,
@@ -2372,6 +2382,7 @@ mod tests {
             2_000_000,
             8,
             ChromaFormat::Yuv420,
+            false,
             None,
         ) {
             Ok(e) => e,
@@ -2457,6 +2468,7 @@ mod tests {
                 2_000_000,
                 8,
                 ChromaFormat::Yuv420,
+                false,
                 None,
             ) {
                 Ok(e) => e,
@@ -2569,6 +2581,7 @@ mod tests {
             2_000_000,
             8,
             ChromaFormat::Yuv420,
+            false,
             None,
         ) {
             Ok(e) => e,
@@ -2708,6 +2721,7 @@ mod tests {
             mbps * 1_000_000,
             8,
             ChromaFormat::Yuv420,
+            false,
             None,
         )
         .expect("AMF open");
@@ -2847,6 +2861,7 @@ mod tests {
             2_000_000,
             8,
             ChromaFormat::Yuv420,
+            false,
             None,
         )
         .expect("native AMF open");
@@ -2948,6 +2963,7 @@ mod tests {
             4_000_000,
             10,
             ChromaFormat::Yuv420,
+            true,
             None,
         ) {
             Ok(e) => e,
@@ -3008,6 +3024,213 @@ mod tests {
         if !mastering {
             eprintln!("note: no mastering-display SEI found on this VCN/driver — client falls back to the 0xCE datagram");
         }
+    }
+
+    /// Live 10-bit SDR: P010 HEVC Main10 under BT.709 (no HDR volume). Confirms the colour untie —
+    /// the encoder must NOT emit mastering/CLL SEI, and (via `AMF_SDR10_DUMP=<path>` + ffprobe) the
+    /// SPS VUI signals BT.709, not BT.2020 PQ. Same P010 ring as the HDR path; only the colour
+    /// differs.
+    #[test]
+    fn amf_sdr10_encode_live_smoke() {
+        use windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE;
+        if let Err(e) = try_factory() {
+            eprintln!("skipping: AMF runtime unavailable ({e})");
+            return;
+        }
+        let Some(device) = amd_d3d11_device() else {
+            eprintln!("skipping: no AMD adapter on this box");
+            return;
+        };
+        let (w, h, fps) = (640u32, 480u32, 60u32);
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_P010,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex: Option<ID3D11Texture2D> = None;
+        // SAFETY: CreateTexture2D fills the out-param only on success; owned COM, this thread.
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }.expect("P010 texture");
+        let tex = tex.expect("P010 texture");
+        let mut enc = match AmfEncoder::open(
+            Codec::H265,
+            PixelFormat::P010,
+            w,
+            h,
+            fps,
+            4_000_000,
+            10,
+            ChromaFormat::Yuv420,
+            false, // SDR: BT.709, not BT.2020 PQ
+            None,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skipping: native AMF 10-bit SDR open declined ({e:#})");
+                return;
+            }
+        };
+        // No set_hdr_meta: a 10-bit SDR session carries no HDR volume.
+        let mut aus: Vec<EncodedFrame> = Vec::new();
+        for i in 0..6 {
+            let frame = CapturedFrame {
+                provenance: Default::default(),
+                width: w,
+                height: h,
+                pts_ns: 1 + i as u64,
+                format: PixelFormat::P010,
+                payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
+                    texture: tex.clone(),
+                    device: device.clone(),
+                    pyro: None,
+                }),
+                cursor: None,
+            };
+            enc.submit(&frame).expect("submit (P010 SDR)");
+            if let Some(au) = enc.poll().expect("poll") {
+                aus.push(au);
+            }
+        }
+        assert!(!aus.is_empty(), "10-bit SDR encode produced no AUs");
+        let idr = &aus[0];
+        assert!(idr.keyframe, "first AU must be an IDR");
+        // No mastering (137) / CLL (144) prefix SEI on an SDR stream.
+        let mut hdr_sei = false;
+        for i in 0..idr.data.len().saturating_sub(5) {
+            let d = &idr.data[i..];
+            let nal = if d.starts_with(&[0, 0, 1]) {
+                &d[3..]
+            } else if d.starts_with(&[0, 0, 0, 1]) {
+                &d[4..]
+            } else {
+                continue;
+            };
+            if nal.len() >= 3 && nal[0] == 0x4E && nal[1] == 0x01 && matches!(nal[2], 137 | 144) {
+                hdr_sei = true;
+            }
+        }
+        assert!(
+            !hdr_sei,
+            "a 10-bit SDR stream must not carry HDR mastering/CLL SEI"
+        );
+        if let Ok(path) = std::env::var("AMF_SDR10_DUMP") {
+            let full: Vec<u8> = aus.iter().flat_map(|a| a.data.iter().copied()).collect();
+            let _ = std::fs::write(&path, &full);
+            eprintln!(
+                "amf_sdr10: wrote {path} ({} bytes, {} AUs)",
+                full.len(),
+                aus.len()
+            );
+        }
+        eprintln!(
+            "live AMF HEVC Main10 SDR: {} AUs, IDR {} bytes, hdr_sei={hdr_sei}",
+            aus.len(),
+            idr.data.len()
+        );
+    }
+
+    /// Live: the D3D11 video processor converts 8-bit BGRA to a P010 target under BT.709 studio on
+    /// AMD. This is the SDR-10 converter half (`EncodeInput::P010Sdr`) — the "renders green" caveat
+    /// on RGB→P010 is NVIDIA-only, so prove AMD writes plausible luma. Mid-grey in → studio Y near
+    /// 504 (10-bit); a failed render is black (0) or clipped.
+    #[test]
+    fn videoconverter_bgra_to_p010_bt709_live() {
+        use crate::convert::VideoConverter;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+            D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SUBRESOURCE_DATA, D3D11_USAGE_STAGING,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+        let Some(device) = amd_d3d11_device() else {
+            eprintln!("skipping: no AMD adapter on this box");
+            return;
+        };
+        let (w, h) = (256u32, 256u32);
+        // SAFETY: the device is live on this thread.
+        let ctx = unsafe { device.GetImmediateContext() }.expect("immediate context");
+
+        // BGRA filled mid-grey (128,128,128,255), one subresource upload.
+        let pixels = vec![128u8; (w * h * 4) as usize];
+        let bgra_desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            // Match the driver's captured-BGRA binds (`Targets::new` InputKind::Bgra); a
+            // shader-resource-only texture is not a valid video-processor input surface on AMD.
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr() as *const _,
+            SysMemPitch: w * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut bgra: Option<ID3D11Texture2D> = None;
+        // SAFETY: descriptor + init data are fully populated; out-param filled on success.
+        unsafe { device.CreateTexture2D(&bgra_desc, Some(&init), Some(&mut bgra)) }
+            .expect("BGRA texture");
+        let bgra = bgra.expect("BGRA texture");
+
+        let p010_desc = D3D11_TEXTURE2D_DESC {
+            Format: DXGI_FORMAT_P010,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            ..bgra_desc
+        };
+        let mut p010: Option<ID3D11Texture2D> = None;
+        // SAFETY: as above.
+        unsafe { device.CreateTexture2D(&p010_desc, None, Some(&mut p010)) }.expect("P010 texture");
+        let p010 = p010.expect("P010 texture");
+
+        let conv = VideoConverter::new(&device, &ctx, w, h, false).expect("VideoConverter");
+        // The load-bearing assertion: AMD's video processor accepts a P010 output view.
+        conv.convert(&bgra, &p010)
+            .expect("BGRA->P010 on the AMD video processor (a green render would still Ok here)");
+
+        // Read back the Y plane's first sample through a staging copy.
+        let stag_desc = D3D11_TEXTURE2D_DESC {
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            ..p010_desc
+        };
+        let mut stag: Option<ID3D11Texture2D> = None;
+        // SAFETY: as above.
+        unsafe { device.CreateTexture2D(&stag_desc, None, Some(&mut stag)) }.expect("staging P010");
+        let stag = stag.expect("staging P010");
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: `stag` and `p010` are live same-device textures; `ctx` is their immediate context.
+        // `Map` fills `mapped`; `Unmap` releases it before the function returns.
+        let y10 = unsafe {
+            ctx.CopyResource(&stag, &p010);
+            ctx.Map(&stag, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .expect("map staging");
+            // P010 Y plane: row 0, first 16-bit sample; the 10-bit code sits in the high bits.
+            let sample = *(mapped.pData as *const u16);
+            ctx.Unmap(&stag, 0);
+            sample >> 6
+        };
+        eprintln!("VideoConverter BGRA(128)->P010 on AMD: Y10={y10} (expect ~504 studio grey)");
+        assert!(
+            (400..=620).contains(&y10),
+            "P010 luma {y10} off BT.709 studio grey — the AMD video processor mis-rendered P010"
+        );
     }
 
     /// Live intra-refresh property on a scratch component (does not mutate process env).
@@ -3090,6 +3313,7 @@ mod tests {
             2_000_000,
             8,
             ChromaFormat::Yuv420,
+            false,
             None,
         ) {
             Ok(e) => e,

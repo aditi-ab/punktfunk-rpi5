@@ -197,6 +197,9 @@ pub(super) struct SendStats {
     /// Frames the Windows driver dropped at its pool, session-cumulative. Written by the
     /// encode thread from the driver's telemetry; stays 0 off the driver.
     pub(super) driver_dropped: Arc<AtomicU64>,
+    /// Sealed wire bytes go here each aggregation tick; the control task diffs them into the
+    /// per-minute `link health` line's `egress_mbps`.
+    pub(super) counters: Arc<crate::session_status::SessionCounters>,
 }
 
 /// Whether this session may accept a mid-stream `Reconfigure`.
@@ -469,6 +472,7 @@ pub(super) fn send_loop(
             let s = session.stats();
             let secs = last_perf.elapsed().as_secs_f64();
             let tx_mbps = (s.bytes_sent - last_bytes) as f64 * 8.0 / secs / 1_000_000.0;
+            stats.counters.link.publish_egress_bytes(s.bytes_sent);
             // One window of seal timing feeds both the perf line and the recorder. It runs only
             // while one of them reads it.
             let seal_perf = session.take_seal_perf();

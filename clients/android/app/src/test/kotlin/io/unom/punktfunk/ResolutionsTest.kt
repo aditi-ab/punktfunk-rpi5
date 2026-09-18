@@ -40,6 +40,24 @@ class ResolutionsTest {
         assertEquals(1600 to 1200, Resolutions.nearest(5, 1000))
     }
 
+    /** A OnePlus 9 Pro: 3216×1440, 127 px of cutout on one side. Twin of the core test. */
+    @Test
+    fun aPhoneLeadsWithItsScreenAndSafeArea() {
+        val f = Resolutions.families(3216 to 1440, 3088 to 1440)
+        assertEquals(listOf("Screen", "Safe area", "16:9"), f.take(3).map { it.label })
+        assertEquals(listOf(1608 to 720, 2412 to 1080, 3216 to 1440), f[0].sizes)
+        assertEquals(listOf(1544 to 720, 2316 to 1080, 3088 to 1440), f[1].sizes)
+        assertEquals(0, Resolutions.familyOf(f, 2412, 1080))
+        assertEquals(1, Resolutions.familyOf(f, 2316, 1080))
+        assertEquals(2, Resolutions.familyOf(f, 1920, 1080))
+        // Native and the safe-area mode list their own entries; a 2412 × 1080 pick is a preset.
+        assertEquals(0, Settings(width = 0, height = 0).resolutionFamily(f))
+        assertEquals(1, Settings(width = SAFE_AREA_MODE, height = SAFE_AREA_MODE).resolutionFamily(f))
+        assertTrue(!Settings(width = 2412, height = 1080).isCustomResolution(f))
+        // A standard screen adds nothing.
+        assertEquals(Resolutions.ASPECTS.size, Resolutions.families(1920 to 1080, 1920 to 1080).size)
+    }
+
     @Test
     fun customIsWhatNoFamilyLists() {
         assertTrue(Settings(width = 1500, height = 1000).isCustomResolution())

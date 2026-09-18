@@ -121,8 +121,8 @@ two wrong results: the host's speakers stay silent because the stream owns the o
 **Keep host audio playing** on a client, everyone hears everything — the friends' own voices
 included, a beat late. That is routing, not echo: Discord's playback is inside the captured mix.
 
-Two lines in `host.env` on a Linux host give the shape you want — you and the friends hear the
-game, the friends never hear themselves:
+Two lines in `host.env` give the shape you want on Linux and Windows — you and the friends hear
+the game, the friends never hear themselves:
 
 ```ini
 PUNKTFUNK_AUDIO_OUTPUT_MODE=host_and_client
@@ -131,9 +131,11 @@ PUNKTFUNK_AUDIO_VOICE_CHAT=host
 
 The first plays the stream's sound on the host's speakers too. The second keeps Discord, Vesktop,
 WebCord, ArmCord, Legcord, TeamSpeak and Mumble on those speakers and out of the stream; for
-Discord in a browser tab add the browser with `PUNKTFUNK_AUDIO_VOICE_APPS=discord,firefox`.
-Restart the host after editing `host.env`. If one friend should not hear the game at all, the
-console's **Session** card mutes a single session.
+Discord in a browser tab add the browser with `PUNKTFUNK_AUDIO_VOICE_APPS=firefox`. Restart the
+host after editing `host.env`. On Windows this needs the silent virtual output the host mints
+from Steam's streaming drivers; without Steam, the game plays on your speakers and the split
+cannot happen. If one friend should not hear the game at all, the console's **Session** card
+mutes a single session.
 
 ## What not to use
 

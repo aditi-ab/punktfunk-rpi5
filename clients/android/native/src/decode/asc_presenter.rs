@@ -62,9 +62,10 @@ const AWAITING_CAP: usize = 8;
 const FENCE_PATIENCE_NS: i64 = 200_000_000;
 
 /// One image acquired from the reader, held until it is presented (or dropped as a newest-wins
-/// eviction). Carries the decode stamps paired by pts for the latency metrics.
+/// eviction). An unpresented image returns with its acquire fence as the release fence, so the
+/// codec cannot reuse its buffer before its write finishes.
 struct Acquired {
-    image: Image,
+    image: Option<Image>,
     buffer: HardwareBuffer,
     fence: Option<OwnedFd>,
     pts_us: u64,
@@ -72,6 +73,36 @@ struct Acquired {
     decoded_real: i128,
     /// The source's due time on the cadence grid (`CLOCK_MONOTONIC`), `None` under latency.
     due_ns: Option<i64>,
+}
+
+impl Acquired {
+    /// Transfer a presented image out after SurfaceFlinger has consumed its acquire fence.
+    fn take_presented_image(&mut self) -> Image {
+        debug_assert!(
+            self.fence.is_none(),
+            "presented image still owns its acquire fence"
+        );
+        self.image
+            .take()
+            .expect("acquired image already transferred")
+    }
+}
+
+impl Drop for Acquired {
+    fn drop(&mut self) {
+        let Some(image) = self.image.take() else {
+            return;
+        };
+        release_image(image, self.fence.take());
+    }
+}
+
+/// Return an unused image only after the codec's pending write finishes.
+fn release_image(image: Image, fence: Option<OwnedFd>) {
+    match fence {
+        Some(fence) => image.delete_async(fence),
+        None => drop(image),
+    }
 }
 
 /// One image applied to SurfaceFlinger, awaiting its completion (metrics) and its successor's
@@ -161,6 +192,8 @@ pub(super) struct AscBackend {
 
     /// `ADataSpace` for the transaction (BT709 for SDR — never untagged; see `color_dataspace`).
     dataspace: i32,
+    /// The session's HDR10 volume, sent with every transaction. `None` on SDR.
+    hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
     /// Layer frame-rate vote (source Hz), applied once.
     frame_rate: f32,
     src_w: i32,
@@ -312,6 +345,7 @@ impl AscBackend {
             #[cfg(debug_assertions)]
             rng: 0x9E37_79B9_7F4A_7C15,
             dataspace,
+            hdr_meta: None,
             frame_rate: if source_hz > 0 { source_hz as f32 } else { 0.0 },
             src_w: src_w.max(1),
             src_h: src_h.max(1),
@@ -483,9 +517,10 @@ impl AscBackend {
             &frame.buffer,
             self.src_w,
             self.src_h,
-            frame.fence.take(),
+            &mut frame.fence,
             target,
             self.dataspace,
+            self.hdr_meta.as_ref(),
             // The layer's fixed-source rate — applied once, at layer config (see `Layer::present`).
             self.frame_rate,
             seq,
@@ -497,9 +532,10 @@ impl AscBackend {
         let release_real = now_realtime_ns();
         let pace_us = ((release_real - frame.decoded_real).max(0) / 1000) as u64;
         self.pace_us.push(pace_us);
+        let image = frame.take_presented_image();
         self.presented.push_back(Presented {
             seq,
-            image: frame.image,
+            image,
             pts_us: frame.pts_us,
             decoded_real: frame.decoded_real,
             release_real,
@@ -540,7 +576,7 @@ impl AscBackend {
     fn drain_reader(&mut self) {
         if self.fifo_capacity == 0 {
             // Newest-wins: collapse the burst to the freshest buffer ourselves. Each superseded
-            // candidate drops here — its image returns to the pool, its own acquire fence closes.
+            // candidate returns with its acquire fence, so the codec cannot reuse it too early.
             while let Some(acq) = self.acquire() {
                 if self.candidate.replace(acq).is_some() {
                     self.skipped += 1; // an un-presented candidate was superseded
@@ -561,9 +597,8 @@ impl AscBackend {
     /// Acquire the next image and pair its decode stamps + cadence due. `None` when the reader is
     /// empty or a transient acquire error occurs.
     fn acquire(&mut self) -> Option<Acquired> {
-        // SAFETY: we never touch the image's pixels — the acquire fence is handed straight to
-        // SurfaceFlinger via `setBuffer`, which is exactly the "await before access" the async
-        // acquire requires.
+        // SAFETY: we never touch the image's pixels. Its acquire fence goes to SurfaceFlinger when
+        // presented or back to AImageReader as the release fence when discarded.
         let res = unsafe { self.reader.acquire_next_image_async() };
         let (image, fence) = match res {
             Ok(AcquireResult::Image(pair)) => pair,
@@ -577,7 +612,8 @@ impl AscBackend {
             Ok(b) => b,
             Err(e) => {
                 log::warn!("asc: image has no hardware buffer: {e:?}");
-                return None; // `image` drops here → back to the pool
+                release_image(image, fence);
+                return None;
             }
         };
         // The buffer timestamp is the pts the codec echoed (ns); pair the parked decode stamps.
@@ -594,7 +630,7 @@ impl AscBackend {
             )
         });
         Some(Acquired {
-            image,
+            image: Some(image),
             buffer,
             fence,
             pts_us,
@@ -838,9 +874,8 @@ impl AscBackend {
         self.coalesced = 0;
     }
 
-    /// Teardown: drop every held image (candidate, FIFO, and still-presented) back to the pool
-    /// before the reader + codec go away. Plain deletes — SurfaceFlinger releases its own refs as
-    /// it finishes, so this is memory-safe without waiting on the fences.
+    /// Teardown: return every held image before the reader and codec go away. Unpresented images
+    /// retain their acquire fences; SurfaceFlinger owns refs to the presented images until done.
     pub(super) fn release_all(&mut self) {
         self.candidate = None;
         self.fifo.clear();
@@ -850,9 +885,14 @@ impl AscBackend {
 }
 
 impl AscBackend {
+    /// The HDR10 volume sent with every subsequent transaction.
+    pub(super) fn set_hdr_meta(&mut self, meta: Option<punktfunk_core::quic::HdrMeta>) {
+        self.hdr_meta = meta;
+    }
+
     /// Update the `ADataSpace` applied to every subsequent transaction (a refinement from the
-    /// codec's output format — the analogue of the SurfaceView path's `apply_hdr_dataspace`; the
-    /// negotiated colour set the initial value at create).
+    /// codec's output format — the analogue of the SurfaceView path's `apply_reported_dataspace`;
+    /// the negotiated colour set the initial value at create).
     pub(super) fn set_dataspace(&mut self, dataspace: i32) {
         if self.dataspace != dataspace {
             self.dataspace = dataspace;

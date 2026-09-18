@@ -30,7 +30,7 @@ import {
 	reconcileSharedSdk,
 	removePlugins,
 } from "./plugins.js";
-import { discoverUnits, runner } from "./runner.js";
+import { discoverUnits, runner, runOneUnit } from "./runner.js";
 
 const arg = (flag: string): string | undefined => {
 	const i = process.argv.indexOf(flag);
@@ -148,6 +148,30 @@ switch (process.argv[2]) {
 		}
 		process.exit(0);
 	}
+}
+
+// ---- one unit, inside its sandbox (spawned by the supervisor; never run by hand) --------------
+//
+// The other half of `runner.ts`'s sandbox: `bwrap` re-execs this bundle with one unit to run, so a
+// plugin's code gets a process — and a token — of its own. Everything it can see was decided by
+// the argv on the outside; there is nothing left to enforce in here. The exit code is how the
+// supervisor learns the plugin failed, and what makes it restart on the usual backoff.
+const runUnit = arg("--run-unit");
+if (runUnit) {
+	const unit = { name: arg("--unit-name") ?? runUnit, file: runUnit };
+	const unitShipper = installLogShipper();
+	const unitFiber = Effect.runFork(runOneUnit(unit));
+	const stopUnit = (): void => {
+		void Effect.runPromise(Fiber.interrupt(unitFiber));
+	};
+	process.on("SIGTERM", stopUnit);
+	process.on("SIGINT", stopUnit);
+	const failed = await Effect.runPromise(Fiber.await(unitFiber)).then(
+		(exit) => exit._tag !== "Success",
+	);
+	await unitShipper.flush();
+	unitShipper.stop();
+	process.exit(failed ? 1 : 0);
 }
 
 // ---- run the runner (default; --list keeps the legacy unit-listing behavior) ------------------

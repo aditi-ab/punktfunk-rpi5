@@ -158,6 +158,12 @@ public final class GamepadMenuInput {
     /// needed) — a disconnect/reconnect or a controller switch is just picked up on the next poll.
     private func poll() {
         guard isActive else { return }
+        // A stream in another window owns the pad. What is held when it hands back is adopted.
+        guard !manager.streamOwnsPads else {
+            needsSnapshot = true
+            updateDirection(nil)
+            return
+        }
         guard let pad = livePad() else {
             // The controller went away mid-press. Returning here would leave a held direction's
             // repeat timer running forever, walking the list to its end and bumping there every

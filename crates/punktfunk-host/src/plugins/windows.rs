@@ -12,10 +12,15 @@ use super::*;
 /// `NT AUTHORITY\LocalService` in icacls SID form.
 pub(super) const LOCAL_SERVICE_SID: &str = "*S-1-5-19";
 
-/// Secrets the runner may read: scoped `plugin-token` and the TLS-pin cert
-/// (`native-cert.pem` after the identity split, else `cert.pem`). Never `mgmt-token`.
-/// Absent files are skipped, so listing both certs is safe on either host.
-const RUNNER_SECRET_FILES: [&str; 3] = ["plugin-token", "native-cert.pem", "cert.pem"];
+/// Secrets the runner may read: the scoped `plugin-token`, the per-plugin tokens it hands each
+/// sandboxed plugin, and the TLS-pin cert (`native-cert.pem` after the identity split, else
+/// `cert.pem`). Never `mgmt-token`. Absent files are skipped, so listing both certs is safe.
+const RUNNER_SECRET_FILES: [&str; 4] = [
+    "plugin-token",
+    "plugin-tokens.json",
+    "native-cert.pem",
+    "cert.pem",
+];
 
 /// Unit dirs the runner imports. Inheritable `(RX,WA)`: bun's loader opens unit
 /// files with FILE_WRITE_ATTRIBUTES; plain `(RX)` is EPERM on every import. WA
@@ -447,118 +452,4 @@ pub(super) fn restart_runtime() -> Result<()> {
         "Stop-ScheduledTask -TaskName {TASK} -ErrorAction SilentlyContinue; \
          Start-ScheduledTask -TaskName {TASK} -ErrorAction Stop"
     ))
-}
-
-/// Whether the process listening on `127.0.0.1:port` runs as LocalService, the runner's
-/// principal. A registration outlives its plugin by up to the lease TTL, and a local user who
-/// binds the freed port would otherwise receive the UI secret and answer the launch.
-#[cfg(not(test))]
-pub(crate) fn listener_is_runner(port: u16) -> bool {
-    loopback_listener_pid(port).is_some_and(runs_as_local_service)
-}
-
-/// Owning pid of the IPv4 listener on `127.0.0.1:port`, if there is one.
-#[cfg(not(test))]
-fn loopback_listener_pid(port: u16) -> Option<u32> {
-    use ::windows::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
-        TCP_TABLE_OWNER_PID_LISTENER,
-    };
-    use ::windows::Win32::Networking::WinSock::AF_INET;
-
-    let mut size: u32 = 0;
-    // SAFETY: a null table with a zero size is the documented size query; `size` is a live local.
-    let _ = unsafe {
-        GetExtendedTcpTable(
-            None,
-            &mut size,
-            false,
-            u32::from(AF_INET.0),
-            TCP_TABLE_OWNER_PID_LISTENER,
-            0,
-        )
-    };
-    if size == 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; size as usize];
-    // SAFETY: `buf` is at least the size the query asked for and outlives the call; the table
-    // is read back only up to `dwNumEntries`, which the call wrote.
-    let rc = unsafe {
-        GetExtendedTcpTable(
-            Some(buf.as_mut_ptr().cast()),
-            &mut size,
-            false,
-            u32::from(AF_INET.0),
-            TCP_TABLE_OWNER_PID_LISTENER,
-            0,
-        )
-    };
-    if rc != 0 || (size as usize) > buf.len() {
-        return None;
-    }
-    let table = buf.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
-    // SAFETY: the buffer holds a `MIB_TCPTABLE_OWNER_PID` header followed by `dwNumEntries`
-    // rows, per the successful call above; the row count is bounded by the buffer length.
-    let (entries, rows) = unsafe {
-        let n = (*table).dwNumEntries as usize;
-        let first = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
-        let max =
-            (buf.len() - std::mem::size_of::<u32>()) / std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
-        (n.min(max), first)
-    };
-    let loopback = u32::from_be(u32::from_be_bytes([127, 0, 0, 1]));
-    for i in 0..entries {
-        // SAFETY: `i < entries`, and every row up to `entries` lies inside `buf`.
-        let row = unsafe { &*rows.add(i) };
-        // Both fields are network byte order in the low 16 / 32 bits.
-        let local_port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
-        if local_port == port && (row.dwLocalAddr == loopback || row.dwLocalAddr == 0) {
-            return Some(row.dwOwningPid);
-        }
-    }
-    None
-}
-
-/// Whether `pid`'s primary token belongs to `NT AUTHORITY\LocalService`.
-#[cfg(not(test))]
-fn runs_as_local_service(pid: u32) -> bool {
-    use ::windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use ::windows::Win32::Security::{
-        GetTokenInformation, IsWellKnownSid, TokenUser, WinLocalServiceSid, TOKEN_QUERY, TOKEN_USER,
-    };
-    use ::windows::Win32::System::Threading::{
-        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    // SAFETY: plain handle plumbing. Every handle opened here is closed on every path, and
-    // the token buffer is sized by the first query before the second call fills it.
-    unsafe {
-        let Ok(proc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
-            return false;
-        };
-        let mut token = HANDLE::default();
-        let opened = OpenProcessToken(proc, TOKEN_QUERY, &mut token).is_ok();
-        let _ = CloseHandle(proc);
-        if !opened {
-            return false;
-        }
-        let mut len = 0u32;
-        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
-        let mut buf = vec![0u8; len as usize];
-        let read = GetTokenInformation(
-            token,
-            TokenUser,
-            Some(buf.as_mut_ptr().cast()),
-            len,
-            &mut len,
-        )
-        .is_ok();
-        let _ = CloseHandle(token);
-        if !read || buf.len() < std::mem::size_of::<TOKEN_USER>() {
-            return false;
-        }
-        let user = &*buf.as_ptr().cast::<TOKEN_USER>();
-        IsWellKnownSid(user.User.Sid, WinLocalServiceSid).as_bool()
-    }
 }

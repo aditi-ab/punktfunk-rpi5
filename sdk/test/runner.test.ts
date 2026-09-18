@@ -8,6 +8,7 @@ import * as path from "node:path";
 import {
 	discoverUnits,
 	runner,
+	spawnAgainIfKilled,
 	superviseUnit,
 	windowsSddlUnsafeReason,
 } from "../src/runner.js";
@@ -186,6 +187,26 @@ describe("discovery", () => {
 	});
 });
 
+describe("spawnAgainIfKilled (the ACL read's guard against a misfired timeout)", () => {
+	const scripted = (...statuses: (number | null)[]) => {
+		const seen: (number | null)[] = [];
+		const last = spawnAgainIfKilled(() => {
+			const status = statuses[seen.length] ?? null;
+			seen.push(status);
+			return { status };
+		});
+		return { status: last.status, spawns: seen.length };
+	};
+
+	test("a killed spawn runs once more; an exit of any code is final", () => {
+		// `status: null` is the kill. A non-zero exit is PowerShell's own answer and stays.
+		expect(scripted(null, 0)).toEqual({ status: 0, spawns: 2 });
+		expect(scripted(1)).toEqual({ status: 1, spawns: 1 });
+		// A real hang is killed twice and the unit is still refused: bounded, fail-closed.
+		expect(scripted(null, null, 0)).toEqual({ status: null, spawns: 2 });
+	});
+});
+
 describe("windowsSddlUnsafeReason (the sshd rule's Windows half, pure)", () => {
 	// What a file under the host's ACL'd %ProgramData%\punktfunk actually looks like: owned by
 	// Administrators, protected DACL, admin/SYSTEM/OWNER-RIGHTS full + Users read-execute.
@@ -351,6 +372,27 @@ describe("supervision", () => {
 		await new Promise((r) => setTimeout(r, 200)); // would have restarted by now
 		expect(fs.readFileSync(counter, "utf8")).toBe("1");
 		await Effect.runPromise(Fiber.interrupt(fiber));
+	});
+
+	test("a plugin package without a manifest does not run while sandboxing is on", async () => {
+		const d = mkdirs("no-manifest");
+		const ran = path.join(d.dir, "ran.txt");
+		const pkg = path.join(d.pluginsDir, "node_modules", "punktfunk-plugin-bare");
+		write(
+			path.join(pkg, "package.json"),
+			JSON.stringify({ name: "punktfunk-plugin-bare", main: "index.js" }),
+		);
+		write(
+			path.join(pkg, "index.js"),
+			`import * as fs from "node:fs"; fs.writeFileSync(${JSON.stringify(ran)}, "1");`,
+		);
+		const logs: string[] = [];
+		const fiber = Effect.runFork(runner({ ...d, sandbox: "on", log: (l) => logs.push(l) }));
+		await waitFor(() => logs.some((l) => l.includes("not starting punktfunk-plugin-bare")));
+		await new Promise((r) => setTimeout(r, 200)); // would have imported by now
+		await Effect.runPromise(Fiber.interrupt(fiber));
+		expect(logs.some((l) => l.includes("starting punktfunk-plugin-bare ("))).toBe(false);
+		expect(fs.existsSync(ran)).toBe(false);
 	});
 
 	test("shutdown interrupts an Effect plugin STRUCTURALLY — its finalizer runs", async () => {

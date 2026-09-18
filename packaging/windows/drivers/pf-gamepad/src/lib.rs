@@ -17,7 +17,8 @@
 #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
 // Every remaining `unsafe {}` (all WDF setup FFI) must carry a `// SAFETY:` proof.
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use pf_driver_proto::gamepad::PadShm;
 use pf_umdf_util::channel::{ChannelClient, ChannelConfig};
@@ -35,7 +36,7 @@ use pf_umdf_util::wdf::{self, Request};
 use pf_umdf_util::{dbglog, nt_success};
 use wdk_sys::{
     NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PWDFDEVICE_INIT, ULONG, WDF_NO_OBJECT_ATTRIBUTES,
-    WDFDEVICE, WDFDRIVER, WDFQUEUE, WDFQUEUE__, WDFREQUEST, WDFTIMER,
+    WDF_PNPPOWER_EVENT_CALLBACKS, WDFDEVICE, WDFDRIVER, WDFQUEUE, WDFQUEUE__, WDFREQUEST,
     call_unsafe_wdf_function_binding,
 };
 
@@ -593,7 +594,13 @@ const NEUTRAL_REPORT: [u8; 64] = {
     // finger held at (0, 0) until the host attaches.
     r[33] = 0x80;
     r[37] = 0x80;
-    r[53] = 0x0A; // battery: discharging, full — zero reads as ~5 %
+    // The rest of a USB pad at rest, as pf-inject's `serialize_state` writes it: IMU temperature,
+    // no trigger effect (zone 9), charge complete, USB data + power.
+    r[32] = 0x14;
+    r[42] = 0x09;
+    r[43] = 0x09;
+    r[53] = 0x2A;
+    r[54] = 0x18;
     r
 };
 // Neutral DualShock 4 input report 0x01: sticks centered (0x80); the dpad hat is in byte 5 (low
@@ -663,7 +670,7 @@ static INPUT_REPORT: std::sync::Mutex<[u8; 64]> = std::sync::Mutex::new(NEUTRAL_
 /// Whether [`INPUT_REPORT`] holds a value no pended READ_REPORT has been completed with yet. Set
 /// only when the latch actually CHANGES, cleared only when a request is actually completed, so a
 /// tick that finds no read pended leaves the report undelivered rather than losing it. Consulted
-/// by the Triton identity alone — see the delivery gate in [`evt_timer`].
+/// by the Triton identity alone — see the delivery gate in [`tick`].
 static INPUT_DIRTY: AtomicBool = AtomicBool::new(true);
 
 // ---- the sealed pad channel: layouts + offsets from pf_driver_proto (drift = compile error) ----
@@ -697,12 +704,115 @@ const OFF_INPUT_GEN: usize = core::mem::offset_of!(PadShm, input_gen);
 /// [`TIMER_PERIOD_MS`]; the pump, the `driver_proto` stamp and the heartbeat keep their historical
 /// ~8 ms cadence so nothing that watches them changes rate — only the input path got faster.
 const PUMP_EVERY_N_TICKS: u32 = 4;
-/// Timer period. Was 8 ms, which — with one pended READ_REPORT completed per tick — capped what a
-/// game could observe at ~125 Hz and added up to 8 ms of latency, while clients stream motion at
-/// ~250 Hz. 2 ms is about a real DualShock 4's Bluetooth cadence and leaves headroom above the
-/// client rate; the extra ticks only do the cheap half (read the input slot, complete one pended
-/// read), see [`PUMP_EVERY_N_TICKS`].
+/// Tick period. One pended READ_REPORT completes per tick, so this caps what a game observes: 2 ms
+/// is about a real DualShock 4's Bluetooth cadence and leaves headroom above a Sony pad's 250 Hz.
+/// The extra ticks only do the cheap half (read the input slot, complete one pended read), see
+/// [`PUMP_EVERY_N_TICKS`].
 const TIMER_PERIOD_MS: u32 = 2;
+
+static TICKER_STOP: AtomicBool = AtomicBool::new(false);
+static TICKER: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
+
+const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x2;
+const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+const INFINITE: u32 = u32::MAX;
+const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009A_u32 as NTSTATUS;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateWaitableTimerExW(
+        attributes: *const c_void,
+        name: *const u16,
+        flags: u32,
+        access: u32,
+    ) -> *mut c_void;
+    fn SetWaitableTimer(
+        timer: *mut c_void,
+        due: *const i64,
+        period: i32,
+        routine: *const c_void,
+        context: *const c_void,
+        resume: i32,
+    ) -> i32;
+    fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32;
+    fn CloseHandle(handle: *mut c_void) -> i32;
+    fn GetCurrentThread() -> *mut c_void;
+    fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32;
+}
+
+const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
+
+/// Runs [`tick`] every [`TIMER_PERIOD_MS`] until [`TICKER_STOP`]. WUDFHost stays on the 15.6 ms
+/// system tick, and a WDF timer or a plain wait quantises to it (~64 reports/s, where a Sony pad
+/// sends 250); a high-resolution waitable timer does not. Deadlines are absolute, so a late wake
+/// never pushes the next one back. Time-critical: a tick is one copy and at most one completion,
+/// and a game saturating the CPU must not stretch the report period.
+fn tick_loop() {
+    // SAFETY: the calling thread's own pseudo-handle and a plain priority constant.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+    // SAFETY: an unnamed timer with default security. Null (pre-1803 Windows has no such flag)
+    // falls back to sleeping at the system tick.
+    let timer = unsafe {
+        CreateWaitableTimerExW(
+            core::ptr::null(),
+            core::ptr::null(),
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_ALL_ACCESS,
+        )
+    };
+    let period_ns = u64::from(TIMER_PERIOD_MS) * 1_000_000;
+    let start = std::time::Instant::now();
+    let mut n: u64 = 0;
+    while !TICKER_STOP.load(Ordering::Relaxed) {
+        let queue = MANUAL_QUEUE.load(Ordering::SeqCst);
+        if !queue.is_null() {
+            tick(queue);
+        }
+        let now_ns = start.elapsed().as_nanos() as u64;
+        n = (n + 1).max(now_ns / period_ns + 1);
+        let wait_ns = n * period_ns - now_ns;
+        let due = -((wait_ns / 100).max(1) as i64);
+        // SAFETY: our own timer handle; `due` outlives the call; no completion routine.
+        let armed = !timer.is_null()
+            && unsafe { SetWaitableTimer(timer, &due, 0, core::ptr::null(), core::ptr::null(), 0) }
+                != 0;
+        if armed {
+            // SAFETY: the timer handle is live until the CloseHandle below.
+            unsafe { WaitForSingleObject(timer, INFINITE) };
+        } else {
+            std::thread::sleep(std::time::Duration::from_nanos(wait_ns));
+        }
+    }
+    if !timer.is_null() {
+        // SAFETY: created above, closed once.
+        unsafe { CloseHandle(timer) };
+    }
+}
+
+extern "C" fn evt_self_managed_io_init(_device: WDFDEVICE) -> NTSTATUS {
+    TICKER_STOP.store(false, Ordering::SeqCst);
+    match std::thread::Builder::new()
+        .name("pf-gamepad-tick".into())
+        .spawn(tick_loop)
+    {
+        Ok(handle) => {
+            *TICKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+            STATUS_SUCCESS
+        }
+        Err(e) => {
+            dbglog!("[pf-gamepad] tick thread did not start: {e}");
+            STATUS_INSUFFICIENT_RESOURCES
+        }
+    }
+}
+
+/// Joins the ticker before the framework deletes the manual queue it completes reads on.
+extern "C" fn evt_self_managed_io_cleanup(_device: WDFDEVICE) {
+    TICKER_STOP.store(true, Ordering::SeqCst);
+    if let Some(handle) = TICKER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = handle.join();
+    }
+}
 
 /// Read the host's input report out of the section under the v2.3 seqlock, so a report caught
 /// mid-copy is retried instead of handed to a game.
@@ -831,6 +941,29 @@ static PNP_DEVTYPE: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Timer ticks since load — picks the [`PUMP_EVERY_N_TICKS`] ticks that also do the channel
 /// handshake and health marks. Wrapping is fine: only its residue matters.
 static TICK: AtomicU32 = AtomicU32::new(0);
+
+/// The pad's own clock: when it started (the first report served), the slot the next report is
+/// due at in µs since then, and the index of the next Sony report. See
+/// [`pf_driver_proto::gamepad::serve_due`] and [`pf_driver_proto::gamepad::stamp_sony_clock`].
+static PAD_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static SERVE_DUE_US: AtomicU64 = AtomicU64::new(0);
+static SONY_SERIAL: AtomicU32 = AtomicU32::new(0);
+
+fn pad_elapsed_us() -> u64 {
+    PAD_EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
+}
+
+/// The identities whose reports carry a sequence counter and sensor timestamp a game can time by.
+fn is_sony(device_type: u8) -> bool {
+    use pf_driver_proto::gamepad::{DEVTYPE_DUALSENSE, DEVTYPE_DUALSENSE_EDGE, DEVTYPE_DUALSHOCK4};
+    matches!(
+        device_type,
+        DEVTYPE_DUALSENSE | DEVTYPE_DUALSENSE_EDGE | DEVTYPE_DUALSHOCK4
+    )
+}
 /// Last pump verdict, as in pf-xusb. `data()` returns the adopted view whatever the mailbox
 /// says, so the three ticks between pumps would otherwise keep serving a departed host's last
 /// report — a detached pad frozen mid-input instead of neutral.
@@ -918,6 +1051,21 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     // SAFETY: device_init is provided by the framework and non-null.
     unsafe { call_unsafe_wdf_function_binding!(WdfFdoInitSetFilter, device_init) };
 
+    // The ticker starts once the device is up and is joined at removal, before its queue goes.
+    // SAFETY: a zeroed callbacks struct is valid with every callback unset; Size + two fields follow.
+    let mut pnp: WDF_PNPPOWER_EVENT_CALLBACKS = unsafe { core::mem::zeroed() };
+    pnp.Size = core::mem::size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG;
+    pnp.EvtDeviceSelfManagedIoInit = Some(evt_self_managed_io_init);
+    pnp.EvtDeviceSelfManagedIoCleanup = Some(evt_self_managed_io_cleanup);
+    // SAFETY: device_init is the framework's live init struct, not yet consumed by WdfDeviceCreate.
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceInitSetPnpPowerEventCallbacks,
+            device_init,
+            &mut pnp
+        )
+    };
+
     let mut device: WDFDEVICE = core::ptr::null_mut();
     // SAFETY: device_init valid; attributes allowed null; device receives the handle.
     let st = unsafe {
@@ -979,16 +1127,6 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         }
     };
     MANUAL_QUEUE.store(manual_queue, Ordering::SeqCst);
-
-    // Periodic timer (parent = manual queue) completes pended reads with the neutral report.
-    // SAFETY: `manual_queue` is the live queue just created.
-    let timer = unsafe {
-        skeleton::create_periodic_timer(manual_queue.cast(), Some(evt_timer), TIMER_PERIOD_MS)
-    };
-    if let Err(st) = timer {
-        dbglog!("[pf-gamepad] WdfTimerCreate failed 0x{:08x}", st as u32);
-        return st;
-    }
 
     log("[pf-gamepad] device ready");
     STATUS_SUCCESS
@@ -1059,7 +1197,18 @@ extern "C" fn evt_io_device_control(
         // report it still owes. Before any host publish the latch is the neutral default anyway.
         IOCTL_UMDF_HID_GET_INPUT_REPORT => {
             let dt = device_type();
-            let report = INPUT_REPORT.lock().map(|g| *g).unwrap_or(NEUTRAL_REPORT);
+            let mut report = INPUT_REPORT.lock().map(|g| *g).unwrap_or(NEUTRAL_REPORT);
+            // The pad's clock as of now, not the host's stamp: a poll must agree with the stream.
+            // The counter is not advanced — a poll is not a report in the interrupt pipeline.
+            if is_sony(dt) {
+                let serial = SONY_SERIAL.load(Ordering::Relaxed);
+                pf_driver_proto::gamepad::stamp_sony_clock(
+                    dt,
+                    &mut report,
+                    serial,
+                    pad_elapsed_us(),
+                );
+            }
             let served: &[u8] = if dt == pf_driver_proto::gamepad::DEVTYPE_TRITON {
                 // Same per-id trim as the timer's completion: Triton input reports are
                 // variable-length and id-first; an undeclared latched id falls back to neutral.
@@ -1507,13 +1656,11 @@ fn device_type() -> u8 {
     LAST_DEVTYPE.load(Ordering::Relaxed) as u8
 }
 
-extern "C" fn evt_timer(timer: WDFTIMER) {
-    // Two cadences on one timer. EVERY tick ([`TIMER_PERIOD_MS`]) does the cheap input half —
-    // read the section's report slot, complete one pended READ_REPORT — because that pair is what
-    // bounds the rate a game can observe, and at the old 8 ms it halved a 250 Hz motion stream.
-    // The channel handshake and the health marks stay on their historical ~8 ms
-    // ([`PUMP_EVERY_N_TICKS`]): they cost more, nothing about them wants to be faster, and the
-    // heartbeat's documented "+1 per ~8 ms tick" is what the host reads as liveness.
+fn tick(queue: WDFQUEUE) {
+    // Two cadences on one tick. Every tick ([`TIMER_PERIOD_MS`]) reads the report slot; the
+    // identity's delivery gate below decides whether it also completes a pended READ_REPORT. The
+    // handshake and health marks stay on ~8 ms ([`PUMP_EVERY_N_TICKS`]): the heartbeat's "+1 per
+    // ~8 ms" is what the host reads as liveness.
     let tick = TICK.fetch_add(1, Ordering::Relaxed);
     let housekeeping = tick.is_multiple_of(PUMP_EVERY_N_TICKS);
     let view = if housekeeping {
@@ -1593,37 +1740,32 @@ extern "C" fn evt_timer(timer: WDFTIMER) {
         }
     }
 
-    // Triton delivery is EVENT-DRIVEN; every other identity keeps the every-tick cadence.
-    //
-    // The others carry typed frames a client streams at ~250 Hz, which a 2 ms tick undersamples
-    // nothing of. Triton carries the physical pad's own BLE reports instead, and iOS floors the
-    // connection interval at ~15 ms (~66 Hz) — so re-serving the latch every tick handed Steam
-    // ~7 identical reports and then one holding a full 15 ms of trackpad travel. A delta that
-    // large across a 2 ms inter-report gap reads as a flick ~7x faster than the finger made it,
-    // which is where the runaway trackpad momentum came from (bench 2, 2026-08-23). Real hardware
-    // NAKs the interrupt IN when it has nothing new; leaving the READ_REPORT pended is this
-    // stack's equivalent, so Steam sees one report per real report, spaced as the pad spaced them.
-    //
-    // No idle re-serve floor: the pad streams state reports continuously — ~66 Hz over BLE with
-    // the seq byte advancing even at rest (600-frame capture, 2026-06-08) — so total silence
-    // means link loss, not idleness, and neutral-on-detach rides this same dirty path (the
-    // detach branch above latches neutral, which IS a change). A time-based re-serve would only
-    // ever fire across a stream stall, where re-serving the latch resets the reader's
-    // arrival-time reference and the recovery report's delta lands on a compressed window —
-    // the momentum bug's exact shape.
+    // Triton relays the physical pad's own ~66 Hz BLE reports, so it serves only a changed one:
+    // re-serving the latch makes Steam read one report's travel as a flick ~7x too fast, and a
+    // pended read is the NAK real hardware sends. Every other identity streams at the USB period,
+    // held state included, as the hardware does (see `pf_driver_proto::gamepad::REPORT_PERIOD_US`).
     let dt = device_type();
-    if dt == pf_driver_proto::gamepad::DEVTYPE_TRITON && !INPUT_DIRTY.load(Ordering::Relaxed) {
-        return;
+    let now = pad_elapsed_us();
+    if dt == pf_driver_proto::gamepad::DEVTYPE_TRITON {
+        if !INPUT_DIRTY.load(Ordering::Relaxed) {
+            return;
+        }
+    } else {
+        match pf_driver_proto::gamepad::serve_due(now, SERVE_DUE_US.load(Ordering::Relaxed)) {
+            Some(next) => SERVE_DUE_US.store(next, Ordering::Relaxed),
+            None => return,
+        }
     }
 
     // Complete the next pended READ_REPORT with the current input report (safe queue/request API).
-    // SAFETY: the timer's parent object is the manual queue (set in EvtDeviceAdd); the framework
-    // guarantees a live handle here.
-    let queue =
-        unsafe { call_unsafe_wdf_function_binding!(WdfTimerGetParentObject, timer) } as WDFQUEUE;
-    // SAFETY: `queue` is that live manual queue — the exact contract `retrieve_next_request` needs.
+    // SAFETY: `queue` is the manual queue from EvtDeviceAdd, live until the ticker is joined in
+    // EvtDeviceSelfManagedIoCleanup — the exact contract `retrieve_next_request` needs.
     if let Some(request) = unsafe { wdf::retrieve_next_request(queue) } {
-        let report = INPUT_REPORT.lock().map(|g| *g).unwrap_or(NEUTRAL_REPORT);
+        let mut report = INPUT_REPORT.lock().map(|g| *g).unwrap_or(NEUTRAL_REPORT);
+        if is_sony(dt) {
+            let serial = SONY_SERIAL.fetch_add(1, Ordering::Relaxed);
+            pf_driver_proto::gamepad::stamp_sony_clock(dt, &mut report, serial, now);
+        }
         // Serve exactly what this identity's descriptor declares — `copy_to_output` REFUSES a
         // source longer than hidclass's buffer instead of truncating, so a 64-byte hand-over for
         // the Xbox pad's 16-byte report would fail every read and the pad would look dead.

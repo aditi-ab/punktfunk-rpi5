@@ -1295,8 +1295,7 @@ pub struct Settings {
     /// Subsumed by `hdr_enabled`. `default` so older stores load off.
     ///
     /// Unlike `hdr_enabled` this asks nothing of the panel, so no client gates it on a display
-    /// probe. webOS is the exception that cannot obey it: NDL decodes what it is given and
-    /// exposes no bit-depth ask.
+    /// probe.
     #[serde(default)]
     pub ten_bit_sdr: bool,
     /// `"latency"` (default) or `"smooth"`. Unknown reads as latency so a future

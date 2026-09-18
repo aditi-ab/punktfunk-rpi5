@@ -173,11 +173,13 @@ data class RunningGame(
     val appId: String?,
     val title: String,
     /**
-     * `launching` | `running` | `exited` | `untracked` | `grace`. A plain String on purpose: the
-     * host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an unknown value
-     * must never fail the decode of the whole list.
+     * `launching` | `running` | `window` | `exited` | `untracked` | `grace`. A plain String on
+     * purpose: the host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an
+     * unknown value must never fail the decode of the whole list.
      */
     val state: String,
+    /** `running`, and the host will report `window` once the game's window is up. */
+    val awaitingWindow: Boolean = false,
 ) {
     /**
      * Is this title *up on the host right now* — i.e. would picking it take the player back into
@@ -309,6 +311,7 @@ object LibraryClient {
                     appId = str(o, "app_id"),
                     title = o.optString("title"),
                     state = o.optString("state"),
+                    awaitingWindow = o.optBoolean("awaiting_window"),
                 ),
             )
         }

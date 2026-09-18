@@ -1,19 +1,24 @@
-//! Process-lifetime host configuration, parsed once from the environment.
+//! Host configuration: the [`registry`] rows the web console edits, plus the
+//! env-only knobs.
 //!
 //! [`HostConfig`] is the one resolved value capture, topology, and encoding
-//! share. Session-mutated compositor variables, path lookups, credentials,
-//! and single-use tuning stay live reads at their call sites.
-//!
-//! Pin knobs with `PUNKTFUNK_*` in operator-owned `host.env`. [`config`]
-//! parses on first access. [`env_on`] is the explicit-off grammar; it is not
-//! `pf-zerocopy`'s truthy parser.
+//! share. A registry row resolves flag > env > `host-settings.json` > default;
+//! a console write swaps the snapshot, so read [`config`] where the value is
+//! used, not once at startup. Session-mutated compositor variables, path
+//! lookups, credentials, and single-use tuning stay live reads at their call
+//! sites. [`env_on`] is the explicit-off grammar of the env-only knobs.
 #![forbid(unsafe_code)]
 
 /// Keyboard LAYOUT from `localectl`, not a `PUNKTFUNK_*` knob. Shared so the
 /// injector and the gamescope backend do not depend on each other.
 pub mod layout;
+pub mod registry;
+mod store;
 
-use std::sync::OnceLock;
+pub use store::{
+    knob, mark_started, pin, reload, restart_pending, save, snapshot, store_path, Resolved,
+    SaveError, Snapshot, Source,
+};
 
 /// Explicit-off for a `PUNKTFUNK_*` var: trimmed, case-insensitive
 /// `0`/`false`/`off`/`no` are off; any other present value is on; unset is
@@ -21,17 +26,20 @@ use std::sync::OnceLock;
 /// `"false"` as ON.
 ///
 /// Not `pf-zerocopy`'s grammar (`1|true|yes|on` on, everything else off).
+///
+/// Reads through [`knob`], so a registry row's console value counts as set.
 pub fn env_on(name: &str) -> Option<bool> {
-    std::env::var(name).ok().map(|s| {
-        !matches!(
-            s.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        )
-    })
+    knob(name).map(|s| is_on(&s))
 }
 
-/// Which render endpoint the loopback captures. Legacy `PUNKTFUNK_HOST_AUDIO`
-/// and `PUNKTFUNK_KEEP_DEFAULT` still select a variant.
+fn is_on(s: &str) -> bool {
+    !matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+/// Which render endpoint the loopback captures (registry row `audio_output_mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AudioOutputMode {
     /// Silent render endpoint; streamed audio does not also play on the host.
@@ -45,30 +53,6 @@ pub enum AudioOutputMode {
 }
 
 impl AudioOutputMode {
-    /// `PUNKTFUNK_AUDIO_OUTPUT_MODE` wins; else `KEEP_DEFAULT` before `HOST_AUDIO`
-    /// so a stale host-audio flag cannot override "do not touch my devices".
-    fn from_env() -> AudioOutputMode {
-        if let Ok(raw) = std::env::var("PUNKTFUNK_AUDIO_OUTPUT_MODE")
-            && !raw.trim().is_empty()
-        {
-            if let Some(m) = AudioOutputMode::parse(&raw) {
-                return m;
-            }
-            // Unknown spelling: warn and keep going; do not invent a variant.
-            eprintln!(
-                "punktfunk: PUNKTFUNK_AUDIO_OUTPUT_MODE={raw:?} is not one of \
-                 client_only/host_and_client/follow_default — using client_only"
-            );
-        }
-        if std::env::var_os("PUNKTFUNK_KEEP_DEFAULT").is_some() {
-            return AudioOutputMode::FollowDefault;
-        }
-        if std::env::var_os("PUNKTFUNK_HOST_AUDIO").is_some() {
-            return AudioOutputMode::HostAndClient;
-        }
-        AudioOutputMode::ClientOnly
-    }
-
     pub fn parse(s: &str) -> Option<AudioOutputMode> {
         match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
             "client_only" | "client" => Some(AudioOutputMode::ClientOnly),
@@ -95,8 +79,8 @@ impl AudioOutputMode {
     }
 }
 
-/// Where voice-chat apps play while a stream runs (`PUNKTFUNK_AUDIO_VOICE_CHAT`).
-/// Linux only: the other planes capture one endpoint and cannot split a mix.
+/// Where voice-chat apps play while a stream runs (registry row `audio_voice_chat`).
+/// Linux moves the apps' PipeWire streams; Windows writes their per-app output device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VoiceChatRoute {
     /// In the stream like everything else. Right when the viewer is not in the call.
@@ -108,20 +92,6 @@ pub enum VoiceChatRoute {
 }
 
 impl VoiceChatRoute {
-    fn from_env() -> VoiceChatRoute {
-        let raw = std::env::var("PUNKTFUNK_AUDIO_VOICE_CHAT").unwrap_or_default();
-        if raw.trim().is_empty() {
-            return VoiceChatRoute::Stream;
-        }
-        VoiceChatRoute::parse(&raw).unwrap_or_else(|| {
-            eprintln!(
-                "punktfunk: PUNKTFUNK_AUDIO_VOICE_CHAT={raw:?} is not one of stream/host — \
-                 using stream"
-            );
-            VoiceChatRoute::Stream
-        })
-    }
-
     pub fn parse(s: &str) -> Option<VoiceChatRoute> {
         match s.trim().to_ascii_lowercase().as_str() {
             "stream" | "client" => Some(VoiceChatRoute::Stream),
@@ -138,8 +108,29 @@ impl VoiceChatRoute {
     }
 }
 
-/// Lowercase fragments a voice-chat app's `application.name` or process binary
-/// contains. Discord's three builds all contain `discord`.
+/// Whether the host shares its clipboard (registry row `clipboard`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipboardPolicy {
+    #[default]
+    Off,
+    Text,
+    /// Text and files.
+    Files,
+}
+
+impl ClipboardPolicy {
+    pub fn parse(s: &str) -> Option<ClipboardPolicy> {
+        match s {
+            "off" => Some(ClipboardPolicy::Off),
+            "text" => Some(ClipboardPolicy::Text),
+            "files" => Some(ClipboardPolicy::Files),
+            _ => None,
+        }
+    }
+}
+
+/// Lowercase fragments a voice-chat app's `application.name`, process binary or
+/// exe file name contains. Discord's three builds all contain `discord`.
 pub const DEFAULT_VOICE_APPS: &[&str] = &[
     "discord",
     "vesktop",
@@ -151,20 +142,30 @@ pub const DEFAULT_VOICE_APPS: &[&str] = &[
     "mumble",
 ];
 
-/// `PUNKTFUNK_AUDIO_VOICE_APPS`: a comma list replacing [`DEFAULT_VOICE_APPS`].
-/// Blank entries drop; an empty or unset value keeps the default list.
+/// `PUNKTFUNK_AUDIO_VOICE_APPS`: a comma list added to [`DEFAULT_VOICE_APPS`],
+/// lowercased, blanks and repeats dropped. A console store feeds the same list later.
 pub fn parse_voice_apps(raw: Option<&str>) -> Vec<String> {
-    let listed: Vec<String> = raw
+    let mut apps: Vec<String> = DEFAULT_VOICE_APPS.iter().map(|s| s.to_string()).collect();
+    for extra in raw
         .unwrap_or_default()
         .split(',')
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
-        .collect();
-    if listed.is_empty() {
-        DEFAULT_VOICE_APPS.iter().map(|s| s.to_string()).collect()
-    } else {
-        listed
+    {
+        if !apps.contains(&extra) {
+            apps.push(extra);
+        }
     }
+    apps
+}
+
+/// Whether any of `names` (an application name, a binary path, an exe file name)
+/// contains a listed voice-app fragment. Case-insensitive; the list is lowercase.
+pub fn voice_app_matches<'a>(names: impl IntoIterator<Item = &'a str>, apps: &[String]) -> bool {
+    names
+        .into_iter()
+        .map(str::to_ascii_lowercase)
+        .any(|n| apps.iter().any(|a| n.contains(a.as_str())))
 }
 
 /// Operator and dispatch knobs resolved once. Session-mutated values stay at
@@ -172,10 +173,12 @@ pub fn parse_voice_apps(raw: Option<&str>) -> Vec<String> {
 /// parser remain one platform-neutral function.
 #[derive(Debug, Clone, Default)]
 pub struct HostConfig {
-    /// `PUNKTFUNK_HOST_NAME` — Moonlight `<hostname>` and the mDNS instance name.
-    /// Unset/blank = the machine hostname. Display-only; the DNS `<label>.local.`
+    /// Row `host_name` — Moonlight `<hostname>` and the mDNS instance name.
+    /// Blank = the machine hostname. Display-only; the DNS `<label>.local.`
     /// is a sanitized label so a spacey name cannot produce an invalid record.
     pub host_name: Option<String>,
+    /// Row `clipboard`.
+    pub clipboard: ClipboardPolicy,
     /// `PUNKTFUNK_MGMT_BIND` — management listen (`IP:PORT`). `--mgmt-bind` wins.
     /// Unset = `0.0.0.0:47990` (Sunshine's web UI; the only port the two share).
     /// Lives in `host.env` because a package upgrade rewrites the unit file.
@@ -184,12 +187,11 @@ pub struct HostConfig {
     /// `PUNKTFUNK_NATIVE_PORT` — native QUIC control port. `--native-port` wins.
     /// Unset = 9777. Raw string so a typo is a startup error, not a silent 9777.
     pub native_port: Option<String>,
-    /// `PUNKTFUNK_GAMESTREAM` — GameStream/Moonlight-compat planes. `--gamestream`
-    /// also turns them on. **Default OFF**: they carry plain-HTTP pairing.
+    /// Row `gamestream` — GameStream/Moonlight-compat planes. **Default OFF**: they
+    /// carry plain-HTTP pairing.
     pub gamestream: bool,
-    /// `PUNKTFUNK_WEBTRANSPORT` — the browser plane. `--webtransport` also turns it on.
-    /// **Default OFF**, like GameStream: a new externally-reachable transport should not
-    /// appear on a host because it was upgraded.
+    /// Row `webtransport` — the browser plane. **Default OFF**, like GameStream: a new
+    /// externally-reachable transport should not appear on a host because it was upgraded.
     pub webtransport: bool,
     /// `PUNKTFUNK_WEBTRANSPORT_ORIGINS` — comma-separated browser origins allowed to open a
     /// session (`https://host:47990`). Unset = any, because a host has no way to know its own
@@ -208,30 +210,27 @@ pub struct HostConfig {
     /// `PUNKTFUNK_RENDER_ADAPTER` — discrete render-GPU pin by description substring.
     /// `Some` even when empty: empty still counts as set for presence checks.
     pub render_adapter: Option<String>,
-    /// `PUNKTFUNK_IDD_DEPTH` — IDD-push pipeline depth. Default 2; the call site clamps to its `OUT_RING`.
-    pub idd_depth: usize,
     /// `PUNKTFUNK_ZEROCOPY` — Windows D3D11 zero-copy encode input. `None` defers to
     /// the per-vendor default (AMF on, QSV off).
     pub zerocopy: Option<bool>,
-    /// `PUNKTFUNK_10BIT` — host policy gate for HEVC Main10 / AV1. **Default ON**,
-    /// explicit-off. The host only *allows* 10-bit; the session still needs
-    /// `VIDEO_CAP_10BIT` and `can_encode_10bit`. Independent of `four_four_four`.
+    /// Row `ten_bit` — host policy gate for HEVC Main10 / AV1. **Default ON**. The
+    /// host only *allows* 10-bit; the session still needs `VIDEO_CAP_10BIT` and
+    /// `can_encode_10bit`. Independent of `four_four_four`.
     pub ten_bit: bool,
-    /// `PUNKTFUNK_444` — host policy gate for HEVC 4:4:4. **Default ON**,
-    /// explicit-off. The host only *allows* 4:4:4; the session still needs the
-    /// client to advertise it, HEVC, full-chroma capture, and the encode probe.
-    /// Independent of `ten_bit`.
+    /// Row `chroma_444` — host policy gate for HEVC 4:4:4. **Default ON**. The host
+    /// only *allows* 4:4:4; the session still needs the client to advertise it, HEVC,
+    /// full-chroma capture, and the encode probe. Independent of `ten_bit`.
     pub four_four_four: bool,
     /// `PUNKTFUNK_CHACHA20` — host policy gate for ChaCha20-Poly1305
     /// (`design/chacha20-session-cipher.md`). **Default ON**, explicit-off.
     /// The host only *allows* it; a session uses ChaCha only when the client
     /// advertised `VIDEO_CAP_CHACHA20`. Everyone else stays AES-128-GCM.
     pub chacha20: bool,
-    /// `PUNKTFUNK_AUDIO_OUTPUT_MODE` — see [`AudioOutputMode`].
+    /// Row `audio_output_mode` — see [`AudioOutputMode`].
     pub audio_output_mode: AudioOutputMode,
-    /// `PUNKTFUNK_AUDIO_VOICE_CHAT` — see [`VoiceChatRoute`].
+    /// Row `audio_voice_chat` — see [`VoiceChatRoute`].
     pub audio_voice_chat: VoiceChatRoute,
-    /// `PUNKTFUNK_AUDIO_VOICE_APPS` — see [`parse_voice_apps`]. Never empty.
+    /// Row `audio_voice_apps` — see [`parse_voice_apps`]. Never empty.
     pub audio_voice_apps: Vec<String>,
     /// `PUNKTFUNK_AUDIO_QUALITY` — encode tier (`low`/`standard`/`high`; default
     /// `high`). Raw string: the table lives in `punktfunk-core`. The audio thread
@@ -265,9 +264,6 @@ pub struct HostConfig {
     pub compositor: Option<String>,
     /// `PUNKTFUNK_GAMEPAD` — virtual-pad backend preference, fed to `pick_gamepad`.
     pub gamepad: Option<String>,
-    /// `PUNKTFUNK_VDISPLAY` — Windows virtual-display backend. IddCx is the only
-    /// backend; kept for shipped `host.env`.
-    pub vdisplay: Option<String>,
     /// `PUNKTFUNK_GAMESCOPE_STEAM` — force `--steam` on every bare headless gamescope
     /// launch. Steam titles already pass it; this is for non-Steam. Managed
     /// gamescope-session-plus/SteamOS sessions ignore it.
@@ -283,13 +279,30 @@ pub struct HostConfig {
     /// (`design/gamescope-multiuser.md`). **Default ON**; `=0` restores shared
     /// host-lifetime planes. Shared-desktop and managed/attach routes are untouched.
     pub gamescope_isolate: bool,
+    /// `PUNKTFUNK_STEAM_SEAT_HOME` — run a dedicated Steam launch under the
+    /// session's own `HOME` (`pf_paths::seat_home`), so it neither waits for the
+    /// desktop Steam to shut down nor shares its account
+    /// (`design/steam-seats-warm-launch-implementation-plan.md`). **Default OFF.**
+    /// Needs a native Steam to clone; a seat signs in on its own.
+    pub steam_seat_home: bool,
+    /// `PUNKTFUNK_STEAM_SEAT_SANDBOX` — show a seat's nested Steam only the pads
+    /// this session created, by running it under `bwrap` with a per-seat
+    /// `/dev/input` and `/dev/hidraw*`
+    /// (`design/steam-seats-warm-launch-implementation-plan.md` WP-S3).
+    /// **Default OFF.** Needs a seat home and `bwrap` on `PATH`.
+    pub steam_seat_sandbox: bool,
+    /// `PUNKTFUNK_STEAM_PREWARM` — how many seats the host may hold a Big Picture Steam up for
+    /// before their clients connect, so a launch skips Steam's 13–30 s cold boot
+    /// (`design/steam-seats-warm-launch-implementation-plan.md` WP-S2). **Default 1**; `0` is
+    /// off. Each parked seat costs about a gigabyte, and only a seat home can be pre-warmed.
+    pub steam_prewarm: u32,
     /// `PUNKTFUNK_GAMESCOPE_HDR` — allow HDR on gamescope. The host probes the
     /// punktfunk build (`packaging/gamescope`) and stays SDR if missing; this only
     /// decides whether HDR is *attempted*. **Default ON**, matching `PUNKTFUNK_10BIT`.
     pub gamescope_hdr: bool,
-    /// `PUNKTFUNK_GAMESCOPE_SDR_NITS` — SDR luminance inside the PQ container
+    /// `PUNKTFUNK_GAMESCOPE_SDR_NITS` — starting SDR luminance inside the PQ container
     /// (`--hdr-sdr-content-nits`). `None` = 203 nits (BT.2408), what our clients
-    /// decode against — not gamescope's 400. See `SDR_REFERENCE_WHITE_NITS`.
+    /// decode against. See `SDR_REFERENCE_WHITE_NITS`.
     pub gamescope_sdr_nits: Option<u32>,
     /// `PUNKTFUNK_GAMESCOPE_BIND` — bind patched gamescope over `/usr/bin/gamescope`
     /// in the session unit's mount namespace. `gamescope-session-plus` hardcodes
@@ -313,10 +326,9 @@ pub struct HostConfig {
     /// `PUNKTFUNK_ON_DISCONNECT_CMD` — `client.disconnected` sibling of
     /// [`Self::on_connect_cmd`].
     pub on_disconnect_cmd: Option<String>,
-    /// `PUNKTFUNK_MAX_FPS` — game-side frame limiter. `None` (unset, `0`, unparseable)
-    /// = no limit. Caps compositor render rate, not the session: a 120 Hz session
-    /// over a 60 fps cap still sends 120 frames (60 repeats). gamescope:
-    /// `--nested-refresh`, clamped to 1..=240.
+    /// Row `max_fps` — game-side frame limiter. `None` (`0`) = no limit. Caps
+    /// compositor render rate, not the session: a 120 Hz session over a 60 fps cap
+    /// still sends 120 frames (60 repeats). gamescope: `--nested-refresh`, 1..=240.
     pub max_fps: Option<u32>,
     /// `PUNKTFUNK_VDISPLAY_HZ_MULT` — virtual-display refresh as a multiple of the
     /// session rate; the stream stays at the session rate. Default 1; 2 halves
@@ -329,15 +341,15 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
-    fn from_env() -> Self {
+    /// Fields parsed from their env spelling. Each read goes through the rows, so a field whose
+    /// env name has a registry row also sees the console's value. The typed rows are
+    /// [`Self::apply_settings`].
+    fn from_rows(rows: &[Resolved]) -> Self {
+        let val = |k: &str| store::knob_in(rows, k);
         // Presence, not value.
-        let flag = |k: &str| std::env::var_os(k).is_some();
-        // `Some` (possibly empty) when set with valid UTF-8.
-        let val = |k: &str| std::env::var(k).ok();
+        let flag = |k: &str| val(k).is_some();
+        let on = |k: &str| val(k).map(|s| is_on(&s));
         Self {
-            host_name: val("PUNKTFUNK_HOST_NAME")
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
             // Blank-is-unset: `PUNKTFUNK_MGMT_BIND=` means default.
             mgmt_bind: val("PUNKTFUNK_MGMT_BIND")
                 .map(|s| s.trim().to_string())
@@ -345,8 +357,6 @@ impl HostConfig {
             native_port: val("PUNKTFUNK_NATIVE_PORT")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
-            gamestream: env_on("PUNKTFUNK_GAMESTREAM").unwrap_or(false),
-            webtransport: env_on("PUNKTFUNK_WEBTRANSPORT").unwrap_or(false),
             webtransport_origins: val("PUNKTFUNK_WEBTRANSPORT_ORIGINS")
                 .unwrap_or_default()
                 .split(',')
@@ -359,21 +369,13 @@ impl HostConfig {
             webtransport_port: val("PUNKTFUNK_WEBTRANSPORT_PORT")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
-            encoder_pref: encoder_pref(),
+            encoder_pref: encoder_pref(val("PUNKTFUNK_ENCODER")),
             render_adapter: val("PUNKTFUNK_RENDER_ADAPTER"),
-            idd_depth: val("PUNKTFUNK_IDD_DEPTH")
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(2),
-            zerocopy: env_on("PUNKTFUNK_ZEROCOPY"),
-            ten_bit: env_on("PUNKTFUNK_10BIT").unwrap_or(true),
-            four_four_four: env_on("PUNKTFUNK_444").unwrap_or(true),
-            chacha20: env_on("PUNKTFUNK_CHACHA20").unwrap_or(true),
-            audio_output_mode: AudioOutputMode::from_env(),
-            audio_voice_chat: VoiceChatRoute::from_env(),
-            audio_voice_apps: parse_voice_apps(val("PUNKTFUNK_AUDIO_VOICE_APPS").as_deref()),
+            zerocopy: on("PUNKTFUNK_ZEROCOPY"),
+            chacha20: on("PUNKTFUNK_CHACHA20").unwrap_or(true),
             audio_quality: val("PUNKTFUNK_AUDIO_QUALITY").map(|s| s.trim().to_lowercase()),
-            audio_redundancy: env_on("PUNKTFUNK_AUDIO_REDUNDANCY"),
-            audio_hires: env_on("PUNKTFUNK_AUDIO_HIRES").unwrap_or(true),
+            audio_redundancy: on("PUNKTFUNK_AUDIO_REDUNDANCY"),
+            audio_hires: on("PUNKTFUNK_AUDIO_HIRES").unwrap_or(true),
             perf: flag("PUNKTFUNK_PERF"),
             // Defaults to `virtual` — the flagship per-client virtual output. It used to be unset,
             // which fell through to the synthetic test pattern: fine for a dev box that always has
@@ -390,7 +392,6 @@ impl HostConfig {
                 .filter(|s| !s.is_empty()),
             compositor: val("PUNKTFUNK_COMPOSITOR"),
             gamepad: val("PUNKTFUNK_GAMEPAD"),
-            vdisplay: val("PUNKTFUNK_VDISPLAY"),
             gamescope_steam: val("PUNKTFUNK_GAMESCOPE_STEAM").is_some_and(|s| {
                 matches!(
                     s.trim().to_ascii_lowercase().as_str(),
@@ -403,14 +404,20 @@ impl HostConfig {
                     "1" | "true" | "yes" | "on"
                 )
             }),
-            gamescope_splash: env_on("PUNKTFUNK_GAMESCOPE_SPLASH").unwrap_or(true),
-            gamescope_isolate: env_on("PUNKTFUNK_GAMESCOPE_ISOLATE").unwrap_or(true),
-            gamescope_hdr: env_on("PUNKTFUNK_GAMESCOPE_HDR").unwrap_or(true),
+            gamescope_splash: on("PUNKTFUNK_GAMESCOPE_SPLASH").unwrap_or(true),
+            gamescope_isolate: on("PUNKTFUNK_GAMESCOPE_ISOLATE").unwrap_or(true),
+            steam_seat_home: on("PUNKTFUNK_STEAM_SEAT_HOME").unwrap_or(false),
+            steam_seat_sandbox: on("PUNKTFUNK_STEAM_SEAT_SANDBOX").unwrap_or(false),
+            steam_prewarm: val("PUNKTFUNK_STEAM_PREWARM")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .min(8),
+            gamescope_hdr: on("PUNKTFUNK_GAMESCOPE_HDR").unwrap_or(true),
             gamescope_sdr_nits: val("PUNKTFUNK_GAMESCOPE_SDR_NITS")
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .filter(|n| (1..=10_000).contains(n)),
             // Unset is AUTO; `=0` is stock gamescope; `=1` is force.
-            gamescope_bind: env_on("PUNKTFUNK_GAMESCOPE_BIND"),
+            gamescope_bind: on("PUNKTFUNK_GAMESCOPE_BIND"),
             // Junk entries are dropped; this only widens a menu.
             gamescope_refresh_rates: parse_refresh_rates(
                 val("PUNKTFUNK_GAMESCOPE_REFRESH_RATES").as_deref(),
@@ -419,17 +426,46 @@ impl HostConfig {
                 .filter(|s| !s.trim().is_empty()),
             on_connect_cmd: val("PUNKTFUNK_ON_CONNECT_CMD").filter(|s| !s.trim().is_empty()),
             on_disconnect_cmd: val("PUNKTFUNK_ON_DISCONNECT_CMD").filter(|s| !s.trim().is_empty()),
-            // 0 means no limit, not "stream nothing".
-            max_fps: val("PUNKTFUNK_MAX_FPS")
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .filter(|&f| f > 0)
-                .map(|f| f.clamp(1, 240)),
             vdisplay_hz_mult: val("PUNKTFUNK_VDISPLAY_HZ_MULT")
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(1)
                 .clamp(1, 4),
             gamescope_vrr: val("PUNKTFUNK_GAMESCOPE_VRR").as_deref().map(str::trim) != Some("0"),
+            ..Self::default()
         }
+    }
+
+    /// Registry fields from resolved rows. Values are already validated, so a type
+    /// mismatch here is a registry bug and falls back to the field default.
+    fn apply_settings(&mut self, rows: &[Resolved]) {
+        let get = |id: &str| {
+            rows.iter()
+                .find(|r| r.setting.id == id)
+                .map(|r| &r.value)
+                .unwrap_or(&serde_json::Value::Null)
+        };
+        let text = |id: &str| get(id).as_str().unwrap_or_default().to_string();
+        let on = |id: &str| get(id).as_bool().unwrap_or_default();
+        self.gamestream = on("gamestream");
+        self.webtransport = on("webtransport");
+        self.clipboard = ClipboardPolicy::parse(&text("clipboard")).unwrap_or_default();
+        self.host_name = Some(text("host_name")).filter(|s| !s.is_empty());
+        self.ten_bit = on("ten_bit");
+        self.four_four_four = on("chroma_444");
+        // 0 means no limit, not "stream nothing".
+        self.max_fps = get("max_fps")
+            .as_u64()
+            .filter(|&f| f > 0)
+            .map(|f| f.min(240) as u32);
+        self.audio_output_mode =
+            AudioOutputMode::parse(&text("audio_output_mode")).unwrap_or_default();
+        self.audio_voice_chat =
+            VoiceChatRoute::parse(&text("audio_voice_chat")).unwrap_or_default();
+        let apps: Vec<&str> = get("audio_voice_apps")
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        self.audio_voice_apps = parse_voice_apps(Some(&apps.join(",")));
     }
 }
 
@@ -460,13 +496,10 @@ impl HostConfig {
     }
 }
 
-/// Process-wide host configuration, parsed once on first access.
 /// `PUNKTFUNK_ENCODER`, lower-cased. On Windows a software pin becomes `auto`: the driver
 /// encodes, so a session opened on it would pass the handshake and die at the encoder open.
-fn encoder_pref() -> String {
-    let pref = std::env::var("PUNKTFUNK_ENCODER")
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+fn encoder_pref(raw: Option<String>) -> String {
+    let pref = raw.unwrap_or_default().to_ascii_lowercase();
     if cfg!(windows) && matches!(pref.as_str(), "sw" | "software" | "openh264") {
         eprintln!(
             "punktfunk: PUNKTFUNK_ENCODER={pref:?} — Windows has no software encoder since the \
@@ -477,9 +510,9 @@ fn encoder_pref() -> String {
     pref
 }
 
+/// The current host configuration. Built on first access; a settings write replaces it.
 pub fn config() -> &'static HostConfig {
-    static CFG: OnceLock<HostConfig> = OnceLock::new();
-    CFG.get_or_init(HostConfig::from_env)
+    &snapshot().config
 }
 
 #[cfg(test)]
@@ -562,13 +595,24 @@ mod tests {
         );
         assert_eq!(VoiceChatRoute::parse("both"), None);
         assert_eq!(VoiceChatRoute::default(), VoiceChatRoute::Stream);
-        // A blank or absent list keeps the default; a typed one replaces it, lowercased.
+        // A blank or absent list is the default; a typed one adds to it, lowercased, no repeats.
         assert_eq!(parse_voice_apps(None), DEFAULT_VOICE_APPS);
         assert_eq!(parse_voice_apps(Some(" , ")), DEFAULT_VOICE_APPS);
-        assert_eq!(
-            parse_voice_apps(Some("Discord, firefox ,,")),
-            vec!["discord", "firefox"]
-        );
+        let extended = parse_voice_apps(Some("Discord, firefox ,,"));
+        assert_eq!(extended.len(), DEFAULT_VOICE_APPS.len() + 1);
+        assert_eq!(extended.last().map(String::as_str), Some("firefox"));
+        assert!(voice_app_matches(["Discord"], &extended));
+        assert!(voice_app_matches(
+            ["WEBRTC VoiceEngine", "DiscordCanary.exe"],
+            &extended
+        ));
+        assert!(voice_app_matches(["/usr/bin/vesktop"], &extended));
+        assert!(voice_app_matches(["Firefox"], &extended));
+        assert!(!voice_app_matches(
+            ["Firefox", "firefox.exe"],
+            &parse_voice_apps(None)
+        ));
+        assert!(!voice_app_matches(std::iter::empty(), &extended));
     }
 
     /// `prefers_host_hardware` and `keeps_default` must stay mutually exclusive:

@@ -71,6 +71,7 @@ mod windows {
         pub(crate) fn hw_cursor_capable() -> bool {
             false
         }
+        #[allow(clippy::too_many_arguments)]
         pub(crate) fn open_driver_encoder(
             _plan: &crate::session_plan::SessionPlan,
             _capturer: &dyn crate::capture::Capturer,
@@ -78,6 +79,7 @@ mod windows {
             _fps: u32,
             _bitrate_bps: u64,
             _bit_depth: u8,
+            _client_hdr: Option<pf_frame::HdrMeta>,
             _wire_seq_base: u32,
         ) -> Result<Box<dyn crate::encode::Encoder>> {
             anyhow::bail!("the in-driver encoder is Windows IDD-push only")
@@ -131,6 +133,8 @@ mod client_logs;
 // Re-`Hello::launch` must not start a second copy — design/session-game-lifetime.md.
 mod launchreg;
 mod library;
+#[forbid(unsafe_code)]
+mod link_health;
 mod log_capture;
 // Network-facing secure-default surface. `not(test)` because tests mutate process env
 // (`set_var` is unsafe in 2024) and `native` has in-process C-ABI roundtrips.
@@ -322,6 +326,24 @@ pub(crate) fn refresh_capture_monitor_anchor(context: &str) {
     }
 }
 
+/// Take the credentials out of our own environment before anything can inherit them: hooks, games
+/// and the plugin runner are children of this process, and none of them has business with the
+/// admin API. `mgmt_token` keeps the values and persists a pinned one to its file.
+fn take_env_credentials() {
+    let read = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    mgmt_token::adopt_env_tokens(read("PUNKTFUNK_MGMT_TOKEN"), read("PUNKTFUNK_PLUGIN_TOKEN"));
+    for key in mgmt_token::CREDENTIAL_ENV_VARS {
+        // SAFETY: the first statement of `real_main`, so this process is still single-threaded and
+        // nothing can read the environment concurrently.
+        unsafe { std::env::remove_var(key) };
+    }
+}
+
 // Package/service/driver CLI: skip the banner and the Windows GPU-pref hook (its DPI
 // probe WARNs `access denied` on `plugins add`). `service run` is the SCM host, not CLI.
 fn is_management_cli(args: &[String]) -> bool {
@@ -335,6 +357,8 @@ fn is_management_cli(args: &[String]) -> bool {
         | Some("openapi")
         | Some("library")
         | Some("detect-conflicts")
+        // The per-app audio pin, run as the console user by the capture thread.
+        | Some("voice-route")
         // Prints the same list `refresh_capture_monitor_anchor` would log; skip host startup.
         | Some("list-monitors")
         | Some("-h")
@@ -347,6 +371,7 @@ fn is_management_cli(args: &[String]) -> bool {
 }
 
 fn real_main() -> Result<()> {
+    take_env_credentials();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if matches!(
@@ -403,6 +428,8 @@ fn real_main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("serve") => {
             let (mgmt_opts, native, gamestream) = parse_serve(&args[1..])?;
+            // Restart-class settings changed after this point wait for a restart.
+            pf_host_config::mark_started();
             // Must run before any new session touches the topology.
             windows::entry::serve_startup_recover();
             gamestream::serve(mgmt_opts, native, gamestream)
@@ -460,7 +487,7 @@ fn real_main() -> Result<()> {
             let monitor_hdr = pf_capture::gnome_hdr_monitor_active();
             let hevc10 = encode::can_encode_10bit(encode::Codec::H265);
             let av110 = encode::can_encode_10bit(encode::Codec::Av1);
-            let gs_binary_hdr = pf_vdisplay::gamescope_hdr_available();
+            let gs_binary_hdr = pf_vdisplay::gamescope_hdr_available(None);
             let gs_knob = pf_host_config::config().gamescope_hdr;
             let compositor = vdisplay::detect().ok();
             println!("monitor in BT.2100 (HDR) colour mode: {monitor_hdr}");
@@ -470,14 +497,14 @@ fn real_main() -> Result<()> {
             // full-frame blend. Invisible until you compare two streams, so print it here.
             println!(
                 "gamescope paints the cursor in-node:  {}",
-                pf_vdisplay::gamescope_composites_cursor()
+                pf_vdisplay::gamescope_composites_cursor(None)
             );
             println!("encoder Main10 (HEVC): {hevc10}");
             println!("encoder 10-bit (AV1):  {av110}");
             println!(
                 "native-plane HDR on the resolved compositor ({}): {}",
                 compositor.map_or("none".to_string(), |c| format!("{c:?}")),
-                crate::capture::capturer_supports_hdr_for(compositor)
+                crate::capture::capturer_supports_hdr_for(compositor, None)
             );
             println!(
                 "GameStream HDR capable (PUNKTFUNK_10BIT + a capable source + encoder): {}",
@@ -492,6 +519,10 @@ fn real_main() -> Result<()> {
             println!("{compositor:?} ready");
             Ok(())
         }
+        // `voice-route set|clear …`: the per-app output pin. The capture thread spawns it as the
+        // console user, because a SYSTEM caller writes SYSTEM's app preferences, not the user's.
+        #[cfg(target_os = "windows")]
+        Some("voice-route") => audio::voice_route_cli(&args[1..]),
         // Connector names `PUNKTFUNK_CAPTURE_MONITOR` takes — available before the mgmt API is up.
         #[cfg(target_os = "linux")]
         Some("list-monitors") => {
@@ -649,14 +680,6 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
                     .map_err(|_| anyhow::anyhow!("bad --mgmt-bind (want IP:PORT)"))?;
                 mgmt_bind_explicit = true;
             }
-            "--mgmt-token" => {
-                let token = next()?;
-                // Empty satisfies "token required" while authenticating nobody (`"$UNSET_VAR"`).
-                if token.trim().is_empty() {
-                    bail!("--mgmt-token must not be empty");
-                }
-                opts.token = Some(token);
-            }
             // No-op: the native plane always runs.
             "--native" => {}
             "--native-port" => {
@@ -695,7 +718,7 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
         }
         i += 1;
     }
-    // Flag, else env, else persisted `mgmt-token`, else generate. HTTPS+token even on loopback.
+    // Env (persisted), else the `mgmt-token` file, else generate. HTTPS+token even on loopback.
     if opts.token.is_none() {
         opts.token = Some(crate::mgmt_token::load_or_generate()?);
     }
@@ -703,6 +726,10 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
     // on disk for a subsystem that is not running. Scope: `plugin_may_access`, not pairing/hooks.
     if crate::plugins::runtime_status().installed {
         opts.plugin_token = Some(crate::mgmt_token::load_or_generate_plugin()?);
+        // One token per installed plugin, so the API can tell them apart: a plugin may write its
+        // own registration and its own provider, and no other's.
+        let ids: Vec<String> = crate::plugins::manifest::installed().into_keys().collect();
+        opts.plugin_tokens = crate::mgmt_token::load_or_generate_per_plugin(&ids)?;
     }
     // Default all-interfaces so paired clients browse over mTLS. Admin stays loopback in
     // `require_auth`. Packaged units ship a fixed ExecStart — `host.env` is the upgrade-safe pin;
@@ -761,10 +788,21 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
     )
     .parse()
     .map_err(|_| anyhow::anyhow!("bad --webtransport-bind '{webtransport_host}' (want an IP)"))?;
-    // CLI or `PUNKTFUNK_GAMESTREAM`. Packaged units ship native-only ExecStart; env is the pin.
-    let gamestream = gamestream || pf_host_config::config().gamestream;
+    // A flag outranks env and the console's value; pinning it lets the console show why.
+    if gamestream {
+        pf_host_config::pin("gamestream", "--gamestream", serde_json::Value::Bool(true));
+    }
+    if webtransport {
+        pf_host_config::pin(
+            "webtransport",
+            "--webtransport",
+            serde_json::Value::Bool(true),
+        );
+    }
+    let gamestream = pf_host_config::config().gamestream;
     let native = native::NativeServe {
-        webtransport_bind: (webtransport || pf_host_config::config().webtransport)
+        webtransport_bind: pf_host_config::config()
+            .webtransport
             .then_some(webtransport_bind),
         ..native
     };
@@ -933,9 +971,6 @@ SERVE OPTIONS:
                                  bind loopback only. Move the PORT (e.g. 0.0.0.0:47991) to share a
                                  machine with Sunshine/Apollo/Vibeshine, whose web UI owns 47990 —
                                  clients follow via mDNS and the console via mgmt-endpoint
-    --mgmt-token <TOKEN>         bearer token for the management API (or PUNKTFUNK_MGMT_TOKEN); the
-                                 admin endpoints it guards are honored only from a loopback peer
-                                 (the co-located web console), never over the LAN
     --gamestream  (--moonlight)  ALSO run the GameStream/Moonlight-compat planes (nvhttp pairing,
                                  RTSP, ENet control, _nvstream mDNS). OFF by default — they carry
                                  inherent on-path weaknesses (plain-HTTP pairing + legacy GCM nonce

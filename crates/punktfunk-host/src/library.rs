@@ -24,7 +24,6 @@ mod custom;
 mod detect;
 mod hidden;
 mod launch;
-mod plugin_launch;
 mod scanners;
 mod stats;
 
@@ -33,7 +32,6 @@ pub use custom::*;
 pub use detect::*;
 pub use hidden::*;
 pub use launch::*;
-pub use plugin_launch::*;
 pub use scanners::*;
 pub use stats::*;
 
@@ -58,12 +56,26 @@ pub struct Artwork {
 /// How the host launches a title. Open-ended so new stores slot in:
 /// `steam_appid` → `steam steam://rungameid/<value>`; `command` → run `<value>`
 /// nested in a gamescope session.
-#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Default, Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct LaunchSpec {
     /// `"steam_appid"` or `"command"`.
     #[schema(example = "steam_appid")]
     pub kind: String,
-    /// Appid for `steam_appid`, or the shell command for `command`.
+    /// Appid for `steam_appid`, the shell command for `command`, or — for `exec` — the name of a
+    /// template in the publishing plugin's manifest.
+    pub value: String,
+    /// Values for an `exec` template's parameters. Each is checked against the character class
+    /// the manifest declares for it, and a path must sit inside the paths that manifest names.
+    /// A list rather than a map: a map of strings generates as an untyped object in the SDK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<LaunchArg>>,
+}
+
+/// One `{param}` value for an `exec` template.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct LaunchArg {
+    /// The parameter's name in the template.
+    pub name: String,
     pub value: String,
 }
 

@@ -204,9 +204,10 @@ in
         description = ''
           `host.env` key/value pairs passed to the service via `EnvironmentFile`. See
           `''${package}/share/punktfunk-host/host.env.example` for the full surface. Booleans render
-          as `1`/`0`. Leave empty to rely on the host's per-connect auto-detection of the
-          compositor + input backend. Do NOT put secrets here (world-readable in the store) — use
-          `environmentFile` instead.
+          as `1`/`0`. A key the web console also offers (Host → Settings) is locked there while it
+          is set here. Leave empty to rely on the host's per-connect auto-detection of the
+          compositor + input backend. Secrets are REFUSED here (this renders to a world-readable
+          store path) — use `environmentFile`, or let the host generate them.
         '';
       };
 
@@ -215,8 +216,10 @@ in
         default = null;
         example = "/run/secrets/punktfunk-host.env";
         description = ''
-          Extra `EnvironmentFile` layered AFTER `settings` (its values win). For secrets such as
-          `PUNKTFUNK_MGMT_TOKEN`. Loaded optionally (a missing file does not fail the unit).
+          Extra `EnvironmentFile` layered AFTER `settings` (its values win), for values that must
+          not reach the store. Loaded optionally (a missing file does not fail the unit). The host
+          keeps its own credentials in `~/.config/punktfunk/`, owner-only, and takes them out of its
+          environment at startup so the games and hooks it launches cannot inherit them.
         '';
       };
 
@@ -310,24 +313,16 @@ in
 
       bind = mkOption {
         type = types.str;
-        default = if cfg.web.openFirewall then "0.0.0.0" else "127.0.0.1";
-        defaultText = literalExpression ''if openFirewall then "0.0.0.0" else "127.0.0.1"'';
-        example = "100.64.0.3";
+        default = "0.0.0.0";
+        example = "127.0.0.1";
         description = ''
-          The address the console listens on: `127.0.0.1` for this machine only, `0.0.0.0` for
-          every interface, or one address such as a VPN interface. The plugin-UI origin on 47993
-          follows it, always.
+          The address the console listens on: `0.0.0.0` for every interface, `127.0.0.1` for this
+          machine only, or one address such as a VPN interface. The plugin-UI origin on 47993
+          follows it, always. On any bind the console answers only peers on the local network or a
+          VPN (RFC 1918, link-local, IPv6 unique-local, Tailscale's 100.64/10), never the internet.
 
           This is the imperative install's `PUNKTFUNK_UI_BIND` in `host.env`; on NixOS the option
-          is the source and `host.env` is not read by the console. The default follows
-          `openFirewall`, because a configuration that opened 47992 asked for the LAN in so many
-          words, while one that did not was only reachable there by accident — so a rebuild onto
-          this release never takes a console off a network its owner declared.
-
-          The one case that signal misses is `networking.firewall.enable = false`, where nothing
-          was opened because nothing is closed. A rebuild moves that console to loopback with no
-          warning; set this to `"0.0.0.0"` to keep it. There is no imperative migration step on
-          NixOS, so the option is the only place this can be said.
+          is the source and `host.env` is not read by the console.
         '';
       };
 
@@ -395,6 +390,18 @@ in
     # --- shared: whenever either half is enabled -----------------------------------------------
     (mkIf (cfg.host.enable || cfg.client.enable) {
       assertions = [
+        {
+          # `settings` renders to a world-readable store path, and every value in it is inherited
+          # by the games and hooks the host launches.
+          assertion = !(lib.any (k: lib.hasInfix "TOKEN" k || lib.hasInfix "PASSWORD" k) (
+            lib.attrNames cfg.host.settings
+          ));
+          message = ''
+            services.punktfunk.host.settings must not carry a token or a password: it becomes a
+            world-readable file in the Nix store. Use services.punktfunk.host.environmentFile, or
+            let the host generate its own credentials in ~/.config/punktfunk/.
+          '';
+        }
         {
           assertion = system == "x86_64-linux";
           message = "services.punktfunk is x86_64-linux only (desktop NVENC host; no aarch64 build).";
@@ -703,8 +710,7 @@ in
           # Hardcoding it here would have to out-rank the file, which is a directive-ordering
           # question in the generated unit — so we simply do not create the conflict.
           PORT = "47992";
-          # Where both listeners bind (`web.bind`). The server's own default is loopback, so this
-          # is the only thing standing between a NixOS console and this machine only.
+          # Where both listeners bind (`web.bind`).
           PUNKTFUNK_UI_BIND = cfg.web.bind;
           # Serve HTTPS with the host's own identity cert (the anchor native clients already pin) and
           # mark the session cookie Secure. The host's `serve` writes these PEMs.
@@ -754,6 +760,8 @@ in
         # and retries per unit, so this is ordering only, not a hard requirement).
         after = [ "punktfunk-host.service" ];
         wantedBy = optional cfg.scripting.autoStart "default.target";
+        # Each plugin runs inside its own `bwrap` sandbox, built by the runner.
+        path = [ pkgs.bubblewrap ];
         serviceConfig = {
           Type = "simple";
           ExecStart = "${cfg.scripting.package}/bin/punktfunk-scripting";
@@ -765,11 +773,10 @@ in
           KillSignal = "SIGTERM";
           TimeoutStopSec = 30;
 
-          # Sandbox — the same confinement scripts/punktfunk-scripting.service gives the deb/rpm
-          # installs. The runner `import()`s the operator's own `.ts` files, so this is the one unit
-          # here that executes arbitrary code by design; without these it ran strictly LESS confined
-          # on NixOS than on every other channel. Keep the two files in step: module-check.nix
-          # asserts each directive below.
+          # Unit-level hardening, the same scripts/punktfunk-scripting.service gives the deb/rpm
+          # installs — keep the two in step, module-check.nix asserts each directive. It confines
+          # the supervisor and the operator's loose scripts, not a PLUGIN: those get their own
+          # bwrap sandbox, because a mount namespace on a same-uid unit is no boundary.
           NoNewPrivileges = true;
           # PrivateTmp deliberately OFF (field report 2026-08-03, the VirtualHere plugin). A
           # plugin's whole job is integrating with things already running on this box, and on Linux
@@ -825,6 +832,10 @@ in
           # the home and points ExecStart at it. Every path is '-' because none is guaranteed.
           BindReadOnlyPaths = [
             "-%h/.config/punktfunk/plugin-token"
+            # What the supervisor hands each sandbox: that plugin's own minted token, and the roots
+            # `plugins grant` added. Without them no plugin with a manifest starts at all.
+            "-%h/.config/punktfunk/plugin-tokens.json"
+            "-%h/.config/punktfunk/plugin-grants.json"
             "-%h/.config/punktfunk/native-cert.pem"
             "-%h/.config/punktfunk/cert.pem"
             "-%h/.config/punktfunk/mgmt-endpoint"
@@ -842,18 +853,20 @@ in
           ];
           # Puts back the write bit ProtectSystem=strict takes away from the real /tmp above.
           ReadWritePaths = [ "/tmp" ];
-          # Free for a JS runtime that only talks HTTP and reads files. Two are absent on purpose:
-          # MemoryDenyWriteExecute because bun JITs, and PrivateDevices because a plugin's vendor
-          # binary integrates with hardware already on this box (VirtualHere forwards USB).
-          ProtectKernelTunables = true;
+          # Free for a JS runtime that only talks HTTP and reads files. Absent on purpose:
+          # MemoryDenyWriteExecute (bun JITs), PrivateDevices (VirtualHere forwards USB), and
+          # ProtectKernelTunables, which refuses bwrap a fresh /proc; the sandbox binds /proc/sys ro.
           ProtectControlGroups = true;
-          RestrictNamespaces = true;
+          # Exactly the namespaces each plugin's bwrap sandbox is built from; `true` starts no plugin.
+          RestrictNamespaces = "user mnt pid net ipc uts cgroup";
           SystemCallArchitectures = "native";
           CapabilityBoundingSet = "";
+          # AF_NETLINK brings up a sandbox's loopback; its seccomp filter keeps it from the plugin.
           RestrictAddressFamilies = [
             "AF_UNIX"
             "AF_INET"
             "AF_INET6"
+            "AF_NETLINK"
           ];
         };
       };

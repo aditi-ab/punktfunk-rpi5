@@ -139,12 +139,17 @@ pub struct Encoder {
     /// Pictures encoded so far; the next one's `wire`.
     wire: i64,
     coded_buf: VaBufferId,
-    /// Ingest: every capture shape is converted — a larger one scaled — into the
-    /// input surface here.
+    /// Ingest: RGB captures are converted — a larger one scaled — into the input
+    /// surface here. A producer's own NV12/P010 skips it (`direct`).
     vpp: Vpp,
     /// Where CPU RGB lands before conversion, and the (fourcc, width, height) it
     /// was made for.
     staging: Option<(VaSurfaceId, (u32, u32, u32))>,
+    /// A producer's own NV12/P010 at the session's size: the next picture is encoded
+    /// straight from this import, no VPP pass. Destroyed once that encode has synced.
+    direct: Option<VaSurfaceId>,
+    /// The first direct picture has been logged; a field log, not a per-frame one.
+    direct_seen: bool,
     params: SessionParams,
     /// Frames encoded since the last IDR; `frame_num` in the slice header.
     frame_num: u16,
@@ -399,6 +404,8 @@ impl Encoder {
             coded_buf,
             vpp,
             staging: None,
+            direct: None,
+            direct_seen: false,
             params,
             frame_num: 0,
             idr_pic_id: 0,
@@ -480,6 +487,22 @@ impl Encoder {
         matches!(self.codec, Codec::Hevc(h) if h.ten_bit)
     }
 
+    /// The VUI colour triple this session emits (`[1,1,1]` BT.709, `[9,16,9]` BT.2020 PQ). The
+    /// VPP RGB→YUV matrix follows it, so a 10-bit SDR session converts as BT.709, not BT.2020.
+    fn colour(&self) -> [u8; 3] {
+        match self.codec {
+            Codec::Hevc(h) => h.colour,
+            _ => pf_vaapi::hevc::COLOUR_BT709,
+        }
+    }
+
+    /// Drop a pending direct picture: its encode synced, or a later submit replaced it.
+    fn clear_direct(&mut self) {
+        if let Some(surface) = self.direct.take() {
+            self.display.destroy_surface(surface);
+        }
+    }
+
     /// Fill the next input surface with NV12 from `y` and `uv`, for tests. Capture
     /// goes through [`Self::submit_packed`] or [`Self::submit_dmabuf`].
     pub fn write_nv12(&self, y: &[u8], uv: &[u8]) -> Result<()> {
@@ -532,6 +555,7 @@ impl Encoder {
             Some(rt @ (VA_RT_FORMAT_RGB32 | VA_RT_FORMAT_RGB32_10)) => rt,
             _ => bail!("no packed RGB ingest for fourcc {fourcc:#x}"),
         };
+        self.clear_direct();
         let shape = (fourcc, width, height);
         let staging = match self.staging {
             Some((surface, s)) if s == shape => surface,
@@ -552,14 +576,14 @@ impl Encoder {
             staging,
             (width, height),
             true,
-            self.ten_bit(),
+            self.colour(),
             self.input_surface(),
         )
     }
 
-    /// Ingest a capture dmabuf: imported for this picture, converted — and scaled
-    /// down when larger — into the next input surface at the session's depth,
-    /// released.
+    /// Ingest a capture dmabuf, imported for this picture. A producer's own NV12/P010
+    /// at the session's size and depth is encoded as imported; anything else is
+    /// converted — and scaled down when larger — into the next input surface.
     pub fn submit_dmabuf(&mut self, source: &DmabufSource) -> Result<()> {
         let rt_format = pf_vaapi::vpp::import_format(source.drm_fourcc)
             .map(|(_, rt)| rt)
@@ -567,12 +591,31 @@ impl Encoder {
         let is_rgb = rt_format == VA_RT_FORMAT_RGB32 || rt_format == VA_RT_FORMAT_RGB32_10;
         // Imported once per picture; a cache keyed on the fd would save the ioctl.
         let surface = self.display.import_dmabuf(source)?;
+        if direct_ingest(
+            rt_format,
+            (source.width, source.height),
+            (self.params.width, self.params.height),
+            self.ten_bit(),
+            self.vpp.crop.is_some(),
+        ) {
+            self.clear_direct();
+            self.direct = Some(surface);
+            if !self.direct_seen {
+                self.direct_seen = true;
+                tracing::info!(
+                    fourcc = format_args!("{:#010x}", source.drm_fourcc),
+                    ten_bit = self.ten_bit(),
+                    "VAAPI: encoding the producer's own picture direct (no conversion pass)"
+                );
+            }
+            return Ok(());
+        }
         let converted = self.vpp.convert(
             &self.display,
             surface,
             (source.width, source.height),
             is_rgb,
-            self.ten_bit(),
+            self.colour(),
             self.input_surface(),
         );
         self.display.destroy_surface(surface);
@@ -651,7 +694,7 @@ impl Encoder {
             max_slots: slot_count as u8,
             reference_slot: reference.map(|s| s as u8),
         };
-        let surface = self.input[self.next_surface];
+        let surface = self.direct.unwrap_or(self.input[self.next_surface]);
         let recon = self
             .free
             .pop()
@@ -698,6 +741,7 @@ impl Encoder {
         let status = unsafe { (self.display.va.sync_surface)(self.display.display, surface) };
         let synced = self.display.va.check("vaSyncSurface", status);
         let bytes = synced.and_then(|()| self.read_coded());
+        self.clear_direct();
         let bytes = match bytes {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1126,6 +1170,7 @@ impl Drop for Encoder {
     /// The display is dropped last, by its own `Drop`.
     fn drop(&mut self) {
         self.vpp.destroy(&self.display);
+        self.clear_direct();
         if let Some((staging, _)) = self.staging.take() {
             self.display.destroy_surface(staging);
         }
@@ -1154,4 +1199,44 @@ pub fn open(params: SessionParams, codec: CodecParams) -> Result<Encoder> {
     let va = crate::Libva::load().context("libva")?;
     let display = Display::open(va).context("no VAAPI display")?;
     Encoder::new(display, params, codec).map_err(|e| anyhow!("{e:#}"))
+}
+
+/// A dmabuf already in the session's format and size needs no VPP pass. A crop (a
+/// mirrored head) still needs one: the encoder reads the whole surface.
+fn direct_ingest(
+    rt_format: u32,
+    source: (u32, u32),
+    session: (u32, u32),
+    ten_bit: bool,
+    cropped: bool,
+) -> bool {
+    let session_rt = if ten_bit {
+        VA_RT_FORMAT_YUV420_10
+    } else {
+        VA_RT_FORMAT_YUV420
+    };
+    rt_format == session_rt && source == session && !cropped
+}
+
+#[cfg(test)]
+mod direct_ingest_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_matching_yuv_source_skips_the_vpp_pass() {
+        let s = (1920, 1080);
+        assert!(direct_ingest(VA_RT_FORMAT_YUV420, s, s, false, false));
+        assert!(direct_ingest(VA_RT_FORMAT_YUV420_10, s, s, true, false));
+        // Depth, size, RGB and a crop each keep the conversion.
+        assert!(!direct_ingest(VA_RT_FORMAT_YUV420, s, s, true, false));
+        assert!(!direct_ingest(
+            VA_RT_FORMAT_YUV420,
+            (3840, 2160),
+            s,
+            false,
+            false
+        ));
+        assert!(!direct_ingest(VA_RT_FORMAT_RGB32, s, s, false, false));
+        assert!(!direct_ingest(VA_RT_FORMAT_YUV420, s, s, false, true));
+    }
 }

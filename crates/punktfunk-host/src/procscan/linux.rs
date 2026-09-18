@@ -130,6 +130,29 @@ impl Scanner {
             .collect()
     }
 
+    /// `(pid, parent)` for every own process, from `stat`.
+    pub fn parents(&self) -> Vec<(u32, u32)> {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+                if let Some(uid) = self.uid {
+                    use std::os::unix::fs::MetadataExt;
+                    if std::fs::metadata(e.path()).ok()?.uid() != uid {
+                        return None;
+                    }
+                }
+                let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+                let tail = &stat[stat.rfind(')')? + 1..];
+                let ppid = tail.split_whitespace().nth(1)?.parse().ok()?;
+                Some((pid, ppid))
+            })
+            .collect()
+    }
+
     fn matches(
         &self,
         dir_path: &Path,
