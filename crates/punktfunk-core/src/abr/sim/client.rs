@@ -144,7 +144,10 @@ struct InFlight {
 pub(super) struct Client {
     cfg: ClientCfg,
     rng: Rng,
-    /// The scenario's zero, so a millisecond can become an `Instant`.
+    /// The scenario's zero, so a millisecond can become an `Instant`. Not the
+    /// instant this session joined: a session that joins at 60 s still reads
+    /// the run's clock, and dating a probe result from its own start put its
+    /// report windows a minute into the future.
     base: Instant,
     pub(super) abr: Driver,
     flight: VecDeque<InFlight>,
@@ -190,7 +193,7 @@ pub(super) struct Client {
 }
 
 impl Client {
-    pub(super) fn new(cfg: ClientCfg, seed: u64, base: Instant) -> Self {
+    pub(super) fn new(cfg: ClientCfg, seed: u64, base: Instant, joined: Instant) -> Self {
         let abr = Driver::new(
             DriverConfig {
                 start_kbps: if cfg.automatic { cfg.start_kbps } else { 0 },
@@ -206,7 +209,7 @@ impl Client {
                 probe_target_kbps: cfg.probe_target_kbps,
                 ramp: cfg.ramp,
             },
-            base,
+            joined,
         );
         Client {
             rng: Rng::new(seed),
@@ -612,7 +615,7 @@ mod tests {
     }
 
     fn client(base: Instant) -> Client {
-        Client::new(ClientCfg::default(), 11, base)
+        Client::new(ClientCfg::default(), 11, base, base)
     }
 
     fn loss_ppm(c: &Client) -> u32 {
@@ -713,6 +716,7 @@ mod tests {
                 ..ClientCfg::default()
             },
             1,
+            base,
             base,
         );
         let mut out = Vec::new();

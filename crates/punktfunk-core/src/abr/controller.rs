@@ -656,6 +656,16 @@ impl BitrateController {
             self.baselines.clear_encode();
             self.current_kbps = kbps;
         }
+        // A share above this session's own ceiling is the host saying the path
+        // carries more than this session measured — which it does, because a
+        // wall measured beside a sibling read that sibling's residual. Only
+        // the host can see that, so the reading it refutes goes with it.
+        if kbps > self.ceiling_kbps {
+            self.raise_ceiling(kbps);
+            self.link_cap.drop_cap();
+            self.probing = true;
+            self.rate_verdict = false;
+        }
         tracing::info!(
             share_kbps = kbps,
             "adaptive bitrate: the host divided this path — climbs stop at this session's share"
