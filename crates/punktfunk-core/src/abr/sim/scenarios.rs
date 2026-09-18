@@ -922,12 +922,17 @@ pub(super) fn host_rebuild_stall() -> Scenario {
     host_rebuild("host_rebuild_stall", 0x7A_6900, 171_294, 20_150)
 }
 
-/// The same stall 400 ms earlier in its window, on a session still climbing:
-/// the discarded window swallows most of the wave and two asks reach the
-/// judged one. Under the severe bar, at `RECOVERY_KF_BAD` — enough to end
-/// slow start, which is the whole of what it costs.
+/// The same stall earlier in its window, on a session still climbing: the
+/// discarded window swallows most of the wave and three asks reach the judged
+/// one. Under the severe bar, at `RECOVERY_KF_BAD` — enough to end slow
+/// start, which is the whole of what it costs.
+///
+/// Where the stall falls inside its window is the whole scenario, so the
+/// offset follows the window phase: the ramp's confirmation step moved every
+/// boundary by ~50 ms and six asks were landing in the judged window, which
+/// is the sibling row's case, not this one's.
 pub(super) fn host_rebuild_wave() -> Scenario {
-    host_rebuild("host_rebuild_wave", 0x7A_7000, 20_000, 4_850)
+    host_rebuild("host_rebuild_wave", 0x7A_7000, 20_000, 4_550)
 }
 
 /// The probe declined or refused: no ceiling was ever learned, so the
@@ -1158,7 +1163,9 @@ mod tests {
     ///
     /// Steps, bytes and milliseconds are pinned here rather than in the
     /// baseline, which cannot see them: what the measurement costs the link
-    /// is the whole point of replacing the burst.
+    /// is the whole point of replacing the burst. A wall costs one step more
+    /// than the rate that found it — a lossless refusal is asked again before
+    /// it is believed.
     #[test]
     fn the_bring_up_ramp_measures_each_link_and_stops() {
         // Scenario · wall · steps · rates asked · payload KB · ms.
@@ -1167,19 +1174,19 @@ mod tests {
             (
                 with_ramp(wan_wg_12(0x7A_5500, 180_000)),
                 true,
-                3,
+                4,
                 5_000,
                 20_000,
-                110,
+                180,
                 300,
             ),
             (
                 with_ramp(wifi_tv_probe_damage()),
                 true,
-                7,
+                8,
                 5_000,
                 320_000,
-                2_100,
+                3_100,
                 700,
             ),
         ] {
