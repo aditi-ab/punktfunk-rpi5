@@ -123,7 +123,8 @@ fn window_json(w: &WindowRecord, held_ms: u64) -> String {
             r#"{{"t_ms":{},"target_kbps":{},"request_kbps":{},"delivered_kbps":{},"#,
             r#""loss_ppm":{},"lost_frames":{},"owd_mean_us":{},"decode_mean_us":{},"#,
             r#""encode_mean_us":{},"delay_rise_us":{},"delay_last_us":{},"#,
-            r#""keyframe_asks":{},"held_ms":{},"flushed":{},"discarded":{},"#,
+            r#""activity":"{:?}","keyframe_asks":{},"held_ms":{},"flushed":{},"#,
+            r#""discarded":{},"#,
             r#""reason":"{:?}"}}"#
         ),
         w.t_ms,
@@ -137,6 +138,7 @@ fn window_json(w: &WindowRecord, held_ms: u64) -> String {
         opt(w.sample.encode_mean_us),
         opt(w.sample.delay.map(|d| d.rise_us)),
         opt(w.sample.delay.map(|d| d.last_us)),
+        w.sample.activity,
         w.sample.recovery_kf,
         held_ms,
         w.sample.flushed,
