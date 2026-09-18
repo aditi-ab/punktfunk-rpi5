@@ -673,15 +673,13 @@ impl BitrateController {
             self.baselines.clear_encode();
             self.current_kbps = kbps;
         }
-        // A share above this session's own ceiling is the host saying the path
-        // carries more than this session measured — which it does, because a
-        // wall measured beside a sibling read that sibling's residual. Only
-        // the host can see that, so the reading it refutes goes with it.
+        // A share above this session's ceiling is the host saying the path has
+        // room, not that this session's wall was a sibling's queue: one
+        // address is one NAT, and the sibling may be on other air. The
+        // allowance rises, the wall stands, and the cap is asked again now.
         if kbps > self.ceiling_kbps {
             self.raise_ceiling(kbps);
-            self.link_cap.drop_cap();
-            self.probing = true;
-            self.rate_verdict = false;
+            self.link_cap.lift_now();
         }
         tracing::info!(
             share_kbps = kbps,
@@ -1973,6 +1971,30 @@ mod tests {
         );
         assert_eq!(c.share_cap, None);
         climb_to(&mut c, start, &mut t, 40_000);
+    }
+
+    /// A share above this session's ceiling is an allowance, not evidence
+    /// about its own air: the wall it measured stands, slow start does not
+    /// re-arm, and the cap is asked again at the next window instead of on
+    /// its clock.
+    #[test]
+    fn a_share_above_the_ceiling_keeps_the_wall_and_asks_it_again() {
+        let mut c = BitrateController::new(20_000, None);
+        // Two deliveries at one rate are a wall; the verdict that marked them
+        // is what ends slow start in a live session.
+        c.note_link_mark(12_000);
+        c.note_link_mark(11_500);
+        c.probing = false;
+        let cap = c.link_cap.kbps().expect("two marks are a wall");
+        c.on_ack(24_000, Some(AckReason::Governor));
+        assert_eq!(c.link_cap.kbps(), Some(cap), "a sibling's queue is not it");
+        assert!(!c.probing, "and a share is not licence to double");
+        assert_eq!(c.ceiling_kbps, 24_000, "only the allowance moved");
+        // Parked at the wall, the next clean window asks it again: one step,
+        // where the clock would have held for a re-probe interval.
+        c.on_ack(cap, None);
+        run_clean(&mut c, Instant::now(), 0, 1);
+        assert_eq!(c.link_cap.kbps(), Some(cap + cap / 8));
     }
 
     /// A share that lands while a request is outstanding is not an answer to
