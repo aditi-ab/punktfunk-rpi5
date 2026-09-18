@@ -1688,18 +1688,6 @@ impl NativeClient {
         Ok(())
     }
 
-    /// Replace the controller-mouse layout — plain buttons, chords, and the pointer, scroll,
-    /// deadzone and long-press tunables — from a JSON document. `None` restores the shipped
-    /// table. A pad already in controller mouse keeps the layout it entered with.
-    pub fn set_pad_mouse_layout(&self, doc: Option<&str>) -> Result<()> {
-        let layout = match doc {
-            Some(json) => pad_mouse::Layout::parse(json)?,
-            None => pad_mouse::Layout::default(),
-        };
-        self.pad_mouse.set_layout(layout);
-        Ok(())
-    }
-
     /// Pads the embedder switched to controller mouse and that are still connected.
     pub fn pad_mouse(&self) -> u16 {
         self.pad_mouse.active(self.access_grants())
