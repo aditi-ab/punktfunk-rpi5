@@ -122,7 +122,7 @@ fn window_json(w: &WindowRecord, held_ms: u64) -> String {
         concat!(
             r#"{{"t_ms":{},"target_kbps":{},"request_kbps":{},"delivered_kbps":{},"#,
             r#""loss_ppm":{},"lost_frames":{},"owd_mean_us":{},"decode_mean_us":{},"#,
-            r#""encode_mean_us":{},"delay_rise_us":{},"delay_last_us":{},"#,
+            r#""encode_mean_us":{},"delay_mean_us":{},"delay_rise_us":{},"delay_last_us":{},"#,
             r#""activity":"{:?}","keyframe_asks":{},"held_ms":{},"flushed":{},"#,
             r#""discarded":{},"#,
             r#""reason":"{:?}"}}"#
@@ -136,6 +136,8 @@ fn window_json(w: &WindowRecord, held_ms: u64) -> String {
         opt(w.sample.owd_mean_us),
         opt(w.sample.decode_mean_us),
         opt(w.sample.encode_mean_us),
+        // The lift bar and the drain guard both read the mean, not the slope.
+        opt(w.sample.delay.map(|d| d.mean_us)),
         opt(w.sample.delay.map(|d| d.rise_us)),
         opt(w.sample.delay.map(|d| d.last_us)),
         w.sample.activity,
@@ -354,6 +356,7 @@ pub fn run(
 
 /// One JSON line per window, then the summary. Returns the summary's
 /// [`metrics::HEADER`] row.
+#[allow(clippy::too_many_arguments)]
 fn write_trajectory(
     mut out: impl Write,
     ramp: Option<&punktfunk_core::abr::RampRecord>,
@@ -517,6 +520,14 @@ mod tests {
         let mut w = rec(1_500, 9_800, Some(6_800), 2);
         w.discarded = true;
         w.reason = Reason::Owd;
+        // The three delay columns are distinct numbers here: a recorder that
+        // wired the slope into the mean would read the same either way.
+        w.sample.delay = Some(punktfunk_core::abr::DelayTrend {
+            samples: 30,
+            mean_us: 41_000,
+            rise_us: 7_000,
+            last_us: 52_000,
+        });
         let line = window_json(&w, 480);
         for want in [
             r#""t_ms":1500"#,
@@ -526,6 +537,9 @@ mod tests {
             r#""lost_frames":2"#,
             r#""owd_mean_us":12000"#,
             r#""decode_mean_us":null"#,
+            r#""delay_mean_us":41000"#,
+            r#""delay_rise_us":7000"#,
+            r#""delay_last_us":52000"#,
             r#""discarded":true"#,
             r#""held_ms":480"#,
             r#""reason":"Owd""#,
