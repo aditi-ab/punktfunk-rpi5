@@ -15,7 +15,7 @@ const paths = {
 	tokenFile: "/home/u/.config/punktfunk/plugin-state/demo/.plugin-token",
 	socket: "/run/user/1000/punktfunk/plugin-demo.sock",
 	pluginsDir: "/home/u/.config/punktfunk/plugins",
-	bun: "/usr/lib/punktfunk-scripting/bun",
+	bun: "/usr/lib/punktfunk-bun/bun",
 	runner: "/usr/share/punktfunk-scripting/runner-cli.js",
 	home: "/home/u",
 };
