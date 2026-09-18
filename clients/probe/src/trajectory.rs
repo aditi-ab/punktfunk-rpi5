@@ -122,8 +122,9 @@ fn window_json(w: &WindowRecord, held_ms: u64) -> String {
         concat!(
             r#"{{"t_ms":{},"target_kbps":{},"request_kbps":{},"delivered_kbps":{},"#,
             r#""loss_ppm":{},"lost_frames":{},"owd_mean_us":{},"decode_mean_us":{},"#,
-            r#""encode_mean_us":{},"keyframe_asks":{},"held_ms":{},"flushed":{},"#,
-            r#""discarded":{},"reason":"{:?}"}}"#
+            r#""encode_mean_us":{},"delay_rise_us":{},"delay_last_us":{},"#,
+            r#""keyframe_asks":{},"held_ms":{},"flushed":{},"discarded":{},"#,
+            r#""reason":"{:?}"}}"#
         ),
         w.t_ms,
         w.rate_kbps,
@@ -134,6 +135,8 @@ fn window_json(w: &WindowRecord, held_ms: u64) -> String {
         opt(w.sample.owd_mean_us),
         opt(w.sample.decode_mean_us),
         opt(w.sample.encode_mean_us),
+        opt(w.sample.delay.map(|d| d.rise_us)),
+        opt(w.sample.delay.map(|d| d.last_us)),
         w.sample.recovery_kf,
         held_ms,
         w.sample.flushed,
@@ -408,6 +411,7 @@ mod tests {
                 dropped,
                 loss_ppm: 0,
                 owd_mean_us: Some(12_000),
+                delay: None,
                 decode_mean_us: None,
                 encode_mean_us: None,
                 actual_kbps: rate_kbps * 9 / 10,
