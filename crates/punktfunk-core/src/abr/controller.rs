@@ -22,7 +22,8 @@ use super::cap::{LearnedCap, StandDown, StepProbe};
 use super::growth::{self, Proven, CLEAN_WINDOWS_TO_INCREASE};
 use super::sample::{self, WindowActivity, WindowSample};
 use super::verdict::{
-    encode_thresholds, Baselines, Reason, Verdict, HEAVY_LOSS_PPM, RECOVERY_KF_BAD,
+    encode_thresholds, Baselines, Reason, Verdict, BLIP_CLEAN_WINDOWS, HEAVY_LOSS_PPM,
+    RECOVERY_KF_BAD,
 };
 use crate::quic::AckReason;
 use std::time::{Duration, Instant};
@@ -220,6 +221,10 @@ pub(crate) struct BitrateController {
     drain_ref_us: i64,
     /// Windows the guard kept a cut off, for the line it logs when it ends.
     drain_suppressed: u32,
+    /// Windows left in which a second lone lost frame is ordinary damage. The
+    /// blip exemption is spent once; a link losing a frame every window is
+    /// not a recovery-plane event however clean each window looks.
+    blip_hold: u32,
     /// Where the link stopped carrying what it was asked for. Latched from
     /// two deliveries at the same rate (the ramp's wall counts as one), it
     /// holds the climb a tenth under that rate and is re-tested on the same
@@ -250,6 +255,10 @@ pub(crate) struct BitrateController {
     /// reference a lift is frozen against. Dropped with the delivery norm.
     delay_sum_us: i64,
     delay_windows: u32,
+    /// The last delay norm, kept when a rate move drops the one above. A
+    /// climb step or a cut changes the queue's occupancy, not the path's own
+    /// delay, so this is still the mark a drained queue comes back to.
+    delay_norm_us: i64,
     /// Rolling minima the relative signals are scored against.
     baselines: Baselines,
     /// One refresh interval, µs. `None` = the 120 Hz [`ENCODE_RISE_US`] defaults.
@@ -339,6 +348,7 @@ impl BitrateController {
             drain_windows: 0,
             drain_ref_us: 0,
             drain_suppressed: 0,
+            blip_hold: 0,
             link_cap: LearnedCap::new(),
             link_mark_kbps: 0,
             delivery_sum_kbps: 0,
@@ -349,6 +359,7 @@ impl BitrateController {
             lift: None,
             delay_sum_us: 0,
             delay_windows: 0,
+            delay_norm_us: 0,
             baselines: Baselines::new(),
             frame_budget_us: None,
             encode_probe: None,
@@ -797,6 +808,7 @@ impl BitrateController {
             return None;
         }
         let draining = self.note_drain(w);
+        self.blip_hold = self.blip_hold.saturating_sub(1);
         let v = self.baselines.score(
             w,
             self.current_kbps,
@@ -804,6 +816,7 @@ impl BitrateController {
             self.encode_down.disarmed(),
             self.clean_windows,
             draining,
+            self.link_vouches_for(w),
             self.lift_probing(),
         );
         self.last_reason = v.reason;
@@ -959,14 +972,33 @@ impl BitrateController {
         self.request(p.cap_kbps, now)
     }
 
+    /// Does this window say for itself what a clean run says: one frame gone
+    /// and a link with room behind it?
+    ///
+    /// The wire carried what the rate asked for and the queue is not growing,
+    /// so nothing here is the rate's doing — which is what the run stands for
+    /// and what a session climbing back to its cap can never accumulate. One
+    /// exemption at a time: [`blip_hold`](Self::blip_hold) holds the next
+    /// window to the ordinary verdict.
+    fn link_vouches_for(&self, w: &WindowSample) -> bool {
+        self.blip_hold == 0
+            && w.dropped == 1
+            && w.delay.is_some_and(|d| d.rise_us < DRAIN_FALL_US)
+            && !self.short_of_offered(w, false)
+    }
+
     /// Forget what this rate looked like, on the wire and in the delay.
     ///
     /// Both norms are only true of the rate they were taken at: the parity
     /// floor, the content's fill and the FEC share move with the rate, and so
-    /// does the queue behind it.
+    /// does the queue behind it. The delay's last value is kept anyway: the
+    /// drain guard needs a mark to wait for.
     fn forget_rate_norms(&mut self) {
         self.delivery_sum_kbps = 0;
         self.delivery_windows = 0;
+        if self.delay_windows > 0 {
+            self.delay_norm_us = self.delay_sum_us / i64::from(self.delay_windows);
+        }
         self.delay_sum_us = 0;
         self.delay_windows = 0;
     }
@@ -1102,14 +1134,16 @@ impl BitrateController {
     /// Arm the guard: this cut queued something, and what that queue does on
     /// the way out is not fresh evidence.
     ///
-    /// The reference is where clean windows at this rate sat before the cut —
-    /// taken now, because the request that follows drops it.
+    /// The reference is where clean windows sat before the cut: this rate's
+    /// own norm, or the one the last rate move left behind. A session climbing
+    /// back to its cap has no norm of its own when the next cut lands, and a
+    /// guard with no mark to wait for spends its whole budget.
     fn arm_drain(&mut self) {
         self.drain_windows = LINK_DRAIN_WINDOWS;
         self.drain_ref_us = if self.delay_windows > 0 {
             self.delay_sum_us / i64::from(self.delay_windows)
         } else {
-            0
+            self.delay_norm_us
         };
         self.drain_suppressed = 0;
     }
@@ -1212,6 +1246,13 @@ impl BitrateController {
             // vouched for this window starts over: a second lost frame inside
             // the next one is judged like any other damage.
             self.clean_windows = 0;
+            self.blip_hold = BLIP_CLEAN_WINDOWS;
+            // A window the decoder sailed through ends the knee reference on
+            // the terms a backoff without decode evidence ends it: a climbed-to
+            // rate, delivery that means something. Nothing else expires one.
+            if self.climb_since_backoff && !v.starved {
+                self.decode_backoff_kbps = 0;
+            }
             tracing::info!(
                 dropped = w.dropped,
                 loss_ppm = w.loss_ppm,
@@ -1676,7 +1717,11 @@ impl BitrateController {
         // the proration took it out of.
         let cap = eff_ceiling.min(growth::proven_target_cap(self.proven.mark(), proration));
         if self.current_kbps < eff_ceiling && utilized && cap > self.current_kbps {
-            let slow_start = self.probing && self.clean_windows >= 1;
+            // A blip holds the doubling for as long as it holds the next lost
+            // frame's exemption. The additive climb already waits six clean
+            // windows; slow start would take its step one window later, and
+            // half again a rate a frame has just died at is a wall's cascade.
+            let slow_start = self.probing && self.clean_windows >= 1 && self.blip_hold == 0;
             if slow_start || self.clean_windows >= CLEAN_WINDOWS_TO_INCREASE {
                 let next = growth::climb_step(self.current_kbps, cap, slow_start);
                 self.clean_windows = 0;
@@ -2082,6 +2127,149 @@ mod tests {
             after(9_000, 0, 2),
             Some(7_000),
             "a delay back where it was ends the guard, and the window is judged"
+        );
+    }
+
+    /// A blip costs the doubling for as long as it holds the exemption.
+    ///
+    /// Slow start takes its next step off one clean window, so a lost frame it
+    /// waves through would be answered by half again the rate that lost it.
+    /// The rate stands still until the additive climb earns its step.
+    #[test]
+    fn a_vouched_blip_holds_the_rate_and_the_doubling() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        let held = |at: u32, dropped: u64| WindowSample {
+            owd_mean_us: Some(10_000),
+            delay: Some(trend(10_000, 0)),
+            dropped,
+            actual_kbps: 20_000,
+            ..WindowSample::at(ticks(start, at))
+        };
+        for i in 0..4 {
+            assert_eq!(c.on_window(&held(i, 0)), None);
+        }
+        assert!(c.probing, "slow start is still armed");
+        c.set_ceiling(300_000);
+        assert_eq!(c.on_window(&held(4, 1)), None);
+        assert_eq!(c.last_reason(), Reason::Blip);
+        assert!(c.probing, "the blip does not spend slow start");
+        for i in 5..10 {
+            assert_eq!(c.on_window(&held(i, 0)), None, "window {i} moved the rate");
+        }
+        assert_eq!(
+            c.on_window(&held(10, 0)),
+            Some(21_251),
+            "and the first step after it is additive, not a doubling"
+        );
+    }
+
+    /// A blip draining the last backoff teaches no knee, the way that
+    /// backoff's own successor does not.
+    ///
+    /// The reference the choke left stands until a rate the session climbed to
+    /// meets it again; a climbed-to rate the decoder sailed through ends it.
+    #[test]
+    fn a_blip_without_a_climb_behind_it_keeps_the_knee_reference() {
+        let start = Instant::now();
+        let after_backoff = |climbed: bool| -> u32 {
+            let mut c = BitrateController::new(20_000, None);
+            c.set_frame_budget(120);
+            for i in 0..BASELINE_MIN_WINDOWS as u32 {
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    decode_mean_us: Some(8_000),
+                    delay: Some(trend(10_000, 0)),
+                    actual_kbps: 20_000,
+                    ..WindowSample::at(ticks(start, i))
+                });
+            }
+            let mut t = BASELINE_MIN_WINDOWS as u32;
+            let cut = c
+                .on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    decode_mean_us: Some(60_000),
+                    delay: Some(trend(10_000, 0)),
+                    actual_kbps: 20_000,
+                    ..WindowSample::at(ticks(start, t))
+                })
+                .expect("a decode excursion backs off");
+            assert_eq!(c.decode_backoff_kbps, 20_000, "and leaves its reference");
+            c.on_ack(cut, None);
+            if climbed {
+                c.on_ack(cut + 1_000, None);
+            }
+            t += 1;
+            assert_eq!(
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    delay: Some(trend(10_000, 0)),
+                    dropped: 1,
+                    actual_kbps: c.current_kbps,
+                    ..WindowSample::at(ticks(start, t))
+                }),
+                None
+            );
+            assert_eq!(c.last_reason(), Reason::Blip);
+            c.decode_backoff_kbps
+        };
+        assert_eq!(after_backoff(false), 20_000, "no climb, no knee sample");
+        assert_eq!(after_backoff(true), 0, "a climbed-to rate ends it");
+    }
+
+    /// A cut one window after a climb step still knows where the delay sat.
+    ///
+    /// The step forgets this rate's norms, and one window is too few to build
+    /// another, so the guard would have no mark to wait for and would spend
+    /// its whole budget. The norm the step left behind is that mark.
+    #[test]
+    fn a_guard_armed_right_after_a_climb_keeps_a_reference() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        // Four windows at the ceiling: 10 ms is where this rate's delay sits.
+        for i in 0..BASELINE_MIN_WINDOWS as u32 {
+            assert_eq!(
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    delay: Some(trend(10_000, 0)),
+                    actual_kbps: 20_000,
+                    ..WindowSample::at(ticks(start, i))
+                }),
+                None
+            );
+        }
+        let mut t = BASELINE_MIN_WINDOWS as u32;
+        c.set_ceiling(30_000);
+        let up = c
+            .on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                delay: Some(trend(10_000, 0)),
+                actual_kbps: 20_000,
+                ..WindowSample::at(ticks(start, t))
+            })
+            .expect("the room is there, so the session climbs");
+        c.on_ack(up, None);
+        assert_eq!(c.delay_windows, 0, "the step forgot the rate's norms");
+        // The link answers the step: the queue fills, then it swallows frames.
+        for dropped in [0, 4] {
+            t += 1;
+            let _ = c.on_window(&WindowSample {
+                dropped,
+                owd_mean_us: Some(300_000),
+                delay: Some(trend(300_000, 100_000)),
+                actual_kbps: 10_000,
+                ..WindowSample::at(ticks(start, t))
+            });
+        }
+        assert!(c.drain_windows > 0, "a link cut arms the guard");
+        assert_eq!(c.drain_ref_us, 10_000, "the norm the step left behind");
+        t += 1;
+        assert!(
+            !c.note_drain(&WindowSample {
+                delay: Some(trend(10_000, -20_000)),
+                ..WindowSample::at(ticks(start, t))
+            }),
+            "and the guard ends when the delay is back at it"
         );
     }
 

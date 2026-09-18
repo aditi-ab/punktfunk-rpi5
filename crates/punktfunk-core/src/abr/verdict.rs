@@ -140,9 +140,11 @@ impl Baselines {
     /// what tells a blip from the first window of congestion — and
     /// `draining` says the last link cut is still emptying the queue it
     /// caused, which is the one thing a delay rise can mean that the rate
-    /// must not answer again, and `freeze_owd` holds the delay baseline still
-    /// while a lift is being judged — a baseline that learns the rise it is
-    /// supposed to detect detects nothing.
+    /// must not answer again, `link_vouches` is the same vouching the run
+    /// gives, read off this window instead of its history, and `freeze_owd`
+    /// holds the delay baseline still while a lift is being judged — a
+    /// baseline that learns the rise it is supposed to detect detects
+    /// nothing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn score(
         &mut self,
@@ -152,6 +154,7 @@ impl Baselines {
         encode_disarmed: bool,
         clean_run: u32,
         draining: bool,
+        link_vouches: bool,
         freeze_owd: bool,
     ) -> Verdict {
         let quiet = w.activity.quiet();
@@ -194,12 +197,12 @@ impl Baselines {
             encode_rise_us,
             encode_severe_us,
         );
-        // A lost frame and nothing else, behind a long clean run at this rate:
-        // the recovery plane's business (RFI, FEC), not the rate's. The run is
-        // what makes it isolated — during a climb or at session start the same
-        // window is the first of a cascade.
+        // A lost frame and nothing else: the recovery plane's business (RFI,
+        // FEC), not the rate's. A long clean run at this rate says so, and so
+        // does a window whose wire and delay show a link with room — which a
+        // session still climbing has instead of a run.
         let blip = w.dropped > 0
-            && clean_run >= BLIP_CLEAN_WINDOWS
+            && (clean_run >= BLIP_CLEAN_WINDOWS || link_vouches)
             && w.loss_ppm < HEAVY_LOSS_PPM
             && !w.flushed
             && !owd_bad
@@ -494,6 +497,53 @@ mod tests {
                 ..held(0)
             }),
             Some(14_000)
+        );
+    }
+
+    /// A climbing session never holds a rate long enough to earn the run, so
+    /// the window says for itself what the run would have said: the wire
+    /// carried what the rate asked for and the queue is not growing.
+    #[test]
+    fn one_lost_frame_on_a_full_wire_is_a_blip_with_no_run_behind_it() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        let held = |at: u32, dropped: u64, actual_kbps: u32| WindowSample {
+            owd_mean_us: Some(10_000),
+            delay: Some(crate::abr::DelayTrend {
+                samples: 20,
+                mean_us: 10_000,
+                rise_us: 0,
+                last_us: 10_000,
+            }),
+            dropped,
+            actual_kbps,
+            ..WindowSample::at(start + TICK * at)
+        };
+        // Four windows build this rate's wire norm, and no more than that.
+        for i in 0..4 {
+            assert_eq!(c.on_window(&held(i, 0, 20_000)), None);
+        }
+        assert_eq!(
+            c.on_window(&held(4, 1, 20_000)),
+            None,
+            "one lost frame on a wire that carried the rate"
+        );
+        assert_eq!(c.last_reason(), Reason::Blip);
+        assert_eq!(
+            c.on_window(&held(5, 1, 20_000)),
+            Some(14_000),
+            "a second one inside the hold is congestion like any other"
+        );
+
+        // The same window on a wire that fell short: the link is answering.
+        let mut c = BitrateController::new(20_000, None);
+        for i in 0..4 {
+            assert_eq!(c.on_window(&held(i, 0, 20_000)), None);
+        }
+        assert_eq!(
+            c.on_window(&held(4, 1, 14_000)),
+            Some(14_000),
+            "a wire short of the rate is the link answering, not a blip"
         );
     }
 
