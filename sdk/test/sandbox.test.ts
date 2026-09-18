@@ -1,9 +1,13 @@
 // What a plugin can reach is decided entirely by this argv, so it is worth pinning: an empty home,
 // its own state and token, the paths it declared — and nothing that was not asked for.
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
 	bwrapArgv,
 	expandHome,
+	grantedRoots,
 	netlinkFilter,
 	type PluginManifest,
 	sandboxEnv,
@@ -87,12 +91,47 @@ describe("bwrapArgv", () => {
 		expect(bwrapArgv(manifest({ network: true }), paths)).toContain("--share-net");
 	});
 
-	test("what the operator granted is writable, and nothing relative is bound at all", () => {
-		const argv = bwrapArgv(manifest({ writes: ["/tmp/vhclient"] }), paths, ["/mnt/games"]);
+	test("grants bind read-only by default and writable only when they say so", () => {
+		const argv = bwrapArgv(manifest({ writes: ["/tmp/vhclient"] }), paths, [
+			{ path: "/mnt/legacy", write: false },
+			{ path: "/mnt/write", write: true },
+			{ path: "not/absolute", write: false },
+		]);
 		expect(binds(argv, "--bind-try")).toContainEqual(["/tmp/vhclient", "/tmp/vhclient"]);
-		expect(binds(argv, "--bind-try")).toContainEqual(["/mnt/games", "/mnt/games"]);
-		const relative = bwrapArgv(manifest({ reads: ["not/absolute"] }), paths);
-		expect(relative.join(" ")).not.toContain("not/absolute");
+		expect(binds(argv, "--ro-bind-try")).toContainEqual(["/mnt/legacy", "/mnt/legacy"]);
+		expect(binds(argv, "--bind-try")).toContainEqual(["/mnt/write", "/mnt/write"]);
+		expect(argv.join(" ")).not.toContain("not/absolute");
+	});
+});
+
+describe("grantedRoots", () => {
+	test("parses v1 path arrays and v2 grant records, and nothing malformed", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grants-"));
+		try {
+			const write = (v: unknown) =>
+				fs.writeFileSync(path.join(dir, "plugin-grants.json"), JSON.stringify(v));
+			write({ demo: ["/mnt/old"] });
+			expect(grantedRoots(dir, "demo")).toEqual([{ path: "/mnt/old", write: false }]);
+			write({
+				demo: {
+					grants: [
+						{ path: "/mnt/read", write: false },
+						{ path: "/mnt/write", write: true },
+					],
+					denied: [],
+				},
+			});
+			expect(grantedRoots(dir, "demo")).toEqual([
+				{ path: "/mnt/read", write: false },
+				{ path: "/mnt/write", write: true },
+			]);
+			fs.writeFileSync(path.join(dir, "plugin-grants.json"), "{not json");
+			expect(grantedRoots(dir, "demo")).toEqual([]);
+			write({ demo: { grants: [{ path: "/mnt/x", write: "yes" }] } });
+			expect(grantedRoots(dir, "demo")).toEqual([]);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
