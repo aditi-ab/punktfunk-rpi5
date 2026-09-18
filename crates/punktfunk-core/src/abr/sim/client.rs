@@ -453,6 +453,10 @@ impl Client {
             },
             host_duration_ms: done.duration_ms,
             client_interval_ms,
+            // The model's clock is one millisecond, so this carries no more
+            // resolution than the field above it — the microsecond half of
+            // the judge is a fact about wires, not about the model.
+            client_interval_us: client_interval_ms.saturating_mul(1_000),
             host_bytes_sent: done.bytes_sent,
             wire_packets_sent: done.wire_packets_sent,
             send_dropped: 0,

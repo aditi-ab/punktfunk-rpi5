@@ -582,6 +582,7 @@ mod tests {
                             window_ms: interval as u32,
                             host_duration_ms: s.duration_ms as u32,
                             client_interval_ms: interval as u32,
+                            client_interval_us: (interval as u32) * 1_000,
                             host_bytes_sent: u64::from(s.target_kbps) * s.duration_ms / 8,
                             wire_packets_sent: s.packets as u32,
                             send_dropped: 0,
@@ -732,6 +733,7 @@ mod tests {
             window_ms: burst_ms,
             host_duration_ms: burst_ms,
             client_interval_ms: burst_ms,
+            client_interval_us: (burst_ms) * 1_000,
             ..ProbeReport::default()
         };
         let mut windows = Vec::new();

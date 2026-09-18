@@ -72,8 +72,11 @@ pub struct ProbeReport {
     pub window_ms: u32,
     /// Host send-window duration. `0` = the host declined the burst.
     pub host_duration_ms: u32,
-    /// The measured client interval, the ramp's own denominator. `0` = none.
+    /// The measured client interval, for the log. `0` = none.
     pub client_interval_ms: u32,
+    /// The same interval in microseconds: the ramp's own denominator, at the
+    /// resolution the arrival stamps have. `0` = none.
+    pub client_interval_us: u32,
     /// Payload bytes the host put on the wire, against what was asked.
     pub host_bytes_sent: u64,
     /// Wire packets the host's kernel accepted.
@@ -138,6 +141,13 @@ enum Verdict {
 /// One step in flight.
 struct Step {
     target_kbps: u32,
+    /// How long the host was asked to send for, microseconds. The offered
+    /// side of the ratio is measured against this rather than against the
+    /// host's own `duration_ms`: that is a wire field it rounds down to whole
+    /// milliseconds off its own clock, which is 4 % of a 25 ms step, and the
+    /// sender-limit rule below has already established that the host put
+    /// what was asked on the wire (`send_dropped == 0`, offered ≈ asked).
+    asked_us: u64,
     /// Payload bytes the host was asked for: `target_kbps` over the step.
     asked_bytes: u64,
     /// Delivered bytes the last report showed, and when they last grew.
@@ -182,8 +192,8 @@ struct Ramp {
 /// the first swings the implied rate 2.5× (rig, every profile), and an
 /// unclamped reading opened sessions on a rate no step ever offered.
 fn step_rate_kbps(step: &Step, r: &ProbeReport) -> u32 {
-    let interval = u64::from(r.client_interval_ms.max(1));
-    let rate = (r.delivered_bytes.saturating_mul(8) / interval) as u32;
+    let us = u64::from(r.client_interval_us.max(1));
+    let rate = (r.delivered_bytes.saturating_mul(8_000) / us) as u32;
     rate.min(step.target_kbps)
 }
 
@@ -250,7 +260,7 @@ impl Ramp {
 
     /// Judge a settled step. `None` = it proved the rate and the ramp goes on.
     fn judge(&self, step: &Step, r: &ProbeReport) -> Option<Verdict> {
-        let interval = u64::from(r.client_interval_ms);
+        let interval = u64::from(r.client_interval_us);
         // Under two packets there is no interval, so there is no rate either.
         if interval == 0 || r.delivered_packets < 2 || r.wire_packets_sent == 0 {
             return Some(Verdict::Unreadable);
@@ -271,18 +281,21 @@ impl Ramp {
             // link would take.
             return Some(Verdict::Sender(delivered_kbps));
         }
-        // Delivered ÷ offered as packets a millisecond on each side: the host
-        // sent `wire_packets_sent` over its window, we received
-        // `delivered_packets` over ours. A queue that stretches the arrivals
-        // and loss that thins them both land here.
-        let delivered = r.delivered_packets * u64::from(r.host_duration_ms);
+        // Delivered ÷ offered as packets a microsecond on each side. Both
+        // spans are first-to-last: `n` packets paced over the asked window
+        // leave it across `n - 1` gaps, and the arrivals are timed the same
+        // way, so a clean step reads 1.00 instead of 1.04. A queue that
+        // stretches the arrivals and loss that thins them both land here.
+        let offered_span =
+            step.asked_us * (u64::from(r.wire_packets_sent) - 1) / u64::from(r.wire_packets_sent);
+        let delivered = r.delivered_packets * offered_span;
         let offered = u64::from(r.wire_packets_sent) * interval;
         if delivered * 100 < offered * RAMP_WALL_PCT {
             tracing::info!(
                 target_kbps = step.target_kbps,
                 delivered_kbps,
-                client_interval_ms = r.client_interval_ms,
-                host_duration_ms = r.host_duration_ms,
+                client_interval_us = r.client_interval_us,
+                offered_span_us = offered_span,
                 "adaptive bitrate: ramp found the link's wall"
             );
             return Some(Verdict::Wall(delivered_kbps));
@@ -356,10 +369,12 @@ impl Ramp {
         let target_kbps = self.next_kbps.min(self.max_kbps);
         let duration_ms = step_ms(target_kbps);
         let asked_bytes = u64::from(target_kbps) * u64::from(duration_ms) / 8;
+        let asked_us = u64::from(duration_ms) * 1_000;
         self.spent_bytes += asked_bytes;
         self.steps += 1;
         self.step = Some(Step {
             target_kbps,
+            asked_us,
             asked_bytes,
             seen_bytes: 0,
             seen_at: now,
@@ -678,6 +693,7 @@ mod tests {
             window_ms,
             host_duration_ms: 800,
             client_interval_ms: window_ms,
+            client_interval_us: (window_ms) * 1_000,
             ..ProbeReport::default()
         }
     }
@@ -737,6 +753,7 @@ mod tests {
                 window_ms: interval,
                 host_duration_ms: duration_ms,
                 client_interval_ms: interval,
+                client_interval_us: (interval) * 1_000,
                 host_bytes_sent: u64::from(sent_kbps) * u64::from(duration_ms) / 8,
                 wire_packets_sent: packets as u32,
                 send_dropped: 0,
@@ -878,6 +895,7 @@ mod tests {
             window_ms: duration_ms,
             host_duration_ms: duration_ms,
             client_interval_ms: duration_ms,
+            client_interval_us: (duration_ms) * 1_000,
             host_bytes_sent: u64::from(target) * u64::from(duration_ms) / 8,
             wire_packets_sent: 8,
             send_dropped: 0,
@@ -901,6 +919,42 @@ mod tests {
         );
     }
 
+    /// The verdict is read in microseconds, because a millisecond of
+    /// rounding is 4 % of a 25 ms step and the decision turns on 10 %.
+    ///
+    /// Two steps that differ by 600 µs — one arrival pattern inside the same
+    /// millisecond — land on opposite sides of the bar. Four of the rig's 28
+    /// walls sat in exactly that band, one of them latching 80 Mbps on a
+    /// 237 Mbps link.
+    #[test]
+    fn a_step_is_judged_in_microseconds() {
+        for (interval_us, wall) in [(27_000u32, false), (27_600u32, true)] {
+            let mut rig = Rig::new(1_026_432, None);
+            let (target, duration_ms) = rig.p.poll(rig.now, 0, 0).expect("a step");
+            assert_eq!(duration_ms, RAMP_STEP_MS, "the arithmetic below assumes it");
+            let r = ProbeReport {
+                delivered_bytes: 100 * 1_448,
+                delivered_packets: 100,
+                window_ms: interval_us / 1_000,
+                host_duration_ms: duration_ms,
+                client_interval_ms: interval_us / 1_000,
+                client_interval_us: interval_us,
+                host_bytes_sent: u64::from(target) * u64::from(duration_ms) / 8,
+                wire_packets_sent: 100,
+                send_dropped: 0,
+            };
+            let at = rig.at(u64::from(interval_us) / 1_000);
+            rig.p.on_result(r, at);
+            let at = rig.at(RAMP_DRAIN_MS + 1);
+            rig.p.poll(at, 0, 0);
+            assert_eq!(
+                matches!(rig.p.take_ramped(at), Some(Ramped::Wall { .. })),
+                wall,
+                "{interval_us} us of arrivals against a 25 000 us ask"
+            );
+        }
+    }
+
     /// A short step's implied rate is noise: the rig measured the same 24
     /// packets arriving over 6 ms and over 15 ms, 2.5× apart. Whatever the
     /// arithmetic says, a step cannot have proved more than it offered — and
@@ -918,6 +972,7 @@ mod tests {
             window_ms: 6,
             host_duration_ms: duration_ms,
             client_interval_ms: 6,
+            client_interval_us: (6) * 1_000,
             host_bytes_sent: u64::from(target) * u64::from(duration_ms) / 8,
             wire_packets_sent: 24,
             send_dropped: 0,
@@ -1016,6 +1071,7 @@ mod tests {
                 delivered_bytes: 11 * 1_448,
                 delivered_packets: 11,
                 client_interval_ms: duration_ms * 4,
+                client_interval_us: (duration_ms * 4) * 1_000,
                 ..empty
             },
             at,

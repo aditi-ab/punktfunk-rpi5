@@ -253,6 +253,7 @@ impl DataPump {
                     window_ms: p.throughput_window_ms(p.delivered_packets),
                     host_duration_ms: p.host_duration_ms,
                     client_interval_ms: p.client_interval_ms,
+                    client_interval_us: p.client_interval_us,
                     host_bytes_sent: p.host_goodput_bytes,
                     wire_packets_sent: p.host_wire_packets,
                     send_dropped: p.host_send_dropped,
