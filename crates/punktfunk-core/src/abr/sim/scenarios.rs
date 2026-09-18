@@ -1693,9 +1693,14 @@ mod tests {
                 .count() as u64;
             minutes += duration_ms / 60_000;
         }
+        // The return trips are the link's and do not go away, but the package
+        // is meant to make them rarer: 65 per 100 min before it, 37 with the
+        // cut and the cap, 31 once a measurement's wall became a cap too, 28
+        // once a cut was sized against the wire's own norm. The bound
+        // ratchets downward with them.
         let per_min = wall_cuts * 100 / minutes;
         assert!(
-            per_min >= 30,
+            (10..=35).contains(&per_min),
             "{wall_cuts} cuts from 12 Mbps or above over {minutes} min"
         );
     }

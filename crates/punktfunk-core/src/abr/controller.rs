@@ -100,6 +100,15 @@ const DRAIN_FALL_US: i64 = 5_000;
 /// without the queue answering; climbs stop at the cap, so this is also where
 /// the session rides.
 const LINK_HOLD_DIV: u32 = 10;
+/// Clean windows at the current rate whose delivered wire rate is the norm a
+/// short window is judged against. Four is 3 s: long enough to average out a
+/// scene, short enough to be this rate's own regime.
+const DELIVERY_REF_WINDOWS: u32 = 4;
+/// A window is short when it carried less than this share of that norm. The
+/// wire dropped against itself; under `current_kbps` means nothing, because
+/// what a clean window delivers depends on the content's fill and the parity
+/// floor, not only on the link.
+const DELIVERY_SHORT_PCT: u32 = 90;
 /// Two delivered rates this close are the same wall (±1/5). Wider than the
 /// decode cap's ±1/8 because a wall is a moving physical thing — Wi-Fi and a
 /// cell both wander further than that inside a minute.
@@ -170,6 +179,11 @@ pub(crate) struct BitrateController {
     pub(super) link_cap: LearnedCap,
     /// Previous delivered mark (`0` = none). Two within ±1/5 are a wall.
     pub(super) link_mark_kbps: u32,
+    /// What clean windows at this rate deliver: the sum and the count, reset
+    /// on every rate change because the parity floor and the content's fill
+    /// both move with the rate.
+    delivery_sum_kbps: u64,
+    delivery_windows: u32,
     /// The standing cap came from a measurement, which holds 30 % back by
     /// design. Its early lifts are that margin coming back, not a wall that
     /// moved, so they must not retire it.
@@ -271,6 +285,8 @@ impl BitrateController {
             drain_windows: 0,
             link_cap: LearnedCap::new(),
             link_mark_kbps: 0,
+            delivery_sum_kbps: 0,
+            delivery_windows: 0,
             link_cap_measured: false,
             link_evidence: false,
             link_lifted: false,
@@ -774,19 +790,41 @@ impl BitrateController {
         self.idle_windows = 0;
     }
 
+    /// What clean windows at this rate have been delivering, or `None` until
+    /// there are enough of them to mean anything.
+    fn delivery_reference(&self) -> Option<u32> {
+        (self.delivery_windows >= DELIVERY_REF_WINDOWS)
+            .then(|| (self.delivery_sum_kbps / u64::from(self.delivery_windows)) as u32)
+    }
+
+    /// One clean window's delivered wire rate. Stillness teaches nothing: a
+    /// repeat-marked or empty window is not this rate's norm, which is the
+    /// same exclusion the climb makes.
+    fn note_delivery(&mut self, w: &WindowSample) {
+        if w.activity.quiet() {
+            return;
+        }
+        self.delivery_sum_kbps += u64::from(w.actual_kbps);
+        self.delivery_windows += 1;
+    }
+
     /// Did the link hand over less than the rate it was running at?
     ///
     /// The climb's own bar, prorated by the frames that arrived: content that
     /// never filled the target is not the link falling short, and reading it
     /// as one would land the rate on a still picture.
     fn short_of_offered(&self, w: &WindowSample, owd_bad: bool) -> bool {
+        if let Some(reference) = self.delivery_reference() {
+            return u64::from(w.actual_kbps) * 100
+                < u64::from(reference) * u64::from(DELIVERY_SHORT_PCT);
+        }
+        // Nothing to compare against yet. The climb's own bar, prorated by the
+        // frames that arrived; a standing queue breaks that denominator, so
+        // when delay says so the wall clock is the honest measure.
         let proration = growth::proration(w.activity, self.frame_budget_us);
         if !growth::utilized(w.activity, proration, w.actual_kbps, self.current_kbps) {
             return true;
         }
-        // A standing queue breaks that denominator: the frames it is holding
-        // are missing for the link's own reasons, so the wall clock is the
-        // honest measure of what was asked for.
         owd_bad && !growth::delivered_the_rate(w.actual_kbps, self.current_kbps)
     }
 
@@ -898,7 +936,19 @@ impl BitrateController {
     /// step from the rate the session is running at.
     fn link_cut_kbps(&self, delivered_kbps: u32) -> u32 {
         let share = |kbps: u32, pct: u32| (u64::from(kbps) * u64::from(pct) / 100) as u32;
-        share(delivered_kbps, LINK_CUT_PCT)
+        // The drop the wire showed against its own norm, put back into target
+        // units. A content-bound source delivers 78 % of every clean window
+        // and the parity floor puts 210 % on the wire at the bottom of the
+        // range; dividing by the norm cancels both, and what is left is the
+        // link's share of the fall.
+        let target = match self.delivery_reference() {
+            Some(reference) if reference > 0 => {
+                (u64::from(delivered_kbps) * u64::from(self.current_kbps) / u64::from(reference))
+                    as u32
+            }
+            _ => delivered_kbps,
+        };
+        share(target, LINK_CUT_PCT)
             .clamp(
                 share(self.current_kbps, LINK_CUT_FLOOR_PCT),
                 share(self.current_kbps, LINK_CUT_PCT),
@@ -930,6 +980,7 @@ impl BitrateController {
         }
         if !v.bad {
             self.proven.note(w.actual_kbps);
+            self.note_delivery(w);
         }
         if v.bad {
             // What the rate is the lever for, read before the streaks move:
@@ -1375,6 +1426,10 @@ impl BitrateController {
     }
 
     fn request(&mut self, kbps: u32, now: Instant) -> Option<u32> {
+        // A new rate is a new regime for the wire: the parity floor, the
+        // content's fill and the FEC share all move with it.
+        self.delivery_sum_kbps = 0;
+        self.delivery_windows = 0;
         self.last_change = Some(now);
         self.unacked += 1;
         self.last_requested_kbps = Some(kbps);
