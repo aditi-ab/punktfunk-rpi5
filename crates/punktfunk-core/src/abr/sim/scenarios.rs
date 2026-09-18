@@ -457,8 +457,9 @@ pub(super) fn wan_lift_overshoot() -> Scenario {
             ..LinkCfg::default()
         },
         sessions: vec![wg_session()],
-        // What the link carries, not what one step of a ramp saw of it.
-        achievable_kbps: 11_250,
+        // Three quarters of nominal: what a session that respects a link
+        // wandering ±30 % can hold, and the bar round 7 is judged against.
+        achievable_kbps: 9_375,
         blip_at_ms: None,
     }
 }
@@ -1788,6 +1789,31 @@ mod tests {
         );
         // The cap is still doing its job: nothing runs away past the wall.
         assert!(m.under5_pct == 0 && m.queue_p95_ms < 100, "{m:?}");
+    }
+
+    /// A lift the tunnel refuses costs the step it was testing, not a third
+    /// of the session.
+    ///
+    /// Round 6 answered every refused lift with a blind ×0.7 — 9 794 down to
+    /// 6 855 with a 9 527 cap standing — and spent the next ten seconds
+    /// climbing back into it. The lift is a probe now: what it retreats to is
+    /// the cap it came from, so no cut on this link lands under the wall the
+    /// session had already learned.
+    #[test]
+    fn a_lift_the_tunnel_refuses_costs_the_cap_step() {
+        let r = run(&with_ramp(wan_lift_overshoot()));
+        for w in r.cuts() {
+            let (to, cap) = (
+                w.request_kbps.expect("a cut asks for a rate"),
+                w.link_cap.expect("the session is riding a learned wall"),
+            );
+            assert!(
+                to >= cap,
+                "{} ms: {} → {to} under a {cap} cap",
+                w.t_ms,
+                w.cut_from_kbps.unwrap_or_default()
+            );
+        }
     }
 
     /// A cell that gets better: the cap it taught has to get out of the way.

@@ -100,6 +100,26 @@ const DRAIN_FALL_US: i64 = 5_000;
 /// without the queue answering; climbs stop at the cap, so this is also where
 /// the session rides.
 const LINK_HOLD_DIV: u32 = 10;
+/// How far over its frozen reference the delay may go at a lifted rate
+/// before the lift is refused, as an absolute floor and as a share of the
+/// reference. 15 ms is past any pacing jitter at any refresh; a quarter of the
+/// reference is what a link whose baseline delay is already tens of
+/// milliseconds needs instead.
+const LIFT_BAR_US: i64 = 15_000;
+const LIFT_BAR_DIV: i64 = 4;
+/// Consecutive windows over that bar, or rising under it, that refuse a lift.
+/// Two, because one window is a handover stall or a send loop losing a slice:
+/// both read as a mean over the bar and are back at the reference the next
+/// window, while a queue that is filling keeps climbing.
+const LIFT_OVER_WINDOWS: u32 = 2;
+const LIFT_RISING_WINDOWS: u32 = 2;
+/// Clean windows at the lifted rate that settle it: the cap keeps the new
+/// value and the delay baseline learns again. 8 x 750 ms = 6 s.
+const LIFT_PROBE_WINDOWS: u32 = 8;
+/// Windows a lift may wait for the climb to take it up before the probe is
+/// dropped. Content that does not fill the target never asks for the lifted
+/// rate, and a probe left open holds the delay baseline still.
+const LIFT_PROBE_MAX_AGE: u32 = 16;
 /// Clean windows at the current rate whose delivered wire rate is the norm a
 /// short window is judged against. Four is 3 s: long enough to average out a
 /// scene, short enough to be this rate's own regime.
@@ -113,6 +133,28 @@ const DELIVERY_SHORT_PCT: u32 = 90;
 /// decode cap's ±1/8 because a wall is a moving physical thing — Wi-Fi and a
 /// cell both wander further than that inside a minute.
 const LINK_MARK_SIMILAR_DIV: u32 = 5;
+
+/// A cap lift awaiting the link's answer, and the delay the session had
+/// before it.
+///
+/// The reference is frozen at the lift: the baseline the ordinary delay
+/// verdict uses would learn a slow rise and then call it normal, which is how
+/// a 5 % overshoot fills a 450 ms queue for a minute and is first noticed as a
+/// lost frame. `settled` is the probe's budget spent — the lift is kept and
+/// the baseline learns again, but the reference stays, because a wall can
+/// answer a lift late and that is still the lift's fault, not a cut's.
+#[derive(Clone, Copy, Debug)]
+struct LiftProbe {
+    /// Where a refused lift retreats to: the cap as it was.
+    cap_kbps: u32,
+    ref_us: i64,
+    clean: u32,
+    over: u32,
+    rising: u32,
+    /// Windows since the lift, at any rate.
+    age: u32,
+    settled: bool,
+}
 
 /// A headroom step awaiting the decoder's answer at its new rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +238,12 @@ pub(crate) struct BitrateController {
     /// the lifted rate for a whole re-probe interval: the wall moved, and the
     /// cap goes rather than crawl after it at +12.5 % a time.
     link_lifted: bool,
+    /// The lift in flight, and the delay the session had before it.
+    lift: Option<LiftProbe>,
+    /// Shard delay of clean windows at this rate: the sum and the count, the
+    /// reference a lift is frozen against. Dropped with the delivery norm.
+    delay_sum_us: i64,
+    delay_windows: u32,
     /// Rolling minima the relative signals are scored against.
     baselines: Baselines,
     /// One refresh interval, µs. `None` = the 120 Hz [`ENCODE_RISE_US`] defaults.
@@ -290,6 +338,9 @@ impl BitrateController {
             link_cap_measured: false,
             link_evidence: false,
             link_lifted: false,
+            lift: None,
+            delay_sum_us: 0,
+            delay_windows: 0,
             baselines: Baselines::new(),
             frame_budget_us: None,
             encode_probe: None,
@@ -737,6 +788,7 @@ impl BitrateController {
             self.encode_down.disarmed(),
             self.clean_windows,
             draining,
+            self.lift_probing(),
         );
         self.last_reason = v.reason;
         self.note_activity(w.activity, v.quiet);
@@ -748,6 +800,12 @@ impl BitrateController {
             .is_none_or(|t| w.now.duration_since(t) >= CHANGE_COOLDOWN);
         if !cooled {
             return None;
+        }
+        // A lift the link refused is answered before anything else: the
+        // session was fine at the cap one window ago, so the answer is that
+        // rate and not a fraction of this one.
+        if let Some(kbps) = self.judge_lift(w, w.now) {
+            return Some(kbps);
         }
         if let Some(kbps) = self.judge_encode_step(w, &v) {
             return Some(kbps);
@@ -790,6 +848,90 @@ impl BitrateController {
         self.idle_windows = 0;
     }
 
+    /// Is a lift being judged right now? While it is, the delay baseline is
+    /// held still.
+    fn lift_probing(&self) -> bool {
+        self.lift.is_some_and(|p| !p.settled)
+    }
+
+    /// How far over the frozen reference the delay may go before the lift is
+    /// refused.
+    fn lift_bar_us(ref_us: i64) -> i64 {
+        LIFT_BAR_US.max(ref_us / LIFT_BAR_DIV)
+    }
+
+    /// One window's answer to a lift. `Some` is the retreat to ask for.
+    ///
+    /// The delay bar outlives the probe: a wall can answer a lift a minute
+    /// later, and the session was fine at the cap, so the answer is the cap
+    /// and not a cut. Loss, a lost frame and a rising trend only refuse while
+    /// the probe is still open — after it the ordinary verdict owns them.
+    fn judge_lift(&mut self, w: &WindowSample, now: Instant) -> Option<u32> {
+        let mut p = self.lift?;
+        p.age += 1;
+        if self.current_kbps <= p.cap_kbps {
+            // The host has not applied the lift, or the climb never asked for
+            // it. Nothing here is about the lift, and a probe kept open would
+            // hold the delay baseline still for nothing.
+            self.lift = (p.age < LIFT_PROBE_MAX_AGE).then_some(p);
+            return None;
+        }
+        let bar = Self::lift_bar_us(p.ref_us);
+        p.over = match w.delay {
+            Some(d) if d.mean_us > p.ref_us.saturating_add(bar) => p.over + 1,
+            Some(_) => 0,
+            None => p.over,
+        };
+        // Rising, and already halfway to the bar: a fit that wobbles either
+        // side of the reference is not a queue filling, and a lift the link
+        // is carrying must not be spent on one.
+        let half_bar = p.ref_us.saturating_add(bar / 2);
+        p.rising = match w.delay {
+            Some(d) if d.rise_us >= DRAIN_FALL_US && d.mean_us > half_bar => p.rising + 1,
+            Some(_) => 0,
+            None => p.rising,
+        };
+        let over = p.over >= LIFT_OVER_WINDOWS;
+        // The link showing itself at a lifted rate is the lift's answer,
+        // whatever form it took. `link_evidence` is this window's, scored a
+        // moment ago, and it already excludes the lone lost frame a long
+        // clean run vouches for.
+        let refused =
+            over || (!p.settled && (p.rising >= LIFT_RISING_WINDOWS || self.link_evidence));
+        if !refused {
+            if !p.settled && !w.activity.quiet() {
+                p.clean += 1;
+                p.settled = p.clean >= LIFT_PROBE_WINDOWS;
+            }
+            self.lift = Some(p);
+            return None;
+        }
+        self.lift = None;
+        self.link_lifted = false;
+        self.link_cap.latch(p.cap_kbps, self.floor_kbps);
+        self.drain_windows = LINK_DRAIN_WINDOWS;
+        tracing::info!(
+            from_kbps = self.current_kbps,
+            to_kbps = p.cap_kbps,
+            delay_us = w.delay.map_or(-1, |d| d.mean_us),
+            reference_us = p.ref_us,
+            settled = p.settled,
+            reprobe_after_windows = self.link_cap.reprobe_after(),
+            "adaptive bitrate: the link refused the lift — back to the cap it came from, and \
+             the next ask waits twice as long"
+        );
+        self.bad_windows = 0;
+        self.streak_decode_windows = 0;
+        // The delay is the probe's own signal; anything else came with a
+        // verdict that named itself.
+        self.last_cut = Some(if over || p.rising >= LIFT_RISING_WINDOWS {
+            Reason::Owd
+        } else {
+            self.last_reason
+        });
+        self.request(p.cap_kbps, now)
+    }
+
     /// What clean windows at this rate have been delivering, or `None` until
     /// there are enough of them to mean anything.
     fn delivery_reference(&self) -> Option<u32> {
@@ -806,6 +948,10 @@ impl BitrateController {
         }
         self.delivery_sum_kbps += u64::from(w.actual_kbps);
         self.delivery_windows += 1;
+        if let Some(d) = w.delay {
+            self.delay_sum_us += d.mean_us;
+            self.delay_windows += 1;
+        }
     }
 
     /// Did the link hand over less than the rate it was running at?
@@ -890,6 +1036,7 @@ impl BitrateController {
         }
         let hold = delivered_kbps.saturating_sub(delivered_kbps / LINK_HOLD_DIV);
         self.link_cap_measured = false;
+        self.lift = None;
         // A wall a fifth below the one already learned is a different wall,
         // not the same one standing again: start its clock over rather than
         // back it off, or a link that degrades twice is re-tested minutes
@@ -1124,6 +1271,7 @@ impl BitrateController {
             if std::mem::replace(&mut self.link_lifted, true) && !self.link_cap_measured {
                 self.link_cap.drop_cap();
                 self.link_lifted = false;
+                self.lift = None;
                 // The link just carried a rate the cap said it could not.
                 // Doubling back to what it now holds is what makes coming
                 // back cost about what the cut cost.
@@ -1135,9 +1283,24 @@ impl BitrateController {
                      interval — the wall moved, dropping it and doubling after it"
                 );
             } else {
+                // Freeze what the session's delay looked like before the ask.
+                // Everything after this judges the lift against this number,
+                // not against a baseline that will learn the rise. No delay
+                // at this rate is no reference: the ordinary verdict keeps
+                // the lift, as it did before there was a probe.
+                self.lift = (self.delay_windows > 0).then(|| LiftProbe {
+                    cap_kbps: from,
+                    ref_us: self.delay_sum_us / i64::from(self.delay_windows),
+                    clean: 0,
+                    over: 0,
+                    rising: 0,
+                    age: 0,
+                    settled: false,
+                });
                 tracing::info!(
                     from_kbps = from,
                     to_kbps = to,
+                    reference_us = self.lift.map_or(-1, |p| p.ref_us),
                     "adaptive bitrate: asking the link's wall again — lifting the cap"
                 );
             }
@@ -1430,6 +1593,8 @@ impl BitrateController {
         // content's fill and the FEC share all move with it.
         self.delivery_sum_kbps = 0;
         self.delivery_windows = 0;
+        self.delay_sum_us = 0;
+        self.delay_windows = 0;
         self.last_change = Some(now);
         self.unacked += 1;
         self.last_requested_kbps = Some(kbps);
@@ -1560,6 +1725,180 @@ mod tests {
             }),
             Some(14_000),
             "the decoder's verdict keeps the blind step"
+        );
+    }
+
+    fn trend(mean_us: i64, rise_us: i64) -> crate::abr::DelayTrend {
+        crate::abr::DelayTrend {
+            samples: 20,
+            mean_us,
+            rise_us,
+            last_us: mean_us,
+        }
+    }
+
+    /// A session parked at a learned wall with `ref_us` of delay behind it, at
+    /// the window the re-probe clock lifts the cap. `take_up` is the host
+    /// applying the lift; without it the rate stays at the cap. The returned
+    /// tick is past the cooldown the climb's own ask holds.
+    fn lifted_cap(start: Instant, ref_us: i64, take_up: bool) -> (BitrateController, u32, u32) {
+        let mut c = BitrateController::new(20_000, None);
+        c.set_ceiling(300_000);
+        // A wall at 12 000 twice: the cap latches a tenth under it.
+        c.note_link_mark(12_000);
+        c.note_link_mark(11_500);
+        let cap = c.link_cap.kbps().expect("two marks are a wall");
+        c.on_ack(cap, None);
+        let mut t = 0;
+        for _ in 0..CAP_REPROBE_WINDOWS_MIN {
+            let at = ticks(start, t);
+            t += 1;
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(ref_us),
+                delay: Some(trend(ref_us, 0)),
+                actual_kbps: cap,
+                ..WindowSample::at(at)
+            });
+        }
+        let lift = c.link_cap.kbps().expect("the clock must lift the cap");
+        assert!(lift > cap, "the re-probe never lifted");
+        if take_up {
+            c.on_ack(lift, None);
+        }
+        (c, t + 2, if take_up { lift } else { cap })
+    }
+
+    /// A lift is a probe, and a queue filling under it is the wall answering.
+    ///
+    /// The retreat goes to the cap the lift came from — the session was fine
+    /// there a window ago — and the cap's clock doubles. One window over the
+    /// bar is a handover stall or a send loop losing a slice, and a lift the
+    /// link is carrying outlives it.
+    #[test]
+    fn a_lift_the_queue_answers_retreats_to_the_cap() {
+        let start = Instant::now();
+        let judged = |ref_us: i64, mean_us: i64, rise_us: i64, n: u32| -> (Option<u32>, u32) {
+            let (mut c, mut t, rate) = lifted_cap(start, ref_us, true);
+            let mut out = None;
+            for _ in 0..n {
+                let at = ticks(start, t);
+                t += 1;
+                out = out.or(c.on_window(&WindowSample {
+                    owd_mean_us: Some(mean_us),
+                    delay: Some(trend(mean_us, rise_us)),
+                    actual_kbps: rate,
+                    ..WindowSample::at(at)
+                }));
+            }
+            (out, c.link_cap.reprobe_after())
+        };
+        let bar = BitrateController::lift_bar_us(10_000);
+        let over = 10_000 + bar + 1_000;
+        assert_eq!(
+            judged(10_000, over, 0, 1).0,
+            None,
+            "one window over the bar is a stall"
+        );
+        let (retreat, reprobe_after) = judged(10_000, over, 0, LIFT_OVER_WINDOWS);
+        assert_eq!(retreat, Some(10_350), "back to the cap, not a fraction");
+        assert_eq!(
+            reprobe_after,
+            CAP_REPROBE_WINDOWS_MIN * 2,
+            "and the next ask waits twice as long"
+        );
+        assert_eq!(
+            judged(
+                10_000,
+                10_000 + bar / 2 + 1_000,
+                DRAIN_FALL_US,
+                LIFT_RISING_WINDOWS
+            )
+            .0,
+            Some(10_350),
+            "a queue filling under the bar is the same answer"
+        );
+        // A tunnel whose own delay is 100 ms: the bar is a quarter of that,
+        // not the 15 ms a LAN is judged by.
+        assert_eq!(
+            judged(100_000, 120_000, 0, LIFT_OVER_WINDOWS).0,
+            None,
+            "20 ms on a 100 ms link is inside the session's own noise"
+        );
+    }
+
+    /// The probe's budget settles the lift, and a lift nothing took up gives
+    /// the delay baseline back.
+    ///
+    /// After the budget the cap keeps the new value and the ordinary verdict
+    /// owns the window again — but the frozen reference stays, because a wall
+    /// that answers late is still the lift's doing and not a cut's.
+    #[test]
+    fn a_settled_lift_keeps_its_reference_and_nothing_else() {
+        let start = Instant::now();
+        let (mut c, mut t, rate) = lifted_cap(start, 10_000, true);
+        let bar = BitrateController::lift_bar_us(10_000);
+        let window = |c: &mut BitrateController, t: &mut u32, mean_us: i64, rise_us: i64| {
+            let at = ticks(start, *t);
+            *t += 1;
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(mean_us),
+                delay: Some(trend(mean_us, rise_us)),
+                actual_kbps: rate,
+                ..WindowSample::at(at)
+            })
+        };
+        for _ in 0..LIFT_PROBE_WINDOWS {
+            assert_eq!(
+                window(&mut c, &mut t, 10_000, 0),
+                None,
+                "the link carries it"
+            );
+        }
+        for _ in 0..LIFT_RISING_WINDOWS {
+            assert_eq!(
+                window(&mut c, &mut t, 10_000 + bar / 2 + 1_000, DRAIN_FALL_US),
+                None,
+                "a settled lift leaves a rise under the bar to the verdict"
+            );
+        }
+        let mut out = None;
+        for _ in 0..LIFT_OVER_WINDOWS {
+            out = out.or(window(&mut c, &mut t, 10_000 + bar + 1_000, 0));
+        }
+        assert_eq!(
+            out,
+            Some(10_350),
+            "a standing rise at a lifted rate retreats"
+        );
+    }
+
+    /// A lift the climb never takes up is dropped: a probe left open holds the
+    /// delay baseline still, and a baseline that never learns judges nothing.
+    #[test]
+    fn a_lift_nothing_takes_up_is_dropped() {
+        let start = Instant::now();
+        let (mut c, mut t, rate) = lifted_cap(start, 10_000, false);
+        let window = |c: &mut BitrateController, t: &mut u32| {
+            let at = ticks(start, *t);
+            *t += 1;
+            // Half the rate: the climb has no reason to ask for the lift.
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                delay: Some(trend(10_000, 0)),
+                actual_kbps: rate / 2,
+                ..WindowSample::at(at)
+            })
+        };
+        for _ in 0..LIFT_PROBE_MAX_AGE / 2 {
+            window(&mut c, &mut t);
+        }
+        assert!(c.lift.is_some(), "the probe waits for the rate to arrive");
+        for _ in 0..LIFT_PROBE_MAX_AGE {
+            window(&mut c, &mut t);
+        }
+        assert!(
+            c.lift.is_none(),
+            "and gives up rather than freeze the delay"
         );
     }
 

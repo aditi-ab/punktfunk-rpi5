@@ -140,7 +140,9 @@ impl Baselines {
     /// what tells a blip from the first window of congestion — and
     /// `draining` says the last link cut is still emptying the queue it
     /// caused, which is the one thing a delay rise can mean that the rate
-    /// must not answer again.
+    /// must not answer again, and `freeze_owd` holds the delay baseline still
+    /// while a lift is being judged — a baseline that learns the rise it is
+    /// supposed to detect detects nothing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn score(
         &mut self,
@@ -150,6 +152,7 @@ impl Baselines {
         encode_disarmed: bool,
         clean_run: u32,
         draining: bool,
+        freeze_owd: bool,
     ) -> Verdict {
         let quiet = w.activity.quiet();
         // Keepalive OWD/decode would train the rolling min on the quietest
@@ -158,7 +161,12 @@ impl Baselines {
         let decode_mean_us = w.decode_mean_us.filter(|_| !quiet);
         // No severe OWD tier: a standing queue is congestion, not visible
         // damage, so it always takes the two-window path.
-        let (owd_rise, _) = score_baseline(&mut self.owd, owd_mean_us, OWD_RISE_US, i64::MAX);
+        let (owd_rise, _) = score_baseline(
+            &mut self.owd,
+            owd_mean_us.filter(|_| !freeze_owd),
+            OWD_RISE_US,
+            i64::MAX,
+        );
         // Delay over a queue the last cut is still draining is that cut
         // working. The baseline still learns the window: only the verdict is
         // withheld, and only for delay — loss, drops and a flush keep full
