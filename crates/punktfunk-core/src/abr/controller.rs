@@ -170,6 +170,10 @@ pub(crate) struct BitrateController {
     pub(super) link_cap: LearnedCap,
     /// Previous delivered mark (`0` = none). Two within ±1/5 are a wall.
     pub(super) link_mark_kbps: u32,
+    /// The standing cap came from a measurement, which holds 30 % back by
+    /// design. Its early lifts are that margin coming back, not a wall that
+    /// moved, so they must not retire it.
+    link_cap_measured: bool,
     /// The last bad window was the link's. Wider than
     /// [`link_verdict`](Self::link_verdict): a session sitting exactly on its
     /// wall is getting what it asks for and still has to learn where it is.
@@ -262,6 +266,7 @@ impl BitrateController {
             drain_windows: 0,
             link_cap: LearnedCap::new(),
             link_mark_kbps: 0,
+            link_cap_measured: false,
             link_evidence: false,
             link_lifted: false,
             baselines: Baselines::new(),
@@ -772,6 +777,43 @@ impl BitrateController {
         owd_bad && !growth::delivered_the_rate(w.actual_kbps, self.current_kbps)
     }
 
+    /// A wall a deliberate measurement found, and the rate it licenses.
+    ///
+    /// One reading latches it. Two agreeing windows are what the controller
+    /// needs when nobody measured; a ramp step or a burst offered the link
+    /// several times what the session will and watched it refuse, which is
+    /// the same evidence gathered on purpose. The cap goes at the licensed
+    /// rate, not a tenth under it: the measurement already holds 30 % back,
+    /// and the hold margin exists for a wall read off a window the session
+    /// was merely running in.
+    ///
+    /// From here the cap is a cap like any other — parked at, lifted +12.5 %
+    /// on the clock, re-latched with a doubled wait when the wall answers,
+    /// dropped when two lifts go unanswered. That is the whole point: a
+    /// measurement that binds for the session's life is a bound with no
+    /// expiry (L1), and on Klos54's tunnel it cost 45 % of the link.
+    pub(crate) fn note_measured_wall(&mut self, park_kbps: u32, delivered_kbps: u32) {
+        // A wall that licenses more than this stream can use is not a limit
+        // on the session: the stream's own shape is, and it is already the
+        // ceiling.
+        // A wall licensing more than the stream can use is not a limit on
+        // the session: its own shape is, and that is already the ceiling.
+        if !self.enabled || park_kbps == 0 || self.stream_cap_kbps.is_some_and(|c| park_kbps >= c) {
+            return;
+        }
+        self.link_mark_kbps = delivered_kbps;
+        self.link_cap_measured = true;
+        if self.link_cap.latch_measured(park_kbps, self.floor_kbps) {
+            tracing::info!(
+                cap_kbps = park_kbps,
+                delivered_kbps,
+                reprobe_after_windows = self.link_cap.reprobe_after(),
+                "adaptive bitrate: link cap measured — the climb holds here until the \
+                 re-probe clock asks the wall again"
+            );
+        }
+    }
+
     /// What a link-attributed cut delivered: one mark toward the wall.
     ///
     /// Two marks at the same rate are a wall, and the bring-up ramp's own wall
@@ -796,6 +838,7 @@ impl BitrateController {
             return;
         }
         let hold = delivered_kbps.saturating_sub(delivered_kbps / LINK_HOLD_DIV);
+        self.link_cap_measured = false;
         // A wall a fifth below the one already learned is a different wall,
         // not the same one standing again: start its clock over rather than
         // back it off, or a link that degrades twice is re-tested minutes
@@ -935,13 +978,16 @@ impl BitrateController {
     /// the lever for is held to instead: doubling back into a wall saws it,
     /// and the decode cap latches only on two chokes at a similar rate.
     fn note_rearm(&mut self, w: &WindowSample, v: &Verdict) {
-        // A knee reference is not refuted by a clean run either. A latched
-        // link cap is: the wall is known and the doubling cannot pass it, so
-        // a session left far under it comes back in seconds.
-        let far_under_the_wall = self
-            .link_cap
-            .kbps()
-            .is_some_and(|c| self.current_kbps < c.saturating_sub(c / LINK_HOLD_DIV));
+        // A knee reference is not refuted by a clean run either. A wall the
+        // session ran into is: the doubling cannot pass it, so a session left
+        // far under it comes back in seconds. A wall a measurement set is
+        // not — it holds 30 % back by design, so being under it is the
+        // ordinary state, not a verdict's aftermath.
+        let far_under_the_wall = !self.link_cap_measured
+            && self
+                .link_cap
+                .kbps()
+                .is_some_and(|c| self.current_kbps < c.saturating_sub(c / LINK_HOLD_DIV));
         if self.probing
             || (self.rate_verdict && !far_under_the_wall)
             || self.decode_backoff_kbps > 0
@@ -995,12 +1041,22 @@ impl BitrateController {
                 step: StepProbe::new(from, ref_us),
             });
         }
-        // Only the wall itself breaks the link cap's park, and it does that by
-        // re-latching. A damaged window does not: a cell drops a frame every
-        // few seconds, and a clock that waits for sixteen unbroken clean ones
-        // there is a bound with no expiry (L1).
-        if let Some((from, to)) = self.link_cap.on_window(false, quiet, rate, ceiling) {
-            if std::mem::replace(&mut self.link_lifted, true) {
+        // Only the wall breaks this park, by re-latching: a cell drops a frame
+        // every few seconds, so a clock waiting for clean windows never runs.
+        let lift_to = self
+            .stream_cap_kbps
+            .unwrap_or(u32::MAX)
+            .min(self.ceiling_cap_kbps.unwrap_or(u32::MAX))
+            .max(ceiling);
+        // `lift_to` is the stream's shape, not the ceiling: on a measured
+        // wall the ceiling IS this cap, so clamping there clamps it to itself.
+        if let Some((from, to)) = self.link_cap.on_window(false, quiet, rate, lift_to) {
+            // A measured wall is the ceiling as well as the cap, so asking it
+            // again means carrying the ceiling up with the answer. Nothing
+            // else's authority moves: the host and decode caps keep the
+            // bound they had.
+            self.raise_ceiling(to);
+            if std::mem::replace(&mut self.link_lifted, true) && !self.link_cap_measured {
                 self.link_cap.drop_cap();
                 self.link_lifted = false;
                 // The link just carried a rate the cap said it could not.

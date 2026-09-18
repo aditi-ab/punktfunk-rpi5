@@ -76,6 +76,21 @@ impl LearnedCap {
         true
     }
 
+    /// Latch a cap the session measured on purpose, on the long clock.
+    ///
+    /// A measurement holds its own margin back — the ramp licenses 70 % of
+    /// what it saw — so the session is not being damaged while the cap
+    /// stands, and the first re-ask is not urgent. Asking on the short clock
+    /// instead spends a probe every twelve seconds on a link whose margin is
+    /// load-bearing, which is what the margin was for.
+    pub(super) fn latch_measured(&mut self, kbps: u32, floor_kbps: u32) -> bool {
+        let latched = self.latch(kbps, floor_kbps);
+        if latched {
+            self.reprobe_after = CAP_REPROBE_WINDOWS_MAX;
+        }
+        latched
+    }
+
     /// Park at `kbps` and restart the clock, without judging the evidence.
     /// The headroom driver moves its cap both ways as one step is answered.
     pub fn park(&mut self, kbps: u32) {
@@ -285,6 +300,57 @@ mod tests {
         };
         assert_eq!(latched(11_500), Some(11_500 - 1_150));
         assert_eq!(latched(5_000), None, "half the rate is a different wall");
+    }
+
+    /// A measurement latches the cap on its own — it offered the link far
+    /// more than the session will and watched it refuse — and on the long
+    /// clock, because it holds its own margin back. The ceiling rides the
+    /// lift, or the wall it set would bind forever.
+    #[test]
+    fn a_measured_wall_latches_the_cap_and_lets_the_ceiling_follow() {
+        let mut c = BitrateController::new(20_000, None);
+        c.set_stream_cap(60_000);
+        let start = Instant::now();
+        // 0.7 of a 10 000 kbps reading, as the ramp licenses it.
+        c.note_measured_wall(7_000, 10_000);
+        assert_eq!(c.link_cap.kbps(), Some(7_000), "one reading is enough");
+        assert_eq!(
+            c.link_cap.reprobe_after(),
+            CAP_REPROBE_WINDOWS_MAX,
+            "and it is re-asked on the long clock"
+        );
+        c.set_ceiling(7_000);
+        c.on_ack(7_000, None);
+        // Parked at it, nothing may ask for more.
+        let mut t = 0;
+        for _ in 0..CAP_REPROBE_WINDOWS_MAX - 1 {
+            if let Some(k) = run_clean(&mut c, start, t, 1) {
+                assert!(k <= 7_000, "asked {k} above a 7 000 kbps wall");
+                c.on_ack(k, None);
+            }
+            t += 1;
+        }
+        assert_eq!(c.current_kbps, 7_000);
+        // The clock runs out: the wall is asked again and the ceiling follows.
+        let asked = until_request(&mut c, start, &mut t, 0, 8);
+        assert_eq!(c.link_cap.kbps(), Some(7_875), "+12.5 %");
+        assert!(
+            asked.is_some_and(|k| k > 7_000),
+            "the session must follow the lift: {asked:?}"
+        );
+    }
+
+    /// A wall that licenses more than the stream can use is not a limit on
+    /// this session, and putting a re-probe ladder on one would be a
+    /// slow-link rule reaching a link with room.
+    #[test]
+    fn a_measured_wall_above_the_stream_cap_teaches_no_cap() {
+        let mut c = BitrateController::new(20_000, None);
+        c.set_stream_cap(60_000);
+        c.note_measured_wall(60_000, 85_000);
+        assert!(c.link_cap.kbps().is_none());
+        c.note_measured_wall(59_000, 84_000);
+        assert_eq!(c.link_cap.kbps(), Some(59_000), "a hair under it is");
     }
 
     /// A wall that moved down is not the old one standing again: the cap

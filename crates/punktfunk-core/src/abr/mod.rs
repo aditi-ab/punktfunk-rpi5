@@ -310,12 +310,13 @@ impl Driver {
                 wall_kbps,
             } => {
                 self.set_ceiling(ceiling_kbps);
-                // A burst the link refused measured the same wall a ramp step
-                // would have, so it is one mark toward the link cap. One-shot
-                // at the source: a finished burst is answered once, however
-                // often the pump re-presents its report.
+                // The ramp's bargain, for the same reason. The burst reads
+                // low for a second one — it counts its own filler while video
+                // shares the link — so re-asking it matters more, not less.
+                // A burst the link kept up with refused nothing and leaves
+                // the ceiling alone, as it always has.
                 if let Some(kbps) = wall_kbps {
-                    self.abr.note_link_mark(kbps);
+                    self.abr.note_measured_wall(ceiling_kbps, kbps);
                 }
             }
         }
@@ -358,10 +359,14 @@ impl Driver {
     fn on_ramped(&mut self, ramped: probe::Ramped, now: Instant) -> Option<u32> {
         let proven_kbps = match ramped {
             probe::Ramped::Wall { delivered_kbps } => {
-                self.set_ceiling(probe::wall_ceiling_kbps(delivered_kbps));
-                // One mark toward the link cap: the ramp refused a step here,
-                // and a later window that delivers the same rate is the second.
-                self.abr.note_link_mark(delivered_kbps);
+                // The wall licenses a rate as it always has, and that rate is
+                // the link cap too, so the clock asks the wall again and
+                // carries the ceiling with the answer. A reading is one
+                // moment of a link that moves; bound for a session's life it
+                // left 45 % of the rig's tunnel unused (§4.1).
+                let licensed = probe::wall_ceiling_kbps(delivered_kbps);
+                self.set_ceiling(licensed);
+                self.abr.note_measured_wall(licensed, delivered_kbps);
                 delivered_kbps
             }
             probe::Ramped::NoWall { proven_kbps } if proven_kbps > 0 => {

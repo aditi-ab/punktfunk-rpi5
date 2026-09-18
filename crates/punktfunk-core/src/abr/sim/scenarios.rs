@@ -431,6 +431,33 @@ pub(super) fn wan_wg_12(seed: u64, duration_ms: u64) -> Scenario {
     }
 }
 
+/// Klos54's tunnel as the rig measured it: 12.05 Mbps behind a queue deep
+/// enough that the ramp's deciding step drains through it and reads ~17 %
+/// low.
+///
+/// The reading is the thing under test, so the yardstick here is the link
+/// rather than what the ramp licensed: a session that treats the reading as
+/// a ceiling never reaches it, and one that treats it as a cap to be re-asked
+/// does, without buying the rate with frames.
+pub(super) fn wan_ramp_reads_low() -> Scenario {
+    Scenario {
+        name: "wan_ramp_reads_low",
+        seed: 0x7A_7400,
+        duration_ms: 600_000,
+        link: LinkCfg {
+            capacity: vec![(0, 12_050)],
+            buffer_ms: 900,
+            base_delay_ms: 10,
+            loss_ppm: 7_000,
+            ..LinkCfg::default()
+        },
+        sessions: vec![wg_session()],
+        // What the link carries, not what one step of a ramp saw of it.
+        achievable_kbps: 10_845,
+        blip_at_ms: None,
+    }
+}
+
 /// A tunnel that browns out for ten seconds after a clean run, then comes
 /// back — the case a delivered-rate cut has to leave alone once it lands.
 ///
@@ -1114,6 +1141,7 @@ pub(super) fn all() -> Vec<Scenario> {
         ramp_cut_short_wifi(),
         ramp_cut_short_wan(),
         wan_brownout(),
+        wan_ramp_reads_low(),
     ]
     .into_iter()
     // `old_host` is the host that has none of this: it stays as it is.
@@ -1656,6 +1684,36 @@ mod tests {
         }
     }
 
+    /// What the rig found on Klos54's tunnel: the ramp's reading became a
+    /// ceiling for the session's life and left 30 % of the link unused.
+    ///
+    /// As a cap it is asked again on the long clock, and the session walks up
+    /// to what the link carries without buying it with frames.
+    #[test]
+    fn a_measured_wall_is_asked_again_until_the_link_answers() {
+        let sc = with_ramp(wan_ramp_reads_low());
+        let achievable = sc.achievable_kbps;
+        let r = run(&sc);
+        let m = r.metrics;
+        assert!(
+            m.to90_s <= 300,
+            "{} s to reach 90 % of what the link carries",
+            m.to90_s
+        );
+        assert_eq!(m.lost_per_10min, 0, "and it may not be bought with frames");
+        let top = r.windows[0]
+            .iter()
+            .map(|w| w.rate_kbps)
+            .max()
+            .expect("windows");
+        assert!(
+            top > achievable,
+            "the session peaked at {top} kbps of a {achievable} kbps link"
+        );
+        // The cap is still doing its job: nothing runs away past the wall.
+        assert!(m.under5_pct == 0 && m.queue_p95_ms < 100, "{m:?}");
+    }
+
     /// A cell that gets better: the cap it taught has to get out of the way.
     ///
     /// `lte_variable` steps 8 → 50 Mbps at 75 s with a cap latched at 4 736.
@@ -1706,6 +1764,7 @@ mod tests {
             "wan" => wan_wg_12(0x7A_5500, 180_000),
             "lte" => lte_variable(),
             "brownout" => wan_brownout(),
+            "readslow" => wan_ramp_reads_low(),
             "newcomer" => shared_newcomer(),
             "c6" => wifi_tv_probe_damage(),
             "knee" => decoder_knee(),
