@@ -72,8 +72,11 @@ pub struct ProbeReport {
     pub window_ms: u32,
     /// Host send-window duration. `0` = the host declined the burst.
     pub host_duration_ms: u32,
-    /// The measured client interval, the ramp's own denominator. `0` = none.
+    /// The measured client interval, for the log. `0` = none.
     pub client_interval_ms: u32,
+    /// The same interval in microseconds: the ramp's own denominator, at the
+    /// resolution the arrival stamps have. `0` = none.
+    pub client_interval_us: u32,
     /// Payload bytes the host put on the wire, against what was asked.
     pub host_bytes_sent: u64,
     /// Wire packets the host's kernel accepted.
@@ -132,8 +135,9 @@ pub(crate) struct RampSummary {
 
 /// What one settled step says.
 enum Verdict {
-    /// The link refused it at this delivered rate.
-    Wall(u32),
+    /// The link did not carry it. `lossless` = every packet the host sent
+    /// arrived, so the reading rests entirely on when they arrived.
+    Refused { delivered_kbps: u32, lossless: bool },
     /// The host could not offer the rate; what it managed is a floor.
     Sender(u32),
     /// Too few packets, or no interval: nothing can be read from it.
@@ -143,6 +147,13 @@ enum Verdict {
 /// One step in flight.
 struct Step {
     target_kbps: u32,
+    /// How long the host was asked to send for, microseconds. The offered
+    /// side of the ratio is measured against this rather than against the
+    /// host's own `duration_ms`: that is a wire field it rounds down to whole
+    /// milliseconds off its own clock, which is 4 % of a 25 ms step, and the
+    /// sender-limit rule below has already established that the host put
+    /// what was asked on the wire (`send_dropped == 0`, offered ≈ asked).
+    asked_us: u64,
     /// Payload bytes the host was asked for: `target_kbps` over the step.
     asked_bytes: u64,
     /// Delivered bytes the last report showed, and when they last grew.
@@ -173,6 +184,10 @@ struct Ramp {
     /// look like an unfinished ramp.
     done: bool,
     wall: bool,
+    /// A lossless refusal waiting on its repeat, and whether this ramp has
+    /// spent the one repeat it gets.
+    confirming: Option<u32>,
+    re_ask_spent: bool,
     /// Stopped before it had asked everything it meant to: video arrived, or
     /// a step went unanswered. Capacity above `proven_kbps` is unmeasured.
     cut_short: bool,
@@ -187,16 +202,19 @@ struct Ramp {
 /// the first swings the implied rate 2.5× (rig, every profile), and an
 /// unclamped reading opened sessions on a rate no step ever offered.
 fn step_rate_kbps(step: &Step, r: &ProbeReport) -> u32 {
-    let interval = u64::from(r.client_interval_ms.max(1));
-    let rate = (r.delivered_bytes.saturating_mul(8) / interval) as u32;
+    let us = u64::from(r.client_interval_us.max(1));
+    let rate = (r.delivered_bytes.saturating_mul(8_000) / us) as u32;
     rate.min(step.target_kbps)
 }
 
-/// Did the link refuse what was offered? Delivered ÷ offered as packets a
-/// millisecond on each side: the host sent `wire_packets_sent` over its
+/// Did the link refuse what was offered? The legacy burst's version of the
+/// test a ramp step is judged by: the host sent `wire_packets_sent` over its
 /// window, we received `delivered_packets` over ours. A queue that stretches
 /// the arrivals and loss that thins them both land here.
 ///
+/// The burst carries no asked span of its own, so the host's send window
+/// stands in for one — 800 ms of it, where a step's is 25 ms, so the
+/// first-to-last correction a step needs is under a tenth of a percent here.
 /// A sender that could not offer the rate is not a refusal: the link was
 /// never asked.
 fn link_refused(r: &ProbeReport) -> bool {
@@ -227,6 +245,8 @@ impl Ramp {
             started: now,
             done: false,
             wall: false,
+            confirming: None,
+            re_ask_spent: false,
             cut_short: false,
             outcome: None,
         }
@@ -269,9 +289,47 @@ impl Ramp {
         });
     }
 
+    /// A step the link did not carry.
+    ///
+    /// With packets lost that is decisive: the link dropped them, and no
+    /// second reading makes that untrue. With none lost the verdict rests
+    /// entirely on WHEN they arrived, and a few milliseconds of scheduling on
+    /// a 25 ms window is the difference between 0.86 and 0.91 — four of the
+    /// rig's walls sat in that band, one latching 80 Mbps on a 237 Mbps link.
+    /// So the same rate goes out once more and only a second refusal is a
+    /// wall; a repeat that passes carries the ramp on. One repeat per ramp,
+    /// so it costs one step at one rate.
+    fn on_refusal(
+        &mut self,
+        delivered_kbps: u32,
+        lossless: bool,
+        now: Instant,
+    ) -> Option<(u32, u32)> {
+        if let Some(first) = self.confirming.take() {
+            // Refused twice at the same rate: the link carried at best the
+            // better of the two readings.
+            self.stop(Ramped::Wall {
+                delivered_kbps: delivered_kbps.max(first),
+            });
+            return None;
+        }
+        if lossless && !self.re_ask_spent {
+            self.re_ask_spent = true;
+            self.confirming = Some(delivered_kbps);
+            tracing::info!(
+                delivered_kbps,
+                "adaptive bitrate: ramp asking the refused rate once more before calling it a wall"
+            );
+            // `next_kbps` still holds the rate that was just asked.
+            return Some(self.begin(now));
+        }
+        self.stop(Ramped::Wall { delivered_kbps });
+        None
+    }
+
     /// Judge a settled step. `None` = it proved the rate and the ramp goes on.
     fn judge(&self, step: &Step, r: &ProbeReport) -> Option<Verdict> {
-        let interval = u64::from(r.client_interval_ms);
+        let interval = u64::from(r.client_interval_us);
         // Under two packets there is no interval, so there is no rate either.
         if interval == 0 || r.delivered_packets < 2 || r.wire_packets_sent == 0 {
             return Some(Verdict::Unreadable);
@@ -292,15 +350,29 @@ impl Ramp {
             // link would take.
             return Some(Verdict::Sender(delivered_kbps));
         }
-        if link_refused(r) {
+        // Delivered ÷ offered as packets a microsecond on each side. Both
+        // spans are first-to-last: `n` packets paced over the asked window
+        // leave it across `n - 1` gaps, and the arrivals are timed the same
+        // way, so a clean step reads 1.00 instead of 1.04. A queue that
+        // stretches the arrivals and loss that thins them both land here.
+        let offered_span =
+            step.asked_us * (u64::from(r.wire_packets_sent) - 1) / u64::from(r.wire_packets_sent);
+        let delivered = r.delivered_packets * offered_span;
+        let offered = u64::from(r.wire_packets_sent) * interval;
+        if delivered * 100 < offered * RAMP_WALL_PCT {
+            let lossless = r.delivered_packets >= u64::from(r.wire_packets_sent);
             tracing::info!(
                 target_kbps = step.target_kbps,
                 delivered_kbps,
-                client_interval_ms = r.client_interval_ms,
-                host_duration_ms = r.host_duration_ms,
-                "adaptive bitrate: ramp found the link's wall"
+                client_interval_us = r.client_interval_us,
+                offered_span_us = offered_span,
+                lossless,
+                "adaptive bitrate: ramp step refused"
             );
-            return Some(Verdict::Wall(delivered_kbps));
+            return Some(Verdict::Refused {
+                delivered_kbps,
+                lossless,
+            });
         }
         None
     }
@@ -337,10 +409,10 @@ impl Ramp {
             return None;
         };
         match self.judge(&step, &report) {
-            Some(Verdict::Wall(delivered_kbps)) => {
-                self.stop(Ramped::Wall { delivered_kbps });
-                None
-            }
+            Some(Verdict::Refused {
+                delivered_kbps,
+                lossless,
+            }) => self.on_refusal(delivered_kbps, lossless, now),
             Some(Verdict::Sender(delivered_kbps)) => {
                 self.stop(Ramped::NoWall {
                     proven_kbps: self.proven_kbps.max(delivered_kbps),
@@ -352,6 +424,8 @@ impl Ramp {
                 None
             }
             None => {
+                // A rate that passes refutes any refusal of it.
+                self.confirming = None;
                 self.proven_kbps = step_rate_kbps(&step, &report);
                 if step.target_kbps >= self.max_kbps {
                     // The ramp asked for everything this stream can use and
@@ -371,10 +445,12 @@ impl Ramp {
         let target_kbps = self.next_kbps.min(self.max_kbps);
         let duration_ms = step_ms(target_kbps);
         let asked_bytes = u64::from(target_kbps) * u64::from(duration_ms) / 8;
+        let asked_us = u64::from(duration_ms) * 1_000;
         self.spent_bytes += asked_bytes;
         self.steps += 1;
         self.step = Some(Step {
             target_kbps,
+            asked_us,
             asked_bytes,
             seen_bytes: 0,
             seen_at: now,
@@ -701,6 +777,7 @@ mod tests {
             window_ms,
             host_duration_ms: 800,
             client_interval_ms: window_ms,
+            client_interval_us: (window_ms) * 1_000,
             ..ProbeReport::default()
         }
     }
@@ -760,6 +837,7 @@ mod tests {
                 window_ms: interval,
                 host_duration_ms: duration_ms,
                 client_interval_ms: interval,
+                client_interval_us: (interval) * 1_000,
                 host_bytes_sent: u64::from(sent_kbps) * u64::from(duration_ms) / 8,
                 wire_packets_sent: packets as u32,
                 send_dropped: 0,
@@ -786,12 +864,19 @@ mod tests {
     }
 
     /// The ramp doubles from 5 Mbps and stops at the first step the link
-    /// cannot carry, with the rate that step actually delivered.
+    /// cannot carry, with the rate that step actually delivered. The refused
+    /// rate goes out twice: nothing was lost, so one reading of it is as much
+    /// a reading of the client's scheduler as of the link.
     #[test]
     fn the_ramp_stops_at_the_first_step_the_link_refuses() {
         let mut rig = Rig::new(46_656, None); // 1080p30 HEVC
         let end = rig.run(12_500, u32::MAX);
-        assert_eq!(rig.asked, [5_000, 10_000, 20_000], "{:?}", rig.asked);
+        assert_eq!(
+            rig.asked,
+            [5_000, 10_000, 20_000, 20_000],
+            "{:?}",
+            rig.asked
+        );
         let Ramped::Wall { delivered_kbps } = end else {
             panic!("a 12.5 Mbps link is a wall: {end:?}");
         };
@@ -799,9 +884,9 @@ mod tests {
             (11_000..=14_000).contains(&delivered_kbps),
             "the wall read {delivered_kbps} kbps"
         );
-        // What it costs the link: three steps of 25 ms.
+        // What it costs the link: four steps of 25 ms.
         let spent = rig.p.ramp_summary().expect("it stopped").asked_bytes;
-        assert!(spent < 120_000, "the ramp asked for {spent} bytes");
+        assert!(spent < 180_000, "the ramp asked for {spent} bytes");
     }
 
     /// A link with room to spare: the ramp stops at the rate that proves what
@@ -901,6 +986,7 @@ mod tests {
             window_ms: duration_ms,
             host_duration_ms: duration_ms,
             client_interval_ms: duration_ms,
+            client_interval_us: (duration_ms) * 1_000,
             host_bytes_sent: u64::from(target) * u64::from(duration_ms) / 8,
             wire_packets_sent: 8,
             send_dropped: 0,
@@ -924,6 +1010,45 @@ mod tests {
         );
     }
 
+    /// The verdict is read in microseconds, because a millisecond of
+    /// rounding is 4 % of a 25 ms step and the decision turns on 10 %.
+    ///
+    /// Two steps that differ by 600 µs — one arrival pattern inside the same
+    /// millisecond — land on opposite sides of the bar. Four of the rig's 28
+    /// walls sat in exactly that band, one of them latching 80 Mbps on a
+    /// 237 Mbps link.
+    #[test]
+    fn a_step_is_judged_in_microseconds() {
+        for (interval_us, wall) in [(27_000u32, false), (27_600u32, true)] {
+            let mut rig = Rig::new(1_026_432, None);
+            let (target, duration_ms) = rig.p.poll(rig.now, 0, 0).expect("a step");
+            assert_eq!(duration_ms, RAMP_STEP_MS, "the arithmetic below assumes it");
+            let r = ProbeReport {
+                delivered_bytes: 100 * 1_448,
+                delivered_packets: 100,
+                window_ms: interval_us / 1_000,
+                host_duration_ms: duration_ms,
+                client_interval_ms: interval_us / 1_000,
+                client_interval_us: interval_us,
+                host_bytes_sent: u64::from(target) * u64::from(duration_ms) / 8,
+                wire_packets_sent: 100,
+                send_dropped: 0,
+            };
+            // Nothing was lost either way, so a refusal is asked again.
+            for _ in 0..2 {
+                let at = rig.at(u64::from(interval_us) / 1_000);
+                rig.p.on_result(r, at);
+                let at = rig.at(RAMP_DRAIN_MS + 1);
+                rig.p.poll(at, 0, 0);
+            }
+            assert_eq!(
+                matches!(rig.p.take_ramped(rig.now), Some(Ramped::Wall { .. })),
+                wall,
+                "{interval_us} us of arrivals against a 25 000 us ask"
+            );
+        }
+    }
+
     /// A short step's implied rate is noise: the rig measured the same 24
     /// packets arriving over 6 ms and over 15 ms, 2.5× apart. Whatever the
     /// arithmetic says, a step cannot have proved more than it offered — and
@@ -941,6 +1066,7 @@ mod tests {
             window_ms: 6,
             host_duration_ms: duration_ms,
             client_interval_ms: 6,
+            client_interval_us: (6) * 1_000,
             host_bytes_sent: u64::from(target) * u64::from(duration_ms) / 8,
             wire_packets_sent: 24,
             send_dropped: 0,
@@ -1013,6 +1139,7 @@ mod tests {
                 window_ms: 800,
                 host_duration_ms: 800,
                 client_interval_ms: 800,
+                client_interval_us: 800_000,
                 host_bytes_sent: 40_000_000,
                 wire_packets_sent,
                 send_dropped,
@@ -1070,22 +1197,29 @@ mod tests {
                 "and the ramp has no verdict"
             );
         }
-        // The queue hands them over, late and stretched: that is the wall.
-        let at = rig.at(1);
-        rig.p.on_result(
-            ProbeReport {
-                delivered_bytes: 11 * 1_448,
-                delivered_packets: 11,
-                client_interval_ms: duration_ms * 4,
-                ..empty
-            },
-            at,
-        );
-        let at = rig.at(RAMP_DRAIN_MS + 1);
-        rig.p.poll(at, 0, 0);
+        // The queue hands them over, late and stretched. Nothing was lost,
+        // so the rate is asked once more and refused again: that is the wall.
+        let late = ProbeReport {
+            delivered_bytes: 11 * 1_448,
+            delivered_packets: 11,
+            client_interval_ms: duration_ms * 4,
+            client_interval_us: (duration_ms * 4) * 1_000,
+            ..empty
+        };
+        for pass in 0..2 {
+            let at = rig.at(1);
+            rig.p.on_result(late, at);
+            let at = rig.at(RAMP_DRAIN_MS + 1);
+            let again = rig.p.poll(at, 0, 0);
+            assert_eq!(
+                again.is_some(),
+                pass == 0,
+                "the refused rate goes out once more, and only once"
+            );
+        }
         assert!(
             matches!(rig.p.take_ramped(rig.now), Some(Ramped::Wall { .. })),
-            "a step that took four times its window is a wall"
+            "a rate that took four times its window twice over is a wall"
         );
     }
 
