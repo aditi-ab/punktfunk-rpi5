@@ -250,6 +250,10 @@ pub(crate) struct BitrateController {
     /// reference a lift is frozen against. Dropped with the delivery norm.
     delay_sum_us: i64,
     delay_windows: u32,
+    /// The last delay norm, kept when a rate move drops the one above. A
+    /// climb step or a cut changes the queue's occupancy, not the path's own
+    /// delay, so this is still the mark a drained queue comes back to.
+    delay_norm_us: i64,
     /// Rolling minima the relative signals are scored against.
     baselines: Baselines,
     /// One refresh interval, µs. `None` = the 120 Hz [`ENCODE_RISE_US`] defaults.
@@ -349,6 +353,7 @@ impl BitrateController {
             lift: None,
             delay_sum_us: 0,
             delay_windows: 0,
+            delay_norm_us: 0,
             baselines: Baselines::new(),
             frame_budget_us: None,
             encode_probe: None,
@@ -963,10 +968,14 @@ impl BitrateController {
     ///
     /// Both norms are only true of the rate they were taken at: the parity
     /// floor, the content's fill and the FEC share move with the rate, and so
-    /// does the queue behind it.
+    /// does the queue behind it. The delay's last value is kept anyway: the
+    /// drain guard needs a mark to wait for.
     fn forget_rate_norms(&mut self) {
         self.delivery_sum_kbps = 0;
         self.delivery_windows = 0;
+        if self.delay_windows > 0 {
+            self.delay_norm_us = self.delay_sum_us / i64::from(self.delay_windows);
+        }
         self.delay_sum_us = 0;
         self.delay_windows = 0;
     }
@@ -1102,14 +1111,16 @@ impl BitrateController {
     /// Arm the guard: this cut queued something, and what that queue does on
     /// the way out is not fresh evidence.
     ///
-    /// The reference is where clean windows at this rate sat before the cut —
-    /// taken now, because the request that follows drops it.
+    /// The reference is where clean windows sat before the cut: this rate's
+    /// own norm, or the one the last rate move left behind. A session climbing
+    /// back to its cap has no norm of its own when the next cut lands, and a
+    /// guard with no mark to wait for spends its whole budget.
     fn arm_drain(&mut self) {
         self.drain_windows = LINK_DRAIN_WINDOWS;
         self.drain_ref_us = if self.delay_windows > 0 {
             self.delay_sum_us / i64::from(self.delay_windows)
         } else {
-            0
+            self.delay_norm_us
         };
         self.drain_suppressed = 0;
     }
@@ -2082,6 +2093,62 @@ mod tests {
             after(9_000, 0, 2),
             Some(7_000),
             "a delay back where it was ends the guard, and the window is judged"
+        );
+    }
+
+    /// A cut one window after a climb step still knows where the delay sat.
+    ///
+    /// The step forgets this rate's norms, and one window is too few to build
+    /// another, so the guard would have no mark to wait for and would spend
+    /// its whole budget. The norm the step left behind is that mark.
+    #[test]
+    fn a_guard_armed_right_after_a_climb_keeps_a_reference() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        // Four windows at the ceiling: 10 ms is where this rate's delay sits.
+        for i in 0..BASELINE_MIN_WINDOWS as u32 {
+            assert_eq!(
+                c.on_window(&WindowSample {
+                    owd_mean_us: Some(10_000),
+                    delay: Some(trend(10_000, 0)),
+                    actual_kbps: 20_000,
+                    ..WindowSample::at(ticks(start, i))
+                }),
+                None
+            );
+        }
+        let mut t = BASELINE_MIN_WINDOWS as u32;
+        c.set_ceiling(30_000);
+        let up = c
+            .on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                delay: Some(trend(10_000, 0)),
+                actual_kbps: 20_000,
+                ..WindowSample::at(ticks(start, t))
+            })
+            .expect("the room is there, so the session climbs");
+        c.on_ack(up, None);
+        assert_eq!(c.delay_windows, 0, "the step forgot the rate's norms");
+        // The link answers the step: the queue fills, then it swallows frames.
+        for dropped in [0, 4] {
+            t += 1;
+            let _ = c.on_window(&WindowSample {
+                dropped,
+                owd_mean_us: Some(300_000),
+                delay: Some(trend(300_000, 100_000)),
+                actual_kbps: 10_000,
+                ..WindowSample::at(ticks(start, t))
+            });
+        }
+        assert!(c.drain_windows > 0, "a link cut arms the guard");
+        assert_eq!(c.drain_ref_us, 10_000, "the norm the step left behind");
+        t += 1;
+        assert!(
+            !c.note_drain(&WindowSample {
+                delay: Some(trend(10_000, -20_000)),
+                ..WindowSample::at(ticks(start, t))
+            }),
+            "and the guard ends when the delay is back at it"
         );
     }
 
