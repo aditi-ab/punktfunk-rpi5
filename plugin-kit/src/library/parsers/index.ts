@@ -18,7 +18,6 @@ export {
 	confinedJoin,
 	dirAccess,
 	fileAccess,
-	grantCommand,
 	isDir,
 	isFile,
 	listDir,
@@ -54,6 +53,7 @@ export {
 export { openReadOnly, type ReadOnlyDb, withReadOnlyDb } from "./sqlite.js";
 export {
 	steamLibraryDirs,
+	steamListedLibraries,
 	steamRoots,
 	steamUserConfigDirs,
 } from "./steam-root.js";

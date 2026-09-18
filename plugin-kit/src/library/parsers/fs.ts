@@ -75,7 +75,7 @@ export const listDir = (dir: string): string[] => {
  * Load-bearing on Windows: the plugin runner is `NT AUTHORITY\LocalService`, which holds no ACE
  * anywhere inside a user profile. A per-user install therefore stats exactly like an absent one,
  * and a scanner that cannot tell them apart reports "not installed" for a launcher sitting right
- * there. See {@link grantCommand} for the other half.
+ * there. Folder access requests are the other half.
  */
 export type Access = "ok" | "missing" | "denied";
 
@@ -96,19 +96,6 @@ export const dirAccess = (p: string): Access =>
 /** {@link Access} for a regular, non-empty file. */
 export const fileAccess = (p: string): Access =>
 	classify(p, (st) => st.isFile() && st.size > 0);
-
-/**
- * The command that grants the plugin runner read on `p`'s directory, or `null` where none applies
- * — off Windows the runner is a `systemctl --user` unit, so it already runs as the operator.
- *
- * Granting the directory is enough: "bypass traverse checking" is held by every service account,
- * so the locked parents above it are never access-checked and the rest of the profile stays shut.
- * Addressed by SID rather than by name because that is what an operator can paste anywhere.
- */
-export const grantCommand = (p: string): string | null =>
-	process.platform === "win32"
-		? `icacls "${path.win32.dirname(p)}" /grant "*S-1-5-19:(OI)(CI)(RX)"`
-		: null;
 
 /** Does this path exist as a directory? */
 export const isDir = (p: string): boolean => dirAccess(p) === "ok";

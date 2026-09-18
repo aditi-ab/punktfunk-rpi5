@@ -10,8 +10,10 @@
 import * as fs from "node:fs";
 import type { PluginDef } from "@punktfunk/host";
 import { Duration, Effect, type Schema, Stream } from "effect";
+import { requestAccess, unreachable } from "../access.js";
 import { type CliCommand, runPluginCli } from "../cli.js";
 import { type ConfigService, makeConfigService } from "../config.js";
+import type { HostRequestError } from "../errors.js";
 import { HostClient, type PluginInfo } from "../host-client.js";
 import { ProviderClient, type ProviderClientService } from "../reconcile.js";
 import { definePluginKit, type PluginKitDef } from "../runtime.js";
@@ -76,6 +78,8 @@ export interface LibraryPluginDef<S extends Schema.Top> {
 	readonly launchers?: (cfg: S["Type"]) => ReadonlyArray<ProviderEntry>;
 	/** Launcher data dirs to watch, so a newly installed game appears without waiting for a poll. */
 	readonly watchDirs?: (cfg: S["Type"]) => ReadonlyArray<string>;
+	/** Folders the launcher lists dynamically; unusable ones are requested before each scan. */
+	readonly wants?: (cfg: S["Type"]) => ReadonlyArray<string>;
 	/** How often to re-scan regardless of watches. Default `Duration.minutes(15)`. */
 	readonly pollInterval?: Duration.Duration;
 	/** Debounce on filesystem events. Default `Duration.seconds(3)`. */
@@ -110,6 +114,37 @@ export interface LibraryPlugin {
 	readonly cli: (argv?: ReadonlyArray<string>) => Promise<void>;
 }
 
+const accessAwareCompute = <Cfg, A, E, R>(
+	wants: ((cfg: Cfg) => ReadonlyArray<string>) | undefined,
+	title: string,
+	load: Effect.Effect<Cfg, E, R>,
+	compute: (cfg: Cfg) => Effect.Effect<A, E, R>,
+): (() => Effect.Effect<A, E | HostRequestError, R | HostClient>) => {
+	let lastAsked: string | undefined;
+	return () =>
+		load.pipe(
+			Effect.flatMap((cfg) => {
+				const dirs = unreachable(wants?.(cfg) ?? []).sort();
+				const key = JSON.stringify(dirs);
+				if (key === lastAsked) return compute(cfg);
+				if (dirs.length === 0) {
+					lastAsked = key;
+					return compute(cfg);
+				}
+				return requestAccess(dirs, title).pipe(
+					Effect.tap((outcomes) => {
+						lastAsked = key;
+						return outcomes.length > 0
+							? Effect.logInfo(`asked the operator for ${dirs.length} folders`)
+							: Effect.void;
+					}),
+					Effect.andThen(compute(cfg)),
+				);
+			}),
+		);
+};
+
+/** Build a library plugin whose scans also reconcile any dynamic folder requests. */
 export const defineLibraryPlugin = <S extends Schema.Top>(
 	def: LibraryPluginDef<S>,
 ): LibraryPlugin => {
@@ -184,13 +219,19 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 		const cfgService = yield* config;
 		const provider = yield* ProviderClient;
 		const state = { warned: false };
+		const compute = accessAwareCompute(
+			def.wants,
+			def.title ?? def.name,
+			cfgService.load,
+			computeEntries,
+		);
 
 		const engine = yield* makeSyncEngine<
 			ScanReport,
 			ReadonlyArray<ProviderEntry>,
-			never
+			HostClient
 		>({
-			compute: () => cfgService.load.pipe(Effect.flatMap(computeEntries)),
+			compute,
 			apply: applyEntries(provider, state),
 			// The host IS the state: a full-replace reconcile is idempotent, so there is nothing to
 			// persist between runs. Reporting no previous fingerprint means the first sync after a
