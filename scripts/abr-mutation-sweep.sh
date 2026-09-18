@@ -101,6 +101,10 @@ SHARE_BAND_DIV|const SHARE_BAND_DIV: u32 = 10;|const SHARE_BAND_DIV: u32 = 4;
 SHORT_DIV|const SHORT_DIV: u32 = 16;|const SHORT_DIV: u32 = 4;
 SHARE_CLOCK|const SHARE_CLOCK: Duration = Duration::from_secs(5);|const SHARE_CLOCK: Duration = Duration::from_secs(60);
 SHARE_LIFT_CLOCK|const SHARE_LIFT_CLOCK: Duration = Duration::from_secs(60);|const SHARE_LIFT_CLOCK: Duration = Duration::from_secs(5);
+LOSS_HORIZON_WINDOWS|const LOSS_HORIZON_WINDOWS: u32 = 32;|const LOSS_HORIZON_WINDOWS: u32 = 4;
+LOSS_BUDGET_SECS|const LOSS_BUDGET_SECS: u64 = 600;|const LOSS_BUDGET_SECS: u64 = 60;
+LOSS_RELEASE_PCT|const LOSS_RELEASE_PCT: u32 = 125;|const LOSS_RELEASE_PCT: u32 = 100;
+LOSS_PCT_MAX|const LOSS_PCT_MAX: u8 = 25;|const LOSS_PCT_MAX: u8 = 50;
 EOF
 )
 

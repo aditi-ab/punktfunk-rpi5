@@ -129,8 +129,11 @@ pub(super) struct Task {
     /// client-set rate and a PyroWave pin are never touched.
     pub(super) bitrate_automatic: bool,
     /// One wire packet, bytes. Turns the client's delivery count into the rate
-    /// the governor divides.
+    /// the governor divides, and the shard the parity rule sizes against.
     pub(super) wire_bytes: u64,
+    /// Audio reservation out of the wire budget. With [`Self::wire_bytes`] and
+    /// the live mode it is the frame adaptive FEC has to protect.
+    pub(super) audio_kbps: u32,
     /// Client set `EXT_ABR_ACK_REASON` in its `Start` block: its `BitrateChanged`
     /// may carry the reason byte. Clear for every shipped client, which rejects
     /// a longer ack, and for every client behind a host without `HOST_CAP2_EXT`.
@@ -217,6 +220,7 @@ pub(super) async fn run(task: Task) {
         session_bitrate_kbps,
         bitrate_automatic,
         wire_bytes,
+        audio_kbps,
         ack_reason,
         live_bitrate,
         encoder_ceiling,
@@ -284,6 +288,9 @@ pub(super) async fn run(task: Task) {
     // An RFI ask is a frame parity could not repair; the LossReport that
     // closes the window carries only what parity did repair.
     let mut unrecovered = UnrecoveredRun::default();
+    // The link's loss over a horizon one report window cannot see, which is
+    // what sizes parity against the frame this session's budget buys.
+    let mut fec_horizon = punktfunk_core::abr::budget::LossHorizon::default();
     // Shared-path governor: what this session offered and what reached it over
     // the last window, read at the same boundary so a shortfall describes one
     // stretch of link, plus the two clocks an up-move rides.
@@ -411,7 +418,23 @@ pub(super) async fn run(task: Task) {
                     // No-op when FEC is pinned (`PUNKTFUNK_FEC_PCT`).
                     if adaptive_fec {
                         let prev = fec_target_ctl.load(Ordering::Relaxed);
-                        let target = fec_target(rep.loss_ppm, prev, unrecovered_run);
+                        let target = fec_target(
+                            rep.loss_ppm,
+                            prev,
+                            unrecovered_run,
+                            punktfunk_core::abr::budget::FrameBudget {
+                                budget_kbps: live_bitrate.load(Ordering::Relaxed),
+                                audio_kbps,
+                                shard_payload: wire_bytes
+                                    .saturating_sub(
+                                        punktfunk_core::abr::budget::SHARD_WIRE_OVERHEAD,
+                                    )
+                                    .try_into()
+                                    .unwrap_or(u16::MAX),
+                                fps: active.refresh_hz,
+                            },
+                            &mut fec_horizon,
+                        );
                         fec_target_ctl.store(target, Ordering::Relaxed);
                         if prev != target {
                             tracing::debug!(

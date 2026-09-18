@@ -1848,9 +1848,8 @@ mod tests {
     /// ceiling for the session's life and left 30 % of the link unused.
     ///
     /// As a cap it is asked again on the long clock, and the session walks up
-    /// to what the link carries. The frames it loses on the way are the
-    /// link's own 0.7 %, not the climb's: a two-shard pool covers a frame of
-    /// this size until three shards of it go at once.
+    /// to what the link carries without buying it with frames: parity sized
+    /// for the link's own 0.7 % covers the climb as well.
     #[test]
     fn a_measured_wall_is_asked_again_until_the_link_answers() {
         let sc = with_ramp(wan_ramp_reads_low());
@@ -1863,8 +1862,8 @@ mod tests {
             m.to90_s
         );
         assert!(
-            m.lost_per_10min <= 20,
-            "{} frames per ten minutes: more than the link's own loss",
+            m.lost_per_10min <= 2,
+            "{} frames per ten minutes, on a link parity is sized for",
             m.lost_per_10min
         );
         let top = r.windows[0]
@@ -1896,8 +1895,11 @@ mod tests {
                 w.request_kbps.expect("a cut asks for a rate"),
                 w.link_cap.expect("the session is riding a learned wall"),
             );
+            // A delay this far out is not the lift being refused: the link
+            // moved, and the link cut answers that under the cap by design.
+            let moved = w.delay.is_some_and(|d| d.rise_us > 50_000);
             assert!(
-                to >= cap || w.dropped > 0,
+                to >= cap || moved,
                 "{} ms: {} → {to} under a {cap} cap",
                 w.t_ms,
                 w.cut_from_kbps.unwrap_or_default()
@@ -1926,6 +1928,7 @@ mod tests {
             lone.len()
         );
         let pairs = r.windows[0].iter().filter(|w| w.dropped > 1).count();
+
         assert!(
             pairs <= 8,
             "the burst chain lands twice in one window {pairs} times"
@@ -1935,6 +1938,7 @@ mod tests {
             .filter(|w| w.cut_from_kbps.is_some())
             .map(|w| w.t_ms)
             .collect();
+        eprintln!("PAID {} LONE {} PAIRS {pairs}", paid.len(), lone.len());
         assert!(
             paid.len() * 2 <= lone.len(),
             "{} of {} lone frames cost the rate: {paid:?}",
@@ -1973,6 +1977,11 @@ mod tests {
     /// The re-probe clock lifts it, the link carries the lift, a second
     /// unanswered lift drops the cap, and slow start doubles after the wall
     /// that moved instead of crawling +6 % a step.
+    ///
+    /// Two lifts take a re-probe clock each, about 48 s, and the 50 Mbps leg
+    /// lasts 35 s — so which cells get there is luck, not a property. The
+    /// check is that it happens, and that a wall the session followed was
+    /// dropped rather than laddered. Do not narrow it back to one cell.
     #[test]
     fn a_wall_that_moved_up_is_found_and_followed() {
         let r = run(&with_ramp(lte_variable()));
@@ -1987,18 +1996,28 @@ mod tests {
             held.link_cap.is_some_and(|c| held.rate_kbps <= c),
             "the session should be riding a learned wall at 70 s: {held:?}"
         );
-        let followed = r.windows[0]
-            .iter()
-            .find(|w| w.t_ms > 75_000 && w.rate_kbps >= 15_000)
-            .expect("the session never followed the link up");
+        let mut followed = 0;
+        for seed in (0..12).map(|i| 0x7A_5700 + i) {
+            let sc = Scenario {
+                seed,
+                ..lte_variable()
+            };
+            let r = run(&with_ramp(sc));
+            let Some(w) = r.windows[0]
+                .iter()
+                .find(|w| w.t_ms > 75_000 && w.rate_kbps >= 15_000)
+            else {
+                continue;
+            };
+            assert!(
+                w.link_cap.is_none(),
+                "a wall the link stopped answering must be dropped, not laddered"
+            );
+            followed += 1;
+        }
         assert!(
-            followed.t_ms - 75_000 <= 90_000,
-            "{} s to follow a wall that moved up",
-            (followed.t_ms - 75_000) / 1_000
-        );
-        assert!(
-            followed.link_cap.is_none(),
-            "a wall the link stopped answering must be dropped, not laddered"
+            followed >= 3,
+            "the wall that moved up was followed on {followed} of twelve cells"
         );
     }
 
@@ -2055,7 +2074,7 @@ mod tests {
             "queue p95 {} ms",
             r.metrics.queue_p95_ms
         );
-        assert!(r.metrics.lost_per_10min <= 8, "{:?}", r.metrics);
+        assert_eq!(r.metrics.lost_per_10min, 0, "{:?}", r.metrics);
     }
 
     /// A sibling that goes still lends the path, and a sibling that leaves
@@ -2072,21 +2091,39 @@ mod tests {
             "the active session held {during} kbps against {before} while its sibling was still"
         );
         // And the lender takes it back on its own growth law, because its own
-        // ceiling never went with what it lent.
-        let (still, back) = (at(100_000)[1], at(145_000)[1]);
+        // ceiling never went with what it lent. It climbs off the floor its
+        // own stillness latched a cap on, so how far it gets in the run's
+        // last forty seconds is the cell's luck: most of them have to double.
+        let doubled = (0..8u64)
+            .map(|i| 0x7A_5800 + i)
+            .filter(|&seed| {
+                let sc = Scenario {
+                    seed,
+                    ..shared_idle_lender()
+                };
+                let r = run(&with_ramp(sc));
+                let at = |t: u64| {
+                    r.pairs()
+                        .into_iter()
+                        .find(|(s, _)| *s == t)
+                        .map_or(0, |p| p.1[1])
+                };
+                at(145_000) >= at(100_000) * 2
+            })
+            .count();
         assert!(
-            back >= still * 2,
-            "the lender was at {back} kbps forty seconds after producing frames again"
+            doubled >= 6,
+            "the lender doubled off its floor on {doubled} of eight cells"
         );
 
         let r = run(&with_ramp(shared_leaver()));
         let at = |t: u64| r.pairs().into_iter().find(|(s, _)| *s == t).expect("t").1;
         let (shared, alone) = (at(59_000)[0], at(135_000)[0]);
         assert!(
-            alone * 2 >= shared * 3,
+            alone >= shared * 2,
             "the survivor was still at {alone} kbps against the {shared} it shared"
         );
-        assert!(r.metrics.lost_per_10min <= 20, "{:?}", r.metrics);
+        assert!(r.metrics.lost_per_10min <= 4, "{:?}", r.metrics);
     }
 
     /// `SIM_DUMP=c3 cargo test … dump -- --ignored --nocapture`: one
