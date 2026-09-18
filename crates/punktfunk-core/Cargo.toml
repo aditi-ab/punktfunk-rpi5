@@ -26,10 +26,7 @@ tls = ["dep:rustls", "dep:sha2"]
 # The SPAKE2 pairing ceremony on its own, so a client that pairs over a transport quinn does
 # not speak (the browser, over WebTransport) can have it without the QUIC runtime.
 pake = ["dep:hmac", "dep:spake2", "dep:sha2"]
-# `dep:serde`/`dep:serde_json` (not the `serde` feature, which is the hud derives): the
-# controller-mouse layout arrives over the C ABI as a JSON document, the shape the rest of
-# the client's preset plumbing already speaks.
-quic = ["tls", "pake", "dep:quinn", "dep:tokio", "dep:rcgen", "dep:opus", "dep:serde", "dep:serde_json"]
+quic = ["tls", "pake", "dep:quinn", "dep:tokio", "dep:rcgen", "dep:opus"]
 # Blocking-HTTP clients that must speak the SAME pinned TLS as the QUIC plane: `tls::ureq_agent`
 # hands ureq a caller-built `rustls::ClientConfig` (which is how `PinVerify` gets installed —
 # ureq's own `TlsConfig` has no hook for a custom verifier). Separate from `tls` because the
@@ -103,7 +100,6 @@ ureq = { version = "3", optional = true, default-features = false, features = [
 ] }
 sha2 = { version = "0.11", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
 hmac = { version = "0.13", optional = true }
 spake2 = { version = "0.4", optional = true }
 # `io-util` for the `AsyncRead`/`AsyncWrite` extension traits the control framing is generic

@@ -243,11 +243,15 @@ pub fn launch_is_nested(compositor: Compositor, route: Option<&GamescopeRoute>) 
     compositor == Compositor::Gamescope && matches!(route, Some(GamescopeRoute::Spawn))
 }
 
-/// Launch `cmd` into a live managed/attach session. Spawn nests instead
-/// ([`launch_is_nested`]).
+/// Launch `cmd` into a live managed/attach session, or into a kept bare spawn. A fresh spawn
+/// nests instead ([`launch_is_nested`]). `steam_home` is that seat's ([`crate::SessionIsolation`]).
 #[cfg(target_os = "linux")]
-pub fn launch_into_gamescope_session(cmd: &str, seat: Option<&str>) -> Result<std::process::Child> {
-    gamescope::launch_into_session(cmd, seat)
+pub fn launch_into_gamescope_session(
+    cmd: &str,
+    seat: Option<&str>,
+    steam_home: Option<&std::path::Path>,
+) -> Result<std::process::Child> {
+    gamescope::launch_into_session(cmd, seat, steam_home)
 }
 
 /// Put compositor focus on streamed head `name` so a window mapping now lands
@@ -449,6 +453,13 @@ pub fn dedicated_game_exited(node_id: u32) -> bool {
 #[cfg(not(target_os = "linux"))]
 pub fn dedicated_game_exited(_node_id: u32) -> bool {
     false
+}
+
+/// Does this launch go through Steam? Steam owns what it starts, so the game lands under
+/// whichever gamescope that Steam runs in, reuse included.
+#[cfg(target_os = "linux")]
+pub fn launch_is_steam(cmd: &str) -> bool {
+    gamescope::is_steam_launch(cmd)
 }
 
 /// Steam appid a dedicated launch targets, for the exit watcher. `None` for a

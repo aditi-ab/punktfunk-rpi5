@@ -24,6 +24,8 @@ pub(super) struct ControlTask {
     /// `note_frame_index`, pump) funnels through this choke point. The pump
     /// drains the count per report window as the ABR recovery signal.
     pub(super) recovery_kf: Arc<AtomicU32>,
+    /// Outbound RFIs, noted at the same choke point for the overlay's per-minute count.
+    pub(super) recent_rfis: Arc<Mutex<RecentRfis>>,
     /// Last host pipeline gap in ms ([`crate::quic::PipelineGap`]); `0` = none.
     /// Pump drains it and discards the in-flight report window — a host-local
     /// rebuild is not congestion. Atomic because the pump only ever swaps it.
@@ -70,6 +72,7 @@ impl ControlTask {
             bitrate_ack,
             live_bitrate,
             recovery_kf,
+            recent_rfis,
             pipeline_gap,
             clock_offset,
             clock_gen,
@@ -111,7 +114,10 @@ impl ControlTask {
                             recovery_kf.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             RequestKeyframe.encode()
                         }
-                        CtrlRequest::Rfi(r) => r.encode(),
+                        CtrlRequest::Rfi(r) => {
+                            recent_rfis.lock().unwrap().note(std::time::Instant::now());
+                            r.encode()
+                        }
                         CtrlRequest::Loss(r) => r.encode(),
                         CtrlRequest::Delivery(r) => r.encode(),
                         CtrlRequest::SetBitrate(k) => SetBitrate { bitrate_kbps: k }.encode(),

@@ -375,6 +375,14 @@ impl Capture {
         }
     }
 
+    /// OS auto-repeat of a held key. Only a key whose press reached the host repeats; a
+    /// chord or toggle swallowed its press, so its repeats stay here too.
+    pub fn on_key_repeat(&mut self, sc: sdl3::keyboard::Scancode) {
+        if keymap_sdl::scancode_to_vk(sc).is_some_and(|vk| self.held_keys.contains(&vk)) {
+            self.on_key_down(sc);
+        }
+    }
+
     pub fn on_key_up(&mut self, sc: sdl3::keyboard::Scancode) {
         if let Some(vk) = keymap_sdl::scancode_to_vk(sc) {
             // Flush-on-release may have already sent this up.

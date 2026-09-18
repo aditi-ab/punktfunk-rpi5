@@ -97,7 +97,7 @@ use self::planes::{
 };
 use self::probe::ProbeState;
 use self::pump::run_pump;
-use self::recovery::{RecoveryAsk, RfiRecovery};
+use self::recovery::{RecentRfis, RecoveryAsk, RfiRecovery};
 use self::worker::WorkerArgs;
 
 /// What this client calls itself in the host's `handshake complete` line: build plus the shell
@@ -355,6 +355,8 @@ pub struct NativeClient {
     abr_windows: Arc<Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>>,
     /// What the bring-up ramp measured ([`NativeClient::abr_ramp`]).
     abr_ramp: Arc<Mutex<Option<crate::abr::RampRecord>>>,
+    /// RFIs the control task sent, aged at each overlay read.
+    recent_rfis: Arc<Mutex<RecentRfis>>,
     /// ABR armed (Automatic, not rate-pinned PyroWave). Skip per-frame decode measurement when
     /// false ([`wants_decode_latency`](Self::wants_decode_latency)).
     wants_decode: bool,
@@ -732,6 +734,7 @@ impl NativeClient {
         // Pump seeds from Welcome before ready_tx, then follows every ack.
         let live_bitrate = Arc::new(AtomicU32::new(0));
         let rate_cut = Arc::new(AtomicU8::new(0));
+        let recent_rfis = Arc::new(Mutex::new(RecentRfis::default()));
         // Same seeding: Welcome before ready_tx, then every AccessUpdate. GRANT_ALL /
         // permanent here is the pre-handshake placeholder.
         let access_grants = Arc::new(AtomicU32::new(crate::quic::GRANT_ALL));
@@ -759,6 +762,7 @@ impl NativeClient {
         let abr_ramp_w = abr_ramp.clone();
         let live_bitrate_w = live_bitrate.clone();
         let rate_cut_w = rate_cut.clone();
+        let recent_rfis_w = recent_rfis.clone();
         let pad_audio_caps_w = pad_audio_caps.clone();
         let pad_mouse_w = pad_mouse.clone();
         let audio_mute_w = audio_mute.clone();
@@ -847,6 +851,7 @@ impl NativeClient {
                     abr_ramp: abr_ramp_w,
                     live_bitrate: live_bitrate_w,
                     rate_cut: rate_cut_w,
+                    recent_rfis: recent_rfis_w,
                     audio_mute: audio_mute_w,
                     pad_slots: pad_slots_w,
                     launch_outcome: launch_outcome_w,
@@ -937,6 +942,7 @@ impl NativeClient {
             abr_ramp,
             live_bitrate_kbps: live_bitrate,
             rate_cut,
+            recent_rfis,
             // Match the pump: Automatic, not rate-pinned PyroWave, AND host echoed a rate.
             // Dropping the last term over-advertises against an old host that reports no rate.
             wants_decode: bitrate_kbps == 0
@@ -1221,6 +1227,7 @@ impl NativeClient {
             rtt_us: self.rtt_us(),
             target_kbps: self.current_bitrate_kbps(),
             rate_cut: self.rate_cut.load(Ordering::Relaxed),
+            rfis_last_min: self.recent_rfis.lock().unwrap().count(Instant::now()),
             pad_slots: self.pad_slots(),
         }
     }
@@ -1712,18 +1719,6 @@ impl NativeClient {
             ));
         }
         self.pad_mouse.request(mask);
-        Ok(())
-    }
-
-    /// Replace the controller-mouse layout — plain buttons, chords, and the pointer, scroll,
-    /// deadzone and long-press tunables — from a JSON document. `None` restores the shipped
-    /// table. A pad already in controller mouse keeps the layout it entered with.
-    pub fn set_pad_mouse_layout(&self, doc: Option<&str>) -> Result<()> {
-        let layout = match doc {
-            Some(json) => pad_mouse::Layout::parse(json)?,
-            None => pad_mouse::Layout::default(),
-        };
-        self.pad_mouse.set_layout(layout);
         Ok(())
     }
 

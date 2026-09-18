@@ -4052,7 +4052,7 @@
           "session"
         ],
         "summary": "Watch this session's pads (SSE)",
-        "description": "One frame per pad state the host applies — what it injects, not what the client\nsays it sent — so a controller question is answered from the host's own hand\ninstead of an evdev dump. `data:` is a [`PadFrame`]; `event:` is `pad.state`.\nAttaching replays every live pad, so a button already held draws at once.\n\nConsole lane only, like the window routes: a paired certificate is not bound to\na session id, and this is the operator's own machine watching its own input.\n\nNothing is published while nobody is attached, so a console on another page —\nor none at all — costs the input thread one atomic load per pad event.",
+        "description": "One frame per pad state the host applies — what it injects, not what the client\nsays it sent — so a controller question is answered from the host's own hand\ninstead of an evdev dump. `data:` is a [`PadFrame`]; `event:` is `pad.state`.\nAttaching replays every live pad, so a button already held draws at once.\n\nConsole lane only: a paired certificate is not bound to a session id, and this\nis the operator's own machine watching its own input.\n\nNothing is published while nobody is attached, so a console on another page —\nor none at all — costs the input thread one atomic load per pad event.",
         "operationId": "streamSessionPads",
         "parameters": [
           {
@@ -4175,151 +4175,6 @@
           },
           "404": {
             "description": "No live session with that id",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/session/{id}/windows": {
-      "get": {
-        "tags": [
-          "session"
-        ],
-        "summary": "List this session's windows",
-        "description": "The toplevels on the head this session streams, so a client in a full-screen\ngame can see what is behind it. Free to every session: those windows are\nalready in the pixels it receives. The operator's other monitors are not in\nthe payload, whatever the caller's access.",
-        "operationId": "getSessionWindows",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Session id from `GET /status`",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64",
-              "minimum": 0
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Windows on this session's head",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/Toplevel"
-                  }
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid bearer token",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No live session with that id",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/session/{id}/windows/{window}": {
-      "post": {
-        "tags": [
-          "session"
-        ],
-        "summary": "Act on one of this session's windows",
-        "description": "Focus, full-screen or close by id, gated on the session's LIVE grants — the\nsame mask the input thread checks every event against. A view-only guest is\nrefused all three; a controller-only guest raises a window but never closes\none. An id this session's head does not currently hold is a 404, so a stale\nid cannot act on whatever now answers to it.",
-        "operationId": "actOnSessionWindow",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Session id from `GET /status`",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64",
-              "minimum": 0
-            }
-          },
-          {
-            "name": "window",
-            "in": "path",
-            "description": "Window id from `GET /session/{id}/windows`",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/WindowActionRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "The compositor accepted the verb"
-          },
-          "401": {
-            "description": "Missing or invalid bearer token",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "This session's access does not cover the verb",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No such session, or no such window on its head",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          },
-          "502": {
-            "description": "The compositor refused the verb",
             "content": {
               "application/json": {
                 "schema": {
@@ -11667,52 +11522,6 @@
           }
         }
       },
-      "Toplevel": {
-        "type": "object",
-        "description": "One compositor toplevel, as every backend reports it.\n\n`id` is the backend's own handle (a Hyprland address, a sway con id) and is\nopaque above this module: it goes back to the backend that minted it and\nnowhere else. Defined on every platform — the management route and its\nschema exist on a Windows host too, which simply lists nothing.",
-        "required": [
-          "id",
-          "title",
-          "app_id",
-          "focused",
-          "fullscreen",
-          "workspace",
-          "output"
-        ],
-        "properties": {
-          "app_id": {
-            "type": "string",
-            "description": "Wayland `app_id`, or the X11 class on an Xwayland window."
-          },
-          "focused": {
-            "type": "boolean"
-          },
-          "fullscreen": {
-            "type": "boolean"
-          },
-          "id": {
-            "type": "string",
-            "description": "Backend handle. Never parsed above the backend, never reused across one."
-          },
-          "output": {
-            "type": "string",
-            "description": "The head this window is on — always the streamed one, by construction."
-          },
-          "pid": {
-            "type": "integer",
-            "format": "int32",
-            "description": "`None` where the compositor does not report one (some Xwayland cons).",
-            "minimum": 0
-          },
-          "title": {
-            "type": "string"
-          },
-          "workspace": {
-            "type": "string",
-            "description": "Workspace name as the compositor spells it, not its id."
-          }
-        }
-      },
       "Topology": {
         "type": "string",
         "description": "Host topology while managed virtual displays are up.",
@@ -12094,27 +11903,6 @@
             "minimum": 0
           }
         }
-      },
-      "WindowActionRequest": {
-        "type": "object",
-        "required": [
-          "action"
-        ],
-        "properties": {
-          "action": {
-            "$ref": "#/components/schemas/WindowVerb",
-            "description": "`focus` | `fullscreen` | `close`."
-          }
-        }
-      },
-      "WindowVerb": {
-        "type": "string",
-        "description": "What a client may ask of one window.\n\nDefined on every platform: the management route decodes it before any\nbackend is consulted.",
-        "enum": [
-          "focus",
-          "fullscreen",
-          "close"
-        ]
       },
       "WorkspacePlacement": {
         "type": "string",

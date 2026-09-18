@@ -133,6 +133,23 @@ pub fn with_descendants(roots: &[u32]) -> Vec<u32> {
     }
 }
 
+/// `procs` narrowed to `root` and its descendants.
+///
+/// A nested lease's whole tree descends from its own gamescope. Two seats can run the same
+/// title, and Steam's `SteamLaunch AppId=` reaper looks identical in both, so without this a
+/// seat adopts — and its term ladder kills — the other seat's game.
+pub fn under(procs: &[ProcRef], root: u32) -> Vec<ProcRef> {
+    under_tree(procs, &with_descendants(&[root]))
+}
+
+fn under_tree(procs: &[ProcRef], tree: &[u32]) -> Vec<ProcRef> {
+    procs
+        .iter()
+        .copied()
+        .filter(|p| tree.contains(&p.pid))
+        .collect()
+}
+
 /// `roots` first, then each descendant once, from `(pid, parent)` rows.
 fn descend(roots: &[u32], parents: &[(u32, u32)]) -> Vec<u32> {
     let mut out: Vec<u32> = Vec::new();
@@ -157,7 +174,22 @@ fn descend(roots: &[u32], parents: &[(u32, u32)]) -> Vec<u32> {
 
 #[cfg(test)]
 mod descend_tests {
-    use super::descend;
+    use super::{descend, under_tree, ProcRef};
+
+    /// Two seats, one appid: the scan hits both reapers, and a seat may keep only its own.
+    #[test]
+    fn a_scoped_scan_drops_the_other_seats_copy_of_the_same_title() {
+        let rows = [(11, 10), (12, 11), (21, 20), (22, 21)];
+        let p = |pid| ProcRef { pid, start: 1 };
+        let hits = [p(12), p(22)];
+        let mine = descend(&[10], &rows);
+        assert_eq!(under_tree(&hits, &mine), [p(12)]);
+        assert_eq!(under_tree(&hits, &descend(&[20], &rows)), [p(22)]);
+        assert!(
+            under_tree(&hits, &descend(&[99], &rows)).is_empty(),
+            "a gone gamescope owns nothing"
+        );
+    }
 
     #[test]
     fn a_shells_game_and_its_helpers_are_found_and_strangers_are_not() {

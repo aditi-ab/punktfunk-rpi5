@@ -765,6 +765,7 @@ mod tests {
                 bitrate_ack: Arc::new(Mutex::new(AckQueue::new())),
                 live_bitrate: Arc::new(AtomicU32::new(0)),
                 recovery_kf: Arc::new(AtomicU32::new(0)),
+                recent_rfis: Default::default(),
                 pipeline_gap: pipeline_gap.clone(),
                 clock_offset: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 clock_gen: Arc::new(AtomicU32::new(0)),

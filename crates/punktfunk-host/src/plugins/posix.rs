@@ -9,6 +9,9 @@ const UNIT: &str = "punktfunk-scripting";
 /// Wrapper name every non-Windows package installs (`/usr/bin`, `~/.local/bin`, `$out/bin`).
 const RUNNER_BIN: &str = "punktfunk-scripting";
 
+/// The bun the deb and pacman packages share between the console and the runner (`punktfunk-bun`).
+const PACKAGED_BUN: &str = "/usr/lib/punktfunk-bun/bun";
+
 /// No elevation bar off Windows: the runner is the operator's own user unit.
 pub(super) fn require_elevation(_what: &str) -> Result<()> {
     Ok(())
@@ -80,7 +83,7 @@ fn resolve_runner_in(
         return Some((wrapper, Vec::new()));
     }
     if let Some(cmd) = pair(
-        Path::new("/usr/lib").join(RUNNER_BIN).join("bun"),
+        PathBuf::from(PACKAGED_BUN),
         Path::new("/usr/share")
             .join(RUNNER_BIN)
             .join("runner-cli.js"),
@@ -304,7 +307,7 @@ mod tests {
             Some((PathBuf::from("/usr/bin").join(RUNNER_BIN), Vec::new()))
         );
         // Private two-file layout when the wrapper is absent.
-        let bun = PathBuf::from("/usr/lib").join(RUNNER_BIN).join("bun");
+        let bun = PathBuf::from(PACKAGED_BUN);
         let cli = PathBuf::from("/usr/share")
             .join(RUNNER_BIN)
             .join("runner-cli.js");
@@ -314,7 +317,7 @@ mod tests {
             Some((bun, vec![cli.to_string_lossy().into_owned()]))
         );
         // Half of that layout is not a rung — do not spawn bun with no script.
-        let exists = present(vec![PathBuf::from("/usr/lib").join(RUNNER_BIN).join("bun")]);
+        let exists = present(vec![PathBuf::from(PACKAGED_BUN)]);
         assert_eq!(resolve_runner_in(None, None, None, None, &exists), None);
 
         // SteamOS payload is user-scoped; reached only via HOME.

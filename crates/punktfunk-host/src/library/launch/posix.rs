@@ -194,13 +194,15 @@ pub fn adopt_launch_workspace(
 ///   steam://…` also forwards over Steam's pipe.
 /// * **gamescope (bare spawn)** — only after a keep-alive reuse, which spawned
 ///   nothing. A fresh spawn nests via `set_launch_command`
-///   ([`crate::vdisplay::launch_is_nested`]).
+///   ([`crate::vdisplay::launch_is_nested`]). `steam_home` is the seat's, so
+///   the forwarder reaches the Steam that reuse kept, not the box's.
 #[cfg(target_os = "linux")]
 pub fn launch_session_command(
     compositor: crate::vdisplay::Compositor,
     cmd: &str,
     seat: Option<&str>,
     own_workspace: bool,
+    steam_home: Option<&std::path::Path>,
 ) -> Result<SpawnedLaunch> {
     use std::os::unix::process::CommandExt;
     let cmd = cmd.trim();
@@ -210,7 +212,7 @@ pub fn launch_session_command(
     let workspace = focus_and_claim(compositor, own_workspace, None);
     let (child, group_leader) = match compositor {
         crate::vdisplay::Compositor::Gamescope => (
-            crate::vdisplay::launch_into_gamescope_session(cmd, seat)?,
+            crate::vdisplay::launch_into_gamescope_session(cmd, seat, steam_home)?,
             false,
         ),
         _ => {

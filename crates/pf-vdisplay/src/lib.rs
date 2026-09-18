@@ -63,16 +63,15 @@ pub use session::{
 #[cfg(target_os = "linux")]
 pub use session::{session_epoch, session_x11_env};
 
-/// The streamed head's window list and the verbs that act on one.
-/// Types on every platform; the backend arms are Linux.
+/// The compositor's windows and the verbs the launch path runs on the game's.
+#[cfg(target_os = "linux")]
 #[path = "vdisplay/toplevels.rs"]
 pub(crate) mod toplevels;
 #[cfg(target_os = "linux")]
 pub use toplevels::{
     list_all_toplevels, list_toplevels, move_toplevel_to_output, places_windows, toplevels_token,
-    window_action,
+    window_action, Toplevel, WindowVerb,
 };
-pub use toplevels::{Toplevel, WindowVerb};
 
 #[path = "vdisplay/routing.rs"]
 pub(crate) mod routing;
@@ -87,7 +86,7 @@ pub use routing::{
 pub use routing::{
     claim_workspace, dedicated_game_exited, focus_streamed_output, gamescope_presenting,
     gamescope_xwayland_cursor_targets, launch_into_gamescope_session, launch_is_nested,
-    steam_appid_from_launch, watch_steam_game_exit, WorkspaceClaim,
+    launch_is_steam, steam_appid_from_launch, watch_steam_game_exit, WorkspaceClaim,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -602,6 +601,30 @@ pub fn gamescope_splash_client() -> anyhow::Result<()> {
     gamescope::splash_run()
 }
 
+/// Where this session's virtual pads must be exposed for its seat's Steam to see them, or
+/// `None` when that Steam sees every pad on the box as it always has.
+///
+/// The spawn wraps the seat's nested command in a `bwrap` whose `/dev/input` is this directory,
+/// so `pf-inject` writing one symlink here is the whole of "the seat has a controller". Same
+/// decision both sides ask (`vdisplay/linux/gamescope/sandbox.rs`); `pf-inject` never learns
+/// what a seat is.
+#[cfg(target_os = "linux")]
+pub fn seat_device_dir(iso: &SessionIsolation) -> Option<std::path::PathBuf> {
+    gamescope::sandbox::plan(Some(iso), iso.steam_home.is_some()).dev()
+}
+
+/// Does this session's seat still owe Steam a sign-in?
+///
+/// A seat home carries no account, so the first Steam launch on it shows the sign-in screen
+/// rather than the game. `false` for every session without a seat home of its own — the box's
+/// Steam is signed in already (`vdisplay/linux/gamescope/seat.rs`).
+#[cfg(target_os = "linux")]
+pub fn seat_needs_sign_in(iso: &SessionIsolation) -> bool {
+    iso.steam_home
+        .as_deref()
+        .is_some_and(gamescope::seat::needs_sign_in)
+}
+
 /// Can a gamescope session on this host stream 10-bit BT.2020 PQ?
 ///
 /// Settled **before spawn** — punktfunk/1 Welcome fixes bit depth and cannot
@@ -610,8 +633,11 @@ pub fn gamescope_splash_client() -> anyhow::Result<()> {
 /// gamescope rather than attaching (`PUNKTFUNK_GAMESCOPE_NODE` inherits
 /// someone else's flags). A host-managed `gamescope-session-plus` / SteamOS
 /// session counts as a spawn: we own `GAMESCOPE_BIN`.
-pub fn gamescope_hdr_available() -> bool {
+///
+/// `route` is the session's own; `None` re-runs the ladder without a launch.
+pub fn gamescope_hdr_available(route: Option<&GamescopeRoute>) -> bool {
     gamescope_ours_and(
+        route,
         #[cfg(target_os = "linux")]
         gamescope::gamescope_hdr_capable,
     )
@@ -623,10 +649,21 @@ pub fn gamescope_hdr_available() -> bool {
 /// zero-copy RGB-direct front end has no blend stage. Settled before
 /// `SessionPlan::cursor_blend` opens the encoder. Same two terms as
 /// [`gamescope_hdr_available`]: patched binary, and this host spawns it.
-pub fn gamescope_composites_cursor() -> bool {
+pub fn gamescope_composites_cursor(route: Option<&GamescopeRoute>) -> bool {
     gamescope_ours_and(
+        route,
         #[cfg(target_os = "linux")]
         gamescope::gamescope_can_composite_cursor,
+    )
+}
+
+/// May the capture offer tiled dmabuf modifiers to this gamescope? Same two terms as
+/// [`gamescope_hdr_available`]; `false` keeps the LINEAR-only offer every gamescope links.
+pub fn gamescope_tiled_capture(route: Option<&GamescopeRoute>) -> bool {
+    gamescope_ours_and(
+        route,
+        #[cfg(target_os = "linux")]
+        gamescope::gamescope_offers_tiled_capture,
     )
 }
 
@@ -637,26 +674,45 @@ pub fn gamescope_composites_cursor() -> bool {
 /// an operator override, not the published decision. [`GamescopeRoute::Attach`]
 /// and the monitor-pin mirror would otherwise answer "ours".
 ///
-/// The ladder is re-run with `dedicated_launch = false` (no session context),
-/// and `create_managed_session` can still degrade `Managed` to Attach after
-/// this answer is due. Do not guess `dedicated_launch = true`: over-promising
-/// 10-bit PQ / a composited cursor is unrecoverable. Under-promise plus
-/// `gamescope::cursor_args` (binary probe, ungated) can double-draw the
-/// pointer; that is the cheaper failure. Close both gaps by taking the
-/// session's own [`GamescopeRoute`].
-fn gamescope_ours_and(#[cfg(target_os = "linux")] probe: fn() -> bool) -> bool {
+/// Pass the session's own `route`. A caller without one gets the ladder re-run
+/// with `dedicated_launch = false`, which calls a dedicated spawn an attach as
+/// soon as any other gamescope runs on the box. `create_managed_session` can
+/// still degrade `Managed` to Attach after this answer is due; under-promising
+/// there plus `gamescope::cursor_args` (binary probe, ungated) can double-draw
+/// the pointer, which is the cheaper failure.
+fn gamescope_ours_and(
+    route: Option<&GamescopeRoute>,
+    #[cfg(target_os = "linux")] probe: fn() -> bool,
+) -> bool {
     #[cfg(target_os = "linux")]
     {
         // `probe` first: memoized `--version`. Route resolution walks `/proc`;
         // a stock gamescope is already `false` and skips the walk.
-        probe()
-            && !session_is_a_foreign_gamescope(
-                capture_monitor().is_some(),
-                resolve_gamescope_route(Compositor::Gamescope, false).as_ref(),
-            )
+        if !probe() {
+            return false;
+        }
+        let blind;
+        let route = match route {
+            Some(r) => Some(r),
+            None => {
+                blind = resolve_gamescope_route(Compositor::Gamescope, false);
+                blind.as_ref()
+            }
+        };
+        let foreign = session_is_a_foreign_gamescope(capture_monitor().is_some(), route);
+        if foreign {
+            tracing::info!(
+                ?route,
+                "gamescope capability withheld: this session uses a gamescope this host did not start"
+            );
+        }
+        !foreign
     }
     #[cfg(not(target_os = "linux"))]
-    false
+    {
+        let _ = route;
+        false
+    }
 }
 
 /// Is the gamescope this session will use one somebody else started?
@@ -768,6 +824,24 @@ mod tests {
 
     /// `mgmt/display.rs` puts this error verbatim on `/display/monitors`;
     /// the wording is a user-facing surface.
+    /// The seat is the only session the sign-in question is ever asked of: without a home of
+    /// its own a launch shares the box's Steam, which has an account.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_session_with_a_seat_home_can_owe_a_sign_in() {
+        let iso = |steam_home| SessionIsolation {
+            id: "fp".into(),
+            ei_relay: std::path::PathBuf::from("/run/pf-ei"),
+            sink: None,
+            mic_source: None,
+            steam_home,
+        };
+        assert!(!seat_needs_sign_in(&iso(None)));
+        // A home with no Steam under it is the box's, whatever the session carries.
+        let bare = std::env::temp_dir().join("pf-seat-no-steam");
+        assert!(!seat_needs_sign_in(&iso(Some(bare))));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn xdg_sniff_maps_known_desktops() {

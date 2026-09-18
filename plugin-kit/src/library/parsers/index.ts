@@ -41,6 +41,7 @@ export {
 	regQueryValue,
 	regQueryValues,
 	regSubKeys,
+	spawnAgainIfKilled,
 	validRegKey,
 } from "./registry.js";
 export {

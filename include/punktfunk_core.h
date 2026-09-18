@@ -25,7 +25,7 @@
 // Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 // Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
 // in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 35
+#define PUNKTFUNK_ABI_VERSION 36
 
 // punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 //
@@ -2601,20 +2601,6 @@ PunktfunkStatus punktfunk_connection_set_pad_audio_caps(PunktfunkConnection *c,
 // # Safety
 // `c` is a valid connection handle. Callable from any thread.
 PunktfunkStatus punktfunk_connection_set_pad_mouse(PunktfunkConnection *c, uint16_t mask);
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Replace the controller-mouse layout from a JSON document: `settings` (the `pointer` and
-// `scroll` multipliers, `deadzone`, `long_press_ms`), a `buttons` table of pad button to
-// `mouse:left` / `key:Escape`, and a `chords` array of `buttons` + `press`
-// (`any` / `short` / `long` / `hold`) + `keys`. NULL restores the shipped table. A pad already
-// in controller mouse keeps the layout it entered with. `InvalidArg` on a document that does
-// not parse, and the live layout is left alone.
-//
-// # Safety
-// `c` is a valid connection handle; `json` is a NUL-terminated UTF-8 string or NULL.
-// Callable from any thread.
-PunktfunkStatus punktfunk_connection_set_pad_mouse_layout(PunktfunkConnection *c, const char *json);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

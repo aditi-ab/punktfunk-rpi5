@@ -205,6 +205,12 @@ impl<B: PadProto> UhidManager<B> {
         }
     }
 
+    /// Show this session's pads to one seat alone
+    /// ([`PadSlots::expose_in`](crate::pad_slots::PadSlots::expose_in)).
+    pub fn expose_in(&mut self, dir: Option<std::path::PathBuf>) {
+        self.slots.expose_in(dir);
+    }
+
     /// Bring-up harnesses only ([`PadSlots::live`](crate::pad_slots::PadSlots::live)): a create
     /// failure leaves the slot empty and only logs, so a harness that still pushes frames
     /// drives nothing while another process may own that index. A session has no use for this

@@ -302,6 +302,8 @@ pub struct Counters {
     pub target_kbps: u32,
     /// [`RateCut`] code; `0` = the rate has not been cut since it last climbed.
     pub rate_cut: u8,
+    /// RFIs this client sent in the last 60 s. A gauge, not windowed.
+    pub rfis_last_min: u32,
     /// OS pad slots this session holds, one bit each ([`crate::quic::PadSlots`]).
     pub pad_slots: u16,
 }
@@ -339,6 +341,8 @@ pub struct StatsSnapshot {
     pub auto_rate: bool,
     /// Why the controller last lowered `target_kbps`, until it climbs again.
     pub rate_cut: Option<RateCut>,
+    /// Loss repairs (RFIs) this client asked for in the last 60 s.
+    pub rfis_last_min: u32,
     /// Capture → displayed, and capture → decoded (the headline when nothing reached glass).
     pub e2e: Summary,
     pub e2e_decoded: Summary,
@@ -823,6 +827,7 @@ impl Stats {
             presented: w.counts_presented.then_some(w.presented),
             target_kbps: c.target_kbps,
             rate_cut: RateCut::from_code(c.rate_cut),
+            rfis_last_min: c.rfis_last_min,
             e2e: Summary::of(&mut w.e2e),
             e2e_decoded: Summary::of(&mut w.e2e_decoded),
             host_net: Summary::of(&mut w.host_net),
@@ -934,11 +939,16 @@ fn mode(s: &StatsSnapshot) -> String {
     format!("{}×{}@{}", s.width, s.height, s.refresh_hz)
 }
 
-/// Why Automatic is running below where it was, while that still holds. Advanced only.
+/// Why Automatic is running below where it was, while that still holds, and how often
+/// loss needed a repair in the last minute: a climbing count is a link not recovering.
 fn rate_cut(s: &StatsSnapshot) -> Option<String> {
-    s.rate_cut
-        .filter(|_| s.auto_rate)
-        .map(|c| format!("bitrate lowered: {}", c.label()))
+    s.rate_cut.filter(|_| s.auto_rate).map(|c| {
+        format!(
+            "bitrate lowered: {} · {} loss repairs/min",
+            c.label(),
+            s.rfis_last_min
+        )
+    })
 }
 
 fn target(s: &StatsSnapshot) -> Option<String> {
@@ -1603,15 +1613,22 @@ mod tests {
         let lines = format(&s, StatsVerbosity::Normal, true);
         let cut = lines
             .iter()
-            .find(|l| l.text.contains("bitrate lowered: network delay"))
+            .find(|l| {
+                l.text
+                    .contains("bitrate lowered: network delay · 0 loss repairs/min")
+            })
             .expect("the cut is named at Normal");
         assert_eq!(cut.role, Role::Warn);
+        s.rfis_last_min = 7;
+        assert!(all(&s, StatsVerbosity::Normal, true).contains("delay · 7 loss repairs/min"));
         assert!(!all(&s, StatsVerbosity::Detailed, false).contains("lowered"));
+        assert!(!all(&s, StatsVerbosity::Detailed, false).contains("repairs"));
         s.auto_rate = false;
         assert!(!all(&s, StatsVerbosity::Detailed, true).contains("lowered"));
         s.auto_rate = true;
         s.rate_cut = None;
         assert!(!all(&s, StatsVerbosity::Detailed, true).contains("lowered"));
+        assert!(!all(&s, StatsVerbosity::Detailed, true).contains("repairs"));
         assert_eq!(
             RateCut::from_code(RateCut::Encoder as u8),
             Some(RateCut::Encoder)

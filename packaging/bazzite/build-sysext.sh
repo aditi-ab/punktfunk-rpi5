@@ -5,7 +5,7 @@
 # /var/lib/extensions/, survives OS updates, and is toggled/updated without a reboot.
 #
 # Counterpart to ../arch/build-sysext.sh (which wraps a pacman package for SteamOS). This one
-# wraps the Fedora RPMs (punktfunk + punktfunk-web) and additionally:
+# wraps the Fedora RPMs (punktfunk, -web, -scripting, -bun) and additionally:
 #   * relocates the RPMs' /etc payload to /usr/share/punktfunk/etc/ (a sysext carries ONLY /usr;
 #     punktfunk-sysext(8) copies these into the real /etc on install),
 #   * bakes SELinux labels in as squashfs pseudo-xattrs, computed with matchpathcon from the
@@ -25,7 +25,8 @@
 # Usage:
 #   bash build-sysext.sh --version-id 43 --out dist/punktfunk-0.7.1-1-x86-64.raw \
 #        [--gamescope-stage path/to/gamescope-destdir] \
-#        dist/punktfunk-0.7.1-1.fc43.x86_64.rpm dist/punktfunk-web-0.7.1-1.fc43.noarch.rpm
+#        dist/punktfunk-0.7.1-1.fc43.x86_64.rpm dist/punktfunk-web-0.7.1-1.fc43.x86_64.rpm \
+#        dist/punktfunk-bun-0.7.1-1.fc43.x86_64.rpm
 #
 # --gamescope-stage folds in a prebuilt HDR-capable gamescope (packaging/gamescope) as
 # /usr/bin/punktfunk-gamescope, which is what lets the gamescope backend stream 10-bit BT.2020 PQ.
@@ -82,6 +83,11 @@ for rpm in "${RPMS[@]}"; do
   rpm2cpio "$rpm" | ( cd "$STAGE" && cpio -idmu --quiet )
 done
 [ -n "$PF_VR" ] || { echo "the punktfunk (host) RPM must be among the inputs" >&2; exit 1; }
+# An image resolves no dependencies, and both launchers exec punktfunk-bun's bun.
+if [ -e "$STAGE/usr/bin/punktfunk-web-server" ] || [ -e "$STAGE/usr/bin/punktfunk-scripting" ]; then
+  [ -x "$STAGE/usr/libexec/punktfunk-bun/bun" ] || {
+    echo "the punktfunk-bun RPM must be among the inputs — web and scripting run on it" >&2; exit 1; }
+fi
 
 # A sysext carries only /usr. Relocate the RPMs' /etc payload (gamescope-session drop-in, tray
 # autostart entry) under /usr/share/punktfunk/etc/ — punktfunk-sysext copies it into /etc.

@@ -107,6 +107,8 @@ pub(crate) struct WorkerArgs {
     pub(crate) abr_windows: Arc<Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>>,
     /// What the bring-up ramp measured, once it stopped.
     pub(crate) abr_ramp: Arc<Mutex<Option<crate::abr::RampRecord>>>,
+    /// RFIs sent in the last minute, for the overlay. The control task notes each one.
+    pub(crate) recent_rfis: Arc<Mutex<RecentRfis>>,
     /// Mute mask the control task ORs [`crate::client::AUDIO_MUTE_HOST`] into on every
     /// `AudioState`. The embedder's own bit rides the same cell.
     pub(crate) audio_mute: Arc<AtomicU8>,
