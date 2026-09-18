@@ -1496,6 +1496,49 @@ mod tests {
         assert_eq!(cut(20_000), Some(14_000));
     }
 
+    /// What a clean window delivers at this rate is the norm a short one is
+    /// read against.
+    ///
+    /// A source filling 78 % of its allowance makes every clean window read
+    /// 78 % of the rate; sizing a cut from that delivery charges the content's
+    /// fill to the link. Against the norm the fill cancels, and a wire above
+    /// its own target — the parity floor at the bottom of the range — has
+    /// measured no fall at all.
+    #[test]
+    fn a_content_bound_window_is_cut_against_the_wires_own_norm() {
+        let start = Instant::now();
+        let cut = |windows: u32, delivered: u32| -> Option<u32> {
+            let mut c = BitrateController::new(20_000, None);
+            for i in 0..windows {
+                assert_eq!(
+                    c.on_window(&WindowSample {
+                        owd_mean_us: Some(10_000),
+                        actual_kbps: 15_600,
+                        ..WindowSample::at(ticks(start, i))
+                    }),
+                    None,
+                    "78 % of the rate is what this content delivers"
+                );
+            }
+            c.on_window(&WindowSample {
+                dropped: 4,
+                actual_kbps: delivered,
+                ..WindowSample::at(ticks(start, windows))
+            })
+        };
+        // 13 400 of a 15 600 norm: the wire fell to 86 % of itself, and the
+        // cut is that fall in target units — not 0.85 × 13 400.
+        assert_eq!(cut(DELIVERY_REF_WINDOWS, 13_400), Some(14_602));
+        // Too few clean windows to know this rate's norm: the blind step.
+        assert_eq!(cut(DELIVERY_REF_WINDOWS - 1, 13_400), Some(11_390));
+        // The same window on a wire carrying more than its target.
+        assert_eq!(
+            cut(DELIVERY_REF_WINDOWS, 21_000),
+            Some(14_000),
+            "a blind step, not a link cut"
+        );
+    }
+
     /// A decoder past its budget is not the link: the rate may be the lever,
     /// but what the link delivered is not the number to land on.
     #[test]
