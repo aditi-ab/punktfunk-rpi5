@@ -1144,10 +1144,24 @@ impl BitrateController {
         );
     }
 
+    /// The rate a cut is measured from: the ask still in flight, when there is
+    /// one.
+    ///
+    /// A `BitrateChanged` waits behind the same queue the video does — 3.3 s on
+    /// the rig's cell — and every window until it lands still reads the rate
+    /// the session has already asked to leave. Cutting from that rate three
+    /// times took a session to 2 464 kbps where one cut would have left it at
+    /// about 2 480.
+    fn cut_base_kbps(&self) -> u32 {
+        self.last_requested_kbps
+            .map_or(self.current_kbps, |asked| asked.min(self.current_kbps))
+    }
+
     /// Where a link-attributed cut lands: what the window delivered, less the
     /// margin that drains the queue, and never further than one ×0.7-sized
     /// step from the rate the session is running at.
     fn link_cut_kbps(&self, delivered_kbps: u32) -> u32 {
+        let base = self.cut_base_kbps();
         let share = |kbps: u32, pct: u32| (u64::from(kbps) * u64::from(pct) / 100) as u32;
         // The drop the wire showed against its own norm, put back into target
         // units. A content-bound source delivers 78 % of every clean window
@@ -1156,16 +1170,12 @@ impl BitrateController {
         // link's share of the fall.
         let target = match self.delivery_reference() {
             Some(reference) if reference > 0 => {
-                (u64::from(delivered_kbps) * u64::from(self.current_kbps) / u64::from(reference))
-                    as u32
+                (u64::from(delivered_kbps) * u64::from(base) / u64::from(reference)) as u32
             }
             _ => delivered_kbps,
         };
         share(target, LINK_CUT_PCT)
-            .clamp(
-                share(self.current_kbps, LINK_CUT_FLOOR_PCT),
-                share(self.current_kbps, LINK_CUT_PCT),
-            )
+            .clamp(share(base, LINK_CUT_FLOOR_PCT), share(base, LINK_CUT_PCT))
             .max(self.floor_kbps)
     }
 
@@ -1431,7 +1441,7 @@ impl BitrateController {
             );
             next
         } else {
-            ((self.current_kbps as u64 * 7 / 10) as u32).max(self.floor_kbps)
+            ((self.cut_base_kbps() as u64 * 7 / 10) as u32).max(self.floor_kbps)
         };
         self.warn_low_rate(next);
         self.bad_windows = 0;
@@ -2074,6 +2084,33 @@ mod tests {
         assert!(
             c.note_drain(&WindowSample::at(now)),
             "no delay reading is no evidence of draining"
+        );
+    }
+
+    /// Three windows cannot cut from one number.
+    ///
+    /// Until the host's ack lands, `current_kbps` is a rate the session has
+    /// already asked to leave: on the rig's cell three windows cut from the
+    /// same 4 043 in 4.5 s. Each cut measures from the ask in flight.
+    #[test]
+    fn a_cut_while_a_request_is_unacked_measures_from_the_ask() {
+        let mut c = BitrateController::new(20_000, None);
+        let start = Instant::now();
+        let bad = |c: &mut BitrateController, t: u32| {
+            c.on_window(&WindowSample {
+                loss_ppm: 25_000,
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, t))
+            })
+        };
+        assert_eq!(bad(&mut c, 0), None);
+        assert_eq!(bad(&mut c, 1), Some(14_000));
+        // Nothing acked: the rate the host is running is still 20 000.
+        assert_eq!(bad(&mut c, 6), None);
+        assert_eq!(
+            bad(&mut c, 7),
+            Some(9_800),
+            "x0.7 of the ask, not of 20 000"
         );
     }
 
