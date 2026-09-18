@@ -1,4 +1,4 @@
-//! Client-side loss-range detector (`RfiRecovery::observe`).
+//! Client-side loss-range detector (`RfiRecovery::observe`) and the recent-RFI count.
 
 use std::time::{Duration, Instant};
 
@@ -79,9 +79,35 @@ impl RfiRecovery {
     }
 }
 
+/// One minute, the span of the host's `link health … rfi=` line.
+const RECENT_SPAN: Duration = Duration::from_secs(60);
+
+/// When each RFI in the last [`RECENT_SPAN`] went out, for the overlay.
+#[derive(Default)]
+pub(crate) struct RecentRfis(std::collections::VecDeque<Instant>);
+
+impl RecentRfis {
+    pub(crate) fn note(&mut self, now: Instant) {
+        self.count(now);
+        self.0.push_back(now);
+    }
+
+    /// RFIs sent in the minute before `now`. Ages out the older ones.
+    pub(crate) fn count(&mut self, now: Instant) -> u32 {
+        while self
+            .0
+            .front()
+            .is_some_and(|&t| now.duration_since(t) >= RECENT_SPAN)
+        {
+            self.0.pop_front();
+        }
+        self.0.len() as u32
+    }
+}
+
 #[cfg(test)]
 mod rfi_recovery_tests {
-    use super::{RecoveryAsk, RfiRecovery, RFI_THROTTLE};
+    use super::{RecentRfis, RecoveryAsk, RfiRecovery, RFI_THROTTLE};
     use std::time::{Duration, Instant};
 
     // Offsets from this Instant model the throttle window; do not sleep.
@@ -220,5 +246,20 @@ mod rfi_recovery_tests {
             r.observe(jump + 10, t + Duration::from_millis(1)),
             (8, RecoveryAsk::None)
         );
+    }
+
+    #[test]
+    fn recent_rfis_age_out_after_a_minute() {
+        let t0 = base();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut r = RecentRfis::default();
+        assert_eq!(r.count(t0), 0);
+        r.note(t0);
+        r.note(at(30));
+        assert_eq!(r.count(at(59)), 2);
+        assert_eq!(r.count(at(60)), 1);
+        r.note(at(61));
+        assert_eq!(r.count(at(89)), 2);
+        assert_eq!(r.count(at(121)), 0);
     }
 }
