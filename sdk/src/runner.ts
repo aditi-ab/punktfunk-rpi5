@@ -217,24 +217,39 @@ export const windowsSddlUnsafeReason = (
 	return null;
 };
 
+/**
+ * Run `spawn`, and once more if the first run was killed rather than exiting.
+ *
+ * Bun on Windows fires a `spawnSync` timeout within milliseconds when the spawn is the first
+ * after an idle event loop. A killed ACL read is an unreadable ACL, which refuses the unit.
+ */
+export const spawnAgainIfKilled = <T extends { status: number | null }>(
+	spawn: () => T,
+): T => {
+	const first = spawn();
+	return first.status === null ? spawn() : first;
+};
+
 /** The SID this process runs as, fetched once (`undefined` when it can't be determined). */
 let processSidCache: string | undefined | false;
 const processSid = (): string | undefined => {
 	if (processSidCache === undefined) {
-		const res = spawnSync(
-			windowsPowershell(),
-			[
-				"-NoProfile",
-				"-NonInteractive",
-				"-Command",
-				"[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-			],
-			{
-				encoding: "utf8",
-				windowsHide: true,
-				timeout: 15_000,
-				env: windowsPowershellEnv(),
-			},
+		const res = spawnAgainIfKilled(() =>
+			spawnSync(
+				windowsPowershell(),
+				[
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					"[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+				],
+				{
+					encoding: "utf8",
+					windowsHide: true,
+					timeout: 15_000,
+					env: windowsPowershellEnv(),
+				},
+			),
 		);
 		const sid = res.status === 0 ? (res.stdout ?? "").trim() : "";
 		processSidCache = /^S-[0-9-]+$/.test(sid) ? sid : false;
@@ -267,20 +282,22 @@ const windowsPowershellEnv = (): Record<string, string | undefined> => {
 /** Read a file's SDDL and apply [`windowsSddlUnsafeReason`]. Unreadable ACL ⇒ refuse. */
 const windowsFileIsSafe = (file: string, log: LogSink): boolean => {
 	const escaped = file.replace(/'/g, "''");
-	const res = spawnSync(
-		windowsPowershell(),
-		[
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			`(Get-Acl -LiteralPath '${escaped}').Sddl`,
-		],
-		{
-			encoding: "utf8",
-			windowsHide: true,
-			timeout: 15_000,
-			env: windowsPowershellEnv(),
-		},
+	const res = spawnAgainIfKilled(() =>
+		spawnSync(
+			windowsPowershell(),
+			[
+				"-NoProfile",
+				"-NonInteractive",
+				"-Command",
+				`(Get-Acl -LiteralPath '${escaped}').Sddl`,
+			],
+			{
+				encoding: "utf8",
+				windowsHide: true,
+				timeout: 15_000,
+				env: windowsPowershellEnv(),
+			},
+		),
 	);
 	const sddl = res.status === 0 ? (res.stdout ?? "").trim() : "";
 	if (!sddl) {
