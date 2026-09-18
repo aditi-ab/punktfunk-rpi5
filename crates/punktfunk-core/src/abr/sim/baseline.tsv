@@ -35,6 +35,8 @@ ramp_cut_short_wifi	0	34	10	0	6	0	0	1000	cd50f2f4
 ramp_cut_short_wan	28	18	10	110	28	0	0	1000	4a30c397
 wan_brownout	61	3	33	220	1464	0	0	1000	f440c0b6
 wan_ramp_reads_low	0	195	3	0	38	0	0	1000	ef3e5658
+wan_lift_overshoot	0	321	4	0	44	0	0	1000	dae3d82b
+wifi_content_bound	0	3	6	0	4	0	0	1000	5f267b14
 wifi_tv_legacy	0	20	0	0	3	0	0	1000	a510e60b
 wifi_good_legacy	0	1	0	8	2	0	0	1000	811c9dc5
 slow_start_spent_legacy	0	19	2	2	5	0	7	1000	20813fbc

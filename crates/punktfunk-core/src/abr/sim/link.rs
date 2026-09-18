@@ -36,6 +36,12 @@ pub(super) struct LinkCfg {
     /// `stall_every_ms`, so a session never opens inside one.
     pub stall_every_ms: u64,
     pub stall_ms: u64,
+    /// One-off `(at_ms, for_ms)` stalls. The sender, not the path: a send
+    /// loop that loses a scheduling slice emits its backlog as one burst,
+    /// which is what the rig's Wi-Fi delay steps are and the only thing that
+    /// can put tens of milliseconds into a queue with no loss and no host
+    /// event behind it.
+    pub hiccups: Vec<(u64, u64)>,
     /// Foreign CBR traffic into the same queue.
     pub cross_kbps: u32,
 }
@@ -54,6 +60,7 @@ impl Default for LinkCfg {
             burst_shards: 0,
             stall_every_ms: 0,
             stall_ms: 0,
+            hiccups: Vec::new(),
             cross_kbps: 0,
         }
     }
@@ -115,6 +122,14 @@ impl Link {
     pub(super) fn capacity_kbps(&mut self, now_ms: u64) -> u32 {
         if self.cfg.stall_every_ms > 0
             && now_ms % self.cfg.stall_every_ms >= self.cfg.stall_every_ms - self.cfg.stall_ms
+        {
+            return 0;
+        }
+        if self
+            .cfg
+            .hiccups
+            .iter()
+            .any(|&(at, ms)| now_ms >= at && now_ms < at + ms)
         {
             return 0;
         }
