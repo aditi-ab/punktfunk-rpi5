@@ -6,7 +6,8 @@
 
 use super::Rng;
 pub(super) use crate::abr::budget::{
-    adapt_fec, encoder_kbps_for_budget, fec_target, FEC_ADAPTIVE_START, SHARD_WIRE_OVERHEAD,
+    adapt_fec, encoder_kbps_for_budget, fec_target, FrameBudget, LossHorizon, FEC_ADAPTIVE_START,
+    SHARD_WIRE_OVERHEAD,
 };
 use crate::quic::AckReason;
 
@@ -270,6 +271,7 @@ pub(super) struct Host {
     share_kbps: u32,
     governing: Option<(u64, u32)>,
     fec_percent: u8,
+    fec_horizon: LossHorizon,
     unrecovered_run: u32,
     next_id: u32,
     next_frame_us: u64,
@@ -305,6 +307,7 @@ impl Host {
             share_kbps: 0,
             governing: None,
             fec_percent: FEC_ADAPTIVE_START,
+            fec_horizon: LossHorizon::default(),
             unrecovered_run: 0,
             next_id: 1,
             next_frame_us: 0,
@@ -413,14 +416,27 @@ impl Host {
         Some(done)
     }
 
-    /// Host adaptive FEC closes on the client's loss report.
+    /// Host adaptive FEC closes on the client's loss report, sized for the
+    /// frame this session's budget buys — the same call the host's control
+    /// task makes, with the facts a host has without asking.
     pub(super) fn on_loss_report(&mut self, loss_ppm: u32, unrecovered: bool) {
         self.unrecovered_run = if unrecovered {
             self.unrecovered_run.saturating_add(1)
         } else {
             0
         };
-        self.fec_percent = fec_target(loss_ppm, self.fec_percent, self.unrecovered_run);
+        self.fec_percent = fec_target(
+            loss_ppm,
+            self.fec_percent,
+            self.unrecovered_run,
+            FrameBudget {
+                budget_kbps: self.budget_kbps,
+                audio_kbps: self.cfg.audio_kbps,
+                shard_payload: self.cfg.shard_payload,
+                fps: self.cfg.fps,
+            },
+            &mut self.fec_horizon,
+        );
     }
 
     /// The encoder target, which is the `current_kbps` the host governor reads.
@@ -669,9 +685,16 @@ mod tests {
         assert_eq!(adapt_fec(400_000), 50);
         // A run of unrecovered frames adds the step for four windows, then
         // lets it go; decay is one point per window.
-        assert_eq!(fec_target(0, 5, 1), 8);
-        assert_eq!(fec_target(0, 8, 5), 7, "past the run, decay by one");
-        assert_eq!(fec_target(0, 8, 0), 7);
+        let frame = FrameBudget {
+            budget_kbps: 12_500,
+            audio_kbps: 256,
+            shard_payload: 1408,
+            fps: 30,
+        };
+        let mut h = LossHorizon::default();
+        assert_eq!(fec_target(0, 5, 1, frame, &mut h), 8);
+        assert_eq!(fec_target(0, 8, 5, frame, &mut h), 7, "past the run, decay");
+        assert_eq!(fec_target(0, 8, 0, frame, &mut h), 7);
     }
 
     /// Parity is at least two shards per block, and the wire index of every

@@ -1756,6 +1756,7 @@ pub(crate) async fn run_admitted(
         bitrate_automatic: hello.bitrate_kbps == 0 && codec != crate::encode::Codec::PyroWave,
         wire_bytes: u64::from(welcome.shard_payload)
             + punktfunk_core::abr::budget::SHARD_WIRE_OVERHEAD,
+        audio_kbps: audio_reserved_kbps(&welcome),
         ack_reason: abr_features & punktfunk_core::quic::EXT_ABR_ACK_REASON != 0,
         live_bitrate: live_bitrate.clone(),
         encoder_ceiling: encoder_ceiling.clone(),

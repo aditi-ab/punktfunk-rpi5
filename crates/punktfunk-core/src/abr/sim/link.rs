@@ -3,9 +3,13 @@
 //!
 //! Fluid per tick: the queue drains `capacity ÷ 8` bytes per millisecond and
 //! anything offered past the depth is tail-dropped. Loss is drawn per frame as
-//! a shard count — uniform from a ppm accumulator, bursts from a
-//! Gilbert-Elliott chain — and placed in wire order, so a burst lands inside
-//! one FEC block the way a real burst does.
+//! a shard count — independently per shard, bursts from a Gilbert-Elliott
+//! chain — and placed in wire order, so a burst lands inside one FEC block the
+//! way a real burst does.
+//!
+//! Independent per shard, not a share spread evenly: what costs a frame is the
+//! binomial tail, the window where three shards of thirty go at once, and a
+//! model that hands every frame the mean loses none of them.
 
 use super::Rng;
 use std::collections::VecDeque;
@@ -25,7 +29,7 @@ pub(super) struct LinkCfg {
     /// Queue depth, in milliseconds of the current capacity.
     pub buffer_ms: u64,
     pub base_delay_ms: u64,
-    /// Uniform shard loss.
+    /// Independent shard loss.
     pub loss_ppm: u32,
     /// Gilbert-Elliott, stepped once per frame: entry and exit odds for the
     /// bad state, and the contiguous run it drops while there.
@@ -94,7 +98,6 @@ pub(super) struct Link {
     wander_off: i64,
     wander_until_ms: u64,
     ge_bad: bool,
-    loss_acc: u64,
 }
 
 impl Link {
@@ -109,7 +112,6 @@ impl Link {
             wander_off: 0,
             wander_until_ms: 0,
             ge_bad: false,
-            loss_acc: 0,
         }
     }
 
@@ -218,15 +220,22 @@ impl Link {
         }
     }
 
-    /// Loss for one frame of `shards` wire shards. The chain steps once per
-    /// frame, so a bad state spans a few frames at any frame rate.
+    /// Loss for one frame of `shards` wire shards: a trial per shard, plus the
+    /// burst chain, which steps once per frame so a bad state spans a few
+    /// frames at any frame rate.
     pub(super) fn draw_loss(&mut self, shards: u32) -> LossDraw {
         if shards == 0 {
             return LossDraw::default();
         }
-        self.loss_acc += shards as u64 * self.cfg.loss_ppm as u64;
-        let random = (self.loss_acc / 1_000_000) as u32;
-        self.loss_acc %= 1_000_000;
+        // A link with no loss process draws nothing at all: it must cost no
+        // generator state, or every clean scenario moves with this model.
+        let random = if self.cfg.loss_ppm == 0 {
+            0
+        } else {
+            (0..shards)
+                .filter(|_| self.rng.chance_ppm(self.cfg.loss_ppm))
+                .count() as u32
+        };
         self.ge_bad = if self.ge_bad {
             !self.rng.chance_ppm(self.cfg.burst_out_ppm)
         } else {
@@ -299,10 +308,11 @@ mod tests {
         assert_eq!(out.iter().map(|d| d.2).sum::<u64>(), 50_000);
     }
 
-    /// The ppm accumulator spends exactly the configured loss over a run, and
-    /// a link with no loss process drops nothing.
+    /// Independent loss spends its ppm over a run, and puts more than one
+    /// shard into some of the frames — the draw a frame of two parity shards
+    /// actually dies to. A link with no loss process drops nothing.
     #[test]
-    fn uniform_loss_spends_exactly_its_ppm_over_a_run() {
+    fn independent_loss_spends_its_ppm_and_clusters() {
         let mut link = Link::new(
             LinkCfg {
                 loss_ppm: 10_000,
@@ -310,8 +320,14 @@ mod tests {
             },
             3,
         );
-        let lost: u32 = (0..100).map(|_| link.draw_loss(100).random).sum();
-        assert_eq!(lost, 100, "1 % of 10 000 shards");
+        let per_frame: Vec<u32> = (0..1_000).map(|_| link.draw_loss(100).random).collect();
+        let lost: u32 = per_frame.iter().sum();
+        assert!(
+            (950..=1_050).contains(&lost),
+            "1 % of 100 000 shards: {lost}"
+        );
+        let over_two = per_frame.iter().filter(|&&n| n > 2).count();
+        assert!(over_two > 10, "a 2-shard parity pool dies {over_two} times");
         let mut clean = Link::new(LinkCfg::default(), 4);
         assert_eq!(clean.draw_loss(100).random, 0);
         assert_eq!(clean.draw_loss(100).burst_len, 0);
