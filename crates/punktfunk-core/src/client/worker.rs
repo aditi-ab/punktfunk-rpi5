@@ -103,6 +103,8 @@ pub(crate) struct WorkerArgs {
     pub(crate) live_bitrate: Arc<AtomicU32>,
     /// Why Automatic last cut the rate ([`crate::hud::RateCut`] code), for the overlay.
     pub(crate) rate_cut: Arc<AtomicU8>,
+    /// RFIs sent in the last minute, for the overlay. The control task notes each one.
+    pub(crate) recent_rfis: Arc<Mutex<RecentRfis>>,
     /// Mute mask the control task ORs [`crate::client::AUDIO_MUTE_HOST`] into on every
     /// `AudioState`. The embedder's own bit rides the same cell.
     pub(crate) audio_mute: Arc<AtomicU8>,
