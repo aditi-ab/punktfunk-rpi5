@@ -88,6 +88,10 @@ LINK_DRAIN_WINDOWS|const LINK_DRAIN_WINDOWS: u32 = 4;|const LINK_DRAIN_WINDOWS: 
 DRAIN_FALL_US|const DRAIN_FALL_US: i64 = 5_000;|const DRAIN_FALL_US: i64 = 500_000;
 LINK_HOLD_DIV|const LINK_HOLD_DIV: u32 = 10;|const LINK_HOLD_DIV: u32 = 3;
 LINK_MARK_SIMILAR_DIV|const LINK_MARK_SIMILAR_DIV: u32 = 5;|const LINK_MARK_SIMILAR_DIV: u32 = 25;
+SHARE_BAND_DIV|const SHARE_BAND_DIV: u32 = 10;|const SHARE_BAND_DIV: u32 = 4;
+SHORT_DIV|const SHORT_DIV: u32 = 16;|const SHORT_DIV: u32 = 4;
+SHARE_CLOCK|const SHARE_CLOCK: Duration = Duration::from_secs(5);|const SHARE_CLOCK: Duration = Duration::from_secs(60);
+SHARE_LIFT_CLOCK|const SHARE_LIFT_CLOCK: Duration = Duration::from_secs(60);|const SHARE_LIFT_CLOCK: Duration = Duration::from_secs(5);
 EOF
 )
 
