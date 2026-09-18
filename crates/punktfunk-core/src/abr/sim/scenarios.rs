@@ -1468,39 +1468,27 @@ mod tests {
         );
     }
 
-    /// C3: one severe window inside the first 10 s still cuts and still ends
-    /// slow start — the lost frame comes too early for a clean run to vouch
-    /// for it. Eight clean utilised windows then refute the verdict, and the
-    /// session doubles back instead of crawling.
+    /// C3: a lost frame inside the first ten seconds, on a link with room.
     ///
-    /// Before: +6 % a step from 14 000, 158 s to pass 170 000, and a `to90_s`
-    /// of 187 for the scenario.
+    /// Nothing else is wrong with the window — the wire carries this rate's
+    /// own norm and the delay sits flat — so the rate stands, slow start
+    /// stands, and the session reaches its ceiling on the doublings it
+    /// already had instead of spending a third of itself and earning them
+    /// back.
     #[test]
-    fn c3_a_refuted_early_verdict_gives_slow_start_back() {
+    fn c3_an_early_lost_frame_on_a_link_with_room_costs_nothing() {
         let r = run(&slow_start_spent());
-        let cut = r.cuts()[0];
-        assert!(cut.t_ms <= 10_000, "the blip lands at {} ms", cut.t_ms);
-        let from = r.windows[0]
+        let lost = r.windows[0]
             .iter()
-            .find(|w| w.t_ms > cut.t_ms && w.rate_kbps == 14_000)
-            .expect("20 000 × 0.7");
-        let to = r.windows[0]
+            .find(|w| w.dropped > 0)
+            .expect("the injected frame dies somewhere");
+        assert!(lost.t_ms <= 10_000, "it dies at {} ms", lost.t_ms);
+        assert!(r.cuts().is_empty(), "and nothing cuts for it");
+        let top = r.windows[0]
             .iter()
-            .find(|w| w.t_ms > from.t_ms && w.rate_kbps >= 170_000)
-            .expect("and it does get back");
-        let took_s = (to.t_ms - from.t_ms) / 1_000;
-        assert!(took_s <= 20, "14 000 → 170 000 took {took_s} s");
-        // The re-arm, not a faster additive step: six seconds of clean
-        // windows first, then doublings.
-        let steps = r.steps();
-        let rearmed = steps
-            .windows(2)
-            .find(|p| u64::from(p[1]) * 100 / u64::from(p[0]) >= 150)
-            .expect("a doubling after the cut");
-        assert_eq!(
-            rearmed[0], 14_876,
-            "one additive step at 14 000, then the verdict is refuted"
-        );
+            .find(|w| w.rate_kbps >= 170_000)
+            .expect("the session reaches its ceiling");
+        assert!(top.t_ms <= 20_000, "170 000 took {} ms", top.t_ms);
     }
 
     /// A cadence refusal costs the ten seconds it lasts, not the session.
@@ -1901,6 +1889,15 @@ mod tests {
         assert!(
             r.windows[0].iter().all(|w| w.dropped <= 1),
             "a burst here never costs two frames in one window"
+        );
+        let paid: Vec<u64> = lone
+            .iter()
+            .filter(|w| w.cut_from_kbps.is_some())
+            .map(|w| w.t_ms)
+            .collect();
+        assert!(
+            paid.len() <= 1,
+            "only a lone frame inside another one's hold costs the rate: {paid:?}"
         );
     }
 
