@@ -48,6 +48,8 @@ struct UserData {
     signals: super::CaptureSignals,
     /// Raw dmabuf to the encoder instead of a CUDA import (VAAPI).
     vaapi_passthrough: bool,
+    /// Tiled 10-bit was offered because the encoder's raw convert reads it; hold it, never import.
+    hdr_tiled_raw: bool,
     /// CUDA import choices; the consumer imports held frames with the same policy.
     import_policy: ImportPolicy,
     /// Arrival-path import memory. The consumer keeps its own.
@@ -625,6 +627,10 @@ impl PassthroughFallbacks {
     }
 }
 
+/// A tiled 10-bit frame reached the CUDA import, which has no 10-bit de-tile. HDR offers
+/// stay LINEAR for the rest of this process.
+static HDR_TILED_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Tiled-import failures (worker alive) before the stream is poisoned for rebuild.
 /// Never fall through to CPU mmap: de-padding tiled bytes as linear is a scrambled image.
 const IMPORT_FAIL_POISON: u32 = 3;
@@ -656,6 +662,16 @@ pub(super) fn gpu_import(
     };
     let modifier = (modifier != 0).then_some(modifier);
     let ten_bit = fmt.is_hdr_rgb10();
+    // The raw lane let go of a tiled HDR stream. Rebuild it on the LINEAR offer.
+    if ten_bit && modifier.is_some() {
+        if !HDR_TILED_REFUSED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "tiled 10-bit dmabuf reached the CUDA import — capture rebuilds on LINEAR"
+            );
+        }
+        signals.broken.store(true, Ordering::Relaxed);
+        return ImportOutcome::Dropped;
+    }
     let yuv444 = policy.yuv444 && modifier.is_some() && !ten_bit;
     let mut nv12 = policy.nv12 && !policy.yuv444 && !ten_bit;
     let imported = if let Some(m) = modifier {
@@ -1283,14 +1299,16 @@ fn consume_frame(
     if ud.signals.has_importer.load(Ordering::Relaxed) {
         if let Some(fmt) = ud.format {
             let hdr_tiled = fmt.is_hdr_rgb10() && ud.modifier != 0;
-            if hdr_tiled {
+            if hdr_tiled && !ud.hdr_tiled_raw {
                 warn_once(
                     "HDR frame arrived with a tiled modifier — the GPU de-tile blit is 8-bit, so \
                      this stream falls back to the CPU path (the producer ignored our LINEAR-only \
                      HDR offer)",
                 );
             }
-            if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf && !hdr_tiled {
+            if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf
+                && (!hdr_tiled || ud.hdr_tiled_raw)
+            {
                 let Some(fourcc) = pf_frame::drm_fourcc(fmt) else {
                     return; // format has no DRM fourcc mapping — skip the frame
                 };
@@ -1631,8 +1649,29 @@ pub fn pipewire_thread(
         *list = dmabuf_modifiers_for_producer(
             list,
             importer.is_some() || vaapi_passthrough,
-            producer_is_gamescope,
+            producer_is_gamescope && !policy.gamescope_tiled,
         );
+    }
+    // Tiled 10-bit has one reader: the encoder's raw convert. Every other arm de-tiles into
+    // 8 bits, so offer it only while that lane holds the stream.
+    let hdr_tiled_raw = want_hdr
+        && policy.gamescope_tiled
+        && plan.nvenc_raw
+        && !HDR_TILED_REFUSED.load(Ordering::Relaxed);
+    let mut hdr_modifiers: Vec<(VideoFormat, Vec<u64>)> = Vec::new();
+    for fmt in HDR_FORMAT_ORDER {
+        let mut list = Vec::new();
+        if hdr_tiled_raw {
+            if let (Some(i), Some(fourcc)) = (
+                importer.as_mut(),
+                map_format(fmt).and_then(pf_frame::drm_fourcc),
+            ) {
+                list = i.supported_modifiers(fourcc);
+            }
+        }
+        list.retain(|&m| m != 0);
+        list.push(0);
+        hdr_modifiers.push((fmt, list));
     }
     if extend_pyrowave {
         tracing::info!(
@@ -1764,6 +1803,7 @@ pub fn pipewire_thread(
         wake,
         signals,
         vaapi_passthrough,
+        hdr_tiled_raw,
         import_policy: plan.import_policy.for_ten_bit_sdr(opts.ten_bit_sdr),
         import_state: ImportState::default(),
         dbg_log_n: 0,
@@ -2209,12 +2249,13 @@ pub fn pipewire_thread(
             if prefer_native_p010 {
                 pods.push(build_hdr_dmabuf_format(
                     VideoFormat::P010_10LE,
+                    &[0],
                     preferred,
                     pacing,
                 )?);
             }
-            for fmt in HDR_FORMAT_ORDER {
-                pods.push(build_hdr_dmabuf_format(fmt, preferred, pacing)?);
+            for (fmt, list) in &hdr_modifiers {
+                pods.push(build_hdr_dmabuf_format(*fmt, list, preferred, pacing)?);
             }
             return Ok(pods);
         }
@@ -2714,14 +2755,14 @@ fn offer_pacing(unpaced: bool, gamescope: bool, preferred: Option<(u32, u32, u32
     }
 }
 
-/// gamescope's node offers LINEAR as `{0,0}`. spa_pod_filter without DONT_FIXATE
-/// fixates our default, so a tiled NVIDIA default fails the link. Empty `egl`
+/// A `linear_only` gamescope node offers LINEAR as `{0,0}`. spa_pod_filter without
+/// DONT_FIXATE fixates our default, so a tiled NVIDIA default fails the link. Empty `egl`
 /// with `advertise` still yields LINEAR — the importer exists, EGL listed none.
-fn dmabuf_modifiers_for_producer(egl: &[u64], advertise: bool, gamescope: bool) -> Vec<u64> {
+fn dmabuf_modifiers_for_producer(egl: &[u64], advertise: bool, linear_only: bool) -> Vec<u64> {
     if !advertise {
         return egl.to_vec();
     }
-    if gamescope {
+    if linear_only {
         return vec![0];
     }
     let mut m = egl.to_vec();

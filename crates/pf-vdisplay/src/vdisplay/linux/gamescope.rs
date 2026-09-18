@@ -35,8 +35,8 @@ use discovery::{
 };
 pub(crate) use discovery::{
     display_presenting, game_session_exited, gamescope_can_composite_cursor, gamescope_hdr_capable,
-    is_available, note_spawn_flags_lost, steam_appid_from_launch, wait_for_steam_game_exit,
-    SteamGameWatch,
+    gamescope_offers_tiled_capture, is_available, note_spawn_flags_lost, steam_appid_from_launch,
+    wait_for_steam_game_exit, SteamGameWatch,
 };
 pub(crate) use heads::list_monitors;
 pub(crate) use splash::run as splash_run;

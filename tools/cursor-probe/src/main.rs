@@ -83,6 +83,7 @@ mod linux {
             pyrowave_modifiers: Vec::new(),
             hdr_cuda_ok: false,
             nvenc_raw_dmabuf: false,
+            gamescope_tiled: false,
         };
         let kwin = compositor == pf_vdisplay::Compositor::Kwin;
         let mut cap = pf_capture::open_virtual_output(
