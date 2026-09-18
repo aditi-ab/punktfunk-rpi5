@@ -944,6 +944,8 @@ impl BitrateController {
     /// later, and the session was fine at the cap, so the answer is the cap
     /// and not a cut. Loss, a lost frame and a rising trend only refuse while
     /// the probe is still open — after it the ordinary verdict owns them.
+    /// The retreat backs the cap's clock off only where this session is the
+    /// one on the path; on a divided one the refusal names no wall of its own.
     fn judge_lift(&mut self, w: &WindowSample, now: Instant) -> Option<u32> {
         let mut p = self.lift?;
         p.age += 1;
@@ -986,7 +988,14 @@ impl BitrateController {
         }
         self.lift = None;
         self.link_lifted = false;
-        self.link_cap.latch(p.cap_kbps, self.floor_kbps);
+        if self.share_cap.is_some() {
+            // On a path the host has divided, the queue this lift met may be
+            // a sibling's: backing the clock off would record a wall this
+            // session cannot have seen. It retreats, and asks again soon.
+            self.link_cap.park(p.cap_kbps);
+        } else {
+            self.link_cap.latch(p.cap_kbps, self.floor_kbps);
+        }
         self.arm_drain();
         tracing::info!(
             from_kbps = self.current_kbps,
@@ -995,8 +1004,7 @@ impl BitrateController {
             reference_us = p.ref_us,
             settled = p.settled,
             reprobe_after_windows = self.link_cap.reprobe_after(),
-            "adaptive bitrate: the link refused the lift — back to the cap it came from, and \
-             the next ask waits twice as long"
+            "adaptive bitrate: the link refused the lift — back to the cap it came from"
         );
         self.bad_windows = 0;
         self.streak_decode_windows = 0;
@@ -1991,6 +1999,37 @@ mod tests {
             judged(100_000, 120_000, 0, LIFT_OVER_WINDOWS).0,
             None,
             "20 ms on a 100 ms link is inside the session's own noise"
+        );
+    }
+
+    /// A lift refused on a path the host has divided costs the step, not the
+    /// clock.
+    ///
+    /// The queue that refused it may be the sibling's, and one window cannot
+    /// tell. Doubling the wait there records a wall this session never
+    /// measured, and the ladder stops closing on the share it was given.
+    #[test]
+    fn a_lift_refused_on_a_shared_path_keeps_the_short_clock() {
+        let start = Instant::now();
+        let (mut c, mut t, rate) = lifted_cap(start, 10_000, true);
+        c.share_cap = Some(rate * 2);
+        let over = 10_000 + BitrateController::lift_bar_us(10_000) + 1_000;
+        let mut out = None;
+        for _ in 0..LIFT_OVER_WINDOWS {
+            let at = ticks(start, t);
+            t += 1;
+            out = out.or(c.on_window(&WindowSample {
+                owd_mean_us: Some(over),
+                delay: Some(trend(over, 0)),
+                actual_kbps: rate,
+                ..WindowSample::at(at)
+            }));
+        }
+        assert_eq!(out, Some(10_350), "back to the cap it came from");
+        assert_eq!(
+            c.link_cap.reprobe_after(),
+            CAP_REPROBE_WINDOWS_MIN,
+            "the host, not this window, says when the path has room again"
         );
     }
 
