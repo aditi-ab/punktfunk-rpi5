@@ -19,6 +19,9 @@ profile() {
   BUFFER_MS=20
   LOSS_PCT=0
   TRACE=""
+  # Non-zero swaps netem's rate for an ingress policer at this rate: the wall answers an
+  # overshoot with dropped packets and no queue, which is the one shape netem cannot make.
+  POLICE_KBIT=0
   WANDER_PCT=0
   WANDER_S=0
   MODE=1920x1080x60
@@ -80,6 +83,13 @@ profile() {
     # bring-up ramp runs out of things to prove before the link refuses
     # anything. `lan_1g` is NOT this case: its cap / 0.7 is above what the VM
     # can shape, and the ramp reads the two hosts' packet paths instead.
+    # A wall that drops instead of queueing: 20 Mbit policed, 10 ms, no random loss, no
+    # wander. 1080p60's stream cap is ~90 Mbps, so the policer is what the session meets and
+    # the ramp has a real wall to find. BUFFER_MS is the policer's single burst, not a queue.
+    policer_20)
+      RATE_KBIT=20000; POLICE_KBIT=20000; DELAY_MS=10; BUFFER_MS=10; LOSS_PCT=0
+      MODE=1920x1080x60; ACHIEVABLE_KBPS=19000
+      ;;
     nowall_720p)
       RATE_KBIT=245000; DELAY_MS=3; BUFFER_MS=60
       MODE=1280x720x60; ACHIEVABLE_KBPS=25000
@@ -95,7 +105,7 @@ profile() {
       ;;
     *)
       echo "unknown profile '$1' (lan_1g wifi_tv wifi_tv_probe_damage wan_wg_12 \
-lte_variable nowall_720p shared_two_auto)" >&2
+lte_variable nowall_720p policer_20 shared_two_auto)" >&2
       return 1
       ;;
   esac

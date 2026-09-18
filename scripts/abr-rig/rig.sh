@@ -62,6 +62,19 @@ shape() {
     rate "${kbit}kbit" delay "${DELAY_MS}ms" limit "$queue_pkts" loss "${LOSS_PCT}%"
 }
 
+# A wall that answers with loss instead of delay: netem carries the delay only, and an
+# ingress policer drops everything over the rate. `burst` is the single bucket — BUFFER_MS
+# of it — so an overshoot costs packets within a few ms, never a queue that grows.
+police() {
+  local ns=$1 dev=$2 kbit=$3
+  local burst=$(( kbit * BUFFER_MS / 8 ))
+  ip netns exec "$ns" tc qdisc add dev "$dev" root netem \
+    delay "${DELAY_MS}ms" limit 10000
+  ip netns exec "$ns" tc qdisc add dev "$dev" handle ffff: ingress
+  ip netns exec "$ns" tc filter add dev "$dev" parent ffff: protocol ip prio 1 u32 \
+    match u32 0 0 police rate "${kbit}kbit" burst "${burst}b" conform-exceed drop
+}
+
 say "namespaces + veth"
 cleanup
 ip netns add h
@@ -74,9 +87,15 @@ ip -n c addr add $CLIENT_IP/24 dev vc
 ip -n h link set vh up; ip -n h link set lo up
 ip -n c link set vc up; ip -n c link set lo up
 
-say "shaping ${RATE_KBIT}kbit, ${DELAY_MS}ms, ${BUFFER_MS}ms queue, ${LOSS_PCT}% loss"
-shape h vh "$RATE_KBIT"
-shape c vc "$RATE_KBIT"
+if [ "$POLICE_KBIT" != 0 ]; then
+  say "policing ${POLICE_KBIT}kbit, ${DELAY_MS}ms, ${BUFFER_MS}ms burst, drop over (no queue)"
+  police h vh "$POLICE_KBIT"
+  police c vc "$POLICE_KBIT"
+else
+  say "shaping ${RATE_KBIT}kbit, ${DELAY_MS}ms, ${BUFFER_MS}ms queue, ${LOSS_PCT}% loss"
+  shape h vh "$RATE_KBIT"
+  shape c vc "$RATE_KBIT"
+fi
 
 # ---- prove the link before streaming over it --------------------------------
 # A profile that did not take is hours of misread trajectory. Two commands.
@@ -84,7 +103,10 @@ say "checking the shaped link"
 ip netns exec c ping -c 3 -i 0.2 -q $HOST_IP | tail -2
 ip netns exec h iperf3 -s -1 -B $HOST_IP >/dev/null 2>&1 &
 sleep 0.5
-ip netns exec c iperf3 -c $HOST_IP -u -b "${RATE_KBIT}k" -t 3 -f k 2>&1 | tail -4
+# A policer is proved by over-offering: the excess must come back as loss, not as delay.
+OFFER_KBIT=$RATE_KBIT
+if [ "$POLICE_KBIT" != 0 ]; then OFFER_KBIT=$(( POLICE_KBIT * 3 / 2 )); fi
+ip netns exec c iperf3 -c $HOST_IP -u -b "${OFFER_KBIT}k" -t 3 -f k 2>&1 | tail -4
 wait %2 2>/dev/null || true
 
 # ---- the session ------------------------------------------------------------
@@ -171,3 +193,14 @@ for n in $(seq "$PROBES"); do
           v["fairness_x1000"], v["decisions_fnv1a"] }'
 done
 echo "trajectories: $OUT/$PROFILE-*.jsonl   host log: $OUT/$PROFILE-host.log"
+
+# ---- the ramp guard ---------------------------------------------------------
+# A ramp step the HOST could not fill reads as a floor under the link, never a wall, and the
+# session then spends 600 s below a link it never measured. It is a rig fault whatever the
+# profile — `nowall_720p` ends `wall=false` with no such step and passes. Exit 3 so the
+# driver repeats the run instead of reporting it.
+if grep -qs "ramp step limited by the sender" "$OUT/$PROFILE-1.log"; then
+  echo "[rig] FAILED: the bring-up ramp hit a sender-limited step — the wall was never measured"
+  grep -h "ramp step limited by the sender\|bring-up ramp done" "$OUT/$PROFILE-1.log" | tail -2
+  exit 3
+fi
