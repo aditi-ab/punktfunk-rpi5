@@ -48,6 +48,15 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
+/// Unique temp dir for the access store; never the host config dir.
+fn test_access_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "pf-mgmt-access-{}-{:p}",
+        std::process::id(),
+        &0u8 as *const u8
+    ))
+}
+
 /// Unique temp dir; never the host config dir.
 fn test_client_logs_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -106,6 +115,7 @@ fn test_app(state: Arc<AppState>, token: Option<&str>) -> Router {
         None,
         stats,
         test_client_logs_dir(),
+        test_access_dir(),
         // GameStream-compat off: the native-only default these tests model.
         false,
         None,
@@ -126,6 +136,7 @@ fn test_app_browser(state: Arc<AppState>) -> Router {
         None,
         stats,
         test_client_logs_dir(),
+        test_access_dir(),
         false,
         None,
         true,
@@ -144,6 +155,7 @@ fn test_app_native(state: Arc<AppState>, np: Arc<crate::native_pairing::NativePa
         Some(np),
         stats,
         test_client_logs_dir(),
+        test_access_dir(),
         false,
         // A fixed binding, so a device test signs what the host will check.
         Some([0x5a; 32]),
@@ -1078,6 +1090,7 @@ async fn host_info_publishes_the_hosts_own_fingerprint() {
         None,
         stats,
         test_client_logs_dir(),
+        test_access_dir(),
         false,
         Some([0xab; 32]),
         false,
@@ -2013,6 +2026,18 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("PUT", "/api/v1/plugins/{id}", true, false),
         ("DELETE", "/api/v1/plugins/{id}", true, false),
         ("GET", "/api/v1/plugins/{id}/ui-credential", false, false),
+        // A plugin asks for a folder and reads its own rows (its own token, not the shared
+        // runner's — the handler 403s without a PluginIdentity). Deciding is operator-only,
+        // so the overview and decide routes admit neither lane.
+        ("POST", "/api/v1/plugin-access/requests", true, false),
+        ("GET", "/api/v1/plugin-access/requests", true, false),
+        ("GET", "/api/v1/plugin-access", false, false),
+        (
+            "POST",
+            "/api/v1/plugin-access/{plugin}/decide",
+            false,
+            false,
+        ),
         // Hooks: write is command execution as the host user; read exposes webhook creds.
         ("GET", "/api/v1/hooks", false, false),
         ("PUT", "/api/v1/hooks", false, false),
@@ -4277,4 +4302,360 @@ async fn custom_entry_hints_round_trip_and_survive_an_update() {
 
     let (s, _) = send(&app, get_req("/api/v1/library/custom/nonesuch")).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+// ---- plugin access requests --------------------------------------------------------------------
+
+/// An app whose access store lives in `access_dir`, with a second identified plugin (`other`)
+/// beside `demo` so ownership can be checked both ways. The requested dir must exist.
+fn test_app_access(state: Arc<AppState>, access_dir: &std::path::Path) -> Router {
+    let stats = state.stats.clone();
+    app(
+        state,
+        Some("test-secret".to_string()),
+        Some("plugin-secret".to_string()),
+        std::collections::BTreeMap::from([
+            ("demo".to_string(), "demo-secret".to_string()),
+            ("other".to_string(), "other-secret".to_string()),
+        ]),
+        DEFAULT_PORT,
+        None,
+        stats,
+        test_client_logs_dir(),
+        access_dir.to_path_buf(),
+        false,
+        None,
+        false,
+    )
+}
+
+fn bearer_req(req: axum::http::Request<Body>, token: &str) -> axum::http::Request<Body> {
+    let mut req = req;
+    req.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    req
+}
+
+/// The next `plugins.changed` for `id`, failing on timeout. Subscribe BEFORE the call so the
+/// event cannot race past the receiver.
+async fn expect_plugins_changed(
+    mut rx: tokio::sync::broadcast::Receiver<crate::events::HostEvent>,
+    id: &str,
+) {
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(ev) = rx.recv().await {
+                if let crate::events::EventKind::PluginsChanged { id: got } = ev.kind {
+                    if got == id {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(seen.is_ok(), "no plugins.changed for {id} within 5s");
+}
+
+/// A request lands pending, the same plugin reads its own rows, and the shared runner token —
+/// which carries no plugin identity — gets 403 on both.
+#[tokio::test]
+async fn plugin_access_request_and_own_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = tempfile::tempdir().unwrap();
+    let app = test_app_access(test_state(), dir.path());
+    let path = wanted
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let rx = crate::events::bus().subscribe_live();
+    let body = serde_json::json!({ "paths": [{ "path": path }], "reason": "library folder" });
+    let (s, json) = send(
+        &app,
+        bearer_req(
+            post_json("/api/v1/plugin-access/requests", body),
+            "demo-secret",
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{json}");
+    assert_eq!(json[0]["outcome"], "pending");
+    assert_eq!(json[0]["path"], path);
+    // The new row announces itself.
+    expect_plugins_changed(rx, "demo").await;
+
+    let (s, json) = send(
+        &app,
+        bearer_req(get_req("/api/v1/plugin-access/requests"), "demo-secret"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{json}");
+    assert_eq!(json["plugin"], "demo");
+    assert_eq!(json["pending"][0]["path"], path);
+    assert_eq!(json["pending"][0]["reason"], "library folder");
+
+    for req in [
+        post_json(
+            "/api/v1/plugin-access/requests",
+            serde_json::json!({ "paths": [{ "path": path }] }),
+        ),
+        post_json(
+            "/api/v1/plugin-access/requests",
+            serde_json::json!({ "paths": [] }),
+        ),
+    ] {
+        let (s, _) = send(&app, bearer_req(req, "plugin-secret")).await;
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "the shared runner token has no identity"
+        );
+    }
+    let (s, _) = send(
+        &app,
+        bearer_req(get_req("/api/v1/plugin-access/requests"), "plugin-secret"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+/// Another plugin's token sees only its own rows and cannot reach the admin decision.
+#[tokio::test]
+async fn plugin_access_rows_stay_with_their_plugin() {
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = tempfile::tempdir().unwrap();
+    let app = test_app_access(test_state(), dir.path());
+    let path = wanted
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let (s, _) = send(
+        &app,
+        bearer_req(
+            post_json(
+                "/api/v1/plugin-access/requests",
+                serde_json::json!({ "paths": [{ "path": path }] }),
+            ),
+            "demo-secret",
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // `other` gets an empty snapshot, not demo's row.
+    let (s, json) = send(
+        &app,
+        bearer_req(get_req("/api/v1/plugin-access/requests"), "other-secret"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{json}");
+    assert_eq!(json["plugin"], "other");
+    assert!(json["pending"].as_array().unwrap().is_empty());
+
+    // And no plugin token may decide — demo's own row included.
+    let decide = |token: &str| {
+        bearer_req(
+            post_json(
+                "/api/v1/plugin-access/demo/decide",
+                serde_json::json!({ "path": path, "decision": "allow" }),
+            ),
+            token,
+        )
+    };
+    let (s, _) = send(&app, decide("demo-secret")).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = send(&app, decide("other-secret")).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // The admin overview is likewise off-lane.
+    let (s, _) = send(
+        &app,
+        bearer_req(get_req("/api/v1/plugin-access"), "demo-secret"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+/// Allow turns the pending row into a grant; deny sticks across a rebuilt store; a denied
+/// repost answers `denied` and files nothing.
+#[tokio::test]
+async fn plugin_access_decisions_land_and_stick() {
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = tempfile::tempdir().unwrap();
+    let denied_dir = tempfile::tempdir().unwrap();
+    let app = test_app_access(test_state(), dir.path());
+    let allow_path = wanted
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let deny_path = denied_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let post = |p: &str| {
+        bearer_req(
+            post_json(
+                "/api/v1/plugin-access/requests",
+                serde_json::json!({ "paths": [{ "path": p }] }),
+            ),
+            "demo-secret",
+        )
+    };
+    assert_eq!(send(&app, post(&allow_path)).await.0, StatusCode::OK);
+    assert_eq!(send(&app, post(&deny_path)).await.0, StatusCode::OK);
+
+    let rx = crate::events::bus().subscribe_live();
+    let (s, json) = send(
+        &app,
+        post_json(
+            "/api/v1/plugin-access/demo/decide",
+            serde_json::json!({ "path": allow_path, "decision": "allow" }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{json}");
+    assert_eq!(json["grants"][0]["path"], allow_path);
+    assert_eq!(json["grants"][0]["by"], "console");
+    assert!(json["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["path"] != allow_path));
+    expect_plugins_changed(rx, "demo").await;
+
+    let (s, json) = send(
+        &app,
+        post_json(
+            "/api/v1/plugin-access/demo/decide",
+            serde_json::json!({ "path": deny_path, "decision": "deny" }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{json}");
+    assert_eq!(json["denied"], serde_json::json!([deny_path]));
+
+    // Rebuilt store over the same dir: the denial still answers, without a new row.
+    let app2 = test_app_access(test_state(), dir.path());
+    let (s, json) = send(&app2, post(&deny_path)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json[0]["outcome"], "denied");
+
+    // The admin overview lists both verdicts under the plugin.
+    let (s, json) = send(&app, get_req("/api/v1/plugin-access")).await;
+    assert_eq!(s, StatusCode::OK, "{json}");
+    let demo = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["plugin"] == "demo")
+        .expect("demo row");
+    assert_eq!(demo["grants"].as_array().unwrap().len(), 1);
+    assert_eq!(demo["denied"], serde_json::json!([deny_path]));
+
+    // Deciding a path that was never asked for is a 404.
+    let (s, _) = send(
+        &app,
+        post_json(
+            "/api/v1/plugin-access/demo/decide",
+            serde_json::json!({ "path": deny_path, "decision": "allow" }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+/// A refused path is an answer, not a row; a plugin-authored reason loses its control bytes.
+#[tokio::test]
+async fn plugin_access_refusals_and_reason_sanitizing() {
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = tempfile::tempdir().unwrap();
+    let app = test_app_access(test_state(), dir.path());
+    let path = wanted
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let (s, json) = send(
+        &app,
+        bearer_req(
+            post_json(
+                "/api/v1/plugin-access/requests",
+                serde_json::json!({
+                    "paths": [
+                        { "path": "/" },
+                        { "path": "relative/dir" },
+                        { "path": path },
+                    ],
+                    "reason": "games\u{7}\n library"
+                }),
+            ),
+            "demo-secret",
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{json}");
+    let outcomes: Vec<&str> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes[0], "refused:broad_root");
+    assert_eq!(outcomes[1], "refused:not_absolute");
+    assert_eq!(outcomes[2], "pending");
+
+    let (s, json) = send(
+        &app,
+        bearer_req(get_req("/api/v1/plugin-access/requests"), "demo-secret"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    // One row only — the refused paths never became rows — with the controls stripped.
+    assert_eq!(json["pending"].as_array().unwrap().len(), 1);
+    assert_eq!(json["pending"][0]["reason"], "games library");
+
+    // The cap is in Unicode chars: a longer reason is truncated, not refused.
+    let other = tempfile::tempdir().unwrap();
+    let (s, _) = send(
+        &app,
+        bearer_req(
+            post_json(
+                "/api/v1/plugin-access/requests",
+                serde_json::json!({
+                    "paths": [{ "path": other.path().canonicalize().unwrap().to_string_lossy() }],
+                    "reason": "x".repeat(200)
+                }),
+            ),
+            "demo-secret",
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, json) = send(
+        &app,
+        bearer_req(get_req("/api/v1/plugin-access/requests"), "demo-secret"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let reasons: Vec<&str> = json["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["reason"].as_str())
+        .collect();
+    assert!(reasons.iter().any(|r| r.chars().count() == 120));
 }

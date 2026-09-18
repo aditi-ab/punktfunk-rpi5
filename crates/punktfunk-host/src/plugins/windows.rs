@@ -382,7 +382,18 @@ pub(super) fn runner_command() -> Result<(std::path::PathBuf, Vec<String>)> {
     Ok((bun, vec![runner.to_string_lossy().into_owned()]))
 }
 
-/// Grant the runner READ on one directory the operator owns.
+/// The ACE a grant carries: `(RX)` for read, `(M)` for write, both inheritable.
+/// Pure so a test pins the string without a real `icacls`.
+fn grant_permission(write: bool) -> &'static str {
+    if write {
+        "(OI)(CI)(M)"
+    } else {
+        "(OI)(CI)(RX)"
+    }
+}
+
+/// Grant the runner access to one directory the operator owns, via `icacls /grant:r` so an
+/// existing ACE is replaced rather than stacked.
 ///
 /// The Windows runner is `NT AUTHORITY\LocalService`, which holds no ACE anywhere inside a user
 /// profile — so a launcher installed there is invisible to every scanner plugin, and reads exactly
@@ -390,31 +401,42 @@ pub(super) fn runner_command() -> Result<(std::path::PathBuf, Vec<String>)> {
 ///
 /// It stays one directory: every service account holds "bypass traverse checking", so the locked
 /// parents above the target are never access-checked and the rest of the profile stays shut.
-pub(super) fn grant(dir: Option<&str>) -> Result<()> {
-    let Some(dir) = dir.map(str::trim).filter(|d| !d.is_empty()) else {
-        bail!("usage: punktfunk-host plugins grant <dir>");
-    };
+pub(super) fn grant(dir: &std::path::Path, write: bool) -> Result<()> {
     // A typo must not report success — the ACE would land on a name nothing ever reads.
-    if !std::path::Path::new(dir).is_dir() {
-        bail!("'{dir}' is not a directory (grant the folder holding the launcher, not the .exe)");
+    if !dir.is_dir() {
+        bail!(
+            "'{}' is not a directory (grant the folder holding the launcher, not the .exe)",
+            dir.display()
+        );
     }
     let ok = Command::new(icacls_path())
         .arg(dir)
-        .args(["/grant", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(RX)")])
+        .args([
+            "/grant:r",
+            &format!("{LOCAL_SERVICE_SID}:{}", grant_permission(write)),
+        ])
         .status()
         .context("run icacls")?
         .success();
     if !ok {
         bail!(
-            "icacls left '{dir}' unchanged: a folder's permissions are changed by its OWNER or \
+            "icacls left '{}' unchanged: a folder's permissions are changed by its OWNER or \
              an administrator - run this as the user who owns the folder, or from an elevated \
-             prompt"
+             prompt",
+            dir.display()
         );
     }
-    println!(
-        "Granted the plugin runner read on {dir}. Re-run the plugin's detection to pick it up."
-    );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Read grants are read-only ACEs; a write grant is the one that carries Modify.
+    #[test]
+    fn grant_permission_splits_read_from_write() {
+        assert_eq!(super::grant_permission(false), "(OI)(CI)(RX)");
+        assert_eq!(super::grant_permission(true), "(OI)(CI)(M)");
+    }
 }
 
 pub(super) fn runtime_status() -> RuntimeStatus {

@@ -3415,6 +3415,249 @@
         }
       }
     },
+    "/api/v1/plugin-access": {
+      "get": {
+        "tags": [
+          "plugin-access"
+        ],
+        "summary": "List every plugin's folder access",
+        "description": "Admin lane only: grants, pending requests, and denials across all plugins.",
+        "operationId": "getPluginAccess",
+        "responses": {
+          "200": {
+            "description": "All plugins' access state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PluginAccessSnapshot"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not reachable on the plugin or device lane",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugin-access/requests": {
+      "get": {
+        "tags": [
+          "plugin-access"
+        ],
+        "summary": "List this plugin's own access rows",
+        "description": "Grants, pending requests, and denials for the calling plugin only.",
+        "operationId": "getPluginAccessRequests",
+        "responses": {
+          "200": {
+            "description": "The calling plugin's access state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginAccessSnapshot"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The shared runner token has no plugin identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "plugin-access"
+        ],
+        "summary": "Ask for folders this plugin cannot reach",
+        "description": "Each path is validated against the real filesystem before it becomes a row the operator\nsees: `granted` (already reachable), `pending`, `denied` (a sticky no), or `refused:<rule>`.",
+        "operationId": "requestPluginAccess",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Per-path outcomes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccessPathOutcome"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The shared runner token has no plugin identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The request could not be recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugin-access/{plugin}/decide": {
+      "post": {
+        "tags": [
+          "plugin-access"
+        ],
+        "summary": "Grant, deny, or forget an access request",
+        "description": "`allow` turns a pending request into a grant (the platform ACL lands first, so a failed\ngrant stores nothing); `deny` remembers the no; `forget` removes a grant or denial.",
+        "operationId": "decidePluginAccess",
+        "parameters": [
+          {
+            "name": "plugin",
+            "in": "path",
+            "description": "The plugin id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecideRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The plugin's access state after the decision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginAccessSnapshot"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or a limit reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not reachable on the plugin or device lane",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No pending request for that path",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The decision could not be recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/plugins": {
       "get": {
         "tags": [
@@ -5318,6 +5561,59 @@
   },
   "components": {
     "schemas": {
+      "AccessPathOutcome": {
+        "type": "object",
+        "description": "One path's answer: `granted`, `pending`, `denied`, or `refused:<rule>`.",
+        "required": [
+          "path",
+          "outcome"
+        ],
+        "properties": {
+          "outcome": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "AccessPathRequest": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The directory the plugin wants, absolute on the host."
+          },
+          "write": {
+            "type": "boolean",
+            "description": "`true` asks for write access too; a grant is read-only unless the operator allows it."
+          }
+        }
+      },
+      "AccessRequest": {
+        "type": "object",
+        "required": [
+          "paths"
+        ],
+        "properties": {
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessPathRequest"
+            }
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the plugin wants it, in the plugin's words. Optional, sanitized, ≤120 chars."
+          }
+        }
+      },
       "ActionInfo": {
         "type": "object",
         "description": "One action as the caller sees it (`GET /actions`).",
@@ -6841,6 +7137,30 @@
           }
         }
       },
+      "DecideRequest": {
+        "type": "object",
+        "required": [
+          "path",
+          "decision"
+        ],
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/DecisionInput"
+          },
+          "path": {
+            "type": "string",
+            "description": "The path as it appears in the request or grant list."
+          }
+        }
+      },
+      "DecisionInput": {
+        "type": "string",
+        "enum": [
+          "allow",
+          "deny",
+          "forget"
+        ]
+      },
       "DetectHint": {
         "type": "object",
         "description": "Inbound wire half of [`DetectSpec`]: what an operator or plugin can name about\nrecognizing a title. Every field optional; all empty is no hint.\n\nNot returned by the catalog API — detect data does not go outbound.",
@@ -8147,6 +8467,30 @@
                 "$ref": "#/components/schemas/ApiSelectedGpu"
               }
             ]
+          }
+        }
+      },
+      "Grant": {
+        "type": "object",
+        "description": "One root the operator granted, as recorded on disk. `at`/`by` are audit fields:\nRFC3339 and `console`/`cli`/`legacy` (a v1 entry has neither).",
+        "required": [
+          "path",
+          "write",
+          "at",
+          "by"
+        ],
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "by": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "write": {
+            "type": "boolean"
           }
         }
       },
@@ -9685,6 +10029,32 @@
           }
         }
       },
+      "PendingRequest": {
+        "type": "object",
+        "description": "A path a plugin asked for that the operator has not answered yet.",
+        "required": [
+          "path",
+          "write",
+          "at"
+        ],
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "write": {
+            "type": "boolean"
+          }
+        }
+      },
       "Plane": {
         "type": "string",
         "description": "Origin plane. Both planes must emit; filtering is the consumer's job.",
@@ -9709,6 +10079,39 @@
               "discord",
               "firefox"
             ]
+          }
+        }
+      },
+      "PluginAccessSnapshot": {
+        "type": "object",
+        "description": "What an API read returns for one plugin: its entry plus its pending rows.",
+        "required": [
+          "plugin",
+          "grants",
+          "pending",
+          "denied"
+        ],
+        "properties": {
+          "denied": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Grant"
+            }
+          },
+          "pending": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PendingRequest"
+            }
+          },
+          "plugin": {
+            "type": "string"
           }
         }
       },
@@ -11981,6 +12384,10 @@
     {
       "name": "plugins",
       "description": "Plugin directory: running `punktfunk-plugin-*` processes register a lease and, optionally, a loopback UI the web console proxies and adds to its nav"
+    },
+    {
+      "name": "plugin-access",
+      "description": "Plugin folder access: a plugin requests a directory (its own token), the operator grants or denies it (admin lane only)"
     },
     {
       "name": "store",

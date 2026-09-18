@@ -37,6 +37,7 @@ mod hooks;
 mod host;
 mod library;
 mod native;
+mod plugin_access;
 mod plugins;
 mod session;
 mod settings;
@@ -164,6 +165,8 @@ pub(crate) struct MgmtState {
     /// Per-plugin tokens by id ([`Options::plugin_tokens`]). A match also stamps
     /// [`auth::PluginIdentity`], which is what the id-scoped routes check.
     pub(crate) plugin_tokens: std::collections::BTreeMap<String, String>,
+    /// Folder grants, denials, and pending requests — the `/plugin-access` routes' store.
+    access: Arc<crate::plugins::access::AccessStore>,
     /// Bound port, echoed in [`PortMap`].
     port: u16,
     /// Live device challenges and the tokens they became. See [`mgmt::device_auth`].
@@ -233,6 +236,7 @@ pub async fn run(
         native,
         stats,
         crate::client_logs::default_dir(),
+        pf_paths::config_dir(),
         gamestream_enabled,
         identity_fingerprint,
         browser_plane,
@@ -252,6 +256,8 @@ fn app(
     stats: Arc<crate::stats_recorder::StatsRecorder>,
     // Injected so handler tests use a temp dir, not the real config dir.
     client_logs_dir: std::path::PathBuf,
+    // Where `plugin-grants.json` / `plugin-access-pending.json` live; injected for the same reason.
+    access_config_dir: std::path::PathBuf,
     gamestream_enabled: bool,
     identity_fingerprint: Option<[u8; 32]>,
     // Whether the WebTransport plane is running. State only for `cors::enabled`, so it is not
@@ -270,6 +276,7 @@ fn app(
         port,
         device_auth: device_auth::DeviceAuth::default(),
         identity_fingerprint,
+        access: Arc::new(crate::plugins::access::AccessStore::open(access_config_dir)),
     });
     let (api_routes, api) = api_router_parts();
     let routed = api_routes.route_layer(middleware::from_fn_with_state(
@@ -434,6 +441,14 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         .routes(routes!(plugins::register_plugin, plugins::delete_plugin))
         .routes(routes!(plugins::get_ui_credential))
         .routes(routes!(plugins::ingest_plugin_logs))
+        // GET and POST share the path — one `routes!` (same-path merge). The plugin lane
+        // reaches these two only; the overview and the decision stay admin by allowlist.
+        .routes(routes!(
+            plugin_access::get_plugin_access_requests,
+            plugin_access::request_plugin_access
+        ))
+        .routes(routes!(plugin_access::get_plugin_access))
+        .routes(routes!(plugin_access::decide_plugin_access))
         .routes(routes!(store::get_catalog))
         .routes(routes!(store::refresh_catalog))
         .routes(routes!(store::list_installed))
@@ -488,6 +503,7 @@ pub fn openapi_json() -> String {
         (name = "events", description = "Host lifecycle events: an SSE stream (client/session/stream lifecycle, pairing, displays, library, host) with Last-Event-ID resume and server-side kind filters"),
         (name = "hooks", description = "Operator hooks: commands and webhooks fired on lifecycle events (fire-and-forget — hooks observe, never veto)"),
         (name = "plugins", description = "Plugin directory: running `punktfunk-plugin-*` processes register a lease and, optionally, a loopback UI the web console proxies and adds to its nav"),
+        (name = "plugin-access", description = "Plugin folder access: a plugin requests a directory (its own token), the operator grants or denies it (admin lane only)"),
         (name = "store", description = "Plugin store: browse signed catalogs (verified first-party entries, attributed third-party sources), install/uninstall as tracked jobs, and switch the plugin runner on"),
         (name = "update", description = "Host update check: install kind + channel, the last verified release manifest, and whether a newer host exists (admin lane only)"),
         (name = "actions", description = "Host actions: discover what this host offers (per-caller availability + permission) and invoke one by id — v1: sleep, restart, shut down the machine, gated per device by the Host power grant"),
