@@ -1143,24 +1143,6 @@ object SkiaConsole {
         }
     }
 
-    /** One poster: the candidates in order, first success wins. */
-    private fun fetchArt(candidates: List<String>, client: OkHttpClient, offline: Boolean): ByteArray? {
-        for (url in candidates) {
-            val req = Request.Builder().url(url)
-            // With the host down the cache is the only answer there is. Left to itself OkHttp
-            // honours the proxy's `max-age`, goes to revalidate once it lapses, fails to
-            // connect, and reports a miss on bytes that are sitting on disk.
-            if (offline) req.cacheControl(CacheControl.FORCE_CACHE)
-            val bytes = runCatching {
-                client.newCall(req.build()).execute().use { resp ->
-                    if (resp.code == 200) resp.body?.bytes()?.takeIf { it.isNotEmpty() && it.size <= 16 shl 20 } else null
-                }
-            }.getOrNull()
-            if (bytes != null) return bytes
-        }
-        return null
-    }
-
     /** The no-PIN request-access park (≥ the host's approval window) — ConnectScreen's figure. */
     private const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
 
@@ -1175,4 +1157,25 @@ object SkiaConsole {
     /** How long a host's running title stays fresh — `pf_client_core::library::RUNNING_TTL`.
      *  Short: this is the one host fact that changes while somebody is looking at the tile. */
     private const val NOW_PLAYING_TTL_MS = 20_000L
+}
+
+/**
+ * One poster: the candidates in order, first success wins. Any failure, a malformed URL
+ * included, moves on to the next candidate; none left is no cover.
+ */
+internal fun fetchArt(candidates: List<String>, client: OkHttpClient, offline: Boolean): ByteArray? {
+    for (url in candidates) {
+        val bytes = runCatching {
+            val req = Request.Builder().url(url)
+            // With the host down the cache is the only answer there is. Left to itself OkHttp
+            // honours the proxy's `max-age`, goes to revalidate once it lapses, fails to
+            // connect, and reports a miss on bytes that are sitting on disk.
+            if (offline) req.cacheControl(CacheControl.FORCE_CACHE)
+            client.newCall(req.build()).execute().use { resp ->
+                if (resp.code == 200) resp.body?.bytes()?.takeIf { it.isNotEmpty() && it.size <= 16 shl 20 } else null
+            }
+        }.getOrNull()
+        if (bytes != null) return bytes
+    }
+    return null
 }
