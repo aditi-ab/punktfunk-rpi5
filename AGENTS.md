@@ -65,6 +65,12 @@ Do not add a player-facing setting without the maintainer's yes. First make it a
 the OS, or fix the detection. Automatic means automatic; never override what the player picked.
 Rules and examples: `docs/settings.md`.
 
+## Feature requests
+
+New features do not belong on `git.unom.io`. Discuss a feature, a design proposal or a
+"which way should this go" question with the maintainer first — no issue, no PR. The tracker
+holds bugs and work the maintainer has already agreed to.
+
 ## Agent skills
 
 Project SKILL.md files live in `.agents/skills/`. A harness that only
