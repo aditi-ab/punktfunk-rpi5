@@ -67,7 +67,8 @@ shape() {
 # of it — so an overshoot costs packets within a few ms, never a queue that grows.
 police() {
   local ns=$1 dev=$2 kbit=$3
-  local burst=$(( kbit * BUFFER_MS / 8 ))
+  local burst=$(( POLICE_BURST_KB * 1024 ))
+  if [ "$burst" = 0 ]; then burst=$(( kbit * BUFFER_MS / 8 )); fi
   ip netns exec "$ns" tc qdisc add dev "$dev" root netem \
     delay "${DELAY_MS}ms" limit 10000
   ip netns exec "$ns" tc qdisc add dev "$dev" handle ffff: ingress
@@ -88,7 +89,7 @@ ip -n h link set vh up; ip -n h link set lo up
 ip -n c link set vc up; ip -n c link set lo up
 
 if [ "$POLICE_KBIT" != 0 ]; then
-  say "policing ${POLICE_KBIT}kbit, ${DELAY_MS}ms, ${BUFFER_MS}ms burst, drop over (no queue)"
+  say "policing ${POLICE_KBIT}kbit, ${DELAY_MS}ms, burst ${POLICE_BURST_KB}KiB (0 = ${BUFFER_MS}ms), drop over (no queue)"
   police h vh "$POLICE_KBIT"
   police c vc "$POLICE_KBIT"
 else
