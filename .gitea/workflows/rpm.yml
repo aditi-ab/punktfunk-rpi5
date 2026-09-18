@@ -188,7 +188,7 @@ jobs:
           #
           # A PINNED release asset, checked by SHA-256 — never `curl https://bun.sh/install | bash`.
           # This job holds RPM_GPG_PRIVATE_KEY, and the spec VENDORS this very binary into
-          # punktfunk-web, so an install script piped into root's shell is upstream code running in
+          # punktfunk-bun, so an install script piped into root's shell is upstream code running in
           # front of the signing key AND choosing bytes we then sign. Same discipline as
           # windows-host.yml's bun pin. Bump BUN_VER and BUN_SHA together (the sums are published in
           # the release's SHASUMS256.txt). `-baseline` on purpose: it needs no AVX2, so the bun we
@@ -275,8 +275,8 @@ jobs:
 
       - name: Build RPM
         # PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1 → also build the punktfunk-web console + the
-        # punktfunk-scripting runner subpackages (the publish loop globs them in; the host RPM
-        # Recommends both). Both need bun (ensured in Prep).
+        # punktfunk-scripting runner subpackages, and punktfunk-bun, the runtime both require (the
+        # publish loop globs them in; the host RPM Recommends both). Bun is ensured in Prep.
         run: |
           PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" \
             PF_RPM_TOPDIR=/tmp/pf-rpmbuild \
@@ -480,7 +480,8 @@ jobs:
             "${gs[@]}" \
             dist/punktfunk-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
             dist/punktfunk-web-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
-            dist/punktfunk-scripting-"${PF_VERSION}-${PF_RELEASE}"*.rpm
+            dist/punktfunk-scripting-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
+            dist/punktfunk-bun-"${PF_VERSION}-${PF_RELEASE}"*.rpm
 
       # Read the capability matrix back OUT of the image that is about to be published — the one
       # channel where getting it wrong is unrepairable, because a merged sysext's /usr is read-only
