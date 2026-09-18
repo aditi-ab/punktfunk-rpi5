@@ -408,7 +408,8 @@ jobs:
       # Publish BEFORE the Play upload so artifacts land even while the Play step is still failing.
       # Generic registry is public for reads — matches windows-client.yml / deb.yml (REGISTRY_TOKEN, user enricobuehler).
       # main = canary store + `canary/` sideload alias; a `vX.Y.Z` tag = `latest/` alias + attached
-      # to the unified Gitea Release.
+      # to the unified Gitea Release. The native symbols share each APK's version, so the cleanup
+      # rules keep them exactly as long.
       - name: Publish to generic registry + attach to Gitea release
         if: >-
           (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == 'true'))
@@ -423,23 +424,28 @@ jobs:
         run: |
           AAB=clients/android/app/build/outputs/bundle/release/app-release.aab
           APK=clients/android/app/build/outputs/apk/release/app-release.apk
+          SYMS=clients/android/app/build/outputs/native-debug-symbols/release/native-debug-symbols.zip
           base="https://$REGISTRY/api/packages/$OWNER/generic/$PKG"
           # 1) immutable, run-number-versioned store (sideload + provenance)
           curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$AAB" "$base/$VERSION/punktfunk-android-r$VERSION.aab"
           curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$APK" "$base/$VERSION/punktfunk-android-r$VERSION.apk"
+          curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$SYMS" "$base/$VERSION/punktfunk-android-r$VERSION-native-symbols.zip"
           echo "published store version $VERSION (versionCode)"
           # 2) channel alias for a predictable sideload URL: stable -> latest/, canary -> canary/
           case "$GITHUB_REF" in refs/tags/v*) ALIAS=latest ;; *) ALIAS=canary ;; esac
           curl -fsS -o /dev/null --user "enricobuehler:$REGISTRY_TOKEN" -X DELETE "$base/$ALIAS/punktfunk-android.apk" || true
           curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$APK" "$base/$ALIAS/punktfunk-android.apk"
+          curl -fsS -o /dev/null --user "enricobuehler:$REGISTRY_TOKEN" -X DELETE "$base/$ALIAS/punktfunk-android-native-symbols.zip" || true
+          curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$SYMS" "$base/$ALIAS/punktfunk-android-native-symbols.zip"
           echo "sideload alias: $base/$ALIAS/punktfunk-android.apk"
-          # 3) on a real release, attach the .aab + .apk to the unified Gitea Release (X.Y.Z names)
+          # 3) on a real release, attach the .aab + .apk + symbols to the unified Gitea Release (X.Y.Z names)
           case "$GITHUB_REF" in
             refs/tags/v*)
               . scripts/ci/gitea-release.sh
               RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
               upsert_asset "$RID" "$AAB" "punktfunk-${VERSION_NAME}.aab"
               upsert_asset "$RID" "$APK" "punktfunk-${VERSION_NAME}.apk"
+              upsert_asset "$RID" "$SYMS" "punktfunk-${VERSION_NAME}-android-native-symbols.zip"
               ;;
           esac
 
