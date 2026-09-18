@@ -25,11 +25,13 @@ bun build src/runner-cli.ts --target=bun --outfile /runner.js >/dev/null || { ec
 export HOME=/root
 CFG=$HOME/.config/punktfunk
 P=$CFG/plugins/node_modules/punktfunk-plugin-probe
-mkdir -p "$P" "$HOME/.ssh" "$HOME/steamlike"
+mkdir -p "$P" "$HOME/.ssh" "$HOME/steamlike" "$HOME/granted"
 echo "secret-admin-token"  > "$CFG/mgmt-token"
 echo "private key"         > "$HOME/.ssh/id_ed25519"
 echo "library-data"        > "$HOME/steamlike/marker"
+echo "granted-data"        > "$HOME/granted/marker"
 echo '{"probe":"testtoken"}' > "$CFG/plugin-tokens.json"
+printf '{"probe":["/root/granted"]}' > "$CFG/plugin-grants.json"
 printf '{"dependencies":{"punktfunk-plugin-probe":"*"}}' > "$CFG/plugins/package.json"
 printf '{"name":"punktfunk-plugin-probe","version":"1.0.0","main":"index.js","punktfunk":{"schema":1,"id":"probe","reads":["~/steamlike"]}}' > "$P/package.json"
 
@@ -45,6 +47,8 @@ o.push(say("mgmt", gone(() => fs.readFileSync("/root/.config/punktfunk/mgmt-toke
 o.push(say("ssh", gone(() => fs.readFileSync("/root/.ssh/id_ed25519", "utf8"))));
 o.push(say("declared", (() => { try { return fs.readFileSync(home + "/steamlike/marker", "utf8").trim(); } catch { return "UNREACHABLE"; } })()));
 o.push(say("declared_ro", (() => { try { fs.writeFileSync(home + "/steamlike/w", "x"); return "WRITABLE"; } catch { return "readonly"; } })()));
+o.push(say("granted", (() => { try { return fs.readFileSync(home + "/granted/marker", "utf8").trim(); } catch { return "UNREACHABLE"; } })()));
+o.push(say("granted_write", (() => { try { fs.writeFileSync(home + "/granted/w", "x"); return "WRITABLE"; } catch (e) { return e.code; } })()));
 o.push(say("state", (() => { try { fs.writeFileSync("/run/punktfunk/plugin-state/w", "x"); return "writable"; } catch { return "UNWRITABLE"; } })()));
 o.push(say("owntoken", (() => { try { fs.readFileSync("/run/punktfunk/plugin-token", "utf8"); return "present"; } catch { return "MISSING"; } })()));
 o.push(say("procs", fs.readdirSync("/proc").filter((d) => /^\d+$/.test(d)).length));
@@ -74,6 +78,8 @@ want "the admin token is not there"      mgmt        blocked
 want "~/.ssh is not there"               ssh         blocked
 want "the declared root IS there"        declared    library-data
 want "the declared root is READ-ONLY"    declared_ro readonly
+want "the granted root IS there"         granted     granted-data
+want "the granted root is READ-ONLY"     granted_write EROFS
 want "its own state dir IS writable"     state       writable
 want "its own token IS there"            owntoken    present
 want "HOME is the real home"             homedir     /root
