@@ -98,6 +98,15 @@ const BASE_ARGV: readonly string[] = [
 	"--ro-bind-try",
 	"/etc/resolv.conf",
 	"/etc/resolv.conf",
+	// NixOS has no FHS /bin/true and no ld-linux under /usr. Store binaries (bun, the
+	// probe's `true`, glibc) live under /nix; the profile symlink lives under
+	// /run/current-system. `-try` no-ops on a distro that has neither.
+	"--ro-bind-try",
+	"/nix",
+	"/nix",
+	"--ro-bind-try",
+	"/run/current-system",
+	"/run/current-system",
 	"--symlink",
 	"usr/lib",
 	"/lib",
@@ -214,10 +223,30 @@ export const grantedRoots = (configDir: string, id: string): string[] => {
 	}
 };
 
+/** Host `true` as an absolute path. `/bin/true` is an FHS path NixOS does not have.
+ *  Do not realpath: Nix `true` is a symlink onto the coreutils multicall binary. */
+const whichTrue = (): string => {
+	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+		if (!dir) continue;
+		const candidate = path.join(dir, "true");
+		try {
+			if (fs.existsSync(candidate)) return candidate;
+		} catch {
+			/* dangling symlink */
+		}
+	}
+	return "/bin/true";
+};
+
 /** Can this box sandbox at all? The reason, when it cannot, is what the operator needs. */
 export const sandboxProbe = (
-	run: (cmd: string, args: string[]) => { status: number | null } = (cmd, args) =>
-		spawnSync(cmd, args, { stdio: "ignore" }),
+	run: (
+		cmd: string,
+		args: string[],
+	) => { status: number | null; stderr?: string } = (cmd, args) => {
+		const r = spawnSync(cmd, args, { encoding: "utf8" });
+		return { status: r.error ? null : r.status, stderr: r.stderr ?? "" };
+	},
 	platform: string = process.platform,
 ): { ok: true } | { ok: false; reason: string } => {
 	if (platform !== "linux") {
@@ -227,7 +256,7 @@ export const sandboxProbe = (
 	// sandbox-capable that then refuses every plugin.
 	// Exactly what a real sandbox asks for, plus a trivial exec. Probing a weaker set reports a
 	// box as capable that then refuses every plugin.
-	const probe = run("bwrap", [...BASE_ARGV, "/bin/true"]);
+	const probe = run("bwrap", [...BASE_ARGV, whichTrue()]);
 	if (probe.status === 0) return { ok: true };
 	if (probe.status === null) {
 		return {
@@ -236,9 +265,11 @@ export const sandboxProbe = (
 				"bubblewrap (bwrap) is not installed — install it, or set PUNKTFUNK_PLUGIN_SANDBOX=off",
 		};
 	}
+	const line = (probe.stderr ?? "").split("\n")[0]?.trim();
 	return {
 		ok: false,
 		reason:
+			line ||
 			"bwrap could not create a namespace — this kernel restricts unprivileged user namespaces",
 	};
 };

@@ -282,7 +282,7 @@ let
         && !(has appliance "punktfunk-scripting" "ProtectKernelTunables=true")
         && has appliance "punktfunk-scripting" "AF_NETLINK"
         && has appliance "punktfunk-scripting" "ProtectControlGroups=true"
-        && has appliance "punktfunk-scripting" "RestrictNamespaces=user mnt pid net ipc uts cgroup"
+        && !(has appliance "punktfunk-scripting" "RestrictNamespaces=user mnt pid net ipc uts cgroup")
         && has appliance "punktfunk-scripting" "SystemCallArchitectures=native"
         && has appliance "punktfunk-scripting" "CapabilityBoundingSet=";
     }

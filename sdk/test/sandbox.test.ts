@@ -127,11 +127,22 @@ describe("sandboxProbe", () => {
 		}, "linux");
 		expect(probed).toContain("--unshare-user");
 		expect(probed).toContain("--disable-userns");
+		expect(probed).toContain("/nix");
+		expect(probed).toContain("/run/current-system");
+		expect(probed.at(-1)).toMatch(/true$/);
 		const missing = sandboxProbe(() => ({ status: null }), "linux");
 		expect(missing.ok).toBe(false);
 		expect(!missing.ok && missing.reason).toContain("bubblewrap");
 		const denied = sandboxProbe(() => ({ status: 1 }), "linux");
 		expect(!denied.ok && denied.reason).toContain("user namespaces");
+		const execFail = sandboxProbe(
+			() => ({
+				status: 1,
+				stderr: "bwrap: execvp /bin/true: No such file or directory\n",
+			}),
+			"linux",
+		);
+		expect(!execFail.ok && execFail.reason).toContain("execvp");
 	});
 });
 

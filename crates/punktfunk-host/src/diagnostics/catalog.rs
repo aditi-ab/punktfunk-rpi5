@@ -142,6 +142,12 @@ const SANDBOX_BASE_ARGV: &[&str] = &[
     "--ro-bind-try",
     "/etc/resolv.conf",
     "/etc/resolv.conf",
+    "--ro-bind-try",
+    "/nix",
+    "/nix",
+    "--ro-bind-try",
+    "/run/current-system",
+    "/run/current-system",
     "--symlink",
     "usr/lib",
     "/lib",
@@ -159,10 +165,24 @@ const SANDBOX_BASE_ARGV: &[&str] = &[
 /// Can bwrap build the sandbox a plugin gets? `Err(None)` when bwrap is missing, else bwrap's
 /// own first stderr line.
 #[cfg(target_os = "linux")]
+fn which_true() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("true");
+            // Do not canonicalize: Nix `true` is a symlink onto the coreutils multicall binary.
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    "/bin/true".into()
+}
+
+#[cfg(target_os = "linux")]
 fn bwrap_probe() -> Result<(), Option<String>> {
     let out = Command::new("bwrap")
         .args(SANDBOX_BASE_ARGV)
-        .arg("/bin/true")
+        .arg(which_true())
         .output()
         .map_err(|_| None)?;
     if out.status.success() {

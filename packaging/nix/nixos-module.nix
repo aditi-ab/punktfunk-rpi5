@@ -572,7 +572,9 @@ in
         # is never beside the host binary and nothing lands in /usr. `environment.systemPackages`
         # covers an operator's interactive shell but NOT this unit, whose PATH is exactly this
         # list — without it the console reports a running, enabled runner as "not installed".
-        ++ optional cfg.scripting.enable cfg.scripting.package;
+        ++ optional cfg.scripting.enable cfg.scripting.package
+        # Host diagnostics exec `bwrap` on THIS unit's PATH, not the runner's.
+        ++ optional cfg.scripting.enable pkgs.bubblewrap;
         # Point the host at the WRAPPED encode worker (see `security.wrappers` above). The host's
         # own resolution order is PUNKTFUNK_ENCODE_WORKER -> alongside /proc/self/exe -> PATH, and
         # on NixOS the sibling of the store binary is the UNCAPPED store copy — it would run, and
@@ -749,7 +751,10 @@ in
     # Installs the runner + defines its opt-in `systemd --user` unit (mirrors the deb/rpm
     # punktfunk-scripting subpackage). NOT auto-started unless `scripting.autoStart` is set.
     (mkIf cfg.scripting.enable {
-      environment.systemPackages = [ cfg.scripting.package ];
+      environment.systemPackages = [
+        cfg.scripting.package
+        pkgs.bubblewrap
+      ];
 
       systemd.user.services.punktfunk-scripting = {
         description = "punktfunk plugin/script runner";
@@ -857,8 +862,9 @@ in
           # MemoryDenyWriteExecute (bun JITs), PrivateDevices (VirtualHere forwards USB), and
           # ProtectKernelTunables, which refuses bwrap a fresh /proc; the sandbox binds /proc/sys ro.
           ProtectControlGroups = true;
-          # Exactly the namespaces each plugin's bwrap sandbox is built from; `true` starts no plugin.
-          RestrictNamespaces = "user mnt pid net ipc uts cgroup";
+          # No RestrictNamespaces: on some kernels (measured: NixOS xanmod 7.2) listing
+          # `user mnt pid …` on a systemd --user unit makes bwrap --unshare-user fail with
+          # EPERM, so the runner starts no plugin. The plugin sandbox is bwrap itself.
           SystemCallArchitectures = "native";
           CapabilityBoundingSet = "";
           # AF_NETLINK brings up a sandbox's loopback; its seccomp filter keeps it from the plugin.
