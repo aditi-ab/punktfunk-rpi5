@@ -464,6 +464,65 @@ pub(super) fn wan_lift_overshoot() -> Scenario {
     }
 }
 
+/// A wall with almost no queue behind it: the overshoot the cap ladder's next
+/// rung takes shows as lost frames with the delay still flat.
+///
+/// 100 Mbps and 8 ms of buffer — a policer, or a shaper whose queue holds one
+/// 165 Hz frame. The ramp measures the wall, the cap parks under it, and each
+/// re-probe rung lifts 12.5 % until one lands over, where the link answers by
+/// dropping frame tails instead of queueing them. No loss process and no
+/// wander: the only damage here is the session's own overshoot.
+pub(super) fn wan_shallow_wall() -> Scenario {
+    Scenario {
+        name: "wan_shallow_wall",
+        seed: 0x7A_7700,
+        duration_ms: 600_000,
+        link: LinkCfg {
+            capacity: vec![(0, 100_000)],
+            buffer_ms: 8,
+            base_delay_ms: 10,
+            ..LinkCfg::default()
+        },
+        sessions: vec![tv_session(20_000, None, full())],
+        achievable_kbps: wall_respecting_kbps(100_000, 1, cap_4k165()),
+        blip_at_ms: None,
+    }
+}
+
+/// The rig's tunnel, losing one frame to a burst longer than a frame's parity.
+///
+/// The window it is for carries nothing else: the delay sits on its 10 ms
+/// floor and the wire carries 100–105 % of the target. The Gilbert-Elliott
+/// run is sized to the 14–17 frames per ten minutes the rig loses on this
+/// path — one frame every 40 s or so, rarely two together. Static capacity,
+/// so the only other event is the cap ladder asking the wall again.
+pub(super) fn wan_lone_loss() -> Scenario {
+    let mut s = wg_session();
+    // A wave answers the keyframe ask: the refresh is paid for out of the
+    // same budget, so one ask costs the wire nothing and the picture comes
+    // back on the next frame.
+    s.host.idr_pct = 100;
+    s.host.recovery_ms = 0;
+    Scenario {
+        name: "wan_lone_loss",
+        seed: 0x7A_7800,
+        duration_ms: 600_000,
+        link: LinkCfg {
+            capacity: vec![(0, 12_500)],
+            buffer_ms: 450,
+            base_delay_ms: 10,
+            loss_ppm: 7_000,
+            burst_in_ppm: 800,
+            burst_out_ppm: 990_000,
+            burst_shards: 8,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 9_375,
+        blip_at_ms: None,
+    }
+}
+
 /// The rig's Wi-Fi profile: a 237 Mbps link nothing touches, and a source that
 /// fills 78 % of whatever allowance it is given.
 ///
@@ -1214,6 +1273,8 @@ pub(super) fn all() -> Vec<Scenario> {
         wan_ramp_reads_low(),
         wan_lift_overshoot(),
         wifi_content_bound(),
+        wan_shallow_wall(),
+        wan_lone_loss(),
     ]
     .into_iter()
     // `old_host` is the host that has none of this: it stays as it is.
@@ -1814,6 +1875,57 @@ mod tests {
                 w.cut_from_kbps.unwrap_or_default()
             );
         }
+    }
+
+    /// The tunnel's lone lost frame is a lost frame and nothing else.
+    ///
+    /// The row exists for that window: the wire carries what the rate asks
+    /// for, the delay sits on its floor, and one frame is gone. Anything the
+    /// controller does with it is judged against this shape.
+    #[test]
+    fn the_tunnels_burst_costs_one_frame_and_leaves_the_link_alone() {
+        let r = run(&with_ramp(wan_lone_loss()));
+        let lone: Vec<&WindowRec> = r.windows[0]
+            .iter()
+            .filter(|w| {
+                w.dropped == 1
+                    && w.actual_kbps >= w.rate_kbps
+                    && w.delay.is_some_and(|d| d.rise_us.abs() < 5_000)
+            })
+            .collect();
+        assert!(
+            lone.len() >= 5,
+            "the row has to produce the window it is for, got {}",
+            lone.len()
+        );
+        assert!(
+            r.windows[0].iter().all(|w| w.dropped <= 1),
+            "a burst here never costs two frames in one window"
+        );
+    }
+
+    /// A wall with no queue behind it answers an overshoot with loss.
+    ///
+    /// The delay never reaches the rise threshold, so nothing but the lost
+    /// frames says the rung went too far. The session still has to come back
+    /// under the wall and stay there.
+    #[test]
+    fn a_shallow_wall_answers_the_overshoot_with_loss_and_no_queue() {
+        let sc = with_ramp(wan_shallow_wall());
+        let r = run(&sc);
+        assert!(
+            r.metrics.queue_p95_ms < 25 && r.metrics.lost_per_10min > 0,
+            "loss without a queue is the whole point: {:?}",
+            r.metrics
+        );
+        let tail = r.windows[0]
+            .iter()
+            .rev()
+            .take(8)
+            .map(|w| w.rate_kbps)
+            .max()
+            .expect("the session runs");
+        assert!(tail < 100_000, "the session ends over the wall at {tail}");
     }
 
     /// A cell that gets better: the cap it taught has to get out of the way.

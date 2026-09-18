@@ -37,6 +37,8 @@ wan_brownout	54	3	26	220	1441	0	0	1000	e0dcaf99
 wan_ramp_reads_low	0	195	4	0	37	0	0	1000	4023db7d
 wan_lift_overshoot	0	99	3	0	36	0	0	1000	55165629
 wifi_content_bound	0	3	3	0	4	0	0	1000	3320c9a6
+wan_shallow_wall	0	49	9	123	6	0	0	1000	a86df0bc
+wan_lone_loss	0	3	5	11	38	0	0	1000	47a31c74
 wifi_tv_legacy	0	20	0	0	3	0	0	1000	a510e60b
 wifi_good_legacy	0	1	0	8	2	0	0	1000	811c9dc5
 slow_start_spent_legacy	0	19	2	2	5	0	7	1000	20813fbc
