@@ -15,10 +15,8 @@
 
 use crate::error::{PunktfunkError, Result};
 use crate::input::gamepad::*;
-use crate::input::{
-    key_vk, GamepadSnapshot, InputEvent, InputKind, MAX_PADS, PRECISE_PX_PER_DETENT,
-    SCROLL_FLAG_PRECISE,
-};
+use crate::input::scroll::{ScrollEvent, ScrollPhase, ScrollSource, SCROLL_SCALE};
+use crate::input::{key_vk, GamepadSnapshot, InputEvent, InputKind, MAX_PADS};
 use crate::quic::{GRANT_KEYBOARD, GRANT_POINTER};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -336,6 +334,41 @@ struct ChordState {
 }
 
 #[derive(Clone, Default)]
+struct ControllerScrollAxis {
+    active: bool,
+    remainder: f64,
+}
+
+impl ControllerScrollAxis {
+    fn step(&mut self, axis: u32, velocity: f64, units: f64, pointer: bool) -> Option<InputEvent> {
+        if !pointer || velocity == 0.0 {
+            self.remainder = 0.0;
+            return std::mem::take(&mut self.active).then(|| {
+                scroll_event(
+                    axis,
+                    0,
+                    if pointer {
+                        ScrollPhase::End
+                    } else {
+                        ScrollPhase::Cancel
+                    },
+                )
+            });
+        }
+        let delta = take(&mut self.remainder, velocity * units);
+        if delta == 0 {
+            return None;
+        }
+        let phase = if std::mem::replace(&mut self.active, true) {
+            ScrollPhase::Update
+        } else {
+            ScrollPhase::Begin
+        };
+        Some(scroll_event(axis, delta, phase))
+    }
+}
+
+#[derive(Clone, Default)]
 struct Pad {
     on: bool,
     snap: GamepadSnapshot,
@@ -345,8 +378,10 @@ struct Pad {
     rt: bool,
     /// [`Layout::buttons`] entries down on the wire.
     out: u32,
-    /// Sub-unit carry: pointer x, y; scroll x, y.
-    rem: [f64; 4],
+    /// Sub-pixel carry for pointer x and y.
+    rem: [f64; 2],
+    /// Vertical and horizontal scroll own their phase and Q24.8 remainder.
+    scroll: [ControllerScrollAxis; 2],
     layout: Arc<Layout>,
     /// One per [`Layout::chords`] entry, same order.
     chords: Vec<ChordState>,
@@ -533,6 +568,26 @@ fn take(rem: &mut f64, v: f64) -> i32 {
     whole as i32
 }
 
+/// Normalized controller scroll: `delta` is Q24.8 DIP on wire `axis` 0 or 1.
+fn scroll_event(axis: u32, delta: i32, phase: ScrollPhase) -> InputEvent {
+    ScrollEvent {
+        source: ScrollSource::Controller,
+        phase,
+        axis,
+        delta,
+    }
+    .to_event()
+}
+
+fn tick_scroll(p: &mut Pad, dt: f64, pointer: bool, evs: &mut Vec<InputEvent>) {
+    // The fixed 1080-DIP reference keeps stream resolution out of scroll speed.
+    let units =
+        SCROLL_HEIGHTS_PER_S * p.layout.scroll * f64::from(FALLBACK_HEIGHT) * SCROLL_SCALE * dt;
+    let (sx, sy) = curve(p.snap.rs_x, p.snap.rs_y, p.layout.deadzone);
+    evs.extend(p.scroll[0].step(0, sy, units, pointer));
+    evs.extend(p.scroll[1].step(1, sx, units, pointer));
+}
+
 #[derive(Default)]
 pub(crate) struct PadMouse {
     pads: [Pad; MAX_PADS],
@@ -566,10 +621,15 @@ impl PadMouse {
     /// Release every output `pad` holds, plain and chord, and stop translating it.
     pub(crate) fn leave(&mut self, pad: usize) -> Vec<InputEvent> {
         let p = std::mem::take(&mut self.pads[pad]);
-        let mut evs: Vec<_> = (0..p.layout.buttons.len())
-            .filter(|i| p.out & 1 << i != 0)
-            .map(|i| press(p.layout.buttons[i].1, false))
+        let mut evs: Vec<_> = (0..2u32)
+            .filter(|&a| p.scroll[a as usize].active)
+            .map(|a| scroll_event(a, 0, ScrollPhase::Cancel))
             .collect();
+        evs.extend(
+            (0..p.layout.buttons.len())
+                .filter(|i| p.out & 1 << i != 0)
+                .map(|i| press(p.layout.buttons[i].1, false)),
+        );
         for (c, st) in p.layout.chords.iter().zip(&p.chords) {
             if st.holding {
                 evs.extend(key_seq(&c.keys, false, GRANT_KEYBOARD));
@@ -613,11 +673,12 @@ impl PadMouse {
             .collect()
     }
 
-    /// True while a translated pad has a stick past the deadzone or a chord still counting.
+    /// True while a translated pad has a stick past the deadzone, a chord still counting, or a
+    /// scroll axis owing its `End`.
     pub(crate) fn ticking(&self) -> bool {
         self.pads
             .iter()
-            .any(|p| p.on && (p.deflected() || p.counting()))
+            .any(|p| p.on && (p.deflected() || p.counting() || p.scroll.iter().any(|a| a.active)))
     }
 
     /// Chord thresholds, pointer motion and scroll for `dt_s` on a `height`-pixel stream.
@@ -629,27 +690,19 @@ impl PadMouse {
         for p in self.pads.iter_mut().filter(|p| p.on) {
             evs.extend(p.advance(dt * 1000.0, grants));
             if !pointer {
+                // The grant went mid-gesture: cancel open scroll axes so the host is not left
+                // holding a live interaction, and drop the carried fractions.
+                tick_scroll(p, dt, false, &mut evs);
                 continue;
             }
-            let d = p.layout.deadzone;
             let px = POINTER_HEIGHTS_PER_S * p.layout.pointer * h * dt;
-            let units =
-                SCROLL_HEIGHTS_PER_S * p.layout.scroll * h * 120.0 / PRECISE_PX_PER_DETENT * dt;
-            let (cx, cy) = curve(p.snap.ls_x, p.snap.ls_y, d);
+            let (cx, cy) = curve(p.snap.ls_x, p.snap.ls_y, p.layout.deadzone);
             let dx = take(&mut p.rem[0], cx * px);
             let dy = take(&mut p.rem[1], -cy * px);
             if dx != 0 || dy != 0 {
                 evs.push(event(InputKind::MouseMove, 0, dx, dy, 0));
             }
-            let (sx, sy) = curve(p.snap.rs_x, p.snap.rs_y, d);
-            let vy = take(&mut p.rem[3], sy * units);
-            if vy != 0 {
-                evs.push(event(InputKind::MouseScroll, 0, vy, 0, SCROLL_FLAG_PRECISE));
-            }
-            let vx = take(&mut p.rem[2], sx * units);
-            if vx != 0 {
-                evs.push(event(InputKind::MouseScroll, 1, vx, 0, SCROLL_FLAG_PRECISE));
-            }
+            tick_scroll(p, dt, true, &mut evs);
         }
         evs
     }
@@ -659,6 +712,28 @@ impl PadMouse {
 mod tests {
     use super::*;
     use crate::quic::GRANT_ALL;
+
+    #[test]
+    fn scroll_axis_neutral_discards_fraction_without_ending_a_subunit_move() {
+        let mut axis = ControllerScrollAxis::default();
+        assert!(axis.step(0, 1.0, 0.4, true).is_none());
+        assert!(axis.step(0, 0.0, 0.4, true).is_none());
+        assert!(axis.step(0, 1.0, 0.4, true).is_none());
+        assert!(axis.step(0, 1.0, 0.4, true).is_none());
+        let start = axis.step(0, 1.0, 0.4, true).unwrap();
+        assert_eq!(
+            ScrollEvent::from_event(&start).unwrap().phase,
+            ScrollPhase::Begin
+        );
+        assert!(axis.step(0, 0.1, 0.01, true).is_none());
+        assert!(axis.active);
+        let end = axis.step(0, 0.0, 1.0, true).unwrap();
+        assert_eq!(
+            ScrollEvent::from_event(&end).unwrap().phase,
+            ScrollPhase::End
+        );
+        assert!(!axis.active);
+    }
 
     fn button(bit: u32, down: bool) -> InputEvent {
         event(InputKind::GamepadButton, bit, down as i32, 0, 0)
@@ -842,21 +917,85 @@ mod tests {
     }
 
     #[test]
-    fn right_stick_scrolls_precise_both_axes() {
+    fn right_stick_scrolls_both_axes() {
         let mut m = entered();
         m.fold(0, &axis(AXIS_RS_Y, 32767), GRANT_ALL);
         m.fold(0, &axis(AXIS_RS_X, -32767), GRANT_ALL);
         assert!(m.ticking());
         let evs = m.tick(0.01, 1000, GRANT_ALL);
         assert_eq!(evs.len(), 2);
-        // 0.3 × 1000 px/s × 12 units/px × 10 ms = 36 units at full travel; the diagonal is
-        // radial, so each axis carries 1/√2 of it.
+        // 0.3 heights/s on the fixed 1080 DIP reference → 829.44 Q24.8 per 10 ms at full
+        // travel; the diagonal is radial, so each axis carries 1/√2 of it.
+        for (i, axis) in [0u32, 1].iter().enumerate() {
+            let se = ScrollEvent::from_event(&evs[i]).unwrap();
+            assert_eq!(
+                (se.source, se.phase, se.axis),
+                (ScrollSource::Controller, ScrollPhase::Begin, *axis)
+            );
+        }
+        assert_eq!(evs[0].x, 586, "up is positive");
+        assert_eq!(evs[1].x, -586, "left is negative");
+    }
+
+    #[test]
+    fn scroll_distance_ignores_stream_height() {
+        for height in [720u32, 1080, 2160] {
+            let mut m = entered();
+            m.fold(0, &axis(AXIS_RS_Y, 32767), GRANT_ALL);
+            let evs = m.tick(0.01, height, GRANT_ALL);
+            let se = ScrollEvent::from_event(&evs[0]).unwrap();
+            assert_eq!(se.delta, 829, "height {height}");
+        }
+        // Pointer motion still scales with the negotiated height.
+        for (height, want) in [(720u32, -9i32), (2160, -27)] {
+            let mut m = entered();
+            m.fold(0, &axis(AXIS_LS_Y, 32767), GRANT_ALL);
+            let dy: i32 = m.tick(0.01, height, GRANT_ALL).iter().map(|e| e.y).sum();
+            assert_eq!(dy, want, "height {height}");
+        }
+    }
+
+    #[test]
+    fn scroll_gesture_runs_begin_update_end() {
+        let mut m = entered();
+        m.fold(0, &axis(AXIS_RS_Y, 32767), GRANT_ALL);
+        let first = m.tick(0.01, 1080, GRANT_ALL);
+        let se = ScrollEvent::from_event(&first[0]).unwrap();
         assert_eq!(
-            (evs[0].code, evs[0].x, evs[0].flags),
-            (0, 25, SCROLL_FLAG_PRECISE),
-            "up is positive"
+            (se.source, se.phase, se.axis),
+            (ScrollSource::Controller, ScrollPhase::Begin, 0)
         );
-        assert_eq!((evs[1].code, evs[1].x), (1, -25), "left is negative");
+        let next = m.tick(0.01, 1080, GRANT_ALL);
+        assert_eq!(
+            ScrollEvent::from_event(&next[0]).unwrap().phase,
+            ScrollPhase::Update
+        );
+        m.fold(0, &axis(AXIS_RS_Y, 0), GRANT_ALL);
+        assert!(m.ticking(), "the open axis still owes an End");
+        let end = m.tick(0.01, 1080, GRANT_ALL);
+        assert_eq!(end.len(), 1);
+        let se = ScrollEvent::from_event(&end[0]).unwrap();
+        assert_eq!((se.phase, se.delta), (ScrollPhase::End, 0));
+        assert!(!m.ticking());
+    }
+
+    #[test]
+    fn leave_and_grant_loss_cancel_open_scroll_axes() {
+        let mut m = entered();
+        m.fold(0, &axis(AXIS_RS_Y, 32767), GRANT_ALL);
+        m.tick(0.01, 1080, GRANT_ALL);
+        let evs = m.leave(0);
+        let se = ScrollEvent::from_event(&evs[0]).unwrap();
+        assert_eq!((se.phase, se.axis, se.delta), (ScrollPhase::Cancel, 0, 0));
+
+        let mut m = entered();
+        m.fold(0, &axis(AXIS_RS_Y, 32767), GRANT_ALL);
+        m.tick(0.01, 1080, GRANT_ALL);
+        let evs = m.tick(0.01, 1080, GRANT_KEYBOARD);
+        assert_eq!(evs.len(), 1);
+        let se = ScrollEvent::from_event(&evs[0]).unwrap();
+        assert_eq!((se.phase, se.axis, se.delta), (ScrollPhase::Cancel, 0, 0));
+        assert!(m.tick(0.01, 1080, GRANT_KEYBOARD).is_empty());
     }
 
     #[test]
@@ -1130,7 +1269,9 @@ mod tests {
         assert_eq!(dx, 108, "40 ms at twice 1350 px/s");
         let mut slow = with(r#"{"settings":{"scroll":0.5}}"#);
         slow.fold(0, &axis(AXIS_RS_Y, 32767), GRANT_ALL);
+        // Scroll prices against the fixed 1080-DIP reference, not the stream
+        // height: half of the full-travel 829 Q24.8 units.
         let vy: i32 = slow.tick(0.01, 1000, GRANT_ALL).iter().map(|e| e.x).sum();
-        assert_eq!(vy, 18, "half of 36 units");
+        assert_eq!(vy, 414, "half of 828 Q24.8 units");
     }
 }

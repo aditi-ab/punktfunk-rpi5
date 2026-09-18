@@ -16,10 +16,11 @@
 //! is relative-only; those sessions pin to capture ([`Capture::new`] `abs_ok`).
 
 use crate::keymap_sdl;
-use crate::touch::{Abs, Act, Gestures};
+use crate::touch::{Abs, Act, Gestures, TouchScrollPhase};
 use pf_client_core::trust::{MouseMode, TouchMode};
 use punktfunk_core::client::NativeClient;
-use punktfunk_core::input::{InputEvent, InputKind, SCROLL_FLAG_PRECISE};
+use punktfunk_core::input::scroll::{ScrollAccumulator, ScrollEvent, ScrollPhase, ScrollSource};
+use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::quic::{classify, GRANT_KEYBOARD, GRANT_POINTER};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -37,8 +38,21 @@ impl Act {
                 a.y,
                 ((a.w & 0xffff) << 16) | (a.h & 0xffff),
             )),
-            Act::Scroll { axis, delta } => {
-                Some((InputKind::MouseScroll, axis, delta, 0, SCROLL_FLAG_PRECISE))
+            Act::Scroll { axis, delta, phase } => {
+                let phase = match phase {
+                    TouchScrollPhase::Begin => ScrollPhase::Begin,
+                    TouchScrollPhase::Update => ScrollPhase::Update,
+                    TouchScrollPhase::End => ScrollPhase::End,
+                    TouchScrollPhase::Cancel => ScrollPhase::Cancel,
+                };
+                let ev = ScrollEvent {
+                    source: ScrollSource::Touch,
+                    phase,
+                    axis,
+                    delta,
+                }
+                .to_event();
+                Some((ev.kind, ev.code, ev.x, ev.y, ev.flags))
             }
             Act::Button { .. }
             | Act::CycleStats
@@ -72,19 +86,16 @@ pub struct Capture {
     desktop: bool,
     /// Host injector accepts `MouseMoveAbs` (any compositor but gamescope).
     abs_ok: bool,
-    /// Fractional remainder per axis in 120-unit WHEEL_DELTA space — precision
-    /// surfaces deliver sub-unit deltas; truncating each event drops the tail.
-    scroll_acc: (f64, f64),
-    /// This mouse has reported a sub-detent delta, so it MEASURES distance (trackpad, high-res
-    /// wheel) rather than counting clicks. SDL exposes no scroll source and a notched wheel
-    /// reports exactly ±1.0, so the fraction is the only tell. Latched: one exact 1.0 mid-gesture
-    /// would otherwise inject a whole detent and jump the page.
-    precise_wheel: bool,
+    /// SDL wheel quantization — SDL reports detents with no source or phase, so
+    /// the fallback rides as `Unknown` v120.
+    scroll_acc: ScrollAccumulator,
+    /// Scroll axes a native capture path (`wayland_scroll`) has open, so a
+    /// capture release can cancel them.
+    scroll_axes: [Option<ScrollSource>; 2],
     /// SDL finger id → compact host slot (`TouchDown`). SDL ids are opaque and
     /// large; slots reuse after up, flush on release. [`TouchMode::Touch`] only.
     touch_slots: HashMap<u64, u32>,
     touch_mode: TouchMode,
-    invert_scroll: bool,
     gestures: Gestures,
     /// Session access mask. `send` uses the same [`classify`] as the host filter
     /// so a new `InputKind` cannot slip one side. Live via [`Capture::set_grants`].
@@ -117,7 +128,8 @@ fn send(
 
 impl Capture {
     /// Without `abs_ok` the desktop model is unavailable and `mouse_mode`
-    /// silently resolves to capture.
+    /// silently resolves to capture. `invert_scroll` seeds the live core
+    /// setting; [`NativeClient::set_invert_scroll`] changes it later.
     pub fn new(
         connector: Arc<NativeClient>,
         touch_mode: TouchMode,
@@ -126,6 +138,7 @@ impl Capture {
         abs_ok: bool,
         grants: u32,
     ) -> Capture {
+        connector.set_invert_scroll(invert_scroll);
         Capture {
             connector,
             captured: false,
@@ -136,14 +149,18 @@ impl Capture {
             pending_abs: None,
             desktop: abs_ok && mouse_mode == MouseMode::Desktop,
             abs_ok,
-            scroll_acc: (0.0, 0.0),
-            precise_wheel: false,
+            scroll_acc: ScrollAccumulator::new(),
+            scroll_axes: [None; 2],
             touch_slots: HashMap::new(),
             touch_mode,
-            invert_scroll,
-            gestures: Gestures::new(touch_mode == TouchMode::Trackpad, invert_scroll),
+            gestures: Gestures::new(touch_mode == TouchMode::Trackpad),
             grants,
         }
+    }
+
+    /// Physical px per DIP for gesture ballistics — the window's display scale.
+    pub fn set_touch_density(&mut self, pixels_per_dip: f32) {
+        self.gestures.set_density(pixels_per_dip);
     }
 
     pub fn captured(&self) -> bool {
@@ -169,44 +186,14 @@ impl Capture {
         }
         let lost = self.grants & !grants;
         if lost & GRANT_KEYBOARD != 0 {
-            for vk in self.held_keys.drain() {
-                send(
-                    &self.connector,
-                    self.grants,
-                    InputKind::KeyUp,
-                    vk as u32,
-                    0,
-                    0,
-                    0,
-                );
-            }
+            self.release_keys();
         }
         if lost & GRANT_POINTER != 0 {
             self.pending_rel = (0, 0);
             self.pending_abs = None;
-            for b in self.held_buttons.drain() {
-                send(
-                    &self.connector,
-                    self.grants,
-                    InputKind::MouseButtonUp,
-                    b,
-                    0,
-                    0,
-                    0,
-                );
-            }
-            for slot in self.touch_slots.drain().map(|(_, slot)| slot) {
-                send(
-                    &self.connector,
-                    self.grants,
-                    InputKind::TouchUp,
-                    slot,
-                    0,
-                    0,
-                    0,
-                );
-            }
-            self.gestures.reset();
+            self.release_contacts();
+            self.reset_touch_gestures();
+            self.cancel_scroll_axes();
         }
         self.grants = grants;
     }
@@ -260,6 +247,13 @@ impl Capture {
     /// overlay that starts eating events needs this WITHOUT releasing the pointer, and a
     /// press whose release never reaches the host stays down there forever.
     pub fn flush_held(&mut self) {
+        self.release_keys();
+        self.release_contacts();
+        self.reset_touch_gestures();
+        self.cancel_scroll_axes();
+    }
+
+    fn release_keys(&mut self) {
         for vk in self.held_keys.drain() {
             send(
                 &self.connector,
@@ -271,12 +265,15 @@ impl Capture {
                 0,
             );
         }
-        for b in self.held_buttons.drain() {
+    }
+
+    fn release_contacts(&mut self) {
+        for button in self.held_buttons.drain() {
             send(
                 &self.connector,
                 self.grants,
                 InputKind::MouseButtonUp,
-                b,
+                button,
                 0,
                 0,
                 0,
@@ -293,8 +290,39 @@ impl Capture {
                 0,
             );
         }
-        // Tap-drag's left button went out via `held_buttons`; only forget state.
-        self.gestures.reset();
+    }
+
+    fn reset_touch_gestures(&mut self) {
+        // Held buttons release separately; reset emits only the gesture's owed scroll cancels.
+        for act in self.gestures.reset() {
+            self.apply_touch_act(act);
+        }
+    }
+
+    /// Close scroll axes a native capture path left open. Runs before the local
+    /// state drops so the host's interaction never dangles.
+    fn cancel_scroll_axes(&mut self) {
+        self.scroll_acc = ScrollAccumulator::new();
+        for (axis, source) in self.scroll_axes.iter_mut().enumerate() {
+            if let Some(source) = source.take() {
+                let ev = ScrollEvent {
+                    source,
+                    phase: ScrollPhase::Cancel,
+                    axis: axis as u32,
+                    delta: 0,
+                }
+                .to_event();
+                send(
+                    &self.connector,
+                    self.grants,
+                    ev.kind,
+                    ev.code,
+                    ev.x,
+                    ev.y,
+                    ev.flags,
+                );
+            }
+        }
     }
 
     /// Flush held keys/buttons/touches as ups. `by_user` (the chord) stays
@@ -430,52 +458,54 @@ impl Capture {
         }
     }
 
-    /// Wire units are WHEEL_DELTA (120), positive = up / right — same as SDL3.
-    /// Fractional remainder per axis; truncating each event drops the tail. A sub-detent delta
-    /// latches `precise_wheel`, telling the host to scroll the measured distance rather than
-    /// pricing every 10 px as a wheel click.
+    /// SDL wheel fallback: detents with no source or phase, so `Unknown` v120 —
+    /// the wire rule gives the host one honest reading. The fractional tail
+    /// rides the accumulator; truncating each event would drop it. On Wayland
+    /// the native pointer path supersedes this — `run` stops routing wheel
+    /// events here once `WaylandScroll` is live.
     pub fn on_wheel(&mut self, dx: f32, dy: f32) {
         if !self.captured {
             return;
         }
-        self.precise_wheel |= dx.fract() != 0.0 || dy.fract() != 0.0;
-        let flags = if self.precise_wheel {
-            SCROLL_FLAG_PRECISE
-        } else {
-            0
-        };
         self.flush_motion(); // scroll happens at the latest cursor position
-        let sign = if self.invert_scroll { -1.0 } else { 1.0 };
-        let (mut ax, mut ay) = self.scroll_acc;
-        ay += f64::from(dy) * 120.0 * sign;
-        ax += f64::from(dx) * 120.0 * sign;
-        let vy = ay.trunc() as i32;
-        if vy != 0 {
-            ay -= f64::from(vy);
+        for ev in crate::scroll::sdl_wheel(&mut self.scroll_acc, dx, dy) {
             send(
                 &self.connector,
                 self.grants,
-                InputKind::MouseScroll,
-                0,
-                vy,
-                0,
-                flags,
+                ev.kind,
+                ev.code,
+                ev.x,
+                ev.y,
+                ev.flags,
             );
         }
-        let vx = ax.trunc() as i32;
-        if vx != 0 {
-            ax -= f64::from(vx);
-            send(
-                &self.connector,
-                self.grants,
-                InputKind::MouseScroll,
-                1,
-                vx,
-                0,
-                flags,
-            );
+    }
+
+    /// An already-normalized scroll event from a native capture path
+    /// (`wayland_scroll`). Dropped while uncaptured — nothing replays on
+    /// re-engage. Open axes are tracked so `release`/`flush_held` can close them.
+    pub fn on_scroll(&mut self, ev: InputEvent) {
+        let Some(se) = ScrollEvent::from_event(&ev) else {
+            return;
+        };
+        if !self.captured {
+            return;
         }
-        self.scroll_acc = (ax, ay);
+        self.flush_motion();
+        self.scroll_axes[se.axis as usize] = if se.is_stop() || se.is_wheel() {
+            None
+        } else {
+            Some(se.source)
+        };
+        send(
+            &self.connector,
+            self.grants,
+            ev.kind,
+            ev.code,
+            ev.x,
+            ev.y,
+            ev.flags,
+        );
     }
 
     fn touch_slot(&mut self, finger_id: u64) -> u32 {
@@ -593,30 +623,10 @@ impl Capture {
     /// Mid-stream model switch. Flush held buttons/touches first — a drag
     /// must not survive — then restart the gesture engine.
     pub fn set_touch_mode(&mut self, mode: TouchMode) {
-        for b in self.held_buttons.drain() {
-            send(
-                &self.connector,
-                self.grants,
-                InputKind::MouseButtonUp,
-                b,
-                0,
-                0,
-                0,
-            );
-        }
-        for (_, slot) in self.touch_slots.drain() {
-            send(
-                &self.connector,
-                self.grants,
-                InputKind::TouchUp,
-                slot,
-                0,
-                0,
-                0,
-            );
-        }
+        self.release_contacts();
+        self.reset_touch_gestures();
         self.touch_mode = mode;
-        self.gestures = Gestures::new(mode == TouchMode::Trackpad, self.invert_scroll);
+        self.gestures = Gestures::new(mode == TouchMode::Trackpad);
     }
 
     /// Down in order, up in reverse so modifiers stay held until the last key.

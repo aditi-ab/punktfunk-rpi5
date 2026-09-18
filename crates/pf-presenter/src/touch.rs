@@ -23,9 +23,8 @@ const TAP_SLOP: f32 = 12.0;
 const TAP_DRAG_MS: f64 = 250.0;
 /// ms of a still single finger: press left and hold until lift.
 const LONG_PRESS_MS: f64 = 500.0;
-/// Precise wheel units per px of two-finger pan: the wheel path's 120 per 10 px, which the
-/// host's `PRECISE_PX_PER_DETENT` undoes, so the content travels with the fingers.
-const SCROLL_UNITS_PER_PX: f32 = 12.0;
+/// Q24.8 wire units per DIP of two-finger pan — `delta` is DIP × 256.
+const SCROLL_UNITS_PER_DIP: f32 = 256.0;
 /// Degrees of two-finger twist before the quick-action ring arms. Natural scrolls
 /// rotate a few degrees; much below 8° two-finger scrolling gets flaky.
 const DIAL_ARM_DEG: f32 = 10.0;
@@ -63,6 +62,17 @@ pub struct Abs {
     pub h: u32,
 }
 
+/// Scroll-axis lifecycle carried by [`Act::Scroll`]. A nonzero delta opens its
+/// axis with `Begin` and continues as `Update`; `End` and `Cancel` close it and
+/// always carry `delta` 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchScrollPhase {
+    Begin,
+    Update,
+    End,
+    Cancel,
+}
+
 /// Wire intent. `Capture` in `input.rs` sends each one and folds `CycleStats` back
 /// to the run loop; the `InputKind` translation lives there so this crate stays
 /// free of core.
@@ -78,10 +88,12 @@ pub enum Act {
         gs: u32,
         down: bool,
     },
-    /// `axis` 0 = vertical, 1 = horizontal; `delta` in precise WHEEL(120) units.
+    /// `axis` 0 = vertical, 1 = horizontal; `delta` is Q24.8 DIP (256 per DIP),
+    /// finger-up / finger-right positive.
     Scroll {
         axis: u32,
         delta: i32,
+        phase: TouchScrollPhase,
     },
     /// Three-finger tap. The run loop owns the overlay tier.
     CycleStats,
@@ -114,9 +126,9 @@ struct Dial {
 /// Fed only direct touchscreen fingers.
 pub struct Gestures {
     trackpad: bool,
-    /// `-1` when invert-scroll is on. Applied where the scroll is made, matching the
-    /// twins and the wheel path.
-    scroll_sign: i32,
+    /// Physical px per DIP — the window's display scale. Scroll distance is
+    /// measured in DIP so the host's pricing never depends on the panel.
+    density: f32,
     /// Live fingers → window px. A move event carries only the finger that changed.
     positions: HashMap<u64, (f32, f32)>,
     /// Live fingers → last-event time (ms). The dial's same-frame test.
@@ -132,6 +144,8 @@ pub struct Gestures {
     scroll_anchor: (f32, f32),
     /// Sub-unit scroll remainder, so a slow pan is not lost to truncation.
     scroll_carry: (f32, f32),
+    /// Wire scroll axes (0 = vertical) currently inside a `Begin`…`End`.
+    scroll_axes: [bool; 2],
     /// The pair travelled past `DIAL_SLOP` unarmed: scroll for the gesture's lifetime.
     scroll_locked: bool,
     /// Units scrolled while the pair was undecided, sent back if it becomes a twist or a tap.
@@ -154,10 +168,10 @@ pub struct Gestures {
 }
 
 impl Gestures {
-    pub fn new(trackpad: bool, invert_scroll: bool) -> Gestures {
+    pub fn new(trackpad: bool) -> Gestures {
         Gestures {
             trackpad,
-            scroll_sign: if invert_scroll { -1 } else { 1 },
+            density: 1.0,
             positions: HashMap::new(),
             times: HashMap::new(),
             active: false,
@@ -168,6 +182,7 @@ impl Gestures {
             scrolling: false,
             scroll_anchor: (0.0, 0.0),
             scroll_carry: (0.0, 0.0),
+            scroll_axes: [false; 2],
             scroll_locked: false,
             provisional: (0, 0),
             dial: None,
@@ -183,6 +198,16 @@ impl Gestures {
         }
     }
 
+    /// Physical px per DIP — the window's display scale. A non-finite or
+    /// non-positive value falls back to 1 (unscaled).
+    pub fn set_density(&mut self, pixels_per_dip: f32) {
+        self.density = if pixels_per_dip.is_finite() && pixels_per_dip > 0.0 {
+            pixels_per_dip
+        } else {
+            1.0
+        };
+    }
+
     /// Pointer mode jumps the cursor to `abs` on the first finger. `t` is ms.
     pub fn down(&mut self, id: u64, wx: f32, wy: f32, abs: Abs, t: f64) -> Vec<Act> {
         let mut acts = Vec::new();
@@ -190,6 +215,9 @@ impl Gestures {
         self.positions.insert(id, (wx, wy));
         self.times.insert(id, t);
         if first {
+            // A leaked open axis (an Up the engine never saw) cancels before the
+            // new gesture starts.
+            self.close_scroll(TouchScrollPhase::Cancel, &mut acts);
             self.active = true;
             self.start = (wx, wy);
             self.down_t = t;
@@ -233,7 +261,11 @@ impl Gestures {
                     });
                 }
             }
-            n if n > 2 => acts.extend(self.end_dial(false)),
+            n if n > 2 => {
+                acts.extend(self.end_dial(false));
+                // Three or more fingers never scroll: an in-flight pair ends here.
+                self.close_scroll(TouchScrollPhase::End, &mut acts);
+            }
             _ => {}
         }
         acts
@@ -255,8 +287,10 @@ impl Gestures {
                 .dial_step(id, t)
                 .unwrap_or_else(|| self.scroll_by_centroid()),
             n if n >= 3 => {
+                let mut acts = Vec::new();
                 self.many_fingers();
-                Vec::new()
+                self.close_scroll(TouchScrollPhase::End, &mut acts);
+                acts
             }
             // One finger and never a scroll: dropping 2→1 must not jerk the cursor.
             _ if !self.scrolling => self.single_finger(id, wx, wy, abs, t),
@@ -276,6 +310,11 @@ impl Gestures {
         // back, and keep the remaining finger inert (`scrolling`) so it cannot move the
         // cursor.
         acts.extend(self.end_dial(true));
+        // A committed scroll ends when the pair breaks up. Provisional scroll is
+        // still possibly a tap — `roll_back_provisional` cancels it at the last lift.
+        if self.positions.len() < 2 && (self.moved || !self.active) {
+            self.close_scroll(TouchScrollPhase::End, &mut acts);
+        }
         if !self.positions.is_empty() || !self.active {
             return acts;
         }
@@ -337,9 +376,12 @@ impl Gestures {
         acts
     }
 
-    /// Drop in-flight state (capture release / session teardown). Never re-emits; the
-    /// owner's held-button flush releases any left button the engine was holding.
-    pub fn reset(&mut self) {
+    /// Drop in-flight state (capture release / model change). Open scroll axes come
+    /// back as `Cancel` acts — the owner sends them before dropping the gesture; the
+    /// held-button flush releases any left button the engine was holding.
+    pub fn reset(&mut self) -> Vec<Act> {
+        let mut acts = Vec::new();
+        self.close_scroll(TouchScrollPhase::Cancel, &mut acts);
         self.positions.clear();
         self.times.clear();
         self.track_id = None;
@@ -351,6 +393,7 @@ impl Gestures {
         self.moved = false;
         self.drag_held = false;
         self.last_tap_up = 0.0;
+        acts
     }
 
     /// Two-finger move. `Some` when the twist owns the gesture (scroll never runs);
@@ -445,9 +488,9 @@ impl Gestures {
         (sx / n, sy / n)
     }
 
-    /// Two fingers: scroll by centroid delta as a precise distance, never move the cursor.
+    /// Two fingers: scroll by centroid delta as a DIP distance, never move the cursor.
     /// While the pair is undecided the units are provisional (`roll_back_provisional`).
-    /// Finger-up / finger-right match host WHEEL(120).
+    /// Finger-up / finger-right are positive.
     fn scroll_by_centroid(&mut self) -> Vec<Act> {
         let (cx, cy) = self.centroid();
         if !self.scrolling {
@@ -455,7 +498,7 @@ impl Gestures {
             self.scrolling = true;
             self.scroll_anchor = self.dial.map_or((cx, cy), |d| d.anchor);
         }
-        let gain = SCROLL_UNITS_PER_PX * self.scroll_sign as f32;
+        let gain = SCROLL_UNITS_PER_DIP / self.density;
         self.scroll_carry.1 += (self.scroll_anchor.1 - cy) * gain;
         self.scroll_carry.0 += (cx - self.scroll_anchor.0) * gain;
         self.scroll_anchor = (cx, cy);
@@ -473,14 +516,55 @@ impl Gestures {
             self.scroll_locked = true;
             self.moved = true;
         }
-        scroll_acts(dx, dy)
+        self.scroll_acts(dx, dy)
     }
 
-    /// The undecided pair became a twist or a tap: send back what it scrolled.
+    /// The undecided pair became a twist or a tap: send back what it scrolled, then
+    /// cancel the axes — a rolled-back gesture never runs a kinetic tail.
     fn roll_back_provisional(&mut self) -> Vec<Act> {
         let (x, y) = std::mem::take(&mut self.provisional);
         self.scroll_carry = (0.0, 0.0);
-        scroll_acts(-x, -y)
+        let mut acts = self.scroll_acts(-x, -y);
+        self.close_scroll(TouchScrollPhase::Cancel, &mut acts);
+        acts
+    }
+
+    /// Vertical then horizontal scroll acts for a Q24.8 delta, skipping a zero axis.
+    /// The first nonzero delta opens the axis with `Begin`; later ones are `Update`.
+    fn scroll_acts(&mut self, dx: i32, dy: i32) -> Vec<Act> {
+        let mut acts = Vec::new();
+        for (axis, delta) in [(0u32, dy), (1, dx)] {
+            if delta != 0 {
+                let phase = if self.scroll_axes[axis as usize] {
+                    TouchScrollPhase::Update
+                } else {
+                    self.scroll_axes[axis as usize] = true;
+                    TouchScrollPhase::Begin
+                };
+                acts.push(Act::Scroll { axis, delta, phase });
+            }
+        }
+        acts
+    }
+
+    /// A zero-delta `End`/`Cancel` on every open scroll axis, and its sub-unit
+    /// remainder drops with it.
+    fn close_scroll(&mut self, phase: TouchScrollPhase, acts: &mut Vec<Act>) {
+        for (axis, open) in self.scroll_axes.iter_mut().enumerate() {
+            if *open {
+                *open = false;
+                if axis == 0 {
+                    self.scroll_carry.1 = 0.0;
+                } else {
+                    self.scroll_carry.0 = 0.0;
+                }
+                acts.push(Act::Scroll {
+                    axis: axis as u32,
+                    delta: 0,
+                    phase,
+                });
+            }
+        }
     }
 
     /// Three or more fingers: no scroll, no cursor. Travel past `TAP_SLOP` disqualifies
@@ -539,18 +623,6 @@ impl Gestures {
         }
         acts
     }
-}
-
-/// Vertical then horizontal scroll acts for a unit delta, skipping a zero axis.
-fn scroll_acts(dx: i32, dy: i32) -> Vec<Act> {
-    let mut acts = Vec::new();
-    if dy != 0 {
-        acts.push(Act::Scroll { axis: 0, delta: dy });
-    }
-    if dx != 0 {
-        acts.push(Act::Scroll { axis: 1, delta: dx });
-    }
-    acts
 }
 
 /// px. No finger drag moves this far in one SDL event; a leaked absolute position does.
@@ -644,7 +716,7 @@ mod tests {
 
     #[test]
     fn trackpad_tap_is_a_left_click_with_no_motion() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let mut acts = g.down(1, 50.0, 50.0, ABS, 0.0);
         acts.extend(g.up(1, 40.0));
         assert_eq!(
@@ -664,7 +736,7 @@ mod tests {
 
     #[test]
     fn pointer_tap_places_the_cursor_then_clicks() {
-        let mut g = Gestures::new(false, false);
+        let mut g = Gestures::new(false);
         let mut acts = g.down(1, 50.0, 50.0, abs_at(640, 360), 0.0);
         acts.extend(g.up(1, 40.0));
         assert_eq!(
@@ -685,7 +757,7 @@ mod tests {
 
     #[test]
     fn two_finger_tap_is_a_right_click() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let mut acts = g.down(1, 50.0, 50.0, ABS, 0.0);
         acts.extend(g.down(2, 80.0, 52.0, ABS, 5.0));
         acts.extend(g.up(1, 40.0));
@@ -707,7 +779,7 @@ mod tests {
 
     #[test]
     fn three_finger_tap_cycles_stats() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let mut acts = g.down(1, 50.0, 50.0, ABS, 0.0);
         acts.extend(g.down(2, 80.0, 50.0, ABS, 2.0));
         acts.extend(g.down(3, 110.0, 50.0, ABS, 4.0));
@@ -719,7 +791,7 @@ mod tests {
 
     #[test]
     fn trackpad_drag_emits_relative_motion() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         assert!(g.down(1, 100.0, 100.0, ABS, 0.0).is_empty());
         // 40 px in 16 ms: acceleration should exceed 1:1.
         let acts = g.motion(1, 140.0, 100.0, ABS, 16.0);
@@ -736,7 +808,7 @@ mod tests {
 
     #[test]
     fn pointer_motion_follows_the_finger_absolutely() {
-        let mut g = Gestures::new(false, false);
+        let mut g = Gestures::new(false);
         let _ = g.down(1, 100.0, 100.0, abs_at(300, 300), 0.0);
         let acts = g.motion(1, 140.0, 120.0, abs_at(360, 340), 16.0);
         assert_eq!(acts, vec![Act::MoveAbs(abs_at(360, 340))]);
@@ -744,7 +816,7 @@ mod tests {
 
     #[test]
     fn two_finger_pan_scrolls_by_the_centroid() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 120.0, 200.0, ABS, 2.0);
         // Both up 40 px: centroid up → positive (finger-up) notches.
@@ -754,33 +826,103 @@ mod tests {
         assert!(
             scrolls
                 .iter()
-                .any(|a| matches!(a, Act::Scroll { axis: 0, delta } if *delta > 0)),
+                .any(|a| matches!(a, Act::Scroll { axis: 0, delta, .. } if *delta > 0)),
             "expected an upward vertical scroll, got {scrolls:?}"
         );
     }
 
     #[test]
-    fn invert_scroll_flips_the_touch_scroll() {
-        let mut g = Gestures::new(true, true);
+    fn scroll_delta_is_dips_not_physical_px() {
+        // 2 DIP of centroid travel: at 2x that is twice the physical px — the wire
+        // delta must be identical either way.
+        for (density, finger_travel) in [(1.0f32, 4.0f32), (2.0, 8.0)] {
+            let mut g = Gestures::new(true);
+            g.set_density(density);
+            let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
+            let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
+            // One finger carries the whole pair move: finger travel is 2x centroid.
+            let acts = g.motion(1, 100.0, 200.0 - finger_travel, ABS, 10.0);
+            assert_eq!(net_scroll(&acts), (512, 0), "density {density}: {acts:?}");
+        }
+        // A bogus density falls back to unscaled rather than blowing up.
+        let mut g = Gestures::new(true);
+        g.set_density(f32::NAN);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
-        let _ = g.down(2, 120.0, 200.0, ABS, 2.0);
-        let a1 = g.motion(1, 100.0, 160.0, ABS, 10.0);
-        let a2 = g.motion(2, 120.0, 160.0, ABS, 12.0);
-        let scrolls: Vec<_> = a1.into_iter().chain(a2).collect();
-        assert!(
-            scrolls
-                .iter()
-                .any(|a| matches!(a, Act::Scroll { axis: 0, delta } if *delta < 0)),
-            "expected an inverted (negative) vertical scroll, got {scrolls:?}"
+        let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
+        let acts = g.motion(1, 100.0, 196.0, ABS, 10.0);
+        assert_eq!(net_scroll(&acts), (512, 0), "{acts:?}");
+    }
+
+    #[test]
+    fn a_pan_runs_begin_update_end_and_the_next_gesture_begins_fresh() {
+        let mut g = Gestures::new(true);
+        let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
+        let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
+        assert_eq!(
+            g.motion(1, 100.0, 198.0, ABS, 10.0),
+            vec![Act::Scroll {
+                axis: 0,
+                delta: 256,
+                phase: TouchScrollPhase::Begin,
+            }]
         );
-        assert!(!scrolls
-            .iter()
-            .any(|a| matches!(a, Act::Scroll { delta, .. } if *delta > 0)));
+        assert_eq!(
+            g.motion(2, 140.0, 198.0, ABS, 11.0),
+            vec![Act::Scroll {
+                axis: 0,
+                delta: 256,
+                phase: TouchScrollPhase::Update,
+            }]
+        );
+        // Past the tap slop the scroll is committed; small steps keep the pair
+        // vector straight — a big lone-finger move reads as a twist.
+        for step in 2..=10 {
+            let y = 200.0 - 2.0 * step as f32;
+            let _ = g.motion(1, 100.0, y, ABS, 10.0 + step as f64);
+            let _ = g.motion(2, 140.0, y, ABS, 10.0 + step as f64 + 1.0);
+        }
+        // The pair is broken up: the committed scroll ends even with no distance left.
+        assert_eq!(
+            g.up(1, 40.0),
+            vec![Act::Scroll {
+                axis: 0,
+                delta: 0,
+                phase: TouchScrollPhase::End,
+            }]
+        );
+        assert!(g.up(2, 41.0).is_empty());
+        // A fresh pair opens a fresh Begin.
+        let _ = g.down(3, 100.0, 200.0, ABS, 100.0);
+        let _ = g.down(4, 140.0, 200.0, ABS, 102.0);
+        assert_eq!(
+            g.motion(3, 100.0, 198.0, ABS, 110.0),
+            vec![Act::Scroll {
+                axis: 0,
+                delta: 256,
+                phase: TouchScrollPhase::Begin,
+            }]
+        );
+    }
+
+    #[test]
+    fn reset_cancels_open_scroll_axes() {
+        let mut g = Gestures::new(true);
+        let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
+        let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
+        let _ = g.motion(1, 100.0, 198.0, ABS, 10.0);
+        assert_eq!(
+            g.reset(),
+            vec![Act::Scroll {
+                axis: 0,
+                delta: 0,
+                phase: TouchScrollPhase::Cancel,
+            }]
+        );
     }
 
     #[test]
     fn three_finger_drag_scrolls_nothing() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 130.0, 200.0, ABS, 2.0);
         let _ = g.down(3, 160.0, 200.0, ABS, 4.0);
@@ -797,7 +939,7 @@ mod tests {
 
     #[test]
     fn tap_then_press_drag_holds_the_left_button() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let _ = g.down(1, 50.0, 50.0, ABS, 0.0);
         let click = g.up(1, 10.0);
         assert_eq!(
@@ -848,7 +990,7 @@ mod tests {
 
     #[test]
     fn a_pure_scroll_never_arms_the_dial() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
         let mut acts = Vec::new();
@@ -867,7 +1009,7 @@ mod tests {
 
     #[test]
     fn a_thirty_five_degree_twist_commits_at_the_first_sample_past_thirty() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let c = (120.0, 200.0);
         let (p1, p2) = twisted(c, 0.0);
         let _ = g.down(1, p1.0, p1.1, ABS, 0.0);
@@ -927,7 +1069,7 @@ mod tests {
 
     #[test]
     fn a_twenty_degree_twist_then_a_lift_cancels_and_sends_nothing() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let c = (120.0, 200.0);
         let (p1, p2) = twisted(c, 0.0);
         let _ = g.down(1, p1.0, p1.1, ABS, 0.0);
@@ -953,7 +1095,7 @@ mod tests {
     /// Net scroll units per axis (vertical, horizontal).
     fn net_scroll(acts: &[Act]) -> (i32, i32) {
         acts.iter().fold((0, 0), |(v, h), a| match a {
-            Act::Scroll { axis: 0, delta } => (v + delta, h),
+            Act::Scroll { axis: 0, delta, .. } => (v + delta, h),
             Act::Scroll { delta, .. } => (v, h + delta),
             _ => (v, h),
         })
@@ -961,28 +1103,36 @@ mod tests {
 
     #[test]
     fn a_pan_scrolls_from_the_first_pixel_as_a_precise_distance() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
         // 2 px up, both fingers: far under the tap slop, and it already scrolls.
         let mut acts = g.motion(1, 100.0, 198.0, ABS, 10.0);
         acts.extend(g.motion(2, 140.0, 198.0, ABS, 11.0));
-        assert_eq!(net_scroll(&acts), (24, 0), "{acts:?}");
+        assert_eq!(net_scroll(&acts), (512, 0), "{acts:?}");
         for step in 2..=10 {
             let y = 200.0 - 2.0 * step as f32;
             acts.extend(g.motion(1, 100.0, y, ABS, 10.0 * step as f64));
             acts.extend(g.motion(2, 140.0, y, ABS, 10.0 * step as f64 + 1.0));
         }
-        // 20 px of centroid travel is 240 units, every one of them sent.
-        assert_eq!(net_scroll(&acts), (240, 0), "{acts:?}");
+        // 20 px of centroid travel is 20 DIP: 5120 wire units, every one sent.
+        assert_eq!(net_scroll(&acts), (5120, 0), "{acts:?}");
         assert!(dial_acts(&acts).is_empty());
-        assert!(g.up(1, 200.0).is_empty());
+        // The committed scroll ends on the first lift; the second emits nothing.
+        assert_eq!(
+            g.up(1, 200.0),
+            vec![Act::Scroll {
+                axis: 0,
+                delta: 0,
+                phase: TouchScrollPhase::End,
+            }]
+        );
         assert!(g.up(2, 201.0).is_empty(), "a scroll is not a tap");
     }
 
     #[test]
     fn a_two_finger_tap_takes_back_its_jitter_before_the_click() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
         let mut acts = g.motion(1, 100.0, 196.0, ABS, 10.0);
@@ -992,11 +1142,27 @@ mod tests {
         assert_eq!(
             acts,
             vec![
-                Act::Scroll { axis: 0, delta: 24 },
-                Act::Scroll { axis: 0, delta: 24 },
                 Act::Scroll {
                     axis: 0,
-                    delta: -48
+                    delta: 512,
+                    phase: TouchScrollPhase::Begin,
+                },
+                Act::Scroll {
+                    axis: 0,
+                    delta: 512,
+                    phase: TouchScrollPhase::Update,
+                },
+                // The lift resolves as a tap: send back the provisional scroll on the
+                // still-open axis, then cancel it — never a kinetic tail.
+                Act::Scroll {
+                    axis: 0,
+                    delta: -1024,
+                    phase: TouchScrollPhase::Update,
+                },
+                Act::Scroll {
+                    axis: 0,
+                    delta: 0,
+                    phase: TouchScrollPhase::Cancel,
                 },
                 Act::Button {
                     gs: BTN_RIGHT,
@@ -1014,7 +1180,7 @@ mod tests {
     fn a_drifting_twist_arms_and_takes_back_its_scroll() {
         // Real fingers drift a few px per sample while turning. The drift scrolls
         // provisionally; arming the twist sends it back.
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
         let mut acts = Vec::new();
@@ -1038,7 +1204,7 @@ mod tests {
 
     #[test]
     fn a_scroll_then_a_rotation_stays_a_scroll() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let c = (120.0, 200.0);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
@@ -1056,7 +1222,7 @@ mod tests {
 
     #[test]
     fn long_press_arms_a_drag() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         assert!(g.down(1, 50.0, 50.0, ABS, 0.0).is_empty());
         assert!(g.tick(400.0).is_empty(), "under the hold time: nothing");
         assert_eq!(
@@ -1079,7 +1245,7 @@ mod tests {
 
     #[test]
     fn long_press_after_motion_or_a_second_finger_does_not_arm() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let _ = g.down(1, 50.0, 50.0, ABS, 0.0);
         let _ = g.motion(1, 90.0, 50.0, ABS, 100.0); // past the slop: a swipe, not a press
         assert!(g.tick(600.0).is_empty());
@@ -1093,7 +1259,7 @@ mod tests {
 
     #[test]
     fn reset_clears_a_drag_without_re_emitting() {
-        let mut g = Gestures::new(true, false);
+        let mut g = Gestures::new(true);
         let _ = g.down(1, 50.0, 50.0, ABS, 0.0);
         let _ = g.up(1, 5.0);
         let _ = g.down(2, 51.0, 50.0, ABS, 50.0);

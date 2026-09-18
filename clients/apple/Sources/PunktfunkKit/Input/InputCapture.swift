@@ -69,8 +69,9 @@ public final class InputCapture {
     // Main-queue-only state (see header comment).
     private var residualX: Float = 0
     private var residualY: Float = 0
-    private var residualScrollX: Float = 0
-    private var residualScrollY: Float = 0
+    /// Scroll quantization and open-axis tracking for every pointer scroll path — wheel,
+    /// trackpad, GCMouse — shared so a source switch on one axis cancels the previous source.
+    private var scrollCapture = ScrollCapture()
     private var pressedVKs: Set<UInt32> = []
     private var pressedButtons: Set<UInt32> = []
     /// One-shot: the left click that engaged capture belongs to the local UI — GC sees
@@ -119,6 +120,8 @@ public final class InputCapture {
     /// locally; while false the user is interacting with the local UI (dragging the
     /// window, clicking the HUD) and nothing is forwarded. Main-queue only.
     public private(set) var forwarding = false
+
+    public var forwardsRawWheel: Bool { forwarding && gcMouseForwarding && !mice.isEmpty }
 
     /// iPad pointer routing (the StreamViewController mirrors the scene's live pointer-lock
     /// state into this). GCMouse only delivers relative deltas + buttons while the scene is
@@ -432,12 +435,13 @@ public final class InputCapture {
         for button in pressedButtons {
             connection.send(.mouseButton(button, down: false))
         }
+        for event in scrollCapture.cancelAll() {
+            connection.send(event) // axes close BEFORE `forwarding` drops below
+        }
         pressedVKs.removeAll()
         pressedButtons.removeAll()
         residualX = 0
         residualY = 0
-        residualScrollX = 0
-        residualScrollY = 0
     }
 
     #if !os(macOS)
@@ -886,23 +890,17 @@ public final class InputCapture {
                 }
             }
         }
-        // Scroll WHEEL, tvOS only. GCMouse's scroll dpad reports raw device deltas, +y up / +x
-        // right — the host's WHEEL convention already, one unit per notch → ×120 (WHEEL_DELTA),
-        // residual-accumulated by sendScroll.
-        //
-        // iOS deliberately installs no handler here and takes ALL scroll from the stream view's
-        // pan recognizer instead — the same one that carries trackpad two-finger scrolling, which
-        // is gesture-based and never reaches GameController. That recognizer sees a plain wheel
-        // too, and unlike this raw axis its deltas already carry the system's Natural Scrolling
-        // preference, so routing everything through it is what makes the setting apply under
-        // pointer lock. Installing both would double-send every wheel notch. (macOS has its own
-        // path: StreamLayerView.scrollWheel.)
-        #if os(tvOS)
+        // Scroll WHEEL: GCMouse's dpad reports raw device deltas (+y up / +x right, one unit
+        // per notch → ×120 v120). The `gcMouseForwarding` gate keeps it silent until the
+        // scene pointer-locks — tvOS latches it for the session; on iOS it only fires while
+        // locked, where the discrete recognizer's duplicate is suppressed at the stream view.
+        // macOS takes wheel from NSEvent instead (StreamLayerView.scrollWheel).
         input.scroll.valueChangedHandler = { [weak self] _, dx, dy in
             guard let self, self.forwarding, self.gcMouseForwarding else { return }
-            self.sendScroll(dx: dx * 120, dy: dy * 120) // a real wheel: notches, not distance
+            self.sendScroll( // a real wheel: counted detents, not distance
+                dx: dx * 120, dy: dy * 120,
+                source: PUNKTFUNK_SCROLL_SOURCE_WHEEL, phase: PUNKTFUNK_SCROLL_PHASE_NONE)
         }
-        #endif
         #endif
     }
 
@@ -947,32 +945,21 @@ public final class InputCapture {
             x: x, y: y, surfaceWidth: surfaceWidth, surfaceHeight: surfaceHeight))
     }
 
-    /// Forward a scroll gesture, WHEEL_DELTA(120)-scaled (positive = up / right,
-    /// Moonlight's convention). Fed by StreamLayerView.scrollWheel — the only delivery
-    /// path that covers trackpad/Magic Mouse gestures (GCMouse never reports them).
-    /// Fractional remainders accumulate so slow two-finger scrolling isn't truncated away.
-    /// `precise` says the delta was MEASURED off such a surface rather than counted off a
-    /// notched wheel, so the host travels that distance instead of expanding each detent into
-    /// a full scroll step.
-    public func sendScroll(dx rawDx: Float, dy rawDy: Float, precise: Bool = false) {
+    /// Forward a scroll sample as normalized `InputKind::Scroll` events — positive = up /
+    /// right, `dx`/`dy` in `source`'s unit (v120 for a counted wheel, DIP for a surface's
+    /// measured distance) and `phase` the platform's gesture boundary. Fed by
+    /// StreamLayerView.scrollWheel, the iOS pan recognizers, and the GCMouse wheel. The
+    /// unsent fraction rides in `scrollCapture`; inversion happens once at the connection's
+    /// outbound seam (`setInvertScroll`), never here.
+    public func sendScroll(
+        dx: Float, dy: Float, source: PunktfunkScrollSource, phase: PunktfunkScrollPhase
+    ) {
         guard forwarding else { return }
-        // Optionally invert both axes (read live). Every POINTER scroll lands here — the macOS
-        // wheel, the iOS trackpad pan, a GCMouse wheel — so the toggle flips them consistently.
-        // The one other sink is the touch engine's two-finger scroll (`TouchMouse.scrollByCentroid`),
-        // which sends straight to the connection and reads the same setting itself. Residuals are
-        // accumulated AFTER inversion so a direction change between events doesn't strand a
-        // fractional remainder of the old sign.
-        let invert = connection.settings.invertScroll
-        let dx = invert ? -rawDx : rawDx
-        let dy = invert ? -rawDy : rawDy
-        let fy = dy + residualScrollY
-        let fx = dx + residualScrollX
-        let iy = fy.rounded(.towardZero)
-        let ix = fx.rounded(.towardZero)
-        residualScrollY = fy - iy
-        residualScrollX = fx - ix
-        if iy != 0 { connection.send(.scroll(Int32(iy), precise: precise)) }
-        if ix != 0 { connection.send(.scroll(Int32(ix), horizontal: true, precise: precise)) }
+        for event in scrollCapture.event(
+            dx: Double(dx), dy: Double(dy), source: source, phase: phase)
+        {
+            connection.send(event)
+        }
     }
 
     private func attach(keyboard: GCKeyboard) {

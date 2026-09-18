@@ -194,9 +194,10 @@ public enum DefaultsKey {
     public static let mouseMode = "punktfunk.mouseMode"
     /// Invert the scroll-wheel / two-finger-scroll direction sent to the host (both axes). Off by
     /// default: the local (natural-scrolling) sign passes through untouched. When on, the sign is
-    /// negated at the single scroll sink (`InputCapture.sendScroll`), so it flips consistently across
-    /// the macOS wheel, the iOS trackpad pan, and a GCMouse wheel. For users whose host expects the
-    /// opposite convention from their local OS preference.
+    /// negated at the connection's one outbound seam (`PunktfunkConnection.setInvertScroll`), so
+    /// it flips consistently across the macOS wheel, the iOS trackpad pan, a GCMouse wheel, and the
+    /// touch engine. For users whose host expects the opposite convention from their local OS
+    /// preference.
     public static let invertScroll = "punktfunk.invertScroll"
     /// The in-stream quick-action ring: one JSON blob parsed by `OverlayConfig.parse` (six slots,
     /// shortcuts, the virtual pad's preset). Empty = the platform default ring. Cross-client

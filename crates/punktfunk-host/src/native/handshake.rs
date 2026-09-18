@@ -705,6 +705,12 @@ pub(super) async fn negotiate(
             } else {
                 0
             }
+            // Without the bit the client converts Scroll to MouseScroll before the wire.
+            | if crate::inject::scroll_supported() {
+                punktfunk_core::quic::HOST_CAP2_SCROLL
+            } else {
+                0
+            }
             // Invites the client's `Start` extension block, which is where it names itself.
             | punktfunk_core::quic::HOST_CAP2_EXT,
     };

@@ -3747,6 +3747,7 @@ mod tests {
             InputKind::MouseMove,
             InputKind::MouseMoveAbs,
             InputKind::MouseScroll,
+            InputKind::Scroll,
             InputKind::TouchDown,
         ] {
             assert!(!admitted(GRANT_PRESET_CONTROLLER_ONLY, kind), "{kind:?}");

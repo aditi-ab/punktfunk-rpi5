@@ -59,6 +59,7 @@ enum SheetRow {
     Slot(SlotId),
     Resolution,
     Refresh,
+    ScrollInvert,
 }
 
 /// Editor: a press picks, Y lifts, A drops, a pointer carries. Centre is inert;
@@ -351,6 +352,7 @@ impl Ring {
         self.highlight.hash(&mut h);
         self.list.cursor.hash(&mut h);
         self.facts.touch_mode.hash(&mut h);
+        self.facts.invert_scroll.hash(&mut h);
         self.facts.stats_tier.hash(&mut h);
         self.facts.mic_muted.hash(&mut h);
         self.facts.pad_mouse_on.hash(&mut h);
@@ -622,6 +624,7 @@ impl Ring {
             SheetRow::Resolution,
             SheetRow::Refresh,
             SheetRow::Slot(SlotId::TouchMode),
+            SheetRow::ScrollInvert,
             SheetRow::Slot(SlotId::Keyboard),
             SheetRow::Slot(SlotId::Guide),
             SheetRow::Slot(SlotId::Qam),
@@ -662,6 +665,18 @@ impl Ring {
         match row {
             SheetRow::Resolution => RowSpec::field("Resolution", self.res_label(), ""),
             SheetRow::Refresh => RowSpec::field("Refresh", format!("{} Hz", self.facts.mode.2), ""),
+            SheetRow::ScrollInvert => {
+                let value = if !self.facts.pointer_granted {
+                    "Pointer input is not allowed"
+                } else if self.facts.invert_scroll {
+                    "On"
+                } else {
+                    "Off"
+                };
+                let mut row = RowSpec::field("Invert scroll direction", value.into(), "");
+                row.enabled = self.facts.pointer_granted;
+                row
+            }
             SheetRow::Slot(slot) => {
                 let s = self.spec(slot);
                 let value = if !s.enabled {
@@ -709,6 +724,11 @@ impl Ring {
                     refresh_hz: rhz,
                 });
             }
+            SheetRow::ScrollInvert => {
+                if self.facts.pointer_granted {
+                    self.pending.push_back(RingCommand::ToggleScrollInvert);
+                }
+            }
             SheetRow::Slot(_) => {}
         }
     }
@@ -722,7 +742,9 @@ impl Ring {
             ListMsg::Adjust(d) => self.adjust(&row, d),
             ListMsg::Activate => match &row {
                 SheetRow::Slot(slot) => self.fire(slot),
-                SheetRow::Resolution | SheetRow::Refresh => self.adjust(&row, 1),
+                SheetRow::Resolution | SheetRow::Refresh | SheetRow::ScrollInvert => {
+                    self.adjust(&row, 1)
+                }
             },
         }
     }
@@ -1469,6 +1491,42 @@ mod tests {
             mic_available: true,
             ..RingFacts::default()
         }
+    }
+
+    #[test]
+    fn scroll_inversion_sheet_tracks_live_value_and_grants() {
+        let mut r = Ring::new();
+        let mut f = RingFacts {
+            pointer_granted: true,
+            ..facts()
+        };
+        r.set_facts(&f);
+        r.input(RingInput::Toggle { x: 1.0, y: 1.0 });
+        let rows = r.sheet_rows();
+        r.list.cursor = rows
+            .iter()
+            .position(|row| *row == SheetRow::ScrollInvert)
+            .unwrap();
+        assert_eq!(
+            r.sheet_row_spec(&SheetRow::ScrollInvert).value.as_deref(),
+            Some("Off")
+        );
+        r.sheet_msg(ListMsg::Activate, &rows);
+        assert_eq!(r.take_command(), Some(RingCommand::ToggleScrollInvert));
+        let damage = r.damage();
+        f.invert_scroll = true;
+        r.set_facts(&f);
+        assert_eq!(
+            r.sheet_row_spec(&SheetRow::ScrollInvert).value.as_deref(),
+            Some("On")
+        );
+        assert_ne!(r.damage(), damage);
+        f.pointer_granted = false;
+        r.set_facts(&f);
+        assert!(!r.sheet_row_spec(&SheetRow::ScrollInvert).enabled);
+        r.sheet_msg(ListMsg::Activate, &rows);
+        r.sheet_msg(ListMsg::Adjust(1), &rows);
+        assert_eq!(r.take_command(), None);
     }
 
     #[test]

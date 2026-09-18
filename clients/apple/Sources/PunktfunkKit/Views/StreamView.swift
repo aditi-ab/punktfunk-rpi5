@@ -19,6 +19,7 @@
 #if os(macOS)
 import AppKit
 import AVFoundation
+import PunktfunkCore
 import PunktfunkShared
 import SwiftUI
 import os
@@ -396,23 +397,52 @@ public final class StreamLayerView: NSView {
 
     /// Scroll is forwarded from here, not from GCMouse: trackpad/Magic Mouse gestures
     /// never reach GameController's scroll dpad. While captured the cursor is parked
-    /// mid-view, so this view receives every scroll event. Precise (gesture) deltas are
-    /// pixels — ~0.1 wheel notch per pixel (SDL's factor) → ×12 for WHEEL_DELTA(120);
-    /// classic wheels report lines, one notch = ±1 → ×120. Signs pass through as-is,
-    /// preserving the user's local (natural-)scrolling preference. The precise flag rides
-    /// along so the host scrolls a gesture by the distance the fingers moved, instead of
-    /// reading each 10 px as a wheel click and expanding it into a full scroll step.
+    /// mid-view, so this view receives every scroll event. A notched wheel counts detents
+    /// (±1 per notch → ×120, v120); a precise surface reports distance in points — DIP on
+    /// the wire — and keeps its own `phase`/`momentumPhase` lifecycle. Signs pass through
+    /// as-is, preserving the user's local natural-scrolling preference; the connection's
+    /// outbound seam applies the Punktfunk inversion setting on top.
     public override func scrollWheel(with event: NSEvent) {
         guard captured, let inputCapture else {
             super.scrollWheel(with: event)
             return
         }
-        let precise = event.hasPreciseScrollingDeltas
-        let scale: Float = precise ? 12 : 120
+        guard let (source, phase) = Self.scrollWireShape(
+            precise: event.hasPreciseScrollingDeltas,
+            phase: event.phase, momentumPhase: event.momentumPhase) else { return }
+        let scale: Float = source == PUNKTFUNK_SCROLL_SOURCE_WHEEL ? 120 : 1
         inputCapture.sendScroll(
             dx: Float(event.scrollingDeltaX) * scale,
             dy: Float(event.scrollingDeltaY) * scale,
-            precise: precise)
+            source: source, phase: phase)
+    }
+
+    /// The wire source+phase an NSEvent scroll describes. A precise delta whose `phase` or
+    /// `momentumPhase` is set is a tracked surface — Finger, with the boundary translated
+    /// (momentum wins: its events arrive while `phase` still reads `.ended`). A precise
+    /// delta with neither is a continuous surface that can't claim finger tracking —
+    /// Continuous, no phase. A non-precise delta is a counted wheel. nil = `.mayBegin`,
+    /// the zero-length herald there is nothing to send for.
+    nonisolated static func scrollWireShape(
+        precise: Bool, phase: NSEvent.Phase, momentumPhase: NSEvent.Phase
+    ) -> (PunktfunkScrollSource, PunktfunkScrollPhase)? {
+        guard precise else {
+            return (PUNKTFUNK_SCROLL_SOURCE_WHEEL, PUNKTFUNK_SCROLL_PHASE_NONE)
+        }
+        let finger = PUNKTFUNK_SCROLL_SOURCE_FINGER
+        if momentumPhase.contains(.began) { return (finger, PUNKTFUNK_SCROLL_PHASE_MOMENTUM_BEGIN) }
+        if momentumPhase.contains(.changed) { return (finger, PUNKTFUNK_SCROLL_PHASE_MOMENTUM) }
+        if momentumPhase.contains(.ended) || momentumPhase.contains(.cancelled) {
+            return (finger, PUNKTFUNK_SCROLL_PHASE_MOMENTUM_END)
+        }
+        if phase.contains(.began) { return (finger, PUNKTFUNK_SCROLL_PHASE_BEGIN) }
+        if phase.contains(.cancelled) { return (finger, PUNKTFUNK_SCROLL_PHASE_CANCEL) }
+        if phase.contains(.ended) { return (finger, PUNKTFUNK_SCROLL_PHASE_END) }
+        if phase.contains(.changed) || phase.contains(.stationary) {
+            return (finger, PUNKTFUNK_SCROLL_PHASE_UPDATE)
+        }
+        if phase.contains(.mayBegin) { return nil }
+        return (PUNKTFUNK_SCROLL_SOURCE_CONTINUOUS, PUNKTFUNK_SCROLL_PHASE_NONE)
     }
 
     // While captured, the view is first responder and SENDS key events to the host straight

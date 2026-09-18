@@ -20,13 +20,11 @@ import kotlin.math.roundToInt
 
 // Touch-gesture tuning (px / ms). TAP_SLOP: movement under this still counts as a tap, not a drag.
 // TAP_DRAG_MS: a new touch within this long after a tap starts a left-button drag. LONG_PRESS_MS:
-// one finger held still this long presses the left button and drags until it lifts.
-// SCROLL_UNITS_PER_PX: precise wheel units per px of two-finger pan, the wheel path's 120 per
-// 10 px that the host undoes, so the content travels with the fingers.
+// one finger held still this long presses the left button and drags until it lifts. Two-finger pan
+// scrolls in DIP (Gesture.scrollPerPx), so the content travels with the fingers at any density.
 private const val TAP_SLOP = 12f
 private const val TAP_DRAG_MS = 250L
 private const val LONG_PRESS_MS = 500L
-private const val SCROLL_UNITS_PER_PX = 12f
 
 // The dial (design/touch-client-overlay.md §2.1): a two-finger TWIST opens the quick-action ring.
 // DIAL_ARM_DEG: below this rotation the gesture is still a scroll candidate — natural scrolls
@@ -203,7 +201,6 @@ internal suspend fun PointerInputScope.streamTouchInput(
     stylus: StylusStream?,
     video: () -> VideoFrame,
     trackpad: Boolean,
-    invertScroll: Boolean,
     /** The dial editor's stage: only multi-finger gestures are owned (the twist, with the real
      *  thresholds); a lone finger passes unconsumed to whatever scrolls beneath, and no click,
      *  cursor move or tap is ever synthesized. */
@@ -223,7 +220,7 @@ internal suspend fun PointerInputScope.streamTouchInput(
             abs(down.position.x - lastTapX) < TAP_SLOP && abs(down.position.y - lastTapY) < TAP_SLOP
         lastTapUp = 0L // consume the arming either way
         val g = Gesture(
-            sink, down, trackpad, invertScroll, dialOnly, size.height, onDial, onKeyboard,
+            sink, down, trackpad, density, dialOnly, size.height, onDial, onKeyboard,
         ) { video().at(size) }
         // Direct mode jumps the cursor to the finger; trackpad mode leaves it put (the
         // whole point — you nudge it with swipes instead).
@@ -271,6 +268,8 @@ internal suspend fun PointerInputScope.streamTouchInput(
                         lastTapY = down.position.y
                     }
                 }
+            } else {
+                g.endScroll() // an ordinary lift closes any open scroll axes
             }
         } finally {
             g.release() // end a held drag exactly once, teardown mid-drag included
@@ -288,14 +287,17 @@ private class Gesture(
     private val sink: TouchSink,
     down: PointerInputChange,
     private val trackpad: Boolean,
-    invertScroll: Boolean,
+    pxPerDip: Float,
     private val dialOnly: Boolean,
     private val viewHeight: Int,
     private val onDial: (DialEvent) -> Unit,
     private val onKeyboard: (show: Boolean) -> Unit,
     private val frame: () -> FrameMap,
 ) {
-    private val scrollDir = if (invertScroll) -1 else 1
+    /** Wire Q24.8 delta per scrolled pixel — DIP-priced, so denser screens scroll the same
+     *  distance. Inversion is the core's outbound seam, never a sign here. */
+    private val scrollPerPx = ScrollWire.SCALE.toFloat() /
+        (pxPerDip.takeIf { it.isFinite() && it > 0f } ?: 1f)
     private val startX = down.position.x
     private val startY = down.position.y
     private val downId = down.id
@@ -307,6 +309,8 @@ private class Gesture(
         private set
     private var scrolling = false
     private var scrollCount = 0 // pointer count the scroll centroid is anchored at
+    /** Wire scroll axes carrying an open gesture (0 = vertical, 1 = horizontal). */
+    private val scrollOpen = booleanArrayOf(false, false)
     /** The pair travelled past DIAL_SLOP unarmed: a scroll for the gesture's lifetime. */
     private var scrollLocked = false
     /** Units scrolled while the pair was undecided, sent back if it becomes a twist or a tap. */
@@ -354,7 +358,34 @@ private class Gesture(
 
     fun release() {
         if (dragHeld) sink.button(1, false)
+        scrollClose(ScrollWire.PHASE_CANCEL) // teardown never strands an open axis on the host
     }
+
+    /** One scroll delta; the first on an axis is its Begin, later ones Update. */
+    private fun scrollEmit(axis: Int, delta: Int) {
+        if (delta == 0) return
+        val phase = if (scrollOpen[axis]) {
+            ScrollWire.PHASE_UPDATE
+        } else {
+            scrollOpen[axis] = true
+            ScrollWire.PHASE_BEGIN
+        }
+        sink.scroll(axis, delta, ScrollWire.SOURCE_TOUCH, phase)
+    }
+
+    /** A zero-delta [phase] on every open axis; the axis's sub-unit remainder drops with it. */
+    private fun scrollClose(phase: Int) {
+        for (axis in 0..1) {
+            if (scrollOpen[axis]) {
+                scrollOpen[axis] = false
+                if (axis == ScrollWire.AXIS_VERTICAL) scrollAccY = 0f else scrollAccX = 0f
+                sink.scroll(axis, 0, ScrollWire.SOURCE_TOUCH, phase)
+            }
+        }
+    }
+
+    /** The gesture ended without a rollback: a zero-delta End on each open scroll axis. */
+    fun endScroll() = scrollClose(ScrollWire.PHASE_END)
 
     /** One finger, nothing moved, no drag yet: the long-press timeout is live. */
     fun awaitingLongPress() = !dialOnly && !dragHeld && !moved && maxFingers == 1
@@ -388,8 +419,13 @@ private class Gesture(
             pressed.size >= 3 -> { threeFingers(pressed); true }
             !scrolling -> { oneFinger(pressed); true }
             // Skipped once a gesture turned into a scroll, so dropping back to one finger
-            // doesn't jerk the cursor.
-            else -> true
+            // doesn't jerk the cursor. A committed scroll's axes end with the pair that drove
+            // them; a still-undecided (provisional) one stays open — the last lift decides
+            // between the tap's rollback and the closing End.
+            else -> {
+                if (scrollLocked) endScroll()
+                true
+            }
         }
     }
 
@@ -455,8 +491,8 @@ private class Gesture(
             prevCx = cx
             prevCy = cy
         }
-        scrollAccY += (prevCy - cy) * SCROLL_UNITS_PER_PX * scrollDir // finger up → wheel up
-        scrollAccX += (cx - prevCx) * SCROLL_UNITS_PER_PX * scrollDir
+        scrollAccY += (prevCy - cy) * scrollPerPx // finger up → scroll up
+        scrollAccX += (cx - prevCx) * scrollPerPx
         prevCx = cx
         prevCy = cy
         val sy = scrollAccY.toInt() // truncates toward zero → remainder kept w/ sign
@@ -471,19 +507,21 @@ private class Gesture(
             scrollLocked = true
             moved = true
         }
-        if (sy != 0) sink.scroll(0, sy, true)
-        if (sx != 0) sink.scroll(1, sx, true)
+        scrollEmit(ScrollWire.AXIS_VERTICAL, sy)
+        scrollEmit(ScrollWire.AXIS_HORIZONTAL, sx)
         return true
     }
 
-    /** The undecided pair became a twist or a tap: send back what it scrolled. */
+    /** The undecided pair became a twist or a tap: send back what it scrolled, then cancel the
+     *  axes — a rolled-back gesture never runs a kinetic tail. */
     fun rollBackProvisional() {
-        if (provisionalY != 0) sink.scroll(0, -provisionalY, true)
-        if (provisionalX != 0) sink.scroll(1, -provisionalX, true)
+        scrollEmit(ScrollWire.AXIS_VERTICAL, -provisionalY)
+        scrollEmit(ScrollWire.AXIS_HORIZONTAL, -provisionalX)
         provisionalX = 0
         provisionalY = 0
         scrollAccX = 0f
         scrollAccY = 0f
+        scrollClose(ScrollWire.PHASE_CANCEL)
     }
 
     /**
@@ -508,12 +546,14 @@ private class Gesture(
                 onKeyboard(dy < 0) // finger up → show, finger down → hide
             }
         }
-        // Leaving the scroll state stale would read the 3→2 centroid jump as a wheel notch;
-        // clearing it makes a return to two fingers re-anchor fresh. Same for the trackpad's
-        // tracked finger: its prev position froze while 3+ fingers were down, so dropping
-        // straight back to one finger must re-anchor (zero delta), not replay the phase.
+        // Three or more fingers never scroll: an in-flight pair ends here. Leaving the scroll
+        // state stale would also read the 3→2 centroid jump as a wheel notch; clearing it makes
+        // a return to two fingers re-anchor fresh. Same for the trackpad's tracked finger: its
+        // prev position froze while 3+ fingers were down, so dropping straight back to one
+        // finger must re-anchor (zero delta), not replay the phase.
         scrolling = false
         scrollCount = 0
+        endScroll()
         trackId = PointerId(Long.MIN_VALUE)
     }
 

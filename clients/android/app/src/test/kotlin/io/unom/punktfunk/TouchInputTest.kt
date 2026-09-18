@@ -34,8 +34,8 @@ class TouchInputTest {
         override fun pointerMove(dx: Int, dy: Int) { log += "move $dx $dy" }
         override fun pointerAbs(x: Int, y: Int, w: Int, h: Int) { log += "abs $x $y" }
         override fun button(button: Int, down: Boolean) { log += "btn $button ${if (down) "down" else "up"}" }
-        override fun scroll(axis: Int, delta: Int, precise: Boolean) {
-            log += "scroll $axis $delta" + if (precise) " precise" else ""
+        override fun scroll(axis: Int, delta: Int, source: Int, phase: Int) {
+            log += "scroll $axis $delta s$source p$phase"
         }
         override fun touch(id: Int, kind: Int, x: Int, y: Int, w: Int, h: Int) { log += "touch $id $kind" }
         fun buttons() = log.filter { it.startsWith("btn") }
@@ -56,7 +56,7 @@ class TouchInputTest {
                     streamTouchInput(
                         sink = sink, stylus = null,
                         video = { VideoFrame(io.unom.punktfunk.kit.VideoFit.FIT, 0, 0) },
-                        trackpad = trackpad, invertScroll = false,
+                        trackpad = trackpad,
                         onCycleStats = { stats++ }, onKeyboard = { keyboard += it }, onDial = { dial += it },
                     )
                 },
@@ -134,9 +134,17 @@ class TouchInputTest {
         }
         settle()
         assertTrue(sink.scrolls().isNotEmpty())
-        // Finger up → wheel up: positive, precise, and the whole 180 px of travel at 12 units/px.
-        assertTrue(sink.scrolls().all { it.startsWith("scroll 0 ") && it.endsWith(" precise") && it.split(" ")[2].toInt() > 0 })
-        assertEquals(2160, sink.scrolls().sumOf { it.split(" ")[2].toInt() })
+        // Finger up → scroll up: positive, Touch-sourced, and the whole 180 px of travel —
+        // 60 DIP at this density (xxhdpi = 3 px/dp), 256 wire units each. The gesture runs
+        // Begin → Update… and the lift closes it with a zero-delta End.
+        val deltas = sink.scrolls().map { it.split(" ")[2].toInt() }
+        assertEquals("scroll 0 ${deltas[0]} s4 p1", sink.scrolls().first())
+        assertEquals("scroll 0 0 s4 p3", sink.scrolls().last())
+        assertTrue(
+            sink.scrolls().drop(1).dropLast(1)
+                .all { it.startsWith("scroll 0 ") && it.endsWith(" s4 p2") },
+        )
+        assertEquals(15360, deltas.sum())
         assertEquals(emptyList<String>(), sink.buttons())
     }
 
@@ -150,8 +158,15 @@ class TouchInputTest {
             advanceEventTime(30); up(0); up(1)
         }
         settle()
-        // 5 px under the tap slop scrolls at once, then the tap sends it back before clicking.
-        assertEquals(listOf("scroll 0 60 precise", "scroll 0 -60 precise", "btn 3 down", "btn 3 up"), sink.log)
+        // 5 px under the tap slop scrolls at once (426 = 5 px × 256/3 at xxhdpi), then the tap
+        // sends it back as an Update and cancels the axis before clicking.
+        assertEquals(
+            listOf(
+                "scroll 0 426 s4 p1", "scroll 0 -426 s4 p2", "scroll 0 0 s4 p4",
+                "btn 3 down", "btn 3 up",
+            ),
+            sink.log,
+        )
     }
 
     @Test
