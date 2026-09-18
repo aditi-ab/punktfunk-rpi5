@@ -1679,8 +1679,6 @@ pub(crate) async fn run_admitted(
         )),
         access_tx: Some(access_tx.clone()),
         audio_tx: Some(audio_tx),
-        // Filled by the stream thread once capture names the head.
-        head: Arc::new(std::sync::Mutex::new(None)),
         pad_slots: pad_slots.clone(),
         fingerprint: session_fp_hex.clone(),
         pad_owner: pad_id.owner,
