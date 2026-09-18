@@ -1906,6 +1906,78 @@ mod tests {
         assert!(!r.carrying());
     }
 
+    /// The sheet open and drawn, so its rows have real rects to press; row 0 is End stream.
+    fn rendered_sheet() -> (Ring, Rect) {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
+        let mut r = Ring::new();
+        r.set_facts(&facts());
+        r.input(RingInput::Toggle { x: 640.0, y: 300.0 });
+        r.menu(MenuEvent::Confirm); // the lit centre opens the sheet
+        for _ in 0..120 {
+            r.render(surface.canvas(), 1280, 800, 1.0, &fonts, 1.0 / 60.0);
+        }
+        let row = r.list.row_rect(0).expect("the sheet drew its rows");
+        (r, row)
+    }
+
+    /// A finger swipe on the sheet steps its rows and fires none. The same contact
+    /// lifted in place is the tap, fired on the lift at the anchor.
+    #[test]
+    fn a_touch_swipe_scrolls_the_sheet_without_firing_a_row() {
+        use crate::pointer::Touch;
+        use pf_client_core::console::{PointerButton, PointerInput};
+        let (mut r, row) = rendered_sheet();
+        let (cx, cy) = (row.center_x(), row.center_y());
+        let mut touch = Touch::default();
+        let mut feed = |r: &mut Ring, input| touch.feed(input, 1.0, |p| r.pointer(p));
+        let down = PointerInput::Down {
+            x: cx,
+            y: cy,
+            button: PointerButton::Primary,
+            touch: true,
+        };
+
+        feed(&mut r, down);
+        for i in 1..=6 {
+            feed(
+                &mut r,
+                PointerInput::Move {
+                    x: cx,
+                    y: cy - (i as f32) * 40.0,
+                },
+            );
+        }
+        feed(
+            &mut r,
+            PointerInput::Up {
+                x: cx,
+                y: cy - 240.0,
+                button: PointerButton::Primary,
+            },
+        );
+        assert!(r.list.cursor > 0, "the swipe stepped the rows");
+        assert!(r.sheet, "the sheet stayed up");
+        assert_eq!(r.armed, None, "a swipe across a row fires nothing");
+        assert_eq!(r.take_command(), None);
+
+        feed(&mut r, down);
+        assert_eq!(r.armed, None, "a finger must not act on contact");
+        feed(
+            &mut r,
+            PointerInput::Up {
+                x: cx,
+                y: cy,
+                button: PointerButton::Primary,
+            },
+        );
+        assert_eq!(
+            r.armed.as_deref(),
+            Some("end_stream"),
+            "the tap lands on the lift, at the anchor"
+        );
+    }
+
     #[test]
     fn closed_means_no_damage_and_no_pointer_consumption() {
         let mut r = Ring::new();
