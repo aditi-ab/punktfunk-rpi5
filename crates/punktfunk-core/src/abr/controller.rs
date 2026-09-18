@@ -86,11 +86,12 @@ const LINK_CUT_PCT: u32 = 85;
 /// almost nothing measured an interruption, not a capacity, and ×0.7 never
 /// moved more than this in one step either.
 const LINK_CUT_FLOOR_PCT: u32 = 50;
-/// Windows a link-attributed cut is given to drain what it queued, while the
-/// delay it left behind is still falling. 4 × 750 ms covers the deepest queue
-/// this controller can have caused; the first window that stops falling ends
-/// it sooner, so it composes with the change cooldown instead of adding to it.
-const LINK_DRAIN_WINDOWS: u32 = 4;
+/// Windows a link-attributed cut is given to drain what it queued. 6 × 750 ms
+/// is 4.5 s, past the deepest queue a wall of this kind sits behind (450 ms of
+/// buffer, drained at the margin one cut holds back); the delay coming back to
+/// where it was ends it sooner, so it composes with the change cooldown
+/// instead of adding to it.
+pub(super) const LINK_DRAIN_WINDOWS: u32 = 6;
 /// Delay fall across a window that counts as a queue emptying. 5 ms over
 /// 750 ms is past the fit's own noise on a jittery link and well under one
 /// frame period at any refresh.
@@ -211,9 +212,14 @@ pub(crate) struct BitrateController {
     /// The last bad window was the link's, and the link handed over less than
     /// it was asked for. Only then does the rate land on what was delivered.
     link_verdict: bool,
-    /// Windows left in which a falling delay reading is the last
-    /// link-attributed cut working. `0` = nothing to drain.
+    /// Windows left in which the damage is the last link-attributed cut's own
+    /// queue emptying. `0` = nothing to drain.
     drain_windows: u32,
+    /// Delay level the guard is waiting to see again: what clean windows read
+    /// before the cut. `0` = none was known, so the budget ends the guard.
+    drain_ref_us: i64,
+    /// Windows the guard kept a cut off, for the line it logs when it ends.
+    drain_suppressed: u32,
     /// Where the link stopped carrying what it was asked for. Latched from
     /// two deliveries at the same rate (the ramp's wall counts as one), it
     /// holds the climb a tenth under that rate and is re-tested on the same
@@ -331,6 +337,8 @@ impl BitrateController {
             rearm_windows: 0,
             link_verdict: false,
             drain_windows: 0,
+            drain_ref_us: 0,
+            drain_suppressed: 0,
             link_cap: LearnedCap::new(),
             link_mark_kbps: 0,
             delivery_sum_kbps: 0,
@@ -813,6 +821,17 @@ impl BitrateController {
         if (self.bad_windows >= BAD_WINDOWS_TO_DECREASE || (v.severe && self.bad_windows >= 1))
             && self.current_kbps > self.floor_kbps
         {
+            // Damage inside the guard is the overflow the last cut is still
+            // clearing: the lost frames and the loss in it are that queue's
+            // tail, and cutting again deepens what caused them. FEC and
+            // keyframe recovery answer them as always. The host encoder's own
+            // verdict is not the link's and is never guarded.
+            if draining && !encode_named(w, &v) {
+                self.drain_suppressed += 1;
+                self.bad_windows = 0;
+                self.streak_decode_windows = 0;
+                return None;
+            }
             return self.back_off(w, &v);
         }
         if let Some(kbps) = self.judge_headroom(w, &v) {
@@ -909,7 +928,7 @@ impl BitrateController {
         self.lift = None;
         self.link_lifted = false;
         self.link_cap.latch(p.cap_kbps, self.floor_kbps);
-        self.drain_windows = LINK_DRAIN_WINDOWS;
+        self.arm_drain();
         tracing::info!(
             from_kbps = self.current_kbps,
             to_kbps = p.cap_kbps,
@@ -1060,22 +1079,69 @@ impl BitrateController {
         }
     }
 
+    /// Arm the guard: this cut queued something, and what that queue does on
+    /// the way out is not fresh evidence.
+    ///
+    /// The reference is where clean windows at this rate sat before the cut —
+    /// taken now, because the request that follows drops it.
+    fn arm_drain(&mut self) {
+        self.drain_windows = LINK_DRAIN_WINDOWS;
+        self.drain_ref_us = if self.delay_windows > 0 {
+            self.delay_sum_us / i64::from(self.delay_windows)
+        } else {
+            0
+        };
+        self.drain_suppressed = 0;
+    }
+
     /// Is this window the last link-attributed cut draining the queue it
     /// caused?
     ///
-    /// Only a falling delay counts, and only while the guard lasts: the first
-    /// window that stops falling ends it, so a wall that did not move is
-    /// answered again on the next window rather than after a timer.
+    /// The queue is the measure, not one window's slope: a queue still filling
+    /// reads as rising, and standing down there is what turned one cut into
+    /// four. The guard ends when the delay is back where clean windows had it
+    /// before the cut, or when its budget runs out — after that the next cut
+    /// is an ordinary one.
     fn note_drain(&mut self, w: &WindowSample) -> bool {
         if self.drain_windows == 0 {
             return false;
         }
-        if w.delay.is_none_or(|d| d.rise_us > -DRAIN_FALL_US) {
-            self.drain_windows = 0;
+        let delay_us = w.delay.map_or(-1, |d| d.mean_us);
+        // A queue that is not emptying while frames are still being lost is
+        // not this cut's tail — the rate is over the wall again, or still.
+        // Damage on a falling delay is that tail, whatever form it takes.
+        let over_again = (w.dropped > 0 || w.loss_ppm >= HEAVY_LOSS_PPM)
+            && w.delay.is_none_or(|d| d.rise_us > -DRAIN_FALL_US);
+        if over_again
+            || (self.drain_ref_us > 0 && w.delay.is_some_and(|d| d.mean_us <= self.drain_ref_us))
+        {
+            self.end_drain(delay_us, !over_again);
             return false;
         }
         self.drain_windows -= 1;
+        if self.drain_windows == 0 {
+            self.end_drain(delay_us, false);
+        } else {
+            tracing::debug!(
+                windows_left = self.drain_windows,
+                delay_us,
+                reference_us = self.drain_ref_us,
+                "adaptive bitrate: the queue the last cut caused is still emptying"
+            );
+        }
         true
+    }
+
+    /// The guard is over, and says what it kept off the rate.
+    fn end_drain(&mut self, delay_us: i64, drained: bool) {
+        self.drain_windows = 0;
+        tracing::info!(
+            suppressed_windows = std::mem::take(&mut self.drain_suppressed),
+            delay_us,
+            reference_us = self.drain_ref_us,
+            drained,
+            "adaptive bitrate: the last cut's queue is done — the link is judged again"
+        );
     }
 
     /// Where a link-attributed cut lands: what the window delivered, less the
@@ -1348,11 +1414,13 @@ impl BitrateController {
             self.note_link_mark(w.actual_kbps);
         }
         self.climb_since_backoff = false;
+        // Whatever kind of cut this is, if the link is what it answered then
+        // the queue it leaves behind is this cut's own tail.
+        if self.link_evidence {
+            self.arm_drain();
+        }
         let next = if self.link_verdict {
             let next = self.link_cut_kbps(w.actual_kbps);
-            // The queue this overshoot built is the reason the next window
-            // still reads badly; a delay that is falling in it says so.
-            self.drain_windows = LINK_DRAIN_WINDOWS;
             tracing::info!(
                 from_kbps = self.current_kbps,
                 to_kbps = next,
@@ -1902,17 +1970,23 @@ mod tests {
         );
     }
 
-    /// The queue a link cut caused is what makes the next window read badly.
-    /// While the delay it left is falling, that is the cut working; the first
-    /// window that stops falling is judged again.
+    /// The queue a link cut caused is what makes the next windows read badly.
+    ///
+    /// Standing delay, lost frames and loss inside the guard are that queue's
+    /// tail, whether the fit says it is falling yet or not: a queue that has
+    /// not peaked still reads as rising, and cutting there is the cascade the
+    /// rig recorded. Only the delay coming back to where it was, or the
+    /// budget, ends it.
     #[test]
-    fn a_falling_delay_after_a_link_cut_is_not_a_second_verdict() {
+    fn damage_while_the_last_cut_drains_is_not_a_second_verdict() {
         let start = Instant::now();
-        let after = |falling: bool| -> Option<u32> {
+        let after = |mean_us: i64, rise_us: i64, dropped: u64| -> Option<u32> {
             let mut c = BitrateController::new(20_000, None);
+            // Four clean windows: 10 ms is where this rate's delay sits.
             for i in 0..BASELINE_MIN_WINDOWS as u32 {
                 c.on_window(&WindowSample {
                     owd_mean_us: Some(10_000),
+                    delay: Some(trend(10_000, 0)),
                     actual_kbps: 20_000,
                     ..WindowSample::at(ticks(start, i))
                 });
@@ -1922,72 +1996,83 @@ mod tests {
             let cut = c.on_window(&WindowSample {
                 dropped: 4,
                 owd_mean_us: Some(400_000),
+                delay: Some(trend(400_000, 100_000)),
                 actual_kbps: 7_000,
                 ..WindowSample::at(ticks(start, t))
             });
             assert_eq!(cut, Some(10_000), "the cut lands on what was delivered");
             c.on_ack(10_000, None);
-            // Two windows of standing delay and nothing else: without the
-            // guard that is a second verdict.
+            // The overflow's tail: standing delay and the frames it swallowed.
             let mut out = None;
             for _ in 0..2 {
                 t += 1;
                 out = out.or(c.on_window(&WindowSample {
+                    dropped,
                     owd_mean_us: Some(300_000),
                     actual_kbps: 9_500,
-                    delay: Some(crate::abr::DelayTrend {
-                        samples: 20,
-                        mean_us: 300_000,
-                        rise_us: if falling { -60_000 } else { 0 },
-                        last_us: 280_000,
-                    }),
+                    delay: Some(trend(mean_us, rise_us)),
                     ..WindowSample::at(ticks(start, t))
                 }));
             }
             out
         };
         assert_eq!(
-            after(true),
+            after(300_000, -60_000, 2),
             None,
-            "a draining queue is not fresh congestion"
+            "frames lost out of a draining queue are that queue's tail"
         );
         assert_eq!(
-            after(false),
+            after(300_000, 0, 0),
+            None,
+            "and a queue that has not peaked yet is still the cut's own"
+        );
+        assert_eq!(
+            after(300_000, 0, 2),
             Some(7_000),
-            "a queue that stopped emptying is judged again"
+            "a queue that is not emptying and still losing frames is the rate"
+        );
+        assert_eq!(
+            after(9_000, 0, 2),
+            Some(7_000),
+            "a delay back where it was ends the guard, and the window is judged"
         );
     }
 
-    /// The guard is a run of falling windows, not a timer: it ends at the
-    /// first one that is not, and never outlasts its budget.
+    /// The guard runs until the queue is gone or the budget is, and a window
+    /// with nothing to read from is not evidence that it drained.
     #[test]
-    fn the_drain_guard_ends_with_the_fall_or_with_its_budget() {
+    fn the_drain_guard_ends_with_the_queue_or_with_its_budget() {
         let mut c = BitrateController::new(20_000, None);
         let now = Instant::now();
-        let falling = |rise_us: i64| WindowSample {
-            delay: Some(crate::abr::DelayTrend {
-                samples: 20,
-                mean_us: 300_000,
-                rise_us,
-                last_us: 280_000,
-            }),
+        let at = |mean_us: i64, rise_us: i64| WindowSample {
+            delay: Some(trend(mean_us, rise_us)),
             ..WindowSample::at(now)
         };
         c.drain_windows = LINK_DRAIN_WINDOWS;
+        c.drain_ref_us = 10_000;
         for _ in 0..LINK_DRAIN_WINDOWS {
-            assert!(c.note_drain(&falling(-DRAIN_FALL_US)));
+            assert!(c.note_drain(&at(300_000, 40_000)), "still filling");
         }
-        assert!(!c.note_drain(&falling(-DRAIN_FALL_US)), "budget spent");
+        assert!(!c.note_drain(&at(300_000, 40_000)), "budget spent");
 
         c.drain_windows = LINK_DRAIN_WINDOWS;
         assert!(
-            !c.note_drain(&falling(-DRAIN_FALL_US + 1)),
-            "barely falling"
+            !c.note_drain(&WindowSample {
+                dropped: 3,
+                ..at(300_000, 0)
+            }),
+            "a full queue still losing frames is the rate, not the tail"
         );
-        assert_eq!(c.drain_windows, 0, "and the guard is over");
+
         c.drain_windows = LINK_DRAIN_WINDOWS;
+        assert!(!c.note_drain(&at(9_000, 0)), "back where it was");
+        assert_eq!(c.drain_windows, 0, "and the guard is over");
+
+        c.drain_windows = LINK_DRAIN_WINDOWS;
+        c.drain_ref_us = 0;
+        assert!(c.note_drain(&at(1_000, 0)), "no reference, only the budget");
         assert!(
-            !c.note_drain(&WindowSample::at(now)),
+            c.note_drain(&WindowSample::at(now)),
             "no delay reading is no evidence of draining"
         );
     }
