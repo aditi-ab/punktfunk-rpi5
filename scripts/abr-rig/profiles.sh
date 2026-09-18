@@ -31,6 +31,9 @@ profile() {
   # 09-17 09:53 logged keyframe_req=9 idr=2 rfi=8 in one minute.
   RECOVERY_MS=${PF_RIG_RECOVERY_MS:-0}
   KEYFRAME_ANSWER=${PF_RIG_KEYFRAME_ANSWER:-idr}
+  # A keyframe's size against an ordinary frame, percent. 1000 is what rounds 4-7 ran;
+  # a hardware encoder holds VBV at one frame, so a faithful row is far nearer 100.
+  IDR_PCT=${PF_RIG_IDR_PCT:-1000}
   # Hold the picture after a lost frame until one re-anchors it, as a real
   # decoder must. Off by default: it is a model, not a decoder.
   DECODER_HOLD=${PF_RIG_DECODER_HOLD:-0}

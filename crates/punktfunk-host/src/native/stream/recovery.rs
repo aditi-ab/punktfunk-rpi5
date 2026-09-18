@@ -219,8 +219,6 @@ impl StreamState {
     /// re-asks after is one it lost or could not use; each such IDR doubles the cooldown
     /// ([`idr_cooldown`]) so the repair stops feeding the overload that defeats it.
     fn force_keyframe(&mut self, rfi_declined: bool) {
-        const IDR_COOLDOWN_INTRA: std::time::Duration = std::time::Duration::from_secs(2);
-        const IDR_COOLDOWN_FULL: std::time::Duration = std::time::Duration::from_millis(750);
         let base = if self.enc.caps().intra_refresh_recovery {
             IDR_COOLDOWN_INTRA
         } else {
@@ -445,6 +443,13 @@ const RECOVERY_FLIGHT: std::time::Duration = std::time::Duration::from_millis(30
 /// Longest wait between forced IDRs, whatever the backoff. 3 s of a broken picture is the
 /// ceiling a user tolerates over a storm of repairs that never take.
 const IDR_COOLDOWN_MAX: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Base cooldown where the encoder's recovery marks let the picture heal over ~0.5 s.
+pub(super) const IDR_COOLDOWN_INTRA: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Base cooldown where the IDR is the only repair, so the wait is short. `synth_abr` takes
+/// this one: an arithmetic encoder has no recovery marks.
+pub(super) const IDR_COOLDOWN_FULL: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Consecutive unhealed IDRs that name the state in the log, once.
 const IDR_STORM: u32 = 3;

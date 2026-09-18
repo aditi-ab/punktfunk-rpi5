@@ -38,7 +38,7 @@ use self::session_watch::{session_watch_enabled, session_watcher_loop, SessionSw
 use self::state::StreamState;
 // `main.rs` parses the content script; `native.rs` builds the context and dispatches.
 pub(super) use self::synth_abr::{synthetic_abr_stream, SynthAbrContext};
-pub use self::synth_abr::{Content, KeyframeAnswer, SynthAbrShape};
+pub use self::synth_abr::{Content, KeyframeAnswer, SynthAbrShape, DEFAULT_IDR_PCT};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn synthetic_stream(

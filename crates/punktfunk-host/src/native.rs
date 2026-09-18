@@ -74,7 +74,7 @@ use stream::{
     reconfig_allowed, software_stream, synthetic_abr_stream, synthetic_stream, virtual_stream,
     SessionContext, SynthAbrContext,
 };
-pub use stream::{Content, KeyframeAnswer, SynthAbrShape};
+pub use stream::{Content, KeyframeAnswer, SynthAbrShape, DEFAULT_IDR_PCT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Punktfunk1Source {
@@ -2419,6 +2419,7 @@ pub(crate) async fn run_admitted(
                     content: shape.content,
                     recovery: shape.recovery,
                     answer: shape.answer,
+                    idr_pct: shape.idr_pct,
                     bringup_delay: shape.bringup,
                     ramp_open,
                     stop: stop_stream,

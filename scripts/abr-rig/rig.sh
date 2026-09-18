@@ -90,10 +90,11 @@ wait %2 2>/dev/null || true
 # ---- the session ------------------------------------------------------------
 NO_RAMP_ARG=""
 if [ "$NO_RAMP" = 1 ]; then NO_RAMP_ARG="--no-ramp"; fi
-say "host: --content $CONTENT --fill $FILL --recovery-ms $RECOVERY_MS --keyframe-answer $KEYFRAME_ANSWER --bringup-ms $BRINGUP_MS $NO_RAMP_ARG"
+say "host: --content $CONTENT --fill $FILL --recovery-ms $RECOVERY_MS --keyframe-answer $KEYFRAME_ANSWER --idr-pct $IDR_PCT --bringup-ms $BRINGUP_MS $NO_RAMP_ARG"
 ip netns exec h "$BIN/punktfunk-host" punktfunk1-host \
   --port $PORT --source synthetic-abr --content "$CONTENT" --fill "$FILL" \
   --recovery-ms "$RECOVERY_MS" --keyframe-answer "$KEYFRAME_ANSWER" \
+  --idr-pct "$IDR_PCT" \
   --bringup-ms "$BRINGUP_MS" $NO_RAMP_ARG \
   --seconds $(( SECONDS_RUN + 30 )) --pairing-pin "$PIN" --no-mdns \
   > "$OUT/$PROFILE-host.log" 2>&1 &

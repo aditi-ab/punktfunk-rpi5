@@ -5,12 +5,13 @@
 //! bytes on the wire within one frame. [`send_loop`] paces them and answers speed-test bursts
 //! exactly as it does for a virtual display; only the encoder is arithmetic.
 
+use super::recovery::{KeyframeGate, KeyframeVerdict, IDR_COOLDOWN_FULL};
 use super::*;
 
-/// A keyframe against an ordinary frame. Ten, because that is the ratio a real inter-coded
-/// 4K stream shows; the link sees one frame's worth of overload, which is what a recovery IDR
-/// costs a constrained path.
-const IDR_PCT: u64 = 1_000;
+/// A keyframe against an ordinary frame, percent, when `--idr-pct` says nothing. Ten times,
+/// which is what rounds 4–7 measured against; a hardware encoder runs `PUNKTFUNK_VBV_FRAMES`
+/// = 1.0 and fits its keyframe near one frame's share, so this is the pessimistic end.
+pub const DEFAULT_IDR_PCT: u32 = 1_000;
 
 /// Repeats and the idle keepalive: one shard, the size a host sends when nothing moved.
 const REPEAT_SHARDS: u64 = 1;
@@ -119,6 +120,8 @@ pub struct SynthAbrShape {
     /// How long a keyframe ask takes to reach the wire.
     pub recovery: std::time::Duration,
     pub answer: KeyframeAnswer,
+    /// A keyframe's size as a percent of an ordinary frame ([`DEFAULT_IDR_PCT`]).
+    pub idr_pct: u32,
     /// How long the first frame is held back, as a pipeline build holds it.
     pub bringup: std::time::Duration,
     /// Advertise `HOST_CAP2_RAMP`. `false` is the old-host control: the client
@@ -147,6 +150,7 @@ fn frame_bytes(
     fill_pct: u32,
     shot: Shot,
     idr: bool,
+    idr_pct: u32,
 ) -> usize {
     if shot == Shot::Repeat {
         return (REPEAT_SHARDS * u64::from(shard_payload)) as usize;
@@ -154,9 +158,32 @@ fn frame_bytes(
     let allowance = u64::from(enc_kbps) * 1_000 / 8 / u64::from(fps.max(1));
     let mut b = allowance * u64::from(fill_pct) / 100;
     if idr {
-        b = b * IDR_PCT / 100;
+        b = b * u64::from(idr_pct) / 100;
     }
     b.max(1) as usize
+}
+
+/// When the next IDR is owed after one ask, with production's gate in front of it.
+///
+/// [`KeyframeGate`] and [`IDR_COOLDOWN_FULL`] are `recovery.rs`'s own, so the rig cannot
+/// drift from the host it models. A coalesced ask owes the IDR the cooldown ends on:
+/// production sends nothing and a client asking at 10 Hz forces one the moment the gate
+/// opens, which puts the same frame on the same wire.
+fn owe_idr(
+    gate: &mut KeyframeGate,
+    now: std::time::Instant,
+    recovery: std::time::Duration,
+    last_idr: Option<std::time::Instant>,
+    idr_due: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    match gate.decide(now, IDR_COOLDOWN_FULL, last_idr, None, false) {
+        KeyframeVerdict::Force { .. } => Some(idr_due.unwrap_or(now + recovery)),
+        KeyframeVerdict::Coalesced { cooldown, .. } => {
+            idr_due.or_else(|| last_idr.map(|t| t + cooldown))
+        }
+        // Unreachable: this source has no RFI to echo, so it never passes one in.
+        KeyframeVerdict::RfiEcho { .. } => idr_due,
+    }
 }
 
 /// Per-session inputs for [`synthetic_abr_stream`]. The display-side half of
@@ -172,6 +199,8 @@ pub(crate) struct SynthAbrContext {
     /// that pile up in the meantime are what a report window reads as damage.
     pub(crate) recovery: std::time::Duration,
     pub(crate) answer: KeyframeAnswer,
+    /// A keyframe's size as a percent of an ordinary frame ([`DEFAULT_IDR_PCT`]).
+    pub(crate) idr_pct: u32,
     /// How long the first frame is held back, the way a display session's
     /// pipeline build holds it. The client's bring-up ramp is served on the
     /// idle data plane for exactly this long.
@@ -211,6 +240,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         content,
         recovery,
         answer,
+        idr_pct,
         bringup_delay,
         ramp_open,
         stop,
@@ -327,6 +357,8 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
     let (mut au_seq, mut tick, mut asks) = (0u32, 0u64, 0u32);
     // An IDR at start, then whenever one comes due. `None` = none owed.
     let mut idr_due: Option<std::time::Instant> = Some(started);
+    // `recovery.rs`'s gate, so a burst of asks costs what it costs a real host.
+    let (mut kf_gate, mut last_idr) = (KeyframeGate::default(), None);
     while !stop.load(Ordering::SeqCst) {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             break;
@@ -348,20 +380,26 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
             live_bitrate.store(budget_kbps, Ordering::Relaxed);
         }
         // Both mean the picture needs re-anchoring, and arithmetic has no reference chain to
-        // invalidate: an RFI costs the same IDR here. The first ask sets the clock; asks
-        // while one is already owed do not move it, as a rebuild in flight does not restart.
+        // invalidate: an RFI costs the same IDR here. An answered ask goes through the same
+        // cooldown a real host applies ([`owe_idr`]); asks while one is already owed do not
+        // move it, as a rebuild in flight does not restart.
         for _ in 0..(keyframe.try_iter().count() + rfi.try_iter().count()) {
             asks += 1;
             if answer.answers(asks) {
-                idr_due.get_or_insert_with(|| std::time::Instant::now() + recovery);
+                let now = std::time::Instant::now();
+                idr_due = owe_idr(&mut kf_gate, now, recovery, last_idr, idr_due);
             }
         }
 
         let elapsed = started.elapsed();
         if let Some(shot) = content.frame_at(elapsed, fps, tick) {
-            let idr = idr_due.is_some_and(|t| std::time::Instant::now() >= t);
+            let now = std::time::Instant::now();
+            let idr = idr_due.is_some_and(|t| now >= t);
             if idr {
                 idr_due = None;
+                last_idr = Some(now);
+                // The `link health` line's `idr=` counter, so a run's repairs are in the log.
+                counters.link.note_idr();
             }
             // Re-derived per frame: an adaptive-FEC move changes the picture's share of the
             // budget without the budget moving.
@@ -371,7 +409,15 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
                 fec_target.load(Ordering::Relaxed),
                 shard_payload,
             );
-            let len = frame_bytes(enc_kbps, shard_payload, fps, content.fill_pct(), shot, idr);
+            let len = frame_bytes(
+                enc_kbps,
+                shard_payload,
+                fps,
+                content.fill_pct(),
+                shot,
+                idr,
+                idr_pct,
+            );
             let flags = if idr {
                 u32::from(FLAG_PIC | FLAG_SOF)
             } else {
@@ -438,7 +484,7 @@ mod tests {
             for fec in [5u8, 10, 25] {
                 for fps in [30u32, 60, 165] {
                     let enc = encoder_kbps_for_budget(budget, 512, fec, 1408);
-                    let one = frame_bytes(enc, 1408, fps, 100, Shot::New, false);
+                    let one = frame_bytes(enc, 1408, fps, 100, Shot::New, false, DEFAULT_IDR_PCT);
                     let second = one as u64 * u64::from(fps);
                     let want = u64::from(enc) * 1_000 / 8;
                     assert!(
@@ -451,18 +497,18 @@ mod tests {
         }
     }
 
-    /// Fill scales the frame, a keyframe is [`IDR_PCT`] of one, and a repeat is one shard
+    /// Fill scales the frame, a keyframe is `idr_pct` of one, and a repeat is one shard
     /// whatever the budget — the three shapes the controller reads differently.
     #[test]
     fn fill_idr_and_repeat_each_size_their_own_frame() {
         let enc = encoder_kbps_for_budget(20_000, 512, 10, 1408);
-        let at = |fill, shot, idr| frame_bytes(enc, 1408, 60, fill, shot, idr);
+        let at = |fill, shot, idr| frame_bytes(enc, 1408, 60, fill, shot, idr, DEFAULT_IDR_PCT);
         let full = at(100, Shot::New, false);
         assert_eq!(at(50, Shot::New, false), full / 2, "fill halves the frame");
         assert_eq!(
             at(100, Shot::New, true) as u64,
-            full as u64 * IDR_PCT / 100,
-            "a keyframe is IDR_PCT of an ordinary frame"
+            full as u64 * u64::from(DEFAULT_IDR_PCT) / 100,
+            "a keyframe is idr_pct of an ordinary frame"
         );
         assert_eq!(at(100, Shot::Repeat, false), 1408, "a repeat is one shard");
         assert_eq!(
@@ -470,6 +516,43 @@ mod tests {
             1408,
             "even when an IDR is owed"
         );
+        // A VBV-bounded encoder fits its keyframe near one frame's share.
+        assert_eq!(
+            frame_bytes(enc, 1408, 60, 100, Shot::New, true, 100),
+            full,
+            "100 % is a keyframe the size of the frame it replaces"
+        );
+    }
+
+    /// A burst of asks costs one IDR, not one each: production gates them behind
+    /// [`IDR_COOLDOWN_FULL`], and the ones that land inside it collapse into the IDR the
+    /// cooldown ends on. Round 7's 111 asks became 111 bursts without this.
+    #[test]
+    fn a_burst_of_asks_costs_one_idr_per_cooldown() {
+        let mut gate = KeyframeGate::default();
+        let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let (mut due, mut last_idr) = (None, None);
+        let mut sent = Vec::new();
+        // A client asking at 10 Hz for 3 s, the way `Hold` does behind a lost frame.
+        for step in 0..30u64 {
+            let now = t0 + ms(step * 100);
+            due = owe_idr(&mut gate, now, std::time::Duration::ZERO, last_idr, due);
+            if due.is_some_and(|t| now >= t) {
+                due = None;
+                last_idr = Some(now);
+                sent.push(step * 100);
+            }
+        }
+        assert_eq!(
+            sent,
+            [0, 800, 2300],
+            "one IDR, then one per cooldown — 750 ms, then doubled while the asks keep coming"
+        );
+        // A lone ask well past the cooldown is answered at once.
+        let quiet = t0 + ms(10_000);
+        due = owe_idr(&mut gate, quiet, std::time::Duration::ZERO, last_idr, None);
+        assert_eq!(due, Some(quiet), "a new episode is not held back");
     }
 
     /// A host that answers with an intra-refresh wave re-anchors only every n-th ask; the

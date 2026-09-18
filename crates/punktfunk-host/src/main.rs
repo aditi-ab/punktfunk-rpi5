@@ -613,11 +613,16 @@ fn real_main() -> Result<()> {
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(2_500),
                     );
+                    let idr_pct = get("--idr-pct")
+                        .and_then(|s| s.parse().ok())
+                        .filter(|&p: &u32| p > 0)
+                        .unwrap_or(native::DEFAULT_IDR_PCT);
                     match native::Content::parse(spec, fill) {
                         Some(c) => native::Punktfunk1Source::SyntheticAbr(native::SynthAbrShape {
                             content: c,
                             recovery,
                             answer,
+                            idr_pct,
                             bringup,
                             serve_ramp: !args.iter().any(|a| a == "--no-ramp"),
                         }),
@@ -1043,7 +1048,12 @@ PUNKTFUNK1-HOST OPTIONS:
                                  rebuilds its pipeline takes about a second
     --keyframe-answer <KIND>     what synthetic-abr answers a keyframe request with: idr
                                  (the default), or wave:<n> to answer only every n-th ask
-                                 with one, as a host that prefers an intra-refresh wave does
+                                 with one, as a host that prefers an intra-refresh wave does.
+                                 Either way the answer waits out the same IDR cooldown a real
+                                 host applies, so a burst of asks costs one keyframe
+    --idr-pct <PCT>              a keyframe's size as a percent of an ordinary frame
+                                 (default: 1000). A hardware encoder runs VBV at one frame,
+                                 so a measured host is far nearer 100 than 1000
     --bringup-ms <MS>            how long synthetic-abr holds its first frame back, the way
                                  a display session's pipeline build does (default: 2500).
                                  The client measures the link over this window
