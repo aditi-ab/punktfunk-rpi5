@@ -23,6 +23,7 @@ import io.unom.punktfunk.connectToHost
 import io.unom.punktfunk.deviceName
 import io.unom.punktfunk.effectiveFor
 import io.unom.punktfunk.matches
+import io.unom.punktfunk.posterHttp
 import io.unom.punktfunk.runSpeedTest
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
@@ -44,11 +45,9 @@ import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.kit.security.obtainIdentity
 import io.unom.punktfunk.models.ActiveSession
-import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import okhttp3.Cache
 import okhttp3.CacheControl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -98,11 +97,6 @@ object SkiaConsole {
     private val main = Handler(Looper.getMainLooper())
     private val ioPool = Executors.newCachedThreadPool { r -> Thread(r, "pf-console-io").apply { isDaemon = true } }
     private val artPool = Executors.newFixedThreadPool(3) { r -> Thread(r, "pf-console-art").apply { isDaemon = true } }
-    /** One disk cache behind both art clients: the host proxy sends `Cache-Control` + `ETag`, a
-     *  CDN its own, and OkHttp honours either, so a shelf revisit is a 304 at most. Null before
-     *  `init`: no context, no cache, fetches still work. */
-    private val artCache: Cache? by lazy { appContext?.let { Cache(File(it.cacheDir, "art-http"), 64L shl 20) } }
-    private val artHttp by lazy { OkHttpClient.Builder().cache(artCache).build() }
     private var eventThread: Thread? = null
     private val running = AtomicBoolean(false)
 
@@ -1121,7 +1115,8 @@ object SkiaConsole {
     }
 
     /**
-     * Every poster on this shelf, one job each.
+     * Every poster on this shelf, one job each, over the touch shelf's client and cache
+     * ([posterHttp]). The console gets encoded bytes because Skia decodes them itself.
      *
      * Also runs when the host did not answer: the shelf is drawn from the library cache and
      * the covers for it are on disk too, so a lettered placeholder next to "last known
@@ -1135,23 +1130,22 @@ object SkiaConsole {
         fp: String,
         offline: Boolean,
     ) {
+        val app = appContext ?: return
+        val http = runCatching { posterHttp(app, id, addr, fp) }.getOrNull() ?: return
         for (g in games) {
             val candidates = g.art.posterCandidates
             if (candidates.isEmpty()) continue
             artPool.execute {
                 if (gen != fetchGen.get()) return@execute
-                val bytes = fetchArt(candidates, id, addr, fp, offline) ?: return@execute
+                val bytes = fetchArt(candidates, http, offline) ?: return@execute
                 main.post { if (gen == fetchGen.get() && handle != 0L) NativeBridge.nativeConsoleLibraryArt(handle, g.id, bytes) }
             }
         }
     }
 
-    /** One poster: the candidates in order, first success wins; the host's art proxy over mTLS. */
-    private fun fetchArt(candidates: List<String>, id: ClientIdentity, addr: String, fp: String, offline: Boolean): ByteArray? {
+    /** One poster: the candidates in order, first success wins. */
+    private fun fetchArt(candidates: List<String>, client: OkHttpClient, offline: Boolean): ByteArray? {
         for (url in candidates) {
-            val client = if (url.contains(addr)) {
-                runCatching { io.unom.punktfunk.kit.library.mtlsHttpClient(id.certPem, id.privateKeyPem, addr, fp, artCache) }.getOrNull() ?: continue
-            } else artHttp
             val req = Request.Builder().url(url)
             // With the host down the cache is the only answer there is. Left to itself OkHttp
             // honours the proxy's `max-age`, goes to revalidate once it lapses, fails to
