@@ -61,12 +61,15 @@ pub(in crate::native) fn prepare_display(
             compositor == pf_vdisplay::Compositor::Gamescope,
             codec,
             bit_depth,
+            None,
         ),
         cursor_forward,
         multi_slice,
     );
-    plan.gamescope_cursor =
-        crate::session_plan::gamescope_cursor_for(compositor == pf_vdisplay::Compositor::Gamescope);
+    plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(
+        compositor == pf_vdisplay::Compositor::Gamescope,
+        None,
+    );
     if codec == crate::encode::Codec::PyroWave {
         plan.wire_chunk = Some(shard_payload as usize);
     }

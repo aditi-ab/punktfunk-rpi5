@@ -634,8 +634,11 @@ pub fn seat_needs_sign_in(iso: &SessionIsolation) -> bool {
 /// gamescope rather than attaching (`PUNKTFUNK_GAMESCOPE_NODE` inherits
 /// someone else's flags). A host-managed `gamescope-session-plus` / SteamOS
 /// session counts as a spawn: we own `GAMESCOPE_BIN`.
-pub fn gamescope_hdr_available() -> bool {
+///
+/// `route` is the session's own; `None` re-runs the ladder without a launch.
+pub fn gamescope_hdr_available(route: Option<&GamescopeRoute>) -> bool {
     gamescope_ours_and(
+        route,
         #[cfg(target_os = "linux")]
         gamescope::gamescope_hdr_capable,
     )
@@ -647,8 +650,9 @@ pub fn gamescope_hdr_available() -> bool {
 /// zero-copy RGB-direct front end has no blend stage. Settled before
 /// `SessionPlan::cursor_blend` opens the encoder. Same two terms as
 /// [`gamescope_hdr_available`]: patched binary, and this host spawns it.
-pub fn gamescope_composites_cursor() -> bool {
+pub fn gamescope_composites_cursor(route: Option<&GamescopeRoute>) -> bool {
     gamescope_ours_and(
+        route,
         #[cfg(target_os = "linux")]
         gamescope::gamescope_can_composite_cursor,
     )
@@ -656,8 +660,9 @@ pub fn gamescope_composites_cursor() -> bool {
 
 /// May the capture offer tiled dmabuf modifiers to this gamescope? Same two terms as
 /// [`gamescope_hdr_available`]; `false` keeps the LINEAR-only offer every gamescope links.
-pub fn gamescope_tiled_capture() -> bool {
+pub fn gamescope_tiled_capture(route: Option<&GamescopeRoute>) -> bool {
     gamescope_ours_and(
+        route,
         #[cfg(target_os = "linux")]
         gamescope::gamescope_offers_tiled_capture,
     )
@@ -670,26 +675,45 @@ pub fn gamescope_tiled_capture() -> bool {
 /// an operator override, not the published decision. [`GamescopeRoute::Attach`]
 /// and the monitor-pin mirror would otherwise answer "ours".
 ///
-/// The ladder is re-run with `dedicated_launch = false` (no session context),
-/// and `create_managed_session` can still degrade `Managed` to Attach after
-/// this answer is due. Do not guess `dedicated_launch = true`: over-promising
-/// 10-bit PQ / a composited cursor is unrecoverable. Under-promise plus
-/// `gamescope::cursor_args` (binary probe, ungated) can double-draw the
-/// pointer; that is the cheaper failure. Close both gaps by taking the
-/// session's own [`GamescopeRoute`].
-fn gamescope_ours_and(#[cfg(target_os = "linux")] probe: fn() -> bool) -> bool {
+/// Pass the session's own `route`. A caller without one gets the ladder re-run
+/// with `dedicated_launch = false`, which calls a dedicated spawn an attach as
+/// soon as any other gamescope runs on the box. `create_managed_session` can
+/// still degrade `Managed` to Attach after this answer is due; under-promising
+/// there plus `gamescope::cursor_args` (binary probe, ungated) can double-draw
+/// the pointer, which is the cheaper failure.
+fn gamescope_ours_and(
+    route: Option<&GamescopeRoute>,
+    #[cfg(target_os = "linux")] probe: fn() -> bool,
+) -> bool {
     #[cfg(target_os = "linux")]
     {
         // `probe` first: memoized `--version`. Route resolution walks `/proc`;
         // a stock gamescope is already `false` and skips the walk.
-        probe()
-            && !session_is_a_foreign_gamescope(
-                capture_monitor().is_some(),
-                resolve_gamescope_route(Compositor::Gamescope, false).as_ref(),
-            )
+        if !probe() {
+            return false;
+        }
+        let blind;
+        let route = match route {
+            Some(r) => Some(r),
+            None => {
+                blind = resolve_gamescope_route(Compositor::Gamescope, false);
+                blind.as_ref()
+            }
+        };
+        let foreign = session_is_a_foreign_gamescope(capture_monitor().is_some(), route);
+        if foreign {
+            tracing::info!(
+                ?route,
+                "gamescope capability withheld: this session uses a gamescope this host did not start"
+            );
+        }
+        !foreign
     }
     #[cfg(not(target_os = "linux"))]
-    false
+    {
+        let _ = route;
+        false
+    }
 }
 
 /// Is the gamescope this session will use one somebody else started?

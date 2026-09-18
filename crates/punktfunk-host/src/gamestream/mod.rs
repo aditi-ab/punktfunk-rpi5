@@ -174,7 +174,7 @@ pub fn host_hdr_capable() -> bool {
             // the session will pick, and it is cached downstream.
             _ => crate::vdisplay::detect()
                 .ok()
-                .is_some_and(|c| crate::capture::capturer_supports_hdr_for(Some(c))),
+                .is_some_and(|c| crate::capture::capturer_supports_hdr_for(Some(c), None)),
         };
         // Any 10-bit encoder makes the host HDR-capable. Which bits get advertised is
         // `serverinfo::apply_hdr`; whether this session can carry it is the RTSP honor.

@@ -888,11 +888,33 @@ pub fn foreign_gamescope_running() -> bool {
         if !matches!(comm.as_str(), "gamescope" | "gamescope-wl") {
             continue;
         }
+        // A killed gamescope its parent has not reaped serves no node to attach to.
+        if is_zombie(pid) {
+            continue;
+        }
         if !descends_from(pid, our_pid) {
             return true;
         }
     }
     false
+}
+
+/// `/proc/<pid>/stat` state `Z`. Unreadable counts as gone.
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat_state(&stat))
+        .is_none_or(|state| state == 'Z')
+}
+
+/// Field 3 follows the parenthesized comm; split after the LAST ')' (comm may contain them).
+fn stat_state(stat: &str) -> Option<char> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
 }
 
 /// Walk `/proc/<pid>/stat` ppid. Hop cap so a racing/exiting process cannot loop us.
@@ -5525,6 +5547,19 @@ mod tests {
     /// A managed session that ignored `GAMESCOPE_BIN` / the PATH shim runs a stock gamescope, and
     /// the host — already told the compositor would paint the pointer — paints none either. Only a
     /// compositor we can see, missing a flag we can name, may fail.
+    #[test]
+    fn a_zombie_reads_from_the_state_field_after_the_comm() {
+        assert_eq!(
+            super::stat_state("9846 (gamescope-wl) Z 837 9846 9846 0 -1"),
+            Some('Z')
+        );
+        assert_eq!(
+            super::stat_state("77 (odd) name)) S 1 77 77 0 -1"),
+            Some('S')
+        );
+        assert_eq!(super::stat_state("garbage"), None);
+    }
+
     #[test]
     fn spawn_flag_verification_fails_closed_only_on_evidence() {
         let argv = |s: &str| -> Vec<String> { s.split(' ').map(str::to_string).collect() };
