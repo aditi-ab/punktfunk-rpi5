@@ -757,6 +757,9 @@ impl BitrateController {
         if kbps < self.current_kbps {
             self.baselines.clear_encode();
             self.current_kbps = kbps;
+            // The host moved the rate to divide the path. What the old rate
+            // put on the wire, and the delay behind it, are not this one's.
+            self.forget_rate_norms();
         }
         // A share above this session's ceiling is the host saying the path has
         // room, not that this session's wall was a sibling's queue: one
@@ -2699,6 +2702,40 @@ mod tests {
             old.host_cap.kbps(),
             Some(14_000),
             "a nameless ack still binds — safe, and only slower to lift"
+        );
+    }
+
+    /// A share is a rate the session never asked for: the wire's norm at the
+    /// old rate goes with it, the ask it did not answer does not become the
+    /// base of the next cut, and the guard the last cut armed keeps measuring
+    /// against the number it was given.
+    #[test]
+    fn a_share_that_moves_the_rate_drops_what_only_the_old_rate_knew() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        for i in 0..DELIVERY_REF_WINDOWS {
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                delay: Some(trend(10_000, 0)),
+                actual_kbps: 15_600,
+                ..WindowSample::at(ticks(start, i))
+            });
+        }
+        assert_eq!(c.delivery_reference(), Some(15_600));
+        c.arm_drain();
+        // An ask in flight, and a share arriving where its answer would.
+        c.last_requested_kbps = Some(18_000);
+        c.on_ack(14_000, Some(AckReason::Governor));
+        assert_eq!(
+            c.delivery_reference(),
+            None,
+            "a different rate, a different wire"
+        );
+        assert_eq!(c.cut_base_kbps(), 14_000, "no ask survives a share");
+        assert_eq!(
+            (c.drain_windows, c.drain_ref_us),
+            (LINK_DRAIN_WINDOWS, 10_000),
+            "the guard keeps the delay it was armed on"
         );
     }
 
