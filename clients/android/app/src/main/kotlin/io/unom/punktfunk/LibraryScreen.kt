@@ -84,7 +84,6 @@ import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.library.LibraryResult
 import io.unom.punktfunk.kit.library.LibraryCache
 import io.unom.punktfunk.kit.library.RunningGame
-import io.unom.punktfunk.kit.library.mtlsHttpClient
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.IdentityStore
 import io.unom.punktfunk.kit.security.KnownHost
@@ -431,11 +430,8 @@ private suspend fun loadLibrary(context: Context, host: KnownHost, set: (LibStat
 private suspend fun prepareLoader(context: Context, host: KnownHost): Pair<ClientIdentity, ImageLoader>? =
     withContext(Dispatchers.IO) {
         val id = runCatching { obtainIdentity(IdentityStore(context)) }.getOrNull() ?: return@withContext null
-        val loader = runCatching {
-            ImageLoader.Builder(context)
-                .okHttpClient(mtlsHttpClient(id.certPem, id.privateKeyPem, host.address, host.fpHex))
-                .build()
-        }.getOrNull() ?: return@withContext null
+        val loader = runCatching { posterLoader(context, id, host.address, host.fpHex) }.getOrNull()
+            ?: return@withContext null
         id to loader
     }
 
