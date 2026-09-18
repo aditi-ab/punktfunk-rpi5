@@ -96,6 +96,10 @@ LIFT_RISING_WINDOWS|const LIFT_RISING_WINDOWS: u32 = 2;|const LIFT_RISING_WINDOW
 LIFT_PROBE_WINDOWS|const LIFT_PROBE_WINDOWS: u32 = 8;|const LIFT_PROBE_WINDOWS: u32 = 40;
 LIFT_PROBE_MAX_AGE|const LIFT_PROBE_MAX_AGE: u32 = 16;|const LIFT_PROBE_MAX_AGE: u32 = 2;
 LINK_MARK_SIMILAR_DIV|const LINK_MARK_SIMILAR_DIV: u32 = 5;|const LINK_MARK_SIMILAR_DIV: u32 = 25;
+SHARE_BAND_DIV|const SHARE_BAND_DIV: u32 = 10;|const SHARE_BAND_DIV: u32 = 4;
+SHORT_DIV|const SHORT_DIV: u32 = 16;|const SHORT_DIV: u32 = 4;
+SHARE_CLOCK|const SHARE_CLOCK: Duration = Duration::from_secs(5);|const SHARE_CLOCK: Duration = Duration::from_secs(60);
+SHARE_LIFT_CLOCK|const SHARE_LIFT_CLOCK: Duration = Duration::from_secs(60);|const SHARE_LIFT_CLOCK: Duration = Duration::from_secs(5);
 EOF
 )
 

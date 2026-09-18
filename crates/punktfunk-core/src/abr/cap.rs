@@ -103,6 +103,19 @@ impl LearnedCap {
         *self = LearnedCap::new();
     }
 
+    /// Ask the wall again at the next clean window, for evidence this session
+    /// could not have measured.
+    ///
+    /// The step is the clock's own +12.5 %, and the interval it waits before
+    /// the next one is the short one again: a backed-off clock is the record
+    /// of a limit that re-taught itself here, and that record is what the
+    /// outside evidence disputes. The cap itself stands, so every step still
+    /// has to survive a window at the new rate.
+    pub(super) fn lift_now(&mut self) {
+        self.probe_windows = self.reprobe_after;
+        self.reprobe_after = CAP_REPROBE_WINDOWS_MIN;
+    }
+
     /// One report window at the cap. Damage restarts the park; a clean loaded
     /// window at the cap accrues, and the clock lifts the cap +12.5 % when it
     /// runs out. `Some((from, to))` is the lift.
@@ -350,6 +363,25 @@ mod tests {
             asked.is_some_and(|k| k > 7_000),
             "the session must follow the lift: {asked:?}"
         );
+    }
+
+    /// An early lift is one step at the next clean window, and the ladder
+    /// behind it is the short clock: a measured wall's long one was the margin
+    /// it held back, which is exactly what the outside evidence disputes.
+    #[test]
+    fn an_early_lift_takes_one_step_and_puts_the_ladder_on_the_short_clock() {
+        let mut cap = LearnedCap::new();
+        cap.latch_measured(8_000, FLOOR_KBPS);
+        cap.lift_now();
+        assert_eq!(
+            cap.on_window(false, false, 8_000, 40_000),
+            Some((8_000, 9_000))
+        );
+        assert_eq!(cap.reprobe_after(), CAP_REPROBE_WINDOWS_MIN);
+        for _ in 0..CAP_REPROBE_WINDOWS_MIN - 1 {
+            assert_eq!(cap.on_window(false, false, 9_000, 40_000), None);
+        }
+        assert!(cap.on_window(false, false, 9_000, 40_000).is_some());
     }
 
     /// A wall that licenses more than the stream can use is not a limit on

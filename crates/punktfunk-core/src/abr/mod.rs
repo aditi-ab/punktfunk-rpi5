@@ -13,7 +13,8 @@
 //! bounds — its `LearnedCap` is what the host reuses for its own encoder
 //! ceiling — [`growth`] the climb law, [`probe`] the startup capacity burst,
 //! and [`controller`] the state they all move. [`budget`] is the wire
-//! arithmetic the host shares. `sim/` drives this same
+//! arithmetic the host shares, and [`governor`] the policy it runs above
+//! every session on one path. `sim/` drives this same
 //! `Driver` against modelled links and pins every decision in a checked-in
 //! baseline.
 
@@ -25,6 +26,7 @@ mod sim;
 pub mod budget;
 mod cap;
 mod controller;
+pub mod governor;
 mod growth;
 #[cfg(test)]
 mod harness;

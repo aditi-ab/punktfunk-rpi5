@@ -275,6 +275,14 @@ pub(crate) struct BitrateController {
     /// Two identical short acks latch this. Kept apart from `ceiling_kbps` so a
     /// mode switch does not drop probe-measured link authority.
     pub(super) host_cap: LearnedCap,
+    /// This session's share of a path it is not alone on
+    /// ([`super::governor`]). A plain ceiling, not a [`LearnedCap`]: the host
+    /// owns both directions and re-tests the path itself, so there is no
+    /// clock here to re-probe on. Survives a mode switch — the group does.
+    pub(super) share_cap: Option<u32>,
+    /// A share above this session's ceiling owes the link cap one early step,
+    /// taken at the first window that leaves a delay to judge it against.
+    share_lift: bool,
     /// Last [`request`](Self::request). Taken (not kept) by the ack, so one
     /// request is judged at most once.
     pub(super) last_requested_kbps: Option<u32>,
@@ -366,6 +374,8 @@ impl BitrateController {
             encode_down: StandDown::new(),
             cadence_hold: StandDown::new(),
             host_cap: LearnedCap::new(),
+            share_cap: None,
+            share_lift: false,
             last_requested_kbps: None,
             short_ack_kbps: 0,
             short_acks: 0,
@@ -661,10 +671,15 @@ impl BitrateController {
     ///
     /// [`AckReason`] says which limit answered. A pinned session has no rate to
     /// control; a cadence refusal is a busy GPU, held on a clock and never
-    /// latched. An ack with no reason is an older host, read as today.
+    /// latched; a governor share is a ceiling, not an answer to anything this
+    /// session asked. An ack with no reason is an older host, read as today.
     pub(crate) fn on_ack(&mut self, kbps: u32, why: Option<AckReason>) {
         if why == Some(AckReason::Pinned) {
             self.on_pinned(kbps);
+            return;
+        }
+        if why == Some(AckReason::Governor) {
+            self.on_share(kbps);
             return;
         }
         if kbps > 0 {
@@ -726,6 +741,49 @@ impl BitrateController {
             self.raise_ceiling(kbps);
         }
         self.unacked = 0;
+    }
+
+    /// The host divided a path this session shares with another
+    /// ([`super::governor`]): `kbps` is the ceiling it may climb to, and
+    /// [`NO_SHARE_KBPS`](super::governor::NO_SHARE_KBPS) is the group ending.
+    ///
+    /// Never a target, and never authority to climb: the growth law still has
+    /// to earn every step under it. A share below the live rate is a retarget
+    /// the host has already applied, so it is the rate now — reading it as a
+    /// short ack instead would latch a host cap off the host's own clamp.
+    fn on_share(&mut self, kbps: u32) {
+        self.unacked = 0;
+        self.last_requested_kbps = None;
+        self.short_acks = 0;
+        // Whatever the overlay was naming, it is not what moved the rate now.
+        // A share has no cause among the five the wire carries, and showing
+        // the last link fault instead would be a lie.
+        self.last_cut = None;
+        if kbps == 0 {
+            self.share_cap = None;
+            tracing::info!("adaptive bitrate: alone on this path again — the share is released");
+            return;
+        }
+        self.share_cap = Some(kbps);
+        if kbps < self.current_kbps {
+            self.baselines.clear_encode();
+            self.current_kbps = kbps;
+            // The host moved the rate to divide the path. What the old rate
+            // put on the wire, and the delay behind it, are not this one's.
+            self.forget_rate_norms();
+        }
+        // A share above this session's ceiling is the host saying the path has
+        // room, not that this session's wall was a sibling's queue: one
+        // address is one NAT, and the sibling may be on other air. The
+        // allowance rises, the wall stands, and the cap is asked again soon.
+        if kbps > self.ceiling_kbps {
+            self.raise_ceiling(kbps);
+            self.share_lift = true;
+        }
+        tracing::info!(
+            share_kbps = kbps,
+            "adaptive bitrate: the host divided this path — climbs stop at this session's share"
+        );
     }
 
     /// The host will not negotiate this session's rate (PyroWave: per-frame
@@ -906,6 +964,8 @@ impl BitrateController {
     /// later, and the session was fine at the cap, so the answer is the cap
     /// and not a cut. Loss, a lost frame and a rising trend only refuse while
     /// the probe is still open — after it the ordinary verdict owns them.
+    /// The retreat backs the cap's clock off only where this session is the
+    /// one on the path; on a divided one the refusal names no wall of its own.
     fn judge_lift(&mut self, w: &WindowSample, now: Instant) -> Option<u32> {
         let mut p = self.lift?;
         p.age += 1;
@@ -948,7 +1008,14 @@ impl BitrateController {
         }
         self.lift = None;
         self.link_lifted = false;
-        self.link_cap.latch(p.cap_kbps, self.floor_kbps);
+        if self.share_cap.is_some() {
+            // On a path the host has divided, the queue this lift met may be
+            // a sibling's: backing the clock off would record a wall this
+            // session cannot have seen. It retreats, and asks again soon.
+            self.link_cap.park(p.cap_kbps);
+        } else {
+            self.link_cap.latch(p.cap_kbps, self.floor_kbps);
+        }
         self.arm_drain();
         tracing::info!(
             from_kbps = self.current_kbps,
@@ -957,8 +1024,7 @@ impl BitrateController {
             reference_us = p.ref_us,
             settled = p.settled,
             reprobe_after_windows = self.link_cap.reprobe_after(),
-            "adaptive bitrate: the link refused the lift — back to the cap it came from, and \
-             the next ask waits twice as long"
+            "adaptive bitrate: the link refused the lift — back to the cap it came from"
         );
         self.bad_windows = 0;
         self.streak_decode_windows = 0;
@@ -1371,6 +1437,14 @@ impl BitrateController {
     /// decides whether it holds.
     fn tick_caps(&mut self, v: &Verdict) {
         let (bad, quiet, rate, ceiling) = (v.bad, v.quiet, self.current_kbps, self.ceiling_kbps);
+        // The step a share asked for, once a clean window at this rate has
+        // left a delay to freeze. Taken any sooner it is a commitment, and
+        // the host's evidence is about the path, not about this session's
+        // own air — so it is the one lift that must not go unjudged.
+        if self.share_lift && self.delay_windows > 0 {
+            self.share_lift = false;
+            self.link_cap.lift_now();
+        }
         if let Some((from, to)) = self.host_cap.on_window(bad, quiet, rate, ceiling) {
             tracing::debug!(
                 from_kbps = from,
@@ -1690,12 +1764,14 @@ impl BitrateController {
         let proration = growth::proration(w.activity, self.frame_budget_us);
         let utilized = growth::utilized(w.activity, proration, w.actual_kbps, self.current_kbps);
         // Probe = link, short acks = encoder, decode cap = client decoder,
-        // link cap = the wall this session walked into.
+        // link cap = the wall this session walked into, share = the host
+        // dividing a path this session is not alone on.
         let eff_ceiling = self
             .ceiling_kbps
             .min(self.host_cap.kbps().unwrap_or(u32::MAX))
             .min(self.decode_cap.kbps().unwrap_or(u32::MAX))
-            .min(self.link_cap.kbps().unwrap_or(u32::MAX));
+            .min(self.link_cap.kbps().unwrap_or(u32::MAX))
+            .min(self.share_cap.unwrap_or(u32::MAX));
         // Above the env/policy ceiling with no congestion: step down once per
         // distinct target. A host that answers higher cannot go there.
         let ceiling_target = eff_ceiling.max(self.floor_kbps);
@@ -1983,6 +2059,37 @@ mod tests {
             judged(100_000, 120_000, 0, LIFT_OVER_WINDOWS).0,
             None,
             "20 ms on a 100 ms link is inside the session's own noise"
+        );
+    }
+
+    /// A lift refused on a path the host has divided costs the step, not the
+    /// clock.
+    ///
+    /// The queue that refused it may be the sibling's, and one window cannot
+    /// tell. Doubling the wait there records a wall this session never
+    /// measured, and the ladder stops closing on the share it was given.
+    #[test]
+    fn a_lift_refused_on_a_shared_path_keeps_the_short_clock() {
+        let start = Instant::now();
+        let (mut c, mut t, rate) = lifted_cap(start, 10_000, true);
+        c.share_cap = Some(rate * 2);
+        let over = 10_000 + BitrateController::lift_bar_us(10_000) + 1_000;
+        let mut out = None;
+        for _ in 0..LIFT_OVER_WINDOWS {
+            let at = ticks(start, t);
+            t += 1;
+            out = out.or(c.on_window(&WindowSample {
+                owd_mean_us: Some(over),
+                delay: Some(trend(over, 0)),
+                actual_kbps: rate,
+                ..WindowSample::at(at)
+            }));
+        }
+        assert_eq!(out, Some(10_350), "back to the cap it came from");
+        assert_eq!(
+            c.link_cap.reprobe_after(),
+            CAP_REPROBE_WINDOWS_MIN,
+            "the host, not this window, says when the path has room again"
         );
     }
 
@@ -2664,6 +2771,160 @@ mod tests {
         c.on_ack(60_000, None);
         assert_eq!(c.ceiling_kbps, 50_000);
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(50_000));
+    }
+
+    /// The host's share bounds the climb, and a share under the live rate is
+    /// the live rate: the host applied it before it said so.
+    #[test]
+    fn a_share_is_a_ceiling_the_climb_stops_at() {
+        let mut c = BitrateController::new(20_000, None);
+        c.set_ceiling(200_000);
+        let start = Instant::now();
+        let mut t = 0;
+        climb_to(&mut c, start, &mut t, 40_000);
+        c.on_ack(24_000, Some(AckReason::Governor));
+        assert_eq!(c.current_kbps, 24_000, "the host already retargeted to it");
+        assert_eq!(c.share_cap, Some(24_000));
+        assert_eq!(c.host_cap.kbps(), None, "a share is not a short ack");
+        // Clean windows for a minute: the climb stops at the share.
+        for _ in 0..80 {
+            if let Some(k) = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, t))
+            }) {
+                c.on_ack(k, None);
+            }
+            t += 1;
+        }
+        assert!(
+            c.current_kbps <= 24_000,
+            "climbed past the share to {}",
+            c.current_kbps
+        );
+        // The group ends: the ceiling goes with it and the session climbs.
+        c.on_ack(
+            super::super::governor::NO_SHARE_KBPS,
+            Some(AckReason::Governor),
+        );
+        assert_eq!(c.share_cap, None);
+        climb_to(&mut c, start, &mut t, 40_000);
+    }
+
+    /// A share above this session's ceiling is an allowance, not evidence
+    /// about its own air: the wall it measured stands, slow start does not
+    /// re-arm, and the cap is asked again at the next window that can judge
+    /// the answer instead of on its clock.
+    #[test]
+    fn a_share_above_the_ceiling_keeps_the_wall_and_probes_it_again() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        // Two deliveries at one rate are a wall; the verdict that marked them
+        // is what ends slow start in a live session.
+        c.note_link_mark(12_000);
+        c.note_link_mark(11_500);
+        c.probing = false;
+        let cap = c.link_cap.kbps().expect("two marks are a wall");
+        c.on_ack(24_000, Some(AckReason::Governor));
+        assert_eq!(c.link_cap.kbps(), Some(cap), "a sibling's queue is not it");
+        assert!(!c.probing, "and a share is not licence to double");
+        assert_eq!(c.ceiling_kbps, 24_000, "only the allowance moved");
+        c.on_ack(cap, None);
+        let mut t = 0;
+        let window = |c: &mut BitrateController, t: &mut u32, mean_us: i64| {
+            let at = ticks(start, *t);
+            *t += 1;
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(mean_us),
+                delay: Some(trend(mean_us, 0)),
+                actual_kbps: c.current_kbps,
+                ..WindowSample::at(at)
+            })
+        };
+        // A window the shard path said nothing in freezes nothing, and a lift
+        // with no reference is a commitment. The step waits for one that does.
+        run_clean(&mut c, start, t, 1);
+        t += 1;
+        assert_eq!(c.link_cap.kbps(), Some(cap), "no reference, no step");
+        window(&mut c, &mut t, 10_000);
+        assert_eq!(c.link_cap.kbps(), Some(cap + cap / 8), "the share's step");
+        assert!(c.lift.is_some(), "and it is judged, not granted");
+        // The host takes the lift up and the queue answers it: back to the cap
+        // exactly, no ×0.7, and still on the short clock — this session cannot
+        // tell that queue from the sibling it is sharing with.
+        c.on_ack(cap + cap / 8, None);
+        let over = 10_000 + BitrateController::lift_bar_us(10_000) + 1_000;
+        let mut out = None;
+        for _ in 0..LIFT_OVER_WINDOWS {
+            out = out.or(window(&mut c, &mut t, over));
+        }
+        assert_eq!(out, Some(cap), "the rate it was fine at a window ago");
+        assert_eq!(c.link_cap.reprobe_after(), CAP_REPROBE_WINDOWS_MIN);
+    }
+
+    /// A share that lands while a request is outstanding is not an answer to
+    /// it. The same pair of numbers from a host that names nothing is, which
+    /// is what an old client sees and why it is only slower to lift.
+    #[test]
+    fn a_share_is_never_read_as_the_answer_to_a_request() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        c.set_ceiling(200_000);
+        let ask = run_clean(&mut c, start, 0, 8).expect("a clean run climbs");
+        assert!(ask > 14_000);
+        c.on_ack(14_000, Some(AckReason::Governor));
+        assert_eq!(c.host_cap.kbps(), None, "a share is not a short ack");
+        assert_eq!(c.share_cap, Some(14_000));
+        assert_eq!(c.current_kbps, 14_000);
+
+        let mut old = BitrateController::new(20_000, None);
+        old.set_ceiling(200_000);
+        let mut t = 0;
+        for _ in 0..2 {
+            let ask = run_clean(&mut old, start, t, 8).expect("a clean run climbs");
+            assert!(ask > 14_000);
+            t += 8;
+            old.on_ack(14_000, None);
+        }
+        assert_eq!(
+            old.host_cap.kbps(),
+            Some(14_000),
+            "a nameless ack still binds — safe, and only slower to lift"
+        );
+    }
+
+    /// A share is a rate the session never asked for: the wire's norm at the
+    /// old rate goes with it, the ask it did not answer does not become the
+    /// base of the next cut, and the guard the last cut armed keeps measuring
+    /// against the number it was given.
+    #[test]
+    fn a_share_that_moves_the_rate_drops_what_only_the_old_rate_knew() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        for i in 0..DELIVERY_REF_WINDOWS {
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                delay: Some(trend(10_000, 0)),
+                actual_kbps: 15_600,
+                ..WindowSample::at(ticks(start, i))
+            });
+        }
+        assert_eq!(c.delivery_reference(), Some(15_600));
+        c.arm_drain();
+        // An ask in flight, and a share arriving where its answer would.
+        c.last_requested_kbps = Some(18_000);
+        c.on_ack(14_000, Some(AckReason::Governor));
+        assert_eq!(
+            c.delivery_reference(),
+            None,
+            "a different rate, a different wire"
+        );
+        assert_eq!(c.cut_base_kbps(), 14_000, "no ask survives a share");
+        assert_eq!(
+            (c.drain_windows, c.drain_ref_us),
+            (LINK_DRAIN_WINDOWS, 10_000),
+            "the guard keeps the delay it was armed on"
+        );
     }
 
     #[test]
