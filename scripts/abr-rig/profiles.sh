@@ -22,6 +22,9 @@ profile() {
   # Non-zero swaps netem's rate for an ingress policer at this rate: the wall answers an
   # overshoot with dropped packets and no queue, which is the one shape netem cannot make.
   POLICE_KBIT=0
+  # The policer's token bucket, KiB. 0 = BUFFER_MS of the policed rate. A real policer's
+  # burst allowance varies by an order of magnitude, so it is a knob, not a constant.
+  POLICE_BURST_KB=${PF_RIG_POLICE_BURST_KB:-0}
   WANDER_PCT=0
   WANDER_S=0
   MODE=1920x1080x60
