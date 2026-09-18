@@ -499,7 +499,7 @@ pub(super) async fn negotiate(
     );
 
     let (bit_depth, session_hdr, chroma) =
-        negotiate_video_format(&hello, codec, compositor).await?;
+        negotiate_video_format(&hello, codec, compositor, gamescope_route.as_ref()).await?;
 
     // After depth + chroma: PyroWave Automatic is a ~bpp pin that scales with both.
     let bitrate_kbps =
@@ -849,6 +849,7 @@ async fn negotiate_video_format(
     hello: &Hello,
     codec: crate::encode::Codec,
     compositor: Option<crate::vdisplay::Compositor>,
+    gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
 ) -> Result<(u8, bool, crate::encode::ChromaFormat)> {
     // 10-bit only when host, client, codec, capture, and GPU all allow it. Resolved before
     // Welcome so `color` matches the stream (a can't-10-bit GPU yields 8-bit SDR).
@@ -859,7 +860,8 @@ async fn negotiate_video_format(
     // Source-aware: Linux HDR depends on the compositor just resolved. Gamescope folds in
     // `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no twin here because
     // that latch is per-source and this gate already used this session's source.
-    let capture_supports_hdr = crate::capture::capturer_supports_hdr_for(compositor);
+    let capture_supports_hdr =
+        crate::capture::capturer_supports_hdr_for(compositor, gamescope_route);
     // SDR-10 needs a backend that writes 10 bits from an SDR desktop's 8-bit capture:
     // direct-NVENC (`backend_carries_sdr10`). A Linux 4:4:4 session is clamped to 8-bit
     // separately at the resolved-chroma gate below, so depth needs no chroma input here.

@@ -487,7 +487,7 @@ fn real_main() -> Result<()> {
             let monitor_hdr = pf_capture::gnome_hdr_monitor_active();
             let hevc10 = encode::can_encode_10bit(encode::Codec::H265);
             let av110 = encode::can_encode_10bit(encode::Codec::Av1);
-            let gs_binary_hdr = pf_vdisplay::gamescope_hdr_available();
+            let gs_binary_hdr = pf_vdisplay::gamescope_hdr_available(None);
             let gs_knob = pf_host_config::config().gamescope_hdr;
             let compositor = vdisplay::detect().ok();
             println!("monitor in BT.2100 (HDR) colour mode: {monitor_hdr}");
@@ -497,14 +497,14 @@ fn real_main() -> Result<()> {
             // full-frame blend. Invisible until you compare two streams, so print it here.
             println!(
                 "gamescope paints the cursor in-node:  {}",
-                pf_vdisplay::gamescope_composites_cursor()
+                pf_vdisplay::gamescope_composites_cursor(None)
             );
             println!("encoder Main10 (HEVC): {hevc10}");
             println!("encoder 10-bit (AV1):  {av110}");
             println!(
                 "native-plane HDR on the resolved compositor ({}): {}",
                 compositor.map_or("none".to_string(), |c| format!("{c:?}")),
-                crate::capture::capturer_supports_hdr_for(compositor)
+                crate::capture::capturer_supports_hdr_for(compositor, None)
             );
             println!(
                 "GameStream HDR capable (PUNKTFUNK_10BIT + a capable source + encoder): {}",

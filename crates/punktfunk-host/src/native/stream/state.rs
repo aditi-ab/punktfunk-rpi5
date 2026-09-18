@@ -293,6 +293,7 @@ impl StreamState {
                 ctx.compositor == pf_vdisplay::Compositor::Gamescope,
                 ctx.codec,
                 ctx.bit_depth,
+                ctx.gamescope_route.as_ref(),
             ),
             ctx.cursor_forward,
             ctx.multi_slice,
@@ -300,6 +301,7 @@ impl StreamState {
         // After resolve: a self-painting gamescope node would otherwise get a second XFixes pointer.
         plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(
             ctx.compositor == pf_vdisplay::Compositor::Gamescope,
+            ctx.gamescope_route.as_ref(),
         );
         if ctx.codec == crate::encode::Codec::PyroWave {
             plan.wire_chunk = Some(ctx.session.shard_payload());
