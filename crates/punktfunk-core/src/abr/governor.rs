@@ -107,8 +107,10 @@ fn short(m: &Member) -> bool {
 ///
 /// `path_kbps` is the most this group has been seen to carry between them —
 /// caller-kept, because a session that has gone still is not measuring the
-/// path any more and its sibling should still be told the room is there.
-/// `clocks` says which up-moves may go out; without either, only cuts do.
+/// path any more and its sibling should still be told the room is there. It
+/// expires on [`crowded`]: a group that is re-measuring its path now must not
+/// spend a figure from before the path changed. `clocks` says which up-moves
+/// may go out; without either, only cuts do.
 ///
 /// Fewer than two members is not a group and nothing is said, which is what
 /// keeps a single session's decisions byte-identical to an ungoverned build.
@@ -130,7 +132,7 @@ pub fn shares(members: &[Member], path_kbps: u32, clocks: Clocks) -> Vec<Option<
     // path, so nothing here may cut. What is left worth saying is to a member
     // sitting under what the group has room for — the wall it measured beside
     // the others was their residual, and only the host can see that.
-    let crowded = members.iter().any(short);
+    let crowded = crowded(members);
     let budget = budget_kbps(members, path_kbps, crowded);
     let equal = (budget / auto.len() as u64) as u32;
     // Max-min fair: a member that wants less than an equal share takes what it
@@ -201,6 +203,16 @@ fn budget_kbps(members: &[Member], path_kbps: u32, crowded: bool) -> u64 {
         .map(|m| u64::from(m.current_kbps))
         .sum();
     u64::from(proved).saturating_sub(fixed)
+}
+
+/// The path is refusing some of what this group offers it, so what arrives
+/// this window is a fresh reading of it.
+///
+/// The caller keeps [`path_kbps`] as the most it has seen, and this is when
+/// that memory expires: a group that has just re-measured its path must not
+/// keep spending a figure from before the path changed (L1).
+pub fn crowded(members: &[Member]) -> bool {
+    members.iter().any(short)
 }
 
 /// What this group is carrying between them, kbps.

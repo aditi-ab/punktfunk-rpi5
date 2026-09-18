@@ -871,9 +871,16 @@ pub fn share_for(id: u64, clocks: punktfunk_core::abr::governor::Clocks) -> Opti
     share.grouped.store(true, Ordering::Relaxed);
     let members: Vec<governor::Member> = group.iter().map(|s| member(s)).collect();
     // What the path has carried for this group, kept per session because each
-    // of them asks on its own clock.
+    // of them asks on its own clock. The most it has been seen to carry, until
+    // the group is short of what it offers: that is the path being re-measured,
+    // and a figure from before it changed expires there (L1).
     let now = governor::path_kbps(&members);
-    let path = share.path_kbps.fetch_max(now, Ordering::Relaxed).max(now);
+    let path = if governor::crowded(&members) {
+        share.path_kbps.store(now, Ordering::Relaxed);
+        now
+    } else {
+        share.path_kbps.fetch_max(now, Ordering::Relaxed).max(now)
+    };
     let share = governor::shares(&members, path, clocks)[mine]?;
     me.counters.share.note_share(share);
     tracing::info!(
@@ -1414,6 +1421,33 @@ mod tests {
         let (only, c, _r) = fake_member("phone", peer, 20_000);
         c.share.publish(true, 20_000, 9_000);
         assert_eq!(share_for(only.id, both_clocks()), None);
+    }
+
+    /// A path that has degraded since the group's best window: the moment they
+    /// are short of what they offer, the group has re-measured it, and the
+    /// survivor is handed what it carries now rather than what it once did.
+    #[test]
+    fn a_path_that_shrank_is_not_handed_over_at_its_old_figure() {
+        let peer: std::net::IpAddr = "203.0.113.94".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 15_000);
+        let (b, bc, _br) = fake_member("pc", peer, 15_000);
+        // Both clean at 15 Mbps: the pair has carried 30 between them.
+        for c in [&ac, &bc] {
+            c.share.publish(true, 15_000, 15_000);
+        }
+        assert_eq!(share_for(a.id, both_clocks()), None, "nothing to divide");
+        assert_eq!(ac.share.path_kbps.load(Ordering::Relaxed), 30_000);
+        // The path halves. Both are short, so what it carried before is gone.
+        for c in [&ac, &bc] {
+            c.share.publish(true, 15_000, 6_000);
+        }
+        assert_eq!(share_for(a.id, both_clocks()), Some(6_000), "half of 12");
+        drop(b);
+        assert_eq!(
+            share_for(a.id, both_clocks()),
+            Some(12_000),
+            "the path as it is now, not the 30 000 the pair once carried"
+        );
     }
 
     /// The sibling leaves: the survivor is handed the whole of what the pair

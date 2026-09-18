@@ -378,7 +378,14 @@ fn run(sc: &Scenario) -> Run {
             path_kbps = 0;
             continue;
         }
-        path_kbps = path_kbps.max(governor::path_kbps(&facts));
+        // The most the path has been seen to carry, until the group is short of
+        // what it offers: that is the path being re-measured, and a figure from
+        // before it changed expires there (L1).
+        path_kbps = if governor::crowded(&facts) {
+            governor::path_kbps(&facts)
+        } else {
+            path_kbps.max(governor::path_kbps(&facts))
+        };
         for &i in &members {
             grouped[i] = true;
         }
