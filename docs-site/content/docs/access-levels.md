@@ -77,15 +77,6 @@ hears your whole screen, and game audio is one stream both of you hear.
 A session's quality controls — resolution, bitrate, keyframe requests — are *not* governed. They
 only shape that device's own stream; restricting them would cost usability and buy no security.
 
-**The window list is not a grant.** A client can ask what is open on the screen it is streaming —
-so a player in a full-screen game can see the Discord call or the launcher waiting behind it — and
-every device gets that, spectators included: those windows are already in the picture it receives.
-Only the streamed screen is listed; your other monitors never appear, whatever the access level.
-*Acting* on a window is governed: **Gamepad, Pointer or Keyboard** lets a device focus or
-full-screen one (a device that can send input can already click a window to raise it), and
-**closing** one needs **Launch**, for the same reason Launch governs starting a game — the owner
-drives what runs. A view-only spectator can do none of the three.
-
 ## Temporary access
 
 Any grant can carry an expiry, picked when you approve the device or set later in its edit sheet:
