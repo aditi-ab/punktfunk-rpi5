@@ -267,9 +267,10 @@ impl StandDown {
 mod tests {
     use super::super::controller::{
         BitrateController, CLEAN_WINDOWS_TO_REARM, DECODE_CAP_SIMILAR_DIV, FLOOR_KBPS,
+        LINK_DRAIN_WINDOWS,
     };
     use super::super::harness::*;
-    use super::super::sample::WindowSample;
+    use super::super::sample::{WindowActivity, WindowSample};
     use super::super::verdict::{
         BASELINE_MIN_WINDOWS, HEAVY_LOSS_PPM, RECOVERY_KF_SEVERE, SEVERE_LOSS_PPM,
     };
@@ -278,12 +279,23 @@ mod tests {
     use std::time::Instant;
 
     /// One link-attributed cut, at a rate the session had climbed to.
+    ///
+    /// The guard the last cut armed is spent first — a cut inside one is the
+    /// drain's business, and these tests are about the wall.
     fn link_choke(
         c: &mut BitrateController,
         start: Instant,
         tick: &mut u32,
         delivered_kbps: u32,
     ) -> Option<u32> {
+        for _ in 0..LINK_DRAIN_WINDOWS {
+            let at = ticks(start, *tick);
+            *tick += 1;
+            c.on_window(&WindowSample {
+                activity: WindowActivity::Empty,
+                ..WindowSample::at(at)
+            });
+        }
         let at = ticks(start, *tick);
         *tick += 3;
         c.on_window(&WindowSample {

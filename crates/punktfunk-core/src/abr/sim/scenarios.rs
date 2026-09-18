@@ -433,6 +433,76 @@ pub(super) fn wan_wg_12(seed: u64, duration_ms: u64) -> Scenario {
     }
 }
 
+/// The rig's tunnel, long enough for the re-probe clock to lift into the wall
+/// and for what follows to be read.
+///
+/// Round 6 ran this shape for 600 s three times and averaged 58 % of the link
+/// with 12–21 cuts and 41–87 lost frames per ten minutes: a lift ~5 % over the
+/// wall, a queue that fills for the best part of a minute while the delay
+/// baseline learns the rise, and then a tail drop the controller answers with
+/// four cuts in five seconds. Static, so nothing but the session moves it.
+pub(super) fn wan_lift_overshoot() -> Scenario {
+    Scenario {
+        name: "wan_lift_overshoot",
+        seed: 0x7A_7500,
+        duration_ms: 600_000,
+        link: LinkCfg {
+            capacity: vec![(0, 12_500)],
+            // The rig's, to the parameter: 494 packets of queue, 0.7 % loss,
+            // and a capacity that wanders ±30 % every three minutes — which
+            // is what turns a cap the ladder lifted into an overshoot.
+            wander_pct: 30,
+            wander_ms: 180_000,
+            buffer_ms: 450,
+            base_delay_ms: 10,
+            loss_ppm: 7_000,
+            ..LinkCfg::default()
+        },
+        sessions: vec![wg_session()],
+        // Three quarters of nominal: what a session that respects a link
+        // wandering ±30 % can hold, and the bar round 7 is judged against.
+        achievable_kbps: 9_375,
+        blip_at_ms: None,
+    }
+}
+
+/// The rig's Wi-Fi profile: a 237 Mbps link nothing touches, and a source that
+/// fills 78 % of whatever allowance it is given.
+///
+/// A clean window therefore delivers 78 % of the rate — the content is the
+/// limiter, not the link — and one airtime stall is enough to make the delay
+/// read badly for a window. Round 6 answered that with nine cuts to the
+/// 2 000 kbps floor, three of them while the wire carried 103–190 % of the
+/// rate it was cutting from.
+pub(super) fn wifi_content_bound() -> Scenario {
+    let s = tv_session(
+        20_000,
+        None,
+        vec![ContentPhase {
+            fill_pct: 78,
+            ..ContentPhase::default()
+        }],
+    );
+    Scenario {
+        name: "wifi_content_bound",
+        seed: 0x7A_7600,
+        duration_ms: 180_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 250,
+            base_delay_ms: 3,
+            // Two lost scheduling slices, 800 ms apart: the delay reads
+            // ~20 ms for one window and ~45 ms for the next, then subsides,
+            // with nothing lost — `lc-wifi-1` at 101.9 s and 102.7 s.
+            hiccups: vec![(120_000, 300), (121_500, 300)],
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
+        blip_at_ms: None,
+    }
+}
+
 /// Klos54's tunnel as the rig measured it: 12.05 Mbps behind a queue deep
 /// enough that the ramp's deciding step drains through it and reads ~17 %
 /// low.
@@ -1176,6 +1246,8 @@ pub(super) fn all() -> Vec<Scenario> {
         ramp_cut_short_wan(),
         wan_brownout(),
         wan_ramp_reads_low(),
+        wan_lift_overshoot(),
+        wifi_content_bound(),
     ]
     .into_iter()
     // `old_host` is the host that has none of this: it stays as it is.
@@ -1656,9 +1728,14 @@ mod tests {
                 .count() as u64;
             minutes += duration_ms / 60_000;
         }
+        // The return trips are the link's and do not go away, but the package
+        // is meant to make them rarer: 65 per 100 min before it, 37 with the
+        // cut and the cap, 31 once a measurement's wall became a cap too, 28
+        // once a cut was sized against the wire's own norm. The bound
+        // ratchets downward with them.
         let per_min = wall_cuts * 100 / minutes;
         assert!(
-            per_min >= 30,
+            (10..=35).contains(&per_min),
             "{wall_cuts} cuts from 12 Mbps or above over {minutes} min"
         );
     }
@@ -1746,6 +1823,31 @@ mod tests {
         );
         // The cap is still doing its job: nothing runs away past the wall.
         assert!(m.under5_pct == 0 && m.queue_p95_ms < 100, "{m:?}");
+    }
+
+    /// A lift the tunnel refuses costs the step it was testing, not a third
+    /// of the session.
+    ///
+    /// Round 6 answered every refused lift with a blind ×0.7 — 9 794 down to
+    /// 6 855 with a 9 527 cap standing — and spent the next ten seconds
+    /// climbing back into it. The lift is a probe now: what it retreats to is
+    /// the cap it came from, so no cut on this link lands under the wall the
+    /// session had already learned.
+    #[test]
+    fn a_lift_the_tunnel_refuses_costs_the_cap_step() {
+        let r = run(&with_ramp(wan_lift_overshoot()));
+        for w in r.cuts() {
+            let (to, cap) = (
+                w.request_kbps.expect("a cut asks for a rate"),
+                w.link_cap.expect("the session is riding a learned wall"),
+            );
+            assert!(
+                to >= cap,
+                "{} ms: {} → {to} under a {cap} cap",
+                w.t_ms,
+                w.cut_from_kbps.unwrap_or_default()
+            );
+        }
     }
 
     /// A cell that gets better: the cap it taught has to get out of the way.
@@ -1886,6 +1988,8 @@ mod tests {
             "lte" => lte_variable(),
             "brownout" => wan_brownout(),
             "readslow" => wan_ramp_reads_low(),
+            "overshoot" => wan_lift_overshoot(),
+            "content" => wifi_content_bound(),
             "newcomer" => shared_newcomer(),
             "two" => shared_two_auto(),
             "fixed" => shared_fixed_plus_auto(),
