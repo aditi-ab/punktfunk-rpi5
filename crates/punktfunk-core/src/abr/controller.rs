@@ -702,6 +702,12 @@ impl BitrateController {
                 self.climb_since_backoff = true;
                 self.last_cut = None;
             }
+            if kbps != self.current_kbps {
+                // The host moved the rate: a clamp, or a re-resolve nobody
+                // asked for. Either way what the old rate put on the wire
+                // says nothing about this one.
+                self.forget_rate_norms();
+            }
             self.current_kbps = kbps;
             // Unsolicited `BitrateChanged` can sit above our ceiling (host
             // re-resolved Automatic for what it encodes). Follow it; env cap
@@ -770,6 +776,8 @@ impl BitrateController {
         self.encode_probe = None;
         self.proven.clear();
         self.idle_windows = 0;
+        // A frame of the new mode is a different size on the wire.
+        self.forget_rate_norms();
     }
 
     /// Decide whether this 750 ms window should ask for a new encoder rate.
@@ -949,6 +957,18 @@ impl BitrateController {
             self.last_reason
         });
         self.request(p.cap_kbps, now)
+    }
+
+    /// Forget what this rate looked like, on the wire and in the delay.
+    ///
+    /// Both norms are only true of the rate they were taken at: the parity
+    /// floor, the content's fill and the FEC share move with the rate, and so
+    /// does the queue behind it.
+    fn forget_rate_norms(&mut self) {
+        self.delivery_sum_kbps = 0;
+        self.delivery_windows = 0;
+        self.delay_sum_us = 0;
+        self.delay_windows = 0;
     }
 
     /// What clean windows at this rate have been delivering, or `None` until
@@ -1667,12 +1687,7 @@ impl BitrateController {
     }
 
     fn request(&mut self, kbps: u32, now: Instant) -> Option<u32> {
-        // A new rate is a new regime for the wire: the parity floor, the
-        // content's fill and the FEC share all move with it.
-        self.delivery_sum_kbps = 0;
-        self.delivery_windows = 0;
-        self.delay_sum_us = 0;
-        self.delay_windows = 0;
+        self.forget_rate_norms();
         self.last_change = Some(now);
         self.unacked += 1;
         self.last_requested_kbps = Some(kbps);
@@ -1779,6 +1794,28 @@ mod tests {
             cut(DELIVERY_REF_WINDOWS, 21_000),
             Some(14_000),
             "a blind step, not a link cut"
+        );
+    }
+
+    /// A norm belongs to the rate it was taken at, and the host can move the
+    /// rate without being asked: a re-resolve, a clamp, a mode switch.
+    #[test]
+    fn a_rate_the_host_moved_drops_the_wires_norm() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        for i in 0..DELIVERY_REF_WINDOWS {
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 15_600,
+                ..WindowSample::at(ticks(start, i))
+            });
+        }
+        assert_eq!(c.delivery_reference(), Some(15_600));
+        c.on_ack(40_000, None);
+        assert_eq!(
+            c.delivery_reference(),
+            None,
+            "a different rate, a different wire"
         );
     }
 
