@@ -659,6 +659,10 @@ impl BitrateController {
         self.unacked = 0;
         self.last_requested_kbps = None;
         self.short_acks = 0;
+        // Whatever the overlay was naming, it is not what moved the rate now.
+        // A share has no cause among the five the wire carries, and showing
+        // the last link fault instead would be a lie.
+        self.last_cut = None;
         if kbps == 0 {
             self.share_cap = None;
             tracing::info!("adaptive bitrate: alone on this path again — the share is released");

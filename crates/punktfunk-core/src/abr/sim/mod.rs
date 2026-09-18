@@ -260,10 +260,7 @@ fn run(sc: &Scenario) -> Run {
     let mut next_raise_ms = governor::SHARE_CLOCK.as_millis() as u64;
     let mut next_lift_ms = governor::SHARE_LIFT_CLOCK.as_millis() as u64;
     let mut members: Vec<usize> = Vec::new();
-    // Who is on a shared path, and what the path was last seen carrying for
-    // them. A session left alone is told that figure once: the wall it
-    // measured beside a sibling was the sibling's residual, and the host is
-    // the only one who knows the sibling has gone.
+    // Who is on a shared path, and what it was last seen carrying for them.
     let mut grouped = vec![false; sessions.len()];
     let mut path_kbps = 0;
     // A session that has not joined has sent nothing, so its mark starts
@@ -368,17 +365,22 @@ fn run(sc: &Scenario) -> Run {
             .iter()
             .map(|&i| sessions[i].member(now, offered[i].kbps, shares[i]))
             .collect();
-        if members.len() > 1 {
-            path_kbps = path_kbps.max(governor::path_kbps(&facts));
-        }
-        for &i in &members {
-            if members.len() > 1 {
-                grouped[i] = true;
-            } else if std::mem::take(&mut grouped[i]) && path_kbps > 0 {
-                sessions[i].host.govern(now, path_kbps);
-                shares[i] = Some(path_kbps);
-                path_kbps = 0;
+        if members.len() < 2 {
+            // Alone on the path: hand over the whole of what the group proved
+            // it carried, once. The wall this session measured beside them was
+            // their residual, and nobody but the host knows they have gone.
+            for &i in &members {
+                if std::mem::take(&mut grouped[i]) && path_kbps > 0 {
+                    sessions[i].host.govern(now, path_kbps);
+                    shares[i] = Some(path_kbps);
+                }
             }
+            path_kbps = 0;
+            continue;
+        }
+        path_kbps = path_kbps.max(governor::path_kbps(&facts));
+        for &i in &members {
+            grouped[i] = true;
         }
         let clocks = governor::Clocks {
             room: now >= next_raise_ms,

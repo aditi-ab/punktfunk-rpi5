@@ -109,17 +109,15 @@ fn short(m: &Member) -> bool {
 /// caller-kept, because a session that has gone still is not measuring the
 /// path any more and its sibling should still be told the room is there.
 /// `clocks` says which up-moves may go out; without either, only cuts do.
-/// Fewer than two members is not a group, and every standing share is
-/// released — which is also what keeps a single session's decisions
-/// byte-identical to an ungoverned build.
+///
+/// Fewer than two members is not a group and nothing is said, which is what
+/// keeps a single session's decisions byte-identical to an ungoverned build.
+/// Telling a session its group has ended is the caller's: only it knows there
+/// was one, and what it should hand over is [`path_kbps`] rather than a share
+/// of it.
 pub fn shares(members: &[Member], path_kbps: u32, clocks: Clocks) -> Vec<Option<u32>> {
     let mut out = vec![None; members.len()];
     if members.len() < 2 {
-        for (o, m) in out.iter_mut().zip(members) {
-            if m.automatic && m.share_kbps.is_some() {
-                *o = Some(NO_SHARE_KBPS);
-            }
-        }
         return out;
     }
     let auto: Vec<usize> = (0..members.len())
@@ -383,8 +381,9 @@ mod tests {
         assert_eq!(send(None, 8_000, false), Some(8_000), "the first share");
     }
 
-    /// One session is not a group: nothing is governed, and a session left
-    /// alone on the path gets its ceiling back at once.
+    /// One session is not a group, whatever it is holding: what a session left
+    /// alone is told is its caller's to say, because only the caller knows it
+    /// had a group at all.
     #[test]
     fn one_session_is_not_a_group() {
         assert_eq!(shares(&[auto(20_000, 9_000)], true), [None]);
@@ -392,7 +391,10 @@ mod tests {
             share_kbps: Some(9_000),
             ..auto(9_000, 9_000)
         };
-        assert_eq!(shares(&[survivor], false), [Some(NO_SHARE_KBPS)]);
+        assert_eq!(
+            super::shares(&[survivor], 18_000, Clocks::default()),
+            [None]
+        );
     }
 
     /// A path carrying everything it is offered has nothing to divide: two

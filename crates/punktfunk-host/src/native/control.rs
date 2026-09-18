@@ -31,6 +31,80 @@ fn bitrate_ack(kbps: u32, why: AckReason, client_reads_reason: bool) -> BitrateC
     }
 }
 
+/// The send counter and the client's receive counter as they stood at the last
+/// delivery report, so the next one gives a rate for the same window.
+///
+/// A delivery report is the host's own window boundary: it arrives once per
+/// client report window, and both figures are cumulative, so the pair of diffs
+/// describes one stretch of link rather than two overlapping ones.
+struct ShareWindow {
+    at: std::time::Instant,
+    egress_bytes: u64,
+    packets_received: u64,
+}
+
+impl ShareWindow {
+    fn new(egress_bytes: u64) -> Self {
+        ShareWindow {
+            at: std::time::Instant::now(),
+            egress_bytes,
+            packets_received: 0,
+        }
+    }
+
+    /// `(offered, delivered)` over the window that just closed, kbps.
+    ///
+    /// Delivered is the client's packet count in this session's wire packets:
+    /// the datagram size both ends agreed on, which is what the host has
+    /// without asking for a byte count it never sends.
+    fn close(&mut self, egress_bytes: u64, packets_received: u64, wire_bytes: u64) -> (u32, u32) {
+        let now = std::time::Instant::now();
+        let ms = now.duration_since(self.at).as_millis().max(1) as u64;
+        let kbps = |bytes: u64| u32::try_from(bytes * 8 / ms).unwrap_or(u32::MAX);
+        let offered = kbps(egress_bytes.saturating_sub(self.egress_bytes));
+        let arrived = packets_received.saturating_sub(self.packets_received);
+        *self = ShareWindow {
+            at: now,
+            egress_bytes,
+            packets_received,
+        };
+        (offered, kbps(arrived.saturating_mul(wire_bytes)))
+    }
+}
+
+/// When each of the governor's up-moves may next go out.
+struct ShareClocks {
+    room: std::time::Instant,
+    lift: std::time::Instant,
+}
+
+impl Default for ShareClocks {
+    fn default() -> Self {
+        let now = std::time::Instant::now();
+        ShareClocks {
+            room: now + punktfunk_core::abr::governor::SHARE_CLOCK,
+            lift: now + punktfunk_core::abr::governor::SHARE_LIFT_CLOCK,
+        }
+    }
+}
+
+impl ShareClocks {
+    fn take(&mut self) -> punktfunk_core::abr::governor::Clocks {
+        let now = std::time::Instant::now();
+        let out = punktfunk_core::abr::governor::Clocks {
+            room: now >= self.room,
+            lift: now >= self.lift,
+        };
+        if out.room {
+            self.room = now + punktfunk_core::abr::governor::SHARE_CLOCK;
+        }
+        if out.lift {
+            self.lift = now + punktfunk_core::abr::governor::SHARE_LIFT_CLOCK;
+        }
+        out
+    }
+}
+
 /// Whether this probe request skips the one-per-10 s spacing: a bring-up ramp
 /// step, which is short and lands on a data plane with no video on it.
 ///
@@ -51,6 +125,12 @@ pub(super) struct Task {
     pub(super) live_reconfig_ok: bool,
     pub(super) adaptive_fec: bool,
     pub(super) session_bitrate_kbps: u32,
+    /// Automatic bitrate, so the shared-path governor may move this session. A
+    /// client-set rate and a PyroWave pin are never touched.
+    pub(super) bitrate_automatic: bool,
+    /// One wire packet, bytes. Turns the client's delivery count into the rate
+    /// the governor divides.
+    pub(super) wire_bytes: u64,
     /// Client set `EXT_ABR_ACK_REASON` in its `Start` block: its `BitrateChanged`
     /// may carry the reason byte. Clear for every shipped client, which rejects
     /// a longer ack, and for every client behind a host without `HOST_CAP2_EXT`.
@@ -135,6 +215,8 @@ pub(super) async fn run(task: Task) {
         live_reconfig_ok,
         adaptive_fec,
         session_bitrate_kbps,
+        bitrate_automatic,
+        wire_bytes,
         ack_reason,
         live_bitrate,
         encoder_ceiling,
@@ -202,6 +284,11 @@ pub(super) async fn run(task: Task) {
     // An RFI ask is a frame parity could not repair; the LossReport that
     // closes the window carries only what parity did repair.
     let mut unrecovered = UnrecoveredRun::default();
+    // Shared-path governor: what this session offered and what reached it over
+    // the last window, read at the same boundary so a shortfall describes one
+    // stretch of link, plus the two clocks an up-move rides.
+    let mut window = ShareWindow::new(counters.link.egress_bytes());
+    let mut share_clocks = ShareClocks::default();
     // One `link health` line a minute, ticking whether or not anything arrived: a reader must
     // be able to tell a clean minute from a host that stopped logging.
     let mut link = crate::link_health::LinkWindow::new(&counters.link);
@@ -284,6 +371,35 @@ pub(super) async fn run(task: Task) {
                         rep.packets_received.min(u32::MAX as u64 - 1) as u32,
                         Ordering::Relaxed,
                     );
+                    // This report is the host's own window boundary: publish
+                    // what the window offered and what reached the client, then
+                    // ask the governor what this session's share of the path is
+                    // (`session_status::share_for`). A group of one never has one.
+                    let (offered, delivered) = window.close(
+                        counters.link.egress_bytes(),
+                        rep.packets_received,
+                        wire_bytes,
+                    );
+                    counters.share.publish(bitrate_automatic, offered, delivered);
+                    // `0` until the video loop registers the session; before
+                    // that there is nothing for a sibling to share with.
+                    let id = counters.link.session_id();
+                    if let Some(share) = (id != 0)
+                        .then(|| crate::session_status::share_for(id, share_clocks.take()))
+                        .flatten()
+                    {
+                        // A share under the live rate is a retarget the encoder
+                        // takes now; one above it is a ceiling the client still
+                        // has to earn, so nothing is applied for it.
+                        let live = live_bitrate.load(Ordering::Relaxed);
+                        if share > 0 && live > share && bitrate_tx.send(share).is_err() {
+                            break;
+                        }
+                        let ack = bitrate_ack(share, AckReason::Governor, ack_reason);
+                        if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
+                            break;
+                        }
+                    }
                 } else if let Ok(rep) = LossReport::decode(&msg) {
                     let unrecovered_run = unrecovered.report(std::time::Instant::now());
                     link.note_loss(rep.loss_ppm, unrecovered_run);
@@ -347,12 +463,20 @@ pub(super) async fn run(task: Task) {
                         // ceiling the encoder taught, unless its wait has run
                         // out and this ask is the re-test. A ceiling under the
                         // held rate binds tighter, and names the ack instead.
-                        let (r, ceiling_why) = encoder_ceiling
+                        let (mut r, ceiling_why) = encoder_ceiling
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .resolve(want);
                         if r < want {
                             why = ceiling_why;
+                        }
+                        // The share this session holds on a path it is not
+                        // alone on binds last: whatever else allows, it may not
+                        // take a sibling's half.
+                        let share = counters.share.share_kbps();
+                        if share > 0 && r > share {
+                            r = share;
+                            why = AckReason::Governor;
                         }
                         (r, why)
                     };

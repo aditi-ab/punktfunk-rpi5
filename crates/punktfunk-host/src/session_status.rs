@@ -279,6 +279,8 @@ pub struct SessionCounters {
     /// Per-minute link health ([`crate::link_health`]). Drained by the control task, not by
     /// the summary: these are window deltas, the rest of this block is session totals.
     pub link: crate::link_health::LinkCounters,
+    /// What the shared-path governor reads and writes for this session.
+    pub share: AbrShare,
 }
 
 impl SessionCounters {
@@ -691,12 +693,13 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
     let mut reg = registry().lock().unwrap();
     let sharing = shared_path(&reg, session.id, session.peer);
     if !sharing.is_empty() {
-        // Same address is one NAT or tunnel, not proof of one bottleneck — so an observation.
-        tracing::warn!(
+        // Same address is one NAT or tunnel, not proof of one bottleneck, so the
+        // governor divides only what the group is short of ([`share_for`]).
+        tracing::info!(
             session = session.id,
             peer = ?session.peer,
             others = ?sharing,
-            "sessions share one client address — each adapts its bitrate on its own"
+            "sessions share one client address — Automatic ones take equal shares of it"
         );
     }
     reg.push(session);
@@ -792,6 +795,124 @@ fn shared_path(reg: &[LiveSession], id: u64, peer: Option<std::net::IpAddr>) -> 
         .filter(|s| s.id != id && s.peer == Some(peer))
         .map(|s| s.id)
         .collect()
+}
+
+/// What the shared-path governor reads across the sessions of one client
+/// address, published by each session's control task on its own report cadence.
+///
+/// Here rather than in the control task because the governor divides a path
+/// between sessions, and no task can see its siblings' locals. Relaxed
+/// throughout: a policy input, never synchronisation.
+#[derive(Default)]
+pub struct AbrShare {
+    /// Automatic bitrate, so a share may move it. A fixed rate and a PyroWave
+    /// pin are never touched.
+    automatic: AtomicBool,
+    /// Wire rate the host put out for this session over the last window.
+    offered_kbps: AtomicU32,
+    /// What the client's last `DeliveryReport` came to. `0` = none yet.
+    delivered_kbps: AtomicU32,
+    /// The share this session was last told (`0` = none), the most its group
+    /// has been seen to carry between them, and whether it had a group at all.
+    share_kbps: AtomicU32,
+    path_kbps: AtomicU32,
+    grouped: AtomicBool,
+}
+
+impl AbrShare {
+    /// This session's own view, as its control task takes it.
+    pub fn publish(&self, automatic: bool, offered_kbps: u32, delivered_kbps: u32) {
+        self.automatic.store(automatic, Ordering::Relaxed);
+        self.offered_kbps.store(offered_kbps, Ordering::Relaxed);
+        self.delivered_kbps.store(delivered_kbps, Ordering::Relaxed);
+    }
+
+    /// The ceiling this session is running under. `0` = none.
+    pub fn share_kbps(&self) -> u32 {
+        self.share_kbps.load(Ordering::Relaxed)
+    }
+
+    fn note_share(&self, kbps: u32) {
+        self.share_kbps.store(kbps, Ordering::Relaxed);
+    }
+}
+
+/// This session's ceiling on the path it shares, if the governor has one to
+/// send. `None` leaves the standing share alone.
+///
+/// Every member computes the whole group and applies only its own, so a share
+/// is only ever sent by the task that owns the control stream it goes down.
+/// One session is not a group and nothing here fires for it.
+pub fn share_for(id: u64, clocks: punktfunk_core::abr::governor::Clocks) -> Option<u32> {
+    use punktfunk_core::abr::governor;
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let me = reg.iter().find(|s| s.id == id)?;
+    let peer = me.peer?;
+    let group: Vec<&LiveSession> = reg.iter().filter(|s| s.peer == Some(peer)).collect();
+    let mine = group.iter().position(|s| s.id == id)?;
+    let share = &me.counters.share;
+    if group.len() < 2 {
+        // Alone on the path: hand over the whole of what the group proved it
+        // carried, once. The wall this session measured beside them was their
+        // residual, and nobody but this host knows they have gone.
+        let path = share.path_kbps.swap(0, Ordering::Relaxed);
+        if !share.grouped.swap(false, Ordering::Relaxed) || path == 0 {
+            return None;
+        }
+        share.note_share(path);
+        tracing::info!(
+            session = id,
+            peer = %peer,
+            path_kbps = path,
+            "adaptive bitrate: alone on this path again — all of it is this session's"
+        );
+        return Some(path);
+    }
+    share.grouped.store(true, Ordering::Relaxed);
+    let members: Vec<governor::Member> = group.iter().map(|s| member(s)).collect();
+    // What the path has carried for this group, kept per session because each
+    // of them asks on its own clock.
+    let now = governor::path_kbps(&members);
+    let path = share.path_kbps.fetch_max(now, Ordering::Relaxed).max(now);
+    let share = governor::shares(&members, path, clocks)[mine]?;
+    me.counters.share.note_share(share);
+    tracing::info!(
+        session = id,
+        peer = %peer,
+        share_kbps = share,
+        rate_kbps = me.bitrate_kbps.load(Ordering::Relaxed),
+        others = group.len() - 1,
+        "adaptive bitrate: this session's share of a path it is not alone on"
+    );
+    Some(share)
+}
+
+/// One live session as the governor reads it.
+fn member(s: &LiveSession) -> punktfunk_core::abr::governor::Member {
+    let share = &s.counters.share;
+    punktfunk_core::abr::governor::Member {
+        automatic: share.automatic.load(Ordering::Relaxed),
+        current_kbps: s.bitrate_kbps.load(Ordering::Relaxed),
+        offered_kbps: share.offered_kbps.load(Ordering::Relaxed),
+        // `0` is "no report yet": the client has not told this host anything
+        // about what is arriving, which is not the same as nothing arriving.
+        delivered_kbps: match share.delivered_kbps.load(Ordering::Relaxed) {
+            0 => None,
+            kbps => Some(kbps),
+        },
+        // The capturer's own verdict that the source has nothing new, so the
+        // host is repeating the last picture rather than encoding motion.
+        idle: s
+            .capture_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|h| h.class == "idle"),
+        share_kbps: match share.share_kbps.load(Ordering::Relaxed) {
+            0 => None,
+            kbps => Some(kbps),
+        },
+    }
 }
 
 pub fn count() -> usize {
@@ -1209,6 +1330,111 @@ mod tests {
             peer,
         });
         (guard, controls)
+    }
+
+    /// A live session at `peer` with its own counter block, so a test can
+    /// publish what the governor reads and move the rate it hands out.
+    fn fake_member(
+        client: &str,
+        peer: std::net::IpAddr,
+        kbps: u32,
+    ) -> (LiveSessionGuard, Arc<SessionCounters>, Arc<AtomicU32>) {
+        let counters = Arc::new(SessionCounters::default());
+        let bitrate_kbps = Arc::new(AtomicU32::new(kbps));
+        let guard = register(Registration {
+            mode: Arc::new(AtomicU64::new(0)),
+            bitrate_kbps: bitrate_kbps.clone(),
+            codec: Codec::H265,
+            stop: Arc::new(AtomicBool::new(false)),
+            quit: Arc::new(AtomicBool::new(false)),
+            force_idr: Arc::new(AtomicBool::new(false)),
+            client: client.into(),
+            client_name: None,
+            plane: crate::events::Plane::Native,
+            hdr: false,
+            ttff_ms: Arc::new(AtomicU32::new(0)),
+            last_resize_ms: Arc::new(AtomicU32::new(0)),
+            game: None,
+            capture_health: Arc::new(Mutex::new(None)),
+            join: false,
+            controls: SessionControls::open(),
+            bit_depth: 8,
+            chroma: ChromaFormat::Yuv420,
+            end_reason: Arc::new(AtomicU8::new(0)),
+            counters: counters.clone(),
+            peer: Some(peer),
+        });
+        (guard, counters, bitrate_kbps)
+    }
+
+    fn both_clocks() -> punktfunk_core::abr::governor::Clocks {
+        punktfunk_core::abr::governor::Clocks {
+            room: true,
+            lift: true,
+        }
+    }
+
+    /// Two Automatic sessions from one address, each asking an 18 Mbps path
+    /// for 12: each is told half of what is actually arriving.
+    #[test]
+    fn two_automatic_sessions_on_one_address_take_equal_shares() {
+        let peer: std::net::IpAddr = "203.0.113.90".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (b, bc, _br) = fake_member("pc", peer, 12_000);
+        for c in [&ac, &bc] {
+            c.share.publish(true, 12_000, 9_000);
+        }
+        assert_eq!(share_for(a.id, both_clocks()), Some(9_000));
+        assert_eq!(share_for(b.id, both_clocks()), Some(9_000));
+        assert_eq!(ac.share.share_kbps(), 9_000, "and it is remembered");
+    }
+
+    /// A fixed-rate session takes what it is set to off the top and is never
+    /// told anything; the Automatic one gets what is left.
+    #[test]
+    fn a_fixed_rate_session_is_never_told_a_share() {
+        let peer: std::net::IpAddr = "203.0.113.91".parse().unwrap();
+        let (auto, auto_c, _ar) = fake_member("phone", peer, 14_000);
+        let (fixed, fixed_c, _fr) = fake_member("pc", peer, 8_000);
+        auto_c.share.publish(true, 14_000, 10_000);
+        fixed_c.share.publish(false, 8_000, 8_000);
+        assert_eq!(share_for(fixed.id, both_clocks()), None);
+        assert_eq!(fixed_c.share.share_kbps(), 0, "nothing was written either");
+        assert_eq!(
+            share_for(auto.id, both_clocks()),
+            Some(10_000),
+            "18 Mbps arriving, less the fixed 8"
+        );
+    }
+
+    /// One session is not a group, whatever it reports.
+    #[test]
+    fn a_session_alone_on_its_address_is_never_governed() {
+        let peer: std::net::IpAddr = "203.0.113.92".parse().unwrap();
+        let (only, c, _r) = fake_member("phone", peer, 20_000);
+        c.share.publish(true, 20_000, 9_000);
+        assert_eq!(share_for(only.id, both_clocks()), None);
+    }
+
+    /// The sibling leaves: the survivor is handed the whole of what the pair
+    /// proved the path carried, because the wall it measured beside them was
+    /// their residual. Once, and then never again.
+    #[test]
+    fn a_survivor_is_handed_the_path_its_group_proved() {
+        let peer: std::net::IpAddr = "203.0.113.93".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (b, bc, _br) = fake_member("pc", peer, 12_000);
+        for c in [&ac, &bc] {
+            c.share.publish(true, 12_000, 9_000);
+        }
+        assert_eq!(share_for(a.id, both_clocks()), Some(9_000));
+        drop(b);
+        assert_eq!(
+            share_for(a.id, both_clocks()),
+            Some(18_000),
+            "all of what the two of them were carrying"
+        );
+        assert_eq!(share_for(a.id, both_clocks()), None, "and only the once");
     }
 
     /// One address is one NAT or tunnel: each session names the others there, and an

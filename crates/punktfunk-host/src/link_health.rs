@@ -144,6 +144,11 @@ impl LinkCounters {
         self.session_id.store(id, Ordering::Relaxed);
     }
 
+    /// That id, or `0` while the video loop has yet to register this session.
+    pub fn session_id(&self) -> u64 {
+        self.session_id.load(Ordering::Relaxed)
+    }
+
     /// One recovery AU the encoder produced for an RFI: a clean anchor P, or the start of an
     /// intra refresh wave. Called from [`crate::native::stream::encode`] per AU.
     pub fn note_recovery_au(&self, anchor_p: bool, wave_start: bool) {
