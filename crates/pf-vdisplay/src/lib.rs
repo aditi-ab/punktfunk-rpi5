@@ -654,6 +654,15 @@ pub fn gamescope_composites_cursor() -> bool {
     )
 }
 
+/// May the capture offer tiled dmabuf modifiers to this gamescope? Same two terms as
+/// [`gamescope_hdr_available`]; `false` keeps the LINEAR-only offer every gamescope links.
+pub fn gamescope_tiled_capture() -> bool {
+    gamescope_ours_and(
+        #[cfg(target_os = "linux")]
+        gamescope::gamescope_offers_tiled_capture,
+    )
+}
+
 /// Shared half of the HDR/cursor answers: this host must **spawn** the
 /// session (an attach inherits someone else's flags), then `probe` the binary.
 ///

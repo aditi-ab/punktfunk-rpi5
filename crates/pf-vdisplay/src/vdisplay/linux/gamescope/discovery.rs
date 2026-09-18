@@ -520,6 +520,12 @@ pub(crate) fn gamescope_paints_on_commit() -> bool {
     gamescope_patch_level() >= 10 && !flags_lost()
 }
 
+/// The capture node lists tiled modifiers and fixates the one the consumer keeps. Below
+/// this its single LINEAR choice fixates our default, so a tiled default fails the link.
+pub(crate) fn gamescope_offers_tiled_capture() -> bool {
+    gamescope_patch_level() >= 21 && !flags_lost()
+}
+
 /// `GAMESCOPE_SET_OUTPUT_MODE`. Below this a spawn serves the one mode it was started at, and
 /// a client asking for another retires it.
 pub(crate) fn gamescope_can_resize_output() -> bool {
