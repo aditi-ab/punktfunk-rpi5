@@ -321,7 +321,8 @@ jobs:
           VERSION_CODE: ${{ github.run_number }}
         run: ./gradlew :app:assembleDebug --stacktrace
 
-      # Debug APKs keep the symbol table (app/build.gradle.kts); release ones are stripped below.
+      # Every .so carries a build-id. Debug APKs keep the symbol table (app/build.gradle.kts);
+      # release ones are stripped below.
       - name: Debug native libs keep their symbols
         run: sh scripts/ci/check-android-strip.sh clients/android/app/build/outputs/apk/debug/app-debug.apk symbols
 

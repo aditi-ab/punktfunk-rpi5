@@ -106,6 +106,12 @@ fun Exec.cargoNdkEnvironment() {
     // (pure C) so the android .so links it instead of looking for the host's libopus.so.
     environment("LIBOPUS_STATIC", "1")
     environment("LIBOPUS_NO_PKG", "1")
+    // A GNU build-id ties a tombstone to its symbols. Target-scoped, so host build scripts and
+    // desktop builds keep their flags. A RUSTFLAGS env overrides it, and check-android-strip.sh
+    // then fails the build.
+    for (triple in listOf("AARCH64_LINUX_ANDROID", "ARMV7_LINUX_ANDROIDEABI", "X86_64_LINUX_ANDROID")) {
+        environment("CARGO_TARGET_${triple}_RUSTFLAGS", "-C link-arg=-Wl,--build-id=sha1")
+    }
     // The Skia console (pf-console-ui over skia-bindings): prebuilt Skia archives are keyed by
     // target + features (see the fetchSkiaBinaries block below for provenance and digests).
     // The default hands skia-bindings a file:// template into the directory fetchSkiaBinaries
