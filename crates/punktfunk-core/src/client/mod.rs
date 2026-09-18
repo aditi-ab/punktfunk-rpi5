@@ -260,8 +260,7 @@ pub struct NativeClient {
     pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]>,
     /// Pads translated into pointer and keys ([`NativeClient::set_pad_mouse`]).
     pad_mouse: Arc<pad_mouse::PadMouseShared>,
-    /// Live invert-scroll toggle ([`NativeClient::set_invert_scroll`]). The input
-    /// task reads it per event, so a mid-session flip needs no wake-up.
+    /// Live setting read by the shared input seam for every scroll event.
     scroll_invert: Arc<AtomicBool>,
     hdr_meta: Mutex<Receiver<HdrMeta>>,
     /// Per-AU capture→send timings. Client always advertises [`quic::VIDEO_CAP_HOST_TIMING`];
@@ -1695,22 +1694,7 @@ impl NativeClient {
         Ok(())
     }
 
-    /// Replace the controller-mouse layout — plain buttons, chords, and the pointer, scroll,
-    /// deadzone and long-press tunables — from a JSON document. `None` restores the shipped
-    /// table. A pad already in controller mouse keeps the layout it entered with.
-    pub fn set_pad_mouse_layout(&self, doc: Option<&str>) -> Result<()> {
-        let layout = match doc {
-            Some(json) => pad_mouse::Layout::parse(json)?,
-            None => pad_mouse::Layout::default(),
-        };
-        self.pad_mouse.set_layout(layout);
-        Ok(())
-    }
-
-    /// Invert every scroll delta this session sends — the natural-scroll toggle.
-    /// Applied once at the outbound seam, so wheel, continuous and controller-mouse
-    /// scroll invert identically and a mid-session flip takes effect on the next
-    /// event. `false` restores the host convention.
+    /// Change scroll direction for this session at the shared outbound seam.
     pub fn set_invert_scroll(&self, invert: bool) {
         self.scroll_invert.store(invert, Ordering::Relaxed);
     }

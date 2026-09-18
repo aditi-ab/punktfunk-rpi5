@@ -25,7 +25,7 @@
 // Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 // Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
 // in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 36
+#define PUNKTFUNK_ABI_VERSION 37
 
 // punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 //
@@ -241,12 +241,6 @@
 // host injector puts wire touch contacts on its desktop. Without the bit, fall
 // back to a cursor model — the host drops every contact silently.
 #define PUNKTFUNK_HOST_CAP2_TOUCH 2
-
-// Host-capability bit in [`punktfunk_connection_host_caps2`] (second byte): the
-// host injector consumes normalized scroll (`PUNKTFUNK_INPUT_KIND_SCROLL`).
-// Without the bit the client converts to `PUNKTFUNK_INPUT_KIND_MOUSE_SCROLL`
-// before anything goes on the wire.
-#define PUNKTFUNK_HOST_CAP2_SCROLL 8
 
 // Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): BACK channel pair —
 // DualSense voice-coil haptics, 5 ms Opus frames.
@@ -2639,29 +2633,11 @@ PunktfunkStatus punktfunk_connection_set_pad_mouse(PunktfunkConnection *c, uint1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Invert every scroll delta this session sends — the natural-scroll toggle. Applies to
-// wheel and continuous deltas alike, once, at the outbound seam, so controller-mouse
-// scroll and normalized `PUNKTFUNK_INPUT_KIND_SCROLL` events invert identically.
-// `invert=false` restores the host convention. Live: the next event follows the new
-// setting. Session-scoped.
+// Change scroll direction for this session at the shared outbound seam.
 //
 // # Safety
 // `c` is a valid connection handle. Callable from any thread.
 PunktfunkStatus punktfunk_connection_set_invert_scroll(PunktfunkConnection *c, bool invert);
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Replace the controller-mouse layout from a JSON document: `settings` (the `pointer` and
-// `scroll` multipliers, `deadzone`, `long_press_ms`), a `buttons` table of pad button to
-// `mouse:left` / `key:Escape`, and a `chords` array of `buttons` + `press`
-// (`any` / `short` / `long` / `hold`) + `keys`. NULL restores the shipped table. A pad already
-// in controller mouse keeps the layout it entered with. `InvalidArg` on a document that does
-// not parse, and the live layout is left alone.
-//
-// # Safety
-// `c` is a valid connection handle; `json` is a NUL-terminated UTF-8 string or NULL.
-// Callable from any thread.
-PunktfunkStatus punktfunk_connection_set_pad_mouse_layout(PunktfunkConnection *c, const char *json);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

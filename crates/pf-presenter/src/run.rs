@@ -870,6 +870,17 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         st.relearn_grid(&window);
                     }
                 }
+                // Windows never auto-repeats injected input, so a held key needs these.
+                // Chords and toggles below fire on the first press only.
+                Event::KeyDown {
+                    scancode: Some(sc),
+                    repeat: true,
+                    ..
+                } => {
+                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
+                        cap.on_key_repeat(sc);
+                    }
+                }
                 Event::KeyDown {
                     keycode,
                     scancode: Some(sc),

@@ -84,7 +84,6 @@ fn sync_mouse(
                     pad,
                     ..Default::default()
                 }),
-                args.shared.layout(),
             );
             if let Some(snap) = pads[idx].as_mut() {
                 *snap = GamepadSnapshot {
@@ -249,7 +248,7 @@ pub(super) async fn run(
                     send_input(&conn, &mut scroll_out, &mouse_args, ev);
                 }
                 flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
-                if !mouse.ticking() {
+                if !mouse.moving() {
                     last_mouse_tick = None;
                 }
                 let live = (0..MAX_PADS)
@@ -260,11 +259,11 @@ pub(super) async fn run(
             _ = mouse_args.shared.changed.notified() => {
                 sync_mouse(&conn, &mut mouse, &mouse_args, &mut scroll_out, &mut pads, &mut dirty);
                 flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
-                if !mouse.ticking() {
+                if !mouse.moving() {
                     last_mouse_tick = None;
                 }
             }
-            _ = mouse_tick.tick(), if mouse.ticking() => {
+            _ = mouse_tick.tick(), if mouse.moving() => {
                 let now = std::time::Instant::now();
                 let dt = last_mouse_tick.map_or(TICK, |t| now.duration_since(t));
                 last_mouse_tick = Some(now);

@@ -170,9 +170,9 @@ const KEY_NAMES: &[(&str, u8)] = &[
     ("capslock", 0x14),
 ];
 
-/// Windows VK for a stored key name. The wire is VKs; a preset or a controller-mouse
-/// layout stores names, so one document fires on every client. `None` means this build
-/// does not know the name — the chord does not fire. The Kotlin and Swift `keyVk` twins
+/// Windows VK for a stored key name. The wire is VKs; a ring preset stores names, so one
+/// preset works on every client. `None` means this build does not know the name — the
+/// shortcut does not fire. The Kotlin and Swift `keyVk` twins
 /// replay `testdata/key-vk-vectors.json`, which `key_vk_vectors_are_checked_in` regenerates.
 pub fn key_vk(name: &str) -> Option<u8> {
     let n = name.trim().to_ascii_lowercase();
