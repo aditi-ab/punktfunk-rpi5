@@ -198,6 +198,11 @@ pub(crate) struct BitrateController {
     /// Two identical short acks latch this. Kept apart from `ceiling_kbps` so a
     /// mode switch does not drop probe-measured link authority.
     pub(super) host_cap: LearnedCap,
+    /// This session's share of a path it is not alone on
+    /// ([`super::governor`]). A plain ceiling, not a [`LearnedCap`]: the host
+    /// owns both directions and re-tests the path itself, so there is no
+    /// clock here to re-probe on. Survives a mode switch — the group does.
+    pub(super) share_cap: Option<u32>,
     /// Last [`request`](Self::request). Taken (not kept) by the ack, so one
     /// request is judged at most once.
     pub(super) last_requested_kbps: Option<u32>,
@@ -275,6 +280,7 @@ impl BitrateController {
             encode_down: StandDown::new(),
             cadence_hold: StandDown::new(),
             host_cap: LearnedCap::new(),
+            share_cap: None,
             last_requested_kbps: None,
             short_ack_kbps: 0,
             short_acks: 0,
@@ -563,10 +569,15 @@ impl BitrateController {
     ///
     /// [`AckReason`] says which limit answered. A pinned session has no rate to
     /// control; a cadence refusal is a busy GPU, held on a clock and never
-    /// latched. An ack with no reason is an older host, read as today.
+    /// latched; a governor share is a ceiling, not an answer to anything this
+    /// session asked. An ack with no reason is an older host, read as today.
     pub(crate) fn on_ack(&mut self, kbps: u32, why: Option<AckReason>) {
         if why == Some(AckReason::Pinned) {
             self.on_pinned(kbps);
+            return;
+        }
+        if why == Some(AckReason::Governor) {
+            self.on_share(kbps);
             return;
         }
         if kbps > 0 {
@@ -621,6 +632,34 @@ impl BitrateController {
             self.raise_ceiling(kbps);
         }
         self.unacked = 0;
+    }
+
+    /// The host divided a path this session shares with another
+    /// ([`super::governor`]): `kbps` is the ceiling it may climb to, and
+    /// [`NO_SHARE_KBPS`](super::governor::NO_SHARE_KBPS) is the group ending.
+    ///
+    /// Never a target, and never authority to climb: the growth law still has
+    /// to earn every step under it. A share below the live rate is a retarget
+    /// the host has already applied, so it is the rate now — reading it as a
+    /// short ack instead would latch a host cap off the host's own clamp.
+    fn on_share(&mut self, kbps: u32) {
+        self.unacked = 0;
+        self.last_requested_kbps = None;
+        self.short_acks = 0;
+        if kbps == 0 {
+            self.share_cap = None;
+            tracing::info!("adaptive bitrate: alone on this path again — the share is released");
+            return;
+        }
+        self.share_cap = Some(kbps);
+        if kbps < self.current_kbps {
+            self.baselines.clear_encode();
+            self.current_kbps = kbps;
+        }
+        tracing::info!(
+            share_kbps = kbps,
+            "adaptive bitrate: the host divided this path — climbs stop at this session's share"
+        );
     }
 
     /// The host will not negotiate this session's rate (PyroWave: per-frame
@@ -1321,12 +1360,14 @@ impl BitrateController {
         let proration = growth::proration(w.activity, self.frame_budget_us);
         let utilized = growth::utilized(w.activity, proration, w.actual_kbps, self.current_kbps);
         // Probe = link, short acks = encoder, decode cap = client decoder,
-        // link cap = the wall this session walked into.
+        // link cap = the wall this session walked into, share = the host
+        // dividing a path this session is not alone on.
         let eff_ceiling = self
             .ceiling_kbps
             .min(self.host_cap.kbps().unwrap_or(u32::MAX))
             .min(self.decode_cap.kbps().unwrap_or(u32::MAX))
-            .min(self.link_cap.kbps().unwrap_or(u32::MAX));
+            .min(self.link_cap.kbps().unwrap_or(u32::MAX))
+            .min(self.share_cap.unwrap_or(u32::MAX));
         // Above the env/policy ceiling with no congestion: step down once per
         // distinct target. A host that answers higher cannot go there.
         let ceiling_target = eff_ceiling.max(self.floor_kbps);
@@ -1863,6 +1904,75 @@ mod tests {
         c.on_ack(60_000, None);
         assert_eq!(c.ceiling_kbps, 50_000);
         assert_eq!(run_clean(&mut c, start, 0, 1), Some(50_000));
+    }
+
+    /// The host's share bounds the climb, and a share under the live rate is
+    /// the live rate: the host applied it before it said so.
+    #[test]
+    fn a_share_is_a_ceiling_the_climb_stops_at() {
+        let mut c = BitrateController::new(20_000, None);
+        c.set_ceiling(200_000);
+        let start = Instant::now();
+        let mut t = 0;
+        climb_to(&mut c, start, &mut t, 40_000);
+        c.on_ack(24_000, Some(AckReason::Governor));
+        assert_eq!(c.current_kbps, 24_000, "the host already retargeted to it");
+        assert_eq!(c.share_cap, Some(24_000));
+        assert_eq!(c.host_cap.kbps(), None, "a share is not a short ack");
+        // Clean windows for a minute: the climb stops at the share.
+        for _ in 0..80 {
+            if let Some(k) = c.on_window(&WindowSample {
+                owd_mean_us: Some(10_000),
+                actual_kbps: 1_000_000,
+                ..WindowSample::at(ticks(start, t))
+            }) {
+                c.on_ack(k, None);
+            }
+            t += 1;
+        }
+        assert!(
+            c.current_kbps <= 24_000,
+            "climbed past the share to {}",
+            c.current_kbps
+        );
+        // The group ends: the ceiling goes with it and the session climbs.
+        c.on_ack(
+            super::super::governor::NO_SHARE_KBPS,
+            Some(AckReason::Governor),
+        );
+        assert_eq!(c.share_cap, None);
+        climb_to(&mut c, start, &mut t, 40_000);
+    }
+
+    /// A share that lands while a request is outstanding is not an answer to
+    /// it. The same pair of numbers from a host that names nothing is, which
+    /// is what an old client sees and why it is only slower to lift.
+    #[test]
+    fn a_share_is_never_read_as_the_answer_to_a_request() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000, None);
+        c.set_ceiling(200_000);
+        let ask = run_clean(&mut c, start, 0, 8).expect("a clean run climbs");
+        assert!(ask > 14_000);
+        c.on_ack(14_000, Some(AckReason::Governor));
+        assert_eq!(c.host_cap.kbps(), None, "a share is not a short ack");
+        assert_eq!(c.share_cap, Some(14_000));
+        assert_eq!(c.current_kbps, 14_000);
+
+        let mut old = BitrateController::new(20_000, None);
+        old.set_ceiling(200_000);
+        let mut t = 0;
+        for _ in 0..2 {
+            let ask = run_clean(&mut old, start, t, 8).expect("a clean run climbs");
+            assert!(ask > 14_000);
+            t += 8;
+            old.on_ack(14_000, None);
+        }
+        assert_eq!(
+            old.host_cap.kbps(),
+            Some(14_000),
+            "a nameless ack still binds — safe, and only slower to lift"
+        );
     }
 
     #[test]
