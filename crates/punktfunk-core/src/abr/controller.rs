@@ -271,6 +271,9 @@ pub(crate) struct BitrateController {
     /// owns both directions and re-tests the path itself, so there is no
     /// clock here to re-probe on. Survives a mode switch — the group does.
     pub(super) share_cap: Option<u32>,
+    /// A share above this session's ceiling owes the link cap one early step,
+    /// taken at the first window that leaves a delay to judge it against.
+    share_lift: bool,
     /// Last [`request`](Self::request). Taken (not kept) by the ack, so one
     /// request is judged at most once.
     pub(super) last_requested_kbps: Option<u32>,
@@ -361,6 +364,7 @@ impl BitrateController {
             cadence_hold: StandDown::new(),
             host_cap: LearnedCap::new(),
             share_cap: None,
+            share_lift: false,
             last_requested_kbps: None,
             short_ack_kbps: 0,
             short_acks: 0,
@@ -757,10 +761,10 @@ impl BitrateController {
         // A share above this session's ceiling is the host saying the path has
         // room, not that this session's wall was a sibling's queue: one
         // address is one NAT, and the sibling may be on other air. The
-        // allowance rises, the wall stands, and the cap is asked again now.
+        // allowance rises, the wall stands, and the cap is asked again soon.
         if kbps > self.ceiling_kbps {
             self.raise_ceiling(kbps);
-            self.link_cap.lift_now();
+            self.share_lift = true;
         }
         tracing::info!(
             share_kbps = kbps,
@@ -1389,6 +1393,14 @@ impl BitrateController {
     /// decides whether it holds.
     fn tick_caps(&mut self, v: &Verdict) {
         let (bad, quiet, rate, ceiling) = (v.bad, v.quiet, self.current_kbps, self.ceiling_kbps);
+        // The step a share asked for, once a clean window at this rate has
+        // left a delay to freeze. Taken any sooner it is a commitment, and
+        // the host's evidence is about the path, not about this session's
+        // own air — so it is the one lift that must not go unjudged.
+        if self.share_lift && self.delay_windows > 0 {
+            self.share_lift = false;
+            self.link_cap.lift_now();
+        }
         if let Some((from, to)) = self.host_cap.on_window(bad, quiet, rate, ceiling) {
             tracing::debug!(
                 from_kbps = from,
@@ -2610,10 +2622,11 @@ mod tests {
 
     /// A share above this session's ceiling is an allowance, not evidence
     /// about its own air: the wall it measured stands, slow start does not
-    /// re-arm, and the cap is asked again at the next window instead of on
-    /// its clock.
+    /// re-arm, and the cap is asked again at the next window that can judge
+    /// the answer instead of on its clock.
     #[test]
-    fn a_share_above_the_ceiling_keeps_the_wall_and_asks_it_again() {
+    fn a_share_above_the_ceiling_keeps_the_wall_and_probes_it_again() {
+        let start = Instant::now();
         let mut c = BitrateController::new(20_000, None);
         // Two deliveries at one rate are a wall; the verdict that marked them
         // is what ends slow start in a live session.
@@ -2625,11 +2638,37 @@ mod tests {
         assert_eq!(c.link_cap.kbps(), Some(cap), "a sibling's queue is not it");
         assert!(!c.probing, "and a share is not licence to double");
         assert_eq!(c.ceiling_kbps, 24_000, "only the allowance moved");
-        // Parked at the wall, the next clean window asks it again: one step,
-        // where the clock would have held for a re-probe interval.
         c.on_ack(cap, None);
-        run_clean(&mut c, Instant::now(), 0, 1);
-        assert_eq!(c.link_cap.kbps(), Some(cap + cap / 8));
+        let mut t = 0;
+        let window = |c: &mut BitrateController, t: &mut u32, mean_us: i64| {
+            let at = ticks(start, *t);
+            *t += 1;
+            c.on_window(&WindowSample {
+                owd_mean_us: Some(mean_us),
+                delay: Some(trend(mean_us, 0)),
+                actual_kbps: c.current_kbps,
+                ..WindowSample::at(at)
+            })
+        };
+        // A window the shard path said nothing in freezes nothing, and a lift
+        // with no reference is a commitment. The step waits for one that does.
+        run_clean(&mut c, start, t, 1);
+        t += 1;
+        assert_eq!(c.link_cap.kbps(), Some(cap), "no reference, no step");
+        window(&mut c, &mut t, 10_000);
+        assert_eq!(c.link_cap.kbps(), Some(cap + cap / 8), "the share's step");
+        assert!(c.lift.is_some(), "and it is judged, not granted");
+        // The host takes the lift up and the queue answers it: back to the cap
+        // exactly, no ×0.7, and still on the short clock — this session cannot
+        // tell that queue from the sibling it is sharing with.
+        c.on_ack(cap + cap / 8, None);
+        let over = 10_000 + BitrateController::lift_bar_us(10_000) + 1_000;
+        let mut out = None;
+        for _ in 0..LIFT_OVER_WINDOWS {
+            out = out.or(window(&mut c, &mut t, over));
+        }
+        assert_eq!(out, Some(cap), "the rate it was fine at a window ago");
+        assert_eq!(c.link_cap.reprobe_after(), CAP_REPROBE_WINDOWS_MIN);
     }
 
     /// A share that lands while a request is outstanding is not an answer to
