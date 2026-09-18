@@ -173,6 +173,11 @@ pub(crate) struct BitrateController {
     ceiling_ask_kbps: u32,
     /// What the last window was scored as. Named on every re-target.
     last_reason: Reason,
+    /// What made the latest bad window bad. A backoff can fire on a quiet
+    /// window after the streak, so the cause is kept from the bad one.
+    streak_cut: Option<Reason>,
+    /// Why the last backoff happened; cleared by the next acked climb.
+    last_cut: Option<Reason>,
 }
 
 impl BitrateController {
@@ -218,12 +223,19 @@ impl BitrateController {
             unacked: 0,
             ceiling_ask_kbps: 0,
             last_reason: Reason::Clean,
+            streak_cut: None,
+            last_cut: None,
         }
     }
 
     /// The signal that decided the last window — what named this re-target.
     pub(crate) fn last_reason(&self) -> Reason {
         self.last_reason
+    }
+
+    /// Why the rate was last cut, while it has not climbed since.
+    pub(crate) fn last_cut(&self) -> Option<Reason> {
+        self.last_cut
     }
 
     /// Raise the climb ceiling to a measured link capacity (caller already
@@ -460,6 +472,7 @@ impl BitrateController {
                 // Rate rose: next choke is at a climbed-to rate. An acked
                 // decrease does not arm this — drain is not a knee encounter.
                 self.climb_since_backoff = true;
+                self.last_cut = None;
             }
             self.current_kbps = kbps;
             // Unsolicited `BitrateChanged` can sit above our ceiling (host
@@ -576,6 +589,7 @@ impl BitrateController {
         }
         if v.bad {
             self.bad_windows += 1;
+            self.streak_cut = Some(v.reason);
             if v.decode_bad {
                 // Counted here: backoff only sees the final window, and the
                 // cooldown eats the first ordinary-bad window.
@@ -666,6 +680,7 @@ impl BitrateController {
         }
         self.bad_windows = 0;
         self.streak_decode_windows = 0;
+        self.last_cut = self.streak_cut;
         self.request(next, w.now)
     }
 
@@ -930,6 +945,7 @@ mod tests {
             }),
             Some(14_000)
         );
+        assert_eq!(c.last_cut(), Some(Reason::Loss));
     }
 
     #[test]
