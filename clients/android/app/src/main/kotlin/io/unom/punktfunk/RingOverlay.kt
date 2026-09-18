@@ -304,8 +304,8 @@ private fun spec(slot: SlotId, cfg: OverlayConfig, a: RingActions): SlotSpec = w
     SlotId.StreamMute -> SlotSpec(
         "stream_mute", "Mute this stream",
         if (a.audioMute() != 0) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp,
-        // The shared sentence, so the slot never reads "On" while the host is muting.
-        toggle = true, state = a.audioMuteLabel() ?: "On",
+        // The state describes the mute: "Off" while audible, else whose mute it is.
+        toggle = true, state = a.audioMuteLabel() ?: "Off",
     )
     is SlotId.Host -> {
         val act = a.hostActions().firstOrNull { it.id == slot.actionId }

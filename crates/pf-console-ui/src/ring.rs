@@ -490,10 +490,10 @@ impl Ring {
             },
             SlotId::StreamMute => Spec {
                 toggle: true,
-                // The shared sentence, so the slot never claims sound is back while the
-                // operator's mute stands.
+                // The state describes the mute: `Off` while audible, else the shared
+                // sentence naming whose mute it is.
                 state: punktfunk_core::client::audio_mute_label(f.audio_mute)
-                    .unwrap_or("On")
+                    .unwrap_or("Off")
                     .into(),
                 ..plain(
                     "stream_mute",
@@ -1617,7 +1617,7 @@ mod tests {
 
         let mut r = Ring::new();
         r.set_facts(&RingFacts { ..facts() });
-        assert_eq!(r.spec(&SlotId::StreamMute).state, "On");
+        assert_eq!(r.spec(&SlotId::StreamMute).state, "Off");
 
         r.input(RingInput::Toggle { x: 1.0, y: 1.0 });
         r.fire(&SlotId::StreamMute);
