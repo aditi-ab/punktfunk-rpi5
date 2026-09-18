@@ -264,6 +264,11 @@ pub(super) struct Host {
     /// lands, at what rate, and what the ack will name.
     budget_kbps: u32,
     pending: Option<(u64, u32, AckReason)>,
+    /// This session's share of a path it is not alone on (`0` = none), and the
+    /// unsolicited ack carrying it. Its own slot: a share must not swallow the
+    /// answer the client is waiting for.
+    share_kbps: u32,
+    governing: Option<(u64, u32)>,
     fec_percent: u8,
     unrecovered_run: u32,
     next_id: u32,
@@ -284,6 +289,10 @@ pub(super) struct Host {
     /// so it finishes what it holds before picking the new frame up.
     flush: Option<(u32, u64)>,
     next_cut_ms: u64,
+    /// Video wire bytes this session has handed the link. The host's own send
+    /// counter, in the domain a report window measures: probe filler is not
+    /// in it, because the window it lands in is discarded on the other side.
+    offered_bytes: u64,
 }
 
 impl Host {
@@ -293,6 +302,8 @@ impl Host {
             rng: Rng::new(seed),
             budget_kbps: start_kbps,
             pending: None,
+            share_kbps: 0,
+            governing: None,
             fec_percent: FEC_ADAPTIVE_START,
             unrecovered_run: 0,
             next_id: 1,
@@ -309,12 +320,14 @@ impl Host {
             pace_until_ms: 0,
             flush: None,
             next_cut_ms: 0,
+            offered_bytes: 0,
         }
     }
 
     /// A `SetBitrate` landed. The ack the client gets back is what the encoder
     /// can apply, not what was asked, and it names what held it short
-    /// (`native/control.rs`: the ceiling clamp, then the cadence hold).
+    /// (`native/control.rs`: the share, the ceiling clamp, then the cadence
+    /// hold).
     pub(super) fn on_set_bitrate(&mut self, now_ms: u64, kbps: u32) {
         if !self.cfg.acks {
             return;
@@ -326,6 +339,10 @@ impl Host {
         } else {
             AckReason::Granted
         };
+        if self.share_kbps > 0 && applied > self.share_kbps {
+            applied = self.share_kbps;
+            why = AckReason::Governor;
+        }
         let (from, until) = self.cfg.cadence_refusal_ms;
         if (from..until).contains(&now_ms) && applied > self.budget_kbps {
             applied = self.budget_kbps;
@@ -404,6 +421,46 @@ impl Host {
             0
         };
         self.fec_percent = fec_target(loss_ppm, self.fec_percent, self.unrecovered_run);
+    }
+
+    /// The encoder target, which is the `current_kbps` the host governor reads.
+    pub(super) fn budget_kbps(&self) -> u32 {
+        self.budget_kbps
+    }
+
+    /// Wire bytes handed to the link since the session opened.
+    pub(super) fn offered_bytes(&self) -> u64 {
+        self.offered_bytes
+    }
+
+    /// The source has nothing new: the host is repeating the last picture, so
+    /// this session is not asking for its share.
+    pub(super) fn idle(&self, now_ms: u64) -> bool {
+        self.phase(now_ms).idle
+    }
+
+    /// This session's share of a shared path, on its way to the client.
+    pub(super) fn govern(&mut self, now_ms: u64, share_kbps: u32) {
+        if !self.cfg.acks {
+            return;
+        }
+        self.share_kbps = share_kbps;
+        self.governing = Some((now_ms + self.cfg.retarget_ms, share_kbps));
+    }
+
+    /// The share the unsolicited ack carries, once the retarget lands. A share
+    /// under the live rate retargets the encoder; one above it only travels,
+    /// because the share is a ceiling the client still has to earn.
+    pub(super) fn apply_governor(&mut self, now_ms: u64) -> Option<u32> {
+        let (at, share) = self.governing?;
+        if now_ms < at {
+            return None;
+        }
+        self.governing = None;
+        if share > 0 {
+            self.budget_kbps = self.budget_kbps.min(share);
+        }
+        Some(share)
     }
 
     /// The rate the encoder is now running at, `Some` on the tick it changes,
@@ -516,6 +573,7 @@ impl Host {
             shape.shards() as u64 * (self.cfg.shard_payload as u64 + SHARD_WIRE_OVERHEAD);
         let id = self.next_id;
         self.next_id += 1;
+        self.offered_bytes += wire_bytes;
         // Pacer: the burst leaves now, the overflow over its wire time at 3×
         // the budget, bounded by MAX_PACE_SPREAD.
         let pace_rate_bps = self.budget_kbps as u64 * 1_000 * PACE_FACTOR;

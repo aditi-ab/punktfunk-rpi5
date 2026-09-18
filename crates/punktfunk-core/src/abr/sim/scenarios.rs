@@ -95,6 +95,7 @@ fn tv_session(
 ) -> SessionCfg {
     SessionCfg {
         join_ms: 0,
+        leave_ms: u64::MAX,
         host: HostCfg {
             fps: 165,
             audio_kbps: 512,
@@ -379,6 +380,7 @@ pub(super) fn encoder_weak() -> Scenario {
 fn wg_session() -> SessionCfg {
     SessionCfg {
         join_ms: 0,
+        leave_ms: u64::MAX,
         host: HostCfg {
             fps: 30,
             audio_kbps: 128,
@@ -497,6 +499,7 @@ fn lan(name: &'static str, capacity_kbps: u32, refresh_hz: u32) -> Scenario {
         },
         sessions: vec![SessionCfg {
             join_ms: 0,
+            leave_ms: u64::MAX,
             host: HostCfg {
                 fps: refresh_hz,
                 audio_kbps: 512,
@@ -597,6 +600,33 @@ pub(super) fn shared_newcomer() -> Scenario {
 
 pub(super) fn shared_fixed_plus_auto() -> Scenario {
     shared("shared_fixed_plus_auto", 0, true)
+}
+
+/// One of the two goes still for a minute. Its share is there to lend, and it
+/// wants it back the moment the source produces frames again.
+pub(super) fn shared_idle_lender() -> Scenario {
+    let mut sc = shared("shared_idle_lender", 0, false);
+    sc.sessions[1].host.content = vec![
+        ContentPhase {
+            until_ms: 45_000,
+            ..ContentPhase::default()
+        },
+        ContentPhase {
+            until_ms: 105_000,
+            idle: true,
+            ..ContentPhase::default()
+        },
+        ContentPhase::default(),
+    ];
+    sc
+}
+
+/// One of the two disconnects at a minute: the survivor is alone on the path
+/// and the ceiling the group put on it has to go with the group.
+pub(super) fn shared_leaver() -> Scenario {
+    let mut sc = shared("shared_leaver", 0, false);
+    sc.sessions[1].leave_ms = 60_000;
+    sc
 }
 
 /// August's Phase 3 cases: a still desktop that starts moving, and a source
@@ -1001,6 +1031,7 @@ pub(super) fn no_ramp() -> Scenario {
         },
         sessions: vec![SessionCfg {
             join_ms: 0,
+            leave_ms: u64::MAX,
             host: HostCfg {
                 fps: 60,
                 content: full(),
@@ -1080,6 +1111,7 @@ pub(super) fn fat_pipe_10min() -> Scenario {
         },
         sessions: vec![SessionCfg {
             join_ms: 0,
+            leave_ms: u64::MAX,
             host: HostCfg {
                 fps: 240,
                 audio_kbps: 512,
@@ -1115,6 +1147,8 @@ pub(super) fn all() -> Vec<Scenario> {
         shared_two_auto(),
         shared_newcomer(),
         shared_fixed_plus_auto(),
+        shared_idle_lender(),
+        shared_leaver(),
         gpu_saturated(),
         static_then_motion(),
         frame_driven_35fps(),
@@ -1749,6 +1783,93 @@ mod tests {
         );
     }
 
+    /// Two sessions on one path converge and hold there.
+    ///
+    /// The nested loop the maintainer named on #1135: the host's share sits
+    /// above each client's own controller, and either could chase the other.
+    /// Measured over the last minute of the newcomer run — the leg where both
+    /// are established — the two rates stay within a tenth of each other and
+    /// neither walks away.
+    #[test]
+    fn two_sessions_on_one_path_converge_and_hold() {
+        let r = run(&with_ramp(shared_newcomer()));
+        let held: Vec<(u64, Vec<u32>)> = r
+            .pairs()
+            .into_iter()
+            .filter(|(t, rates)| *t >= 90_000 && rates.iter().all(|&k| k > 0))
+            .collect();
+        assert!(held.len() >= 50, "only {} seconds of overlap", held.len());
+        let mean = |i: usize| -> u64 {
+            held.iter().map(|(_, r)| u64::from(r[i])).sum::<u64>() / held.len() as u64
+        };
+        let (a, b) = (mean(0), mean(1));
+        assert!(
+            a.abs_diff(b) * 10 <= a.max(b),
+            "the two settled {a} and {b} kbps apart, further than a tenth"
+        );
+        // And neither half of the run runs away from the other: a loop that
+        // oscillates shows up as the gap changing sign and growing.
+        let half = held.len() / 2;
+        for leg in [&held[..half], &held[half..]] {
+            let n = leg.len() as u64;
+            let s = |i: usize| leg.iter().map(|(_, r)| u64::from(r[i])).sum::<u64>() / n;
+            let (x, y) = (s(0), s(1));
+            assert!(
+                x.abs_diff(y) * 5 <= x.max(y),
+                "one leg settled {x} against {y}: the pair is still moving"
+            );
+        }
+    }
+
+    /// The row the ramp and the link cap made worse together, repaired: the
+    /// fixed-rate session is never touched, and the Automatic one stops
+    /// filling the queue in front of it.
+    #[test]
+    fn a_fixed_rate_session_keeps_its_rate_and_its_sibling_keeps_the_queue_down() {
+        let r = run(&with_ramp(shared_fixed_plus_auto()));
+        let fixed: Vec<u32> = r.windows[1].iter().map(|w| w.rate_kbps).collect();
+        assert!(
+            fixed.iter().all(|&k| k == 8_000),
+            "the fixed session was moved: {:?}",
+            &fixed[..fixed.len().min(8)]
+        );
+        assert!(
+            r.metrics.queue_p95_ms < 100,
+            "queue p95 {} ms",
+            r.metrics.queue_p95_ms
+        );
+        assert_eq!(r.metrics.lost_per_10min, 0);
+    }
+
+    /// A sibling that goes still lends the path, and a sibling that leaves
+    /// hands it over inside the share clock.
+    #[test]
+    fn a_still_sibling_lends_the_path_and_a_departing_one_hands_it_over() {
+        let r = run(&with_ramp(shared_idle_lender()));
+        let at = |t: u64| r.pairs().into_iter().find(|(s, _)| *s == t).expect("t").1;
+        let (before, during) = (at(44_000)[0], at(70_000)[0]);
+        assert!(
+            during * 4 >= before * 8,
+            "the active session held {during} kbps against {before} while its sibling was still"
+        );
+        // And the lender is back inside a few seconds of asking, because its
+        // own ceiling never went with what it lent.
+        let (still, back) = (at(100_000)[1], at(120_000)[1]);
+        assert!(
+            back >= still * 2,
+            "the lender was at {back} kbps fifteen seconds after producing frames again"
+        );
+
+        let r = run(&with_ramp(shared_leaver()));
+        let at = |t: u64| r.pairs().into_iter().find(|(s, _)| *s == t).expect("t").1;
+        let (shared, alone) = (at(59_000)[0], at(66_000)[0]);
+        assert!(
+            alone * 2 >= shared * 3,
+            "the survivor was still at {alone} kbps six seconds after {shared}"
+        );
+        assert_eq!(r.metrics.lost_per_10min, 0, "no cut on the way");
+    }
+
     /// `SIM_DUMP=c3 cargo test … dump -- --ignored --nocapture`: one
     /// scenario's window trail, for reading a calibration by eye.
     #[test]
@@ -1766,6 +1887,10 @@ mod tests {
             "brownout" => wan_brownout(),
             "readslow" => wan_ramp_reads_low(),
             "newcomer" => shared_newcomer(),
+            "two" => shared_two_auto(),
+            "fixed" => shared_fixed_plus_auto(),
+            "lender" => shared_idle_lender(),
+            "leaver" => shared_leaver(),
             "c6" => wifi_tv_probe_damage(),
             "knee" => decoder_knee(),
             "starved" => starved_client(),
@@ -1786,6 +1911,12 @@ mod tests {
         let r = run(&sc);
         for (i, t) in r.ramps.iter().enumerate() {
             println!("session {i} ramp {:?} asks={:?}", t.done, t.asks);
+        }
+        // Two sessions on one path read as one trajectory or not at all.
+        if r.windows.len() > 1 {
+            for (t_ms, rates) in r.pairs() {
+                println!("t={t_ms:6} {rates:?}");
+            }
         }
         for w in &r.windows[0] {
             println!(

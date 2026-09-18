@@ -146,8 +146,8 @@ pub(super) struct Client {
     rng: Rng,
     /// The scenario's zero, so a millisecond can become an `Instant`. Not the
     /// instant this session joined: a session that joins at 60 s still reads
-    /// the run's clock, and dating a probe result from its own start put its
-    /// report windows a minute into the future.
+    /// the run's clock, and dating its probe results from its own start put
+    /// every report window a minute into the future.
     base: Instant,
     pub(super) abr: Driver,
     flight: VecDeque<InFlight>,
@@ -251,6 +251,28 @@ impl Client {
         } else {
             self.cfg.start_kbps
         }
+    }
+
+    /// `false` = an explicit bitrate, which the governor never touches.
+    pub(super) fn automatic(&self) -> bool {
+        self.cfg.automatic
+    }
+
+    /// What the last report window said arrived, kbps. `None` before the first
+    /// one closes: the host has no delivery report for this session yet, and
+    /// a zero there would read as a path refusing everything.
+    pub(super) fn delivered_kbps(&self) -> Option<u32> {
+        self.windows
+            .iter()
+            .rev()
+            .find(|w| !w.discarded)
+            .map(|w| w.actual_kbps)
+    }
+
+    /// Report windows closed so far. What the host sees as its own count of
+    /// delivery reports, and so when it re-reads its send counter.
+    pub(super) fn reports(&self) -> usize {
+        self.windows.len()
     }
 
     /// Make the next frame unrecoverable, whatever the link does.

@@ -25,15 +25,40 @@ use std::time::Duration;
 /// growth law again, one round-trip behind it.
 pub const SHARE_CLOCK: Duration = Duration::from_secs(5);
 
+/// How often a standing ceiling breathes a band, so a share cannot outlive
+/// the crowding that taught it (L1).
+///
+/// Twelve times the share clock, because this one has no evidence behind it:
+/// a group pressed against its shares is delivering exactly what it asks for,
+/// and the only way to find out whether the path grew is to ask for more and
+/// see. Every ask costs a rebuild and a window of queue, so it is asked about
+/// as often as a learned cap re-probes a standing limit.
+pub const SHARE_LIFT_CLOCK: Duration = Duration::from_secs(60);
+
+/// The two clocks an up-move rides. A cut needs neither.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Clocks {
+    /// [`SHARE_CLOCK`] fired: a session may be told about room a sibling left
+    /// it.
+    pub room: bool,
+    /// [`SHARE_LIFT_CLOCK`] fired: a standing ceiling may breathe.
+    pub lift: bool,
+}
+
 /// A share moves only when it differs from the standing one by more than a
 /// tenth. Under that the two controllers trade the same kilobits back and
 /// forth for the life of the session.
 const SHARE_BAND_DIV: u32 = 10;
 
-/// Delivered within an eighth of the rate it is set to: the path is carrying
-/// what this session offers it. The same band the decode cap calls "the same
-/// rate".
-const SHORT_DIV: u32 = 8;
+/// Delivered within a sixteenth of what the host put on the wire: the path is
+/// carrying what this session offers it.
+///
+/// Tighter than the band on purpose, and that is what settles the two loops.
+/// A session riding one band above its fair share already reads as short, so
+/// the budget stays pinned at what arrives and the share it would be handed
+/// is inside the band of the one it holds. Loosen this past the band and the
+/// pair saws between a notch over and a notch under all session.
+const SHORT_DIV: u32 = 16;
 
 /// A share of `0` releases the ceiling: the group is gone, or this session is
 /// alone on the path again.
@@ -50,8 +75,14 @@ pub struct Member {
     pub automatic: bool,
     /// Encoder target, kbps.
     pub current_kbps: u32,
-    /// What reached the client over the last report window, kbps.
-    pub delivered_kbps: u32,
+    /// Wire rate the host actually put out for this session, kbps. A pipeline
+    /// still coming up offers almost nothing, and a delivery report short of
+    /// nothing is not the path talking.
+    pub offered_kbps: u32,
+    /// What reached the client over the last report window, kbps. `None`
+    /// before this session's first delivery report: a zero there would read
+    /// as a path refusing everything it was offered.
+    pub delivered_kbps: Option<u32>,
     /// The host is sending keepalive repeats: this session is not asking for
     /// its share.
     pub idle: bool,
@@ -60,18 +91,28 @@ pub struct Member {
 }
 
 /// The path refused some of what this session offered it.
+///
+/// A session neither side has yet put the floor rate through says nothing
+/// about the path: the pipeline is still coming up, and a window carrying the
+/// audio reservation and one frame is a shortfall of noise.
 fn short(m: &Member) -> bool {
-    !m.idle && m.delivered_kbps < m.current_kbps - m.current_kbps / SHORT_DIV
+    !m.idle
+        && m.offered_kbps >= FLOOR_KBPS
+        && m.delivered_kbps
+            .is_some_and(|d| d < m.offered_kbps - m.offered_kbps / SHORT_DIV)
 }
 
 /// Shares for a group, in the members' own order. `Some(kbps)` is a ceiling to
 /// send; `None` leaves the standing one alone.
 ///
-/// `may_raise` is the [`SHARE_CLOCK`] tick: without it only cuts go out.
+/// `path_kbps` is the most this group has been seen to carry between them —
+/// caller-kept, because a session that has gone still is not measuring the
+/// path any more and its sibling should still be told the room is there.
+/// `clocks` says which up-moves may go out; without either, only cuts do.
 /// Fewer than two members is not a group, and every standing share is
 /// released — which is also what keeps a single session's decisions
 /// byte-identical to an ungoverned build.
-pub fn shares(members: &[Member], may_raise: bool) -> Vec<Option<u32>> {
+pub fn shares(members: &[Member], path_kbps: u32, clocks: Clocks) -> Vec<Option<u32>> {
     let mut out = vec![None; members.len()];
     if members.len() < 2 {
         for (o, m) in out.iter_mut().zip(members) {
@@ -87,7 +128,12 @@ pub fn shares(members: &[Member], may_raise: bool) -> Vec<Option<u32>> {
     if auto.is_empty() {
         return out;
     }
-    let budget = budget_kbps(members);
+    // Nobody short of what was put on the wire for it: nothing has bound this
+    // path, so nothing here may cut. What is left worth saying is to a member
+    // sitting under what the group has room for — the wall it measured beside
+    // the others was their residual, and only the host can see that.
+    let crowded = members.iter().any(short);
+    let budget = budget_kbps(members, path_kbps, crowded);
     let equal = (budget / auto.len() as u64) as u32;
     // Max-min fair: a member that wants less than an equal share takes what it
     // wants, and the rest split what it left behind.
@@ -95,43 +141,77 @@ pub fn shares(members: &[Member], may_raise: bool) -> Vec<Option<u32>> {
     order.sort_by_key(|&i| demand(&members[i], equal));
     let (mut left, mut rest) = (auto.len() as u64, budget);
     for &i in &order {
-        let take = u64::from(demand(&members[i], equal)).min(rest / left);
+        let m = &members[i];
+        let take = u64::from(demand(m, equal)).min(rest / left);
         rest -= take;
         left -= 1;
-        // Never under what this one is already delivering: it proved the path
-        // had that much, and cutting it would punish the evidence.
-        let share = (take as u32).max(members[i].delivered_kbps).max(FLOOR_KBPS);
-        out[i] = send(members[i].share_kbps, share, may_raise);
+        // Lending decides what the others may have, never what the lender is
+        // allowed: its ceiling stays at an equal share, so taking it back
+        // costs nothing and a session pinned under its share is not read as
+        // one that does not want it. Over-committed while somebody is still,
+        // which is the safe direction: the path answers the moment both ask.
+        let take = take.max(u64::from(equal));
+        if !crowded {
+            // A lift or nothing, from two rules. A standing ceiling breathes a
+            // band on its clock, so it cannot outlive the crowding that taught
+            // it (L1). And a session two bands under the room this group has
+            // is told so: its wall was the others' residual. Two, because a
+            // group's delivery wanders by about one.
+            let breathe = m
+                .share_kbps
+                .filter(|_| clocks.lift)
+                .map(|s| s + s / SHARE_BAND_DIV);
+            let take = take as u32;
+            let room = (clocks.room
+                && take > m.current_kbps + m.current_kbps / (SHARE_BAND_DIV / 2))
+                .then_some(take);
+            if let Some(want) = breathe.into_iter().chain(room).max() {
+                out[i] = send(m.share_kbps, want.max(FLOOR_KBPS), true);
+            }
+            continue;
+        }
+        // A member the path is carrying whole is never cut: one address is one
+        // NAT, and a sibling's trouble is not evidence about its own air. One
+        // that is short is the member filling the queue, and its fair share is
+        // the answer.
+        let keep = if short(m) {
+            0
+        } else {
+            m.delivered_kbps.unwrap_or(0)
+        };
+        let share = (take as u32).max(keep).max(FLOOR_KBPS);
+        out[i] = send(m.share_kbps, share, clocks.room);
     }
     out
 }
 
 /// What there is to divide.
 ///
-/// The group's own delivery, because that is the one wall every member is
-/// measuring together and it is re-taken every window (L1). A wall one member
-/// measured beside a sibling read that sibling's residual, not the path.
-/// Nothing about a session that is getting what it asked for says the path is
-/// full, so a group with no short member asks for a notch more; one short
-/// member pins the budget at what arrived. A fixed-rate session's rate comes
-/// off the top: it is not in the division.
-fn budget_kbps(members: &[Member]) -> u64 {
-    let delivered: u64 = members.iter().map(|m| u64::from(m.delivered_kbps)).sum();
-    let headroom: u64 = if members.iter().any(short) {
-        0
-    } else {
-        members
-            .iter()
-            .filter(|m| !m.idle)
-            .map(|m| u64::from(m.current_kbps) / 8)
-            .sum()
-    };
+/// Once a member has gone short it is the group's delivery right now: the one
+/// wall they measure together, re-taken every window, which is what gives the
+/// bound its expiry (L1). A wall one of them measured beside a sibling read
+/// that sibling's residual, not the path. While nobody is short the most this
+/// group has been seen to carry stands instead, so the room a session lent by
+/// going still is still there when its sibling asks for it. A fixed-rate
+/// session's rate comes off the top either way — it is not in the division.
+fn budget_kbps(members: &[Member], path_kbps: u32, crowded: bool) -> u64 {
+    let now = self::path_kbps(members);
+    let proved = if crowded { now } else { now.max(path_kbps) };
     let fixed: u64 = members
         .iter()
         .filter(|m| !m.automatic)
         .map(|m| u64::from(m.current_kbps))
         .sum();
-    (delivered + headroom).saturating_sub(fixed)
+    u64::from(proved).saturating_sub(fixed)
+}
+
+/// What this group is carrying between them, kbps.
+///
+/// The caller keeps the last one: a session left alone on the path is told it,
+/// because the wall it measured beside a sibling was that sibling's residual
+/// and only the host knows the sibling has gone.
+pub fn path_kbps(members: &[Member]) -> u32 {
+    members.iter().map(|m| m.delivered_kbps.unwrap_or(0)).sum()
 }
 
 /// What a member would use if the path were free. `u32::MAX` = everything it
@@ -142,10 +222,11 @@ fn budget_kbps(members: &[Member]) -> u64 {
 /// is being starved, and asks for the whole share.
 fn demand(m: &Member, equal_kbps: u32) -> u32 {
     if m.idle {
-        return m.delivered_kbps + m.delivered_kbps / 4;
+        let d = m.delivered_kbps.unwrap_or(0);
+        return d + d / 4;
     }
-    if !short(m) && m.current_kbps < equal_kbps {
-        return m.current_kbps + m.current_kbps / 8;
+    if !short(m) && m.offered_kbps < equal_kbps {
+        return m.offered_kbps + m.offered_kbps / SHARE_BAND_DIV;
     }
     u32::MAX
 }
@@ -156,7 +237,7 @@ fn send(standing: Option<u32>, share: u32, may_raise: bool) -> Option<u32> {
     let Some(old) = standing else {
         return Some(share);
     };
-    if share.abs_diff(old) <= old / SHARE_BAND_DIV {
+    if share.abs_diff(old) < old / SHARE_BAND_DIV {
         return None;
     }
     (share < old || may_raise).then_some(share)
@@ -166,33 +247,41 @@ fn send(standing: Option<u32>, share: u32, may_raise: bool) -> Option<u32> {
 mod tests {
     use super::*;
 
+    /// A group with no history behind it, which is how most cases below open.
+    fn shares(members: &[Member], may_raise: bool) -> Vec<Option<u32>> {
+        super::shares(
+            members,
+            0,
+            Clocks {
+                room: may_raise,
+                lift: may_raise,
+            },
+        )
+    }
+
     fn auto(current_kbps: u32, delivered_kbps: u32) -> Member {
         Member {
             automatic: true,
             current_kbps,
-            delivered_kbps,
+            offered_kbps: current_kbps,
+            delivered_kbps: Some(delivered_kbps),
             idle: false,
             share_kbps: None,
         }
     }
 
-    /// Two Automatic sessions on a path carrying 18 Mbps split it, and a pair
-    /// already sitting at that share is left alone.
+    /// Two Automatic sessions asking a path for more than it carries split
+    /// what it does carry, and a pair already sitting near that share is left
+    /// alone.
     #[test]
     fn two_automatic_sessions_split_what_the_path_delivers() {
-        let g = [auto(9_000, 9_000), auto(9_000, 9_000)];
-        assert_eq!(shares(&g, true), [Some(10_125), Some(10_125)]);
-        let held = [
-            Member {
-                share_kbps: Some(10_000),
-                ..g[0]
-            },
-            Member {
-                share_kbps: Some(10_000),
-                ..g[1]
-            },
-        ];
-        assert_eq!(shares(&held, true), [None, None], "inside the band");
+        let g = [auto(12_000, 9_000); 2];
+        assert_eq!(shares(&g, true), [Some(9_000); 2], "half of 18 Mbps each");
+        let held = [Member {
+            share_kbps: Some(9_500),
+            ..g[0]
+        }; 2];
+        assert_eq!(shares(&held, true), [None; 2], "inside the band");
     }
 
     /// The fixed session's rate comes off the top and it is never told
@@ -202,10 +291,7 @@ mod tests {
     fn a_fixed_rate_session_is_never_touched_and_takes_its_rate_off_the_top() {
         let fixed = Member {
             automatic: false,
-            current_kbps: 8_000,
-            delivered_kbps: 8_000,
-            idle: false,
-            share_kbps: None,
+            ..auto(8_000, 8_000)
         };
         let out = shares(&[auto(14_000, 10_000), fixed], true);
         assert_eq!(out[1], None, "a fixed session never gets a governor ack");
@@ -216,22 +302,24 @@ mod tests {
         );
     }
 
-    /// An idle sibling lends what it is not using, and asks for it back by
-    /// producing frames again.
+    /// An idle sibling lends what it is not using, and has nothing to take
+    /// back: lending decides what the other may have, not what the lender is
+    /// allowed.
     #[test]
     fn an_idle_session_lends_its_share_and_takes_it_back() {
         let still = Member {
             idle: true,
+            offered_kbps: 300,
             ..auto(9_000, 300)
         };
-        let out = shares(&[auto(9_000, 9_000), still], true);
-        assert_eq!(out[1], Some(FLOOR_KBPS), "the lender keeps only the floor");
+        let out = shares(&[auto(20_000, 17_700), still], true);
         assert!(
-            out[0].is_some_and(|k| k > 9_000),
-            "the active session takes the rest: {out:?}"
+            out[0].is_some_and(|k| k > 17_000),
+            "the active session takes nearly the whole path: {out:?}"
         );
-        let back = [auto(9_000, 9_000), auto(9_000, 9_000)];
-        assert_eq!(shares(&back, true), [Some(10_125), Some(10_125)]);
+        assert_eq!(out[1], Some(9_000), "the lender keeps an equal share");
+        // Both want it: the path says how much there is and this halves it.
+        assert_eq!(shares(&[auto(20_000, 9_000); 2], true), [Some(9_000); 2]);
     }
 
     /// A member held under its share by its own bounds lends the difference;
@@ -239,11 +327,14 @@ mod tests {
     /// its whole share.
     #[test]
     fn a_self_bounded_member_lends_and_a_starved_one_does_not() {
-        let out = shares(&[auto(4_000, 4_000), auto(14_000, 14_000)], true);
-        assert_eq!(out[0], Some(4_500), "its own bound plus a notch");
-        assert!(out[1].is_some_and(|k| k > 14_000), "the rest: {out:?}");
+        let out = shares(&[auto(4_000, 4_000), auto(18_000, 14_000)], true);
+        assert_eq!(out[0], Some(9_000), "an equal share it is not using");
+        assert!(
+            out[1].is_some_and(|k| k > 13_000),
+            "and the sibling gets more than half: {out:?}"
+        );
 
-        let out = shares(&[auto(12_000, 4_000), auto(14_000, 14_000)], true);
+        let out = shares(&[auto(12_000, 4_000), auto(18_000, 14_000)], true);
         assert_eq!(out[0], Some(9_000), "half of the 18 Mbps that arrived");
     }
 
@@ -278,8 +369,7 @@ mod tests {
             ..auto(17_000, 12_000)
         };
         let out = shares(&[sibling, auto(20_000, 6_000)], true);
-        assert_eq!(out[0], Some(12_000), "down to what arrived, no further");
-        assert_eq!(out[1], Some(9_000), "the newcomer opens at half the path");
+        assert_eq!(out, [Some(9_000), Some(9_000)], "half the path each");
     }
 
     /// The band and the clock: a small move never goes out, a rise waits for
@@ -303,5 +393,38 @@ mod tests {
             ..auto(9_000, 9_000)
         };
         assert_eq!(shares(&[survivor], false), [Some(NO_SHARE_KBPS)]);
+    }
+
+    /// A path carrying everything it is offered has nothing to divide: two
+    /// pipelines still coming up are left entirely alone, and so is a pair
+    /// climbing a link neither of them has filled.
+    #[test]
+    fn a_path_that_is_carrying_the_group_is_left_alone() {
+        let joining = Member {
+            offered_kbps: 0,
+            delivered_kbps: None,
+            ..auto(20_000, 0)
+        };
+        let opening = Member {
+            offered_kbps: 130,
+            delivered_kbps: Some(128),
+            ..auto(4_500, 0)
+        };
+        assert_eq!(shares(&[auto(17_000, 17_000), joining], true), [None; 2]);
+        assert_eq!(shares(&[opening, opening], true), [None; 2]);
+        assert_eq!(shares(&[auto(9_000, 9_000); 2], true), [None; 2]);
+    }
+
+    /// A ceiling an earlier crowd taught cannot outlive it: while the path
+    /// carries everything offered, the standing share breathes a band on the
+    /// clock, and nothing happens between clocks (L1).
+    #[test]
+    fn a_standing_share_breathes_while_nobody_is_short() {
+        let held = Member {
+            share_kbps: Some(9_000),
+            ..auto(9_000, 9_000)
+        };
+        assert_eq!(shares(&[held; 2], true), [Some(9_900); 2]);
+        assert_eq!(shares(&[held; 2], false), [None; 2]);
     }
 }
