@@ -15,14 +15,20 @@ keep() { # <tag> <profile>
 
 PF_RIG_SKIP_BUILD=0 "$HERE/run.sh" nowall_720p 1 >/dev/null 2>&1 || true
 export PF_RIG_SKIP_BUILD=1
+# The drain guard's per-window line is debug; without this the reader can count
+# guard endings but not the windows each one covered.
+export RUST_LOG=${RUST_LOG:-info,punktfunk_core::abr=debug}
 
 echo "== 5: nowall_720p 120 s, the control =="
 "$HERE/run.sh" nowall_720p 120 > "$OUT/lc-nowall-1.run" 2>&1 && keep lc-nowall-1 nowall_720p
 echo "  done"
 
-echo "== 4: wifi_tv_probe_damage 300 s x2, decoder hold =="
-for r in 1 2; do
-  PF_RIG_DECODER_HOLD=1 "$HERE/run.sh" wifi_tv_probe_damage 300 \
+# Three runs, not two: round 6's two split 35 % / 73 % and a coin flip needs a
+# third face. PUNKTFUNK_PERF puts the host's send-loop percentiles in its log,
+# which is how a standing delay at a low rate is read.
+echo "== 4: wifi_tv_probe_damage 300 s x3, decoder hold, host perf =="
+for r in 1 2 3; do
+  PF_RIG_DECODER_HOLD=1 PUNKTFUNK_PERF=1 "$HERE/run.sh" wifi_tv_probe_damage 300 \
     > "$OUT/lc-wifi-$r.run" 2>&1 && keep "lc-wifi-$r" wifi_tv_probe_damage
   echo "  run $r done"
 done
