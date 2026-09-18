@@ -25,11 +25,12 @@ bun build src/runner-cli.ts --target=bun --outfile /runner.js >/dev/null || { ec
 export HOME=/root
 CFG=$HOME/.config/punktfunk
 P=$CFG/plugins/node_modules/punktfunk-plugin-probe
-mkdir -p "$P" "$HOME/.ssh" "$HOME/steamlike" "$HOME/granted"
+mkdir -p "$P" "$HOME/.ssh" "$HOME/steamlike" "$HOME/granted" "$HOME/dynamic"
 echo "secret-admin-token"  > "$CFG/mgmt-token"
 echo "private key"         > "$HOME/.ssh/id_ed25519"
 echo "library-data"        > "$HOME/steamlike/marker"
 echo "granted-data"        > "$HOME/granted/marker"
+echo "dynamic-data"        > "$HOME/dynamic/marker"
 echo '{"probe":"testtoken"}' > "$CFG/plugin-tokens.json"
 printf '{"probe":["/root/granted"]}' > "$CFG/plugin-grants.json"
 printf '{"dependencies":{"punktfunk-plugin-probe":"*"}}' > "$CFG/plugins/package.json"
@@ -49,6 +50,7 @@ o.push(say("declared", (() => { try { return fs.readFileSync(home + "/steamlike/
 o.push(say("declared_ro", (() => { try { fs.writeFileSync(home + "/steamlike/w", "x"); return "WRITABLE"; } catch { return "readonly"; } })()));
 o.push(say("granted", (() => { try { return fs.readFileSync(home + "/granted/marker", "utf8").trim(); } catch { return "UNREACHABLE"; } })()));
 o.push(say("granted_write", (() => { try { fs.writeFileSync(home + "/granted/w", "x"); return "WRITABLE"; } catch (e) { return e.code; } })()));
+o.push(say("dynamic", (() => { try { return fs.readFileSync(home + "/dynamic/marker", "utf8").trim(); } catch { return "UNREACHABLE"; } })()));
 o.push(say("state", (() => { try { fs.writeFileSync("/run/punktfunk/plugin-state/w", "x"); return "writable"; } catch { return "UNWRITABLE"; } })()));
 o.push(say("owntoken", (() => { try { fs.readFileSync("/run/punktfunk/plugin-token", "utf8"); return "present"; } catch { return "MISSING"; } })()));
 o.push(say("procs", fs.readdirSync("/proc").filter((d) => /^\d+$/.test(d)).length));
@@ -62,9 +64,31 @@ JS
 
 chmod -R go-w "$CFG"
 LOG=$(mktemp)
-timeout 60 bun /runner.js --plugins "$CFG/plugins" --scripts /nonexistent > "$LOG" 2>&1
-line=$(grep -m1 '^PROBE ' "$LOG")
+timeout 60 bun /runner.js --plugins "$CFG/plugins" --scripts /nonexistent > "$LOG" 2>&1 &
+RUNNER_PID=$!
+cleanup() {
+  kill "$RUNNER_PID" 2>/dev/null || true
+  wait "$RUNNER_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+line=""
+for _ in $(seq 1 100); do
+  line=$(grep -m1 '^PROBE ' "$LOG" || true)
+  [ -n "$line" ] && break
+  sleep 0.1
+done
 [ -n "$line" ] || { echo "FAIL: the plugin never started"; tail -20 "$LOG"; exit 1; }
+
+# The same runner must notice the atomic grant rewrite and restart only this plugin.
+printf '{"probe":["/root/granted","/root/dynamic"]}' > "$CFG/plugin-grants.json.tmp"
+mv "$CFG/plugin-grants.json.tmp" "$CFG/plugin-grants.json"
+dynamic_line=""
+for _ in $(seq 1 50); do
+  dynamic_line=$(grep '^PROBE ' "$LOG" | grep 'dynamic=dynamic-data' | tail -1 || true)
+  [ -n "$dynamic_line" ] && break
+  sleep 0.1
+done
 
 pass=0; fail=0
 want() { # label, key, expected
@@ -80,6 +104,19 @@ want "the declared root IS there"        declared    library-data
 want "the declared root is READ-ONLY"    declared_ro readonly
 want "the granted root IS there"         granted     granted-data
 want "the granted root is READ-ONLY"     granted_write EROFS
+want "an ungranted root is absent"        dynamic     UNREACHABLE
+if [ -n "$dynamic_line" ]; then
+  echo "  ok   a live grant restarts the plugin with the new root"; pass=$((pass+1))
+else
+  echo "  FAIL the live grant was not visible within 5 seconds"; fail=$((fail+1))
+  tail -20 "$LOG"
+fi
+restart_count=$(grep -c '\[runner\] probe: folder access changed — restarting' "$LOG" || true)
+if [ "$restart_count" -eq 1 ]; then
+  echo "  ok   the grant caused exactly one targeted restart"; pass=$((pass+1))
+else
+  echo "  FAIL targeted restart count is $restart_count (want 1)"; fail=$((fail+1))
+fi
 want "its own state dir IS writable"     state       writable
 want "its own token IS there"            owntoken    present
 want "HOME is the real home"             homedir     /root

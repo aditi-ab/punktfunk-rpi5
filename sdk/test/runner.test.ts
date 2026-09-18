@@ -355,6 +355,77 @@ describe("supervision", () => {
 		}
 	});
 
+	test("a grants change restarts only the affected sandboxed plugin", async () => {
+		const d = mkdirs("grant-restart");
+		const packages = ["one", "two"];
+		for (const id of packages) {
+			const pkg = path.join(d.pluginsDir, "node_modules", `punktfunk-plugin-${id}`);
+			write(
+				path.join(pkg, "package.json"),
+				JSON.stringify({
+					name: `punktfunk-plugin-${id}`,
+					main: "index.js",
+					punktfunk: { schema: 1, id },
+				}),
+			);
+			write(path.join(pkg, "index.js"), "export default {};");
+		}
+		write(
+			path.join(d.pluginsDir, "package.json"),
+			JSON.stringify({
+				dependencies: Object.fromEntries(packages.map((id) => [`punktfunk-plugin-${id}`, "1.0.0"])),
+			}),
+		);
+		const grants = (one: unknown[] = []) =>
+			JSON.stringify({ one: { grants: one }, two: { grants: [] } });
+		const grantsFile = path.join(d.dir, "plugin-grants.json");
+		fs.writeFileSync(grantsFile, grants());
+
+		const starts: Record<string, number> = { one: 0, two: 0 };
+		const active: Record<string, number> = { one: 0, two: 0 };
+		const logs: string[] = [];
+		const fiber = Effect.runFork(
+			runner({
+				...d,
+				sandbox: "on",
+				configDir: d.dir,
+				grantPollInterval: "20 millis",
+				log: (line) => logs.push(line),
+				sandboxRun: (_unit, manifest) => {
+					const id = manifest.id as "one" | "two";
+					return Effect.scoped(
+						Effect.acquireRelease(
+							Effect.sync(() => {
+								starts[id] += 1;
+								active[id] += 1;
+							}),
+							() => Effect.sync(() => void (active[id] -= 1)),
+						).pipe(Effect.andThen(Effect.never)),
+					).pipe(Effect.as("plugin" as const));
+				},
+			}),
+		);
+		try {
+			await waitFor(() => starts.one === 1 && starts.two === 1);
+			const changed = grants([{ path: "/mnt/one", write: false }]);
+			fs.writeFileSync(grantsFile, changed);
+			await waitFor(() => starts.one === 2);
+			expect(starts.two).toBe(1);
+			expect(active).toEqual({ one: 1, two: 1 });
+			const restartLines = () =>
+				logs.filter((line) => line.includes("[runner] one: folder access changed — restarting"));
+			expect(restartLines()).toHaveLength(1);
+			expect(logs.some((line) => line.includes("[one] restarting (attempt 2)"))).toBe(false);
+			fs.writeFileSync(grantsFile, changed);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect(starts).toEqual({ one: 2, two: 1 });
+			expect(restartLines()).toHaveLength(1);
+		} finally {
+			await Effect.runPromise(Fiber.interrupt(fiber));
+		}
+		expect(active).toEqual({ one: 0, two: 0 });
+	});
+
 	test("a bare script is one-shot: runs on import, never restarts", async () => {
 		const d = mkdirs("bare");
 		const counter = path.join(d.dir, "ran.txt");
