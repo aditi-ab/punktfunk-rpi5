@@ -1,0 +1,6 @@
+• A launch holds the cover until the game's window is up — and says so when it didn't start.
+• Automatic opens at the rate your link actually carries.
+• Mute from the quick-action ring; bitrate takes a typed rate in whole Mbps.
+• Stream sizes group by aspect family with Screen and Safe area shapes.
+• Steam Controller 2 passthrough, a capture test, and gyro driving the on-screen pad.
+• Safe areas follow the window; TV consoles draw lighter; offline shelves keep their covers.
