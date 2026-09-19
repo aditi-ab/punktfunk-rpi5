@@ -62,30 +62,31 @@ export const steamRoots = (): string[] => {
 	return roots;
 };
 
-/**
- * Every `steamapps` dir holding installed titles: each root's own, plus the extra library folders
- * listed in its `libraryfolders.vdf` (Steam installs to other drives).
- */
-export const steamLibraryDirs = (roots = steamRoots()): string[] => {
+/** Steam library roots as listed by Steam, including paths this process cannot stat yet. */
+export const steamListedLibraries = (roots = steamRoots()): string[] => {
 	const seen = new Set<string>();
-	const dirs: string[] = [];
-	const push = (p: string) => {
-		const n = norm(p);
-		if (!seen.has(n) && isDir(n)) {
-			seen.add(n);
-			dirs.push(n);
-		}
+	const listed: string[] = [];
+	const push = (value: string) => {
+		const library = norm(value);
+		if (seen.has(library)) return;
+		seen.add(library);
+		listed.push(library);
 	};
 	for (const root of roots) {
-		const steamapps = path.join(root, "steamapps");
-		const text = readTextCapped(path.join(steamapps, "libraryfolders.vdf"));
-		if (text !== undefined) {
-			for (const p of vdfPaths(text)) push(path.join(p, "steamapps"));
-		}
-		push(steamapps);
+		const text = readTextCapped(
+			path.join(root, "steamapps", "libraryfolders.vdf"),
+		);
+		if (text !== undefined) for (const library of vdfPaths(text)) push(library);
+		push(root);
 	}
-	return dirs;
+	return listed;
 };
+
+/** Existing `steamapps` directories from every root Steam lists. */
+export const steamLibraryDirs = (roots = steamRoots()): string[] =>
+	steamListedLibraries(roots)
+		.map((library) => path.join(library, "steamapps"))
+		.filter(isDir);
 
 /**
  * Every `userdata/<accountId>/config` dir across all roots — one per Steam account that has signed
