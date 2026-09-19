@@ -303,6 +303,64 @@ fn send(standing: Option<u32>, share: u32, may_raise: bool) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abr::{Action, Driver, DriverConfig};
+    use crate::stats::Stats;
+
+    /// One wire packet: shard payload plus its header and seal.
+    const WIRE: u64 = 1_448;
+
+    /// Every delivery count a real [`Driver`] asks the host for over `windows`
+    /// report windows, and the millisecond of the ask. Driven as the pump drives
+    /// it: session counters in, actions out, a packet a millisecond arriving.
+    fn delivery_reports(windows: u64) -> Vec<(u64, u64)> {
+        let base = Instant::now();
+        let mut d = Driver::new(
+            DriverConfig {
+                start_kbps: 20_000,
+                ceiling_cap_kbps: None,
+                stream_cap_kbps: 200_000,
+                refresh_hz: 60,
+                codec: crate::quic::CODEC_HEVC,
+                bit_depth: 8,
+                chroma_format: crate::quic::CHROMA_IDC_420,
+                audio_reserved_kbps: 256,
+                marks_repeats: true,
+                probe: false,
+                probe_target_kbps: None,
+                ramp: false,
+            },
+            base,
+        );
+        let mut st = Stats::default();
+        let mut out = Vec::new();
+        for ms in 0..windows * 760 {
+            st.packets_received += 1;
+            st.bytes_received += WIRE;
+            d.on_stats(&st);
+            if ms % 16 == 0 {
+                st.frames_completed += 1;
+                d.on_au(false);
+            }
+            for a in d.tick(base + Duration::from_millis(ms)).actions {
+                if let Action::Delivery(packets) = a {
+                    out.push((ms, packets));
+                }
+            }
+        }
+        out
+    }
+
+    /// The governor's own input, from the client that has to produce it.
+    ///
+    /// A session that is receiving owes its count once, so the host's share
+    /// window ([`ShareWindow`]) closes once however long the session runs: the
+    /// path is read once and the group divided once.
+    #[test]
+    fn a_receiving_session_reports_its_delivery_once() {
+        let reports = delivery_reports(12);
+        assert_eq!(reports.len(), 1, "twelve windows, one report: {reports:?}");
+        assert!(reports[0].0 < 1_600, "and it is the first window's");
+    }
 
     /// A group with no history behind it, which is how most cases below open.
     fn shares(members: &[Member], may_raise: bool) -> Vec<Option<u32>> {

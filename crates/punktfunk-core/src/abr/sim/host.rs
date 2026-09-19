@@ -8,7 +8,9 @@ use super::Rng;
 pub(super) use crate::abr::budget::{
     adapt_fec, encoder_kbps_for_budget, fec_target, FEC_ADAPTIVE_START, SHARD_WIRE_OVERHEAD,
 };
+use crate::abr::governor::ShareWindow;
 use crate::quic::AckReason;
+use std::time::Instant;
 
 /// `config.rs` `MIN_RECOVERY_SHARDS`, and the `max_data_per_block` the host
 /// negotiates (`native/handshake.rs`). 4 096 means an ordinary frame is one
@@ -289,14 +291,20 @@ pub(super) struct Host {
     /// so it finishes what it holds before picking the new frame up.
     flush: Option<(u32, u64)>,
     next_cut_ms: u64,
-    /// Video wire bytes this session has handed the link. The host's own send
-    /// counter, in the domain a report window measures: probe filler is not
-    /// in it, because the window it lands in is discarded on the other side.
+    /// Wire bytes this session has handed the link, filler included — the
+    /// host's own send counter (`Stats::bytes_sent`), which knows nothing about
+    /// whose index space a packet is in.
     offered_bytes: u64,
+    /// What the client's delivery reports say about the path, and the window
+    /// they are measured over. `None` until the first one arrives: a zero there
+    /// would read as a path refusing everything this session offered it.
+    share_window: ShareWindow,
+    offered_kbps: u32,
+    delivered_kbps: Option<u32>,
 }
 
 impl Host {
-    pub(super) fn new(cfg: HostCfg, start_kbps: u32, seed: u64) -> Self {
+    pub(super) fn new(cfg: HostCfg, start_kbps: u32, seed: u64, joined: Instant) -> Self {
         Host {
             cfg,
             rng: Rng::new(seed),
@@ -321,6 +329,9 @@ impl Host {
             flush: None,
             next_cut_ms: 0,
             offered_bytes: 0,
+            share_window: ShareWindow::new(joined, 0),
+            offered_kbps: 0,
+            delivered_kbps: None,
         }
     }
 
@@ -392,6 +403,7 @@ impl Host {
         let allowed = elapsed * u64::from(p.target_kbps) * 125 / 1_000;
         let take = allowed.saturating_sub(p.bytes_sent);
         p.bytes_sent += take;
+        self.offered_bytes += take;
         take
     }
 
@@ -428,9 +440,27 @@ impl Host {
         self.budget_kbps
     }
 
-    /// Wire bytes handed to the link since the session opened.
-    pub(super) fn offered_bytes(&self) -> u64 {
-        self.offered_bytes
+    /// A client [`crate::quic::DeliveryReport`] arrived. Its boundary closes the
+    /// share window, so what this session offered and what reached the client
+    /// cover one stretch of link (`native/control.rs`).
+    pub(super) fn on_delivery_report(&mut self, now: Instant, packets_received: u64) {
+        let wire = self.cfg.shard_payload as u64 + SHARD_WIRE_OVERHEAD;
+        let (offered, delivered) =
+            self.share_window
+                .close(now, self.offered_bytes, packets_received, wire);
+        self.offered_kbps = offered;
+        self.delivered_kbps = Some(delivered);
+    }
+
+    /// The wire rate this session put out over the last reported window.
+    pub(super) fn offered_kbps(&self) -> u32 {
+        self.offered_kbps
+    }
+
+    /// What the client's last report said was arriving, kbps. `None` until one
+    /// has arrived — the host knows nothing about this session's air until then.
+    pub(super) fn delivered_kbps(&self) -> Option<u32> {
+        self.delivered_kbps
     }
 
     /// The source has nothing new: the host is repeating the last picture, so
@@ -720,7 +750,7 @@ mod tests {
             }],
             ..HostCfg::default()
         };
-        let mut host = Host::new(cfg, 100_000, 7);
+        let mut host = Host::new(cfg, 100_000, 7, Instant::now());
         let frames = (0..1_000).filter_map(|t| host.tick(t)).count();
         assert_eq!(frames, 82, "165 fps × 50 % over one second");
 
@@ -732,6 +762,7 @@ mod tests {
             },
             100_000,
             7,
+            Instant::now(),
         );
         let frames = (0..1_000).filter_map(|t| loaded.tick(t)).count();
         assert_eq!(frames, 55, "one frame per 18 ms of encode");
