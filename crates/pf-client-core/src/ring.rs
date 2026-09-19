@@ -27,6 +27,7 @@ pub enum RingCommand {
     CycleStats,
     ToggleMic,
     CycleTouchMode,
+    ToggleScrollInvert,
     /// Platform text input, not a Keyboard key.
     Keyboard,
     RequestMode {
@@ -93,6 +94,7 @@ pub struct RingFacts {
     pub overlay_actions: String,
     /// Touch-model name: `trackpad` / `pointer` / `touch`.
     pub touch_mode: String,
+    pub invert_scroll: bool,
     /// Without this the `touch` model is skipped.
     pub host_accepts_touch: bool,
     pub stats_tier: String,

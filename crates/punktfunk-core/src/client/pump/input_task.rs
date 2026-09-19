@@ -18,7 +18,9 @@
 
 use super::super::pad_mouse::{PadMouse, PadMouseShared, TICK};
 use super::*;
+use crate::input::scroll::ScrollOutput;
 use crate::input::{GamepadSnapshot, MAX_PADS};
+use std::sync::atomic::AtomicBool;
 
 /// What the controller-mouse translator reads beside the input queue.
 pub(super) struct MouseArgs {
@@ -27,11 +29,32 @@ pub(super) struct MouseArgs {
     pub(super) grants: Arc<AtomicU32>,
     /// Current stream mode; pointer speed scales with its height.
     pub(super) mode: Arc<std::sync::Mutex<Mode>>,
+    /// Live invert-scroll toggle ([`NativeClient::set_invert_scroll`]).
+    pub(super) scroll_invert: Arc<AtomicBool>,
+    /// Host advertised `HOST_CAP2_SCROLL`: normalized events go out unchanged.
+    pub(super) normalized_scroll: bool,
 }
 
-fn send_all(conn: &quinn::Connection, evs: Vec<InputEvent>) {
-    for ev in evs {
+/// The final outbound gate for every ordinary input event — raw embedder sends
+/// and controller-mouse output share it, so validation, the invert toggle and
+/// the old-host `MouseScroll` conversion each happen exactly once.
+fn send_input(conn: &quinn::Connection, out: &mut ScrollOutput, args: &MouseArgs, ev: InputEvent) {
+    let invert = args
+        .scroll_invert
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if let Some(ev) = out.prepare(ev, invert) {
         let _ = conn.send_datagram(ev.encode().to_vec().into());
+    }
+}
+
+fn send_all(
+    conn: &quinn::Connection,
+    out: &mut ScrollOutput,
+    args: &MouseArgs,
+    evs: Vec<InputEvent>,
+) {
+    for ev in evs {
+        send_input(conn, out, args, ev);
     }
 }
 
@@ -41,6 +64,7 @@ fn sync_mouse(
     conn: &quinn::Connection,
     mouse: &mut PadMouse,
     args: &MouseArgs,
+    out: &mut ScrollOutput,
     pads: &mut [Option<GamepadSnapshot>; MAX_PADS],
     dirty: &mut [bool; MAX_PADS],
 ) {
@@ -60,7 +84,6 @@ fn sync_mouse(
                     pad,
                     ..Default::default()
                 }),
-                args.shared.layout(),
             );
             if let Some(snap) = pads[idx].as_mut() {
                 *snap = GamepadSnapshot {
@@ -71,7 +94,7 @@ fn sync_mouse(
                 dirty[idx] = true;
             }
         } else if want & bit == 0 && on & bit != 0 {
-            send_all(conn, mouse.leave(idx));
+            send_all(conn, out, args, mouse.leave(idx));
         }
     }
 }
@@ -110,6 +133,10 @@ pub(super) async fn run(
     use crate::input::InputKind;
     use std::sync::atomic::Ordering;
     let mut mouse = PadMouse::default();
+    // One seam for every outbound input event: Scroll stays whole toward a
+    // normalized host, converts once to MouseScroll against an older one, and
+    // the live invert flag applies to both plus controller-mouse output.
+    let mut scroll_out = ScrollOutput::new(mouse_args.normalized_scroll);
     let mut mouse_tick = tokio::time::interval(TICK);
     mouse_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Unset while no stick is deflected, so a fresh push starts from one nominal tick.
@@ -159,11 +186,11 @@ pub(super) async fn run(
                     {
                         flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
                         let grants = mouse_args.grants.load(Ordering::Relaxed);
-                        send_all(&conn, mouse.fold(idx, &ev, grants));
+                        send_all(&conn, &mut scroll_out, &mouse_args, mouse.fold(idx, &ev, grants));
                         continue;
                     }
                     if ev.kind == InputKind::GamepadRemove && mouse.is_on(idx) {
-                        send_all(&conn, mouse.leave(idx));
+                        send_all(&conn, &mut scroll_out, &mouse_args, mouse.leave(idx));
                         mouse_args.shared.clear(idx);
                     }
                     if gamepad_snapshots
@@ -218,10 +245,10 @@ pub(super) async fn run(
                             continue;
                         }
                     }
-                    let _ = conn.send_datagram(ev.encode().to_vec().into());
+                    send_input(&conn, &mut scroll_out, &mouse_args, ev);
                 }
                 flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
-                if !mouse.ticking() {
+                if !mouse.moving() {
                     last_mouse_tick = None;
                 }
                 let live = (0..MAX_PADS)
@@ -230,23 +257,23 @@ pub(super) async fn run(
                 mouse_args.shared.set_live(live);
             }
             _ = mouse_args.shared.changed.notified() => {
-                sync_mouse(&conn, &mut mouse, &mouse_args, &mut pads, &mut dirty);
+                sync_mouse(&conn, &mut mouse, &mouse_args, &mut scroll_out, &mut pads, &mut dirty);
                 flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
-                if !mouse.ticking() {
+                if !mouse.moving() {
                     last_mouse_tick = None;
                 }
             }
-            _ = mouse_tick.tick(), if mouse.ticking() => {
+            _ = mouse_tick.tick(), if mouse.moving() => {
                 let now = std::time::Instant::now();
                 let dt = last_mouse_tick.map_or(TICK, |t| now.duration_since(t));
                 last_mouse_tick = Some(now);
                 let height = mouse_args.mode.lock().map(|m| m.height).unwrap_or(0);
                 let grants = mouse_args.grants.load(Ordering::Relaxed);
-                send_all(&conn, mouse.tick(dt.as_secs_f64(), height, grants));
+                send_all(&conn, &mut scroll_out, &mouse_args, mouse.tick(dt.as_secs_f64(), height, grants));
             }
             _ = refresh.tick() => {
                 // Grants arrive without a wake-up; losing the pointer grant ends mouse mode here.
-                sync_mouse(&conn, &mut mouse, &mouse_args, &mut pads, &mut dirty);
+                sync_mouse(&conn, &mut mouse, &mouse_args, &mut scroll_out, &mut pads, &mut dirty);
                 for idx in 0..MAX_PADS {
                     // Caps moved after the burst drained: re-arm. Live declared pads only;
                     // a steady session sends nothing.
@@ -330,6 +357,8 @@ mod tests {
                 height: 1080,
                 refresh_hz: 60,
             })),
+            scroll_invert: Arc::new(AtomicBool::new(false)),
+            normalized_scroll: true,
         }
     }
 

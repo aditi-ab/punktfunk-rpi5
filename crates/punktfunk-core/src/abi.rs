@@ -3274,21 +3274,15 @@ pub unsafe extern "C" fn punktfunk_connection_set_pad_mouse(
     })
 }
 
-/// Replace the controller-mouse layout from a JSON document: `settings` (the `pointer` and
-/// `scroll` multipliers, `deadzone`, `long_press_ms`), a `buttons` table of pad button to
-/// `mouse:left` / `key:Escape`, and a `chords` array of `buttons` + `press`
-/// (`any` / `short` / `long` / `hold`) + `keys`. NULL restores the shipped table. A pad already
-/// in controller mouse keeps the layout it entered with. `InvalidArg` on a document that does
-/// not parse, and the live layout is left alone.
+/// Change scroll direction for this session at the shared outbound seam.
 ///
 /// # Safety
-/// `c` is a valid connection handle; `json` is a NUL-terminated UTF-8 string or NULL.
-/// Callable from any thread.
+/// `c` is a valid connection handle. Callable from any thread.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn punktfunk_connection_set_pad_mouse_layout(
+pub unsafe extern "C" fn punktfunk_connection_set_invert_scroll(
     c: *mut PunktfunkConnection,
-    json: *const std::os::raw::c_char,
+    invert: bool,
 ) -> PunktfunkStatus {
     guard(|| {
         // SAFETY: caller handle or null; `as_ref` never dereferences null.
@@ -3296,15 +3290,8 @@ pub unsafe extern "C" fn punktfunk_connection_set_pad_mouse_layout(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: caller C string or null, borrowed for this call only.
-        let doc = match unsafe { opt_cstr(json) } {
-            Ok(d) => d,
-            Err(()) => return PunktfunkStatus::InvalidArg,
-        };
-        match c.inner.set_pad_mouse_layout(doc) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+        c.inner.set_invert_scroll(invert);
+        PunktfunkStatus::Ok
     })
 }
 
@@ -6158,8 +6145,8 @@ mod abi_version_tests {
     #[test]
     fn abi_version_is_pinned() {
         // Current ABI. A bump must update this pin.
-        assert_eq!(crate::ABI_VERSION, 35);
-        assert_eq!(super::punktfunk_abi_version(), 35);
+        assert_eq!(crate::ABI_VERSION, 37);
+        assert_eq!(super::punktfunk_abi_version(), 37);
     }
 
     #[test]

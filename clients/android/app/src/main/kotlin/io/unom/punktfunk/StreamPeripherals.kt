@@ -125,10 +125,15 @@ internal class StreamPeripherals(
             context,
             android.view.PointerIcon.TYPE_NULL,
         )
+        val viewConfig = android.view.ViewConfiguration.get(context)
         mouse = MouseForwarder(
             handle,
-            invertScroll = settings.invertScroll,
             captureWanted = settings.mouseMode == MouseMode.CAPTURE,
+            // A touchpad's ACTION_SCROLL axes price distance through the OS scroll factors;
+            // the display density turns those pixels into the wire's DIP.
+            scrollFactorV = viewConfig.scaledVerticalScrollFactor,
+            scrollFactorH = viewConfig.scaledHorizontalScrollFactor,
+            density = context.resources.displayMetrics.density,
             // Window point → frame pixel through the picture's placement (see MouseForwarder.frameAt)
             // — read live, so it is right from the frame the SurfaceView is first laid out. The
             // SurfaceView sits at the placement's rect, so the container's origin is its origin

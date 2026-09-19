@@ -57,6 +57,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         pad_audio_tx,
         pad_audio_caps,
         pad_mouse,
+        scroll_invert,
         hdr_meta_tx,
         host_timing_tx,
         cursor_shape_tx,
@@ -84,6 +85,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         decode_lat,
         live_bitrate,
         rate_cut,
+        recent_rfis,
         audio_mute,
         pad_slots,
         launch_outcome,
@@ -152,6 +154,9 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     );
     // Bumped when a re-sync batch is applied; the pump resets staleness and re-arms jump-to-live.
     let clock_gen = Arc::new(AtomicU32::new(0));
+    // Normalized scroll only toward HOST_CAP2_SCROLL; an older host gets each
+    // event converted once at the outbound seam instead.
+    let normalized_scroll = negotiated.host_caps2 & crate::quic::HOST_CAP2_SCROLL != 0;
     let _ = ready_tx.send(Ok(negotiated));
 
     // Snapshots only toward GAMEPAD_STATE. Flags 8/9 only toward PAD_AUDIO — an
@@ -168,6 +173,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             shared: pad_mouse,
             grants: access_grants.clone(),
             mode: mode_slot.clone(),
+            scroll_invert,
+            normalized_scroll,
         },
     ));
 
@@ -236,6 +243,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             bitrate_ack: bitrate_ack.clone(),
             live_bitrate,
             recovery_kf: recovery_kf.clone(),
+            recent_rfis,
             pipeline_gap: pipeline_gap.clone(),
             clock_offset: clock_offset.clone(),
             clock_gen: clock_gen.clone(),

@@ -855,6 +855,13 @@ final class SessionModel: ObservableObject {
     /// Advance this session's overlay one tier (⌃⌥⇧S, the three-finger tap, the Stream menu).
     func cycleStats() { setStatsVerbosity(statsVerbosity.next()) }
 
+    /// The ring changes this session only; saved defaults and presets remain unchanged.
+    func setInvertScroll(_ invert: Bool) {
+        guard settings.invertScroll != invert, let conn = connection,
+              conn.canSendPointer, conn.setInvertScroll(invert) else { return }
+        settings.invertScroll = invert
+    }
+
     /// Take the physical controllers for this session (its window came to the front).
     func claimControllers() { gamepadCapture?.claim() }
 

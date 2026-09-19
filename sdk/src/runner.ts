@@ -29,7 +29,7 @@ import type { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { PunktfunkHost } from "./client.js";
 import { layer as hostLayer } from "./effect.js";
-import { type ConnectOptions, configDir, publishedMgmtUrl } from "./config.js";
+import { type ConnectOptions, configDir, hostFetch, publishedMgmtUrl } from "./config.js";
 import { connect, type PluginDef } from "./index.js";
 import {
 	bwrapArgv,
@@ -217,24 +217,39 @@ export const windowsSddlUnsafeReason = (
 	return null;
 };
 
+/**
+ * Run `spawn`, and once more if the first run was killed rather than exiting.
+ *
+ * Bun on Windows fires a `spawnSync` timeout within milliseconds when the spawn is the first
+ * after an idle event loop. A killed ACL read is an unreadable ACL, which refuses the unit.
+ */
+export const spawnAgainIfKilled = <T extends { status: number | null }>(
+	spawn: () => T,
+): T => {
+	const first = spawn();
+	return first.status === null ? spawn() : first;
+};
+
 /** The SID this process runs as, fetched once (`undefined` when it can't be determined). */
 let processSidCache: string | undefined | false;
 const processSid = (): string | undefined => {
 	if (processSidCache === undefined) {
-		const res = spawnSync(
-			windowsPowershell(),
-			[
-				"-NoProfile",
-				"-NonInteractive",
-				"-Command",
-				"[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-			],
-			{
-				encoding: "utf8",
-				windowsHide: true,
-				timeout: 15_000,
-				env: windowsPowershellEnv(),
-			},
+		const res = spawnAgainIfKilled(() =>
+			spawnSync(
+				windowsPowershell(),
+				[
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					"[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+				],
+				{
+					encoding: "utf8",
+					windowsHide: true,
+					timeout: 15_000,
+					env: windowsPowershellEnv(),
+				},
+			),
 		);
 		const sid = res.status === 0 ? (res.stdout ?? "").trim() : "";
 		processSidCache = /^S-[0-9-]+$/.test(sid) ? sid : false;
@@ -267,20 +282,22 @@ const windowsPowershellEnv = (): Record<string, string | undefined> => {
 /** Read a file's SDDL and apply [`windowsSddlUnsafeReason`]. Unreadable ACL ⇒ refuse. */
 const windowsFileIsSafe = (file: string, log: LogSink): boolean => {
 	const escaped = file.replace(/'/g, "''");
-	const res = spawnSync(
-		windowsPowershell(),
-		[
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			`(Get-Acl -LiteralPath '${escaped}').Sddl`,
-		],
-		{
-			encoding: "utf8",
-			windowsHide: true,
-			timeout: 15_000,
-			env: windowsPowershellEnv(),
-		},
+	const res = spawnAgainIfKilled(() =>
+		spawnSync(
+			windowsPowershell(),
+			[
+				"-NoProfile",
+				"-NonInteractive",
+				"-Command",
+				`(Get-Acl -LiteralPath '${escaped}').Sddl`,
+			],
+			{
+				encoding: "utf8",
+				windowsHide: true,
+				timeout: 15_000,
+				env: windowsPowershellEnv(),
+			},
+		),
 	);
 	const sddl = res.status === 0 ? (res.stdout ?? "").trim() : "";
 	if (!sddl) {
@@ -476,10 +493,15 @@ const runSandboxed = (
 		}
 		const runtime = process.env.XDG_RUNTIME_DIR ?? "/tmp";
 		const socket = path.join(runtime, "punktfunk", `plugin-${id}.sock`);
+		const url = options.connect?.url ?? publishedMgmtUrl() ?? "https://127.0.0.1:47990";
+		// The host's cert is self-signed: a bare `fetch` fails TLS and every plugin 502s at connect.
+		const pinned = options.sandboxFetch
+			? Promise.resolve(options.sandboxFetch)
+			: hostFetch(url, options.connect);
 		const proxy = serveHostProxy({
 			socket,
-			url: options.connect?.url ?? publishedMgmtUrl() ?? "https://127.0.0.1:47990",
-			fetch: options.sandboxFetch ?? fetch,
+			url,
+			fetch: ((input, init) => pinned.then((f) => f(input, init))) as typeof fetch,
 		});
 		const argv = [
 			...bwrapArgv(

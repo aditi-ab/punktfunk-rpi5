@@ -261,7 +261,7 @@ private fun RingStage(cfg: OverlayConfig, editing: RingEditing) {
                     streamTouchInput(
                         sink = NativeTouchSink(0L), stylus = null,
                         video = { VideoFrame(io.unom.punktfunk.kit.VideoFit.FIT, 0, 0) },
-                        trackpad = true, invertScroll = false,
+                        trackpad = true,
                         // Only the twist is this stage's: a lone finger keeps scrolling the
                         // settings page under the card (dialOnly's whole point).
                         dialOnly = true,

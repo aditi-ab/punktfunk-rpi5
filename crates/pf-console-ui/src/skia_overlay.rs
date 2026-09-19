@@ -93,6 +93,10 @@ pub struct SkiaOverlay {
     /// In-stream quick-action ring (`design/touch-client-overlay.md`).
     ring: crate::ring::Ring,
     ring_drawn_at: Option<Instant>,
+    /// The ring's finger, read the same way as the shell's.
+    ring_touch: crate::pointer::Touch,
+    /// Scale the ring last drew at; its touch slop and drag ticks grow with it.
+    ring_k: f64,
 }
 
 struct Gpu {
@@ -123,6 +127,8 @@ impl SkiaOverlay {
             banner_text: None,
             ring: crate::ring::Ring::new(),
             ring_drawn_at: None,
+            ring_touch: crate::pointer::Touch::default(),
+            ring_k: 1.0,
             resizing_since: None,
         }
     }
@@ -311,38 +317,23 @@ impl Overlay for SkiaOverlay {
         }
     }
 
+    /// The console takes the pointer while visible, the open ring otherwise. The side
+    /// that skips an event drops its finger, so no gesture outlives a switch.
     fn handle_pointer(&mut self, input: PointerInput) -> bool {
-        if !self.console_visible() {
-            if !self.ring.open() {
-                return false;
-            }
-            use crate::pointer::{Pointer, PointerKind};
-            use pf_client_core::console::PointerButton;
-            let (x, y, kind) = match input {
-                PointerInput::Move { x, y } => (x, y, PointerKind::Move),
-                PointerInput::Down {
-                    x,
-                    y,
-                    button: PointerButton::Primary,
-                    ..
-                } => (x, y, PointerKind::Press),
-                PointerInput::Down { x, y, .. } => (x, y, PointerKind::Back),
-                PointerInput::Up { x, y, .. } => (x, y, PointerKind::Release),
-                PointerInput::Wheel { x, y, dy, .. } => {
-                    (x, y, PointerKind::Scroll { up: dy > 0.0 })
-                }
-                _ => return true,
-            };
-            return self.ring.pointer(Pointer {
-                x: f64::from(x),
-                y: f64::from(y),
-                kind,
-            });
+        if self.console_visible() {
+            self.ring_touch.reset();
+            return self.shell.as_mut().is_some_and(|s| s.pointer_input(input));
         }
-        match &mut self.shell {
-            Some(shell) => shell.pointer_input(input),
-            None => false,
+        if let Some(shell) = &mut self.shell {
+            shell.touch.reset();
         }
+        if !self.ring.open() {
+            self.ring_touch.reset();
+            return false;
+        }
+        let ring = &mut self.ring;
+        self.ring_touch
+            .feed(input, self.ring_k, |p| ring.pointer(p))
     }
 
     fn take_action(&mut self) -> Option<OverlayAction> {
@@ -543,6 +534,7 @@ impl Overlay for SkiaOverlay {
             if let Some(fonts) = self.fonts.as_ref() {
                 self.ring
                     .render(canvas, ctx.width, ctx.height, scale, fonts, dt);
+                self.ring_k = f64::from(scale);
             }
         }
 

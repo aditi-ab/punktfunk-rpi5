@@ -97,7 +97,7 @@ use self::planes::{
 };
 use self::probe::ProbeState;
 use self::pump::run_pump;
-use self::recovery::{RecoveryAsk, RfiRecovery};
+use self::recovery::{RecentRfis, RecoveryAsk, RfiRecovery};
 use self::worker::WorkerArgs;
 
 /// What this client calls itself in the host's `handshake complete` line: build plus the shell
@@ -260,6 +260,8 @@ pub struct NativeClient {
     pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]>,
     /// Pads translated into pointer and keys ([`NativeClient::set_pad_mouse`]).
     pad_mouse: Arc<pad_mouse::PadMouseShared>,
+    /// Live setting read by the shared input seam for every scroll event.
+    scroll_invert: Arc<AtomicBool>,
     hdr_meta: Mutex<Receiver<HdrMeta>>,
     /// Per-AU capture→send timings. Client always advertises [`quic::VIDEO_CAP_HOST_TIMING`];
     /// an older host never sends any.
@@ -351,6 +353,8 @@ pub struct NativeClient {
     live_bitrate_kbps: Arc<AtomicU32>,
     /// [`crate::hud::RateCut`] code the pump publishes each window; `0` = no standing cut.
     rate_cut: Arc<AtomicU8>,
+    /// RFIs the control task sent, aged at each overlay read.
+    recent_rfis: Arc<Mutex<RecentRfis>>,
     /// ABR armed (Automatic, not rate-pinned PyroWave). Skip per-frame decode measurement when
     /// false ([`wants_decode_latency`](Self::wants_decode_latency)).
     wants_decode: bool,
@@ -687,6 +691,7 @@ impl NativeClient {
         let pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]> =
             Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
         let pad_mouse = Arc::new(pad_mouse::PadMouseShared::default());
+        let scroll_invert = Arc::new(AtomicBool::new(false));
         let (hdr_meta_tx, hdr_meta_rx) = std::sync::mpsc::sync_channel::<HdrMeta>(HDR_META_QUEUE);
         let (host_timing_tx, host_timing_rx) =
             std::sync::mpsc::sync_channel::<crate::quic::HostTiming>(HOST_TIMING_QUEUE);
@@ -726,6 +731,7 @@ impl NativeClient {
         // Pump seeds from Welcome before ready_tx, then follows every ack.
         let live_bitrate = Arc::new(AtomicU32::new(0));
         let rate_cut = Arc::new(AtomicU8::new(0));
+        let recent_rfis = Arc::new(Mutex::new(RecentRfis::default()));
         // Same seeding: Welcome before ready_tx, then every AccessUpdate. GRANT_ALL /
         // permanent here is the pre-handshake placeholder.
         let access_grants = Arc::new(AtomicU32::new(crate::quic::GRANT_ALL));
@@ -751,8 +757,10 @@ impl NativeClient {
         let decode_lat_w = decode_lat.clone();
         let live_bitrate_w = live_bitrate.clone();
         let rate_cut_w = rate_cut.clone();
+        let recent_rfis_w = recent_rfis.clone();
         let pad_audio_caps_w = pad_audio_caps.clone();
         let pad_mouse_w = pad_mouse.clone();
+        let scroll_invert_w = scroll_invert.clone();
         let audio_mute_w = audio_mute.clone();
         let pad_slots_w = pad_slots.clone();
         let launch_outcome_w = launch_outcome.clone();
@@ -810,6 +818,7 @@ impl NativeClient {
                     pad_audio_tx,
                     pad_audio_caps: pad_audio_caps_w,
                     pad_mouse: pad_mouse_w,
+                    scroll_invert: scroll_invert_w,
                     hdr_meta_tx,
                     host_timing_tx,
                     cursor_shape_tx,
@@ -837,6 +846,7 @@ impl NativeClient {
                     decode_lat: decode_lat_w,
                     live_bitrate: live_bitrate_w,
                     rate_cut: rate_cut_w,
+                    recent_rfis: recent_rfis_w,
                     audio_mute: audio_mute_w,
                     pad_slots: pad_slots_w,
                     launch_outcome: launch_outcome_w,
@@ -882,6 +892,7 @@ impl NativeClient {
             pad_audio: Mutex::new(pad_audio_rx),
             pad_audio_caps,
             pad_mouse,
+            scroll_invert,
             hdr_meta: Mutex::new(hdr_meta_rx),
             host_timing: Mutex::new(host_timing_rx),
             cursor_shape: Mutex::new(cursor_shape_rx),
@@ -925,6 +936,7 @@ impl NativeClient {
             decode_lat,
             live_bitrate_kbps: live_bitrate,
             rate_cut,
+            recent_rfis,
             // Match the pump: Automatic, not rate-pinned PyroWave, AND host echoed a rate.
             // Dropping the last term over-advertises against an old host that reports no rate.
             wants_decode: bitrate_kbps == 0
@@ -1209,6 +1221,7 @@ impl NativeClient {
             rtt_us: self.rtt_us(),
             target_kbps: self.current_bitrate_kbps(),
             rate_cut: self.rate_cut.load(Ordering::Relaxed),
+            rfis_last_min: self.recent_rfis.lock().unwrap().count(Instant::now()),
             pad_slots: self.pad_slots(),
         }
     }
@@ -1681,16 +1694,13 @@ impl NativeClient {
         Ok(())
     }
 
-    /// Replace the controller-mouse layout — plain buttons, chords, and the pointer, scroll,
-    /// deadzone and long-press tunables — from a JSON document. `None` restores the shipped
-    /// table. A pad already in controller mouse keeps the layout it entered with.
-    pub fn set_pad_mouse_layout(&self, doc: Option<&str>) -> Result<()> {
-        let layout = match doc {
-            Some(json) => pad_mouse::Layout::parse(json)?,
-            None => pad_mouse::Layout::default(),
-        };
-        self.pad_mouse.set_layout(layout);
-        Ok(())
+    /// Change scroll direction for this session at the shared outbound seam.
+    pub fn set_invert_scroll(&self, invert: bool) {
+        self.scroll_invert.store(invert, Ordering::Relaxed);
+    }
+
+    pub fn invert_scroll(&self) -> bool {
+        self.scroll_invert.load(Ordering::Relaxed)
     }
 
     /// Pads the embedder switched to controller mouse and that are still connected.

@@ -116,10 +116,6 @@ pub struct SessionControls {
     pub access_tx: Option<tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::AccessUpdate>>,
     /// The control task's audio lane. `None` on a session with no control task (tests).
     pub audio_tx: Option<tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::AudioState>>,
-    /// Head the window routes read and act on ([`SessionControls::set_head`]).
-    /// Latched per session: the injector's slot is one per process, and a second
-    /// session's bring-up would otherwise re-point this one at its head.
-    pub head: Arc<Mutex<Option<StreamedHead>>>,
     /// OS pad slots this session holds, one bit each — the player numbers a local
     /// co-op game reads. Published by the input thread.
     pub pad_slots: Arc<AtomicU16>,
@@ -140,7 +136,8 @@ pub struct SessionControls {
 /// slot: `MAX_PADS` is 16.
 pub const NO_PAD_SLOT: u8 = u8::MAX;
 
-/// The compositor head one session streams — what its window list names.
+/// The compositor head one session streams — where its launch's window stage
+/// places the game.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamedHead {
     pub compositor: crate::vdisplay::Compositor,
@@ -159,7 +156,6 @@ impl SessionControls {
             deadline_unix: Arc::new(AtomicI64::new(0)),
             access_tx: None,
             audio_tx: None,
-            head: Arc::new(Mutex::new(None)),
             pad_slots: Arc::new(AtomicU16::new(0)),
             fingerprint: None,
             pad_owner: crate::inject::pad_pool::owner_key(None),
@@ -200,17 +196,6 @@ impl SessionControls {
         (0..punktfunk_core::input::MAX_PADS as u8)
             .filter(|n| mask & (1 << n) != 0)
             .collect()
-    }
-
-    /// Latch the head this session streams, once the capture pipeline names it.
-    /// A backend that names no output leaves it `None` and lists nothing.
-    pub fn set_head(&self, head: Option<StreamedHead>) {
-        *self.head.lock().unwrap_or_else(|e| e.into_inner()) = head;
-    }
-
-    /// This session's head, or `None` before capture is up.
-    pub fn head(&self) -> Option<StreamedHead> {
-        self.head.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Re-point the live mask, clamped to the pairing's ceiling, and tell the client
@@ -1340,6 +1325,7 @@ mod tests {
                 // No signals: inert lease, so no watcher thread races the assertions.
                 spec: crate::library::DetectSpec::default(),
                 nested: false,
+                scope_pid: None,
                 launcher: false,
                 child: None,
                 spawned: None,

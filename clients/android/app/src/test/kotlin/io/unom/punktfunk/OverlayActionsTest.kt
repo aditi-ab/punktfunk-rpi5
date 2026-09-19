@@ -1,5 +1,7 @@
 package io.unom.punktfunk
 
+import java.io.File
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -82,20 +84,23 @@ class OverlayActionsTest {
         assertTrue("absent fields stay absent: $sparse", """"rs":{"x":0.5}""" in sparse)
     }
 
+    /** Every case Rust's `key_vk` wrote; `../../../` from the module directory is the repo root. */
     @Test
-    fun keyNamesMapToWindowsVks() {
-        assertEquals(0x11, keyVk("ctrl"))
-        assertEquals(0x10, keyVk("Shift"))
-        assertEquals(0x1B, keyVk("escape"))
-        assertEquals(0x09, keyVk("tab"))
-        assertEquals(0x41, keyVk("a"))
-        assertEquals(0x5A, keyVk("z"))
-        assertEquals(0x30, keyVk("0"))
-        assertEquals(0x70, keyVk("f1"))
-        assertEquals(0x7B, keyVk("f12"))
-        assertNull(keyVk("f25"))
-        assertNull(keyVk("hyper"))
-        assertNull(keyVk(""))
+    fun keyVkMatchesTheRustVectors() {
+        val file = File("../../../crates/punktfunk-core/testdata/key-vk-vectors.json")
+        assertTrue("the vector file must be reachable at ${file.absolutePath}", file.isFile)
+        val cases = JSONObject(file.readText()).getJSONArray("cases")
+        assertTrue("the vector file has cases", cases.length() > 0)
+        val wrong = (0 until cases.length()).map { cases.getJSONObject(it) }.mapNotNull { c ->
+            val name = c.getString("name")
+            val want = if (c.isNull("vk")) null else c.getInt("vk")
+            "${JSONObject.quote(name)}: Rust $want, Kotlin ${keyVk(name)}".takeIf { keyVk(name) != want }
+        }
+        assertTrue(wrong.joinToString("\n"), wrong.isEmpty())
+    }
+
+    @Test
+    fun chordLegends() {
         assertEquals("Ctrl+Shift+Esc", chordChip(listOf("ctrl", "shift", "escape")))
         assertEquals("Win", keyLegend("win"))
         assertEquals("PgUp", keyLegend("pageup"))

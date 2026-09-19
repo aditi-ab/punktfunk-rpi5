@@ -279,6 +279,23 @@ pub struct HostConfig {
     /// (`design/gamescope-multiuser.md`). **Default ON**; `=0` restores shared
     /// host-lifetime planes. Shared-desktop and managed/attach routes are untouched.
     pub gamescope_isolate: bool,
+    /// `PUNKTFUNK_STEAM_SEAT_HOME` — run a dedicated Steam launch under the
+    /// session's own `HOME` (`pf_paths::seat_home`), so it neither waits for the
+    /// desktop Steam to shut down nor shares its account
+    /// (`design/steam-seats-warm-launch-implementation-plan.md`). **Default OFF.**
+    /// Needs a native Steam to clone; a seat signs in on its own.
+    pub steam_seat_home: bool,
+    /// `PUNKTFUNK_STEAM_SEAT_SANDBOX` — show a seat's nested Steam only the pads
+    /// this session created, by running it under `bwrap` with a per-seat
+    /// `/dev/input` and `/dev/hidraw*`
+    /// (`design/steam-seats-warm-launch-implementation-plan.md` WP-S3).
+    /// **Default OFF.** Needs a seat home and `bwrap` on `PATH`.
+    pub steam_seat_sandbox: bool,
+    /// `PUNKTFUNK_STEAM_PREWARM` — how many seats the host may hold a Big Picture Steam up for
+    /// before their clients connect, so a launch skips Steam's 13–30 s cold boot
+    /// (`design/steam-seats-warm-launch-implementation-plan.md` WP-S2). **Default 1**; `0` is
+    /// off. Each parked seat costs about a gigabyte, and only a seat home can be pre-warmed.
+    pub steam_prewarm: u32,
     /// `PUNKTFUNK_GAMESCOPE_HDR` — allow HDR on gamescope. The host probes the
     /// punktfunk build (`packaging/gamescope`) and stays SDR if missing; this only
     /// decides whether HDR is *attempted*. **Default ON**, matching `PUNKTFUNK_10BIT`.
@@ -389,6 +406,12 @@ impl HostConfig {
             }),
             gamescope_splash: on("PUNKTFUNK_GAMESCOPE_SPLASH").unwrap_or(true),
             gamescope_isolate: on("PUNKTFUNK_GAMESCOPE_ISOLATE").unwrap_or(true),
+            steam_seat_home: on("PUNKTFUNK_STEAM_SEAT_HOME").unwrap_or(false),
+            steam_seat_sandbox: on("PUNKTFUNK_STEAM_SEAT_SANDBOX").unwrap_or(false),
+            steam_prewarm: val("PUNKTFUNK_STEAM_PREWARM")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .min(8),
             gamescope_hdr: on("PUNKTFUNK_GAMESCOPE_HDR").unwrap_or(true),
             gamescope_sdr_nits: val("PUNKTFUNK_GAMESCOPE_SDR_NITS")
                 .and_then(|s| s.trim().parse::<u32>().ok())

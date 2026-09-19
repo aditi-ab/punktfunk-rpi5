@@ -16,7 +16,17 @@ internal class StreamUi(
     private val handle: Long,
     initialAccess: IntArray?,
     initialVerbosity: StatsVerbosity,
+    initialInvertScroll: Boolean = false,
+    private val applyInvertScroll: (Boolean) -> Boolean = { NativeBridge.nativeSetInvertScroll(handle, it) },
 ) {
+    var invertScroll by mutableStateOf(initialInvertScroll)
+        private set
+
+    fun setScrollInverted(inverted: Boolean) {
+        if (accessGrants and SessionAccess.POINTER == 0 || inverted == invertScroll) return
+        if (applyInvertScroll(inverted)) invertScroll = inverted
+    }
+
     /** The session's grants (per-client access), the courtesy mirror of what the host enforces. */
     var accessGrants by mutableIntStateOf(initialAccess?.getOrNull(0) ?: SessionAccess.ALL)
 

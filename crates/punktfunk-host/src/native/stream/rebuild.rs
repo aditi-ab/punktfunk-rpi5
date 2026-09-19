@@ -442,9 +442,12 @@ impl StreamState {
                         gamescope,
                         self.plan.codec,
                         self.plan.bit_depth,
+                        rebuilt_route.as_ref(),
                     );
-                    self.plan.gamescope_cursor =
-                        crate::session_plan::gamescope_cursor_for(gamescope);
+                    self.plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(
+                        gamescope,
+                        rebuilt_route.as_ref(),
+                    );
                     (self.gamescope_composite, self.metadata_composite) =
                         composite_plan(&self.plan, self.cursor_fwd.is_some(), gamescope);
                     self.vd

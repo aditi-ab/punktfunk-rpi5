@@ -32,6 +32,8 @@ impl PadBackends {
         &mut self,
         kind: GamepadPref,
         ev: &punktfunk_core::input::GamepadEvent,
+        // A seat is a gamescope shape; a Windows host has one desktop and one `/dev`-less OS.
+        _dev: &Option<std::path::PathBuf>,
     ) -> bool {
         match kind {
             GamepadPref::SteamController2 => self

@@ -121,7 +121,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // reports — gates nothing and draws nothing: today's look, unchanged.
     val initialAccess = remember(handle) { NativeBridge.nativeAccessState(handle) }
     // The Compose state the session's peripherals write (see [StreamUi]).
-    val ui = remember(handle) { StreamUi(handle, initialAccess, initialSettings.statsVerbosity) }
+    val ui = remember(handle) { StreamUi(handle, initialAccess, initialSettings.statsVerbosity, initialSettings.invertScroll) }
 
     // Start mic only if the user enabled it AND granted RECORD_AUDIO (else the AAudio input fails).
     val micWanted = micEnabled && ContextCompat.checkSelfPermission(
@@ -288,6 +288,10 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     val keyboard = remember { !isTv && hasPhysicalKeyboard() }
     val hasTouch = remember {
         context.packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)
+    }
+    // Seed once per handle; the in-stream control must survive recomposition.
+    LaunchedEffect(handle) {
+        NativeBridge.nativeSetInvertScroll(handle, ui.invertScroll)
     }
     LaunchedEffect(handle, statsOn) {
         NativeBridge.nativeSetVideoStatsEnabled(handle, statsOn)
@@ -872,7 +876,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                             stylus,
                             ::videoFrame,
                             trackpad = touchMode == TouchMode.TRACKPAD,
-                            invertScroll = initialSettings.invertScroll,
                             onCycleStats = { ui.statsVerbosity = ui.statsVerbosity.next() },
                             // The summon rides the pointer gesture but TYPES — so it also needs the
                             // KEYBOARD grant (dismissing is always allowed).
@@ -958,6 +961,8 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                         audioMute = { ui.audioMute },
                         audioMuteLabel = { ui.audioMuteLabel },
                         toggleStreamMute = { ui.muteStream(!ui.streamMuted) },
+                        scrollInverted = { ui.invertScroll },
+                        toggleScrollInversion = { ui.setScrollInverted(!ui.invertScroll) },
                         currentMode = { requestedMode },
                         requestMode = { w, h, hz ->
                             if (NativeBridge.nativeRequestMode(handle, w, h, hz)) {

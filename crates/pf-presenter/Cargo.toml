@@ -8,6 +8,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+# `scroll`/`touch` are pure modules built on every platform; `input`/`run` take the
+# client-core dependency only on Linux+Windows.
+[dependencies]
+punktfunk-core = { path = "../punktfunk-core", default-features = false }
+
 # Same Linux+Windows gating as the rest of the client stack (dmabuf import is the one
 # Linux-only module — see lib.rs).
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
@@ -40,6 +45,12 @@ tracing = "0.1"
 # of the workspace's Windows SDL consumers).
 [target.'cfg(target_os = "linux")'.dependencies]
 sdl3 = { version = "0.18", features = ["hidapi", "ash"] }
+# `wayland_scroll` wraps SDL's foreign wl_display: `system` is the backend that
+# can, `dlopen` keeps the libwayland-client link lazy. Versions match the
+# workspace's locked wayland-* set (pf-inject uses the same 0.31/0.3 line).
+wayland-client = { version = "0.31", features = ["system", "dlopen"] }
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-sys = { version = "0.31", default-features = false, features = ["client"] }
 
 [target.'cfg(windows)'.dependencies]
 sdl3 = { version = "0.18", features = ["hidapi", "ash", "build-from-source"] }

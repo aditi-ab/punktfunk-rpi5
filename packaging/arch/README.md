@@ -15,8 +15,10 @@ deb build scripts. On a **Steam Deck used as a client you want `punktfunk-client
 A third member, **`punktfunk-web`** (the browser management console — pairing + status), is
 **opt-in**: build it by setting `PF_WITH_WEB=1`, which requires **`bun`** at build time (`bun-bin`
 from the AUR if it isn't in your repos). bun is also the **runtime** — the console serves HTTPS
-(HTTP/1.1 over TLS) via `Bun.serve`, so the package vendors the bun binary (no `nodejs` dependency). A
-default `makepkg` builds only host+client with no JS tooling — mirroring the RPM spec's `%bcond_with web`.
+(HTTP/1.1 over TLS) via `Bun.serve`. Either `PF_WITH_WEB=1` or `PF_WITH_SCRIPTING=1` also builds
+**`punktfunk-bun`**: the one vendored bun both packages run on, at `/usr/lib/punktfunk-bun/bun`,
+never on PATH (no `nodejs` dependency). A default `makepkg` builds only host+client with no JS
+tooling — mirroring the RPM spec's `%bcond_with web`.
 
 > **Host encode: NVENC on NVIDIA, VAAPI on AMD/Intel** (`PUNKTFUNK_ENCODER=auto` picks one). The host
 > now has a VAAPI encoder + zero-copy dmabuf path alongside NVENC/CUDA, so `punktfunk-host` works on

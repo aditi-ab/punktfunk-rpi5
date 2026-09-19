@@ -520,6 +520,92 @@ pub(crate) fn gamescope_paints_on_commit() -> bool {
     gamescope_patch_level() >= 10 && !flags_lost()
 }
 
+/// The capture node lists tiled modifiers and fixates the one the consumer keeps. Below
+/// this its single LINEAR choice fixates our default, so a tiled default fails the link.
+pub(crate) fn gamescope_offers_tiled_capture() -> bool {
+    gamescope_patch_level() >= 21 && !flags_lost()
+}
+
+/// `GAMESCOPE_SET_OUTPUT_MODE`. Below this a spawn serves the one mode it was started at, and
+/// a client asking for another retires it.
+pub(crate) fn gamescope_can_resize_output() -> bool {
+    gamescope_patch_level() >= 19 && !flags_lost()
+}
+
+/// The resize lands on the compositor's next pass, so this is tens of milliseconds. The
+/// fallback costs a cold spawn, which is Steam's 13–30 s boot again.
+const RESIZE_BUDGET: Duration = Duration::from_secs(2);
+
+/// Move a kept gamescope to `mode`, on `seat`'s own Xwayland. `false` leaves the caller its
+/// retire-and-spawn: no seat key, no display of that seat, a compositor that never interned the
+/// atom, or the budget spent.
+///
+/// `seat` is required. Every gamescope on the box answers this atom, and resizing the first one
+/// found resizes another player's screen.
+pub(crate) fn resize_kept_output(seat: Option<&str>, mode: crate::Mode) -> bool {
+    let Some(seat) = seat else {
+        return false;
+    };
+    // `-r` at spawn is `game_hz`, so the resize asks for the rate a fresh spawn would.
+    let want = [
+        mode.width,
+        mode.height,
+        super::game_hz(mode.refresh_hz.max(1)) * 1000,
+    ];
+    xwayland_cursor_targets(Some(seat))
+        .into_iter()
+        .any(|(dpy, _xauth)| set_output_mode(&dpy, want))
+}
+
+/// Ask `display`'s gamescope for `want` (width, height, refresh in mHz) and wait for it to
+/// report that mode in effect. The feedback atom is published from the pass that remade the
+/// output and nudged the capture, so this is the resize landing, not the request being taken.
+fn set_output_mode(display: &str, want: [u32; 3]) -> bool {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
+    let Some((conn, root)) = root_atoms(display) else {
+        return false;
+    };
+    let intern = |name: &[u8]| -> u32 {
+        conn.intern_atom(true, name)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.atom)
+            .unwrap_or(0)
+    };
+    // Never interned: this gamescope carries no runtime resize, whatever its banner said.
+    let (ask, feedback) = (
+        intern(b"GAMESCOPE_SET_OUTPUT_MODE"),
+        intern(b"GAMESCOPE_OUTPUT_MODE_FEEDBACK"),
+    );
+    if ask == 0 || feedback == 0 {
+        return false;
+    }
+    let sent = conn
+        .change_property32(PropMode::REPLACE, root, ask, AtomEnum::CARDINAL, &want)
+        .ok()
+        .and_then(|c| c.check().ok())
+        .is_some();
+    if !sent {
+        return false;
+    }
+    let deadline = Instant::now() + RESIZE_BUDGET;
+    loop {
+        let applied: Option<Vec<u32>> = conn
+            .get_property(false, root, feedback, AtomEnum::CARDINAL, 0, 3)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|p| p.value32().map(|v| v.collect()));
+        if applied.as_deref() == Some(&want[..]) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Latched when a spawn's gamescope did not receive our flags.
 /// Indirect modes (`GAMESCOPE_BIN` / PATH shim) can exec the distro binary;
 /// the retry then plans SDR host-composited instead of promising HDR it lacks.
@@ -676,6 +762,11 @@ mod tests {
         assert_eq!(parse_patch_level(""), 0);
         // Multi-digit revisions must not truncate to their first digit.
         assert_eq!(parse_patch_level("3.16.25+pfhdr10 (gcc)"), 10);
+        // The runtime-resize floor: 18 keeps a kept spawn at one mode, 19 lets it move.
+        assert_eq!(
+            parse_patch_level("3.16.25-32-ga10c9f9e+pfhdr19 (gcc 14.2.0)"),
+            19
+        );
         // A marker with no number is not a capability claim.
         assert_eq!(parse_patch_level("3.16.25+pfhdr (gcc)"), 0);
         // The version triple must never be mistaken for the level.
