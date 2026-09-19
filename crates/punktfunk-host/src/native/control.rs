@@ -930,6 +930,7 @@ mod tests {
     /// address and is never told anything.
     #[test]
     fn a_real_clients_reports_keep_dividing_a_shared_path() {
+        let _registry = crate::session_status::tests::registry_lock();
         let base = std::time::Instant::now();
         let shared: std::net::IpAddr = "203.0.113.41".parse().unwrap();
         let mut peers = [
@@ -963,6 +964,7 @@ mod tests {
     /// the first window — today's behaviour, reached by never being told.
     #[test]
     fn a_client_that_reports_once_is_governed_at_most_once() {
+        let _registry = crate::session_status::tests::registry_lock();
         let base = std::time::Instant::now();
         let shared: std::net::IpAddr = "203.0.113.43".parse().unwrap();
         let mut peers = [

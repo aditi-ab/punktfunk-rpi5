@@ -1215,11 +1215,27 @@ pub fn force_idr_all() {
 pub(crate) mod tests {
     use super::*;
 
+    /// The live-session registry is one table for the whole test binary: a
+    /// session one test registers is an active stream to another test's route,
+    /// a row in its `/status`, and an entry in the recent ring. Every test that
+    /// registers a session or reads the registry's shape holds this.
+    ///
+    /// A test that also needs `native::tests`' admission lock takes this one
+    /// first. One order, so the pair cannot deadlock.
+    pub(crate) static REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The registry lock for a test that has no runtime of its own.
+    /// [`tokio::sync::Mutex::blocking_lock`] panics inside one, so an
+    /// `#[tokio::test]` takes `REGISTRY.lock().await` instead.
+    pub(crate) fn registry_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        REGISTRY.blocking_lock()
+    }
+
     /// A compat-plane session is a registry entry like any other, which is what gives the
     /// console an id to stop — before, a Moonlight session could only be ended host-wide.
     #[test]
     fn a_compat_session_is_stoppable_by_its_own_id() {
-        // No serializing lock: the registry is shared, but this is its only compat session.
+        let _registry = registry_lock();
         let stop = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
         let _guard = register(Registration {
@@ -1385,6 +1401,7 @@ pub(crate) mod tests {
     /// for 12: each is told half of what is actually arriving.
     #[test]
     fn two_automatic_sessions_on_one_address_take_equal_shares() {
+        let _registry = registry_lock();
         let peer: std::net::IpAddr = "203.0.113.90".parse().unwrap();
         let (a, ac, _ar) = fake_member("phone", peer, 12_000);
         let (b, bc, _br) = fake_member("pc", peer, 12_000);
@@ -1400,6 +1417,7 @@ pub(crate) mod tests {
     /// told anything; the Automatic one gets what is left.
     #[test]
     fn a_fixed_rate_session_is_never_told_a_share() {
+        let _registry = registry_lock();
         let peer: std::net::IpAddr = "203.0.113.91".parse().unwrap();
         let (auto, auto_c, _ar) = fake_member("phone", peer, 14_000);
         let (fixed, fixed_c, _fr) = fake_member("pc", peer, 8_000);
@@ -1417,6 +1435,7 @@ pub(crate) mod tests {
     /// One session is not a group, whatever it reports.
     #[test]
     fn a_session_alone_on_its_address_is_never_governed() {
+        let _registry = registry_lock();
         let peer: std::net::IpAddr = "203.0.113.92".parse().unwrap();
         let (only, c, _r) = fake_member("phone", peer, 20_000);
         c.share.publish(true, 20_000, 9_000);
@@ -1428,6 +1447,7 @@ pub(crate) mod tests {
     /// survivor is handed what it carries now rather than what it once did.
     #[test]
     fn a_path_that_shrank_is_not_handed_over_at_its_old_figure() {
+        let _registry = registry_lock();
         let peer: std::net::IpAddr = "203.0.113.94".parse().unwrap();
         let (a, ac, _ar) = fake_member("phone", peer, 15_000);
         let (b, bc, _br) = fake_member("pc", peer, 15_000);
@@ -1455,6 +1475,7 @@ pub(crate) mod tests {
     /// their residual. Once, and then never again.
     #[test]
     fn a_survivor_is_handed_the_path_its_group_proved() {
+        let _registry = registry_lock();
         let peer: std::net::IpAddr = "203.0.113.93".parse().unwrap();
         let (a, ac, _ar) = fake_member("phone", peer, 12_000);
         let (b, bc, _br) = fake_member("pc", peer, 12_000);
@@ -1475,6 +1496,7 @@ pub(crate) mod tests {
     /// IPv4-mapped IPv6 peer is the same address.
     #[test]
     fn sessions_from_one_address_name_each_other() {
+        let _registry = registry_lock();
         let v4: std::net::IpAddr = "203.0.113.77".parse().unwrap();
         let mapped: std::net::IpAddr = "::ffff:203.0.113.77".parse().unwrap();
         let (a, _) = fake_at("phone", false, Some(v4));
@@ -1525,6 +1547,7 @@ pub(crate) mod tests {
     /// unmutes only what it muted: an operator's own mute stays.
     #[test]
     fn policy_mute_reaches_late_joiners_and_lifts_at_the_end() {
+        let _registry = registry_lock();
         let (_owner, owner) = fake_joiner("cccccccccccc", false);
         let guard = apply_audio_policy(AudioSessions::Owner, "cccccccccccc");
         let (_joiner, joiner) = fake_joiner("dddddddddddd", true);
@@ -1549,6 +1572,7 @@ pub(crate) mod tests {
     /// (`quit` + `stop`). Other clients and IP-labelled sessions stay up.
     #[test]
     fn stop_by_fingerprint_revokes_exactly_the_unpaired_client() {
+        let _registry = registry_lock();
         let fp = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
         let (_g1, stop1, quit1) = fake_session(&fp[..12]);
         let (_g2, stop2, _q2) = fake_session("112233445566"); // a different paired client
@@ -1580,6 +1604,7 @@ pub(crate) mod tests {
     /// while [`publish_gamestream_game`]'s guard is alive.
     #[test]
     fn a_gamestream_game_is_visible_only_while_its_stream_runs() {
+        let _registry = registry_lock();
         let id = "steam:1701";
         let mine = || {
             games()
@@ -1692,6 +1717,7 @@ pub(crate) mod tests {
     /// reason an operator stop latched, survive into the ring `GET /session/last` reads.
     #[test]
     fn a_finished_session_lands_in_the_ring_with_its_numbers() {
+        let _registry = registry_lock();
         let reason = Arc::new(AtomicU8::new(0));
         let counters = Arc::new(SessionCounters::default());
         let (guard, _stop, _quit) =
@@ -1758,6 +1784,7 @@ pub(crate) mod tests {
     /// rather than a clean end with zeros in it.
     #[test]
     fn a_session_that_never_finished_reports_a_host_error() {
+        let _registry = registry_lock();
         let (guard, _stop, _quit) = fake_session("192.0.2.10");
         let id = guard.id;
         drop(guard);
