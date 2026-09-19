@@ -78,13 +78,15 @@ fn delivery_share(
     automatic: bool,
     wire_bytes: u64,
 ) -> Option<u32> {
-    let (offered, delivered) = window.close(
+    let (offered, delivered, streaming) = window.close(
         now,
         counters.link.egress_bytes(),
         packets_received,
         wire_bytes,
     );
-    counters.share.publish(automatic, offered, delivered);
+    counters
+        .share
+        .publish(automatic, offered, delivered, streaming);
     let id = counters.link.session_id();
     (id != 0)
         .then(|| crate::session_status::share_for(id, clocks.take(now)))

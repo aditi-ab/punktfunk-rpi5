@@ -75,6 +75,9 @@ pub struct ShareWindow {
     at: Instant,
     egress_bytes: u64,
     packets_received: u64,
+    /// The window that closed before this one carried the stream: its egress
+    /// was over [`FLOOR_KBPS`].
+    streaming: bool,
 }
 
 impl ShareWindow {
@@ -83,31 +86,41 @@ impl ShareWindow {
             at: now,
             egress_bytes,
             packets_received: 0,
+            streaming: false,
         }
     }
 
-    /// `(offered, delivered)` over the window that just closed, kbps.
+    /// `(offered, delivered)` over the window that just closed, kbps, and
+    /// whether the session was already streaming when it opened.
     ///
     /// Delivered is the client's packet count in this session's wire packets:
     /// the datagram size both ends agreed on, which is what the host has
-    /// without asking for a byte count it never sends.
+    /// without asking for a byte count it never sends. The third figure is
+    /// [`Member::streaming`], which says whether the pair is a reading of the
+    /// path at all.
     pub fn close(
         &mut self,
         now: Instant,
         egress_bytes: u64,
         packets_received: u64,
         wire_bytes: u64,
-    ) -> (u32, u32) {
+    ) -> (u32, u32, bool) {
         let ms = now.duration_since(self.at).as_millis().max(1) as u64;
         let kbps = |bytes: u64| u32::try_from(bytes * 8 / ms).unwrap_or(u32::MAX);
         let offered = kbps(egress_bytes.saturating_sub(self.egress_bytes));
         let arrived = packets_received.saturating_sub(self.packets_received);
+        let opened_streaming = self.streaming;
         *self = ShareWindow {
             at: now,
             egress_bytes,
             packets_received,
+            streaming: offered >= FLOOR_KBPS,
         };
-        (offered, kbps(arrived.saturating_mul(wire_bytes)))
+        (
+            offered,
+            kbps(arrived.saturating_mul(wire_bytes)),
+            opened_streaming,
+        )
     }
 }
 
@@ -135,15 +148,23 @@ pub struct Member {
     pub idle: bool,
     /// The share this session was last told. `None` = it has never had one.
     pub share_kbps: Option<u32>,
+    /// The window before this one carried the stream too ([`ShareWindow`]).
+    /// The window a stream starts in is short of what left the host by
+    /// everything still in flight at its boundary, which is not the path
+    /// refusing anything.
+    pub streaming: bool,
 }
 
 /// The path refused some of what this session offered it.
 ///
-/// A session neither side has yet put the floor rate through says nothing
-/// about the path: the pipeline is still coming up, and a window carrying the
-/// audio reservation and one frame is a shortfall of noise.
+/// A session that has not put the floor rate through for two windows running
+/// says nothing about the path: the pipeline is still coming up, a window
+/// carrying the audio reservation and one frame is a shortfall of noise, and
+/// the window a stream starts in is short by everything still in flight at its
+/// boundary.
 fn short(m: &Member) -> bool {
-    !m.idle
+    m.streaming
+        && !m.idle
         && m.offered_kbps >= FLOOR_KBPS
         && m.delivered_kbps
             .is_some_and(|d| d < m.offered_kbps - m.offered_kbps / SHORT_DIV)
@@ -398,6 +419,7 @@ mod tests {
             delivered_kbps: Some(delivered_kbps),
             idle: false,
             share_kbps: None,
+            streaming: true,
         }
     }
 
@@ -567,6 +589,25 @@ mod tests {
             shares(&[starved, auto(12_000, 6_000)], true),
             [Some(6_000); 2]
         );
+    }
+
+    /// The window a stream starts in is not a reading of the path: what left
+    /// the host over it is still partly in flight when the client closes it, so
+    /// the shortfall is the pipeline, not the link. One more window of the same
+    /// rates and the pair means something.
+    #[test]
+    fn the_window_a_stream_starts_in_does_not_divide_the_path() {
+        let opening = Member {
+            streaming: false,
+            ..auto(20_000, 9_000)
+        };
+        assert_eq!(shares(&[opening; 2], true), [None; 2], "nothing to divide");
+        assert!(!crowded(&[opening; 2]));
+        let running = Member {
+            streaming: true,
+            ..opening
+        };
+        assert_eq!(shares(&[running; 2], true), [Some(9_000); 2]);
     }
 
     /// A ceiling an earlier crowd taught cannot outlive it: while the path

@@ -199,6 +199,7 @@ impl Session {
             delivered_kbps: self.host.delivered_kbps(),
             idle: self.host.idle(now_ms),
             share_kbps: self.share_kbps,
+            streaming: self.host.streaming(),
         }
     }
 
