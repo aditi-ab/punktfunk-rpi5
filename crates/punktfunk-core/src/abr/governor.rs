@@ -18,7 +18,7 @@
 //! simulator show that the host's loop above the client's does not oscillate.
 
 use super::controller::FLOOR_KBPS;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How often an up-move may go out. Down-moves apply as soon as the evidence
 /// does; a share that climbed every report window would be the client's own
@@ -63,6 +63,53 @@ const SHORT_DIV: u32 = 16;
 /// A share of `0` releases the ceiling: the group is gone, or this session is
 /// alone on the path again.
 pub const NO_SHARE_KBPS: u32 = 0;
+
+/// The host's send counter and the client's receive counter as they stood at
+/// the last delivery report, so the next one gives a rate for the same window.
+///
+/// The report is the boundary: the client closes one per report window, and
+/// both figures are cumulative, so the pair of diffs describes one stretch of
+/// link rather than two overlapping ones. A window the client discarded owes no
+/// report, which makes the next one long rather than wrong.
+pub struct ShareWindow {
+    at: Instant,
+    egress_bytes: u64,
+    packets_received: u64,
+}
+
+impl ShareWindow {
+    pub fn new(now: Instant, egress_bytes: u64) -> Self {
+        ShareWindow {
+            at: now,
+            egress_bytes,
+            packets_received: 0,
+        }
+    }
+
+    /// `(offered, delivered)` over the window that just closed, kbps.
+    ///
+    /// Delivered is the client's packet count in this session's wire packets:
+    /// the datagram size both ends agreed on, which is what the host has
+    /// without asking for a byte count it never sends.
+    pub fn close(
+        &mut self,
+        now: Instant,
+        egress_bytes: u64,
+        packets_received: u64,
+        wire_bytes: u64,
+    ) -> (u32, u32) {
+        let ms = now.duration_since(self.at).as_millis().max(1) as u64;
+        let kbps = |bytes: u64| u32::try_from(bytes * 8 / ms).unwrap_or(u32::MAX);
+        let offered = kbps(egress_bytes.saturating_sub(self.egress_bytes));
+        let arrived = packets_received.saturating_sub(self.packets_received);
+        *self = ShareWindow {
+            at: now,
+            egress_bytes,
+            packets_received,
+        };
+        (offered, kbps(arrived.saturating_mul(wire_bytes)))
+    }
+}
 
 /// One session of a group, as the host knows it.
 ///

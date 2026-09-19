@@ -19,6 +19,7 @@
 
 use super::*;
 use pf_clipboard::ClipCoordCmd;
+use punktfunk_core::abr::governor::ShareWindow;
 use punktfunk_core::quic::{AckReason, ClipControl, ClipOffer, ClipState};
 
 /// The ack this client can read. The reason byte goes only to a client that
@@ -28,47 +29,6 @@ fn bitrate_ack(kbps: u32, why: AckReason, client_reads_reason: bool) -> BitrateC
     BitrateChanged {
         bitrate_kbps: kbps,
         reason: client_reads_reason.then_some(why),
-    }
-}
-
-/// The send counter and the client's receive counter as they stood at the last
-/// delivery report, so the next one gives a rate for the same window.
-///
-/// A delivery report is the host's own window boundary: it arrives once per
-/// client report window, and both figures are cumulative, so the pair of diffs
-/// describes one stretch of link rather than two overlapping ones.
-struct ShareWindow {
-    at: std::time::Instant,
-    egress_bytes: u64,
-    packets_received: u64,
-}
-
-impl ShareWindow {
-    fn new(egress_bytes: u64) -> Self {
-        ShareWindow {
-            at: std::time::Instant::now(),
-            egress_bytes,
-            packets_received: 0,
-        }
-    }
-
-    /// `(offered, delivered)` over the window that just closed, kbps.
-    ///
-    /// Delivered is the client's packet count in this session's wire packets:
-    /// the datagram size both ends agreed on, which is what the host has
-    /// without asking for a byte count it never sends.
-    fn close(&mut self, egress_bytes: u64, packets_received: u64, wire_bytes: u64) -> (u32, u32) {
-        let now = std::time::Instant::now();
-        let ms = now.duration_since(self.at).as_millis().max(1) as u64;
-        let kbps = |bytes: u64| u32::try_from(bytes * 8 / ms).unwrap_or(u32::MAX);
-        let offered = kbps(egress_bytes.saturating_sub(self.egress_bytes));
-        let arrived = packets_received.saturating_sub(self.packets_received);
-        *self = ShareWindow {
-            at: now,
-            egress_bytes,
-            packets_received,
-        };
-        (offered, kbps(arrived.saturating_mul(wire_bytes)))
     }
 }
 
@@ -287,7 +247,7 @@ pub(super) async fn run(task: Task) {
     // Shared-path governor: what this session offered and what reached it over
     // the last window, read at the same boundary so a shortfall describes one
     // stretch of link, plus the two clocks an up-move rides.
-    let mut window = ShareWindow::new(counters.link.egress_bytes());
+    let mut window = ShareWindow::new(std::time::Instant::now(), counters.link.egress_bytes());
     let mut share_clocks = ShareClocks::default();
     // One `link health` line a minute, ticking whether or not anything arrived: a reader must
     // be able to tell a clean minute from a host that stopped logging.
@@ -376,6 +336,7 @@ pub(super) async fn run(task: Task) {
                     // ask the governor what this session's share of the path is
                     // (`session_status::share_for`). A group of one never has one.
                     let (offered, delivered) = window.close(
+                        std::time::Instant::now(),
                         counters.link.egress_bytes(),
                         rep.packets_received,
                         wire_bytes,
