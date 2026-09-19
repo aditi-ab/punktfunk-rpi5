@@ -88,7 +88,8 @@ pub struct DriverConfig {
 pub enum Action {
     /// Shard loss this window, ppm: the host's adaptive-FEC input.
     Loss(u32),
-    /// Session total packets received. The host escalates on a dead plane.
+    /// Session total packets received. The host escalates on a dead plane, and
+    /// divides a path two of its sessions share by these.
     Delivery(u64),
     /// Ask the host for a new encoder rate.
     SetBitrate(u32),
