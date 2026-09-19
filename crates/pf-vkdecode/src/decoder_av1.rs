@@ -427,7 +427,7 @@ struct SessionStateAv1 {
     /// Std ref info per DPB slot. Begin-coding wants it for every bound slot,
     /// including ones this frame does not reference.
     slot_refs: Vec<Option<hh::StdVideoDecodeAV1ReferenceInfo>>,
-    /// Coincide: pool image bound to each DPB slot. Rebound on activation.
+    /// Coincide: pool picture bound to each DPB slot. Rebound on activation.
     slot_image: Vec<Option<usize>>,
     /// Per command-buffer completion tokens (reuse gate).
     cmd_marks: Vec<Option<(vk::Semaphore, u64)>>,
@@ -667,7 +667,7 @@ impl VkAv1Decoder {
             }
         }
 
-        // Free pool image, never one a consumer holds.
+        // Free pool picture, never one a consumer holds.
         let Some(dst) = state.pool.free_index() else {
             debug!(
                 held = state.pool.held_total(),
@@ -700,7 +700,7 @@ impl VkAv1Decoder {
         let submission = state.submitted;
         let cmd_index = (submission % state.ops.cmds.len() as u64) as usize;
         if let Some((sem, value)) = state.cmd_marks[cmd_index] {
-            // SAFETY: live device; token is a pool image's semaphore.
+            // SAFETY: live device; token is a pool picture's semaphore.
             unsafe { wait_timeline(self.dev.ash(), sem, value, "command buffer reuse")? };
         }
         let query_index = (submission % u64::from(state.ops.query_count)) as u32;
@@ -912,7 +912,7 @@ impl VkAv1Decoder {
     }
 
     /// Next display-ready frame after the one `decode` returned. Drain after every
-    /// decode; leftover frames occupy pool images. A temporal unit can fill several.
+    /// decode; leftover frames occupy pool pictures. A temporal unit can fill several.
     pub fn take_ready(&mut self) -> Option<DecodedVkFrame> {
         self.ready.pop_front()
     }
@@ -1118,7 +1118,7 @@ impl VkAv1Decoder {
     }
 
     /// Align the three DPB ledgers after a post-planning failure: planner store,
-    /// [`SlotMap`], slot→image. [`Self::flush`] empties the last two and arms
+    /// [`SlotMap`], slot→picture. [`Self::flush`] empties the last two and arms
     /// [`Self::awaiting_key`]. Not a session rebuild — pools stay valid.
     fn recover_dpb(&mut self) {
         debug!(
@@ -1300,7 +1300,7 @@ impl VkAv1Decoder {
             return Ok(());
         };
         if let Some((sem, value)) = state.last_submit {
-            // SAFETY: live device; token is a pool image's semaphore.
+            // SAFETY: live device; token is a pool picture's semaphore.
             unsafe { wait_timeline(self.dev.ash(), sem, value, "session drain")? };
         }
         Ok(())
@@ -1378,9 +1378,9 @@ fn coded_extent(plan: &AuPlan) -> vk::Extent2D {
     }
 }
 
-/// Empty DPB residency, slot→image, and cached ref info together. Leaving ref
+/// Empty DPB residency, slot→picture, and cached ref info together. Leaving ref
 /// info would let [`build_scope_av1`] bind a slot the planner no longer knows.
-/// Returns the pool images the cleared bindings pinned.
+/// Returns the pool pictures the cleared bindings pinned.
 fn reset_slot_bindings(
     slots: &mut SlotMap,
     slot_image: &mut [Option<usize>],
@@ -1509,7 +1509,7 @@ fn build_scope_av1(
 /// # Safety
 ///
 /// Live device; `vk_plan` derived against this generation's `SlotMap`; `dst` a
-/// free pool image; tiles resident in `upload`'s ring slot; the command buffer's
+/// free pool picture; tiles resident in `upload`'s ring slot; the command buffer's
 /// previous submission completed (caller waited its mark).
 #[allow(clippy::too_many_arguments)]
 unsafe fn record_and_submit_av1(
@@ -1591,12 +1591,13 @@ unsafe fn record_and_submit_av1(
                 layer_count: 1,
             })
     };
-    let dst_image = state.pool.pictures[dst].image;
+    let dst_picture = &state.pool.pictures[dst];
+    let dst_image = dst_picture.image;
     let mut image_barriers = Vec::new();
     if coincide {
         image_barriers.push(decode_layer_barrier(
             dst_image,
-            0,
+            dst_picture.layer,
             vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
         ));
     } else {
@@ -1609,7 +1610,7 @@ unsafe fn record_and_submit_av1(
         ));
         image_barriers.push(decode_layer_barrier(
             dst_image,
-            0,
+            dst_picture.layer,
             vk::ImageLayout::VIDEO_DECODE_DST_KHR,
         ));
     }
@@ -1969,7 +1970,7 @@ mod tests {
         assert_eq!(
             unbound,
             vec![7, 8],
-            "the pool images the stale bindings pinned go back on the free list"
+            "the pool pictures the stale bindings pinned go back on the free list"
         );
         assert_eq!(slots.active(), 0);
         assert_eq!(
@@ -2527,8 +2528,8 @@ mod tests {
     }
 
     /// Vector through convert + [`sync_slot_bindings`] + [`build_scope_av1`].
-    /// A referenced slot must still bind the image it was decoded into — bound
-    /// to the setup picture is also wrong, and silent on the GPU.
+    /// A referenced slot must still bind the picture it was decoded into —
+    /// bound to the setup picture is also wrong, and silent on the GPU.
     #[test]
     fn slot_recycling_waits_for_the_decode_op() {
         #[derive(Clone, Default)]
@@ -2537,7 +2538,7 @@ mod tests {
             pending: bool,
             held: u32,
         }
-        // Distinct view per pool image (never dereferenced).
+        // Distinct view per pool picture (never dereferenced).
         let image_view = |picture: usize| vk::ImageView::from_raw(picture as u64 + 1);
 
         let mut planner = Av1Planner::new();

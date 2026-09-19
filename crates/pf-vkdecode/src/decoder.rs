@@ -3,14 +3,14 @@
 //! Each AU is planned, converted, packed into the bitstream ring, recorded
 //! (bound DPB slots, one-time session RESET, a `RESULT_STATUS_ONLY` query
 //! around `vkCmdDecodeVideoKHR`), then submitted under the caller's
-//! [`QueueLock`] with a per-image timeline signal.
+//! [`QueueLock`] with a per-picture timeline signal.
 //!
 //! Decode targets come from a picture pool decoupled from DPB slots
-//! ([`crate::images`]). A slot binds a free image at activation so a delivered
+//! ([`crate::images`]). A slot binds a free picture at activation so a delivered
 //! picture is never a decode target while the consumer reads it. The decoder
 //! signals `value+1` at write; the presenter waits, samples, restores layout,
 //! and signals `value+1` again; [`VkH264Decoder::release_frame`] reports that
-//! write-back before the image's next use.
+//! write-back before the picture's next use.
 //!
 //! Every decode op has a query slot. [`VkH264Decoder::poll_status`] reads it
 //! without waiting; a non-COMPLETE result is the concealment signal. FFmpeg
@@ -85,7 +85,7 @@ pub enum DecodeStatus {
     Failed,
 }
 
-/// Display-ready pool image; the decoder does not touch it until
+/// Display-ready pool picture; the decoder does not touch it until
 /// [`VkH264Decoder::release_frame`].
 ///
 /// Pixels ready when `semaphore` reaches [`Self::value`]. A sampler must, in
@@ -105,7 +105,7 @@ pub struct DecodedVkFrame {
     /// Presenter sampler views; formats from [`crate::plane_formats`] on
     /// [`Self::format`].
     pub plane_views: [vk::ImageView; 2],
-    /// Always 0 — pool images are single-layer (kept for the consumer ABI).
+    /// Array layer this picture occupies; 0 when its backing image is private.
     pub layer: u32,
     /// Layout at the semaphore signal, and the layout the consumer must restore
     /// after sampling: `VIDEO_DECODE_DPB_KHR` (coincide) or `VIDEO_DECODE_DST_KHR`.
@@ -575,7 +575,7 @@ struct SessionState {
     /// codec info for every bound slot, including ones this AU does not
     /// reference. Refreshed from each plan so MMCO long-term promotions land.
     slot_refs: Vec<Option<hh::StdVideoDecodeH264ReferenceInfo>>,
-    /// Coincide: pool image bound to each DPB slot (rebound at activation).
+    /// Coincide: pool picture bound to each DPB slot (rebound at activation).
     slot_image: Vec<Option<usize>>,
     /// Per command-buffer completion tokens (reuse gate).
     cmd_marks: Vec<Option<(vk::Semaphore, u64)>>,
@@ -818,8 +818,8 @@ impl VkH264Decoder {
                 }
             }
 
-            // Free pool image, never one a consumer holds. Exhaustion means the
-            // consumer owes HOLD_HEADROOM releases; no wait frees an image here.
+            // Free pool picture, never one a consumer holds. Exhaustion means the
+            // consumer owes HOLD_HEADROOM releases; no wait frees a picture here.
             let Some(dst) = state.pool.free_index() else {
                 debug!(
                     held = state.pool.held_total(),
@@ -853,7 +853,7 @@ impl VkH264Decoder {
             let submission = state.submitted;
             let cmd_index = (submission % state.ops.cmds.len() as u64) as usize;
             if let Some((sem, value)) = state.cmd_marks[cmd_index] {
-                // SAFETY: live device; the token is a pool image's semaphore.
+                // SAFETY: live device; the token is a pool picture's semaphore.
                 unsafe { wait_timeline(self.dev.ash(), sem, value, "command buffer reuse")? };
             }
             let query_index = (submission % u64::from(state.ops.query_count)) as u32;
@@ -1050,7 +1050,7 @@ impl VkH264Decoder {
 
     /// A display-ready frame beyond the one `decode` returned, if any. Non-empty
     /// only around discontinuities/flushes (zero-reorder envelope). Drain after
-    /// every decode; leftover frames still occupy pool images.
+    /// every decode; leftover frames still occupy pool pictures.
     pub fn take_ready(&mut self) -> Option<DecodedVkFrame> {
         self.ready.pop_front()
     }
@@ -1276,7 +1276,7 @@ impl VkH264Decoder {
     /// Clear DPB state a failed AU left so planning resumes at the next IDR.
     ///
     /// After a post-planning failure three ledgers disagree: the planner DPB,
-    /// [`SlotMap`], and slot→image bindings. [`Self::flush`] settles the first
+    /// [`SlotMap`], and slot→picture bindings. [`Self::flush`] settles the first
     /// (and still delivers pictures that reached output);
     /// [`crate::decoder_h265::reset_slot_bindings`] empties the other two.
     /// Images a consumer holds stay pinned by `held`, as across a rebuild.
@@ -1553,7 +1553,7 @@ pub(crate) fn build_frame(
         format,
         view: picture.view,
         plane_views: picture.plane_views,
-        layer: 0,
+        layer: picture.layer,
         layout: if coincide {
             vk::ImageLayout::VIDEO_DECODE_DPB_KHR
         } else {
@@ -1634,8 +1634,8 @@ pub(crate) unsafe fn wait_timeline(
     }
 }
 
-/// Picture resource view for DPB `slot`: bound pool image (coincide) or DPB
-/// array layer (distinct). `None` when a coincide slot has no binding.
+/// Picture resource view for DPB `slot`: bound pool picture layer (coincide)
+/// or DPB array layer (distinct). `None` when a coincide slot has no binding.
 fn slot_view(state: &SessionState, slot: u8) -> Option<vk::ImageView> {
     match &state.dpb {
         Some(dpb) => Some(dpb.dpb_view(slot)),
@@ -1649,7 +1649,7 @@ fn slot_view(state: &SessionState, slot: u8) -> Option<vk::ImageView> {
 /// # Safety
 ///
 /// Live device; `state` is the current session generation with `vk_plan` derived
-/// against its `SlotMap`, `dst` a free pool image, the AU resident in `upload`'s
+/// against its `SlotMap`, `dst` a free pool picture, the AU resident in `upload`'s
 /// ring slot, and the command buffer's previous submission completed (caller
 /// waited its mark).
 #[allow(clippy::too_many_arguments)]
@@ -1714,13 +1714,14 @@ unsafe fn record_and_submit(
                 layer_count: 1,
             })
     };
-    let dst_image = state.pool.pictures[dst].image;
+    let dst_picture = &state.pool.pictures[dst];
+    let dst_image = dst_picture.image;
     let mut image_barriers = Vec::new();
     if coincide {
-        // Coincide: dst pool image is the setup DPB picture.
+        // Coincide: dst pool layer is the setup DPB picture.
         image_barriers.push(decode_layer_barrier(
             dst_image,
-            0,
+            dst_picture.layer,
             vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
         ));
     } else {
@@ -1733,7 +1734,7 @@ unsafe fn record_and_submit(
         ));
         image_barriers.push(decode_layer_barrier(
             dst_image,
-            0,
+            dst_picture.layer,
             vk::ImageLayout::VIDEO_DECODE_DST_KHR,
         ));
     }
@@ -1751,8 +1752,8 @@ unsafe fn record_and_submit(
         unsafe { device.cmd_reset_query_pool(cmd, query_pool, query_index, 1) };
     }
 
-    // Setup/dst: fresh pool image (coincide) or DPB layer (distinct). Resolved
-    // before the scope is built — it is the scope's last entry.
+    // Setup/dst: fresh pool picture layer (coincide) or DPB layer (distinct).
+    // Resolved before the scope is built — it is the scope's last entry.
     let setup_view = if coincide {
         state.pool.pictures[dst].view
     } else {
@@ -1819,7 +1820,7 @@ unsafe fn record_and_submit(
         .picture_resource(&setup_resource)
         .push_next(&mut setup_dpb);
 
-    // Decode destination: the setup picture (coincide) or the pool image.
+    // Decode destination: the setup picture layer (coincide) or pool picture.
     let dst_resource = if coincide {
         setup_resource
     } else {

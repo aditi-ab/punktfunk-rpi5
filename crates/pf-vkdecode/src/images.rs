@@ -1,20 +1,19 @@
-//! Decode image pools: picture images are decoupled from DPB slots.
+//! Decode image pools: picture slots are decoupled from DPB slots.
 //!
 //! Pool size is `required_slots + HOLD_HEADROOM`. A DPB slot binds a free
-//! image at activation; a re-activated slot may bind a different one
-//! (`SEPARATE_REFERENCE_IMAGES`, required for coincide). A consumer-held
-//! picture stays off the free list until its release token returns, so it
-//! is never a decode target.
+//! picture at activation; a re-activated slot may bind a different one.
+//! A consumer-held picture stays off the free list until its release token
+//! returns, so it is never a decode target.
 //!
-//! - **coincide**: each pool image is DPB + decode output + sampled
-//!   (`DPB|DST|SAMPLED`).
-//! - **distinct**: a reference-only DPB array (layered or per-slot; never
-//!   delivered, slot↔layer mapping fixed) plus the pool as `DST|SAMPLED`.
+//! - **coincide, separate refs**: one `DPB|DST|SAMPLED` image per picture.
+//! - **coincide, layered refs**: one array image, one picture per layer.
+//! - **distinct**: a reference-only DPB (layered or per-slot; never
+//!   delivered, slot↔layer mapping fixed) plus `DST|SAMPLED` pictures.
 //!
-//! Each pool image owns a timeline semaphore (AVVkFrame): the decoder
+//! Each picture owns a timeline semaphore (AVVkFrame): the decoder
 //! signals `value+1` on write; the presenter waits, samples, restores
 //! layout, and signals `value+1` in the same submission. `release_frame`
-//! waits that write-back before the image's next use.
+//! waits that write-back before the picture's next use.
 
 use ash::vk;
 
@@ -41,6 +40,9 @@ pub struct PoolPlan {
     pub dpb_image_count: u32,
     pub dpb_layers_per_image: u32,
     pub dpb_usage: vk::ImageUsageFlags,
+    /// Layers in each backing picture image. Layered coincide uses
+    /// `picture_count` so every DPB candidate is a layer of the one image.
+    pub picture_layers_per_image: u32,
     /// Decode outputs; also DPB bindings in coincide mode.
     pub picture_count: u32,
     pub picture_usage: vk::ImageUsageFlags,
@@ -49,7 +51,7 @@ pub struct PoolPlan {
 
 /// `required_slots` is the stream's `max_dpb_frames + 1`. Picture count is
 /// that plus [`HOLD_HEADROOM`] so a consumer-held picture is never a decode
-/// target. Layered-coincide never reaches here (caps derivation rejects it).
+/// target. Layered coincide puts all of them in one array image.
 pub fn plan_pools(caps: &DecodeCaps, required_slots: u32) -> PoolPlan {
     let picture_count = required_slots + HOLD_HEADROOM;
     let picture_flags = vk::ImageCreateFlags::MUTABLE_FORMAT;
@@ -58,6 +60,7 @@ pub fn plan_pools(caps: &DecodeCaps, required_slots: u32) -> PoolPlan {
             dpb_image_count: 0,
             dpb_layers_per_image: 0,
             dpb_usage: vk::ImageUsageFlags::empty(),
+            picture_layers_per_image: if caps.layered_dpb { picture_count } else { 1 },
             picture_count,
             picture_usage: COINCIDE_USAGE,
             picture_flags,
@@ -72,6 +75,7 @@ pub fn plan_pools(caps: &DecodeCaps, required_slots: u32) -> PoolPlan {
             dpb_image_count,
             dpb_layers_per_image,
             dpb_usage: DPB_USAGE,
+            picture_layers_per_image: 1,
             picture_count,
             picture_usage: OUTPUT_USAGE,
             picture_flags,
@@ -80,23 +84,27 @@ pub fn plan_pools(caps: &DecodeCaps, required_slots: u32) -> PoolPlan {
 }
 
 pub(crate) struct Picture {
+    /// Shared with the other pictures when a layered coincide pool backs them
+    /// all with one array image.
     pub image: vk::Image,
-    /// Full-picture view: decode dst and (coincide) DPB binding.
+    /// Array layer this picture occupies; 0 when the backing image is private.
+    pub layer: u32,
+    /// Full-picture view of [`Self::layer`]: decode dst and (coincide) DPB.
     pub view: vk::ImageView,
-    /// Per-plane views for the presenter's sampler, formats from
-    /// [`crate::caps::plane_formats`].
+    /// Per-plane views of [`Self::layer`] for the presenter's sampler, formats
+    /// from [`crate::caps::plane_formats`].
     pub plane_views: [vk::ImageView; 2],
-    /// The image's own timeline semaphore (AVVkFrame contract).
+    /// The picture's own timeline semaphore (AVVkFrame contract).
     pub semaphore: vk::Semaphore,
     /// Latest timeline value signalled or enqueued. Decoder write, then
     /// presenter's write-back (`frame.value + 1`) once a release token
     /// reports the sample.
     pub value: u64,
-    /// A DPB slot currently binds this image (coincide mode).
+    /// A DPB slot currently binds this picture (coincide mode).
     pub bound: bool,
     /// Decoded picture awaiting its output verdict.
     pub pending: bool,
-    /// Frames over this image not yet released (ready queue + consumer-held).
+    /// Frames over this picture not yet released (ready queue + consumer-held).
     pub held: u32,
 }
 
@@ -111,6 +119,9 @@ impl Picture {
 /// when the last release token arrives — do not Drop it while `held > 0`.
 pub(crate) struct PicturePool {
     device: ash::Device,
+    /// Backing images, once each: a layered coincide pool stores one array
+    /// handle here while `pictures` repeats it with a different layer.
+    images: Vec<vk::Image>,
     memory: Vec<vk::DeviceMemory>,
     /// Caps-resolved `output_format` this pool was created with. Stashed
     /// because a delivered frame outlives its generation's caps entry
@@ -121,8 +132,9 @@ pub(crate) struct PicturePool {
 }
 
 impl PicturePool {
-    /// `plan.picture_count` single-layer images at `extent` (granularity-aligned
-    /// allocation extent, not coded size).
+    /// `plan.picture_count` pictures at `extent` (granularity-aligned
+    /// allocation extent, not coded size), each occupying one layer of a
+    /// `picture_layers_per_image`-layer backing image.
     ///
     /// # Safety
     ///
@@ -136,12 +148,15 @@ impl PicturePool {
     ) -> Result<Self, AllocError> {
         let mut pool = Self {
             device: dev.ash().clone(),
+            images: Vec::new(),
             memory: Vec::new(),
             format: caps.output_format,
             pictures: Vec::new(),
         };
         let families = dev.sharing_families();
-        for _ in 0..plan.picture_count {
+        let layers = plan.picture_layers_per_image.max(1);
+        let image_count = plan.picture_count.div_ceil(layers);
+        for _ in 0..image_count {
             // SAFETY: fn contract (live device); each handle is parked in
             // `pool` so a mid-build failure unwinds through Drop.
             let (image, memory) = unsafe {
@@ -149,19 +164,25 @@ impl PicturePool {
                     dev,
                     caps.output_format,
                     extent,
-                    1,
+                    layers,
                     plan.picture_usage,
                     plan.picture_flags,
                     &families,
                     profile,
                 )?
             };
+            pool.images.push(image);
             pool.memory.push(memory);
+        }
+        for picture_index in 0..plan.picture_count {
+            let image = pool.images[(picture_index / layers) as usize];
+            let layer = picture_index % layers;
             // Park with null views/semaphore first: Drop ignores nulls, so a
-            // later create failure still unwinds the image and everything
+            // later create failure still unwinds the images and everything
             // already filled.
             pool.pictures.push(Picture {
                 image,
+                layer,
                 view: vk::ImageView::null(),
                 plane_views: [vk::ImageView::null(); 2],
                 semaphore: vk::Semaphore::null(),
@@ -171,30 +192,29 @@ impl PicturePool {
                 held: 0,
             });
             let picture = pool.pictures.len() - 1;
-            // SAFETY: `image` was just created with layer 0 in range (all three
-            // views); plane formats are caps-resolved for this picture format
-            // and plane-compatible under MUTABLE_FORMAT.
+            // SAFETY: `image` was created with `layers` layers, `layer` is in
+            // range, and plane formats are caps-resolved for MUTABLE_FORMAT.
             unsafe {
                 pool.pictures[picture].view = create_view(
                     &pool.device,
                     image,
                     caps.output_format,
                     vk::ImageAspectFlags::COLOR,
-                    0,
+                    layer,
                 )?;
                 pool.pictures[picture].plane_views[0] = create_view(
                     &pool.device,
                     image,
                     caps.plane_view_formats[0],
                     vk::ImageAspectFlags::PLANE_0,
-                    0,
+                    layer,
                 )?;
                 pool.pictures[picture].plane_views[1] = create_view(
                     &pool.device,
                     image,
                     caps.plane_view_formats[1],
                     vk::ImageAspectFlags::PLANE_1,
-                    0,
+                    layer,
                 )?;
             }
             let mut type_info = vk::SemaphoreTypeCreateInfo::default()
@@ -230,7 +250,9 @@ impl Drop for PicturePool {
                 self.device.destroy_image_view(p.plane_views[0], None);
                 self.device.destroy_image_view(p.plane_views[1], None);
                 self.device.destroy_semaphore(p.semaphore, None);
-                self.device.destroy_image(p.image, None);
+            }
+            for image in self.images.drain(..) {
+                self.device.destroy_image(image, None);
             }
             for memory in self.memory.drain(..) {
                 self.device.free_memory(memory, None);
@@ -508,7 +530,20 @@ mod tests {
             plan.picture_usage, COINCIDE_USAGE,
             "pool pictures are DPB + decode dst + sampled surface in one"
         );
+        assert_eq!(plan.picture_layers_per_image, 1);
         assert_eq!(plan.picture_flags, vk::ImageCreateFlags::MUTABLE_FORMAT);
+    }
+
+    #[test]
+    fn layered_coincide_puts_every_picture_in_one_array() {
+        let plan = plan_pools(&caps(true, true), 8);
+        assert_eq!(plan.dpb_image_count, 0);
+        assert_eq!(plan.picture_count, 8 + HOLD_HEADROOM);
+        assert_eq!(
+            plan.picture_layers_per_image, plan.picture_count,
+            "without SEPARATE_REFERENCE_IMAGES every DPB candidate is a layer"
+        );
+        assert_eq!(plan.picture_usage, COINCIDE_USAGE);
     }
 
     #[test]
@@ -521,6 +556,7 @@ mod tests {
         );
         assert_eq!(plan.dpb_usage, DPB_USAGE);
         assert_eq!(plan.picture_count, 17 + HOLD_HEADROOM);
+        assert_eq!(plan.picture_layers_per_image, 1);
         assert_eq!(plan.picture_usage, OUTPUT_USAGE);
 
         let plan = plan_pools(&caps(false, false), 3);
@@ -536,6 +572,7 @@ mod tests {
     fn picture_occupancy_frees_only_when_unbound_unpending_and_released() {
         let mut p = Picture {
             image: vk::Image::null(),
+            layer: 0,
             view: vk::ImageView::null(),
             plane_views: [vk::ImageView::null(); 2],
             semaphore: vk::Semaphore::null(),
