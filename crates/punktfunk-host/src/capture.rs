@@ -61,6 +61,7 @@ fn zero_copy_policy(
         // Without it HDR capture stays on the CPU path.
         hdr_cuda_ok: pf_encode::linux_hdr_cuda_ok(),
         nvenc_raw_dmabuf: pf_encode::linux_nvenc_raw_dmabuf_ok(),
+        gamescope_tiled: false,
     }
 }
 
@@ -173,7 +174,11 @@ pub fn capture_virtual_output(
         want.chroma_444,
         want.hdr,
         want.ten_bit_sdr,
-        zero_copy_policy(want.pyrowave, want.nv12_native),
+        pf_capture::ZeroCopyPolicy {
+            // No route here. A wrong "foreign" only keeps the LINEAR offer.
+            gamescope_tiled: gamescope && pf_vdisplay::gamescope_tiled_capture(None),
+            ..zero_copy_policy(want.pyrowave, want.nv12_native)
+        },
         vout.expect_exact_dims,
         kwin,
         gamescope,
@@ -251,16 +256,19 @@ impl Capturer for KeptAlive {
 /// spawned (not attached-foreign) sub-mode, and no earlier virtual-output HDR
 /// downgrade latched. Anything else on Linux is 8-bit; GNOME 50+ portal HDR is
 /// the GameStream plane (`gamestream::host_hdr_capable` + live monitor probe).
-pub fn capturer_supports_hdr_for(compositor: Option<crate::vdisplay::Compositor>) -> bool {
+pub fn capturer_supports_hdr_for(
+    compositor: Option<crate::vdisplay::Compositor>,
+    gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
+) -> bool {
     #[cfg(target_os = "linux")]
     {
         if compositor == Some(crate::vdisplay::Compositor::Gamescope) {
             return pf_host_config::config().gamescope_hdr
-                && pf_vdisplay::gamescope_hdr_available()
+                && pf_vdisplay::gamescope_hdr_available(gamescope_route)
                 && !pf_capture::hdr_capture_failed(pf_capture::HdrSource::VirtualOutput);
         }
     }
-    let _ = compositor;
+    let _ = (compositor, gamescope_route);
     pf_capture::capturer_supports_hdr()
 }
 

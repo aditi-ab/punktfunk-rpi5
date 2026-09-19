@@ -11,6 +11,9 @@
 //!
 //! `VIDEO_CAP_MULTI_SLICE` is the last `video_caps` bit; `HOST_CAP_AUDIO_HIRES` is the
 //! last `host_caps` bit — further host caps already use `host_caps2`. Evidence: `design/`.
+//!
+//! A new `*_CAP_*`, `CODEC_*` or `EXT_TAG_*` constant goes in the matching table in
+//! `tests::CAP_TABLES` / `tests::EXT_TAGS`; `every_cap_constant_is_tabled` fails until it does.
 
 /// [`Hello::video_caps`]: client can decode Main10. Without [`VIDEO_CAP_HDR`] this is
 /// 10-bit SDR — Main10 under a BT.709 SDR VUI; neither display's colour state is touched.
@@ -161,12 +164,18 @@ pub const HOST_CAP2_TOUCH: u8 = 0x02;
 /// bit — Hello is first contact, with no host capability known yet, and stays frozen.
 pub const HOST_CAP2_EXT: u8 = 0x04;
 
+/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the injector consumes
+/// [`InputKind::Scroll`](crate::input::InputKind::Scroll) — source/phase-aware
+/// normalized scroll. Without the bit the client's outbound seam converts each
+/// event to the legacy `MouseScroll` vocabulary instead; the host never sees both.
+pub const HOST_CAP2_SCROLL: u8 = 0x08;
+
 /// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host serves
 /// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is punched,
 /// before its pipeline exists and without the one-per-10 s spacing, until the first video
 /// frame leaves. That window is what the client's bring-up ramp measures the link in; a
 /// client that does not see the bit bursts beside live video as before.
-pub const HOST_CAP2_RAMP: u8 = 0x08;
+pub const HOST_CAP2_RAMP: u8 = 0x10;
 
 /// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads a
 /// [`DeliveryReport`](super::control::DeliveryReport) every report window and divides a path
@@ -321,6 +330,139 @@ mod tests {
     use crate::audio::SAMPLE_RATE_HZ;
     use crate::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Mode};
     use crate::quic::*;
+
+    /// Every capability constant, grouped by the wire byte it is a bit of. Two features on
+    /// one bit is a host advertising one and being read as the other, which no peer can
+    /// report — so the tables are the wire's own record of what each byte spends.
+    const CAP_TABLES: &[(&str, &[(&str, u8)])] = &[
+        (
+            "video_caps",
+            &[
+                ("VIDEO_CAP_10BIT", VIDEO_CAP_10BIT),
+                ("VIDEO_CAP_HDR", VIDEO_CAP_HDR),
+                ("VIDEO_CAP_444", VIDEO_CAP_444),
+                ("VIDEO_CAP_HOST_TIMING", VIDEO_CAP_HOST_TIMING),
+                ("VIDEO_CAP_PROBE_SEQ", VIDEO_CAP_PROBE_SEQ),
+                ("VIDEO_CAP_STREAMED_AU", VIDEO_CAP_STREAMED_AU),
+                ("VIDEO_CAP_CHACHA20", VIDEO_CAP_CHACHA20),
+                ("VIDEO_CAP_MULTI_SLICE", VIDEO_CAP_MULTI_SLICE),
+            ],
+        ),
+        (
+            "client_caps",
+            &[
+                ("CLIENT_CAP_CURSOR", CLIENT_CAP_CURSOR),
+                ("CLIENT_CAP_PHASE_LOCK", CLIENT_CAP_PHASE_LOCK),
+                ("CLIENT_CAP_AUDIO_RED", CLIENT_CAP_AUDIO_RED),
+                ("CLIENT_CAP_PAD_AUDIO", CLIENT_CAP_PAD_AUDIO),
+                ("CLIENT_CAP_AUDIO_HIRES", CLIENT_CAP_AUDIO_HIRES),
+                ("CLIENT_CAP_KEEP_HOST_AUDIO", CLIENT_CAP_KEEP_HOST_AUDIO),
+                ("CLIENT_CAP_EXT", CLIENT_CAP_EXT),
+            ],
+        ),
+        (
+            "host_caps",
+            &[
+                ("HOST_CAP_GAMEPAD_STATE", HOST_CAP_GAMEPAD_STATE),
+                ("HOST_CAP_CLIPBOARD", HOST_CAP_CLIPBOARD),
+                ("HOST_CAP_TEXT_INPUT", HOST_CAP_TEXT_INPUT),
+                ("HOST_CAP_CURSOR", HOST_CAP_CURSOR),
+                ("HOST_CAP_PEN", HOST_CAP_PEN),
+                ("HOST_CAP_AUDIO_RED", HOST_CAP_AUDIO_RED),
+                ("HOST_CAP_PAD_AUDIO", HOST_CAP_PAD_AUDIO),
+                ("HOST_CAP_AUDIO_HIRES", HOST_CAP_AUDIO_HIRES),
+            ],
+        ),
+        (
+            "host_caps2",
+            &[
+                ("HOST_CAP2_REPEAT_MARK", HOST_CAP2_REPEAT_MARK),
+                ("HOST_CAP2_TOUCH", HOST_CAP2_TOUCH),
+                ("HOST_CAP2_EXT", HOST_CAP2_EXT),
+                ("HOST_CAP2_SCROLL", HOST_CAP2_SCROLL),
+                ("HOST_CAP2_RAMP", HOST_CAP2_RAMP),
+            ],
+        ),
+        (
+            "video_codecs",
+            &[
+                ("CODEC_H264", CODEC_H264),
+                ("CODEC_HEVC", CODEC_HEVC),
+                ("CODEC_AV1", CODEC_AV1),
+                ("CODEC_PYROWAVE", CODEC_PYROWAVE),
+            ],
+        ),
+    ];
+
+    /// The `Start` extension block's tag space: ids, not bits, so they only have to differ.
+    const EXT_TAGS: &[(&str, u16)] = &[
+        ("EXT_TAG_PADDING", EXT_TAG_PADDING),
+        ("EXT_TAG_CLIENT", EXT_TAG_CLIENT),
+        ("EXT_TAG_ABR", EXT_TAG_ABR),
+    ];
+
+    /// Within a byte, each constant is one bit and no bit is spent twice; tags are distinct
+    /// ids. A peer reads a byte it did not write, so a collision is silent on both ends.
+    #[test]
+    fn cap_bytes_are_distinct_single_bits() {
+        for (byte, consts) in CAP_TABLES {
+            let mut taken = 0u8;
+            for (name, bit) in *consts {
+                assert_eq!(bit.count_ones(), 1, "{byte}: {name} is not a single bit");
+                assert_eq!(
+                    taken & bit,
+                    0,
+                    "{byte}: {name} = {bit:#04x} is already taken"
+                );
+                taken |= bit;
+            }
+        }
+        for (i, (name, id)) in EXT_TAGS.iter().enumerate() {
+            let earlier = &EXT_TAGS[..i];
+            assert!(
+                !earlier.iter().any(|(_, seen)| seen == id),
+                "{name} = {id} is already taken"
+            );
+        }
+    }
+
+    /// The tables above cover every constant declared under these prefixes. Reads the two
+    /// sources at compile time, so a bit added without a table entry fails here by name.
+    /// A prefix nobody tables is a whole new byte and wants its own table and its own line.
+    #[test]
+    fn every_cap_constant_is_tabled() {
+        let sources: [(&str, &[&str]); 2] = [
+            (
+                include_str!("caps.rs"),
+                &[
+                    "VIDEO_CAP_",
+                    "CLIENT_CAP_",
+                    "HOST_CAP_",
+                    "HOST_CAP2_",
+                    "CODEC_",
+                ],
+            ),
+            (include_str!("handshake.rs"), &["EXT_TAG_"]),
+        ];
+        for (src, prefixes) in sources {
+            for line in src.lines() {
+                let Some(name) = line
+                    .strip_prefix("pub const ")
+                    .and_then(|rest| rest.split(':').next())
+                else {
+                    continue;
+                };
+                if !prefixes.iter().any(|p| name.starts_with(p)) {
+                    continue;
+                }
+                let tabled = CAP_TABLES
+                    .iter()
+                    .any(|(_, cs)| cs.iter().any(|(n, _)| *n == name))
+                    || EXT_TAGS.iter().any(|(n, _)| *n == name);
+                assert!(tabled, "{name} is missing from the capability tables");
+            }
+        }
+    }
 
     #[test]
     fn host_cap_clipboard_bit_is_distinct_and_survives_welcome() {

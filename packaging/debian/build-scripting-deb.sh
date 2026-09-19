@@ -3,15 +3,15 @@
 # built on Effect, run on bun).
 #
 # Runtime is BUN: the runner `import()`s the operator's `.ts` plugin/script files directly, which
-# only bun can do. Like the web console, we VENDOR a bun binary into the package (bun isn't in apt),
-# which makes the package per-arch (amd64/arm64), NOT `all`. Unlike the console it is NOT a Nitro
+# only bun can do. Like the web console it runs on the vendored bun from punktfunk-bun
+# (build-bun-deb.sh), pinned to this exact version. Unlike the console it is NOT a Nitro
 # bundle: we `bun build` the runner CLI into ONE self-contained JS (effect + the SDK inlined; the
 # dynamic plugin import stays a runtime import), so there is no node_modules to ship. The host's
 # punktfunk-host .deb Recommends this so a default `apt install punktfunk-host` pulls the runner too;
 # its systemd --user unit is installed but NOT auto-enabled (the runner is inert until you add
 # scripts/plugins — enable it with `systemctl --user enable --now punktfunk-scripting`).
 #
-# Usage: VERSION=0.0.1~ci42.gdeadbee [DEB_ARCH=amd64] [BUN_BIN=/path/to/bun] bash packaging/debian/build-scripting-deb.sh
+# Usage: VERSION=0.0.1~ci42.gdeadbee [DEB_ARCH=amd64] bash packaging/debian/build-scripting-deb.sh
 # Output: dist/punktfunk-scripting_<version>_<arch>.deb
 set -euo pipefail
 
@@ -20,20 +20,13 @@ PKG="punktfunk-scripting"
 ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
 
-# Per-arch: vendor bun for the target Debian arch. Map deb arch → bun's release arch tag.
+# Per-arch, like the punktfunk-bun it depends on.
 DEB_ARCH="${DEB_ARCH:-$(dpkg --print-architecture)}"
-BUN_VERSION="${BUN_VERSION:-1.3.14}" # pinned bun build vendored into the package (matches build-web-deb.sh)
-case "$DEB_ARCH" in
-  amd64) BUN_ARCH=x64 ;;
-  arm64) BUN_ARCH=aarch64 ;;
-  *) echo "ERROR: unsupported DEB_ARCH=$DEB_ARCH (want amd64 or arm64)" >&2; exit 1 ;;
-esac
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 SHAREDIR="$STAGE/usr/share/$PKG"
 DOCDIR="$STAGE/usr/share/doc/$PKG"
-LIBDIR="$STAGE/usr/lib/$PKG"
 
 # --- build the runner bundle -------------------------------------------------
 # One self-contained JS: `bun build --target=bun` inlines effect + the @punktfunk/host SDK; the
@@ -49,31 +42,13 @@ mkdir -p "$SHAREDIR"
 grep -q 'attempt=' "$SHAREDIR/runner-cli.js" \
   || { echo "ERROR: runner bundle missing the dynamic plugin import — wrong build" >&2; exit 1; }
 
-# --- vendor the bun runtime --------------------------------------------------
-# Honor a pre-fetched bun (CI may cache it) via BUN_BIN; else download the pinned release.
-mkdir -p "$LIBDIR"
-if [ -n "${BUN_BIN:-}" ]; then
-  echo "==> vendoring bun from BUN_BIN=$BUN_BIN"
-  install -m0755 "$BUN_BIN" "$LIBDIR/bun"
-else
-  url="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${BUN_ARCH}.zip"
-  echo "==> downloading bun $BUN_VERSION ($BUN_ARCH) from $url"
-  tmp="$(mktemp -d)"
-  curl -fsSL "$url" -o "$tmp/bun.zip"
-  unzip -q "$tmp/bun.zip" -d "$tmp"
-  install -m0755 "$tmp/bun-linux-${BUN_ARCH}/bun" "$LIBDIR/bun"
-  rm -rf "$tmp"
-fi
-"$LIBDIR/bun" --version
-
 # --- file layout -------------------------------------------------------------
 # Stable PATH-independent launcher (the systemd unit's ExecStart) — runs the bundle on vendored bun.
 install -d "$STAGE/usr/bin"
 cat > "$STAGE/usr/bin/punktfunk-scripting" <<'WRAP'
 #!/bin/sh
-# The runner runs on the vendored bun (it import()s the operator's .ts plugins); bun lives privately
-# under /usr/lib/punktfunk-scripting so it never collides with a system-wide bun on PATH.
-exec /usr/lib/punktfunk-scripting/bun /usr/share/punktfunk-scripting/runner-cli.js "$@"
+# The runner runs on punktfunk-bun's private bun (it import()s the operator's .ts plugins).
+exec /usr/lib/punktfunk-bun/bun /usr/share/punktfunk-scripting/runner-cli.js "$@"
 WRAP
 chmod 0755 "$STAGE/usr/bin/punktfunk-scripting"
 install -Dm0644 scripts/punktfunk-scripting.service "$STAGE/usr/lib/systemd/user/punktfunk-scripting.service"
@@ -107,13 +82,13 @@ Maintainer: unom <packages@unom.io>
 Installed-Size: $INSTALLED_KB
 Section: net
 Priority: optional
-Depends: bubblewrap
+Depends: bubblewrap, punktfunk-bun (= $VERSION)
 Homepage: https://git.unom.io/unom/punktfunk
 Description: punktfunk plugin/script runner (Effect SDK on bun)
  Runs a punktfunk host's automation: loose scripts in ~/.config/punktfunk/scripts and installed
  punktfunk-plugin-* packages under ~/.config/punktfunk/plugins, each supervised (Effect fibers with
  capped-jittered restart; SIGTERM shuts the whole tree down structurally so plugin finalizers run).
- Bundles its own bun runtime (no system nodejs/bun dependency).
+ Runs on the bun from punktfunk-bun (no system nodejs/bun dependency).
  .
  ON BY DEFAULT: the systemd --user unit is enabled for every user (systemctl --global). The runner is
  inert until you add scripts or plugins, and the game-library scanners now ship AS plugins — so a

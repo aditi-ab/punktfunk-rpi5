@@ -25,7 +25,7 @@
 // Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 // Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
 // in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 35
+#define PUNKTFUNK_ABI_VERSION 37
 
 // punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 //
@@ -420,6 +420,13 @@
 // accumulators.
 #define PUNKTFUNK_MAX_PADS 16
 
+// Q24.8 fixed-point scale of [`ScrollEvent::delta`].
+#define PUNKTFUNK_SCROLL_SCALE 256.0
+
+// Device-independent pixels one wheel detent spans. Converts DIP to v120 at
+// `DIP * 120 / 60 = DIP * 2`.
+#define PUNKTFUNK_SCROLL_DIP_PER_DETENT 60.0
+
 #define PUNKTFUNK_BTN_DPAD_UP 1
 
 #define PUNKTFUNK_BTN_DPAD_DOWN 2
@@ -766,7 +773,7 @@
 // before its pipeline exists and without the one-per-10 s spacing, until the first video
 // frame leaves. That window is what the client's bring-up ramp measures the link in; a
 // client that does not see the bit bursts beside live video as before.
-#define PUNKTFUNK_HOST_CAP2_RAMP 8
+#define PUNKTFUNK_HOST_CAP2_RAMP 16
 
 // [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads a
 // [`DeliveryReport`](super::control::DeliveryReport) every report window and divides a path
@@ -1343,6 +1350,12 @@ enum PunktfunkInputKind
     // [`HOST_CAP_TEXT_INPUT`](crate::quic::HOST_CAP_TEXT_INPUT); older hosts ignore
     // the tag and clients keep best-effort VK synthesis.
     PUNKTFUNK_INPUT_KIND_TEXT_INPUT = 15,
+    // Normalized scroll ([`scroll::ScrollEvent`]): `code` = axis (0 = vertical,
+    // 1 = horizontal), `x` = signed Q24.8 delta in the source's unit, `y` = 0,
+    // `flags` = source in the low byte, phase in bits 8–15. Sent only when the
+    // host advertised `HOST_CAP2_SCROLL`; the client's outbound seam converts
+    // to [`MouseScroll`](Self::MouseScroll) for older hosts.
+    PUNKTFUNK_INPUT_KIND_SCROLL = 16,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -1407,6 +1420,42 @@ typedef uint8_t PunktfunkEndReason;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 #endif
+
+// What produced the distance. `flags` low byte.
+typedef enum {
+    // Source not reported; treated as detent-counted wheel units.
+    PUNKTFUNK_SCROLL_SOURCE_UNKNOWN = 0,
+    // Notched wheel; `delta` is Q24.8 v120.
+    PUNKTFUNK_SCROLL_SOURCE_WHEEL = 1,
+    // Finger on a touchpad or similar; `delta` is Q24.8 DIP.
+    PUNKTFUNK_SCROLL_SOURCE_FINGER = 2,
+    // Continuous surface without finger tracking (dial, tilt wheel).
+    PUNKTFUNK_SCROLL_SOURCE_CONTINUOUS = 3,
+    // Touchscreen pan; `delta` is Q24.8 DIP.
+    PUNKTFUNK_SCROLL_SOURCE_TOUCH = 4,
+    // Controller-driven scroll (stick, gyro, touchpad emulation).
+    PUNKTFUNK_SCROLL_SOURCE_CONTROLLER = 5,
+} PunktfunkScrollSource;
+
+// Gesture boundary marker. `flags` bits 8–15.
+typedef enum {
+    // No boundary — a plain delta (the only phase wheel sources may send).
+    PUNKTFUNK_SCROLL_PHASE_NONE = 0,
+    // Gesture starts; may carry its first delta.
+    PUNKTFUNK_SCROLL_PHASE_BEGIN = 1,
+    // Gesture delta.
+    PUNKTFUNK_SCROLL_PHASE_UPDATE = 2,
+    // Gesture ends; `delta` must be 0.
+    PUNKTFUNK_SCROLL_PHASE_END = 3,
+    // Gesture cancelled; `delta` must be 0.
+    PUNKTFUNK_SCROLL_PHASE_CANCEL = 4,
+    // Client-computed kinetic tail starts after the gesture's `End`.
+    PUNKTFUNK_SCROLL_PHASE_MOMENTUM_BEGIN = 5,
+    // Kinetic delta.
+    PUNKTFUNK_SCROLL_PHASE_MOMENTUM = 6,
+    // Kinetic tail ends; `delta` must be 0.
+    PUNKTFUNK_SCROLL_PHASE_MOMENTUM_END = 7,
+} PunktfunkScrollPhase;
 
 // Per-session CICP (ITU-T H.273) the host resolved, on [`Welcome`]. Configure the
 // decoder/presenter from these; do not infer from bitstream VUI. An older host omits the
@@ -2613,17 +2662,11 @@ PunktfunkStatus punktfunk_connection_set_pad_mouse(PunktfunkConnection *c, uint1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Replace the controller-mouse layout from a JSON document: `settings` (the `pointer` and
-// `scroll` multipliers, `deadzone`, `long_press_ms`), a `buttons` table of pad button to
-// `mouse:left` / `key:Escape`, and a `chords` array of `buttons` + `press`
-// (`any` / `short` / `long` / `hold`) + `keys`. NULL restores the shipped table. A pad already
-// in controller mouse keeps the layout it entered with. `InvalidArg` on a document that does
-// not parse, and the live layout is left alone.
+// Change scroll direction for this session at the shared outbound seam.
 //
 // # Safety
-// `c` is a valid connection handle; `json` is a NUL-terminated UTF-8 string or NULL.
-// Callable from any thread.
-PunktfunkStatus punktfunk_connection_set_pad_mouse_layout(PunktfunkConnection *c, const char *json);
+// `c` is a valid connection handle. Callable from any thread.
+PunktfunkStatus punktfunk_connection_set_invert_scroll(PunktfunkConnection *c, bool invert);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

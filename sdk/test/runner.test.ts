@@ -8,6 +8,7 @@ import * as path from "node:path";
 import {
 	discoverUnits,
 	runner,
+	spawnAgainIfKilled,
 	superviseUnit,
 	windowsSddlUnsafeReason,
 } from "../src/runner.js";
@@ -183,6 +184,26 @@ describe("discovery", () => {
 			JSON.stringify({ name: "plugins", dependencies: {} }),
 		);
 		expect(discoverUnits(d)).toEqual([]);
+	});
+});
+
+describe("spawnAgainIfKilled (the ACL read's guard against a misfired timeout)", () => {
+	const scripted = (...statuses: (number | null)[]) => {
+		const seen: (number | null)[] = [];
+		const last = spawnAgainIfKilled(() => {
+			const status = statuses[seen.length] ?? null;
+			seen.push(status);
+			return { status };
+		});
+		return { status: last.status, spawns: seen.length };
+	};
+
+	test("a killed spawn runs once more; an exit of any code is final", () => {
+		// `status: null` is the kill. A non-zero exit is PowerShell's own answer and stays.
+		expect(scripted(null, 0)).toEqual({ status: 0, spawns: 2 });
+		expect(scripted(1)).toEqual({ status: 1, spawns: 1 });
+		// A real hang is killed twice and the unit is still refused: bounded, fail-closed.
+		expect(scripted(null, null, 0)).toEqual({ status: null, spawns: 2 });
 	});
 });
 

@@ -184,7 +184,8 @@ impl std::fmt::Display for MaxLevelIdc {
 #[derive(Debug, Clone)]
 pub struct DecodeCaps {
     /// `true`: decode output is the DPB image. `false`: separate DPB array and
-    /// output images. When the driver advertises both, coincide wins (half the images).
+    /// output images. When the driver advertises both, a usable coincide wins
+    /// (half the images).
     pub coincide: bool,
     /// `true` when the driver does not advertise `SEPARATE_REFERENCE_IMAGES`: every
     /// DPB slot is then a layer of one image array. Otherwise each slot is its own
@@ -256,9 +257,9 @@ pub enum CapsError {
         mode: &'static str,
         format: vk::Format,
     },
-    /// COINCIDE plus a layered DPB (no `SEPARATE_REFERENCE_IMAGES`). The picture
-    /// pool rebinds a fresh image per activation, which a fixed layer of one array
-    /// cannot do. Demote rather than build a copy path.
+    /// COINCIDE only, plus a layered DPB (no `SEPARATE_REFERENCE_IMAGES`). The
+    /// picture pool rebinds a fresh image per activation, which a fixed layer of
+    /// one array cannot do. A device that also offers DISTINCT never reports this.
     CoincideLayeredDpb,
 }
 
@@ -309,8 +310,9 @@ impl std::fmt::Display for CapsError {
             CapsError::CoincideLayeredDpb => {
                 write!(
                     f,
-                    "coincide mode with a layered DPB (no SEPARATE_REFERENCE_IMAGES) — \
-                     the picture-pool model needs per-slot images; demote this device"
+                    "coincide-only device with a layered DPB (no DPB_AND_OUTPUT_DISTINCT, \
+                     no SEPARATE_REFERENCE_IMAGES) — the picture-pool model needs \
+                     per-slot images; demote this device"
                 )
             }
         }
@@ -411,10 +413,9 @@ pub(crate) fn derive_arrangement(
 
     let layered_dpb =
         !capability_flags.contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES);
-    // Coincide preferred when both are offered (struct docs). Presenter-facing
-    // images need the pool's exact usage plus MUTABLE_FORMAT; distinct DPB
-    // needs neither sampling nor plane views.
-    let (dpb_format, output_format) = if coincide {
+    // Presenter-facing images need the pool's exact usage plus MUTABLE_FORMAT;
+    // distinct DPB needs neither sampling nor plane views.
+    let try_coincide = || -> Result<(vk::Format, vk::Format), CapsError> {
         if layered_dpb {
             // Picture-pool model needs per-slot images (a slot rebinds a fresh
             // image at activation); one fixed layer per slot cannot.
@@ -424,15 +425,28 @@ pub(crate) fn derive_arrangement(
         let entry = pick_format(coincide_formats, wanted, mode)?;
         require_usage(&entry, COINCIDE_USAGE, mode)?;
         require_mutable(&entry, mode)?;
-        (entry.format, entry.format)
-    } else {
+        Ok((entry.format, entry.format))
+    };
+    let try_distinct = || -> Result<(vk::Format, vk::Format), CapsError> {
         let dpb = pick_format(dpb_formats, wanted, "DPB")?;
         require_usage(&dpb, DPB_USAGE, "DPB")?;
         let out_mode = "output (DST|SAMPLED)";
         let output = pick_format(output_formats, wanted, out_mode)?;
         require_usage(&output, OUTPUT_USAGE, out_mode)?;
         require_mutable(&output, out_mode)?;
-        (dpb.format, output.format)
+        Ok((dpb.format, output.format))
+    };
+    // Coincide preferred (struct docs). A device offering both whose coincide
+    // arrangement is unusable decodes distinct; the error names distinct then.
+    let (coincide, (dpb_format, output_format)) = match try_coincide() {
+        Ok(formats) if coincide => (true, formats),
+        Err(unusable) if !distinct => return Err(unusable),
+        tried => {
+            if let (true, Err(unusable)) = (coincide, &tried) {
+                tracing::info!(%unusable, "coincide arrangement unusable, decoding distinct");
+            }
+            (false, try_distinct()?)
+        }
     };
     let plane_view_formats = plane_formats(output_format).ok_or(CapsError::NoPlaneMapping {
         format: output_format,
@@ -867,6 +881,26 @@ mod tests {
         raw.output_formats = vec![entry(NV12, OUTPUT_USAGE)];
         let caps = derive_caps(&raw).unwrap();
         assert!(caps.coincide, "coincide wins when both are offered");
+    }
+
+    /// NVIDIA on Windows: both modes, no `SEPARATE_REFERENCE_IMAGES`.
+    #[test]
+    fn a_device_whose_coincide_is_unusable_decodes_distinct() {
+        let both = vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_COINCIDE
+            | vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_DISTINCT;
+        let mut raw = nvidia_like();
+        raw.decode_flags = both;
+        raw.coincide_formats = vec![entry(NV12, COINCIDE_USAGE)];
+        let caps = derive_caps(&raw).unwrap();
+        assert!(!caps.coincide && caps.layered_dpb);
+
+        // Per-slot images, but the coincide list lacks the wanted format.
+        let mut raw = radv_like();
+        raw.decode_flags = both;
+        raw.coincide_formats = vec![entry(P010, COINCIDE_USAGE)];
+        raw.dpb_formats = vec![entry(NV12, DPB_USAGE)];
+        raw.output_formats = vec![entry(NV12, OUTPUT_USAGE)];
+        assert!(!derive_caps(&raw).unwrap().coincide);
     }
 
     #[test]

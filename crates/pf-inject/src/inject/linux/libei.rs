@@ -15,6 +15,7 @@
 //! normal key events.
 
 use super::{gs_button_to_evdev, vk_to_evdev, InputInjector};
+use crate::scroll::{ScrollBackend, ScrollMapper, ScrollOp};
 use crate::AbsoluteAnchor;
 use anyhow::{anyhow, Result};
 use ashpd::desktop::{
@@ -117,6 +118,11 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     let mut state = EiState::new();
     state.output_hint = output_hint;
     state.gamescope = gamescope;
+    state.scroll = ScrollMapper::new(if gamescope {
+        ScrollBackend::Gamescope
+    } else {
+        ScrollBackend::Libei
+    });
     // 5s: a live EIS resumes a device right after handshake. Past that the socket
     // was stale — exit so InjectorService reopens instead of swallowing every event.
     let resume_deadline = tokio::time::sleep(Duration::from_secs(5));
@@ -504,6 +510,8 @@ struct EiState {
     gamescope: bool,
     /// Sub-v120 remainder of repriced precise scroll, `[horizontal, vertical]`.
     scroll_rem: [i32; 2],
+    /// Normalized-scroll lowering; the backend inside follows `gamescope`.
+    scroll: ScrollMapper,
 }
 
 /// Last-warned unmatched anchor, so a sticky miss logs once per change rather
@@ -554,6 +562,38 @@ fn gamescope_v120(rem: &mut i32, x: i32, precise: bool) -> i32 {
     v120.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
+/// Execute a normalized-scroll plan on an `ei::Scroll` interface: continuous
+/// and discrete deltas, stops, and the plan's own frame boundaries. Shared by
+/// [`EiState::inject`] and [`EiState::release_all`].
+fn exec_scroll_ops(s: &ei::Scroll, dev: &ei::Device, serial: u32, ops: Vec<ScrollOp>) {
+    for op in ops {
+        match op {
+            ScrollOp::Continuous { horizontal, value } => {
+                if horizontal {
+                    s.scroll(value as f32, 0.0);
+                } else {
+                    s.scroll(0.0, value as f32);
+                }
+            }
+            ScrollOp::Discrete120 { horizontal, value } => {
+                if horizontal {
+                    s.scroll_discrete(value, 0);
+                } else {
+                    s.scroll_discrete(0, value);
+                }
+            }
+            ScrollOp::Stop { horizontal, cancel } => s.scroll_stop(
+                u32::from(horizontal),
+                u32::from(!horizontal),
+                u32::from(cancel),
+            ),
+            ScrollOp::Frame => dev.frame(serial, crate::monotonic_us()),
+            // wlroots-only vocabulary never reaches an ei plan.
+            ScrollOp::AxisSource(_) | ScrollOp::DiscreteDetents { .. } => {}
+        }
+    }
+}
+
 fn kind_bit(kind: InputKind) -> u32 {
     let i = match kind {
         InputKind::MouseMove => 0,
@@ -572,6 +612,7 @@ fn kind_bit(kind: InputKind) -> u32 {
         InputKind::GamepadRemove => 13,
         InputKind::GamepadArrival => 14,
         InputKind::TextInput => 15,
+        InputKind::Scroll => 16,
     };
     1 << i
 }
@@ -591,6 +632,7 @@ impl EiState {
             output_hint: None,
             gamescope: false,
             scroll_rem: [0; 2],
+            scroll: ScrollMapper::new(ScrollBackend::Libei),
         }
     }
 
@@ -606,7 +648,10 @@ impl EiState {
             std::mem::take(&mut self.held_buttons),
             std::mem::take(&mut self.held_touches),
         );
-        if keys.is_empty() && buttons.is_empty() && touches.is_empty() {
+        // A scroll gesture still open ends cancelled, or its kinetic tail
+        // outlives the session.
+        let scroll_ops = self.scroll.cancel_all();
+        if keys.is_empty() && buttons.is_empty() && touches.is_empty() && scroll_ops.is_empty() {
             return;
         }
         tracing::info!(
@@ -631,6 +676,16 @@ impl EiState {
         }
         for id in touches {
             self.inject(&release(InputKind::TouchUp, id), ctx);
+        }
+        if !scroll_ops.is_empty() {
+            if let Some(idx) = self.device_for(DeviceCapability::Scroll) {
+                let dev = self.devices[idx].device.device().clone();
+                self.ensure_emulating(idx, &dev);
+                if let Some(s) = self.devices[idx].device.interface::<ei::Scroll>() {
+                    exec_scroll_ops(&s, &dev, self.last_serial, scroll_ops);
+                    let _ = ctx.flush();
+                }
+            }
         }
     }
 
@@ -786,7 +841,7 @@ impl EiState {
             InputKind::MouseMove => DeviceCapability::Pointer,
             InputKind::MouseMoveAbs => DeviceCapability::PointerAbsolute,
             InputKind::MouseButtonDown | InputKind::MouseButtonUp => DeviceCapability::Button,
-            InputKind::MouseScroll => DeviceCapability::Scroll,
+            InputKind::MouseScroll | InputKind::Scroll => DeviceCapability::Scroll,
             InputKind::KeyDown | InputKind::KeyUp => DeviceCapability::Keyboard,
             InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {
                 DeviceCapability::Touch
@@ -935,6 +990,15 @@ impl EiState {
                         }
                         s.scroll(0.0, -px);
                     }
+                }
+                None => emitted = false,
+            },
+            // The plan already carries ei's framing rules: a Begin-cancel gets
+            // its own frame and a stop never shares one with a nonzero delta.
+            InputKind::Scroll => match slot.interface::<ei::Scroll>() {
+                Some(s) => {
+                    exec_scroll_ops(&s, &dev, self.last_serial, self.scroll.plan(ev));
+                    emitted = false; // plan Frame ops did the framing
                 }
                 None => emitted = false,
             },

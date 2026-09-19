@@ -580,14 +580,12 @@ public final class StreamViewController: StreamViewControllerBase {
                 self.requestPointerRelock()
             }
         }
-        // Scroll is the ONE indirect channel that is NOT gated on the lock. The scroll pan keeps
-        // firing while the scene is pointer-locked (it is the only way trackpad two-finger scrolling
-        // ever arrives — GameController has no gesture channel), so gating it here dropped trackpad
-        // scrolling entirely under lock. Nothing double-sends because iOS installs no GCMouse scroll
-        // handler at all: this recognizer sees the wheel too, already carrying the system's Natural
-        // Scrolling preference, which the raw GameController axis does not.
-        streamView.onScroll = { [weak self] dx, dy, precise in
-            self?.inputCapture?.sendScroll(dx: dx, dy: dy, precise: precise)
+        // Trackpad gestures always use UIKit, including under pointer lock.
+        // Only discrete pans yield to an attached, forwarding GCMouse wheel.
+        streamView.onScroll = { [weak self] dx, dy, source, phase in
+            guard let self, let capture = self.inputCapture else { return }
+            if source == PUNKTFUNK_SCROLL_SOURCE_CONTINUOUS, capture.forwardsRawWheel { return }
+            capture.sendScroll(dx: dx, dy: dy, source: source, phase: phase)
         }
 
         let capture = InputCapture(connection: connection)
@@ -1174,10 +1172,9 @@ final class StreamLayerUIView: UIView {
 
     /// Reads the LIVE negotiated mode in pixels (the touch/pointer coordinate space).
     var currentHostMode: (() -> CGSize)?
-    /// The live session's settings, set when it starts.
-    var settings = EffectiveSettings() {
-        didSet { touchMouse.invertScroll = settings.invertScroll }
-    }
+    /// The live session's settings, set when it starts. Scroll inversion is not seeded here:
+    /// the connection's outbound seam applies it (`setInvertScroll` at connect).
+    var settings = EffectiveSettings()
     /// Direct fingers / Pencil → wire events: real touches in passthrough mode, or the
     /// touch-driven mouse events (`TouchMouse`) in the trackpad/pointer modes.
     var onTouchEvent: ((PunktfunkInputEvent) -> Void)?
@@ -1196,9 +1193,13 @@ final class StreamLayerUIView: UIView {
     var onPointerMoveAbs: ((HostPoint) -> Void)?
     /// Indirect-pointer buttons (GameStream ids: 1=left 3=right); `down` = press.
     var onPointerButton: ((_ button: UInt32, _ down: Bool) -> Void)?
-    /// Trackpad two-finger / wheel scroll (no lock) → host scroll deltas, WHEEL(120)-scaled.
-    /// `precise` = a continuous (trackpad) device, not a notched wheel.
-    var onScroll: ((_ dx: Float, _ dy: Float, _ precise: Bool) -> Void)?
+    /// Trackpad two-finger / wheel scroll → host scroll deltas in `source`'s unit (points =
+    /// DIP for a measured surface; the discrete recognizer's OS-translated distance can't
+    /// recover notches, so it reports `Continuous`, not `Wheel`).
+    var onScroll: (
+        (_ dx: Float, _ dy: Float, _ source: PunktfunkScrollSource,
+         _ phase: PunktfunkScrollPhase) -> Void
+    )?
     /// The two-finger twist turning the quick-action ring, or the passthrough edge pull.
     var onDial: ((DialEvent) -> Void)?
 
@@ -1484,19 +1485,35 @@ final class StreamLayerUIView: UIView {
     /// it — +y is a wheel-forward notch, the one that moves content down. Negating y here, as this
     /// did, pinned the stream to traditional scrolling and inverted the setting for everyone on the
     /// default. macOS passes `NSEvent.scrollingDeltaY` through for exactly the same reason.
+    /// A continuous (trackpad) recognizer is a measured distance in points — DIP on the
+    /// wire — with the recognizer's state as the gesture boundary.
     @objc private func handlePreciseScroll(_ g: UIPanGestureRecognizer) {
-        forwardScroll(g, precise: true)
+        forwardScroll(g, source: PUNKTFUNK_SCROLL_SOURCE_FINGER)
     }
 
+    /// A discrete (wheel) recognizer reports OS-translated POINTS, not raw detents — no
+    /// points-per-notch constant exists to recover them, so the fallback is honest
+    /// Continuous distance without a gesture phase.
     @objc private func handleWheelScroll(_ g: UIPanGestureRecognizer) {
-        forwardScroll(g, precise: false)
+        forwardScroll(g, source: PUNKTFUNK_SCROLL_SOURCE_CONTINUOUS)
     }
 
-    private func forwardScroll(_ g: UIPanGestureRecognizer, precise: Bool) {
-        guard g.state == .began || g.state == .changed else { return }
+    private func forwardScroll(_ g: UIPanGestureRecognizer, source: PunktfunkScrollSource) {
+        let phase: PunktfunkScrollPhase
+        switch g.state {
+        case .began: phase = PUNKTFUNK_SCROLL_PHASE_BEGIN
+        case .changed: phase = PUNKTFUNK_SCROLL_PHASE_UPDATE
+        case .ended: phase = PUNKTFUNK_SCROLL_PHASE_END
+        case .cancelled, .failed: phase = PUNKTFUNK_SCROLL_PHASE_CANCEL
+        default: return // .possible — nothing yet
+        }
         let t = g.translation(in: self)
         g.setTranslation(.zero, in: self)
-        onScroll?(Float(t.x) * 12, Float(t.y) * 12, precise)
+        // A stop's last translation rides out as movement first (ScrollCapture splits it);
+        // the discrete fallback claims no boundary at all.
+        let wirePhase = source == PUNKTFUNK_SCROLL_SOURCE_CONTINUOUS
+            ? PUNKTFUNK_SCROLL_PHASE_NONE : phase
+        onScroll?(Float(t.x), Float(t.y), source, wirePhase)
     }
 
     /// Map a view-space point through the presenter's placement into host-mode pixels, at the

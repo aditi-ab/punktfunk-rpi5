@@ -284,7 +284,7 @@ jobs:
           # job stays green against the PREVIOUS image (docker.yml bootstrap lag).
           #
           # A PINNED release asset, checked by SHA-256 — never `curl https://bun.sh/install | bash`.
-          # build-web-deb.sh VENDORS this very binary into the punktfunk-web .deb (BUN_BIN, below),
+          # build-bun-deb.sh VENDORS this very binary into the punktfunk-bun .deb (BUN_BIN, below),
           # so an install script piped into root's shell is upstream code choosing bytes we then
           # publish under REGISTRY_TOKEN. Not in Debian/Ubuntu, so a pin is the only option here.
           # ONE bun across the repo: same version as rpm.yml and windows-host.yml, and the same
@@ -344,10 +344,11 @@ jobs:
           export PATH="$HOME/.bun/bin:$PATH"
           # host .deb is built in build-publish-host (Ubuntu 24.04 image); this job ships the rest.
           VERSION="$VERSION" bash packaging/debian/build-client-deb.sh
-          # Reuse CI's bun for the vendored runtime (matches the amd64 runner) instead of downloading.
-          VERSION="$VERSION" BUN_BIN="$(command -v bun || true)" bash packaging/debian/build-web-deb.sh
-          # The plugin/script runner (bun-bundled Effect SDK) — same vendored-bun mechanics.
-          VERSION="$VERSION" BUN_BIN="$(command -v bun || true)" bash packaging/debian/build-scripting-deb.sh
+          # The one vendored runtime web and scripting both depend on. Reuse CI's pinned bun.
+          VERSION="$VERSION" BUN_BIN="$(command -v bun || true)" bash packaging/debian/build-bun-deb.sh
+          VERSION="$VERSION" bash packaging/debian/build-web-deb.sh
+          # The plugin/script runner (bun-bundled Effect SDK).
+          VERSION="$VERSION" bash packaging/debian/build-scripting-deb.sh
 
       # Visibility only. With the target cache now actually saving release artifacts (see the
       # cache key note above), this is how a regression in that arrangement becomes visible:

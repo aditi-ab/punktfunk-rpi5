@@ -20,59 +20,82 @@ pub(super) struct PadBackends {
     steamctrl2_puck: Option<crate::inject::steam_controller2::Triton2Manager>,
 }
 
+/// Build a backend on first use with the seat's device directory already on it. A pad created
+/// before that is one the seat's Steam never sees.
+macro_rules! armed {
+    ($slot:expr, $dev:expr, $make:expr) => {
+        $slot.get_or_insert_with(|| {
+            let mut m = $make();
+            m.expose_in($dev.clone());
+            m
+        })
+    };
+}
+
 impl PadBackends {
     /// Route a pad event to the manager for `kind`, building it on first use. `false` = no
     /// backend of this kind here; the caller's Xbox360 default takes it.
+    ///
+    /// `dev` is this session's seat directory, taken as a reference so the hot path clones
+    /// nothing: only a create reads it.
     pub(super) fn route_handle(
         &mut self,
         kind: GamepadPref,
         ev: &punktfunk_core::input::GamepadEvent,
+        dev: &Option<std::path::PathBuf>,
     ) -> bool {
         match kind {
-            GamepadPref::DualSense => self
-                .dualsense
-                .get_or_insert_with(crate::inject::dualsense::DualSenseManager::new)
-                .handle(ev),
-            GamepadPref::DualSenseEdge => self
-                .dualsense_edge
-                .get_or_insert_with(crate::inject::dualsense::DualSenseEdgeManager::new)
-                .handle(ev),
-            GamepadPref::DualShock4 => self
-                .dualshock4
-                .get_or_insert_with(crate::inject::dualshock4::DualShock4Manager::new)
-                .handle(ev),
-            GamepadPref::SteamDeck => self
-                .steamdeck
-                .get_or_insert_with(crate::inject::steam_controller::SteamControllerManager::new)
-                .handle(ev),
-            GamepadPref::SwitchPro => self
-                .switchpro
-                .get_or_insert_with(crate::inject::switch_pro::SwitchProManager::new)
-                .handle(ev),
-            GamepadPref::SteamController => self
-                .steamctrl
-                .get_or_insert_with(crate::inject::steam_controller::SteamCtrlManager::new)
-                .handle(ev),
-            GamepadPref::SteamController2 => self
-                .steamctrl2
-                .get_or_insert_with(Sc2Manager::new)
-                .handle(ev),
-            GamepadPref::SteamController2Puck => self
-                .steamctrl2_puck
-                .get_or_insert_with(|| {
-                    crate::inject::steam_controller2::Triton2Manager::with_backend(
-                        crate::inject::steam_controller2::TritonProto::puck(),
-                    )
-                })
-                .handle(ev),
-            GamepadPref::XboxOne => self
-                .xboxone
-                .get_or_insert_with(|| {
-                    crate::inject::gamepad::GamepadManager::with_identity(
-                        crate::inject::gamepad::PadIdentity::xbox_one(),
-                    )
-                })
-                .handle(ev),
+            GamepadPref::DualSense => armed!(
+                self.dualsense,
+                dev,
+                crate::inject::dualsense::DualSenseManager::new
+            )
+            .handle(ev),
+            GamepadPref::DualSenseEdge => armed!(
+                self.dualsense_edge,
+                dev,
+                crate::inject::dualsense::DualSenseEdgeManager::new
+            )
+            .handle(ev),
+            GamepadPref::DualShock4 => armed!(
+                self.dualshock4,
+                dev,
+                crate::inject::dualshock4::DualShock4Manager::new
+            )
+            .handle(ev),
+            GamepadPref::SteamDeck => armed!(
+                self.steamdeck,
+                dev,
+                crate::inject::steam_controller::SteamControllerManager::new
+            )
+            .handle(ev),
+            GamepadPref::SwitchPro => armed!(
+                self.switchpro,
+                dev,
+                crate::inject::switch_pro::SwitchProManager::new
+            )
+            .handle(ev),
+            GamepadPref::SteamController => armed!(
+                self.steamctrl,
+                dev,
+                crate::inject::steam_controller::SteamCtrlManager::new
+            )
+            .handle(ev),
+            GamepadPref::SteamController2 => {
+                armed!(self.steamctrl2, dev, Sc2Manager::new).handle(ev)
+            }
+            GamepadPref::SteamController2Puck => armed!(self.steamctrl2_puck, dev, || {
+                crate::inject::steam_controller2::Triton2Manager::with_backend(
+                    crate::inject::steam_controller2::TritonProto::puck(),
+                )
+            })
+            .handle(ev),
+            GamepadPref::XboxOne => armed!(self.xboxone, dev, || {
+                crate::inject::gamepad::GamepadManager::with_identity(
+                    crate::inject::gamepad::PadIdentity::xbox_one(),
+                )
+            })
+            .handle(ev),
             _ => return false,
         }
         true

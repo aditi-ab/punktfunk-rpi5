@@ -243,18 +243,19 @@ impl Entry {
             return Some(format!("requires {}", self.platforms.join(" or ")));
         }
         if let Some(min) = &self.min_host {
-            let (Ok(min), Ok(host)) = (
-                semver::Version::parse(min),
-                semver::Version::parse(host_version()),
-            ) else {
-                return None;
-            };
-            if host < min {
+            let min = semver::Version::parse(min).ok()?;
+            if older_than(host_version(), &min) {
                 return Some(format!("needs punktfunk {min} or newer"));
             }
         }
         None
     }
+}
+
+/// Whether the build stamped `host` predates `min`, on `major.minor.patch` alone: a canary
+/// stamped `0.39.0-0.N` is 0.39.0. A stamp with no leading triple is never too old.
+fn older_than(host: &str, min: &semver::Version) -> bool {
+    pf_update_check::triple(host).is_some_and(|h| h < (min.major, min.minor, min.patch))
 }
 
 impl Advisory {
@@ -295,9 +296,10 @@ pub(crate) const HOST_PLATFORM: &str = if cfg!(target_os = "windows") {
     "linux"
 };
 
-/// Left-hand side of every `minHost` comparison.
+/// Left-hand side of every `minHost` comparison: the build stamp, not the manifest version,
+/// which on a canary still names the last release.
 pub(crate) fn host_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    env!("PUNKTFUNK_VERSION")
 }
 
 /// Catalog strings land in logs and the console.
@@ -602,6 +604,24 @@ mod tests {
         assert_eq!(scope_of("@punktfunk/plugin-x").unwrap(), "@punktfunk");
         assert_eq!(scope_of("@a/b").unwrap(), "@a");
         assert!(scope_of("punktfunk-plugin-x").is_none());
+    }
+
+    #[test]
+    fn min_host_compares_the_build_stamp_triple() {
+        let min = semver::Version::parse("0.39.0").unwrap();
+        // Every packaging spelling of a 0.39 canary is 0.39.0.
+        for canary in [
+            "0.39.0-0.00028370",
+            "0.39.0~ci28370.gab12cd34",
+            "0.39.28370",
+            "0.39.0",
+        ] {
+            assert!(!older_than(canary, &min), "{canary}");
+        }
+        for old in ["0.38.0", "0.38.2-1", "0.38.0+gad2aee123"] {
+            assert!(older_than(old, &min), "{old}");
+        }
+        assert!(!older_than("unknown", &min));
     }
 
     #[test]

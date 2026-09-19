@@ -147,6 +147,8 @@ pub struct LeaseShared {
     cancel: Arc<AtomicBool>,
     /// Recognition. Empty for [`LeaseKind::Nested`] / [`LeaseKind::Untracked`].
     spec: DetectSpec,
+    /// Process tree recognition may look in ([`LeaseRequest::scope_pid`]).
+    scope_pid: Option<u32>,
     /// Seconds-since-boot at launch: adopt floor. `None` = no uptime clock,
     /// so only detect signals are used.
     launch_stamp: Option<f64>,
@@ -190,6 +192,32 @@ impl LeaseShared {
 
     pub fn is_trackable(&self) -> bool {
         !matches!(self.kind, LeaseKind::Untracked)
+    }
+
+    /// Everything this lease's signals match, inside its scope if it has one.
+    #[cfg(any(target_os = "linux", windows))]
+    fn find_procs(&self, scanner: &crate::procscan::Scanner) -> Vec<crate::procscan::ProcRef> {
+        let live = scanner.find(&self.spec, self.launch_stamp);
+        match self.scope_pid {
+            Some(root) => crate::procscan::under(&live, root),
+            None => live,
+        }
+    }
+
+    /// Stop every client holding this title's cover: report `running` now, and wait for no
+    /// window.
+    ///
+    /// For a launch whose stream already shows what the player has to act on — a seat's Steam
+    /// at its sign-in screen. Only out of `launching`: the watcher owns every state after it,
+    /// so a game the player then starts is followed as any other.
+    pub fn launch_hold_ends(&self) {
+        let _ = self.state.compare_exchange(
+            GameState::Launching as u8,
+            GameState::Running as u8,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.awaiting_window.store(false, Ordering::Relaxed);
     }
 
     /// Running, and this host will say `window` once the game's window is up.
@@ -252,6 +280,18 @@ impl Drop for GameLease {
     }
 }
 
+/// The process tree a lease may narrow its scan to ([`LeaseRequest::scope_pid`]).
+///
+/// Only where the game is guaranteed to descend from `gamescope`: the launch is that
+/// compositor's own primary child, or it goes through the Steam running inside it. Anything else
+/// a keep-alive reuse starts is spawned by the host, beside gamescope rather than under it, and a
+/// scoped scan would never find it.
+pub fn scan_scope(nested_spawn: bool, steam_launch: bool, gamescope: Option<u32>) -> Option<u32> {
+    (nested_spawn || steam_launch)
+        .then_some(gamescope)
+        .flatten()
+}
+
 /// Inputs for [`open`]. Only the launch site has all of them.
 pub struct LeaseRequest {
     pub game: GameRef,
@@ -262,6 +302,10 @@ pub struct LeaseRequest {
     pub spec: DetectSpec,
     /// `true` when a bare-spawn gamescope owns the game.
     pub nested: bool,
+    /// That gamescope's pid, so recognition stays inside this seat's process tree
+    /// ([`crate::procscan::under`]). `None` scans the whole uid, as every other lease does.
+    /// [`scan_scope`] owns when it may be set.
+    pub scope_pid: Option<u32>,
     /// Opens a launcher, not a game: always [`LeaseKind::Untracked`].
     ///
     /// A launcher has no exit to detect (Big Picture is a mode of Steam, not
@@ -370,6 +414,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         plane,
         spec,
         nested,
+        scope_pid,
         launcher,
         child,
         spawned,
@@ -418,6 +463,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         state: AtomicU8::new(GameState::Launching as u8),
         cancel: Arc::new(AtomicBool::new(false)),
         spec,
+        scope_pid,
         launch_stamp,
         child: Mutex::new(owned),
         spawned,
@@ -896,7 +942,7 @@ fn watch(
         let child_alive = matches!(kind, LeaseKind::Child)
             && (child.is_some() || spawned.is_some())
             && spawned_at.elapsed() >= SHIM_WINDOW;
-        let live = scanner.find(&shared.spec, shared.launch_stamp);
+        let live = shared.find_procs(&scanner);
         // Same window for a scan hit: a pre-launch tree (Steam shader
         // reaper) carries the game's signals. One poll would latch into
         // phase 2 (`EXIT_CONFIRM` then ends the session). A window, not a
@@ -983,7 +1029,7 @@ fn watch(
         let live = {
             let still = scanner.alive(&known);
             if still.is_empty() {
-                scanner.find(&shared.spec, shared.launch_stamp)
+                shared.find_procs(&scanner)
             } else {
                 still
             }
@@ -1191,6 +1237,13 @@ fn terminate_blocking(shared: &LeaseShared) {
                 title = %shared.game.title,
                 "released the nested session's kept display to end its game"
             );
+            // That release takes every kept display, a pre-warmed seat included, and nothing
+            // else stands one back up before the next session ends — which is the player who
+            // left a game running, the one the warm launch is for.
+            #[cfg(target_os = "linux")]
+            if released > 0 {
+                crate::native::prewarm::spawn_run("game ended");
+            }
         }
         LeaseKind::Child | LeaseKind::Matched | LeaseKind::Reported => {
             // A claim that lands while the ladder runs starts the title afresh; the
@@ -1316,7 +1369,7 @@ fn unix_term_ladder(shared: &LeaseShared) {
     // once: a process that starts after this point belongs to a session that
     // claimed the title while the ladder ran, and must outlive it.
     let targets = {
-        let mut procs = scanner.find(&shared.spec, shared.launch_stamp);
+        let mut procs = shared.find_procs(&scanner);
         if let Some(p) = reported_proc(shared) {
             if !procs.iter().any(|q| q.pid == p.pid) {
                 procs.push(p);
@@ -1377,7 +1430,7 @@ fn unix_term_ladder(shared: &LeaseShared) {
 fn windows_term_ladder(shared: &LeaseShared) {
     let scanner = crate::procscan::Scanner::system();
     let live = || {
-        let mut procs = scanner.alive(&scanner.find(&shared.spec, shared.launch_stamp));
+        let mut procs = scanner.alive(&shared.find_procs(&scanner));
         // Re-verify and de-dupe. `spawned` and `reported_proc` join on the
         // same terms; Reported has only the latter.
         let mut fold = |p: crate::procscan::ProcRef| {
@@ -1780,6 +1833,7 @@ mod tests {
             plane: crate::events::Plane::Native,
             spec,
             nested,
+            scope_pid: None,
             launcher: false,
             child: None,
             spawned: None,
@@ -1792,6 +1846,44 @@ mod tests {
             window: None,
             outcome: None,
         }
+    }
+
+    /// Scoping is safe only where the game must descend from that gamescope.
+    #[test]
+    fn only_a_nested_spawn_or_a_steam_launch_narrows_the_scan() {
+        // gamescope's own primary child, and anything Steam starts inside it.
+        assert_eq!(scan_scope(true, false, Some(42)), Some(42));
+        assert_eq!(scan_scope(false, true, Some(42)), Some(42));
+        // A kept session's Lutris/Heroic/custom launch is the host's child, beside gamescope.
+        assert_eq!(scan_scope(false, false, Some(42)), None);
+        // No compositor of ours: every other backend keeps the scan it has today.
+        assert_eq!(scan_scope(true, true, None), None);
+    }
+
+    /// The state a client's launch hold ends on, and the one it never overwrites.
+    ///
+    /// `running` with no window owed is what every client reads as "the host has said all it
+    /// will" — a seat at Steam's sign-in screen needs that within seconds, not after two
+    /// minutes of cover.
+    #[test]
+    fn a_launch_with_nothing_to_wait_for_reports_running_at_once() {
+        // Recognized by a name no process has: the scan leaves this lease `launching`.
+        let spec = DetectSpec {
+            process_name: Some("pf-no-such-game".into()),
+            ..DetectSpec::default()
+        };
+        let lease = open(req("steam:signin", spec, false), Box::new(|| {}));
+        let shared = lease.shared();
+        assert_eq!(shared.state(), GameState::Launching);
+        shared.awaiting_window.store(true, Ordering::Relaxed);
+        shared.launch_hold_ends();
+        assert_eq!(shared.state(), GameState::Running);
+        assert!(!shared.awaits_window(), "no client waits for a window here");
+
+        // The watcher owns every state after `launching`: a window already found stays found.
+        shared.set_state(GameState::Window);
+        shared.launch_hold_ends();
+        assert_eq!(shared.state(), GameState::Window);
     }
 
     /// A launcher entry is Untracked regardless of how it was started.
@@ -2159,6 +2251,7 @@ mod tests {
                 // Real signal nothing will match: the game never shows up.
                 spec: DetectSpec::steam(999_001),
                 nested: false,
+                scope_pid: None,
                 launcher: false,
                 child: Some((child, false)),
                 spawned: None,
@@ -2404,6 +2497,7 @@ mod tests {
                 plane: crate::events::Plane::Native,
                 spec: DetectSpec::dir(td.path()),
                 nested: false,
+                scope_pid: None,
                 launcher: false,
                 child: Some((child, true)),
                 spawned: None,

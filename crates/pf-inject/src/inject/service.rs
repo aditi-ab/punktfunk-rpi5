@@ -258,6 +258,17 @@ mod tests {
         );
     }
 
+    /// Normalized scroll carries gesture phases a sum would erase: adjacent
+    /// `Scroll` events never merge, even same-axis.
+    #[test]
+    fn coalesce_never_merges_normalized_scroll() {
+        let events = vec![
+            mk(InputKind::Scroll, 0, 100, 0),
+            mk(InputKind::Scroll, 0, 200, 0),
+        ];
+        assert_eq!(coalesce(events).len(), 2);
+    }
+
     fn warp(events: Vec<InputEvent>, aim: u64, warped: &mut u64) -> Vec<InputEvent> {
         warp_onto_stream_head(events, aim, warped, Some((3840, 2160)))
     }

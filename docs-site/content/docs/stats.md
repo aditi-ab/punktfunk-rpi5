@@ -137,6 +137,9 @@ format on a lossless session, and `lost` when frames are lost. **Detailed** is e
 - **Counters.** `lost` counts frames the network lost beyond error correction, `skipped` frames your
   device chose not to show (`⚠ N overflow` when the decoder fell behind), and `FEC` the pieces error
   correction rebuilt: loss you did not see.
+- **`bitrate lowered:`** — why Automatic bitrate last cut the rate, shown until it climbs again.
+  `N loss repairs/min` beside it counts how often, in the last minute, your device asked the host to
+  repair the picture after lost frames. A count that keeps climbing means the link is not recovering.
 - **Audio.** `audio buffer` is decoded audio queued ahead of your speakers; `a/v` is where that
   places it against the picture — positive means audio plays behind the picture. The client steers
   towards zero without dropping below the depth your link's jitter needs.

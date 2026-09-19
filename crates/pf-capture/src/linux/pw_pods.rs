@@ -149,13 +149,14 @@ const SPA_VIDEO_TRANSFER_SMPTE2084: u32 = 14;
 pub(super) const HDR_FORMAT_ORDER: [VideoFormat; 2] =
     [VideoFormat::xBGR_210LE, VideoFormat::xRGB_210LE];
 
-/// LINEAR-only 10-bit PQ `EnumFormat`. Tiled modifiers are omitted because the
-/// EGL de-tile blit renders into `GL_RGBA8` and would crush the depth. The
-/// modifier is a Choice enum (same shape as [`build_dmabuf_format`]): a scalar
-/// `Long(0)` does not intersect gamescope's `{default:0, alt:0}` choice.
+/// 10-bit PQ `EnumFormat`. `modifiers` is `[0]` unless the raw lane takes this stream: the
+/// EGL de-tile blit renders into `GL_RGBA8` and would crush the depth. The modifier is a
+/// Choice enum (same shape as [`build_dmabuf_format`]): a scalar `Long(0)` does not
+/// intersect gamescope's `{default:0, alt:0}` choice.
 /// BT.2020 + PQ are **MANDATORY** — Mutter's HDR pods are too.
 pub(super) fn build_hdr_dmabuf_format(
     format: VideoFormat,
+    modifiers: &[u64],
     preferred: Option<(u32, u32, u32)>,
     pacing: Pacing,
 ) -> Result<Vec<u8>> {
@@ -222,8 +223,8 @@ pub(super) fn build_hdr_dmabuf_format(
             pw::spa::utils::Choice(
                 pw::spa::utils::ChoiceFlags::empty(),
                 pw::spa::utils::ChoiceEnum::Enum {
-                    default: 0, // DRM_FORMAT_MOD_LINEAR
-                    alternatives: vec![0],
+                    default: modifiers[0] as i64,
+                    alternatives: modifiers.iter().map(|&m| m as i64).collect(),
                 },
             ),
         )),
@@ -518,12 +519,14 @@ mod tests {
             ),
             (
                 "hdr xRGB",
-                build_hdr_dmabuf_format(VideoFormat::xRGB_210LE, None, Pacing::Producer).unwrap(),
+                build_hdr_dmabuf_format(VideoFormat::xRGB_210LE, &[0], None, Pacing::Producer)
+                    .unwrap(),
             ),
             (
                 "hdr xBGR",
                 build_hdr_dmabuf_format(
                     VideoFormat::xBGR_210LE,
+                    &[0],
                     Some((3840, 2160, 120)),
                     Pacing::Producer,
                 )
@@ -550,7 +553,7 @@ mod tests {
             VideoFormat::xBGR_210LE,
             VideoFormat::P010_10LE,
         ] {
-            let pod = build_hdr_dmabuf_format(fmt, None, Pacing::Producer).unwrap();
+            let pod = build_hdr_dmabuf_format(fmt, &[0], None, Pacing::Producer).unwrap();
             for (name, key) in [
                 (
                     "transferFunction",
@@ -603,9 +606,10 @@ mod tests {
     fn only_the_planar_offers_pin_the_colour_matrix() {
         let nv12 = build_dmabuf_format(VideoFormat::NV12, &[0], None, Pacing::Producer).unwrap();
         let bgrx = build_dmabuf_format(VideoFormat::BGRx, &[0], None, Pacing::Producer).unwrap();
-        let p010 = build_hdr_dmabuf_format(VideoFormat::P010_10LE, None, Pacing::Producer).unwrap();
+        let p010 =
+            build_hdr_dmabuf_format(VideoFormat::P010_10LE, &[0], None, Pacing::Producer).unwrap();
         let xbgr =
-            build_hdr_dmabuf_format(VideoFormat::xBGR_210LE, None, Pacing::Producer).unwrap();
+            build_hdr_dmabuf_format(VideoFormat::xBGR_210LE, &[0], None, Pacing::Producer).unwrap();
         for (name, key) in [
             ("colorMatrix", spa::sys::SPA_FORMAT_VIDEO_colorMatrix),
             ("colorRange", spa::sys::SPA_FORMAT_VIDEO_colorRange),
@@ -753,7 +757,7 @@ mod tests {
         // Both must still build: the order is a preference, never a removal.
         for fmt in HDR_FORMAT_ORDER {
             assert!(
-                !build_hdr_dmabuf_format(fmt, None, Pacing::Producer)
+                !build_hdr_dmabuf_format(fmt, &[0], None, Pacing::Producer)
                     .unwrap()
                     .is_empty(),
                 "{fmt:?} must still produce a format pod"

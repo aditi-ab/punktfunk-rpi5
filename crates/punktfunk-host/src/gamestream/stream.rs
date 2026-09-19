@@ -425,7 +425,7 @@ fn run(
             }
             Some(cmd) => {
                 let own = target.as_ref().is_some_and(|t| t.own_workspace);
-                match crate::library::launch_session_command(compositor, cmd, None, own) {
+                match crate::library::launch_session_command(compositor, cmd, None, own, None) {
                     Ok(mut spawned) => {
                         spawned_now = true;
                         launch_workspace = spawned.workspace.take();
@@ -495,6 +495,9 @@ fn run(
                     // watch, so a Moonlight launch keeps the `running` stage.
                     window: None,
                     nested,
+                    // No pool generation on this plane, and a GameStream session never isolates,
+                    // so there is no sibling seat to be confused with.
+                    scope_pid: None,
                     launcher: t.launcher,
                     child,
                     spawned: spawned_pid,
