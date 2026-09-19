@@ -468,6 +468,9 @@ pub struct ZeroCopyPolicy {
     /// straight into its input slots (`pf_encode::linux_nvenc_raw_dmabuf_ok`). The capture
     /// then imports nothing; a producer that cannot be held keeps the import path.
     pub nvenc_raw_dmabuf: bool,
+    /// The gamescope producer fixates a tiled modifier (`pf_vdisplay::gamescope_tiled_capture`).
+    /// Off, its offer stays LINEAR-only.
+    pub gamescope_tiled: bool,
 }
 
 /// Discovers gamescope's nested Xwayland cursor targets — `(DISPLAY, XAUTHORITY)`,

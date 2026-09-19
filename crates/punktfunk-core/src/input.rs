@@ -15,6 +15,10 @@ pub const INPUT_MAGIC: u8 = 0xC8;
 /// Serialized [`InputEvent`] size (tag + fields). The C struct is larger (`_pad`).
 pub const INPUT_WIRE_LEN: usize = 1 + 1 + 4 + 4 + 4 + 4;
 
+/// Normalized scroll vocabulary ([`InputKind::Scroll`]) plus the client-side
+/// quantizer and the single outbound legacy/inversion seam.
+pub mod scroll;
+
 /// `#[repr(u8)]` so the C ABI sees a byte tag.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +74,12 @@ pub enum InputKind {
     /// [`HOST_CAP_TEXT_INPUT`](crate::quic::HOST_CAP_TEXT_INPUT); older hosts ignore
     /// the tag and clients keep best-effort VK synthesis.
     TextInput = 15,
+    /// Normalized scroll ([`scroll::ScrollEvent`]): `code` = axis (0 = vertical,
+    /// 1 = horizontal), `x` = signed Q24.8 delta in the source's unit, `y` = 0,
+    /// `flags` = source in the low byte, phase in bits 8–15. Sent only when the
+    /// host advertised `HOST_CAP2_SCROLL`; the client's outbound seam converts
+    /// to [`MouseScroll`](Self::MouseScroll) for older hosts.
+    Scroll = 16,
 }
 
 /// Pack [`InputKind::GamepadRemove`] `flags` (`seq << 24 | pad`) — same layout as
@@ -126,49 +136,59 @@ pub fn decode_gamepad_arrival(flags: u32) -> (u8, u8) {
     (flags as u8, ((flags >> 8) & 0x03) as u8)
 }
 
-/// Windows VK for a stored key name. The wire is VKs; a preset or a controller-mouse
-/// layout stores names, so one document fires on every client. `None` means this build
-/// does not know the name — the chord does not fire.
+/// Every stored key name outside the computed `a`-`z`, `0`-`9` and `f1`-`f24` ranges.
+const KEY_NAMES: &[(&str, u8)] = &[
+    ("ctrl", 0x11),
+    ("control", 0x11),
+    ("shift", 0x10),
+    ("alt", 0x12),
+    ("option", 0x12),
+    ("win", 0x5B),
+    ("cmd", 0x5B),
+    ("super", 0x5B),
+    ("meta", 0x5B),
+    ("escape", 0x1B),
+    ("esc", 0x1B),
+    ("tab", 0x09),
+    ("enter", 0x0D),
+    ("return", 0x0D),
+    ("space", 0x20),
+    ("backspace", 0x08),
+    ("delete", 0x2E),
+    ("del", 0x2E),
+    ("insert", 0x2D),
+    ("home", 0x24),
+    ("end", 0x23),
+    ("pageup", 0x21),
+    ("pagedown", 0x22),
+    ("up", 0x26),
+    ("down", 0x28),
+    ("left", 0x25),
+    ("right", 0x27),
+    ("printscreen", 0x2C),
+    ("pause", 0x13),
+    ("capslock", 0x14),
+];
+
+/// Windows VK for a stored key name. The wire is VKs; a ring preset stores names, so one
+/// preset works on every client. `None` means this build does not know the name — the
+/// shortcut does not fire. The Kotlin and Swift `keyVk` twins
+/// replay `testdata/key-vk-vectors.json`, which `key_vk_vectors_are_checked_in` regenerates.
 pub fn key_vk(name: &str) -> Option<u8> {
     let n = name.trim().to_ascii_lowercase();
-    let vk = match n.as_str() {
-        "ctrl" | "control" => 0x11,
-        "shift" => 0x10,
-        "alt" | "option" => 0x12,
-        "win" | "cmd" | "super" | "meta" => 0x5B,
-        "escape" | "esc" => 0x1B,
-        "tab" => 0x09,
-        "enter" | "return" => 0x0D,
-        "space" => 0x20,
-        "backspace" => 0x08,
-        "delete" | "del" => 0x2E,
-        "insert" => 0x2D,
-        "home" => 0x24,
-        "end" => 0x23,
-        "pageup" => 0x21,
-        "pagedown" => 0x22,
-        "up" => 0x26,
-        "down" => 0x28,
-        "left" => 0x25,
-        "right" => 0x27,
-        "printscreen" => 0x2C,
-        "pause" => 0x13,
-        "capslock" => 0x14,
-        _ => {
-            let b = n.as_bytes();
-            return match b {
-                [c @ b'a'..=b'z'] => Some(0x41 + (c - b'a')),
-                [c @ b'0'..=b'9'] => Some(0x30 + (c - b'0')),
-                [b'f', rest @ ..] if !rest.is_empty() => n[1..]
-                    .parse::<u8>()
-                    .ok()
-                    .filter(|f| (1..=24).contains(f))
-                    .map(|f| 0x70 + f - 1),
-                _ => None,
-            };
-        }
-    };
-    Some(vk)
+    if let Some(&(_, vk)) = KEY_NAMES.iter().find(|(k, _)| *k == n) {
+        return Some(vk);
+    }
+    match n.as_bytes() {
+        [c @ b'a'..=b'z'] => Some(0x41 + (c - b'a')),
+        [c @ b'0'..=b'9'] => Some(0x30 + (c - b'0')),
+        [b'f', rest @ ..] if !rest.is_empty() => n[1..]
+            .parse::<u8>()
+            .ok()
+            .filter(|f| (1..=24).contains(f))
+            .map(|f| 0x70 + f - 1),
+        _ => None,
+    }
 }
 
 /// Gamepad wire contract for [`InputKind::GamepadButton`]/[`InputKind::GamepadAxis`].
@@ -251,6 +271,7 @@ impl InputKind {
             13 => GamepadRemove,
             14 => GamepadArrival,
             15 => TextInput,
+            16 => Scroll,
             _ => return None,
         })
     }
@@ -394,14 +415,19 @@ impl InputEvent {
             return None;
         }
         let kind = InputKind::from_u8(buf[1])?;
-        Some(InputEvent {
+        let ev = InputEvent {
             kind,
             _pad: [0; 3],
             code: u32::from_le_bytes(buf[2..6].try_into().unwrap()),
             x: i32::from_le_bytes(buf[6..10].try_into().unwrap()),
             y: i32::from_le_bytes(buf[10..14].try_into().unwrap()),
             flags: u32::from_le_bytes(buf[14..18].try_into().unwrap()),
-        })
+        };
+        // A normalized scroll event is only well-formed when its body is.
+        if kind == InputKind::Scroll && scroll::ScrollEvent::from_event(&ev).is_none() {
+            return None;
+        }
+        Some(ev)
     }
 }
 
@@ -479,11 +505,12 @@ mod tests {
             };
             assert_eq!(InputEvent::decode(&e.encode()), Some(e));
         }
-        // 16 is one past the last valid kind.
+        // 17 is one past the last valid kind.
         assert_eq!(InputKind::from_u8(13), Some(InputKind::GamepadRemove));
         assert_eq!(InputKind::from_u8(14), Some(InputKind::GamepadArrival));
         assert_eq!(InputKind::from_u8(15), Some(InputKind::TextInput));
-        assert_eq!(InputKind::from_u8(16), None);
+        assert_eq!(InputKind::from_u8(16), Some(InputKind::Scroll));
+        assert_eq!(InputKind::from_u8(17), None);
     }
 
     #[test]
@@ -612,5 +639,49 @@ mod tests {
         assert_eq!(key_vk("z"), Some(0x5A));
         assert_eq!(key_vk("f25"), None);
         assert_eq!(key_vk(""), None);
+    }
+
+    /// `key_vk` over every table name (plain, upper-cased, whitespace-padded), every printable
+    /// ASCII character, the `f` edge cases and a few unknown names, one case per line.
+    fn key_vk_vectors() -> String {
+        let mut names: Vec<String> = Vec::new();
+        for (k, _) in KEY_NAMES {
+            names.extend([k.to_string(), k.to_ascii_uppercase(), format!(" \t{k}\r\n")]);
+        }
+        names.extend((0x21u8..=0x7E).map(|b| char::from(b).to_string()));
+        names.extend((0..=25).map(|f| format!("f{f}")));
+        let odd = [
+            "F12", " f4\n", "f01", "f001", "f+1", "f-1", "f256", "ff", "f1a", "f 1",
+        ];
+        let unknown = [
+            "", " ", "\n", "hyper", "ctrl+c", "numpad0", "lctrl", "escape2",
+        ];
+        names.extend(odd.into_iter().chain(unknown).map(String::from));
+
+        let about =
+            "Generated from punktfunk_core::input::key_vk by key_vk_vectors_are_checked_in \
+            (UPDATE_VECTORS=1 rewrites it). The Kotlin and Swift keyVk tests replay every case.";
+        let mut out = format!("{{\n  \"$comment\": \"{about}\",\n  \"cases\": [\n");
+        for (i, name) in names.iter().enumerate() {
+            let vk = key_vk(name).map_or("null".to_string(), |v| v.to_string());
+            let comma = if i + 1 < names.len() { "," } else { "" };
+            let name = serde_json::to_string(name).unwrap();
+            out += &format!("    {{\"name\": {name}, \"vk\": {vk}}}{comma}\n");
+        }
+        out + "  ]\n}\n"
+    }
+
+    #[test]
+    fn key_vk_vectors_are_checked_in() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/key-vk-vectors.json");
+        let fresh = key_vk_vectors();
+        if std::env::var_os("UPDATE_VECTORS").is_some() {
+            std::fs::write(path, &fresh).unwrap();
+        }
+        let on_disk = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            on_disk == fresh,
+            "{path} is stale: rerun with UPDATE_VECTORS=1"
+        );
     }
 }

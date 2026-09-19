@@ -34,10 +34,12 @@ Not on this list on purpose:
 
 ## Security-update availability (CRA: ≥10 years)
 
-Where users fetch fixes, and why old artifacts don't vanish (verified 2026-08-14):
+Where users fetch fixes, and why old artifacts don't vanish (verified 2026-09-18):
 
-- **Gitea releases + package registries** (git.unom.io): no cleanup rules configured,
-  and Gitea does not expire releases or packages on its own — the full release history
+- **Gitea releases + package registries** (git.unom.io): Gitea never expires releases.
+  The org package cleanup rules prune canary builds only: each rule's `keep_pattern`
+  matches release versions (and the generic `latest`/`canary` aliases). Gitea matches
+  the pattern against the whole version string. The full release history
   (v0.17.x through current) is still served with assets. Blobs live in the `unom-git`
   S3 bucket with an R2 mirror, and the box is restic-backed every 6 h. Old release
   assets (and their `.sha256` sidecars) therefore stay downloadable.

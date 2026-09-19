@@ -6,6 +6,7 @@
 //! and keyboard `keyCode` (LE). Layouts match moonlight-common-c `Input.h`; magics match
 //! Sunshine `input.cpp` Gen5+ (`scroll = 0x0A`, `controller = 0x0C`).
 
+use punktfunk_core::input::scroll::{ScrollEvent, ScrollPhase, ScrollSource, SCROLL_SCALE};
 use punktfunk_core::input::{InputEvent, InputKind};
 
 /// moonlight `packetTypesGen7[IDX_INPUT_DATA]`.
@@ -25,7 +26,8 @@ const MAGIC_HSCROLL: u32 = 0x5500_0001;
 const MAGIC_SS_TOUCH: u32 = 0x5500_0002;
 const MAGIC_SS_PEN: u32 = 0x5500_0003;
 
-/// `InputKind::MouseScroll` `code`: `1` = horizontal, `0` = vertical.
+/// Scroll `code`: `1` = horizontal, `0` = vertical — shared by `MouseScroll` and
+/// normalized `Scroll`.
 pub const SCROLL_HORIZONTAL: u32 = 1;
 
 /// Keepalives, QoS, gamepad, pen, and touch yield nothing (sibling decoders).
@@ -73,14 +75,10 @@ fn decode_input_packet(p: &[u8]) -> Option<InputEvent> {
         }
         MAGIC_MOUSE_BTN_DOWN => ev(InputKind::MouseButtonDown, *b.first()? as u32, 0, 0, 0),
         MAGIC_MOUSE_BTN_UP => ev(InputKind::MouseButtonUp, *b.first()? as u32, 0, 0, 0),
-        MAGIC_SCROLL_GEN5 => ev(InputKind::MouseScroll, 0, be16(0)? as i32, 0, 0),
-        MAGIC_HSCROLL => ev(
-            InputKind::MouseScroll,
-            SCROLL_HORIZONTAL,
-            be16(0)? as i32,
-            0,
-            0,
-        ),
+        // Wheel deltas arrive as signed v120 — normalized `Scroll` directly: this
+        // path bypasses the client seam, so it speaks the injector vocabulary.
+        MAGIC_SCROLL_GEN5 => scroll_ev(0, be16(0)?),
+        MAGIC_HSCROLL => scroll_ev(SCROLL_HORIZONTAL, be16(0)?),
         MAGIC_KEY_DOWN | MAGIC_KEY_UP => {
             // keyCode is LE; Sunshine masks the 0x80 key-down high byte (`& 0xFF`). Moonlight
             // VKs are layout-semantic — tag them so Windows maps under the receiving layout,
@@ -192,6 +190,17 @@ pub fn decode_pointer(plaintext: &[u8]) -> Option<SsPointer> {
     }
 }
 
+/// Signed packet v120 → normalized wheel event (Q24.8 delta; no phases on a wheel).
+fn scroll_ev(axis: u32, v120: i16) -> InputEvent {
+    ScrollEvent {
+        source: ScrollSource::Wheel,
+        phase: ScrollPhase::None,
+        axis,
+        delta: i32::from(v120) * SCROLL_SCALE as i32,
+    }
+    .to_event()
+}
+
 fn ev(kind: InputKind, code: u32, x: i32, y: i32, flags: u32) -> InputEvent {
     InputEvent {
         kind,
@@ -226,6 +235,49 @@ mod tests {
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].kind, InputKind::MouseMove);
         assert_eq!((ev[0].x, ev[0].y), (-1, 2));
+    }
+
+    #[test]
+    fn decodes_scroll_packets_as_normalized_wheel() {
+        // Vertical +120 → Scroll, Wheel/None, axis 0, Q24.8 delta.
+        let pt = wrap(MAGIC_SCROLL_GEN5, &[0x00, 0x78]);
+        let ev = decode(&pt);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            ev[0],
+            ScrollEvent {
+                source: ScrollSource::Wheel,
+                phase: ScrollPhase::None,
+                axis: 0,
+                delta: 120 * SCROLL_SCALE as i32,
+            }
+            .to_event()
+        );
+        // Negative vertical and i16 extremes do not sign-wrap.
+        let pt = wrap(MAGIC_SCROLL_GEN5, &[0x80, 0x00]); // -32768
+        let ev = decode(&pt);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].kind, InputKind::Scroll);
+        assert_eq!(ev[0].x, i32::from(-32768i16) * 256);
+        // Horizontal keeps axis 1 and the sign convention.
+        let pt = wrap(MAGIC_HSCROLL, &[0xff, 0x88]); // -120
+        let ev = decode(&pt);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            ev[0],
+            ScrollEvent {
+                source: ScrollSource::Wheel,
+                phase: ScrollPhase::None,
+                axis: SCROLL_HORIZONTAL,
+                delta: -120 * SCROLL_SCALE as i32,
+            }
+            .to_event()
+        );
+        // Truncated body (missing the delta) yields nothing, not a zero scroll.
+        let pt = wrap(MAGIC_SCROLL_GEN5, &[0x00]);
+        assert!(decode(&pt).is_empty());
+        let pt = wrap(MAGIC_SCROLL_GEN5, &[]);
+        assert!(decode(&pt).is_empty());
     }
 
     #[test]

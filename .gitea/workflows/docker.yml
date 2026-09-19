@@ -20,7 +20,7 @@
 #     Gitea registry (git.unom.io) with :latest + :sha-<8> (+ :vX.Y.Z on tags), because
 #     unom-1 deploys pull from there and releases pin them.
 #
-# Host and clients are intentionally NOT containerized (see CLAUDE.md "What's left").
+# Host and clients are intentionally NOT containerized.
 #
 # REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (app images).
 # CI_REGISTRY_PASSWORD: repo Actions secret, the LAN registry's push credential for user

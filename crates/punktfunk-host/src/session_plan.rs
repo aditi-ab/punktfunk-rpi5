@@ -219,10 +219,11 @@ pub(crate) fn cursor_blend_for(
     gamescope: bool,
     codec: crate::encode::Codec,
     bit_depth: u8,
+    gamescope_route: Option<&pf_vdisplay::GamescopeRoute>,
 ) -> bool {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (cursor_forward, gamescope, codec, bit_depth);
+        let _ = (cursor_forward, gamescope, codec, bit_depth, gamescope_route);
         false
     }
     #[cfg(target_os = "linux")]
@@ -231,7 +232,7 @@ pub(crate) fn cursor_blend_for(
             // gamescope capture has no SPA_META_Cursor; skip the blend-capable term or a
             // gamescope that paints its own pointer loses native-NV12 for a blend that
             // never receives an overlay.
-            return gamescope_needs_host_cursor(true);
+            return gamescope_needs_host_cursor(true, gamescope_route);
         }
         if cursor_forward {
             return true;
@@ -250,20 +251,29 @@ pub(crate) fn cursor_blend_for(
 /// forces compute colour-conversion, because the RGB-direct source has no
 /// blend stage; cursor-in-node is the zero-copy end-to-end path.
 #[cfg(not(target_os = "windows"))]
-fn gamescope_needs_host_cursor(gamescope: bool) -> bool {
-    gamescope && !pf_vdisplay::gamescope_composites_cursor()
+fn gamescope_needs_host_cursor(
+    gamescope: bool,
+    gamescope_route: Option<&pf_vdisplay::GamescopeRoute>,
+) -> bool {
+    gamescope && !pf_vdisplay::gamescope_composites_cursor(gamescope_route)
 }
 
 /// No gamescope on Windows: the pointer is the driver's.
 #[cfg(target_os = "windows")]
-fn gamescope_needs_host_cursor(_gamescope: bool) -> bool {
+fn gamescope_needs_host_cursor(
+    _gamescope: bool,
+    _gamescope_route: Option<&pf_vdisplay::GamescopeRoute>,
+) -> bool {
     false
 }
 
 /// Kept beside [`cursor_blend_for`] because the two must agree: reader without
 /// blend wastes an X11 connection; blend without reader streams no pointer.
-pub(crate) fn gamescope_cursor_for(gamescope: bool) -> bool {
-    gamescope_needs_host_cursor(gamescope)
+pub(crate) fn gamescope_cursor_for(
+    gamescope: bool,
+    gamescope_route: Option<&pf_vdisplay::GamescopeRoute>,
+) -> bool {
+    gamescope_needs_host_cursor(gamescope, gamescope_route)
 }
 
 #[cfg(target_os = "windows")]
@@ -384,18 +394,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cursor_forward_forces_blend_on_linux() {
-        assert!(cursor_blend_for(true, false, Codec::H264, 8));
+        assert!(cursor_blend_for(true, false, Codec::H264, 8, None));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gamescope_cursor_reader_matches_blend_rule() {
-        let cursor_blend = cursor_blend_for(false, true, Codec::H265, 10);
-        let gamescope_cursor = gamescope_cursor_for(true);
+        let cursor_blend = cursor_blend_for(false, true, Codec::H265, 10, None);
+        let gamescope_cursor = gamescope_cursor_for(true, None);
 
         assert_eq!(cursor_blend, gamescope_cursor);
-        assert_eq!(cursor_blend, gamescope_needs_host_cursor(true));
-        assert!(!gamescope_cursor_for(false));
+        assert_eq!(cursor_blend, gamescope_needs_host_cursor(true, None));
+        assert!(!gamescope_cursor_for(false, None));
     }
 
     #[cfg(target_os = "windows")]
@@ -407,9 +417,10 @@ mod tests {
                     cursor_forward,
                     gamescope,
                     Codec::H265,
-                    10
+                    10,
+                    None
                 ));
-                assert!(!gamescope_cursor_for(gamescope));
+                assert!(!gamescope_cursor_for(gamescope, None));
             }
         }
     }

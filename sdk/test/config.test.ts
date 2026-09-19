@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 import {
+	hostFetch,
 	pluginIngestDir,
 	pluginStateDir,
 	publishedMgmtUrl,
@@ -105,5 +107,47 @@ describe("publishedMgmtUrl / resolveConfig url", () => {
 	test("a blank file reads as unset, not as an empty URL", () => {
 		fs.writeFileSync(path.join(dir, "mgmt-endpoint"), "\n");
 		expect(publishedMgmtUrl()).toBeUndefined();
+	});
+});
+
+const openssl = spawnSync("openssl", ["version"]).status === 0;
+
+describe("hostFetch", () => {
+	let saved: string | undefined;
+	let dir: string;
+	beforeEach(() => {
+		saved = process.env.PUNKTFUNK_CONFIG_DIR;
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-pin-"));
+		process.env.PUNKTFUNK_CONFIG_DIR = dir;
+	});
+	afterEach(() => {
+		if (saved === undefined) delete process.env.PUNKTFUNK_CONFIG_DIR;
+		else process.env.PUNKTFUNK_CONFIG_DIR = saved;
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	// The sandbox proxy forwards with this and holds no token, so it can't use resolveConfig.
+	test.skipIf(!openssl)("reaches a self-signed host that a bare fetch refuses", async () => {
+		const key = path.join(dir, "key.pem");
+		const cert = path.join(dir, "cert.pem");
+		// CN-only, no SAN: the shape of the host's identity cert.
+		const made = spawnSync("openssl", [
+			"req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+			"-subj", "/CN=punktfunk-host", "-keyout", key, "-out", cert,
+		]);
+		expect(made.status).toBe(0);
+		const server = Bun.serve({
+			port: 0,
+			tls: { key: fs.readFileSync(key, "utf8"), cert: fs.readFileSync(cert, "utf8") },
+			fetch: () => new Response("ok"),
+		});
+		try {
+			const url = `https://127.0.0.1:${server.port}`;
+			await expect(fetch(url)).rejects.toThrow();
+			const pinned = await hostFetch(url);
+			expect(await (await pinned(url)).text()).toBe("ok");
+		} finally {
+			server.stop(true);
+		}
 	});
 });

@@ -45,19 +45,38 @@ pub struct SessionIsolation {
     pub sink: Option<String>,
     /// Nested apps' `PULSE_SOURCE` `node.name`.
     pub mic_source: Option<String>,
+    /// `HOME` a nested Steam launch runs under (`pf_paths::seat_home`), so it neither
+    /// contends with the box's Steam nor shares its account. `None` = the box's own home.
+    pub steam_home: Option<std::path::PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
 impl SessionIsolation {
     /// Build the identity, computing the relay path under the session env lock: the producer-side
     /// `XDG_RUNTIME_DIR` read must not race a concurrent handshake's `apply_session_env`.
-    pub fn new(id: String, sink: Option<String>, mic_source: Option<String>) -> SessionIsolation {
+    pub fn new(
+        id: String,
+        sink: Option<String>,
+        mic_source: Option<String>,
+        steam_home: Option<std::path::PathBuf>,
+    ) -> SessionIsolation {
         let ei_relay = crate::with_env_lock(|| pf_paths::gamescope_ei_socket_file_for(&id));
         SessionIsolation {
             id,
             ei_relay,
             sink,
             mic_source,
+            steam_home,
+        }
+    }
+
+    /// The registry's reuse key. A kept spawn has this id's planes and this home baked into its
+    /// env, so only a session asking for both may be handed it back — and a pre-warm has to
+    /// build the same string, or it parks a display nobody claims.
+    pub fn key(&self) -> String {
+        match &self.steam_home {
+            Some(home) => format!("{}@{}", self.id, home.display()),
+            None => self.id.clone(),
         }
     }
 }
@@ -327,6 +346,17 @@ pub trait VirtualDisplay: Send {
     /// with the game); KWin/Mutter nodes die with the compositor, already reaped by session-epoch.
     fn kept_display_alive(&mut self, _node_id: u32) -> bool {
         true
+    }
+    /// May a kept display of this backend be moved to another mode in place? Gates the reuse
+    /// probe, which must not offer a candidate [`resize_kept`](Self::resize_kept) would refuse.
+    /// Default `false` — every other backend retires a kept display it cannot serve at the mode.
+    fn can_resize_kept(&self) -> bool {
+        false
+    }
+    /// Move the kept display on `seat` to `mode`, blocking until the compositor reports it.
+    /// `false` (the default, and any refusal or timeout) leaves the caller its retire-and-spawn.
+    fn resize_kept(&mut self, _seat: Option<&str>, _mode: Mode) -> bool {
+        false
     }
 }
 

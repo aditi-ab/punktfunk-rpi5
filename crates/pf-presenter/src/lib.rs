@@ -40,10 +40,16 @@ mod present_pace;
 mod run;
 #[cfg(any(target_os = "linux", windows))]
 pub mod scale;
+// Pure scroll-frame accumulation — no Wayland or Vulkan dependency.
+pub mod scroll;
+#[cfg(any(target_os = "linux", windows))]
+mod scroll_routing;
 // Pure gesture logic with no SDL or Vulkan dependency: built (and tested) on every platform.
 pub mod touch;
 #[cfg(any(target_os = "linux", windows))]
 pub mod vk;
+#[cfg(target_os = "linux")]
+pub mod wayland_scroll;
 #[cfg(windows)]
 mod win32;
 

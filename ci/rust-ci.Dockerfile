@@ -4,7 +4,7 @@
 #
 #   docker build -f ci/rust-ci.Dockerfile -t punktfunk-rust-ci ci
 #
-# The workspace links real system libs at build time (CLAUDE.md "Pinned crate facts"):
+# The workspace links real system libs at build time:
 # PipeWire, Opus, GL/EGL/GBM — and libcuda, which has no real driver here; the
 # zerocopy path only needs the symbols at link time, so a driver userspace package plus a
 # libcuda.so -> libcuda.so.1 symlink stands in for it (CI never executes the CUDA path).

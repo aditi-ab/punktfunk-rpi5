@@ -88,7 +88,8 @@ data class Shortcut(val id: String, val label: String = "", val keys: List<Strin
 
 /**
  * The Windows virtual-key code a shortcut key name stands for (the wire speaks VKs); `null` for
- * a name this build does not know. Twin of the Rust `key_vk`.
+ * a name this build does not know. Twin of the Rust `key_vk`: `OverlayActionsTest` replays
+ * `crates/punktfunk-core/testdata/key-vk-vectors.json`, so a new name lands there first.
  */
 fun keyVk(name: String): Int? {
     val n = name.trim().lowercase()
@@ -118,7 +119,7 @@ fun keyVk(name: String): Int? {
         else -> when {
             n.length == 1 && n[0] in 'a'..'z' -> 0x41 + (n[0] - 'a')
             n.length == 1 && n[0] in '0'..'9' -> 0x30 + (n[0] - '0')
-            n.length in 2..3 && n[0] == 'f' ->
+            n.length >= 2 && n[0] == 'f' ->
                 n.substring(1).toIntOrNull()?.takeIf { it in 1..24 }?.let { 0x70 + it - 1 }
             else -> null
         }

@@ -116,6 +116,10 @@ for row in "${MATRIX[@]}"; do
           if echo "$PACKAGES" | grep -q punktfunk-gamescope; then
             punktfunk-gamescope --version
           fi
+          # The console and the runner both exec this one private bun.
+          if echo "$PACKAGES" | grep -qE "punktfunk-(web|scripting)"; then
+            /usr/lib/punktfunk-bun/bun --version
+          fi
         '; then
     echo "PASS: $IMAGE"
   else

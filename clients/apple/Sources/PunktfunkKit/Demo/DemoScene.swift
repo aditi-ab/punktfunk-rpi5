@@ -71,6 +71,8 @@ final class DemoScene {
             press(name, now)
         case PUNKTFUNK_INPUT_KIND_MOUSE_SCROLL.rawValue:
             note(ev.x > 0 ? "Scroll up" : "Scroll down", now)
+        case PUNKTFUNK_INPUT_KIND_SCROLL.rawValue:
+            if ev.x != 0 { note(ev.x > 0 ? "Scroll up" : "Scroll down", now) }
         case PUNKTFUNK_INPUT_KIND_KEY_DOWN.rawValue:
             key(ev.code, now)
         case PUNKTFUNK_INPUT_KIND_TEXT_INPUT.rawValue:

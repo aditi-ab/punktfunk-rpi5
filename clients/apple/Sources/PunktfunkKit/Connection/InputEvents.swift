@@ -47,6 +47,22 @@ public extension PunktfunkInputEvent {
             flags: precise ? UInt32(SCROLL_FLAG_PRECISE) : 0)
     }
 
+    /// Normalized scroll (`InputKind::Scroll`): `delta` is signed Q24.8 in `source`'s unit —
+    /// v120 for `WHEEL`/`UNKNOWN`, DIP for the rest — `axis` 0=vertical/1=horizontal.
+    /// A host without `HOST_CAP2_SCROLL` gets one `MouseScroll` conversion at the core's
+    /// outbound seam, so every capture path feeds this shape.
+    static func normalizedScroll(
+        _ delta: Int32, axis: UInt32, source: PunktfunkScrollSource,
+        phase: PunktfunkScrollPhase
+    ) -> PunktfunkInputEvent {
+        make(
+            PUNKTFUNK_INPUT_KIND_SCROLL.rawValue,
+            code: axis,
+            x: delta,
+            y: 0,
+            flags: UInt32(source.rawValue) | (UInt32(phase.rawValue) << 8))
+    }
+
     // Gamepad (wire contract in punktfunk_core::input::gamepad): one transition per event,
     // `pad` = controller index, accumulated host-side into a virtual Xbox 360 or DualSense
     // pad (the session's negotiated `GamepadType`).

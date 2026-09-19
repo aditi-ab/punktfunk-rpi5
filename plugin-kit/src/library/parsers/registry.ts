@@ -29,16 +29,32 @@ export const validRegKey = (key: string): boolean =>
 	!key.startsWith("/") &&
 	!/[\r\n\0"]/.test(key);
 
+/**
+ * Run `spawn`, and once more if the first run was killed rather than exiting.
+ *
+ * Bun on Windows fires a `spawnSync` timeout within milliseconds when the spawn is the first
+ * after an idle event loop, which is every poll. A killed read looks like an absent key, and an
+ * absent launcher reconciles its store empty. The second spawn runs normally.
+ */
+export const spawnAgainIfKilled = <T extends { status: number | null }>(
+	spawn: () => T,
+): T => {
+	const first = spawn();
+	return first.status === null ? spawn() : first;
+};
+
 const run = (args: string[]): string | undefined => {
 	if (process.platform !== "win32") return undefined;
-	const r = spawnSync("reg.exe", args, {
-		encoding: "utf8",
-		windowsHide: true,
-		// A registry read is instant; a hang means something is badly wrong and a scan must not
-		// block on it forever.
-		timeout: 10_000,
-		maxBuffer: 4 * 1024 * 1024,
-	});
+	const r = spawnAgainIfKilled(() =>
+		spawnSync("reg.exe", args, {
+			encoding: "utf8",
+			windowsHide: true,
+			// A registry read is instant; a hang means something is badly wrong and a scan must
+			// not block on it forever.
+			timeout: 10_000,
+			maxBuffer: 4 * 1024 * 1024,
+		}),
+	);
 	if (r.status !== 0 || typeof r.stdout !== "string") return undefined;
 	return r.stdout;
 };

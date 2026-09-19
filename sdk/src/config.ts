@@ -151,16 +151,7 @@ export const resolveConfig = async (
 				"{ token }, or set PUNKTFUNK_MGMT_TOKEN for a script that needs the admin API.",
 		);
 	}
-	const caPath = process.env.PUNKTFUNK_MGMT_CA;
-	const ca =
-		options?.ca ??
-		(caPath ? readIfExists(caPath) : undefined) ??
-		(url.startsWith("https://")
-			? // The mgmt API presents the NATIVE identity when one exists (the host's identity
-				// split); `cert.pem` is the legacy identity, still served on hosts that predate it.
-				(readIfExists(path.join(configDir(), "native-cert.pem")) ??
-				readIfExists(path.join(configDir(), "cert.pem")))
-			: undefined);
+	const ca = resolveCa(url, options);
 	return {
 		url,
 		token,
@@ -169,6 +160,25 @@ export const resolveConfig = async (
 		fetch: await makeFetch(ca),
 	};
 };
+
+/** The certificate to pin for `url`: explicit, then `PUNKTFUNK_MGMT_CA`, then the host's own. */
+const resolveCa = (url: string, options?: ConnectOptions): string | undefined => {
+	const caPath = process.env.PUNKTFUNK_MGMT_CA;
+	return (
+		options?.ca ??
+		(caPath ? readIfExists(caPath) : undefined) ??
+		(url.startsWith("https://")
+			? // The mgmt API presents the NATIVE identity when one exists (the host's identity
+				// split); `cert.pem` is the legacy identity, still served on hosts that predate it.
+				(readIfExists(path.join(configDir(), "native-cert.pem")) ??
+				readIfExists(path.join(configDir(), "cert.pem")))
+			: undefined)
+	);
+};
+
+/** The pinned fetch for `url`, for a caller that forwards requests and holds no token of its own. */
+export const hostFetch = (url: string, options?: ConnectOptions): Promise<typeof fetch> =>
+	makeFetch(resolveCa(url, options));
 
 /**
  * A fetch that PINS `ca` — the host's self-signed identity cert — on this runtime.
