@@ -789,6 +789,164 @@ mod tests {
         flags: 0,
     };
 
+    /// One wire packet, and the rate both modelled sessions open at.
+    const WIRE: u64 = 1_448;
+    const START_KBPS: u32 = 12_000;
+
+    /// One modelled session: the [`punktfunk_core::abr::Driver`] a real client
+    /// runs, the registry entry and counters the host keeps for it, and the
+    /// share window its reports close.
+    struct Peer {
+        abr: punktfunk_core::abr::Driver,
+        counters: Arc<crate::session_status::SessionCounters>,
+        /// Encoder target, the same Arc the governor reads as `current_kbps`.
+        rate: Arc<AtomicU32>,
+        window: ShareWindow,
+        clocks: ShareClocks,
+        stats: punktfunk_core::stats::Stats,
+        egress: u64,
+        arrived: u64,
+        /// The share standing over this session, and every one it was told.
+        share: u32,
+        told: Vec<(u64, u32)>,
+        _live: crate::session_status::LiveSessionGuard,
+    }
+
+    fn peer(name: &str, at: std::net::IpAddr, base: std::time::Instant) -> Peer {
+        let (live, counters, rate) =
+            crate::session_status::tests::fake_member(name, at, START_KBPS);
+        Peer {
+            abr: punktfunk_core::abr::Driver::new(
+                punktfunk_core::abr::DriverConfig {
+                    start_kbps: START_KBPS,
+                    ceiling_cap_kbps: None,
+                    stream_cap_kbps: 200_000,
+                    refresh_hz: 60,
+                    codec: punktfunk_core::quic::CODEC_HEVC,
+                    bit_depth: 8,
+                    chroma_format: punktfunk_core::quic::CHROMA_IDC_420,
+                    audio_reserved_kbps: 256,
+                    marks_repeats: true,
+                    reads_delivery: true,
+                    probe: false,
+                    probe_target_kbps: None,
+                    ramp: false,
+                },
+                base,
+            ),
+            counters,
+            rate,
+            window: ShareWindow::new(base, 0),
+            clocks: ShareClocks::new(base),
+            stats: punktfunk_core::stats::Stats::default(),
+            egress: 0,
+            arrived: 0,
+            share: 0,
+            told: Vec::new(),
+            _live: live,
+        }
+    }
+
+    impl Peer {
+        /// One millisecond of this session: the host puts its encoder rate on
+        /// the wire, the link carries what it has room for, and whatever the
+        /// driver asks to send reaches the host's own handling of it.
+        fn step(&mut self, ms: u64, at: std::time::Instant, link_kbps: u32) {
+            let offer = u64::from(self.rate.load(Ordering::Relaxed));
+            self.egress += offer * 125 / 1_000;
+            self.counters.link.publish_egress_bytes(self.egress);
+            self.arrived += offer.min(u64::from(link_kbps)) * 125 / 1_000;
+            self.stats.packets_received = self.arrived / WIRE;
+            self.stats.bytes_received = self.arrived;
+            if ms % 16 == 0 {
+                self.stats.frames_completed += 1;
+                self.abr.on_au(false);
+            }
+            self.abr.on_stats(&self.stats);
+            for action in self.abr.tick(at).actions {
+                match action {
+                    punktfunk_core::abr::Action::Delivery(packets) => {
+                        let Some(share) = delivery_share(
+                            at,
+                            packets,
+                            &self.counters,
+                            &mut self.window,
+                            &mut self.clocks,
+                            true,
+                            WIRE,
+                        ) else {
+                            continue;
+                        };
+                        self.share = share;
+                        self.told.push((ms, share));
+                        // As the branch does: a share under the live rate is a
+                        // retarget the encoder takes now.
+                        if share > 0 && self.rate.load(Ordering::Relaxed) > share {
+                            self.rate.store(share, Ordering::Relaxed);
+                        }
+                    }
+                    // As the `SetBitrate` branch does: the share binds last.
+                    punktfunk_core::abr::Action::SetBitrate(kbps) => {
+                        let want = if self.share > 0 {
+                            kbps.min(self.share)
+                        } else {
+                            kbps
+                        };
+                        self.rate.store(want, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The sequence a real client sends, through the host's own handling of it:
+    /// two sessions at one address over a path that falls twice under them.
+    ///
+    /// Each is told a share again at every fall, because the driver closes the
+    /// host's share window every report window. A client that reports once
+    /// leaves the host one reading of the path and no way to take another, and
+    /// this is the test that fails on it. The third session is alone at its own
+    /// address and is never told anything.
+    #[test]
+    fn a_real_clients_reports_keep_dividing_a_shared_path() {
+        let base = std::time::Instant::now();
+        let at = |ms: u64| base + std::time::Duration::from_millis(ms);
+        let shared: std::net::IpAddr = "203.0.113.41".parse().unwrap();
+        let mut group = [peer("phone", shared, base), peer("pc", shared, base)];
+        let mut lone = peer("tv", "203.0.113.42".parse().unwrap(), base);
+        for ms in 0..18_000 {
+            // Half the path each: 9 Mbps, then 5, then 3.
+            let link = match ms {
+                0..6_000 => 9_000,
+                6_000..12_000 => 5_000,
+                _ => 3_000,
+            } / 2;
+            for p in &mut group {
+                p.step(ms, at(ms), link);
+            }
+            lone.step(ms, at(ms), 9_000);
+        }
+        for p in &group {
+            assert!(
+                p.told.len() >= 3,
+                "three falls, {} shares: {:?}",
+                p.told.len(),
+                p.told
+            );
+            assert!(
+                p.told.last().is_some_and(|&(ms, _)| ms > 12_000),
+                "the governor stopped early: {:?}",
+                p.told
+            );
+        }
+        assert!(
+            lone.told.is_empty(),
+            "a session alone at its address was told {:?}",
+            lone.told
+        );
+    }
+
     /// Old client → new host: a client whose `Start` carried no `EXT_TAG_ABR`
     /// gets the ack it has always got — nine bytes, whatever the host knows
     /// about the refusal.

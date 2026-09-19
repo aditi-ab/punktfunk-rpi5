@@ -1212,7 +1212,7 @@ pub fn force_idr_all() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A compat-plane session is a registry entry like any other, which is what gives the
@@ -1341,7 +1341,7 @@ mod tests {
 
     /// A live session at `peer` with its own counter block, so a test can
     /// publish what the governor reads and move the rate it hands out.
-    fn fake_member(
+    pub(crate) fn fake_member(
         client: &str,
         peer: std::net::IpAddr,
         kbps: u32,
