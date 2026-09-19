@@ -17,6 +17,7 @@
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 
+pub mod access;
 pub mod manifest;
 #[cfg(target_os = "windows")]
 mod windows;
@@ -58,6 +59,13 @@ pub fn main(args: &[String]) -> Result<()> {
         Some("grant") => grant(
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
+            &args[3..],
+        ),
+        Some("access") => access_list(&args[1..]),
+        Some("revoke") => revoke(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+            &args[3..],
         ),
         Some("-h") | Some("--help") | Some("help") | None => {
             print_usage();
@@ -67,32 +75,124 @@ pub fn main(args: &[String]) -> Result<()> {
     }
 }
 
-/// `plugins grant <plugin> <dir>` — the operator's answer to "this package may also reach here".
+/// `plugins grant <plugin> <dir> [--write]` — the operator's answer to "this package may also
+/// reach here". Grants bind read-only; `--write` is the exception and says so on the record.
 ///
 /// A package declares the standard locations it knows; where someone keeps their ROMs or installs
 /// their games is not something it can know, and this is how that path becomes usable without the
 /// package asking for the home directory.
-fn grant(plugin: Option<&str>, dir: Option<&str>) -> Result<()> {
+fn grant(plugin: Option<&str>, dir: Option<&str>, flags: &[String]) -> Result<()> {
+    let mut write = false;
+    for flag in flags {
+        match flag.as_str() {
+            "--write" => write = true,
+            other => bail!("unknown flag '{other}' (the only flag is --write)"),
+        }
+    }
     let (Some(plugin), Some(dir)) = (
         plugin.map(str::trim).filter(|s| !s.is_empty()),
         dir.map(str::trim).filter(|s| !s.is_empty()),
     ) else {
-        bail!("usage: punktfunk-host plugins grant <plugin> <dir>");
+        bail!("usage: punktfunk-host plugins grant <plugin> <dir> [--write]");
     };
     let path = std::path::Path::new(dir);
     // A typo must not report success: the grant would name a directory nothing ever reads.
     if !path.is_dir() {
         bail!("'{dir}' is not a directory (grant the folder, not a file inside it)");
     }
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let roots = manifest::grant_root(plugin, &path)
+    let store = access::AccessStore::open(pf_paths::config_dir());
+    let roots = store
+        .grant(plugin, path, write, "cli")
         .with_context(|| format!("record the grant for '{plugin}'"))?;
-    plat::grant(Some(dir))?;
     println!("{plugin} may now reach:");
     for root in roots {
-        println!("  {root}");
+        println!(
+            "  {} ({})",
+            root.path,
+            if root.write {
+                "read and write"
+            } else {
+                "read only"
+            }
+        );
     }
     println!("Re-run the plugin's scan (or restart the runner) to pick it up.");
+    Ok(())
+}
+
+/// `plugins access` — every plugin's grants, pending requests, and denials.
+fn access_list(flags: &[String]) -> Result<()> {
+    if let Some(flag) = flags.first() {
+        bail!("unknown flag '{flag}' (`plugins access` takes none)");
+    }
+    let store = access::AccessStore::open(pf_paths::config_dir());
+    let snapshots = store.snapshot().context("read plugin access records")?;
+    if snapshots
+        .iter()
+        .all(|s| s.grants.is_empty() && s.pending.is_empty() && s.denied.is_empty())
+    {
+        println!("No plugin folder access is recorded.");
+        return Ok(());
+    }
+    for s in snapshots {
+        println!("{plugin}:", plugin = s.plugin);
+        for g in &s.grants {
+            println!(
+                "  granted  {} ({}, by {})",
+                g.path,
+                if g.write {
+                    "read and write"
+                } else {
+                    "read only"
+                },
+                g.by
+            );
+        }
+        for p in &s.pending {
+            println!(
+                "  pending  {} ({})",
+                p.path,
+                if p.write {
+                    "read and write"
+                } else {
+                    "read only"
+                }
+            );
+        }
+        for d in &s.denied {
+            println!("  denied   {d}");
+        }
+    }
+    Ok(())
+}
+
+/// `plugins revoke <plugin> <dir>` — remove one grant by its recorded path.
+fn revoke(plugin: Option<&str>, dir: Option<&str>, flags: &[String]) -> Result<()> {
+    if let Some(flag) = flags.first() {
+        bail!("unknown flag '{flag}' (`plugins revoke` takes none)");
+    }
+    let (Some(plugin), Some(dir)) = (
+        plugin.map(str::trim).filter(|s| !s.is_empty()),
+        dir.map(str::trim).filter(|s| !s.is_empty()),
+    ) else {
+        bail!("usage: punktfunk-host plugins revoke <plugin> <dir>");
+    };
+    let store = access::AccessStore::open(pf_paths::config_dir());
+    let roots = store
+        .revoke(plugin, std::path::Path::new(dir))
+        .with_context(|| format!("revoke the grant for '{plugin}'"))?;
+    println!("{plugin} may now reach:");
+    for root in roots {
+        println!(
+            "  {} ({})",
+            root.path,
+            if root.write {
+                "read and write"
+            } else {
+                "read only"
+            }
+        );
+    }
     Ok(())
 }
 
@@ -107,10 +207,13 @@ USAGE:
     punktfunk-host plugins enable            enable + start the plugin runner (opt-in)
     punktfunk-host plugins disable           stop + disable the plugin runner
     punktfunk-host plugins status            is the runner enabled/running?
-    punktfunk-host plugins grant <plugin> <dir>
+    punktfunk-host plugins grant <plugin> <dir> [--write]
                                              let one plugin reach a directory of yours (a ROM
                                              library, a game install dir) — nothing else on
-                                             this box changes
+                                             this box changes; read-only unless --write
+    punktfunk-host plugins access            list every plugin's granted, pending and denied folders
+    punktfunk-host plugins revoke <plugin> <dir>
+                                             take one granted directory back
 
 NAMES:
     A bare first-party name resolves into the @punktfunk scope: `playnite` installs
@@ -216,6 +319,36 @@ pub(crate) fn set_runtime_enabled(enabled: bool) -> Result<()> {
         plat::enable()
     } else {
         plat::disable()
+    }
+}
+
+/// The ACL half of a grant, as `io::Error` for [`access::AccessStore`]. POSIX needs none:
+/// the runner is the operator's own user unit.
+pub(crate) fn grant_acl(dir: &std::path::Path, write: bool) -> std::io::Result<()> {
+    plat::grant(dir, write).map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// Re-apply every recorded grant's ACL at `serve`. A launcher rewrite can drop the ACE its
+/// grant depended on; a failure warns and the rest still converge. No-op off Windows.
+pub(crate) fn converge_grants() {
+    #[cfg(target_os = "windows")]
+    {
+        let store = access::AccessStore::open(pf_paths::config_dir());
+        match store.snapshot() {
+            Ok(snapshots) => {
+                for s in snapshots {
+                    for g in s.grants {
+                        if let Err(e) = plat::grant(std::path::Path::new(&g.path), g.write) {
+                            tracing::warn!(plugin = %s.plugin, path = %g.path, error = %e,
+                                "plugin grant ACL could not be re-applied");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "plugin grants could not be read for ACL convergence")
+            }
+        }
     }
 }
 

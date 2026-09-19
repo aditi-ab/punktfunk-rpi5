@@ -9,6 +9,10 @@ import * as HttpClientError from "effect/unstable/http/HttpClientError"
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest"
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse"
 // non-recursive definitions
+export type AccessPathOutcome = { readonly "outcome": string, readonly "path": string }
+export const AccessPathOutcome = Schema.Struct({ "outcome": Schema.String, "path": Schema.String }).annotate({ "description": "One path's answer: `granted`, `pending`, `denied`, or `refused:<rule>`." })
+export type AccessPathRequest = { readonly "path": string, readonly "write"?: boolean }
+export const AccessPathRequest = Schema.Struct({ "path": Schema.String.annotate({ "description": "The directory the plugin wants, absolute on the host." }), "write": Schema.optionalKey(Schema.Boolean.annotate({ "description": "`true` asks for write access too; a grant is read-only unless the operator allows it." })) })
 export type ActionInfo = { readonly "available": boolean, readonly "danger": boolean, readonly "group": string, readonly "id": string, readonly "permitted": boolean, readonly "title": string, readonly "unavailable_reason"?: string | null }
 export const ActionInfo = Schema.Struct({ "available": Schema.Boolean.annotate({ "description": "Platform probe. A VM that cannot S3 lists sleep as unavailable rather than a dead switch." }), "danger": Schema.Boolean.annotate({ "description": "Double-confirm hint: reboot/shutdown lose state." }), "group": Schema.String, "id": Schema.String.annotate({ "description": "Invoke path parameter (`power.sleep`, …)." }), "permitted": Schema.Boolean.annotate({ "description": "Whether THIS caller may invoke it (admin: always; cert: live `GRANT_POWER` bit)." }), "title": Schema.String.annotate({ "description": "Clients localize known ids and fall back to this for unknown ones." }), "unavailable_reason": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])) }).annotate({ "description": "One action as the caller sees it (`GET /actions`)." })
 export type ActiveGame = { readonly "app_id"?: string | null, readonly "awaiting_window"?: boolean, readonly "client": string, readonly "grace_remaining_s"?: never, readonly "plane": "native" | "gamestream", readonly "session_id"?: number, readonly "state": string, readonly "store"?: string | null, readonly "title": string }
@@ -55,6 +59,8 @@ export type ClientLogMeta = { readonly "device_name": string, readonly "fingerpr
 export const ClientLogMeta = Schema.Struct({ "device_name": Schema.String.annotate({ "description": "Paired device name at upload, filesystem-sanitized." }), "fingerprint_prefix": Schema.String.annotate({ "description": "First 16 hex chars of the pairing fingerprint — enough to match the roster\nwithout repeating the full identity in every filename." }), "id": Schema.String.annotate({ "description": "Filename stem; pass to fetch/delete." }), "received_ms": Schema.Number.annotate({ "description": "Upload time (unix ms from the file mtime, not the stem timestamp).", "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "size_bytes": Schema.Number.annotate({ "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)) })
 export type ClientLogUploaded = { readonly "id": string }
 export const ClientLogUploaded = Schema.Struct({ "id": Schema.String })
+export type DecisionInput = "allow" | "deny" | "forget"
+export const DecisionInput = Schema.Literals(["allow", "deny", "forget"])
 export type DisconnectReason = "quit" | "timeout" | "error"
 export const DisconnectReason = Schema.Literals(["quit", "timeout", "error"]).annotate({ "description": "`Quit` is the typed close; `Timeout` is transport idle; `Error` is everything else." })
 export type EndGameRequest = { readonly "app_id"?: string | null, readonly "streaming"?: boolean }
@@ -73,6 +79,8 @@ export type GameRole = "game" | "launcher"
 export const GameRole = Schema.Literals(["game", "launcher"]).annotate({ "description": "Presentation hint: ordinary title vs the launcher itself (Steam Big Picture,\nHeroic, Playnite fullscreen). A launcher entry launches, leases, and lists\nlike a game (design D4). Serde-default `game`; skipped when default so the\nwire is unchanged for entries that don't opt in." })
 export type GameSession = "auto" | "dedicated"
 export const GameSession = Schema.Literals(["auto", "dedicated"]).annotate({ "description": "How a session that launches a game is served\n(`design/gamemode-and-dedicated-sessions.md`). Top-level\n[`DisplayPolicy`] field, not part of [`EffectivePolicy`], so a preset\nnever clobbers it. Linux-only in effect." })
+export type Grant = { readonly "at": string, readonly "by": string, readonly "path": string, readonly "write": boolean }
+export const Grant = Schema.Struct({ "at": Schema.String, "by": Schema.String, "path": Schema.String, "write": Schema.Boolean }).annotate({ "description": "One root the operator granted, as recorded on disk. `at`/`by` are audit fields:\nRFC3339 and `console`/`cli`/`legacy` (a v1 entry has neither)." })
 export type Health = { readonly "abi_version": number, readonly "status": string, readonly "version": string }
 export const Health = Schema.Struct({ "abi_version": Schema.Number.annotate({ "description": "`punktfunk-core` C ABI version.", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "status": Schema.String.annotate({ "description": "Always `\"ok\"` when the host responds." }), "version": Schema.String.annotate({ "description": "`punktfunk-host` crate version." }) })
 export type HiddenState = { readonly "hidden": boolean, readonly "id": string }
@@ -119,6 +127,8 @@ export type PendingCeremony = { readonly "fingerprint": string, readonly "peer_i
 export const PendingCeremony = Schema.Struct({ "fingerprint": Schema.String, "peer_ip": Schema.String, "uniqueid": Schema.String }).annotate({ "description": "One pairing handshake parked waiting for its PIN." })
 export type PendingDevice = { readonly "access_level"?: string | null, readonly "age_secs": number, readonly "expires_unix"?: never, readonly "fingerprint": string, readonly "granted_unix"?: never, readonly "grants"?: never, readonly "id": number, readonly "name": string, readonly "source": string, readonly "until_disconnect": boolean }
 export const PendingDevice = Schema.Struct({ "access_level": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "Stored mask's preset. `null` with no stored record — unlike\n[`NativeClient`], where it is always derivable." })), "age_secs": Schema.Number.annotate({ "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "expires_unix": Schema.optionalKey(Schema.Never), "fingerprint": Schema.String.annotate({ "description": "Hex SHA-256 of the device certificate — what approval pins." }), "granted_unix": Schema.optionalKey(Schema.Never), "grants": Schema.optionalKey(Schema.Never), "id": Schema.Number.annotate({ "description": "Approve/deny id. Per-process; entries expire after ~10 minutes.", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "name": Schema.String.annotate({ "description": "Client's own name, else fingerprint-derived." }), "source": Schema.String.annotate({ "description": "Where the knock came from: `\"lan\"` or `\"wan\"`. A `\"wan\"` device cannot be admitted by\napprove — arm a PIN bound to its fingerprint instead." }), "until_disconnect": Schema.Boolean.annotate({ "description": "Stored \"this session\" setting if this fingerprint was paired before. `false` if unknown." }) }).annotate({ "description": "Knock awaiting delegated approval (pair here instead of fetching a PIN)." })
+export type PendingRequest = { readonly "at": string, readonly "path": string, readonly "reason"?: string | null, readonly "write": boolean }
+export const PendingRequest = Schema.Struct({ "at": Schema.String, "path": Schema.String, "reason": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])), "write": Schema.Boolean }).annotate({ "description": "A path a plugin asked for that the operator has not answered yet." })
 export type Plane = "native" | "gamestream"
 export const Plane = Schema.Literals(["native", "gamestream"]).annotate({ "description": "Origin plane. Both planes must emit; filtering is the consumer's job." })
 export type PlayingApps = { readonly "apps": ReadonlyArray<string> }
@@ -219,6 +229,8 @@ export type WebTransportInfo = { readonly "allow_pooling": boolean, readonly "ce
 export const WebTransportInfo = Schema.Struct({ "allow_pooling": Schema.Boolean.annotate({ "description": "`allowPooling: true` is a `TypeError` when combined with `serverCertificateHashes`, so a\nclient must pass this. Stated here because a browser that ignores it fails at Web PKI\nvalidation with no useful error." }), "cert_hash_sha256": Schema.String.annotate({ "description": "Lowercase hex SHA-256 of the leaf certificate DER — the bytes that go in\n`serverCertificateHashes[0].value`." }), "cert_hash_sig": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "Hex ECDSA-P256-SHA256 signature (ASN.1 DER) by the host's long-lived native identity over\n`\"punktfunk-wt-cert-v1:\" + cert_hash_sha256`. Absent when that identity is the legacy RSA\npair. A browser that has paired MUST check this; one that has not cannot, and does not." })), "expires_at": Schema.Number.annotate({ "description": "Unix seconds. Past this the certificate has rotated and the hash above is stale; fetch\nagain rather than cache. Always under two weeks out — the spec refuses anything longer.", "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "host_cert_der": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "Base64 DER of the native identity's leaf certificate — the key that verifies\n`cert_hash_sig`. A browser hashes it and compares with the fingerprint it stored at\npairing; trusting it without that check would defeat the whole exercise." })), "port": Schema.Number.annotate({ "description": "UDP port the plane listens on. Not the management port, and not the native plane's.", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)) }).annotate({ "description": "Everything `new WebTransport(url, { serverCertificateHashes })` needs." })
 export type WorkspacePlacement = "own" | "current"
 export const WorkspacePlacement = Schema.Literals(["own", "current"]).annotate({ "description": "Where a library launch's windows open on the streamed head.\n\nDefault `own`: the player gets the game on an empty workspace instead of\nthe operator's desk. Honoured only by the backends that can place a launch\n(`claim_workspace`); everywhere else a launch is always `current`.\n\n[`DisplayPolicy`] field, not part of [`EffectivePolicy`]: a preset never\nclobbers it. A library entry's own `on_window.workspace` outranks it." })
+export type AccessRequest = { readonly "paths": ReadonlyArray<AccessPathRequest>, readonly "reason"?: string | null }
+export const AccessRequest = Schema.Struct({ "paths": Schema.Array(AccessPathRequest), "reason": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "Why the plugin wants it, in the plugin's words. Optional, sanitized, ≤120 chars." })) })
 export type ActionList = { readonly "actions": ReadonlyArray<ActionInfo> }
 export const ActionList = Schema.Struct({ "actions": Schema.Array(ActionInfo) })
 export type DisplayStateResponse = { readonly "displays": ReadonlyArray<ApiDisplayInfo> }
@@ -231,12 +243,16 @@ export type AudioPolicy = { readonly "sessions"?: AudioSessions }
 export const AudioPolicy = Schema.Struct({ "sessions": Schema.optionalKey(AudioSessions) }).annotate({ "description": "Audio while this title runs: which of the sessions on its display hear it.\n`all` is the same as no policy and is stored as none." })
 export type LocalSummary = { readonly "audio_streaming": boolean, readonly "client_name"?: string | null, readonly "conflicts"?: ReadonlyArray<string>, readonly "games"?: ReadonlyArray<string>, readonly "kept_displays": number, readonly "native_paired_clients": number, readonly "paired_clients": number, readonly "pending_approvals": number, readonly "pin_pending": boolean, readonly "session"?: null | { readonly "capture"?: null | { readonly "backend_opened"?: string | null, readonly "class": string, readonly "cooldown_remaining_ms"?: never, readonly "current_stage"?: string | null, readonly "detached": number, readonly "dropped_total": number, readonly "encoder_state"?: string | null, readonly "episodes_suppressed": number, readonly "evidence"?: string | null, readonly "last_episode"?: null | { readonly "consecutive_failures": number, readonly "cooldown_ms": number, readonly "recovered": boolean, readonly "stages": ReadonlyArray<CaptureStage>, readonly "stall_class": string, readonly "took_ms": number }, readonly "late_frames": boolean, readonly "present_to_arrival_ms"?: never, readonly "published_total": number, readonly "source_gap_ms": number, readonly "stall_class"?: string | null }, readonly "fps": number, readonly "height": number, readonly "width": number }, readonly "version": string, readonly "video_streaming": boolean }
 export const LocalSummary = Schema.Struct({ "audio_streaming": Schema.Boolean.annotate({ "description": "True while audio is streaming on either plane (same rule as `video_streaming`)." }), "client_name": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "First native session's display name (trust-store, else connect-time). `null` when idle, nameless, or GameStream." })), "conflicts": Schema.optionalKey(Schema.Array(Schema.String).annotate({ "description": "Other GameStream hosts on this machine, detected at startup. Running one alongside is unsupported." })), "games": Schema.optionalKey(Schema.Array(Schema.String).annotate({ "description": "Compact labels (`Hades`, `Hades (closing in 4:12)`). Countdown means the client is gone and the host will end the game when the window closes." })), "kept_displays": Schema.Number.annotate({ "description": "Lingering or pinned virtual displays with no live session. Active (in-use) displays are not counted.", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "native_paired_clients": Schema.Number.annotate({ "description": "Native-plane pairing count.", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "paired_clients": Schema.Number.annotate({ "description": "GameStream paired-cert count.", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "pending_approvals": Schema.Number.annotate({ "description": "Native pairing knocks awaiting the operator's approval (count only).", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "pin_pending": Schema.Boolean.annotate({ "description": "GameStream pairing is waiting for a PIN." }), "session": Schema.optionalKey(Schema.Union([Schema.Null, Schema.Struct({ "capture": Schema.optionalKey(Schema.Union([Schema.Null, Schema.Struct({ "backend_opened": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "The backend the driver opened: `nvenc` / `amf` / `qsv` / `pyrowave`. Absent as above." })), "class": Schema.String.annotate({ "description": "`healthy` / `idle` / `suspect` / `stalled` / `recovering` / `rebuilding` / `secure_desktop`." }), "cooldown_remaining_ms": Schema.optionalKey(Schema.Never), "current_stage": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "The recovery stage running now, while an episode is open." })), "detached": Schema.Number.annotate({ "description": "Encode threads the driver abandoned after a wedge; two opens the driver cycle.", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "dropped_total": Schema.Number.annotate({ "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "encoder_state": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "The driver encoder's own state word: `closed` / `open` / `encoding` / `wedged`.\nAbsent until the session's first `SET_ENCODE`." })), "episodes_suppressed": Schema.Number.annotate({ "description": "Stalled verdicts refused for budget or cooldown since the last episode.", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "evidence": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "Activity evidence behind the verdict: `input` / `canary`." })), "last_episode": Schema.optionalKey(Schema.Union([Schema.Null, Schema.Struct({ "consecutive_failures": Schema.Number.annotate({ "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "cooldown_ms": Schema.Number.annotate({ "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "recovered": Schema.Boolean, "stages": Schema.Array(CaptureStage).annotate({ "description": "The rungs run, in ladder order." }), "stall_class": Schema.String, "took_ms": Schema.Number.annotate({ "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)) }).annotate({ "description": "The last closed recovery episode." })], { mode: "oneOf" })), "late_frames": Schema.Boolean.annotate({ "description": "`present_to_arrival_ms` is past the classifier's bound: frames come late rather than not\nat all. Reported only — no recovery rung fires on it." }), "present_to_arrival_ms": Schema.optionalKey(Schema.Never), "published_total": Schema.Number.annotate({ "description": "Access units the driver published, and frames it dropped at its encode pool.", "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "source_gap_ms": Schema.Number.annotate({ "description": "Time since the last real source frame.", "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "stall_class": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "When `class` is `stalled`: `worker` / `encoder` / `presentation` / `driver`." })) }).annotate({ "description": "Live capture health (Windows IDD-push, native plane). Absent on GameStream, on Linux,\nand until the video loop's first publish." })], { mode: "oneOf" })), "fps": Schema.Number.annotate({ "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "height": Schema.Number.annotate({ "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "width": Schema.Number.annotate({ "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)) }).annotate({ "description": "GameStream launch if present, else the first live native session. `null` when idle." })], { mode: "oneOf" })), "version": Schema.String.annotate({ "description": "Host version (mirrors `/health`)." }), "video_streaming": Schema.Boolean.annotate({ "description": "Video streaming on either plane. The GameStream flag alone misses native sessions." }) }).annotate({ "description": "Tray snapshot for loopback: counts, booleans, and `client_name`.\nUnauthenticated; `require_auth` admits loopback only (the tray cannot read the bearer file)." })
+export type DecideRequest = { readonly "decision": DecisionInput, readonly "path": string }
+export const DecideRequest = Schema.Struct({ "decision": DecisionInput, "path": Schema.String.annotate({ "description": "The path as it appears in the request or grant list." }) })
 export type SessionSettings = { readonly "disconnect_grace_seconds"?: number, readonly "game_on_new_launch"?: GameOnNewLaunch, readonly "game_on_session_end"?: GameOnSessionEnd, readonly "session_on_game_exit"?: boolean, readonly "version"?: number }
 export const SessionSettings = Schema.Struct({ "disconnect_grace_seconds": Schema.optionalKey(Schema.Number.annotate({ "description": "Ignored unless `game_on_session_end` is `Always`.", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0))), "game_on_new_launch": Schema.optionalKey(GameOnNewLaunch), "game_on_session_end": Schema.optionalKey(GameOnSessionEnd), "session_on_game_exit": Schema.optionalKey(Schema.Boolean), "version": Schema.optionalKey(Schema.Number.annotate({ "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0))) })
 export type LogPage = { readonly "dropped": boolean, readonly "entries": ReadonlyArray<LogEntry>, readonly "next": number }
 export const LogPage = Schema.Struct({ "dropped": Schema.Boolean.annotate({ "description": "Entries between `after` and the first returned one were already evicted." }), "entries": Schema.Array(LogEntry), "next": Schema.Number.annotate({ "description": "Last returned seq, or the request's `after` when the page is empty.", "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)) })
 export type PairingStatus = { readonly "pending": ReadonlyArray<PendingCeremony>, readonly "pin_pending": boolean }
 export const PairingStatus = Schema.Struct({ "pending": Schema.Array(PendingCeremony).annotate({ "description": "Parked ceremonies. Echo this identity in the submit so the PIN addresses the\nceremony the operator saw, not a later arrival." }), "pin_pending": Schema.Boolean }).annotate({ "description": "Pairing-flow status." })
+export type PluginAccessSnapshot = { readonly "denied": ReadonlyArray<string>, readonly "grants": ReadonlyArray<Grant>, readonly "pending": ReadonlyArray<PendingRequest>, readonly "plugin": string }
+export const PluginAccessSnapshot = Schema.Struct({ "denied": Schema.Array(Schema.String), "grants": Schema.Array(Grant), "pending": Schema.Array(PendingRequest), "plugin": Schema.String }).annotate({ "description": "What an API read returns for one plugin: its entry plus its pending rows." })
 export type ClientRef = { readonly "fingerprint"?: string | null, readonly "name": string, readonly "plane": Plane }
 export const ClientRef = Schema.Struct({ "fingerprint": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])), "name": Schema.String.annotate({ "description": "Display name: the trust-store name (a console rename wins), else the name the client\nsent. On the compat plane it is the name the operator gave the device, since Moonlight\nsends none. Empty when there is no name at all." }), "plane": Plane })
 export type DeviceRef = { readonly "fingerprint": string, readonly "name": string, readonly "plane": Plane }
@@ -762,6 +778,42 @@ export type SubmitPairingPin415 = ApiError
 export const SubmitPairingPin415 = ApiError
 export type SubmitPairingPin422 = ApiError
 export const SubmitPairingPin422 = ApiError
+export type GetPluginAccess200 = ReadonlyArray<PluginAccessSnapshot>
+export const GetPluginAccess200 = Schema.Array(PluginAccessSnapshot)
+export type GetPluginAccess401 = ApiError
+export const GetPluginAccess401 = ApiError
+export type GetPluginAccess403 = ApiError
+export const GetPluginAccess403 = ApiError
+export type GetPluginAccessRequests200 = PluginAccessSnapshot
+export const GetPluginAccessRequests200 = PluginAccessSnapshot
+export type GetPluginAccessRequests401 = ApiError
+export const GetPluginAccessRequests401 = ApiError
+export type GetPluginAccessRequests403 = ApiError
+export const GetPluginAccessRequests403 = ApiError
+export type RequestPluginAccessRequestJson = AccessRequest
+export const RequestPluginAccessRequestJson = AccessRequest
+export type RequestPluginAccess200 = ReadonlyArray<AccessPathOutcome>
+export const RequestPluginAccess200 = Schema.Array(AccessPathOutcome)
+export type RequestPluginAccess401 = ApiError
+export const RequestPluginAccess401 = ApiError
+export type RequestPluginAccess403 = ApiError
+export const RequestPluginAccess403 = ApiError
+export type RequestPluginAccess500 = ApiError
+export const RequestPluginAccess500 = ApiError
+export type DecidePluginAccessRequestJson = DecideRequest
+export const DecidePluginAccessRequestJson = DecideRequest
+export type DecidePluginAccess200 = PluginAccessSnapshot
+export const DecidePluginAccess200 = PluginAccessSnapshot
+export type DecidePluginAccess400 = ApiError
+export const DecidePluginAccess400 = ApiError
+export type DecidePluginAccess401 = ApiError
+export const DecidePluginAccess401 = ApiError
+export type DecidePluginAccess403 = ApiError
+export const DecidePluginAccess403 = ApiError
+export type DecidePluginAccess404 = ApiError
+export const DecidePluginAccess404 = ApiError
+export type DecidePluginAccess500 = ApiError
+export const DecidePluginAccess500 = ApiError
 export type ListPlugins200 = ReadonlyArray<PluginSummary>
 export const ListPlugins200 = Schema.Array(PluginSummary)
 export type ListPlugins401 = ApiError
@@ -1668,6 +1720,44 @@ export const make = (
       orElse: unexpectedStatus
     }))
   ),
+    "getPluginAccess": (options) => HttpClientRequest.get(`/api/v1/plugin-access`).pipe(
+    withResponse(options?.config)(HttpClientResponse.matchStatus({
+      "2xx": decodeSuccess(GetPluginAccess200),
+      "401": decodeError("GetPluginAccess401", GetPluginAccess401),
+      "403": decodeError("GetPluginAccess403", GetPluginAccess403),
+      orElse: unexpectedStatus
+    }))
+  ),
+    "getPluginAccessRequests": (options) => HttpClientRequest.get(`/api/v1/plugin-access/requests`).pipe(
+    withResponse(options?.config)(HttpClientResponse.matchStatus({
+      "2xx": decodeSuccess(GetPluginAccessRequests200),
+      "401": decodeError("GetPluginAccessRequests401", GetPluginAccessRequests401),
+      "403": decodeError("GetPluginAccessRequests403", GetPluginAccessRequests403),
+      orElse: unexpectedStatus
+    }))
+  ),
+    "requestPluginAccess": (options) => HttpClientRequest.post(`/api/v1/plugin-access/requests`).pipe(
+    HttpClientRequest.bodyJsonUnsafe(options.payload),
+    withResponse(options.config)(HttpClientResponse.matchStatus({
+      "2xx": decodeSuccess(RequestPluginAccess200),
+      "401": decodeError("RequestPluginAccess401", RequestPluginAccess401),
+      "403": decodeError("RequestPluginAccess403", RequestPluginAccess403),
+      "500": decodeError("RequestPluginAccess500", RequestPluginAccess500),
+      orElse: unexpectedStatus
+    }))
+  ),
+    "decidePluginAccess": (plugin, options) => HttpClientRequest.post(`/api/v1/plugin-access/${plugin}/decide`).pipe(
+    HttpClientRequest.bodyJsonUnsafe(options.payload),
+    withResponse(options.config)(HttpClientResponse.matchStatus({
+      "2xx": decodeSuccess(DecidePluginAccess200),
+      "400": decodeError("DecidePluginAccess400", DecidePluginAccess400),
+      "401": decodeError("DecidePluginAccess401", DecidePluginAccess401),
+      "403": decodeError("DecidePluginAccess403", DecidePluginAccess403),
+      "404": decodeError("DecidePluginAccess404", DecidePluginAccess404),
+      "500": decodeError("DecidePluginAccess500", DecidePluginAccess500),
+      orElse: unexpectedStatus
+    }))
+  ),
     "listPlugins": (options) => HttpClientRequest.get(`/api/v1/plugins`).pipe(
     withResponse(options?.config)(HttpClientResponse.matchStatus({
       "2xx": decodeSuccess(ListPlugins200),
@@ -2354,6 +2444,24 @@ readonly "getPairingStatus": <Config extends OperationConfig>(options: { readonl
 * Completes the out-of-band half of the handshake.
 */
 readonly "submitPairingPin": <Config extends OperationConfig>(options: { readonly payload: typeof SubmitPairingPinRequestJson.Encoded; readonly config?: Config | undefined }) => Effect.Effect<WithOptionalResponse<void, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"SubmitPairingPin400", typeof SubmitPairingPin400.Type> | PunktfunkError<"SubmitPairingPin401", typeof SubmitPairingPin401.Type> | PunktfunkError<"SubmitPairingPin409", typeof SubmitPairingPin409.Type> | PunktfunkError<"SubmitPairingPin415", typeof SubmitPairingPin415.Type> | PunktfunkError<"SubmitPairingPin422", typeof SubmitPairingPin422.Type>>
+  /**
+* Admin lane only: grants, pending requests, and denials across all plugins.
+*/
+readonly "getPluginAccess": <Config extends OperationConfig>(options: { readonly config?: Config | undefined } | undefined) => Effect.Effect<WithOptionalResponse<typeof GetPluginAccess200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"GetPluginAccess401", typeof GetPluginAccess401.Type> | PunktfunkError<"GetPluginAccess403", typeof GetPluginAccess403.Type>>
+  /**
+* Grants, pending requests, and denials for the calling plugin only.
+*/
+readonly "getPluginAccessRequests": <Config extends OperationConfig>(options: { readonly config?: Config | undefined } | undefined) => Effect.Effect<WithOptionalResponse<typeof GetPluginAccessRequests200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"GetPluginAccessRequests401", typeof GetPluginAccessRequests401.Type> | PunktfunkError<"GetPluginAccessRequests403", typeof GetPluginAccessRequests403.Type>>
+  /**
+* Each path is validated against the real filesystem before it becomes a row the operator
+* sees: `granted` (already reachable), `pending`, `denied` (a sticky no), or `refused:<rule>`.
+*/
+readonly "requestPluginAccess": <Config extends OperationConfig>(options: { readonly payload: typeof RequestPluginAccessRequestJson.Encoded; readonly config?: Config | undefined }) => Effect.Effect<WithOptionalResponse<typeof RequestPluginAccess200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"RequestPluginAccess401", typeof RequestPluginAccess401.Type> | PunktfunkError<"RequestPluginAccess403", typeof RequestPluginAccess403.Type> | PunktfunkError<"RequestPluginAccess500", typeof RequestPluginAccess500.Type>>
+  /**
+* `allow` turns a pending request into a grant (the platform ACL lands first, so a failed
+* grant stores nothing); `deny` remembers the no; `forget` removes a grant or denial.
+*/
+readonly "decidePluginAccess": <Config extends OperationConfig>(plugin: string, options: { readonly payload: typeof DecidePluginAccessRequestJson.Encoded; readonly config?: Config | undefined }) => Effect.Effect<WithOptionalResponse<typeof DecidePluginAccess200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"DecidePluginAccess400", typeof DecidePluginAccess400.Type> | PunktfunkError<"DecidePluginAccess401", typeof DecidePluginAccess401.Type> | PunktfunkError<"DecidePluginAccess403", typeof DecidePluginAccess403.Type> | PunktfunkError<"DecidePluginAccess404", typeof DecidePluginAccess404.Type> | PunktfunkError<"DecidePluginAccess500", typeof DecidePluginAccess500.Type>>
   /**
 * Live, secret-free directory. The console fetches the secret separately, server-side.
 */

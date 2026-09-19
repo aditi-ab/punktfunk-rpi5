@@ -76,15 +76,22 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
+    /// What the manifest itself declares: expanded `reads` + `writes`, without operator grants.
+    pub fn declared_roots(&self) -> Vec<PathBuf> {
+        self.reads
+            .iter()
+            .chain(self.writes.iter())
+            .filter_map(|p| expand_home(p))
+            .collect()
+    }
+
     /// Every root this plugin may reach: what it declared, plus what the operator granted it.
     ///
     /// A package cannot know where someone keeps their ROMs or installs their games, so the
     /// grants are how those paths become usable without the package asking for the whole disk.
     pub fn roots(&self) -> Vec<PathBuf> {
-        self.reads
-            .iter()
-            .chain(self.writes.iter())
-            .filter_map(|p| expand_home(p))
+        self.declared_roots()
+            .into_iter()
             .chain(granted_roots(&self.id))
             .collect()
     }
@@ -111,7 +118,7 @@ fn expand_home(p: &str) -> Option<PathBuf> {
     Some(home_dir()?.join(rest))
 }
 
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let key = "USERPROFILE";
     #[cfg(not(windows))]
@@ -147,43 +154,25 @@ pub fn param_ok(kind: ParamKind, value: &str) -> bool {
     }
 }
 
-/// Extra roots the operator granted a plugin, by id: `<config>/plugin-grants.json`.
-///
-/// Written by `punktfunk-host plugins grant`, never by a plugin — the file is the operator's
-/// answer to "this package may also reach here", so nothing in the plugin lane may edit it.
-pub fn granted_roots(id: &str) -> Vec<PathBuf> {
-    let path = pf_paths::config_dir().join("plugin-grants.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    match serde_json::from_str::<BTreeMap<String, Vec<String>>>(&text) {
-        Ok(map) => map
-            .get(id)
-            .map(|paths| paths.iter().filter_map(|p| expand_home(p)).collect())
-            .unwrap_or_default(),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "plugin grants: unreadable");
-            Vec::new()
-        }
-    }
+/// [`granted_roots`] against a chosen store dir, so a test never opens the real config.
+/// `~/` spells in a v1 grant expand through [`expand_home`], the same rule declared roots
+/// follow.
+pub(crate) fn granted_roots_in(id: &str, config_dir: PathBuf) -> Vec<PathBuf> {
+    crate::plugins::access::AccessStore::open(config_dir)
+        .grants_for(id)
+        .into_iter()
+        .filter_map(|g| expand_home(&g.path))
+        .collect()
 }
 
-/// Record `dir` as a root `id` may reach, and report every root it now has.
-pub fn grant_root(id: &str, dir: &Path) -> std::io::Result<Vec<String>> {
-    let path = pf_paths::config_dir().join("plugin-grants.json");
-    let mut map: BTreeMap<String, Vec<String>> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    let entry = map.entry(id.to_string()).or_default();
-    let dir = dir.to_string_lossy().to_string();
-    if !entry.contains(&dir) {
-        entry.push(dir);
-    }
-    let all = entry.clone();
-    let body = serde_json::to_string_pretty(&map).unwrap_or_default();
-    std::fs::write(&path, body)?;
-    Ok(all)
+/// Extra roots the operator granted a plugin, by id: `<config>/plugin-grants.json` via
+/// [`crate::plugins::access::AccessStore`].
+///
+/// Written by `punktfunk-host plugins grant` or an operator's `allow` decision, never by a
+/// plugin — the file is the operator's answer to "this package may also reach here", so
+/// nothing in the plugin lane may edit it.
+pub fn granted_roots(id: &str) -> Vec<PathBuf> {
+    granted_roots_in(id, pf_paths::config_dir())
 }
 
 /// The plugin install root: `<config>/plugins/node_modules`.
@@ -312,6 +301,14 @@ mod manifest_tests {
         assert!(!m.confines(Path::new("/etc/shadow")));
         assert!(!m.confines(Path::new("/games/../etc/shadow")));
         assert!(!m.confines(Path::new("relative/path")));
+    }
+
+    #[test]
+    fn expand_home_roots_only_a_tilde_prefix() {
+        if let Some(home) = home_dir() {
+            assert_eq!(expand_home("~/legacy"), Some(home.join("legacy")));
+            assert_eq!(expand_home("/abs/path"), Some(PathBuf::from("/abs/path")));
+        }
     }
 
     #[test]

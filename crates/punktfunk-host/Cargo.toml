@@ -203,6 +203,8 @@ aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
 # Semver comparisons for the plugin store: `minHost` gating and the revocation list's version
 # ranges (`<0.3.2`). Already in the lockfile transitively.
 semver = "1"
+# RFC3339 timestamps on plugin access grants (`plugins::access`). Std only — no tzdb.
+jiff = { version = "0.2.35", default-features = false, features = ["std"] }
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-axum = "0.2"
 utoipa-scalar = { version = "0.3", features = ["axum"] }

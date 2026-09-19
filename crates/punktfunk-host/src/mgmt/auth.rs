@@ -255,7 +255,8 @@ fn bearer(req: &Request) -> Option<&str> {
 /// (`plugin_lane_classifies_every_route` in `mgmt::tests` fails the build otherwise).
 ///
 /// Out of the list: hooks (operator commands + webhook secrets), `GET /logs` (those secrets
-/// unredacted), pairing admin, UI-proxy credentials, the plugin store, the update surface.
+/// unredacted), pairing admin, UI-proxy credentials, the plugin store, the update surface,
+/// and the access overview/decision routes — a plugin may ask for a folder, never grant one.
 /// Library writes are in because a provider reconciles its own entries; `prep` and
 /// `launch.kind == "command"` are refused in the handlers via [`AuthLane`].
 ///
@@ -324,6 +325,10 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::DELETE, "/api/v1/stats/recordings/{}"),
         (&Method::GET, "/api/v1/plugins"),
         (&Method::POST, "/api/v1/plugins/logs"),
+        // A plugin asks for a folder and reads its own rows; deciding is admin-only, so the
+        // overview and `/plugin-access/{}/decide` are deliberately absent here.
+        (&Method::GET, "/api/v1/plugin-access/requests"),
+        (&Method::POST, "/api/v1/plugin-access/requests"),
         (&Method::PUT, "/api/v1/plugins/{}"),
         (&Method::DELETE, "/api/v1/plugins/{}"),
     ];
