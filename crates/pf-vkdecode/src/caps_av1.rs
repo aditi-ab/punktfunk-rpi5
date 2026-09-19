@@ -633,14 +633,13 @@ mod tests {
             derive_caps_av1(&raw, NV12).unwrap_err(),
             CapsError::NoDecodeMode
         );
+    }
 
-        // Coincide with a layered DPB stays unsupported: the picture pool needs
-        // per-slot images, whatever the codec.
+    #[test]
+    fn an_av1_layered_coincide_device_derives_a_picture_array() {
         let mut raw = coincide_device(vec![entry(NV12, COINCIDE_USAGE)]);
         raw.capability_flags = vk::VideoCapabilityFlagsKHR::empty();
-        assert_eq!(
-            derive_caps_av1(&raw, NV12).unwrap_err(),
-            CapsError::CoincideLayeredDpb
-        );
+        let caps = derive_caps_av1(&raw, NV12).unwrap();
+        assert!(caps.coincide && caps.layered_dpb);
     }
 }

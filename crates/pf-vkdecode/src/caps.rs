@@ -188,8 +188,8 @@ pub struct DecodeCaps {
     /// (half the images).
     pub coincide: bool,
     /// `true` when the driver does not advertise `SEPARATE_REFERENCE_IMAGES`: every
-    /// DPB slot is then a layer of one image array. Otherwise each slot is its own
-    /// image (nothing downstream requires the layered arrangement).
+    /// DPB slot must be a layer of one image array. Distinct mode uses a
+    /// reference-only array; coincide mode makes every picture one layer.
     pub layered_dpb: bool,
     /// Bitstream buffer alignments, floored at 1 so ring math never divides by
     /// a zero an uninitialized fixture would carry.
@@ -257,10 +257,6 @@ pub enum CapsError {
         mode: &'static str,
         format: vk::Format,
     },
-    /// COINCIDE only, plus a layered DPB (no `SEPARATE_REFERENCE_IMAGES`). The
-    /// picture pool rebinds a fresh image per activation, which a fixed layer of
-    /// one array cannot do. A device that also offers DISTINCT never reports this.
-    CoincideLayeredDpb,
 }
 
 impl std::fmt::Display for CapsError {
@@ -305,14 +301,6 @@ impl std::fmt::Display for CapsError {
                 write!(
                     f,
                     "the {mode} {format:?} entry does not allow MUTABLE_FORMAT (per-plane views)"
-                )
-            }
-            CapsError::CoincideLayeredDpb => {
-                write!(
-                    f,
-                    "coincide-only device with a layered DPB (no DPB_AND_OUTPUT_DISTINCT, \
-                     no SEPARATE_REFERENCE_IMAGES) — the picture-pool model needs \
-                     per-slot images; demote this device"
                 )
             }
         }
@@ -416,11 +404,6 @@ pub(crate) fn derive_arrangement(
     // Presenter-facing images need the pool's exact usage plus MUTABLE_FORMAT;
     // distinct DPB needs neither sampling nor plane views.
     let try_coincide = || -> Result<(vk::Format, vk::Format), CapsError> {
-        if layered_dpb {
-            // Picture-pool model needs per-slot images (a slot rebinds a fresh
-            // image at activation); one fixed layer per slot cannot.
-            return Err(CapsError::CoincideLayeredDpb);
-        }
         let mode = "coincide (DPB|DST|SAMPLED)";
         let entry = pick_format(coincide_formats, wanted, mode)?;
         require_usage(&entry, COINCIDE_USAGE, mode)?;
@@ -883,7 +866,8 @@ mod tests {
         assert!(caps.coincide, "coincide wins when both are offered");
     }
 
-    /// NVIDIA on Windows: both modes, no `SEPARATE_REFERENCE_IMAGES`.
+    /// NVIDIA on Windows: both modes, no `SEPARATE_REFERENCE_IMAGES`. A layered
+    /// coincide array is valid; distinct remains the fallback for a bad format.
     #[test]
     fn a_device_whose_coincide_is_unusable_decodes_distinct() {
         let both = vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_COINCIDE
@@ -892,15 +876,12 @@ mod tests {
         raw.decode_flags = both;
         raw.coincide_formats = vec![entry(NV12, COINCIDE_USAGE)];
         let caps = derive_caps(&raw).unwrap();
-        assert!(!caps.coincide && caps.layered_dpb);
+        assert!(caps.coincide && caps.layered_dpb);
 
-        // Per-slot images, but the coincide list lacks the wanted format.
-        let mut raw = radv_like();
-        raw.decode_flags = both;
+        // Same device, but the coincide list lacks the wanted format.
         raw.coincide_formats = vec![entry(P010, COINCIDE_USAGE)];
-        raw.dpb_formats = vec![entry(NV12, DPB_USAGE)];
-        raw.output_formats = vec![entry(NV12, OUTPUT_USAGE)];
-        assert!(!derive_caps(&raw).unwrap().coincide);
+        let caps = derive_caps(&raw).unwrap();
+        assert!(!caps.coincide && caps.layered_dpb);
     }
 
     #[test]
@@ -1045,13 +1026,11 @@ mod tests {
     }
 
     #[test]
-    fn coincide_with_a_layered_dpb_is_unsupported_not_worked_around() {
+    fn coincide_with_a_layered_dpb_uses_one_picture_array() {
         let mut raw = radv_like();
         raw.capability_flags = vk::VideoCapabilityFlagsKHR::empty();
-        assert_eq!(
-            derive_caps(&raw).unwrap_err(),
-            CapsError::CoincideLayeredDpb
-        );
+        let caps = derive_caps(&raw).unwrap();
+        assert!(caps.coincide && caps.layered_dpb);
     }
 
     #[test]

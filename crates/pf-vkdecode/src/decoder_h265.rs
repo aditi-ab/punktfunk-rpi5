@@ -82,8 +82,8 @@ struct SessionStateH265 {
     /// reference. HEVC long-term promotion arrives only via a later picture's
     /// `RefPicSetLtCurr`, so the cache is refreshed from each plan.
     slot_refs: Vec<Option<hh::StdVideoDecodeH265ReferenceInfo>>,
-    /// Coincide mode: pool image currently bound to each DPB slot. Rebound at
-    /// every activation so a delivered image is never a live decode target.
+    /// Coincide mode: pool picture bound to each DPB slot. Rebound at every
+    /// activation so a delivered picture is never a live decode target.
     slot_image: Vec<Option<usize>>,
     /// Per command-buffer completion tokens (reuse gate).
     cmd_marks: Vec<Option<(vk::Semaphore, u64)>>,
@@ -439,7 +439,7 @@ impl VkH265Decoder {
         let submission = state.submitted;
         let cmd_index = (submission % state.ops.cmds.len() as u64) as usize;
         if let Some((sem, value)) = state.cmd_marks[cmd_index] {
-            // SAFETY: live device; the token is a pool image's semaphore.
+            // SAFETY: live device; the token is a pool picture's semaphore.
             unsafe { wait_timeline(self.dev.ash(), sem, value, "command buffer reuse")? };
         }
         let query_index = (submission % u64::from(state.ops.query_count)) as u32;
@@ -624,7 +624,7 @@ impl VkH265Decoder {
     }
 
     /// A display-ready frame beyond the one `decode` returned, if any. Drain
-    /// after every decode; frames left here still occupy pool images.
+    /// after every decode; frames left here still occupy pool pictures.
     pub fn take_ready(&mut self) -> Option<DecodedVkFrame> {
         self.ready.pop_front()
     }
@@ -858,10 +858,10 @@ impl VkH265Decoder {
     /// IRAP instead of erroring on residency nothing can honour.
     ///
     /// Three ledgers must agree and, after a post-planning failure, do not:
-    /// the planner's DPB, this decoder's [`SlotMap`], and the slot→image
+    /// the planner's DPB, this decoder's [`SlotMap`], and the slot→picture
     /// bindings. [`Self::flush`] settles the first (pictures that reached
     /// output are still delivered); [`reset_slot_bindings`] empties the other
-    /// two. Stale bindings' pool images return to free; consumer-held images
+    /// two. Stale bindings' pool pictures return to free; consumer-held pictures
     /// stay pinned by `held`, as across a session rebuild.
     ///
     /// Not a session rebuild: session, pools, and ring are still valid.
@@ -1072,7 +1072,7 @@ impl VkH265Decoder {
             return Ok(());
         };
         if let Some((sem, value)) = state.last_submit {
-            // SAFETY: live device; the token is a pool image's semaphore.
+            // SAFETY: live device; the token is a pool picture's semaphore.
             unsafe { wait_timeline(self.dev.ash(), sem, value, "session drain")? };
         }
         Ok(())
@@ -1112,8 +1112,8 @@ fn profile_key_for(plan: &AuPlan) -> Result<H265ProfileKey, VkDecodeError> {
 }
 
 /// Empty the three per-slot ledgers a recovery resets: DPB residency,
-/// slot→image bindings, and cached per-slot reference info. Returns the pool
-/// image indices the cleared bindings were pinning, for the caller to unbind.
+/// slot→picture bindings, and cached per-slot reference info. Returns the pool
+/// picture indices the cleared bindings were pinning, for the caller to unbind.
 /// Pure over the ledgers so recovery is testable without a device.
 ///
 /// All three empty together: leftover reference info would let [`build_scope`]
@@ -1136,8 +1136,8 @@ pub(crate) fn reset_slot_bindings<S>(
     unbound
 }
 
-/// Picture resource view for DPB `slot`: bound pool image (coincide) or DPB
-/// array layer (distinct).
+/// Picture resource view for DPB `slot`: bound pool picture layer (coincide)
+/// or DPB array layer (distinct).
 fn slot_view(state: &SessionStateH265, slot: u8) -> Option<vk::ImageView> {
     match &state.dpb {
         Some(dpb) => Some(dpb.dpb_view(slot)),
@@ -1265,7 +1265,7 @@ pub(crate) fn build_scope<R: ScopeRef>(
 /// # Safety
 ///
 /// Live device; `state` is the current session generation with `vk_plan` derived
-/// against its `SlotMap`, `dst` a free pool image, the AU resident in `upload`'s
+/// against its `SlotMap`, `dst` a free pool picture, the AU resident in `upload`'s
 /// ring slot, and the command buffer's previous submission completed (caller
 /// waited its mark).
 #[allow(clippy::too_many_arguments)]
@@ -1353,13 +1353,14 @@ unsafe fn record_and_submit_h265(
                 layer_count: 1,
             })
     };
-    let dst_image = state.pool.pictures[dst].image;
+    let dst_picture = &state.pool.pictures[dst];
+    let dst_image = dst_picture.image;
     let mut image_barriers = Vec::new();
     if coincide {
-        // Coincide: dst pool image is the setup DPB picture.
+        // Coincide: dst pool layer is the setup DPB picture.
         image_barriers.push(decode_layer_barrier(
             dst_image,
-            0,
+            dst_picture.layer,
             vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
         ));
     } else {
@@ -1372,7 +1373,7 @@ unsafe fn record_and_submit_h265(
         ));
         image_barriers.push(decode_layer_barrier(
             dst_image,
-            0,
+            dst_picture.layer,
             vk::ImageLayout::VIDEO_DECODE_DST_KHR,
         ));
     }
@@ -1734,7 +1735,7 @@ mod tests {
         assert_eq!(
             unbound,
             vec![7, 8],
-            "the pool images the stale bindings pinned go back on the free list"
+            "the pool pictures the stale bindings pinned go back on the free list"
         );
         assert_eq!(slots.active(), 0, "no picture is DPB-resident any more");
         assert_eq!(
