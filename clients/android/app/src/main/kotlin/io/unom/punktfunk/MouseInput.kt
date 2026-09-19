@@ -51,6 +51,21 @@ fun isMouseSideKey(
 }
 
 /**
+ * Wire scroll source for a MotionEvent's source bitmask (the `isFromSource` shape): a touchpad
+ * measures distance → [ScrollWire.SOURCE_FINGER]; a wheel counts detents →
+ * [ScrollWire.SOURCE_WHEEL], with SOURCE_MOUSE_RELATIVE alongside since a captured mouse reports
+ * it. The touchpad check goes first; anything else is Unknown, priced as a wheel.
+ */
+internal fun wireScrollSource(motionSource: Int): Int = when {
+    motionSource and InputDevice.SOURCE_TOUCHPAD == InputDevice.SOURCE_TOUCHPAD ->
+        ScrollWire.SOURCE_FINGER
+    motionSource and InputDevice.SOURCE_MOUSE == InputDevice.SOURCE_MOUSE ||
+        motionSource and InputDevice.SOURCE_MOUSE_RELATIVE == InputDevice.SOURCE_MOUSE_RELATIVE ->
+        ScrollWire.SOURCE_WHEEL
+    else -> ScrollWire.SOURCE_UNKNOWN
+}
+
+/**
  * Physical mouse → wire, in two modes (the iPadOS/desktop model):
  *  * **uncaptured** (default): hover/drag positions forward as absolute cursor moves
  *    (`MouseMoveAbs`, host-normalized against the window size) — desktop-style pointing. The
@@ -63,15 +78,22 @@ fun isMouseSideKey(
  *    guarantees that); a click re-engages.
  *
  * Buttons ride [MotionEvent.ACTION_BUTTON_PRESS]/RELEASE edges (left/middle/right/back/forward →
- * wire 1/2/3/4/5), the wheel rides [MotionEvent.ACTION_SCROLL] with fractional accumulation so
- * high-resolution wheels don't lose sub-notch travel. Held buttons are tracked and flushed on
- * capture loss / stream exit so nothing sticks on the host. Events reach this class from
- * MainActivity's dispatch overrides (uncaptured) and the capture view's captured-pointer listener.
+ * wire 1/2/3/4/5), the wheel rides [MotionEvent.ACTION_SCROLL] through [ScrollNormalizer] — a
+ * touchpad's measured distance goes out as Finger DIP, a detent-counted wheel as v120, and the
+ * unsent fraction rides the normalizer so high-resolution wheels don't lose sub-notch travel.
+ * Held buttons are tracked and flushed on capture loss / stream exit so nothing sticks on the
+ * host. Events reach this class from MainActivity's dispatch overrides (uncaptured) and the
+ * capture view's captured-pointer listener.
  */
 class MouseForwarder(
     private val handle: Long,
-    private val invertScroll: Boolean,
     private val captureWanted: Boolean,
+    /** `ViewConfiguration.scaledVerticalScrollFactor` — axis units → pixels for a touchpad. */
+    private val scrollFactorV: Float,
+    /** `ViewConfiguration.scaledHorizontalScrollFactor` — same, horizontal. */
+    private val scrollFactorH: Float,
+    /** Display density (px per DIP), pricing a touchpad's distance in device-independent units. */
+    private val density: Float,
     /**
      * The picture's rect in WINDOW coordinates — where the letterboxed video actually sits, which is
      * the frame absolute positions must be measured against. Events arrive from the activity's
@@ -105,10 +127,7 @@ class MouseForwarder(
     private var userReleased = false
 
     private val heldButtons = mutableSetOf<Int>()
-    private var scrollAccV = 0f
-    private var scrollAccH = 0f
-    /** This mouse has reported a sub-detent delta, so it measures distance rather than clicks. */
-    private var preciseWheel = false
+    private val scrollNorm = ScrollNormalizer()
     private var moveAccX = 0f
     private var moveAccY = 0f
 
@@ -156,6 +175,10 @@ class MouseForwarder(
      */
     fun onCapturedPointer(ev: MotionEvent): Boolean {
         if (!pointerGranted) return true // a revocation is racing the release of the grab
+        if (ev.actionMasked == MotionEvent.ACTION_SCROLL && ev.isFromSource(InputDevice.SOURCE_TOUCHPAD)) {
+            wheel(ev)
+            return true
+        }
         if (!ev.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE)) return false
         when (ev.actionMasked) {
             MotionEvent.ACTION_MOVE -> {
@@ -223,25 +246,17 @@ class MouseForwarder(
     }
 
     private fun wheel(ev: MotionEvent) {
-        val dir = if (invertScroll) -1f else 1f
-        // Android: AXIS_VSCROLL + = up/away, AXIS_HSCROLL + = right — the wire's convention too.
-        val rawV = ev.getAxisValue(MotionEvent.AXIS_VSCROLL)
-        val rawH = ev.getAxisValue(MotionEvent.AXIS_HSCROLL)
-        // A notched wheel reports whole detents; anything finer MEASURES distance (trackpad,
-        // high-res wheel). Android names no scroll source, so the fraction is the only tell.
-        // Latched, because one exact 1.0 mid-gesture would inject a whole click and jump the page.
-        if (rawV % 1f != 0f || rawH % 1f != 0f) preciseWheel = true
-        scrollAccV += rawV * 120f * dir
-        scrollAccH += rawH * 120f * dir
-        val v = scrollAccV.toInt()
-        if (v != 0) {
-            NativeBridge.nativeSendScroll(handle, 0, v, preciseWheel)
-            scrollAccV -= v
-        }
-        val h = scrollAccH.toInt()
-        if (h != 0) {
-            NativeBridge.nativeSendScroll(handle, 1, h, preciseWheel)
-            scrollAccH -= h
+        // ACTION_SCROLL carries no gesture boundary, so these always send PHASE_NONE —
+        // inversion is the core's outbound seam, not a sign flip here.
+        scrollNorm.wheel(
+            ev.getAxisValue(MotionEvent.AXIS_VSCROLL).toDouble(),
+            ev.getAxisValue(MotionEvent.AXIS_HSCROLL).toDouble(),
+            wireScrollSource(ev.source),
+            scrollFactorV.toDouble(),
+            scrollFactorH.toDouble(),
+            density.toDouble(),
+        ).forEach {
+            NativeBridge.nativeSendNormalizedScroll(handle, it.axis, it.delta, it.source, it.phase)
         }
     }
 

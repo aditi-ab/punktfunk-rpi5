@@ -121,6 +121,7 @@ mod backends {
             &mut self,
             _kind: super::GamepadPref,
             _ev: &punktfunk_core::input::GamepadEvent,
+            _dev: &Option<std::path::PathBuf>,
         ) -> bool {
             false
         }
@@ -180,13 +181,21 @@ struct Pads {
     xbox360: Option<crate::inject::gamepad::GamepadManager>,
     /// Every other identity, per OS.
     backends: PadBackends,
+    /// Where this session's pads are exposed for its seat's Steam to open them
+    /// (`pf_vdisplay::seat_device_dir`). `None` leaves them where every process of the user
+    /// sees them, which is every host without the seat filter.
+    seat_dev: Option<std::path::PathBuf>,
 }
 
 impl Pads {
     /// Every pad starts on the session kind ([`resolve_gamepad`]) until it declares otherwise.
     /// `id` names the device and the player slot it asked for, so its pads land on the
     /// same OS slots they had last connect ([`crate::inject::pad_pool::PadIdentity`]).
-    fn new(default: GamepadPref, id: crate::inject::pad_pool::PadIdentity) -> Pads {
+    fn new(
+        default: GamepadPref,
+        id: crate::inject::pad_pool::PadIdentity,
+        seat_dev: Option<std::path::PathBuf>,
+    ) -> Pads {
         let default = resolve_pad_kind(default);
         tracing::info!(
             default = default.as_str(),
@@ -203,6 +212,7 @@ impl Pads {
             owner: [None; MAX_WIRE_PADS],
             xbox360: None,
             backends: PadBackends::default(),
+            seat_dev,
         }
     }
 
@@ -394,9 +404,14 @@ impl Pads {
     }
 
     fn route_handle(&mut self, kind: GamepadPref, ev: &punktfunk_core::input::GamepadEvent) {
-        if !self.backends.route_handle(kind, ev) {
+        if !self.backends.route_handle(kind, ev, &self.seat_dev) {
+            let dev = &self.seat_dev;
             self.xbox360
-                .get_or_insert_with(crate::inject::gamepad::GamepadManager::new)
+                .get_or_insert_with(|| {
+                    let mut m = crate::inject::gamepad::GamepadManager::new();
+                    m.expose_in(dev.clone());
+                    m
+                })
                 .handle(ev);
         }
     }
@@ -821,12 +836,15 @@ pub(super) fn input_thread(
     // This session's Controllers-page tap. Every accepted pad state goes here as well
     // as to the backends, so the page shows what was injected. Idle with nobody watching.
     pad_feed: Arc<crate::pad_feed::PadFeed>,
+    // Where this session's pads are exposed so its seat's Steam can open them, and no other
+    // seat's can (`pf_vdisplay::seat_device_dir`). `None` is every host without the filter.
+    seat_dev: Option<std::path::PathBuf>,
     stop: Arc<AtomicBool>,
     // Session gyro totals. This thread is joined after the summary is built, so the
     // per-pad histogram below cannot be what the summary reads.
     counters: Arc<crate::session_status::SessionCounters>,
 ) {
-    let mut pads = Pads::new(gamepad, pad_id);
+    let mut pads = Pads::new(gamepad, pad_id, seat_dev);
     // 0xD1 streamers; `pad_audio_on` is the negotiated Welcome cap.
     let mut pad_streams = PadAudioSlots::new();
     // Per-pad motion cadence, always on. Summarized at `info` on session end.
@@ -1321,7 +1339,7 @@ mod tests {
     #[test]
     fn rich_input_is_re_addressed_into_slot_space() {
         use punktfunk_core::quic::{RichInput, HID_REPORT_MAX};
-        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), None);
         let slot1 = pads.slots.claim_for(1).expect("a free OS slot");
         let slot0 = pads.slots.claim_for(0).expect("a free OS slot");
         assert_ne!(slot0, slot1, "two wire pads share an OS slot");
@@ -1347,7 +1365,7 @@ mod tests {
     /// change. Resent every frame it would be a control message per pad packet.
     #[test]
     fn the_slot_map_is_reported_only_when_it_moves() {
-        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), None);
         assert_eq!(pads.take_slot_change(), None, "no pad, nothing to say");
         let slot = pads.claim_os_slot(0).expect("a free OS slot");
         assert_eq!(pads.take_slot_change(), Some(1 << slot));
@@ -1361,7 +1379,7 @@ mod tests {
     /// first frame would have taken — never a second name for one pad.
     #[test]
     fn an_arrival_reserves_the_slot_the_first_frame_would_claim() {
-        let mut pads = Pads::new(GamepadPref::DualSense, PadIdentity::anonymous());
+        let mut pads = Pads::new(GamepadPref::DualSense, PadIdentity::anonymous(), None);
         let slot = pads.claim_os_slot(1).expect("a free OS slot");
         assert_eq!(pads.slots.claim_for(1), Some(slot), "first frame re-mints");
         assert_eq!(pads.claim_os_slot(1), Some(slot), "re-declare re-mints");
@@ -1409,6 +1427,7 @@ mod tests {
                         punktfunk_core::video_fit::Reframe::default(),
                     )),
                     Arc::new(crate::pad_feed::PadFeed::new()),
+                    None,
                     stop,
                     Arc::new(crate::session_status::SessionCounters::default()),
                 )
@@ -1434,7 +1453,7 @@ mod tests {
     fn a_removed_pad_keeps_its_slot_through_the_unplug_grace() {
         use std::time::{Duration, Instant};
         let t = Instant::now();
-        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), None);
         let slot = pads.slots.claim_for(0).expect("a free OS slot");
         pads.owner[0] = Some(GamepadPref::Xbox360);
         pads.note_removed(0, true, t);

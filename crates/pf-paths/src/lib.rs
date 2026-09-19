@@ -4,6 +4,7 @@
 //! without depending on `gamestream`. Std + `tracing` only.
 //!
 //! [`config_dir`] is XDG / `%ProgramData%`, overridable with `PUNKTFUNK_CONFIG_DIR`.
+//! [`seat_home`] is the XDG data dir a seat's nested Steam runs under.
 //! [`create_private_dir`] / [`create_secret_dir`] / [`write_secret_file`] apply
 //! 0700 / 0600 on Unix and a restrictive DACL on Windows. Secret dirs omit the
 //! `BUILTIN\Users` read grant the config dir needs for the tray.
@@ -27,12 +28,73 @@ pub fn gamescope_ei_socket_file_for(id: &str) -> PathBuf {
     gamescope_ei_relay(&format!("punktfunk-gamescope-{id}-ei"))
 }
 
+/// What a seat device directory is called. [`gamescope_seat_dev_dir`] writes the
+/// name, [`is_gamescope_seat_dev_dir`] reads it, and one spelling serves both:
+/// `pf-inject` takes a node number off a sibling seat by deleting inside it.
+const SEAT_DEV_PREFIX: &str = "punktfunk-gamescope-";
+const SEAT_DEV_SUFFIX: &str = "-dev";
+
+/// `$XDG_RUNTIME_DIR/punktfunk-gamescope-{id}-dev` — the device nodes a sandboxed
+/// seat may open. `hostdev/` is where its sandbox mounts the real `/dev`, so the
+/// links under `input/` and `hidraw/` resolve there and nowhere on this side.
+/// `pf-vdisplay` builds the sandbox, `pf-inject` writes the links; path only, the
+/// caller creates it 0700 ([`create_private_dir`]).
+#[cfg(target_os = "linux")]
+pub fn gamescope_seat_dev_dir(id: &str) -> PathBuf {
+    gamescope_ei_relay(&format!("{SEAT_DEV_PREFIX}{id}{SEAT_DEV_SUFFIX}"))
+}
+
+/// Is this one of our seat device directories? The name is the whole test: another
+/// seat is a directory we made, never one that happens to hold the same folders.
+/// Ungated — `pf-inject` carries the link arithmetic on every target.
+pub fn is_gamescope_seat_dev_dir(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix(SEAT_DEV_PREFIX))
+        .and_then(|n| n.strip_suffix(SEAT_DEV_SUFFIX))
+        .is_some_and(|id| !id.is_empty())
+}
+
 #[cfg(target_os = "linux")]
 fn gamescope_ei_relay(name: &str) -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
         Some(rt) => PathBuf::from(rt).join(name),
         None => PathBuf::from("/tmp").join(name),
     }
+}
+
+/// `$XDG_DATA_HOME/punktfunk/seats` — every seat's home and record. Path only.
+#[cfg(target_os = "linux")]
+pub fn seats_dir() -> PathBuf {
+    data_dir().join("seats")
+}
+
+/// `$XDG_DATA_HOME/punktfunk/seats/<id>` — the `HOME` a seat's nested Steam runs
+/// under (`design/gamescope-multiuser.md` D1). `id` is `pf-vdisplay`'s
+/// `SessionIsolation`. Path only; the caller creates it 0700
+/// ([`create_private_dir`]).
+#[cfg(target_os = "linux")]
+pub fn seat_home(id: &str) -> PathBuf {
+    seats_dir().join(id)
+}
+
+/// `…/seats/<id>.json` — what pre-warming that seat needs, beside its home rather than inside
+/// it: the home is a `HOME` Steam owns, and a file of ours in it is one Steam may clean up.
+#[cfg(target_os = "linux")]
+pub fn seat_record(id: &str) -> PathBuf {
+    seats_dir().join(format!("{id}.json"))
+}
+
+/// `$XDG_DATA_HOME/punktfunk`, else `~/.local/share/punktfunk`. Separate from
+/// [`config_dir`]: a seat home holds a Steam install, not configuration.
+#[cfg(target_os = "linux")]
+fn data_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("punktfunk")
 }
 
 /// Host identity, pairing, mgmt token, library.
@@ -384,6 +446,41 @@ mod tests {
             per.file_name().unwrap().to_str().unwrap(),
             "punktfunk-gamescope-cafe0123-ei"
         );
+        // The device directory is that seat's alone, beside its relay.
+        let dev = gamescope_seat_dev_dir("cafe0123");
+        assert_eq!(dev.parent(), global.parent());
+        assert_ne!(dev, gamescope_seat_dev_dir("dead0001"));
+        // What we write is what we recognise, or a prune reaches somebody else's directory.
+        assert!(is_gamescope_seat_dev_dir(&dev));
+        assert!(!is_gamescope_seat_dev_dir(&per), "the relay is not a seat");
+        for other in [
+            "hidraw",
+            "punktfunk-gamescope--dev",
+            "some-app-dev",
+            "pipewire-0",
+            "",
+        ] {
+            assert!(
+                !is_gamescope_seat_dev_dir(std::path::Path::new(other)),
+                "{other}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seat_home_is_the_data_dir_plus_the_seat_id() {
+        let seat = seat_home("cafe0123");
+        assert!(
+            seat.ends_with("punktfunk/seats/cafe0123"),
+            "{}",
+            seat.display()
+        );
+        assert_ne!(seat, seat_home("anon0"), "two seats never share a home");
+        // The record sits beside the home, never inside the `HOME` Steam owns.
+        let record = seat_record("cafe0123");
+        assert_eq!(record.parent(), seat.parent());
+        assert!(!record.starts_with(&seat), "{}", record.display());
     }
 
     #[test]

@@ -8,7 +8,7 @@ import java.security.MessageDigest
 // On-disk cache for a host's library CATALOG — the list of titles, not their art. The Android
 // mirror of the Apple client's `LibraryCache.swift` and the Rust `pf_client_core::library_cache`.
 //
-// Cover art has been cached by Coil for a while; the catalog behind it never was. Every visit to a
+// Cover art has been cached on disk for a while; the catalog behind it never was. Every visit to a
 // library refetched `GET /api/v1/library` and showed a spinner until that call returned. A host
 // that is asleep, or simply not reachable yet, therefore had an EMPTY library — which is the
 // opposite of what a player wants from the screen they use to decide what to play, and it makes

@@ -199,8 +199,6 @@ export type TokenGrant = { readonly "expires_at": number, readonly "fingerprint"
 export const TokenGrant = Schema.Struct({ "expires_at": Schema.Number.annotate({ "description": "Unix seconds.", "format": "int64" }).check(Schema.isInt()), "fingerprint": Schema.String.annotate({ "description": "The device's own fingerprint, so a client can show which identity it is using." }), "token": Schema.String.annotate({ "description": "Present as `Authorization: Bearer <token>`." }) })
 export type TokenRequest = { readonly "device_key": string, readonly "nonce": string, readonly "signature": string }
 export const TokenRequest = Schema.Struct({ "device_key": Schema.String.annotate({ "description": "Base64 SPKI of the device's P-256 public key — the same bytes it paired with, whose\nSHA-256 the host stored." }), "nonce": Schema.String.annotate({ "description": "The nonce from `challenge`." }), "signature": Schema.String.annotate({ "description": "Base64 ECDSA-P256-SHA256 signature, ASN.1 DER, over the same message the control stream\nuses: context, the host's identity fingerprint, then the nonce." }) }).annotate({ "description": "`POST /auth/device/token` — what a paired browser presents." })
-export type Toplevel = { readonly "app_id": string, readonly "focused": boolean, readonly "fullscreen": boolean, readonly "id": string, readonly "output": string, readonly "pid"?: number, readonly "title": string, readonly "workspace": string }
-export const Toplevel = Schema.Struct({ "app_id": Schema.String.annotate({ "description": "Wayland `app_id`, or the X11 class on an Xwayland window." }), "focused": Schema.Boolean, "fullscreen": Schema.Boolean, "id": Schema.String.annotate({ "description": "Backend handle. Never parsed above the backend, never reused across one." }), "output": Schema.String.annotate({ "description": "The head this window is on — always the streamed one, by construction." }), "pid": Schema.optionalKey(Schema.Number.annotate({ "description": "`None` where the compositor does not report one (some Xwayland cons).", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0))), "title": Schema.String, "workspace": Schema.String.annotate({ "description": "Workspace name as the compositor spells it, not its id." }) }).annotate({ "description": "One compositor toplevel, as every backend reports it.\n\n`id` is the backend's own handle (a Hyprland address, a sway con id) and is\nopaque above this module: it goes back to the backend that minted it and\nnowhere else. Defined on every platform — the management route and its\nschema exist on a Windows host too, which simply lists nothing." })
 export type Topology = "auto" | "extend" | "primary" | "exclusive"
 export const Topology = Schema.Literals(["auto", "extend", "primary", "exclusive"]).annotate({ "description": "Host topology while managed virtual displays are up." })
 export type UiCredential = { readonly "port": number, readonly "secret": string }
@@ -219,8 +217,6 @@ export type UpdateResultInfo = { readonly "error"?: string | null, readonly "fin
 export const UpdateResultInfo = Schema.Struct({ "error": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])), "finished_unix": Schema.Number.annotate({ "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "from": Schema.String, "log_path": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])), "ok": Schema.Boolean, "stage": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "Failed stage; absent on success." })), "staged": Schema.optionalKey(Schema.Boolean.annotate({ "description": "Applied; activates on the next reboot (rpm-ostree)." })), "to": Schema.String }).annotate({ "description": "Last apply outcome. Survives the host's own restart." })
 export type WebTransportInfo = { readonly "allow_pooling": boolean, readonly "cert_hash_sha256": string, readonly "cert_hash_sig"?: string | null, readonly "expires_at": number, readonly "host_cert_der"?: string | null, readonly "port": number }
 export const WebTransportInfo = Schema.Struct({ "allow_pooling": Schema.Boolean.annotate({ "description": "`allowPooling: true` is a `TypeError` when combined with `serverCertificateHashes`, so a\nclient must pass this. Stated here because a browser that ignores it fails at Web PKI\nvalidation with no useful error." }), "cert_hash_sha256": Schema.String.annotate({ "description": "Lowercase hex SHA-256 of the leaf certificate DER — the bytes that go in\n`serverCertificateHashes[0].value`." }), "cert_hash_sig": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "Hex ECDSA-P256-SHA256 signature (ASN.1 DER) by the host's long-lived native identity over\n`\"punktfunk-wt-cert-v1:\" + cert_hash_sha256`. Absent when that identity is the legacy RSA\npair. A browser that has paired MUST check this; one that has not cannot, and does not." })), "expires_at": Schema.Number.annotate({ "description": "Unix seconds. Past this the certificate has rotated and the hash above is stale; fetch\nagain rather than cache. Always under two weeks out — the spec refuses anything longer.", "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), "host_cert_der": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "Base64 DER of the native identity's leaf certificate — the key that verifies\n`cert_hash_sig`. A browser hashes it and compares with the fingerprint it stored at\npairing; trusting it without that check would defeat the whole exercise." })), "port": Schema.Number.annotate({ "description": "UDP port the plane listens on. Not the management port, and not the native plane's.", "format": "int32" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)) }).annotate({ "description": "Everything `new WebTransport(url, { serverCertificateHashes })` needs." })
-export type WindowActionRequest = { readonly "action": "focus" | "fullscreen" | "close" }
-export const WindowActionRequest = Schema.Struct({ "action": Schema.Literals(["focus", "fullscreen", "close"]).annotate({ "description": "`focus` | `fullscreen` | `close`." }) })
 export type WorkspacePlacement = "own" | "current"
 export const WorkspacePlacement = Schema.Literals(["own", "current"]).annotate({ "description": "Where a library launch's windows open on the streamed head.\n\nDefault `own`: the player gets the game on an empty workspace instead of\nthe operator's desk. Honoured only by the backends that can place a launch\n(`claim_workspace`); everywhere else a launch is always `current`.\n\n[`DisplayPolicy`] field, not part of [`EffectivePolicy`]: a preset never\nclobbers it. A library entry's own `on_window.workspace` outranks it." })
 export type ActionList = { readonly "actions": ReadonlyArray<ActionInfo> }
@@ -856,22 +852,6 @@ export type SetSessionPlayer401 = ApiError
 export const SetSessionPlayer401 = ApiError
 export type SetSessionPlayer404 = ApiError
 export const SetSessionPlayer404 = ApiError
-export type GetSessionWindows200 = ReadonlyArray<Toplevel>
-export const GetSessionWindows200 = Schema.Array(Toplevel)
-export type GetSessionWindows401 = ApiError
-export const GetSessionWindows401 = ApiError
-export type GetSessionWindows404 = ApiError
-export const GetSessionWindows404 = ApiError
-export type ActOnSessionWindowRequestJson = WindowActionRequest
-export const ActOnSessionWindowRequestJson = WindowActionRequest
-export type ActOnSessionWindow401 = ApiError
-export const ActOnSessionWindow401 = ApiError
-export type ActOnSessionWindow403 = ApiError
-export const ActOnSessionWindow403 = ApiError
-export type ActOnSessionWindow404 = ApiError
-export const ActOnSessionWindow404 = ApiError
-export type ActOnSessionWindow502 = ApiError
-export const ActOnSessionWindow502 = ApiError
 export type StatsCaptureLive200 = Capture
 export const StatsCaptureLive200 = Capture
 export type StatsCaptureLive401 = ApiError
@@ -1823,25 +1803,6 @@ export const make = (
       orElse: unexpectedStatus
     }))
   ),
-    "getSessionWindows": (id, options) => HttpClientRequest.get(`/api/v1/session/${id}/windows`).pipe(
-    withResponse(options?.config)(HttpClientResponse.matchStatus({
-      "2xx": decodeSuccess(GetSessionWindows200),
-      "401": decodeError("GetSessionWindows401", GetSessionWindows401),
-      "404": decodeError("GetSessionWindows404", GetSessionWindows404),
-      orElse: unexpectedStatus
-    }))
-  ),
-    "actOnSessionWindow": (id, window, options) => HttpClientRequest.post(`/api/v1/session/${id}/windows/${window}`).pipe(
-    HttpClientRequest.bodyJsonUnsafe(options.payload),
-    withResponse(options.config)(HttpClientResponse.matchStatus({
-      "401": decodeError("ActOnSessionWindow401", ActOnSessionWindow401),
-      "403": decodeError("ActOnSessionWindow403", ActOnSessionWindow403),
-      "404": decodeError("ActOnSessionWindow404", ActOnSessionWindow404),
-      "502": decodeError("ActOnSessionWindow502", ActOnSessionWindow502),
-      "204": () => Effect.void,
-      orElse: unexpectedStatus
-    }))
-  ),
     "statsCaptureLive": (options) => HttpClientRequest.get(`/api/v1/stats/capture/live`).pipe(
     withResponse(options?.config)(HttpClientResponse.matchStatus({
       "2xx": decodeSuccess(StatsCaptureLive200),
@@ -2467,8 +2428,8 @@ readonly "requestSessionIdr": <Config extends OperationConfig>(id: string, optio
 * instead of an evdev dump. `data:` is a [`PadFrame`]; `event:` is `pad.state`.
 * Attaching replays every live pad, so a button already held draws at once.
 * 
-* Console lane only, like the window routes: a paired certificate is not bound to
-* a session id, and this is the operator's own machine watching its own input.
+* Console lane only: a paired certificate is not bound to a session id, and this
+* is the operator's own machine watching its own input.
 * 
 * Nothing is published while nobody is attached, so a console on another page —
 * or none at all — costs the input thread one atomic load per pad event.
@@ -2480,8 +2441,8 @@ readonly "streamSessionPads": <Config extends OperationConfig>(id: string, optio
 * instead of an evdev dump. `data:` is a [`PadFrame`]; `event:` is `pad.state`.
 * Attaching replays every live pad, so a button already held draws at once.
 * 
-* Console lane only, like the window routes: a paired certificate is not bound to
-* a session id, and this is the operator's own machine watching its own input.
+* Console lane only: a paired certificate is not bound to a session id, and this
+* is the operator's own machine watching its own input.
 * 
 * Nothing is published while nobody is attached, so a console on another page —
 * or none at all — costs the input thread one atomic load per pad event.
@@ -2499,21 +2460,6 @@ readonly "streamSessionPadsSse": (id: string) => Stream.Stream<{ readonly event:
 * anonymous session's pick lasts only as long as the session.
 */
 readonly "setSessionPlayer": <Config extends OperationConfig>(id: string, options: { readonly payload: typeof SetSessionPlayerRequestJson.Encoded; readonly config?: Config | undefined }) => Effect.Effect<WithOptionalResponse<typeof SetSessionPlayer200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"SetSessionPlayer400", typeof SetSessionPlayer400.Type> | PunktfunkError<"SetSessionPlayer401", typeof SetSessionPlayer401.Type> | PunktfunkError<"SetSessionPlayer404", typeof SetSessionPlayer404.Type>>
-  /**
-* The toplevels on the head this session streams, so a client in a full-screen
-* game can see what is behind it. Free to every session: those windows are
-* already in the pixels it receives. The operator's other monitors are not in
-* the payload, whatever the caller's access.
-*/
-readonly "getSessionWindows": <Config extends OperationConfig>(id: string, options: { readonly config?: Config | undefined } | undefined) => Effect.Effect<WithOptionalResponse<typeof GetSessionWindows200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"GetSessionWindows401", typeof GetSessionWindows401.Type> | PunktfunkError<"GetSessionWindows404", typeof GetSessionWindows404.Type>>
-  /**
-* Focus, full-screen or close by id, gated on the session's LIVE grants — the
-* same mask the input thread checks every event against. A view-only guest is
-* refused all three; a controller-only guest raises a window but never closes
-* one. An id this session's head does not currently hold is a 404, so a stale
-* id cannot act on whatever now answers to it.
-*/
-readonly "actOnSessionWindow": <Config extends OperationConfig>(id: string, window: string, options: { readonly payload: typeof ActOnSessionWindowRequestJson.Encoded; readonly config?: Config | undefined }) => Effect.Effect<WithOptionalResponse<void, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"ActOnSessionWindow401", typeof ActOnSessionWindow401.Type> | PunktfunkError<"ActOnSessionWindow403", typeof ActOnSessionWindow403.Type> | PunktfunkError<"ActOnSessionWindow404", typeof ActOnSessionWindow404.Type> | PunktfunkError<"ActOnSessionWindow502", typeof ActOnSessionWindow502.Type>>
   readonly "statsCaptureLive": <Config extends OperationConfig>(options: { readonly config?: Config | undefined } | undefined) => Effect.Effect<WithOptionalResponse<typeof StatsCaptureLive200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"StatsCaptureLive401", typeof StatsCaptureLive401.Type> | PunktfunkError<"StatsCaptureLive404", typeof StatsCaptureLive404.Type>>
   /**
 * Streaming loops emit aggregated samples every 1–2 s into the in-progress

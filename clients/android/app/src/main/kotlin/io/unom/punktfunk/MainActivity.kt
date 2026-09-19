@@ -931,7 +931,9 @@ class MainActivity : ComponentActivity() {
         if (streamHandle != 0L) {
             if (gamepadRouter?.onMotion(event) == true) return true
             // Physical mouse (uncaptured): hover motion, wheel, button edges.
-            if (event.isFromSource(InputDevice.SOURCE_MOUSE)) {
+            if (event.isFromSource(InputDevice.SOURCE_MOUSE) ||
+                (event.actionMasked == MotionEvent.ACTION_SCROLL && event.isFromSource(InputDevice.SOURCE_TOUCHPAD))
+            ) {
                 mouseForwarder?.let { if (it.onGenericMotion(event)) return true }
             }
             return super.dispatchGenericMotionEvent(event)

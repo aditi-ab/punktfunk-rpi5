@@ -8,6 +8,7 @@
 //! operator's physical display, never the session head.
 
 use super::{gs_button_to_evdev, vk_to_evdev, InputEvent, InputInjector};
+use crate::scroll::{AxisSource, ScrollBackend, ScrollMapper, ScrollOp};
 use anyhow::{bail, Context, Result};
 use punktfunk_core::input::{InputKind, PRECISE_PX_PER_DETENT, SCROLL_FLAG_PRECISE};
 use std::io::Write;
@@ -170,6 +171,9 @@ pub struct WlrootsInjector {
     /// time; holding the remainder makes them add up into real clicks instead. Integer, because
     /// a float store drifts — ten 0.1 detents sum to 0.9999999999999999 and never fire.
     wheel_rem: (i32, i32),
+    /// Normalized-scroll lowering; its sub-detent residue is per axis AND source,
+    /// so it never mixes with the legacy `wheel_rem` store.
+    scroll: ScrollMapper,
 }
 
 fn resolve_target(globals: &Globals) -> (Option<WlOutput>, Option<String>) {
@@ -286,6 +290,7 @@ impl WlrootsInjector {
             _keymap_file: file,
             text: None,
             wheel_rem: (0, 0),
+            scroll: ScrollMapper::new(ScrollBackend::Wlr),
         })
     }
 
@@ -413,6 +418,61 @@ impl WlrootsInjector {
         let group = self.xkb_state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
         self.keyboard.modifiers(depressed, latched, locked, group);
     }
+
+    /// Execute a normalized-scroll plan: `axis_source` ahead of the axis ops it
+    /// describes, `axis_stop` closing a gesture, `frame` the boundaries the
+    /// plan drew. `axis_stop` cannot tell a cancel from an end — the protocol
+    /// has no flag for it.
+    fn emit_scroll_ops(&mut self, t: u32, ops: Vec<ScrollOp>) {
+        let axis = |horizontal: bool| {
+            if horizontal {
+                wl_pointer::Axis::HorizontalScroll
+            } else {
+                wl_pointer::Axis::VerticalScroll
+            }
+        };
+        for op in ops {
+            match op {
+                ScrollOp::AxisSource(src) => {
+                    self.pointer.axis_source(match src {
+                        AxisSource::Wheel => wl_pointer::AxisSource::Wheel,
+                        AxisSource::Finger => wl_pointer::AxisSource::Finger,
+                        AxisSource::Continuous => wl_pointer::AxisSource::Continuous,
+                    });
+                }
+                ScrollOp::Continuous { horizontal, value } => {
+                    self.pointer.axis(t, axis(horizontal), value);
+                }
+                ScrollOp::DiscreteDetents {
+                    horizontal,
+                    value,
+                    detents,
+                } => {
+                    self.pointer
+                        .axis_discrete(t, axis(horizontal), value, detents);
+                }
+                ScrollOp::Stop { horizontal, .. } => {
+                    self.pointer.axis_stop(t, axis(horizontal));
+                }
+                ScrollOp::Frame => self.pointer.frame(),
+                // ei/Win32 vocabulary; a wlr plan never emits it.
+                ScrollOp::Discrete120 { .. } => {}
+            }
+        }
+    }
+}
+
+impl Drop for WlrootsInjector {
+    fn drop(&mut self) {
+        // A gesture still open ends cancelled, or the compositor keeps the
+        // axis interaction alive past the virtual pointer's destroy.
+        let ops = self.scroll.cancel_all();
+        if !ops.is_empty() {
+            let t = self.now_ms();
+            self.emit_scroll_ops(t, ops);
+            let _ = self.conn.flush();
+        }
+    }
 }
 
 impl InputInjector for WlrootsInjector {
@@ -490,6 +550,13 @@ impl InputInjector for WlrootsInjector {
                         .axis_discrete(t, axis, f64::from(steps) * 15.0, steps);
                 }
                 self.pointer.frame();
+            }
+            // Normalized scroll lowers through the shared mapper; its Frame
+            // ops draw the frame boundaries (a stop never shares one with a
+            // delta).
+            InputKind::Scroll => {
+                let ops = self.scroll.plan(event);
+                self.emit_scroll_ops(t, ops);
             }
             InputKind::KeyDown | InputKind::KeyUp => {
                 let down = event.kind == InputKind::KeyDown;

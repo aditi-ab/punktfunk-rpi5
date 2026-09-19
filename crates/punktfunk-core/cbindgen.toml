@@ -29,16 +29,31 @@ exclude = [
     "sendmmsg",
     "recvmmsg",
     "SOFT_LIMIT_KNEE",
+    # Normalized-scroll machinery that stays Rust-internal: the quantizer, the
+    # outbound seam, the unit marker and the decoded view. C embedders pack an
+    # InputEvent by hand from ScrollSource/ScrollPhase + PUNKTFUNK_SCROLL_SCALE.
+    "ScrollAccumulator",
+    "ScrollOutput",
+    "ScrollUnits",
+    "ScrollEvent",
+    # The `abi.rs` mirror `PUNKTFUNK_HOST_CAP2_SCROLL` already emits the
+    # constant; exporting the core one too would duplicate the `#define`.
+    "HOST_CAP2_SCROLL",
 ]
 # Reached by no exported SIGNATURE, so cbindgen's sweep misses it — but a C embedder needs the
 # vocabulary: `punktfunk_connection_end_reason` writes one of these as a bare byte (deliberately,
 # so the JNI/Swift sides can marshal a `u8` rather than an enum), which without this would leave
 # the header documenting names it never defines.
-include = ["PunktfunkEndReason"]
+# `ScrollSource`/`ScrollPhase` are reached by no exported signature either — an embedder
+# packs a normalized scroll event by hand (kind SCROLL, flags = source | phase << 8) and
+# needs the named vocabulary, same case as PunktfunkEndReason above.
+include = ["PunktfunkEndReason", "ScrollSource", "ScrollPhase"]
 
 [export.rename]
 "InputEvent" = "PunktfunkInputEvent"
 "InputKind" = "PunktfunkInputKind"
+"ScrollSource" = "PunktfunkScrollSource"
+"ScrollPhase" = "PunktfunkScrollPhase"
 # Gamepad wire constants: bare BTN_* names collide with <linux/input-event-codes.h> (at
 # DIFFERENT values — last definition silently wins); prefix everything we export.
 "BTN_DPAD_UP" = "PUNKTFUNK_BTN_DPAD_UP"
@@ -287,6 +302,8 @@ include = ["PunktfunkEndReason"]
 "RUMBLE_V1_LEN" = "PUNKTFUNK_RUMBLE_V1_LEN"
 "RUMBLE_V2_LEN" = "PUNKTFUNK_RUMBLE_V2_LEN"
 "RUMBLE_V3_LEN" = "PUNKTFUNK_RUMBLE_V3_LEN"
+"SCROLL_SCALE" = "PUNKTFUNK_SCROLL_SCALE"
+"SCROLL_DIP_PER_DETENT" = "PUNKTFUNK_SCROLL_DIP_PER_DETENT"
 "SETUP_FAILED_CLOSE_CODE" = "PUNKTFUNK_SETUP_FAILED_CLOSE_CODE"
 "TAG_LEN" = "PUNKTFUNK_TAG_LEN"
 "TRIGGER_EFFECT_MAX" = "PUNKTFUNK_TRIGGER_EFFECT_MAX"

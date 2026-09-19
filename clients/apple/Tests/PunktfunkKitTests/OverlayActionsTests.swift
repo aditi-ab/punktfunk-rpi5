@@ -74,19 +74,21 @@ final class OverlayActionsTests: XCTestCase {
         XCTAssertTrue(sparse.contains(#""rs":{"x":0.5}"#), "absent fields stay absent: \(sparse)")
     }
 
-    func testKeyNamesMapToWindowsVKs() {
-        XCTAssertEqual(keyVk("ctrl"), 0x11)
-        XCTAssertEqual(keyVk("Shift"), 0x10)
-        XCTAssertEqual(keyVk("escape"), 0x1B)
-        XCTAssertEqual(keyVk("tab"), 0x09)
-        XCTAssertEqual(keyVk("a"), 0x41)
-        XCTAssertEqual(keyVk("z"), 0x5A)
-        XCTAssertEqual(keyVk("0"), 0x30)
-        XCTAssertEqual(keyVk("f1"), 0x70)
-        XCTAssertEqual(keyVk("f12"), 0x7B)
-        XCTAssertNil(keyVk("f25"))
-        XCTAssertNil(keyVk("hyper"))
-        XCTAssertNil(keyVk(""))
+    /// Every case Rust's `key_vk` wrote, read from the repo: five levels up from this file is
+    /// the root.
+    func testKeyVkMatchesTheRustVectors() throws {
+        var url = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { url.deleteLastPathComponent() }
+        url.appendPathComponent("crates/punktfunk-core/testdata/key-vk-vectors.json")
+        let cases = try JSONDecoder().decode(KeyVkVectors.self, from: Data(contentsOf: url)).cases
+        XCTAssertFalse(cases.isEmpty)
+        let wrong = cases.filter { keyVk($0.name) != $0.vk }.map {
+            "\($0.name.debugDescription): Rust \($0.vk as Any), Swift \(keyVk($0.name) as Any)"
+        }
+        XCTAssertTrue(wrong.isEmpty, wrong.joined(separator: "\n"))
+    }
+
+    func testChordLegends() {
         XCTAssertEqual(chordChip(["ctrl", "shift", "escape"]), "Ctrl+Shift+Esc")
         XCTAssertEqual(keyLegend("win"), "Win")
         XCTAssertEqual(keyLegend("pageup"), "PgUp")
@@ -124,4 +126,13 @@ extension OverlayActionsTests {
         XCTAssertTrue(cfg.shortcuts.isEmpty)
         XCTAssertNil(cfg.ring[5], "the slot that sent it is empty")
     }
+}
+
+private struct KeyVkCase: Decodable {
+    let name: String
+    let vk: UInt32?
+}
+
+private struct KeyVkVectors: Decodable {
+    let cases: [KeyVkCase]
 }

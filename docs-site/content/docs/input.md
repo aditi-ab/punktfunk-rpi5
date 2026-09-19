@@ -196,6 +196,55 @@ drawing it into the video, the Linux and Windows clients flip to relative motion
 an app on the host grabs or hides the pointer, then back when it lets go. Using the chord yourself
 overrides that until the host's intent next changes. The macOS client ignores the signal on purpose.
 
+## Scrolling
+
+Scroll events identify their source and, when available, gesture begin, update, end,
+cancel and momentum phases. Wheels (including high-resolution wheels) use **v120**:
+120 units per notch. Touchpad, touchscreen, continuous-surface and controller distances
+use density-independent **DIP**. Both units carry 1/256 fractions on the wire.
+An unknown source uses v120, never a fraction-based guess or a session-wide latch.
+
+The host maps each event once. Positive wire deltas mean up or right; Wayland backends
+reverse the vertical sign. The following table gives magnitudes:
+
+| Host backend | Wheel / unknown | Continuous distance | Gesture handling |
+|---|---|---|---|
+| libei (portal / Mutter) | v120 discrete plus 15 axis units per notch | DIP directly | `scroll_stop`; finger/touch end permits host kinetic scrolling |
+| wlroots virtual pointer | whole notches plus 15 axis units per notch | DIP directly, with finger or continuous source | `axis_stop`; no separate cancel primitive |
+| gamescope | v120 discrete | DIP × 120/60 | no stop primitive; client momentum is forwarded |
+| KWin fake input | v120 × 10/120 axis units | DIP × 10/60 axis units | no stop primitive; client momentum is forwarded |
+| Windows SendInput | v120 wheel units | DIP × 120/60 wheel units | no stop primitive; client momentum is forwarded |
+
+libei and wlroots discard client finger/touch momentum after handing the gesture to
+the host. Continuous-source momentum is forwarded instead. libei ends controller and
+continuous gestures with cancellation to avoid a second kinetic tail. Applications
+choose whether to glide; native wheel preferences and app behavior still affect distance.
+The 60-DIP conversion is a nominal wheel fallback, not a pixel-equality guarantee.
+
+Compatibility is negotiated. Existing `MouseScroll` events keep their original meaning.
+For an older host, new events convert once to the legacy wheel/precise format; gesture
+phases cannot survive that conversion. **Invert scroll direction** is applied once in
+the shared outbound path, including controller mouse. Open the quick-action ring's centre
+sheet and choose **Input → Invert scroll direction** to change it during a stream.
+The control needs pointer permission and changes only that session. Saved defaults and
+presets stay unchanged; the next session starts from its resolved settings.
+
+Platform limits:
+
+- **SDL fallback:** without native source information (including Windows), detent deltas
+  become Unknown v120 at ×120. A fractional wheel delta never changes later events' source.
+- **Wayland capture:** native `value120` wins over discrete and continuous copies. Without
+  counts, wheel/unknown axis values use the fixed 15-axis-units-per-notch approximation.
+  Seats older than v5 retain the SDL fallback. The wlroots host protocol accumulates wheel
+  fractions until a whole notch; its continuous scrolling does not have that restriction.
+- **Android:** hardware `ACTION_SCROLL` has no gesture end. Touchpad distance uses native
+  scroll factors divided by density; touchscreen pans carry gesture boundaries.
+- **iPhone/iPad:** UIKit's discrete recognizer provides translated points, not recoverable
+  wheel counts, so that fallback is continuous DIP. Under pointer lock an attached GCMouse
+  supplies raw wheel counts instead. Its raw API does not supply UIKit's natural-scroll sign.
+
+No additional scroll settings are required.
+
 ## Touch modes
 
 On a touchscreen client the **Touch input** setting picks one of three models. All three exist on
@@ -289,51 +338,6 @@ Select stays with the dial, so **Select+A** still opens it. Pointer speed follow
 resolution, so it feels the same at 1080p and 4K. For a combination the table lacks, such as
 Alt+F4, add a shortcut to the dial. The button is dimmed when no controller is connected, or when
 the host lets this device send controller input only.
-
-#### Chords
-
-A **chord** is a set of controller buttons that sends a keyboard shortcut. Hold **RB** and press
-**B** and the host gets Alt+F4; nothing sends B's own Escape, because while every button of a chord
-is down none of them acts on its own. Each chord picks when it fires:
-
-| Fires | |
-|---|---|
-| On press | The moment the last button of the chord goes down |
-| On a tap | On release, if you held it for less than the long-press time |
-| On a hold | Once, when you reach the long-press time |
-| Held | The keys go down at the long-press time and stay down until you let the chord go |
-
-The same buttons can carry a tap chord and a hold chord at once — that is how **RB+B** closes a
-window on a tap and force-quits it on a hold. **Held** is the one for desktop work: put Super on a
-bumper, hold it and push the left stick to drag a window where you want it. A button borrowed by a
-chord you did not hold long enough still sends what it normally sends, so a bumper can be Ctrl on a
-tap and Super on a hold.
-
-#### Customising the layout
-
-Every button above is a starting point, not a fixed wiring. The whole table — which button sends
-what, the chords, pointer and scroll speed, the stick deadzone and the long-press time — is one
-document your client hands to the host:
-
-```json
-{
-  "settings": { "pointer": 1.0, "scroll": 1.0, "deadzone": 0.2, "long_press_ms": 400 },
-  "buttons": { "A": "mouse:left", "RT": "key:Meta", "B": "key:Escape" },
-  "chords": [
-    { "name": "Close window", "buttons": ["RB", "B"], "press": "short", "keys": ["Alt", "F4"] }
-  ]
-}
-```
-
-Buttons are named `A B X Y LB RB LT RT LS RS Guide Start Back Up Down Left Right`. An output is
-`mouse:left`, `mouse:middle`, `mouse:right`, or `key:` and a key name — the same names the dial's
-shortcut editor takes, so `key:Escape`, `key:F4` and `key:Meta` all work. `press` is `any`, `short`,
-`long` or `hold`, matching the table above. `pointer` and `scroll` multiply the shipped speeds, so
-`2.0` is twice as fast. Two buttons may share one output: `A` and `RT` both send the left click, and
-holding either keeps it down.
-
-A change takes effect the next time you switch that controller into Controller mouse — a drag in
-progress is never re-wired under your thumb — and clearing the layout puts the shipped table back.
 
 ### Virtual controller
 

@@ -65,6 +65,12 @@ Do not add a player-facing setting without the maintainer's yes. First make it a
 the OS, or fix the detection. Automatic means automatic; never override what the player picked.
 Rules and examples: `docs/settings.md`.
 
+## Feature requests
+
+New features do not belong on `git.unom.io`. Discuss a feature, a design proposal or a
+"which way should this go" question with the maintainer first — no issue, no PR. The tracker
+holds bugs and work the maintainer has already agreed to.
+
 ## Agent skills
 
 Project SKILL.md files live in `.agents/skills/`. A harness that only
@@ -86,3 +92,15 @@ See `docs/agents/triage-labels.md`.
 
 Single-context: one `CONTEXT.md` and one `docs/adr/` at the repo root, covering the whole
 workspace. See `docs/agents/domain.md`.
+
+## Scroll verification
+
+- `cargo test -p punktfunk-core --features quic scroll` checks wire and compatibility.
+- `cargo test -p pf-inject --lib scroll` checks the production host mapping plans on any OS.
+- `cargo test -p pf-presenter --no-default-features` runs pure touch and scroll tests on macOS;
+  it does not compile the Linux/Windows presenter or injector implementations.
+- `swift test --package-path clients/apple --filter ScrollCaptureTests` needs an ABI-matched,
+  signed XCFramework. Its packaged header must define `PUNKTFUNK_FEATURE_QUIC`.
+- Scope ripwire source reviews with `--exclude=clients/apple/.build`
+  `--exclude=clients/apple/PunktfunkCore.xcframework`; downloaded sources and packaged headers
+  otherwise pollute the symbol graph and clone findings.

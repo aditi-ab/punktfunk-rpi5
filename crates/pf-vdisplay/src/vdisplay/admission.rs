@@ -213,6 +213,16 @@ pub fn register(
     LiveGuard { id }
 }
 
+/// Is this identity streaming right now? Asked before the host pre-warms that seat: a live
+/// session already owns its planes, and a second compositor under the same id fights for them.
+pub fn has_live_session(identity: [u8; 32]) -> bool {
+    table()
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| same_client(s.identity, Some(identity)))
+}
+
 pub struct LiveGuard {
     id: u64,
 }

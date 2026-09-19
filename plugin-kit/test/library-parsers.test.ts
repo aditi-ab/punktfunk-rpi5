@@ -30,6 +30,7 @@ import {
 	readTextCapped,
 	shortcutAppId,
 	shortcutGameId,
+	spawnAgainIfKilled,
 	steamCdnUrl,
 	vdfPaths,
 	vdfValue,
@@ -366,6 +367,23 @@ describe("reg.exe output", () => {
 			},
 			{ name: "Language", type: "REG_SZ", data: "english" },
 		]);
+	});
+
+	test("a killed spawn runs once more; an exit of any code is final", () => {
+		// `status: null` is a kill (the misfired timeout). Exit 1 is reg.exe's "no such key".
+		const scripted = (...statuses: (number | null)[]) => {
+			const seen: (number | null)[] = [];
+			const last = spawnAgainIfKilled(() => {
+				const status = statuses[seen.length] ?? null;
+				seen.push(status);
+				return { status };
+			});
+			return { status: last.status, spawns: seen.length };
+		};
+		expect(scripted(null, 0)).toEqual({ status: 0, spawns: 2 });
+		expect(scripted(1)).toEqual({ status: 1, spawns: 1 });
+		// A real hang is killed twice and still reads as failed: bounded, never a loop.
+		expect(scripted(null, null, 0)).toEqual({ status: null, spawns: 2 });
 	});
 });
 

@@ -1175,6 +1175,9 @@ pub enum LaunchOutcomeKind {
     Refused = 3,
     /// Started and gone within seconds, with nothing left that looks like the game.
     Failed = 4,
+    /// Handed to a Steam that has no account: the stream shows its sign-in
+    /// screen, and the player plays once they are through it.
+    SignInNeeded = 5,
 }
 
 impl LaunchOutcomeKind {
@@ -1184,6 +1187,7 @@ impl LaunchOutcomeKind {
             2 => Self::AdoptedUnknown,
             3 => Self::Refused,
             4 => Self::Failed,
+            5 => Self::SignInNeeded,
             _ => Self::Spawned,
         }
     }
@@ -1195,13 +1199,17 @@ impl LaunchOutcomeKind {
             Self::AdoptedUnknown => "adopted-unknown",
             Self::Refused => "refused",
             Self::Failed => "failed",
+            Self::SignInNeeded => "sign-in-needed",
         }
     }
 
     /// Did the player get the game they asked for? `false` is what a client
     /// turns into a message; the rest needs no words.
     pub fn needs_telling(self) -> bool {
-        matches!(self, Self::AdoptedUnknown | Self::Refused | Self::Failed)
+        matches!(
+            self,
+            Self::AdoptedUnknown | Self::Refused | Self::Failed | Self::SignInNeeded
+        )
     }
 }
 
@@ -1888,6 +1896,7 @@ mod tests {
             LaunchOutcomeKind::AdoptedUnknown,
             LaunchOutcomeKind::Refused,
             LaunchOutcomeKind::Failed,
+            LaunchOutcomeKind::SignInNeeded,
         ] {
             for text in [
                 "",
@@ -1908,6 +1917,12 @@ mod tests {
         );
         assert!(!LaunchOutcomeKind::Spawned.needs_telling());
         assert!(LaunchOutcomeKind::Failed.needs_telling());
+        // A sign-in is the one telling kind that is not a failure: the sentence is the point.
+        assert!(LaunchOutcomeKind::SignInNeeded.needs_telling());
+        assert_eq!(
+            LaunchOutcome::new(LaunchOutcomeKind::SignInNeeded, "Sign in.").notice(),
+            Some("Sign in.")
+        );
         assert_eq!(
             LaunchOutcome::new(LaunchOutcomeKind::Failed, "Quail closed.").notice(),
             Some("Quail closed.")

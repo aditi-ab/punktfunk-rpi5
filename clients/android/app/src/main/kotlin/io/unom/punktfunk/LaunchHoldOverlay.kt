@@ -53,7 +53,6 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.library.LibraryClient
-import io.unom.punktfunk.kit.library.mtlsHttpClient
 import io.unom.punktfunk.kit.security.IdentityStore
 import io.unom.punktfunk.kit.security.obtainIdentity
 import io.unom.punktfunk.models.LaunchHold
@@ -147,16 +146,16 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
         )
     }
     LaunchedEffect(hold) {
-        val id = withContext(Dispatchers.IO) {
-            runCatching { obtainIdentity(IdentityStore(context)) }.getOrNull()
-        }
-        if (id == null) {
+        val (id, art) = withContext(Dispatchers.IO) {
+            runCatching {
+                val me = obtainIdentity(IdentityStore(context))
+                me to posterLoader(context, me, hold.address, hold.fpHex)
+            }.getOrNull()
+        } ?: run {
             onShow()
             return@LaunchedEffect
         }
-        loader = ImageLoader.Builder(context)
-            .okHttpClient(mtlsHttpClient(id.certPem, id.privateKeyPem, hold.address, hold.fpHex))
-            .build()
+        loader = art
         val began = SystemClock.elapsedRealtime()
         while (isActive) {
             val games = withContext(Dispatchers.IO) {
