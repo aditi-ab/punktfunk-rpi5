@@ -180,7 +180,9 @@ pub fn shares(members: &[Member], path_kbps: u32, clocks: Clocks) -> Vec<Option<
     // sitting under what the group has room for — the wall it measured beside
     // the others was their residual, and only the host can see that.
     let crowded = crowded(members);
-    let budget = budget_kbps(members, path_kbps, crowded);
+    let Some(budget) = budget_kbps(members, path_kbps, crowded) else {
+        return out;
+    };
     let equal = (budget / auto.len() as u64) as u32;
     // Max-min fair: a member that wants less than an equal share takes what it
     // wants, and the rest split what it left behind.
@@ -232,7 +234,7 @@ pub fn shares(members: &[Member], path_kbps: u32, clocks: Clocks) -> Vec<Option<
     out
 }
 
-/// What there is to divide.
+/// What there is to divide. `None` = this group has no figure to divide.
 ///
 /// Once a member has gone short it is the group's delivery right now: the one
 /// wall they measure together, re-taken every window, which is what gives the
@@ -241,15 +243,15 @@ pub fn shares(members: &[Member], path_kbps: u32, clocks: Clocks) -> Vec<Option<
 /// group has been seen to carry stands instead, so the room a session lent by
 /// going still is still there when its sibling asks for it. A fixed-rate
 /// session's rate comes off the top either way — it is not in the division.
-fn budget_kbps(members: &[Member], path_kbps: u32, crowded: bool) -> u64 {
-    let now = self::path_kbps(members);
+fn budget_kbps(members: &[Member], path_kbps: u32, crowded: bool) -> Option<u64> {
+    let now = self::path_kbps(members)?;
     let proved = if crowded { now } else { now.max(path_kbps) };
     let fixed: u64 = members
         .iter()
         .filter(|m| !m.automatic)
         .map(|m| u64::from(m.current_kbps))
         .sum();
-    u64::from(proved).saturating_sub(fixed)
+    Some(u64::from(proved).saturating_sub(fixed))
 }
 
 /// The path is refusing some of what this group offers it, so what arrives
@@ -262,13 +264,20 @@ pub fn crowded(members: &[Member]) -> bool {
     members.iter().any(short)
 }
 
-/// What this group is carrying between them, kbps.
+/// What this group is carrying between them, kbps. `None` while any member has
+/// yet to say what reaches it.
+///
+/// A member that says nothing is not a member delivering nothing: a client
+/// whose host never asked for a count per window ([`crate::quic`]'s
+/// `HOST_CAP2_DELIVERY`) never sends one, and reading its silence as zero would
+/// halve its sibling's share to cover a session nobody can see. So the group is
+/// left alone until every one of them has reported.
 ///
 /// The caller keeps the last one: a session left alone on the path is told it,
 /// because the wall it measured beside a sibling was that sibling's residual
 /// and only the host knows the sibling has gone.
-pub fn path_kbps(members: &[Member]) -> u32 {
-    members.iter().map(|m| m.delivered_kbps.unwrap_or(0)).sum()
+pub fn path_kbps(members: &[Member]) -> Option<u32> {
+    members.iter().map(|m| m.delivered_kbps).sum()
 }
 
 /// What a member would use if the path were free. `u32::MAX` = everything it
@@ -539,6 +548,25 @@ mod tests {
         assert_eq!(shares(&[auto(17_000, 17_000), joining], true), [None; 2]);
         assert_eq!(shares(&[opening, opening], true), [None; 2]);
         assert_eq!(shares(&[auto(9_000, 9_000); 2], true), [None; 2]);
+    }
+
+    /// A member whose host never asked it for a count per window says nothing
+    /// about the path, and its silence is not room for its sibling to lose: the
+    /// group is left alone until every one of them has reported.
+    #[test]
+    fn a_member_that_has_not_reported_leaves_its_group_alone() {
+        let quiet = Member {
+            delivered_kbps: None,
+            ..auto(12_000, 0)
+        };
+        let starved = auto(12_000, 6_000);
+        assert_eq!(shares(&[starved, quiet], true), [None; 2]);
+        assert_eq!(path_kbps(&[starved, quiet]), None);
+        // Both of them reporting, and the same pair is divided.
+        assert_eq!(
+            shares(&[starved, auto(12_000, 6_000)], true),
+            [Some(6_000); 2]
+        );
     }
 
     /// A ceiling an earlier crowd taught cannot outlive it: while the path

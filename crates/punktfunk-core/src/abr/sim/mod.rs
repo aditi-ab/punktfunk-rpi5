@@ -248,7 +248,11 @@ fn govern(sessions: &mut [Session], i: usize, now_ms: u64) {
     // The most the path has been seen to carry, until the group is short of
     // what it offers: that is the path being re-measured, and a figure from
     // before it changed expires there (L1).
-    let carried = governor::path_kbps(&facts);
+    // A member that has not reported yet leaves the group unmeasured, and a
+    // figure it is not in must not be remembered as the path.
+    let Some(carried) = governor::path_kbps(&facts) else {
+        return;
+    };
     let path = if governor::crowded(&facts) {
         carried
     } else {

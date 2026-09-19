@@ -871,10 +871,10 @@ pub fn share_for(id: u64, clocks: punktfunk_core::abr::governor::Clocks) -> Opti
     share.grouped.store(true, Ordering::Relaxed);
     let members: Vec<governor::Member> = group.iter().map(|s| member(s)).collect();
     // What the path has carried for this group, kept per session because each
-    // of them asks on its own clock. The most it has been seen to carry, until
-    // the group is short of what it offers: that is the path being re-measured,
-    // and a figure from before it changed expires there (L1).
-    let now = governor::path_kbps(&members);
+    // asks on its own clock: the most it has been seen to carry, until the group
+    // is short of what it offers, which is the path being re-measured (L1). A
+    // member yet to report leaves it unmeasured, and that is never remembered.
+    let now = governor::path_kbps(&members)?;
     let path = if governor::crowded(&members) {
         share.path_kbps.store(now, Ordering::Relaxed);
         now
