@@ -812,7 +812,12 @@ mod tests {
         _live: crate::session_status::LiveSessionGuard,
     }
 
-    fn peer(name: &str, at: std::net::IpAddr, base: std::time::Instant) -> Peer {
+    fn peer(
+        name: &str,
+        at: std::net::IpAddr,
+        base: std::time::Instant,
+        reads_delivery: bool,
+    ) -> Peer {
         let (live, counters, rate) =
             crate::session_status::tests::fake_member(name, at, START_KBPS);
         Peer {
@@ -827,7 +832,7 @@ mod tests {
                     chroma_format: punktfunk_core::quic::CHROMA_IDC_420,
                     audio_reserved_kbps: 256,
                     marks_repeats: true,
-                    reads_delivery: true,
+                    reads_delivery,
                     probe: false,
                     probe_target_kbps: None,
                     ramp: false,
@@ -900,6 +905,21 @@ mod tests {
         }
     }
 
+    /// Eighteen seconds of a path that falls twice under these sessions: nine
+    /// megabits, then five, then three, halved because two of them share it.
+    fn falls_twice(peers: &mut [Peer], base: std::time::Instant) {
+        for ms in 0..18_000 {
+            let link = match ms {
+                0..6_000 => 9_000,
+                6_000..12_000 => 5_000,
+                _ => 3_000,
+            } / 2;
+            for p in peers.iter_mut() {
+                p.step(ms, base + std::time::Duration::from_millis(ms), link);
+            }
+        }
+    }
+
     /// The sequence a real client sends, through the host's own handling of it:
     /// two sessions at one address over a path that falls twice under them.
     ///
@@ -911,23 +931,14 @@ mod tests {
     #[test]
     fn a_real_clients_reports_keep_dividing_a_shared_path() {
         let base = std::time::Instant::now();
-        let at = |ms: u64| base + std::time::Duration::from_millis(ms);
         let shared: std::net::IpAddr = "203.0.113.41".parse().unwrap();
-        let mut group = [peer("phone", shared, base), peer("pc", shared, base)];
-        let mut lone = peer("tv", "203.0.113.42".parse().unwrap(), base);
-        for ms in 0..18_000 {
-            // Half the path each: 9 Mbps, then 5, then 3.
-            let link = match ms {
-                0..6_000 => 9_000,
-                6_000..12_000 => 5_000,
-                _ => 3_000,
-            } / 2;
-            for p in &mut group {
-                p.step(ms, at(ms), link);
-            }
-            lone.step(ms, at(ms), 9_000);
-        }
-        for p in &group {
+        let mut peers = [
+            peer("phone", shared, base, true),
+            peer("pc", shared, base, true),
+            peer("tv", "203.0.113.42".parse().unwrap(), base, true),
+        ];
+        falls_twice(&mut peers, base);
+        for p in &peers[..2] {
             assert!(
                 p.told.len() >= 3,
                 "three falls, {} shares: {:?}",
@@ -941,10 +952,31 @@ mod tests {
             );
         }
         assert!(
-            lone.told.is_empty(),
+            peers[2].told.is_empty(),
             "a session alone at its address was told {:?}",
-            lone.told
+            peers[2].told
         );
+    }
+
+    /// New host, old client: a client that does not stream its count leaves the
+    /// host one reading of the path, so the pair is divided at most once and in
+    /// the first window — today's behaviour, reached by never being told.
+    #[test]
+    fn a_client_that_reports_once_is_governed_at_most_once() {
+        let base = std::time::Instant::now();
+        let shared: std::net::IpAddr = "203.0.113.43".parse().unwrap();
+        let mut peers = [
+            peer("phone", shared, base, false),
+            peer("pc", shared, base, false),
+        ];
+        falls_twice(&mut peers, base);
+        for p in &peers {
+            assert!(
+                p.told.len() <= 1 && p.told.iter().all(|&(ms, _)| ms < 2_000),
+                "an old client was governed past its first window: {:?}",
+                p.told
+            );
+        }
     }
 
     /// Old client → new host: a client whose `Start` carried no `EXT_TAG_ABR`
