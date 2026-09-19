@@ -21,12 +21,42 @@ pub use pf_capture::{capturer_supports_444, Capturer, SyntheticCapturer};
 #[cfg(target_os = "windows")]
 pub use pf_capture::{dxgi, synthetic_nv12};
 
-/// Encode-backend facts for a Linux capture session. Resolved here so pf-capture
-/// never reaches `crate::encode` (that would recreate the capture→encode cycle).
+/// What the session's encoder proved it can import, per capture fourcc. SDR
+/// asks the packed-RGB pair, HDR the packed 10-bit pair; empty verdicts carry
+/// no entry, so an unproved fourcc stays LINEAR-only. `None` (portal/diagnostic
+/// opens) advertises no encoder-proved tiled modifiers.
+#[cfg(target_os = "linux")]
+fn encoder_modifiers(
+    codec: Option<crate::encode::Codec>,
+    bit_depth: u8,
+    hdr: bool,
+) -> Vec<(u32, Vec<u64>)> {
+    codec.map_or_else(Vec::new, |codec| {
+        let formats = if hdr {
+            [PixelFormat::X2Bgr10, PixelFormat::X2Rgb10]
+        } else {
+            [PixelFormat::Bgrx, PixelFormat::Bgra]
+        };
+        formats
+            .into_iter()
+            .filter_map(|fmt| {
+                let fourcc = pf_frame::drm_fourcc(fmt)?;
+                let mods = crate::encode::linux_capture_modifiers(codec, fourcc, bit_depth, hdr);
+                (!mods.is_empty()).then_some((fourcc, mods))
+            })
+            .collect()
+    })
+}
+
+/// Encode route and per-fourcc import verdicts for one Linux capture session.
+/// Resolved here so pf-capture never reaches back into encode.
 #[cfg(target_os = "linux")]
 fn zero_copy_policy(
     pyrowave_session: bool,
     native_nv12_session: bool,
+    codec: Option<crate::encode::Codec>,
+    bit_depth: u8,
+    hdr: bool,
 ) -> pf_capture::ZeroCopyPolicy {
     let backend_is_vaapi = crate::encode::linux_zero_copy_is_vaapi();
     // Raw-dmabuf passthrough serves PyroWave on any vendor: the wavelet encoder
@@ -40,28 +70,27 @@ fn zero_copy_policy(
         let _ = pyrowave_session;
         false
     };
-    #[cfg(feature = "pyrowave")]
-    let pyrowave_modifiers = if pyrowave_session {
-        // BGRx is the capture path's canonical packed-RGB; `drm_fourcc(Bgrx)` is always `Some`.
-        pf_frame::drm_fourcc(PixelFormat::Bgrx)
-            .map(crate::encode::pyrowave_capture_modifiers)
-            .unwrap_or_default()
+    let modifier_codec = if pyrowave_session {
+        Some(crate::encode::Codec::PyroWave)
+    } else {
+        codec
+    };
+    let encoder_modifiers = if backend_is_vaapi || pyrowave_session {
+        encoder_modifiers(modifier_codec, bit_depth, hdr)
     } else {
         Vec::new()
     };
-    #[cfg(not(feature = "pyrowave"))]
-    let pyrowave_modifiers = Vec::new();
     pf_capture::ZeroCopyPolicy {
         backend_is_vaapi,
         backend_is_gpu: crate::encode::resolved_backend_is_gpu(),
         pyrowave_session,
-        pyrowave_modifiers,
         native_nv12_session,
         // Only the direct-SDK NVENC backend takes a packed 10-bit PQ CUDA payload.
         // Without it HDR capture stays on the CPU path.
         hdr_cuda_ok: pf_encode::linux_hdr_cuda_ok(),
         nvenc_raw_dmabuf: pf_encode::linux_nvenc_raw_dmabuf_ok(),
         gamescope_tiled: false,
+        encoder_modifiers,
     }
 }
 
@@ -86,7 +115,7 @@ pub fn open_portal_monitor(
         anchored,
         want_hdr,
         want_metadata_cursor,
-        zero_copy_policy(false, false),
+        zero_copy_policy(false, false, None, 8, want_hdr),
     )
 }
 
@@ -106,23 +135,35 @@ fn head_extent(mode: Option<(u32, u32, u32)>) -> Option<(u16, u16)> {
     Some((u16::try_from(w).ok()?, u16::try_from(h).ok()?))
 }
 
+/// One [`capture_virtual_output`] request, shared by every platform
+/// implementation so the facade takes two arguments. `codec` is the session's
+/// resolved encoder — Linux uses it to seed the gamescope tiled offer, other
+/// platforms ignore it. `kwin`/`gamescope` carry PipeWire producer contracts
+/// node ids and remote fds cannot reveal.
+pub(crate) struct VirtualCaptureRequest {
+    pub output: OutputFormat,
+    pub codec: Option<crate::encode::Codec>,
+    pub capture: crate::session_plan::CaptureBackend,
+    pub kwin: bool,
+    pub gamescope: bool,
+}
+
 /// Capturer from an already-created [`crate::vdisplay::VirtualOutput`].
-/// The compositor flags carry PipeWire producer contracts that node ids and
-/// remote fds cannot reveal. The capturer owns the output keepalive.
+/// The capturer owns the output keepalive. Direct capture probes its consumer;
+/// PipeWire probes only level-21 gamescope and non-gamescope PyroWave. Ordinary
+/// KWin, Mutter, and older gamescope keep their unchanged LINEAR offer.
 #[cfg(target_os = "linux")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
-    want: OutputFormat,
-    _capture: crate::session_plan::CaptureBackend,
-    // The output's compositor is KWin, derived from the backend that created
-    // `vout` (a pooled display only ever matches its own backend). KWin rewrites
-    // `SPA_META_Cursor` on every buffer (id-0 is an authoritative hide), serves a pool
-    // of `KWIN_POOL_MIN..=KWIN_POOL_MAX`, and paces delivery on a millisecond-rounded
-    // timer unless offered no `maxFramerate` ceiling.
-    kwin: bool,
-    // Gamescope omits cursor metadata and exports LINEAR-only dmabufs.
-    gamescope: bool,
+    request: VirtualCaptureRequest,
 ) -> Result<Box<dyn Capturer>> {
+    let VirtualCaptureRequest {
+        output: want,
+        codec,
+        capture: _capture,
+        kwin,
+        gamescope,
+    } = request;
     // Portal negotiates its own pixel format, so `want.gpu` gates GPU zero-copy
     // (this path is always the portal; `CaptureBackend` is Windows-only dispatch)
     // and `want.chroma_444` selects planar-YUV444 GPU convert. `gpu = false`
@@ -136,6 +177,19 @@ pub fn capture_virtual_output(
     // switch Hyprland → gamescope has removed `PF-…`.
     crate::inject::set_stream_output(vout.output_name.clone().or(vout.input_output.clone()));
     crate::inject::set_stream_extent(head_extent(vout.preferred_mode));
+    // The encoder modifier probe keys on bit depth: HDR and 10-bit SDR both ride
+    // the packed 10-bit fourccs.
+    let bit_depth = if want.hdr || want.ten_bit_sdr { 10 } else { 8 };
+    // PipeWire probes only where modifiers are offered: level-21 gamescope, or
+    // non-gamescope PyroWave. Direct capture needs the same exact consumer lists.
+    let gamescope_tiled = gamescope && pf_vdisplay::gamescope_tiled_capture(None);
+    let modifier_codec = if gamescope {
+        gamescope_tiled.then_some(codec).flatten()
+    } else if want.pyrowave {
+        codec
+    } else {
+        None
+    };
     // Direct capture first where the compositor has it: the portal's re-request timer
     // halves the rate above ~140 Hz. GPU consumers only — this delivers dmabufs, and a
     // software encoder wants the portal's CPU pixels. Any failure falls through.
@@ -147,7 +201,7 @@ pub fn capture_virtual_output(
         match pf_capture::open_direct_output(
             name.clone(),
             Box::new(()),
-            zero_copy_policy(want.pyrowave, want.nv12_native),
+            zero_copy_policy(want.pyrowave, want.nv12_native, codec, bit_depth, want.hdr),
         ) {
             Ok(c) => {
                 tracing::info!(output = %name, "capturing the compositor output directly");
@@ -176,8 +230,14 @@ pub fn capture_virtual_output(
         want.ten_bit_sdr,
         pf_capture::ZeroCopyPolicy {
             // No route here. A wrong "foreign" only keeps the LINEAR offer.
-            gamescope_tiled: gamescope && pf_vdisplay::gamescope_tiled_capture(None),
-            ..zero_copy_policy(want.pyrowave, want.nv12_native)
+            gamescope_tiled,
+            ..zero_copy_policy(
+                want.pyrowave,
+                want.nv12_native,
+                modifier_codec,
+                bit_depth,
+                want.hdr,
+            )
         },
         vout.expect_exact_dims,
         kwin,
@@ -275,13 +335,18 @@ pub fn capturer_supports_hdr_for(
 #[cfg(target_os = "windows")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
-    want: OutputFormat,
-    _capture: crate::session_plan::CaptureBackend,
-    // Linux-only (`SPA_META_Cursor`, pool depth). IDD-push has no such meta; hide is
-    // CURSOR_SUPPRESSED.
-    _kwin: bool,
-    _gamescope: bool,
+    request: VirtualCaptureRequest,
 ) -> Result<Box<dyn Capturer>> {
+    let VirtualCaptureRequest {
+        output: want,
+        // Linux-only (encoder-proved tiled offer); IDD-push negotiates no dmabuf modifiers.
+        codec: _codec,
+        capture: _capture,
+        // Linux-only (`SPA_META_Cursor`, pool depth). IDD-push has no such meta; hide is
+        // CURSOR_SUPPRESSED.
+        kwin: _kwin,
+        gamescope: _gamescope,
+    } = request;
     let target = vout.win_capture.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "pf-vdisplay target not yet an active display path (activation failed — see the \
@@ -480,11 +545,15 @@ pub fn open_driver_encoder(
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn capture_virtual_output(
     _vout: crate::vdisplay::VirtualOutput,
-    _want: OutputFormat,
-    _capture: crate::session_plan::CaptureBackend,
-    _kwin: bool,
-    _gamescope: bool,
+    request: VirtualCaptureRequest,
 ) -> Result<Box<dyn Capturer>> {
+    let VirtualCaptureRequest {
+        output: _want,
+        codec: _codec,
+        capture: _capture,
+        kwin: _kwin,
+        gamescope: _gamescope,
+    } = request;
     anyhow::bail!("virtual-output capture requires Linux or Windows")
 }
 
@@ -522,10 +591,13 @@ mod live_tests {
         };
         let mut cap = capture_virtual_output(
             vout,
-            want,
-            crate::session_plan::CaptureBackend::IddPush,
-            false,
-            false,
+            VirtualCaptureRequest {
+                output: want,
+                codec: None,
+                capture: crate::session_plan::CaptureBackend::IddPush,
+                kwin: false,
+                gamescope: false,
+            },
         )
         .expect("open the IDD-push capturer");
         // A static desktop composes nothing: walk the pointer so every tick has a new image.
@@ -678,10 +750,13 @@ mod live_tests {
         };
         let mut cap = capture_virtual_output(
             vout,
-            want,
-            crate::session_plan::CaptureBackend::IddPush,
-            false,
-            false,
+            VirtualCaptureRequest {
+                output: want,
+                codec: None,
+                capture: crate::session_plan::CaptureBackend::IddPush,
+                kwin: false,
+                gamescope: false,
+            },
         )
         .expect("open the IDD-push capturer");
         let mut x = 100i32;

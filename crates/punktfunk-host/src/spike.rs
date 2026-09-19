@@ -119,10 +119,13 @@ pub fn run(opts: Options) -> Result<()> {
             want.pyrowave = opts.codec == Codec::PyroWave;
             capture::capture_virtual_output(
                 vout,
-                want,
-                crate::session_plan::CaptureBackend::resolve(),
-                compositor == crate::vdisplay::Compositor::Kwin,
-                compositor == crate::vdisplay::Compositor::Gamescope,
+                capture::VirtualCaptureRequest {
+                    output: want,
+                    codec: Some(opts.codec),
+                    capture: crate::session_plan::CaptureBackend::resolve(),
+                    kwin: compositor == crate::vdisplay::Compositor::Kwin,
+                    gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
+                },
             )
             .context("capture virtual output")?
         }

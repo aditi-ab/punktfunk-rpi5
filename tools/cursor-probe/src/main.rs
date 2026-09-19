@@ -80,10 +80,10 @@ mod linux {
             backend_is_gpu: gpu,
             pyrowave_session: false,
             native_nv12_session: false,
-            pyrowave_modifiers: Vec::new(),
             hdr_cuda_ok: false,
             nvenc_raw_dmabuf: false,
             gamescope_tiled: false,
+            encoder_modifiers: Vec::new(),
         };
         let kwin = compositor == pf_vdisplay::Compositor::Kwin;
         let mut cap = pf_capture::open_virtual_output(

@@ -523,10 +523,13 @@ pub fn mirror_test(args: &[String]) -> Result<()> {
     );
     let mut cap = crate::capture::capture_virtual_output(
         vout,
-        fmt,
-        crate::session_plan::CaptureBackend::resolve(),
-        compositor == crate::vdisplay::Compositor::Kwin,
-        compositor == crate::vdisplay::Compositor::Gamescope,
+        crate::capture::VirtualCaptureRequest {
+            output: fmt,
+            codec: None,
+            capture: crate::session_plan::CaptureBackend::resolve(),
+            kwin: compositor == crate::vdisplay::Compositor::Kwin,
+            gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
+        },
     )
     .context("attach a capturer to the mirrored monitor")?;
     cap.set_active(true);
