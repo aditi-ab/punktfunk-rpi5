@@ -303,6 +303,7 @@ pub(super) struct Host {
     share_window: ShareWindow,
     offered_kbps: u32,
     delivered_kbps: Option<u32>,
+    streaming: bool,
 }
 
 impl Host {
@@ -335,6 +336,7 @@ impl Host {
             share_window: ShareWindow::new(joined, 0),
             offered_kbps: 0,
             delivered_kbps: None,
+            streaming: false,
         }
     }
 
@@ -461,11 +463,18 @@ impl Host {
     /// cover one stretch of link (`native/control.rs`).
     pub(super) fn on_delivery_report(&mut self, now: Instant, packets_received: u64) {
         let wire = self.cfg.shard_payload as u64 + SHARD_WIRE_OVERHEAD;
-        let (offered, delivered) =
+        let (offered, delivered, streaming) =
             self.share_window
                 .close(now, self.offered_bytes, packets_received, wire);
         self.offered_kbps = offered;
         self.delivered_kbps = Some(delivered);
+        self.streaming = streaming;
+    }
+
+    /// The session was already streaming when the reported window opened, so
+    /// the pair of rates above is a reading of the path.
+    pub(super) fn streaming(&self) -> bool {
+        self.streaming
     }
 
     /// The wire rate this session put out over the last reported window.

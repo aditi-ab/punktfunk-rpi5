@@ -812,6 +812,9 @@ pub struct AbrShare {
     offered_kbps: AtomicU32,
     /// What the client's last `DeliveryReport` came to. `0` = none yet.
     delivered_kbps: AtomicU32,
+    /// The session was already streaming when that window opened, so the two
+    /// rates above are a reading of the path (`governor::Member::streaming`).
+    streaming: AtomicBool,
     /// The share this session was last told (`0` = none), the most its group
     /// has been seen to carry between them, and whether it had a group at all.
     share_kbps: AtomicU32,
@@ -821,10 +824,17 @@ pub struct AbrShare {
 
 impl AbrShare {
     /// This session's own view, as its control task takes it.
-    pub fn publish(&self, automatic: bool, offered_kbps: u32, delivered_kbps: u32) {
+    pub fn publish(
+        &self,
+        automatic: bool,
+        offered_kbps: u32,
+        delivered_kbps: u32,
+        streaming: bool,
+    ) {
         self.automatic.store(automatic, Ordering::Relaxed);
         self.offered_kbps.store(offered_kbps, Ordering::Relaxed);
         self.delivered_kbps.store(delivered_kbps, Ordering::Relaxed);
+        self.streaming.store(streaming, Ordering::Relaxed);
     }
 
     /// The ceiling this session is running under. `0` = none.
@@ -919,6 +929,7 @@ fn member(s: &LiveSession) -> punktfunk_core::abr::governor::Member {
             0 => None,
             kbps => Some(kbps),
         },
+        streaming: share.streaming.load(Ordering::Relaxed),
     }
 }
 
@@ -1406,7 +1417,7 @@ pub(crate) mod tests {
         let (a, ac, _ar) = fake_member("phone", peer, 12_000);
         let (b, bc, _br) = fake_member("pc", peer, 12_000);
         for c in [&ac, &bc] {
-            c.share.publish(true, 12_000, 9_000);
+            c.share.publish(true, 12_000, 9_000, true);
         }
         assert_eq!(share_for(a.id, both_clocks()), Some(9_000));
         assert_eq!(share_for(b.id, both_clocks()), Some(9_000));
@@ -1421,8 +1432,8 @@ pub(crate) mod tests {
         let peer: std::net::IpAddr = "203.0.113.91".parse().unwrap();
         let (auto, auto_c, _ar) = fake_member("phone", peer, 14_000);
         let (fixed, fixed_c, _fr) = fake_member("pc", peer, 8_000);
-        auto_c.share.publish(true, 14_000, 10_000);
-        fixed_c.share.publish(false, 8_000, 8_000);
+        auto_c.share.publish(true, 14_000, 10_000, true);
+        fixed_c.share.publish(false, 8_000, 8_000, true);
         assert_eq!(share_for(fixed.id, both_clocks()), None);
         assert_eq!(fixed_c.share.share_kbps(), 0, "nothing was written either");
         assert_eq!(
@@ -1438,7 +1449,7 @@ pub(crate) mod tests {
         let _registry = registry_lock();
         let peer: std::net::IpAddr = "203.0.113.92".parse().unwrap();
         let (only, c, _r) = fake_member("phone", peer, 20_000);
-        c.share.publish(true, 20_000, 9_000);
+        c.share.publish(true, 20_000, 9_000, true);
         assert_eq!(share_for(only.id, both_clocks()), None);
     }
 
@@ -1453,13 +1464,13 @@ pub(crate) mod tests {
         let (b, bc, _br) = fake_member("pc", peer, 15_000);
         // Both clean at 15 Mbps: the pair has carried 30 between them.
         for c in [&ac, &bc] {
-            c.share.publish(true, 15_000, 15_000);
+            c.share.publish(true, 15_000, 15_000, true);
         }
         assert_eq!(share_for(a.id, both_clocks()), None, "nothing to divide");
         assert_eq!(ac.share.path_kbps.load(Ordering::Relaxed), 30_000);
         // The path halves. Both are short, so what it carried before is gone.
         for c in [&ac, &bc] {
-            c.share.publish(true, 15_000, 6_000);
+            c.share.publish(true, 15_000, 6_000, true);
         }
         assert_eq!(share_for(a.id, both_clocks()), Some(6_000), "half of 12");
         drop(b);
@@ -1480,7 +1491,7 @@ pub(crate) mod tests {
         let (a, ac, _ar) = fake_member("phone", peer, 12_000);
         let (b, bc, _br) = fake_member("pc", peer, 12_000);
         for c in [&ac, &bc] {
-            c.share.publish(true, 12_000, 9_000);
+            c.share.publish(true, 12_000, 9_000, true);
         }
         assert_eq!(share_for(a.id, both_clocks()), Some(9_000));
         drop(b);
