@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot";
 import type { InstalledPlugin } from "@/api/store";
 import { InstalledList } from "@/sections/Store/Installed";
 
@@ -30,6 +31,7 @@ const ROWS: InstalledPlugin[] = [
 		tier: "verified",
 		source: "unom official",
 		entry_id: "rom-manager",
+		plugin_id: "rom-manager",
 		running: true,
 		update_available: "0.3.2",
 	},
@@ -48,6 +50,28 @@ const ROWS: InstalledPlugin[] = [
 		version: "0.1.0",
 		tier: "unverified",
 		running: false,
+	},
+];
+
+const ACCESS: PluginAccessSnapshot[] = [
+	{
+		plugin: "rom-manager",
+		grants: [
+			{
+				path: "/mnt/roms",
+				write: false,
+				at: "2026-09-18T12:00:00Z",
+				by: "console",
+			},
+			{
+				path: "/home/player/Emulation",
+				write: true,
+				at: "2026-09-18T12:01:00Z",
+				by: "cli",
+			},
+		],
+		pending: [],
+		denied: ["/home/player/Downloads"],
 	},
 ];
 
@@ -82,6 +106,10 @@ export const RowBusy: Story = {
 		updateCount: 2,
 		busyPkg: "@punktfunk/plugin-playnite",
 	},
+};
+
+export const RecordedFolderAccess: Story = {
+	args: { installed: loaded(ROWS), updateCount: 2, access: ACCESS },
 };
 
 export const Empty: Story = { args: { installed: loaded([]), updateCount: 0 } };
