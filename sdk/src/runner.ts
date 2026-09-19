@@ -19,6 +19,7 @@ import {
 	Cause,
 	Duration,
 	Effect,
+	Fiber,
 	Schedule,
 } from "effect";
 import { spawn, spawnSync } from "node:child_process";
@@ -58,6 +59,17 @@ export interface RunnerOptions {
 	sandbox?: "on" | "off";
 	/** The pinned fetch the sandbox proxy forwards with (test seam). */
 	sandboxFetch?: typeof globalThis.fetch;
+	/** Config root holding plugin grants, tokens, and state. Default `configDir()`. */
+	configDir?: string;
+	/** Grants poll period. Default 2 seconds; tests shorten it. */
+	grantPollInterval?: Duration.Input;
+	/** Run one sandbox attempt without spawning bwrap (test seam). */
+	sandboxRun?: (
+		unit: Unit,
+		manifest: PluginManifest,
+		options: RunnerOptions,
+		log: LogSink,
+	) => Effect.Effect<"plugin", unknown>;
 	/**
 	 * Line sink. Default: stamped stdout, with `warn`/`error` going to the matching console method
 	 * (hence stderr, and hence the right level in the console's log page — see `log-ship.ts`).
@@ -74,7 +86,7 @@ export interface RunnerOptions {
 export type RunnerLogLevel = "info" | "warn" | "error";
 
 /** The sink shape used internally, with the level always supplied by the caller's default. */
-type LogSink = (line: string, level?: RunnerLogLevel) => void;
+export type LogSink = (line: string, level?: RunnerLogLevel) => void;
 
 export interface Unit {
 	/** Display name: the file stem, or the plugin package name. */
@@ -440,12 +452,12 @@ export const discoverUnits = (
 export const sandboxMode = (): "on" | "off" =>
 	/^(0|off|false)$/i.test(process.env.PUNKTFUNK_PLUGIN_SANDBOX ?? "") ? "off" : "on";
 
-/** This plugin's own token, written where only its sandbox can read it. */
-const writePluginToken = (stateDir: string, id: string): string | undefined => {
+/** Write this plugin's own token under its state dir for the sandbox's read-only bind. */
+const writePluginToken = (config: string, stateDir: string, id: string): string | undefined => {
 	const file = path.join(stateDir, ".plugin-token");
 	try {
 		const tokens = JSON.parse(
-			fs.readFileSync(path.join(configDir(), "plugin-tokens.json"), "utf8"),
+			fs.readFileSync(path.join(config, "plugin-tokens.json"), "utf8"),
 		) as Record<string, string>;
 		const token = tokens[id];
 		if (token === undefined) return undefined;
@@ -473,9 +485,9 @@ const runSandboxed = (
 ): Effect.Effect<"plugin", unknown> =>
 	Effect.callback<"plugin", unknown>((resume) => {
 		const id = manifest.id ?? unit.name;
-		const config = configDir();
+		const config = options.configDir ?? configDir();
 		const stateDir = path.join(config, "plugin-state", id);
-		const tokenFile = writePluginToken(stateDir, id);
+		const tokenFile = writePluginToken(config, stateDir, id);
 		if (!tokenFile) {
 			resume(
 				Effect.fail(
@@ -575,7 +587,8 @@ const attemptUnit = (
 		// script is the operator's own code and stays here, as does everything on a box that
 		// cannot sandbox — with the reason said out loud at startup, never silently.
 		if (unit.manifest && options.sandbox !== "off") {
-			return yield* runSandboxed(unit, unit.manifest, options, log);
+			const run = options.sandboxRun ?? runSandboxed;
+			return yield* run(unit, unit.manifest, options, log);
 		}
 		const mod = (yield* Effect.tryPromise(
 			() => import(`${pathToFileURL(unit.file).href}?attempt=${attempt}`),
@@ -689,10 +702,65 @@ export const runOneUnit = (
 	);
 };
 
+type FileStamp = { mtimeMs: number; size: number } | undefined;
+
+/** The grants file's rename-safe polling stamp; absence is a stable state too. */
+const grantFileStamp = (config: string): FileStamp => {
+	try {
+		const stat = fs.statSync(path.join(config, "plugin-grants.json"));
+		return { mtimeMs: stat.mtimeMs, size: stat.size };
+	} catch {
+		return undefined;
+	}
+};
+
+const sameStamp = (a: FileStamp, b: FileStamp): boolean =>
+	a === undefined ? b === undefined : b !== undefined && a.mtimeMs === b.mtimeMs && a.size === b.size;
+
+const grantKey = (config: string, unit: Unit): string =>
+	JSON.stringify(grantedRoots(config, unit.manifest?.id ?? unit.name));
+
+/** Poll effective grants and replace only the supervisor whose roots changed. */
+const watchGrantChanges = (
+	config: string,
+	units: Unit[],
+	fibers: Map<string, Fiber.Fiber<void, never>>,
+	options: RunnerOptions & { sandbox: "on" | "off" },
+	log: LogSink,
+) => {
+	const grantKeys = new Map(units.map((unit) => [unit.name, grantKey(config, unit)]));
+	let stamp = grantFileStamp(config);
+	return Effect.forever(
+		Effect.sleep(options.grantPollInterval ?? "2 seconds").pipe(
+			Effect.andThen(
+				Effect.gen(function* () {
+					const nextStamp = grantFileStamp(config);
+					if (sameStamp(stamp, nextStamp)) return;
+					stamp = nextStamp;
+					for (const unit of units) {
+						const nextKey = grantKey(config, unit);
+						if (grantKeys.get(unit.name) === nextKey) continue;
+						const id = unit.manifest?.id ?? unit.name;
+						log(`[runner] ${id}: folder access changed — restarting`);
+						const old = fibers.get(unit.name);
+						if (old) yield* Fiber.interrupt(old);
+						fibers.set(
+							unit.name,
+							yield* Effect.forkScoped(superviseUnit(unit, options)),
+						);
+						grantKeys.set(unit.name, nextKey);
+					}
+				}),
+			),
+		),
+	);
+};
+
 /**
- * The runner: discover units, supervise each as a fiber, run until interrupted — at which
- * point every unit is interrupted STRUCTURALLY (scoped finalizers run: facade clients close,
- * Effect plugins release what they acquired).
+ * Discover and supervise every unit until interrupted. Sandboxed units are tracked separately:
+ * a grants-file poll compares their effective roots and restarts only the plugin whose roots
+ * changed. Every supervisor and the poller share this scope, so shutdown interrupts all of them
+ * and runs their finalizers.
  */
 export const runner = (options: RunnerOptions = {}): Effect.Effect<void> => {
 	const log = options.log ?? defaultLog;
@@ -727,11 +795,20 @@ export const runner = (options: RunnerOptions = {}): Effect.Effect<void> => {
 					"[runner] nothing to run — add scripts to the scripts dir or install punktfunk-plugin-* packages",
 				);
 			}
+
+			const config = options.configDir ?? configDir();
+			const supervised = { ...options, sandbox };
+			const fibers = new Map<string, Fiber.Fiber<void, never>>();
 			for (const unit of units) {
 				log(`[runner] starting ${unit.name} (${unit.file})`);
-				yield* Effect.forkScoped(superviseUnit(unit, { ...options, sandbox }));
+				fibers.set(unit.name, yield* Effect.forkScoped(superviseUnit(unit, supervised)));
 			}
-			yield* Effect.never; // interruption (shutdown) collapses the scope → all units
+
+			const sandboxed = units.filter((unit) => sandbox !== "off" && unit.manifest);
+			yield* Effect.forkScoped(
+				watchGrantChanges(config, sandboxed, fibers, supervised, log),
+			);
+			yield* Effect.never; // interruption collapses the scope → poller and every unit
 		}),
 	);
 };
