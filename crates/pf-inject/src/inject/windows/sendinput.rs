@@ -12,6 +12,8 @@
 
 use anyhow::Result;
 use punktfunk_core::input::{InputEvent, InputKind, PRECISE_PX_PER_DETENT, SCROLL_FLAG_PRECISE};
+
+use crate::scroll::{ScrollBackend, ScrollMapper, ScrollOp};
 use std::mem::size_of;
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
@@ -47,6 +49,8 @@ pub struct SendInputInjector {
     wheel_px: i32,
     /// Sub-unit remainder of that repricing, (horizontal, vertical).
     precise_rem: (i32, i32),
+    /// Normalized-scroll lowering onto WHEEL/HWHEEL clicks.
+    scroll: ScrollMapper,
 }
 
 // SAFETY: the only non-`Send` field is `Option<HDESK>` (`SyntheticTouch` is `Send`
@@ -98,6 +102,7 @@ impl SendInputInjector {
             touch_failed: false,
             wheel_px: wheel_px_per_detent(),
             precise_rem: (0, 0),
+            scroll: ScrollMapper::new(ScrollBackend::Windows),
         };
         me.reattach_input_desktop(); // best-effort
         tracing::info!("SendInput injector ready (Win32 KeyboardAndMouse)");
@@ -131,6 +136,34 @@ impl SendInputInjector {
                 Err(_) => { /* not privileged enough for the secure desktop; stay put */ }
             }
         }
+    }
+
+    /// Normalized scroll lowers through the shared mapper: v120 stays v120, DIP
+    /// re-prices at the nominal detent, both axes keep the wire sign. The OS
+    /// applies the user's wheel-lines setting itself, so `wheel_px` stays out
+    /// of this path. Stops are no-ops — Win32 has no scroll-stop primitive.
+    fn inject_scroll(&mut self, event: &InputEvent) -> Result<()> {
+        let mut inputs = Vec::new();
+        for op in self.scroll.plan(event) {
+            if let ScrollOp::Discrete120 { horizontal, value } = op {
+                inputs.push(mouse(MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: value as u32, // signed wheel delta reinterpreted as DWORD
+                    dwFlags: if horizontal {
+                        MOUSEEVENTF_HWHEEL
+                    } else {
+                        MOUSEEVENTF_WHEEL
+                    },
+                    time: 0,
+                    dwExtraInfo: 0,
+                }));
+            }
+        }
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        self.send(&inputs)
     }
 
     /// Inject with Sunshine's retry-on-failure: stay bound to the last desktop, and only
@@ -303,6 +336,7 @@ impl InputInjector for SendInputInjector {
                 };
                 self.send(&[mouse(mi)])
             }
+            InputKind::Scroll => self.inject_scroll(event),
             InputKind::KeyDown | InputKind::KeyUp => {
                 let down = event.kind == InputKind::KeyDown;
                 let vk = (event.code & 0xff) as u16;

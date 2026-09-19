@@ -18,6 +18,7 @@
 #![allow(clippy::all, dead_code, non_camel_case_types, non_snake_case, unused)]
 
 use super::{gs_button_to_evdev, vk_to_evdev, InputEvent, InputInjector};
+use crate::scroll::{ScrollBackend, ScrollMapper, ScrollOp};
 use anyhow::{Context, Result};
 use punktfunk_core::input::{InputKind, PRECISE_PX_PER_DETENT, SCROLL_FLAG_PRECISE};
 use std::time::{Duration, Instant};
@@ -286,6 +287,8 @@ pub struct KwinFakeInjector {
     state: State,
     fake: FakeInput,
     last_refresh: Option<Instant>,
+    /// Normalized-scroll lowering onto the bare `axis` click channel.
+    scroll: ScrollMapper,
 }
 
 /// Cap geometry roundtrips at 2 Hz. A roundtrip on every mouse-move would stall the control path.
@@ -323,6 +326,7 @@ impl KwinFakeInjector {
             state,
             fake,
             last_refresh: None,
+            scroll: ScrollMapper::new(ScrollBackend::Kwin),
         };
         injector.refresh_geometry();
         tracing::info!(
@@ -370,6 +374,21 @@ impl KwinFakeInjector {
             None => (0.0, 0.0, phys_w as f64, phys_h as f64),
         }
     }
+
+    /// Execute a normalized-scroll plan on the bare `axis` channel: the only
+    /// op a KWin plan emits is a click-priced axis value.
+    fn inject_scroll(&mut self, event: &InputEvent) {
+        for op in self.scroll.plan(event) {
+            if let ScrollOp::Continuous { horizontal, value } = op {
+                let axis = if horizontal {
+                    AXIS_HORIZONTAL
+                } else {
+                    AXIS_VERTICAL
+                };
+                self.fake.axis(axis, value);
+            }
+        }
+    }
 }
 
 impl InputInjector for KwinFakeInjector {
@@ -411,6 +430,10 @@ impl InputInjector for KwinFakeInjector {
                 let precise = event.flags & SCROLL_FLAG_PRECISE != 0;
                 self.fake.axis(axis, sign * axis_value(event.x, precise));
             }
+            // Normalized scroll lowers through the shared mapper onto the same
+            // bare axis; the plan carries click-priced units and the Wayland
+            // vertical sign already applied.
+            InputKind::Scroll => self.inject_scroll(event),
             InputKind::KeyDown | InputKind::KeyUp => {
                 // Evdev code; KWin owns the keymap and modifier state — no modifiers request.
                 if let Some(evdev) = vk_to_evdev(event.code as u8) {

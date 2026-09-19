@@ -9,9 +9,8 @@
 //! on a 1080p and a 4K desktop.
 
 use crate::input::gamepad::*;
-use crate::input::{
-    GamepadSnapshot, InputEvent, InputKind, MAX_PADS, PRECISE_PX_PER_DETENT, SCROLL_FLAG_PRECISE,
-};
+use crate::input::scroll::{ScrollEvent, ScrollPhase, ScrollSource, SCROLL_SCALE};
+use crate::input::{GamepadSnapshot, InputEvent, InputKind, MAX_PADS};
 use crate::quic::{GRANT_KEYBOARD, GRANT_POINTER};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -118,6 +117,8 @@ struct Pad {
     out: u16,
     /// Sub-unit carry: pointer x, y; scroll x, y.
     rem: [f64; 4],
+    /// Scroll axes mid-gesture; a neutral stick owes an End.
+    scroll_active: [bool; 2],
 }
 
 impl Pad {
@@ -159,6 +160,16 @@ fn event(kind: InputKind, code: u32, x: i32, y: i32, flags: u32) -> InputEvent {
         y,
         flags,
     }
+}
+
+fn scroll_event(axis: u32, delta: i32, phase: ScrollPhase) -> InputEvent {
+    ScrollEvent {
+        source: ScrollSource::Controller,
+        phase,
+        axis,
+        delta,
+    }
+    .to_event()
 }
 
 fn press(out: Out, down: bool) -> InputEvent {
@@ -214,11 +225,17 @@ impl PadMouse {
 
     /// Release every output `pad` holds and stop translating it.
     pub(crate) fn leave(&mut self, pad: usize) -> Vec<InputEvent> {
-        let out = std::mem::take(&mut self.pads[pad]).out;
-        (0..MAP.len())
-            .filter(|i| out & 1 << i != 0)
-            .map(|i| press(MAP[i].1, false))
-            .collect()
+        let p = std::mem::take(&mut self.pads[pad]);
+        let mut evs: Vec<_> = (0..2u32)
+            .filter(|&axis| p.scroll_active[axis as usize])
+            .map(|axis| scroll_event(axis, 0, ScrollPhase::Cancel))
+            .collect();
+        evs.extend(
+            (0..MAP.len())
+                .filter(|i| p.out & 1 << i != 0)
+                .map(|i| press(MAP[i].1, false)),
+        );
+        evs
     }
 
     /// Fold one button/axis event and emit the output edges it causes.
@@ -245,15 +262,16 @@ impl PadMouse {
             .collect()
     }
 
-    /// True while a translated pad has a stick past the deadzone.
+    /// True while a translated pad has motion or an open scroll gesture.
     pub(crate) fn moving(&self) -> bool {
         self.pads.iter().any(|p| {
             p.on && (curve(p.snap.ls_x, p.snap.ls_y) != (0.0, 0.0)
-                || curve(p.snap.rs_x, p.snap.rs_y) != (0.0, 0.0))
+                || curve(p.snap.rs_x, p.snap.rs_y) != (0.0, 0.0)
+                || p.scroll_active.iter().any(|&active| active))
         })
     }
 
-    /// Pointer motion and scroll for `dt_s` of stick deflection on a `height`-pixel stream.
+    /// Pointer motion and normalized scroll for `dt_s` of stick deflection.
     pub(crate) fn tick(&mut self, dt_s: f64, height: u32, grants: u32) -> Vec<InputEvent> {
         let mut evs = Vec::new();
         if grants & GRANT_POINTER == 0 {
@@ -262,7 +280,7 @@ impl PadMouse {
         let h = f64::from(if height == 0 { FALLBACK_HEIGHT } else { height });
         let dt = dt_s.clamp(0.0, MAX_DT);
         let px = POINTER_HEIGHTS_PER_S * h * dt;
-        let units = SCROLL_HEIGHTS_PER_S * h * 120.0 / PRECISE_PX_PER_DETENT * dt;
+        let units = SCROLL_HEIGHTS_PER_S * f64::from(FALLBACK_HEIGHT) * SCROLL_SCALE * dt;
         for p in self.pads.iter_mut().filter(|p| p.on) {
             let (cx, cy) = curve(p.snap.ls_x, p.snap.ls_y);
             let dx = take(&mut p.rem[0], cx * px);
@@ -271,13 +289,23 @@ impl PadMouse {
                 evs.push(event(InputKind::MouseMove, 0, dx, dy, 0));
             }
             let (sx, sy) = curve(p.snap.rs_x, p.snap.rs_y);
-            let vy = take(&mut p.rem[3], sy * units);
-            if vy != 0 {
-                evs.push(event(InputKind::MouseScroll, 0, vy, 0, SCROLL_FLAG_PRECISE));
-            }
-            let vx = take(&mut p.rem[2], sx * units);
-            if vx != 0 {
-                evs.push(event(InputKind::MouseScroll, 1, vx, 0, SCROLL_FLAG_PRECISE));
+            for (axis, velocity, remainder) in [(0usize, sy, 3usize), (1, sx, 2)] {
+                if velocity == 0.0 {
+                    p.rem[remainder] = 0.0;
+                    if std::mem::take(&mut p.scroll_active[axis]) {
+                        evs.push(scroll_event(axis as u32, 0, ScrollPhase::End));
+                    }
+                    continue;
+                }
+                let delta = take(&mut p.rem[remainder], velocity * units);
+                if delta != 0 {
+                    let phase = if std::mem::replace(&mut p.scroll_active[axis], true) {
+                        ScrollPhase::Update
+                    } else {
+                        ScrollPhase::Begin
+                    };
+                    evs.push(scroll_event(axis as u32, delta, phase));
+                }
             }
         }
         evs
@@ -457,21 +485,47 @@ mod tests {
     }
 
     #[test]
-    fn right_stick_scrolls_precise_both_axes() {
+    fn right_stick_scrolls_normalized_both_axes() {
         let mut m = entered();
         m.fold(0, &axis(AXIS_RS_Y, 32767), GRANT_ALL);
         m.fold(0, &axis(AXIS_RS_X, -32767), GRANT_ALL);
         assert!(m.moving());
         let evs = m.tick(0.01, 1000, GRANT_ALL);
-        assert_eq!(evs.len(), 2);
-        // 0.3 × 1000 px/s × 12 units/px × 10 ms = 36 units at full travel; the diagonal is
-        // radial, so each axis carries 1/√2 of it.
+        let vertical = ScrollEvent::from_event(&evs[0]).unwrap();
+        let horizontal = ScrollEvent::from_event(&evs[1]).unwrap();
         assert_eq!(
-            (evs[0].code, evs[0].x, evs[0].flags),
-            (0, 25, SCROLL_FLAG_PRECISE),
-            "up is positive"
+            (vertical.axis, vertical.delta, vertical.phase),
+            (0, 586, ScrollPhase::Begin)
         );
-        assert_eq!((evs[1].code, evs[1].x), (1, -25), "left is negative");
+        assert_eq!(
+            (horizontal.axis, horizontal.delta, horizontal.phase),
+            (1, -586, ScrollPhase::Begin)
+        );
+        m.fold(0, &axis(AXIS_RS_Y, 0), GRANT_ALL);
+        m.fold(0, &axis(AXIS_RS_X, 0), GRANT_ALL);
+        let ended = m.tick(0.01, 1000, GRANT_ALL);
+        assert_eq!(ended.len(), 2);
+        assert!(ended
+            .iter()
+            .all(|event| ScrollEvent::from_event(event).unwrap().phase == ScrollPhase::End));
+    }
+
+    #[test]
+    fn leaving_cancels_open_scroll_axes() {
+        let mut m = entered();
+        m.fold(0, &axis(AXIS_RS_Y, 32767), GRANT_ALL);
+        assert_eq!(
+            ScrollEvent::from_event(&m.tick(0.01, 1080, GRANT_ALL)[0])
+                .unwrap()
+                .phase,
+            ScrollPhase::Begin
+        );
+        let left = m.leave(0);
+        assert_eq!(left.len(), 1);
+        assert_eq!(
+            ScrollEvent::from_event(&left[0]).unwrap().phase,
+            ScrollPhase::Cancel
+        );
     }
 
     #[test]

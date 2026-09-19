@@ -19,6 +19,7 @@
 
 use super::*;
 use pf_clipboard::ClipCoordCmd;
+use punktfunk_core::abr::governor::ShareWindow;
 use punktfunk_core::quic::{AckReason, ClipControl, ClipOffer, ClipState};
 
 /// The ack this client can read. The reason byte goes only to a client that
@@ -31,66 +32,21 @@ fn bitrate_ack(kbps: u32, why: AckReason, client_reads_reason: bool) -> BitrateC
     }
 }
 
-/// The send counter and the client's receive counter as they stood at the last
-/// delivery report, so the next one gives a rate for the same window.
-///
-/// A delivery report is the host's own window boundary: it arrives once per
-/// client report window, and both figures are cumulative, so the pair of diffs
-/// describes one stretch of link rather than two overlapping ones.
-struct ShareWindow {
-    at: std::time::Instant,
-    egress_bytes: u64,
-    packets_received: u64,
-}
-
-impl ShareWindow {
-    fn new(egress_bytes: u64) -> Self {
-        ShareWindow {
-            at: std::time::Instant::now(),
-            egress_bytes,
-            packets_received: 0,
-        }
-    }
-
-    /// `(offered, delivered)` over the window that just closed, kbps.
-    ///
-    /// Delivered is the client's packet count in this session's wire packets:
-    /// the datagram size both ends agreed on, which is what the host has
-    /// without asking for a byte count it never sends.
-    fn close(&mut self, egress_bytes: u64, packets_received: u64, wire_bytes: u64) -> (u32, u32) {
-        let now = std::time::Instant::now();
-        let ms = now.duration_since(self.at).as_millis().max(1) as u64;
-        let kbps = |bytes: u64| u32::try_from(bytes * 8 / ms).unwrap_or(u32::MAX);
-        let offered = kbps(egress_bytes.saturating_sub(self.egress_bytes));
-        let arrived = packets_received.saturating_sub(self.packets_received);
-        *self = ShareWindow {
-            at: now,
-            egress_bytes,
-            packets_received,
-        };
-        (offered, kbps(arrived.saturating_mul(wire_bytes)))
-    }
-}
-
 /// When each of the governor's up-moves may next go out.
 struct ShareClocks {
     room: std::time::Instant,
     lift: std::time::Instant,
 }
 
-impl Default for ShareClocks {
-    fn default() -> Self {
-        let now = std::time::Instant::now();
+impl ShareClocks {
+    fn new(now: std::time::Instant) -> Self {
         ShareClocks {
             room: now + punktfunk_core::abr::governor::SHARE_CLOCK,
             lift: now + punktfunk_core::abr::governor::SHARE_LIFT_CLOCK,
         }
     }
-}
 
-impl ShareClocks {
-    fn take(&mut self) -> punktfunk_core::abr::governor::Clocks {
-        let now = std::time::Instant::now();
+    fn take(&mut self, now: std::time::Instant) -> punktfunk_core::abr::governor::Clocks {
         let out = punktfunk_core::abr::governor::Clocks {
             room: now >= self.room,
             lift: now >= self.lift,
@@ -103,6 +59,38 @@ impl ShareClocks {
         }
         out
     }
+}
+
+/// What a client's [`punktfunk_core::quic::DeliveryReport`] leaves this session:
+/// the share of the path it is on, if the governor has one to send.
+///
+/// The report is the boundary both figures are read over, so closing the window
+/// and asking are one step ([`crate::session_status::share_for`]). A group of
+/// one never has a share. The id is `0` until the video loop registers the
+/// session, and before that there is nothing for a sibling to share with.
+#[allow(clippy::too_many_arguments)]
+fn delivery_share(
+    now: std::time::Instant,
+    packets_received: u64,
+    counters: &crate::session_status::SessionCounters,
+    window: &mut ShareWindow,
+    clocks: &mut ShareClocks,
+    automatic: bool,
+    wire_bytes: u64,
+) -> Option<u32> {
+    let (offered, delivered, streaming) = window.close(
+        now,
+        counters.link.egress_bytes(),
+        packets_received,
+        wire_bytes,
+    );
+    counters
+        .share
+        .publish(automatic, offered, delivered, streaming);
+    let id = counters.link.session_id();
+    (id != 0)
+        .then(|| crate::session_status::share_for(id, clocks.take(now)))
+        .flatten()
 }
 
 /// Whether this probe request skips the one-per-10 s spacing: a bring-up ramp
@@ -294,8 +282,8 @@ pub(super) async fn run(task: Task) {
     // Shared-path governor: what this session offered and what reached it over
     // the last window, read at the same boundary so a shortfall describes one
     // stretch of link, plus the two clocks an up-move rides.
-    let mut window = ShareWindow::new(counters.link.egress_bytes());
-    let mut share_clocks = ShareClocks::default();
+    let mut window = ShareWindow::new(std::time::Instant::now(), counters.link.egress_bytes());
+    let mut share_clocks = ShareClocks::new(std::time::Instant::now());
     // One `link health` line a minute, ticking whether or not anything arrived: a reader must
     // be able to tell a clean minute from a host that stopped logging.
     let mut link = crate::link_health::LinkWindow::new(&counters.link);
@@ -378,23 +366,15 @@ pub(super) async fn run(task: Task) {
                         rep.packets_received.min(u32::MAX as u64 - 1) as u32,
                         Ordering::Relaxed,
                     );
-                    // This report is the host's own window boundary: publish
-                    // what the window offered and what reached the client, then
-                    // ask the governor what this session's share of the path is
-                    // (`session_status::share_for`). A group of one never has one.
-                    let (offered, delivered) = window.close(
-                        counters.link.egress_bytes(),
+                    if let Some(share) = delivery_share(
+                        std::time::Instant::now(),
                         rep.packets_received,
+                        &counters,
+                        &mut window,
+                        &mut share_clocks,
+                        bitrate_automatic,
                         wire_bytes,
-                    );
-                    counters.share.publish(bitrate_automatic, offered, delivered);
-                    // `0` until the video loop registers the session; before
-                    // that there is nothing for a sibling to share with.
-                    let id = counters.link.session_id();
-                    if let Some(share) = (id != 0)
-                        .then(|| crate::session_status::share_for(id, share_clocks.take()))
-                        .flatten()
-                    {
+                    ) {
                         // A share under the live rate is a retarget the encoder
                         // takes now; one above it is a ceiling the client still
                         // has to earn, so nothing is applied for it.
@@ -833,6 +813,198 @@ mod tests {
         enabled: true,
         flags: 0,
     };
+
+    /// One wire packet, and the rate both modelled sessions open at.
+    const WIRE: u64 = 1_448;
+    const START_KBPS: u32 = 12_000;
+
+    /// One modelled session: the [`punktfunk_core::abr::Driver`] a real client
+    /// runs, the registry entry and counters the host keeps for it, and the
+    /// share window its reports close.
+    struct Peer {
+        abr: punktfunk_core::abr::Driver,
+        counters: Arc<crate::session_status::SessionCounters>,
+        /// Encoder target, the same Arc the governor reads as `current_kbps`.
+        rate: Arc<AtomicU32>,
+        window: ShareWindow,
+        clocks: ShareClocks,
+        stats: punktfunk_core::stats::Stats,
+        egress: u64,
+        arrived: u64,
+        /// The share standing over this session, and every one it was told.
+        share: u32,
+        told: Vec<(u64, u32)>,
+        _live: crate::session_status::LiveSessionGuard,
+    }
+
+    fn peer(
+        name: &str,
+        at: std::net::IpAddr,
+        base: std::time::Instant,
+        reads_delivery: bool,
+    ) -> Peer {
+        let (live, counters, rate) =
+            crate::session_status::tests::fake_member(name, at, START_KBPS);
+        Peer {
+            abr: punktfunk_core::abr::Driver::new(
+                punktfunk_core::abr::DriverConfig {
+                    start_kbps: START_KBPS,
+                    ceiling_cap_kbps: None,
+                    stream_cap_kbps: 200_000,
+                    refresh_hz: 60,
+                    codec: punktfunk_core::quic::CODEC_HEVC,
+                    bit_depth: 8,
+                    chroma_format: punktfunk_core::quic::CHROMA_IDC_420,
+                    audio_reserved_kbps: 256,
+                    marks_repeats: true,
+                    reads_delivery,
+                    probe: false,
+                    probe_target_kbps: None,
+                    ramp: false,
+                },
+                base,
+            ),
+            counters,
+            rate,
+            window: ShareWindow::new(base, 0),
+            clocks: ShareClocks::new(base),
+            stats: punktfunk_core::stats::Stats::default(),
+            egress: 0,
+            arrived: 0,
+            share: 0,
+            told: Vec::new(),
+            _live: live,
+        }
+    }
+
+    impl Peer {
+        /// One millisecond of this session: the host puts its encoder rate on
+        /// the wire, the link carries what it has room for, and whatever the
+        /// driver asks to send reaches the host's own handling of it.
+        fn step(&mut self, ms: u64, at: std::time::Instant, link_kbps: u32) {
+            let offer = u64::from(self.rate.load(Ordering::Relaxed));
+            self.egress += offer * 125 / 1_000;
+            self.counters.link.publish_egress_bytes(self.egress);
+            self.arrived += offer.min(u64::from(link_kbps)) * 125 / 1_000;
+            self.stats.packets_received = self.arrived / WIRE;
+            self.stats.bytes_received = self.arrived;
+            if ms % 16 == 0 {
+                self.stats.frames_completed += 1;
+                self.abr.on_au(false);
+            }
+            self.abr.on_stats(&self.stats);
+            for action in self.abr.tick(at).actions {
+                match action {
+                    punktfunk_core::abr::Action::Delivery(packets) => {
+                        let Some(share) = delivery_share(
+                            at,
+                            packets,
+                            &self.counters,
+                            &mut self.window,
+                            &mut self.clocks,
+                            true,
+                            WIRE,
+                        ) else {
+                            continue;
+                        };
+                        self.share = share;
+                        self.told.push((ms, share));
+                        // As the branch does: a share under the live rate is a
+                        // retarget the encoder takes now.
+                        if share > 0 && self.rate.load(Ordering::Relaxed) > share {
+                            self.rate.store(share, Ordering::Relaxed);
+                        }
+                    }
+                    // As the `SetBitrate` branch does: the share binds last.
+                    punktfunk_core::abr::Action::SetBitrate(kbps) => {
+                        let want = if self.share > 0 {
+                            kbps.min(self.share)
+                        } else {
+                            kbps
+                        };
+                        self.rate.store(want, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Eighteen seconds of a path that falls twice under these sessions: nine
+    /// megabits, then five, then three, halved because two of them share it.
+    fn falls_twice(peers: &mut [Peer], base: std::time::Instant) {
+        for ms in 0..18_000 {
+            let link = match ms {
+                0..6_000 => 9_000,
+                6_000..12_000 => 5_000,
+                _ => 3_000,
+            } / 2;
+            for p in peers.iter_mut() {
+                p.step(ms, base + std::time::Duration::from_millis(ms), link);
+            }
+        }
+    }
+
+    /// The sequence a real client sends, through the host's own handling of it:
+    /// two sessions at one address over a path that falls twice under them.
+    ///
+    /// Each is told a share again at every fall, because the driver closes the
+    /// host's share window every report window. A client that reports once
+    /// leaves the host one reading of the path and no way to take another, and
+    /// this is the test that fails on it. The third session is alone at its own
+    /// address and is never told anything.
+    #[test]
+    fn a_real_clients_reports_keep_dividing_a_shared_path() {
+        let _registry = crate::session_status::tests::registry_lock();
+        let base = std::time::Instant::now();
+        let shared: std::net::IpAddr = "203.0.113.41".parse().unwrap();
+        let mut peers = [
+            peer("phone", shared, base, true),
+            peer("pc", shared, base, true),
+            peer("tv", "203.0.113.42".parse().unwrap(), base, true),
+        ];
+        falls_twice(&mut peers, base);
+        for p in &peers[..2] {
+            assert!(
+                p.told.len() >= 3,
+                "three falls, {} shares: {:?}",
+                p.told.len(),
+                p.told
+            );
+            assert!(
+                p.told.last().is_some_and(|&(ms, _)| ms > 12_000),
+                "the governor stopped early: {:?}",
+                p.told
+            );
+        }
+        assert!(
+            peers[2].told.is_empty(),
+            "a session alone at its address was told {:?}",
+            peers[2].told
+        );
+    }
+
+    /// New host, old client: a client that does not stream its count leaves the
+    /// host one reading of the path, so the pair is divided at most once and in
+    /// the first window — today's behaviour, reached by never being told.
+    #[test]
+    fn a_client_that_reports_once_is_governed_at_most_once() {
+        let _registry = crate::session_status::tests::registry_lock();
+        let base = std::time::Instant::now();
+        let shared: std::net::IpAddr = "203.0.113.43".parse().unwrap();
+        let mut peers = [
+            peer("phone", shared, base, false),
+            peer("pc", shared, base, false),
+        ];
+        falls_twice(&mut peers, base);
+        for p in &peers {
+            assert!(
+                p.told.len() <= 1 && p.told.iter().all(|&(ms, _)| ms < 2_000),
+                "an old client was governed past its first window: {:?}",
+                p.told
+            );
+        }
+    }
 
     /// Old client → new host: a client whose `Start` carried no `EXT_TAG_ABR`
     /// gets the ack it has always got — nine bytes, whatever the host knows

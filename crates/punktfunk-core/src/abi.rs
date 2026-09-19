@@ -3274,6 +3274,27 @@ pub unsafe extern "C" fn punktfunk_connection_set_pad_mouse(
     })
 }
 
+/// Change scroll direction for this session at the shared outbound seam.
+///
+/// # Safety
+/// `c` is a valid connection handle. Callable from any thread.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_set_invert_scroll(
+    c: *mut PunktfunkConnection,
+    invert: bool,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: caller handle or null; `as_ref` never dereferences null.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        c.inner.set_invert_scroll(invert);
+        PunktfunkStatus::Ok
+    })
+}
+
 /// Pads in controller mouse now. A removed pad or a lost pointer grant clears its bit.
 ///
 /// # Safety
@@ -6124,8 +6145,8 @@ mod abi_version_tests {
     #[test]
     fn abi_version_is_pinned() {
         // Current ABI. A bump must update this pin.
-        assert_eq!(crate::ABI_VERSION, 36);
-        assert_eq!(super::punktfunk_abi_version(), 36);
+        assert_eq!(crate::ABI_VERSION, 37);
+        assert_eq!(super::punktfunk_abi_version(), 37);
     }
 
     #[test]

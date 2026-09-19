@@ -749,6 +749,17 @@ public final class PunktfunkConnection: @unchecked Sendable {
         return punktfunk_connection_set_pad_mouse(h, mask) == statusOK
     }
 
+    /// Live scroll inversion at the connection's one outbound seam — seeded from
+    /// `settings.invertScroll` at connect; a mid-session change calls this, never a
+    /// per-event reseed. False when the session is gone.
+    @discardableResult
+    public func setInvertScroll(_ invert: Bool) -> Bool {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return false }
+        return punktfunk_connection_set_invert_scroll(h, invert) == statusOK
+    }
+
     /// Wire pads the host holds now, a bit per pad: declared or driven, not yet removed.
     public var livePads: UInt16 {
         abiLock.lock()
@@ -781,6 +792,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
              PUNKTFUNK_INPUT_KIND_MOUSE_BUTTON_DOWN.rawValue,
              PUNKTFUNK_INPUT_KIND_MOUSE_BUTTON_UP.rawValue,
              PUNKTFUNK_INPUT_KIND_MOUSE_SCROLL.rawValue,
+             PUNKTFUNK_INPUT_KIND_SCROLL.rawValue,
              PUNKTFUNK_INPUT_KIND_TOUCH_DOWN.rawValue,
              PUNKTFUNK_INPUT_KIND_TOUCH_MOVE.rawValue,
              PUNKTFUNK_INPUT_KIND_TOUCH_UP.rawValue:
@@ -997,6 +1009,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
             }
             throw PunktfunkClientError.connectFailed
         }
+        // Scroll inversion lives at the core's outbound seam — seeded once from the session
+        // settings; a live change goes through `setInvertScroll`, not a per-event reseed.
+        _ = punktfunk_connection_set_invert_scroll(handle, settings.invertScroll)
         hostFingerprint = Data(observed)
         var w: UInt32 = 0, h: UInt32 = 0, hz: UInt32 = 0
         _ = punktfunk_connection_mode(handle, &w, &h, &hz)

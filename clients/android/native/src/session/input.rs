@@ -10,6 +10,7 @@ use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteBuffer, JFloatArray, JObject, JString};
 use jni::sys::{jboolean, jint, jlong};
 use jni::EnvUnowned;
+use punktfunk_core::input::scroll::ScrollEvent;
 use punktfunk_core::input::{InputEvent, InputKind, SCROLL_FLAG_PRECISE};
 use punktfunk_core::quic::{
     PenSample, PenTool, RichInput, HID_REPORT_MAX, HOST_CAP2_TOUCH, HOST_CAP_PEN,
@@ -105,6 +106,61 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendScroll(
     jni_guard((), || {
         let flags = if precise { SCROLL_FLAG_PRECISE } else { 0 };
         send_event(handle, InputKind::MouseScroll, axis as u32, delta, 0, flags);
+    })
+}
+
+/// `NativeBridge.nativeSendNormalizedScroll(handle, axis, delta, source, phase)` — one normalized
+/// scroll event (`InputKind::Scroll`). `delta` is signed Q24.8 in the source's unit (v120 for
+/// Wheel/Unknown, DIP for the rest); `source`/`phase` are the wire bytes packed into `flags`.
+/// [`ScrollEvent::from_event`] drops a malformed pair — bad axis, a stop carrying distance, a
+/// phased wheel — before anything is sent, so Kotlin constants are checked, not trusted.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendNormalizedScroll(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    axis: jint,
+    delta: jint,
+    source: jint,
+    phase: jint,
+) {
+    jni_guard((), || {
+        if !(0..=1).contains(&axis) || !(0..=5).contains(&source) || !(0..=7).contains(&phase) {
+            return;
+        }
+        let ev = InputEvent {
+            kind: InputKind::Scroll,
+            _pad: [0; 3],
+            code: axis as u32,
+            x: delta,
+            y: 0,
+            flags: (source as u32) | ((phase as u32) << 8),
+        };
+        if ScrollEvent::from_event(&ev).is_none() {
+            return;
+        }
+        let Some(h) = get_session(handle) else {
+            return;
+        };
+        let _ = h.client.send_input(&ev);
+    })
+}
+
+/// `NativeBridge.nativeSetInvertScroll(handle, invert)` — the live natural-scroll toggle,
+/// applied once at the core's outbound seam (wheel, continuous and controller scroll alike).
+/// `false` when the session is gone.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetInvertScroll(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    invert: jboolean,
+) -> jboolean {
+    jni_guard(false, || {
+        get_session(handle).is_some_and(|h| {
+            h.client.set_invert_scroll(invert);
+            true
+        })
     })
 }
 

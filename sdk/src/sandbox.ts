@@ -38,6 +38,12 @@ export const readManifest = (packageDir: string): PluginManifest | undefined => 
 export const expandHome = (p: string, home: string): string =>
 	p.startsWith("~/") ? path.join(home, p.slice(2)) : p;
 
+/** One extra root the operator granted a plugin, read-only unless `write` is set. */
+export interface GrantedRoot {
+	path: string;
+	write: boolean;
+}
+
 export interface SandboxPaths {
 	/** Where this plugin's own files live, bound read-write. */
 	stateDir: string;
@@ -56,9 +62,9 @@ export interface SandboxPaths {
 /**
  * The `bwrap` argv for one plugin: everything before the program it runs.
  *
- * Read-only for the system and the plugin's own code; read-write for exactly its state dir, the
- * paths its manifest declares as `writes`, and `/tmp` (VirtualHere's client IPC is a FIFO pair
- * there, which is why the unit keeps the real `/tmp` rather than a private one).
+ * Read-only for the system, the plugin's own code, manifest `reads`, and granted roots; read-write
+ * for exactly its state dir, manifest `writes`, grants marked `write: true`, and `/tmp` (VirtualHere's
+ * client IPC is a FIFO pair there, which is why the unit keeps the real `/tmp`).
  */
 /**
  * The namespaces and the minimal root every sandbox gets, shared with {@link sandboxProbe} so a
@@ -115,7 +121,7 @@ const BASE_ARGV: readonly string[] = [
 export const bwrapArgv = (
 	manifest: PluginManifest,
 	paths: SandboxPaths,
-	grants: readonly string[] = [],
+	grants: readonly GrantedRoot[] = [],
 ): string[] => {
 	// The spawner hands `netlinkFilter()` over on fd 3.
 	const argv = [...BASE_ARGV, "--add-seccomp-fd", "3"];
@@ -139,9 +145,15 @@ export const bwrapArgv = (
 		const abs = expandHome(p, paths.home);
 		if (path.isAbsolute(abs)) argv.push("--ro-bind-try", abs, abs);
 	}
-	for (const p of [...(manifest.writes ?? []), ...grants]) {
+	for (const p of manifest.writes ?? []) {
 		const abs = expandHome(p, paths.home);
 		if (path.isAbsolute(abs)) argv.push("--bind-try", abs, abs);
+	}
+	// Operator grants are read-only unless one opts into write.
+	for (const grant of grants) {
+		const abs = expandHome(grant.path, paths.home);
+		if (path.isAbsolute(abs))
+			argv.push(grant.write ? "--bind-try" : "--ro-bind-try", abs, abs);
 	}
 	return argv;
 };
@@ -202,13 +214,36 @@ export const sandboxEnv = (
 	...extra,
 });
 
-/** Where the operator's extra roots for `id` live, as the host records them. */
-export const grantedRoots = (configDir: string, id: string): string[] => {
+/**
+ * The operator's extra roots for `id` from `plugin-grants.json`. Accepts a legacy path array
+ * (read-only grants) and a `{ grants: [{ path, write }] }` record. Anything else — malformed JSON,
+ * a missing entry, a shape that does not parse strictly — grants nothing.
+ */
+export const grantedRoots = (configDir: string, id: string): GrantedRoot[] => {
 	try {
 		const map = JSON.parse(
 			fs.readFileSync(path.join(configDir, "plugin-grants.json"), "utf8"),
-		) as Record<string, string[]>;
-		return map[id] ?? [];
+		) as Record<string, unknown>;
+		const entry = map[id];
+		if (Array.isArray(entry)) {
+			if (!entry.every((p) => typeof p === "string")) return [];
+			return entry.map((p) => ({ path: p, write: false }));
+		}
+		if (typeof entry !== "object" || entry === null) return [];
+		const grants = (entry as { grants?: unknown }).grants;
+		if (!Array.isArray(grants)) return [];
+		if (
+			!grants.every(
+				(g) =>
+					typeof g === "object" &&
+					g !== null &&
+					!Array.isArray(g) &&
+					typeof (g as GrantedRoot).path === "string" &&
+					typeof (g as GrantedRoot).write === "boolean",
+			)
+		)
+			return [];
+		return grants as GrantedRoot[];
 	} catch {
 		return [];
 	}

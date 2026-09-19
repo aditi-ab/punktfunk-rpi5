@@ -573,6 +573,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         }
         b.build().context("SDL window")?
     };
+    // SDL wheel input remains the fallback when native Wayland capture is unavailable.
+    let mut scroll_routing = crate::scroll_routing::ScrollRouting::new(&window);
     // Exe-embedded icon onto the title bar/taskbar; a no-op for exes that embed none.
     #[cfg(windows)]
     crate::win32::stamp_window_icon(&window);
@@ -747,16 +749,22 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         while let Some(e) = event_pump.poll_event() {
             queued.push(e);
         }
+        scroll_routing.begin(
+            stream.as_ref().and_then(|s| s.capture.as_ref()),
+            overlay.as_deref(),
+        );
         for event in queued {
             // Console UI sees input first: a consumed event never reaches capture/forwarding.
             if let Some(o) = overlay.as_mut() {
                 if o.handle_event(&event) {
+                    scroll_routing.consumed(&event);
                     continue;
                 }
                 // Mouse/touch: console hit-tests in its own pixel space. Consumed while
                 // the console is up; ignored while streaming (those belong to `Capture`).
                 if let Some(input) = overlay_pointer(&event, &window) {
                     if o.handle_pointer(input) {
+                        scroll_routing.consumed(&event);
                         continue;
                     }
                 }
@@ -770,6 +778,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
                 Event::Window { win_event, .. } => match win_event {
                     WindowEvent::FocusLost => {
+                        scroll_routing.focus_lost();
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.release(false) {
                                 apply_capture(
@@ -1081,9 +1090,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                 }
                 Event::MouseWheel { x, y, .. } => {
-                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                        cap.on_wheel(x, y);
-                    }
+                    // The overlay consumes SDL wheels before native/fallback routing.
+                    scroll_routing.wheel(stream.as_mut().and_then(|s| s.capture.as_mut()), x, y);
                 }
                 // Touchscreen fingers → the session's touch model. `x`/`y` are
                 // window-normalized; only DIRECT devices (an INDIRECT trackpad drives
@@ -1193,6 +1201,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 other => pump.handle_event(other),
             }
         }
+        // Native events forward only when capture owns the entire SDL batch.
+        scroll_routing.finish(
+            stream.as_mut().and_then(|s| s.capture.as_mut()),
+            overlay.as_deref(),
+        );
         // Who owns the pad: window focus plus Gaming Mode's overlay signal. Edge-triggered
         // so an open QAM does not re-flush the pads every iteration.
         #[cfg(target_os = "linux")]
@@ -2886,6 +2899,8 @@ fn dispatch_finger(
     let Some(cap) = st.capture.as_mut() else {
         return Vec::new();
     };
+    // `wx`/`wy` are physical px; the gesture engine prices scroll in DIP.
+    cap.set_touch_density(window.display_scale());
     cap.dispatch_finger(
         phase,
         finger_id,
@@ -2976,6 +2991,7 @@ fn ring_facts(
             .map_or(TouchMode::Trackpad, Capture::touch_mode)
             .as_name()
             .into(),
+        invert_scroll: c.invert_scroll(),
         host_accepts_touch: c.host_caps2() & punktfunk_core::quic::HOST_CAP2_TOUCH != 0,
         stats_tier: stats.label().into(),
         // The mic control answers `toggle` with `None` when no uplink runs; a session
@@ -3041,6 +3057,15 @@ fn ring_command(
         }
         RingCommand::ToggleMic => {
             st.handle.mic.toggle();
+        }
+        RingCommand::ToggleScrollInvert => {
+            if let Some(c) = st
+                .connector
+                .as_ref()
+                .filter(|c| c.access_grants() & punktfunk_core::quic::GRANT_POINTER != 0)
+            {
+                c.set_invert_scroll(!c.invert_scroll());
+            }
         }
         RingCommand::CycleTouchMode => {
             let accepts_touch = st

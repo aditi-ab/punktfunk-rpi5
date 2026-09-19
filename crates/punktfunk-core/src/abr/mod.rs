@@ -67,6 +67,10 @@ pub struct DriverConfig {
     pub audio_reserved_kbps: u32,
     /// Host marks idle-keepalive repeats (`HOST_CAP2_REPEAT_MARK`).
     pub marks_repeats: bool,
+    /// Host reads a [`crate::quic::DeliveryReport`] every window
+    /// ([`HOST_CAP2_DELIVERY`](crate::quic::HOST_CAP2_DELIVERY)): it divides a
+    /// path two of its sessions share, and that is the only figure it has.
+    pub reads_delivery: bool,
     /// Run the startup capacity probe (`PUNKTFUNK_ABR_PROBE`).
     pub probe: bool,
     /// `PUNKTFUNK_ABR_PROBE_KBPS`. `None` = twice the stream-shape cap; with
@@ -85,7 +89,8 @@ pub struct DriverConfig {
 pub enum Action {
     /// Shard loss this window, ppm: the host's adaptive-FEC input.
     Loss(u32),
-    /// Session total packets received. The host escalates on a dead plane.
+    /// Session total packets received. The host escalates on a dead plane, and
+    /// divides a path two of its sessions share by these.
     Delivery(u64),
     /// Ask the host for a new encoder rate.
     SetBitrate(u32),
@@ -203,7 +208,12 @@ impl Driver {
         abr.set_frame_budget(cfg.refresh_hz);
         Driver {
             abr,
-            window: window::WindowAccumulator::new(cfg.audio_reserved_kbps, cfg.marks_repeats, now),
+            window: window::WindowAccumulator::new(
+                cfg.audio_reserved_kbps,
+                cfg.marks_repeats,
+                cfg.reads_delivery,
+                now,
+            ),
             // A pinned or explicit rate has nothing to measure for.
             probe: probe::CapacityProbe::new(
                 cfg.probe && cfg.start_kbps > 0,
@@ -638,6 +648,7 @@ mod tests {
                 probe: true,
                 probe_target_kbps: None,
                 ramp: true,
+                reads_delivery: true,
             },
             base,
         );
@@ -788,6 +799,7 @@ mod tests {
                 probe: true,
                 probe_target_kbps: Some(400_000),
                 ramp: false,
+                reads_delivery: true,
             },
             base,
         );

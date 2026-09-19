@@ -179,6 +179,8 @@ struct RingActions {
     var togglePadMouse: () -> Void
     var currentMode: () -> (w: UInt32, h: UInt32, hz: UInt32)
     var requestMode: (UInt32, UInt32, UInt32) -> Void
+    var scrollInverted: () -> Bool = { false }
+    var toggleScrollInversion: () -> Void = {}
 }
 
 /// The editor's hooks (design §3.3): a tap on a slot picks its action instead of firing it, and
@@ -732,6 +734,15 @@ private struct SheetRowSpec {
     /// Left/Right on a pad: cycle a value (the resolution rows); a tap cycles forward.
     var adjust: ((Int) -> Void)? = nil
     var tap: () -> Void
+
+    static func scrollInversion(_ actions: RingActions) -> SheetRowSpec {
+        let granted = actions.pointerGranted()
+        return SheetRowSpec(label: "Invert scroll direction",
+                            value: granted ? (actions.scrollInverted() ? "On" : "Off") : "Pointer input is not allowed",
+                            enabled: granted) {
+            if actions.pointerGranted() { actions.toggleScrollInversion() }
+        }
+    }
 }
 
 private let resPresets: [(String, UInt32, UInt32)] = [("1440p", 2560, 1440), ("1080p", 1920, 1080), ("720p", 1280, 720)]
@@ -779,6 +790,7 @@ extension RingOverlay {
                                  enabled: tm.enabled) {
             if tm.enabled { a.cycleTouchMode() }
         })
+        rows.append(.scrollInversion(a))
         let kb = spec(.keyboard, cfg, a)
         rows.append(SheetRowSpec(label: kb.label, value: kb.enabled ? "" : kb.reason,
                                  enabled: kb.enabled) { [state] in

@@ -260,6 +260,8 @@ pub struct NativeClient {
     pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]>,
     /// Pads translated into pointer and keys ([`NativeClient::set_pad_mouse`]).
     pad_mouse: Arc<pad_mouse::PadMouseShared>,
+    /// Live setting read by the shared input seam for every scroll event.
+    scroll_invert: Arc<AtomicBool>,
     hdr_meta: Mutex<Receiver<HdrMeta>>,
     /// Per-AU capture→send timings. Client always advertises [`quic::VIDEO_CAP_HOST_TIMING`];
     /// an older host never sends any.
@@ -693,6 +695,7 @@ impl NativeClient {
         let pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]> =
             Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
         let pad_mouse = Arc::new(pad_mouse::PadMouseShared::default());
+        let scroll_invert = Arc::new(AtomicBool::new(false));
         let (hdr_meta_tx, hdr_meta_rx) = std::sync::mpsc::sync_channel::<HdrMeta>(HDR_META_QUEUE);
         let (host_timing_tx, host_timing_rx) =
             std::sync::mpsc::sync_channel::<crate::quic::HostTiming>(HOST_TIMING_QUEUE);
@@ -765,6 +768,7 @@ impl NativeClient {
         let recent_rfis_w = recent_rfis.clone();
         let pad_audio_caps_w = pad_audio_caps.clone();
         let pad_mouse_w = pad_mouse.clone();
+        let scroll_invert_w = scroll_invert.clone();
         let audio_mute_w = audio_mute.clone();
         let pad_slots_w = pad_slots.clone();
         let launch_outcome_w = launch_outcome.clone();
@@ -822,6 +826,7 @@ impl NativeClient {
                     pad_audio_tx,
                     pad_audio_caps: pad_audio_caps_w,
                     pad_mouse: pad_mouse_w,
+                    scroll_invert: scroll_invert_w,
                     hdr_meta_tx,
                     host_timing_tx,
                     cursor_shape_tx,
@@ -897,6 +902,7 @@ impl NativeClient {
             pad_audio: Mutex::new(pad_audio_rx),
             pad_audio_caps,
             pad_mouse,
+            scroll_invert,
             hdr_meta: Mutex::new(hdr_meta_rx),
             host_timing: Mutex::new(host_timing_rx),
             cursor_shape: Mutex::new(cursor_shape_rx),
@@ -1720,6 +1726,15 @@ impl NativeClient {
         }
         self.pad_mouse.request(mask);
         Ok(())
+    }
+
+    /// Change scroll direction for this session at the shared outbound seam.
+    pub fn set_invert_scroll(&self, invert: bool) {
+        self.scroll_invert.store(invert, Ordering::Relaxed);
+    }
+
+    pub fn invert_scroll(&self) -> bool {
+        self.scroll_invert.load(Ordering::Relaxed)
     }
 
     /// Pads the embedder switched to controller mouse and that are still connected.

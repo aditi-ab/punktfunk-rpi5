@@ -709,8 +709,18 @@ pub(super) async fn negotiate(
             } else {
                 0
             }
+            // Without the bit the client converts Scroll to MouseScroll before the wire.
+            | if crate::inject::scroll_supported() {
+                punktfunk_core::quic::HOST_CAP2_SCROLL
+            } else {
+                0
+            }
             // Invites the client's `Start` extension block, which is where it names itself.
             | punktfunk_core::quic::HOST_CAP2_EXT
+            // This host divides a path between the sessions that share a client address
+            // (`session_status::share_for`), and a delivery count every report window is the
+            // only measure of a session's own air it has.
+            | punktfunk_core::quic::HOST_CAP2_DELIVERY
             // The virtual path punches its data plane two to three seconds before its
             // pipeline exists, and serves the client's bring-up ramp in that gap. The
             // rate-following source holds its first frame back for the same span

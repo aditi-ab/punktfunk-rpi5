@@ -196,6 +196,55 @@ drawing it into the video, the Linux and Windows clients flip to relative motion
 an app on the host grabs or hides the pointer, then back when it lets go. Using the chord yourself
 overrides that until the host's intent next changes. The macOS client ignores the signal on purpose.
 
+## Scrolling
+
+Scroll events identify their source and, when available, gesture begin, update, end,
+cancel and momentum phases. Wheels (including high-resolution wheels) use **v120**:
+120 units per notch. Touchpad, touchscreen, continuous-surface and controller distances
+use density-independent **DIP**. Both units carry 1/256 fractions on the wire.
+An unknown source uses v120, never a fraction-based guess or a session-wide latch.
+
+The host maps each event once. Positive wire deltas mean up or right; Wayland backends
+reverse the vertical sign. The following table gives magnitudes:
+
+| Host backend | Wheel / unknown | Continuous distance | Gesture handling |
+|---|---|---|---|
+| libei (portal / Mutter) | v120 discrete plus 15 axis units per notch | DIP directly | `scroll_stop`; finger/touch end permits host kinetic scrolling |
+| wlroots virtual pointer | whole notches plus 15 axis units per notch | DIP directly, with finger or continuous source | `axis_stop`; no separate cancel primitive |
+| gamescope | v120 discrete | DIP × 120/60 | no stop primitive; client momentum is forwarded |
+| KWin fake input | v120 × 10/120 axis units | DIP × 10/60 axis units | no stop primitive; client momentum is forwarded |
+| Windows SendInput | v120 wheel units | DIP × 120/60 wheel units | no stop primitive; client momentum is forwarded |
+
+libei and wlroots discard client finger/touch momentum after handing the gesture to
+the host. Continuous-source momentum is forwarded instead. libei ends controller and
+continuous gestures with cancellation to avoid a second kinetic tail. Applications
+choose whether to glide; native wheel preferences and app behavior still affect distance.
+The 60-DIP conversion is a nominal wheel fallback, not a pixel-equality guarantee.
+
+Compatibility is negotiated. Existing `MouseScroll` events keep their original meaning.
+For an older host, new events convert once to the legacy wheel/precise format; gesture
+phases cannot survive that conversion. **Invert scroll direction** is applied once in
+the shared outbound path, including controller mouse. Open the quick-action ring's centre
+sheet and choose **Input → Invert scroll direction** to change it during a stream.
+The control needs pointer permission and changes only that session. Saved defaults and
+presets stay unchanged; the next session starts from its resolved settings.
+
+Platform limits:
+
+- **SDL fallback:** without native source information (including Windows), detent deltas
+  become Unknown v120 at ×120. A fractional wheel delta never changes later events' source.
+- **Wayland capture:** native `value120` wins over discrete and continuous copies. Without
+  counts, wheel/unknown axis values use the fixed 15-axis-units-per-notch approximation.
+  Seats older than v5 retain the SDL fallback. The wlroots host protocol accumulates wheel
+  fractions until a whole notch; its continuous scrolling does not have that restriction.
+- **Android:** hardware `ACTION_SCROLL` has no gesture end. Touchpad distance uses native
+  scroll factors divided by density; touchscreen pans carry gesture boundaries.
+- **iPhone/iPad:** UIKit's discrete recognizer provides translated points, not recoverable
+  wheel counts, so that fallback is continuous DIP. Under pointer lock an attached GCMouse
+  supplies raw wheel counts instead. Its raw API does not supply UIKit's natural-scroll sign.
+
+No additional scroll settings are required.
+
 ## Touch modes
 
 On a touchscreen client the **Touch input** setting picks one of three models. All three exist on

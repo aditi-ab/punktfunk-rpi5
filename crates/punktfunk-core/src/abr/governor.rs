@@ -18,7 +18,7 @@
 //! simulator show that the host's loop above the client's does not oscillate.
 
 use super::controller::FLOOR_KBPS;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How often an up-move may go out. Down-moves apply as soon as the evidence
 /// does; a share that climbed every report window would be the client's own
@@ -64,6 +64,66 @@ const SHORT_DIV: u32 = 16;
 /// alone on the path again.
 pub const NO_SHARE_KBPS: u32 = 0;
 
+/// The host's send counter and the client's receive counter as they stood at
+/// the last delivery report, so the next one gives a rate for the same window.
+///
+/// The report is the boundary: the client closes one per report window, and
+/// both figures are cumulative, so the pair of diffs describes one stretch of
+/// link rather than two overlapping ones. A window the client discarded owes no
+/// report, which makes the next one long rather than wrong.
+pub struct ShareWindow {
+    at: Instant,
+    egress_bytes: u64,
+    packets_received: u64,
+    /// The window that closed before this one carried the stream: its egress
+    /// was over [`FLOOR_KBPS`].
+    streaming: bool,
+}
+
+impl ShareWindow {
+    pub fn new(now: Instant, egress_bytes: u64) -> Self {
+        ShareWindow {
+            at: now,
+            egress_bytes,
+            packets_received: 0,
+            streaming: false,
+        }
+    }
+
+    /// `(offered, delivered)` over the window that just closed, kbps, and
+    /// whether the session was already streaming when it opened.
+    ///
+    /// Delivered is the client's packet count in this session's wire packets:
+    /// the datagram size both ends agreed on, which is what the host has
+    /// without asking for a byte count it never sends. The third figure is
+    /// [`Member::streaming`], which says whether the pair is a reading of the
+    /// path at all.
+    pub fn close(
+        &mut self,
+        now: Instant,
+        egress_bytes: u64,
+        packets_received: u64,
+        wire_bytes: u64,
+    ) -> (u32, u32, bool) {
+        let ms = now.duration_since(self.at).as_millis().max(1) as u64;
+        let kbps = |bytes: u64| u32::try_from(bytes * 8 / ms).unwrap_or(u32::MAX);
+        let offered = kbps(egress_bytes.saturating_sub(self.egress_bytes));
+        let arrived = packets_received.saturating_sub(self.packets_received);
+        let opened_streaming = self.streaming;
+        *self = ShareWindow {
+            at: now,
+            egress_bytes,
+            packets_received,
+            streaming: offered >= FLOOR_KBPS,
+        };
+        (
+            offered,
+            kbps(arrived.saturating_mul(wire_bytes)),
+            opened_streaming,
+        )
+    }
+}
+
 /// One session of a group, as the host knows it.
 ///
 /// Every field is something the host has without asking the client: the
@@ -88,15 +148,23 @@ pub struct Member {
     pub idle: bool,
     /// The share this session was last told. `None` = it has never had one.
     pub share_kbps: Option<u32>,
+    /// The window before this one carried the stream too ([`ShareWindow`]).
+    /// The window a stream starts in is short of what left the host by
+    /// everything still in flight at its boundary, which is not the path
+    /// refusing anything.
+    pub streaming: bool,
 }
 
 /// The path refused some of what this session offered it.
 ///
-/// A session neither side has yet put the floor rate through says nothing
-/// about the path: the pipeline is still coming up, and a window carrying the
-/// audio reservation and one frame is a shortfall of noise.
+/// A session that has not put the floor rate through for two windows running
+/// says nothing about the path: the pipeline is still coming up, a window
+/// carrying the audio reservation and one frame is a shortfall of noise, and
+/// the window a stream starts in is short by everything still in flight at its
+/// boundary.
 fn short(m: &Member) -> bool {
-    !m.idle
+    m.streaming
+        && !m.idle
         && m.offered_kbps >= FLOOR_KBPS
         && m.delivered_kbps
             .is_some_and(|d| d < m.offered_kbps - m.offered_kbps / SHORT_DIV)
@@ -133,7 +201,9 @@ pub fn shares(members: &[Member], path_kbps: u32, clocks: Clocks) -> Vec<Option<
     // sitting under what the group has room for — the wall it measured beside
     // the others was their residual, and only the host can see that.
     let crowded = crowded(members);
-    let budget = budget_kbps(members, path_kbps, crowded);
+    let Some(budget) = budget_kbps(members, path_kbps, crowded) else {
+        return out;
+    };
     let equal = (budget / auto.len() as u64) as u32;
     // Max-min fair: a member that wants less than an equal share takes what it
     // wants, and the rest split what it left behind.
@@ -185,7 +255,7 @@ pub fn shares(members: &[Member], path_kbps: u32, clocks: Clocks) -> Vec<Option<
     out
 }
 
-/// What there is to divide.
+/// What there is to divide. `None` = this group has no figure to divide.
 ///
 /// Once a member has gone short it is the group's delivery right now: the one
 /// wall they measure together, re-taken every window, which is what gives the
@@ -194,15 +264,15 @@ pub fn shares(members: &[Member], path_kbps: u32, clocks: Clocks) -> Vec<Option<
 /// group has been seen to carry stands instead, so the room a session lent by
 /// going still is still there when its sibling asks for it. A fixed-rate
 /// session's rate comes off the top either way — it is not in the division.
-fn budget_kbps(members: &[Member], path_kbps: u32, crowded: bool) -> u64 {
-    let now = self::path_kbps(members);
+fn budget_kbps(members: &[Member], path_kbps: u32, crowded: bool) -> Option<u64> {
+    let now = self::path_kbps(members)?;
     let proved = if crowded { now } else { now.max(path_kbps) };
     let fixed: u64 = members
         .iter()
         .filter(|m| !m.automatic)
         .map(|m| u64::from(m.current_kbps))
         .sum();
-    u64::from(proved).saturating_sub(fixed)
+    Some(u64::from(proved).saturating_sub(fixed))
 }
 
 /// The path is refusing some of what this group offers it, so what arrives
@@ -215,13 +285,20 @@ pub fn crowded(members: &[Member]) -> bool {
     members.iter().any(short)
 }
 
-/// What this group is carrying between them, kbps.
+/// What this group is carrying between them, kbps. `None` while any member has
+/// yet to say what reaches it.
+///
+/// A member that says nothing is not a member delivering nothing: a client
+/// whose host never asked for a count per window ([`crate::quic`]'s
+/// `HOST_CAP2_DELIVERY`) never sends one, and reading its silence as zero would
+/// halve its sibling's share to cover a session nobody can see. So the group is
+/// left alone until every one of them has reported.
 ///
 /// The caller keeps the last one: a session left alone on the path is told it,
 /// because the wall it measured beside a sibling was that sibling's residual
 /// and only the host knows the sibling has gone.
-pub fn path_kbps(members: &[Member]) -> u32 {
-    members.iter().map(|m| m.delivered_kbps.unwrap_or(0)).sum()
+pub fn path_kbps(members: &[Member]) -> Option<u32> {
+    members.iter().map(|m| m.delivered_kbps).sum()
 }
 
 /// What a member would use if the path were free. `u32::MAX` = everything it
@@ -256,6 +333,71 @@ fn send(standing: Option<u32>, share: u32, may_raise: bool) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abr::{Action, Driver, DriverConfig};
+    use crate::stats::Stats;
+
+    /// One wire packet: shard payload plus its header and seal.
+    const WIRE: u64 = 1_448;
+
+    /// Every delivery count a real [`Driver`] asks the host for over `windows`
+    /// report windows, and the millisecond of the ask. Driven as the pump drives
+    /// it: session counters in, actions out, a packet a millisecond arriving.
+    fn delivery_reports(windows: u64, reads_delivery: bool) -> Vec<(u64, u64)> {
+        let base = Instant::now();
+        let mut d = Driver::new(
+            DriverConfig {
+                start_kbps: 20_000,
+                ceiling_cap_kbps: None,
+                stream_cap_kbps: 200_000,
+                refresh_hz: 60,
+                codec: crate::quic::CODEC_HEVC,
+                bit_depth: 8,
+                chroma_format: crate::quic::CHROMA_IDC_420,
+                audio_reserved_kbps: 256,
+                marks_repeats: true,
+                probe: false,
+                probe_target_kbps: None,
+                ramp: false,
+                reads_delivery,
+            },
+            base,
+        );
+        let mut st = Stats::default();
+        let mut out = Vec::new();
+        for ms in 0..windows * 760 {
+            st.packets_received += 1;
+            st.bytes_received += WIRE;
+            d.on_stats(&st);
+            if ms % 16 == 0 {
+                st.frames_completed += 1;
+                d.on_au(false);
+            }
+            for a in d.tick(base + Duration::from_millis(ms)).actions {
+                if let Action::Delivery(packets) = a {
+                    out.push((ms, packets));
+                }
+            }
+        }
+        out
+    }
+
+    /// The governor's own input, from the client that has to produce it: a
+    /// session on a governing host closes the host's share window
+    /// ([`ShareWindow`]) every report window, so the path is re-read and the
+    /// group re-divided every window. Toward every other host the count goes out
+    /// once and the group can never be divided again.
+    #[test]
+    fn a_governing_host_is_told_what_arrived_every_window() {
+        let told = delivery_reports(12, true);
+        assert_eq!(told.len(), 12, "a window each: {told:?}");
+        assert!(
+            told.windows(2).all(|p| p[1].1 > p[0].1),
+            "every count is this window's own: {told:?}"
+        );
+        let quiet = delivery_reports(12, false);
+        assert_eq!(quiet.len(), 1, "twelve windows, one report: {quiet:?}");
+        assert!(quiet[0].0 < 1_600, "and it is the first window's");
+    }
 
     /// A group with no history behind it, which is how most cases below open.
     fn shares(members: &[Member], may_raise: bool) -> Vec<Option<u32>> {
@@ -277,6 +419,7 @@ mod tests {
             delivered_kbps: Some(delivered_kbps),
             idle: false,
             share_kbps: None,
+            streaming: true,
         }
     }
 
@@ -427,6 +570,44 @@ mod tests {
         assert_eq!(shares(&[auto(17_000, 17_000), joining], true), [None; 2]);
         assert_eq!(shares(&[opening, opening], true), [None; 2]);
         assert_eq!(shares(&[auto(9_000, 9_000); 2], true), [None; 2]);
+    }
+
+    /// A member whose host never asked it for a count per window says nothing
+    /// about the path, and its silence is not room for its sibling to lose: the
+    /// group is left alone until every one of them has reported.
+    #[test]
+    fn a_member_that_has_not_reported_leaves_its_group_alone() {
+        let quiet = Member {
+            delivered_kbps: None,
+            ..auto(12_000, 0)
+        };
+        let starved = auto(12_000, 6_000);
+        assert_eq!(shares(&[starved, quiet], true), [None; 2]);
+        assert_eq!(path_kbps(&[starved, quiet]), None);
+        // Both of them reporting, and the same pair is divided.
+        assert_eq!(
+            shares(&[starved, auto(12_000, 6_000)], true),
+            [Some(6_000); 2]
+        );
+    }
+
+    /// The window a stream starts in is not a reading of the path: what left
+    /// the host over it is still partly in flight when the client closes it, so
+    /// the shortfall is the pipeline, not the link. One more window of the same
+    /// rates and the pair means something.
+    #[test]
+    fn the_window_a_stream_starts_in_does_not_divide_the_path() {
+        let opening = Member {
+            streaming: false,
+            ..auto(20_000, 9_000)
+        };
+        assert_eq!(shares(&[opening; 2], true), [None; 2], "nothing to divide");
+        assert!(!crowded(&[opening; 2]));
+        let running = Member {
+            streaming: true,
+            ..opening
+        };
+        assert_eq!(shares(&[running; 2], true), [Some(9_000); 2]);
     }
 
     /// A ceiling an earlier crowd taught cannot outlive it: while the path
