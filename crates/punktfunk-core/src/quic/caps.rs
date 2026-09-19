@@ -168,6 +168,15 @@ pub const HOST_CAP2_EXT: u8 = 0x04;
 /// client that does not see the bit bursts beside live video as before.
 pub const HOST_CAP2_RAMP: u8 = 0x08;
 
+/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads a
+/// [`DeliveryReport`](super::control::DeliveryReport) every report window and divides a path
+/// two sessions share by them (`abr::governor`). Toward this bit the client sends one per
+/// window — 13 bytes against 750 ms; toward every other host it sends one while nothing is
+/// arriving and one when the first packets land, because an older host logs each unknown
+/// message. A host that leaves the bit clear therefore learns nothing about a session's air
+/// after its first window, and its groups are left alone.
+pub const HOST_CAP2_DELIVERY: u8 = 0x10;
+
 /// [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
 /// that wants to stream from a GPU-less host must advertise this.
 pub const CODEC_H264: u8 = 0x01;

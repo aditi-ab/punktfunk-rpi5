@@ -450,6 +450,14 @@ pub(super) fn send_loop(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        // The share window closes on a client delivery report, one per 750 ms
+        // report window. A counter published on a 2 s clock gives that window
+        // nothing twice and then 2 s of bytes, which reads as a path refusing
+        // everything it was offered ([`crate::session_status::share_for`]).
+        stats
+            .counters
+            .link
+            .publish_egress_bytes(session.stats().bytes_sent);
         if last_wire.elapsed() >= std::time::Duration::from_secs(30) {
             let s = session.stats();
             let w = wire.window();
@@ -472,7 +480,6 @@ pub(super) fn send_loop(
             let s = session.stats();
             let secs = last_perf.elapsed().as_secs_f64();
             let tx_mbps = (s.bytes_sent - last_bytes) as f64 * 8.0 / secs / 1_000_000.0;
-            stats.counters.link.publish_egress_bytes(s.bytes_sent);
             // One window of seal timing feeds both the perf line and the recorder. It runs only
             // while one of them reads it.
             let seal_perf = session.take_seal_perf();

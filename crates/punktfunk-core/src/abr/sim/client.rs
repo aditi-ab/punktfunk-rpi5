@@ -61,6 +61,8 @@ pub(super) struct ClientCfg {
     pub probe_target_kbps: Option<u32>,
     /// Host advertises `HOST_CAP2_RAMP`: measure the link during bring-up.
     pub ramp: bool,
+    /// Host advertises `HOST_CAP2_DELIVERY`: report what arrived every window.
+    pub reads_delivery: bool,
     /// Ceiling injected directly, for a scenario that replays a host which
     /// paused video for the burst. The window it lands in is discarded, as
     /// the probe tail is.
@@ -85,6 +87,7 @@ impl Default for ClientCfg {
             probe: true,
             probe_target_kbps: None,
             ramp: false,
+            reads_delivery: true,
             ceiling_at: None,
             rebuild_at_ms: None,
             automatic: true,
@@ -95,11 +98,16 @@ impl Default for ClientCfg {
 /// What the client sends the host in one tick. The driver's own
 /// [`crate::abr::Action`]s become these; `unrecovered` is what the client
 /// model knows and the real wire carries as a keyframe ask.
+///
+/// `Delivery` is the session's total packets received, and the only thing that
+/// tells the host what is arriving. It goes out when the driver asks, which is
+/// what makes the host's view of a shared path as thin here as on a wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
     SetBitrate(u32),
     Keyframe,
     Loss { ppm: u32, unrecovered: bool },
+    Delivery(u64),
     Probe { target_kbps: u32, duration_ms: u32 },
 }
 
@@ -208,6 +216,7 @@ impl Client {
                 probe: cfg.probe,
                 probe_target_kbps: cfg.probe_target_kbps,
                 ramp: cfg.ramp,
+                reads_delivery: cfg.reads_delivery,
             },
             joined,
         );
@@ -256,23 +265,6 @@ impl Client {
     /// `false` = an explicit bitrate, which the governor never touches.
     pub(super) fn automatic(&self) -> bool {
         self.cfg.automatic
-    }
-
-    /// What the last report window said arrived, kbps. `None` before the first
-    /// one closes: the host has no delivery report for this session yet, and
-    /// a zero there would read as a path refusing everything.
-    pub(super) fn delivered_kbps(&self) -> Option<u32> {
-        self.windows
-            .iter()
-            .rev()
-            .find(|w| !w.discarded)
-            .map(|w| w.actual_kbps)
-    }
-
-    /// Report windows closed so far. What the host sees as its own count of
-    /// delivery reports, and so when it re-reads its send counter.
-    pub(super) fn reports(&self) -> usize {
-        self.windows.len()
     }
 
     /// Make the next frame unrecoverable, whatever the link does.
@@ -591,7 +583,7 @@ impl Client {
                 // As the pump does: a burst nobody answered is let go, or the
                 // report tick stays suppressed for the rest of the session.
                 crate::abr::Action::AbandonProbe => self.probing = false,
-                crate::abr::Action::Delivery(_) => {}
+                crate::abr::Action::Delivery(packets) => out.push(Action::Delivery(packets)),
             }
         }
         if self.ramp_done.is_none() {
@@ -766,6 +758,7 @@ mod tests {
             },
             20_000,
             2,
+            Instant::now(),
         );
         let base = Instant::now();
         let mut c = client(base);

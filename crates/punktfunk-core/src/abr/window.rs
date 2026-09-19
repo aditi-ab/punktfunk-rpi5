@@ -68,16 +68,24 @@ pub(crate) struct WindowAccumulator {
     aftermath_left: u32,
     flushed: bool,
     discard: bool,
-    /// [`crate::quic::DeliveryReport`] cadence: every window while nothing has
-    /// arrived, once when the first packets land, then silence.
+    /// The host reads a delivery count every window
+    /// ([`crate::quic::HOST_CAP2_DELIVERY`]), and what the last window said
+    /// about a plane that had not carried anything yet.
+    reads_delivery: bool,
     delivery_confirmed: bool,
 }
 
 impl WindowAccumulator {
-    pub(crate) fn new(audio_reserved_kbps: u32, marks_repeats: bool, now: Instant) -> Self {
+    pub(crate) fn new(
+        audio_reserved_kbps: u32,
+        marks_repeats: bool,
+        reads_delivery: bool,
+        now: Instant,
+    ) -> Self {
         WindowAccumulator {
             audio_reserved_kbps,
             marks_repeats,
+            reads_delivery,
             last_report: now,
             recovered: 0,
             late: 0,
@@ -278,11 +286,13 @@ impl WindowAccumulator {
 
     /// Whether this window owes the host a [`crate::quic::DeliveryReport`].
     ///
-    /// Every window while `packets_received` is 0 (the host escalates on
-    /// that), then once when the first packets land, then silence. Older
-    /// hosts log every unknown control message.
+    /// A host that divides a shared path is told every window: it has no other
+    /// measure of what reaches this session, and the report is 13 bytes against
+    /// 750 ms. Any other host gets one every window while `packets_received` is
+    /// 0 — it escalates a dead plane on that — then one when the first packets
+    /// land, then silence, because an older host logs every unknown message.
     fn owes_delivery(&mut self, packets_received: u64) -> bool {
-        let owed = packets_received == 0 || !self.delivery_confirmed;
+        let owed = self.reads_delivery || packets_received == 0 || !self.delivery_confirmed;
         self.delivery_confirmed = packets_received > 0;
         owed
     }
@@ -382,11 +392,23 @@ fn wire_bytes(st: &Stats) -> u64 {
 mod tests {
     use super::*;
 
-    /// DeliveryReport: "zero" while true, one confirmation when video
-    /// starts, then silence (older hosts warn per unknown message).
+    /// A host that reads a count every window is sent one every window, dead
+    /// plane or not: it divides a shared path by nothing else.
+    #[test]
+    fn a_governing_host_is_told_what_arrived_every_window() {
+        let mut w = WindowAccumulator::new(0, true, true, Instant::now());
+        assert!(w.owes_delivery(0));
+        for n in [500, 900, 1_200, 90_000] {
+            assert!(w.owes_delivery(n), "a share needs this window's count");
+        }
+    }
+
+    /// DeliveryReport toward every other host: "zero" while true, one
+    /// confirmation when video starts, then silence (older hosts warn per
+    /// unknown message).
     #[test]
     fn the_delivery_count_is_reported_while_zero_then_once_more_and_never_again() {
-        let mut w = WindowAccumulator::new(0, true, Instant::now());
+        let mut w = WindowAccumulator::new(0, true, false, Instant::now());
         for _ in 0..5 {
             assert!(
                 w.owes_delivery(0),
@@ -405,7 +427,7 @@ mod tests {
     /// A session that never receives must never look confirmed.
     #[test]
     fn a_session_that_receives_nothing_never_reports_itself_healthy() {
-        let mut w = WindowAccumulator::new(0, true, Instant::now());
+        let mut w = WindowAccumulator::new(0, true, false, Instant::now());
         for _ in 0..100 {
             assert!(w.owes_delivery(0));
             assert!(!w.delivery_confirmed);

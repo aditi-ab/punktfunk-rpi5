@@ -3088,12 +3088,16 @@ mod tests {
 
     /// In-process hosts share the process-global admission table. Concurrent tests would
     /// `preempt_same_identity` each other. Poison-tolerant so a failing test does not cascade.
+    ///
+    /// A session here also lands in the live registry, so every holder takes
+    /// [`crate::session_status::tests::REGISTRY`] first — that order, always.
     static SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// C ABI: TOFU connect → pull frames → send input → close. Three sequential sessions
     /// against one host prove the persistent listener; a wrong pin is rejected.
     #[test]
     fn c_abi_connection_roundtrip() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::abi::{
             punktfunk_connect, punktfunk_connection_close, punktfunk_connection_mode,
@@ -3261,6 +3265,7 @@ mod tests {
     /// not covered here. `design/clipboard-and-file-transfer.md`.
     #[test]
     fn clipboard_control_and_fetch_decline_over_session() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::clipboard::ClipEventCore;
@@ -3393,6 +3398,7 @@ mod tests {
     /// Unpaired knock is parked; approve while waiting admits the same connection, no reconnect.
     #[test]
     fn delegated_approval_admits_after_knock() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::endpoint;
@@ -3534,6 +3540,7 @@ mod tests {
     /// Right PIN pairs; paired identity gets a session; anonymous does not.
     #[test]
     fn pairing_ceremony_and_gate() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::endpoint;
@@ -3836,6 +3843,7 @@ mod tests {
     /// Short expiry: Welcome advertises grants + remaining; deadline closes typed (`0x69`).
     #[test]
     fn access_expiry_advertises_and_closes_typed() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::quic::endpoint;
 
@@ -3890,6 +3898,7 @@ mod tests {
     /// Mid-session grant edit → `AccessUpdate`; T−1 m warning fires; "expire now" typed-closes.
     #[test]
     fn access_edit_pushes_updates_and_expire_now_closes() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::quic::endpoint;
 
@@ -3976,6 +3985,7 @@ mod tests {
     /// Launch without the grant: typed 0x6A before handshake. Same device without launch is admitted.
     #[test]
     fn launch_refused_without_grant_but_session_admitted() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::endpoint;
@@ -4067,6 +4077,7 @@ mod tests {
     /// control message.
     #[test]
     fn unknown_launch_reaches_the_client_as_a_refusal() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::{endpoint, LaunchOutcomeKind};
@@ -4125,6 +4136,7 @@ mod tests {
     /// Expired record knocks into pending; re-approval is the re-grant on the held connection.
     #[test]
     fn expired_record_knocks_into_pending_and_reapproval_regrants() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::endpoint;

@@ -171,6 +171,16 @@ struct Session {
     leave_ms: u64,
     host: Host,
     client: Client,
+    /// What the host last told this session, the most its group was seen to
+    /// carry between them, and whether it had a group at all — the three the
+    /// host keeps per session (`session_status::AbrShare`).
+    share_kbps: Option<u32>,
+    path_kbps: u32,
+    grouped: bool,
+    /// When each of this session's up-moves may next go out
+    /// (`native/control.rs` `ShareClocks`).
+    room_at_ms: u64,
+    lift_at_ms: u64,
 }
 
 impl Session {
@@ -179,51 +189,82 @@ impl Session {
     }
 
     /// This session as the host's governor sees it: the encoder target it set,
-    /// the wire rate it put out, what the client last reported arriving, and
-    /// whether the source is still. The host has all four without asking.
-    fn member(&self, now_ms: u64, offered_kbps: u32, share_kbps: Option<u32>) -> governor::Member {
+    /// the wire rate it put out, what the client's last delivery report said
+    /// arrived, and whether the source is still.
+    fn member(&self, now_ms: u64) -> governor::Member {
         governor::Member {
             automatic: self.client.automatic(),
             current_kbps: self.host.budget_kbps(),
-            offered_kbps,
-            delivered_kbps: self.client.delivered_kbps(),
+            offered_kbps: self.host.offered_kbps(),
+            delivered_kbps: self.host.delivered_kbps(),
             idle: self.host.idle(now_ms),
-            share_kbps,
+            share_kbps: self.share_kbps,
         }
+    }
+
+    /// The two clocks an up-move rides, taken as the host takes them.
+    fn clocks(&mut self, now_ms: u64) -> governor::Clocks {
+        let out = governor::Clocks {
+            room: now_ms >= self.room_at_ms,
+            lift: now_ms >= self.lift_at_ms,
+        };
+        if out.room {
+            self.room_at_ms = now_ms + governor::SHARE_CLOCK.as_millis() as u64;
+        }
+        if out.lift {
+            self.lift_at_ms = now_ms + governor::SHARE_LIFT_CLOCK.as_millis() as u64;
+        }
+        out
     }
 }
 
-/// The host's send counter as it stood at the last delivery report, and the
-/// rate it came to since the one before that.
+/// Session `i`'s delivery report reached the host: it re-takes the shares of the
+/// path this session is on and applies its own.
 ///
-/// Read on a report rather than on a timer so both sides of "short" describe
-/// the same stretch of link: what went out over one window against what
-/// arrived over it.
-#[derive(Clone, Copy, Default)]
-struct Offered {
-    reports: usize,
-    at_ms: u64,
-    bytes: u64,
-    kbps: u32,
-}
-
-impl Offered {
-    fn update(&mut self, s: &Session, now_ms: u64) {
-        if s.client.reports() == self.reports {
-            return;
+/// The report is the only boundary the host has, so this is where the policy
+/// runs — `session_status::share_for`, driven by `native/control.rs`. Every
+/// member computes the whole group and applies only its own share, because a
+/// share is only ever sent down the control stream its own task owns.
+fn govern(sessions: &mut [Session], i: usize, now_ms: u64) {
+    let group: Vec<usize> = (0..sessions.len())
+        .filter(|&k| sessions[k].live(now_ms))
+        .collect();
+    let Some(mine) = group.iter().position(|&k| k == i) else {
+        return;
+    };
+    let facts: Vec<governor::Member> = group.iter().map(|&k| sessions[k].member(now_ms)).collect();
+    if group.len() < 2 {
+        // Alone on the path: hand over the whole of what the group proved it
+        // carried, once. The wall this session measured beside them was their
+        // residual, and nobody but the host knows they have gone.
+        let path = std::mem::take(&mut sessions[i].path_kbps);
+        if std::mem::take(&mut sessions[i].grouped) && path > 0 {
+            sessions[i].share_kbps = Some(path);
+            sessions[i].host.govern(now_ms, path);
         }
-        let bytes = s.host.offered_bytes();
-        self.kbps = ((bytes - self.bytes) * 8 / (now_ms - self.at_ms).max(1)) as u32;
-        self.reports = s.client.reports();
-        self.at_ms = now_ms;
-        self.bytes = bytes;
+        return;
+    }
+    sessions[i].grouped = true;
+    // The most the path has been seen to carry, until the group is short of
+    // what it offers: that is the path being re-measured, and a figure from
+    // before it changed expires there (L1).
+    // A member that has not reported yet leaves the group unmeasured, and a
+    // figure it is not in must not be remembered as the path.
+    let Some(carried) = governor::path_kbps(&facts) else {
+        return;
+    };
+    let path = if governor::crowded(&facts) {
+        carried
+    } else {
+        sessions[i].path_kbps.max(carried)
+    };
+    sessions[i].path_kbps = path;
+    let clocks = sessions[i].clocks(now_ms);
+    if let Some(share) = governor::shares(&facts, path, clocks)[mine] {
+        sessions[i].share_kbps = (share != governor::NO_SHARE_KBPS).then_some(share);
+        sessions[i].host.govern(now_ms, share);
     }
 }
-
-/// How often the host re-takes the shares. It runs on delivery reports, which
-/// arrive a few times a second; only [`governor::SHARE_CLOCK`] lets a share
-/// rise, so this cadence decides how fast a cut lands and nothing else.
-const GOVERN_EVERY_MS: u64 = 250;
 
 fn run(sc: &Scenario) -> Run {
     let base = Instant::now();
@@ -246,32 +287,27 @@ fn run(sc: &Scenario) -> Run {
             Session {
                 join_ms: s.join_ms,
                 leave_ms: s.leave_ms,
-                host: Host::new(s.host.clone(), s.client.start_kbps, sc.seed ^ (0x9A << i)),
+                host: Host::new(
+                    s.host.clone(),
+                    s.client.start_kbps,
+                    sc.seed ^ (0x9A << i),
+                    joined,
+                ),
                 client,
+                share_kbps: None,
+                path_kbps: 0,
+                grouped: false,
+                room_at_ms: s.join_ms + governor::SHARE_CLOCK.as_millis() as u64,
+                lift_at_ms: s.join_ms + governor::SHARE_LIFT_CLOCK.as_millis() as u64,
             }
         })
         .collect();
     let mut drained = Vec::new();
     let mut actions = Vec::new();
     let (mut offered_10s, mut capacity_10s) = (0u64, 0u64);
-    // The host's own memory of what each session was last told, and the clock
-    // an up-move waits for.
-    let mut shares: Vec<Option<u32>> = vec![None; sessions.len()];
-    let mut next_raise_ms = governor::SHARE_CLOCK.as_millis() as u64;
-    let mut next_lift_ms = governor::SHARE_LIFT_CLOCK.as_millis() as u64;
-    let mut members: Vec<usize> = Vec::new();
-    // Who is on a shared path, and what it was last seen carrying for them.
-    let mut grouped = vec![false; sessions.len()];
-    let mut path_kbps = 0;
-    // A session that has not joined has sent nothing, so its mark starts
-    // where it does.
-    let mut offered: Vec<Offered> = sessions
-        .iter()
-        .map(|s| Offered {
-            at_ms: s.join_ms,
-            ..Offered::default()
-        })
-        .collect();
+    // Sessions whose delivery report arrived this millisecond: the host's only
+    // chance to re-take their shares.
+    let mut reported: Vec<usize> = Vec::new();
 
     for now in 0..sc.duration_ms {
         if now < 10_000 {
@@ -326,6 +362,7 @@ fn run(sc: &Scenario) -> Run {
                 s.client.complete(frame, draw, now + link.base_delay_ms());
             }
         }
+        reported.clear();
         for (i, s) in sessions.iter_mut().enumerate() {
             if !s.live(now) {
                 continue;
@@ -337,6 +374,13 @@ fn run(sc: &Scenario) -> Run {
                     Action::SetBitrate(kbps) => s.host.on_set_bitrate(now, kbps),
                     Action::Keyframe => s.host.on_keyframe_request(now),
                     Action::Loss { ppm, unrecovered } => s.host.on_loss_report(ppm, unrecovered),
+                    Action::Delivery(packets) => {
+                        s.host.on_delivery_report(
+                            base + std::time::Duration::from_millis(now),
+                            packets,
+                        );
+                        reported.push(i);
+                    }
                     Action::Probe {
                         target_kbps,
                         duration_ms,
@@ -352,61 +396,9 @@ fn run(sc: &Scenario) -> Run {
             if let Some(share) = s.host.apply_governor(now) {
                 s.client.push_ack(share, AckReason::Governor);
             }
-            // Read the send counter where the report window closed, so both
-            // sides of "short" cover the same stretch of link.
-            offered[i].update(s, now);
         }
-        if now % GOVERN_EVERY_MS != 0 {
-            continue;
-        }
-        members.clear();
-        members.extend((0..sessions.len()).filter(|&i| sessions[i].live(now)));
-        let facts: Vec<governor::Member> = members
-            .iter()
-            .map(|&i| sessions[i].member(now, offered[i].kbps, shares[i]))
-            .collect();
-        if members.len() < 2 {
-            // Alone on the path: hand over the whole of what the group proved
-            // it carried, once. The wall this session measured beside them was
-            // their residual, and nobody but the host knows they have gone.
-            for &i in &members {
-                if std::mem::take(&mut grouped[i]) && path_kbps > 0 {
-                    sessions[i].host.govern(now, path_kbps);
-                    shares[i] = Some(path_kbps);
-                }
-            }
-            path_kbps = 0;
-            continue;
-        }
-        // The most the path has been seen to carry, until the group is short of
-        // what it offers: that is the path being re-measured, and a figure from
-        // before it changed expires there (L1).
-        path_kbps = if governor::crowded(&facts) {
-            governor::path_kbps(&facts)
-        } else {
-            path_kbps.max(governor::path_kbps(&facts))
-        };
-        for &i in &members {
-            grouped[i] = true;
-        }
-        let clocks = governor::Clocks {
-            room: now >= next_raise_ms,
-            lift: now >= next_lift_ms,
-        };
-        if clocks.room {
-            next_raise_ms = now + governor::SHARE_CLOCK.as_millis() as u64;
-        }
-        if clocks.lift {
-            next_lift_ms = now + governor::SHARE_LIFT_CLOCK.as_millis() as u64;
-        }
-        for (k, share) in governor::shares(&facts, path_kbps, clocks)
-            .into_iter()
-            .enumerate()
-        {
-            let Some(share) = share else { continue };
-            let i = members[k];
-            shares[i] = (share != governor::NO_SHARE_KBPS).then_some(share);
-            sessions[i].host.govern(now, share);
+        for &i in &reported {
+            govern(&mut sessions, i, now);
         }
     }
     let metrics = measure(sc, &sessions, &mut link, offered_10s, capacity_10s);
