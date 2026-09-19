@@ -114,8 +114,9 @@ struct Args {
     /// seconds (default 4), print what's found, and exit. No connection is made.
     discover: Option<u64>,
     /// `--trajectory FILE` — stream on the shared client pump (the one the desktop and TV
-    /// clients run) in Automatic and write one JSON line per ABR report window, plus a
-    /// summary carrying the link simulator's metrics. The netem rig's client half.
+    /// clients run) and write one JSON line per ABR report window, plus a summary carrying
+    /// the link simulator's metrics. The netem rig's client half. `--bitrate` pins the
+    /// session: the windows are still recorded, with no controller behind them.
     trajectory: Option<String>,
     /// `--link <achievable_kbps>[:<capacity_kbps>]` — what the shaped path is, for the two
     /// summary metrics a client cannot measure from inside its own session.
@@ -425,6 +426,7 @@ fn run(args: Args) -> Result<()> {
             args.link,
             &args.profile,
             args.decoder_hold,
+            args.bitrate_kbps,
         );
     }
     let rt = tokio::runtime::Builder::new_multi_thread()

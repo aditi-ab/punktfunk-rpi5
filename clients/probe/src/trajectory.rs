@@ -1,5 +1,5 @@
 //! `--trajectory`: a session on the shipped client pump, writing down every
-//! Automatic-bitrate window.
+//! report window.
 //!
 //! The rest of the probe drives the wire by hand. This path does not: it opens
 //! a [`NativeClient`], which runs the same `DataPump` and `abr::Driver` the
@@ -242,6 +242,10 @@ pub fn summary(
 }
 
 /// Stream for `seconds`, recording every closed window, then write the file.
+///
+/// `bitrate_kbps` is the embedder's rate: `0` is Automatic, and anything else pins the
+/// session exactly as it does for a shipped client. A pinned session's controller never
+/// arms, so its windows carry `"target_kbps":0` — a record of a link nobody is steering.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     connect: &str,
@@ -254,6 +258,7 @@ pub fn run(
     link: Link,
     profile: &str,
     decoder_hold: bool,
+    bitrate_kbps: u32,
 ) -> Result<()> {
     let (host, port) = connect
         .rsplit_once(':')
@@ -265,8 +270,7 @@ pub fn run(
         mode,
         CompositorPref::Auto,
         GamepadPref::Auto,
-        // Automatic: the only case the controller arms.
-        0,
+        bitrate_kbps,
         0,
         2,
         punktfunk_core::quic::CODEC_H264
@@ -285,6 +289,7 @@ pub fn run(
     .map_err(|e| anyhow::anyhow!("connect to the host: {e:?}"))?;
     tracing::info!(
         start_kbps = client.current_bitrate_kbps(),
+        pinned = bitrate_kbps > 0,
         mode = ?client.mode(),
         "trajectory session open"
     );
