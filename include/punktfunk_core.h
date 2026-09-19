@@ -782,7 +782,7 @@
 // arriving and one when the first packets land, because an older host logs each unknown
 // message. A host that leaves the bit clear therefore learns nothing about a session's air
 // after its first window, and its groups are left alone.
-#define PUNKTFUNK_HOST_CAP2_DELIVERY 16
+#define PUNKTFUNK_HOST_CAP2_DELIVERY 32
 
 // [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
 // that wants to stream from a GPU-less host must advertise this.

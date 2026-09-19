@@ -184,7 +184,7 @@ pub const HOST_CAP2_RAMP: u8 = 0x10;
 /// arriving and one when the first packets land, because an older host logs each unknown
 /// message. A host that leaves the bit clear therefore learns nothing about a session's air
 /// after its first window, and its groups are left alone.
-pub const HOST_CAP2_DELIVERY: u8 = 0x10;
+pub const HOST_CAP2_DELIVERY: u8 = 0x20;
 
 /// [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
 /// that wants to stream from a GPU-less host must advertise this.
@@ -381,6 +381,7 @@ mod tests {
                 ("HOST_CAP2_EXT", HOST_CAP2_EXT),
                 ("HOST_CAP2_SCROLL", HOST_CAP2_SCROLL),
                 ("HOST_CAP2_RAMP", HOST_CAP2_RAMP),
+                ("HOST_CAP2_DELIVERY", HOST_CAP2_DELIVERY),
             ],
         ),
         (
