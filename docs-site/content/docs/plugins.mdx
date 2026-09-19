@@ -124,7 +124,9 @@ plugin from **Browse** and it carries its catalog badge instead.
 | `punktfunk-host plugins enable` | Enable + start the runner. |
 | `punktfunk-host plugins disable` | Stop + disable the runner. |
 | `punktfunk-host plugins status` | Is the runner enabled and running? |
-| `punktfunk-host plugins grant <plugin> <dir>` | Let one plugin reach a directory of yours — a ROM library, a game install dir. |
+| `punktfunk-host plugins grant <plugin> <dir> [--write]` | Allow a folder directly; read-only unless `--write`. |
+| `punktfunk-host plugins access` | List grants, pending requests and denials. |
+| `punktfunk-host plugins revoke <plugin> <dir>` | Remove one grant. |
 
 A bare name resolves to the first-party package — `playnite` installs `@punktfunk/plugin-playnite`
 from Punktfunk's own registry. Any other name installs from the **public npm registry** and is
@@ -179,14 +181,22 @@ reach, and builds the argv itself — so a value is always one argument, never s
 declaration ships inside the reviewed, hash-pinned tarball; nothing the plugin says while running
 can widen it.
 
-**Your own directories.** A package cannot know where you keep your ROMs or install your games, so
-those are yours to grant:
+**Your own directories.** A package cannot know where you keep ROMs or games. When its scanner
+finds a folder it cannot read, the Library source shows the exact path and whether it asks for read
+or write access. Choose **Allow** or **Don't allow** there. Allowing it restarts only that plugin;
+read access is the default.
+
+The Installed plugin row lists every grant and denial. Remove a grant there, or choose **Ask again**
+to clear a denial. The CLI is the alternative:
 
 ```sh
 punktfunk-host plugins grant rom-manager /mnt/games/roms
+punktfunk-host plugins access
+punktfunk-host plugins revoke rom-manager /mnt/games/roms
 ```
 
-The plugin may then read that directory and launch from it, and nothing else on the box changes.
+Use `--write` only when the plugin must change files in that folder. A request is only a suggestion:
+nothing reaches the sandbox until you allow it.
 
 ## Windows: a plugin that says "not installed"
 
@@ -194,15 +204,9 @@ The runner is a de-privileged account (`NT AUTHORITY\LocalService`), so it can't
 inside **your** user profile — a launcher or database under `%AppData%` or `%LocalAppData%` is
 invisible to it and reads exactly like one that isn't installed.
 
-When a plugin reports a path it can see but not read, grant it that one directory:
-
-```powershell
-punktfunk-host plugins grant rom-manager "C:\Users\you\AppData\Roaming\Ryujinx"
-```
-
-That adds read-only access to that folder and everything under it; the rest of your profile stays
-closed. Nothing to do on Linux: the runner there is a systemd **user** unit and already runs as
-you.
+When a plugin finds that launcher path, it asks through the same Library source row. Allowing it
+adds read-only access to that folder and everything under it; the rest of your profile stays
+closed. The CLI command above remains available from an elevated PowerShell.
 
 ## Updating and removing a plugin
 
@@ -355,11 +359,9 @@ packaged `/usr` and `~/.local` layouts. Point `PUNKTFUNK_SCRIPTING` at it (see
 whose `PATH` is much shorter than your shell's — a runner that `plugins add` finds and the console
 doesn't is that difference, and the env var is the fix.
 
-**A plugin can't read a file in your home (Linux)** — the runner starts with an empty home and
-gets back only what plugins work in: their packages and state, your scripts, and the usual game
-library roots. Anything else is yours to grant, with `systemctl --user edit punktfunk-scripting`
-and a `BindReadOnlyPaths=%h/<path>` (or `ReadWritePaths=/mnt/games` for a path outside the home).
-The host's admin token and identity key stay out of reach either way — see
+**A plugin can't read one of its folders** — open its Library source. A valid request appears with
+the exact path; allow it there. Missing drives and protected paths are refused by the host and
+never appear. The host's admin token and identity key stay out of reach either way — see
 [Security](/docs/security).
 
 **A plugin's interface won't load** — see
@@ -426,3 +428,22 @@ by the runner. The kit owns lifecycle, config and state, the library sync engine
 plugin's console page. Start from the
 [plugin-kit README](https://git.unom.io/unom/punktfunk/src/branch/main/plugin-kit) and
 [ROM Manager](https://git.unom.io/unom/punktfunk-plugin-rom-manager), the reference implementation.
+
+A library plugin declares folders discovered from launcher data with `wants`. The kit checks them
+before every scan, batches unusable paths into one request, and scans whatever is reachable now:
+
+```ts
+export default defineLibraryPlugin({
+  // …name, schema, detect and scan…
+  wants: (config) => launcherLibraryFolders(config),
+})
+```
+
+Inside the Linux sandbox an unbound directory and a missing drive both look like `ENOENT`, so the
+kit asks for `missing` paths there and lets the host check the real filesystem. Outside the sandbox,
+only permission-denied paths are requested. The same unreachable set is posted once per run; a
+grant restarts the plugin and starts a fresh scan.
+
+Plugins that do not use `defineLibraryPlugin` can yield `requestAccess(paths, reason)` from
+`@punktfunk/plugin-kit`. It only creates pending rows. Never tell users to widen the runner unit or
+change ACLs by hand; the operator's Allow action is the grant.

@@ -242,13 +242,14 @@ machine. Punktfunk narrows it as far as it can:
   the host will then refuse any index from it that isn't correctly signed.
 - **A plugin does not choose what runs.** Its package declares which programs the host may start
   for it, and with what shape of arguments; a library entry only fills in values, which the host
-  checks and turns into one argument each. Paths outside what that package declares — or what you
-  granted it with `plugins grant` — are refused. So a plugin publishing a tile cannot publish a
-  command.
+  checks and turns into one argument each. Paths outside what that package declares — or a folder
+  you allowed — are refused. Folder grants are read-only unless a request explicitly asks for write
+  access and you allow that separate request. So a plugin publishing a tile cannot publish a command.
 - **Each plugin runs in its own sandbox.** On Linux every plugin is a separate process in its own
   [bubblewrap](https://github.com/containers/bubblewrap) sandbox: an empty home, no network unless
   its manifest asked for one, and read access to exactly the paths it declared plus the ones you
-  granted it. Your `~/.ssh`, your browser profile and the host's own credentials are not in it. Nor
+  allowed. A plugin's request only puts a row in the console; it cannot widen its own sandbox. Your
+  `~/.ssh`, browser profile and the host's own credentials are not in it. Nor
   is the host's process — the sandbox has its own PID namespace, which is what makes this a
   boundary rather than a curtain: a plugin cannot reach the host through `/proc`, read its
   environment, or signal it. A box that cannot build a sandbox runs **no** plugins and says so on
