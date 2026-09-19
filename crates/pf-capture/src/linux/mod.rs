@@ -57,7 +57,7 @@ struct CaptureOpts {
     /// `SPA_META_Cursor` every buffer. `false` (Mutter): buffers recycle
     /// the region. See [`pw_cursor::CursorState::id0_hides`].
     cursor_id0_hides: bool,
-    /// Gamescope omits cursor metadata and exports LINEAR-only dmabufs.
+    /// Gamescope omits cursor metadata. Its proved tiled formats lead; LINEAR remains fallback.
     producer_is_gamescope: bool,
     /// Least dmabuf pool depth to ask for: [`crate::POOL_MIN`], or
     /// [`crate::KWIN_POOL_MIN`] so KWin's default of 3 cannot win.
@@ -77,6 +77,8 @@ struct CaptureOpts {
 
 #[derive(Clone)]
 struct CaptureSignals {
+    /// Failure memory scoped to this producer identity and shared with encoder frames.
+    health: pf_zerocopy::ZeroCopyHealth,
     /// Per-frame de-pad runs only while set; pooling a 5K capturer is cheap
     /// between streams.
     active: Arc<AtomicBool>,
@@ -115,9 +117,22 @@ struct CaptureSignals {
     has_importer: Arc<AtomicBool>,
 }
 
+/// Producer identity plus the consumer policy whose failures must stay independent.
+fn health_identity(base: u64, policy: &ZeroCopyPolicy) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    base.hash(&mut hash);
+    policy.backend_is_vaapi.hash(&mut hash);
+    policy.pyrowave_session.hash(&mut hash);
+    policy.nvenc_raw_dmabuf.hash(&mut hash);
+    policy.encoder_modifiers.hash(&mut hash);
+    hash.finish()
+}
+
 impl CaptureSignals {
-    fn new() -> Self {
+    fn new(health: pf_zerocopy::ZeroCopyHealth) -> Self {
         Self {
+            health,
             active: Arc::new(AtomicBool::new(false)),
             negotiated: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
@@ -148,7 +163,7 @@ pub struct PortalCapturer {
     stall_since: Option<std::time::Instant>,
     /// Raw-dmabuf passthrough offer, copied from the thread's
     /// [`NegotiationPlan`](pipewire::NegotiationPlan) — never re-derived.
-    /// A failed offer latches [`pf_zerocopy::note_raw_dmabuf_negotiation_failed`].
+    /// A failed offer latches this capture's [`pf_zerocopy::ZeroCopyHealth`].
     vaapi_dmabuf: bool,
     /// CUDA import choices for held frames ([`Self::import_held`]).
     import_policy: pipewire::ImportPolicy,
@@ -402,9 +417,8 @@ impl PwHandles {
     }
 }
 
-/// Spawn the PipeWire consumer (`fd` Some = portal remote, None = default
-/// daemon). `preferred` seeds negotiation; for Mutter virtual monitors it
-/// is what sizes the monitor.
+/// Spawn one PipeWire consumer with health keyed by source and encoder policy.
+/// `preferred` seeds negotiation and sizes a Mutter virtual monitor.
 fn spawn_pipewire(
     fd: Option<OwnedFd>,
     node_id: u32,
@@ -425,7 +439,11 @@ fn spawn_pipewire(
     let slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
     let slot_cb = slot.clone();
     let (wake_tx, wake_rx) = sync_channel::<()>(1);
-    let signals = CaptureSignals::new();
+    // Portal-fd vs virtual-output with the same node number are different sources.
+    let identity = u64::from(node_id) | (u64::from(fd.is_some()) << 32);
+    let signals = CaptureSignals::new(pf_zerocopy::zero_copy_health(health_identity(
+        identity, &policy,
+    )));
     let signals_cb = signals.clone();
     // Absolute `::pipewire`: inner `mod pipewire` shadows the crate. Receiver
     // attaches to the loop; sender fires in `Drop`.
@@ -443,9 +461,6 @@ fn spawn_pipewire(
     } else {
         want_hdr
     };
-    // Latch key before reading the verdict. Portal-fd vs virtual-output
-    // with the same node number are different sources (bit 32).
-    pf_zerocopy::note_raw_dmabuf_capture(u64::from(node_id) | (u64::from(fd.is_some()) << 32));
     // Resolved once and handed to the thread; every env/latch read happens here.
     let plan = pipewire::negotiation_plan(pipewire::NegotiationInputs {
         zerocopy,
@@ -455,9 +470,9 @@ fn spawn_pipewire(
         backend_is_vaapi: policy.backend_is_vaapi,
         pyrowave_session: policy.pyrowave_session,
         native_nv12_session: policy.native_nv12_session,
-        raw_dmabuf_import_disabled: pf_zerocopy::raw_dmabuf_import_disabled(),
-        gpu_import_disabled: pf_zerocopy::gpu_import_disabled(),
-        gpu_dmabuf_negotiation_failed: pf_zerocopy::gpu_dmabuf_negotiation_disabled(),
+        raw_dmabuf_import_disabled: signals.health.raw_disabled(),
+        gpu_import_disabled: signals.health.gpu_import_disabled(),
+        gpu_dmabuf_negotiation_failed: signals.health.gpu_negotiation_disabled(),
         // Default ON; `=0` (any falsy spelling, shared parser) restores packed RGB.
         native_nv12_env_on: pf_host_config::env_on("PUNKTFUNK_PIPEWIRE_NV12").unwrap_or(true),
         hdr_cuda_ok: policy.hdr_cuda_ok,
@@ -824,7 +839,7 @@ impl PortalCapturer {
     fn note_negotiation_confirmed(&mut self) {
         if (self.vaapi_dmabuf || self.raw_for_encoder) && !self.negotiation_confirmed {
             self.negotiation_confirmed = true;
-            pf_zerocopy::note_raw_dmabuf_negotiation_ok();
+            self.signals.health.note_raw_negotiation_ok();
         }
     }
 
@@ -886,7 +901,7 @@ impl PortalCapturer {
                         // `pf_zerocopy::enabled()` dropped every later
                         // session (NVENC EGL→CUDA included) to CPU capture.
                         if convicted {
-                            pf_zerocopy::note_raw_dmabuf_negotiation_failed();
+                            self.signals.health.note_raw_negotiation_failed();
                         }
                         Err(anyhow!(
                             "no PipeWire frame within {within}s (node {}): the compositor never \
@@ -906,7 +921,7 @@ impl PortalCapturer {
                         // refuses them identically on every retry. Forced
                         // `PUNKTFUNK_ZEROCOPY=1` keeps erroring (same as raw).
                         if convicted {
-                            pf_zerocopy::note_gpu_dmabuf_negotiation_failed();
+                            self.signals.health.note_gpu_negotiation_failed();
                         }
                         Err(anyhow!(
                             "no PipeWire frame within {within}s (node {}): the compositor never \
@@ -955,17 +970,19 @@ pub struct WlCapturer {
 }
 
 impl WlCapturer {
-    /// `output_name` is the compositor's `wl_output.name` for the head the host
-    /// already created. Fails when the compositor lacks the protocol, the output
-    /// is gone, or no dmabuf format the consumer imports is on offer — every one
-    /// of which is a reason for the caller to keep the portal path.
+    /// Open the named compositor output with identity-scoped failure health.
+    /// Missing protocol/output or no consumer-importable dmabuf keeps the portal path.
     pub fn open(
         output_name: String,
         keepalive: Box<dyn Send>,
         policy: ZeroCopyPolicy,
     ) -> Result<WlCapturer> {
         let slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
-        let signals = CaptureSignals::new();
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        output_name.hash(&mut hash);
+        let identity = health_identity(hash.finish() | (1 << 63), &policy);
+        let signals = CaptureSignals::new(pf_zerocopy::zero_copy_health(identity));
         signals.active.store(true, Ordering::Relaxed);
         let h = wl_capture::spawn(output_name.clone(), policy, slot, signals)?;
         Ok(WlCapturer {

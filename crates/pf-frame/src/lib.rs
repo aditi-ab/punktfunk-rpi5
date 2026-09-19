@@ -320,6 +320,10 @@ pub struct DmabufFrame {
     pub stride: u32,
     /// Deferred-requeue hold; `None` when the pool could not spare a buffer (`PUNKTFUNK_ZEROCOPY_HOLD=0`).
     pub hold: Option<FrameHold>,
+    /// Failure state for this producer identity; encoder imports update its scoped latch.
+    pub health: pf_zerocopy::ZeroCopyHealth,
+    /// Encoder rejection marks this capture broken so the next tick rebuilds its offer.
+    pub rebuild: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub enum FramePayload {

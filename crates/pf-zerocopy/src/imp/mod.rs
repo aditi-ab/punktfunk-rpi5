@@ -24,7 +24,7 @@ pub mod vkslot;
 pub mod vulkan;
 pub mod worker;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub use cuda::DeviceBuffer;
 pub use egl::{DmabufPlane, EglImporter};
@@ -66,8 +66,7 @@ pub fn zerocopy_forced() -> bool {
 }
 
 /// Zero-copy is on. Unset defaults ON; `PUNKTFUNK_ZEROCOPY=0` opts out.
-/// Global env switch only — do not consult the raw-passthrough latch; that
-/// gate is [`note_raw_dmabuf_negotiation_failed`], scoped to that offer.
+/// Global env switch only; each capture's [`ZeroCopyHealth`] applies its own latches.
 pub fn enabled() -> bool {
     flag_opt("PUNKTFUNK_ZEROCOPY").unwrap_or(true)
 }
@@ -279,30 +278,9 @@ impl Importer {
     }
 }
 
-/// One compositor crash kills the worker once and the rebuild succeeds; 3
-/// consecutive deaths without an import means the GPU stack is wedged.
-static GPU_IMPORT_DEATH_STREAK: AtomicU32 = AtomicU32::new(0);
-static GPU_IMPORT_DISABLED: AtomicBool = AtomicBool::new(false);
+/// One compositor crash costs one rebuild; three consecutive worker deaths disable
+/// the GPU importer for that capture identity.
 const GPU_IMPORT_DEATH_LATCH: u32 = 3;
-
-pub fn note_gpu_import_death() {
-    let streak = GPU_IMPORT_DEATH_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
-    if streak >= GPU_IMPORT_DEATH_LATCH && !GPU_IMPORT_DISABLED.swap(true, Ordering::Relaxed) {
-        tracing::error!(
-            streak,
-            "zero-copy GPU import disabled for this host process: the import worker died {streak} \
-             times in a row (GPU/driver stack unstable) — captures fall back to the CPU path"
-        );
-    }
-}
-
-pub fn note_gpu_import_ok() {
-    GPU_IMPORT_DEATH_STREAK.store(0, Ordering::Relaxed);
-}
-
-pub fn gpu_import_disabled() -> bool {
-    GPU_IMPORT_DISABLED.load(Ordering::Relaxed)
-}
 
 /// Below the encoder rebuild budget, so this fires before that session ends.
 const RAW_DMABUF_FAILURE_LATCH: u32 = 3;
@@ -327,11 +305,7 @@ pub struct RawDmabufLatch {
     import_latched: AtomicBool,
     negotiation_streak: AtomicU32,
     negotiation_latched: AtomicBool,
-    identity: AtomicU64,
 }
-
-/// Sentinel: a real node id is never `u64::MAX`.
-const NO_IDENTITY: u64 = u64::MAX;
 
 impl RawDmabufLatch {
     pub const fn new() -> Self {
@@ -340,7 +314,6 @@ impl RawDmabufLatch {
             import_latched: AtomicBool::new(false),
             negotiation_streak: AtomicU32::new(0),
             negotiation_latched: AtomicBool::new(false),
-            identity: AtomicU64::new(NO_IDENTITY),
         }
     }
 
@@ -349,33 +322,14 @@ impl RawDmabufLatch {
             || self.negotiation_latched.load(Ordering::Relaxed)
     }
 
-    /// Bind the latch to this capture. A different identity clears counters and
-    /// both latches.
-    ///
-    /// `true` only when a latch actually cleared — not merely "identity
-    /// changed". Call before [`disabled`](Self::disabled) or the decision uses
-    /// the previous capture's verdict.
-    pub fn observe_capture(&self, identity: u64) -> bool {
-        if self.identity.swap(identity, Ordering::Relaxed) == identity {
-            return false;
-        }
-        let was_latched = self.disabled();
-        self.import_streak.store(0, Ordering::Relaxed);
-        self.import_latched.store(false, Ordering::Relaxed);
-        self.negotiation_streak.store(0, Ordering::Relaxed);
-        self.negotiation_latched.store(false, Ordering::Relaxed);
-        was_latched
-    }
-
     pub fn note_import_failure(&self) -> Option<u32> {
         let streak = self.import_streak.fetch_add(1, Ordering::Relaxed) + 1;
         (streak >= RAW_DMABUF_FAILURE_LATCH && !self.import_latched.swap(true, Ordering::Relaxed))
             .then_some(streak)
     }
 
-    /// Reset the failure streak. Does not clear `import_latched`: after the
-    /// latch, capture is on CPU frames, so no dmabuf import can succeed. Only a
-    /// new capture identity clears it. Relaxed store: per-frame path.
+    /// Reset the failure streak. Does not clear a sticky verdict: after fallback,
+    /// this identity has no dmabuf import left to succeed.
     pub fn note_import_ok(&self) {
         self.import_streak.store(0, Ordering::Relaxed);
     }
@@ -412,87 +366,146 @@ impl Default for RawDmabufLatch {
     }
 }
 
-static RAW_DMABUF: RawDmabufLatch = RawDmabufLatch::new();
+#[derive(Debug, Default)]
+struct ZeroCopyHealthState {
+    raw: RawDmabufLatch,
+    gpu_death_streak: AtomicU32,
+    gpu_disabled: AtomicBool,
+    gpu_negotiation_failed: AtomicBool,
+    passthrough_tiled_refused: AtomicBool,
+    hdr_tiled_refused: AtomicBool,
+}
 
-pub fn note_raw_dmabuf_import_failure(reason: &str) {
-    if let Some(streak) = RAW_DMABUF.note_import_failure() {
-        tracing::error!(
-            streak,
-            reason,
-            "zero-copy raw-dmabuf passthrough disabled: the encoder did not import the \
-             compositor's dmabuf {streak} times in a row — captures fall back to the CPU path \
-             until a new capture (different node / compositor) clears this"
-        );
+/// Failure memory for one capture identity. Clones share only that source's verdicts;
+/// concurrent sessions on another node cannot clear or poison them.
+#[derive(Clone, Debug)]
+pub struct ZeroCopyHealth(std::sync::Arc<ZeroCopyHealthState>);
+
+impl ZeroCopyHealth {
+    pub fn raw_disabled(&self) -> bool {
+        self.0.raw.disabled()
+    }
+
+    /// Record an encoder import failure. Tiled refuses immediately; LINEAR keeps the
+    /// three-failure budget. `true` asks the owning capture to rebuild on its safe offer.
+    pub fn note_raw_import_failure(&self, modifier: u64, reason: &str) -> bool {
+        if modifier != 0 {
+            let first = self.refuse_passthrough_tiled();
+            self.0.hdr_tiled_refused.store(true, Ordering::Relaxed);
+            if first {
+                tracing::error!(
+                    reason,
+                    "tiled raw-dmabuf import rejected for this capture — rebuilding on LINEAR"
+                );
+            }
+            return true;
+        }
+        let latched = self.0.raw.note_import_failure().is_some();
+        if latched {
+            tracing::error!(
+                reason,
+                "LINEAR raw-dmabuf import disabled for this capture after repeated failures"
+            );
+        }
+        latched
+    }
+
+    pub fn note_raw_import_ok(&self) {
+        self.0.raw.note_import_ok();
+    }
+
+    pub fn note_raw_negotiation_failed(&self) {
+        match self.0.raw.note_negotiation_timeout() {
+            Some(streak) => tracing::warn!(
+                streak,
+                "zero-copy raw-dmabuf passthrough disabled for this capture after repeated negotiation timeouts"
+            ),
+            None => tracing::warn!(
+                "the compositor did not accept the raw-dmabuf offer — retrying once"
+            ),
+        }
+    }
+
+    pub fn note_raw_negotiation_ok(&self) {
+        self.0.raw.note_negotiation_ok();
+    }
+
+    pub fn raw_state(&self) -> &'static str {
+        self.0.raw.state()
+    }
+
+    pub fn note_gpu_import_death(&self) {
+        let streak = self.0.gpu_death_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= GPU_IMPORT_DEATH_LATCH && !self.0.gpu_disabled.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                streak,
+                "zero-copy GPU import disabled for this capture after repeated worker deaths"
+            );
+        }
+    }
+
+    pub fn note_gpu_import_ok(&self) {
+        self.0.gpu_death_streak.store(0, Ordering::Relaxed);
+    }
+
+    pub fn gpu_import_disabled(&self) -> bool {
+        self.0.gpu_disabled.load(Ordering::Relaxed)
+    }
+
+    pub fn note_gpu_negotiation_failed(&self) {
+        if !self.0.gpu_negotiation_failed.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "zero-copy EGL-to-CUDA dmabuf offer disabled for this capture after a negotiation timeout"
+            );
+        }
+    }
+
+    pub fn gpu_negotiation_disabled(&self) -> bool {
+        self.0.gpu_negotiation_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn passthrough_tiled_refused(&self) -> bool {
+        self.0.passthrough_tiled_refused.load(Ordering::Relaxed)
+    }
+
+    pub fn refuse_passthrough_tiled(&self) -> bool {
+        !self
+            .0
+            .passthrough_tiled_refused
+            .swap(true, Ordering::Relaxed)
+    }
+
+    pub fn hdr_tiled_refused(&self) -> bool {
+        self.0.hdr_tiled_refused.load(Ordering::Relaxed)
+    }
+
+    pub fn refuse_hdr_tiled(&self) -> bool {
+        !self.0.hdr_tiled_refused.swap(true, Ordering::Relaxed)
     }
 }
 
-pub fn note_raw_dmabuf_import_ok() {
-    RAW_DMABUF.note_import_ok();
-}
-
-/// Latch after the dmabuf-only offer never negotiated. Retry budget, then
-/// sticky for this capture identity. Gates only the raw-passthrough offer —
-/// not [`enabled`], not the EGL→CUDA importer.
-pub fn note_raw_dmabuf_negotiation_failed() {
-    match RAW_DMABUF.note_negotiation_timeout() {
-        Some(streak) => tracing::warn!(
-            streak,
-            "zero-copy raw-dmabuf passthrough disabled: the compositor did not accept the \
-             dmabuf-only capture offer {streak} builds in a row, so later captures negotiate the \
-             CPU path instead of repeating that timeout (the EGL→CUDA import path is NOT \
-             affected). A new capture (different node / compositor) clears this."
-        ),
-        None => tracing::warn!(
-            "the compositor did not accept the dmabuf-only capture offer — retrying dmabuf on the \
-             next capture build before giving up on it"
-        ),
+/// Keep recent capture verdicts sticky across rebuilds without an unbounded node-id map.
+pub fn zero_copy_health(identity: u64) -> ZeroCopyHealth {
+    const CAP: usize = 64;
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::VecDeque<(u64, ZeroCopyHealth)>>,
+    > = std::sync::OnceLock::new();
+    let mut registry = REGISTRY
+        .get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(pos) = registry.iter().position(|(id, _)| *id == identity) {
+        let entry = registry.remove(pos).expect("position exists");
+        let health = entry.1.clone();
+        registry.push_back(entry);
+        return health;
     }
-}
-
-pub fn note_raw_dmabuf_negotiation_ok() {
-    RAW_DMABUF.note_negotiation_ok();
-}
-
-pub fn note_raw_dmabuf_capture(identity: u64) -> bool {
-    let cleared = RAW_DMABUF.observe_capture(identity);
-    if cleared {
-        tracing::info!(
-            identity,
-            "zero-copy raw-dmabuf passthrough re-armed: this is a different capture from the one \
-             that failed, so it gets a fresh dmabuf attempt"
-        );
+    let health = ZeroCopyHealth(std::sync::Arc::new(ZeroCopyHealthState::default()));
+    registry.push_back((identity, health.clone()));
+    while registry.len() > CAP {
+        registry.pop_front();
     }
-    cleared
-}
-
-pub fn raw_dmabuf_import_disabled() -> bool {
-    RAW_DMABUF.disabled()
-}
-
-pub fn raw_dmabuf_latch_state() -> &'static str {
-    RAW_DMABUF.state()
-}
-
-/// EGL→CUDA twin of the raw-passthrough negotiation latch. Without it the
-/// GPU-import offer re-runs the same negotiation timeout every session.
-static GPU_DMABUF_NEGOTIATION_FAILED: AtomicBool = AtomicBool::new(false);
-
-/// One timeout is conclusive: a compositor that cannot allocate any advertised
-/// EGL-importable modifier refuses them identically on retry. Gates only
-/// `build_importer`; raw passthrough and the worker-death latch stay.
-pub fn note_gpu_dmabuf_negotiation_failed() {
-    if !GPU_DMABUF_NEGOTIATION_FAILED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            "zero-copy EGL→CUDA dmabuf offer disabled for this host process: the compositor never \
-             accepted the GPU importer's dmabuf-only capture offer, so later captures negotiate \
-             the CPU path instead of repeating that timeout (the raw-dmabuf passthrough is NOT \
-             affected)"
-        );
-    }
-}
-
-pub fn gpu_dmabuf_negotiation_disabled() -> bool {
-    GPU_DMABUF_NEGOTIATION_FAILED.load(Ordering::Relaxed)
+    health
 }
 
 /// DRM FourCC from a four-byte name, little-endian (`b"XR24"`).
@@ -681,23 +694,19 @@ mod tests {
         assert!(close(y, 16.0 + 219.0 * 0.7152), "green Y → {y}");
     }
 
-    /// Owns the process-global latch statics (never reset, by design).
     #[test]
-    fn gpu_import_death_latch() {
-        note_gpu_import_death();
-        note_gpu_import_ok();
-        note_gpu_import_death();
-        note_gpu_import_death();
-        assert!(
-            !gpu_import_disabled(),
-            "two consecutive deaths must not latch"
-        );
-        note_gpu_import_death();
-        assert!(gpu_import_disabled());
+    fn gpu_import_death_latch_is_scoped_to_one_identity() {
+        let failing = zero_copy_health(0x1001);
+        let healthy = zero_copy_health(0x1002);
+        failing.note_gpu_import_death();
+        failing.note_gpu_import_ok();
+        failing.note_gpu_import_death();
+        failing.note_gpu_import_death();
+        assert!(!failing.gpu_import_disabled());
+        failing.note_gpu_import_death();
+        assert!(failing.gpu_import_disabled());
+        assert!(!healthy.gpu_import_disabled());
     }
-
-    // Local `RawDmabufLatch` only — the process-wide static is never reset,
-    // so sharing it across tests is order-dependent.
 
     #[test]
     fn import_failures_latch_and_stay_latched() {
@@ -752,38 +761,59 @@ mod tests {
     }
 
     #[test]
-    fn a_new_capture_identity_clears_the_latch_and_the_same_one_does_not() {
-        let l = RawDmabufLatch::new();
-        // Nothing latched → observe returns false (no re-arm log on a
-        // healthy session open).
-        assert!(
-            !l.observe_capture(7),
-            "nothing was latched, nothing re-armed"
-        );
-        assert!(!l.observe_capture(7), "same capture, no clear");
-        for _ in 0..RAW_DMABUF_FAILURE_LATCH {
-            l.note_import_failure();
-        }
-        assert!(l.disabled());
-        assert!(
-            !l.observe_capture(7),
-            "the SAME capture must keep its verdict — this is the 10s-stall hazard the latch exists for"
-        );
-        assert!(l.disabled());
-        assert!(l.observe_capture(9), "a different node re-arms it");
-        assert!(!l.disabled());
-        assert_eq!(l.note_import_failure(), None);
+    fn raw_latches_are_sticky_per_identity_and_independent() {
+        let failing = zero_copy_health(0x2001);
+        let same = zero_copy_health(0x2001);
+        let other = zero_copy_health(0x2002);
+        assert!(!failing.note_raw_import_failure(0, "one"));
+        assert!(!failing.note_raw_import_failure(0, "two"));
+        assert!(failing.note_raw_import_failure(0, "three"));
+        assert!(same.raw_disabled(), "the same identity keeps its verdict");
+        assert!(!other.raw_disabled(), "another identity stays independent");
     }
 
     #[test]
-    fn a_new_capture_identity_clears_the_negotiation_latch_too() {
-        let l = RawDmabufLatch::new();
-        l.observe_capture(1);
-        l.note_negotiation_timeout();
-        l.note_negotiation_timeout();
-        assert!(l.disabled());
-        assert!(l.observe_capture(2));
-        assert!(!l.disabled());
+    fn tiled_import_failure_refuses_tiled_without_spending_three_frames() {
+        let health = zero_copy_health(0x2801);
+        let other = zero_copy_health(0x2802);
+        assert!(health.note_raw_import_failure(7, "tiled reject"));
+        assert!(
+            !health.raw_disabled(),
+            "LINEAR passthrough remains available"
+        );
+        assert!(health.passthrough_tiled_refused());
+        assert!(health.hdr_tiled_refused());
+        assert!(!other.passthrough_tiled_refused());
+        assert!(!other.hdr_tiled_refused());
+    }
+
+    #[test]
+    fn gpu_negotiation_failure_is_scoped_to_one_identity() {
+        let failing = zero_copy_health(0x2901);
+        let healthy = zero_copy_health(0x2902);
+        failing.note_gpu_negotiation_failed();
+        assert!(failing.gpu_negotiation_disabled());
+        assert!(!healthy.gpu_negotiation_disabled());
+    }
+
+    #[test]
+    fn concurrent_capture_success_cannot_clear_another_identitys_failures() {
+        let failing = zero_copy_health(0x3001);
+        let healthy = zero_copy_health(0x3002);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..RAW_DMABUF_FAILURE_LATCH {
+                    failing.note_raw_import_failure(0, "probe");
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..100 {
+                    healthy.note_raw_import_ok();
+                }
+            });
+        });
+        assert!(failing.raw_disabled());
+        assert!(!healthy.raw_disabled());
     }
 
     /// Session-open line names the cause: "never offered" vs "failed earlier"

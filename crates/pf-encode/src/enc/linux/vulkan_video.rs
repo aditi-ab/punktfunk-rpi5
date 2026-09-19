@@ -17,7 +17,7 @@
 
 use super::vk_util::{
     color_range, find_mem, import_failure_feeds_latch, make_host_buffer, make_plain_image,
-    make_view, normalize_cpu_rgb, pixel_to_vk,
+    make_view, normalize_cpu_rgb, pixel_to_vk, reject_dmabuf,
 };
 use crate::rfi::Wave;
 use crate::{Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -444,6 +444,158 @@ fn codec_op_for(av1: bool) -> vk::VideoCodecOperationFlagsKHR {
         )
     } else {
         vk::VideoCodecOperationFlagsKHR::ENCODE_H265
+    }
+}
+
+/// One-plane `DrmFormatModifierPropertiesEXT` entries for `fmt`, driver order.
+///
+/// # Safety
+/// `instance`/`pd` must be live and paired.
+unsafe fn one_plane_modifiers(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    fmt: vk::Format,
+) -> Vec<u64> {
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+    instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
+    let mut props = vec![
+        vk::DrmFormatModifierPropertiesEXT::default();
+        list.drm_format_modifier_count as usize
+    ];
+    list.p_drm_format_modifier_properties = props.as_mut_ptr();
+    let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+    instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
+    props.truncate(list.drm_format_modifier_count as usize);
+    props
+        .into_iter()
+        // Capture hands one fd/offset/stride.
+        .filter(|p| p.drm_format_modifier_plane_count == 1)
+        .map(|p| p.drm_format_modifier)
+        .collect()
+}
+
+/// Whether `pd` accepts a dmabuf import of `fmt` tiled as `modifier` with `usage` —
+/// and, when `profile` is given, under that video profile. IMPORTABLE on the
+/// external properties is the whole answer.
+///
+/// # Safety
+/// `instance`/`pd` must be live and paired; `profile` must be a fully-wired profile.
+unsafe fn modifier_importable(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    fmt: vk::Format,
+    modifier: u64,
+    usage: vk::ImageUsageFlags,
+    profile: Option<&vk::VideoProfileInfoKHR>,
+) -> bool {
+    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let profile_arr = profile.map(|p| [*p]);
+    let mut plist = vk::VideoProfileListInfoKHR::default();
+    let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(fmt)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(usage)
+        .flags(vk::ImageCreateFlags::empty())
+        .push_next(&mut modifier_info)
+        .push_next(&mut external);
+    if let Some(profiles) = &profile_arr {
+        plist = plist.profiles(profiles);
+        info = info.push_next(&mut plist);
+    }
+    let mut ext_props = vk::ExternalImageFormatProperties::default();
+    let mut props = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+    instance
+        .get_physical_device_image_format_properties2(pd, &info, &mut props)
+        .is_ok()
+        && ext_props
+            .external_memory_properties
+            .external_memory_features
+            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+}
+
+/// DRM modifiers the encode device accepts for a `fourcc` capture dmabuf in every
+/// packed import mode the runtime can create: SAMPLED (compute CSC), TRANSFER_SRC
+/// (padded-copy fallback), and VIDEO_ENCODE_SRC under the session's RGB profile
+/// at `ten_bit`. Driver order, LINEAR excluded, deduplicated. Unknown fourcc, or
+/// any loader/instance/device/query failure, is an empty list — the offer stays
+/// LINEAR rather than failing capture.
+pub(crate) fn vulkan_capture_modifiers(codec: Codec, fourcc: u32, ten_bit: bool) -> Vec<u64> {
+    if !matches!(codec, Codec::H265 | Codec::Av1) {
+        return Vec::new();
+    }
+    let Some(fmt) = super::vk_util::fourcc_to_vk(fourcc) else {
+        return Vec::new();
+    };
+    let av1 = codec == Codec::Av1;
+    let codec_op = codec_op_for(av1);
+    // SAFETY: fresh instance, physical-device queries only, destroyed on every path;
+    // nothing derived from it escapes.
+    unsafe {
+        let Ok(entry) = ash::Entry::load() else {
+            return Vec::new();
+        };
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+        let Ok(instance) = entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&app),
+            None,
+        ) else {
+            return Vec::new();
+        };
+        // Same pick as `open_inner`: capture allocates against the device that encodes.
+        let pd = instance
+            .enumerate_physical_devices()
+            .ok()
+            .and_then(|devices| find_encode_device(&instance, &devices, codec_op))
+            .map(|(pd, _)| pd);
+        let mods = pd
+            .map(|pd| {
+                let mut accepted: Vec<u64> = Vec::new();
+                for m in one_plane_modifiers(&instance, pd, fmt) {
+                    // LINEAR is appended by the capture offer, never probed here.
+                    if m == 0 || accepted.contains(&m) {
+                        continue;
+                    }
+                    let ok = modifier_importable(
+                        &instance,
+                        pd,
+                        fmt,
+                        m,
+                        vk::ImageUsageFlags::SAMPLED,
+                        None,
+                    ) && modifier_importable(
+                        &instance,
+                        pd,
+                        fmt,
+                        m,
+                        vk::ImageUsageFlags::TRANSFER_SRC,
+                        None,
+                    ) && {
+                        let mut ps = RgbProfileStack::new(codec_op, ten_bit);
+                        let profile = *ps.wire(av1);
+                        modifier_importable(
+                            &instance,
+                            pd,
+                            fmt,
+                            m,
+                            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
+                            Some(&profile),
+                        )
+                    };
+                    if ok {
+                        accepted.push(m);
+                    }
+                }
+                accepted
+            })
+            .unwrap_or_default();
+        instance.destroy_instance(None);
+        mods
     }
 }
 
@@ -1871,20 +2023,18 @@ impl VulkanVideoEncoder {
             self.device.destroy_image(e.img, None);
             self.device.free_memory(e.mem, None);
         }
-        // Feed pf-zerocopy's raw-dmabuf degrade latch: a deterministic import refusal repeats
-        // forever, and the latch (CPU delivery next session) is its only recovery. Excluded:
-        // transient OOM (`import_failure_feeds_latch`), and native-NV12 entirely — an NV12
-        // layout quirk should not cost all dmabuf capture.
+        // A deterministic packed import refusal rebuilds this capture on its safe offer.
+        // Transient OOM and native NV12 stay out of that sticky verdict.
         let (img, mem, view) = match self.import_dmabuf(d, cw, ch) {
             Ok(t) => {
                 if !self.native_nv12 {
-                    pf_zerocopy::note_raw_dmabuf_import_ok();
+                    d.health.note_raw_import_ok();
                 }
                 t
             }
             Err(e) => {
                 if !self.native_nv12 && import_failure_feeds_latch(&e) {
-                    pf_zerocopy::note_raw_dmabuf_import_failure(&format!("{e:#}"));
+                    reject_dmabuf(d, &format!("{e:#}"));
                 }
                 return Err(e);
             }

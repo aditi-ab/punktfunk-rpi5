@@ -150,6 +150,216 @@ impl NativeVaapiEncoder {
     }
 }
 
+// libgbm allocation half, declared the same way pf-capture's `gbm_pool.rs` does:
+// both resolve to the same `libgbm`, already a workspace runtime dependency.
+#[link(name = "gbm")]
+unsafe extern "C" {
+    fn gbm_create_device(fd: i32) -> *mut std::ffi::c_void;
+    fn gbm_device_destroy(device: *mut std::ffi::c_void);
+    fn gbm_bo_create_with_modifiers2(
+        device: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+        format: u32,
+        modifiers: *const u64,
+        count: u32,
+        flags: u32,
+    ) -> *mut std::ffi::c_void;
+    fn gbm_bo_destroy(bo: *mut std::ffi::c_void);
+    fn gbm_bo_get_fd(bo: *mut std::ffi::c_void) -> i32;
+    fn gbm_bo_get_stride(bo: *mut std::ffi::c_void) -> u32;
+    fn gbm_bo_get_offset(bo: *mut std::ffi::c_void, plane: i32) -> u32;
+    fn gbm_bo_get_modifier(bo: *mut std::ffi::c_void) -> u64;
+    fn gbm_bo_get_plane_count(bo: *mut std::ffi::c_void) -> i32;
+}
+
+/// The buffer is rendered into by the compositor's GPU.
+const GBM_BO_USE_RENDERING: u32 = 1 << 2;
+/// Probe picture size: large enough to exercise the real import + VPP path.
+const PROBE_DIM: u32 = 64;
+
+/// A GBM BO allocated on the probe node. Drop order is the contract: `bo`
+/// references `device`, so it dies first, and `device` borrows the node fd,
+/// so `_node` is declared last — its close lands after `Drop` ran.
+struct ProbeBo {
+    bo: *mut std::ffi::c_void,
+    device: *mut std::ffi::c_void,
+    /// `gbm_bo_get_fd`'s fresh fd; `OwnedFd` closes it exactly once.
+    fd: std::os::fd::OwnedFd,
+    offset: u32,
+    stride: u32,
+    _node: std::fs::File,
+}
+
+impl Drop for ProbeBo {
+    fn drop(&mut self) {
+        // SAFETY: `bo`/`device` are the live handles this guard uniquely owns,
+        // destroyed once, in libgbm's required order.
+        unsafe {
+            gbm_bo_destroy(self.bo);
+            gbm_device_destroy(self.device);
+        }
+    }
+}
+
+/// Allocate a 64x64 BO tiled exactly as `modifier` on `node`'s GBM device.
+/// `Err`/`None` is a refused candidate, never a host failure.
+fn alloc_probe_bo(node: &std::path::Path, fourcc: u32, modifier: u64) -> Option<ProbeBo> {
+    use std::os::fd::FromRawFd as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(node)
+        .ok()?;
+    // SAFETY: `file` outlives every call into `device` — it is kept open in the
+    // caller's scope for the whole probe.
+    let device = unsafe { gbm_create_device(file.as_raw_fd()) };
+    if device.is_null() {
+        return None;
+    }
+    // SAFETY: `device` is live; `modifier` is read as one u64.
+    let bo = unsafe {
+        gbm_bo_create_with_modifiers2(
+            device,
+            PROBE_DIM,
+            PROBE_DIM,
+            fourcc,
+            &modifier,
+            1,
+            GBM_BO_USE_RENDERING,
+        )
+    };
+    if bo.is_null() {
+        // SAFETY: `device` is live, owned here.
+        unsafe { gbm_device_destroy(device) };
+        return None;
+    }
+    // SAFETY: plain accessors on the BO just created, valid until `gbm_bo_destroy`.
+    let (planes, got_mod, fd, stride, offset) = unsafe {
+        (
+            gbm_bo_get_plane_count(bo),
+            gbm_bo_get_modifier(bo),
+            gbm_bo_get_fd(bo),
+            gbm_bo_get_stride(bo),
+            gbm_bo_get_offset(bo, 0),
+        )
+    };
+    if planes != 1 || got_mod != modifier || fd < 0 || stride == 0 {
+        // SAFETY: `bo`/`device` are live and owned here; nothing was handed out.
+        unsafe {
+            gbm_bo_destroy(bo);
+            gbm_device_destroy(device);
+        }
+        return None;
+    }
+    Some(ProbeBo {
+        bo,
+        device,
+        // SAFETY: `fd` is the fresh descriptor `gbm_bo_get_fd` returned (>= 0).
+        fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+        offset,
+        stride,
+        _node: file,
+    })
+}
+
+/// Prove one candidate: allocate the modifier on the session's own render node
+/// and run a real 64x64 H.264/8-bit dmabuf submit through the native session —
+/// `Display::import_dmabuf` plus the source VPP into the NV12 target is the
+/// import contract being proved (the source VPP also serves a 10-bit source).
+fn probe_capture_modifier(node: &std::path::Path, fourcc: u32, modifier: u64) -> bool {
+    use pf_frame::DmabufFrame;
+    let Some(bo) = alloc_probe_bo(node, fourcc, modifier) else {
+        return false;
+    };
+    let Ok(mut enc) = NativeVaapiEncoder::open(
+        Codec::H264,
+        PROBE_DIM,
+        PROBE_DIM,
+        60,
+        1_000_000,
+        8,
+        ChromaFormat::Yuv420,
+        false,
+    ) else {
+        return false;
+    };
+    let Ok(fd) = bo.fd.try_clone() else {
+        return false;
+    };
+    let frame = CapturedFrame {
+        provenance: Default::default(),
+        width: PROBE_DIM,
+        height: PROBE_DIM,
+        pts_ns: 0,
+        format: PixelFormat::Bgrx,
+        payload: FramePayload::Dmabuf(DmabufFrame {
+            // A dup, owned by the frame: closed once on drop. `bo.fd` stays open
+            // through the submit and is closed by the guard after.
+            fd,
+            fourcc,
+            modifier,
+            offset: bo.offset,
+            stride: bo.stride,
+            plane1: None,
+            hold: None,
+            health: pf_zerocopy::zero_copy_health(modifier ^ u64::from(fourcc)),
+            rebuild: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }),
+        cursor: None,
+    };
+    enc.submit(&frame).is_ok()
+}
+
+/// The `candidates` subset libva actually imports for `fourcc` on this render
+/// node, proved by a real GBM alloc + encoder submit per candidate. Verdicts are
+/// cached per (node rdev, fourcc, modifier) so each is proved once per device.
+pub(crate) fn vaapi_capture_modifiers(fourcc: u32, candidates: &[u64]) -> Vec<u64> {
+    use std::collections::HashMap;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::{Mutex, OnceLock};
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<Mutex<HashMap<(u64, u32, u64), bool>>> = OnceLock::new();
+    let node = pf_gpu::linux_render_node();
+    let rdev = std::fs::metadata(&node).map(|m| m.rdev()).unwrap_or(0);
+    let mut accepted: Vec<u64> = Vec::new();
+    for &m in candidates {
+        if m == 0 || accepted.contains(&m) {
+            continue;
+        }
+        let key = (rdev, fourcc, m);
+        // The lock guards the map, not the probe: a concurrent first probe of the
+        // same candidate may run twice; the verdict is identical and last-write wins.
+        let cached = CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied();
+        let ok = match cached {
+            Some(v) => v,
+            None => {
+                let v = probe_capture_modifier(&node, fourcc, m);
+                CACHE
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, v);
+                v
+            }
+        };
+        if ok {
+            accepted.push(m);
+        }
+    }
+    tracing::info!(
+        fourcc = format_args!("{fourcc:#010x}"),
+        ?accepted,
+        "VAAPI: encoder-proved tiled capture modifiers (LINEAR is always appended)"
+    );
+    accepted
+}
+
 /// Whether the host's render node offers an encode entrypoint for `codec`
 /// at this depth — what a native open needs. AV1 is not a native path.
 pub fn probe_can_encode(codec: Codec, ten_bit: bool) -> bool {
@@ -179,10 +389,49 @@ pub fn probe_can_encode(codec: Codec, ten_bit: bool) -> bool {
         .unwrap_or(false)
 }
 
+/// Describe one captured dmabuf for libva and route tiled rejection back to capture.
+fn submit_captured_dmabuf(
+    session: &mut Session,
+    frame: &CapturedFrame,
+    d: &pf_frame::DmabufFrame,
+) -> Result<()> {
+    let fd = d.fd.as_raw_fd();
+    let mut planes = vec![ExportedPlane {
+        fd,
+        offset: d.offset,
+        stride: d.stride,
+    }];
+    if let Some((offset, stride)) = d.plane1 {
+        planes.push(ExportedPlane { fd, offset, stride });
+    } else if d.fourcc == vpp::DRM_FORMAT_NV12 || d.fourcc == vpp::DRM_FORMAT_P010 {
+        planes.push(ExportedPlane {
+            fd,
+            offset: d.offset + d.stride * frame.height,
+            stride: d.stride,
+        });
+    }
+    let imported = session.submit_dmabuf(&DmabufSource {
+        width: frame.width,
+        height: frame.height,
+        drm_fourcc: d.fourcc,
+        modifier: d.modifier,
+        planes: &planes,
+    });
+    if let Err(e) = imported {
+        if d.modifier != 0 {
+            super::vk_util::reject_dmabuf(d, &format!("{e:#}"));
+        }
+        return Err(e);
+    }
+    if d.modifier != 0 {
+        d.health.note_raw_import_ok();
+    }
+    Ok(())
+}
+
 impl Encoder for NativeVaapiEncoder {
-    /// A mirrored head or a crop arrives larger and is scaled on ingest; the shape must
-    /// match within the even-floor's two pixels. Smaller, another shape, or a crop past
-    /// the picture is a host size fault: fail here, not with a garbage picture.
+    /// A mirrored head or crop may scale down, but cannot be smaller or change shape.
+    /// Tiled dmabuf rejection marks its capture for a LINEAR rebuild before returning.
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()> {
         let [cx, cy, cw, ch] = self
             .crop
@@ -217,32 +466,7 @@ impl Encoder for NativeVaapiEncoder {
                     frame.width as usize * 4,
                 )?;
             }
-            FramePayload::Dmabuf(d) => {
-                let fd = d.fd.as_raw_fd();
-                let mut planes = vec![ExportedPlane {
-                    fd,
-                    offset: d.offset,
-                    stride: d.stride,
-                }];
-                // NV12/P010 chroma: named by the producer, or contiguous below the luma
-                // rows. Both are two-plane; a single-plane import is refused by the driver.
-                if let Some((offset, stride)) = d.plane1 {
-                    planes.push(ExportedPlane { fd, offset, stride });
-                } else if d.fourcc == vpp::DRM_FORMAT_NV12 || d.fourcc == vpp::DRM_FORMAT_P010 {
-                    planes.push(ExportedPlane {
-                        fd,
-                        offset: d.offset + d.stride * frame.height,
-                        stride: d.stride,
-                    });
-                }
-                session.submit_dmabuf(&DmabufSource {
-                    width: frame.width,
-                    height: frame.height,
-                    drm_fourcc: d.fourcc,
-                    modifier: d.modifier,
-                    planes: &planes,
-                })?;
-            }
+            FramePayload::Dmabuf(d) => submit_captured_dmabuf(session, frame, d)?,
             FramePayload::Cuda(_) => bail!(
                 "a CUDA frame reached the VAAPI encoder — that payload is NVENC-only; unset \
                  PUNKTFUNK_ZEROCOPY or do not pin PUNKTFUNK_ENCODER=vaapi-native on an NVIDIA host"

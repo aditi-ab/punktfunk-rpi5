@@ -397,10 +397,13 @@ pub(super) fn build_pipeline(
     let producer_is_gamescope = vd.name() == pf_vdisplay::Compositor::Gamescope.id();
     let mut capturer = crate::capture::capture_virtual_output(
         vout,
-        plan.output_format(),
-        plan.capture,
-        cursor_id0_hides,
-        producer_is_gamescope,
+        crate::capture::VirtualCaptureRequest {
+            output: plan.output_format(),
+            codec: Some(plan.codec),
+            capture: plan.capture,
+            kwin: cursor_id0_hides,
+            gamescope: producer_is_gamescope,
+        },
     )
     .context("capture virtual output")?;
     #[cfg(target_os = "linux")]

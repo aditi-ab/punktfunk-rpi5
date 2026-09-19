@@ -268,7 +268,15 @@ impl Link {
                     chunk_aligned,
                 })
             }
-            FromWorker::EncodeErr { message } => Err(Fail::Encode(message)),
+            FromWorker::EncodeErr {
+                message,
+                capture_rebuild,
+            } => {
+                if capture_rebuild {
+                    super::vk_util::reject_dmabuf(d, &message);
+                }
+                Err(Fail::Encode(message))
+            }
             other => Err(Fail::Dead(anyhow::anyhow!(
                 "unexpected encode worker reply to a frame: {other:?}"
             ))),
@@ -895,6 +903,8 @@ mod tests {
                 offset: 0,
                 stride: 1920 * 4,
                 hold: None,
+                health: pf_zerocopy::zero_copy_health(42),
+                rebuild: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }),
             cursor,
         }
@@ -1324,8 +1334,7 @@ mod tests {
         }
     }
 
-    /// A live worker that refuses the frame classifies as `Encode`, which pins the session
-    /// in-process so the raw-dmabuf degrade latch (a host-process static) still fires.
+    /// A live worker refusal stays an encode error and forwards its capture-rebuild verdict.
     #[test]
     fn a_refused_frame_is_an_encode_error() {
         let (host, peer) = ipc::socketpair_seqpacket().unwrap();
@@ -1336,18 +1345,25 @@ mod tests {
                 peer.as_fd(),
                 &FromWorker::EncodeErr {
                     message: "unsupported dmabuf fourcc".into(),
+                    capture_rebuild: true,
                 },
                 &[],
             )
             .unwrap();
         });
         let mut link = mock_link(host, File::from(memfd()));
-        let f = frame(memfd(), None);
+        let mut f = frame(memfd(), None);
+        let FramePayload::Dmabuf(d) = &mut f.payload else {
+            unreachable!()
+        };
+        d.modifier = 7;
+        let rebuild = d.rebuild.clone();
         match link.encode(&f) {
             Err(Fail::Encode(m)) => assert!(m.contains("fourcc")),
             Err(Fail::Dead(e)) => panic!("a live worker's refusal must not read as death: {e:#}"),
             Ok(_) => panic!("a refusal must not produce an AU"),
         }
+        assert!(rebuild.load(std::sync::atomic::Ordering::Relaxed));
         server.join().unwrap();
     }
 

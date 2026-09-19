@@ -577,9 +577,28 @@ enum Source<'a> {
     Dmabuf(&'a DmabufFrame),
 }
 
+/// Clone the producer hold only for a raw dmabuf submission.
+fn source_hold(frame: &CapturedFrame) -> Option<pf_frame::FrameHold> {
+    match &frame.payload {
+        FramePayload::Dmabuf(d) => d.hold.clone(),
+        _ => None,
+    }
+}
+
 struct RingSlot {
     surface: SlotSurface,
     reg: nv::NV_ENC_REGISTERED_PTR,
+}
+
+/// One submitted picture and the raw source lifetime it still owns.
+struct PendingEncode {
+    bs: nv::NV_ENC_OUTPUT_PTR,
+    map: nv::NV_ENC_INPUT_PTR,
+    pts_ns: u64,
+    anchor: bool,
+    idr_hint: bool,
+    mark: WaveMark,
+    _src_hold: Option<pf_frame::FrameHold>,
 }
 
 /// Ring-slot backing: Vulkan-imported (cursor-blendable) or pitched CUDA (encode still works,
@@ -735,17 +754,9 @@ pub struct NvencCudaEncoder {
     /// Lifetime submit count (never reset, unlike `next`) — `PUNKTFUNK_PERF` sample cadence.
     frames: u64,
     bitstreams: Vec<nv::NV_ENC_OUTPUT_PTR>,
-    /// In-flight: (bitstream, mapped input, pts_ns, recovery-anchor, IDR-predicted).
-    /// Fourth: first frame after a successful RFI. Fifth: submit-time IDR hint for chunks
-    /// emitted before picture type is known (P-only + infinite GOP; finish lock checks).
-    pending: VecDeque<(
-        nv::NV_ENC_OUTPUT_PTR,
-        nv::NV_ENC_INPUT_PTR,
-        u64,
-        bool,
-        bool,
-        WaveMark,
-    )>,
+    /// In-flight bitstream/input/timestamp/anchor/IDR/wave plus the source hold.
+    /// The last guard keeps an ordered raw-dmabuf conversion stable through retrieval.
+    pending: VecDeque<PendingEncode>,
     /// Next `inputTimeStamp`. [`Encoder::submit_indexed`] pins it to the wire index so RFI
     /// timestamps stay 1:1 across rebuilds. Self-increments for un-indexed callers.
     frame_idx: i64,
@@ -923,10 +934,9 @@ impl NvencCudaEncoder {
             cursor_tried: false,
             cursor_serial: u64::MAX,
             cursor_blend_warned: false,
-            // Same terms capture negotiated its arm on, sampled once here: a latch that
-            // tripped in an earlier session must not re-arm the lane behind capture's back.
-            raw_wanted: pf_zerocopy::nvenc_raw_enabled()
-                && !pf_zerocopy::raw_dmabuf_import_disabled(),
+            // Capture's identity-scoped latch controls whether a dmabuf arrives; the encoder
+            // only applies the raw-lane knob to that payload.
+            raw_wanted: pf_zerocopy::nvenc_raw_enabled(),
             worker: None,
             worker_slots: HashSet::new(),
             worker_cursor_serial: u64::MAX,
@@ -1001,7 +1011,7 @@ impl NvencCudaEncoder {
         }
     }
 
-    /// Destroy the session and pooled resources. Size change and Drop.
+    /// Stop retrieval, unmap pending inputs, then release source holds and session resources.
     unsafe fn teardown(&mut self) {
         if self.encoder.is_null() {
             return;
@@ -1014,9 +1024,9 @@ impl NvencCudaEncoder {
                 let _ = j.join();
             }
         }
-        for (_, map, _, _, _, _) in &self.pending {
-            if !map.is_null() {
-                let _ = (api().unmap_input_resource)(self.encoder, *map);
+        for pending in &self.pending {
+            if !pending.map.is_null() {
+                let _ = (api().unmap_input_resource)(self.encoder, pending.map);
             }
         }
         for slot in &self.ring {
@@ -1882,8 +1892,7 @@ impl NvencCudaEncoder {
 
     /// The fused convert: the worker writes `d`, cursor included, into ring slot `slot` — or
     /// into the reframe staging slot, which the Lanczos pass then scales into the ring. One
-    /// GPU pass, no copy. A failure feeds the raw-dmabuf latch, so the next capture falls back
-    /// to the import path instead of looping here.
+    /// GPU pass, no copy. A failure marks this capture for rebuild on its safe offer.
     /// The raw lane: the held dmabuf goes through the worker's fused pass into the slot (or
     /// the staging slot of a reframing session). `ordered`: the copy stream carries the
     /// hand-off to NVENC; otherwise the CPU waits it here.
@@ -1935,11 +1944,11 @@ impl NvencCudaEncoder {
         }
         let value = match self.convert_raw_inner(captured, d, fmt, target, src_size) {
             Ok(v) => {
-                pf_zerocopy::note_raw_dmabuf_import_ok();
+                d.health.note_raw_import_ok();
                 v
             }
             Err(e) => {
-                pf_zerocopy::note_raw_dmabuf_import_failure("nvenc convert");
+                super::vk_util::reject_dmabuf(d, "nvenc convert");
                 return Err(e).context("NVENC (Linux): fused convert");
             }
         };
@@ -1947,7 +1956,7 @@ impl NvencCudaEncoder {
         // and a CUDA external-semaphore wait has no timeout — refuse the frame while the failure
         // is still an error rather than a hang.
         if self.worker.as_ref().is_none_or(|w| w.dead()) {
-            pf_zerocopy::note_raw_dmabuf_import_failure("convert worker died mid-pass");
+            super::vk_util::reject_dmabuf(d, "convert worker died mid-pass");
             bail!("NVENC (Linux): the convert worker died before its pass could be waited on");
         }
         // The pass lands on the GPU; its value gates the copy stream, which is NVENC's input
@@ -1962,7 +1971,7 @@ impl NvencCudaEncoder {
             // Bounded: the value came from another process, so a lost signal must cost this
             // frame, not the encode thread. Generous against a slow 4K pass under load.
             cuda::copy_stream_sync_deadline(std::time::Duration::from_secs(2))
-                .inspect_err(|_| pf_zerocopy::note_raw_dmabuf_import_failure("fused pass stalled"))
+                .inspect_err(|_| super::vk_util::reject_dmabuf(d, "fused pass stalled"))
                 .context("NVENC (Linux): sync the fused pass")?;
         }
         if let Some(r) = &self.reframe {
@@ -1988,7 +1997,7 @@ impl NvencCudaEncoder {
         if self.worker.as_ref().is_none_or(|w| w.dead()) {
             // A corpse, not a first spawn: its death is the lane's to count.
             if self.worker.take().is_some() {
-                pf_zerocopy::note_raw_dmabuf_import_failure("convert worker died");
+                super::vk_util::reject_dmabuf(d, "convert worker died");
             }
             // The timeline and the slot registrations belonged to that process.
             self.worker_slots.clear();
@@ -2117,7 +2126,16 @@ impl NvencCudaEncoder {
     /// Absorb one retrieve completion: FIFO-check, unmap on the encode thread (retrieve never
     /// touches input resources), queue the AU.
     fn absorb_done(&mut self, done: RetrieveDone) -> Result<()> {
-        let Some((bs, map, pts_ns, anchor, _, mark)) = self.pending.pop_front() else {
+        let Some(PendingEncode {
+            bs,
+            map,
+            pts_ns,
+            anchor,
+            mark,
+            _src_hold,
+            ..
+        }) = self.pending.pop_front()
+        else {
             bail!("NVENC retrieve: completion with no in-flight frame (pairing bug)");
         };
         if bs as usize != done.bs {
@@ -2200,8 +2218,8 @@ impl NvencCudaEncoder {
         Ok(buf)
     }
 
-    /// One frame from a device buffer: session (re)init on a size or layout change, the copy
-    /// into a ring slot, the cursor, then the encode call.
+    /// Prepare and submit one device frame. The pending entry owns a raw source hold
+    /// until retrieval completes, including stream-ordered fused conversion.
     fn submit_device(&mut self, captured: &CapturedFrame, src: Source<'_>) -> Result<()> {
         self.maybe_engage_async();
         self.maybe_disengage_async();
@@ -2576,18 +2594,17 @@ impl NvencCudaEncoder {
                 return Err(nvenc_status::call_err("encode_picture", e));
             }
             t_pic = tp.elapsed();
-            self.pending.push_back((
-                self.bitstreams[slot],
-                mp.mappedResource,
-                captured.pts_ns,
+            self.pending.push_back(PendingEncode {
+                bs: self.bitstreams[slot],
+                map: mp.mappedResource,
+                pts_ns: captured.pts_ns,
                 anchor,
-                // Chunked-poll IDR hint = `is_idr`. P-only + infinite GOP: the driver never
-                // emits an IDR we did not ask for.
-                is_idr,
+                // P-only + infinite GOP: the driver never emits an unrequested IDR.
+                idr_hint: is_idr,
                 mark,
-            ));
-            // Arbiter stamp. One field, not a sixth `pending` slot: sync depth-1 has at most
-            // one encode outstanding.
+                _src_hold: source_hold(captured),
+            });
+            // Sync depth one has at most one encode timestamp outstanding.
             self.last_submit_at = Some(std::time::Instant::now());
         }
         if sample {
@@ -2787,7 +2804,16 @@ impl Encoder for NvencCudaEncoder {
                 .ready
                 .pop_front());
         }
-        let Some((bs, map, pts_ns, anchor, _, mark)) = self.pending.pop_front() else {
+        let Some(PendingEncode {
+            bs,
+            map,
+            pts_ns,
+            anchor,
+            mark,
+            _src_hold,
+            ..
+        }) = self.pending.pop_front()
+        else {
             return Ok(None);
         };
         // SAFETY: non-empty `pending` ⇒ live session (`teardown` clears both). Encode thread.
@@ -2848,9 +2874,16 @@ impl Encoder for NvencCudaEncoder {
         if !self.supports_chunked_poll() && self.chunk.is_none() {
             return Ok(self.poll()?.map(AuChunk::whole));
         }
-        let Some(&(bs, _, pts_ns, anchor, idr_hint, mark)) = self.pending.front() else {
+        let Some(front) = self.pending.front() else {
             return Ok(None);
         };
+        let (bs, pts_ns, anchor, idr_hint, mark) = (
+            front.bs,
+            front.pts_ns,
+            front.anchor,
+            front.idr_hint,
+            front.mark,
+        );
         // ~2 frame intervals of doNotWait; then the blocking lock. Worst case = sync `poll`.
         let budget = std::time::Duration::from_micros(2_000_000 / self.fps.max(1) as u64);
         let t0 = std::time::Instant::now();
@@ -2921,8 +2954,15 @@ impl Encoder for NvencCudaEncoder {
 
         // One blocking lock — completion authority and wedge watchdog (depth-1: tail must
         // not ride a +1 tick). Emits whatever the sampler had not handed out.
-        let (bs, map, pts_ns, anchor, idr_hint, mark) =
-            self.pending.pop_front().expect("front() checked above");
+        let PendingEncode {
+            bs,
+            map,
+            pts_ns,
+            anchor,
+            idr_hint,
+            mark,
+            _src_hold,
+        } = self.pending.pop_front().expect("front() checked above");
         // SAFETY: same as `poll`: live session, encode thread, blocking lock. Reads (tail +
         // prefix check) before unlock. Unmap `map` exactly once.
         unsafe {
@@ -3105,6 +3145,34 @@ mod tests {
             proven_bitrate_ceiling(620_000_000, false),
             Some(620_000_000)
         );
+    }
+
+    #[test]
+    fn raw_source_hold_is_cloned_for_the_pending_encode() {
+        let hold: pf_frame::FrameHold = std::sync::Arc::new(());
+        let frame = CapturedFrame {
+            provenance: Default::default(),
+            width: 64,
+            height: 64,
+            pts_ns: 0,
+            format: PixelFormat::Bgrx,
+            payload: FramePayload::Dmabuf(pf_frame::DmabufFrame {
+                fd: std::fs::File::open("/dev/null").unwrap().into(),
+                fourcc: u32::from_le_bytes(*b"XR24"),
+                modifier: 0,
+                plane1: None,
+                offset: 0,
+                stride: 256,
+                hold: Some(hold.clone()),
+                health: pf_zerocopy::zero_copy_health(0x5001),
+                rebuild: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            cursor: None,
+        };
+        let pending = source_hold(&frame).expect("raw frame hold");
+        assert_eq!(std::sync::Arc::strong_count(&hold), 3);
+        drop(pending);
+        assert_eq!(std::sync::Arc::strong_count(&hold), 2);
     }
 
     /// Env helper for ignored hardware tests. Run `--test-threads=1` — they mutate process env.
@@ -5236,7 +5304,7 @@ mod tests {
         // Spin doNotWait against the in-flight bitstream before the blocking poll.
         let frame = nv12_frame(W, H, 1);
         enc.submit_indexed(&frame, 1).expect("submit probed frame");
-        let bs = enc.pending.back().expect("in-flight entry").0;
+        let bs = enc.pending.back().expect("in-flight entry").bs;
         let t0 = std::time::Instant::now();
         let mut timeline: Vec<(u64, nv::NVENCSTATUS, u32, u32)> = Vec::new();
         let mut offsets = [0u32; 32];

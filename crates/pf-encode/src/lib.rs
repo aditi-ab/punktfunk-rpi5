@@ -698,16 +698,15 @@ pub fn linux_native_nv12_ok(codec: Codec) -> bool {
     }
 }
 
-/// May the capture hand the NVENC lane its held dmabufs? The encoder's zero-copy worker then
-/// converts each straight into a registered input slot (`PUNKTFUNK_NVENC_RAW`). Off without
-/// direct-SDK NVENC, on the VAAPI plane, or once the raw-dmabuf latch tripped.
+/// May capture plan the NVENC raw-dmabuf lane? Its identity-scoped health applies the
+/// failure latch later, where the node id is known. Off without direct-SDK NVENC or on
+/// the AMD/Intel plane.
 #[cfg(target_os = "linux")]
 pub fn linux_nvenc_raw_dmabuf_ok() -> bool {
     #[cfg(feature = "nvenc")]
     {
         !linux_zero_copy_is_vaapi()
             && pf_zerocopy::nvenc_raw_enabled()
-            && !pf_zerocopy::raw_dmabuf_import_disabled()
             && pf_zerocopy::fused_convert_available()
     }
     #[cfg(not(feature = "nvenc"))]
@@ -941,6 +940,43 @@ fn linux_resolved_backend() -> LinuxBackend {
 #[cfg(all(target_os = "linux", feature = "pyrowave"))]
 pub fn pyrowave_capture_modifiers(fourcc: u32) -> Vec<u64> {
     pyrowave::capture_modifiers(fourcc)
+}
+
+/// Tiled dmabuf modifiers the session's encoder lane proved it can import for
+/// the capture `fourcc` — what the gamescope producer's tiled offer narrows to.
+/// Empty means LINEAR-only. Each lane returns its own proved list: Vulkan
+/// Video answers come from the packed-usage probes, VAAPI answers from
+/// `Display::import_dmabuf` + VPP, never one lane filtered by the other.
+#[cfg(target_os = "linux")]
+pub fn linux_capture_modifiers(codec: Codec, fourcc: u32, bit_depth: u8, hdr: bool) -> Vec<u64> {
+    #[cfg(feature = "pyrowave")]
+    if codec == Codec::PyroWave {
+        return pyrowave_capture_modifiers(fourcc);
+    }
+    // A build without PyroWave has no module to ask; advertise LINEAR.
+    #[cfg(not(feature = "pyrowave"))]
+    if codec == Codec::PyroWave {
+        return Vec::new();
+    }
+    // Same Vulkan arm as `open_amd_intel`, depth included: 10-bit SDR HEVC stays
+    // on VAAPI, so its capture answers come from the libva probe below.
+    #[cfg(feature = "vulkan-encode")]
+    let ten_bit = bit_depth >= 10;
+    #[cfg(feature = "vulkan-encode")]
+    let vulkan_lane = !(ten_bit && !hdr && codec == Codec::H265)
+        && matches!(codec, Codec::H265 | Codec::Av1)
+        && vulkan_encode_enabled()
+        && vulkan_encode_available_at(codec, ten_bit);
+    #[cfg(not(feature = "vulkan-encode"))]
+    let vulkan_lane = false;
+    if vulkan_lane {
+        #[cfg(feature = "vulkan-encode")]
+        {
+            return vulkan_video::vulkan_capture_modifiers(codec, fourcc, ten_bit);
+        }
+    }
+    let candidates = vk_util::sampled_capture_modifiers(fourcc);
+    vaapi_native::vaapi_capture_modifiers(fourcc, &candidates)
 }
 
 /// True if the Linux GPU backend is VAAPI rather than NVENC — so capture
@@ -1648,11 +1684,10 @@ mod vk_valve_rgb;
 #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
 #[path = "enc/linux/vk_intra_refresh.rs"]
 mod vk_intra_refresh;
-// Shared ash helpers (dmabuf import, image/memory) for the Linux Vulkan backends.
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "vulkan-encode", feature = "pyrowave")
-))]
+// Shared ash helpers (dmabuf import, image/memory, the device pick) for the
+// Linux Vulkan backends — plus `sampled_capture_modifiers`, which the VAAPI
+// modifier offer needs even without those features.
+#[cfg(target_os = "linux")]
 #[path = "enc/linux/vk_util.rs"]
 mod vk_util;
 // PyroWave: Vulkan-compute intra wavelet. Explicit `PUNKTFUNK_ENCODER=pyrowave`.

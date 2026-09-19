@@ -19,7 +19,7 @@
 
 use super::vk_util::{
     color_range, import_failure_feeds_latch, import_rgb_dmabuf, make_host_buffer, make_plain_image,
-    normalize_cpu_rgb, pixel_to_vk,
+    normalize_cpu_rgb, pixel_to_vk, reject_dmabuf, select_physical_device,
 };
 use crate::{EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
@@ -49,54 +49,12 @@ const BS_SLACK: usize = 256 * 1024;
 /// to capture instead of VAAPI's LINEAR-only policy — tiled dmabufs import via
 /// `VK_EXT_image_drm_format_modifier`. Probed per session (instance + PD only).
 pub(crate) fn capture_modifiers(fourcc: u32) -> Vec<u64> {
-    let Some(fmt) = super::vk_util::fourcc_to_vk(fourcc) else {
-        return Vec::new();
-    };
-    // SAFETY: fresh instance, plain physical-device property queries, destroyed before
-    // returning; nothing borrows across the call.
-    unsafe {
-        let Ok(entry) = ash::Entry::load() else {
-            return Vec::new();
-        };
-        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
-        let Ok(instance) = entry.create_instance(
-            &vk::InstanceCreateInfo::default().application_info(&app),
-            None,
-        ) else {
-            return Vec::new();
-        };
-        // Same selector as `open_inner`: these modifiers are what capture allocates against.
-        let pd = select_physical_device(&instance).ok().map(|p| p.pd);
-        let mods = pd
-            .map(|pd| {
-                let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
-                let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
-                instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
-                let n = list.drm_format_modifier_count as usize;
-                let mut props = vec![vk::DrmFormatModifierPropertiesEXT::default(); n];
-                list.p_drm_format_modifier_properties = props.as_mut_ptr();
-                let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
-                instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
-                props.truncate(list.drm_format_modifier_count as usize);
-                props
-                    .into_iter()
-                    .filter(|p| {
-                        p.drm_format_modifier_tiling_features
-                            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
-                            // Capture hands one fd/offset/stride.
-                            && p.drm_format_modifier_plane_count == 1
-                    })
-                    .map(|p| p.drm_format_modifier)
-                    .collect()
-            })
-            .unwrap_or_default();
-        instance.destroy_instance(None);
-        mods
-    }
+    // Same selector as `open_inner`: these modifiers are what capture allocates against.
+    super::vk_util::sampled_capture_modifiers(fourcc)
 }
 
 /// Render node named beside the picked device: `PUNKTFUNK_RENDER_NODE` else
-/// `/dev/dri/renderD128`. Log-only — [`select_physical_device`] must not use this.
+/// `/dev/dri/renderD128`. Log-only — the device pick must not use this.
 fn capture_anchor_node() -> std::path::PathBuf {
     pf_gpu::render_node_env().unwrap_or_else(|| std::path::PathBuf::from("/dev/dri/renderD128"))
 }
@@ -202,58 +160,6 @@ unsafe fn device_owns_node(
         }
     }
     false
-}
-
-struct PickedDevice {
-    pd: vk::PhysicalDevice,
-    /// Graphics+compute queue family. Pyrowave's device create-info requires graphics;
-    /// CSC + codec run on it.
-    family: u32,
-    vendor_id: u32,
-    device_id: u32,
-}
-
-/// First non-CPU Vulkan device with a graphics+compute family.
-///
-/// Do not switch this to `pf_gpu::selected_gpu()`: that picks "the NVIDIA GPU"
-/// whenever `/dev/nvidiactl` exists, which on an Intel-compositor + NVIDIA-present
-/// laptop is the GPU that cannot import the compositor's dmabufs and trips the
-/// process-wide raw-dmabuf latch. Do not anchor on `/dev/dri/renderD128`: render
-/// minors are driver bind-order, not display topology (amdgpu binds first → idle
-/// iGPU while the compositor allocates on NVIDIA).
-///
-/// The right oracle is which device allocated the capture buffers; that plumbing
-/// is not here. Shared with [`capture_modifiers`] so capture and encode never
-/// disagree about the device across an in-place resize that does not renegotiate.
-///
-/// # Safety
-/// `instance` must be live; only physical-device property/queue queries.
-unsafe fn select_physical_device(instance: &ash::Instance) -> Result<PickedDevice> {
-    for pd in instance.enumerate_physical_devices()? {
-        let props = instance.get_physical_device_properties(pd);
-        if props.device_type == vk::PhysicalDeviceType::CPU {
-            continue;
-        }
-        let Some(family) = instance
-            .get_physical_device_queue_family_properties(pd)
-            .iter()
-            .position(|q| {
-                q.queue_flags
-                    .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
-            })
-        else {
-            continue;
-        };
-        return Ok(PickedDevice {
-            pd,
-            family: family as u32,
-            vendor_id: props.vendor_id,
-            device_id: props.device_id,
-        });
-    }
-    Err(anyhow::anyhow!(
-        "no Vulkan GPU with a graphics+compute queue"
-    ))
 }
 
 fn pw_check(r: pw::pyrowave_result, what: &str) -> Result<()> {
@@ -389,28 +295,20 @@ impl Slot {
     }
 }
 
-/// One submitted frame whose fence has not been waited and whose bitstream has
-/// not been packetized yet.
-#[derive(Clone, Copy)]
+/// Submitted frame state kept until its fence is waited and packetized.
+#[derive(Clone)]
 struct InFlight {
-    /// Slot this frame owns. Carried, not recomputed: waiting the wrong fence looks
-    /// like corruption, not an error.
+    /// Slot whose fence and bitstream belong to this frame.
     slot: usize,
-    /// Capture timestamp for this AU. The `CapturedFrame` is the caller's and is
-    /// gone by packetize.
     pts_ns: u64,
-    /// Bitstream cap this frame was encoded against (`frame_budget + BS_SLACK`).
-    /// Snapshotted at submit: `reconfigure_bitrate` can land before poll, and in
-    /// dense mode the boundary is this number — a shrunk budget would make
-    /// `compute_num_packets` return more than one packet.
+    /// Submit-time cap; a later bitrate update cannot change this frame's boundary.
     cap: usize,
-    /// Sequence stamped into this frame's block headers (`wait_and_packetize` check).
     seq: u8,
-    /// Datagram alignment this frame was encoded for. `set_wire_chunking` can land
-    /// mid-flight; packetizing at a different boundary would mis-set `chunk_aligned`.
+    /// Submit-time chunking; a later update cannot relabel this frame's AU.
     wire_chunk: Option<usize>,
-    /// When `submit` started. The summary measures submit→AU, not just the wait.
     t0: std::time::Instant,
+    /// Keeps a raw producer buffer stable through the GPU read.
+    _src_hold: Option<pf_frame::FrameHold>,
 }
 
 pub struct PyroWaveEncoder {
@@ -1330,18 +1228,17 @@ impl PyroWaveEncoder {
         if let Some(&(_, _, img, _, view)) = self.import_cache.iter().find(|e| (e.0, e.1) == key) {
             return Ok((img, view, false));
         }
-        // Feed pf-zerocopy's raw-dmabuf latch: a driver that refuses compositor buffers
-        // refuses them forever, and only the latch (CPU capture next session) recovers.
-        // Transient OOM is excluded (`import_failure_feeds_latch`).
+        // Deterministic import refusal rebuilds this capture on its safe offer.
+        // Transient OOM stays out of the sticky verdict.
         let (img, mem, view) =
             match import_rgb_dmabuf(&self.device, &self.ext_fd, &self.mem_props, d, cw, ch) {
                 Ok(t) => {
-                    pf_zerocopy::note_raw_dmabuf_import_ok();
+                    d.health.note_raw_import_ok();
                     t
                 }
                 Err(e) => {
                     if import_failure_feeds_latch(&e) {
-                        pf_zerocopy::note_raw_dmabuf_import_failure(&format!("{e:#}"));
+                        reject_dmabuf(d, &format!("{e:#}"));
                     }
                     return Err(e);
                 }
@@ -1421,9 +1318,8 @@ impl PyroWaveEncoder {
         }
     }
 
-    /// Ingest → CSC → encode, recorded into our command buffer → queue-submit → return.
-    /// Fence wait and packetize are [`wait_and_packetize`]. Success pushes one [`InFlight`];
-    /// failure pushes nothing and resets the command buffer.
+    /// Record and submit ingest, CSC and encode. The in-flight entry owns any raw
+    /// source hold until [`wait_and_packetize`] retires its fence.
     unsafe fn submit_frame(&mut self, frame: &CapturedFrame, t0: std::time::Instant) -> Result<()> {
         // A failed `reset()` leaves the encoder destroyed and null. A null here is a
         // use-after-free inside pyrowave, so fail loudly.
@@ -1719,6 +1615,10 @@ impl PyroWaveEncoder {
             cap: self.frame_budget + BS_SLACK,
             wire_chunk: self.wire_chunk,
             t0,
+            _src_hold: match &frame.payload {
+                FramePayload::Dmabuf(d) => d.hold.clone(),
+                _ => None,
+            },
         });
         Ok(())
     }
@@ -1728,7 +1628,7 @@ impl PyroWaveEncoder {
     /// VUID-vkResetCommandBuffer-commandBuffer-00045) and does not pop the entry: that is
     /// what tells `reset()` there is still live GPU work.
     unsafe fn wait_and_packetize(&mut self) -> Result<()> {
-        let Some(fr) = self.inflight.front().copied() else {
+        let Some(fr) = self.inflight.front().cloned() else {
             return Ok(());
         };
         let dev = self.device.clone();
@@ -2051,6 +1951,23 @@ mod tests {
             payload: FramePayload::Cpu(buf),
             cursor: None,
         }
+    }
+
+    #[test]
+    fn in_flight_frame_owns_the_raw_source_hold() {
+        let hold: pf_frame::FrameHold = std::sync::Arc::new(());
+        let frame = InFlight {
+            slot: 0,
+            pts_ns: 0,
+            cap: 1,
+            seq: 0,
+            wire_chunk: None,
+            t0: std::time::Instant::now(),
+            _src_hold: Some(hold.clone()),
+        };
+        assert_eq!(std::sync::Arc::strong_count(&hold), 2);
+        drop(frame);
+        assert_eq!(std::sync::Arc::strong_count(&hold), 1);
     }
 
     /// BT.709 limited-range YCbCr of an 8-bit RGB fill — same math as `rgb2yuv.comp`.
@@ -2398,6 +2315,8 @@ mod tests {
                 offset: 0,
                 stride: 64 * 4,
                 hold: None,
+                health: pf_zerocopy::zero_copy_health(modifier),
+                rebuild: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         };
         let fd_count = || std::fs::read_dir("/proc/self/fd").expect("procfs").count();

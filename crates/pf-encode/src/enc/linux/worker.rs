@@ -226,9 +226,11 @@ pub(crate) enum FromWorker {
     },
     /// No cached fd for `key`. Host forgets "already sent" and retries once with the fd.
     NeedFd,
-    /// This frame failed; the worker is still alive.
+    /// This frame failed; the worker is still alive. `capture_rebuild` feeds a
+    /// dmabuf submit failure to the host's identity-scoped fallback.
     EncodeErr {
         message: String,
+        capture_rebuild: bool,
     },
     Ack {
         ok: bool,
@@ -462,6 +464,7 @@ fn serve(sock: &OwnedFd, mut enc: super::pyrowave::PyroWaveEncoder, au_buf: &Fil
         let reply = match msg {
             ToWorker::Hello { .. } => FromWorker::EncodeErr {
                 message: "duplicate Hello".into(),
+                capture_rebuild: false,
             },
             ToWorker::SetWireChunking { shard_payload } => {
                 enc.set_wire_chunking(shard_payload);
@@ -524,6 +527,7 @@ fn serve(sock: &OwnedFd, mut enc: super::pyrowave::PyroWaveEncoder, au_buf: &Fil
                     Ok(reply) => reply,
                     Err(e) => FromWorker::EncodeErr {
                         message: format!("{e:#}"),
+                        capture_rebuild: false,
                     },
                 }
             }
@@ -619,16 +623,22 @@ fn encode_one(
             plane1: req.plane1,
             offset: req.offset,
             stride: req.stride,
-            // Deferred-requeue hold stays host-side: this backend is synchronous
-            // at depth 1, so the host's frame outlives the whole encode.
+            // Hold and the authoritative rebuild signal stay host-side.
             hold: None,
+            health: pf_zerocopy::zero_copy_health(0),
+            rebuild: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
         cursor,
     };
     // submit then poll in one breath: encode is synchronous at depth 1, so the
     // AU is ready when `poll` returns and `frame` is alive across both halves.
     let t0 = Instant::now();
-    enc.submit(&frame)?;
+    if let Err(e) = enc.submit(&frame) {
+        return Ok(FromWorker::EncodeErr {
+            message: format!("{e:#}"),
+            capture_rebuild: true,
+        });
+    }
     let Some(au) = enc.poll()? else {
         anyhow::bail!("encoder returned no AU for a submitted frame");
     };
@@ -732,6 +742,7 @@ mod tests {
             FromWorker::Ack { ok: true },
             FromWorker::EncodeErr {
                 message: "boom".into(),
+                capture_rebuild: false,
             },
         ] {
             ipc::send(b.as_fd(), &reply, None).unwrap();

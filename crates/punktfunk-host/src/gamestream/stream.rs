@@ -680,12 +680,16 @@ fn open_gs_mirror_source(
             refresh_hz: cfg.fps,
         })
         .context("start mirroring the pinned monitor")?;
+    let plan = gs_session_plan(&cfg, metadata_cursor);
     crate::capture::capture_virtual_output(
         vout,
-        gs_session_plan(&cfg, metadata_cursor).output_format(),
-        crate::session_plan::CaptureBackend::resolve(),
-        compositor == crate::vdisplay::Compositor::Kwin,
-        compositor == crate::vdisplay::Compositor::Gamescope,
+        crate::capture::VirtualCaptureRequest {
+            output: plan.output_format(),
+            codec: Some(plan.codec),
+            capture: crate::session_plan::CaptureBackend::resolve(),
+            kwin: compositor == crate::vdisplay::Compositor::Kwin,
+            gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
+        },
     )
     .context("attach a capturer to the mirrored monitor")
 }
@@ -841,17 +845,19 @@ fn open_gs_virtual_source(
     )
     .context("create virtual output at client resolution")?;
     // Linux virtual-output capture is SDR-only (Mutter RecordVirtual); HDR is portal mirror.
+    let plan = gs_session_plan(
+        &cfg,
+        compositor != crate::vdisplay::Compositor::Gamescope && blend_capable_metadata_cursor(&cfg),
+    );
     let mut capturer = capture::capture_virtual_output(
         vout,
-        gs_session_plan(
-            &cfg,
-            compositor != crate::vdisplay::Compositor::Gamescope
-                && blend_capable_metadata_cursor(&cfg),
-        )
-        .output_format(),
-        crate::session_plan::CaptureBackend::resolve(),
-        compositor == crate::vdisplay::Compositor::Kwin,
-        compositor == crate::vdisplay::Compositor::Gamescope,
+        capture::VirtualCaptureRequest {
+            output: plan.output_format(),
+            codec: Some(plan.codec),
+            capture: crate::session_plan::CaptureBackend::resolve(),
+            kwin: compositor == crate::vdisplay::Compositor::Kwin,
+            gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
+        },
     )
     .context("capture virtual output")?;
     capturer.set_active(true);
