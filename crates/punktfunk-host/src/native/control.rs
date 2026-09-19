@@ -38,19 +38,15 @@ struct ShareClocks {
     lift: std::time::Instant,
 }
 
-impl Default for ShareClocks {
-    fn default() -> Self {
-        let now = std::time::Instant::now();
+impl ShareClocks {
+    fn new(now: std::time::Instant) -> Self {
         ShareClocks {
             room: now + punktfunk_core::abr::governor::SHARE_CLOCK,
             lift: now + punktfunk_core::abr::governor::SHARE_LIFT_CLOCK,
         }
     }
-}
 
-impl ShareClocks {
-    fn take(&mut self) -> punktfunk_core::abr::governor::Clocks {
-        let now = std::time::Instant::now();
+    fn take(&mut self, now: std::time::Instant) -> punktfunk_core::abr::governor::Clocks {
         let out = punktfunk_core::abr::governor::Clocks {
             room: now >= self.room,
             lift: now >= self.lift,
@@ -63,6 +59,36 @@ impl ShareClocks {
         }
         out
     }
+}
+
+/// What a client's [`punktfunk_core::quic::DeliveryReport`] leaves this session:
+/// the share of the path it is on, if the governor has one to send.
+///
+/// The report is the boundary both figures are read over, so closing the window
+/// and asking are one step ([`crate::session_status::share_for`]). A group of
+/// one never has a share. The id is `0` until the video loop registers the
+/// session, and before that there is nothing for a sibling to share with.
+#[allow(clippy::too_many_arguments)]
+fn delivery_share(
+    now: std::time::Instant,
+    packets_received: u64,
+    counters: &crate::session_status::SessionCounters,
+    window: &mut ShareWindow,
+    clocks: &mut ShareClocks,
+    automatic: bool,
+    wire_bytes: u64,
+) -> Option<u32> {
+    let (offered, delivered) = window.close(
+        now,
+        counters.link.egress_bytes(),
+        packets_received,
+        wire_bytes,
+    );
+    counters.share.publish(automatic, offered, delivered);
+    let id = counters.link.session_id();
+    (id != 0)
+        .then(|| crate::session_status::share_for(id, clocks.take(now)))
+        .flatten()
 }
 
 /// Whether this probe request skips the one-per-10 s spacing: a bring-up ramp
@@ -248,7 +274,7 @@ pub(super) async fn run(task: Task) {
     // the last window, read at the same boundary so a shortfall describes one
     // stretch of link, plus the two clocks an up-move rides.
     let mut window = ShareWindow::new(std::time::Instant::now(), counters.link.egress_bytes());
-    let mut share_clocks = ShareClocks::default();
+    let mut share_clocks = ShareClocks::new(std::time::Instant::now());
     // One `link health` line a minute, ticking whether or not anything arrived: a reader must
     // be able to tell a clean minute from a host that stopped logging.
     let mut link = crate::link_health::LinkWindow::new(&counters.link);
@@ -331,24 +357,15 @@ pub(super) async fn run(task: Task) {
                         rep.packets_received.min(u32::MAX as u64 - 1) as u32,
                         Ordering::Relaxed,
                     );
-                    // This report is the host's own window boundary: publish
-                    // what the window offered and what reached the client, then
-                    // ask the governor what this session's share of the path is
-                    // (`session_status::share_for`). A group of one never has one.
-                    let (offered, delivered) = window.close(
+                    if let Some(share) = delivery_share(
                         std::time::Instant::now(),
-                        counters.link.egress_bytes(),
                         rep.packets_received,
+                        &counters,
+                        &mut window,
+                        &mut share_clocks,
+                        bitrate_automatic,
                         wire_bytes,
-                    );
-                    counters.share.publish(bitrate_automatic, offered, delivered);
-                    // `0` until the video loop registers the session; before
-                    // that there is nothing for a sibling to share with.
-                    let id = counters.link.session_id();
-                    if let Some(share) = (id != 0)
-                        .then(|| crate::session_status::share_for(id, share_clocks.take()))
-                        .flatten()
-                    {
+                    ) {
                         // A share under the live rate is a retarget the encoder
                         // takes now; one above it is a ceiling the client still
                         // has to earn, so nothing is applied for it.
