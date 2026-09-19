@@ -773,7 +773,6 @@
 // before its pipeline exists and without the one-per-10 s spacing, until the first video
 // frame leaves. That window is what the client's bring-up ramp measures the link in; a
 // client that does not see the bit bursts beside live video as before.
-// New `host_caps2` bits go in `cap_bytes_are_distinct_single_bits`.
 #define PUNKTFUNK_HOST_CAP2_RAMP 16
 
 // [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
