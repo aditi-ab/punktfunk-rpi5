@@ -312,7 +312,7 @@ mod tests {
     /// Every delivery count a real [`Driver`] asks the host for over `windows`
     /// report windows, and the millisecond of the ask. Driven as the pump drives
     /// it: session counters in, actions out, a packet a millisecond arriving.
-    fn delivery_reports(windows: u64) -> Vec<(u64, u64)> {
+    fn delivery_reports(windows: u64, reads_delivery: bool) -> Vec<(u64, u64)> {
         let base = Instant::now();
         let mut d = Driver::new(
             DriverConfig {
@@ -328,6 +328,7 @@ mod tests {
                 probe: false,
                 probe_target_kbps: None,
                 ramp: false,
+                reads_delivery,
             },
             base,
         );
@@ -350,16 +351,22 @@ mod tests {
         out
     }
 
-    /// The governor's own input, from the client that has to produce it.
-    ///
-    /// A session that is receiving owes its count once, so the host's share
-    /// window ([`ShareWindow`]) closes once however long the session runs: the
-    /// path is read once and the group divided once.
+    /// The governor's own input, from the client that has to produce it: a
+    /// session on a governing host closes the host's share window
+    /// ([`ShareWindow`]) every report window, so the path is re-read and the
+    /// group re-divided every window. Toward every other host the count goes out
+    /// once and the group can never be divided again.
     #[test]
-    fn a_receiving_session_reports_its_delivery_once() {
-        let reports = delivery_reports(12);
-        assert_eq!(reports.len(), 1, "twelve windows, one report: {reports:?}");
-        assert!(reports[0].0 < 1_600, "and it is the first window's");
+    fn a_governing_host_is_told_what_arrived_every_window() {
+        let told = delivery_reports(12, true);
+        assert_eq!(told.len(), 12, "a window each: {told:?}");
+        assert!(
+            told.windows(2).all(|p| p[1].1 > p[0].1),
+            "every count is this window's own: {told:?}"
+        );
+        let quiet = delivery_reports(12, false);
+        assert_eq!(quiet.len(), 1, "twelve windows, one report: {quiet:?}");
+        assert!(quiet[0].0 < 1_600, "and it is the first window's");
     }
 
     /// A group with no history behind it, which is how most cases below open.

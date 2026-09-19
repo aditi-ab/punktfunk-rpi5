@@ -709,6 +709,10 @@ pub(super) async fn negotiate(
             }
             // Invites the client's `Start` extension block, which is where it names itself.
             | punktfunk_core::quic::HOST_CAP2_EXT
+            // This host divides a path between the sessions that share a client address
+            // (`session_status::share_for`), and a delivery count every report window is the
+            // only measure of a session's own air it has.
+            | punktfunk_core::quic::HOST_CAP2_DELIVERY
             // The virtual path punches its data plane two to three seconds before its
             // pipeline exists, and serves the client's bring-up ramp in that gap. The
             // protocol-test sources have no such gap: video leaves at once.

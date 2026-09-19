@@ -61,6 +61,8 @@ pub(super) struct ClientCfg {
     pub probe_target_kbps: Option<u32>,
     /// Host advertises `HOST_CAP2_RAMP`: measure the link during bring-up.
     pub ramp: bool,
+    /// Host advertises `HOST_CAP2_DELIVERY`: report what arrived every window.
+    pub reads_delivery: bool,
     /// Ceiling injected directly, for a scenario that replays a host which
     /// paused video for the burst. The window it lands in is discarded, as
     /// the probe tail is.
@@ -85,6 +87,7 @@ impl Default for ClientCfg {
             probe: true,
             probe_target_kbps: None,
             ramp: false,
+            reads_delivery: true,
             ceiling_at: None,
             rebuild_at_ms: None,
             automatic: true,
@@ -213,6 +216,7 @@ impl Client {
                 probe: cfg.probe,
                 probe_target_kbps: cfg.probe_target_kbps,
                 ramp: cfg.ramp,
+                reads_delivery: cfg.reads_delivery,
             },
             joined,
         );

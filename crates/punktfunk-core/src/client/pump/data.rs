@@ -59,6 +59,9 @@ pub(super) struct DataPump {
     /// ([`crate::quic::HOST_CAP2_RAMP`]): the link is measured before the
     /// first frame instead of burst at beside it.
     pub(super) serves_ramp: bool,
+    /// Host reads a delivery count every window
+    /// ([`crate::quic::HOST_CAP2_DELIVERY`]) to divide a shared path.
+    pub(super) reads_delivery: bool,
     /// Audio-plane wire reservation, spent whether video flows or not.
     pub(super) audio_reserved_kbps: u32,
     /// Mode+codec ceiling ([`crate::abr::stream_ceiling_kbps`]) for the
@@ -100,6 +103,7 @@ impl DataPump {
             chroma_format,
             marks_repeats,
             serves_ramp,
+            reads_delivery,
             audio_reserved_kbps,
             stream_cap_kbps,
             refresh_hz,
@@ -140,6 +144,7 @@ impl DataPump {
                 probe: std::env::var("PUNKTFUNK_ABR_PROBE").map_or(true, |v| v != "0"),
                 probe_target_kbps: env_u32("PUNKTFUNK_ABR_PROBE_KBPS"),
                 ramp: serves_ramp,
+                reads_delivery,
             },
             Instant::now(),
         );
@@ -764,6 +769,7 @@ mod tests {
             chroma_format: 0,
             marks_repeats: false,
             serves_ramp: false,
+            reads_delivery: false,
             audio_reserved_kbps: 256,
             stream_cap_kbps: 100_000,
             refresh_hz: 60,
