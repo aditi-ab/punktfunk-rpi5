@@ -228,6 +228,18 @@ pub(crate) struct SynthAbrContext {
     pub(crate) client_label: String,
     pub(crate) bringup: Arc<crate::bringup::Trace>,
     pub(crate) wire_sock: Option<std::net::UdpSocket>,
+    /// What [`crate::session_status::register`] needs and this source cannot derive: the
+    /// session's own handles, what the handshake negotiated, and the client's address, which
+    /// is how the shared-path governor groups sessions.
+    pub(crate) codec: crate::encode::Codec,
+    pub(crate) quit: Arc<AtomicBool>,
+    pub(crate) end_reason: Arc<AtomicU8>,
+    pub(crate) controls: crate::session_status::SessionControls,
+    pub(crate) client_name: Option<String>,
+    pub(crate) hdr: bool,
+    pub(crate) bit_depth: u8,
+    pub(crate) chroma: crate::encode::ChromaFormat,
+    pub(crate) peer: std::net::IpAddr,
 }
 
 /// Stream until the client leaves, `seconds` elapse, or the send thread goes.
@@ -263,6 +275,15 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         client_label,
         bringup,
         wire_sock,
+        codec,
+        quit,
+        end_reason,
+        controls,
+        client_name,
+        hdr,
+        bit_depth,
+        chroma,
+        peer,
     } = ctx;
     let fps = mode.refresh_hz.max(1);
     let mut budget_kbps = bitrate_kbps;
@@ -294,9 +315,9 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
     let live_mode = Arc::new(AtomicU64::new(pack_mode(mode.width, mode.height, fps)));
     let send_stats = SendStats {
         rec: stats,
-        mode: live_mode,
+        mode: live_mode.clone(),
         codec: "synthetic-abr",
-        client: client_label,
+        client: client_label.clone(),
         bitrate_kbps: live_bitrate.clone(),
         bringup: bringup.clone(),
         wire_sock,
@@ -352,6 +373,36 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         budget_kbps = k;
         live_bitrate.store(budget_kbps, Ordering::Relaxed);
     }
+    // Published where the display path publishes, once the encoder has its opening rate:
+    // registration latches the id the control task asks the shared-path governor with
+    // ([`crate::session_status::share_for`]). The guard retires the entry on every exit below.
+    let _live_session = crate::session_status::register(crate::session_status::Registration {
+        mode: live_mode,
+        bitrate_kbps: live_bitrate.clone(),
+        codec,
+        stop: stop.clone(),
+        quit,
+        // Nothing drains it here: a console force-keyframe is a no-op on this source.
+        force_idr: Arc::new(AtomicBool::new(false)),
+        client: client_label,
+        client_name,
+        plane: crate::events::Plane::Native,
+        hdr,
+        ttff_ms: bringup.total_slot(),
+        // Never written: a source that cannot reconfigure never resizes.
+        last_resize_ms: Arc::new(AtomicU32::new(0)),
+        // No display, so no launch and no lease: this session plays no title.
+        game: None,
+        // No capturer to classify, which the governor reads as a session that is not idle.
+        capture_health: Arc::new(std::sync::Mutex::new(None)),
+        join: false,
+        controls,
+        bit_depth,
+        chroma,
+        end_reason,
+        counters: counters.clone(),
+        peer: Some(peer),
+    });
     let deadline = (seconds > 0).then(|| started + std::time::Duration::from_secs(seconds.into()));
     let mut due = started;
     let (mut au_seq, mut tick, mut asks) = (0u32, 0u64, 0u32);

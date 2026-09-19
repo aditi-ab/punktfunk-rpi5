@@ -1381,6 +1381,25 @@ mod tests {
         assert_eq!(ac.share.share_kbps(), 9_000, "and it is remembered");
     }
 
+    /// What the control task asks the governor with: registration stamps the
+    /// session's id onto the counter block its side threads already hold, and
+    /// that id is what `share_for` takes. A source that never registers leaves
+    /// it `0`, which the control task reads as "nothing to share with".
+    #[test]
+    fn registration_latches_the_id_the_governor_is_asked_for() {
+        let peer: std::net::IpAddr = "203.0.113.95".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (b, bc, _br) = fake_member("pc", peer, 12_000);
+        for c in [&ac, &bc] {
+            c.share.publish(true, 12_000, 9_000);
+        }
+        assert_eq!(ac.link.session_id(), a.id, "the id the link lines carry");
+        assert_eq!(bc.link.session_id(), b.id);
+        assert_ne!(ac.link.session_id(), 0);
+        assert_eq!(share_for(ac.link.session_id(), both_clocks()), Some(9_000));
+        assert_eq!(share_for(bc.link.session_id(), both_clocks()), Some(9_000));
+    }
+
     /// A fixed-rate session takes what it is set to off the top and is never
     /// told anything; the Automatic one gets what is left.
     #[test]

@@ -2329,6 +2329,8 @@ pub(crate) async fn run_admitted(
     let inj_session_tx_dp = inj_session_tx.clone();
     // Control-plane local IP for the source-address check (send loop is a blocking thread).
     let control_local_ip = conn.local_ip();
+    // Client address: what the registry groups sessions of one NAT or tunnel by.
+    let peer_ip = conn.remote_address().ip();
     let result: Result<()> = async {
         let stream_thread = tokio::task::spawn_blocking(move || -> Result<()> {
             let (transport, wire_sock): (Box<dyn punktfunk_core::transport::Transport>, _) = match (data_plane, data_sock) {
@@ -2463,6 +2465,15 @@ pub(crate) async fn run_admitted(
                     client_label,
                     bringup: bringup_dp,
                     wire_sock,
+                    codec,
+                    quit: quit_stream,
+                    end_reason: end_reason_stream,
+                    controls,
+                    client_name,
+                    hdr,
+                    bit_depth,
+                    chroma,
+                    peer: peer_ip,
                     })
                 }
                 Punktfunk1Source::Virtual => {
@@ -3364,6 +3375,100 @@ mod tests {
         unsafe { punktfunk_connection_close(conn4) };
 
         host.join().unwrap().unwrap();
+    }
+
+    /// A `synthetic-abr` session publishes a registry row while it streams and retires it
+    /// when it ends. The row's id is the one the control task reads off the session's
+    /// counters before it asks the governor for a share, so a source that never registers
+    /// leaves a shared path undivided.
+    #[test]
+    fn a_synthetic_abr_session_registers_while_it_streams() {
+        let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use punktfunk_core::client::NativeClient;
+
+        let host = std::thread::spawn(|| {
+            run_ephemeral(Punktfunk1Options {
+                port: 19782,
+                source: Punktfunk1Source::SyntheticAbr(SynthAbrShape {
+                    content: Content::Steady { fill_pct: 100 },
+                    recovery: std::time::Duration::ZERO,
+                    answer: KeyframeAnswer::Idr,
+                    idr_pct: DEFAULT_IDR_PCT,
+                    bringup: std::time::Duration::ZERO,
+                    serve_ramp: false,
+                }),
+                seconds: 3,
+                frames: 0, // this source is timed, not counted
+                max_sessions: 1,
+                max_concurrent: 1,
+                require_pairing: false,
+                allow_pairing: false,
+                pairing_pin: None,
+                paired_store: None,
+                data_port: None,
+                idle_timeout: None,
+                mdns: false,
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let mode = punktfunk_core::Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+        let client = NativeClient::connect(
+            "127.0.0.1",
+            19782,
+            mode,
+            CompositorPref::Auto,
+            GamepadPref::Auto,
+            0,
+            0,
+            2,
+            0,
+            0,
+            None,
+            0,
+            false,
+            None,
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(10),
+        )
+        .expect("client connects to the synthetic-abr host");
+
+        // The registry is process-global and the session_status tests register their own
+        // rows in it; this mode is what tells ours apart from theirs.
+        let ours = || {
+            crate::session_status::snapshot()
+                .into_iter()
+                .find(|s| (s.width, s.height, s.fps) == (1280, 720, 60))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let row = loop {
+            if let Some(r) = ours() {
+                break r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the synthetic-abr session never reached the registry"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_ne!(
+            row.id, 0,
+            "0 is the id the control task skips the governor on"
+        );
+        assert_eq!(row.plane, crate::events::Plane::Native);
+
+        drop(client);
+        host.join().unwrap().unwrap();
+        assert!(
+            ours().is_none(),
+            "the guard retires the row on the stream's exit path"
+        );
     }
 
     /// Clipboard over a synthetic session: host advertises the cap, acks enable with
