@@ -161,6 +161,12 @@ pub const HOST_CAP2_TOUCH: u8 = 0x02;
 /// bit — Hello is first contact, with no host capability known yet, and stays frozen.
 pub const HOST_CAP2_EXT: u8 = 0x04;
 
+/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the injector consumes
+/// [`InputKind::Scroll`](crate::input::InputKind::Scroll) — source/phase-aware
+/// normalized scroll. Without the bit the client's outbound seam converts each
+/// event to the legacy `MouseScroll` vocabulary instead; the host never sees both.
+pub const HOST_CAP2_SCROLL: u8 = 0x08;
+
 /// [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
 /// that wants to stream from a GPU-less host must advertise this.
 pub const CODEC_H264: u8 = 0x01;

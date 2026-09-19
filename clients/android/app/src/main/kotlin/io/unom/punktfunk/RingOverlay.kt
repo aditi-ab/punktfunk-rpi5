@@ -226,6 +226,8 @@ class RingActions(
     /** `[w, h, hz]` as last requested (Android has no live read-back of the negotiated mode). */
     val currentMode: () -> IntArray,
     val requestMode: (Int, Int, Int) -> Unit,
+    val scrollInverted: () -> Boolean = { false },
+    val toggleScrollInversion: () -> Unit = {},
 )
 
 /**
@@ -833,6 +835,11 @@ private fun sheetRows(
     rows += SheetRowSpec(null, "Refresh", "$hz Hz", onAdjust = ::adjustHz) { adjustHz(1) }
     val tm = spec(SlotId.TouchMode, cfg, actions)
     rows += SheetRowSpec("Input", tm.label, tm.state) { actions.cycleTouchMode() }
+    val pointerGranted = actions.pointerGranted()
+    rows += SheetRowSpec(null, "Invert scroll direction",
+        if (pointerGranted) { if (actions.scrollInverted()) "On" else "Off" } else "Pointer input is not allowed",
+        pointerGranted,
+    ) { if (actions.pointerGranted()) actions.toggleScrollInversion() }
     val kb = spec(SlotId.Keyboard, cfg, actions)
     rows += SheetRowSpec(null, kb.label, if (kb.enabled) "" else kb.reason, kb.enabled) { if (kb.enabled) { state.close(); actions.keyboard() } }
     val st = spec(SlotId.SendText, cfg, actions)

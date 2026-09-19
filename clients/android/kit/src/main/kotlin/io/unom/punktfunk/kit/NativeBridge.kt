@@ -472,8 +472,19 @@ object NativeBridge {
     /** One mouse-button transition. button: 1=left 2=middle 3=right 4=X1 5=X2. */
     external fun nativeSendPointerButton(handle: Long, button: Int, down: Boolean)
 
-    /** One scroll step. axis: 0=vertical 1=horizontal. delta: signed, 120-scaled, +=up/right. */
+    /** One scroll step. axis: 0=vertical 1=horizontal. delta: signed, 120-scaled, +=up/right.
+     *  Legacy embedder API — production capture uses [nativeSendNormalizedScroll]. */
     external fun nativeSendScroll(handle: Long, axis: Int, delta: Int, precise: Boolean)
+
+    /**
+     * One normalized scroll step (`InputKind::Scroll`). [axis]: 0=vertical 1=horizontal. [delta]:
+     * signed Q24.8 in the source's unit — 120-per-detent for Wheel/Unknown, DIP for the rest.
+     * [source]/[phase] are the wire bytes; Rust drops a malformed pair before anything is sent.
+     */
+    external fun nativeSendNormalizedScroll(handle: Long, axis: Int, delta: Int, source: Int, phase: Int)
+
+    /** Live natural-scroll toggle, applied once at the core's outbound seam. False on a dead session. */
+    external fun nativeSetInvertScroll(handle: Long, invert: Boolean): Boolean
 
     /**
      * One REAL touchscreen transition (the touch-passthrough input mode). [kind]: 0=down 1=move

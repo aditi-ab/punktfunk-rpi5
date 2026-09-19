@@ -318,7 +318,7 @@ jobs:
       #
       # This does NOT disturb the 1.96.0 pin: `cargo +<toolchain>` overrides rust-toolchain.toml
       # for that single invocation only, so `cargo fmt` / `clippy` keep resolving 1.96.0 and the
-      # fmt-parity contract in CLAUDE.md is untouched. The two echo lines below keep that claim
+      # fmt-parity contract is untouched. The two echo lines below keep that claim
       # honest in the log. They are deliberately NOT `rustup show active-toolchain`: that command
       # RESOLVES the toolchain file and would install the whole 1.96.0 toolchain just to print a
       # line, in a job where every cargo call is `+$MIRI_TOOLCHAIN` and 1.96.0 is never needed.

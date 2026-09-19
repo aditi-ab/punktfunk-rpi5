@@ -62,6 +62,9 @@ pub(crate) struct WorkerArgs {
     pub(crate) pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]>,
     /// Pads the embedder switched to controller mouse.
     pub(crate) pad_mouse: Arc<super::pad_mouse::PadMouseShared>,
+    /// Live invert-scroll toggle ([`NativeClient::set_invert_scroll`]); the input
+    /// task applies it once at the outbound seam.
+    pub(crate) scroll_invert: Arc<AtomicBool>,
     pub(crate) hdr_meta_tx: SyncSender<HdrMeta>,
     pub(crate) host_timing_tx: SyncSender<crate::quic::HostTiming>,
     pub(crate) cursor_shape_tx: SyncSender<crate::quic::CursorShape>,
@@ -103,6 +106,8 @@ pub(crate) struct WorkerArgs {
     pub(crate) live_bitrate: Arc<AtomicU32>,
     /// Why Automatic last cut the rate ([`crate::hud::RateCut`] code), for the overlay.
     pub(crate) rate_cut: Arc<AtomicU8>,
+    /// RFIs sent in the last minute, for the overlay. The control task notes each one.
+    pub(crate) recent_rfis: Arc<Mutex<RecentRfis>>,
     /// Mute mask the control task ORs [`crate::client::AUDIO_MUTE_HOST`] into on every
     /// `AudioState`. The embedder's own bit rides the same cell.
     pub(crate) audio_mute: Arc<AtomicU8>,

@@ -61,9 +61,9 @@ final class TouchMouse {
         /// One finger held still this long (s) presses the left button and drags until it
         /// lifts — the touch idiom for "pick this up".
         static let longPress: TimeInterval = 0.5
-        /// Precise wheel units per point of two-finger pan: the indirect trackpad's scale
-        /// (`StreamLayerUIView.forwardScroll`), so the content travels with the fingers.
-        static let scrollUnitsPerPt: CGFloat = 12
+        /// Wire scroll units per point of two-finger pan: points are DIP, so the Q24.8
+        /// distance is the centroid travel × 256 — the content travels with the fingers.
+        static let scrollUnitsPerPt: CGFloat = 256
         /// Base finger-px → host-px gain (~1:1, never twitchy). The acceleration below lets a
         /// flick cross the screen while a slow drag stays precise.
         static let pointerSens: CGFloat = 1.3
@@ -92,8 +92,6 @@ final class TouchMouse {
 
     /// Wire events out (the owner gates them on its capture state).
     var send: ((PunktfunkInputEvent) -> Void)?
-    /// The session's invert-scroll setting, for the two-finger scroll that sends directly.
-    var invertScroll = false
     /// View-space point → host-mode pixels through the letterbox (pointer mode's moves).
     var hostPoint: ((CGPoint) -> StreamLayerUIView.HostPoint?)?
     /// Three-finger vertical swipe crossed the threshold: `true` = show the local soft
@@ -115,6 +113,8 @@ final class TouchMouse {
     private var dial: Dial?
     /// The pair travelled past `dialSlop` unarmed: a scroll for the gesture's lifetime.
     private var scrollLocked = false
+    /// Wire axes an in-flight scroll has opened — Begin'd and closed (End/Cancel) here.
+    private var scrollOpen = (v: false, h: false)
     /// Units scrolled while the pair was undecided, sent back if it turns out a twist or a tap.
     private var provisional = (x: Int32(0), y: Int32(0))
     /// Sub-unit scroll remainder, so a slow pan is not lost to truncation.
@@ -170,6 +170,7 @@ final class TouchMouse {
             moved = false
             scrolling = false
             scrollLocked = false
+            scrollClose(PUNKTFUNK_SCROLL_PHASE_CANCEL) // a leak can't survive the gesture break
             provisional = (0, 0)
             scrollCarry = .zero
             dial = nil
@@ -207,6 +208,7 @@ final class TouchMouse {
                 anchor: CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2))
         case 3...:
             endDial() // a third finger ends the twist
+            endScroll() // and the in-flight scroll: the pair that drove it is gone
         default:
             break
         }
@@ -294,6 +296,7 @@ final class TouchMouse {
         if lastPos.count == 2 {
             if !dialStep() { scrollByCentroid() }
         } else if lastPos.count >= 3 {
+            endScroll() // 3+ is the keyboard swipe — a committed scroll's axes end here
             keyboardSwipe(in: view)
         } else if !scrolling, let touch = touches.first(where: {
             lastPos[ObjectIdentifier($0)] != nil
@@ -313,11 +316,15 @@ final class TouchMouse {
             upTime = max(upTime, touch.timestamp)
         }
         endDial() // any lift ends the twist
+        // A committed scroll's axes end with the pair that drove them — the last lift below
+        // decides between the tap's rollback and the closing End for everything still open.
+        if lastPos.count < 2, scrollLocked { endScroll() }
         guard lastPos.isEmpty, sessionActive else { return }
         sessionActive = false
         if dragHeld {
             dragHeld = false
             send?(.mouseButton(Button.left, down: false)) // end the drag
+            endScroll()
         } else if !moved {
             rollBackProvisional() // a tap's jitter must not leave the page nudged
             switch maxFingers {
@@ -332,6 +339,8 @@ final class TouchMouse {
                 lastTapUp = upTime
                 lastTapPoint = startPoint
             }
+        } else {
+            endScroll()
         }
     }
 
@@ -362,6 +371,7 @@ final class TouchMouse {
             dragHeld = false
             send?(.mouseButton(Button.left, down: false))
         }
+        scrollClose(PUNKTFUNK_SCROLL_PHASE_CANCEL)
         sessionActive = false
         scrolling = false
         moved = false
@@ -369,9 +379,10 @@ final class TouchMouse {
 
     // MARK: - Per-event work
 
-    /// Two fingers → scroll by the centroid delta as a precise distance; never move the cursor.
+    /// Two fingers → scroll by the centroid delta as a Touch distance; never move the cursor.
     /// While the pair is undecided the units are provisional (`rollBackProvisional`). Finger
-    /// up scrolls up, finger right scrolls right (the host WHEEL(120) convention).
+    /// up scrolls up, finger right scrolls right (the wire's positive convention). Inversion
+    /// is the connection's outbound seam — nothing here flips a sign.
     private func scrollByCentroid() {
         let n = CGFloat(lastPos.count)
         let cx = lastPos.values.reduce(0) { $0 + $1.x } / n
@@ -381,10 +392,8 @@ final class TouchMouse {
             scrolling = true
             scrollAnchor = dial?.anchor ?? CGPoint(x: cx, y: cy)
         }
-        // This path sends straight to the connection, so the invert setting is applied here.
-        let gain = Tuning.scrollUnitsPerPt * (invertScroll ? -1 : 1)
-        scrollCarry.y += (scrollAnchor.y - cy) * gain
-        scrollCarry.x += (cx - scrollAnchor.x) * gain
+        scrollCarry.y += (scrollAnchor.y - cy) * Tuning.scrollUnitsPerPt
+        scrollCarry.x += (cx - scrollAnchor.x) * Tuning.scrollUnitsPerPt
         scrollAnchor = CGPoint(x: cx, y: cy)
         let dy = Int32(scrollCarry.y) // truncates toward zero → remainder kept with its sign
         let dx = Int32(scrollCarry.x)
@@ -398,16 +407,47 @@ final class TouchMouse {
             scrollLocked = true
             moved = true
         }
-        if dy != 0 { send?(.scroll(dy, precise: true)) }
-        if dx != 0 { send?(.scroll(dx, horizontal: true, precise: true)) }
+        scrollEmit(axis: 0, delta: dy)
+        scrollEmit(axis: 1, delta: dx)
     }
 
-    /// The undecided pair became a twist or a tap: send back what it scrolled.
+    /// One scroll delta on an axis — the first opens it (`Begin`), later ones `Update`.
+    private func scrollEmit(axis: UInt32, delta: Int32) {
+        guard delta != 0 else { return }
+        let opening = axis == 0 ? !scrollOpen.v : !scrollOpen.h
+        if axis == 0 { scrollOpen.v = true } else { scrollOpen.h = true }
+        send?(.normalizedScroll(
+            delta, axis: axis, source: PUNKTFUNK_SCROLL_SOURCE_TOUCH,
+            phase: opening ? PUNKTFUNK_SCROLL_PHASE_BEGIN : PUNKTFUNK_SCROLL_PHASE_UPDATE))
+    }
+
+    /// Every open axis stops at zero distance — `End` when a gesture ran its course,
+    /// `Cancel` on a rollback or teardown.
+    private func scrollClose(_ phase: PunktfunkScrollPhase) {
+        if scrollOpen.v {
+            scrollOpen.v = false
+            scrollCarry.y = 0
+            send?(.normalizedScroll(
+                0, axis: 0, source: PUNKTFUNK_SCROLL_SOURCE_TOUCH, phase: phase))
+        }
+        if scrollOpen.h {
+            scrollOpen.h = false
+            scrollCarry.x = 0
+            send?(.normalizedScroll(
+                0, axis: 1, source: PUNKTFUNK_SCROLL_SOURCE_TOUCH, phase: phase))
+        }
+    }
+
+    /// A committed scroll closes cleanly (`End`); a rolled-back or torn-down one cancels.
+    private func endScroll() { scrollClose(PUNKTFUNK_SCROLL_PHASE_END) }
+
+    /// The undecided pair became a twist or a tap: send back what it scrolled, then cancel.
     private func rollBackProvisional() {
-        if provisional.y != 0 { send?(.scroll(-provisional.y, precise: true)) }
-        if provisional.x != 0 { send?(.scroll(-provisional.x, horizontal: true, precise: true)) }
+        if provisional.y != 0 { scrollEmit(axis: 0, delta: -provisional.y) }
+        if provisional.x != 0 { scrollEmit(axis: 1, delta: -provisional.x) }
         provisional = (0, 0)
         scrollCarry = .zero
+        scrollClose(PUNKTFUNK_SCROLL_PHASE_CANCEL)
     }
 
     /// Three+ fingers → the keyboard swipe, never scroll (the documented vocabulary is

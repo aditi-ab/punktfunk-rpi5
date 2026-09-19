@@ -1324,7 +1324,7 @@ fn write_session_plus_dropin(
             .chain(adaptive_sync_args(game_hz(mode.refresh_hz)))
             .collect::<Vec<_>>()
             .join(" "),
-        wsi = wsi.unit_lines(),
+        wsi = wsi.unit_lines(hdr),
     );
     std::fs::write(&path, body).with_context(|| format!("write drop-in {}", path.display()))?;
     Ok(true)
@@ -3753,7 +3753,19 @@ impl WsiPlan {
 
     /// Nested-client environment. Implicit-layer search belongs here, never on the compositor:
     /// gamescope's own Vulkan loads every implicit layer in its process env.
-    fn env(self) -> Vec<(&'static str, String)> {
+    ///
+    /// An `hdr` session with a live layer also gets `DXVK_HDR=1`: DXVK and vkd3d-proton report an
+    /// HDR display only under it. Never without a layer, where a game would write PQ into an SDR
+    /// swapchain. A launch option set by the player is applied later and wins.
+    fn env(self, hdr: bool) -> Vec<(&'static str, String)> {
+        let mut env = self.layer_env();
+        if hdr && self != Self::DistroDisabled {
+            env.push(("DXVK_HDR", "1".to_string()));
+        }
+        env
+    }
+
+    fn layer_env(self) -> Vec<(&'static str, String)> {
         match self {
             // `VK_ADD_IMPLICIT_LAYER_PATH` ADDS to the loader's implicit-layer search (loader
             // 1.3.234+), so the box's own layer directories keep working; the distro's gamescope
@@ -3784,8 +3796,8 @@ impl WsiPlan {
     }
 
     /// As `systemd-run` arguments, for the transient unit.
-    fn setenv_args(self) -> Vec<String> {
-        self.env()
+    fn setenv_args(self, hdr: bool) -> Vec<String> {
+        self.env(hdr)
             .iter()
             .map(|(name, value)| format!("--setenv={name}={value}"))
             .collect()
@@ -3793,8 +3805,8 @@ impl WsiPlan {
 
     /// As unit-file lines, for the box-session drop-in. Trailing newline included, so whatever the
     /// body puts after it still parses — same contract as [`SessionBind::unit_lines`].
-    fn unit_lines(self) -> String {
-        self.env()
+    fn unit_lines(self, hdr: bool) -> String {
+        self.env(hdr)
             .iter()
             .map(|(name, value)| format!("Environment={name}={value}\n"))
             .collect()
@@ -3869,7 +3881,7 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
         for arg in bind.map(SessionBind::run_args).unwrap_or_default() {
             cmd.arg(arg);
         }
-        for arg in wsi.setenv_args() {
+        for arg in wsi.setenv_args(hdr) {
             cmd.arg(arg);
         }
         for arg in xkb_setenv_args() {
@@ -4436,7 +4448,7 @@ fn spawn(
     if let Some(home) = nested_seat_home {
         mark_seat_steam_log(home);
     }
-    let mut nested_env = wsi.env();
+    let mut nested_env = wsi.env(hdr);
     if let Some(home) = nested_seat_home {
         nested_env.extend(seat::env(home));
     }
@@ -5820,8 +5832,8 @@ mod tests {
         );
 
         // Both spellings reach both launch paths, and neither may lose the other.
-        let args = WsiPlan::DistroDisabled.setenv_args();
-        let lines = WsiPlan::DistroDisabled.unit_lines();
+        let args = WsiPlan::DistroDisabled.setenv_args(false);
+        let lines = WsiPlan::DistroDisabled.unit_lines(false);
         for (name, value) in WSI_OFF_ENV {
             assert!(args.contains(&format!("--setenv={name}={value}")), "{name}");
             assert!(
@@ -5840,7 +5852,7 @@ mod tests {
     /// WSI layers in the loader's implicit set. Assert the pair, not either half.
     #[test]
     fn our_own_layer_is_enabled_and_the_distro_one_forced_off_together() {
-        let env = WsiPlan::Ours.env();
+        let env = WsiPlan::Ours.env(false);
         let get = |k: &str| {
             env.iter()
                 .find(|(name, _)| *name == k)
@@ -5856,8 +5868,27 @@ mod tests {
 
         // `DistroKept` must stay genuinely inert: it is the arm that runs on a box we decided not
         // to touch, so a stray variable there would change behaviour we promised not to change.
-        assert!(WsiPlan::DistroKept.env().is_empty());
-        assert!(WsiPlan::DistroKept.unit_lines().is_empty());
+        assert!(WsiPlan::DistroKept.env(false).is_empty());
+        assert!(WsiPlan::DistroKept.unit_lines(false).is_empty());
+    }
+
+    #[test]
+    fn dxvk_hdr_follows_the_session_and_needs_a_layer() {
+        let has = |env: Vec<(&'static str, String)>| {
+            env.iter().any(|(k, v)| *k == "DXVK_HDR" && v == "1")
+        };
+        assert!(has(WsiPlan::Ours.env(true)));
+        assert!(has(WsiPlan::DistroKept.env(true)));
+        assert!(!has(WsiPlan::Ours.env(false)));
+        assert!(!has(WsiPlan::DistroKept.env(false)));
+        // No layer, no HDR10 swapchain: the game would write PQ into an SDR one.
+        assert!(!has(WsiPlan::DistroDisabled.env(true)));
+        assert!(WsiPlan::Ours
+            .setenv_args(true)
+            .contains(&"--setenv=DXVK_HDR=1".to_string()));
+        assert!(WsiPlan::Ours
+            .unit_lines(true)
+            .contains("Environment=DXVK_HDR=1\n"));
     }
 
     #[test]

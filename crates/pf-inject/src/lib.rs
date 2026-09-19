@@ -28,6 +28,12 @@ pub use keymap::vk_to_evdev;
 #[path = "inject/hidout_dedup.rs"]
 pub mod hidout_dedup;
 
+/// Normalized scroll ([`InputKind::Scroll`]) → per-backend primitive plans.
+/// Pure and ungated so tests on any platform assert the same mapping the
+/// injectors execute.
+#[path = "inject/scroll.rs"]
+pub mod scroll;
+
 /// Host-session injector. Not `Send`: owns compositor resources and stays on the control
 /// thread that created it.
 pub trait InputInjector {
@@ -334,6 +340,20 @@ pub fn touch_supported() -> bool {
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn touch_supported() -> bool {
+    false
+}
+
+/// Whether this backend consumes normalized scroll ([`InputKind::Scroll`],
+/// `HOST_CAP2_SCROLL`). Every shipped backend does — the mapper lowers it onto
+/// each one's own primitives. Welcome-time; a host without the bit only sees
+/// the legacy `MouseScroll` wire.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub fn scroll_supported() -> bool {
+    true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn scroll_supported() -> bool {
     false
 }
 

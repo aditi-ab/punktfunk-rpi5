@@ -571,14 +571,12 @@ impl StreamState {
         // discoverable in `/proc`, so an unscoped launch or watch lands on somebody else's screen.
         #[cfg(target_os = "linux")]
         let seat: Option<String> = cur_display_gen.and_then(crate::vdisplay::registry::seat_for);
-        // Latch the head for this session's window routes. Read here, where capture
+        // The head the lease's window stage places the game on. Read here, where capture
         // has already published it and a later session cannot have re-pointed the
         // injector's one-per-process slot yet.
         #[cfg(target_os = "linux")]
         let streamed_head = crate::inject::stream_output()
             .map(|output| crate::session_status::StreamedHead { compositor, output });
-        #[cfg(target_os = "linux")]
-        controls.set_head(streamed_head.clone());
         // Workspace this launch owns on the streamed head; handed to the lease, which
         // releases it when the game is done.
         #[cfg(target_os = "linux")]

@@ -16,8 +16,9 @@ internal interface TouchSink {
     /** One button transition: 1 = left, 2 = middle, 3 = right. */
     fun button(button: Int, down: Boolean)
 
-    /** One scroll step: axis 0 = vertical, 1 = horizontal; delta WHEEL_DELTA(120)-scaled. */
-    fun scroll(axis: Int, delta: Int, precise: Boolean)
+    /** One normalized scroll step: [axis] 0 = vertical, 1 = horizontal; [delta] signed Q24.8 in
+     *  the [source]'s unit (v120 wheel, DIP distance); [source]/[phase] are ScrollWire bytes. */
+    fun scroll(axis: Int, delta: Int, source: Int, phase: Int)
 
     /** One touchscreen contact transition: kind 0 = down, 1 = move, 2 = up. */
     fun touch(id: Int, kind: Int, x: Int, y: Int, w: Int, h: Int)
@@ -27,7 +28,8 @@ internal class NativeTouchSink(private val handle: Long) : TouchSink {
     override fun pointerMove(dx: Int, dy: Int) = NativeBridge.nativeSendPointerMove(handle, dx, dy)
     override fun pointerAbs(x: Int, y: Int, w: Int, h: Int) = NativeBridge.nativeSendPointerAbs(handle, x, y, w, h)
     override fun button(button: Int, down: Boolean) = NativeBridge.nativeSendPointerButton(handle, button, down)
-    override fun scroll(axis: Int, delta: Int, precise: Boolean) = NativeBridge.nativeSendScroll(handle, axis, delta, precise)
+    override fun scroll(axis: Int, delta: Int, source: Int, phase: Int) =
+        NativeBridge.nativeSendNormalizedScroll(handle, axis, delta, source, phase)
     override fun touch(id: Int, kind: Int, x: Int, y: Int, w: Int, h: Int) =
         NativeBridge.nativeSendTouch(handle, id, kind, x, y, w, h)
 }

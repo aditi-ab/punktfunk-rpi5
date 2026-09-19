@@ -63,16 +63,15 @@ pub use session::{
 #[cfg(target_os = "linux")]
 pub use session::{session_epoch, session_x11_env};
 
-/// The streamed head's window list and the verbs that act on one.
-/// Types on every platform; the backend arms are Linux.
+/// The compositor's windows and the verbs the launch path runs on the game's.
+#[cfg(target_os = "linux")]
 #[path = "vdisplay/toplevels.rs"]
 pub(crate) mod toplevels;
 #[cfg(target_os = "linux")]
 pub use toplevels::{
     list_all_toplevels, list_toplevels, move_toplevel_to_output, places_windows, toplevels_token,
-    window_action,
+    window_action, Toplevel, WindowVerb,
 };
-pub use toplevels::{Toplevel, WindowVerb};
 
 #[path = "vdisplay/routing.rs"]
 pub(crate) mod routing;

@@ -10,6 +10,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/abi.rs");
     println!("cargo:rerun-if-changed=src/config.rs");
     println!("cargo:rerun-if-changed=src/input.rs");
+    println!("cargo:rerun-if-changed=src/input/scroll.rs");
     println!("cargo:rerun-if-changed=src/error.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 

@@ -15,6 +15,10 @@ pub const INPUT_MAGIC: u8 = 0xC8;
 /// Serialized [`InputEvent`] size (tag + fields). The C struct is larger (`_pad`).
 pub const INPUT_WIRE_LEN: usize = 1 + 1 + 4 + 4 + 4 + 4;
 
+/// Normalized scroll vocabulary ([`InputKind::Scroll`]) plus the client-side
+/// quantizer and the single outbound legacy/inversion seam.
+pub mod scroll;
+
 /// `#[repr(u8)]` so the C ABI sees a byte tag.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +74,12 @@ pub enum InputKind {
     /// [`HOST_CAP_TEXT_INPUT`](crate::quic::HOST_CAP_TEXT_INPUT); older hosts ignore
     /// the tag and clients keep best-effort VK synthesis.
     TextInput = 15,
+    /// Normalized scroll ([`scroll::ScrollEvent`]): `code` = axis (0 = vertical,
+    /// 1 = horizontal), `x` = signed Q24.8 delta in the source's unit, `y` = 0,
+    /// `flags` = source in the low byte, phase in bits 8–15. Sent only when the
+    /// host advertised `HOST_CAP2_SCROLL`; the client's outbound seam converts
+    /// to [`MouseScroll`](Self::MouseScroll) for older hosts.
+    Scroll = 16,
 }
 
 /// Pack [`InputKind::GamepadRemove`] `flags` (`seq << 24 | pad`) — same layout as
@@ -160,9 +170,9 @@ const KEY_NAMES: &[(&str, u8)] = &[
     ("capslock", 0x14),
 ];
 
-/// Windows VK for a stored key name. The wire is VKs; a preset or a controller-mouse
-/// layout stores names, so one document fires on every client. `None` means this build
-/// does not know the name — the chord does not fire. The Kotlin and Swift `keyVk` twins
+/// Windows VK for a stored key name. The wire is VKs; a ring preset stores names, so one
+/// preset works on every client. `None` means this build does not know the name — the
+/// shortcut does not fire. The Kotlin and Swift `keyVk` twins
 /// replay `testdata/key-vk-vectors.json`, which `key_vk_vectors_are_checked_in` regenerates.
 pub fn key_vk(name: &str) -> Option<u8> {
     let n = name.trim().to_ascii_lowercase();
@@ -261,6 +271,7 @@ impl InputKind {
             13 => GamepadRemove,
             14 => GamepadArrival,
             15 => TextInput,
+            16 => Scroll,
             _ => return None,
         })
     }
@@ -404,14 +415,19 @@ impl InputEvent {
             return None;
         }
         let kind = InputKind::from_u8(buf[1])?;
-        Some(InputEvent {
+        let ev = InputEvent {
             kind,
             _pad: [0; 3],
             code: u32::from_le_bytes(buf[2..6].try_into().unwrap()),
             x: i32::from_le_bytes(buf[6..10].try_into().unwrap()),
             y: i32::from_le_bytes(buf[10..14].try_into().unwrap()),
             flags: u32::from_le_bytes(buf[14..18].try_into().unwrap()),
-        })
+        };
+        // A normalized scroll event is only well-formed when its body is.
+        if kind == InputKind::Scroll && scroll::ScrollEvent::from_event(&ev).is_none() {
+            return None;
+        }
+        Some(ev)
     }
 }
 
@@ -489,11 +505,12 @@ mod tests {
             };
             assert_eq!(InputEvent::decode(&e.encode()), Some(e));
         }
-        // 16 is one past the last valid kind.
+        // 17 is one past the last valid kind.
         assert_eq!(InputKind::from_u8(13), Some(InputKind::GamepadRemove));
         assert_eq!(InputKind::from_u8(14), Some(InputKind::GamepadArrival));
         assert_eq!(InputKind::from_u8(15), Some(InputKind::TextInput));
-        assert_eq!(InputKind::from_u8(16), None);
+        assert_eq!(InputKind::from_u8(16), Some(InputKind::Scroll));
+        assert_eq!(InputKind::from_u8(17), None);
     }
 
     #[test]

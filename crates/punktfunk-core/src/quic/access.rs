@@ -107,6 +107,7 @@ pub fn classify(kind: InputKind) -> GrantClass {
         | InputKind::MouseButtonDown
         | InputKind::MouseButtonUp
         | InputKind::MouseScroll
+        | InputKind::Scroll
         | InputKind::TouchDown
         | InputKind::TouchMove
         | InputKind::TouchUp => GrantClass::Pointer,
@@ -186,7 +187,7 @@ mod tests {
             assert_eq!(classify(kind), want, "kind {kind:?}");
         }
         assert_eq!(
-            seen, 16,
+            seen, 17,
             "InputKind wire vocabulary grew — classify the new kind"
         );
     }

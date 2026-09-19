@@ -1536,7 +1536,9 @@ struct ContentView: View {
                 let m = conn.currentMode()
                 return (m.width, m.height, m.refreshHz)
             },
-            requestMode: { w, h, hz in conn.requestMode(width: w, height: h, refreshHz: hz) })
+            requestMode: { w, h, hz in conn.requestMode(width: w, height: h, refreshHz: hz) },
+            scrollInverted: { [model] in model.settings.invertScroll },
+            toggleScrollInversion: { [model] in model.setInvertScroll(!model.settings.invertScroll) })
     }
     #endif
     #if os(iOS) || os(tvOS) || os(macOS)
