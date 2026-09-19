@@ -23,6 +23,8 @@ CLIENT_IP=10.77.0.2
 PORT=9777
 # A fresh PIN per run: nothing to check in, and the ceremony is the real one.
 PIN=$(shuf -i 1000-9999 -n 1)
+# One client identity per probe lives here; see the pairing block.
+PROBE_HOME=/tmp/pf-rig-home
 
 say() { echo "[rig] $*"; }
 
@@ -34,6 +36,7 @@ cleanup() {
   ip netns pids c 2>/dev/null | xargs -r kill 2>/dev/null
   ip netns del h 2>/dev/null
   ip netns del c 2>/dev/null
+  rm -rf "$PROBE_HOME"
 }
 trap cleanup EXIT
 
@@ -113,13 +116,17 @@ wait %2 2>/dev/null || true
 # ---- the session ------------------------------------------------------------
 NO_RAMP_ARG=""
 if [ "$NO_RAMP" = 1 ]; then NO_RAMP_ARG="--no-ramp"; fi
+# A PIN pairs one device, so a run with more than one probe trusts on first use instead
+# (see the pairing block).
+TOFU_ARG=""
+if [ "$PROBES" != 1 ]; then TOFU_ARG="--allow-tofu"; fi
 say "host: --content $CONTENT --fill $FILL --recovery-ms $RECOVERY_MS --keyframe-answer $KEYFRAME_ANSWER --idr-pct $IDR_PCT --bringup-ms $BRINGUP_MS $NO_RAMP_ARG"
 ip netns exec h "$BIN/punktfunk-host" punktfunk1-host \
   --port $PORT --source synthetic-abr --content "$CONTENT" --fill "$FILL" \
   --recovery-ms "$RECOVERY_MS" --keyframe-answer "$KEYFRAME_ANSWER" \
   --idr-pct "$IDR_PCT" \
   --bringup-ms "$BRINGUP_MS" $NO_RAMP_ARG \
-  --seconds $(( SECONDS_RUN + 30 )) --pairing-pin "$PIN" --no-mdns \
+  --seconds $(( SECONDS_RUN + 30 )) --pairing-pin "$PIN" --no-mdns $TOFU_ARG \
   > "$OUT/$PROFILE-host.log" 2>&1 &
 HOST_PID=$!
 for _ in $(seq 40); do
@@ -127,11 +134,31 @@ for _ in $(seq 40); do
   sleep 0.25
 done
 
-say "pairing"
-FP=$(echo "$PIN" | ip netns exec c "$BIN/punktfunk-probe" \
-      --connect $HOST_IP:$PORT --pair - --name abr-rig 2>&1 \
-      | grep -o 'connect with --pin [0-9a-f]\{64\}' | awk '{print $4}')
-[ -n "$FP" ] || { echo "[rig] pairing did not return a fingerprint"; tail -20 "$OUT/$PROFILE-host.log"; exit 1; }
+# `cleanup` above already removed the last run's; one directory per probe.
+for n in $(seq "$PROBES"); do mkdir -p "$PROBE_HOME/$n"; done
+if [ "$PROBES" = 1 ]; then
+  say "pairing"
+  FP=$(echo "$PIN" | HOME="$PROBE_HOME/1" ip netns exec c "$BIN/punktfunk-probe" \
+        --connect $HOST_IP:$PORT --pair - --name abr-rig 2>&1 \
+        | grep -o 'connect with --pin [0-9a-f]\{64\}' | awk '{print $4}')
+  [ -n "$FP" ] || { echo "[rig] pairing did not return a fingerprint"; tail -20 "$OUT/$PROFILE-host.log"; exit 1; }
+else
+  # Two sessions on a path are two clients. The host preempts a client's own earlier
+  # session by certificate fingerprint and the probe keeps its certificate in
+  # $HOME/.config/punktfunk, so each probe needs its own HOME — and one PIN pairs one
+  # device. `--allow-tofu` admits both on first use; each still pins the host, which
+  # prints its fingerprint on the line it starts listening on.
+  say "reading the host's fingerprint (--allow-tofu: one PIN cannot pair two clients)"
+  FP=""
+  for _ in $(seq 60); do
+    FP=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$PROFILE-host.log" \
+          | grep 'clients pin this fingerprint' \
+          | grep -o 'fingerprint=[0-9a-f]\{64\}' | head -1 | cut -d= -f2)
+    [ -n "$FP" ] && break
+    sleep 0.25
+  done
+  [ -n "$FP" ] || { echo "[rig] the host printed no fingerprint"; tail -20 "$OUT/$PROFILE-host.log"; exit 1; }
+fi
 
 # The rate trace and the wander both run beside the session; a profile with
 # neither leaves the shaper alone.
@@ -167,9 +194,22 @@ HOLD_ARG=""
 if [ "$DECODER_HOLD" = 1 ]; then HOLD_ARG="--decoder-hold"; fi
 run_probe() {
   local n=$1
-  ip netns exec c "$BIN/punktfunk-probe" \
+  # What only this probe does (profiles.sh): join late, pin a rate, leave early.
+  local join secs rate rate_arg
+  join=$(echo "$PROBE_JOIN_S" | awk -v n="$n" '{print $n+0}')
+  secs=$(echo "$PROBE_SECONDS" | awk -v n="$n" '{print $n+0}')
+  rate=$(echo "$PROBE_BITRATE" | awk -v n="$n" '{print $n+0}')
+  if [ "$join" != 0 ]; then sleep "$join"; fi
+  if [ "$secs" = 0 ] || [ "$secs" -gt $(( SECONDS_RUN - join )) ]; then
+    secs=$(( SECONDS_RUN - join ))
+  fi
+  # A pinned probe's controller never arms, so its trajectory's target column is 0 and
+  # what the row is read on is its delivered rate.
+  rate_arg=""
+  if [ "$rate" != 0 ]; then rate_arg="--bitrate $rate"; fi
+  HOME="$PROBE_HOME/$n" ip netns exec c "$BIN/punktfunk-probe" \
     --connect $HOST_IP:$PORT --pin "$FP" --name "abr-rig-$n" \
-    --mode "$MODE" --seconds "$SECONDS_RUN" $HOLD_ARG \
+    --mode "$MODE" --seconds "$secs" $HOLD_ARG $rate_arg \
     --trajectory "$OUT/$PROFILE-$n.jsonl" \
     --link "$ACHIEVABLE_KBPS:$RATE_KBIT" --profile "$PROFILE" \
     > "$OUT/$PROFILE-$n.log" 2>&1
