@@ -90,7 +90,13 @@ fn a_wide_upload_encodes_straight() {
             (w * 4) as usize,
         )
         .expect("upload");
-        stream.extend_from_slice(&enc.encode(i == 0).expect("encode").bytes);
+        enc.encode(i == 0).expect("encode");
+        stream.extend_from_slice(
+            &enc.collect(true)
+                .expect("collect")
+                .expect("a picture per encode")
+                .bytes,
+        );
     }
     write_out(&stream);
 }
@@ -197,7 +203,13 @@ fn a_wide_linear_dmabuf_encodes_straight() {
             planes: &planes,
         })
         .expect("import");
-        stream.extend_from_slice(&enc.encode(i == 0).expect("encode").bytes);
+        enc.encode(i == 0).expect("encode");
+        stream.extend_from_slice(
+            &enc.collect(true)
+                .expect("collect")
+                .expect("a picture per encode")
+                .bytes,
+        );
     }
     write_out(&stream);
 }

@@ -98,7 +98,8 @@ impl UserData {
 
     /// Withhold this buffer from the producer until the returned hold drops.
     /// `None` (pool too shallow, or `PUNKTFUNK_ZEROCOPY_HOLD=0`) requeues at `.process` return —
-    /// the producer may then rewrite the dmabuf while encode still reads it.
+    /// the producer may then rewrite the dmabuf while encode still reads it, so the raw
+    /// passthrough publishes only under `Some` and treats `None` as a CPU fallback.
     /// Every hold out with an untaken frame in the slot: that frame gives its hold to this one.
     /// A buffer the book already lists was re-sent by the producer: no hold, and the capture is
     /// flagged for a rebuild.
@@ -455,6 +456,8 @@ pub(super) enum PassthroughFallback {
     DupFailed,
     /// A linear pitch off 64 bytes: iHD imports it at a rounded pitch and the picture shears.
     UnalignedPitch,
+    /// The pool could not spare a deferred-requeue hold, so the raw frame is unsafe to publish.
+    NoHold,
 }
 
 impl PassthroughFallback {
@@ -465,6 +468,7 @@ impl PassthroughFallback {
             PassthroughFallback::NoFourcc => 1 << 2,
             PassthroughFallback::DupFailed => 1 << 3,
             PassthroughFallback::UnalignedPitch => 1 << 4,
+            PassthroughFallback::NoHold => 1 << 5,
         }
     }
 
@@ -477,10 +481,13 @@ impl PassthroughFallback {
             PassthroughFallback::UnalignedPitch => {
                 "the dmabuf's pitch is not a multiple of 64 bytes"
             }
+            PassthroughFallback::NoHold => {
+                "the producer pool could not spare a deferred-requeue hold"
+            }
         }
     }
 
-    /// Three reasons downgrade to CPU; `NoFormat` drops the frame (CPU path needs `ud.format` too).
+    /// `NoFormat` drops the frame (CPU path needs `ud.format` too); the rest downgrade to CPU.
     pub(super) fn falls_back_to_cpu(self) -> bool {
         !matches!(self, PassthroughFallback::NoFormat)
     }
@@ -502,6 +509,9 @@ impl PassthroughFallback {
             PassthroughFallback::UnalignedPitch => {
                 "the compositor pads linear buffers only for scanout, and iHD reads an odd pitch \
                  rounded — this width streams through the CPU copy instead of the raw import"
+            }
+            PassthroughFallback::NoHold => {
+                "the frame stays on the CPU copy path rather than letting the producer rewrite a DMA-BUF the encoder still reads"
             }
         }
     }
@@ -837,29 +847,30 @@ pub(super) fn gpu_import(
     }
 }
 
-/// Buffers left in the producer's pool: one it is rendering, one in transit.
-/// Withholding past that skips frames when holds peak (host frame + up to two encoder slots).
+/// Buffers left in the producer's pool: one it is rendering, one in transit. The remaining
+/// pool is the consumer hold budget (host frame, capture slot, and pipelined encoder sources).
 const HOLD_POOL_RESERVE: u32 = 2;
 
-/// Pool the raw lane asks for. The encoder keeps its frame held across ticks (a repeat re-uses
-/// it), the slot holds the next, and an arrival must still find a buffer: three holds beyond
-/// the producer's reserve. A producer capped below this runs two holds, and
-/// [`UserData::release_unconsumed`] frees the slot's for the arrival.
-const RAW_LANE_POOL_MIN: i32 = 6;
+/// Pool the raw lane asks for: four encoder holds, the host frame, the capture slot, and two
+/// buffers reserved for the producer. A producer capped below this spends only the holds it
+/// serves; [`UserData::release_unconsumed`] frees the slot's for the next arrival.
+const RAW_LANE_POOL_MIN: i32 = 8;
 
 /// Least pool depth this stream asks for: the producer's minimum, deepened to
 /// [`RAW_LANE_POOL_MIN`] on the raw lane but never past `pool_max`. A minimum above what the
 /// producer serves fails negotiation outright.
-fn pool_ask(pool_min: i32, pool_max: Option<i32>, nvenc_raw: bool) -> i32 {
-    if !nvenc_raw {
+fn pool_ask(pool_min: i32, pool_max: Option<i32>, raw_lane: bool) -> i32 {
+    if !raw_lane {
         return pool_min;
     }
     let deep = pool_min.max(RAW_LANE_POOL_MIN);
     pool_max.map_or(deep, |max| deep.min(max).max(pool_min))
 }
 
-/// `PUNKTFUNK_ZEROCOPY_HOLD=0` restores immediate requeue (racy). Use `env_on`; a bare
-/// `== "0"` is the trap `PUNKTFUNK_FORCE_SHM` already hit.
+/// `PUNKTFUNK_ZEROCOPY_HOLD=0` restores immediate requeue (racy). On the raw passthrough it
+/// never publishes an unheld dmabuf: `try_defer` returns `None` there and the frame takes the
+/// safe CPU fallback instead. Use `env_on`; a bare `== "0"` is the trap `PUNKTFUNK_FORCE_SHM`
+/// already hit.
 fn zerocopy_hold_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| pf_host_config::env_on("PUNKTFUNK_ZEROCOPY_HOLD").unwrap_or(true))
@@ -1300,8 +1311,10 @@ fn consume_frame(
             {
                 break 'passthrough PassthroughFallback::UnalignedPitch;
             }
-            // Dup so the fd outlives SPA recycle. Content stability is `try_defer`; without a
-            // hold (shallow pool / PUNKTFUNK_ZEROCOPY_HOLD=0) the pool depth must outrun encode.
+            // Dup so the fd outlives SPA recycle. Content stability is `try_defer`: a raw
+            // frame is published only under a hold, so the producer can never rewrite a
+            // DMA-BUF the encoder still reads. No hold — shallow pool or
+            // PUNKTFUNK_ZEROCOPY_HOLD=0 — is a safe CPU fallback, never an unsafe publish.
 
             // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
             // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
@@ -1311,7 +1324,11 @@ fn consume_frame(
             if dup < 0 {
                 break 'passthrough PassthroughFallback::DupFailed;
             }
-            let hold = ud.try_defer(pw_buf, stream);
+            let Some(hold) = ud.try_defer(pw_buf, stream) else {
+                // SAFETY: `dup` is ours and was not published.
+                unsafe { libc::close(dup) };
+                break 'passthrough PassthroughFallback::NoHold;
+            };
             ud.publish(CapturedFrame {
                 provenance: Default::default(),
                 width: w as u32,
@@ -1329,7 +1346,7 @@ fn consume_frame(
                     offset,
                     stride,
                     plane1,
-                    hold,
+                    hold: Some(hold),
                     health: ud.signals.health.clone(),
                     rebuild: ud.signals.broken.clone(),
                 }),
@@ -1640,7 +1657,7 @@ pub fn pipewire_thread(
     } = opts;
     // Node ids and remote fds do not identify a compositor: Mutter and gamescope
     // can both use the default daemon. Keep the producer contract explicit.
-    let pool_min = pool_ask(pool_min, pool_max, plan.nvenc_raw);
+    let pool_min = pool_ask(pool_min, pool_max, plan.nvenc_raw || plan.vaapi_passthrough);
     let offer_cursor_meta = !producer_is_gamescope;
     crate::pwinit::ensure_init();
 
@@ -3447,6 +3464,7 @@ mod tests {
             PassthroughFallback::NoFourcc,
             PassthroughFallback::DupFailed,
             PassthroughFallback::UnalignedPitch,
+            PassthroughFallback::NoHold,
         ];
         let mut f = PassthroughFallbacks::default();
         for r in all {
@@ -3457,12 +3475,13 @@ mod tests {
             assert!(!r.as_str().is_empty());
             assert!(!r.hint().is_empty());
         }
-        // Only `NoFormat` drops the frame; the other four downgrade it.
+        // Only `NoFormat` drops the frame; the other five downgrade it.
         assert!(!PassthroughFallback::NoFormat.falls_back_to_cpu());
         assert!(PassthroughFallback::NotDmabuf.falls_back_to_cpu());
         assert!(PassthroughFallback::NoFourcc.falls_back_to_cpu());
         assert!(PassthroughFallback::DupFailed.falls_back_to_cpu());
         assert!(PassthroughFallback::UnalignedPitch.falls_back_to_cpu());
+        assert!(PassthroughFallback::NoHold.falls_back_to_cpu());
     }
 
     /// A tiled buffer can never take the CPU de-pad — any failure on a nonzero
@@ -3476,6 +3495,7 @@ mod tests {
             PassthroughFallback::NoFourcc,
             PassthroughFallback::DupFailed,
             PassthroughFallback::UnalignedPitch,
+            PassthroughFallback::NoHold,
         ];
         for reason in all {
             for modifier in [1u64, 0x100000000000001, 0x200000000000a04] {

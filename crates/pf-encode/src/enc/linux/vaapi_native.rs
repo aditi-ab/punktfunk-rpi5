@@ -4,10 +4,12 @@
 //! (`invalidate_ref_frames`), or by an intra refresh wave when none survives
 //! (`design/vulkan-intra-refresh.md` §10), an ABR step retargets in place
 //! (`reconfigure_bitrate`), and HEVC Main 10 carries the HDR10 SEI.
-//! Synchronous: `submit` encodes and `poll` hands the AU straight back.
+//! `submit` enqueues and `poll` collects — blocking until `set_pipelined` turns
+//! the wait into a `vaQuerySurfaceStatus` probe under GPU contention.
 //!
 //! H.264 and HEVC on AMD and Intel. AV1 there is Vulkan Video's.
 
+use std::collections::VecDeque;
 use std::os::fd::AsRawFd as _;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -47,7 +49,12 @@ pub struct NativeVaapiEncoder {
     /// The host's wire index minus the session's own picture count.
     wire_offset: i64,
     frames: u64,
-    pending: Option<EncodedFrame>,
+    /// One [`PendingMeta`] per picture the session holds, in encode order —
+    /// `poll` pairs a collected picture back with its meta.
+    meta: VecDeque<PendingMeta>,
+    /// `set_pipelined`: `poll` probes the oldest pending encode instead of
+    /// waiting the driver's surface out.
+    pipelined: bool,
     /// 24-bit CPU frames are repacked to 32 here.
     repack: Vec<u8>,
     /// The part of each picture this session encodes ([`Encoder::set_input_crop`]).
@@ -114,7 +121,8 @@ impl NativeVaapiEncoder {
             wave_queued: false,
             wire_offset: 0,
             frames: 0,
-            pending: None,
+            meta: VecDeque::new(),
+            pipelined: false,
             repack: Vec::new(),
             crop: None,
             dump: std::env::var("PUNKTFUNK_VAAPI_DUMP")
@@ -389,12 +397,23 @@ pub fn probe_can_encode(codec: Codec, ten_bit: bool) -> bool {
         .unwrap_or(false)
 }
 
+/// What `poll` pairs back to a collected picture. `source_hold` is the deferred-requeue
+/// hold of a direct-ingested dmabuf: kept in the queue until `collect` synced the encode,
+/// it makes the producer's rewrite wait out the GPU read.
+struct PendingMeta {
+    pts_ns: u64,
+    mark: WaveMark,
+    source_hold: Option<pf_frame::FrameHold>,
+}
+
 /// Describe one captured dmabuf for libva and route tiled rejection back to capture.
+/// `true` = the import was retained as the encode source (VPP was skipped), so the
+/// caller must hold the producer off the buffer until collect.
 fn submit_captured_dmabuf(
     session: &mut Session,
     frame: &CapturedFrame,
     d: &pf_frame::DmabufFrame,
-) -> Result<()> {
+) -> Result<bool> {
     let fd = d.fd.as_raw_fd();
     let mut planes = vec![ExportedPlane {
         fd,
@@ -417,16 +436,19 @@ fn submit_captured_dmabuf(
         modifier: d.modifier,
         planes: &planes,
     });
-    if let Err(e) = imported {
-        if d.modifier != 0 {
-            super::vk_util::reject_dmabuf(d, &format!("{e:#}"));
+    let direct = match imported {
+        Ok(direct) => direct,
+        Err(e) => {
+            if d.modifier != 0 {
+                super::vk_util::reject_dmabuf(d, &format!("{e:#}"));
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
+    };
     if d.modifier != 0 {
         d.health.note_raw_import_ok();
     }
-    Ok(())
+    Ok(direct)
 }
 
 impl Encoder for NativeVaapiEncoder {
@@ -455,7 +477,7 @@ impl Encoder for NativeVaapiEncoder {
             self.open_session()?;
         }
         let session = self.session.as_mut().expect("opened above");
-        match &frame.payload {
+        let source_hold = match &frame.payload {
             FramePayload::Cpu(bytes) => {
                 let (fourcc, bytes) = packed_rgb(frame.format, bytes, &mut self.repack)?;
                 session.submit_packed(
@@ -465,13 +487,22 @@ impl Encoder for NativeVaapiEncoder {
                     frame.height,
                     frame.width as usize * 4,
                 )?;
+                None
             }
-            FramePayload::Dmabuf(d) => submit_captured_dmabuf(session, frame, d)?,
+            // The hold matters only when the import itself is the encode source: a
+            // VPP conversion has already read the dmabuf by the time it returns.
+            FramePayload::Dmabuf(d) => {
+                if submit_captured_dmabuf(session, frame, d)? {
+                    d.hold.clone()
+                } else {
+                    None
+                }
+            }
             FramePayload::Cuda(_) => bail!(
                 "a CUDA frame reached the VAAPI encoder — that payload is NVENC-only; unset \
                  PUNKTFUNK_ZEROCOPY or do not pin PUNKTFUNK_ENCODER=vaapi-native on an NVIDIA host"
             ),
-        }
+        };
         if self.force_kf || self.anchor.is_some() {
             self.wave = None;
             self.wave_spoiled = false;
@@ -479,7 +510,7 @@ impl Encoder for NativeVaapiEncoder {
         }
         let wave = self.wave;
         let mark = wave.map_or(WaveMark::None, |w| w.mark(self.wave_spoiled));
-        let pic = match (self.anchor.take(), wave) {
+        match (self.anchor.take(), wave) {
             (Some(slot), _) => session.encode_anchored(slot)?,
             (None, Some(w)) => {
                 let (first_row, rows) = w.stripe(session.wave_rows());
@@ -491,7 +522,7 @@ impl Encoder for NativeVaapiEncoder {
                 session.encode_wave(stripe, !w.closes() || self.wave_spoiled)?
             }
             (None, None) => session.encode(self.force_kf)?,
-        };
+        }
         self.force_kf = false;
         if let Some(w) = wave {
             self.wave = w.next();
@@ -502,20 +533,12 @@ impl Encoder for NativeVaapiEncoder {
                 }
             }
         }
-        if let Some(f) = &mut self.dump {
-            use std::io::Write as _;
-            let _ = f.write_all(&pic.bytes);
-        }
         let pts_ns = self.frames * 1_000_000_000 / u64::from(self.params.fps_num.max(1));
         self.frames += 1;
-        self.pending = Some(EncodedFrame {
-            data: pic.bytes,
+        self.meta.push_back(PendingMeta {
             pts_ns,
-            keyframe: pic.is_idr,
-            recovery_anchor: pic.recovery_anchor,
-            recovery_point: mark.point() && !pic.is_idr,
-            recovery_close: mark.close() && !pic.is_idr,
-            chunk_aligned: false,
+            mark,
+            source_hold,
         });
         Ok(())
     }
@@ -619,14 +642,52 @@ impl Encoder for NativeVaapiEncoder {
         }
     }
 
+    /// Collect the oldest finished picture. Sync mode waits the driver's surface
+    /// out; `pipelined` probes it, so an encode still running yields `None` and
+    /// the AU rides a tick behind instead of holding the loop.
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        Ok(self.pending.take())
+        let Some(session) = &mut self.session else {
+            return Ok(None);
+        };
+        let Some(pic) = session.collect(!self.pipelined)? else {
+            return Ok(None);
+        };
+        // The hold rides `meta` through `collect`: the producer stays locked out of
+        // the source dmabuf until the encode that read it has synced.
+        let PendingMeta {
+            pts_ns,
+            mark,
+            source_hold: _hold,
+        } = self
+            .meta
+            .pop_front()
+            .expect("every enqueued picture queued its meta");
+        if let Some(f) = &mut self.dump {
+            use std::io::Write as _;
+            let _ = f.write_all(&pic.bytes);
+        }
+        Ok(Some(EncodedFrame {
+            data: pic.bytes,
+            pts_ns,
+            keyframe: pic.is_idr,
+            recovery_anchor: pic.recovery_anchor,
+            recovery_point: mark.point() && !pic.is_idr,
+            recovery_close: mark.close() && !pic.is_idr,
+            chunk_aligned: false,
+        }))
+    }
+
+    /// Probe instead of wait: under contention the AU rides a tick behind rather
+    /// than holding the loop on the driver's surface.
+    fn set_pipelined(&mut self, on: bool) -> bool {
+        self.pipelined = on;
+        self.pipelined
     }
 
     /// Drop the session; the next submit reopens it with an IDR.
     fn reset(&mut self) -> bool {
         self.session = None;
-        self.pending = None;
+        self.meta.clear();
         self.anchor = None;
         self.wave = None;
         self.wave_spoiled = false;
@@ -913,6 +974,71 @@ mod tests {
     #[ignore = "needs a real VAAPI device"]
     fn native_vaapi_wave_hevc() {
         run_wave_smoke(Codec::H265, "h265");
+    }
+
+    /// A direct-ingest hold lives exactly as long as its `PendingMeta`: once the
+    /// frame and the original Arc are gone the meta still pins it, and popping the
+    /// meta is what lets the producer back in.
+    #[test]
+    fn pending_meta_keeps_the_source_hold_alive() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        struct Probe(Arc<AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(Probe(dropped.clone()));
+        let meta = PendingMeta {
+            pts_ns: 0,
+            mark: WaveMark::None,
+            source_hold: Some(probe),
+        };
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "PendingMeta keeps the hold alive"
+        );
+        drop(meta);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// Coded-buffer exhaustion plus `ready`: five submits ahead of any collect must
+    /// not drop a picture — the fifth submit's `acquire_coded` drains the oldest into
+    /// `ready`, and every AU comes back in encode order.
+    ///
+    /// `cargo test -p pf-encode native_vaapi_collect_depth -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a real VAAPI device"]
+    fn native_vaapi_collect_depth() {
+        let (w, h) = (320u32, 240u32);
+        let mut enc = NativeVaapiEncoder::open(
+            Codec::H264,
+            w,
+            h,
+            60,
+            4_000_000,
+            8,
+            ChromaFormat::Yuv420,
+            false,
+        )
+        .expect("open");
+        for i in 0..5u32 {
+            enc.submit_indexed(&scroll_frame(w, h, i), i)
+                .expect("submit");
+        }
+        let mut aus = Vec::new();
+        while let Some(au) = enc.poll().expect("poll") {
+            aus.push(au);
+        }
+        assert_eq!(aus.len(), 5, "every queued picture drains");
+        assert!(aus[0].keyframe);
+        assert!(aus[1..].iter().all(|au| !au.keyframe));
+        assert!(
+            aus.windows(2).all(|w| w[0].pts_ns < w[1].pts_ns),
+            "AUs come back in encode order"
+        );
     }
 
     /// The probe agrees with an open: H.264 and both HEVC depths yes, AV1 and

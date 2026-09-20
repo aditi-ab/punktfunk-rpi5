@@ -84,7 +84,11 @@ fn the_hevc_stream_decodes() {
     for i in 0..30 {
         let (y, uv) = frame(w, h, i);
         enc.write_nv12(&y, &uv).expect("fill");
-        let pic = enc.encode(i == 0).expect("encode");
+        enc.encode(i == 0).expect("encode");
+        let pic = enc
+            .collect(true)
+            .expect("collect")
+            .expect("a picture per encode");
         assert_eq!(pic.is_idr, i == 0);
         let types = nal_types(&pic.bytes);
         if i == 0 {
@@ -119,10 +123,14 @@ fn an_hevc_loss_recovers_through_the_rps() {
     let encode = |enc: &mut Encoder, i: usize, anchor: Option<usize>| {
         let (y, uv) = frame(w, h, i);
         enc.write_nv12(&y, &uv).expect("fill");
-        let pic = match anchor {
+        match anchor {
             Some(slot) => enc.encode_anchored(slot).expect("anchored encode"),
             None => enc.encode(i == 0).expect("encode"),
-        };
+        }
+        let pic = enc
+            .collect(true)
+            .expect("collect")
+            .expect("a picture per encode");
         assert_eq!(pic.is_idr, i == 0, "picture {i}");
         assert_eq!(pic.recovery_anchor, anchor.is_some());
         pic.bytes
@@ -209,7 +217,11 @@ fn a_ten_bit_stream_carries_hdr10() {
             p.width as usize * 4,
         )
         .expect("ten-bit ingest");
-        let pic = enc.encode(i == 0).expect("encode");
+        enc.encode(i == 0).expect("encode");
+        let pic = enc
+            .collect(true)
+            .expect("collect")
+            .expect("a picture per encode");
         if i == 0 {
             assert_eq!(
                 nal_types(&pic.bytes),
