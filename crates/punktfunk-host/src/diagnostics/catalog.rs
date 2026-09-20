@@ -156,15 +156,56 @@ const SANDBOX_BASE_ARGV: &[&str] = &[
     "/sbin",
 ];
 
+/// Probe-only binds: a PATH `true` on NixOS is a store path whose loader lives under /nix;
+/// /run/current-system is the profile symlink farm. Not in SANDBOX_BASE_ARGV — plugins do
+/// not get the whole store read-only for a diagnostic.
+#[cfg(target_os = "linux")]
+const PROBE_BINDS: &[&str] = &[
+    "--ro-bind-try",
+    "/nix",
+    "/nix",
+    "--ro-bind-try",
+    "/run/current-system",
+    "/run/current-system",
+];
+
+/// Host `true` as an absolute path. `/bin/true` is an FHS path NixOS does not have.
+#[cfg(target_os = "linux")]
+fn which_true() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("true");
+            // A file with an exec bit — a directory or unexecutable `true` on PATH makes a
+            // healthy sandbox read as an exec failure. Do not canonicalize: Nix `true` is a
+            // symlink onto the coreutils multicall binary.
+            if candidate
+                .metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            {
+                return candidate;
+            }
+        }
+    }
+    "/bin/true".into()
+}
+
 /// Can bwrap build the sandbox a plugin gets? `Err(None)` when bwrap is missing, else bwrap's
 /// own first stderr line.
 #[cfg(target_os = "linux")]
 fn bwrap_probe() -> Result<(), Option<String>> {
-    let out = Command::new("bwrap")
-        .args(SANDBOX_BASE_ARGV)
-        .arg("/bin/true")
-        .output()
-        .map_err(|_| None)?;
+    let true_bin = which_true();
+    let mut cmd = Command::new("bwrap");
+    cmd.args(SANDBOX_BASE_ARGV).args(PROBE_BINDS);
+    // A `true` under a PATH dir the sandbox does not bind (a ~/bin on FHS) still execs:
+    // its parent comes along.
+    if let Some(dir) = true_bin
+        .parent()
+        .filter(|d| *d != std::path::Path::new("/"))
+    {
+        cmd.arg("--ro-bind-try").arg(dir).arg(dir);
+    }
+    let out = cmd.arg(&true_bin).output().map_err(|_| None)?;
     if out.status.success() {
         return Ok(());
     }

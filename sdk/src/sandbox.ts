@@ -249,10 +249,52 @@ export const grantedRoots = (configDir: string, id: string): GrantedRoot[] => {
 	}
 };
 
+// NixOS has no FHS /bin/true and no ld-linux under /usr. A store `true` needs /nix
+// for its loader, /run/current-system for the profile symlink. Probe scope only —
+// plugins do not get the whole store read-only for a diagnostic.
+const PROBE_BINDS: readonly string[] = [
+	"--ro-bind-try",
+	"/nix",
+	"/nix",
+	"--ro-bind-try",
+	"/run/current-system",
+	"/run/current-system",
+];
+
+/** Host `true` as an absolute path. `/bin/true` is an FHS path NixOS does not have.
+ *  Do not realpath: Nix `true` is a symlink onto the coreutils multicall binary. */
+const whichTrue = (): string => {
+	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+		if (!dir) continue;
+		const candidate = path.join(dir, "true");
+		try {
+			// A file with an exec bit — a directory or unexecutable `true` on PATH
+			// would make a healthy sandbox read as an exec failure.
+			fs.accessSync(candidate, fs.constants.X_OK);
+			if (fs.statSync(candidate).isFile()) return candidate;
+		} catch {
+			/* absent, dangling, or not executable */
+		}
+	}
+	return "/bin/true";
+};
+
 /** Can this box sandbox at all? The reason, when it cannot, is what the operator needs. */
 export const sandboxProbe = (
-	run: (cmd: string, args: string[]) => { status: number | null } = (cmd, args) =>
-		spawnSync(cmd, args, { stdio: "ignore" }),
+	run: (
+		cmd: string,
+		args: string[],
+	) => { status: number | null; signal?: string | null; stderr?: string } = (
+		cmd,
+		args,
+	) => {
+		const r = spawnSync(cmd, args, { encoding: "utf8" });
+		return {
+			status: r.error ? null : r.status,
+			signal: r.signal,
+			stderr: r.stderr ?? "",
+		};
+	},
 	platform: string = process.platform,
 ): { ok: true } | { ok: false; reason: string } => {
 	if (platform !== "linux") {
@@ -262,18 +304,30 @@ export const sandboxProbe = (
 	// sandbox-capable that then refuses every plugin.
 	// Exactly what a real sandbox asks for, plus a trivial exec. Probing a weaker set reports a
 	// box as capable that then refuses every plugin.
-	const probe = run("bwrap", [...BASE_ARGV, "/bin/true"]);
+	const trueBin = whichTrue();
+	// A `true` under a PATH dir the sandbox does not bind (a ~/bin on FHS) still execs:
+	// its parent comes along.
+	const dir = path.dirname(trueBin);
+	const probe = run("bwrap", [
+		...BASE_ARGV,
+		...PROBE_BINDS,
+		...(dir === "/" ? [] : ["--ro-bind-try", dir, dir]),
+		trueBin,
+	]);
 	if (probe.status === 0) return { ok: true };
 	if (probe.status === null) {
 		return {
 			ok: false,
-			reason:
-				"bubblewrap (bwrap) is not installed — install it, or set PUNKTFUNK_PLUGIN_SANDBOX=off",
+			reason: probe.signal
+				? `bwrap was killed by ${probe.signal} before it could report`
+				: "bubblewrap (bwrap) is not installed — install it, or set PUNKTFUNK_PLUGIN_SANDBOX=off",
 		};
 	}
+	const line = (probe.stderr ?? "").split("\n")[0]?.trim();
 	return {
 		ok: false,
 		reason:
+			line ||
 			"bwrap could not create a namespace — this kernel restricts unprivileged user namespaces",
 	};
 };

@@ -166,11 +166,29 @@ describe("sandboxProbe", () => {
 		}, "linux");
 		expect(probed).toContain("--unshare-user");
 		expect(probed).toContain("--disable-userns");
+		expect(probed).toContain("/nix");
+		expect(probed).toContain("/run/current-system");
+		expect(probed.at(-1)).toMatch(/true$/);
+		// The store binds are probe plumbing; a plugin's sandbox keeps them out.
+		expect(bwrapArgv({ schema: 1, id: "x" }, paths)).not.toContain("/nix");
 		const missing = sandboxProbe(() => ({ status: null }), "linux");
 		expect(missing.ok).toBe(false);
 		expect(!missing.ok && missing.reason).toContain("bubblewrap");
+		const killed = sandboxProbe(
+			() => ({ status: null, signal: "SIGKILL" }),
+			"linux",
+		);
+		expect(!killed.ok && killed.reason).toContain("SIGKILL");
 		const denied = sandboxProbe(() => ({ status: 1 }), "linux");
 		expect(!denied.ok && denied.reason).toContain("user namespaces");
+		const execFail = sandboxProbe(
+			() => ({
+				status: 1,
+				stderr: "bwrap: execvp /bin/true: No such file or directory\n",
+			}),
+			"linux",
+		);
+		expect(!execFail.ok && execFail.reason).toContain("execvp");
 	});
 });
 
