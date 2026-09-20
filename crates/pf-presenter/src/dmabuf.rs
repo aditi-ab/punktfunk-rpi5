@@ -2,8 +2,10 @@
 //! explicit DRM format modifier.
 //!
 //! Formats: R8/R8G8 for NV12 and full-chroma NV24; R16/R16G16 for P010.
-//! Same-Mesa export/import is the contract. A driver rejection is a clean
-//! error; the caller demotes to software decode. EGL sibling: `video_gl.rs`.
+//! The export's modifier must pass this device's importability query — a
+//! foreign GPU's tiling refuses before image create. A refusal or driver
+//! rejection is a clean error; the caller demotes to software decode.
+//! EGL sibling: `video_gl.rs`.
 
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
@@ -19,8 +21,6 @@ const DRM_FORMAT_P010: u32 = 0x3031_3050;
 /// single-plane and still demotes.
 const DRM_FORMAT_NV24: u32 = 0x3432_564e;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-/// Fallback when the export carried no explicit modifier.
-const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 pub const DEVICE_EXTENSIONS: [&std::ffi::CStr; 4] = [
     ash::ext::external_memory_dma_buf::NAME,
@@ -29,14 +29,129 @@ pub const DEVICE_EXTENSIONS: [&std::ffi::CStr; 4] = [
     ash::ext::queue_family_foreign::NAME,
 ];
 
+/// The export's tiling modifier, or a refusal. Explicit-modifier images cannot
+/// take INVALID, and guessing a tiling the exporter did not name is never right.
+fn explicit_modifier(modifier: u64) -> Result<u64> {
+    if modifier == DRM_FORMAT_MOD_INVALID {
+        bail!("dmabuf export has no explicit DRM modifier");
+    }
+    Ok(modifier)
+}
+
+/// Whether `pdev` accepts a `DMA_BUF_EXT` import of `fmt` tiled as `modifier`
+/// for a one-plane SAMPLED image. Extension presence admitted this lane; this
+/// is the legal answer — an unsupported external image is UB
+/// (`VK_ERROR_DEVICE_LOST` on first submit).
+///
+/// Two queries. The modifier list must name this exact modifier for a one-plane
+/// image with SAMPLED_IMAGE — the same one-layout
+/// `ImageDrmFormatModifierExplicitCreateInfoEXT` [`plane_image`] creates. Then
+/// the external-image query must answer IMPORTABLE.
+///
+/// # Safety
+/// `instance`/`pdev` must be live and paired.
+unsafe fn modifier_importable(
+    instance: &ash::Instance,
+    pdev: vk::PhysicalDevice,
+    fmt: vk::Format,
+    modifier: u64,
+) -> bool {
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+    // SAFETY: read-only query; `list`/`fp2` outlive the call.
+    unsafe { instance.get_physical_device_format_properties2(pdev, fmt, &mut fp2) };
+    let mut props = vec![
+        vk::DrmFormatModifierPropertiesEXT::default();
+        list.drm_format_modifier_count as usize
+    ];
+    list.p_drm_format_modifier_properties = props.as_mut_ptr();
+    let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+    // SAFETY: read-only query; `props`/`list`/`fp2` outlive the call.
+    unsafe { instance.get_physical_device_format_properties2(pdev, fmt, &mut fp2) };
+    props.truncate(list.drm_format_modifier_count as usize);
+    let one_plane_sampled = props.iter().any(|p| {
+        p.drm_format_modifier == modifier
+            && p.drm_format_modifier_plane_count == 1
+            && p.drm_format_modifier_tiling_features
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+    });
+    if !one_plane_sampled {
+        return false;
+    }
+
+    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(fmt)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(vk::ImageUsageFlags::SAMPLED)
+        .flags(vk::ImageCreateFlags::empty())
+        .push_next(&mut modifier_info)
+        .push_next(&mut external);
+    let mut ext_props = vk::ExternalImageFormatProperties::default();
+    let mut props = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+    // SAFETY: `instance`/`pdev` are live and paired by the caller's contract;
+    // the pNext chain outlives the call.
+    unsafe {
+        instance
+            .get_physical_device_image_format_properties2(pdev, &info, &mut props)
+            .is_ok()
+            && ext_props
+                .external_memory_properties
+                .external_memory_features
+                .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    }
+}
+
+/// (format, modifier) importability answers. Immutable per device — the
+/// physical-device queries run once per pair, not per frame, and refusals are
+/// cached too.
+#[derive(Default)]
+pub(crate) struct ModifierCache {
+    supported: std::collections::HashMap<(i32, u64), bool>,
+}
+
+impl ModifierCache {
+    fn importable(
+        &mut self,
+        instance: &ash::Instance,
+        pdev: vk::PhysicalDevice,
+        fmt: vk::Format,
+        modifier: u64,
+    ) -> bool {
+        *self
+            .supported
+            .entry((fmt.as_raw(), modifier))
+            .or_insert_with(|| unsafe { modifier_importable(instance, pdev, fmt, modifier) })
+    }
+}
+
+/// Visible/coded scale per axis — the fraction of the imported (coded) image
+/// the visible picture occupies.
+fn crop_scale(width: u32, height: u32, coded_width: u32, coded_height: u32) -> [f32; 2] {
+    [
+        width as f32 / coded_width as f32,
+        height as f32 / coded_height as f32,
+    ]
+}
+
 /// Imported frame. GPU reads outlive submit: park until the fence signals,
 /// then [`HwFrame::destroy`] (drops the decoder surface guard).
 pub struct HwFrame {
     pub luma_view: vk::ImageView,
     pub chroma_view: vk::ImageView,
     pub color: pf_client_core::video::ColorDesc,
+    /// Visible picture extent; the imported images are [`Self::coded_width`] ×
+    /// [`Self::coded_height`], so sampling must crop ([`Self::uv_scale`]).
     pub width: u32,
     pub height: u32,
+    /// Exported surface extent the plane images were created at.
+    coded_width: u32,
+    coded_height: u32,
     /// Fourcc. CSC picks its P010 vs 8-bit rows off this.
     fourcc: u32,
     images: [vk::Image; 2],
@@ -48,6 +163,11 @@ pub struct HwFrame {
 impl HwFrame {
     pub fn is_p010(&self) -> bool {
         self.fourcc == DRM_FORMAT_P010
+    }
+
+    /// UV scale cropping the coded-extent images to the visible picture.
+    pub fn uv_scale(&self) -> [f32; 2] {
+        crop_scale(self.width, self.height, self.coded_width, self.coded_height)
     }
 
     /// Plane images for the presenter's foreign-acquire barriers.
@@ -77,10 +197,15 @@ impl HwFrame {
     }
 }
 
-/// Import both planes. Driver rejection is a clean error; the caller demotes.
-pub fn import(
+/// Import both planes at the exported (coded) extent; [`HwFrame::uv_scale`]
+/// crops sampling to the visible picture. An unimportable modifier, or a
+/// driver rejection, is a clean error; the caller demotes.
+pub(crate) fn import(
+    instance: &ash::Instance,
+    pdev: vk::PhysicalDevice,
     device: &ash::Device,
     ext_mem_fd: &ash::khr::external_memory_fd::Device,
+    cache: &mut ModifierCache,
     frame: DmabufFrame,
 ) -> Result<HwFrame> {
     // Test hook: fault every import so demotion is exercisable without a broken
@@ -94,24 +219,43 @@ pub fn import(
         DRM_FORMAT_NV24 => (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM, true),
         other => bail!("hw presenter handles NV12/P010/NV24 only (got {other:#x})"),
     };
-    if frame.planes.len() < 2 {
-        bail!("2-plane YCbCr needs 2 planes (got {})", frame.planes.len());
+    if frame.planes.len() != 2 {
+        bail!(
+            "2-plane YCbCr needs exactly 2 planes (got {})",
+            frame.planes.len()
+        );
     }
-    // Explicit-modifier images cannot take INVALID; LINEAR is the only honest guess.
-    let modifier = if frame.modifier == DRM_FORMAT_MOD_INVALID {
-        tracing::trace!("dmabuf carried no explicit modifier — importing as LINEAR");
-        DRM_FORMAT_MOD_LINEAR
-    } else {
-        frame.modifier
-    };
+    if frame.width == 0
+        || frame.height == 0
+        || frame.coded_width < frame.width
+        || frame.coded_height < frame.height
+    {
+        bail!(
+            "dmabuf extent must be nonzero with visible <= coded (got {}x{} in {}x{})",
+            frame.width,
+            frame.height,
+            frame.coded_width,
+            frame.coded_height
+        );
+    }
+    let modifier = explicit_modifier(frame.modifier)?;
+    // The export's modifier is only legal if this device can import it; a
+    // foreign GPU's tiling must refuse here, not at image create.
+    for fmt in [luma_fmt, chroma_fmt] {
+        if !cache.importable(instance, pdev, fmt, modifier) {
+            bail!("dmabuf modifier {modifier:#x} not importable as sampled {fmt:?} on this device");
+        }
+    }
 
+    // Plane images take the exported extent: tiled addressing is defined over
+    // the coded size, so a visible-only image would misaddress the tail rows.
     let y = &frame.planes[0];
     let c = &frame.planes[1];
     let (luma_img, luma_mem) = plane_image(
         device,
         ext_mem_fd,
-        frame.width,
-        frame.height,
+        frame.coded_width,
+        frame.coded_height,
         luma_fmt,
         y.fd,
         y.offset,
@@ -120,9 +264,12 @@ pub fn import(
     )
     .context("luma plane")?;
     let (cw, ch) = if chroma_full_res {
-        (frame.width, frame.height)
+        (frame.coded_width, frame.coded_height)
     } else {
-        (frame.width.div_ceil(2), frame.height.div_ceil(2))
+        (
+            frame.coded_width.div_ceil(2),
+            frame.coded_height.div_ceil(2),
+        )
     };
     let (chroma_img, chroma_mem) = match plane_image(
         device, ext_mem_fd, cw, ch, chroma_fmt, c.fd, c.offset, c.stride, modifier,
@@ -193,6 +340,8 @@ pub fn import(
         color: frame.color,
         width: frame.width,
         height: frame.height,
+        coded_width: frame.coded_width,
+        coded_height: frame.coded_height,
         fourcc: frame.fourcc,
         images: [luma_img, chroma_img],
         memories: [luma_mem, chroma_mem],
@@ -318,5 +467,21 @@ fn plane_image(
             unsafe { device.destroy_image(image, None) };
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_modifier_is_never_guessed_linear() {
+        assert!(explicit_modifier(DRM_FORMAT_MOD_INVALID).is_err());
+        assert_eq!(explicit_modifier(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn visible_picture_crops_the_coded_surface() {
+        assert_eq!(crop_scale(1920, 1080, 1920, 1088), [1.0, 1080.0 / 1088.0]);
     }
 }

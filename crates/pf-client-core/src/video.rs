@@ -23,6 +23,8 @@ pub use crate::video_color::{csc_rows, ColorDesc};
 /// The module stays private, like every other backend.
 pub use crate::video_software::NoSoftwareRung;
 use crate::video_software::SoftwareDecoder;
+#[cfg(target_os = "linux")]
+use crate::video_vaapi_native::NativeVaapiDecoder;
 /// The Vulkan handoff types live in [`crate::video_vk`] so Android can reach them without
 /// the `desktop` half of this crate; re-exported so every desktop call site keeps naming
 /// them here.
@@ -428,18 +430,25 @@ impl CpuPlanarFrame {
     }
 }
 
-/// GPU frame: dmabuf fds + plane layout for `GdkDmabufTextureBuilder`.
-/// Fds belong to `guard`'s mapped DRM frame; valid until the guard drops.
+/// GPU frame: dmabuf fds + plane layout for the Vulkan importer
+/// (`pf-presenter::dmabuf`). Fds belong to `guard`'s mapped DRM frame; valid
+/// until the guard drops. Tiled addressing is defined over the coded extent;
+/// the importer crops sampling to the visible picture.
 #[cfg(target_os = "linux")]
 pub struct DmabufFrame {
+    /// Visible picture extent.
     pub width: u32,
     pub height: u32,
+    /// Exported VA surface extent. Tiled addressing is defined over this size;
+    /// the presenter crops it to the visible picture.
+    pub coded_width: u32,
+    pub coded_height: u32,
     /// Combined DRM fourcc of the whole surface (NV12 for 8-bit VAAPI), from the
     /// decoder's software format — not the per-plane component formats.
     pub fourcc: u32,
     pub modifier: u64,
     pub planes: Vec<DmabufPlane>,
-    /// Source colour — `GdkDmabufTexture` state (BT.709 narrow SDR, BT.2020 PQ HDR).
+    /// Source colour for the presenter's CSC pass (BT.709 narrow SDR, BT.2020 PQ HDR).
     pub color: ColorDesc,
     /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor. See [`DecodedImage::is_keyframe`].
     pub keyframe: bool,
@@ -638,6 +647,14 @@ fn native_vaapi_codec(wire: u8) -> Option<pf_vaapi::Codec> {
     }
 }
 
+/// May `auto` enter the VAAPI rung with this presenter? The selected device
+/// must import dma-bufs and must not be NVIDIA. The `native-vaapi` pin bypasses
+/// this gate; `None` preserves non-presenter callers.
+#[cfg(target_os = "linux")]
+fn vaapi_auto_ok(vk: Option<&VulkanDecodeDevice>) -> bool {
+    vk.is_none_or(|v| v.dmabuf_import && v.vendor_id != crate::video_vk::VENDOR_NVIDIA)
+}
+
 /// One decode rung, named so evidence and admission can talk without a
 /// per-platform [`Backend`] variant. The CPU rung is in the table only ([`native_evidence`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -664,18 +681,19 @@ impl NativeRung {
     }
 }
 
-/// Whether hardware has produced a checked picture through this rung/codec pair.
-/// Yes/no for admission and the session log's `hardware_verified=` line, not a score.
+/// Evidence for automatic rung ordering, keyed by rung and wire codec.
+/// `verified` means the recorded coverage meets this project's priority bar;
+/// the note names both the evidence and what it still lacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RungEvidence {
-    /// A real device decoded this pair and the result was checked (frame-hash parity or soak).
+    /// Whether `auto` may prioritize this pair over a usable rung below it.
     pub verified: bool,
-    /// What hardware, in one line — or, when unverified, why none. Goes verbatim into the session log.
+    /// Hardware coverage and its remaining gap, emitted verbatim in the session log.
     pub note: &'static str,
 }
 
-/// Evidence table, keyed by rung and wire codec. An unknown pair is
-/// `verified: false` — a new codec leg must not inherit a neighbour's evidence.
+/// Evidence table for automatic priority. An unknown pair is `verified: false` —
+/// a new codec leg must not inherit a neighbour's confidence.
 pub fn native_evidence(rung: NativeRung, wire: u8) -> RungEvidence {
     use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
     let (verified, note) = match (rung, wire) {
@@ -1053,7 +1071,7 @@ fn report_au_fault_env(native_rung: bool) {
     }
 }
 
-/// Name the landed rung and whether hardware has decoded this codec through it.
+/// Name the landed rung and whether its evidence meets the automatic-priority bar.
 /// `info` if verified, `warn` if not, with [`native_evidence`] verbatim.
 /// The `stats:` decode-path tag names the rung but not its provenance.
 fn log_rung(backend: &Backend, wire: u8) {
@@ -1085,17 +1103,17 @@ fn log_rung(backend: &Backend, wire: u8) {
         Some(e) if e.verified => tracing::info!(
             rung,
             codec,
-            hardware_verified = true,
+            automatic_priority_verified = true,
             evidence = e.note,
             "decode rung active"
         ),
         Some(e) => tracing::warn!(
             rung,
             codec,
-            hardware_verified = false,
+            automatic_priority_verified = false,
             evidence = e.note,
-            "decode rung active — NO hardware has ever decoded a frame through this \
-             rung/codec pair (evidence table, video.rs)"
+            "decode rung active — evidence is below the automatic-priority bar \
+             (evidence table, video.rs)"
         ),
         None => tracing::info!(rung, codec, "decode rung active"),
     }
@@ -1163,6 +1181,8 @@ impl Decoder {
             })
         };
         let codec_name = wire_codec_name(wire);
+        #[cfg(target_os = "linux")]
+        let presenter_vendor = vk.map(|v| v.vendor_id);
         // Pins first: a pin skips vendor order. Refusal or init failure logs and
         // continues as `auto` — a pin's failure must not be quieter than auto's.
         let mut choice = choice;
@@ -1206,7 +1226,7 @@ impl Decoder {
         if choice == crate::video_vaapi_native::DECODER_PIN {
             match native_vaapi_codec(wire) {
                 Some(codec) => {
-                    match crate::video_vaapi_native::NativeVaapiDecoder::new(codec, stream) {
+                    match NativeVaapiDecoder::new_for_presenter(codec, stream, presenter_vendor) {
                         Ok(d) => {
                             tracing::info!(
                                 codec = codec_name,
@@ -1268,11 +1288,18 @@ impl Decoder {
             }
             choice = "auto".to_string();
         }
-        // Linux VAAPI rung, once: Intel/unknown take it before Vulkan, everyone else after.
+        // Linux VAAPI rung, once: Intel/unknown take it before Vulkan, everyone
+        // else after — NVIDIA and non-importing presenters never (`vaapi_auto_ok`).
         #[cfg(target_os = "linux")]
         let vaapi_rung = |choice: &str| -> Result<Option<Backend>> {
+            if !vaapi_auto_ok(vk) {
+                tracing::info!(
+                    "native VAAPI outside the presenter's automatic safety gate (pin overrides)"
+                );
+                return Ok(None);
+            }
             if let Some(codec) = native_vaapi_codec(wire) {
-                match crate::video_vaapi_native::NativeVaapiDecoder::new(codec, stream) {
+                match NativeVaapiDecoder::new_for_presenter(codec, stream, presenter_vendor) {
                     Ok(d) => {
                         tracing::info!(
                             codec = codec_name,
@@ -1405,8 +1432,8 @@ impl Decoder {
                     "native Vulkan decode unavailable — continuing down the ladder"),
             }
         }
-        // VAAPI after Vulkan when that rung was not already tried. A presenter
-        // that cannot display the dmabufs demotes via [`Decoder::force_software`].
+        // VAAPI after Vulkan when that rung was not already tried.
+        // `vaapi_auto_ok` may skip it to the final software attempt.
         #[cfg(target_os = "linux")]
         if choice != "software" && !vaapi_tried {
             if let Some(b) = vaapi_rung(&choice)? {
@@ -1668,12 +1695,17 @@ impl Decoder {
                     // A never-delivered native rung is a decoder the session never
                     // had; it must not cost the rung below. `entered_rungs` keeps
                     // the walk monotone (native rungs sit in opposite vendor order).
+                    // `vaapi_auto_ok` bars the same rung on NVIDIA and on
+                    // presenters that cannot import its dmabufs.
                     #[cfg(target_os = "linux")]
-                    if self.entered_rungs & RUNG_BIT_NATIVE_PLATFORM == 0 {
+                    if self.entered_rungs & RUNG_BIT_NATIVE_PLATFORM == 0
+                        && vaapi_auto_ok(self.vk.as_ref())
+                    {
                         if let Some(codec) = native_vaapi_codec(self.wire_codec) {
-                            match crate::video_vaapi_native::NativeVaapiDecoder::new(
+                            match NativeVaapiDecoder::new_for_presenter(
                                 codec,
                                 self.stream,
+                                self.vk.as_ref().map(|v| v.vendor_id),
                             ) {
                                 Ok(d) => {
                                     tracing::warn!(error = %format!("{e:#}"), fails = self.vaapi_fails,
@@ -2064,6 +2096,7 @@ mod tests {
             video_decode: true,
             present_timing: false,
             d3d11_import: false,
+            dmabuf_import: true,
             d3d11_hdr10: false,
             d3d11_nv12: false,
             d3d11_p010: false,
@@ -2131,8 +2164,8 @@ mod tests {
         );
     }
 
-    /// Auto is Vulkan-first on NVIDIA and AMD; Intel/unknown take VAAPI or D3D11VA.
-    /// A Vulkan streak still demotes to hardware, so this cannot strand a box on software.
+    /// Ordering only: auto tries Vulkan first on NVIDIA/AMD and the platform rung
+    /// first on Intel/unknown. Separate admission gates may skip a platform rung.
     #[test]
     fn vulkan_first_on_nvidia_and_amd_only() {
         assert!(decode_device(0x10DE, "NVIDIA GeForce RTX 5070 Ti").prefer_vulkan_first());
@@ -2145,6 +2178,29 @@ mod tests {
         // Discrete Arc advertises Vulkan Video and must still land on D3D11VA in auto.
         assert!(!decode_device(0x8086, "Intel(R) Arc(TM) B580 Graphics").prefer_vulkan_first());
         assert!(!decode_device(0x8086, "Intel(R) Arc(TM) Pro Graphics").prefer_vulkan_first());
+    }
+
+    /// `auto` enters the VAAPI rung only on a presenter that imports its
+    /// dmabufs and is not NVIDIA, so a Vulkan refusal cannot land on frames
+    /// the selected device cannot display.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_never_enters_vaapi_on_an_nvidia_presenter() {
+        assert!(!vaapi_auto_ok(Some(&decode_device(
+            0x10DE,
+            "NVIDIA GeForce RTX 3070 Ti"
+        ))));
+        assert!(vaapi_auto_ok(Some(&decode_device(
+            0x1002,
+            "AMD RADV NAVI32"
+        ))));
+        assert!(vaapi_auto_ok(Some(&decode_device(0x8086, "Intel Arc"))));
+        // Without dmabuf import the exported surfaces can never reach the screen.
+        let mut no_import = decode_device(0x1002, "AMD RADV NAVI32");
+        no_import.dmabuf_import = false;
+        assert!(!vaapi_auto_ok(Some(&no_import)));
+        // No Vulkan decode device means no presenter facts to refuse on.
+        assert!(vaapi_auto_ok(None));
     }
 
     /// AV1 is advertised on a hardware fact, never on a decoder existing.
@@ -2336,10 +2392,10 @@ mod tests {
         assert!(native_codec(0).is_none());
     }
 
-    /// Which rung/codec pairs have decoded on hardware. A table nobody checks
-    /// drifts into a table that says everything is fine.
+    /// Which rung/codec pairs meet the automatic-priority confidence bar.
+    /// A table nobody checks drifts into a table that says everything is fine.
     #[test]
-    fn the_evidence_table_says_exactly_which_rungs_have_run_on_hardware() {
+    fn the_evidence_table_marks_automatic_priority_confidence() {
         for (rung, codec, what) in [
             (
                 NativeRung::Vulkan,
@@ -2369,17 +2425,17 @@ mod tests {
             (
                 NativeRung::Vaapi,
                 CODEC_H264,
-                "no VAAPI device has run this leg",
+                "single-vendor parity without a soak stays below the priority bar",
             ),
             (
                 NativeRung::Vaapi,
                 CODEC_HEVC,
-                "no VAAPI device has run this leg",
+                "single-vendor parity without a soak stays below the priority bar",
             ),
             (
                 NativeRung::Vaapi,
                 CODEC_AV1,
-                "VAAPI decoded AV1 on RDNA3 but has no parity check",
+                "single-vendor parity without a soak stays below the priority bar",
             ),
             (
                 NativeRung::Software,
@@ -2392,11 +2448,14 @@ mod tests {
                 "rav1d has decoded on glass but has no parity check and no soak",
             ),
         ] {
-            assert!(
-                !native_evidence(rung, codec).verified,
-                "{why} — claiming otherwise is the dishonesty this program must not ship"
-            );
+            assert!(!native_evidence(rung, codec).verified, "{why}");
         }
+        let vaapi_hevc = native_evidence(NativeRung::Vaapi, CODEC_HEVC);
+        assert!(!vaapi_hevc.verified);
+        assert!(
+            vaapi_hevc.note.contains("bit-identical"),
+            "below-priority evidence is not the same as never having run"
+        );
         // An unknown codec leg is unverified, never a neighbour's evidence.
         assert!(!native_evidence(NativeRung::Vulkan, CODEC_PYROWAVE).verified);
         assert!(!native_evidence(NativeRung::Software, CODEC_HEVC).verified);
@@ -2418,8 +2477,8 @@ mod tests {
         }
     }
 
-    /// An unproven rung still runs where only the CPU is below it, and it is named.
-    /// Which of them `auto` may pick first is [`native_rung_admitted`].
+    /// A rung below the automatic-priority bar still runs when only CPU is below.
+    /// Which rung `auto` may prioritize is [`native_rung_admitted`].
     #[test]
     fn every_rung_runs_and_the_unproven_ones_are_named() {
         let unproven = [
@@ -2431,16 +2490,14 @@ mod tests {
             let e = native_evidence(rung, codec);
             assert!(
                 !e.verified,
-                "{} / {codec:#x} is claimed proven — if a hardware run really happened, \
-                 move it into the verified half of the table on purpose",
+                "{} / {codec:#x} reached the automatic-priority bar without a deliberate \
+                 evidence-table promotion",
                 rung.name()
             );
             assert!(
-                e.note.contains("NEVER") || e.note.contains("never"),
-                "{} / {codec:#x}: the note is what the session log prints at warn — it \
-                 must name plainly what this pair has NEVER had, whether that is a \
-                 hardware run at all (VAAPI H.264/H.265) or the parity check that would \
-                 promote it (VAAPI AV1, which HAS decoded), got {:?}",
+                e.note.contains("second vendor") && e.note.contains("soak"),
+                "{} / {codec:#x}: the warning note must name the missing priority \
+                 coverage, got {:?}",
                 rung.name(),
                 e.note
             );

@@ -229,7 +229,7 @@ impl Presenter {
         }
 
         // Optional: video extensions, decode queue, and decoder features, or
-        // `vulkan_decode()` stays `None`.
+        // the exported `video_decode` fact stays `false`.
         // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let dev_props = unsafe { instance.get_physical_device_properties(pdev) };
         let dev_is_13 = vk::api_version_major(dev_props.api_version) > 1
@@ -446,6 +446,7 @@ impl Presenter {
         let hw = if hw_capable {
             Some(HwCtx {
                 ext_mem_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
+                modifier_cache: Default::default(),
             })
         } else {
             None
@@ -461,14 +462,16 @@ impl Presenter {
         // pyrowave probe would hide software frames.
         let csc_planar = CscPass::new_planar(&device, vk::Format::R8G8B8A8_UNORM)?;
 
-        // Export when any consumer needs the handles. Extension lists must match
+        // Export the selected device facts when any consumer needs the handles —
+        // on Linux always: the presenter has a selected device and every consumer
+        // gates individual lanes on the booleans. Extension lists must match
         // creation: the pyrowave decoder replays them into its pinned create-info.
         // One `queue_lock` per device (decode + Skia + presenter; see its docs).
         let queue_lock = std::sync::Arc::new(pf_client_core::video::QueueLock::new());
         #[cfg(windows)]
         let export_worthy = video_ok || win_capable || pyrowave_ok;
-        #[cfg(not(windows))]
-        let export_worthy = video_ok || pyrowave_ok;
+        #[cfg(target_os = "linux")]
+        let export_worthy = true;
         let video_export = if export_worthy {
             let mut device_extensions: Vec<CString> =
                 vec![CString::from(ash::khr::swapchain::NAME)];
@@ -525,6 +528,10 @@ impl Presenter {
                 d3d11_import: win_capable,
                 #[cfg(not(windows))]
                 d3d11_import: false,
+                #[cfg(target_os = "linux")]
+                dmabuf_import: hw_capable,
+                #[cfg(not(target_os = "linux"))]
+                dmabuf_import: false,
                 // HDR10 surface facts arrive with `pick_formats` below.
                 d3d11_hdr10: false,
                 d3d11_nv12: false,

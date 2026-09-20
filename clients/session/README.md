@@ -29,19 +29,20 @@ dependency tree.
 
 ## Decode rungs
 
-`auto` walks native rungs only — pf-vkdecode over Vulkan Video, then the platform's own
-(pf-dxvadec on Windows, pf-vaapi on Linux), then the CPU rung (openh264/rav1d). **There is no
-FFmpeg in this binary.**
+`auto` walks native rungs in device-specific order: NVIDIA/AMD try pf-vkdecode over Vulkan
+Video first; Intel/unknown try the platform rung first (pf-dxvadec on Windows, pf-vaapi on Linux).
+Admission may skip a rung before the CPU fallback (openh264/rav1d). **There is no FFmpeg in this
+binary.**
 
-Which rung/codec pairs have actually decoded on real hardware lives in one place —
-`pf_client_core::video::native_evidence` — and that table feeds both admission and the session's own
-log line:
+The confidence used to prioritize rung/codec pairs lives in
+`pf_client_core::video::native_evidence`. Its note names the hardware evidence and remaining gap;
+the same facts appear in the session log:
 
 ```
-decode rung active  rung=native-vulkan codec=HEVC hardware_verified=true evidence=...
+decode rung active  rung=native-vulkan codec=HEVC automatic_priority_verified=true evidence=...
 ```
 
-That line is a **WARNING** when nothing has ever decoded through the pair the session chose. Read
+That line is a **WARNING** when the active pair is below the automatic-priority evidence bar. Read
 any field report against the table, not against prose here.
 
 ## Dev knobs

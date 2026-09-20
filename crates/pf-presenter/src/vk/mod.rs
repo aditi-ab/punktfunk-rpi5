@@ -71,6 +71,9 @@ pub enum FrameInput<'a> {
 #[cfg(target_os = "linux")]
 struct HwCtx {
     ext_mem_fd: ash::khr::external_memory_fd::Device,
+    /// (format, modifier) importability answers — immutable per device, so the
+    /// driver queries run once, not per frame.
+    modifier_cache: crate::dmabuf::ModifierCache,
 }
 
 /// Win32 external-memory + keyed-mutex table; present only when both extensions exist.
@@ -161,7 +164,10 @@ pub struct Presenter {
     csc_planar: CscPass,
     /// CPU-rung Y/Cb/Cr R8 images. `None` until the first CPU frame.
     cpu_planes: Option<CpuPlanes>,
-    /// Shared device handles for the Vulkan Video decode lane. `None` if the stack cannot.
+    /// Selected presenter-device facts plus shared handles for the decode lanes.
+    /// `video_decode` inside says whether Vulkan Video is usable; the rest of the
+    /// bundle answers vendor/import gates without it, so Linux always has a
+    /// `Some` here. On Windows `None` means no decode lane could use the device.
     video_export: Option<pf_client_core::video::VulkanDecodeDevice>,
     overlay_pipe: OverlayPipe,
     /// Filtered video scale into the swapchain; its output pass shares the overlay's
@@ -240,8 +246,9 @@ impl Presenter {
         self.hw_win.is_some()
     }
 
-    /// Vulkan Video decode handles. `None` when the device is < 1.3 or missing video
-    /// extensions / queue / features; the ladder then falls through.
+    /// Selected presenter-device facts. `video_decode` inside says whether
+    /// Vulkan Video is usable — the rest of the bundle is returned anyway so
+    /// vendor and import gates still work; on Linux this is always `Some`.
     pub fn vulkan_decode(&self) -> Option<pf_client_core::video::VulkanDecodeDevice> {
         self.video_export.clone()
     }

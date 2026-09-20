@@ -137,9 +137,16 @@ impl Presenter {
             FrameInput::Dmabuf(d) => {
                 let hw = self
                     .hw
-                    .as_ref()
+                    .as_mut()
                     .context("hardware frame without dmabuf support")?;
-                hw_frame = Some(dmabuf::import(&self.device, &hw.ext_mem_fd, d)?);
+                hw_frame = Some(dmabuf::import(
+                    &self.instance,
+                    self.pdev,
+                    &self.device,
+                    &hw.ext_mem_fd,
+                    &mut hw.modifier_cache,
+                    d,
+                )?);
                 hw_lane = true;
                 None
             }
@@ -410,12 +417,12 @@ impl Presenter {
                     height: v.height,
                 };
                 let ten_bit = f.is_p010();
-                // No crop: `dmabuf::import` sizes plane images to the picture, so
-                // 0..1 is the picture (not the surface stride).
+                // Imported images span the full exported (coded) extent; the
+                // CSC pass crops them to the visible picture.
                 self.record_csc(
                     v.framebuffer,
                     extent,
-                    [1.0, 1.0],
+                    f.uv_scale(),
                     f.color,
                     if ten_bit { 10 } else { 8 },
                     ten_bit,

@@ -405,15 +405,25 @@ pub(crate) struct NativeVaapiDecoder {
 }
 
 impl NativeVaapiDecoder {
-    /// Probe [`StreamFormat`] here. A first-AU refusal is a decode error, burns the
-    /// demotion streak, and skips the ladder's fall-through.
+    /// Tests use render-node name order unless they set `PUNKTFUNK_VAAPI_DEVICE`.
+    #[cfg(test)]
     pub(crate) fn new(codec: pf_vaapi::Codec, stream: StreamFormat) -> Result<NativeVaapiDecoder> {
+        Self::new_for_presenter(codec, stream, None)
+    }
+
+    /// Probe [`StreamFormat`] on the presenter's GPU where possible. A first-AU
+    /// refusal burns the demotion streak and skips the ladder's fall-through.
+    pub(crate) fn new_for_presenter(
+        codec: pf_vaapi::Codec,
+        stream: StreamFormat,
+        presenter_vendor: Option<u32>,
+    ) -> Result<NativeVaapiDecoder> {
         let depth = stream.bit_depth;
         pf_vaapi::profile_for(codec, stream.chroma_format_idc, depth)
             .map_err(|e| anyhow!("{e}"))
             .context("the negotiated stream shape has no VAAPI decode profile")?;
         let va = Libva::load().context("libva")?;
-        let display = Display::open(va)?;
+        let display = Display::open_for_vendor(va, presenter_vendor)?;
         let planner = match codec {
             pf_vaapi::Codec::H264 => Planner::H264(Box::new(pf_vaapi::H264Planner::new())),
             pf_vaapi::Codec::H265 => Planner::H265(Box::new(pf_vaapi::H265Planner::new())),
@@ -1246,9 +1256,12 @@ fn ship(
         })
         .collect();
     Ok(DmabufFrame {
-        // Coded size would show granule padding.
+        // Visible picture; the coded export extent below carries the padding
+        // the importer crops off.
         width: picture.facts.display.0,
         height: picture.facts.display.1,
+        coded_width: exported.width,
+        coded_height: exported.height,
         fourcc: exported.fourcc,
         modifier: exported.modifier,
         planes,
@@ -1735,6 +1748,8 @@ mod tests {
         DmabufFrame {
             width: 64,
             height: 64,
+            coded_width: 64,
+            coded_height: 64,
             fourcc: pf_vaapi::VA_FOURCC_NV12,
             modifier: 0,
             planes: Vec::new(),
