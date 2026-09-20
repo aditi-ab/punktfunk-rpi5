@@ -103,6 +103,39 @@ fn is_ramp_step(req: &ProbeRequest, ramp_open: bool) -> bool {
     ramp_open && req.duration_ms <= super::stream::RAMP_STEP_MAX_MS
 }
 
+/// A PyroWave session's pin against `SetBitrate` asks.
+///
+/// Every ask is refused with the pin — except one: an Automatic client's
+/// bring-up ramp ends in a verdict ask, and while the ramp window is still
+/// open a lower one becomes the pin. Never a raise, never twice, and a
+/// refused ask does not spend the verdict.
+struct PyroWavePin {
+    /// The pin as it stands — what refused asks ack.
+    kbps: u32,
+    /// The client asked Automatic, so its ramp's verdict may fit the pin.
+    automatic: bool,
+    /// The verdict ask already landed.
+    fit_taken: bool,
+}
+
+impl PyroWavePin {
+    /// The rate to ack and send the encoder: the asked rate the one time the
+    /// window admits it, the standing pin every other time. `ramp_open` is
+    /// the bring-up window — it closes before the first frame.
+    fn resolve(&mut self, asked_kbps: u32, ramp_open: bool) -> u32 {
+        if self.automatic
+            && !self.fit_taken
+            && ramp_open
+            && asked_kbps > 0
+            && asked_kbps < self.kbps
+        {
+            self.fit_taken = true;
+            self.kbps = asked_kbps;
+        }
+        self.kbps
+    }
+}
+
 /// Named fields, not a 30-argument spawn: `retarget_rx` and `gap_rx` are both
 /// bare `u32`, so a positional swap would compile and fail at runtime.
 pub(super) struct Task {
@@ -116,6 +149,11 @@ pub(super) struct Task {
     /// Automatic bitrate, so the shared-path governor may move this session. A
     /// client-set rate and a PyroWave pin are never touched.
     pub(super) bitrate_automatic: bool,
+    /// PyroWave session whose client asked Automatic (`Hello.bitrate_kbps ==
+    /// 0`): its bring-up ramp may lower the pin once while `ramp_open` holds.
+    /// An explicit ask — resolved to the same pin regardless — and every other
+    /// codec never get that window.
+    pub(super) pyrowave_automatic: bool,
     /// One wire packet, bytes. Turns the client's delivery count into the rate
     /// the governor divides, and the shard the parity rule sizes against.
     pub(super) wire_bytes: u64,
@@ -207,6 +245,7 @@ pub(super) async fn run(task: Task) {
         adaptive_fec,
         session_bitrate_kbps,
         bitrate_automatic,
+        pyrowave_automatic,
         wire_bytes,
         audio_kbps,
         ack_reason,
@@ -265,6 +304,14 @@ pub(super) async fn run(task: Task) {
     // Same again. The launch site drops its sender when the session ends.
     let mut launch_outcome_closed = false;
     let mut active = initial_mode;
+    // PyroWave's pin, against the session's asks: an Automatic client's
+    // bring-up ramp may lower it once while the window before the first
+    // frame is open; every other ask is refused with the pin as it stands.
+    let mut pyrowave_pin = PyroWavePin {
+        kbps: session_bitrate_kbps,
+        automatic: pyrowave_automatic,
+        fit_taken: false,
+    };
     // Backstop against Reconfigure spam. Data-plane drain-to-newest already
     // coalesces a resize drag; 500 ms is half the client's 1 s self-limit.
     const MIN_SWITCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -433,14 +480,27 @@ pub(super) async fn run(task: Task) {
                     );
                     // Data plane rebuilds the encoder in place (first frame is
                     // an IDR with in-band SPS). PyroWave is pinned: ack the
-                    // session rate so a foreign client cannot AIMD it down.
+                    // pin so a foreign client cannot AIMD it down. The one
+                    // exception is the Automatic ramp's verdict, inside the
+                    // window and lower, which becomes the pin.
                     let (resolved, why) = if codec == crate::encode::Codec::PyroWave {
-                        tracing::info!(
-                            requested_kbps = req.bitrate_kbps,
-                            pinned_kbps = session_bitrate_kbps,
-                            "PyroWave session: mid-stream bitrate retarget refused (pinned)"
-                        );
-                        (session_bitrate_kbps, AckReason::Pinned)
+                        let was_kbps = pyrowave_pin.kbps;
+                        let resolved =
+                            pyrowave_pin.resolve(req.bitrate_kbps, ramp_open.load(Ordering::SeqCst));
+                        if resolved < was_kbps {
+                            tracing::info!(
+                                pin_kbps = was_kbps,
+                                fit_kbps = resolved,
+                                "PyroWave pin lowered to what the bring-up ramp measured"
+                            );
+                        } else {
+                            tracing::info!(
+                                requested_kbps = req.bitrate_kbps,
+                                pinned_kbps = resolved,
+                                "PyroWave session: mid-stream bitrate retarget refused (pinned)"
+                            );
+                        }
+                        (resolved, AckReason::Pinned)
                     } else {
                         let mut want = resolve_bitrate_kbps(req.bitrate_kbps);
                         let mut why = AckReason::Granted;
@@ -687,6 +747,12 @@ pub(super) async fn run(task: Task) {
                 // pin (~1.6 bpp for the new pixel rate) and the live-rate
                 // display otherwise stays on the old number.
                 let Some((kbps, why)) = retarget else { break };
+                // A re-resolve is the pin itself moving: the verdict bound
+                // follows it, or a queued mode switch would let a stale pin
+                // admit a raise.
+                if codec == crate::encode::Codec::PyroWave {
+                    pyrowave_pin.kbps = kbps;
+                }
                 tracing::info!(
                     kbps,
                     "encoder re-targeted by a pipeline rebuild — telling the client"
@@ -861,6 +927,7 @@ mod tests {
                     probe: false,
                     probe_target_kbps: None,
                     ramp: false,
+                    pin_kbps: None,
                 },
                 base,
             ),
@@ -1095,5 +1162,100 @@ mod tests {
         ));
         assert!(!is_ramp_step(&req(800), true));
         assert!(!is_ramp_step(&req(25), false));
+    }
+
+    /// The ramp's verdict ask — lower than the pin, inside the bring-up
+    /// window — becomes the pin, and the ack carries it.
+    #[test]
+    fn a_ramp_verdict_under_the_pin_lowers_it() {
+        let mut pin = PyroWavePin {
+            kbps: 800_000,
+            automatic: true,
+            fit_taken: false,
+        };
+        assert_eq!(pin.resolve(340_000, true), 340_000);
+        assert_eq!(pin.kbps, 340_000, "the pin moved to the measured rate");
+    }
+
+    /// Once the verdict landed the session is pinned again: a further ask —
+    /// even a lower one — is refused with the pin as it now stands.
+    #[test]
+    fn the_verdict_ask_comes_once() {
+        let mut pin = PyroWavePin {
+            kbps: 800_000,
+            automatic: true,
+            fit_taken: false,
+        };
+        pin.resolve(340_000, true);
+        assert_eq!(
+            pin.resolve(200_000, true),
+            340_000,
+            "a second lower ask is refused at the lowered pin"
+        );
+        assert_eq!(
+            pin.resolve(900_000, true),
+            340_000,
+            "and a raise over the old pin is refused the same"
+        );
+    }
+
+    /// A raise inside the window is refused and does not spend the verdict:
+    /// the ramp's own ask, landing behind it, still lowers the pin.
+    #[test]
+    fn the_pin_never_raises_and_a_refusal_spends_nothing() {
+        let mut pin = PyroWavePin {
+            kbps: 800_000,
+            automatic: true,
+            fit_taken: false,
+        };
+        assert_eq!(pin.resolve(900_000, true), 800_000, "a raise is refused");
+        assert_eq!(pin.resolve(800_000, true), 800_000, "as is the pin itself");
+        assert_eq!(
+            pin.resolve(340_000, true),
+            340_000,
+            "the verdict still fits after them"
+        );
+    }
+
+    /// The window closes with the bring-up: a verdict that lands after it is
+    /// an ordinary ask, refused like every other.
+    #[test]
+    fn a_late_verdict_finds_the_window_closed() {
+        let mut pin = PyroWavePin {
+            kbps: 800_000,
+            automatic: true,
+            fit_taken: false,
+        };
+        assert_eq!(
+            pin.resolve(340_000, false),
+            800_000,
+            "ramp_open closed: the pin stands"
+        );
+        // And it did not spend the verdict — an ask inside the window can
+        // still follow a refused one, though the window itself is gone.
+        assert!(!pin.fit_taken);
+    }
+
+    /// An explicit-rate PyroWave session — resolved to the same pin — gets no
+    /// window at all: its asks are refused inside the window too, and a zero
+    /// ask on the wire is no verdict.
+    #[test]
+    fn only_an_automatic_sessions_verdict_fits() {
+        let mut explicit = PyroWavePin {
+            kbps: 800_000,
+            automatic: false,
+            fit_taken: false,
+        };
+        assert_eq!(explicit.resolve(340_000, true), 800_000);
+        let mut automatic = PyroWavePin {
+            kbps: 800_000,
+            automatic: true,
+            fit_taken: false,
+        };
+        assert_eq!(
+            automatic.resolve(0, true),
+            800_000,
+            "a zero ask is not a measurement"
+        );
     }
 }

@@ -1754,6 +1754,9 @@ pub(crate) async fn run_admitted(
         // Automatic, and negotiable: PyroWave resolves a pin the client cannot
         // move either, so the governor must not move it for it.
         bitrate_automatic: hello.bitrate_kbps == 0 && codec != crate::encode::Codec::PyroWave,
+        // Automatic PyroWave: the client's bring-up ramp may lower the pin
+        // once, while the ramp window is still open.
+        pyrowave_automatic: hello.bitrate_kbps == 0 && codec == crate::encode::Codec::PyroWave,
         wire_bytes: u64::from(welcome.shard_payload)
             + punktfunk_core::abr::budget::SHARD_WIRE_OVERHEAD,
         audio_kbps: audio_reserved_kbps(&welcome),

@@ -80,6 +80,11 @@ pub struct DriverConfig {
     /// ([`HOST_CAP2_RAMP`](crate::quic::HOST_CAP2_RAMP)): measure the link
     /// before the first frame instead of bursting beside it.
     pub ramp: bool,
+    /// PyroWave Automatic: the pin the Welcome resolved, kbps. `Some` runs
+    /// the bring-up ramp as a fit check on that pin — a measured wall lowers
+    /// it once, every other outcome leaves it. The controller stays off
+    /// either way, and the pin is never raised from a measurement.
+    pub pin_kbps: Option<u32>,
 }
 
 /// What the embedder has to do for the controller. Everything else it does
@@ -185,6 +190,9 @@ pub struct Driver {
     codec: u8,
     bit_depth: u8,
     chroma_format: u8,
+    /// The pin a PyroWave Automatic session negotiated, when it has one. The
+    /// ramp's verdict is judged against it in [`on_ramped`](Self::on_ramped).
+    pin_kbps: Option<u32>,
     /// Raised between ticks (a probe ended, a burst was abandoned) and sent
     /// on the next one, microseconds later.
     pending: Vec<Action>,
@@ -206,6 +214,13 @@ impl Driver {
         // Encode thresholds in this session's frame budgets, not the 120 Hz
         // durations they were calibrated at.
         abr.set_frame_budget(cfg.refresh_hz);
+        let pin_kbps = cfg.pin_kbps.filter(|&pin| pin > 0);
+        if let Some(pin) = pin_kbps {
+            // A pinned session's running rate is the pin itself. The
+            // controller is off, so the number windows are judged against
+            // is seeded here and moves only with the host's acks.
+            abr.current_kbps = pin;
+        }
         Driver {
             abr,
             window: window::WindowAccumulator::new(
@@ -214,18 +229,29 @@ impl Driver {
                 cfg.reads_delivery,
                 now,
             ),
-            // A pinned or explicit rate has nothing to measure for.
-            probe: probe::CapacityProbe::new(
-                cfg.probe && cfg.start_kbps > 0,
-                cfg.ramp,
-                cfg.probe_target_kbps,
-                cfg.stream_cap_kbps,
-                now,
-            ),
+            // A pinned or explicit rate has nothing to measure for — except
+            // a PyroWave pin, which the ramp checks once before the first
+            // frame. The pinned probe never arms the beside-video burst.
+            probe: match pin_kbps {
+                Some(pin) => probe::CapacityProbe::for_pinned(
+                    cfg.probe && cfg.ramp,
+                    cfg.probe_target_kbps,
+                    pin,
+                    now,
+                ),
+                None => probe::CapacityProbe::new(
+                    cfg.probe && cfg.start_kbps > 0,
+                    cfg.ramp,
+                    cfg.probe_target_kbps,
+                    cfg.stream_cap_kbps,
+                    now,
+                ),
+            },
             stream_cap_kbps: cfg.stream_cap_kbps,
             codec: cfg.codec,
             bit_depth: cfg.bit_depth,
             chroma_format: cfg.chroma_format,
+            pin_kbps,
             pending: Vec::new(),
             acks: Vec::new(),
             video_aus: 0,
@@ -436,7 +462,29 @@ impl Driver {
     /// means the ramp asked for everything this stream can use and the link
     /// gave it: the stream shape is the only bound left, so authority goes
     /// there. Nothing measured at all licenses nothing.
+    ///
+    /// A pinned session reads the verdict instead: the pin drops to
+    /// `min(pin, 0.7 × delivered)` on a wall, and only on a wall — a floor
+    /// under the link, an unreadable step, and a ramp cut short are not
+    /// walls, so none of them moves the pin. The one ask goes out before
+    /// the first frame; a ramp that never ran produces no ask at all.
     fn on_ramped(&mut self, ramped: probe::Ramped, now: Instant) -> Option<u32> {
+        if let Some(pin) = self.pin_kbps {
+            let probe::Ramped::Wall { delivered_kbps } = ramped else {
+                return None;
+            };
+            let fit = probe::wall_ceiling_kbps(delivered_kbps).min(pin);
+            if fit > 0 && fit < pin {
+                tracing::info!(
+                    pin_kbps = pin,
+                    fit_kbps = fit,
+                    delivered_kbps,
+                    "adaptive bitrate: PyroWave pin lowered to what the ramp measured"
+                );
+                return Some(fit);
+            }
+            return None;
+        }
         let proven_kbps = match ramped {
             probe::Ramped::Wall { delivered_kbps } => {
                 // The wall licenses a rate as it always has, and that rate is
@@ -649,6 +697,7 @@ mod tests {
                 probe_target_kbps: None,
                 ramp: true,
                 reads_delivery: true,
+                pin_kbps: None,
             },
             base,
         );
@@ -800,6 +849,7 @@ mod tests {
                 probe_target_kbps: Some(400_000),
                 ramp: false,
                 reads_delivery: true,
+                pin_kbps: None,
             },
             base,
         );

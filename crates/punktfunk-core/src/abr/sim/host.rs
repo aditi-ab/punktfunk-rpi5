@@ -195,6 +195,10 @@ pub(super) struct HostCfg {
     /// `false` = a host that predates renegotiation: it applies nothing and
     /// answers nothing, and the controller retires itself.
     pub acks: bool,
+    /// PyroWave: the session's rate is a pin. Asks are refused with it —
+    /// except the bring-up ramp's verdict, once, inside the window, and only
+    /// ever lower (`native/control.rs` `PyroWavePin`).
+    pub pinned: bool,
 }
 
 impl Default for HostCfg {
@@ -222,6 +226,7 @@ impl Default for HostCfg {
             bringup_ms: 0,
             answers_probes: true,
             acks: true,
+            pinned: false,
         }
     }
 }
@@ -267,6 +272,8 @@ pub(super) struct Host {
     /// lands, at what rate, and what the ack will name.
     budget_kbps: u32,
     pending: Option<(u64, u32, AckReason)>,
+    /// A pinned session's verdict ask already landed (`Pinned` sessions only).
+    pin_fit_taken: bool,
     /// This session's share of a path it is not alone on (`0` = none), and the
     /// unsolicited ack carrying it. Its own slot: a share must not swallow the
     /// answer the client is waiting for.
@@ -313,6 +320,7 @@ impl Host {
             rng: Rng::new(seed),
             budget_kbps: start_kbps,
             pending: None,
+            pin_fit_taken: false,
             share_kbps: 0,
             governing: None,
             fec_percent: FEC_ADAPTIVE_START,
@@ -344,8 +352,26 @@ impl Host {
     /// can apply, not what was asked, and it names what held it short
     /// (`native/control.rs`: the share, the ceiling clamp, then the cadence
     /// hold).
+    ///
+    /// A pinned session answers every ask `Pinned` with the pin as it stands.
+    /// The one exception is the ramp's verdict inside the bring-up window —
+    /// `now_ms < bringup_ms` is `ramp_open` — which lowers the pin to what it
+    /// asked. Never a raise, never twice.
     pub(super) fn on_set_bitrate(&mut self, now_ms: u64, kbps: u32) {
         if !self.cfg.acks {
+            return;
+        }
+        if self.cfg.pinned {
+            let open = now_ms < self.cfg.bringup_ms;
+            if open && !self.pin_fit_taken && kbps > 0 && kbps < self.budget_kbps {
+                self.pin_fit_taken = true;
+                self.budget_kbps = kbps;
+            }
+            self.pending = Some((
+                now_ms + self.cfg.retarget_ms,
+                self.budget_kbps,
+                AckReason::Pinned,
+            ));
             return;
         }
         let ceiling = self.cfg.encoder_ceiling_kbps.unwrap_or(u32::MAX);

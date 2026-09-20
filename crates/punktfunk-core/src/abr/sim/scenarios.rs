@@ -1212,6 +1212,82 @@ pub(super) fn ramp_cut_short_wan() -> Scenario {
     )
 }
 
+/// The 4K165 PyroWave pin, 1.6 bpp 4:2:0 8-bit (`resolve_bitrate_kbps_for`).
+const PYROWAVE_PIN_KBPS: u32 = 2_189_721;
+
+/// An Automatic PyroWave session: the pin is the rate, and the ramp only
+/// checks whether it fits. `automatic` is the governor's view — a pin is
+/// never shared — not the client's ask, which `pin_kbps` carries.
+fn pyrowave_session() -> SessionCfg {
+    SessionCfg {
+        join_ms: 0,
+        leave_ms: u64::MAX,
+        host: HostCfg {
+            fps: 165,
+            audio_kbps: 512,
+            content: full(),
+            ramp: true,
+            bringup_ms: BRINGUP_MS,
+            pinned: true,
+            ..HostCfg::default()
+        },
+        client: ClientCfg {
+            start_kbps: PYROWAVE_PIN_KBPS,
+            refresh_hz: 165,
+            audio_kbps: 512,
+            ramp: true,
+            automatic: false,
+            pin_kbps: Some(PYROWAVE_PIN_KBPS),
+            ..ClientCfg::default()
+        },
+    }
+}
+
+/// The 2.5 GbE case the pin used to outrun: the ramp trips the wall, and the
+/// pin lowers to `0.7 ×` what the wall step delivered — before a frame ever
+/// went out.
+pub(super) fn pyrowave_pin_fit() -> Scenario {
+    Scenario {
+        name: "pyrowave_pin_fit",
+        seed: 0x7A_7900,
+        duration_ms: 30_000,
+        link: LinkCfg {
+            capacity: vec![(0, 2_500_000)],
+            buffer_ms: 20,
+            base_delay_ms: 1,
+            ..LinkCfg::default()
+        },
+        sessions: vec![pyrowave_session()],
+        // A wall-respecting pin: the ceiling the ramp's verdict leaves.
+        achievable_kbps: wall_ceiling_kbps(2_500_000),
+        blip_at_ms: None,
+    }
+}
+
+/// A bring-up faster than the ramp: video arrives three or four steps in, so
+/// nothing was measured — and the pin stands. The cut-short tail must not arm
+/// the beside-video burst either: a pinned session has no ceiling for it to
+/// set, so no window is ever discarded.
+pub(super) fn pyrowave_pin_holds() -> Scenario {
+    let mut sc = Scenario {
+        name: "pyrowave_pin_holds",
+        seed: 0x7A_7A00,
+        duration_ms: 30_000,
+        link: LinkCfg {
+            capacity: vec![(0, 10_000_000)],
+            buffer_ms: 20,
+            base_delay_ms: 1,
+            ..LinkCfg::default()
+        },
+        sessions: vec![pyrowave_session()],
+        // The pin itself: nothing moved it.
+        achievable_kbps: PYROWAVE_PIN_KBPS,
+        blip_at_ms: None,
+    };
+    sc.sessions[0].host.bringup_ms = 200;
+    sc
+}
+
 /// A host that advertises the ramp and then answers no step: the client
 /// waits out the step deadline, learns nothing, and opens on the authority
 /// that no measurement leaves it.
@@ -1345,6 +1421,10 @@ pub(super) fn all() -> Vec<Scenario> {
         "unknown_refresh_knee_legacy",
     ));
     table.push(legacy(idle_then_motion(), "idle_then_motion_legacy"));
+    // The PyroWave pin-fit pair: new rows at the tail so the baseline stays
+    // append-only.
+    table.push(pyrowave_pin_fit());
+    table.push(pyrowave_pin_holds());
     table
 }
 
@@ -1438,6 +1518,73 @@ mod tests {
                 "{name}: the ramp ran {at_ms} ms into a {BRINGUP_MS} ms bring-up"
             );
         }
+    }
+
+    /// The pin-fit pair: a measured wall lowers the PyroWave pin once, inside
+    /// the bring-up window, and a ramp that measured nothing moves nothing.
+    ///
+    /// `pyrowave_pin_fit` is the 2.5 GbE case: the 1.6 bpp pin overbooks the
+    /// link, the ramp trips the wall, and the one verdict ask lands before a
+    /// frame exists. The pin becomes `0.7 ×` what the wall step delivered —
+    /// a lowering the host answers `Pinned`, so the session simply runs at
+    /// it. `pyrowave_pin_holds` is the same session on a fast bring-up:
+    /// video ends the ramp a few steps in, nothing was measured, the pin
+    /// stands for the whole session — and the cut-short tail arms no burst
+    /// beside the picture, so no later window is ever discarded.
+    #[test]
+    fn the_pyrowave_pin_fits_to_a_wall_and_stands_without_one() {
+        let r = run(&pyrowave_pin_fit());
+        let (at_ms, s) = r.ramps[0].done.expect("the ramp measured the link");
+        assert!(s.wall, "the 2.5 GbE wall is the verdict");
+        assert!(
+            at_ms < BRINGUP_MS,
+            "the verdict landed {at_ms} ms into a {BRINGUP_MS} ms bring-up"
+        );
+        let fit = wall_ceiling_kbps(s.proven_kbps).min(PYROWAVE_PIN_KBPS);
+        assert!(
+            fit < PYROWAVE_PIN_KBPS,
+            "the wall sits under the pin: {} vs {PYROWAVE_PIN_KBPS}",
+            s.proven_kbps
+        );
+        assert_eq!(
+            r.asks[0],
+            [(at_ms, fit)],
+            "the verdict ask comes once, at the fit, the tick the ramp ended"
+        );
+        for w in &r.windows[0] {
+            assert!(
+                w.rate_kbps == PYROWAVE_PIN_KBPS || w.rate_kbps == fit,
+                "the pin or the fit, never anything else: {w:?}"
+            );
+        }
+        assert_eq!(
+            r.windows[0].last().expect("the session ran").rate_kbps,
+            fit,
+            "the session ends where the wall put it"
+        );
+
+        let r = run(&pyrowave_pin_holds());
+        let (at_ms, s) = r.ramps[0].done.expect("the ramp ran until video");
+        assert!(!s.wall, "video ended it — no wall was measured");
+        assert!(at_ms >= 200, "it ran until the frames arrived: {at_ms}");
+        assert!(s.steps < 8, "cut short: {} steps", s.steps);
+        assert!(
+            r.asks[0].is_empty(),
+            "nothing measured, nothing asked: {:?}",
+            r.asks[0]
+        );
+        assert!(
+            r.windows[0]
+                .iter()
+                .all(|w| w.rate_kbps == PYROWAVE_PIN_KBPS),
+            "the pin stands for the whole session"
+        );
+        // The window the ramp's steps straddled is residue; a burst beside
+        // the picture would discard one much later.
+        assert!(
+            r.windows[0].iter().all(|w| !w.discarded || w.t_ms < 1_500),
+            "a cut-short pinned ramp arms no burst beside the picture"
+        );
     }
 
     /// C1: the G5 reaches its measured ceiling in one climb, no cut on the

@@ -607,6 +607,10 @@ pub(crate) struct CapacityProbe {
     /// Nothing is going to measure this link: no probe was armed, the host
     /// declined it, it timed out, or the ramp ended with nothing. Taken once.
     no_evidence: bool,
+    /// A pinned session's ramp: it sizes the pin, and nothing follows — no
+    /// burst beside video, and no controller a measured ceiling would serve.
+    /// A cut-short ramp must not arm the burst it was never going to fire.
+    pinned: bool,
 }
 
 impl CapacityProbe {
@@ -632,6 +636,34 @@ impl CapacityProbe {
             watchdog: None,
             frames_at_start: 0,
             no_evidence: !armed,
+            pinned: false,
+        }
+    }
+
+    /// A pinned session's ramp, sized by the pin it has to fit: the verdict
+    /// is a wall under `pin × 10/7` or the proof that none exists. `armed` is
+    /// `PUNKTFUNK_ABR_PROBE` plus the host's `HOST_CAP2_RAMP`; an old host
+    /// runs no measurement and keeps the pin it resolved.
+    ///
+    /// No burst follows: a cut-short ramp leaves the pin as it is rather
+    /// than costing a started picture a measurement nobody would use.
+    pub(crate) fn for_pinned(
+        armed: bool,
+        target_kbps: Option<u32>,
+        pin_kbps: u32,
+        now: Instant,
+    ) -> Self {
+        CapacityProbe {
+            // Never fired: `fire_at` stays `None` for a pinned session.
+            target_kbps: 0,
+            ramp: armed.then(|| Ramp::new(ramp_max_kbps(pin_kbps, target_kbps), now)),
+            fire_at: None,
+            result_by: None,
+            active: false,
+            watchdog: None,
+            frames_at_start: 0,
+            no_evidence: !armed,
+            pinned: true,
         }
     }
 
@@ -772,11 +804,13 @@ impl CapacityProbe {
     /// rig, 38 % over a 237 Mbps link and 19 cuts in ten minutes. So the
     /// legacy burst is armed to finish the job the moment video flows. It
     /// costs the picture what it has always cost, in the only case that needs
-    /// it, and it is a measurement rather than a guess.
+    /// it, and it is a measurement rather than a guess. A pinned session
+    /// skips that: it has no ceiling for the burst to set, and the pin it
+    /// could not check stands.
     pub(crate) fn take_ramped(&mut self, now: Instant) -> Option<Ramped> {
         let r = self.ramp.as_mut()?;
         let out = r.outcome.take()?;
-        if r.cut_short {
+        if r.cut_short && !self.pinned {
             self.fire_at = Some(now + PROBE_DELAY);
             self.no_evidence = false;
         }

@@ -55,8 +55,9 @@ its list: type it, or slide to it on iPhone, iPad and Mac. A host card's menu ha
 speed…** to suggest a value.
 
 PyroWave is **always Automatic**: a fixed per-pixel budget for the negotiated mode (hundreds of
-Mbps). A fixed kbps is meaningless for the all-intra codec, so the bitrate setting is disabled
-while PyroWave is selected — your stored value is kept.
+Mbps), fitted once to the link during bring-up. A fixed kbps is meaningless for the all-intra
+codec, so the bitrate setting is disabled while PyroWave is selected — your stored value is
+kept.
 
 **Render scale** — *default: Native (1×).* The host renders and encodes at your mode times this;
 your device resamples to its window. Above 1× supersamples at more bandwidth and decode work; below

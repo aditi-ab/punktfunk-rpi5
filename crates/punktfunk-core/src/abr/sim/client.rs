@@ -72,6 +72,10 @@ pub(super) struct ClientCfg {
     pub rebuild_at_ms: Option<u64>,
     /// `false` = an explicit bitrate, so no controller.
     pub automatic: bool,
+    /// PyroWave Automatic: the pin the Welcome resolved. `Some` runs the
+    /// bring-up ramp as a fit check on it — a measured wall lowers it once,
+    /// every other outcome leaves it, and no controller runs either way.
+    pub pin_kbps: Option<u32>,
 }
 
 impl Default for ClientCfg {
@@ -91,6 +95,7 @@ impl Default for ClientCfg {
             ceiling_at: None,
             rebuild_at_ms: None,
             automatic: true,
+            pin_kbps: None,
         }
     }
 }
@@ -211,13 +216,23 @@ pub(super) struct Client {
     pub(super) ramp_asks: Vec<(u64, u32)>,
     /// When the ramp stopped, and what it came to.
     pub(super) ramp_done: Option<(u64, crate::abr::probe::RampSummary)>,
+    /// Every `SetBitrate` the driver emitted: when, and for what. The window
+    /// record's `request_kbps` sees only asks that land on a close tick, so
+    /// the ramp's own asks — the opening rate, the pin's verdict — live here.
+    pub(super) set_asks: Vec<(u64, u32)>,
 }
 
 impl Client {
     pub(super) fn new(cfg: ClientCfg, seed: u64, base: Instant, joined: Instant) -> Self {
         let abr = Driver::new(
             DriverConfig {
-                start_kbps: if cfg.automatic { cfg.start_kbps } else { 0 },
+                // A pinned session opens at its pin, and the pin is the
+                // driver's own config — the controller stays off.
+                start_kbps: if cfg.automatic && cfg.pin_kbps.is_none() {
+                    cfg.start_kbps
+                } else {
+                    0
+                },
                 ceiling_cap_kbps: None,
                 stream_cap_kbps: cfg.stream_cap_kbps,
                 refresh_hz: cfg.refresh_hz,
@@ -230,6 +245,7 @@ impl Client {
                 probe_target_kbps: cfg.probe_target_kbps,
                 ramp: cfg.ramp,
                 reads_delivery: cfg.reads_delivery,
+                pin_kbps: cfg.pin_kbps,
             },
             joined,
         );
@@ -261,14 +277,16 @@ impl Client {
             owd_samples: Vec::new(),
             ramp_asks: Vec::new(),
             ramp_done: None,
+            set_asks: Vec::new(),
             cfg,
         }
     }
 
     /// What the session is running at. A fixed-rate session has no
-    /// controller, so its rate is the one it negotiated.
+    /// controller, so its rate is the one it negotiated; a pinned session's
+    /// moves with the host's `Pinned` acks.
     pub(super) fn rate_kbps(&self) -> u32 {
-        if self.cfg.automatic {
+        if self.cfg.automatic || self.cfg.pin_kbps.is_some() {
             self.abr.abr.current_kbps
         } else {
             self.cfg.start_kbps
@@ -563,6 +581,7 @@ impl Client {
                 crate::abr::Action::Loss(ppm) => out.push(Action::Loss { ppm, unrecovered }),
                 crate::abr::Action::SetBitrate(kbps) => {
                     request = Some(kbps);
+                    self.set_asks.push((now_ms, kbps));
                     out.push(Action::SetBitrate(kbps));
                 }
                 crate::abr::Action::Probe {

@@ -94,6 +94,9 @@ struct Run {
     pub metrics: Metrics,
     pub windows: Vec<Vec<WindowRec>>,
     pub ramps: Vec<RampTrace>,
+    /// Every `SetBitrate` each session sent, when it sent it: the asks a
+    /// window close never saw (the ramp's opening rate, the pin's verdict).
+    pub asks: Vec<Vec<(u64, u32)>>,
 }
 
 impl Run {
@@ -270,7 +273,8 @@ fn run(sc: &Scenario) -> Run {
                 leave_ms: s.leave_ms,
                 host: Host::new(
                     s.host.clone(),
-                    s.client.start_kbps,
+                    // A pinned session's Welcome rate is the pin itself.
+                    s.client.pin_kbps.unwrap_or(s.client.start_kbps),
                     sc.seed ^ (0x9A << i),
                     joined,
                 ),
@@ -383,23 +387,23 @@ fn run(sc: &Scenario) -> Run {
         }
     }
     let metrics = measure(sc, &sessions, &mut link, offered_10s, capacity_10s);
-    let (windows, ramps) = sessions
-        .into_iter()
-        .map(|s| {
-            let c = s.client;
-            (
-                c.windows,
-                RampTrace {
-                    asks: c.ramp_asks,
-                    done: c.ramp_done,
-                },
-            )
-        })
-        .unzip();
+    let mut windows = Vec::new();
+    let mut ramps = Vec::new();
+    let mut asks = Vec::new();
+    for s in sessions {
+        let c = s.client;
+        windows.push(c.windows);
+        ramps.push(RampTrace {
+            asks: c.ramp_asks,
+            done: c.ramp_done,
+        });
+        asks.push(c.set_asks);
+    }
     Run {
         metrics,
         windows,
         ramps,
+        asks,
     }
 }
 

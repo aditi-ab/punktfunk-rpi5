@@ -131,8 +131,15 @@ impl DataPump {
         let mut arrivals_us: Vec<u32> = Vec::new();
         let mut last_arrival: Option<Instant> = None;
         // PyroWave pins the rate (hard per-frame CBR), so Automatic never
-        // arms: no AIMD, no climb probe.
+        // arms: no AIMD. The bring-up ramp still runs for an Automatic
+        // session — to size the pin, not to feed a controller.
         let rate_pinned = negotiated_codec == crate::quic::CODEC_PYROWAVE;
+        // The pin the Welcome resolved, for a PyroWave Automatic session
+        // (`bitrate_kbps == 0`) on a host that serves the ramp. A measured
+        // wall lowers it once; everything else leaves it, and it never rises.
+        let pin_kbps = (rate_pinned && bitrate_kbps == 0)
+            .then_some(resolved_bitrate_kbps)
+            .filter(|&pin| pin > 0);
         // All-intra: no reference chain, so the channel drains to newest
         // (`FrameChannel::set_all_intra`) instead of strict FIFO.
         frames.set_all_intra(negotiated_codec == crate::quic::CODEC_PYROWAVE);
@@ -159,6 +166,7 @@ impl DataPump {
                 probe_target_kbps: env_u32("PUNKTFUNK_ABR_PROBE_KBPS"),
                 ramp: serves_ramp,
                 reads_delivery,
+                pin_kbps,
             },
             session_start,
         );
