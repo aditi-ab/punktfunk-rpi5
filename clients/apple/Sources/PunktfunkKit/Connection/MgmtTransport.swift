@@ -146,6 +146,9 @@ actor MgmtConnectionPool {
     /// Connections created and not yet closed, per host — the cap this pool enforces.
     private var live: [String: Int] = [:]
     private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    /// Bumped by `closeAll`: a connection checked out under an older epoch is closed on release
+    /// rather than pooled, so the close reaches sockets still in flight, not just idle ones.
+    private var epoch: [String: UInt64] = [:]
     /// Also the retry budget: every pooled socket may be a stale keep-alive.
     static let maxPerHost = 4
 
@@ -153,14 +156,19 @@ actor MgmtConnectionPool {
         while true {
             if var idle = available[key], let connection = idle.popLast() {
                 available[key] = idle
-                if connection.isHealthy { return connection }
+                if connection.isHealthy {
+                    connection.poolEpoch = epoch[key] ?? 0
+                    return connection
+                }
                 connection.close()
                 live[key] = max(0, (live[key] ?? 1) - 1)
                 continue
             }
             if (live[key] ?? 0) < Self.maxPerHost {
                 live[key] = (live[key] ?? 0) + 1
-                return make()
+                let connection = make()
+                connection.poolEpoch = epoch[key] ?? 0
+                return connection
             }
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 waiters[key, default: []].append(continuation)
@@ -171,7 +179,9 @@ actor MgmtConnectionPool {
     /// Always call this, on success AND on failure: a connection that is never returned leaks a
     /// slot, and enough leaked slots would hang every later request on the waiter queue.
     func release(_ connection: MgmtConnection, key: String) {
-        if connection.isHealthy, (available[key]?.count ?? 0) < Self.maxPerHost {
+        let stillCurrent = connection.poolEpoch == (epoch[key] ?? 0)
+        if connection.isHealthy, stillCurrent,
+           (available[key]?.count ?? 0) < Self.maxPerHost {
             available[key, default: []].append(connection)
         } else {
             connection.close()
@@ -184,12 +194,17 @@ actor MgmtConnectionPool {
         }
     }
 
-    /// Drop every idle connection for a host — used when a library screen goes away, so we don't
-    /// sit on sockets the user is done with.
+    /// Drop every connection for a host — used when a library screen goes away, so we don't sit
+    /// on sockets the user is done with. Idle ones close here; checked-out ones were stamped
+    /// with the pre-close epoch, so `release` closes them when they come back.
     func closeAll(matching prefix: String) {
-        for (key, connections) in available where key.hasPrefix(prefix) {
-            connections.forEach { $0.close() }
-            live[key] = max(0, (live[key] ?? 0) - connections.count)
+        let keys = live.keys.filter { $0.hasPrefix(prefix) }
+        for key in keys {
+            epoch[key, default: 0] += 1
+            for connection in available[key] ?? [] {
+                connection.close()
+                live[key] = max(0, (live[key] ?? 0) - 1)
+            }
             available[key] = []
         }
     }
@@ -215,9 +230,11 @@ final class MgmtConnection: @unchecked Sendable {
     /// us, which none do — but dropping them would silently corrupt the next read.
     private var buffer = Data()
     private var operation = 0
-    private var pinRejected = false
     private var servedRequest = false
 
+    /// The pool's checkout stamp — written and read only by `MgmtConnectionPool`, which is why
+    /// it needs no queue hop.
+    var poolEpoch: UInt64 = 0
     /// False once the connection has failed; the pool discards these instead of handing them out.
     private(set) var isHealthy = true
     /// Has this connection completed at least one request? Drives the retry-once rule in
