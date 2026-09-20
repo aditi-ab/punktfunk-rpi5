@@ -246,6 +246,8 @@ pub fn summary(
 /// `bitrate_kbps` is the embedder's rate: `0` is Automatic, and anything else pins the
 /// session exactly as it does for a shipped client. A pinned session's controller never
 /// arms, so its windows carry `"target_kbps":0` — a record of a link nobody is steering.
+/// `preferred_codec` is `--codec`: PyroWave joins the advertised set only when asked for,
+/// as in the hand-built Hello.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     connect: &str,
@@ -259,6 +261,7 @@ pub fn run(
     profile: &str,
     decoder_hold: bool,
     bitrate_kbps: u32,
+    preferred_codec: u8,
 ) -> Result<()> {
     let (host, port) = connect
         .rsplit_once(':')
@@ -275,8 +278,13 @@ pub fn run(
         2,
         punktfunk_core::quic::CODEC_H264
             | punktfunk_core::quic::CODEC_HEVC
-            | punktfunk_core::quic::CODEC_AV1,
-        0,
+            | punktfunk_core::quic::CODEC_AV1
+            | if preferred_codec == punktfunk_core::quic::CODEC_PYROWAVE {
+                punktfunk_core::quic::CODEC_PYROWAVE
+            } else {
+                0
+            },
+        preferred_codec,
         None,
         0,
         false,

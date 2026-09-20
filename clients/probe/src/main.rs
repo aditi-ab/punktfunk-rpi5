@@ -427,6 +427,7 @@ fn run(args: Args) -> Result<()> {
             &args.profile,
             args.decoder_hold,
             args.bitrate_kbps,
+            args.preferred_codec,
         );
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
