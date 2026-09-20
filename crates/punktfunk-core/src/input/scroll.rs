@@ -449,11 +449,7 @@ mod tests {
         })
         .is_none());
         // Out-of-range source/phase bytes.
-        assert!(ScrollEvent::from_event(&InputEvent {
-            flags: 6 | (0 << 8),
-            ..base
-        })
-        .is_none());
+        assert!(ScrollEvent::from_event(&InputEvent { flags: 6, ..base }).is_none());
         assert!(ScrollEvent::from_event(&InputEvent {
             flags: 1 | (8 << 8),
             ..base
