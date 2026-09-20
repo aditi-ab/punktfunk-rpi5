@@ -240,12 +240,20 @@ fn audio_rate_is_openable(_rate_hz: u32, _channels: u8) -> bool {
 /// it — the HDR metadata and the Surface dataspace are gated on the stream's own colour, so an
 /// SDR Main10 stream skips both.
 ///
-/// `multi_slice` is DECODER truth, not panel truth: Kotlin probes every decoder this device would
-/// use (`VideoDecoders.multiSliceTolerant`), because Amlogic wedges the whole device on
-/// multi-slice AUs — the 0.17.0 field regression. Only then may the host send >1 slice per frame.
+/// `multi_slice` is decoder truth: Kotlin probes every decoder this device would use because
+/// Amlogic can wedge on multi-slice AUs. Only then may the host send more than one slice.
+///
+/// Android ARMv7 always asks for ChaCha because software AES limits these TV-class devices. Other
+/// ABIs keep AES; their hardware acceleration makes the tradeoff target-specific.
 fn video_caps(hdr: bool, ten_bit_sdr: bool, multi_slice: bool) -> u8 {
-    use punktfunk_core::quic::{VIDEO_CAP_10BIT, VIDEO_CAP_HDR, VIDEO_CAP_MULTI_SLICE};
-    let mut caps = 0;
+    use punktfunk_core::quic::{
+        VIDEO_CAP_10BIT, VIDEO_CAP_CHACHA20, VIDEO_CAP_HDR, VIDEO_CAP_MULTI_SLICE,
+    };
+    let mut caps = if cfg!(all(target_os = "android", target_arch = "arm")) {
+        VIDEO_CAP_CHACHA20
+    } else {
+        0
+    };
     if hdr {
         caps |= VIDEO_CAP_10BIT | VIDEO_CAP_HDR;
     }
@@ -261,22 +269,28 @@ fn video_caps(hdr: bool, ten_bit_sdr: bool, multi_slice: bool) -> u8 {
 #[cfg(test)]
 mod caps_tests {
     use super::video_caps;
-    use punktfunk_core::quic::{VIDEO_CAP_10BIT, VIDEO_CAP_HDR, VIDEO_CAP_MULTI_SLICE};
+    use punktfunk_core::quic::{
+        VIDEO_CAP_10BIT, VIDEO_CAP_CHACHA20, VIDEO_CAP_HDR, VIDEO_CAP_MULTI_SLICE,
+    };
+
+    fn automatic_caps() -> u8 {
+        video_caps(false, false, false)
+    }
 
     /// HDR carries 10-bit with it, 10-bit-SDR asks for the depth alone, and neither reaches for
     /// the other's bit. The whole point of the split: an SDR panel can still get Main10.
     #[test]
     fn ten_bit_is_asked_for_with_or_without_hdr() {
-        assert_eq!(video_caps(false, false, false), 0);
+        let automatic = automatic_caps();
         assert_eq!(
             video_caps(true, false, false),
-            VIDEO_CAP_10BIT | VIDEO_CAP_HDR
+            automatic | VIDEO_CAP_10BIT | VIDEO_CAP_HDR
         );
-        assert_eq!(video_caps(false, true, false), VIDEO_CAP_10BIT);
+        assert_eq!(video_caps(false, true, false), automatic | VIDEO_CAP_10BIT);
         // HDR already implies the depth, so asking for both is the same request as HDR.
         assert_eq!(
             video_caps(true, true, false),
-            VIDEO_CAP_10BIT | VIDEO_CAP_HDR
+            automatic | VIDEO_CAP_10BIT | VIDEO_CAP_HDR
         );
         // …and 10-bit alone never implies PQ, which would be the mis-tone-mapped stream.
         assert_eq!(video_caps(false, true, false) & VIDEO_CAP_HDR, 0);
@@ -285,11 +299,27 @@ mod caps_tests {
     /// Multi-slice is decoder truth and rides alongside, never gated by the colour asks.
     #[test]
     fn multi_slice_is_independent_of_the_colour_bits() {
-        assert_eq!(video_caps(false, false, true), VIDEO_CAP_MULTI_SLICE);
+        let automatic = automatic_caps();
+        assert_eq!(
+            video_caps(false, false, true),
+            automatic | VIDEO_CAP_MULTI_SLICE
+        );
         assert_eq!(
             video_caps(true, false, true),
-            VIDEO_CAP_10BIT | VIDEO_CAP_HDR | VIDEO_CAP_MULTI_SLICE
+            automatic | VIDEO_CAP_10BIT | VIDEO_CAP_HDR | VIDEO_CAP_MULTI_SLICE
         );
+    }
+
+    #[cfg(all(target_os = "android", target_arch = "arm"))]
+    #[test]
+    fn armv7_android_automatically_requests_chacha() {
+        assert_eq!(automatic_caps() & VIDEO_CAP_CHACHA20, VIDEO_CAP_CHACHA20);
+    }
+
+    #[cfg(not(all(target_os = "android", target_arch = "arm")))]
+    #[test]
+    fn other_targets_keep_aes() {
+        assert_eq!(automatic_caps() & VIDEO_CAP_CHACHA20, 0);
     }
 }
 
