@@ -24,7 +24,8 @@ use pf_client_core::console::OverlayAction;
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse, PadInfo};
 use pf_client_core::start;
 use pf_client_core::trust;
-use skia_safe::{Canvas, Color4f, Data, Rect, RuntimeEffect};
+use skia_safe::{Canvas, Color4f, Data, Paint, Rect, RuntimeEffect, Surface};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
@@ -53,6 +54,14 @@ const NAV_INPUT_OPENS: f64 = 0.85;
 /// Chrome bands, design units: pinned title above, hints below.
 const TOP_BAND: f64 = 64.0;
 const BOTTOM_BAND: f64 = 86.0;
+
+/// Long edge of the reduced backdrop's offscreen, px. The field is a pure function of
+/// `xy/u_res`, so a small buffer holds the same picture — the per-pixel exp/sin/Bézier
+/// work is exactly what a TV GPU cannot afford.
+const FIELD_EDGE: f64 = 512.0;
+/// Seconds between reduced-backdrop re-renders (~25 Hz). The field drifts on ~90–130 s
+/// periods, so the step is invisible; a frozen (reduce-motion) field renders once.
+const FIELD_STEP: f64 = 0.04;
 
 /// Paint recipe for a transition. Distinct from spring direction: a reversed
 /// push still paints as a push.
@@ -379,6 +388,10 @@ pub(crate) struct Shell {
     /// The aurora phase *is* the clock; wall time never agrees across dumps.
     #[cfg(test)]
     pub(crate) fake_clock: Option<(f64, f64)>,
+    /// The reduced backdrop's retained pass — [`Shell::draw_field_reduced`]. A cell
+    /// because the takeover chain borrows overlay state while it draws, so `&mut self`
+    /// never reaches here.
+    field: RefCell<Option<FieldCache>>,
 }
 
 impl Shell {
@@ -458,6 +471,7 @@ impl Shell {
             last_frame: None,
             #[cfg(test)]
             fake_clock: None,
+            field: RefCell::new(None),
         })
     }
 
@@ -1523,9 +1537,10 @@ impl Shell {
         }
     }
 
-    fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64) {
-        // One clock read: the takeover's `draw_aurora` inherits it.
-        let t = self.field_clock(t);
+    /// The field as a paint for an `w`×`h` target — `u_res` is the TARGET's pixels,
+    /// the shader's `xy/u_res` normalises everything, so the reduced pass's small
+    /// offscreen renders the same picture the full surface would.
+    fn aurora_paint(&self, w: f64, h: f64, t: f64, calm: f64) -> Option<Paint> {
         // Matches the SkSL block: u_res, u_tc, u_lift, u_scrim (each float2/4).
         let uniforms: [f32; 12] = [
             w as f32,
@@ -1543,17 +1558,165 @@ impl Shell {
         ];
         let words = uniforms.map(f32::to_ne_bytes);
         let bytes = words.as_flattened();
-        match self.mesh.make_shader(Data::new_copy(bytes), &[], None) {
-            Some(shader) => {
+        self.mesh
+            .make_shader(Data::new_copy(bytes), &[], None)
+            .map(|shader| {
                 let mut paint = crate::theme::shaded();
                 paint.set_shader(shader);
-                canvas.draw_rect(Rect::from_wh(w as f32, h as f32), &paint);
+                paint
+            })
+    }
+
+    fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64) {
+        // One clock read: the takeover's `draw_aurora` inherits it.
+        let t = self.field_clock(t);
+        let reduced = crate::screens::settings::reduce_ui_res(
+            &self.settings,
+            self.platform,
+            self.fallback_ui,
+        );
+        let mut cache = self.field.borrow_mut();
+        if !reduced {
+            // Hand the offscreen back while the full-rate path runs — it is dead weight
+            // under the resource cache until the switch comes back on.
+            cache.take();
+            match self.aurora_paint(w, h, t, calm) {
+                Some(paint) => {
+                    canvas.draw_rect(Rect::from_wh(w as f32, h as f32), &paint);
+                }
+                None => {
+                    canvas.clear(Color4f::new(0.0, 0.0, 0.0, 1.0));
+                }
             }
+            return;
+        }
+        self.draw_field_reduced(canvas, &mut cache, w, h, t, calm);
+    }
+
+    /// The reduced-interface pass: the field into a ≤[`FIELD_EDGE`]-px offscreen, blitted
+    /// up with bilinear sampling. Re-rendered only when an input moved — size, palette,
+    /// calm, or the clock past [`FIELD_STEP`]. The takeover's `calm = 0` and the base
+    /// field's share one slot: when both differ each gets a small re-render a frame,
+    /// still a fraction of the full-surface cost.
+    fn draw_field_reduced(
+        &self,
+        canvas: &Canvas,
+        cache: &mut Option<FieldCache>,
+        w: f64,
+        h: f64,
+        t: f64,
+        calm: f64,
+    ) {
+        let scale = (FIELD_EDGE / w.max(h)).min(1.0);
+        let size = ((w * scale).ceil() as i32, (h * scale).ceil() as i32);
+        // `t < c.t` is the test clock rewinding, not a direction the field moves.
+        let stale = cache.as_ref().is_none_or(|c| {
+            c.size != size
+                || c.calm != calm
+                || c.mesh.0 != self.mesh_palette
+                || c.mesh.1 != self.mesh_os
+                || t - c.t >= FIELD_STEP
+                || t < c.t
+        });
+        if stale {
+            if let Some(mut surface) = field_surface(canvas, size) {
+                // u_res is the offscreen's own pixels — `aurora_paint` is resolution-free.
+                if let Some(paint) = self.aurora_paint(size.0 as f64, size.1 as f64, t, calm) {
+                    surface
+                        .canvas()
+                        .draw_rect(Rect::from_wh(size.0 as f32, size.1 as f32), &paint);
+                    *cache = Some(FieldCache {
+                        surface,
+                        size,
+                        t,
+                        calm,
+                        mesh: (self.mesh_palette.clone(), self.mesh_os),
+                    });
+                }
+                // A rejected shader keeps whatever the cache held: a stale field beats black.
+            } else {
+                // No offscreen (context teardown): the full-rate draw is the fallback,
+                // never a black frame — the same stance the unreduced path takes.
+                match self.aurora_paint(w, h, t, calm) {
+                    Some(paint) => {
+                        canvas.draw_rect(Rect::from_wh(w as f32, h as f32), &paint);
+                    }
+                    None => {
+                        canvas.clear(Color4f::new(0.0, 0.0, 0.0, 1.0));
+                    }
+                }
+                return;
+            }
+        }
+        match cache {
+            Some(c) => {
+                canvas.draw_image_rect_with_sampling_options(
+                    c.surface.image_snapshot(),
+                    None,
+                    Rect::from_wh(w as f32, h as f32),
+                    skia_safe::SamplingOptions::new(
+                        skia_safe::FilterMode::Linear,
+                        skia_safe::MipmapMode::None,
+                    ),
+                    &crate::theme::shaded(),
+                );
+            }
+            // Stale with nothing cached means the shader rejected — the direct path's
+            // own answer.
             None => {
                 canvas.clear(Color4f::new(0.0, 0.0, 0.0, 1.0));
             }
         }
     }
+}
+
+/// The reduced backdrop's retained pass: the offscreen and the inputs it was rendered
+/// from — anything that moves one of them is what a re-render keys on.
+struct FieldCache {
+    surface: Surface,
+    /// The offscreen's pixel size (`FIELD_EDGE`-scaled from the surface it blits to).
+    size: (i32, i32),
+    /// Clock and calm mix baked into the current contents.
+    t: f64,
+    calm: f64,
+    /// `mesh`'s provenance (palette id, OS-theme revision) — a palette change must
+    /// re-render even with the clock frozen.
+    mesh: (String, Option<u64>),
+}
+
+/// The reduced backdrop's offscreen: a GPU render target on `canvas`'s own context
+/// where one exists, a raster surface where none does (tests, a software host) — the
+/// cheap pass still applies there.
+#[cfg(any(feature = "gl", feature = "vulkan-overlay"))]
+fn field_surface(canvas: &Canvas, size: (i32, i32)) -> Option<Surface> {
+    use skia_safe::gpu;
+    let info = skia_safe::ImageInfo::new_n32_premul(size, None);
+    canvas
+        .recording_context()
+        .and_then(|mut rc| {
+            gpu::surfaces::render_target(
+                &mut rc,
+                gpu::Budgeted::Yes,
+                &info,
+                None,
+                gpu::SurfaceOrigin::TopLeft,
+                None,
+                false,
+                None,
+            )
+        })
+        .or_else(|| skia_safe::surfaces::raster(&info, None, None))
+}
+
+/// The reduced backdrop's offscreen where the build has no GPU backend: a raster
+/// surface — same pass, just CPU-painted.
+#[cfg(not(any(feature = "gl", feature = "vulkan-overlay")))]
+fn field_surface(_canvas: &Canvas, size: (i32, i32)) -> Option<Surface> {
+    skia_safe::surfaces::raster(
+        &skia_safe::ImageInfo::new_n32_premul(size, None),
+        None,
+        None,
+    )
 }
 
 /// Compile the mesh for a palette and the lift, scrim, and ink it decides.
