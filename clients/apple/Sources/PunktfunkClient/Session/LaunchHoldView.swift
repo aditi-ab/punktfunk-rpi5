@@ -191,8 +191,8 @@ struct LaunchHoldView: View {
     private func backdrop(_ size: CGSize) -> some View {
         ZStack {
             Color.black
-            // Held back until there is a loader, for the same reason as the cover: a poster that
-            // mounts without one exhausts its candidates against nothing and never looks again.
+            // Held back until there is a loader, for the same reason as the cover: a poster
+            // still waiting on one draws its grey library placeholder under the wash.
             if loader != nil {
                 PosterImage(
                     candidates: entry.art.posterCandidates, title: "", loader: loader,
@@ -213,10 +213,9 @@ struct LaunchHoldView: View {
     }
 
     private var cover: some View {
-        // Held back until there is a loader. `PosterImage` walks its candidates once, from
-        // `.task(id: index)`, so one that mounts without a loader exhausts them against nothing
-        // and settles on the placeholder for good. Re-identifying it instead would restart the
-        // flight, since replacing a view drops the frame it was animating from.
+        // Held back until there is a loader: the hold's own placeholder is the flat dark card,
+        // not the poster's grey one — and a subtree swapped in mid-flight has no previous frame
+        // to animate from, so the cover would land in place rather than fly.
         Group {
             if loader != nil {
                 PosterImage(

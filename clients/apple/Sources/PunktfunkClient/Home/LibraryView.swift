@@ -984,6 +984,16 @@ struct LibraryView: View {
             loading = false
             return
         }
+        // Built ahead of the first suspension: a remounted shelf draws its restored tiles
+        // before `load()` resumes, and every poster needs this waiting. The fetch's outcome
+        // doesn't gate it — cached posters render with the host still down.
+        artLoader = try? LibraryArtLoader(
+            address: current.address,
+            port: current.effectiveMgmtPort,
+            certPEM: identity.certPEM,
+            keyPEM: identity.keyPEM,
+            hostFingerprint: current.pinnedSHA256)
+
         // Show the catalog we already have BEFORE talking to the host. A library is the screen a
         // player uses to decide what to play, and an empty one while a sleeping box boots is the
         // opposite of useful — so the last-known titles go up immediately, marked as remembered,
@@ -1006,15 +1016,6 @@ struct LibraryView: View {
         if waking {
             _ = PunktfunkConnection.wakeOnLAN(macs: current.wakeMacs, lastKnownIP: current.address)
         }
-
-        // The art loader is built from the same identity whether or not the catalog fetch
-        // succeeds, so cached posters render behind a cached catalog with the host still down.
-        artLoader = try? LibraryArtLoader(
-            address: current.address,
-            port: current.effectiveMgmtPort,
-            certPEM: identity.certPEM,
-            keyPEM: identity.keyPEM,
-            hostFingerprint: current.pinnedSHA256)
 
         // A woken box takes 20–60 s to answer, so one attempt would almost always land on a host
         // that is still POSTing. Retry across that window when we sent a packet; without one, ask
@@ -1113,6 +1114,9 @@ struct LibraryView: View {
         struct Wrapped: Decodable { let library: [GameEntry] }
         servedFromCacheAt = nil
         running = [:]
+        // A source that fails every URL, so the posters settle on their placeholders rather
+        // than wait on a loader this path never builds.
+        artLoader = ShotArtSource(fixtures: [:])
         guard let data = FileManager.default.contents(atPath: path) else {
             games = []
             errorText = "PUNKTFUNK_FAKE_LIBRARY: can't read \(path)"

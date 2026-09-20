@@ -6,8 +6,9 @@
 // hit costs no connection at all.
 //
 // Lives in the CACHES directory on purpose: every byte here is re-derivable from the host, so the
-// system is welcome to evict it under storage pressure. Entries are keyed by the SHA-256 of the
-// absolute URL, which covers both host-proxy paths and store CDN URLs without either colliding.
+// system is welcome to evict it under storage pressure. Entries are keyed by a caller-chosen
+// string hashed to a filename — the loader keys host art by pin+path (a re-addressed host keeps
+// its cache) and CDN art by URL.
 //
 // Deliberately free of any Network.framework / PunktfunkCore dependency, so it can be unit-tested
 // against a temporary directory.
@@ -45,26 +46,28 @@ actor ArtCache {
         return ArtCache(directory: caches.appendingPathComponent("PunktfunkArt", isDirectory: true))
     }
 
-    func data(for url: URL) -> Data? {
-        let file = path(for: url)
-        guard let data = try? Data(contentsOf: file) else { return nil }
+    func data(forKey key: String) -> Data? {
+        let file = path(forKey: key)
+        // Stat before reading: an expired entry is deleted unseen rather than paying a full
+        // read just to throw it away.
+        guard let modified = modificationDate(of: file) else { return nil }
         // Age out stale art rather than serving it forever.
-        if let modified = modificationDate(of: file), Date().timeIntervalSince(modified) > maxAge {
+        if Date().timeIntervalSince(modified) > maxAge {
             try? fileManager.removeItem(at: file)
             return nil
         }
+        guard let data = try? Data(contentsOf: file) else { return nil }
         // Touch, so eviction can order by last USE rather than last write.
         try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
         return data
     }
 
-    func store(_ data: Data, for url: URL) {
-        // An empty body is not art, and a `data:` URL is already inline — caching either is a
-        // pure loss.
-        guard !data.isEmpty, url.scheme?.lowercased() != "data" else { return }
+    func store(_ data: Data, forKey key: String) {
+        // An empty body is not art.
+        guard !data.isEmpty else { return }
         do {
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-            try data.write(to: path(for: url), options: .atomic)
+            try data.write(to: path(forKey: key), options: .atomic)
         } catch {
             return // a cache that can't write is a slow cache, not a broken app
         }
@@ -114,13 +117,8 @@ actor ArtCache {
         }
     }
 
-    /// Wipe the cache — for a "clear cached data" affordance, and for tests.
-    func clear() {
-        try? fileManager.removeItem(at: directory)
-    }
-
-    private func path(for url: URL) -> URL {
-        let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+    private func path(forKey key: String) -> URL {
+        let digest = SHA256.hash(data: Data(key.utf8))
         let name = digest.map { String(format: "%02x", $0) }.joined()
         return directory.appendingPathComponent(name, isDirectory: false)
     }

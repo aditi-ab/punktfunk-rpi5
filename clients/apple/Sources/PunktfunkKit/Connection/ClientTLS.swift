@@ -44,9 +44,27 @@ enum ClientTLS {
         return Data(base64Encoded: b64)
     }
 
-    /// Build a `SecIdentity` from the client's PEM cert + PKCS#8 P-256 key. Pairs them via the
-    /// Keychain (stored once under a stable tag, so repeat calls reuse it).
+    /// Built identities by PEM pair — a vended SecIdentity is immutable, so repeat calls reuse
+    /// the built pair instead of round-tripping the Keychain on every send. `lock` also
+    /// serialises the Keychain work in `buildIdentity`, so two builds can't interleave delete/add.
+    private static var built: [String: SecIdentity] = [:]
+    private static let lock = NSLock()
+
+    /// Build a `SecIdentity` from the client's PEM cert + PKCS#8 P-256 key, cached per PEM pair.
     static func makeIdentity(certPEM: String, keyPEM: String) throws -> SecIdentity {
+        let cacheKey = certPEM + "\u{0}" + keyPEM
+        return try lock.withLock {
+            if let hit = built[cacheKey] { return hit }
+            let identity = try buildIdentity(certPEM: certPEM, keyPEM: keyPEM)
+            built[cacheKey] = identity
+            return identity
+        }
+    }
+
+    /// Pair the PEM cert and key via the Keychain. Stored once under a stable tag/label — but
+    /// dropped and rewritten every call, since a regenerated identity must not keep presenting
+    /// a previous pair (`SecItemAdd` refuses to overwrite).
+    private static func buildIdentity(certPEM: String, keyPEM: String) throws -> SecIdentity {
         // Key: CryptoKit accepts the SEC1 or PKCS#8 PEM; its x963 form is what SecKey wants.
         let priv: P256.Signing.PrivateKey
         do {
@@ -71,10 +89,17 @@ enum ClientTLS {
         else { throw TLSError.badCert }
 
         let tag = Data("io.unom.punktfunk.library-client-key".utf8)
+        let certLabel = "io.unom.punktfunk.library-client-cert"
+        // The stored key and cert are derived artifacts — the PEM store is the durable state.
+        // Drop whatever a previous identity left, or a regenerated identity would keep vending
+        // pairs built from the OLD key while QUIC presents the new PEM: one device, two certs.
+        SecItemDelete([kSecClass: kSecClassKey, kSecAttrApplicationTag: tag] as CFDictionary)
+        SecItemDelete(
+            [kSecClass: kSecClassCertificate, kSecAttrLabel: certLabel] as CFDictionary)
 
         #if os(macOS)
         // The key must live in a Keychain for SecIdentityCreateWithCertificate to pair it with the
-        // cert. Add it under a stable tag; a duplicate just means a previous fetch already did.
+        // cert. Add it under a stable tag; the delete above makes a duplicate impossible.
         let add: [CFString: Any] = [
             kSecClass: kSecClassKey,
             kSecAttrApplicationTag: tag,
@@ -92,8 +117,8 @@ enum ClientTLS {
         }
         return identity
         #else
-        // Add the key (tagged) and the certificate (matched to it by public key) separately —
-        // a duplicate of either just means a previous fetch already added it.
+        // Add the key (tagged) and the certificate (labelled, matched to the key by public key)
+        // separately; the deletes above make a duplicate impossible.
         let addKey: [CFString: Any] = [
             kSecClass: kSecClassKey,
             kSecAttrApplicationTag: tag,
@@ -106,6 +131,7 @@ enum ClientTLS {
 
         let addCert: [CFString: Any] = [
             kSecClass: kSecClassCertificate,
+            kSecAttrLabel: certLabel,
             kSecValueRef: cert,
         ]
         let certStatus = SecItemAdd(addCert as CFDictionary, nil)
