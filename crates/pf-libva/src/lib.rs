@@ -319,11 +319,23 @@ pub struct Display {
 // `&mut NativeVaapiDecoder`, and that is the serialisation.
 unsafe impl Send for Display {}
 
+/// PCI vendor of a render node in Vulkan `vendorID` units. A platform or
+/// virtual GPU with no PCI vendor returns `None` and stays in the fallback set.
+fn node_vendor_id(node: &std::path::Path) -> Option<u32> {
+    let name = node.file_name()?.to_str()?;
+    let text = std::fs::read_to_string(format!("/sys/class/drm/{name}/device/vendor")).ok()?;
+    u32::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+}
+
 impl Display {
-    /// `PUNKTFUNK_VAAPI_DEVICE` pins a node; otherwise name order, first that
-    /// initialises wins. That GPU need not be the presenter's — a dmabuf across
-    /// GPUs fails or copies — so the pin is the escape hatch.
+    /// Open the first VAAPI render node in name order. The environment pin wins.
     pub fn open(va: Libva) -> Result<Display> {
+        Self::open_for_vendor(va, None)
+    }
+
+    /// `PUNKTFUNK_VAAPI_DEVICE` pins a node; otherwise nodes matching the
+    /// presenter's PCI vendor lead each name-ordered probe. Unknown nodes follow.
+    pub fn open_for_vendor(va: Libva, preferred_vendor: Option<u32>) -> Result<Display> {
         if let Some(pin) = std::env::var_os("PUNKTFUNK_VAAPI_DEVICE") {
             let path = pin.to_string_lossy().into_owned();
             let (display, node, version) = Display::probe(&va, &path)
@@ -347,6 +359,10 @@ impl Display {
             })
             .collect();
         nodes.sort();
+        // Stable partition: name order still decides inside each vendor group.
+        if let Some(want) = preferred_vendor {
+            nodes.sort_by_key(|node| node_vendor_id(node) != Some(want));
+        }
         let mut tried: Vec<String> = Vec::new();
         for node in &nodes {
             let path = node.to_string_lossy().into_owned();

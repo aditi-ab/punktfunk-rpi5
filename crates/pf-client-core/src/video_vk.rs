@@ -68,12 +68,15 @@ impl Drop for QueueLockGuard<'_> {
     }
 }
 
-/// The device the frame is presented from, so decode runs where the pixels are
-/// sampled — the VkImage is composited in place. Desktop fills this from the session
-/// presenter, Android from the JNI client's own swapchain.
+/// Selected presenter-device facts plus shared handles: the device the frame is
+/// presented from, so decode runs where the pixels are sampled — the VkImage is
+/// composited in place. Desktop fills this from the session presenter, Android
+/// from the JNI client's own swapchain.
 ///
-/// Plain integers: this crate has no ash. Handles stay valid for the owner's
-/// lifetime, which outlives every session pump.
+/// The bundle exists with or without Vulkan Video: `video_decode` gates that
+/// rung while vendor and import facts keep answering either way. Plain integers:
+/// this crate has no ash. Handles stay valid for the owner's lifetime, which
+/// outlives every session pump.
 #[derive(Clone)]
 pub struct VulkanDecodeDevice {
     /// `PFN_vkGetInstanceProcAddr` from the loader. Decode lanes resolve everything else through it.
@@ -101,7 +104,7 @@ pub struct VulkanDecodeDevice {
     pub f_timeline_semaphore: bool,
     pub f_synchronization2: bool,
     /// Vulkan Video decode is usable (queue + extensions + features). The bundle
-    /// exists without it (D3D11 interop); gate the Vulkan rung on this, not on `Some`.
+    /// exists without it; gate the Vulkan rung on this, not on `Some`.
     pub video_decode: bool,
     /// Real present timing (`VK_KHR_present_wait`). Gates `CLIENT_CAP_PHASE_LOCK`:
     /// without a latch stamp the desktop must not claim the cap.
@@ -122,6 +125,8 @@ pub struct VulkanDecodeDevice {
     pub queue_families: Vec<u32>,
     /// Presenter enabled win32 external-memory + keyed mutex. Always `false` off Windows.
     pub d3d11_import: bool,
+    /// Presenter enabled Linux dma-buf import. Always `false` off Linux.
+    pub dmabuf_import: bool,
     /// Presenter can import RGB10A2 and offers an HDR10 swapchain, so D3D11VA
     /// emits PQ pass-through instead of tonemapping to sRGB. Always `false` off Windows.
     pub d3d11_hdr10: bool,
@@ -137,15 +142,17 @@ pub struct VulkanDecodeDevice {
     pub queue_lock: std::sync::Arc<QueueLock>,
 }
 
+/// PCI vendor ids `vendor_id` reports.
+pub(crate) const VENDOR_NVIDIA: u32 = 0x10DE;
+pub(crate) const VENDOR_AMD: u32 = 0x1002;
+
 impl VulkanDecodeDevice {
     /// Should `auto` try Vulkan Video before VAAPI / D3D11VA on this device?
     ///
     /// NVIDIA and AMD: yes. NVIDIA has no usable VAAPI; VanGogh VAAPI chroma-fringes.
-    /// A Vulkan streak demotes to the platform rung, not software. Intel/unknown
-    /// take VAAPI or D3D11VA first (ANV is the least-proven Mesa path).
+    /// This orders attempts only: later admission may skip the platform rung
+    /// (NVIDIA VAAPI is barred from auto). Intel/unknown try the platform rung first.
     pub fn prefer_vulkan_first(&self) -> bool {
-        const VENDOR_NVIDIA: u32 = 0x10DE;
-        const VENDOR_AMD: u32 = 0x1002;
         self.vendor_id == VENDOR_NVIDIA || self.vendor_id == VENDOR_AMD
     }
 }
