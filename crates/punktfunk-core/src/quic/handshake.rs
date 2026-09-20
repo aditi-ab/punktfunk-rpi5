@@ -168,6 +168,7 @@ pub const EXT_ABR_ACK_REASON: u8 = 0x01;
 /// `Start`'s six frozen bytes and nothing else, so it never learns the ABR features and
 /// never lengthens an ack — today's behaviour, reached by never being told. An empty label
 /// says nothing rather than saying nothing at length.
+#[cfg(any(feature = "quic", test))]
 pub(crate) fn start_ext<'a>(host_caps2: u8, label: &'a str, abr: &'a [u8]) -> Vec<(u16, &'a [u8])> {
     if host_caps2 & super::HOST_CAP2_EXT == 0 {
         return Vec::new();

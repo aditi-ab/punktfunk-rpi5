@@ -1210,21 +1210,6 @@ mod session_main {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::resolve_hdr_enabled;
-
-    // The stored preference cannot advertise HDR through an SDR Windows output.
-    // Presentation support remains a separate required device fact.
-    #[test]
-    fn hdr_requires_the_setting_output_and_presenter() {
-        assert!(resolve_hdr_enabled(true, true, || true));
-        assert!(!resolve_hdr_enabled(false, true, || panic!()));
-        assert!(!resolve_hdr_enabled(true, false, || panic!()));
-        assert!(!resolve_hdr_enabled(true, true, || false));
-    }
-}
-
 #[cfg(any(target_os = "linux", windows))]
 fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(session_main::run())
@@ -1238,4 +1223,19 @@ fn main() {
         "punktfunk-session runs on Linux and Windows — the macOS client lives in clients/apple"
     );
     std::process::exit(2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_hdr_enabled;
+
+    // The stored preference cannot advertise HDR through an SDR Windows output.
+    // Presentation support remains a separate required device fact.
+    #[test]
+    fn hdr_requires_the_setting_output_and_presenter() {
+        assert!(resolve_hdr_enabled(true, true, || true));
+        assert!(!resolve_hdr_enabled(false, true, || panic!()));
+        assert!(!resolve_hdr_enabled(true, false, || panic!()));
+        assert!(!resolve_hdr_enabled(true, true, || false));
+    }
 }
