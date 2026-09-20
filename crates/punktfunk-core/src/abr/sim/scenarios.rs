@@ -1390,7 +1390,7 @@ mod tests {
     fn the_bring_up_ramp_measures_each_link_and_stops() {
         // Scenario · wall · steps · rates asked · payload KB · ms.
         for (sc, wall, steps, first, last, max_kb, max_ms) in [
-            (with_ramp(lan_1g()), false, 9, 5_000, 1_066_423, 7_200, 900),
+            (with_ramp(lan_1g()), false, 9, 5_000, 1_066_423, 7_400, 900),
             (
                 with_ramp(wan_wg_12(0x7A_5500, 180_000)),
                 true,

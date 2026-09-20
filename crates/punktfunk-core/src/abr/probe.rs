@@ -34,9 +34,11 @@ const RAMP_STEP_MS: u32 = 25;
 /// The ramp's first rate. Under the controller's floor there is nothing worth
 /// measuring.
 const RAMP_START_KBPS: u32 = 5_000;
-/// A step is capped in bytes as well as in time: 25 ms at 2 Gbps is 6 MB, and
-/// a step the application cannot drain measures the receive buffer.
-const RAMP_STEP_BYTES: u64 = 3_000_000;
+/// A step is capped in bytes as well as in time: 25 ms at 5.1 Gbps is 16 MB,
+/// and a step the application cannot drain measures the receive buffer.
+/// Multi-gigabit steps keep ~20 ms windows instead of shrinking to a few
+/// milliseconds, where fixed scheduling jitter reads as a wall.
+const RAMP_STEP_BYTES: u64 = 16_000_000;
 /// Delivered ÷ offered under this is a wall.
 const RAMP_WALL_PCT: u64 = 90;
 /// Loss a refused step may carry and still be asked a second time. At the
@@ -1498,8 +1500,12 @@ mod tests {
     #[test]
     fn a_step_is_capped_in_bytes_as_well_as_time() {
         assert_eq!(step_ms(5_000), RAMP_STEP_MS);
-        assert_eq!(step_ms(960_000), RAMP_STEP_MS, "3 MB is 25 ms at 960 Mbps");
-        assert_eq!(step_ms(2_000_000), 12);
+        assert_eq!(
+            step_ms(5_120_000),
+            RAMP_STEP_MS,
+            "16 MB is 25 ms at 5.12 Gbps"
+        );
+        assert_eq!(step_ms(8_000_000), 16);
         for kbps in [5_000u32, 100_000, 960_000, 2_000_000, 8_000_000] {
             let bytes = u64::from(kbps) * u64::from(step_ms(kbps)) / 8;
             assert!(bytes <= RAMP_STEP_BYTES, "{kbps} kbps sends {bytes} bytes");
