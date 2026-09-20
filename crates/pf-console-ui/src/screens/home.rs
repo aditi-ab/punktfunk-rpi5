@@ -33,6 +33,16 @@ const ADD_KEY: &str = "\0add";
 /// Sentinel for the trailing Rescan tile; same `\0` prefix as [`ADD_KEY`].
 const SCAN_KEY: &str = "\0scan";
 
+/// The offscreen a tile needs: reduced rendering keeps only the entrance fade. Once mounted,
+/// its veil and scale carry depth without rerasterizing the card through a colour-filter layer.
+fn tile_layer(reduced: bool, entrance: f64, alpha: f64, recede: f64) -> Option<(f32, bool)> {
+    if reduced {
+        (entrance < 0.999).then_some((entrance as f32, false))
+    } else {
+        (alpha < 0.999 || recede > 0.001).then_some((alpha as f32, recede > 0.001))
+    }
+}
+
 /// Do not use `hosts.get(i)`: `None` is both trailing actions.
 enum Slot<'h> {
     Host(&'h HostRow),
@@ -323,6 +333,7 @@ impl HomeScreen {
         ctx: &mut Ctx,
     ) {
         self.reconcile(ctx.hosts);
+        let reduced = super::settings::reduce_ui_res(ctx.settings, ctx.platform, ctx.fallback_ui);
         self.anim
             .step(f64::from(self.cursor), SPRING_K, SPRING_C, dt);
         self.anim.settle(f64::from(self.cursor), 0.001, 0.01);
@@ -390,15 +401,14 @@ impl HomeScreen {
             canvas.translate((cx as f32, cy as f32));
             canvas.scale((scale as f32, scale as f32));
             canvas.translate((-cx as f32, -cy as f32));
-            // Bounded save_layer only when alpha or recede is not identity.
-            // Unbounded allocates a surface-sized offscreen. 36k = halo (outset 4k,
-            // sigma 10k) + 10k shadow drop; clip to the tile and both vanish.
+            // Rich tiles isolate alpha/recede and blur focus marks. The reduced path keeps the
+            // entrance layer only; live card motion remains direct geometry on the main target.
             let recede = 1.0 - f;
-            let layered = alpha < 0.999 || recede > 0.001;
-            if layered {
+            let layer = tile_layer(reduced, ent.fade, alpha, recede);
+            if let Some((layer_alpha, filter_recede)) = layer {
                 let mut lp = crate::theme::layer();
-                lp.set_alpha_f(alpha as f32);
-                if recede > 0.001 {
+                lp.set_alpha_f(layer_alpha);
+                if filter_recede {
                     lp.set_color_filter(skia_safe::color_filters::matrix_row_major(
                         &crate::theme::recede_matrix(recede),
                         None,
@@ -411,32 +421,38 @@ impl HomeScreen {
                         .paint(&lp),
                 );
             }
-            // Focus glow under the shadow: a 12% scale step does not read at couch distance.
-            crate::theme::focus_halo(canvas, tile, TILE_CORNER as f32, k as f32, f as f32);
-            if f > 0.4 {
-                crate::theme::drop_shadow(
-                    canvas,
-                    tile,
-                    TILE_CORNER as f32,
-                    k as f32,
-                    0.45 * f as f32,
-                );
+            if !reduced {
+                crate::theme::focus_halo(canvas, tile, TILE_CORNER as f32, k as f32, f as f32);
+                if f > 0.4 {
+                    crate::theme::drop_shadow(
+                        canvas,
+                        tile,
+                        TILE_CORNER as f32,
+                        k as f32,
+                        0.45 * f as f32,
+                    );
+                }
             }
             match slot_at(i, ctx.hosts) {
                 Slot::Host(h) => draw_host_tile(canvas, fonts, h, tile, k, ctx.t),
                 Slot::AddHost => draw_action_tile(canvas, fonts, tile, k, ActionTile::AddHost),
                 Slot::Rescan => draw_action_tile(canvas, fonts, tile, k, ActionTile::Rescan),
             }
-            // Scrim veil, not black: a pale palette recedes the same way the colour
-            // matrix does.
+            // The cheap path leans harder on the veil because it omits the recede matrix.
             if f < 1.0 {
-                let veil = (1.0 - f) as f32 * 0.07;
+                let veil = (1.0 - f) as f32 * if reduced { 0.16 } else { 0.07 };
                 canvas.draw_rrect(
                     RRect::new_rect_xy(tile, (TILE_CORNER * k) as f32, (TILE_CORNER * k) as f32),
                     &fill(crate::theme::shade(veil)),
                 );
             }
-            if layered {
+            if reduced && f > 0.01 {
+                canvas.draw_rrect(
+                    RRect::new_rect_xy(tile, (TILE_CORNER * k) as f32, (TILE_CORNER * k) as f32),
+                    &stroke(accent(0.55 * f as f32), (2.0 * k) as f32),
+                );
+            }
+            if layer.is_some() {
                 canvas.restore();
             }
             canvas.restore();
@@ -807,6 +823,14 @@ fn draw_lock(canvas: &Canvas, x: f64, y: f64, k: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reduced_tiles_layer_only_for_the_entrance() {
+        assert_eq!(tile_layer(true, 1.0, 0.78, 1.0), None);
+        assert_eq!(tile_layer(true, 0.5, 0.39, 1.0), Some((0.5, false)));
+        assert_eq!(tile_layer(false, 1.0, 0.78, 1.0), Some((0.78, true)));
+        assert_eq!(tile_layer(false, 1.0, 1.0, 0.0), None);
+    }
 
     fn host(key: &str, paired: bool, online: bool, can_wake: bool) -> HostRow {
         HostRow {
