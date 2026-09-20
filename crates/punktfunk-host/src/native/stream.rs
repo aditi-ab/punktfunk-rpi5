@@ -463,7 +463,11 @@ pub(super) struct SessionContext {
     pub(super) reconfig_result_tx: tokio::sync::mpsc::UnboundedSender<Reconfigured>,
     pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
     pub(super) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    /// The FEC the packetizer runs at. The send loop reads this one only.
     pub(super) fec_target: Arc<AtomicU8>,
+    /// The control task's adaptive-FEC proposal. `StreamState` publishes it to
+    /// `fec_target` once the encoder accepts the rate the proposal implies.
+    pub(super) fec_requested: Arc<AtomicU8>,
     pub(super) conn: super::link::SessionLink,
     pub(super) timing_conn: Option<super::link::SessionLink>,
     pub(super) phase: Arc<PhaseCtl>,

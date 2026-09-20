@@ -173,7 +173,10 @@ pub(super) struct StreamState {
     pub(super) resize_ms: Arc<AtomicU32>,
     pub(super) stats: Arc<StatsRecorder>,
     pub(super) phase: Arc<PhaseCtl>,
+    /// Applied FEC: what the packetizer and [`Self::enc_now`] run at.
     pub(super) fec_target: Arc<AtomicU8>,
+    /// Control task's proposal; applied only after the encoder takes its rate.
+    pub(super) fec_requested: Arc<AtomicU8>,
     pub(super) live_bitrate: Arc<AtomicU32>,
     pub(super) encoder_ceiling: Arc<std::sync::Mutex<super::EncoderCeiling>>,
     pub(super) cadence_degraded: Arc<AtomicBool>,
@@ -319,6 +322,9 @@ impl StreamState {
         }
         plan.reframe_to = ctx.reframe_to;
         tracing::info!(?plan, "resolved session plan");
+        // Automatic PyroWave: the client's ramp closes with one lower pin, so
+        // the window lingers past pipeline-ready for it to cross.
+        let fit_pin = ctx.bitrate_auto && ctx.codec == crate::encode::Codec::PyroWave;
         let SessionContext {
             session: punched_session,
             mode,
@@ -354,6 +360,7 @@ impl StreamState {
             retarget_tx,
             gap_tx,
             fec_target,
+            fec_requested,
             conn,
             timing_conn,
             phase,
@@ -398,6 +405,7 @@ impl StreamState {
             probe_seq,
             stop.clone(),
             ramp_open,
+            fit_pin,
         );
         // Stamp before the display exists: a reading after launch would reject the process it is meant to find.
         let fresh_stamp = crate::gamelease::launch_clock();
@@ -968,6 +976,7 @@ impl StreamState {
             stats,
             phase,
             fec_target: fec_target.clone(),
+            fec_requested: fec_requested.clone(),
             live_bitrate,
             encoder_ceiling,
             cadence_degraded,

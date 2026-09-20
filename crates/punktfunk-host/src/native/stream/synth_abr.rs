@@ -207,6 +207,9 @@ pub(crate) struct SynthAbrContext {
     pub(crate) bringup_delay: std::time::Duration,
     /// The ramp window's flag, cleared on hand-over.
     pub(crate) ramp_open: Arc<AtomicBool>,
+    /// Automatic PyroWave: the client's ramp closes with one lower pin, so the
+    /// window lingers a bounded grace past the fake bring-up for it to cross.
+    pub(crate) fit_pin: bool,
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) counters: Arc<crate::session_status::SessionCounters>,
     pub(crate) keyframe: std::sync::mpsc::Receiver<()>,
@@ -255,6 +258,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         idr_pct,
         bringup_delay,
         ramp_open,
+        fit_pin,
         stop,
         counters,
         keyframe,
@@ -299,6 +303,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         probe_seq,
         stop.clone(),
         ramp_open,
+        fit_pin,
     );
     let build_until = std::time::Instant::now() + bringup_delay;
     while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < build_until {

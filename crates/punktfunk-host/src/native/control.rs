@@ -86,7 +86,7 @@ fn delivery_share(
     );
     counters
         .share
-        .publish(automatic, offered, delivered, streaming);
+        .publish(now, automatic, offered, delivered, streaming);
     let id = counters.link.session_id();
     (id != 0)
         .then(|| crate::session_status::share_for(id, clocks.take(now)))
@@ -177,7 +177,11 @@ pub(super) struct Task {
     pub(super) cadence_behind_score: Arc<AtomicU32>,
     /// `u32::MAX` is the pre-seed: an old client never sent a `DeliveryReport`.
     pub(super) client_packets_received: Arc<AtomicU32>,
-    pub(super) fec_target_ctl: Arc<AtomicU8>,
+    /// FEC in force: what the packetizer runs. Read here; only the stream loop writes.
+    pub(super) fec_target: Arc<AtomicU8>,
+    /// This task's adaptive-FEC proposals. The stream loop publishes them to
+    /// `fec_target` once the encoder accepts the rate the proposal implies.
+    pub(super) fec_requested: Arc<AtomicU8>,
     /// Encode loop drains at its own cadence (`design/phase-locked-capture.md`).
     pub(super) phase_ctl: Arc<super::stream::PhaseCtl>,
     pub(super) reconfig_tx: std::sync::mpsc::Sender<punktfunk_core::Mode>,
@@ -254,7 +258,8 @@ pub(super) async fn run(task: Task) {
         cadence_degraded,
         cadence_behind_score,
         client_packets_received,
-        fec_target_ctl,
+        fec_target,
+        fec_requested,
         phase_ctl,
         reconfig_tx,
         keyframe_tx,
@@ -438,14 +443,16 @@ pub(super) async fn run(task: Task) {
                     let unrecovered_run = unrecovered.report(std::time::Instant::now());
                     link.note_loss(rep.loss_ppm, unrecovered_run);
                     link.sample_bands(
-                        fec_target_ctl.load(Ordering::Relaxed),
+                        fec_target.load(Ordering::Relaxed),
                         live_bitrate.load(Ordering::Relaxed),
                     );
-                    // Data-plane send loop applies `fec_target_ctl` per frame.
+                    // The proposal lands on `fec_requested`; the stream loop
+                    // publishes it to `fec_target` (what the send loop reads per
+                    // frame) once the encoder accepts the matching rate.
                     // No-op when FEC is pinned (`PUNKTFUNK_FEC_PCT`).
                     if adaptive_fec {
-                        let prev = fec_target_ctl.load(Ordering::Relaxed);
-                        let target = fec_target(
+                        let prev = fec_target.load(Ordering::Relaxed);
+                        let target = punktfunk_core::abr::budget::fec_target(
                             rep.loss_ppm,
                             prev,
                             unrecovered_run,
@@ -462,7 +469,7 @@ pub(super) async fn run(task: Task) {
                             },
                             &mut fec_horizon,
                         );
-                        fec_target_ctl.store(target, Ordering::Relaxed);
+                        fec_requested.store(target, Ordering::Release);
                         if prev != target {
                             tracing::debug!(
                                 loss_ppm = rep.loss_ppm,
@@ -780,7 +787,7 @@ pub(super) async fn run(task: Task) {
                 }
             }
             _ = link_tick.tick() => {
-                emit_link(&mut link, &counters, &fec_target_ctl, &live_bitrate, &stats, peer);
+                emit_link(&mut link, &counters, &fec_target, &live_bitrate, &stats, peer);
             }
             correction = reconfig_result_rx.recv() => {
                 // Mode actually live after a failed rebuild or a refresh the
@@ -798,7 +805,7 @@ pub(super) async fn run(task: Task) {
     emit_link(
         &mut link,
         &counters,
-        &fec_target_ctl,
+        &fec_target,
         &live_bitrate,
         &stats,
         peer,
@@ -812,14 +819,14 @@ pub(super) async fn run(task: Task) {
 fn emit_link(
     link: &mut crate::link_health::LinkWindow,
     counters: &crate::session_status::SessionCounters,
-    fec_target_ctl: &AtomicU8,
+    fec_target: &AtomicU8,
     live_bitrate: &AtomicU32,
     stats: &crate::stats_recorder::StatsRecorder,
     peer: std::net::IpAddr,
 ) {
     let m = link.close(
         &counters.link,
-        fec_target_ctl.load(Ordering::Relaxed),
+        fec_target.load(Ordering::Relaxed),
         live_bitrate.load(Ordering::Relaxed),
     );
     crate::link_health::emit(&m, peer);

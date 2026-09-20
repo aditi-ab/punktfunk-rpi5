@@ -16,6 +16,14 @@ use super::*;
 /// task's spacing can cost.
 pub(crate) const RAMP_STEP_MAX_MS: u32 = 50;
 
+/// Quiet window after the last served result during which a fit server's
+/// `ramp_open` stays true, so an Automatic PyroWave client's one lower pin
+/// can still cross the control stream.
+const PIN_FIT_IDLE_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+/// Hard bound on the grace: counted from when `serve` first observes the
+/// pipeline ready, so a client cannot delay video indefinitely.
+const PIN_FIT_MAX_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The ramp window, serving until [`finish`](RampServer::finish) takes the
 /// session back. Dropping it instead ends the window and lets both go.
 pub(super) struct RampServer {
@@ -32,7 +40,9 @@ impl RampServer {
     /// Take the session for the bring-up gap. `open` is the flag the control
     /// task reads to let ramp steps past its one-per-10 s spacing; it is
     /// cleared on hand-over, because from then on the send loop owns the
-    /// session and video is about to leave.
+    /// session and video is about to leave. `fit_pin` keeps `open` true a
+    /// bounded grace past pipeline-ready: an Automatic PyroWave client's one
+    /// lower pin must still read the ramp as open.
     pub(super) fn start(
         session: Session,
         probe_rx: ProbeReceiver,
@@ -40,6 +50,7 @@ impl RampServer {
         probe_seq: bool,
         stop: Arc<AtomicBool>,
         open: Arc<AtomicBool>,
+        fit_pin: bool,
     ) -> Self {
         // A client whose reassembler cannot window probe frames has no ramp to
         // serve, and the spawn is pure cost.
@@ -57,7 +68,18 @@ impl RampServer {
             .name("punktfunk-ramp".into())
             .spawn({
                 let done = done.clone();
-                move || serve(session, probe_rx, &probe_result_tx, &done, &stop)
+                let open = open.clone();
+                move || {
+                    serve(
+                        session,
+                        probe_rx,
+                        &probe_result_tx,
+                        &done,
+                        &stop,
+                        &open,
+                        fit_pin,
+                    )
+                }
             })
             .map_err(|e| tracing::warn!(error = %e, "bring-up ramp thread not started"))
             .ok();
@@ -73,21 +95,24 @@ impl RampServer {
     }
 
     /// The pipeline is ready: finish the step in flight, join, and give the
-    /// session back for the send thread.
+    /// session back for the send thread. `open` stays true until the thread is
+    /// joined, so a fit server's grace still reads the ramp as open.
     pub(super) fn finish(mut self) -> (Session, ProbeReceiver) {
-        self.open.store(false, Ordering::SeqCst);
         self.done.store(true, Ordering::SeqCst);
-        if let Some(t) = self.thread.take() {
+        let pair = if let Some(t) = self.thread.take() {
             match t.join() {
-                Ok(pair) => return pair,
+                Ok(pair) => pair,
                 // The session went with it. Nothing below can stream, and the
                 // caller's `?` is the honest end.
                 Err(_) => panic!("the bring-up ramp thread panicked"),
             }
-        }
-        self.idle
-            .take()
-            .expect("a server with no thread holds both")
+        } else {
+            self.idle
+                .take()
+                .expect("a server with no thread holds both")
+        };
+        self.open.store(false, Ordering::SeqCst);
+        pair
     }
 }
 
@@ -104,35 +129,67 @@ impl Drop for RampServer {
 }
 
 /// Serve requests until the pipeline is ready. One burst at a time, each
-/// clamped to [`RAMP_STEP_MAX_MS`], so the hand-over never waits long.
+/// clamped to [`RAMP_STEP_MAX_MS`], so the hand-over never waits long. A fit
+/// server then lingers: `open` cleared by `Drop` cancels at once, but
+/// `finish` lets queued requests — and the client's closing pin — through
+/// for [`PIN_FIT_IDLE_GRACE`] after the last result, bounded by
+/// [`PIN_FIT_MAX_GRACE`] from first ready.
 fn serve(
     mut session: Session,
     probe_rx: ProbeReceiver,
     probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     done: &AtomicBool,
     stop: &AtomicBool,
+    open: &AtomicBool,
+    fit_pin: bool,
 ) -> (Session, ProbeReceiver) {
     let mut served = 0u32;
-    while !done.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
-        let Ok(req) = probe_rx.recv_timeout(std::time::Duration::from_millis(2)) else {
-            continue; // timeout, or the control task is gone — the loop's own flags end it
-        };
-        let req = ProbeRequest {
-            duration_ms: req.duration_ms.min(RAMP_STEP_MAX_MS),
-            ..req
-        };
-        let result = match ProbeBurst::begin(req, true) {
-            Some(mut burst) => {
-                while !burst.expired() && !stop.load(Ordering::SeqCst) {
-                    burst.pump(&mut session);
-                    std::thread::sleep(burst.next_due().min(std::time::Duration::from_micros(200)));
-                }
-                served += 1;
-                burst.finish()
+    let mut ready_at: Option<std::time::Instant> = None;
+    let mut quiet_since: Option<std::time::Instant> = None;
+    loop {
+        if stop.load(Ordering::SeqCst) || !open.load(Ordering::SeqCst) {
+            break;
+        }
+        if done.load(Ordering::SeqCst) {
+            let now = std::time::Instant::now();
+            let ready = *ready_at.get_or_insert(now);
+            let quiet = *quiet_since.get_or_insert(now);
+            if !fit_pin
+                || now.duration_since(quiet) >= PIN_FIT_IDLE_GRACE
+                || now.duration_since(ready) >= PIN_FIT_MAX_GRACE
+            {
+                break;
             }
-            None => declined(),
-        };
-        let _ = probe_result_tx.send(result);
+        }
+        match probe_rx.recv_timeout(std::time::Duration::from_millis(2)) {
+            Ok(req) => {
+                quiet_since = None;
+                let req = ProbeRequest {
+                    duration_ms: req.duration_ms.min(RAMP_STEP_MAX_MS),
+                    ..req
+                };
+                let result = match ProbeBurst::begin(req, true) {
+                    Some(mut burst) => {
+                        while !burst.expired() && !stop.load(Ordering::SeqCst) {
+                            burst.pump(&mut session);
+                            std::thread::sleep(
+                                burst.next_due().min(std::time::Duration::from_micros(200)),
+                            );
+                        }
+                        served += 1;
+                        burst.finish()
+                    }
+                    None => declined(),
+                };
+                let _ = probe_result_tx.send(result);
+                if done.load(Ordering::SeqCst) {
+                    quiet_since = Some(std::time::Instant::now());
+                }
+            }
+            // The control task going away ends the loop the same as its flags.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
     if served > 0 {
         tracing::info!(
@@ -171,6 +228,7 @@ mod tests {
             true,
             Arc::new(AtomicBool::new(false)),
             open.clone(),
+            false,
         );
         for target_kbps in [5_000, 10_000] {
             req_tx
@@ -221,6 +279,7 @@ mod tests {
             true,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(true)),
+            false,
         );
         req_tx
             .send(ProbeRequest {
@@ -258,6 +317,7 @@ mod tests {
             true,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(true)),
+            false,
         );
         let (session, _rx) = ramp.finish();
         let took = started.elapsed();
@@ -280,6 +340,7 @@ mod tests {
             false,
             Arc::new(AtomicBool::new(false)),
             open.clone(),
+            false,
         );
         assert!(!open.load(Ordering::SeqCst));
         let (session, _rx) = ramp.finish();
@@ -301,6 +362,7 @@ mod tests {
             true,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(true)),
+            false,
         );
         req_tx
             .send(ProbeRequest {
@@ -321,5 +383,109 @@ mod tests {
         };
         let _ = ramp.finish();
         assert!(r.duration_ms <= 2 * RAMP_STEP_MAX_MS, "{r:?}");
+    }
+
+    /// A fit server whose pipeline reports ready mid-step keeps `open` and
+    /// keeps serving through the idle grace: the client's closing pin — the
+    /// last request the window answers — still reaches the result channel.
+    #[test]
+    fn a_fit_server_keeps_the_window_open_for_the_closing_pin() {
+        let (_client, session) = loopback_host();
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel();
+        let open = Arc::new(AtomicBool::new(true));
+        let ramp = RampServer::start(
+            session,
+            req_rx,
+            res_tx,
+            true,
+            Arc::new(AtomicBool::new(false)),
+            open.clone(),
+            true,
+        );
+        req_tx
+            .send(ProbeRequest {
+                target_kbps: 20_000,
+                duration_ms: 25,
+            })
+            .expect("the server is listening");
+        // The pipeline reports ready while the step is in flight: `finish`
+        // blocks on the grace, so it goes on its own thread.
+        let finishing = std::thread::spawn(move || ramp.finish());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            open.load(Ordering::SeqCst),
+            "ready mid-step still leaves the window open for the closing pin"
+        );
+        req_tx
+            .send(ProbeRequest {
+                target_kbps: 40_000,
+                duration_ms: 25,
+            })
+            .expect("the grace still serves");
+        let (session, _rx) = finishing.join().expect("finish returns");
+        assert!(!open.load(Ordering::SeqCst));
+        assert!(session.stats().packets_sent > 0);
+        let mut results = Vec::new();
+        while let Ok(r) = res_rx.try_recv() {
+            results.push(r);
+        }
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(
+            results.iter().all(|r| r.bytes_sent > 0),
+            "both steps delivered bytes: {results:?}"
+        );
+    }
+
+    /// The fit grace is bounded: with nothing left to serve, `finish` waits
+    /// the idle grace and never the whole budget a stall could spend.
+    #[test]
+    fn a_fit_servers_grace_is_idle_bounded() {
+        let (_client, session) = loopback_host();
+        let (_req_tx, req_rx) = std::sync::mpsc::channel();
+        let (res_tx, _res_rx) = tokio::sync::mpsc::unbounded_channel();
+        let open = Arc::new(AtomicBool::new(true));
+        let ramp = RampServer::start(
+            session,
+            req_rx,
+            res_tx,
+            true,
+            Arc::new(AtomicBool::new(false)),
+            open.clone(),
+            true,
+        );
+        let started = std::time::Instant::now();
+        let (_session, _rx) = ramp.finish();
+        let took = started.elapsed();
+        assert!(
+            took >= std::time::Duration::from_millis(70),
+            "took {took:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "took {took:?}"
+        );
+        assert!(!open.load(Ordering::SeqCst));
+    }
+
+    /// Dropping a fit server is an early teardown: clearing `open` cancels
+    /// the grace, so the drop does not wait it out.
+    #[test]
+    fn dropping_a_fit_server_cancels_the_grace() {
+        let (_client, session) = loopback_host();
+        let (_req_tx, req_rx) = std::sync::mpsc::channel();
+        let (res_tx, _res_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ramp = RampServer::start(
+            session,
+            req_rx,
+            res_tx,
+            true,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            true,
+        );
+        let started = std::time::Instant::now();
+        drop(ramp);
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
     }
 }

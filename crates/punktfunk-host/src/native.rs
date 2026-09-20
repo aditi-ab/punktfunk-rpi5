@@ -15,8 +15,7 @@ use anyhow::{anyhow, Context, Result};
 // The wire budget, adaptive FEC and their band: one arithmetic, shared with
 // the client's controller and the link simulator.
 use punktfunk_core::abr::budget::{
-    budget_kbps_for_encoder, encoder_kbps_for_budget, fec_target, FEC_ADAPTIVE_START,
-    MIN_BITRATE_KBPS,
+    budget_kbps_for_encoder, encoder_kbps_for_budget, FEC_ADAPTIVE_START, MIN_BITRATE_KBPS,
 };
 use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Role};
 use punktfunk_core::input::{InputEvent, InputKind};
@@ -1095,6 +1094,18 @@ fn fec_static_override() -> Option<u8> {
         .map(|p| p.min(90))
 }
 
+/// Whether this source adapts FEC: only sources that can keep encoder and packetizer
+/// FEC in one wire budget. Synthetic-abr derives frame bytes from FEC every frame;
+/// the virtual path publishes a proposal only after its encoder accepts the matching
+/// rate. Fixed synthetic and the standalone software source have no retarget path.
+fn adaptive_fec_for(source: Punktfunk1Source, static_override: bool) -> bool {
+    !static_override
+        && matches!(
+            source,
+            Punktfunk1Source::SyntheticAbr(_) | Punktfunk1Source::Virtual
+        )
+}
+
 /// Consecutive report windows an RFI ask landed in — frames parity could not repair. The
 /// client sends no [`LossReport`] for a window it discards (probe tail, host pipeline gap),
 /// so a report a window late says the asks before it belong to a window nobody may price.
@@ -1673,10 +1684,19 @@ pub(crate) async fn run_admitted(
     // `true` = client draws (exclude + forward), `false` = host composites. Starts true.
     let cursor_client_draws = Arc::new(AtomicBool::new(true));
     let cursor_client_draws_dp = cursor_client_draws.clone();
-    // Control task publishes LossReport → recovery %; send loop applies per frame. Seeded no-op.
-    let adaptive_fec = fec_static_override().is_none();
+    // Only sources that can keep encoder and packetizer FEC in one wire budget adapt it.
+    // Synthetic-abr derives frame bytes from FEC every frame; the virtual path publishes
+    // a proposal only after its encoder accepts the matching rate. Fixed synthetic and
+    // the standalone software source have no coordinated retarget path.
+    let adaptive_fec = adaptive_fec_for(source, fec_static_override().is_some());
+    // A proposal lands on `fec_requested`; the stream loop publishes it to `fec_target`
+    // only after the encoder accepts the matching rate. Synthetic-abr aliases the pair:
+    // it re-derives frame bytes from FEC every frame and has no retarget to coordinate.
     let fec_target = Arc::new(AtomicU8::new(welcome.fec.fec_percent));
-    let fec_target_ctl = fec_target.clone();
+    let fec_requested = match source {
+        Punktfunk1Source::SyntheticAbr(_) => fec_target.clone(),
+        _ => Arc::new(AtomicU8::new(welcome.fec.fec_percent)),
+    };
     // PhaseReports from the control task; encode loop drains. Inert until a vsync-aware client.
     let phase_ctl = Arc::new(stream::PhaseCtl::new());
     let phase_ctl_control = phase_ctl.clone();
@@ -1766,7 +1786,8 @@ pub(crate) async fn run_admitted(
         cadence_degraded: cadence_degraded.clone(),
         cadence_behind_score: cadence_behind_score.clone(),
         client_packets_received: client_packets_received_ctl,
-        fec_target_ctl,
+        fec_target: fec_target.clone(),
+        fec_requested: fec_requested.clone(),
         phase_ctl: phase_ctl_control,
         reconfig_tx,
         keyframe_tx,
@@ -2296,6 +2317,7 @@ pub(crate) async fn run_admitted(
     // Client HDR volume for EDID + 0xCE. `None` = older client / no HDR → built-in defaults.
     let client_hdr = hello.display_hdr.map(crate::encode::hdr_meta_from_wire);
     let fec_target_dp = fec_target.clone();
+    let fec_requested_dp = fec_requested.clone();
     let conn_stream = conn.clone();
     // 0xCF host-timing only if the client advertised the cap; older clients get no extra datagrams.
     let timing_conn =
@@ -2448,6 +2470,7 @@ pub(crate) async fn run_admitted(
                     idr_pct: shape.idr_pct,
                     bringup_delay: shape.bringup,
                     ramp_open,
+                    fit_pin: hello.bitrate_kbps == 0 && codec == crate::encode::Codec::PyroWave,
                     stop: stop_stream,
                     counters: counters_stream,
                     keyframe: keyframe_rx,
@@ -2517,6 +2540,7 @@ pub(crate) async fn run_admitted(
                         retarget_tx,
                         gap_tx,
                         fec_target: fec_target_dp,
+                        fec_requested: fec_requested_dp,
                         phase: phase_ctl,
                         conn: conn_stream,
                         timing_conn,
@@ -2735,6 +2759,37 @@ mod tests {
         assert!(seat.ends_with("seats/cafe0123"), "{}", seat.display());
         assert_eq!(seat_home_for(Some("cafe0123"), false), None, "knob off");
         assert_eq!(seat_home_for(None, true), None, "anon<seq> has no identity");
+    }
+
+    /// Adaptive FEC is offered only to a source that can keep encoder and packetizer
+    /// on one wire budget: a proposal a source cannot apply would be accepted work
+    /// that never reaches the wire.
+    #[test]
+    fn adaptive_fec_only_for_sources_with_a_coordinated_retarget() {
+        let abr = Punktfunk1Source::SyntheticAbr(SynthAbrShape {
+            content: Content::Steady { fill_pct: 100 },
+            recovery: std::time::Duration::ZERO,
+            answer: KeyframeAnswer::Idr,
+            idr_pct: DEFAULT_IDR_PCT,
+            bringup: std::time::Duration::ZERO,
+            serve_ramp: false,
+        });
+        for (source, want) in [
+            (Punktfunk1Source::Synthetic, false),
+            (Punktfunk1Source::Software, false),
+            (abr, true),
+            (Punktfunk1Source::Virtual, true),
+        ] {
+            assert_eq!(
+                adaptive_fec_for(source, false),
+                want,
+                "static override unset: {source:?}"
+            );
+            assert!(
+                !adaptive_fec_for(source, true),
+                "a pinned FEC adapts nothing: {source:?}"
+            );
+        }
     }
 
     /// The accept loop's address-validation gate. A first contact is unvalidated; a Retry turns

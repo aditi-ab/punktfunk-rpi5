@@ -782,12 +782,17 @@ fn shared_path(reg: &[LiveSession], id: u64, peer: Option<std::net::IpAddr>) -> 
         .collect()
 }
 
+/// Report age after which a session no longer contributes to a shared path.
+/// Four 750 ms windows leave one discarded report fresh; a legacy client's
+/// startup-only sample expires.
+const DELIVERY_STALE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// What the shared-path governor reads across the sessions of one client
 /// address, published by each session's control task on its own report cadence.
 ///
 /// Here rather than in the control task because the governor divides a path
-/// between sessions, and no task can see its siblings' locals. Relaxed
-/// throughout: a policy input, never synchronisation.
+/// between sessions, and no task can see its siblings' locals. Relaxed atomics
+/// carry policy inputs; the report timestamp has its own mutex.
 #[derive(Default)]
 pub struct AbrShare {
     /// Automatic bitrate, so a share may move it. A fixed rate and a PyroWave
@@ -800,6 +805,12 @@ pub struct AbrShare {
     /// The session was already streaming when that window opened, so the two
     /// rates above are a reading of the path (`governor::Member::streaming`).
     streaming: AtomicBool,
+    /// Non-zero delivery samples seen on the report cadence. Two distinguish a
+    /// current client from the legacy one-shot startup report.
+    delivery_samples: AtomicU32,
+    /// Arrival time of the last report. A wedged or legacy control plane must
+    /// not leave a permanent path reading.
+    last_delivery: Mutex<Option<std::time::Instant>>,
     /// The share this session was last told (`0` = none), the most its group
     /// has been seen to carry between them, and whether it had a group at all.
     share_kbps: AtomicU32,
@@ -811,15 +822,34 @@ impl AbrShare {
     /// This session's own view, as its control task takes it.
     pub fn publish(
         &self,
+        now: std::time::Instant,
         automatic: bool,
         offered_kbps: u32,
         delivered_kbps: u32,
         streaming: bool,
     ) {
+        let mut last = self.last_delivery.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|at| now.saturating_duration_since(at) > DELIVERY_STALE) {
+            self.delivery_samples.store(0, Ordering::Relaxed);
+        }
+        *last = Some(now);
+        if delivered_kbps > 0 {
+            self.delivery_samples.fetch_add(1, Ordering::Relaxed);
+        }
         self.automatic.store(automatic, Ordering::Relaxed);
         self.offered_kbps.store(offered_kbps, Ordering::Relaxed);
         self.delivered_kbps.store(delivered_kbps, Ordering::Relaxed);
         self.streaming.store(streaming, Ordering::Relaxed);
+    }
+
+    /// Whether repeated, recent reports make this a current path member.
+    fn delivery_ready(&self, now: std::time::Instant) -> bool {
+        self.delivery_samples.load(Ordering::Relaxed) >= 2
+            && self
+                .last_delivery
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|at| now.saturating_duration_since(at) <= DELIVERY_STALE)
     }
 
     /// The ceiling this session is running under. `0` = none.
@@ -837,16 +867,39 @@ impl AbrShare {
 ///
 /// Every member computes the whole group and applies only its own, so a share
 /// is only ever sent by the task that owns the control stream it goes down.
-/// One session is not a group and nothing here fires for it.
+/// Only sessions with repeated, fresh delivery reports form the group; one
+/// capable reporter beside a legacy or stale client is left alone.
 pub fn share_for(id: u64, clocks: punktfunk_core::abr::governor::Clocks) -> Option<u32> {
+    share_for_at(id, std::time::Instant::now(), clocks)
+}
+
+/// Time-injected [`share_for`] for cadence and expiry tests.
+fn share_for_at(
+    id: u64,
+    now: std::time::Instant,
+    clocks: punktfunk_core::abr::governor::Clocks,
+) -> Option<u32> {
     use punktfunk_core::abr::governor;
     let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
     let me = reg.iter().find(|s| s.id == id)?;
+    if !me.counters.share.delivery_ready(now) {
+        return None;
+    }
     let peer = me.peer?;
-    let group: Vec<&LiveSession> = reg.iter().filter(|s| s.peer == Some(peer)).collect();
+    let peers: Vec<&LiveSession> = reg.iter().filter(|s| s.peer == Some(peer)).collect();
+    let group: Vec<&LiveSession> = peers
+        .iter()
+        .copied()
+        .filter(|s| s.counters.share.delivery_ready(now))
+        .collect();
     let mine = group.iter().position(|s| s.id == id)?;
     let share = &me.counters.share;
     if group.len() < 2 {
+        // An incapable or stale sibling may still be consuming the path. Leave
+        // the capable session alone, but do not hand it that sibling's share.
+        if peers.len() > 1 {
+            return None;
+        }
         // Alone on the path: hand over the whole of what the group proved it
         // carried, once. The wall this session measured beside them was their
         // residual, and nobody but this host knows they have gone.
@@ -1393,6 +1446,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// Publish two non-zero cadence samples, which makes a member current.
+    fn publish_ready(
+        counters: &SessionCounters,
+        now: std::time::Instant,
+        automatic: bool,
+        offered_kbps: u32,
+        delivered_kbps: u32,
+    ) -> std::time::Instant {
+        counters
+            .share
+            .publish(now, automatic, offered_kbps, delivered_kbps, true);
+        let ready = now + std::time::Duration::from_millis(750);
+        counters
+            .share
+            .publish(ready, automatic, offered_kbps, delivered_kbps, true);
+        ready
+    }
+
     /// Two Automatic sessions from one address, each asking an 18 Mbps path
     /// for 12: each is told half of what is actually arriving.
     #[test]
@@ -1401,12 +1472,73 @@ pub(crate) mod tests {
         let peer: std::net::IpAddr = "203.0.113.90".parse().unwrap();
         let (a, ac, _ar) = fake_member("phone", peer, 12_000);
         let (b, bc, _br) = fake_member("pc", peer, 12_000);
-        for c in [&ac, &bc] {
-            c.share.publish(true, 12_000, 9_000, true);
-        }
-        assert_eq!(share_for(a.id, both_clocks()), Some(9_000));
-        assert_eq!(share_for(b.id, both_clocks()), Some(9_000));
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+        assert_eq!(share_for_at(b.id, ready, both_clocks()), Some(9_000));
         assert_eq!(ac.share.share_kbps(), 9_000, "and it is remembered");
+    }
+
+    /// One startup sample does not prove a report cadence; the second fresh
+    /// sample admits both members and produces the ordinary equal split.
+    #[test]
+    fn two_fresh_samples_are_required_before_a_group_is_governed() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.96".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (_b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        for c in [&ac, &bc] {
+            c.share.publish(now, true, 12_000, 9_000, true);
+        }
+        assert_eq!(share_for_at(a.id, now, both_clocks()), None);
+        let ready = now + std::time::Duration::from_millis(750);
+        for c in [&ac, &bc] {
+            c.share.publish(ready, true, 12_000, 9_000, true);
+        }
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+    }
+
+    /// A new client beside a legacy startup-only reporter is one capable
+    /// member, not a group with a permanent stale second path reading.
+    #[test]
+    fn a_mixed_old_and_new_pair_is_left_ungoverned() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.97".parse().unwrap();
+        let (_old, old_c, _or) = fake_member("old", peer, 12_000);
+        let (new, new_c, _nr) = fake_member("new", peer, 12_000);
+        let now = std::time::Instant::now();
+        old_c.share.publish(now, true, 12_000, 9_000, true);
+        let ready = publish_ready(&new_c, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(new.id, ready, both_clocks()), None);
+        assert_eq!(old_c.share.share_kbps(), 0);
+        assert_eq!(new_c.share.share_kbps(), 0);
+    }
+
+    /// A sibling whose reports stop is excluded without handing its share to
+    /// the current member: the stale session is still live and may consume it.
+    #[test]
+    fn a_stale_sibling_neither_governs_nor_triggers_a_handback() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.98".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (_b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+        let stale = ready + DELIVERY_STALE + std::time::Duration::from_millis(1);
+        publish_ready(
+            &ac,
+            stale - std::time::Duration::from_millis(750),
+            true,
+            12_000,
+            9_000,
+        );
+        assert!(!bc.share.delivery_ready(stale));
+        assert_eq!(share_for_at(a.id, stale, both_clocks()), None);
+        assert_eq!(ac.share.share_kbps(), 9_000, "no stale-sibling handback");
     }
 
     /// What the control task asks the governor with: registration stamps the
@@ -1419,14 +1551,20 @@ pub(crate) mod tests {
         let peer: std::net::IpAddr = "203.0.113.95".parse().unwrap();
         let (a, ac, _ar) = fake_member("phone", peer, 12_000);
         let (b, bc, _br) = fake_member("pc", peer, 12_000);
-        for c in [&ac, &bc] {
-            c.share.publish(true, 12_000, 9_000, true);
-        }
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
         assert_eq!(ac.link.session_id(), a.id, "the id the link lines carry");
         assert_eq!(bc.link.session_id(), b.id);
         assert_ne!(ac.link.session_id(), 0);
-        assert_eq!(share_for(ac.link.session_id(), both_clocks()), Some(9_000));
-        assert_eq!(share_for(bc.link.session_id(), both_clocks()), Some(9_000));
+        assert_eq!(
+            share_for_at(ac.link.session_id(), ready, both_clocks()),
+            Some(9_000)
+        );
+        assert_eq!(
+            share_for_at(bc.link.session_id(), ready, both_clocks()),
+            Some(9_000)
+        );
     }
 
     /// A fixed-rate session takes what it is set to off the top and is never
@@ -1437,12 +1575,13 @@ pub(crate) mod tests {
         let peer: std::net::IpAddr = "203.0.113.91".parse().unwrap();
         let (auto, auto_c, _ar) = fake_member("phone", peer, 14_000);
         let (fixed, fixed_c, _fr) = fake_member("pc", peer, 8_000);
-        auto_c.share.publish(true, 14_000, 10_000, true);
-        fixed_c.share.publish(false, 8_000, 8_000, true);
-        assert_eq!(share_for(fixed.id, both_clocks()), None);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&auto_c, now, true, 14_000, 10_000);
+        publish_ready(&fixed_c, now, false, 8_000, 8_000);
+        assert_eq!(share_for_at(fixed.id, ready, both_clocks()), None);
         assert_eq!(fixed_c.share.share_kbps(), 0, "nothing was written either");
         assert_eq!(
-            share_for(auto.id, both_clocks()),
+            share_for_at(auto.id, ready, both_clocks()),
             Some(10_000),
             "18 Mbps arriving, less the fixed 8"
         );
@@ -1454,8 +1593,9 @@ pub(crate) mod tests {
         let _registry = registry_lock();
         let peer: std::net::IpAddr = "203.0.113.92".parse().unwrap();
         let (only, c, _r) = fake_member("phone", peer, 20_000);
-        c.share.publish(true, 20_000, 9_000, true);
-        assert_eq!(share_for(only.id, both_clocks()), None);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&c, now, true, 20_000, 9_000);
+        assert_eq!(share_for_at(only.id, ready, both_clocks()), None);
     }
 
     /// A path that has degraded since the group's best window: the moment they
@@ -1467,20 +1607,29 @@ pub(crate) mod tests {
         let peer: std::net::IpAddr = "203.0.113.94".parse().unwrap();
         let (a, ac, _ar) = fake_member("phone", peer, 15_000);
         let (b, bc, _br) = fake_member("pc", peer, 15_000);
+        let now = std::time::Instant::now();
         // Both clean at 15 Mbps: the pair has carried 30 between them.
-        for c in [&ac, &bc] {
-            c.share.publish(true, 15_000, 15_000, true);
-        }
-        assert_eq!(share_for(a.id, both_clocks()), None, "nothing to divide");
+        let ready = publish_ready(&ac, now, true, 15_000, 15_000);
+        publish_ready(&bc, now, true, 15_000, 15_000);
+        assert_eq!(
+            share_for_at(a.id, ready, both_clocks()),
+            None,
+            "nothing to divide"
+        );
         assert_eq!(ac.share.path_kbps.load(Ordering::Relaxed), 30_000);
         // The path halves. Both are short, so what it carried before is gone.
+        let short_at = ready + std::time::Duration::from_millis(750);
         for c in [&ac, &bc] {
-            c.share.publish(true, 15_000, 6_000, true);
+            c.share.publish(short_at, true, 15_000, 6_000, true);
         }
-        assert_eq!(share_for(a.id, both_clocks()), Some(6_000), "half of 12");
+        assert_eq!(
+            share_for_at(a.id, short_at, both_clocks()),
+            Some(6_000),
+            "half of 12"
+        );
         drop(b);
         assert_eq!(
-            share_for(a.id, both_clocks()),
+            share_for_at(a.id, short_at, both_clocks()),
             Some(12_000),
             "the path as it is now, not the 30 000 the pair once carried"
         );
@@ -1495,17 +1644,21 @@ pub(crate) mod tests {
         let peer: std::net::IpAddr = "203.0.113.93".parse().unwrap();
         let (a, ac, _ar) = fake_member("phone", peer, 12_000);
         let (b, bc, _br) = fake_member("pc", peer, 12_000);
-        for c in [&ac, &bc] {
-            c.share.publish(true, 12_000, 9_000, true);
-        }
-        assert_eq!(share_for(a.id, both_clocks()), Some(9_000));
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
         drop(b);
         assert_eq!(
-            share_for(a.id, both_clocks()),
+            share_for_at(a.id, ready, both_clocks()),
             Some(18_000),
             "all of what the two of them were carrying"
         );
-        assert_eq!(share_for(a.id, both_clocks()), None, "and only the once");
+        assert_eq!(
+            share_for_at(a.id, ready, both_clocks()),
+            None,
+            "and only the once"
+        );
     }
 
     /// One address is one NAT or tunnel: each session names the others there, and an
