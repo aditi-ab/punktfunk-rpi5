@@ -687,12 +687,23 @@ fn vulkan_encode_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether `bit_depth`/`hdr` describes a frame a native planar source can carry: 8-bit SDR is
+/// NV12 and HDR is P010, but 10-bit SDR captures 8-bit packed RGB that must pass through the
+/// BT.709 widening CSC — native NV12 cannot be a P010 source there.
+#[cfg(target_os = "linux")]
+const fn native_planar_depth_matches(bit_depth: u8, hdr: bool) -> bool {
+    bit_depth < 10 || hdr
+}
+
 /// Whether this session can ingest a producer's own NV12 without a host pass. Both AMD/Intel
 /// lanes can: Vulkan Video imports it as its picture, the native libva session encodes it as
 /// imported. AV1 is Vulkan Video's alone. The NVENC lane's fused convert reads RGB only.
 #[cfg(target_os = "linux")]
-pub fn linux_native_nv12_ok(codec: Codec) -> bool {
+pub fn linux_native_nv12_ok(codec: Codec, bit_depth: u8, hdr: bool) -> bool {
     if !linux_zero_copy_is_vaapi() {
+        return false;
+    }
+    if !native_planar_depth_matches(bit_depth, hdr) {
         return false;
     }
     match codec {
@@ -2019,6 +2030,17 @@ mod tests {
             resolve_linux_backend("vaapi", no_probe, true),
             Some(AmdIntel)
         );
+    }
+
+    /// Native-planar depth parity: 8-bit SDR (NV12) and HDR (P010) may take the
+    /// native source; 10-bit SDR must not — it captures 8-bit packed RGB for the
+    /// widening CSC and native NV12 cannot be a P010 source.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_planar_depth_matches_excludes_ten_bit_sdr() {
+        assert!(native_planar_depth_matches(8, false));
+        assert!(native_planar_depth_matches(10, true));
+        assert!(!native_planar_depth_matches(10, false));
     }
 
     /// Linux dispatch through the resolver, GPU-free via the software arm.

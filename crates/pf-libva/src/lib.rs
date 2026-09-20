@@ -165,6 +165,10 @@ pub struct Libva {
         unsafe extern "C" fn(VaDisplay, VaContextId, *mut VaBufferId, c_int) -> VaStatus,
     pub end_picture: unsafe extern "C" fn(VaDisplay, VaContextId) -> VaStatus,
     pub sync_surface: unsafe extern "C" fn(VaDisplay, VaSurfaceId) -> VaStatus,
+    /// Buffer-specific encode completion (libva >= 1.9); `None` keeps the surface fallback.
+    pub sync_buffer: Option<unsafe extern "C" fn(VaDisplay, VaBufferId, u64) -> VaStatus>,
+    /// Non-blocking half of `sync_surface`: the surface's `VASurfaceStatus` out.
+    pub query_surface_status: unsafe extern "C" fn(VaDisplay, VaSurfaceId, *mut c_int) -> VaStatus,
     pub export_surface_handle:
         unsafe extern "C" fn(VaDisplay, VaSurfaceId, c_uint, c_uint, *mut c_void) -> VaStatus,
     /// Encode reads its bitstream back through a mapped coded buffer; decode has no
@@ -226,6 +230,9 @@ impl Libva {
             let render_picture = get!(va, "vaRenderPicture");
             let end_picture = get!(va, "vaEndPicture");
             let sync_surface = get!(va, "vaSyncSurface");
+            let sync_buffer: Option<unsafe extern "C" fn(VaDisplay, VaBufferId, u64) -> VaStatus> =
+                va.get(b"vaSyncBuffer\0").ok().map(|symbol| *symbol);
+            let query_surface_status = get!(va, "vaQuerySurfaceStatus");
             let export_surface_handle = get!(va, "vaExportSurfaceHandle");
             let map_buffer = get!(va, "vaMapBuffer");
             let unmap_buffer = get!(va, "vaUnmapBuffer");
@@ -252,6 +259,8 @@ impl Libva {
                 render_picture,
                 end_picture,
                 sync_surface,
+                sync_buffer,
+                query_surface_status,
                 export_surface_handle,
                 map_buffer,
                 unmap_buffer,

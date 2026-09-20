@@ -190,7 +190,8 @@ impl SessionPlan {
             // to fold the cursor, so any `cursor_blend` session captures RGB instead
             // (compute-CSC / VkSlotBlend). `cursor_blend` subsumes `gamescope_cursor`.
             #[cfg(target_os = "linux")]
-            nv12_native: crate::encode::linux_native_nv12_ok(self.codec) && !self.cursor_blend,
+            nv12_native: crate::encode::linux_native_nv12_ok(self.codec, self.bit_depth, self.hdr)
+                && !self.cursor_blend,
             #[cfg(not(target_os = "linux"))]
             nv12_native: false,
         }

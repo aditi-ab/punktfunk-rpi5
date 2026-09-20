@@ -58,6 +58,66 @@ const fn yuv_format(hdr: bool) -> vk::Format {
         NV12
     }
 }
+
+/// Whether the producer-planar `format` matches the session depth: NV12 is the 8-bit source,
+/// P010 the 10-bit one. A crossed pair names a picture the encoder cannot program.
+const fn native_planar_format_matches(format: PixelFormat, ten_bit: bool) -> bool {
+    matches!(
+        (format, ten_bit),
+        (PixelFormat::Nv12, false) | (PixelFormat::P010, true)
+    )
+}
+
+/// Ownership/visibility acquire for an EXCLUSIVE-sharing imported image: `foreign_qfi` →
+/// `dst_qfi`, discarding (`fresh`, UNDEFINED) or keeping (GENERAL) prior contents.
+fn imported_acquire_barrier(
+    image: vk::Image,
+    fresh: bool,
+    foreign_qfi: u32,
+    dst_qfi: u32,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+    new_layout: vk::ImageLayout,
+) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+        .src_access_mask(vk::AccessFlags2::NONE)
+        .dst_stage_mask(dst_stage)
+        .dst_access_mask(dst_access)
+        .old_layout(if fresh {
+            vk::ImageLayout::UNDEFINED
+        } else {
+            vk::ImageLayout::GENERAL
+        })
+        .new_layout(new_layout)
+        .src_queue_family_index(foreign_qfi)
+        .dst_queue_family_index(dst_qfi)
+        .image(image)
+        .subresource_range(color_range(0))
+}
+
+/// Ownership release back to the foreign producer family after the last read of an imported
+/// image, landing in GENERAL (the layout every later cached acquire expects).
+fn imported_release_barrier(
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    src_qfi: u32,
+    foreign_qfi: u32,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(src_stage)
+        .src_access_mask(src_access)
+        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+        .dst_access_mask(vk::AccessFlags2::NONE)
+        .old_layout(old_layout)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(src_qfi)
+        .dst_queue_family_index(foreign_qfi)
+        .image(image)
+        .subresource_range(color_range(0))
+}
 /// Max resident dmabuf imports. Above any PipeWire pool; imports alias existing buffers.
 const IMPORT_CACHE_CAP: usize = 16;
 // RGB→NV12 BT.709 CSC. Source `rgb2yuv.comp`; regenerate with
@@ -555,6 +615,15 @@ pub(crate) fn vulkan_capture_modifiers(codec: Codec, fourcc: u32, ten_bit: bool)
             .map(|(pd, _)| pd);
         let mods = pd
             .map(|pd| {
+                // The probe must name the profile the import will use: planar fourccs
+                // (NV12/P010) go in under the native profile, packed RGB under EFC conversion.
+                let mut native_ps = NativeProfileStack::new(codec_op, ten_bit);
+                let mut rgb_ps = RgbProfileStack::new(codec_op, ten_bit);
+                let encode_profile = *if matches!(fmt, NV12 | P010) {
+                    native_ps.wire(av1)
+                } else {
+                    rgb_ps.wire(av1)
+                };
                 let mut accepted: Vec<u64> = Vec::new();
                 for m in one_plane_modifiers(&instance, pd, fmt) {
                     // LINEAR is appended by the capture offer, never probed here.
@@ -575,18 +644,14 @@ pub(crate) fn vulkan_capture_modifiers(codec: Codec, fourcc: u32, ten_bit: bool)
                         m,
                         vk::ImageUsageFlags::TRANSFER_SRC,
                         None,
-                    ) && {
-                        let mut ps = RgbProfileStack::new(codec_op, ten_bit);
-                        let profile = *ps.wire(av1);
-                        modifier_importable(
-                            &instance,
-                            pd,
-                            fmt,
-                            m,
-                            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
-                            Some(&profile),
-                        )
-                    };
+                    ) && modifier_importable(
+                        &instance,
+                        pd,
+                        fmt,
+                        m,
+                        vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
+                        Some(&encode_profile),
+                    );
                     if ok {
                         accepted.push(m);
                     }
@@ -608,8 +673,9 @@ enum SrcAcquire {
     /// First use of a DMA-BUF imported directly as the video source: acquire from the foreign
     /// producer (UNDEFINED preserves modifier-backed bytes) with a FOREIGN→encode-family transfer.
     DmabufFresh,
-    /// Cached direct-source import: already VIDEO_ENCODE_SRC; visibility-only barrier for the
-    /// producer's out-of-band rewrite of the bytes.
+    /// Cached direct-source import: re-acquired from the foreign family out of GENERAL, the
+    /// layout the previous release left it in. The producer's rewrite is fenced by
+    /// `Frame::src_hold`, not by this barrier.
     DmabufCached,
     /// RGB-direct CPU upload: the compute queue copied the staging buffer in (semaphore
     /// ordered); transition TRANSFER_DST → VIDEO_ENCODE_SRC.
@@ -790,6 +856,9 @@ pub struct VulkanVideoEncoder {
     frames: Vec<Frame>,
     ring: usize,                // next slot to record into
     in_flight: VecDeque<usize>, // submitted, not yet read; oldest first
+    /// Pipelined retrieve (`set_pipelined`): `poll` probes the oldest fence instead of
+    /// waiting on it, so an AU may ride a loop tick behind its submit under contention.
+    pipelined: bool,
     bs_size: u64,
     cmd_pool: vk::CommandPool,
     compute_pool: vk::CommandPool,
@@ -821,11 +890,14 @@ pub struct VulkanVideoEncoder {
     rgb: Option<RgbDirect>,
     /// The host's crop and scale ahead of the CSC ([`Encoder::set_input_crop`]). CSC sessions only.
     reframe: Option<reframe_stage::Reframe>,
-    /// Producer supplied native NV12. Encodes the imported visible-size buffer directly: native
-    /// sessions use TRUE-SIZE headers so RADV programs firmware padding and the source is never
-    /// read past its extent. CSC/RGB paths keep app-aligned SPS (coded extent 64×16); an
-    /// undersized direct source on those paths is an OOB-read class.
+    /// Producer supplied native NV12/P010. Encodes the imported visible-size buffer directly:
+    /// native sessions use TRUE-SIZE headers so RADV programs firmware padding and the source
+    /// is never read past its extent. CSC/RGB paths keep app-aligned SPS (coded extent 64×16);
+    /// an undersized direct source on those paths is an OOB-read class.
     native_nv12: bool,
+    /// The negotiated producer-planar format — `Nv12`, or `P010` at ten bits. Meaningful only
+    /// under `native_nv12`; the submit gate compares the frame's format and FourCC against it.
+    native_fmt: PixelFormat,
     /// 10-bit session (HDR or 10-bit SDR). Every profile chain rebuilt after `open` must present
     /// the same depth, so it is carried here rather than re-derived.
     ten_bit: bool,
@@ -890,6 +962,13 @@ impl VulkanVideoEncoder {
         let is_hdr = format.is_hdr();
         // Depth: HDR, or a 10-bit SDR session on an 8-bit capture (`bit_depth == 10`, BT.709).
         let ten_bit = is_hdr || bit_depth >= 10;
+        // Native planar is NV12 at eight bits or P010 at ten — a crossed pair (e.g. P010 bytes
+        // on an 8-bit session) describes no source this encoder can program.
+        ensure!(
+            !native_nv12 || native_planar_format_matches(format, ten_bit),
+            "vulkan-encode (native planar): {format:?} does not match session depth \
+             (ten_bit={ten_bit})"
+        );
         // RGB-direct needs the captured format as the session picture format. BGRA default is
         // only for CPU-only layouts, which never reach that arm.
         let src_rgb_fmt = pixel_to_vk(format).unwrap_or(vk::Format::B8G8R8A8_UNORM);
@@ -910,6 +989,7 @@ impl VulkanVideoEncoder {
             bitrate_bps,
             want_rgb,
             native_nv12,
+            format,
             ten_bit,
             is_hdr,
             src_rgb_fmt,
@@ -961,6 +1041,7 @@ impl VulkanVideoEncoder {
             bitrate_bps,
             want_rgb,
             false,
+            PixelFormat::Nv12,
             ten_bit,
             is_hdr,
             if is_hdr {
@@ -980,6 +1061,7 @@ impl VulkanVideoEncoder {
         bitrate_bps: u64,
         want_rgb: bool,
         native_nv12: bool,
+        native_fmt: PixelFormat,
         ten_bit: bool,
         is_hdr: bool,
         src_rgb_fmt: vk::Format,
@@ -1005,6 +1087,7 @@ impl VulkanVideoEncoder {
                 bitrate_bps.max(1_000_000),
                 want_rgb,
                 native_nv12,
+                native_fmt,
                 ten_bit,
                 is_hdr,
                 src_rgb_fmt,
@@ -1023,6 +1106,7 @@ impl VulkanVideoEncoder {
         bitrate: u64,
         want_rgb: bool,
         native_nv12: bool,
+        native_fmt: PixelFormat,
         ten_bit: bool,
         // Colour axis (BT.2020 PQ vs BT.709). Named `is_hdr`, not `hdr`: this fn binds `hdr` to the
         // parameter-set header bytes below, which would shadow it at the CSC-shader pick.
@@ -1107,11 +1191,12 @@ impl VulkanVideoEncoder {
         if native_nv12 {
             tracing::info!(
                 native_nv12 = "active(direct-import)",
+                format = ?native_fmt,
                 source_width = rw,
                 source_height = rh,
                 fw_padding_width = w - rw,
                 fw_padding_height = h - rh,
-                "vulkan-encode: producer-native NV12 encode source (true-size headers: the \
+                "vulkan-encode: producer-native planar encode source (true-size headers: the \
                  driver aligns the bitstream SPS itself and the firmware edge-extends the \
                  padding — the source is never read past its extent)"
             );
@@ -1773,6 +1858,7 @@ impl VulkanVideoEncoder {
             rgb: rgb_cfg,
             reframe: None,
             native_nv12,
+            native_fmt,
             ten_bit,
             is_hdr,
             intra_refresh,
@@ -1792,6 +1878,7 @@ impl VulkanVideoEncoder {
             force_kf: false,
             pending_loss: None,
             pending: VecDeque::new(),
+            pipelined: false,
         })
     }
 }
@@ -2318,7 +2405,7 @@ impl VulkanVideoEncoder {
         }
 
         if self.native_nv12 {
-            self.record_submit_nv12(slot, frame, is_idr, recovery, ref_slot, setup_idx, poc)?;
+            self.record_submit_native(slot, frame, is_idr, recovery, ref_slot, setup_idx, poc)?;
             self.post_submit_bookkeeping(
                 slot,
                 frame.pts_ns,
@@ -2370,7 +2457,7 @@ impl VulkanVideoEncoder {
         // Fallible prefix in one closure whose error arm resets `compute_cmd`. Leaving it
         // RECORDING makes the next `begin` violate VUID-vkBeginCommandBuffer-commandBuffer-00049.
         // Never PENDING here: nothing is submitted until stage 4, so the reset is legal.
-        let prefix = (|| -> Result<([i32; 4], vk::ImageView)> {
+        let prefix = (|| -> Result<([i32; 4], vk::ImageView, Option<vk::Image>)> {
             self.frames[slot].ts_written = false;
             if self.ts_period_ns > 0.0 {
                 dev.cmd_reset_query_pool(compute_cmd, ts_pool, 0, 2);
@@ -2380,40 +2467,28 @@ impl VulkanVideoEncoder {
 
             let cursor_pc = self.prep_cursor(slot, compute_cmd, frame.cursor.as_ref())?;
 
-            let rgb_view = match &frame.payload {
+            let (rgb_view, imported) = match &frame.payload {
                 FramePayload::Dmabuf(d) => {
                     let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-                    // Fresh: UNDEFINED preserves modifier-tiled bytes, FOREIGN→compute acquire.
-                    // Cached: visibility-only; content stability is `Frame::src_hold`.
-                    let (old, src_qf, dst_qf) = if fresh {
-                        (
-                            vk::ImageLayout::UNDEFINED,
-                            self.foreign_qfi,
-                            self.compute_family,
-                        )
-                    } else {
-                        (
-                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::QUEUE_FAMILY_IGNORED,
-                            vk::QUEUE_FAMILY_IGNORED,
-                        )
-                    };
-                    let acq = vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                        .src_access_mask(vk::AccessFlags2::NONE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                        .old_layout(old)
-                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        .src_queue_family_index(src_qf)
-                        .dst_queue_family_index(dst_qf)
-                        .image(img)
-                        .subresource_range(color_range(0));
+                    // EXCLUSIVE sharing: fresh or cached, acquire the image from the
+                    // foreign producer family for this compute read (UNDEFINED on a
+                    // fresh import preserves modifier-tiled bytes; a cached one sits
+                    // in GENERAL where the release below left it). `Frame::src_hold`
+                    // covers content stability, not queue ownership.
+                    let acq = imported_acquire_barrier(
+                        img,
+                        fresh,
+                        self.foreign_qfi,
+                        self.compute_family,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER,
+                        vk::AccessFlags2::SHADER_READ,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    );
                     dev.cmd_pipeline_barrier2(
                         compute_cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[acq]),
                     );
-                    view
+                    (view, Some(img))
                 }
                 FramePayload::Cpu(bytes) => {
                     // Expand 24-bpp 3→4 first (`normalize_cpu_rgb`); `ensure_cpu_rgb` padding does
@@ -2481,13 +2556,13 @@ impl VulkanVideoEncoder {
                         compute_cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[to_read]),
                     );
-                    view
+                    (view, None)
                 }
                 _ => bail!("vulkan-encode: unsupported FramePayload (need Dmabuf or Cpu RGB)"),
             };
-            Ok((cursor_pc, rgb_view))
+            Ok((cursor_pc, rgb_view, imported))
         })();
-        let (cursor_pc, rgb_view) = match prefix {
+        let (cursor_pc, rgb_view, imported) = match prefix {
             Ok(v) => v,
             Err(e) => {
                 // RECORDING (never submitted yet); pool allows reset.
@@ -2653,6 +2728,22 @@ impl VulkanVideoEncoder {
                 1,
             );
         }
+        // Hand the imported source back to the producer family: the slot fence covers this
+        // batch, so the producer may rewrite the dmabuf once the fence signals.
+        if let Some(img) = imported {
+            let rel = imported_release_barrier(
+                img,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                self.compute_family,
+                self.foreign_qfi,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_READ,
+            );
+            dev.cmd_pipeline_barrier2(
+                compute_cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&[rel]),
+            );
+        }
         dev.end_command_buffer(compute_cmd)?;
 
         if self.codec == Codec::Av1 {
@@ -2742,31 +2833,18 @@ impl VulkanVideoEncoder {
             dev.cmd_reset_query_pool(compute_cmd, ts_pool, 0, 2);
             dev.cmd_write_timestamp2(compute_cmd, vk::PipelineStageFlags2::NONE, ts_pool, 0);
         }
-        // Fresh import: FOREIGN hand-off, UNDEFINED preserves modifier-tiled bytes.
-        // Cached: visibility-only. Staging: transfer-write, prior contents discarded.
-        let src_acq = if src_fresh {
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_queue_family_index(self.foreign_qfi)
-                .dst_queue_family_index(self.compute_family)
-        } else {
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        }
-        .image(src)
-        .subresource_range(color_range(0));
+        // EXCLUSIVE sharing: acquire the import from the producer family for this blit
+        // (UNDEFINED on a fresh import preserves modifier-tiled bytes; cached sits in
+        // GENERAL where the release below left it). Staging: transfer-write, discarded.
+        let src_acq = imported_acquire_barrier(
+            src,
+            src_fresh,
+            self.foreign_qfi,
+            self.compute_family,
+            vk::PipelineStageFlags2::ALL_TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
         let pad_dst = vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::NONE)
             .src_access_mask(vk::AccessFlags2::NONE)
@@ -2857,14 +2935,27 @@ impl VulkanVideoEncoder {
                 1,
             );
         }
+        // Last read of the import in this batch: release it back to the producer family.
+        let src_rel = imported_release_barrier(
+            src,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            self.compute_family,
+            self.foreign_qfi,
+            vk::PipelineStageFlags2::ALL_TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+        );
+        dev.cmd_pipeline_barrier2(
+            compute_cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&[src_rel]),
+        );
         dev.end_command_buffer(compute_cmd)?;
         Ok(())
     }
 
-    /// Import the producer's visible-size NV12 buffer as the encode source. Safe at every mode
-    /// because native sessions run true-size headers (see [`Self::native_nv12`]).
+    /// Import the producer's visible-size NV12/P010 buffer as the encode source. Safe at every
+    /// mode because native sessions run true-size headers (see [`Self::native_nv12`]).
     #[allow(clippy::too_many_arguments)]
-    unsafe fn record_submit_nv12(
+    unsafe fn record_submit_native(
         &mut self,
         slot: usize,
         frame: &CapturedFrame,
@@ -2874,15 +2965,16 @@ impl VulkanVideoEncoder {
         setup_idx: usize,
         poc: i32,
     ) -> Result<()> {
-        if frame.format != PixelFormat::Nv12 {
+        let want = self.native_fmt;
+        if frame.format != want {
             bail!(
-                "vulkan-encode (native NV12): negotiated NV12 but received {:?}",
+                "vulkan-encode (native planar): negotiated {want:?} but received {:?}",
                 frame.format
             );
         }
         if frame.width != self.render_w || frame.height != self.render_h {
             bail!(
-                "vulkan-encode (native NV12): frame {}x{} != mode {}x{}",
+                "vulkan-encode (native planar): frame {}x{} != mode {}x{}",
                 frame.width,
                 frame.height,
                 self.render_w,
@@ -2890,20 +2982,20 @@ impl VulkanVideoEncoder {
             );
         }
         if frame.width % 2 != 0 || frame.height % 2 != 0 {
-            bail!("vulkan-encode (native NV12): 4:2:0 frame dimensions must be even");
+            bail!("vulkan-encode (native planar): 4:2:0 frame dimensions must be even");
         }
         let FramePayload::Dmabuf(d) = &frame.payload else {
-            bail!("vulkan-encode (native NV12): producer frame is not a DMA-BUF");
+            bail!("vulkan-encode (native planar): producer frame is not a DMA-BUF");
         };
-        if d.fourcc != pf_frame::drm_fourcc(PixelFormat::Nv12).expect("NV12 FourCC") {
+        if d.fourcc != pf_frame::drm_fourcc(want).expect("planar FourCC") {
             bail!(
-                "vulkan-encode (native NV12): DMA-BUF FourCC {:#x} is not NV12",
+                "vulkan-encode (native planar): DMA-BUF FourCC {:#x} does not match {want:?}",
                 d.fourcc
             );
         }
         if d.modifier != 0 {
             bail!(
-                "vulkan-encode (native NV12): only LINEAR is supported, got modifier {:#x}",
+                "vulkan-encode (native planar): only LINEAR is supported, got modifier {:#x}",
                 d.modifier
             );
         }
@@ -3246,16 +3338,17 @@ impl VulkanVideoEncoder {
                 .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .old_layout(vk::ImageLayout::GENERAL),
-            SrcAcquire::DmabufFresh => src_base
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .src_queue_family_index(self.foreign_qfi)
-                .dst_queue_family_index(self.encode_family),
-            SrcAcquire::DmabufCached => src_base
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .old_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR),
+            // Imported EXCLUSIVE image: encode must acquire it from the producer family on
+            // every use (UNDEFINED on first import; GENERAL after the previous release).
+            SrcAcquire::DmabufFresh | SrcAcquire::DmabufCached => imported_acquire_barrier(
+                src_img,
+                matches!(acquire, SrcAcquire::DmabufFresh),
+                self.foreign_qfi,
+                self.encode_family,
+                vk::PipelineStageFlags2::VIDEO_ENCODE_KHR,
+                vk::AccessFlags2::VIDEO_ENCODE_READ_KHR,
+                vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+            ),
             SrcAcquire::CpuUpload => src_base
                 .src_stage_mask(vk::PipelineStageFlags2::NONE)
                 .src_access_mask(vk::AccessFlags2::NONE)
@@ -3269,9 +3362,35 @@ impl VulkanVideoEncoder {
         Ok(())
     }
 
+    /// Release a direct DMA-BUF source to the foreign producer family. Internal CSC and
+    /// CPU-upload sources stay device-owned. The command buffer's slot fence covers the hand-off.
+    unsafe fn release_direct_source(
+        &self,
+        dev: &ash::Device,
+        cmd: vk::CommandBuffer,
+        src_img: vk::Image,
+        acquire: SrcAcquire,
+    ) {
+        if !matches!(acquire, SrcAcquire::DmabufFresh | SrcAcquire::DmabufCached) {
+            return;
+        }
+        let release = imported_release_barrier(
+            src_img,
+            vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+            self.encode_family,
+            self.foreign_qfi,
+            vk::PipelineStageFlags2::VIDEO_ENCODE_KHR,
+            vk::AccessFlags2::VIDEO_ENCODE_READ_KHR,
+        );
+        dev.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&[release]),
+        );
+    }
+
     /// HEVC Std structs + begin/encode/end. A recovery anchor is an ordinary P whose
     /// `RefPicList0` names the known-good slot; the full short-term RPS ([`build_h265_rps_s0`])
-    /// keeps all resident DPB pictures alive at the decoder.
+    /// keeps all resident DPB pictures alive. Direct imports return to the producer after coding.
     #[allow(clippy::too_many_arguments)]
     unsafe fn record_coding_h265(
         &self,
@@ -3514,14 +3633,14 @@ impl VulkanVideoEncoder {
         (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
         dev.cmd_end_query(cmd, query_pool, 0);
         (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
+        self.release_direct_source(dev, cmd, src_img, acquire);
         dev.end_command_buffer(cmd)?;
         Ok(())
     }
 
-    /// AV1 Std structs + begin/encode/end. IDR, recovery and a wave start break the CDF chain
-    /// (`primary_ref_frame = PRIMARY_REF_NONE` + `error_resilient_mode`). A normal P inherits
-    /// context (name 0 → `ref_slot`). AV1's 8 virtual slots persist until `refresh_frame_flags`
-    /// overwrites them — no per-frame RPS.
+    /// AV1 Std structs + begin/encode/end. IDR, recovery and a wave start break the CDF chain;
+    /// a normal P inherits context through `ref_slot`. Virtual slots persist until refreshed,
+    /// and a direct import returns to the producer only after coding ends.
     #[allow(clippy::too_many_arguments)]
     unsafe fn record_coding_av1(
         &self,
@@ -3818,6 +3937,7 @@ impl VulkanVideoEncoder {
         (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
         dev.cmd_end_query(cmd, query_pool, 0);
         (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
+        self.release_direct_source(dev, cmd, src_img, acquire);
         dev.end_command_buffer(cmd)?;
         Ok(())
     }
@@ -4053,27 +4173,41 @@ impl Encoder for VulkanVideoEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        // Blocking, per the depth-1 pump contract. A non-blocking fence probe deferred every
-        // AU a full frame period. `None` means nothing submitted.
+        // Blocking at depth-1 sync: a non-blocking probe would defer every AU a full
+        // frame period. `pipelined` flips that — an unready oldest defers one tick, so
+        // encode latency stops bounding the loop's cadence. `None` = nothing submitted,
+        // or (pipelined) the oldest AU is still on the GPU.
         if let Some(f) = self.pending.pop_front() {
             return Ok(Some(f));
         }
         let Some(&slot) = self.in_flight.front() else {
             return Ok(None);
         };
-        // Bounded like `enqueue`: this is the stall-recovery thread.
-        // SAFETY: waiting a fence owned by this encoder's slot under `&mut self`.
-        match unsafe {
-            self.device
-                .wait_for_fences(&[self.frames[slot].fence], true, ENCODE_FENCE_TIMEOUT_NS)
-        } {
-            Ok(()) => {}
-            Err(vk::Result::TIMEOUT) => anyhow::bail!(
-                "vulkan-encode: fence for slot {slot} did not signal within {} ms — GPU or \
-                 driver wedged; failing the poll so the session can reset",
-                ENCODE_FENCE_TIMEOUT_NS / 1_000_000
-            ),
-            Err(e) => return Err(e.into()),
+        if self.pipelined {
+            // SAFETY: probing a fence owned by this encoder's slot under `&mut self`.
+            match unsafe { self.device.get_fence_status(self.frames[slot].fence) } {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            // Bounded like `enqueue`: this is the stall-recovery thread.
+            // SAFETY: waiting a fence owned by this encoder's slot under `&mut self`.
+            match unsafe {
+                self.device.wait_for_fences(
+                    &[self.frames[slot].fence],
+                    true,
+                    ENCODE_FENCE_TIMEOUT_NS,
+                )
+            } {
+                Ok(()) => {}
+                Err(vk::Result::TIMEOUT) => anyhow::bail!(
+                    "vulkan-encode: fence for slot {slot} did not signal within {} ms — GPU or \
+                     driver wedged; failing the poll so the session can reset",
+                    ENCODE_FENCE_TIMEOUT_NS / 1_000_000
+                ),
+                Err(e) => return Err(e.into()),
+            }
         }
         self.in_flight.pop_front();
         self.frames[slot].src_hold = None;
@@ -4139,6 +4273,13 @@ impl Encoder for VulkanVideoEncoder {
         true
     }
 
+    /// `poll` switches between a bounded wait and a fence probe. Wind-back is immediate:
+    /// the next blocking poll simply drains whatever the ring still holds.
+    fn set_pipelined(&mut self, on: bool) -> bool {
+        self.pipelined = on;
+        self.pipelined
+    }
+
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
         // Staged rate: next `record_submit` emits ENCODE_RATE_CONTROL — no session churn, no IDR.
         // Same floor as `open` and the same driver ceiling. Clamp is visible via `applied_bitrate_bps`.
@@ -4183,6 +4324,7 @@ impl Encoder for VulkanVideoEncoder {
                 self.bitrate,
                 false,
                 false,
+                self.native_fmt,
                 self.ten_bit,
                 self.is_hdr,
                 vk::Format::B8G8R8A8_UNORM,
@@ -4219,6 +4361,8 @@ impl Encoder for VulkanVideoEncoder {
             unsafe {
                 self.device
                     .wait_for_fences(&[self.frames[slot].fence], true, u64::MAX)?;
+                // The fence also covers the source release; the producer may rewrite now.
+                self.frames[slot].src_hold = None;
                 let done = self.read_slot(slot)?;
                 self.pending.push_back(done);
             }
@@ -4428,6 +4572,66 @@ mod tests {
     use super::{build_h265_rps_s0, intra_refresh_caps, parse_rgb_request, VulkanVideoEncoder};
     use crate::{Codec, Encoder};
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
+
+    /// Native planar pairs: NV12 is the 8-bit source, P010 the 10-bit one; a crossed pair
+    /// names a picture the session cannot program.
+    #[test]
+    fn native_planar_format_matches_only_the_depth_pair() {
+        use super::native_planar_format_matches;
+        assert!(native_planar_format_matches(PixelFormat::Nv12, false));
+        assert!(native_planar_format_matches(PixelFormat::P010, true));
+        assert!(!native_planar_format_matches(PixelFormat::Nv12, true));
+        assert!(!native_planar_format_matches(PixelFormat::P010, false));
+    }
+
+    /// Imported EXCLUSIVE images are re-acquired from the producer family on every use —
+    /// a cached acquire is an ownership transfer out of GENERAL, never IGNORED families.
+    #[test]
+    fn imported_acquire_moves_ownership_every_time() {
+        use super::imported_acquire_barrier;
+        use ash::vk::{self, Handle};
+        let img = vk::Image::from_raw(7);
+        for fresh in [true, false] {
+            let b = imported_acquire_barrier(
+                img,
+                fresh,
+                9,
+                3,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_READ,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+            assert_eq!(b.src_queue_family_index, 9);
+            assert_eq!(b.dst_queue_family_index, 3);
+            assert_eq!(
+                b.old_layout,
+                if fresh {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    vk::ImageLayout::GENERAL
+                }
+            );
+        }
+    }
+
+    /// The release hands the image back to the producer family in GENERAL — the layout the
+    /// next cached acquire comes out of.
+    #[test]
+    fn imported_release_returns_ownership_in_general() {
+        use super::imported_release_barrier;
+        use ash::vk::{self, Handle};
+        let b = imported_release_barrier(
+            vk::Image::from_raw(7),
+            vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+            3,
+            9,
+            vk::PipelineStageFlags2::VIDEO_ENCODE_KHR,
+            vk::AccessFlags2::VIDEO_ENCODE_READ_KHR,
+        );
+        assert_eq!(b.src_queue_family_index, 3);
+        assert_eq!(b.dst_queue_family_index, 9);
+        assert_eq!(b.new_layout, vk::ImageLayout::GENERAL);
+    }
 
     /// The latch needs every gate at once; the 780M's measured caps pass, each missing one fails.
     #[test]

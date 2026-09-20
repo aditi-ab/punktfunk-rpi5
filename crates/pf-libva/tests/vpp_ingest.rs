@@ -372,7 +372,11 @@ fn the_session_encodes_what_ingest_gives_it() {
             W as usize * 4,
         )
         .expect("ingest");
-        let pic = enc.encode(i == 0).expect("encode");
+        enc.encode(i == 0).expect("encode");
+        let pic = enc
+            .collect(true)
+            .expect("collect")
+            .expect("a picture per encode");
         assert_eq!(pic.is_idr, i == 0);
         stream.extend_from_slice(&pic.bytes);
     }
@@ -405,7 +409,11 @@ fn a_larger_picture_encodes_at_the_session_size() {
         let picture = [i * 40, 0, 255 - i * 40, 255].repeat((sw * sh) as usize);
         enc.submit_packed(&picture, VA_FOURCC_BGRA, sw, sh, sw as usize * 4)
             .expect("scaled ingest");
-        let pic = enc.encode(i == 0).expect("encode");
+        enc.encode(i == 0).expect("encode");
+        let pic = enc
+            .collect(true)
+            .expect("collect")
+            .expect("a picture per encode");
         assert_eq!(pic.is_idr, i == 0);
         assert!(
             pic.bytes.len() > 10,
