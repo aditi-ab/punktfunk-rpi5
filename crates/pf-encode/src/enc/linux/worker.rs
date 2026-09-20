@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 /// Bumped on any wire change. Host and worker are different files, so a lockstep
 /// miss must fall back to the in-process encoder, never a dead session.
-pub(crate) const PROTO_VERSION: u32 = 1;
+pub(crate) const PROTO_VERSION: u32 = 2;
 
 /// Compile-time `CARGO_PKG_VERSION` of this crate. Handshake compares it too: a
 /// protocol can stay still while the encoder moves, and a stale worker binary
@@ -162,6 +162,10 @@ pub(crate) enum ToWorker {
         fps: u32,
         bitrate_bps: u64,
         chroma444: bool,
+        /// Negotiated stream depth (8 or 10) and the BT.2020 PQ flag — the encoder's
+        /// CSC shader, plane formats, and colour stamp all follow them.
+        bit_depth: u8,
+        hdr: bool,
         priority_intent: Option<String>,
     },
     /// Encode one frame. The dmabuf fd rides as `SCM_RIGHTS` only on first sight
@@ -385,6 +389,8 @@ fn run(sock: OwnedFd) -> Result<()> {
         fps,
         bitrate_bps,
         chroma444,
+        bit_depth,
+        hdr,
         priority_intent,
     } = hello
     else {
@@ -411,6 +417,8 @@ fn run(sock: OwnedFd) -> Result<()> {
         fps,
         bitrate_bps,
         chroma444,
+        bit_depth,
+        hdr,
         priority_intent.as_deref(),
     ) {
         Ok(e) => e,
@@ -671,6 +679,8 @@ mod tests {
             fps: 60,
             bitrate_bps: 400_000_000,
             chroma444: true,
+            bit_depth: 10,
+            hdr: true,
             priority_intent: Some("realtime".into()),
         }
     }
@@ -778,6 +788,8 @@ mod tests {
             fps,
             bitrate_bps,
             chroma444,
+            bit_depth,
+            hdr,
             priority_intent,
             ..
         } = hello()
@@ -795,6 +807,8 @@ mod tests {
             fps,
             bitrate_bps,
             chroma444,
+            bit_depth,
+            hdr,
             priority_intent,
         };
         let err = ipc::send(a.as_fd(), &huge, None).unwrap_err();

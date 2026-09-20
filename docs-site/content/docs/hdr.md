@@ -37,12 +37,13 @@ that asked for 8-bit is never handed PQ. If enabling it fails, the host logs a l
 8-bit anyway — the client was already told HDR, so that is the one place a Punktfunk label can
 outrun the picture.
 
-- **HDR and 4:4:4 compose on Windows, not on Linux.** A **Windows** host carries both: the capture
-  path writes full-resolution 10-bit chroma and NVENC encodes HEVC Main 4:4:4 10, so
+- **HDR and 4:4:4 compose on Windows, and on Linux via PyroWave.** A **Windows** host carries both:
+  the capture path writes full-resolution 10-bit chroma and NVENC encodes HEVC Main 4:4:4 10, so
   [full chroma](/docs/client-settings) costs nothing on an HDR desktop; [PyroWave](/docs/pyrowave)
-  does the same there, in 16-bit planes. On **Linux** the 4:4:4 route is 8-bit, so a session that
-  asks for both keeps HDR and drops to 4:2:0 — HDR wins, since games can only offer HDR on an HDR
-  display. AV1 never carries 4:4:4 anywhere: Range Extensions are HEVC-only.
+  does the same there, in 16-bit planes. On **Linux** the H.26x 4:4:4 route is 8-bit, so an HEVC
+  session that asks for both keeps HDR and drops to 4:2:0 — HDR wins, since games can only offer
+  HDR on an HDR display. PyroWave's own 4:4:4 conversion is 10-bit, so a Linux PyroWave session
+  keeps both. AV1 never carries 4:4:4 anywhere: Range Extensions are HEVC-only.
 - **Vulkan games need the bundled layer.** NVIDIA and AMD Vulkan drivers refuse to advertise any HDR
   colour space for a surface on an indirect (virtual) display, so Vulkan games decide the device
   "does not support HDR" — though the driver happily presents an HDR swapchain there. The host
@@ -144,13 +145,15 @@ a tone-map — washed out. Turn the client's HDR setting off there. The
   one and not the other tells the truth about each.
 - **H.264** — never. High10 is not an encode mode on the hardware Punktfunk targets, so negotiation
   never asks. Pinning H.264 in your client settings pins the session to SDR.
-- **[PyroWave](/docs/pyrowave)** — carries HDR in 16-bit planes, but **only from a Windows host**.
-  The Linux PyroWave capture path has no HDR colour conversion, so a Linux-hosted PyroWave session
-  is SDR. Use HEVC or AV1 for HDR from Linux.
+- **[PyroWave](/docs/pyrowave)** — carries HDR in 16-bit planes on Windows and Linux hosts alike.
+  On Linux it needs the same HDR source as the H.26x codecs (a `punktfunk-gamescope` virtual
+  output — see [Per host](#per-host)); its encoder does the colour conversion itself, so it also
+  keeps 4:4:4 under HDR where the H.26x 4:4:4 path would drop to 8-bit.
 
-With full chroma: a **Linux** host encodes 4:4:4 at 8 bits, so a session that negotiates both
-resolves back down to SDR before the stream starts — on Linux, 4:4:4 wins. A **Windows** host
-carries HDR and full chroma at once. Full chroma is off until you turn it on, so this only bites if
+With full chroma: a **Linux** host encodes H.26x 4:4:4 at 8 bits, so an HEVC session that
+negotiates both resolves back down to SDR before the stream starts — on Linux, 4:4:4 wins over HDR
+there. PyroWave's 4:4:4 is 10-bit and combines with HDR on either host. A **Windows** host carries
+HDR and full chroma at once. Full chroma is off until you turn it on, so this only bites if
 you did.
 
 ## Check it

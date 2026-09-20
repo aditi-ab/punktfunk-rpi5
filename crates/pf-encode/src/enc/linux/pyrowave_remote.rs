@@ -109,6 +109,9 @@ struct Params {
     height: u32,
     fps: u32,
     chroma: ChromaFormat,
+    /// Negotiated stream depth (8 or 10) and the BT.2020 PQ flag.
+    bit_depth: u8,
+    hdr: bool,
 }
 
 enum Fail {
@@ -343,6 +346,8 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
         fps: p.fps,
         bitrate_bps,
         chroma444: p.chroma.is_444(),
+        bit_depth: p.bit_depth,
+        hdr: p.hdr,
         // Resolved here and forwarded. The worker strips this variable from its own environment,
         // so the operator's knob cannot silently mean something different across the boundary.
         priority_intent: std::env::var("PYROWAVE_QUEUE_PRIORITY").ok(),
@@ -412,16 +417,28 @@ pub(crate) fn open_preferring_worker(
     fps: u32,
     bitrate_bps: u64,
     chroma: ChromaFormat,
+    bit_depth: u8,
+    hdr: bool,
 ) -> Result<Box<dyn Encoder>> {
     let params = Params {
         width,
         height,
         fps,
         chroma,
+        bit_depth,
+        hdr,
     };
     let inline = || -> Result<Box<dyn Encoder>> {
-        super::pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps, chroma)
-            .map(|e| Box::new(e) as Box<dyn Encoder>)
+        super::pyrowave::PyroWaveEncoder::open(
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            chroma,
+            bit_depth,
+            hdr,
+        )
+        .map(|e| Box::new(e) as Box<dyn Encoder>)
     };
     let path = match resolve_worker_path() {
         WorkerPath::Off => {
@@ -540,6 +557,8 @@ impl RemotePyroWave {
                 self.params.fps,
                 self.bitrate_bps,
                 self.params.chroma,
+                self.params.bit_depth,
+                self.params.hdr,
             )
             .context("open the in-process PyroWave encoder after leaving the worker")?;
             // Replay: the boundary changes the AU bytes, so a fallback that forgot it would ship
@@ -865,6 +884,8 @@ mod tests {
             height: 1080,
             fps: 60,
             chroma: ChromaFormat::Yuv420,
+            bit_depth: 8,
+            hdr: false,
         }
     }
 
@@ -1111,6 +1132,8 @@ mod tests {
                 height: 64,
                 fps: 60,
                 chroma: ChromaFormat::Yuv420,
+                bit_depth: 8,
+                hdr: false,
             },
             bitrate_bps: 5_000_000,
             worker_path: PathBuf::from("/usr/bin/punktfunk-encode-worker"),
