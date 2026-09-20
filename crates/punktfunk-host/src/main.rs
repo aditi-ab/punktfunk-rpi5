@@ -593,6 +593,46 @@ fn real_main() -> Result<()> {
             };
             let source = match get("--source") {
                 Some("virtual") => native::Punktfunk1Source::Virtual,
+                Some("synthetic-abr") => {
+                    let fill = get("--fill")
+                        .and_then(|s| s.parse().ok())
+                        .filter(|&p: &u32| p > 0 && p <= 100)
+                        .unwrap_or(100);
+                    let spec = get("--content").unwrap_or("steady");
+                    let recovery = std::time::Duration::from_millis(
+                        get("--recovery-ms")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0),
+                    );
+                    let answer = match native::KeyframeAnswer::parse(
+                        get("--keyframe-answer").unwrap_or("idr"),
+                    ) {
+                        Some(a) => a,
+                        None => bail!("--keyframe-answer takes idr or wave:<n>"),
+                    };
+                    let bringup = std::time::Duration::from_millis(
+                        get("--bringup-ms")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(2_500),
+                    );
+                    let idr_pct = get("--idr-pct")
+                        .and_then(|s| s.parse().ok())
+                        .filter(|&p: &u32| p > 0)
+                        .unwrap_or(native::DEFAULT_IDR_PCT);
+                    match native::Content::parse(spec, fill) {
+                        Some(c) => native::Punktfunk1Source::SyntheticAbr(native::SynthAbrShape {
+                            content: c,
+                            recovery,
+                            answer,
+                            idr_pct,
+                            bringup,
+                            serve_ramp: !args.iter().any(|a| a == "--no-ramp"),
+                        }),
+                        None => {
+                            bail!("--content takes steady, idle-then-motion or frame-driven:<fps>")
+                        }
+                    }
+                }
                 _ => native::Punktfunk1Source::Synthetic,
             };
             // Empty would arm SPAKE2 with an empty password (same trap as `--mgmt-token`).
@@ -996,8 +1036,34 @@ SERVE OPTIONS:
 
 PUNKTFUNK1-HOST OPTIONS:
     --port <N>                   QUIC listen port (default: 9777)
-    --source <synthetic|virtual> test frames, or virtual display + NVENC (default: synthetic)
-    --seconds <N>                per-session stream duration, virtual source (default: 30)
+    --source <synthetic|synthetic-abr|virtual>
+                                 test frames, frames sized from the live Automatic rate, or a
+                                 virtual display + NVENC (default: synthetic). synthetic-abr
+                                 needs no display and no GPU
+    --content <SCRIPT>           what synthetic-abr encodes: steady, idle-then-motion, or
+                                 frame-driven:<fps> for a source slower than the session
+                                 (default: steady)
+    --fill <PCT>                 share of each frame's bit allowance synthetic-abr fills,
+                                 1-100 (default: 100)
+    --recovery-ms <MS>           how long synthetic-abr takes to answer a keyframe request.
+                                 0 (the default) answers on the next frame; a GPU host that
+                                 rebuilds its pipeline takes about a second
+    --keyframe-answer <KIND>     what synthetic-abr answers a keyframe request with: idr
+                                 (the default), or wave:<n> to answer only every n-th ask
+                                 with one, as a host that prefers an intra-refresh wave does.
+                                 Either way the answer waits out the same IDR cooldown a real
+                                 host applies, so a burst of asks costs one keyframe
+    --idr-pct <PCT>              a keyframe's size as a percent of an ordinary frame
+                                 (default: 1000). A hardware encoder runs VBV at one frame,
+                                 so a measured host is far nearer 100 than 1000
+    --bringup-ms <MS>            how long synthetic-abr holds its first frame back, the way
+                                 a display session's pipeline build does (default: 2500).
+                                 The client measures the link over this window
+    --no-ramp                    do not offer to measure the link before the first frame.
+                                 The client falls back to the in-session test burst, which
+                                 is what it does against a host that predates the ramp
+    --seconds <N>                per-session stream duration, virtual and synthetic-abr
+                                 sources (default: 30)
     --frames <N>                 per-session frame count, synthetic source (default: 300)
     --max-sessions <N>           exit after N sessions; 0 = serve forever (default: 0)
     --max-concurrent <N>         stream at most N sessions at once (NVENC bound); overflow waits

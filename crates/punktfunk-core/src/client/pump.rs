@@ -1,19 +1,18 @@
 //! The client worker: QUIC handshake + control/input/datagram tasks + the blocking data-plane pump.
 
 use super::frame_channel::{
-    StandingLatAction, StandingLatency, ADAPT_REPORT_INTERVAL, CLOCK_RESYNC_INTERVAL, FLUSH_AFTER,
-    FLUSH_COOLDOWN, FLUSH_LATENCY, NOOP_CLOCK_FLUSHES_TO_DISARM, NOOP_FLUSH_DATAGRAMS,
-    PIN_SHEDS_TO_WARN, QUEUE_HIGH, QUEUE_LOW, STANDING_TIME,
+    StandingLatAction, StandingLatency, CLOCK_RESYNC_INTERVAL, FLUSH_AFTER, FLUSH_COOLDOWN,
+    FLUSH_LATENCY, NOOP_CLOCK_FLUSHES_TO_DISARM, NOOP_FLUSH_DATAGRAMS, PIN_SHEDS_TO_WARN,
+    QUEUE_HIGH, QUEUE_LOW, STANDING_TIME,
 };
 use super::worker::reject_from_close;
 use super::*;
-use crate::abr::BitrateController;
 use crate::config::Role;
 use crate::packet::FLAG_PROBE;
 use crate::quic::{
-    io, wall_clock_ns, window_loss_ppm, BitrateChanged, ClipState, ClockEcho, ClockResync,
-    DeliveryReport, Hello, LossReport, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe,
-    ResyncAdmit, ResyncGuard, ResyncStep, SetBitrate, Start, Welcome,
+    io, wall_clock_ns, BitrateChanged, ClipState, ClockEcho, ClockResync, DeliveryReport, Hello,
+    LossReport, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, ResyncAdmit, ResyncGuard,
+    ResyncStep, SetBitrate, Start, Welcome,
 };
 use crate::session::Session;
 use crate::transport::UdpTransport;
@@ -26,6 +25,10 @@ mod datagram_task;
 mod handshake;
 mod input_task;
 mod rx_gap;
+
+/// Host bitrate acks the control task parked for the pump, each with the
+/// reason it carried (`None` from a host that does not name its limits).
+type AckQueue = std::collections::VecDeque<(u32, Option<crate::quic::AckReason>)>;
 
 pub(super) async fn run_pump(args: WorkerArgs) {
     let hs = match handshake::connect_and_handshake(&args).await {
@@ -82,6 +85,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         decode_lat,
         live_bitrate,
         rate_cut,
+        abr_windows,
+        abr_ramp,
         recent_rfis,
         audio_mute,
         pad_slots,
@@ -99,6 +104,12 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // Host marks idle-keepalive repeats (`USER_FLAG_REPEAT`). Only then is an
     // unflagged AU new content; older hosts keep the legacy window arithmetic.
     let marks_repeats = negotiated.host_caps2 & crate::quic::HOST_CAP2_REPEAT_MARK != 0;
+    // Host serves probe requests during its own bring-up: measure the link
+    // before the first frame instead of bursting beside it.
+    let serves_ramp = negotiated.host_caps2 & crate::quic::HOST_CAP2_RAMP != 0;
+    // Host divides a path its sessions share, and a delivery count every window
+    // is the only thing it can divide by.
+    let reads_delivery = negotiated.host_caps2 & crate::quic::HOST_CAP2_DELIVERY != 0;
     // Wire budgets: `actual` is wire bytes plus this audio reservation, spent
     // whether video flows or not. PCM is exact; Opus uses the default-tier ladder
     // (a pinned tier skews a few hundred kbps, inside the ¾ utilization gate).
@@ -212,8 +223,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
 
     // BitrateChanged queue, drained in order. Not latest-wins: host-cap learning
     // needs two consecutive short acks in the same 750 ms window.
-    let bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>> =
-        Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let bitrate_ack: Arc<Mutex<AckQueue>> = Arc::new(Mutex::new(AckQueue::new()));
     // Outbound `CtrlRequest::Keyframe` count (the one choke point). Pump drains per report window.
     let recovery_kf = Arc::new(AtomicU32::new(0));
     // Host `PipelineGap` length. A local rebuild starves a window without the
@@ -323,11 +333,15 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         bit_depth,
         chroma_format,
         marks_repeats,
+        serves_ramp,
+        reads_delivery,
         audio_reserved_kbps,
         stream_cap_kbps,
         refresh_hz,
         mode_slot: mode_slot_pump,
         rate_cut,
+        abr_windows,
+        abr_ramp,
     };
     let _ = tokio::task::spawn_blocking(move || pump.run()).await;
 

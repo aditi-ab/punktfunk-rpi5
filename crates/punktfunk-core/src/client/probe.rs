@@ -31,6 +31,11 @@ pub(crate) struct ProbeState {
     /// 0 = fewer than two probe packets; consumers use
     /// [`throughput_window_ms`](Self::throughput_window_ms).
     pub(crate) client_interval_ms: u32,
+    /// The same interval in microseconds. A bring-up step is 25 ms, so a
+    /// millisecond of rounding is 4 % of the ratio that decides a wall — more
+    /// than the 10 % the decision turns on. The stamps are nanoseconds; only
+    /// this field keeps their resolution.
+    pub(crate) client_interval_us: u32,
     /// Host end-of-burst report.
     pub(crate) host_goodput_bytes: u64,
     pub(crate) host_au: u32,
@@ -44,6 +49,9 @@ pub(crate) struct ProbeState {
     /// `ProbeRequest` would latch `active` and suppress the whole report tick
     /// (loss, ABR, standing-latency, clock re-sync) for the rest of the session.
     pub(crate) duration_ms: u32,
+    /// A bring-up ramp step. Its delivered figures keep moving after the host
+    /// report lands — see [`refresh_delivered`](Self::refresh_delivered).
+    pub(crate) ramp: bool,
 }
 
 impl ProbeState {
@@ -54,14 +62,49 @@ impl ProbeState {
     ///
     /// The host `duration_ms` is the SEND window: it closes while the
     /// bottleneck queue still drains, so client bytes / host window overstates
-    /// the link. [`set_ceiling`](crate::abr::BitrateController::set_ceiling)
+    /// the link. [`crate::abr::Driver::set_ceiling`]
     /// never lowers, so a high reading sticks for the session.
     pub(crate) fn measured_interval_ms(first_ns: u64, last_ns: u64, packets: u64) -> Option<u32> {
+        Self::measured_interval_us(first_ns, last_ns, packets).map(|us| (us / 1_000).max(1))
+    }
+
+    /// The same interval in microseconds, floored at 1. What the ramp judges
+    /// a step on: at a 25 ms step the millisecond form quantises the ratio by
+    /// 4 %, and four of the rig's walls were decided inside that.
+    pub(crate) fn measured_interval_us(first_ns: u64, last_ns: u64, packets: u64) -> Option<u32> {
         if packets < 2 || first_ns == 0 || last_ns <= first_ns {
             return None;
         }
-        let ms = ((last_ns - first_ns) / 1_000_000).max(1);
-        Some(u32::try_from(ms).unwrap_or(u32::MAX))
+        let us = ((last_ns - first_ns) / 1_000).max(1);
+        Some(u32::try_from(us).unwrap_or(u32::MAX))
+    }
+
+    /// Re-read the probe counters into a finished ramp step's figures.
+    ///
+    /// The host's report closes its SEND window; the bottleneck queue is
+    /// still draining toward us. Counting on lets the bring-up ramp time the
+    /// drain — the bytes stop moving when the receive buffer is empty, which
+    /// is the only honest denominator (`abr::probe`). Probe-scoped counters,
+    /// so video beside the burst cannot inflate them. The 800 ms burst keeps
+    /// the figures the control task froze: its tail is a thousandth of them.
+    pub(crate) fn refresh_delivered(&mut self, st: &crate::stats::Stats) {
+        let base_p = self.base_packets.unwrap_or(st.probe_packets_received);
+        let base_b = self.base_bytes.unwrap_or(st.probe_bytes_received);
+        self.delivered_packets = st.probe_packets_received.saturating_sub(base_p);
+        self.delivered_bytes = st.probe_bytes_received.saturating_sub(base_b);
+        self.first_arrival_ns = st.probe_first_arrival_ns;
+        self.last_arrival_ns = st.probe_last_arrival_ns;
+        self.client_interval_us = Self::measured_interval_us(
+            self.first_arrival_ns,
+            self.last_arrival_ns,
+            self.delivered_packets,
+        )
+        .unwrap_or(0);
+        self.client_interval_ms = if self.client_interval_us > 0 {
+            (self.client_interval_us / 1_000).max(1)
+        } else {
+            0
+        };
     }
 
     /// Throughput denominator, ms: client receive interval when the burst

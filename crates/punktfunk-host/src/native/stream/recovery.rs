@@ -7,30 +7,49 @@ use super::state::{announce_pipeline_gap, Inflight, StreamState};
 use super::*;
 
 impl StreamState {
-    /// Adaptive FEC moved: re-derive the encoder rate inside the unchanged wire budget.
+    /// Apply adaptive FEC behind the encoder rate it implies. A budget-identity
+    /// codec needs no retarget; every other codec publishes only after its
+    /// encoder accepts. A refusal leaves both on the previous FEC for a retry.
     pub(super) fn on_fec_moved(&mut self) {
-        if self.budget_identity {
+        let requested = self.fec_requested.load(Ordering::Acquire);
+        if requested == self.last_fec {
             return;
         }
-        let fec_now = self.fec_target.load(Ordering::Relaxed);
-        if fec_now == self.last_fec {
+        if self.budget_identity {
+            publish_fec(&self.fec_target, &mut self.last_fec, requested);
             return;
         }
         let prev = self.enc_derive(self.last_fec).enc_kbps(self.bitrate_kbps);
-        let want = self.enc_derive(fec_now).enc_kbps(self.bitrate_kbps);
-        self.last_fec = fec_now;
-        if want != prev && self.enc.reconfigure_bitrate(want as u64 * 1000) {
+        let want = self.enc_derive(requested).enc_kbps(self.bitrate_kbps);
+        if fec_retarget(
+            |bps| want == prev || self.enc.reconfigure_bitrate(bps),
+            want as u64 * 1000,
+            &self.fec_target,
+            &self.fec_requested,
+            &mut self.last_fec,
+            requested,
+        ) {
             tracing::debug!(
-                fec_pct = fec_now,
+                fec_pct = requested,
                 encoder_kbps = want,
                 budget_kbps = self.bitrate_kbps,
                 "adaptive FEC moved — encoder rate re-derived within the wire budget"
             );
+        } else {
+            tracing::warn!(
+                requested_fec_pct = requested,
+                applied_fec_pct = self.last_fec,
+                "adaptive FEC held — encoder refused the matching bitrate"
+            );
         }
     }
 
-    /// The client's latest bitrate ask, clamped to a known encoder ceiling: reconfigure in place
-    /// when the encoder can, else rebuild it at the new rate.
+    /// The client's latest bitrate ask: reconfigure in place when the encoder can, else rebuild
+    /// it at the new rate, and tell the ceiling what the encoder made of it.
+    ///
+    /// The ask arrives already resolved against the ceiling — the control task spends it there so
+    /// the ack and the encoder never disagree. Clamping again here would make an ack the client
+    /// already holds a promise the encoder was never given.
     pub(super) fn on_bitrate_request(&mut self) {
         let mut want_kbps = None;
         while let Ok(k) = self.bitrate_rx.try_recv() {
@@ -38,17 +57,6 @@ impl StreamState {
         }
         self.enc
             .set_send_spread_us(self.send_spread_us.load(Ordering::Relaxed));
-        if let Some(k) = want_kbps.as_mut() {
-            let ceiling = self.encoder_ceiling_kbps.load(Ordering::Relaxed);
-            if ceiling != 0 && *k > ceiling {
-                tracing::info!(
-                    requested_kbps = *k,
-                    ceiling_kbps = ceiling,
-                    "bitrate request clamped to the known encoder ceiling"
-                );
-                *k = ceiling;
-            }
-        }
         let Some(new_kbps) = want_kbps.filter(|&k| k != self.bitrate_kbps) else {
             return;
         };
@@ -70,11 +78,7 @@ impl StreamState {
                 requested_kbps = new_kbps,
                 "encoder bitrate reconfigured in place (adaptive bitrate — no IDR)"
             );
-            if applied_kbps < new_kbps {
-                self.encoder_ceiling_kbps
-                    .store(applied_kbps, Ordering::Relaxed);
-                let _ = self.retarget_tx.send(applied_kbps);
-            }
+            self.note_applied_rate(new_kbps, applied_kbps);
             if applied_kbps < self.bitrate_kbps {
                 self.behind_score = 0;
             }
@@ -111,11 +115,7 @@ impl StreamState {
                     "encoder rebuilt at new bitrate (adaptive bitrate)"
                 );
                 self.enc = new_enc;
-                if applied_kbps < new_kbps {
-                    self.encoder_ceiling_kbps
-                        .store(applied_kbps, Ordering::Relaxed);
-                    let _ = self.retarget_tx.send(applied_kbps);
-                }
+                self.note_applied_rate(new_kbps, applied_kbps);
                 self.counters.note_bitrate(applied_kbps);
                 self.bitrate_kbps = applied_kbps;
                 self.live_bitrate.store(applied_kbps, Ordering::Relaxed);
@@ -134,8 +134,23 @@ impl StreamState {
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
                     "bitrate-change encoder rebuild failed — keeping the current rate");
-                let _ = self.retarget_tx.send(self.bitrate_kbps);
+                self.note_applied_rate(new_kbps, self.bitrate_kbps);
             }
+        }
+    }
+
+    /// What the encoder made of `want`: the ceiling learns it, and a client that
+    /// was promised `want` is corrected.
+    ///
+    /// A failed rebuild reports the rate it kept, so a refusal that costs no
+    /// encoder at all still teaches the ceiling.
+    fn note_applied_rate(&mut self, want: u32, applied: u32) {
+        self.encoder_ceiling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_applied(want, applied);
+        if applied < want {
+            let _ = self.retarget_tx.send((applied, AckReason::EncoderLimit));
         }
     }
 
@@ -219,8 +234,6 @@ impl StreamState {
     /// re-asks after is one it lost or could not use; each such IDR doubles the cooldown
     /// ([`idr_cooldown`]) so the repair stops feeding the overload that defeats it.
     fn force_keyframe(&mut self, rfi_declined: bool) {
-        const IDR_COOLDOWN_INTRA: std::time::Duration = std::time::Duration::from_secs(2);
-        const IDR_COOLDOWN_FULL: std::time::Duration = std::time::Duration::from_millis(750);
         let base = if self.enc.caps().intra_refresh_recovery {
             IDR_COOLDOWN_INTRA
         } else {
@@ -378,6 +391,38 @@ impl StreamState {
     }
 }
 
+/// Publish one FEC target to the packetizer and the stream's applied record.
+fn publish_fec(fec_target: &AtomicU8, last_fec: &mut u8, requested: u8) {
+    *last_fec = requested;
+    fec_target.store(requested, Ordering::Release);
+}
+
+/// Apply a control-proposed FEC target behind the encoder's answer: `retarget` is the
+/// in-place `reconfigure_bitrate` (true when the new FEC implies no rate change), and
+/// only its success moves `last_fec` and the applied `fec_target`. On refusal the
+/// request slot returns to the applied value — unless a newer proposal already landed.
+pub(super) fn fec_retarget(
+    retarget: impl FnOnce(u64) -> bool,
+    bps: u64,
+    fec_target: &AtomicU8,
+    fec_requested: &AtomicU8,
+    last_fec: &mut u8,
+    requested: u8,
+) -> bool {
+    if retarget(bps) {
+        publish_fec(fec_target, last_fec, requested);
+        true
+    } else {
+        let _ = fec_requested.compare_exchange(
+            requested,
+            *last_fec,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        false
+    }
+}
+
 /// Rebuild the encoder in place and drop owed in-flight AUs. `false` = no in-place reset.
 pub(super) fn reset_stalled_encoder(
     enc: &mut Box<dyn crate::encode::Encoder>,
@@ -445,6 +490,13 @@ const RECOVERY_FLIGHT: std::time::Duration = std::time::Duration::from_millis(30
 /// Longest wait between forced IDRs, whatever the backoff. 3 s of a broken picture is the
 /// ceiling a user tolerates over a storm of repairs that never take.
 const IDR_COOLDOWN_MAX: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Base cooldown where the encoder's recovery marks let the picture heal over ~0.5 s.
+pub(super) const IDR_COOLDOWN_INTRA: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Base cooldown where the IDR is the only repair, so the wait is short. `synth_abr` takes
+/// this one: an arithmetic encoder has no recovery marks.
+pub(super) const IDR_COOLDOWN_FULL: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Consecutive unhealed IDRs that name the state in the log, once.
 const IDR_STORM: u32 = 3;
@@ -558,6 +610,7 @@ fn matches_client_recovery_cooldown(period: std::time::Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encode::Encoder;
     use std::time::{Duration, Instant};
 
     /// Drives [`KeyframeGate`] like the encode loop: a request every `step` from `t`, each
@@ -697,6 +750,116 @@ mod tests {
         assert!(!matches_client_flush_cadence(flush * 2));
         assert!(!matches_client_flush_cadence(flush + flush / 5));
         assert!(!matches_client_flush_cadence(std::time::Duration::ZERO));
+    }
+
+    /// Encoder whose in-place retarget answer is scripted; every other trait
+    /// method keeps its default. `asks` records the rates it was offered.
+    struct RetargetEnc {
+        accepts: bool,
+        asks: Vec<u64>,
+    }
+
+    impl crate::encode::Encoder for RetargetEnc {
+        fn submit(&mut self, _frame: &crate::capture::CapturedFrame) -> Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> Result<Option<crate::encode::EncodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
+            self.asks.push(bps);
+            self.accepts
+        }
+    }
+
+    /// A budget-identity codec changes parity without changing its encoder
+    /// rate, so its proposal publishes directly to the packetizer.
+    #[test]
+    fn on_fec_moved_applies_identity_budget_fec_without_a_retarget() {
+        let applied = AtomicU8::new(10);
+        let mut last_fec = 10;
+        publish_fec(&applied, &mut last_fec, 30);
+        assert_eq!(last_fec, 30);
+        assert_eq!(applied.load(Ordering::Relaxed), 30);
+    }
+
+    /// The `want == prev` leg aside, [`StreamState::on_fec_moved`] is this helper:
+    /// an accepted retarget publishes the requested FEC to `fec_target` and
+    /// `last_fec` together.
+    #[test]
+    fn on_fec_moved_applies_the_proposal_once_the_encoder_accepts() {
+        let applied = AtomicU8::new(10);
+        let requested = AtomicU8::new(30);
+        let mut last_fec = 10;
+        let mut enc = RetargetEnc {
+            accepts: true,
+            asks: Vec::new(),
+        };
+        assert!(fec_retarget(
+            |bps| enc.reconfigure_bitrate(bps),
+            12_000_000,
+            &applied,
+            &requested,
+            &mut last_fec,
+            30,
+        ));
+        assert_eq!(enc.asks, [12_000_000]);
+        assert_eq!(last_fec, 30);
+        assert_eq!(applied.load(Ordering::Relaxed), 30);
+        assert_eq!(requested.load(Ordering::Relaxed), 30);
+    }
+
+    /// A refused retarget leaves applied FEC and `last_fec` untouched and hands
+    /// the request slot back to the applied value.
+    #[test]
+    fn on_fec_moved_refusal_keeps_the_previous_fec() {
+        let applied = AtomicU8::new(10);
+        let requested = AtomicU8::new(30);
+        let mut last_fec = 10;
+        let mut enc = RetargetEnc {
+            accepts: false,
+            asks: Vec::new(),
+        };
+        assert!(!fec_retarget(
+            |bps| enc.reconfigure_bitrate(bps),
+            12_000_000,
+            &applied,
+            &requested,
+            &mut last_fec,
+            30,
+        ));
+        assert_eq!(last_fec, 10);
+        assert_eq!(applied.load(Ordering::Relaxed), 10);
+        assert_eq!(requested.load(Ordering::Relaxed), 10);
+    }
+
+    /// The refusal's compare-exchange must not clobber a proposal the control
+    /// task wrote after the refused one: the reset applies only to the slot
+    /// still holding the value this call was asked to move.
+    #[test]
+    fn on_fec_moved_refusal_does_not_clobber_a_newer_proposal() {
+        let applied = AtomicU8::new(10);
+        // Control raced ahead: the slot holds a newer proposal than the refused 30.
+        let requested = AtomicU8::new(50);
+        let mut last_fec = 10;
+        let mut enc = RetargetEnc {
+            accepts: false,
+            asks: Vec::new(),
+        };
+        assert!(!fec_retarget(
+            |bps| enc.reconfigure_bitrate(bps),
+            12_000_000,
+            &applied,
+            &requested,
+            &mut last_fec,
+            30,
+        ));
+        assert_eq!(last_fec, 10);
+        assert_eq!(applied.load(Ordering::Relaxed), 10);
+        assert_eq!(requested.load(Ordering::Relaxed), 50);
     }
 
     #[test]

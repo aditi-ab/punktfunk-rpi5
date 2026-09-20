@@ -326,14 +326,20 @@ pub struct FecConfig {
 /// on the wire in `Welcome`, and the receiver sizes blocks from the packet header anyway.
 pub(crate) const MIN_RECOVERY_SHARDS: usize = 2;
 
+/// Parity shards a percent buys for a block of `data_shards`. The adaptive-FEC
+/// target is sized against this, so there is one definition of it.
+pub(crate) fn recovery_shards(data_shards: usize, fec_percent: u8) -> usize {
+    if fec_percent == 0 || data_shards == 0 {
+        return 0;
+    }
+    (data_shards * fec_percent as usize)
+        .div_ceil(100)
+        .max(MIN_RECOVERY_SHARDS)
+}
+
 impl FecConfig {
     pub fn recovery_for(&self, data_shards: usize) -> usize {
-        if self.fec_percent == 0 || data_shards == 0 {
-            return 0;
-        }
-        (data_shards * self.fec_percent as usize)
-            .div_ceil(100)
-            .max(MIN_RECOVERY_SHARDS)
+        recovery_shards(data_shards, self.fec_percent)
     }
 }
 

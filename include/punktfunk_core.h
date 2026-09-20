@@ -768,6 +768,22 @@
 // bit — Hello is first contact, with no host capability known yet, and stays frozen.
 #define PUNKTFUNK_HOST_CAP2_EXT 4
 
+// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host serves
+// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is punched,
+// before its pipeline exists and without the one-per-10 s spacing, until the first video
+// frame leaves. That window is what the client's bring-up ramp measures the link in; a
+// client that does not see the bit bursts beside live video as before.
+#define PUNKTFUNK_HOST_CAP2_RAMP 16
+
+// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads a
+// [`DeliveryReport`](super::control::DeliveryReport) every report window and divides a path
+// two sessions share by them (`abr::governor`). Toward this bit the client sends one per
+// window — 13 bytes against 750 ms; toward every other host it sends one while nothing is
+// arriving and one when the first packets land, because an older host logs each unknown
+// message. A host that leaves the bit clear therefore learns nothing about a session's air
+// after its first window, and its groups are left alone.
+#define PUNKTFUNK_HOST_CAP2_DELIVERY 32
+
 // [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
 // that wants to stream from a GPU-less host must advertise this.
 #define PUNKTFUNK_CODEC_H264 1
@@ -1081,6 +1097,19 @@
 
 // Longest [`EXT_TAG_CLIENT`] value in UTF-8 bytes. A log field, so short.
 #define PUNKTFUNK_EXT_CLIENT_MAX 96
+
+// Extension tag `3` on `Start`: one byte of ABR protocol features the client understands,
+// as a bitfield ([`EXT_ABR_ACK_REASON`] is bit 0). A later feature takes another bit here
+// rather than a tag of its own, so the host reads one byte and answers what it recognises.
+// An absent tag, an empty value or a zero byte is a client that understands none of them —
+// which is every client shipped so far.
+#define PUNKTFUNK_EXT_TAG_ABR 3
+
+// [`EXT_TAG_ABR`] bit 0: the client reads the reason byte on
+// [`BitrateChanged`](super::control::BitrateChanged). The host sends that tenth byte only
+// toward this bit, because every client without it rejects an ack of any other length.
+// Core sets it for every embedder that links the controller reading it, not the embedder.
+#define PUNKTFUNK_EXT_ABR_ACK_REASON 1
 
 // Largest extension block on the wire, its `ext_len` header included. The block is read
 // before the peer is trusted, so this bounds what one message makes the other side hold.

@@ -107,10 +107,7 @@ pub struct Session {
 /// frames return as the last shard lands, so this is reassembly completion. CLOCK_REALTIME
 /// to match `pts_ns` and the skew handshake — not monotonic; the math is cross-machine.
 fn stamp_received(mut f: Frame) -> Frame {
-    f.received_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    f.received_ns = crate::stats::now_realtime_ns();
     f
 }
 
@@ -637,6 +634,14 @@ impl Session {
     /// AU still completes as one `Frame` here.
     pub fn set_deliver_frame_parts(&mut self, on: bool) {
         self.reassembler.set_deliver_parts(on);
+    }
+
+    /// Client: capture → first-shard arrival for every frame that opened since the
+    /// last call, ns, oldest first. Raw `arrival − pts_ns`; the caller adds the clock
+    /// offset. A frame parity never recovers still has a sample here, which a
+    /// completed-AU delay reading loses exactly when the queue is deepest.
+    pub fn take_shard_delays(&mut self) -> std::vec::Drain<'_, i64> {
+        self.reassembler.take_shard_delays()
     }
 
     /// Negotiated wire shard payload (bytes of AU per datagram) — the window size for

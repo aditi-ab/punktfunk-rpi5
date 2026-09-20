@@ -182,6 +182,21 @@ impl RateCut {
         })
     }
 
+    /// What a window's [`Reason`](crate::abr::Reason) tells a player. Several
+    /// signals share a word: lost frames, a flush and shard loss are all
+    /// "packet loss" to the person watching. `None` = no cut in it.
+    pub fn of_reason(reason: crate::abr::Reason) -> Option<RateCut> {
+        use crate::abr::Reason;
+        Some(match reason {
+            Reason::LostFrame | Reason::Flush | Reason::Loss => RateCut::Loss,
+            Reason::KeyframeAsks => RateCut::Repairs,
+            Reason::Decode => RateCut::Decoder,
+            Reason::Encode => RateCut::Encoder,
+            Reason::Owd => RateCut::Delay,
+            Reason::Clean | Reason::Quiet | Reason::Blip => return None,
+        })
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             RateCut::Loss => "packet loss",

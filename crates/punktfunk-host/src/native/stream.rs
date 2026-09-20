@@ -16,6 +16,7 @@ mod cursor;
 mod encode;
 mod phase_lock;
 mod pipeline;
+mod ramp;
 mod rebuild;
 mod recovery;
 #[cfg(target_os = "windows")]
@@ -23,15 +24,21 @@ mod resize;
 mod send;
 mod session_watch;
 mod state;
+mod synth_abr;
 use self::phase_lock::{phase_lock_enabled, PhaseController};
 // `native.rs` builds it and `control.rs` holds it: the 0xCF ACK hold crosses the module.
 pub(crate) use self::phase_lock::PhaseCtl;
 pub(super) use self::pipeline::{prepare_display, PrepHandle, PreparedDisplay};
+// `control.rs` bounds its spacing exemption by the same step length.
+pub(crate) use self::ramp::RAMP_STEP_MAX_MS;
 use self::send::{send_loop, ChunkMsg, FrameMsg, SendMsg, SendStats};
 // `native.rs` asks before offering a mid-stream reconfig.
 pub(crate) use self::send::reconfig_allowed;
 use self::session_watch::{session_watch_enabled, session_watcher_loop, SessionSwitch};
 use self::state::StreamState;
+// `main.rs` parses the content script; `native.rs` builds the context and dispatches.
+pub(super) use self::synth_abr::{synthetic_abr_stream, SynthAbrContext};
+pub use self::synth_abr::{Content, KeyframeAnswer, SynthAbrShape, DEFAULT_IDR_PCT};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn synthetic_stream(
@@ -436,7 +443,7 @@ pub(super) struct SessionContext {
     /// ASIC-applied rate, not the request. Shared with pacer, console, mgmt, and climb acks.
     pub(super) live_bitrate: Arc<AtomicU32>,
     /// 0 = none discovered. A request already at the ceiling costs nothing to apply.
-    pub(super) encoder_ceiling_kbps: Arc<AtomicU32>,
+    pub(super) encoder_ceiling: Arc<std::sync::Mutex<super::EncoderCeiling>>,
     /// While set, refuse bitrate climbs — the network is not the bottleneck.
     pub(super) cadence_degraded: Arc<AtomicBool>,
     pub(super) cadence_behind_score: Arc<AtomicU32>,
@@ -454,9 +461,13 @@ pub(super) struct SessionContext {
     pub(super) probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     /// Corrective `Reconfigured` when a rebuild stayed at the old mode or honored a different refresh.
     pub(super) reconfig_result_tx: tokio::sync::mpsc::UnboundedSender<Reconfigured>,
-    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
     pub(super) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    /// The FEC the packetizer runs at. The send loop reads this one only.
     pub(super) fec_target: Arc<AtomicU8>,
+    /// The control task's adaptive-FEC proposal. `StreamState` publishes it to
+    /// `fec_target` once the encoder accepts the rate the proposal implies.
+    pub(super) fec_requested: Arc<AtomicU8>,
     pub(super) conn: super::link::SessionLink,
     pub(super) timing_conn: Option<super::link::SessionLink>,
     pub(super) phase: Arc<PhaseCtl>,
@@ -468,6 +479,10 @@ pub(super) struct SessionContext {
         tokio::sync::watch::Sender<Option<punktfunk_core::quic::CursorShape>>,
     /// Without this, a mid-session probe consumes video indexes the gap detector cannot see.
     pub(super) probe_seq: bool,
+    /// The client's bring-up ramp may be served on the idle data plane
+    /// (`HOST_CAP2_RAMP`). Cleared when the send thread takes the session,
+    /// which is where the control task's probe spacing comes back.
+    pub(super) ramp_open: Arc<AtomicBool>,
     pub(super) streamed_au: bool,
     /// `false` = single-slice. TV-SoC decoders (Amlogic) wedge on multi-slice.
     pub(super) multi_slice: bool,

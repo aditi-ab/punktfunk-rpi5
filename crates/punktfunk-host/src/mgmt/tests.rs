@@ -449,10 +449,6 @@ async fn health_is_open_and_versioned() {
     assert_eq!(body["abi_version"], punktfunk_core::ABI_VERSION);
 }
 
-/// Serializes tests that touch the process-global live-session registry
-/// ([`crate::session_status`]); otherwise one test's session leaks into another.
-static SESSION_REGISTRY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 fn summary_req() -> axum::http::Request<Body> {
     let mut req = get_req("/api/v1/local/summary");
     req.extensions_mut()
@@ -547,7 +543,7 @@ fn fake_session_with_flags(
 /// never a panic and never another session's teardown.
 #[tokio::test]
 async fn a_per_session_route_404s_an_unknown_id() {
-    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let app = test_app(test_state(), None);
     let (_live, stop, _quit, idr) = fake_session_with_flags("aabbccddeeff");
     let ghost = u64::MAX;
@@ -583,7 +579,7 @@ async fn a_per_session_route_404s_an_unknown_id() {
 /// never a 404 and never a 500. A stopped session arrives on it with the reason attached.
 #[tokio::test]
 async fn the_last_session_route_answers_before_and_after_a_session() {
-    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let app = test_app(test_state(), None);
 
     let (status, body) = send(&app, get_req("/api/v1/session/last")).await;
@@ -621,7 +617,7 @@ async fn the_last_session_route_answers_before_and_after_a_session() {
 /// other streaming — and the id-less `DELETE /session` must still take both.
 #[tokio::test]
 async fn a_per_session_stop_drops_only_that_session() {
-    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let app = test_app(test_state(), None);
     let (one, stop1, quit1, idr1) = fake_session_with_flags("aabbccddeeff");
     let (_two, stop2, quit2, idr2) = fake_session_with_flags("112233445566");
@@ -659,7 +655,7 @@ async fn a_per_session_stop_drops_only_that_session() {
 /// on a real host; this covers the flag the audio thread reads.
 #[tokio::test]
 async fn muting_one_session_leaves_the_other_hearing() {
-    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let app = test_app(test_state(), None);
     let (one, ..) = fake_session_with_flags("aabbccddeeff");
     let (two, ..) = fake_session_with_flags("112233445566");
@@ -718,7 +714,7 @@ async fn muting_one_session_leaves_the_other_hearing() {
 /// against a private pool — the process-wide one is shared with every other test here.
 #[tokio::test]
 async fn placing_a_player_touches_only_that_session() {
-    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let app = test_app(test_state(), None);
     let (one, ..) = fake_session_with_flags("aabbccddeeff");
     let (two, ..) = fake_session_with_flags("112233445566");
@@ -770,7 +766,7 @@ async fn placing_a_player_touches_only_that_session() {
 /// pairing: these sessions are paired controller-only, so `full` comes back clamped.
 #[tokio::test]
 async fn a_live_access_change_applies_to_the_running_session() {
-    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let app = test_app(test_state(), None);
     let (one, ..) = fake_session_with_flags("aabbccddeeff");
     let (two, ..) = fake_session_with_flags("112233445566");
@@ -843,7 +839,7 @@ async fn a_live_access_change_applies_to_the_running_session() {
 /// stays false for the whole native stream, so the tray must not key off that flag alone.
 #[tokio::test]
 async fn local_summary_reports_a_native_session_as_streaming() {
-    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let app = test_app(test_state(), None);
 
     let (status, body) = send(&app, summary_req()).await;
@@ -877,7 +873,7 @@ async fn local_summary_reports_a_native_session_as_streaming() {
 /// no session so `client_name` stays absent.
 #[tokio::test]
 async fn local_summary_is_loopback_only_and_non_sensitive() {
-    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
             Some(std::env::temp_dir().join(format!("pf-mgmt-summary-{}.json", std::process::id()))),
@@ -1130,7 +1126,7 @@ async fn compositors_lists_all_backends_with_flags() {
 
 #[tokio::test]
 async fn status_reflects_runtime_state() {
-    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let state = test_state();
     let app = test_app(state.clone(), None);
 
@@ -1623,6 +1619,8 @@ async fn blank_token_rejected() {
 
 #[tokio::test]
 async fn stop_session_clears_runtime_state() {
+    // This route quits every live native session, a sibling test's included.
+    let _registry = crate::session_status::tests::REGISTRY.lock().await;
     let state = test_state();
     let app = test_app(state.clone(), None);
     state.streaming.store(true, Ordering::SeqCst);
@@ -1650,7 +1648,7 @@ async fn stop_session_clears_runtime_state() {
 #[tokio::test]
 async fn idr_requires_an_active_stream() {
     // A sibling test's live native session would look like an active stream to this route.
-    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let state = test_state();
     let app = test_app(state.clone(), None);
     let post = || {

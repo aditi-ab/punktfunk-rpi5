@@ -175,9 +175,12 @@ pub(super) struct StreamState {
     pub(super) resize_ms: Arc<AtomicU32>,
     pub(super) stats: Arc<StatsRecorder>,
     pub(super) phase: Arc<PhaseCtl>,
+    /// Applied FEC: what the packetizer and [`Self::enc_now`] run at.
     pub(super) fec_target: Arc<AtomicU8>,
+    /// Control task's proposal; applied only after the encoder takes its rate.
+    pub(super) fec_requested: Arc<AtomicU8>,
     pub(super) live_bitrate: Arc<AtomicU32>,
-    pub(super) encoder_ceiling_kbps: Arc<AtomicU32>,
+    pub(super) encoder_ceiling: Arc<std::sync::Mutex<super::EncoderCeiling>>,
     pub(super) cadence_degraded: Arc<AtomicBool>,
     pub(super) cadence_behind_score: Arc<AtomicU32>,
     pub(super) client_packets_received: Arc<AtomicU32>,
@@ -204,7 +207,7 @@ pub(super) struct StreamState {
     pub(super) bitrate_rx: std::sync::mpsc::Receiver<u32>,
     pub(super) session_rx: std::sync::mpsc::Receiver<SessionSwitch>,
     pub(super) reconfig_result_tx: tokio::sync::mpsc::UnboundedSender<Reconfigured>,
-    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
     pub(super) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
 }
 
@@ -227,6 +230,17 @@ impl StreamState {
     /// Swap the built pipeline in and forget every owed AU. The caller retires the old lease,
     /// re-arms the IDR clock, and re-reads `enc_src` as its path requires.
     pub(super) fn adopt_pipeline(&mut self, p: Pipeline) {
+        // A ceiling was learned from the encoder this one replaces. It survives
+        // a rebuild that opens on the same source; a different geometry or
+        // format is a different encoder, whose limits are unknown again.
+        if (p.frame.format, p.frame.width, p.frame.height)
+            != (self.frame.format, self.frame.width, self.frame.height)
+        {
+            self.encoder_ceiling
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
         self.adopt_reframe(p.reframe);
         self.capturer = p.capturer;
         self.enc = p.enc;
@@ -310,8 +324,11 @@ impl StreamState {
         }
         plan.reframe_to = ctx.reframe_to;
         tracing::info!(?plan, "resolved session plan");
+        // Automatic PyroWave: the client's ramp closes with one lower pin, so
+        // the window lingers past pipeline-ready for it to cross.
+        let fit_pin = ctx.bitrate_auto && ctx.codec == crate::encode::Codec::PyroWave;
         let SessionContext {
-            session,
+            session: punched_session,
             mode,
             seconds,
             stop,
@@ -329,7 +346,7 @@ impl StreamState {
             audio_reserved_kbps,
             shard_payload,
             live_bitrate,
-            encoder_ceiling_kbps,
+            encoder_ceiling,
             cadence_degraded,
             cadence_behind_score,
             client_packets_received,
@@ -340,10 +357,12 @@ impl StreamState {
             codec: _,
             probe_rx,
             probe_result_tx,
+            ramp_open,
             reconfig_result_tx,
             retarget_tx,
             gap_tx,
             fec_target,
+            fec_requested,
             conn,
             timing_conn,
             phase,
@@ -378,6 +397,18 @@ impl StreamState {
             #[cfg(target_os = "linux")]
             inj_session_tx,
         } = ctx;
+        // The data plane is punched and idle until the send thread starts.
+        // Answer the client's bring-up ramp on it meanwhile: it measures the
+        // link with no video to damage, and hands both back below.
+        let ramp = ramp::RampServer::start(
+            punched_session,
+            probe_rx,
+            probe_result_tx.clone(),
+            probe_seq,
+            stop.clone(),
+            ramp_open,
+            fit_pin,
+        );
         // Stamp before the display exists: a reading after launch would reject the process it is meant to find.
         let fresh_stamp = crate::gamelease::launch_clock();
         // Re-dial re-sends `Hello::launch` verbatim. Adopt against the original stamp or procscan refuses it.
@@ -861,6 +892,9 @@ impl StreamState {
             driver_dropped: driver_dropped.clone(),
             counters: counters.clone(),
         };
+        // Pipeline, launch and lease are up: take the data plane back. A step
+        // in flight finishes first, which is ≤ 50 ms.
+        let (session, probe_rx) = ramp.finish();
         let send_thread = std::thread::Builder::new()
             .name("punktfunk-send".into())
             .spawn({
@@ -944,8 +978,9 @@ impl StreamState {
             stats,
             phase,
             fec_target: fec_target.clone(),
+            fec_requested: fec_requested.clone(),
             live_bitrate,
-            encoder_ceiling_kbps,
+            encoder_ceiling,
             cadence_degraded,
             cadence_behind_score,
             client_packets_received,
@@ -1134,7 +1169,7 @@ pub(super) fn adopt_built_bitrate(
     current: &mut u32,
     built: u32,
     live: &Arc<AtomicU32>,
-    retarget: &tokio::sync::mpsc::UnboundedSender<u32>,
+    retarget: &tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
 ) {
     if built == *current {
         return;
@@ -1146,7 +1181,8 @@ pub(super) fn adopt_built_bitrate(
     );
     *current = built;
     live.store(built, Ordering::Relaxed);
-    let _ = retarget.send(built);
+    // The host re-resolved what it encodes; nothing refused the client a rate.
+    let _ = retarget.send((built, AckReason::Granted));
 }
 
 /// What this session's launch came to, in the client's vocabulary.
@@ -1253,14 +1289,15 @@ mod tests {
     #[test]
     fn adopting_a_rebuilt_rate_tells_the_client() {
         let live = Arc::new(AtomicU32::new(20_000));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, AckReason)>();
         let mut current = 20_000;
         adopt_built_bitrate(&mut current, 20_000, &live, &tx);
         assert_eq!(rx.try_recv().ok(), None);
         adopt_built_bitrate(&mut current, 60_000, &live, &tx);
         assert_eq!(current, 60_000);
         assert_eq!(live.load(Ordering::Relaxed), 60_000);
-        assert_eq!(rx.try_recv().ok(), Some(60_000));
+        // Nobody refused the client anything: the host re-resolved its own rate.
+        assert_eq!(rx.try_recv().ok(), Some((60_000, AckReason::Granted)));
     }
 
     /// The registry's liveness vocabulary and the wire's are one set, mapped here

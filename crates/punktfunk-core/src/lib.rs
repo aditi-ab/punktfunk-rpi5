@@ -23,8 +23,8 @@
 // JS identifier.
 #[cfg(not(target_family = "wasm"))]
 pub mod abi;
-#[cfg(feature = "quic")]
-mod abr;
+/// cbindgen:ignore
+pub mod abr;
 pub mod audio;
 #[cfg(feature = "quic")]
 pub mod client;

@@ -106,6 +106,10 @@ pub(crate) struct WorkerArgs {
     pub(crate) live_bitrate: Arc<AtomicU32>,
     /// Why Automatic last cut the rate ([`crate::hud::RateCut`] code), for the overlay.
     pub(crate) rate_cut: Arc<AtomicU8>,
+    /// Closed ABR windows, newest last, for an embedder recording a trajectory.
+    pub(crate) abr_windows: Arc<Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>>,
+    /// What the bring-up ramp measured, once it stopped.
+    pub(crate) abr_ramp: Arc<Mutex<Option<crate::abr::RampRecord>>>,
     /// RFIs sent in the last minute, for the overlay. The control task notes each one.
     pub(crate) recent_rfis: Arc<Mutex<RecentRfis>>,
     /// Mute mask the control task ORs [`crate::client::AUDIO_MUTE_HOST`] into on every

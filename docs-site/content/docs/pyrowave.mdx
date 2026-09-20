@@ -72,10 +72,11 @@ HEVC/AV1; nothing PyroWave-specific to turn on beyond picking the codec.
   or 4:4:4, SDR or HDR — with no extra setup.
 
 At the top end this gets demanding: 4:4:4 + HDR at a super-ultrawide 5120×1440@240 pins around
-5.3 Gbps, which is more than a 5GbE link carries. A client bitrate does not lower it: PyroWave
-ignores it. On a link that can't keep up, lower the mode or cap the host's pin with
-[`PUNKTFUNK_PYROWAVE_MAX_MBPS`](/docs/configuration) — otherwise the overshoot just becomes
-dropped packets.
+5.3 Gbps, which is more than a 5GbE link carries. An Automatic session catches this itself:
+the bring-up ramp measures the link before the first frame and drops the pin to fit — a 2.5GbE
+path settles near 1.7 Gbps. A client bitrate does not lower it: PyroWave ignores it. When the
+measurement can't help — an older host, or a ceiling you want tighter than the link's wall —
+cap the host's pin with [`PUNKTFUNK_PYROWAVE_MAX_MBPS`](/docs/configuration).
 
 ## Turning it on
 
@@ -101,11 +102,15 @@ dropped packets.
      and presents through its own swapchain rather than through the hardware video decoder, so
      the low-latency and presentation settings that tune MediaCodec do not apply to it.
 3. Leave the bitrate on Automatic: a PyroWave session pins itself to the ~1.6 bpp rate for
-   your mode (≈200 Mbps at 1080p60; ~2.6 bpp for 4:4:4, +15 % for HDR). A client bitrate is
-   ignored, and the adaptive-bitrate controller stays off — this codec has no useful low-rate
-   regime, so under sustained loss the right move is switching back to HEVC, not degrading.
-   The pin follows the resolution: a mid-stream resize (e.g. Match window) re-pins the rate
-   for the new mode, so resizing a window down also cuts the bandwidth.
+   your mode (≈200 Mbps at 1080p60; ~2.6 bpp for 4:4:4, +15 % for HDR). Before the first
+   frame the client runs the same bring-up ramp the adaptive bitrate uses and fits the pin to
+   it: only a measured link wall moves it, down to ~0.7× what the ramp proved — it never
+   rises, and a ramp that measured nothing (or an older host that never ran one) leaves the
+   pin exactly where it resolved. A client bitrate is ignored, and the adaptive-bitrate
+   controller stays off — this codec has no useful low-rate regime, so under sustained loss
+   the right move is switching back to HEVC, not degrading. The pin follows the resolution:
+   a mid-stream resize (e.g. Match window) re-pins the rate for the new mode, so resizing a
+   window down also cuts the bandwidth.
 
 The stats overlay shows `pyrowave` as the decode path when the mode is active.
 

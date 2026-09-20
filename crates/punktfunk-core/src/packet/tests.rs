@@ -2026,6 +2026,49 @@ fn shard_size_firewall_bounds() {
     }
 }
 
+/// The delay reading a lost frame would otherwise take with it: the sample is
+/// taken when the frame OPENS, so a frame whose other shards never arrive is
+/// still timed, and probe filler is not timed at all.
+#[test]
+fn a_frame_that_never_completes_is_still_timed() {
+    let mut r = Reassembler::new(limits());
+    let coder = coder_for(FecScheme::Gf8);
+    let stats = StatsCounters::default();
+    // Four data shards, no parity: one shard arrives, three never do.
+    let mut h = base_header();
+    h.frame_bytes = 64;
+    h.data_shards = 4;
+    h.pts_ns = crate::stats::now_realtime_ns() - 30_000_000;
+    assert!(r
+        .push(&packet(h), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    // A second shard of the same frame adds nothing: one sample per frame.
+    let mut h2 = h;
+    h2.shard_index = 1;
+    assert!(r
+        .push(&packet(h2), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    let mut probe = h;
+    probe.frame_index = 9;
+    probe.user_flags = FLAG_PROBE as u32;
+    let _ = r.push(&packet(probe), coder.as_ref(), &stats);
+
+    let got: Vec<i64> = r.take_shard_delays().collect();
+    assert_eq!(got.len(), 1, "one sample for the one frame that opened");
+    assert!(
+        (25_000_000..60_000_000).contains(&got[0]),
+        "a 30 ms-old capture read {} ns",
+        got[0]
+    );
+    assert_eq!(
+        r.take_shard_delays().count(),
+        0,
+        "a drained sample is not re-presented"
+    );
+}
+
 mod geometry_proptests {
     use super::*;
     use proptest::prelude::*;

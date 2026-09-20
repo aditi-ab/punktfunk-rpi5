@@ -264,6 +264,8 @@ pub struct SessionCounters {
     /// Per-minute link health ([`crate::link_health`]). Drained by the control task, not by
     /// the summary: these are window deltas, the rest of this block is session totals.
     pub link: crate::link_health::LinkCounters,
+    /// What the shared-path governor reads and writes for this session.
+    pub share: AbrShare,
 }
 
 impl SessionCounters {
@@ -676,12 +678,13 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
     let mut reg = registry().lock().unwrap();
     let sharing = shared_path(&reg, session.id, session.peer);
     if !sharing.is_empty() {
-        // Same address is one NAT or tunnel, not proof of one bottleneck — so an observation.
-        tracing::warn!(
+        // Same address is one NAT or tunnel, not proof of one bottleneck, so the
+        // governor divides only what the group is short of ([`share_for`]).
+        tracing::info!(
             session = session.id,
             peer = ?session.peer,
             others = ?sharing,
-            "sessions share one client address — each adapts its bitrate on its own"
+            "sessions share one client address — Automatic ones take equal shares of it"
         );
     }
     reg.push(session);
@@ -777,6 +780,195 @@ fn shared_path(reg: &[LiveSession], id: u64, peer: Option<std::net::IpAddr>) -> 
         .filter(|s| s.id != id && s.peer == Some(peer))
         .map(|s| s.id)
         .collect()
+}
+
+/// Report age after which a session no longer contributes to a shared path.
+/// Four 750 ms windows leave one discarded report fresh; a legacy client's
+/// startup-only sample expires.
+const DELIVERY_STALE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What the shared-path governor reads across the sessions of one client
+/// address, published by each session's control task on its own report cadence.
+///
+/// Here rather than in the control task because the governor divides a path
+/// between sessions, and no task can see its siblings' locals. Relaxed atomics
+/// carry policy inputs; the report timestamp has its own mutex.
+#[derive(Default)]
+pub struct AbrShare {
+    /// Automatic bitrate, so a share may move it. A fixed rate and a PyroWave
+    /// pin are never touched.
+    automatic: AtomicBool,
+    /// Wire rate the host put out for this session over the last window.
+    offered_kbps: AtomicU32,
+    /// What the client's last `DeliveryReport` came to. `0` = none yet.
+    delivered_kbps: AtomicU32,
+    /// The session was already streaming when that window opened, so the two
+    /// rates above are a reading of the path (`governor::Member::streaming`).
+    streaming: AtomicBool,
+    /// Non-zero delivery samples seen on the report cadence. Two distinguish a
+    /// current client from the legacy one-shot startup report.
+    delivery_samples: AtomicU32,
+    /// Arrival time of the last report. A wedged or legacy control plane must
+    /// not leave a permanent path reading.
+    last_delivery: Mutex<Option<std::time::Instant>>,
+    /// The share this session was last told (`0` = none), the most its group
+    /// has been seen to carry between them, and whether it had a group at all.
+    share_kbps: AtomicU32,
+    path_kbps: AtomicU32,
+    grouped: AtomicBool,
+}
+
+impl AbrShare {
+    /// This session's own view, as its control task takes it.
+    pub fn publish(
+        &self,
+        now: std::time::Instant,
+        automatic: bool,
+        offered_kbps: u32,
+        delivered_kbps: u32,
+        streaming: bool,
+    ) {
+        let mut last = self.last_delivery.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|at| now.saturating_duration_since(at) > DELIVERY_STALE) {
+            self.delivery_samples.store(0, Ordering::Relaxed);
+        }
+        *last = Some(now);
+        if delivered_kbps > 0 {
+            self.delivery_samples.fetch_add(1, Ordering::Relaxed);
+        }
+        self.automatic.store(automatic, Ordering::Relaxed);
+        self.offered_kbps.store(offered_kbps, Ordering::Relaxed);
+        self.delivered_kbps.store(delivered_kbps, Ordering::Relaxed);
+        self.streaming.store(streaming, Ordering::Relaxed);
+    }
+
+    /// Whether repeated, recent reports make this a current path member.
+    fn delivery_ready(&self, now: std::time::Instant) -> bool {
+        self.delivery_samples.load(Ordering::Relaxed) >= 2
+            && self
+                .last_delivery
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|at| now.saturating_duration_since(at) <= DELIVERY_STALE)
+    }
+
+    /// The ceiling this session is running under. `0` = none.
+    pub fn share_kbps(&self) -> u32 {
+        self.share_kbps.load(Ordering::Relaxed)
+    }
+
+    fn note_share(&self, kbps: u32) {
+        self.share_kbps.store(kbps, Ordering::Relaxed);
+    }
+}
+
+/// This session's ceiling on the path it shares, if the governor has one to
+/// send. `None` leaves the standing share alone.
+///
+/// Every member computes the whole group and applies only its own, so a share
+/// is only ever sent by the task that owns the control stream it goes down.
+/// Only sessions with repeated, fresh delivery reports form the group; one
+/// capable reporter beside a legacy or stale client is left alone.
+pub fn share_for(id: u64, clocks: punktfunk_core::abr::governor::Clocks) -> Option<u32> {
+    share_for_at(id, std::time::Instant::now(), clocks)
+}
+
+/// Time-injected [`share_for`] for cadence and expiry tests.
+fn share_for_at(
+    id: u64,
+    now: std::time::Instant,
+    clocks: punktfunk_core::abr::governor::Clocks,
+) -> Option<u32> {
+    use punktfunk_core::abr::governor;
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let me = reg.iter().find(|s| s.id == id)?;
+    if !me.counters.share.delivery_ready(now) {
+        return None;
+    }
+    let peer = me.peer?;
+    let peers: Vec<&LiveSession> = reg.iter().filter(|s| s.peer == Some(peer)).collect();
+    let group: Vec<&LiveSession> = peers
+        .iter()
+        .copied()
+        .filter(|s| s.counters.share.delivery_ready(now))
+        .collect();
+    let mine = group.iter().position(|s| s.id == id)?;
+    let share = &me.counters.share;
+    if group.len() < 2 {
+        // An incapable or stale sibling may still be consuming the path. Leave
+        // the capable session alone, but do not hand it that sibling's share.
+        if peers.len() > 1 {
+            return None;
+        }
+        // Alone on the path: hand over the whole of what the group proved it
+        // carried, once. The wall this session measured beside them was their
+        // residual, and nobody but this host knows they have gone.
+        let path = share.path_kbps.swap(0, Ordering::Relaxed);
+        if !share.grouped.swap(false, Ordering::Relaxed) || path == 0 {
+            return None;
+        }
+        share.note_share(path);
+        tracing::info!(
+            session = id,
+            peer = %peer,
+            path_kbps = path,
+            "adaptive bitrate: alone on this path again — all of it is this session's"
+        );
+        return Some(path);
+    }
+    share.grouped.store(true, Ordering::Relaxed);
+    let members: Vec<governor::Member> = group.iter().map(|s| member(s)).collect();
+    // What the path has carried for this group, kept per session because each
+    // asks on its own clock: the most it has been seen to carry, until the group
+    // is short of what it offers, which is the path being re-measured (L1). A
+    // member yet to report leaves it unmeasured, and that is never remembered.
+    let now = governor::path_kbps(&members)?;
+    let path = if governor::crowded(&members) {
+        share.path_kbps.store(now, Ordering::Relaxed);
+        now
+    } else {
+        share.path_kbps.fetch_max(now, Ordering::Relaxed).max(now)
+    };
+    let share = governor::shares(&members, path, clocks)[mine]?;
+    me.counters.share.note_share(share);
+    tracing::info!(
+        session = id,
+        peer = %peer,
+        share_kbps = share,
+        rate_kbps = me.bitrate_kbps.load(Ordering::Relaxed),
+        others = group.len() - 1,
+        "adaptive bitrate: this session's share of a path it is not alone on"
+    );
+    Some(share)
+}
+
+/// One live session as the governor reads it.
+fn member(s: &LiveSession) -> punktfunk_core::abr::governor::Member {
+    let share = &s.counters.share;
+    punktfunk_core::abr::governor::Member {
+        automatic: share.automatic.load(Ordering::Relaxed),
+        current_kbps: s.bitrate_kbps.load(Ordering::Relaxed),
+        offered_kbps: share.offered_kbps.load(Ordering::Relaxed),
+        // `0` is "no report yet": the client has not told this host anything
+        // about what is arriving, which is not the same as nothing arriving.
+        delivered_kbps: match share.delivered_kbps.load(Ordering::Relaxed) {
+            0 => None,
+            kbps => Some(kbps),
+        },
+        // The capturer's own verdict that the source has nothing new, so the
+        // host is repeating the last picture rather than encoding motion.
+        idle: s
+            .capture_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|h| h.class == "idle"),
+        share_kbps: match share.share_kbps.load(Ordering::Relaxed) {
+            0 => None,
+            kbps => Some(kbps),
+        },
+        streaming: share.streaming.load(Ordering::Relaxed),
+    }
 }
 
 pub fn count() -> usize {
@@ -1069,14 +1261,30 @@ pub fn force_idr_all() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// The live-session registry is one table for the whole test binary: a
+    /// session one test registers is an active stream to another test's route,
+    /// a row in its `/status`, and an entry in the recent ring. Every test that
+    /// registers a session or reads the registry's shape holds this.
+    ///
+    /// A test that also needs `native::tests`' admission lock takes this one
+    /// first. One order, so the pair cannot deadlock.
+    pub(crate) static REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The registry lock for a test that has no runtime of its own.
+    /// [`tokio::sync::Mutex::blocking_lock`] panics inside one, so an
+    /// `#[tokio::test]` takes `REGISTRY.lock().await` instead.
+    pub(crate) fn registry_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        REGISTRY.blocking_lock()
+    }
 
     /// A compat-plane session is a registry entry like any other, which is what gives the
     /// console an id to stop — before, a Moonlight session could only be ended host-wide.
     #[test]
     fn a_compat_session_is_stoppable_by_its_own_id() {
-        // No serializing lock: the registry is shared, but this is its only compat session.
+        let _registry = registry_lock();
         let stop = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
         let _guard = register(Registration {
@@ -1196,10 +1404,268 @@ mod tests {
         (guard, controls)
     }
 
+    /// A live session at `peer` with its own counter block, so a test can
+    /// publish what the governor reads and move the rate it hands out.
+    pub(crate) fn fake_member(
+        client: &str,
+        peer: std::net::IpAddr,
+        kbps: u32,
+    ) -> (LiveSessionGuard, Arc<SessionCounters>, Arc<AtomicU32>) {
+        let counters = Arc::new(SessionCounters::default());
+        let bitrate_kbps = Arc::new(AtomicU32::new(kbps));
+        let guard = register(Registration {
+            mode: Arc::new(AtomicU64::new(0)),
+            bitrate_kbps: bitrate_kbps.clone(),
+            codec: Codec::H265,
+            stop: Arc::new(AtomicBool::new(false)),
+            quit: Arc::new(AtomicBool::new(false)),
+            force_idr: Arc::new(AtomicBool::new(false)),
+            client: client.into(),
+            client_name: None,
+            plane: crate::events::Plane::Native,
+            hdr: false,
+            ttff_ms: Arc::new(AtomicU32::new(0)),
+            last_resize_ms: Arc::new(AtomicU32::new(0)),
+            game: None,
+            capture_health: Arc::new(Mutex::new(None)),
+            join: false,
+            controls: SessionControls::open(),
+            bit_depth: 8,
+            chroma: ChromaFormat::Yuv420,
+            end_reason: Arc::new(AtomicU8::new(0)),
+            counters: counters.clone(),
+            peer: Some(peer),
+        });
+        (guard, counters, bitrate_kbps)
+    }
+
+    fn both_clocks() -> punktfunk_core::abr::governor::Clocks {
+        punktfunk_core::abr::governor::Clocks {
+            room: true,
+            lift: true,
+        }
+    }
+
+    /// Publish two non-zero cadence samples, which makes a member current.
+    fn publish_ready(
+        counters: &SessionCounters,
+        now: std::time::Instant,
+        automatic: bool,
+        offered_kbps: u32,
+        delivered_kbps: u32,
+    ) -> std::time::Instant {
+        counters
+            .share
+            .publish(now, automatic, offered_kbps, delivered_kbps, true);
+        let ready = now + std::time::Duration::from_millis(750);
+        counters
+            .share
+            .publish(ready, automatic, offered_kbps, delivered_kbps, true);
+        ready
+    }
+
+    /// Two Automatic sessions from one address, each asking an 18 Mbps path
+    /// for 12: each is told half of what is actually arriving.
+    #[test]
+    fn two_automatic_sessions_on_one_address_take_equal_shares() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.90".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+        assert_eq!(share_for_at(b.id, ready, both_clocks()), Some(9_000));
+        assert_eq!(ac.share.share_kbps(), 9_000, "and it is remembered");
+    }
+
+    /// One startup sample does not prove a report cadence; the second fresh
+    /// sample admits both members and produces the ordinary equal split.
+    #[test]
+    fn two_fresh_samples_are_required_before_a_group_is_governed() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.96".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (_b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        for c in [&ac, &bc] {
+            c.share.publish(now, true, 12_000, 9_000, true);
+        }
+        assert_eq!(share_for_at(a.id, now, both_clocks()), None);
+        let ready = now + std::time::Duration::from_millis(750);
+        for c in [&ac, &bc] {
+            c.share.publish(ready, true, 12_000, 9_000, true);
+        }
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+    }
+
+    /// A new client beside a legacy startup-only reporter is one capable
+    /// member, not a group with a permanent stale second path reading.
+    #[test]
+    fn a_mixed_old_and_new_pair_is_left_ungoverned() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.97".parse().unwrap();
+        let (_old, old_c, _or) = fake_member("old", peer, 12_000);
+        let (new, new_c, _nr) = fake_member("new", peer, 12_000);
+        let now = std::time::Instant::now();
+        old_c.share.publish(now, true, 12_000, 9_000, true);
+        let ready = publish_ready(&new_c, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(new.id, ready, both_clocks()), None);
+        assert_eq!(old_c.share.share_kbps(), 0);
+        assert_eq!(new_c.share.share_kbps(), 0);
+    }
+
+    /// A sibling whose reports stop is excluded without handing its share to
+    /// the current member: the stale session is still live and may consume it.
+    #[test]
+    fn a_stale_sibling_neither_governs_nor_triggers_a_handback() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.98".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (_b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+        let stale = ready + DELIVERY_STALE + std::time::Duration::from_millis(1);
+        publish_ready(
+            &ac,
+            stale - std::time::Duration::from_millis(750),
+            true,
+            12_000,
+            9_000,
+        );
+        assert!(!bc.share.delivery_ready(stale));
+        assert_eq!(share_for_at(a.id, stale, both_clocks()), None);
+        assert_eq!(ac.share.share_kbps(), 9_000, "no stale-sibling handback");
+    }
+
+    /// What the control task asks the governor with: registration stamps the
+    /// session's id onto the counter block its side threads already hold, and
+    /// that id is what `share_for` takes. A source that never registers leaves
+    /// it `0`, which the control task reads as "nothing to share with".
+    #[test]
+    fn registration_latches_the_id_the_governor_is_asked_for() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.95".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(ac.link.session_id(), a.id, "the id the link lines carry");
+        assert_eq!(bc.link.session_id(), b.id);
+        assert_ne!(ac.link.session_id(), 0);
+        assert_eq!(
+            share_for_at(ac.link.session_id(), ready, both_clocks()),
+            Some(9_000)
+        );
+        assert_eq!(
+            share_for_at(bc.link.session_id(), ready, both_clocks()),
+            Some(9_000)
+        );
+    }
+
+    /// A fixed-rate session takes what it is set to off the top and is never
+    /// told anything; the Automatic one gets what is left.
+    #[test]
+    fn a_fixed_rate_session_is_never_told_a_share() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.91".parse().unwrap();
+        let (auto, auto_c, _ar) = fake_member("phone", peer, 14_000);
+        let (fixed, fixed_c, _fr) = fake_member("pc", peer, 8_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&auto_c, now, true, 14_000, 10_000);
+        publish_ready(&fixed_c, now, false, 8_000, 8_000);
+        assert_eq!(share_for_at(fixed.id, ready, both_clocks()), None);
+        assert_eq!(fixed_c.share.share_kbps(), 0, "nothing was written either");
+        assert_eq!(
+            share_for_at(auto.id, ready, both_clocks()),
+            Some(10_000),
+            "18 Mbps arriving, less the fixed 8"
+        );
+    }
+
+    /// One session is not a group, whatever it reports.
+    #[test]
+    fn a_session_alone_on_its_address_is_never_governed() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.92".parse().unwrap();
+        let (only, c, _r) = fake_member("phone", peer, 20_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&c, now, true, 20_000, 9_000);
+        assert_eq!(share_for_at(only.id, ready, both_clocks()), None);
+    }
+
+    /// A path that has degraded since the group's best window: the moment they
+    /// are short of what they offer, the group has re-measured it, and the
+    /// survivor is handed what it carries now rather than what it once did.
+    #[test]
+    fn a_path_that_shrank_is_not_handed_over_at_its_old_figure() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.94".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 15_000);
+        let (b, bc, _br) = fake_member("pc", peer, 15_000);
+        let now = std::time::Instant::now();
+        // Both clean at 15 Mbps: the pair has carried 30 between them.
+        let ready = publish_ready(&ac, now, true, 15_000, 15_000);
+        publish_ready(&bc, now, true, 15_000, 15_000);
+        assert_eq!(
+            share_for_at(a.id, ready, both_clocks()),
+            None,
+            "nothing to divide"
+        );
+        assert_eq!(ac.share.path_kbps.load(Ordering::Relaxed), 30_000);
+        // The path halves. Both are short, so what it carried before is gone.
+        let short_at = ready + std::time::Duration::from_millis(750);
+        for c in [&ac, &bc] {
+            c.share.publish(short_at, true, 15_000, 6_000, true);
+        }
+        assert_eq!(
+            share_for_at(a.id, short_at, both_clocks()),
+            Some(6_000),
+            "half of 12"
+        );
+        drop(b);
+        assert_eq!(
+            share_for_at(a.id, short_at, both_clocks()),
+            Some(12_000),
+            "the path as it is now, not the 30 000 the pair once carried"
+        );
+    }
+
+    /// The sibling leaves: the survivor is handed the whole of what the pair
+    /// proved the path carried, because the wall it measured beside them was
+    /// their residual. Once, and then never again.
+    #[test]
+    fn a_survivor_is_handed_the_path_its_group_proved() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.93".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+        drop(b);
+        assert_eq!(
+            share_for_at(a.id, ready, both_clocks()),
+            Some(18_000),
+            "all of what the two of them were carrying"
+        );
+        assert_eq!(
+            share_for_at(a.id, ready, both_clocks()),
+            None,
+            "and only the once"
+        );
+    }
+
     /// One address is one NAT or tunnel: each session names the others there, and an
     /// IPv4-mapped IPv6 peer is the same address.
     #[test]
     fn sessions_from_one_address_name_each_other() {
+        let _registry = registry_lock();
         let v4: std::net::IpAddr = "203.0.113.77".parse().unwrap();
         let mapped: std::net::IpAddr = "::ffff:203.0.113.77".parse().unwrap();
         let (a, _) = fake_at("phone", false, Some(v4));
@@ -1250,6 +1716,7 @@ mod tests {
     /// unmutes only what it muted: an operator's own mute stays.
     #[test]
     fn policy_mute_reaches_late_joiners_and_lifts_at_the_end() {
+        let _registry = registry_lock();
         let (_owner, owner) = fake_joiner("cccccccccccc", false);
         let guard = apply_audio_policy(AudioSessions::Owner, "cccccccccccc");
         let (_joiner, joiner) = fake_joiner("dddddddddddd", true);
@@ -1274,6 +1741,7 @@ mod tests {
     /// (`quit` + `stop`). Other clients and IP-labelled sessions stay up.
     #[test]
     fn stop_by_fingerprint_revokes_exactly_the_unpaired_client() {
+        let _registry = registry_lock();
         let fp = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
         let (_g1, stop1, quit1) = fake_session(&fp[..12]);
         let (_g2, stop2, _q2) = fake_session("112233445566"); // a different paired client
@@ -1305,6 +1773,7 @@ mod tests {
     /// while [`publish_gamestream_game`]'s guard is alive.
     #[test]
     fn a_gamestream_game_is_visible_only_while_its_stream_runs() {
+        let _registry = registry_lock();
         let id = "steam:1701";
         let mine = || {
             games()
@@ -1418,6 +1887,7 @@ mod tests {
     /// reason an operator stop latched, survive into the ring `GET /session/last` reads.
     #[test]
     fn a_finished_session_lands_in_the_ring_with_its_numbers() {
+        let _registry = registry_lock();
         let reason = Arc::new(AtomicU8::new(0));
         let counters = Arc::new(SessionCounters::default());
         let (guard, _stop, _quit) =
@@ -1484,6 +1954,7 @@ mod tests {
     /// rather than a clean end with zeros in it.
     #[test]
     fn a_session_that_never_finished_reports_a_host_error() {
+        let _registry = registry_lock();
         let (guard, _stop, _quit) = fake_session("192.0.2.10");
         let id = guard.id;
         drop(guard);

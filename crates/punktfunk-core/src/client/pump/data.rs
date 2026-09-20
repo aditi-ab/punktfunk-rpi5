@@ -2,13 +2,13 @@
 //! jump-to-live / standing-latency, and hand frames to the embedder.
 //!
 //! Dedicated user-interactive thread. Newest-frame drop on embedder lag.
-//! [`FLAG_PROBE`] filler never enters the decoder. Tests here pin the
-//! delivery-report cadence, ABR window activity, probe targets, and
-//! pipeline-gap window discard.
+//! [`FLAG_PROBE`] filler never enters the decoder. The ABR window is
+//! assembled by [`crate::abr::Driver`]: this file feeds it events and sends
+//! what it asks for.
 
 use super::super::*;
 use super::*;
-use crate::abr::WindowActivity;
+use crate::abr::{Action, DriverConfig, ProbeReport};
 
 /// Data-plane pump on a blocking thread. `try_send` drops the newest frame
 /// when the embedder lags. [`FLAG_PROBE`] filler goes to the probe accumulator,
@@ -27,7 +27,7 @@ pub(super) struct DataPump {
     /// fed by the datagram task, not the overlay's lossy `host_timing_tx`.
     pub(super) encode_lat: Arc<Mutex<super::super::frame_channel::EncodeLatAcc>>,
     /// Control-task mode-switch generation. A change resets mode-scoped ABR
-    /// state ([`BitrateController::on_mode_switch`]).
+    /// state ([`crate::abr::Driver::on_mode_switch`]).
     pub(super) mode_gen: Arc<AtomicU32>,
     pub(super) frames_dropped: Arc<std::sync::atomic::AtomicU64>,
     pub(super) fec_recovered: Arc<std::sync::atomic::AtomicU64>,
@@ -37,9 +37,8 @@ pub(super) struct DataPump {
     /// Host `BitrateChanged` acks, drained in arrival order. A queue so a
     /// corrective short retarget cannot be clobbered by a full resolve ack
     /// in the same window (host-cap learning needs two consecutive shorts).
-    pub(super) bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>>,
+    pub(super) bitrate_ack: Arc<Mutex<AckQueue>>,
     /// Decode-recovery keyframe asks, counted at the control-task send choke.
-    /// Drained per report window as the ABR recovery signal.
     pub(super) recovery_kf: Arc<AtomicU32>,
     /// Host pipeline-rebuild gap in ms ([`crate::quic::PipelineGap`]); `0` =
     /// none. Drained each iteration — see [`take_pipeline_gap`].
@@ -54,24 +53,39 @@ pub(super) struct DataPump {
     pub(super) bit_depth: u8,
     pub(super) chroma_format: u8,
     /// Host marks idle-keepalive repeats (`USER_FLAG_REPEAT` / Welcome
-    /// [`crate::quic::HOST_CAP2_REPEAT_MARK`]). Older hosts are
-    /// [`crate::abr::WindowActivity::Unmarked`].
+    /// [`crate::quic::HOST_CAP2_REPEAT_MARK`]).
     pub(super) marks_repeats: bool,
-    /// Audio-plane wire reservation. Added to window `actual` so the
-    /// controller's domain matches the budget its targets are in.
+    /// Host serves probe requests during its own bring-up
+    /// ([`crate::quic::HOST_CAP2_RAMP`]): the link is measured before the
+    /// first frame instead of burst at beside it.
+    pub(super) serves_ramp: bool,
+    /// Host reads a delivery count every window
+    /// ([`crate::quic::HOST_CAP2_DELIVERY`]) to divide a shared path.
+    pub(super) reads_delivery: bool,
+    /// Audio-plane wire reservation, spent whether video flows or not.
     pub(super) audio_reserved_kbps: u32,
-    /// Mode+codec ceiling ([`crate::abr::stream_ceiling_kbps`]). Holds the
-    /// probe-measured link ceiling; recomputed on an accepted mode switch.
+    /// Mode+codec ceiling ([`crate::abr::stream_ceiling_kbps`]) for the
+    /// negotiated geometry; recomputed by the driver on a mode switch.
     pub(super) stream_cap_kbps: u32,
-    /// Negotiated refresh. ABR sizes host-encode thresholds in these frame
-    /// budgets ([`crate::abr::BitrateController::set_frame_budget`]).
+    /// Negotiated refresh, not the request still sitting in `mode_slot`.
     pub(super) refresh_hz: u32,
     /// Accepted mode, written by the control task. Read when `mode_gen`
-    /// moves so the frame budget follows the new refresh.
+    /// moves so the driver follows the new geometry.
     pub(super) mode_slot: Arc<Mutex<crate::config::Mode>>,
-    /// Published each window from [`crate::abr::BitrateController::last_cut`].
+    /// Published each window from [`crate::abr::Driver::last_cut`].
     pub(super) rate_cut: Arc<std::sync::atomic::AtomicU8>,
+    /// Closed windows for an embedder recording a trajectory
+    /// ([`crate::client::NativeClient::take_abr_windows`]).
+    pub(super) abr_windows: Arc<Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>>,
+    /// The bring-up ramp's steps and outcome, published once it stops
+    /// ([`crate::client::NativeClient::abr_ramp`]).
+    pub(super) abr_ramp: Arc<Mutex<Option<crate::abr::RampRecord>>>,
 }
+
+/// Closed windows held for an embedder that has not read them. Forty-eight
+/// seconds at the report cadence: enough that a client polling once a second
+/// never loses one, small enough that one which never polls costs nothing.
+pub(crate) const ABR_TRAJECTORY_WINDOWS: usize = 64;
 
 impl DataPump {
     pub(super) fn run(self) {
@@ -99,89 +113,63 @@ impl DataPump {
             bit_depth,
             chroma_format,
             marks_repeats,
+            serves_ramp,
+            reads_delivery,
             audio_reserved_kbps,
             stream_cap_kbps,
             refresh_hz,
             mode_slot: pump_mode_slot,
             rate_cut,
+            abr_windows,
+            abr_ramp,
         } = self;
         pin_thread_user_interactive(); // frame channel → user-interactive video pump
         register_hot_tid(&pump_hot_tids); // UDP receive + FEC reassembly
-                                          // Adaptive-FEC loss window. FLAG_PROBE filler would skew it, so
-                                          // reports are suppressed for the whole speed-test burst.
-        let mut last_report = Instant::now();
-        // DeliveryReport: every window while packets_received is 0, once
-        // more when the first packets land, then never. Older hosts log
-        // each unknown control message.
-        let mut delivery_confirmed = false;
-        let (
-            mut last_recovered,
-            mut last_late,
-            mut last_received,
-            mut last_dropped,
-            mut last_bytes,
-        ) = (0u64, 0u64, 0u64, 0u64, 0u64);
-        // PUNKTFUNK_PERF: recv/decrypt/reassemble split plus AU inter-arrival
-        // jitter. Jump-to-live only fires after the stream is already behind.
+                                          // PUNKTFUNK_PERF: recv/decrypt/reassemble split plus AU inter-arrival
+                                          // jitter. Jump-to-live only fires after the stream is already behind.
         let pump_perf_on = std::env::var("PUNKTFUNK_PERF").is_ok_and(|v| v != "0");
         let mut arrivals_us: Vec<u32> = Vec::new();
         let mut last_arrival: Option<Instant> = None;
-        // ABR: Automatic (`bitrate_kbps == 0`) and a non-zero Welcome echo.
-        // Old host echoes 0 → controller stays off. PyroWave pins the rate
-        // (hard per-frame CBR — AIMD and the climb probe stay off).
+        // PyroWave pins the rate (hard per-frame CBR), so Automatic never
+        // arms: no AIMD. The bring-up ramp still runs for an Automatic
+        // session — to size the pin, not to feed a controller.
         let rate_pinned = negotiated_codec == crate::quic::CODEC_PYROWAVE;
+        // The pin the Welcome resolved, for a PyroWave Automatic session
+        // (`bitrate_kbps == 0`) on a host that serves the ramp. A measured
+        // wall lowers it once; everything else leaves it, and it never rises.
+        let pin_kbps = (rate_pinned && bitrate_kbps == 0)
+            .then_some(resolved_bitrate_kbps)
+            .filter(|&pin| pin > 0);
         // All-intra: no reference chain, so the channel drains to newest
         // (`FrameChannel::set_all_intra`) instead of strict FIFO.
         frames.set_all_intra(negotiated_codec == crate::quic::CODEC_PYROWAVE);
-        let mut abr = BitrateController::new(if bitrate_kbps == 0 && !rate_pinned {
-            resolved_bitrate_kbps
-        } else {
-            0
-        });
-        // Bound the probe by stream shape, not raw link capacity. A fat LAN
-        // otherwise licenses rates no inter-coded stream can use.
-        abr.set_stream_cap(stream_cap_kbps);
-        // Encode thresholds in this session's frame budgets, not the 120 Hz
-        // durations they were calibrated at. 60 Hz would take SEVERE ×0.7
-        // on an ordinary one-frame encode hiccup.
-        abr.set_frame_budget(refresh_hz);
-        // Startup capacity probe (Automatic): one burst after video flows.
-        // Ceiling = delivered × 0.7. Target is `2 × stream_cap` (need
-        // delivered ≥ cap × 1.43; `set_ceiling` clamps to the stream cap).
-        // `PUNKTFUNK_ABR_PROBE=0` opts out; `_KBPS` overrides the target.
-        let capacity_probe_kbps: u32 = std::env::var("PUNKTFUNK_ABR_PROBE_KBPS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or_else(|| probe_target_kbps(stream_cap_kbps));
-        const CAPACITY_PROBE_MS: u32 = 800;
-        const CAPACITY_PROBE_DELAY: Duration = Duration::from_secs(2);
-        // Burst aftermath: queue + QUIC loss-recovery sit between host
-        // "complete" and our receipt. A late result is discarded.
-        const CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-        let mut capacity_probe_at: Option<Instant> = (bitrate_kbps == 0
-            && !rate_pinned
-            && resolved_bitrate_kbps > 0
-            && std::env::var("PUNKTFUNK_ABR_PROBE").map_or(true, |v| v != "0"))
-        .then(|| Instant::now() + CAPACITY_PROBE_DELAY);
-        let mut capacity_probe_deadline: Option<Instant> = None;
-        // Leading/trailing edge of any probe (startup or embedder). An
-        // unanswered request must not wedge the report tick forever.
-        let mut was_probing = false;
-        // `frames_completed` at burst start: "did any frame survive", not
-        // "has one ever arrived".
-        let mut frames_at_probe_start: u64 = 0;
-        // Discard this window's LossReport / ABR / standing-latency close.
-        // Probe tail (reassembler still aging FLAG_PROBE as drops) and a
-        // host pipeline rebuild both describe something other than the
-        // link; one bogus congestion verdict ends slow start for good.
-        let mut discard_abr_window = false;
-        let mut probe_watchdog: Option<Instant> = None;
-        let (mut owd_sum_ns, mut owd_frames) = (0i128, 0u32);
-        // Completed video AUs vs host-marked idle repeats. Meaningful only
-        // when `marks_repeats`.
-        let (mut au_frames, mut au_repeats) = (0u32, 0u32);
-        let mut flush_in_window = false;
+        // The three environment overrides, read once. Automatic is a session
+        // with no embedder rate and a host that echoed one.
+        let session_start = Instant::now();
+        let mut abr = crate::abr::Driver::new(
+            DriverConfig {
+                start_kbps: if bitrate_kbps == 0 && !rate_pinned {
+                    resolved_bitrate_kbps
+                } else {
+                    0
+                },
+                ceiling_cap_kbps: env_u32("PUNKTFUNK_ABR_MAX_MBPS")
+                    .map(|m| m.saturating_mul(1_000)),
+                stream_cap_kbps,
+                refresh_hz,
+                codec: negotiated_codec,
+                bit_depth,
+                chroma_format,
+                audio_reserved_kbps,
+                marks_repeats,
+                probe: std::env::var("PUNKTFUNK_ABR_PROBE").map_or(true, |v| v != "0"),
+                probe_target_kbps: env_u32("PUNKTFUNK_ABR_PROBE_KBPS"),
+                ramp: serves_ramp,
+                reads_delivery,
+                pin_kbps,
+            },
+            session_start,
+        );
         // Jump-to-live: clock-based over-bound run (`stale_since`, needs
         // skew handshake), clock-free queue run (`standing_since`), shared
         // cooldown. Wall-clock, not frame counts — fps must not scale it.
@@ -230,19 +218,23 @@ impl DataPump {
             }
             // Drain here, not at the report tick, so the in-flight window
             // (the one the rebuild corrupted) is the one we can still drop.
-            // A gap that straddled a boundary already fed the previous
-            // window; holding every window back would be a permanent lag.
             if let Some(gap_ms) = take_pipeline_gap(&pump_pipeline_gap) {
-                discard_abr_window = true;
-                tracing::debug!(
-                    gap_ms,
-                    window_ms = last_report.elapsed().as_millis() as u64,
-                    "host pipeline gap — the report window in flight is discarded"
-                );
+                abr.on_pipeline_gap(gap_ms);
             }
             // Mirror drop/FEC counters every iteration, not only on a
             // produced frame — a total-loss drought completes no AU.
             let st = session.stats();
+            abr.on_stats(&st);
+            // One delay sample per frame that opened since the last iteration,
+            // whether or not it ever completed. Same offset and same sign test
+            // as a completed AU's; without an offset there is no delay to read,
+            // but the samples are still drained.
+            for raw_ns in session.take_shard_delays() {
+                let owd_ns = i128::from(raw_ns) + i128::from(clock_offset_ns);
+                if clock_offset_ns != 0 && owd_ns > 0 {
+                    abr.on_shard_owd(owd_ns);
+                }
+            }
             if let Some(g) = rx_gap.observe(Instant::now(), st.packets_received) {
                 tracing::warn!(
                     silence_ms = g.silence_ms,
@@ -269,7 +261,7 @@ impl DataPump {
             }
             frames_dropped.store(st.frames_dropped, Ordering::Relaxed);
             fec_recovered.store(st.fec_recovered_shards, Ordering::Relaxed);
-            let probe_active = {
+            let (probe_active, probe_duration_ms, probe_report) = {
                 let mut p = pump_probe.lock().unwrap();
                 if p.active && !p.done {
                     // First mirror tick: zero arrival stamps before the
@@ -288,125 +280,137 @@ impl DataPump {
                     };
                     p.base_packets.get_or_insert(st.probe_packets_received);
                     p.base_bytes.get_or_insert(st.probe_bytes_received);
+                } else if p.done && p.ramp {
+                    // The host's report rides the control stream and the
+                    // filler rides the data plane, so it can arrive while the
+                    // bottleneck queue is still handing us the step. Keep
+                    // counting: the ramp reads the drain, not the send window.
+                    p.refresh_delivered(&st);
                 }
-                p.active && !p.done
+                let report = p.done.then(|| ProbeReport {
+                    delivered_bytes: p.delivered_bytes,
+                    delivered_packets: p.delivered_packets,
+                    window_ms: p.throughput_window_ms(p.delivered_packets),
+                    host_duration_ms: p.host_duration_ms,
+                    client_interval_ms: p.client_interval_ms,
+                    client_interval_us: p.client_interval_us,
+                    host_bytes_sent: p.host_goodput_bytes,
+                    wire_packets_sent: p.host_wire_packets,
+                    send_dropped: p.host_send_dropped,
+                });
+                (p.active && !p.done, p.duration_ms, report)
             };
-            // Probe ended: rebase every window anchor past the burst.
-            // FLAG_PROBE landed in packet/byte counters but never the
-            // decoder; without this the first post-burst window poisons
-            // proven-throughput (monotone, never decays) and loss_ppm.
-            if was_probing && !probe_active {
-                last_recovered = st.fec_recovered_shards;
-                last_late = st.fec_late_shards;
-                last_received = st.packets_received;
-                last_dropped = st.frames_dropped;
-                last_bytes = wire_bytes(&st);
-                last_report = Instant::now();
-                discard_abr_window = true;
-                flush_in_window = false;
-                // Burst may have taken the keyframe with it. Compare
-                // against the count snapshotted at the leading edge, not
-                // 0: that also catches a mid-session embedder speed test.
-                // One request per probe, via the control-task coalescer.
-                if st.frames_completed == frames_at_probe_start {
-                    let _ = ctrl_tx.try_send(CtrlRequest::Keyframe);
-                    tracing::warn!(
-                        "no frame survived the capacity probe — requested a keyframe to re-anchor"
-                    );
-                }
+            abr.on_probe_active(probe_active, probe_duration_ms, Instant::now());
+            if let Some(r) = probe_report {
+                abr.on_probe_result(r, Instant::now());
             }
-            // Leading edge of any probe: an old host that ignores
-            // ProbeRequest must not latch `active` and mute reports.
-            if !was_probing && probe_active {
-                let burst = Duration::from_millis(pump_probe.lock().unwrap().duration_ms as u64);
-                probe_watchdog = Some(Instant::now() + burst + CAPACITY_PROBE_TIMEOUT);
-                frames_at_probe_start = st.frames_completed;
+            let mg = pump_mode_gen.load(Ordering::Relaxed);
+            if mg != seen_mode_gen {
+                seen_mode_gen = mg;
+                let m = *pump_mode_slot.lock().unwrap();
+                abr.on_mode_switch(m.width, m.height, m.refresh_hz);
             }
-            if !probe_active {
-                probe_watchdog = None;
-            } else if let Some(deadline) = probe_watchdog {
-                if Instant::now() >= deadline {
-                    probe_watchdog = None;
-                    pump_probe.lock().unwrap().active = false;
-                    tracing::warn!(
-                        "speed-test probe unanswered — clearing it so loss reports and ABR resume"
-                    );
-                }
+            for (acked, why) in bitrate_ack.lock().unwrap().drain(..) {
+                abr.on_ack(acked, why);
             }
-            was_probing = probe_active;
-            // Startup probe once video flows. One ProbeState, no
-            // correlation id — do not clobber an embedder speed test.
-            // "Settled" is a completed frame, not the 2 s timer: a slow
-            // host bring-up is still emitting its first IDR.
-            if capacity_probe_at.is_some_and(|at| Instant::now() >= at)
-                && (probe_active || st.frames_completed == 0)
-            {
-                capacity_probe_at = Some(Instant::now() + CAPACITY_PROBE_DELAY);
-            } else if capacity_probe_at.is_some_and(|at| Instant::now() >= at) {
-                capacity_probe_at = None;
-                *pump_probe.lock().unwrap() = ProbeState {
-                    active: true,
-                    duration_ms: CAPACITY_PROBE_MS,
-                    ..Default::default()
-                };
-                if ctrl_tx
-                    .try_send(CtrlRequest::Probe(ProbeRequest {
-                        target_kbps: capacity_probe_kbps,
-                        duration_ms: CAPACITY_PROBE_MS,
-                    }))
-                    .is_ok()
-                {
-                    capacity_probe_deadline = Some(Instant::now() + CAPACITY_PROBE_TIMEOUT);
-                    tracing::info!(
-                        target_kbps = capacity_probe_kbps,
-                        duration_ms = CAPACITY_PROBE_MS,
-                        "adaptive bitrate: startup link-capacity probe"
-                    );
-                } else {
-                    pump_probe.lock().unwrap().active = false; // ctrl queue full — skip
-                }
-            }
-            if let Some(deadline) = capacity_probe_deadline {
-                let mut p = pump_probe.lock().unwrap();
-                if p.done {
-                    capacity_probe_deadline = None;
-                    // All-zero reply = decline: keep the negotiated ceiling.
-                    // Else delivered × 0.7 over the CLIENT receive interval
-                    // (the host send window closes while the bottleneck
-                    // queue is still draining; that duration overstates).
-                    if p.host_duration_ms > 0 && p.delivered_bytes > 0 {
-                        let window_ms = p.throughput_window_ms(p.delivered_packets);
-                        let delivered_kbps =
-                            (p.delivered_bytes.saturating_mul(8) / window_ms.max(1) as u64) as u32;
-                        let ceiling = delivered_kbps.saturating_mul(7) / 10;
-                        abr.set_ceiling(ceiling);
-                        tracing::info!(
-                            delivered_kbps,
-                            ceiling_kbps = ceiling,
-                            client_interval_ms = p.client_interval_ms,
-                            host_duration_ms = p.host_duration_ms,
-                            "adaptive bitrate: link-capacity probe done — climb ceiling set"
-                        );
-                    } else {
-                        tracing::info!(
-                            "adaptive bitrate: capacity probe declined — keeping negotiated ceiling"
-                        );
+            // Drain even when the controller is off, so the accumulators
+            // stay bounded and no count leaks into a later window.
+            let (sum, count) = {
+                let mut acc = pump_decode_lat.lock().unwrap();
+                let taken = (acc.sum_us, acc.count);
+                *acc = DecodeLatAcc::default();
+                taken
+            };
+            abr.on_decode_latency(sum, count);
+            let (sum, count) = {
+                let mut acc = pump_encode_lat.lock().unwrap();
+                let taken = (acc.sum_us, acc.count);
+                *acc = Default::default();
+                taken
+            };
+            abr.on_encode_latency(sum, count);
+            abr.on_keyframe_asks(pump_recovery_kf.swap(0, Ordering::Relaxed));
+            let tick = abr.tick(Instant::now());
+            // The rate this window asked for, recorded beside the window it
+            // came out of.
+            let mut request_kbps = None;
+            for action in tick.actions {
+                match action {
+                    Action::Loss(loss_ppm) => {
+                        let _ = ctrl_tx.try_send(CtrlRequest::Loss(LossReport { loss_ppm }));
                     }
-                    // Rebase the ABR byte anchor past the burst. `wire_bytes`
-                    // already nets filler; this skips video that landed under
-                    // a suppressed report tick (else a long span / one window).
-                    last_bytes = wire_bytes(&st);
-                } else if Instant::now() >= deadline {
-                    // Host never answered: clear stuck-active so LossReports
-                    // resume. Keep the negotiated ceiling.
-                    p.active = false;
-                    capacity_probe_deadline = None;
-                    tracing::info!(
-                        "adaptive bitrate: capacity probe timed out (old host?) — keeping negotiated ceiling"
-                    );
+                    Action::Delivery(packets_received) => {
+                        let _ = ctrl_tx
+                            .try_send(CtrlRequest::Delivery(DeliveryReport { packets_received }));
+                    }
+                    Action::SetBitrate(kbps) => {
+                        request_kbps = Some(kbps);
+                        if ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps)).is_err() {
+                            // Never reached the control task. Three of these
+                            // retire the controller as "the host never acked".
+                            abr.on_request_dropped(kbps);
+                        }
+                    }
+                    Action::Keyframe => {
+                        let _ = ctrl_tx.try_send(CtrlRequest::Keyframe);
+                    }
+                    Action::Probe {
+                        target_kbps,
+                        duration_ms,
+                        ramp,
+                    } => {
+                        // One ProbeState, no correlation id — do not clobber
+                        // an embedder speed test.
+                        *pump_probe.lock().unwrap() = ProbeState {
+                            active: true,
+                            duration_ms,
+                            ramp,
+                            ..Default::default()
+                        };
+                        if ctrl_tx
+                            .try_send(CtrlRequest::Probe(ProbeRequest {
+                                target_kbps,
+                                duration_ms,
+                            }))
+                            .is_err()
+                        {
+                            pump_probe.lock().unwrap().active = false; // ctrl queue full — skip
+                            abr.on_probe_dropped();
+                        }
+                    }
+                    Action::AbandonProbe => pump_probe.lock().unwrap().active = false,
                 }
             }
-            if !probe_active && last_report.elapsed() >= ADAPT_REPORT_INTERVAL {
+            if let Some(window) = tick.window {
+                // Published at the first window, not the moment the ramp
+                // stopped: the rate it opened at is the one the host acked,
+                // and that ack is still in flight while the ramp finishes.
+                if let Some(outcome) = abr.ramp_outcome() {
+                    let mut slot = abr_ramp.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(crate::abr::RampRecord {
+                            steps: abr.ramp_steps().to_vec(),
+                            outcome,
+                            opening_kbps: abr.target_kbps(),
+                        });
+                    }
+                }
+                {
+                    let mut q = abr_windows.lock().unwrap_or_else(|e| e.into_inner());
+                    if q.len() == ABR_TRAJECTORY_WINDOWS {
+                        q.pop_front();
+                    }
+                    q.push_back(crate::abr::WindowRecord {
+                        t_ms: window.sample.now.duration_since(session_start).as_millis() as u64,
+                        // The rate the window ran at: the ask has not been
+                        // acked yet, so it is not this window's rate.
+                        rate_kbps: abr.target_kbps(),
+                        request_kbps,
+                        sample: window.sample,
+                        discarded: window.discarded,
+                        reason: abr.reason(),
+                    });
+                }
                 // No-op clock flush suspected a wall-clock step: re-sync
                 // once. The 60 s periodic covers everything else.
                 if resync_wanted {
@@ -419,39 +423,10 @@ impl DataPump {
                 if skipped > 0 {
                     tracing::debug!(skipped, "all-intra frame channel drained to newest");
                 }
-                let discard = std::mem::take(&mut discard_abr_window);
-                let window_dropped = st.frames_dropped.wrapping_sub(last_dropped);
-                let loss_ppm = window_loss_ppm(
-                    st.fec_recovered_shards.wrapping_sub(last_recovered),
-                    st.fec_late_shards.wrapping_sub(last_late),
-                    st.packets_received.wrapping_sub(last_received),
-                );
-                if discard {
-                    // LossReport goes with the window: probe tail would
-                    // spike host FEC off deliberate overload; a rebuild
-                    // window has a near-zero denominator.
-                    tracing::debug!(
-                        loss_ppm,
-                        window_dropped,
-                        "discarding this ABR window (probe tail or a host pipeline gap)"
-                    );
-                } else {
-                    let _ = ctrl_tx.try_send(CtrlRequest::Loss(LossReport { loss_ppm }));
-                    // DeliveryReport rides the loss report so `loss_ppm = 0`
-                    // is readable (flawless vs delivering nothing). Session
-                    // total, same arm: a discarded window stays silent.
-                    // Cadence is in [`should_report_delivery`].
-                    if should_report_delivery(st.packets_received, &mut delivery_confirmed) {
-                        let _ = ctrl_tx.try_send(CtrlRequest::Delivery(DeliveryReport {
-                            packets_received: st.packets_received,
-                        }));
-                    }
-                }
                 // Standing-latency window close. Escalation: re-sync (stale
                 // offset), then bleed (flush+keyframe), then disarm (path
-                // latency changed). A discard window is NOT loss-free —
-                // no action off probe residue.
-                match standing_lat.on_window(!discard && loss_ppm == 0 && window_dropped == 0) {
+                // latency changed).
+                match standing_lat.on_window(window.loss_free) {
                     StandingLatAction::None => {}
                     StandingLatAction::Resync { above_ms } => {
                         tracing::info!(
@@ -467,7 +442,7 @@ impl DataPump {
                         // bleed re-arms as the detector's run rebuilds.
                         if last_flush.is_none_or(|t| t.elapsed() >= FLUSH_COOLDOWN) {
                             last_flush = Some(Instant::now());
-                            // Not `flush_in_window`: that is ABR SEVERE
+                            // Not a jump-to-live: that is ABR SEVERE
                             // (immediate ×0.7). Bleed fires after ~6 clean
                             // windows with a sub-25 ms elevation the
                             // controller already scores as fine.
@@ -493,112 +468,14 @@ impl DataPump {
                         );
                     }
                 }
-                let mg = pump_mode_gen.load(Ordering::Relaxed);
-                if mg != seen_mode_gen {
-                    seen_mode_gen = mg;
-                    abr.on_mode_switch();
-                    let m = *pump_mode_slot.lock().unwrap();
-                    // Frame budget is a mode property: refresh changes
-                    // what one frame of encode time costs.
-                    abr.set_frame_budget(m.refresh_hz);
-                    // Stream-shape cap too. `set_stream_cap` also rebinds
-                    // an already-learned ceiling downward for the new
-                    // geometry.
-                    abr.set_stream_cap(crate::abr::stream_ceiling_kbps(
-                        m.width,
-                        m.height,
-                        m.refresh_hz,
-                        negotiated_codec,
-                        bit_depth,
-                        chroma_format,
-                    ));
-                }
-                for acked in bitrate_ack.lock().unwrap().drain(..) {
-                    abr.on_ack(acked);
-                }
-                let owd_mean_us =
-                    (owd_frames > 0).then(|| (owd_sum_ns / owd_frames as i128 / 1000) as i64);
-                (owd_sum_ns, owd_frames) = (0, 0);
-                // Active = new content this window. Empty ≠ unmarked: no AU
-                // is not an older host, and cannot prove repeat-only idle.
-                let activity = abr_window_activity(marks_repeats, au_frames, au_repeats);
-                (au_frames, au_repeats) = (0, 0);
-                // Drain even when ABR is off so the accumulator stays
-                // bounded. `None` = nothing reported this window.
-                let decode_mean_us = {
-                    let mut acc = pump_decode_lat.lock().unwrap();
-                    let (sum, count) = (acc.sum_us, acc.count);
-                    *acc = DecodeLatAcc::default();
-                    (count > 0).then(|| (sum / count as u64) as i64)
-                };
-                // Host-encode window (0xCF `encode_us`). `None` on an
-                // old host that does not send stage timings.
-                let encode_mean_us = {
-                    let mut acc = pump_encode_lat.lock().unwrap();
-                    let (sum, count) = (acc.sum_us, acc.count);
-                    *acc = Default::default();
-                    (count > 0).then(|| (sum / count as u64) as i64)
-                };
-                // Always drain so a discard window cannot leak its
-                // count into the next one.
-                let recovery_kf_reqs = pump_recovery_kf.swap(0, Ordering::Relaxed);
-                // Wire throughput vs target: headers, seals, FEC parity
-                // included (they spend the budget), minus probe filler,
-                // plus the audio reservation (spent whether video flows).
-                let window_ms = last_report.elapsed().as_millis().max(1) as u64;
-                let actual_kbps = ((wire_bytes(&st).wrapping_sub(last_bytes).saturating_mul(8)
-                    / window_ms) as u32)
-                    .saturating_add(audio_reserved_kbps);
-                // Discard window: signals are probe-tail residue. One
-                // congestion verdict here ends slow start for good.
-                let verdict = if discard {
-                    None
-                } else {
-                    abr.on_window(
-                        Instant::now(),
-                        window_dropped,
-                        loss_ppm,
-                        owd_mean_us,
-                        decode_mean_us,
-                        encode_mean_us,
-                        actual_kbps,
-                        flush_in_window,
-                        recovery_kf_reqs,
-                        activity,
-                    )
-                };
-                rate_cut.store(abr.last_cut().map_or(0, |c| c as u8), Ordering::Relaxed);
-                if let Some(kbps) = verdict {
-                    // Log window signals with the decision so decode-/
-                    // encode-driven retargets are separable from network.
-                    tracing::info!(
-                        kbps,
-                        loss_ppm,
-                        owd_mean_us = owd_mean_us.unwrap_or(-1),
-                        decode_mean_us = decode_mean_us.unwrap_or(-1),
-                        encode_mean_us = encode_mean_us.unwrap_or(-1),
-                        actual_kbps,
-                        flushed = flush_in_window,
-                        recovery_kf = recovery_kf_reqs,
-                        "adaptive bitrate: requesting encoder re-target"
-                    );
-                    if ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps)).is_err() {
-                        // Never reached the control task. Three of these
-                        // retire the controller as "the host never acked".
-                        abr.on_request_dropped();
-                        tracing::warn!(
-                            kbps,
-                            "adaptive bitrate: control queue full — re-target dropped"
-                        );
-                    }
-                }
-                flush_in_window = false;
-                last_report = Instant::now();
-                last_recovered = st.fec_recovered_shards;
-                last_late = st.fec_late_shards;
-                last_received = st.packets_received;
-                last_dropped = st.frames_dropped;
-                last_bytes = wire_bytes(&st);
+                // The overlay names why Automatic sits low; the cut
+                // stands until the host grants a climb.
+                rate_cut.store(
+                    abr.last_cut()
+                        .and_then(crate::hud::RateCut::of_reason)
+                        .map_or(0, |c| c as u8),
+                    Ordering::Relaxed,
+                );
                 if pump_perf_on {
                     if let Some(p) = session.take_pump_perf() {
                         let per_pkt_ns = |ns: u64| ns.checked_div(p.packets).unwrap_or(0);
@@ -645,10 +522,7 @@ impl DataPump {
                     if is_au {
                         // Repeats are the host's idle keepalive, not
                         // new content.
-                        au_frames = au_frames.saturating_add(1);
-                        if frame.flags & crate::packet::USER_FLAG_REPEAT != 0 {
-                            au_repeats = au_repeats.saturating_add(1);
-                        }
+                        abr.on_au(frame.flags & crate::packet::USER_FLAG_REPEAT != 0);
                     }
                     if pump_perf_on && is_au {
                         let now = Instant::now();
@@ -698,8 +572,7 @@ impl DataPump {
                         // Mean capture→received delay. Rising delay under
                         // zero loss is queue growth — the pre-loss signal.
                         if clock_offset_ns != 0 && lat_ns > 0 {
-                            owd_sum_ns += lat_ns;
-                            owd_frames += 1;
+                            abr.on_owd(lat_ns);
                             // Window MINIMUM, not mean: a standing state
                             // elevates the floor. 10 s clamp matches hn stats.
                             if lat_ns < 10_000_000_000 {
@@ -732,7 +605,7 @@ impl DataPump {
                             stale_since = None;
                             standing_since = None;
                             last_flush = Some(Instant::now());
-                            flush_in_window = true; // ABR SEVERE: link cannot hold the rate
+                            abr.on_flush(); // SEVERE: the link cannot hold the rate
                             let flushed = session.flush_backlog().unwrap_or(0);
                             let dropped = frames.clear();
                             let _ = ctrl_tx.try_send(CtrlRequest::Keyframe);
@@ -795,6 +668,14 @@ impl DataPump {
     }
 }
 
+/// A positive `u32` from the environment. Unset, zero or garbage is `None`.
+fn env_u32(key: &str) -> Option<u32> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&v| v > 0)
+}
+
 /// Drain the host's pending pipeline gap. `Some(gap_ms)` = the in-flight
 /// report window must be discarded. Swap-to-zero so one announcement
 /// cannot keep poisoning later windows.
@@ -805,118 +686,9 @@ fn take_pipeline_gap(slot: &AtomicU32) -> Option<u32> {
     }
 }
 
-/// Whether this window owes the host a [`DeliveryReport`].
-///
-/// Every window while `packets_received` is 0 (the host escalates on
-/// that), then once when the first packets land, then silence. Older
-/// hosts log every unknown control message.
-fn should_report_delivery(packets_received: u64, confirmed: &mut bool) -> bool {
-    let owed = packets_received == 0 || !*confirmed;
-    *confirmed = packets_received > 0;
-    owed
-}
-
-/// Capacity-probe burst target in kbps. `PUNKTFUNK_ABR_PROBE_KBPS`
-/// overrides. `set_ceiling` clamps to the stream cap, so bits above
-/// `cap / 0.7` are discarded; ×2 clears the 1.43× bar with margin.
-///
-/// `u32::MAX` (a mode [`crate::abr::stream_ceiling_kbps`] declines to size)
-/// keeps 2 Gbps — also the hard ceiling; this can only lower the target.
-fn probe_target_kbps(stream_cap_kbps: u32) -> u32 {
-    stream_cap_kbps.saturating_mul(2).min(2_000_000)
-}
-
-/// Classify this window's new-content evidence for ABR.
-///
-/// No arrivals are [`WindowActivity::Empty`]: quiet like idle, not an
-/// older-host unmarked window. Repeat-only (every arrived AU a host-marked
-/// repeat) is [`WindowActivity::Active`]`(0)` and counts toward re-arm.
-/// Arrivals on a host that does not mark repeats are
-/// [`WindowActivity::Unmarked`]. The controller never infers stillness
-/// from a blackout.
-fn abr_window_activity(marks_repeats: bool, frames: u32, repeats: u32) -> WindowActivity {
-    if frames == 0 {
-        WindowActivity::Empty
-    } else if marks_repeats {
-        WindowActivity::Active(frames.saturating_sub(repeats))
-    } else {
-        WindowActivity::Unmarked
-    }
-}
-
-/// Wire measure: every received media-plane byte (headers, seals, FEC
-/// parity spend the budget) minus speed-test filler.
-fn wire_bytes(st: &crate::stats::Stats) -> u64 {
-    st.bytes_received.wrapping_sub(st.probe_bytes_received)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// DeliveryReport: "zero" while true, one confirmation when video
-    /// starts, then silence (older hosts warn per unknown message).
-    #[test]
-    fn the_delivery_count_is_reported_while_zero_then_once_more_and_never_again() {
-        let mut confirmed = false;
-        for _ in 0..5 {
-            assert!(
-                should_report_delivery(0, &mut confirmed),
-                "a dead data plane must be re-reported every window"
-            );
-        }
-        assert!(should_report_delivery(500, &mut confirmed));
-        for n in [900, 1_200, 90_000] {
-            assert!(
-                !should_report_delivery(n, &mut confirmed),
-                "a healthy session must not stream delivery reports"
-            );
-        }
-    }
-
-    /// A session that never receives must never look confirmed.
-    #[test]
-    fn a_session_that_receives_nothing_never_reports_itself_healthy() {
-        let mut confirmed = false;
-        for _ in 0..100 {
-            assert!(should_report_delivery(0, &mut confirmed));
-            assert!(!confirmed);
-        }
-    }
-
-    /// Burst must prove the stream cap and no more. Above `cap / 0.7`
-    /// is discarded by `set_ceiling` (see `abr::tests::the_stream_bound_clamps_a_learned_ceiling_only`).
-    #[test]
-    fn the_probe_target_proves_the_stream_cap_without_overshooting_it() {
-        for (w, h, hz, codec, depth) in [
-            (1280, 720, 60, crate::quic::CODEC_HEVC, 8),
-            (1920, 1080, 60, crate::quic::CODEC_H264, 8),
-            (2560, 1440, 120, crate::quic::CODEC_HEVC, 8),
-            (3840, 2160, 120, crate::quic::CODEC_HEVC, 10),
-        ] {
-            let cap = crate::abr::stream_ceiling_kbps(w, h, hz, codec, depth, 0);
-            let target = probe_target_kbps(cap);
-            assert!(
-                target.saturating_mul(7) / 10 >= cap,
-                "{w}x{h}@{hz}: a {target} kbps burst cannot prove a {cap} kbps cap"
-            );
-            assert!(
-                target <= cap.saturating_mul(2),
-                "{w}x{h}@{hz}: {target} kbps chases capacity the clamp discards"
-            );
-        }
-        assert_eq!(probe_target_kbps(u32::MAX), 2_000_000);
-        assert_eq!(probe_target_kbps(1_500_000), 2_000_000);
-    }
-
-    #[test]
-    fn only_observed_repeats_make_an_idle_abr_window() {
-        assert_eq!(abr_window_activity(true, 45, 45), WindowActivity::Active(0));
-        assert_eq!(abr_window_activity(true, 45, 40), WindowActivity::Active(5));
-        assert_eq!(abr_window_activity(true, 0, 0), WindowActivity::Empty);
-        assert_eq!(abr_window_activity(false, 45, 0), WindowActivity::Unmarked);
-        assert_eq!(abr_window_activity(false, 0, 0), WindowActivity::Empty);
-    }
 
     #[test]
     fn a_pipeline_gap_is_taken_exactly_once() {
@@ -1003,7 +775,7 @@ mod tests {
                     refresh_hz: 60,
                 })),
                 probe: Arc::new(Mutex::new(ProbeState::default())),
-                bitrate_ack: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                bitrate_ack: Arc::new(Mutex::new(AckQueue::new())),
                 live_bitrate: Arc::new(AtomicU32::new(0)),
                 recovery_kf: Arc::new(AtomicU32::new(0)),
                 recent_rfis: Default::default(),
@@ -1043,8 +815,10 @@ mod tests {
             frames_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             unsustainable_pin_kbps: Arc::new(AtomicU32::new(0)),
             fec_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            bitrate_ack: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            bitrate_ack: Arc::new(Mutex::new(AckQueue::new())),
             recovery_kf: Arc::new(AtomicU32::new(0)),
+            abr_windows: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            abr_ramp: Arc::new(Mutex::new(None)),
             pipeline_gap: pipeline_gap.clone(),
             bitrate_kbps: 20_000,
             resolved_bitrate_kbps: 20_000,
@@ -1052,6 +826,8 @@ mod tests {
             bit_depth: 8,
             chroma_format: 0,
             marks_repeats: false,
+            serves_ramp: false,
+            reads_delivery: false,
             audio_reserved_kbps: 256,
             stream_cap_kbps: 100_000,
             refresh_hz: 60,

@@ -66,7 +66,7 @@ pub const NO_VIDEO_RETRY: Duration = Duration::from_millis(2600);
 /// One adaptive-FEC / ABR report window. A window the client discards (probe
 /// tail, host pipeline gap) sends no [`crate::quic::LossReport`], so the host
 /// reads a report later than this by a window as a discard, not jitter.
-pub const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
+pub const ADAPT_REPORT_INTERVAL: Duration = crate::abr::WINDOW;
 
 /// A clock-triggered jump that discarded fewer datagrams than this (and no queued
 /// AUs) found no local backlog. Flushing helps neither a wall-clock step (NTP
@@ -221,7 +221,7 @@ impl StandingLatency {
 /// Client decode latency for ABR. Embedder samples via
 /// [`NativeClient::report_decode_us`] (µs from [`NativeClient::next_frame`] to
 /// decoded output); the pump drains a window mean into
-/// [`crate::abr::BitrateController::on_window`]. Only signal that sees the
+/// [`crate::abr::Driver`]. Only signal that sees the
 /// client's decoder — a fast-LAN HW decoder saturates before the link, where
 /// loss/OWD never register. Sum+count (not a running mean) so the pump takes
 /// an unweighted mean and resets. Always accumulated so it stays bounded
@@ -234,7 +234,7 @@ pub(crate) struct DecodeLatAcc {
 
 /// Host encode latency — [`DecodeLatAcc`]'s mirror. Datagram task samples
 /// `HostStages::encode_us` (submit → bitstream ready); the pump drains a window
-/// mean into [`crate::abr::BitrateController::on_window`]. Own accumulator, not
+/// mean into [`crate::abr::Driver`]. Own accumulator, not
 /// the overlay `host_timing` channel: that is a lossy `try_send` the embedder
 /// may never drain, and a fat-LAN Automatic session otherwise drives the
 /// encoder past its compute knee with nothing to stop it.

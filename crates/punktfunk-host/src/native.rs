@@ -12,12 +12,17 @@
 //! the counterpart. Evidence: `design/` and the tests below.
 
 use anyhow::{anyhow, Context, Result};
+// The wire budget, adaptive FEC and their band: one arithmetic, shared with
+// the client's controller and the link simulator.
+use punktfunk_core::abr::budget::{
+    budget_kbps_for_encoder, encoder_kbps_for_budget, FEC_ADAPTIVE_START, MIN_BITRATE_KBPS,
+};
 use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Role};
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
-    classify, endpoint, io, AccessUpdate, BitrateChanged, ClockEcho, ClockProbe, ColorInfo,
-    GrantClass, Hello, LossReport, PairRequest, PipelineGap, ProbeRequest, ProbeResult,
+    classify, endpoint, io, AccessUpdate, AckReason, BitrateChanged, ClockEcho, ClockProbe,
+    ColorInfo, GrantClass, Hello, LossReport, PairRequest, PipelineGap, ProbeRequest, ProbeResult,
     Reconfigure, Reconfigured, RequestKeyframe, RfiRequest, SetBitrate, Start, Welcome, GRANT_ALL,
     GRANT_CLIPBOARD, GRANT_GAMEPAD, GRANT_LAUNCH, GRANT_MIC, GRANT_POINTER,
 };
@@ -67,12 +72,21 @@ mod control;
 mod cursor_fwd;
 
 mod stream;
-use stream::{reconfig_allowed, software_stream, synthetic_stream, virtual_stream, SessionContext};
+use stream::{
+    reconfig_allowed, software_stream, synthetic_abr_stream, synthetic_stream, virtual_stream,
+    SessionContext, SynthAbrContext,
+};
+pub use stream::{Content, KeyframeAnswer, SynthAbrShape, DEFAULT_IDR_PCT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Punktfunk1Source {
     /// Protocol-test frames; the client byte-checks the payload.
     Synthetic,
+    /// Frames sized from the live wire budget, on the real paced send path. No display and no
+    /// GPU: what the netem rig streams so Automatic can be judged on a shaped link. The
+    /// [`SynthAbrShape`] is what it encodes, how long it holds the first frame back, and
+    /// what it answers a keyframe ask with.
+    SyntheticAbr(SynthAbrShape),
     /// Virtual display at the requested mode → NVENC.
     Virtual,
     /// A moving test picture through the software H.264 encoder, unbounded. No display and no
@@ -807,12 +821,123 @@ const QUIT_CODE: u32 = punktfunk_core::quic::QUIT_CLOSE_CODE;
 
 /// Fallback when `Hello::bitrate_kbps == 0` (20 Mbps). A client that knows its link asks.
 const DEFAULT_BITRATE_KBPS: u32 = 20_000;
-/// Floor keeps the stream usable; ceiling is headroom over the 1 Gbps+ Leopard target
-/// (5K@240 with margin). Echoed in `Welcome::bitrate_kbps`.
-const MIN_BITRATE_KBPS: u32 = 500;
-// 8 Gbps: encoder is pixel-rate bound (~1 Gpix/s per NVENC, ~2 with 2-way split). The
-// real ceiling is the transport send path, not this number.
+/// Ceiling on a resolved rate: headroom over the 1 Gbps+ Leopard target
+/// (5K@240 with margin), echoed in `Welcome::bitrate_kbps`. The encoder is
+/// pixel-rate bound (~1 Gpix/s per NVENC, ~2 with a 2-way split), so the real
+/// ceiling is the transport send path, not this number. The floor lives with
+/// the derivation it floors ([`MIN_BITRATE_KBPS`]).
 const MAX_BITRATE_KBPS: u32 = 8_000_000;
+
+/// A rate this session's encoder was seen to refuse, and the clock that tests
+/// that refusal again.
+///
+/// One transient short apply used to cap the session for good. This is the
+/// client's own learned-cap lifecycle on the host side: cleared when the
+/// encoder opens at a different configuration, and re-tested once the wait has
+/// run out — the wait doubles each time the refusal is still there, so an
+/// encoder that means it costs one ask every few minutes.
+pub(super) struct EncoderCeiling {
+    cap: punktfunk_core::abr::LearnedCap,
+    /// When the cap was last written. The wait is `reprobe_after` report
+    /// windows of real time, the same 12 s → 96 s ladder the client re-probes
+    /// its own caps on.
+    written_at: std::time::Instant,
+}
+
+impl EncoderCeiling {
+    pub(super) fn new() -> Self {
+        EncoderCeiling {
+            cap: punktfunk_core::abr::LearnedCap::new(),
+            written_at: std::time::Instant::now(),
+        }
+    }
+
+    /// The rate to hand the encoder for an ask of `want`, and what the client
+    /// is told held it there.
+    ///
+    /// Past the wait the ask goes through: the encoder's answer is the only
+    /// evidence that the ceiling still stands. The cap moves up an eighth
+    /// first, exactly as the client's re-probe does, so a refusal that is still
+    /// there re-latches under the lift and backs the clock off.
+    pub(super) fn resolve(&mut self, want: u32) -> (u32, AckReason) {
+        let Some(cap) = self.cap.kbps() else {
+            return (want, AckReason::Granted);
+        };
+        if want <= cap {
+            return (want, AckReason::Granted);
+        }
+        if self.written_at.elapsed() < self.wait() {
+            tracing::info!(
+                requested_kbps = want,
+                ceiling_kbps = cap,
+                "bitrate request clamped to the known encoder ceiling"
+            );
+            return (cap, AckReason::EncoderLimit);
+        }
+        self.write(cap.saturating_add(cap / 8));
+        tracing::info!(
+            requested_kbps = want,
+            ceiling_kbps = cap,
+            "re-testing the encoder ceiling — letting the request reach the encoder"
+        );
+        (want, AckReason::Granted)
+    }
+
+    /// What the encoder made of an ask of `want`. Short is the ceiling, again;
+    /// taking the whole ask is the ceiling gone.
+    pub(super) fn note_applied(&mut self, want: u32, applied: u32) {
+        if applied >= want {
+            if self.cap.kbps().is_some() {
+                tracing::info!(
+                    applied_kbps = applied,
+                    "the encoder took the whole rate — dropping the ceiling it refused before"
+                );
+                self.cap.drop_cap();
+            }
+            return;
+        }
+        // `latch` backs the clock off only for a cap that binds tighter; an
+        // encoder that took more than the ceiling remembered has moved it up,
+        // and that is not evidence of a standing refusal.
+        if !self.cap.latch(applied, MIN_BITRATE_KBPS) {
+            self.cap.park(applied);
+        }
+        self.written_at = std::time::Instant::now();
+        tracing::info!(
+            requested_kbps = want,
+            ceiling_kbps = self.cap.kbps().unwrap_or(applied),
+            retest_in_s = self.wait().as_secs(),
+            "the encoder applied less than the rate asked — ceiling learned"
+        );
+    }
+
+    /// The encoder opened at a different configuration. Whatever it refused was
+    /// refused by an encoder that no longer exists.
+    pub(super) fn clear(&mut self) {
+        if self.cap.kbps().is_some() {
+            tracing::info!("encoder rebuilt at a new configuration — its learned ceiling is gone");
+            self.cap.drop_cap();
+        }
+    }
+
+    fn write(&mut self, kbps: u32) {
+        self.cap.park(kbps);
+        self.written_at = std::time::Instant::now();
+    }
+
+    fn wait(&self) -> std::time::Duration {
+        punktfunk_core::abr::WINDOW * self.cap.reprobe_after()
+    }
+
+    /// Spend the whole wait at once, so a test is not twelve seconds long.
+    #[cfg(test)]
+    fn spend_the_wait(&mut self) {
+        self.written_at = self
+            .written_at
+            .checked_sub(self.wait())
+            .expect("a monotonic clock older than one wait");
+    }
+}
 
 /// `0` → host default; anything else clamped into `[MIN, MAX]`.
 fn resolve_bitrate_kbps(requested: u32) -> u32 {
@@ -870,49 +995,6 @@ fn resolve_bitrate_kbps_for(
         return pin;
     }
     resolve_bitrate_kbps(requested)
-}
-
-/// 40-byte header + 24-byte crypto seal inside each UDP payload (~4.5 % at 1408).
-const SHARD_WIRE_OVERHEAD: u64 =
-    (punktfunk_core::packet::HEADER_LEN + punktfunk_core::packet::CRYPTO_OVERHEAD) as u64;
-
-/// Wire budget → encoder rate. Client bitrate is the session wire budget.
-///
-/// ```text
-/// wire  = video × (payload+64)/payload × (100+fec)/100 + audio
-/// video = (wire − audio) × payload/(payload+64) × 100/(100+fec)
-/// ```
-///
-/// Adaptive FEC reallocates inside the budget: more parity, lower encoder rate, never a
-/// fatter wire. Floored at [`MIN_BITRATE_KBPS`]. PyroWave bypasses this (bpp pin, ABR off).
-fn encoder_kbps_for_budget(
-    budget_kbps: u32,
-    audio_kbps: u32,
-    fec_percent: u8,
-    shard_payload: u16,
-) -> u32 {
-    let payload = shard_payload.max(1) as u64;
-    let video_wire = budget_kbps.saturating_sub(audio_kbps) as u64;
-    let video =
-        video_wire * payload * 100 / ((payload + SHARD_WIRE_OVERHEAD) * (100 + fec_percent as u64));
-    u32::try_from(video)
-        .unwrap_or(u32::MAX)
-        .max(MIN_BITRATE_KBPS)
-}
-
-/// Inverse: wire spend of an encoder rate. A short apply reports this so the client's climb
-/// base tracks wire truth. Rounds up where the derivation rounds down, so a roundtrip never
-/// inflates the budget the client believes.
-fn budget_kbps_for_encoder(
-    encoder_kbps: u32,
-    audio_kbps: u32,
-    fec_percent: u8,
-    shard_payload: u16,
-) -> u32 {
-    let payload = shard_payload.max(1) as u64;
-    let wire = encoder_kbps as u64 * (payload + SHARD_WIRE_OVERHEAD) * (100 + fec_percent as u64)
-        / (payload * 100);
-    u32::try_from(wire.saturating_add(audio_kbps as u64)).unwrap_or(u32::MAX)
 }
 
 /// Budget↔encoder at one moment: session constants plus a snapshot of adaptive FEC,
@@ -1012,25 +1094,17 @@ fn fec_static_override() -> Option<u8> {
         .map(|p| p.min(90))
 }
 
-/// Adaptive-FEC band. A clean link decays to [`FEC_MIN`]; loss ramps toward [`FEC_MAX`].
-/// 5 % is 4 parity shards on a ~110 KB frame (2 on a 30 KB one) — the burst a clean link
-/// still drops. A 1 % floor left one, so the cleanest link lost a frame to two packets.
-const FEC_MIN: u8 = 5;
-const FEC_MAX: u8 = 50;
-const FEC_ADAPTIVE_START: u8 = 10;
-
-/// Loss ppm ([`LossReport`]) → recovery %. FEC must exceed loss, so target ≈ loss × 1.4 + 1.
-/// Clean (≈0 ppm) lands on [`FEC_MIN`].
-fn adapt_fec(loss_ppm: u32) -> u8 {
-    let loss_pct = loss_ppm as f64 / 10_000.0; // ppm → percent
-    let target = (loss_pct * 1.4).ceil() as u32 + 1;
-    target.clamp(FEC_MIN as u32, FEC_MAX as u32) as u8
+/// Whether this source adapts FEC: only sources that can keep encoder and packetizer
+/// FEC in one wire budget. Synthetic-abr derives frame bytes from FEC every frame;
+/// the virtual path publishes a proposal only after its encoder accepts the matching
+/// rate. Fixed synthetic and the standalone software source have no retarget path.
+fn adaptive_fec_for(source: Punktfunk1Source, static_override: bool) -> bool {
+    !static_override
+        && matches!(
+            source,
+            Punktfunk1Source::SyntheticAbr(_) | Punktfunk1Source::Virtual
+        )
 }
-
-/// Points over the measured level while frames die that parity might have caught.
-const FEC_STEP: u8 = 3;
-/// Report windows (~750 ms each) the step gets to prove itself.
-const FEC_STEP_WINDOWS: u32 = 4;
 
 /// Consecutive report windows an RFI ask landed in — frames parity could not repair. The
 /// client sends no [`LossReport`] for a window it discards (probe tail, host pipeline gap),
@@ -1061,23 +1135,6 @@ impl UnrecoveredRun {
         };
         self.run
     }
-}
-
-/// One window's FEC target. `unrecovered_run` is [`UnrecoveredRun::report`]. The first
-/// [`FEC_STEP_WINDOWS`] of a run add [`FEC_STEP`] over the measured level; a run past that is
-/// loss no per-frame parity bridges, so the step comes off and only the measured loss holds.
-/// Decays one point per window so a burst every few seconds does not fall to the floor
-/// between hits.
-fn fec_target(loss_ppm: u32, prev: u8, unrecovered_run: u32) -> u8 {
-    let step = if (1..=FEC_STEP_WINDOWS).contains(&unrecovered_run) {
-        FEC_STEP
-    } else {
-        0
-    };
-    adapt_fec(loss_ppm)
-        .saturating_add(step)
-        .min(FEC_MAX)
-        .max(prev.saturating_sub(1))
 }
 
 /// Per-frame send path: apply the adaptive-FEC target if it changed (relaxed load + compare).
@@ -1490,6 +1547,7 @@ pub(crate) async fn run_admitted(
         data_sock,
         start,
         client_label,
+        abr_features,
         compositor,
         gamescope_route,
         prep,
@@ -1564,10 +1622,10 @@ pub(crate) async fn run_admitted(
     // LTR-RFI: encode loop prefers `invalidate_ref_frames` over a full IDR when the encoder can.
     let (rfi_tx, rfi_rx) = std::sync::mpsc::channel::<(u32, u32)>();
     let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
-    // Encoder truth for `SetBitrate` resolve: applied rate, discovered ceiling (`0` = none),
-    // cadence-degraded (climb refused — more bits are not the fix). Atomics: freshest only.
+    // Encoder truth for `SetBitrate` resolve: applied rate, a ceiling the encoder taught and
+    // re-tests, cadence-degraded (climb refused — more bits are not the fix).
     let live_bitrate = Arc::new(AtomicU32::new(welcome.bitrate_kbps));
-    let encoder_ceiling_kbps = Arc::new(AtomicU32::new(0));
+    let encoder_ceiling = Arc::new(std::sync::Mutex::new(EncoderCeiling::new()));
     let cadence_degraded = Arc::new(AtomicBool::new(false));
     // Behind-cadence score for the climb-refusal log (the flag alone has no evidence).
     let cadence_behind_score = Arc::new(AtomicU32::new(0));
@@ -1576,6 +1634,14 @@ pub(crate) async fn run_admitted(
     let client_packets_received = Arc::new(AtomicU32::new(u32::MAX));
     let client_packets_received_ctl = client_packets_received.clone();
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
+    // The bring-up ramp's window: probe requests are served on the punched
+    // data plane without the control task's spacing until the send thread
+    // takes it. Open from the handshake, because the client asks as soon as
+    // it has punched — before this host has built anything.
+    let ramp_open = Arc::new(AtomicBool::new(
+        welcome.host_caps2 & punktfunk_core::quic::HOST_CAP2_RAMP != 0,
+    ));
+    let ramp_open_ctl = ramp_open.clone();
     let (probe_result_tx, probe_result_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
     // Accept ack is written before the rebuild; a failed or differently-honored rebuild must
     // correct the client's mode slot with a second `Reconfigured { accepted: true, mode }`.
@@ -1583,7 +1649,7 @@ pub(crate) async fn run_admitted(
         tokio::sync::mpsc::unbounded_channel::<Reconfigured>();
     // Rebuild can re-resolve Automatic (1080p client mirroring a 4K panel). Tell the client
     // (`BitrateChanged`); otherwise ABR's first climb is from a stale lower base.
-    let (retarget_tx, retarget_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let (retarget_tx, retarget_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, AckReason)>();
     // Rebuild gap (ms) → `PipelineGap` so the client discards that ABR window as congestion.
     let (gap_tx, gap_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     // Encode loop diffs cursor serial; control task is the sole writer. Wired even if unused.
@@ -1618,10 +1684,19 @@ pub(crate) async fn run_admitted(
     // `true` = client draws (exclude + forward), `false` = host composites. Starts true.
     let cursor_client_draws = Arc::new(AtomicBool::new(true));
     let cursor_client_draws_dp = cursor_client_draws.clone();
-    // Control task publishes LossReport → recovery %; send loop applies per frame. Seeded no-op.
-    let adaptive_fec = fec_static_override().is_none();
+    // Only sources that can keep encoder and packetizer FEC in one wire budget adapt it.
+    // Synthetic-abr derives frame bytes from FEC every frame; the virtual path publishes
+    // a proposal only after its encoder accepts the matching rate. Fixed synthetic and
+    // the standalone software source have no coordinated retarget path.
+    let adaptive_fec = adaptive_fec_for(source, fec_static_override().is_some());
+    // A proposal lands on `fec_requested`; the stream loop publishes it to `fec_target`
+    // only after the encoder accepts the matching rate. Synthetic-abr aliases the pair:
+    // it re-derives frame bytes from FEC every frame and has no retarget to coordinate.
     let fec_target = Arc::new(AtomicU8::new(welcome.fec.fec_percent));
-    let fec_target_ctl = fec_target.clone();
+    let fec_requested = match source {
+        Punktfunk1Source::SyntheticAbr(_) => fec_target.clone(),
+        _ => Arc::new(AtomicU8::new(welcome.fec.fec_percent)),
+    };
     // PhaseReports from the control task; encode loop drains. Inert until a vsync-aware client.
     let phase_ctl = Arc::new(stream::PhaseCtl::new());
     let phase_ctl_control = phase_ctl.clone();
@@ -1696,12 +1771,23 @@ pub(crate) async fn run_admitted(
         live_reconfig_ok,
         adaptive_fec,
         session_bitrate_kbps,
+        // Automatic, and negotiable: PyroWave resolves a pin the client cannot
+        // move either, so the governor must not move it for it.
+        bitrate_automatic: hello.bitrate_kbps == 0 && codec != crate::encode::Codec::PyroWave,
+        // Automatic PyroWave: the client's bring-up ramp may lower the pin
+        // once, while the ramp window is still open.
+        pyrowave_automatic: hello.bitrate_kbps == 0 && codec == crate::encode::Codec::PyroWave,
+        wire_bytes: u64::from(welcome.shard_payload)
+            + punktfunk_core::abr::budget::SHARD_WIRE_OVERHEAD,
+        audio_kbps: audio_reserved_kbps(&welcome),
+        ack_reason: abr_features & punktfunk_core::quic::EXT_ABR_ACK_REASON != 0,
         live_bitrate: live_bitrate.clone(),
-        encoder_ceiling_kbps: encoder_ceiling_kbps.clone(),
+        encoder_ceiling: encoder_ceiling.clone(),
         cadence_degraded: cadence_degraded.clone(),
         cadence_behind_score: cadence_behind_score.clone(),
         client_packets_received: client_packets_received_ctl,
-        fec_target_ctl,
+        fec_target: fec_target.clone(),
+        fec_requested: fec_requested.clone(),
         phase_ctl: phase_ctl_control,
         reconfig_tx,
         keyframe_tx,
@@ -1709,6 +1795,7 @@ pub(crate) async fn run_admitted(
         bitrate_tx,
         probe_tx,
         probe_result_rx,
+        ramp_open: ramp_open_ctl,
         reconfig_result_rx,
         retarget_rx,
         gap_rx,
@@ -2024,9 +2111,13 @@ pub(crate) async fn run_admitted(
         )
     };
 
-    // Not for the byte-pattern source, which has a test client that wants nothing else on the
-    // wire. Best-effort: a spawn error must not early-return (threads already up).
-    let audio_handle = if opts.source != Punktfunk1Source::Synthetic {
+    // Not for the two frame-arithmetic sources: their clients want nothing else on the wire,
+    // and the rig's budget carries the audio reservation without a capture behind it.
+    // Best-effort: a spawn error must not early-return (threads already up).
+    let audio_handle = if !matches!(
+        opts.source,
+        Punktfunk1Source::Synthetic | Punktfunk1Source::SyntheticAbr(..)
+    ) {
         let conn = conn.clone();
         let stop = stop.clone();
         let cap = audio_cap.clone();
@@ -2226,6 +2317,7 @@ pub(crate) async fn run_admitted(
     // Client HDR volume for EDID + 0xCE. `None` = older client / no HDR → built-in defaults.
     let client_hdr = hello.display_hdr.map(crate::encode::hdr_meta_from_wire);
     let fec_target_dp = fec_target.clone();
+    let fec_requested_dp = fec_requested.clone();
     let conn_stream = conn.clone();
     // 0xCF host-timing only if the client advertised the cap; older clients get no extra datagrams.
     let timing_conn =
@@ -2262,6 +2354,8 @@ pub(crate) async fn run_admitted(
     let inj_session_tx_dp = inj_session_tx.clone();
     // Control-plane local IP for the source-address check (send loop is a blocking thread).
     let control_local_ip = conn.local_ip();
+    // Client address: what the registry groups sessions of one NAT or tunnel by.
+    let peer_ip = conn.remote_address().ip();
     let result: Result<()> = async {
         let stream_thread = tokio::task::spawn_blocking(move || -> Result<()> {
             let (transport, wire_sock): (Box<dyn punktfunk_core::transport::Transport>, _) = match (data_plane, data_sock) {
@@ -2365,6 +2459,49 @@ pub(crate) async fn run_admitted(
                     timing_conn.as_ref(),
                     probe_seq,
                 ),
+                Punktfunk1Source::SyntheticAbr(shape) => {
+                    synthetic_abr_stream(SynthAbrContext {
+                    session,
+                    mode,
+                    seconds,
+                    content: shape.content,
+                    recovery: shape.recovery,
+                    answer: shape.answer,
+                    idr_pct: shape.idr_pct,
+                    bringup_delay: shape.bringup,
+                    ramp_open,
+                    fit_pin: hello.bitrate_kbps == 0 && codec == crate::encode::Codec::PyroWave,
+                    stop: stop_stream,
+                    counters: counters_stream,
+                    keyframe: keyframe_rx,
+                    rfi: rfi_rx,
+                    bitrate_rx,
+                    shard_rx: shard_apply_rx,
+                    bitrate_kbps,
+                    audio_reserved_kbps,
+                    shard_payload: welcome.shard_payload,
+                    live_bitrate,
+                    fec_target: fec_target_dp,
+                    probe_rx,
+                    probe_result_tx,
+                    timing_conn,
+                    phase: phase_ctl,
+                    probe_seq,
+                    stats: stats_dp,
+                    client_label,
+                    bringup: bringup_dp,
+                    wire_sock,
+                    codec,
+                    quit: quit_stream,
+                    end_reason: end_reason_stream,
+                    controls,
+                    client_name,
+                    hdr,
+                    bit_depth,
+                    chroma,
+                    peer: peer_ip,
+                    })
+                }
                 Punktfunk1Source::Virtual => {
                     let compositor = compositor
                         .expect("the Virtual source resolves a compositor during the handshake");
@@ -2387,7 +2524,7 @@ pub(crate) async fn run_admitted(
                         audio_reserved_kbps,
                         shard_payload: welcome.shard_payload,
                         live_bitrate,
-                        encoder_ceiling_kbps,
+                        encoder_ceiling,
                         cadence_degraded,
                         cadence_behind_score,
                         client_packets_received,
@@ -2398,10 +2535,12 @@ pub(crate) async fn run_admitted(
                         codec,
                         probe_rx,
                         probe_result_tx,
+                        ramp_open,
                         reconfig_result_tx,
                         retarget_tx,
                         gap_tx,
                         fec_target: fec_target_dp,
+                        fec_requested: fec_requested_dp,
                         phase: phase_ctl,
                         conn: conn_stream,
                         timing_conn,
@@ -2622,6 +2761,37 @@ mod tests {
         assert_eq!(seat_home_for(None, true), None, "anon<seq> has no identity");
     }
 
+    /// Adaptive FEC is offered only to a source that can keep encoder and packetizer
+    /// on one wire budget: a proposal a source cannot apply would be accepted work
+    /// that never reaches the wire.
+    #[test]
+    fn adaptive_fec_only_for_sources_with_a_coordinated_retarget() {
+        let abr = Punktfunk1Source::SyntheticAbr(SynthAbrShape {
+            content: Content::Steady { fill_pct: 100 },
+            recovery: std::time::Duration::ZERO,
+            answer: KeyframeAnswer::Idr,
+            idr_pct: DEFAULT_IDR_PCT,
+            bringup: std::time::Duration::ZERO,
+            serve_ramp: false,
+        });
+        for (source, want) in [
+            (Punktfunk1Source::Synthetic, false),
+            (Punktfunk1Source::Software, false),
+            (abr, true),
+            (Punktfunk1Source::Virtual, true),
+        ] {
+            assert_eq!(
+                adaptive_fec_for(source, false),
+                want,
+                "static override unset: {source:?}"
+            );
+            assert!(
+                !adaptive_fec_for(source, true),
+                "a pinned FEC adapts nothing: {source:?}"
+            );
+        }
+    }
+
     /// The accept loop's address-validation gate. A first contact is unvalidated; a Retry turns
     /// it into a second, validated arrival, and the client completes anyway. Pins the quinn
     /// behaviour the gate rests on — a release that validated first contact would leave the
@@ -2741,6 +2911,46 @@ mod tests {
         let asked_enc = ed.enc_kbps(1_010_000);
         let short = ed.applied_budget_kbps(1_010_000, asked_enc * 3 / 4);
         assert!(short < ed.budget_kbps(ed.enc_kbps(1_010_000)));
+    }
+
+    /// One short apply is a ceiling, not a life sentence: it holds for its wait,
+    /// then the next ask reaches the encoder. A full apply there drops it; a
+    /// short one puts it back with twice the wait.
+    #[test]
+    fn a_learned_encoder_ceiling_is_re_tested_and_backs_off() {
+        let mut c = EncoderCeiling::new();
+        assert_eq!(c.resolve(400_000), (400_000, AckReason::Granted));
+        c.note_applied(400_000, 300_000);
+        let first_wait = c.wait();
+        // Under the ceiling nothing is refused; above it, the ack says why.
+        assert_eq!(c.resolve(200_000), (200_000, AckReason::Granted));
+        assert_eq!(c.resolve(400_000), (300_000, AckReason::EncoderLimit));
+        // Past the wait, one ask reaches the encoder.
+        c.spend_the_wait();
+        assert_eq!(c.resolve(400_000), (400_000, AckReason::Granted));
+        // Still there: re-learned, and the next wait is twice as long.
+        c.note_applied(400_000, 300_000);
+        assert_eq!(c.wait(), first_wait * 2);
+        assert_eq!(c.resolve(400_000), (300_000, AckReason::EncoderLimit));
+        // Gone: the ceiling goes with it, and nothing is clamped again.
+        c.spend_the_wait();
+        assert_eq!(c.resolve(400_000), (400_000, AckReason::Granted));
+        c.note_applied(400_000, 400_000);
+        assert_eq!(c.resolve(8_000_000), (8_000_000, AckReason::Granted));
+    }
+
+    /// The encoder that refused a rate is gone (a mode switch, a rebuild on a
+    /// new source), and so is what it taught.
+    #[test]
+    fn a_rebuilt_encoder_starts_with_no_ceiling() {
+        let mut c = EncoderCeiling::new();
+        c.note_applied(400_000, 300_000);
+        assert_eq!(c.resolve(400_000), (300_000, AckReason::EncoderLimit));
+        c.clear();
+        assert_eq!(c.resolve(400_000), (400_000, AckReason::Granted));
+        // And the clock starts over rather than carrying the old backoff.
+        c.note_applied(400_000, 300_000);
+        assert_eq!(c.wait(), punktfunk_core::abr::WINDOW * 16);
     }
 
     #[test]
@@ -2895,45 +3105,6 @@ mod tests {
         pf_host_config::reload();
     }
 
-    #[test]
-    fn adapt_fec_maps_loss_to_recovery_band() {
-        // Clean window (0 loss) is FEC_MIN; loss under ~2.8 % clamps to it.
-        assert_eq!(adapt_fec(0), FEC_MIN);
-        assert_eq!(adapt_fec(1), FEC_MIN);
-        // FEC exceeds the loss it covers (×1.4 + 1 pt).
-        assert_eq!(adapt_fec(30_000), 6); // 3% → ceil(4.2)+1 = 6
-        assert_eq!(adapt_fec(50_000), 8); // 5% → ceil(7)+1 = 8
-        assert_eq!(adapt_fec(100_000), 15); // 10% → ceil(14)+1 = 15
-        assert_eq!(adapt_fec(1_000_000), FEC_MAX); // 100% → clamped
-        assert!(adapt_fec(u32::MAX) <= FEC_MAX);
-    }
-
-    /// A frame dying every window under low measured loss is a bounded step over the
-    /// measured level, never a 5 % reading: on for a few windows, off once it has not
-    /// stopped the asks, and a clean window ends the run.
-    #[test]
-    fn fec_step_is_bounded_and_gives_up_when_frames_keep_dying() {
-        // Clean: measured level, decaying one point per window.
-        assert_eq!(fec_target(0, FEC_MIN, 0), FEC_MIN);
-        assert_eq!(fec_target(0, 12, 0), 11);
-        // A dropped frame at 0.3 % loss: +3 over the floor, held while the run is young.
-        let mut fec = FEC_MIN;
-        let mut seen = Vec::new();
-        for run in 1..=FEC_STEP_WINDOWS + 2 {
-            fec = fec_target(3_000, fec, run);
-            seen.push(fec);
-        }
-        assert_eq!(
-            seen,
-            [8, 8, 8, 8, 7, 6],
-            "step, then the decay back to measured"
-        );
-        // Measured loss still carries its own level once the step is off.
-        assert_eq!(fec_target(100_000, FEC_MIN, FEC_STEP_WINDOWS + 1), 15);
-        // Never past the band.
-        assert_eq!(fec_target(1_000_000, FEC_MAX, 1), FEC_MAX);
-    }
-
     /// An RFI ask prices the report window it lands in. A report a window late closes a
     /// window the client discarded on purpose (probe tail, pipeline gap), so the asks before
     /// it must not leak into the clean window that follows.
@@ -2958,45 +3129,6 @@ mod tests {
             1,
             "the next on-time window counts again"
         );
-    }
-
-    #[test]
-    fn wire_budget_derivation_never_overshoots() {
-        // 20 Mbps budget, 300 kbps audio, 10 % FEC, 1408-byte shards → 17 130 kbps video.
-        assert_eq!(encoder_kbps_for_budget(20_000, 300, 10, 1408), 17_130);
-        // Wire spend rounds back under the budget, never over.
-        assert_eq!(budget_kbps_for_encoder(17_130, 300, 10, 1408), 19_999);
-
-        // Non-floored roundtrip spends within the budget.
-        for budget in [2_000u32, 5_000, 20_000, 100_000, 1_000_000] {
-            for fec in [1u8, 5, 10, 25, 50] {
-                for audio in [0u32, 256, 512, 8_500] {
-                    for payload in [1388u16, 1408, 8896] {
-                        let e = encoder_kbps_for_budget(budget, audio, fec, payload);
-                        if e > MIN_BITRATE_KBPS {
-                            let back = budget_kbps_for_encoder(e, audio, fec, payload);
-                            assert!(
-                                back <= budget,
-                                "budget {budget} fec {fec} audio {audio} payload {payload}: \
-                                 derived {e} spends {back}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Budget too small for its audio: floor at MIN and overshoot honestly.
-        assert_eq!(
-            encoder_kbps_for_budget(500, 8_500, 50, 1408),
-            MIN_BITRATE_KBPS
-        );
-
-        // More parity ⇒ lower video rate, same budget.
-        let calm = encoder_kbps_for_budget(20_000, 300, 1, 1408);
-        let burned = encoder_kbps_for_budget(20_000, 300, 5, 1408);
-        let stormy = encoder_kbps_for_budget(20_000, 300, 50, 1408);
-        assert!(calm > burned && burned > stormy);
     }
 
     #[test]
@@ -3135,12 +3267,16 @@ mod tests {
 
     /// In-process hosts share the process-global admission table. Concurrent tests would
     /// `preempt_same_identity` each other. Poison-tolerant so a failing test does not cascade.
+    ///
+    /// A session here also lands in the live registry, so every holder takes
+    /// [`crate::session_status::tests::REGISTRY`] first — that order, always.
     static SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// C ABI: TOFU connect → pull frames → send input → close. Three sequential sessions
     /// against one host prove the persistent listener; a wrong pin is rejected.
     #[test]
     fn c_abi_connection_roundtrip() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::abi::{
             punktfunk_connect, punktfunk_connection_close, punktfunk_connection_mode,
@@ -3303,11 +3439,107 @@ mod tests {
         host.join().unwrap().unwrap();
     }
 
+    /// A `synthetic-abr` session publishes a registry row while it streams and retires it
+    /// when it ends. The row's id is the one the control task reads off the session's
+    /// counters before it asks the governor for a share, so a source that never registers
+    /// leaves a shared path undivided.
+    #[test]
+    fn a_synthetic_abr_session_registers_while_it_streams() {
+        let _registry = crate::session_status::tests::registry_lock();
+        let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use punktfunk_core::client::NativeClient;
+
+        let host = std::thread::spawn(|| {
+            run_ephemeral(Punktfunk1Options {
+                port: 19782,
+                source: Punktfunk1Source::SyntheticAbr(SynthAbrShape {
+                    content: Content::Steady { fill_pct: 100 },
+                    recovery: std::time::Duration::ZERO,
+                    answer: KeyframeAnswer::Idr,
+                    idr_pct: DEFAULT_IDR_PCT,
+                    bringup: std::time::Duration::ZERO,
+                    serve_ramp: false,
+                }),
+                seconds: 3,
+                frames: 0, // this source is timed, not counted
+                max_sessions: 1,
+                max_concurrent: 1,
+                require_pairing: false,
+                allow_pairing: false,
+                pairing_pin: None,
+                paired_store: None,
+                data_port: None,
+                idle_timeout: None,
+                mdns: false,
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let mode = punktfunk_core::Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+        let client = NativeClient::connect(
+            "127.0.0.1",
+            19782,
+            mode,
+            CompositorPref::Auto,
+            GamepadPref::Auto,
+            0,
+            0,
+            2,
+            0,
+            0,
+            None,
+            0,
+            false,
+            None,
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(10),
+        )
+        .expect("client connects to the synthetic-abr host");
+
+        // The registry is process-global and the session_status tests register their own
+        // rows in it; this mode is what tells ours apart from theirs.
+        let ours = || {
+            crate::session_status::snapshot()
+                .into_iter()
+                .find(|s| (s.width, s.height, s.fps) == (1280, 720, 60))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let row = loop {
+            if let Some(r) = ours() {
+                break r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the synthetic-abr session never reached the registry"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_ne!(
+            row.id, 0,
+            "0 is the id the control task skips the governor on"
+        );
+        assert_eq!(row.plane, crate::events::Plane::Native);
+
+        drop(client);
+        host.join().unwrap().unwrap();
+        assert!(
+            ours().is_none(),
+            "the guard retires the row on the stream's exit path"
+        );
+    }
+
     /// Clipboard over a synthetic session: host advertises the cap, acks enable with
     /// `BACKEND_UNAVAILABLE` (no compositor), declines a fetch. Live-backend paths are
     /// not covered here. `design/clipboard-and-file-transfer.md`.
     #[test]
     fn clipboard_control_and_fetch_decline_over_session() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::clipboard::ClipEventCore;
@@ -3440,6 +3672,7 @@ mod tests {
     /// Unpaired knock is parked; approve while waiting admits the same connection, no reconnect.
     #[test]
     fn delegated_approval_admits_after_knock() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::endpoint;
@@ -3581,6 +3814,7 @@ mod tests {
     /// Right PIN pairs; paired identity gets a session; anonymous does not.
     #[test]
     fn pairing_ceremony_and_gate() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::endpoint;
@@ -3884,6 +4118,7 @@ mod tests {
     /// Short expiry: Welcome advertises grants + remaining; deadline closes typed (`0x69`).
     #[test]
     fn access_expiry_advertises_and_closes_typed() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::quic::endpoint;
 
@@ -3938,6 +4173,7 @@ mod tests {
     /// Mid-session grant edit → `AccessUpdate`; T−1 m warning fires; "expire now" typed-closes.
     #[test]
     fn access_edit_pushes_updates_and_expire_now_closes() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::quic::endpoint;
 
@@ -4024,6 +4260,7 @@ mod tests {
     /// Launch without the grant: typed 0x6A before handshake. Same device without launch is admitted.
     #[test]
     fn launch_refused_without_grant_but_session_admitted() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::endpoint;
@@ -4115,6 +4352,7 @@ mod tests {
     /// control message.
     #[test]
     fn unknown_launch_reaches_the_client_as_a_refusal() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::{endpoint, LaunchOutcomeKind};
@@ -4173,6 +4411,7 @@ mod tests {
     /// Expired record knocks into pending; re-approval is the re-grant on the held connection.
     #[test]
     fn expired_record_knocks_into_pending_and_reapproval_regrants() {
+        let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::endpoint;

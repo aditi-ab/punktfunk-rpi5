@@ -13,6 +13,16 @@ pub(crate) fn now_monotonic_ns() -> u64 {
     (EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64).max(1)
 }
 
+/// Wall-clock ns since the Unix epoch — the basis `pts_ns` and the skew
+/// handshake share. Cross-machine arithmetic, so a monotonic clock is wrong
+/// here by boot time and still looks plausible.
+pub(crate) fn now_realtime_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 /// Immutable snapshot, copied across the C ABI as `PunktfunkStats`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {

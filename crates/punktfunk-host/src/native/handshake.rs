@@ -326,6 +326,8 @@ pub(super) async fn negotiate(
     // What the client calls itself (`EXT_TAG_CLIENT` on `Start`); `None` from one that sent no
     // block. Log only: two dialers from one device are told apart by that line.
     Option<String>,
+    // `EXT_TAG_ABR` on `Start` (`0` = absent): the ABR wire features this client reads.
+    u8,
     Option<crate::vdisplay::Compositor>,
     // Gamescope sub-mode as a value, not process env — a concurrent connect would overwrite env.
     Option<crate::vdisplay::GamescopeRoute>,
@@ -597,7 +599,9 @@ pub(super) async fn negotiate(
         frames: match source {
             Punktfunk1Source::Synthetic => frames,
             // Unbounded; the client streams until we close.
-            Punktfunk1Source::Virtual | Punktfunk1Source::Software => 0,
+            Punktfunk1Source::SyntheticAbr(..)
+            | Punktfunk1Source::Virtual
+            | Punktfunk1Source::Software => 0,
         },
         // Auto for the synthetic source (no compositor).
         compositor: compositor
@@ -712,7 +716,23 @@ pub(super) async fn negotiate(
                 0
             }
             // Invites the client's `Start` extension block, which is where it names itself.
-            | punktfunk_core::quic::HOST_CAP2_EXT,
+            | punktfunk_core::quic::HOST_CAP2_EXT
+            // This host divides a path between the sessions that share a client address
+            // (`session_status::share_for`), and a delivery count every report window is the
+            // only measure of a session's own air it has.
+            | punktfunk_core::quic::HOST_CAP2_DELIVERY
+            // The virtual path punches its data plane two to three seconds before its
+            // pipeline exists, and serves the client's bring-up ramp in that gap. The
+            // rate-following source holds its first frame back for the same span
+            // (`--bringup-ms`) so the rig measures the ramp the way a display session
+            // runs it. The byte-pattern source has no such gap: video leaves at once.
+            | match source {
+                Punktfunk1Source::Virtual => punktfunk_core::quic::HOST_CAP2_RAMP,
+                Punktfunk1Source::SyntheticAbr(shape) if shape.serve_ramp => {
+                    punktfunk_core::quic::HOST_CAP2_RAMP
+                }
+                _ => 0,
+            },
     };
     io::write_msg(send, &welcome.encode()).await?;
     bringup.mark("welcome");
@@ -788,14 +808,19 @@ pub(super) async fn negotiate(
 
     let start_msg = io::read_msg(recv).await?;
     let start = Start::decode(&start_msg).map_err(|e| anyhow!("Start decode: {e:?}"))?;
-    // What the client calls itself, when it sent one. A label for the log: a bad block fails the
-    // handshake (`decode_ext`'s rule), an unknown tag is skipped, and absence says nothing.
-    let client_label = Start::decode_ext(&start_msg)
-        .map_err(|e| anyhow!("Start extensions: {e:?}"))?
-        .into_iter()
+    // The block the client appended, decoded once. A bad block fails the handshake
+    // (`decode_ext`'s rule), an unknown tag is skipped, and absence says nothing.
+    let start_ext =
+        Start::decode_ext(&start_msg).map_err(|e| anyhow!("Start extensions: {e:?}"))?;
+    // What the client calls itself, when it sent one. A label for the log.
+    let client_label = start_ext
+        .iter()
         .find(|(tag, _)| *tag == punktfunk_core::quic::EXT_TAG_CLIENT)
         .map(|(_, v)| punktfunk_core::quic::client_label(&String::from_utf8_lossy(v)))
         .filter(|s| !s.is_empty());
+    // Which ABR wire features this client understands. Bits it does not set are bits it
+    // cannot read, and bits this host does not know are ignored.
+    let abr_features = punktfunk_core::quic::ext_abr_features(&start_ext);
     bringup.mark("start");
     // `wire_mtu::spawn_watch` is started by `serve_session` once the control-task channels
     // exist; it also drives mid-session shard renegotiation (needs the control writer).
@@ -806,6 +831,7 @@ pub(super) async fn negotiate(
         data_sock,
         start,
         client_label,
+        abr_features,
         compositor,
         gamescope_route,
         prep,
@@ -842,7 +868,9 @@ async fn negotiate_compositor(
                     .context("resolve compositor task")??,
             )
         }
-        Punktfunk1Source::Synthetic | Punktfunk1Source::Software => None,
+        Punktfunk1Source::Synthetic
+        | Punktfunk1Source::SyntheticAbr(..)
+        | Punktfunk1Source::Software => None,
     };
     // Split the pair: compositor for Welcome/cursor; gamescope route as a value, not process env.
     let gamescope_route = compositor.as_ref().and_then(|(_, r)| r.clone());

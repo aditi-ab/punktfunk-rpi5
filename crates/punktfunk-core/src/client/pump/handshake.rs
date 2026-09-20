@@ -156,11 +156,15 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
             client_udp_port: udp_port,
         };
         let label = super::super::client_label();
-        let start_msg = if welcome.host_caps2 & crate::quic::HOST_CAP2_EXT != 0 && !label.is_empty()
-        {
-            start.encode_ext(&[(crate::quic::EXT_TAG_CLIENT, label.as_bytes())])?
-        } else {
+        // Core decides the ABR byte for every embedder: the controller that reads the ack's
+        // reason is this crate's, so no client app can leave it clear and make one host
+        // answer two ways.
+        let abr = [crate::quic::EXT_ABR_ACK_REASON];
+        let ext = crate::quic::start_ext(welcome.host_caps2, &label, &abr);
+        let start_msg = if ext.is_empty() {
             start.encode()
+        } else {
+            start.encode_ext(&ext)?
         };
         io::write_msg(&mut send, &start_msg).await?;
 

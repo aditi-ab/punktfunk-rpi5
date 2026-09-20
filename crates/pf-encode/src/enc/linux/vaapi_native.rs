@@ -696,8 +696,14 @@ impl Encoder for NativeVaapiEncoder {
         true
     }
 
+    /// Retarget in place: the next picture is rate-controlled to `bps`.
+    ///
+    /// VA-API has no query for what the driver settled on — the rate goes out
+    /// with every picture in `VAEncMiscParameterRateControl` and nothing comes
+    /// back — so [`Encoder::applied_bitrate_bps`] reports what this session will
+    /// ask for, and [`va_rate_bps`] is the one clamp it can know about.
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
-        let bps = bps.min(u64::from(u32::MAX)) as u32;
+        let bps = va_rate_bps(bps);
         self.params.bitrate_bps = bps;
         if let Some(s) = &mut self.session {
             s.set_bitrate(bps);
@@ -720,6 +726,23 @@ impl Encoder for NativeVaapiEncoder {
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
+}
+
+/// The rate a VA-API session can actually ask for.
+///
+/// `VAEncMiscParameterRateControl::bits_per_second` is a `u32`, so a higher ask
+/// is truncated. Reported as applied rather than swallowed: the caller reads the
+/// truncation as a short apply and stops promising the client a rate no VA-API
+/// driver can be told about.
+fn va_rate_bps(asked_bps: u64) -> u32 {
+    u32::try_from(asked_bps).unwrap_or_else(|_| {
+        tracing::warn!(
+            asked_bps,
+            applied_bps = u32::MAX,
+            "VA-API rate control carries a 32-bit rate — the ask is truncated"
+        );
+        u32::MAX
+    })
 }
 
 /// The packed-RGB fourcc a CPU frame uploads as, repacking 24-bit to 32 on the
@@ -770,6 +793,16 @@ mod tests {
         assert_eq!(fourcc, vpp::VA_FOURCC_BGRA);
         assert_eq!(out.as_ptr(), bytes.as_ptr(), "no copy");
         assert!(packed_rgb(PixelFormat::Nv12, &bytes, &mut scratch).is_err());
+    }
+
+    /// The rate control buffer is 32 bits wide, so an ask past it is truncated
+    /// and reported as truncated — never echoed back as if the driver took it.
+    #[test]
+    fn a_rate_past_the_buffers_width_is_reported_truncated() {
+        assert_eq!(va_rate_bps(2_000_000), 2_000_000);
+        assert_eq!(va_rate_bps(u64::from(u32::MAX)), u32::MAX);
+        assert_eq!(va_rate_bps(u64::from(u32::MAX) + 1), u32::MAX);
+        assert_eq!(va_rate_bps(u64::MAX), u32::MAX);
     }
 
     /// The trait contract on real silicon: an IDR first, P after, a loss answered

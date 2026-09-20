@@ -102,12 +102,66 @@ pub struct SetBitrate {
     pub bitrate_kbps: u32,
 }
 
+/// Why an ack is short of what was asked. The tenth byte of
+/// [`BitrateChanged`], toward a client whose `Start` carried
+/// [`EXT_TAG_ABR`](super::EXT_TAG_ABR) with
+/// [`EXT_ABR_ACK_REASON`](super::EXT_ABR_ACK_REASON) set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckReason {
+    /// Nothing on the host held the rate down. A request past the host's
+    /// absolute rate bound still reads as granted: that constant bounds the
+    /// absurd, not the link.
+    Granted,
+    /// The driver or the codec level applied less than the ask.
+    EncoderLimit,
+    /// Encode is behind the frame cadence, so the climb is refused for now.
+    /// A GPU fact, not a rate the encoder cannot hold.
+    Cadence,
+    /// The host divided a shared path between sessions. Reserved: no host
+    /// sends it yet.
+    Governor,
+    /// PyroWave: the rate is per-frame CBR and not negotiable.
+    Pinned,
+}
+
+impl AckReason {
+    fn to_wire(self) -> u8 {
+        match self {
+            AckReason::Granted => 0,
+            AckReason::EncoderLimit => 1,
+            AckReason::Cadence => 2,
+            AckReason::Governor => 3,
+            AckReason::Pinned => 4,
+        }
+    }
+
+    /// `None` for a code this build does not know: the ack still stands, and
+    /// the client falls back to reading a short one as an encoder limit.
+    fn from_wire(b: u8) -> Option<AckReason> {
+        Some(match b {
+            0 => AckReason::Granted,
+            1 => AckReason::EncoderLimit,
+            2 => AckReason::Cadence,
+            3 => AckReason::Governor,
+            4 => AckReason::Pinned,
+            _ => return None,
+        })
+    }
+}
+
 /// `host → client` answer to [`SetBitrate`]: the clamped configured rate.
 /// In-place retarget has no IDR; a rebuild switches on the next frame (IDR).
 /// No answer ⇒ an old host that does not renegotiate bitrate.
+///
+/// Nine bytes, or ten with [`AckReason`]. The host lengthens it only for a
+/// client whose `Start` carried [`EXT_TAG_ABR`](super::EXT_TAG_ABR) with
+/// [`EXT_ABR_ACK_REASON`](super::EXT_ABR_ACK_REASON) set, because every other
+/// client rejects an ack of any other length. `reason: None` is what an older
+/// host sends and what this host sends to a client that did not ask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BitrateChanged {
     pub bitrate_kbps: u32,
+    pub reason: Option<AckReason>,
 }
 
 /// `host → client`, unsolicited: capture+encoder rebuilt in place; nothing
@@ -414,20 +468,24 @@ impl SetBitrate {
 
 impl BitrateChanged {
     pub fn encode(&self) -> Vec<u8> {
-        // magic[0..4] type[4] bitrate_kbps[5..9]
-        let mut b = Vec::with_capacity(9);
+        // magic[0..4] type[4] bitrate_kbps[5..9] reason[9] (optional)
+        let mut b = Vec::with_capacity(10);
         b.extend_from_slice(CTL_MAGIC);
         b.push(MSG_BITRATE_CHANGED);
         b.extend_from_slice(&self.bitrate_kbps.to_le_bytes());
+        if let Some(r) = self.reason {
+            b.push(r.to_wire());
+        }
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<BitrateChanged> {
-        if b.len() != 9 || &b[0..4] != CTL_MAGIC || b[4] != MSG_BITRATE_CHANGED {
+        if !matches!(b.len(), 9 | 10) || &b[0..4] != CTL_MAGIC || b[4] != MSG_BITRATE_CHANGED {
             return Err(PunktfunkError::InvalidArg("bad BitrateChanged"));
         }
         Ok(BitrateChanged {
             bitrate_kbps: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+            reason: b.get(9).copied().and_then(AckReason::from_wire),
         })
     }
 }
@@ -1397,13 +1455,53 @@ mod tests {
         assert_eq!(SetBitrate::decode(&req.encode()).unwrap(), req);
         let ack = BitrateChanged {
             bitrate_kbps: 14_000,
+            reason: None,
         };
+        assert_eq!(ack.encode().len(), 9, "an old client's ack is unchanged");
         assert_eq!(BitrateChanged::decode(&ack.encode()).unwrap(), ack);
         // Same 9-byte shape as [`LossReport`] — type byte is the only split.
         assert!(LossReport::decode(&req.encode()).is_err());
         assert!(SetBitrate::decode(&ack.encode()).is_err());
         assert!(BitrateChanged::decode(&req.encode()).is_err());
         assert!(SetBitrate::decode(&LossReport { loss_ppm: 7 }.encode()).is_err());
+    }
+
+    /// New client ↔ new host: both lengths round-trip, an unknown code reads as
+    /// no reason, and nothing else on the control stream decodes as a ten-byte
+    /// ack.
+    #[test]
+    fn a_bitrate_ack_carries_its_reason_or_goes_without_one() {
+        for reason in [
+            AckReason::Granted,
+            AckReason::EncoderLimit,
+            AckReason::Cadence,
+            AckReason::Governor,
+            AckReason::Pinned,
+        ] {
+            let ack = BitrateChanged {
+                bitrate_kbps: 41_852,
+                reason: Some(reason),
+            };
+            let wire = ack.encode();
+            assert_eq!(wire.len(), 10);
+            assert_eq!(BitrateChanged::decode(&wire).unwrap(), ack);
+        }
+        // A code from a later host: the rate stands, the reason does not.
+        let mut unknown = BitrateChanged {
+            bitrate_kbps: 41_852,
+            reason: Some(AckReason::Pinned),
+        }
+        .encode();
+        unknown[9] = 9;
+        let got = BitrateChanged::decode(&unknown).unwrap();
+        assert_eq!(got.bitrate_kbps, 41_852);
+        assert_eq!(got.reason, None);
+        // Length is still the split: nine, ten, nothing else.
+        assert!(BitrateChanged::decode(&unknown[..8]).is_err());
+        assert!(BitrateChanged::decode(&[unknown.as_slice(), &[0]].concat()).is_err());
+        assert!(SetBitrate::decode(&unknown).is_err());
+        assert!(PipelineGap::decode(&unknown).is_err());
+        assert!(LossReport::decode(&unknown).is_err());
     }
 
     #[test]
@@ -1421,7 +1519,14 @@ mod tests {
         assert!(BitrateChanged::decode(&gap).is_err());
         assert!(PipelineGap::decode(&LossReport { loss_ppm: 401 }.encode()).is_err());
         assert!(PipelineGap::decode(&SetBitrate { bitrate_kbps: 401 }.encode()).is_err());
-        assert!(PipelineGap::decode(&BitrateChanged { bitrate_kbps: 401 }.encode()).is_err());
+        assert!(PipelineGap::decode(
+            &BitrateChanged {
+                bitrate_kbps: 401,
+                reason: None,
+            }
+            .encode()
+        )
+        .is_err());
         assert!(ShardPayloadAck::decode(&gap).is_err());
         assert!(PipelineGap::decode(&[gap.as_slice(), &[0]].concat()).is_err());
         assert!(PipelineGap::decode(&gap[..gap.len() - 1]).is_err());
