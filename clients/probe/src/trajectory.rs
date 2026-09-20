@@ -241,11 +241,15 @@ pub fn summary(
     (m, m.row(name))
 }
 
+/// Whether the negotiated session runs at a pin rather than under AIMD.
+fn rate_pinned(requested_kbps: u32, codec: u8) -> bool {
+    requested_kbps > 0 || (requested_kbps == 0 && codec == punktfunk_core::quic::CODEC_PYROWAVE)
+}
+
 /// Stream for `seconds`, recording every closed window, then write the file.
 ///
-/// `bitrate_kbps` is the embedder's rate: `0` is Automatic, and anything else pins the
-/// session exactly as it does for a shipped client. A pinned session's controller never
-/// arms, so its windows carry `"target_kbps":0` — a record of a link nobody is steering.
+/// `bitrate_kbps` is the embedder's rate: `0` is Automatic, and anything else is an
+/// explicit pin. Negotiated PyroWave Automatic is pinned too; neither kind arms AIMD.
 /// `preferred_codec` is `--codec`: PyroWave joins the advertised set only when asked for,
 /// as in the hand-built Hello.
 #[allow(clippy::too_many_arguments)]
@@ -297,7 +301,8 @@ pub fn run(
     .map_err(|e| anyhow::anyhow!("connect to the host: {e:?}"))?;
     tracing::info!(
         start_kbps = client.current_bitrate_kbps(),
-        pinned = bitrate_kbps > 0,
+        pinned = rate_pinned(bitrate_kbps, client.codec),
+        codec = client.codec,
         mode = ?client.mode(),
         "trajectory session open"
     );
@@ -611,6 +616,15 @@ mod tests {
         assert!(h.step(false, false, 0x1, t0 + HOLD_GIVE_UP / 2).0.is_zero());
         let (held, _) = h.step(false, false, 0x1, t0 + HOLD_GIVE_UP);
         assert_eq!(held, HOLD_GIVE_UP, "gave up and resumed on a P-frame");
+    }
+
+    /// Automatic inter-coded sessions are governed; explicit rates and an
+    /// Automatic PyroWave negotiation are both pins.
+    #[test]
+    fn trajectory_names_both_kinds_of_pinned_session() {
+        assert!(!rate_pinned(0, punktfunk_core::quic::CODEC_HEVC));
+        assert!(rate_pinned(20_000, punktfunk_core::quic::CODEC_HEVC));
+        assert!(rate_pinned(0, punktfunk_core::quic::CODEC_PYROWAVE));
     }
 
     #[test]
