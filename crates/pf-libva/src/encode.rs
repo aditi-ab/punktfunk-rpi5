@@ -927,6 +927,7 @@ impl Encoder {
     /// drivers parse them: sequence, packed parameter sets, picture, slice, then
     /// the packed slice header — which Mesa reads against the sequence and picture
     /// state the earlier buffers set.
+    #[allow(clippy::too_many_arguments)]
     fn render_picture(
         &self,
         owned: &mut Vec<VaBufferId>,
@@ -1018,6 +1019,7 @@ impl Encoder {
     /// The HEVC picture: sequence, rate control, the packed VPS/SPS/PPS (and HDR SEI)
     /// on an IDR, then picture, slice and the packed slice header whose reference
     /// picture set is every trusted slot, closest first, the reference marked used.
+    #[allow(clippy::too_many_arguments)]
     fn render_picture_hevc(
         &self,
         owned: &mut Vec<VaBufferId>,
