@@ -341,12 +341,15 @@ fn open_video_backend_linux(
         {
             // Worker seam, not the encoder: GPU-priority needs `CAP_SYS_NICE`,
             // which only `punktfunk-encode-worker` may carry. See `pyrowave_remote`.
+            // `format.is_hdr()` marks the BT.2020 PQ capture — 10-bit without it is SDR.
             return pyrowave_remote::open_preferring_worker(
                 width,
                 height,
                 fps,
                 bitrate_bps,
                 chroma,
+                bit_depth,
+                format.is_hdr(),
             )
             .map(|e| (e, "pyrowave"));
         }
@@ -487,6 +490,8 @@ fn open_video_backend_linux(
                     fps,
                     bitrate_bps,
                     ChromaFormat::Yuv420,
+                    bit_depth,
+                    format.is_hdr(),
                 )
                 .map(|e| (e, "pyrowave"))
             }
@@ -960,6 +965,8 @@ pub fn linux_capture_modifiers(codec: Codec, fourcc: u32, bit_depth: u8, hdr: bo
     }
     // Same Vulkan arm as `open_amd_intel`, depth included: 10-bit SDR HEVC stays
     // on VAAPI, so its capture answers come from the libva probe below.
+    #[cfg(not(feature = "vulkan-encode"))]
+    let _ = (bit_depth, hdr);
     #[cfg(feature = "vulkan-encode")]
     let ten_bit = bit_depth >= 10;
     #[cfg(feature = "vulkan-encode")]
@@ -1234,9 +1241,11 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
         return false;
     }
     if codec == Codec::PyroWave {
-        // Wavelet is depth-agnostic. HDR CSC exists on the Windows IDD-push
-        // path only; Linux capture has no HDR. See `design/pyrowave-444-hdr.md`.
-        return cfg!(target_os = "windows");
+        // Wavelet is depth-agnostic; the CSC runs on the encoder's own Vulkan device, so
+        // 10-bit needs no encode-profile probe — just the `pyrowave` backend existing on
+        // this OS (Linux/Windows only). See `design/pyrowave-444-hdr.md`.
+        return cfg!(target_os = "windows")
+            || (cfg!(target_os = "linux") && cfg!(feature = "pyrowave"));
     }
     // Per (selected GPU, codec) so a console preference change re-probes.
     static CACHE: OnceLock<Mutex<HashMap<(String, &'static str), bool>>> = OnceLock::new();
@@ -1498,6 +1507,11 @@ fn vulkan_sdr10_available(_codec: Codec) -> bool {
 }
 #[cfg(target_os = "linux")]
 pub fn backend_carries_sdr10(codec: Codec) -> bool {
+    // PyroWave's own CSC widens packed RGB to 10-bit (`rgb2yuv10_709.comp` / the 4:4:4
+    // twin) on its private Vulkan device — the resolved H.26x backend is irrelevant.
+    if codec == Codec::PyroWave {
+        return cfg!(feature = "pyrowave");
+    }
     // Direct NVENC (HEVC + AV1) widens 8→10 from packed RGB. On AMD/Intel, VAAPI carries HEVC
     // Main10 under BT.709, and Vulkan Video carries AV1 10-bit SDR (`rgb2yuv10_709.comp`) where the
     // device offers a 10-bit AV1 profile. The encoder degrades a planar surface to 8-bit if some
