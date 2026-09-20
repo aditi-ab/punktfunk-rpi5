@@ -3848,6 +3848,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "if-addrs",
+ "jiff",
  "libc",
  "libloading 0.9.0",
  "log",

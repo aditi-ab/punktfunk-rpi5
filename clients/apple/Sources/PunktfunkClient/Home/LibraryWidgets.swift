@@ -106,9 +106,10 @@ private extension Image {
 /// at twice their cell size): `CGImageSourceCreateThumbnailAtIndex` decodes straight to a
 /// bounded bitmap and never materialises the full-size one. `maxPixels` is the longer edge, in
 /// PIXELS (the caller multiplies its point size by the screen scale, ×2 for headroom under the
-/// focus pop). nil ⇒ decode as-is (the touch grid's tiles are small and few enough).
+/// focus pop). nil ⇒ decode as shipped — still capped by DECLARED pixels, since the wire bound
+/// caps bytes, not those.
 private func decodePoster(_ data: Data, maxPixels: Int?) -> PlatformImage? {
-    guard let maxPixels, maxPixels > 0 else { return PlatformImage(data: data) }
+    guard let maxPixels, maxPixels > 0 else { return imageWithinPixelCap(data) }
     guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
     let options: [CFString: Any] = [
         kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -117,14 +118,30 @@ private func decodePoster(_ data: Data, maxPixels: Int?) -> PlatformImage? {
         kCGImageSourceThumbnailMaxPixelSize: maxPixels,
     ]
     guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-        // A format ImageIO can't thumbnail (rare) still gets the full decode rather than a hole.
-        return PlatformImage(data: data)
+        // A format ImageIO can't thumbnail (rare) still gets the decode — with the same pixel
+        // cap, since a full-size bitmap is the unbounded case.
+        return imageWithinPixelCap(data)
     }
     #if canImport(UIKit)
     return UIImage(cgImage: cg)
     #elseif canImport(AppKit)
     return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     #endif
+}
+
+/// `data` decoded as shipped — but only if its declared dimensions pass the cap. A 16 MB body
+/// can name 100 000×100 000 pixels; decoding that at draw time is a memory bomb the wire bound
+/// can't see, so anything past ~4× the biggest real capsule is refused instead of a hole.
+private let maxFullDecodePixels = 16_777_216 // 4096×4096
+
+private func imageWithinPixelCap(_ data: Data) -> PlatformImage? {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = props[kCGImagePropertyPixelWidth] as? Int,
+          let height = props[kCGImagePropertyPixelHeight] as? Int,
+          width > 0, height > 0, width * height <= maxFullDecodePixels
+    else { return nil }
+    return PlatformImage(data: data)
 }
 
 /// Where each library poster last drew, in global (window) coordinates, by entry id.
@@ -189,6 +206,14 @@ struct PosterImage: View {
     @State private var image: PlatformImage?
     @Environment(\.displayScale) private var displayScale
 
+    /// What re-runs the load task: the next candidate, or a loader arriving. A remounted
+    /// shelf draws its restored tiles a tick before `load()` has built one, and keying on
+    /// `index` alone spent every candidate on `nil` — the placeholder for good.
+    private struct LoadKey: Equatable {
+        var index: Int
+        var hasLoader: Bool
+    }
+
     var body: some View {
         Group {
             if let image {
@@ -233,7 +258,7 @@ struct PosterImage: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
-        .task(id: index) { await loadCurrent() }
+        .task(id: LoadKey(index: index, hasLoader: loader != nil)) { await loadCurrent() }
     }
 
     private func loadCurrent() async {
@@ -242,13 +267,24 @@ struct PosterImage: View {
             onLoaded?()
             return
         }
+        // No loader yet is not a failed candidate — the task refires when one arrives.
+        guard let loader else { return }
         // Twice the drawn edge: headroom for the focus pop and a Retina-crisp cover, without
         // ever holding the CDN's 600×900 (or larger) bitmap for the life of the tile.
         let maxPixels = drawnSize.map { Int(max($0.width, $0.height) * displayScale * 2) }
-        guard let loader, let data = try? await loader.data(for: candidates[index]),
-              let loaded = decodePoster(data, maxPixels: maxPixels)
-        else {
-            index += 1 // advance to the next candidate (or past the end → placeholder)
+        guard let data = try? await loader.data(for: candidates[index]) else {
+            // A cancelled fetch is the shelf leaving, not a dead URL: keep `index` here so
+            // the next appearance retries this candidate rather than skipping it.
+            if !Task.isCancelled { index += 1 }
+            return
+        }
+        // Decoding is CPU work a scroll shouldn't pay on the main actor.
+        let loaded = await Task.detached(priority: .userInitiated) {
+            decodePoster(data, maxPixels: maxPixels)
+        }.value
+        guard !Task.isCancelled else { return }
+        guard let loaded else {
+            index += 1
             return
         }
         image = loaded

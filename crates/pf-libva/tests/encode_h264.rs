@@ -62,7 +62,11 @@ fn the_encoder_emits_a_decodable_stream() {
     for i in 0..30 {
         let (y, uv) = frame(p.width as usize, p.height as usize, i);
         enc.write_nv12(&y, &uv).expect("fill the input surface");
-        let pic = enc.encode(i == 0).expect("encode");
+        enc.encode(i == 0).expect("encode");
+        let pic = enc
+            .collect(true)
+            .expect("collect")
+            .expect("a picture per encode");
         assert!(!pic.bytes.is_empty(), "frame {i} came back empty");
         assert_eq!(pic.is_idr, i == 0, "only the first frame opens the GOP");
         sizes.push(pic.bytes.len());
@@ -125,10 +129,14 @@ fn a_loss_recovers_on_an_anchored_p_not_an_idr() {
     let encode = |enc: &mut pf_libva::encode::Encoder, i: usize, anchor: Option<usize>| {
         let (y, uv) = frame(w, h, i);
         enc.write_nv12(&y, &uv).expect("fill");
-        let pic = match anchor {
+        match anchor {
             Some(slot) => enc.encode_anchored(slot).expect("anchored encode"),
             None => enc.encode(i == 0).expect("encode"),
-        };
+        }
+        let pic = enc
+            .collect(true)
+            .expect("collect")
+            .expect("a picture per encode");
         assert_eq!(pic.is_idr, i == 0, "picture {i}");
         assert_eq!(pic.recovery_anchor, anchor.is_some());
         assert_eq!(pic.wire, i as i64);
@@ -220,7 +228,11 @@ fn a_bitrate_step_lands_without_an_idr() {
             })
             .collect();
         enc.write_nv12(&y, &vec![128u8; w * h / 2]).expect("fill");
-        let pic = enc.encode(i == 0).expect("encode");
+        enc.encode(i == 0).expect("encode");
+        let pic = enc
+            .collect(true)
+            .expect("collect")
+            .expect("a picture per encode");
         idrs += usize::from(
             pic.bytes
                 .windows(5)

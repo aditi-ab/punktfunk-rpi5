@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 /// Bumped on any wire change. Host and worker are different files, so a lockstep
 /// miss must fall back to the in-process encoder, never a dead session.
-pub(crate) const PROTO_VERSION: u32 = 1;
+pub(crate) const PROTO_VERSION: u32 = 2;
 
 /// Compile-time `CARGO_PKG_VERSION` of this crate. Handshake compares it too: a
 /// protocol can stay still while the encoder moves, and a stale worker binary
@@ -162,6 +162,10 @@ pub(crate) enum ToWorker {
         fps: u32,
         bitrate_bps: u64,
         chroma444: bool,
+        /// Negotiated stream depth (8 or 10) and the BT.2020 PQ flag — the encoder's
+        /// CSC shader, plane formats, and colour stamp all follow them.
+        bit_depth: u8,
+        hdr: bool,
         priority_intent: Option<String>,
     },
     /// Encode one frame. The dmabuf fd rides as `SCM_RIGHTS` only on first sight
@@ -226,9 +230,11 @@ pub(crate) enum FromWorker {
     },
     /// No cached fd for `key`. Host forgets "already sent" and retries once with the fd.
     NeedFd,
-    /// This frame failed; the worker is still alive.
+    /// This frame failed; the worker is still alive. `capture_rebuild` feeds a
+    /// dmabuf submit failure to the host's identity-scoped fallback.
     EncodeErr {
         message: String,
+        capture_rebuild: bool,
     },
     Ack {
         ok: bool,
@@ -383,6 +389,8 @@ fn run(sock: OwnedFd) -> Result<()> {
         fps,
         bitrate_bps,
         chroma444,
+        bit_depth,
+        hdr,
         priority_intent,
     } = hello
     else {
@@ -409,6 +417,8 @@ fn run(sock: OwnedFd) -> Result<()> {
         fps,
         bitrate_bps,
         chroma444,
+        bit_depth,
+        hdr,
         priority_intent.as_deref(),
     ) {
         Ok(e) => e,
@@ -462,6 +472,7 @@ fn serve(sock: &OwnedFd, mut enc: super::pyrowave::PyroWaveEncoder, au_buf: &Fil
         let reply = match msg {
             ToWorker::Hello { .. } => FromWorker::EncodeErr {
                 message: "duplicate Hello".into(),
+                capture_rebuild: false,
             },
             ToWorker::SetWireChunking { shard_payload } => {
                 enc.set_wire_chunking(shard_payload);
@@ -524,6 +535,7 @@ fn serve(sock: &OwnedFd, mut enc: super::pyrowave::PyroWaveEncoder, au_buf: &Fil
                     Ok(reply) => reply,
                     Err(e) => FromWorker::EncodeErr {
                         message: format!("{e:#}"),
+                        capture_rebuild: false,
                     },
                 }
             }
@@ -619,16 +631,22 @@ fn encode_one(
             plane1: req.plane1,
             offset: req.offset,
             stride: req.stride,
-            // Deferred-requeue hold stays host-side: this backend is synchronous
-            // at depth 1, so the host's frame outlives the whole encode.
+            // Hold and the authoritative rebuild signal stay host-side.
             hold: None,
+            health: pf_zerocopy::zero_copy_health(0),
+            rebuild: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
         cursor,
     };
     // submit then poll in one breath: encode is synchronous at depth 1, so the
     // AU is ready when `poll` returns and `frame` is alive across both halves.
     let t0 = Instant::now();
-    enc.submit(&frame)?;
+    if let Err(e) = enc.submit(&frame) {
+        return Ok(FromWorker::EncodeErr {
+            message: format!("{e:#}"),
+            capture_rebuild: true,
+        });
+    }
     let Some(au) = enc.poll()? else {
         anyhow::bail!("encoder returned no AU for a submitted frame");
     };
@@ -661,6 +679,8 @@ mod tests {
             fps: 60,
             bitrate_bps: 400_000_000,
             chroma444: true,
+            bit_depth: 10,
+            hdr: true,
             priority_intent: Some("realtime".into()),
         }
     }
@@ -732,6 +752,7 @@ mod tests {
             FromWorker::Ack { ok: true },
             FromWorker::EncodeErr {
                 message: "boom".into(),
+                capture_rebuild: false,
             },
         ] {
             ipc::send(b.as_fd(), &reply, None).unwrap();
@@ -767,6 +788,8 @@ mod tests {
             fps,
             bitrate_bps,
             chroma444,
+            bit_depth,
+            hdr,
             priority_intent,
             ..
         } = hello()
@@ -784,6 +807,8 @@ mod tests {
             fps,
             bitrate_bps,
             chroma444,
+            bit_depth,
+            hdr,
             priority_intent,
         };
         let err = ipc::send(a.as_fd(), &huge, None).unwrap_err();

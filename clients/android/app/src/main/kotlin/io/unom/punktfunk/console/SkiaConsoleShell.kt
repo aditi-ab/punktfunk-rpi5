@@ -163,9 +163,11 @@ fun SkiaConsoleShell(
     var viewW by remember { mutableStateOf(0) }
     var viewH by remember { mutableStateOf(0) }
     // "Reduce interface resolution" (`Settings.reduceUiResolution`): cap the console's BUFFER at
-    // 1920 on its long edge and let the compositor scale it up to the panel. 1 means "draw at the
-    // panel's own resolution" — the setting is off, or the display is already at or under 1080p
-    // and there is nothing to give back.
+    // 1920 on its long edge and let the compositor scale it up to the panel. The same flag reaches
+    // the shell as `android.reduce_ui_resolution`, where it also puts the animated backdrop on a
+    // small, decimated pass — on a TV SoC that shader is the bigger half of the bill. 1 means
+    // "draw at the panel's own resolution" — the setting is off, or the display is already at or
+    // under 1080p and there is nothing to give back.
     //
     // ONE factor on both axes, so the aspect ratio survives exactly and no layout can stretch.
     // Everything else in this function that speaks in SURFACE pixels multiplies by it — the insets

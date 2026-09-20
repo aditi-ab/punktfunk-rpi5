@@ -98,7 +98,8 @@ impl UserData {
 
     /// Withhold this buffer from the producer until the returned hold drops.
     /// `None` (pool too shallow, or `PUNKTFUNK_ZEROCOPY_HOLD=0`) requeues at `.process` return —
-    /// the producer may then rewrite the dmabuf while encode still reads it.
+    /// the producer may then rewrite the dmabuf while encode still reads it, so the raw
+    /// passthrough publishes only under `Some` and treats `None` as a CPU fallback.
     /// Every hold out with an untaken frame in the slot: that frame gives its hold to this one.
     /// A buffer the book already lists was re-sent by the producer: no hold, and the capture is
     /// flagged for a rebuild.
@@ -279,9 +280,8 @@ pub(super) struct NegotiationPlan {
 /// Resolve the negotiation plan. **Pure** — every environment read is already in `i`.
 ///
 /// Invariants (pinned by `negotiation_plan_invariants`):
-/// 1. HDR never takes the tiled EGL de-tile blit (8-bit `GL_RGBA8`). It may still build the
-///    importer: HDR pods advertise LINEAR only ([`build_hdr_dmabuf_format`]), so the frame
-///    takes the Vulkan-bridge arm. The per-frame gate in `.process` enforces the tiled half.
+/// 1. HDR never takes the 8-bit EGL de-tile blit. An EGL/CUDA fallback offers LINEAR;
+///    direct raw lanes may offer proved tiled formats, guarded again per frame.
 /// 2. 4:4:4 never prefers producer NV12 or P010 (must not subsample).
 /// 3. Producer-native planar only on a `native_nv12_session` under active raw passthrough
 ///    (the VAAPI session takes RGB; the CUDA importer expects packed RGB): NV12 for SDR,
@@ -292,8 +292,8 @@ pub(super) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPlan {
     let raw_passthrough = i.backend_is_vaapi || i.pyrowave_session;
     // Skip under raw passthrough (payloads only NVENC consumes) and both GPU latches
     // (worker-death crash-loop; compositor that rejects our modifiers would re-pay 10 s).
-    // HDR is allowed: pods are LINEAR-only, so it never hits the 8-bit de-tile blit. Exclude
-    // HDR when the encoder cannot take packed 10-bit CUDA (a build without `nvenc`).
+    // HDR through this importer is LINEAR, so it avoids the 8-bit de-tile blit. Exclude
+    // it when the encoder cannot take packed 10-bit CUDA (a build without `nvenc`).
     let build_importer = i.zerocopy
         && !raw_passthrough
         && !i.gpu_import_disabled
@@ -398,8 +398,8 @@ pub(super) fn resolved_capture_arm(
 pub(super) enum ConsumerKind {
     /// Wavelet encoder's Vulkan device imports dmabufs on any vendor; CPU costs the passthrough.
     PyroWave,
-    /// libva imports the dmabuf and CSCs on the GPU.
-    Vaapi,
+    /// AMD/Intel encoder: libva or Vulkan Video imports the dmabuf.
+    AmdIntel,
     Nvenc,
     /// Software encoder — CPU frames are native input, so a CPU arm is not a downgrade.
     Software,
@@ -409,7 +409,7 @@ impl ConsumerKind {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             ConsumerKind::PyroWave => "pyrowave",
-            ConsumerKind::Vaapi => "vaapi",
+            ConsumerKind::AmdIntel => "amd-intel",
             ConsumerKind::Nvenc => "nvenc",
             ConsumerKind::Software => "software",
         }
@@ -434,7 +434,7 @@ pub(super) fn consumer_kind(
     } else if !backend_is_gpu {
         ConsumerKind::Software
     } else if backend_is_vaapi {
-        ConsumerKind::Vaapi
+        ConsumerKind::AmdIntel
     } else {
         ConsumerKind::Nvenc
     }
@@ -456,6 +456,8 @@ pub(super) enum PassthroughFallback {
     DupFailed,
     /// A linear pitch off 64 bytes: iHD imports it at a rounded pitch and the picture shears.
     UnalignedPitch,
+    /// The pool could not spare a deferred-requeue hold, so the raw frame is unsafe to publish.
+    NoHold,
 }
 
 impl PassthroughFallback {
@@ -466,6 +468,7 @@ impl PassthroughFallback {
             PassthroughFallback::NoFourcc => 1 << 2,
             PassthroughFallback::DupFailed => 1 << 3,
             PassthroughFallback::UnalignedPitch => 1 << 4,
+            PassthroughFallback::NoHold => 1 << 5,
         }
     }
 
@@ -478,10 +481,13 @@ impl PassthroughFallback {
             PassthroughFallback::UnalignedPitch => {
                 "the dmabuf's pitch is not a multiple of 64 bytes"
             }
+            PassthroughFallback::NoHold => {
+                "the producer pool could not spare a deferred-requeue hold"
+            }
         }
     }
 
-    /// Three reasons downgrade to CPU; `NoFormat` drops the frame (CPU path needs `ud.format` too).
+    /// `NoFormat` drops the frame (CPU path needs `ud.format` too); the rest downgrade to CPU.
     pub(super) fn falls_back_to_cpu(self) -> bool {
         !matches!(self, PassthroughFallback::NoFormat)
     }
@@ -503,6 +509,9 @@ impl PassthroughFallback {
             PassthroughFallback::UnalignedPitch => {
                 "the compositor pads linear buffers only for scanout, and iHD reads an odd pitch \
                  rounded — this width streams through the CPU copy instead of the raw import"
+            }
+            PassthroughFallback::NoHold => {
+                "the frame stays on the CPU copy path rather than letting the producer rewrite a DMA-BUF the encoder still reads"
             }
         }
     }
@@ -627,9 +636,100 @@ impl PassthroughFallbacks {
     }
 }
 
-/// A tiled 10-bit frame reached the CUDA import, which has no 10-bit de-tile. HDR offers
-/// stay LINEAR for the rest of this process.
-static HDR_TILED_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What a broken raw-passthrough frame does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassthroughFallbackAction {
+    /// Nothing streams — the CPU path cannot serve this frame either.
+    Drop,
+    /// De-pad through the CPU mmap path.
+    Cpu,
+    /// The tiled modifier failed: refuse it for this identity and rebuild on LINEAR.
+    DropTiledAndRebuild,
+}
+
+/// The action for a passthrough break. A nonzero modifier is never de-padded: a
+/// tiled buffer read as linear is a scrambled picture, so any failure on it
+/// retires the tiled offer itself. On LINEAR, keep today's split.
+fn passthrough_fallback_action(
+    reason: PassthroughFallback,
+    modifier: u64,
+) -> PassthroughFallbackAction {
+    if modifier != 0 {
+        PassthroughFallbackAction::DropTiledAndRebuild
+    } else if reason.falls_back_to_cpu() {
+        PassthroughFallbackAction::Cpu
+    } else {
+        PassthroughFallbackAction::Drop
+    }
+}
+
+/// The encoder-proved list for an exact drm fourcc out of
+/// [`ZeroCopyPolicy::encoder_modifiers`]: cloned, LINEAR stripped, order kept.
+fn encoder_modifiers_for(policy: &ZeroCopyPolicy, fourcc: u32) -> Vec<u64> {
+    let Some(list) = policy
+        .encoder_modifiers
+        .iter()
+        .find(|(f, _)| *f == fourcc)
+        .map(|(_, m)| m)
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<u64> = Vec::with_capacity(list.len());
+    for &m in list {
+        if m != 0 && !out.contains(&m) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// Run the fallback for a broken raw-passthrough frame: pick the action for
+/// `(reason, ud.modifier)`, emit its once-per-reason line, and act on it.
+/// `true` = the caller falls through to the mmap de-pad; `false` = the frame
+/// ends here — dropped, or the tiled offer refused and the capture flagged to
+/// rebuild on LINEAR.
+fn handle_passthrough_fallback(ud: &mut UserData, reason: PassthroughFallback) -> bool {
+    let action = passthrough_fallback_action(reason, ud.modifier);
+    // Once per distinct reason (`.process` is per-frame). The running count separates a
+    // persistent downgrade from a one-frame hiccup at renegotiation.
+    if let Some(frames) = ud.passthrough_fallbacks.note(reason) {
+        tracing::warn!(
+            frames,
+            "zero-copy raw-dmabuf passthrough did not take this frame: {} — {} ({})",
+            reason.as_str(),
+            match action {
+                PassthroughFallbackAction::Cpu => {
+                    "it falls back to the CPU capture path, costing a full-resolution mmap \
+                     de-pad plus the encoder's own upload on every such frame"
+                }
+                PassthroughFallbackAction::Drop => {
+                    "the frame is DROPPED — the CPU de-pad path needs the negotiated format \
+                     too, so nothing streams while this persists"
+                }
+                PassthroughFallbackAction::DropTiledAndRebuild => {
+                    "the tiled offer is refused for this capture identity and it rebuilds on \
+                     LINEAR"
+                }
+            },
+            reason.hint()
+        );
+    }
+    match action {
+        PassthroughFallbackAction::Cpu => true,
+        PassthroughFallbackAction::Drop => false,
+        PassthroughFallbackAction::DropTiledAndRebuild => {
+            if ud.signals.health.refuse_passthrough_tiled() {
+                tracing::warn!(
+                    "tiled raw-dmabuf passthrough could not continue ({}) — capture rebuilds \
+                     on LINEAR",
+                    reason.as_str()
+                );
+            }
+            ud.signals.broken.store(true, Ordering::Relaxed);
+            false
+        }
+    }
+}
 
 /// Tiled-import failures (worker alive) before the stream is poisoned for rebuild.
 /// Never fall through to CPU mmap: de-padding tiled bytes as linear is a scrambled image.
@@ -664,7 +764,7 @@ pub(super) fn gpu_import(
     let ten_bit = fmt.is_hdr_rgb10();
     // The raw lane let go of a tiled HDR stream. Rebuild it on the LINEAR offer.
     if ten_bit && modifier.is_some() {
-        if !HDR_TILED_REFUSED.swap(true, Ordering::Relaxed) {
+        if signals.health.refuse_hdr_tiled() {
             tracing::warn!(
                 "tiled 10-bit dmabuf reached the CUDA import — capture rebuilds on LINEAR"
             );
@@ -701,7 +801,7 @@ pub(super) fn gpu_import(
     match imported {
         Ok(devbuf) => {
             state.fail_streak = 0;
-            pf_zerocopy::note_gpu_import_ok();
+            signals.health.note_gpu_import_ok();
             static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
             if ONCE.swap(false, Ordering::Relaxed) {
                 tracing::info!(
@@ -725,7 +825,7 @@ pub(super) fn gpu_import(
         Err(e) => {
             let dead = importer.dead();
             if dead {
-                pf_zerocopy::note_gpu_import_death();
+                signals.health.note_gpu_import_death();
             }
             if modifier.is_none() {
                 tracing::warn!(error = %format!("{e:#}"),
@@ -747,29 +847,30 @@ pub(super) fn gpu_import(
     }
 }
 
-/// Buffers left in the producer's pool: one it is rendering, one in transit.
-/// Withholding past that skips frames when holds peak (host frame + up to two encoder slots).
+/// Buffers left in the producer's pool: one it is rendering, one in transit. The remaining
+/// pool is the consumer hold budget (host frame, capture slot, and pipelined encoder sources).
 const HOLD_POOL_RESERVE: u32 = 2;
 
-/// Pool the raw lane asks for. The encoder keeps its frame held across ticks (a repeat re-uses
-/// it), the slot holds the next, and an arrival must still find a buffer: three holds beyond
-/// the producer's reserve. A producer capped below this runs two holds, and
-/// [`UserData::release_unconsumed`] frees the slot's for the arrival.
-const RAW_LANE_POOL_MIN: i32 = 6;
+/// Pool the raw lane asks for: four encoder holds, the host frame, the capture slot, and two
+/// buffers reserved for the producer. A producer capped below this spends only the holds it
+/// serves; [`UserData::release_unconsumed`] frees the slot's for the next arrival.
+const RAW_LANE_POOL_MIN: i32 = 8;
 
 /// Least pool depth this stream asks for: the producer's minimum, deepened to
 /// [`RAW_LANE_POOL_MIN`] on the raw lane but never past `pool_max`. A minimum above what the
 /// producer serves fails negotiation outright.
-fn pool_ask(pool_min: i32, pool_max: Option<i32>, nvenc_raw: bool) -> i32 {
-    if !nvenc_raw {
+fn pool_ask(pool_min: i32, pool_max: Option<i32>, raw_lane: bool) -> i32 {
+    if !raw_lane {
         return pool_min;
     }
     let deep = pool_min.max(RAW_LANE_POOL_MIN);
     pool_max.map_or(deep, |max| deep.min(max).max(pool_min))
 }
 
-/// `PUNKTFUNK_ZEROCOPY_HOLD=0` restores immediate requeue (racy). Use `env_on`; a bare
-/// `== "0"` is the trap `PUNKTFUNK_FORCE_SHM` already hit.
+/// `PUNKTFUNK_ZEROCOPY_HOLD=0` restores immediate requeue (racy). On the raw passthrough it
+/// never publishes an unheld dmabuf: `try_defer` returns `None` there and the frame takes the
+/// safe CPU fallback instead. Use `env_on`; a bare `== "0"` is the trap `PUNKTFUNK_FORCE_SHM`
+/// already hit.
 fn zerocopy_hold_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| pf_host_config::env_on("PUNKTFUNK_ZEROCOPY_HOLD").unwrap_or(true))
@@ -1003,6 +1104,8 @@ fn packed_frame_geometry(
 /// cast as libspa's `Buffer::datas_mut`, so the safe `Data` accessors keep working. `pw_buf`
 /// is identity for [`UserData::try_defer`] only — never dereferenced here. `stream` is the
 /// stream running this `.process`; `try_defer` requeues a stale held buffer on it.
+/// A broken raw-passthrough frame routes through [`handle_passthrough_fallback`]:
+/// CPU de-pad, drop, or tiled-offer refusal + rebuild.
 fn consume_frame(
     ud: &mut UserData,
     spa_buf: *mut spa::sys::spa_buffer,
@@ -1208,8 +1311,10 @@ fn consume_frame(
             {
                 break 'passthrough PassthroughFallback::UnalignedPitch;
             }
-            // Dup so the fd outlives SPA recycle. Content stability is `try_defer`; without a
-            // hold (shallow pool / PUNKTFUNK_ZEROCOPY_HOLD=0) the pool depth must outrun encode.
+            // Dup so the fd outlives SPA recycle. Content stability is `try_defer`: a raw
+            // frame is published only under a hold, so the producer can never rewrite a
+            // DMA-BUF the encoder still reads. No hold — shallow pool or
+            // PUNKTFUNK_ZEROCOPY_HOLD=0 — is a safe CPU fallback, never an unsafe publish.
 
             // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
             // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
@@ -1219,7 +1324,11 @@ fn consume_frame(
             if dup < 0 {
                 break 'passthrough PassthroughFallback::DupFailed;
             }
-            let hold = ud.try_defer(pw_buf, stream);
+            let Some(hold) = ud.try_defer(pw_buf, stream) else {
+                // SAFETY: `dup` is ours and was not published.
+                unsafe { libc::close(dup) };
+                break 'passthrough PassthroughFallback::NoHold;
+            };
             ud.publish(CapturedFrame {
                 provenance: Default::default(),
                 width: w as u32,
@@ -1237,7 +1346,9 @@ fn consume_frame(
                     offset,
                     stride,
                     plane1,
-                    hold,
+                    hold: Some(hold),
+                    health: ud.signals.health.clone(),
+                    rebuild: ud.signals.broken.clone(),
                 }),
                 // RGB→NV12 backends blend cursor-as-metadata. Gamescope burns the pointer in;
                 // native NV12/P010 has none.
@@ -1271,22 +1382,8 @@ fn consume_frame(
             }
             return;
         };
-        // Once per distinct reason (`.process` is per-frame). The running count separates a
-        // persistent downgrade from a one-frame hiccup at renegotiation.
-        if let Some(frames) = ud.passthrough_fallbacks.note(reason) {
-            tracing::warn!(
-                frames,
-                "zero-copy raw-dmabuf passthrough did not take this frame: {} — {} ({})",
-                reason.as_str(),
-                if reason.falls_back_to_cpu() {
-                    "it falls back to the CPU capture path, costing a full-resolution mmap \
-                     de-pad plus the encoder's own upload on every such frame"
-                } else {
-                    "the frame is DROPPED — the CPU de-pad path needs the negotiated format \
-                     too, so nothing streams while this persists"
-                },
-                reason.hint()
-            );
+        if !handle_passthrough_fallback(ud, reason) {
+            return;
         }
     }
 
@@ -1337,6 +1434,8 @@ fn consume_frame(
                                 stride: plane.stride,
                                 plane1: None,
                                 hold: Some(hold),
+                                health: ud.signals.health.clone(),
+                                rebuild: ud.signals.broken.clone(),
                             }),
                             cursor: ud.cursor.overlay(),
                         });
@@ -1524,6 +1623,9 @@ fn consume_frame(
     ud.publish(frame);
 }
 
+/// The PipeWire loop thread for one capture session: connects, builds the
+/// modifier offers ([`packed_modifier_offers`], [`hdr_modifier_offers`]),
+/// negotiates, and runs `.process` until `quit_rx`, `broken`, or disconnect.
 #[allow(clippy::too_many_arguments)]
 pub fn pipewire_thread(
     fd: Option<OwnedFd>,
@@ -1555,7 +1657,7 @@ pub fn pipewire_thread(
     } = opts;
     // Node ids and remote fds do not identify a compositor: Mutter and gamescope
     // can both use the default daemon. Keep the producer contract explicit.
-    let pool_min = pool_ask(pool_min, pool_max, plan.nvenc_raw);
+    let pool_min = pool_ask(pool_min, pool_max, plan.nvenc_raw || plan.vaapi_passthrough);
     let offer_cursor_meta = !producer_is_gamescope;
     crate::pwinit::ensure_init();
 
@@ -1602,8 +1704,8 @@ pub fn pipewire_thread(
     // already encodes when to try.
     if plan.gpu_import_latched {
         tracing::warn!(
-            "zero-copy GPU import disabled for this host process (repeated import-worker deaths, \
-             or a previous dmabuf negotiation timeout) — using CPU path"
+            "zero-copy GPU import disabled for this capture identity (repeated import-worker \
+             deaths or a previous dmabuf negotiation timeout) — using CPU path"
         );
     }
     let mut importer = if plan.build_importer {
@@ -1624,55 +1726,24 @@ pub fn pipewire_thread(
              RGB CSC; PUNKTFUNK_PIPEWIRE_NV12=0 restores the packed-RGB negotiation)"
         );
     }
-    // Per-fourcc: EGL/libva answer per format; XR24 (BGRx) and AR24 (BGRA) are asked
-    // separately. LINEAR (0) is appended for KWin/portal (NVIDIA EGL omits it). gamescope
-    // capture textures are LINEAR-only — see `dmabuf_modifiers_for_producer`.
-    let mut modifiers = Vec::new();
-    let mut modifiers_bgra = Vec::new();
-    if let Some(i) = importer.as_mut() {
-        modifiers = i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgrx).unwrap());
-        modifiers_bgra = i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgra).unwrap());
-    }
-    // PyroWave imports through Vulkan, not libva. Extra modifiers come from the facade
-    // (`ZeroCopyPolicy::pyrowave_modifiers`) so capture never calls `encode`. Empty unless
-    // the `pyrowave` feature is on and this session (or the global pref) is PyroWave.
-    let extend_pyrowave =
-        vaapi_passthrough && !policy.pyrowave_modifiers.is_empty() && !producer_is_gamescope;
-    for list in [&mut modifiers, &mut modifiers_bgra] {
-        if extend_pyrowave {
-            for &m in &policy.pyrowave_modifiers {
-                if !list.contains(&m) {
-                    list.push(m);
-                }
-            }
-        }
-        *list = dmabuf_modifiers_for_producer(
-            list,
-            importer.is_some() || vaapi_passthrough,
-            producer_is_gamescope && !policy.gamescope_tiled,
-        );
-    }
-    // Tiled 10-bit has one reader: the encoder's raw convert. Every other arm de-tiles into
-    // 8 bits, so offer it only while that lane holds the stream.
-    let hdr_tiled_raw = want_hdr
-        && policy.gamescope_tiled
-        && plan.nvenc_raw
-        && !HDR_TILED_REFUSED.load(Ordering::Relaxed);
-    let mut hdr_modifiers: Vec<(VideoFormat, Vec<u64>)> = Vec::new();
-    for fmt in HDR_FORMAT_ORDER {
-        let mut list = Vec::new();
-        if hdr_tiled_raw {
-            if let (Some(i), Some(fourcc)) = (
-                importer.as_mut(),
-                map_format(fmt).and_then(pf_frame::drm_fourcc),
-            ) {
-                list = i.supported_modifiers(fourcc);
-            }
-        }
-        list.retain(|&m| m != 0);
-        list.push(0);
-        hdr_modifiers.push((fmt, list));
-    }
+    // Per-fourcc offers: importer lists plus the encoder-proved gamescope seed
+    // and the PyroWave Vulkan list, finalized by `dmabuf_modifiers_for_producer`.
+    let (modifiers, modifiers_bgra, extend_pyrowave) = packed_modifier_offers(
+        &policy,
+        &signals.health,
+        importer.as_mut(),
+        vaapi_passthrough,
+        producer_is_gamescope,
+    );
+    let hdr_modifiers = hdr_modifier_offers(
+        &policy,
+        &signals.health,
+        importer.as_mut(),
+        want_hdr,
+        vaapi_passthrough,
+        producer_is_gamescope,
+        plan.nvenc_raw,
+    );
     if extend_pyrowave {
         tracing::info!(
             count = modifiers.len(),
@@ -1697,10 +1768,18 @@ pub fn pipewire_thread(
     tracing::info!(
         capture_arm = arm.as_str(),
         consumer = consumer.as_str(),
-        modifier_count = modifiers.len(),
+        modifier_count = if want_hdr {
+            hdr_modifiers
+                .iter()
+                .map(|(_, m)| m.len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            modifiers.len()
+        },
         // Latch state belongs on the same line as the arm: `cpu` is either "never dmabuf"
         // or "a prior failure we are still living with" — only the second is a bug.
-        raw_dmabuf_latch = pf_zerocopy::raw_dmabuf_latch_state(),
+        raw_dmabuf_latch = signals.health.raw_state(),
         "capture pipeline resolved: {} → {}",
         arm.as_str(),
         consumer.as_str()
@@ -1711,20 +1790,18 @@ pub fn pipewire_thread(
         );
     } else if plan.raw_dmabuf_latched {
         tracing::warn!(
-            "zero-copy raw-dmabuf passthrough disabled for this host process (repeated encoder \
-             import failures, or a previous dmabuf negotiation timeout) — capturing CPU frames \
-             instead"
+            "zero-copy raw-dmabuf passthrough disabled for this capture identity (repeated \
+             encoder import failures or a negotiation timeout) — capturing CPU frames instead"
         );
     } else if !want_dmabuf && (plan.build_importer || plan.vaapi_passthrough) {
         tracing::warn!("zero-copy: no importable dmabuf modifiers — using CPU path");
     } else if vaapi_passthrough {
-        // Covers PyroWave: its extra Vulkan modifiers were appended above. Do not gate this
-        // on `pyrowave_modifiers.is_empty()` — that dropped a zero-copy PyroWave session to CPU.
+        // PyroWave remains raw passthrough when its tiled lists are empty: LINEAR is valid.
         tracing::info!(
             native_nv12_preferred = prefer_native_nv12,
             native_p010_preferred = prefer_native_p010,
             modifier_count = modifiers.len(),
-            pyrowave_extended = !policy.pyrowave_modifiers.is_empty(),
+            pyrowave_extended = extend_pyrowave,
             "zero-copy: advertising DMA-BUF modifiers for direct encoder import (LINEAR \
              always; native NV12 first when enabled, packed RGB fallback)"
         );
@@ -1795,6 +1872,8 @@ pub fn pipewire_thread(
         .store(importer.is_some(), Ordering::Relaxed);
     *signals.importer.lock().unwrap_or_else(|e| e.into_inner()) = importer;
     let signals_exit = signals.clone();
+    let hdr_tiled_raw =
+        want_hdr && policy.gamescope_tiled && plan.nvenc_raw && !signals.health.hdr_tiled_refused();
     let data = UserData {
         info: VideoInfoRaw::default(),
         format: None,
@@ -1803,6 +1882,7 @@ pub fn pipewire_thread(
         wake,
         signals,
         vaapi_passthrough,
+        // Same predicate `hdr_modifier_offers` used for the NVENC raw lane.
         hdr_tiled_raw,
         import_policy: plan.import_policy.for_ten_bit_sdr(opts.ten_bit_sdr),
         import_state: ImportState::default(),
@@ -2232,8 +2312,8 @@ pub fn pipewire_thread(
 
     if want_hdr {
         tracing::info!(
-            "HDR capture: offering xBGR_210LE/xRGB_210LE LINEAR dmabufs with MANDATORY \
-             BT.2020 + SMPTE-2084 (PQ) colorimetry (GNOME 50+ monitor stream)"
+            "HDR capture: offering xBGR_210LE/xRGB_210LE DMA-BUF modifiers (LINEAR always) \
+             with MANDATORY BT.2020 + SMPTE-2084 (PQ) colorimetry"
         );
     }
     // Zero-copy: offer only BGRx dmabuf with our EGL-importable modifiers (offering shm
@@ -2755,6 +2835,113 @@ fn offer_pacing(unpaced: bool, gamescope: bool, preferred: Option<(u32, u32, u32
     }
 }
 
+/// BGRx/BGRA dmabuf offers. Importer lists per format; the direct-import lane's
+/// tiled seed is `ZeroCopyPolicy::encoder_modifiers`, offered only to a
+/// tiled-opted gamescope producer on VA passthrough while the refusal latch is
+/// clear; PyroWave merges its Vulkan-importable list on non-gamescope
+/// passthrough. `dmabuf_modifiers_for_producer` finalizes each list. Returns
+/// `(bgrx, bgra, extend_pyrowave)` — the flag feeds the session-start log line.
+fn packed_modifier_offers(
+    policy: &ZeroCopyPolicy,
+    health: &pf_zerocopy::ZeroCopyHealth,
+    importer: Option<&mut pf_zerocopy::Importer>,
+    vaapi_passthrough: bool,
+    producer_is_gamescope: bool,
+) -> (Vec<u64>, Vec<u64>, bool) {
+    // EGL importer answers per format; the encoder seed does too. LINEAR is appended for
+    // every advertised list and remains the only gamescope choice without a proved tiled seed.
+    let advertise = importer.is_some() || vaapi_passthrough;
+    let mut modifiers = Vec::new();
+    let mut modifiers_bgra = Vec::new();
+    if let Some(i) = importer {
+        modifiers = i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgrx).unwrap());
+        modifiers_bgra = i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgra).unwrap());
+    }
+    // PyroWave imports through Vulkan, not libva. Its per-fourcc lists come from the
+    // facade so capture never calls `encode`; gamescope has its separately gated seed.
+    let extend_pyrowave = vaapi_passthrough && policy.pyrowave_session && !producer_is_gamescope;
+    // The direct-import lane's tiled offer comes from what the session encoder
+    // proved (`ZeroCopyPolicy::encoder_modifiers`), per fourcc. A refused tiled
+    // offer or a non-gamescope producer keeps the importer's list alone.
+    let tiled_refused = health.passthrough_tiled_refused();
+    let seed_encoder_mods =
+        vaapi_passthrough && producer_is_gamescope && policy.gamescope_tiled && !tiled_refused;
+    for (fourcc, mods) in &policy.encoder_modifiers {
+        let nonzero: Vec<u64> = mods.iter().copied().filter(|m| *m != 0).collect();
+        if !nonzero.is_empty() {
+            tracing::info!(
+                fourcc = format!("{fourcc:#010x}"),
+                modifiers = ?nonzero,
+                "zero-copy: encoder-proved tiled dmabuf modifiers for capture"
+            );
+        }
+    }
+    for (list, fmt) in [
+        (&mut modifiers, PixelFormat::Bgrx),
+        (&mut modifiers_bgra, PixelFormat::Bgra),
+    ] {
+        if seed_encoder_mods || extend_pyrowave {
+            if let Some(fourcc) = pf_frame::drm_fourcc(fmt) {
+                for m in encoder_modifiers_for(policy, fourcc) {
+                    if !list.contains(&m) {
+                        list.push(m);
+                    }
+                }
+            }
+        }
+        *list = dmabuf_modifiers_for_producer(
+            list,
+            advertise,
+            producer_is_gamescope
+                && (!policy.gamescope_tiled || (vaapi_passthrough && tiled_refused)),
+        );
+    }
+    (modifiers, modifiers_bgra, extend_pyrowave)
+}
+
+/// Packed 10-bit offers. Tiled has two readers: NVENC's raw convert, and the VA
+/// encoder's own import — the latter only for `encoder_modifiers`-proved
+/// modifiers. Every other arm de-tiles into 8 bits, so tiled is offered only
+/// while one lane holds the stream. LINEAR is always appended once.
+fn hdr_modifier_offers(
+    policy: &ZeroCopyPolicy,
+    health: &pf_zerocopy::ZeroCopyHealth,
+    importer: Option<&mut pf_zerocopy::Importer>,
+    want_hdr: bool,
+    vaapi_passthrough: bool,
+    producer_is_gamescope: bool,
+    nvenc_raw: bool,
+) -> Vec<(VideoFormat, Vec<u64>)> {
+    let mut importer = importer;
+    let hdr_tiled_raw =
+        want_hdr && policy.gamescope_tiled && nvenc_raw && !health.hdr_tiled_refused();
+    let hdr_tiled_direct = want_hdr
+        && vaapi_passthrough
+        && producer_is_gamescope
+        && policy.gamescope_tiled
+        && !health.passthrough_tiled_refused();
+    let mut hdr_modifiers: Vec<(VideoFormat, Vec<u64>)> = Vec::new();
+    for fmt in HDR_FORMAT_ORDER {
+        let mut list = Vec::new();
+        if hdr_tiled_direct {
+            if let Some(fourcc) = map_format(fmt).and_then(pf_frame::drm_fourcc) {
+                list = encoder_modifiers_for(policy, fourcc);
+            }
+        } else if hdr_tiled_raw {
+            if let (Some(i), Some(fourcc)) = (
+                importer.as_deref_mut(),
+                map_format(fmt).and_then(pf_frame::drm_fourcc),
+            ) {
+                list = i.supported_modifiers(fourcc);
+            }
+        }
+        list.retain(|&m| m != 0);
+        list.push(0);
+        hdr_modifiers.push((fmt, list));
+    }
+    hdr_modifiers
+}
+
 /// A `linear_only` gamescope node offers LINEAR as `{0,0}`. spa_pod_filter without
 /// DONT_FIXATE fixates our default, so a tiled NVIDIA default fails the link. Empty `egl`
 /// with `advertise` still yields LINEAR — the importer exists, EGL listed none.
@@ -2855,7 +3042,7 @@ mod tests {
         assert_eq!(
             dmabuf_modifiers_for_producer(&egl, true, true),
             vec![0],
-            "gamescope's producer choice is LINEAR-only; a tiled default fails the link"
+            "a forced LINEAR offer must discard tiled defaults"
         );
         assert_eq!(
             dmabuf_modifiers_for_producer(&[], true, true),
@@ -2924,8 +3111,8 @@ mod tests {
     /// Pins the four invariants documented on [`negotiation_plan`].
     #[test]
     fn negotiation_plan_invariants() {
-        // HDR on NVENC builds the importer: pods are LINEAR-only, so frames take the
-        // Vulkan-bridge arm, never the 8-bit de-tile blit. Tiled half is enforced in `.process`.
+        // HDR on the NVENC importer is LINEAR and takes the Vulkan bridge, never the
+        // 8-bit de-tile blit. Direct raw lanes gate tiled formats separately.
         for want_444 in [false, true] {
             let p = negotiation_plan(NegotiationInputs {
                 want_hdr: true,
@@ -3169,8 +3356,9 @@ mod tests {
     // functions the logging sites call.
 
     use super::{
-        consumer_kind, resolved_capture_arm, CaptureArm, ConsumerKind, FenceWaitStats,
-        PassthroughFallback, PassthroughFallbacks, PoolCensus, FENCE_WAIT_BUCKETS_US,
+        consumer_kind, encoder_modifiers_for, passthrough_fallback_action, resolved_capture_arm,
+        CaptureArm, ConsumerKind, FenceWaitStats, PassthroughFallback, PassthroughFallbackAction,
+        PassthroughFallbacks, PoolCensus, ZeroCopyPolicy, FENCE_WAIT_BUCKETS_US,
     };
 
     /// PyroWave wins even when it also flips `backend_is_vaapi` on (`linux_zero_copy_is_vaapi`
@@ -3184,12 +3372,12 @@ mod tests {
 
     #[test]
     fn consumer_kinds_and_which_ones_a_cpu_arm_degrades() {
-        assert_eq!(consumer_kind(false, true, true), ConsumerKind::Vaapi);
+        assert_eq!(consumer_kind(false, true, true), ConsumerKind::AmdIntel);
         assert_eq!(consumer_kind(false, false, true), ConsumerKind::Nvenc);
         // No GPU backend ⇒ the software encoder, whose native input IS CPU frames.
         assert_eq!(consumer_kind(false, false, false), ConsumerKind::Software);
         assert!(ConsumerKind::PyroWave.cpu_is_downgrade());
-        assert!(ConsumerKind::Vaapi.cpu_is_downgrade());
+        assert!(ConsumerKind::AmdIntel.cpu_is_downgrade());
         assert!(ConsumerKind::Nvenc.cpu_is_downgrade());
         assert!(!ConsumerKind::Software.cpu_is_downgrade());
     }
@@ -3254,11 +3442,13 @@ mod tests {
         assert_eq!(f.note(PassthroughFallback::DupFailed), None);
         assert_eq!(f.note(PassthroughFallback::NoFormat), Some(1004));
         assert_eq!(f.note(PassthroughFallback::NoFourcc), Some(1005));
+        assert_eq!(f.note(PassthroughFallback::UnalignedPitch), Some(1006));
         for r in [
             PassthroughFallback::NoFormat,
             PassthroughFallback::NotDmabuf,
             PassthroughFallback::NoFourcc,
             PassthroughFallback::DupFailed,
+            PassthroughFallback::UnalignedPitch,
         ] {
             assert_eq!(f.note(r), None);
         }
@@ -3273,6 +3463,8 @@ mod tests {
             PassthroughFallback::NotDmabuf,
             PassthroughFallback::NoFourcc,
             PassthroughFallback::DupFailed,
+            PassthroughFallback::UnalignedPitch,
+            PassthroughFallback::NoHold,
         ];
         let mut f = PassthroughFallbacks::default();
         for r in all {
@@ -3283,11 +3475,64 @@ mod tests {
             assert!(!r.as_str().is_empty());
             assert!(!r.hint().is_empty());
         }
-        // Only `NoFormat` drops the frame; the other three downgrade it.
+        // Only `NoFormat` drops the frame; the other five downgrade it.
         assert!(!PassthroughFallback::NoFormat.falls_back_to_cpu());
         assert!(PassthroughFallback::NotDmabuf.falls_back_to_cpu());
         assert!(PassthroughFallback::NoFourcc.falls_back_to_cpu());
         assert!(PassthroughFallback::DupFailed.falls_back_to_cpu());
+        assert!(PassthroughFallback::UnalignedPitch.falls_back_to_cpu());
+        assert!(PassthroughFallback::NoHold.falls_back_to_cpu());
+    }
+
+    /// A tiled buffer can never take the CPU de-pad — any failure on a nonzero
+    /// modifier retires the tiled offer and rebuilds the capture on LINEAR.
+    /// LINEAR keeps the per-reason split.
+    #[test]
+    fn tiled_passthrough_failures_rebuild_on_linear() {
+        let all = [
+            PassthroughFallback::NoFormat,
+            PassthroughFallback::NotDmabuf,
+            PassthroughFallback::NoFourcc,
+            PassthroughFallback::DupFailed,
+            PassthroughFallback::UnalignedPitch,
+            PassthroughFallback::NoHold,
+        ];
+        for reason in all {
+            for modifier in [1u64, 0x100000000000001, 0x200000000000a04] {
+                assert_eq!(
+                    passthrough_fallback_action(reason, modifier),
+                    PassthroughFallbackAction::DropTiledAndRebuild,
+                    "{reason:?} on modifier {modifier:#x} must refuse the tiled offer"
+                );
+            }
+            let linear = passthrough_fallback_action(reason, 0);
+            let want = match reason {
+                PassthroughFallback::NoFormat => PassthroughFallbackAction::Drop,
+                _ => PassthroughFallbackAction::Cpu,
+            };
+            assert_eq!(linear, want, "{reason:?} on LINEAR");
+        }
+    }
+
+    /// The lookup clones only the exact fourcc's list, drops LINEAR entries and
+    /// duplicates, and answers empty for a fourcc the encoder never proved.
+    #[test]
+    fn encoder_modifiers_lookup_is_exact_and_linear_stripped() {
+        const XR24: u32 = 0x34325258;
+        const AR24: u32 = 0x34325241;
+        let policy = ZeroCopyPolicy {
+            encoder_modifiers: vec![(
+                XR24,
+                vec![0x100000000000001, 0, 0x100000000000001, 0x100000000000002],
+            )],
+            ..Default::default()
+        };
+        assert_eq!(
+            encoder_modifiers_for(&policy, XR24),
+            vec![0x100000000000001, 0x100000000000002]
+        );
+        assert!(encoder_modifiers_for(&policy, AR24).is_empty());
+        assert!(encoder_modifiers_for(&policy, 0xdeadbeef).is_empty());
     }
 
     // A p99 one bucket low would call the wait free; one bucket high would justify moving

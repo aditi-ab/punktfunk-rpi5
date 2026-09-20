@@ -341,12 +341,15 @@ fn open_video_backend_linux(
         {
             // Worker seam, not the encoder: GPU-priority needs `CAP_SYS_NICE`,
             // which only `punktfunk-encode-worker` may carry. See `pyrowave_remote`.
+            // `format.is_hdr()` marks the BT.2020 PQ capture — 10-bit without it is SDR.
             return pyrowave_remote::open_preferring_worker(
                 width,
                 height,
                 fps,
                 bitrate_bps,
                 chroma,
+                bit_depth,
+                format.is_hdr(),
             )
             .map(|e| (e, "pyrowave"));
         }
@@ -487,6 +490,8 @@ fn open_video_backend_linux(
                     fps,
                     bitrate_bps,
                     ChromaFormat::Yuv420,
+                    bit_depth,
+                    format.is_hdr(),
                 )
                 .map(|e| (e, "pyrowave"))
             }
@@ -682,12 +687,23 @@ fn vulkan_encode_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether `bit_depth`/`hdr` describes a frame a native planar source can carry: 8-bit SDR is
+/// NV12 and HDR is P010, but 10-bit SDR captures 8-bit packed RGB that must pass through the
+/// BT.709 widening CSC — native NV12 cannot be a P010 source there.
+#[cfg(target_os = "linux")]
+const fn native_planar_depth_matches(bit_depth: u8, hdr: bool) -> bool {
+    bit_depth < 10 || hdr
+}
+
 /// Whether this session can ingest a producer's own NV12 without a host pass. Both AMD/Intel
 /// lanes can: Vulkan Video imports it as its picture, the native libva session encodes it as
 /// imported. AV1 is Vulkan Video's alone. The NVENC lane's fused convert reads RGB only.
 #[cfg(target_os = "linux")]
-pub fn linux_native_nv12_ok(codec: Codec) -> bool {
+pub fn linux_native_nv12_ok(codec: Codec, bit_depth: u8, hdr: bool) -> bool {
     if !linux_zero_copy_is_vaapi() {
+        return false;
+    }
+    if !native_planar_depth_matches(bit_depth, hdr) {
         return false;
     }
     match codec {
@@ -698,16 +714,15 @@ pub fn linux_native_nv12_ok(codec: Codec) -> bool {
     }
 }
 
-/// May the capture hand the NVENC lane its held dmabufs? The encoder's zero-copy worker then
-/// converts each straight into a registered input slot (`PUNKTFUNK_NVENC_RAW`). Off without
-/// direct-SDK NVENC, on the VAAPI plane, or once the raw-dmabuf latch tripped.
+/// May capture plan the NVENC raw-dmabuf lane? Its identity-scoped health applies the
+/// failure latch later, where the node id is known. Off without direct-SDK NVENC or on
+/// the AMD/Intel plane.
 #[cfg(target_os = "linux")]
 pub fn linux_nvenc_raw_dmabuf_ok() -> bool {
     #[cfg(feature = "nvenc")]
     {
         !linux_zero_copy_is_vaapi()
             && pf_zerocopy::nvenc_raw_enabled()
-            && !pf_zerocopy::raw_dmabuf_import_disabled()
             && pf_zerocopy::fused_convert_available()
     }
     #[cfg(not(feature = "nvenc"))]
@@ -941,6 +956,45 @@ fn linux_resolved_backend() -> LinuxBackend {
 #[cfg(all(target_os = "linux", feature = "pyrowave"))]
 pub fn pyrowave_capture_modifiers(fourcc: u32) -> Vec<u64> {
     pyrowave::capture_modifiers(fourcc)
+}
+
+/// Tiled dmabuf modifiers the session's encoder lane proved it can import for
+/// the capture `fourcc` — what the gamescope producer's tiled offer narrows to.
+/// Empty means LINEAR-only. Each lane returns its own proved list: Vulkan
+/// Video answers come from the packed-usage probes, VAAPI answers from
+/// `Display::import_dmabuf` + VPP, never one lane filtered by the other.
+#[cfg(target_os = "linux")]
+pub fn linux_capture_modifiers(codec: Codec, fourcc: u32, bit_depth: u8, hdr: bool) -> Vec<u64> {
+    #[cfg(feature = "pyrowave")]
+    if codec == Codec::PyroWave {
+        return pyrowave_capture_modifiers(fourcc);
+    }
+    // A build without PyroWave has no module to ask; advertise LINEAR.
+    #[cfg(not(feature = "pyrowave"))]
+    if codec == Codec::PyroWave {
+        return Vec::new();
+    }
+    // Same Vulkan arm as `open_amd_intel`, depth included: 10-bit SDR HEVC stays
+    // on VAAPI, so its capture answers come from the libva probe below.
+    #[cfg(not(feature = "vulkan-encode"))]
+    let _ = (bit_depth, hdr);
+    #[cfg(feature = "vulkan-encode")]
+    let ten_bit = bit_depth >= 10;
+    #[cfg(feature = "vulkan-encode")]
+    let vulkan_lane = !(ten_bit && !hdr && codec == Codec::H265)
+        && matches!(codec, Codec::H265 | Codec::Av1)
+        && vulkan_encode_enabled()
+        && vulkan_encode_available_at(codec, ten_bit);
+    #[cfg(not(feature = "vulkan-encode"))]
+    let vulkan_lane = false;
+    if vulkan_lane {
+        #[cfg(feature = "vulkan-encode")]
+        {
+            return vulkan_video::vulkan_capture_modifiers(codec, fourcc, ten_bit);
+        }
+    }
+    let candidates = vk_util::sampled_capture_modifiers(fourcc);
+    vaapi_native::vaapi_capture_modifiers(fourcc, &candidates)
 }
 
 /// True if the Linux GPU backend is VAAPI rather than NVENC — so capture
@@ -1198,9 +1252,11 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
         return false;
     }
     if codec == Codec::PyroWave {
-        // Wavelet is depth-agnostic. HDR CSC exists on the Windows IDD-push
-        // path only; Linux capture has no HDR. See `design/pyrowave-444-hdr.md`.
-        return cfg!(target_os = "windows");
+        // Wavelet is depth-agnostic; the CSC runs on the encoder's own Vulkan device, so
+        // 10-bit needs no encode-profile probe — just the `pyrowave` backend existing on
+        // this OS (Linux/Windows only). See `design/pyrowave-444-hdr.md`.
+        return cfg!(target_os = "windows")
+            || (cfg!(target_os = "linux") && cfg!(feature = "pyrowave"));
     }
     // Per (selected GPU, codec) so a console preference change re-probes.
     static CACHE: OnceLock<Mutex<HashMap<(String, &'static str), bool>>> = OnceLock::new();
@@ -1462,6 +1518,11 @@ fn vulkan_sdr10_available(_codec: Codec) -> bool {
 }
 #[cfg(target_os = "linux")]
 pub fn backend_carries_sdr10(codec: Codec) -> bool {
+    // PyroWave's own CSC widens packed RGB to 10-bit (`rgb2yuv10_709.comp` / the 4:4:4
+    // twin) on its private Vulkan device — the resolved H.26x backend is irrelevant.
+    if codec == Codec::PyroWave {
+        return cfg!(feature = "pyrowave");
+    }
     // Direct NVENC (HEVC + AV1) widens 8→10 from packed RGB. On AMD/Intel, VAAPI carries HEVC
     // Main10 under BT.709, and Vulkan Video carries AV1 10-bit SDR (`rgb2yuv10_709.comp`) where the
     // device offers a 10-bit AV1 profile. The encoder degrades a planar surface to 8-bit if some
@@ -1648,11 +1709,10 @@ mod vk_valve_rgb;
 #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
 #[path = "enc/linux/vk_intra_refresh.rs"]
 mod vk_intra_refresh;
-// Shared ash helpers (dmabuf import, image/memory) for the Linux Vulkan backends.
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "vulkan-encode", feature = "pyrowave")
-))]
+// Shared ash helpers (dmabuf import, image/memory, the device pick) for the
+// Linux Vulkan backends — plus `sampled_capture_modifiers`, which the VAAPI
+// modifier offer needs even without those features.
+#[cfg(target_os = "linux")]
 #[path = "enc/linux/vk_util.rs"]
 mod vk_util;
 // PyroWave: Vulkan-compute intra wavelet. Explicit `PUNKTFUNK_ENCODER=pyrowave`.
@@ -1970,6 +2030,17 @@ mod tests {
             resolve_linux_backend("vaapi", no_probe, true),
             Some(AmdIntel)
         );
+    }
+
+    /// Native-planar depth parity: 8-bit SDR (NV12) and HDR (P010) may take the
+    /// native source; 10-bit SDR must not — it captures 8-bit packed RGB for the
+    /// widening CSC and native NV12 cannot be a P010 source.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_planar_depth_matches_excludes_ten_bit_sdr() {
+        assert!(native_planar_depth_matches(8, false));
+        assert!(native_planar_depth_matches(10, true));
+        assert!(!native_planar_depth_matches(10, false));
     }
 
     /// Linux dispatch through the resolver, GPU-free via the software arm.

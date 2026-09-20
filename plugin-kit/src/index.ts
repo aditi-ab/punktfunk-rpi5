@@ -1,5 +1,11 @@
 // @punktfunk/plugin-kit — Effect-based framework for punktfunk plugins.
 
+export {
+	type AccessRequestOutcome,
+	type AccessRequestPath,
+	requestAccess,
+	unreachable,
+} from "./access.js";
 export { type CacheStore, makeCacheStore } from "./cache-store.js";
 export { type CliCommand, runPluginCli } from "./cli.js";
 export { type ConfigService, makeConfigService } from "./config.js";

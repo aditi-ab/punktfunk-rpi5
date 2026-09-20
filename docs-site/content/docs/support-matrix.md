@@ -190,7 +190,7 @@ newer on AMD, Arc and newer on Intel).
 | Linux · NVIDIA | NVENC (direct SDK) | probed ¹ | ✅ ⁶ | ⚠️ ² |
 | Linux · AMD, Intel | Vulkan Video | HEVC, AV1 ⁷ | ⚠️ probed | ❌ |
 | Linux · AMD, Intel | VAAPI | probed | ⚠️ probed | ❌ ⁹ |
-| Linux · any | PyroWave | wavelet ⁵ | ❌ ⁸ | ✅ |
+| Linux · any | PyroWave | wavelet ⁵ | ✅ ⁸ | ✅ |
 | Linux · none | software H.264 ¹⁰ | H.264 only | ❌ | ❌ |
 
 1. H.264, HEVC and AV1, intersected with what the driver reports. If the probe cannot run (no
@@ -199,9 +199,10 @@ newer on AMD, Arc and newer on Intel).
 2. HEVC only, and only when the GPU's 4:4:4 capability bit says yes. **HDR and 4:4:4 together
    depend on the platform.** On Windows they compose: the IDD-push capturer converts the FP16
    desktop to packed 10-bit BT.2020 PQ RGB and NVENC encodes HEVC Main 4:4:4 10, so a session gets
-   both. On Linux 4:4:4 rides an 8-bit `YUV444P` route, so a session that negotiates both resolves
-   the bit depth back to 8 — full chroma wins and the stream is SDR. Either way the answer is
-   settled before the Welcome, so the client is never told one thing and sent another.
+   both. On Linux the H.26x 4:4:4 route is 8-bit `YUV444P`, so an HEVC session that negotiates
+   both resolves to HDR at 4:2:0 — while a PyroWave session keeps 10-bit 4:4:4 because its own
+   colour conversion is depth-native. Either way the answer is settled before the Welcome, so
+   the client is never told one thing and sent another.
 3. A hardware limitation of AMD's encode block, not a gap in Punktfunk. VCN never encodes 4:4:4,
    so there is nothing to probe.
 4. Only in a build that includes the native QSV backend — which the shipped installer does. In a
@@ -219,7 +220,9 @@ newer on AMD, Arc and newer on Intel).
    Vulkan open that fails falls back to the native VAAPI session, which takes a producer's
    NV12 as it is (no conversion pass), so a gamescope session that negotiated NV12 keeps
    streaming either way.
-8. PyroWave is 8-bit on Linux. The 10-bit path exists only on Windows.
+8. PyroWave's own colour conversion is depth-native, so 10-bit needs no GPU encode probe —
+   on Linux it covers 10-bit SDR and BT.2020 PQ alike. HDR still needs a 10-bit PQ source:
+   the same gamescope route every codec uses, see [HDR](/docs/hdr).
 9. Not a hardware limit — the VAAPI backend simply has no 4:4:4 path yet, so the probe declines
    unconditionally and the session is negotiated as 4:2:0.
 10. Explicit-only on Linux. `auto` never resolves here — a box with no usable GPU driver fails the

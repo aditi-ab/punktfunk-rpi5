@@ -4,6 +4,12 @@
 // SAFETY comment that only restates the signature. Exit: delete unmarked
 // calls; do not wrap them.
 #![allow(unsafe_op_in_unsafe_fn)]
+// Compiled for every Linux build: `sampled_capture_modifiers` feeds the VAAPI
+// modifier offer even without `vulkan-encode`/`pyrowave`, which own the rest.
+#![cfg_attr(
+    not(any(feature = "vulkan-encode", feature = "pyrowave")),
+    allow(dead_code, unused_imports)
+)]
 
 use anyhow::Result;
 use ash::vk;
@@ -12,6 +18,122 @@ use pf_frame::PixelFormat;
 pub(super) fn ext_advertised(exts: &[vk::ExtensionProperties], name: &std::ffi::CStr) -> bool {
     // Bounded: a missing NUL is `Err` (non-match), not a walk past the array.
     exts.iter().any(|e| e.extension_name_as_c_str() == Ok(name))
+}
+
+pub(crate) struct PickedDevice {
+    pub pd: vk::PhysicalDevice,
+    /// Graphics+compute queue family. PyroWave's device create-info requires graphics;
+    /// CSC + codec run on it.
+    #[cfg(feature = "pyrowave")]
+    pub family: u32,
+    #[cfg(feature = "pyrowave")]
+    pub vendor_id: u32,
+    #[cfg(feature = "pyrowave")]
+    pub device_id: u32,
+}
+
+/// First non-CPU Vulkan device with a graphics+compute family.
+///
+/// Do not switch this to `pf_gpu::selected_gpu()`: that picks "the NVIDIA GPU"
+/// whenever `/dev/nvidiactl` exists, which on an Intel-compositor + NVIDIA-present
+/// laptop is the GPU that cannot import the compositor's dmabufs and trips the
+/// process-wide raw-dmabuf latch. Do not anchor on `/dev/dri/renderD128`: render
+/// minors are driver bind-order, not display topology (amdgpu binds first → idle
+/// iGPU while the compositor allocates on NVIDIA).
+///
+/// The right oracle is which device allocated the capture buffers; that plumbing
+/// is not here. Shared with every capture-modifier probe so capture and encode
+/// never disagree about the device across an in-place resize that does not
+/// renegotiate.
+///
+/// # Safety
+/// `instance` must be live; only physical-device property/queue queries.
+pub(crate) unsafe fn select_physical_device(instance: &ash::Instance) -> Result<PickedDevice> {
+    for pd in instance.enumerate_physical_devices()? {
+        let props = instance.get_physical_device_properties(pd);
+        if props.device_type == vk::PhysicalDeviceType::CPU {
+            continue;
+        }
+        let Some(family) = instance
+            .get_physical_device_queue_family_properties(pd)
+            .iter()
+            .position(|q| {
+                q.queue_flags
+                    .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+            })
+        else {
+            continue;
+        };
+        #[cfg(not(feature = "pyrowave"))]
+        let _ = family;
+        return Ok(PickedDevice {
+            pd,
+            #[cfg(feature = "pyrowave")]
+            family: family as u32,
+            #[cfg(feature = "pyrowave")]
+            vendor_id: props.vendor_id,
+            #[cfg(feature = "pyrowave")]
+            device_id: props.device_id,
+        });
+    }
+    Err(anyhow::anyhow!(
+        "no Vulkan GPU with a graphics+compute queue"
+    ))
+}
+
+/// DRM modifiers this device can import as a SAMPLED packed-RGB image for
+/// `fourcc`. The upper bound every capture offer narrows from; driver order,
+/// deduplicated, one memory plane. Unknown fourcc, or no loader/instance/device,
+/// is an empty list, not an error.
+pub(crate) fn sampled_capture_modifiers(fourcc: u32) -> Vec<u64> {
+    let Some(fmt) = fourcc_to_vk(fourcc) else {
+        return Vec::new();
+    };
+    // SAFETY: fresh instance, plain physical-device property queries, destroyed before
+    // returning; nothing borrows across the call.
+    unsafe {
+        let Ok(entry) = ash::Entry::load() else {
+            return Vec::new();
+        };
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+        let Ok(instance) = entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&app),
+            None,
+        ) else {
+            return Vec::new();
+        };
+        let pd = select_physical_device(&instance).ok().map(|p| p.pd);
+        let mods = pd
+            .map(|pd| {
+                let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+                let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+                instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
+                let n = list.drm_format_modifier_count as usize;
+                let mut props = vec![vk::DrmFormatModifierPropertiesEXT::default(); n];
+                list.p_drm_format_modifier_properties = props.as_mut_ptr();
+                let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+                instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
+                props.truncate(list.drm_format_modifier_count as usize);
+                let mut out: Vec<u64> = Vec::new();
+                for p in props {
+                    if !p
+                        .drm_format_modifier_tiling_features
+                        .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+                        // Capture hands one fd/offset/stride.
+                        || p.drm_format_modifier_plane_count != 1
+                    {
+                        continue;
+                    }
+                    if !out.contains(&p.drm_format_modifier) {
+                        out.push(p.drm_format_modifier);
+                    }
+                }
+                out
+            })
+            .unwrap_or_default();
+        instance.destroy_instance(None);
+        mods
+    }
 }
 
 pub(crate) fn color_range(layer: u32) -> vk::ImageSubresourceRange {
@@ -139,6 +261,14 @@ pub(crate) fn import_failure_feeds_latch(e: &anyhow::Error) -> bool {
             r != vk::Result::ERROR_OUT_OF_DEVICE_MEMORY && r != vk::Result::ERROR_OUT_OF_HOST_MEMORY
         }
         None => true,
+    }
+}
+
+/// Feed a deterministic dmabuf rejection to this capture's health. A completed
+/// latch marks the capturer broken so the next tick rebuilds its offer.
+pub(crate) fn reject_dmabuf(d: &pf_frame::DmabufFrame, reason: &str) {
+    if d.health.note_raw_import_failure(d.modifier, reason) {
+        d.rebuild.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -488,5 +618,25 @@ mod tests {
         assert_eq!(f, PixelFormat::Bgra);
         assert!(std::ptr::eq(b.as_ptr(), src.as_ptr()));
         assert!(scratch.is_empty());
+    }
+
+    #[test]
+    fn tiled_rejection_marks_the_capture_for_rebuild() {
+        let rebuild = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let frame = pf_frame::DmabufFrame {
+            fd: std::fs::File::open("/dev/null").unwrap().into(),
+            fourcc: u32::from_le_bytes(*b"XR24"),
+            modifier: 7,
+            plane1: None,
+            offset: 0,
+            stride: 256,
+            hold: None,
+            health: pf_zerocopy::zero_copy_health(0x4001),
+            rebuild: rebuild.clone(),
+        };
+        reject_dmabuf(&frame, "test rejection");
+        assert!(rebuild.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(frame.health.passthrough_tiled_refused());
+        assert!(!frame.health.raw_disabled(), "LINEAR remains available");
     }
 }

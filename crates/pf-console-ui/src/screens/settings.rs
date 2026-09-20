@@ -83,7 +83,8 @@ pub enum RowId {
     FollowOsTheme,
     Palette,
     ReduceMotion,
-    /// Android-only. Draw the console at 1080p; a 4K panel otherwise pays 4× fill.
+    /// The TV clients' low-cost interface mode: Android caps its surface at 1080p,
+    /// both draw the backdrop small and slow. The TVs default it on.
     ReduceUiResolution,
     /// Same `library_view` key the library bar writes.
     LibraryView,
@@ -135,6 +136,7 @@ mod android_keys {
 mod webos_keys {
     pub const AUDIO_ROUTE: &str = "webos.audio_route";
     pub const CURSOR_GESTURES: &str = "webos.cursor_gestures";
+    pub const REDUCE_UI_RES: &str = "webos.reduce_ui_resolution";
 }
 
 /// Stored `webos.audio_route` values, spelled as that client's enum serializes.
@@ -184,6 +186,38 @@ fn toggle_extra(
     toggle(&mut v, delta, wrap)?;
     set_extra_bool(s, key, v);
     Some(())
+}
+
+/// The `extra` key behind [`RowId::ReduceUiResolution`] on this platform. Each TV client
+/// persists its own — the names are what Kotlin (`ConsoleJson`) and the webOS store share.
+fn reduce_ui_key(platform: crate::platform::Platform) -> &'static str {
+    use crate::platform::Platform;
+    match platform {
+        Platform::WebOS => webos_keys::REDUCE_UI_RES,
+        _ => android_keys::REDUCE_UI_RES,
+    }
+}
+
+/// The value an unwritten [`reduce_ui_key`] resolves to: on for the TV shells — a webOS set
+/// always is one, and an Android host without the touch fallback is the box plugged into a
+/// panel far faster than its GPU. Off elsewhere, where the GPU is not the bottleneck.
+fn reduce_ui_default(platform: crate::platform::Platform, fallback_ui: bool) -> bool {
+    use crate::platform::Platform;
+    platform == Platform::WebOS || (platform == Platform::Android && !fallback_ui)
+}
+
+/// The resolved "Reduce interface resolution" flag. The settings rows read it; the shell's
+/// backdrop pass reads the same answer — one switch carries both savings.
+pub(crate) fn reduce_ui_res(
+    s: &pf_client_core::trust::Settings,
+    platform: crate::platform::Platform,
+    fallback_ui: bool,
+) -> bool {
+    extra_bool(
+        s,
+        reduce_ui_key(platform),
+        reduce_ui_default(platform, fallback_ui),
+    )
 }
 
 // Tab names match Apple/Android (`console-vectors.json`). Presets is empty here:
@@ -1008,9 +1042,9 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
     let on: &[Platform] = match id {
         // Phone sensors and the Steam Controller 2 dongle: hardware a TV does not have.
         RowId::PhoneRumble | RowId::PhoneGyro | RowId::Sc2Passthrough => &[Android],
-        // Android's own render-scale knob. webOS gets a 1080p surface from the compositor
-        // whatever it asks for, so the quantity does not exist there.
-        RowId::ReduceUiResolution => &[Android],
+        // The weak-GPU row. On Android it also shrinks the surface; webOS's compositor
+        // already hands a 1080p buffer, so there it is the cheaper backdrop alone.
+        RowId::ReduceUiResolution => &[Android, WebOS],
         // A MediaCodec decoder flag; nothing else has the knob.
         RowId::LowLatency => &[Android],
         // The clients whose presenters place the picture through `video_fit`.
@@ -1419,7 +1453,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::ReduceUiResolution => (
             None,
             "Reduce interface resolution",
-            on_off(extra_bool(s, android_keys::REDUCE_UI_RES, false)).into(),
+            on_off(reduce_ui_res(s, ctx.platform, ctx.fallback_ui)).into(),
         ),
         RowId::LibraryView => (
             None,
@@ -1677,12 +1711,20 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
              fades. Also the gentler choice on an OLED, where a still field can sit for \
              hours."
         }
-        RowId::ReduceUiResolution => {
-            "Draws the menus at 1080p and lets the display scale them up. Text goes a \
-             little softer; the console gets much smoother on a 4K TV or projector, whose \
-             graphics chip is far slower than the panel in front of it. Nothing about a \
-             stream changes — this is the interface only."
-        }
+        RowId::ReduceUiResolution => match platform {
+            Platform::WebOS => {
+                "Draws the animated backdrop small and steps it slower, so the console \
+                 stays smooth on this TV's graphics chip. Nothing about a stream changes \
+                 — this is the interface only."
+            }
+            _ => {
+                "Draws the menus at 1080p — the backdrop cheaper, too — and lets the \
+                 display scale them up. Text goes a little softer; the console gets much \
+                 smoother on a 4K TV or projector, whose graphics chip is far slower than \
+                 the panel in front of it. Nothing about a stream changes — this is the \
+                 interface only."
+            }
+        },
         RowId::LibraryView => {
             "Shelf shows one cover at a time, big. Grid shows about eighteen at once — \
              for when you already know what you are looking for. The library's own bar \
@@ -2039,9 +2081,13 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, all.len(), delta, wrap).map(|i| s.ui_palette = all[i].id.to_string())
         }
         RowId::ReduceMotion => toggle(&mut s.reduce_motion, delta, wrap),
-        RowId::ReduceUiResolution => {
-            toggle_extra(s, android_keys::REDUCE_UI_RES, false, delta, wrap)
-        }
+        RowId::ReduceUiResolution => toggle_extra(
+            s,
+            reduce_ui_key(platform),
+            reduce_ui_default(platform, ctx.fallback_ui),
+            delta,
+            wrap,
+        ),
         RowId::LibraryView => {
             let all = &crate::library::LibraryView::ALL;
             let cur = crate::library::LibraryView::parse(&s.library_view);
@@ -2334,6 +2380,65 @@ pub(crate) mod tests {
             t: 0.0,
         };
         f(&mut ctx);
+    }
+
+    /// Default-on where the GPU is the weak part; a stored value always wins over
+    /// the platform default, in both directions.
+    #[test]
+    fn reduce_ui_res_defaults_on_for_tvs_and_stays_revertible() {
+        use crate::platform::Platform;
+        let s = Settings::default();
+        assert!(reduce_ui_res(&s, Platform::WebOS, true));
+        assert!(reduce_ui_res(&s, Platform::WebOS, false));
+        assert!(reduce_ui_res(&s, Platform::Android, false));
+        assert!(!reduce_ui_res(&s, Platform::Android, true));
+        assert!(!reduce_ui_res(&s, Platform::Desktop, false));
+
+        let mut off = s.clone();
+        off.extra.insert(
+            "webos.reduce_ui_resolution".into(),
+            serde_json::Value::Bool(false),
+        );
+        assert!(!reduce_ui_res(&off, Platform::WebOS, true));
+        let mut on = s;
+        on.extra.insert(
+            "android.reduce_ui_resolution".into(),
+            serde_json::Value::Bool(true),
+        );
+        assert!(reduce_ui_res(&on, Platform::Android, true));
+    }
+
+    /// Each TV client owns its key: stepping the row on webOS writes `webos.*`,
+    /// the same place that client's store and the shell's backdrop read.
+    #[test]
+    fn the_row_writes_the_platforms_own_key() {
+        with_ctx(|ctx| {
+            ctx.platform = crate::platform::Platform::WebOS;
+            assert!(adjust(RowId::ReduceUiResolution, -1, false, ctx));
+            assert_eq!(
+                ctx.settings
+                    .extra
+                    .get("webos.reduce_ui_resolution")
+                    .and_then(|v| v.as_bool()),
+                Some(false)
+            );
+            assert!(!ctx
+                .settings
+                .extra
+                .contains_key("android.reduce_ui_resolution"));
+
+            // A phone defaults off, so stepping right writes an explicit On.
+            ctx.platform = crate::platform::Platform::Android;
+            ctx.fallback_ui = true;
+            assert!(adjust(RowId::ReduceUiResolution, 1, false, ctx));
+            assert_eq!(
+                ctx.settings
+                    .extra
+                    .get("android.reduce_ui_resolution")
+                    .and_then(|v| v.as_bool()),
+                Some(true)
+            );
+        });
     }
 
     #[test]

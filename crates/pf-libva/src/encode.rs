@@ -1,5 +1,5 @@
-//! An encode session over libva: config, context, surfaces, and one frame in one
-//! frame out — H.264 or HEVC, chosen at open.
+//! An encode session over libva: config, context, surfaces, and a short pending
+//! queue between enqueue and collect — H.264 or HEVC, chosen at open.
 //!
 //! The unsafe half of the native VAAPI encoder. What a picture *is* — the parameter
 //! sets, the parameter buffers — comes from [`pf_vaapi`], which is pure and tested
@@ -13,6 +13,7 @@
 //! long-term pictures; HEVC lists them in every slice header's reference picture
 //! set.
 
+use std::collections::VecDeque;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
 
@@ -49,6 +50,15 @@ const VA_PROFILE_H264_HIGH: c_int = 7;
 const VA_CONFIG_ATTRIB_RT_FORMAT: u32 = 0;
 const VA_CONFIG_ATTRIB_RATE_CONTROL: u32 = 5;
 const VA_CONFIG_ATTRIB_ENC_PACKED_HEADERS: u32 = 10;
+/// `VASurfaceStatus`: work is still queued against the surface.
+const VA_SURFACE_RENDERING: c_int = 1;
+/// `VASurfaceStatus`: a display pipeline holds the surface.
+const VA_SURFACE_DISPLAYING: c_int = 2;
+/// The loaded runtime exposes `vaSyncBuffer`, but this driver does not implement it.
+const VA_STATUS_ERROR_UNIMPLEMENTED: c_int = 0x0000_0014;
+/// `vaSyncBuffer`: the exact coded output is not complete at the requested deadline.
+const VA_STATUS_ERROR_TIMEDOUT: c_int = 0x0000_0026;
+const VA_TIMEOUT_INFINITE: u64 = u64::MAX;
 
 /// `VAConfigAttrib`: a type/value pair, and the shape `vaCreateConfig` takes.
 #[repr(C)]
@@ -110,8 +120,24 @@ pub struct Stripe {
     pub rows: u16,
 }
 
-/// A live encode session. Owns its config, context, surfaces and coded buffer, and
-/// releases them in the order libva requires.
+/// One picture the driver is still encoding. Slot bookkeeping ran at enqueue —
+/// the queue is in-order, so a later picture may already name this one as its
+/// reference; [`Encoder::collect`] owes only the sync, the read-back and the
+/// per-picture releases.
+struct Pending {
+    /// The picture's source surface — what `vaSyncSurface` names.
+    surface: VaSurfaceId,
+    /// A producer-direct import, destroyed at collect; session inputs are not.
+    direct: Option<VaSurfaceId>,
+    /// Its coded buffer, returned to the free pool once read.
+    coded: VaBufferId,
+    is_idr: bool,
+    anchor: bool,
+    wire: i64,
+}
+
+/// A live encode session. Owns its config, context, surfaces and coded buffers,
+/// and releases them in the order libva requires.
 pub struct Encoder {
     display: Display,
     codec: Codec,
@@ -136,9 +162,17 @@ pub struct Encoder {
     free: Vec<VaSurfaceId>,
     /// The long-term references, by `LongTermFrameIdx`.
     slots: Vec<Option<Slot>>,
-    /// Pictures encoded so far; the next one's `wire`.
+    /// Pictures queued so far; the next one's `wire`.
     wire: i64,
-    coded_buf: VaBufferId,
+    /// The whole pool — one per pending encode, so a picture drains while the
+    /// next is written. `coded_free` is the submit-side bound: empty means the
+    /// pitch is full and a collect runs first.
+    coded: Vec<VaBufferId>,
+    coded_free: Vec<VaBufferId>,
+    /// Pictures submitted to the driver and not yet collected, in encode order.
+    pending: VecDeque<Pending>,
+    /// Collected early because a submit needed the coded buffer back.
+    ready: VecDeque<EncodedPicture>,
     /// Ingest: RGB captures are converted — a larger one scaled — into the input
     /// surface here. A producer's own NV12/P010 skips it (`direct`).
     vpp: Vpp,
@@ -146,7 +180,8 @@ pub struct Encoder {
     /// was made for.
     staging: Option<(VaSurfaceId, (u32, u32, u32))>,
     /// A producer's own NV12/P010 at the session's size: the next picture is encoded
-    /// straight from this import, no VPP pass. Destroyed once that encode has synced.
+    /// straight from this import, no VPP pass. Moves into `pending` at enqueue and
+    /// is destroyed at collect.
     direct: Option<VaSurfaceId>,
     /// The first direct picture has been logged; a field log, not a per-frame one.
     direct_seen: bool,
@@ -155,14 +190,18 @@ pub struct Encoder {
     frame_num: u16,
     /// Toggled on every IDR, so two in a row are told apart.
     idr_pic_id: u16,
-    /// Rolling index for the picture being encoded.
+    /// Rolling index for the picture being queued.
     next_surface: usize,
 }
 
 impl Encoder {
-    /// Surfaces: one being encoded, one holding the reference, one spare so the
-    /// next submit does not wait on the driver releasing the last.
-    const SURFACES: usize = 3;
+    /// Input surfaces rotate one past the four-picture encode pitch, so the surface a
+    /// submit fills is never one an in-flight encode still reads.
+    const SURFACES: usize = 5;
+
+    /// Coded buffers — the pending pitch, matching NVENC's default asynchronous depth.
+    /// Four lets VideoProc for the next frame overlap prior encode work under contention.
+    const CODED_BUFS: usize = 4;
 
     /// Open a session on `display`.
     pub fn new(display: Display, params: SessionParams, codec: CodecParams) -> Result<Self> {
@@ -369,21 +408,26 @@ impl Encoder {
         // at a low QP is far bigger than the average rate suggests; the uncompressed
         // frame is the bound that cannot be exceeded.
         let coded_size = (coded_w as u32 * coded_h as u32 * 3 / 2).max(1 << 20);
-        let mut coded_buf = VA_INVALID_ID;
-        // SAFETY: `context` is live, the size is non-zero, one element, and no
-        // initial data — which is what a coded (output) buffer takes.
-        let status = unsafe {
-            (display.va.create_buffer)(
-                display.display,
-                context,
-                vah::VA_ENC_CODED_BUFFER_TYPE,
-                coded_size,
-                1,
-                std::ptr::null_mut(),
-                &mut coded_buf,
-            )
-        };
-        display.va.check("vaCreateBuffer(coded)", status)?;
+        let mut coded = Vec::with_capacity(Self::CODED_BUFS);
+        for _ in 0..Self::CODED_BUFS {
+            let mut buf = VA_INVALID_ID;
+            // SAFETY: `context` is live, the size is non-zero, one element, and no
+            // initial data — which is what a coded (output) buffer takes.
+            let status = unsafe {
+                (display.va.create_buffer)(
+                    display.display,
+                    context,
+                    vah::VA_ENC_CODED_BUFFER_TYPE,
+                    coded_size,
+                    1,
+                    std::ptr::null_mut(),
+                    &mut buf,
+                )
+            };
+            display.va.check("vaCreateBuffer(coded)", status)?;
+            coded.push(buf);
+        }
+        let coded_free = coded.clone();
 
         let vpp = Vpp::new(&display, params.width, params.height)?;
 
@@ -401,7 +445,10 @@ impl Encoder {
             recon,
             slots: vec![None; slot_count],
             wire: 0,
-            coded_buf,
+            coded,
+            coded_free,
+            pending: VecDeque::new(),
+            ready: VecDeque::new(),
             vpp,
             staging: None,
             direct: None,
@@ -584,7 +631,9 @@ impl Encoder {
     /// Ingest a capture dmabuf, imported for this picture. A producer's own NV12/P010
     /// at the session's size and depth is encoded as imported; anything else is
     /// converted — and scaled down when larger — into the next input surface.
-    pub fn submit_dmabuf(&mut self, source: &DmabufSource) -> Result<()> {
+    /// `true` = the direct import was retained for encode (its producer hold must
+    /// outlive GPU completion); `false` = VPP already consumed the source.
+    pub fn submit_dmabuf(&mut self, source: &DmabufSource) -> Result<bool> {
         let rt_format = pf_vaapi::vpp::import_format(source.drm_fourcc)
             .map(|(_, rt)| rt)
             .ok_or_else(|| anyhow!("no ingest for DRM fourcc {:#x}", source.drm_fourcc))?;
@@ -608,7 +657,7 @@ impl Encoder {
                     "VAAPI: encoding the producer's own picture direct (no conversion pass)"
                 );
             }
-            return Ok(());
+            return Ok(true);
         }
         let converted = self.vpp.convert(
             &self.display,
@@ -619,15 +668,16 @@ impl Encoder {
             self.input_surface(),
         );
         self.display.destroy_surface(surface);
-        converted
+        converted.map(|()| false)
     }
 
-    /// Encode the picture currently in [`Self::input_surface`].
+    /// Queue the picture currently in [`Self::input_surface`]; [`Self::collect`]
+    /// hands the finished picture back.
     ///
     /// `force_idr` opens a GOP: SPS and PPS are packed ahead of the slice, so a
     /// client that joins here has parameter sets. Every other picture is a P
     /// predicted from the newest trusted slot — or an IDR when there is none.
-    pub fn encode(&mut self, force_idr: bool) -> Result<EncodedPicture> {
+    pub fn encode(&mut self, force_idr: bool) -> Result<()> {
         let newest = self
             .slots()
             .into_iter()
@@ -637,19 +687,20 @@ impl Encoder {
         self.encode_with(reference, false, None, false)
     }
 
-    /// Encode the picture predicting from `slot` — the recovery anchor a loss plan
+    /// Queue the picture predicting from `slot` — the recovery anchor a loss plan
     /// picked. Refuses a slot that is empty or distrusted.
-    pub fn encode_anchored(&mut self, slot: usize) -> Result<EncodedPicture> {
+    pub fn encode_anchored(&mut self, slot: usize) -> Result<()> {
         match self.slots.get(slot) {
             Some(Some(s)) if s.trusted => self.encode_with(Some(slot), true, None, false),
             _ => bail!("slot {slot} holds no trusted reference"),
         }
     }
 
-    /// One frame of an intra refresh wave: `stripe` is coded intra, the rest predicts
-    /// from the previous picture whatever its trust, and the result is stored `dirty`
-    /// until the wave's close. An IDR when the session holds no picture at all.
-    pub fn encode_wave(&mut self, stripe: Stripe, dirty: bool) -> Result<EncodedPicture> {
+    /// Queue one frame of an intra refresh wave: `stripe` is coded intra, the rest
+    /// predicts from the previous picture whatever its trust, and the result is
+    /// stored `dirty` until the wave's close. An IDR when the session holds no
+    /// picture at all.
+    pub fn encode_wave(&mut self, stripe: Stripe, dirty: bool) -> Result<()> {
         let previous = self
             .slots
             .iter()
@@ -660,13 +711,34 @@ impl Encoder {
         self.encode_with(previous, false, Some(stripe), dirty)
     }
 
+    /// A coded buffer for the next picture. Every one spoken for means the pitch
+    /// is full of pendings — collect the oldest first; that wait is the
+    /// submit-side bound, not caller latency.
+    fn acquire_coded(&mut self) -> Result<VaBufferId> {
+        if self.coded_free.is_empty() {
+            // `collect_pending`, not `collect`: a `ready` hit would hand back a picture
+            // without releasing a coded buffer, leaving none free below.
+            if let Some(picture) = self.collect_pending(true)? {
+                self.ready.push_back(picture);
+            }
+        }
+        self.coded_free
+            .pop()
+            .ok_or_else(|| anyhow!("no coded buffer free after a collect"))
+    }
+
+    /// Queue one picture: parameter buffers rendered, the encode submitted, the
+    /// slot bookkeeping done — the queue is in-order, so a later picture may
+    /// already name this one as its reference. [`Self::collect`] owes only the
+    /// sync, the read-back and the per-picture releases.
     fn encode_with(
         &mut self,
         reference: Option<usize>,
         anchor: bool,
         stripe: Option<Stripe>,
         dirty: bool,
-    ) -> Result<EncodedPicture> {
+    ) -> Result<()> {
+        let coded = self.acquire_coded()?;
         let is_idr = reference.is_none();
         let slot_count = self.slots.len();
         // HEVC names the kept pictures in every slice header, so a distrusted
@@ -694,7 +766,8 @@ impl Encoder {
             max_slots: slot_count as u8,
             reference_slot: reference.map(|s| s as u8),
         };
-        let surface = self.direct.unwrap_or(self.input[self.next_surface]);
+        let direct = self.direct.take();
+        let surface = direct.unwrap_or(self.input[self.next_surface]);
         let recon = self
             .free
             .pop()
@@ -710,9 +783,9 @@ impl Encoder {
 
         let mut owned: Vec<VaBufferId> = Vec::new();
         let result = match self.codec {
-            Codec::H264 => self.render_picture(&mut owned, &sps, &pps, recon, slice, stripe),
+            Codec::H264 => self.render_picture(&mut owned, &sps, &pps, recon, coded, slice, stripe),
             Codec::Hevc(hevc) => {
-                self.render_picture_hevc(&mut owned, &hevc, recon, poc, slice, stripe)
+                self.render_picture_hevc(&mut owned, &hevc, recon, coded, poc, slice, stripe)
             }
         }
         .and_then(|()| self.render_ids(&mut owned.clone()));
@@ -733,25 +806,16 @@ impl Encoder {
             if !self.free.contains(&recon) {
                 self.free.push(recon);
             }
+            self.coded_free.push(coded);
+            if let Some(direct) = direct {
+                self.display.destroy_surface(direct);
+            }
             return Err(e);
         }
 
-        // SAFETY: `surface` is live; sync blocks until the encode that names it has
-        // completed, which is what makes the coded buffer readable.
-        let status = unsafe { (self.display.va.sync_surface)(self.display.display, surface) };
-        let synced = self.display.va.check("vaSyncSurface", status);
-        let bytes = synced.and_then(|()| self.read_coded());
-        self.clear_direct();
-        let bytes = match bytes {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                self.free.push(recon);
-                return Err(e);
-            }
-        };
-
-        // The picture is now the long-term reference in its slot. An IDR also
-        // emptied the decoder's DPB, so every other slot goes with it.
+        // The picture is the long-term reference in its slot from here — the encode
+        // may still run, but the queue is in-order so nothing later overtakes it.
+        // An IDR also emptied the decoder's DPB: every other slot goes with it.
         if is_idr {
             for slot in self.slots.iter_mut() {
                 if let Some(old) = slot.take() {
@@ -776,12 +840,87 @@ impl Encoder {
         let max_frame_num = 1u16 << (sps.log2_max_frame_num_minus4 + 4);
         self.frame_num = (slice.frame_num + 1) % max_frame_num;
         self.idr_pic_id = slice.idr_pic_id;
-        Ok(EncodedPicture {
-            bytes,
+        self.pending.push_back(Pending {
+            surface,
+            direct,
+            coded,
             is_idr,
-            recovery_anchor: anchor,
+            anchor,
             wire,
-        })
+        });
+        Ok(())
+    }
+
+    /// The next finished picture, in encode order — first anything collected
+    /// early, then the pending queue. `block` waits out the driver's surface;
+    /// without it a `vaQuerySurfaceStatus` probe decides and `None` means the
+    /// oldest is still rendering.
+    pub fn collect(&mut self, block: bool) -> Result<Option<EncodedPicture>> {
+        if let Some(picture) = self.ready.pop_front() {
+            return Ok(Some(picture));
+        }
+        self.collect_pending(block)
+    }
+
+    /// `true` when this picture's coded output is complete. New libva synchronizes the exact
+    /// output buffer; older runtimes retain the input-surface compatibility path.
+    fn pending_complete(&self, pending: &Pending, block: bool) -> Result<bool> {
+        if let Some(sync) = self.display.va.sync_buffer {
+            let timeout = if block { VA_TIMEOUT_INFINITE } else { 0 };
+            // SAFETY: `coded` is a live output buffer on this display; the call only waits or
+            // probes it and retains no pointer.
+            let status = unsafe { sync(self.display.display, pending.coded, timeout) };
+            if status != VA_STATUS_ERROR_UNIMPLEMENTED {
+                if !block && status == VA_STATUS_ERROR_TIMEDOUT {
+                    return Ok(false);
+                }
+                self.display.va.check("vaSyncBuffer", status)?;
+                return Ok(true);
+            }
+        }
+        if !block {
+            let mut status = 0;
+            // SAFETY: `surface` is live on this display and `status` is written through; the
+            // result is read only on `VA_STATUS_SUCCESS`.
+            let queried = unsafe {
+                (self.display.va.query_surface_status)(
+                    self.display.display,
+                    pending.surface,
+                    &mut status,
+                )
+            };
+            self.display.va.check("vaQuerySurfaceStatus", queried)?;
+            return Ok(status != VA_SURFACE_RENDERING && status != VA_SURFACE_DISPLAYING);
+        }
+        // SAFETY: the input surface is live and uniquely names this queued picture on the
+        // compatibility path.
+        self.display.va.check("vaSyncSurface", unsafe {
+            (self.display.va.sync_surface)(self.display.display, pending.surface)
+        })?;
+        Ok(true)
+    }
+
+    /// The pending queue half of [`Self::collect`], with `ready` untouched: the only shape
+    /// that guarantees a coded buffer comes back, so [`Self::acquire_coded`] calls it directly.
+    fn collect_pending(&mut self, block: bool) -> Result<Option<EncodedPicture>> {
+        let Some(pending) = self.pending.front() else {
+            return Ok(None);
+        };
+        if !self.pending_complete(pending, block)? {
+            return Ok(None);
+        }
+        let pending = self.pending.pop_front().expect("front checked above");
+        let bytes = self.read_coded(pending.coded);
+        self.coded_free.push(pending.coded);
+        if let Some(direct) = pending.direct {
+            self.display.destroy_surface(direct);
+        }
+        Ok(Some(EncodedPicture {
+            bytes: bytes?,
+            is_idr: pending.is_idr,
+            recovery_anchor: pending.anchor,
+            wire: pending.wire,
+        }))
     }
 
     /// Build and hand over every buffer this picture needs, in the order the
@@ -794,6 +933,7 @@ impl Encoder {
         sps: &cros_codecs::codec::h264::parser::Sps,
         pps: &cros_codecs::codec::h264::parser::Pps,
         recon: VaSurfaceId,
+        coded: VaBufferId,
         slice: PictureSlice,
         stripe: Option<Stripe>,
     ) -> Result<()> {
@@ -818,7 +958,7 @@ impl Encoder {
         }
 
         let mut pic = vah::VaEncPictureParameterBufferH264 {
-            coded_buf: self.coded_buf,
+            coded_buf: coded,
             frame_num: slice.frame_num,
             pic_init_qp: self.params.initial_qp,
             ..Default::default()
@@ -883,6 +1023,7 @@ impl Encoder {
         owned: &mut Vec<VaBufferId>,
         hevc: &HevcParams,
         recon: VaSurfaceId,
+        coded: VaBufferId,
         poc: i32,
         slice: PictureSlice,
         stripe: Option<Stripe>,
@@ -934,7 +1075,7 @@ impl Encoder {
         };
         let mut pic = vahevc::VaEncPictureParameterBufferHEVC {
             decoded_curr_pic: entry(recon, poc, false),
-            coded_buf: self.coded_buf,
+            coded_buf: coded,
             collocated_ref_pic_index: if hevc.features.temporal_mvp { 0 } else { 0xff },
             pic_init_qp: self.params.initial_qp,
             diff_cu_qp_delta_depth: hevc.diff_cu_qp_delta_depth(),
@@ -1117,12 +1258,11 @@ impl Encoder {
         self.display.va.check("vaRenderPicture", status)
     }
 
-    /// Copy the picture out of the coded buffer.
-    fn read_coded(&self) -> Result<Vec<u8>> {
+    /// Copy the picture out of `coded`.
+    fn read_coded(&self, coded: VaBufferId) -> Result<Vec<u8>> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `coded_buf` is live on this display and `ptr` is written through.
-        let status =
-            unsafe { (self.display.va.map_buffer)(self.display.display, self.coded_buf, &mut ptr) };
+        // SAFETY: `coded` is live on this display and `ptr` is written through.
+        let status = unsafe { (self.display.va.map_buffer)(self.display.display, coded, &mut ptr) };
         self.display.va.check("vaMapBuffer(coded)", status)?;
         if ptr.is_null() {
             bail!("vaMapBuffer(coded) returned success with a null pointer");
@@ -1158,7 +1298,7 @@ impl Encoder {
         })();
 
         // SAFETY: the buffer that was mapped, unmapped once, on every path.
-        let unmap = unsafe { (self.display.va.unmap_buffer)(self.display.display, self.coded_buf) };
+        let unmap = unsafe { (self.display.va.unmap_buffer)(self.display.display, coded) };
         let out = collected?;
         self.display.va.check("vaUnmapBuffer(coded)", unmap)?;
         Ok(out)
@@ -1167,17 +1307,28 @@ impl Encoder {
 
 impl Drop for Encoder {
     /// libva's teardown order: buffers, then context, then surfaces, then config.
-    /// The display is dropped last, by its own `Drop`.
+    /// Pending output is synchronized before the coded buffers are destroyed —
+    /// the driver may still be writing one — and each pending direct import goes
+    /// with its picture. The display is dropped last, by its own `Drop`.
     fn drop(&mut self) {
         self.vpp.destroy(&self.display);
         self.clear_direct();
         if let Some((staging, _)) = self.staging.take() {
             self.display.destroy_surface(staging);
         }
-        // SAFETY: every id was created on this display and is destroyed once. Drop
-        // runs after the last encode, and `sync_surface` has completed each one.
+        while let Some(pending) = self.pending.pop_front() {
+            // Best effort: teardown has no error path, but output storage stays live until this
+            // exact picture has been given a completion opportunity.
+            let _ = self.pending_complete(&pending, true);
+            if let Some(direct) = pending.direct {
+                self.display.destroy_surface(direct);
+            }
+        }
+        // SAFETY: every id was created on this display and is destroyed once.
         unsafe {
-            (self.display.va.destroy_buffer)(self.display.display, self.coded_buf);
+            for &coded in &self.coded {
+                (self.display.va.destroy_buffer)(self.display.display, coded);
+            }
             (self.display.va.destroy_context)(self.display.display, self.context);
             (self.display.va.destroy_surfaces)(
                 self.display.display,

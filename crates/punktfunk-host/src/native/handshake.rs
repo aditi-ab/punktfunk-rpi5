@@ -897,8 +897,9 @@ async fn negotiate_video_format(
     let capture_supports_hdr =
         crate::capture::capturer_supports_hdr_for(compositor, gamescope_route);
     // SDR-10 needs a backend that writes 10 bits from an SDR desktop's 8-bit capture:
-    // direct-NVENC (`backend_carries_sdr10`). A Linux 4:4:4 session is clamped to 8-bit
-    // separately at the resolved-chroma gate below, so depth needs no chroma input here.
+    // direct-NVENC, VAAPI/Vulkan Video, or PyroWave's own CSC (`backend_carries_sdr10`).
+    // A Linux non-PyroWave 4:4:4 session is clamped to 8-bit separately at the
+    // resolved-chroma gate below, so depth needs no chroma input here.
     let sdr10_chain_ok = codec_carries_sdr10(codec) && crate::encode::backend_carries_sdr10(codec);
     let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
     // Probe may open a tiny encoder; spawn_blocking, short-circuited behind the cheap gates.
@@ -988,7 +989,7 @@ async fn negotiate_video_format(
         chroma
     };
     #[cfg(target_os = "linux")]
-    let chroma = linux_chroma_under_hdr(chroma, session_hdr);
+    let chroma = linux_chroma_under_hdr(chroma, session_hdr, codec);
     tracing::info!(
         chroma = ?chroma,
         host_wants_444,
@@ -997,29 +998,33 @@ async fn negotiate_video_format(
         "encode chroma"
     );
 
-    // Linux 4:4:4 is CPU swscale → 8-bit `YUV444P`; a 10-bit SDR session would silently encode
-    // 8-bit (HDR already took 4:2:0 above). Clamp depth before Welcome. Windows NVENC keeps 10.
+    // Linux 4:4:4 on the H.26x path is CPU swscale → 8-bit `YUV444P`; a 10-bit SDR session
+    // would silently encode 8-bit (HDR already took 4:2:0 above). PyroWave's own 4:4:4 CSC
+    // is shader-native and 10-bit, so the clamp skips it. Windows NVENC keeps 10.
     #[cfg(target_os = "linux")]
-    let bit_depth: u8 = if chroma.is_444() && bit_depth == 10 {
-        tracing::info!("4:4:4 on the Linux path encodes 8-bit YUV444P — resolving bit depth 8");
-        8
-    } else {
-        bit_depth
-    };
+    let bit_depth: u8 =
+        if chroma.is_444() && bit_depth == 10 && codec != crate::encode::Codec::PyroWave {
+            tracing::info!("4:4:4 on the Linux path encodes 8-bit YUV444P — resolving bit depth 8");
+            8
+        } else {
+            bit_depth
+        };
     // Follows the depth clamp: an 8-bit stream is never labelled HDR.
     let session_hdr = session_hdr && bit_depth == 10;
 
     Ok((bit_depth, session_hdr, chroma))
 }
 
-/// Linux 4:4:4 is 8-bit, so it cannot carry HDR. A client that asked for both keeps HDR at
-/// 4:2:0: a game only offers HDR on an HDR display, while 4:4:4 only sharpens text.
+/// Linux 4:4:4 on the H.26x path is 8-bit, so it cannot carry HDR. A client that asked for
+/// both keeps HDR at 4:2:0: a game only offers HDR on an HDR display, while 4:4:4 only
+/// sharpens text. PyroWave is exempt: its own CSC writes 10-bit 4:4:4 (`rgb2yuv444_10*.comp`).
 #[cfg(target_os = "linux")]
 fn linux_chroma_under_hdr(
     chroma: crate::encode::ChromaFormat,
     session_hdr: bool,
+    codec: crate::encode::Codec,
 ) -> crate::encode::ChromaFormat {
-    if !(chroma.is_444() && session_hdr) {
+    if codec == crate::encode::Codec::PyroWave || !(chroma.is_444() && session_hdr) {
         return chroma;
     }
     tracing::info!(
@@ -1029,13 +1034,14 @@ fn linux_chroma_under_hdr(
     crate::encode::ChromaFormat::Yuv420
 }
 
-/// Codecs that carry 10-bit SDR off the packed-RGB capture. PyroWave is out: its capture path
-/// hands NV12 under SDR, so a 10-bit label would outrun the stream.
+/// Codecs that carry 10-bit SDR off the packed-RGB capture. PyroWave is in on Linux: its CSC
+/// shaders widen 8-bit RGB to 10-bit codes in the same pass that does the colour matrix.
+/// (Windows PyroWave stays out — its capture there hands NV12 SDR.)
 fn codec_carries_sdr10(codec: crate::encode::Codec) -> bool {
     matches!(
         codec,
         crate::encode::Codec::H265 | crate::encode::Codec::Av1
-    )
+    ) || (codec == crate::encode::Codec::PyroWave && cfg!(target_os = "linux"))
 }
 
 /// Whether Hello carried a format at all. Decode maps an absent one to 48 kHz/16-bit, so
@@ -1097,14 +1103,20 @@ mod tests {
     use super::*;
     use punktfunk_core::audio::pcm;
 
-    /// HDR takes 4:2:0 over Linux's 8-bit 4:4:4; without HDR the chroma stands.
+    /// HDR takes 4:2:0 over Linux's 8-bit 4:4:4 on the H.26x path; without HDR the chroma
+    /// stands. PyroWave's own 4:4:4 CSC is 10-bit, so HDR never costs it chroma.
     #[cfg(target_os = "linux")]
     #[test]
     fn hdr_outranks_444_on_linux() {
         use crate::encode::ChromaFormat::{Yuv420, Yuv444};
-        assert_eq!(linux_chroma_under_hdr(Yuv444, true), Yuv420);
-        assert_eq!(linux_chroma_under_hdr(Yuv444, false), Yuv444);
-        assert_eq!(linux_chroma_under_hdr(Yuv420, true), Yuv420);
+        use crate::encode::Codec;
+        assert_eq!(linux_chroma_under_hdr(Yuv444, true, Codec::H265), Yuv420);
+        assert_eq!(linux_chroma_under_hdr(Yuv444, false, Codec::H265), Yuv444);
+        assert_eq!(linux_chroma_under_hdr(Yuv420, true, Codec::H265), Yuv420);
+        assert_eq!(
+            linux_chroma_under_hdr(Yuv444, true, Codec::PyroWave),
+            Yuv444
+        );
     }
 
     /// The negotiation line names the preference, and a preference that lost says which
@@ -1151,13 +1163,17 @@ mod tests {
         );
     }
 
-    /// AV1 carries 10-bit SDR like HEVC; PyroWave captures NV12 under SDR, so it must not.
+    /// AV1 carries 10-bit SDR like HEVC; Linux PyroWave widens RGB→10-bit in its own CSC,
+    /// so it is in there too (Windows PyroWave's NV12 SDR capture keeps it out).
     #[test]
-    fn av1_carries_sdr10_and_pyrowave_does_not() {
+    fn sdr10_codecs_cover_hevc_av1_and_linux_pyrowave() {
         use crate::encode::Codec;
         assert!(codec_carries_sdr10(Codec::Av1));
         assert!(codec_carries_sdr10(Codec::H265));
-        assert!(!codec_carries_sdr10(Codec::PyroWave));
+        assert_eq!(
+            codec_carries_sdr10(Codec::PyroWave),
+            cfg!(target_os = "linux")
+        );
         assert!(!codec_carries_sdr10(Codec::H264));
     }
 

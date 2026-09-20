@@ -335,29 +335,27 @@ fn new_state() -> Result<State> {
 
 /// Pick the format to allocate, and the modifiers to allocate it with.
 ///
-/// Preference is the encoder's, not ours: `want` is what the consumer imports today
-/// (`XR24`/`AR24` packed RGB). `importable` narrows the compositor's modifier list to what
-/// the GPU importer can take; empty means "anything the compositor offered".
+/// Preference is the encoder's, not ours: `want` is what the consumer imports today.
+/// Each fourcc needs an exact consumer list; missing or empty rejects that format.
 fn choose_format(
     offered: &[(u32, Vec<u64>)],
     want: &[u32],
-    importable: &[u64],
+    importable: &[(u32, Vec<u64>)],
 ) -> Option<(u32, Vec<u64>)> {
     for w in want {
         let Some((fourcc, mods)) = offered.iter().find(|(f, _)| f == w) else {
             continue;
         };
-        let mut usable: Vec<u64> = if importable.is_empty() {
-            mods.clone()
-        } else {
-            mods.iter()
-                .copied()
-                .filter(|m| importable.contains(m))
-                .collect()
+        let Some((_, accepted)) = importable.iter().find(|(f, _)| f == w) else {
+            continue;
         };
-        // LINEAR first: every consumer imports it, and it is the one layout a CPU
-        // fallback could also read.
+        let mut usable: Vec<u64> = mods
+            .iter()
+            .copied()
+            .filter(|m| accepted.contains(m))
+            .collect();
         usable.sort_by_key(|m| (*m != 0, *m));
+        usable.dedup();
         if !usable.is_empty() {
             return Some((*fourcc, usable));
         }
@@ -544,7 +542,7 @@ fn run(
     } else {
         None
     };
-    let build = build_pool(&st, importer.as_mut());
+    let build = build_pool(&st, importer.as_mut(), &policy);
     let (pool, fourcc, format, (w, h)) = match build {
         Ok(v) => v,
         Err(e) => {
@@ -689,6 +687,8 @@ fn run(
                     stride: bo.stride,
                     plane1: None,
                     hold: Some(hold),
+                    health: signals.health.clone(),
+                    rebuild: signals.broken.clone(),
                 })
             };
             // The compositor stamps `presentation_time` on CLOCK_MONOTONIC; the wire
@@ -733,10 +733,11 @@ fn run(
     Ok(())
 }
 
-/// Resolve the format and allocate the pool from the session's constraints.
+/// Intersect each constrained fourcc with its consumer list, then allocate that pool.
 fn build_pool(
     st: &State,
     importer: Option<&mut pf_zerocopy::Importer>,
+    policy: &crate::ZeroCopyPolicy,
 ) -> Result<(GbmPool, u32, PixelFormat, (u32, u32))> {
     let (w, h) = st
         .size
@@ -744,14 +745,30 @@ fn build_pool(
     let dev = st
         .dmabuf_dev
         .ok_or_else(|| anyhow!("session offered no dmabuf device (shm-only capture)"))?;
-    // What the encoder imports. PyroWave's Vulkan and libva both take packed RGB; the
-    // CUDA importer narrows further through `importable` below.
+    // Every format gets its own consumer-proved list. LINEAR is always supported by
+    // the CUDA Vulkan bridge and remains the safe fallback for direct encoders.
     let want = [u32::from_le_bytes(*b"XR24"), u32::from_le_bytes(*b"AR24")];
-    // No importer means libva or the wavelet encoder, which take what the compositor
-    // allocates. With one, only what it can import is allocatable.
-    let importable: Vec<u64> = importer
-        .map(|i| i.supported_modifiers(want[0]))
-        .unwrap_or_default();
+    let mut importer = importer;
+    let importable: Vec<(u32, Vec<u64>)> = want
+        .iter()
+        .copied()
+        .map(|fourcc| {
+            let mut modifiers = if let Some(i) = importer.as_deref_mut() {
+                i.supported_modifiers(fourcc)
+            } else {
+                policy
+                    .encoder_modifiers
+                    .iter()
+                    .find(|(f, _)| *f == fourcc)
+                    .map(|(_, m)| m.clone())
+                    .unwrap_or_default()
+            };
+            modifiers.retain(|m| *m != 0);
+            modifiers.dedup();
+            modifiers.push(0);
+            (fourcc, modifiers)
+        })
+        .collect();
     let (fourcc, mods) =
         choose_format(&st.dmabuf_formats, &want, &importable).ok_or_else(|| {
             anyhow!(
@@ -836,7 +853,8 @@ mod tests {
     #[test]
     fn the_wanted_format_wins_over_the_order_the_compositor_offered() {
         let offered = vec![(AR24, vec![1, 2]), (XR24, vec![5])];
-        let (f, m) = choose_format(&offered, &[XR24, AR24], &[]).unwrap();
+        let importable = vec![(XR24, vec![5]), (AR24, vec![1, 2])];
+        let (f, m) = choose_format(&offered, &[XR24, AR24], &importable).unwrap();
         assert_eq!(
             f, XR24,
             "preference is the consumer's, not the compositor's"
@@ -845,19 +863,27 @@ mod tests {
     }
 
     #[test]
-    fn an_importer_narrows_the_modifier_list_and_can_veto_a_format() {
-        let offered = vec![(XR24, vec![7, 9]), (AR24, vec![3])];
-        // Only 9 is importable, so XR24 survives with just that one.
-        let (f, m) = choose_format(&offered, &[XR24, AR24], &[9]).unwrap();
-        assert_eq!((f, m), (XR24, vec![9]));
-        // Nothing importable in either format: no allocation is possible.
-        assert!(choose_format(&offered, &[XR24, AR24], &[42]).is_none());
+    fn modifier_lists_are_scoped_to_their_exact_fourcc() {
+        let offered = vec![(XR24, vec![7]), (AR24, vec![3])];
+        let importable = vec![(XR24, vec![9]), (AR24, vec![3])];
+        assert_eq!(
+            choose_format(&offered, &[XR24, AR24], &importable),
+            Some((AR24, vec![3]))
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_consumer_lists_reject_the_format() {
+        let offered = vec![(XR24, vec![7])];
+        assert!(choose_format(&offered, &[XR24], &[]).is_none());
+        assert!(choose_format(&offered, &[XR24], &[(XR24, Vec::new())]).is_none());
     }
 
     #[test]
     fn linear_is_offered_first_because_every_consumer_imports_it() {
         let offered = vec![(XR24, vec![0x0100_0000_0000_0002, 0, 5])];
-        let (_, m) = choose_format(&offered, &[XR24], &[]).unwrap();
+        let importable = vec![(XR24, vec![5, 0x0100_0000_0000_0002, 0])];
+        let (_, m) = choose_format(&offered, &[XR24], &importable).unwrap();
         assert_eq!(m[0], 0, "LINEAR must lead the allocation attempt");
     }
 

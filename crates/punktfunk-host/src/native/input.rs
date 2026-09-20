@@ -211,7 +211,16 @@ impl Pads {
             declared: [None; MAX_WIRE_PADS],
             owner: [None; MAX_WIRE_PADS],
             xbox360: None,
-            backends: PadBackends::default(),
+            backends: {
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                {
+                    PadBackends::default()
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+                {
+                    PadBackends
+                }
+            },
             seat_dev,
         }
     }

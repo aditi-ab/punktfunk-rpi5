@@ -428,6 +428,8 @@ fn real_main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("serve") => {
             let (mgmt_opts, native, gamestream) = parse_serve(&args[1..])?;
+            // A launcher rewrite can drop a granted folder's ACE; re-apply them each boot.
+            plugins::converge_grants();
             // Restart-class settings changed after this point wait for a restart.
             pf_host_config::mark_started();
             // Must run before any new session touches the topology.

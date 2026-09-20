@@ -243,30 +243,82 @@ final class LibraryClientTests: XCTestCase {
         let portrait = URL(string: "https://100.64.1.2:47990/api/v1/library/art/steam:570/portrait")!
         let header = URL(string: "https://100.64.1.2:47990/api/v1/library/art/steam:570/header")!
 
-        var hit = await cache.data(for: portrait)
+        var hit = await cache.data(forKey: portrait.absoluteString)
         XCTAssertNil(hit, "cold cache must miss")
-        await cache.store(png, for: portrait)
-        hit = await cache.data(for: portrait)
+        await cache.store(png, forKey: portrait.absoluteString)
+        hit = await cache.data(forKey: portrait.absoluteString)
         XCTAssertEqual(hit, png, "posters are binary; the body must survive byte-for-byte")
         // Sibling art of the same title must not collide.
-        let sibling = await cache.data(for: header)
+        let sibling = await cache.data(forKey: header.absoluteString)
         XCTAssertNil(sibling)
     }
 
-    func testArtCacheRefusesEmptyAndInlineData() async throws {
+    func testArtCacheRefusesEmptyData() async throws {
         let directory = temporaryCacheDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let cache = ArtCache(directory: directory)
 
         let empty = URL(string: "https://cdn.example.com/empty.jpg")!
-        await cache.store(Data(), for: empty)
-        let emptyHit = await cache.data(for: empty)
+        await cache.store(Data(), forKey: empty.absoluteString)
+        let emptyHit = await cache.data(forKey: empty.absoluteString)
         XCTAssertNil(emptyHit, "an empty body is not art")
+    }
 
-        let inline = URL(string: "data:image/png;base64,iVBORw0KGgo=")!
-        await cache.store(Data("x".utf8), for: inline)
-        let inlineHit = await cache.data(for: inline)
-        XCTAssertNil(inlineHit, "a data: URL is already inline — caching it is a pure loss")
+    func testInlineBytesDecodesBase64AndRefusesTheRest() throws {
+        let payload = Data([0x89, 0x50, 0x4E, 0x47])
+        let url = URL(string: "data:image/png;base64,\(payload.base64EncodedString())")!
+        XCTAssertEqual(try LibraryArtLoader.inlineBytes(url), payload)
+        // No ;base64 marker — a charset/plaintext data URL is not the form the kit emits.
+        XCTAssertThrowsError(try LibraryArtLoader.inlineBytes(
+            URL(string: "data:image/png,\(payload.base64EncodedString())")!))
+        // A body over the transport ceiling is refused even when it decodes.
+        let huge = Data(repeating: 0x41, count: MgmtTransport.maxResponseBytes + 1)
+        XCTAssertThrowsError(try LibraryArtLoader.inlineBytes(
+            URL(string: "data:image/png;base64,\(huge.base64EncodedString())")!))
+    }
+
+    func testCacheKeyPinsHostArtToTheMachineNotItsAddress() {
+        let pin = Data([0xDE, 0xAD])
+        let art = URL(
+            string: "https://192.168.1.70:47990/api/v1/library/art/steam:570/portrait")!
+        let key = LibraryArtLoader.cacheKey(
+            for: art, hostAddress: "192.168.1.70", hostPort: 47990, pin: pin)
+        XCTAssertEqual(key, "dead|/api/v1/library/art/steam:570/portrait")
+
+        // The same host answering at a NEW address must keep its cache entries.
+        let moved = URL(
+            string: "https://100.64.1.2:47990/api/v1/library/art/steam:570/portrait")!
+        XCTAssertEqual(
+            LibraryArtLoader.cacheKey(
+                for: moved, hostAddress: "100.64.1.2", hostPort: 47990, pin: pin),
+            key)
+
+        // A different machine answering the SAME address must not inherit them.
+        XCTAssertNotEqual(
+            LibraryArtLoader.cacheKey(
+                for: art, hostAddress: "192.168.1.70", hostPort: 47990,
+                pin: Data([0xBE, 0xEF])),
+            key)
+
+        // Unpinned has no machine to key by — the address stands in (TOFU semantics).
+        XCTAssertEqual(
+            LibraryArtLoader.cacheKey(
+                for: art, hostAddress: "192.168.1.70", hostPort: 47990, pin: nil),
+            "tofu|192.168.1.70:47990|/api/v1/library/art/steam:570/portrait")
+
+        // A query is part of the path — art endpoints that take one don't collide.
+        let queried = URL(
+            string: "https://192.168.1.70:47990/api/v1/library/art/steam:570/portrait?v=2")!
+        XCTAssertEqual(
+            LibraryArtLoader.requestPath(queried),
+            "/api/v1/library/art/steam:570/portrait?v=2")
+
+        // CDN art is keyed by its URL — the URL already names its origin.
+        let cdn = URL(string: "https://cdn.example.com/hero.jpg")!
+        XCTAssertEqual(
+            LibraryArtLoader.cacheKey(
+                for: cdn, hostAddress: "192.168.1.70", hostPort: 47990, pin: pin),
+            cdn.absoluteString)
     }
 
     /// Age-out reads the file mtime, so stamp it instead of sleeping past `maxAge`.
@@ -276,11 +328,11 @@ final class LibraryClientTests: XCTestCase {
         let cache = ArtCache(directory: directory, maxAge: 1)
         let url = URL(string: "https://cdn.example.com/stale.jpg")!
 
-        await cache.store(Data("stale".utf8), for: url)
-        let fresh = await cache.data(for: url)
+        await cache.store(Data("stale".utf8), forKey: url.absoluteString)
+        let fresh = await cache.data(forKey: url.absoluteString)
         XCTAssertNotNil(fresh)
         ageFiles(in: directory, by: 10)
-        let expired = await cache.data(for: url)
+        let expired = await cache.data(forKey: url.absoluteString)
         XCTAssertNil(expired)
     }
 
@@ -294,13 +346,13 @@ final class LibraryClientTests: XCTestCase {
         for i in 0..<4 {
             let url = URL(string: "https://cdn.example.com/blob\(i).jpg")!
             urls.append(url)
-            await cache.store(blob, for: url)
+            await cache.store(blob, forKey: url.absoluteString)
             // Back-date what is already stored, so each blob lands newer than the last.
             if i < 3 { ageFiles(in: directory, by: 1) }
         }
-        let evicted = await cache.data(for: urls[0])
+        let evicted = await cache.data(forKey: urls[0].absoluteString)
         XCTAssertNil(evicted, "the oldest entry should have been evicted")
-        let newest = await cache.data(for: urls[3])
+        let newest = await cache.data(forKey: urls[3].absoluteString)
         XCTAssertEqual(newest, blob)
     }
 

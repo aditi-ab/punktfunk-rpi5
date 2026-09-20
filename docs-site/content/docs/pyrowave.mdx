@@ -62,10 +62,11 @@ HEVC/AV1; nothing PyroWave-specific to turn on beyond picking the codec.
   luma, so it is less than the 2× the extra samples imply). Available on Linux and Windows
   hosts.
 - **HDR (10-bit, BT.2020 PQ).** With HDR on, the session carries the 10-bit BT.2020 PQ signal in
-  16-bit planes and adds ~15 % to the bitrate. **PyroWave HDR needs a Windows host today** — the
-  Linux PyroWave path has no HDR colour conversion, so a Linux-hosted PyroWave session is SDR; stay
-  on HEVC or AV1 for HDR from Linux, where PyroWave is the odd one out among the
-  [codec rules](/docs/hdr#codec-rules). 4:4:4 works with PyroWave on both.
+  16-bit planes and adds ~15 % to the bitrate. Available on Windows and Linux hosts — on Linux it
+  needs the same HDR source as the other codecs (a `punktfunk-gamescope` virtual output; see
+  [the HDR chain](/docs/hdr#per-host)). It combines with 4:4:4 on both.
+- **10-bit SDR.** A client that asks for 10-bit but not HDR gets the same 16-bit plane depth with
+  ordinary BT.709 colour — on Linux too, since the colour conversion is PyroWave's own.
 - The two combine: a 4:4:4 **and** HDR session applies both factors (~1.6 × 1.15 ≈ 1.9× the
   4:2:0 SDR rate). The Apple and Rust clients decode whatever the session negotiated — 4:2:0
   or 4:4:4, SDR or HDR — with no extra setup.
@@ -141,5 +142,6 @@ on) and read the accompanying line — it names the cause and the fix.
   A13-or-newer iPhone, iPad and Apple TV hardware), and 64-bit Android devices with a Vulkan 1.3
   GPU. The 32-bit Android build carries no decoder, and Wi-Fi cannot carry these rates on any
   client — this is a wired-LAN codec everywhere.
-- **PyroWave HDR needs a Windows host today** — a Linux-hosted PyroWave session is SDR, however the
-  rest of the box is set up (see [4:4:4 and HDR](#444-and-hdr) above). 4:4:4 works on both.
+- PyroWave HDR on **Linux** needs the same HDR source as the other codecs — a `punktfunk-gamescope`
+  virtual output ([the HDR chain](/docs/hdr#per-host)). Without it the session is SDR, as it is for
+  HEVC and AV1.

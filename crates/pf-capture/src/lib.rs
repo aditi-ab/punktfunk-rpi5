@@ -457,9 +457,6 @@ pub struct ZeroCopyPolicy {
     /// H265/AV1 — `pf_encode::linux_native_nv12_ok`). Every other arm takes
     /// packed RGB; H264/GameStream/PyroWave must never see NV12.
     pub native_nv12_session: bool,
-    /// PyroWave Vulkan-importable dmabuf modifiers for packed-RGB. Advertised
-    /// so Mutter+NVIDIA (tiled-only alloc) still negotiates zero-copy. Empty otherwise.
-    pub pyrowave_modifiers: Vec<u64>,
     /// Encoder can ingest packed 10-bit PQ CUDA (`pf_encode::linux_hdr_cuda_ok`,
     /// direct-SDK NVENC only). No other arm reads those 2:10:10:10 words as
     /// anything but garbage, so do not produce them unless this holds.
@@ -471,6 +468,8 @@ pub struct ZeroCopyPolicy {
     /// The gamescope producer fixates a tiled modifier (`pf_vdisplay::gamescope_tiled_capture`).
     /// Off, its offer stays LINEAR-only.
     pub gamescope_tiled: bool,
+    /// Per-fourcc modifiers the session's direct encoder import proved. Empty keeps LINEAR.
+    pub encoder_modifiers: Vec<(u32, Vec<u64>)>,
 }
 
 /// Discovers gamescope's nested Xwayland cursor targets — `(DISPLAY, XAUTHORITY)`,
@@ -714,7 +713,7 @@ pub fn open_portal_monitor(
 /// `keepalive` owns the output. `want_hdr` holds on a gamescope node only: every other
 /// virtual output is SDR, and a desktop that refuses the offer would latch gamescope's SDR.
 /// `cursor_id0_hides` selects KWin's rewritten cursor-meta contract.
-/// `producer_is_gamescope` selects its no-meta, LINEAR-only contract.
+/// `producer_is_gamescope` selects its no-meta contract and gated tiled modifier offer.
 /// KWin also needs [`KWIN_POOL_MIN`], [`KWIN_POOL_MAX`] as `pool_max`, and [`unpaced_capture`].
 /// `pool_max` is the deepest pool the producer serves; `None` when it serves any depth asked.
 #[cfg(target_os = "linux")]

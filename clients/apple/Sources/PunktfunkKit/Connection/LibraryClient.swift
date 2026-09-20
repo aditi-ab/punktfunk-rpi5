@@ -539,10 +539,15 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
     private let identity: SecIdentity
     private let hostFingerprint: Data?
     /// Third-party origins only. No delegate: these are ordinary public HTTPS URLs and get the
-    /// system's normal certificate validation.
-    private let cdn = URLSession(configuration: .default)
+    /// system's normal certificate validation. No URLCache either — `ArtCache` owns the disk
+    /// persistence, so a second unmanaged copy underneath it would be pure waste.
+    private let cdn: URLSession
     /// nil when the caches directory is unavailable — then we simply always fetch.
     private let cache = ArtCache.standard()
+    /// One fetch per cache key at a time — the same entry shown in two sections must not fetch
+    /// its art twice on a cold cache. Failures are deliberately not remembered.
+    private let inflightLock = NSLock()
+    private var inflight: [String: Task<Data, Error>] = [:]
 
     public init(
         address: String,
@@ -555,12 +560,28 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         self.port = port
         self.identity = try LibraryClient.clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
         self.hostFingerprint = hostFingerprint
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        self.cdn = URLSession(configuration: config)
     }
 
+    /// Image bytes for one art URL, cached on disk after the first fetch. A miss propagates the
+    /// error so the poster can move on to its next candidate.
     public func data(for url: URL) async throws -> Data {
-        if let cache, let cached = await cache.data(for: url) { return cached }
-        let fetched = try await fetch(url)
-        if let cache { await cache.store(fetched, for: url) }
+        // Inline art never leaves the manifest — decode it here rather than probe a cache that
+        // could never hold it.
+        if url.scheme?.lowercased() == "data" { return try Self.inlineBytes(url) }
+        let key = Self.cacheKey(for: url, hostAddress: address, hostPort: port, pin: hostFingerprint)
+        if let cache, let cached = await cache.data(forKey: key) { return cached }
+        let task: Task<Data, Error> = inflightLock.withLock {
+            if let flying = inflight[key] { return flying }
+            let flying = Task.detached { try await self.fetch(url) }
+            inflight[key] = flying
+            return flying
+        }
+        defer { inflightLock.withLock { inflight[key] = nil } }
+        let fetched = try await task.value
+        if let cache { await cache.store(fetched, forKey: key) }
         return fetched
     }
 
@@ -575,15 +596,39 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         return data
     }
 
-    /// Release this host's pooled connections — call when the library screen goes away, so we
-    /// don't sit on open TLS sockets the user is finished with.
+    /// Release this host's pooled connections and the CDN session — call when the library screen
+    /// goes away, so we don't sit on open TLS sockets the user is finished with.
     public func close() async {
+        cdn.finishTasksAndInvalidate()
         await MgmtConnectionPool.shared.closeAll(
             matching: "\(MgmtTransport.unbracketed(address)):\(port):")
     }
 
+    /// The cache entry's identity. A HOST-origin URL is `pin | path` — the machine, not the
+    /// address it happened to have at fetch time: a re-addressed host must keep its cache, and a
+    /// different machine answering the same address must not inherit it. Anything else is keyed
+    /// by its URL, which already names its origin.
+    static func cacheKey(for url: URL, hostAddress: String, hostPort: UInt16, pin: Data?) -> String {
+        guard isHostOrigin(url, address: hostAddress, port: hostPort) else {
+            return url.absoluteString
+        }
+        if let pin { return "\(MgmtTransport.hex(pin))|\(requestPath(url))" }
+        return "tofu|\(MgmtTransport.unbracketed(hostAddress)):\(hostPort)|\(requestPath(url))"
+    }
+
+    /// The request path exactly as it goes on the wire — the ENCODED components. `url.path` and
+    /// `url.query` hand back percent-DECODED text: an id that needed encoding breaks the request
+    /// line, and a decoded CRLF splits the request outright.
+    static func requestPath(_ url: URL) -> String {
+        let parts = URLComponents(url: url, resolvingAgainstBaseURL: true)
+        var path = parts?.percentEncodedPath ?? ""
+        if path.isEmpty { path = "/" }
+        if let query = parts?.percentEncodedQuery { path += "?\(query)" }
+        return path
+    }
+
     private func fetch(_ url: URL) async throws -> Data {
-        guard isHostOrigin(url) else {
+        guard Self.isHostOrigin(url, address: address, port: port) else {
             // A library entry names its own art URL, so this is host-supplied. Web schemes and
             // inline `data:` only — a `file:` URL would make the client read its own container and
             // cache the result as a poster — and the same ceiling the pinned path enforces, since
@@ -591,20 +636,24 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
             if url.scheme?.lowercased() == "data" { return try Self.inlineBytes(url) }
             guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http"
             else { throw LibraryError.badArtURL }
-            let data = try await cdn.data(from: url).0
-            guard data.count <= MgmtTransport.maxResponseBytes else { throw MgmtTransportError.tooLarge }
+            let (bytes, response) = try await cdn.bytes(from: url)
+            guard let http = response as? HTTPURLResponse else { throw LibraryError.badArtURL }
+            guard (200..<300).contains(http.statusCode) else {
+                throw LibraryError.http(http.statusCode)
+            }
+            // Bound the body WHILE it streams — the ceiling is decorative if every byte is in
+            // memory already when it's checked.
+            var data = Data()
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count > MgmtTransport.maxResponseBytes {
+                    throw MgmtTransportError.tooLarge
+                }
+            }
             return data
         }
-        // The ENCODED components: `url.path` and `url.query` hand back percent-DECODED text, and
-        // writing that straight into the request line breaks any id that needed encoding (a space
-        // in a custom entry's id makes the line unparseable, so that tile silently never gets
-        // art) — and a decoded CRLF would split the request outright.
-        let parts = URLComponents(url: url, resolvingAgainstBaseURL: true)
-        var path = parts?.percentEncodedPath ?? ""
-        if path.isEmpty { path = "/" }
-        if let query = parts?.percentEncodedQuery { path += "?\(query)" }
         let response = try await LibraryClient.send(
-            path: path, address: address, port: port,
+            path: Self.requestPath(url), address: address, port: port,
             identity: identity, hostFingerprint: hostFingerprint)
         guard response.status == 200 else { throw LibraryError.http(response.status) }
         return response.body
@@ -612,7 +661,7 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
 
     /// Does this URL point at the host's own art proxy? Compared on host + port rather than a
     /// string prefix, so a differently-spelled but equivalent URL still takes the pinned path.
-    private func isHostOrigin(_ url: URL) -> Bool {
+    static func isHostOrigin(_ url: URL, address: String, port: UInt16) -> Bool {
         guard let host = url.host else { return false }
         let bare = MgmtTransport.unbracketed(address)
         let scheme = url.scheme?.lowercased()

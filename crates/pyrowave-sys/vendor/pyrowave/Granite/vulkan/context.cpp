@@ -215,29 +215,38 @@ bool Context::init_loader(PFN_vkGetInstanceProcAddr addr, bool force_reload)
 	if (loader_init_once && !force_reload && !addr)
 		return true;
 
+#ifndef _WIN32
+	// PUNKTFUNK LOCAL PATCH (patches/0009-keep-vulkan-module-resident.patch), not upstream.
+	// volkInitializeCustom binds the global procs through `addr`, but the trampolines it
+	// resolves live in libvulkan.so.1. When the first init arrives with a caller-owned
+	// `addr` (pyrowave_create_device's GetInstanceProcAddr), upstream holds no dlopen
+	// reference: the caller's last dlclose unmaps the library, and the early-return above
+	// then re-enters with dangling globals — a jump into unmapped memory.
+	static void *module;
+	if (!module)
+	{
+		auto vulkan_path = Util::get_environment_string("GRANITE_VULKAN_LIBRARY", "");
+		if (!vulkan_path.empty())
+			module = dlopen(vulkan_path.c_str(), RTLD_LOCAL | RTLD_LAZY);
+#ifdef __APPLE__
+		if (!module)
+			module = dlopen("libvulkan.1.dylib", RTLD_LOCAL | RTLD_LAZY);
+		if (!module)
+			module = dlopen("libMoltenVK.dylib", RTLD_LOCAL | RTLD_LAZY);
+#else
+		if (!module)
+			module = dlopen("libvulkan.so.1", RTLD_LOCAL | RTLD_LAZY);
+		if (!module)
+			module = dlopen("libvulkan.so", RTLD_LOCAL | RTLD_LAZY);
+#endif
+	}
+#endif
+
 	if (!addr)
 	{
 #ifndef _WIN32
-		static void *module;
 		if (!module)
-		{
-			auto vulkan_path = Util::get_environment_string("GRANITE_VULKAN_LIBRARY", "");
-			if (!vulkan_path.empty())
-				module = dlopen(vulkan_path.c_str(), RTLD_LOCAL | RTLD_LAZY);
-#ifdef __APPLE__
-			if (!module)
-				module = dlopen("libvulkan.1.dylib", RTLD_LOCAL | RTLD_LAZY);
-			if (!module)
-				module = dlopen("libMoltenVK.dylib", RTLD_LOCAL | RTLD_LAZY);
-#else
-			if (!module)
-				module = dlopen("libvulkan.so.1", RTLD_LOCAL | RTLD_LAZY);
-			if (!module)
-				module = dlopen("libvulkan.so", RTLD_LOCAL | RTLD_LAZY);
-#endif
-			if (!module)
-				return false;
-		}
+			return false;
 
 		addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(module, "vkGetInstanceProcAddr"));
 		if (!addr)

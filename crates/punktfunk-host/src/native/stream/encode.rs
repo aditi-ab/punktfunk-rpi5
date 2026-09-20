@@ -60,6 +60,13 @@ fn cadence_budget(
     }
 }
 
+/// 80% of the cadence budget spent inside the host's submit+poll chain is encode
+/// pressure: activation follows the measured encoder cost, not the consumed-frame
+/// clock — a chain at the bottleneck still reads ≥80% of a budget it stretched.
+fn encode_chain_pressure(budget: std::time::Duration, chain_ns: u64) -> bool {
+    u128::from(chain_ns).saturating_mul(5) >= budget.as_nanos().saturating_mul(4)
+}
+
 /// The wire flags for one access unit: picture, keyframe, and the recovery marks the client
 /// lifts its post-loss freeze on.
 ///
@@ -265,6 +272,7 @@ impl StreamState {
     /// into the send thread. `Continue` = the submit failed and the tick is spent on the
     /// backoff; `Break` = the send thread is gone.
     pub(super) fn encode_and_send(&mut self, tick: Tick) -> Result<Flow> {
+        self.encode_chain_ns = 0;
         let Tick {
             t_cap: _,
             cap_us,
@@ -349,8 +357,9 @@ impl StreamState {
             std::thread::sleep(backoff);
             return Ok(Flow::Continue);
         }
+        let submit_elapsed = t_submit.elapsed();
         let submit_us = if measure {
-            t_submit.elapsed().as_micros() as u32
+            submit_elapsed.as_micros() as u32
         } else {
             0
         };
@@ -370,6 +379,7 @@ impl StreamState {
             queue_us,
             cap_us,
             submit_us,
+            submit_elapsed,
             repeat,
             measure,
             owed: owed.is_some(),
@@ -411,6 +421,21 @@ impl StreamState {
         Ok(Flow::Next)
     }
 
+    /// Fold this poll's elapsed time into the tick's longest submit+poll chain —
+    /// the backend-neutral pressure input `adapt_depth` reads. Driver-owned AUs
+    /// carry no host submit, so they never count.
+    fn note_encode_chain(&mut self, st: &Stamps, t_wait: std::time::Instant) {
+        if st.owed {
+            return;
+        }
+        self.encode_chain_ns = self.encode_chain_ns.max(
+            st.submit_elapsed
+                .saturating_add(t_wait.elapsed())
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+    }
+
     /// Stream one AU's chunks as they land. `Au` = a whole AU went out (the caller polls again
     /// while owed frames remain); `Nothing` = the encoder has no more output this tick.
     fn poll_chunked(&mut self, st: &Stamps, resend_meta: &mut bool) -> Polled {
@@ -418,7 +443,9 @@ impl StreamState {
         let mut first_chunk_us = 0u32;
         let mut flags = 0u32;
         loop {
-            let c = match self.enc.poll_chunk() {
+            let polled = self.enc.poll_chunk();
+            self.note_encode_chain(st, t_wait);
+            let c = match polled {
                 Ok(Some(c)) => c,
                 Ok(None) => return Polled::Nothing,
                 Err(e) => return Polled::Failed(e),
@@ -514,8 +541,10 @@ impl StreamState {
     fn poll_whole(&mut self, st: &Stamps, resend_meta: &mut bool) -> Polled {
         let t_wait = std::time::Instant::now();
         let polled = self.enc.poll();
+        let wait_elapsed = t_wait.elapsed();
+        self.note_encode_chain(st, t_wait);
         let wait_us = if st.measure {
-            t_wait.elapsed().as_micros() as u32
+            wait_elapsed.as_micros() as u32
         } else {
             0
         };
@@ -640,7 +669,9 @@ impl StreamState {
         }
         let max_depth = self.capturer.pipeline_depth().max(1);
         let budget = cadence_budget(self.interval, self.src_period_ns);
-        let behind = std::time::Instant::now() >= self.next + (budget - self.interval);
+        let schedule_behind = std::time::Instant::now() >= self.next + (budget - self.interval);
+        let encode_pressure = encode_chain_pressure(budget, self.encode_chain_ns);
+        let behind = schedule_behind || encode_pressure;
         self.behind_score = if behind {
             (self.behind_score + 1).min(DEPTH_BEHIND_CAP)
         } else {
@@ -661,6 +692,7 @@ impl StreamState {
                     tracing::info!(
                         behind_score = self.behind_score,
                         escalated,
+                        encode_pressure,
                         budget_us = budget.as_micros() as u64,
                         interval_us = self.interval.as_micros() as u64,
                         src_period_us = self.src_period_ns.map(|p| p / 1_000).unwrap_or_default(),
@@ -670,6 +702,7 @@ impl StreamState {
                 } else {
                     tracing::info!(
                         behind_score = self.behind_score,
+                        encode_pressure,
                         flips_suppressed = self.cadence_flips_suppressed,
                         "encode cadence recovered — ABR climbs allowed again"
                     );
@@ -773,7 +806,10 @@ impl StreamState {
     }
 
     /// After the loop: poll what the encoder still owes into the send thread.
+    /// Pipelined retrieve must be wound back first — a probing `poll` would
+    /// return `None` on the first in-flight AU and strand the tail.
     pub(super) fn drain(&mut self) {
+        self.enc.set_pipelined(false);
         while let Some((cap_ns, sub_ns, deadline)) = self.inflight.pop_front() {
             let Ok(Some(au)) = self.enc.poll() else { break };
             let flags = if au.keyframe {
@@ -854,6 +890,8 @@ struct Stamps {
     queue_us: u32,
     cap_us: u32,
     submit_us: u32,
+    /// Always captured (perf sampling aside): the submit half of the encode-pressure chain.
+    submit_elapsed: std::time::Duration,
     repeat: bool,
     measure: bool,
     /// The driver already held the AUs: their own present time beats the tick's clock.
@@ -881,6 +919,21 @@ mod tests {
         assert!(encode_behind_cadence(false, 10, DEGRADE));
         assert!(encode_behind_cadence(true, 1, DEGRADE));
         assert!(!encode_behind_cadence(true, 0, DEGRADE));
+    }
+
+    /// 80% of budget spent in the submit+poll chain is pressure — boundary inclusive —
+    /// and a chain that stretched the budget to itself cannot hide behind it.
+    #[test]
+    fn encode_chain_pressure_fires_at_eighty_percent_of_budget() {
+        let ms = std::time::Duration::from_millis;
+        assert!(!encode_chain_pressure(ms(10), 3_000_000));
+        assert!(encode_chain_pressure(ms(10), 8_000_000));
+        assert!(encode_chain_pressure(ms(10), 13_000_000));
+        assert!(!encode_chain_pressure(
+            ms(16) + std::time::Duration::from_micros(667),
+            13_000_000
+        ));
+        assert!(encode_chain_pressure(ms(13), 13_000_000));
     }
 
     #[test]

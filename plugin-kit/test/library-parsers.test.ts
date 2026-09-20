@@ -19,7 +19,6 @@ import {
 	fileUrl,
 	findGridArtFile,
 	findLocalArtFile,
-	grantCommand,
 	gridFilenames,
 	isSteamTool,
 	openReadOnly,
@@ -32,6 +31,8 @@ import {
 	shortcutGameId,
 	spawnAgainIfKilled,
 	steamCdnUrl,
+	steamLibraryDirs,
+	steamListedLibraries,
 	vdfPaths,
 	vdfValue,
 	withReadOnlyDb,
@@ -72,6 +73,22 @@ describe("text VDF / ACF", () => {
 			"/home/u/.local/share/Steam",
 			"D:\\SteamLibrary",
 		]);
+	});
+
+	test("listed Steam libraries keep an unbound path for the host to judge", () => {
+		const root = tmp("steam-listed");
+		const steamapps = path.join(root, "steamapps");
+		fs.mkdirSync(steamapps, { recursive: true });
+		const missing = path.join(root, "other-drive");
+		fs.writeFileSync(
+			path.join(steamapps, "libraryfolders.vdf"),
+			`"libraryfolders"\n{\n\t"1"\n\t{\n\t\t"path" "${missing}"\n\t}\n}`,
+		);
+		expect(steamListedLibraries([root])).toEqual([
+			path.resolve(missing),
+			path.resolve(root),
+		]);
+		expect(steamLibraryDirs([root])).toEqual([path.resolve(steamapps)]);
 	});
 
 	test("parseAppManifest reads the flat fields it needs", () => {
@@ -570,20 +587,6 @@ describe("access classification", () => {
 			expect(fileAccess(path.join(shut, "emu.exe"))).toBe("denied");
 		} finally {
 			fs.chmodSync(shut, 0o700);
-		}
-	});
-
-	test("the grant names a directory, and only on Windows", () => {
-		const grant = grantCommand(
-			"C:\\Users\\e\\AppData\\Roaming\\Ryujinx\\Ryujinx.exe",
-		);
-		if (process.platform === "win32") {
-			expect(grant).toBe(
-				'icacls "C:\\Users\\e\\AppData\\Roaming\\Ryujinx" /grant "*S-1-5-19:(OI)(CI)(RX)"',
-			);
-		} else {
-			// The Linux runner is a `systemctl --user` unit — already the operator, nothing to grant.
-			expect(grant).toBeNull();
 		}
 	});
 });

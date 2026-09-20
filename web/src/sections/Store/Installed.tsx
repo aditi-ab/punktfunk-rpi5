@@ -1,5 +1,6 @@
 import { ArrowUpCircle, Ban, Circle, Package, Trash2 } from "lucide-react";
 import type { FC } from "react";
+import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot";
 import { type InstalledPlugin, useInstalledPlugins } from "@/api/store";
 import { QueryState } from "@/components/query-state";
 import { ROW, ROW_GAP, staggerProps } from "@/components/stagger";
@@ -13,13 +14,17 @@ import {
 } from "@/components/ui/table";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
+import {
+	type AccessDecision,
+	RecordedAccess,
+	usePluginAccess,
+} from "@/sections/PluginAccess";
 import { RunnerCardSection } from "./Runner";
 import { SourceChip, TierBadge } from "./TierBadge";
 
 /**
- * Container: what's installed. Owns the installed query; the runner switch above it owns its own.
- * Updating and uninstalling are escalated to the parent, which owns the confirm dialogs and the
- * resulting job card.
+ * Installed plugins plus their recorded folder access. This container owns both queries and the
+ * access decisions; package updates and removals stay with the parent dialogs.
  */
 export const InstalledTab: FC<{
 	onUpdate: (plugin: InstalledPlugin) => void;
@@ -40,6 +45,7 @@ export const InstalledTab: FC<{
 	batchRunning,
 }) => {
 	const installed = useInstalledPlugins();
+	const access = usePluginAccess();
 	return (
 		<div className="flex flex-col gap-card">
 			<RunnerCardSection />
@@ -51,15 +57,39 @@ export const InstalledTab: FC<{
 				updateCount={updateCount}
 				busyPkg={busyPkg}
 				batchRunning={batchRunning}
+				access={access.access.data}
+				accessBusy={access.busy}
+				onAccessDecision={access.onDecide}
 			/>
 		</div>
 	);
 };
 
+const InstalledAccess: FC<{
+	plugin: InstalledPlugin;
+	access: PluginAccessSnapshot[];
+	busy: boolean;
+	onDecision: (
+		plugin: string,
+		paths: string[],
+		decision: AccessDecision,
+	) => void;
+}> = ({ plugin, access, busy, onDecision }) => {
+	const id = plugin.plugin_id ?? plugin.entry_id;
+	const snapshot = access.find((row) => row.plugin === id);
+	if (!id || !snapshot) return null;
+	return (
+		<RecordedAccess
+			access={snapshot}
+			busy={busy}
+			onDecide={(paths, decision) => onDecision(id, paths, decision)}
+		/>
+	);
+};
+
 /**
- * One row per installed plugin. The tier badge is permanent and non-negotiable: a plugin installed
- * from a raw spec stays marked unverified here for as long as it's on the host, no matter what it
- * later reports about itself.
+ * One installed-plugin row with provenance, runtime state, package actions, and recorded access.
+ * Pending requests stay on the matching Library source; this list never announces them.
  */
 export const InstalledList: FC<{
 	installed: Loadable<InstalledPlugin[]>;
@@ -69,6 +99,13 @@ export const InstalledList: FC<{
 	updateCount: number;
 	busyPkg: string | null;
 	batchRunning: boolean;
+	access?: PluginAccessSnapshot[];
+	accessBusy?: boolean;
+	onAccessDecision?: (
+		plugin: string,
+		paths: string[],
+		decision: AccessDecision,
+	) => void;
 }> = ({
 	installed,
 	onUpdate,
@@ -77,6 +114,9 @@ export const InstalledList: FC<{
 	updateCount,
 	busyPkg,
 	batchRunning,
+	access = [],
+	accessBusy = false,
+	onAccessDecision = () => {},
 }) => {
 	const rows = installed.data ?? [];
 	return (
@@ -125,6 +165,12 @@ export const InstalledList: FC<{
 													<span>{m.store_blocked({ reason: p.blocked })}</span>
 												</p>
 											)}
+											<InstalledAccess
+												plugin={p}
+												access={access}
+												busy={accessBusy}
+												onDecision={onAccessDecision}
+											/>
 										</TableCell>
 										<TableCell className="py-4">
 											<div className="flex flex-col items-start gap-1">

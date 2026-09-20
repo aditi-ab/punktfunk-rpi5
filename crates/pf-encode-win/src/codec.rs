@@ -252,11 +252,12 @@ pub trait Encoder: Send {
     /// unusable: ordinary prediction uses the backend's slot index. A re-mark
     /// or an IDR that flushes the DPB restores trust. Default: no-op.
     fn distrust_references(&mut self) {}
-    /// Escalate to pipelined (two-thread) retrieve under GPU contention: AUs
-    /// ride ~one loop tick behind (`poll` may return `None` while an encode is
-    /// in flight). Returns whether pipelined retrieve is now active; the switch
-    /// may defer. `true` returning `false` (the default) = unsupported — the
-    /// session loop stops asking.
+    /// Escalate to pipelined retrieve under GPU contention: `poll` stops waiting
+    /// on the newest in-flight AU (a retrieve thread on NVENC, a completion probe
+    /// on Vulkan/VA-API), so AUs may ride ~one loop tick behind their submit.
+    /// Returns whether pipelined retrieve is now active; the switch may defer.
+    /// `true` returning `false` (the default) = unsupported — the session loop
+    /// stops asking.
     ///
     /// `false` requests wind-back to sync-retrieve at the next safe point,
     /// usually a rebuild whose first frame is an IDR. Caller polls until it

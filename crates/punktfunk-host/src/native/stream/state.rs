@@ -93,6 +93,8 @@ pub(super) struct StreamState {
     pub(super) depth_frames: u64,
     /// EMA of real-frame arrivals. Negotiated refresh is the wrong deadline when the game is slower.
     pub(super) src_period_ns: Option<u64>,
+    /// Longest host submit+poll chain observed this tick, independent of perf sampling.
+    pub(super) encode_chain_ns: u64,
     pub(super) last_real_cap: Option<std::time::Instant>,
     pub(super) was_degraded: bool,
     pub(super) last_cadence_log: Option<std::time::Instant>,
@@ -1069,6 +1071,7 @@ impl StreamState {
             last_fec: fec_target.load(Ordering::Relaxed),
             depth_frames: 0,
             src_period_ns: None,
+            encode_chain_ns: 0,
             last_real_cap: None,
             was_degraded: false,
             last_cadence_log: None,

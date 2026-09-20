@@ -109,6 +109,9 @@ struct Params {
     height: u32,
     fps: u32,
     chroma: ChromaFormat,
+    /// Negotiated stream depth (8 or 10) and the BT.2020 PQ flag.
+    bit_depth: u8,
+    hdr: bool,
 }
 
 enum Fail {
@@ -268,7 +271,15 @@ impl Link {
                     chunk_aligned,
                 })
             }
-            FromWorker::EncodeErr { message } => Err(Fail::Encode(message)),
+            FromWorker::EncodeErr {
+                message,
+                capture_rebuild,
+            } => {
+                if capture_rebuild {
+                    super::vk_util::reject_dmabuf(d, &message);
+                }
+                Err(Fail::Encode(message))
+            }
             other => Err(Fail::Dead(anyhow::anyhow!(
                 "unexpected encode worker reply to a frame: {other:?}"
             ))),
@@ -335,6 +346,8 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
         fps: p.fps,
         bitrate_bps,
         chroma444: p.chroma.is_444(),
+        bit_depth: p.bit_depth,
+        hdr: p.hdr,
         // Resolved here and forwarded. The worker strips this variable from its own environment,
         // so the operator's knob cannot silently mean something different across the boundary.
         priority_intent: std::env::var("PYROWAVE_QUEUE_PRIORITY").ok(),
@@ -404,16 +417,28 @@ pub(crate) fn open_preferring_worker(
     fps: u32,
     bitrate_bps: u64,
     chroma: ChromaFormat,
+    bit_depth: u8,
+    hdr: bool,
 ) -> Result<Box<dyn Encoder>> {
     let params = Params {
         width,
         height,
         fps,
         chroma,
+        bit_depth,
+        hdr,
     };
     let inline = || -> Result<Box<dyn Encoder>> {
-        super::pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps, chroma)
-            .map(|e| Box::new(e) as Box<dyn Encoder>)
+        super::pyrowave::PyroWaveEncoder::open(
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            chroma,
+            bit_depth,
+            hdr,
+        )
+        .map(|e| Box::new(e) as Box<dyn Encoder>)
     };
     let path = match resolve_worker_path() {
         WorkerPath::Off => {
@@ -532,6 +557,8 @@ impl RemotePyroWave {
                 self.params.fps,
                 self.bitrate_bps,
                 self.params.chroma,
+                self.params.bit_depth,
+                self.params.hdr,
             )
             .context("open the in-process PyroWave encoder after leaving the worker")?;
             // Replay: the boundary changes the AU bytes, so a fallback that forgot it would ship
@@ -857,6 +884,8 @@ mod tests {
             height: 1080,
             fps: 60,
             chroma: ChromaFormat::Yuv420,
+            bit_depth: 8,
+            hdr: false,
         }
     }
 
@@ -895,6 +924,8 @@ mod tests {
                 offset: 0,
                 stride: 1920 * 4,
                 hold: None,
+                health: pf_zerocopy::zero_copy_health(42),
+                rebuild: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }),
             cursor,
         }
@@ -1101,6 +1132,8 @@ mod tests {
                 height: 64,
                 fps: 60,
                 chroma: ChromaFormat::Yuv420,
+                bit_depth: 8,
+                hdr: false,
             },
             bitrate_bps: 5_000_000,
             worker_path: PathBuf::from("/usr/bin/punktfunk-encode-worker"),
@@ -1324,8 +1357,7 @@ mod tests {
         }
     }
 
-    /// A live worker that refuses the frame classifies as `Encode`, which pins the session
-    /// in-process so the raw-dmabuf degrade latch (a host-process static) still fires.
+    /// A live worker refusal stays an encode error and forwards its capture-rebuild verdict.
     #[test]
     fn a_refused_frame_is_an_encode_error() {
         let (host, peer) = ipc::socketpair_seqpacket().unwrap();
@@ -1336,18 +1368,25 @@ mod tests {
                 peer.as_fd(),
                 &FromWorker::EncodeErr {
                     message: "unsupported dmabuf fourcc".into(),
+                    capture_rebuild: true,
                 },
                 &[],
             )
             .unwrap();
         });
         let mut link = mock_link(host, File::from(memfd()));
-        let f = frame(memfd(), None);
+        let mut f = frame(memfd(), None);
+        let FramePayload::Dmabuf(d) = &mut f.payload else {
+            unreachable!()
+        };
+        d.modifier = 7;
+        let rebuild = d.rebuild.clone();
         match link.encode(&f) {
             Err(Fail::Encode(m)) => assert!(m.contains("fourcc")),
             Err(Fail::Dead(e)) => panic!("a live worker's refusal must not read as death: {e:#}"),
             Ok(_) => panic!("a refusal must not produce an AU"),
         }
+        assert!(rebuild.load(std::sync::atomic::Ordering::Relaxed));
         server.join().unwrap();
     }
 

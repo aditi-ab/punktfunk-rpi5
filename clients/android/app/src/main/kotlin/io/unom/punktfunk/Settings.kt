@@ -151,8 +151,8 @@ data class Settings(
     val gamepadUiEnabled: Boolean = true,
     /**
      * Draw the console UI at 1080p and let the display scale it up, instead of at the panel's own
-     * resolution. Off by default — this is a deliberate sharpness-for-smoothness trade, not
-     * something to impose on a device that does not need it.
+     * resolution. On by default on a TV, off on a phone — a deliberate sharpness-for-smoothness
+     * trade, imposed only where the hardware cannot afford the sharpness.
      *
      * It exists for 4K TVs and projectors. Their graphics chips are chosen to decode and composite
      * video, not to shade a UI, and are far slower than a phone's; at 4K every pass the console
@@ -161,8 +161,13 @@ data class Settings(
      * a cheap 1080p stick, which never had the extra pixels to begin with.
      *
      * Read by [io.unom.punktfunk.console.SkiaConsoleShell], which applies it with
-     * `SurfaceHolder.setFixedSize` — the compositor then scales the smaller buffer up for free.
+     * `SurfaceHolder.setFixedSize` — the compositor then scales the smaller buffer up for free —
+     * and by the console shell itself, which draws its backdrop through a small retained pass.
      * The stream is untouched; that has its own `renderScale`.
+     *
+     * The data-class default is the PHONE answer. [SettingsStore.load] seeds the fold with the
+     * TV answer so an absent preference resolves on there; a stored value — either way — always
+     * wins, which is what keeps the user's revert honoured.
      */
     val reduceUiResolution: Boolean = false,
     /**
@@ -375,11 +380,20 @@ enum class StatsVerbosity(val label: String) {
 }
 
 /** Loads/saves [Settings] in the app-private `punktfunk_settings` prefs. */
-class SettingsStore(context: Context) {
+class SettingsStore(
+    context: Context,
+    /**
+     * A TV is the device the reduced interface is FOR (see [Settings.reduceUiResolution]). Seeded
+     * into the fold's base rather than written: `Field.load` reads the seed as the absent-key
+     * default, so a stored value still wins and nothing is persisted the user never picked.
+     */
+    private val tv: Boolean = isTvDevice(context),
+) {
     private val prefs =
         context.applicationContext.getSharedPreferences("punktfunk_settings", Context.MODE_PRIVATE)
 
-    fun load(): Settings = SettingsFields.ALL.fold(Settings()) { s, f -> f.load(s, prefs) }
+    fun load(): Settings =
+        SettingsFields.ALL.fold(Settings(reduceUiResolution = tv)) { s, f -> f.load(s, prefs) }
 
     fun save(s: Settings) {
         val e = prefs.edit()

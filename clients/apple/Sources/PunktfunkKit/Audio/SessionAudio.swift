@@ -256,8 +256,9 @@ public final class SessionAudio {
     static let preferredIOBufferSeconds: Double = 0.010
 
     #if !os(macOS)
-    /// Route + policy live in the session, not per-engine: stereo playback, mic capture when
-    /// enabled, Bluetooth allowed. Failure is non-fatal (defaults). Runs on `sessionQueue`.
+    /// Route + policy live in the session, not per-engine: playback at the negotiated rate and
+    /// channel count, mic capture when enabled, Bluetooth allowed on iOS. Failure is non-fatal
+    /// (defaults). Runs on `sessionQueue`.
     private func activateAudioSession(micEnabled: Bool) {
         let session = AVAudioSession.sharedInstance()
         let wanted = Double(wireRateHz)
@@ -299,23 +300,28 @@ public final class SessionAudio {
                 try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             }
             #else // tvOS — no app-accessible mic
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            // No `.mixWithOthers` here: a mixable playback session is offered a stereo mix, so
+            // HDMI would carry PCM 2.0 whatever the wire negotiated — and there is nothing to
+            // mix with on the box anyway.
+            try session.setCategory(.playback, mode: .default)
             #endif
             // Asked for on every branch, mic on or off. The hardware IO buffer is one shared,
             // device-wide setting: a session that asks for nothing runs at whatever iOS or another
             // mixing app chose (85 ms seen), and the ring's floor is this quantum plus one packet.
             try? session.setPreferredIOBufferDuration(Self.preferredIOBufferSeconds)
-            // The session's rate, asked for on EVERY branch — the `.playback` ones (mic off, and
-            // all of tvOS) used to ask for nothing at all, which was invisible while the answer
-            // was always 48 kHz and is the difference between real and resampled hi-res now. Set
-            // BEFORE `setActive`: the hardware is configured on activation, and a preference
-            // expressed after it only takes effect at the next route change.
-            //
-            // Best-effort by API contract, and genuinely refused in practice — a Bluetooth route
-            // has no 96 kHz mode to give (§9's iOS caveat). Which is why nothing downstream reads
-            // this back as permission: `noteOutputRate` checks what the graph was ACTUALLY built
-            // on, and the honest statement is made there.
+            // The session's rate, on every branch. BEFORE `setActive`: the hardware is configured
+            // on activation, and a preference expressed after it only takes effect at the next
+            // route change. Best-effort — a Bluetooth route has no 96 kHz mode to give, which is
+            // why `noteOutputFormat` reads back what the graph actually got.
             try? session.setPreferredSampleRate(wanted)
+            // Channel count, same rule and same ordering as the rate: a session that asks for
+            // nothing is offered the route's default — 2 on HDMI — and the mixer then folds a
+            // negotiated 5.1 to stereo without a word. Best-effort like the rest: a stereo
+            // route answers 2.
+            let wireChannels = Int(connection.resolvedAudioChannels)
+            if wireChannels > 2 {
+                try? session.setPreferredOutputNumberOfChannels(wireChannels)
+            }
             try session.setActive(true)
             // What we were actually GRANTED, not what we asked for. All three are best-effort, and
             // the ring's behaviour depends on the quantum it really gets — without this, a report of
@@ -327,6 +333,8 @@ public final class SessionAudio {
                 AVAudioSession active: io_buffer_ms=\
                 \(grantedMS, format: .fixed(precision: 2)) asked_ms=\(Int(askedMS)) \
                 sample_rate=\(Int(session.sampleRate)) wire_rate=\(Int(wanted)) \
+                out_ch=\(session.outputNumberOfChannels)/\(session.maximumOutputNumberOfChannels) \
+                wire_ch=\(wireChannels) \
                 route=\(session.currentRoute.outputs.first?.portType.rawValue ?? "none") \
                 input=\(session.currentRoute.inputs.first?.portType.rawValue ?? "none")
                 """)
@@ -1004,17 +1012,11 @@ public final class SessionAudio {
         // buffer grant. The largest callback the PREVIOUS engine saw is not a floor for this one.
         ring.forgetRenderQuantum()
 
-        // Engine-native deinterleaved float; the render block deinterleaves from the ring. Surround
-        // uses an explicit wire-order channel layout; the mixer downmixes to the output device when
-        // it has fewer speakers (e.g. an iPhone's stereo built-ins). (Explicit if/else rather than
-        // map/flatMap so it's correct whether the channelLayout initializer is failable or not.)
-        //
-        // The rate here describes the SAMPLES, not the hardware: it is the rate `nextAudioPcm`
-        // hands them back at, and the engine converts from it to whatever the output device runs
-        // at. Declaring the device's rate instead would play a 96 kHz stream at half speed — which
-        // is why the honesty check about a device that refused the rate (`noteOutputRate`) reports
-        // rather than re-formats. Resampling in the mixer is the fallback; claiming hi-res while it
-        // happens is the thing §9 forbids.
+        // Engine-native deinterleaved float; the render block deinterleaves the ring's wire order,
+        // surround with an explicit channel layout (`wireChannelLayout` is failable — hence
+        // if/else, not map). The rate describes the SAMPLES, not the device: declare the device's
+        // rate and a 96 kHz stream plays at half speed. The mixer converts to whatever the output
+        // runs at — resample and downmix alike; `noteOutputFormat` says when that happened.
         let rate = Double(rateHz)
         var format: AVAudioFormat?
         if channels == 2 {
@@ -1046,33 +1048,50 @@ public final class SessionAudio {
         return (ring, source, format)
     }
 
-    /// Say — out loud, in the log — what rate this engine is REALLY rendering at, and whether it is
-    /// the one the session negotiated. Call it after `prepare()`, when the output node has settled
-    /// on the device's format; on iOS/tvOS that follows the AVAudioSession, on macOS the HAL device.
+    /// Say — out loud, in the log — what rate and channel count this engine is REALLY rendering
+    /// at, versus what the session negotiated. Call it after `prepare()`, when the output node
+    /// has settled on the device's format; on iOS/tvOS that follows the AVAudioSession, on macOS
+    /// the HAL device.
     ///
-    /// This is §9's "never claim a rate you did not get", at the client end. The whole hi-res
-    /// exercise is contingent on the samples reaching a converter-free path, and every layer here
-    /// will happily hide a failure to do so: `setPreferredSampleRate` is advisory and a Bluetooth
-    /// route simply has no 96 kHz mode, `AVAudioEngine`'s mixer resamples silently between any two
-    /// formats, and the stream keeps playing perfectly. The session would then cost 3.2 Mbps,
-    /// report 96 kHz on the HUD, and carry nothing above 24 kHz — which is precisely the shape of
-    /// bug design/hi-res-audio.md §4.3 exists to name, wearing the client's hat instead of the
-    /// host's. Nothing here re-formats the graph (see `makePlaybackChain`): the samples are what
-    /// they are, the mixer's conversion is the correct fallback, and the only thing missing was
-    /// somebody saying so.
-    private func noteOutputRate(_ engine: AVAudioEngine, wireRateHz: Int) {
-        let deviceRate = Int(engine.outputNode.outputFormat(forBus: 0).sampleRate)
+    /// §9's "never claim a rate you did not get", plus its channel twin: a session that never
+    /// asks AVAudioSession for more than 2 renders a negotiated 5.1 as PCM 2.0 over HDMI — the
+    /// handshake says 6ch, the AVR says stereo, and nothing anywhere disagrees.
+    /// `setPreferredSampleRate` is advisory, the mixer resamples and downmixes silently between
+    /// any two formats, and the stream keeps playing either way. Nothing here re-formats the
+    /// graph — the mixer's conversion is the correct fallback; somebody just has to say it
+    /// happened.
+    private func noteOutputFormat(_ engine: AVAudioEngine, wireRateHz: Int) {
+        let outFormat = engine.outputNode.outputFormat(forBus: 0)
+        let deviceRate = Int(outFormat.sampleRate)
         // 0 = the node has no device yet (a start that is about to fail) — nothing to compare.
         guard deviceRate > 0 else { return }
-        guard deviceRate != wireRateHz else {
-            log.info("audio output opened at \(wireRateHz) Hz — the negotiated rate")
+        let outChannels = Int(outFormat.channelCount)
+        let wireChannels = Int(connection.resolvedAudioChannels)
+        if deviceRate == wireRateHz, outChannels == wireChannels {
+            log.info("""
+                audio output opened at \(wireRateHz) Hz \(outChannels)ch — the negotiated format
+                """)
             return
         }
-        log.warning("""
-            audio output is \(deviceRate) Hz but the session negotiated \(wireRateHz) Hz — the \
-            engine is resampling. Playback is correct; this session is NOT \(wireRateHz) Hz at the \
-            speaker, whatever the host resolved
-            """)
+        if deviceRate != wireRateHz {
+            log.warning("""
+                audio output is \(deviceRate) Hz but the session negotiated \(wireRateHz) Hz — \
+                the engine is resampling. Playback is correct; this session is NOT \
+                \(wireRateHz) Hz at the speaker, whatever the host resolved
+                """)
+        }
+        if outChannels < wireChannels {
+            log.warning("""
+                audio output is \(outChannels)ch but the session negotiated \(wireChannels)ch — \
+                the stream is folded to the route's width before it leaves the box. On an HDMI \
+                route that is PCM 2.0 to the AVR, whatever the host sent
+                """)
+        } else if outChannels > wireChannels {
+            log.info("""
+                audio output is \(outChannels)ch on a \(wireChannels)ch session — the tail \
+                channels carry silence
+                """)
+        }
     }
 
     private func startPlayback(speakerUID: String) {
@@ -1099,7 +1118,7 @@ public final class SessionAudio {
             log.error("playback engine failed to start: \(error.localizedDescription)")
             return
         }
-        noteOutputRate(engine, wireRateHz: wireRateHz)
+        noteOutputFormat(engine, wireRateHz: wireRateHz)
         stateLock.lock()
         if flag.isStopped {
             stateLock.unlock()
@@ -1262,7 +1281,7 @@ public final class SessionAudio {
         // Worth its own read on this path rather than only the plain one: the voice processor picks
         // its OWN formats when it engages (that is why the mic tap reads them after `prepare()`),
         // and a VPIO unit is the least likely thing in the graph to have honoured a 96 kHz request.
-        noteOutputRate(engine, wireRateHz: wireRateHz)
+        noteOutputFormat(engine, wireRateHz: wireRateHz)
         startDrain(into: ring)
         log.info("audio engines joined — voice processing (echo cancellation) active")
     }

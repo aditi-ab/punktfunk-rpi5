@@ -105,9 +105,8 @@ fn resolve_runner_in(
 }
 
 /// Nothing to grant off Windows: the runner is a systemd USER unit, so it already runs as the
-/// operator and reads exactly what they can.
-pub(super) fn grant(_dir: Option<&str>) -> Result<()> {
-    println!("Nothing to grant: the plugin runner is a systemd USER unit, so it runs as you.");
+/// operator and reads exactly what they can. The bind, not an ACL, is the boundary there.
+pub(super) fn grant(_dir: &std::path::Path, _write: bool) -> Result<()> {
     Ok(())
 }
 
