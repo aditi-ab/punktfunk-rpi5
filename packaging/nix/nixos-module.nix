@@ -862,9 +862,8 @@ in
           # MemoryDenyWriteExecute (bun JITs), PrivateDevices (VirtualHere forwards USB), and
           # ProtectKernelTunables, which refuses bwrap a fresh /proc; the sandbox binds /proc/sys ro.
           ProtectControlGroups = true;
-          # No RestrictNamespaces: on some kernels (measured: NixOS xanmod 7.2) listing
-          # `user mnt pid …` on a systemd --user unit makes bwrap --unshare-user fail with
-          # EPERM, so the runner starts no plugin. The plugin sandbox is bwrap itself.
+          # Exactly the namespaces each plugin's bwrap sandbox is built from; `true` starts no plugin.
+          RestrictNamespaces = "user mnt pid net ipc uts cgroup";
           SystemCallArchitectures = "native";
           CapabilityBoundingSet = "";
           # AF_NETLINK brings up a sandbox's loopback; its seccomp filter keeps it from the plugin.
