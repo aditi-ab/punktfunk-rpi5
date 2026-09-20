@@ -114,6 +114,15 @@ mod ctl_socket {
     }
 }
 
+#[cfg(any(target_os = "linux", windows, test))]
+fn resolve_hdr_enabled(
+    setting: bool,
+    output_hdr: bool,
+    presentable: impl FnOnce() -> bool,
+) -> bool {
+    setting && output_hdr && presentable()
+}
+
 #[cfg(any(target_os = "linux", windows))]
 mod session_main {
     use pf_client_core::gamepad::GamepadService;
@@ -270,16 +279,15 @@ mod session_main {
         )
     }
 
-    /// One session's pump parameters from the EFFECTIVE settings — shared by `--connect`
-    /// and every `--browse` launch. Explicit settings, `0` fields resolved to the
-    /// window's display (the GTK client reads the monitor under its window — same
-    /// contract).
+    /// Builds one session's pump parameters from effective settings.
     ///
-    /// `settings` is what [`trust::effective_settings`] returned, never a raw
-    /// `Settings::load()`: both callers resolve the host's preset first, so the two
-    /// construction sites cannot drift (they historically did — touching one and not the
-    /// other is a Windows-only build break). `preset` is that preset's name, for the
-    /// stats overlay's first line.
+    /// Both direct and browse launches pass the result of [`trust::effective_settings`],
+    /// including the resolved host preset. Zero-valued mode fields inherit the display
+    /// under the session window. `preset` names that resolution in the stats overlay.
+    ///
+    /// Capability preferences remain requests. Device and selected-output probes narrow
+    /// them before they enter [`SessionParams`], so the handshake only advertises formats
+    /// this session can present.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn session_params(
         settings: &trust::Settings,
@@ -386,18 +394,24 @@ mod session_main {
                  decodes full chroma on any GPU."
             );
         }
-        // Computed before the struct literal below moves `vulkan`. Advertising HDR invites a
-        // PQ stream, and a device with no HDR10 swapchain and no PQ→sRGB tone-map renders it
-        // green. `ten_bit_sdr` is not gated on this: 10-bit SDR needs no tone-map, and every
-        // hardware rung decodes P010.
-        let hdr_enabled =
-            settings.hdr_enabled && pf_client_core::video::hdr_presentable(vulkan.as_ref());
+        // Windows offers HDR only when the selected output is actively presenting HDR.
+        // Driver-declared SDR tone-mapping is not enough: unsupported outputs can accept
+        // the conversion and cover the stream with a black or corrupt layer. The peak-nits
+        // environment override remains the explicit headless-test bypass.
+        #[cfg(windows)]
+        let display_hdr = punktfunk_core::client::display_hdr_env_override()
+            .or_else(|| pf_client_core::video_d3d11::display_hdr_volume(window_pos()));
+        #[cfg(windows)]
+        let output_hdr = display_hdr.is_some();
+        #[cfg(not(windows))]
+        let output_hdr = true;
+        let hdr_enabled = super::resolve_hdr_enabled(settings.hdr_enabled, output_hdr, || {
+            pf_client_core::video::hdr_presentable(vulkan.as_ref())
+        });
         if settings.hdr_enabled && !hdr_enabled {
             tracing::warn!(
-                "HDR requested but this device can't present a PQ stream (no HDR10 \
-                 swapchain, and the video processor reports no PQ→sRGB conversion) — \
-                 asking for SDR instead. Advertising it would paint the stream green: \
-                 the driver accepts the tonemap it can't do and renders garbage."
+                reason = "the selected output or presentation path does not support PQ",
+                "HDR request declined"
             );
         }
         SessionParams {
@@ -447,9 +461,7 @@ mod session_main {
             // unadvertised 10-bit/HDR makes the volume noise. Linux has no portable query
             // and keeps the host EDID; `PUNKTFUNK_CLIENT_PEAK_NITS` overrides both.
             #[cfg(windows)]
-            display_hdr: hdr_enabled
-                .then(|| pf_client_core::video_d3d11::display_hdr_volume(window_pos()))
-                .flatten(),
+            display_hdr: hdr_enabled.then_some(display_hdr).flatten(),
             #[cfg(not(windows))]
             display_hdr: None,
             // The presenter renders the host cursor locally in desktop mouse mode (M2 cursor
@@ -1195,6 +1207,21 @@ mod session_main {
                 assert_eq!(stats_tier_with(s.stats_verbosity(), false), chosen);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_hdr_enabled;
+
+    // The stored preference cannot advertise HDR through an SDR Windows output.
+    // Presentation support remains a separate required device fact.
+    #[test]
+    fn hdr_requires_the_setting_output_and_presenter() {
+        assert!(resolve_hdr_enabled(true, true, || true));
+        assert!(!resolve_hdr_enabled(false, true, || panic!()));
+        assert!(!resolve_hdr_enabled(true, false, || panic!()));
+        assert!(!resolve_hdr_enabled(true, true, || false));
     }
 }
 
