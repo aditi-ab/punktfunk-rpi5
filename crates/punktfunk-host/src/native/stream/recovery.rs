@@ -8,8 +8,8 @@ use super::*;
 
 impl StreamState {
     /// Apply adaptive FEC behind the encoder rate it implies. A budget-identity
-    /// codec needs no retarget; every other codec publishes only after its
-    /// encoder accepts. A refusal leaves both on the previous FEC for a retry.
+    /// codec needs no retarget; a synchronous encoder publishes after accepting.
+    /// An asynchronous or refused retarget leaves both on the previous FEC.
     pub(super) fn on_fec_moved(&mut self) {
         let requested = self.fec_requested.load(Ordering::Acquire);
         if requested == self.last_fec {
@@ -22,6 +22,7 @@ impl StreamState {
         let prev = self.enc_derive(self.last_fec).enc_kbps(self.bitrate_kbps);
         let want = self.enc_derive(requested).enc_kbps(self.bitrate_kbps);
         if fec_retarget(
+            self.enc.bitrate_retarget_is_synchronous(),
             |bps| want == prev || self.enc.reconfigure_bitrate(bps),
             want as u64 * 1000,
             &self.fec_target,
@@ -51,6 +52,7 @@ impl StreamState {
     /// the ack and the encoder never disagree. Clamping again here would make an ack the client
     /// already holds a promise the encoder was never given.
     pub(super) fn on_bitrate_request(&mut self) {
+        self.settle_applied_rate();
         let mut want_kbps = None;
         while let Ok(k) = self.bitrate_rx.try_recv() {
             want_kbps = Some(k);
@@ -139,12 +141,47 @@ impl StreamState {
         }
     }
 
+    /// The rate the encoder settled on, read back after the fact.
+    ///
+    /// An encoder that applies a retarget on its own thread — the Windows IDD
+    /// driver, whose bitrate control is a queued message with no reply —
+    /// answers a frame later, so the read taken beside the request cannot see a
+    /// decline. Only a retarget is read back this way, and only a rate below
+    /// the session's own is acted on: an encoder that answers in place cannot
+    /// trip it, because the session rate came from this same read-back.
+    fn settle_applied_rate(&mut self) {
+        if !self.retargeted {
+            return;
+        }
+        let ed = self.enc_now();
+        let Some(applied) = self
+            .enc
+            .applied_bitrate_bps()
+            .map(|b| (b / 1000) as u32)
+            .filter(|&k| k > 0)
+            .map(|k| ed.applied_budget_kbps(self.bitrate_kbps, k))
+            .filter(|&k| k < self.bitrate_kbps)
+        else {
+            return;
+        };
+        tracing::info!(
+            from_kbps = self.bitrate_kbps,
+            to_kbps = applied,
+            "the encoder settled below the rate it was given — the session follows it"
+        );
+        self.note_applied_rate(self.bitrate_kbps, applied);
+        self.counters.note_bitrate(applied);
+        self.bitrate_kbps = applied;
+        self.live_bitrate.store(applied, Ordering::Relaxed);
+    }
+
     /// What the encoder made of `want`: the ceiling learns it, and a client that
     /// was promised `want` is corrected.
     ///
     /// A failed rebuild reports the rate it kept, so a refusal that costs no
     /// encoder at all still teaches the ceiling.
     fn note_applied_rate(&mut self, want: u32, applied: u32) {
+        self.retargeted = true;
         self.encoder_ceiling
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -397,11 +434,11 @@ fn publish_fec(fec_target: &AtomicU8, last_fec: &mut u8, requested: u8) {
     fec_target.store(requested, Ordering::Release);
 }
 
-/// Apply a control-proposed FEC target behind the encoder's answer: `retarget` is the
-/// in-place `reconfigure_bitrate` (true when the new FEC implies no rate change), and
-/// only its success moves `last_fec` and the applied `fec_target`. On refusal the
-/// request slot returns to the applied value — unless a newer proposal already landed.
+/// Apply a control-proposed FEC target behind the encoder's answer. Only a
+/// synchronous accepted retarget moves applied FEC; an asynchronous or refused
+/// request returns the slot to the applied value unless a newer proposal landed.
 pub(super) fn fec_retarget(
+    synchronous: bool,
     retarget: impl FnOnce(u64) -> bool,
     bps: u64,
     fec_target: &AtomicU8,
@@ -409,7 +446,7 @@ pub(super) fn fec_retarget(
     last_fec: &mut u8,
     requested: u8,
 ) -> bool {
-    if retarget(bps) {
+    if synchronous && retarget(bps) {
         publish_fec(fec_target, last_fec, requested);
         true
     } else {
@@ -786,6 +823,27 @@ mod tests {
         assert_eq!(applied.load(Ordering::Relaxed), 30);
     }
 
+    /// An asynchronous encoder has only queued the rate when it returns true.
+    /// FEC stays applied at the old value and no retarget is attempted here.
+    #[test]
+    fn on_fec_moved_holds_fec_for_an_asynchronous_encoder() {
+        let applied = AtomicU8::new(10);
+        let requested = AtomicU8::new(30);
+        let mut last_fec = 10;
+        assert!(!fec_retarget(
+            false,
+            |_| panic!("an asynchronous FEC retarget must not be queued"),
+            12_000_000,
+            &applied,
+            &requested,
+            &mut last_fec,
+            30,
+        ));
+        assert_eq!(last_fec, 10);
+        assert_eq!(applied.load(Ordering::Relaxed), 10);
+        assert_eq!(requested.load(Ordering::Relaxed), 10);
+    }
+
     /// The `want == prev` leg aside, [`StreamState::on_fec_moved`] is this helper:
     /// an accepted retarget publishes the requested FEC to `fec_target` and
     /// `last_fec` together.
@@ -799,6 +857,7 @@ mod tests {
             asks: Vec::new(),
         };
         assert!(fec_retarget(
+            true,
             |bps| enc.reconfigure_bitrate(bps),
             12_000_000,
             &applied,
@@ -824,6 +883,7 @@ mod tests {
             asks: Vec::new(),
         };
         assert!(!fec_retarget(
+            true,
             |bps| enc.reconfigure_bitrate(bps),
             12_000_000,
             &applied,
@@ -850,6 +910,7 @@ mod tests {
             asks: Vec::new(),
         };
         assert!(!fec_retarget(
+            true,
             |bps| enc.reconfigure_bitrate(bps),
             12_000_000,
             &applied,

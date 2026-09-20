@@ -299,6 +299,9 @@ impl Encoder for TrackedEncoder {
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
         self.inner.reconfigure_bitrate(bps.max(MIN_BITRATE_BPS))
     }
+    fn bitrate_retarget_is_synchronous(&self) -> bool {
+        self.inner.bitrate_retarget_is_synchronous()
+    }
     fn applied_bitrate_bps(&self) -> Option<u64> {
         self.inner.applied_bitrate_bps()
     }

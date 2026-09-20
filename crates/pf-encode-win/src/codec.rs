@@ -325,6 +325,12 @@ pub trait Encoder: Send {
     fn reconfigure_bitrate(&mut self, _bps: u64) -> bool {
         false
     }
+    /// Whether `true` from [`Self::reconfigure_bitrate`] means the encoder has
+    /// already accepted the rate. An asynchronous proxy leaves this false so
+    /// parity does not move ahead of an unconfirmed encoder budget.
+    fn bitrate_retarget_is_synchronous(&self) -> bool {
+        true
+    }
     /// Bitrate (bps) the encoder is actually running at (or will open at, for a
     /// lazily-opened backend) after any internal clamp. The session stores this,
     /// not the requested rate, as the live bitrate so the send pacer, console,

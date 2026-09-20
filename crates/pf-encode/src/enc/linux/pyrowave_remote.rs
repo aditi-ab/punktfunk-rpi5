@@ -811,6 +811,12 @@ impl Encoder for RemotePyroWave {
         }
     }
 
+    fn bitrate_retarget_is_synchronous(&self) -> bool {
+        // `Reconfigure` blocks for the worker's Ack, which it sends only after its own
+        // `reconfigure_bitrate` returns; the in-process fallback applies the rate in-call.
+        true
+    }
+
     fn applied_bitrate_bps(&self) -> Option<u64> {
         // PyroWave applies the requested rate as a per-frame byte budget with no internal clamp
         // to report.

@@ -181,6 +181,10 @@ pub(super) struct StreamState {
     pub(super) fec_requested: Arc<AtomicU8>,
     pub(super) live_bitrate: Arc<AtomicU32>,
     pub(super) encoder_ceiling: Arc<std::sync::Mutex<super::EncoderCeiling>>,
+    /// A rate was handed to this encoder after it opened, so a later read-back
+    /// is about that retarget. What a pipeline opened at is the build's own
+    /// business (`Pipeline::bitrate_kbps`), and is not re-litigated here.
+    pub(super) retargeted: bool,
     pub(super) cadence_degraded: Arc<AtomicBool>,
     pub(super) cadence_behind_score: Arc<AtomicU32>,
     pub(super) client_packets_received: Arc<AtomicU32>,
@@ -241,6 +245,7 @@ impl StreamState {
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
         }
+        self.retargeted = false;
         self.adopt_reframe(p.reframe);
         self.capturer = p.capturer;
         self.enc = p.enc;
@@ -981,6 +986,7 @@ impl StreamState {
             fec_requested: fec_requested.clone(),
             live_bitrate,
             encoder_ceiling,
+            retargeted: false,
             cadence_degraded,
             cadence_behind_score,
             client_packets_received,
