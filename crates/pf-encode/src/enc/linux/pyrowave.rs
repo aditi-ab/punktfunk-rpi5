@@ -1766,10 +1766,15 @@ impl Encoder for PyroWaveEncoder {
             }
             self.chunker = None;
         }
+        // `submit` only queues GPU work; mirror `poll`'s wait so the AU reaches `pending`.
+        if self.pending.is_empty() && !self.inflight.is_empty() {
+            // SAFETY: single-threaded encoder, waiting its own fence and reading its own
+            // bitstream; failure leaves the entry in flight for `reset()` to re-wait.
+            unsafe { self.wait_and_packetize()? };
+        }
         let Some(f) = self.pending.pop_front() else {
             return Ok(None);
         };
-        // No wait: `submit` already ran the encode, so an AU in `pending` is complete.
         match crate::pyrowave_wire::stream_chunk_step(self.wire_chunk) {
             Some(step) => Ok(self
                 .chunker
