@@ -126,7 +126,10 @@ impl ModifierCache {
         *self
             .supported
             .entry((fmt.as_raw(), modifier))
-            .or_insert_with(|| unsafe { modifier_importable(instance, pdev, fmt, modifier) })
+            .or_insert_with(|| {
+                // SAFETY: `instance`/`pdev` are live and paired by the caller's contract.
+                unsafe { modifier_importable(instance, pdev, fmt, modifier) }
+            })
     }
 }
 

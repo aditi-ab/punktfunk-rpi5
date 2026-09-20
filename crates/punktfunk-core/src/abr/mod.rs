@@ -408,7 +408,7 @@ impl Driver {
     }
 
     /// What the bring-up ramp came to, once it has stopped.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "quic"))]
     pub(crate) fn ramp_summary(&self) -> Option<probe::RampSummary> {
         self.probe.ramp_summary()
     }
