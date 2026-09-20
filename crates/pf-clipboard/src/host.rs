@@ -85,7 +85,7 @@ fn fulfill_paste(fd: OwnedFd, bytes: &[u8]) -> std::io::Result<()> {
 
 pub enum HostClipboard {
     #[cfg(target_os = "linux")]
-    DataControl(wayland::ClipboardBackend),
+    DataControl(Box<wayland::ClipboardBackend>),
     #[cfg(target_os = "linux")]
     Mutter(mutter::MutterClipboard),
     #[cfg(target_os = "windows")]
@@ -105,7 +105,7 @@ impl HostClipboard {
                 .await
                 .map_err(|e| anyhow::anyhow!("data-control open join: {e}"))?;
             match dc {
-                Ok((b, rx)) => return Ok((HostClipboard::DataControl(b), rx)),
+                Ok((b, rx)) => return Ok((HostClipboard::DataControl(Box::new(b)), rx)),
                 Err(e) => tracing::debug!(
                     error = format!("{e:#}"),
                     "no ext-data-control — trying Mutter direct clipboard"
