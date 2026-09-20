@@ -38,6 +38,8 @@ quic = ["tls", "pake", "dep:quinn", "dep:tokio", "dep:rcgen", "dep:opus", "dep:s
 ureq-tls = ["tls", "dep:ureq"]
 # Serde derives on the stats-overlay snapshot (`hud`), for the desktop's `stats-json:` line.
 serde = ["dep:serde"]
+# Optional native backend for armv7 SIMD; preserves the RFC 8439 wire format.
+chacha-aws-lc-rs = ["dep:aws-lc-rs"]
 
 [dependencies]
 reed-solomon-simd = "3.1"      # GF(2^16) Leopard-RS, SIMD, O(n log n) — the wall-breaker (P2)
@@ -53,6 +55,8 @@ aes-gcm = "0.11"               # AES-128-GCM session crypto, matches GameStream
 # Same RustCrypto `aead 0.6` generation as aes-gcm: identical trait/nonce/tag shapes, pure Rust,
 # cross-compiles like aes-gcm (no cmake). See design/chacha20-session-cipher.md.
 chacha20poly1305 = "0.11"
+# Optional for chacha-aws-lc-rs; prebuilt-nasm keeps aws-lc-sys building on Windows.
+aws-lc-rs = { version = "1.18", features = ["prebuilt-nasm"], optional = true }
 zerocopy = { version = "0.8", features = ["derive"] }
 socket2 = { version = "0.6", features = [
     "all",

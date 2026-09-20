@@ -83,3 +83,12 @@ To run it as a user service, copy `scripts/punktfunk-host.service` to
 `systemctl --user daemon-reload && systemctl --user enable --now punktfunk-host`. The other
 workspace members (`punktfunk-web`, `punktfunk-scripting`, the client) build the same way — the
 root [README](https://git.unom.io/unom/punktfunk#build--test-from-source) covers the dev loop.
+
+## Client builds on ARM
+
+Client developers can add `chacha-aws-lc-rs` to the existing features on their
+`punktfunk-core` dependency to reduce streaming CPU use on 32-bit ARM devices such
+as webOS TVs. The client must still request ChaCha20 during connection setup.
+
+Existing clients keep their current behavior unless they opt in. No host update
+or settings migration is needed.

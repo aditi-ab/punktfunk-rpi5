@@ -3777,6 +3777,7 @@ name = "punktfunk-core"
 version = "0.38.0"
 dependencies = [
  "aes-gcm",
+ "aws-lc-rs",
  "cbindgen",
  "chacha20poly1305",
  "criterion",

@@ -16,7 +16,6 @@ use crate::config::Role;
 use crate::error::{PunktfunkError, Result};
 use aes_gcm::aead::{Aead, AeadInOut, KeyInit, Payload};
 use aes_gcm::Aes128Gcm;
-use chacha20poly1305::ChaCha20Poly1305;
 use zeroize::Zeroize;
 
 pub const TAG_LEN: usize = 16;
@@ -24,6 +23,110 @@ pub const TAG_LEN: usize = 16;
 // CRYPTO_OVERHEAD and every in-place split assume both AEADs append TAG_LEN.
 const _: () = assert!(std::mem::size_of::<aes_gcm::Tag>() == TAG_LEN);
 const _: () = assert!(std::mem::size_of::<chacha20poly1305::Tag>() == TAG_LEN);
+
+// Both backends use the same nonce, AAD, and detached tag.
+mod chacha {
+    #[cfg(feature = "chacha-aws-lc-rs")]
+    mod imp {
+        use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+
+        use crate::crypto::TAG_LEN;
+        use crate::error::{PunktfunkError, Result};
+
+        pub struct Key(LessSafeKey);
+
+        impl Key {
+            pub fn new(key: &[u8; 32]) -> Self {
+                debug_assert_eq!(CHACHA20_POLY1305.tag_len(), TAG_LEN);
+                // `LessSafeKey` because the nonce is ours (`salt || seq`), not a counter the
+                // library owns; uniqueness is this module's invariant, documented above.
+                let key = UnboundKey::new(&CHACHA20_POLY1305, key).expect("32-byte ChaCha20 key");
+                Key(LessSafeKey::new(key))
+            }
+
+            pub fn seal_in_place(
+                &self,
+                nonce: [u8; 12],
+                aad: [u8; 8],
+                plaintext: &mut [u8],
+            ) -> Result<[u8; TAG_LEN]> {
+                let tag = self
+                    .0
+                    .seal_in_place_separate_tag(
+                        Nonce::assume_unique_for_key(nonce),
+                        Aad::from(aad),
+                        plaintext,
+                    )
+                    .map_err(|_| PunktfunkError::Crypto)?;
+                let mut out = [0u8; TAG_LEN];
+                out.copy_from_slice(tag.as_ref());
+                Ok(out)
+            }
+
+            pub fn open_in_place(
+                &self,
+                nonce: [u8; 12],
+                aad: [u8; 8],
+                ciphertext: &mut [u8],
+                tag: &[u8; TAG_LEN],
+            ) -> Result<()> {
+                self.0
+                    .open_in_place_separate_tag(
+                        Nonce::assume_unique_for_key(nonce),
+                        Aad::from(aad),
+                        tag,
+                        ciphertext,
+                    )
+                    .map_err(|_| PunktfunkError::Crypto)?;
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(not(feature = "chacha-aws-lc-rs"))]
+    mod imp {
+        use chacha20poly1305::aead::{AeadInOut, KeyInit};
+        use chacha20poly1305::ChaCha20Poly1305;
+
+        use crate::crypto::TAG_LEN;
+        use crate::error::{PunktfunkError, Result};
+
+        pub struct Key(ChaCha20Poly1305);
+
+        impl Key {
+            pub fn new(key: &[u8; 32]) -> Self {
+                Key(ChaCha20Poly1305::new(key.into()))
+            }
+
+            pub fn seal_in_place(
+                &self,
+                nonce: [u8; 12],
+                aad: [u8; 8],
+                plaintext: &mut [u8],
+            ) -> Result<[u8; TAG_LEN]> {
+                let tag = self
+                    .0
+                    .encrypt_inout_detached((&nonce).into(), &aad, plaintext.into())
+                    .map_err(|_| PunktfunkError::Crypto)?;
+                Ok(tag.into())
+            }
+
+            pub fn open_in_place(
+                &self,
+                nonce: [u8; 12],
+                aad: [u8; 8],
+                ciphertext: &mut [u8],
+                tag: &[u8; TAG_LEN],
+            ) -> Result<()> {
+                self.0
+                    .decrypt_inout_detached((&nonce).into(), &aad, ciphertext.into(), tag.into())
+                    .map_err(|_| PunktfunkError::Crypto)
+            }
+        }
+    }
+
+    pub use imp::Key;
+}
 
 /// Negotiated AEAD plus matching key. Mixed cipher/key sizes are unrepresentable.
 /// ChaCha is 32 bytes (RFC 8439); offered when the peer advertised
@@ -75,7 +178,7 @@ impl Zeroize for SessionKey {
 #[allow(clippy::large_enum_variant)]
 enum Cipher {
     Aes128Gcm(Aes128Gcm),
-    ChaCha20Poly1305(ChaCha20Poly1305),
+    ChaCha20Poly1305(chacha::Key),
 }
 
 pub struct SessionCrypto {
@@ -91,9 +194,7 @@ impl SessionCrypto {
         let cipher = match key {
             // Compile-time `&[u8; N]` → `hybrid_array`; not runtime `from_slice`.
             SessionKey::Aes128Gcm(k) => Cipher::Aes128Gcm(Aes128Gcm::new(k.into())),
-            SessionKey::ChaCha20Poly1305(k) => {
-                Cipher::ChaCha20Poly1305(ChaCha20Poly1305::new(k.into()))
-            }
+            SessionKey::ChaCha20Poly1305(k) => Cipher::ChaCha20Poly1305(chacha::Key::new(k)),
         };
         let own = direction(role);
         SessionCrypto {
@@ -112,10 +213,17 @@ impl SessionCrypto {
             aad: &aad,
         };
         match &self.cipher {
-            Cipher::Aes128Gcm(c) => c.encrypt((&nonce).into(), payload),
-            Cipher::ChaCha20Poly1305(c) => c.encrypt((&nonce).into(), payload),
+            Cipher::Aes128Gcm(c) => c
+                .encrypt((&nonce).into(), payload)
+                .map_err(|_| PunktfunkError::Crypto),
+            Cipher::ChaCha20Poly1305(c) => {
+                let mut buf = Vec::with_capacity(plaintext.len() + TAG_LEN);
+                buf.extend_from_slice(plaintext);
+                let tag = c.seal_in_place(nonce, aad, &mut buf)?;
+                buf.extend_from_slice(&tag);
+                Ok(buf)
+            }
         }
-        .map_err(|_| PunktfunkError::Crypto)
     }
 
     /// Seal in place: `buf` is `[plaintext..][TAG_LEN scratch]`; returns
@@ -127,20 +235,21 @@ impl SessionCrypto {
         let (plaintext, tag_slot) = buf.split_at_mut(split);
         let aad = seq.to_be_bytes();
         let tag = match &self.cipher {
-            Cipher::Aes128Gcm(c) => {
-                c.encrypt_inout_detached((&nonce).into(), &aad, plaintext.into())
-            }
-            Cipher::ChaCha20Poly1305(c) => {
-                c.encrypt_inout_detached((&nonce).into(), &aad, plaintext.into())
-            }
-        }
-        .map_err(|_| PunktfunkError::Crypto)?;
+            Cipher::Aes128Gcm(c) => c
+                .encrypt_inout_detached((&nonce).into(), &aad, plaintext.into())
+                .map_err(|_| PunktfunkError::Crypto)?
+                .into(),
+            Cipher::ChaCha20Poly1305(c) => c.seal_in_place(nonce, aad, plaintext)?,
+        };
         tag_slot.copy_from_slice(&tag);
         Ok(())
     }
 
     /// Open `ciphertext || tag` for `seq` (also AAD).
     pub fn open(&self, seq: u64, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        if ciphertext.len() < TAG_LEN {
+            return Err(PunktfunkError::Crypto);
+        }
         let nonce = nonce(self.recv_salt, seq);
         let aad = seq.to_be_bytes();
         let payload = Payload {
@@ -148,15 +257,21 @@ impl SessionCrypto {
             aad: &aad,
         };
         match &self.cipher {
-            Cipher::Aes128Gcm(c) => c.decrypt((&nonce).into(), payload),
-            Cipher::ChaCha20Poly1305(c) => c.decrypt((&nonce).into(), payload),
+            Cipher::Aes128Gcm(c) => c
+                .decrypt((&nonce).into(), payload)
+                .map_err(|_| PunktfunkError::Crypto),
+            Cipher::ChaCha20Poly1305(_) => {
+                let mut buf = ciphertext.to_vec();
+                let n = self.open_in_place(seq, &mut buf)?;
+                buf.truncate(n);
+                Ok(buf)
+            }
         }
-        .map_err(|_| PunktfunkError::Crypto)
     }
 
     /// Open in place: `buf` is `[ciphertext..][tag]`; on success plaintext
-    /// occupies the first `len - TAG_LEN` bytes (returned). Tag check runs
-    /// before decrypt, so failure leaves `buf` as ciphertext.
+    /// occupies the first `len - TAG_LEN` bytes (returned).
+    /// On failure, discard the buffer: its contents are unspecified.
     pub fn open_in_place(&self, seq: u64, buf: &mut [u8]) -> Result<usize> {
         if buf.len() < TAG_LEN {
             return Err(PunktfunkError::BadPacket);
@@ -165,17 +280,13 @@ impl SessionCrypto {
         let split = buf.len() - TAG_LEN;
         let (ciphertext, tag) = buf.split_at_mut(split);
         let aad = seq.to_be_bytes();
-        // Tag is TAG_LEN (const-asserted). Map, don't unwrap: hot path must not panic.
-        let tag: &aes_gcm::Tag = (&*tag).try_into().map_err(|_| PunktfunkError::Crypto)?;
+        let tag: &[u8; TAG_LEN] = (&*tag).try_into().map_err(|_| PunktfunkError::Crypto)?;
         match &self.cipher {
-            Cipher::Aes128Gcm(c) => {
-                c.decrypt_inout_detached((&nonce).into(), &aad, ciphertext.into(), tag)
-            }
-            Cipher::ChaCha20Poly1305(c) => {
-                c.decrypt_inout_detached((&nonce).into(), &aad, ciphertext.into(), tag)
-            }
+            Cipher::Aes128Gcm(c) => c
+                .decrypt_inout_detached((&nonce).into(), &aad, ciphertext.into(), tag.into())
+                .map_err(|_| PunktfunkError::Crypto)?,
+            Cipher::ChaCha20Poly1305(c) => c.open_in_place(nonce, aad, ciphertext, tag)?,
         }
-        .map_err(|_| PunktfunkError::Crypto)?;
         Ok(split)
     }
 }
@@ -230,6 +341,83 @@ mod tests {
             SessionKey::Aes128Gcm(random_key()),
             SessionKey::ChaCha20Poly1305(random_key32()),
         ]
+    }
+
+    // Cross-library checks keep the backend switch wire-compatible in both directions.
+    #[cfg(feature = "chacha-aws-lc-rs")]
+    #[test]
+    fn chacha_matches_rustcrypto_bytes() {
+        use chacha20poly1305::ChaCha20Poly1305;
+
+        let key = [0x5a; 32];
+        let salt = [0x93, 0x37, 0x42, 0x99];
+        let host = SessionCrypto::new(&SessionKey::ChaCha20Poly1305(key), salt, Role::Host);
+        let client = SessionCrypto::new(&SessionKey::ChaCha20Poly1305(key), salt, Role::Client);
+        let reference = ChaCha20Poly1305::new((&key).into());
+
+        for (sender, receiver, dir) in [(&host, &client, 0), (&client, &host, 1)] {
+            for seq in [0, 1, 4242, u64::MAX] {
+                for len in [0, 1, 15, 16, 17, 63, 64, 65, 255, 256, 257, 1408] {
+                    let msg: Vec<u8> = (0..len).map(|i| i as u8).collect();
+                    let nonce = nonce(dir_salt(salt, dir), seq);
+                    let aad = seq.to_be_bytes();
+                    let theirs = reference
+                        .encrypt(
+                            (&nonce).into(),
+                            Payload {
+                                msg: &msg,
+                                aad: &aad,
+                            },
+                        )
+                        .unwrap();
+                    let ours = sender.seal(seq, &msg).unwrap();
+                    assert_eq!(ours, theirs, "dir={dir} seq={seq} len={len}");
+                    assert_eq!(
+                        reference
+                            .decrypt(
+                                (&nonce).into(),
+                                Payload {
+                                    msg: &ours,
+                                    aad: &aad
+                                }
+                            )
+                            .unwrap(),
+                        msg
+                    );
+                    let mut buf = msg.clone();
+                    buf.resize(len + TAG_LEN, 0);
+                    sender.seal_in_place(seq, &mut buf).unwrap();
+                    assert_eq!(buf, theirs);
+                    assert_eq!(receiver.open(seq, &theirs).unwrap(), msg);
+                    let n = receiver.open_in_place(seq, &mut buf).unwrap();
+                    assert_eq!(&buf[..n], msg);
+
+                    for index in [0, theirs.len() - 1] {
+                        let mut corrupted = theirs.clone();
+                        corrupted[index] ^= 1;
+                        assert!(receiver.open(seq, &corrupted).is_err());
+                        assert!(receiver.open_in_place(seq, &mut corrupted).is_err());
+                    }
+                    let mut buf = theirs;
+                    assert!(receiver.open_in_place(seq ^ 1, &mut buf).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_tags_preserve_error_kinds() {
+        for key in both_keys() {
+            let crypto = SessionCrypto::new(&key, [0; 4], Role::Client);
+            for len in 0..TAG_LEN {
+                let mut buf = vec![0; len];
+                assert!(matches!(crypto.open(0, &buf), Err(PunktfunkError::Crypto)));
+                assert!(matches!(
+                    crypto.open_in_place(0, &mut buf),
+                    Err(PunktfunkError::BadPacket)
+                ));
+            }
+        }
     }
 
     #[test]
