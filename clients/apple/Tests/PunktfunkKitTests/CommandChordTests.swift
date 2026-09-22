@@ -136,11 +136,64 @@ final class CommandChordTests: XCTestCase {
         XCTAssertEqual(InputCapture.keyCodeToVK[126], 0x26) // Up arrow (⌃↑ Mission Control)
     }
 
-    private func keyEvent(_ keyCode: UInt16, _ flags: NSEvent.ModifierFlags) -> NSEvent? {
+    // Release ownership follows the forwarded physical key, not the current modifier chord
+    func testTrackedReleasesIgnoreModifierChanges() throws {
+        for flags: NSEvent.ModifierFlags in [.command, [], .control, [.control, .command]] {
+            var tracked: Set<UInt32> = [0x46]
+            let event = try XCTUnwrap(keyEvent(f, flags, type: .keyUp))
+            XCTAssertEqual(InputCapture.takeCommandChordRelease(
+                event, forwarding: true, trackedVKs: &tracked), 0x46)
+            XCTAssertTrue(tracked.isEmpty)
+        }
+    }
+
+    // One key's release cannot clear another held chord key or generate a duplicate release
+    func testRepeatedTapsClaimEachReleaseOnce() throws {
+        var tracked: Set<UInt32> = [0x51, 0x57]
+        let event = try XCTUnwrap(keyEvent(w, .command, type: .keyUp))
+        for _ in 0..<3 {
+            tracked.insert(0x57)
+            XCTAssertEqual(InputCapture.takeCommandChordRelease(
+                event, forwarding: true, trackedVKs: &tracked), 0x57)
+            XCTAssertEqual(tracked, [0x51])
+            XCTAssertNil(InputCapture.takeCommandChordRelease(
+                event, forwarding: true, trackedVKs: &tracked))
+        }
+    }
+
+    // Held-key repeats keep their release outstanding for the eventual physical key-up
+    func testHeldKeyRepeatDoesNotTakeReleaseOwnership() throws {
+        var tracked: Set<UInt32> = [0x57]
+        let repeatedDown = try XCTUnwrap(keyEvent(w, .command, isRepeat: true))
+        XCTAssertNil(InputCapture.takeCommandChordRelease(
+            repeatedDown, forwarding: true, trackedVKs: &tracked))
+        XCTAssertEqual(tracked, [0x57])
+        let release = try XCTUnwrap(keyEvent(w, .command, type: .keyUp))
+        XCTAssertEqual(InputCapture.takeCommandChordRelease(
+            release, forwarding: true, trackedVKs: &tracked), 0x57)
+    }
+
+    // Unowned releases and local input retain the responder-chain path
+    func testUntrackedAndReleasedCaptureKeysPassThrough() throws {
+        var tracked: Set<UInt32> = [0x57]
+        let untracked = try XCTUnwrap(keyEvent(q, .command, type: .keyUp))
+        XCTAssertNil(InputCapture.takeCommandChordRelease(
+            untracked, forwarding: true, trackedVKs: &tracked))
+        let released = try XCTUnwrap(keyEvent(w, .command, type: .keyUp))
+        XCTAssertNil(InputCapture.takeCommandChordRelease(
+            released, forwarding: false, trackedVKs: &tracked))
+        XCTAssertEqual(tracked, [0x57])
+    }
+
+    // Construct physical key events without keyboard layout or window dependencies
+    private func keyEvent(
+        _ keyCode: UInt16, _ flags: NSEvent.ModifierFlags,
+        type: NSEvent.EventType = .keyDown, isRepeat: Bool = false
+    ) -> NSEvent? {
         NSEvent.keyEvent(
-            with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+            with: type, location: .zero, modifierFlags: flags, timestamp: 0,
             windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "",
-            isARepeat: false, keyCode: keyCode)
+            isARepeat: isRepeat, keyCode: keyCode)
     }
 }
 #endif

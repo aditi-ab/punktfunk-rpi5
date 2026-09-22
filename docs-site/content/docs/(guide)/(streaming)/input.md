@@ -49,7 +49,7 @@ Settings. The macOS **Stream** menu lists them too.
 **macOS:** while input is captured, every other ⌘ chord goes to the host, ⌘Q included. Turn
 **Capture system shortcuts** off to keep them local. ⌘⎋ and ⌃⌘F always stay with the Mac.
 ⌘Space, ⌘Tab, Mission Control and other apps' global shortcuts go to the host too, with no
-permission to grant.
+permission to grant. Captured Control shortcuts such as ⌃C and ⌃R also go to the host.
 
 **Android:** Android keeps **Alt+Tab**, the **Windows** key and the **Language** key for itself.
 To send them, turn on **Punktfunk keyboard shortcuts** under Android's Accessibility settings;

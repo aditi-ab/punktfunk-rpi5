@@ -97,6 +97,7 @@ public final class InputCapture {
     /// cannot be relied on to arrive through the responder chain at all: these are flushed when
     /// the last ⌘ comes up (`flushCommandChord`), which is what stands between the host and a
     /// key held down for the rest of the session.
+    /// A keyUp that DOES arrive drops its VK here (`takeCommandChordRelease`).
     private var commandChordVKs: Set<UInt32> = []
 
     #endif
@@ -296,9 +297,16 @@ public final class InputCapture {
         // handler detects the combos.)
         #if os(macOS)
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.keyDown]
+            matching: [.keyDown, .keyUp]
         ) { [weak self] event in
             guard let self, self.ownsEvent?(event) ?? true else { return event }
+            if event.type == .keyUp {
+                guard let vk = Self.takeCommandChordRelease(
+                    event, forwarding: self.forwarding, trackedVKs: &self.commandChordVKs)
+                else { return event }
+                self.sendKey(vk, down: false)
+                return nil // The monitor owns this release; the responder must not send it again
+            }
             let flags = Self.chordFlags(event)
             if event.keyCode == 53 /* Esc */, flags == .command {
                 self.suppressedVK = 0x1B // VK_ESC — its keyUp still reaches the responder chain
@@ -690,6 +698,16 @@ public final class InputCapture {
     private func sendCommandChordKey(_ vk: UInt32) {
         commandChordVKs.insert(vk)
         sendKey(vk, down: true)
+    }
+
+    // Take one release owed by a forwarded Command press, even when its modifiers have changed
+    static func takeCommandChordRelease(
+        _ event: NSEvent, forwarding: Bool, trackedVKs: inout Set<UInt32>
+    ) -> UInt32? {
+        guard forwarding, event.type == .keyUp, let vk = keyCodeToVK[event.keyCode],
+              trackedVKs.remove(vk) != nil
+        else { return nil }
+        return vk
     }
 
     /// Release whatever the ⌘-chord passthrough sent down and is still held — called when the last

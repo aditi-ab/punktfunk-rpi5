@@ -522,6 +522,18 @@ public final class StreamLayerView: NSView {
         super.flagsChanged(with: event)
     }
 
+    // Forward captured Control shortcuts before AppKit can consume them ahead of keyDown
+    public override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if captured, window?.firstResponder === self,
+           let inputCapture, inputCapture.forwarding, event.type == .keyDown,
+           InputCapture.chordFlags(event) == .control,
+           let vk = InputCapture.keyCodeToVK[event.keyCode] {
+            inputCapture.sendKey(vk, down: true)
+            return true // Own this press once; its release follows the ordinary keyUp path
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
     private func requestAutoCapture() {
         pendingAutoCapture = true
         attemptPendingCapture()
