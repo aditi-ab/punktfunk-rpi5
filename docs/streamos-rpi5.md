@@ -1,14 +1,13 @@
 # StreamOS Raspberry Pi 5 fork
 
 This repository is Aditi's Raspberry Pi 5 client fork of Punktfunk. It preserves
-upstream history and is based on upstream's v0.34.0-era `main` at the hardware-tested
-commit:
+upstream history and release `v0.39.0` at commit:
 
 ```text
-90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2
+b1051a3a1cc7a04a1ae3a11691b32dc851a6f8a9
 ```
 
-That commit is a descendant of the annotated `v0.34.0` release tag. The fork keeps
+That commit is the target of the annotated `v0.39.0` release tag. The fork keeps
 the Raspberry Pi changes as four separate commits, in the same order as the former
 StreamOS patch series. This makes each downstream concern reviewable and allows an
 upstream update to fail visibly at the exact change that needs a deliberate rebase.
@@ -69,7 +68,7 @@ the StreamOS layout this is:
 export PKG_CONFIG_PATH=/opt/streamos-rpi-ffmpeg/lib/pkgconfig
 export LD_LIBRARY_PATH=/opt/streamos-rpi-ffmpeg/lib
 export LIBCLANG_PATH=/usr/lib/llvm-14/lib
-export PUNKTFUNK_BUILD_VERSION=0.34.0+streamos.90ce72497f34
+export PUNKTFUNK_BUILD_VERSION=0.39.0+streamos.b1051a3a1cc7
 ```
 
 Build the headless launcher and session renderer used by StreamOS:
@@ -79,7 +78,7 @@ cargo build --release -p punktfunk-cli --no-default-features
 cargo build --release \
   -p punktfunk-client-session \
   --no-default-features \
-  --features ui
+  --features ui,rpi5-v4l2-request
 ```
 
 The resulting programs are `target/release/punktfunk` and
@@ -89,13 +88,24 @@ decoder or optimized SAND transfer path.
 
 ## Verification
 
-The fork integration was checked on 2026-09-03 with:
+The v0.39.0 rebase candidate was checked on 2026-09-22 with:
+
+```powershell
+./packaging/rpi5/build-release-local.ps1 v0.39.0-rpi5.1-local.1
+```
+
+The emulated ARM64 preflight completed both locked release builds with
+`ui,rpi5-v4l2-request`, verified that bundled SDL exposes Wayland, checked dynamic
+linkage, ran `punktfunk --help`, and produced the reproducible archive and checksum.
+This verifies the release build and packaging path, not physical Pi 5 behavior.
+
+The previous v0.34 integration was checked on 2026-09-03 with:
 
 ```sh
 cargo test --locked -p pf-client-core -p pf-presenter -p pf-console-ui
 ```
 
-This passed 277 `pf-client-core`, 64 `pf-presenter`, and 231 `pf-console-ui`
+That historical run passed 277 `pf-client-core`, 64 `pf-presenter`, and 231 `pf-console-ui`
 tests (with the existing hardware-dependent ignored tests left ignored), plus their
 documentation tests. A native `aarch64-unknown-linux-gnu` release build of those
 three affected crates also passed under a `linux/arm64` container using the StreamOS
@@ -162,16 +172,16 @@ git fetch origin
 ```
 
 Start from the current fork tip and create a temporary integration branch. For
-example, when updating to upstream v0.35.0:
+example, when updating from this release to upstream v0.40.0:
 
 ```sh
 git switch main
 git pull --ff-only origin main
-git switch -c update/v0.35.0-rpi5
-git show upstream/v0.35.0
+git switch -c update/v0.40.0-rpi5
+git show upstream/v0.40.0
 git rebase --reapply-cherry-picks --empty=stop \
-  --onto upstream/v0.35.0 \
-  90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2
+  --onto upstream/v0.40.0 \
+  b1051a3a1cc7a04a1ae3a11691b32dc851a6f8a9
 ```
 
 The rebase replays all fork commits after the old upstream base. This includes the
@@ -197,9 +207,9 @@ Compare the old and new series before testing:
 
 ```sh
 git range-diff \
-  90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2..v0.34.0-rpi5.3 \
-  upstream/v0.35.0..HEAD
-git log --oneline upstream/v0.35.0..HEAD
+  b1051a3a1cc7a04a1ae3a11691b32dc851a6f8a9..v0.39.0-rpi5.1 \
+  upstream/v0.40.0..HEAD
+git log --oneline upstream/v0.40.0..HEAD
 cargo test --workspace
 ```
 
@@ -208,8 +218,8 @@ Run the ARM64 release workflow and the physical Pi 5 1080p60 checklist before up
 guarded force push:
 
 ```sh
-git push origin update/v0.35.0-rpi5
-git push --force-with-lease origin update/v0.35.0-rpi5:main
+git push origin update/v0.40.0-rpi5
+git push --force-with-lease origin update/v0.40.0-rpi5:main
 ```
 
 Rebasing changes downstream commit IDs. `--force-with-lease` prevents overwriting
@@ -217,14 +227,31 @@ unexpected remote work. Never move an existing published release tag; create and
 a new annotated tag instead:
 
 ```sh
-git tag -a v0.35.0-rpi5.1 \
-  -m "Punktfunk v0.35.0 for Raspberry Pi 5 - revision 1"
-git push origin v0.35.0-rpi5.1
+git tag -a v0.40.0-rpi5.1 \
+  -m "Punktfunk v0.40.0 for Raspberry Pi 5 - revision 1"
+git push origin v0.40.0-rpi5.1
 ```
 
-Update the recorded upstream base, patch rationale, release notes, StreamOS version,
-download URL, and checksum for the new tag. Existing release tags retain the prior
-tested history.
+Create a draft GitHub release for that exact tag and dispatch the release workflow:
+
+```sh
+gh release create v0.40.0-rpi5.1 --draft \
+  --title "Punktfunk v0.40.0 for Raspberry Pi 5 - revision 1" \
+  --notes "Punktfunk v0.40.0 with the maintained Raspberry Pi 5 delta."
+gh workflow run rpi5-release.yml -f tag=v0.40.0-rpi5.1
+gh run watch --exit-status
+gh release view v0.40.0-rpi5.1
+```
+
+Verify that the ARM64 archive and its `.sha256` file are attached, download the
+checksum file, and compare it with a locally calculated digest. In StreamOS, update
+the four `PUNKTFUNK_RPI5_RELEASE_*` values in
+`image/ubuntu/client-manifest.env`: version, release URL, archive SHA-256, and the
+fork commit. The pinned `PUNKTFUNK_RPI5_FFMPEG_COMMIT` changes only when the release
+builder's FFmpeg revision changes. Update StreamOS's integration documentation and
+version assertions in the same commit, run `scripts/test-ubuntu-milestones.sh`, then
+build the Raspberry Pi image and perform the physical checklist before publishing it.
+Existing release tags retain the prior tested history.
 
 ## Upstream and licensing
 

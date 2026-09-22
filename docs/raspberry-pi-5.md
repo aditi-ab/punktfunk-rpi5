@@ -27,9 +27,9 @@ Download the archive and its `.sha256` file from the GitHub release. Verify it
 before extracting:
 
 ```sh
-sha256sum --check punktfunk-0.34.0-rpi5.2-linux-arm64.tar.gz.sha256
-tar -xzf punktfunk-0.34.0-rpi5.2-linux-arm64.tar.gz
-cd punktfunk-0.34.0-rpi5.2-linux-arm64
+sha256sum --check punktfunk-0.39.0-rpi5.1-linux-arm64.tar.gz.sha256
+tar -xzf punktfunk-0.39.0-rpi5.1-linux-arm64.tar.gz
+cd punktfunk-0.39.0-rpi5.1-linux-arm64
 sudo ./install.sh
 ```
 
@@ -57,8 +57,8 @@ On Windows with Docker Desktop, create a local candidate tag at the commit to be
 tested and run the ARM64 release container:
 
 ```powershell
-git tag -a v0.34.0-rpi5.3-local.1 -m "Local Raspberry Pi 5 release test"
-./packaging/rpi5/build-release-local.ps1 v0.34.0-rpi5.3-local.1
+git tag -a v0.39.0-rpi5.1-local.1 -m "Local Raspberry Pi 5 release test"
+./packaging/rpi5/build-release-local.ps1 v0.39.0-rpi5.1-local.1
 ```
 
 The container runs as ARM64 even on an x86-64 workstation and mirrors the
@@ -68,7 +68,7 @@ an ARM64 Linux host, install the packages listed in
 `.github/workflows/rpi5-release.yml` and run:
 
 ```sh
-packaging/rpi5/build-release.sh v0.34.0-rpi5.3 dist
+packaging/rpi5/build-release.sh v0.39.0-rpi5.1 dist
 ```
 
 The script checks out the tag into a temporary tree, builds the pinned Raspberry

@@ -5,24 +5,40 @@ fork, the failure that motivated each runtime patch, and whether the change is
 Pi-specific or a candidate for upstream Punktfunk. Read it before rebasing the
 fork, changing the Raspberry Pi release build, or proposing a fix upstream.
 
-The fork base for release `v0.34.0-rpi5.3` is upstream commit
-[`90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2`](https://git.unom.io/unom/punktfunk/commit/90ce72497f3420f9efcbaaee0eb5fb973ed2bdd2).
+The fork base for release `v0.39.0-rpi5.1` is upstream commit
+[`b1051a3a1cc7a04a1ae3a11691b32dc851a6f8a9`](https://git.unom.io/unom/punktfunk/commit/b1051a3a1cc7a04a1ae3a11691b32dc851a6f8a9).
 The four original StreamOS patches are preserved as individual Git commits. Git
-history is authoritative; use `git diff 90ce7249..v0.34.0-rpi5.3` to inspect the
+history is authoritative; use `git diff b1051a3a..v0.39.0-rpi5.1` to inspect the
 complete release delta.
 
 ## Runtime patch map
 
 | Original patch | Fork commit | Classification | Keep for a non-Pi fork? |
 | --- | --- | --- | --- |
-| `0001-client-add-Raspberry-Pi-V4L2-request-decoder.patch` | [`64b7427b`](https://github.com/aditi-ab/punktfunk-rpi5/commit/64b7427bc98af7a45c6f3f5c3ae26add8f9e1711) | Raspberry Pi 5 hardware enablement | Only with the Pi V4L2 Request decoder and matching FFmpeg |
-| `0002-presenter-pace-Wayland-frames-from-compositor-callbacks.patch` | [`d80173fe`](https://github.com/aditi-ab/punktfunk-rpi5/commit/d80173fe7d592ff99dd58699e3eff239316fbb97) | General Wayland presentation correctness, exposed on Pi/Weston | Yes, for affected Wayland compositors |
-| `0003-presenter-restrict-overlay-rendering-to-its-damage-band.patch` | [`8257c318`](https://github.com/aditi-ab/punktfunk-rpi5/commit/8257c318a9b591390725360614973b6f8ea857f8) | General Vulkan overlay optimization with a large Pi impact | Yes, where full-surface blending is costly |
-| `0004-audio-do-not-replay-delayed-packets-after-PLC.patch` | [`e0326c24`](https://github.com/aditi-ab/punktfunk-rpi5/commit/e0326c247a8cedeb53c6e1828b9c80fb8caf0ac6) | General client audio timeline correctness | Yes |
+| `0001-client-add-Raspberry-Pi-V4L2-request-decoder.patch` | [`ccbc34b7`](https://github.com/aditi-ab/punktfunk-rpi5/commit/ccbc34b776c8d803c4cbc6f42f212ce39c1afbbc) | Raspberry Pi 5 hardware enablement | Only with the Pi V4L2 Request decoder and matching FFmpeg |
+| `0002-presenter-pace-Wayland-frames-from-compositor-callbacks.patch` | [`00920937`](https://github.com/aditi-ab/punktfunk-rpi5/commit/00920937930f4b1a608c26cd0c4933d32177dc3c) | General Wayland presentation correctness, exposed on Pi/Weston | Yes, for affected Wayland compositors |
+| `0003-presenter-restrict-overlay-rendering-to-its-damage-band.patch` | [`012df8d7`](https://github.com/aditi-ab/punktfunk-rpi5/commit/012df8d710c473645951893bd59170e36e428ab9) | General Vulkan overlay optimization with a large Pi impact | Yes, where full-surface blending is costly |
+| `0004-audio-do-not-replay-delayed-packets-after-PLC.patch` | [`9626fc01`](https://github.com/aditi-ab/punktfunk-rpi5/commit/9626fc01f93fae6002f6de0bd9babe3f41140109) | General client audio timeline correctness | Yes |
 
 Only the first patch is inherently Raspberry Pi-specific. The other three are
 plausible upstream fixes or optimizations, although this fork validates them on
 the Pi 5, Weston, and StreamOS stack.
+
+## v0.39.0 rebase decision
+
+Upstream v0.39.0 removed FFmpeg from the normal client dependency graph and split
+desktop and PyroWave capabilities into explicit Cargo features. The Pi decoder
+still requires the Raspberry Pi FFmpeg fork, so release `v0.39.0-rpi5.1` exposes
+it through the explicit `rpi5-v4l2-request` feature. That feature enables the
+desktop client path and `ffmpeg-sys-next`; ordinary upstream builds remain
+FFmpeg-free. The StreamOS session build must use
+`--features ui,rpi5-v4l2-request`.
+
+The rebase conflicts were resolved at the decoder module boundary, decoded-image
+dispatch, presenter dependency features, session feature forwarding, and release
+builder. These are the areas to inspect first during the next upstream update.
+The release builder uses `--locked`, so any feature dependency change must also
+be reflected in `Cargo.lock` before creating a candidate tag.
 
 ## 0001: Raspberry Pi V4L2 Request HEVC decoding
 
@@ -39,7 +55,7 @@ made the stream blurry without fixing the absent hardware path.
 
 The hardware decoder returns DRM PRIME frames using Broadcom's SAND layout. V3DV
 cannot import that modifier directly into Punktfunk's Vulkan presenter. Commit
-[`64b7427b`](https://github.com/aditi-ab/punktfunk-rpi5/commit/64b7427bc98af7a45c6f3f5c3ae26add8f9e1711):
+[`ccbc34b7`](https://github.com/aditi-ab/punktfunk-rpi5/commit/ccbc34b776c8d803c4cbc6f42f212ce39c1afbbc):
 
 - adds a Linux decoder rung selected by `PUNKTFUNK_DECODER=v4l2-request`;
 - opens FFmpeg's HEVC V4L2 Request decoder through `ffmpeg-sys-next`;
@@ -58,9 +74,9 @@ Primary implementation files are
 [`video_v4l2_request.rs`](../crates/pf-client-core/src/video_v4l2_request.rs),
 [`video.rs`](../crates/pf-client-core/src/video.rs), and
 [`session.rs`](../crates/pf-client-core/src/session.rs). Commit
-[`84f2ade9`](https://github.com/aditi-ab/punktfunk-rpi5/commit/84f2ade9df9786280b520cfc53d0b4fc9e251a38)
+[`a43c1327`](https://github.com/aditi-ab/punktfunk-rpi5/commit/a43c1327)
 adds compatibility with the older FFmpeg headers used by the Raspberry Pi build,
-and [`d2114543`](https://github.com/aditi-ab/punktfunk-rpi5/commit/d2114543912e2919c1ec3e0cfc239a8508ff20d8)
+and [`7ff28efa`](https://github.com/aditi-ab/punktfunk-rpi5/commit/7ff28efa)
 locks the client FFmpeg dependency.
 
 Expected log evidence includes:
@@ -94,7 +110,7 @@ on this path, and `VK_KHR_present_wait` was unavailable. The client could submit
 independently of Weston's repaint opportunity, so internal FPS counters did not
 measure evenly latched KMS frames.
 
-Commit [`d80173fe`](https://github.com/aditi-ab/punktfunk-rpi5/commit/d80173fe7d592ff99dd58699e3eff239316fbb97):
+Commit [`00920937`](https://github.com/aditi-ab/punktfunk-rpi5/commit/00920937930f4b1a608c26cd0c4933d32177dc3c):
 
 - obtains the native `wl_surface` from SDL;
 - attaches a one-shot `wl_surface.frame` callback to each surface commit;
@@ -130,7 +146,7 @@ visible content occupied only a narrow top or bottom band. That full-surface
 read/modify/write consumed enough memory bandwidth and GPU time to disturb scanout
 cadence.
 
-Commit [`8257c318`](https://github.com/aditi-ab/punktfunk-rpi5/commit/8257c318a9b591390725360614973b6f8ea857f8)
+Commit [`012df8d7`](https://github.com/aditi-ab/punktfunk-rpi5/commit/012df8d710c473645951893bd59170e36e428ab9)
 carries `scissor_y` and `scissor_height` from
 [`skia_overlay.rs`](../crates/pf-console-ui/src/skia_overlay.rs) through the
 overlay frame into the Vulkan render pass. Normal top and bottom chrome use a
@@ -156,7 +172,7 @@ delayed rather than lost, the receive path could later decode and queue the same
 timeline positions, advancing decoder and playout state twice. A delayed packet
 could also become an invalid A/V-sync observation.
 
-Commit [`e0326c24`](https://github.com/aditi-ab/punktfunk-rpi5/commit/e0326c247a8cedeb53c6e1828b9c80fb8caf0ac6)
+Commit [`9626fc01`](https://github.com/aditi-ab/punktfunk-rpi5/commit/9626fc01f93fae6002f6de0bd9babe3f41140109)
 tracks positions already covered by drought PLC. Sequence gaps consume those
 positions first. A packet already represented by PLC is not decoded, queued, or
 submitted to A/V synchronization; genuinely missing positions beyond the
@@ -180,7 +196,7 @@ metadata supplied by `libegl1-mesa-dev`. The resulting standalone bundle passed
 linkage checks but SDL exposed no Wayland video driver, so StreamOS launch failed
 immediately with `presenter: SDL video: wayland not available` and exit code 4.
 
-Commit [`a360a44e`](https://github.com/aditi-ab/punktfunk-rpi5/commit/a360a44e841a40450cdf1c9b5e38afaf0f4f84a3)
+Commit [`2a8474e1`](https://github.com/aditi-ab/punktfunk-rpi5/commit/2a8474e1557e46643716e4695a63f1b332927439)
 installs `wayland-protocols` in the ARM64 release job. The bundle builder now asks
 SDL for its compiled video drivers and rejects the artifact unless `wayland` is
 present. That guard intentionally rejected the `v0.34.0-rpi5.2` build and kept
@@ -200,27 +216,29 @@ The builder now dereferences the tag to its commit before reading the commit
 timestamp, so every archive member receives a valid, reproducible modification
 time.
 
-## Supporting fork changes in `v0.34.0-rpi5.3`
+## Supporting fork changes retained in `v0.39.0-rpi5.1`
 
 The following commits are part of the release delta but are not additional
 runtime bug patches:
 
 | Commit | Purpose |
 | --- | --- |
-| [`2df1e5d8`](https://github.com/aditi-ab/punktfunk-rpi5/commit/2df1e5d84cc40fa829e90ffa6884fae2137a9967) | Formats the imported patch series without changing intent. |
-| [`9c88dba3`](https://github.com/aditi-ab/punktfunk-rpi5/commit/9c88dba35e85ffe6e2b9302ae9ae35e4d00cae63) | Builds SDL3 from source for appliance targets. |
-| [`c508e1db`](https://github.com/aditi-ab/punktfunk-rpi5/commit/c508e1db5aadf37fd4d8a0e698a8aaea05776d01) | Keeps the unrelated experimental PyroWave feature out of the console UI edge. |
-| [`f08f6615`](https://github.com/aditi-ab/punktfunk-rpi5/commit/f08f66158d4d163145d9b0b652d8bc1939c8571f) | Adds the standalone ARM64 release bundle, installer, and CI workflow. |
-| [`c3b3bb37`](https://github.com/aditi-ab/punktfunk-rpi5/commit/c3b3bb373170135937d26739131a878e4e1f3758) | Builds releases on a Raspberry Pi OS-compatible baseline. |
-| [`dc03dd66`](https://github.com/aditi-ab/punktfunk-rpi5/commit/dc03dd66c09cca22fcbddb5bc970275f2a0891be) | Marks the container workspace safe for the release build. |
-| [`efc5db21`](https://github.com/aditi-ab/punktfunk-rpi5/commit/efc5db21f5d51a210106d6d7113dd47286ca63d7) | Preserves the upstream locked Android resolution. |
-| [`605d4a66`](https://github.com/aditi-ab/punktfunk-rpi5/commit/605d4a667cf2748b62cef114125db3e549c1f48d) | Builds the committed workspace without release-time manifest rewriting. |
-| [`d078c848`](https://github.com/aditi-ab/punktfunk-rpi5/commit/d078c8482d88e2917129aa98d9f27fa1063b7d37) | Bundles the SDL3 runtime required by the standalone binaries. |
-| [`06445740`](https://github.com/aditi-ab/punktfunk-rpi5/commit/0644574049680b0d9e37e8b6d137f4119bdf4b9c) | Installs the release uploader in CI. |
-| [`a360a44e`](https://github.com/aditi-ab/punktfunk-rpi5/commit/a360a44e841a40450cdf1c9b5e38afaf0f4f84a3) | Requires Wayland support in the SDL3 runtime and verifies it before publishing. |
-| [`3477efa2`](https://github.com/aditi-ab/punktfunk-rpi5/commit/3477efa2) | Restores SDL's Wayland prerequisites and adds the local ARM64 release preflight. |
-| [`823e072d`](https://github.com/aditi-ab/punktfunk-rpi5/commit/823e072d) | Dereferences annotated tags when normalizing archive timestamps. |
-| [`2a8c48c4`](https://github.com/aditi-ab/punktfunk-rpi5/commit/2a8c48c4) | Keeps local release output outside version control. |
+| [`32def45f`](https://github.com/aditi-ab/punktfunk-rpi5/commit/32def45fec4d34e73646544d043c874b55e915c3) | Formats the imported patch series without changing intent. |
+| [`13a39869`](https://github.com/aditi-ab/punktfunk-rpi5/commit/13a3986999f14994911f3c33bcab70b39c0ed7d3) | Builds SDL3 from source for appliance targets. |
+| [`2c7a119b`](https://github.com/aditi-ab/punktfunk-rpi5/commit/2c7a119b4791ebe0ee23fdc5a42536988ff9d93b) | Keeps the unrelated experimental PyroWave feature out of the console UI edge. |
+| [`c52975af`](https://github.com/aditi-ab/punktfunk-rpi5/commit/c52975affd8c226ce146cc25782edc30c4e333af) | Adds the standalone ARM64 release bundle, installer, and CI workflow. |
+| [`262a14a2`](https://github.com/aditi-ab/punktfunk-rpi5/commit/262a14a2dab476c423cfce6d1cc4c5a1267b1840) | Builds releases on a Raspberry Pi OS-compatible baseline. |
+| [`ac93b616`](https://github.com/aditi-ab/punktfunk-rpi5/commit/ac93b6168bf21a4dc5af1a4367b8f3430af020f5) | Marks the container workspace safe for the release build. |
+| [`e7538417`](https://github.com/aditi-ab/punktfunk-rpi5/commit/e7538417f03c5a940cc58bde67cbd44fd22f4e72) | Preserves the upstream locked Android resolution. |
+| [`943f9ec0`](https://github.com/aditi-ab/punktfunk-rpi5/commit/943f9ec01dd389c378bae74751a4f64aa302a1b1) | Builds the committed workspace without release-time manifest rewriting. |
+| [`3fbabf0b`](https://github.com/aditi-ab/punktfunk-rpi5/commit/3fbabf0bef4dfbb1a3c1cdb6246e386ade65d645) | Bundles the SDL3 runtime required by the standalone binaries. |
+| [`13eb2178`](https://github.com/aditi-ab/punktfunk-rpi5/commit/13eb217862cae1e974e11d1c8b86a3ab15e6caf8) | Installs the release uploader in CI. |
+| [`2a8474e1`](https://github.com/aditi-ab/punktfunk-rpi5/commit/2a8474e1557e46643716e4695a63f1b332927439) | Requires Wayland support in the SDL3 runtime and verifies it before publishing. |
+| [`373cc4a8`](https://github.com/aditi-ab/punktfunk-rpi5/commit/373cc4a82c4e9006b2e080bbe194a9d69cd172f8) | Restores SDL's Wayland prerequisites and adds the local ARM64 release preflight. |
+| [`c3107b0e`](https://github.com/aditi-ab/punktfunk-rpi5/commit/c3107b0eaa2c4d972e908899c68ca6b6dbec1359) | Dereferences annotated tags when normalizing archive timestamps. |
+| [`c86ad6c4`](https://github.com/aditi-ab/punktfunk-rpi5/commit/c86ad6c423c5aa99a0925f855c9730032d1545d7) | Keeps local release output outside version control. |
+| [`e3172346`](https://github.com/aditi-ab/punktfunk-rpi5/commit/e31723465f14cd9aa0974633945d96815a00d374) | Gates the Pi decoder and FFmpeg dependency behind `rpi5-v4l2-request`. |
+| [`d14a93da`](https://github.com/aditi-ab/punktfunk-rpi5/commit/d14a93dadbb400df98c70834f79601d04c700860) | Locks the optional dependency and enforces Linux line endings in release scripts. |
 
 Documentation and repository-identification commits are intentionally omitted
 from that implementation table but remain visible in the base-to-tag Git log.
