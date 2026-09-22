@@ -114,6 +114,7 @@ pub enum RowId {
     CursorGestures,
     /// Action row: opens the in-process controllers screen.
     Controllers,
+    Bluetooth,
     /// Action row: asks the host to open the platform licences screen.
     Licenses,
 }
@@ -276,6 +277,7 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::Sc2Passthrough,
             RowId::DsCapture,
             RowId::Controllers,
+            RowId::Bluetooth,
         ],
     ),
     (
@@ -812,6 +814,16 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
+            RowId::Bluetooth => {
+                return match msg {
+                    ListMsg::Activate => {
+                        fx.push(Screen::Bluetooth(super::bluetooth::BluetoothScreen::new()));
+                        pulse
+                    }
+                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+                    ListMsg::None => pulse,
+                };
+            }
             // In-process Skia screen; grant dialogs still go to the host.
             RowId::Controllers => {
                 return match msg {
@@ -914,7 +926,7 @@ impl SettingsScreen {
                 Hint::new(HintKey::Back, "Done"),
             ],
             Some(RowId::NoPresets) | None => vec![Hint::new(HintKey::Back, "Done")],
-            Some(RowId::Controllers | RowId::Licenses) => vec![
+            Some(RowId::Controllers | RowId::Bluetooth | RowId::Licenses) => vec![
                 Hint::new(HintKey::Confirm, "Open"),
                 Hint::new(HintKey::Back, "Done"),
             ],
@@ -1054,6 +1066,7 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::GamepadUi | RowId::GamepadUiMode => &[Android, WebOS],
         // A pad list and a licences screen: both real on a TV.
         RowId::Controllers | RowId::Licenses => &[Android, WebOS],
+        RowId::Bluetooth => &[Desktop],
         // DualSense capture — the pad reaches webOS over Bluetooth HID, not hidraw, so the
         // concept is real there too (punktfunk-webos docs/NOTES.md).
         RowId::DsCapture => &[Android, WebOS],
@@ -1090,6 +1103,7 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
 /// below the intent row so the cursor is never on a row that vanishes.
 pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
     match id {
+        RowId::Bluetooth => pf_client_core::bluetooth::snapshot().available,
         RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
         // Needs `fallback_ui`; otherwise off strands the user with no UI.
         RowId::GamepadUi => ctx.fallback_ui,
@@ -1242,6 +1256,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::NoPresets => {
             return RowSpec::action("No presets yet", false);
         }
+        RowId::Bluetooth => return RowSpec::action("Bluetooth devices", true),
         RowId::Controllers => return RowSpec::action("Connected controllers", true),
         RowId::Licenses => return RowSpec::action("Open-source licences", true),
         RowId::QuickActions => {
@@ -1536,6 +1551,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         ),
         RowId::Preset(_)
         | RowId::NoPresets
+        | RowId::Bluetooth
         | RowId::Controllers
         | RowId::Licenses
         | RowId::QuickActions => {
@@ -1813,6 +1829,7 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
                  The switch above turns it off altogether."
             }
         },
+        RowId::Bluetooth => "Pair, connect or forget Bluetooth devices.",
         RowId::Controllers => "Connected controllers, their grants and a rumble/haptics test.",
         RowId::Licenses => "The open-source licences this app ships under.",
         RowId::Preset(_) => {
@@ -2132,6 +2149,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         // Navigation rows: handled in `apply_row` before the settings path.
         RowId::Preset(_)
         | RowId::NoPresets
+        | RowId::Bluetooth
         | RowId::Controllers
         | RowId::Licenses
         | RowId::QuickActions => None,
@@ -3428,6 +3446,7 @@ pub(crate) mod tests {
                 RowId::AudioRoute,
                 // Every controller already gets its own wire slot, so player 1 is not a choice.
                 RowId::Pad,
+                RowId::Bluetooth,
                 RowId::CursorGestures,
                 RowId::Shortcuts,
                 RowId::Fullscreen,
@@ -3552,7 +3571,8 @@ pub(crate) mod tests {
                 seen.push(*id);
             }
         }
-        assert_eq!(seen.len(), 55, "{seen:?}");
+        assert_eq!(seen.len(), 56, "{seen:?}");
+        assert!(seen.contains(&RowId::Bluetooth));
         assert!(seen.contains(&RowId::StartIn));
         assert!(seen.contains(&RowId::AdvancedStats));
         assert!(seen.contains(&RowId::FollowOsTheme));

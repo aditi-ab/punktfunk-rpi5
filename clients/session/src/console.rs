@@ -41,6 +41,7 @@ struct PendingApproval {
 }
 
 pub fn run(target: Option<&str>) -> u8 {
+    pf_client_core::bluetooth::start();
     // Publish the desktop's theme to the shell ("Follow system theme"), and keep it
     // current: a 2 s poll, the same interval and reason as the GTK shell and the web
     // console — `~/.local/state/omarchy/current` is a SYMLINK `omarchy-theme-set`

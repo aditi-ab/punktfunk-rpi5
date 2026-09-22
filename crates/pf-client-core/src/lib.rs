@@ -13,6 +13,7 @@
 
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 mod au_dump;
+pub mod bluetooth;
 #[cfg(all(feature = "desktop", target_os = "linux"))]
 pub mod audio;
 #[cfg(all(feature = "desktop", windows))]

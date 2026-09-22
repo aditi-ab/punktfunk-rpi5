@@ -6,6 +6,7 @@
 
 pub(crate) mod add_host;
 pub(crate) mod bind_preset;
+pub(crate) mod bluetooth;
 pub(crate) mod collections;
 pub(crate) mod controllers;
 pub(crate) mod home;
@@ -165,6 +166,7 @@ pub(crate) enum Screen {
     Library(library::LibraryScreen),
     Collections(collections::CollectionsScreen),
     Settings(settings::SettingsScreen),
+    Bluetooth(bluetooth::BluetoothScreen),
     AddHost(add_host::AddHostScreen),
     Pair(pair::PairScreen),
     PinHosts(pin_hosts::PinHostsScreen),
@@ -194,6 +196,7 @@ impl Screen {
             Screen::RingEditor(s) => s.menu(ev, ctx, fx),
             Screen::ShortcutEditor(s) => s.menu(ev, ctx, fx),
             Screen::Pair(s) => s.menu(ev, ctx, fx),
+            Screen::Bluetooth(s) => s.menu(ev, ctx, fx),
             Screen::PinHosts(s) => s.menu(ev, ctx, fx),
             Screen::BindPreset(s) => s.menu(ev, ctx, fx),
             Screen::Controllers(s) => s.menu(ev, ctx, fx),
@@ -214,6 +217,7 @@ impl Screen {
             Screen::RingEditor(s) => s.pointer(p, ctx, fx),
             Screen::ShortcutEditor(s) => s.pointer(p, ctx, fx),
             Screen::Pair(s) => s.pointer(p, ctx, fx),
+            Screen::Bluetooth(s) => s.pointer(p, ctx, fx),
             Screen::PinHosts(s) => s.pointer(p, ctx, fx),
             Screen::BindPreset(s) => s.pointer(p, ctx, fx),
             Screen::Controllers(s) => s.pointer(p, ctx, fx),
@@ -227,6 +231,7 @@ impl Screen {
             Screen::AddHost(s) => s.text_input(text),
             Screen::ShortcutEditor(s) => s.text_input(text),
             Screen::Pair(s) => s.text_input(text),
+            Screen::Bluetooth(s) => s.text_input(text),
             Screen::Settings(s) => s.text_input(text),
             _ => {}
         }
@@ -239,6 +244,7 @@ impl Screen {
             Screen::AddHost(s) => s.edit_key(key),
             Screen::ShortcutEditor(s) => s.edit_key(key),
             Screen::Pair(s) => s.edit_key(key),
+            Screen::Bluetooth(s) => s.edit_key(key),
             Screen::Settings(s) => s.edit_key(key, ctx),
             _ => false,
         }
@@ -250,6 +256,7 @@ impl Screen {
             Screen::AddHost(s) => s.editing(),
             Screen::ShortcutEditor(s) => s.editing(),
             Screen::Pair(s) => s.editing(),
+            Screen::Bluetooth(s) => s.editing(),
             Screen::Settings(s) => s.editing(),
             _ => false,
         }
@@ -268,6 +275,7 @@ impl Screen {
             Screen::Library(s) => s.title(),
             Screen::Collections(s) => s.title(),
             Screen::Settings(_) => "Settings".into(),
+            Screen::Bluetooth(_) => "Bluetooth devices".into(),
             Screen::AddHost(s) => s.title(),
             Screen::RingEditor(s) => s.title(),
             Screen::ShortcutEditor(s) => s.title(),
@@ -300,6 +308,7 @@ impl Screen {
             Screen::RingEditor(s) => s.hints(ctx),
             Screen::ShortcutEditor(s) => s.hints(ctx),
             Screen::Pair(s) => s.hints(ctx),
+            Screen::Bluetooth(s) => s.hints(ctx),
             Screen::PinHosts(s) => s.hints(ctx),
             Screen::BindPreset(s) => s.hints(ctx),
             Screen::Controllers(s) => s.hints(ctx),
@@ -326,6 +335,7 @@ impl Screen {
             Screen::RingEditor(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::ShortcutEditor(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::Pair(s) => s.render(canvas, rect, k, dt, fonts, ctx),
+            Screen::Bluetooth(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::PinHosts(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::BindPreset(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::Controllers(s) => s.render(canvas, rect, k, dt, fonts, ctx),
