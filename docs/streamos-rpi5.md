@@ -22,6 +22,9 @@ is maintained in [the patch rationale](streamos-rpi5-patch-rationale.md).
    build performs an optimized NEON SAND-to-I420 transfer, after which Punktfunk's
    existing planar Vulkan upload path presents the frame. This avoids software HEVC
    decode while retaining the existing Vulkan renderer.
+   Transfer format negotiation accepts both I420 and little-endian 10-bit planar
+   output. Ten-bit samples are rounded and saturated to the existing 8-bit upload
+   format, retaining colour metadata; this does not add a 10-bit presentation path.
 
 2. **Compositor-paced Vulkan/Wayland presentation.** Uses Wayland compositor frame
    callbacks to prevent the client from outrunning Weston, permits a deeper swapchain
@@ -98,6 +101,10 @@ The emulated ARM64 preflight completed both locked release builds with
 `ui,rpi5-v4l2-request`, verified that bundled SDL exposes Wayland, checked dynamic
 linkage, ran `punktfunk --help`, and produced the reproducible archive and checksum.
 This verifies the release build and packaging path, not physical Pi 5 behavior.
+
+For a local fix before tagging, pass `-WorkingTree` to the PowerShell builder.
+This overlays tracked working-tree changes onto HEAD and includes `source.patch`
+in the bundle. Untracked files are not included. Use a new local version each time.
 
 The previous v0.34 integration was checked on 2026-09-03 with:
 

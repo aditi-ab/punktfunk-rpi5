@@ -17,8 +17,14 @@ if [[ $(uname -m) != aarch64 ]]; then
     exit 2
 fi
 
-git -C "${repo_root}" rev-parse --verify "${tag}^{commit}" >/dev/null
-release_commit=$(git -C "${repo_root}" rev-parse "${tag}^{commit}")
+source_ref=${tag}
+working_tree=${3:-}
+if [[ "${working_tree}" == --working-tree ]]; then
+    source_ref=HEAD
+elif [[ -n "${working_tree}" ]]; then
+    printf 'Unknown option: %s\n' "${working_tree}" >&2; exit 2
+fi
+release_commit=$(git -C "${repo_root}" rev-parse "${source_ref}^{commit}")
 work=$(mktemp -d "${TMPDIR:-/tmp}/punktfunk-rpi5-release.XXXXXX")
 cleanup() { rm -rf -- "${work}"; }
 trap cleanup EXIT
@@ -31,7 +37,14 @@ bundle=${work}/${bundle_name}
 target_dir=${CARGO_TARGET_DIR:-${repo_root}/target/rpi5-release}
 
 mkdir -p "${source_tree}" "${ffmpeg_prefix}" "${bundle}/lib" "${output}"
-git -C "${repo_root}" archive "${tag}" | tar -x -C "${source_tree}"
+git -C "${repo_root}" archive "${source_ref}" | tar -x -C "${source_tree}"
+if [[ "${working_tree}" == --working-tree ]]; then
+    git -C "${repo_root}" diff HEAD --binary >"${bundle}/source.patch"
+    if [[ -s "${bundle}/source.patch" ]]; then
+        (cd "${source_tree}" && git apply "${bundle}/source.patch")
+        release_commit="${release_commit}-dirty"
+    fi
+fi
 
 git clone --filter=blob:none https://github.com/jc-kynesim/rpi-ffmpeg.git "${ffmpeg_source}"
 git -C "${ffmpeg_source}" checkout --detach "${ffmpeg_ref}"
@@ -127,7 +140,7 @@ if ldd "${bundle}/punktfunk" "${bundle}/punktfunk-session" | grep -q 'not found'
 fi
 
 archive=${output}/${bundle_name}.tar.gz
-tar --sort=name --mtime="@$(git -C "${repo_root}" show -s --format=%ct "${tag}^{commit}")" \
+tar --sort=name --mtime="@$(git -C "${repo_root}" show -s --format=%ct "${source_ref}^{commit}")" \
     --owner=0 --group=0 --numeric-owner -C "${work}" -czf "${archive}" "${bundle_name}"
 (
     cd "${output}"
