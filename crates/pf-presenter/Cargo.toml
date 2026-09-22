@@ -70,6 +70,7 @@ windows-sys = { version = "0.61", features = [
 # backend in pf-client-core; ON by default, matching pf-client-core's default.
 default = ["pyrowave"]
 pyrowave = ["pf-client-core/pyrowave"]
+rpi5-v4l2-request = ["pf-client-core/rpi5-v4l2-request"]
 
 [lints]
 workspace = true

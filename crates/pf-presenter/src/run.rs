@@ -2093,7 +2093,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             }
                         }
                     }
-                    DecodedImage::Cpu(c) | DecodedImage::V4l2Planar(c) => {
+                    DecodedImage::Cpu(c) => {
                         st.hdr = c.color.is_pq();
                         // Software lane uploads planes into the same planar CSC pass as
                         // hardware, so PQ is tone-mapped there too.
@@ -2118,6 +2118,34 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                     tracing::warn!(
                                         error = %format!("{e:#}"),
                                         "software present failed — suppressing repeats until it recovers"
+                                    );
+                                }
+                                false
+                            }
+                        }
+                    }
+                    #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+                    DecodedImage::V4l2Planar(c) => {
+                        st.hdr = c.color.is_pq();
+                        st.hdr_untonemapped = false;
+                        match presenter.present(
+                            &window,
+                            FrameInput::Cpu(&c),
+                            overlay_frame.as_ref(),
+                        ) {
+                            Ok(p) => {
+                                st.cpu_present_warned = false;
+                                p
+                            }
+                            Err(e) => {
+                                if device_lost(&e) {
+                                    return Err(e).context("GPU device lost");
+                                }
+                                if !st.cpu_present_warned {
+                                    st.cpu_present_warned = true;
+                                    tracing::warn!(
+                                        error = %format!("{e:#}"),
+                                        "V4L2 Request present failed — suppressing repeats until it recovers"
                                     );
                                 }
                                 false

@@ -78,7 +78,7 @@ git -C "${ffmpeg_source}" checkout --detach "${ffmpeg_ref}"
     cargo build --locked --release \
         -p punktfunk-client-session \
         --no-default-features \
-        --features ui
+        --features ui,rpi5-v4l2-request
 )
 
 install -m 0755 "${target_dir}/release/punktfunk" "${bundle}/punktfunk"
