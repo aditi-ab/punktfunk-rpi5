@@ -1,4 +1,4 @@
-//! Weston repaint-clock gate for Vulkan WSI when VK_KHR_present_wait is absent.
+//! Wayland repaint-clock gate for immediate Vulkan WSI presentation.
 
 #![cfg(target_os = "linux")]
 

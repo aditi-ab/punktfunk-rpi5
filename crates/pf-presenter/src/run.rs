@@ -1823,7 +1823,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             }
         }
 
-        if let Some(o) = overlay.as_mut() {
+        if presenter.compositor_frame_ready()
+            && let Some(o) = overlay.as_mut()
+        {
             let (pw, ph) = window.size_in_pixels();
             let (stats, hint) = match &stream {
                 Some(st) if st.connector.is_some() => {
@@ -2415,8 +2417,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         let browse_idle = matches!(mode, ModeCtl::Browse(_))
             && stream.as_ref().is_none_or(|s| s.connector.is_none());
         let still_picture = stream.as_ref().is_some_and(|s| s.last_video.is_some())
+            && presenter.compositor_frame_ready()
             && overlay_damage.take_due(Instant::now());
-        if !presented_video && (resize_scrim || browse_idle || still_picture) {
+        if !presented_video
+            && presenter.compositor_frame_ready()
+            && (resize_scrim || browse_idle || still_picture)
+        {
             // The UI owns the screen: hand the swapchain back to SDR. A finished PQ stream
             // leaves HDR10 live, and UI presents carry no frame. Not applied to
             // `resize_scrim`: that gap is still an HDR session, and flipping would rebuild

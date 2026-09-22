@@ -275,8 +275,8 @@ impl Presenter {
         self.present_timer.is_some()
     }
 
-    /// True when Weston has opened the next compositor repaint. Non-Wayland
-    /// and present-wait paths remain unconditionally ready.
+    /// True when Wayland opens the next repaint. Present-wait measures completion
+    /// independently; paths without compositor pacing remain ready.
     pub(crate) fn compositor_frame_ready(&self) -> bool {
         #[cfg(target_os = "linux")]
         if let Some(pacer) = &self.wayland_frame {

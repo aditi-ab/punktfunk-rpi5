@@ -1049,9 +1049,7 @@ fn reduce_motion_freezes_the_field_and_shortens_the_transition() {
     assert!(!s.store.load().reduce_motion, "and back off again");
 }
 
-/// The reduced backdrop keeps its offscreen and re-renders only when an input moves:
-/// a frame inside `FIELD_STEP` blits the cached field, a bigger clock move or a new
-/// size re-renders, and switching the flag off hands the surface back.
+/// The field cache follows size, time and rendering policy without changing layout.
 #[test]
 fn the_reduced_backdrop_caches_its_field() {
     let fonts = crate::theme::build_fonts().unwrap();
@@ -1092,6 +1090,10 @@ fn the_reduced_backdrop_caches_its_field() {
         .insert("android.reduce_ui_resolution".into(), false.into());
     s.render(small.canvas(), 480, 300, &fonts, None, None, &pads);
     assert!(s.field.borrow().is_none());
+    s.efficient_backdrop = true;
+    s.render(small.canvas(), 480, 300, &fonts, None, None, &pads);
+    assert_eq!(s.field.borrow().as_ref().map(|c| c.size), Some((480, 300)));
+    assert_eq!(s.last_full, (480.0, 300.0));
 }
 
 /// Ignored eyeball dump. `PF_CONSOLE_DUMP=<dir> cargo test -p pf-console-ui --release -- --ignored dump`.

@@ -317,6 +317,7 @@ pub(crate) struct Shell {
     device_name: String,
     deck: bool,
     fallback_ui: bool,
+    pub(crate) efficient_backdrop: bool,
     pyrowave_ok: bool,
     pub(crate) av1_ok: bool,
     pub(crate) in_stream: bool,
@@ -440,6 +441,7 @@ impl Shell {
             device_name: opts.device_name,
             deck: opts.deck,
             fallback_ui: opts.fallback_ui,
+            efficient_backdrop: false,
             pyrowave_ok: opts.pyrowave_ok,
             av1_ok: opts.av1_ok,
             in_stream: false,
@@ -1567,14 +1569,16 @@ impl Shell {
             })
     }
 
+    /// Cache the field on constrained GPUs; text and controls keep native resolution.
     fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64) {
         // One clock read: the takeover's `draw_aurora` inherits it.
         let t = self.field_clock(t);
-        let reduced = crate::screens::settings::reduce_ui_res(
-            &self.settings,
-            self.platform,
-            self.fallback_ui,
-        );
+        let reduced = self.efficient_backdrop
+            || crate::screens::settings::reduce_ui_res(
+                &self.settings,
+                self.platform,
+                self.fallback_ui,
+            );
         let mut cache = self.field.borrow_mut();
         if !reduced {
             // Hand the offscreen back while the full-rate path runs — it is dead weight

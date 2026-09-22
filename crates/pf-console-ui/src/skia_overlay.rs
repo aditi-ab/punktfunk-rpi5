@@ -172,7 +172,20 @@ impl Drop for SkiaOverlay {
 }
 
 impl Overlay for SkiaOverlay {
+    /// Share the presenter's Vulkan device and select its backdrop rendering cost.
     fn init(&mut self, shared: &SharedDevice) -> Result<()> {
+        // SAFETY: the shared instance owns this live physical-device handle.
+        let properties = unsafe {
+            shared
+                .instance
+                .get_physical_device_properties(shared.physical_device)
+        };
+        if let Some(shell) = &mut self.shell {
+            shell.efficient_backdrop = properties.vendor_id == 0x14e4;
+            if shell.efficient_backdrop {
+                tracing::info!("Broadcom GPU: cached backdrop with native-resolution controls");
+            }
+        }
         // Skia resolves Vulkan entry points through us (same ash dispatch). The
         // DirectContext bakes the table in `make_vulkan`; this closure dies with `init`.
         let entry = shared.entry.clone();

@@ -603,10 +603,10 @@ impl Presenter {
         }?;
 
         #[cfg(target_os = "linux")]
-        let wayland_frame = (present_mode == vk::PresentModeKHR::IMMEDIATE
-            && present_timer.is_none())
-        .then(|| super::wayland_frame::WaylandFramePacer::new(window))
-        .flatten();
+        // Present-wait measures completion; Wayland callbacks schedule the next repaint.
+        let wayland_frame = (present_mode == vk::PresentModeKHR::IMMEDIATE)
+            .then(|| super::wayland_frame::WaylandFramePacer::new(window))
+            .flatten();
 
         let mut p = Presenter {
             entry,
