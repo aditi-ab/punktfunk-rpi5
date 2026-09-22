@@ -2,7 +2,8 @@
 //!
 //! The Pi decoder produces Broadcom SAND DMA-BUFs. V3DV cannot import that modifier
 //! through Vulkan, so the Raspberry Pi FFmpeg fork's NEON transfer converts SAND to
-//! tightly packed I420 for Punktfunk's existing planar Vulkan upload path.
+//! planar 8/10-bit samples. Ten-bit samples are rounded to eight bits for the
+//! existing I420 Vulkan upload path; stream colour metadata stays attached.
 
 use crate::video::CpuPlanarFrame;
 use crate::video_color::ColorDesc;
@@ -148,8 +149,9 @@ impl V4l2RequestDecoder {
                 if status < 0 {
                     return Err(av_error("avcodec_receive_frame", status));
                 }
-                output = Some(self.planar_frame()?);
+                let decoded = self.planar_frame();
                 ffi::av_frame_unref(self.frame);
+                output = Some(decoded?);
             }
             Ok(output)
         }
@@ -160,18 +162,57 @@ impl V4l2RequestDecoder {
             if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32 {
                 bail!("V4L2 Request returned a non-DRM frame");
             }
+            if (*self.frame).hw_frames_ctx.is_null() {
+                bail!("missing hardware frame context for SAND transfer");
+            }
+            let mut formats = ptr::null_mut();
+            let status = ffi::av_hwframe_transfer_get_formats(
+                (*self.frame).hw_frames_ctx,
+                ffi::AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_FROM,
+                &mut formats,
+                0,
+            );
+            if status < 0 {
+                return Err(av_error("query SAND transfer formats", status));
+            }
+            let mut format = ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+            let mut candidate = formats;
+            while !candidate.is_null() && *candidate != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+                if matches!(
+                    *candidate,
+                    ffi::AVPixelFormat::AV_PIX_FMT_YUV420P
+                        | ffi::AVPixelFormat::AV_PIX_FMT_YUV420P10LE
+                ) {
+                    format = *candidate;
+                    break;
+                }
+                candidate = candidate.add(1);
+            }
+            ffi::av_free(formats.cast());
+            if format == ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+                bail!("no supported planar SAND transfer format");
+            }
+            let ten_bit = format == ffi::AVPixelFormat::AV_PIX_FMT_YUV420P10LE;
             if (*self.planar).buf[0].is_null()
                 || (*self.planar).width != (*self.frame).width
                 || (*self.planar).height != (*self.frame).height
+                || (*self.planar).format != format as i32
             {
                 ffi::av_frame_unref(self.planar);
-                (*self.planar).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+                (*self.planar).format = format as i32;
                 (*self.planar).width = (*self.frame).width;
                 (*self.planar).height = (*self.frame).height;
                 let status = ffi::av_frame_get_buffer(self.planar, 64);
                 if status < 0 {
                     return Err(av_error("allocating the planar transfer frame", status));
                 }
+                tracing::info!(
+                    input_bits = if ten_bit { 10 } else { 8 },
+                    output_bits = 8,
+                    width = (*self.planar).width,
+                    height = (*self.planar).height,
+                    "SAND planar transfer configured"
+                );
             }
             let status = ffi::av_frame_make_writable(self.planar);
             if status < 0 {
@@ -182,7 +223,7 @@ impl V4l2RequestDecoder {
             }
             let status = ffi::av_hwframe_transfer_data(self.planar, self.frame, 0);
             if status < 0 {
-                return Err(av_error("transferring SAND output to planar I420", status));
+                return Err(av_error("transfer SAND output to planar samples", status));
             }
 
             let width = (*self.planar).width as u32;
@@ -195,18 +236,36 @@ impl V4l2RequestDecoder {
             ];
             let mut planes: [&[u8]; 3] = [&[]; 3];
             let mut strides = [0usize; 3];
+            let mut converted: [Vec<u8>; 3] = std::array::from_fn(|_| Vec::new());
             for index in 0..3 {
                 if (*self.planar).data[index].is_null() || (*self.planar).linesize[index] <= 0 {
                     bail!("planar transfer returned an invalid plane {index}");
                 }
                 let stride = (*self.planar).linesize[index] as usize;
                 let rows = dimensions[index].1 as usize;
-                let row_bytes = dimensions[index].0 as usize;
+                let row_bytes = dimensions[index].0 as usize * if ten_bit { 2 } else { 1 };
+                if rows == 0 || row_bytes == 0 || stride < row_bytes {
+                    bail!("invalid planar transfer dimensions or stride");
+                }
                 strides[index] = stride;
                 planes[index] = slice::from_raw_parts(
                     (*self.planar).data[index],
                     (rows - 1) * stride + row_bytes,
                 );
+            }
+            if ten_bit {
+                for index in 0..3 {
+                    converted[index] = downshift_10bit(
+                        planes[index],
+                        strides[index],
+                        dimensions[index].0 as usize,
+                        dimensions[index].1 as usize,
+                    );
+                }
+                for index in 0..3 {
+                    planes[index] = &converted[index];
+                    strides[index] = dimensions[index].0 as usize;
+                }
             }
             let flags = (*self.frame).flags;
             CpuPlanarFrame::from_i420(
@@ -225,6 +284,35 @@ impl V4l2RequestDecoder {
                 punktfunk_core::reanchor::LocalRecovery::NONE,
             )
         }
+    }
+}
+
+fn downshift_10bit(source: &[u8], stride: usize, width: usize, height: usize) -> Vec<u8> {
+    let mut result = Vec::with_capacity(width * height);
+    for row in 0..height {
+        for sample in source[row * stride..row * stride + width * 2].chunks_exact(2) {
+            let value = u16::from_le_bytes([sample[0], sample[1]]);
+            result.push(((u32::from(value) + 2) >> 2).min(255) as u8);
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::downshift_10bit;
+
+    #[test]
+    fn ten_bit_transfer_preserves_range_rounding_and_row_padding() {
+        let samples = [0u16, 64, 512, 940, 1023, 65535, 1, 2, 3, 4, 1022];
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        assert_eq!(
+            downshift_10bit(&bytes, 12, 5, 2),
+            [0, 16, 128, 235, 255, 0, 1, 1, 1, 255]
+        );
     }
 }
 
