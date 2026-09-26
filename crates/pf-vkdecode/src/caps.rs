@@ -421,8 +421,15 @@ pub(crate) fn derive_arrangement(
     };
     // Coincide preferred (struct docs). A device offering both whose coincide
     // arrangement is unusable decodes distinct; the error names distinct then.
+    // `PUNKTFUNK_VKDECODE_ARRANGEMENT=distinct` skips coincide on such a device: the
+    // switch for a driver whose coincide path faults at the first decode.
+    let prefer_distinct = distinct
+        && std::env::var("PUNKTFUNK_VKDECODE_ARRANGEMENT")
+            .ok()
+            .as_deref()
+            == Some("distinct");
     let (coincide, (dpb_format, output_format)) = match try_coincide() {
-        Ok(formats) if coincide => (true, formats),
+        Ok(formats) if coincide && !prefer_distinct => (true, formats),
         Err(unusable) if !distinct => return Err(unusable),
         tried => {
             if let (true, Err(unusable)) = (coincide, &tried) {
