@@ -1049,7 +1049,11 @@ impl Presenter {
             let render_sem = self.render_sems[index as usize];
             let cmd_bufs = [self.cmd_buf];
             let mut wait_sems = vec![self.acquire_sem];
-            let mut wait_stages = vec![vk::PipelineStageFlags::TRANSFER];
+            // The swapchain image is written by the blit (transfer) or by the direct,
+            // scale and overlay passes (colour attachment): both wait the acquire.
+            let mut wait_stages = vec![
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            ];
             let mut signal_sems = vec![render_sem];
             let mut wait_values = vec![0u64];
             let mut signal_values = vec![0u64];
