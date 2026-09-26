@@ -73,7 +73,7 @@ jobs:
 
       - name: Build frontend
         run: |
-          pnpm install --frozen-lockfile
+          pnpm install --frozen-lockfile --ignore-scripts
           pnpm run build          # rollup -> clients/decky/dist/index.js
 
       - name: Version + channel + stamp
