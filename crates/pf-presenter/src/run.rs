@@ -278,6 +278,10 @@ struct StreamState {
     win_steps: [u32; 6],
     /// Non-blocking presents that came back busy this window: [fence, acquire].
     win_busy: [u32; 2],
+    /// What the held frame waits on. The fence paces the loop itself (the presenter waits
+    /// it for a millisecond per pass), so the pass turns straight around and drains the
+    /// channel first: a newer frame replaces the held one instead of queuing behind it.
+    busy_on: crate::vk::BusyOn,
     last_displayed_ns: u64,
     /// Smoothing: the latch slot the last vended frame was aimed at. One present per
     /// slot; a second frame due before the same slot waits for the next.
@@ -433,6 +437,7 @@ impl StreamState {
             win_out_max: 0,
             win_steps: [0; 6],
             win_busy: [0; 2],
+            busy_on: crate::vk::BusyOn::Fence,
             last_displayed_ns: 0,
             last_slot_ns: 0,
             busy_retry: false,
@@ -485,6 +490,7 @@ impl StreamState {
             });
         }
         self.win_busy[on as usize] += 1;
+        self.busy_on = on;
         self.busy_retry = true;
     }
 
@@ -506,8 +512,12 @@ impl StreamState {
     fn wake_timeout(&self) -> Duration {
         const TICK: Duration = Duration::from_millis(15);
         if self.busy_retry {
-            // A frame is waiting on a swapchain image; a refresh frees one.
-            return Duration::from_millis(1);
+            // The fence wait inside the presenter is the pace; only a full swapchain
+            // needs a refresh to pass.
+            return match self.busy_on {
+                crate::vk::BusyOn::Fence => Duration::ZERO,
+                crate::vk::BusyOn::Acquire => Duration::from_millis(1),
+            };
         }
         if !self.store.is_smoothing() {
             return TICK;

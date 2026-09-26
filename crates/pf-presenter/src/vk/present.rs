@@ -138,16 +138,23 @@ impl Presenter {
             return Ok(Presented::Shown); // minimized: not Stale (Stale recreates)
         }
         // FIFO without present-wait: the queue is policed here rather than by blocking.
-        // Probe the previous submit's fence and take the image ahead of time; either
-        // one not ready means a refresh has not passed yet. Probed before `input` is
-        // consumed so the frame can go back to the store whole.
+        // Give the previous submit's fence up to 1 ms (it is the frame's real gate, and a
+        // sleep-and-retry either spins or wakes late), then take the image ahead of time;
+        // either one not ready means a refresh has not passed yet. Probed before `input`
+        // is consumed so the frame can go back to the store whole.
         let nonblocking = self.needs_glass_gate()
             && self.present_timer.is_none()
             && !matches!(input, FrameInput::Redraw);
         if nonblocking {
-            // SAFETY: `fence` is owned here; a status query is always legal.
-            if self.submitted && !unsafe { self.device.get_fence_status(self.fence) }? {
-                return Ok(Presented::Busy(input, BusyOn::Fence));
+            // SAFETY: `fence` is owned here; a bounded wait is always legal.
+            if self.submitted {
+                match unsafe { self.device.wait_for_fences(&[self.fence], true, 1_000_000) } {
+                    Ok(()) => {}
+                    Err(vk::Result::TIMEOUT) => {
+                        return Ok(Presented::Busy(input, BusyOn::Fence));
+                    }
+                    Err(e) => return Err(e).context("vkWaitForFences"),
+                }
             }
             if self.acquired.is_none() {
                 // SAFETY: `swapchain`/`acquire_sem` are owned; the last submit that waited
