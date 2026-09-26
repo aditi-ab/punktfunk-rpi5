@@ -278,6 +278,12 @@ pub(crate) unsafe fn bind_session_memory(
                 .memory_size(mr.size),
         );
     }
+    // A session with no memory requirements is bound already. The bind call with
+    // zero entries is invalid (VUID arraylength), and Intel's Windows driver takes it
+    // as a poisoned session: the next parameters create faults inside the driver.
+    if binds.is_empty() {
+        return Ok(allocated);
+    }
     // SAFETY: session + freshly allocated memory, one bind per requirement.
     let r = unsafe {
         (dev.video_queue().fp().bind_video_session_memory_khr)(
