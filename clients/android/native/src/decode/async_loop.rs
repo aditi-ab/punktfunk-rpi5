@@ -6,14 +6,14 @@ use ndk::native_window::NativeWindow;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::error::PunktfunkError;
 use punktfunk_core::packet::FLAG_SOF;
-use punktfunk_core::reanchor::{GateVerdict, ReanchorGate};
+use punktfunk_core::reanchor::{AuAdmission, DecoderClass, GateVerdict, ReanchorGate, Resume};
 use punktfunk_core::session::Frame;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::asc_presenter::{asc_backend_selected, AscBackend};
+use super::asc_presenter::{asc_backend_selected, sysprop, AscBackend};
 use super::display::{
     apply_reported_dataspace, color_dataspace, install_render_callback, release_render_callback,
     reported_dataspace, DisplayTracker,
@@ -330,6 +330,7 @@ fn run_codec(
         decoded_size: opts.decoded_size.clone(),
     };
     let mut state = State::new(asc, presenter, ReanchorGate::new(client.frames_dropped()));
+    state.admit = admission(client.codec, &ctx.codec.name().unwrap_or_default());
     if rebuilt {
         // A fresh decoder holds no reference picture, so every P-frame before a keyframe is a
         // reference error, and reference errors can hang a hardware decoder. None reach this one.
@@ -667,6 +668,8 @@ struct Pass {
     aus_dropped: u64,
     /// The codec freed an input slot this pass (the hung-codec check, see [`InputStall`]).
     input_offered: bool,
+    /// The admission rule asked for a keyframe this pass.
+    ask_keyframe: bool,
     /// ASurfaceControl transaction completions, applied after the drain (on the decode thread,
     /// not the binder thread that posted them).
     present_completes: Vec<PresentComplete>,
@@ -706,6 +709,42 @@ struct State {
     /// A rebuilt run drops every AU before the first keyframe.
     await_keyframe: bool,
     backstops: Backstops,
+    /// The receiver rule on AV1 sessions ([`admission`]); `None` feeds every AU.
+    admit: Option<Admit>,
+    /// AUs the rule kept off the codec. They owe output like fed ones ([`Backstops::poll`]).
+    withheld: u64,
+}
+
+/// [`AuAdmission`] and what the loop keeps beside it.
+struct Admit {
+    rule: AuAdmission,
+    class: DecoderClass,
+    /// The AU whose parts are withheld: the rule decides on the first part.
+    parts_of: Option<u32>,
+    /// A backstop asked for a keyframe during the current stretch.
+    backstop: bool,
+}
+
+/// The receiver rule for this session: AV1 only, strict on the Tensor G5 decoder, lenient on
+/// the rest. `debug.punktfunk.au_admission` = `strict` / `lenient` / `off` overrides the pick.
+fn admission(codec: u8, decoder: &str) -> Option<Admit> {
+    if codec != punktfunk_core::quic::CODEC_AV1 {
+        return None;
+    }
+    let class = match sysprop(c"debug.punktfunk.au_admission").as_deref() {
+        Some("off") => return None,
+        Some("strict") => DecoderClass::Strict,
+        Some("lenient") => DecoderClass::Lenient,
+        _ if decoder == "c2.google.av1.decoder" => DecoderClass::Strict,
+        _ => DecoderClass::Lenient,
+    };
+    log::info!("decode: AV1 AU admission {class:?} for {decoder}");
+    Some(Admit {
+        rule: AuAdmission::default(),
+        class,
+        parts_of: None,
+        backstop: false,
+    })
 }
 
 impl State {
@@ -732,6 +771,8 @@ impl State {
             stall: InputStall::default(),
             await_keyframe: false,
             backstops: Backstops::new(),
+            admit: None,
+            withheld: 0,
         }
     }
 
@@ -746,6 +787,9 @@ impl State {
                 if gap > 0 {
                     self.gate
                         .arm_expecting_drops(Instant::now(), u64::from(gap));
+                }
+                if self.withhold(&f, gap, pass) {
+                    return;
                 }
                 if self.await_keyframe {
                     if f.flags & u32::from(FLAG_SOF) == 0 {
@@ -799,6 +843,41 @@ impl State {
             DecodeEvent::Error { fatal: false } => self.gate.arm(Instant::now()),
             DecodeEvent::PresentComplete(pc) => pass.present_completes.push(pc),
         }
+    }
+
+    /// The receiver rule ([`Admit`]): `true` keeps `f` off the codec and out of
+    /// `recovery_flags`. Decided on an AU's first part; its later parts follow.
+    fn withhold(&mut self, f: &Frame, gap: u32, pass: &mut Pass) -> bool {
+        let Some(a) = self.admit.as_mut() else {
+            return false;
+        };
+        if f.part.is_some_and(|p| !p.first) {
+            return a.parts_of == Some(f.frame_index);
+        }
+        let step = a.rule.note(f.frame_index, gap, f.flags, a.class, None);
+        a.parts_of = step.withhold.then_some(f.frame_index);
+        if let Some(e) = step.ended {
+            log::info!(
+                "decode: withheld {} AU(s) from frame {} after a loss, until {} at frame {}{}",
+                e.withheld,
+                e.first,
+                match e.by {
+                    Resume::Idr => "an IDR",
+                    Resume::Anchor => "the anchor",
+                    Resume::WaveStart => "a wave start",
+                    Resume::Concealed => "the concealer",
+                },
+                f.frame_index,
+                if std::mem::take(&mut a.backstop) {
+                    " (a backstop asked for it)"
+                } else {
+                    ""
+                }
+            );
+        }
+        self.withheld += u64::from(step.withhold);
+        pass.ask_keyframe |= step.ask_keyframe;
+        step.withhold
     }
 
     /// The pass proper, after the drain: completions, the vsync tick, the format change, feeding,
@@ -1148,7 +1227,8 @@ impl State {
         }
     }
 
-    /// The hung-codec check ([`InputStall`]), then the keyframe backstops ([`Backstops::poll`]).
+    /// The hung-codec check ([`InputStall`]), the keyframe backstops ([`Backstops::poll`]), then the
+    /// admission rule's keyframe ask through the same throttle.
     /// Evaluated after `feed`, so an AU that arrived this pass has either been fed or is parked
     /// in `pending_aus`.
     fn housekeeping(&mut self, ctx: &Ctx, had_output: bool, pass: &Pass) {
@@ -1161,14 +1241,20 @@ impl State {
             );
             self.wedged = true;
         }
-        self.backstops.poll(
+        let backstop = self.backstops.poll(
             &ctx.client,
             &mut self.gate,
-            self.fed,
+            self.fed + self.withheld,
             had_output,
             waiting,
             pass.aus_dropped,
         );
+        if let Some(a) = self.admit.as_mut() {
+            a.backstop |= backstop && a.rule.is_withholding();
+        }
+        if pass.ask_keyframe {
+            self.backstops.ask(&ctx.client);
+        }
     }
 }
 
