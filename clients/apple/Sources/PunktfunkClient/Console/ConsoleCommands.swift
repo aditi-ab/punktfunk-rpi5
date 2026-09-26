@@ -245,9 +245,13 @@ extension ConsoleModel {
                 await LibraryCache.shared?.store(games, hostID: host.id.uuidString)
                 loadArt(games, host: host, identity: identity, mgmt: mgmt)
             } catch {
-                // The cached shelf stays up; its covers still come from the host's store.
+                // A newer fetch owns the shelf now.
+                if Task.isCancelled { return }
+                // The cached shelf stays up, marked offline; its covers come from the art cache.
                 if let cached {
                     loadArt(cached.games, host: host, identity: identity, mgmt: mgmt)
+                    bridge.push(.libraryStale, "2")
+                    return
                 }
                 bridge.push(
                     .libraryPhase,
