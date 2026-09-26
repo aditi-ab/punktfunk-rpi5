@@ -690,7 +690,8 @@ mod tests {
         let raw = coincide_device(vec![VideoFormat {
             format: P010,
             image_usage: COINCIDE_USAGE,
-            image_create_flags: vk::ImageCreateFlags::empty(),
+            // A non-empty report that lacks MUTABLE_FORMAT: an explicit envelope, refused.
+            image_create_flags: vk::ImageCreateFlags::ALIAS,
             ..Default::default()
         }]);
         assert_eq!(

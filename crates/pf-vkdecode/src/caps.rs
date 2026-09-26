@@ -476,11 +476,20 @@ fn require_usage(
     }
 }
 
+/// A driver that reports no create flags at all (Intel on Windows) has not said no:
+/// the pool asks for MUTABLE_FORMAT and `vkCreateImage` is the judge.
 fn require_mutable(entry: &VideoFormat, mode: &'static str) -> Result<(), CapsError> {
     if entry
         .image_create_flags
         .contains(vk::ImageCreateFlags::MUTABLE_FORMAT)
     {
+        Ok(())
+    } else if entry.image_create_flags.is_empty() {
+        tracing::info!(
+            format = ?entry.format,
+            mode,
+            "driver reports no image create flags; creating with MUTABLE_FORMAT anyway"
+        );
         Ok(())
     } else {
         Err(CapsError::NoMutableFormat {
@@ -725,11 +734,14 @@ pub(crate) unsafe fn query_formats_on(
         return Err(r);
     }
     props.truncate(count as usize);
+    // A format the driver returns for `usage` supports `usage`: that is the query's
+    // contract. Intel's Windows driver echoes one fixed video-only mask for every
+    // query, so the answer, not the echoed mask, carries the queried bits.
     Ok(props
         .iter()
         .map(|p| VideoFormat {
             format: p.format,
-            image_usage: p.image_usage_flags,
+            image_usage: p.image_usage_flags | usage,
             image_create_flags: p.image_create_flags,
             image_type: p.image_type,
             image_tiling: p.image_tiling,
@@ -750,6 +762,15 @@ mod tests {
                 | vk::ImageCreateFlags::EXTENDED_USAGE,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn no_create_flags_reported_is_not_a_refusal() {
+        let mut e = entry(vk::Format::G8_B8R8_2PLANE_420_UNORM, COINCIDE_USAGE);
+        e.image_create_flags = vk::ImageCreateFlags::empty();
+        assert!(require_mutable(&e, "coincide").is_ok());
+        e.image_create_flags = vk::ImageCreateFlags::ALIAS;
+        assert!(require_mutable(&e, "coincide").is_err());
     }
 
     fn radv_like() -> RawH264Caps {
@@ -981,7 +1002,8 @@ mod tests {
         raw.coincide_formats = vec![VideoFormat {
             format: NV12,
             image_usage: COINCIDE_USAGE,
-            image_create_flags: vk::ImageCreateFlags::empty(),
+            // A non-empty report that lacks MUTABLE_FORMAT: an explicit envelope, refused.
+            image_create_flags: vk::ImageCreateFlags::ALIAS,
             ..Default::default()
         }];
         assert_eq!(
