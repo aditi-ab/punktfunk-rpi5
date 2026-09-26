@@ -75,7 +75,16 @@ pub enum Presented<'a> {
     /// Swapchain out of date; recreated, frame dropped.
     Stale,
     /// No swapchain image yet: the frame comes back for a retry, unconsumed.
-    Busy(FrameInput<'a>),
+    Busy(FrameInput<'a>, BusyOn),
+}
+
+/// What a non-blocking present found busy. The ledger counts each per window: the
+/// fence means the GPU still renders the last frame, the acquire means the swapchain
+/// holds every image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusyOn {
+    Fence = 0,
+    Acquire = 1,
 }
 
 pub enum FrameInput<'a> {

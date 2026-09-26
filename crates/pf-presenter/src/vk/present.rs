@@ -15,7 +15,7 @@
 //! Evidence: `csc_depth_packing` table tests; `design/pyrowave-444-hdr.md`.
 
 use super::gpu::*;
-use super::{DirectLast, DirectSrc, FrameInput, Presented, Presenter, Retired};
+use super::{BusyOn, DirectLast, DirectSrc, FrameInput, Presented, Presenter, Retired};
 use crate::csc::csc_rows;
 #[cfg(target_os = "linux")]
 use crate::dmabuf::{self, HwFrame};
@@ -147,7 +147,7 @@ impl Presenter {
         if nonblocking {
             // SAFETY: `fence` is owned here; a status query is always legal.
             if self.submitted && !unsafe { self.device.get_fence_status(self.fence) }? {
-                return Ok(Presented::Busy(input));
+                return Ok(Presented::Busy(input, BusyOn::Fence));
             }
             if self.acquired.is_none() {
                 // SAFETY: `swapchain`/`acquire_sem` are owned; the last submit that waited
@@ -162,7 +162,7 @@ impl Presenter {
                 } {
                     Ok((index, _)) => self.acquired = Some(index),
                     Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
-                        return Ok(Presented::Busy(input));
+                        return Ok(Presented::Busy(input, BusyOn::Acquire));
                     }
                     Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                         self.recreate_swapchain(window)?;
