@@ -47,8 +47,8 @@ fn refused(code: u32, what: &'static str) -> anyhow::Error {
 ///
 /// The permit is the same pool the native plane draws from: a browser holds a session slot, not
 /// a browser slot. It is taken before the first read so a slow handshake never lets a host that
-/// is full accept a fifth encoder — which is why every pre-auth read is bounded: an idle peer
-/// must give the slot back.
+/// is full accept a fifth encoder — which is why every pre-auth read and write is bounded: an
+/// idle peer must give the slot back.
 pub(crate) async fn run(
     conn: Connection,
     serving: Arc<Serving>,
@@ -77,9 +77,14 @@ pub(crate) async fn run(
     let device_fp_hex = if serving.plane.require_pairing {
         let mut nonce = [0u8; 32];
         rand::rng().fill_bytes(&mut nonce);
-        write_msg(&mut tx, &AuthChallenge { nonce }.encode())
-            .await
-            .context("write AuthChallenge")?;
+        // Bounded too: the write waits on the peer's stream credit while we hold the permit.
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            write_msg(&mut tx, &AuthChallenge { nonce }.encode()),
+        )
+        .await
+        .context("AuthChallenge: handshake timeout")?
+        .context("write AuthChallenge")?;
         let answer = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_msg(&mut rx))
             .await
             .context("AuthResponse: handshake timeout")?
