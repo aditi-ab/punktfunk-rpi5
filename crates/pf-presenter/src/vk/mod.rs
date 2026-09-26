@@ -126,6 +126,28 @@ enum Retired {
     NativeVk(NativeVkFrame),
 }
 
+/// Which planes the direct pass sampled last, and how. A `Redraw` replays this: the
+/// descriptor set still points at those planes and the frame behind them is still held.
+#[derive(Clone, Copy)]
+struct DirectLast {
+    src: DirectSrc,
+    uv_scale: [f32; 2],
+    color: pf_client_core::video::ColorDesc,
+    depth: u8,
+    msb_packed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DirectSrc {
+    /// `retired_hw` holds the `NativeVk` frame.
+    Native,
+    /// `retired_hw` holds the `Dmabuf` frame.
+    #[cfg(target_os = "linux")]
+    Dmabuf,
+    /// The software rung's plane images, which persist.
+    Cpu,
+}
+
 /// Premultiplied-alpha quad blended over the swapchain image after the video blit.
 /// Recorded only when an overlay frame arrives.
 struct OverlayPipe {
@@ -207,7 +229,13 @@ pub struct Presenter {
     /// Filtered video scale into the swapchain; its output pass shares the overlay's
     /// framebuffers. Rebuilt with the overlay pipe on an HDR flip.
     scale: crate::scale::ScalePass,
-    /// In-flight hardware frame; released after the next fence wait.
+    /// CSC straight into the swapchain image; rebuilt with the overlay pipe on an HDR flip.
+    direct: crate::csc::DirectPass,
+    /// What the last real frame drew through the direct pass, so a `Redraw` can sample it
+    /// again from the retired frame. `None`: the last frame went through the video image.
+    direct_last: Option<DirectLast>,
+    /// In-flight hardware frame; released after the next fence wait. A `Redraw` keeps it:
+    /// the direct path samples it again, so it lives until the next real frame's fence.
     retired_hw: Option<Retired>,
     /// D3D11 lane: the slot last composited and its picture size, which `Redraw` blits
     /// again. The import cache owns the objects; a newer picture in that slot (six
@@ -477,6 +505,7 @@ impl Drop for Presenter {
             }
             self.overlay_pipe.destroy(&self.device);
             self.scale.destroy(&self.device);
+            self.direct.destroy(&self.device);
             for s in self.render_sems.drain(..) {
                 self.device.destroy_semaphore(s, None);
             }

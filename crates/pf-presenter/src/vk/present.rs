@@ -15,7 +15,7 @@
 //! Evidence: `csc_depth_packing` table tests; `design/pyrowave-444-hdr.md`.
 
 use super::gpu::*;
-use super::{FrameInput, Presented, Presenter, Retired};
+use super::{DirectLast, DirectSrc, FrameInput, Presented, Presenter, Retired};
 use crate::csc::csc_rows;
 #[cfg(target_os = "linux")]
 use crate::dmabuf::{self, HwFrame};
@@ -37,6 +37,37 @@ fn tonemap_peak() -> f32 {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(4.9)
     })
+}
+
+/// `PUNKTFUNK_DIRECT_PRESENT=0` keeps every lane on the video image: an A/B on one build.
+fn direct_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PUNKTFUNK_DIRECT_PRESENT").ok().as_deref() != Some("0"))
+}
+
+/// Where a CSC pass draws.
+#[derive(Clone, Copy)]
+enum CscTarget {
+    /// The video image, blitted or filtered into the swapchain afterwards.
+    Video {
+        framebuffer: vk::Framebuffer,
+        extent: vk::Extent2D,
+    },
+    /// A swapchain image through the overlay's framebuffer: `rect` is the picture's place,
+    /// `surface` the whole image, which `clear` paints black first (the letterbox).
+    Direct {
+        framebuffer: vk::Framebuffer,
+        surface: vk::Extent2D,
+        rect: vk::Rect2D,
+        clear: bool,
+    },
+}
+
+/// The picture's place on the swapchain image for the direct pass.
+#[derive(Clone, Copy)]
+struct DirectPlan {
+    rect: vk::Rect2D,
+    clear: bool,
 }
 
 /// `PUNKTFUNK_D3D11_NO_MUTEX=1`, read once (debugging only: torn frames).
@@ -169,7 +200,6 @@ impl Presenter {
                 self.set_hdr_mode(window, want)?;
             }
         }
-        #[cfg(windows)]
         let redraw = matches!(input, FrameInput::Redraw);
         // Import/view before acquire: a reject must fail before this present
         // consumes the acquire semaphore.
@@ -252,8 +282,12 @@ impl Presenter {
             self.device.reset_fences(&[self.fence])?;
         }
         self.last_fence_us = fence_started.elapsed().as_micros() as u32;
-        if let Some(old) = self.retired_hw.take() {
-            old.destroy(&self.device);
+        // A `Redraw` samples the retired frame again through the direct pass, so it goes
+        // with the next real frame, whose fence covers the redraw's reads too.
+        if !redraw {
+            if let Some(old) = self.retired_hw.take() {
+                old.destroy(&self.device);
+            }
         }
         // Nothing is in flight past the wait above: imports of a superseded ring
         // generation can go now.
@@ -424,10 +458,93 @@ impl Presenter {
             }
             _ => None,
         };
+        // Direct CSC into the swapchain image: the whole picture at an exact scale, from a
+        // lane that samples on this device. A `Redraw` replays the last real frame's planes
+        // while the frame behind them is still held. Everything else takes the video image.
+        let last: Option<DirectLast> = if redraw {
+            self.direct_last.filter(|l| match l.src {
+                DirectSrc::Native => matches!(self.retired_hw, Some(Retired::NativeVk(_))),
+                #[cfg(target_os = "linux")]
+                DirectSrc::Dmabuf => matches!(self.retired_hw, Some(Retired::Dmabuf(_))),
+                DirectSrc::Cpu => self.cpu_planes.is_some(),
+            })
+        } else if let Some(f) = &native_frame {
+            let (depth, msb_packed) = csc_depth_packing_or_8bit(f.vk_format);
+            Some(DirectLast {
+                src: DirectSrc::Native,
+                uv_scale: [
+                    f.width as f32 / f.coded_width as f32,
+                    f.height as f32 / f.coded_height as f32,
+                ],
+                color: f.color,
+                depth,
+                msb_packed,
+            })
+        } else if let Some(f) = cpu_frame {
+            Some(DirectLast {
+                src: DirectSrc::Cpu,
+                uv_scale: [1.0, 1.0],
+                color: f.color,
+                depth: 8,
+                msb_packed: false,
+            })
+        } else {
+            #[cfg(target_os = "linux")]
+            let dmabuf = hw_frame.as_ref().map(|f| DirectLast {
+                src: DirectSrc::Dmabuf,
+                uv_scale: f.uv_scale(),
+                color: f.color,
+                depth: if f.is_p010() { 10 } else { 8 },
+                msb_packed: f.is_p010(),
+            });
+            #[cfg(not(target_os = "linux"))]
+            let dmabuf = None;
+            dmabuf
+        };
+        let direct = match (last, source, placement) {
+            (Some(l), Some((_, w, h)), Some(p))
+                if direct_enabled()
+                    && targets_ready
+                    && !from_slot
+                    && filtered.is_none()
+                    && p.src_x == 0.0
+                    && p.src_y == 0.0
+                    && p.src_w == f64::from(w)
+                    && p.src_h == f64::from(h) =>
+            {
+                let covered = p.dst_x == 0
+                    && p.dst_y == 0
+                    && p.dst_w == self.extent.width
+                    && p.dst_h == self.extent.height;
+                let rect = vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: p.dst_x as i32,
+                        y: p.dst_y as i32,
+                    },
+                    extent: vk::Extent2D {
+                        width: p.dst_w,
+                        height: p.dst_h,
+                    },
+                };
+                Some((
+                    l,
+                    DirectPlan {
+                        rect,
+                        clear: !covered,
+                    },
+                ))
+            }
+            _ => None,
+        };
+        if !redraw {
+            self.direct_last = direct.map(|(l, _)| l);
+        }
         if let (Some((_, w, h)), Some(p)) = (source, placement) {
             // A D3D11 RGB ring slot is imported TRANSFER_SRC only, so a fractional scale of it
             // stays a bilinear blit until the import also asks for SAMPLED.
-            let path = if filtered.is_some() {
+            let path = if direct.is_some() {
+                "direct"
+            } else if filtered.is_some() {
                 "filtered"
             } else if crate::scale::needs_filter(&p) {
                 "bilinear blit"
@@ -467,6 +584,12 @@ impl Presenter {
         };
         self.last_acquire_us = acquire_started.elapsed().as_micros() as u32;
         let swap_image = self.images[index as usize];
+        let direct_target = direct.map(|(_, plan)| CscTarget::Direct {
+            framebuffer: self.overlay_pipe.framebuffers[index as usize],
+            surface: self.extent,
+            rect: plan.rect,
+            clear: plan.clear,
+        });
 
         // SAFETY: `cmd_buf` is owned and idle (fence wait above). Recording names
         // images/views/sets this presenter owns (or a live overlay/native frame
@@ -492,9 +615,13 @@ impl Presenter {
                 let ten_bit = f.is_p010();
                 // Imported images span the full exported (coded) extent; the
                 // CSC pass crops them to the visible picture.
-                self.record_csc(
-                    v.framebuffer,
+                let target = direct_target.unwrap_or(CscTarget::Video {
+                    framebuffer: v.framebuffer,
                     extent,
+                });
+                self.record_csc(
+                    false,
+                    target,
                     f.uv_scale(),
                     f.color,
                     if ten_bit { 10 } else { 8 },
@@ -539,14 +666,11 @@ impl Presenter {
                         width: v.width,
                         height: v.height,
                     };
-                    self.record_csc(
-                        v.framebuffer,
+                    let target = CscTarget::Video {
+                        framebuffer: v.framebuffer,
                         extent,
-                        [1.0, 1.0],
-                        d.color,
-                        depth,
-                        msb_packed,
-                    );
+                    };
+                    self.record_csc(false, target, [1.0, 1.0], d.color, depth, msb_packed);
                 }
             }
 
@@ -576,9 +700,13 @@ impl Presenter {
                 // 8-bit math over P010 decodes and displays the wrong range.
                 // `uv_scale` is picture/coded so a taller decode pool does not show.
                 let (depth, msb_packed) = csc_depth_packing_or_8bit(f.vk_format);
-                self.record_csc(
-                    v.framebuffer,
+                let target = direct_target.unwrap_or(CscTarget::Video {
+                    framebuffer: v.framebuffer,
                     extent,
+                });
+                self.record_csc(
+                    false,
+                    target,
                     [
                         f.width as f32 / f.coded_width as f32,
                         f.height as f32 / f.coded_height as f32,
@@ -607,7 +735,11 @@ impl Presenter {
                 };
                 // 10-bit planes hold MSB-packed codes, PQ or SDR.
                 let (depth, msb_packed) = if f.ten_bit { (10, true) } else { (8, false) };
-                self.record_csc_planar(v.framebuffer, extent, f.color, depth, msb_packed);
+                let target = CscTarget::Video {
+                    framebuffer: v.framebuffer,
+                    extent,
+                };
+                self.record_csc(true, target, [1.0, 1.0], f.color, depth, msb_packed);
             }
 
             // Tightly packed (`CpuPlanarFrame`): leave `buffer_row_length` zero —
@@ -664,10 +796,66 @@ impl Presenter {
                 };
                 // Always 8-bit, no MSB packing — R8 planes, whatever the stream
                 // signals. PQ tone-maps through shader mode 1, not 10-bit.
-                self.record_csc_planar(v.framebuffer, extent, f.color, 8, false);
+                let target = direct_target.unwrap_or(CscTarget::Video {
+                    framebuffer: v.framebuffer,
+                    extent,
+                });
+                self.record_csc(true, target, [1.0, 1.0], f.color, 8, false);
             }
 
-            let swap_layout = if let (Some(p), Some(v)) = (filtered, &self.video) {
+            // `Redraw` on the direct path: the same planes and push constants, no new decode
+            // wait (the last real submit waited it) and no timeline signal (that value is
+            // spent). The native frame returns to its decode layout as on a real frame.
+            if let (true, Some((l, _)), Some(target)) = (redraw, direct, direct_target) {
+                match l.src {
+                    DirectSrc::Native => {
+                        if let Some(Retired::NativeVk(f)) = &self.retired_hw {
+                            let image = vk::Image::from_raw(f.image);
+                            let decode_layout = match f.layout {
+                                NativeVkLayout::DecodeDst => vk::ImageLayout::VIDEO_DECODE_DST_KHR,
+                                NativeVkLayout::DecodeDpb => vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                            };
+                            native_layer_barrier(
+                                &self.device,
+                                self.cmd_buf,
+                                image,
+                                f.layer,
+                                decode_layout,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            );
+                            self.record_csc(
+                                false,
+                                target,
+                                l.uv_scale,
+                                l.color,
+                                l.depth,
+                                l.msb_packed,
+                            );
+                            native_layer_barrier(
+                                &self.device,
+                                self.cmd_buf,
+                                image,
+                                f.layer,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                decode_layout,
+                            );
+                        }
+                    }
+                    // Planes stay where the first pass left them, owned by this queue.
+                    #[cfg(target_os = "linux")]
+                    DirectSrc::Dmabuf => {
+                        self.record_csc(false, target, l.uv_scale, l.color, l.depth, l.msb_packed);
+                    }
+                    DirectSrc::Cpu => {
+                        self.record_csc(true, target, l.uv_scale, l.color, l.depth, l.msb_packed);
+                    }
+                }
+            }
+
+            let swap_layout = if direct.is_some() {
+                // The direct pass drew the picture, and the letterbox when there is one.
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            } else if let (Some(p), Some(v)) = (filtered, &self.video) {
                 // The CSC pass leaves the video image in TRANSFER_SRC; the blit path and the
                 // next `Redraw` expect it back there.
                 barrier(
@@ -939,18 +1127,20 @@ impl Presenter {
             }
             // Park until the fence proves the reads done (next present's wait, or
             // Drop). At most one of hw_frame / native_frame is set; a D3D11 slot stays
-            // in the import cache.
-            self.retired_hw = None;
-            #[cfg(target_os = "linux")]
-            if let Some(f) = hw_frame.take() {
-                self.retired_hw = Some(Retired::Dmabuf(f));
-            }
-            // Submit enqueued `value + 1` — `mark_presented` so the decoder waits
-            // that write-back. Failed submit never reaches here (no phantom signal).
-            // Park until the fence; Drop sends the release token.
-            if let Some(mut f) = native_frame.take() {
-                f.guard.mark_presented();
-                self.retired_hw = Some(Retired::NativeVk(f));
+            // in the import cache. A `Redraw` keeps the parked frame: it read it again.
+            if !redraw {
+                self.retired_hw = None;
+                #[cfg(target_os = "linux")]
+                if let Some(f) = hw_frame.take() {
+                    self.retired_hw = Some(Retired::Dmabuf(f));
+                }
+                // Submit enqueued `value + 1` — `mark_presented` so the decoder waits
+                // that write-back. Failed submit never reaches here (no phantom signal).
+                // Park until the fence; Drop sends the release token.
+                if let Some(mut f) = native_frame.take() {
+                    f.guard.mark_presented();
+                    self.retired_hw = Some(Retired::NativeVk(f));
+                }
             }
 
             let swapchains = [self.swapchain];
@@ -992,71 +1182,99 @@ impl Presenter {
         }
     }
 
-    /// NV12→RGBA CSC into the video image: fullscreen triangle, CICP push-constant
-    /// rows. Shared by the dmabuf and Vulkan-Video paths — only the bound plane
-    /// views and `uv_scale` differ.
-    ///
-    /// `extent` is the picture (framebuffer size). `uv_scale` is picture/surface
-    /// per axis: `[1.0, 1.0]` unless the bound planes are a decode pool larger
-    /// than the picture. See the shader's `params.zw`.
+    /// YCbCr→RGBA CSC: a fullscreen triangle with the CICP push-constant rows, drawn where
+    /// `target` says. `planar` picks the 3-plane pipe (PyroWave, software I420) over the
+    /// NV12 one (dmabuf, Vulkan Video, D3D11 slots). `uv_scale` is picture/surface per
+    /// axis: `[1.0, 1.0]` unless the bound planes are a decode pool larger than the
+    /// picture (see the shader's `params.zw`).
     ///
     /// # Safety
-    /// `self.cmd_buf` must be recording; the CSC descriptor set must point at
-    /// live plane views.
+    /// `self.cmd_buf` must be recording; the pass's descriptor set must point at live
+    /// plane views.
     unsafe fn record_csc(
         &self,
-        framebuffer: vk::Framebuffer,
-        extent: vk::Extent2D,
+        planar: bool,
+        target: CscTarget,
         uv_scale: [f32; 2],
         color: pf_client_core::video::ColorDesc,
         depth: u8,
         msb_packed: bool,
     ) {
-        // SAFETY: `cmd_buf` is recording (`# Safety` on this fn). CSC pipeline,
-        // layout, and desc_set are owned here; plane views were bound this present.
+        let pass = if planar { &self.csc_planar } else { &self.csc };
+        let full = |extent: vk::Extent2D| vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        let (render_pass, pipeline, framebuffer, area, rect) = match target {
+            CscTarget::Video {
+                framebuffer,
+                extent,
+            } => (
+                pass.render_pass,
+                pass.pipeline,
+                framebuffer,
+                full(extent),
+                full(extent),
+            ),
+            CscTarget::Direct {
+                framebuffer,
+                surface,
+                rect,
+                clear,
+            } => (
+                if clear {
+                    self.direct.clear
+                } else {
+                    self.direct.keep
+                },
+                if planar {
+                    self.direct.planar
+                } else {
+                    self.direct.nv12
+                },
+                framebuffer,
+                if clear { full(surface) } else { rect },
+                rect,
+            ),
+        };
+        let clear_values = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        }];
+        // SAFETY: `cmd_buf` is recording (`# Safety` on this fn). Pipelines, layouts, and
+        // desc_sets are owned here; plane views were bound this present or the last real one.
         unsafe {
             self.device.cmd_begin_render_pass(
                 self.cmd_buf,
                 &vk::RenderPassBeginInfo::default()
-                    .render_pass(self.csc.render_pass)
+                    .render_pass(render_pass)
                     .framebuffer(framebuffer)
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent,
-                    }),
+                    .render_area(area)
+                    .clear_values(&clear_values),
                 vk::SubpassContents::INLINE,
             );
-            self.device.cmd_bind_pipeline(
-                self.cmd_buf,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.csc.pipeline,
-            );
+            self.device
+                .cmd_bind_pipeline(self.cmd_buf, vk::PipelineBindPoint::GRAPHICS, pipeline);
             self.device.cmd_set_viewport(
                 self.cmd_buf,
                 0,
                 &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: extent.width as f32,
-                    height: extent.height as f32,
+                    x: rect.offset.x as f32,
+                    y: rect.offset.y as f32,
+                    width: rect.extent.width as f32,
+                    height: rect.extent.height as f32,
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
             );
-            self.device.cmd_set_scissor(
-                self.cmd_buf,
-                0,
-                &[vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent,
-                }],
-            );
+            self.device.cmd_set_scissor(self.cmd_buf, 0, &[rect]);
             self.device.cmd_bind_descriptor_sets(
                 self.cmd_buf,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.csc.pipeline_layout,
+                pass.pipeline_layout,
                 0,
-                &[self.csc.desc_set],
+                &[pass.desc_set],
                 &[],
             );
             let rows = csc_rows(color, depth, msb_packed);
@@ -1077,95 +1295,7 @@ impl Presenter {
             let bytes = words.as_flattened();
             self.device.cmd_push_constants(
                 self.cmd_buf,
-                self.csc.pipeline_layout,
-                vk::ShaderStageFlags::FRAGMENT,
-                0,
-                bytes,
-            );
-            self.device.cmd_draw(self.cmd_buf, 3, 1, 0, 0);
-            self.device.cmd_end_render_pass(self.cmd_buf);
-        }
-    }
-
-    /// [`record_csc`] on the planar (3-plane) pass — PyroWave decode output and
-    /// the software rung's uploaded I420.
-    ///
-    /// `depth`/`msb_packed` are the producer's, never inferred from colour.
-    /// Pyrowave couples 10-bit to PQ by negotiation; the software rung is 8-bit
-    /// regardless. Treating PQ as 10-bit MSB-packed over an 8-bit plane samples
-    /// at quarter scale.
-    unsafe fn record_csc_planar(
-        &self,
-        framebuffer: vk::Framebuffer,
-        extent: vk::Extent2D,
-        color: pf_client_core::video::ColorDesc,
-        depth: u8,
-        msb_packed: bool,
-    ) {
-        let planar = &self.csc_planar;
-        // SAFETY: caller holds `cmd_buf` recording. Planar pipeline, layout, and
-        // desc_set are owned here; plane views were bound this present.
-        unsafe {
-            self.device.cmd_begin_render_pass(
-                self.cmd_buf,
-                &vk::RenderPassBeginInfo::default()
-                    .render_pass(planar.render_pass)
-                    .framebuffer(framebuffer)
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent,
-                    }),
-                vk::SubpassContents::INLINE,
-            );
-            self.device.cmd_bind_pipeline(
-                self.cmd_buf,
-                vk::PipelineBindPoint::GRAPHICS,
-                planar.pipeline,
-            );
-            self.device.cmd_set_viewport(
-                self.cmd_buf,
-                0,
-                &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: extent.width as f32,
-                    height: extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }],
-            );
-            self.device.cmd_set_scissor(
-                self.cmd_buf,
-                0,
-                &[vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent,
-                }],
-            );
-            self.device.cmd_bind_descriptor_sets(
-                self.cmd_buf,
-                vk::PipelineBindPoint::GRAPHICS,
-                planar.pipeline_layout,
-                0,
-                &[planar.desc_set],
-                &[],
-            );
-            let rows = csc_rows(color, depth, msb_packed);
-            // Mode 1 = PQ→SDR tonemap; mode 0 passes the transfer through.
-            let mode = if color.is_pq() && !self.hdr_active {
-                1.0f32
-            } else {
-                0.0
-            };
-            let mut pc = [0f32; 16];
-            pc[..12].copy_from_slice(rows.as_flattened());
-            pc[12] = mode;
-            pc[13] = tonemap_peak();
-            let words = pc.map(f32::to_ne_bytes);
-            let bytes = words.as_flattened();
-            self.device.cmd_push_constants(
-                self.cmd_buf,
-                planar.pipeline_layout,
+                pass.pipeline_layout,
                 vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytes,

@@ -286,6 +286,7 @@ Read by the Linux and Windows clients, the Decky plugin and the `punktfunk` CLI 
 | `PUNKTFUNK_PRESENT_DEBUG` | `1` | Windows: log the D3D11VA hand-off window every second. The presenter's own summary line is always logged. |
 | `PUNKTFUNK_THREAD_BOOST` | `0` | Leave the video threads (receive, decode, present) at normal priority instead of raising them. An A/B, and the way out if a driver misbehaves under a boosted thread. |
 | `PUNKTFUNK_VAAPI_EXPLICIT_SYNC` | `0` | Linux: wait each VAAPI decode on the CPU before handing it to the presenter, instead of passing the GPU's own fence along. Costs one decode time of pipelining per frame; the way out if a driver shows a frame before it is done. |
+| `PUNKTFUNK_DIRECT_PRESENT` | `0` | Draw every frame through the intermediate video image and a blit, as before, instead of straight into the swapchain image. An A/B; the direct path saves most of the present cost on an iGPU at 4K. |
 | `PUNKTFUNK_ABR_PROBE_KBPS` | kbps | Upper limit for the startup link measurement. |
 | `PUNKTFUNK_ABR_PROBE` | `0` | Skip the startup link measurement; Automatic then opens at the starting rate and climbs. |
 | `PUNKTFUNK_ABR_MAX_MBPS` | Mbps | Cap on Automatic's ceiling, for a client whose decoder can't keep up with what the link carries. |

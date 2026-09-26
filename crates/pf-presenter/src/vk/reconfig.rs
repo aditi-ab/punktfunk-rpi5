@@ -281,6 +281,14 @@ impl Presenter {
         // The scale pass renders into the swapchain format too; fence quiesce above.
         self.scale.destroy(&self.device);
         self.scale = crate::scale::ScalePass::new(&self.device, target.format)?;
+        self.direct.destroy(&self.device);
+        self.direct = crate::csc::DirectPass::new(
+            &self.device,
+            target.format,
+            self.csc.pipeline_layout,
+            self.csc_planar.pipeline_layout,
+        )?;
+        self.direct_last = None;
         self.format = target;
         self.hdr_active = on;
         match self.recreate_swapchain(window) {
