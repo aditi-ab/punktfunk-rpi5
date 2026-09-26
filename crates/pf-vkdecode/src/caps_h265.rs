@@ -152,6 +152,10 @@ pub fn output_format_for(chroma_format_idc: u8, bit_depth_luma_minus8: u8) -> Op
 /// use of the returned reference.
 pub(crate) struct H265ProfileChain {
     h265: vk::VideoDecodeH265ProfileInfoKHR<'static>,
+    /// Decode usage hints between the profile and the codec struct. Optional by the
+    /// spec, but Intel's Windows driver walks the chain expecting it and faults on
+    /// the first parameters create without it; FFmpeg always chains it.
+    usage: vk::VideoDecodeUsageInfoKHR<'static>,
     profile: vk::VideoProfileInfoKHR<'static>,
 }
 
@@ -159,6 +163,7 @@ impl H265ProfileChain {
     pub(crate) fn new(key: H265ProfileKey) -> Self {
         Self {
             h265: vk::VideoDecodeH265ProfileInfoKHR::default().std_profile_idc(key.std_profile_idc),
+            usage: vk::VideoDecodeUsageInfoKHR::default(),
             profile: vk::VideoProfileInfoKHR::default()
                 .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H265)
                 .chroma_subsampling(key.chroma_subsampling)
@@ -170,7 +175,8 @@ impl H265ProfileChain {
     /// Wire the internal `p_next` chain and hand out the profile root. Do not move
     /// `self` while the returned reference (or any pointer taken from it) lives.
     pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'static> {
-        self.profile.p_next = (&self.h265 as *const vk::VideoDecodeH265ProfileInfoKHR<'_>).cast();
+        self.usage.p_next = (&self.h265 as *const vk::VideoDecodeH265ProfileInfoKHR<'_>).cast();
+        self.profile.p_next = (&self.usage as *const vk::VideoDecodeUsageInfoKHR<'_>).cast();
         &self.profile
     }
 }
@@ -520,13 +526,17 @@ mod tests {
             vk::VideoComponentBitDepthFlagsKHR::TYPE_10
         );
         assert!(!profile.p_next.is_null());
-        // SAFETY: wire() pointed p_next at chain's own h265 field, which lives for
-        // this whole scope and is a valid VideoDecodeH265ProfileInfoKHR.
-        let h265 = unsafe {
-            &*profile
-                .p_next
-                .cast::<vk::VideoDecodeH265ProfileInfoKHR<'_>>()
-        };
+        // SAFETY: wire() pointed p_next at chain's own usage field, which lives for
+        // this whole scope and is a valid VideoDecodeUsageInfoKHR.
+        let usage = unsafe { &*profile.p_next.cast::<vk::VideoDecodeUsageInfoKHR<'_>>() };
+        assert_eq!(usage.s_type, vk::StructureType::VIDEO_DECODE_USAGE_INFO_KHR);
+        assert_eq!(
+            usage.video_usage_hints,
+            vk::VideoDecodeUsageFlagsKHR::DEFAULT
+        );
+        // SAFETY: wire() pointed the usage struct's p_next at chain's own h265 field,
+        // which lives for this whole scope and is a valid VideoDecodeH265ProfileInfoKHR.
+        let h265 = unsafe { &*usage.p_next.cast::<vk::VideoDecodeH265ProfileInfoKHR<'_>>() };
         assert_eq!(
             h265.std_profile_idc,
             hh::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10

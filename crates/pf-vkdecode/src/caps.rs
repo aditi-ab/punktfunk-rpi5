@@ -540,6 +540,10 @@ fn require_mutable_with(
 /// it holds the reference across the call in `OpRing::create_status_query_pool`.
 pub(crate) struct H264ProfileChain {
     h264: vk::VideoDecodeH264ProfileInfoKHR<'static>,
+    /// Decode usage hints between the profile and the codec struct. Optional by the
+    /// spec, but Intel's Windows driver walks the chain expecting it and faults on
+    /// the first parameters create without it; FFmpeg always chains it.
+    usage: vk::VideoDecodeUsageInfoKHR<'static>,
     profile: vk::VideoProfileInfoKHR<'static>,
 }
 
@@ -551,6 +555,7 @@ impl H264ProfileChain {
             h264: vk::VideoDecodeH264ProfileInfoKHR::default()
                 .std_profile_idc(std_profile_idc)
                 .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE),
+            usage: vk::VideoDecodeUsageInfoKHR::default(),
             profile: vk::VideoProfileInfoKHR::default()
                 .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
                 .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
@@ -562,7 +567,8 @@ impl H264ProfileChain {
     /// Wire the internal `p_next` chain and hand out the profile root. Do not
     /// move `self` while the returned reference (or any pointer from it) lives.
     pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'static> {
-        self.profile.p_next = (&self.h264 as *const vk::VideoDecodeH264ProfileInfoKHR<'_>).cast();
+        self.usage.p_next = (&self.h264 as *const vk::VideoDecodeH264ProfileInfoKHR<'_>).cast();
+        self.profile.p_next = (&self.usage as *const vk::VideoDecodeUsageInfoKHR<'_>).cast();
         &self.profile
     }
 }
@@ -1138,13 +1144,17 @@ mod tests {
             vk::VideoCodecOperationFlagsKHR::DECODE_H264
         );
         assert!(!profile.p_next.is_null());
-        // SAFETY: wire() pointed p_next at chain's own h264 field, which lives for
-        // this whole scope and is a valid VideoDecodeH264ProfileInfoKHR.
-        let h264 = unsafe {
-            &*profile
-                .p_next
-                .cast::<vk::VideoDecodeH264ProfileInfoKHR<'_>>()
-        };
+        // SAFETY: wire() pointed p_next at chain's own usage field, which lives for
+        // this whole scope and is a valid VideoDecodeUsageInfoKHR.
+        let usage = unsafe { &*profile.p_next.cast::<vk::VideoDecodeUsageInfoKHR<'_>>() };
+        assert_eq!(usage.s_type, vk::StructureType::VIDEO_DECODE_USAGE_INFO_KHR);
+        assert_eq!(
+            usage.video_usage_hints,
+            vk::VideoDecodeUsageFlagsKHR::DEFAULT
+        );
+        // SAFETY: wire() pointed the usage struct's p_next at chain's own h264 field,
+        // which lives for this whole scope and is a valid VideoDecodeH264ProfileInfoKHR.
+        let h264 = unsafe { &*usage.p_next.cast::<vk::VideoDecodeH264ProfileInfoKHR<'_>>() };
         assert_eq!(
             h264.std_profile_idc,
             hh::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN
