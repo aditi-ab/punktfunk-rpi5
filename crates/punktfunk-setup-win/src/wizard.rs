@@ -1514,8 +1514,8 @@ fn done_page(ctx: &Ctx) -> Element {
                 next_step(
                     "Open the web console",
                     "Approve devices, pick what to stream, change settings. The certificate is the host's own — continue past the browser's warning.",
-                    "https://localhost:47992",
-                    "https://localhost:47992/",
+                    "https://127.0.0.1:47992",
+                    "https://127.0.0.1:47992/",
                 ),
                 next_step(
                     "Install a client",

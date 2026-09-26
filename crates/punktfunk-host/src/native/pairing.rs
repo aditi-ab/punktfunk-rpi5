@@ -1,9 +1,9 @@
 //! Host SPAKE2 pairing.
 //!
 //! `serve_session` dispatches a first-message `PairRequest` here after resolving
-//! the armed PIN. This is SPAKE2 role B: the PIN is consumed after the host
-//! confirmation so an attacker gets one online guess, then the client fingerprint
-//! is persisted on success.
+//! the armed PIN. This is SPAKE2 role B: the PIN is consumed before the host
+//! challenge goes out so an attacker gets one online guess, then the client
+//! fingerprint is persisted on success.
 //!
 //! **The caller supplies both identities.** The ceremony binds the SPAKE2 key to them and does
 //! not care where they came from — which is what lets a carrier without mTLS use it. On the
@@ -23,8 +23,9 @@ use punktfunk_core::quic::{PairChallenge, PairProof, PairResult};
 /// 60 s: a person reads the PIN off the host and types it. Session handshake is machine-speed.
 const PAIRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Host SPAKE2 (role B). Consumes the armed PIN after the challenge write so a
-/// vanished client still burns the one online guess. Both stream writes time out.
+/// Host SPAKE2 (role B). Consumes the armed PIN before the challenge write, so a
+/// client that stalls or resets that write still spends its one online guess.
+/// Both stream writes time out.
 ///
 /// `client_fp` and `host_fp` are the SPAKE2 identities: whatever the caller binds this pairing
 /// to. Getting them wrong does not fail loudly — it yields a different key and a MAC mismatch,
@@ -63,8 +64,11 @@ where
     let (pake, spake_b) = pake::start(false, pin, &client_fp, host_fp);
     let confirms = pake.finish(&req.spake_a)?; // Err only on a malformed peer message
 
-    // Timeout: this write waits on the client's stream window. Sequential host;
-    // the armed TTL can lapse while parked.
+    // Burn the PIN before the challenge leaves: a client can read most of it and then stall
+    // or reset the write, and the guess is spent either way. Garbage `finish` never got here.
+    let access = consume_window(np, pin)?;
+
+    // Timeout: this write waits on the client's stream window.
     tokio::time::timeout(
         PAIRING_TIMEOUT,
         io::write_msg(
@@ -78,11 +82,6 @@ where
     )
     .await
     .map_err(|_| anyhow!("pairing timed out sending the challenge"))??;
-
-    // Consume now — the challenge lets the client test this guess; a wrong PIN
-    // disconnects without a proof, so there is no host-visible miss to wait for.
-    // Malformed `finish` never reached here, so garbage does not burn the window.
-    let access = consume_window(np, pin)?;
 
     let proof = tokio::time::timeout(PAIRING_TIMEOUT, io::read_msg(&mut recv))
         .await

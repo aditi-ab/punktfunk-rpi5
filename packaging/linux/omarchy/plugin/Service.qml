@@ -142,7 +142,7 @@ Item {
   // console-url`, and an EMPTY --app= opens a plain browser window.
   function openConsole() {
     detached(["sh", "-c",
-              "exec omarchy-launch-webapp \"$(punktfunk-host ctl console-url || echo https://localhost:47992)\""])
+              "exec omarchy-launch-webapp \"$(punktfunk-host ctl console-url || echo https://127.0.0.1:47992)\""])
   }
 
   Component {

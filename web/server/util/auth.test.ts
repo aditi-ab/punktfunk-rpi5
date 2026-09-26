@@ -28,6 +28,10 @@ describe("safeNextPath", () => {
 			"//evil.com/x",
 			"/\\evil.com",
 			"\\\\evil.com",
+			// Same origin while parsed, but the path serializes to `//evil.com`.
+			"/.//evil.com",
+			"/..//evil.com",
+			"/%2e//evil.com",
 		]) {
 			expect(safeNextPath(evil)).toBe("/");
 		}

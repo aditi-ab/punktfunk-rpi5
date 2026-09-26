@@ -707,7 +707,9 @@ fn console_stub() -> Result<String> {
     let ticket = handoff_ticket(&token, ts, &nonce)?;
     // The console's own port, not the mgmt one. It is not published anywhere the way
     // `mgmt-endpoint` is, so the documented default stands until somebody moves it.
-    let target = format!("https://localhost:47992/_auth/handoff?t={ticket}");
+    // `127.0.0.1`, not `localhost`: the console binds IPv4 only, and any local user can
+    // listen on `[::1]:47992`, which browsers try first, and take the ticket.
+    let target = format!("https://127.0.0.1:47992/_auth/handoff?t={ticket}");
     write_stub(&std::path::Path::new(&runtime).join("punktfunk"), &target)
 }
 

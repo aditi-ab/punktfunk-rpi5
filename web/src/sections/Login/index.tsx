@@ -40,7 +40,11 @@ export const SectionLogin: FC<{ next?: string }> = ({ next }) => {
 			let safe = "/";
 			try {
 				const u = new URL(next ?? "/", window.location.origin);
-				if (u.origin === window.location.origin) {
+				// `/.//evil.com` parses same-origin but serializes to `//evil.com`.
+				if (
+					u.origin === window.location.origin &&
+					!u.pathname.startsWith("//")
+				) {
 					safe = u.pathname + u.search + u.hash;
 				}
 			} catch {
