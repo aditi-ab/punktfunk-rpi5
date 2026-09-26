@@ -430,12 +430,14 @@ impl BitstreamRing {
                 au = len,
                 "bitstream ring grows for an oversized AU"
             );
-            // SAFETY: every in-flight read was drained above; destroy_backing only
-            // touches this ring's own objects.
-            unsafe { self.destroy_backing() };
+            // Allocate before destroying: a failed grow keeps the old mapping and
+            // layout, never a null `ptr` for the next AU that fits.
             // SAFETY: caller's live-device contract.
             let (buffer, memory, ptr) =
                 unsafe { Self::allocate_backing(dev, &grown, self.profile)? };
+            // SAFETY: every in-flight read was drained above; destroy_backing only
+            // touches this ring's own objects.
+            unsafe { self.destroy_backing() };
             self.layout = grown;
             self.buffer = buffer;
             self.memory = memory;
