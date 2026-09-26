@@ -483,15 +483,36 @@ fn require_usage(
     }
 }
 
-/// A driver that reports no create flags at all (Intel on Windows) has not said no:
-/// the pool asks for MUTABLE_FORMAT and `vkCreateImage` is the judge.
+/// `PUNKTFUNK_VKDECODE_TRUST_QUERY=1`: take a format's return from the usage query as
+/// support for that usage, and an all-empty create-flag report as "not refused". For
+/// driver investigation; on Intel Windows it turns the refusal into a driver fault.
+pub(crate) fn trust_query() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("PUNKTFUNK_VKDECODE_TRUST_QUERY")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 fn require_mutable(entry: &VideoFormat, mode: &'static str) -> Result<(), CapsError> {
+    require_mutable_with(entry, mode, trust_query())
+}
+
+/// `trust`: a driver that reports no create flags at all has not said no, the pool asks
+/// for MUTABLE_FORMAT and `vkCreateImage` is the judge. Off, the empty report refuses.
+fn require_mutable_with(
+    entry: &VideoFormat,
+    mode: &'static str,
+    trust: bool,
+) -> Result<(), CapsError> {
     if entry
         .image_create_flags
         .contains(vk::ImageCreateFlags::MUTABLE_FORMAT)
     {
         Ok(())
-    } else if entry.image_create_flags.is_empty() {
+    } else if trust && entry.image_create_flags.is_empty() {
         tracing::info!(
             format = ?entry.format,
             mode,
@@ -741,14 +762,20 @@ pub(crate) unsafe fn query_formats_on(
         return Err(r);
     }
     props.truncate(count as usize);
-    // A format the driver returns for `usage` supports `usage`: that is the query's
-    // contract. Intel's Windows driver echoes one fixed video-only mask for every
-    // query, so the answer, not the echoed mask, carries the queried bits.
+    // Opted in, the queried usage rides the entry: the query's contract says a returned
+    // format supports it. Intel's Windows driver echoes one fixed video-only mask for
+    // every query, and creating past that mask faults inside its media module, so the
+    // echoed mask stays the default authority.
+    let trusted = if trust_query() {
+        usage
+    } else {
+        vk::ImageUsageFlags::empty()
+    };
     Ok(props
         .iter()
         .map(|p| VideoFormat {
             format: p.format,
-            image_usage: p.image_usage_flags | usage,
+            image_usage: p.image_usage_flags | trusted,
             image_create_flags: p.image_create_flags,
             image_type: p.image_type,
             image_tiling: p.image_tiling,
@@ -772,12 +799,13 @@ mod tests {
     }
 
     #[test]
-    fn no_create_flags_reported_is_not_a_refusal() {
+    fn an_empty_create_flag_report_refuses_unless_the_query_is_trusted() {
         let mut e = entry(vk::Format::G8_B8R8_2PLANE_420_UNORM, COINCIDE_USAGE);
         e.image_create_flags = vk::ImageCreateFlags::empty();
-        assert!(require_mutable(&e, "coincide").is_ok());
+        assert!(require_mutable_with(&e, "coincide", false).is_err());
+        assert!(require_mutable_with(&e, "coincide", true).is_ok());
         e.image_create_flags = vk::ImageCreateFlags::ALIAS;
-        assert!(require_mutable(&e, "coincide").is_err());
+        assert!(require_mutable_with(&e, "coincide", true).is_err());
     }
 
     fn radv_like() -> RawH264Caps {
