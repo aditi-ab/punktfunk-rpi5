@@ -563,6 +563,112 @@ fn connect_plan(params: &SessionParams) -> ConnectPlan {
     }
 }
 
+/// Hello's client-capability bits. `CLIENT_CAP_AUDIO_HIRES` is not here: core derives
+/// it from the audio format pair being specified, the one rule that keeps 48 kHz/16-bit
+/// lossless askable.
+fn client_caps(params: &SessionParams, pad_audio_on: bool) -> u8 {
+    use punktfunk_core::quic::{
+        CLIENT_CAP_CURSOR, CLIENT_CAP_KEEP_HOST_AUDIO, CLIENT_CAP_PAD_AUDIO, CLIENT_CAP_PHASE_LOCK,
+    };
+    let bit = |on: bool, cap: u8| if on { cap } else { 0 };
+    bit(params.cursor_forward, CLIENT_CAP_CURSOR)
+        | bit(params.phase_lock, CLIENT_CAP_PHASE_LOCK)
+        | bit(pad_audio_on, CLIENT_CAP_PAD_AUDIO)
+        | bit(params.keep_host_audio, CLIENT_CAP_KEEP_HOST_AUDIO)
+}
+
+/// Dial the host. `Err` is the terminal event the pump sends instead of `Connected`.
+fn dial(
+    params: &SessionParams,
+    stop: &Arc<AtomicBool>,
+    plan: &ConnectPlan,
+) -> Result<Arc<NativeClient>, SessionEvent> {
+    // Lossless opt-in, filtered by what this box can play. `CLIENT_CAP_AUDIO_HIRES`
+    // means capable *and* the user turned it on — advertising without being able to
+    // render spends 1.5–4.6 Mbps ABR cannot reclaim. `Some` past this block is
+    // "ask", and asking is what sets the bit (`AUDIO_FORMAT_UNSPECIFIED`).
+    let hires = requested_audio_format(&params.audio_format).filter(|&(rate, _)| {
+        if params.audio_channels != 2 {
+            // A hi-res surround frame does not fit one datagram at the default MTU
+            // and this plane is never fragmented. The two settings are independent
+            // overlay keys, and the env override answers to no UI, so this is the
+            // one place both are known.
+            tracing::warn!(
+                channels = params.audio_channels,
+                "lossless audio is stereo-only — a surround frame does not fit one QUIC \
+                 datagram; asking for the default Opus plane instead"
+            );
+            return false;
+        }
+        audio::can_render_at(rate)
+    });
+    if let Some((rate, bits)) = hires {
+        tracing::info!(rate, bits, "asking the host for the lossless audio plane");
+    }
+    // This pair is the request: core derives the cap from it being specified, so
+    // `None` must reach the wire as unspecified, not as an explicit 48 000/16.
+    let (audio_rate_hz, audio_bits) = hires.unwrap_or(AUDIO_FORMAT_UNSPECIFIED);
+    // Per dial: a session without a preset must not name the last one's.
+    punktfunk_core::client::set_session_preset(params.preset_id.as_deref().and_then(|id| {
+        punktfunk_core::quic::SessionPreset::new(id, params.preset.as_deref().unwrap_or(""))
+    }));
+    NativeClient::connect_with_audio_format(
+        &params.host,
+        params.port,
+        params.mode,
+        params.compositor,
+        params.gamepad,
+        plan.bitrate_kbps,
+        plan.video_caps,
+        params.audio_channels,
+        audio_rate_hz,
+        audio_bits,
+        // Legacy coupling: this client decodes either, and only NDL-class sinks need the other.
+        punktfunk_core::audio::AudioLayout::Legacy,
+        params.video_fit,
+        plan.advertised_codecs,
+        plan.preferred,
+        // Env hatch wins so an A/B run can pin an exact peak (`PUNKTFUNK_CLIENT_PEAK_NITS`).
+        punktfunk_core::client::display_hdr_env_override().or(params.display_hdr),
+        client_caps(params, plan.pad_audio_on),
+        // Slice-progressive delivery: off — every rung here is fed whole AUs.
+        false,
+        params.launch.clone(),
+        // Host's trust-store label. Without it every no-PIN "request access" knock
+        // showed as the fingerprint placeholder "device abcd1234".
+        Some(crate::trust::device_name()),
+        params.pin,
+        Some(params.identity.clone()),
+        params.connect_timeout,
+        // Session stop flag, so cancel reaches a dial that has not landed. Without
+        // it this parks the pump for the whole budget (185 s on a request-access
+        // connect the host holds pending) and cancel cannot be answered until return.
+        Some(stop.clone()),
+    )
+    .map(Arc::new)
+    .map_err(|e| {
+        let trust_rejected = matches!(e, PunktfunkError::Crypto);
+        let msg = match e {
+            PunktfunkError::Crypto => {
+                "Host identity rejected — wrong fingerprint, or the host requires pairing"
+                    .to_string()
+            }
+            PunktfunkError::Timeout => "Connection timed out".to_string(),
+            // Host said why it turned us away — show that verbatim: "denied on the
+            // host" and "timed out" call for different next steps.
+            PunktfunkError::Rejected(reason) => crate::trust::connect_reject_message(reason),
+            other => {
+                tracing::warn!(error = %other, "connect failed");
+                "The host didn't answer".to_string()
+            }
+        };
+        SessionEvent::Failed {
+            msg,
+            trust_rejected,
+        }
+    })
+}
+
 fn open_decoder(
     decoder: &str,
     vulkan: Option<&crate::video::VulkanDecodeDevice>,
@@ -717,6 +823,37 @@ enum HwDone {
     Cpu,
 }
 
+/// One keyframe ask per 100 ms, shared by every recovery site in the pump.
+#[derive(Default)]
+struct KeyframeAsk {
+    last: Option<Instant>,
+}
+
+impl KeyframeAsk {
+    const EVERY: Duration = Duration::from_millis(100);
+
+    /// Take the ask window at `now`. False while an ask from the last 100 ms holds it.
+    fn claim(&mut self, now: Instant) -> bool {
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < Self::EVERY)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+
+    /// [`Self::claim`], then ask the host for a keyframe when the window was open.
+    fn ask(&mut self, now: Instant, connector: &NativeClient) -> bool {
+        let open = self.claim(now);
+        if open {
+            let _ = connector.request_keyframe();
+        }
+        open
+    }
+}
+
 fn pump(
     params: SessionParams,
     ev_tx: async_channel::Sender<SessionEvent>,
@@ -725,117 +862,17 @@ fn pump(
     mic: MicControl,
 ) {
     crate::audio_rt::boost_and_log("decode");
+    let plan = connect_plan(&params);
     let ConnectPlan {
-        preferred,
         pad_speaker_on,
         pad_audio_on,
         advertised_codecs,
-        bitrate_kbps,
-        video_caps,
-    } = connect_plan(&params);
-    // Lossless opt-in, filtered by what this box can play. `CLIENT_CAP_AUDIO_HIRES`
-    // means capable *and* the user turned it on — advertising without being able to
-    // render spends 1.5–4.6 Mbps ABR cannot reclaim. `Some` past this block is
-    // "ask", and asking is what sets the bit (`AUDIO_FORMAT_UNSPECIFIED`).
-    let hires = requested_audio_format(&params.audio_format).filter(|&(rate, _)| {
-        if params.audio_channels != 2 {
-            // A hi-res surround frame does not fit one datagram at the default MTU
-            // and this plane is never fragmented. The two settings are independent
-            // overlay keys, and the env override answers to no UI, so this is the
-            // one place both are known.
-            tracing::warn!(
-                channels = params.audio_channels,
-                "lossless audio is stereo-only — a surround frame does not fit one QUIC \
-                 datagram; asking for the default Opus plane instead"
-            );
-            return false;
-        }
-        audio::can_render_at(rate)
-    });
-    if let Some((rate, bits)) = hires {
-        tracing::info!(rate, bits, "asking the host for the lossless audio plane");
-    }
-    // This pair is the request: core derives the cap from it being specified, so
-    // `None` must reach the wire as unspecified, not as an explicit 48 000/16.
-    let (audio_rate_hz, audio_bits) = hires.unwrap_or(AUDIO_FORMAT_UNSPECIFIED);
-    // Per dial: a session without a preset must not name the last one's.
-    punktfunk_core::client::set_session_preset(params.preset_id.as_deref().and_then(|id| {
-        punktfunk_core::quic::SessionPreset::new(id, params.preset.as_deref().unwrap_or(""))
-    }));
-    let connector = match NativeClient::connect_with_audio_format(
-        &params.host,
-        params.port,
-        params.mode,
-        params.compositor,
-        params.gamepad,
-        bitrate_kbps,
-        video_caps,
-        params.audio_channels,
-        audio_rate_hz,
-        audio_bits,
-        // Legacy coupling: this client decodes either, and only NDL-class sinks need the other.
-        punktfunk_core::audio::AudioLayout::Legacy,
-        params.video_fit,
-        advertised_codecs,
-        preferred,
-        // Env hatch wins so an A/B run can pin an exact peak (`PUNKTFUNK_CLIENT_PEAK_NITS`).
-        punktfunk_core::client::display_hdr_env_override().or(params.display_hdr),
-        (if params.cursor_forward {
-            punktfunk_core::quic::CLIENT_CAP_CURSOR
-        } else {
-            0
-        }) | (if params.phase_lock {
-            punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
-        } else {
-            0
-            // AUDIO_HIRES is not set here: core derives it from the format pair being
-            // specified, which is the one rule that keeps 48 kHz/16-bit lossless
-            // askable. Setting it without a format would advertise a request the host
-            // can only decline.
-        }) | (if pad_audio_on {
-            punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO
-        } else {
-            0
-        }) | (if params.keep_host_audio {
-            punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO
-        } else {
-            0
-        }),
-        // Slice-progressive delivery: off — every rung here is fed whole AUs.
-        false,
-        params.launch.clone(),
-        // Host's trust-store label. Without it every no-PIN "request access" knock
-        // showed as the fingerprint placeholder "device abcd1234".
-        Some(crate::trust::device_name()),
-        params.pin,
-        Some(params.identity),
-        params.connect_timeout,
-        // Session stop flag, so cancel reaches a dial that has not landed. Without
-        // it this parks the pump for the whole budget (185 s on a request-access
-        // connect the host holds pending) and cancel cannot be answered until return.
-        Some(stop.clone()),
-    ) {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            let trust_rejected = matches!(e, PunktfunkError::Crypto);
-            let msg = match e {
-                PunktfunkError::Crypto => {
-                    "Host identity rejected — wrong fingerprint, or the host requires pairing"
-                        .to_string()
-                }
-                PunktfunkError::Timeout => "Connection timed out".to_string(),
-                // Host said why it turned us away — show that verbatim: "denied on the
-                // host" and "timed out" call for different next steps.
-                PunktfunkError::Rejected(reason) => crate::trust::connect_reject_message(reason),
-                other => {
-                    tracing::warn!(error = %other, "connect failed");
-                    "The host didn't answer".to_string()
-                }
-            };
-            let _ = ev_tx.send_blocking(SessionEvent::Failed {
-                msg,
-                trust_rejected,
-            });
+        ..
+    } = plan;
+    let connector = match dial(&params, &stop, &plan) {
+        Ok(c) => c,
+        Err(failed) => {
+            let _ = ev_tx.send_blocking(failed);
             return;
         }
     };
@@ -938,7 +975,7 @@ fn pump(
     let wants_decode = connector.wants_decode_latency();
     // What actually decoded the last frame — VAAPI can demote mid-session.
     let mut dec_path: &'static str = "";
-    let mut last_kf_req: Option<Instant> = None;
+    let mut kf = KeyframeAsk::default();
     // PyroWave AUs decode independently, so a late one is still worth showing.
     let all_intra = connector.codec == punktfunk_core::quic::CODEC_PYROWAVE;
     // Freeze-until-reanchor. Armed on any loss signal, withholds concealed frames
@@ -1033,11 +1070,7 @@ fn pump(
                     FrameOrder::Gap(gap) => {
                         let now = Instant::now();
                         gate.arm_expecting_drops(now, u64::from(gap));
-                        if last_kf_req
-                            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-                        {
-                            last_kf_req = Some(now);
-                        }
+                        kf.claim(now);
                         tracing::trace!(
                             gap,
                             "frame gap — RFI recovery, holding last frame until re-anchor"
@@ -1139,43 +1172,13 @@ fn pump(
                                 "damaged reference chain reached an unfrozen gate — holding, \
                                  requesting keyframe"
                             );
-                            if last_kf_req
-                                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-                            {
-                                last_kf_req = Some(now);
-                                let _ = connector.request_keyframe();
-                            }
+                            kf.ask(now, &connector);
                         }
                         total_frames += 1;
-                        // `stats:` decode-path tag is a machine interface — additive
-                        // only. Surviving tags keep their exact spelling.
-                        dec_path = match &image {
-                            DecodedImage::Cpu(_) => "software",
-                            #[cfg(target_os = "linux")]
-                            DecodedImage::NativeDmabuf(_) => "native-vaapi",
-                            #[cfg(windows)]
-                            DecodedImage::D3d11(_) => "native-d3d11va",
-                            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-                            DecodedImage::PyroWave(_) => "pyrowave",
-                            DecodedImage::NativeVk(_) => "native-vulkan",
-                        };
+                        dec_path = image.path_label();
                         if total_frames == 1 {
-                            let (w, h, path) = match &image {
-                                DecodedImage::Cpu(c) => (c.width, c.height, "software"),
-                                #[cfg(target_os = "linux")]
-                                DecodedImage::NativeDmabuf(d) => {
-                                    (d.width, d.height, "native-vaapi-dmabuf")
-                                }
-                                #[cfg(windows)]
-                                DecodedImage::D3d11(d) => (d.width, d.height, "native-d3d11va"),
-                                #[cfg(all(
-                                    any(target_os = "linux", windows),
-                                    feature = "pyrowave"
-                                ))]
-                                DecodedImage::PyroWave(f) => (f.width, f.height, "pyrowave"),
-                                DecodedImage::NativeVk(f) => (f.width, f.height, "native-vulkan"),
-                            };
-                            tracing::info!(width = w, height = h, path, "first frame decoded");
+                            let (width, height) = image.dimensions();
+                            tracing::info!(width, height, path = dec_path, "first frame decoded");
                         }
                         // Travels with the frame so the presenter can measure `display`.
                         let decoded_ns = now_ns();
@@ -1258,12 +1261,7 @@ fn pump(
                     // and, once it trips, arms the freeze and asks for an IDR.
                     Ok(None) => {
                         let now = Instant::now();
-                        if gate.on_no_output(now)
-                            && last_kf_req
-                                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-                        {
-                            last_kf_req = Some(now);
-                            let _ = connector.request_keyframe();
+                        if gate.on_no_output(now) && kf.ask(now, &connector) {
                             tracing::debug!("requested keyframe (decoder produced no output)");
                         }
                     }
@@ -1286,12 +1284,7 @@ fn pump(
                     Err(e) => {
                         tracing::debug!(error = %e, "decode error (recovering)");
                         let now = Instant::now();
-                        if gate.on_no_output(now)
-                            && last_kf_req
-                                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-                        {
-                            last_kf_req = Some(now);
-                            let _ = connector.request_keyframe();
+                        if gate.on_no_output(now) && kf.ask(now, &connector) {
                             tracing::debug!("requested keyframe (decode error recovery)");
                         }
                     }
@@ -1313,11 +1306,7 @@ fn pump(
                     if !gate.is_holding() {
                         gate.arm(now);
                     }
-                    if last_kf_req
-                        .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-                    {
-                        last_kf_req = Some(now);
-                        let _ = connector.request_keyframe();
+                    if kf.ask(now, &connector) {
                         tracing::debug!("requested keyframe (decoder recovery)");
                     }
                 }
@@ -1373,11 +1362,7 @@ fn pump(
         // means the only recovery keyframe is one we request.
         let dropped = connector.frames_dropped();
         let now = Instant::now();
-        if gate.poll(dropped, now)
-            && last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-        {
-            last_kf_req = Some(now);
-            let _ = connector.request_keyframe();
+        if gate.poll(dropped, now) && kf.ask(now, &connector) {
             tracing::debug!(
                 dropped,
                 "requested keyframe (loss recovery / overdue re-anchor)"
@@ -1880,6 +1865,20 @@ mod tests {
             Some((48_000, BITS_24))
         );
         assert_eq!(resolve_audio_format(Some("44100"), AUDIO_FORMAT_OPUS), None);
+    }
+
+    /// Every recovery site shares one window: a claim inside 100 ms of the last is refused.
+    #[test]
+    fn keyframe_asks_share_one_hundred_millisecond_window() {
+        let t0 = Instant::now();
+        let mut kf = KeyframeAsk::default();
+        assert!(kf.claim(t0), "the first ask goes out");
+        assert!(!kf.claim(t0 + Duration::from_millis(99)));
+        assert!(kf.claim(t0 + Duration::from_millis(100)));
+        assert!(
+            !kf.claim(t0 + Duration::from_millis(150)),
+            "the window restarts at the last granted ask"
+        );
     }
 
     #[test]

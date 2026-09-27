@@ -57,10 +57,29 @@ impl DecodeHealth {
 
     /// One correctly-decoded frame discarded unshown. Separate from [`Self::note`]:
     /// several frames can drop inside one AU that still shipped a picture. Never touches [`Self::run`].
+    /// True when this drop should warn: the first in full, then one per [`DROP_WARN_EVERY`].
     #[cfg(feature = "desktop")]
-    pub(crate) fn note_dropped(&mut self) {
+    pub(crate) fn note_dropped(&mut self) -> bool {
         self.dropped = self.dropped.saturating_add(1);
+        self.dropped == 1 || self.dropped % DROP_WARN_EVERY == 0
     }
+}
+
+/// Deliverable-queue drops between two warnings (~5 s at 60 fps). The shape that drops
+/// at all drops every AU; a warn per frame buries the log.
+#[cfg(feature = "desktop")]
+const DROP_WARN_EVERY: u64 = 300;
+
+/// Trim a native rung's deliverable queue to `cap` by dropping from the front; the
+/// caller releases the returned frames.
+///
+/// Oldest-first: the front is several AUs stale and the next stage is newest-wins.
+/// Call after this AU's own frame is taken off the front so `cap` bounds carry-over.
+/// Trimming before the take would drop the first of a two-output AU and ship the second.
+#[cfg(feature = "desktop")]
+pub(crate) fn trim_deliverable<F>(queue: &mut std::collections::VecDeque<F>, cap: usize) -> Vec<F> {
+    let excess = queue.len().saturating_sub(cap);
+    queue.drain(..excess).collect()
 }
 
 /// Picture shape the host resolved in Welcome, before any AU arrives.

@@ -173,6 +173,15 @@ mod sc2_capture;
 pub mod presets;
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 pub mod session;
+// The `Settings` model and the preset resolver; `trust` re-exports them.
+#[cfg(any(
+    target_os = "linux",
+    windows,
+    target_os = "android",
+    target_vendor = "apple",
+    target_family = "wasm"
+))]
+pub mod settings;
 // One decode-less connect and one host burst — the shared half of every "Test network
 // speed…" row. Desktop-gated with `video`, whose codec advertisement the probe connect
 // sends; Android measures through its own JNI session instead.

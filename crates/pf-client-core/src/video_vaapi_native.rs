@@ -37,6 +37,7 @@ use crate::video::DmabufPlane;
 use crate::video::DrmFrameGuard;
 use crate::video::StreamFormat;
 use crate::video_color::ColorDesc;
+use crate::video_types::trim_deliverable;
 
 /// `PUNKTFUNK_DECODER=native-vaapi`. Skips the vendor order so a box that would
 /// pick Vulkan first can still reach this rung; gating the pin would make the
@@ -365,29 +366,6 @@ fn max_deliverable(s: &Session) -> usize {
     s.shape.max_dpb_frames
 }
 
-/// First drop in full, then a heartbeat (~every 5 s at 60 fps). A drop-every-AU
-/// shape would bury the log at frame rate.
-const DROP_WARN_EVERY: u64 = 300;
-
-/// Drop oldest first after this AU's own frame is taken off the front, so `cap`
-/// bounds carry-over. Trimming before the take would invert display order inside
-/// one AU. Returned frames drop via [`VaFrameGuard`]; the caller counts first.
-fn trim_deliverable(
-    queue: &mut std::collections::VecDeque<DmabufFrame>,
-    cap: usize,
-) -> Vec<DmabufFrame> {
-    let mut dropped = Vec::new();
-    while queue.len() > cap {
-        match queue.pop_front() {
-            Some(frame) => dropped.push(frame),
-            // `len() > cap` means non-empty. Break, not `expect`: a bound of 0
-            // on an empty queue must not panic in the decode path.
-            None => break,
-        }
-    }
-    dropped
-}
-
 pub(crate) struct NativeVaapiDecoder {
     display: Display,
     planner: Planner,
@@ -536,6 +514,7 @@ impl NativeVaapiDecoder {
     }
 
     /// This AU's frame off the front first so [`trim_deliverable`] bounds carry-over.
+    /// Trimmed frames free their surface through [`VaFrameGuard`] on drop.
     fn take_deliverable(&mut self) -> Option<DmabufFrame> {
         let shipped = self.deliverable.pop_front();
         // No session means no pool; cap 0 is "no surfaces exist".
@@ -543,8 +522,7 @@ impl NativeVaapiDecoder {
         // Pre-trim depth: after the trim this would be `cap` every time.
         let queued = self.deliverable.len();
         for frame in trim_deliverable(&mut self.deliverable, cap) {
-            self.health.note_dropped();
-            if self.health.dropped == 1 || self.health.dropped % DROP_WARN_EVERY == 0 {
+            if self.health.note_dropped() {
                 tracing::warn!(
                     queued,
                     cap,
@@ -623,13 +601,14 @@ impl NativeVaapiDecoder {
             },
             _ => unreachable!("dispatched on the planner's own arm"),
         };
+        let pic = &plan.picture;
         let shape = shape_of(
-            plan.picture.coded_width,
-            plan.picture.coded_height,
-            plan.picture.display_crop,
-            plan.picture.max_dpb_frames,
-            plan.picture.chroma_format_idc,
-            8 + plan.picture.bit_depth_luma_minus8,
+            pic.coded_width,
+            pic.coded_height,
+            pic.display_crop,
+            pic.max_dpb_frames,
+            pic.chroma_format_idc,
+            8 + pic.bit_depth_luma_minus8,
         )?;
         let damaged = plan
             .warnings
@@ -638,54 +617,20 @@ impl NativeVaapiDecoder {
         if !plan.warnings.is_empty() {
             tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI plan warnings");
         }
-
-        let Self {
-            display, session, ..
-        } = self;
-        let s = ensure_session(
-            display,
-            session,
-            pf_vaapi::Codec::H264,
+        let planned = PlannedPicture {
+            codec: pf_vaapi::Codec::H264,
             shape,
-            &mut self.generation,
-        )?;
-        let (free, target, table) = s
-            .acquire_target()
-            .ok_or_else(|| anyhow!("surface pool exhausted ({} surfaces)", s.surfaces.len()))?;
-        let converted = pf_vaapi::plan_to_va(&plan, au, &mut s.slots, &table, target)
-            .map_err(|e| anyhow!("{e}"))?;
-
-        // This picture's facts, not the later display AU's ([`PictureFacts`]).
-        let facts = PictureFacts {
-            keyframe: plan.picture.is_idr,
-            references_clean: plan.picture.references_clean,
-            color: colour_of(&plan.picture.colour),
-            display: (s.shape.display_width, s.shape.display_height),
-        };
-        bind_setup(s, plan.dpb.stored, Some(free), facts);
-
-        let iq = Some(as_ptr(&converted.iq_matrix));
-        let slices = one_record_each(&converted.slices, &converted.slice_data)?;
-        submit(
-            display,
-            s,
-            target,
-            as_ptr(&converted.pic_params),
-            iq,
-            &slices,
-            au,
-        )?;
-
-        let frames = finish(
-            display,
-            s,
-            &plan.dpb.outputs,
-            &plan.dpb.removed,
             damaged,
-            &mut self.recovery_request,
-            &self.release_tx,
-        )?;
-        Ok(Some((frames, damaged)))
+            keyframe: pic.is_idr,
+            references_clean: pic.references_clean,
+            color: colour_of(&pic.colour),
+            stored: plan.dpb.stored,
+            outputs: &plan.dpb.outputs,
+            removed: &plan.dpb.removed,
+        };
+        self.decode_planned(au, planned, |slots, table, target| {
+            pf_vaapi::plan_to_va(&plan, au, slots, table, target)
+        })
     }
 
     fn decode_h265(&mut self, au: &[u8]) -> Result<Option<(Vec<DmabufFrame>, bool)>> {
@@ -701,13 +646,14 @@ impl NativeVaapiDecoder {
             },
             _ => unreachable!("dispatched on the planner's own arm"),
         };
+        let pic = &plan.picture;
         let shape = shape_of(
-            plan.picture.coded_width,
-            plan.picture.coded_height,
-            plan.picture.display_crop,
-            plan.picture.max_dpb_frames,
-            plan.picture.chroma_format_idc,
-            8 + plan.picture.bit_depth_luma_minus8,
+            pic.coded_width,
+            pic.coded_height,
+            pic.display_crop,
+            pic.max_dpb_frames,
+            pic.chroma_format_idc,
+            8 + pic.bit_depth_luma_minus8,
         )?;
         let damaged = plan
             .warnings
@@ -716,41 +662,55 @@ impl NativeVaapiDecoder {
         if !plan.warnings.is_empty() {
             tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI plan warnings");
         }
+        let planned = PlannedPicture {
+            codec: pf_vaapi::Codec::H265,
+            shape,
+            damaged,
+            keyframe: pic.is_idr,
+            references_clean: pic.references_clean,
+            color: colour_of(&pic.colour),
+            stored: plan.dpb.stored,
+            outputs: &plan.dpb.outputs,
+            removed: &plan.dpb.removed,
+        };
+        self.decode_planned(au, planned, |slots, table, target| {
+            pf_vaapi::plan_to_va_h265(&plan, au, slots, table, target)
+        })
+    }
 
+    /// The H.264/H.265 tail: session, target surface, `convert`, setup binding, submit,
+    /// then [`finish`]. `convert` is the codec's `plan_to_va*` over this AU's plan.
+    fn decode_planned<B: VaBuffers, E: std::fmt::Display>(
+        &mut self,
+        au: &[u8],
+        p: PlannedPicture<'_>,
+        convert: impl FnOnce(&mut pf_vaapi::SlotMap, &[VaSurfaceId], VaSurfaceId) -> Result<B, E>,
+    ) -> Result<Option<(Vec<DmabufFrame>, bool)>> {
         let Self {
             display, session, ..
         } = self;
-        let s = ensure_session(
-            display,
-            session,
-            pf_vaapi::Codec::H265,
-            shape,
-            &mut self.generation,
-        )?;
+        let s = ensure_session(display, session, p.codec, p.shape, &mut self.generation)?;
         let (free, target, table) = s
             .acquire_target()
             .ok_or_else(|| anyhow!("surface pool exhausted ({} surfaces)", s.surfaces.len()))?;
-        let converted = pf_vaapi::plan_to_va_h265(&plan, au, &mut s.slots, &table, target)
-            .map_err(|e| anyhow!("{e}"))?;
+        let converted = convert(&mut s.slots, &table, target).map_err(|e| anyhow!("{e}"))?;
 
+        // This picture's facts, not the later display AU's ([`PictureFacts`]).
         let facts = PictureFacts {
-            keyframe: plan.picture.is_idr,
-            references_clean: plan.picture.references_clean,
-            color: colour_of(&plan.picture.colour),
+            keyframe: p.keyframe,
+            references_clean: p.references_clean,
+            color: p.color,
             display: (s.shape.display_width, s.shape.display_height),
         };
-        bind_setup(s, plan.dpb.stored, Some(free), facts);
+        bind_setup(s, p.stored, Some(free), facts);
 
-        // Only when the sequence codes scaling lists. An all-zero matrix on a
-        // "use the defaults" stream dequantises every residual to zero.
-        let iq = converted.iq_matrix.as_ref().map(as_ptr);
-        let slices = one_record_each(&converted.slices, &converted.slice_data)?;
+        let slices = converted.slice_pairs()?;
         submit(
             display,
             s,
             target,
-            as_ptr(&converted.pic_params),
-            iq,
+            converted.pic_params(),
+            converted.iq_matrix(),
             &slices,
             au,
         )?;
@@ -758,13 +718,13 @@ impl NativeVaapiDecoder {
         let frames = finish(
             display,
             s,
-            &plan.dpb.outputs,
-            &plan.dpb.removed,
-            damaged,
+            p.outputs,
+            p.removed,
+            p.damaged,
             &mut self.recovery_request,
             &self.release_tx,
         )?;
-        Ok(Some((frames, damaged)))
+        Ok(Some((frames, p.damaged)))
     }
 
     /// One temporal unit: decode every frame, present at most one. Hidden frames
@@ -1092,6 +1052,53 @@ fn bind_setup(s: &mut Session, stored: Option<u64>, surface: Option<usize>, fact
     }
     if let Some(surface) = surface {
         s.pending.push(PendingPicture { id, surface, facts });
+    }
+}
+
+/// One H.264/H.265 plan, codec-neutral: what [`NativeVaapiDecoder::decode_planned`] reads.
+struct PlannedPicture<'p> {
+    codec: pf_vaapi::Codec,
+    shape: StreamShape,
+    damaged: bool,
+    keyframe: bool,
+    references_clean: bool,
+    color: ColorDesc,
+    stored: Option<u64>,
+    outputs: &'p [u64],
+    removed: &'p [u64],
+}
+
+/// A converted H.264/H.265 plan as the buffers [`submit`] takes. Pointers borrow `self`.
+trait VaBuffers {
+    fn pic_params(&self) -> (*const c_void, usize);
+    /// `None` submits no IQ buffer.
+    fn iq_matrix(&self) -> Option<(*const c_void, usize)>;
+    fn slice_pairs(&self) -> Result<Vec<SlicePair>>;
+}
+
+impl VaBuffers for pf_vaapi::DecodePlanVa {
+    fn pic_params(&self) -> (*const c_void, usize) {
+        as_ptr(&self.pic_params)
+    }
+    fn iq_matrix(&self) -> Option<(*const c_void, usize)> {
+        Some(as_ptr(&self.iq_matrix))
+    }
+    fn slice_pairs(&self) -> Result<Vec<SlicePair>> {
+        one_record_each(&self.slices, &self.slice_data)
+    }
+}
+
+impl VaBuffers for pf_vaapi::DecodePlanVaH265 {
+    fn pic_params(&self) -> (*const c_void, usize) {
+        as_ptr(&self.pic_params)
+    }
+    /// Only when the sequence codes scaling lists. An all-zero matrix on a
+    /// "use the defaults" stream dequantises every residual to zero.
+    fn iq_matrix(&self) -> Option<(*const c_void, usize)> {
+        self.iq_matrix.as_ref().map(as_ptr)
+    }
+    fn slice_pairs(&self) -> Result<Vec<SlicePair>> {
+        one_record_each(&self.slices, &self.slice_data)
     }
 }
 
