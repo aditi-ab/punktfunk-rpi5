@@ -590,7 +590,7 @@ pub fn nv12_selftest() -> anyhow::Result<()> {
     let mut importer = EglImporter::new()?;
     let nv12 = importer.convert_rgba_for_test(&rgba, W, H)?;
     let (uv_ptr, uv_pitch) = nv12
-        .uv
+        .uv()
         .ok_or_else(|| anyhow::anyhow!("self-test buffer is not NV12"))?;
     let y_host = cuda::read_plane_to_host(nv12.ptr, nv12.pitch, W as usize, H as usize)?;
     let uv_host = cuda::read_plane_to_host(uv_ptr, uv_pitch, (W as usize / 2) * 2, H as usize / 2)?;

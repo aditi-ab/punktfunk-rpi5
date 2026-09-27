@@ -48,7 +48,8 @@ fn nv12_layout(width: u32, height: u32) -> Option<Nv12Layout> {
     }
     let pitch = u64::from(width).checked_add(3)? & !3;
     let uv_offset = pitch.checked_mul(u64::from(height))?;
-    let uv_size = pitch.checked_mul(u64::from(height.div_ceil(2)))?;
+    let [_, (_, uv_rows), _] = cuda::PlaneLayout::Nv12.planes(width, height);
+    let uv_size = pitch.checked_mul(uv_rows as u64)?;
     Some(Nv12Layout {
         uv_offset,
         size: uv_offset.checked_add(uv_size)?,
@@ -636,7 +637,7 @@ impl VkBridge {
     /// Convert one LINEAR RGB dmabuf into a pooled NV12 CUDA buffer through the Vulkan CSC.
     /// Source and destination spans are validated before any import, allocation, or dispatch.
     /// The checked layout must fit Vulkan's byte sizes, the shader's u32 word offsets, and CUDA's
-    /// host `usize`; `pool` must come from [`cuda::BufferPool::new_nv12`].
+    /// host `usize`; `pool` must come from an NV12 [`cuda::BufferPool`].
     pub fn import_linear_nv12(
         &mut self,
         fd: i32,

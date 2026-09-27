@@ -473,7 +473,7 @@ impl EglBackend {
                 let id = self.next_id;
                 self.next_id = self.next_id.wrapping_add(1);
                 let y_handle = cuda::ipc_export(buf.ptr)?.to_vec();
-                let uv = match buf.uv {
+                let uv = match buf.uv() {
                     Some((uv_ptr, uv_pitch)) => {
                         Some((cuda::ipc_export(uv_ptr)?.to_vec(), uv_pitch))
                     }

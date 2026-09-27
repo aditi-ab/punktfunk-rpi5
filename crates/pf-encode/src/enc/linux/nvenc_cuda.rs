@@ -522,7 +522,7 @@ fn retrieve_loop(
 /// packed RGB is 4 bytes/px either way, so depth and channel order come from `fmt`, not `buf`.
 /// Packed RGB lets NVENC do the CSC (BT.2020 NCL when HDR) — no host CSC, no depth loss.
 fn buffer_format(buf: &cuda::DeviceBuffer, fmt: pf_frame::PixelFormat) -> nv::NV_ENC_BUFFER_FORMAT {
-    if buf.yuv444 {
+    if buf.is_yuv444() {
         nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444
     } else if buf.is_nv12() {
         nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12
@@ -1597,15 +1597,19 @@ impl NvencCudaEncoder {
                         }
                     } else {
                         SlotSurface::Cuda(
-                            match self.buffer_fmt {
-                                nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
-                                    InputSurface::alloc_yuv444(self.width, self.height)
-                                }
-                                nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => {
-                                    InputSurface::alloc_nv12(self.width, self.height)
-                                }
-                                _ => InputSurface::alloc_rgb(self.width, self.height),
-                            }
+                            InputSurface::alloc(
+                                match self.buffer_fmt {
+                                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
+                                        cuda::PlaneLayout::Yuv444
+                                    }
+                                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => {
+                                        cuda::PlaneLayout::Nv12
+                                    }
+                                    _ => cuda::PlaneLayout::Packed32,
+                                },
+                                self.width,
+                                self.height,
+                            )
                             .context("alloc NVENC input surface")?,
                         )
                     };
@@ -2080,7 +2084,7 @@ impl NvencCudaEncoder {
     ) -> Result<()> {
         match self.buffer_fmt {
             nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
-                if !buf.yuv444 {
+                if !buf.is_yuv444() {
                     bail!("4:4:4 session but the captured buffer is not planar YUV444");
                 }
                 let planes = [
@@ -2170,14 +2174,14 @@ impl NvencCudaEncoder {
         cuda::make_current().context("cuCtxSetCurrent (CPU upload)")?;
         let nv12 = captured.format == P::Nv12;
         let buf = match self.upload.take() {
-            Some(b) if b.width == w && b.height == h && b.uv.is_some() == nv12 => b,
-            _ if nv12 => cuda::DeviceBuffer::alloc_nv12(w, h)?,
-            _ => cuda::DeviceBuffer::alloc(w, h)?,
+            Some(b) if b.width == w && b.height == h && b.is_nv12() == nv12 => b,
+            _ if nv12 => cuda::DeviceBuffer::alloc(cuda::PlaneLayout::Nv12, w, h)?,
+            _ => cuda::DeviceBuffer::alloc(cuda::PlaneLayout::Packed32, w, h)?,
         };
         let (w, h) = (w as usize, h as usize);
         if nv12 {
             let (uv_ptr, uv_pitch) = buf
-                .uv
+                .uv()
                 .context("NV12 device buffer without a chroma plane")?;
             cuda::write_plane_from_host(buf.ptr, buf.pitch, pixels, w, h)?;
             cuda::write_plane_from_host(uv_ptr, uv_pitch, &pixels[w * h..], w, h / 2)?;
@@ -2267,7 +2271,7 @@ impl NvencCudaEncoder {
             // FREXT only on genuine YUV444; NV12/RGB cannot reconstruct full chroma.
             self.chroma_444 = self.chroma_444
                 && match src {
-                    Source::Cuda(b) => b.yuv444,
+                    Source::Cuda(b) => b.is_yuv444(),
                     Source::Dmabuf(_) => true,
                 };
             // `init_session` publishes `encoder` before later fallible steps. A failure leaves
@@ -3131,7 +3135,7 @@ impl Drop for NvencCudaEncoder {
 mod tests {
     use super::*;
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
-    use pf_zerocopy::cuda::DeviceBuffer;
+    use pf_zerocopy::cuda::{DeviceBuffer, PlaneLayout};
 
     #[test]
     fn split_fallback_does_not_poison_the_no_split_ceiling() {
@@ -3232,8 +3236,8 @@ mod tests {
     /// quota, so timings measure only pixel-proportional cost. `block=1` is incompressible
     /// (RC overshoots); larger `block` is the only way to reach the low bits/frame end.
     fn noise_nv12_frame(w: u32, h: u32, i: u32, block: usize) -> CapturedFrame {
-        let buf = DeviceBuffer::alloc_nv12(w, h).expect("alloc NV12 device buffer");
-        let (uv_ptr, uv_pitch) = buf.uv.expect("NV12 buffer has a UV plane");
+        let buf = DeviceBuffer::alloc(PlaneLayout::Nv12, w, h).expect("alloc NV12 device buffer");
+        let (uv_ptr, uv_pitch) = buf.uv().expect("NV12 buffer has a UV plane");
         let mut st = 0x2545_F491_4F6C_DD1Du64 ^ ((i as u64 + 1) << 32);
         let mut next = move || {
             st ^= st << 13;
@@ -3275,7 +3279,7 @@ mod tests {
 
     fn nv12_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
         // Uninit VRAM: session/RFI machinery, not picture fidelity.
-        let buf = DeviceBuffer::alloc_nv12(w, h).expect("alloc NV12 device buffer");
+        let buf = DeviceBuffer::alloc(PlaneLayout::Nv12, w, h).expect("alloc NV12 device buffer");
         CapturedFrame {
             provenance: Default::default(),
             width: w,
@@ -3566,7 +3570,8 @@ mod tests {
     /// Packed `X2Rgb10` (NVENC `ARGB10`, no host CSC). Uninit VRAM: session machinery, not
     /// picture fidelity.
     fn rgb10_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
-        let buf = DeviceBuffer::alloc(w, h).expect("alloc packed RGB device buffer");
+        let buf = DeviceBuffer::alloc(PlaneLayout::Packed32, w, h)
+            .expect("alloc packed RGB device buffer");
         CapturedFrame {
             provenance: Default::default(),
             width: w,
@@ -3911,18 +3916,18 @@ mod tests {
         // Regression guard: a planar 8-bit capture (real Linux default is NV12; 4:4:4 is
         // planar YUV444) under a 10-bit-negotiated session must degrade to 8-bit and encode,
         // never fail register_resource and end the video.
-        for (label, fmt, chroma, alloc) in [
+        for (label, fmt, chroma, layout) in [
             (
                 "nv12",
                 PixelFormat::Nv12,
                 ChromaFormat::Yuv420,
-                DeviceBuffer::alloc_nv12 as fn(u32, u32) -> anyhow::Result<DeviceBuffer>,
+                PlaneLayout::Nv12,
             ),
             (
                 "yuv444",
                 PixelFormat::Yuv444,
                 ChromaFormat::Yuv444,
-                DeviceBuffer::alloc_yuv444 as fn(u32, u32) -> anyhow::Result<DeviceBuffer>,
+                PlaneLayout::Yuv444,
             ),
         ] {
             pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
@@ -3948,7 +3953,9 @@ mod tests {
                     height: H,
                     pts_ns: u64::from(i) * 16_666_667,
                     format: fmt,
-                    payload: FramePayload::Cuda(alloc(W, H).expect("alloc planar device buffer")),
+                    payload: FramePayload::Cuda(
+                        DeviceBuffer::alloc(layout, W, H).expect("alloc planar device buffer"),
+                    ),
                     cursor: None,
                 };
                 enc.submit_indexed(&frame, i).unwrap_or_else(|e| {
@@ -3993,7 +4000,8 @@ mod tests {
 
         let mut aus = 0usize;
         for i in 0..6u32 {
-            let buf = DeviceBuffer::alloc_yuv444(W, H).expect("alloc YUV444 device buffer");
+            let buf =
+                DeviceBuffer::alloc(PlaneLayout::Yuv444, W, H).expect("alloc YUV444 device buffer");
             let frame = CapturedFrame {
                 provenance: Default::default(),
                 width: W,

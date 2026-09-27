@@ -17,7 +17,7 @@
 //! Bring-up failure → plain CUDA surfaces and no cursor (warned once); the
 //! session still starts.
 
-use super::cuda::{self, CUdeviceptr};
+use super::cuda::{self, CUdeviceptr, PlaneLayout};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
 
@@ -60,10 +60,7 @@ impl SlotFormat {
     }
     /// One 32-bit word per pixel: same slot geometry and one-invocation-per-pixel dispatch.
     fn is_packed32(self) -> bool {
-        matches!(
-            self,
-            SlotFormat::Argb | SlotFormat::X2Rgb10 | SlotFormat::X2Bgr10
-        )
+        self.layout() == PlaneLayout::Packed32
     }
     /// `reframe_buf.comp` LAYOUT of the first plane: packed 8-bit, the two 10-bit orders, or
     /// one byte per pixel.
@@ -75,26 +72,22 @@ impl SlotFormat {
             SlotFormat::Nv12 | SlotFormat::Yuv444 => 3,
         }
     }
-    fn row_bytes(self, width: u32) -> u64 {
-        if self.is_packed32() {
-            return width as u64 * 4;
-        }
+    /// The CUDA plane layout this slot holds, under one pitch.
+    pub fn layout(self) -> PlaneLayout {
         match self {
-            SlotFormat::Nv12 | SlotFormat::Yuv444 => width as u64,
-            _ => unreachable!("packed formats returned above"),
+            SlotFormat::Nv12 => PlaneLayout::Nv12,
+            SlotFormat::Yuv444 => PlaneLayout::Yuv444,
+            SlotFormat::Argb | SlotFormat::X2Rgb10 | SlotFormat::X2Bgr10 => PlaneLayout::Packed32,
         }
+    }
+    // A plane's row bytes never depend on the height, nor its rows on the width.
+    fn row_bytes(self, width: u32) -> u64 {
+        self.layout().stacked(width, 1).0 as u64
     }
     /// Rows the layout holds for `height` luma rows (NV12 adds its chroma rows, YUV444 its
     /// two extra planes).
     pub fn rows(self, height: u32) -> u64 {
-        if self.is_packed32() {
-            return height as u64;
-        }
-        match self {
-            SlotFormat::Nv12 => height as u64 + (height as u64 / 2).max(1),
-            SlotFormat::Yuv444 => height as u64 * 3,
-            _ => unreachable!("packed formats returned above"),
-        }
+        self.layout().stacked(1, height).1 as u64
     }
 }
 

@@ -324,104 +324,80 @@ pub fn copy_stream_handle() -> *mut c_void {
 /// Max cursor-overlay bitmap edge (px) uploaded to the device blend buffer — matches the Vulkan path.
 pub const CURSOR_MAX: u32 = 256;
 
-/// Pitched device buffer of `width`×`height` 4-byte pixels. Returns `(ptr, pitch)`.
-fn alloc_pitched(width: u32, height: u32) -> Result<(CUdeviceptr, usize)> {
-    let mut ptr: CUdeviceptr = 0;
-    let mut pitch: usize = 0;
-    // SAFETY: `&mut ptr`/`&mut pitch` are live out-params that outlive the synchronous alloc. Width,
-    // height, and element-size are by-value.
-    unsafe {
-        ck(
-            cuMemAllocPitch_v2(
-                &mut ptr,
-                &mut pitch,
-                width as usize * 4,
-                height as usize,
-                16,
-            ),
-            "cuMemAllocPitch_v2",
-        )?;
-    }
-    Ok((ptr, pitch))
+/// How a pitched surface holds its planes. Every allocator and copy sizes planes from
+/// [`planes`](Self::planes), so an allocation always covers what a copy writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaneLayout {
+    /// One plane of 4-byte pixels (BGRx, 2:10:10:10).
+    Packed32,
+    /// 8-bit 4:2:0: luma, then interleaved U,V pairs at ⌈W/2⌉ × ⌈H/2⌉.
+    Nv12,
+    /// Planar 4:4:4: three full-res 1-byte planes.
+    Yuv444,
 }
 
-/// One pitched allocation of three stacked full-res 1-byte planes: rows `[0,H)` Y, `[H,2H)` U,
-/// `[2H,3H)` V. One IPC handle, same as RGB.
-fn alloc_pitched_yuv444(width: u32, height: u32) -> Result<(CUdeviceptr, usize)> {
-    let mut ptr: CUdeviceptr = 0;
-    let mut pitch: usize = 0;
-    // SAFETY: `&mut ptr`/`&mut pitch` are live out-params that outlive the synchronous alloc.
-    unsafe {
-        ck(
-            cuMemAllocPitch_v2(
-                &mut ptr,
-                &mut pitch,
-                width as usize,      // 1 byte/px per plane
-                height as usize * 3, // Y + U + V stacked
-                16,
-            ),
-            "cuMemAllocPitch_v2(YUV444)",
-        )?;
-    }
-    Ok((ptr, pitch))
-}
-
-/// Two pitched NV12 planes (8-bit 4:2:0): Y is W×H bytes; UV is W bytes × H/2 (interleaved). Both
-/// use the driver's Y pitch so the encoder's two-plane surface matches.
-fn alloc_pitched_nv12(
-    width: u32,
-    height: u32,
-) -> Result<((CUdeviceptr, usize), (CUdeviceptr, usize))> {
-    let mut y_ptr: CUdeviceptr = 0;
-    let mut y_pitch: usize = 0;
-    let mut uv_ptr: CUdeviceptr = 0;
-    let mut uv_pitch: usize = 0;
-    // SAFETY: four live out-params outlive their synchronous allocs. If UV fails, Y is freed
-    // before the error returns — a leak here is a per-frame `BufferPool::get` miss.
-    unsafe {
-        ck(
-            cuMemAllocPitch_v2(
-                &mut y_ptr,
-                &mut y_pitch,
-                width as usize,
-                height as usize,
-                16,
-            ),
-            "cuMemAllocPitch_v2(Y)",
-        )?;
-        // Chroma: W/2 samples × 2 bytes = W bytes (even); H/2 rows.
-        if let Err(e) = ck(
-            cuMemAllocPitch_v2(
-                &mut uv_ptr,
-                &mut uv_pitch,
-                (width as usize / 2) * 2,
-                (height as usize / 2).max(1),
-                16,
-            ),
-            "cuMemAllocPitch_v2(UV)",
-        ) {
-            let _ = cuMemFree_v2(y_ptr);
-            return Err(e);
+impl PlaneLayout {
+    /// `(row_bytes, rows)` of each plane for `width`×`height` luma; absent planes are `(0, 0)`.
+    /// Chroma rounds up, so an odd edge keeps its last chroma sample.
+    pub const fn planes(self, width: u32, height: u32) -> [(usize, usize); 3] {
+        let (w, h) = (width as usize, height as usize);
+        match self {
+            PlaneLayout::Packed32 => [(w * 4, h), (0, 0), (0, 0)],
+            PlaneLayout::Nv12 => [(w, h), (w.div_ceil(2) * 2, h.div_ceil(2)), (0, 0)],
+            PlaneLayout::Yuv444 => [(w, h), (w, h), (w, h)],
         }
     }
-    Ok(((y_ptr, y_pitch), (uv_ptr, uv_pitch)))
+
+    /// `(row_bytes, rows)` of one allocation holding every plane under one pitch.
+    pub fn stacked(self, width: u32, height: u32) -> (usize, usize) {
+        self.planes(width, height)
+            .iter()
+            .fold((0, 0), |(bytes, rows), &(b, r)| (bytes.max(b), rows + r))
+    }
 }
 
-/// Contiguous NV12: Y rows `[0,H)` then UV `[H, 3H/2)` at one pitch. NVENC's single `CUDADEVICEPTR`
-/// input reads UV at `ptr + pitch*height`. Encode side only ([`InputSurface`]).
-fn alloc_pitched_nv12_contiguous(width: u32, height: u32) -> Result<(CUdeviceptr, usize)> {
+/// One pitched allocation of `rows` rows of `row_bytes`. Returns `(ptr, pitch)`.
+fn alloc_rows(row_bytes: usize, rows: usize, what: &str) -> Result<(CUdeviceptr, usize)> {
     let mut ptr: CUdeviceptr = 0;
     let mut pitch: usize = 0;
-    // UV is H/2 rows at the same width-bytes as Y; NVENC finds it at `ptr + pitch*H`.
-    let rows = height as usize + (height as usize / 2).max(1);
     // SAFETY: `&mut ptr`/`&mut pitch` are live out-params that outlive the synchronous alloc.
+    // Row bytes, rows, and element size are by value.
     unsafe {
         ck(
-            cuMemAllocPitch_v2(&mut ptr, &mut pitch, width as usize, rows, 16),
-            "cuMemAllocPitch_v2(NV12 contiguous)",
+            cuMemAllocPitch_v2(&mut ptr, &mut pitch, row_bytes, rows, 16),
+            what,
         )?;
     }
     Ok((ptr, pitch))
+}
+
+/// A pitched plane: `(ptr, pitch)`.
+type PlaneSpan = (CUdeviceptr, usize);
+
+/// One buffer in `layout`: `(ptr, pitch)`, plus NV12's chroma as its own allocation.
+/// YUV444 stacks Y, U and V in the one allocation, so the wire carries it like one plane.
+fn alloc_planes(
+    layout: PlaneLayout,
+    width: u32,
+    height: u32,
+) -> Result<(PlaneSpan, Option<PlaneSpan>)> {
+    if layout != PlaneLayout::Nv12 {
+        let (row_bytes, rows) = layout.stacked(width, height);
+        return Ok((alloc_rows(row_bytes, rows, "cuMemAllocPitch_v2")?, None));
+    }
+    let [(y_bytes, y_rows), (uv_bytes, uv_rows), _] = layout.planes(width, height);
+    let y = alloc_rows(y_bytes, y_rows, "cuMemAllocPitch_v2(Y)")?;
+    match alloc_rows(uv_bytes, uv_rows, "cuMemAllocPitch_v2(UV)") {
+        Ok(uv) => Ok((y, Some(uv))),
+        Err(e) => {
+            // SAFETY: `y.0` is the allocation just made and owned by nobody else. A leak here
+            // would be a per-frame `BufferPool::get` miss.
+            unsafe {
+                let _ = cuMemFree_v2(y.0);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Encoder-owned contiguous pitched CUDA surface. Registered once as
@@ -437,21 +413,11 @@ pub struct InputSurface {
 }
 
 impl InputSurface {
-    /// Contiguous NV12 (Y then UV, one pitch).
-    pub fn alloc_nv12(width: u32, height: u32) -> Result<InputSurface> {
-        let (ptr, pitch) = alloc_pitched_nv12_contiguous(width, height)?;
-        Ok(InputSurface { ptr, pitch, height })
-    }
-
-    /// Planar YUV444 stacked Y|U|V (see `alloc_pitched_yuv444`).
-    pub fn alloc_yuv444(width: u32, height: u32) -> Result<InputSurface> {
-        let (ptr, pitch) = alloc_pitched_yuv444(width, height)?;
-        Ok(InputSurface { ptr, pitch, height })
-    }
-
-    /// Packed 4-byte RGB/BGRx. NVENC CSCs when registered as `ABGR`/`ARGB`.
-    pub fn alloc_rgb(width: u32, height: u32) -> Result<InputSurface> {
-        let (ptr, pitch) = alloc_pitched(width, height)?;
+    /// Every plane of `layout` under one pitch: NV12 chroma at `ptr + pitch*height`, YUV444
+    /// U/V at `1*`/`2*`. Packed RGB/BGRx is what NVENC CSCs as `ABGR`/`ARGB`.
+    pub fn alloc(layout: PlaneLayout, width: u32, height: u32) -> Result<InputSurface> {
+        let (row_bytes, rows) = layout.stacked(width, height);
+        let (ptr, pitch) = alloc_rows(row_bytes, rows, "cuMemAllocPitch_v2(input surface)")?;
         Ok(InputSurface { ptr, pitch, height })
     }
 }
@@ -506,60 +472,26 @@ pub struct BufferPool {
     inner: Arc<Mutex<PoolInner>>,
     width: u32,
     height: u32,
+    layout: PlaneLayout,
     pitch: usize,
-    /// `Some` ⇒ NV12; buffers carry a UV plane at this pitch.
-    uv_pitch: Option<usize>,
-    /// YUV444: one allocation of 3·`height` stacked 1-byte planes.
-    yuv444: bool,
+    /// NV12 chroma pitch; unused by the other layouts.
+    uv_pitch: usize,
 }
 
 impl BufferPool {
-    /// Pool of `width`×`height` 4-byte buffers. Allocates one to learn the driver's pitch.
-    pub fn new(width: u32, height: u32) -> Result<BufferPool> {
-        let (ptr, pitch) = alloc_pitched(width, height)?;
+    /// Pool of `width`×`height` buffers in `layout`. Allocates one to learn the driver's pitches.
+    pub fn new(layout: PlaneLayout, width: u32, height: u32) -> Result<BufferPool> {
+        let ((ptr, pitch), uv) = alloc_planes(layout, width, height)?;
         Ok(BufferPool {
             inner: Arc::new(Mutex::new(PoolInner {
                 free: vec![ptr],
-                free_uv: Vec::new(),
+                free_uv: uv.map(|(p, _)| p).into_iter().collect(),
             })),
             width,
             height,
+            layout,
             pitch,
-            uv_pitch: None,
-            yuv444: false,
-        })
-    }
-
-    /// Pool of NV12 (Y + interleaved UV). Allocates one pair to learn per-plane pitches.
-    pub fn new_nv12(width: u32, height: u32) -> Result<BufferPool> {
-        let ((y_ptr, y_pitch), (uv_ptr, uv_pitch)) = alloc_pitched_nv12(width, height)?;
-        Ok(BufferPool {
-            inner: Arc::new(Mutex::new(PoolInner {
-                free: vec![y_ptr],
-                free_uv: vec![uv_ptr],
-            })),
-            width,
-            height,
-            pitch: y_pitch,
-            uv_pitch: Some(uv_pitch),
-            yuv444: false,
-        })
-    }
-
-    /// Pool of planar YUV444: one allocation per buffer, stacked `[Y | U | V]`, so the wire/IPC
-    /// path carries it like a single-plane buffer.
-    pub fn new_yuv444(width: u32, height: u32) -> Result<BufferPool> {
-        let (ptr, pitch) = alloc_pitched_yuv444(width, height)?;
-        Ok(BufferPool {
-            inner: Arc::new(Mutex::new(PoolInner {
-                free: vec![ptr],
-                free_uv: Vec::new(),
-            })),
-            width,
-            height,
-            pitch,
-            uv_pitch: None,
-            yuv444: true,
+            uv_pitch: uv.map_or(0, |(_, pitch)| pitch),
         })
     }
 
@@ -574,46 +506,48 @@ impl BufferPool {
     /// Recycled if free, else freshly allocated. Returns to this pool on drop (consumer must have
     /// synced). NV12: Y and its paired UV.
     pub fn get(&self) -> Result<DeviceBuffer> {
-        if let Some(uv_pitch) = self.uv_pitch {
-            let reuse = {
-                let mut g = self.inner.lock().unwrap();
-                g.free.pop().map(|y| (y, g.free_uv.pop()))
-            };
-            let (ptr, uv_ptr) = match reuse {
-                // Pushed/popped together, so a popped Y always has its UV.
-                Some((y, Some(uv))) => (y, uv),
-                _ => {
-                    let ((y, _), (uv, _)) = alloc_pitched_nv12(self.width, self.height)?;
-                    (y, uv)
-                }
-            };
-            return Ok(DeviceBuffer {
-                ptr,
-                pitch: self.pitch,
-                width: self.width,
-                height: self.height,
-                uv: Some((uv_ptr, uv_pitch)),
-                yuv444: false,
-                pool: Some(self.inner.clone()),
-                remote_release: None,
-            });
-        }
-        let reuse = self.inner.lock().unwrap().free.pop();
-        let ptr = match reuse {
-            Some(p) => p,
-            None if self.yuv444 => alloc_pitched_yuv444(self.width, self.height)?.0,
-            None => alloc_pitched(self.width, self.height)?.0,
+        let reuse = {
+            let mut g = self.inner.lock().unwrap();
+            g.free.pop().map(|y| (y, g.free_uv.pop()))
+        };
+        // Pushed and popped together, so a recycled NV12 Y always has its UV.
+        let (ptr, uv) = match reuse {
+            Some(pair) => pair,
+            None => {
+                let ((ptr, _), uv) = alloc_planes(self.layout, self.width, self.height)?;
+                (ptr, uv.map(|(uv, _)| uv))
+            }
         };
         Ok(DeviceBuffer {
             ptr,
             pitch: self.pitch,
             width: self.width,
             height: self.height,
-            uv: None,
-            yuv444: self.yuv444,
+            planes: Planes::new(self.layout, uv.map(|uv| (uv, self.uv_pitch))),
             pool: Some(self.inner.clone()),
             remote_release: None,
         })
+    }
+}
+
+/// Where a [`DeviceBuffer`]'s chroma lives: one field, so no layout disagrees with its planes.
+#[derive(Clone, Copy)]
+enum Planes {
+    Packed32,
+    /// NV12 chroma `(ptr, pitch)`, its own allocation.
+    Nv12(CUdeviceptr, usize),
+    /// U and V stacked under Y in the one allocation.
+    Yuv444,
+}
+
+impl Planes {
+    /// `uv` is the chroma allocation, which only NV12 has.
+    fn new(layout: PlaneLayout, uv: Option<(CUdeviceptr, usize)>) -> Planes {
+        match (layout, uv) {
+            (PlaneLayout::Yuv444, _) => Planes::Yuv444,
+            (_, Some((uv, pitch))) => Planes::Nv12(uv, pitch),
+            (_, None) => Planes::Packed32,
+        }
     }
 }
 
@@ -624,69 +558,56 @@ pub struct DeviceBuffer {
     pub pitch: usize,
     pub width: u32,
     pub height: u32,
-    /// NV12 chroma `(ptr, pitch)` paired with Y in [`ptr`](Self::ptr). `None` for 4-byte RGB/BGRx.
-    pub uv: Option<(CUdeviceptr, usize)>,
-    /// YUV444: [`ptr`](Self::ptr) is one allocation of 3·[`height`](Self::height) stacked Y,U,V
-    /// (`uv` stays `None`; the single-plane wire/IPC path carries it unchanged).
-    pub yuv444: bool,
+    planes: Planes,
     pool: Option<Arc<Mutex<PoolInner>>>,
     /// IPC import: drop runs this once (owner recycles). Must not free or pool-recycle locally.
     remote_release: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl DeviceBuffer {
-    /// Standalone pitched buffer. Prefer [`BufferPool`] on the hot path.
-    pub fn alloc(width: u32, height: u32) -> Result<DeviceBuffer> {
-        let (ptr, pitch) = alloc_pitched(width, height)?;
+    /// Standalone buffer in `layout`. Prefer [`BufferPool`] on the hot path.
+    pub fn alloc(layout: PlaneLayout, width: u32, height: u32) -> Result<DeviceBuffer> {
+        let ((ptr, pitch), uv) = alloc_planes(layout, width, height)?;
         Ok(DeviceBuffer {
             ptr,
             pitch,
             width,
             height,
-            uv: None,
-            yuv444: false,
+            planes: Planes::new(layout, uv),
             pool: None,
             remote_release: None,
         })
     }
 
-    /// Standalone NV12 two-plane buffer. Prefer [`BufferPool::new_nv12`]; used by the self-test.
-    pub fn alloc_nv12(width: u32, height: u32) -> Result<DeviceBuffer> {
-        let ((y_ptr, y_pitch), (uv_ptr, uv_pitch)) = alloc_pitched_nv12(width, height)?;
-        Ok(DeviceBuffer {
-            ptr: y_ptr,
-            pitch: y_pitch,
-            width,
-            height,
-            uv: Some((uv_ptr, uv_pitch)),
-            yuv444: false,
-            pool: None,
-            remote_release: None,
-        })
+    pub fn layout(&self) -> PlaneLayout {
+        match self.planes {
+            Planes::Packed32 => PlaneLayout::Packed32,
+            Planes::Nv12(..) => PlaneLayout::Nv12,
+            Planes::Yuv444 => PlaneLayout::Yuv444,
+        }
     }
 
-    /// Standalone planar-YUV444 stacked buffer. Prefer [`BufferPool::new_yuv444`]; self-test.
-    pub fn alloc_yuv444(width: u32, height: u32) -> Result<DeviceBuffer> {
-        let (ptr, pitch) = alloc_pitched_yuv444(width, height)?;
-        Ok(DeviceBuffer {
-            ptr,
-            pitch,
-            width,
-            height,
-            uv: None,
-            yuv444: true,
-            pool: None,
-            remote_release: None,
-        })
+    /// NV12 chroma `(ptr, pitch)`; `None` for every other layout.
+    pub fn uv(&self) -> Option<(CUdeviceptr, usize)> {
+        match self.planes {
+            Planes::Nv12(uv, pitch) => Some((uv, pitch)),
+            _ => None,
+        }
     }
 
     pub fn is_nv12(&self) -> bool {
-        self.uv.is_some()
+        self.layout() == PlaneLayout::Nv12
+    }
+
+    /// [`ptr`](Self::ptr) holds 3·[`height`](Self::height) stacked Y, U, V rows.
+    pub fn is_yuv444(&self) -> bool {
+        self.layout() == PlaneLayout::Yuv444
     }
 
     /// Wrap planes owned by another process ([`ipc_open`]). `release` runs once on drop; nothing
     /// is freed or pooled here (the IPC cache closes the mapping after the last remote buffer).
-    /// `yuv444` marks stacked 3-plane YUV444 — the wire carries no format (`ImportKind::Tiled444`).
+    /// `uv` makes it NV12; otherwise `yuv444` marks stacked 3-plane YUV444 — the wire carries
+    /// no format (`ImportKind::Tiled444`).
     pub fn remote(
         ptr: CUdeviceptr,
         pitch: usize,
@@ -701,8 +622,11 @@ impl DeviceBuffer {
             pitch,
             width,
             height,
-            uv,
-            yuv444,
+            planes: match (uv, yuv444) {
+                (Some((uv, uv_pitch)), _) => Planes::Nv12(uv, uv_pitch),
+                (None, true) => Planes::Yuv444,
+                (None, false) => Planes::Packed32,
+            },
             pool: None,
             remote_release: Some(release),
         }
@@ -722,11 +646,11 @@ impl Drop for DeviceBuffer {
             // Consumer synced before drop. Y and UV go back together so `get` can pop them as a unit.
             let mut g = pool.lock().unwrap();
             g.free.push(self.ptr);
-            if let Some((uv_ptr, _)) = self.uv {
+            if let Some((uv_ptr, _)) = self.uv() {
                 g.free_uv.push(uv_ptr);
             }
         } else {
-            // SAFETY: un-pooled: this buffer exclusively owns `self.ptr` and `self.uv`, each from
+            // SAFETY: un-pooled: this buffer exclusively owns `self.ptr` and its chroma, each from
             // `cuMemAllocPitch_v2`, freed once (`ptr == 0` skipped above). Context is set current
             // first: drop may run on the encode thread, where it isn't.
             unsafe {
@@ -734,7 +658,7 @@ impl Drop for DeviceBuffer {
                     let _ = cuCtxSetCurrent(c.0);
                 }
                 let _ = cuMemFree_v2(self.ptr);
-                if let Some((uv_ptr, _)) = self.uv {
+                if let Some((uv_ptr, _)) = self.uv() {
                     let _ = cuMemFree_v2(uv_ptr);
                 }
             }
@@ -773,43 +697,15 @@ impl RegisteredTexture {
         }
     }
 
-    /// Map, copy the linear RGBA8 array into `dst`, unmap. Syncs on the priority stream before
-    /// unmap so `dst` is ready before the dmabuf is recycled. Always unmaps, even on copy error.
+    /// Map, copy the linear RGBA8 array into `dst`, unmap. Syncs before unmap so `dst` is
+    /// ready before the dmabuf is recycled.
     pub fn copy_mapped_to(&mut self, dst: &DeviceBuffer) -> Result<()> {
-        // SAFETY: `self.resource` is from `register_gl`. Caller holds GL+CUDA current. Map, copy,
-        // and unmap all use `copy_stream()`: map only orders prior GL work before CUDA issued *in
-        // that stream*, and `copy_stream` is `CU_STREAM_NON_BLOCKING` (no implicit NULL-stream
-        // order). Mapping on NULL let the copy race the GL de-tile. `array` is mip 0; unmap on
-        // GetMappedArray failure. `copy` outlives `copy_blocking`; `srcArray` valid while mapped;
-        // `dst` live; `width*4`×`height` fit. Always unmap after the copy (even on error).
-        unsafe {
-            ck(
-                cuGraphicsMapResources(1, &mut self.resource, copy_stream()),
-                "cuGraphicsMapResources",
-            )?;
-            let mut array: CUarray = std::ptr::null_mut();
-            if cuGraphicsSubResourceGetMappedArray(&mut array, self.resource, 0, 0) != 0 {
-                let _ = cuGraphicsUnmapResources(1, &mut self.resource, copy_stream());
-                bail!("cuGraphicsSubResourceGetMappedArray failed");
-            }
-            let copy = CUDA_MEMCPY2D {
-                srcMemoryType: CU_MEMORYTYPE_ARRAY,
-                srcArray: array,
-                dstMemoryType: CU_MEMORYTYPE_DEVICE,
-                dstDevice: dst.ptr,
-                dstPitch: dst.pitch,
-                WidthInBytes: dst.width as usize * 4, // 4 bytes/px (BGRx)
-                Height: dst.height as usize,
-                ..Default::default()
-            };
-            let res = copy_blocking(&copy, "cuMemcpy2DAsync_v2");
-            let _ = cuGraphicsUnmapResources(1, &mut self.resource, copy_stream());
-            res
-        }
+        let [(row_bytes, rows), ..] = PlaneLayout::Packed32.planes(dst.width, dst.height);
+        self.copy_mapped_plane(dst.ptr, dst.pitch, row_bytes, rows)
     }
 
-    /// Map and copy into `(dst_ptr, dst_pitch)` for `width_bytes`×`height` (`width` for `R8` luma,
-    /// `(width/2)*2` for `RG8` chroma). Syncs before unmap; always unmaps, even on copy error.
+    /// Map and copy into `(dst_ptr, dst_pitch)` for `width_bytes`×`height`, one plane of
+    /// [`PlaneLayout::planes`]. Syncs before unmap; always unmaps, even on copy error.
     fn copy_mapped_plane(
         &mut self,
         dst_ptr: CUdeviceptr,
@@ -817,9 +713,12 @@ impl RegisteredTexture {
         width_bytes: usize,
         height: usize,
     ) -> Result<()> {
-        // SAFETY: same as `copy_mapped_to`. `array` is mip 0; unmap on GetMappedArray failure.
-        // `copy` outlives `copy_blocking`; `srcArray` valid while mapped; dest plane live;
-        // `width_bytes`×`height` fit. Always unmap after the copy.
+        // SAFETY: `self.resource` is from `register_gl`; the caller holds GL+CUDA current. Map,
+        // copy and unmap all use `copy_stream()`: map orders prior GL work only before CUDA work
+        // issued *in that stream*, and `copy_stream` is `CU_STREAM_NON_BLOCKING`, so a NULL-stream
+        // map would let the copy race the GL de-tile. `array` is mip 0; unmap on GetMappedArray
+        // failure. `copy` outlives `copy_blocking`; `srcArray` is valid while mapped; the dest
+        // plane is live and `width_bytes`×`height` fit it. Always unmap after the copy.
         unsafe {
             ck(
                 cuGraphicsMapResources(1, &mut self.resource, copy_stream()),
@@ -847,37 +746,33 @@ impl RegisteredTexture {
     }
 }
 
-/// Copy registered `R8` luma + `RG8` chroma into `dst`'s NV12 planes (`dst.uv` set). Y is
-/// `width`×`height` bytes; UV is `(width/2)·2` × `height/2`. Both copies sync before return.
+/// Copy registered `R8` luma + `RG8` chroma into `dst`'s NV12 planes. Both copies sync
+/// before return.
 pub fn copy_mapped_nv12(
     y_tex: &mut RegisteredTexture,
     uv_tex: &mut RegisteredTexture,
     dst: &DeviceBuffer,
 ) -> Result<()> {
     let (uv_ptr, uv_pitch) = dst
-        .uv
+        .uv()
         .ok_or_else(|| anyhow::anyhow!("copy_mapped_nv12 on a non-NV12 buffer"))?;
-    let w = dst.width as usize;
-    let h = dst.height as usize;
-    y_tex.copy_mapped_plane(dst.ptr, dst.pitch, w, h)?;
-    uv_tex.copy_mapped_plane(uv_ptr, uv_pitch, (w / 2) * 2, h / 2)
+    let [(y_bytes, y_rows), (uv_bytes, uv_rows), _] =
+        PlaneLayout::Nv12.planes(dst.width, dst.height);
+    y_tex.copy_mapped_plane(dst.ptr, dst.pitch, y_bytes, y_rows)?;
+    uv_tex.copy_mapped_plane(uv_ptr, uv_pitch, uv_bytes, uv_rows)
 }
 
 /// Copy three full-res `R8` textures into `dst`'s stacked YUV444 planes (`[0,H)` Y, `[H,2H)` U,
 /// `[2H,3H)` V). Each copy syncs before return.
-pub fn copy_mapped_yuv444(
-    y_tex: &mut RegisteredTexture,
-    u_tex: &mut RegisteredTexture,
-    v_tex: &mut RegisteredTexture,
-    dst: &DeviceBuffer,
-) -> Result<()> {
-    anyhow::ensure!(dst.yuv444, "copy_mapped_yuv444 on a non-YUV444 buffer");
-    let w = dst.width as usize;
-    let h = dst.height as usize;
-    let plane = |i: usize| dst.ptr + (dst.pitch * h * i) as CUdeviceptr;
-    y_tex.copy_mapped_plane(plane(0), dst.pitch, w, h)?;
-    u_tex.copy_mapped_plane(plane(1), dst.pitch, w, h)?;
-    v_tex.copy_mapped_plane(plane(2), dst.pitch, w, h)
+pub fn copy_mapped_yuv444(textures: [&mut RegisteredTexture; 3], dst: &DeviceBuffer) -> Result<()> {
+    anyhow::ensure!(dst.is_yuv444(), "copy_mapped_yuv444 on a non-YUV444 buffer");
+    let planes = PlaneLayout::Yuv444.planes(dst.width, dst.height);
+    let mut at = dst.ptr;
+    for (tex, (row_bytes, rows)) in textures.into_iter().zip(planes) {
+        tex.copy_mapped_plane(at, dst.pitch, row_bytes, rows)?;
+        at += (dst.pitch * rows) as CUdeviceptr;
+    }
+    Ok(())
 }
 
 /// Device→device copy of one pitched surface into another of the same layout: `rows` rows of
@@ -891,17 +786,7 @@ pub fn copy_surface_to_surface(
     rows: usize,
     sync: bool,
 ) -> Result<()> {
-    let copy = CUDA_MEMCPY2D {
-        srcMemoryType: CU_MEMORYTYPE_DEVICE,
-        srcDevice: src_ptr,
-        srcPitch: pitch,
-        dstMemoryType: CU_MEMORYTYPE_DEVICE,
-        dstDevice: dst_ptr,
-        dstPitch: pitch,
-        WidthInBytes: pitch,
-        Height: rows,
-        ..Default::default()
-    };
+    let copy = device_copy((src_ptr, pitch), (dst_ptr, pitch), pitch, rows);
     // SAFETY: caller: context current; both surfaces hold `pitch × rows` bytes and outlive the
     // copy (`sync: false` shifts that to the caller).
     unsafe { copy_issue(&copy, "cuMemcpy2DAsync_v2(slot->slot)", sync) }
@@ -915,25 +800,72 @@ pub fn copy_device_to_device(
     dst_pitch: usize,
     sync: bool,
 ) -> Result<()> {
-    let copy = CUDA_MEMCPY2D {
-        srcMemoryType: CU_MEMORYTYPE_DEVICE,
-        srcDevice: src.ptr,
-        srcPitch: src.pitch,
-        dstMemoryType: CU_MEMORYTYPE_DEVICE,
-        dstDevice: dst_ptr,
-        dstPitch: dst_pitch,
-        WidthInBytes: src.width as usize * 4,
-        Height: src.height as usize,
-        ..Default::default()
-    };
+    let [(row_bytes, rows), ..] = PlaneLayout::Packed32.planes(src.width, src.height);
+    let copy = device_copy((src.ptr, src.pitch), (dst_ptr, dst_pitch), row_bytes, rows);
     // SAFETY: caller: context current. `copy` outlives the enqueue; `src` and `dst` are live;
     // `width*4`×`height` fit both. `sync: false` shifts source lifetime to the caller.
     unsafe { copy_issue(&copy, "cuMemcpy2DAsync_v2(dev->dev)", sync) }
 }
 
-/// Copy imported NV12 into NVENC's two-plane surface (`data[0]`/`data[1]`). Y is `width`×`height`;
-/// UV is `(width/2)·2` × `height/2`. Context current. `sync: false`: `src` must stay valid until
-/// downstream stream work completes.
+/// A device→device 2D copy of `rows` rows of `row_bytes`, each side `(ptr, pitch)`.
+fn device_copy(
+    src: (CUdeviceptr, usize),
+    dst: (CUdeviceptr, usize),
+    row_bytes: usize,
+    rows: usize,
+) -> CUDA_MEMCPY2D {
+    CUDA_MEMCPY2D {
+        srcMemoryType: CU_MEMORYTYPE_DEVICE,
+        srcDevice: src.0,
+        srcPitch: src.1,
+        dstMemoryType: CU_MEMORYTYPE_DEVICE,
+        dstDevice: dst.0,
+        dstPitch: dst.1,
+        WidthInBytes: row_bytes,
+        Height: rows,
+        ..Default::default()
+    }
+}
+
+/// Copy a planar `src` into NVENC's planes (`data[0..]`), one `(ptr, pitch)` per plane of its
+/// layout. Context current. `sync: false`: `src` must stay valid until downstream stream work
+/// completes.
+fn copy_planes_to_device(
+    src: &DeviceBuffer,
+    dsts: &[(CUdeviceptr, usize)],
+    sync: bool,
+) -> Result<()> {
+    let planes = src.layout().planes(src.width, src.height);
+    let mut stacked = src.ptr;
+    for (i, (&dst, (row_bytes, rows))) in dsts.iter().zip(planes).enumerate() {
+        // NV12 chroma is its own allocation; YUV444 stacks every plane under Y.
+        let from = match (i, src.uv()) {
+            (1, Some(uv)) => uv,
+            _ => (stacked, src.pitch),
+        };
+        stacked += (src.pitch * rows) as CUdeviceptr;
+        let copy = device_copy(from, dst, row_bytes, rows);
+        // SAFETY: caller: context current. `copy` outlives the enqueue. `from` is a plane of
+        // the live `src` inside its allocation (the layout's own plane table); `dst` is the
+        // caller's NVENC plane. Drain on enqueue failure: earlier planes are queued and the
+        // caller recycles `src` on `Err`, so a copy still in flight would race the next frame.
+        unsafe {
+            if let Err(e) = copy_async(&copy, "cuMemcpy2DAsync_v2(plane dev->dev)") {
+                let _ = sync_copy_stream();
+                return Err(e);
+            }
+        }
+    }
+    if sync {
+        // SAFETY: one stream sync after the last enqueue covers every plane (FIFO). Context
+        // current per the caller.
+        unsafe { sync_copy_stream()? };
+    }
+    Ok(())
+}
+
+/// Copy imported NV12 into NVENC's two-plane surface (`data[0]`/`data[1]`). Context current.
+/// `sync: false`: `src` must stay valid until downstream stream work completes.
 pub fn copy_nv12_to_device(
     src: &DeviceBuffer,
     y_dst: CUdeviceptr,
@@ -942,92 +874,22 @@ pub fn copy_nv12_to_device(
     uv_pitch: usize,
     sync: bool,
 ) -> Result<()> {
-    let (src_uv_ptr, src_uv_pitch) = src
-        .uv
-        .ok_or_else(|| anyhow::anyhow!("copy_nv12_to_device on a non-NV12 buffer"))?;
-    let w = src.width as usize;
-    let h = src.height as usize;
-    let y = CUDA_MEMCPY2D {
-        srcMemoryType: CU_MEMORYTYPE_DEVICE,
-        srcDevice: src.ptr,
-        srcPitch: src.pitch,
-        dstMemoryType: CU_MEMORYTYPE_DEVICE,
-        dstDevice: y_dst,
-        dstPitch: y_pitch,
-        WidthInBytes: w, // 1 byte/px luma
-        Height: h,
-        ..Default::default()
-    };
-    let uv = CUDA_MEMCPY2D {
-        srcMemoryType: CU_MEMORYTYPE_DEVICE,
-        srcDevice: src_uv_ptr,
-        srcPitch: src_uv_pitch,
-        dstMemoryType: CU_MEMORYTYPE_DEVICE,
-        dstDevice: uv_dst,
-        dstPitch: uv_pitch,
-        WidthInBytes: (w / 2) * 2, // 2 bytes/sample interleaved U,V
-        Height: h / 2,
-        ..Default::default()
-    };
-    // SAFETY: caller: context current. `&y`/`&uv` outlive each enqueue. `src` is a live NV12
-    // buffer (`.uv` checked); `y_dst`/`uv_dst` are the caller's NVENC planes. `sync` waits both
-    // (FIFO); `sync: false` shifts source lifetime to the caller.
-    unsafe {
-        // Failed enqueue: drain before return. Caller drops `src` on `Err` (pool recycle); a
-        // copy still in flight would race the next frame in that allocation.
-        let r = copy_async(&y, "cuMemcpy2DAsync_v2(nv12 Y dev->dev)")
-            .and_then(|()| copy_async(&uv, "cuMemcpy2DAsync_v2(nv12 UV dev->dev)"));
-        if r.is_err() {
-            let _ = sync_copy_stream();
-            return r;
-        }
-        if sync {
-            sync_copy_stream()?;
-        }
-    }
-    Ok(())
+    anyhow::ensure!(src.is_nv12(), "copy_nv12_to_device on a non-NV12 buffer");
+    copy_planes_to_device(src, &[(y_dst, y_pitch), (uv_dst, uv_pitch)], sync)
 }
 
-/// Copy stacked YUV444 into NVENC's three-plane surface (`data[0..3]`). Each plane is
-/// `width`×`height`; source at row offsets `0/H/2H`. Context current. `sync: false`: `src` must
-/// stay valid until downstream stream work completes.
+/// Copy stacked YUV444 into NVENC's three-plane surface (`data[0..3]`). Context current.
+/// `sync: false`: `src` must stay valid until downstream stream work completes.
 pub fn copy_yuv444_to_device(
     src: &DeviceBuffer,
     dsts: [(CUdeviceptr, usize); 3],
     sync: bool,
 ) -> Result<()> {
-    anyhow::ensure!(src.yuv444, "copy_yuv444_to_device on a non-YUV444 buffer");
-    let w = src.width as usize;
-    let h = src.height as usize;
-    for (i, (dst_ptr, dst_pitch)) in dsts.into_iter().enumerate() {
-        let copy = CUDA_MEMCPY2D {
-            srcMemoryType: CU_MEMORYTYPE_DEVICE,
-            srcDevice: src.ptr + (src.pitch * h * i) as CUdeviceptr,
-            srcPitch: src.pitch,
-            dstMemoryType: CU_MEMORYTYPE_DEVICE,
-            dstDevice: dst_ptr,
-            dstPitch: dst_pitch,
-            WidthInBytes: w, // 1 byte/px per plane
-            Height: h,
-            ..Default::default()
-        };
-        // SAFETY: caller: context current. `copy` outlives the enqueue. `src.ptr + pitch·h·i`
-        // is inside the live 3·H stacked allocation (`yuv444` checked); dest is the caller's
-        // NVENC plane. Drain on enqueue failure: earlier planes are queued and caller recycles
-        // `src` on `Err`.
-        unsafe {
-            if let Err(e) = copy_async(&copy, "cuMemcpy2DAsync_v2(yuv444 plane dev->dev)") {
-                let _ = sync_copy_stream();
-                return Err(e);
-            }
-        }
-    }
-    if sync {
-        // SAFETY: one stream sync after the last enqueue covers all three planes (FIFO). Context
-        // current per the caller.
-        unsafe { sync_copy_stream()? };
-    }
-    Ok(())
+    anyhow::ensure!(
+        src.is_yuv444(),
+        "copy_yuv444_to_device on a non-YUV444 buffer"
+    );
+    copy_planes_to_device(src, &dsts, sync)
 }
 
 impl RegisteredTexture {
@@ -1225,60 +1087,32 @@ pub fn copy_pitched_to_buffer(
     src_pitch: usize,
     dst: &DeviceBuffer,
 ) -> Result<()> {
-    let copy = CUDA_MEMCPY2D {
-        srcMemoryType: CU_MEMORYTYPE_DEVICE,
-        srcDevice: src_ptr,
-        srcPitch: src_pitch,
-        dstMemoryType: CU_MEMORYTYPE_DEVICE,
-        dstDevice: dst.ptr,
-        dstPitch: dst.pitch,
-        WidthInBytes: dst.width as usize * 4,
-        Height: dst.height as usize,
-        ..Default::default()
-    };
+    let [(row_bytes, rows), ..] = PlaneLayout::Packed32.planes(dst.width, dst.height);
+    let copy = device_copy((src_ptr, src_pitch), (dst.ptr, dst.pitch), row_bytes, rows);
     // SAFETY: caller: context current. `copy` outlives the synchronous call; `src` is the caller's
     // mapped span, `dst` is live; `width*4`×`height` fit both. Sync completes before the dmabuf is
     // requeued.
     unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(ext->dev)") }
 }
 
-/// De-stride an NV12 pair from an external mapping into a pooled two-plane [`DeviceBuffer`]: Y
-/// (`width` × `height`) and interleaved UV (`width` × ⌈h/2⌉), each from `src_pitch` to the pool
-/// pitch. Context must be current.
+/// De-stride an NV12 pair from an external mapping into a pooled two-plane [`DeviceBuffer`],
+/// each plane from `src_pitch` to the pool pitch. Context must be current.
 pub fn copy_pitched_nv12_to_buffer(
     y_src: CUdeviceptr,
     uv_src: CUdeviceptr,
     src_pitch: usize,
     dst: &DeviceBuffer,
 ) -> Result<()> {
-    let Some((uv_ptr, uv_pitch)) = dst.uv else {
+    let Some((uv_ptr, uv_pitch)) = dst.uv() else {
         anyhow::bail!("copy_pitched_nv12_to_buffer: destination is not an NV12 buffer");
     };
-    let y = CUDA_MEMCPY2D {
-        srcMemoryType: CU_MEMORYTYPE_DEVICE,
-        srcDevice: y_src,
-        srcPitch: src_pitch,
-        dstMemoryType: CU_MEMORYTYPE_DEVICE,
-        dstDevice: dst.ptr,
-        dstPitch: dst.pitch,
-        WidthInBytes: dst.width as usize,
-        Height: dst.height as usize,
-        ..Default::default()
-    };
-    let uv = CUDA_MEMCPY2D {
-        srcMemoryType: CU_MEMORYTYPE_DEVICE,
-        srcDevice: uv_src,
-        srcPitch: src_pitch,
-        dstMemoryType: CU_MEMORYTYPE_DEVICE,
-        dstDevice: uv_ptr,
-        dstPitch: uv_pitch,
-        // W/2 interleaved UV samples × 2 bytes = `width` bytes/row.
-        WidthInBytes: dst.width as usize,
-        Height: dst.height.div_ceil(2) as usize,
-        ..Default::default()
-    };
+    let [(y_bytes, y_rows), (uv_bytes, uv_rows), _] =
+        PlaneLayout::Nv12.planes(dst.width, dst.height);
+    let y = device_copy((y_src, src_pitch), (dst.ptr, dst.pitch), y_bytes, y_rows);
+    let uv = device_copy((uv_src, src_pitch), (uv_ptr, uv_pitch), uv_bytes, uv_rows);
     // SAFETY: caller: context current. Both copies are live locals over the caller's mapping and
-    // `dst`'s pooled planes; each `copy_blocking` syncs before return.
+    // `dst`'s pooled planes, which the same plane table sized; each `copy_blocking` syncs before
+    // return.
     unsafe {
         copy_blocking(&y, "cuMemcpy2DAsync_v2(ext->dev nv12 Y)")?;
         copy_blocking(&uv, "cuMemcpy2DAsync_v2(ext->dev nv12 UV)")
@@ -1286,3 +1120,19 @@ pub fn copy_pitched_nv12_to_buffer(
 }
 
 // `cuda.h` layouts these calls need are compile-time asserted in `ffi.rs` (`const _`).
+
+#[cfg(test)]
+mod tests {
+    use super::PlaneLayout;
+
+    /// An odd height keeps its last chroma row, and one stacked allocation covers every plane.
+    #[test]
+    fn nv12_chroma_rounds_up_and_the_stack_covers_it() {
+        assert_eq!(PlaneLayout::Nv12.planes(1920, 1080)[1], (1920, 540));
+        assert_eq!(PlaneLayout::Nv12.planes(6, 3)[1], (6, 2));
+        assert_eq!(PlaneLayout::Nv12.planes(5, 1)[1], (6, 1));
+        assert_eq!(PlaneLayout::Nv12.stacked(6, 3), (6, 5));
+        assert_eq!(PlaneLayout::Yuv444.stacked(8, 4), (8, 12));
+        assert_eq!(PlaneLayout::Packed32.stacked(8, 4), (32, 4));
+    }
+}

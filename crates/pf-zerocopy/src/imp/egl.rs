@@ -182,7 +182,7 @@ impl GlBlit {
                 "blit FBO incomplete ({status:#x})"
             );
             let registered = cuda::RegisteredTexture::register_gl(dst_tex)?;
-            let pool = cuda::BufferPool::new(width, height)?;
+            let pool = cuda::BufferPool::new(cuda::PlaneLayout::Packed32, width, height)?;
             guard.defuse();
             Ok(GlBlit {
                 program,
@@ -332,7 +332,7 @@ impl Nv12Blit {
             }
             let y_registered = cuda::RegisteredTexture::register_gl(y_tex)?;
             let uv_registered = cuda::RegisteredTexture::register_gl(uv_tex)?;
-            let pool = cuda::BufferPool::new_nv12(width, height)?;
+            let pool = cuda::BufferPool::new(cuda::PlaneLayout::Nv12, width, height)?;
             guard.defuse();
             Ok(Nv12Blit {
                 y_program,
@@ -426,7 +426,7 @@ pub fn yuv444_full_range() -> bool {
 
 /// Per-size planar YUV444 convert (BT.709; studio or full range via `PUNKTFUNK_444_FULLRANGE`).
 /// Three full-res `GL_R8` passes share `src_tex`. The pool is one stacked allocation
-/// (`BufferPool::new_yuv444`) so the worker↔host wire stays single-plane.
+/// (`PlaneLayout::Yuv444`) so the worker↔host wire stays single-plane.
 struct Yuv444Blit {
     programs: [u32; 3],
     vao: u32,
@@ -498,7 +498,7 @@ impl Yuv444Blit {
                 cuda::RegisteredTexture::register_gl(texs[1])?,
                 cuda::RegisteredTexture::register_gl(texs[2])?,
             ];
-            let pool = cuda::BufferPool::new_yuv444(width, height)?;
+            let pool = cuda::BufferPool::new(cuda::PlaneLayout::Yuv444, width, height)?;
             guard.defuse();
             if full_range {
                 tracing::info!("YUV444 zero-copy convert: FULL range (PUNKTFUNK_444_FULLRANGE=1)");
@@ -798,7 +798,11 @@ impl EglImporter {
     ) -> Result<DeviceBuffer> {
         cuda::make_current()?;
         if self.linear_pool.as_ref().map(|p| (p.width(), p.height())) != Some((width, height)) {
-            self.linear_pool = Some(cuda::BufferPool::new(width, height)?);
+            self.linear_pool = Some(cuda::BufferPool::new(
+                cuda::PlaneLayout::Packed32,
+                width,
+                height,
+            )?);
         }
         if self.vk.is_none() {
             self.vk = Some(super::vulkan::VkBridge::new()?);
@@ -820,8 +824,7 @@ impl EglImporter {
         width: u32,
         height: u32,
     ) -> Result<DeviceBuffer> {
-        // Even dimensions only: UV copy walks `height.div_ceil(2)` rows, the pool is `height/2`.
-        // Odd height writes one `uv_pitch` past the allocation and poisons the shared CUDA context.
+        // NVENC takes 4:2:0 at even dimensions only.
         anyhow::ensure!(
             width % 2 == 0 && height % 2 == 0,
             "LINEAR NV12 needs even dimensions (got {width}x{height})"
@@ -833,7 +836,11 @@ impl EglImporter {
             .map(|p| (p.width(), p.height()))
             != Some((width, height))
         {
-            self.linear_nv12_pool = Some(cuda::BufferPool::new_nv12(width, height)?);
+            self.linear_nv12_pool = Some(cuda::BufferPool::new(
+                cuda::PlaneLayout::Nv12,
+                width,
+                height,
+            )?);
         }
         if self.vk.is_none() {
             self.vk = Some(super::vulkan::VkBridge::new()?);
@@ -1090,8 +1097,7 @@ impl EglImporter {
         // `import_inner` destroys only after this call returns.
         unsafe { blit.run(egl_image_target, image)? };
         let dst = blit.pool.get()?;
-        let [y, u, v] = &mut blit.registered;
-        cuda::copy_mapped_yuv444(y, u, v, &dst)?;
+        cuda::copy_mapped_yuv444(blit.registered.each_mut(), &dst)?;
         Ok(dst)
     }
 
