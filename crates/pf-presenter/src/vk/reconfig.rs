@@ -278,9 +278,10 @@ impl Presenter {
             }
         }
         old_pipe.destroy(&self.device);
-        // The scale pass renders into the swapchain format too; fence quiesce above.
-        self.scale.destroy(&self.device);
-        self.scale = crate::scale::ScalePass::new(&self.device, target.format)?;
+        // The scale pass renders into the swapchain format too; fence quiesce above. Build the
+        // new one first: a failed create must not leave destroyed handles for Drop to free again.
+        let new_scale = crate::scale::ScalePass::new(&self.device, target.format)?;
+        std::mem::replace(&mut self.scale, new_scale).destroy(&self.device);
         self.format = target;
         self.hdr_active = on;
         match self.recreate_swapchain(window) {
