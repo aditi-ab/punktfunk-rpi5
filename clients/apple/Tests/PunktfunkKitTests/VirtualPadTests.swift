@@ -30,7 +30,7 @@ final class VirtualPadTests: XCTestCase {
     func testPresetsCarryTheControlsTheDesignNames() {
         func labels(_ layout: String) -> Set<String> { Set(padControls(layout: layout, w: 933, h: 420).map(\.label)) }
         let full = labels("full")
-        XCTAssertEqual(full.count, 13)
+        XCTAssertEqual(full.count, 14)
         XCTAssertTrue(full.isSuperset(of: ["Left stick", "Right stick", "D-pad", "Face buttons", "Left trigger",
                                           "Right bumper", "Start", "Left stick click", "Right stick click"]))
         let sticks = labels("sticks")
@@ -44,7 +44,7 @@ final class VirtualPadTests: XCTestCase {
 
     func testPresetIdsAreTheSchemaIds() {
         XCTAssertEqual(Set(padControls(layout: "full", w: 933, h: 420).map(\.id)),
-                       ["lb", "lt", "rb", "rt", "l3", "r3", "ls", "rs", "dpad", "face", "select", "guide", "start"])
+                       ["lb", "lt", "rb", "rt", "l3", "r3", "ls", "rs", "dpad", "face", "select", "guide", "start", "ring"])
     }
 
     func testTweaksMoveScaleHideAndClamp() {

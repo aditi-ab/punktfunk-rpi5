@@ -459,6 +459,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     val gestures = hasTouch && touchMode != TouchMode.TOUCH && pointerOk
     // Settings can turn Back off, but only while another opener exists: the ring holds End stream.
     val backOpensRing = initialSettings.backOpensRing || !(ui.padPresent || keyboard || gestures)
+    val openRingCentred = { ring.openAt(Offset(containerSize.width / 2f, containerSize.height / 2f)) }
     // The quick-action ring (design/touch-client-overlay.md §2). Back opens it at the screen
     // centre instead of ending the session; "End stream" is a slot inside, behind a two-press arm.
     // Back never falls through: an edge swipe mid-game must not tear the session down.
@@ -467,7 +468,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             activity?.mouseForwarder?.backIsMouseEcho() == true -> {}
             ring.sheet -> ring.sheet = false
             ring.committed -> ring.close()
-            backOpensRing -> ring.openAt(Offset(containerSize.width / 2f, containerSize.height / 2f))
+            backOpensRing -> openRingCentred()
         }
     }
     // Host actions are PRE-FETCHED on the session tick, never fetched when the ring opens: two
@@ -679,7 +680,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                     onDial = {},
                 )
             },
-            pad = { size -> PadHalf(virtualPad, overlayCfg.pad, size, haptics) },
+            pad = { size -> PadHalf(virtualPad, overlayCfg.pad, size, haptics, openRingCentred) },
         )
     }
     // A safe-area mode asked the host for a picture narrower than the panel by the housing, so the
@@ -1013,7 +1014,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             // first and every other finger falls through; below the ring, whose scrim owns every
             // finger while it is up. Composed only while shown (tenet 1) — and with a lower half or
             // a companion panel it leaves this half entirely for that.
-            if (split == null && !companionUp) PadHalf(virtualPad, overlayCfg.pad, containerSize, haptics)
+            if (split == null && !companionUp) PadHalf(virtualPad, overlayCfg.pad, containerSize, haptics, openRingCentred)
             // The ring, above the gesture layer so its buttons take the finger first. Composed only
             // while open: a closed overlay costs nothing (tenet 1).
             OsdScaled {
@@ -1042,7 +1043,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             // The hinge itself: nothing on a creased panel, a real strip on a two-panel device.
             Spacer(Modifier.height(with(density) { split.hingePx.toDp() }))
             Box(modifier = Modifier.fillMaxWidth().weight(1f).onSizeChanged { padSize = it }) {
-                if (hingeCompanion) companion() else PadHalf(virtualPad, overlayCfg.pad, padSize, haptics)
+                if (hingeCompanion) companion() else PadHalf(virtualPad, overlayCfg.pad, padSize, haptics, openRingCentred)
             }
         }
         companionDisplay?.let { CompanionOnDisplay(it, companion) }
@@ -1066,9 +1067,10 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
  * (`DisposableEffect(padShown)`), so moving the layer never makes the host see a controller reconnect.
  */
 @Composable
-private fun PadHalf(pad: GamepadRouter.ExternalPad?, cfg: PadConfig, size: IntSize, haptics: ConsoleHaptics) {
+private fun PadHalf(pad: GamepadRouter.ExternalPad?, cfg: PadConfig, size: IntSize, haptics: ConsoleHaptics, openRing: () -> Unit) {
     if (pad == null) return
-    val sink = remember(pad) { PadSink(pad::button, pad::axis) }
+    val ring by rememberUpdatedState(openRing)
+    val sink = remember(pad) { PadSink(pad::button, pad::axis) { ring() } }
     VirtualPadLayer(cfg, size, sink, haptics)
 }
 
