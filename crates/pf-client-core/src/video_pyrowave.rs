@@ -802,6 +802,41 @@ impl PyroWaveDecoder {
 
         let slot = self.next;
         self.next = (self.next + 1) % RING;
+        if let Err(e) = self.record_and_wait(slot) {
+            // The buffer may still be recording or on the GPU, and the pump keeps this decoder:
+            // idle the queue, then reset the buffer so the next frame can begin on it.
+            let _guard = self.queue_lock.guard();
+            let _ = self.device.queue_wait_idle(self.queue);
+            let _ = self
+                .device
+                .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty());
+            return Err(e);
+        }
+        self.ring[slot].initialized = true;
+
+        for r in &mut self.retired {
+            r.handed_over += 1;
+        }
+        self.reap_retired();
+
+        let (w, h) = (self.width, self.height);
+        Ok(Some(PyroWavePlanarFrame {
+            views: [
+                self.ring[slot].views[0].as_raw(),
+                self.ring[slot].views[1].as_raw(),
+                self.ring[slot].views[2].as_raw(),
+            ],
+            width: w,
+            height: h,
+            color: self.color,
+            ten_bit: self.hdr16,
+            keyframe: true,
+        }))
+    }
+
+    /// Record `slot`'s decode, submit it, and wait for its fence. On `Err` the command buffer
+    /// may be recording or pending; the caller idles the queue before reusing it.
+    unsafe fn record_and_wait(&mut self, slot: usize) -> Result<()> {
         let dev = self.device.clone();
         dev.begin_command_buffer(
             self.cmd,
@@ -916,25 +951,7 @@ impl PyroWaveDecoder {
         }
         dev.wait_for_fences(&[self.fence], true, 5_000_000_000)
             .context("pyrowave decode fence")?;
-        self.ring[slot].initialized = true;
-
-        for r in &mut self.retired {
-            r.handed_over += 1;
-        }
-        self.reap_retired();
-
-        Ok(Some(PyroWavePlanarFrame {
-            views: [
-                self.ring[slot].views[0].as_raw(),
-                self.ring[slot].views[1].as_raw(),
-                self.ring[slot].views[2].as_raw(),
-            ],
-            width: w,
-            height: h,
-            color: self.color,
-            ten_bit: self.hdr16,
-            keyframe: true,
-        }))
+        Ok(())
     }
 }
 
