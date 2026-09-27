@@ -6162,7 +6162,7 @@
           },
           "plane": {
             "$ref": "#/components/schemas/Plane",
-            "description": "`native` or `gamestream`."
+            "description": "`native`, `gamestream` or `web`."
           },
           "session_id": {
             "type": "integer",
@@ -7006,7 +7006,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`\"native\" | \"gamestream\"`."
+            "description": "`\"native\" | \"gamestream\" | \"web\"`."
           },
           "sample_count": {
             "type": "integer",
@@ -7732,7 +7732,8 @@
             "description": "Pairing-store copy, already sanitized."
           },
           "plane": {
-            "$ref": "#/components/schemas/Plane"
+            "$ref": "#/components/schemas/Plane",
+            "description": "The store the device is paired in. Browsers pair into the native store, so `native`."
           }
         }
       },
@@ -10762,10 +10763,11 @@
       },
       "Plane": {
         "type": "string",
-        "description": "Origin plane. Both planes must emit; filtering is the consumer's job.",
+        "description": "Origin plane. Every plane must emit; filtering is the consumer's job.",
         "enum": [
           "native",
-          "gamestream"
+          "gamestream",
+          "web"
         ]
       },
       "PlayingApps": {
@@ -12537,7 +12539,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`\"native\" | \"gamestream\"`, or `\"\"` if idle."
+            "description": "`\"native\" | \"gamestream\" | \"web\"`, or `\"\"` if idle."
           },
           "sample_count": {
             "type": "integer",

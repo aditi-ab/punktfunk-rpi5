@@ -2058,7 +2058,7 @@ pub(crate) async fn run_admitted(
     let event_client = crate::events::ClientRef {
         name: client_name.clone().unwrap_or_default(),
         fingerprint: session_fp_hex.clone(),
-        plane: crate::events::Plane::Native,
+        plane: conn.plane(),
         preset: session_preset.clone(),
     };
     crate::events::emit(crate::events::EventKind::ClientConnected {
@@ -2238,7 +2238,7 @@ pub(crate) async fn run_admitted(
         client: client_name.clone().unwrap_or_default(),
         fingerprint: session_fp_hex.clone(),
         launch: hello.launch.clone(),
-        plane: crate::events::Plane::Native,
+        plane: conn.plane(),
         preset: session_preset.clone(),
     });
     // Linux `PUNKTFUNK_PIN_CLOCKS`: refcounted vendor clock floor while any session streams.
@@ -2331,7 +2331,7 @@ pub(crate) async fn run_admitted(
             store: t.game.store.clone(),
             client: client_label.clone(),
             fingerprint: fp.clone(),
-            plane: crate::events::Plane::Native,
+            plane: conn.plane(),
             preset: session_preset.clone(),
         };
         tokio::task::block_in_place(|| crate::holds::launching(game));
@@ -2393,6 +2393,7 @@ pub(crate) async fn run_admitted(
     let control_local_ip = conn.local_ip();
     // Client address: what the registry groups sessions of one NAT or tunnel by.
     let peer_ip = conn.remote_address().ip();
+    let plane = conn.plane();
     let result: Result<()> = async {
         let stream_thread = tokio::task::spawn_blocking(move || -> Result<()> {
             let (transport, wire_sock): (Box<dyn punktfunk_core::transport::Transport>, _) = match (data_plane, data_sock) {
@@ -2526,6 +2527,7 @@ pub(crate) async fn run_admitted(
                     probe_seq,
                     stats: stats_dp,
                     client_label,
+                    plane,
                     bringup: bringup_dp,
                     wire_sock,
                     codec,

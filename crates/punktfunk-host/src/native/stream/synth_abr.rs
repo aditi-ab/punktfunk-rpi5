@@ -250,6 +250,7 @@ pub(crate) struct SynthAbrContext {
     pub(crate) probe_seq: bool,
     pub(crate) stats: Arc<StatsRecorder>,
     pub(crate) client_label: String,
+    pub(crate) plane: crate::events::Plane,
     pub(crate) bringup: Arc<crate::bringup::Trace>,
     pub(crate) wire_sock: Option<std::net::UdpSocket>,
     /// What [`crate::session_status::register`] needs and this source cannot derive: the
@@ -298,6 +299,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         probe_seq,
         stats,
         client_label,
+        plane,
         bringup,
         wire_sock,
         codec,
@@ -344,6 +346,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         mode: live_mode.clone(),
         codec: "synthetic-abr",
         client: client_label.clone(),
+        plane,
         bitrate_kbps: live_bitrate.clone(),
         // No client ramp reaches the synthetic source; the factor paces it.
         link_kbps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -415,7 +418,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         force_idr: Arc::new(AtomicBool::new(false)),
         client: client_label,
         client_name,
-        plane: crate::events::Plane::Native,
+        plane,
         hdr,
         ttff_ms: bringup.total_slot(),
         // Never written: a source that cannot reconfigure never resizes.

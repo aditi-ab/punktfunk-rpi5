@@ -511,6 +511,7 @@
 	"stats_kind": "Pfad",
 	"stats_kind_native": "Nativ",
 	"stats_kind_gamestream": "GameStream",
+	"stats_kind_web": "Browser",
 	"stats_live_title": "Live",
 	"stats_live_window": "Es werden die letzten {count} Messpunkte gezeigt. Die gespeicherte Aufzeichnung enthält alles.",
 	"stats_live_waiting": "Scharf — warte auf die ersten Proben. Starte eine Sitzung, um aufzuzeichnen.",

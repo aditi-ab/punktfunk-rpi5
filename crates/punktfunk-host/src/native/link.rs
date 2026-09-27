@@ -218,6 +218,14 @@ impl SessionLink {
         }
     }
 
+    /// The plane events and session rows name this session by.
+    pub(crate) fn plane(&self) -> crate::events::Plane {
+        match self {
+            SessionLink::Quic(_) => crate::events::Plane::Native,
+            SessionLink::Web(..) => crate::events::Plane::Web,
+        }
+    }
+
     /// Whether a browser is on the other end. For the few decisions that really are about the
     /// carrier: there is no second UDP plane to punch, and the capabilities that ride quinn
     /// streams are not on offer.

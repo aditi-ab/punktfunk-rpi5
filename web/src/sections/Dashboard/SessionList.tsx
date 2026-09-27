@@ -97,7 +97,7 @@ const Row: FC<{
 	const perSession = row.id != null;
 	// Mute and the player slot ride native-only lanes: the compat plane's audio has no
 	// per-session mute, and its pads are not placed through the host's pad pool.
-	const nativeLanes = row.plane === "native";
+	const nativeLanes = row.plane !== "gamestream";
 	const facts = [
 		row.mode,
 		row.join ? m.sessions_joined() : m.sessions_own_display(),
@@ -106,6 +106,7 @@ const Row: FC<{
 			? m.sessions_shared_path({ names: sharedWith.join(", ") })
 			: undefined,
 		row.plane === "gamestream" ? "GameStream" : undefined,
+		row.plane === "web" ? m.sessions_plane_web() : undefined,
 	].filter(Boolean);
 	return (
 		<div className="flex flex-col gap-3 border-b pb-4 last:border-0 last:pb-0 sm:flex-row sm:items-center">
