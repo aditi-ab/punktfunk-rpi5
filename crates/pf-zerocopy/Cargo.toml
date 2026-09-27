@@ -30,6 +30,8 @@ ash = "0.38"
 # (SCM_RIGHTS carries the fds; pixels never cross the socket).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The worker maps the cursor memfd through the shared read-only mapping.
+pf-dmabuf = { path = "../pf-dmabuf" }
 # Safe fd syscalls: the worker socket (SCM_RIGHTS framing), fstat, memfd seals.
 rustix = { version = "1", features = ["fs", "net"] }
 # Push-constant blocks as bytes without a hand-written `from_raw_parts`.

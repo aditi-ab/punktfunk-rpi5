@@ -10,9 +10,10 @@ use super::UserData;
 use crate::linux::pw_cursor::composite_cursor;
 use crate::linux::sync_timeline::{plane_count, SyncPoints};
 use crate::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
+use pf_dmabuf::{ReadMap, Share};
 use pipewire as pw;
 use pw::spa;
-use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -138,48 +139,6 @@ fn warn_once(msg: &'static str) {
     }
 }
 
-/// Read-only mmap of a dmabuf fd, unmapped on drop. Used when MAP_BUFFERS left the buffer unmapped
-/// (producers do not always flag dmabufs mappable — gamescope Vulkan exports).
-struct DmabufMap {
-    ptr: *mut std::ffi::c_void,
-    len: usize,
-}
-
-impl DmabufMap {
-    fn new(fd: i32, len: usize) -> Option<DmabufMap> {
-        // SAFETY: a null `addr` lets the kernel choose the mapping address; `fd` is a caller-owned
-        // dmabuf/MemFd fd, valid for the duration of this call, and `len` is the requested map length.
-        // `mmap` reads no Rust memory — it installs a fresh PROT_READ/MAP_SHARED page mapping and
-        // returns its base (or MAP_FAILED, checked below before `DmabufMap` adopts it). The returned
-        // region is a brand-new VMA, so it aliases no live Rust object, and it keeps the underlying
-        // object mapped independently of `fd` (which may be closed after this returns).
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        (ptr != libc::MAP_FAILED).then_some(DmabufMap { ptr, len })
-    }
-}
-
-impl Drop for DmabufMap {
-    fn drop(&mut self) {
-        // SAFETY: `self.ptr`/`self.len` are exactly the base+length of a successful `mmap` in
-        // `DmabufMap::new` (constructed only when `ptr != MAP_FAILED`). This `DmabufMap` uniquely owns
-        // that mapping and `drop` runs once, so `munmap` releases a live mapping exactly once — no
-        // double-unmap. Every `&[u8]` derived from the mapping is bounded by this `DmabufMap`'s
-        // lifetime, so no borrow outlives the unmap.
-        unsafe {
-            libc::munmap(self.ptr, self.len);
-        }
-    }
-}
-
 fn supported_data_plane_count(count: u32) -> Option<usize> {
     (1..=2).contains(&count).then_some(count as usize)
 }
@@ -207,18 +166,6 @@ pub(in crate::linux) fn realtime_minus_monotonic_ns() -> i64 {
         return 0;
     }
     rt - (ts.tv_sec * 1_000_000_000 + ts.tv_nsec)
-}
-
-/// The dmabuf's allocation as `fstat` reports it; 0 once the fd is gone.
-fn dmabuf_len(fd: i32) -> u64 {
-    // SAFETY: `stat` is plain data that `fstat` only writes.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` is an integer; a closed fd fails the call and nothing is dereferenced.
-    if unsafe { libc::fstat(fd, &mut st) } == 0 {
-        st.st_size as u64
-    } else {
-        0
-    }
 }
 
 /// `data`'s fd, borrowed for as long as `data` is. `None` when the data carries no fd.
@@ -605,7 +552,7 @@ fn try_passthrough(ud: &mut UserData, a: &Arrival) -> bool {
                 offset,
                 stride,
                 // The held buffer's own fd: the consumer may already have closed the dup.
-                fd_size = dmabuf_len(datas[0].fd()),
+                fd_size = data_fd(&datas[0]).map_or(0, |fd| pf_dmabuf::byte_len(fd).unwrap_or(0)),
                 modifier = ud.modifier,
                 fourcc = format_args!("{:#010x}", fourcc),
                 source = match fmt {
@@ -731,9 +678,8 @@ fn cpu_depad(ud: &mut UserData, a: Arrival) {
         ..
     } = a;
     let d = &mut datas[0];
-    // LINEAR dmabufs also land here (gamescope). Capture the fd before `data()` borrows `d`.
+    // LINEAR dmabufs also land here (gamescope).
     let data_type = d.type_();
-    let raw_fd = d.fd();
     // `mapoffset` is this spa_data's start in the fd — non-zero when one fd is pooled.
     // PipeWire's MAP_BUFFERS slice already starts there; our self-mmap maps from 0, so
     // add it (`region_off`). Skip it and we index the wrong buffer; `needed > avail` cannot
@@ -770,42 +716,18 @@ fn cpu_depad(ud: &mut UserData, a: Arrival) {
     // mmap the fd ourselves at fstat length. xdg-desktop-portal-wlr MemFd reports
     // `data.maxsize` past the mapped bytes — reading to maxsize segfaults. Also covers
     // MAP_BUFFERS skipping Vulkan dmabufs. MemPtr (no fd) is same-process: trust `d.data()`.
-    let fd_len = if raw_fd > 0 {
-        // SAFETY: `libc::stat` is a C plain-old-data struct for which all-zero is a valid value, so
-        // `mem::zeroed()` is a sound initializer. `raw_fd` is the buffer's fd (`> 0` checked here) and
-        // valid for this callback; `fstat` writes metadata into `&mut st`, a live, aligned,
-        // correctly-sized stack `stat` that outlives the synchronous call. `st.st_size` is read only
-        // after the return value is confirmed `== 0`. `st` is a fresh local, so nothing aliases it.
-        unsafe {
-            let mut st: libc::stat = std::mem::zeroed();
-            (libc::fstat(raw_fd, &mut st) == 0 && st.st_size > 0).then_some(st.st_size as usize)
-        }
-    } else {
-        None
-    };
-    let _mapping; // keeps a manual mmap alive for the copy below
-                  // Prefer our fstat-sized mmap; else PipeWire's MAP_BUFFERS slice. `fd_len` is required:
-                  // falling back to `offset + needed` maps a producer-invented length and can SIGBUS past
-                  // the object. Without a real length, decline to self-map.
-    let self_mapped: Option<&[u8]> = if raw_fd > 0 {
-        match fd_len.and_then(|map_len| DmabufMap::new(raw_fd, map_len)) {
-            Some(m) => {
-                _mapping = m;
-                // SAFETY: `_mapping` is the `DmabufMap` just stored; its `ptr`/`len` come from a
-                // successful `mmap` of `map_len` PROT_READ bytes, so `ptr` is non-null, page-aligned,
-                // and the VMA is one allocated object of `len` bytes valid for reads. In the common
-                // path `map_len == fd_len` (the fd's real size from `fstat`), so the mapping spans the
-                // whole object; the de-pad copy below is further bounded by the `offset <= buf.len()`
-                // and `needed > avail` guards. The `&[u8]` borrows `_mapping`, which lives to the end
-                // of `cpu_depad`, so the slice never outlives the mapping, and the memory is only
-                // read here, so there is no aliasing/mutation.
-                Some(unsafe { std::slice::from_raw_parts(_mapping.ptr as *const u8, _mapping.len) })
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
+    let fd = data_fd(d).filter(|fd| fd.as_raw_fd() > 0);
+    let fd_len = fd
+        .and_then(|fd| pf_dmabuf::byte_len(fd).ok())
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n > 0);
+    // Prefer our fstat-sized mmap; else PipeWire's MAP_BUFFERS slice. `fd_len` is required:
+    // falling back to `offset + needed` maps a producer-invented length and can SIGBUS past
+    // the object. Without a real length, decline to self-map.
+    let mapping = fd
+        .zip(fd_len)
+        .and_then(|(fd, len)| ReadMap::new(fd, len, Share::Shared).ok());
+    let self_mapped = mapping.as_ref().map(ReadMap::bytes);
     // Self-mmap starts at fd offset 0, so this spa_data begins at `mapoffset`; MAP_BUFFERS
     // already begins there. Checked add — both halves are producer-controlled.
     let (buf, region_off): (&[u8], usize) = if let Some(b) = self_mapped {
