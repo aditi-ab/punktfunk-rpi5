@@ -2276,6 +2276,12 @@ const _: () = {
     assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 76);
 };
 
+/// What [`punktfunk_set_session_preset`] last named. Process-wide, so a connect reads it once,
+/// at entry, into that dial's own parameters.
+#[cfg(feature = "quic")]
+static SESSION_PRESET: std::sync::Mutex<Option<crate::quic::SessionPreset>> =
+    std::sync::Mutex::new(None);
+
 /// Name the settings preset the next connect sends: its stable id and display name. The host
 /// shows it and hands it to hooks; the stream is unchanged. A null `id` names none. The value
 /// outlives the call, so set it before every connect. ABI v38.
@@ -2295,7 +2301,7 @@ pub unsafe extern "C" fn punktfunk_set_session_preset(
         }
         _ => None,
     };
-    crate::client::set_session_preset(preset);
+    *lock_recover(&SESSION_PRESET) = preset;
 }
 
 /// Minimum `struct_size` [`punktfunk_connect_opts`] accepts. Frozen: when the
@@ -2487,6 +2493,7 @@ unsafe fn connect_ex_impl(
             name: Some(name),
             pin,
             identity,
+            preset: lock_recover(&SESSION_PRESET).clone(),
             // The rest stays default: Legacy coupling (embedders decode what the host answers),
             // no display volume, whole AUs (`PunktfunkFrame` cannot tell a part), no abort.
             ..crate::client::ConnectParams::new(

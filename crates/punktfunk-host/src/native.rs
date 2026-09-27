@@ -3382,7 +3382,7 @@ mod tests {
     /// A `synthetic-abr` session publishes a registry row while it streams and retires it
     /// when it ends. The row's id is the one the control task reads off the session's
     /// counters before it asks the governor for a share, so a source that never registers
-    /// leaves a shared path undivided.
+    /// leaves a shared path undivided. The row names the preset this dial carried.
     #[test]
     fn a_synthetic_abr_session_registers_while_it_streams() {
         let _registry = crate::session_status::tests::registry_lock();
@@ -3420,12 +3420,10 @@ mod tests {
             height: 720,
             refresh_hz: 60,
         };
-        let client = NativeClient::connect(ConnectParams::new(
-            "127.0.0.1",
-            19782,
-            mode,
-            std::time::Duration::from_secs(10),
-        ))
+        let client = NativeClient::connect(ConnectParams {
+            preset: punktfunk_core::quic::SessionPreset::new("dock-1", "Docked"),
+            ..ConnectParams::new("127.0.0.1", 19782, mode, std::time::Duration::from_secs(10))
+        })
         .expect("client connects to the synthetic-abr host");
 
         // The registry is process-global and the session_status tests register their own
@@ -3451,6 +3449,7 @@ mod tests {
             "0 is the id the control task skips the governor on"
         );
         assert_eq!(row.plane, crate::events::Plane::Native);
+        assert_eq!(row.preset_name.as_deref(), Some("Docked"));
 
         drop(client);
         host.join().unwrap().unwrap();

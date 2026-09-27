@@ -90,26 +90,6 @@ pub(crate) fn client_label() -> String {
         .clone()
 }
 
-/// The settings preset the next dial names in [`EXT_TAG_PRESET`](crate::quic::EXT_TAG_PRESET).
-/// Set before every connect, `None` for plain settings: a stale value would name the last
-/// session's preset.
-static SESSION_PRESET: Mutex<Option<crate::quic::SessionPreset>> = Mutex::new(None);
-
-/// Name the preset the next dial is made with; `None` names none.
-pub fn set_session_preset(preset: Option<crate::quic::SessionPreset>) {
-    *SESSION_PRESET.lock().unwrap_or_else(|e| e.into_inner()) = preset;
-}
-
-/// The preset a dial should send, encoded; empty for none.
-pub(crate) fn session_preset_bytes() -> Vec<u8> {
-    SESSION_PRESET
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map(|p| p.encode())
-        .unwrap_or_default()
-}
-
 /// Bracket a bare IPv6 literal so `SocketAddr` parse succeeds (`fd00::1` → `[fd00::1]:4770`).
 /// Without brackets the joined string never parses and the error blames the caller's input.
 /// V4, hostnames, and already-bracketed input pass through. A v6 dial still fails at connect
@@ -559,6 +539,9 @@ pub struct ConnectParams {
     pub pin: Option<[u8; 32]>,
     /// PEM cert + PKCS#8 key ([`endpoint::generate_identity`]); `None` = anonymous.
     pub identity: Option<(String, String)>,
+    /// Settings preset this dial names ([`crate::quic::EXT_TAG_PRESET`]); the host shows it and
+    /// hands it to hooks, the stream is unchanged. `None` names none.
+    pub preset: Option<crate::quic::SessionPreset>,
     /// Handshake budget. The dial re-dials inside it, so a waking host is not a failure.
     pub timeout: Duration,
     /// Abort while blocked: a request-access knock parks ~185 s. Never alias the session's
@@ -591,6 +574,7 @@ impl ConnectParams {
             name: None,
             pin: None,
             identity: None,
+            preset: None,
             timeout,
             cancel: None,
         }

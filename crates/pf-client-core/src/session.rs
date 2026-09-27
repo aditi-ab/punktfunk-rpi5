@@ -612,10 +612,6 @@ fn dial(
     // This pair is the request: core derives the cap from it being specified, so
     // `None` must reach the wire as unspecified, not as an explicit 48 000/16.
     let (audio_rate_hz, audio_bits) = hires.unwrap_or(AUDIO_FORMAT_UNSPECIFIED);
-    // Per dial: a session without a preset must not name the last one's.
-    punktfunk_core::client::set_session_preset(params.preset_id.as_deref().and_then(|id| {
-        punktfunk_core::quic::SessionPreset::new(id, params.preset.as_deref().unwrap_or(""))
-    }));
     NativeClient::connect(ConnectParams {
         compositor: params.compositor,
         gamepad: params.gamepad,
@@ -640,6 +636,9 @@ fn dial(
         name: Some(crate::trust::device_name()),
         pin: params.pin,
         identity: Some(params.identity.clone()),
+        preset: params.preset_id.as_deref().and_then(|id| {
+            punktfunk_core::quic::SessionPreset::new(id, params.preset.as_deref().unwrap_or(""))
+        }),
         // Session stop flag, so cancel reaches a dial that has not landed. Without
         // it this parks the pump for the whole budget (185 s on a request-access
         // connect the host holds pending) and cancel cannot be answered until return.
