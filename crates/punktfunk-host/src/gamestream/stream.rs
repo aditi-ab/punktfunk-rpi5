@@ -344,11 +344,17 @@ fn run(
             });
         }
         // Re-runnable: the encode loop calls it again on a mid-stream capture loss.
-        let (mut capturer, compositor, gamescope_route) =
-            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, true)?;
-        // Only Linux `launch_is_nested` reads it; gamescope does not exist on Windows.
+        let GsSource {
+            mut capturer,
+            compositor,
+            route: gamescope_route,
+            nested_launch_started,
+            #[cfg(target_os = "linux")]
+            seat,
+        } = open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, true)?;
+        // Only Linux `launch_is_nested` reads them; gamescope does not exist on Windows.
         #[cfg(not(target_os = "linux"))]
-        let _ = &gamescope_route;
+        let _ = (&gamescope_route, nested_launch_started);
         // GameStream holds a real display; without this, Windows `admit` budgets cannot see it.
         // `None` identity is the anonymous slot. Dropped at the end of `run`.
         let _admission_guard = crate::vdisplay::admission::register(
@@ -433,13 +439,19 @@ fn run(
                     .and_then(|ws| crate::library::adopt_launch_workspace(compositor, ws));
                 None
             }
-            Some(_) if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()) => {
+            // Nested only when this acquire spawned gamescope with `cmd` as its primary child. A
+            // keep-alive reuse spawned nothing, so it falls through and launches into its seat.
+            Some(_)
+                if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref())
+                    && nested_launch_started =>
+            {
                 spawned_now = true;
                 None
             }
             Some(cmd) => {
                 let own = target.as_ref().is_some_and(|t| t.own_workspace);
-                match crate::library::launch_session_command(compositor, cmd, None, own, None) {
+                let seat = seat.as_deref();
+                match crate::library::launch_session_command(compositor, cmd, seat, own, None) {
                     Ok(mut spawned) => {
                         spawned_now = true;
                         launch_workspace = spawned.workspace.take();
@@ -543,8 +555,12 @@ fn run(
         // Re-detect the live compositor so a Desktop↔Game switch is followed in place, with its
         // own cursor blend. WxH is locked at ANNOUNCE — a resolution change cannot follow.
         let rebuild = || {
-            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, false)
-                .map(|(c, comp, route)| (c, gs_cursor_blend(comp, route.as_ref(), &cfg)))
+            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, false).map(|s| {
+                (
+                    s.capturer,
+                    gs_cursor_blend(s.compositor, s.route.as_ref(), &cfg),
+                )
+            })
         };
         return stream_body(
             &mut capturer,
@@ -812,6 +828,19 @@ fn blend_capable_metadata_cursor(cfg: &StreamConfig) -> bool {
     }
 }
 
+/// An opened virtual source.
+struct GsSource {
+    capturer: Box<dyn Capturer>,
+    compositor: crate::vdisplay::Compositor,
+    route: Option<crate::vdisplay::GamescopeRoute>,
+    /// This acquire spawned gamescope with the launch as its primary child. A keep-alive reuse
+    /// spawned nothing.
+    nested_launch_started: bool,
+    /// The gamescope seat a launch that did not nest goes to. `None` off a gamescope spawn.
+    #[cfg(target_os = "linux")]
+    seat: Option<String>,
+}
+
 /// Virtual-display source at the client's mode. The app's own `compositor` wins; otherwise the
 /// native plane's [`crate::compositor_route::resolve_compositor`] picks, pin included. Only a
 /// connect (`revive`) may revive a session. Re-run on mid-stream capture loss to follow a
@@ -824,11 +853,7 @@ fn open_gs_virtual_source(
     launch: Option<&GsApp>,
     quit: &Arc<AtomicBool>,
     revive: bool,
-) -> Result<(
-    Box<dyn Capturer>,
-    crate::vdisplay::Compositor,
-    Option<crate::vdisplay::GamescopeRoute>,
-)> {
+) -> Result<GsSource> {
     let (compositor, gamescope_route) = if let Some(c) = app.and_then(|a| a.compositor) {
         // Still resolve a route, or `create` falls through to a bare spawn on a managed box.
         let r = crate::vdisplay::resolve_gamescope_route(c, false);
@@ -874,6 +899,9 @@ fn open_gs_virtual_source(
         None,
     )
     .context("create virtual output at client resolution")?;
+    let nested_launch_started = vd.nested_launch_started();
+    #[cfg(target_os = "linux")]
+    let seat = vout.seat.clone();
     let plan = gs_session_plan(
         &cfg,
         gs_cursor_blend(compositor, gamescope_route.as_ref(), &cfg),
@@ -901,7 +929,14 @@ fn open_gs_virtual_source(
         }));
     }
     capturer.set_active(true);
-    Ok((capturer, compositor, gamescope_route))
+    Ok(GsSource {
+        capturer,
+        compositor,
+        route: gamescope_route,
+        nested_launch_started,
+        #[cfg(target_os = "linux")]
+        seat,
+    })
 }
 
 /// Shared [`SessionPlan`](crate::session_plan::SessionPlan) at this plane's shape: 4:2:0,
