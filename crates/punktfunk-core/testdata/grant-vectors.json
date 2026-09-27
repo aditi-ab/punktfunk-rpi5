@@ -1,5 +1,5 @@
 {
-  "$comment": "Generated from punktfunk_core::quic::access by grant_vectors_are_checked_in (UPDATE_VECTORS=1 rewrites it). The web console and Kotlin SessionAccess tests replay it.",
+  "$comment": "Generated from punktfunk_core::quic::access by grant_vectors_are_checked_in (UPDATE_VECTORS=1 rewrites it). pf-client-core, the web console, Kotlin and Swift replay it.",
   "bits": {
     "GAMEPAD": 1,
     "POINTER": 2,

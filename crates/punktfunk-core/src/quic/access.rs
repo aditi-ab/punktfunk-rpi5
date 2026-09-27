@@ -15,34 +15,29 @@
 
 use crate::input::InputKind;
 
+// Literals, not `1 << n` or ORs: cbindgen copies the spelling into the header, and Swift
+// imports a `#define` only when it is a plain value.
 /// DualSense `0xCC`, pad-audio, rumble, and virtual-pad creation (no bit, no uinput node).
-pub const GRANT_GAMEPAD: u32 = 1 << 0;
+pub const GRANT_GAMEPAD: u32 = 0x01;
 /// Mouse, scroll, touch, and the pen plane.
-pub const GRANT_POINTER: u32 = 1 << 1;
+pub const GRANT_POINTER: u32 = 0x02;
 /// Key down/up and IME-committed text.
-pub const GRANT_KEYBOARD: u32 = 1 << 2;
+pub const GRANT_KEYBOARD: u32 = 0x04;
 /// Clipboard coordinator. ANDed with the operator clipboard policy; never overrides it.
-pub const GRANT_CLIPBOARD: u32 = 1 << 3;
+pub const GRANT_CLIPBOARD: u32 = 0x08;
 /// Mic datagram plane and the per-session mic-service attach.
-pub const GRANT_MIC: u32 = 1 << 4;
+pub const GRANT_MIC: u32 = 0x10;
 /// `Hello.launch` resolution.
-pub const GRANT_LAUNCH: u32 = 1 << 5;
+pub const GRANT_LAUNCH: u32 = 0x20;
 /// `power.*` (sleep/reboot/shutdown) on the mgmt cert lane (`design/host-actions.md`).
 /// Not a datagram; [`classify`] is untouched. Machine power only — never plugin actions.
-pub const GRANT_POWER: u32 = 1 << 6;
+pub const GRANT_POWER: u32 = 0x40;
 
-/// An omitted Welcome or registry mask reads as this.
-pub const GRANT_ALL: u32 = GRANT_GAMEPAD
-    | GRANT_POINTER
-    | GRANT_KEYBOARD
-    | GRANT_CLIPBOARD
-    | GRANT_MIC
-    | GRANT_LAUNCH
-    | GRANT_POWER;
+/// An omitted Welcome or registry mask reads as this: every bit above.
+pub const GRANT_ALL: u32 = 0x7F;
 
 /// Stored "Full control" before [`GRANT_POWER`]. [`normalize_legacy_full`] lifts it.
-pub const GRANT_ALL_PRE_POWER: u32 =
-    GRANT_GAMEPAD | GRANT_POINTER | GRANT_KEYBOARD | GRANT_CLIPBOARD | GRANT_MIC | GRANT_LAUNCH;
+pub const GRANT_ALL_PRE_POWER: u32 = 0x3F;
 
 /// Exact [`GRANT_ALL_PRE_POWER`] → [`GRANT_ALL`]. Other masks pass through.
 /// That stored Full already has `KEYBOARD`+`POINTER` (desktop power menu), so
@@ -156,7 +151,7 @@ mod tests {
 
     #[test]
     fn legacy_full_reads_as_the_current_full() {
-        assert_eq!(GRANT_ALL_PRE_POWER, 0x3F);
+        assert_eq!(GRANT_ALL_PRE_POWER, GRANT_ALL & !GRANT_POWER);
         assert_eq!(normalize_legacy_full(GRANT_ALL_PRE_POWER), GRANT_ALL);
         assert_eq!(normalize_legacy_full(GRANT_ALL), GRANT_ALL);
         assert_eq!(normalize_legacy_full(GRANT_GAMEPAD), GRANT_GAMEPAD);
@@ -226,7 +221,7 @@ mod tests {
             _ => "custom",
         };
         let about = "Generated from punktfunk_core::quic::access by grant_vectors_are_checked_in \
-            (UPDATE_VECTORS=1 rewrites it). The web console and Kotlin SessionAccess tests \
+            (UPDATE_VECTORS=1 rewrites it). pf-client-core, the web console, Kotlin and Swift \
             replay it.";
         let mut out = format!("{{\n  \"$comment\": \"{about}\",\n  \"bits\": {{\n");
         for (i, (name, bit)) in bits.iter().enumerate() {

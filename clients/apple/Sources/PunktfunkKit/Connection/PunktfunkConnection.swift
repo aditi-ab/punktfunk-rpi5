@@ -637,22 +637,21 @@ public final class PunktfunkConnection: @unchecked Sendable {
     // MARK: - Per-client access (design/per-client-access.md §7)
 
     /// The `PUNKTFUNK_GRANT_*` access bits — what a paired device may DO on the host, per the
-    /// session's live grants (``accessGrants``). Values are wire/ABI-frozen (the header's
-    /// expression macros don't import into Swift, like `userFlagChunkAligned`'s).
-    public static let grantGamepad: UInt32 = 1 << 0
-    public static let grantPointer: UInt32 = 1 << 1
-    public static let grantKeyboard: UInt32 = 1 << 2
-    public static let grantClipboard: UInt32 = 1 << 3
-    public static let grantMic: UInt32 = 1 << 4
-    public static let grantLaunch: UInt32 = 1 << 5
+    /// session's live grants (``accessGrants``).
+    public static let grantGamepad = UInt32(PUNKTFUNK_GRANT_GAMEPAD)
+    public static let grantPointer = UInt32(PUNKTFUNK_GRANT_POINTER)
+    public static let grantKeyboard = UInt32(PUNKTFUNK_GRANT_KEYBOARD)
+    public static let grantClipboard = UInt32(PUNKTFUNK_GRANT_CLIPBOARD)
+    public static let grantMic = UInt32(PUNKTFUNK_GRANT_MIC)
+    public static let grantLaunch = UInt32(PUNKTFUNK_GRANT_LAUNCH)
     /// Host power — the `power.*` host actions (`design/host-actions.md`); route-gated on the
     /// mgmt cert lane, never carried by any input event.
-    public static let grantPower: UInt32 = 1 << 6
+    public static let grantPower = UInt32(PUNKTFUNK_GRANT_POWER)
     /// Every defined grant — full control, today's behavior and what an old host's Welcome
     /// decodes to.
-    public static let grantAll: UInt32 = 0x7F
+    public static let grantAll = UInt32(PUNKTFUNK_GRANT_ALL)
     /// `grantAll` before Power existed (hosts ≤ 0.32.x) — see ``normalizedGrants(_:)``.
-    public static let grantAllPrePower: UInt32 = 0x3F
+    public static let grantAllPrePower = UInt32(PUNKTFUNK_GRANT_ALL_PRE_POWER)
 
     /// The legacy-full read rule (host-actions §4.3): exactly the pre-power full mask — an old
     /// host's "Full control" — reads as the current ``grantAll``, so a Full session against an
@@ -1692,6 +1691,10 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// the same audio. REQUEST-only, no host-cap echo: an older host ignores it and goes quiet
     /// exactly as it always did, so it is safe to set unconditionally from the user's setting.
     public static let clientCapKeepHostAudio: UInt8 = UInt8(PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO)
+    /// `clientCaps` bit: this client draws the host cursor locally.
+    public static let clientCapCursor = UInt8(PUNKTFUNK_CLIENT_CAP_CURSOR)
+    /// `clientCaps` bit: this client's presenter reports its latch phase (vsync-aware pacing).
+    public static let clientCapPhaseLock = UInt8(PUNKTFUNK_CLIENT_CAP_PHASE_LOCK)
 
     /// The `codec` SETTING (a `DefaultsKey.codec` / preset-overlay string) as a soft-preference
     /// byte; `0` = Automatic, i.e. the host decides. Lives here beside the bits so the settings
@@ -1707,19 +1710,18 @@ public final class PunktfunkConnection: @unchecked Sendable {
         }
     }
 
-    /// `AccessUnit.flags` bit: the AU is shard-aligned self-delimiting chunks (the wire's
-    /// `USER_FLAG_CHUNK_ALIGNED`, PyroWave datagram-aligned mode §4.4) — walk it
-    /// window-by-window at `shardPayload`. (The C `#define` doesn't import into Swift.)
-    public static let userFlagChunkAligned: UInt32 = 64
-    /// `AccessUnit.flags` bit: the AU is an IDR (the wire's `FLAG_SOF`).
-    public static let flagSOF: UInt32 = 4
-    /// `AccessUnit.flags` bit: an intra-refresh wave boundary (the wire's `USER_FLAG_RECOVERY_POINT`).
-    public static let userFlagRecoveryPoint: UInt32 = 16
-    /// `AccessUnit.flags` bit: a clean RFI recovery anchor P (the wire's `USER_FLAG_RECOVERY_ANCHOR`).
-    public static let userFlagRecoveryAnchor: UInt32 = 32
-    /// `AccessUnit.flags` bit: an idle-keepalive re-encode of the previous picture (the wire's
-    /// `USER_FLAG_REPEAT`). Its pts is the host's submit instant, not a capture — off-cadence.
-    public static let userFlagRepeat: UInt32 = 256
+    /// `AccessUnit.flags` bit: the AU is shard-aligned self-delimiting chunks (PyroWave
+    /// datagram-aligned mode §4.4) — walk it window-by-window at `shardPayload`.
+    public static let userFlagChunkAligned = UInt32(PUNKTFUNK_USER_FLAG_CHUNK_ALIGNED)
+    /// `AccessUnit.flags` bit: the AU is an IDR.
+    public static let flagSOF = UInt32(PUNKTFUNK_FLAG_SOF)
+    /// `AccessUnit.flags` bit: an intra-refresh wave boundary.
+    public static let userFlagRecoveryPoint = UInt32(PUNKTFUNK_USER_FLAG_RECOVERY_POINT)
+    /// `AccessUnit.flags` bit: a clean RFI recovery anchor P.
+    public static let userFlagRecoveryAnchor = UInt32(PUNKTFUNK_USER_FLAG_RECOVERY_ANCHOR)
+    /// `AccessUnit.flags` bit: an idle-keepalive re-encode of the previous picture. Its pts is
+    /// the host's submit instant, not a capture — off-cadence.
+    public static let userFlagRepeat = UInt32(PUNKTFUNK_USER_FLAG_REPEAT)
 
     /// Static HDR mastering metadata (SMPTE ST.2086 + content light level) the host sent for an HDR
     /// session. Mirrors the wire/ABI `PunktfunkHdrMeta`; primaries are in ST.2086 **G, B, R** order,
