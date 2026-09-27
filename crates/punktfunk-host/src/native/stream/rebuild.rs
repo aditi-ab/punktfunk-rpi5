@@ -305,12 +305,12 @@ impl StreamState {
         Ok(())
     }
 
-    /// Capture failed. On Linux a dedicated game session whose game exited ends cleanly
-    /// (`Ok(false)`); otherwise rebuild within a budget, re-detecting the live compositor each
-    /// attempt. `Err` = the rebuild budget or the rebuild count is exhausted.
+    /// Capture failed. On Linux a dedicated game session whose game exited emits `game.exited`
+    /// and ends cleanly (`Ok(false)`); otherwise rebuild within a budget, re-detecting the live
+    /// compositor each attempt. `Err` = the rebuild budget or the rebuild count is exhausted.
     pub(super) fn on_capture_lost(&mut self, e: anyhow::Error) -> Result<bool> {
         #[cfg(not(target_os = "linux"))]
-        let _ = &self.cur_node_id;
+        let _ = (&self.cur_node_id, &self.game_life);
         #[cfg(target_os = "linux")]
         if self.launch.is_some()
             && crate::session_settings::get().session_on_game_exit
@@ -318,6 +318,9 @@ impl StreamState {
             && crate::vdisplay::dedicated_game_exited(self.cur_node_id)
         {
             tracing::info!("dedicated game session: the game exited — ending the session cleanly");
+            if let Some(g) = self.game_life.as_ref() {
+                crate::gamelease::report_exit(&g.shared());
+            }
             crate::events::SessionEndReason::GameExited.latch(&self.end_reason);
             self.quit.store(true, Ordering::SeqCst);
             self.conn
