@@ -449,6 +449,245 @@ impl Shell {
     }
 }
 
+impl Shell {
+    /// Whether window focus, Gaming Mode's overlay or a released capture wants the pads
+    /// masked. The ring is the mask's third owner; [`Shell::pad_owner_tick`] joins them.
+    pub(super) fn ui_wants_mask(&self, stream: &Option<StreamState>) -> bool {
+        // Who owns the pad: capture, window focus, and Gaming Mode's overlay signal.
+        // Edge-triggered so an open QAM does not re-flush the pads every iteration.
+        #[cfg(target_os = "linux")]
+        let overlay_now = self.overlay_focus.as_ref().is_some_and(|of| of.is_open());
+        #[cfg(not(target_os = "linux"))]
+        let overlay_now = false;
+        // Remembered, not applied: the ring is a third owner of this same mask and is only
+        // known further down. Applying here too gave one boolean two latches, and whichever
+        // fell last unmasked the pads while the other still wanted them masked.
+        let capture_active = stream
+            .as_ref()
+            .and_then(|st| st.capture.as_ref())
+            .map(Capture::captured);
+        ui_wants_pad_mask(self.focus_lost, overlay_now, capture_active)
+    }
+
+    /// Drain forwarded cursor shape/state and drive the local OS cursor — only
+    /// meaningful in the desktop mouse model (capture's relative lock hides it).
+    pub(super) fn cursor_tick(&mut self, st: &mut StreamState) {
+        // Host-framebuffer px → cursor-surface px: the placement scale (physical px per
+        // host px) over what the backend scales a cursor by itself, so the pointer is the
+        // size it has in the picture, as on Apple. Stretch keeps the shape undistorted.
+        let cursor_scale = st.last_video.map_or(1.0, |video| {
+            let p = video_fit::place(self.opts.video_fit, self.window.size_in_pixels(), video);
+            p.scale_x.min(p.scale_y) as f32 / cursor_surface_scale(&self.window)
+        });
+        if let (Some(chan), Some(c)) = (st.cursor_chan.as_mut(), st.connector.as_ref()) {
+            let desktop_active = st
+                .capture
+                .as_ref()
+                .is_some_and(|cap| cap.captured() && cap.desktop());
+            chan.pump(c, &self.mouse, desktop_active, cursor_scale);
+            // We draw the pointer while released (a released cursor over a composited one is
+            // a frozen twin), in desktop mode, or relative on the host's hint: only the state
+            // it keeps forwarding can clear the hint. Without the pointer grant the host
+            // pointer is someone else's, so the host draws it.
+            let hint_relative = !st.hint_override && st.last_hint == Some(true);
+            let client_draws = match st.capture.as_ref() {
+                Some(cap) => {
+                    (!cap.captured() || cap.desktop() || hint_relative)
+                        && cap.grants() & punktfunk_core::quic::GRANT_POINTER != 0
+                }
+                None => true,
+            };
+            if chan.negotiated() && st.sent_client_draws != Some(client_draws) {
+                st.sent_client_draws = Some(client_draws);
+                let _ = c.set_cursor_render(client_draws);
+            }
+        }
+        // Host-driven mode flip: `relative_hint` set = run captured relative; clear
+        // = return to absolute. Edge-triggered so a manual chord is not fought: the
+        // override latch holds until the host's intent next changes. The hint must hold
+        // [`HINT_SETTLE`] with no button down (Windows hides the pointer for a click or a
+        // keystroke), and a grab needs the pointer over this window.
+        let hint_state = st.cursor_chan.as_ref().and_then(|ch| ch.state());
+        if let Some(hs) = hint_state {
+            let hint = hs.relative_hint();
+            if st.last_hint != Some(hint) {
+                st.last_hint = Some(hint);
+                st.hint_override = false;
+                st.hint_since = std::time::Instant::now();
+            }
+            if !st.hint_override && st.hint_since.elapsed() >= HINT_SETTLE {
+                let video = st.last_video;
+                let over_us = !hint || self.mouse.focused_window_id() == Some(self.window.id());
+                if let Some(cap) = st.capture.as_mut() {
+                    if cap.captured()
+                        && !cap.buttons_held()
+                        && over_us
+                        && !self.ring_was_open
+                        && cap.set_desktop(!hint)
+                    {
+                        self.capture_on(cap);
+                        if cap.desktop() {
+                            // Reappear where the host last had the pointer so the
+                            // hand-back is seamless.
+                            if let Some(video) = video {
+                                let (wx, wy) = content_to_window(
+                                    self.opts.video_fit,
+                                    self.window.size(),
+                                    self.window.size_in_pixels(),
+                                    video,
+                                    hs.x,
+                                    hs.y,
+                                );
+                                self.mouse.warp_mouse_in_window(&self.window, wx, wy);
+                            }
+                        }
+                        tracing::info!(
+                            desktop = cap.desktop(),
+                            "host cursor hint: mouse model flipped"
+                        );
+                    }
+                }
+            }
+            // Something else moved the pointer we draw (controller mouse, a trackpad
+            // gesture, an app warping it): once the user's own mouse has been still for
+            // longer than a round trip, the local cursor goes where the host put it.
+            let over_us = self.mouse.focused_window_id() == Some(self.window.id());
+            let still = st.last_user_motion.elapsed() >= FOLLOW_HOST_AFTER;
+            if let (Some(cap), Some(video)) = (st.capture.as_mut(), st.last_video) {
+                let drifted = cap.last_abs().is_some_and(|(x, y)| {
+                    (x - hs.x).abs() > FOLLOW_SLACK_PX || (y - hs.y).abs() > FOLLOW_SLACK_PX
+                });
+                if cap.captured() && cap.desktop() && hs.visible() && over_us && still && drifted {
+                    let (wx, wy) = content_to_window(
+                        self.opts.video_fit,
+                        self.window.size(),
+                        self.window.size_in_pixels(),
+                        video,
+                        hs.x,
+                        hs.y,
+                    );
+                    st.warp_echo_until = Instant::now() + WARP_ECHO;
+                    self.mouse.warp_mouse_in_window(&self.window, wx, wy);
+                    cap.followed_host((hs.x, hs.y));
+                }
+            }
+        }
+    }
+
+    /// SDL text input tracks overlay editing (IME / Steam OSK), edge-wise.
+    pub(super) fn text_input_tick(&mut self) {
+        let want_text = self.overlay.as_ref().is_some_and(|o| o.text_input_active());
+        if want_text != self.text_input_on {
+            self.text_input_on = want_text;
+            let ti = self.sdl_video.text_input();
+            if want_text {
+                ti.start(&self.window);
+            } else {
+                ti.stop(&self.window);
+            }
+        }
+    }
+
+    /// Who owns the pads: pad chords, the ring, the mask, and the escape and disconnect
+    /// holds. `want_mask_ui` is [`Shell::ui_wants_mask`] from before the pump tick.
+    pub(super) fn pad_owner_tick(&mut self, stream: &mut Option<StreamState>, want_mask_ui: bool) {
+        // Select chords on a pad. `Select+A` puts the ring at the window centre, where its
+        // highlight starts on the centre so `Select+A` then `A` opens the sheet; `Select+X`
+        // steps the stats tier, the same move the keyboard chord and the dial's own slot make.
+        while let Ok((pad, chord)) = self.chord_rx.try_recv() {
+            if self.overlay.is_none() || stream.is_none() {
+                continue;
+            }
+            match chord {
+                SelectChord::Ring => {
+                    if let Some(o) = self.overlay.as_mut() {
+                        self.ring_opener = Some(pad);
+                        let (pw, ph) = self.window.size_in_pixels();
+                        o.ring_input(RingInput::Toggle {
+                            x: pw as f32 / 2.0,
+                            y: ph as f32 / 2.0,
+                        });
+                    }
+                }
+                SelectChord::Stats => {
+                    bump_stats_tier(&mut self.stats_verbosity, stream);
+                    tracing::info!(tier = ?self.stats_verbosity, "chord: stats verbosity");
+                }
+            }
+        }
+        // While the ring is up, or the console holds a launch over the live stream, the
+        // pad belongs to the overlay: masked off the wire, polled into menu events. The
+        // three gates that keep pad input off client UI flip together.
+        let ring_open = stream.is_some()
+            && self
+                .overlay
+                .as_ref()
+                .is_some_and(|o| o.ring_open() || o.holds_stream());
+        if ring_open != self.ring_was_open {
+            self.ring_was_open = ring_open;
+            self.gamepad.set_ring_nav(ring_open);
+            if !ring_open {
+                self.ring_opener = None;
+            }
+            // The ring eats every pointer event, so a button already down would stay pressed
+            // on the host without a flush. It also needs a pointer to aim with: under a lock
+            // the cursor is hidden and every event carries the position the lock froze, so
+            // capture hands the local one back while it is up and takes the window on close.
+            if let Some(cap) = capture_mut(stream) {
+                if ring_open {
+                    cap.flush_held();
+                }
+                if cap.captured() {
+                    if ring_open {
+                        self.capture_off();
+                    } else {
+                        self.capture_on(cap);
+                    }
+                }
+            }
+        }
+        // One owner for the mask: any gate that wants the pads keeps them masked.
+        let want_mask = want_mask_ui || ring_open;
+        if want_mask != self.mask_applied {
+            self.mask_applied = want_mask;
+            self.gamepad.set_masked(want_mask);
+        }
+        if ring_open {
+            while let Ok(ev) = self.menu_rx.try_recv() {
+                if let Some(o) = self.overlay.as_mut() {
+                    o.handle_menu(ev);
+                }
+            }
+        }
+
+        // Controller escape chord: release capture and leave fullscreen. Gamescope has
+        // nothing to release into and no pointer to click back with, while a release masks
+        // the pads — there the chord only starts the disconnect hold.
+        while self.escape_rx.try_recv().is_ok() {
+            if in_gamescope() {
+                continue;
+            }
+            if let Some(cap) = capture_mut(stream) {
+                if cap.release(true) {
+                    self.capture_off();
+                }
+            }
+            if self.fullscreen && !self.opts.fullscreen {
+                self.fullscreen = false;
+                let _ = self.window.set_fullscreen(false);
+            }
+        }
+        // Escape chord held past the threshold: the controller's disconnect.
+        if self.disconnect_rx.try_recv().is_ok() {
+            if let Some(st) = stream {
+                tracing::info!("controller chord: disconnect");
+                st.request_quit();
+                self.capture_off();
+            }
+        }
+    }
+}
+
 /// A key the loop answers itself instead of forwarding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Chord {

@@ -385,6 +385,100 @@ pub(super) fn toggle_pad_mouse(c: &NativeClient, ring_opener: Option<u8>) {
 }
 
 impl Shell {
+    /// Browse mode's console: menu events while no stream is engaged, and the action the
+    /// console took. `Break` is the console's Quit.
+    pub(super) fn browse_tick(
+        &mut self,
+        stream: &mut Option<StreamState>,
+        on_action: &mut OnAction<'_>,
+    ) -> ControlFlow<Outcome> {
+        // Menu events flow while no stream is engaged — including a connect in
+        // flight, so B can cancel the dial. Once attached, the worker forwards raw
+        // input instead.
+        if stream.as_ref().is_none_or(|s| s.connector.is_none()) {
+            while let Ok(ev) = self.menu_rx.try_recv() {
+                if let Some(o) = self.overlay.as_mut() {
+                    if let Some(pulse) = o.handle_menu(ev) {
+                        self.gamepad.menu_rumble(pulse);
+                    }
+                }
+            }
+        }
+        if let Some(action) = self.overlay.as_mut().and_then(|o| o.take_action()) {
+            match action {
+                OverlayAction::CancelConnect => {
+                    if let Some(st) = stream {
+                        if st.connector.is_none() && !st.canceled {
+                            tracing::info!("connect canceled from the console");
+                            st.canceled = true;
+                            st.handle.stop.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+                // The console already toasted "Link copied"; a clipboard SDL refuses
+                // is a log line, not a contradiction of the toast.
+                OverlayAction::CopyText(text) => {
+                    if let Err(e) = self.sdl_video.clipboard().set_clipboard_text(&text) {
+                        tracing::warn!(error = %e, "copying to the clipboard");
+                    }
+                }
+                action => {
+                    let force_software = Arc::new(AtomicBool::new(false));
+                    match on_action(
+                        action,
+                        &self.gamepad,
+                        self.native,
+                        window_display_hdr(&self.window),
+                        force_software.clone(),
+                        self.presenter.vulkan_decode(),
+                    ) {
+                        ActionOutcome::Handled => {}
+                        ActionOutcome::Start(mut params) => {
+                            if self.opts.match_window.is_some() {
+                                apply_match_window(
+                                    &mut params,
+                                    &self.window,
+                                    self.opts.render_scale,
+                                    self.opts.render_scale_max_dim,
+                                );
+                            }
+                            // Adopt the tier this launch resolved. The console outlives
+                            // every stream. Not in `StreamState::new`: a codec-fallback
+                            // retry rebuilds from a clone of these params and would snap
+                            // the overlay back, undoing a chord the user had just made.
+                            self.stats_verbosity = params.stats_verbosity;
+                            // A live pump here would be detached by the assignment —
+                            // `StreamState` has no `Drop`, so its thread would keep
+                            // decoding onto the shared Vulkan device. Every other
+                            // replacement site takes-and-shuts-down; so does this one.
+                            if let Some(prev) = stream.take() {
+                                tracing::warn!(
+                                    "launch while a session was still attached — \
+                                     stopping it first"
+                                );
+                                prev.shutdown();
+                            }
+                            *stream = Some(StreamState::new(
+                                *params,
+                                force_software,
+                                self.sdl_events.event_sender(),
+                                self.present_priority,
+                                self.native.refresh_hz,
+                            ));
+                            if let Some(o) = self.overlay.as_mut() {
+                                o.session_phase(SessionPhase::Connecting);
+                            }
+                        }
+                        ActionOutcome::Quit => return ControlFlow::Break(Outcome::Ended(None)),
+                    }
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+impl Shell {
     /// Run one ring command against the live session (stats tier, keyboard, system buttons
     /// and controller mouse are the loop's own and are handled at the call site).
     pub(super) fn ring_command(&mut self, cmd: RingCommand, st: &mut StreamState) {
