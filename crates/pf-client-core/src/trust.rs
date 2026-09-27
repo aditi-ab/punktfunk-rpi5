@@ -782,7 +782,15 @@ impl KnownHosts {
 }
 
 /// Load-upsert-save: the pin every trust decision (TOFU, PIN, delegated, headless) ends in.
-pub fn persist_host(name: &str, addr: &str, port: u16, fp_hex: &str, paired: bool) -> Result<()> {
+/// `mac` is the wake MAC(s) the caller learned; empty keeps the saved ones.
+pub fn persist_host(
+    name: &str,
+    addr: &str,
+    port: u16,
+    fp_hex: &str,
+    paired: bool,
+    mac: &[String],
+) -> Result<()> {
     let mut known = KnownHosts::load();
     // `..Default::default()` so user-set fields arrive uncarried; a literal would
     // reset them on re-pair. `upsert_trusted`: this is the authorised decision.
@@ -792,6 +800,7 @@ pub fn persist_host(name: &str, addr: &str, port: u16, fp_hex: &str, paired: boo
         port,
         fp_hex: fp_hex.to_string(),
         paired,
+        mac: mac.to_vec(),
         ..Default::default()
     });
     // Returned, not swallowed: this is the door every trust decision walks through, and the

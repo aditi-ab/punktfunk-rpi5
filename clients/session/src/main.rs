@@ -233,6 +233,7 @@ mod session_main {
                     port,
                     &fp_hex,
                     true,
+                    &[],
                 ) {
                     eprintln!("couldn't save the host: {e:#}");
                 }

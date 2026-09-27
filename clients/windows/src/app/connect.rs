@@ -6,7 +6,7 @@
 use super::lucide;
 use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
-use crate::trust::{self, KnownHost, KnownHosts};
+use crate::trust::{self, KnownHosts};
 use pf_client_core::discovery::{DiscoveredHost, DiscoveryEvent};
 use pf_client_core::orchestrate::{CancelHandle, ConnectOutcome, WakeOutcome, WakeWait};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -292,24 +292,20 @@ fn connect_spawn(
                 SpawnEvent::Ready => {
                     // Ready proves the host answered, so no later exit is the asleep case.
                     wake_on_fail = false;
-                    if persist_paired || tofu {
-                        // Request-access: the operator approved this device — record the
-                        // host PAIRED so future connects are silent. Plain TOFU persists
-                        // it *unpaired* (pinned): the child connected pinned to the
-                        // advertised fingerprint, so ready proves the host holds it.
-                        // Either way an authorised decision, so `upsert_trusted`: a dead
-                        // record for this address is retired instead of shadowing this one.
-                        let mut k = KnownHosts::load();
-                        k.upsert_trusted(KnownHost {
-                            name: target.name.clone(),
-                            addr: target.addr.clone(),
-                            port: target.port,
-                            fp_hex: fp_hex.clone(),
-                            paired: persist_paired,
-                            mac: target.mac.clone(),
-                            ..Default::default()
-                        });
-                        let _ = k.save();
+                    // Request-access records the host PAIRED; plain TOFU pins it *unpaired*
+                    // (ready proves the host holds the advertised fingerprint). A failed save
+                    // waits on the status line, which a clean exit leaves for the host list.
+                    if (persist_paired || tofu)
+                        && let Err(e) = trust::persist_host(
+                            &target.name,
+                            &target.addr,
+                            target.port,
+                            &fp_hex,
+                            persist_paired,
+                            &target.mac,
+                        )
+                    {
+                        st.call(format!("Connected, but couldn't save — {e:#}"));
                     }
                     // The child presented its first frame — its window is up, so the
                     // shell yields: one visible Punktfunk window at a time. Every exit

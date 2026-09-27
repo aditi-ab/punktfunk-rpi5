@@ -672,7 +672,7 @@ impl SimpleComponent for AppModel {
                 if persist_paired {
                     // Request-access: the operator approved this device — a trusted
                     // PAIRED host from now on, like after a PIN ceremony.
-                    match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true) {
+                    match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true, &[]) {
                         Ok(()) => self.toast("Approved — connected"),
                         // The stream is up (the pin was carried in memory), but nothing was
                         // written — say so, or the host is simply gone at the next launch.
@@ -680,7 +680,7 @@ impl SimpleComponent for AppModel {
                     }
                 } else if tofu {
                     // The advertised fingerprint proved itself on a real connect.
-                    match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, false) {
+                    match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, false, &[]) {
                         Ok(()) => self.toast(&format!(
                             "Trusted on first use — fingerprint {}…",
                             &fp_hex[..16.min(fp_hex.len())]
