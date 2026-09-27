@@ -2612,12 +2612,13 @@ impl NvencCudaEncoder {
             );
         }
         // Hand the blocking lock to the retrieve thread. `sync_channel(POOL)` cannot fill
-        // (in-flight is capped < POOL).
+        // (in-flight is capped < POOL). A dead thread would strand this AU, so rebuild.
         if let Some(rt) = &self.async_rt {
-            if let Some(tx) = &rt.work_tx {
-                let _ = tx.send(RetrieveJob {
-                    bs: self.bitstreams[slot] as usize,
-                });
+            let job = RetrieveJob {
+                bs: self.bitstreams[slot] as usize,
+            };
+            if rt.work_tx.as_ref().is_none_or(|tx| tx.send(job).is_err()) {
+                bail!("NVENC retrieve thread gone — rebuilding the session");
             }
         }
         Ok(())
