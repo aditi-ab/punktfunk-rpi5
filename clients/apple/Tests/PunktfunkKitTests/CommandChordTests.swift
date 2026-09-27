@@ -136,11 +136,75 @@ final class CommandChordTests: XCTestCase {
         XCTAssertEqual(InputCapture.keyCodeToVK[126], 0x26) // Up arrow (⌃↑ Mission Control)
     }
 
-    private func keyEvent(_ keyCode: UInt16, _ flags: NSEvent.ModifierFlags) -> NSEvent? {
+    // Release ownership follows the forwarded physical key, not the current modifier chord
+    func testTrackedReleasesIgnoreModifierChanges() throws {
+        for flags: NSEvent.ModifierFlags in [.command, [], .control, [.control, .command]] {
+            var tracked: Set<UInt32> = [0x46]
+            let event = try XCTUnwrap(keyEvent(f, flags, type: .keyUp))
+            XCTAssertEqual(InputCapture.takeRelease(
+                event, forwarding: true, pressedVKs: [0x46], chordVKs: &tracked), 0x46)
+            XCTAssertTrue(tracked.isEmpty)
+        }
+    }
+
+    // One key's release cannot clear another held chord key or generate a duplicate release
+    func testRepeatedTapsClaimEachReleaseOnce() throws {
+        var tracked: Set<UInt32> = [0x51, 0x57]
+        let event = try XCTUnwrap(keyEvent(w, .command, type: .keyUp))
+        for _ in 0..<3 {
+            tracked.insert(0x57)
+            XCTAssertEqual(InputCapture.takeRelease(
+                event, forwarding: true, pressedVKs: [0x51, 0x57], chordVKs: &tracked), 0x57)
+            XCTAssertEqual(tracked, [0x51])
+            XCTAssertNil(InputCapture.takeRelease(
+                event, forwarding: true, pressedVKs: [0x51], chordVKs: &tracked))
+        }
+    }
+
+    // Held-key repeats keep their release outstanding for the eventual physical key-up
+    func testHeldKeyRepeatDoesNotTakeReleaseOwnership() throws {
+        var tracked: Set<UInt32> = [0x57]
+        let repeatedDown = try XCTUnwrap(keyEvent(w, .command, isRepeat: true))
+        XCTAssertNil(InputCapture.takeRelease(
+            repeatedDown, forwarding: true, pressedVKs: [0x57], chordVKs: &tracked))
+        XCTAssertEqual(tracked, [0x57])
+        let release = try XCTUnwrap(keyEvent(w, .command, type: .keyUp))
+        XCTAssertEqual(InputCapture.takeRelease(
+            release, forwarding: true, pressedVKs: [0x57], chordVKs: &tracked), 0x57)
+    }
+
+    // A key held before ⌘ went down still reaches the host when it is released under ⌘
+    func testAHeldKeyReleasedUnderCommandIsTaken() throws {
+        var tracked: Set<UInt32> = []
+        let underCommand = try XCTUnwrap(keyEvent(leftArrow, .command, type: .keyUp))
+        XCTAssertEqual(InputCapture.takeRelease(
+            underCommand, forwarding: true, pressedVKs: [0x25], chordVKs: &tracked), 0x25)
+        let plain = try XCTUnwrap(keyEvent(leftArrow, [], type: .keyUp))
+        XCTAssertNil(InputCapture.takeRelease(
+            plain, forwarding: true, pressedVKs: [0x25], chordVKs: &tracked))
+    }
+
+    // Unowned releases and local input retain the responder-chain path
+    func testUntrackedAndReleasedCaptureKeysPassThrough() throws {
+        var tracked: Set<UInt32> = [0x57]
+        let untracked = try XCTUnwrap(keyEvent(q, .command, type: .keyUp))
+        XCTAssertNil(InputCapture.takeRelease(
+            untracked, forwarding: true, pressedVKs: [0x57], chordVKs: &tracked))
+        let released = try XCTUnwrap(keyEvent(w, .command, type: .keyUp))
+        XCTAssertNil(InputCapture.takeRelease(
+            released, forwarding: false, pressedVKs: [0x57], chordVKs: &tracked))
+        XCTAssertEqual(tracked, [0x57])
+    }
+
+    // Construct physical key events without keyboard layout or window dependencies
+    private func keyEvent(
+        _ keyCode: UInt16, _ flags: NSEvent.ModifierFlags,
+        type: NSEvent.EventType = .keyDown, isRepeat: Bool = false
+    ) -> NSEvent? {
         NSEvent.keyEvent(
-            with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+            with: type, location: .zero, modifierFlags: flags, timestamp: 0,
             windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "",
-            isARepeat: false, keyCode: keyCode)
+            isARepeat: isRepeat, keyCode: keyCode)
     }
 }
 #endif
