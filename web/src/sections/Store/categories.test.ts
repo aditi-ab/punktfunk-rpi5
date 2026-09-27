@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import type { StoreEntry } from "@/api/store";
+import type { CatalogEntry } from "@/api/gen/model";
 import { groupCatalog, groupOf } from "./categories";
 
 const entry = (
 	title: string,
 	categories?: string[],
 	detected?: boolean,
-): StoreEntry => ({
+): CatalogEntry => ({
 	id: title.toLowerCase(),
 	pkg: `@punktfunk/plugin-${title.toLowerCase()}`,
 	title,
