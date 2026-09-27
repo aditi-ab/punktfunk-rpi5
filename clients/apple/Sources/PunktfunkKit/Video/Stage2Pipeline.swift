@@ -63,7 +63,7 @@ public enum FrameStorePolicy: Sendable, Equatable {
 
 public final class FrameStore<Frame>: @unchecked Sendable {
     private let lock = NSLock()
-    private let capacity: Int // 1 = newest-wins semantics
+    let capacity: Int // 1 = newest-wins semantics
     private let isFifo: Bool
     private var frames: [Frame] = []
     private var prerolled = false
@@ -1680,8 +1680,10 @@ public final class Stage2Pipeline {
             // Compiles the two compute kernels on the session's first frames' thread — ~tens of
             // ms, once per session. Failure = this device can't run the negotiated codec (the
             // advertisement probe should have prevented this); end the session cleanly.
+            // Ring past the store: its queued frames, the render thread's, a put-back, the decode.
             guard let decoder = MetalWaveletDecoder(
-                device: device, queue: queue, tenBit: connection.bitDepth >= 10)
+                device: device, queue: queue, tenBit: connection.bitDepth >= 10,
+                ringDepth: max(4, ring.capacity + 3))
             else {
                 if !token.isStopped { onSessionEnd?() }
                 return
