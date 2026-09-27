@@ -357,28 +357,36 @@ pub fn detect_active_session() -> ActiveSession {
 /// owned instance dir under `$XDG_RUNTIME_DIR/hypr/` that still has `.socket.sock`.
 #[cfg(target_os = "linux")]
 fn find_hypr_signature(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
     let hypr = std::path::Path::new(runtime).join("hypr");
     if let Some(sig) = &env.hyprland_signature {
         if hypr.join(sig).join(".socket.sock").exists() {
             return Some(sig.clone());
         }
     }
-    let mut cands: Vec<(std::time::SystemTime, String)> = Vec::new();
-    for e in std::fs::read_dir(&hypr).ok()?.flatten() {
-        let Ok(md) = e.metadata() else { continue };
-        if !md.is_dir() || md.uid() != uid {
-            continue;
-        }
-        if !e.path().join(".socket.sock").exists() {
-            continue;
-        }
-        let name = e.file_name().to_string_lossy().into_owned();
-        let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
-        cands.push((mtime, name));
-    }
-    cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    cands.into_iter().next().map(|(_, n)| n)
+    newest_owned(&hypr, uid, |name, md, path| {
+        (md.is_dir() && path.join(".socket.sock").exists()).then(|| name.to_string())
+    })
+}
+
+/// What `accept` makes of the newest entry of `dir` owned by `uid` that it takes. `accept` sees
+/// the entry's name, metadata and path. Equal mtimes keep `read_dir` order.
+#[cfg(target_os = "linux")]
+fn newest_owned(
+    dir: &std::path::Path,
+    uid: u32,
+    accept: impl Fn(&str, &std::fs::Metadata, &std::path::Path) -> Option<String>,
+) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let md = e.metadata().ok().filter(|md| md.uid() == uid)?;
+            let answer = accept(&e.file_name().to_string_lossy(), &md, &e.path())?;
+            Some((md.modified().unwrap_or(std::time::UNIX_EPOCH), answer))
+        })
+        .min_by_key(|(mtime, _)| std::cmp::Reverse(*mtime))
+        .map(|(_, answer)| answer)
 }
 
 /// sway and scroll name their IPC socket `<stem>.<uid>.<pid>.sock`.
@@ -391,7 +399,6 @@ const SWAY_IPC_STEMS: [&str; 2] = ["sway-ipc", "scroll-ipc"];
 /// backend talks through `swaymsg`.
 #[cfg(target_os = "linux")]
 fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
     if let Some(s) = &env.swaysock {
         if std::path::Path::new(s).exists() {
             return Some(s.clone());
@@ -406,21 +413,10 @@ fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -
         }
     }
     let prefixes = SWAY_IPC_STEMS.map(|stem| format!("{stem}.{uid}."));
-    let mut cands: Vec<(std::time::SystemTime, String)> = Vec::new();
-    for e in std::fs::read_dir(runtime).ok()?.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if !prefixes.iter().any(|p| name.starts_with(p)) || !name.ends_with(".sock") {
-            continue;
-        }
-        let Ok(md) = e.metadata() else { continue };
-        if md.uid() != uid {
-            continue;
-        }
-        let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
-        cands.push((mtime, e.path().to_string_lossy().into_owned()));
-    }
-    cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    cands.into_iter().next().map(|(_, p)| p)
+    newest_owned(std::path::Path::new(runtime), uid, |name, _, path| {
+        (prefixes.iter().any(|p| name.starts_with(p)) && name.ends_with(".sock"))
+            .then(|| path.to_string_lossy().into_owned())
+    })
 }
 
 /// `HYPRLAND_INSTANCE_SIGNATURE` for a `hyprctl` child, resolved at spawn.
@@ -512,7 +508,6 @@ pub fn detect_active_session() -> ActiveSession {
 /// else newest-mtime owned socket (skip `.lock`).
 #[cfg(target_os = "linux")]
 fn find_wayland_socket(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
     if let Some(w) = env.wayland_display.clone() {
         {
             let p = if w.starts_with('/') {
@@ -525,21 +520,9 @@ fn find_wayland_socket(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String
             }
         }
     }
-    let mut cands: Vec<(std::time::SystemTime, String)> = Vec::new();
-    for e in std::fs::read_dir(runtime).ok()?.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("wayland-") || name.ends_with(".lock") {
-            continue;
-        }
-        let Ok(md) = e.metadata() else { continue };
-        if md.uid() != uid {
-            continue;
-        }
-        let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
-        cands.push((mtime, name));
-    }
-    cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    cands.into_iter().next().map(|(_, n)| n)
+    newest_owned(std::path::Path::new(runtime), uid, |name, _, _| {
+        (name.starts_with("wayland-") && !name.ends_with(".lock")).then(|| name.to_string())
+    })
 }
 
 /// Write the live session into the process env so backends that can only read
