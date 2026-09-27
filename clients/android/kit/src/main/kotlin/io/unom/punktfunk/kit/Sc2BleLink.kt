@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
@@ -24,10 +25,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * GATT operations are serialized by a small state machine (connect → MTU → discover → subscribe
  * each notify char → lizard-off → ready); duplicate callbacks (the Android stack sometimes fires
- * `onMtuChanged` twice) are ignored. Every framing rule lives device-free in [Sc2Device], where
- * tests reach it: the `0x45` re-prepend on the way up, and on the way down the per-report
- * characteristic each output id is routed to and the feature characteristic every command goes
- * to, id byte stripped in both directions.
+ * `onMtuChanged` twice) are ignored. Once ready, every write waits its turn in [writes]: Android
+ * takes one GATT operation per connection, unacked writes included, until its write callback, and
+ * a write refused while another is in flight is lost. Every framing rule lives device-free in
+ * [Sc2Device], where tests reach it: the `0x45` re-prepend on the way up, and on the way down
+ * the per-report characteristic each output id is routed to and the feature characteristic
+ * every command goes to, id byte stripped in both directions.
  *
  * The link re-acquires by itself — `autoConnect` leaves the request with the stack, so a pad that
  * powers off mid-session reconnects on its own and [onClosed] only means "release the slot".
@@ -48,7 +51,22 @@ class Sc2BleLink(
     private var gatt: BluetoothGatt? = null
     private val pendingSubs = mutableListOf<BluetoothGattCharacteristic>()
     private var subsIndex = 0
-    private val writeBusy = AtomicBoolean(false)
+
+    /** One characteristic write: where it goes, what it carries, and whether it wants the ack. */
+    private class GattWrite(
+        val ch: BluetoothGattCharacteristic,
+        val payload: ByteArray,
+        val acked: Boolean,
+    )
+
+    /** Writes waiting for the link. Rumble supersedes rumble; the rest are never dropped. */
+    private val writes = OutReportQueue<GattWrite>()
+
+    /** A write is with the stack; its callback clears this and sends the next. */
+    private val inFlight = AtomicBoolean(false)
+
+    /** A write the stack refused as busy: it goes before the queue. Touched only under [inFlight]. */
+    @Volatile private var held: GattWrite? = null
     private var lizardTicker: Thread? = null
 
     /** Output ids this firmware has no characteristic for — one line each, not one per resend. */
@@ -99,6 +117,8 @@ class Sc2BleLink(
         state = State.CONNECTING
         // autoConnect: the stack keeps the request and connects whenever the pad appears, so a
         // controller that is bonded but asleep costs nothing instead of failing a 30 s attempt.
+        // Deprecated at 37 for a flag-gated overload this one forwards to; below 37 it is the API.
+        @Suppress("DEPRECATION")
         gatt = device.connectGatt(context, true, callback, BluetoothDevice.TRANSPORT_LE)
         return true
     }
@@ -111,43 +131,76 @@ class Sc2BleLink(
      */
     fun writeRaw(kind: Int, data: ByteArray) {
         if (state != State.READY) return
-        val g = gatt ?: return
         if (kind == 0) {
             val out = Sc2Device.outputWrite(data) ?: return
             val ch = chars[out.charUuid]
                 ?: return noteUnmapped(data[0].toInt() and 0xFF, out.charUuid)
-            write(g, ch, out.payload, acked = false)
+            write(ch, out.payload, acked = false, Sc2Device.outputCoalesceKey(data))
         } else {
             val payload = Sc2Device.featurePayload(data) ?: return
-            write(g, featureChar ?: return, payload, acked = true)
+            write(featureChar ?: return, payload, acked = true, OutReportQueue.NO_COALESCE)
         }
     }
 
     /**
-     * One GATT write, honouring what the characteristic offers. Output prefers unacked (the 25 Hz
-     * rumble resend must not queue behind acks), feature prefers acked. An acked write holds
-     * [writeBusy]: the stack rejects a second one while the first is in flight.
+     * Queue one GATT write, honouring what the characteristic offers — output prefers unacked,
+     * feature prefers acked — and send it when the link is free.
      */
-    private fun write(
-        g: BluetoothGatt,
-        ch: BluetoothGattCharacteristic,
-        payload: ByteArray,
-        acked: Boolean,
-    ) {
+    private fun write(ch: BluetoothGattCharacteristic, payload: ByteArray, acked: Boolean, key: Int) {
         val canAck = ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
         val canFire = ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
-        val useAck = if (acked) canAck else !canFire
-        if (useAck && !writeBusy.compareAndSet(false, true)) return
-        val ok = runCatching {
-            ch.value = payload
-            ch.writeType = if (useAck) {
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            } else {
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        writes.offer(GattWrite(ch, payload, if (acked) canAck else !canFire), key)
+        pump()
+    }
+
+    /** Send the next write unless one is with the stack. Any thread; the write callback too. */
+    private fun pump() {
+        while (state == State.READY) {
+            val g = gatt ?: return
+            if (!inFlight.compareAndSet(false, true)) return
+            val w = held?.also { held = null } ?: writes.poll()
+            if (w == null) {
+                inFlight.set(false)
+                if (writes.size == 0) return // else an offer raced the empty poll: go again
+                continue
             }
-            g.writeCharacteristic(ch)
-        }.getOrDefault(false)
-        if (useAck && !ok) writeBusy.set(false)
+            when (send(g, w)) {
+                Sent.OK -> return // the write callback frees the link
+                Sent.BUSY -> {
+                    held = w
+                    inFlight.set(false)
+                    return // whatever holds the link calls back, and that pumps again
+                }
+                Sent.FAILED -> inFlight.set(false) // this one is lost; try the next
+            }
+        }
+    }
+
+    private enum class Sent { OK, BUSY, FAILED }
+
+    private fun send(g: BluetoothGatt, w: GattWrite): Sent {
+        val type = if (w.acked) {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        }
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= 33) {
+                when (g.writeCharacteristic(w.ch, w.payload, type)) {
+                    BluetoothStatusCodes.SUCCESS -> Sent.OK
+                    BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY -> Sent.BUSY
+                    else -> Sent.FAILED
+                }
+            } else {
+                // Before 33 the payload rides the shared characteristic object, and `false` does
+                // not say why — this queue is the only writer, so it is not "busy".
+                @Suppress("DEPRECATION")
+                w.ch.value = w.payload
+                w.ch.writeType = type
+                @Suppress("DEPRECATION")
+                if (g.writeCharacteristic(w.ch)) Sent.OK else Sent.FAILED
+            }
+        }.getOrDefault(Sent.FAILED)
     }
 
     /**
@@ -168,17 +221,17 @@ class Sc2BleLink(
      *  the feature characteristic. Off feeds the firmware watchdog; on hands the pad back. */
     private fun sendLizard(frame: ByteArray) {
         if (state != State.READY) return
-        val g = gatt ?: return
         val ch = featureChar ?: return
         val payload = Sc2Device.featurePayload(frame) ?: return
-        write(g, ch, payload, acked = true)
+        // One key for both settings: the newest supersedes a pending one.
+        write(ch, payload, acked = true, KEY_LIZARD)
     }
 
-    /** Wait out the acked write in flight, at most 30 × 5 ms — a GATT write is asynchronous and
-     *  a disconnect drops one still queued. Returns early the moment the ack lands. */
+    /** Wait until every queued write went out, at most 30 × 5 ms — a GATT write is asynchronous
+     *  and a disconnect drops one still queued. Returns early the moment the link is idle. */
     private fun awaitWriteIdle() {
         repeat(30) {
-            if (!writeBusy.get()) return
+            if (!inFlight.get() && held == null && writes.size == 0) return
             runCatching { Thread.sleep(5) }
         }
     }
@@ -213,7 +266,9 @@ class Sc2BleLink(
         featureChar = null
         pendingSubs.clear()
         subsIndex = 0
-        writeBusy.set(false) // an ack that can never land now would wedge every later write
+        writes.clear()
+        held = null
+        inFlight.set(false) // a callback that can never land now would wedge every later write
     }
 
     private val callback = object : BluetoothGattCallback() {
@@ -281,10 +336,20 @@ class Sc2BleLink(
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
-            writeBusy.set(false)
+            inFlight.set(false)
+            pump()
         }
 
+        override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
+            val framed = Sc2Device.frameIncoming(value)
+            onReport(framed, framed.size)
+        }
+
+        /** Below 33 only; from 33 the stack calls both, and the overload above has the value. */
+        @Deprecated("Replaced at API 33 by the overload that carries the value")
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+            if (Build.VERSION.SDK_INT >= 33) return
+            @Suppress("DEPRECATION")
             val data = ch.value ?: return
             val framed = Sc2Device.frameIncoming(data)
             onReport(framed, framed.size)
@@ -313,8 +378,16 @@ class Sc2BleLink(
         val ch = pendingSubs[subsIndex++]
         g.setCharacteristicNotification(ch, true)
         val cccd = ch.getDescriptor(CCCD) ?: return subscribeNext(g)
-        cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-        if (!g.writeDescriptor(cccd)) subscribeNext(g) // lose this one, try the rest
+        val on = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        val sent = if (Build.VERSION.SDK_INT >= 33) {
+            g.writeDescriptor(cccd, on) == BluetoothStatusCodes.SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            cccd.value = on
+            @Suppress("DEPRECATION")
+            g.writeDescriptor(cccd)
+        }
+        if (!sent) subscribeNext(g) // lose this one, try the rest
     }
 
     /** The 32-bit short id of a Valve vendor UUID, or null for foreign UUIDs. */
@@ -338,6 +411,9 @@ class Sc2BleLink(
 
         /** Enough for a state payload (45 B) + ATT header with margin. */
         private const val DESIRED_MTU = 100
+
+        /** [writes] key for the lizard-mode setting (rumble is [OutReportQueue.KEY_RUMBLE]). */
+        private const val KEY_LIZARD = 2
 
         /**
          * The runtime permission this transport needs, or null where the platform grants Bluetooth

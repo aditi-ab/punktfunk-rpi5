@@ -16,6 +16,7 @@ export function fmtTimestamp(unixMs: number): string {
 export function kindLabel(kind: string): string {
 	if (kind === "gamestream") return m.stats_kind_gamestream();
 	if (kind === "native") return m.stats_kind_native();
+	if (kind === "web") return m.stats_kind_web();
 	return kind;
 }
 

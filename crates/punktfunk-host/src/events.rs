@@ -39,12 +39,27 @@ pub struct HostEvent {
     pub kind: EventKind,
 }
 
-/// Origin plane. Both planes must emit; filtering is the consumer's job.
+/// Origin plane. Every plane must emit; filtering is the consumer's job.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Plane {
+    /// `punktfunk/1` over quinn.
     Native,
+    /// The Moonlight-compatible plane.
     Gamestream,
+    /// `punktfunk/1` from a browser, over WebTransport.
+    Web,
+}
+
+impl Plane {
+    /// The wire spelling, for the places that store it as text.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Plane::Native => "native",
+            Plane::Gamestream => "gamestream",
+            Plane::Web => "web",
+        }
+    }
 }
 
 /// `Quit` is the typed close; `Timeout` is transport idle; `Error` is everything else.
@@ -315,6 +330,7 @@ pub struct DeviceRef {
     /// Pairing-store copy, already sanitized.
     pub name: String,
     pub fingerprint: String,
+    /// The store the device is paired in. Browsers pair into the native store, so `native`.
     pub plane: Plane,
 }
 
@@ -1240,6 +1256,14 @@ mod tests {
                 assert_eq!(device.plane, Plane::Native);
             }
             other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    /// Stats recordings store the plane as text, and must spell it as the events do.
+    #[test]
+    fn plane_text_matches_the_wire() {
+        for plane in [Plane::Native, Plane::Gamestream, Plane::Web] {
+            assert_eq!(serde_json::to_value(plane).unwrap(), plane.as_str());
         }
     }
 }

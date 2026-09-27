@@ -118,6 +118,29 @@ class HostDiscovery private constructor(context: Context) {
     /** How many subscribers hold the browse up. Zero means no daemon and no multicast lock. */
     val listenerCount: Int get() = listeners.size
 
+    /** Started activities, counted by [onAppStart]/[onAppStop]. At zero the browse sleeps. */
+    private var visible = 0
+
+    /** Whether any activity is on screen: probing for a UI nobody sees is battery for nothing. */
+    val appVisible: Boolean get() = visible > 0
+
+    /** An activity started: a browse the app's last stop put to sleep wakes for its subscribers. */
+    fun onAppStart() {
+        if (visible++ == 0 && listeners.isNotEmpty()) start()
+    }
+
+    /**
+     * An activity stopped. The last one out ends the browse and its Wi-Fi locks at once;
+     * subscribers stay subscribed and get fresh hosts after [onAppStart].
+     */
+    fun onAppStop() {
+        visible = (visible - 1).coerceAtLeast(0)
+        if (visible == 0) {
+            handler.removeCallbacks(quiesce)
+            stop()
+        }
+    }
+
     private val handler = Handler(Looper.getMainLooper())
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wifiLocks: List<WifiManager.WifiLock> = emptyList()
@@ -190,7 +213,8 @@ class HostDiscovery private constructor(context: Context) {
         if (listeners.any { it === listener }) return
         handler.removeCallbacks(quiesce)
         listeners += listener
-        if (listeners.size == 1) start() // a no-op while the browse is still lingering
+        // A no-op while the browse is still lingering; away, [onAppStart] starts it.
+        if (listeners.size == 1 && appVisible) start()
         if (last.isNotEmpty()) listener(last)
     }
 
@@ -293,11 +317,12 @@ class HostDiscovery private constructor(context: Context) {
      *
      * The shown host set is left alone across the swap; the first poll of the new browse
      * publishes the fresh one. A browse nobody holds up is not rebuilt: a grant that lands
-     * mid-stream must not put a daemon beside the session, with nothing left to stop it.
+     * mid-stream must not put a daemon beside the session, with nothing left to stop it. Nor is
+     * one rebuilt while the app is away: [onAppStart] builds it on the way back.
      */
     fun restart() {
         stop()
-        if (listeners.isNotEmpty()) start()
+        if (listeners.isNotEmpty() && appVisible) start()
     }
 
     private fun stop() {

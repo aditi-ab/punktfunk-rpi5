@@ -517,11 +517,9 @@ impl ServiceState {
     fn handle(&mut self, cmd: ConsoleCmd) {
         match cmd {
             ConsoleCmd::FetchLibrary { addr, mgmt, fp_hex } => {
-                // Opening a library is the earliest honest signal that somebody intends to
-                // play, so the box gets woken HERE rather than at connect time — by which
-                // point they have chosen a title and are sitting through a cold boot. Resolved
-                // the same way `Wake` does, and empty for a host with no MAC on record, which
-                // simply means the fetch asks once instead of retrying across a boot window.
+                // Opening a library is the earliest signal that somebody intends to play, so
+                // the box is woken HERE, not at connect time. Empty with auto-wake off or no
+                // MAC on record: the fetch then asks once instead of retrying across a boot.
                 let known = trust::KnownHosts::load();
                 let macs = known
                     .find_by_fp(&fp_hex)
@@ -531,6 +529,7 @@ impl ServiceState {
                             .iter()
                             .find(|h| h.fp_hex.is_empty() && h.addr == addr)
                     })
+                    .filter(|_| trust::Settings::load().auto_wake)
                     .map(|h| h.mac.clone())
                     .unwrap_or_default();
                 spawn_fetch(
@@ -1294,7 +1293,7 @@ const WAKE_RESEND_EVERY: u32 = 2;
 /// 1. the CACHED catalog goes up immediately, marked stale — a library is the screen a player
 ///    uses to decide what to play, and an empty one while a sleeping box boots is the opposite
 ///    of useful;
-/// 2. a magic packet goes out, so the box warms while they are still choosing;
+/// 2. given `macs` (auto-wake on), a magic packet goes out so the box warms while they choose;
 /// 3. only then does the live fetch start, retrying across the boot window.
 ///
 /// A cached catalog also outranks a failure: if the host never answers, the titles on screen are
@@ -1336,13 +1335,15 @@ fn spawn_fetch(
                     cached_games = Some(cached.games);
                 }
             }
-            // Fire-and-forget, and deliberately unconditional rather than only when the host
-            // looks offline: a magic packet is one datagram that an already-awake machine
-            // ignores, so finding out whether it is needed costs more than sending it.
+            // Fire-and-forget whenever `macs` is given (auto-wake on), online or not: a magic
+            // packet is one datagram an awake machine ignores, cheaper than checking first.
             let waking = !macs.is_empty();
             let last_ip = addr.parse::<Ipv4Addr>().ok();
             if waking {
                 wol::wake(&macs, last_ip);
+                if mine() {
+                    shared.set_stale(pf_console_ui::Stale::Waking);
+                }
             }
 
             let attempts = if waking { WAKE_ATTEMPTS } else { 1 };

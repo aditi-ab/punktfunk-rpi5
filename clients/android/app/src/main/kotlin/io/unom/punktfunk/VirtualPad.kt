@@ -91,8 +91,13 @@ import kotlin.math.roundToInt
  * its Remove on close — exactly a real controller's lifetime.
  */
 
-/** Where the pad's events go: a router `ExternalPad` in-stream, nothing in a preview. */
-class PadSink(val button: (bit: Int, down: Boolean) -> Unit, val axis: (axis: Int, value: Int) -> Unit)
+/** Where the pad's events go: a router `ExternalPad` in-stream, nothing in a preview. [ring]
+ *  opens the quick-action ring. */
+class PadSink(
+    val button: (bit: Int, down: Boolean) -> Unit,
+    val axis: (axis: Int, value: Int) -> Unit,
+    val ring: () -> Unit = {},
+)
 
 const val PAD_SCALE_MIN = 0.6f
 const val PAD_SCALE_MAX = 1.6f
@@ -130,12 +135,16 @@ internal sealed class PadControl(val id: String, val label: String, val rect: Pa
     class Trigger(id: String, label: String, rect: PadRect, val axis: Int, sc: Float = 1f, hidden: Boolean = false) :
         PadControl(id, label, rect, sc, hidden)
 
+    /** A tap opens the quick-action ring; nothing goes on the wire. */
+    class Ring(rect: PadRect, sc: Float = 1f, hidden: Boolean = false) : PadControl("ring", "Quick actions", rect, sc, hidden)
+
     /** The same control at [rect], sized by [sc], possibly [hidden] — how a tweak is applied. */
     fun tweaked(rect: PadRect, sc: Float, hidden: Boolean): PadControl = when (this) {
         is Buttons -> Buttons(id, label, rect, discs.map { it.copy(cx = it.cx * sc, cy = it.cy * sc, r = it.r * sc) }, sc, hidden)
         is Dpad -> Dpad(rect, sc, hidden)
         is Stick -> Stick(id, label, rect, axisX, axisY, sc, hidden)
         is Trigger -> Trigger(id, label, rect, axis, sc, hidden)
+        is Ring -> Ring(rect, sc, hidden)
     }
 }
 
@@ -167,10 +176,10 @@ private fun disc(id: String, label: String, glyph: String, bit: Int, cx: Float, 
  * The preset's controls for a layer [w] × [h] dp (the container divided by the scale). Positions
  * are fixed per preset (§4.3): sticks in the bottom corners, the D-pad beside the left stick, the
  * face buttons in the bottom-right corner with the right stick beside them, the shoulders in the
- * top corners with the stick clicks beside them, Select, Guide and Start along the bottom edge. A
- * narrow layer lifts the D-pad and the right stick above their neighbours; the middle three keep
- * the bottom edge only while the clusters leave it free, and take the top edge when they do not.
- * An unknown preset is `full`.
+ * top corners with the stick clicks beside them, Select, Guide and Start along the bottom edge, and
+ * the quick-action ring's button inboard of the left bumper. A narrow layer lifts the D-pad and the
+ * right stick above their neighbours; the middle three keep the bottom edge only while the clusters
+ * leave it free, and take the top edge when they do not. An unknown preset is `full`.
  */
 internal fun padControls(layout: String, w: Float, h: Float): List<PadControl> {
     val narrow = w < NARROW
@@ -231,6 +240,7 @@ internal fun padControls(layout: String, w: Float, h: Float): List<PadControl> {
     }
     val low = middle(bottom - SMALL_R)
     out += if (low.none { m -> out.any { it.rect.overlaps(m.rect) } }) low else middle(MARGIN + SMALL_R)
+    out += PadControl.Ring(PadRect(MARGIN + 2 * BUMPER_R + 8, MARGIN + BUMPER_R - SMALL_R, 2 * SMALL_R, 2 * SMALL_R))
     return out
 }
 
@@ -343,6 +353,7 @@ private fun PadControlView(
             is PadControl.Dpad -> DpadTouch(ctl, px, sink, haptics)
             is PadControl.Stick -> StickTouch(ctl, px, sink)
             is PadControl.Trigger -> TriggerTouch(ctl, px, sink, haptics)
+            is PadControl.Ring -> RingTouch(ctl, px, sink, haptics)
         }
     }
     val r = ctl.rect
@@ -405,6 +416,7 @@ private fun PadControlView(
             is DpadTouch -> Cross(st)
             is StickTouch -> StickFace(st, scale)
             is TriggerTouch -> Pill(st, scale)
+            is RingTouch -> RingFace(st, scale)
         }
     }
 }
@@ -531,6 +543,30 @@ private class TriggerTouch(val c: PadControl.Trigger, px: Float, private val sin
     }
 }
 
+/** The first finger owns it; lifting inside the button opens the ring. */
+private class RingTouch(val c: PadControl.Ring, px: Float, private val sink: PadSink, private val haptics: ConsoleHaptics) :
+    PadTouch() {
+    private var owner: PointerId? = null
+    private var inside = false
+    private val w = c.rect.w * px
+    private val h = c.rect.h * px
+
+    override fun down(id: PointerId, p: Offset) {
+        if (owner != null) return
+        owner = id
+        inside = true
+        active = true
+        haptics.tick()
+    }
+    override fun move(id: PointerId, p: Offset) { if (id == owner) inside = p.x in 0f..w && p.y in 0f..h }
+    override fun up(id: PointerId) {
+        if (id != owner) return
+        reset()
+        if (inside) sink.ring()
+    }
+    override fun reset() { owner = null; active = false }
+}
+
 // ---- how each kind draws ----
 
 @Composable
@@ -613,6 +649,20 @@ private fun BoxScope.Pill(st: TriggerTouch, scale: Float) {
             fontSize = (15f * scale * st.c.sc).sp,
             fontWeight = FontWeight.Bold,
         )
+    }
+}
+
+@Composable
+private fun BoxScope.RingFace(st: RingTouch, scale: Float) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .clip(CircleShape)
+            .background(if (st.active) FILL_ON else FILL)
+            .border(1.5.dp, EDGE, CircleShape),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text("•••", color = Color.White, fontSize = (st.c.rect.w * 0.3f * scale).sp, fontWeight = FontWeight.Bold)
     }
 }
 

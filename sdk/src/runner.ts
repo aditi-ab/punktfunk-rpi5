@@ -515,8 +515,15 @@ export const inProcessConnect = (
 /**
  * Write this plugin's own token under its state dir for the sandbox's read-only bind. A missing
  * token and an unwritable state dir are different faults and say so.
+ *
+ * The plugin writes that dir, so the old file is unlinked and a new one created exclusively: a
+ * link it left there is removed, never followed to another plugin's files.
  */
-const writePluginToken = (config: string, stateDir: string, id: string): string | Error => {
+export const writePluginToken = (
+	config: string,
+	stateDir: string,
+	id: string,
+): string | Error => {
 	const token = pluginToken(config, id);
 	if (token === undefined)
 		return new Error(
@@ -525,7 +532,8 @@ const writePluginToken = (config: string, stateDir: string, id: string): string 
 	const file = path.join(stateDir, ".plugin-token");
 	try {
 		fs.mkdirSync(stateDir, { recursive: true });
-		fs.writeFileSync(file, `PUNKTFUNK_PLUGIN_TOKEN=${token}\n`, { mode: 0o600 });
+		fs.rmSync(file, { force: true });
+		fs.writeFileSync(file, `PUNKTFUNK_PLUGIN_TOKEN=${token}\n`, { mode: 0o600, flag: "wx" });
 		return file;
 	} catch (e) {
 		return new Error(`Couldn't write the credential for ${id} into ${stateDir} — ${e}`);

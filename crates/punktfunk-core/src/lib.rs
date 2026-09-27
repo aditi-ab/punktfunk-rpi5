@@ -57,6 +57,9 @@ pub mod reject;
 pub mod render_scale;
 /// cbindgen:ignore
 pub mod resolutions;
+/// The rumble policy every client runs. Outside `client` because the browser, which has no
+/// quinn, runs it too.
+pub mod rumble;
 pub mod session;
 pub mod stats;
 #[cfg(feature = "tls")]
@@ -85,7 +88,7 @@ pub use stats::Stats;
 /// Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 /// Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
 /// in `CHANGELOG.md`.
-pub const ABI_VERSION: u32 = 38;
+pub const ABI_VERSION: u32 = 39;
 
 /// punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 ///

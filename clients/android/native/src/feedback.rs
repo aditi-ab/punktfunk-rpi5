@@ -12,12 +12,20 @@ use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteBuffer, JObject};
 use jni::sys::{jint, jlong};
 use jni::EnvUnowned;
+use punktfunk_core::error::PunktfunkError;
 use punktfunk_core::quic::HidOutput;
 use std::time::Duration;
 
 /// Short blocking timeout: long enough not to busy-spin, short enough that the Kotlin poll thread
 /// observes its `running=false` flag promptly on teardown.
 const PULL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// A pull with no session (or a closed one) still blocks for [`PULL_TIMEOUT`]: both answers are
+/// instant, and the Kotlin loop spins until `stop()`.
+fn idle_pull<T>(sentinel: T) -> T {
+    std::thread::sleep(PULL_TIMEOUT);
+    sentinel
+}
 
 /// Width of the packed `pad` field in [`pack_rumble`] — 4 bits, i.e. indices 0..15.
 const PAD_BITS: u32 = 4;
@@ -71,7 +79,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
     // Runs on a Kotlin poll thread, so a panic here would abort the process; guard the boundary.
     jni_guard(-1, || {
         let Some(h) = get_session(handle) else {
-            return -1;
+            return idle_pull(-1);
         };
         match h.client.next_rumble_command(PULL_TIMEOUT) {
             // A pad whose coils are ACTIVELY being driven by the 0xD1 haptics stream must not see
@@ -83,7 +91,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
             // Dropping it here rather than in Kotlin keeps the rule next to the reason.
             Ok(cmd) if crate::pad_audio::haptics_owns_coils((cmd.pad & 0xF) as u8) => -1,
             Ok(cmd) => pack_rumble(cmd.pad, cmd.low, cmd.high, cmd.backstop_ms),
-            Err(_) => -1, // NoFrame (timeout) or Closed — Kotlin loops on its running flag
+            Err(PunktfunkError::Closed) => idle_pull(-1),
+            Err(_) => -1, // timeout — Kotlin loops on its running flag
         }
     })
 }
@@ -115,11 +124,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
     jni_guard(-1, || {
         env.with_env_no_catch(|env| -> jni::errors::Result<jint> {
             let Some(h) = get_session(handle) else {
-                return Ok(-1);
+                return Ok(idle_pull(-1));
             };
             let ev = match h.client.next_hidout(PULL_TIMEOUT) {
                 Ok(ev) => ev,
-                Err(_) => return Ok(-1), // timeout or closed — Kotlin loops
+                Err(PunktfunkError::Closed) => return Ok(idle_pull(-1)),
+                Err(_) => return Ok(-1), // timeout — Kotlin loops
             };
             // `[pad][tag][head…][tail…]` — the two slices spare a concat per event.
             let (pad, tag, head, tail): (u8, u8, &[u8], &[u8]) = match &ev {

@@ -375,19 +375,16 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background:
-                guard model.phase == .streaming else { break }
-                if backgroundKeepAlive {
-                    model.enterBackground(timeoutMinutes: backgroundTimeoutMinutes)
-                } else {
-                    // Not deliberate: the user may come straight back, so let the host linger the
-                    // display for a fast reconnect instead of tearing it down.
-                    model.disconnect(deliberate: false)
-                }
+                applyBackgroundPolicy()
             case .active:
                 model.exitBackground()
             default:
                 break
             }
+        }
+        // A dial in flight when the user swiped home can land before suspension: same rule.
+        .onChange(of: model.phase) { _, phase in
+            if phase == .streaming, scenePhase == .background { applyBackgroundPolicy() }
         }
         #endif
         #if os(iOS)
@@ -447,6 +444,7 @@ struct ContentView: View {
                 showTouchExit = true // the off-tier exit disc's 8 s window, per session start
                 #endif
                 ring.close()
+                ring.native = nil // this session's Welcome mode, captured at its first open
                 // Host-action slots are pre-fetched here, never when the ring opens (§3.1).
                 if let host = model.activeHost { HostPowerStore.shared.refresh(host) }
                 // `Select+A` on a pad opens the ring in the middle of the stage; while it is up
@@ -494,7 +492,10 @@ struct ContentView: View {
                 break
             }
         }
-        .onDisappear { model.disconnect() } // window closed mid-session (Cmd+N spawns more)
+        .onDisappear { // window closed mid-session or mid-wake (Cmd+N spawns more)
+            waker.cancel() // its onOnline would dial for a window that is gone
+            model.disconnect()
+        }
         // Expose the session to the Scene-level Stream menu (Disconnect ⌃⌥⇧D works even when
         // the HUD is hidden). tvOS has no such menu.
         #if !os(tvOS)
@@ -719,6 +720,20 @@ struct ContentView: View {
     /// live session (same host → focus, different host → say so; NEVER tear one down on a
     /// background tap), and carries only references — a preset it can't honor refuses with a
     /// notice rather than streaming with the wrong settings.
+    #if os(iOS) || os(tvOS)
+    /// Hold a streaming session under the opt-in keep-alive, or end it.
+    private func applyBackgroundPolicy() {
+        guard model.phase == .streaming else { return }
+        if backgroundKeepAlive {
+            model.enterBackground(timeoutMinutes: backgroundTimeoutMinutes)
+        } else {
+            // Not deliberate: the user may come straight back, so let the host linger the
+            // display for a fast reconnect instead of tearing it down.
+            model.disconnect(deliberate: false)
+        }
+    }
+    #endif
+
     private func handleDeepLink(_ url: URL) {
         // Explicit intent beats the start-screen policy, and the two race on a cold start:
         // `.onOpenURL` and `.onAppear` have no guaranteed order. Claiming the once-per-process
@@ -1183,21 +1198,12 @@ struct ContentView: View {
                     .animation(.easeOut(duration: 0.2), value: model.sc2CapturedHint)
                 }
                 #if os(iOS)
-                // Touch users have no menu / ⌘D, so when the HUD's Disconnect button isn't on
-                // screen — the overlay off, or the compact pill (which carries no button) —
-                // keep a minimal touch exit in a corner. It rides a material disc (like the
-                // HUD) so the glyph stays legible over a bright frame.
-                //
-                // In the OFF tier the disc shows for the first 8 s of a session, then leaves
-                // the hierarchy ENTIRELY (the shortcut-banner pattern): any composited overlay
-                // above the stream — a glass one doubly so, its blur SAMPLES the video layer —
-                // forces the CAMetalLayer through the compositor, costing ~a refresh of display
-                // latency and blocking direct-to-display promotion. Off is the immersive/
-                // measurement tier; after the fade, touch-only exits are backgrounding the app
-                // or re-enabling the stats overlay. Compact keeps its disc permanently — that
-                // tier composites a HUD pill anyway, so hiding the exit there wins nothing.
+                // Touch has no menu or ⌘D: while the HUD shows no Disconnect (compact, off) a
+                // corner disc opens the ring. Off drops it after 8 s, since any overlay above the
+                // stream costs ~a refresh of latency; compact composites a pill anyway. The
+                // virtual controller carries its own ring button, so the discs leave while it is up.
                 .overlay(alignment: .topLeading) {
-                    if captureEnabled,
+                    if captureEnabled, !model.virtualPadShown,
                        statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
                         HStack(spacing: 10) {
                             // Opens the quick-action ring (End stream is a slot inside, behind
@@ -1236,11 +1242,12 @@ struct ContentView: View {
                 .overlay {
                     if captureEnabled, model.virtualPadShown, let pad = model.virtualPad {
                         VirtualPadLayer(config: OverlayConfig.parse(model.settings.overlayActions).pad,
-                                        wire: pad)
+                                        wire: pad, openRing: { [ring] at in ring.openAt(at) })
                     }
                 }
-                // The quick-action ring: opened by the two-finger twist under the fingers, or by
-                // the disc above. Mounted only while open — a closed overlay costs nothing.
+                // The quick-action ring: opened by the two-finger twist under the fingers, the
+                // disc above, or the pad's ring button. Mounted only while open — a closed
+                // overlay costs nothing.
                 .overlay {
                     if captureEnabled, ring.visible {
                         RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn))

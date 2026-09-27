@@ -10,9 +10,8 @@
 //! request field reaches the privileged path. Power on accept: `202` → typed `HostPower`
 //! close of every session → ~1 s so the reply flushes → act. `display.next` ends nothing.
 
-use super::auth::AuthLane;
+use super::auth::{AuthLane, PairedDevice};
 use super::shared::*;
-use crate::gamestream::tls::PeerCertFingerprint;
 use crate::power::{Availability, PowerVerb};
 use crate::vdisplay::monitors::PhysicalMonitor;
 use axum::Extension;
@@ -227,9 +226,9 @@ fn unix_now() -> i64 {
 pub(crate) async fn list_actions(
     State(st): State<Arc<MgmtState>>,
     Extension(lane): Extension<AuthLane>,
-    fp: Option<Extension<PeerCertFingerprint>>,
+    device: Option<Extension<PairedDevice>>,
 ) -> Json<ActionList> {
-    let fp = fp.as_ref().and_then(|e| e.0 .0.as_deref());
+    let fp = device.as_ref().map(|e| e.0 .0.as_str());
     let power = power_permitted(&st, lane, fp);
     let display = display_permitted(lane, fp);
     // D-Bus and compositor round trips — off the async worker, all of them in one hop.
@@ -308,13 +307,13 @@ fn log_denial_once(fp: &str, action: &str, device: &str) {
 pub(crate) async fn invoke_action(
     State(st): State<Arc<MgmtState>>,
     Extension(lane): Extension<AuthLane>,
-    fp: Option<Extension<PeerCertFingerprint>>,
+    device: Option<Extension<PairedDevice>>,
     Path(id): Path<String>,
 ) -> Response {
     let Some(builtin) = BUILTINS.iter().find(|b| b.id == id) else {
         return api_error(StatusCode::NOT_FOUND, "unknown action id");
     };
-    let fp = fp.as_ref().and_then(|e| e.0 .0.as_deref());
+    let fp = device.as_ref().map(|e| e.0 .0.as_str());
     let device = fp.and_then(|fp| {
         st.native.as_ref().and_then(|n| {
             n.list()

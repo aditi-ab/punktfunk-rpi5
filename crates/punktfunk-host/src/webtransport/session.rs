@@ -18,7 +18,8 @@ use crate::native::link::{CtlRecv, CtlSend, SessionLink};
 use crate::native::{DataPlane, Served};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::io::{read_msg, write_msg};
-use punktfunk_core::quic::{auth_signed_message, AuthChallenge, AuthResponse, PairRequest};
+use punktfunk_core::quic::{auth_signed_message, AuthChallenge, AuthResponse, Hello, PairRequest};
+use punktfunk_core::reject::RejectReason;
 use rand::RngCore;
 use std::sync::Arc;
 use wtransport::Connection;
@@ -28,32 +29,93 @@ use wtransport::Connection;
 #[derive(Debug)]
 pub(crate) struct Refusal {
     pub(crate) code: u32,
-    pub(crate) what: &'static str,
+    pub(crate) what: String,
 }
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.what)
+        f.write_str(&self.what)
     }
 }
 
 impl std::error::Error for Refusal {}
 
-fn refused(code: u32, what: &'static str) -> anyhow::Error {
-    anyhow::Error::new(Refusal { code, what })
+fn refused(code: u32, what: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Refusal {
+        code,
+        what: what.into(),
+    })
+}
+
+fn rejected(reason: RejectReason) -> anyhow::Error {
+    refused(reason.close_code(), reason.to_string())
 }
 
 /// Admit the browser, then run the native session on its connection.
 ///
 /// The permit is the same pool the native plane draws from: a browser holds a session slot, not
 /// a browser slot. It is taken before the first read so a slow handshake never lets a host that
-/// is full accept a fifth encoder — which is why every pre-auth read is bounded: an idle peer
-/// must give the slot back.
+/// is full accept a fifth encoder — which is why every pre-auth read and write is bounded: an
+/// idle peer must give the slot back. An unpaired device gives it back while it waits for the
+/// console, past those bounds; the plane's keep-alive holds the path meanwhile.
 pub(crate) async fn run(
     conn: Connection,
     serving: Arc<Serving>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    sem: Arc<tokio::sync::Semaphore>,
 ) -> Result<Served> {
+    let Some(Admitted {
+        link,
+        tx,
+        rx,
+        first,
+        knock,
+    }) = admit_session(&conn, &serving).await?
+    else {
+        return Ok(Served::Session);
+    };
+    let permit = match knock {
+        None => permit,
+        Some(label) => {
+            let fp = link
+                .peer_fingerprint()
+                .context("a knock is keyed by its device")?;
+            let pairing = &serving.plane.pairing;
+            crate::native::park_knock(&link, pairing, &label, &hex::encode(fp), permit, &sem)
+                .await?
+                .map_err(rejected)?
+        }
+    };
+    crate::native::run_admitted(
+        link,
+        CtlSend::Web(tx),
+        CtlRecv::Web(rx),
+        first,
+        &serving.host,
+        DataPlane::Web(WebTransportPlane::new(conn)),
+        permit,
+    )
+    .await
+}
+
+/// A browser past admission: its link, and the control stream with the first message read.
+struct Admitted {
+    link: SessionLink,
+    tx: wtransport::SendStream,
+    rx: wtransport::RecvStream,
+    first: Vec<u8>,
+    /// The name it asks for access under, when the host does not admit this device yet.
+    knock: Option<String>,
+}
+
+/// The control stream, its first message, and the device behind it.
+///
+/// The link comes back keyed by the fingerprint the device signature proved, so the session's
+/// per-device decisions — mode cap, game re-adopt, its own stale session — see a browser as they
+/// see a native client. A device the host does not admit, never paired or expired, comes back as
+/// a knock. `None` once a `PairRequest` has run: pairing is its own connection, as on the native
+/// plane, so a browser reconnects to stream.
+async fn admit_session(conn: &Connection, serving: &Serving) -> Result<Option<Admitted>> {
     const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     let (mut tx, mut rx) = tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
         .await
@@ -64,22 +126,25 @@ pub(crate) async fn run(
         .context("first message: handshake timeout")?
         .context("read the first message")?;
 
-    // A `PairRequest` ends the session either way — pairing is its own connection, as on the
-    // native plane, so a browser reconnects to stream.
     if let Ok(req) = PairRequest::decode(&first) {
-        pair(&conn, tx, rx, req, &serving).await?;
-        return Ok(Served::Session);
+        pair(conn, tx, rx, req, serving).await?;
+        return Ok(None);
     }
 
     // Nothing is offered until the device answers. The nonce is fresh per connection, so a
     // captured response does not open a second one. Off (`serve --open`), the browser is as
     // anonymous as a native client would be, and the trust record enforces nothing.
-    let device_fp_hex = if serving.plane.require_pairing {
+    let (device_fp, knock) = if serving.plane.require_pairing {
         let mut nonce = [0u8; 32];
         rand::rng().fill_bytes(&mut nonce);
-        write_msg(&mut tx, &AuthChallenge { nonce }.encode())
-            .await
-            .context("write AuthChallenge")?;
+        // Bounded too: the write waits on the peer's stream credit while we hold the permit.
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            write_msg(&mut tx, &AuthChallenge { nonce }.encode()),
+        )
+        .await
+        .context("AuthChallenge: handshake timeout")?
+        .context("write AuthChallenge")?;
         let answer = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_msg(&mut rx))
             .await
             .context("AuthResponse: handshake timeout")?
@@ -90,49 +155,48 @@ pub(crate) async fn run(
                 "this host requires pairing — no device signature",
             )
         })?;
-        let (name, fp_hex) = admit(&auth, &nonce, &serving)?;
-        tracing::info!(device = %name, "browser authenticated");
-        Some(fp_hex)
+        let fp = verify(&auth, &nonce, serving)?;
+        let fp_hex = hex::encode(fp);
+        // `effective`, not `list`: an expired record knocks like an unpaired device, and
+        // re-approval is the re-grant.
+        let now = crate::native::wall_unix_now();
+        let knock = match serving.plane.pairing.effective(&fp_hex, now) {
+            Some(_) => {
+                tracing::info!(fingerprint = %fp_hex, "browser authenticated");
+                None
+            }
+            None => Some(knock_label(&first, &fp_hex)?),
+        };
+        (Some(fp), knock)
     } else {
-        None
+        (None, None)
     };
-
-    crate::native::run_admitted(
-        SessionLink::Web(conn.clone()),
-        CtlSend::Web(tx),
-        CtlRecv::Web(rx),
+    Ok(Some(Admitted {
+        link: SessionLink::Web(conn.clone(), device_fp),
+        tx,
+        rx,
         first,
-        device_fp_hex,
-        &serving.host,
-        DataPlane::Web(WebTransportPlane::new(conn)),
-        permit,
-    )
-    .await
+        knock,
+    }))
 }
 
-/// Is this device one the host paired with, and does it still hold the key?
+/// The console label for an unpaired browser, from its `Hello`. A client on another wire version
+/// is refused here, before anyone is asked to approve a session it could not run.
+fn knock_label(first: &[u8], fp_hex: &str) -> Result<String> {
+    let hello = Hello::decode(first).map_err(|e| anyhow::anyhow!("Hello decode: {e:?}"))?;
+    if hello.abi_version != punktfunk_core::WIRE_VERSION {
+        return Err(rejected(RejectReason::WireVersionMismatch));
+    }
+    let name = hello.name.as_deref().unwrap_or("");
+    Ok(crate::native_pairing::sanitize_device_name(name, fp_hex))
+}
+
+/// Does the device hold the key it names, signed over this nonce on this channel? Returns the
+/// fingerprint the session is keyed by.
 ///
-/// Both halves matter and neither is enough. A signature by an unpaired key proves possession of
-/// something the host never trusted; a fingerprint in the store with no signature is a public
-/// value anyone can replay. Returns the stored device name and the hex fingerprint the
-/// session's grants are keyed by.
-fn admit(auth: &AuthResponse, nonce: &[u8; 32], serving: &Serving) -> Result<(String, String)> {
-    let fp = sha256(&auth.device_key);
-    let hex: String = fp.iter().map(|b| format!("{b:02x}")).collect();
-    // `PAIR_DENIED`: the code a native client reads as "this host does not admit you"; a browser
-    // that was paired once takes it as the pairing being gone.
-    let paired = serving
-        .plane
-        .pairing
-        .list()
-        .into_iter()
-        .find(|c| c.fingerprint == hex)
-        .ok_or_else(|| {
-            refused(
-                punktfunk_core::reject::PAIR_DENIED_CLOSE_CODE,
-                "this device is not paired with the host",
-            )
-        })?;
+/// Checked before the pairing store is asked anything. A fingerprint is a public value anyone
+/// can replay, so an unproven one may neither stream nor knock under a paired device's name.
+fn verify(auth: &AuthResponse, nonce: &[u8; 32], serving: &Serving) -> Result<[u8; 32]> {
     let msg = auth_signed_message(&serving.cert_hash, nonce);
     aws_lc_rs::signature::UnparsedPublicKey::new(
         &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
@@ -140,7 +204,7 @@ fn admit(auth: &AuthResponse, nonce: &[u8; 32], serving: &Serving) -> Result<(St
     )
     .verify(&msg, &auth.signature)
     .map_err(|_| anyhow::anyhow!("the device signature does not verify"))?;
-    Ok((paired.name, hex))
+    Ok(sha256(&auth.device_key))
 }
 
 /// The 65-byte uncompressed point inside a P-256 SPKI.
@@ -224,7 +288,7 @@ async fn pair(
         }
     };
     crate::native::pair_ceremony(
-        &crate::native::link::SessionLink::Web(conn.clone()),
+        &crate::native::link::SessionLink::Web(conn.clone(), None),
         tx,
         rx,
         req,
@@ -299,47 +363,239 @@ mod tests {
         assert!(spki_p256_point(&trailing).is_none(), "over-long");
     }
 
-    /// The session credential: paired *and* holding the key, on *this* connection.
+    /// A signature proves the key only over *this* nonce on *this* connection, and yields that
+    /// key's own fingerprint: a second key cannot claim someone else's.
     #[test]
-    fn admission_needs_a_pairing_a_signature_and_this_channel() {
-        let np = store("admit");
-        let s = serving(np.clone());
+    fn a_device_proves_its_key_over_this_nonce_on_this_channel() {
+        let s = serving(store("verify"));
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let nonce = [0x77u8; 32];
         let auth = respond(&key, &s.cert_hash, &nonce);
-
-        // Unpaired: a perfect signature buys nothing.
-        assert!(admit(&auth, &nonce, &s).is_err(), "not paired yet");
-
-        let fp: String = sha256(&auth.device_key)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        np.add("Enrico's browser", &fp).unwrap();
-        let (name, admitted_fp) = admit(&auth, &nonce, &s).unwrap();
-        assert_eq!(name, "Enrico's browser");
         assert_eq!(
-            admitted_fp, fp,
+            verify(&auth, &nonce, &s).unwrap(),
+            sha256(&key.subject_public_key_info()),
             "the session is keyed by the device fingerprint"
         );
 
-        // Paired, but the signature must still be over this nonce on this channel.
-        assert!(admit(&auth, &[0x78; 32], &s).is_err(), "replayed nonce");
-        let mut elsewhere = serving(np.clone());
+        assert!(verify(&auth, &[0x78; 32], &s).is_err(), "replayed nonce");
+        let mut elsewhere = serving(store("verify-elsewhere"));
         elsewhere.cert_hash = [0x22; 32];
         assert!(
-            admit(&auth, &nonce, &elsewhere).is_err(),
+            verify(&auth, &nonce, &elsewhere).is_err(),
             "a response captured on one connection must not open another"
         );
 
-        // A different key that claims the paired fingerprint cannot: the fingerprint IS the key.
+        // Another key's signature proves that key, never this one's fingerprint.
         let other = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-        assert!(admit(&respond(&other, &s.cert_hash, &nonce), &nonce, &s).is_err());
+        let mut claimed = respond(&other, &s.cert_hash, &nonce);
+        claimed.device_key = auth.device_key.clone();
+        assert!(verify(&claimed, &nonce, &s).is_err());
 
-        // And the paired key with a mangled signature does not slip through.
         let mut bent = auth.clone();
         let last = bent.signature.len() - 1;
         bent.signature[last] ^= 0xff;
-        assert!(admit(&bent, &nonce, &s).is_err());
+        assert!(verify(&bent, &nonce, &s).is_err());
+    }
+
+    /// The `Hello` a browser opens a session with.
+    fn hello(name: &str, launch: Option<&str>) -> Hello {
+        use punktfunk_core::config::{CompositorPref, GamepadPref};
+        Hello {
+            abi_version: punktfunk_core::WIRE_VERSION,
+            mode: punktfunk_core::Mode {
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+            },
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            name: Some(name.into()),
+            launch: launch.map(Into::into),
+            video_caps: 0,
+            audio_channels: 2,
+            video_codecs: 0,
+            preferred_codec: 0,
+            display_hdr: None,
+            client_caps: 0,
+            max_shard_payload: 0,
+            audio_rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
+            audio_bits: punktfunk_core::audio::pcm::BITS_16,
+            audio_layout: 0,
+            video_fit: 0,
+        }
+    }
+
+    /// One browser dial over loopback WebTransport, up to admission. The browser's end is
+    /// returned too: dropping it would close the session under the test.
+    async fn admit_over_loopback(
+        s: &Serving,
+        key: &KeyPair,
+        first: &[u8],
+    ) -> (wtransport::Connection, Admitted) {
+        let identity = wtransport::Identity::self_signed(["localhost"]).unwrap();
+        let cert = identity.certificate_chain().as_slice()[0].hash();
+        let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = wtransport::Endpoint::server(
+            wtransport::ServerConfig::builder()
+                .with_bind_address(loopback)
+                .with_identity(identity)
+                .build(),
+        )
+        .unwrap();
+        let url = format!("https://127.0.0.1:{}/", server.local_addr().unwrap().port());
+        let browser = async {
+            let conn = wtransport::Endpoint::client(
+                wtransport::ClientConfig::builder()
+                    .with_bind_address(loopback)
+                    .with_server_certificate_hashes([cert])
+                    .build(),
+            )
+            .unwrap()
+            .connect(url)
+            .await
+            .unwrap();
+            let (mut tx, mut rx) = conn.open_bi().await.unwrap().await.unwrap();
+            write_msg(&mut tx, first).await.unwrap();
+            let nonce = AuthChallenge::decode(&read_msg(&mut rx).await.unwrap())
+                .unwrap()
+                .nonce;
+            let answer = respond(key, &s.cert_hash, &nonce).encode();
+            write_msg(&mut tx, &answer).await.unwrap();
+            conn
+        };
+        let host = async {
+            let conn = server.accept().await.await.unwrap().accept().await.unwrap();
+            admit_session(&conn, s)
+                .await
+                .unwrap()
+                .expect("a session, not a pairing")
+        };
+        tokio::join!(browser, host)
+    }
+
+    /// An admitted browser is its device for the rest of the session, as a native client is its
+    /// certificate. Over a real WebTransport connection, because the link is what carries it.
+    #[tokio::test]
+    async fn an_admitted_browser_is_keyed_by_its_device() {
+        let np = store("keyed");
+        let s = serving(np.clone());
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let fp = sha256(&key.subject_public_key_info());
+        np.add("Enrico's browser", &hex::encode(fp)).unwrap();
+
+        // A paired device's first message is not read here: the session decodes its `Hello`.
+        let (_browser, admitted) = admit_over_loopback(&s, &key, b"hello").await;
+        assert!(admitted.link.is_web());
+        assert_eq!(admitted.link.peer_fingerprint(), Some(fp));
+        assert!(admitted.knock.is_none(), "a paired device streams at once");
+    }
+
+    /// An unpaired browser asks for access under its `Hello` name, waits without a session slot,
+    /// and the console's approval admits this same connection.
+    #[tokio::test]
+    async fn an_unpaired_browser_knocks_and_approval_admits_it() {
+        let np = store("knock");
+        let s = serving(np.clone());
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let fp_hex = hex::encode(sha256(&key.subject_public_key_info()));
+        let first = hello("Safari on Mac", None).encode();
+        let (_browser, admitted) = admit_over_loopback(&s, &key, &first).await;
+        let label = admitted.knock.expect("an unpaired device knocks");
+        assert_eq!(label, "Safari on Mac");
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = sem.clone().try_acquire_owned().unwrap();
+        let park = crate::native::park_knock(&admitted.link, &np, &label, &fp_hex, permit, &sem);
+        let console = async {
+            let pending = loop {
+                if let Some(p) = np.pending().into_iter().find(|p| p.fingerprint == fp_hex) {
+                    break p;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            assert_eq!(pending.name, "Safari on Mac");
+            assert_eq!(sem.available_permits(), 1, "a parked knock holds no slot");
+            np.approve_pending(pending.id, None, None).unwrap();
+        };
+        let (parked, ()) = tokio::join!(park, console);
+        let _slot = parked
+            .unwrap()
+            .expect("approval admits the parked connection");
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the admitted session holds its slot again"
+        );
+    }
+
+    /// A browser reads why the host refused it: WebKit shows a page nothing of a close reason, so
+    /// the typed refusal rides a stream. Here the device may not launch titles, and asks to.
+    #[tokio::test]
+    async fn a_browser_reads_why_its_launch_was_refused() {
+        use punktfunk_core::quic::{Refused, GRANT_ALL, GRANT_LAUNCH};
+        let np = store("refused");
+        let s = serving(np.clone());
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let no_launch = crate::native_pairing::Access {
+            grants: GRANT_ALL & !GRANT_LAUNCH,
+            expires_unix: None,
+            until_disconnect: false,
+        };
+        let fp_hex = hex::encode(sha256(&key.subject_public_key_info()));
+        np.add_with_access("Enrico's browser", &fp_hex, Some(no_launch))
+            .unwrap();
+
+        let first = hello("Safari on Mac", Some("steam:570")).encode();
+        let (browser, admitted) = admit_over_loopback(&s, &key, &first).await;
+        let Admitted {
+            link,
+            tx,
+            rx,
+            first,
+            ..
+        } = admitted;
+        let SessionLink::Web(host, _) = &link else {
+            unreachable!("a browser's link")
+        };
+        let plane = DataPlane::Web(WebTransportPlane::new(host.clone()));
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = sem.try_acquire_owned().unwrap();
+        let session = crate::native::run_admitted(
+            link.clone(),
+            CtlSend::Web(tx),
+            CtlRecv::Web(rx),
+            first,
+            &s.host,
+            plane,
+            permit,
+        );
+        let read = async {
+            let mut uni = browser.accept_uni().await.unwrap();
+            Refused::decode(&read_msg(&mut uni).await.unwrap()).unwrap()
+        };
+        let (ended, said) = tokio::join!(session, read);
+        assert!(ended.is_err(), "the session is refused");
+        let why = RejectReason::LaunchNotPermitted;
+        assert_eq!(said.code, why.close_code());
+        assert_eq!(said.reason, why.to_string());
+    }
+
+    /// A browser's close code reaches the session: `QUIT_CLOSE_CODE` is how a player ends the
+    /// title rather than leaving it running.
+    #[tokio::test]
+    async fn a_browser_link_reports_the_close_code() {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let s = serving(store("closed"));
+        let fp_hex = hex::encode(sha256(&key.subject_public_key_info()));
+        s.plane.pairing.add("Enrico's browser", &fp_hex).unwrap();
+        let (browser, admitted) = admit_over_loopback(&s, &key, b"hello").await;
+        let quit = punktfunk_core::quic::QUIT_CLOSE_CODE;
+        browser.close(wtransport::VarInt::from_u32(quit), b"");
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), admitted.link.closed())
+                .await
+                .expect("the close reaches the host");
+        assert!(closed.closed_with(quit), "{closed}");
     }
 }

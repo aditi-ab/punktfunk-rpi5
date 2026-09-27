@@ -1227,11 +1227,13 @@ impl pf_client_core::collate::Collatable for LibraryGame {
 
 /// Observation vs memory, and whether a memory is still being fetched.
 ///
-/// Three states because Waking and Offline need different shelf copy. A boolean would
-/// say "waking" while nothing is happening.
+/// Separate states because each needs its own shelf copy. A boolean would say "waking"
+/// while nothing is happening.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Stale {
     No,
+    /// Served from the disk cache while the host is asked. No packet is implied.
+    Checking,
     /// Served from the disk cache while the host is being woken and re-asked.
     Waking,
     /// Disk cache; the host never answered. Not an error: these are still the titles to pick from.
@@ -1242,6 +1244,7 @@ impl Stale {
     pub(crate) fn note(self) -> Option<&'static str> {
         match self {
             Stale::No => None,
+            Stale::Checking => Some("Last known library \u{2014} checking the host\u{2026}"),
             Stale::Waking => Some("Last known library \u{2014} waking the host\u{2026}"),
             Stale::Offline => Some("Last known library \u{2014} the host didn't answer"),
         }
@@ -1376,8 +1379,9 @@ impl LibraryShared {
     }
 
     /// Disk-cache catalog while the host is still being asked. Live fetch stays in flight.
+    /// A shell that sends a wake says so with [`Self::set_stale`]`(Waking)`.
     pub fn set_games_cached(&self, games: Vec<LibraryGame>) {
-        self.put_games(games, Stale::Waking);
+        self.put_games(games, Stale::Checking);
     }
 
     /// Shelf copy about a cached catalog, catalog unchanged. No-op on a live shelf, so a late
@@ -2218,8 +2222,14 @@ mod tests {
         shared.set_games_cached(vec![g("Celeste"), g("Tunic")]);
         let cached = shared.snapshot();
         assert!(matches!(cached.phase, LibraryPhase::Ready));
-        assert_eq!(cached.stale, Stale::Waking);
+        assert_eq!(
+            cached.stale,
+            Stale::Checking,
+            "a cached shelf claims no wake"
+        );
         assert!(cached.stale.note().is_some());
+        shared.set_stale(Stale::Waking);
+        assert_eq!(shared.snapshot().stale, Stale::Waking);
         // The retry window closed with no answer: same titles, different words.
         shared.set_stale(Stale::Offline);
         assert_eq!(shared.snapshot().stale, Stale::Offline);

@@ -14,6 +14,7 @@ import {
 	spawnAgainIfKilled,
 	superviseUnit,
 	windowsSddlUnsafeReason,
+	writePluginToken,
 } from "../src/runner.js";
 
 const TOKEN = "runner-token";
@@ -248,6 +249,28 @@ describe("inProcessConnect (Windows, or the sandbox off)", () => {
 		expect(inProcessConnect({ name: "s", file: "/x" }, options)).toBe(shared);
 		const unknown = { name: "n", file: "/x", manifest: { id: "nope" } };
 		expect(inProcessConnect(unknown, options)).toBe(shared);
+	});
+});
+
+describe("writePluginToken", () => {
+	test("a link the plugin left in its state dir is replaced, not followed", () => {
+		const config = path.join(ROOT, "token-link");
+		fs.mkdirSync(path.join(config, "plugin-run"), { recursive: true });
+		fs.writeFileSync(
+			path.join(config, "plugin-run", "plugin-tokens.json"),
+			JSON.stringify({ demo: "demo-token" }),
+		);
+		const victim = path.join(config, "other-plugin.json");
+		fs.writeFileSync(victim, "untouched");
+		const state = path.join(config, "plugin-state", "demo");
+		fs.mkdirSync(state, { recursive: true });
+		fs.symlinkSync(victim, path.join(state, ".plugin-token"));
+
+		const file = writePluginToken(config, state, "demo");
+		expect(file).toBe(path.join(state, ".plugin-token"));
+		expect(fs.lstatSync(file as string).isSymbolicLink()).toBe(false);
+		expect(fs.readFileSync(file as string, "utf8")).toBe("PUNKTFUNK_PLUGIN_TOKEN=demo-token\n");
+		expect(fs.readFileSync(victim, "utf8")).toBe("untouched");
 	});
 });
 

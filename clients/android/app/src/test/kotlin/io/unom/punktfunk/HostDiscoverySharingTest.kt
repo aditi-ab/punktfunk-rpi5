@@ -82,10 +82,34 @@ class HostDiscoverySharingTest {
         discovery.restart()
         assertEquals(Duration.ZERO, looper.nextScheduledTaskTime)
         val screen = subscriber()
+        discovery.onAppStart()
         try {
             discovery.addListener(screen)
             assertNotEquals(Duration.ZERO, looper.nextScheduledTaskTime)
         } finally {
+            discovery.onAppStop()
+            discovery.removeListener(screen)
+        }
+    }
+
+    /** Home with a subscriber still attached ends the browse; coming back starts it again. */
+    @Test
+    fun the_browse_sleeps_while_the_app_is_away() {
+        val discovery = HostDiscovery.shared(context)
+        val looper = shadowOf(Looper.getMainLooper())
+        looper.idleFor(Duration.ofSeconds(5))
+        val screen = subscriber()
+        discovery.onAppStart()
+        try {
+            discovery.addListener(screen)
+            assertNotEquals(Duration.ZERO, looper.nextScheduledTaskTime) // a start was attempted
+            discovery.onAppStop()
+            assertEquals(Duration.ZERO, looper.nextScheduledTaskTime)
+            assertEquals(1, discovery.listenerCount)
+            discovery.onAppStart()
+            assertNotEquals(Duration.ZERO, looper.nextScheduledTaskTime)
+        } finally {
+            discovery.onAppStop()
             discovery.removeListener(screen)
         }
     }

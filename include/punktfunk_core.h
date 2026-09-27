@@ -25,7 +25,7 @@
 // Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 // Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
 // in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 38
+#define PUNKTFUNK_ABI_VERSION 39
 
 // punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 //
@@ -327,6 +327,15 @@
 // `PunktfunkStatus` code).
 #define PUNKTFUNK_CLIP_ERROR 6
 
+// [`punktfunk_au_admission_note`]'s `concealed`: the lane has no concealer.
+#define PUNKTFUNK_CONCEALED_NONE 0
+
+// The concealer left every reference on a picture the decoder holds.
+#define PUNKTFUNK_CONCEALED_DECODABLE 1
+
+// Nothing can stand in for the lost reference.
+#define PUNKTFUNK_CONCEALED_UNRECOVERABLE 2
+
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
 #define PUNKTFUNK_AUDIO_MUTE_LOCAL (1 << 0)
@@ -355,11 +364,6 @@
 #define PUNKTFUNK_AUDIO_BITS_16 16
 
 #define PUNKTFUNK_AUDIO_BITS_24 24
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Two missed 500 ms legacy refreshes. A quieter host is treated as gone.
-#define PUNKTFUNK_LEGACY_STALE_MS 1000
-#endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Per-fetch read cap, bytes (`design/clipboard-and-file-transfer.md`). A holder that
@@ -1266,6 +1270,9 @@
 // Supersample cap; still clamped per axis by [`max_dimension`].
 #define PUNKTFUNK_MAX_SCALE 4.0
 
+// Two missed 500 ms legacy refreshes. A quieter host is treated as gone.
+#define PUNKTFUNK_LEGACY_STALE_MS 1000
+
 // Stable C ABI status codes. `Ok` is 0; errors are negative so callers can
 // test `rc < 0`. Existing variants must not be renumbered — only append.
 enum PunktfunkStatus
@@ -1470,6 +1477,14 @@ typedef enum {
     // Kinetic tail ends; `delta` must be 0.
     PUNKTFUNK_SCROLL_PHASE_MOMENTUM_END = 7,
 } PunktfunkScrollPhase;
+
+// The receiver half of reactive recovery: an AU reaches the decoder only when every picture
+// it references was decoded. After an index gap, each AU until the host's IDR or anchor names
+// the lost picture. A wave start also ends the stretch on a lenient decoder; a strict one keeps
+// withholding and asks for a keyframe. One per elementary stream, fed every AU in receive
+// order. A withheld AU is never fed and never folded into [`ReanchorGate`]; the gate's
+// [`REANCHOR_FREEZE_MAX`] re-ask ends a stretch whose anchor was lost.
+typedef struct AuAdmission AuAdmission;
 
 // Per-session CICP (ITU-T H.273) the host resolved, on [`Welcome`]. Configure the
 // decoder/presenter from these; do not infer from bitstream VUI. An older host omits the
@@ -2016,8 +2031,9 @@ uint32_t punktfunk_abi_version(void);
 PunktfunkStatus punktfunk_set_log_callback(uint8_t max_level, PunktfunkLogCb cb, void *user);
 
 // Wake-on-LAN magic packet. `macs` is `mac_count` contiguous 6-byte MACs.
-// `last_known_ip` is an optional IPv4 dotted-quad unicast target. Broadcasts
-// subnet-directed and `255.255.255.255` on ports 9 and 7. No session needed.
+// `last_known_ip` is an optional unicast target, used only when it is an IPv4
+// dotted quad. Broadcasts subnet-directed and `255.255.255.255` on ports 9
+// and 7. No session needed.
 // `Ok` if at least one datagram was sent. Call off the UI thread.
 //
 // # Safety
@@ -3509,6 +3525,31 @@ PunktfunkStatus punktfunk_reanchor_gate_poll(ReanchorGate *g,
 // # Safety
 // `g` is a valid gate handle; `out_holding` is writable or NULL.
 PunktfunkStatus punktfunk_reanchor_gate_is_holding(const ReanchorGate *g, bool *out_holding);
+
+// Create an admission rule. Free with [`punktfunk_au_admission_free`]. Never returns NULL.
+AuAdmission *punktfunk_au_admission_new(void);
+
+// Free a rule created by [`punktfunk_au_admission_new`]. NULL is a no-op.
+//
+// # Safety
+// `a` was returned by [`punktfunk_au_admission_new`] and is not used after this call.
+void punktfunk_au_admission_free(AuAdmission *a);
+
+// Fold one AU: its frame index, the index gap ahead of it (0 for none), its wire flags,
+// whether the decoder is strict, and a `PUNKTFUNK_CONCEALED_*`. Writes whether to keep the
+// AU off the decoder and whether to ask for a keyframe. An unknown `concealed` returns
+// [`PunktfunkStatus::InvalidArg`].
+//
+// # Safety
+// `a` is a valid handle; the out pointers are writable or NULL.
+PunktfunkStatus punktfunk_au_admission_note(AuAdmission *a,
+                                            uint32_t index,
+                                            uint32_t gap,
+                                            uint32_t flags,
+                                            bool strict,
+                                            uint32_t concealed,
+                                            bool *out_withhold,
+                                            bool *out_ask_keyframe);
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Start a demo host on a free loopback port. `codecs` is the `PUNKTFUNK_CODEC_*` mask the

@@ -391,7 +391,7 @@ pub fn apply_audio_policy(sessions: AudioSessions, launcher: &str) -> AudioPolic
     for s in registry().lock().unwrap().iter() {
         // Compat sessions have no per-session mute, and marking one muted without muting it
         // would put a Muted badge on a session the operator can still hear.
-        if s.plane == crate::events::Plane::Native
+        if s.plane != crate::events::Plane::Gamestream
             && policy_mutes(sessions, launcher, &s.client, s.join)
         {
             s.controls.set_muted(true);
@@ -643,7 +643,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
     let id = next_id();
     // A standing title policy reaches a session that arrives under it.
     if let Some(p) = AUDIO_POLICY.lock().unwrap().as_mut() {
-        if plane == crate::events::Plane::Native
+        if plane != crate::events::Plane::Gamestream
             && policy_mutes(p.sessions, &p.launcher, &client, join)
         {
             controls.set_muted(true);
@@ -1285,7 +1285,7 @@ pub fn has_native_lanes(id: u64) -> Option<bool> {
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .find(|s| s.id == id)
-        .map(|s| s.plane == crate::events::Plane::Native)
+        .map(|s| s.plane != crate::events::Plane::Gamestream)
 }
 
 /// This session's management handles, cloned out so the caller acts without the

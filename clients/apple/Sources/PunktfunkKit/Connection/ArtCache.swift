@@ -37,6 +37,10 @@ actor ArtCache {
         self.maxAge = maxAge
     }
 
+    /// The one cache every loader shares. One instance per directory keeps the prune budget
+    /// counting across library visits, and keeps prune from racing another instance's write.
+    static let shared = standard()
+
     /// The app's standard location, or nil if the caches directory is unavailable (in which case
     /// callers simply run without a cache rather than failing).
     static func standard() -> ArtCache? {

@@ -97,13 +97,4 @@ final class ReanchorGate: @unchecked Sendable {
         _ = punktfunk_reanchor_gate_poll(ptr, framesDropped, &requestKf)
         return requestKf
     }
-
-    /// Whether the gate is currently withholding concealed frames (frozen on the last good picture).
-    var isHolding: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        var holding = false
-        _ = punktfunk_reanchor_gate_is_holding(ptr, &holding)
-        return holding
-    }
 }

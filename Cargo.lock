@@ -3866,6 +3866,7 @@ dependencies = [
  "base64 0.23.1",
  "cbc",
  "futures-util",
+ "h2",
  "hex",
  "hmac 0.13.0",
  "http-body-util",

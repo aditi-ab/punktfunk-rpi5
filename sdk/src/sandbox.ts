@@ -185,15 +185,18 @@ export const bwrapArgv = (
 
 /**
  * A root no manifest or grant may bind: the host's processes, devices, the session bus and
- * runtime sockets, the home or anything above it, keys, and punktfunk's own config, which holds
- * every plugin's token. Checked on the path and on what it resolves to in the runner's view.
+ * runtime sockets, the home or anything above it, keys, and punktfunk's own config or anything
+ * above it, which holds every plugin's token. Checked on the path and on what it resolves to in
+ * the runner's view.
  */
 export const refusedRoot = (abs: string, home: string): boolean => {
 	const refused = (p: string, h: string) => {
 		const under = (base: string) => p === base || p.startsWith(`${base}/`);
+		const above = (base: string) => `${base}/`.startsWith(`${p}/`);
 		return (
 			p === "/" ||
-			`${h}/`.startsWith(`${p}/`) ||
+			above(h) ||
+			above(path.join(h, ".config", "punktfunk")) ||
 			["/proc", "/sys", "/dev"].some(under) ||
 			(under("/run") && !p.startsWith("/run/media/")) ||
 			[".ssh", ".gnupg"].some((d) => under(path.join(h, d))) ||

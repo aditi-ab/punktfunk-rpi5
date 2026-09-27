@@ -112,6 +112,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
+
+    /// Without this a quit reads to the host as a dropped link, and it lingers the display.
+    func applicationWillTerminate(_ notification: Notification) {
+        SessionModel.quitAll()
+    }
 }
 #elseif os(iOS)
 final class AppDelegate: NSObject, UIApplicationDelegate {

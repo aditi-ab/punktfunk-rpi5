@@ -272,7 +272,7 @@
             }
           },
           "400": {
-            "description": "No paired-device certificate on the connection",
+            "description": "No paired device behind the request",
             "content": {
               "application/json": {
                 "schema": {
@@ -3929,7 +3929,7 @@
           "plugin-access"
         ],
         "summary": "Grant, deny, or forget an access request",
-        "description": "`allow` turns a pending request into a grant (the platform ACL lands first, so a failed\ngrant stores nothing), or with `write` set grants a path the operator handed over;\n`deny` remembers the no; `forget` removes a grant or denial.",
+        "description": "`allow` turns a pending request into a grant (the platform ACL lands first, so a failed\ngrant stores nothing), or with `write` set grants a path the operator handed over, on\nbehalf of `form` when named; `deny` remembers the no; `forget` removes a grant or denial.",
         "operationId": "decidePluginAccess",
         "parameters": [
           {
@@ -4005,6 +4005,89 @@
           },
           "500": {
             "description": "The decision could not be recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugin-access/{plugin}/release": {
+      "post": {
+        "tags": [
+          "plugin-access"
+        ],
+        "summary": "Let a plugin form go of the paths it no longer hands over",
+        "description": "`keep` is every path the form still holds. Each grant the form holds outside it loses the\nform, and a grant only forms made goes with its last one. The operator's own grants stay.",
+        "operationId": "releasePluginAccess",
+        "parameters": [
+          {
+            "name": "plugin",
+            "in": "path",
+            "description": "The plugin id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReleaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The plugin's access state after the release",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginAccessSnapshot"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid form name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not reachable on the plugin or device lane",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The release could not be recorded",
             "content": {
               "application/json": {
                 "schema": {
@@ -6079,7 +6162,7 @@
           },
           "plane": {
             "$ref": "#/components/schemas/Plane",
-            "description": "`native` or `gamestream`."
+            "description": "`native`, `gamestream` or `web`."
           },
           "session_id": {
             "type": "integer",
@@ -6923,7 +7006,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`\"native\" | \"gamestream\"`."
+            "description": "`\"native\" | \"gamestream\" | \"web\"`."
           },
           "sample_count": {
             "type": "integer",
@@ -7561,6 +7644,13 @@
           "decision": {
             "$ref": "#/components/schemas/DecisionInput"
           },
+          "form": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "With `allow` and `write`: the plugin form handing the path over (`config`,\n`game:<entry id>`). Its grant goes once every form that handed it lets go."
+          },
           "path": {
             "type": "string",
             "description": "The path as it appears in the request or grant list."
@@ -7642,7 +7732,8 @@
             "description": "Pairing-store copy, already sanitized."
           },
           "plane": {
-            "$ref": "#/components/schemas/Plane"
+            "$ref": "#/components/schemas/Plane",
+            "description": "The store the device is paired in. Browsers pair into the native store, so `native`."
           }
         }
       },
@@ -8943,7 +9034,7 @@
       },
       "Grant": {
         "type": "object",
-        "description": "One root the operator granted, as recorded on disk. `at`/`by` are audit fields:\nRFC3339 and `console`/`cli`/`legacy` (a v1 entry has neither).",
+        "description": "One root the operator granted, as recorded on disk. `at`/`by` are audit fields:\nRFC3339 and `console`/`cli`/`legacy`/`form` (a v1 entry has neither).",
         "required": [
           "path",
           "write",
@@ -8956,6 +9047,13 @@
           },
           "by": {
             "type": "string"
+          },
+          "forms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The plugin forms that handed this path over (`config`, `game:<entry id>`). A grant\nwith `by: \"form\"` goes when the last of them lets go."
           },
           "path": {
             "type": "string"
@@ -10665,10 +10763,11 @@
       },
       "Plane": {
         "type": "string",
-        "description": "Origin plane. Both planes must emit; filtering is the consumer's job.",
+        "description": "Origin plane. Every plane must emit; filtering is the consumer's job.",
         "enum": [
           "native",
-          "gamestream"
+          "gamestream",
+          "web"
         ]
       },
       "PlayingApps": {
@@ -11236,6 +11335,26 @@
           "released": {
             "type": "integer",
             "minimum": 0
+          }
+        }
+      },
+      "ReleaseRequest": {
+        "type": "object",
+        "required": [
+          "form",
+          "keep"
+        ],
+        "properties": {
+          "form": {
+            "type": "string",
+            "description": "The plugin form letting go, as named when it handed the paths over."
+          },
+          "keep": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Every path the form still hands over, as saved."
           }
         }
       },
@@ -12420,7 +12539,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`\"native\" | \"gamestream\"`, or `\"\"` if idle."
+            "description": "`\"native\" | \"gamestream\" | \"web\"`, or `\"\"` if idle."
           },
           "sample_count": {
             "type": "integer",

@@ -96,7 +96,7 @@ pub struct CaptureMeta {
     pub id: String,
     pub started_unix_ms: u64,
     pub duration_ms: u64,
-    /// `"native" | "gamestream"`.
+    /// `"native" | "gamestream" | "web"`.
     pub kind: String,
     pub width: u32,
     pub height: u32,
@@ -141,7 +141,7 @@ pub struct StatsStatus {
     /// Host monotonic elapsed ms (`0` if idle). Do not subtract `started_unix_ms`
     /// from the console's wall clock — that clock may be skewed.
     pub elapsed_ms: u64,
-    /// `"native" | "gamestream"`, or `""` if idle.
+    /// `"native" | "gamestream" | "web"`, or `""` if idle.
     pub kind: String,
 }
 

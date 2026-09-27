@@ -217,6 +217,8 @@ utoipa-scalar = { version = "0.3", features = ["axum"] }
 # normal dependency above and those are visible to tests — the dev-dependency re-declaration was
 # redundant.)
 http-body-util = "0.1"
+# An HTTP/2 client for the management API's multiplexing test (`gamestream/tls.rs`).
+h2 = "0.4"
 # Disposable directory fixtures for the Steam local-librarycache scan tests (library.rs).
 tempfile = "3"
 

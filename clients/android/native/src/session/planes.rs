@@ -168,7 +168,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSource
 /// `NativeBridge.nativeVideoMime(handle): String` — the MediaCodec MIME for the codec the host
 /// resolved (`"video/hevc"` / `"video/avc"` / `"video/av01"`), so Kotlin can rank `MediaCodecList`
 /// decoders for it before calling [`Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo`].
-/// Empty string on a `0` handle. Cheap; safe on the UI thread.
+/// Empty string on a `0` or closed handle. Cheap; safe on the UI thread.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'local>(
@@ -177,11 +177,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'
     handle: jlong,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        if handle == 0 {
-            return Ok(JString::default());
-        }
+        // Never null: Kotlin declares a non-null `String`.
         let Some(h) = get_session(handle) else {
-            return Ok(JString::default());
+            return env.new_string("");
         };
         env.new_string(crate::decode::codec_mime(h.client.codec))
     })
