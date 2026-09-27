@@ -522,9 +522,10 @@ impl H264ProfileChain {
         }
     }
 
-    /// Wire the internal `p_next` chain and hand out the profile root. Do not
-    /// move `self` while the returned reference (or any pointer from it) lives.
-    pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'static> {
+    /// Wire the internal `p_next` chain and hand out the profile root. The root, and
+    /// any copy of it, borrows `self`; a raw pointer from it must not outlive `self`
+    /// in place.
+    pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'_> {
         self.profile.p_next = (&self.h264 as *const vk::VideoDecodeH264ProfileInfoKHR<'_>).cast();
         &self.profile
     }
@@ -568,9 +569,9 @@ pub(crate) enum ProfileChain {
 }
 
 impl ProfileChain {
-    /// Wire the chain and hand out the profile root. Do not move `self` while
-    /// the returned reference (or any pointer from it) lives.
-    pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'static> {
+    /// Wire the chain and hand out the profile root, borrowing `self` as the
+    /// variants' `wire` does.
+    pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'_> {
         match self {
             ProfileChain::H264(chain) => chain.wire(),
             ProfileChain::H265(chain) => chain.wire(),

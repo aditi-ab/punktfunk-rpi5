@@ -145,9 +145,9 @@ impl Av1ProfileChain {
         }
     }
 
-    /// Do not move `self` while the returned reference (or any pointer taken
-    /// from it) lives.
-    pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'static> {
+    /// The root, and any copy of it, borrows `self`; a raw pointer from it must
+    /// not outlive `self` in place.
+    pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'_> {
         self.profile.p_next = (&self.av1 as *const vk::VideoDecodeAV1ProfileInfoKHR<'_>).cast();
         &self.profile
     }
