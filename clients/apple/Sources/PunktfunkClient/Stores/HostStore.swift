@@ -120,9 +120,16 @@ final class HostStore: ObservableObject {
         hosts[i] = host
     }
 
-    func markConnected(_ hostID: UUID) {
+    /// A session started: stamp it, with what the session itself taught us about the host.
+    /// One write, because each one encodes the store and reloads both widgets. A `mgmtPort`
+    /// of 0 is not advertised.
+    func markConnected(_ hostID: UUID, mgmtPort: UInt16? = nil, fingerprint: Data? = nil) {
         guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
-        hosts[i].lastConnected = Date() // didSet → persist() writes the shared suite + reloads widget
+        var host = hosts[i]
+        host.lastConnected = Date()
+        if let mgmtPort, mgmtPort > 0 { host.mgmtPort = mgmtPort }
+        if let fingerprint { host.pinnedSHA256 = fingerprint }
+        hosts[i] = host
     }
 
     /// Is `host` reachable RIGHT NOW — the one definition of online, used by the pip, the
@@ -174,13 +181,15 @@ final class HostStore: ObservableObject {
     }
 
     /// Did the host pinned to `pin` (any host, when `nil`) answer a probe at this address?
+    /// The probe blocks for up to its timeout, so it runs on GCD: a sweep of silent hosts would
+    /// otherwise hold the cooperative pool, two threads on an Apple TV HD.
     private static func answers(_ address: String, _ port: UInt16, pin: Data?) async -> Bool {
-        await Task.detached(priority: .utility) {
-            guard let answered = PunktfunkConnection.probeIdentity(host: address, port: port) else {
-                return false
+        await withCheckedContinuation { done in
+            DispatchQueue.global(qos: .utility).async {
+                let answered = PunktfunkConnection.probeIdentity(host: address, port: port)
+                done.resume(returning: answered.map { got in pin.map { $0 == got } ?? true } ?? false)
             }
-            return pin.map { $0 == answered } ?? true
-        }.value
+        }
     }
 
     /// One reachability sweep, driving `probedOnline`: probe every saved host and publish the
@@ -191,10 +200,30 @@ final class HostStore: ObservableObject {
     /// before the next was asked, and nothing was published until the last — so a list holding a
     /// few sleeping machines took half a minute to light the one that was up. A host lights the
     /// moment it answers; the end of the lap drops the ones that stopped.
+    ///
+    /// One sweep at a time: a second caller waits for the one in flight and takes its answer,
+    /// so an older lap never publishes over a newer one.
     func refreshReachability(discovery: HostDiscovery) async {
         #if DEBUG
         guard !probePinned else { return } // a seeded reachable set outranks the live LAN
         #endif
+        if let sweep {
+            await sweep.value
+            return
+        }
+        let lap = Task { await sweepOnce(discovery: discovery) }
+        sweep = lap
+        await lap.value
+        sweep = nil
+        lastSweep = Date()
+    }
+
+    private var sweep: Task<Void, Never>?
+    private var lastSweep = Date.distantPast
+    /// Seconds between presence laps.
+    private static let presencePeriod: TimeInterval = 10
+
+    private func sweepOnce(discovery: HostDiscovery) async {
         var online: Set<StoredHost.ID> = []
         await withTaskGroup(of: (StoredHost.ID, Bool).self) { group in
             for host in hosts {
@@ -212,16 +241,21 @@ final class HostStore: ObservableObject {
     /// reachable paired host's actions and running title kept warm on the same beat, so a
     /// card's menu is built from a settled answer. Both are TTL-gated inside. Run it from the
     /// home's `.task`; it returns when that task is cancelled.
+    ///
+    /// Each Mac window runs one. A lap that finds a sweep younger than the period skips its
+    /// own, so the process probes once per period however many windows are open.
     func keepPresence(
         discovery: HostDiscovery, power: HostPowerStore, nowPlaying: NowPlayingStore
     ) async {
         while !Task.isCancelled {
-            await refreshReachability(discovery: discovery)
+            if Date().timeIntervalSince(lastSweep) >= Self.presencePeriod {
+                await refreshReachability(discovery: discovery)
+            }
             for host in hosts where host.pinnedSHA256 != nil && probedOnline.contains(host.id) {
                 power.refresh(host)
                 nowPlaying.refresh(host)
             }
-            try? await Task.sleep(for: .seconds(10))
+            try? await Task.sleep(for: .seconds(Self.presencePeriod))
         }
     }
 

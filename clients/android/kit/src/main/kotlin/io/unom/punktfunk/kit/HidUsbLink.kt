@@ -67,7 +67,8 @@ class HidUsbLink(
         val epIn: UsbEndpoint,
         val epOut: UsbEndpoint?,
     ) {
-        val inBuf: ByteBuffer = ByteBuffer.allocate(64)
+        // Direct: UsbRequest.queue copies a heap buffer into a fresh direct one on every report.
+        val inBuf: ByteBuffer = ByteBuffer.allocateDirect(64)
         var inReq: UsbRequest? = null
         var outReq: UsbRequest? = null
         var outBusy = false
@@ -86,7 +87,7 @@ class HidUsbLink(
      *  connection's [UsbRequest]s ([UsbDeviceConnection.requestWait] returns ANY completed
      *  request; a second waiter would steal the reader's completions). See [OutReportQueue] for
      *  what gets discarded when it fills, and why that is not simply "the oldest". */
-    private val outQueue = OutReportQueue()
+    private val outQueue = OutReportQueue<ByteArray>()
 
     private var reader: Thread? = null
     private var keepAlive: Thread? = null

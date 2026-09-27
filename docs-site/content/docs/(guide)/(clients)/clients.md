@@ -1,6 +1,6 @@
 ---
 title: Clients
-description: The Punktfunk apps for Apple devices, Linux, Windows and Android, the community webOS app, Moonlight, and the punktfunk command — what each does and which to pick.
+description: The Punktfunk apps for Apple devices, Linux, Windows and Android, the browser client, the community webOS app, Moonlight, and the punktfunk command — what each does and which to pick.
 ---
 
 Pick the app for the device you stream *to*. Install steps for each are on
@@ -16,7 +16,8 @@ Pick the app for the device you stream *to*. Install steps for each are on
 | A Windows PC | The [Windows app](#windows-desktop-client) |
 | An Android phone, tablet or TV | The [Android app](#android-app-phone--android-tv) |
 | An LG webOS TV | The community [webOS app](#webos-lg-tv--community) |
-| A browser or any other device | [Moonlight](#moonlight-anything-else) |
+| A browser tab, with nothing to install | The [browser client](/docs/browser-client) (preview) |
+| Any other device | [Moonlight](#moonlight-anything-else) |
 | Scripts and home automation | The [`punktfunk` command](#scripting-the-punktfunk-cli) |
 
 Every Punktfunk app finds hosts on your network, [pairs](/docs/pairing) once and reconnects on its

@@ -143,11 +143,12 @@ fn decoder_supports_max_operating_rate(name_lower: &str) -> bool {
 }
 
 /// Raise the pipeline's OTHER hot threads — the core's data-plane pump (UDP receive + FEC
-/// reassembly) and the audio decode thread — toward the display band, matching this decode thread's
-/// own boost. `setpriority(PRIO_PROCESS, tid)` targets any task in the process, so we do it from
-/// here once their tids are known (the same set ADPF hints), without a per-platform priority hook
-/// in the shared core. Slightly below the decode thread's -10 so the display path still wins.
-/// Best-effort; skips this thread (already boosted) and is non-fatal if the platform refuses.
+/// reassembly) and any other registered thread — toward the display band, matching this decode
+/// thread's own boost. `setpriority(PRIO_PROCESS, tid)` targets any task in the process, so we do
+/// it from here once their tids are known (the same set ADPF hints), without a per-platform
+/// priority hook in the shared core. Slightly below the decode thread's -10 so the display path
+/// still wins. Only ever raises: the audio and mic threads already sit at
+/// [`crate::audio::AUDIO_NICE`]. Best-effort; skips this thread and is non-fatal if refused.
 pub(super) fn boost_hot_threads(tids: &[i32]) {
     // SAFETY: `gettid` is an always-safe syscall on the calling thread.
     let self_tid = unsafe { libc::gettid() };
@@ -155,9 +156,13 @@ pub(super) fn boost_hot_threads(tids: &[i32]) {
         if tid == self_tid {
             continue;
         }
-        // SAFETY: `setpriority` with PRIO_PROCESS + a live tid in our own process is an always-safe
-        // syscall; a refusal is reported via the return value, not UB.
+        // SAFETY: `getpriority`/`setpriority` with PRIO_PROCESS + a tid in our own process are
+        // always-safe syscalls; a refusal is reported via the return value, not UB. A failed read
+        // returns -1, which is above -8, so the set is tried and fails the same way.
         unsafe {
+            if libc::getpriority(libc::PRIO_PROCESS, tid as libc::id_t) <= -8 {
+                continue;
+            }
             if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -8) != 0 {
                 log::debug!("decode: setpriority(-8) on hot tid {tid} failed (non-fatal)");
             }
@@ -210,9 +215,8 @@ pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: 
     //     ANativeWindow*, float frameRate, int8_t compatibility, int8_t changeFrameRateStrategy)
     type SetFrameRateStrategyFn = unsafe extern "C" fn(*mut c_void, f32, i8, i8) -> i32;
     // SAFETY: `dlopen` of the always-mapped `libandroid.so` (only bumps its refcount; never closed —
-    // process-lifetime handle). Each `dlsym` returns null when the symbol is absent (device below the
-    // symbol's API level), checked before transmuting the non-null pointer to its fn-pointer type.
-    // `window.ptr()` is the live `ANativeWindow` this `NativeWindow` owns for the call's duration.
+    // process-lifetime handle; null is checked). Each `sym` type is the NDK header's signature;
+    // absent = below its API level. `window.ptr()` is live for the call (`&NativeWindow`).
     unsafe {
         let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
         if lib.is_null() {
@@ -223,21 +227,17 @@ pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: 
         // TV: prefer the API-31 change-strategy form to force the mode switch (strategy 1 =
         // ALWAYS). Absent on API 30 ⇒ fall through to the 2-arg hint below.
         if is_tv {
-            let sym = libc::dlsym(
+            if let Some(set) = crate::sym::<SetFrameRateStrategyFn>(
                 lib,
-                c"ANativeWindow_setFrameRateWithChangeStrategy".as_ptr(),
-            );
-            if !sym.is_null() {
-                let set = std::mem::transmute::<*mut c_void, SetFrameRateStrategyFn>(sym);
+                c"ANativeWindow_setFrameRateWithChangeStrategy",
+            ) {
                 return set(window.ptr().as_ptr().cast(), frame_rate, FIXED_SOURCE, 1) == 0;
             }
         }
-        let sym = libc::dlsym(lib, c"ANativeWindow_setFrameRate".as_ptr());
-        if sym.is_null() {
+        let Some(set) = crate::sym::<SetFrameRateFn>(lib, c"ANativeWindow_setFrameRate") else {
             return false; // device API < 30 — no per-surface frame-rate hint
-        }
-        let set_frame_rate = std::mem::transmute::<*mut c_void, SetFrameRateFn>(sym);
-        set_frame_rate(window.ptr().as_ptr().cast(), frame_rate, FIXED_SOURCE) == 0
+        };
+        set(window.ptr().as_ptr().cast(), frame_rate, FIXED_SOURCE) == 0
     }
 }
 
@@ -278,16 +278,17 @@ pub(super) fn android_hdr_static_info(m: &punktfunk_core::quic::HdrMeta) -> [u8;
 /// host sends a 0xCE right after the handshake, so it's typically already queued; wait briefly
 /// otherwise. The Surface DataSpace (applied on the format change) carries transfer/primaries
 /// regardless — this adds the luminance the tone-mapper needs. `None` on an SDR session.
+/// The newest entry, not the first: the host follows its generic baseline with the source's grade.
 pub(super) fn hdr_static(client: &NativeClient) -> Option<punktfunk_core::quic::HdrMeta> {
     if !client.color.is_hdr() {
         return None;
     }
-    match client.next_hdr_meta(Duration::from_millis(250)) {
-        Ok(meta) => {
+    match client.latest_hdr_meta(Duration::from_millis(250)) {
+        Some(meta) => {
             log::info!("decode: HDR static metadata applied (KEY_HDR_STATIC_INFO)");
             Some(meta)
         }
-        Err(_) => {
+        None => {
             log::info!("decode: HDR session but no mastering metadata yet — DataSpace only");
             None
         }
@@ -307,7 +308,7 @@ pub(super) const LOW_LATENCY_KEY_PROP: &std::ffi::CStr = c"debug.punktfunk.low_l
 const HALF_RATE_TVS: &[(&str, &str)] = &[("TPV", "PH1M_WW_9972"), ("TCL", "G08")];
 
 fn half_rate_tv() -> bool {
-    use super::asc_presenter::sysprop;
+    use crate::sysprop;
     let (Some(maker), Some(device)) = (
         sysprop(c"ro.product.manufacturer"),
         sysprop(c"ro.product.device"),
@@ -341,7 +342,7 @@ pub(super) fn low_latency_format(
         (mode.width * mode.height).max(2_000_000) as i32,
     );
     if let Some(aggressive) = keys {
-        let forced = super::asc_presenter::sysprop(LOW_LATENCY_KEY_PROP);
+        let forced = crate::sysprop(LOW_LATENCY_KEY_PROP);
         let profile = match forced.as_deref() {
             Some(p @ ("standard" | "off" | "mtk-tv")) => p,
             _ if codec_name.to_ascii_lowercase().starts_with("c2.mtk") && half_rate_tv() => {

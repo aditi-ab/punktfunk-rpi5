@@ -16,11 +16,10 @@
 //! and [`PyroWaveDecoder::reconfigure`] rebuilds decoder + plane ring in place; device,
 //! command pool and pinned create-infos survive. Superseded rings are retired, not
 //! destroyed — the presenter may still hold their views (see [`RETIRE_HANDOVERS`]).
-
-// UNSAFE-LINT EXEMPTION: pyrowave-sys C-API + ash compute, line for line. Wrapping
-// each call would add `unsafe {}` + a SAFETY that restates the signature. Clearing
-// this file means deleting markers with no caller contract, not wrapping the calls.
-#![allow(unsafe_op_in_unsafe_fn)]
+//!
+//! Decoder invariants every method's SAFETY leans on: `device` is the presenter's live
+//! device, which outlives the decoder; `pw_dev`, `pw_dec`, the rings, `cmd` and `fence`
+//! are this decoder's own; the shared queue is touched only under `queue_lock`.
 
 use crate::video_color::ColorDesc;
 use crate::video_vk::{QueueLock, VulkanDecodeDevice};
@@ -242,6 +241,10 @@ struct RetiredRing {
 }
 
 /// One decode-output plane: STORAGE (decode writes) + SAMPLED (presenter CSC).
+///
+/// # Safety
+///
+/// `device` is live, and `mem_props` are its physical device's.
 unsafe fn make_plane(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -249,89 +252,99 @@ unsafe fn make_plane(
     h: u32,
     fmt: vk::Format,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
-    let img = device.create_image(
-        &vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(fmt)
-            .extent(vk::Extent3D {
-                width: w,
-                height: h,
-                depth: 1,
+    // SAFETY: fn contract; the create-info is a local that outlives the call.
+    let img = unsafe {
+        device.create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(fmt)
+                .extent(vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
+                .initial_layout(vk::ImageLayout::UNDEFINED),
+            None,
+        )
+    }?;
+    let mut mem = vk::DeviceMemory::null();
+    let view = (|| -> Result<vk::ImageView> {
+        // SAFETY: `img` was created above on the live `device`.
+        let req = unsafe { device.get_image_memory_requirements(img) };
+        let ti = (0..mem_props.memory_type_count)
+            .find(|&i| {
+                (req.memory_type_bits & (1 << i)) != 0
+                    && mem_props.memory_types[i as usize]
+                        .property_flags
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
             })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
-            .initial_layout(vk::ImageLayout::UNDEFINED),
-        None,
-    )?;
-    let req = device.get_image_memory_requirements(img);
-    let ti = (0..mem_props.memory_type_count)
-        .find(|&i| {
-            (req.memory_type_bits & (1 << i)) != 0
-                && mem_props.memory_types[i as usize]
-                    .property_flags
-                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        })
-        .unwrap_or(0);
-    let mem = match device.allocate_memory(
-        &vk::MemoryAllocateInfo::default()
+            .unwrap_or(0);
+        let alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
-            .memory_type_index(ti),
-        None,
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            device.destroy_image(img, None);
-            return Err(e.into());
-        }
-    };
-    if let Err(e) = device.bind_image_memory(img, mem, 0) {
-        device.destroy_image(img, None);
-        device.free_memory(mem, None);
-        return Err(e.into());
-    }
-    let view = match device.create_image_view(
-        &vk::ImageViewCreateInfo::default()
+            .memory_type_index(ti);
+        // SAFETY: fn contract; `alloc` is a local.
+        mem = unsafe { device.allocate_memory(&alloc, None) }?;
+        // SAFETY: `img` and `mem` were created above; neither is bound yet.
+        unsafe { device.bind_image_memory(img, mem, 0) }?;
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let info = vk::ImageViewCreateInfo::default()
             .image(img)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(fmt)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }),
-        None,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
+            .subresource_range(range);
+        // SAFETY: fn contract; `img` is bound above; `info` is a local.
+        Ok(unsafe { device.create_image_view(&info, None) }?)
+    })();
+    if view.is_err() {
+        // SAFETY: both were created above and never used; freeing a null `mem` is a no-op.
+        unsafe {
             device.destroy_image(img, None);
             device.free_memory(mem, None);
-            return Err(e.into());
         }
-    };
-    Ok((img, mem, view))
+    }
+    Ok((img, mem, view?))
 }
 
+/// Null handles are a no-op, so a partly built set unwinds here too.
+///
+/// # Safety
+///
+/// Every handle in `sets` is null or was created on the live `device`, and the GPU is
+/// done with all of them.
 unsafe fn destroy_sets(device: &ash::Device, sets: &[PlaneSet]) {
-    for set in sets {
-        for v in set.views {
-            device.destroy_image_view(v, None);
-        }
-        for i in set.imgs {
-            device.destroy_image(i, None);
-        }
-        for m in set.mems {
-            device.free_memory(m, None);
+    // SAFETY: fn contract.
+    unsafe {
+        for set in sets {
+            for v in set.views {
+                device.destroy_image_view(v, None);
+            }
+            for i in set.imgs {
+                device.destroy_image(i, None);
+            }
+            for m in set.mems {
+                device.free_memory(m, None);
+            }
         }
     }
 }
 
 /// Fresh [`RING`]-deep plane ring. Cleans up a partial ring on failure; the caller
 /// keeps whatever it was using.
+///
+/// # Safety
+///
+/// As [`make_plane`].
 unsafe fn build_ring(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -348,40 +361,26 @@ unsafe fn build_ring(
     };
     let mut ring: Vec<PlaneSet> = Vec::with_capacity(RING);
     for _ in 0..RING {
-        let built = (|| -> Result<PlaneSet> {
-            let (y, ym, yv) = make_plane(device, mem_props, width, height, fmt)?;
-            let (cb, cbm, cbv) = match make_plane(device, mem_props, cw, ch, fmt) {
-                Ok(p) => p,
+        // Null until built, so `destroy_sets` unwinds a partial set with the rest.
+        ring.push(PlaneSet {
+            imgs: [vk::Image::null(); 3],
+            mems: [vk::DeviceMemory::null(); 3],
+            views: [vk::ImageView::null(); 3],
+            initialized: false,
+        });
+        let set = ring.last_mut().expect("pushed above");
+        for (i, (w, h)) in [(width, height), (cw, ch), (cw, ch)]
+            .into_iter()
+            .enumerate()
+        {
+            // SAFETY: fn contract.
+            match unsafe { make_plane(device, mem_props, w, h, fmt) } {
+                Ok(p) => (set.imgs[i], set.mems[i], set.views[i]) = p,
                 Err(e) => {
-                    device.destroy_image_view(yv, None);
-                    device.destroy_image(y, None);
-                    device.free_memory(ym, None);
+                    // SAFETY: every handle in `ring` is null or made above, never used.
+                    unsafe { destroy_sets(device, &ring) };
                     return Err(e);
                 }
-            };
-            let (cr, crm, crv) = match make_plane(device, mem_props, cw, ch, fmt) {
-                Ok(p) => p,
-                Err(e) => {
-                    for (v, i, m) in [(yv, y, ym), (cbv, cb, cbm)] {
-                        device.destroy_image_view(v, None);
-                        device.destroy_image(i, None);
-                        device.free_memory(m, None);
-                    }
-                    return Err(e);
-                }
-            };
-            Ok(PlaneSet {
-                imgs: [y, cb, cr],
-                mems: [ym, cbm, crm],
-                views: [yv, cbv, crv],
-                initialized: false,
-            })
-        })();
-        match built {
-            Ok(set) => ring.push(set),
-            Err(e) => {
-                destroy_sets(device, &ring);
-                return Err(e);
             }
         }
     }
@@ -444,6 +443,10 @@ impl PyroWaveDecoder {
         unsafe { Self::new_inner(vkd, width, height, shard_payload, chroma444, color, hdr16) }
     }
 
+    /// # Safety
+    ///
+    /// `vkd`'s handles are the presenter's live instance and device, and they outlive
+    /// the decoder.
     unsafe fn new_inner(
         vkd: &VulkanDecodeDevice,
         width: u32,
@@ -453,18 +456,22 @@ impl PyroWaveDecoder {
         color: ColorDesc,
         hdr16: bool,
     ) -> Result<PyroWaveDecoder> {
-        let static_fn = ash::StaticFn {
-            get_instance_proc_addr: std::mem::transmute::<usize, vk::PFN_vkGetInstanceProcAddr>(
-                vkd.get_instance_proc_addr,
-            ),
+        // SAFETY: fn contract: `get_instance_proc_addr` is the loader's entry point for the
+        // live instance and device, so each table loads from live handles.
+        let (static_fn, instance, device) = unsafe {
+            let static_fn = ash::StaticFn {
+                get_instance_proc_addr: std::mem::transmute::<usize, vk::PFN_vkGetInstanceProcAddr>(
+                    vkd.get_instance_proc_addr,
+                ),
+            };
+            let instance_h = vk::Instance::from_raw(vkd.instance as u64);
+            let device_h = vk::Device::from_raw(vkd.device as u64);
+            let instance = ash::Instance::load(&static_fn, instance_h);
+            let device = ash::Device::load(instance.fp_v1_0(), device_h);
+            (static_fn, instance, device)
         };
-        let instance_h = vk::Instance::from_raw(vkd.instance as u64);
-        let device_h = vk::Device::from_raw(vkd.device as u64);
-        let entry = ash::Entry::from_static_fn(static_fn.clone());
-        let instance = ash::Instance::load(&static_fn, instance_h);
-        let device = ash::Device::load(instance.fp_v1_0(), device_h);
-        let queue = device.get_device_queue(vkd.graphics_qf, 0);
-        let _ = &entry;
+        // SAFETY: fn contract; the presenter created queue 0 of its graphics family.
+        let queue = unsafe { device.get_device_queue(vkd.graphics_qf, 0) };
 
         let hold = Box::new(Hold::build(vkd));
         let queue_lock = vkd.queue_lock.clone();
@@ -474,12 +481,14 @@ impl PyroWaveDecoder {
             index: 0,
         };
         let create = pw::pyrowave_device_create_info {
-            // SAFETY(cast): re-labels the loader entry point between ash's and bindgen's
+            // SAFETY: re-labels the loader entry point between ash's and bindgen's
             // identical C function-pointer types.
-            GetInstanceProcAddr: Some(std::mem::transmute::<
-                vk::PFN_vkGetInstanceProcAddr,
-                unsafe extern "C" fn(pw::VkInstance, *const c_char) -> pw::PFN_vkVoidFunction,
-            >(static_fn.get_instance_proc_addr)),
+            GetInstanceProcAddr: Some(unsafe {
+                std::mem::transmute::<
+                    vk::PFN_vkGetInstanceProcAddr,
+                    unsafe extern "C" fn(pw::VkInstance, *const c_char) -> pw::PFN_vkVoidFunction,
+                >(static_fn.get_instance_proc_addr)
+            }),
             instance: vkd.instance as pw::VkInstance,
             physical_device: vkd.physical_device as pw::VkPhysicalDevice,
             device: vkd.device as pw::VkDevice,
@@ -495,12 +504,14 @@ impl PyroWaveDecoder {
             userdata: Arc::as_ptr(&queue_lock) as *mut c_void,
         };
         let mut pw_dev: pw::pyrowave_device = std::ptr::null_mut();
-        pw_check(
-            pw::pyrowave_create_device(&create, &mut pw_dev),
-            "create_device (shared presenter device)",
-        )?;
-        let _ =
-            pw::pyrowave_device_set_queue_type(pw_dev, pw::VkQueueFlagBits_VK_QUEUE_COMPUTE_BIT);
+        // SAFETY: fn contract for the handles; `create` points at `hold`'s pinned
+        // create-infos, `queue_info` and the `queue_lock` the decoder keeps alive.
+        let created = unsafe { pw::pyrowave_create_device(&create, &mut pw_dev) };
+        pw_check(created, "create_device (shared presenter device)")?;
+        // SAFETY: `pw_dev` was created above.
+        let _ = unsafe {
+            pw::pyrowave_device_set_queue_type(pw_dev, pw::VkQueueFlagBits_VK_QUEUE_COMPUTE_BIT)
+        };
 
         let dinfo = pw::pyrowave_decoder_create_info {
             device: pw_dev,
@@ -515,58 +526,70 @@ impl PyroWaveDecoder {
             fragment_path: false,
         };
         let mut pw_dec: pw::pyrowave_decoder = std::ptr::null_mut();
-        if let Err(e) = pw_check(
-            pw::pyrowave_decoder_create(&dinfo, &mut pw_dec),
-            "decoder_create",
-        ) {
-            pw::pyrowave_device_destroy(pw_dev);
+        // SAFETY: `pw_dev` was created above; `dinfo` and `pw_dec` are locals.
+        let created = unsafe { pw::pyrowave_decoder_create(&dinfo, &mut pw_dec) };
+        if let Err(e) = pw_check(created, "decoder_create") {
+            // SAFETY: `pw_dev` has no decoder and no work.
+            unsafe { pw::pyrowave_device_destroy(pw_dev) };
             return Err(e);
         }
+        // Only the pyrowave objects exist yet: an early error destroys both.
+        let destroy_pw = || {
+            // SAFETY: `pw_dec` and `pw_dev` were created above and have recorded nothing.
+            unsafe {
+                pw::pyrowave_decoder_destroy(pw_dec);
+                pw::pyrowave_device_destroy(pw_dev);
+            }
+        };
 
-        let mem_props = instance.get_physical_device_memory_properties(
-            vk::PhysicalDevice::from_raw(vkd.physical_device as u64),
-        );
+        let pdev = vk::PhysicalDevice::from_raw(vkd.physical_device as u64);
+        // SAFETY: fn contract: `pdev` is the live instance's physical device.
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
         // R16_UNORM STORAGE_IMAGE is optional in Vulkan. Probe so a miss is a clear
         // error instead of a validation failure.
         let plane_fmt = if hdr16 {
-            let props = instance.get_physical_device_format_properties(
-                vk::PhysicalDevice::from_raw(vkd.physical_device as u64),
-                vk::Format::R16_UNORM,
-            );
+            // SAFETY: as above.
+            let props = unsafe {
+                instance.get_physical_device_format_properties(pdev, vk::Format::R16_UNORM)
+            };
             if !props
                 .optimal_tiling_features
                 .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
             {
-                pw::pyrowave_decoder_destroy(pw_dec);
-                pw::pyrowave_device_destroy(pw_dev);
+                destroy_pw();
                 bail!("this GPU lacks R16_UNORM STORAGE_IMAGE — cannot decode a 10-bit PyroWave session");
             }
             vk::Format::R16_UNORM
         } else {
             vk::Format::R8_UNORM
         };
-        let ring = match build_ring(&device, &mem_props, width, height, chroma444, plane_fmt) {
-            Ok(r) => r,
-            Err(e) => {
-                pw::pyrowave_decoder_destroy(pw_dec);
-                pw::pyrowave_device_destroy(pw_dev);
-                return Err(e);
-            }
-        };
+        // SAFETY: fn contract; `mem_props` are the device's physical device's.
+        let ring =
+            match unsafe { build_ring(&device, &mem_props, width, height, chroma444, plane_fmt) } {
+                Ok(r) => r,
+                Err(e) => {
+                    destroy_pw();
+                    return Err(e);
+                }
+            };
 
-        let cmd_pool = device.create_command_pool(
-            &vk::CommandPoolCreateInfo::default()
-                .queue_family_index(vkd.graphics_qf)
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-            None,
-        )?;
-        let cmd = device.allocate_command_buffers(
-            &vk::CommandBufferAllocateInfo::default()
-                .command_pool(cmd_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1),
-        )?[0];
-        let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+        // SAFETY: fn contract; every create-info is a local that outlives its call.
+        let (cmd_pool, cmd, fence) = unsafe {
+            let cmd_pool = device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(vkd.graphics_qf)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )?;
+            let cmd = device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            (cmd_pool, cmd, fence)
+        };
 
         tracing::info!(
             width,
@@ -600,7 +623,7 @@ impl PyroWaveDecoder {
     /// pinned create-infos are dimension-independent and survive. Build-new-before-drop-old:
     /// failure leaves the current decoder untouched. The old ring is retired, not
     /// destroyed (see [`RETIRE_HANDOVERS`]).
-    unsafe fn reconfigure(&mut self, width: u32, height: u32) -> Result<()> {
+    fn reconfigure(&mut self, width: u32, height: u32) -> Result<()> {
         if !self.chroma444 && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (resize to {width}x{height})");
         }
@@ -617,31 +640,35 @@ impl PyroWaveDecoder {
             fragment_path: false,
         };
         let mut new_dec: pw::pyrowave_decoder = std::ptr::null_mut();
-        pw_check(
-            pw::pyrowave_decoder_create(&dinfo, &mut new_dec),
-            "decoder_create (mid-stream resize)",
-        )?;
-        let new_ring = match build_ring(
-            &self.device,
-            &self.mem_props,
-            width,
-            height,
-            self.chroma444,
-            if self.hdr16 {
-                vk::Format::R16_UNORM
-            } else {
-                vk::Format::R8_UNORM
-            },
-        ) {
+        // SAFETY: `pw_dev` is this decoder's live device; `dinfo`/`new_dec` are locals.
+        let created = unsafe { pw::pyrowave_decoder_create(&dinfo, &mut new_dec) };
+        pw_check(created, "decoder_create (mid-stream resize)")?;
+        let fmt = if self.hdr16 {
+            vk::Format::R16_UNORM
+        } else {
+            vk::Format::R8_UNORM
+        };
+        // SAFETY: `device` is the presenter's live device; `mem_props` are its GPU's.
+        let new_ring = match unsafe {
+            build_ring(
+                &self.device,
+                &self.mem_props,
+                width,
+                height,
+                self.chroma444,
+                fmt,
+            )
+        } {
             Ok(r) => r,
             Err(e) => {
-                pw::pyrowave_decoder_destroy(new_dec);
+                // SAFETY: `new_dec` was created above and has decoded nothing.
+                unsafe { pw::pyrowave_decoder_destroy(new_dec) };
                 return Err(e).context("plane ring (mid-stream resize)");
             }
         };
-        // Decode is fence-synchronous here, so the old decoder can go now; only the
-        // plane images wait (retired).
-        pw::pyrowave_decoder_destroy(self.pw_dec);
+        // SAFETY: decode is fence-synchronous, so no work of the old decoder is in
+        // flight and it can go now; only the plane images wait (retired).
+        unsafe { pw::pyrowave_decoder_destroy(self.pw_dec) };
         self.pw_dec = new_dec;
         let old = std::mem::replace(&mut self.ring, new_ring);
         self.retired.push(RetiredRing {
@@ -662,7 +689,7 @@ impl PyroWaveDecoder {
 
     /// Destroy retired rings that have enough new-ring handovers and have aged past
     /// [`RETIRE_MIN_AGE`]. Queue idle bounds any still-submitted sampling of those views.
-    unsafe fn reap_retired(&mut self) {
+    fn reap_retired(&mut self) {
         let ripe = |r: &RetiredRing| {
             r.handed_over >= RETIRE_HANDOVERS && r.retired_at.elapsed() >= RETIRE_MIN_AGE
         };
@@ -671,12 +698,15 @@ impl PyroWaveDecoder {
         }
         {
             let _guard = self.queue_lock.guard();
-            let _ = self.device.queue_wait_idle(self.queue);
+            // SAFETY: `queue` external sync is `queue_lock`, held above.
+            let _ = unsafe { self.device.queue_wait_idle(self.queue) };
         }
         let mut kept = Vec::new();
         for r in self.retired.drain(..) {
             if ripe(&r) {
-                destroy_sets(&self.device, &r.sets);
+                // SAFETY: the ring is this decoder's. The queue idle above ended every
+                // submitted read; RETIRE_HANDOVERS/RETIRE_MIN_AGE outlast unsubmitted ones.
+                unsafe { destroy_sets(&self.device, &r.sets) };
             } else {
                 kept.push(r);
             }
@@ -684,24 +714,24 @@ impl PyroWaveDecoder {
         self.retired = kept;
     }
 
-    /// One AU in → one frame out. `aligned`: shard-window chunked (each `wire_window`
-    /// holds whole self-delimiting packets, zero-padded). `complete`: every shard arrived;
-    /// a partial still decodes — missing blocks are localized blur for this frame only.
-    pub fn decode_frame(
-        &mut self,
-        au: &[u8],
-        aligned: bool,
-        complete: bool,
-    ) -> Result<Option<PyroWavePlanarFrame>> {
-        // SAFETY: single decode thread; all handles owned/pinned by `self`; queue access
-        // serialized under QueueLock; the fence bounds GPU completion before handover.
-        unsafe { self.decode_inner(au, aligned, complete) }
+    /// Push one packet into the decoder.
+    fn push_packet(&mut self, packet: &[u8], what: &str) -> Result<()> {
+        // SAFETY: `pw_dec` is this decoder's live decoder; `packet` is a live slice for
+        // the call.
+        let r = unsafe {
+            pw::pyrowave_decoder_push_packet(
+                self.pw_dec,
+                packet.as_ptr() as *const c_void,
+                packet.len(),
+            )
+        };
+        pw_check(r, what)
     }
 
     /// One framed shard window: 4-byte prefix (`used:u16`, `kind:u16`) then whole packets
     /// (PACKED) or one fragment of an oversized packet (FRAG chain). A lost shard is a
     /// zeroed window (`used = 0`) — skip it and break any fragment chain it interrupts.
-    unsafe fn push_window(&mut self, win: &[u8], frag: &mut Vec<u8>) -> Result<()> {
+    fn push_window(&mut self, win: &[u8], frag: &mut Vec<u8>) -> Result<()> {
         if win.len() < 4 {
             return Ok(());
         }
@@ -715,14 +745,7 @@ impl PyroWaveDecoder {
         match kind {
             0 => {
                 frag.clear();
-                pw_check(
-                    pw::pyrowave_decoder_push_packet(
-                        self.pw_dec,
-                        body.as_ptr() as *const c_void,
-                        body.len(),
-                    ),
-                    "push_packet",
-                )
+                self.push_packet(body, "push_packet")
             }
             1 => {
                 frag.clear();
@@ -738,14 +761,7 @@ impl PyroWaveDecoder {
             3 => {
                 if !frag.is_empty() {
                     frag.extend_from_slice(body);
-                    let r = pw_check(
-                        pw::pyrowave_decoder_push_packet(
-                            self.pw_dec,
-                            frag.as_ptr() as *const c_void,
-                            frag.len(),
-                        ),
-                        "push_packet (fragmented)",
-                    );
+                    let r = self.push_packet(frag, "push_packet (fragmented)");
                     frag.clear();
                     return r;
                 }
@@ -758,7 +774,10 @@ impl PyroWaveDecoder {
         }
     }
 
-    unsafe fn decode_inner(
+    /// One AU in → one frame out. `aligned`: shard-window chunked (each `wire_window`
+    /// holds whole self-delimiting packets, zero-padded). `complete`: every shard arrived;
+    /// a partial still decodes — missing blocks are localized blur for this frame only.
+    pub fn decode_frame(
         &mut self,
         au: &[u8],
         aligned: bool,
@@ -781,10 +800,7 @@ impl PyroWaveDecoder {
                     break;
                 }
             }
-        } else if let Err(e) = pw_check(
-            pw::pyrowave_decoder_push_packet(self.pw_dec, au.as_ptr() as *const c_void, au.len()),
-            "push_packet",
-        ) {
+        } else if let Err(e) = self.push_packet(au, "push_packet") {
             push_err = Some(e);
         }
         if let Some(e) = push_err {
@@ -800,18 +816,64 @@ impl PyroWaveDecoder {
         // A complete AU that isn't ready is a stale/duplicate (sequence rewind) — skip.
         // A partial still decodes: missing wavelet blocks reconstruct as zeros (blur
         // for this frame only).
-        if complete && !pw::pyrowave_decoder_decode_is_ready(self.pw_dec, false) {
+        // SAFETY: `pw_dec` is this decoder's live decoder.
+        if complete && !unsafe { pw::pyrowave_decoder_decode_is_ready(self.pw_dec, false) } {
             return Ok(None);
         }
 
         let slot = self.next;
         self.next = (self.next + 1) % RING;
+        if let Err(e) = self.record_and_wait(slot) {
+            // The buffer may still be recording or on the GPU, and the pump keeps this decoder:
+            // idle the queue, then reset the buffer so the next frame can begin on it.
+            let _guard = self.queue_lock.guard();
+            // SAFETY: `queue_lock` is held; after the idle `cmd` (from a RESET_COMMAND_BUFFER
+            // pool) is not pending, so it can be reset.
+            unsafe {
+                let _ = self.device.queue_wait_idle(self.queue);
+                let _ = self
+                    .device
+                    .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty());
+            }
+            return Err(e);
+        }
+        self.ring[slot].initialized = true;
+
+        for r in &mut self.retired {
+            r.handed_over += 1;
+        }
+        self.reap_retired();
+
+        let (w, h) = (self.width, self.height);
+        Ok(Some(PyroWavePlanarFrame {
+            views: [
+                self.ring[slot].views[0].as_raw(),
+                self.ring[slot].views[1].as_raw(),
+                self.ring[slot].views[2].as_raw(),
+            ],
+            luma: self.ring[slot].imgs[0].as_raw(),
+            chroma444: self.chroma444,
+            width: w,
+            height: h,
+            color: self.color,
+            ten_bit: self.hdr16,
+            keyframe: true,
+        }))
+    }
+
+    /// Record `slot`'s decode, submit it, and wait for its fence. On `Err` the command buffer
+    /// may be recording or pending; the caller idles the queue before reusing it.
+    fn record_and_wait(&mut self, slot: usize) -> Result<()> {
         let dev = self.device.clone();
-        dev.begin_command_buffer(
-            self.cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
+        // SAFETY: `cmd` is this decoder's and idle: the last submit's fence was waited, or
+        // a failed decode idled the queue and reset it.
+        unsafe {
+            dev.begin_command_buffer(
+                self.cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }?;
         let old_layout = if self.ring[slot].initialized {
             vk::ImageLayout::GENERAL
         } else {
@@ -842,10 +904,13 @@ impl PyroWaveDecoder {
                 .subresource_range(range)
         };
         let pre: Vec<_> = self.ring[slot].imgs.iter().map(|&i| to_write(i)).collect();
-        dev.cmd_pipeline_barrier2(
-            self.cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&pre),
-        );
+        // SAFETY: `cmd` is recording (begun above); `pre` names this decoder's ring images.
+        unsafe {
+            dev.cmd_pipeline_barrier2(
+                self.cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&pre),
+            )
+        };
 
         // Declared format/extent must equal the ring image. pyrowave wraps our VkImage
         // and creates a storage view from `image_format`/`view_format`; R8 over R16_UNORM
@@ -880,17 +945,23 @@ impl PyroWaveDecoder {
                 plane(self.ring[slot].imgs[2], cw, ch),
             ],
         };
-        pw::pyrowave_device_set_command_buffer(
-            self.pw_dev,
-            self.cmd.as_raw() as usize as pw::VkCommandBuffer,
-        );
-        let dec_res = pw::pyrowave_decoder_decode_gpu_buffer(
-            self.pw_dec,
-            std::ptr::null(),
-            std::ptr::null(),
-            &buffers,
-        );
-        pw::pyrowave_device_set_command_buffer(self.pw_dev, std::ptr::null_mut());
+        // SAFETY: `pw_dev`/`pw_dec` are this decoder's; `cmd` is recording on this thread
+        // only and is unset again before return. `buffers` names the slot's ring images at
+        // their created format and extent, in GENERAL after the barrier above.
+        let dec_res = unsafe {
+            pw::pyrowave_device_set_command_buffer(
+                self.pw_dev,
+                self.cmd.as_raw() as usize as pw::VkCommandBuffer,
+            );
+            let r = pw::pyrowave_decoder_decode_gpu_buffer(
+                self.pw_dec,
+                std::ptr::null(),
+                std::ptr::null(),
+                &buffers,
+            );
+            pw::pyrowave_device_set_command_buffer(self.pw_dev, std::ptr::null_mut());
+            r
+        };
         pw_check(dec_res, "decode_gpu_buffer")?;
 
         // Storage writes → presenter fragment sampling. Layout stays GENERAL: that is
@@ -907,45 +978,33 @@ impl PyroWaveDecoder {
                 .subresource_range(range)
         };
         let post: Vec<_> = self.ring[slot].imgs.iter().map(|&i| to_read(i)).collect();
-        dev.cmd_pipeline_barrier2(
-            self.cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&post),
-        );
-        dev.end_command_buffer(self.cmd)?;
-
-        dev.reset_fences(&[self.fence])?;
+        // SAFETY: `cmd` is still recording; `post` names this decoder's ring images. The
+        // fence is not pending: the last submit's wait finished, or the queue was idled.
+        unsafe {
+            dev.cmd_pipeline_barrier2(
+                self.cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&post),
+            );
+            dev.end_command_buffer(self.cmd)?;
+            dev.reset_fences(&[self.fence])?;
+        }
         {
             let _guard = self.queue_lock.guard();
             let cmds = [self.cmd];
-            dev.queue_submit(
-                self.queue,
-                &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                self.fence,
-            )?;
+            // SAFETY: `queue` external sync is `queue_lock`, held above; `cmd` is executable
+            // and `fence` unsignalled; the submit info and `cmds` are locals.
+            unsafe {
+                dev.queue_submit(
+                    self.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                    self.fence,
+                )
+            }?;
         }
-        dev.wait_for_fences(&[self.fence], true, 5_000_000_000)
+        // SAFETY: `fence` is this decoder's, named by the submit above.
+        unsafe { dev.wait_for_fences(&[self.fence], true, 5_000_000_000) }
             .context("pyrowave decode fence")?;
-        self.ring[slot].initialized = true;
-
-        for r in &mut self.retired {
-            r.handed_over += 1;
-        }
-        self.reap_retired();
-
-        Ok(Some(PyroWavePlanarFrame {
-            views: [
-                self.ring[slot].views[0].as_raw(),
-                self.ring[slot].views[1].as_raw(),
-                self.ring[slot].views[2].as_raw(),
-            ],
-            luma: self.ring[slot].imgs[0].as_raw(),
-            chroma444: self.chroma444,
-            width: w,
-            height: h,
-            color: self.color,
-            ten_bit: self.hdr16,
-            keyframe: true,
-        }))
+        Ok(())
     }
 }
 

@@ -26,6 +26,9 @@ final class AudioDeviceWatcher {
         case engineConfiguration = "the audio hardware configuration changed"
         /// The system's default output device moved (macOS).
         case defaultOutputDevice = "the default output device changed"
+        /// An audio device came or went (macOS): a pinned device can return without becoming the
+        /// default.
+        case deviceList = "an audio device came or went"
     }
 
     /// Does this configuration change belong to an engine the session still owns? A retired engine
@@ -79,9 +82,10 @@ final class AudioDeviceWatcher {
         // to notify anyone) and on an engine topology whose notification behaviour is unverified
         // (the voice-processing engine, which is the DEFAULT macOS configuration and which no Mac
         // here can even initialize). The HAL is told either way.
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        let block: AudioObjectPropertyListenerBlock = { [weak self] count, addresses in
             // On the main queue — registered against it below. No engine posted this, so nil.
-            self?.onChange(.defaultOutputDevice, nil)
+            let list = count > 0 && addresses[0].mSelector == kAudioHardwarePropertyDevices
+            self?.onChange(list ? .deviceList : .defaultOutputDevice, nil)
         }
         var address = Self.defaultOutputAddress()
         let status = AudioObjectAddPropertyListenerBlock(
@@ -92,6 +96,12 @@ final class AudioDeviceWatcher {
                 mid-stream may need a reconnect
                 """)
             return
+        }
+        var devices = Self.deviceListAddress()
+        let listStatus = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &devices, DispatchQueue.main, block)
+        if listStatus != noErr {
+            log.warning("no listener on the device list (\(listStatus)) — a replugged pinned device needs a reconnect")
         }
         lock.lock()
         defaultOutputListener = block
@@ -116,6 +126,9 @@ final class AudioDeviceWatcher {
         var address = Self.defaultOutputAddress()
         AudioObjectRemovePropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject), &address, DispatchQueue.main, listener)
+        var devices = Self.deviceListAddress()
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &devices, DispatchQueue.main, listener)
         #endif
     }
 
@@ -126,6 +139,13 @@ final class AudioDeviceWatcher {
     private static func defaultOutputAddress() -> AudioObjectPropertyAddress {
         AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+    }
+
+    private static func deviceListAddress() -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain)
     }

@@ -9,6 +9,8 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Managed emulators: install, detect, remove. Pinned to a commit until it is on crates.io.
+hermir = { git = "https://github.com/unom-io/hermir", rev = "26f87cb857670517b83f59d7a56d651ebfd403fe" }
 # `ureq-tls` is for `ctl`: ureq's own `TlsConfig` has no hook for a custom certificate verifier,
 # so the pinned operator client hands rustls a `ClientConfig` through core's shared glue — the same
 # path the tray and the desktop client already take. `quic` brings `tls` (and `PinVerify`) with it.
@@ -217,6 +219,8 @@ utoipa-scalar = { version = "0.3", features = ["axum"] }
 # normal dependency above and those are visible to tests — the dev-dependency re-declaration was
 # redundant.)
 http-body-util = "0.1"
+# An HTTP/2 client for the management API's multiplexing test (`gamestream/tls.rs`).
+h2 = "0.4"
 # Disposable directory fixtures for the Steam local-librarycache scan tests (library.rs).
 tempfile = "3"
 
@@ -229,7 +233,7 @@ tempfile = "3"
 opus = "0.3"
 
 [target.'cfg(unix)'.dependencies]
-# The POSIX calls behind the `#[cfg(unix)]` helpers in `hooks.rs` (geteuid) and the SIGTERM
+# The POSIX calls behind the `#[cfg(unix)]` helpers in `hooks.rs` (kill) and the SIGTERM
 # ladder in `gamelease.rs`. Declared for every unix, not just Linux, or a macOS build fails on
 # code whose own cfg already says it is portable.
 libc = "0.2"

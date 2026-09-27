@@ -358,6 +358,23 @@ pub(crate) fn grant_acl(dir: &std::path::Path, write: bool) -> std::io::Result<(
     plat::grant(dir, write).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
+/// A managed emulator runs in the player's session and, portable, writes beside its exe: on
+/// Windows the folder gets `Users: Modify`. Best-effort; POSIX needs none.
+#[cfg(windows)]
+pub(crate) fn open_for_players(dir: &std::path::Path) {
+    let ok = std::process::Command::new(windows::icacls_path())
+        .arg(dir)
+        .args(["/grant", "*S-1-5-32-545:(OI)(CI)M"])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        tracing::warn!(dir = %dir.display(), "emulator folder not opened to players");
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn open_for_players(_dir: &std::path::Path) {}
+
 /// Take the runner's ACE off a folder no plugin holds any more. POSIX has none to take.
 pub(crate) fn revoke_acl(dir: &std::path::Path) -> std::io::Result<()> {
     plat::revoke(dir).map_err(|e| std::io::Error::other(e.to_string()))

@@ -348,7 +348,7 @@ pub(crate) struct ActiveGame {
     /// Which store surfaced it (`steam`, `heroic`, `custom`, …), when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     store: Option<String>,
-    /// `native` or `gamestream`.
+    /// `native`, `gamestream` or `web`.
     plane: crate::events::Plane,
     /// `launching` | `running` | `window` (its window is on the streamed screen) | `exited` |
     /// `untracked` (exit will never be seen) | `grace` (reconnect window).
@@ -628,7 +628,7 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
     let sessions: Vec<SessionRow> = native
         .iter()
         .map(|s| {
-            let native_plane = s.plane == crate::events::Plane::Native;
+            let native_plane = s.plane != crate::events::Plane::Gamestream;
             SessionRow {
                 id: Some(s.id),
                 plane: s.plane,

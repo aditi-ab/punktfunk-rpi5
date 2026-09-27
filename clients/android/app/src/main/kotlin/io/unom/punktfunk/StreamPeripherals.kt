@@ -2,6 +2,7 @@ package io.unom.punktfunk
 
 import android.content.BroadcastReceiver
 import android.content.Context
+import android.hardware.usb.UsbManager
 import android.util.Log
 import android.view.SurfaceView
 import androidx.compose.ui.geometry.Offset
@@ -334,6 +335,18 @@ internal class StreamPeripherals(
                 )
             }
         }
+        activity?.recaptureUsbPads = ::recaptureUsbPads
+    }
+
+    /**
+     * A pad plugged back in mid-stream: capture it again when its grant already stands. An unplug
+     * ends the link; without this the pad stays on the plain input path for the rest of the
+     * session. Never asks — a permission dialog does not belong in the middle of a game.
+     */
+    private fun recaptureUsbPads() {
+        val usb = context.getSystemService(Context.USB_SERVICE) as UsbManager
+        ds?.takeIf { !it.isActive }?.findUsbDevice()?.takeIf(usb::hasPermission)?.let { ds?.startUsb(it) }
+        sc2?.takeIf { !it.isActive }?.findUsbDevice()?.takeIf(usb::hasPermission)?.let { sc2?.startUsb(it) }
     }
 
     /**
@@ -367,6 +380,7 @@ internal class StreamPeripherals(
 
     /** Release in the order the handle's lifetime needs; the caller closes the handle after. */
     fun stop() {
+        activity?.recaptureUsbPads = null
         clip?.stop() // stop + join the clipboard poll thread BEFORE the handle is freed
         feedback.onHidRaw = null
         feedback.sink = null

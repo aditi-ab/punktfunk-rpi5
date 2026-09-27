@@ -62,6 +62,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.startIn) var startInRaw = StartIn.hosts.stored
     @AppStorage(DefaultsKey.defaultHost) var defaultHostID = ""
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) var fullscreenWhileStreaming = true
+    @AppStorage(DefaultsKey.fullscreenAlways) var fullscreenAlways = false
     @AppStorage(DefaultsKey.micEnabled) var micEnabled = true
     @AppStorage(DefaultsKey.echoCancel) var echoCancel = true
     @AppStorage(DefaultsKey.keepHostAudio) var keepHostAudio = false
@@ -97,6 +98,10 @@ struct SettingsView: View {
     @State var showQuickActions = false
     #if DEBUG && !os(tvOS)
     @State var showControllerTest = false
+    #endif
+    #if !os(tvOS)
+    /// The OS keeps the controller's Home press from the stream (`watchHomeButton`).
+    @State var homeButtonKept = false
     #endif
     #if os(iOS)
     @AppStorage(DefaultsKey.pointerCapture) var pointerCapture = true
@@ -578,7 +583,9 @@ struct SettingsView: View {
                     Button(role: .destructive) {
                         presetPendingDelete = active
                     } label: {
+                        // Text and symbol in one colour: the role reddens only the text.
                         Label("Delete…", systemImage: "trash")
+                            .foregroundStyle(.red)
                     }
                 }
             }

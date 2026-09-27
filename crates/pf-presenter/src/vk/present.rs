@@ -15,6 +15,7 @@
 //! Evidence: `csc_depth_packing` table tests; `design/pyrowave-444-hdr.md`.
 
 use super::gpu::*;
+use super::present_timing::SLICE_NS;
 use super::{BusyOn, DirectLast, DirectSrc, FrameInput, Presented, Presenter, Retired};
 use crate::csc::csc_rows;
 #[cfg(target_os = "linux")]
@@ -170,8 +171,10 @@ impl Presenter {
                 }
             }
             if self.acquired.is_none() {
-                // SAFETY: `swapchain`/`acquire_sem` are owned; the last submit that waited
-                // `acquire_sem` is fence-complete (checked above), so it is not pending.
+                // The non-blocking probe runs only without a present waiter: no swapchain lock.
+                // SAFETY: `swapchain`/`acquire_sem` are owned. No image is held, so every wait
+                // on `acquire_sem` is complete: a present's by its fence (checked above), a
+                // discarded image's by `recreate_swapchain`'s queue drain.
                 match unsafe {
                     self.swap_d.acquire_next_image(
                         self.swapchain,
@@ -313,7 +316,10 @@ impl Presenter {
         // generation can go now.
         #[cfg(windows)]
         if let (Some((d, _)), Some(hw)) = (&win_frame, self.hw_win.as_mut()) {
-            hw.imports.retire_stale(&self.device, d.generation);
+            // The retained slot may name a retired import; a `Redraw` must not sample it.
+            if hw.imports.retire_stale(&self.device, d.generation) {
+                self.retained_slot = None;
+            }
         }
         // Same for a rebuilt VAAPI pool; another lane's frame means that decoder is
         // gone, and its cached imports pin the pool's memory until they go too.
@@ -465,15 +471,8 @@ impl Presenter {
         let targets_ready = self.overlay_pipe.framebuffers.len() == self.images.len();
         let filtered = match (placement, &self.video) {
             (Some(p), Some(v)) if !from_slot && targets_ready && crate::scale::needs_filter(&p) => {
-                let (device, mem_props) = (&self.device, &self.mem_props);
-                self.scale.prepare(device, v.height, &p, v.view, |reqs| {
-                    allocate(
-                        device,
-                        mem_props,
-                        reqs,
-                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    )
-                })?;
+                self.scale
+                    .prepare(&self.device, &self.mem_props, v.height, &p, v.view)?;
                 Some(p)
             }
             _ => None,
@@ -576,18 +575,33 @@ impl Presenter {
 
         let acquire_started = std::time::Instant::now();
         // An image taken by the non-blocking probe above is used as is.
-        let acquired = match self.acquired.take() {
+        let acquired = match self.acquired {
             Some(index) => Ok((index, false)),
-            // SAFETY: `swapchain` and `acquire_sem` are owned here. Fence wait above
-            // completed the last submit that waited `acquire_sem`, so it is not pending.
-            None => unsafe {
-                self.swap_d.acquire_next_image(
-                    self.swapchain,
-                    u64::MAX,
-                    self.acquire_sem,
-                    vk::Fence::null(),
-                )
-            },
+            None => {
+                // With a present waiter, each call holds the swapchain for one bounded slice.
+                let timeout = match self.present_timer {
+                    Some(_) => SLICE_NS,
+                    None => u64::MAX,
+                };
+                loop {
+                    let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
+                    // SAFETY: `swapchain` and `acquire_sem` are owned here; the guard above is
+                    // the swapchain's host sync. No image is held, so every wait on
+                    // `acquire_sem` is complete: a present's by the fence wait above, a
+                    // discarded image's by `recreate_swapchain`'s queue drain.
+                    let r = unsafe {
+                        self.swap_d.acquire_next_image(
+                            self.swapchain,
+                            timeout,
+                            self.acquire_sem,
+                            vk::Fence::null(),
+                        )
+                    };
+                    if r != Err(vk::Result::TIMEOUT) {
+                        break r;
+                    }
+                }
+            }
         };
         let (index, _suboptimal) = match acquired {
             Ok(r) => r,
@@ -602,6 +616,9 @@ impl Presenter {
             }
             Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
         };
+        // Held until the submit waits `acquire_sem`: an error before then leaves the image
+        // for the next present, or for `recreate_swapchain` to retire.
+        self.acquired = Some(index);
         self.last_acquire_us = acquire_started.elapsed().as_micros() as u32;
         let swap_image = self.images[index as usize];
         let direct_target = direct.map(|(_, plan)| CscTarget::Direct {
@@ -1151,6 +1168,7 @@ impl Presenter {
             self.last_submit_us = submit_started.elapsed().as_micros() as u32;
             submitted?;
             self.submitted = true;
+            self.acquired = None;
             // A real frame from any other lane ends the D3D11 picture; `Redraw` keeps it.
             #[cfg(windows)]
             {
@@ -1190,8 +1208,10 @@ impl Presenter {
             }
             let present_started = std::time::Instant::now();
             // Same queue external-sync as the submit. Scoped tightly: OUT_OF_DATE
-            // re-enters the lock via `recreate_swapchain`'s queue drain.
+            // re-enters the lock via `recreate_swapchain`'s queue drain. The swapchain
+            // guard comes first, so a waiter slice never holds off decode submits.
             let present_res = {
+                let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
                 let _q = self.queue_lock.guard();
                 self.swap_d.queue_present(self.queue, &present_info)
             };

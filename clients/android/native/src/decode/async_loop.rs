@@ -6,7 +6,7 @@ use ndk::native_window::NativeWindow;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::error::PunktfunkError;
 use punktfunk_core::packet::FLAG_SOF;
-use punktfunk_core::reanchor::{GateVerdict, ReanchorGate};
+use punktfunk_core::reanchor::{AuAdmission, DecoderClass, GateVerdict, ReanchorGate, Resume};
 use punktfunk_core::session::Frame;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -30,6 +30,7 @@ use super::surface_control::{Layer, PresentComplete};
 use super::vsync::{now_monotonic_ns, VsyncClock, VsyncShared};
 use super::{Backstops, DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP};
 use crate::input_stall::{InputStall, INPUT_STALL_PATIENCE};
+use crate::sysprop;
 
 /// One decoded output buffer ready to release: its codec buffer index + the pts the codec echoed
 /// (from the output callback's `BufferInfo`), used to pair the `decode` HUD stat, and the
@@ -66,6 +67,8 @@ pub(super) enum DecodeEvent {
     FormatChanged,
     /// A panel vsync (from the [`VsyncClock`] thread) — the presenter's retry/pacing tick.
     Vsync,
+    /// A rendered frame reached the ASC reader. Only wakes the loop: its pass drains the reader.
+    ImageAvailable,
     /// An `ASurfaceControl` transaction completed (ASurfaceControl backend only): the real latch
     /// time + the previous buffer's release fence, forwarded from the completion callback (a binder
     /// thread) so the decode loop applies it on its own thread.
@@ -330,6 +333,7 @@ fn run_codec(
         decoded_size: opts.decoded_size.clone(),
     };
     let mut state = State::new(asc, presenter, ReanchorGate::new(client.frames_dropped()));
+    state.admit = admission(client.codec, &ctx.codec.name().unwrap_or_default());
     if rebuilt {
         // A fresh decoder holds no reference picture, so every P-frame before a keyframe is a
         // reference error, and reference errors can hang a hardware decoder. None reach this one.
@@ -558,6 +562,7 @@ fn bring_up(
             )
             .map(|mut a| {
                 a.set_hdr_meta(hdr_static);
+                a.wake_on_image(ev_tx.clone());
                 a
             })
         });
@@ -667,6 +672,8 @@ struct Pass {
     aus_dropped: u64,
     /// The codec freed an input slot this pass (the hung-codec check, see [`InputStall`]).
     input_offered: bool,
+    /// The admission rule asked for a keyframe this pass.
+    ask_keyframe: bool,
     /// ASurfaceControl transaction completions, applied after the drain (on the decode thread,
     /// not the binder thread that posted them).
     present_completes: Vec<PresentComplete>,
@@ -706,6 +713,45 @@ struct State {
     /// A rebuilt run drops every AU before the first keyframe.
     await_keyframe: bool,
     backstops: Backstops,
+    /// The receiver rule on AV1 sessions ([`admission`]); `None` feeds every AU.
+    admit: Option<Admit>,
+    /// AUs the rule kept off the codec. They owe output like fed ones ([`Backstops::poll`]).
+    withheld: u64,
+}
+
+/// [`AuAdmission`] and what the loop keeps beside it.
+struct Admit {
+    rule: AuAdmission,
+    class: DecoderClass,
+    /// The AU whose parts are withheld: the rule decides on the first part.
+    parts_of: Option<u32>,
+    /// A backstop asked for a keyframe during the current stretch.
+    backstop: bool,
+    /// This loop dropped an admitted AU; the next first part is noted with a gap.
+    local_gap: bool,
+}
+
+/// The receiver rule for this session: AV1 only, strict on the Tensor G5 decoder, lenient on
+/// the rest. `debug.punktfunk.au_admission` = `strict` / `lenient` / `off` overrides the pick.
+fn admission(codec: u8, decoder: &str) -> Option<Admit> {
+    if codec != punktfunk_core::quic::CODEC_AV1 {
+        return None;
+    }
+    let class = match sysprop(c"debug.punktfunk.au_admission").as_deref() {
+        Some("off") => return None,
+        Some("strict") => DecoderClass::Strict,
+        Some("lenient") => DecoderClass::Lenient,
+        _ if decoder == "c2.google.av1.decoder" => DecoderClass::Strict,
+        _ => DecoderClass::Lenient,
+    };
+    log::info!("decode: AV1 AU admission {class:?} for {decoder}");
+    Some(Admit {
+        rule: AuAdmission::default(),
+        class,
+        parts_of: None,
+        backstop: false,
+        local_gap: false,
+    })
 }
 
 impl State {
@@ -732,6 +778,8 @@ impl State {
             stall: InputStall::default(),
             await_keyframe: false,
             backstops: Backstops::new(),
+            admit: None,
+            withheld: 0,
         }
     }
 
@@ -746,6 +794,9 @@ impl State {
                 if gap > 0 {
                     self.gate
                         .arm_expecting_drops(Instant::now(), u64::from(gap));
+                }
+                if self.withhold(&f, gap, pass) {
+                    return;
                 }
                 if self.await_keyframe {
                     if f.flags & u32::from(FLAG_SOF) == 0 {
@@ -774,6 +825,7 @@ impl State {
                 if self.pending_aus.len() > FRAME_PARK_CAP {
                     self.pending_aus.pop_front(); // sustained overflow — drop oldest
                     pass.aus_dropped += 1;
+                    self.local_loss(pass);
                 }
             }
             DecodeEvent::InputAvailable(i) => {
@@ -793,11 +845,66 @@ impl State {
             }),
             DecodeEvent::FormatChanged => pass.fmt_dirty = true,
             DecodeEvent::Vsync => pass.vsync_tick = true,
+            DecodeEvent::ImageAvailable => {}
             DecodeEvent::Error { fatal: true } => self.fatal = true,
             // A recoverable/transient codec error is a decode hiccup on a broken reference chain —
             // arm the freeze so the concealed output it recovers into is held off the screen.
             DecodeEvent::Error { fatal: false } => self.gate.arm(Instant::now()),
             DecodeEvent::PresentComplete(pc) => pass.present_completes.push(pc),
+        }
+    }
+
+    /// The receiver rule ([`Admit`]): `true` keeps `f` off the codec and out of
+    /// `recovery_flags`. Decided on an AU's first part; its later parts follow.
+    fn withhold(&mut self, f: &Frame, gap: u32, pass: &mut Pass) -> bool {
+        let Some(a) = self.admit.as_mut() else {
+            return false;
+        };
+        if f.part.is_some_and(|p| !p.first) {
+            return a.parts_of == Some(f.frame_index);
+        }
+        let gap = if std::mem::take(&mut a.local_gap) {
+            gap.max(1)
+        } else {
+            gap
+        };
+        let step = a.rule.note(f.frame_index, gap, f.flags, a.class, None);
+        a.parts_of = step.withhold.then_some(f.frame_index);
+        if let Some(e) = step.ended {
+            log::info!(
+                "decode: withheld {} AU(s) from frame {} after a loss, until {} at frame {}{}",
+                e.withheld,
+                e.first,
+                match e.by {
+                    Resume::Idr => "an IDR",
+                    Resume::Anchor => "the anchor",
+                    Resume::WaveStart => "a wave start",
+                    Resume::Concealed => "the concealer",
+                },
+                f.frame_index,
+                if std::mem::take(&mut a.backstop) {
+                    " (a backstop asked for it)"
+                } else {
+                    ""
+                }
+            );
+        }
+        self.withheld += u64::from(step.withhold);
+        pass.ask_keyframe |= step.ask_keyframe;
+        step.withhold
+    }
+
+    /// This loop dropped an AU the rule had admitted, and the AUs behind it may name it. The
+    /// parked ones are judged again and the next arrival sees the gap, as for a network loss.
+    fn local_loss(&mut self, pass: &mut Pass) {
+        let Some(a) = self.admit.as_mut() else {
+            return;
+        };
+        a.local_gap = true;
+        for f in std::mem::take(&mut self.pending_aus) {
+            if !self.withhold(&f, 0, pass) {
+                self.pending_aus.push_back(f);
+            }
         }
     }
 
@@ -816,6 +923,10 @@ impl State {
             }
             if let Some(a) = self.asc.as_mut() {
                 a.poll_fences(ctx.offset(), &ctx.stats, &ctx.video_e2e);
+                // The host re-sends the source's grade on capture start and keyframes.
+                if ctx.client.color.is_hdr() {
+                    a.set_hdr_meta(ctx.client.latest_hdr_meta(Duration::ZERO));
+                }
             }
         }
         ctx.stats.note_skipped_overflow(pass.aus_dropped); // parked-AU overflow: skips, flagged as such
@@ -823,6 +934,9 @@ impl State {
             if let Some((w, h)) = super::display::picture_size(&ctx.codec) {
                 ctx.decoded_size
                     .store(crate::session::pack_surface_size(w, h), Ordering::Relaxed);
+                if let Some(a) = self.asc.as_mut() {
+                    a.set_src_size(w, h);
+                }
             }
             match self.asc.as_mut() {
                 // ASC carries the colour on the transaction, not the SurfaceView window. Refine
@@ -836,7 +950,7 @@ impl State {
                 None => apply_reported_dataspace(&ctx.codec, &ctx.window, &mut self.applied_ds),
             }
         }
-        self.feed(ctx);
+        self.feed(ctx, pass);
         // The cadence loop's re-anchor seam. A fresh arm means a loss was detected: the frames
         // that reach the presenter on the far side come through a decoder that has just
         // recovered, so the source→presentable delay the loop had measured is not the one it
@@ -864,7 +978,7 @@ impl State {
     /// [`BUFFER_FLAG_PARTIAL_FRAME`] except the AU's last, all at the AU's pts. `part_open` is
     /// the continuity ledger — any break (gap, orphan, oversize) abandons the AU per
     /// [`PartFeed::pts_us`]'s close contract and re-syncs at the next `first`.
-    fn feed(&mut self, ctx: &Ctx) {
+    fn feed(&mut self, ctx: &Ctx, pass: &mut Pass) {
         let codec = &ctx.codec;
         while !self.pending_aus.is_empty() && !self.free_inputs.is_empty() {
             let idx = self.free_inputs.pop_front().unwrap();
@@ -896,6 +1010,7 @@ impl State {
                     self.gate.arm(Instant::now());
                     let _ = ctx.client.request_keyframe();
                     self.pending_aus.push_front(frame);
+                    self.local_loss(pass);
                     continue;
                 }
                 // No AU open: an orphan non-first piece lost its head upstream — discard and
@@ -930,8 +1045,8 @@ impl State {
                     self.oversized_dropped
                 );
                 let _ = ctx.client.request_keyframe();
+                self.gate.arm(Instant::now());
                 if frame.part.is_some() {
-                    self.gate.arm(Instant::now());
                     // Pieces already queued can't be unqueued: poison the ledger so the next
                     // delivery mismatches and takes the close-empty path above.
                     self.part_open = Some(PartFeed {
@@ -939,6 +1054,8 @@ impl State {
                         expected: usize::MAX,
                         pts_us,
                     });
+                } else {
+                    self.local_loss(pass);
                 }
                 continue;
             }
@@ -959,6 +1076,11 @@ impl State {
                         expected: usize::MAX,
                         pts_us,
                     });
+                } else {
+                    // A whole AU lost here is a loss like any other: freeze and ask.
+                    self.gate.arm(Instant::now());
+                    let _ = ctx.client.request_keyframe();
+                    self.local_loss(pass);
                 }
                 continue;
             }
@@ -1148,7 +1270,8 @@ impl State {
         }
     }
 
-    /// The hung-codec check ([`InputStall`]), then the keyframe backstops ([`Backstops::poll`]).
+    /// The hung-codec check ([`InputStall`]), the keyframe backstops ([`Backstops::poll`]), then the
+    /// admission rule's keyframe ask through the same throttle.
     /// Evaluated after `feed`, so an AU that arrived this pass has either been fed or is parked
     /// in `pending_aus`.
     fn housekeeping(&mut self, ctx: &Ctx, had_output: bool, pass: &Pass) {
@@ -1161,14 +1284,20 @@ impl State {
             );
             self.wedged = true;
         }
-        self.backstops.poll(
+        let backstop = self.backstops.poll(
             &ctx.client,
             &mut self.gate,
-            self.fed,
+            self.fed + self.withheld,
             had_output,
             waiting,
             pass.aus_dropped,
         );
+        if let Some(a) = self.admit.as_mut() {
+            a.backstop |= backstop && a.rule.is_withholding();
+        }
+        if pass.ask_keyframe {
+            self.backstops.ask(&ctx.client);
+        }
     }
 }
 

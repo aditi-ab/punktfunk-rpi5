@@ -69,47 +69,41 @@ pub fn replace_on_reboot(_new: &std::path::Path, _dest: &std::path::Path) -> boo
 
 #[cfg(windows)]
 pub fn stop_service_wait(name: &str) -> Result<(), String> {
-    use ::windows::core::HSTRING;
+    use ::windows::core::{Owned, HSTRING};
     use ::windows::Win32::System::Services::{
-        CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
-        SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS,
-        SERVICE_STOP, SERVICE_STOPPED,
+        ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+        SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP, SERVICE_STOPPED,
     };
 
-    // SAFETY: plain SCM handle lifecycle — open manager, open service, control, poll, close
-    // both handles on every path. All buffers are stack locals owned by this frame.
+    // SAFETY: each SCM handle is adopted by an `Owned` right after its open succeeds, which
+    // closes it on every path. The status buffer is a stack local owned by this frame.
     unsafe {
-        let scm =
-            OpenSCManagerW(None, None, SC_MANAGER_CONNECT).map_err(|e| format!("SCM: {e}"))?;
-        let service = match OpenServiceW(
-            scm,
+        let scm = Owned::new(
+            OpenSCManagerW(None, None, SC_MANAGER_CONNECT).map_err(|e| format!("SCM: {e}"))?,
+        );
+        let Ok(service) = OpenServiceW(
+            *scm,
             &HSTRING::from(name),
             SERVICE_STOP | SERVICE_QUERY_STATUS,
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                // Not installed — nothing to stop, which is the goal state.
-                let _ = CloseServiceHandle(scm);
-                return Ok(());
-            }
+        ) else {
+            // Not installed — nothing to stop, which is the goal state.
+            return Ok(());
         };
+        let service = Owned::new(service);
         let mut status = SERVICE_STATUS::default();
-        let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut status);
+        let _ = ControlService(*service, SERVICE_CONTROL_STOP, &mut status);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let outcome = loop {
-            if QueryServiceStatus(service, &mut status).is_err()
+        loop {
+            if QueryServiceStatus(*service, &mut status).is_err()
                 || status.dwCurrentState == SERVICE_STOPPED
             {
-                break Ok(());
+                return Ok(());
             }
             if std::time::Instant::now() > deadline {
-                break Err(format!("'{name}' did not stop within 30s"));
+                return Err(format!("'{name}' did not stop within 30s"));
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
-        };
-        let _ = CloseServiceHandle(service);
-        let _ = CloseServiceHandle(scm);
-        outcome
+        }
     }
 }
 
@@ -122,8 +116,8 @@ pub fn stop_service_wait(_name: &str) -> Result<(), String> {
 pub fn create_shortcut(link: &str, target: &str) -> Result<(), String> {
     use ::windows::core::{Interface, HSTRING};
     use ::windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile,
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
     };
     use ::windows::Win32::UI::Shell::{
         FOLDERID_Desktop, FOLDERID_Programs, IShellLinkW, SHGetKnownFolderPath, ShellLink,
@@ -132,17 +126,16 @@ pub fn create_shortcut(link: &str, target: &str) -> Result<(), String> {
 
     // SAFETY: COM lifecycle as in `nlm_networks` — init tolerating an initialized thread,
     // smart-pointer interfaces, uninit only when this call did the init. The known-folder
-    // path is copied out before the interfaces drop.
+    // path is CoTaskMem the shell hands us: copied out, then freed once.
     unsafe {
         let inited = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
         let result = (|| -> Result<(), String> {
             let resolve = |id, tail: &str| -> Result<String, String> {
                 let base = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None)
                     .map_err(|e| format!("known folder: {e}"))?;
-                Ok(format!(
-                    "{}{tail}",
-                    base.to_string().map_err(|e| e.to_string())?
-                ))
+                let text = base.to_string();
+                CoTaskMemFree(Some(base.0 as *const _));
+                Ok(format!("{}{tail}", text.map_err(|e| e.to_string())?))
             };
             let path = if let Some(rest) = link.strip_prefix("<start menu>") {
                 resolve(&FOLDERID_Programs, rest)?

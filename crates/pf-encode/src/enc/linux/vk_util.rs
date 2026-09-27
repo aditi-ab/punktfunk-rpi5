@@ -146,17 +146,18 @@ pub(crate) fn color_range(layer: u32) -> vk::ImageSubresourceRange {
     }
 }
 
-pub(crate) unsafe fn find_mem(
+/// The first memory type in `bits` carrying every `want` flag. `Err` when none does: an
+/// index outside `bits` is invalid for the allocation it would back.
+pub(crate) fn find_mem(
     mp: &vk::PhysicalDeviceMemoryProperties,
     bits: u32,
     want: vk::MemoryPropertyFlags,
-) -> u32 {
-    for i in 0..mp.memory_type_count {
-        if (bits & (1 << i)) != 0 && mp.memory_types[i as usize].property_flags.contains(want) {
-            return i;
-        }
-    }
-    0
+) -> Result<u32> {
+    (0..mp.memory_type_count)
+        .find(|&i| {
+            bits & (1 << i) != 0 && mp.memory_types[i as usize].property_flags.contains(want)
+        })
+        .ok_or_else(|| anyhow::anyhow!("find a {want:?} memory type among {bits:#x}"))
 }
 
 /// DRM fourcc → VkFormat whose *color* components match; Vulkan does the byte swizzle.
@@ -377,7 +378,7 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
     };
     let req = device.get_image_memory_requirements(img);
     let bits = req.memory_type_bits & fd_props;
-    let ti = find_mem(
+    let ti = match find_mem(
         mem_props,
         if bits != 0 {
             bits
@@ -385,7 +386,13 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
             req.memory_type_bits
         },
         vk::MemoryPropertyFlags::empty(),
-    );
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            device.destroy_image(img, None);
+            return Err(e); // `dup` drops: nothing consumed it
+        }
+    };
     let mut ded = vk::MemoryDedicatedAllocateInfo::default().image(img);
     let mut import = vk::ImportMemoryFdInfoKHR::default()
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
@@ -443,14 +450,21 @@ pub(crate) unsafe fn make_host_buffer(
         None,
     )?;
     let req = device.get_buffer_memory_requirements(buf);
+    let ti = match find_mem(
+        mp,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            device.destroy_buffer(buf, None);
+            return Err(e);
+        }
+    };
     let mem = match device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
-            .memory_type_index(find_mem(
-                mp,
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )),
+            .memory_type_index(ti),
         None,
     ) {
         Ok(m) => m,
@@ -494,14 +508,21 @@ pub(crate) unsafe fn make_plain_image(
     )?;
     let req = device.get_image_memory_requirements(img);
     // Unwind: callers only ever see the completed triple.
+    let ti = match find_mem(
+        mp,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            device.destroy_image(img, None);
+            return Err(e);
+        }
+    };
     let mem = match device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
-            .memory_type_index(find_mem(
-                mp,
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )),
+            .memory_type_index(ti),
         None,
     ) {
         Ok(m) => m,

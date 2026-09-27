@@ -63,7 +63,7 @@ public enum FrameStorePolicy: Sendable, Equatable {
 
 public final class FrameStore<Frame>: @unchecked Sendable {
     private let lock = NSLock()
-    private let capacity: Int // 1 = newest-wins semantics
+    let capacity: Int // 1 = newest-wins semantics
     private let isFifo: Bool
     private var frames: [Frame] = []
     private var prerolled = false
@@ -210,41 +210,10 @@ private final class VsyncClock: @unchecked Sendable {
     }
 }
 
-/// Selects immediate adaptive presents for sparse input and display-slot presents for dense input.
-/// It observes source spacing only; it never computes a due time or delays a frame. Hysteresis keeps
-/// 42–48 fps in its current regime, and the 50 ms sample cap prevents one transport hitch from
-/// disabling slot pacing at high rate.
-struct AdaptiveSlotRegime {
-    private var previousPtsNs: UInt64?
-    private var intervalNs: Double?
-    private(set) var isSlotted = true
-
-    mutating func update(ptsNs: UInt64) -> Bool {
-        guard let previousPtsNs else {
-            self.previousPtsNs = ptsNs
-            return isSlotted
-        }
-        if ptsNs == previousPtsNs { return isSlotted }
-        guard ptsNs > previousPtsNs else {
-            self.previousPtsNs = ptsNs
-            intervalNs = nil
-            isSlotted = true
-            return isSlotted
-        }
-        self.previousPtsNs = ptsNs
-        let sample = Double(min(ptsNs - previousPtsNs, 50_000_000))
-        let estimate = intervalNs.map { $0 * 0.75 + sample * 0.25 } ?? sample
-        intervalNs = estimate
-        if isSlotted, estimate >= 24_000_000 { isSlotted = false }
-        if !isSlotted, estimate <= 21_000_000 { isSlotted = true }
-        return isSlotted
-    }
-}
-
 /// Selects when a decoded frame enters the layer; decode and the newest-wins store are shared.
 ///
-/// - `arrival` (stage-2): render from frame arrival. This is the macOS default and remains an
-///   explicit A/B elsewhere; macOS smoothness can additionally schedule it on the vsync grid.
+/// - `arrival` (stage-2): render from frame arrival. This is the macOS default for every codec and
+///   an explicit A/B elsewhere; macOS smoothness can additionally schedule it on the vsync grid.
 /// - `glass` (stage-3): admit a bounded number of presents and reopen each slot from its on-glass
 ///   callback. Frames decoded while closed coalesce in the store instead of joining the layer FIFO.
 /// - `deadline` (stage-4): pair the newest frame with a CAMetalDisplayLink-vended drawable. This is
@@ -252,8 +221,6 @@ struct AdaptiveSlotRegime {
 ///   fixed-rate refreshes.
 /// - `decoded`: send VideoToolbox's IOSurface-backed output directly to the system video renderer.
 ///   This is tvOS's latency default and avoids compressed decode buffering plus the Metal FIFO.
-///
-/// macOS PyroWave defaults to `glass` to prevent burst presents in its composited layer.
 public enum PresentPacing: Sendable, Equatable {
     case arrival
     case glass
@@ -744,8 +711,6 @@ public final class Stage2Pipeline {
     /// macOS smoothness: schedule at most one present on each display-link target so the FIFO
     /// store drains at display cadence. Deadline pacing has its own link and ignores this policy.
     private let vsyncPaced: Bool
-    /// macOS adaptive-refresh latency path: immediate sparse input, one drawable per dense slot.
-    private let adaptiveSlotPaced: Bool
     /// Source-timestamp playout for the SMOOTHNESS intent: every decoded frame is stamped with
     /// when it is due on the host's own cadence. `nil` under latency, whose path presents on
     /// arrival without cadence arithmetic.
@@ -809,15 +774,14 @@ public final class Stage2Pipeline {
     /// presenter choice. Returns nil if Metal can't be set up (headless / no GPU) — caller
     /// falls back to the stage-1 presenter. `pacing` also selects the decoded video sink when its
     /// `displayLayer` is supplied. `gateDepth` bounds glass presents; `vsyncPaced` schedules macOS
-    /// smoothness, while `adaptiveSlotPaced` schedules latency onto the ordinary display-link grid.
+    /// smoothness onto the display-link grid.
     public init?(
         endToEndMeter: LatencyMeter?,
         displayLayer: AVSampleBufferDisplayLayer? = nil,
         pacing: PresentPacing = .arrival,
         gateDepth: Int = 1,
         storePolicy: FrameStorePolicy = .newestWins,
-        vsyncPaced: Bool = false,
-        adaptiveSlotPaced: Bool = false
+        vsyncPaced: Bool = false
     ) {
         let decodedSink: DecodedVideoSink?
         if pacing == .decoded {
@@ -831,7 +795,6 @@ public final class Stage2Pipeline {
         self.pacing = pacing
         self.gateDepth = gateDepth
         self.vsyncPaced = vsyncPaced
-        self.adaptiveSlotPaced = adaptiveSlotPaced
         self.ring = FrameStore(policy: storePolicy)
         self.endToEndMeter = endToEndMeter
         self.decodedSink = decodedSink
@@ -986,10 +949,11 @@ public final class Stage2Pipeline {
             // bitstream before submit (see HevcConcealer). Thread-confined; one per session.
             let concealer: HevcConcealer? = connection.videoCodec == .hevc ? HevcConcealer() : nil
             var wasUnrecoverable = false
-            // 4:4:4 backstop: a run of decode/create failures in a 4:4:4 session means this device can't
-            // decode 4:4:4 at the negotiated resolution (the HW probe clears the common case but not a
-            // resolution-ceiling miss). End cleanly instead of looping on a black screen.
-            var decodeFailRun = 0
+            // Hardware-only backstop (4:4:4, AV1): 3 s in which every decode fails means this device
+            // can't decode the mode at all, e.g. past a resolution ceiling. End instead of looping on
+            // black. Timed, not counted: after a failure only IDRs reach the decoder.
+            let hardwareOnly = connection.isChroma444 || connection.videoCodec == .av1
+            var failingSinceNs: UInt64?
             // Every iteration drains its own autorelease pool: this thread has no runloop, so
             // autoreleased VT/CM temporaries would otherwise accumulate until session end.
             // `false` = session over — exit the loop (the closure can't `break` across itself).
@@ -1004,6 +968,7 @@ public final class Stage2Pipeline {
                     // withheld until it lands.
                     if connection.isVideoDropped {
                         _ = try connection.nextAU(timeoutMs: 100)
+                        failingSinceNs = nil
                         return true
                     }
                     if pump.awaitingIDR { recovery.request() }
@@ -1071,16 +1036,16 @@ public final class Stage2Pipeline {
                     if step.withhold { return true }
                     guard let f = pump.format, !token.isStopped else { return true }
                     if decoder.decode(au: au, format: f) {
-                        decodeFailRun = 0
+                        failingSinceNs = nil
                     } else {
                         // Submit/decoder error: drop the session and re-gate on the next IDR's in-band
                         // parameter sets (a delta frame can't recover) and keep asking for that IDR.
                         decoder.reset()
                         pump.requireIDR()
-                        decodeFailRun += 1
-                        // ~3 s of solid failure in a 4:4:4 session (and only there — a 4:2:0 loss
-                        // recovers within a GOP) ⇒ 4:4:4 isn't decodable here; end the session.
-                        if connection.isChroma444, decodeFailRun >= 180 {
+                        let nowNs = DispatchTime.now().uptimeNanoseconds
+                        let sinceNs = failingSinceNs ?? nowNs
+                        failingSinceNs = sinceNs
+                        if hardwareOnly, nowNs - sinceNs >= 3_000_000_000 {
                             if !token.isStopped { onSessionEnd?() }
                             return false
                         }
@@ -1100,19 +1065,16 @@ public final class Stage2Pipeline {
         thread.start()
 
         // Present policy, resolved once per session before the stats so each line names it.
-        // Adaptive-refresh latency chooses immediate sparse or slotted dense input. The env selects
-        // slot, immediate or legacy scheduled V-Sync explicitly for A/B.
+        // Latency presents on arrival, on fixed and ProMotion panels alike. The env forces slot,
+        // immediate or scheduled V-Sync for A/B.
         let presentMode = ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENT_MODE"]
-        let forcedSlot = presentMode == "slot"
-        let adaptiveSlot = adaptiveSlotPaced && !connection.settings.vsync
-            && presentMode != "immediate" && presentMode != "vsync" && !forcedSlot
-        let fixedSlot = vsyncPaced || forcedSlot
+        let fixedSlot = vsyncPaced || presentMode == "slot"
         let fixedVsync = presentMode == "vsync"
             || (presentMode != "immediate" && connection.settings.vsync)
         let vsyncClock = vsyncClock
         frameRateHint.stagePace(
             pacing == .decoded ? "decoded" : pacing == .deadline ? "deadline"
-                : adaptiveSlot ? "adaptive" : fixedSlot ? "slot" : fixedVsync ? "vsync" : "immediate")
+                : pacing == .glass ? "glass" : fixedSlot ? "slot" : fixedVsync ? "vsync" : "immediate")
         // The video plane has no present thread: `renderTick` stamps and flushes its line.
         let debugStats: PresentDebugStats? = self.debugStats
         if decodedSink != nil { return }
@@ -1146,10 +1108,9 @@ public final class Stage2Pipeline {
             : { ring.take(dueBy: CACurrentMediaTime(), due: { $0.dueMediaTime }) }
         let renderThread = Thread {
             defer { renderStopped.signal() }
-            // Slot-paced modes record the display-link target they last used: at most one frame
-            // enters each link slot. The adaptive regime is thread-confined with it.
+            // Slot pacing records the display-link target it last used: at most one frame enters
+            // each link slot.
             var lastPresentTarget: CFTimeInterval = 0
-            var adaptiveRegime = AdaptiveSlotRegime()
             // Every iteration drains its own autorelease pool (`return` = the old `continue`):
             // this thread has no runloop, and `nextDrawable()` AUTORELEASES each CAMetalDrawable —
             // without a per-iteration pool every presented frame's drawable object (plus its
@@ -1159,8 +1120,7 @@ public final class Stage2Pipeline {
                     debugStats?.flushIfDue(ring: ring, gate: gate)
                     return
                 }
-                // Fixed slot pacing can reject the wake before touching the store. Adaptive pacing
-                // resolves after taking a frame because its source stamp selects the regime.
+                // Slot pacing rejects a wake whose link slot is taken before touching the store.
                 let fixedSlotTarget =
                     fixedSlot ? vsyncClock.nextVsync(after: CACurrentMediaTime()) : nil
                 if let fixedSlotTarget, abs(fixedSlotTarget - lastPresentTarget) < 0.002 {
@@ -1184,21 +1144,9 @@ public final class Stage2Pipeline {
                     return
                 }
                 let now = CACurrentMediaTime()
-                let adaptiveSlotActive = adaptiveSlot && adaptiveRegime.update(ptsNs: frame.ptsNs)
-                let slotTarget = fixedSlotTarget
-                    ?? (adaptiveSlotActive ? vsyncClock.nextVsync(after: now) : nil)
-                if adaptiveSlotActive, let slotTarget,
-                   abs(slotTarget - lastPresentTarget) < 0.002 {
-                    gate?.release()
-                    ring.putBack(frame)
-                    debugStats?.gatedWake()
-                    debugStats?.flushIfDue(ring: ring, gate: gate)
-                    return
-                }
                 // A stale grid yields no target and falls back to an immediate present.
-                let scheduleOnGrid = fixedSlot || fixedVsync || adaptiveSlotActive
-                let presentAt = scheduleOnGrid
-                    ? slotTarget
+                let presentAt = fixedSlot || fixedVsync
+                    ? fixedSlotTarget
                         ?? vsyncClock.nextVsync(after: max(now, frame.dueMediaTime ?? now))
                     : nil
                 let renderStarted = CACurrentMediaTime()
@@ -1242,8 +1190,8 @@ public final class Stage2Pipeline {
                 if !rendered {
                     gate?.release() // no present registered — its handler will never fire
                     ring.putBack(frame)
-                } else if let slotTarget {
-                    lastPresentTarget = slotTarget
+                } else if let fixedSlotTarget {
+                    lastPresentTarget = fixedSlotTarget
                 }
                 debugStats?.flushIfDue(ring: ring, gate: gate)
             } }
@@ -1678,8 +1626,10 @@ public final class Stage2Pipeline {
             // Compiles the two compute kernels on the session's first frames' thread — ~tens of
             // ms, once per session. Failure = this device can't run the negotiated codec (the
             // advertisement probe should have prevented this); end the session cleanly.
+            // Ring past the store: its queued frames, the render thread's, a put-back, the decode.
             guard let decoder = MetalWaveletDecoder(
-                device: device, queue: queue, tenBit: connection.bitDepth >= 10)
+                device: device, queue: queue, tenBit: connection.bitDepth >= 10,
+                ringDepth: max(4, ring.capacity + 3))
             else {
                 if !token.isStopped { onSessionEnd?() }
                 return

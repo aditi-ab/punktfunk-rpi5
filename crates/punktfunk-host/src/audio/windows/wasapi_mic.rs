@@ -330,17 +330,15 @@ pub(crate) fn steam_infs_present() -> bool {
         })
 }
 
-/// Install one Steam Streaming INF via `DiInstallDriverW` (loaded from
-/// `newdev.dll` to skip an extra windows-crate feature). `inf_name` is a bare
+/// Install one Steam Streaming INF via `DiInstallDriverW`. `inf_name` is a bare
 /// filename under Steam's per-arch `drivers\Windows10\{arch}\`.
 ///
 /// Safe: `inf_name` is `&str` and every FFI argument is built locally — no
-/// caller precondition. The `unsafe` is the LoadLibrary/transmute/call chain.
+/// caller precondition.
 fn try_install_steam_audio(inf_name: &str) -> bool {
-    use windows::core::{s, w, PCWSTR};
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::System::LibraryLoader::{
-        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    use windows::core::PCWSTR;
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        DiInstallDriverW, DIINSTALLDRIVER_FLAGS,
     };
 
     if std::env::var_os("PUNKTFUNK_NO_MIC_INSTALL").is_some() {
@@ -350,49 +348,28 @@ fn try_install_steam_audio(inf_name: &str) -> bool {
         return false;
     };
 
-    // SAFETY: a static NUL-terminated literal, loaded from System32 only (the flag), so this cannot
-    // pick up a planted `newdev.dll` from the working directory. The handle is checked before use.
-    let Ok(newdev) =
-        (unsafe { LoadLibraryExW(w!("newdev.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) })
-    else {
-        tracing::warn!("newdev.dll not loaded — Steam-audio auto-install unavailable");
-        return false;
-    };
-    // SAFETY: `newdev` is the live module just loaded; the export name is a static literal.
-    let Some(addr) = (unsafe { GetProcAddress(newdev, s!("DiInstallDriverW")) }) else {
-        return false;
-    };
-    // BOOL DiInstallDriverW(HWND hwndParent, PCWSTR InfPath, DWORD Flags, PBOOL NeedReboot)
-    type DiInstall = unsafe extern "system" fn(HWND, PCWSTR, u32, *mut i32) -> i32;
-    // SAFETY: `addr` is the non-null export just resolved and `DiInstall` mirrors its documented
-    // signature (commented above).
-    let f: DiInstall = unsafe { std::mem::transmute(addr) };
     // SAFETY: `path` is the expanded, NUL-terminated buffer above and outlives the call; a null
     // parent HWND and a null `NeedReboot` are both documented as accepted.
-    let ok = unsafe {
-        f(
-            HWND(std::ptr::null_mut()),
-            PCWSTR(path.as_ptr()),
-            0,
-            std::ptr::null_mut(),
-        )
-    } != 0;
-    if ok {
-        tracing::info!(
-            inf = inf_name,
-            "installed a Steam Streaming virtual audio device"
-        );
-        std::thread::sleep(Duration::from_secs(5)); // let the audio subsystem register the endpoint
-    } else {
-        // SAFETY: reads this thread's last-error value; takes no arguments and touches no memory.
-        let err = unsafe { windows::Win32::Foundation::GetLastError() };
-        tracing::info!(
-            inf = inf_name,
-            ?err,
-            "Steam-audio device not auto-installed (Steam absent / not admin) — see install guidance"
-        );
+    let installed =
+        unsafe { DiInstallDriverW(None, PCWSTR(path.as_ptr()), DIINSTALLDRIVER_FLAGS(0), None) };
+    match installed {
+        Ok(()) => {
+            tracing::info!(
+                inf = inf_name,
+                "installed a Steam Streaming virtual audio device"
+            );
+            std::thread::sleep(Duration::from_secs(5)); // let the audio subsystem register the endpoint
+            true
+        }
+        Err(e) => {
+            tracing::info!(
+                inf = inf_name,
+                error = %e,
+                "Steam-audio device not auto-installed (Steam absent / not admin) — see install guidance"
+            );
+            false
+        }
     }
-    ok
 }
 
 fn render_thread(

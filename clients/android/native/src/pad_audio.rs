@@ -497,10 +497,12 @@ impl Drop for PadAudio {
 /// Start the renderer for a pad whose descriptor Java has handed over.
 ///
 /// Returns `None` when neither kind is enabled (nothing to render) or the thread will not start.
-/// **The caller must keep the `UsbDeviceConnection` open until the returned handle is dropped** —
-/// the renderer borrows the descriptor and never closes it.
+///
+/// # Safety
+/// `fd` is a live usbfs descriptor whose `UsbDeviceConnection` stays open until the returned
+/// handle is dropped — the renderer borrows it and never closes it.
 #[cfg(target_os = "android")]
-pub(crate) fn start(
+pub(crate) unsafe fn start(
     client: Arc<NativeClient>,
     pad: u8,
     fd: i32,
@@ -511,7 +513,8 @@ pub(crate) fn start(
         return None;
     }
     let stop = Arc::new(AtomicBool::new(false));
-    let join = spawn(client, Arc::clone(&stop), pad, fd, haptics, speaker)?;
+    // SAFETY: forwarded from this function's contract; dropping the handle joins the thread.
+    let join = unsafe { spawn(client, Arc::clone(&stop), pad, fd, haptics, speaker) }?;
     Some(PadAudio {
         pad,
         stop,
@@ -519,13 +522,14 @@ pub(crate) fn start(
     })
 }
 
-/// Spawn the pad-audio renderer — the 0xD1 plane's single consumer on Android.
+/// Spawn the pad-audio renderer — the 0xD1 plane's single consumer on Android. Returns `None` if
+/// the thread could not be started.
 ///
-/// `fd` is the pad's usbfs descriptor from `UsbDeviceConnection.getFileDescriptor()`; the caller
-/// **must** keep that connection open until [`stop`](AtomicBool) has been observed and the handle
-/// joined. Returns `None` if the thread could not be started.
+/// # Safety
+/// `fd` is the pad's usbfs descriptor from `UsbDeviceConnection.getFileDescriptor()`, and that
+/// connection stays open until the returned handle is joined.
 #[cfg(target_os = "android")]
-pub(crate) fn spawn(
+unsafe fn spawn(
     client: Arc<NativeClient>,
     stop: Arc<AtomicBool>,
     pad: u8,
@@ -535,13 +539,25 @@ pub(crate) fn spawn(
 ) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("pf-pad-audio".into())
-        .spawn(move || run(&client, &stop, pad, fd, haptics, speaker))
+        // SAFETY: the caller keeps `fd` open until this thread is joined.
+        .spawn(move || unsafe { run(&client, &stop, pad, fd, haptics, speaker) })
         .map_err(|e| log::warn!("pad-audio thread not started: {e}"))
         .ok()
 }
 
+/// The renderer thread's body.
+///
+/// # Safety
+/// `fd` stays open until this returns (see [`spawn`]).
 #[cfg(target_os = "android")]
-fn run(client: &NativeClient, stop: &AtomicBool, pad: u8, fd: i32, haptics: bool, speaker: bool) {
+unsafe fn run(
+    client: &NativeClient,
+    stop: &AtomicBool,
+    pad: u8,
+    fd: i32,
+    haptics: bool,
+    speaker: bool,
+) {
     // Ask the scheduler for audio priority. Android does not hand SCHED_FIFO to ordinary app
     // threads, so -16 (ANDROID_PRIORITY_AUDIO) is the realistic knob — and WP7 measured that it
     // both applies and is enough to hold the 4 ms floor against eight busy cores.
@@ -550,7 +566,7 @@ fn run(client: &NativeClient, stop: &AtomicBool, pad: u8, fd: i32, haptics: bool
         libc::setpriority(libc::PRIO_PROCESS, 0, -16);
     }
 
-    // SAFETY: the caller's contract — the Java connection outlives this thread.
+    // SAFETY: forwarded from this function's contract.
     let dev = unsafe { sink::device(fd) };
     // Through a reference, deliberately: `UsbFsDevice` has a `Drop`, and opening the stream in
     // this same scope would make the borrow outlive the value it borrows.
@@ -650,7 +666,8 @@ fn pump(
         // that state indistinguishable from the renderer being dead.
         tally.report(playback);
 
-        let Some(frame) = client.next_pad_audio(Duration::from_millis(10)) else {
+        let mut next = client.next_pad_audio(Duration::from_millis(10));
+        if next.is_none() {
             // R12: `next_pad_audio` collapses a DISCONNECTED channel into the same `None` as an
             // ordinary timeout, so this arm cannot tell "nothing arrived in 10 ms" from "the
             // session is gone and nothing will ever arrive again". Left to `continue`, a closed
@@ -661,57 +678,62 @@ fn pump(
                 break;
             }
             continue;
-        };
-
-        // R14: `PadAudioFrame` carries the wire pad it was addressed to, and this renderer serves
-        // exactly one. A frame for another pad — a queue still holding the previous occupant's
-        // when a slot is re-used, or a host bug — would otherwise be decoded here AND seed the
-        // gap tracker from a foreign sequence space, which shows up as a burst of phantom
-        // concealment rather than as anything obviously wrong.
-        if frame.pad != pad {
-            log::debug!(
-                "pad audio: dropping frame for pad {} on pad {pad}",
-                frame.pad
-            );
-            continue;
         }
+        // Everything queued goes into the mixer before one write, so its MAX_BUFFER_FRAMES
+        // ceiling bounds the backlog. One frame per USB-paced write never sheds a burst.
+        while let Some(frame) = next.take() {
+            next = client.next_pad_audio(Duration::ZERO);
 
-        // The settings gate each kind independently: haptics off but speaker on is a legitimate
-        // configuration, and the host may still be sending both.
-        let wanted = match frame.kind {
-            PAD_AUDIO_KIND_HAPTICS => haptics,
-            PAD_AUDIO_KIND_SPEAKER => speaker,
-            _ => false,
-        };
-        if !wanted {
-            continue;
+            // R14: `PadAudioFrame` carries the wire pad it was addressed to, and this renderer serves
+            // exactly one. A frame for another pad — a queue still holding the previous occupant's
+            // when a slot is re-used, or a host bug — would otherwise be decoded here AND seed the
+            // gap tracker from a foreign sequence space, which shows up as a burst of phantom
+            // concealment rather than as anything obviously wrong.
+            if frame.pad != pad {
+                log::debug!(
+                    "pad audio: dropping frame for pad {} on pad {pad}",
+                    frame.pad
+                );
+                continue;
+            }
+
+            // The settings gate each kind independently: haptics off but speaker on is a legitimate
+            // configuration, and the host may still be sending both.
+            let wanted = match frame.kind {
+                PAD_AUDIO_KIND_HAPTICS => haptics,
+                PAD_AUDIO_KIND_SPEAKER => speaker,
+                _ => false,
+            };
+            if !wanted {
+                continue;
+            }
+
+            // A real haptics frame is the evidence that the game is driving the coils, and therefore
+            // that wire rumble must stand down for this pad (see `haptics_owns_coils`). Stamped on
+            // arrival rather than after decode so a decoder hiccup cannot hand the coils back
+            // mid-effect; concealment never reaches here, so PLC still does not count.
+            if frame.kind == PAD_AUDIO_KIND_HAPTICS {
+                note_haptics_frame(pad);
+            }
+
+            tally.frames_in += 1;
+            let k = usize::from(frame.kind).min(1);
+            let st = match &mut streams[k] {
+                Some(s) => s,
+                slot @ None => match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo) {
+                    Ok(dec) => slot.insert(KindStream {
+                        dec,
+                        gaps: AudioGapTracker::default(),
+                        frame_samples: 0,
+                    }),
+                    Err(e) => {
+                        log::warn!("pad audio: no Opus decoder for kind {}: {e}", frame.kind);
+                        continue;
+                    }
+                },
+            };
+            decode_into(st, &frame, &mut pcm, &mut mixer, &mut tally);
         }
-
-        // A real haptics frame is the evidence that the game is driving the coils, and therefore
-        // that wire rumble must stand down for this pad (see `haptics_owns_coils`). Stamped on
-        // arrival rather than after decode so a decoder hiccup cannot hand the coils back
-        // mid-effect; concealment never reaches here, so PLC still does not count.
-        if frame.kind == PAD_AUDIO_KIND_HAPTICS {
-            note_haptics_frame(pad);
-        }
-
-        tally.frames_in += 1;
-        let k = usize::from(frame.kind).min(1);
-        let st = match &mut streams[k] {
-            Some(s) => s,
-            slot @ None => match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo) {
-                Ok(dec) => slot.insert(KindStream {
-                    dec,
-                    gaps: AudioGapTracker::default(),
-                    frame_samples: 0,
-                }),
-                Err(e) => {
-                    log::warn!("pad audio: no Opus decoder for kind {}: {e}", frame.kind);
-                    continue;
-                }
-            },
-        };
-        decode_into(st, &frame, &mut pcm, &mut mixer, &mut tally);
 
         // Hand over whole frames only. `write` stages any remainder internally, so a partial
         // chunk is never padded with silence mid-stream.

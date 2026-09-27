@@ -50,16 +50,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
         if guard.is_some() {
             return Ok(()); // already streaming
         }
-        // SAFETY: `env`/`surface` are valid JNI pointers for this call. `as *mut _` bridges any
-        // jni-sys version skew between the `jni` and `ndk` crates (both are raw `*mut _` pointers)
-        // — a real skew here, not a hypothetical one: `jni` is on jni-sys 0.4 while the vendored
-        // `ndk` is still on 0.3.
-        let window = match unsafe {
-            ndk::native_window::NativeWindow::from_surface(
-                env.get_raw() as *mut _,
-                surface.as_raw() as *mut _,
-            )
-        } {
+        // SAFETY: Kotlin declares `surface` a non-null `Surface`.
+        let window = match unsafe { crate::window_from_surface(env, &surface) } {
             Some(w) => w,
             None => {
                 log::error!("nativeStartVideo: no ANativeWindow from Surface");
@@ -168,7 +160,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSource
 /// `NativeBridge.nativeVideoMime(handle): String` — the MediaCodec MIME for the codec the host
 /// resolved (`"video/hevc"` / `"video/avc"` / `"video/av01"`), so Kotlin can rank `MediaCodecList`
 /// decoders for it before calling [`Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo`].
-/// Empty string on a `0` handle. Cheap; safe on the UI thread.
+/// Empty string on a `0` or closed handle. Cheap; safe on the UI thread.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'local>(
@@ -177,11 +169,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'
     handle: jlong,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        if handle == 0 {
-            return Ok(JString::default());
-        }
+        // Never null: Kotlin declares a non-null `String`.
         let Some(h) = get_session(handle) else {
-            return Ok(JString::default());
+            return env.new_string("");
         };
         env.new_string(crate::decode::codec_mime(h.client.codec))
     })
@@ -554,17 +544,22 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
         // Replace any previous renderer first: dropping it joins the old thread, so two of them
         // can never hold the same descriptor at once.
         h.stop_pad_audio();
+        // SAFETY: Kotlin keeps the connection that owns `fd` open until `nativeStopPadAudio`
+        // returns, and that call (or `nativeClose`) drops, and so joins, this renderer first.
+        let started = unsafe {
+            crate::pad_audio::start(
+                std::sync::Arc::clone(&h.client),
+                pad as u8,
+                fd,
+                haptics,
+                speaker,
+            )
+        };
         // The capability declaration and the rumble suppression are NOT done here: the renderer
         // makes both only once its USB stream actually opens (see `pad_audio::render`). Doing them
         // at spawn time would, on a kernel that refuses the interface claim, take the pad off wire
         // rumble and give it nothing in return — no haptics of any kind.
-        match crate::pad_audio::start(
-            std::sync::Arc::clone(&h.client),
-            pad as u8,
-            fd,
-            haptics,
-            speaker,
-        ) {
+        match started {
             Some(p) => {
                 *lock_recover(&h.pad_audio) = Some(p);
                 true

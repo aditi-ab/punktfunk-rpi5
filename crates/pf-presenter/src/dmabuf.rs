@@ -10,7 +10,7 @@
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
 use pf_client_core::video::{DmabufFrame, DrmFrameGuard};
-use std::os::fd::{AsRawFd as _, BorrowedFd, IntoRawFd as _};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, IntoRawFd as _};
 
 /// fourcc('N','V','1','2').
 const DRM_FORMAT_NV12: u32 = 0x3231_564e;
@@ -396,7 +396,7 @@ pub(crate) fn get_or_import(
         None => {
             for fd in &frame.sync_fds {
                 // 100 ms fail-open: a decode this late is a stalled GPU, not a race worth a hang.
-                let _ = pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_raw_fd(), 100);
+                let _ = pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_fd(), 100);
             }
         }
     }

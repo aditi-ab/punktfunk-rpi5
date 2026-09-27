@@ -431,10 +431,16 @@ fn preflight(env: &Env, paths: &BasePaths, runner: &mut SystemRunner) -> Result<
         return Err("curl is required (install it with your package manager first)".into());
     }
     // Root without sudo (a minimal Debian container): a shim so the verbatim `sudo …`
-    // lines from platforms.json still work.
+    // lines from platforms.json still work. The dir leads root's PATH, so it is created
+    // fresh at 0700: a dir another user planted under that name fails the create.
     if root && !runner.which("sudo") {
-        let dir = std::env::temp_dir().join(format!("punktfunk-setup-{}", std::process::id()));
-        if std::fs::create_dir_all(&dir).is_ok()
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("punktfunk-setup-{}-{nanos}", std::process::id()));
+        if create_private_dir(&dir).is_ok()
             && std::fs::write(dir.join("sudo"), "#!/bin/sh\nexec \"$@\"\n").is_ok()
         {
             set_executable(&dir.join("sudo"));
@@ -457,6 +463,18 @@ fn set_executable(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn set_executable(_path: &std::path::Path) {}
+
+/// Owner-only and never an existing dir: `create` fails on a name already taken.
+#[cfg(unix)]
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
 
 fn load_facts(
     cli: &Cli,
@@ -609,5 +627,18 @@ mod tests {
         );
         let both = parse(args(&["--host", "--client"]), &Env::default()).unwrap();
         assert!(both.pins.host && both.pins.client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sudo_shim_dir_is_fresh_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("shim");
+        create_private_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // A name someone else created first is refused, not reused.
+        assert!(create_private_dir(&dir).is_err());
     }
 }

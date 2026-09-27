@@ -16,6 +16,7 @@ use crate::caps::DecodeProfile;
 use crate::device::find_memory_type;
 use crate::device::AllocError;
 use crate::device::DecodeDevice;
+use crate::device::Unwind;
 
 /// 2 MiB covers a 4K IDR at streaming rates; a larger AU grows the ring.
 pub const INITIAL_SLOT_SIZE: u64 = 2 * 1024 * 1024;
@@ -365,23 +366,18 @@ impl BitstreamRing {
         if export {
             ci = ci.push_next(&mut external);
         }
+        // SAFETY: only the buffer and memory created below go in, before any use.
+        let mut unwind = unsafe { Unwind::new(dev.ash()) };
         // SAFETY: live device; `ci` roots a chain of locals outliving the call.
         let buffer = unsafe { dev.ash().create_buffer(&ci, None)? };
+        unwind.buffer = buffer;
         // SAFETY: `buffer` was just created on this device.
         let req = unsafe { dev.ash().get_buffer_memory_requirements(buffer) };
-        let mem_props = dev.memory_properties();
-        let type_index = match find_memory_type(
-            &mem_props,
+        let type_index = find_memory_type(
+            &dev.memory_properties(),
             req.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) {
-            Ok(index) => index,
-            Err(e) => {
-                // SAFETY: destroying the just-created, never-bound buffer.
-                unsafe { dev.ash().destroy_buffer(buffer, None) };
-                return Err(e);
-            }
-        };
+        )?;
         let mut exportable = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
         let mut alloc = vk::MemoryAllocateInfo::default()
@@ -390,40 +386,16 @@ impl BitstreamRing {
         if export {
             alloc = alloc.push_next(&mut exportable);
         }
-        // SAFETY: live device; on failure the buffer is destroyed before returning
-        // so nothing leaks.
-        let memory = match unsafe { dev.ash().allocate_memory(&alloc, None) } {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: destroying the just-created, never-bound buffer.
-                unsafe { dev.ash().destroy_buffer(buffer, None) };
-                return Err(e.into());
-            }
-        };
+        // SAFETY: live device; `alloc` roots locals outliving the call.
+        let memory = unsafe { dev.ash().allocate_memory(&alloc, None)? };
+        unwind.memory = memory;
         // SAFETY: fresh buffer + fresh memory of at least the required size.
-        if let Err(e) = unsafe { dev.ash().bind_buffer_memory(buffer, memory, 0) } {
-            // SAFETY: unwinding the two objects created above (unbound/unused).
-            unsafe {
-                dev.ash().destroy_buffer(buffer, None);
-                dev.ash().free_memory(memory, None);
-            }
-            return Err(e.into());
-        }
+        unsafe { dev.ash().bind_buffer_memory(buffer, memory, 0)? };
         // SAFETY: `memory` is HOST_VISIBLE and unmapped; WHOLE_SIZE maps its full
         // range for the buffer's lifetime (vkFreeMemory implicitly unmaps).
-        let ptr = match unsafe {
+        let ptr = unsafe {
             dev.ash()
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-        } {
-            Ok(p) => p.cast::<u8>(),
-            Err(e) => {
-                // SAFETY: unwinding the two objects created above.
-                unsafe {
-                    dev.ash().destroy_buffer(buffer, None);
-                    dev.ash().free_memory(memory, None);
-                }
-                return Err(e.into());
-            }
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
         };
         // A refused export is not a failed ring: the owner just gets no fd to wait on.
         #[cfg(unix)]
@@ -443,10 +415,11 @@ impl BitstreamRing {
         } else {
             None
         };
+        unwind.disarm();
         Ok(Backing {
             buffer,
             memory,
-            ptr,
+            ptr: ptr.cast::<u8>(),
             #[cfg(unix)]
             dmabuf,
         })
@@ -493,12 +466,14 @@ impl BitstreamRing {
                 au = len,
                 "bitstream ring grows for an oversized AU"
             );
-            // SAFETY: every in-flight read was drained above; destroy_backing only
-            // touches this ring's own objects.
-            unsafe { self.destroy_backing() };
+            // Allocate before destroying: a failed grow keeps the old mapping and
+            // layout, never a null `ptr` for the next AU that fits.
             // SAFETY: caller's live-device contract.
             let backing =
                 unsafe { Self::allocate_backing(dev, &grown, self.profile, self.export)? };
+            // SAFETY: every in-flight read was drained above; destroy_backing only
+            // touches this ring's own objects.
+            unsafe { self.destroy_backing() };
             self.layout = grown;
             self.buffer = backing.buffer;
             self.memory = backing.memory;

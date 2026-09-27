@@ -13,22 +13,35 @@ import { Label } from "@/components/ui/label";
 import { isBoolean, useLocalPref } from "@/lib/prefs";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
+import { GROUPS, type Group, groupCatalog, groupOf } from "./categories";
 import { RunnerBanner } from "./Runner";
 import { SourceChip, TierBadge } from "./TierBadge";
+
+/** The same names the Library section gives its game and art sources. */
+const GROUP_LABEL: Record<Group, () => string> = {
+	library: m.library_sources_title,
+	metadata: m.library_metadata_title,
+	tools: m.store_category_tools,
+	other: m.store_category_other,
+};
 
 /** Case-insensitive substring match across the fields an operator would actually search by. */
 function matches(entry: StoreEntry, needle: string): boolean {
 	if (!needle) return true;
 	const q = needle.toLowerCase();
-	return [entry.title, entry.description, entry.pkg, entry.author].some((f) =>
-		f.toLowerCase().includes(q),
-	);
+	return [
+		entry.title,
+		entry.description,
+		entry.pkg,
+		entry.author,
+		GROUP_LABEL[groupOf(entry)](),
+	].some((f) => f.toLowerCase().includes(q));
 }
 
 /**
- * Container: the catalog. Owns the catalog query plus the local search/source filter; installing is
- * escalated to the parent, which owns the tier-appropriate dialog and the resulting job — so this
- * subsection never installs anything itself.
+ * Container: the catalog, one heading per group. Owns the catalog query plus the local search,
+ * group and source filters; installing is escalated to the parent, which owns the tier-appropriate
+ * dialog and the resulting job — so this subsection never installs anything itself.
  */
 export const BrowseTab: FC<{
 	onInstall: (entry: StoreEntry) => void;
@@ -42,6 +55,7 @@ export const BrowseTab: FC<{
 	);
 	const [query, setQuery] = useState("");
 	const [source, setSource] = useState<string | null>(null);
+	const [group, setGroup] = useState<Group | null>(null);
 	// A Linux operator should not scroll past Windows plugins to find theirs
 	// (design/web-console-overhaul.md D9). The host decides what `compatible` means; this only
 	// decides whether to show the rest. Off by default, remembered per browser.
@@ -58,12 +72,18 @@ export const BrowseTab: FC<{
 		[entries, allPlatforms],
 	);
 	const hiddenCount = entries.length - forHost.length;
+	const present = GROUPS.filter((g) => forHost.some((e) => groupOf(e) === g));
 	const shown = useMemo(
 		() =>
-			forHost.filter(
-				(e) => (source === null || e.source === source) && matches(e, query),
+			groupCatalog(
+				forHost.filter(
+					(e) =>
+						(source === null || e.source === source) &&
+						(group === null || groupOf(e) === group) &&
+						matches(e, query),
+				),
 			),
-		[forHost, source, query],
+		[forHost, source, group, query],
 	);
 
 	return (
@@ -125,6 +145,22 @@ export const BrowseTab: FC<{
 				)}
 			</div>
 
+			{present.length > 1 && (
+				<div className="flex flex-wrap gap-2">
+					{[null, ...present].map((g) => (
+						<Button
+							key={g ?? "all"}
+							size="sm"
+							variant={group === g ? "default" : "outline"}
+							aria-pressed={group === g}
+							onClick={() => setGroup(g)}
+						>
+							{g === null ? m.store_category_all() : GROUP_LABEL[g]()}
+						</Button>
+					))}
+				</div>
+			)}
+
 			<QueryState
 				isLoading={catalog.isLoading}
 				error={catalog.error}
@@ -150,20 +186,28 @@ export const BrowseTab: FC<{
 					</Card>
 				) : (
 					<div className="@container">
-						{/* The catalogue had no stagger container at all, so the cards landed
-						    together however the page was doing. `root` because this is a tab
-						    panel behind a query — two layers between it and the page's
-						    `<Section>` that decide for themselves when to mount. */}
-						<Stagger
-							root
-							className="grid grid-cols-1 gap-card @xl:grid-cols-2 @4xl:grid-cols-3"
-						>
-							{shown.map((entry) => (
-								<StoreCard
-									key={`${entry.source}/${entry.id}`}
-									entry={entry}
-									onInstall={() => onInstall(entry)}
-								/>
+						{/* `root` because this is a tab panel behind a query — two layers between
+						    it and the page's `<Section>` that decide for themselves when to mount.
+						    Each group's grid inherits its cadence through the plain `<section>`. */}
+						<Stagger root className="flex flex-col gap-8">
+							{shown.map(([g, list]) => (
+								<section key={g} className="flex flex-col gap-3">
+									<h2 className="text-base font-semibold">
+										{GROUP_LABEL[g]()}{" "}
+										<span className="font-normal text-muted-foreground">
+											{list.length}
+										</span>
+									</h2>
+									<Stagger className="grid grid-cols-1 gap-card @xl:grid-cols-2 @4xl:grid-cols-3">
+										{list.map((entry) => (
+											<StoreCard
+												key={`${entry.source}/${entry.id}`}
+												entry={entry}
+												onInstall={() => onInstall(entry)}
+											/>
+										))}
+									</Stagger>
+								</section>
 							))}
 						</Stagger>
 					</div>
@@ -244,6 +288,10 @@ export const StoreCard: FC<{ entry: StoreEntry; onInstall: () => void }> = ({
 					<TierBadge tier={entry.tier} />
 					{/* Attribution, never verification: an external entry names who curated it. */}
 					{entry.tier === "external" && <SourceChip source={entry.source} />}
+					{/* Tri-state: no probe for this platform is "unknown", never "not installed". */}
+					{entry.detected === true && (
+						<Badge variant="secondary">{m.library_source_detected()}</Badge>
+					)}
 				</div>
 
 				<p className="line-clamp-3 text-sm text-muted-foreground">

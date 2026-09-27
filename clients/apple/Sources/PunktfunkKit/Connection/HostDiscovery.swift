@@ -126,6 +126,9 @@ public final class HostDiscovery: ObservableObject {
     /// The 1 Hz maintenance tick. Nothing else re-drives a stuck resolve or a sick browser.
     private var sweep: Task<Void, Never>?
     private var scanningUntil: Date?
+    /// Until then a new browser's result set is still filling: a service missing from it is
+    /// not gone. nil once settled.
+    private var settlesAt: Date?
 
     /// A LAN resolve answers in milliseconds; this only has to outlast a slow Wi-Fi wake.
     private static let resolveTimeout: TimeInterval = 6
@@ -168,6 +171,7 @@ public final class HostDiscovery: ObservableObject {
         browserFailures = 0
         browserRearmAt = nil
         scanningUntil = nil
+        settlesAt = nil
         if isScanning { isScanning = false }
         if !hosts.isEmpty { hosts = [] }
     }
@@ -258,6 +262,7 @@ public final class HostDiscovery: ObservableObject {
         connections.removeAll()
         deadlines.removeAll()
         browserRearmAt = nil
+        settlesAt = Date().addingTimeInterval(Self.scanSettle)
 
         let generation = self.generation
         let browser = NWBrowser(
@@ -302,6 +307,9 @@ public final class HostDiscovery: ObservableObject {
     /// record the rest — re-reading the advert every time, so a host that re-keys, moves or flips
     /// its pairing policy republishes under the same name and the card follows it — then resolve
     /// whatever still needs an address.
+    ///
+    /// A browser that has not settled drops nothing: its first sets are partial, and dropping
+    /// from them blinks rows out of the list. `tick` reconciles again once it has.
     private func reconcile(_ results: Set<NWBrowser.Result>) {
         var live: Set<String> = []
         for result in results {
@@ -309,7 +317,9 @@ public final class HostDiscovery: ObservableObject {
             live.insert(key)
             services[key] = result
         }
-        for key in Array(services.keys) where !live.contains(key) { forget(key) }
+        if settlesAt == nil {
+            for key in Array(services.keys) where !live.contains(key) { forget(key) }
+        }
         publish()
         pump()
     }
@@ -421,6 +431,10 @@ public final class HostDiscovery: ObservableObject {
             resolveFailed(key)
         }
         if let at = browserRearmAt, at <= now { armBrowser() }
+        if let at = settlesAt, at <= now {
+            settlesAt = nil
+            if let browser { reconcile(browser.browseResults) }
+        }
         pump()
         if let until = scanningUntil, until <= now {
             scanningUntil = nil

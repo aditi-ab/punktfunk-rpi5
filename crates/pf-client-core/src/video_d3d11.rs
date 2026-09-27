@@ -142,19 +142,7 @@ pub(crate) fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
     let mut chosen: Option<IDXGIAdapter1> = None;
     let mut fallback: Option<IDXGIAdapter1> = None;
-    for i in 0.. {
-        // SAFETY: a COM call on the live factory; the `Ok` binding is what proves an adapter came
-        // back.
-        let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else {
-            break;
-        };
-        // SAFETY: `DXGI_ADAPTER_DESC1` is plain-old-data, so all-zeroes is a valid value.
-        let mut desc: DXGI_ADAPTER_DESC1 = unsafe { std::mem::zeroed() };
-        // SAFETY: a COM call on the adapter just enumerated, filling the zeroed local descriptor
-        // through the out-param; checked before the descriptor is read.
-        if unsafe { adapter.GetDesc1(&mut desc) }.is_err() {
-            continue;
-        }
+    for (adapter, desc) in adapters(&factory) {
         if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE as u32 != 0 {
             continue; // WARP cannot hardware-decode
         }
@@ -1192,23 +1180,33 @@ impl HandoffRing {
     }
 }
 
+/// Every adapter `factory` enumerates, with its description. An adapter DXGI will not
+/// describe is skipped.
+pub(crate) fn adapters(
+    factory: &IDXGIFactory1,
+) -> impl Iterator<Item = (IDXGIAdapter1, DXGI_ADAPTER_DESC1)> + '_ {
+    (0..)
+        .map_while(|i| {
+            // SAFETY: a COM call on the live factory; `ok()` keeps only an adapter that
+            // came back.
+            unsafe { factory.EnumAdapters1(i) }.ok()
+        })
+        .filter_map(|adapter| {
+            let mut desc = DXGI_ADAPTER_DESC1::default();
+            // SAFETY: a COM call on the adapter just enumerated, filling the local
+            // descriptor through the out-param; checked before the descriptor is read.
+            let described = unsafe { adapter.GetDesc1(&mut desc) }.is_ok();
+            described.then_some((adapter, desc))
+        })
+}
+
 /// User-mode driver version of the adapter behind `luid`, as Device Manager shows it
 /// ([`crate::video_types::umd_version_parts`]). `None` when no adapter matches or DXGI refuses.
 pub fn adapter_driver_version(luid: [u8; 8]) -> Option<[u16; 4]> {
     use windows::Win32::dxgi::IDXGIDevice;
     // SAFETY: plain DXGI factory creation; the returned interface is owned by this scope.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
-    for i in 0.. {
-        // SAFETY: read-only enumeration on the live factory; the adapter is owned here.
-        let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else {
-            break;
-        };
-        // SAFETY: `DXGI_ADAPTER_DESC1` is plain-old-data, so all-zeroes is a valid value.
-        let mut desc: DXGI_ADAPTER_DESC1 = unsafe { std::mem::zeroed() };
-        // SAFETY: fills the zeroed local through the out-param; checked before it is read.
-        if unsafe { adapter.GetDesc1(&mut desc) }.is_err() {
-            continue;
-        }
+    for (adapter, desc) in adapters(&factory) {
         let mut have = [0u8; 8];
         have[..4].copy_from_slice(&desc.AdapterLuid.LowPart.to_le_bytes());
         have[4..].copy_from_slice(&desc.AdapterLuid.HighPart.to_le_bytes());

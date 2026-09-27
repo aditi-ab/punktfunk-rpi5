@@ -14,8 +14,7 @@
 //! entry pulse — that gate is Linux-evdev only.
 
 use super::dualsense_windows::{
-    create_swdevice, driver_marks, publish_input, OutputDrain, SwDeviceProfile, OFF_DEVTYPE,
-    OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
+    create_swdevice, driver_marks, publish_input, stamp_pad, OutputDrain, SwDeviceProfile, SHM_SIZE,
 };
 use super::gamepad_raii::PadChannel;
 use super::steam_proto::{
@@ -51,20 +50,14 @@ impl DeckWinPad {
     fn open(index: u8) -> Result<DeckWinPad> {
         let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        let base = channel.data_base();
-        // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range.
-        unsafe {
-            *base.add(OFF_DEVTYPE) = pf_driver_proto::gamepad::DEVTYPE_STEAMDECK;
-            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            // Ring capability `2` = "this host drains the v2.2 long ring", stamped before the
-            // magic so the driver sees it on attach (see the DualSense open path + PadShm docs).
-            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
-            std::ptr::write_unaligned(
-                base.add(OFF_INPUT) as *mut [u8; STEAM_REPORT_LEN],
-                neutral_deck_report(),
-            );
-            std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
-        }
+        // Ring capability `2` = "this host drains the v2.2 long ring".
+        stamp_pad(
+            channel.data(),
+            pf_driver_proto::gamepad::DEVTYPE_STEAMDECK,
+            index,
+            2,
+            &neutral_deck_report(),
+        );
         let inst = format!("pf_deck_{index}");
         let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
             instance: &inst,
@@ -110,19 +103,15 @@ impl DeckWinPad {
         self.seq = self.seq.wrapping_add(1);
         let mut r = [0u8; STEAM_REPORT_LEN];
         serialize_deck_state(&mut r, st, self.seq);
-        // SAFETY: `data_base()` points at a live PAD_SHM_SIZE-byte section and `r` is the 64-byte
-        // Deck state frame.
-        unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };
+        publish_input(self.channel.data(), &mut self.input_gen, &r);
     }
 
     fn service(&mut self) -> (Option<(u16, u16)>, bool) {
         self.channel.pump();
-        // SAFETY: the channel's section is live and SHM_SIZE bytes.
-        let (proto, rev) = unsafe { driver_marks(self.channel.data_base()) };
+        let (proto, rev) = driver_marks(self.channel.data());
         self.attach.observe_pad(proto, rev);
         let mut rumble = None;
-        let base = self.channel.data_base();
-        let resync = self.drain.drain(base, |bytes| {
+        let resync = self.drain.drain(self.channel.data(), |bytes| {
             // Last rumble-carrying report wins. `0x8F` trackpad-haptic reports
             // carry none and must not clear it.
             if let Some(r) = parse_steam_output(bytes).rumble {

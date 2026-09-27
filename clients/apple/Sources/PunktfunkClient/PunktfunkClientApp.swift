@@ -28,6 +28,19 @@ struct PunktfunkClientApp: App {
         // Put Geist on the navigation titles before any bar is built.
         BrandTheme.apply()
         #endif
+        Self.warmIdentity()
+    }
+
+    /// The identity's first load is blocking Keychain work, and most of its callers sit on the
+    /// main actor. Loaded here, off it, they find both halves cached.
+    private static func warmIdentity() {
+        #if DEBUG
+        if ScreenshotMode.isActive { return }
+        #endif
+        DispatchQueue.global(qos: .utility).async {
+            guard let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
+            LibraryClient.warmIdentity(identity)
+        }
     }
 
     var body: some Scene {
@@ -111,6 +124,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Without this a quit reads to the host as a dropped link, and it lingers the display.
+    func applicationWillTerminate(_ notification: Notification) {
+        SessionModel.quitAll()
+        PresetStore.shared.flush()
     }
 }
 #elseif os(iOS)

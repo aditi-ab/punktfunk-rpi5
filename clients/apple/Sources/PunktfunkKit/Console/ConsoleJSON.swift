@@ -316,6 +316,7 @@ public enum ConsoleJSON {
     // MARK: - library
 
     /// `[LibraryGame]` from this client's catalog — the desktop service's `to_model` mapping.
+    /// Without `stats` the Recent and Most played sorts fall back to host order.
     public static func libraryGames(_ games: [GameEntry]) -> String {
         string(
             games.map { g in
@@ -325,6 +326,12 @@ public enum ConsoleJSON {
                     "icon": g.icon.flatMap { validIconToken($0) ? $0 : nil } ?? "",
                     "platform": g.platform ?? NSNull(), "developer": g.developer ?? NSNull(),
                     "year": g.releaseYear ?? NSNull(), "genres": g.genres ?? [],
+                    "stats": g.stats.map { s -> [String: Any] in
+                        [
+                            "last_played_unix_ms": s.lastPlayedUnixMs, "play_time_ms": s.playTimeMs,
+                            "last_run_ms": s.lastRunMs, "launch_count": s.launchCount,
+                        ]
+                    } ?? NSNull(),
                     "running": false,
                 ]
             })

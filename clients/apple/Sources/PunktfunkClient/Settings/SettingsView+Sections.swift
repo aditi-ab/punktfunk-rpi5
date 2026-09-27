@@ -21,6 +21,7 @@
 #if os(iOS)
 import CoreHaptics
 #endif
+import GameController
 import PunktfunkKit
 import SwiftUI
 
@@ -533,11 +534,21 @@ extension SettingsView {
         if showsSessionSection {
             Section("Session") {
                 #if os(macOS)
-                described("Go fullscreen when a session starts; return to a window on the host "
-                    + "list.", field: "fullscreen_on_stream") {
-                    Toggle(
-                        "Fullscreen while streaming",
-                        isOn: scoped(SettingsFields.fullscreenWhileStreaming))
+                if inPresetScope {
+                    described(fullscreenAlways
+                        ? "Every stream is fullscreen while Fullscreen is set to Always."
+                        : "Go fullscreen when a session starts; return to a window on the host "
+                            + "list.", field: "fullscreen_on_stream") {
+                        Toggle(
+                            "Fullscreen while streaming",
+                            isOn: scoped(SettingsFields.fullscreenWhileStreaming))
+                    }
+                } else {
+                    described(fullscreenCaption) {
+                        settingPicker(
+                            "Fullscreen", options: SettingsOptions.fullscreenModes,
+                            selection: fullscreenMode)
+                    }
                 }
                 #endif
                 if !inPresetScope {
@@ -574,6 +585,27 @@ extension SettingsView {
         "Ends a backgrounded session so it can't run down the battery."
         #endif
     }
+
+    #if os(macOS)
+    /// The Fullscreen picker over its two stores. Global scope only: a preset holds just the
+    /// streaming half, so "always" never reaches one.
+    private var fullscreenMode: Binding<String> {
+        Binding(
+            get: { fullscreenAlways ? "always" : (fullscreenWhileStreaming ? "stream" : "off") },
+            set: { mode in
+                fullscreenAlways = mode == "always"
+                if mode != "always" { fullscreenWhileStreaming = mode == "stream" }
+            })
+    }
+
+    private var fullscreenCaption: String {
+        switch fullscreenMode.wrappedValue {
+        case "always": "Punktfunk opens fullscreen and stays fullscreen between streams."
+        case "stream": "Streams go fullscreen. The host list returns to a window."
+        default: "Streams stay in a window."
+        }
+    }
+    #endif
 
     private static var gamepadUIModeCaption: String {
         #if os(tvOS)
@@ -1006,6 +1038,18 @@ extension SettingsView {
                     selection: scoped(SettingsFields.systemButtons))
                     .disabled(!effective.gamepadForwarding)
             }
+            #if !os(tvOS)
+            if homeButtonKept, !inPresetScope, effective.gamepadForwarding,
+               effective.systemButtonsForward, #available(macOS 27.0, iOS 27.0, *) {
+                described("The system keeps the Home button, so the host never sees it. Add "
+                    + "Punktfunk to Home Button Overrides.") {
+                    Button("Home Button Settings…") {
+                        try? GCControllerHomeButtonSettingsManager()
+                            .openControllerHomeButtonSettings(for: .customizeInAppAction)
+                    }
+                }
+            }
+            #endif
             described("Hold Select for the host's guide button; keep holding for its "
                 + "quick-access menu.",
                 field: "guide_gesture") {
@@ -1070,5 +1114,24 @@ extension SettingsView {
             Text("Applies from the next session.")
                 .settingsFooter()
         }
+        #if !os(tvOS)
+        .task(id: gamepads.controllers.isEmpty) { await watchHomeButton() }
+        #endif
     }
+
+    #if !os(tvOS)
+    /// Tracks whether the OS keeps the controller's Home press (macOS/iOS 27). An app listed under
+    /// Home Button Overrides reads `.defer`, and `GamepadCapture.attach`'s gesture claim then
+    /// hands the press to the stream. The setting reads only while a controller is connected.
+    func watchHomeButton() async {
+        guard #available(macOS 27.0, iOS 27.0, *), !gamepads.controllers.isEmpty else {
+            homeButtonKept = false
+            return
+        }
+        let settings = GCControllerHomeButtonSettingsManager()
+        let read = { (try? settings.controllerHomeButtonInAppAction.action) == .systemDefault }
+        homeButtonKept = read()
+        for await _ in settings.settingsUpdates { homeButtonKept = read() }
+    }
+    #endif
 }

@@ -10,19 +10,14 @@
 //! Rumble is the reverse path: `XInputSetState` → driver `SET_STATE` into the section →
 //! [`GamepadManager::pump_rumble`] onto the 0xCA plane, matching Linux `EV_FF`.
 
-use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
+use super::gamepad_raii::{sw_device_create, PadChannel, SwDeviceSpec};
 use crate::pad_slots::PadSlots;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use punktfunk_core::input::{GamepadEvent, MAX_PADS};
-use std::ffi::c_void;
-use std::sync::atomic::{fence, AtomicU32, Ordering};
+use std::sync::atomic::{fence, Ordering};
 use std::time::{Duration, Instant};
-use windows::core::{w, GUID, PCWSTR};
-use windows::Win32::Devices::Enumeration::Pnp::{
-    SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
-};
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::core::GUID;
+use windows::Win32::Devices::Enumeration::Pnp::HSWDEVICE;
 
 // Driver maps this same struct; `offset_of!` so a layout change is a compile error.
 use pf_driver_proto::gamepad::XusbShm;
@@ -40,6 +35,7 @@ const OFF_RUMBLE_SEQ: usize = core::mem::offset_of!(XusbShm, rumble_seq);
 const OFF_RUMBLE: usize = core::mem::offset_of!(XusbShm, rumble_large); // large @28, small @29
 const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(XusbShm, driver_proto);
 const OFF_PAD_INDEX: usize = core::mem::offset_of!(XusbShm, pad_index);
+const OFF_MAGIC: usize = core::mem::offset_of!(XusbShm, magic);
 
 /// INF hardware ids. `pf_xusb` installs the `xinputhid` UpperFilters string WGI admits on;
 /// PnP fails a devnode whose filter service is missing, so without it the pad takes the
@@ -58,91 +54,18 @@ fn xusb_hwid() -> &'static str {
 /// Spawn `pf_xusb_<index>` (hardware id `hwid`, enumerator `punktfunk`). XInput finds the
 /// device by `GUID_DEVINTERFACE_XUSB`, not VID/PID, so no USB compatible-ids — but
 /// `pContainerId` must be a deterministic non-null GUID: the null sentinel trips an
-/// `xinput1_4` slot-skip. `SwDeviceClose` on drop.
+/// `xinput1_4` slot-skip. The driver reads Location as the pad index it polls
+/// `pfxusb-boot-<index>` by. `SwDeviceClose` on drop.
 fn create_swdevice(index: u8, hwid: &str) -> Result<(HSWDEVICE, Option<String>)> {
-    let hwids: Vec<u16> = hwid.encode_utf16().chain([0u16, 0u16]).collect();
-    let instid: Vec<u16> = format!("pf_xusb_{index}")
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let desc: Vec<u16> = "Punktfunk Virtual Xbox 360 (XUSB)"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    // Driver reads Location as the pad index so it can poll `pfxusb-boot-<index>`.
-    // Buffer must outlive `SwDeviceCreate` (it does: we wait on the event).
-    let loc: Vec<u16> = format!("{index}")
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let container = GUID::from_values(0x5046_5855, 0x0000, 0x0000, [0, 0, 0, 0, 0, 0, 0, index]);
-
-    // SAFETY: zeroed then the fields we use are set; the buffers + container outlive the call.
-    let mut info: SW_DEVICE_CREATE_INFO = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<SW_DEVICE_CREATE_INFO>() as u32;
-    info.pszInstanceId = PCWSTR(instid.as_ptr());
-    info.pszzHardwareIds = PCWSTR(hwids.as_ptr());
-    info.pContainerId = &container;
-    info.pszDeviceDescription = PCWSTR(desc.as_ptr());
-    info.pszDeviceLocation = PCWSTR(loc.as_ptr());
-    info.CapabilityFlags = 0x0000_000B; // DriverRequired | SilentInstall | Removable
-
-    // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
-    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
-    // `result` starts as E_FAIL: a zeroed HRESULT is S_OK and would mask a wait timeout.
-    // Heap, not stack: a late callback after the 10 s wait must still write live memory.
-    // Timeout leaks the box and leaves the event open so that write/SetEvent is defined.
-    let ctx = Box::into_raw(Box::new(SwCreateCtx {
-        event,
-        result: E_FAIL,
-        instance_id: [0; 128],
-    }));
-    // SAFETY: info + buffers outlive the call; `ctx` is a live heap allocation outliving every path.
-    let hsw = match unsafe {
-        SwDeviceCreate(
-            w!("punktfunk"),
-            w!("HTREE\\ROOT\\0"),
-            &info,
-            None,
-            Some(sw_create_cb),
-            Some(ctx as *const c_void),
-        )
-    } {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: the call failed, so no callback is pending and `ctx` is ours to reclaim.
-            unsafe {
-                drop(Box::from_raw(ctx));
-                let _ = CloseHandle(event);
-            }
-            return Err(anyhow!("SwDeviceCreate(pf_xusb) failed: {e}"));
-        }
-    };
-    // SAFETY: event valid; block until PnP finishes enumerating, then check the callback result.
-    let wait = unsafe { WaitForSingleObject(event, 10_000) };
-    if wait != WAIT_OBJECT_0 {
-        // Timeout: leak `ctx` and leave `event` open (late callback).
-        // SAFETY: hsw is the handle SwDeviceCreate returned.
-        unsafe { SwDeviceClose(hsw) };
-        return Err(anyhow!(
-            "SwDeviceCreate(pf_xusb) enumeration callback never fired (10s) — PnP may be wedged"
-        ));
-    }
-    // SAFETY: the callback signalled, so nothing else will touch `ctx`/`event`;
-    // `ctx` came from `Box::into_raw` and is reclaimed exactly once here.
-    let ctx = unsafe {
-        let _ = CloseHandle(event);
-        Box::from_raw(ctx)
-    };
-    if ctx.result.is_err() {
-        // SAFETY: hsw is the handle SwDeviceCreate returned.
-        unsafe { SwDeviceClose(hsw) };
-        return Err(anyhow!(
-            "SwDeviceCreate(pf_xusb) enumeration failed: {:?}",
-            ctx.result
-        ));
-    }
-    Ok((hsw, ctx.instance_id()))
+    sw_device_create(&SwDeviceSpec {
+        enumerator: "punktfunk",
+        instance: &format!("pf_xusb_{index}"),
+        hardware_ids: &[hwid],
+        compatible_ids: &[],
+        description: "Punktfunk Virtual Xbox 360 (XUSB)",
+        location: &index.to_string(),
+        container: GUID::from_values(0x5046_5855, 0x0000, 0x0000, [0, 0, 0, 0, 0, 0, 0, index]),
+    })
 }
 
 /// One virtual Xbox 360 pad: `pf_xusb_<index>` plus the sealed `XusbShm` channel.
@@ -160,13 +83,10 @@ impl XusbWinPad {
     fn open(index: u8) -> Result<XusbWinPad> {
         let boot_name = pf_driver_proto::gamepad::xusb_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        let base = channel.data_base();
         // Index first; magic LAST. The driver rejects the section until magic is set.
-        // SAFETY: base points at SHM_SIZE writable bytes; OFF_PAD_INDEX is in range.
-        unsafe {
-            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
-        }
+        let shm = channel.data();
+        shm.store_u32(OFF_PAD_INDEX, index.into(), Ordering::Relaxed);
+        shm.store_u32(OFF_MAGIC, SHM_MAGIC, Ordering::Relaxed);
         // `?` so PadSlots retries; a swallowed failure latched a phantom pad for the session.
         let hwid = xusb_hwid();
         let (hsw, instance_id) = create_swdevice(index, hwid)?;
@@ -197,45 +117,36 @@ impl XusbWinPad {
     #[allow(clippy::too_many_arguments)]
     fn write_state(&mut self, buttons: u16, lt: u8, rt: u8, lx: i16, ly: i16, rx: i16, ry: i16) {
         self.packet = self.packet.wrapping_add(1);
-        let base = self.channel.data_base();
-        // SAFETY: `base` is the mapped `SHM_SIZE` section; every `OFF_*` is in range.
-        // Single owner (`&mut self`). `packet` LAST: `Release` fence then `Release`
-        // store so an `Acquire` load never sees a torn body on ARM64 (x86-TSO: plain
-        // stores). `OFF_PACKET` (== 4) is 4-aligned off the page-aligned base.
-        unsafe {
-            std::ptr::write_unaligned(base.add(OFF_BUTTONS) as *mut u16, buttons);
-            *base.add(OFF_LT) = lt;
-            *base.add(OFF_RT) = rt;
-            std::ptr::write_unaligned(base.add(OFF_LX) as *mut i16, lx);
-            std::ptr::write_unaligned(base.add(OFF_LY) as *mut i16, ly);
-            std::ptr::write_unaligned(base.add(OFF_RX) as *mut i16, rx);
-            std::ptr::write_unaligned(base.add(OFF_RY) as *mut i16, ry);
-            fence(Ordering::Release);
-            (*(base.add(OFF_PACKET) as *const AtomicU32)).store(self.packet, Ordering::Release);
-        }
+        let shm = self.channel.data();
+        shm.write_bytes(OFF_BUTTONS, &buttons.to_ne_bytes());
+        shm.write_bytes(OFF_LT, &[lt]);
+        shm.write_bytes(OFF_RT, &[rt]);
+        shm.write_bytes(OFF_LX, &lx.to_ne_bytes());
+        shm.write_bytes(OFF_LY, &ly.to_ne_bytes());
+        shm.write_bytes(OFF_RX, &rx.to_ne_bytes());
+        shm.write_bytes(OFF_RY, &ry.to_ne_bytes());
+        // `packet` LAST: `Release` fence then `Release` store, so an `Acquire` load never sees a
+        // torn body on ARM64 (x86-TSO: plain stores).
+        fence(Ordering::Release);
+        shm.store_u32(OFF_PACKET, self.packet, Ordering::Release);
     }
 
     /// New rumble `(large, small)` if `rumble_seq` moved. Also pumps handle delivery and attach.
     fn service(&mut self) -> Option<(u8, u8)> {
         self.channel.pump();
-        let base = self.channel.data_base();
-        // SAFETY: base points at SHM_SIZE bytes.
-        let proto = unsafe { std::ptr::read_unaligned(base.add(OFF_DRIVER_PROTO) as *const u32) };
-        self.attach.observe(proto);
-        // SAFETY: base points at SHM_SIZE bytes; `OFF_RUMBLE_SEQ` (== 24) is 4-aligned off the
-        // page-aligned base, so the `AtomicU32` view is valid. The driver bumps `rumble_seq` AFTER
-        // writing the rumble bytes, so an `Acquire` load here orders the `rumble_large`/`rumble_small`
-        // reads below after it — a fresh seq guarantees a coherent snapshot of the rumble bytes on a
-        // weakly-ordered core (ARM64). On x86-TSO it is a plain load.
-        let seq =
-            unsafe { (*(base.add(OFF_RUMBLE_SEQ) as *const AtomicU32)).load(Ordering::Acquire) };
+        let shm = self.channel.data();
+        self.attach
+            .observe(shm.load_u32(OFF_DRIVER_PROTO, Ordering::Relaxed));
+        // The driver bumps `rumble_seq` AFTER writing the rumble bytes, so this Acquire load
+        // orders the byte reads below after it: a fresh seq means a coherent snapshot on ARM64.
+        let seq = shm.load_u32(OFF_RUMBLE_SEQ, Ordering::Acquire);
         if seq == self.last_rumble_seq {
             return None;
         }
         self.last_rumble_seq = seq;
-        // SAFETY: rumble bytes at OFF_RUMBLE / OFF_RUMBLE+1.
-        let (large, small) = unsafe { (*base.add(OFF_RUMBLE), *base.add(OFF_RUMBLE + 1)) };
-        Some((large, small))
+        let mut rumble = [0u8; 2];
+        shm.read_bytes(OFF_RUMBLE, &mut rumble);
+        Some((rumble[0], rumble[1]))
     }
 }
 

@@ -138,18 +138,13 @@ final class SessionPresenter {
     /// Map a presenter choice and codec to its execution path.
     ///
     /// The decoded tvOS path requires a CVPixelBuffer, so PyroWave retains deadline-paced Metal.
-    /// Stage-3 and stage-4 map directly to glass and deadline pacing. On macOS, default PyroWave
-    /// uses glass gating to coalesce its bursty, near-instant decode output; an explicit stage-2
-    /// selection remains a faithful arrival-pacing comparison. Other stage-2 sessions use arrival.
-    static func pacing(
-        for choice: PresenterChoice, explicit: PresenterChoice?, codec: VideoCodec
-    ) -> PresentPacing {
+    /// Stage-3 and stage-4 map directly to glass and deadline pacing; stage-2 is arrival for every
+    /// codec. Glass gating waits for the previous frame's on-glass callback, about a refresh per
+    /// frame, and does not prevent the macOS DCP panic (see `WindowedPresentMode`).
+    static func pacing(for choice: PresenterChoice, codec: VideoCodec) -> PresentPacing {
         if choice == .decoded { return codec == .pyrowave ? .deadline : .decoded }
         if choice == .stage4 { return .deadline }
         if choice == .stage3 { return .glass }
-        #if os(macOS)
-        if explicit == nil, codec == .pyrowave { return .glass }
-        #endif
         return .arrival
     }
 
@@ -185,20 +180,11 @@ final class SessionPresenter {
         if let env, let mode = WindowedPresentMode(rawValue: env) { return mode }
         return (setting ?? true) ? .transaction : .async
     }
-
-    /// Adaptive-refresh latency sessions choose immediate sparse presents or one dense present per
-    /// display-link target. Smoothness and the other presenters keep their own pacing mechanisms.
-    static func adaptiveSlotPaced(
-        adaptiveSync: Bool, priority: PresentPriority, pacing: PresentPacing
-    ) -> Bool {
-        adaptiveSync && priority == .latency && pacing == .arrival
-    }
     #endif
 
     /// `PUNKTFUNK_GATE_DEPTH` (1…3) still overrides on iOS/tvOS so the standing-queue ladder
     /// stays reproducible on-device; macOS is pinned to 1, env ignored — a deeper gate only builds
-    /// a standing queue (see above), and macOS glass pacing exists for PyroWave smoothness
-    /// (see `pacing`), where depth 1 is the point. Internal (not private) for unit tests.
+    /// a standing queue (see above). Internal (not private) for unit tests.
     static func gateDepth(env: String?) -> Int {
         #if os(macOS)
         return 1
@@ -274,7 +260,6 @@ final class SessionPresenter {
     /// metering; deadline pacing owns a CAMetalDisplayLink instead.
     ///
     /// Call `layout(in:contentsScale:)` after start so any Metal sublayer has valid geometry.
-    /// `adaptiveSync` is the hosting screen's fixed-vs-adaptive verdict on macOS.
     func start(
         connection: PunktfunkConnection,
         baseLayer: AVSampleBufferDisplayLayer,
@@ -283,18 +268,21 @@ final class SessionPresenter {
         onFrame: (@Sendable (AccessUnit) -> Void)?,
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
-        onFrameHDR: (@Sendable (Bool) -> Void)? = nil,
-        adaptiveSync: Bool = false
+        onFrameHDR: (@Sendable (Bool) -> Void)? = nil
     ) {
         stop()
         self.connection = connection
         self.baseLayer = baseLayer
         restart = { [weak self] layer in
-            self?.start(
+            guard let self else { return }
+            // The Pencil reports proximity on its edges only, so the new pipeline is told here.
+            let boost = interactionBoost
+            start(
                 connection: connection, baseLayer: layer, endToEndMeter: endToEndMeter,
                 makeDisplayLink: makeDisplayLink,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
-                onFrameHDR: onFrameHDR, adaptiveSync: adaptiveSync)
+                onFrameHDR: onFrameHDR)
+            setInteractionBoost(boost)
         }
 
         // Explicit decode stays default so loss recovery and decode metering survive. Presentation
@@ -315,8 +303,7 @@ final class SessionPresenter {
             env: ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENTER"],
             allowStage1: allowStage1)
         let choice = explicit ?? PresenterChoice.platformDefault
-        let selectedPacing = Self.pacing(
-            for: choice, explicit: explicit, codec: connection.videoCodec)
+        let selectedPacing = Self.pacing(for: choice, codec: connection.videoCodec)
         let priority = PresentPriority.resolve(
             setting: connection.settings.presentPriority,
             bufferSetting: connection.settings.smoothBuffer)
@@ -326,11 +313,8 @@ final class SessionPresenter {
             selectedPacing, priority: priority, videoLayerCompatible: !connection.isChroma444)
         #if os(macOS)
         let vsyncPaced = priority != .latency && pacing == .arrival
-        let adaptiveSlotPaced = Self.adaptiveSlotPaced(
-            adaptiveSync: adaptiveSync, priority: priority, pacing: pacing)
         #else
         let vsyncPaced = false
-        let adaptiveSlotPaced = false
         #endif
         if choice != .stage1,
            let pipeline = Stage2Pipeline(
@@ -340,8 +324,7 @@ final class SessionPresenter {
                gateDepth: Self.gateDepth(
                    env: ProcessInfo.processInfo.environment["PUNKTFUNK_GATE_DEPTH"]),
                storePolicy: priority.storePolicy,
-               vsyncPaced: vsyncPaced,
-               adaptiveSlotPaced: adaptiveSlotPaced) {
+               vsyncPaced: vsyncPaced) {
             pipeline.onPresentWedged = { [weak self] in
                 // The presenter lives on main; the hop only carries the reference back there.
                 nonisolated(unsafe) let presenter = self
@@ -395,6 +378,16 @@ final class SessionPresenter {
         }
     }
 
+    /// Pen-proximity panel-rate boost pass-through (Stage2Pipeline.setInteractionBoost):
+    /// deadline pacing only — under arrival/glass the staged hint feeds no link, so this
+    /// is a no-op there. Kept here so a rebuilt pipeline starts boosted. MAIN thread.
+    func setInteractionBoost(_ on: Bool) {
+        interactionBoost = on
+        stage2?.setInteractionBoost(on)
+    }
+
+    private var interactionBoost = false
+
     /// Hint the display link with the stream's cadence. On iOS/tvOS a range is always required:
     /// without one, ProMotion devices cap CADisplayLink at 60 Hz (iPhones additionally need
     /// `CADisableMinimumFrameDurationOnPhone` in Info.plist), so a 120 fps stream would present
@@ -407,13 +400,6 @@ final class SessionPresenter {
     /// drop its physical refresh to match the content. VRR off falls back to a fixed floor:
     /// iOS keeps 30 Hz; macOS pins the link at the stream rate (see `frameRateRange`).
     /// Re-applied from `layout` so a mid-session `Reconfigure` picks up a new refresh.
-    /// Pen-proximity panel-rate boost pass-through (Stage2Pipeline.setInteractionBoost):
-    /// deadline pacing only — under arrival/glass the staged hint feeds no link, so this
-    /// is a no-op there. MAIN thread.
-    func setInteractionBoost(_ on: Bool) {
-        stage2?.setInteractionBoost(on)
-    }
-
     private func syncFrameRate(hz: UInt32) {
         guard hz > 0 else { return }
         // Deadline pacing: the hint goes to the pipeline's CAMetalDisplayLink instead (staged;
@@ -609,6 +595,7 @@ final class SessionPresenter {
         restart = nil
         baseLayer = nil
         contentSize = nil // a new session re-derives it from its first frame
+        interactionBoost = false
         pump?.stop()
         pump = nil
         stage2Link?.invalidate()

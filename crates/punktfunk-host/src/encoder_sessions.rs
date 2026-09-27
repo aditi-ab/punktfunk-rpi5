@@ -15,13 +15,19 @@ type NvmlDevice = *mut c_void;
 const NVML_SUCCESS: c_int = 0;
 const NVML_ERROR_INSUFFICIENT_SIZE: c_int = 7;
 
+/// Absolute paths only on Windows: this runs as SYSTEM, and a bare `nvml.dll` on a box
+/// without NVIDIA falls through the search order to `%PATH%`, where a user may plant one.
 #[cfg(windows)]
-const LIB_NAMES: &[&str] = &[
-    "nvml.dll",
-    r"C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll",
-];
+fn lib_names() -> Vec<String> {
+    vec![
+        crate::install::sys32("nvml.dll"),
+        r"C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll".to_string(),
+    ]
+}
 #[cfg(not(windows))]
-const LIB_NAMES: &[&str] = &["libnvidia-ml.so.1", "libnvidia-ml.so"];
+fn lib_names() -> Vec<String> {
+    vec!["libnvidia-ml.so.1".into(), "libnvidia-ml.so".into()]
+}
 
 /// `nvmlEncoderSessionInfo_t`: eight `unsigned int`s, header order.
 #[repr(C)]
@@ -57,9 +63,9 @@ impl Nvml {
         // SAFETY: each `lib.get` is a documented NVML symbol with the nvml.h signature
         // (by-value ints/pointers, no callbacks); `_lib` outlives every fn pointer.
         unsafe {
-            let lib = LIB_NAMES
+            let lib = lib_names()
                 .iter()
-                .find_map(|name| libloading::Library::new(*name).ok())?;
+                .find_map(|name| libloading::Library::new(name).ok())?;
             let init: unsafe extern "C" fn() -> c_int = *lib.get(b"nvmlInit_v2\0").ok()?;
             let device_count = *lib.get(b"nvmlDeviceGetCount_v2\0").ok()?;
             let device_by_index = *lib.get(b"nvmlDeviceGetHandleByIndex_v2\0").ok()?;

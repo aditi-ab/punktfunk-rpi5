@@ -508,12 +508,17 @@ public final class MetalVideoPresenter {
     private var lastSizeSig = ""
     #endif
 
-    /// nil if Metal is unavailable (no GPU / a headless CI) or a shader fails to compile — the caller
-    /// falls back to stage-1.
-    public static func make() -> MetalVideoPresenter? {
-        guard let device = MTLCreateSystemDefaultDevice(),
-              let queue = device.makeCommandQueue()
-        else { return nil }
+    private struct Pipelines {
+        let device: MTLDevice
+        let sdr, sdr10, hdr: MTLRenderPipelineState
+        let hdrToneMap: MTLRenderPipelineState?
+        let planar, planarHDR, planarToneMap: MTLRenderPipelineState
+    }
+
+    /// Compiled once per process: the source and its env lever never change, and every session
+    /// start, wedge rebuild and monitor move would otherwise recompile on the main thread.
+    private static let pipelines: Pipelines? = {
+        guard let device = MTLCreateSystemDefaultDevice() else { return nil }
         let pipelineSDR: MTLRenderPipelineState
         let pipelineSDR10: MTLRenderPipelineState
         let pipelineHDR: MTLRenderPipelineState
@@ -524,7 +529,7 @@ public final class MetalVideoPresenter {
         do {
             // DEBUG A/B lever: PUNKTFUNK_BILINEAR_LUMA=1 compiles the shader with Catmull-Rom OFF
             // (plain bilinear luma) by prepending a #define ahead of the source. Default (unset) is
-            // the normal bicubic path. Read at presenter creation — set it in the environment and
+            // the normal bicubic path. Read once per process — set it in the environment and
             // relaunch to flip; the log line confirms which path built.
             let bilinearLuma = ProcessInfo.processInfo.environment["PUNKTFUNK_BILINEAR_LUMA"] == "1"
             let source = (bilinearLuma ? "#define PF_BILINEAR_LUMA 1\n" : "") + shaderSource
@@ -578,6 +583,17 @@ public final class MetalVideoPresenter {
         } catch {
             return nil
         }
+        return Pipelines(
+            device: device, sdr: pipelineSDR, sdr10: pipelineSDR10, hdr: pipelineHDR,
+            hdrToneMap: pipelineHDRToneMap, planar: pipelinePlanar,
+            planarHDR: pipelinePlanarHDR, planarToneMap: pipelinePlanarToneMap)
+    }()
+
+    /// nil if Metal is unavailable (no GPU / a headless CI) or a shader fails to compile — the caller
+    /// falls back to stage-1.
+    public static func make() -> MetalVideoPresenter? {
+        guard let p = pipelines, let queue = p.device.makeCommandQueue() else { return nil }
+        let device = p.device
         var cache: CVMetalTextureCache?
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
         guard let textureCache = cache else { return nil }
@@ -618,10 +634,10 @@ public final class MetalVideoPresenter {
         layer.maximumDrawableCount = 3
 
         return MetalVideoPresenter(
-            device: device, queue: queue, pipelineSDR: pipelineSDR, pipelineSDR10: pipelineSDR10,
-            pipelineHDR: pipelineHDR,
-            pipelineHDRToneMap: pipelineHDRToneMap, pipelinePlanar: pipelinePlanar,
-            pipelinePlanarHDR: pipelinePlanarHDR, pipelinePlanarToneMap: pipelinePlanarToneMap,
+            device: device, queue: queue, pipelineSDR: p.sdr, pipelineSDR10: p.sdr10,
+            pipelineHDR: p.hdr,
+            pipelineHDRToneMap: p.hdrToneMap, pipelinePlanar: p.planar,
+            pipelinePlanarHDR: p.planarHDR, pipelinePlanarToneMap: p.planarToneMap,
             textureCache: textureCache, layer: layer)
     }
 

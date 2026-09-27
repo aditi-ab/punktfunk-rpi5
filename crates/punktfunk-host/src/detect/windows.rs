@@ -3,45 +3,18 @@
 //! Best-effort — privilege or API failure yields no evidence, never aborts startup.
 
 use super::{Evidence, Known};
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-};
 use windows_service::service::{ServiceAccess, ServiceStartType};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 /// Lowercased executable basenames (no `.exe`) from a Toolhelp snapshot.
-/// `szExeFile` is the module base name, not a full path.
 pub fn running_processes() -> Vec<String> {
-    let mut out = Vec::new();
-    // SAFETY: the snapshot handle is closed on every exit path; `entry` is fully
-    // initialized (`dwSize` set) before Process32FirstW reads it.
-    unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return out;
-        };
-        // Zeroed then `dwSize` set. Toolhelp reads `szExeFile` from this; there is no useful Default.
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..std::mem::zeroed()
-        };
-        if Process32FirstW(snap, &mut entry).is_ok() {
-            loop {
-                let end = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let name = String::from_utf16_lossy(&entry.szExeFile[..end]).to_ascii_lowercase();
-                out.push(name.strip_suffix(".exe").unwrap_or(&name).to_string());
-                if Process32NextW(snap, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snap);
-    }
-    out
+    crate::procscan::processes()
+        .into_iter()
+        .map(|(_, _, exe)| {
+            let name = exe.to_ascii_lowercase();
+            name.strip_suffix(".exe").unwrap_or(&name).to_string()
+        })
+        .collect()
 }
 
 pub fn static_evidence(known: &Known) -> Vec<Evidence> {

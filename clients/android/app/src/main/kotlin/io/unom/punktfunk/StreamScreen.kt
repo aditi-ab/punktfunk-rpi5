@@ -86,7 +86,9 @@ import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.VideoFit
 import io.unom.punktfunk.models.ActiveSession
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -427,6 +429,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // again (use-after-free → SIGSEGV: the consistent back-while-streaming crash). Both run on the
     // main thread, so a plain flag is race-free; AtomicBoolean just makes the intent explicit.
     val closed = remember { AtomicBoolean(false) }
+    // The mic opens off the UI thread (AAudio input opens can take hundreds of ms), one start at a
+    // time. Every stop bumps `micGen`, so a start that lost its surface meanwhile undoes itself.
+    val micStarter = remember {
+        Executors.newSingleThreadExecutor { r -> Thread(r, "pf-mic-start").apply { isDaemon = true } }
+    }
+    val micGen = remember { AtomicInteger(0) }
 
     // Everything this stream does to the window — wake/Wi-Fi locks, the refresh pin, ALLM, the
     // cutout and soft-keyboard modes, the landscape lock — and the prior values it puts back.
@@ -438,10 +446,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     DisposableEffect(handle) {
         streamWindow.attach()
         peripherals.start()
-        // The panel's refresh pin, unbuffered pointer dispatch and the render-rate vote.
+        // The panel's refresh pin, unbuffered input dispatch and the render-rate vote.
         streamWindow.pinDisplay()
         onDispose {
             closed.set(true) // from here the handle gets freed; surfaceDestroyed must not touch it
+            micGen.incrementAndGet()
+            micStarter.shutdown()
             peripherals.stop()
             streamWindow.detach()
             // Leaving the stream: stop the mic + audio + decode threads and tear down the session.
@@ -450,7 +460,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             NativeBridge.nativeStopAudio(handle)
             NativeBridge.nativeStopVideo(handle)
             NativeBridge.nativeVideoDrain(handle, false)
-            NativeBridge.nativeClose(handle)
+            SessionGate.close(handle) // the QUIC close drains for up to 300 ms, off this thread
         }
     }
 
@@ -459,6 +469,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     val gestures = hasTouch && touchMode != TouchMode.TOUCH && pointerOk
     // Settings can turn Back off, but only while another opener exists: the ring holds End stream.
     val backOpensRing = initialSettings.backOpensRing || !(ui.padPresent || keyboard || gestures)
+    val openRingCentred = { ring.openAt(Offset(containerSize.width / 2f, containerSize.height / 2f)) }
     // The quick-action ring (design/touch-client-overlay.md §2). Back opens it at the screen
     // centre instead of ending the session; "End stream" is a slot inside, behind a two-press arm.
     // Back never falls through: an edge swipe mid-game must not tear the session down.
@@ -467,7 +478,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             activity?.mouseForwarder?.backIsMouseEcho() == true -> {}
             ring.sheet -> ring.sheet = false
             ring.committed -> ring.close()
-            backOpensRing -> ring.openAt(Offset(containerSize.width / 2f, containerSize.height / 2f))
+            backOpensRing -> openRingCentred()
         }
     }
     // Host actions are PRE-FETCHED on the session tick, never fetched when the ring opens: two
@@ -679,7 +690,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                     onDial = {},
                 )
             },
-            pad = { size -> PadHalf(virtualPad, overlayCfg.pad, size, haptics) },
+            pad = { size -> PadHalf(virtualPad, overlayCfg.pad, size, haptics, openRingCentred) },
         )
     }
     // A safe-area mode asked the host for a picture narrower than the panel by the housing, so the
@@ -778,16 +789,31 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                 // service, so the platform's recording indicator would announce a
                                 // mic nobody can hear.
                                 if (micWanted && ui.accessGrants and SessionAccess.MIC != 0) {
-                                    val sessionId =
-                                        NativeBridge.nativeStartMic(handle, initialSettings.echoCancel)
-                                    if (initialSettings.echoCancel) {
-                                        attachMicEffects(sessionId, micEffects)
+                                    val gen = micGen.incrementAndGet()
+                                    val echo = initialSettings.echoCancel
+                                    val main = ContextCompat.getMainExecutor(context)
+                                    if (!micStarter.isShutdown) micStarter.execute {
+                                        if (micGen.get() != gen) return@execute
+                                        val sessionId = NativeBridge.nativeStartMic(handle, echo)
+                                        // Stopped during the open: that stop found nothing to stop.
+                                        if (micGen.get() != gen) {
+                                            NativeBridge.nativeStopMic(handle)
+                                            return@execute
+                                        }
+                                        main.execute {
+                                            if (micGen.get() != gen) return@execute
+                                            if (ui.accessGrants and SessionAccess.MIC == 0) {
+                                                NativeBridge.nativeStopMic(handle) // revoked meanwhile
+                                                return@execute
+                                            }
+                                            if (echo) attachMicEffects(sessionId, micEffects)
+                                            // Did a capture actually open? That — not the setting —
+                                            // puts the mute control on screen. A restart after a
+                                            // surface recreate comes back already muted if the user
+                                            // muted: the flag lives on the session handle.
+                                            ui.micRunning = NativeBridge.nativeMicActive(handle)
+                                        }
                                     }
-                                    // Did a capture actually open? That — not the setting — is what
-                                    // puts the mute control on screen. A restart after a surface
-                                    // recreate comes back already muted if the user muted: the flag
-                                    // lives on the session handle, so nothing has to be re-applied.
-                                    ui.micRunning = NativeBridge.nativeMicActive(handle)
                                 }
                             }
 
@@ -827,6 +853,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                 // DisposableEffect has closed it, the handle is freed; dereferencing it
                                 // here is the use-after-free that crashed on back-navigation.
                                 if (!closed.get()) {
+                                    micGen.incrementAndGet()
                                     releaseMicEffects(micEffects)
                                     NativeBridge.nativeStopMic(handle)
                                     // No capture, no control — but the MUTE state is deliberately left
@@ -1013,7 +1040,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             // first and every other finger falls through; below the ring, whose scrim owns every
             // finger while it is up. Composed only while shown (tenet 1) — and with a lower half or
             // a companion panel it leaves this half entirely for that.
-            if (split == null && !companionUp) PadHalf(virtualPad, overlayCfg.pad, containerSize, haptics)
+            if (split == null && !companionUp) PadHalf(virtualPad, overlayCfg.pad, containerSize, haptics, openRingCentred)
             // The ring, above the gesture layer so its buttons take the finger first. Composed only
             // while open: a closed overlay costs nothing (tenet 1).
             OsdScaled {
@@ -1042,7 +1069,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             // The hinge itself: nothing on a creased panel, a real strip on a two-panel device.
             Spacer(Modifier.height(with(density) { split.hingePx.toDp() }))
             Box(modifier = Modifier.fillMaxWidth().weight(1f).onSizeChanged { padSize = it }) {
-                if (hingeCompanion) companion() else PadHalf(virtualPad, overlayCfg.pad, padSize, haptics)
+                if (hingeCompanion) companion() else PadHalf(virtualPad, overlayCfg.pad, padSize, haptics, openRingCentred)
             }
         }
         companionDisplay?.let { CompanionOnDisplay(it, companion) }
@@ -1066,9 +1093,10 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
  * (`DisposableEffect(padShown)`), so moving the layer never makes the host see a controller reconnect.
  */
 @Composable
-private fun PadHalf(pad: GamepadRouter.ExternalPad?, cfg: PadConfig, size: IntSize, haptics: ConsoleHaptics) {
+private fun PadHalf(pad: GamepadRouter.ExternalPad?, cfg: PadConfig, size: IntSize, haptics: ConsoleHaptics, openRing: () -> Unit) {
     if (pad == null) return
-    val sink = remember(pad) { PadSink(pad::button, pad::axis) }
+    val ring by rememberUpdatedState(openRing)
+    val sink = remember(pad) { PadSink(pad::button, pad::axis) { ring() } }
     VirtualPadLayer(cfg, size, sink, haptics)
 }
 
@@ -1302,6 +1330,22 @@ internal class KeyCaptureView(context: Context) : View(context) {
     init {
         isFocusable = true
         isFocusableInTouchMode = true
+    }
+
+    // A leaf keeps its unbuffered request; a ViewGroup's is recomputed whenever focus moves below
+    // it. Pointer classes rise from any child, the rest through this view while it holds focus.
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            requestUnbufferedDispatch(STREAM_UNBUFFERED_SOURCES)
+        }
+    }
+
+    override fun onDetachedFromWindow() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            requestUnbufferedDispatch(0)
+        }
+        super.onDetachedFromWindow()
     }
 
     /** The session handle when the host types committed text; `0` = VK-only fallback. */

@@ -2486,13 +2486,17 @@ mod tests {
             "three-quarter fill lights the midpoint: {:?}",
             px(&on, mid)
         );
-        // The icon sits in the gutter the label used to start in, so something is inked there.
-        let gutter = (f64::from(r0.left) + 26.0, f64::from(r0.center_y()));
-        assert!(
-            px(&on, gutter).iter().any(|c| *c > 80),
-            "icon in the gutter: {:?}",
-            px(&on, gutter)
-        );
+        // The icon sits in the gutter the label used to start in. Its strokes are thin, so look
+        // across its box for ink well above a dark ground rather than at one pixel.
+        let (gx, gy) = (f64::from(r0.left) + 26.0, f64::from(r0.center_y()));
+        let inked = (-10..=10).any(|dx| {
+            (-10..=10).any(|dy| {
+                px(&on, (gx + f64::from(dx), gy + f64::from(dy)))
+                    .iter()
+                    .any(|c| *c > 150)
+            })
+        });
+        assert!(inked, "icon in the gutter around {gx},{gy}");
     }
 
     /// Slip arms only when the value actually changed, and settles back to

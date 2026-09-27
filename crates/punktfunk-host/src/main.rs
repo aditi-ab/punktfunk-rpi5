@@ -156,6 +156,7 @@ mod native_pairing;
 mod net_health;
 mod osinfo;
 // Live per-session pad tap the console's Controllers page streams.
+mod emulators;
 mod pad_feed;
 mod plugins;
 mod power;
@@ -199,6 +200,12 @@ use std::path::PathBuf;
 /// portal flow reads a property off those two transient objects. It is the module's
 /// only `warn!`, so `error` there costs nothing else. The ring keeps them regardless.
 const DEFAULT_LOG_FILTER: &str = "info,zbus::proxy=error";
+
+// POSIX `geteuid`: no arguments, no memory, cannot fail — so `safe` for every caller.
+#[cfg(unix)]
+unsafe extern "C" {
+    safe fn geteuid() -> u32;
+}
 
 fn main() {
     // Before any `ureq` agent (cover-art, webhooks, catalog, updates).

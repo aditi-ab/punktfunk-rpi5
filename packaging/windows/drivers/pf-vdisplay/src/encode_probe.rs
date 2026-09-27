@@ -16,13 +16,13 @@ use std::time::{Duration, Instant};
 use pf_driver_proto::control::{self, EncodeProbeReply, EncodeProbeRequest};
 use pf_encode_win::{ChromaFormat, EncodedFrame, Encoder};
 use wdk_sys::NTSTATUS;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
+use windows::Win32::System::Threading::{SetEvent, WaitForMultipleObjects};
 use windows62::Win32::Graphics::Direct3D11 as d3d;
 
 use crate::direct_3d_device::{Direct3DDevice, pooled_device};
@@ -31,7 +31,7 @@ use crate::encode::thread::{
     OpenSpec, codec_from_wire, open_backend, qpc_frequency, qpc_now, qpc_to_ns,
 };
 use crate::registry::lock;
-use crate::worker::Worker;
+use crate::worker::{OwnedHandle, Worker};
 use crate::{STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
 
 const STATUS_UNSUCCESSFUL: NTSTATUS = 0xC000_0001u32 as NTSTATUS;
@@ -77,20 +77,11 @@ enum Ring {
 struct Shared {
     target_id: u32,
     /// Auto-reset, signalled once per copied frame.
-    event: isize,
+    event: OwnedHandle,
     ring: Mutex<Ring>,
     /// Ring device epoch: a hook on a different (recreated) device skips the copy.
     device_epoch: AtomicU32,
     drops: AtomicU32,
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // SAFETY: our own event, created in `arm`; this is its sole close.
-        unsafe {
-            let _ = CloseHandle(HANDLE(self.event as *mut _));
-        }
-    }
 }
 
 struct Probe {
@@ -137,13 +128,12 @@ pub fn arm(req: &EncodeProbeRequest) -> NTSTATUS {
     }
     // The previous run's thread has exited (its state is done/failed): the join is immediate.
     drop(p.worker.take());
-    // SAFETY: plain event creation — auto-reset, unsignalled, unnamed, no security descriptor.
-    let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
+    let Some(event) = OwnedHandle::event(false) else {
         return STATUS_UNSUCCESSFUL;
     };
     let shared = Arc::new(Shared {
         target_id: req.target_id,
-        event: event.0 as isize,
+        event,
         ring: Mutex::new(Ring::Priming),
         device_epoch: AtomicU32::new(0),
         drops: AtomicU32::new(0),
@@ -226,7 +216,7 @@ pub fn offer(device: &Direct3DDevice, tex: &ID3D11Texture2D, display_qpc: u64, t
 fn signal(shared: &Shared) {
     // SAFETY: the event lives as long as `shared`, which the caller holds an `Arc` of.
     unsafe {
-        let _ = SetEvent(HANDLE(shared.event as *mut _));
+        let _ = SetEvent(shared.event.as_raw());
     }
 }
 
@@ -550,7 +540,7 @@ fn wait(
         return Err((-3, starved));
     }
     let ms = left.as_millis().min(1000) as u32;
-    let handles = [stop, HANDLE(shared.event as *mut _)];
+    let handles = [stop, shared.event.as_raw()];
     // SAFETY: `stop` is the worker's stop event, alive until the worker joins this thread;
     // the frame event lives as long as `shared`.
     let waited = unsafe { WaitForMultipleObjects(&handles, false, ms) };

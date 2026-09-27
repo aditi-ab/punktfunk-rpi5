@@ -24,19 +24,37 @@ const INSTANCE_EXTS: [&std::ffi::CStr; 2] =
 /// Device extensions, same contract. Only the swapchain: decode and CSC are core 1.3.
 const DEVICE_EXTS: [&std::ffi::CStr; 1] = [ash::khr::swapchain::NAME];
 
-/// The device this lane decodes and presents on, plus the ash wrappers its callers need.
-pub(super) struct PyroDevice {
+/// The instance and the window surface on it. Dropping destroys the surface, then the instance.
+pub(super) struct WindowSurface {
     pub(super) entry: ash::Entry,
     pub(super) instance: ash::Instance,
+    /// Holds a reference on the `ANativeWindow` until destroyed.
+    pub(super) surface: vk::SurfaceKHR,
+}
+
+impl Drop for WindowSurface {
+    fn drop(&mut self) {
+        // SAFETY: only `PyroDevice` holds this past bring-up, and it destroys its device (and
+        // with it every swapchain on the surface) before its fields drop.
+        unsafe {
+            ash::khr::surface::Instance::new(&self.entry, &self.instance)
+                .destroy_surface(self.surface, None);
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+/// The device this lane decodes and presents on, plus the ash wrappers its callers need.
+/// Dropping destroys the device, then `base`.
+pub(super) struct PyroDevice {
     pub(super) device: ash::Device,
     pub(super) pdev: vk::PhysicalDevice,
     pub(super) queue: vk::Queue,
     pub(super) qf: u32,
-    /// The window surface every swapchain is built on. Owned here so its lifetime brackets
-    /// the device's, which is the order Vulkan requires at teardown.
-    pub(super) surface: vk::SurfaceKHR,
     /// The handoff the shared PyroWave decoder is built from.
     pub(super) vkd: VulkanDecodeDevice,
+    /// The surface every swapchain is built on, outliving the device as Vulkan requires.
+    pub(super) base: WindowSurface,
 }
 
 /// The compute feature set pyrowave's kernels need, read off a physical device.
@@ -150,20 +168,17 @@ impl PyroDevice {
     /// Bring up the device the session decodes and presents on.
     ///
     /// Picks the first physical device that both passes the feature probe and can present
-    /// to `surface` — on a phone or TV box there is exactly one GPU, so the loop is a
+    /// to `base`'s surface — on a phone or TV box there is exactly one GPU, so the loop is a
     /// formality that costs nothing and keeps the emulator (a software device beside a
-    /// hardware one) honest.
-    pub(super) fn new(
-        entry: ash::Entry,
-        instance: ash::Instance,
-        surface: vk::SurfaceKHR,
-    ) -> Result<PyroDevice> {
-        let surface_i = ash::khr::surface::Instance::new(&entry, &instance);
+    /// hardware one) honest. An error drops `base`.
+    pub(super) fn new(base: WindowSurface) -> Result<PyroDevice> {
+        let (instance, surface) = (&base.instance, base.surface);
+        let surface_i = ash::khr::surface::Instance::new(&base.entry, instance);
         // SAFETY: `instance` is live; the enumeration only reads.
         let devices = unsafe { instance.enumerate_physical_devices() }?;
         let mut chosen = None;
         for pdev in devices {
-            let probe = probe_features(&instance, pdev);
+            let probe = probe_features(instance, pdev);
             if !probe.ok {
                 log::info!(
                     "pyro: skipping {} — missing the PyroWave compute feature set",
@@ -175,7 +190,7 @@ impl PyroDevice {
             let families = unsafe { instance.get_physical_device_queue_family_properties(pdev) };
             let qf = families.iter().enumerate().position(|(i, f)| {
                 f.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                    // SAFETY: `surface` is live for the presenter's lifetime.
+                    // SAFETY: `surface` is live while `base` is.
                     && unsafe {
                         surface_i.get_physical_device_surface_support(pdev, i as u32, surface)
                     }
@@ -215,7 +230,7 @@ impl PyroDevice {
             .enabled_extension_names(&ext_ptrs)
             .push_next(&mut f2);
         // SAFETY: every builder above is a local that outlives the call; the returned
-        // device is owned by this struct and destroyed in `destroy`.
+        // device is owned by this struct and destroyed in its `Drop`.
         let device = unsafe { instance.create_device(pdev, &dev_ci, None) }
             .map_err(|e| anyhow!("vkCreateDevice: {e}"))?;
         // SAFETY: queue 0 of `qf` was requested at create.
@@ -230,7 +245,7 @@ impl PyroDevice {
         );
 
         let vkd = VulkanDecodeDevice {
-            get_instance_proc_addr: entry.static_fn().get_instance_proc_addr as usize,
+            get_instance_proc_addr: base.entry.static_fn().get_instance_proc_addr as usize,
             instance: ash::vk::Handle::as_raw(instance.handle()) as usize,
             physical_device: ash::vk::Handle::as_raw(pdev) as usize,
             device: ash::vk::Handle::as_raw(device.handle()) as usize,
@@ -269,32 +284,26 @@ impl PyroDevice {
             queue_lock: std::sync::Arc::new(QueueLock::new()),
         };
         Ok(PyroDevice {
-            entry,
-            instance,
             device,
             pdev,
             queue,
             qf,
-            surface,
             vkd,
+            base,
         })
     }
 
     /// Load the loader, create the instance, and make a surface on `window`.
     ///
-    /// Returned separately from [`PyroDevice::new`] because the surface must exist before a
-    /// physical device can be chosen (presentation support is a per-family property of the
-    /// surface), and the caller owns it for the swapchain's whole life.
-    pub(super) fn open_surface(
-        window: &ndk::native_window::NativeWindow,
-    ) -> Result<(ash::Entry, ash::Instance, vk::SurfaceKHR)> {
+    /// Separate from [`PyroDevice::new`] because the surface must exist before a physical
+    /// device can be chosen (presentation support is a per-family property of the surface).
+    pub(super) fn open_surface(window: &ndk::native_window::NativeWindow) -> Result<WindowSurface> {
         // SAFETY: dlopens libvulkan.so; `Entry` owns the handle for the session.
         let entry = unsafe { ash::Entry::load() }.map_err(|e| anyhow!("no Vulkan loader: {e}"))?;
         let instance = create_instance(&entry, true)?;
         let android = ash::khr::android_surface::Instance::new(&entry, &instance);
         let ci = vk::AndroidSurfaceCreateInfoKHR::default().window(window.ptr().as_ptr().cast());
-        // SAFETY: `window` outlives the surface (the decode thread holds it for its whole
-        // life, and Kotlin stops the thread before releasing the Surface).
+        // SAFETY: `window` is live for the call; the surface takes its own reference on it.
         let surface = match unsafe { android.create_android_surface(&ci, None) } {
             Ok(s) => s,
             Err(e) => {
@@ -303,18 +312,22 @@ impl PyroDevice {
                 bail!("vkCreateAndroidSurfaceKHR: {e}");
             }
         };
-        Ok((entry, instance, surface))
+        Ok(WindowSurface {
+            entry,
+            instance,
+            surface,
+        })
     }
+}
 
-    /// Tear down what [`PyroDevice::new`] created. The caller destroys the surface and the
-    /// instance after this, in that order — a surface outliving its device is fine, a
-    /// device outliving its instance is not.
-    ///
-    /// # Safety
-    /// Every object built on this device (decoder, swapchain, pipeline) must already be
-    /// destroyed, and the queue idle.
-    pub(super) unsafe fn destroy(&self) {
-        // SAFETY: the caller guarantees nothing built on this device survives.
-        unsafe { self.device.destroy_device(None) };
+impl Drop for PyroDevice {
+    fn drop(&mut self) {
+        let _q = self.vkd.queue_lock.guard();
+        // SAFETY: `Present` borrows this device, and `run_inner` declares the decoder after it,
+        // so both are destroyed by now; idling retires any work still on the queue.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_device(None);
+        }
     }
 }

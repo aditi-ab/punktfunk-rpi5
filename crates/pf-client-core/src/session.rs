@@ -1363,9 +1363,8 @@ fn pump(
                             }
                             #[cfg(target_os = "linux")]
                             HwDone::SyncFile(fd) => {
-                                use std::os::fd::AsRawFd as _;
-                                let _ =
-                                    pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_raw_fd(), 50);
+                                use std::os::fd::AsFd as _;
+                                let _ = pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_fd(), 50);
                             }
                             HwDone::Cpu => {}
                         }

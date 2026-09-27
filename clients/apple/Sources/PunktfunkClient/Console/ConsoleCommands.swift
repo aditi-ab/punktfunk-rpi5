@@ -199,8 +199,14 @@ extension ConsoleModel {
     /// runs, then what the host answers. `refreshOnly` asks about running titles alone.
     func fetchLibrary(addr: String, mgmt: UInt16, fp: String, refreshOnly: Bool) {
         guard let host = host(fp: fp, addr: addr, port: 0) else { return }
-        // The demo host serves no management API; its shelf is built in.
-        if DemoMode.isDemo(host) {
+        // The demo host serves no management API; its shelf is built in. The shot harness has
+        // no host to ask, so every host shows that shelf there.
+        #if DEBUG
+        let builtIn = DemoMode.isDemo(host) || ScreenshotMode.isActive
+        #else
+        let builtIn = DemoMode.isDemo(host)
+        #endif
+        if builtIn {
             bridge.push(.libraryRunning, ConsoleJSON.runningGames([]))
             if refreshOnly { return }
             bridge.push(.libraryBegin, "{}")
@@ -245,9 +251,13 @@ extension ConsoleModel {
                 await LibraryCache.shared?.store(games, hostID: host.id.uuidString)
                 loadArt(games, host: host, identity: identity, mgmt: mgmt)
             } catch {
-                // The cached shelf stays up; its covers still come from the host's store.
+                // A newer fetch owns the shelf now.
+                if Task.isCancelled { return }
+                // The cached shelf stays up, marked offline; its covers come from the art cache.
                 if let cached {
                     loadArt(cached.games, host: host, identity: identity, mgmt: mgmt)
+                    bridge.push(.libraryStale, "2")
+                    return
                 }
                 bridge.push(
                     .libraryPhase,
@@ -312,9 +322,11 @@ extension ConsoleModel {
         waker.start(
             host: host, connectsAfter: thenConnect, macs: host.wakeMacs, lastIP: host.address,
             isOnline: { [weak self] in
-                guard let self else { return false }
-                await store.refreshReachability(discovery: discovery)
-                return store.probedOnline.contains(host.id)
+                guard let self, await store.isReachable(host, discovery: discovery)
+                else { return false }
+                // The wake card reads this set.
+                store.probedOnline.insert(host.id)
+                return true
             },
             onOnline: { [weak self] in
                 guard let self else { return }

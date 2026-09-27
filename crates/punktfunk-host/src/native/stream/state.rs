@@ -119,7 +119,7 @@ pub(super) struct StreamState {
     pub(super) force_idr: Arc<AtomicBool>,
     pub(super) capture_health: Arc<std::sync::Mutex<Option<pf_capture::CaptureHealth>>>,
     pub(super) health_published_at: std::time::Instant,
-    _game_life: Option<crate::gamelease::SessionGuard>,
+    pub(super) game_life: Option<crate::gamelease::SessionGuard>,
 
     // ---- the live pipeline ----
     pub(super) capturer: Box<dyn crate::capture::Capturer>,
@@ -777,25 +777,6 @@ impl StreamState {
             }
         };
 
-        // The atom watcher owns the end for a dedicated Steam session; `gamelease` keeps running, so
-        // the console still shows what is playing, but it no longer closes the connection.
-        #[cfg(target_os = "linux")]
-        if let Some(appid) = steam_exit_appid {
-            let stop = stop.clone();
-            let end = end_on_game_exit.clone();
-            let seat = seat.clone();
-            let spawned = std::thread::Builder::new()
-                .name("pf1-steamexit".into())
-                .spawn(move || {
-                    if crate::vdisplay::watch_steam_game_exit(appid, seat.as_deref(), &stop) {
-                        end();
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "dedicated Steam exit watcher not started");
-            }
-        }
-
         let game_lease = launch_target.as_ref().map(|target| {
             #[cfg(target_os = "linux")]
             let nested = crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref());
@@ -814,7 +795,7 @@ impl StreamState {
                     );
                 })
             } else {
-                Box::new(end_on_game_exit)
+                Box::new(end_on_game_exit.clone())
             };
             crate::gamelease::open(
                 crate::gamelease::LeaseRequest {
@@ -822,7 +803,7 @@ impl StreamState {
                     client: client_label.clone(),
                     fingerprint: controls.fingerprint.clone(),
                     preset: controls.preset.clone(),
-                    plane: crate::events::Plane::Native,
+                    plane: conn.plane(),
                     spec: target.detect.clone(),
                     nested,
                     // Two seats can play the same title and Steam's reaper looks the same in both,
@@ -862,6 +843,29 @@ impl StreamState {
             )
         });
         let game_shared = game_lease.as_ref().map(|l| l.shared());
+        // The atom watcher owns the end and `game.exited` for a dedicated Steam session;
+        // `gamelease` keeps running, so the console still shows what is playing, but it no longer
+        // closes the connection.
+        #[cfg(target_os = "linux")]
+        if let Some(appid) = steam_exit_appid {
+            let stop = stop.clone();
+            let end = end_on_game_exit.clone();
+            let seat = seat.clone();
+            let game = game_shared.clone();
+            let spawned = std::thread::Builder::new()
+                .name("pf1-steamexit".into())
+                .spawn(move || {
+                    if crate::vdisplay::watch_steam_game_exit(appid, seat.as_deref(), &stop) {
+                        if let Some(g) = game.as_deref() {
+                            crate::gamelease::report_exit(g);
+                        }
+                        end();
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "dedicated Steam exit watcher not started");
+            }
+        }
         // The watcher keeps its own grace: the game the player starts after signing in is
         // followed as any other.
         if seat_sign_in {
@@ -907,6 +911,7 @@ impl StreamState {
             mode: live_mode.clone(),
             codec: plan.codec.label(),
             client: client_label.clone(),
+            plane: conn.plane(),
             bitrate_kbps: live_bitrate.clone(),
             link_kbps,
             link_paced: budget_identity,
@@ -958,7 +963,7 @@ impl StreamState {
             force_idr: force_idr.clone(),
             client: client_label,
             client_name,
-            plane: crate::events::Plane::Native,
+            plane: conn.plane(),
             hdr: plan.hdr,
             ttff_ms: bringup.total_slot(),
             last_resize_ms: resize_ms.clone(),
@@ -1112,7 +1117,7 @@ impl StreamState {
             deescalate_backoff: super::encode::DEESCALATE_BACKOFF_START,
             live_session,
             _watcher: None,
-            _game_life: game_life,
+            game_life,
         })
     }
 

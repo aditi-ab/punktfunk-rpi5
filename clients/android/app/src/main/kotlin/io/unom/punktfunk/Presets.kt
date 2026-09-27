@@ -185,7 +185,8 @@ class PresetStore(context: Context) {
         .mapNotNull { (it as? String)?.let(::parse) }
         .sortedBy { it.name.lowercase() }
 
-    fun byId(id: String): StreamPreset? = prefs.getString(id, null)?.let(::parse)
+    /** `as? String`: the file also holds a Boolean flag, and `id` can come from a link. */
+    fun byId(id: String): StreamPreset? = (prefs.all[id] as? String)?.let(::parse)
 
     fun save(preset: StreamPreset) {
         prefs.edit().putString(preset.id, encode(preset)).apply()

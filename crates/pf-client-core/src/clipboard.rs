@@ -244,7 +244,7 @@ mod os {
     use windows::core::PCWSTR;
     use windows::Win32::minwindef::HGLOBAL;
     use windows::Win32::winbase::{
-        GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+        GlobalAlloc, GlobalFree, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
     };
     use windows::Win32::winuser::{
         CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
@@ -285,6 +285,52 @@ mod os {
         }
     }
 
+    /// A global memory block held by `GlobalLock`; `GlobalUnlock` runs on drop.
+    struct GlobalLockGuard {
+        mem: HGLOBAL,
+        ptr: *mut u8,
+    }
+    impl GlobalLockGuard {
+        /// `None` when `GlobalLock` refuses the block.
+        ///
+        /// # Safety
+        ///
+        /// `mem` is a live global memory handle, neither freed nor handed to the
+        /// clipboard while the guard lives.
+        unsafe fn lock(mem: HGLOBAL) -> Option<Self> {
+            // SAFETY: fn contract; the pointer stays valid until the matching unlock in drop.
+            let ptr = unsafe { GlobalLock(mem) }.cast::<u8>();
+            (!ptr.is_null()).then_some(Self { mem, ptr })
+        }
+
+        /// The whole block: `GlobalSize` bytes.
+        fn as_slice(&self) -> &[u8] {
+            // SAFETY: a size query on the handle `lock`'s contract keeps live.
+            let len = unsafe { GlobalSize(self.mem) };
+            // SAFETY: `ptr` is the locked block, valid for its `GlobalSize` bytes until drop.
+            unsafe { std::slice::from_raw_parts(self.ptr, len) }
+        }
+
+        /// Copy `bytes` to the start of the block.
+        fn write(&mut self, bytes: &[u8]) {
+            // SAFETY: as in `as_slice`.
+            let len = unsafe { GlobalSize(self.mem) };
+            assert!(
+                bytes.len() <= len,
+                "clipboard block smaller than its payload"
+            );
+            // SAFETY: `ptr` is the locked block of `len >= bytes.len()` bytes, a different
+            // allocation from `bytes`.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr, bytes.len()) };
+        }
+    }
+    impl Drop for GlobalLockGuard {
+        fn drop(&mut self) {
+            // SAFETY: releases the lock `lock` took, exactly once.
+            let _ = unsafe { GlobalUnlock(self.mem) };
+        }
+    }
+
     pub fn sequence_number() -> u32 {
         // SAFETY: a no-argument query that only reads the OS clipboard's sequence counter.
         unsafe { GetClipboardSequenceNumber() }
@@ -319,25 +365,18 @@ mod os {
                 if g.0.is_null() {
                     bail!("clipboard text unavailable");
                 }
-                // SAFETY: `g` is that borrowed clipboard handle; `GlobalLock` yields a pointer valid until the matching `GlobalUnlock` below.
-                let p = unsafe { GlobalLock(g) } as *const u16;
-                if p.is_null() {
+                // SAFETY: `g` is that borrowed handle; `_clip` keeps it live past the guard.
+                let Some(locked) = (unsafe { GlobalLockGuard::lock(g) }) else {
                     bail!("clipboard text lock failed");
-                }
-                // GlobalSize is a byte count of a NUL-terminated UTF-16 buffer.
-                // SAFETY: a size query on the same live handle.
-                let bytes = unsafe { GlobalSize(g) };
-                let mut len = bytes / 2;
-                // SAFETY: `p` is the locked buffer and `len` is derived from the `GlobalSize` above, so the slice stays inside the allocation; it is read before the unlock.
-                let slice = unsafe { std::slice::from_raw_parts(p, len) };
-                if let Some(nul) = slice.iter().position(|&c| c == 0) {
-                    len = nul;
-                }
-                // SAFETY: as above — same locked buffer and same length, read before the unlock.
-                let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) });
-                // SAFETY: releases the lock taken above, exactly once.
-                let _ = unsafe { GlobalUnlock(g) };
-                Ok(text.into_bytes())
+                };
+                // A NUL-terminated UTF-16 buffer; `GlobalSize` counts bytes.
+                let wide: Vec<u16> = locked
+                    .as_slice()
+                    .chunks_exact(2)
+                    .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+                    .take_while(|&c| c != 0)
+                    .collect();
+                Ok(String::from_utf16_lossy(&wide).into_bytes())
             }
             MIME_PNG => {
                 // SAFETY: as the text path — the handle is borrowed from the open clipboard, never freed here.
@@ -345,18 +384,11 @@ mod os {
                 if g.0.is_null() {
                     bail!("clipboard png unavailable");
                 }
-                // SAFETY: `g` is that borrowed handle; the pointer is valid until the matching unlock.
-                let p = unsafe { GlobalLock(g) } as *const u8;
-                if p.is_null() {
+                // SAFETY: `g` is that borrowed handle; `_clip` keeps it live past the guard.
+                let Some(locked) = (unsafe { GlobalLockGuard::lock(g) }) else {
                     bail!("clipboard png lock failed");
-                }
-                // SAFETY: a size query on the same live handle.
-                let len = unsafe { GlobalSize(g) };
-                // SAFETY: `p` is the locked buffer and `len` came from `GlobalSize`, so the slice is in bounds; it is copied out before the unlock.
-                let out = unsafe { std::slice::from_raw_parts(p, len) }.to_vec();
-                // SAFETY: releases the lock taken above, exactly once.
-                let _ = unsafe { GlobalUnlock(g) };
-                Ok(out)
+                };
+                Ok(locked.as_slice().to_vec())
             }
             other => Err(anyhow!("unsupported clipboard format {other}")),
         }
@@ -378,23 +410,25 @@ mod os {
         if !unsafe { EmptyClipboard() }.as_bool() {
             bail!("clipboard clear failed");
         }
-        // The clipboard OWNS this block once SetClipboardData succeeds — do not free it.
-        // SAFETY: a size in, an owned moveable handle out — ownership passes to the clipboard at `SetClipboardData` below.
+        // The clipboard OWNS this block once SetClipboardData succeeds; until then it is ours.
+        // SAFETY: a size in, an owned moveable handle out.
         let g = unsafe { GlobalAlloc(GMEM_MOVEABLE as u32, payload.len()) };
         if g.0.is_null() {
             bail!("clipboard alloc failed");
         }
-        // SAFETY: `g` is the handle just allocated; the pointer is valid until the matching unlock.
-        let p = unsafe { GlobalLock(g) } as *mut u8;
-        if p.is_null() {
+        // SAFETY: `g` is the block just allocated; the guard drops before `g` is handed on.
+        let Some(mut locked) = (unsafe { GlobalLockGuard::lock(g) }) else {
+            // SAFETY: `g` is still ours: allocated above and never handed to the clipboard.
+            let _ = unsafe { GlobalFree(g) };
             bail!("clipboard alloc lock failed");
-        }
-        // SAFETY: `p` addresses that locked block, allocated at exactly `payload.len()` bytes on the line above, and the two regions are distinct allocations.
-        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), p, payload.len()) };
-        // SAFETY: releases the lock taken above, before the handle is handed to the clipboard.
-        let _ = unsafe { GlobalUnlock(g) };
-        // SAFETY: ownership of `g` transfers to the clipboard here, which is why nothing frees it afterwards.
+        };
+        locked.write(&payload);
+        // Unlocked before the clipboard takes the handle.
+        drop(locked);
+        // SAFETY: on success ownership of `g` transfers to the clipboard, which frees it.
         if unsafe { SetClipboardData(fmt, Some(g)) }.0.is_null() {
+            // SAFETY: the clipboard refused `g`, so it is still ours, and unlocked above.
+            let _ = unsafe { GlobalFree(g) };
             bail!("clipboard set failed");
         }
         Ok(())

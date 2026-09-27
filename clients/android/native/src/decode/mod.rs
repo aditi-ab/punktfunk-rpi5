@@ -24,12 +24,14 @@ mod vsync;
 
 use async_loop::run_async;
 pub(crate) use setup::{codec_label, codec_mime};
+pub(crate) use vsync::now_monotonic_ns;
 // Shared with the PyroWave lane, which exists only where the codec is built (see `crate::pyro`).
 #[cfg(target_pointer_width = "64")]
 pub(crate) use latency::now_realtime_ns;
 #[cfg(target_pointer_width = "64")]
 pub(crate) use setup::boost_thread_priority;
 
+use crate::input_stall::NoOutput;
 use ndk::native_window::NativeWindow;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::reanchor::ReanchorGate;
@@ -52,41 +54,10 @@ const IN_FLIGHT_CAP: usize = 64;
 /// gets evicted.
 const RENDERED_CAP: usize = 64;
 
-/// How long the decoder may be FED while producing nothing before we treat it as un-anchored and
-/// ask the host for a fresh IDR.
-///
-/// The shared gate's per-AU streak ([`punktfunk_core::reanchor::ReanchorGate::on_no_output`]) can't
-/// be used verbatim here: it counts one-in/one-out decodes (the desktop clients' `LOW_DELAY`
-/// libavcodec path and Apple's VideoToolbox), while MediaCodec is pipelined — inputs and outputs
-/// don't pair up, so "this AU produced no output" isn't a thing this loop can observe. A wall-clock
-/// silence window is the same signal in the shape Android can measure.
-///
-/// Why it matters: the host opens a stream with an IDR and, under infinite GOP, sends no other one
-/// unless asked. Miss that one — the decode thread only starts at `surfaceCreated`, so a slow TV box
-/// can be handed the stream mid-GOP — and every later AU references a picture the decoder never had.
-/// A hardware decoder doesn't error on that; it simply emits nothing. Without this backstop the
-/// session sat there forever: AUs arriving, a healthy HUD, and a black surface, because nothing in
-/// the Android loops ever asked for the keyframe that would re-anchor it.
-///
-/// 500 ms because it must never fire on a decoder that is merely slow to spin up: even the pokiest
-/// hardware decoder emits its first frame within a couple of frame periods, and a wedge that only
-/// costs half a second before it self-heals is not a bug the user reports.
-const NO_OUTPUT_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
-
 /// How long a session may deliver NO access unit at all before we ask for a keyframe and say so.
-///
-/// [`NO_OUTPUT_PATIENCE`] covers "fed but silent", and it deliberately requires `fed` to have moved
-/// so an idle stream never asks for anything. That leaves its mirror image uncovered: a session that
-/// receives nothing whatsoever. A decoder cannot be starved of output when it was handed no input,
-/// so no signal in either loop fires, and the session sits connected — audio, input and the control
-/// plane all alive — behind a black surface with a HUD reading `0 fps · 0.0 Mb/s`, which is exactly
-/// how it comes back in reports (2026-07-30).
-///
-/// Asking costs one small control message, and it is the right ask in the case we can actually fix:
-/// the host is encoding, but under infinite GOP every picture it sends references an IDR this client
-/// never saw. When the host is sending nothing at all, the request changes nothing — but the log line
-/// beside it is what separates that from "we received AUs and lost them", which no previous black
-/// screen report could tell us.
+/// [`NoOutput`] needs AUs to have arrived, so it cannot see a session that receives nothing:
+/// connected, audio alive, a black surface. Under infinite GOP the ask fetches the IDR this
+/// client never saw; when the host sends nothing, the log line beside it says so.
 pub(crate) const NO_VIDEO_PATIENCE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Re-ask cadence once [`NO_VIDEO_PATIENCE`] has elapsed with still nothing received. Slow, because
@@ -100,17 +71,13 @@ pub(crate) const NO_VIDEO_PATIENCE: std::time::Duration = std::time::Duration::f
 /// for days (2026-08-20). Keeping the value in core is what stops the two drifting back together.
 const NO_VIDEO_RETRY: std::time::Duration = punktfunk_core::client::NO_VIDEO_RETRY;
 
-/// The keyframe backstops both decode loops run once a pass: a decoder fed but silent
-/// ([`NO_OUTPUT_PATIENCE`]), a session that never received an AU ([`NO_VIDEO_PATIENCE`]), and the
-/// gate's own overdue-freeze re-ask — every intent through one 100 ms throttle so a multi-frame
-/// recovery gap can't flood the control stream.
+/// The keyframe backstops the decode loop runs once a pass: a decoder that owes output
+/// ([`NoOutput`]), a session that never received an AU ([`NO_VIDEO_PATIENCE`]), and the gate's
+/// overdue-freeze re-ask. Every ask shares one 100 ms throttle so a multi-frame gap can't flood
+/// the control stream.
 pub(super) struct Backstops {
     last_kf_req: Option<Instant>,
-    /// Start of the no-output window: the latest pass that produced a frame or owed none, and
-    /// the fed count at that pass. The window opens at the first unanswered AU, so a still
-    /// host never counts against the decoder.
-    owed_since: Instant,
-    fed_at_output: u64,
+    no_output: NoOutput,
     started: Instant,
     last_no_video_req: Option<Instant>,
 }
@@ -120,40 +87,36 @@ impl Backstops {
         let now = Instant::now();
         Backstops {
             last_kf_req: None,
-            owed_since: now,
-            fed_at_output: 0,
+            no_output: NoOutput::new(now),
             started: now,
             last_no_video_req: None,
         }
     }
 
-    /// One pass. `had_output` = the decoder produced this pass; `au_parked` = an AU arrived and is
-    /// waiting for an input slot (video IS flowing); `losses` = drops this pass that are a loss in
-    /// their own right (a parked-AU overflow), which arm the gate directly.
+    /// One pass. `handled` = AUs fed to the codec or withheld from it; `had_output` = the decoder
+    /// produced this pass; `au_parked` = an AU is waiting for an input slot; `losses` = drops this
+    /// pass that are a loss in their own right (a parked-AU overflow), which arm the gate.
+    /// `true` when the no-output window or the gate asked for a keyframe.
     pub(super) fn poll(
         &mut self,
         client: &NativeClient,
         gate: &mut ReanchorGate,
-        fed: u64,
+        handled: u64,
         had_output: bool,
         au_parked: bool,
         losses: u64,
-    ) {
+    ) -> bool {
         let now = Instant::now();
         if losses > 0 {
             gate.arm(now);
         }
-        // Fed but silent: the decoder is holding nothing it can decode — the opening IDR never
-        // reached it, or its reference chain is gone. Ask for a fresh one and arm the freeze, so
-        // the concealment it may start emitting on the way back is withheld until a clean
-        // re-anchor (`gate.poll` keeps re-asking on the deadline until one arrives).
-        let starved = self.starved(fed, had_output, now);
+        // Arm the freeze too, so the concealment a re-anchoring decoder emits stays off the glass.
+        let starved = self.no_output.poll(handled, had_output, now);
         if starved {
             gate.arm(now);
         }
-        // Nothing has EVER arrived: not an idle stream but a session that never got a picture —
-        // the `starved` test cannot see it, because it needs `fed` to have moved.
-        if fed == 0
+        // Nothing has EVER arrived: the no-output window cannot see it.
+        if handled == 0
             && !au_parked
             && now.duration_since(self.started) >= NO_VIDEO_PATIENCE
             && self
@@ -168,37 +131,23 @@ impl Backstops {
             let _ = client.request_keyframe();
             self.last_kf_req = Some(now); // share the throttle with the loss-recovery path below
         }
-        if (gate.poll(client.frames_dropped(), now) || losses > 0 || starved)
-            && self
-                .last_kf_req
-                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
+        let backstop = gate.poll(client.frames_dropped(), now) || starved;
+        if backstop || losses > 0 {
+            self.ask(client);
+        }
+        backstop
+    }
+
+    /// Ask for a keyframe through the shared 100 ms throttle.
+    pub(super) fn ask(&mut self, client: &NativeClient) {
+        let now = Instant::now();
+        if self
+            .last_kf_req
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
         {
             self.last_kf_req = Some(now);
             let _ = client.request_keyframe();
         }
-    }
-
-    /// The fed-but-silent test: an AU has gone unanswered for [`NO_OUTPUT_PATIENCE`]. Trips at
-    /// most once per window, and logs when it does.
-    fn starved(&mut self, fed: u64, had_output: bool, now: Instant) -> bool {
-        // Owing nothing restarts the window, so the first AU after a still stretch gets the full
-        // patience instead of tripping on the pause before it.
-        if had_output || fed == self.fed_at_output {
-            self.owed_since = now;
-            self.fed_at_output = fed;
-            return false;
-        }
-        if now.duration_since(self.owed_since) < NO_OUTPUT_PATIENCE {
-            return false;
-        }
-        log::warn!(
-            "decode: no output for {} ms with {} AU(s) fed — requesting a re-anchor keyframe",
-            now.duration_since(self.owed_since).as_millis(),
-            fed - self.fed_at_output
-        );
-        self.owed_since = now; // one request per patience window, not per iteration
-        self.fed_at_output = fed;
-        true
     }
 }
 
@@ -264,32 +213,4 @@ pub fn run(
         return;
     }
     run_async(client, window, shutdown, stats, opts);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Backstops, NO_OUTPUT_PATIENCE};
-    use std::time::{Duration, Instant};
-
-    /// A still host sends one frame after seconds of nothing. That frame must reach the screen:
-    /// tripping on it arms the freeze and holds the very picture that carries the change.
-    #[test]
-    fn an_au_after_a_still_host_gets_the_full_patience() {
-        let mut b = Backstops::new();
-        let t0 = Instant::now();
-        assert!(!b.starved(1, true, t0));
-        assert!(!b.starved(1, false, t0 + Duration::from_secs(2)));
-        let fed_at = t0 + Duration::from_millis(2005);
-        assert!(!b.starved(2, false, fed_at));
-        assert!(!b.starved(2, true, fed_at + Duration::from_millis(8)));
-        // A decoder that really goes silent still trips, once, after the patience.
-        let silent = fed_at + Duration::from_millis(20);
-        assert!(!b.starved(3, false, silent));
-        assert!(b.starved(4, false, silent + NO_OUTPUT_PATIENCE));
-        assert!(!b.starved(
-            5,
-            false,
-            silent + NO_OUTPUT_PATIENCE + Duration::from_millis(5)
-        ));
-    }
 }

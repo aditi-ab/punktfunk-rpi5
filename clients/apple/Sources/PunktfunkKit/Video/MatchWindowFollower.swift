@@ -102,10 +102,13 @@ public final class MatchWindowFollower {
             scale: renderScale, maxDimension: maxDimension)
     }
 
-    /// Turn following on/off live (a mid-session settings change; off cancels a pending request).
+    /// Turn following on/off live. Off cancels a pending request; on forgets the last request, since
+    /// something else (an external monitor) may have moved the mode away from it meanwhile.
     public func setEnabled(_ on: Bool) {
         enabled = on
-        if !on {
+        if on {
+            lastRequested = nil
+        } else {
             work?.cancel()
             work = nil
             pendingSize = nil

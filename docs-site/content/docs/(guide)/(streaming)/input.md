@@ -118,8 +118,9 @@ Two settings control this: **Steam / guide button** (**Guide button** on Apple a
 | Apple TV | tvOS keeps it | On |
 
 If Steam or the Xbox Game Bar on your own device also watches the guide button, both react; turn
-that off on your device. On iOS 27 and newer you can hand the Home button to the app in the
-controller's system settings. The dial's **Guide button** and **Quick access menu** buttons send
+that off on your device. On macOS and iOS 27 and newer, add Punktfunk to **Home Button
+Overrides** in the system's game controller settings; while the system keeps the button, Punktfunk's
+**Controllers** settings link there. The dial's **Guide button** and **Quick access menu** buttons send
 one tap each; **Quick access menu** needs a host whose virtual pad is a Steam controller. On a
 Deck, the Punktfunk panel's **Host menus** buttons do the same ([Steam Deck](/docs/steam-deck)).
 

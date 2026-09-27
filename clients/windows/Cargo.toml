@@ -69,11 +69,8 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
     # CoCreateInstance/CoInitializeEx (+ objbase/objidl/wtypesbase below) for the
     # "Create shortcut" writer (deeplink.rs).
     "combaseapi",
-    # SetWindowSubclass/DefSubclassProc — the deep-link WM_COPYDATA subclass hook.
-    "commctrl",
     "consoleapi",
     "dxgi",
-    "errhandlingapi",
     "libloaderapi",
     "objbase",
     "objidl",
@@ -81,7 +78,7 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
     "shobjidl_core",
     "synchapi",
     "winerror",
-    # Windowing, messages, icons — and COPYDATASTRUCT, which lives in winuser now too.
+    # Windowing, messages, icons, and the deep-link receiver's message-only window + COPYDATASTRUCT.
     "winuser",
 ] }
 

@@ -26,6 +26,13 @@ describe("wire", () => {
 			expect(disc.success.reason).toBe("timeout");
 		}
 
+		const browser = decodeHostEvent(
+			JSON.parse(
+				'{"seq":3,"ts_ms":1700000000000,"schema":1,"kind":"client.connected","client":{"name":"Safari","fingerprint":"c3d4","plane":"web"}}',
+			),
+		);
+		expect(browser._tag).toBe("Success");
+
 		const stopping = decodeHostEvent(
 			JSON.parse('{"seq":2,"ts_ms":1700000000000,"schema":1,"kind":"host.stopping"}'),
 		);

@@ -3,6 +3,7 @@ package io.unom.punktfunk.kit
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -54,7 +55,11 @@ class PadSensors(private val router: GamepadRouter) {
 
     /** One controller's live sensor feed: its listener state and the accel it pairs with each
      *  rotation. Its arrays belong to the sensor thread; [stop] reads them only after the join. */
-    private inner class Feed(private val deviceId: Int) : SensorEventListener {
+    private inner class Feed(
+        private val deviceId: Int,
+        /** The manager it registered with: a removed device can no longer hand it back. */
+        val sensors: SensorManager,
+    ) : SensorEventListener {
         /** Latest converted accel, paired with each gyro send (the wire fuses both per sample).
          *  Starts at the host's neutral — 1 g on the up axis, NOT [0,0,0], which is free fall. */
         private val accel = intArrayOf(0, Gamepad.MOTION_ACCEL_LSB_PER_G, 0)
@@ -144,7 +149,7 @@ class PadSensors(private val router: GamepadRouter) {
         // 4 and DualSense, which says the merge happens; it is not something this code can assert.
         // If a Bluetooth Sony pad ever turns up here with no gyroscope, THAT is the thing to check.
         val gyroSensor = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE) ?: return
-        val feed = Feed(deviceId)
+        val feed = Feed(deviceId, sm)
         feeds[deviceId] = feed
         // ~200 Hz requested, zero report latency: batching is poison for gyro aim, and 200 Hz is
         // what the framework grants an app without HIGH_SAMPLING_RATE_SENSORS anyway.
@@ -190,15 +195,12 @@ class PadSensors(private val router: GamepadRouter) {
 
     /**
      * Drop [deviceId]'s listeners, returning the feed that held them (null if there was none).
-     * Safe for a controller that is already gone: the sensor manager is reached through the
-     * [InputDevice], and a vanished device simply leaves nothing to unregister — the platform has
-     * stopped calling the listener either way.
+     * Through the manager the feed registered with: after a disconnect [InputDevice.getDevice]
+     * is null, and the platform keeps the listener (and this session through it) otherwise.
      */
     private fun unregister(deviceId: Int): Feed? {
         val feed = feeds.remove(deviceId) ?: return null
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            InputDevice.getDevice(deviceId)?.sensorManager?.unregisterListener(feed)
-        }
+        feed.sensors.unregisterListener(feed)
         return feed
     }
 

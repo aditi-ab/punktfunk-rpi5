@@ -30,6 +30,8 @@ public final class SiriRemotePointer {
     private var bound: GCController?
     /// Finger position (±1 axes) at the last dpad callback while touched; nil = lifted.
     private var lastTouch: (x: Float, y: Float)?
+    /// Sub-pixel motion not yet sent, so a slow drag still moves the cursor.
+    private var carry: (x: Float, y: Float) = (0, 0)
     /// When the finger landed; nil while lifted. Set by a touch report, else by the first sample
     /// after a lift or a quiet gap.
     private var contactAt: Date?
@@ -117,6 +119,12 @@ public final class SiriRemotePointer {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.rebind() }
         })
+        // Control Center or the Home button: the lift of a held click never reaches us.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.resetGesture() }
+        })
         rebind()
     }
 
@@ -145,14 +153,7 @@ public final class SiriRemotePointer {
             old.buttonX.pressedChangedHandler = nil
             old.buttonMenu.pressedChangedHandler = nil
         }
-        // Timers first, then the lift: a tap whose release is still owed is held state, so
-        // `releaseHeld` below is what sends its button-up.
-        cancelPlayPause()
-        releaseHeld()
-        lastTouch = nil
-        contactAt = nil
-        inReleaseRamp = false
-        menuDownAt = nil
+        resetGesture()
         bound = controller
         guard let micro = controller?.microGamepad else { return }
 
@@ -235,10 +236,11 @@ public final class SiriRemotePointer {
             return
         }
         if ringOpen { return ringSwipe(x: x, y: y) }
-        let dx = stepX * Self.pointerScale / 2 // axes span ±1 → full swipe = 2.0
-        let dy = -stepY * Self.pointerScale / 2 // GC +y is up; mouse +y is down
-        let ix = Int32(dx.rounded())
-        let iy = Int32(dy.rounded())
+        let dx = stepX * Self.pointerScale / 2 + carry.x // axes span ±1 → full swipe = 2.0
+        let dy = -stepY * Self.pointerScale / 2 + carry.y // GC +y is up; mouse +y is down
+        let ix = Int32(dx.rounded(.towardZero))
+        let iy = Int32(dy.rounded(.towardZero))
+        carry = (dx - Float(ix), dy - Float(iy))
         guard ix != 0 || iy != 0 else { return }
         connection.send(.mouseMove(dx: ix, dy: iy))
     }
@@ -290,7 +292,7 @@ public final class SiriRemotePointer {
         if pressed {
             statsHoldFired = false
             let timer = Timer(timeInterval: Self.statsHold, repeats: false) { [weak self] _ in
-                Task { @MainActor in self?.statsHoldElapsed() }
+                MainActor.assumeIsolated { self?.statsHoldElapsed() }
             }
             RunLoop.main.add(timer, forMode: .common)
             playPauseTimer?.invalidate()
@@ -324,7 +326,7 @@ public final class SiriRemotePointer {
         finishRightClick()
         setButton(3, down: true)
         let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self] _ in
-            Task { @MainActor in self?.finishRightClick() }
+            MainActor.assumeIsolated { self?.finishRightClick() }
         }
         RunLoop.main.add(timer, forMode: .common)
         rightReleaseTimer = timer
@@ -366,6 +368,17 @@ public final class SiriRemotePointer {
             // swallowed in ContentView.
             onShortBack?()
         }
+    }
+
+    /// Forget the gesture in progress and lift anything held. Timers first: a tap whose release
+    /// is still owed is held state, so `releaseHeld` is what sends its button-up.
+    private func resetGesture() {
+        cancelPlayPause()
+        releaseHeld()
+        lastTouch = nil
+        contactAt = nil
+        inReleaseRamp = false
+        menuDownAt = nil
     }
 
     private func releaseHeld() {

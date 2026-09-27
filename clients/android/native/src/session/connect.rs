@@ -91,15 +91,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetLowLaten
 /// c2.qti decoders declare nothing). Android-only; everywhere else the probe verdict stands.
 #[cfg(target_os = "android")]
 fn force_parts_sysprop() -> bool {
-    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
-                             // SAFETY: __system_property_get with a valid name + PROP_VALUE_MAX buffer is always safe.
-    let n = unsafe {
-        libc::__system_property_get(
-            c"debug.punktfunk.force_parts".as_ptr(),
-            buf.as_mut_ptr().cast(),
-        )
-    };
-    n > 0 && std::str::from_utf8(&buf[..n as usize]).unwrap_or("").trim() == "1"
+    crate::sysprop(c"debug.punktfunk.force_parts").as_deref() == Some("1")
 }
 
 #[cfg(not(target_os = "android"))]
@@ -210,7 +202,7 @@ fn resolve_requested_audio_format(rate_hz: u32, bits: u8, channels: u8) -> (u32,
         .unwrap_or(HZ48);
     if granted != rate_hz {
         log::warn!(
-            "audio: this device will not open a {rate_hz} Hz output, so the session asks for {granted} Hz / {bits}-bit instead — the wire is only ever offered a format this client has proved it can play"
+            "audio: this device can't play {rate_hz} Hz without resampling, so the session asks for {granted} Hz / {bits}-bit instead — the wire is only ever offered a format this client has proved it can play"
         );
     }
     (granted, bits)
@@ -639,15 +631,23 @@ fn connect(req: ConnectRequest) -> jlong {
 
 /// `NativeBridge.nativeClose(handle)` — remove one session key and begin teardown.
 ///
-/// Existing JNI calls retain their `Arc` until they return, then the final drop joins media workers
-/// and closes the connector. Zero, stale, duplicate, and concurrent closes are no-ops.
+/// Pad audio is joined here, since it borrows a USB fd Kotlin may close once this returns. Other
+/// JNI calls keep their `Arc` until they return; the final drop joins the remaining workers and
+/// closes the connector. Zero, stale, duplicate, and concurrent closes are no-ops.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
-    jni_guard((), || drop(remove_session(handle)))
+    jni_guard((), || {
+        let Some(session) = remove_session(handle) else {
+            return;
+        };
+        #[cfg(target_os = "android")]
+        session.stop_pad_audio();
+        drop(session);
+    })
 }
 
 /// Mark an explicit user disconnect so the host skips reconnect linger.

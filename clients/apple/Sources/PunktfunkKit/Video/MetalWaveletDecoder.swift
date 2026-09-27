@@ -325,9 +325,9 @@ public struct WaveletPlanes: @unchecked Sendable {
 }
 
 public final class MetalWaveletDecoder {
-    /// Matches the Vulkan client's ring: deep enough that a slot is never rewritten while the
-    /// presenter still samples it in practice; same-queue hazard tracking is the hard backstop.
-    private static let ringDepth = 4
+    /// Slots in the output ring. A slot's planes stay live while its frame waits in the present
+    /// store or sits with the render thread, so the pipeline sizes this past that store.
+    private let ringDepth: Int
 
     /// Device-capability gate for advertisement (SessionModel) and the settings picker: the
     /// dequant kernel needs simdgroup prefix sums with its 16 header lanes inside one
@@ -379,7 +379,7 @@ public final class MetalWaveletDecoder {
     private var slots: [Slot] = []
     private var nextSlot = 0
     /// One permit per ring slot — see the wait in `decode`.
-    private let ringSlots = DispatchSemaphore(value: MetalWaveletDecoder.ringDepth)
+    private let ringSlots: DispatchSemaphore
     /// The ring's plane format facts (from the last SOF): 10-bit ⇒ 16-bit UNORM planes.
     private var hdr16 = false
     /// The session's negotiated depth. The header has no depth bit, and a Linux host sends
@@ -394,10 +394,12 @@ public final class MetalWaveletDecoder {
 
     /// The pump thread owns `decode`; everything mutable is confined to it. `tenBit` is the
     /// session's negotiated depth (`connection.bitDepth >= 10`).
-    init?(device: MTLDevice, queue: MTLCommandQueue, tenBit: Bool = false) {
+    init?(device: MTLDevice, queue: MTLCommandQueue, tenBit: Bool = false, ringDepth: Int = 4) {
         self.device = device
         self.queue = queue
         self.tenBit = tenBit
+        self.ringDepth = max(2, ringDepth)
+        self.ringSlots = DispatchSemaphore(value: self.ringDepth)
         do {
             let lib = try device.makeLibrary(source: waveletShaderSource, options: nil)
             guard let dequantFn = lib.makeFunction(name: "wavelet_dequant") else { return nil }
@@ -574,7 +576,7 @@ public final class MetalWaveletDecoder {
         }
         cmd.commit()
         committed = true
-        nextSlot = (nextSlot + 1) % Self.ringDepth
+        nextSlot = (nextSlot + 1) % ringDepth
         return true
     }
 
@@ -615,7 +617,7 @@ public final class MetalWaveletDecoder {
         }
 
         var newSlots: [Slot] = []
-        for i in 0..<Self.ringDepth {
+        for i in 0..<ringDepth {
             let planeFormat: MTLPixelFormat = newHdr16 ? .r16Unorm : .r8Unorm
             let plane = { (w: Int, h: Int, name: String) -> MTLTexture? in
                 let desc = MTLTextureDescriptor.texture2DDescriptor(

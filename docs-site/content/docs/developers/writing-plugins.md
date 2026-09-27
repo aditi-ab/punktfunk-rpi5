@@ -252,6 +252,9 @@ yield* serveUi({
 - `holdTimeoutMs` is 1–120 000, default 30 000. Past it the host starts the game anyway and logs
   the plugin; the handler's Effect is interrupted.
 - A failure logs and never blocks the launch. A plugin mid-restart misses the stage.
+- A library source holds through `defineLibraryPlugin({ holds, holdTimeoutMs })`; its handler
+  also gets the plugin's config: `(game, cfg) => …`. It fires for every launch on the host, so
+  check that `game.app` is one of yours.
 
 ## Folders you can't know in advance
 

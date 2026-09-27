@@ -22,7 +22,7 @@ use crate::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
 use crate::crypto::SessionKey;
 use crate::error::PunktfunkStatus;
 use crate::input::InputEvent;
-use crate::reanchor::{GateVerdict, ReanchorGate};
+use crate::reanchor::{AuAdmission, DecoderClass, GateVerdict, ReanchorGate};
 use crate::session::Session;
 use crate::stats::Stats;
 use crate::transport::{loopback_pair, Transport, UdpTransport};
@@ -194,6 +194,48 @@ fn ffi_slice_bytes<T>(len: usize) -> Option<usize> {
         .filter(|&bytes| bytes <= isize::MAX as usize)
 }
 
+/// Fill an optional out-param; null is a no-op. `write` never reads or drops the old value,
+/// so the slot may be uninitialised caller memory.
+///
+/// # Safety
+/// `p` is null or valid for a write of one aligned `T`.
+unsafe fn put<T>(p: *mut T, v: T) {
+    if let Some(p) = ptr::NonNull::new(p) {
+        // SAFETY: non-null here; the caller guarantees a non-null `p` is valid for writes.
+        unsafe { p.write(v) };
+    }
+}
+
+/// Copy a SHA-256 into an optional 32-byte caller buffer; null is a no-op. Writes the array by
+/// value, never forming a slice over memory C may leave uninitialised.
+///
+/// # Safety
+/// `out` is null or writable for 32 bytes.
+#[cfg(feature = "quic")]
+unsafe fn put_sha256(out: *mut u8, fp: [u8; 32]) {
+    // SAFETY: `[u8; 32]` has alignment 1, so the caller's 32 writable bytes satisfy `put`.
+    unsafe { put(out.cast::<[u8; 32]>(), fp) };
+}
+
+/// Copy `s` and a NUL into `out` when both fit in `cap` bytes. `false`, with nothing written,
+/// when `out` is null or `s.len() + 1 > cap`.
+///
+/// # Safety
+/// `out` is null or writable for `cap` bytes.
+#[cfg(feature = "quic")]
+unsafe fn write_cstr(out: *mut c_char, cap: usize, s: &str) -> bool {
+    if out.is_null() || s.len() >= cap {
+        return false;
+    }
+    // SAFETY: `out` is non-null and writable for `cap` > `s.len()` bytes; `s` is Rust memory
+    // and cannot overlap it. `.cast()`: `c_char` is i8 on x86_64 and u8 on aarch64.
+    unsafe {
+        ptr::copy_nonoverlapping(s.as_ptr(), out.cast::<u8>(), s.len());
+        out.add(s.len()).write(0);
+    }
+    true
+}
+
 /// [`guard`] for teardown with no status: swallow the panic. Unwinding into C
 /// aborts the embedder; the object is being dropped either way.
 fn guard_void<F: FnOnce()>(f: F) {
@@ -228,13 +270,12 @@ pub type PunktfunkLogCb = Option<
     ),
 >;
 
+/// `user` is kept as an address: an opaque token handed back to `cb`, never dereferenced here.
 #[derive(Clone, Copy)]
 struct LogSink {
     cb: unsafe extern "C" fn(u8, *const c_char, *const c_char, *mut c_void),
-    user: *mut c_void,
+    user: usize,
 }
-// SAFETY: `user` is an opaque token handed back to the caller's thread-safe callback; never deref'd.
-unsafe impl Send for LogSink {}
 
 static LOG_SINK: std::sync::Mutex<Option<LogSink>> = std::sync::Mutex::new(None);
 static LOG_INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -267,7 +308,7 @@ impl log::Log for CallbackLogger {
                 record.level() as u8,
                 target.as_ptr(),
                 message.as_ptr(),
-                sink.user,
+                sink.user as *mut c_void,
             )
         };
     }
@@ -279,8 +320,11 @@ impl log::Log for CallbackLogger {
 /// 3 (info) is the usual default; debug/trace is per-packet. `cb == NULL` detaches.
 /// `Unsupported` if another `log` backend is already installed. Idempotent.
 ///
+/// Detaching or replacing stops new callbacks but does not wait for ones already running.
+///
 /// # Safety
-/// Non-null `cb` stays valid until the next NULL call; `user` stays valid for every callback.
+/// `cb` and `user` stay valid until every thread that may log has stopped, not just until
+/// the next call here.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_set_log_callback(
     max_level: u8,
@@ -292,7 +336,10 @@ pub unsafe extern "C" fn punktfunk_set_log_callback(
         if !installed {
             return PunktfunkStatus::Unsupported;
         }
-        *lock_recover(&LOG_SINK) = cb.map(|cb| LogSink { cb, user });
+        *lock_recover(&LOG_SINK) = cb.map(|cb| LogSink {
+            cb,
+            user: user as usize,
+        });
         log::set_max_level(match (cb.is_some(), max_level) {
             (false, _) | (_, 0) => log::LevelFilter::Off,
             (_, 1) => log::LevelFilter::Error,
@@ -306,8 +353,9 @@ pub unsafe extern "C" fn punktfunk_set_log_callback(
 }
 
 /// Wake-on-LAN magic packet. `macs` is `mac_count` contiguous 6-byte MACs.
-/// `last_known_ip` is an optional IPv4 dotted-quad unicast target. Broadcasts
-/// subnet-directed and `255.255.255.255` on ports 9 and 7. No session needed.
+/// `last_known_ip` is an optional unicast target, used only when it is an IPv4
+/// dotted quad. Broadcasts subnet-directed and `255.255.255.255` on ports 9
+/// and 7. No session needed.
 /// `Ok` if at least one datagram was sent. Call off the UI thread.
 ///
 /// # Safety
@@ -339,19 +387,12 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
                 m
             })
             .collect();
-        let ip = if last_known_ip.is_null() {
-            None
-        } else {
-            // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
-            match unsafe { CStr::from_ptr(last_known_ip) }
-                .to_str()
-                .ok()
-                .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
-            {
-                Some(ip) => Some(ip),
-                None => return PunktfunkStatus::InvalidArg,
-            }
-        };
+        // A hostname or IPv6 address skips the unicast; the broadcasts still go.
+        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
+        let ip = unsafe { opt_cstr(last_known_ip) }
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok());
         match crate::wol::send_magic_packet(&mac_vec, ip) {
             Ok(()) => PunktfunkStatus::Ok,
             Err(_) => PunktfunkStatus::Io,
@@ -378,15 +419,13 @@ pub unsafe extern "C" fn punktfunk_session_new(
             Ok(c) => c,
             Err(_) => return ptr::null_mut(),
         };
-        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
-        let local = match unsafe { CStr::from_ptr(local) }.to_str() {
-            Ok(s) => s,
-            Err(_) => return ptr::null_mut(),
+        // SAFETY: caller C string, NUL-terminated; borrowed for this call only.
+        let Ok(Some(local)) = (unsafe { opt_cstr(local) }) else {
+            return ptr::null_mut();
         };
-        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
-        let peer = match unsafe { CStr::from_ptr(peer) }.to_str() {
-            Ok(s) => s,
-            Err(_) => return ptr::null_mut(),
+        // SAFETY: caller C string, NUL-terminated; borrowed for this call only.
+        let Ok(Some(peer)) = (unsafe { opt_cstr(peer) }) else {
+            return ptr::null_mut();
         };
         let transport: Box<dyn Transport> = match UdpTransport::connect(local, peer) {
             Ok(t) => Box::new(t),
@@ -609,7 +648,7 @@ pub unsafe extern "C" fn punktfunk_set_input_callback(
 /// Returns the count dispatched (≥ 0), or a negative [`PunktfunkStatus`] on error.
 ///
 /// # Safety
-/// `s` is a valid host handle.
+/// `s` is a valid host handle. The callback must not free `s`: the drain uses it again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_host_poll_input(s: *mut PunktfunkSession) -> i32 {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -684,6 +723,14 @@ pub struct PunktfunkConnection {
     /// Stats overlay window as last drained; `hud_text` formats it at any tier.
     hud_snap: std::sync::Mutex<crate::hud::StatsSnapshot>,
 }
+
+// Plane pullers and the demo host's callers use these handles from several threads at once.
+#[cfg(feature = "quic")]
+const _: fn() = || {
+    fn shared<T: Send + Sync>() {}
+    shared::<PunktfunkConnection>();
+    shared::<PunktfunkDemoHost>();
+};
 
 /// Handshake-resolved audio format. Codec + rate together distinguish 48 kHz
 /// PCM from 48 kHz Opus. Read fresh each call; the host never changes it live.
@@ -1348,14 +1395,16 @@ impl PunktfunkPenSample {
     }
 }
 
-/// Read an optional NUL-terminated UTF-8 string; `Err` = invalid pointer/UTF-8.
-#[cfg(feature = "quic")]
+/// Read an optional NUL-terminated string: `Ok(None)` for null, `Err` for invalid UTF-8.
+///
+/// # Safety
+/// `p` is null or a NUL-terminated string that outlives `'a` and is not written meanwhile.
 unsafe fn opt_cstr<'a>(p: *const std::os::raw::c_char) -> std::result::Result<Option<&'a str>, ()> {
     if p.is_null() {
         return Ok(None);
     }
     // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
-    unsafe { std::ffi::CStr::from_ptr(p) }
+    unsafe { CStr::from_ptr(p) }
         .to_str()
         .map(Some)
         .map_err(|_| ())
@@ -2430,10 +2479,8 @@ pub unsafe extern "C" fn punktfunk_connect_opts(
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
     let set_status = |s: crate::error::PunktfunkStatus| {
-        if !status_out.is_null() {
-            // SAFETY: caller out-param, non-null on this path, written once.
-            unsafe { *status_out = s as i32 };
-        }
+        // SAFETY: the caller passes `status_out` null or writable for one value.
+        unsafe { put(status_out, s as i32) };
     };
     if opts.is_null() {
         set_status(crate::error::PunktfunkStatus::NullPointer);
@@ -2520,23 +2567,15 @@ unsafe fn connect_ex_impl(
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
     let set_status = |s: crate::error::PunktfunkStatus| {
-        if !status_out.is_null() {
-            // SAFETY: caller out-param, non-null on this path, written once.
-            unsafe { *status_out = s as i32 };
-        }
+        // SAFETY: the caller passes `status_out` null or writable for one value.
+        unsafe { put(status_out, s as i32) };
     };
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if host.is_null() {
+        // Null and invalid UTF-8 are both `InvalidArg`.
+        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
+        let Ok(Some(host)) = (unsafe { opt_cstr(host) }) else {
             set_status(crate::error::PunktfunkStatus::InvalidArg);
             return std::ptr::null_mut();
-        }
-        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
-        let host = match unsafe { std::ffi::CStr::from_ptr(host) }.to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                set_status(crate::error::PunktfunkStatus::InvalidArg);
-                return std::ptr::null_mut();
-            }
         };
         // Bad-UTF-8 launch id is non-fatal: treat it as "no game" rather than failing connect.
         // SAFETY: pointers are caller-supplied and null-checked on this path.
@@ -2616,13 +2655,8 @@ unsafe fn connect_ex_impl(
             None,
         ) {
             Ok(c) => {
-                if !observed_sha256_out.is_null() {
-                    // SAFETY: caller output buffer of the documented length, written once.
-                    unsafe {
-                        std::slice::from_raw_parts_mut(observed_sha256_out, 32)
-                            .copy_from_slice(&c.host_fingerprint);
-                    }
-                }
+                // SAFETY: `observed_sha256_out` is null or writable for 32 bytes (caller contract).
+                unsafe { put_sha256(observed_sha256_out, c.host_fingerprint) };
                 set_status(crate::error::PunktfunkStatus::Ok);
                 Box::into_raw(Box::new(PunktfunkConnection {
                     inner: c,
@@ -2670,16 +2704,14 @@ pub unsafe extern "C" fn punktfunk_generate_identity(
             Ok(t) => t,
             Err(_) => return PunktfunkStatus::Io,
         };
+        // Both fit or neither is written.
         if cert.len() + 1 > cert_cap || key.len() + 1 > key_cap {
             return PunktfunkStatus::InvalidArg;
         }
-        // SAFETY: pointers are caller-supplied and null-checked on this path.
+        // SAFETY: each buffer is writable for its `cap` bytes, per this function's contract.
         unsafe {
-            // `.cast()`: `c_char` is i8 on x86_64 and u8 on aarch64; `as *mut u8` is not portable.
-            std::ptr::copy_nonoverlapping(cert.as_ptr(), cert_pem_out.cast::<u8>(), cert.len());
-            *cert_pem_out.add(cert.len()) = 0;
-            std::ptr::copy_nonoverlapping(key.as_ptr(), key_pem_out.cast::<u8>(), key.len());
-            *key_pem_out.add(key.len()) = 0;
+            write_cstr(cert_pem_out, cert_cap, &cert);
+            write_cstr(key_pem_out, key_cap, &key);
         }
         PunktfunkStatus::Ok
     })
@@ -2715,12 +2747,8 @@ pub unsafe extern "C" fn punktfunk_probe(
             std::time::Duration::from_millis(timeout_ms as u64),
         ) {
             Some(fp) => {
-                if !observed_sha256_out.is_null() {
-                    // SAFETY: the caller guarantees 32 writable bytes when non-null.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(fp.as_ptr(), observed_sha256_out, 32);
-                    }
-                }
+                // SAFETY: `observed_sha256_out` is null or writable for 32 bytes (caller contract).
+                unsafe { put_sha256(observed_sha256_out, fp) };
                 PunktfunkStatus::Ok
             }
             None => PunktfunkStatus::Timeout,
@@ -2775,10 +2803,8 @@ pub unsafe extern "C" fn punktfunk_pair(
             std::time::Duration::from_millis(timeout_ms as u64),
         ) {
             Ok(fp) => {
-                // SAFETY: caller output buffer of the documented length, written once.
-                unsafe {
-                    std::slice::from_raw_parts_mut(host_sha256_out, 32).copy_from_slice(&fp);
-                }
+                // SAFETY: `host_sha256_out` is non-null here and writable for 32 bytes.
+                unsafe { put_sha256(host_sha256_out, fp) };
                 PunktfunkStatus::Ok
             }
             Err(e) => e.status(),
@@ -2937,10 +2963,8 @@ pub unsafe extern "C" fn punktfunk_connection_audio_mute(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        if !out.is_null() {
-            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
-            unsafe { *out = c.inner.audio_mute() };
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, c.inner.audio_mute()) };
         PunktfunkStatus::Ok
     })
 }
@@ -2964,10 +2988,8 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        if !out.is_null() {
-            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
-            unsafe { *out = c.inner.audio_channels };
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, c.inner.audio_channels) };
         PunktfunkStatus::Ok
     })
 }
@@ -2989,10 +3011,8 @@ pub unsafe extern "C" fn punktfunk_connection_audio_sample_rate(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        if !out.is_null() {
-            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u32`.
-            unsafe { *out = c.inner.audio_sample_rate_hz };
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, c.inner.audio_sample_rate_hz) };
         PunktfunkStatus::Ok
     })
 }
@@ -3014,10 +3034,8 @@ pub unsafe extern "C" fn punktfunk_connection_audio_bits(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        if !out.is_null() {
-            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
-            unsafe { *out = c.inner.audio_bits };
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, c.inner.audio_bits) };
         PunktfunkStatus::Ok
     })
 }
@@ -3041,10 +3059,8 @@ pub unsafe extern "C" fn punktfunk_connection_audio_frame_us(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        if !out.is_null() {
-            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u16`.
-            unsafe { *out = c.inner.audio_frame_us };
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, c.inner.audio_frame_us) };
         PunktfunkStatus::Ok
     })
 }
@@ -3066,10 +3082,8 @@ pub unsafe extern "C" fn punktfunk_connection_end_reason(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        if !out.is_null() {
-            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
-            unsafe { *out = c.inner.end_reason() as u8 };
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, c.inner.end_reason() as u8) };
         PunktfunkStatus::Ok
     })
 }
@@ -3229,20 +3243,12 @@ pub unsafe extern "C" fn punktfunk_connection_next_pad_audio(
                     // Empty/oversized: skip like DTX; truncated Opus is undecodable anyway.
                     return 0;
                 }
-                // SAFETY: optional out-params null-checked; `buf` copy length was just bounded.
+                // SAFETY: out-params are null or writable; the `buf` copy length was just bounded.
                 unsafe {
-                    if !out_pad.is_null() {
-                        *out_pad = f.pad;
-                    }
-                    if !out_kind.is_null() {
-                        *out_kind = f.kind;
-                    }
-                    if !out_seq.is_null() {
-                        *out_seq = f.seq;
-                    }
-                    if !out_pts_ns.is_null() {
-                        *out_pts_ns = f.pts_ns;
-                    }
+                    put(out_pad, f.pad);
+                    put(out_kind, f.kind);
+                    put(out_seq, f.seq);
+                    put(out_pts_ns, f.pts_ns);
                     std::ptr::copy_nonoverlapping(f.opus.as_ptr(), buf, f.opus.len());
                 }
                 f.opus.len() as i32
@@ -3341,12 +3347,8 @@ pub unsafe extern "C" fn punktfunk_connection_pad_mouse(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: out-param is optional; null-checked before write.
-        unsafe {
-            if !mask.is_null() {
-                *mask = c.inner.pad_mouse();
-            }
-        }
+        // SAFETY: the caller passes `mask` null or writable for one value.
+        unsafe { put(mask, c.inner.pad_mouse()) };
         PunktfunkStatus::Ok
     })
 }
@@ -3367,12 +3369,8 @@ pub unsafe extern "C" fn punktfunk_connection_live_pads(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: out-param is optional; null-checked before write.
-        unsafe {
-            if !mask.is_null() {
-                *mask = c.inner.live_pads();
-            }
-        }
+        // SAFETY: the caller passes `mask` null or writable for one value.
+        unsafe { put(mask, c.inner.live_pads()) };
         PunktfunkStatus::Ok
     })
 }
@@ -3405,17 +3403,11 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble(
             .next_rumble(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok((p, l, h)) => {
-                // SAFETY: each out-param is optional; null-checked before write.
+                // SAFETY: the caller passes each out-param null or writable for one value.
                 unsafe {
-                    if !pad.is_null() {
-                        *pad = p;
-                    }
-                    if !low.is_null() {
-                        *low = l;
-                    }
-                    if !high.is_null() {
-                        *high = h;
-                    }
+                    put(pad, p);
+                    put(low, l);
+                    put(high, h);
                 }
                 PunktfunkStatus::Ok
             }
@@ -3457,20 +3449,12 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble2(
             .next_rumble_ttl(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok((p, l, h, ttl)) => {
-                // SAFETY: each out-param is optional; null-checked before write.
+                // SAFETY: the caller passes each out-param null or writable for one value.
                 unsafe {
-                    if !pad.is_null() {
-                        *pad = p;
-                    }
-                    if !low.is_null() {
-                        *low = l;
-                    }
-                    if !high.is_null() {
-                        *high = h;
-                    }
-                    if !ttl_ms.is_null() {
-                        *ttl_ms = ttl.map_or(PUNKTFUNK_RUMBLE_NO_TTL, u32::from);
-                    }
+                    put(pad, p);
+                    put(low, l);
+                    put(high, h);
+                    put(ttl_ms, ttl.map_or(PUNKTFUNK_RUMBLE_NO_TTL, u32::from));
                 }
                 PunktfunkStatus::Ok
             }
@@ -3513,20 +3497,12 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
             .next_rumble_command(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(cmd) => {
-                // SAFETY: each out-param is optional; null-checked before write.
+                // SAFETY: the caller passes each out-param null or writable for one value.
                 unsafe {
-                    if !pad.is_null() {
-                        *pad = cmd.pad;
-                    }
-                    if !low.is_null() {
-                        *low = cmd.low;
-                    }
-                    if !high.is_null() {
-                        *high = cmd.high;
-                    }
-                    if !backstop_ms.is_null() {
-                        *backstop_ms = cmd.backstop_ms;
-                    }
+                    put(pad, cmd.pad);
+                    put(low, cmd.low);
+                    put(high, cmd.high);
+                    put(backstop_ms, cmd.backstop_ms);
                 }
                 PunktfunkStatus::Ok
             }
@@ -3566,26 +3542,14 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd2(
             .next_rumble_command(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(cmd) => {
-                // SAFETY: each out-param is optional; null-checked before write.
+                // SAFETY: the caller passes each out-param null or writable for one value.
                 unsafe {
-                    if !pad.is_null() {
-                        *pad = cmd.pad;
-                    }
-                    if !low.is_null() {
-                        *low = cmd.low;
-                    }
-                    if !high.is_null() {
-                        *high = cmd.high;
-                    }
-                    if !left_trigger.is_null() {
-                        *left_trigger = cmd.left_trigger;
-                    }
-                    if !right_trigger.is_null() {
-                        *right_trigger = cmd.right_trigger;
-                    }
-                    if !backstop_ms.is_null() {
-                        *backstop_ms = cmd.backstop_ms;
-                    }
+                    put(pad, cmd.pad);
+                    put(low, cmd.low);
+                    put(high, cmd.high);
+                    put(left_trigger, cmd.left_trigger);
+                    put(right_trigger, cmd.right_trigger);
+                    put(backstop_ms, cmd.backstop_ms);
                 }
                 PunktfunkStatus::Ok
             }
@@ -3912,23 +3876,13 @@ pub unsafe extern "C" fn punktfunk_connection_color_info(
             None => return PunktfunkStatus::NullPointer,
         };
         let color = c.inner.color;
-        // SAFETY: each out-param is optional; null-checked before write.
+        // SAFETY: the caller passes each out-param null or writable for one value.
         unsafe {
-            if !primaries.is_null() {
-                *primaries = color.primaries;
-            }
-            if !transfer.is_null() {
-                *transfer = color.transfer;
-            }
-            if !matrix.is_null() {
-                *matrix = color.matrix;
-            }
-            if !full_range.is_null() {
-                *full_range = color.full_range;
-            }
-            if !bit_depth.is_null() {
-                *bit_depth = c.inner.bit_depth;
-            }
+            put(primaries, color.primaries);
+            put(transfer, color.transfer);
+            put(matrix, color.matrix);
+            put(full_range, color.full_range);
+            put(bit_depth, c.inner.bit_depth);
         }
         PunktfunkStatus::Ok
     })
@@ -3952,10 +3906,8 @@ pub unsafe extern "C" fn punktfunk_connection_chroma_format(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        if !out.is_null() {
-            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
-            unsafe { *out = c.inner.chroma_format };
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, c.inner.chroma_format) };
         PunktfunkStatus::Ok
     })
 }
@@ -3978,10 +3930,8 @@ pub unsafe extern "C" fn punktfunk_connection_codec(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        if !out.is_null() {
-            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
-            unsafe { *out = c.inner.codec };
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, c.inner.codec) };
         PunktfunkStatus::Ok
     })
 }
@@ -4005,10 +3955,8 @@ pub unsafe extern "C" fn punktfunk_connection_shard_payload(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        if !out.is_null() {
-            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u32`.
-            unsafe { *out = u32::from(c.inner.shard_payload) };
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, u32::from(c.inner.shard_payload)) };
         PunktfunkStatus::Ok
     })
 }
@@ -4267,17 +4215,11 @@ pub unsafe extern "C" fn punktfunk_connection_mode(
             None => return PunktfunkStatus::NullPointer,
         };
         let mode = c.inner.mode();
-        // SAFETY: each out-param is optional; null-checked before write.
+        // SAFETY: the caller passes each out-param null or writable for one value.
         unsafe {
-            if !width.is_null() {
-                *width = mode.width;
-            }
-            if !height.is_null() {
-                *height = mode.height;
-            }
-            if !refresh_hz.is_null() {
-                *refresh_hz = mode.refresh_hz;
-            }
+            put(width, mode.width);
+            put(height, mode.height);
+            put(refresh_hz, mode.refresh_hz);
         }
         PunktfunkStatus::Ok
     })
@@ -4301,12 +4243,8 @@ pub unsafe extern "C" fn punktfunk_connection_gamepad(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: each out-param is optional; null-checked before write.
-        unsafe {
-            if !gamepad.is_null() {
-                *gamepad = c.inner.resolved_gamepad.to_u8() as u32;
-            }
-        }
+        // SAFETY: the caller passes `gamepad` null or writable for one value.
+        unsafe { put(gamepad, c.inner.resolved_gamepad.to_u8() as u32) };
         PunktfunkStatus::Ok
     })
 }
@@ -4477,12 +4415,8 @@ pub unsafe extern "C" fn punktfunk_connection_mgmt_port(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: out-param is optional; null-checked before write.
-        unsafe {
-            if !port.is_null() {
-                *port = c.inner.mgmt_port();
-            }
-        }
+        // SAFETY: the caller passes `port` null or writable for one value.
+        unsafe { put(port, c.inner.mgmt_port()) };
         PunktfunkStatus::Ok
     })
 }
@@ -4505,12 +4439,8 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: each out-param is optional; null-checked before write.
-        unsafe {
-            if !caps.is_null() {
-                *caps = c.inner.host_caps();
-            }
-        }
+        // SAFETY: the caller passes `caps` null or writable for one value.
+        unsafe { put(caps, c.inner.host_caps()) };
         PunktfunkStatus::Ok
     })
 }
@@ -4532,12 +4462,8 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps2(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: out-param is optional; null-checked before write.
-        unsafe {
-            if !caps.is_null() {
-                *caps = c.inner.host_caps2();
-            }
-        }
+        // SAFETY: the caller passes `caps` null or writable for one value.
+        unsafe { put(caps, c.inner.host_caps2()) };
         PunktfunkStatus::Ok
     })
 }
@@ -4560,12 +4486,8 @@ pub unsafe extern "C" fn punktfunk_connection_grants(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: out-param is optional; null-checked before write.
-        unsafe {
-            if !grants.is_null() {
-                *grants = c.inner.access_grants();
-            }
-        }
+        // SAFETY: the caller passes `grants` null or writable for one value.
+        unsafe { put(grants, c.inner.access_grants()) };
         PunktfunkStatus::Ok
     })
 }
@@ -4598,12 +4520,8 @@ pub unsafe extern "C" fn punktfunk_connection_access_expires_in(
                     .max(1)
             }
         };
-        // SAFETY: out-param is optional; null-checked before write.
-        unsafe {
-            if !secs.is_null() {
-                *secs = remaining;
-            }
-        }
+        // SAFETY: the caller passes `secs` null or writable for one value.
+        unsafe { put(secs, remaining) };
         PunktfunkStatus::Ok
     })
 }
@@ -4635,14 +4553,9 @@ pub unsafe extern "C" fn punktfunk_connection_end_reject_said(
             return PunktfunkStatus::NullPointer;
         }
         let said = c.inner.end_reject_said().unwrap_or_default();
-        if said.len() + 1 > cap {
+        // SAFETY: `out` is writable for `cap` bytes, per this function's contract.
+        if !unsafe { write_cstr(out, cap, said) } {
             return PunktfunkStatus::InvalidArg;
-        }
-        // SAFETY: `out` is non-null and holds `cap` >= said.len() + 1 bytes.
-        unsafe {
-            // `.cast()`: `c_char` is i8 on x86_64 and u8 on aarch64.
-            std::ptr::copy_nonoverlapping(said.as_ptr(), out.cast::<u8>(), said.len());
-            *out.add(said.len()) = 0;
         }
         PunktfunkStatus::Ok
     })
@@ -4675,14 +4588,9 @@ pub unsafe extern "C" fn punktfunk_connection_launch_notice(
             .as_ref()
             .and_then(|o| o.notice())
             .unwrap_or_default();
-        if notice.len() + 1 > cap {
+        // SAFETY: `out` is writable for `cap` bytes, per this function's contract.
+        if !unsafe { write_cstr(out, cap, notice) } {
             return PunktfunkStatus::InvalidArg;
-        }
-        // SAFETY: `out` is non-null and holds `cap` >= notice.len() + 1 bytes.
-        unsafe {
-            // `.cast()`: `c_char` is i8 on x86_64 and u8 on aarch64.
-            std::ptr::copy_nonoverlapping(notice.as_ptr(), out.cast::<u8>(), notice.len());
-            *out.add(notice.len()) = 0;
         }
         PunktfunkStatus::Ok
     })
@@ -4709,12 +4617,8 @@ pub unsafe extern "C" fn punktfunk_connection_end_reject(
             Some(reason) => crate::error::PunktfunkError::Rejected(reason).status() as i32,
             None => 0,
         };
-        // SAFETY: out-param is optional; null-checked before write.
-        unsafe {
-            if !status.is_null() {
-                *status = value;
-            }
-        }
+        // SAFETY: the caller passes `status` null or writable for one value.
+        unsafe { put(status, value) };
         PunktfunkStatus::Ok
     })
 }
@@ -4777,17 +4681,12 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
             // SAFETY: `n` is capped and `ffi_slice_bytes`-checked; borrowed for this call.
             let slice = unsafe { std::slice::from_raw_parts(kinds, n) };
             for k in slice {
-                let mime = if k.mime.is_null() {
-                    String::new()
-                } else {
-                    // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
-                    match unsafe { std::ffi::CStr::from_ptr(k.mime) }.to_str() {
-                        Ok(s) => s.to_string(),
-                        Err(_) => return PunktfunkStatus::InvalidArg,
-                    }
+                // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
+                let Ok(mime) = (unsafe { opt_cstr(k.mime) }) else {
+                    return PunktfunkStatus::InvalidArg;
                 };
                 out.push(crate::quic::ClipKind {
-                    mime,
+                    mime: mime.unwrap_or_default().to_string(),
                     size_hint: k.size_hint,
                 });
             }
@@ -4821,22 +4720,16 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        if mime.is_null() {
-            return PunktfunkStatus::NullPointer;
-        }
         // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
-        let mime = match unsafe { std::ffi::CStr::from_ptr(mime) }.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return PunktfunkStatus::InvalidArg,
+        let mime = match unsafe { opt_cstr(mime) } {
+            Ok(Some(s)) => s.to_string(),
+            Ok(None) => return PunktfunkStatus::NullPointer,
+            Err(()) => return PunktfunkStatus::InvalidArg,
         };
         match c.inner.clip_fetch(seq, mime, file_index) {
             Ok(xfer_id) => {
-                // SAFETY: each out-param is optional; null-checked before write.
-                unsafe {
-                    if !xfer_id_out.is_null() {
-                        *xfer_id_out = xfer_id;
-                    }
-                }
+                // SAFETY: the caller passes `xfer_id_out` null or writable for one value.
+                unsafe { put(xfer_id_out, xfer_id) };
                 PunktfunkStatus::Ok
             }
             Err(e) => e.status(),
@@ -4970,12 +4863,8 @@ pub unsafe extern "C" fn punktfunk_connection_compositor(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: each out-param is optional; null-checked before write.
-        unsafe {
-            if !compositor.is_null() {
-                *compositor = c.inner.resolved_compositor.to_u8() as u32;
-            }
-        }
+        // SAFETY: the caller passes `compositor` null or writable for one value.
+        unsafe { put(compositor, c.inner.resolved_compositor.to_u8() as u32) };
         PunktfunkStatus::Ok
     })
 }
@@ -4998,12 +4887,8 @@ pub unsafe extern "C" fn punktfunk_connection_bitrate(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: each out-param is optional; null-checked before write.
-        unsafe {
-            if !bitrate_kbps.is_null() {
-                *bitrate_kbps = c.inner.resolved_bitrate_kbps;
-            }
-        }
+        // SAFETY: the caller passes `bitrate_kbps` null or writable for one value.
+        unsafe { put(bitrate_kbps, c.inner.resolved_bitrate_kbps) };
         PunktfunkStatus::Ok
     })
 }
@@ -5025,12 +4910,8 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_ns(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: each out-param is optional; null-checked before write.
-        unsafe {
-            if !offset_ns.is_null() {
-                *offset_ns = c.inner.clock_offset_ns;
-            }
-        }
+        // SAFETY: the caller passes `offset_ns` null or writable for one value.
+        unsafe { put(offset_ns, c.inner.clock_offset_ns) };
         PunktfunkStatus::Ok
     })
 }
@@ -5052,12 +4933,8 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_now_ns(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: each out-param is optional; null-checked before write.
-        unsafe {
-            if !offset_ns.is_null() {
-                *offset_ns = c.inner.clock_offset_now_ns();
-            }
-        }
+        // SAFETY: the caller passes `offset_ns` null or writable for one value.
+        unsafe { put(offset_ns, c.inner.clock_offset_now_ns()) };
         PunktfunkStatus::Ok
     })
 }
@@ -5159,10 +5036,8 @@ pub unsafe extern "C" fn punktfunk_connection_note_frame_index(
             None => return PunktfunkStatus::NullPointer,
         };
         let gap = c.inner.note_frame_index(frame_index);
-        if !gap_out.is_null() {
-            // SAFETY: caller out-param, non-null on this path, written once.
-            unsafe { *gap_out = gap > 0 };
-        }
+        // SAFETY: the caller passes `gap_out` null or writable for one value.
+        unsafe { put(gap_out, gap > 0) };
         PunktfunkStatus::Ok
     })
 }
@@ -5188,10 +5063,8 @@ pub unsafe extern "C" fn punktfunk_connection_note_frame_index_ex(
             None => return PunktfunkStatus::NullPointer,
         };
         let gap = c.inner.note_frame_index(frame_index);
-        if !gap_width_out.is_null() {
-            // SAFETY: caller out-param, non-null on this path, written once.
-            unsafe { *gap_width_out = gap };
-        }
+        // SAFETY: the caller passes `gap_width_out` null or writable for one value.
+        unsafe { put(gap_width_out, gap) };
         PunktfunkStatus::Ok
     })
 }
@@ -5209,21 +5082,15 @@ pub unsafe extern "C" fn punktfunk_connection_frames_dropped(
 ) -> PunktfunkStatus {
     guard(|| {
         // Write 0 on a NULL connection before the handle check (header contract).
-        if !out.is_null() {
-            // SAFETY: caller out-param, non-null on this path, written once.
-            unsafe { *out = 0 };
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, 0) };
         // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: each out-param is optional; null-checked before write.
-        unsafe {
-            if !out.is_null() {
-                *out = c.inner.frames_dropped();
-            }
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, c.inner.frames_dropped()) };
         PunktfunkStatus::Ok
     })
 }
@@ -5272,19 +5139,33 @@ unsafe fn hud_with_facts(
     if declared < std::mem::size_of::<PunktfunkHudFacts>() {
         return Err(PunktfunkStatus::InvalidArg);
     }
-    // SAFETY: non-null, and `struct_size` covers this type.
-    let f = unsafe { facts.read_unaligned() };
-    s.on_glass = f.on_glass;
-    s.shave_os_floor = f.shave_os_floor;
-    if f.audio_buffer_ms > 0 {
-        s.audio_buffer_ms = f.audio_buffer_ms;
-        s.av_offset_ms = f.av_offset_ms;
+    // SAFETY: non-null, and `struct_size` covers this type. Fields are read one at a time and
+    // the bools as bytes, so a binding that stores 2 cannot produce an invalid `bool`.
+    let (on_glass, shave_os_floor, audio_buffer_ms, av_offset_ms, preset, extras) = unsafe {
+        use std::ptr::addr_of;
+        (
+            addr_of!((*facts).on_glass).cast::<u8>().read_unaligned() != 0,
+            addr_of!((*facts).shave_os_floor)
+                .cast::<u8>()
+                .read_unaligned()
+                != 0,
+            addr_of!((*facts).audio_buffer_ms).read_unaligned(),
+            addr_of!((*facts).av_offset_ms).read_unaligned(),
+            addr_of!((*facts).preset).read_unaligned(),
+            addr_of!((*facts).extras).read_unaligned(),
+        )
+    };
+    s.on_glass = on_glass;
+    s.shave_os_floor = shave_os_floor;
+    if audio_buffer_ms > 0 {
+        s.audio_buffer_ms = audio_buffer_ms;
+        s.av_offset_ms = av_offset_ms;
     }
     // SAFETY: caller strings, NUL-terminated or null, borrowed for this call.
-    let preset = unsafe { opt_cstr(f.preset) }.map_err(|()| PunktfunkStatus::InvalidArg)?;
+    let preset = unsafe { opt_cstr(preset) }.map_err(|()| PunktfunkStatus::InvalidArg)?;
     s.preset = preset.filter(|p| !p.is_empty()).map(str::to_owned);
     // SAFETY: as above.
-    let extras = unsafe { opt_cstr(f.extras) }.map_err(|()| PunktfunkStatus::InvalidArg)?;
+    let extras = unsafe { opt_cstr(extras) }.map_err(|()| PunktfunkStatus::InvalidArg)?;
     s.extras
         .extend(extras.unwrap_or_default().lines().filter_map(|line| {
             let (code, text) = line.split_once('\t')?;
@@ -5428,18 +5309,11 @@ pub unsafe extern "C" fn punktfunk_connection_hud_text(
         };
         let tier = crate::hud::StatsVerbosity::from_index(tier);
         let text = crate::hud::encode_lines(&crate::hud::format(&snap, tier, advanced));
-        if !needed.is_null() {
-            // SAFETY: caller out-param, non-null on this path, written once.
-            unsafe { *needed = text.len() + 1 };
-        }
-        if out.is_null() || text.len() + 1 > cap {
+        // SAFETY: the caller passes `needed` null or writable for one value.
+        unsafe { put(needed, text.len() + 1) };
+        // SAFETY: `out` is null or writable for `cap` bytes, per this function's contract.
+        if !unsafe { write_cstr(out, cap, &text) } {
             return PunktfunkStatus::InvalidArg;
-        }
-        // SAFETY: `out` is non-null and holds `cap` >= text.len() + 1 bytes.
-        unsafe {
-            // `.cast()`: `c_char` is i8 on x86_64 and u8 on aarch64.
-            std::ptr::copy_nonoverlapping(text.as_ptr(), out.cast::<u8>(), text.len());
-            *out.add(text.len()) = 0;
         }
         PunktfunkStatus::Ok
     })
@@ -5514,21 +5388,15 @@ pub unsafe extern "C" fn punktfunk_connection_wants_decode_latency(
 ) -> PunktfunkStatus {
     guard(|| {
         // Write false on a NULL connection before the handle check (uninitialized is not a bool).
-        if !out.is_null() {
-            // SAFETY: caller out-param, non-null on this path, written once.
-            unsafe { *out = false };
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, false) };
         // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: each out-param is optional; null-checked before write.
-        unsafe {
-            if !out.is_null() {
-                *out = c.inner.wants_decode_latency();
-            }
-        }
+        // SAFETY: the caller passes `out` null or writable for one value.
+        unsafe { put(out, c.inner.wants_decode_latency()) };
         PunktfunkStatus::Ok
     })
 }
@@ -5730,15 +5598,14 @@ pub unsafe extern "C" fn punktfunk_h265_concealer_conceal(
     out_len: *mut usize,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let (Some(c), Some(out_kind), Some(out_buf), Some(out_len)) = (
-            unsafe { c.as_mut() },
-            unsafe { out_kind.as_mut() },
-            unsafe { out_buf.as_mut() },
-            unsafe { out_len.as_mut() },
-        ) else {
+        // SAFETY: caller handle or null; `as_mut` never dereferences null.
+        let Some(c) = (unsafe { c.as_mut() }) else {
             return PunktfunkStatus::NullPointer;
         };
+        // Out-slots are written through the raw pointer: C may pass them uninitialised.
+        if out_kind.is_null() || out_buf.is_null() || out_len.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
         if au.is_null() && len != 0 {
             return PunktfunkStatus::NullPointer;
         }
@@ -5751,18 +5618,27 @@ pub unsafe extern "C" fn punktfunk_h265_concealer_conceal(
             // SAFETY: `au` is non-null and `ffi_slice_bytes` proved the extent fits a Rust slice.
             unsafe { std::slice::from_raw_parts(au, len) }
         };
-        *out_buf = std::ptr::null_mut();
-        *out_len = 0;
-        *out_kind = match c.inner.conceal(bytes) {
-            Concealment::Intact => PunktfunkConcealment::Intact,
+        let (kind, buf, n) = match c.inner.conceal(bytes) {
+            Concealment::Intact => (PunktfunkConcealment::Intact, std::ptr::null_mut(), 0),
             Concealment::Rewritten(v) => {
                 let boxed = v.into_boxed_slice();
-                *out_len = boxed.len();
-                *out_buf = Box::into_raw(boxed).cast::<u8>();
-                PunktfunkConcealment::Rewritten
+                let n = boxed.len();
+                (
+                    PunktfunkConcealment::Rewritten,
+                    Box::into_raw(boxed).cast::<u8>(),
+                    n,
+                )
             }
-            Concealment::Unrecoverable => PunktfunkConcealment::Unrecoverable,
+            Concealment::Unrecoverable => {
+                (PunktfunkConcealment::Unrecoverable, std::ptr::null_mut(), 0)
+            }
         };
+        // SAFETY: the three out-pointers are non-null (checked above) and writable per contract.
+        unsafe {
+            out_kind.write(kind);
+            out_buf.write(buf);
+            out_len.write(n);
+        }
         PunktfunkStatus::Ok
     })
 }
@@ -5862,10 +5738,8 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_on_decoded(
         };
         let present = g.on_decoded(flags, decoder_keyframe, std::time::Instant::now())
             == GateVerdict::Present;
-        if !out_present.is_null() {
-            // SAFETY: caller out-param, non-null on this path, written once.
-            unsafe { *out_present = present };
-        }
+        // SAFETY: the caller passes `out_present` null or writable for one value.
+        unsafe { put(out_present, present) };
         PunktfunkStatus::Ok
     })
 }
@@ -5888,10 +5762,8 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_on_no_output(
             None => return PunktfunkStatus::NullPointer,
         };
         let request = g.on_no_output(std::time::Instant::now());
-        if !out_request_kf.is_null() {
-            // SAFETY: caller out-param, non-null on this path, written once.
-            unsafe { *out_request_kf = request };
-        }
+        // SAFETY: the caller passes `out_request_kf` null or writable for one value.
+        unsafe { put(out_request_kf, request) };
         PunktfunkStatus::Ok
     })
 }
@@ -5915,10 +5787,8 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_poll(
             None => return PunktfunkStatus::NullPointer,
         };
         let request = g.poll(frames_dropped, std::time::Instant::now());
-        if !out_request_kf.is_null() {
-            // SAFETY: caller out-param, non-null on this path, written once.
-            unsafe { *out_request_kf = request };
-        }
+        // SAFETY: the caller passes `out_request_kf` null or writable for one value.
+        unsafe { put(out_request_kf, request) };
         PunktfunkStatus::Ok
     })
 }
@@ -5936,9 +5806,82 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_is_holding(
     guard(|| {
         // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let holding = unsafe { g.as_ref() }.is_some_and(ReanchorGate::is_holding);
-        if !out_holding.is_null() {
-            // SAFETY: caller out-param, non-null on this path, written once.
-            unsafe { *out_holding = holding };
+        // SAFETY: the caller passes `out_holding` null or writable for one value.
+        unsafe { put(out_holding, holding) };
+        PunktfunkStatus::Ok
+    })
+}
+
+// C wrapper for [`AuAdmission`]: one per elementary stream, every AU in receive order.
+
+/// [`punktfunk_au_admission_note`]'s `concealed`: the lane has no concealer.
+pub const PUNKTFUNK_CONCEALED_NONE: u32 = 0;
+/// The concealer left every reference on a picture the decoder holds.
+pub const PUNKTFUNK_CONCEALED_DECODABLE: u32 = 1;
+/// Nothing can stand in for the lost reference.
+pub const PUNKTFUNK_CONCEALED_UNRECOVERABLE: u32 = 2;
+
+/// Create an admission rule. Free with [`punktfunk_au_admission_free`]. Never returns NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn punktfunk_au_admission_new() -> *mut AuAdmission {
+    Box::into_raw(Box::default())
+}
+
+/// Free a rule created by [`punktfunk_au_admission_new`]. NULL is a no-op.
+///
+/// # Safety
+/// `a` was returned by [`punktfunk_au_admission_new`] and is not used after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_au_admission_free(a: *mut AuAdmission) {
+    guard_void(|| {
+        if !a.is_null() {
+            // SAFETY: pointers are caller-supplied and null-checked on this path.
+            drop(unsafe { Box::from_raw(a) });
+        }
+    });
+}
+
+/// Fold one AU: its frame index, the index gap ahead of it (0 for none), its wire flags,
+/// whether the decoder is strict, and a `PUNKTFUNK_CONCEALED_*`. Writes whether to keep the
+/// AU off the decoder and whether to ask for a keyframe. An unknown `concealed` returns
+/// [`PunktfunkStatus::InvalidArg`].
+///
+/// # Safety
+/// `a` is a valid handle; the out pointers are writable or NULL.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn punktfunk_au_admission_note(
+    a: *mut AuAdmission,
+    index: u32,
+    gap: u32,
+    flags: u32,
+    strict: bool,
+    concealed: u32,
+    out_withhold: *mut bool,
+    out_ask_keyframe: *mut bool,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: caller handle or null; `as_mut` never dereferences null.
+        let Some(a) = (unsafe { a.as_mut() }) else {
+            return PunktfunkStatus::NullPointer;
+        };
+        let verdict = match concealed {
+            PUNKTFUNK_CONCEALED_NONE => None,
+            PUNKTFUNK_CONCEALED_DECODABLE => Some(crate::reanchor::Concealment::Decodable),
+            PUNKTFUNK_CONCEALED_UNRECOVERABLE => Some(crate::reanchor::Concealment::Unrecoverable),
+            _ => return PunktfunkStatus::InvalidArg,
+        };
+        let class = if strict {
+            DecoderClass::Strict
+        } else {
+            DecoderClass::Lenient
+        };
+        let step = a.note(index, gap, flags, class, verdict);
+        // SAFETY: caller out-params, null or writable. `put` writes without reading, so C may
+        // pass them uninitialised.
+        unsafe {
+            put(out_withhold, step.withhold);
+            put(out_ask_keyframe, step.ask_keyframe);
         }
         PunktfunkStatus::Ok
     })
@@ -6027,8 +5970,8 @@ pub unsafe extern "C" fn punktfunk_demo_host_fingerprint(
         if out_sha256.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        // SAFETY: the caller guarantees 32 writable bytes; non-null on this path.
-        unsafe { ptr::copy_nonoverlapping(h.inner.fingerprint().as_ptr(), out_sha256, 32) };
+        // SAFETY: `out_sha256` is non-null here and writable for 32 bytes.
+        unsafe { put_sha256(out_sha256, h.inner.fingerprint()) };
         PunktfunkStatus::Ok
     })
 }
@@ -6088,13 +6031,8 @@ pub unsafe extern "C" fn punktfunk_demo_host_launch(
         let Some(launch) = h.inner.session().and_then(|s| s.launch) else {
             return 0;
         };
-        if !buf.is_null() && launch.len() < cap {
-            // SAFETY: `buf` is writable for `cap` > `launch.len()` bytes.
-            unsafe {
-                ptr::copy_nonoverlapping(launch.as_ptr(), buf.cast::<u8>(), launch.len());
-                *buf.add(launch.len()) = 0;
-            }
-        }
+        // SAFETY: `buf` is null or writable for `cap` bytes, per this function's contract.
+        unsafe { write_cstr(buf, cap, &launch) };
         launch.len()
     }))
     .unwrap_or(0)
@@ -6175,8 +6113,8 @@ mod abi_version_tests {
     #[test]
     fn abi_version_is_pinned() {
         // Current ABI. A bump must update this pin.
-        assert_eq!(crate::ABI_VERSION, 38);
-        assert_eq!(super::punktfunk_abi_version(), 38);
+        assert_eq!(crate::ABI_VERSION, 39);
+        assert_eq!(super::punktfunk_abi_version(), 39);
     }
 
     #[test]
@@ -6307,6 +6245,22 @@ mod tests {
         assert_eq!(short.unwrap_err(), PunktfunkStatus::InvalidArg);
         // SAFETY: null facts are the documented no-op.
         assert!(unsafe { hud_with_facts(Default::default(), std::ptr::null()) }.is_ok());
+
+        // A non-C binding may store 2 in a bool byte; that reads as true, not as UB (Miri).
+        f.struct_size = std::mem::size_of::<PunktfunkHudFacts>() as u32;
+        let mut bytes = [0u8; std::mem::size_of::<PunktfunkHudFacts>()];
+        // SAFETY: a byte copy of an initialised `f` into a buffer of the same size.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (&raw const f).cast::<u8>(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+            )
+        };
+        bytes[std::mem::offset_of!(PunktfunkHudFacts, on_glass)] = 2;
+        // SAFETY: `bytes` holds `struct_size` readable bytes; the strings outlive the call.
+        let s = unsafe { hud_with_facts(Default::default(), bytes.as_ptr().cast()) }.unwrap();
+        assert!(s.on_glass);
     }
 
     #[cfg(feature = "quic")]
@@ -6385,6 +6339,31 @@ mod tests {
         assert_eq!(status, PunktfunkStatus::InvalidArg);
         assert_eq!(cert, [0x5a; 2]);
         assert_eq!(key, [0x5a; 2]);
+    }
+
+    /// A string plus NUL fills exactly `cap`; one byte less writes nothing. Null slots are skipped.
+    #[test]
+    fn out_param_helpers_respect_capacity_and_null() {
+        let mut buf = [0x5a as c_char; 4];
+        // SAFETY: `buf` is writable for the 3- and 4-byte capacities passed; null is allowed.
+        unsafe {
+            assert!(!write_cstr(buf.as_mut_ptr(), 3, "abc"));
+            assert_eq!(buf, [0x5a; 4]);
+            assert!(write_cstr(buf.as_mut_ptr(), 4, "abc"));
+            assert!(!write_cstr(ptr::null_mut(), 4, "abc"));
+        }
+        assert_eq!(buf.map(|b| b.to_ne_bytes()[0]), *b"abc\0");
+
+        // Byte 0 is a sentinel: the fingerprint lands at offset 1 and fills exactly 32 bytes.
+        let mut fp = [0u8; 33];
+        // SAFETY: `fp[1..]` is 32 writable bytes; null is allowed for both helpers.
+        unsafe {
+            put_sha256(fp.as_mut_ptr().add(1), [7; 32]);
+            put_sha256(ptr::null_mut(), [7; 32]);
+            put(ptr::null_mut::<u32>(), 1);
+        }
+        assert_eq!(fp[0], 0);
+        assert_eq!(fp[1..], [7; 32]);
     }
 
     #[test]

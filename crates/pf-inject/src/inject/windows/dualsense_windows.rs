@@ -15,25 +15,21 @@ use super::dualsense_proto::{
     parse_ds_output, serialize_state, DsFeedback, DsState, DsTriggers, DS_INPUT_REPORT_LEN,
     DS_TOUCH_H, DS_TOUCH_W,
 };
-use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
+use super::gamepad_raii::{sw_device_create, PadChannel, SectionView, SwDeviceSpec};
 use crate::sensor_clock::SensorClock;
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use punktfunk_core::quic::RichInput;
-use std::ffi::c_void;
-use std::sync::atomic::{fence, AtomicU32, Ordering};
+use std::sync::atomic::{fence, Ordering};
 use std::time::{Duration, Instant};
-use windows::core::{w, GUID, PCWSTR};
-use windows::Win32::Devices::Enumeration::Pnp::{
-    SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
-};
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::core::GUID;
+use windows::Win32::Devices::Enumeration::Pnp::HSWDEVICE;
 
 /// Byte size of [`pf_driver_proto::gamepad::PadShm`]. Offsets and magic come from the same struct
 /// so a layout change is a compile error; the driver maps that type too.
 pub(super) const SHM_SIZE: usize = core::mem::size_of::<pf_driver_proto::gamepad::PadShm>();
 pub(super) const SHM_MAGIC: u32 = pf_driver_proto::gamepad::PAD_MAGIC; // "PFDS"
+const OFF_MAGIC: usize = core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, magic);
 pub(super) const OFF_INPUT: usize = core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, input);
 pub(super) const OFF_OUT_SEQ: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, out_seq);
@@ -47,21 +43,28 @@ pub(super) const OFF_DRIVER_PROTO: usize =
 pub(super) const OFF_DRIVER_REV: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, driver_rev);
 
+/// Stamp a fresh pad section: device type first (the driver picks its HID identity off it),
+/// then index, ring version and the neutral report, magic last — the driver accepts a section
+/// only once magic is set.
+pub(super) fn stamp_pad(
+    shm: SectionView<'_>,
+    devtype: u8,
+    index: u8,
+    ring_ver: u32,
+    neutral: &[u8],
+) {
+    shm.write_bytes(OFF_DEVTYPE, &[devtype]);
+    shm.store_u32(OFF_PAD_INDEX, index.into(), Ordering::Relaxed);
+    shm.store_u32(OFF_OUT_RING_VER, ring_ver, Ordering::Relaxed);
+    shm.write_bytes(OFF_INPUT, neutral);
+    shm.store_u32(OFF_MAGIC, SHM_MAGIC, Ordering::Relaxed);
+}
+
 /// `(driver_proto, driver_rev)` from a pad section. The driver stamps the revision first and the
 /// protocol with Release, so a revision read after a nonzero protocol is the driver's.
-///
-/// # Safety
-/// `base` points at a live, mapped [`PadShm`].
-pub(super) unsafe fn driver_marks(base: *mut u8) -> (u32, u32) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    // SAFETY: the caller's contract; both offsets are 4-aligned fields inside the section.
-    unsafe {
-        let proto = (*(base.add(OFF_DRIVER_PROTO) as *const AtomicU32)).load(Ordering::Acquire);
-        (
-            proto,
-            std::ptr::read_volatile(base.add(OFF_DRIVER_REV) as *const u32),
-        )
-    }
+pub(super) fn driver_marks(shm: SectionView<'_>) -> (u32, u32) {
+    let proto = shm.load_u32(OFF_DRIVER_PROTO, Ordering::Acquire);
+    (proto, shm.load_u32(OFF_DRIVER_REV, Ordering::Relaxed))
 }
 pub(super) const OFF_PAD_INDEX: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, pad_index);
@@ -90,29 +93,17 @@ pub(super) const OFF_INPUT_GEN: usize =
 /// `generation` goes odd before the body and even after. The driver samples either side of its
 /// read and retries on disagreement. The `Release` fence keeps body stores below the odd marker;
 /// the `Release` store publishes them ahead of even. Both are no-ops on x86-TSO, load-bearing on ARM64.
-///
-/// # Safety
-/// `base` must point at a live mapped pad section of at least `PAD_SHM_SIZE` bytes, and `report`
-/// must be no longer than the 64-byte input slot.
-pub(super) unsafe fn publish_input(base: *mut u8, generation: &mut u32, report: &[u8]) {
-    debug_assert!(report.len() <= 64, "report overruns the input slot");
+/// A report past the 64-byte slot is cut to it.
+pub(super) fn publish_input(shm: SectionView<'_>, generation: &mut u32, report: &[u8]) {
     // Odd: a report is in flight.
     *generation = generation.wrapping_add(1);
-    // SAFETY: the caller guarantees `base` maps the section; `OFF_INPUT_GEN` is 4-aligned off the
-    // page-aligned base and sits in the v2 legacy region every driver generation maps.
-    unsafe {
-        (*(base.add(OFF_INPUT_GEN) as *const AtomicU32)).store(*generation, Ordering::Relaxed)
-    };
+    shm.store_u32(OFF_INPUT_GEN, *generation, Ordering::Relaxed);
     // Ordered, not ordering: keeps the body stores below from being hoisted above the odd marker.
     fence(Ordering::Release);
-    // SAFETY: the caller guarantees the mapping and that `report` fits the slot at OFF_INPUT.
-    unsafe { std::ptr::copy_nonoverlapping(report.as_ptr(), base.add(OFF_INPUT), report.len()) };
+    shm.write_bytes(OFF_INPUT, &report[..report.len().min(64)]);
     // Even: the slot holds a whole report again.
     *generation = generation.wrapping_add(1);
-    // SAFETY: as the first store.
-    unsafe {
-        (*(base.add(OFF_INPUT_GEN) as *const AtomicU32)).store(*generation, Ordering::Release)
-    };
+    shm.store_u32(OFF_INPUT_GEN, *generation, Ordering::Release);
 }
 
 /// Drain of a pad section's output plane: the lossless report ring when the driver publishes one
@@ -154,14 +145,12 @@ impl OutputDrain {
     /// replays as OUTPUT until the next ring-fed poll.
     pub(super) fn drain_tagged(
         &mut self,
-        base: *mut u8,
+        shm: SectionView<'_>,
         mut per_report: impl FnMut(&[u8], bool),
     ) -> bool {
-        // SAFETY: base points at SHM_SIZE bytes; `OFF_RING_HEAD` is 4-aligned off the
-        // page-aligned base. The driver bumps `ring_head` AFTER writing the slot, so an Acquire
-        // load orders the slot copies below.
-        let head =
-            unsafe { (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire) };
+        // The driver bumps `ring_head` AFTER writing the slot, so an Acquire load orders the
+        // slot copies below.
+        let head = shm.load_u32(OFF_RING_HEAD, Ordering::Acquire);
         if self.ring_live || head != 0 {
             self.ring_live = true;
             if head == self.tail {
@@ -170,10 +159,7 @@ impl OutputDrain {
             // Driver's slot-math modulo (0 = pre-v2.2, hardcodes 8). Loaded after Acquire on
             // `ring_head`; restamped before every bump. Out-of-range clamps to v2.1 so offsets
             // stay inside the v2.2 ring.
-            // SAFETY: `OFF_OUT_RING_LEN` is 4-aligned off the page-aligned base.
-            let echo = unsafe {
-                (*(base.add(OFF_OUT_RING_LEN) as *const AtomicU32)).load(Ordering::Relaxed)
-            };
+            let echo = shm.load_u32(OFF_OUT_RING_LEN, Ordering::Relaxed);
             let ring_len = if (1..=OUT_RING_LEN_V22).contains(&echo) {
                 echo
             } else {
@@ -188,23 +174,14 @@ impl OutputDrain {
                     [([0u8; 64], 0usize, false); pf_driver_proto::gamepad::OUT_RING_LEN_V22_USIZE];
                 for (k, buf) in bufs.iter_mut().enumerate().take(n) {
                     let idx = (self.tail.wrapping_add(k as u32) % ring_len) as usize;
+                    // idx < `ring_len` ≤ OUT_RING_LEN_V22: the last slot ends at 4064 ≤ SHM_SIZE.
                     let slot = OFF_OUT_RING + idx * OUT_SLOT_SIZE;
-                    // SAFETY: slot .. slot+OUT_SLOT_SIZE is inside the SHM_SIZE section (idx <
-                    // `ring_len` ≤ OUT_RING_LEN_V22, whose last slot ends at 4064 ≤ SHM_SIZE);
-                    // the len field is 4-aligned (`OFF_OUT_RING` == 256, `OUT_SLOT_SIZE` == 68).
-                    let raw_len = unsafe { std::ptr::read_unaligned(base.add(slot) as *const u32) };
+                    let raw_len = shm.load_u32(slot, Ordering::Relaxed);
                     buf.2 = pf_driver_proto::triton::out_is_feature(raw_len);
                     buf.1 = (pf_driver_proto::triton::out_len(raw_len) as usize).min(64);
-                    // SAFETY: the slot's data region is slot+4 .. slot+4+64, inside the section;
-                    // `buf.0` is a live local 64-byte array.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(base.add(slot + 4), buf.0.as_mut_ptr(), buf.1)
-                    };
+                    shm.read_bytes(slot + 4, &mut buf.0[..buf.1]);
                 }
-                // SAFETY: as the first `ring_head` load above.
-                let head2 = unsafe {
-                    (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire)
-                };
+                let head2 = shm.load_u32(OFF_RING_HEAD, Ordering::Acquire);
                 if head2.wrapping_sub(self.tail) <= ring_len {
                     for (data, len, feature) in bufs.iter().take(n) {
                         if *len > 0 {
@@ -218,32 +195,31 @@ impl OutputDrain {
             // Overflow or lapped mid-copy: skip to the freshest head and salvage the untagged
             // latest-report slot (driver dual-publishes every report there). No seqlock; parser
             // gates drop most tears, caller resync silences planes the salvage does not assert.
-            // SAFETY: as the first `ring_head` load above.
-            self.tail =
-                unsafe { (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire) };
+            self.tail = shm.load_u32(OFF_RING_HEAD, Ordering::Acquire);
             let mut out = [0u8; 64];
-            // SAFETY: the legacy output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
-            unsafe { std::ptr::copy_nonoverlapping(base.add(OFF_OUTPUT), out.as_mut_ptr(), 64) };
+            shm.read_bytes(OFF_OUTPUT, &mut out);
             per_report(&out, false);
             return true;
         }
         // Pre-ring driver: latest-report slot + seq, coalescing. No feature tag on this slot.
-        // SAFETY: `OFF_OUT_SEQ` is 4-aligned off the page-aligned base; Acquire pairs with the
-        // driver's publish-then-bump store order.
-        let seq = unsafe { (*(base.add(OFF_OUT_SEQ) as *const AtomicU32)).load(Ordering::Acquire) };
+        // Acquire pairs with the driver's publish-then-bump store order.
+        let seq = shm.load_u32(OFF_OUT_SEQ, Ordering::Acquire);
         if seq != self.last_out_seq {
             self.last_out_seq = seq;
             let mut out = [0u8; 64];
-            // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
-            unsafe { std::ptr::copy_nonoverlapping(base.add(OFF_OUTPUT), out.as_mut_ptr(), 64) };
+            shm.read_bytes(OFF_OUTPUT, &mut out);
             per_report(&out, false);
         }
         false
     }
 
     /// Drop the Triton feature flag for DualSense/DS4/Edge/Deck callers.
-    pub(super) fn drain(&mut self, base: *mut u8, mut per_report: impl FnMut(&[u8])) -> bool {
-        self.drain_tagged(base, |b, _| per_report(b))
+    pub(super) fn drain(
+        &mut self,
+        shm: SectionView<'_>,
+        mut per_report: impl FnMut(&[u8]),
+    ) -> bool {
+        self.drain_tagged(shm, |b, _| per_report(b))
     }
 }
 
@@ -301,130 +277,32 @@ pub(super) struct SwDeviceProfile<'a> {
 ///   `HID\VID_…` child ids a genuine USB DualSense exposes.
 /// - a deterministic per-pad `pContainerId` (the null sentinel trips an `xinput1_4` slot skip).
 ///
-/// Enumerator names must not contain `_` (`punktfunk`, not `pf_dualsense`) and `pCallback` is
-/// mandatory — either yields `E_INVALIDARG`. The caller must be Administrator (the host runs as
-/// LocalSystem).
+/// The Location carries the pad index the driver polls `pfds-boot-<index>` by. The caller must
+/// be Administrator (the host runs as LocalSystem).
 pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(HSWDEVICE, Option<String>)> {
-    let multi_sz = |ids: &[&str]| -> Vec<u16> {
-        ids.iter()
-            .flat_map(|s| s.encode_utf16().chain(std::iter::once(0)))
-            .chain(std::iter::once(0))
-            .collect()
-    };
     let mi = p.usb_mi.map(|n| format!("&MI_{n:02}")).unwrap_or_default();
     let usb_rev = format!("USB\\{}&REV_0100{mi}", p.usb_vid_pid);
     let usb = format!("USB\\{}{mi}", p.usb_vid_pid);
-    let hwids = multi_sz(&[
-        p.hwid, // FIRST → the INF binds our UMDF driver on this id
-        usb_rev.as_str(),
-        usb.as_str(),
-    ]);
-    let compat = multi_sz(&[
-        usb.as_str(), // a `USB\` token → native bus-type detection resolves USB
-        "USB\\Class_03&SubClass_00&Prot_00",
-        "USB\\Class_03",
-    ]);
-    let instid: Vec<u16> = p
-        .instance
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let desc: Vec<u16> = p
-        .description
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    // Pad index in Location — the driver polls `pfds-boot-<index>`. The buffer outlives
-    // SwDeviceCreate (we wait on the event before return).
-    let loc: Vec<u16> = format!("{}", p.container_index)
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let container = GUID::from_values(
-        p.container_tag,
-        0x0000,
-        0x0000,
-        [0, 0, 0, 0, 0, 0, 0, p.container_index],
-    );
-
-    // SAFETY: zeroed then the fields we use are set; cbSize identifies the struct version. The id
-    // buffers and `container` outlive SwDeviceCreate (we wait on the event before return).
-    let mut info: SW_DEVICE_CREATE_INFO = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<SW_DEVICE_CREATE_INFO>() as u32;
-    info.pszInstanceId = PCWSTR(instid.as_ptr());
-    info.pszzHardwareIds = PCWSTR(hwids.as_ptr());
-    info.pszzCompatibleIds = PCWSTR(compat.as_ptr());
-    info.pContainerId = &container;
-    info.pszDeviceDescription = PCWSTR(desc.as_ptr());
-    info.pszDeviceLocation = PCWSTR(loc.as_ptr());
-    info.CapabilityFlags = 0x0000_000B; // DriverRequired | SilentInstall | Removable
-
-    // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
-    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
-    // `result` starts as E_FAIL: a timeout must not read a zeroed HRESULT as success.
-    // Heap-allocated: `sw_create_cb` writes through this pointer then `SetEvent`s. The wait is
-    // 10 s; on a wedged-PnP timeout the callback may still be pending, so we leak the box and
-    // leave the event open rather than let a late write hit recycled stack/handle.
-    let ctx = Box::into_raw(Box::new(SwCreateCtx {
-        event,
-        result: E_FAIL,
-        instance_id: [0; 128],
-    }));
-    let enumerator: Vec<u16> = p
-        .enumerator
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    // SAFETY: info + the buffers outlive the call; `ctx` is a live heap allocation that outlives
-    // every path below (reclaimed only where the callback provably ran). windows-rs returns the
-    // HSWDEVICE (the C out-param) as the Result value.
-    let hsw = match unsafe {
-        SwDeviceCreate(
-            PCWSTR(enumerator.as_ptr()),
-            w!("HTREE\\ROOT\\0"),
-            &info,
-            None,
-            Some(sw_create_cb),
-            Some(ctx as *const c_void),
-        )
-    } {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: the call failed, so no callback was registered and `ctx` is ours to reclaim;
-            // `event` is valid and unreferenced.
-            unsafe {
-                drop(Box::from_raw(ctx));
-                let _ = CloseHandle(event);
-            }
-            return Err(anyhow!("SwDeviceCreate failed: {e}"));
-        }
-    };
-    // SAFETY: event is valid.
-    let wait = unsafe { WaitForSingleObject(event, 10_000) };
-    if wait != WAIT_OBJECT_0 {
-        // Timed out: leak `ctx` and leave `event` open so a late callback writes live memory.
-        // SAFETY: hsw is the handle SwDeviceCreate returned.
-        unsafe { SwDeviceClose(hsw) };
-        return Err(anyhow!(
-            "SwDeviceCreate enumeration callback never fired (10s) — PnP may be wedged"
-        ));
-    }
-    // SAFETY: the callback signalled the event, so nothing else will touch `ctx`/`event`.
-    // `ctx` came from `Box::into_raw` above and is reclaimed exactly once here; `event` is
-    // valid and no longer referenced by a pending callback.
-    let ctx = unsafe {
-        let _ = CloseHandle(event);
-        Box::from_raw(ctx)
-    };
-    if ctx.result.is_err() {
-        // SAFETY: hsw is the handle SwDeviceCreate returned.
-        unsafe { SwDeviceClose(hsw) };
-        return Err(anyhow!(
-            "SwDeviceCreate enumeration failed: {:?}",
-            ctx.result
-        ));
-    }
-    Ok((hsw, ctx.instance_id()))
+    sw_device_create(&SwDeviceSpec {
+        enumerator: p.enumerator,
+        instance: p.instance,
+        // INF id FIRST → the INF binds our UMDF driver on it.
+        hardware_ids: &[p.hwid, usb_rev.as_str(), usb.as_str()],
+        // A `USB\` token first → native bus-type detection resolves USB.
+        compatible_ids: &[
+            usb.as_str(),
+            "USB\\Class_03&SubClass_00&Prot_00",
+            "USB\\Class_03",
+        ],
+        description: p.description,
+        location: &p.container_index.to_string(),
+        container: GUID::from_values(
+            p.container_tag,
+            0x0000,
+            0x0000,
+            [0, 0, 0, 0, 0, 0, 0, p.container_index],
+        ),
+    })
 }
 
 /// Identity a [`DsWinPad`] enumerates with. DualSense and Edge share the transport and report
@@ -475,22 +353,11 @@ impl DsWinPad {
     pub(super) fn open(index: u8, id: &WinDsIdentity) -> Result<DsWinPad> {
         let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        let base = channel.data_base();
-        // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range.
-        unsafe {
-            *base.add(OFF_DEVTYPE) = id.devtype;
-            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            // Stamped before magic so the driver sees it on attach. `2` = host drains the v2.2
-            // long ring; a v2.1 driver treats it as boolean and stays on 8-slot math. Drain
-            // follows the driver's `out_ring_len` echo.
-            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
-            std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; DS_INPUT_REPORT_LEN], {
-                let mut r = [0u8; DS_INPUT_REPORT_LEN];
-                serialize_state(&mut r, &DsState::neutral(), 0, 0);
-                r
-            });
-            std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
-        }
+        let mut neutral = [0u8; DS_INPUT_REPORT_LEN];
+        serialize_state(&mut neutral, &DsState::neutral(), 0, 0);
+        // `2` = host drains the v2.2 long ring; a v2.1 driver treats it as boolean and stays
+        // on 8-slot math. Drain follows the driver's `out_ring_len` echo.
+        stamp_pad(channel.data(), id.devtype, index, 2, &neutral);
         let inst = format!("{}_{index}", id.instance_prefix);
         let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
             instance: &inst,
@@ -541,9 +408,7 @@ impl DsWinPad {
         self.triggers.stamp(&mut r, st.l2, st.r2);
         // No driver-polled change-detect on this plane; the timer copies the whole slot. Seqlock:
         // see `publish_input`.
-        // SAFETY: `data_base()` points at a live PAD_SHM_SIZE-byte section and `r` is the 64-byte
-        // input report.
-        unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };
+        publish_input(self.channel.data(), &mut self.input_gen, &r);
     }
 
     /// Drain the output plane oldest → newest so a stop-then-LED burst yields both, never just
@@ -551,13 +416,11 @@ impl DsWinPad {
     pub(super) fn service(&mut self, pad: u8) -> DsFeedback {
         self.channel.pump();
         let mut fb = DsFeedback::default();
-        // SAFETY: the channel's section is live and SHM_SIZE bytes.
-        let (proto, rev) = unsafe { driver_marks(self.channel.data_base()) };
+        let (proto, rev) = driver_marks(self.channel.data());
         self.attach.observe_pad(proto, rev);
-        let base = self.channel.data_base();
-        fb.resync = self
-            .drain
-            .drain(base, |bytes| parse_ds_output(pad, bytes, &mut fb));
+        fb.resync = self.drain.drain(self.channel.data(), |bytes| {
+            parse_ds_output(pad, bytes, &mut fb)
+        });
         self.triggers.observe(&fb.hidout);
         fb
     }
@@ -655,16 +518,15 @@ impl PadProto for DsWinProto {
 pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
     let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
     let mut channel = PadChannel::create(boot_name, SHM_SIZE)?;
-    let base = channel.data_base();
     let neutral = super::steam_proto::neutral_deck_report();
-    // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range. Device-type
-    // FIRST, magic LAST — the same publish order the session pads use.
-    unsafe {
-        *base.add(OFF_DEVTYPE) = pf_driver_proto::gamepad::DEVTYPE_STEAMDECK;
-        std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-        std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; 64], neutral);
-        std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
-    }
+    // Ring version 0: the spike reads only the legacy output slot.
+    stamp_pad(
+        channel.data(),
+        pf_driver_proto::gamepad::DEVTYPE_STEAMDECK,
+        index,
+        0,
+        &neutral,
+    );
     let inst = format!("pf_deckspike_{index}");
     let (hsw, spike_instance_id) = create_swdevice(&SwDeviceProfile {
         instance: &inst,
@@ -697,20 +559,11 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
     let mut last_out_seq = 0u32;
     while std::time::Instant::now() < deadline {
         channel.pump();
-        // SAFETY: base points at SHM_SIZE bytes; OFF_OUT_SEQ is in range.
-        let seq =
-            unsafe { std::ptr::read_unaligned(channel.data_base().add(OFF_OUT_SEQ) as *const u32) };
+        let seq = channel.data().load_u32(OFF_OUT_SEQ, Ordering::Relaxed);
         if seq != last_out_seq {
             last_out_seq = seq;
             let mut out = [0u8; 16];
-            // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    channel.data_base().add(OFF_OUTPUT),
-                    out.as_mut_ptr(),
-                    16,
-                )
-            };
+            channel.data().read_bytes(OFF_OUTPUT, &mut out);
             println!("  output report from a client (Steam?): {out:02x?}");
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -730,10 +583,6 @@ mod drain_tests {
 
     fn section() -> Vec<u32> {
         vec![0u32; SHM_SIZE / 4]
-    }
-
-    fn base(buf: &mut [u32]) -> *mut u8 {
-        buf.as_mut_ptr() as *mut u8
     }
 
     /// v2.1 dual write: legacy slot + seq, then ring slot (8-slot math, no length echo), then head.
@@ -794,6 +643,24 @@ mod drain_tests {
     }
 
     #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn section_view_refuses_a_range_past_its_end() {
+        let mut buf = [0u32; 2];
+        SectionView::over(&mut buf).write_bytes(4, &[0; 8]);
+    }
+
+    /// An oversize report is cut to the 64-byte slot, never spilling into `out_seq`.
+    #[test]
+    fn publish_input_stays_inside_the_input_slot() {
+        let mut buf = section();
+        let mut generation = 0;
+        publish_input(SectionView::over(&mut buf), &mut generation, &[0xAB; 80]);
+        assert_eq!(generation, 2);
+        assert_eq!(read32(&mut buf, OFF_OUT_SEQ), 0);
+        assert_eq!(bytes_mut(&mut buf)[OFF_INPUT + 63], 0xAB);
+    }
+
+    #[test]
     fn byte_view_stays_within_the_source_slice() {
         let mut buf = [0u32; 2];
         assert_eq!(bytes_mut(&mut buf).len(), 2 * size_of::<u32>());
@@ -809,7 +676,7 @@ mod drain_tests {
 
     fn collect(d: &mut OutputDrain, buf: &mut [u32]) -> (Vec<Vec<u8>>, bool) {
         let mut got = Vec::new();
-        let resync = d.drain(base(buf), |b| got.push(b.to_vec()));
+        let resync = d.drain(SectionView::over(buf), |b| got.push(b.to_vec()));
         (got, resync)
     }
 
@@ -822,7 +689,7 @@ mod drain_tests {
         publish_tagged(&mut buf, &[0x01, 0x87, 0x03, 0x09, 0x00, 0x00]);
         let mut got = Vec::new();
         let mut d = OutputDrain::new();
-        d.drain_tagged(base(&mut buf), |bytes, feature| {
+        d.drain_tagged(SectionView::over(&mut buf), |bytes, feature| {
             got.push((bytes.to_vec(), feature));
         });
         assert_eq!(got[0], (vec![0x80, 0x00, 0xFF], false));

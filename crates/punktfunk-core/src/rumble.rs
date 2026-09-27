@@ -1,7 +1,9 @@
 //! Shared rumble policy: seq-gated wire updates in, effective actuator commands out.
 //!
 //! Embedders never see a TTL, a deadline, or a staleness constant. A platform
-//! keeps *how to vibrate* plus [`ActuatorQuirks`]. Priority: lease-expiry zero,
+//! keeps *how to vibrate* plus [`ActuatorQuirks`]. Native clients poll
+//! [`RumbleShared`] from one thread; the browser drives [`RumbleEngine`] from
+//! its frame loop. Priority: lease-expiry zero,
 //! legacy-staleness zero, current level on every wire update (renewals re-emit
 //! so duration APIs re-arm), then quirk keepalives. Close drains one zero per
 //! still-buzzing pad.
@@ -11,6 +13,7 @@
 //! `design/trigger-rumble-plane.md`.
 
 use crate::input::MAX_PADS;
+#[cfg(feature = "quic")]
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -157,8 +160,14 @@ impl PadState {
 
 /// Per-connection policy. `now` is injected so tests pin time; [`RumbleShared`]
 /// owns the real clock.
-pub(crate) struct RumbleEngine {
+pub struct RumbleEngine {
     pads: [PadState; MAX_PADS],
+}
+
+impl Default for RumbleEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn merge_wake(wake: &mut Option<Instant>, t: Instant) {
@@ -166,7 +175,7 @@ fn merge_wake(wake: &mut Option<Instant>, t: Instant) {
 }
 
 impl RumbleEngine {
-    pub(crate) fn new() -> RumbleEngine {
+    pub fn new() -> RumbleEngine {
         RumbleEngine {
             pads: [PadState::NEUTRAL; MAX_PADS],
         }
@@ -178,7 +187,7 @@ impl RumbleEngine {
     /// absent field on a level-triggered plane means off now, never keep.
     // Grouping the four levels would add a hop at the two call sites for nothing.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn wire_update(
+    pub fn wire_update(
         &mut self,
         now: Instant,
         pad: u16,
@@ -213,7 +222,7 @@ impl RumbleEngine {
         }
     }
 
-    pub(crate) fn set_quirks(&mut self, pad: u16, q: ActuatorQuirks) {
+    pub fn set_quirks(&mut self, pad: u16, q: ActuatorQuirks) {
         if let Some(p) = self.pads.get_mut(pad as usize) {
             p.quirks = q;
             // A stale kick from the old cadence is harmless; clearing the
@@ -226,7 +235,7 @@ impl RumbleEngine {
 
     /// Next due command at `now`, plus the earliest future wake. `None` wake
     /// means wait for wire input.
-    pub(crate) fn poll(&mut self, now: Instant) -> (Option<RumbleCommand>, Option<Instant>) {
+    pub fn poll(&mut self, now: Instant) -> (Option<RumbleCommand>, Option<Instant>) {
         let mut wake: Option<Instant> = None;
         for i in 0..MAX_PADS {
             let p = &mut self.pads[i];
@@ -281,7 +290,7 @@ impl RumbleEngine {
     }
 
     /// One stop per still-buzzing pad. Call until `None`.
-    pub(crate) fn close_drain(&mut self) -> Option<RumbleCommand> {
+    pub fn close_drain(&mut self) -> Option<RumbleCommand> {
         for i in 0..MAX_PADS {
             if self.pads[i].level != SILENT {
                 return Some(self.pads[i].silence(i as u16));
@@ -292,19 +301,23 @@ impl RumbleEngine {
 }
 
 /// Engine behind a lock + condvar. Demux feeds; one embedder thread polls.
+#[cfg(feature = "quic")]
 pub(crate) struct RumbleShared {
     inner: Mutex<SharedState>,
     cv: Condvar,
 }
 
+#[cfg(feature = "quic")]
 struct SharedState {
     engine: RumbleEngine,
     closed: bool,
 }
 
 /// Held by the datagram demux. Drop sets `closed` and wakes the poller.
+#[cfg(feature = "quic")]
 pub(crate) struct RumbleFeed(pub(crate) std::sync::Arc<RumbleShared>);
 
+#[cfg(feature = "quic")]
 impl RumbleFeed {
     pub(crate) fn wire_update(
         &self,
@@ -323,6 +336,7 @@ impl RumbleFeed {
     }
 }
 
+#[cfg(feature = "quic")]
 impl Drop for RumbleFeed {
     fn drop(&mut self) {
         self.0.inner.lock().unwrap().closed = true;
@@ -330,6 +344,7 @@ impl Drop for RumbleFeed {
     }
 }
 
+#[cfg(feature = "quic")]
 impl RumbleShared {
     pub(crate) fn new() -> RumbleShared {
         RumbleShared {
@@ -378,6 +393,7 @@ impl RumbleShared {
 
 /// The connection ended and every close-drain stop has been delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "quic")]
 pub(crate) struct Closed;
 
 #[cfg(test)]
@@ -579,6 +595,7 @@ mod tests {
         assert_eq!(e.poll(t).0, None);
     }
 
+    #[cfg(feature = "quic")]
     #[test]
     fn shared_close_delivers_drain_zero_then_closed() {
         let shared = std::sync::Arc::new(RumbleShared::new());

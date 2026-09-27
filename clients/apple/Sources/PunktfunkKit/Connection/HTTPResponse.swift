@@ -46,8 +46,16 @@ enum HTTPResponseParser {
     /// Also nil when the response carries no framing header at all, since then the body runs
     /// until the peer closes and has no knowable length — a connection that answers that way
     /// cannot be reused.
+    ///
+    /// Reads `raw` in place: this runs once per receive, and a copy each time is quadratic in
+    /// the size of the response.
     static func messageLength(in raw: Data) throws -> Int? {
-        let b = [UInt8](raw)
+        try raw.withUnsafeBytes { try messageLength($0.bindMemory(to: UInt8.self)) }
+    }
+
+    private typealias Bytes = UnsafeBufferPointer<UInt8>
+
+    private static func messageLength(_ b: Bytes) throws -> Int? {
         guard let head = try parseHead(b) else { return nil }
         if head.headers["transfer-encoding"]?.lowercased().contains("chunked") == true {
             return try chunkedEnd(b, from: head.bodyStart)
@@ -70,9 +78,12 @@ enum HTTPResponseParser {
     /// Parse one complete response. `raw` must hold exactly one message (use `messageLength` to
     /// slice it) or, for a close-framed response, everything read up to EOF.
     static func parse(_ raw: Data) throws -> HTTPResponse {
-        let b = [UInt8](raw)
+        try raw.withUnsafeBytes { try parse($0.bindMemory(to: UInt8.self)) }
+    }
+
+    private static func parse(_ b: Bytes) throws -> HTTPResponse {
         guard let head = try parseHead(b) else { throw HTTPParseError.truncated }
-        let rest = Data(b[head.bodyStart...])
+        let rest = Bytes(rebasing: b[head.bodyStart...])
         let body: Data
         if head.headers["transfer-encoding"]?.lowercased().contains("chunked") == true {
             body = try decodeChunked(rest)
@@ -81,9 +92,9 @@ enum HTTPResponseParser {
                 throw HTTPParseError.malformedHeader
             }
             guard rest.count >= length else { throw HTTPParseError.truncated }
-            body = rest.prefix(length)
+            body = Data(buffer: Bytes(rebasing: rest[..<length]))
         } else {
-            body = rest // framed by connection close: what we read is what there is
+            body = Data(buffer: rest) // framed by connection close: what we read is all there is
         }
         return HTTPResponse(status: head.status, headers: head.headers, body: body)
     }
@@ -96,7 +107,7 @@ enum HTTPResponseParser {
     }
 
     /// Status line + header block, or nil if the block hasn't fully arrived.
-    private static func parseHead(_ b: [UInt8]) throws -> Head? {
+    private static func parseHead(_ b: Bytes) throws -> Head? {
         guard let headEnd = findHeaderEnd(b) else { return nil }
         let text = String(decoding: b[0..<headEnd], as: UTF8.self)
         var lines = text.components(separatedBy: "\r\n")
@@ -127,7 +138,7 @@ enum HTTPResponseParser {
     }
 
     /// Index just past the CRLFCRLF that ends the header block.
-    private static func findHeaderEnd(_ b: [UInt8]) -> Int? {
+    private static func findHeaderEnd(_ b: Bytes) -> Int? {
         guard b.count >= 4 else { return nil }
         for i in 0...(b.count - 4) where b[i] == 0x0D && b[i + 1] == 0x0A
             && b[i + 2] == 0x0D && b[i + 3] == 0x0A {
@@ -138,7 +149,7 @@ enum HTTPResponseParser {
 
     /// Offset just past a complete chunked body (terminal chunk plus any trailers), or nil if it
     /// hasn't all arrived.
-    private static func chunkedEnd(_ b: [UInt8], from start: Int) throws -> Int? {
+    private static func chunkedEnd(_ b: Bytes, from start: Int) throws -> Int? {
         var i = start
         while true {
             guard let lineEnd = findCRLF(b, from: i) else { return nil }
@@ -161,7 +172,10 @@ enum HTTPResponseParser {
     /// `Transfer-Encoding: chunked` decoding. hyper streams the art proxy this way, so this is a
     /// live path, not defensive dead code.
     static func decodeChunked(_ data: Data) throws -> Data {
-        let b = [UInt8](data)
+        try data.withUnsafeBytes { try decodeChunked($0.bindMemory(to: UInt8.self)) }
+    }
+
+    private static func decodeChunked(_ b: Bytes) throws -> Data {
         var i = 0
         var out = Data()
         while true {
@@ -170,7 +184,7 @@ enum HTTPResponseParser {
             i = lineEnd + 2
             if size == 0 { return out } // terminal chunk; trailers are ignored
             guard spanFits(i, size, within: b.count) else { throw HTTPParseError.malformedChunk }
-            out.append(contentsOf: b[i..<(i + size)])
+            out.append(Bytes(rebasing: b[i..<(i + size)]))
             i += size
             guard i + 1 < b.count, b[i] == 0x0D, b[i + 1] == 0x0A else {
                 throw HTTPParseError.malformedChunk
@@ -188,7 +202,7 @@ enum HTTPResponseParser {
     }
 
     /// "1a" or "1a;ext=value" → 26. Nil if it isn't a hex size.
-    private static func chunkSize(_ b: [UInt8], _ from: Int, _ to: Int) -> Int? {
+    private static func chunkSize(_ b: Bytes, _ from: Int, _ to: Int) -> Int? {
         let field = String(decoding: b[from..<to], as: UTF8.self)
             .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)[0]
             .trimmingCharacters(in: .whitespaces)
@@ -196,7 +210,7 @@ enum HTTPResponseParser {
         return size
     }
 
-    private static func findCRLF(_ b: [UInt8], from: Int) -> Int? {
+    private static func findCRLF(_ b: Bytes, from: Int) -> Int? {
         guard from >= 0, b.count >= 2 else { return nil }
         var i = from
         while i + 1 < b.count {

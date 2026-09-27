@@ -11,11 +11,29 @@
 //! a parked waiter. 250 ms wait cap: ids complete in submission order (a
 //! MAILBOX-replaced id completes with the present that replaced it); a wait
 //! only outlives that cap when the pipeline is already wedged.
+//!
+//! `vkWaitForPresentKHR`, `vkAcquireNextImageKHR` and `vkQueuePresentKHR` each
+//! externally synchronize the swapchain. Every such call holds
+//! [`PresentTimer::swapchain_guard`]'s lock for one call of at most [`SLICE_NS`];
+//! the waiter waits in slices and lets a waiting presenter go first.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use ash::vk;
+
+/// Longest single wait on the swapchain. 1 ms bounds how long a present waits for the
+/// waiter, and a driver with millisecond timeouts still blocks rather than spins.
+pub(crate) const SLICE_NS: u64 = 1_000_000;
+
+/// Host sync for the swapchain between the presenter thread and the waiter.
+#[derive(Default)]
+struct SwapchainSync {
+    lock: Mutex<()>,
+    /// The presenter is blocked on `lock`; the waiter backs off before its next slice.
+    presenter_waiting: AtomicBool,
+}
 
 pub(crate) struct PresentedSample {
     /// Capture stamp (host clock) — the e2e latency anchor.
@@ -53,7 +71,35 @@ pub(crate) struct PresentTimer {
     /// After each wait. The run loop installs an SDL wake so a gate reopen
     /// never waits out the event-loop timeout.
     wake: WakeSlot,
+    sync: Arc<SwapchainSync>,
     join: Option<std::thread::JoinHandle<()>>,
+}
+
+/// `vkWaitForPresentKHR` for up to 250 ms in [`SLICE_NS`] calls, each under the swapchain
+/// lock. 250 ms: ids complete in order; longer means the pipeline is wedged.
+fn wait_sliced(
+    wait_d: &ash::khr::present_wait::Device,
+    sync: &SwapchainSync,
+    job: &Job,
+) -> ash::prelude::VkResult<()> {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        // Sleep, not spin: a boosted waiter could starve the presenter on a shared core.
+        while sync.presenter_waiting.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        let r = {
+            let _swapchain = sync.lock.lock().unwrap_or_else(PoisonError::into_inner);
+            // SAFETY: `job.swapchain` stays live for this call — enqueue runs while the
+            // swapchain exists, and `drain`/Drop wait it out first. The lock above is the
+            // swapchain's host sync against the presenter's acquire and present.
+            unsafe { wait_d.wait_for_present(job.swapchain, job.present_id, SLICE_NS) }
+        };
+        match r {
+            Err(vk::Result::TIMEOUT) if Instant::now() < deadline => {}
+            r => return r,
+        }
+    }
 }
 
 impl PresentTimer {
@@ -62,7 +108,9 @@ impl PresentTimer {
         let pending = Arc::new(AtomicUsize::new(0));
         let results = Arc::new(Mutex::new(Vec::with_capacity(256)));
         let wake: WakeSlot = Arc::new(Mutex::new(None));
-        let (pending_t, results_t, wake_t) = (pending.clone(), results.clone(), wake.clone());
+        let sync = Arc::new(SwapchainSync::default());
+        let (pending_t, results_t, wake_t, sync_t) =
+            (pending.clone(), results.clone(), wake.clone(), sync.clone());
         let join = std::thread::Builder::new()
             .name("pf-present-wait".into())
             .spawn(move || {
@@ -82,12 +130,7 @@ impl PresentTimer {
                             gpu_done_ns = pf_client_core::session::now_ns();
                         }
                     }
-                    // 250 ms: ids complete in order; longer means the pipeline is wedged.
-                    // SAFETY: `job.swapchain` stays live for this call — enqueue runs
-                    // while the swapchain exists, and `drain`/Drop wait it out first.
-                    let r = unsafe {
-                        wait_d.wait_for_present(job.swapchain, job.present_id, 250_000_000)
-                    };
+                    let r = wait_sliced(&wait_d, &sync_t, &job);
                     if r.is_ok() {
                         let displayed_ns = pf_client_core::session::now_ns();
                         results_t.lock().unwrap().push(PresentedSample {
@@ -115,8 +158,22 @@ impl PresentTimer {
             pending,
             results,
             wake,
+            sync,
             join: Some(join),
         }
+    }
+
+    /// The swapchain's host sync on the presenter thread: hold it across one acquire or
+    /// present call. Waits out at most one [`SLICE_NS`] wait of the waiter.
+    pub(crate) fn swapchain_guard(&self) -> MutexGuard<'_, ()> {
+        self.sync.presenter_waiting.store(true, Ordering::Release);
+        let guard = self
+            .sync
+            .lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.sync.presenter_waiting.store(false, Ordering::Release);
+        guard
     }
 
     pub(crate) fn set_wake(&self, cb: Box<dyn Fn() + Send>) {

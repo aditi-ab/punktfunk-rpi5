@@ -14,9 +14,9 @@
 //!
 //! [`SlotMap`] is re-exported from [`pf_vkdecode`]: `DXVA_PicEntry::Index7Bits` is a
 //! decode-surface index with the same lifetime the map already models. Construction
-//! is field-by-field from `const fn zeroed()`, never `mem::zeroed`. The only unsafe
-//! is [`dxva::as_bytes`] / [`dxva::slice_bytes`], sealed to this crate's `#[repr(C)]`
-//! PODs. Evidence: `design/client-native-decode.md`.
+//! is field-by-field from `const fn zeroed()`, never `mem::zeroed`. The crate has no
+//! `unsafe`: [`dxva::as_bytes`] / [`dxva::slice_bytes`] are `bytemuck` casts over
+//! `Pod` layouts. Evidence: `design/client-native-decode.md`.
 
 pub mod config;
 pub mod descriptors;

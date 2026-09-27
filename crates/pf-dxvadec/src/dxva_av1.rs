@@ -19,9 +19,11 @@
 //!   `uv_strengths[i]` hold `primary` in the low six bits and `secondary` in
 //!   the top two — not the separate arrays the AV1 syntax uses.
 
+use bytemuck::{Pod, Zeroable};
+
 /// `DXVA_PicEntry_AV1` — 36 bytes; global motion lives here, not on the picture.
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct PicEntryAv1 {
     /// This reference's `UpscaledWidth`, not the current frame's. AV1 lets each
     /// frame pick its own size; the driver scales motion from this pair.
@@ -67,7 +69,7 @@ impl GlobalMotionFlags {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct TilesAv1 {
     pub cols: u8,
     pub rows: u8,
@@ -89,7 +91,7 @@ impl TilesAv1 {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct LoopFilterAv1 {
     pub filter_level: [u8; 2],
     pub filter_level_u: u8,
@@ -140,7 +142,7 @@ impl LoopFilterFlagsAv1 {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct QuantizationAv1 {
     pub control_flags: u8,
     pub base_qindex: u8,
@@ -188,7 +190,7 @@ impl QuantizationFlagsAv1 {
 
 /// Strengths are packed two fields to a byte — see [`CdefStrength`].
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct CdefAv1 {
     pub control_flags: u8,
     pub y_strengths: [u8; 8],
@@ -234,7 +236,7 @@ impl CdefStrength {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct SegmentationAv1 {
     pub control_flags: u8,
     pub reserved24: [u8; 3],
@@ -301,7 +303,7 @@ impl SegmentFeatureMask {
 /// Scaling points are `[value, scaling]` pairs; AV1 syntax and Vulkan keep two
 /// parallel arrays.
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct FilmGrainAv1 {
     pub control_flags: u16,
     pub grain_seed: u16,
@@ -382,7 +384,7 @@ impl FilmGrainFlagsAv1 {
 
 /// `DXVA_PicParams_AV1` — 912 bytes, packed.
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct PicParamsAv1 {
     pub width: u32,
     pub height: u32,
@@ -534,7 +536,7 @@ impl FormatFlagsAv1 {
 /// [`Self::data_offset`] / [`Self::data_size`] cover the payload after
 /// `tile_size_minus_1`. See [`mod@crate::pack_av1`].
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct TileAv1 {
     pub data_offset: u32,
     pub data_size: u32,
@@ -544,12 +546,6 @@ pub struct TileAv1 {
     pub anchor_frame: u8,
     pub reserved8: u8,
 }
-
-// `#[repr(C, packed)]` has no padding, so every byte is initialized. Nested
-// blocks (`TilesAv1`, …) do not implement this: they are never submitted
-// alone, only as members of [`PicParamsAv1`].
-impl crate::dxva::DxvaBuffer for PicParamsAv1 {}
-impl crate::dxva::DxvaBuffer for TileAv1 {}
 
 // Sizes and offsets from `layout-probe-av1.c` against the SDK `dxva.h`.
 const _: () = {

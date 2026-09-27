@@ -18,7 +18,7 @@ use super::qos::MediaClass;
 use std::net::UdpSocket;
 use std::os::windows::io::AsRawSocket;
 use std::sync::OnceLock;
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::NetworkManagement::QoS::{
     QOSAddSocketToFlow, QOSCreateHandle, QOSRemoveSocketFromFlow, QOSSetFlow,
     QOSSetOutgoingDSCPValue, QOSTrafficTypeAudioVideo, QOSTrafficTypeVoice, QOS_NON_ADAPTIVE_FLOW,
@@ -38,12 +38,8 @@ fn qos_handle() -> Option<HANDLE> {
         let mut handle: HANDLE = std::ptr::null_mut();
         // SAFETY: both pointers are valid for the duration of the synchronous call.
         if unsafe { QOSCreateHandle(&version, &mut handle) } == 0 {
-            tracing::debug!(
-                // SAFETY: `GetLastError` takes no arguments and reads this thread's own last-error
-                // slot; it is called immediately after the failing call, before anything can reset it.
-                err = unsafe { GetLastError() },
-                "QOSCreateHandle failed — qWAVE DSCP marking unavailable"
-            );
+            let err = std::io::Error::last_os_error();
+            tracing::debug!(%err, "QOSCreateHandle failed — qWAVE DSCP marking unavailable");
             None
         } else {
             Some(handle as usize)
@@ -95,13 +91,8 @@ pub(super) fn add_media_flow(socket: &UdpSocket, class: MediaClass) -> Option<Qo
         )
     };
     if ok == 0 {
-        tracing::debug!(
-            // SAFETY: `GetLastError` takes no arguments and reads this thread's own last-error
-            // slot; it is called immediately after the failing call, before anything can reset it.
-            err = unsafe { GetLastError() },
-            ?class,
-            "QOSAddSocketToFlow failed — DSCP marking skipped"
-        );
+        let err = std::io::Error::last_os_error();
+        tracing::debug!(%err, ?class, "QOSAddSocketToFlow failed — DSCP marking skipped");
         return None;
     }
     // Guard first so an early return still removes flow membership.
@@ -126,10 +117,9 @@ pub(super) fn add_media_flow(socket: &UdpSocket, class: MediaClass) -> Option<Qo
         )
     };
     if ok == 0 {
+        let err = std::io::Error::last_os_error();
         tracing::debug!(
-            // SAFETY: `GetLastError` takes no arguments and reads this thread's own last-error
-            // slot; it is called immediately after the failing call, before anything can reset it.
-            err = unsafe { GetLastError() },
+            %err,
             ?class,
             "QOSSetFlow(OutgoingDSCPValue) refused — traffic-type default marking stands"
         );

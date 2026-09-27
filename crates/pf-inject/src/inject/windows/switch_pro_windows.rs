@@ -7,8 +7,7 @@
 //! the output ring. Pin: `dualsense_windows::tests::hwid_matches_inf`.
 
 use super::dualsense_windows::{
-    create_swdevice, driver_marks, publish_input, OutputDrain, SwDeviceProfile, OFF_DEVTYPE,
-    OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
+    create_swdevice, driver_marks, publish_input, stamp_pad, OutputDrain, SwDeviceProfile, SHM_SIZE,
 };
 use super::gamepad_raii::PadChannel;
 use super::switch_proto::{
@@ -39,19 +38,14 @@ impl SwitchWinPad {
     fn open(index: u8) -> Result<SwitchWinPad> {
         let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        let base = channel.data_base();
-        // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range.
-        unsafe {
-            *base.add(OFF_DEVTYPE) = DEVTYPE_SWITCH_PRO;
-            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            // `2` = host drains the v2.2 long ring. Before magic so attach sees it.
-            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
-            std::ptr::write_unaligned(
-                base.add(OFF_INPUT) as *mut [u8; wire::REPORT_LEN],
-                wire::neutral_report(),
-            );
-            std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
-        }
+        // `2` = host drains the v2.2 long ring.
+        stamp_pad(
+            channel.data(),
+            DEVTYPE_SWITCH_PRO,
+            index,
+            2,
+            &wire::neutral_report(),
+        );
         let inst = format!("pf_swpro_{index}");
         let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
             instance: &inst,
@@ -90,19 +84,17 @@ impl SwitchWinPad {
     /// The driver stamps the timer byte per served report, so the host's is left at zero.
     fn write_state(&mut self, st: &SwitchState) {
         let r = serialize_report_0x30(st, 0);
-        // SAFETY: `data_base()` maps a live SHM_SIZE section; `r` is the 64-byte input slot.
-        unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };
+        publish_input(self.channel.data(), &mut self.input_gen, &r);
     }
 
     /// Rumble from every `0x01` / `0x10`, player lights from subcommand `0x30`, oldest first.
     fn service(&mut self, pad: u8) -> PadFeedback {
         self.channel.pump();
-        // SAFETY: the channel's section is live and SHM_SIZE bytes.
-        let (proto, rev) = unsafe { driver_marks(self.channel.data_base()) };
+        let (proto, rev) = driver_marks(self.channel.data());
         self.attach.observe_pad(proto, rev);
         let mut fb = PadFeedback::default();
-        let base = self.channel.data_base();
-        fb.resync = self.drain.drain(base, |bytes| match parse_output(bytes) {
+        let shm = self.channel.data();
+        fb.resync = self.drain.drain(shm, |bytes| match parse_output(bytes) {
             Some(SwitchOutput::Subcmd { id, args, rumble }) => {
                 fb.rumble = Some((rumble.0, rumble.1, 0, 0));
                 if let (0x30, Some(&arg)) = (id, args.first()) {

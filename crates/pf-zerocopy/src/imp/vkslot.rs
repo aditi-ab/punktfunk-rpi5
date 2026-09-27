@@ -20,6 +20,7 @@
 use super::cuda::{self, CUdeviceptr};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
+use std::os::fd::{FromRawFd as _, OwnedFd};
 
 /// Bitmap edge clamp (px); same value as [`cuda::CURSOR_MAX`] and the capture side.
 pub const CURSOR_MAX: u32 = cuda::CURSOR_MAX;
@@ -148,6 +149,7 @@ struct Timeline {
 
 /// 28-byte push-constant block; must match `cursor_blend.comp`'s `Push`.
 #[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Push {
     pitch: u32,
     surf_w: u32,
@@ -160,7 +162,7 @@ struct Push {
 
 /// 56-byte push-constant block; must match `reframe_buf.comp`'s `Push`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct ReframePush {
     lay: u32,
     axis: u32,
@@ -419,8 +421,8 @@ impl VkSlotBlend {
     fn init_timeline(&mut self) -> Result<()> {
         // SAFETY: ash calls on the live device; CreateInfo locals outlive each
         // synchronous call. The semaphore is destroyed on every post-create
-        // failure. `import_owned_timeline_fd` takes the fd on success and
-        // closes it on failure. CUDA context is current (encoder thread).
+        // failure. The exported fd is fresh, so `OwnedFd` is its only owner.
+        // CUDA context is current (encoder thread).
         unsafe {
             let mut type_ci = vk::SemaphoreTypeCreateInfo::default()
                 .semaphore_type(vk::SemaphoreType::TIMELINE)
@@ -442,13 +444,13 @@ impl VkSlotBlend {
                     .semaphore(sem)
                     .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD),
             ) {
-                Ok(f) => f,
+                Ok(f) => OwnedFd::from_raw_fd(f),
                 Err(e) => {
                     self.device.destroy_semaphore(sem, None);
                     return Err(e).context("vkGetSemaphoreFdKHR(timeline)");
                 }
             };
-            let cuda_sem = match cuda::ExternalSemaphore::import_owned_timeline_fd(fd) {
+            let cuda_sem = match cuda::ExternalSemaphore::import_timeline_fd(fd) {
                 Ok(c) => c,
                 Err(e) => {
                     self.device.destroy_semaphore(sem, None);
@@ -617,7 +619,8 @@ impl VkSlotBlend {
         // SAFETY: `ExternalMemoryBufferCreateInfo`/`ExportMemoryAllocateInfo`
         // declare OPAQUE_FD; `MemoryDedicatedAllocateInfo` ties memory to the
         // buffer. Infos are locals outliving each call. Failure paths destroy
-        // created objects once. `import_owned_fd` adopts the fd or closes it.
+        // created objects once. The exported fd is fresh, so `OwnedFd` is its
+        // only owner.
         unsafe {
             let d = &self.device;
             let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
@@ -668,7 +671,7 @@ impl VkSlotBlend {
                     .memory(memory)
                     .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
             ) {
-                Ok(f) => f,
+                Ok(f) => OwnedFd::from_raw_fd(f),
                 Err(e) => {
                     d.free_memory(memory, None);
                     d.destroy_buffer(buffer, None);
@@ -924,8 +927,7 @@ impl VkSlotBlend {
         gy: u32,
     ) -> Result<vk::CommandBuffer> {
         // SAFETY: caller contract (`# Safety`): previous submit completed, so
-        // the command buffer is re-recordable. Single-thread owner. `bytes`
-        // reborrows `push` (`repr(C)`) for the synchronous copy.
+        // the command buffer is re-recordable. Single-thread owner.
         unsafe {
             let alloc = self
                 .slots
@@ -965,16 +967,12 @@ impl VkSlotBlend {
                 &[alloc.desc],
                 &[],
             );
-            let bytes = std::slice::from_raw_parts(
-                (push as *const Push) as *const u8,
-                std::mem::size_of::<Push>(),
-            );
             d.cmd_push_constants(
                 cmd,
                 self.pipe_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
-                bytes,
+                bytemuck::bytes_of(push),
             );
             d.cmd_dispatch(cmd, gx.max(1), gy.max(1), 1);
             // Release shader writes for the downstream CUDA/NVENC read.
@@ -1156,7 +1154,7 @@ impl VkSlotBlend {
             .cmd;
         // SAFETY: single-thread owner. `dst`'s previous submit completed (fence-waited blend
         // or reframe; reframing sessions never submit ordered). Every info and slice is a
-        // local outliving its synchronous call; `bytes` reborrows a `repr(C)` push block.
+        // local outliving its synchronous call.
         // Shader reads and writes stay inside the slots by `reframe_passes`' geometry.
         unsafe {
             let d = &self.device;
@@ -1188,16 +1186,12 @@ impl VkSlotBlend {
                 &[],
             );
             for (push, gx, gy) in &passes {
-                let bytes = std::slice::from_raw_parts(
-                    (push as *const ReframePush) as *const u8,
-                    std::mem::size_of::<ReframePush>(),
-                );
                 d.cmd_push_constants(
                     cmd,
                     stage.pipe_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    bytes,
+                    bytemuck::bytes_of(push),
                 );
                 d.cmd_dispatch(cmd, (*gx).max(1), (*gy).max(1), 1);
                 // Each pass reads what the one before wrote. Without a barrier between them
@@ -1659,7 +1653,9 @@ mod tests {
                 rest[..plane].copy_from_slice(y_plane);
                 rest[plane..2 * plane].copy_from_slice(y_plane);
             }
-            cuda::write_plane_from_host(src.ptr, src.pitch, &bytes, src.pitch, rows)
+            // SAFETY: `src` is the live staging slot allocated above, `rows` rows of `pitch`;
+            // the test made the shared context current.
+            unsafe { cuda::write_plane_from_host(src.ptr, src.pitch, &bytes, src.pitch, rows) }
                 .expect("upload the staging slot");
             vk.reframe(&src, &dst, fmt, crop, out).expect("reframe");
             let got =

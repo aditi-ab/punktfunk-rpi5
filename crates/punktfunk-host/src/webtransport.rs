@@ -217,12 +217,16 @@ pub(crate) async fn serve(
         // against a hash the peer never saw.
         let cert_hash = unhex32(&publish.cert_hash)
             .context("the minted certificate hash is not 32 hex bytes")?;
-        let config = ServerConfig::builder()
-            .with_bind_address(plane.bind)
-            .with_identity(identity)
-            // A browser tab that is throttled in the background must not look like a dead peer.
-            .keep_alive_interval(Some(Duration::from_secs(3)))
-            .build();
+        // Windows leaves an IPv6 socket v6-only, so `[::]` alone never hears an IPv4 browser.
+        let config = match plane.bind {
+            SocketAddr::V6(v6) => ServerConfig::builder()
+                .with_bind_address_v6(v6, wtransport::config::Ipv6DualStackConfig::Allow),
+            v4 => ServerConfig::builder().with_bind_address(v4),
+        }
+        .with_identity(identity)
+        // A browser tab that is throttled in the background must not look like a dead peer.
+        .keep_alive_interval(Some(Duration::from_secs(3)))
+        .build();
         // Bind first, publish second. The other order leaves the route advertising a hash for a
         // plane that never came up, which reads as the API lying.
         let endpoint = match Endpoint::server(config).context("bind the WebTransport endpoint") {
@@ -351,11 +355,12 @@ async fn session(
     // Slot after the handshake, as the native plane does: a full host still accepts, so the
     // browser sees a live path (keep-alive) instead of a silent dial timeout.
     let permit = sem
+        .clone()
         .acquire_owned()
         .await
         .expect("session semaphore is never closed");
     let peer = connection.remote_address();
-    match session::run(connection.clone(), serving.clone(), permit).await {
+    match session::run(connection.clone(), serving.clone(), permit, sem).await {
         Ok(crate::native::Served::Session) => tracing::info!(%peer, "browser session complete"),
         Ok(crate::native::Served::ProbeClose) => {}
         Err(e) => {
@@ -383,7 +388,7 @@ async fn session(
 
 /// Say why on a fresh unidirectional stream, then give the browser a moment to read it. The
 /// close that follows carries no retransmit, so the wait is what makes the message arrive.
-async fn refuse(connection: &wtransport::Connection, code: u32, reason: &str) {
+pub(crate) async fn refuse(connection: &wtransport::Connection, code: u32, reason: &str) {
     let msg = punktfunk_core::quic::Refused {
         code,
         reason: reason.to_string(),

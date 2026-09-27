@@ -253,7 +253,8 @@ internal fun ConnectGrid(
                     Spacer(Modifier.height(12.dp))
                     SectionLabel("Discovered on the network")
                 }
-                items(discoveredUnsaved, key = { "disc-${it.host}-${it.port}" }) { dh ->
+                // The advert's instance key: two same-named hosts can merge onto one address.
+                items(discoveredUnsaved, key = { "disc-${it.key}" }) { dh ->
                     HostCard(
                         name = dh.name,
                         address = "${dh.host}:${dh.port}",

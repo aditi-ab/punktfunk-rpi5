@@ -293,14 +293,15 @@ pub fn codec_from_wire(codec: u32) -> Option<Codec> {
 /// private instance wants none of them. The loader-wide knob needs a 1.3.234+ loader; each
 /// manifest's own `disable_environment` works on any.
 ///
-/// Call from `driver_entry` only. Mutating the environment is unsound once other threads run,
-/// and the encode thread is exactly the wrong place for it; at load there is no other thread.
+/// Call from `driver_entry`, before the first encoder opens: the loader reads these when it
+/// creates an instance. WUDFHost is our own process (`ProcessSharingDisabled`), so the variables
+/// reach nobody else.
 pub fn disable_implicit_vulkan_layers() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        // SAFETY: called from `driver_entry`, before this driver has started a thread, so no
-        // reader can race the write. WUDFHost is our own process (`ProcessSharingDisabled`), so
-        // the variables reach nobody else.
+        // SAFETY: std documents `set_var` as always safe on Windows: the process environment
+        // sits behind the OS's own lock, so the framework threads WUDFHost already runs cannot
+        // race the write.
         unsafe {
             for (k, v) in [
                 ("VK_LOADER_LAYERS_DISABLE", "~implicit~"),

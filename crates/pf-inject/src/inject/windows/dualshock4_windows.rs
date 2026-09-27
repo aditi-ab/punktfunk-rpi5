@@ -9,8 +9,8 @@
 
 use super::dualsense_proto::DsState;
 use super::dualsense_windows::{
-    create_swdevice, driver_marks, publish_input, OutputDrain, SwDeviceProfile, DEVTYPE_DUALSHOCK4,
-    OFF_DEVTYPE, OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
+    create_swdevice, driver_marks, publish_input, stamp_pad, OutputDrain, SwDeviceProfile,
+    DEVTYPE_DUALSHOCK4, SHM_SIZE,
 };
 use super::dualshock4_proto::{
     parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H, DS4_TOUCH_W,
@@ -42,20 +42,10 @@ impl Ds4WinPad {
     fn open(index: u8) -> Result<Ds4WinPad> {
         let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        let base = channel.data_base();
-        // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range.
-        unsafe {
-            *base.add(OFF_DEVTYPE) = DEVTYPE_DUALSHOCK4;
-            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            // `2` = host drains the v2.2 long ring. Before magic so attach sees it.
-            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
-            std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; DS4_INPUT_REPORT_LEN], {
-                let mut r = [0u8; DS4_INPUT_REPORT_LEN];
-                serialize_state(&mut r, &DsState::neutral(), 0, 0);
-                r
-            });
-            std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
-        }
+        let mut neutral = [0u8; DS4_INPUT_REPORT_LEN];
+        serialize_state(&mut neutral, &DsState::neutral(), 0, 0);
+        // `2` = host drains the v2.2 long ring.
+        stamp_pad(channel.data(), DEVTYPE_DUALSHOCK4, index, 2, &neutral);
         let inst = format!("pf_ds4_{index}");
         let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
             instance: &inst,
@@ -100,22 +90,18 @@ impl Ds4WinPad {
         let ts = self.clock.ds4_ticks(Instant::now());
         let mut r = [0u8; DS4_INPUT_REPORT_LEN];
         serialize_state(&mut r, st, self.counter, ts);
-        // SAFETY: `data_base()` maps a live SHM_SIZE section; `r` is the 64-byte
-        // input slot. Seqlock is `publish_input`.
-        unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };
+        publish_input(self.channel.data(), &mut self.input_gen, &r);
     }
 
     /// Drain every new `0x05` oldest-first so a stop-then-LED burst keeps both.
     fn service(&mut self) -> Ds4Feedback {
         self.channel.pump();
         let mut fb = Ds4Feedback::default();
-        // SAFETY: the channel's section is live and SHM_SIZE bytes.
-        let (proto, rev) = unsafe { driver_marks(self.channel.data_base()) };
+        let (proto, rev) = driver_marks(self.channel.data());
         self.attach.observe_pad(proto, rev);
-        let base = self.channel.data_base();
-        fb.resync = self
-            .drain
-            .drain(base, |bytes| parse_ds4_output(bytes, &mut fb));
+        fb.resync = self.drain.drain(self.channel.data(), |bytes| {
+            parse_ds4_output(bytes, &mut fb)
+        });
         fb
     }
 }

@@ -57,6 +57,9 @@ describe("refusedRoot", () => {
 			"/run/user/1000",
 			"/home/u/.ssh",
 			"/home/u/.gnupg/private-keys-v1.d",
+			// A parent of punktfunk's config brings every plugin's token with it.
+			"/home/u/.config",
+			"/home/u/.config/",
 			"/home/u/.config/punktfunk",
 			"/home/u/.config/punktfunk/plugin-run",
 			"/home/u/.config/punktfunk-extra",
@@ -69,6 +72,7 @@ describe("refusedRoot", () => {
 	test("lets launcher, media and temp paths through", () => {
 		for (const p of [
 			"/home/u/.local/share/Steam",
+			"/home/u/.config/retroarch",
 			"/home/u/Emu",
 			"/run/media/u/SD",
 			"/mnt/games1",

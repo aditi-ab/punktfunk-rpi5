@@ -194,7 +194,7 @@ public final class ClipboardSync: NSObject {
     }
 
     private func drain() {
-        var lastAnnounceCheck = Date.distantPast
+        var lastAnnounceCheck = -Double.infinity // monotonic: a clock step can't stall the poll
         while !stopped.isRaised {
             // Drain events (bounded burst so a chatty host can't starve the announce poll).
             var drained = 0
@@ -210,8 +210,8 @@ public final class ClipboardSync: NSObject {
                 drained += 1
                 handle(ev)
             }
-            let now = Date()
-            if now.timeIntervalSince(lastAnnounceCheck) >= Self.announceInterval
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - lastAnnounceCheck >= Self.announceInterval
                 || checkNow.take()
             {
                 lastAnnounceCheck = now
@@ -272,7 +272,7 @@ public final class ClipboardSync: NSObject {
             fetchLock.unlock()
             if overrun {
                 connection.clipCancel(id: xferId)
-                finished?.completion(Data())
+                finished?.completion(nil)
                 return
             }
             // Outside the lock: a completion may start the next fetch (or wake a thread that will).

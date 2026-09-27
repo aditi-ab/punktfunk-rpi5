@@ -276,7 +276,7 @@ public enum LibraryClient {
     /// presents `identity` (its persistent cert/key PEM — the same identity the host paired over
     /// QUIC), and the host's self-signed cert is pinned by `hostFingerprint` (SHA-256 of its DER,
     /// the value the client already trusts). No bearer token — a paired client is authorized by
-    /// its certificate. `hostFingerprint == nil` ⇒ TOFU (accept the presented host cert).
+    /// its certificate. `hostFingerprint == nil` throws `unauthorized`: an unpaired host is never trusted.
     public static func fetch(
         address: String,
         port: UInt16 = punktfunkDefaultMgmtPort,
@@ -461,6 +461,12 @@ public enum LibraryClient {
         }
     }
 
+    /// Build and cache the TLS identity ahead of the first request. Blocking Keychain work:
+    /// call off the main actor, so the callers on it find the pair built.
+    public static func warmIdentity(_ identity: ClientIdentity) {
+        _ = try? ClientTLS.makeIdentity(certPEM: identity.certPEM, keyPEM: identity.keyPEM)
+    }
+
     /// One request against the host — a GET, or a POST when `body` is given — with transport
     /// failures mapped onto `LibraryError`.
     static func send(
@@ -480,6 +486,8 @@ public enum LibraryClient {
                 identity: identity, pinnedHostFingerprint: hostFingerprint)
         } catch MgmtTransportError.pinMismatch {
             throw LibraryError.pinMismatch
+        } catch MgmtTransportError.unpinned {
+            throw LibraryError.unauthorized
         } catch MgmtTransportError.timedOut {
             throw LibraryError.unreachable("timed out")
         } catch let error as MgmtTransportError {
@@ -519,6 +527,48 @@ public protocol LibraryArtSource: Sendable {
     func close() async
 }
 
+/// One fetch per key, shared by everyone who asks while it flies, and cancelled once the last
+/// of them is. A tile scrolled past gives up its fetch; a tile still on screen keeps it.
+final class ArtFlights: @unchecked Sendable {
+    private struct Flight {
+        let task: Task<Data, Error>
+        var waiters: Int
+    }
+
+    private let lock = NSLock()
+    private var flights: [String: Flight] = [:]
+
+    func value(
+        for key: String, fetch: @escaping @Sendable () async throws -> Data
+    ) async throws -> Data {
+        let task: Task<Data, Error> = lock.withLock {
+            if var flying = flights[key] {
+                flying.waiters += 1
+                flights[key] = flying
+                return flying.task
+            }
+            let task = Task.detached(operation: fetch)
+            flights[key] = Flight(task: task, waiters: 1)
+            return task
+        }
+        defer { lock.withLock { if flights[key]?.task == task { flights[key] = nil } } }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            lock.withLock {
+                guard var flying = flights[key], flying.task == task else { return }
+                flying.waiters -= 1
+                if flying.waiters > 0 {
+                    flights[key] = flying
+                } else {
+                    flights[key] = nil
+                    task.cancel()
+                }
+            }
+        }
+    }
+}
+
 /// Loads cover art for the library UI, routing each URL to the transport that suits its origin.
 ///
 /// A `GameEntry`'s art candidates mix two very different things: the host's own art proxy
@@ -538,16 +588,19 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
     private let port: UInt16
     private let identity: SecIdentity
     private let hostFingerprint: Data?
-    /// Third-party origins only. No delegate: these are ordinary public HTTPS URLs and get the
-    /// system's normal certificate validation. No URLCache either — `ArtCache` owns the disk
-    /// persistence, so a second unmanaged copy underneath it would be pure waste.
-    private let cdn: URLSession
+    /// Third-party origins only, with the system's normal certificate validation and no URLCache
+    /// (`ArtCache` owns persistence). Process-wide and never invalidated: a fetch that outlives
+    /// `close()` would otherwise create a task on a dead session, which raises.
+    private static let cdn: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        return URLSession(configuration: config)
+    }()
     /// nil when the caches directory is unavailable — then we simply always fetch.
-    private let cache = ArtCache.standard()
+    private var cache: ArtCache? { ArtCache.shared }
     /// One fetch per cache key at a time — the same entry shown in two sections must not fetch
     /// its art twice on a cold cache. Failures are deliberately not remembered.
-    private let inflightLock = NSLock()
-    private var inflight: [String: Task<Data, Error>] = [:]
+    private let flights = ArtFlights()
 
     public init(
         address: String,
@@ -560,9 +613,6 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         self.port = port
         self.identity = try LibraryClient.clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
         self.hostFingerprint = hostFingerprint
-        let config = URLSessionConfiguration.default
-        config.urlCache = nil
-        self.cdn = URLSession(configuration: config)
     }
 
     /// Image bytes for one art URL, cached on disk after the first fetch. A miss propagates the
@@ -573,14 +623,7 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         if url.scheme?.lowercased() == "data" { return try Self.inlineBytes(url) }
         let key = Self.cacheKey(for: url, hostAddress: address, hostPort: port, pin: hostFingerprint)
         if let cache, let cached = await cache.data(forKey: key) { return cached }
-        let task: Task<Data, Error> = inflightLock.withLock {
-            if let flying = inflight[key] { return flying }
-            let flying = Task.detached { try await self.fetch(url) }
-            inflight[key] = flying
-            return flying
-        }
-        defer { inflightLock.withLock { inflight[key] = nil } }
-        let fetched = try await task.value
+        let fetched = try await flights.value(for: key) { try await self.fetch(url) }
         if let cache { await cache.store(fetched, forKey: key) }
         return fetched
     }
@@ -596,10 +639,9 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         return data
     }
 
-    /// Release this host's pooled connections and the CDN session — call when the library screen
-    /// goes away, so we don't sit on open TLS sockets the user is finished with.
+    /// Release this host's pooled connections — call when the library screen goes away, so we
+    /// don't sit on open TLS sockets the user is finished with.
     public func close() async {
-        cdn.finishTasksAndInvalidate()
         await MgmtConnectionPool.shared.closeAll(
             matching: "\(MgmtTransport.unbracketed(address)):\(port):")
     }
@@ -636,20 +678,29 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
             if url.scheme?.lowercased() == "data" { return try Self.inlineBytes(url) }
             guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http"
             else { throw LibraryError.badArtURL }
-            let (bytes, response) = try await cdn.bytes(from: url)
+            let (bytes, response) = try await Self.cdn.bytes(from: url)
             guard let http = response as? HTTPURLResponse else { throw LibraryError.badArtURL }
             guard (200..<300).contains(http.statusCode) else {
                 throw LibraryError.http(http.statusCode)
             }
-            // Bound the body WHILE it streams — the ceiling is decorative if every byte is in
-            // memory already when it's checked.
-            var data = Data()
-            for try await byte in bytes {
-                data.append(byte)
-                if data.count > MgmtTransport.maxResponseBytes {
-                    throw MgmtTransportError.tooLarge
-                }
+            // Bound the body WHILE it streams: the ceiling is decorative if every byte is in
+            // memory already when it's checked. A declared length past it is refused unread.
+            let ceiling = MgmtTransport.maxResponseBytes
+            guard http.expectedContentLength <= Int64(ceiling) else {
+                throw MgmtTransportError.tooLarge
             }
+            var data = Data()
+            var block: [UInt8] = []
+            block.reserveCapacity(65_536)
+            for try await byte in bytes {
+                block.append(byte)
+                guard block.count == 65_536 else { continue }
+                data.append(contentsOf: block)
+                block.removeAll(keepingCapacity: true)
+                if data.count > ceiling { throw MgmtTransportError.tooLarge }
+            }
+            data.append(contentsOf: block)
+            if data.count > ceiling { throw MgmtTransportError.tooLarge }
             return data
         }
         let response = try await LibraryClient.send(

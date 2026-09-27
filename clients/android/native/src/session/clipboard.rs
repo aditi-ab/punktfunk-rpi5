@@ -180,7 +180,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextClip<'l
     // "null on timeout" contract in the doc comment above is unchanged.
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         let Some(h) = client(handle) else {
-            return Ok(JString::default());
+            return env.new_string("closed");
         };
         let msg = match h.client.next_clip(Duration::from_millis(250)) {
             Ok(ClipEventCore::State { enabled, .. }) => format!("state:{}", u8::from(enabled)),

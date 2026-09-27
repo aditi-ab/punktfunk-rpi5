@@ -6,7 +6,8 @@
 // keys (Effect's default), and an unknown `kind` surfaces on the raw channel, never a throw.
 import { Schema as S } from "effect";
 
-export const Plane = S.Literals(["native", "gamestream"]);
+/** `web` is a browser on the native protocol; `native` also names the store it pairs into. */
+export const Plane = S.Literals(["native", "gamestream", "web"]);
 export type Plane = S.Schema.Type<typeof Plane>;
 
 export const DisconnectReason = S.Literals(["quit", "timeout", "error"]);

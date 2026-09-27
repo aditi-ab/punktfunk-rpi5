@@ -480,7 +480,9 @@ export function normalizePath(pathname: string): string {
 /** Validate a post-login redirect target: a same-origin path only. Resolves `next` against a
  * sentinel origin and keeps it only if it stays same-origin — rejecting absolute (`https://evil.com`),
  * protocol-relative (`//evil.com`) AND backslash/tab variants (`/\evil.com`, which the WHATWG URL
- * parser folds to `//evil.com`) that a plain `startsWith("//")` guard lets through.
+ * parser folds to `//evil.com`) that a plain `startsWith("//")` guard lets through. A path that
+ * parses same-origin but serializes as `//…` (`/.//evil.com`) is refused too: the browser reads
+ * the returned string as protocol-relative.
  *
  * The login page is never a target: the gate redirects a signed-in visitor off `/login` to this
  * path, so `?next=/login` would bounce between the two until the browser gives up. */
@@ -489,7 +491,12 @@ export function safeNextPath(next: string | undefined): string {
 	try {
 		const base = "http://pf.invalid";
 		const u = new URL(next, base);
-		if (u.origin !== base || u.pathname === "/login") return "/";
+		if (
+			u.origin !== base ||
+			u.pathname === "/login" ||
+			u.pathname.startsWith("//")
+		)
+			return "/";
 		return u.pathname + u.search + u.hash;
 	} catch {
 		return "/";

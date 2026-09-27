@@ -227,19 +227,22 @@ impl LinkDedupe {
 
 #[cfg(target_os = "linux")]
 fn route_watch() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::time::{Duration, Instant};
-    // SAFETY: plain socket creation; the fd is owned by this thread until the close below.
-    let fd = unsafe {
+    // SAFETY: plain socket creation; no memory of ours is involved.
+    let raw = unsafe {
         libc::socket(
             libc::AF_NETLINK,
             libc::SOCK_RAW | libc::SOCK_CLOEXEC,
             libc::NETLINK_ROUTE,
         )
     };
-    if fd < 0 {
+    if raw < 0 {
         tracing::debug!("netlink route socket refused — no network-change log");
         return;
     }
+    // SAFETY: `raw` is the fresh socket just created; `OwnedFd` is its only owner and closes it.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     // SAFETY: all-zero is a valid sockaddr_nl (family and groups are set just below).
     let mut sa: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     sa.nl_family = libc::AF_NETLINK as u16;
@@ -247,14 +250,12 @@ fn route_watch() {
     // SAFETY: `sa` is a live sockaddr_nl and the length passed is its size.
     let bound = unsafe {
         libc::bind(
-            fd,
+            fd.as_raw_fd(),
             &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_nl>() as u32,
         )
     };
     if bound < 0 {
-        // SAFETY: `fd` is open and closed exactly once.
-        unsafe { libc::close(fd) };
         tracing::debug!("netlink route bind refused — no network-change log");
         return;
     }
@@ -267,7 +268,7 @@ fn route_watch() {
     let mut links = LinkDedupe::default();
     loop {
         // SAFETY: `buf` is writable for `buf.len()` bytes and outlives the call.
-        let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
         if n < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
@@ -298,8 +299,6 @@ fn route_watch() {
             }
         }
     }
-    // SAFETY: `fd` is open and closed exactly once.
-    unsafe { libc::close(fd) };
 }
 
 /// One human line per message in a netlink batch; unknown types are skipped.

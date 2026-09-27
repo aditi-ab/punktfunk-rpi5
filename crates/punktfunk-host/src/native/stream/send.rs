@@ -190,6 +190,7 @@ pub(super) struct SendStats {
     pub(super) mode: Arc<AtomicU64>,
     pub(super) codec: &'static str,
     pub(super) client: String,
+    pub(super) plane: crate::events::Plane,
     pub(super) bitrate_kbps: Arc<AtomicU32>,
     /// What the client's ramp proved the link carries (kbps); `0` = no report yet.
     pub(super) link_kbps: Arc<AtomicU32>,
@@ -544,7 +545,7 @@ pub(super) fn send_loop(
                     _ => {
                         let (w, h, hz) = unpack_mode(stats.mode.load(Ordering::Relaxed));
                         let id = stats.rec.register_session(
-                            "native",
+                            stats.plane.as_str(),
                             w,
                             h,
                             hz,

@@ -1104,6 +1104,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         }
                         continue;
                     }
+                    // Without the grab the local shell acts on Super; forwarding it too
+                    // opens the host's launcher as well. Its up and repeats follow the down.
+                    if !inhibit_shortcuts && matches!(sc, Scancode::LGui | Scancode::RGui) {
+                        continue;
+                    }
                     if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                         cap.on_key_down(sc);
                     }
