@@ -50,7 +50,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "ma
 # Builds/validates the xkb keymap uploaded to the virtual keyboard + tracks modifier state.
 xkbcommon = "0.9"
 # Vendored + trimmed usbip server core — presents a virtual Steam Deck over USB/IP for Steam Input.
-usbip-sim = { path = "../punktfunk-host/vendor/usbip-sim" }
+usbip-sim = { path = "vendor/usbip-sim" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # The streamed-output desktop rect (CCD source rect) absolute input maps into — the same
