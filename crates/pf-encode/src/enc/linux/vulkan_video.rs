@@ -4684,7 +4684,7 @@ mod tests {
     }
 
     /// BGRX frame of the shared moving texture at `frame` frames of motion
-    /// (`pf_encode_win::smoke_pattern`): the encoder must reach for rows above to predict it.
+    /// (`pf_encode_core::smoke_pattern`): the encoder must reach for rows above to predict it.
     fn cpu_frame_scroll(w: u32, h: u32, pts_ns: u64, frame: u32) -> CapturedFrame {
         let buf = crate::smoke_pattern::scroll_pattern(w as usize, h as usize, frame as usize);
         CapturedFrame {

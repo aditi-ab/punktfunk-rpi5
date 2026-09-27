@@ -701,13 +701,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-encode-core"
+version = "0.40.0"
+dependencies = [
+ "anyhow",
+ "nvidia-video-codec-sdk",
+ "pf-driver-proto",
+ "pf-frame",
+ "pyrowave-sys",
+ "tracing",
+]
+
+[[package]]
 name = "pf-encode-win"
 version = "0.40.0"
 dependencies = [
  "anyhow",
  "libvpl-sys",
  "nvidia-video-codec-sdk",
- "pf-driver-proto",
+ "pf-encode-core",
  "pf-frame",
  "pyrowave-sys",
  "tracing",

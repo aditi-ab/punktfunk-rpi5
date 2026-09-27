@@ -400,10 +400,10 @@ impl EncodeInput {
         )
     }
 }
-/// `pf_encode_win::EncoderCaps` as plain integers — this crate cannot depend on the encoder
-/// crate, which builds only in the driver's graph. Each `bool` there is `0`/`1` here; the
-/// driver fills this from `Encoder::caps()` after the open and the host maps it straight back,
-/// so the session routes by query rather than by a `false` default.
+/// `pf_encode_core::EncoderCaps` as plain integers — the encoder crate depends on this one,
+/// not the reverse. Each `bool` there is `0`/`1` here; the driver fills this from
+/// `Encoder::caps()` after the open and the host maps it straight back, so the session routes
+/// by query rather than by a `false` default.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct EncoderCapsWire {

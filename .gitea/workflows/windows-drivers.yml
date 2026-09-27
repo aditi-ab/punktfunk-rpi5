@@ -28,6 +28,7 @@ on:
       - '.gitea/workflows/windows-drivers.yml'
       - 'crates/pf-driver-proto/**'
       # The driver hosts the encoder backends, so a change to them is a driver change.
+      - 'crates/pf-encode-core/**'
       - 'crates/pf-encode-win/**'
       # …and the crates those backends compile against: pf-frame owns the frame vocabulary
       # their signatures take, pf-zerocopy sits under it, and the two -sys crates are the
@@ -47,6 +48,7 @@ on:
       - '.gitea/workflows/windows-drivers.yml'
       - 'crates/pf-driver-proto/**'
       # The driver hosts the encoder backends, so a change to them is a driver change.
+      - 'crates/pf-encode-core/**'
       - 'crates/pf-encode-win/**'
       # …and the crates those backends compile against: pf-frame owns the frame vocabulary
       # their signatures take, pf-zerocopy sits under it, and the two -sys crates are the

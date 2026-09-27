@@ -82,7 +82,7 @@ fn even_floor(value: f64, minimum: u32) -> u32 {
 mod tests {
     use super::*;
 
-    /// The cross-language contract; Swift, Kotlin and pf-encode-win read the same file.
+    /// The cross-language contract; Swift, Kotlin and pf-encode-core read the same file.
     #[test]
     fn shared_vectors() {
         let raw = include_str!("../../../clients/shared/render-scale-vectors.json");

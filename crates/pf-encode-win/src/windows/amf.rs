@@ -2136,7 +2136,7 @@ impl Encoder for AmfEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smoke_pattern::nv12_texture;
+    use crate::smoke_d3d11::nv12_texture;
 
     /// An IDR empties the mirror, drops a queued force and marks slot 0.
     #[test]
@@ -2678,7 +2678,7 @@ mod tests {
     #[test]
     #[ignore = "requires an AMD GPU with AMF — run manually on an AMD Windows box (.173)"]
     fn amf_ltr_anchor_soak() {
-        use crate::smoke_pattern::{nv12_scroll_frame, Soak};
+        use crate::{smoke_d3d11::nv12_scroll_frame, smoke_pattern::Soak};
         try_factory().expect("AMF runtime");
         let device = amd_d3d11_device().expect("an AMD adapter");
         let soak = Soak::from_env();

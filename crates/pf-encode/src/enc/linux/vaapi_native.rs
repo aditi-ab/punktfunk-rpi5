@@ -23,7 +23,7 @@ use pf_vaapi::vpp;
 use pf_zerocopy::gbm::{GbmBo, GbmDevice, GBM_BO_USE_RENDERING};
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
-use pf_encode_win::rfi::{self, plan_slot_recovery, Wave, WaveMark};
+use crate::rfi::{self, plan_slot_recovery, Wave, WaveMark};
 
 /// Slots a session keeps: how far back a recovery anchor may reach. A report
 /// names frames the client missed two frames ago and spends a round trip
@@ -784,7 +784,7 @@ mod tests {
     /// BGRX frame of horizontal bands scrolled down by `shift` rows, with a diagonal so no
     /// two rows are alike: the encoder must reach for rows above to predict it.
     fn scroll_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
-        let buf = pf_encode_win::smoke_pattern::scroll_pattern(w as usize, h as usize, i as usize);
+        let buf = crate::smoke_pattern::scroll_pattern(w as usize, h as usize, i as usize);
         CapturedFrame {
             provenance: Default::default(),
             width: w,

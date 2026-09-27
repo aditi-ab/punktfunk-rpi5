@@ -32,7 +32,7 @@ on:
       - 'crates/pf-console-ui/**'
       - 'crates/pf-driver-proto/**'
       - 'crates/pf-encode/**'
-      - 'crates/pf-encode-win/**'
+      - 'crates/pf-encode-core/**'
       - 'crates/pf-frame/**'
       - 'crates/pf-gpu/**'
       - 'crates/pf-host-config/**'
