@@ -670,6 +670,68 @@ pub fn parse_session_line(line: &str) -> Option<SessionEvent> {
     None
 }
 
+/// The session's exit codes, beside its stdout lines. 0 is a clean end.
+pub mod exit {
+    pub const CONNECT_FAILED: u8 = 2;
+    /// No pin, the pin no longer matches, or pairing is required.
+    pub const TRUST_REJECTED: u8 = 3;
+    /// The stream window or the console did not start.
+    pub const RENDERER_FAILED: u8 = 4;
+}
+
+/// One line the session writes on stdout; [`parse_session_line`] reads each back.
+pub enum SessionLine<'a> {
+    Ready,
+    /// `trust_rejected: None` leaves the field out, which readers take as `false`.
+    Error {
+        msg: &'a str,
+        trust_rejected: Option<bool>,
+    },
+    Ended(&'a str),
+    Window {
+        w: u32,
+        h: u32,
+    },
+    /// `stats:` for a person reading a log, then `stats-json:` for a program.
+    Stats {
+        text: &'a str,
+        snap: &'a punktfunk_core::hud::StatsSnapshot,
+    },
+}
+
+impl SessionLine<'_> {
+    fn render(&self) -> String {
+        use serde_json::json;
+        match self {
+            SessionLine::Ready => json!({ "ready": true }).to_string(),
+            SessionLine::Error {
+                msg,
+                trust_rejected: None,
+            } => json!({ "error": msg }).to_string(),
+            SessionLine::Error {
+                msg,
+                trust_rejected: Some(t),
+            } => json!({ "error": msg, "trust_rejected": t }).to_string(),
+            SessionLine::Ended(msg) => json!({ "ended": msg }).to_string(),
+            // Not `json!`: its map sorts keys, and this line has always been `w` first.
+            SessionLine::Window { w, h } => format!(r#"{{"window":{{"w":{w},"h":{h}}}}}"#),
+            SessionLine::Stats { text, snap } => format!(
+                "stats: {text}\nstats-json: {}",
+                serde_json::to_string(snap).unwrap_or_default()
+            ),
+        }
+    }
+}
+
+/// Write one contract line to stdout. Not `println!`: it panics on EPIPE, and the shell
+/// can exit mid-stream. Status nobody is left to read costs nothing to lose.
+pub fn emit(line: SessionLine) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{}", line.render());
+    let _ = out.flush();
+}
+
 /// Persist a window size the session reported. The spawner's job, not the
 /// renderer's — and only on a real change, so a session that never resizes
 /// never touches the file.
@@ -1235,6 +1297,61 @@ mod tests {
         }
         assert_eq!(parse_session_line(""), None);
         assert_eq!(parse_session_line(r#"{"other":1}"#), None);
+    }
+
+    /// Every line the session writes parses back to the event it meant, byte for byte
+    /// where the wire form is pinned above.
+    #[test]
+    fn emitted_lines_parse_back() {
+        let parse = |l: SessionLine| parse_session_line(&l.render());
+        assert_eq!(SessionLine::Ready.render(), r#"{"ready":true}"#);
+        assert_eq!(parse(SessionLine::Ready), Some(SessionEvent::Ready));
+        let pin = SessionLine::Error {
+            msg: "pin \"x\"\n\tno",
+            trust_rejected: Some(true),
+        };
+        assert_eq!(
+            parse(pin),
+            Some(SessionEvent::Error {
+                msg: "pin \"x\"\n\tno".into(),
+                trust_rejected: true
+            })
+        );
+        let bare = SessionLine::Error {
+            msg: "no window",
+            trust_rejected: None,
+        };
+        assert_eq!(bare.render(), r#"{"error":"no window"}"#);
+        assert_eq!(
+            parse(bare),
+            Some(SessionEvent::Error {
+                msg: "no window".into(),
+                trust_rejected: false
+            })
+        );
+        assert_eq!(
+            parse(SessionLine::Ended("Host ended")),
+            Some(SessionEvent::Ended("Host ended".into()))
+        );
+        let win = SessionLine::Window { w: 1600, h: 900 };
+        assert_eq!(win.render(), r#"{"window":{"w":1600,"h":900}}"#);
+        assert_eq!(parse(win), Some(SessionEvent::Window { w: 1600, h: 900 }));
+        let snap = punktfunk_core::hud::StatsSnapshot {
+            width: 1280,
+            received: 60,
+            ..Default::default()
+        };
+        let stats = SessionLine::Stats {
+            text: "1280×800@60",
+            snap: &snap,
+        }
+        .render();
+        let mut lines = stats.lines();
+        assert_eq!(lines.next(), Some("stats: 1280×800@60"));
+        match lines.next().and_then(parse_session_line) {
+            Some(SessionEvent::Stats(s)) => assert_eq!((s.width, s.received), (1280, 60)),
+            other => panic!("stats-json parsed as {other:?}"),
+        }
     }
 
     /// No GPU and no store. Host, launch, clipboard, timeout, bitrate, and codec

@@ -32,9 +32,8 @@ mod cli {
     use std::time::Duration;
 
     pub const OK: u8 = 0;
-    pub const CONNECT_FAILED: u8 = 2;
-    pub const TRUST_REJECTED: u8 = 3;
-    pub const RENDERER_FAILED: u8 = 4;
+    // The session's own codes pass through; 5 and 6 are the CLI's.
+    pub use orchestrate::exit::{CONNECT_FAILED, RENDERER_FAILED, TRUST_REJECTED};
     /// Nothing here matches what you named (host, preset, game).
     pub const UNRESOLVED: u8 = 5;
     /// Refused because it needs a person: pairing, or trusting an unknown host.

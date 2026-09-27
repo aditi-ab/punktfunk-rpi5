@@ -6,7 +6,7 @@
 //! destination rect and clears the bars. Whole-number scales on both axes never get
 //! here: a NEAREST blit is exact and costs nothing extra.
 
-use crate::csc::build_fullscreen_pipeline;
+use crate::csc::{build_fullscreen_pipeline, color_pass};
 use anyhow::{Context as _, Result};
 use ash::vk;
 use punktfunk_core::video_fit::{Kernel, Placement};
@@ -65,8 +65,8 @@ fn kernel_id(k: Kernel) -> i32 {
 }
 
 impl ScalePass {
-    /// `out_format` is the swapchain's. The output pass matches the overlay pass's
-    /// attachment and dependency, so the overlay's per-image framebuffers serve both.
+    /// `out_format` is the swapchain's. The output pass comes from `csc::color_pass`, so the
+    /// overlay's per-image framebuffers serve it.
     pub fn new(device: &ash::Device, out_format: vk::Format) -> Result<ScalePass> {
         // SAFETY: CREATE per the crate contract.
         let sampler = unsafe {
@@ -128,16 +128,18 @@ impl ScalePass {
             )
         }?;
 
-        let mid_pass = render_pass(
+        let mid_pass = color_pass(
             device,
             MID_FORMAT,
             vk::AttachmentLoadOp::DONT_CARE,
+            vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         )?;
-        let out_pass = render_pass(
+        let out_pass = color_pass(
             device,
             out_format,
             vk::AttachmentLoadOp::CLEAR,
+            vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         )?;
         let frag = pf_client_core::video_csc_spv::SCALE_FRAG;
@@ -461,49 +463,6 @@ impl ScalePass {
             device.destroy_sampler(self.sampler, None);
         }
     }
-}
-
-/// One colour attachment; the dependency is the overlay pass's, so framebuffers made for
-/// either pass fit both. The direct CSC pass builds its two passes here as well.
-pub(crate) fn render_pass(
-    device: &ash::Device,
-    format: vk::Format,
-    load: vk::AttachmentLoadOp,
-    final_layout: vk::ImageLayout,
-) -> Result<vk::RenderPass> {
-    let attachment = [vk::AttachmentDescription::default()
-        .format(format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(load)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(final_layout)];
-    let color_ref = [vk::AttachmentReference::default()
-        .attachment(0)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-    let subpass = [vk::SubpassDescription::default()
-        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_ref)];
-    let deps = [vk::SubpassDependency::default()
-        .src_subpass(vk::SUBPASS_EXTERNAL)
-        .dst_subpass(0)
-        .src_stage_mask(vk::PipelineStageFlags::ALL_COMMANDS)
-        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .dst_access_mask(
-            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-        )];
-    // SAFETY: CREATE per the crate contract.
-    unsafe {
-        device.create_render_pass(
-            &vk::RenderPassCreateInfo::default()
-                .attachments(&attachment)
-                .subpasses(&subpass)
-                .dependencies(&deps),
-            None,
-        )
-    }
-    .context("scale render pass")
 }
 
 #[cfg(test)]
