@@ -42,7 +42,7 @@ pub(crate) mod bar;
 mod card;
 mod games;
 pub(crate) use games::CustomizeScreen;
-use games::{Line, Zone};
+use games::{Band, Line, Zone};
 
 /// The screen's scroll node, title `i`'s grid cell, the shelf strip and its cover `i`.
 const GRID: &str = "library-grid";
@@ -1385,118 +1385,45 @@ impl LibraryScreen {
         let t = ctx.t;
         let (bands, lines) = self.place_zone(ctx);
         let sectioned = self.sectioned();
-        let shelf = self.view_mode == LibraryView::Shelf && !self.embedded;
-        let avail = f64::from(rect.width()) - 2.0 * edge(k);
         // The lines run on to the screen's foot and blur under the band there.
         let clip = canvas.local_clip_bounds().unwrap_or(rect);
         let foot = clip.bottom.max(rect.bottom);
-        let tray = if self.band_shown() {
-            crate::widgets::FOOT_TITLE_H * k
-        } else {
-            0.0
-        };
-        let band_top = f64::from(rect.bottom) - tray;
-        let usable = band_top - f64::from(rect.top);
-        let view_h = f64::from(foot - rect.top);
-
-        let cols = self.grid_cols(rect, k);
-        // Navigation reads last-drawn columns. A resize is a different grid; re-seat.
-        if self.grid_cols_last != Some(cols) {
-            self.grid_cols_last = Some(cols);
-            self.seat_grid_col();
-        }
-        let shape = GridShape::new(self.len(), cols, self.lead_count());
-        // Two-column clamp can overflow a narrow rect; shrink cells only, never headings.
-        let fit = (avail / ((cols as f64 * (GRID_W + GRID_GAP) - GRID_GAP) * k)).clamp(0.25, 1.0);
-        let (cw, ch) = (GRID_W * k * fit, GRID_H * k * fit);
-        let card_h = ch + card::text_h(self.sort_captions()) * k;
-        let pitch_x = cw + GRID_GAP * k * fit;
-        let gap_y = ROW_GAP * k;
-        let grid_w = cols as f64 * pitch_x - GRID_GAP * k * fit;
-        let split_row = (shape.split > 0).then(|| shape.split_row());
-        let heading_h = if self.embedded {
-            EMBED_AIR
-        } else {
-            GRID_HEADING
-        } * k;
-        // Top inset is always on: it is also the air row 0 needs.
-        let row_top = |row: usize| -> f64 {
-            let section_gap = match split_row {
-                Some(s) if row >= s => heading_h,
-                _ => 0.0,
-            };
-            row as f64 * (card_h + gap_y) + heading_h + section_gap
-        };
-        let geo = shelf.then(|| self.shelf_geo(usable, avail, k));
-        let block_h = |line: Line| -> f64 {
-            match line {
-                Line::Bar => (bar::BAR_H + BAR_AIR) * k,
-                Line::Chips => Self::chips_h(k),
-                Line::Band(b) => Self::band_h(&bands[b], ch, k),
-                Line::Grid => match geo {
-                    Some(g) => g.block,
-                    None => row_top(shape.rows().saturating_sub(1)) + card_h + gap_y,
-                },
-                Line::State if sectioned => STATE_H * k,
-                Line::State => usable,
-            }
-        };
-        let mut tops = Vec::with_capacity(lines.len());
-        let mut content_h = 0.0;
-        for &l in &lines {
-            tops.push(content_h);
-            content_h += block_h(l);
-        }
-        // Matching bottom inset: the last row clears the band.
-        let pad = heading_h + (f64::from(foot) - band_top);
-        content_h += pad;
-        let top_of = |l: Line| lines.iter().position(|&x| x == l).map_or(0.0, |i| tops[i]);
-        let (focus_row, _) = shape.cell_of(self.cursor.max(0) as usize);
-        // The focused item's span: a grid row (its heading too on row 0), or a whole line.
-        let (item_top, item_h) = match (self.zone, geo) {
-            (Zone::Grid, None) if focus_row > 0 => {
-                (top_of(Line::Grid) + row_top(focus_row), card_h)
-            }
-            (Zone::Grid, None) => (top_of(Line::Grid), row_top(0) + card_h),
-            (z, _) => {
-                let line = games::line_of(z);
-                (top_of(line), block_h(line))
-            }
-        };
+        let g = self.field_geom(rect, foot, k, &lines, &bands);
+        let FieldGeom {
+            shape,
+            cw,
+            ch,
+            card_h,
+            pitch_x,
+            gap_y,
+            grid_w,
+            heading_h,
+            split_row,
+            shelf: geo,
+            avail,
+            view_h,
+            ..
+        } = g;
+        let (item_top, item_h) = g.item_span(self.zone, self.cursor, &lines, &bands);
         // Scroll only as far as it takes to show the item and a breath round it, above the
         // band; a line taller than the view shows its top. Never centred: on a phone that
         // walked the first row up over the host's verbs.
         let breath = REVEAL_AIR * k;
         let mut want = self.scroll.pos;
-        if item_top + item_h + breath > want + usable {
-            want = item_top + item_h + breath - usable;
+        if item_top + item_h + breath > want + g.usable {
+            want = item_top + item_h + breath - g.usable;
         }
         if item_top - breath < want {
             want = item_top - breath;
         }
-        let want = want.clamp(0.0, (content_h - view_h).max(0.0));
+        let want = want.clamp(0.0, (g.content_h - view_h).max(0.0));
         let grid = Id::new(GRID, 0);
         let snap = std::mem::take(&mut self.snap_scroll);
         self.follow |= snap;
         self.step_bands(&bands, avail, cw, k, snap);
         let applied = self.applied();
         self.bar.step(fonts, k, avail, true, applied, dt, snap);
-        let tree = self.grid.get_mut();
-        tree.tick(dt as f32);
-        // Follow focus while no finger has the scroll. After a pan the spring starts from
-        // wherever the finger left it, so the next move glides instead of jumping.
-        if self.follow && !tree.moving(grid) {
-            if snap || crate::theme::reduce_motion() {
-                self.scroll = Spring::rest(want);
-            } else {
-                self.scroll
-                    .step_spec(want, crate::anim::springs::FOCUS, 1.0 / 60.0);
-                self.scroll.settle(want, 0.05, 0.5);
-            }
-            tree.set_offset(grid, self.scroll.pos as f32);
-        } else {
-            self.scroll = Spring::rest(f64::from(tree.offset(grid)));
-        }
+        self.follow_scroll(want, snap, dt);
 
         // The recoil moves the drawing on its axis, never the cells a pointer hits.
         let bump = self.bump.pos * k;
@@ -1637,12 +1564,17 @@ impl LibraryScreen {
                         .child(air)
                     }
                 },
-                Line::State => {
-                    root.child(this.state_el(fonts, avail, block_h(Line::State), k, t, hits))
-                }
+                Line::State => root.child(this.state_el(
+                    fonts,
+                    avail,
+                    g.block_h(Line::State, &bands),
+                    k,
+                    t,
+                    hits,
+                )),
             };
         }
-        root = root.child(El::column().size(avail as f32, pad as f32));
+        root = root.child(El::column().size(avail as f32, g.pad as f32));
         let mut tree = this.grid.borrow_mut();
         let frame = tree.layout(root, viewport);
         let field = match geo {
@@ -1665,29 +1597,123 @@ impl LibraryScreen {
         }
         drop(tree);
 
-        // Hit rects are the cells as laid out; covers drawn this frame stay warm.
-        let painted = painted.take();
+        self.record_frame(painted.take(), shelf_cards.as_deref(), hits.take(), &bands);
+    }
+
+    /// This frame's field metrics in `rect`, the lines running on to `foot`. Navigation
+    /// reads last-drawn columns, so a resize re-seats the cursor's column.
+    fn field_geom(
+        &mut self,
+        rect: Rect,
+        foot: f32,
+        k: f64,
+        lines: &[Line],
+        bands: &[Band],
+    ) -> FieldGeom {
+        let shelf = self.view_mode == LibraryView::Shelf && !self.embedded;
+        let avail = f64::from(rect.width()) - 2.0 * edge(k);
+        let tray = if self.band_shown() {
+            crate::widgets::FOOT_TITLE_H * k
+        } else {
+            0.0
+        };
+        let band_top = f64::from(rect.bottom) - tray;
+        let usable = band_top - f64::from(rect.top);
+        let cols = self.grid_cols(rect, k);
+        if self.grid_cols_last != Some(cols) {
+            self.grid_cols_last = Some(cols);
+            self.seat_grid_col();
+        }
+        let shape = GridShape::new(self.len(), cols, self.lead_count());
+        // Two-column clamp can overflow a narrow rect; shrink cells only, never headings.
+        let fit = (avail / ((cols as f64 * (GRID_W + GRID_GAP) - GRID_GAP) * k)).clamp(0.25, 1.0);
+        let (cw, ch) = (GRID_W * k * fit, GRID_H * k * fit);
+        let pitch_x = cw + GRID_GAP * k * fit;
+        let heading_h = if self.embedded {
+            EMBED_AIR
+        } else {
+            GRID_HEADING
+        } * k;
+        let mut g = FieldGeom {
+            k,
+            shape,
+            cw,
+            ch,
+            card_h: ch + card::text_h(self.sort_captions()) * k,
+            pitch_x,
+            gap_y: ROW_GAP * k,
+            grid_w: cols as f64 * pitch_x - GRID_GAP * k * fit,
+            heading_h,
+            split_row: (shape.split > 0).then(|| shape.split_row()),
+            shelf: shelf.then(|| self.shelf_geo(usable, avail, k)),
+            sectioned: self.sectioned(),
+            avail,
+            usable,
+            view_h: f64::from(foot - rect.top),
+            tops: Vec::with_capacity(lines.len()),
+            content_h: 0.0,
+            pad: 0.0,
+        };
+        for &l in lines {
+            g.tops.push(g.content_h);
+            let h = g.block_h(l, bands);
+            g.content_h += h;
+        }
+        // Matching bottom inset: the last row clears the band.
+        g.pad = heading_h + (f64::from(foot) - band_top);
+        g.content_h += g.pad;
+        g
+    }
+
+    /// Follow focus to `want` while no finger has the scroll. After a pan the spring starts
+    /// from wherever the finger left it, so the next move glides instead of jumping.
+    fn follow_scroll(&mut self, want: f64, snap: bool, dt: f64) {
+        let grid = Id::new(GRID, 0);
+        let tree = self.grid.get_mut();
+        tree.tick(dt as f32);
+        if self.follow && !tree.moving(grid) {
+            if snap || crate::theme::reduce_motion() {
+                self.scroll = Spring::rest(want);
+            } else {
+                self.scroll
+                    .step_spec(want, crate::anim::springs::FOCUS, 1.0 / 60.0);
+                self.scroll.settle(want, 0.05, 0.5);
+            }
+            tree.set_offset(grid, self.scroll.pos as f32);
+        } else {
+            self.scroll = Spring::rest(f64::from(tree.offset(grid)));
+        }
+    }
+
+    /// Hit rects are the cells as laid out; covers drawn this frame stay warm.
+    fn record_frame(
+        &mut self,
+        painted: Vec<usize>,
+        shelf_cards: Option<&[ShelfCard]>,
+        hits: Vec<(Zone, Rect)>,
+        bands: &[Band],
+    ) {
         self.geom.clear();
         self.geom.resize(self.len(), Rect::new_empty());
         let tree = self.grid.get_mut();
         for &i in &painted {
             self.geom[i] = tree.rect(grid_cell(i)).unwrap_or_else(Rect::new_empty);
         }
-        if let (Some(cards), Some(strip)) = (&shelf_cards, tree.rect(shelf_strip())) {
+        if let (Some(cards), Some(strip)) = (shelf_cards, tree.rect(shelf_strip())) {
             for c in cards {
                 self.geom[c.i] = c.bounds.with_offset((strip.left, strip.top));
             }
         }
         let seen: Vec<usize> = painted
             .into_iter()
-            .chain(shelf_cards.iter().flatten().map(|c| c.i))
+            .chain(shelf_cards.into_iter().flatten().map(|c| c.i))
             .collect();
         for i in seen {
             if let Some(id) = self.game(i).map(|g| g.id.clone()) {
                 self.art_seen.insert(id, self.frame);
             }
         }
-        self.hits = hits.take();
+        self.hits = hits;
         for (z, _) in &self.hits {
             let Zone::Band { band, item } = *z else {
                 continue;
@@ -2046,6 +2072,83 @@ impl LibraryScreen {
             );
         }
         el
+    }
+}
+
+/// The field's metrics this frame, px: the grid's cells and rows, the shelf when it shows,
+/// and each line's top in the one scroll.
+struct FieldGeom {
+    k: f64,
+    shape: GridShape,
+    /// A grid cell, and the card under it with its caption.
+    cw: f64,
+    ch: f64,
+    card_h: f64,
+    pitch_x: f64,
+    gap_y: f64,
+    grid_w: f64,
+    heading_h: f64,
+    /// The games section's first row when the launchers hold rows of their own.
+    split_row: Option<usize>,
+    shelf: Option<ShelfGeo>,
+    sectioned: bool,
+    /// Width inside the edges, height above the band, height to the screen's foot.
+    avail: f64,
+    usable: f64,
+    view_h: f64,
+    /// Each line's top in `lines` order; the scroll's height, bottom inset `pad` included.
+    tops: Vec<f64>,
+    content_h: f64,
+    pad: f64,
+}
+
+impl FieldGeom {
+    /// Grid row `row`'s top. The top inset is always on: it is also the air row 0 needs.
+    fn row_top(&self, row: usize) -> f64 {
+        let section_gap = match self.split_row {
+            Some(s) if row >= s => self.heading_h,
+            _ => 0.0,
+        };
+        row as f64 * (self.card_h + self.gap_y) + self.heading_h + section_gap
+    }
+
+    fn block_h(&self, line: Line, bands: &[Band]) -> f64 {
+        let k = self.k;
+        match line {
+            Line::Bar => (bar::BAR_H + BAR_AIR) * k,
+            Line::Chips => LibraryScreen::chips_h(k),
+            Line::Band(b) => LibraryScreen::band_h(&bands[b], self.ch, k),
+            Line::Grid => match self.shelf {
+                Some(g) => g.block,
+                None => {
+                    self.row_top(self.shape.rows().saturating_sub(1)) + self.card_h + self.gap_y
+                }
+            },
+            Line::State if self.sectioned => STATE_H * k,
+            Line::State => self.usable,
+        }
+    }
+
+    /// The focused item's `(top, height)`: a grid row (its heading too on row 0), or a
+    /// whole line.
+    fn item_span(&self, zone: Zone, cursor: i32, lines: &[Line], bands: &[Band]) -> (f64, f64) {
+        let top_of = |l: Line| {
+            lines
+                .iter()
+                .position(|&x| x == l)
+                .map_or(0.0, |i| self.tops[i])
+        };
+        let (focus_row, _) = self.shape.cell_of(cursor.max(0) as usize);
+        match (zone, self.shelf) {
+            (Zone::Grid, None) if focus_row > 0 => {
+                (top_of(Line::Grid) + self.row_top(focus_row), self.card_h)
+            }
+            (Zone::Grid, None) => (top_of(Line::Grid), self.row_top(0) + self.card_h),
+            (z, _) => {
+                let line = games::line_of(z);
+                (top_of(line), self.block_h(line, bands))
+            }
+        }
     }
 }
 
