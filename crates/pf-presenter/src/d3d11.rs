@@ -183,19 +183,21 @@ impl ImportCache {
         Ok(imported)
     }
 
-    /// Destroy every import of a generation other than `generation`. Call only after the
-    /// in-flight fence: a ring rebuild retires its slots while the last frame of the old
-    /// generation may still be on the GPU.
-    pub fn retire_stale(&mut self, device: &ash::Device, generation: u32) {
+    /// Destroy every import of a generation other than `generation`; `true` if any went. Call
+    /// only after the in-flight fence: a ring rebuild retires its slots while the last frame of
+    /// the old generation may still be on the GPU.
+    pub fn retire_stale(&mut self, device: &ash::Device, generation: u32) -> bool {
         let (keep, stale): (Vec<_>, Vec<_>) = self
             .entries
             .drain(..)
             .partition(|e| e.generation == generation);
         self.entries = keep;
+        let retired = !stale.is_empty();
         for e in stale {
             // SAFETY: the caller's fence wait; no submit references these objects.
             unsafe { destroy(device, e.imported) };
         }
+        retired
     }
 
     /// Call only after a device wait-idle (`Presenter::drop`).

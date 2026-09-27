@@ -259,7 +259,10 @@ impl Presenter {
         // generation can go now.
         #[cfg(windows)]
         if let (Some((d, _)), Some(hw)) = (&win_frame, self.hw_win.as_mut()) {
-            hw.imports.retire_stale(&self.device, d.generation);
+            // The retained slot may name a retired import; a `Redraw` must not sample it.
+            if hw.imports.retire_stale(&self.device, d.generation) {
+                self.retained_slot = None;
+            }
         }
         // Same for a rebuilt VAAPI pool; another lane's frame means that decoder is
         // gone, and its cached imports pin the pool's memory until they go too.
