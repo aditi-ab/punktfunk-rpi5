@@ -390,43 +390,40 @@ impl AudioPlayback {
     }
 }
 
-/// Check before `Hello` whether AAudio can open the requested rate and channel layout.
+/// Check before `Hello` whether this device plays the requested rate without resampling.
 ///
-/// An explicit AAudio rate is accepted exactly or the open fails, and audio cannot be
-/// renegotiated mid-session. The caller therefore uses failure to omit hi-res capability or
-/// choose a lower wire rate instead of resampling silently.
+/// Audio cannot be renegotiated mid-session, so the caller uses `false` to omit hi-res or choose
+/// a lower wire rate. An explicit rate is not proof: the legacy path grants almost any rate and
+/// AudioFlinger resamples it to the mixer, off the fast track, while the stream still reports the
+/// rate asked for. The rate an unspecified low-latency open picks is the output's own; only that
+/// one plays as sent.
 ///
-/// This probes the most permissive playback mode (Shared with no performance hint), never
-/// starts the stream, and drops it immediately. `channels` is the requested layout because the
-/// host-resolved layout does not exist until `Welcome`.
+/// Never starts the stream, and drops it immediately. `channels` is the requested layout because
+/// the host-resolved layout does not exist until `Welcome`.
 pub fn output_rate_is_openable(rate_hz: u32, channels: u8) -> bool {
     let built = AudioStreamBuilder::new().map(|b| {
         b.direction(AudioDirection::Output)
-            .sample_rate(rate_hz as i32)
             .channel_count(punktfunk_core::audio::normalize_channels(channels) as i32)
             // The same f32 device format playback uses — see `try_open`. The wire depth is a wire
             // fact and never reaches AAudio, so probing at 24-bit would be probing the wrong thing.
             .format(AudioFormat::PCM_Float)
             .sharing_mode(AudioSharingMode::Shared)
-            .performance_mode(AudioPerformanceMode::None)
+            .performance_mode(AudioPerformanceMode::LowLatency)
             .open_stream()
     });
     match built {
         Ok(Ok(stream)) => {
-            // Belt and braces: the contract says an explicit rate is granted or the open fails,
-            // but this is the one place cheap enough to check rather than trust, and a HAL that
-            // lied here would otherwise have talked us into negotiating a wire we cannot play.
-            let granted = stream.sample_rate();
-            if granted != rate_hz as i32 {
-                log::warn!(
-                    "audio: probe asked AAudio for {rate_hz} Hz and was granted {granted} Hz — treating the rate as unavailable"
+            let native = stream.sample_rate();
+            if native != rate_hz as i32 {
+                log::info!(
+                    "audio: this output runs at {native} Hz, so {rate_hz} Hz would be resampled — not offered"
                 );
                 return false;
             }
             true
         }
         Ok(Err(e)) => {
-            log::info!("audio: this device will not open a {rate_hz} Hz output ({e})");
+            log::info!("audio: this device will not open an output to probe its rate ({e})");
             false
         }
         Err(e) => {
