@@ -18,6 +18,7 @@
 //! session still starts.
 
 use super::cuda::{self, CUdeviceptr, PlaneLayout};
+use super::vkdev;
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
 
@@ -280,100 +281,25 @@ impl VkSlotBlend {
     /// Create the device and blend pipelines. The encoder's CUDA shared context must already be
     /// current; the physical device is NVIDIA (NVENC).
     pub fn new() -> Result<VkSlotBlend> {
-        // SAFETY: ash cannot statically verify handle/CreateInfo validity. Every
-        // CreateInfo/AllocateInfo is a local that outlives the synchronous call;
-        // every handle was created and `?`-checked in this function. Single-threaded.
+        let nv = vkdev::NvComputeDevice::open(vkdev::DeviceWants::default(), &[])?;
+        let (instance, device, qf) = (nv.instance, nv.device, nv.queue_family);
+        let want_timeline = nv.timeline_export;
+        // SAFETY: `instance` and `device` are the live handles just opened; every
+        // CreateInfo/AllocateInfo below is a local that outlives the synchronous call.
+        // Single-threaded.
         unsafe {
-            let entry = ash::Entry::load().context("load libvulkan")?;
-            let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
-            let instance = entry
-                .create_instance(
-                    &vk::InstanceCreateInfo::default().application_info(&app),
-                    None,
-                )
-                .context("vkCreateInstance")?;
-            let phys = match instance
-                .enumerate_physical_devices()
-                .context("enumerate GPUs")?
-                .into_iter()
-                .find(|&p| instance.get_physical_device_properties(p).vendor_id == 0x10DE)
-            {
-                Some(p) => p,
-                None => {
-                    instance.destroy_instance(None);
-                    return Err(anyhow!("no NVIDIA Vulkan device"));
-                }
-            };
-            let mem_props = instance.get_physical_device_memory_properties(phys);
-            let qf = match instance
-                .get_physical_device_queue_family_properties(phys)
-                .iter()
-                .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            {
-                Some(i) => i as u32,
-                None => {
-                    instance.destroy_instance(None);
-                    return Err(anyhow!("no compute-capable queue family"));
-                }
-            };
-            let prio = [1.0f32];
-            let qci = [vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(qf)
-                .queue_priorities(&prio)];
-            // Timeline export to CUDA is optional: enable the extensions only when the
-            // device has them, so a driver without them still gets a CPU-synced blend.
-            let want_timeline = {
-                let have_exts = instance
-                    .enumerate_device_extension_properties(phys)
-                    .map(|props| {
-                        let has = |name: &std::ffi::CStr| {
-                            props
-                                .iter()
-                                .any(|p| p.extension_name_as_c_str().is_ok_and(|n| n == name))
-                        };
-                        has(ash::khr::timeline_semaphore::NAME)
-                            && has(ash::khr::external_semaphore_fd::NAME)
-                    })
-                    .unwrap_or(false);
-                have_exts && {
-                    let mut tl = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
-                    let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut tl);
-                    instance.get_physical_device_features2(phys, &mut f2);
-                    tl.timeline_semaphore == vk::TRUE
-                }
-            };
-            let mut exts = vec![ash::khr::external_memory_fd::NAME.as_ptr()];
-            if want_timeline {
-                exts.push(ash::khr::timeline_semaphore::NAME.as_ptr());
-                exts.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
-            }
-            let mut tl_enable =
-                vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
-            let mut dci = vk::DeviceCreateInfo::default()
-                .queue_create_infos(&qci)
-                .enabled_extension_names(&exts);
-            if want_timeline {
-                dci = dci.push_next(&mut tl_enable);
-            }
-            let device = match instance.create_device(phys, &dci, None) {
-                Ok(d) => d,
-                Err(e) => {
-                    instance.destroy_instance(None);
-                    return Err(e).context("vkCreateDevice (external_memory_fd supported?)");
-                }
-            };
             // From here Drop tears down; leftover null handles are no-ops.
             let ext_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
             let queue = device.get_device_queue(qf, 0);
             let mut me = VkSlotBlend {
-                _entry: entry,
+                _entry: nv.entry,
                 instance,
                 device,
                 ext_fd,
                 queue,
                 cmd_pool: vk::CommandPool::null(),
                 fence: vk::Fence::null(),
-                mem_props,
+                mem_props: nv.mem_props,
                 shader: vk::ShaderModule::null(),
                 desc_layout: vk::DescriptorSetLayout::null(),
                 pipe_layout: vk::PipelineLayout::null(),
@@ -592,14 +518,7 @@ impl VkSlotBlend {
     }
 
     fn memory_type(&self, type_bits: u32, flags: vk::MemoryPropertyFlags) -> Result<u32> {
-        (0..self.mem_props.memory_type_count)
-            .find(|&i| {
-                type_bits & (1 << i) != 0
-                    && self.mem_props.memory_types[i as usize]
-                        .property_flags
-                        .contains(flags)
-            })
-            .ok_or_else(|| anyhow!("no memory type for flags {flags:?}"))
+        vkdev::memory_type(&self.mem_props, type_bits, flags)
     }
 
     /// Allocate one NVENC input as exportable Vulkan memory mapped into CUDA. Layout matches

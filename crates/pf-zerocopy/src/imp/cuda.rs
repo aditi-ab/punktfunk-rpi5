@@ -11,7 +11,7 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use std::os::raw::{c_uint, c_void};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -132,21 +132,57 @@ unsafe impl Sync for Context {}
 
 static CONTEXT: OnceLock<Context> = OnceLock::new();
 
+/// CUDA device 0, the one every context here runs on. The Vulkan and EGL devices follow it
+/// ([`device_uuid`], [`device_pci_bus_id`]) so interop stays on one GPU.
+fn device0() -> Result<CUdevice> {
+    if cuda_api().is_none() {
+        bail!("libcuda.so.1 not available — no NVIDIA driver (CUDA zero-copy disabled)");
+    }
+    let mut dev: CUdevice = 0;
+    // SAFETY: `cuda_api()` is `Some` (checked above), so wrappers hit the live `libcuda` table.
+    // `cuInit(0)`: flags 0 is the API-required value, and it is idempotent. `&mut dev` is a
+    // live out-param that outlives the synchronous call.
+    unsafe {
+        ck(cuInit(0), "cuInit")?;
+        ck(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
+    }
+    Ok(dev)
+}
+
+/// [`device0`]'s UUID, the bytes Vulkan reports as `deviceUUID`.
+pub fn device_uuid() -> Result<[u8; 16]> {
+    let dev = device0()?;
+    let mut uuid = [0u8; 16];
+    // SAFETY: `uuid` is a live 16-byte out-param, the size of `CUuuid`.
+    unsafe { ck(cuDeviceGetUuid(&mut uuid, dev), "cuDeviceGetUuid")? };
+    Ok(uuid)
+}
+
+/// [`device0`]'s PCI address, `domain:bus:device.function` as sysfs spells `PCI_SLOT_NAME`.
+pub fn device_pci_bus_id() -> Result<String> {
+    let dev = device0()?;
+    let mut buf = [0u8; 32];
+    // SAFETY: `buf` is a live out-param of the length passed; the driver writes a
+    // NUL-terminated string within it.
+    unsafe {
+        ck(
+            cuDeviceGetPCIBusId(buf.as_mut_ptr().cast(), buf.len() as i32, dev),
+            "cuDeviceGetPCIBusId",
+        )?
+    };
+    let id = std::ffi::CStr::from_bytes_until_nul(&buf).context("PCI bus id without a NUL")?;
+    Ok(id.to_string_lossy().into_owned())
+}
+
 /// Shared CUDA context on device 0, created once.
 pub fn context() -> Result<CUcontext> {
     if let Some(c) = CONTEXT.get() {
         return Ok(c.0);
     }
-    if cuda_api().is_none() {
-        bail!("libcuda.so.1 not available — no NVIDIA driver (CUDA zero-copy disabled)");
-    }
-    // SAFETY: `cuda_api()` is `Some` (checked above), so wrappers hit the live `libcuda` table.
-    // `cuInit(0)`: flags 0 is the API-required value. `&mut dev`/`&mut ctx` are live out-params
-    // that outlive their synchronous calls. `ck` bails unless `ctx` is a valid `CUcontext`.
+    let dev = device0()?;
+    // SAFETY: `device0` confirmed the live `libcuda` table and a valid device. `&mut ctx` is a
+    // live out-param that outlives the synchronous call. `ck` bails unless `ctx` is valid.
     let ctx = unsafe {
-        ck(cuInit(0), "cuInit")?;
-        let mut dev: CUdevice = 0;
-        ck(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
         let mut ctx: CUcontext = std::ptr::null_mut();
         ck(
             cuCtxCreate_v2(&mut ctx, CU_CTX_SCHED_BLOCKING_SYNC, dev),
@@ -169,16 +205,11 @@ pub fn make_current() -> Result<()> {
 /// Run `probe` on a throwaway device-0 context, then restore the shared one. Diagnostic: splits a
 /// bad shared context from a driver-wide failure. Never a hot path.
 pub fn with_fresh_context<R>(probe: impl FnOnce(CUcontext) -> R) -> Result<R> {
-    if cuda_api().is_none() {
-        bail!("libcuda.so.1 not available");
-    }
-    // SAFETY: driver table present (checked above). `cuInit(0)` is idempotent. `&mut dev`/`&mut ctx`
-    // are live out-params. `ctx` is destroyed once below; creation left it current, so restore the
-    // shared context afterwards.
+    let dev = device0()?;
+    // SAFETY: `device0` confirmed the driver table and a valid device. `&mut ctx` is a live
+    // out-param. `ctx` is destroyed once below; creation left it current, so restore the shared
+    // context afterwards.
     unsafe {
-        ck(cuInit(0), "cuInit")?;
-        let mut dev: CUdevice = 0;
-        ck(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
         let mut ctx: CUcontext = std::ptr::null_mut();
         ck(
             cuCtxCreate_v2(&mut ctx, CU_CTX_SCHED_BLOCKING_SYNC, dev),

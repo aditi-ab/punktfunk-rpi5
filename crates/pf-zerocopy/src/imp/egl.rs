@@ -33,30 +33,38 @@ const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: egl::Attrib = 0x3444;
 mod gl;
 use gl::*;
 
-/// NVIDIA PCI vendor. This importer and the Vulkan bridge both key the physical device on it.
+/// NVIDIA PCI vendor: the render node this importer falls back to when CUDA cannot name its own.
 const PCI_VENDOR_NVIDIA: u32 = 0x10de;
 
-/// NVIDIA DRM render node: `PUNKTFUNK_ZEROCOPY_RENDER_NODE`, else the first `/dev/dri/renderD*`
-/// whose sysfs PCI vendor is NVIDIA, else `/dev/dri/renderD128`.
+/// NVIDIA DRM render node: `PUNKTFUNK_ZEROCOPY_RENDER_NODE`, else the node on CUDA device 0's
+/// PCI slot, else the first `/dev/dri/renderD*` whose sysfs PCI vendor is NVIDIA, else
+/// `/dev/dri/renderD128`.
 ///
-/// Scan by vendor, not first node: on a hybrid host `renderD128` is the iGPU. Do not call
-/// `pf_gpu::linux_render_node` — this crate is a leaf worker, and that helper follows the
-/// operator VAAPI preference, which may name the iGPU. The question here is where CUDA lives.
+/// CUDA's device first, so GL interop and the Vulkan bridge ([`super::vkdev`]) stay on one GPU
+/// of a dual-NVIDIA box. Scan by vendor, not first node: on a hybrid host `renderD128` is the
+/// iGPU. Do not call `pf_gpu::linux_render_node` — this crate is a leaf worker, and that
+/// helper follows the operator VAAPI preference, which may name the iGPU.
 fn nvidia_render_node() -> std::path::PathBuf {
     use std::path::{Path, PathBuf};
     if let Some(p) = std::env::var_os("PUNKTFUNK_ZEROCOPY_RENDER_NODE").filter(|s| !s.is_empty()) {
         return PathBuf::from(p);
     }
+    let cuda_slot = cuda::device_pci_bus_id().ok();
     // No NVIDIA node (or no /sys): keep `/dev/dri/renderD128`. CUDA construction fails if it is wrong.
-    nvidia_render_node_in(Path::new("/dev/dri"), Path::new("/sys/class/drm"))
-        .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128"))
+    nvidia_render_node_in(
+        Path::new("/dev/dri"),
+        Path::new("/sys/class/drm"),
+        cuda_slot.as_deref(),
+    )
+    .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128"))
 }
 
 /// Scan half of [`nvidia_render_node`]. Roots are parameters so tests can pin
-/// `<sys_class_drm>/<node>/device/vendor`. Name order keeps the pick stable across boots.
+/// `<sys_class_drm>/<node>/device/{vendor,uevent}`. Name order keeps the pick stable across boots.
 fn nvidia_render_node_in(
     dri: &std::path::Path,
     sys_class_drm: &std::path::Path,
+    cuda_slot: Option<&str>,
 ) -> Option<std::path::PathBuf> {
     let mut nodes: Vec<std::ffi::OsString> = std::fs::read_dir(dri)
         .map(|rd| {
@@ -67,14 +75,27 @@ fn nvidia_render_node_in(
         })
         .unwrap_or_default();
     nodes.sort();
+    let device = |node: &std::ffi::OsString, file: &str| {
+        std::fs::read_to_string(sys_class_drm.join(node).join("device").join(file)).ok()
+    };
+    let on_cuda_slot = |node: &std::ffi::OsString| {
+        let (Some(want), Some(uevent)) = (cuda_slot, device(node, "uevent")) else {
+            return false;
+        };
+        uevent
+            .lines()
+            .filter_map(|l| l.strip_prefix("PCI_SLOT_NAME="))
+            .any(|slot| slot.trim().eq_ignore_ascii_case(want))
+    };
+    let nvidia = |node: &std::ffi::OsString| {
+        device(node, "vendor")
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            == Some(PCI_VENDOR_NVIDIA)
+    };
     nodes
-        .into_iter()
-        .find(|node| {
-            std::fs::read_to_string(sys_class_drm.join(node).join("device").join("vendor"))
-                .ok()
-                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
-                == Some(PCI_VENDOR_NVIDIA)
-        })
+        .iter()
+        .find(|n| on_cuda_slot(n))
+        .or_else(|| nodes.iter().find(|n| nvidia(n)))
         .map(|node| dri.join(node))
 }
 
@@ -823,7 +844,7 @@ mod tests {
             ("renderD129", Some("0x10de\n")),
         ]);
         assert_eq!(
-            nvidia_render_node_in(&dri, &sys),
+            nvidia_render_node_in(&dri, &sys, None),
             Some(dri.join("renderD129"))
         );
     }
@@ -832,11 +853,36 @@ mod tests {
     #[test]
     fn no_nvidia_node_yields_nothing() {
         let (_t, dri, sys) = fixture(&[("renderD128", Some("0x8086\n")), ("renderD129", None)]);
-        assert_eq!(nvidia_render_node_in(&dri, &sys), None);
+        assert_eq!(nvidia_render_node_in(&dri, &sys, None), None);
         // Missing `/dev/dri` or `/sys`.
         assert_eq!(
-            nvidia_render_node_in(Path::new("/nonexistent/dri"), &sys),
+            nvidia_render_node_in(Path::new("/nonexistent/dri"), &sys, None),
             None
+        );
+    }
+
+    /// A dual-NVIDIA box takes the node on CUDA's PCI slot, whatever the name order says.
+    #[test]
+    fn the_cuda_slot_wins_over_name_order() {
+        let (_t, dri, sys) = fixture(&[
+            ("renderD128", Some("0x10de\n")),
+            ("renderD129", Some("0x10de\n")),
+        ]);
+        for (node, slot) in [
+            ("renderD128", "0000:01:00.0"),
+            ("renderD129", "0000:0a:00.0"),
+        ] {
+            let uevent = format!("DRIVER=nvidia\nPCI_SLOT_NAME={slot}\n");
+            std::fs::write(sys.join(node).join("device").join("uevent"), uevent).unwrap();
+        }
+        assert_eq!(
+            nvidia_render_node_in(&dri, &sys, Some("0000:0A:00.0")),
+            Some(dri.join("renderD129"))
+        );
+        assert_eq!(
+            nvidia_render_node_in(&dri, &sys, Some("0000:02:00.0")),
+            Some(dri.join("renderD128")),
+            "an unknown slot keeps the vendor scan"
         );
     }
 
@@ -849,7 +895,7 @@ mod tests {
             ("renderD129", Some("0x10de\n")),
         ]);
         assert_eq!(
-            nvidia_render_node_in(&dri, &sys),
+            nvidia_render_node_in(&dri, &sys, None),
             Some(dri.join("renderD129"))
         );
     }
