@@ -1131,7 +1131,7 @@ final class SessionModel: ObservableObject {
                     self?.revealStream()
                     return
                 }
-                self?.launchWindowWait = windowWait
+                if self?.launchWindowWait != windowWait { self?.launchWindowWait = windowWait }
                 try? await Task.sleep(nanoseconds: NSEC_PER_SEC)
             }
         }
@@ -1289,7 +1289,11 @@ final class SessionModel: ObservableObject {
                 // decodes (a rejected/capped switch). The decoded-frame END clears it promptly on
                 // success; this only fires after the timeout.
                 self.resizeIndicator.tick(now: ProcessInfo.processInfo.systemUptime)
-                self.resizing = self.resizeIndicator.active
+                // Published only on change: @Published fires on every assignment, and each one
+                // re-renders the window over the stream.
+                if self.resizing != self.resizeIndicator.active {
+                    self.resizing = self.resizeIndicator.active
+                }
                 // Access chip + expiry warnings: the same tick that drives every other live
                 // readout also walks the countdown and picks up mid-session grant edits.
                 self.updateAccessState()
@@ -1324,11 +1328,12 @@ final class SessionModel: ObservableObject {
     /// change so a cycle never waits for the next tick.
     func renderHud() {
         guard let conn = connection else {
-            hudLines = []
+            if !hudLines.isEmpty { hudLines = [] }
             return
         }
         let advanced = UserDefaults.standard.bool(forKey: DefaultsKey.advancedStats)
-        hudLines = conn.hudLines(tier: statsVerbosity, advanced: advanced, facts: hudFacts())
+        let lines = conn.hudLines(tier: statsVerbosity, advanced: advanced, facts: hudFacts())
+        if lines != hudLines { hudLines = lines } // an unchanged overlay must not re-render
     }
 
     /// What only the app knows: the floor policy (macOS presents straight to the display, so
