@@ -48,6 +48,12 @@ pub struct PendingRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub at: String,
+    /// An emulator to install into `path` first: the operator's yes installs, then grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emulator: Option<String>,
+    /// A libretro core to install into `path` (RetroArch's cores folder) first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core: Option<String>,
 }
 
 /// One plugin's entry in `plugin-grants.json`.
@@ -666,9 +672,112 @@ impl AccessStore {
             write,
             reason: reason.clone(),
             at: now_rfc3339(),
+            emulator: None,
+            core: None,
         });
         *changed = true;
         outcome(canon, "pending")
+    }
+
+    /// A plugin asks for an emulator. The row carries the folder the install lands in, so the
+    /// operator's yes installs first and then grants it like any folder; the folder need not
+    /// exist yet, which is why this skips the path rules a plain request goes through.
+    pub fn request_emulator(
+        &self,
+        id: &str,
+        emulator: &str,
+        path: &Path,
+        reason: Option<String>,
+    ) -> io::Result<Mutation<RequestOutcome>> {
+        self.request_managed(id, path, reason, Some(emulator), None)
+    }
+
+    /// A plugin asks for a libretro core: the row's folder is RetroArch's cores folder.
+    pub fn request_core(
+        &self,
+        id: &str,
+        core: &str,
+        path: &Path,
+        reason: Option<String>,
+    ) -> io::Result<Mutation<RequestOutcome>> {
+        self.request_managed(id, path, reason, None, Some(core))
+    }
+
+    fn request_managed(
+        &self,
+        id: &str,
+        path: &Path,
+        reason: Option<String>,
+        emulator: Option<&str>,
+        core: Option<&str>,
+    ) -> io::Result<Mutation<RequestOutcome>> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let access = self.load_access();
+        let mut pending_all = self.load_pending();
+        let canon = path.to_string_lossy().into_owned();
+        let entry = access.get(id).cloned().unwrap_or_default();
+        let mut pending = pending_all.remove(id).unwrap_or_default();
+        let outcome = |o: &str| RequestOutcome {
+            path: canon.clone(),
+            outcome: o.into(),
+        };
+        let answer = if entry.grants.iter().any(|g| same_path(&g.path, &canon)) {
+            outcome("granted")
+        } else if entry.denied.iter().any(|d| same_path(d, &canon)) {
+            outcome("denied")
+        } else if pending
+            .iter()
+            .any(|p| same_path(&p.path, &canon) && p.core.as_deref() == core)
+        {
+            outcome("pending")
+        } else if entry.grants.len() >= MAX_GRANTS {
+            outcome("refused:grant_limit")
+        } else if pending.len() >= MAX_PENDING {
+            outcome("refused:pending_limit")
+        } else {
+            pending.push(PendingRequest {
+                path: canon.clone(),
+                write: false,
+                reason,
+                at: now_rfc3339(),
+                emulator: emulator.map(str::to_string),
+                core: core.map(str::to_string),
+            });
+            pending_all.insert(id.to_string(), pending);
+            self.write_pending(&pending_all)?;
+            return Ok(Mutation {
+                value: outcome("pending"),
+                changed: true,
+            });
+        };
+        Ok(Mutation {
+            value: answer,
+            changed: false,
+        })
+    }
+
+    /// The emulator a pending row asks for, when it is one.
+    pub fn pending_emulator(&self, id: &str, path: &str) -> Option<String> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.load_pending()
+            .get(id)?
+            .iter()
+            .find(|p| same_path(&p.path, path))
+            .and_then(|p| p.emulator.clone())
+    }
+
+    /// The cores the pending rows for `path` ask for: several cores share one folder.
+    pub fn pending_cores(&self, id: &str, path: &str) -> Vec<String> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.load_pending()
+            .get(id)
+            .map(|rows| {
+                rows.iter()
+                    .filter(|p| same_path(&p.path, path))
+                    .filter_map(|p| p.core.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The operator's answer. `allow` needs a matching pending row and applies the platform
@@ -1743,6 +1852,8 @@ mod tests {
                 write: false,
                 reason: None,
                 at: "x".into(),
+                emulator: None,
+                core: None,
             })
             .collect();
         let s = write_state(&f, entry, pending);
@@ -1771,6 +1882,8 @@ mod tests {
                 write: false,
                 reason: None,
                 at: "x".into(),
+                emulator: None,
+                core: None,
             }],
         );
         let acl_before = acl_calls();

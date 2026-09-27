@@ -164,6 +164,7 @@ mod native_pairing;
 mod net_health;
 mod osinfo;
 // Live per-session pad tap the console's Controllers page streams.
+mod emulators;
 mod pad_feed;
 mod plugins;
 mod power;

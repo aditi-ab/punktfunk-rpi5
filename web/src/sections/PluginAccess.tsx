@@ -1,7 +1,14 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
-import { AlertTriangle, FolderLock, RotateCcw, Trash2 } from "lucide-react";
+import {
+	AlertTriangle,
+	Download,
+	FolderLock,
+	RotateCcw,
+	Trash2,
+} from "lucide-react";
 import type { FC } from "react";
+import { useGetEmulators } from "@/api/gen/emulators/emulators";
 import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot";
 import {
 	getGetPluginAccessQueryKey,
@@ -56,7 +63,14 @@ export const PendingAccess: FC<{
 	onDecide: DecideAccess;
 }> = ({ access, busy, onDecide }) => {
 	const allowAll =
-		access.pending.length > 1 && access.pending.every((row) => !row.write);
+		access.pending.length > 1 &&
+		access.pending.every((row) => !row.write && !row.emulator && !row.core);
+	// An emulator row names the catalog id; the list gives it its name.
+	const emulators = useGetEmulators({
+		query: { enabled: access.pending.some((row) => !!row.emulator) },
+	});
+	const emulatorName = (id: string) =>
+		emulators.data?.find((e) => e.id === id)?.name ?? id;
 	return (
 		<div className="mt-3 space-y-2 border-t pt-3">
 			{access.pending.map((row) => (
@@ -69,14 +83,33 @@ export const PendingAccess: FC<{
 					}
 				>
 					<div className="flex items-start gap-2">
-						{row.write ? (
+						{row.emulator || row.core ? (
+							<Download className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+						) : row.write ? (
 							<AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" />
 						) : (
 							<FolderLock className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
 						)}
 						<div className="min-w-0 flex-1">
-							<div className="break-all font-mono text-xs">{row.path}</div>
-							<Mode write={row.write} />
+							{row.emulator || row.core ? (
+								<>
+									<div className="text-sm font-medium">
+										{row.core
+											? m.plugin_access_install_core({ name: row.core })
+											: m.plugin_access_install_emulator({
+													name: emulatorName(row.emulator ?? ""),
+												})}
+									</div>
+									<div className="break-all font-mono text-xs text-muted-foreground">
+										{row.path}
+									</div>
+								</>
+							) : (
+								<>
+									<div className="break-all font-mono text-xs">{row.path}</div>
+									<Mode write={row.write} />
+								</>
+							)}
 							{row.reason && (
 								<p className="mt-1 text-xs text-muted-foreground">
 									{row.reason}
@@ -91,14 +124,20 @@ export const PendingAccess: FC<{
 							disabled={busy}
 							onClick={() => onDecide([row.path], "deny")}
 						>
-							{m.plugin_access_dont_allow()}
+							{row.emulator || row.core
+								? m.plugin_access_not_now()
+								: m.plugin_access_dont_allow()}
 						</Button>
 						<Button
 							size="sm"
 							disabled={busy}
 							onClick={() => onDecide([row.path], "allow")}
 						>
-							{m.plugin_access_allow()}
+							{row.emulator || row.core
+								? busy
+									? m.plugin_access_installing()
+									: m.plugin_access_install()
+								: m.plugin_access_allow()}
 						</Button>
 					</div>
 				</div>
