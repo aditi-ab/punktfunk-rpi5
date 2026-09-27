@@ -108,8 +108,8 @@ public enum GamepadGlyphs {
         // Xbox, the Steam pads (Deck included — its ABXY is the Xbox layout), and `.auto`, which
         // is what a client with no remembered pad has. Xbox letters double as the neutral default
         // because they ARE the positional names in `GCExtendedGamepad`.
-        case .auto, .xbox360, .xboxOne, .steamController, .steamDeck, .steamController2,
-             .steamController2Puck:
+        case .auto, .xbox360, .xboxOne, .xboxElite, .steamController, .steamDeck,
+             .steamController2, .steamController2Puck:
             switch role {
             case .a: return "a.circle"
             case .b: return "b.circle"
