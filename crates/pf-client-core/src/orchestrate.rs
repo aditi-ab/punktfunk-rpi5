@@ -549,13 +549,15 @@ impl ResolvedSpec {
     }
 }
 
-/// One event from the session child's stdout contract (`{"ready":true}`,
+/// One event from the session child's stdout contract (`{"ready":true}`, `stats-json:`,
 /// `{"error":…}`, `{"ended":…}`, then EOF and an exit code). Parsed once so
 /// shells cannot disagree about what "ready" or "trust rejected" means.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SessionEvent {
     /// First frame presented — the stream is up.
     Ready,
+    /// One `stats-json:` window, once a second.
+    Stats(Box<punktfunk_core::hud::StatsSnapshot>),
     Error {
         msg: String,
         trust_rejected: bool,
@@ -572,8 +574,14 @@ pub enum SessionEvent {
     Exited(i32),
 }
 
-/// Parse one stdout line of the session contract. `None` for `stats:` and stray output.
+/// Parse one stdout line of the session contract. `None` for the text `stats:` line, which
+/// is for a person reading a log, and for stray output.
 pub fn parse_session_line(line: &str) -> Option<SessionEvent> {
+    if let Some(json) = line.strip_prefix("stats-json: ") {
+        return serde_json::from_str(json)
+            .ok()
+            .map(|s| SessionEvent::Stats(Box::new(s)));
+    }
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     if v.get("ready").and_then(|r| r.as_bool()) == Some(true) {
         return Some(SessionEvent::Ready);
@@ -644,21 +652,19 @@ impl CancelHandle {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
+
+    /// Whether a child is spawned and not yet reaped.
+    pub fn is_running(&self) -> bool {
+        self.child.lock().unwrap().is_some()
+    }
 }
 
-/// Spawns the session and supervises stdout on a reader thread. `cancel` accepts
-/// cancellation before or after the child is armed. [`SessionEvent::Exited`] always
-/// arrives, and `None` creates a fresh handle.
-pub fn spawn_session(
-    plan: &ConnectPlan,
-    cancel: Option<CancelHandle>,
-    on_event: impl FnMut(SessionEvent) + Send + 'static,
-) -> Result<CancelHandle, String> {
+/// The session command for `plan`, and the `--resolved-spec` temp it names. Spec mode: the
+/// child reads no stores and cannot disagree about a file either of us might write. A failed
+/// write is not fatal — the child's compat path resolves the same values through the same helper.
+pub fn session_command(plan: &ConnectPlan) -> (Command, Option<std::path::PathBuf>) {
     let mut cmd = Command::new(session_binary());
     let mut args = plan.session_args();
-    // Spec mode: the child reads no stores and cannot disagree about a file either
-    // of us might write. A failed write is not fatal — the child's compat path
-    // resolves the same values through the same helper.
     let spec_path = match plan.spec(plan.clipboard).write_temp() {
         Ok(path) => {
             args.push("--resolved-spec".into());
@@ -670,14 +676,42 @@ pub fn spawn_session(
             None
         }
     };
-    cmd.args(args)
-        .stdin(Stdio::null())
+    cmd.args(args);
+    (cmd, spec_path)
+}
+
+/// Spawns the session for `plan` and supervises it. See [`spawn_child`].
+pub fn spawn_session(
+    plan: &ConnectPlan,
+    cancel: Option<CancelHandle>,
+    on_event: impl FnMut(SessionEvent) + Send + 'static,
+) -> Result<CancelHandle, String> {
+    let (cmd, spec_path) = session_command(plan);
+    let slot = spawn_child(cmd, spec_path, cancel, std::io::stderr(), on_event)?;
+    tracing::info!(
+        host = %plan.host.addr, port = plan.host.port,
+        preset = plan.preset.as_ref().map(|p| p.name.as_str()).unwrap_or("-"),
+        "session binary spawned"
+    );
+    Ok(slot)
+}
+
+/// Spawns a session command and supervises its stdout contract on a reader thread.
+/// Stderr goes to `stderr_sink` and the log ring. `spec_path` is deleted once the child
+/// exits, or at once if it never starts. `cancel` accepts cancellation before or after the
+/// child is armed; `None` creates a fresh handle. [`SessionEvent::Exited`] always arrives.
+pub fn spawn_child(
+    mut cmd: Command,
+    spec_path: Option<std::path::PathBuf>,
+    cancel: Option<CancelHandle>,
+    stderr_sink: impl std::io::Write + Send + 'static,
+    on_event: impl FnMut(SessionEvent) + Send + 'static,
+) -> Result<CancelHandle, String> {
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Piped through the ring forwarder, not inherited: a GUI-only log export
         // otherwise holds everything except the stream it was exported about.
         .stderr(Stdio::piped());
-    // The reader thread below deletes the spec once the child is done with it; a spawn that
-    // never gets there has to clean up after itself, or the temp is left for good.
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -688,13 +722,8 @@ pub fn spawn_session(
         }
     };
     if let Some(stderr) = child.stderr.take() {
-        crate::logring::forward_child_stderr(stderr, std::io::stderr());
+        crate::logring::forward_child_stderr(stderr, stderr_sink);
     }
-    tracing::info!(
-        host = %plan.host.addr, port = plan.host.port,
-        preset = plan.preset.as_ref().map(|p| p.name.as_str()).unwrap_or("-"),
-        "session binary spawned"
-    );
     let stdout = child.stdout.take().expect("piped stdout");
     let slot = cancel.unwrap_or_default();
     *slot.child.lock().unwrap() = Some(child);
@@ -1081,7 +1110,11 @@ mod tests {
         // ignoring it.
         assert_eq!(parse_session_line(r#"{"window":{"w":1600}}"#), None);
         assert_eq!(parse_session_line("stats: 1280×800@60 · 60 fps"), None);
-        assert_eq!(parse_session_line(r#"stats-json: {"received":60}"#), None);
+        // The snapshot is an event; the text line is for a person reading a log.
+        match parse_session_line(r#"stats-json: {"width":1280,"received":60}"#) {
+            Some(SessionEvent::Stats(s)) => assert_eq!((s.width, s.received), (1280, 60)),
+            other => panic!("stats line parsed as {other:?}"),
+        }
         assert_eq!(parse_session_line(""), None);
         assert_eq!(parse_session_line(r#"{"other":1}"#), None);
     }

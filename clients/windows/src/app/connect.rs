@@ -8,7 +8,7 @@ use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
 use crate::trust::{self, KnownHost, KnownHosts};
 use pf_client_core::discovery::{DiscoveredHost, DiscoveryEvent};
-use pf_client_core::orchestrate::{WakeOutcome, WakeWait};
+use pf_client_core::orchestrate::{CancelHandle, WakeOutcome, WakeWait};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -244,7 +244,7 @@ fn connect_spawn(
     };
 
     // A fresh child slot per spawn, installed where Disconnect/Cancel can reach it.
-    let child = crate::spawn::SessionChild::default();
+    let child = CancelHandle::default();
     *ctx.shared.session.lock().unwrap() = child.clone();
     *ctx.shared.stats.lock().unwrap() = None;
     ctx.shared.browse.store(false, Ordering::SeqCst);
@@ -370,7 +370,7 @@ pub(crate) fn open_console(
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
 ) {
-    let child = crate::spawn::SessionChild::default();
+    let child = CancelHandle::default();
     *ctx.shared.session.lock().unwrap() = child.clone();
     *ctx.shared.stats.lock().unwrap() = None;
     ctx.shared.browse.store(true, Ordering::SeqCst);

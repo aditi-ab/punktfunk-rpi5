@@ -1169,8 +1169,8 @@ from the config directory for a true factory reset."
                     trust_rejected,
                 } => failure = Some((msg, trust_rejected)),
                 SessionEvent::Ended(reason) => eprintln!("{reason}"),
-                // Persisted by the brain on the way past; nothing to report here.
-                SessionEvent::Window { .. } => {}
+                // The window size is persisted by the brain on the way past.
+                SessionEvent::Window { .. } | SessionEvent::Stats(_) => {}
                 SessionEvent::Exited(code) => {
                     return match failure {
                         Some((msg, true)) => {

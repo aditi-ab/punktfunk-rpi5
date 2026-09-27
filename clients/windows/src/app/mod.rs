@@ -162,8 +162,9 @@ pub(crate) struct Shared {
     /// case Refresh is simply inert rather than a second, competing browse).
     pub(crate) rescan: Mutex<Option<discovery::Rescan>>,
     /// The live session child (spawn mode) — the status page's Disconnect and the
-    /// request-access Cancel kill it. A FRESH handle is installed per spawn.
-    pub(crate) session: Mutex<crate::spawn::SessionChild>,
+    /// request-access Cancel kill it. A FRESH handle is installed per spawn, so a stale
+    /// handle never kills a newer session.
+    pub(crate) session: Mutex<pf_client_core::orchestrate::CancelHandle>,
     /// Latest stats window from the session child (spawn mode); mirrored into the HUD
     /// sample for the session status page.
     pub(crate) stats: Mutex<Option<punktfunk_core::hud::StatsSnapshot>>,
