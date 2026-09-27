@@ -292,26 +292,17 @@ pub(crate) fn art_slot(art: &mut Artwork, kind: ArtKind) -> &mut Option<String> 
     }
 }
 
-/// Held across load-modify-save: two providers syncing at once share one `library.json.tmp`,
-/// and the later save would drop the earlier one's rows.
+/// Held across load-modify-save: two providers syncing at once would each write back what
+/// they loaded, and the later save would drop the earlier one's rows.
 fn catalog_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Every mutation path goes through here, so the first write upgrades v1.
+/// Every mutation path goes through here, so the first write upgrades v1. Owner-only, like
+/// hooks.json: a local user must not plant `prep`/`launch`.
 fn save_catalog(catalog: &Catalog) -> Result<()> {
-    let dir = pf_paths::config_dir();
-    // 0700 / SYSTEM+Admins, matching hooks.json: a local user must not plant `prep`/`launch`.
-    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let json = serde_json::to_string_pretty(catalog)?;
-    // Crash mid-write must not truncate. `write_secret_file` applies 0600 / SYSTEM+Admins before
-    // the rename carries them to the final path.
-    let tmp = custom_path().with_extension("json.tmp");
-    pf_paths::write_secret_file(&tmp, json.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, custom_path()).context("rename library.json")?;
-    Ok(())
+    save_json(&custom_path(), &serde_json::to_string_pretty(catalog)?)
 }
 
 /// 12 hex chars from title + wall-clock nanos.

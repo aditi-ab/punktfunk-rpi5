@@ -160,28 +160,6 @@ fn overlay_path(source: &str) -> PathBuf {
         .join(format!("{source}.json"))
 }
 
-/// Absent or malformed → the default. A bad file must cost its fills, not the library.
-fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-            tracing::warn!(file = %path.display(), error = %e, "library metadata file malformed — ignored");
-            T::default()
-        }),
-        Err(_) => T::default(),
-    }
-}
-
-/// Write-then-rename in the private config dir, like `library.json`.
-fn write_private(path: &Path, json: &str) -> Result<()> {
-    let dir = path.parent().context("metadata path has no parent")?;
-    pf_paths::create_private_dir(dir).with_context(|| format!("create {}", dir.display()))?;
-    let tmp = path.with_extension("json.tmp");
-    pf_paths::write_secret_file(&tmp, json.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
-    Ok(())
-}
-
 /// Held across every load-modify-save in this module.
 fn lock() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
@@ -206,7 +184,7 @@ fn load_overlay(source: &str) -> Arc<Overlay> {
             return o.clone();
         }
     }
-    let overlay = Arc::new(read_json::<Overlay>(&path));
+    let overlay = Arc::new(read_json_or_default::<Overlay>(&path));
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -355,12 +333,12 @@ pub fn put_metadata(source: &str, input: MetadataInput) -> Result<(usize, usize)
     let path = overlay_path(source);
     let changed = std::fs::read_to_string(&path).map_or(true, |old| old != json);
     if changed {
-        write_private(&path, &json)?;
+        save_json(&path, &json)?;
     }
-    let mut settings: Settings = read_json(&settings_path());
+    let mut settings: Settings = read_json_or_default(&settings_path());
     let placed = place_source(&mut settings.sources, source, input.matching);
     if placed {
-        write_private(&settings_path(), &serde_json::to_string_pretty(&settings)?)?;
+        save_json(&settings_path(), &serde_json::to_string_pretty(&settings)?)?;
     }
     if changed || placed {
         emit_changed(source);
@@ -376,12 +354,12 @@ pub fn delete_metadata(source: &str) -> Result<bool> {
     if had_file {
         std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
     }
-    let mut settings: Settings = read_json(&settings_path());
+    let mut settings: Settings = read_json_or_default(&settings_path());
     let before = settings.sources.len();
     settings.sources.retain(|s| s.id != source);
     let had_row = settings.sources.len() != before;
     if had_row {
-        write_private(&settings_path(), &serde_json::to_string_pretty(&settings)?)?;
+        save_json(&settings_path(), &serde_json::to_string_pretty(&settings)?)?;
     }
     if had_file || had_row {
         emit_changed(source);
@@ -391,7 +369,7 @@ pub fn delete_metadata(source: &str) -> Result<bool> {
 
 /// Every source, in the operator's order.
 pub fn list_metadata_sources() -> Vec<MetadataSourceInfo> {
-    read_json::<Settings>(&settings_path())
+    read_json_or_default::<Settings>(&settings_path())
         .sources
         .into_iter()
         .map(|s| MetadataSourceInfo {
@@ -409,7 +387,7 @@ pub fn list_metadata_sources() -> Vec<MetadataSourceInfo> {
 pub fn set_metadata_sources(updates: &[MetadataSourceUpdate]) -> Result<Vec<MetadataSourceInfo>> {
     {
         let _serial = lock();
-        let mut settings: Settings = read_json(&settings_path());
+        let mut settings: Settings = read_json_or_default(&settings_path());
         let mut next = Vec::with_capacity(settings.sources.len());
         for u in updates {
             if let Some(pos) = settings.sources.iter().position(|s| s.id == u.id) {
@@ -421,7 +399,7 @@ pub fn set_metadata_sources(updates: &[MetadataSourceUpdate]) -> Result<Vec<Meta
         }
         next.append(&mut settings.sources);
         settings.sources = next;
-        write_private(&settings_path(), &serde_json::to_string_pretty(&settings)?)?;
+        save_json(&settings_path(), &serde_json::to_string_pretty(&settings)?)?;
     }
     emit_changed("manual");
     Ok(list_metadata_sources())
@@ -432,7 +410,7 @@ pub fn set_metadata_sources(updates: &[MetadataSourceUpdate]) -> Result<Vec<Meta
 pub fn set_art_pick(library_id: &str, kind: ArtKind, url: Option<String>) -> Result<Artwork> {
     let picked = {
         let _serial = lock();
-        let mut picks: Picks = read_json(&picks_path());
+        let mut picks: Picks = read_json_or_default(&picks_path());
         let art = picks.picks.entry(library_id.to_string()).or_default();
         *art_slot(art, kind) = url;
         let picked = art.clone();
@@ -442,7 +420,7 @@ pub fn set_art_pick(library_id: &str, kind: ArtKind, url: Option<String>) -> Res
         {
             picks.picks.remove(library_id);
         }
-        write_private(&picks_path(), &serde_json::to_string_pretty(&picks)?)?;
+        save_json(&picks_path(), &serde_json::to_string_pretty(&picks)?)?;
         picked
     };
     emit_changed("manual");
@@ -457,7 +435,7 @@ pub(crate) struct Fills {
 
 impl Fills {
     pub(crate) fn load() -> Self {
-        let sources = read_json::<Settings>(&settings_path())
+        let sources = read_json_or_default::<Settings>(&settings_path())
             .sources
             .into_iter()
             .filter(|s| s.enabled)
@@ -468,7 +446,7 @@ impl Fills {
             .collect();
         Self {
             sources,
-            picks: read_json::<Picks>(&picks_path()).picks,
+            picks: read_json_or_default::<Picks>(&picks_path()).picks,
         }
     }
 

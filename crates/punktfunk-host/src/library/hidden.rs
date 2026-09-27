@@ -27,25 +27,7 @@ fn settings_path() -> PathBuf {
 /// Malformed or absent file → nothing hidden. A bad parse must show too much,
 /// not an empty library.
 fn load_settings() -> HiddenSettings {
-    match std::fs::read_to_string(settings_path()) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "library-hidden.json malformed — nothing hidden");
-            HiddenSettings::default()
-        }),
-        Err(_) => HiddenSettings::default(),
-    }
-}
-
-fn save_settings(settings: &HiddenSettings) -> Result<()> {
-    let dir = pf_paths::config_dir();
-    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let json = serde_json::to_string_pretty(settings)?;
-    // Write-then-rename: a crash mid-write must not truncate the file.
-    let tmp = settings_path().with_extension("json.tmp");
-    pf_paths::write_secret_file(&tmp, json.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, settings_path()).context("rename library-hidden.json")?;
-    Ok(())
+    read_json_or_default(&settings_path())
 }
 
 pub(crate) fn hidden_ids() -> HashSet<String> {
@@ -73,7 +55,7 @@ pub fn set_entry_hidden(id: &str, hidden: bool) -> Result<bool> {
     } else {
         settings.hidden.retain(|h| h != id);
     }
-    save_settings(&settings)?;
+    save_json(&settings_path(), &serde_json::to_string_pretty(&settings)?)?;
     crate::events::emit(crate::events::EventKind::LibraryChanged {
         source: store_of(id).to_string(),
     });
