@@ -65,7 +65,7 @@ fn check_privileged_fields(
                          only be set with the operator's admin token — a plugin may publish entries \
                          with any host-resolved launch kind (steam_appid, steam_ui, launcher_ui, \
                          epic, gog, aumid, xbox, lutris_id, heroic, playnite, uplay, amazon, \
-                         battlenet) or `plugin` instead"
+                         battlenet, ea, rockstar) or `plugin` instead"
                     ),
                 ),
             ));
