@@ -986,10 +986,11 @@ public final class Stage2Pipeline {
             // bitstream before submit (see HevcConcealer). Thread-confined; one per session.
             let concealer: HevcConcealer? = connection.videoCodec == .hevc ? HevcConcealer() : nil
             var wasUnrecoverable = false
-            // 4:4:4 backstop: a run of decode/create failures in a 4:4:4 session means this device can't
-            // decode 4:4:4 at the negotiated resolution (the HW probe clears the common case but not a
-            // resolution-ceiling miss). End cleanly instead of looping on a black screen.
-            var decodeFailRun = 0
+            // Hardware-only backstop (4:4:4, AV1): 3 s in which every decode fails means this device
+            // can't decode the mode at all, e.g. past a resolution ceiling. End instead of looping on
+            // black. Timed, not counted: after a failure only IDRs reach the decoder.
+            let hardwareOnly = connection.isChroma444 || connection.videoCodec == .av1
+            var failingSinceNs: UInt64?
             // Every iteration drains its own autorelease pool: this thread has no runloop, so
             // autoreleased VT/CM temporaries would otherwise accumulate until session end.
             // `false` = session over — exit the loop (the closure can't `break` across itself).
@@ -1004,6 +1005,7 @@ public final class Stage2Pipeline {
                     // withheld until it lands.
                     if connection.isVideoDropped {
                         _ = try connection.nextAU(timeoutMs: 100)
+                        failingSinceNs = nil
                         return true
                     }
                     if pump.awaitingIDR { recovery.request() }
@@ -1071,16 +1073,16 @@ public final class Stage2Pipeline {
                     if step.withhold { return true }
                     guard let f = pump.format, !token.isStopped else { return true }
                     if decoder.decode(au: au, format: f) {
-                        decodeFailRun = 0
+                        failingSinceNs = nil
                     } else {
                         // Submit/decoder error: drop the session and re-gate on the next IDR's in-band
                         // parameter sets (a delta frame can't recover) and keep asking for that IDR.
                         decoder.reset()
                         pump.requireIDR()
-                        decodeFailRun += 1
-                        // ~3 s of solid failure in a 4:4:4 session (and only there — a 4:2:0 loss
-                        // recovers within a GOP) ⇒ 4:4:4 isn't decodable here; end the session.
-                        if connection.isChroma444, decodeFailRun >= 180 {
+                        let nowNs = DispatchTime.now().uptimeNanoseconds
+                        let sinceNs = failingSinceNs ?? nowNs
+                        failingSinceNs = sinceNs
+                        if hardwareOnly, nowNs - sinceNs >= 3_000_000_000 {
                             if !token.isStopped { onSessionEnd?() }
                             return false
                         }
