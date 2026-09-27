@@ -254,11 +254,12 @@ impl Ink {
     /// OS-theme ink. The accent is already lifted by [`crate::os_theme::readable_accent`];
     /// an arbitrary OS colour is not contrast-safe as focus. Fg is the theme's own.
     pub fn of_os(t: &crate::os_theme::OsTheme) -> Ink {
-        let c = |(r, g, b): (f64, f64, f64), a: f32| Color4f::new(r as f32, g as f32, b as f32, a);
+        let c =
+            |crate::os_theme::Rgb(r, g, b), a: f32| Color4f::new(r as f32, g as f32, b as f32, a);
         let accent = c(crate::os_theme::readable_accent(t), 1.0);
         if !t.light {
             // Theme field, not brand violet-grey: a panel sits a shade above the ground it covers.
-            let glass = c(crate::os_theme::mix(t.background, t.foreground, 0.10), 0.62);
+            let glass = c(t.background.mix(t.foreground, 0.10), 0.62);
             return Ink {
                 fg: c(t.foreground, 1.0),
                 accent,
@@ -1024,6 +1025,21 @@ pub fn match_first_family(mgr: &FontMgr, families: &[&str], style: FontStyle) ->
     families
         .iter()
         .find_map(|f| mgr.match_family_style(f, style))
+}
+
+/// `src` composited over an opaque `dst`, for tests that read contrast off stacked paints.
+#[cfg(test)]
+pub(crate) fn over(src: Color4f, dst: Color4f) -> Color4f {
+    let m = |s: f32, d: f32| s * src.a + d * (1.0 - src.a);
+    Color4f::new(m(src.r, dst.r), m(src.g, dst.g), m(src.b, dst.b), 1.0)
+}
+
+/// WCAG contrast of two opaque colours ([`pf_client_core::rgb::contrast`]).
+#[cfg(test)]
+pub(crate) fn contrast(a: Color4f, b: Color4f) -> f64 {
+    use pf_client_core::rgb::Rgb;
+    let rgb = |c: Color4f| Rgb(f64::from(c.r), f64::from(c.g), f64::from(c.b));
+    pf_client_core::rgb::contrast(rgb(a), rgb(b))
 }
 
 #[cfg(test)]

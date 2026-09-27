@@ -1597,6 +1597,69 @@ fn key_rows() -> &'static [Vec<Key>] {
     })
 }
 
+/// What input to an open text field asks of the screen that owns it. Typing and deleting
+/// already landed in the field's text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Entry {
+    /// Nothing more to do: a key typed, deleted, moved over or refused.
+    Stay,
+    /// Put the field away: Back, Return or Escape, or a press outside the tray.
+    Close,
+    /// The keyboard's Done key or Y; on a Steam Deck, OK. A field whose Done means
+    /// something (search, save) does it; the rest close.
+    Done,
+}
+
+/// `ch` appended to `text` when `admits(text, ch)`; whether it was.
+fn type_into(text: &mut String, ch: char, admits: impl Fn(&str, char) -> bool) -> bool {
+    let ok = admits(text, ch);
+    if ok {
+        text.push(ch);
+    }
+    ok
+}
+
+/// SDL text (a hardware keyboard, or Steam's under gamescope) into an open field, one
+/// character at a time through `admits`.
+pub(crate) fn type_text(text: &mut String, typed: &str, admits: impl Fn(&str, char) -> bool) {
+    for ch in typed.chars() {
+        type_into(text, ch, &admits);
+    }
+}
+
+/// A hardware key while a field is open: Backspace deletes, Return and Escape close.
+/// `None` leaves the key to the shell.
+pub(crate) fn field_key(key: crate::input::Key, text: &mut String) -> Option<Entry> {
+    use crate::input::Key as K;
+    match key {
+        K::Backspace => {
+            text.pop();
+            Some(Entry::Stay)
+        }
+        K::Return | K::Escape => Some(Entry::Close),
+        _ => None,
+    }
+}
+
+/// The legend while a field is open. On a Steam Deck Steam's keyboard types, so the pad
+/// only confirms (`done`) or closes.
+pub(crate) fn entry_hints(deck: bool, done: &'static str) -> Vec<crate::glyphs::Hint> {
+    use crate::glyphs::{Hint, HintKey};
+    if deck {
+        vec![
+            Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
+            Hint::new(HintKey::Confirm, done),
+            Hint::new(HintKey::Back, "Done"),
+        ]
+    } else {
+        vec![
+            Hint::new(HintKey::Confirm, "Type"),
+            Hint::new(HintKey::Tertiary, "Delete"),
+            Hint::new(HintKey::Back, "Done"),
+        ]
+    }
+}
+
 /// Controller keyboard: fixed grid in a bottom tray. D-pad moves, A types, X
 /// backspaces, B/Y/Done confirms. Edits apply live; closing is done. Focus is the console's
 /// plate: it glides in from the field's row, key to key, and back out on close.
@@ -1734,6 +1797,65 @@ impl Keyboard {
         self.shown = shown;
         self.dt = dt;
         self.tray.pos.clamp(0.0, 1.2)
+    }
+
+    /// A pad or remote event for the open field over `text`. Typing lands through `admits`.
+    /// On a Steam Deck (`deck`) Steam types, so the pad only confirms or closes.
+    pub(crate) fn edit_menu(
+        &mut self,
+        ev: MenuEvent,
+        deck: bool,
+        text: &mut String,
+        admits: impl Fn(&str, char) -> bool,
+    ) -> (Entry, Option<MenuPulse>) {
+        if ev == MenuEvent::Back {
+            return (Entry::Close, Some(MenuPulse::Confirm));
+        }
+        if deck {
+            return match ev {
+                MenuEvent::Confirm => (Entry::Done, Some(MenuPulse::Confirm)),
+                _ => (Entry::Stay, None),
+            };
+        }
+        let moved = |ok: bool| {
+            Some(if ok {
+                MenuPulse::Move
+            } else {
+                MenuPulse::Boundary
+            })
+        };
+        match self.menu(ev) {
+            (KeyMsg::Type(c), _) => (Entry::Stay, moved(type_into(text, c, admits))),
+            (KeyMsg::Backspace, _) => (Entry::Stay, moved(text.pop().is_some())),
+            (KeyMsg::Done, _) => (Entry::Done, Some(MenuPulse::Confirm)),
+            (KeyMsg::None, pulse) => (Entry::Stay, pulse),
+        }
+    }
+
+    /// A pointer while the tray is up over `text`. The tray is modal: a press outside it
+    /// closes the field rather than reaching the row underneath. `None` for a hover
+    /// outside, which nothing takes.
+    pub(crate) fn edit_pointer(
+        &mut self,
+        p: Pointer,
+        text: &mut String,
+        admits: impl Fn(&str, char) -> bool,
+    ) -> Option<Entry> {
+        if !self.covers(p) {
+            return p.press().then_some(Entry::Close);
+        }
+        Some(match self.pointer(p).0 {
+            KeyMsg::Type(c) => {
+                type_into(text, c, admits);
+                Entry::Stay
+            }
+            KeyMsg::Backspace => {
+                text.pop();
+                Entry::Stay
+            }
+            KeyMsg::Done => Entry::Done,
+            KeyMsg::None => Entry::Stay,
+        })
     }
 
     /// Tray height in design units (pre-`k`), for layout above it.
@@ -1915,6 +2037,63 @@ fn draw_check(canvas: &Canvas, cx: f64, cy: f64, k: f64, ink: skia_safe::Color4f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Back closes an open field and Y is Done; on a Steam Deck OK is Done and the D-pad
+    /// types nothing. OK types the focused key through the field's rule.
+    #[test]
+    fn an_open_field_routes_back_done_and_the_deck() {
+        use MenuPulse::{Boundary, Confirm, Move};
+        let (mut kb, mut text) = (Keyboard::new(), String::new());
+        let any = |_: &str, _: char| true;
+        let none = |_: &str, _: char| false;
+        let mut ev =
+            |ev, deck, admits: fn(&str, char) -> bool| kb.edit_menu(ev, deck, &mut text, admits);
+        assert!(matches!(
+            ev(MenuEvent::Back, false, any),
+            (Entry::Close, Some(Confirm))
+        ));
+        assert!(matches!(
+            ev(MenuEvent::Back, true, any),
+            (Entry::Close, Some(Confirm))
+        ));
+        assert!(matches!(
+            ev(MenuEvent::Secondary, false, any),
+            (Entry::Done, Some(Confirm))
+        ));
+        assert!(matches!(
+            ev(MenuEvent::Confirm, true, any),
+            (Entry::Done, Some(Confirm))
+        ));
+        let left = MenuEvent::Move(MenuDir::Left);
+        assert!(matches!(ev(left, true, any), (Entry::Stay, None)));
+        assert!(matches!(
+            ev(MenuEvent::Confirm, false, none),
+            (Entry::Stay, Some(Boundary))
+        ));
+        assert!(matches!(
+            ev(MenuEvent::Confirm, false, any),
+            (Entry::Stay, Some(Move))
+        ));
+        assert!(matches!(
+            ev(MenuEvent::Tertiary, false, any),
+            (Entry::Stay, Some(Move))
+        ));
+        assert!(matches!(
+            ev(MenuEvent::Tertiary, false, any),
+            (Entry::Stay, Some(Boundary))
+        ));
+        let mut text = String::from("ab");
+        assert_eq!(
+            field_key(crate::input::Key::Backspace, &mut text),
+            Some(Entry::Stay)
+        );
+        assert_eq!(text, "a");
+        assert_eq!(
+            field_key(crate::input::Key::Return, &mut text),
+            Some(Entry::Close)
+        );
+        assert_eq!(field_key(crate::input::Key::Left, &mut text), None);
+    }
 
     fn kb() -> Keyboard {
         Keyboard::new()

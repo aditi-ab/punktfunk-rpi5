@@ -88,8 +88,8 @@ impl RingEditorScreen {
     pub(crate) fn new(ctx: &Ctx) -> RingEditorScreen {
         let mut s = RingEditorScreen {
             ring: Ring::new(),
-            cfg: OverlayConfig::platform_default(ring_platform(ctx.platform)),
-            platform: ctx.platform,
+            cfg: OverlayConfig::platform_default(ring_platform(ctx.device.platform)),
+            platform: ctx.device.platform,
             blob: String::new(),
             list: MenuList::new(),
             focus: Focus::Ring,
@@ -101,7 +101,7 @@ impl RingEditorScreen {
             swallow_move: false,
         };
         s.ring.edit_at(0.0, 0.0);
-        s.adopt(&ctx.settings.overlay_actions, ctx.platform);
+        s.adopt(&ctx.settings.overlay_actions, ctx.device.platform);
         s
     }
 
@@ -140,7 +140,7 @@ impl RingEditorScreen {
             true
         });
         let b = ctx.settings.overlay_actions.clone();
-        self.adopt(&b, ctx.platform);
+        self.adopt(&b, ctx.device.platform);
     }
 
     fn pick(&mut self, slot: usize, id: &str, ctx: &mut Ctx) {
@@ -458,7 +458,7 @@ impl RingEditorScreen {
     ) {
         if ctx.settings.overlay_actions != self.blob {
             let b = ctx.settings.overlay_actions.clone();
-            self.adopt(&b, ctx.platform);
+            self.adopt(&b, ctx.device.platform);
         }
         self.ring.tick();
         let kf = k as f32;

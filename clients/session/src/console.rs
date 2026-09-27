@@ -50,9 +50,9 @@ pub fn run(target: Option<&str>) -> u8 {
         std::thread::spawn(|| loop {
             let t = pf_client_core::omarchy::current().map(|t| pf_console_ui::os_theme::OsTheme {
                 light: !t.dark,
-                background: (t.bg.0, t.bg.1, t.bg.2),
-                foreground: (t.fg.0, t.fg.1, t.fg.2),
-                accent: (t.accent.0, t.accent.1, t.accent.2),
+                background: t.bg,
+                foreground: t.fg,
+                accent: t.accent,
             });
             // The revision only moves on a real change, so the idle case is one file read.
             pf_console_ui::os_theme::set_os_theme(t);
@@ -380,24 +380,15 @@ fn seed_row(k: Option<&trust::KnownHost>, addr: &str, port: u16) -> HostRow {
 fn fake_host_row() -> HostRow {
     HostRow {
         key: "fake".into(),
-        id: None,
         name: "Demo Host".into(),
         addr: "127.0.0.1".into(),
         port: 9777,
-        fp_hex: String::new(),
         paired: true,
         saved: true,
         online: true,
         mgmt_port: library::DEFAULT_MGMT_PORT,
-        can_wake: false,
-        clipboard_sync: false,
-        last_used: None,
         os: "linux/arch/steamos".into(),
-        actions: Vec::new(),
-        pin: None,
-        bound_preset: None,
-        running: String::new(),
-        game_presets: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -1113,14 +1104,13 @@ impl ServiceState {
                     // compares, and a deleted preset falls back at resolve, not here.
                     game_presets: h.game_presets.clone(),
                 };
-                // A pinned card shares the primary tile's live state; its key rides the
-                // preset id behind a NUL (impossible in a fingerprint or `addr:port`),
-                // so cursor-follow and the wake path address the card itself.
+                // A pinned card shares the primary tile's live state; its own key lets
+                // cursor-follow and the wake path address the card itself.
                 let pins = h
                     .resolved_pins(&catalog)
                     .into_iter()
                     .map(|p| HostRow {
-                        key: format!("{key}\0{}", p.id),
+                        key: pf_console_ui::model::pinned_key(&key, &p.id),
                         pin: Some(chip(p)),
                         bound_preset: None,
                         ..row.clone()

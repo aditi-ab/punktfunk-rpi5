@@ -94,11 +94,11 @@ fn targets(ctx: &Ctx, others: &[OtherDevice]) -> Vec<Target> {
     } else {
         (0..ctx.pads.len()).map(Target::Pad).collect()
     };
-    if !ctx.pads.is_empty() && can_test(ctx.platform) {
+    if !ctx.pads.is_empty() && can_test(ctx.device.platform) {
         all.push(Target::Test);
     }
     all.extend((0..others.len()).map(Target::Other));
-    if ctx.platform == Platform::Android {
+    if ctx.device.platform == Platform::Android {
         all.push(Target::Grants);
     }
     all
@@ -212,7 +212,7 @@ impl PlayersScreen {
         if self.tree.focus().is_none() {
             self.tree.set_focus(Some(target_id(all[0], ctx.pads)));
         }
-        let (platform, pads) = (ctx.platform, ctx.pads);
+        let (platform, pads) = (ctx.device.platform, ctx.pads);
         let (cw, ch, gap) = (CARD_W * k, CARD_H * k, CARD_GAP * k);
         let cards = &all;
         let row_w = cards.len() as f64 * (cw + gap) - gap;
@@ -258,41 +258,17 @@ impl PlayersScreen {
             ));
         let root = El::column().child(row);
         let frame = self.tree.layout(root, rect);
-        let cheap = super::settings::reduce_ui_res(ctx.settings, ctx.platform, ctx.fallback_ui);
+        let cheap = super::settings::reduce_ui_res(
+            ctx.settings,
+            ctx.device.platform,
+            ctx.device.fallback_ui,
+        );
         self.tree.paint_focus(canvas, frame, k as f32, dt, cheap);
     }
 
-    /// The explainer's band reaches the shell's tray in: grant rows run under it on a
-    /// short screen.
-    pub(crate) fn pinned(&self, k: f64) -> (f32, f32) {
-        (0.0, (crate::widgets::FOOT_DETAIL_H * k) as f32)
-    }
-
-    /// What the focus is, on the shell's tray after the trays.
-    pub(crate) fn render_pinned(
-        &mut self,
-        canvas: &Canvas,
-        rect: Rect,
-        k: f64,
-        fonts: &Fonts,
-        ctx: &Ctx,
-    ) {
-        let detail = detail(self.focused(ctx), ctx, &self.others);
-        let h = (crate::widgets::FOOT_DETAIL_H * k) as f32;
-        crate::widgets::Foot {
-            detail: Some(&detail),
-            ..Default::default()
-        }
-        .paint(
-            canvas,
-            fonts,
-            Rect::from_ltrb(rect.left, rect.bottom - h, rect.right, rect.bottom),
-            (
-                f64::from(rect.left) + edge(k),
-                f64::from(rect.right) - edge(k),
-            ),
-            k,
-        );
+    /// What the focus is. Grant rows run under it on a short screen.
+    pub(crate) fn foot(&self, ctx: &Ctx) -> String {
+        detail(self.focused(ctx), ctx, &self.others)
     }
 }
 
@@ -300,7 +276,7 @@ impl PlayersScreen {
 /// for the last card. Anything else is a thud.
 fn activate(t: Target, ctx: &Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
     match t {
-        Target::Pad(i) if can_rumble(&ctx.pads[i], ctx.platform) => {
+        Target::Pad(i) if can_rumble(&ctx.pads[i], ctx.device.platform) => {
             fx.cmds.push(ConsoleCmd::PadAction {
                 action: PadAction::Rumble.id().to_string(),
                 pad_key: ctx.pads[i].key.clone(),
@@ -581,21 +557,14 @@ mod tests {
     ) -> Vec<(Outbox, Option<MenuPulse>)> {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
+        let device = crate::screens::Device {
             platform,
-            screen: None,
+            ..crate::screens::Device::test()
+        };
+        let mut ctx = Ctx {
             pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let fonts = crate::theme::build_fonts().unwrap();
         let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();

@@ -199,25 +199,9 @@ impl CardMenu {
         }
     }
 
-    /// What the connecting takeover names for [`Action::Connect`]: the game being resumed
-    /// if there is one, else the host, with a pinned card's preset.
-    fn title_for_connect(&self) -> String {
-        let host = self.host();
-        let subject = if host.running.is_empty() {
-            &host.name
-        } else {
-            &host.running
-        };
-        match &host.pin {
-            Some(p) => format!("{subject} \u{b7} {}", p.name),
-            None => subject.clone(),
-        }
-    }
-
-    /// Pinned-card keys append the preset id past a NUL. Commands address the host half.
+    /// Commands address the host, not a pinned card's composite key.
     fn host_key(&self) -> &str {
-        let key = self.host().key.as_str();
-        key.split('\0').next().unwrap_or(key)
+        self.host().host_key()
     }
 
     /// The presets this host pins as cards, by id.
@@ -492,7 +476,7 @@ impl CardMenu {
                 _ => {}
             }
         }
-        let actions = self.actions(ctx.store, ctx.tv);
+        let actions = self.actions(ctx.store, ctx.device.tv);
         let (msg, pulse) = self.list.menu(ev, actions.len());
         self.dispatch(msg, pulse, &actions, ctx, fx)
     }
@@ -509,7 +493,7 @@ impl CardMenu {
                 self.strip_focus = false;
             }
         }
-        let actions = self.actions(ctx.store, ctx.tv);
+        let actions = self.actions(ctx.store, ctx.device.tv);
         let (msg, pulse) = self.list.pointer(p, actions.len());
         if matches!(msg, ListMsg::None) && pulse.is_none() {
             return false;
@@ -561,26 +545,11 @@ impl CardMenu {
 
     /// A connect with `preset`: a poster's launches its title, a card's the host alone.
     fn connect(&self, preset: Option<String>) -> super::ConnectIntent {
-        let host = self.host();
-        let (launch, title) = match &self.subject {
-            Subject::Game { game, .. } => (
-                Some(game.id.clone()),
-                match &host.pin {
-                    Some(p) => format!("{} \u{b7} {}", game.title, p.name),
-                    None => game.title.clone(),
-                },
-            ),
-            Subject::Host(_) => (None, self.title_for_connect()),
+        let game = match &self.subject {
+            Subject::Game { game, .. } => Some((game.id.as_str(), game.title.as_str())),
+            Subject::Host(_) => None,
         };
-        super::ConnectIntent {
-            addr: host.addr.clone(),
-            port: host.port,
-            fp_hex: host.fp_hex.clone(),
-            launch,
-            title,
-            request_access: false,
-            preset,
-        }
+        super::ConnectIntent::to_host(self.host(), game).with_preset(preset)
     }
 
     fn run(&mut self, action: Action, ctx: &mut Ctx, fx: &mut Outbox) {
@@ -625,7 +594,7 @@ impl CardMenu {
             }
             Action::Pair => fx.replace(Screen::Pair(super::pair::PairScreen::new(
                 self.host(),
-                ctx.device_name,
+                &ctx.device.name,
             ))),
             Action::AddHost => {
                 let host = self.host();
@@ -855,7 +824,7 @@ impl CardMenu {
         };
         let strip_top = list_rect.top;
         list_rect.top += strip_h as f32;
-        let actions = self.actions(ctx.store, ctx.tv);
+        let actions = self.actions(ctx.store, ctx.device.tv);
         let rows: Vec<RowSpec> = actions
             .iter()
             .map(|&a| {
@@ -965,22 +934,7 @@ mod tests {
         fake_home();
         let mut settings = crate::store::file_store().load();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &[],
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         f(&mut ctx)
     }
 
@@ -1016,25 +970,9 @@ mod tests {
 
     fn host() -> HostRow {
         HostRow {
-            key: "aa".into(),
-            id: None,
-            name: "Desk".into(),
             addr: "10.0.0.5".into(),
-            port: 9777,
-            fp_hex: "aa".into(),
-            paired: true,
-            saved: true,
-            online: true,
             mgmt_port: 9778,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
+            ..HostRow::fixture("aa", "Desk")
         }
     }
 

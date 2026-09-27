@@ -25,7 +25,7 @@ pub struct PresetChip {
 
 /// Home carousel row, fully resolved by the service thread. The shell renders it
 /// verbatim.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostRow {
     /// Fingerprint when pinned, else `addr:port` — cursor identity across snapshot churn.
     pub key: String,
@@ -79,6 +79,41 @@ pub struct HostRow {
     /// outranks `bound_preset` at launch, which the host resolves.
     #[serde(default)]
     pub game_presets: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+impl HostRow {
+    /// A paired, saved, online host at `10.0.0.9:9777` pinned as `key`. Tests override what
+    /// they are about.
+    pub(crate) fn fixture(key: &str, name: &str) -> HostRow {
+        HostRow {
+            key: key.into(),
+            fp_hex: key.into(),
+            name: name.into(),
+            addr: "10.0.0.9".into(),
+            port: 9777,
+            mgmt_port: 47990,
+            paired: true,
+            saved: true,
+            online: true,
+            ..Default::default()
+        }
+    }
+}
+
+impl HostRow {
+    /// The host half of [`Self::key`]: commands, bindings and the store address the host,
+    /// never a pinned card's composite key.
+    pub fn host_key(&self) -> &str {
+        self.key.split('\0').next().unwrap_or(&self.key)
+    }
+}
+
+/// A pinned card's row key: the host's key, then the preset id past a NUL, which no
+/// fingerprint or `addr:port` holds. Apple and Android build the same string, pinned by
+/// `pinned_key` in `clients/shared/console-vectors.json`.
+pub fn pinned_key(host: &str, preset: &str) -> String {
+    format!("{host}\0{preset}")
 }
 
 /// One host-offered action, resolved from `GET /api/v1/actions`
@@ -511,30 +546,38 @@ impl ConsoleBus {
 mod tests {
     use super::*;
 
+    fn tower() -> HostRow {
+        HostRow {
+            addr: "10.0.0.2".into(),
+            online: false,
+            ..HostRow::fixture("aa", "Tower")
+        }
+    }
+
+    #[test]
+    fn pinned_keys_match_the_shared_vectors() {
+        let raw = include_str!("../../../clients/shared/console-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let cases = file["pinned_key"].as_array().expect("pinned_key cases");
+        assert!(!cases.is_empty());
+        for c in cases {
+            let s = |k: &str| c[k].as_str().unwrap_or_else(|| panic!("{k} missing"));
+            let key = pinned_key(s("host"), s("preset"));
+            assert_eq!(key, s("key"));
+            let card = HostRow { key, ..tower() };
+            assert_eq!(card.host_key(), s("host"));
+        }
+        assert_eq!(
+            tower().host_key(),
+            "aa",
+            "a primary row's key is its host key"
+        );
+    }
+
     #[test]
     fn hosts_generation_bumps_only_on_change() {
         let shared = ConsoleShared::default();
-        let row = HostRow {
-            key: "aa".into(),
-            id: None,
-            name: "Tower".into(),
-            addr: "10.0.0.2".into(),
-            port: 9777,
-            fp_hex: "aa".into(),
-            paired: true,
-            saved: true,
-            online: false,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
-        };
+        let row = tower();
         shared.set_hosts(vec![row.clone()]);
         let g1 = shared.hosts_gen();
         shared.set_hosts(vec![row.clone()]);

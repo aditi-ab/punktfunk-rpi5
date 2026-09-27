@@ -389,20 +389,14 @@ pub(crate) struct Shell {
     actions: VecDeque<OverlayAction>,
     settings: trust::Settings,
     store: Arc<dyn SettingsStore>,
-    pub(crate) platform: Platform,
-    screen: Option<DeviceScreen>,
+    /// This device. The overlay corrects `av1_ok` in place.
+    pub(crate) device: crate::screens::Device,
     hosts: Vec<HostRow>,
     hosts_gen: u64,
     /// The host was last told the input test is on.
     pad_testing: bool,
     /// The `host_sort` / `host_grouping` values `hosts` was last arranged by.
     hosts_order: (Option<serde_json::Value>, Option<serde_json::Value>),
-    device_name: String,
-    deck: bool,
-    tv: bool,
-    fallback_ui: bool,
-    pyrowave_ok: bool,
-    pub(crate) av1_ok: bool,
     pub(crate) in_stream: bool,
     connecting: Option<Connecting>,
     launching: Option<Launching>,
@@ -527,18 +521,20 @@ impl Shell {
             mesh_os: None,
             settings,
             store,
-            platform: opts.platform,
-            screen: opts.screen,
+            device: crate::screens::Device {
+                platform: opts.platform,
+                screen: opts.screen,
+                deck: opts.deck,
+                tv: opts.tv,
+                fallback_ui: opts.fallback_ui,
+                pyrowave_ok: opts.pyrowave_ok,
+                av1_ok: opts.av1_ok,
+                name: opts.device_name,
+            },
             hosts: Vec::new(),
             hosts_gen: u64::MAX,
             hosts_order: (None, None),
             pad_testing: false,
-            device_name: opts.device_name,
-            deck: opts.deck,
-            tv: opts.tv,
-            fallback_ui: opts.fallback_ui,
-            pyrowave_ok: opts.pyrowave_ok,
-            av1_ok: opts.av1_ok,
             in_stream: false,
             connecting: None,
             launching: None,
@@ -690,25 +686,23 @@ impl Shell {
         if self.strip_focus && self.stack.len() == 1 {
             return Some(format!("{} tab", self.tab.name()));
         }
+        let (ctx, screen) = self.ctx_and_top();
+        screen.announcement(&ctx)
+    }
+
+    /// The top screen and a [`Ctx`] over the rest of the shell, borrowed apart.
+    fn ctx_and_top(&mut self) -> (Ctx<'_>, &mut Screen) {
         let t = self.t();
-        let screen = self.stack.last()?;
         let ctx = Ctx {
             hosts: &self.hosts,
             library: &self.library,
             settings: &mut self.settings,
             store: &*self.store,
-            platform: self.platform,
-            screen: self.screen,
             pads: &self.pads,
-            deck: self.deck,
-            tv: self.tv,
-            fallback_ui: self.fallback_ui,
-            pyrowave_ok: self.pyrowave_ok,
-            av1_ok: self.av1_ok,
-            device_name: &self.device_name,
+            device: &self.device,
             t,
         };
-        screen.announcement(&ctx)
+        (ctx, self.stack.last_mut().expect("non-empty stack"))
     }
 
     /// The console is covering a live stream — a launch hold — and wants the
@@ -874,7 +868,7 @@ impl Shell {
     }
 
     pub(crate) fn device_name(&self) -> &str {
-        &self.device_name
+        &self.device.name
     }
 
     /// The OS's answer when the host read one, else the console's own row.
@@ -1073,19 +1067,7 @@ impl Shell {
                     self.hosts
                         .iter()
                         .find(|h| h.key == w.key)
-                        .map(|h| ConnectIntent {
-                            addr: h.addr.clone(),
-                            port: h.port,
-                            fp_hex: h.fp_hex.clone(),
-                            launch: None,
-                            // Pinned-card wake carries the pin's preset.
-                            title: match &h.pin {
-                                Some(p) => format!("{} · {}", h.name, p.name),
-                                None => h.name.clone(),
-                            },
-                            request_access: false,
-                            preset: h.pin.as_ref().map(|p| p.id.clone()),
-                        })
+                        .map(|h| ConnectIntent::to_host(h, None))
                 });
                 self.bus.send(ConsoleCmd::CancelWake);
                 self.wake = None;
@@ -1542,26 +1524,8 @@ impl Shell {
 
         let mut fx = Outbox::default();
         let pulse = {
-            let mut ctx = Ctx {
-                hosts: &self.hosts,
-                library: &self.library,
-                settings: &mut self.settings,
-                store: &*self.store,
-                platform: self.platform,
-                screen: self.screen,
-                pads: &self.pads,
-                deck: self.deck,
-                tv: self.tv,
-                fallback_ui: self.fallback_ui,
-                pyrowave_ok: self.pyrowave_ok,
-                av1_ok: self.av1_ok,
-                device_name: &self.device_name,
-                t: self.t0.elapsed().as_secs_f64(),
-            };
-            self.stack
-                .last_mut()
-                .expect("non-empty stack")
-                .menu(ev, &mut ctx, &mut fx)
+            let (mut ctx, top) = self.ctx_and_top();
+            top.menu(ev, &mut ctx, &mut fx)
         };
         // Up that a root screen bumps or leaves unanswered lands on its tab.
         let to_strip = self.stack.len() == 1
@@ -1683,26 +1647,8 @@ impl Shell {
     fn screen_pointer(&mut self, p: Pointer) -> bool {
         let mut fx = Outbox::default();
         let consumed = {
-            let mut ctx = Ctx {
-                hosts: &self.hosts,
-                library: &self.library,
-                settings: &mut self.settings,
-                store: &*self.store,
-                platform: self.platform,
-                screen: self.screen,
-                pads: &self.pads,
-                deck: self.deck,
-                tv: self.tv,
-                fallback_ui: self.fallback_ui,
-                pyrowave_ok: self.pyrowave_ok,
-                av1_ok: self.av1_ok,
-                device_name: &self.device_name,
-                t: self.t0.elapsed().as_secs_f64(),
-            };
-            self.stack
-                .last_mut()
-                .expect("non-empty stack")
-                .pointer(p, &mut ctx, &mut fx)
+            let (mut ctx, top) = self.ctx_and_top();
+            top.pointer(p, &mut ctx, &mut fx)
         };
         self.apply(fx);
         consumed
@@ -1721,26 +1667,9 @@ impl Shell {
         self.last_input = Instant::now();
         self.input_source = Some(crate::console::InputSource::Keys);
         if self.editing() {
-            let mut ctx = Ctx {
-                hosts: &self.hosts,
-                library: &self.library,
-                settings: &mut self.settings,
-                store: &*self.store,
-                platform: self.platform,
-                screen: self.screen,
-                pads: &self.pads,
-                deck: self.deck,
-                tv: self.tv,
-                fallback_ui: self.fallback_ui,
-                pyrowave_ok: self.pyrowave_ok,
-                av1_ok: self.av1_ok,
-                device_name: &self.device_name,
-                t: self.t0.elapsed().as_secs_f64(),
-            };
-            if let Some(top) = self.stack.last_mut() {
-                if top.edit_key(key, &mut ctx) {
-                    return true;
-                }
+            let (mut ctx, top) = self.ctx_and_top();
+            if top.edit_key(key, &mut ctx) {
+                return true;
             }
             // Editing consumed nothing: arrows still drive the OSK grid.
         }
@@ -1820,7 +1749,7 @@ impl Shell {
     /// measures well above what a webOS TV will keep.
     fn apply_speed_bitrate(&mut self, kbps: u32) -> String {
         self.settings = self.store.load();
-        let ceiling = crate::screens::settings::bitrate_ceiling_kbps(self.platform);
+        let ceiling = crate::screens::settings::bitrate_ceiling_kbps(self.device.platform);
         self.settings.bitrate_kbps = kbps.min(ceiling);
         self.store.save(&self.settings);
         format!(
@@ -1948,7 +1877,7 @@ impl Shell {
     /// question, not a press. An Apple app and a browser page cannot close themselves:
     /// there the press does nothing, and a TV remote's Menu is the system's (`at_root`).
     fn ask_exit(&mut self) -> Option<MenuPulse> {
-        if matches!(self.platform, Platform::Apple | Platform::Web) {
+        if matches!(self.device.platform, Platform::Apple | Platform::Web) {
             return Some(MenuPulse::Boundary);
         }
         let exit = crate::screens::prompt::PromptScreen::exit();
@@ -2105,8 +2034,8 @@ impl Shell {
         let t = self.field_clock(t);
         let reduced = crate::screens::settings::reduce_ui_res(
             &self.settings,
-            self.platform,
-            self.fallback_ui,
+            self.device.platform,
+            self.device.fallback_ui,
         );
         let mut cache = self.field.borrow_mut();
         // The reduced interface takes a smaller buffer and one pass over the sphere.
@@ -2241,7 +2170,6 @@ fn stand_in_games() -> Vec<crate::library::LibraryGame> {
 fn stand_in_host() -> HostRow {
     HostRow {
         key: "warm".into(),
-        id: None,
         name: "Stand-in".into(),
         addr: "127.0.0.1".into(),
         port: 9777,
@@ -2250,15 +2178,8 @@ fn stand_in_host() -> HostRow {
         saved: true,
         online: true,
         mgmt_port: 9778,
-        can_wake: false,
-        clipboard_sync: false,
-        last_used: None,
         os: "linux".into(),
-        actions: Vec::new(),
-        pin: None,
-        bound_preset: None,
-        running: String::new(),
-        game_presets: std::collections::BTreeMap::new(),
+        ..Default::default()
     }
 }
 
@@ -2308,16 +2229,17 @@ fn build_mesh(palette_id: &str) -> Result<MeshLook> {
 /// Follow-system field: a quiet ramp from the theme's own colours, not the
 /// curated hue arcs. The desk colour is the point.
 fn build_mesh_os(t: &crate::os_theme::OsTheme) -> Result<MeshLook> {
-    use crate::os_theme::mix;
+    use crate::os_theme::Rgb;
     let (bg, fg, ac) = (t.background, t.foreground, t.accent);
     // A pale field shades toward its text colour, not black: darkening a pastel strands
     // dark ink on it (see `theme::Ink` scrim).
     let stops = if t.light {
-        [mix(bg, fg, 0.10), mix(bg, ac, 0.18), bg]
+        [bg.mix(fg, 0.10), bg.mix(ac, 0.18), bg]
     } else {
-        [mix(bg, (0.0, 0.0, 0.0), 0.35), mix(bg, ac, 0.30), bg]
+        [bg.mix(Rgb(0.0, 0.0, 0.0), 0.35), bg.mix(ac, 0.30), bg]
     };
-    compile_mesh(&stops, crate::theme::Ink::of_os(t), bg)
+    let rgb = |Rgb(r, g, b)| (r, g, b);
+    compile_mesh(&stops.map(rgb), crate::theme::Ink::of_os(t), rgb(bg))
 }
 
 fn compile_mesh(

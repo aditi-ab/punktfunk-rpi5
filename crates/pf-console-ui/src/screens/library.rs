@@ -410,29 +410,6 @@ pub(crate) fn draw_poster_placeholder(
     );
 }
 
-/// Stream `h` itself, launching nothing — asking a host to launch what it is already
-/// showing is how a second copy starts. The takeover names the running game when there
-/// is one, the host otherwise; a pinned card's preset rides along.
-fn desk_intent(h: &HostRow) -> ConnectIntent {
-    let subject = if h.running.is_empty() {
-        &h.name
-    } else {
-        &h.running
-    };
-    ConnectIntent {
-        addr: h.addr.clone(),
-        port: h.port,
-        fp_hex: h.fp_hex.clone(),
-        launch: None,
-        title: match &h.pin {
-            Some(p) => format!("{subject} \u{b7} {}", p.name),
-            None => subject.clone(),
-        },
-        request_access: false,
-        preset: h.pin.as_ref().map(|p| p.id.clone()),
-    }
-}
-
 /// Write `library_sort` only. Screens re-read it each frame; assigning the field reverts.
 pub(super) fn store_sort(sort: crate::collate::SortKey, ctx: &mut Ctx) {
     ctx.write(|c| {
@@ -1059,26 +1036,16 @@ impl LibraryScreen {
         }
     }
 
-    /// This shelf's host itself ([`desk_intent`]).
+    /// This shelf's host itself, launching nothing — asking a host to launch what it is
+    /// already showing is how a second copy starts.
     fn desktop_intent(&self) -> ConnectIntent {
-        desk_intent(&self.host)
+        ConnectIntent::to_host(&self.host, None)
     }
 
     /// Launch `g` on this shelf's host. Pinned card: that preset as a one-off; primary
     /// tile: the host's default.
     fn launch_intent(&self, g: &LibraryGame) -> ConnectIntent {
-        ConnectIntent {
-            addr: self.host.addr.clone(),
-            port: self.host.port,
-            fp_hex: self.host.fp_hex.clone(),
-            launch: Some(g.id.clone()),
-            title: match &self.host.pin {
-                Some(p) => format!("{} \u{b7} {}", g.title, p.name),
-                None => g.title.clone(),
-            },
-            request_access: false,
-            preset: self.host.pin.as_ref().map(|p| p.id.clone()),
-        }
+        ConnectIntent::to_host(&self.host, Some((&g.id, &g.title)))
     }
 
     /// The button the state card offers: Retry after a failure that can retry, the desk
@@ -1676,7 +1643,11 @@ impl LibraryScreen {
             None => grid_cell(this.cursor.max(0) as usize),
         };
         tree.set_focus((!this.quiet).then(|| games::zone_id(this.zone, field)));
-        let cheap = super::settings::reduce_ui_res(ctx.settings, ctx.platform, ctx.fallback_ui);
+        let cheap = super::settings::reduce_ui_res(
+            ctx.settings,
+            ctx.device.platform,
+            ctx.device.fallback_ui,
+        );
         if bleed {
             tree.paint_focus(canvas, frame, k as f32, dt, cheap);
         } else {
@@ -2096,6 +2067,7 @@ mod tests {
     use super::*;
     use crate::library::POSTER_W;
     use crate::screens::Screen;
+    use crate::theme::{contrast, over};
 
     #[test]
     fn a_cover_already_at_cache_size_decodes_here_with_mips() {
@@ -2115,25 +2087,9 @@ mod tests {
 
     fn host() -> HostRow {
         HostRow {
-            key: "aa".into(),
-            id: None,
-            name: "Desk".into(),
             addr: "10.0.0.5".into(),
-            port: 9777,
-            fp_hex: "aa".into(),
-            paired: true,
-            saved: true,
-            online: true,
             mgmt_port: 9778,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
+            ..HostRow::fixture("aa", "Desk")
         }
     }
 
@@ -2177,28 +2133,6 @@ mod tests {
         (s, library)
     }
 
-    fn ctx<'a>(
-        library: &'a LibraryShared,
-        settings: &'a mut pf_client_core::trust::Settings,
-    ) -> Ctx<'a> {
-        Ctx {
-            hosts: &[],
-            library,
-            settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &[],
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
-        }
-    }
-
     fn press(
         s: &mut LibraryScreen,
         library: &LibraryShared,
@@ -2206,7 +2140,7 @@ mod tests {
         ev: MenuEvent,
     ) -> (Option<MenuPulse>, Outbox) {
         let mut fx = Outbox::default();
-        let pulse = s.menu(ev, &mut ctx(library, settings), &mut fx);
+        let pulse = s.menu(ev, &mut Ctx::test(settings, library), &mut fx);
         (pulse, fx)
     }
 
@@ -2215,7 +2149,7 @@ mod tests {
         library: &LibraryShared,
         settings: &mut pf_client_core::trust::Settings,
     ) -> Vec<HintKey> {
-        s.hints(&ctx(library, settings))
+        s.hints(&Ctx::test(settings, library))
             .iter()
             .map(|h| h.key)
             .collect()
@@ -2290,7 +2224,7 @@ mod tests {
         );
         press(&mut s, &library, &mut settings, down());
         assert_eq!(s.zone, Zone::Grid);
-        s.adopt_settings(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
         assert_eq!(s.sort, crate::collate::SortKey::Title);
         assert_eq!(
             s.game(1).map(|g| g.title.as_str()),
@@ -2326,7 +2260,7 @@ mod tests {
         assert_eq!(s.zone, Zone::Bar(7));
         press(&mut s, &library, &mut settings, MenuEvent::Confirm);
         assert_eq!(settings.library_view, LibraryView::Grid.id());
-        s.adopt_settings(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
         assert_eq!(s.view_mode, LibraryView::Grid);
         assert!(s.snap_scroll, "a new arrangement seats rather than glides");
         assert_eq!(s.applied(), [0, 7]);
@@ -2340,22 +2274,26 @@ mod tests {
         let mut settings = shelf_settings();
         // The leading tile is the desktop, and it speaks the caption it draws.
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Desktop")
         );
         press(&mut s, &library, &mut settings, right());
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Zeta")
         );
         press(&mut s, &library, &mut settings, up());
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Sort Default, selected")
         );
         press(&mut s, &library, &mut settings, right());
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Sort A–Z")
         );
     }
@@ -2583,8 +2521,8 @@ mod tests {
                 })
                 .collect()
         };
-        s.adopt_settings(&ctx(&library, &mut settings));
-        let (bands, before) = s.bands(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
+        let (bands, before) = s.bands(&Ctx::test(&mut settings, &library));
         let sections: Vec<_> = bands.iter().map(|b| b.section).collect();
         use crate::library::Section;
         assert_eq!(
@@ -2599,8 +2537,8 @@ mod tests {
         assert!(!s.view.iter().any(|&i| s.games[i].launcher));
 
         settings.library_sections = "-launchers".into();
-        s.adopt_settings(&ctx(&library, &mut settings));
-        let (bands, _) = s.bands(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
+        let (bands, _) = s.bands(&Ctx::test(&mut settings, &library));
         assert!(bands.iter().all(|b| b.section != Section::Launchers));
         assert!(
             s.view.iter().any(|&i| s.games[i].launcher),
@@ -2701,25 +2639,6 @@ mod tests {
         s.art.insert("g1".into(), surface.image_snapshot());
         s.arm_entrance(4.05);
         assert!(s.entrance_armed, "a decoded poster is the whole point");
-    }
-
-    fn over(src: Color4f, dst: Color4f) -> Color4f {
-        let m = |s: f32, d: f32| s * src.a + d * (1.0 - src.a);
-        Color4f::new(m(src.r, dst.r), m(src.g, dst.g), m(src.b, dst.b), 1.0)
-    }
-
-    /// WCAG contrast: sRGB → linear, Rec. 709 luminance.
-    fn contrast(a: Color4f, b: Color4f) -> f32 {
-        let lin = |c: f32| {
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        let lum = |c: Color4f| 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
-        let (x, y) = (lum(a), lum(b));
-        (x.max(y) + 0.05) / (x.min(y) + 0.05)
     }
 
     /// Coverless monogram vs face must contrast on every palette. Side cards overlap: alpha leaks.
@@ -2898,7 +2817,7 @@ mod tests {
                 1.0,
                 1.0 / 60.0,
                 &fonts,
-                &mut ctx(library, settings),
+                &mut Ctx::test(settings, library),
             );
         }
         if let Ok(dir) = std::env::var("PF_GRID_DUMP") {
@@ -2975,7 +2894,7 @@ mod tests {
         let mut fx = Outbox::default();
         s.menu(
             MenuEvent::Move(MenuDir::Down),
-            &mut ctx(&library, &mut settings),
+            &mut Ctx::test(&mut settings, &library),
             &mut fx,
         );
         grid_frames(&mut s, &library, &mut settings, 120, "pan-3");
@@ -3392,7 +3311,7 @@ mod tests {
             scale: Some(2.25),
         };
         let mut s = games_tab(LibraryView::Grid, &full());
-        s.platform = crate::platform::Platform::Apple;
+        s.device.platform = crate::platform::Platform::Apple;
         let phone = |s: &mut Shell, frames: usize, name: &str| {
             let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
             for _ in 0..frames {

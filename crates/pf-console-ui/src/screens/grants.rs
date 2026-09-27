@@ -8,7 +8,7 @@ use crate::model::ConsoleCmd;
 use crate::pointer::Pointer;
 use crate::screens::players::{PadAction, PASSTHROUGH};
 use crate::screens::{Ctx, Outbox};
-use crate::theme::{edge, Fonts};
+use crate::theme::Fonts;
 use crate::widgets::{ListMsg, MenuList, RowSpec};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
@@ -100,29 +100,9 @@ impl GrantsScreen {
         self.list.render(canvas, rect, &rows, fonts, k, dt, true);
     }
 
-    /// The explainer's band reaches the shell's tray in.
-    pub(crate) fn pinned(&self, k: f64) -> (f32, f32) {
-        (0.0, (crate::widgets::FOOT_DETAIL_H * k) as f32)
-    }
-
-    /// Why the focused row exists, on the shell's tray after the trays.
-    pub(crate) fn render_pinned(&mut self, canvas: &Canvas, rect: Rect, k: f64, fonts: &Fonts) {
-        let detail = detail(PASSTHROUGH[self.list.cursor].0);
-        let h = (crate::widgets::FOOT_DETAIL_H * k) as f32;
-        crate::widgets::Foot {
-            detail: Some(detail),
-            ..Default::default()
-        }
-        .paint(
-            canvas,
-            fonts,
-            Rect::from_ltrb(rect.left, rect.bottom - h, rect.right, rect.bottom),
-            (
-                f64::from(rect.left) + edge(k),
-                f64::from(rect.right) - edge(k),
-            ),
-            k,
-        );
+    /// Why the focused row exists.
+    pub(crate) fn foot(&self) -> &'static str {
+        detail(PASSTHROUGH[self.list.cursor].0)
     }
 }
 
@@ -158,22 +138,13 @@ mod tests {
     fn ok_on_a_row_asks_the_host_for_that_grant() {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let pads = Vec::new();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
+        let device = crate::screens::Device {
             platform: crate::platform::Platform::Android,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..crate::screens::Device::test()
+        };
+        let mut ctx = Ctx {
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = GrantsScreen::new();
         let mut fx = Outbox::default();

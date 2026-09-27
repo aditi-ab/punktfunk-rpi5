@@ -153,6 +153,8 @@ pub mod omarchy_menu;
 // Lucide path data shared by Skia and GTK so a mark cannot differ between them.
 pub mod lucide;
 pub mod overlay_actions;
+// sRGB mixes and WCAG contrast for every client theme, the console's included.
+pub mod rgb;
 pub mod ring;
 // DualSense voice-coil + speaker on the pad's 4-ch device (0xD1 plane): correlation, per-session renderer, tier-A registry the gamepad worker feeds.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]

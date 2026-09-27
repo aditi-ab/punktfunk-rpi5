@@ -32,6 +32,15 @@ internal object ConsoleJson {
     fun rowKey(fpHex: String, address: String, port: Int): String =
         if (fpHex.isEmpty()) "$address:$port" else fpHex
 
+    /**
+     * A pinned card's `HostRow.key`: the host's [rowKey], a NUL, then the preset id. Pinned by
+     * `pinned_key` in `clients/shared/console-vectors.json`, which the console splits back.
+     */
+    fun pinnedKey(key: String, presetId: String): String = "$key\u0000$presetId"
+
+    /** The host half of a row key: a pinned card's key without its preset id. */
+    fun hostKey(key: String): String = key.substringBefore('\u0000')
+
     private fun presetChip(p: StreamPreset): JSONObject = JSONObject()
         .put("id", p.id)
         .put("name", p.name)
@@ -113,13 +122,12 @@ internal object ConsoleJson {
                 // inherit the map — a card is the same host's shelf.
                 .put("game_presets", JSONObject(h.gamePresets))
             out.put(base)
-            // A pinned card shares the primary tile's live state; its key rides the preset id
-            // behind a NUL (impossible in a fingerprint or `addr:port`) — Rust parity.
+            // A pinned card shares the primary tile's live state under its own key.
             for (pid in h.pinnedPresetIds.distinct()) {
                 val p = presets.firstOrNull { it.id == pid } ?: continue
                 out.put(
                     JSONObject(base.toString())
-                        .put("key", "$key\u0000${p.id}")
+                        .put("key", pinnedKey(key, p.id))
                         .put("pin", presetChip(p))
                         .put("bound_preset", JSONObject.NULL),
                 )
@@ -157,7 +165,7 @@ internal object ConsoleJson {
     fun hostRow(h: KnownHost, pin: StreamPreset?, presets: List<StreamPreset>): JSONObject {
         val key = rowKey(h.fpHex, h.address, h.port)
         return JSONObject()
-            .put("key", if (pin == null) key else "$key\u0000${pin.id}")
+            .put("key", if (pin == null) key else pinnedKey(key, pin.id))
             .put("id", h.id)
                 .put("name", h.name.ifBlank { h.address })
             .put("addr", h.address)

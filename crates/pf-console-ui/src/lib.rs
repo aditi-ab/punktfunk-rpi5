@@ -63,7 +63,7 @@ mod skia_overlay;
 /// [`widgets`]: one consumer, no stability promise.
 pub mod settings_rows {
     pub use crate::screens::settings::{adjust, detail, row_applies, row_on, row_spec, RowId};
-    pub use crate::screens::Ctx;
+    pub use crate::screens::{Ctx, Device};
 }
 pub mod store;
 pub mod theme;

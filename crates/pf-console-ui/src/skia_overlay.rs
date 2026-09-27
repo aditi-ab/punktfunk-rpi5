@@ -246,7 +246,7 @@ impl Overlay for SkiaOverlay {
         // The console is built before the presenter, so the codec row starts optimistic.
         // This is the first moment the real device can answer, and it runs before any frame.
         if let Some(shell) = &mut self.shell {
-            shell.av1_ok = shared.av1_decode;
+            shell.device.av1_ok = shared.av1_decode;
         }
 
         let typeface = match_first_family(
@@ -530,19 +530,29 @@ impl Overlay for SkiaOverlay {
             draw_osd_panel(canvas, font, stats, ctx.width, scale);
         }
         // Top-right, stacked in a fixed order: never collides with the stats panel or the
-        // bottom pill, even at stats Off.
+        // bottom pill, even at stats Off. The mute badges persist, because what they report
+        // does not go away on its own.
         let mut row = 0;
         if want.mic_muted {
-            draw_badge(canvas, font, "Microphone muted", ctx.width, row, scale);
+            corner_pill(
+                canvas,
+                font,
+                "Microphone muted",
+                true,
+                ctx.width,
+                row,
+                scale,
+            );
             row += 1;
         }
         if !want.audio_mute.is_empty() {
-            draw_badge(canvas, font, &want.audio_mute, ctx.width, row, scale);
+            corner_pill(canvas, font, &want.audio_mute, true, ctx.width, row, scale);
             row += 1;
         }
-        // Same corner as the badges (must survive stats Off); stacks under them.
+        // The access chip (preset label + countdown) stacks under them. A full-control
+        // permanent session has none.
         if let Some(access) = &want.access {
-            draw_access_chip(canvas, font, access, ctx.width, row, scale);
+            corner_pill(canvas, font, access, false, ctx.width, row, scale);
         }
         // Access toast outranks the capture hint for its few seconds.
         if let Some(notice) = &want.notice {
@@ -821,19 +831,27 @@ fn role_color(role: Role) -> Color4f {
     }
 }
 
-/// Standing badge (error-colour dot + words), top-right at `row`. Drawn from state, not
-/// from the stats text, so it survives stats Off. Words: the runtime monospace may not ship
-/// a mute glyph. Persistent, because what it reports does not go away on its own.
-fn draw_badge(canvas: &Canvas, base_font: &Font, label: &str, width: u32, row: usize, scale: f32) {
+/// A standing pill in the top-right corner, `row` pills down: words, led by an error-colour
+/// dot when `dot`. Drawn from state, not from the stats text, so it survives stats Off.
+/// Words: the runtime monospace may not ship a mute glyph. Every pill is one line tall, so
+/// rows stack on one pitch.
+fn corner_pill(
+    canvas: &Canvas,
+    base_font: &Font,
+    text: &str,
+    dot: bool,
+    width: u32,
+    row: usize,
+    scale: f32,
+) {
     // Short; it fits any stream window, so take the display scale as-is.
     let font = &chrome_font(base_font, scale);
     let (_, metrics) = font.metrics();
     let line_h = metrics.descent - metrics.ascent;
     let (pad_x, pad_y) = (base::PILL_PAD_X * scale, base::PILL_PAD_Y * scale);
     let dot_r = 4.0 * scale;
-    let dot_gap = 8.0 * scale;
-    let text_w = font.measure_str(label, None).0;
-    let w = text_w + 2.0 * dot_r + dot_gap + 2.0 * pad_x;
+    let lead = if dot { 2.0 * dot_r + 8.0 * scale } else { 0.0 };
+    let w = font.measure_str(text, None).0 + lead + 2.0 * pad_x;
     let h = line_h + 2.0 * pad_y;
     let margin = base::OSD_MARGIN * scale;
     let x = width as f32 - w - margin;
@@ -842,52 +860,16 @@ fn draw_badge(canvas: &Canvas, base_font: &Font, label: &str, width: u32, row: u
         RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
         &fill(Color4f::new(0.0, 0.0, 0.0, 0.62)),
     );
-    canvas.draw_circle(
-        Point::new(x + pad_x + dot_r, y + h / 2.0),
-        dot_r,
-        &fill(crate::theme::ERROR),
-    );
-    canvas.draw_str(
-        label,
-        Point::new(
-            x + pad_x + 2.0 * dot_r + dot_gap,
-            y + pad_y - metrics.ascent,
-        ),
-        font,
-        &fill(Color4f::new(1.0, 1.0, 1.0, 0.92)),
-    );
-}
-
-/// Access chip: preset label + countdown, top-right, under whatever badges hold the
-/// corner. Standing, like them: must stay readable at every stats tier including Off.
-/// Omitted for a full-control permanent session (`None` from the run loop).
-fn draw_access_chip(
-    canvas: &Canvas,
-    base_font: &Font,
-    text: &str,
-    width: u32,
-    rows_above: usize,
-    scale: f32,
-) {
-    let font = &chrome_font(base_font, scale);
-    let (_, metrics) = font.metrics();
-    let line_h = metrics.descent - metrics.ascent;
-    let (pad_x, pad_y) = (base::PILL_PAD_X * scale, base::PILL_PAD_Y * scale);
-    let text_w = font.measure_str(text, None).0;
-    let w = text_w + 2.0 * pad_x;
-    let h = line_h + 2.0 * pad_y;
-    let margin = base::OSD_MARGIN * scale;
-    // One row per badge already in the corner (same height formula; a badge's dot fits
-    // inside the shared line height).
-    let y = margin + rows_above as f32 * (h + 8.0 * scale);
-    let x = width as f32 - w - margin;
-    canvas.draw_rrect(
-        RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
-        &fill(Color4f::new(0.0, 0.0, 0.0, 0.62)),
-    );
+    if dot {
+        canvas.draw_circle(
+            Point::new(x + pad_x + dot_r, y + h / 2.0),
+            dot_r,
+            &fill(crate::theme::ERROR),
+        );
+    }
     canvas.draw_str(
         text,
-        Point::new(x + pad_x, y + pad_y - metrics.ascent),
+        Point::new(x + pad_x + lead, y + pad_y - metrics.ascent),
         font,
         &fill(Color4f::new(1.0, 1.0, 1.0, 0.92)),
     );

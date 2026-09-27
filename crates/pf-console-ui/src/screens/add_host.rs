@@ -8,7 +8,10 @@ use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox};
 use crate::theme::Fonts;
-use crate::widgets::{blurb, permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec};
+use crate::widgets::{
+    blurb, entry_hints, field_key, permits, type_text, Charset, Entry, Keyboard, ListMsg, MenuList,
+    RowSpec,
+};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
@@ -50,8 +53,7 @@ impl AddHostScreen {
             name: host.name.clone(),
             address: host.addr.clone(),
             port: host.port.to_string(),
-            // Pinned-card keys are `host\0preset`; only the host side is edited.
-            edits: Some(host.key.split('\0').next().unwrap_or(&host.key).to_string()),
+            edits: Some(host.host_key().to_string()),
             ..AddHostScreen::new()
         }
     }
@@ -74,24 +76,12 @@ impl AddHostScreen {
 
     /// A press outside the tray closes it; the row underneath is not activated.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if self.editing.is_some() && !ctx.deck {
-            if !self.keyboard.covers(p) {
-                if p.press() {
-                    self.editing = None;
-                    return true;
-                }
+        if let Some((f, keyboard, text)) = self.open().filter(|_| !ctx.device.deck) {
+            let Some(entry) = keyboard.edit_pointer(p, text, |t, c| Self::admits(f, t, c)) else {
                 return false;
-            }
-            let (msg, _) = self.keyboard.pointer(p);
-            match msg {
-                KeyMsg::Type(c) => {
-                    self.type_char(c);
-                }
-                KeyMsg::Backspace => {
-                    self.backspace();
-                }
-                KeyMsg::Done => self.editing = None,
-                KeyMsg::None => {}
+            };
+            if entry != Entry::Stay {
+                self.editing = None;
             }
             return true;
         }
@@ -120,12 +110,15 @@ impl AddHostScreen {
         !self.address.trim().is_empty() && self.port.parse::<u16>().is_ok_and(|p| p > 0)
     }
 
-    fn field_mut(&mut self, f: Field) -> &mut String {
-        match f {
+    /// The open field, its text, and the keyboard that types into it.
+    fn open(&mut self) -> Option<(Field, &mut Keyboard, &mut String)> {
+        let f = self.editing?;
+        let text = match f {
             Field::Name => &mut self.name,
             Field::Address => &mut self.address,
             Field::Port => &mut self.port,
-        }
+        };
+        Some((f, &mut self.keyboard, text))
     }
 
     fn charset(f: Field) -> Charset {
@@ -136,46 +129,28 @@ impl AddHostScreen {
         }
     }
 
-    fn type_char(&mut self, ch: char) -> bool {
-        let Some(f) = self.editing else { return false };
-        if !permits(Self::charset(f), ch) {
-            return false;
-        }
-        // u16 max is 65535 — five digits.
-        if f == Field::Port && self.field_mut(f).chars().count() >= 5 {
-            return false;
-        }
-        self.field_mut(f).push(ch);
-        true
+    /// Whether field `f` takes `ch` after `text`. A port is five digits: u16 max is 65535.
+    fn admits(f: Field, text: &str, ch: char) -> bool {
+        permits(Self::charset(f), ch) && !(f == Field::Port && text.chars().count() >= 5)
     }
 
-    fn backspace(&mut self) -> bool {
-        let Some(f) = self.editing else { return false };
-        self.field_mut(f).pop().is_some()
-    }
-
-    pub(crate) fn text_input(&mut self, text: &str) {
-        for ch in text.chars() {
-            self.type_char(ch);
+    pub(crate) fn text_input(&mut self, typed: &str) {
+        if let Some((f, _, text)) = self.open() {
+            type_text(text, typed, |t, c| Self::admits(f, t, c));
         }
     }
 
     pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
-        use crate::input::Key as K;
-        if self.editing.is_none() {
+        let Some((_, _, text)) = self.open() else {
             return false;
+        };
+        let Some(entry) = field_key(key, text) else {
+            return false;
+        };
+        if entry != Entry::Stay {
+            self.editing = None;
         }
-        match key {
-            K::Backspace => {
-                self.backspace();
-                true
-            }
-            K::Return | K::Escape => {
-                self.editing = None;
-                true
-            }
-            _ => false,
-        }
+        true
     }
 
     pub(crate) fn menu(
@@ -184,39 +159,13 @@ impl AddHostScreen {
         ctx: &mut Ctx,
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
-        if let Some(_field) = self.editing {
-            if ctx.deck {
-                // Steam owns typing on Deck; the pad only dismisses the field.
-                return match ev {
-                    MenuEvent::Back | MenuEvent::Confirm => {
-                        self.editing = None;
-                        Some(MenuPulse::Confirm)
-                    }
-                    _ => None,
-                };
+        let deck = ctx.device.deck;
+        if let Some((f, keyboard, text)) = self.open() {
+            let (entry, pulse) = keyboard.edit_menu(ev, deck, text, |t, c| Self::admits(f, t, c));
+            if entry != Entry::Stay {
+                self.editing = None;
             }
-            let (msg, pulse) = self.keyboard.menu(ev);
-            return match msg {
-                KeyMsg::Type(c) => {
-                    if self.type_char(c) {
-                        Some(MenuPulse::Move)
-                    } else {
-                        Some(MenuPulse::Boundary)
-                    }
-                }
-                KeyMsg::Backspace => {
-                    if self.backspace() {
-                        Some(MenuPulse::Move)
-                    } else {
-                        Some(MenuPulse::Boundary)
-                    }
-                }
-                KeyMsg::Done => {
-                    self.editing = None;
-                    Some(MenuPulse::Confirm)
-                }
-                KeyMsg::None => pulse,
-            };
+            return pulse;
         }
 
         if ev == MenuEvent::Back {
@@ -278,18 +227,7 @@ impl AddHostScreen {
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
         if self.editing.is_some() {
-            if ctx.deck {
-                return vec![
-                    Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
-                    Hint::new(HintKey::Confirm, "Done"),
-                    Hint::new(HintKey::Back, "Done"),
-                ];
-            }
-            return vec![
-                Hint::new(HintKey::Confirm, "Type"),
-                Hint::new(HintKey::Tertiary, "Delete"),
-                Hint::new(HintKey::Back, "Done"),
-            ];
+            return entry_hints(ctx.device.deck, "Done");
         }
         vec![
             Hint::new(HintKey::Confirm, "Select"),
@@ -314,7 +252,9 @@ impl AddHostScreen {
             k,
         );
 
-        let seat = self.keyboard.seat(self.editing.is_some() && !ctx.deck, dt);
+        let seat = self
+            .keyboard
+            .seat(self.editing.is_some() && !ctx.device.deck, dt);
         let tray_h = if seat > 0.0 {
             (Keyboard::tray_height() + 12.0) * k * seat
         } else {
@@ -374,36 +314,12 @@ mod tests {
     use crate::screens::Nav;
     use pf_client_core::trust::Settings;
 
-    fn ctx<'a>(
-        settings: &'a mut Settings,
-        pads: &'a [pf_client_core::menu_nav::PadInfo],
-        library: &'a crate::library::LibraryShared,
-        deck: bool,
-    ) -> Ctx<'a> {
-        Ctx {
-            hosts: &[],
-            library,
-            settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads,
-            deck,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        }
-    }
-
     /// The field's plate carries on into the keyboard: it starts row-wide, then lands on a key.
     #[test]
     fn the_plate_glides_from_the_field_into_the_keyboard() {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut c = ctx(&mut settings, &[], &library, false);
+        let mut c = Ctx::test(&mut settings, &library);
         let mut s = AddHostScreen::new();
         let mut fx = Outbox::default();
         let fonts = crate::theme::build_fonts().unwrap();
@@ -434,7 +350,7 @@ mod tests {
     fn end_to_end_add_flow() {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut c = ctx(&mut settings, &[], &library, false);
+        let mut c = Ctx::test(&mut settings, &library);
         let mut s = AddHostScreen::new();
         let mut fx = Outbox::default();
 
@@ -468,7 +384,9 @@ mod tests {
         s.port.clear();
         s.text_input("123456789");
         assert_eq!(s.port, "12345");
-        assert!(!s.type_char('x'), "digits only");
+        s.port.clear();
+        s.text_input("x");
+        assert!(s.port.is_empty(), "digits only");
     }
 
     /// A drag over the tray must not scroll the form under it.
@@ -486,7 +404,7 @@ mod tests {
             1.0,
             1.0 / 60.0,
             &fonts,
-            &mut ctx(&mut settings, &[], &library, false),
+            &mut Ctx::test(&mut settings, &library),
         );
         let row = s.list.row_rect(0).expect("the form drew");
         let drag = Pointer {
@@ -507,7 +425,14 @@ mod tests {
     fn deck_mode_never_uses_the_grid() {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut c = ctx(&mut settings, &[], &library, true);
+        let deck = crate::screens::Device {
+            deck: true,
+            ..crate::screens::Device::test()
+        };
+        let mut c = Ctx {
+            device: &deck,
+            ..Ctx::test(&mut settings, &library)
+        };
         let mut s = AddHostScreen::new();
         let mut fx = Outbox::default();
         s.list.cursor = 1;

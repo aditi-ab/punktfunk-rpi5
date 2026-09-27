@@ -33,6 +33,7 @@ use crate::theme::Fonts;
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use pf_client_core::{menu_nav::PadInfo, trust};
 use skia_safe::{Canvas, Rect};
+use std::borrow::Cow;
 
 /// Backdrop the shell crossfades on push/pop.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,19 +43,13 @@ pub(crate) enum Bg {
     Form,
 }
 
-/// Per-event screen context. `settings` is mut — the settings screen persists in place.
-pub struct Ctx<'a> {
-    pub hosts: &'a [HostRow],
-    /// Live library slot; the top screen owns it.
-    pub library: &'a LibraryShared,
-    pub settings: &'a mut trust::Settings,
-    /// Persistence for `settings` and the preset catalog. A settings change goes through
-    /// [`Ctx::write`].
-    pub store: &'a dyn crate::store::SettingsStore,
+/// This device, from [`crate::shell::ConsoleOptions`]. Fixed for the shell's life but for
+/// `av1_ok`, which the overlay corrects before the first frame.
+#[derive(Clone, Debug)]
+pub struct Device {
     pub platform: crate::platform::Platform,
     /// This device's own screen ([`crate::shell::ConsoleOptions::screen`]).
     pub screen: Option<crate::shell::DeviceScreen>,
-    pub pads: &'a [PadInfo],
     /// Steam Deck: never draw our keyboard — Steam's types via SDL text input.
     pub deck: bool,
     /// A TV: no clipboard to copy to, no phone sensors ([`crate::shell::ConsoleOptions::tv`]).
@@ -69,9 +64,57 @@ pub struct Ctx<'a> {
     /// False marks the codec row's AV1 value unsupported: the Hello never asks for it.
     pub av1_ok: bool,
     /// Name the host stores this client under when pairing.
-    pub device_name: &'a str,
+    pub name: String,
+}
+
+/// Per-event screen context. `settings` is mut — the settings screen persists in place.
+pub struct Ctx<'a> {
+    pub hosts: &'a [HostRow],
+    /// Live library slot; the top screen owns it.
+    pub library: &'a LibraryShared,
+    pub settings: &'a mut trust::Settings,
+    /// Persistence for `settings` and the preset catalog. A settings change goes through
+    /// [`Ctx::write`].
+    pub store: &'a dyn crate::store::SettingsStore,
+    pub pads: &'a [PadInfo],
+    pub device: &'a Device,
     /// Shell clock in seconds (spinners, pulses).
     pub t: f64,
+}
+
+#[cfg(test)]
+impl Device {
+    /// A desktop that decodes everything, named `test`.
+    pub(crate) fn test() -> Device {
+        Device {
+            platform: crate::platform::Platform::Desktop,
+            screen: None,
+            deck: false,
+            tv: false,
+            fallback_ui: false,
+            pyrowave_ok: true,
+            av1_ok: true,
+            name: "test".into(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'a> Ctx<'a> {
+    /// [`Device::test`] over the file store, with no hosts or pads. Tests override the rest
+    /// by struct update.
+    pub(crate) fn test(settings: &'a mut trust::Settings, library: &'a LibraryShared) -> Ctx<'a> {
+        static DESKTOP: std::sync::LazyLock<Device> = std::sync::LazyLock::new(Device::test);
+        Ctx {
+            hosts: &[],
+            library,
+            settings,
+            store: crate::store::file_store(),
+            pads: &[],
+            device: &DESKTOP,
+            t: 0.0,
+        }
+    }
 }
 
 impl Ctx<'_> {
@@ -121,6 +164,36 @@ pub(crate) struct ConnectIntent {
     pub request_access: bool,
     /// One-off preset for this launch; `None` keeps the host's default binding.
     pub preset: Option<String>,
+}
+
+impl ConnectIntent {
+    /// Stream `h`: launch `game` (id, title), else its desk. The takeover names the game,
+    /// else what the host has up, else the host. A pinned card's preset rides along and
+    /// adds its name to the title.
+    pub(crate) fn to_host(h: &HostRow, game: Option<(&str, &str)>) -> ConnectIntent {
+        let subject = match game {
+            Some((_, title)) => title,
+            None if !h.running.is_empty() => &h.running,
+            None => &h.name,
+        };
+        ConnectIntent {
+            addr: h.addr.clone(),
+            port: h.port,
+            fp_hex: h.fp_hex.clone(),
+            launch: game.map(|(id, _)| id.to_string()),
+            title: match &h.pin {
+                Some(p) => format!("{subject} \u{b7} {}", p.name),
+                None => subject.to_string(),
+            },
+            request_access: false,
+            preset: h.pin.as_ref().map(|p| p.id.clone()),
+        }
+    }
+
+    /// The same connect with `preset` in place of the pin's: Connect with….
+    pub(crate) fn with_preset(self, preset: Option<String>) -> ConnectIntent {
+        ConnectIntent { preset, ..self }
+    }
 }
 
 pub(crate) enum Nav {
@@ -430,14 +503,25 @@ impl Screen {
         }
     }
 
+    /// One explainer line under the list, painted on the shell's bottom tray.
+    pub(crate) fn foot(&self, ctx: &Ctx) -> Option<Cow<'static, str>> {
+        match self {
+            Screen::Grants(s) => Some(s.foot().into()),
+            Screen::Players(s) => Some(s.foot(ctx).into()),
+            Screen::PinHosts(s) => s.foot(ctx).map(Cow::from),
+            Screen::BindPreset(s) => s.foot().map(Cow::from),
+            Screen::Customize(s) => Some(s.foot().into()),
+            _ => None,
+        }
+    }
+
     /// How far past the content's top and bottom edges the shell's trays reach in, px:
     /// the depth of a screen's own pinned chrome, so one ramp covers it with the band's.
-    pub(crate) fn pinned(&self, k: f64) -> (f32, f32) {
+    pub(crate) fn pinned(&self, k: f64, ctx: &Ctx) -> (f32, f32) {
         match self {
             Screen::Library(s) => s.pinned(k),
-            Screen::Players(s) => s.pinned(k),
             Screen::Settings(s) => s.pinned(k),
-            Screen::Grants(s) => s.pinned(k),
+            _ if self.foot(ctx).is_some() => (0.0, (crate::widgets::FOOT_DETAIL_H * k) as f32),
             _ => (0.0, 0.0),
         }
     }
@@ -455,10 +539,25 @@ impl Screen {
     ) {
         match self {
             Screen::Library(s) => s.render_pinned(canvas, rect, k, fonts, ctx),
-            Screen::Players(s) => s.render_pinned(canvas, rect, k, fonts, ctx),
             Screen::Settings(s) => s.render_pinned(canvas, rect, k, dt, fonts, ctx),
-            Screen::Grants(s) => s.render_pinned(canvas, rect, k, fonts),
-            _ => {}
+            _ => {
+                let Some(detail) = self.foot(ctx) else {
+                    return;
+                };
+                let h = (crate::widgets::FOOT_DETAIL_H * k) as f32;
+                let edge = crate::theme::edge(k);
+                crate::widgets::Foot {
+                    detail: Some(&detail),
+                    ..Default::default()
+                }
+                .paint(
+                    canvas,
+                    fonts,
+                    Rect::from_ltrb(rect.left, rect.bottom - h, rect.right, rect.bottom),
+                    (f64::from(rect.left) + edge, f64::from(rect.right) - edge),
+                    k,
+                );
+            }
         }
     }
 
