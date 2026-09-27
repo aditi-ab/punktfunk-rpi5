@@ -93,12 +93,6 @@ unsafe extern "C" {
     );
 }
 
-#[link(name = "gbm")]
-unsafe extern "C" {
-    pub(crate) fn gbm_create_device(fd: c_int) -> *mut c_void;
-    pub(crate) fn gbm_device_destroy(device: *mut c_void);
-}
-
 /// `glEGLImageTargetTexture2DOES` — `eglGetProcAddress`, not `#[link]`.
 pub(crate) type EglImageTargetFn = unsafe extern "system" fn(u32, *mut c_void);
 

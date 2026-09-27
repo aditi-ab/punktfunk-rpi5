@@ -2194,12 +2194,10 @@ impl VulkanVideoEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        let mut st: libc::stat = std::mem::zeroed();
-        let key = if libc::fstat(d.fd.as_raw_fd(), &mut st) == 0 {
-            (st.st_dev as u64, st.st_ino as u64)
-        } else {
+        let key = match pf_zerocopy::ipc::dmabuf_inode(d.fd.as_raw_fd()) {
+            Ok(key) => key,
             // fstat failed → uncacheable sentinel; still owned by the cache and freed on evict/Drop.
-            (u64::MAX, self.enc_count)
+            Err(_) => (u64::MAX, self.enc_count),
         };
         if let Some(pos) = self.import_cache.iter().position(|e| e.key == key) {
             let e = &self.import_cache[pos];

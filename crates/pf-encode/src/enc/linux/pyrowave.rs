@@ -1579,11 +1579,9 @@ impl PyroWaveEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        let mut st: libc::stat = std::mem::zeroed();
-        let key = if libc::fstat(d.fd.as_raw_fd(), &mut st) == 0 {
-            (st.st_dev as u64, st.st_ino as u64)
-        } else {
-            (u64::MAX, self.frame_count)
+        let key = match pf_zerocopy::ipc::dmabuf_inode(d.fd.as_raw_fd()) {
+            Ok(key) => key,
+            Err(_) => (u64::MAX, self.frame_count),
         };
         if let Some(&(_, _, img, _, view)) = self.import_cache.iter().find(|e| (e.0, e.1) == key) {
             return Ok((img, view, false));

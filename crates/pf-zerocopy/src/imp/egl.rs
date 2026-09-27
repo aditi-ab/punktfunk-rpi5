@@ -13,9 +13,9 @@
 #![allow(non_upper_case_globals)]
 
 use super::cuda::{self, DeviceBuffer};
+use super::gbm::GbmDevice;
 use anyhow::{ensure, Context as _, Result};
 use khronos_egl as egl;
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::raw::{c_int, c_void};
 
 // Not in khronos-egl: EGL_EXT_image_dma_buf_import(_modifiers) and the GBM platform enum.
@@ -116,21 +116,6 @@ impl Drop for GlNameGuard {
                 glDeleteProgram(p);
             }
         }
-    }
-}
-
-/// GBM device plus the render-node fd it borrows. Drop order is destroy-device then close-fd.
-/// `EglImporter` has no `Drop`, so this field is last: GL/CUDA objects release against a live display.
-struct GbmDevice {
-    raw: *mut c_void,
-    _fd: std::os::fd::OwnedFd,
-}
-
-impl Drop for GbmDevice {
-    fn drop(&mut self) {
-        // SAFETY: `raw` is the non-null `gbm_device*` from `gbm_create_device`, owned exclusively
-        // here and destroyed once — before `_fd` (the borrowed render-node fd) closes.
-        unsafe { gbm_device_destroy(self.raw) };
     }
 }
 
@@ -639,39 +624,26 @@ impl EglImporter {
         // GBM on the NVIDIA render node so the EGLDisplay shares the DRM device CUDA-GL interop
         // uses. The EGL *device* platform does not — `cuGraphicsGLRegisterImage` rejects those textures.
         let node = nvidia_render_node();
-        let path = std::ffi::CString::new(node.as_os_str().as_encoded_bytes())
-            .with_context(|| format!("render node path {} has an interior NUL", node.display()))?;
-        // SAFETY: `path` is a live local `CString` (constructor rejected interior NULs, so it is
-        // NUL-terminated). `open` only reads the pointer for this call and does not retain it.
-        let render_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        ensure!(render_fd >= 0, "open {} for GBM", node.display());
-        // SAFETY: `open` returned this fd (`>= 0`) and nothing else owns it. `OwnedFd` takes sole
-        // ownership; every `?` closes it after `GbmDevice` destroys the device that borrows it.
-        let render_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(render_fd) };
-        // SAFETY: `render_fd` is the live DRM render-node fd. `gbm_create_device` borrows it and
-        // returns `*mut gbm_device` (or null); `GbmDevice` keeps the fd open until after
-        // `gbm_device_destroy`. No Rust-owned memory is passed.
-        let raw_gbm = unsafe { gbm_create_device(render_fd.as_raw_fd()) };
-        if raw_gbm.is_null() {
-            anyhow::bail!("gbm_create_device failed on {}", node.display());
-        }
-        let gbm = GbmDevice {
-            raw: raw_gbm,
-            _fd: render_fd,
-        };
+        let render_node = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&node)
+            .with_context(|| format!("open {} for GBM", node.display()))?;
+        let gbm = GbmDevice::open(render_node)
+            .with_context(|| format!("open the GBM device on {}", node.display()))?;
 
         // SAFETY: `Egl::load_required` dlopens libEGL and binds EGL 1.5 entry points matching
         // the `khronos_egl` `EGL1_5` ABI. No Rust memory is passed; later use is through the
         // safe wrappers.
         let egl: Egl =
             unsafe { Egl::load_required() }.context("load libEGL (EGL 1.5 dynamic instance)")?;
-        // SAFETY: `gbm.raw` is the non-null `gbm_device*` just created; `EGL_PLATFORM_GBM_KHR`
+        // SAFETY: `gbm.as_ptr()` is the live `gbm_device*` just created; `EGL_PLATFORM_GBM_KHR`
         // is the platform enum that pairs with a GBM device as native display. `&[ATTRIB_NONE]`
         // is a terminated empty attrib list borrowed for this call; EGL does not retain it.
         let display = unsafe {
             egl.get_platform_display(
                 EGL_PLATFORM_GBM_KHR,
-                gbm.raw as egl::NativeDisplayType,
+                gbm.as_ptr() as egl::NativeDisplayType,
                 &[egl::ATTRIB_NONE],
             )
         }

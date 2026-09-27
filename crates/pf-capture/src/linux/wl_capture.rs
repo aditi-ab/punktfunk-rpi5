@@ -555,7 +555,9 @@ fn run(
     let mut buffers: Vec<wl_buffer::WlBuffer> = Vec::with_capacity(pool.bos.len());
     for bo in &pool.bos {
         let params = linux_dmabuf.create_params(&qh, ());
-        let m = bo.wire_modifier();
+        // An implicit layout (`INVALID`) goes out as-is: the compositor rejects it rather
+        // than this side guessing one.
+        let m = bo.modifier;
         params.add(
             bo.fd.as_fd(),
             0,
@@ -590,7 +592,7 @@ fn run(
         w,
         h,
         fourcc = format_args!("{:#010x}", fourcc),
-        modifier = pool.bos.first().map(|b| b.wire_modifier()).unwrap_or(0),
+        modifier = pool.bos.first().map(|b| b.modifier).unwrap_or(0),
         pool = pool.bos.len(),
         "direct wayland capture: the compositor fills our dmabufs, no portal in the path"
     );
@@ -642,10 +644,10 @@ fn run(
             };
             f.destroy();
             let bo = &pool.bos[idx];
-            let modifier = if bo.modifier_is_invalid() {
+            let modifier = if bo.modifier == pf_zerocopy::gbm::DRM_FORMAT_MOD_INVALID {
                 0
             } else {
-                bo.wire_modifier()
+                bo.modifier
             };
             let payload = if let Some(imp) = importer.as_mut() {
                 // The import reads the buffer synchronously here, so the buffer goes

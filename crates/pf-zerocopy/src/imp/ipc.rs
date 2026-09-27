@@ -368,6 +368,56 @@ pub fn spawn_worker(exe: &Path, argv0: &str, args: &[&str]) -> io::Result<(Owned
     Ok((host_end, child))
 }
 
+/// The worker half of [`spawn_worker`]: adopt the socket on `--fd N` (default 3).
+///
+/// Refuses anything that cannot be the spawning host's socket. A negative fd is UB inside
+/// `OwnedFd` (its niche) and 0–2 would close stdio on exit; `fstat` then confirms an open
+/// socket, since a worker subcommand is runnable by hand and adopting an inherited fd would
+/// close it behind its real owner.
+pub fn adopt_spawned_socket(args: &[String]) -> anyhow::Result<OwnedFd> {
+    use anyhow::Context;
+    let fd: RawFd = args
+        .iter()
+        .skip_while(|a| *a != "--fd")
+        .nth(1)
+        .map(|s| s.parse())
+        .transpose()
+        .context("parse --fd")?
+        .unwrap_or(3);
+    anyhow::ensure!(fd >= 3, "--fd must be >= 3 (got {fd})");
+    // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
+    // `mem::zeroed()` is a sound initializer; `fstat` writes into the live, correctly-sized
+    // `&mut st` and only reads `fd`. `st_mode` is read only after the return value is checked.
+    let is_socket = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
+    };
+    anyhow::ensure!(
+        is_socket,
+        "--fd {fd} is not an open socket (workers are spawned by punktfunk-host, not run by hand)"
+    );
+    // SAFETY: the spawning host `dup2`'d its socketpair end onto exactly this fd number before
+    // exec (the worker's contract, just verified to be an open socket ≥ 3) and nothing else in
+    // this fresh process owns it, so `OwnedFd` takes sole ownership and closes it once at exit.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// A dma-buf's `(st_dev, st_ino)`. The kernel gives each dma-buf a unique inode for its
+/// lifetime, so the key survives a fresh dup per frame and `SCM_RIGHTS` re-numbering.
+pub fn dmabuf_inode(fd: impl AsRawFd) -> io::Result<(u64, u64)> {
+    // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
+    // `mem::zeroed()` is a sound initializer. `fstat` only reads the fd number (a closed one
+    // fails with EBADF) and writes into the live, correctly-sized `&mut st`, which is read
+    // only after the return value is checked.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd.as_raw_fd(), &mut st) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((st.st_dev as u64, st.st_ino as u64))
+    }
+}
+
 /// Parked children not yet exited (a worker exits on socket EOF after the
 /// last in-flight frame). Swept on spawn and drop so they do not linger as
 /// zombies past one generation.
@@ -639,5 +689,28 @@ mod tests {
         assert_eq!(got, "pong");
         assert!(fds.is_empty());
         child.wait().unwrap();
+    }
+
+    /// Only an open socket at fd 3 or above is adopted; anything else is left to its owner.
+    #[test]
+    fn adopt_spawned_socket_takes_only_a_socket_it_may_own() {
+        let args = |fd: &str| vec!["--fd".to_string(), fd.to_string()];
+        assert!(
+            adopt_spawned_socket(&args("2")).is_err(),
+            "stdio is never adopted"
+        );
+        assert!(adopt_spawned_socket(&args("x")).is_err());
+        let file = File::open("/dev/null").unwrap();
+        let raw = file.as_raw_fd().to_string();
+        assert!(
+            adopt_spawned_socket(&args(&raw)).is_err(),
+            "a file is not a socket"
+        );
+        let (a, b) = socketpair_seqpacket().unwrap();
+        let adopted = adopt_spawned_socket(&args(&a.as_raw_fd().to_string())).unwrap();
+        assert_eq!(adopted.as_raw_fd(), a.as_raw_fd());
+        // `adopted` now owns the number; forget the original so it closes once.
+        std::mem::forget(a);
+        drop((adopted, b));
     }
 }

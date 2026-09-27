@@ -14,6 +14,7 @@
 pub mod client;
 pub mod cuda;
 pub mod egl;
+pub mod gbm;
 // Shared worker rails (SEQPACKET ± `SCM_RIGHTS`, pinned-exe spawn, reaping).
 // Message body is generic; `proto` is this worker's vocabulary only.
 pub mod ipc;

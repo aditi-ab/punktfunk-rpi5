@@ -13,7 +13,6 @@ use super::proto::{
 };
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::process::Child;
@@ -529,17 +528,7 @@ impl Drop for RemoteImporter {
 /// kernel gives each dma-buf a unique inode for its lifetime. Worker fd-cache
 /// key, so the fd itself is passed once.
 fn dmabuf_key(fd: i32) -> Result<u64> {
-    // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
-    // `mem::zeroed()` is a sound initializer. `fd` is the caller's live dmabuf fd; `fstat` writes
-    // into `&mut st`, a live, correctly-sized stack struct that outlives the synchronous call,
-    // and `st_ino` is read only after the return value is checked.
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut st) != 0 {
-            bail!("fstat(dmabuf fd): {}", io::Error::last_os_error());
-        }
-        Ok(st.st_ino)
-    }
+    Ok(ipc::dmabuf_inode(fd).context("fstat dmabuf fd")?.1)
 }
 
 fn open_mapping(desc: &BufferDesc) -> Result<Mapping> {
