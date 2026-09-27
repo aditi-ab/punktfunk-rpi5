@@ -11,6 +11,8 @@
 //! Opus is 48 kHz; the lossless plane is a second plane — [`pcm`], `design/hi-res-audio.md`.
 
 pub mod pcm;
+/// cbindgen:ignore
+pub mod plane;
 
 use std::time::Duration;
 
