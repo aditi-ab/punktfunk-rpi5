@@ -469,6 +469,7 @@ fn project_frame(frame: &DecodedVkFrame, guard: NativeReleaseGuard) -> NativeVkF
         // Which side of a loss this picture was decoded on. A post-failure DPB flush
         // can deliver pre-loss pictures whose recovery marks describe a finished wave.
         decode_order: frame.decode_order,
+        copyable: frame.copyable,
         guard,
     }
 }
@@ -624,6 +625,8 @@ impl NativeVulkanDecoder {
             .flatten();
         #[cfg(not(target_os = "linux"))]
         let boost: Option<()> = None;
+        // The native Wayland lane copies pictures out; only a presenter that can export asks.
+        let copy_out = crate::video::native_scanout_wanted() && vk.dmabuf_import;
         let dec = match codec {
             NativeCodec::H264 => {
                 // SAFETY: the handle contract stated directly above.
@@ -631,6 +634,9 @@ impl NativeVulkanDecoder {
                     .map_err(|e| anyhow!("VkH264Decoder init: {e}"))?;
                 if boost.is_some() {
                     d.export_bitstream();
+                }
+                if copy_out {
+                    d.copy_out();
                 }
                 Codec::H264(d)
             }
@@ -646,6 +652,9 @@ impl NativeVulkanDecoder {
                 }
                 if boost.is_some() {
                     d.export_bitstream();
+                }
+                if copy_out {
+                    d.copy_out();
                 }
                 // Does this driver advertise that format for this profile? Same query
                 // `ensure_state` would run at the first AU — only the timing differs.
@@ -673,6 +682,9 @@ impl NativeVulkanDecoder {
                     .map_err(|e| anyhow!("VkAv1Decoder init: {e}"))?;
                 if boost.is_some() {
                     d.export_bitstream();
+                }
+                if copy_out {
+                    d.copy_out();
                 }
                 d.probe_stream_support(
                     stream.chroma_format_idc,
@@ -1199,6 +1211,8 @@ mod tests {
             submission: 11,
             picture: 6,
             generation,
+            // True per the no-false-boolean rule: a dropped field would read `false`.
+            copyable: true,
         }
     }
 
@@ -1281,8 +1295,13 @@ mod tests {
             recovery,
             references_clean,
             decode_order,
+            copyable,
             guard: _,
         } = p;
+        assert!(
+            copyable,
+            "the pool's TRANSFER_SRC answer reaches the presenter"
+        );
         assert_eq!(image, 0x1001);
         assert_eq!(
             vk_format,
@@ -1590,6 +1609,7 @@ mod tests {
             recovery: punktfunk_core::reanchor::LocalRecovery::NONE,
             references_clean: true,
             decode_order: 1,
+            copyable: false,
             guard: NativeReleaseGuard::new(
                 tx,
                 NativeReleaseToken {

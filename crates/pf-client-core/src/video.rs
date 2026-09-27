@@ -199,6 +199,8 @@ pub struct NativeVkFrame {
     /// H.265 flushes its DPB and may deliver pictures decoded before the loss.
     /// The pump stamps this at arm and ignores older [`Self::recovery`].
     pub decode_order: u64,
+    /// The picture carries TRANSFER_SRC: a consumer may copy it out (native scanout).
+    pub copyable: bool,
     /// Sends the release token on drop — see [`NativeReleaseGuard`].
     pub guard: NativeReleaseGuard,
 }
@@ -904,6 +906,16 @@ pub fn amd_vulkan_hdr_driver_notice(
          AMD Software 25.9.1 or newer, or switch the decoder to Direct3D 11 in Settings.",
         v[0], v[1], v[2], v[3]
     ))
+}
+
+/// `PUNKTFUNK_NATIVE_SCANOUT=1`: the Wayland presenter hands pictures to the compositor as
+/// the window's buffer, so the Vulkan decoder keeps its pictures copyable.
+pub fn native_scanout_wanted() -> bool {
+    cfg!(target_os = "linux")
+        && matches!(
+            std::env::var("PUNKTFUNK_NATIVE_SCANOUT").as_deref(),
+            Ok("1")
+        )
 }
 
 /// Can this machine's decoders take an access unit of several slices? Intel's Windows

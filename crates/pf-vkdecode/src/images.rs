@@ -83,6 +83,37 @@ pub fn plan_pools(caps: &DecodeCaps, required_slots: u32) -> PoolPlan {
     }
 }
 
+/// Give the pool's pictures TRANSFER_SRC when the driver answers a query that asks for it
+/// on `format`. Some drivers report exactly the usage they were asked about, so the base
+/// negotiation's answer cannot vouch for a bit it never asked. `false` leaves the plan as is.
+///
+/// # Safety
+///
+/// `dev` wraps live handles ([`crate::DeviceHandles`] contract).
+pub(crate) unsafe fn allow_copy_out(
+    dev: &DecodeDevice,
+    profile: DecodeProfile,
+    plan: &mut PoolPlan,
+    format: vk::Format,
+) -> bool {
+    let usage = plan.picture_usage | vk::ImageUsageFlags::TRANSFER_SRC;
+    // SAFETY: fn contract; a physical-device query.
+    let answered = match unsafe { crate::caps::query_formats(dev, profile, usage) } {
+        Ok(formats) => formats.iter().any(|f| {
+            f.format == format
+                && f.image_usage.contains(usage)
+                && f.image_create_flags.contains(plan.picture_flags)
+                && f.image_tiling == vk::ImageTiling::OPTIMAL
+        }),
+        Err(_) => false,
+    };
+    if answered {
+        plan.picture_usage = usage;
+    }
+    tracing::debug!(?format, answered, "decode pictures copyable (TRANSFER_SRC)");
+    answered
+}
+
 pub(crate) struct Picture {
     /// Shared with the other pictures when a layered coincide pool backs them
     /// all with one array image.
@@ -128,6 +159,8 @@ pub(crate) struct PicturePool {
     /// (session caps are keyed by profile). `build_frame` stamps it onto
     /// each `DecodedVkFrame`.
     pub(crate) format: vk::Format,
+    /// The pictures carry TRANSFER_SRC ([`allow_copy_out`]).
+    pub(crate) copyable: bool,
     pub(crate) pictures: Vec<Picture>,
 }
 
@@ -151,6 +184,9 @@ impl PicturePool {
             images: Vec::new(),
             memory: Vec::new(),
             format: caps.output_format,
+            copyable: plan
+                .picture_usage
+                .contains(vk::ImageUsageFlags::TRANSFER_SRC),
             pictures: Vec::new(),
         };
         let families = dev.sharing_families();

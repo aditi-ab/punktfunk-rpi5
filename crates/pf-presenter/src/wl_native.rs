@@ -1,13 +1,14 @@
-//! Native Wayland lane: the decoder's dma-buf becomes the window's own buffer.
+//! Native Wayland lane: a decoded picture's dma-buf becomes the window's own buffer.
 //!
 //! The Vulkan presenter draws every picture through a colour-conversion pass into a
-//! swapchain the compositor then composites. Here a VAAPI frame's dma-buf goes straight on
-//! SDL's `wl_surface` through `zwp_linux_dmabuf_v1`, so the compositor can put it on a
-//! plane, and `wp_presentation` stamps the glass for the HUD. The lane takes a picture only
+//! swapchain the compositor then composites. Here a dma-buf goes straight on SDL's
+//! `wl_surface` through `zwp_linux_dmabuf_v1`, so the compositor can put it on a plane, and
+//! `wp_presentation` stamps the glass for the HUD. The buffer is a VAAPI surface as decoded,
+//! or a copy of a Vulkan Video picture (`vk::export_ring`). The lane takes a picture only
 //! when the surface feedback lists its format and modifier, it is SDR, and it fills the
 //! window; anything else is declined and the Vulkan path draws that frame.
 //!
-//! A pool slot's buffer is imported once and reused; the decoder's guard is held until the
+//! Each buffer is imported once under a key and reused; the caller's hold is kept until the
 //! compositor releases the buffer. The overlay is not drawn on this lane yet, so it stays an
 //! opt-in (`PUNKTFUNK_NATIVE_SCANOUT=1`).
 //!
@@ -16,9 +17,10 @@
 //! and are moved onto the session's realtime clock as they land.
 
 use anyhow::{Context as _, Result};
-use pf_client_core::video::{DmabufFrame, DrmFrameGuard};
+use pf_client_core::video::{ColorDesc, DmabufFrame};
 use punktfunk_core::video_fit::VideoFit;
 use sdl3::video::WindowContext;
+use std::any::Any;
 use std::collections::HashMap;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
@@ -41,20 +43,32 @@ const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 const CLOCK_MONOTONIC: u32 = 1;
 /// `wp_presentation_feedback.kind` bit: the buffer reached the screen without a copy.
 const KIND_ZERO_COPY: u32 = 8;
+/// linux-dmabuf tranche flag: this tranche's buffers can go straight to a plane.
+const TRANCHE_SCANOUT: u32 = 1;
 
 /// `PUNKTFUNK_NATIVE_SCANOUT=1` arms the lane. Off until the overlay rides along.
 pub fn enabled() -> bool {
-    matches!(
-        std::env::var("PUNKTFUNK_NATIVE_SCANOUT").as_deref(),
-        Ok("1")
-    )
+    pf_client_core::video::native_scanout_wanted()
 }
 
-/// What the lane did with a frame.
+/// What the lane did with a VAAPI frame.
 pub enum Outcome {
     Shown,
     /// Not this lane's frame (or not yet): the caller draws it through Vulkan.
     Declined(DmabufFrame),
+}
+
+/// Where a keyed buffer stands with the compositor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotState {
+    /// Never offered.
+    Unknown,
+    Pending,
+    /// Imported and not on screen: a commit may use it.
+    Free,
+    /// The compositor may still read it.
+    Held,
+    Failed,
 }
 
 /// One presented frame's stamps, client realtime clock.
@@ -68,8 +82,8 @@ pub struct NativeSample {
 
 struct Slot {
     buffer: wl_buffer::WlBuffer,
-    /// The decoder's slot, held while the compositor may still read the buffer.
-    held: Option<DrmFrameGuard>,
+    /// The caller's hold (a decoder slot, a ring slot), kept while the compositor may read.
+    held: Option<Box<dyn Any>>,
 }
 
 enum Import {
@@ -90,8 +104,13 @@ struct LaneState {
     table: Vec<(u32, u64)>,
     /// Every (fourcc, modifier) pair the surface's tranches list.
     pairs: Vec<(u32, u64)>,
+    /// The pairs a scanout tranche lists.
+    scanout: Vec<(u32, u64)>,
+    tranche_flags: u32,
     feedback_done: bool,
-    /// Buffer params in flight, by protocol id, to the pool key they import.
+    /// Bumped on every complete feedback: a caller that chose a modifier re-chooses.
+    feedback_gen: u64,
+    /// Buffer params in flight, by protocol id, to the key they import.
     pending: HashMap<u32, u64>,
     imports: HashMap<u64, Import>,
     by_buffer: HashMap<ObjectId, u64>,
@@ -201,7 +220,14 @@ impl Dispatch<feedback::ZwpLinuxDmabufFeedbackV1, ()> for LaneState {
                 }
                 // A new table starts a new answer.
                 state.pairs.clear();
+                state.scanout.clear();
                 state.feedback_done = false;
+            }
+            feedback::Event::TrancheFlags { flags } => {
+                state.tranche_flags = match flags {
+                    WEnum::Value(f) => f.bits(),
+                    WEnum::Unknown(v) => v,
+                };
             }
             feedback::Event::TrancheFormats { indices } => {
                 for c in indices.chunks_exact(2) {
@@ -210,10 +236,19 @@ impl Dispatch<feedback::ZwpLinuxDmabufFeedbackV1, ()> for LaneState {
                         if !state.pairs.contains(&pair) {
                             state.pairs.push(pair);
                         }
+                        if state.tranche_flags & TRANCHE_SCANOUT != 0
+                            && !state.scanout.contains(&pair)
+                        {
+                            state.scanout.push(pair);
+                        }
                     }
                 }
             }
-            feedback::Event::Done => state.feedback_done = true,
+            feedback::Event::TrancheDone => state.tranche_flags = 0,
+            feedback::Event::Done => {
+                state.feedback_done = true;
+                state.feedback_gen += 1;
+            }
             _ => {}
         }
     }
@@ -377,6 +412,7 @@ impl NativeLane {
         }
         tracing::info!(
             pairs = state.pairs.len(),
+            scanout_pairs = state.scanout.len(),
             color_representation = color_repr.is_some(),
             viewport = !viewport_ptr.is_null(),
             "native scanout lane armed on SDL's surface"
@@ -420,16 +456,20 @@ impl NativeLane {
         }
     }
 
-    /// Whether this frame can be the window's buffer: listed pair, SDR, fills the window.
-    pub fn takes(&self, d: &DmabufFrame, view: (u32, u32), fit: VideoFit) -> bool {
-        if self.dead || d.color.is_pq() || d.modifier == DRM_FORMAT_MOD_INVALID {
-            return false;
-        }
-        if !self.state.pairs.contains(&(d.fourcc, d.modifier)) {
+    /// Whether a picture of this size and colour can be the window's buffer: SDR, and it
+    /// fills the window (through SDL's viewport, or at the window's own size without one).
+    pub fn fits(
+        &self,
+        color: ColorDesc,
+        frame: (u32, u32),
+        view: (u32, u32),
+        fit: VideoFit,
+    ) -> bool {
+        if self.dead || color.is_pq() {
             return false;
         }
         let (vw, vh) = (u64::from(view.0), u64::from(view.1));
-        let (fw, fh) = (u64::from(d.width), u64::from(d.height));
+        let (fw, fh) = (u64::from(frame.0), u64::from(frame.1));
         if vw == 0 || vh == 0 || fw == 0 || fh == 0 {
             return false;
         }
@@ -440,34 +480,88 @@ impl NativeLane {
         fit == VideoFit::Stretch || (vw * fh).abs_diff(vh * fw) * 100 <= vw * fh
     }
 
-    fn start_import(&mut self, d: &DmabufFrame) {
+    /// The surface feedback lists this (fourcc, modifier).
+    pub fn lists(&self, fourcc: u32, modifier: u64) -> bool {
+        modifier != DRM_FORMAT_MOD_INVALID && self.state.pairs.contains(&(fourcc, modifier))
+    }
+
+    /// Modifiers the surface takes for `fourcc`, scanout tranches first.
+    pub fn modifiers_for(&self, fourcc: u32) -> Vec<u64> {
+        let scanout = self.state.scanout.iter().filter(|(f, _)| *f == fourcc);
+        let rest = self.state.pairs.iter().filter(|(f, _)| *f == fourcc);
+        let mut out: Vec<u64> = Vec::new();
+        for &(_, m) in scanout.chain(rest) {
+            if m != DRM_FORMAT_MOD_INVALID && !out.contains(&m) {
+                out.push(m);
+            }
+        }
+        out
+    }
+
+    /// Changes whenever the compositor sends new surface feedback.
+    pub fn feedback_generation(&self) -> u64 {
+        self.state.feedback_gen
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.dead
+    }
+
+    pub fn slot_state(&self, key: u64) -> SlotState {
+        match self.state.imports.get(&key) {
+            None => SlotState::Unknown,
+            Some(Import::Pending(_)) => SlotState::Pending,
+            Some(Import::Failed) => SlotState::Failed,
+            Some(Import::Ready(slot)) if slot.held.is_some() => SlotState::Held,
+            Some(Import::Ready(_)) => SlotState::Free,
+        }
+    }
+
+    /// Offer a dma-buf under `key`: one `(fd, offset, pitch)` per memory plane. The answer
+    /// arrives with a later [`Self::pump`]; libwayland dups each fd while marshalling.
+    pub fn import(
+        &mut self,
+        key: u64,
+        size: (u32, u32),
+        fourcc: u32,
+        modifier: u64,
+        planes: &[(BorrowedFd<'_>, u32, u32)],
+    ) {
         let prm = self.dmabuf.create_params(&self.qh, ());
-        for (i, p) in d.planes.iter().enumerate() {
-            // SAFETY: the frame owns `p.fd` for this call; libwayland dups it at marshal.
-            let fd = unsafe { BorrowedFd::borrow_raw(p.fd) };
+        for (i, (fd, offset, pitch)) in planes.iter().enumerate() {
             prm.add(
-                fd,
+                *fd,
                 i as u32,
-                p.offset,
-                p.stride,
-                (d.modifier >> 32) as u32,
-                d.modifier as u32,
+                *offset,
+                *pitch,
+                (modifier >> 32) as u32,
+                modifier as u32,
             );
         }
-        prm.create(
-            d.width as i32,
-            d.height as i32,
-            d.fourcc,
-            params::Flags::empty(),
-        );
-        self.state
-            .pending
-            .insert(prm.id().protocol_id(), d.pool_key);
-        self.state.imports.insert(d.pool_key, Import::Pending(prm));
+        prm.create(size.0 as i32, size.1 as i32, fourcc, params::Flags::empty());
+        self.state.pending.insert(prm.id().protocol_id(), key);
+        self.state.imports.insert(key, Import::Pending(prm));
         self.flush();
     }
 
-    fn apply_color(&mut self, color: pf_client_core::video::ColorDesc) {
+    /// Drop the buffer under `key`. The compositor keeps its own reference to a buffer it
+    /// still shows; the hold goes now.
+    pub fn forget(&mut self, key: u64) {
+        match self.state.imports.remove(&key) {
+            Some(Import::Ready(slot)) => {
+                self.state.by_buffer.remove(&slot.buffer.id());
+                slot.buffer.destroy();
+            }
+            Some(Import::Pending(prm)) => {
+                self.state.pending.remove(&prm.id().protocol_id());
+                prm.destroy();
+            }
+            _ => {}
+        }
+        self.flush();
+    }
+
+    fn apply_color(&mut self, color: ColorDesc) {
         let Some(manager) = &self.color_repr else {
             return;
         };
@@ -492,41 +586,24 @@ impl NativeLane {
         self.repr_set = Some(want);
     }
 
-    /// Attach the frame as the window's buffer. `Declined` while the slot's buffer is still
-    /// importing or still held by the compositor; the caller draws that frame through Vulkan.
-    pub fn present(&mut self, d: DmabufFrame, pts_ns: u64, decoded_ns: u64) -> Outcome {
-        self.pump();
-        if self.dead {
-            return Outcome::Declined(d);
+    /// Put the free buffer under `key` on the window and keep `hold` until the compositor
+    /// releases it. `false` when the buffer is not free; `hold` is dropped then.
+    pub fn commit(
+        &mut self,
+        key: u64,
+        color: ColorDesc,
+        hold: Box<dyn Any>,
+        pts_ns: u64,
+        decoded_ns: u64,
+    ) -> bool {
+        if self.dead || self.slot_state(key) != SlotState::Free {
+            return false;
         }
-        match self.state.imports.get(&d.pool_key) {
-            None => {
-                self.start_import(&d);
-                return Outcome::Declined(d);
-            }
-            Some(Import::Pending(_)) => return Outcome::Declined(d),
-            Some(Import::Failed) => {
-                tracing::warn!(
-                    fourcc = format!("{:#010x}", d.fourcc),
-                    modifier = format!("{:#x}", d.modifier),
-                    "native scanout: the compositor refused a listed dma-buf — the lane retires"
-                );
-                self.dead = true;
-                return Outcome::Declined(d);
-            }
-            Some(Import::Ready(slot)) if slot.held.is_some() => return Outcome::Declined(d),
-            Some(Import::Ready(_)) => {}
-        }
-        // The pump waited the decode already; a leftover sync_file costs a poll.
-        for fd in &d.sync_fds {
-            use std::os::fd::AsRawFd as _;
-            let _ = pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_raw_fd(), 50);
-        }
-        self.apply_color(d.color);
+        self.apply_color(color);
         let seq = self.seq;
         self.seq += 1;
-        let Some(Import::Ready(slot)) = self.state.imports.get_mut(&d.pool_key) else {
-            return Outcome::Declined(d);
+        let Some(Import::Ready(slot)) = self.state.imports.get_mut(&key) else {
+            return false;
         };
         self.surface.attach(Some(&slot.buffer), 0, 0);
         self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
@@ -540,9 +617,65 @@ impl NativeLane {
             },
         );
         self.surface.commit();
-        let DmabufFrame { guard, .. } = d;
-        slot.held = Some(guard);
+        slot.held = Some(hold);
         self.flush();
+        true
+    }
+
+    /// A refused import of a listed pair retires the lane for the session.
+    pub fn refused(&mut self, fourcc: u32, modifier: u64) {
+        tracing::warn!(
+            fourcc = format!("{fourcc:#010x}"),
+            modifier = format!("{modifier:#x}"),
+            "native scanout: the compositor refused a listed dma-buf — the lane retires"
+        );
+        self.dead = true;
+    }
+
+    /// Whether a VAAPI frame can be the window's buffer: listed pair and it [`Self::fits`].
+    pub fn takes(&self, d: &DmabufFrame, view: (u32, u32), fit: VideoFit) -> bool {
+        self.lists(d.fourcc, d.modifier) && self.fits(d.color, (d.width, d.height), view, fit)
+    }
+
+    /// A VAAPI frame as the window's buffer, its pool slot imported once. `Declined` while
+    /// the slot is importing or still held; the caller draws that frame through Vulkan.
+    pub fn present(&mut self, d: DmabufFrame, pts_ns: u64, decoded_ns: u64) -> Outcome {
+        self.pump();
+        if self.dead {
+            return Outcome::Declined(d);
+        }
+        match self.slot_state(d.pool_key) {
+            SlotState::Unknown => {
+                let planes: Vec<_> = d
+                    .planes
+                    .iter()
+                    // SAFETY: the frame owns each fd for this call; libwayland dups it.
+                    .map(|p| (unsafe { BorrowedFd::borrow_raw(p.fd) }, p.offset, p.stride))
+                    .collect();
+                self.import(
+                    d.pool_key,
+                    (d.width, d.height),
+                    d.fourcc,
+                    d.modifier,
+                    &planes,
+                );
+                return Outcome::Declined(d);
+            }
+            SlotState::Failed => {
+                self.refused(d.fourcc, d.modifier);
+                return Outcome::Declined(d);
+            }
+            SlotState::Pending | SlotState::Held => return Outcome::Declined(d),
+            SlotState::Free => {}
+        }
+        // The pump waited the decode already; a leftover sync_file costs a poll.
+        for fd in &d.sync_fds {
+            use std::os::fd::AsRawFd as _;
+            let _ = pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_raw_fd(), 50);
+        }
+        let (key, color) = (d.pool_key, d.color);
+        let DmabufFrame { guard, .. } = d;
+        self.commit(key, color, Box::new(guard), pts_ns, decoded_ns);
         Outcome::Shown
     }
 

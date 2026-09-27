@@ -2441,11 +2441,17 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     DecodedImage::NativeVk(v) if !st.dmabuf_demoted => {
                         st.hdr = v.color.is_pq();
                         st.hdr_untonemapped = false;
-                        match presenter.present(
-                            &window,
-                            FrameInput::NativeVk(v),
-                            overlay_frame.as_ref(),
-                        ) {
+                        // The native lane first: a copy of the picture as the window's buffer.
+                        let native = presenter.present_native_vk(v, pts_ns, decoded_ns);
+                        match match native {
+                            crate::vk::NativeVkOutcome::Shown => Ok(Presented::Shown),
+                            crate::vk::NativeVkOutcome::Dropped => Ok(Presented::Stale),
+                            crate::vk::NativeVkOutcome::Declined(v) => presenter.present(
+                                &window,
+                                FrameInput::NativeVk(v),
+                                overlay_frame.as_ref(),
+                            ),
+                        } {
                             Ok(Presented::Shown) => {
                                 st.hw_fails = 0;
                                 true

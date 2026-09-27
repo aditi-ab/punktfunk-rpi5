@@ -717,6 +717,12 @@ impl Presenter {
             } else {
                 None
             },
+            #[cfg(target_os = "linux")]
+            export_ring: None,
+            #[cfg(target_os = "linux")]
+            export_refused: None,
+            #[cfg(target_os = "linux")]
+            export_gen: 0,
             native_last: false,
         };
         p.recreate_swapchain(window)?;
