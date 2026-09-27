@@ -307,12 +307,14 @@ fn run(
         // Do not start a second copy or mint a stamp the running game could never satisfy.
         // Anonymous / no library id is unrecordable.
         let launch_claim = target.as_ref().map(|t| {
-            crate::launchreg::claim(
+            let claim = crate::launchreg::claim(
                 life.fingerprint.as_deref(),
                 t.game.id.as_deref(),
                 t.launcher,
                 fresh_stamp,
-            )
+            );
+            claim.describe(&t.game, crate::events::Plane::Gamestream);
+            claim
         });
         let launch_stamp = launch_claim.as_ref().map_or(fresh_stamp, |c| c.stamp());
         let adopt_launch = launch_claim.as_ref().is_some_and(|c| !c.must_spawn());

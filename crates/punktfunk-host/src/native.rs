@@ -2331,7 +2331,10 @@ pub(crate) async fn run_admitted(
     // hold below must know already whether this session spawns. A re-dial adopts the original.
     let fresh_stamp = crate::gamelease::launch_clock();
     let launch_claim = launch_target.as_ref().map(|t| {
-        crate::launchreg::claim(fp.as_deref(), t.game.id.as_deref(), t.launcher, fresh_stamp)
+        let claim =
+            crate::launchreg::claim(fp.as_deref(), t.game.id.as_deref(), t.launcher, fresh_stamp);
+        claim.describe(&t.game, conn.plane());
+        claim
     });
     // Custom-title prep before the display opens. Drop undoes in reverse. `block_in_place`:
     // operator code is blocking and this is a multi-thread runtime.

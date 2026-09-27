@@ -1672,8 +1672,8 @@
         "tags": [
           "session"
         ],
-        "summary": "End waiting games",
-        "description": "Ends games waiting out the reconnect window. With `streaming` and an\n`app_id`, also ends that title where it is still on a live session — the\nmove a player has after a launch that never produced a game. The session\nitself stays up (`DELETE /session` plus `game_on_session_end`).",
+        "summary": "End a launched game",
+        "description": "Ends games nobody is streaming: those waiting out the reconnect window and\nlaunches left running after their session ended (`detached` in `GET /status`).\nWith `streaming`, also ends games still on a live session; the session itself\nstays up (`DELETE /session` plus `game_on_session_end`). `app_id` narrows it to\none title. A paired device ends only games it launched.",
         "operationId": "endGame",
         "requestBody": {
           "content": {
@@ -1687,7 +1687,7 @@
         },
         "responses": {
           "200": {
-            "description": "How many waiting games were ended",
+            "description": "How many games were ended",
             "content": {
               "application/json": {
                 "schema": {
@@ -1697,7 +1697,17 @@
             }
           },
           "401": {
-            "description": "Missing or invalid bearer token",
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "This device's access has expired",
             "content": {
               "application/json": {
                 "schema": {
@@ -1707,7 +1717,7 @@
             }
           },
           "409": {
-            "description": "No game is waiting to be ended",
+            "description": "No game in reach to end",
             "content": {
               "application/json": {
                 "schema": {
@@ -6376,6 +6386,10 @@
             "type": "string",
             "description": "Client-supplied device name of the session that launched it; may be empty."
           },
+          "endable": {
+            "type": "boolean",
+            "description": "Present and true when this caller may end it with `POST /game/end`: the operator any\nlaunched game, a paired device only a game it launched."
+          },
           "grace_remaining_s": {
             "type": [
               "integer",
@@ -6397,7 +6411,7 @@
           },
           "state": {
             "type": "string",
-            "description": "`launching` | `running` | `window` (its window is on the streamed screen) | `exited` |\n`untracked` (exit will never be seen) | `grace` (reconnect window).",
+            "description": "`launching` | `running` | `window` (its window is on the streamed screen) | `exited` |\n`untracked` (exit will never be seen) | `grace` (reconnect window) | `detached` (still\nrunning, no session holds it).",
             "example": "running"
           },
           "store": {
@@ -8339,11 +8353,11 @@
               "string",
               "null"
             ],
-            "description": "Store-qualified id (`steam:570`); omit to end every waiting game."
+            "description": "Store-qualified id (`steam:570`); omit to reach every title."
           },
           "streaming": {
             "type": "boolean",
-            "description": "Also end `app_id` where it is on a live session, not only where it is\nwaiting out a reconnect window. Ignored without `app_id`."
+            "description": "Also end games on a live session, not only games nobody is streaming."
           }
         }
       },
