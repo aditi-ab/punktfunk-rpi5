@@ -147,6 +147,7 @@
 	"activity_display_created": "Display created",
 	"activity_display_released": "Display released",
 	"activity_library_changed": "Library changed",
+	"activity_emulators_changed": "Emulators changed",
 	"activity_update_available": "Update available",
 	"activity_update_applied": "Update applied",
 	"activity_plugins_changed": "Plugins changed",
