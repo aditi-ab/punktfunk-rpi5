@@ -160,7 +160,7 @@ export const togglePin = (pins: string[], id: string) =>
 export interface PinnablePlugin {
 	id: string;
 	title: string;
-	ui?: { icon?: string };
+	ui?: { icon?: string | null } | null;
 }
 
 /**

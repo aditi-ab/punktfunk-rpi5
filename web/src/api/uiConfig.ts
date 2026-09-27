@@ -4,31 +4,7 @@
 // scheme and host, its own port. The console has to build iframe and new-tab URLs against that
 // origin, and the port has to come from the server — only it knows whether the listener bound.
 import { useQuery } from "@tanstack/react-query";
-
-/**
- * The desktop's own theme, from whichever reader answered (design/web-console-overhaul.md §7).
- *
- * Only `mode` is always there. Omarchy renders our template and so publishes all four values;
- * the host's own read of the desktop — XDG portal on Linux, DWM on Windows — publishes an
- * accent at most, and the console then keeps its own surfaces rather than half a palette.
- */
-export interface OmarchyTheme {
-	mode: "light" | "dark";
-	accent?: string;
-	background?: string;
-	foreground?: string;
-	/** Which reader answered: `omarchy` | `portal` | `windows`. Named on the Appearance panel. */
-	source?: string;
-}
-
-export interface UiConfig {
-	pluginUi: "origin" | "same-origin" | "unavailable";
-	pluginPort: number | null;
-	/** `null` on every box that is not a themed Omarchy one — the console keeps its own palette. */
-	theme: OmarchyTheme | null;
-	/** The console answers on more than this machine. Settings shows a notice when it does. */
-	reachableFromNetwork: boolean;
-}
+import type { UiConfig } from "../../server/routes/_auth/ui-config.get";
 
 /**
  * Deployment facts the console cannot infer.

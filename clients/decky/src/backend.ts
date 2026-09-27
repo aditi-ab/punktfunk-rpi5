@@ -30,6 +30,8 @@ export interface DiscoveredHost {
   mgmt: number; // management-API port; 0 = not advertised
   os: string; // OS-identity chain, e.g. "linux/fedora/bazzite"; "" on older hosts
   saved: boolean;
+  /** The saved record's id when the CLI matched one; null or absent from an older client. */
+  saved_id?: string | null;
   paired: boolean;
 }
 

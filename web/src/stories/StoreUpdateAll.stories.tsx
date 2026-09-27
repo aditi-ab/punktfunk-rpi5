@@ -48,6 +48,7 @@ const update = (
 		source,
 		tier,
 		platforms: ["linux", "windows"],
+		categories: [],
 		compatible: true,
 		update_available: true,
 	},

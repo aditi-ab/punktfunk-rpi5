@@ -19,6 +19,7 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
+import { fmtClockDuration } from "@/lib/format";
 import { m } from "@/paraglide/messages";
 import { levelLabel } from "@/sections/Pairing/access";
 
@@ -101,7 +102,9 @@ const Row: FC<{
 	const facts = [
 		row.mode,
 		row.join ? m.sessions_joined() : m.sessions_own_display(),
-		m.sessions_uptime({ time: formatUptime(row.uptime_s) }),
+		m.sessions_uptime({
+			time: fmtClockDuration(row.uptime_s, { hours: true }),
+		}),
 		sharedWith.length > 0
 			? m.sessions_shared_path({ names: sharedWith.join(", ") })
 			: undefined,
@@ -231,12 +234,3 @@ const Row: FC<{
 
 /** No pick: the slot is whichever comes free. Not a slot number, so it cannot collide with one. */
 const AUTO_PLAYER = "auto";
-
-/** `h:mm` past an hour, else `m:ss` — a session's age reads as a duration, not seconds.
- * Shared with `LastSessionCard`, so a finished session reads the same as a live one. */
-export function formatUptime(seconds: number): string {
-	const s = Math.max(0, Math.floor(seconds));
-	const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
-	if (s >= 3600) return `${Math.floor(s / 3600)}:${mm}`;
-	return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-}

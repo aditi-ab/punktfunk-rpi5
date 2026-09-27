@@ -520,6 +520,10 @@ from the config directory for a true factory reset."
                         "mgmt": d.mgmt_port.unwrap_or(0),
                         "os": d.os,
                         "saved": saved.is_some(),
+                        // The record's stable id, so a consumer pairs the advert with the row
+                        // it already listed instead of re-deriving the match. `null` when the
+                        // record predates ids: this verb reads the store and never mints.
+                        "saved_id": saved.and_then(|h| h.id.as_deref()),
                         "paired": saved.is_some_and(|h| h.paired),
                     })
                 })
@@ -546,13 +550,13 @@ from the config directory for a true factory reset."
         OK
     }
 
-    /// The saved record an advert belongs to, if any: fingerprint first, address second.
+    /// The saved record an advert belongs to, if any: an exact fingerprint first, then
+    /// [`same_host`](pf_client_core::discovery::same_host).
     ///
-    /// Fingerprint FIRST is deliberate and load-bearing — a host that moved to a new DHCP lease
-    /// still matches its record, and a *different* host that inherited the old address does not
-    /// inherit its pairing. This is the rule the plugin's `mergeHosts` and the shells' hosts
-    /// pages already use; keeping one copy is what stops two surfaces disagreeing about whether
-    /// the box in front of you is paired.
+    /// Two known fingerprints settle it on their own, so a host that moved lease still matches
+    /// its record and a different box at the old address (the other OS of a dual-boot machine,
+    /// or whoever inherited the lease) does not inherit its pairing. The plugin's `mergeHosts`
+    /// and the shells' hosts pages use the same rule.
     fn match_saved<'a>(
         known: &'a KnownHosts,
         advert: &pf_client_core::discovery::DiscoveredHost,
@@ -560,16 +564,12 @@ from the config directory for a true factory reset."
         known
             .hosts
             .iter()
-            .find(|h| {
-                !h.fp_hex.is_empty()
-                    && !advert.fp_hex.is_empty()
-                    && h.fp_hex.eq_ignore_ascii_case(&advert.fp_hex)
-            })
+            .find(|h| !h.fp_hex.is_empty() && h.fp_hex.eq_ignore_ascii_case(&advert.fp_hex))
             .or_else(|| {
                 known
                     .hosts
                     .iter()
-                    .find(|h| h.addr == advert.addr && h.port == advert.port)
+                    .find(|h| pf_client_core::discovery::same_host(h, advert))
             })
     }
 
@@ -1378,6 +1378,45 @@ from the config directory for a true factory reset."
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The other OS of a dual-boot box answers at the saved one's lease with its own pin.
+        /// It is not that record, so `discover` must not call it saved or paired.
+        #[test]
+        fn a_second_os_at_a_saved_address_is_not_saved() {
+            let saved = KnownHost {
+                addr: "192.168.1.9".into(),
+                port: 9777,
+                fp_hex: "aa".into(),
+                paired: true,
+                ..Default::default()
+            };
+            let known = KnownHosts { hosts: vec![saved] };
+            let mut advert = pf_client_core::discovery::DiscoveredHost {
+                key: "id-2".into(),
+                fullname: "desk._punktfunk._udp.local.".into(),
+                name: "desk".into(),
+                addr: "192.168.1.9".into(),
+                port: 9777,
+                fp_hex: "bb".into(),
+                pair: "required".into(),
+                mgmt_port: None,
+                mac: vec![],
+                os: String::new(),
+            };
+            assert!(match_saved(&known, &advert).is_none());
+            advert.fp_hex = "AA".into();
+            advert.addr = "192.168.1.20".into();
+            assert!(
+                match_saved(&known, &advert).is_some(),
+                "a moved lease keeps its record"
+            );
+            advert.fp_hex = String::new();
+            advert.addr = "192.168.1.9".into();
+            assert!(
+                match_saved(&known, &advert).is_some(),
+                "no pin: the address decides"
+            );
+        }
 
         fn argv(v: &[&str]) -> Vec<String> {
             v.iter().map(|s| s.to_string()).collect()

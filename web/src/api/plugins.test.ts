@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { gamePlugins, type PluginSummary, uiPlugins } from "./plugins";
+import type { PluginSummary } from "./gen/model";
+import { gamePlugins, uiPlugins } from "./plugins";
 
 const p = (id: string, ui?: PluginSummary["ui"], category?: string) => ({
 	id,

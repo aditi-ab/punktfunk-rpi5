@@ -17,11 +17,11 @@ import { m } from "@/paraglide/messages";
 // instead of a verification it hasn't got.
 
 /** The short, permanent provenance badge for a tier. */
-export const TierBadge: FC<{ tier: StoreTier; className?: string }> = ({
+export const TierBadge: FC<{ tier: string; className?: string }> = ({
 	tier,
 	className,
 }) => {
-	switch (tier) {
+	switch (tier as StoreTier) {
 		case "verified":
 			return (
 				<Badge

@@ -5,6 +5,7 @@ import type { GameEntry } from "@/api/gen/model/gameEntry";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { fmtClockDuration } from "@/lib/format";
 import { m } from "@/paraglide/messages";
 
 /**
@@ -89,7 +90,7 @@ const GameRow: FC<{
 				<p className="mt-0.5 truncate text-xs text-muted-foreground">
 					{waiting
 						? m.games_closing_in({
-								time: formatCountdown(game.grace_remaining_s ?? 0),
+								time: fmtClockDuration(game.grace_remaining_s ?? 0),
 							})
 						: untracked
 							? m.games_untracked_note()
@@ -120,12 +121,6 @@ function coverFor(game: ActiveGame, library?: GameEntry[]): string | undefined {
 	if (!game.app_id || !library) return undefined;
 	const entry = library.find((e) => e.id === game.app_id);
 	return entry?.art.portrait ?? entry?.art.header ?? undefined;
-}
-
-/** `mm:ss` — the countdown reads as a duration, not a number of seconds. */
-function formatCountdown(seconds: number): string {
-	const s = Math.max(0, Math.floor(seconds));
-	return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
 function stateLabel(state: string): string {

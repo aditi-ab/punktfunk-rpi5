@@ -7,18 +7,14 @@
 // Wins over the `/api/**` catch-all by h3 route specificity. Only reachable when the host runs the
 // compat planes (`--gamestream`, off by default).
 import { defineEventHandler, readBody } from "h3";
+import type { SubmitPin } from "../../../../../src/api/gen/model";
 import { confirmPassword } from "../../../../util/confirm";
-import { forwardJson } from "../../../../util/forward";
+import { type AllFields, forwardJson } from "../../../../util/forward";
 
 export default defineEventHandler(async (event) => {
-	const body = await readBody<{
-		pin?: string;
-		uniqueid?: string;
-		fingerprint?: string;
-		peer_ip?: string;
-		label?: string;
-		password?: string;
-	}>(event);
+	const body = await readBody<Partial<SubmitPin> & { password?: string }>(
+		event,
+	);
 	await confirmPassword(event, body?.password);
 	// Rebuild from exactly the fields the host takes, so the password cannot leak upstream.
 	// uniqueid/fingerprint address the PIN to one parked ceremony — the one the operator SAW in
@@ -30,6 +26,6 @@ export default defineEventHandler(async (event) => {
 		uniqueid: String(body?.uniqueid ?? ""),
 		fingerprint: String(body?.fingerprint ?? ""),
 		peer_ip: String(body?.peer_ip ?? ""),
-		...(body?.label ? { label: String(body.label) } : {}),
-	});
+		label: body?.label ? String(body.label) : undefined,
+	} satisfies AllFields<SubmitPin>);
 });
