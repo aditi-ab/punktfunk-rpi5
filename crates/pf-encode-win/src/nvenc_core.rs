@@ -498,6 +498,28 @@ pub fn store_split_verdict(key: SplitKey, mode: u32) {
     split_verdicts().lock().unwrap().insert(key, mode);
 }
 
+#[cfg(any(target_os = "linux", windows))]
+/// Split mode a new session opens at: the cached verdict for `key`, else
+/// `static_mode` from [`crate::resolve_split_mode`]. An operator pin
+/// (`PUNKTFUNK_SPLIT_ENCODE`) beats the verdict.
+pub fn open_split_mode(static_mode: u32, key: &SplitKey) -> u32 {
+    if crate::knobs::get().split_encode != 0 {
+        return static_mode;
+    }
+    match cached_split_verdict(key) {
+        Some(known) if known != static_mode => {
+            tracing::info!(
+                from = static_mode,
+                to = known,
+                "NVENC: using the split mode a previous arbitration measured as fastest for \
+                 this config"
+            );
+            known
+        }
+        _ => static_mode,
+    }
+}
+
 /// Drop every cached verdict. For tests: the cache is process-global, so an
 /// on-hardware arbitration would otherwise leak into later tests that open
 /// the same config with `PUNKTFUNK_SPLIT_ENCODE` unset.
@@ -516,6 +538,28 @@ mod tests {
     use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
 
     // Assumes `PUNKTFUNK_SPLIT_ENCODE` is unset (CI); an operator override wins.
+
+    #[test]
+    fn a_new_session_opens_at_the_measured_split() {
+        let key = SplitKey {
+            gpu: 0x5eed_0001,
+            codec: Codec::H265,
+            width: 1234,
+            height: 567,
+            fps: 89,
+            bit_depth: 8,
+            chroma_444: false,
+        };
+        let auto = M::NV_ENC_SPLIT_AUTO_MODE as u32;
+        let two = M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32;
+        assert_eq!(
+            open_split_mode(auto, &key),
+            auto,
+            "no verdict: the static rule"
+        );
+        store_split_verdict(key, two);
+        assert_eq!(open_split_mode(auto, &key), two, "the verdict wins");
+    }
 
     /// `encodeCodecConfig` is a C union: the HEVC 4:4:4 arm must be codec-gated
     /// or it stamps `hevcConfig` bytes onto another codec. Ungated, this branch

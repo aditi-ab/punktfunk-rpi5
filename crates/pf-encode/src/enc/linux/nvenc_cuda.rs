@@ -25,9 +25,9 @@
 
 use super::nvenc_core::{
     apply_low_latency_config, build_init_params, cached_ceiling, cached_split_verdict, codec_guid,
-    plan_range_recovery, resolve_slices, resolve_split_subframe, resolve_subframe, store_ceiling,
-    store_split_verdict, subframe_env_forced, wave_rows, ArbAction, CeilingKey, LowLatencyConfig,
-    NvStatusExt, RangePlan, SplitArbiter, SplitKey,
+    open_split_mode, plan_range_recovery, resolve_slices, resolve_split_subframe, resolve_subframe,
+    store_ceiling, store_split_verdict, subframe_env_forced, wave_rows, ArbAction, CeilingKey,
+    LowLatencyConfig, NvStatusExt, RangePlan, SplitArbiter, SplitKey,
 };
 use super::nvenc_status;
 use super::{max_forced_split_mode, resolve_split_mode};
@@ -1418,25 +1418,13 @@ impl NvencCudaEncoder {
             }
             const FLOOR_BPS: u64 = 10_000_000;
             let requested_bps = self.bitrate_bps;
-            // [`resolve_split_mode`]: env / 10-bit / pixel-rate precedence.
+            // [`resolve_split_mode`]: env / 10-bit / pixel-rate precedence; a measured verdict
+            // wins over the static rule ([`open_split_mode`]).
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let mut split_mode: u32 =
-                resolve_split_mode(self.codec, self.bit_depth, pixel_rate, self.encoder_engines);
-            // Cached verdict wins over the static rule. Operator pin still beats both
-            // (`resolve_split_mode`); only consult the cache when the knob is unset.
-            if std::env::var_os("PUNKTFUNK_SPLIT_ENCODE").is_none() {
-                if let Some(known) = cached_split_verdict(&self.split_key()) {
-                    if known != split_mode {
-                        tracing::info!(
-                            from = split_mode,
-                            to = known,
-                            "NVENC: using the split mode a previous arbitration measured as \
-                             fastest for this config"
-                        );
-                    }
-                    split_mode = known;
-                }
-            }
+            let split_mode = open_split_mode(
+                resolve_split_mode(self.codec, self.bit_depth, pixel_rate, self.encoder_engines),
+                &self.split_key(),
+            );
             // Split × sub-frame *before* the ladder, ceiling key, and chunked-poll latch —
             // a drop inside `build_init_params` would leave `poll_chunk` busy-polling.
             let (split_mode, subframe_on) = resolve_split_subframe(

@@ -30,7 +30,7 @@ use super::nvenc_core::{
 use crate::rfi::{Wave, WaveMark};
 // Shared with Linux's direct session. Do not fork this copy.
 use super::nvenc_core::{
-    cached_split_verdict, store_split_verdict, ArbAction, SplitArbiter, SplitKey,
+    cached_split_verdict, open_split_mode, store_split_verdict, ArbAction, SplitArbiter, SplitKey,
 };
 use super::nvenc_status;
 use super::{max_forced_split_mode, resolve_split_mode};
@@ -1205,11 +1205,14 @@ impl NvencD3d11Encoder {
             // Try the request, then binary-search down to the max the level accepts.
             const FLOOR_BPS: u64 = 10_000_000;
             let requested_bps = self.bitrate_bps;
-            // Split-frame encode: one session tops out ~0.8–1 Gpix/s. See [`resolve_split_mode`].
-            // Init-failure fallback below disables it if rejected.
+            // Split-frame encode: one session tops out ~0.8–1 Gpix/s. See [`resolve_split_mode`];
+            // a measured verdict wins ([`open_split_mode`]). Init-failure fallback below
+            // disables it if rejected.
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let split_mode: u32 =
-                resolve_split_mode(self.codec, self.bit_depth, pixel_rate, self.encoder_engines);
+            let split_mode = open_split_mode(
+                resolve_split_mode(self.codec, self.bit_depth, pixel_rate, self.encoder_engines),
+                &self.split_key(),
+            );
             // Multi-slice default 4, clamped by the client ceiling. `PUNKTFUNK_NVENC_SLICES` overrides.
             self.slices = resolve_slices(self.codec, 4.min(self.max_slices));
             // Sub-frame follows the GPU cap and the slice count ([`resolve_subframe`]).
