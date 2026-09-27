@@ -117,9 +117,9 @@ impl HostRef {
 pub(crate) struct HostsProps {
     pub(crate) svc: Svc,
     pub(crate) hosts: Vec<DiscoveredHost>,
-    /// Saved hosts proven reachable by the periodic QUIC probe (keyed by `fp_hex`) — the whole
-    /// of the Online pip. A routed host (Tailscale/VPN) that never advertises reads Online here,
-    /// and a sleeping one whose advert has not aged out yet reads Offline.
+    /// Saved hosts proven reachable by the periodic QUIC probe, keyed by `KnownHost::card_key` —
+    /// the whole of the Online pip. A routed host (Tailscale/VPN) that never advertises reads
+    /// Online here, and a sleeping one whose advert has not aged out yet reads Offline.
     pub(crate) probed: HashMap<String, bool>,
     pub(crate) status: String,
     /// Connected-controller count (root state, mirrored from the gamepad service) — a
@@ -766,7 +766,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             // goodbye for, so counting it kept a sleeping machine's pip green — and every wake
             // gate below reads `!online`, which is how Wake-on-LAN stayed silent for exactly the
             // host it was meant to wake.
-            let online = props.probed.get(&k.fp_hex).copied().unwrap_or(false);
+            let online = props.probed.get(&k.card_key()).copied().unwrap_or(false);
             // Everything the advert teaches: wake MAC(s), OS chain (so the mark survives going
             // offline), management port, and its address as a place the probe sweep asks —
             // the card moves there only once its pin answers. No disk write when unchanged.

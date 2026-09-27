@@ -10,6 +10,7 @@ use crate::trust::{self, Settings};
 use crate::ui_hosts::{self, ConnectRequest, HostsMsg, HostsOutput, HostsPage};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
+use pf_client_core::orchestrate::ConnectOutcome;
 use pf_client_core::start;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref};
@@ -671,7 +672,7 @@ impl SimpleComponent for AppModel {
                 if persist_paired {
                     // Request-access: the operator approved this device — a trusted
                     // PAIRED host from now on, like after a PIN ceremony.
-                    match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true) {
+                    match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true, &[]) {
                         Ok(()) => self.toast("Approved — connected"),
                         // The stream is up (the pin was carried in memory), but nothing was
                         // written — say so, or the host is simply gone at the next launch.
@@ -679,7 +680,7 @@ impl SimpleComponent for AppModel {
                     }
                 } else if tofu {
                     // The advertised fingerprint proved itself on a real connect.
-                    match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, false) {
+                    match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, false, &[]) {
                         Ok(()) => self.toast(&format!(
                             "Trusted on first use — fingerprint {}…",
                             &fp_hex[..16.min(fp_hex.len())]
@@ -711,12 +712,18 @@ impl SimpleComponent for AppModel {
                             (Some(a), Some(b)) => a == b,
                             _ => fb.addr == req.addr && fb.port == req.port,
                         });
-                match (code, error, ended) {
-                    (0, _, None) => {} // clean end — back on the hosts page, no noise
-                    (0, _, Some(reason)) => self.hosts.emit(HostsMsg::ShowError(reason)),
-                    (_, Some((_, true)), _) if !tofu => {
-                        // The stored pin no longer matches (rotated cert or impostor). The host
-                        // ANSWERED — never the wake fallback.
+                match ConnectOutcome::from_exit(code, error, ended, cancelled) {
+                    // A clean end, or our own kill (request-access cancel) — the toast
+                    // already said so.
+                    ConnectOutcome::Ended(None) | ConnectOutcome::Cancelled => {}
+                    ConnectOutcome::Ended(Some(reason)) => {
+                        self.hosts.emit(HostsMsg::ShowError(reason))
+                    }
+                    o if wake_fb.is_some() && o.warrants_wake() => {
+                        crate::ui_trust::wake_and_connect(&self.window, &sender, req)
+                    }
+                    ConnectOutcome::TrustRejected(_) if !tofu => {
+                        // The stored pin no longer matches (rotated cert or impostor).
                         self.toast("Host fingerprint changed — re-pair with a PIN to continue");
                         crate::ui_trust::pin_dialog(
                             &self.window,
@@ -725,26 +732,21 @@ impl SimpleComponent for AppModel {
                             req,
                         );
                     }
-                    // A fingerprint mismatch means the host ANSWERED — reachable, so the plain
-                    // error arms below handle it; only a genuine connect failure wakes.
-                    (_, Some((_, false)), _) if wake_fb.is_some() => {
-                        crate::ui_trust::wake_and_connect(&self.window, &sender, req)
-                    }
-                    (_, Some((msg, _)), _) => self
+                    ConnectOutcome::TrustRejected(msg) | ConnectOutcome::ConnectFailed(msg) => self
                         .hosts
                         .emit(HostsMsg::ShowError(format!("Couldn't connect — {msg}"))),
-                    // Killed by us (request-access cancel) — the toast already said so.
-                    (-1, None, _) if cancelled => {}
-                    (-1, None, _) => self.hosts.emit(HostsMsg::ShowError(
-                        "Stream session was killed — out of memory, or stopped by the system"
-                            .into(),
-                    )),
-                    (_, None, _) if wake_fb.is_some() => {
-                        crate::ui_trust::wake_and_connect(&self.window, &sender, req)
+                    ConnectOutcome::RendererFailed { code: -1 } => {
+                        self.hosts.emit(HostsMsg::ShowError(
+                            "Stream session was killed — out of memory, or stopped by the system"
+                                .into(),
+                        ))
                     }
-                    (code, None, _) => self.hosts.emit(HostsMsg::ShowError(format!(
-                        "The session didn't start (exit {code}). Check the client log."
-                    ))),
+                    ConnectOutcome::RendererFailed { code } => {
+                        let how = ConnectOutcome::exit_phrase(code);
+                        self.hosts.emit(HostsMsg::ShowError(format!(
+                            "The session didn't start ({how}). Check the client log."
+                        )))
+                    }
                 }
             }
             AppMsg::OpenConsole => {
