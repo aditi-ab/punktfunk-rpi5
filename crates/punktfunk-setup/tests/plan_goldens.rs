@@ -1108,3 +1108,59 @@ fn the_password_file_is_written_owner_only() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Settings land through the host's own store: validated against the registry, merged with the
+/// keys already there, and owner-only like every write the host makes to that file.
+#[cfg(unix)]
+#[test]
+fn host_settings_go_through_the_hosts_store() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!("pf-setup-settings-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let paths = BasePaths::rooted(&root);
+    let file = paths.host_settings();
+    std::fs::create_dir_all(file.parent().expect("dir")).unwrap();
+    std::fs::write(&file, r#"{"version":1,"from_a_newer_host":"kept"}"#).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let facts = fresh("arch", Family::Pacman);
+    let choices = Choices::derive(&facts, &pins());
+    let (ui, buf) = Plain::capture();
+    let run = FakeRunner::new();
+    let exec = Executor {
+        paths: &paths,
+        run: &run,
+        ui: &ui,
+        opts: Opts {
+            dry: false,
+            quiet: false,
+            tty: false,
+        },
+    };
+    let plan = Plan {
+        phases: vec![PlanPhase {
+            kind: Phase::Options,
+            title: "Host settings".into(),
+            steps: vec![
+                Step::set_setting("gamestream", true),
+                Step::set_setting("clipboard", "files"),
+                Step::set_setting("clipboard", "everything"),
+            ],
+        }],
+    };
+    exec.execute(&plan, &facts, &choices).expect("the writes");
+
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(stored["gamestream"], true);
+    assert_eq!(stored["clipboard"], "files", "an invalid value never lands");
+    assert_eq!(stored["from_a_newer_host"], "kept");
+    assert!(
+        buf.borrow().contains("couldn't write"),
+        "the refusal is reported"
+    );
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&file), 0o600);
+    assert_eq!(mode(file.parent().unwrap()), 0o700);
+    let _ = std::fs::remove_dir_all(&root);
+}

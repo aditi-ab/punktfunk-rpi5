@@ -17,7 +17,7 @@ pub mod registry;
 mod store;
 
 pub use store::{
-    knob, mark_started, pin, reload, restart_pending, row_bool, row_tri, save, snapshot,
+    knob, mark_started, pin, reload, restart_pending, row_bool, row_tri, save, save_at, snapshot,
     store_path, Resolved, SaveError, Snapshot, Source,
 };
 

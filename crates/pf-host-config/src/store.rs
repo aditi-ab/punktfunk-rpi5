@@ -203,12 +203,22 @@ fn pending_between(start: &Snapshot, now: &Snapshot) -> Vec<&'static str> {
 /// before writing anything.
 pub fn save(patch: &Map<String, Value>) -> Result<(), SaveError> {
     let _w = WRITE.lock().unwrap_or_else(PoisonError::into_inner);
-    let path = store_path();
-    let mut file = load_file(&path);
-    apply_patch(&mut file, patch)?;
-    write_file(&path, &file).map_err(SaveError::Io)?;
+    merge_into(&store_path(), patch)?;
     reload();
     Ok(())
+}
+
+/// [`save`] into the store at `path`, without reloading this process. The installer writes a
+/// host's store this way before the host runs.
+pub fn save_at(path: &Path, patch: &Map<String, Value>) -> Result<(), SaveError> {
+    let _w = WRITE.lock().unwrap_or_else(PoisonError::into_inner);
+    merge_into(path, patch)
+}
+
+fn merge_into(path: &Path, patch: &Map<String, Value>) -> Result<(), SaveError> {
+    let mut file = load_file(path);
+    apply_patch(&mut file, patch)?;
+    write_file(path, &file).map_err(SaveError::Io)
 }
 
 fn apply_patch(file: &mut Map<String, Value>, patch: &Map<String, Value>) -> Result<(), SaveError> {
