@@ -620,22 +620,13 @@ fn warn_primary_is_not_expressible() {
     );
 }
 
-/// Enabled, not ours, not managed. Pure so the sibling-spare rule is testable
-/// without a compositor. `managed` is the `HEADLESS-` prefix, so a concurrent
-/// session's output is never blacked out.
+/// Disable every head [`crate::monitors::darkens`] names for `exclusive`. Returns
+/// those actually disabled ([`restore_heads`]). One refusal costs that screen, not
+/// the session. `keep_monitors` stays lit.
 ///
-/// The prefix is blunt: sway's own bootstrap `HEADLESS-1` is spared too. Leaving a
-/// headless box's only screen lit is the cheaper failure vs disabling a sibling.
-fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> Vec<String> {
-    heads
-        .iter()
-        .filter(|h| h.enabled && !h.managed && h.connector != ours)
-        .map(|h| h.connector.clone())
-        .collect()
-}
-
-/// Disable every non-managed head for `exclusive`. Returns those actually disabled
-/// ([`restore_heads`]). One refusal costs that screen, not the session.
+/// `managed` is the `HEADLESS-` prefix, so a concurrent session's output is never
+/// blacked out. The prefix is blunt: sway's own bootstrap `HEADLESS-1` is spared
+/// too. Leaving a headless box's only screen lit is the cheaper failure.
 fn disable_other_heads(ours: &str) -> Vec<String> {
     let heads = match list_monitors() {
         Ok(h) => h,
@@ -648,11 +639,12 @@ fn disable_other_heads(ours: &str) -> Vec<String> {
             return Vec::new();
         }
     };
-    let targets = heads_to_disable(&heads, ours);
+    let keep = crate::policy::prefs().get().keep_monitors;
+    let targets = crate::monitors::heads_to_darken(&heads, ours, &keep);
     if targets.is_empty() {
         tracing::info!(
             "wlroots: `topology: exclusive` had nothing to disable — no enabled output besides the \
-             headless ones (a headless box, or a sibling session already took the desk)"
+             headless and kept ones (a headless box, or a sibling session already took the desk)"
         );
         return Vec::new();
     }
@@ -705,14 +697,15 @@ fn dpms_argv(name: &str, on: bool) -> [&str; 4] {
 ///
 /// Not [`disable_other_heads`]: gamescope is its own compositor and owns no sway
 /// output, so disable would move workspaces for a stream that is not on this
-/// compositor. Empty `ours` still spares a concurrent session's `HEADLESS-*`.
+/// compositor. Empty `ours` still spares a concurrent session's `HEADLESS-*`. No
+/// keep list: the gamescope darken ignores `keep_monitors` on every compositor.
 /// Returns the heads actually changed. One refusal costs a lit screen, not the stream.
 pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
     let Ok(heads) = list_monitors() else {
         return Vec::new();
     };
     let mut changed = Vec::new();
-    for name in heads_to_disable(&heads, "") {
+    for name in crate::monitors::heads_to_darken(&heads, "", &[]) {
         match swaymsg(&dpms_argv(&name, on)) {
             Ok(_) => changed.push(name),
             Err(e) => tracing::warn!(
@@ -1407,7 +1400,10 @@ mod tests {
             // Already off: must not enter the restore list or teardown would switch it on.
             head("DP-3", false),
         ];
-        assert_eq!(heads_to_disable(&heads, ours), vec!["DP-1", "HDMI-A-1"]);
+        assert_eq!(
+            crate::monitors::heads_to_darken(&heads, ours, &[]),
+            vec!["DP-1", "HDMI-A-1"]
+        );
     }
 
     /// `dpms` ≠ `disable`: disable moves workspaces; `dpms off` only stops the panel.
@@ -1428,7 +1424,10 @@ mod tests {
             head("HEADLESS-1", true),
             head("DP-3", false),
         ];
-        assert_eq!(heads_to_disable(&heads, ""), vec!["DP-1"]);
+        assert_eq!(
+            crate::monitors::heads_to_darken(&heads, "", &[]),
+            vec!["DP-1"]
+        );
     }
 
     /// Shutdown hands both chooser keys back byte for byte; left taken, every share on
@@ -1455,6 +1454,6 @@ mod tests {
     #[test]
     fn exclusive_on_a_headless_box_disables_nothing() {
         let ours = "HEADLESS-1";
-        assert!(heads_to_disable(&[head(ours, true)], ours).is_empty());
+        assert!(crate::monitors::heads_to_darken(&[head(ours, true)], ours, &[]).is_empty());
     }
 }
