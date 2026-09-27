@@ -158,7 +158,9 @@ mod native;
 mod native_pairing;
 // Live per-session pad tap the console's Controllers page streams.
 mod pad_feed;
-mod plugins;
+// Plugin runner, access and store; the flat names keep `crate::plugins::*`.
+mod plugin_host;
+use plugin_host::{plugins, store};
 mod send_pacing;
 mod session_plan;
 mod slug;
@@ -169,8 +171,6 @@ use telemetry::{
     client_logs, encoder_sessions, link_health, log_capture, net_health, session_status,
     stats_recorder,
 };
-// Signed catalogs and install jobs via the `plugins` runner — design/plugin-store.md.
-mod store;
 #[cfg(test)]
 mod test_support {
     /// A fresh directory that lives until the calling test's thread ends, for a helper that

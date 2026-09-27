@@ -1,8 +1,8 @@
 // `punktfunk-host plugins …` package operations, run on the vendored bun. The host CLI forwards
-// add/remove/list here (crates/punktfunk-host/src/plugins.rs) and the runner-cli exposes them as
-// subcommands. Everything a plugin needs to be installed — the plugins dir, the `@punktfunk`
-// registry scope in bunfig.toml, and the right bun — is handled here so the operator types one line
-// instead of the old create-dir / write-bunfig / `bun add` ritual.
+// add/remove/list here (crates/punktfunk-host/src/plugin_host/plugins.rs) and the runner-cli
+// exposes them as subcommands. Everything a plugin needs to be installed — the plugins dir, the
+// `@punktfunk` registry scope in bunfig.toml, and the right bun — is handled here so the operator
+// types one line instead of the old create-dir / write-bunfig / `bun add` ritual.
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
