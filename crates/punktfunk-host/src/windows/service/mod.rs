@@ -69,7 +69,7 @@ use self::{firewall::*, host_env::*, rollback::*, runtime::*, setup::*, web::*};
 pub(crate) use firewall::{
     allow_public_network, firewall_profile_arg, fw_add_rule_args, run_netsh,
 };
-pub use runtime::{init_file_logging, service_log_path};
+pub use runtime::init_file_logging;
 
 pub fn main(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
