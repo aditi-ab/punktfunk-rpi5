@@ -24,7 +24,6 @@ pub use keymap::KEY_FLAG_SEMANTIC_VK;
 pub use keymap::vk_to_evdev;
 
 /// Dedup for HID-output reports (0xCD), shared by [`uhid_manager`].
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/hidout_dedup.rs"]
 pub mod hidout_dedup;
 
@@ -705,7 +704,6 @@ pub mod dualsense;
 pub mod dualsense_edge_windows;
 /// DualSense HID contract, shared by Linux UHID ([`dualsense`]) and Windows UMDF
 /// ([`dualsense_windows`]).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/dualsense_proto.rs"]
 pub mod dualsense_proto;
 /// Virtual DualSense over USB/IP (`vhci_hcd`) with its own USB Audio Class card — real USB
@@ -723,7 +721,6 @@ pub mod dualsense_windows;
 pub mod dualshock4;
 /// DualShock 4 HID codec, shared by Linux UHID ([`dualshock4`]) and Windows UMDF
 /// ([`dualshock4_windows`]).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/dualshock4_proto.rs"]
 pub mod dualshock4_proto;
 /// Virtual DualShock 4 via UMDF + shm (device-type 1).
@@ -786,7 +783,6 @@ pub mod seat_dev;
 /// `sensor_timestamp` every virtual Sony pad stamps into its input reports
 /// ([`sensor_clock::SensorClock`]) — elapsed time in DualSense 1/3 µs and DualShock 4
 /// 5.33 µs units, shared by all four backends.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/sensor_clock.rs"]
 pub mod sensor_clock;
 /// Virtual Steam Deck via UHID — kernel `hid-steam` binds it as a real Deck.
@@ -811,13 +807,11 @@ pub mod steam_gadget;
 /// Steam Controller / Steam Deck HID contract (descriptor, byte-exact Deck serializer,
 /// XInput/rich mappers, rumble parser). Linux UHID ([`steam_controller`]) and Windows UMDF
 /// ([`steam_deck_windows`]).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/steam_proto.rs"]
 pub mod steam_proto;
 /// Fallback remap of Steam-only inputs onto a non-Steam backend, plus Deck motion rescale.
 /// Shared by DualSense/DS4 (slot-less pads that must fold Steam back grips). Deck rescale
-/// is Linux-only but harmless to compile on Windows.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// is Linux-only but builds everywhere, so its tests run on any host.
 #[path = "inject/proto/steam_remap.rs"]
 pub mod steam_remap;
 /// Virtual Steam Deck over USB/IP (`vhci_hcd`). Steam-Input-promotable on non-SteamOS hosts
@@ -868,7 +862,6 @@ pub mod uhid_abi;
 /// Stateful virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame
 /// merge, heartbeat, and feedback pump shared by the five UHID/UMDF backends; each supplies
 /// only its protocol via [`uhid_manager::PadProto`].
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/uhid_manager.rs"]
 pub mod uhid_manager;
 /// Byte-level tracing of the USB/IP socket (`PUNKTFUNK_USBIP_TRACE`). A framing bug in that

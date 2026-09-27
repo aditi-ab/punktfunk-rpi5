@@ -9,8 +9,6 @@
 //! This file applies the consumer's arithmetic to each declaration and asserts the
 //! result is the wire constant. A new motion-capable backend belongs here.
 
-#![cfg(any(target_os = "linux", target_os = "windows"))]
-
 use pf_inject::dualsense_proto::{
     serialize_state as ds_serialize, DsState, DS_FEATURE_CALIBRATION, DS_INPUT_REPORT_LEN,
     DS_TOUCH_H, DS_TOUCH_W,
