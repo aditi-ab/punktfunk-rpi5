@@ -12,7 +12,7 @@
 //! [`Monitor::teardown`] stops the workers (cursor first, then the encode session, the drain
 //! worker, the pool), and only then does the caller run `IddCxMonitorDeparture`.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,12 @@ pub use pf_driver_proto::vdisplay::{Mode, flatten};
 
 /// The IddCx monitor handle, set once `IddCxMonitorCreate` returns.
 type SendMonitor = Sendable<iddcx::IDDCX_MONITOR>;
+
+/// [`Monitor::state`]: the IddCx lifecycle. `IddCxMonitorDeparture` is legal only on an arrived
+/// monitor, so exactly one caller wins the `ARRIVED → DEPARTED` swap and departs it.
+const CREATING: u8 = 0;
+const ARRIVED: u8 = 1;
+const DEPARTED: u8 = 2;
 
 /// What `IddCxMonitorArrival` reported: the OS target id — the key the host addresses every
 /// later delivery by — and the render-adapter LUID for the ADD reply.
@@ -96,6 +102,8 @@ pub struct Monitor {
     pub created_at: Instant,
     object: OnceLock<SendMonitor>,
     arrival: OnceLock<Arrival>,
+    /// `CREATING`, `ARRIVED` or `DEPARTED`; see [`Monitor::claim_departure`].
+    state: AtomicU8,
     /// Advertised modes (requested mode first, then the proto's fallbacks).
     modes: Mutex<Vec<Mode>>,
     /// The live swap-chain drain worker; dropping it joins the thread.
@@ -156,6 +164,7 @@ impl Monitor {
             created_at: Instant::now(),
             object: OnceLock::new(),
             arrival: OnceLock::new(),
+            state: AtomicU8::new(CREATING),
             modes: Mutex::new(modes),
             swap: Mutex::new(None),
             source_seq: Arc::new(AtomicU64::new(0)),
@@ -294,14 +303,27 @@ impl Monitor {
         }
     }
 
-    /// The IddCx handle — `None` until `IddCxMonitorCreate` returned.
     /// True once the OS has assigned this monitor a swap chain — the seat bring-up waits on it.
     pub fn has_swap_chain(&self) -> bool {
         lock(&self.swap).is_some()
     }
 
+    /// The IddCx handle — `None` until `IddCxMonitorCreate` returned. It is set before the
+    /// arrival, so the mode DDIs the arrival re-enters can match on it.
     pub fn object(&self) -> Option<iddcx::IDDCX_MONITOR> {
         self.object.get().map(|o| o.0)
+    }
+
+    /// True between a successful arrival and the departure claim.
+    fn arrived(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ARRIVED
+    }
+
+    /// Mark the monitor departed. `true` only when it had arrived: the caller, alone, then runs
+    /// `IddCxMonitorDeparture`. A monitor still creating is left to its creator, which sees the
+    /// mark after the arrival and departs it itself.
+    fn claim_departure(&self) -> bool {
+        self.state.swap(DEPARTED, Ordering::AcqRel) == ARRIVED
     }
 
     /// The OS target id — 0 until arrival, a value the host never sends (OS target ids are
@@ -421,15 +443,19 @@ impl Monitor {
     }
 }
 
-/// Tear every removed monitor down, then depart the ones that have an IddCx object: a worker
-/// can be inside a DDI against the handle departure destroys, so the joins come first.
+/// Tear every removed monitor down, then depart the ones this call claims
+/// ([`Monitor::claim_departure`]): a worker can be inside a DDI against the handle departure
+/// destroys, so the joins come first. A monitor still creating is marked, and its creator
+/// departs it.
 fn depart(removed: Vec<Arc<Monitor>>) {
     for m in &removed {
         m.teardown();
     }
     for m in removed {
-        if let Some(object) = m.object() {
-            // SAFETY: `object` is a live IddCx monitor handle; departure tears it down.
+        if m.claim_departure()
+            && let Some(object) = m.object()
+        {
+            // SAFETY: `object` arrived, and this call won its one departure claim.
             unsafe { wdk_iddcx::IddCxMonitorDeparture(object) };
         }
     }
@@ -707,8 +733,9 @@ pub const SEAT_PLACEHOLDER_SESSION: u64 = 0;
 /// re-enters find it by id; the handle and then the arrival are filled in write-once. A create
 /// failure reclaims the id. An arrival failure must also `WdfObjectDelete` the created object:
 /// departure is only valid for an arrived monitor, and a leaked object pins its slot against the
-/// adapter's monitor budget. The entry is removed before that delete so a concurrent clear or
-/// reap cannot depart the handle being deleted.
+/// adapter's monitor budget. A concurrent clear or reap never departs a monitor that has not
+/// arrived ([`Monitor::claim_departure`]), so that delete, and the creator's own departure after
+/// a mid-create removal, each run exactly once.
 pub fn create_monitor(
     owner: u32,
     req: &pf_driver_proto::control::AddRequest,
@@ -790,32 +817,42 @@ pub fn create_monitor(
 
     // Tell the OS the monitor is plugged in.
     let mut arrival_out = iddcx::IDARG_OUT_MONITORARRIVAL::default();
-    // SAFETY: `object` is the just-created IddCx monitor handle.
+    // SAFETY: `object` is the just-created IddCx monitor handle. No one departs it before it
+    // arrives: `claim_departure` only marks a monitor still creating.
     let st = unsafe { wdk_iddcx::IddCxMonitorArrival(object, &mut arrival_out) };
     dbglog!("[pf-vd] IddCxMonitorArrival(id={id}) -> {st:#x}");
     if !wdk_iddcx::nt_success(st) {
         dbglog!(
             "[pf-vd] IddCxMonitorArrival(id={id}) FAILED — reclaiming the id + deleting the created monitor"
         );
+        monitor.state.store(DEPARTED, Ordering::Release);
         remove_by_id(id);
-        // SAFETY: `object` is the just-created (not-yet-arrived) IddCx monitor handle, now owned
-        // solely here (its registry entry was just removed); `WdfObjectDelete` takes a `WDFOBJECT`
-        // (a raw handle cast, as in the swap-chain / device-cleanup teardowns).
+        // SAFETY: `object` never arrived, so no departure ran on it, and only this thread
+        // deletes it; `WdfObjectDelete` takes a `WDFOBJECT` (a raw handle cast, as in the
+        // swap-chain teardown).
         unsafe {
             call_unsafe_wdf_function_binding!(WdfObjectDelete, object as WDFOBJECT);
         }
         return None;
     }
 
-    // A clear that landed while the create was in flight found the entry with no handle set,
-    // so `depart` skipped it and dropped it from the registry. The monitor has now arrived and
-    // nothing can reach it: it would stay plugged in for the device's life. Undo it here.
-    // `reap_owner`'s grace already covers the reaper; this covers CLEAR_ALL, which has none.
-    if !registry::find(|m| m.id == id).is_some_and(|m| Arc::ptr_eq(&m, &monitor)) {
+    // A removal that ran while the create was in flight either marked the monitor departed
+    // (clear, reap, remove) or only unlinked it (device cleanup). Either way nothing else will
+    // depart it, and it would stay plugged in for the device's life: undo it here.
+    let arrived = monitor
+        .state
+        .compare_exchange(CREATING, ARRIVED, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    let linked = registry::find(|m| m.id == id).is_some_and(|m| Arc::ptr_eq(&m, &monitor));
+    if !arrived || !linked {
         dbglog!("[pf-vd] create_monitor(id={id}): cleared mid-create — departing the new monitor");
-        // SAFETY: `object` arrived successfully just above, which is what makes departure legal.
-        unsafe { wdk_iddcx::IddCxMonitorDeparture(object) };
         monitor.teardown();
+        // A lost swap means a removal marked it and left the departure here; an unlinked one
+        // is claimed like any other removal, so a remover still in `depart` skips it.
+        if !arrived || monitor.claim_departure() {
+            // SAFETY: `object` arrived successfully just above, and this is its one departure.
+            unsafe { wdk_iddcx::IddCxMonitorDeparture(object) };
+        }
         return None;
     }
 
@@ -853,8 +890,8 @@ pub fn update_monitor_modes(
     let Some(m) = registry::find(|m| m.owner == owner && m.session_id == session_id) else {
         return crate::STATUS_NOT_FOUND;
     };
-    let Some(object) = m.object() else {
-        return crate::STATUS_NOT_FOUND; // created but not yet arrived — nothing to update
+    let Some(object) = m.object().filter(|_| m.arrived()) else {
+        return crate::STATUS_NOT_FOUND; // not arrived, or departing — nothing to update
     };
     let Some(_ddi) = m.ddi() else {
         return crate::STATUS_NOT_FOUND; // torn down under us
