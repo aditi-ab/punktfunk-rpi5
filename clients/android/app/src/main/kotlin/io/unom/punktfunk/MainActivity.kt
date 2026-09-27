@@ -222,6 +222,12 @@ class MainActivity : ComponentActivity() {
     var remotePointer: RemotePointer? = null
 
     /**
+     * Set by the stream's peripherals: capture a USB pad plugged in mid-stream. Called on an
+     * attach and on resume, since the default handler's grant lands after the attach broadcast.
+     */
+    var recaptureUsbPads: (() -> Unit)? = null
+
+    /**
      * Set by [StreamScreen] to its disconnect action. The emergency-exit chord (below) invokes it so a
      * couch user with no keyboard/Back can always leave a stream.
      */
@@ -331,6 +337,9 @@ class MainActivity : ComponentActivity() {
                     UsbManager.ACTION_USB_DEVICE_ATTACHED,
                     UsbManager.ACTION_USB_DEVICE_DETACHED,
                     -> {
+                        if (intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+                            recaptureUsbPads?.invoke()
+                        }
                         sc2PermissionAsked = false // a fresh attach may ask once again
                         startSc2MenuNav()
                         dsPermissionAsked = false
@@ -402,6 +411,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        recaptureUsbPads?.invoke()
         startSc2MenuNav()
         maybeAskDsPermission()
     }
