@@ -95,9 +95,328 @@ fn native_encoder(
     )
 }
 
+/// Ceiling on a single pacing sleep. The capture channel is finite and `next_chunk` has to be
+/// serviced; sleeping past a couple of frames would trade a burst on the wire for a drop at the
+/// capturer, which is strictly worse (a drop is a click AND a permanent shift).
+const PACE_MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
+/// How far behind schedule the pacer may fall before it stops trying to catch up and simply
+/// re-anchors. Chasing an old schedule after a stall would send a burst — the exact thing
+/// pacing exists to prevent — so past this point the debt is forgiven, not repaid.
+const PACE_REANCHOR: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// What the wire does in the slot [`Pacer::release`] was asked about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    /// Nothing is owed yet, or the hole is too young (or too old) to cover.
+    Wait,
+    /// A frame of real audio.
+    Frame,
+    /// Silence over a capture hole; `first` is the hole's first frame, which fades.
+    Silence { first: bool },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Release {
+    slot: Slot,
+    /// How far past its slot this frame leaves, measured before a re-anchor forgives it.
+    late: std::time::Duration,
+    /// The schedule fell more than [`PACE_REANCHOR`] behind and restarted.
+    reanchored: bool,
+}
+
+/// The wall-clock send schedule. A capture quantum is not a frame: draining it into
+/// back-to-back datagrams bursts 4–5 frames then silence. One frame leaves per slot; a source
+/// behind the schedule is covered with silence once the hole reaches [`InfillPolicy::after`],
+/// or the schedule falls behind forever; a source ahead (backlog past one chunk plus one
+/// frame) sends a second frame in the same slot, so surplus drains at 2× instead of growing
+/// latency. Time is passed in.
+///
+/// [`InfillPolicy::after`]: crate::audio::capture_policy::InfillPolicy::after
+struct Pacer {
+    due: Option<std::time::Instant>,
+    interval: std::time::Duration,
+    /// Interleaved samples in one protocol frame.
+    frame_len: usize,
+    infill: crate::audio::capture_policy::InfillPolicy,
+    /// Recent capture quantum, the bonus-send threshold with one frame on top.
+    max_chunk: crate::audio::capture_policy::RecentMax<usize>,
+    last_chunk_at: std::time::Instant,
+    /// Nothing is synthesized before the first real frame: there is no continuity to protect
+    /// yet, and the wire clock has no anchor to continue from.
+    sent_any: bool,
+    bonus_taken: bool,
+}
+
+impl Pacer {
+    /// Holes are sized from this session's `frame_us`: PCM frames can be 1 ms, so Opus's 5 ms
+    /// constants would be off by up to 5×.
+    fn new(
+        frame_us: u32,
+        frame_len: usize,
+        interval: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Pacer {
+        Pacer {
+            due: None,
+            interval,
+            frame_len,
+            infill: crate::audio::capture_policy::InfillPolicy::new(frame_us),
+            max_chunk: Default::default(),
+            last_chunk_at: now,
+            sent_any: false,
+            bonus_taken: false,
+        }
+    }
+
+    /// How long capture may block: until the next owed slot, or for a due slot with no audio,
+    /// until the hole is old enough to cover. `None` blocks for a chunk: nothing is owed before
+    /// the first send, and a spent infill budget should not wake hundreds of times a second to
+    /// stay silent.
+    fn wake_budget(&self, now: std::time::Instant, queued: usize) -> Option<std::time::Duration> {
+        if self.infill.exhausted() || !self.sent_any {
+            return None;
+        }
+        let ready_at = match self.due {
+            Some(due) if queued >= self.frame_len => due,
+            Some(due) => due.max(self.last_chunk_at + self.infill.after()),
+            None => now + self.interval,
+        };
+        Some(ready_at.saturating_duration_since(now).min(PACE_MAX_SLEEP))
+    }
+
+    /// A capture chunk of `len` samples lasting `quantum`. `true` = the wire fell silent across
+    /// the hole it ends: the partial frame and the redundancy predecessor both describe audio
+    /// from before a discontinuity.
+    fn on_chunk(
+        &mut self,
+        now: std::time::Instant,
+        len: usize,
+        quantum: std::time::Duration,
+    ) -> bool {
+        let broke = self.infill.chunk_arrived();
+        self.last_chunk_at = now;
+        self.max_chunk.note(len, now);
+        // The graph's real buffer size, so the infill threshold is one chunk plus one frame and
+        // never the middle of a legitimately long cycle.
+        self.infill.note_quantum(quantum, now);
+        broke
+    }
+
+    /// Start one wake's releases: at most one bonus frame per wake.
+    fn wake(&mut self) {
+        self.bonus_taken = false;
+    }
+
+    /// The slot due at `now`, with `queued` samples waiting. Consumes infill budget on silence.
+    fn release(&mut self, now: std::time::Instant, queued: usize) -> Release {
+        let mut late = std::time::Duration::ZERO;
+        let mut reanchored = false;
+        match self.due {
+            Some(due) if due > now => {
+                return Release {
+                    slot: Slot::Wait,
+                    late,
+                    reanchored,
+                }
+            }
+            Some(due) if now.duration_since(due) > PACE_REANCHOR => {
+                reanchored = true;
+                self.due = None;
+            }
+            Some(due) => late = now.duration_since(due),
+            None => {}
+        }
+        let slot = if queued >= self.frame_len {
+            Slot::Frame
+        } else if !self.sent_any {
+            Slot::Wait
+        } else {
+            // The hole is the longer of the time since the last chunk (the graph stopped) and
+            // the schedule lag (the graph fed less than the wall clock).
+            let hole = now.duration_since(self.last_chunk_at).max(late);
+            match self.infill.decide(hole) {
+                crate::audio::capture_policy::Infill::Silence => Slot::Silence {
+                    first: self.infill.covered() == self.infill.frame(),
+                },
+                _ => Slot::Wait,
+            }
+        };
+        if slot != Slot::Wait {
+            // A second frame in this slot when what is left after this one exceeds one chunk
+            // plus one frame. Never twice in a row, never for silence.
+            let left = queued.saturating_sub(self.frame_len);
+            let bonus = slot == Slot::Frame
+                && !self.bonus_taken
+                && left >= self.max_chunk.get() + self.frame_len;
+            self.due = match self.due {
+                Some(due) if bonus => Some(due),
+                other => Some(other.unwrap_or(now) + self.interval),
+            };
+            self.bonus_taken = bonus;
+        }
+        Release {
+            slot,
+            late,
+            reanchored,
+        }
+    }
+
+    /// A frame reached the wire.
+    fn sent(&mut self) {
+        self.sent_any = true;
+    }
+}
+
+/// This session's capturer: opened, reopened after a death under [`INJECTOR_REOPEN_BACKOFF`],
+/// its sink name published for a later joiner, and parked at the end. Empty chunks from a
+/// quiet sink are not a death.
+struct CaptureLease {
+    cap: Option<Box<dyn crate::audio::AudioCapturer>>,
+    /// The sink this session opens by name. `None` is the shared path, the only one that parks.
+    target: Option<String>,
+    last_failed: Option<std::time::Instant>,
+    channels: u32,
+    rate_hz: u32,
+    /// A `join` session taps the owner's sink instead of minting a second one of that name.
+    tap: bool,
+    /// Isolated session sink (`design/gamescope-multiuser.md`). Linux-only.
+    sink: Option<String>,
+    /// The owner's live-display slot, for a joiner on the shared path.
+    tap_from: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    /// This session's live-display record: the sink name goes here on every open.
+    published: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// What [`CaptureLease::ready`] found.
+enum Ready {
+    Live,
+    /// A new capturer after a gap: drop whatever straddles it.
+    Reopened,
+    /// Still down; try again next pass.
+    Down,
+}
+
+impl CaptureLease {
+    /// How long a joiner waits for the owner's sink name before minting its own. The owner's
+    /// capturer opens within its first second; past this, the owner has no audio to share.
+    const JOIN_SINK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// The sink to open: the isolated one, else the owner's once published. A joiner spawned
+    /// inside the owner's first second waits for it — minting its own sink here would claim
+    /// the default from under the owner.
+    fn resolve(&self, stop: &AtomicBool) -> Option<String> {
+        if self.sink.is_some() {
+            return self.sink.clone();
+        }
+        let slot = self.tap_from.as_ref()?;
+        let deadline = std::time::Instant::now() + Self::JOIN_SINK_WAIT;
+        loop {
+            if let Some(name) = slot.lock().unwrap().clone() {
+                return Some(name);
+            }
+            if std::time::Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// First open. Isolated sessions never adopt the parked shared capturer, and the audio
+    /// settings must match too: a keep-host session must not inherit a sink claim. A failed
+    /// open is retried by [`Self::ready`] like a mid-session death.
+    fn open(&mut self, parked: &AudioCapSlot, stop: &AtomicBool) {
+        self.target = self.resolve(stop);
+        let reuse = if self.target.is_none() {
+            crate::audio::take_parked_capture(parked, self.channels, self.rate_hz)
+        } else {
+            None
+        };
+        self.cap = reuse.or_else(|| match self.open_named() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "punktfunk/1 audio failed to open — retrying in the background until it comes up");
+                None
+            }
+        });
+        self.last_failed = self.cap.is_none().then(std::time::Instant::now);
+        self.publish();
+    }
+
+    fn open_named(&self) -> Result<Box<dyn crate::audio::AudioCapturer>> {
+        crate::audio::open_audio_capture_named(
+            self.channels,
+            self.rate_hz,
+            self.target.as_deref(),
+            self.tap,
+        )
+    }
+
+    fn publish(&self) {
+        if let Some(c) = &self.cap {
+            *self.published.lock().unwrap() = c.sink_name().map(str::to_owned);
+        }
+    }
+
+    /// A live capturer, reopening a dead one once the backoff allows. Sleeps 200 ms when it
+    /// stays down.
+    fn ready(&mut self, stop: &AtomicBool) -> Ready {
+        if self.cap.is_some() {
+            return Ready::Live;
+        }
+        if self
+            .last_failed
+            .is_some_and(|t| t.elapsed() < INJECTOR_REOPEN_BACKOFF)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            return Ready::Down;
+        }
+        // The owner may have reopened on a new name meanwhile.
+        self.target = self.resolve(stop);
+        match self.open_named() {
+            Ok(c) => {
+                tracing::info!("punktfunk/1 audio capture reopened");
+                self.cap = Some(c);
+                self.last_failed = None;
+                self.publish();
+                Ready::Reopened
+            }
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), "audio reopen failed — will retry");
+                self.last_failed = Some(std::time::Instant::now());
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ready::Down
+            }
+        }
+    }
+
+    /// The live capturer. Only after [`Self::ready`] said so.
+    fn live(&mut self) -> &mut Box<dyn crate::audio::AudioCapturer> {
+        self.cap.as_mut().expect("capturer is live")
+    }
+
+    /// The capture thread died: reopen after the backoff.
+    fn lost(&mut self) {
+        self.cap = None;
+        self.last_failed = Some(std::time::Instant::now());
+    }
+
+    /// Park a live shared capturer (releases the routing claim). An isolated capturer is
+    /// dropped: its sink name is this session's, and a later shared session would capture a
+    /// sink nothing routes to.
+    fn park(self, parked: &AudioCapSlot) {
+        if let Some(mut c) = self.cap {
+            c.idle();
+            if self.target.is_none() {
+                crate::audio::park_audio_capture(parked, c);
+            }
+        }
+    }
+}
+
 /// Desktop capture → the session's resolved plane (Opus on `AUDIO_MAGIC`/`AUDIO_RED_MAGIC`,
 /// or PCM on `AUDIO_PCM_MAGIC`) at negotiated `channels` (2 / 6 = 5.1 / 8 = 7.1, wire order
-/// FL FR FC LFE RL RR SL SR). Capturer comes from and returns to [`AudioCapSlot`].
+/// FL FR FC LFE RL RR SL SR). Capturer comes from and returns to [`AudioCapSlot`] through a
+/// [`CaptureLease`]; [`Pacer`] decides when each frame leaves.
 ///
 /// `plane` is the format `Welcome` stated — read back by the caller, never recomputed, so
 /// the promised wire and the sent wire cannot disagree.
@@ -131,17 +450,6 @@ pub(super) fn audio_thread(
     counters.note_audio_started();
     use crate::audio::SAMPLE_RATE;
     const FRAME_MS: usize = 5;
-    /// How long a joiner waits for the owner's sink name before minting its own. The owner's
-    /// capturer opens within its first second; past this, the owner has no audio to share.
-    const JOIN_SINK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-    /// Ceiling on a single pacing sleep. The capture channel is finite and `next_chunk` has to be
-    /// serviced; sleeping past a couple of frames would trade a burst on the wire for a drop at
-    /// the capturer, which is strictly worse (a drop is a click AND a permanent shift).
-    const PACE_MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
-    /// How far behind schedule the pacer may fall before it stops trying to catch up and simply
-    /// re-anchors. Chasing an old schedule after a stall would send a burst — the exact thing
-    /// pacing exists to prevent — so past this point the debt is forgiven, not repaid.
-    const PACE_REANCHOR: std::time::Duration = std::time::Duration::from_millis(100);
     /// Fade at each edge of a capture hole, in µs. 1 ms is a slope, not an edge, and too
     /// short to read as a swell. See `last_real` / `resume_fade`.
     const EDGE_FADE_US: u64 = 1_000;
@@ -180,50 +488,18 @@ pub(super) fn audio_thread(
     // lock so a budget-ladder change cannot turn redundancy on here.
     let (tier, redundancy) = (budget.tier, budget.redundancy && !pcm_plane);
 
-    // The sink to open: the isolated one, else the owner's once published. A joiner spawned
-    // inside the owner's first second waits for it — minting its own sink here would claim
-    // the default from under the owner.
-    let resolve = || -> Option<String> {
-        if sink.is_some() {
-            return sink.clone();
-        }
-        let slot = tap_from.as_ref()?;
-        let deadline = std::time::Instant::now() + JOIN_SINK_WAIT;
-        loop {
-            if let Some(name) = slot.lock().unwrap().clone() {
-                return Some(name);
-            }
-            if std::time::Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
-                return None;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+    let mut lease = CaptureLease {
+        cap: None,
+        target: None,
+        last_failed: None,
+        channels: want as u32,
+        rate_hz,
+        tap,
+        sink,
+        tap_from,
+        published,
     };
-    let mut target = resolve();
-    // The audio settings must match too: a keep-host session must not inherit a sink claim.
-    // Isolated sessions never adopt the parked shared capturer (the match cannot see the wrong
-    // sink). A failed first open enters the same reopen-with-backoff loop as a mid-session death.
-    let parked = if target.is_none() {
-        crate::audio::take_parked_capture(&audio_cap, want as u32, rate_hz)
-    } else {
-        None
-    };
-    let capturer = parked.or_else(|| {
-        match crate::audio::open_audio_capture_named(want as u32, rate_hz, target.as_deref(), tap)
-        {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "punktfunk/1 audio failed to open — retrying in the background until it comes up");
-                None
-            }
-        }
-    });
-    let publish = |c: &dyn crate::audio::AudioCapturer| {
-        *published.lock().unwrap() = c.sink_name().map(str::to_owned);
-    };
-    if let Some(c) = &capturer {
-        publish(c.as_ref());
-    }
+    lease.open(&audio_cap, &stop);
     // No Opus encoder at all on the PCM plane — there is nothing for it to do, and building one
     // would make a libopus failure able to kill a session that does not use libopus.
     let mut enc = if pcm_plane {
@@ -233,10 +509,7 @@ pub(super) fn audio_thread(
             Ok(e) => Some(e),
             Err(e) => {
                 tracing::warn!(error = %e, "opus encoder init failed — session continues without audio");
-                if let Some(mut c) = capturer {
-                    c.idle(); // parked, not streaming — release the routing claim
-                    crate::audio::park_audio_capture(&audio_cap, c);
-                }
+                lease.park(&audio_cap);
                 return;
             }
         }
@@ -265,14 +538,14 @@ pub(super) fn audio_thread(
     } else {
         Vec::new()
     };
+    // Survives reopens so the client sees a gap, not a restart.
     let mut seq: u32 = 0;
-    // Cover capture holes with silence. Built from this session's `frame_us`: PCM frames
-    // can be 1 ms, so Opus's 5 ms constants would be off by up to 5×. See [`InfillPolicy`].
-    let mut infill = crate::audio::capture_policy::InfillPolicy::new(frame_us);
-    let mut last_chunk_at = std::time::Instant::now();
-    // Nothing may be synthesized before the first real frame: there is no continuity to protect
-    // yet, and the wire clock has no anchor to continue from.
-    let mut sent_any = false;
+    let mut pacer = Pacer::new(
+        frame_us,
+        frame_len,
+        frame_interval,
+        std::time::Instant::now(),
+    );
     // Fade out into a hole and fade in after it (`EDGE_FADE_US`, raised cosine). Digital
     // zero is a step from the last real sample — a click. `last_real` is the fade-out
     // source when the hole opens on an empty partial.
@@ -280,25 +553,15 @@ pub(super) fn audio_thread(
     let mut resume_fade = false;
     // Interleaved: `frames × channels` so the curve spans whole frames.
     let edge_fade_samples = (rate_hz as u64 * EDGE_FADE_US / 1_000_000) as usize * want as usize;
-    // Bonus-send threshold: recent capture quantum plus one protocol frame. Up to that
-    // is a chunk being paced out; past it, audio arrived faster than the schedule.
-    let mut max_chunk_len = crate::audio::capture_policy::RecentMax::<usize>::default();
-    // Reopen on capture-thread death (or a failed first open). Empty chunks from a quiet
-    // sink are not death. Encoder and `seq` survive reopens so the client sees a gap, not
-    // a restart. Throttled by `INJECTOR_REOPEN_BACKOFF`.
-    let mut last_failed = capturer.is_none().then(std::time::Instant::now);
-    let mut capturer = capturer;
     // A stuck Opus encoder would fail on every 5 ms frame (~200/s); power-of-two throttle the
     // warn so it can't flood stderr + the log ring while still surfacing that it's failing.
     let mut opus_encode_errs: u64 = 0;
     // Previous Opus bytes for the redundant `0xD2` plane. Cleared when continuity breaks
     // so we never advertise a predecessor the client's seq does not agree with.
     let mut prev_frame: Vec<u8> = Vec::new();
-    // Sample clock (see [`PtsClock`]) and the wall-clock send schedule. A capture quantum
-    // is not a frame: draining it into back-to-back datagrams bursts 4–5 frames then
-    // silence. `sent_any` keeps the seed off the wire until the first real send.
+    // Sample clock (see [`PtsClock`]); the pacer keeps the seed off the wire until the first
+    // real send.
     let mut clock = PtsClock::new(rate_hz, want);
-    let mut pace_due: Option<std::time::Instant> = None;
     // Wire-side counters. `late` is "missed the slot by a whole protocol frame"; PCM
     // frames can be 1 ms, so an Opus 5 ms constant would miss every slot and report zero.
     let mut send_stats = crate::audio::capture_policy::SendStats::new(frame_us);
@@ -310,7 +573,7 @@ pub(super) fn audio_thread(
     // re-tested a few hundred times a second, and it is a statement about the capturer, not an
     // event.
     let rate_mismatch_warned = std::sync::Once::new();
-    if capturer.is_some() {
+    if lease.cap.is_some() {
         tracing::info!(
             channels = want,
             plane = if pcm_plane { "0xD3 PCM" } else { "0xC9 Opus" },
@@ -332,42 +595,21 @@ pub(super) fn audio_thread(
         );
     }
     'session: while !stop.load(Ordering::SeqCst) {
-        if capturer.is_none() {
-            if last_failed.is_some_and(|t| t.elapsed() < INJECTOR_REOPEN_BACKOFF) {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                continue;
-            }
-            // The owner may have reopened on a new name meanwhile.
-            target = resolve();
-            match crate::audio::open_audio_capture_named(
-                want as u32,
-                rate_hz,
-                target.as_deref(),
-                tap,
-            ) {
-                Ok(c) => {
-                    tracing::info!("punktfunk/1 audio capture reopened");
-                    publish(c.as_ref());
-                    capturer = Some(c);
-                    last_failed = None;
-                    acc.clear(); // drop the partial frame straddling the gap
-                                 // Predecessor is invalid across the gap: the client would splice pre-gap
-                                 // audio onto the new stream.
-                    prev_frame.clear();
-                }
-                Err(e) => {
-                    tracing::debug!(error = %format!("{e:#}"), "audio reopen failed — will retry");
-                    last_failed = Some(std::time::Instant::now());
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    continue;
-                }
+        match lease.ready(&stop) {
+            Ready::Live => {}
+            Ready::Down => continue,
+            Ready::Reopened => {
+                // The partial frame straddles the gap, and the predecessor is invalid across
+                // it: the client would splice pre-gap audio onto the new stream.
+                acc.clear();
+                prev_frame.clear();
             }
         }
         // Never send a rate we did not get (`design/hi-res-audio.md`). Probe-then-open is a
         // race (hotplug, format change, renegotiate). PCM ends: the client is open at
         // `rate_hz` and the plane cannot switch. Opus only warns — 48 kHz, capturer resamples.
         // Checked every iteration: PipeWire may not know its rate at open.
-        let live_rate = capturer.as_ref().unwrap().sample_rate();
+        let live_rate = lease.live().sample_rate();
         if live_rate != rate_hz {
             if pcm_plane {
                 tracing::warn!(
@@ -393,53 +635,30 @@ pub(super) fn audio_thread(
         }
         // Wake on a chunk or the next owed slot, whichever first. Waiting only on capture
         // made a hole cost more than the audio it swallowed — see [`InfillPolicy`].
-        let waited = if infill.exhausted() || !sent_any {
-            // Infill budget spent (sink is quiet) or nothing has been sent yet. Block on
-            // capture rather than waking hundreds of times a second to stay silent.
-            capturer.as_mut().unwrap().next_chunk()
-        } else {
-            let now = std::time::Instant::now();
-            // A due slot with no audio cannot fire until the hole is old enough to cover;
-            // wait for the later of the two.
-            let ready_at = match pace_due {
-                Some(due) if acc.len() >= frame_len => due,
-                Some(due) => due.max(last_chunk_at + infill.after()),
-                None => now + frame_interval,
-            };
-            let budget = ready_at.saturating_duration_since(now).min(PACE_MAX_SLEEP);
-            capturer.as_mut().unwrap().next_chunk_within(budget)
+        let waited = match pacer.wake_budget(std::time::Instant::now(), acc.len()) {
+            None => lease.live().next_chunk(),
+            Some(budget) => lease.live().next_chunk_within(budget),
         };
         let chunk = match waited {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "audio capture lost — reopening");
-                capturer = None;
-                last_failed = Some(std::time::Instant::now());
+                lease.lost();
                 continue;
             }
         };
         if !chunk.is_empty() {
-            if infill.chunk_arrived() {
-                // The wire fell silent across that hole. The partial frame in `acc` and the
-                // redundancy predecessor both describe audio from before a discontinuity;
-                // splicing either onto what follows is a click plus a pts for the wrong time.
+            let quantum =
+                std::time::Duration::from_nanos(pcm::frame_duration_ns(chunk.len(), rate_hz, want));
+            if pacer.on_chunk(std::time::Instant::now(), chunk.len(), quantum) {
                 acc.clear();
                 prev_frame.clear();
             }
-            last_chunk_at = std::time::Instant::now();
             // Anchor on this chunk's arrival. PipeWire hands already-captured audio, so
             // the newest sample is ~now. Re-deriving each chunk ties pts to the device
             // cadence instead of accumulating graph drift.
             let arrival_ns = now_ns();
             acc.extend_from_slice(&chunk);
-            max_chunk_len.note(chunk.len(), last_chunk_at);
-            // How big the graph's buffers really are, so the infill threshold is one chunk plus
-            // one frame and never the middle of a legitimately long cycle — see
-            // `InfillPolicy::after`.
-            infill.note_quantum(
-                std::time::Duration::from_nanos(pcm::frame_duration_ns(chunk.len(), rate_hz, want)),
-                last_chunk_at,
-            );
             let queued_frames = (acc.len() / want as usize) as u64;
             // Session rate, not the 48 kHz module constant: at 96 kHz that divisor would
             // put the anchor a whole buffer occupancy too early.
@@ -448,68 +667,47 @@ pub(super) fn audio_thread(
             // exactly what makes a fast clock unrecoverable and the sample-exact stamp mandatory.
             clock.reanchor(anchor);
         }
-        // Release one frame per wall-clock slot. Source behind (no complete frame): cover
-        // with silence when lag ≥ `after()`, else the schedule falls behind forever.
-        // Source ahead (backlog > one chunk + one frame): send a second frame in the same
-        // slot (`bonus`), at most two, so surplus drains at 2× instead of growing latency.
-        let mut bonus_taken = false;
+        pacer.wake();
         loop {
             let now = std::time::Instant::now();
-            // Late vs slot, measured before the re-anchor arm forgives the debt.
-            let mut late = std::time::Duration::ZERO;
-            match pace_due {
-                Some(due) if due > now => break,
-                Some(due) if now.duration_since(due) > PACE_REANCHOR => {
-                    send_stats.observe_reanchor();
-                    counters.note_audio_reanchor();
-                    pace_due = None;
-                }
-                Some(due) => late = now.duration_since(due),
-                None => {}
+            let Release {
+                slot,
+                late,
+                reanchored,
+            } = pacer.release(now, acc.len());
+            if reanchored {
+                send_stats.observe_reanchor();
+                counters.note_audio_reanchor();
             }
             frame_buf.clear();
-            let mut infilled = false;
-            if acc.len() >= frame_len {
-                frame_buf.extend(acc.drain(..frame_len));
-            } else if !sent_any {
-                break;
-            } else {
-                // Hole is max(time since last chunk, schedule lag): graph stopped, or
-                // graph fed less than wall clock.
-                match infill.decide(last_chunk_at.elapsed().max(late)) {
-                    crate::audio::capture_policy::Infill::Silence => {
-                        infilled = true;
-                        // Send the partial padded with silence; do not wait for post-gap
-                        // samples to complete it (that frame would straddle the hole).
-                        // Dropping it would come back as schedule lag.
-                        let partial = acc.len();
-                        frame_buf.append(&mut acc);
-                        if infill.covered() == infill.frame() {
-                            // Fade the tail we have — the partial, or `last_real` if empty —
-                            // so the hole is a slope from the listener's level, not a step.
-                            if partial == 0 && !last_real.is_empty() {
-                                let n = edge_fade_samples.min(last_real.len());
-                                frame_buf.extend_from_slice(&last_real[..n]);
-                            }
-                            let n = frame_buf.len().min(edge_fade_samples);
-                            pcm::raised_cosine_tail(&mut frame_buf, n);
-                        }
-                        frame_buf.resize(frame_len, 0.0);
-                        // Whatever follows this hole starts mid-waveform.
-                        resume_fade = true;
-                    }
-                    crate::audio::capture_policy::Infill::Wait
-                    | crate::audio::capture_policy::Infill::Quiet => break,
+            let infilled = match slot {
+                Slot::Wait => break,
+                Slot::Frame => {
+                    frame_buf.extend(acc.drain(..frame_len));
+                    false
                 }
-            }
-            // Second frame in this slot if remaining backlog exceeds one chunk plus one
-            // frame. Decided on what is left AFTER this frame; never twice in a row.
-            let bonus = !infilled && !bonus_taken && acc.len() >= max_chunk_len.get() + frame_len;
-            pace_due = match pace_due {
-                Some(due) if bonus => Some(due), // same slot again for the next frame
-                other => Some(other.unwrap_or_else(std::time::Instant::now) + frame_interval),
+                Slot::Silence { first } => {
+                    // Send the partial padded with silence; do not wait for post-gap samples
+                    // to complete it (that frame would straddle the hole). Dropping it would
+                    // come back as schedule lag.
+                    let partial = acc.len();
+                    frame_buf.append(&mut acc);
+                    if first {
+                        // Fade the tail we have — the partial, or `last_real` if empty — so
+                        // the hole is a slope from the listener's level, not a step.
+                        if partial == 0 && !last_real.is_empty() {
+                            let n = edge_fade_samples.min(last_real.len());
+                            frame_buf.extend_from_slice(&last_real[..n]);
+                        }
+                        let n = frame_buf.len().min(edge_fade_samples);
+                        pcm::raised_cosine_tail(&mut frame_buf, n);
+                    }
+                    frame_buf.resize(frame_len, 0.0);
+                    // Whatever follows this hole starts mid-waveform.
+                    resume_fade = true;
+                    true
+                }
             };
-            bonus_taken = bonus;
             if !infilled {
                 if gain != 1.0 {
                     punktfunk_core::audio::apply_gain(&mut frame_buf, gain);
@@ -604,7 +802,7 @@ pub(super) fn audio_thread(
                     last_departure = Some(now);
                     // From here there is a continuity worth protecting, and `clock` has a real
                     // anchor to continue from — both preconditions for synthesizing anything.
-                    sent_any = true;
+                    pacer.sent();
                 }
                 // One oversized frame, not the plane. Advance `seq` so the client sees a
                 // gap and conceals it. Warn on powers of two. Persistent means
@@ -660,20 +858,142 @@ pub(super) fn audio_thread(
             last_send_stats = std::time::Instant::now();
         }
     }
-    // Park a live shared capturer (releases the routing claim). Isolated capturers are
-    // dropped: their sink name is this session's, and a later shared session would capture
-    // a sink nothing routes to.
-    if let Some(mut c) = capturer {
-        c.idle();
-        if target.is_none() {
-            crate::audio::park_audio_capture(&audio_cap, c);
-        }
-    }
+    lease.park(&audio_cap);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    /// One frame per slot. A backlog past one chunk plus one frame drains two per slot, never
+    /// three; nothing is owed before the first send.
+    #[test]
+    fn the_pacer_releases_a_frame_a_slot_and_drains_a_backlog_at_twice_that() {
+        let t0 = Instant::now();
+        let frame = 480; // 5 ms of 48 kHz stereo
+        let mut p = Pacer::new(5_000, frame, MS(5), t0);
+        assert_eq!(
+            p.wake_budget(t0, 0),
+            None,
+            "blocks for capture before the first send"
+        );
+        assert_eq!(p.release(t0, 0).slot, Slot::Wait);
+        p.on_chunk(t0, frame, MS(5));
+        p.wake();
+        assert_eq!(p.release(t0, frame).slot, Slot::Frame);
+        p.sent();
+        assert_eq!(
+            p.release(t0, frame).slot,
+            Slot::Wait,
+            "the next slot is 5 ms out"
+        );
+        assert_eq!(p.wake_budget(t0, frame), Some(MS(5)));
+
+        let t1 = t0 + MS(5);
+        p.wake();
+        assert_eq!(p.release(t1, 10 * frame).slot, Slot::Frame);
+        assert_eq!(
+            p.release(t1, 9 * frame).slot,
+            Slot::Frame,
+            "the bonus frame"
+        );
+        assert_eq!(
+            p.release(t1, 8 * frame).slot,
+            Slot::Wait,
+            "never three in a slot"
+        );
+    }
+
+    /// A hole is covered once it outlasts `after()` (10 ms here), fading on its first frame
+    /// only; a stall past `PACE_REANCHOR` is forgiven, not repaid; past the 500 ms budget the
+    /// wire goes quiet and the next chunk starts a new continuity.
+    #[test]
+    fn the_pacer_covers_a_hole_then_goes_quiet() {
+        let t0 = Instant::now();
+        let frame = 480;
+        let mut p = Pacer::new(5_000, frame, MS(5), t0);
+        p.on_chunk(t0, frame, MS(5));
+        p.wake();
+        assert_eq!(p.release(t0, frame).slot, Slot::Frame);
+        p.sent();
+        assert_eq!(
+            p.release(t0 + MS(5), 0).slot,
+            Slot::Wait,
+            "a 5 ms hole is too young"
+        );
+        let first = Release {
+            slot: Slot::Silence { first: true },
+            late: MS(5),
+            reanchored: false,
+        };
+        assert_eq!(p.release(t0 + MS(10), 0), first);
+        let next = p.release(t0 + MS(10), 0).slot;
+        assert_eq!(next, Slot::Silence { first: false });
+
+        assert!(
+            !p.on_chunk(t0 + MS(200), 10 * frame, MS(5)),
+            "covered: no break"
+        );
+        p.wake();
+        let r = p.release(t0 + MS(200), 10 * frame);
+        assert!(r.reanchored, "a 185 ms stall re-anchors");
+        assert_eq!((r.slot, r.late), (Slot::Frame, Duration::ZERO));
+
+        let mut t = t0 + MS(200);
+        let mut silent = 0;
+        for _ in 0..200 {
+            t += MS(5);
+            if let Slot::Silence { .. } = p.release(t, 0).slot {
+                silent += 1;
+            }
+        }
+        assert_eq!(silent, 100, "500 ms of 5 ms frames");
+        assert_eq!(
+            p.wake_budget(t, 0),
+            None,
+            "a spent budget blocks for capture"
+        );
+        assert!(
+            p.on_chunk(t, frame, MS(5)),
+            "the next chunk starts a new continuity"
+        );
+    }
+
+    struct Idle;
+    impl crate::audio::AudioCapturer for Idle {
+        fn next_chunk(&mut self) -> Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Only a shared capturer parks. An isolated one carries this session's sink name, and a
+    /// later shared session adopting it would capture a sink nothing routes to.
+    #[test]
+    fn only_a_shared_capturer_is_parked() {
+        let lease = |target: Option<&str>| CaptureLease {
+            cap: Some(Box::new(Idle)),
+            target: target.map(str::to_owned),
+            last_failed: None,
+            channels: 2,
+            rate_hz: 48_000,
+            tap: false,
+            sink: None,
+            tap_from: None,
+            published: Default::default(),
+        };
+        let slot: AudioCapSlot = Default::default();
+        lease(Some("punktfunk-session-1")).park(&slot);
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "an isolated capturer was parked"
+        );
+        lease(None).park(&slot);
+        // Windows drops every capturer at park (`park_audio_capture`).
+        assert_eq!(slot.lock().unwrap().is_some(), !cfg!(windows));
+    }
 
     /// The number this clock exists for, pinned exactly.
     ///
