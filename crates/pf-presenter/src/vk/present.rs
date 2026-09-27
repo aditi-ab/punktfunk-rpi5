@@ -146,8 +146,8 @@ impl Presenter {
             && self.present_timer.is_none()
             && !matches!(input, FrameInput::Redraw);
         if nonblocking {
-            // SAFETY: `fence` is owned here; a bounded wait is always legal.
             if self.submitted {
+                // SAFETY: `fence` is owned here; a bounded wait is always legal.
                 match unsafe { self.device.wait_for_fences(&[self.fence], true, 1_000_000) } {
                     Ok(()) => {}
                     Err(vk::Result::TIMEOUT) => {
