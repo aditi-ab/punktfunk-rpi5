@@ -1564,21 +1564,36 @@ pub(crate) fn run_netsh(args: &[String]) -> bool {
     run_quiet("netsh", &borrowed)
 }
 
-/// The mgmt port `serve` binds: host.env's last `PUNKTFUNK_MGMT_BIND`, else 47990. A blank or
-/// bad value keeps 47990; the host treats blank as unset and refuses to start on a bad one.
+/// A setting `serve` reads: `flag` in host.env's `PUNKTFUNK_HOST_CMD`, else the last `key=` line,
+/// the same order `parse_serve` applies.
+fn serve_setting<'a>(host_env: &'a str, flag: &str, key: &str) -> Option<&'a str> {
+    let last = |name: &str| {
+        host_env
+            .lines()
+            .rev()
+            .filter_map(|l| l.trim().split_once('='))
+            .find(|(k, _)| k.trim() == name)
+            .map(|(_, v)| v.trim().trim_matches('"'))
+    };
+    let mut cmd = last("PUNKTFUNK_HOST_CMD").unwrap_or("").split_whitespace();
+    cmd.find(|w| *w == flag)
+        .and_then(|_| cmd.next())
+        .or_else(|| last(key))
+}
+
+/// The mgmt port `serve` binds, else 47990. A blank or bad value keeps 47990; the host treats
+/// blank as unset and refuses to start on a bad one.
 fn mgmt_port(host_env: &str) -> u16 {
-    host_env
-        .lines()
-        .rev()
-        .filter_map(|l| l.trim().split_once('='))
-        .find(|(k, _)| k.trim() == "PUNKTFUNK_MGMT_BIND")
-        .and_then(|(_, v)| {
-            v.trim()
-                .trim_matches('"')
-                .parse::<std::net::SocketAddr>()
-                .ok()
-        })
+    serve_setting(host_env, "--mgmt-bind", "PUNKTFUNK_MGMT_BIND")
+        .and_then(|v| v.parse::<std::net::SocketAddr>().ok())
         .map_or(crate::mgmt::DEFAULT_PORT, |a| a.port())
+}
+
+/// The native QUIC port `serve` binds, else 9777, read the way [`mgmt_port`] reads its own.
+fn native_port(host_env: &str) -> u16 {
+    serve_setting(host_env, "--native-port", "PUNKTFUNK_NATIVE_PORT")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9777)
 }
 
 /// Inbound streaming + mgmt rules. Best-effort; never fails the install. Scoped by
@@ -1599,14 +1614,12 @@ fn add_firewall_rules(allow_public: bool) {
             None
         }
     };
-    // Mgmt/library on host.env's port (LAN read-only, paired-cert); `--mgmt-bind` lands there
-    // first. GameStream 47984/47989/48010, 47998-48010; native 9777; mDNS 5353.
-    let mgmt = mgmt_port(&std::fs::read_to_string(host_env_path()).unwrap_or_default());
-    let tcp = format!("47984,47989,48010,{mgmt}");
-    let rules = [
-        ("TCP", "TCP", tcp.as_str()),
-        ("UDP", "UDP", "47998-48010,9777,5353"),
-    ];
+    // Mgmt/library (LAN read-only, paired-cert) and native on the ports host.env gives `serve`;
+    // `--mgmt-bind` lands there first. GameStream 47984/47989/48010, 47998-48010; mDNS 5353.
+    let host_env = std::fs::read_to_string(host_env_path()).unwrap_or_default();
+    let tcp = format!("47984,47989,48010,{}", mgmt_port(&host_env));
+    let udp = format!("47998-48010,{},5353", native_port(&host_env));
+    let rules = [("TCP", "TCP", tcp.as_str()), ("UDP", "UDP", udp.as_str())];
     for (suffix, proto, ports) in rules {
         let name = format!("Punktfunk {suffix}");
         let ok = run_netsh(&fw_add_rule_args(
@@ -1952,6 +1965,31 @@ mod firewall_tests {
         );
         assert_eq!(mgmt_port("PUNKTFUNK_MGMT_BIND=\"[::]:48123\"\n"), 48123);
         assert_eq!(mgmt_port("PUNKTFUNK_MGMT_BIND=nonsense\n"), 47990);
+        let cmd = "PUNKTFUNK_MGMT_BIND=0.0.0.0:47991\nPUNKTFUNK_HOST_CMD=serve --mgmt-bind 0.0.0.0:48123\n";
+        assert_eq!(
+            mgmt_port(cmd),
+            48123,
+            "the command line outranks the env line"
+        );
+    }
+
+    /// A native port moved in host.env or on the host command is the one the UDP rule opens.
+    #[test]
+    fn the_native_rule_follows_the_serve_port() {
+        assert_eq!(native_port(""), 9777);
+        assert_eq!(native_port("PUNKTFUNK_NATIVE_PORT=9800\r\n"), 9800);
+        assert_eq!(native_port("# PUNKTFUNK_NATIVE_PORT=9800\n"), 9777);
+        assert_eq!(native_port("PUNKTFUNK_NATIVE_PORT=\n"), 9777);
+        assert_eq!(
+            native_port(
+                "PUNKTFUNK_NATIVE_PORT=9800\nPUNKTFUNK_HOST_CMD=\"serve --native-port 9900\"\n"
+            ),
+            9900
+        );
+        assert_eq!(
+            native_port("PUNKTFUNK_NATIVE_PORT=9800\nPUNKTFUNK_HOST_CMD=serve --gamestream\n"),
+            9800
+        );
     }
 
     /// `--mgmt-bind` writes the line the mgmt rule reads back, whatever host.env already holds.
