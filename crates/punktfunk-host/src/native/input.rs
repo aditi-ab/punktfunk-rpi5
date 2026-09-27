@@ -38,70 +38,6 @@ impl InputRoute {
     }
 }
 
-/// Incremental wire events (one button/axis per datagram) folded into the full frame the
-/// virtual xpad applies. Snapshot clients replace the whole state ([`PadState::set_snapshot`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct PadState {
-    buttons: u32,
-    left_trigger: u8,
-    right_trigger: u8,
-    ls_x: i16,
-    ls_y: i16,
-    rs_x: i16,
-    rs_y: i16,
-}
-
-impl PadState {
-    /// `false` = unknown axis id; the event is dropped.
-    fn apply(&mut self, ev: &InputEvent) -> bool {
-        if ev.kind == InputKind::GamepadButton {
-            if ev.x != 0 {
-                self.buttons |= ev.code;
-            } else {
-                self.buttons &= !ev.code;
-            }
-            return true;
-        }
-        use punktfunk_core::input::gamepad::*;
-        let stick = ev.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        let trigger = ev.x.clamp(0, 255) as u8;
-        match ev.code {
-            AXIS_LS_X => self.ls_x = stick,
-            AXIS_LS_Y => self.ls_y = stick,
-            AXIS_RS_X => self.rs_x = stick,
-            AXIS_RS_Y => self.rs_y = stick,
-            AXIS_LT => self.left_trigger = trigger,
-            AXIS_RT => self.right_trigger = trigger,
-            _ => return false,
-        }
-        true
-    }
-
-    fn set_snapshot(&mut self, s: &punktfunk_core::input::GamepadSnapshot) {
-        self.buttons = s.buttons;
-        self.left_trigger = s.left_trigger;
-        self.right_trigger = s.right_trigger;
-        self.ls_x = s.ls_x;
-        self.ls_y = s.ls_y;
-        self.rs_x = s.rs_x;
-        self.rs_y = s.rs_y;
-    }
-
-    fn frame(&self, index: usize, active_mask: u16) -> punktfunk_core::input::GamepadFrame {
-        punktfunk_core::input::GamepadFrame {
-            index: index as i16,
-            active_mask,
-            buttons: self.buttons,
-            left_trigger: self.left_trigger,
-            right_trigger: self.right_trigger,
-            ls_x: self.ls_x,
-            ls_y: self.ls_y,
-            rs_x: self.rs_x,
-            rs_y: self.rs_y,
-        }
-    }
-}
-
 /// Highest wire pad index (`flags` / snapshot `pad`). The uinput manager caps creation separately.
 const MAX_WIRE_PADS: usize = punktfunk_core::input::MAX_PADS;
 
@@ -247,7 +183,12 @@ impl Pads {
 
     /// This pad as the Controllers feed reports it: the device the host built, the
     /// kind the client asked for, and the state this thread just applied.
-    fn feed_frame(&self, idx: usize, state: &PadState, mask: u16) -> crate::pad_feed::PadFrame {
+    fn feed_frame(
+        &self,
+        idx: usize,
+        state: &punktfunk_core::input::GamepadSnapshot,
+        mask: u16,
+    ) -> crate::pad_feed::PadFrame {
         crate::pad_feed::PadFrame {
             pad: idx as u8,
             ts_ms: crate::clock::unix_ms(),
@@ -827,7 +768,9 @@ pub(super) fn input_thread(
     // Per-pad motion cadence, always on. Summarized at `info` on session end.
     let mut motion_cadence = super::motion_cadence::MotionCadence::new();
     let mut pad_uplink = super::pad_uplink::PadUplink::new(std::time::Instant::now());
-    let mut pad_state = [PadState::default(); MAX_WIRE_PADS];
+    // Incremental events fold into these ([`GamepadSnapshot::fold`]); a snapshot replaces
+    // one. `pad`/`seq` stay zero so an unchanged snapshot refresh compares equal.
+    let mut pad_state = [punktfunk_core::input::GamepadSnapshot::default(); MAX_WIRE_PADS];
     let mut pad_mask = 0u16;
     // Last applied snapshot seq (`None` until first). Older seq must not roll held state back.
     let mut pad_seq: [Option<u8>; MAX_WIRE_PADS] = [None; MAX_WIRE_PADS];
@@ -920,9 +863,9 @@ pub(super) fn input_thread(
                         // Bad index / unknown axis: fall through, no `continue`.
                         // The DualSense GET_REPORT handshake still has to run this tick.
                         let idx = ev.flags as usize;
-                        if idx < MAX_WIRE_PADS && pad_state[idx].apply(&ev) {
+                        if idx < MAX_WIRE_PADS && pad_state[idx].fold(&ev) {
                             pad_mask |= 1 << idx;
-                            let frame = pad_state[idx].frame(idx, pad_mask);
+                            let frame = pad_state[idx].to_frame(idx as u8, pad_mask);
                             pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
                             pad_feed.publish(|| pads.feed_frame(idx, &pad_state[idx], pad_mask));
                         }
@@ -953,11 +896,15 @@ pub(super) fn input_thread(
                             {
                                 pad_seq[idx] = Some(snap.seq);
                                 let before = pad_state[idx];
-                                pad_state[idx].set_snapshot(&snap);
+                                pad_state[idx] = GamepadSnapshot {
+                                    pad: 0,
+                                    seq: 0,
+                                    ..snap
+                                };
                                 let first = pad_mask & (1 << idx) == 0;
                                 if first || pad_state[idx] != before {
                                     pad_mask |= 1 << idx;
-                                    let frame = pad_state[idx].frame(idx, pad_mask);
+                                    let frame = pad_state[idx].to_frame(idx as u8, pad_mask);
                                     pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
                                     pad_feed.publish(|| {
                                         pads.feed_frame(idx, &pad_state[idx], pad_mask)
@@ -980,8 +927,8 @@ pub(super) fn input_thread(
                             pad_uplink.forget(idx);
                             if pad_mask & (1 << idx) != 0 {
                                 pad_mask &= !(1 << idx);
-                                pad_state[idx] = PadState::default();
-                                let frame = pad_state[idx].frame(idx, pad_mask);
+                                pad_state[idx] = Default::default();
+                                let frame = pad_state[idx].to_frame(idx as u8, pad_mask);
                                 pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
                                 pad_feed
                                     .publish(|| pads.feed_frame(idx, &pad_state[idx], pad_mask));
@@ -1404,7 +1351,7 @@ mod tests {
     #[test]
     fn pad_snapshot_replaces_state_and_seq_gates() {
         use punktfunk_core::input::{gamepad, GamepadSnapshot};
-        let mut state = PadState::default();
+        let mut state = GamepadSnapshot::default();
         let mut last_seq: Option<u8> = None;
 
         // Incremental events first, then a snapshot replaces the whole state.
@@ -1416,7 +1363,7 @@ mod tests {
             y: 0,
             flags: 0,
         };
-        assert!(state.apply(&axis));
+        assert!(state.fold(&axis));
         assert_eq!(state.left_trigger, 200);
 
         let snap = GamepadSnapshot {
@@ -1432,7 +1379,11 @@ mod tests {
         };
         assert!(GamepadSnapshot::seq_newer(snap.seq, last_seq));
         last_seq = Some(snap.seq);
-        state.set_snapshot(&snap);
+        state = GamepadSnapshot {
+            pad: 0,
+            seq: 0,
+            ..snap
+        };
         assert_eq!(state.left_trigger, 255);
         assert_eq!(state.buttons, gamepad::BTN_A);
         assert_eq!((state.ls_x, state.ls_y), (100, -100));
@@ -1449,7 +1400,11 @@ mod tests {
         let refresh = GamepadSnapshot { seq: 2, ..snap };
         assert!(GamepadSnapshot::seq_newer(refresh.seq, last_seq));
         let before = state;
-        state.set_snapshot(&refresh);
+        state = GamepadSnapshot {
+            pad: 0,
+            seq: 0,
+            ..refresh
+        };
         assert_eq!(state, before);
 
         // Wire roundtrip must decode to the same snapshot.
@@ -1457,17 +1412,6 @@ mod tests {
             GamepadSnapshot::from_event(&InputEvent::decode(&snap.to_event().encode()).unwrap())
                 .unwrap();
         assert_eq!(dec, snap);
-    }
-
-    fn gp(kind: InputKind, code: u32, x: i32, pad: u32) -> InputEvent {
-        InputEvent {
-            kind,
-            _pad: [0; 3],
-            code,
-            x,
-            y: 0,
-            flags: pad,
-        }
     }
 
     /// A pad re-plug must not reset `rumble_seq`.
@@ -1530,28 +1474,6 @@ mod tests {
             (1..=100).all(|s| !deliver(s, &mut stranded)),
             "test is vacuous — a restarted counter should have been gated out"
         );
-    }
-
-    /// Incremental wire events fold into the full frame the virtual xpad applies.
-    #[test]
-    fn gamepad_accumulator() {
-        use punktfunk_core::input::gamepad::*;
-        let mut s = PadState::default();
-        assert!(s.apply(&gp(InputKind::GamepadButton, BTN_A, 1, 0)));
-        assert!(s.apply(&gp(InputKind::GamepadButton, BTN_LB, 1, 0)));
-        assert!(s.apply(&gp(InputKind::GamepadAxis, AXIS_LS_X, -32768, 0)));
-        assert!(s.apply(&gp(InputKind::GamepadAxis, AXIS_RT, 255, 0)));
-        let f = s.frame(2, 0b0100);
-        assert_eq!(f.buttons, BTN_A | BTN_LB);
-        assert_eq!((f.ls_x, f.right_trigger), (-32768, 255));
-        assert_eq!((f.index, f.active_mask), (2, 0b0100));
-
-        // Release folds out; axis values clamp; unknown axis ids are rejected.
-        assert!(s.apply(&gp(InputKind::GamepadButton, BTN_A, 0, 0)));
-        assert_eq!(s.frame(0, 1).buttons, BTN_LB);
-        assert!(s.apply(&gp(InputKind::GamepadAxis, AXIS_LT, 9_999, 0)));
-        assert_eq!(s.left_trigger, 255);
-        assert!(!s.apply(&gp(InputKind::GamepadAxis, 42, 1, 0)));
     }
 
     /// A rumble that drives only the impulse triggers must still get a live TTL
