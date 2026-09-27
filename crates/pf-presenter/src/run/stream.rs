@@ -385,6 +385,261 @@ pub(super) fn toggle_pad_mouse(c: &NativeClient, ring_opener: Option<u8>) {
 }
 
 impl Shell {
+    /// Drain the pump's session events. A browse stream ending or a codec fallback
+    /// replaces `stream` mid-drain, so each event re-borrows it and a terminal one stops
+    /// the drain. `Break` is a single-mode stream ending the loop.
+    pub(super) fn drain_session_events(
+        &mut self,
+        stream: &mut Option<StreamState>,
+    ) -> ControlFlow<Outcome> {
+        while let Some(st) = stream.as_mut() {
+            let Ok(ev) = st.handle.events.try_recv() else {
+                break;
+            };
+            match ev {
+                SessionEvent::Connected {
+                    connector,
+                    mode,
+                    fingerprint,
+                } => self.on_connected(st, connector, mode, fingerprint),
+                SessionEvent::DecodeFacts(f) => st.facts = f,
+                // Welcome advert first, then every mid-session AccessUpdate. Re-gate live
+                // capture: a removed POINTER/KEYBOARD bit releases the lock it backed;
+                // with neither class left the capture drops (auto-release, so a later
+                // re-grant re-engages on click).
+                SessionEvent::Notice(n) => {
+                    st.session_notice = Some((n, Instant::now()));
+                }
+                SessionEvent::Access { access, notice } => {
+                    st.access = access;
+                    if let Some(n) = notice {
+                        tracing::info!(notice = %n, "session access changed");
+                        st.session_notice = Some((n, Instant::now()));
+                    }
+                    if let Some(cap) = st.capture.as_mut() {
+                        cap.set_grants(access.grants);
+                        if cap.captured() {
+                            // With the ring up the pointer stays the ring's; its close re-applies.
+                            if cap.can_capture() && !self.ring_was_open {
+                                self.capture_on(cap);
+                            } else if !cap.can_capture() {
+                                cap.release(false);
+                                self.capture_off();
+                            }
+                        }
+                    }
+                }
+                SessionEvent::Failed {
+                    msg,
+                    trust_rejected,
+                } => {
+                    if !self.browse {
+                        return ControlFlow::Break(Outcome::ConnectFailed {
+                            msg,
+                            trust_rejected,
+                        });
+                    }
+                    tracing::warn!(%msg, "connect failed — back to the console");
+                    let phase = if st.canceled {
+                        SessionPhase::Ended(None)
+                    } else {
+                        SessionPhase::Failed(&msg)
+                    };
+                    self.capture_off();
+                    self.end_stream(stream, phase);
+                    break;
+                }
+                SessionEvent::Ended(reason) => {
+                    self.release_stream(st);
+                    if !self.browse {
+                        return ControlFlow::Break(Outcome::Ended(reason));
+                    }
+                    self.window.set_title(&self.opts.window_title).ok();
+                    let phase =
+                        SessionPhase::Ended(if st.canceled { None } else { reason.as_deref() });
+                    self.end_stream(stream, phase);
+                    break;
+                }
+                // The negotiated codec ran out of decode rungs: re-dial the same host
+                // with that codec removed from advertised caps. The pump left nothing of
+                // its own running before sending this, so this is a clean start, not an
+                // overlap. Applies in both modes — single has no console to fall back to.
+                SessionEvent::CodecFallback {
+                    exclude_codecs,
+                    retry_caps,
+                    msg,
+                } => {
+                    tracing::warn!(
+                        %msg,
+                        exclude_codecs,
+                        retry_caps,
+                        "decode ladder exhausted — reconnecting with reduced codec caps"
+                    );
+                    self.release_stream(st);
+                    // Widen the exclusion rather than replace it: a second fallback must
+                    // not re-offer what the first already ruled out.
+                    let mut params = st.params.clone();
+                    params.exclude_codecs |= exclude_codecs;
+                    // The mode this session ended on, not the one it dialled with: a
+                    // mid-session `Reconfigure` lives only in the connector, and
+                    // `st.params` is a launch clone. `start_stream` then fits the window.
+                    if let Some(c) = &st.connector {
+                        params.mode = c.mode();
+                    }
+                    // A fresh demote flag, like `ActionOutcome::Start` — never the old
+                    // session's. Inheriting it would open a software decoder on good hardware.
+                    let force_software = Arc::new(AtomicBool::new(false));
+                    params.force_software = force_software.clone();
+                    // `params.launch` rides along verbatim. Dropping it would miss
+                    // `pf-vdisplay`'s reuse key (it includes the launch command) and
+                    // orphan the running game inside the lingering display. A `gog:`/
+                    // `custom:` target may start a second copy; Steam/Epic URIs dedupe.
+                    self.end_stream(stream, SessionPhase::Reconnecting(&msg));
+                    *stream = Some(self.start_stream(params, force_software));
+                    break;
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// The dial landed: title, pads, capture and the cursor channel come up for `c`. A
+    /// connect canceled from the console quit-closes the host instead.
+    fn on_connected(
+        &mut self,
+        st: &mut StreamState,
+        c: Arc<NativeClient>,
+        m: Mode,
+        fingerprint: [u8; 32],
+    ) {
+        if st.canceled {
+            // The dial won the race against the cancel: quit-close the host
+            // now; the stop flag (already set) ends the pump without engaging.
+            c.disconnect_quit();
+            return;
+        }
+        st.mode_line = format!("{}×{}@{}", m.width, m.height, m.refresh_hz);
+        st.native_mode = (m.width, m.height, m.refresh_hz);
+        st.fp_hex = pf_client_core::trust::hex(&fingerprint);
+        // Pre-fetch the ring's host-action slots here, never when it opens.
+        let host_addr = st.params.host.clone();
+        pf_client_core::host_actions::refresh(&host_addr, c.mgmt_port(), &st.fp_hex);
+        // The resolved rate — a `0 = native` request becomes a real number
+        // here, last moment before frames start arriving.
+        st.source_interval_ns = frame_interval_ns(m.refresh_hz, self.native.refresh_hz);
+        tracing::info!(mode = %st.mode_line, "connected");
+        // Which touch devices SDL sees. Under gamescope this is the tell
+        // for whether Steam Input hands the touchscreen through as touch:
+        // no DIRECT device, no twist can arrive.
+        tracing::info!(
+            devices = ?touch_devices(),
+            gamescope = in_gamescope(),
+            "touch devices"
+        );
+        self.window
+            .set_title(&format!("{} · {}", self.opts.window_title, st.mode_line))
+            .ok();
+        self.gamepad.attach(c.clone());
+        st.clock_offset = Some(c.clock_offset_shared());
+        st.video_e2e = Some(c.video_e2e_shared());
+        // gamescope's EIS grants only a relative pointer — absolute would be
+        // dropped, so desktop mode is pinned off. Auto (a host that never
+        // said) stays allowed.
+        let abs_ok = c.resolved_compositor != CompositorPref::Gamescope;
+        if self.opts.mouse_mode == MouseMode::Desktop && !abs_ok {
+            tracing::info!(
+                "desktop mouse mode unavailable on a gamescope host \
+                 (relative-only input) — using capture"
+            );
+        }
+        // Access off the Welcome. The pump's Access event lands in this drain,
+        // but capture below must be built gated, not re-gated a beat later.
+        st.access = pf_client_core::access::SessionAccess::from_connector(&c);
+        // Passthrough needs a host that injects touch. Without the bit every
+        // contact would vanish with no error, so the session runs the trackpad
+        // model and the notice says so.
+        let touch_mode = if self.opts.touch_mode == TouchMode::Touch
+            && c.host_caps2() & punktfunk_core::quic::HOST_CAP2_TOUCH == 0
+        {
+            st.session_notice = Some((
+                "This host does not accept touch — using the trackpad model".into(),
+                Instant::now(),
+            ));
+            TouchMode::Trackpad
+        } else {
+            self.opts.touch_mode
+        };
+        let mut cap = Capture::new(
+            c.clone(),
+            touch_mode,
+            self.opts.invert_scroll,
+            self.opts.mouse_mode,
+            abs_ok,
+            st.access.grants,
+        );
+        // Capture engages when the stream starts unless access covers neither
+        // pointer nor keyboard, where `engage` refuses and the pointer stays free.
+        if cap.engage() {
+            self.capture_on(&cap);
+        }
+        st.capture = Some(cap);
+        st.cursor_chan = Some(crate::cursor::CursorChannel::new(&c));
+        // Read the mgmt port before `c` is moved into `st` — the Welcome's
+        // library address, which the binary persists so it survives without mDNS.
+        let mgmt_port = c.mgmt_port();
+        st.connector = Some(c);
+        if let Some(f) = self.opts.on_connected.as_mut() {
+            f(fingerprint, mgmt_port);
+        }
+        if let Some(o) = self.overlay.as_mut() {
+            o.session_phase(SessionPhase::Streaming);
+        }
+    }
+
+    /// A new stream on `params`, sized to the window under Match-window.
+    pub(super) fn start_stream(
+        &self,
+        mut params: SessionParams,
+        force_software: Arc<AtomicBool>,
+    ) -> StreamState {
+        if self.opts.match_window.is_some() {
+            apply_match_window(
+                &mut params,
+                &self.window,
+                self.opts.render_scale,
+                self.opts.render_scale_max_dim,
+            );
+        }
+        StreamState::new(
+            params,
+            force_software,
+            self.sdl_events.event_sender(),
+            self.present_priority,
+            self.native.refresh_hz,
+        )
+    }
+
+    /// Hand back what a connected stream held: the pads, then the capture.
+    fn release_stream(&mut self, st: &mut StreamState) {
+        self.gamepad.detach();
+        if let Some(cap) = &mut st.capture {
+            cap.release(true);
+        }
+        self.capture_off();
+    }
+
+    /// Stop the stream's pump and show the console `phase`.
+    fn end_stream(&mut self, stream: &mut Option<StreamState>, phase: SessionPhase<'_>) {
+        if let Some(st) = stream.take() {
+            st.shutdown();
+        }
+        if let Some(o) = self.overlay.as_mut() {
+            o.session_phase(phase);
+        }
+    }
+}
+
+impl Shell {
     /// Browse mode's console: menu events while no stream is engaged, and the action the
     /// console took. `Break` is the console's Quit.
     pub(super) fn browse_tick(
@@ -433,15 +688,7 @@ impl Shell {
                         self.presenter.vulkan_decode(),
                     ) {
                         ActionOutcome::Handled => {}
-                        ActionOutcome::Start(mut params) => {
-                            if self.opts.match_window.is_some() {
-                                apply_match_window(
-                                    &mut params,
-                                    &self.window,
-                                    self.opts.render_scale,
-                                    self.opts.render_scale_max_dim,
-                                );
-                            }
+                        ActionOutcome::Start(params) => {
                             // Adopt the tier this launch resolved. The console outlives
                             // every stream. Not in `StreamState::new`: a codec-fallback
                             // retry rebuilds from a clone of these params and would snap
@@ -458,13 +705,7 @@ impl Shell {
                                 );
                                 prev.shutdown();
                             }
-                            *stream = Some(StreamState::new(
-                                *params,
-                                force_software,
-                                self.sdl_events.event_sender(),
-                                self.present_priority,
-                                self.native.refresh_hz,
-                            ));
+                            *stream = Some(self.start_stream(*params, force_software));
                             if let Some(o) = self.overlay.as_mut() {
                                 o.session_phase(SessionPhase::Connecting);
                             }
