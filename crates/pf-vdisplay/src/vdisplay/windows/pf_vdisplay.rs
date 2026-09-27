@@ -90,6 +90,17 @@ unsafe fn ioctl(h: HANDLE, code: u32, input: &[u8], output: &mut [u8]) -> Result
     Ok(returned)
 }
 
+/// [`ioctl`] for a control verb that writes no output.
+///
+/// # Safety
+///
+/// `h` must be a live pf-vdisplay control handle ([`ioctl`]'s only obligation).
+unsafe fn ioctl_send(h: HANDLE, code: u32, input: &[u8]) -> Result<()> {
+    // SAFETY: `h` is live by this fn's contract; `input` outlives the synchronous call and the
+    // empty output is the verb's "no output buffer" contract.
+    unsafe { ioctl(h, code, input, &mut []) }.map(|_| ())
+}
+
 /// Remove not-present "punktfunk" monitor PDOs that `IddCxMonitorDeparture` leaves behind.
 /// Each ghost pins a VidPN target against IddCx's ~16-slot budget; once full, `IOCTL_ADD`
 /// returns 0x80070490 (`ERROR_NOT_FOUND`). Best-effort: only `Present==false` AND
@@ -298,19 +309,14 @@ unsafe fn set_render_adapter(h: HANDLE, luid: LUID) -> Result<()> {
         luid_low: luid.LowPart,
         luid_high: luid.HighPart,
     };
-    let mut none: [u8; 0] = [];
-    // SAFETY: `h` is a live control-device handle by this fn's contract — `ioctl`'s only
-    // obligation. The request is a `Pod` viewed through `bytemuck::bytes_of`; empty output
-    // matches the IOCTL's "no output buffer" contract.
+    // SAFETY: `h` is a live control-device handle by this fn's contract.
     unsafe {
-        ioctl(
+        ioctl_send(
             h,
             control::IOCTL_SET_RENDER_ADAPTER,
             bytemuck::bytes_of(&req),
-            &mut none,
         )
     }
-    .map(|_| ())
     .context("pf-vdisplay SET_RENDER_ADAPTER")
 }
 
@@ -324,18 +330,14 @@ pub unsafe fn send_cursor_channel(
     dev: HANDLE,
     req: &control::SetCursorChannelRequest,
 ) -> Result<()> {
-    let mut none: [u8; 0] = [];
-    // SAFETY: `dev` is the live control handle by this fn's contract; `bytes_of(req)` borrows the
-    // caller's request across this synchronous call; no output buffer.
+    // SAFETY: `dev` is the live control handle by this fn's contract.
     unsafe {
-        ioctl(
+        ioctl_send(
             dev,
             control::IOCTL_SET_CURSOR_CHANNEL,
             bytemuck::bytes_of(req),
-            &mut none,
         )
     }
-    .map(|_| ())
     .context("pf-vdisplay SET_CURSOR_CHANNEL")
 }
 
@@ -348,18 +350,14 @@ pub unsafe fn send_cursor_forward(
     dev: HANDLE,
     req: &control::SetCursorForwardRequest,
 ) -> Result<()> {
-    let mut none: [u8; 0] = [];
-    // SAFETY: `dev` is the live control handle by this fn's contract; `bytes_of(req)` borrows the
-    // caller's request across this synchronous call; no output buffer.
+    // SAFETY: `dev` is the live control handle by this fn's contract.
     unsafe {
-        ioctl(
+        ioctl_send(
             dev,
             control::IOCTL_SET_CURSOR_FORWARD,
             bytemuck::bytes_of(req),
-            &mut none,
         )
     }
-    .map(|_| ())
     .context("pf-vdisplay SET_CURSOR_FORWARD")
 }
 
@@ -434,19 +432,9 @@ unsafe fn drain_driver_log(dev: HANDLE) {
 /// # Safety
 /// `dev` must be a live pf-vdisplay control handle (see [`super::manager::control_device_handle`]).
 pub unsafe fn send_encode_ctl(dev: HANDLE, req: &encode::EncodeCtlRequest) -> Result<()> {
-    let mut none: [u8; 0] = [];
-    // SAFETY: `dev` is the live control handle by this fn's contract; `bytes_of(req)` borrows the
-    // caller's request across this synchronous call; no output buffer.
-    unsafe {
-        ioctl(
-            dev,
-            encode::IOCTL_ENCODE_CTL,
-            bytemuck::bytes_of(req),
-            &mut none,
-        )
-    }
-    .map(|_| ())
-    .with_context(|| format!("pf-vdisplay ENCODE_CTL op {}", req.op))
+    // SAFETY: `dev` is the live control handle by this fn's contract.
+    unsafe { ioctl_send(dev, encode::IOCTL_ENCODE_CTL, bytemuck::bytes_of(req)) }
+        .with_context(|| format!("pf-vdisplay ENCODE_CTL op {}", req.op))
 }
 
 /// RAII SetupAPI device-info list. Every [`open_device`] exit path must destroy it; a driverless
@@ -802,10 +790,8 @@ impl VdisplayDriver for PfVdisplayDriver {
             reap_ghost_monitors();
             return Ok((device, watchdog_s, info.protocol_version));
         }
-        let mut none: [u8; 0] = [];
-        // SAFETY: `raw` borrows the live `OwnedHandle` above. `IOCTL_CLEAR_ALL` has no input and
-        // no output: `&[]` and empty `none` pass zero-length buffers.
-        if unsafe { ioctl(raw, control::IOCTL_CLEAR_ALL, &[], &mut none) }.is_ok() {
+        // SAFETY: `raw` borrows the live `OwnedHandle` above. `IOCTL_CLEAR_ALL` takes no input.
+        if unsafe { ioctl_send(raw, control::IOCTL_CLEAR_ALL, &[]) }.is_ok() {
             tracing::info!("cleared orphaned virtual monitors on host startup");
         } else {
             tracing::warn!("pf-vdisplay IOCTL_CLEAR_ALL failed on startup (continuing)");
@@ -911,18 +897,8 @@ impl VdisplayDriver for PfVdisplayDriver {
             // IOCTL succeeded: the driver already created the monitor and took a slot. Bailing
             // without REMOVE leaks it; ~16 leaks wedge later ADDs at 0x80070490.
             let req = control::RemoveRequest { session_id };
-            let mut none: [u8; 0] = [];
-            // SAFETY: `dev` is the live control handle (`add_monitor`'s contract); `bytes_of(&req)`
-            // borrows a local across this synchronous call; `none` is the empty output the IOCTL
-            // expects.
-            let undo = unsafe {
-                ioctl(
-                    dev,
-                    control::IOCTL_REMOVE,
-                    bytemuck::bytes_of(&req),
-                    &mut none,
-                )
-            };
+            // SAFETY: `dev` is the live control handle (`add_monitor`'s contract).
+            let undo = unsafe { ioctl_send(dev, control::IOCTL_REMOVE, bytemuck::bytes_of(&req)) };
             match undo {
                 Ok(_) => tracing::warn!(
                     session_id,
@@ -999,24 +975,14 @@ impl VdisplayDriver for PfVdisplayDriver {
             refresh_hz: mode.refresh_hz,
             _reserved: 0,
         };
-        let mut none: [u8; 0] = [];
-        // SAFETY: per `update_modes`'s contract `dev` is the live control handle. `bytes_of(&req)`
-        // borrows the local `UpdateModesRequest` across this synchronous call; `none` is empty.
-        unsafe {
-            ioctl(
-                dev,
-                control::IOCTL_UPDATE_MODES,
-                bytemuck::bytes_of(&req),
-                &mut none,
-            )
-        }
-        .map(|_| ())
-        .with_context(|| {
-            format!(
-                "pf-vdisplay UPDATE_MODES {}x{}@{}",
-                mode.width, mode.height, mode.refresh_hz
-            )
-        })
+        // SAFETY: per `update_modes`'s contract `dev` is the live control handle.
+        unsafe { ioctl_send(dev, control::IOCTL_UPDATE_MODES, bytemuck::bytes_of(&req)) }
+            .with_context(|| {
+                format!(
+                    "pf-vdisplay UPDATE_MODES {}x{}@{}",
+                    mode.width, mode.height, mode.refresh_hz
+                )
+            })
     }
 
     unsafe fn remove_monitor(&self, dev: HANDLE, key: &MonitorKey) -> Result<()> {
@@ -1026,25 +992,13 @@ impl VdisplayDriver for PfVdisplayDriver {
         let req = control::RemoveRequest {
             session_id: *session_id,
         };
-        let mut none: [u8; 0] = [];
-        // SAFETY: per `remove_monitor`'s contract `dev` is the live control handle. `bytes_of(&req)`
-        // borrows the local `RemoveRequest` across this synchronous call; `none` is empty.
-        unsafe {
-            ioctl(
-                dev,
-                control::IOCTL_REMOVE,
-                bytemuck::bytes_of(&req),
-                &mut none,
-            )
-        }
-        .map(|_| ())
+        // SAFETY: per `remove_monitor`'s contract `dev` is the live control handle.
+        unsafe { ioctl_send(dev, control::IOCTL_REMOVE, bytemuck::bytes_of(&req)) }
     }
 
     unsafe fn ping(&self, dev: HANDLE) -> Result<()> {
-        let mut none: [u8; 0] = [];
-        // SAFETY: per `ping`'s contract `dev` is the live control handle. `IOCTL_PING` has no
-        // input (`&[]`) and no output (`none` is empty).
-        unsafe { ioctl(dev, control::IOCTL_PING, &[], &mut none) }.map(|_| ())
+        // SAFETY: per `ping`'s contract `dev` is the live control handle. `IOCTL_PING` takes no input.
+        unsafe { ioctl_send(dev, control::IOCTL_PING, &[]) }
     }
 
     unsafe fn drain_log(&self, dev: HANDLE) {
@@ -1623,18 +1577,9 @@ mod tests {
         let req = control::EncodeProbeRequest { target_id, ..req };
         let dev = open_device().expect("open the pf-vdisplay control device");
         let h = HANDLE(dev.as_raw_handle());
-        let mut none: [u8; 0] = [];
-        // SAFETY: `h` borrows the live `OwnedHandle` above; `bytes_of(&req)` is a local that
-        // outlives the synchronous call; ARM writes no output.
-        unsafe {
-            ioctl(
-                h,
-                control::IOCTL_ENCODE_PROBE_ARM,
-                bytemuck::bytes_of(&req),
-                &mut none,
-            )
-        }
-        .expect("IOCTL_ENCODE_PROBE_ARM — is the driver built with --features encode-probe?");
+        // SAFETY: `h` borrows the live `OwnedHandle` above.
+        unsafe { ioctl_send(h, control::IOCTL_ENCODE_PROBE_ARM, bytemuck::bytes_of(&req)) }
+            .expect("IOCTL_ENCODE_PROBE_ARM — is the driver built with --features encode-probe?");
 
         // DWM presents only what something dirties: a 1 px pointer wiggle keeps frames flowing
         // on the (isolated, so pointer-holding) virtual display.
