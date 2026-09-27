@@ -4,9 +4,10 @@
 //! swapchain the compositor then composites. Here a dma-buf goes straight on SDL's
 //! `wl_surface` through `zwp_linux_dmabuf_v1`, so the compositor can put it on a plane, and
 //! `wp_presentation` stamps the glass for the HUD. The buffer is a VAAPI surface as decoded,
-//! or a copy of a Vulkan Video picture (`vk::export_ring`). The lane takes a picture only
-//! when the surface feedback lists its format and modifier, it is SDR, and it fills the
-//! window; anything else is declined and the Vulkan path draws that frame. The presenter
+//! or a copy of a Vulkan Video or PyroWave picture (`vk::export_ring`). The lane takes a
+//! picture only when the surface feedback lists its format and modifier, the compositor
+//! takes its colour, and it fills the window; anything else is declined and the Vulkan path
+//! draws that frame. The presenter
 //! suspends its swapchain while the lane owns the window: Mesa's explicit-sync object on the
 //! surface would make a plain dma-buf commit a fatal protocol error.
 //!

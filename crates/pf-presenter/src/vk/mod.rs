@@ -315,12 +315,13 @@ pub struct Presenter {
     /// Wayland lane that hands a dma-buf to the compositor as the window's own buffer.
     #[cfg(target_os = "linux")]
     native: Option<crate::wl_native::NativeLane>,
-    /// Exportable copies of Vulkan Video pictures for the lane; built on the first one.
+    /// Exportable copies of Vulkan Video or PyroWave pictures for the lane; built on the
+    /// first one.
     #[cfg(target_os = "linux")]
     export_ring: Option<export_ring::ExportRing>,
-    /// (fourcc, width, height, feedback generation) a ring could not be built for.
+    /// The shape a ring could not be built for.
     #[cfg(target_os = "linux")]
-    export_refused: Option<(u32, u32, u32, u64)>,
+    export_refused: Option<RingShape>,
     /// Rings built so far; keeps each ring's lane keys apart.
     #[cfg(target_os = "linux")]
     export_gen: u64,
@@ -352,14 +353,29 @@ pub struct Presenter {
     suspended: bool,
 }
 
-/// What the native lane did with a Vulkan Video picture.
-pub enum NativeVkOutcome {
+/// What the native lane did with a Vulkan Video or PyroWave picture.
+pub enum NativeVkOutcome<F = NativeVkFrame> {
     /// Copied and committed as the window's buffer.
     Shown,
     /// Copied, but the copy did not finish in time: the frame is gone, nothing shown.
     Dropped,
     /// Not taken; draw it through the swapchain.
-    Declined(NativeVkFrame),
+    Declined(F),
+}
+
+/// (fourcc, width, height, feedback generation, three-plane source) of a picture ring.
+#[cfg(target_os = "linux")]
+type RingShape = (u32, u32, u32, u64, bool);
+
+/// Where the picture ring left a frame.
+#[cfg(target_os = "linux")]
+enum RingSlot {
+    /// This free, imported slot takes the copy; the lane owns the window.
+    Ready(usize),
+    /// Every buffer is on screen or importing while the lane owns the window: skip it.
+    Drop,
+    /// No ring or no free slot yet: the swapchain draws it.
+    Decline,
 }
 
 impl Presenter {
@@ -605,8 +621,8 @@ impl Presenter {
 
     /// A Vulkan Video picture through the native lane: copied into an exportable buffer on a
     /// modifier the compositor listed, then committed as the window's buffer. Declined when
-    /// the lane is off, the picture is not a copyable SDR NV12/P010 that fills the window, or
-    /// no ring slot is free and imported.
+    /// the lane is off, the picture is not a copyable NV12/P010 that fills the window in a
+    /// colour the compositor takes, or no ring slot is free and imported.
     pub fn present_native_vk(
         &mut self,
         f: NativeVkFrame,
@@ -629,19 +645,16 @@ impl Presenter {
         pts_ns: u64,
         decoded_ns: u64,
     ) -> NativeVkOutcome {
-        use crate::wl_native::SlotState;
         self.poll_native_releases();
         let view = (self.extent.width, self.extent.height);
         if self.overlay_blocks_native || self.flip_holds_swapchain() {
             return NativeVkOutcome::Declined(f);
         }
-        let (Some(lane), Some(hw)) = (self.native.as_mut(), self.hw.as_ref()) else {
+        let Some(lane) = self.native.as_mut() else {
             return NativeVkOutcome::Declined(f);
         };
-        // Timelines only where the lane will put points on the surface.
-        let timelines = hw.timelines.as_ref().filter(|_| lane.explicit_sync());
         lane.pump();
-        let Some((fourcc, format)) = export_ring::fourcc_for(f.vk_format) else {
+        let Some(target) = export_ring::fourcc_for(f.vk_format) else {
             return NativeVkOutcome::Declined(f);
         };
         let even = |v: u32| v % 2 == 0;
@@ -654,98 +667,12 @@ impl Presenter {
         if !takes {
             return NativeVkOutcome::Declined(f);
         }
-        let want = (fourcc, f.width, f.height, lane.feedback_generation());
-        if self
-            .export_ring
-            .as_ref()
-            .is_some_and(|r| (r.fourcc, r.width, r.height, r.feedback_gen) != want)
-        {
-            if let Some(old) = self.export_ring.take() {
-                for i in 0..old.len() {
-                    lane.forget(old.key(i));
-                }
-            }
-        }
-        if self.export_ring.is_none() {
-            if self.export_refused == Some(want) {
-                return NativeVkOutcome::Declined(f);
-            }
-            self.export_gen += 1;
-            // SAFETY: the presenter's live, paired handles; `hw` exists only when the device
-            // enabled the dma-buf extension set the ring needs.
-            let built = unsafe {
-                export_ring::ExportRing::new(
-                    &self.instance,
-                    self.pdev,
-                    &self.device,
-                    &hw.ext_mem_fd,
-                    &self.mem_props,
-                    self.qfi,
-                    (fourcc, format),
-                    (f.width, f.height),
-                    &lane.modifiers_for(fourcc),
-                    want.3,
-                    export_ring::KEY_PICTURES | (self.export_gen << 8),
-                    timelines,
-                )
-            };
-            match built {
-                Ok(ring) => {
-                    tracing::info!(
-                        fourcc = format!("{fourcc:#010x}"),
-                        modifier = format!("{:#x}", ring.modifier),
-                        width = f.width,
-                        height = f.height,
-                        explicit_sync = timelines.is_some(),
-                        "native scanout: Vulkan Video pictures copy into exported buffers"
-                    );
-                    for i in 0..ring.len() {
-                        lane.import(
-                            ring.key(i),
-                            (f.width, f.height),
-                            fourcc,
-                            ring.modifier,
-                            &ring.planes(i),
-                        );
-                        if let Some((a, r)) = ring.sync_fds(i) {
-                            lane.import_timelines(ring.key(i), a, r);
-                        }
-                    }
-                    self.export_ring = Some(ring);
-                }
-                Err(e) => {
-                    tracing::info!(
-                        error = %format!("{e:#}"),
-                        "native scanout: no exportable copy target — Vulkan presents"
-                    );
-                    self.export_refused = Some(want);
-                    return NativeVkOutcome::Declined(f);
-                }
-            }
-        }
+        let slot = match self.picture_slot(target, (f.width, f.height), false) {
+            RingSlot::Ready(slot) => slot,
+            RingSlot::Drop => return NativeVkOutcome::Dropped,
+            RingSlot::Decline => return NativeVkOutcome::Declined(f),
+        };
         let Some(ring) = self.export_ring.as_mut() else {
-            return NativeVkOutcome::Declined(f);
-        };
-        if (0..ring.len()).any(|i| lane.slot_state(ring.key(i)) == SlotState::Failed) {
-            lane.refused(fourcc, ring.modifier);
-            return NativeVkOutcome::Declined(f);
-        }
-        let Some(slot) = ring.free_slot(|k| lane.slot_state(k) == SlotState::Free) else {
-            // Every buffer on screen or still importing: skip the frame, or let the swapchain
-            // draw it while the lane is not in charge yet.
-            return if self.suspended {
-                NativeVkOutcome::Dropped
-            } else {
-                NativeVkOutcome::Declined(f)
-            };
-        };
-        if !self.suspended {
-            if let Err(e) = self.suspend_swapchain() {
-                tracing::warn!(error = %format!("{e:#}"), "native scanout: swapchain suspend failed");
-                return NativeVkOutcome::Declined(f);
-            }
-        }
-        let (Some(lane), Some(ring)) = (self.native.as_mut(), self.export_ring.as_mut()) else {
             return NativeVkOutcome::Declined(f);
         };
         // SAFETY: the frame's handles live on this device while its guard is held (below);
@@ -760,22 +687,239 @@ impl Presenter {
                 // The submit carries `value + 1`: the decoder waits it before reusing the picture.
                 let mut f = f;
                 f.guard.mark_presented();
-                let (color, pq) = (f.color, f.color.is_pq());
+                let color = f.color;
                 drop(f);
-                let export_ring::Copied::Ready(point) = copied else {
-                    return NativeVkOutcome::Dropped;
-                };
-                let hold = Box::new(ring.hold(slot));
-                let key = ring.key(slot);
-                if lane.commit(key, color, self.hdr_meta, hold, pts_ns, decoded_ns, point) {
-                    self.native_last = true;
-                    self.native_pq = pq;
+                if self.commit_picture(slot, copied, color, pts_ns, decoded_ns) {
                     NativeVkOutcome::Shown
                 } else {
-                    ring.uncommit(slot);
                     NativeVkOutcome::Dropped
                 }
             }
+        }
+    }
+
+    /// A PyroWave picture through the native lane: Y copied and Cb/Cr interleaved into an
+    /// exported NV12 or P010 buffer, then committed as the window's buffer. Declined as
+    /// [`Self::present_native_vk`], and at 4:4:4, which display planes do not scan out as YUV.
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
+    pub fn present_native_pyro(
+        &mut self,
+        f: pf_client_core::video_pyrowave::PyroWavePlanarFrame,
+        pts_ns: u64,
+        decoded_ns: u64,
+    ) -> NativeVkOutcome<pf_client_core::video_pyrowave::PyroWavePlanarFrame> {
+        #[cfg(target_os = "linux")]
+        return self.present_native_pyro_linux(f, pts_ns, decoded_ns);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (pts_ns, decoded_ns);
+            NativeVkOutcome::Declined(f)
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    fn present_native_pyro_linux(
+        &mut self,
+        f: pf_client_core::video_pyrowave::PyroWavePlanarFrame,
+        pts_ns: u64,
+        decoded_ns: u64,
+    ) -> NativeVkOutcome<pf_client_core::video_pyrowave::PyroWavePlanarFrame> {
+        use ash::vk::Handle as _;
+        self.poll_native_releases();
+        let view = (self.extent.width, self.extent.height);
+        if self.overlay_blocks_native || self.flip_holds_swapchain() {
+            return NativeVkOutcome::Declined(f);
+        }
+        let Some(lane) = self.native.as_mut() else {
+            return NativeVkOutcome::Declined(f);
+        };
+        lane.pump();
+        let takes = !f.chroma444
+            && f.width % 2 == 0
+            && f.height % 2 == 0
+            && lane.fits(f.color, (f.width, f.height), view, self.video_fit);
+        if !takes {
+            return NativeVkOutcome::Declined(f);
+        }
+        let target = if f.ten_bit {
+            (
+                export_ring::DRM_FORMAT_P010,
+                vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+            )
+        } else {
+            (
+                export_ring::DRM_FORMAT_NV12,
+                vk::Format::G8_B8R8_2PLANE_420_UNORM,
+            )
+        };
+        let slot = match self.picture_slot(target, (f.width, f.height), true) {
+            RingSlot::Ready(slot) => slot,
+            RingSlot::Drop => return NativeVkOutcome::Dropped,
+            RingSlot::Decline => return NativeVkOutcome::Declined(f),
+        };
+        let Some(ring) = self.export_ring.as_mut() else {
+            return NativeVkOutcome::Declined(f);
+        };
+        let luma = vk::Image::from_raw(f.luma);
+        let [_, cb, cr] = f.views.map(vk::ImageView::from_raw);
+        // SAFETY: the planes live on this device in GENERAL and their decode was submitted
+        // on this queue; the decoder orders its next write of them after this copy's compute
+        // and copy stages. `queue` is this presenter's, externally synchronised by
+        // `queue_lock`.
+        let copied =
+            unsafe { ring.copy_planar(slot, luma, [cb, cr], self.queue, &self.queue_lock) };
+        match copied {
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "native scanout: PyroWave copy failed");
+                NativeVkOutcome::Declined(f)
+            }
+            Ok(copied) => {
+                if self.commit_picture(slot, copied, f.color, pts_ns, decoded_ns) {
+                    NativeVkOutcome::Shown
+                } else {
+                    NativeVkOutcome::Dropped
+                }
+            }
+        }
+    }
+
+    /// A free, imported slot of the picture ring for a `size` picture copied to `target`
+    /// (fourcc, format), taking the window from the swapchain before handing it out. The ring
+    /// is rebuilt when the shape, the source or the compositor's feedback changes; a
+    /// `planar` ring carries the chroma pass.
+    #[cfg(target_os = "linux")]
+    fn picture_slot(
+        &mut self,
+        (fourcc, format): (u32, vk::Format),
+        size: (u32, u32),
+        planar: bool,
+    ) -> RingSlot {
+        use crate::wl_native::SlotState;
+        let (Some(lane), Some(hw)) = (self.native.as_mut(), self.hw.as_ref()) else {
+            return RingSlot::Decline;
+        };
+        // Timelines only where the lane will put points on the surface.
+        let timelines = hw.timelines.as_ref().filter(|_| lane.explicit_sync());
+        let want: RingShape = (fourcc, size.0, size.1, lane.feedback_generation(), planar);
+        let shape =
+            |r: &export_ring::ExportRing| (r.fourcc, r.width, r.height, r.feedback_gen, r.planar());
+        if self.export_ring.as_ref().is_some_and(|r| shape(r) != want) {
+            if let Some(old) = self.export_ring.take() {
+                for i in 0..old.len() {
+                    lane.forget(old.key(i));
+                }
+            }
+        }
+        if self.export_ring.is_none() {
+            if self.export_refused == Some(want) {
+                return RingSlot::Decline;
+            }
+            self.export_gen += 1;
+            // SAFETY: the presenter's live, paired handles; `hw` exists only when the device
+            // enabled the dma-buf extension set the ring needs.
+            let built = unsafe {
+                export_ring::ExportRing::new(
+                    &self.instance,
+                    self.pdev,
+                    &self.device,
+                    &hw.ext_mem_fd,
+                    &self.mem_props,
+                    self.qfi,
+                    (fourcc, format),
+                    size,
+                    &lane.modifiers_for(fourcc),
+                    want.3,
+                    export_ring::KEY_PICTURES | (self.export_gen << 8),
+                    timelines,
+                )
+            }
+            .and_then(|mut ring| {
+                if planar {
+                    // SAFETY: the handles the ring was just built with.
+                    unsafe { ring.add_interleave(&self.instance, self.pdev, &self.mem_props)? };
+                }
+                Ok(ring)
+            });
+            match built {
+                Ok(ring) => {
+                    tracing::info!(
+                        source = if planar { "PyroWave" } else { "Vulkan Video" },
+                        fourcc = format!("{fourcc:#010x}"),
+                        modifier = format!("{:#x}", ring.modifier),
+                        width = size.0,
+                        height = size.1,
+                        explicit_sync = timelines.is_some(),
+                        "native scanout: pictures copy into exported buffers"
+                    );
+                    for i in 0..ring.len() {
+                        lane.import(ring.key(i), size, fourcc, ring.modifier, &ring.planes(i));
+                        if let Some((a, r)) = ring.sync_fds(i) {
+                            lane.import_timelines(ring.key(i), a, r);
+                        }
+                    }
+                    self.export_ring = Some(ring);
+                }
+                Err(e) => {
+                    tracing::info!(
+                        error = %format!("{e:#}"),
+                        "native scanout: no exportable copy target — Vulkan presents"
+                    );
+                    self.export_refused = Some(want);
+                    return RingSlot::Decline;
+                }
+            }
+        }
+        let Some(ring) = self.export_ring.as_mut() else {
+            return RingSlot::Decline;
+        };
+        if (0..ring.len()).any(|i| lane.slot_state(ring.key(i)) == SlotState::Failed) {
+            lane.refused(fourcc, ring.modifier);
+            return RingSlot::Decline;
+        }
+        let Some(slot) = ring.free_slot(|k| lane.slot_state(k) == SlotState::Free) else {
+            // Every buffer on screen or still importing: skip the frame, or let the swapchain
+            // draw it while the lane is not in charge yet.
+            return if self.suspended {
+                RingSlot::Drop
+            } else {
+                RingSlot::Decline
+            };
+        };
+        if !self.suspended {
+            if let Err(e) = self.suspend_swapchain() {
+                tracing::warn!(error = %format!("{e:#}"), "native scanout: swapchain suspend failed");
+                return RingSlot::Decline;
+            }
+        }
+        RingSlot::Ready(slot)
+    }
+
+    /// Commit `slot` of the picture ring after its copy; true when shown. A copy that ran
+    /// late, or a commit the lane could not make, shows nothing.
+    #[cfg(target_os = "linux")]
+    fn commit_picture(
+        &mut self,
+        slot: usize,
+        copied: export_ring::Copied,
+        color: pf_client_core::video::ColorDesc,
+        pts_ns: u64,
+        decoded_ns: u64,
+    ) -> bool {
+        let export_ring::Copied::Ready(point) = copied else {
+            return false;
+        };
+        let (Some(lane), Some(ring)) = (self.native.as_mut(), self.export_ring.as_mut()) else {
+            return false;
+        };
+        let hold = Box::new(ring.hold(slot));
+        let key = ring.key(slot);
+        if lane.commit(key, color, self.hdr_meta, hold, pts_ns, decoded_ns, point) {
+            self.native_last = true;
+            self.native_pq = color.is_pq();
+            true
+        } else {
+            ring.uncommit(slot);
+            false
         }
     }
 

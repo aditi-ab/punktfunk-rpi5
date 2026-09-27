@@ -2250,11 +2250,17 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         // session presents through the HDR10 path like the H.26x codecs.
                         st.hdr = f.color.is_pq();
                         st.hdr_untonemapped = false;
-                        match presenter.present(
-                            &window,
-                            FrameInput::PyroWave(f),
-                            overlay_frame.as_ref(),
-                        ) {
+                        // The native lane first: the planes copied into the window's buffer.
+                        let native = presenter.present_native_pyro(f, pts_ns, decoded_ns);
+                        match match native {
+                            crate::vk::NativeVkOutcome::Shown => Ok(Presented::Shown),
+                            crate::vk::NativeVkOutcome::Dropped => Ok(Presented::Stale),
+                            crate::vk::NativeVkOutcome::Declined(f) => presenter.present(
+                                &window,
+                                FrameInput::PyroWave(f),
+                                overlay_frame.as_ref(),
+                            ),
+                        } {
                             Ok(Presented::Shown) => {
                                 st.pyro_present_warned = false;
                                 true

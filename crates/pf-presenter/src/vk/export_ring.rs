@@ -2,10 +2,12 @@
 //!
 //! Drivers decode only into their own optimal tiling, which no compositor imports. A ring
 //! holds a few images on a DRM modifier the compositor listed, each exported as one dma-buf:
-//! NV12 or P010 for Vulkan Video pictures, the overlay's RGBA for the HUD surface. A picture
-//! copy waits the picture's timeline value, restores its layout and signals `value + 1`: the
-//! write-back the decoder waits before it reuses a sampled picture. Every copy's fence is
-//! waited on the CPU before the commit, so the compositor never reads a half-written buffer.
+//! NV12 or P010 for Vulkan Video and PyroWave pictures, the overlay's RGBA for the HUD
+//! surface. A Vulkan Video copy waits the picture's timeline value, restores its layout and
+//! signals `value + 1`: the write-back the decoder waits before it reuses a sampled picture.
+//! PyroWave's three planes need a compute pass to interleave Cb and Cr. Under explicit sync
+//! the copy signals the buffer's acquire point; otherwise its fence is waited before the
+//! commit, so the compositor never reads a half-written buffer.
 
 use super::sync_timeline::{TimelineMaker, Timelines};
 use anyhow::{bail, Context as _, Result};
@@ -108,6 +110,185 @@ pub(crate) struct ExportRing {
     pub(crate) format: vk::Format,
     /// [`KEY_PICTURES`] or [`KEY_OVERLAY`] plus the ring generation: keys no other ring uses.
     key_base: u64,
+    /// The chroma pass of a ring that takes three-plane pictures.
+    interleave: Option<Interleave>,
+}
+
+/// Cb and Cr interleaved into the chroma plane: a compute pass per copy writes them into a
+/// two-channel scratch image of the slot, which the copy then moves into plane 1.
+#[derive(Default)]
+struct Interleave {
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pool: vk::DescriptorPool,
+    scratch: Vec<Scratch>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Scratch {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    set: vk::DescriptorSet,
+}
+
+impl Interleave {
+    /// # Safety
+    ///
+    /// `device` is live and `mem_props` are its physical device's. A failure leaves the
+    /// objects made so far for [`Self::destroy`].
+    unsafe fn build(
+        &mut self,
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        (chroma, spv): (vk::Format, &[u8]),
+        (width, height): (u32, u32),
+        slots: usize,
+    ) -> Result<()> {
+        let binding = |b| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        };
+        let bindings = [binding(0), binding(1), binding(2)];
+        let code = ash::util::read_spv(&mut std::io::Cursor::new(spv))?;
+        // SAFETY: fn contract; every create-info roots locals that outlive its call, and each
+        // handle lands in `self` as it is made.
+        unsafe {
+            self.set_layout = device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+                .context("vkCreateDescriptorSetLayout (chroma)")?;
+            let set_layouts = [self.set_layout];
+            self.layout = device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
+                    None,
+                )
+                .context("vkCreatePipelineLayout (chroma)")?;
+            let module = device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+                .context("chroma shader module")?;
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main");
+            let ci = vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(self.layout);
+            let made = device.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None);
+            device.destroy_shader_module(module, None);
+            self.pipeline = made
+                .map_err(|(_, e)| e)
+                .context("vkCreateComputePipelines (chroma)")?[0];
+            let sizes = [vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 3 * slots as u32,
+            }];
+            self.pool = device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(slots as u32)
+                        .pool_sizes(&sizes),
+                    None,
+                )
+                .context("vkCreateDescriptorPool (chroma)")?;
+            for _ in 0..slots {
+                self.scratch.push(Scratch::default());
+                let s = self.scratch.last_mut().expect("just pushed");
+                let ci = vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(chroma)
+                    .extent(extent(width / 2, height / 2))
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED);
+                s.image = device
+                    .create_image(&ci, None)
+                    .context("vkCreateImage (chroma)")?;
+                let req = device.get_image_memory_requirements(s.image);
+                let Some(type_index) = device_local(mem_props, req.memory_type_bits) else {
+                    bail!("no device-local memory type for the chroma image");
+                };
+                s.memory = device
+                    .allocate_memory(
+                        &vk::MemoryAllocateInfo::default()
+                            .allocation_size(req.size)
+                            .memory_type_index(type_index),
+                        None,
+                    )
+                    .context("vkAllocateMemory (chroma)")?;
+                device.bind_image_memory(s.image, s.memory, 0)?;
+                s.view = device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(s.image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(chroma)
+                            .subresource_range(subresource(0)),
+                        None,
+                    )
+                    .context("vkCreateImageView (chroma)")?;
+                s.set = device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(self.pool)
+                            .set_layouts(&set_layouts),
+                    )
+                    .context("vkAllocateDescriptorSets (chroma)")?[0];
+            }
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    ///
+    /// No submit that uses these objects is pending; null handles are skipped by Vulkan.
+    unsafe fn destroy(&mut self, device: &ash::Device) {
+        // SAFETY: fn contract; the sets go with their pool.
+        unsafe {
+            for s in self.scratch.drain(..) {
+                device.destroy_image_view(s.view, None);
+                device.destroy_image(s.image, None);
+                device.free_memory(s.memory, None);
+            }
+            device.destroy_descriptor_pool(self.pool, None);
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+        }
+    }
+}
+
+/// The first device-local memory type among `bits`.
+fn device_local(mem_props: &vk::PhysicalDeviceMemoryProperties, bits: u32) -> Option<u32> {
+    (0..mem_props.memory_type_count).find(|&i| {
+        bits & (1 << i) != 0
+            && mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    })
+}
+
+/// The chroma plane's format of an NV12 or P010 ring, as a storage image, with its pass.
+fn chroma_stage(format: vk::Format) -> Option<(vk::Format, &'static [u8])> {
+    use pf_client_core::video_csc_spv::{CHROMA_RG16_COMP, CHROMA_RG8_COMP};
+    match format {
+        vk::Format::G8_B8R8_2PLANE_420_UNORM => Some((vk::Format::R8G8_UNORM, CHROMA_RG8_COMP)),
+        vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 => {
+            Some((vk::Format::R16G16_UNORM, CHROMA_RG16_COMP))
+        }
+        _ => None,
+    }
 }
 
 /// `(modifier, memory planes)` the driver can create `format` with as a copy target.
@@ -238,6 +419,7 @@ impl ExportRing {
             feedback_gen,
             format,
             key_base,
+            interleave: None,
         };
         let image_mod = ash::ext::image_drm_format_modifier::Device::new(instance, device);
         for _ in 0..SLOTS {
@@ -259,6 +441,45 @@ impl ExportRing {
             }
         }
         Ok(ring)
+    }
+
+    /// Give an NV12 or P010 ring the chroma pass three-plane pictures need.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::new`], with the same `instance`, `pdev` and `mem_props`.
+    pub(crate) unsafe fn add_interleave(
+        &mut self,
+        instance: &ash::Instance,
+        pdev: vk::PhysicalDevice,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+    ) -> Result<()> {
+        let Some((chroma, spv)) = chroma_stage(self.format) else {
+            bail!("no chroma pass for {:?}", self.format);
+        };
+        let needs = vk::FormatFeatureFlags::STORAGE_IMAGE | vk::FormatFeatureFlags::TRANSFER_SRC;
+        // SAFETY: fn contract.
+        let props = unsafe { instance.get_physical_device_format_properties(pdev, chroma) };
+        if !props.optimal_tiling_features.contains(needs) {
+            bail!("{chroma:?} is no storage image here");
+        }
+        let mut il = Interleave::default();
+        let slots = self.slots.len();
+        let size = (self.width, self.height);
+        // SAFETY: fn contract; nothing of `il` was submitted when a failure destroys it.
+        unsafe {
+            if let Err(e) = il.build(&self.device, mem_props, (chroma, spv), size, slots) {
+                il.destroy(&self.device);
+                return Err(e);
+            }
+        }
+        self.interleave = Some(il);
+        Ok(())
+    }
+
+    /// The ring takes three-plane pictures.
+    pub(crate) fn planar(&self) -> bool {
+        self.interleave.is_some()
     }
 
     /// `slot`'s (acquire, release) timeline fds, under explicit sync.
@@ -328,13 +549,7 @@ impl ExportRing {
         let image = unsafe { d.create_image(&ci, None) }.context("vkCreateImage (export)")?;
         // SAFETY: `image` was just created on this device.
         let req = unsafe { d.get_image_memory_requirements(image) };
-        let type_index = (0..mem_props.memory_type_count).find(|&i| {
-            req.memory_type_bits & (1 << i) != 0
-                && mem_props.memory_types[i as usize]
-                    .property_flags
-                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        });
-        let Some(type_index) = type_index else {
+        let Some(type_index) = device_local(mem_props, req.memory_type_bits) else {
             // SAFETY: the never-bound image created above.
             unsafe { d.destroy_image(image, None) };
             bail!("no device-local memory type for the export image");
@@ -646,6 +861,134 @@ impl ExportRing {
         unsafe { self.run(slot, None, queue, lock, record) }
     }
 
+    /// Copy a three-plane picture into `slot`: Y straight into plane 0, Cb and Cr through the
+    /// chroma pass into plane 1. Results as [`Self::copy`].
+    ///
+    /// # Safety
+    ///
+    /// The ring has its interleave. `luma` (the ring's size, R8 for NV12 or R16 for P010)
+    /// and the `cb`/`cr` views (half size each way, same depth) are live on this device in
+    /// GENERAL, and their writer was submitted on `queue` before this call. Their next writer
+    /// orders itself after this submit's compute and copy stages. `queue` as in [`Self::copy`].
+    #[cfg(feature = "pyrowave")]
+    pub(crate) unsafe fn copy_planar(
+        &mut self,
+        slot: usize,
+        luma: vk::Image,
+        [cb, cr]: [vk::ImageView; 2],
+        queue: vk::Queue,
+        lock: &QueueLock,
+    ) -> Result<Copied> {
+        let Some(il) = self.interleave.as_ref() else {
+            bail!("the ring has no chroma pass");
+        };
+        let (s, pipeline, layout) = (il.scratch[slot], il.pipeline, il.layout);
+        let (w, h) = (self.width, self.height);
+        let plane = |aspect| vk::ImageSubresourceLayers {
+            aspect_mask: aspect,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let region = |dst_aspect, (w, h)| vk::ImageCopy {
+            src_subresource: plane(vk::ImageAspectFlags::COLOR),
+            src_offset: vk::Offset3D::default(),
+            dst_subresource: plane(dst_aspect),
+            dst_offset: vk::Offset3D::default(),
+            extent: extent(w, h),
+        };
+        let luma_region = region(vk::ImageAspectFlags::PLANE_0, (w, h));
+        let chroma_region = region(vk::ImageAspectFlags::PLANE_1, (w / 2, h / 2));
+        let info = |view| {
+            [vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view: view,
+                image_layout: vk::ImageLayout::GENERAL,
+            }]
+        };
+        let (cb_info, cr_info, out_info) = (info(cb), info(cr), info(s.view));
+        // The decode's storage writes, made visible to the pass and the luma copy.
+        let decoded = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ);
+        let to_write = layout_barrier(
+            s.image,
+            subresource(0),
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::GENERAL,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::SHADER_WRITE,
+        );
+        let to_src = layout_barrier(
+            s.image,
+            subresource(0),
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::TRANSFER_READ,
+        );
+        let record = |d: &ash::Device, cmd: vk::CommandBuffer, dst: vk::Image| {
+            let writes = [(0, &cb_info), (1, &cr_info), (2, &out_info)].map(|(binding, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(s.set)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(info)
+            });
+            // SAFETY: `cmd` is recording and the slot's last submit finished, so its set is
+            // idle; every handle is live per the contract.
+            unsafe {
+                d.update_descriptor_sets(&writes, &[]);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[decoded],
+                    &[],
+                    &[to_write],
+                );
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[s.set],
+                    &[],
+                );
+                d.cmd_dispatch(cmd, (w / 2).div_ceil(8), (h / 2).div_ceil(8), 1);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_src],
+                );
+                d.cmd_copy_image(
+                    cmd,
+                    luma,
+                    vk::ImageLayout::GENERAL,
+                    dst,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[luma_region],
+                );
+                d.cmd_copy_image(
+                    cmd,
+                    s.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    dst,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[chroma_region],
+                );
+            }
+        };
+        // SAFETY: fn contract.
+        unsafe { self.run(slot, None, queue, lock, record) }
+    }
+
     /// One copy into `slot`: take the export image back from the compositor, let `record`
     /// copy into it, hand it back, submit (waiting `timeline`'s value at TRANSFER and
     /// signalling value + 1). Under explicit sync the submit also signals the slot's next
@@ -837,6 +1180,9 @@ impl Drop for ExportRing {
                     let _ = d.wait_for_fences(&[s.fence], true, COPY_WAIT_NS);
                 }
             }
+            if let Some(mut il) = self.interleave.take() {
+                il.destroy(d);
+            }
             for s in self.slots.drain(..) {
                 if s.fence != vk::Fence::null() {
                     d.destroy_fence(s.fence, None);
@@ -880,6 +1226,30 @@ mod tests {
             0,
             "a VAAPI pool key never sets bit 63 or 62"
         );
+    }
+
+    /// The chroma pass writes the chroma plane's two-channel format at the ring's depth, from
+    /// SPIR-V that parses.
+    #[test]
+    fn the_chroma_pass_matches_the_ring_depth() {
+        let stage = |f| chroma_stage(f).map(|(c, spv)| (c, spv.len() % 4 == 0 && spv.len() > 20));
+        assert_eq!(
+            stage(vk::Format::G8_B8R8_2PLANE_420_UNORM),
+            Some((vk::Format::R8G8_UNORM, true))
+        );
+        assert_eq!(
+            stage(vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16),
+            Some((vk::Format::R16G16_UNORM, true))
+        );
+        assert_eq!(stage(vk::Format::B8G8R8A8_UNORM), None);
+        for (_, spv) in [
+            vk::Format::G8_B8R8_2PLANE_420_UNORM,
+            vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+        ]
+        .map(|f| chroma_stage(f).expect("mapped"))
+        {
+            assert!(ash::util::read_spv(&mut std::io::Cursor::new(spv)).is_ok());
+        }
     }
 
     /// The overlay's formats map to the DRM codes whose byte order they share.
