@@ -80,15 +80,17 @@ private extension Image {
 /// bounded bitmap and never materialises the full-size one. `maxPixels` is the longer edge, in
 /// PIXELS (the caller multiplies its point size by the screen scale, ×2 for headroom under the
 /// focus pop). nil ⇒ decode as shipped — still capped by DECLARED pixels, since the wire bound
-/// caps bytes, not those.
+/// caps bytes, not those. Either way the bitmap is decoded HERE, off the main actor: a plain
+/// `UIImage(data:)` would defer the decode to its first draw.
 private func decodePoster(_ data: Data, maxPixels: Int?) -> PlatformImage? {
-    guard let maxPixels, maxPixels > 0 else { return imageWithinPixelCap(data) }
-    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+          let edge = maxPixels.flatMap({ $0 > 0 ? $0 : nil }) ?? declaredEdge(source)
+    else { return nil }
     let options: [CFString: Any] = [
         kCGImageSourceCreateThumbnailFromImageAlways: true,
         kCGImageSourceCreateThumbnailWithTransform: true,
         kCGImageSourceShouldCacheImmediately: true,
-        kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+        kCGImageSourceThumbnailMaxPixelSize: edge,
     ]
     guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
         // A format ImageIO can't thumbnail (rare) still gets the decode — with the same pixel
@@ -109,12 +111,19 @@ private let maxFullDecodePixels = 16_777_216 // 4096×4096
 
 private func imageWithinPixelCap(_ data: Data) -> PlatformImage? {
     guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          declaredEdge(source) != nil
+    else { return nil }
+    return PlatformImage(data: data)
+}
+
+/// The image's longer edge as declared, or nil when it's unreadable or past the pixel cap.
+private func declaredEdge(_ source: CGImageSource) -> Int? {
+    guard let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
           let width = props[kCGImagePropertyPixelWidth] as? Int,
           let height = props[kCGImagePropertyPixelHeight] as? Int,
           width > 0, height > 0, width * height <= maxFullDecodePixels
     else { return nil }
-    return PlatformImage(data: data)
+    return max(width, height)
 }
 
 /// Where each library poster last drew, in global (window) coordinates, by entry id.
