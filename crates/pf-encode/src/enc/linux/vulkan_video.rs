@@ -277,74 +277,29 @@ struct RgbDirect {
     true_extent: bool,
 }
 
-/// Stack storage for a complete rgb-chained video profile. Post-open image creation (dmabuf
-/// imports, CPU staging) must present a profile identical by value to the session's.
-/// `wire()` links `p_next` into this struct's own addresses, so the value must not move between
-/// `wire()` and the last use of `.profile`.
-struct RgbProfileStack {
-    rgb: super::vk_valve_rgb::VideoEncodeProfileRgbConversionInfoVALVE,
+/// Stack storage for a complete video profile: profile → codec profile → usage, then the VALVE
+/// rgb-conversion struct when `rgb`. Profile identity is by value, so the session and every
+/// post-open image (dmabuf imports, CPU staging) build theirs here. `wire()` links `p_next` into
+/// this struct's own addresses, so the value must not move between `wire()` and the last use of
+/// `.profile`.
+struct ProfileStack {
+    rgb: Option<super::vk_valve_rgb::VideoEncodeProfileRgbConversionInfoVALVE>,
     usage: vk::VideoEncodeUsageInfoKHR<'static>,
     h265: vk::VideoEncodeH265ProfileInfoKHR<'static>,
     av1: super::vk_av1_encode::VideoEncodeAV1ProfileInfoKHR,
     profile: vk::VideoProfileInfoKHR<'static>,
 }
 
-impl RgbProfileStack {
-    fn new(codec_op: vk::VideoCodecOperationFlagsKHR, ten_bit: bool) -> Self {
+impl ProfileStack {
+    fn new(codec_op: vk::VideoCodecOperationFlagsKHR, ten_bit: bool, rgb: bool) -> Self {
         use super::vk_av1_encode as av1b;
         use super::vk_valve_rgb as vrgb;
         Self {
-            rgb: vrgb::VideoEncodeProfileRgbConversionInfoVALVE {
+            rgb: rgb.then_some(vrgb::VideoEncodeProfileRgbConversionInfoVALVE {
                 s_type: vrgb::stype(vrgb::ST_PROFILE_INFO),
                 p_next: std::ptr::null(),
                 perform_encode_rgb_conversion: vk::TRUE,
-            },
-            usage: vk::VideoEncodeUsageInfoKHR::default()
-                .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
-                .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
-                .tuning_mode(vk::VideoEncodeTuningModeKHR::ULTRA_LOW_LATENCY),
-            h265: vk::VideoEncodeH265ProfileInfoKHR::default()
-                .std_profile_idc(h265_profile_idc(ten_bit)),
-            av1: av1b::VideoEncodeAV1ProfileInfoKHR {
-                s_type: av1b::stype(av1b::ST_PROFILE_INFO),
-                p_next: std::ptr::null(),
-                std_profile: vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
-            },
-            profile: vk::VideoProfileInfoKHR::default()
-                .video_codec_operation(codec_op)
-                .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-                .luma_bit_depth(component_depth(ten_bit))
-                .chroma_bit_depth(component_depth(ten_bit)),
-        }
-    }
-
-    /// Link `p_next` into this value's final address; returns `&self.profile`.
-    fn wire(&mut self, av1: bool) -> &vk::VideoProfileInfoKHR<'static> {
-        self.usage.p_next = &self.rgb as *const _ as *const c_void;
-        if av1 {
-            self.av1.p_next = &self.usage as *const _ as *const c_void;
-            self.profile.p_next = &self.av1 as *const _ as *const c_void;
-        } else {
-            self.h265.p_next = &self.usage as *const _ as *const c_void;
-            self.profile.p_next = &self.h265 as *const _ as *const c_void;
-        }
-        &self.profile
-    }
-}
-
-/// Non-RGB profile for native NV12 DMA-BUF imports. Post-`open` image creation must match the
-/// session profile by value.
-struct NativeProfileStack {
-    usage: vk::VideoEncodeUsageInfoKHR<'static>,
-    h265: vk::VideoEncodeH265ProfileInfoKHR<'static>,
-    av1: super::vk_av1_encode::VideoEncodeAV1ProfileInfoKHR,
-    profile: vk::VideoProfileInfoKHR<'static>,
-}
-
-impl NativeProfileStack {
-    fn new(codec_op: vk::VideoCodecOperationFlagsKHR, ten_bit: bool) -> Self {
-        use super::vk_av1_encode as av1b;
-        Self {
+            }),
             usage: vk::VideoEncodeUsageInfoKHR::default()
                 .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
                 .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
@@ -365,7 +320,12 @@ impl NativeProfileStack {
         }
     }
 
+    /// Link `p_next` into this value's final address; returns `&self.profile`.
     fn wire(&mut self, av1: bool) -> &vk::VideoProfileInfoKHR<'static> {
+        self.usage.p_next = self
+            .rgb
+            .as_ref()
+            .map_or(std::ptr::null(), |r| r as *const _ as *const c_void);
         if av1 {
             self.av1.p_next = &self.usage as *const _ as *const c_void;
             self.profile.p_next = &self.av1 as *const _ as *const c_void;
@@ -475,7 +435,7 @@ unsafe fn depth_supported(
     av1: bool,
     ten_bit: bool,
 ) -> bool {
-    let mut ps = NativeProfileStack::new(codec_op, ten_bit);
+    let mut ps = ProfileStack::new(codec_op, ten_bit, false);
     let profile = *ps.wire(av1);
     let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
     let mut av1_caps: super::vk_av1_encode::VideoEncodeAV1CapabilitiesKHR = std::mem::zeroed();
@@ -613,13 +573,8 @@ pub(crate) fn vulkan_capture_modifiers(codec: Codec, fourcc: u32, ten_bit: bool)
             .map(|pd| {
                 // The probe must name the profile the import will use: planar fourccs
                 // (NV12/P010) go in under the native profile, packed RGB under EFC conversion.
-                let mut native_ps = NativeProfileStack::new(codec_op, ten_bit);
-                let mut rgb_ps = RgbProfileStack::new(codec_op, ten_bit);
-                let encode_profile = *if matches!(fmt, NV12 | P010) {
-                    native_ps.wire(av1)
-                } else {
-                    rgb_ps.wire(av1)
-                };
+                let mut ps = ProfileStack::new(codec_op, ten_bit, !matches!(fmt, NV12 | P010));
+                let encode_profile = *ps.wire(av1);
                 let mut accepted: Vec<u64> = Vec::new();
                 for m in one_plane_modifiers(&instance, pd, fmt) {
                     // LINEAR is appended by the capture offer, never probed here.
@@ -1329,44 +1284,11 @@ impl VulkanVideoEncoder {
             );
         }
 
-        // Encode profile, chained raw (vendored AV1 + rgb structs can't `push_next`). Must
-        // match [`RgbProfileStack::wire`] when rgb is active — profile identity is by value:
-        // profile → codec profile → usage (→ rgb-conversion when active).
-        let rgb_info = vrgb::VideoEncodeProfileRgbConversionInfoVALVE {
-            s_type: vrgb::stype(vrgb::ST_PROFILE_INFO),
-            p_next: std::ptr::null(),
-            perform_encode_rgb_conversion: vk::TRUE,
-        };
-        let mut h265_profile =
-            vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(h265_profile_idc(ten_bit));
-        let mut av1_profile = av1b::VideoEncodeAV1ProfileInfoKHR {
-            s_type: av1b::stype(av1b::ST_PROFILE_INFO),
-            p_next: std::ptr::null(),
-            std_profile: vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
-        };
-        let mut usage = vk::VideoEncodeUsageInfoKHR::default()
-            .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
-            .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
-            .tuning_mode(vk::VideoEncodeTuningModeKHR::ULTRA_LOW_LATENCY);
-        if rgb_cfg.is_some() {
-            usage.p_next = &rgb_info as *const _ as *const c_void;
-        }
-        // A device that cannot encode 10-bit fails this query with
-        // VIDEO_PROFILE_FORMAT_NOT_SUPPORTED; a failed Vulkan open falls back to VAAPI.
-        // No separate probe, and no way to reach a half-configured session.
-        let depth = component_depth(ten_bit);
-        let mut profile = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(codec_op)
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(depth)
-            .chroma_bit_depth(depth);
-        if av1 {
-            av1_profile.p_next = &usage as *const _ as *const c_void;
-            profile.p_next = &av1_profile as *const _ as *const c_void;
-        } else {
-            h265_profile.p_next = &usage as *const _ as *const c_void;
-            profile.p_next = &h265_profile as *const _ as *const c_void;
-        }
+        // Encode profile, from the same constructor every later image profile uses. A device
+        // that cannot encode 10-bit fails the caps query below with
+        // VIDEO_PROFILE_FORMAT_NOT_SUPPORTED, and a failed Vulkan open falls back to VAAPI.
+        let mut ps = ProfileStack::new(codec_op, ten_bit, rgb_cfg.is_some());
+        let profile = *ps.wire(av1);
 
         // Device extensions, queried once: the intra-refresh caps chain below and the
         // `VK_EXT_queue_family_foreign` decision both read it.
@@ -2131,7 +2053,7 @@ impl VulkanVideoEncoder {
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
         if self.native_nv12 {
             let mut ps =
-                NativeProfileStack::new(codec_op_for(self.codec == Codec::Av1), self.ten_bit);
+                ProfileStack::new(codec_op_for(self.codec == Codec::Av1), self.ten_bit, false);
             let profile = *ps.wire(self.codec == Codec::Av1);
             let arr = [profile];
             let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
@@ -2159,7 +2081,8 @@ impl VulkanVideoEncoder {
                 None,
             )
         } else if self.rgb.is_some() {
-            let mut ps = RgbProfileStack::new(codec_op_for(self.codec == Codec::Av1), self.ten_bit);
+            let mut ps =
+                ProfileStack::new(codec_op_for(self.codec == Codec::Av1), self.ten_bit, true);
             let profile = *ps.wire(self.codec == Codec::Av1);
             let arr = [profile];
             let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
@@ -2292,7 +2215,7 @@ impl VulkanVideoEncoder {
                 // with the encode queue (compute only copies in; semaphore orders; CONCURRENT
                 // avoids a QFOT).
                 let av1 = self.codec == Codec::Av1;
-                let mut ps = RgbProfileStack::new(codec_op_for(av1), self.ten_bit);
+                let mut ps = ProfileStack::new(codec_op_for(av1), self.ten_bit, true);
                 let profile = *ps.wire(av1);
                 let arr = [profile];
                 let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
@@ -4690,6 +4613,40 @@ mod tests {
     use super::{build_h265_rps_s0, intra_refresh_caps, parse_rgb_request, VulkanVideoEncoder};
     use crate::{Codec, Encoder};
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
+
+    /// The profile chain's structure types, head first.
+    fn chain_types(p: &ash::vk::VideoProfileInfoKHR) -> Vec<ash::vk::StructureType> {
+        let mut out = vec![p.s_type];
+        let mut next = p.p_next as *const ash::vk::BaseInStructure;
+        while !next.is_null() {
+            // SAFETY: every link `ProfileStack::wire` makes is a Vulkan struct that opens with
+            // `sType`/`pNext`, alive in the stack the caller still holds.
+            let base = unsafe { &*next };
+            out.push(base.s_type);
+            next = base.p_next;
+        }
+        out
+    }
+
+    /// One constructor for the session and every image profile: the VALVE rgb link is the only
+    /// thing `rgb` changes, and it hangs off usage.
+    #[test]
+    fn profile_chain_adds_rgb_conversion_only_when_asked() {
+        use super::{codec_op_for, ProfileStack};
+        use crate::vk_valve_rgb as vrgb;
+        for av1 in [false, true] {
+            let mut plain = ProfileStack::new(codec_op_for(av1), false, false);
+            let mut rgb = ProfileStack::new(codec_op_for(av1), false, true);
+            let (plain, rgb) = (chain_types(plain.wire(av1)), chain_types(rgb.wire(av1)));
+            assert_eq!(plain.len(), 3, "profile → codec → usage");
+            assert_eq!(
+                plain[2],
+                ash::vk::StructureType::VIDEO_ENCODE_USAGE_INFO_KHR
+            );
+            assert_eq!(rgb[..3], plain[..]);
+            assert_eq!(rgb[3..], [vrgb::stype(vrgb::ST_PROFILE_INFO)]);
+        }
+    }
 
     /// Native planar pairs: NV12 is the 8-bit source, P010 the 10-bit one; a crossed pair
     /// names a picture the session cannot program.
