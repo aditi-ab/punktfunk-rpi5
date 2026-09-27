@@ -781,37 +781,6 @@ public final class PunktfunkConnection: @unchecked Sendable {
             || accessExpiresInSeconds != 0
     }
 
-    /// The grant bit one wire input kind needs — the Swift mirror of core's exhaustive
-    /// `classify` (keys → keyboard; mouse/scroll/touch → pointer; pads → gamepad), consulted
-    /// by ``send(_:)``'s courtesy filter. An unknown/future kind maps to 0 — never granted —
-    /// matching the host's default-deny.
-    private static func grantBit(forInputKind kind: UInt8) -> UInt32 {
-        switch UInt32(kind) {
-        case PUNKTFUNK_INPUT_KIND_KEY_DOWN.rawValue,
-             PUNKTFUNK_INPUT_KIND_KEY_UP.rawValue,
-             PUNKTFUNK_INPUT_KIND_TEXT_INPUT.rawValue:
-            return grantKeyboard
-        case PUNKTFUNK_INPUT_KIND_MOUSE_MOVE.rawValue,
-             PUNKTFUNK_INPUT_KIND_MOUSE_MOVE_ABS.rawValue,
-             PUNKTFUNK_INPUT_KIND_MOUSE_BUTTON_DOWN.rawValue,
-             PUNKTFUNK_INPUT_KIND_MOUSE_BUTTON_UP.rawValue,
-             PUNKTFUNK_INPUT_KIND_MOUSE_SCROLL.rawValue,
-             PUNKTFUNK_INPUT_KIND_SCROLL.rawValue,
-             PUNKTFUNK_INPUT_KIND_TOUCH_DOWN.rawValue,
-             PUNKTFUNK_INPUT_KIND_TOUCH_MOVE.rawValue,
-             PUNKTFUNK_INPUT_KIND_TOUCH_UP.rawValue:
-            return grantPointer
-        case PUNKTFUNK_INPUT_KIND_GAMEPAD_BUTTON.rawValue,
-             PUNKTFUNK_INPUT_KIND_GAMEPAD_AXIS.rawValue,
-             PUNKTFUNK_INPUT_KIND_GAMEPAD_STATE.rawValue,
-             PUNKTFUNK_INPUT_KIND_GAMEPAD_REMOVE.rawValue,
-             PUNKTFUNK_INPUT_KIND_GAMEPAD_ARRIVAL.rawValue:
-            return grantGamepad
-        default:
-            return 0
-        }
-    }
-
     /// Whether the LIVE grants include `bit`. Call with `abiLock` held and a live handle —
     /// the send paths' shape, so the read and the send see the same session.
     private func granted(_ bit: UInt32, handle h: OpaquePointer) -> Bool {
@@ -1828,17 +1797,13 @@ public final class PunktfunkConnection: @unchecked Sendable {
     }
 
     /// Send one input event (delivered to the host as a QUIC datagram). Thread-safe;
-    /// silently dropped after close — and dropped when the session's live grants exclude the
-    /// event's class (the courtesy mirror of the host's classify-and-drop: the HOST enforces
-    /// regardless, but not putting undeliverable events on the wire is what lets every input
-    /// path honor a mid-session grant edit without each caller re-checking).
+    /// silently dropped after close. The core drops an event whose class the live grants
+    /// refuse, so no caller re-checks after a mid-session grant edit.
     public func send(_ event: PunktfunkInputEvent) {
         var ev = event
         abiLock.lock()
         defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested,
-              granted(Self.grantBit(forInputKind: ev.kind), handle: h)
-        else { return }
+        guard let h = handle, !closeRequested else { return }
         _ = punktfunk_connection_send_input(h, &ev)
     }
 

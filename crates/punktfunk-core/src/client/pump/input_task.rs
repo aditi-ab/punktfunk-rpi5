@@ -15,6 +15,10 @@
 //!
 //! A controller-mouse pad ([`super::super::pad_mouse`]) bypasses the fold: its host snapshot
 //! stays neutral and alive on the refresh, and its events become pointer, scroll and key events.
+//!
+//! Every datagram passes [`send_granted`]: what the live grants refuse never goes out. The host
+//! drops the same classes; the gate runs after the controller-mouse fold, so those pads need
+//! only the pointer grant.
 
 use super::super::pad_mouse::{PadMouse, PadMouseShared, TICK};
 use super::*;
@@ -43,6 +47,14 @@ fn send_input(conn: &quinn::Connection, out: &mut ScrollOutput, args: &MouseArgs
         .scroll_invert
         .load(std::sync::atomic::Ordering::Relaxed);
     if let Some(ev) = out.prepare(ev, invert) {
+        send_granted(conn, &args.grants, ev);
+    }
+}
+
+/// Send `ev` when the live grants cover its [`crate::quic::classify`] class.
+fn send_granted(conn: &quinn::Connection, grants: &AtomicU32, ev: InputEvent) {
+    let grants = grants.load(std::sync::atomic::Ordering::Relaxed);
+    if grants & crate::quic::classify(ev.kind).bit() != 0 {
         let _ = conn.send_datagram(ev.encode().to_vec().into());
     }
 }
@@ -102,6 +114,7 @@ fn sync_mouse(
 /// One seq-stamped snapshot per pad flagged in `dirty`; clears the flags.
 fn flush_dirty(
     conn: &quinn::Connection,
+    grants: &AtomicU32,
     pads: &mut [Option<GamepadSnapshot>; MAX_PADS],
     seq: &mut [u8; MAX_PADS],
     dirty: &mut [bool; MAX_PADS],
@@ -113,7 +126,7 @@ fn flush_dirty(
         if let Some(snap) = pads[idx].as_mut() {
             seq[idx] = seq[idx].wrapping_add(1);
             snap.seq = seq[idx];
-            let _ = conn.send_datagram(snap.to_event().encode().to_vec().into());
+            send_granted(conn, grants, snap.to_event());
         }
     }
 }
@@ -184,7 +197,7 @@ pub(super) async fn run(
                     if matches!(ev.kind, InputKind::GamepadButton | InputKind::GamepadAxis)
                         && mouse.is_on(idx)
                     {
-                        flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
+                        flush_dirty(&conn, &mouse_args.grants, &mut pads, &mut seq, &mut dirty);
                         let grants = mouse_args.grants.load(Ordering::Relaxed);
                         send_all(&conn, &mut scroll_out, &mouse_args, mouse.fold(idx, &ev, grants));
                         continue;
@@ -208,7 +221,7 @@ pub(super) async fn run(
                         continue;
                     }
                     // Anything else goes out behind the snapshots folded so far.
-                    flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
+                    flush_dirty(&conn, &mouse_args.grants, &mut pads, &mut seq, &mut dirty);
                     if gamepad_snapshots && ev.kind == InputKind::GamepadRemove && idx < MAX_PADS {
                         // Seq-stamped removal in the shared seq space so no reorder resurrects
                         // the pad. Arm the burst; drop owed arrival (a re-plug sends its own).
@@ -221,7 +234,7 @@ pub(super) async fn run(
                             flags: crate::input::encode_gamepad_remove(idx as u8, seq[idx]),
                             ..ev
                         };
-                        let _ = conn.send_datagram(rem.encode().to_vec().into());
+                        send_granted(&conn, &mouse_args.grants, rem);
                         continue;
                     }
                     if gamepad_snapshots && ev.kind == InputKind::GamepadArrival {
@@ -241,13 +254,13 @@ pub(super) async fn run(
                                 flags: arrival_flags(idx),
                                 ..ev
                             };
-                            let _ = conn.send_datagram(arr.encode().to_vec().into());
+                            send_granted(&conn, &mouse_args.grants, arr);
                             continue;
                         }
                     }
                     send_input(&conn, &mut scroll_out, &mouse_args, ev);
                 }
-                flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
+                flush_dirty(&conn, &mouse_args.grants, &mut pads, &mut seq, &mut dirty);
                 if !mouse.moving() {
                     last_mouse_tick = None;
                 }
@@ -258,7 +271,7 @@ pub(super) async fn run(
             }
             _ = mouse_args.shared.changed.notified() => {
                 sync_mouse(&conn, &mut mouse, &mouse_args, &mut scroll_out, &mut pads, &mut dirty);
-                flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
+                flush_dirty(&conn, &mouse_args.grants, &mut pads, &mut seq, &mut dirty);
                 if !mouse.moving() {
                     last_mouse_tick = None;
                 }
@@ -296,7 +309,7 @@ pub(super) async fn run(
                                 y: 0,
                                 flags: arrival_flags(idx),
                             };
-                            let _ = conn.send_datagram(arr.encode().to_vec().into());
+                            send_granted(&conn, &mouse_args.grants, arr);
                         } else {
                             arrival_owed[idx] = 0;
                         }
@@ -315,10 +328,10 @@ pub(super) async fn run(
                             y: 0,
                             flags: crate::input::encode_gamepad_remove(idx as u8, seq[idx]),
                         };
-                        let _ = conn.send_datagram(rem.encode().to_vec().into());
+                        send_granted(&conn, &mouse_args.grants, rem);
                     }
                 }
-                flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
+                flush_dirty(&conn, &mouse_args.grants, &mut pads, &mut seq, &mut dirty);
             }
         }
     }
@@ -349,9 +362,13 @@ mod tests {
     }
 
     fn mouse_args(shared: &Arc<PadMouseShared>) -> MouseArgs {
+        granted_args(shared, crate::quic::GRANT_ALL)
+    }
+
+    fn granted_args(shared: &Arc<PadMouseShared>, grants: u32) -> MouseArgs {
         MouseArgs {
             shared: shared.clone(),
-            grants: Arc::new(AtomicU32::new(crate::quic::GRANT_ALL)),
+            grants: Arc::new(AtomicU32::new(grants)),
             mode: Arc::new(std::sync::Mutex::new(Mode {
                 width: 1920,
                 height: 1080,
@@ -359,6 +376,17 @@ mod tests {
             })),
             scroll_invert: Arc::new(AtomicBool::new(false)),
             normalized_scroll: true,
+        }
+    }
+
+    fn key_down(vk: u32) -> InputEvent {
+        InputEvent {
+            kind: InputKind::KeyDown,
+            _pad: [0; 3],
+            code: vk,
+            x: 0,
+            y: 0,
+            flags: 0,
         }
     }
 
@@ -434,6 +462,58 @@ mod tests {
             (InputKind::KeyUp, 0x1B),
             "leaving releases Escape"
         );
+        task.abort();
+    }
+
+    /// A controller-only session sends its pad and never the key queued ahead of it.
+    #[tokio::test]
+    async fn a_key_without_the_keyboard_grant_stays_off_the_wire() {
+        let (_server, client_conn, host_conn) = loopback().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let caps = Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
+        let shared = Arc::new(PadMouseShared::default());
+        let args = granted_args(&shared, crate::quic::GRANT_GAMEPAD);
+        let task = tokio::spawn(run(client_conn, rx, true, false, caps, args));
+
+        tx.send(key_down(0x41)).unwrap();
+        tx.send(button(gamepad::BTN_A, 0)).unwrap();
+        let first = next_event(&host_conn, &[]).await;
+        let snap = GamepadSnapshot::from_event(&first).expect("the pad, not the key");
+        assert_eq!((snap.pad, snap.buttons), (0, gamepad::BTN_A));
+        task.abort();
+    }
+
+    /// Without the gamepad grant a pad sends nothing, but a controller-mouse pad still
+    /// drives keys: the gate runs after the fold.
+    #[tokio::test]
+    async fn a_pad_without_the_gamepad_grant_only_reaches_the_host_as_a_mouse() {
+        let (_server, client_conn, host_conn) = loopback().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let caps = Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
+        let shared = Arc::new(PadMouseShared::default());
+        shared.request(1);
+        let grants = crate::quic::GRANT_POINTER | crate::quic::GRANT_KEYBOARD;
+        let task = tokio::spawn(run(
+            client_conn,
+            rx,
+            true,
+            false,
+            caps,
+            granted_args(&shared, grants),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tx.send(button(gamepad::BTN_B, 0)).unwrap();
+        tx.send(button(gamepad::BTN_A, 1)).unwrap();
+        tx.send(key_down(0x41)).unwrap();
+        for want in [0x1B, 0x41] {
+            let ev = next_event(&host_conn, &[]).await;
+            assert_eq!(
+                (ev.kind, ev.code),
+                (InputKind::KeyDown, want),
+                "no pad snapshot"
+            );
+        }
         task.abort();
     }
 
