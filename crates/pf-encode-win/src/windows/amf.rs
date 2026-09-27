@@ -27,8 +27,9 @@ use std::sync::{Arc, Mutex};
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC,
@@ -763,14 +764,15 @@ struct Inner {
     ctx: Ctx,
     /// Capturer device — kept alive for the ring textures.
     _device: ID3D11Device,
-    /// Immediate context for the ring copy (this encode thread only).
+    /// Immediate context for the ring copy. The AMF runtime uses it too, so it runs
+    /// multithread-protected.
     dctx: ID3D11DeviceContext,
     ring: Vec<ID3D11Texture2D>,
     next: usize,
     /// A reference to every texture AMF may still be reading, newest last, capped at [`RING`].
-    /// `CreateSurfaceFromDX11Native` wraps without owning, so nothing else keeps a caller's
-    /// texture alive for the encode; in-flight is never more than `RING`, so the last `RING`
-    /// entries always cover whatever the hardware is on. Encode thread only.
+    /// The AMF docs do not say whether `CreateSurfaceFromDX11Native` AddRefs the texture it
+    /// wraps, so this keeps it alive; in-flight is never more than `RING`, so the last `RING`
+    /// entries always cover whatever the hardware is on. Emptied only after Terminate.
     held: VecDeque<ID3D11Texture2D>,
     /// Last `*InHDRMetadata` pushed to this component — re-push on change or rebuild.
     hdr_pushed: Option<pf_frame::HdrMeta>,
@@ -867,8 +869,10 @@ pub struct AmfEncoder {
     resets_without_output: u32,
 }
 
-// SAFETY: raw AMF pointers and D3D11 COM handles are not auto-`Send`. The session moves the
-// encoder onto one encode thread and drives it there; the immediate context is never shared.
+// SAFETY: raw AMF pointers are not auto-`Send`. AMF objects have no thread affinity, and every
+// call on this encoder runs on the one thread that owns it; only the retrieve thread shares the
+// component (see `Retrieve`). The immediate context it shares with the AMF runtime is
+// multithread-protected in `ensure_inner`.
 unsafe impl Send for AmfEncoder {}
 
 impl AmfEncoder {
@@ -1219,6 +1223,14 @@ impl AmfEncoder {
                 bail!("AMF CreateContext returned null");
             }
             let ctx = Ctx(ctx);
+            let dctx = device
+                .GetImmediateContext()
+                .context("ID3D11Device immediate context")?;
+            // The AMF runtime drives this immediate context from its own threads (the retrieve
+            // thread's QueryOutput included) while this thread copies into the ring on it.
+            if let Ok(mt) = dctx.cast::<ID3D11Multithread>() {
+                let _ = mt.SetMultithreadProtected(true);
+            }
             amf_ok(
                 ((*(*ctx.0).vtbl).init_dx11)(ctx.0, device.as_raw(), sys::AMF_DX11_1),
                 "AMF InitDX11 (capturer device)",
@@ -1283,9 +1295,6 @@ impl AmfEncoder {
                     .context("CreateTexture2D (AMF input ring)")?;
                 ring.push(t.context("AMF input ring texture")?);
             }
-            let dctx = device
-                .GetImmediateContext()
-                .context("ID3D11Device immediate context")?;
             // Bump after successful Init so a failed bring-up never counts.
             let context_no =
                 AMF_CONTEXTS_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1748,9 +1757,9 @@ impl AmfEncoder {
         let slot = inner.next % RING;
         inner.next += 1;
         // SAFETY: `src`/`dst` are same-format, same-size, same-device (ring rebuilt on device
-        // change). `CopySubresourceRegion` on this thread's immediate context is a valid GPU copy.
-        // `CreateSurfaceFromDX11Native` wraps without owning (null observer); the surface moves
-        // into `OwnedData`. AMF AddRefs what it keeps, so our release does not free a buffer in flight.
+        // change). `CopySubresourceRegion` on the protected immediate context is a valid GPU copy.
+        // The surface moves into `OwnedData`; SubmitInput takes the component's own reference, so
+        // our release frees nothing in flight. `held` keeps the texture under it alive.
         unsafe {
             // The texture the hardware will read: the caller's own when it declared a depth deep
             // enough to leave it alone, else our copy of it.
@@ -1764,7 +1773,7 @@ impl AmfEncoder {
                     .CopySubresourceRegion(&dst, 0, 0, 0, 0, &src, 0, None);
                 inner.ring[slot].clone()
             };
-            // Nothing else keeps it alive for the encode (see `Inner::held`).
+            // Kept alive until its AU is out (see `Inner::held`).
             inner.held.push_back(source.clone());
             while inner.held.len() > RING {
                 inner.held.pop_front();
@@ -2083,15 +2092,17 @@ impl Encoder for AmfEncoder {
         // very component, and a re-Init under it would run against a terminated one.
         inner.retrieve.stop_and_join();
         inner.retrieve.reset_queues(); // owed AUs forfeited; rebuilt stream restarts at IDR
-        inner.held.clear(); // the joined thread proves nothing is reading them
         inner.next = 0; // the rebuilt component's first frame is `opening` again
         inner.hdr_pushed = None; // re-Init'd component needs HDR metadata again
-                                 // SAFETY: live component, encode thread, no AMF call in flight. Flush/Terminate are
-                                 // legal on a wedge (results ignored); apply_static_props + init rebuild it.
+
+        // SAFETY: live component, encode thread, no AMF call in flight. Flush/Terminate are
+        // legal on a wedge (results ignored); apply_static_props + init rebuild it.
         let rebuilt = unsafe {
             let comp = inner.comp.0;
             ((*(*comp).vtbl).flush)(comp);
             ((*(*comp).vtbl).terminate)(comp);
+            // VCN may read an input surface until Terminate returns; only then can they go.
+            inner.held.clear();
             let fmt = if self.ten_bit {
                 sys::AMF_SURFACE_P010
             } else {
