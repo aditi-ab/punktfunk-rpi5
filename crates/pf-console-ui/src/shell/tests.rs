@@ -6,16 +6,16 @@ fn the_os_field_compiles_for_both_modes() {
         let t = crate::os_theme::OsTheme {
             light,
             background: if light {
-                (0.99, 0.96, 0.89)
+                crate::os_theme::Rgb(0.99, 0.96, 0.89)
             } else {
-                (0.02, 0.04, 0.12)
+                crate::os_theme::Rgb(0.02, 0.04, 0.12)
             },
             foreground: if light {
-                (0.36, 0.42, 0.45)
+                crate::os_theme::Rgb(0.36, 0.42, 0.45)
             } else {
-                (1.0, 0.81, 0.68)
+                crate::os_theme::Rgb(1.0, 0.81, 0.68)
             },
-            accent: (0.49, 0.51, 0.85),
+            accent: crate::os_theme::Rgb(0.49, 0.51, 0.85),
         };
         build_mesh_os(&t).unwrap();
     }

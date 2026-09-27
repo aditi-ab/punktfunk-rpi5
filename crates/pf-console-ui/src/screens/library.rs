@@ -2067,6 +2067,7 @@ mod tests {
     use super::*;
     use crate::library::POSTER_W;
     use crate::screens::Screen;
+    use crate::theme::{contrast, over};
 
     #[test]
     fn a_cover_already_at_cache_size_decodes_here_with_mips() {
@@ -2638,25 +2639,6 @@ mod tests {
         s.art.insert("g1".into(), surface.image_snapshot());
         s.arm_entrance(4.05);
         assert!(s.entrance_armed, "a decoded poster is the whole point");
-    }
-
-    fn over(src: Color4f, dst: Color4f) -> Color4f {
-        let m = |s: f32, d: f32| s * src.a + d * (1.0 - src.a);
-        Color4f::new(m(src.r, dst.r), m(src.g, dst.g), m(src.b, dst.b), 1.0)
-    }
-
-    /// WCAG contrast: sRGB → linear, Rec. 709 luminance.
-    fn contrast(a: Color4f, b: Color4f) -> f32 {
-        let lin = |c: f32| {
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        let lum = |c: Color4f| 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
-        let (x, y) = (lum(a), lum(b));
-        (x.max(y) + 0.05) / (x.min(y) + 0.05)
     }
 
     /// Coverless monogram vs face must contrast on every palette. Side cards overlap: alpha leaks.

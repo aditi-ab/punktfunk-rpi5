@@ -2229,16 +2229,17 @@ fn build_mesh(palette_id: &str) -> Result<MeshLook> {
 /// Follow-system field: a quiet ramp from the theme's own colours, not the
 /// curated hue arcs. The desk colour is the point.
 fn build_mesh_os(t: &crate::os_theme::OsTheme) -> Result<MeshLook> {
-    use crate::os_theme::mix;
+    use crate::os_theme::Rgb;
     let (bg, fg, ac) = (t.background, t.foreground, t.accent);
     // A pale field shades toward its text colour, not black: darkening a pastel strands
     // dark ink on it (see `theme::Ink` scrim).
     let stops = if t.light {
-        [mix(bg, fg, 0.10), mix(bg, ac, 0.18), bg]
+        [bg.mix(fg, 0.10), bg.mix(ac, 0.18), bg]
     } else {
-        [mix(bg, (0.0, 0.0, 0.0), 0.35), mix(bg, ac, 0.30), bg]
+        [bg.mix(Rgb(0.0, 0.0, 0.0), 0.35), bg.mix(ac, 0.30), bg]
     };
-    compile_mesh(&stops, crate::theme::Ink::of_os(t), bg)
+    let rgb = |Rgb(r, g, b)| (r, g, b);
+    compile_mesh(&stops.map(rgb), crate::theme::Ink::of_os(t), rgb(bg))
 }
 
 fn compile_mesh(

@@ -49,9 +49,9 @@ pub fn run(target: Option<&str>) -> u8 {
         std::thread::spawn(|| loop {
             let t = pf_client_core::omarchy::current().map(|t| pf_console_ui::os_theme::OsTheme {
                 light: !t.dark,
-                background: (t.bg.0, t.bg.1, t.bg.2),
-                foreground: (t.fg.0, t.fg.1, t.fg.2),
-                accent: (t.accent.0, t.accent.1, t.accent.2),
+                background: t.bg,
+                foreground: t.fg,
+                accent: t.accent,
             });
             // The revision only moves on a real change, so the idle case is one file read.
             pf_console_ui::os_theme::set_os_theme(t);

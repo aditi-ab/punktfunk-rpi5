@@ -1230,9 +1230,9 @@ fn the_follow_system_row_exists_only_where_a_theme_is_published() {
 
         let t = crate::os_theme::OsTheme {
             light: false,
-            background: (0.02, 0.04, 0.12),
-            foreground: (1.0, 0.81, 0.68),
-            accent: (0.49, 0.51, 0.85),
+            background: crate::os_theme::Rgb(0.02, 0.04, 0.12),
+            foreground: crate::os_theme::Rgb(1.0, 0.81, 0.68),
+            accent: crate::os_theme::Rgb(0.49, 0.51, 0.85),
         };
         crate::os_theme::set_os_theme(Some(t));
         let rev = crate::os_theme::os_theme().0;
