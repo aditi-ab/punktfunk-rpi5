@@ -16,7 +16,7 @@ These links are the **stable** channel. For builds of `main`, see [Release Chann
 | Steam Deck | [Decky plugin](/docs/steam-deck) for Gaming Mode, [Flatpak](#steam-deck) for Desktop Mode |
 | Windows 10 or 11 (x64, Arm64) | [Installer](#windows) |
 | Mac (macOS 14+) | [`.dmg`](#macos) |
-| iPhone, iPad, Apple TV (17+) | [TestFlight](#ios-ipados-apple-tv) |
+| iPhone, iPad, Apple TV (17+) | [App Store](#ios-ipados-apple-tv) |
 | Android 9+ phone or TV | [Google Play or APK](#android) |
 | LG webOS TV | [Community client](#lg-webos-tv-community) |
 | Anything else | [Moonlight](/docs/moonlight) |
@@ -92,9 +92,11 @@ The Mac app is also in the [TestFlight beta](https://testflight.apple.com/join/Q
 
 ## iOS, iPadOS, Apple TV
 
-Install Apple's [TestFlight](https://apps.apple.com/app/testflight/id899247664) app, then
-**[join the Punktfunk beta](https://testflight.apple.com/join/Qr7uSemk)**. One build covers iPhone,
-iPad, Apple TV and Mac.
+**[Get Punktfunk on the App Store](https://apps.apple.com/app/id6779991756)**. One app covers
+iPhone, iPad and Apple TV.
+
+For beta builds, install Apple's [TestFlight](https://apps.apple.com/app/testflight/id899247664)
+app, then [join the Punktfunk beta](https://testflight.apple.com/join/Qr7uSemk).
 
 ## Android
 
@@ -135,7 +137,7 @@ A client and a host don't need the same version. To update the host, see [Updati
 | Windows installer | Run the newer installer. Hosts and pairing are kept. |
 | Windows MSIX or portable | Add the newer `.msix`, or unzip the newer build over the old one |
 | macOS `.dmg` | Drag the newer app over the old one |
-| iPhone, iPad, Apple TV | TestFlight |
+| iPhone, iPad, Apple TV | App Store, or TestFlight for the beta |
 | Android | Google Play. For the APK, install the newer one over it. |
 | Steam Deck (Decky) | The panel's update button: [Steam Deck → Updating](/docs/steam-deck#updating) |
 | LG webOS | Install the newer `.ipk` |

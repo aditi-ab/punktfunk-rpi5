@@ -29,7 +29,7 @@ always one minor version ahead of stable, so going back to stable is a downgrade
 | **Decky plugin** | `…/generic/punktfunk-decky/canary/punktfunk.zip` | `…/generic/punktfunk-decky/latest/punktfunk.zip` |
 | **Windows host and client** | `canary/` in the download URL, e.g. `…/generic/punktfunk-host-windows/canary/punktfunk-host-setup.exe` | `latest/` in the URL, the releases page, or winget |
 | **Android** | Google Play open testing, or `…/generic/punktfunk-android/canary/punktfunk-android.apk` | [Google Play](https://play.google.com/store/apps/details?id=io.unom.punktfunk), or `latest/` |
-| **Apple** | TestFlight | TestFlight, and the `.dmg` on the releases page |
+| **Apple** | TestFlight | [App Store](https://apps.apple.com/app/id6779991756) for iPhone, iPad and Apple TV; the `.dmg` on the releases page for the Mac |
 
 The [releases page](https://git.unom.io/unom/punktfunk/releases) and winget carry stable only.
 

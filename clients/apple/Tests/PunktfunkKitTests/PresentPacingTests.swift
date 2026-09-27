@@ -380,40 +380,85 @@ final class PresentPacingTests: XCTestCase {
 
     // MARK: - Present policy
 
-    /// Latency presents on arrival, V-Sync schedules on the grid, the smoothness store takes one
-    /// frame per slot, and the env knob overrides each for A/B.
+    /// V-Sync schedules on the grid, adaptive slots need the latency path with V-Sync off, the
+    /// smoothness store takes one frame per slot, and the env knob overrides each for A/B.
     func testPresentPolicyResolution() {
-        func policy(_ env: String?, vsync: Bool = false, vsyncPaced: Bool = false) -> PresentPolicy {
-            PresentPolicy.resolve(env: env, vsync: vsync, vsyncPaced: vsyncPaced)
+        func policy(
+            _ env: String?, vsync: Bool = false, vsyncPaced: Bool = false,
+            adaptive: Bool = false
+        ) -> PresentPolicy {
+            PresentPolicy.resolve(
+                env: env, vsync: vsync, vsyncPaced: vsyncPaced, adaptiveSlotPaced: adaptive)
         }
-        let arrival = policy(nil)
-        XCTAssertEqual(arrival, PresentPolicy(fixedSlot: false, fixedVsync: false))
-        XCTAssertEqual(arrival.label(.arrival), "immediate")
-        XCTAssertEqual(policy("garbage"), arrival, "an unknown mode is no mode")
+        let adaptive = policy(nil, adaptive: true)
+        XCTAssertEqual(adaptive, PresentPolicy(adaptiveSlot: true, fixedSlot: false, fixedVsync: false))
+        XCTAssertEqual(adaptive.label(.arrival), "adaptive")
+        XCTAssertEqual(policy("garbage", adaptive: true), adaptive, "an unknown mode is no mode")
 
-        let vsync = policy(nil, vsync: true)
-        XCTAssertEqual(vsync, PresentPolicy(fixedSlot: false, fixedVsync: true))
+        let vsync = policy(nil, vsync: true, adaptive: true)
+        XCTAssertEqual(vsync, PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: true))
         XCTAssertEqual(vsync.label(.arrival), "vsync")
 
         let smooth = policy(nil, vsyncPaced: true)
-        XCTAssertEqual(smooth, PresentPolicy(fixedSlot: true, fixedVsync: false))
+        XCTAssertEqual(smooth, PresentPolicy(adaptiveSlot: false, fixedSlot: true, fixedVsync: false))
         XCTAssertEqual(smooth.label(.arrival), "slot")
 
-        XCTAssertEqual(policy("slot"), PresentPolicy(fixedSlot: true, fixedVsync: false))
-        let immediate = policy("immediate", vsync: true)
-        XCTAssertEqual(immediate, PresentPolicy(fixedSlot: false, fixedVsync: false))
+        XCTAssertEqual(
+            policy("slot", adaptive: true),
+            PresentPolicy(adaptiveSlot: false, fixedSlot: true, fixedVsync: false))
+        let immediate = policy("immediate", vsync: true, adaptive: true)
+        XCTAssertEqual(
+            immediate, PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: false))
         XCTAssertEqual(immediate.label(.arrival), "immediate")
-        XCTAssertEqual(policy("vsync"), PresentPolicy(fixedSlot: false, fixedVsync: true))
+        XCTAssertEqual(
+            policy("vsync", adaptive: true),
+            PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: true))
 
         // The other pacings name themselves; the display-link policy doesn't apply there.
-        XCTAssertEqual(vsync.label(.glass), "glass")
-        XCTAssertEqual(arrival.label(.deadline), "deadline")
-        XCTAssertEqual(arrival.label(.decoded), "decoded")
+        XCTAssertEqual(adaptive.label(.glass), "glass")
+        XCTAssertEqual(adaptive.label(.deadline), "deadline")
+        XCTAssertEqual(adaptive.label(.decoded), "decoded")
+    }
+
+    // MARK: - macOS adaptive display
+
+    #if os(macOS)
+    func testAdaptiveSlotPacingResolution() {
+        XCTAssertTrue(SessionPresenter.adaptiveSlotPaced(
+            adaptiveSync: true, priority: .latency, pacing: .arrival))
+        XCTAssertFalse(SessionPresenter.adaptiveSlotPaced(
+            adaptiveSync: false, priority: .latency, pacing: .arrival))
+        XCTAssertFalse(SessionPresenter.adaptiveSlotPaced(
+            adaptiveSync: true, priority: .smooth(buffer: 2), pacing: .arrival))
+        XCTAssertFalse(SessionPresenter.adaptiveSlotPaced(
+            adaptiveSync: true, priority: .latency, pacing: .glass))
+    }
+
+    func testAdaptiveSlotRegimeUsesSparseImmediateAndDenseSlots() {
+        var sparse = AdaptiveSlotRegime()
+        XCTAssertTrue(sparse.update(ptsNs: 1_000_000_000))
+        XCTAssertFalse(sparse.update(ptsNs: 1_028_571_429))
+        XCTAssertFalse(sparse.update(ptsNs: 1_028_571_429), "a put-back is not a new sample")
+
+        var dense = AdaptiveSlotRegime()
+        XCTAssertTrue(dense.update(ptsNs: 1_000_000_000))
+        XCTAssertTrue(dense.update(ptsNs: 1_016_666_667))
+
+        var hitched = AdaptiveSlotRegime()
+        XCTAssertTrue(hitched.update(ptsNs: 1_000_000_000))
+        XCTAssertTrue(hitched.update(ptsNs: 1_008_333_333))
+        XCTAssertTrue(hitched.update(ptsNs: 1_058_333_333), "one capped hitch keeps slots")
+
+        var recoveryPts: UInt64 = 1_028_571_429
+        for _ in 0..<4 {
+            recoveryPts += 16_666_667
+            _ = sparse.update(ptsNs: recoveryPts)
+        }
+        XCTAssertTrue(sparse.isSlotted, "sustained 60 fps returns to slots")
     }
 
     // MARK: - pf-present glass metrics
 
-    #if os(macOS)
     /// Fixed 240 Hz: intervals are multiples of the refresh. Adaptive 24–120 Hz with an 8.33 ms
     /// step: 1 = the fastest refresh, 3 = 25 ms, 4 = 33 ms — the 35 fps alternation.
     func testPanelGridUnits() {
