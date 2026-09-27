@@ -16,8 +16,9 @@
 //! [`sync`] keeps 47999 closed until the first pairing and tears it down when the last
 //! one is removed. Pairing itself is HTTPS on nvhttp, never this port.
 
-use super::{AppState, LaunchSession, CONTROL_PORT};
+use super::{LaunchSession, CONTROL_PORT};
 use crate::events::Plane;
+use crate::host::AppState;
 use crate::inject::gamepad::GamepadManager;
 use crate::session_status::GrantDrops;
 use anyhow::{anyhow, Context, Result};
@@ -184,7 +185,7 @@ impl SessionPads {
 /// Bind 47999 while any pairing exists, close it when none remain. Call wherever the
 /// paired list changes (startup, pairing phase 4, unpair); race-free via [`Gate::running`].
 pub(crate) fn sync(state: &Arc<AppState>) -> Result<()> {
-    let gate = &state.control_gate;
+    let gate = &state.gs.control_gate;
     if !gate.enabled.load(Ordering::SeqCst) {
         return Ok(());
     }
@@ -571,7 +572,7 @@ impl ControlPeer {
         let mut out: Vec<Vec<u8>> = Vec::new();
         // HDR-mode (0x010e / `IDX_HDR_MODE`) follows the frames the video thread encodes,
         // off again when they turn SDR. Stock Moonlight switches the TV only on this cue.
-        let encoded_hdr = *state.video_hdr.lock().unwrap();
+        let encoded_hdr = *state.gs.video_hdr.lock().unwrap();
         if encoded_hdr != self.hdr_signalled {
             let meta = encoded_hdr.or(self.hdr_signalled).unwrap_or_default();
             let pt = hdr_mode_plaintext(encoded_hdr.is_some(), &meta);

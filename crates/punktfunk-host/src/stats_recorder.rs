@@ -1,5 +1,5 @@
 //! Shared streaming-stats recorder (`design/stats-capture-plan.md`). One
-//! [`StatsRecorder`] is created in `gamestream::serve` and shared with
+//! [`StatsRecorder`] is created in `host::serve` and shared with
 //! [`crate::mgmt`] and the native / GameStream encode loops.
 //!
 //! Captures persist as JSON under the captures dir and survive a host restart.

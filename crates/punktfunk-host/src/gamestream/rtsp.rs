@@ -14,8 +14,9 @@
 
 use super::audio;
 use super::stream::{self, StreamConfig};
-use super::{AppState, LaunchSession, AUDIO_PORT, CONTROL_PORT, RTSP_PORT, VIDEO_PORT};
+use super::{LaunchSession, AUDIO_PORT, CONTROL_PORT, RTSP_PORT, VIDEO_PORT};
 use crate::encode::Codec;
+use crate::host::AppState;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -274,13 +275,13 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
             match stream_config(&map) {
                 Some(cfg) => {
                     tracing::info!(?cfg, "RTSP ANNOUNCE — negotiated stream config");
-                    *state.stream.lock().unwrap() = Some(cfg);
+                    *state.gs.stream.lock().unwrap() = Some(cfg);
                 }
                 None => tracing::warn!("RTSP ANNOUNCE — missing required video config keys"),
             }
             let ap = audio_params(&map, gs_encryption_offer());
             tracing::info!(?ap, "RTSP ANNOUNCE — negotiated audio params");
-            *state.audio_params.lock().unwrap() = ap;
+            *state.gs.audio_params.lock().unwrap() = ap;
             response(&req.cseq, &[], None)
         }
         "PLAY" => {
@@ -288,7 +289,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 tracing::warn!(?peer, "RTSP PLAY — refused: not the paired `/launch` owner");
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
             };
-            let cfg = *state.stream.lock().unwrap();
+            let cfg = *state.gs.stream.lock().unwrap();
             // Ends the whole session (both planes + launch). One plane detecting a
             // dead client must not leave the other streaming or a stale launch.
             let on_lost: super::OnSessionLost = {
@@ -308,10 +309,10 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                         state.force_idr.clone(),
                         state.rfi_range.clone(),
                         state.loss_stats.clone(),
-                        state.video_hdr.clone(),
+                        state.gs.video_hdr.clone(),
                         // Rikey reaches the video plane only when `SS_ENC_VIDEO` was negotiated.
                         cfg.encrypt_video.then_some(ls.gcm_key),
-                        state.video_cap.clone(),
+                        state.gs.video_cap.clone(),
                         state.stats.clone(),
                         on_lost.clone(),
                         state.media_exited.clone(),
@@ -320,7 +321,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                         // distinction as the native close code; teardown policy keys off it.
                         stream::GameLifetime {
                             quit: state.quit.clone(),
-                            preempted: state.preempted.clone(),
+                            preempted: state.gs.preempted.clone(),
                             fingerprint: ls.owner_fp.map(hex::encode),
                             owner_ip: ls.peer_ip,
                             av_ping: state.av_ping_payload(),
@@ -340,7 +341,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
             // its Opus payload is AES-CBC sealed.
             if !state.audio_streaming.swap(true, Ordering::SeqCst) {
                 tracing::info!("RTSP PLAY — starting audio stream");
-                let params = *state.audio_params.lock().unwrap();
+                let params = *state.gs.audio_params.lock().unwrap();
                 audio::start(
                     state.audio_streaming.clone(),
                     params.encrypt.then_some(ls.gcm_key),

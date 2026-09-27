@@ -55,15 +55,15 @@ pub type PooledCapturer = (Box<dyn Capturer>, bool, bool, Option<String>);
 pub type CapturerSlot = Arc<std::sync::Mutex<Option<PooledCapturer>>>;
 
 /// A pending client reference-frame-invalidation range (lost `firstFrame..=lastFrame`), set by the
-/// control plane and drained by the video thread (see [`AppState::rfi_range`](super::AppState)).
+/// control plane and drained by the video thread (see [`AppState::rfi_range`](crate::host::AppState::rfi_range)).
 pub type RfiSlot = Arc<std::sync::Mutex<Option<(i64, i64)>>>;
 
 /// Game-lifetime wiring spent by the stream thread (`design/session-game-lifetime.md`).
 /// The control plane builds these from live `AppState` at RTSP PLAY; they only exist together.
 pub struct GameLifetime {
-    /// [`super::AppState::quit`]: a decision may end the game; a drop gets a reconnect window.
+    /// [`crate::host::AppState::quit`]: a decision may end the game; a drop gets a reconnect window.
     pub quit: Arc<AtomicBool>,
-    /// [`super::AppState::preempted`]: the stop flag admission raises on a steal.
+    /// [`super::GsState::preempted`]: the stop flag admission raises on a steal.
     pub preempted: Arc<AtomicBool>,
     /// Paired client's cert fingerprint; only it can reclaim the launch. `None` if unread.
     pub fingerprint: Option<String>,

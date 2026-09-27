@@ -335,7 +335,7 @@ pub(crate) async fn serve(
         );
         None
     } else {
-        match crate::gamestream::Host::detect() {
+        match crate::host::Host::detect() {
         Ok(h) => crate::discovery::advertise_native(
             &h.hostname,
             opts.port,

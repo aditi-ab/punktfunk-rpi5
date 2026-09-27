@@ -125,6 +125,8 @@ mod gamestream;
 #[path = "linux/gpuclocks.rs"]
 mod gpuclocks;
 mod hooks;
+// What every plane shares: host facts, session state, `serve`.
+mod host;
 // Launch holds: plugins and hooks that act before a game starts.
 mod holds;
 // Network-facing; same `forbid` as `mod mgmt`. Tests mutate process env (`set_var` is unsafe in 2024).
@@ -459,7 +461,7 @@ fn real_main() -> Result<()> {
             pf_host_config::mark_started();
             // Must run before any new session touches the topology.
             windows::entry::serve_startup_recover();
-            gamestream::serve(mgmt_opts, native, gamestream)
+            host::serve(mgmt_opts, native, gamestream)
         }
         Some("detect-conflicts") => {
             let found = detect::scan();

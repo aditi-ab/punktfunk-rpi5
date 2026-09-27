@@ -33,7 +33,8 @@ use crate::encode::Codec;
 #[cfg(feature = "gamestream")]
 use crate::gamestream::cert::ServerIdentity;
 use crate::gamestream::tls::{PeerAddr, PeerCertFingerprint};
-use crate::gamestream::{Host, LaunchSession, HTTPS_PORT, HTTP_PORT};
+use crate::gamestream::{LaunchSession, HTTPS_PORT, HTTP_PORT};
+use crate::host::Host;
 use axum::body::Body;
 use axum::http::StatusCode;
 use http_body_util::BodyExt;
@@ -65,15 +66,12 @@ fn test_state() -> Arc<AppState> {
         os_chain: "linux/arch/steamos".into(),
         os_name: "SteamOS".into(),
     };
-    #[cfg(feature = "gamestream")]
-    {
-        let identity = ServerIdentity::ephemeral().expect("ephemeral identity");
-        Arc::new(AppState::new(host, identity, test_stats()))
-    }
-    #[cfg(not(feature = "gamestream"))]
-    {
-        Arc::new(AppState::new(host, test_stats()))
-    }
+    Arc::new(AppState::new(
+        host,
+        test_stats(),
+        #[cfg(feature = "gamestream")]
+        crate::gamestream::GsState::new(ServerIdentity::ephemeral().expect("ephemeral identity")),
+    ))
 }
 
 /// One identified plugin, so the id-scoped routes have something to accept and something to

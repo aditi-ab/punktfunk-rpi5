@@ -14,7 +14,8 @@
 //! unauthenticated (the spec is in-tree). Default bind is all interfaces;
 //! `--mgmt-bind 127.0.0.1:47990` restores loopback-only.
 
-use crate::gamestream::{tls::serve_https, AppState};
+use crate::gamestream::tls::serve_https;
+use crate::host::AppState;
 use anyhow::{Context, Result};
 use axum::{middleware, routing::get, Json, Router};
 use std::net::SocketAddr;

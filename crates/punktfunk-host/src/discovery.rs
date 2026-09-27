@@ -70,7 +70,7 @@ const IP_RECHECK: Duration = Duration::from_secs(10);
 
 /// Loopback only while the machine still has none.
 fn current_ip() -> IpAddr {
-    crate::gamestream::primary_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+    crate::host::primary_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
 /// Register `build(ip)` for the current address and again whenever it changes. Shared by
