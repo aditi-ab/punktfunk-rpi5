@@ -410,29 +410,6 @@ pub(crate) fn draw_poster_placeholder(
     );
 }
 
-/// Stream `h` itself, launching nothing — asking a host to launch what it is already
-/// showing is how a second copy starts. The takeover names the running game when there
-/// is one, the host otherwise; a pinned card's preset rides along.
-fn desk_intent(h: &HostRow) -> ConnectIntent {
-    let subject = if h.running.is_empty() {
-        &h.name
-    } else {
-        &h.running
-    };
-    ConnectIntent {
-        addr: h.addr.clone(),
-        port: h.port,
-        fp_hex: h.fp_hex.clone(),
-        launch: None,
-        title: match &h.pin {
-            Some(p) => format!("{subject} \u{b7} {}", p.name),
-            None => subject.clone(),
-        },
-        request_access: false,
-        preset: h.pin.as_ref().map(|p| p.id.clone()),
-    }
-}
-
 /// Write `library_sort` only. Screens re-read it each frame; assigning the field reverts.
 pub(super) fn store_sort(sort: crate::collate::SortKey, ctx: &mut Ctx) {
     ctx.write(|c| {
@@ -1059,26 +1036,16 @@ impl LibraryScreen {
         }
     }
 
-    /// This shelf's host itself ([`desk_intent`]).
+    /// This shelf's host itself, launching nothing — asking a host to launch what it is
+    /// already showing is how a second copy starts.
     fn desktop_intent(&self) -> ConnectIntent {
-        desk_intent(&self.host)
+        ConnectIntent::to_host(&self.host, None)
     }
 
     /// Launch `g` on this shelf's host. Pinned card: that preset as a one-off; primary
     /// tile: the host's default.
     fn launch_intent(&self, g: &LibraryGame) -> ConnectIntent {
-        ConnectIntent {
-            addr: self.host.addr.clone(),
-            port: self.host.port,
-            fp_hex: self.host.fp_hex.clone(),
-            launch: Some(g.id.clone()),
-            title: match &self.host.pin {
-                Some(p) => format!("{} \u{b7} {}", g.title, p.name),
-                None => g.title.clone(),
-            },
-            request_access: false,
-            preset: self.host.pin.as_ref().map(|p| p.id.clone()),
-        }
+        ConnectIntent::to_host(&self.host, Some((&g.id, &g.title)))
     }
 
     /// The button the state card offers: Retry after a failure that can retry, the desk

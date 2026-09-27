@@ -1073,19 +1073,7 @@ impl Shell {
                     self.hosts
                         .iter()
                         .find(|h| h.key == w.key)
-                        .map(|h| ConnectIntent {
-                            addr: h.addr.clone(),
-                            port: h.port,
-                            fp_hex: h.fp_hex.clone(),
-                            launch: None,
-                            // Pinned-card wake carries the pin's preset.
-                            title: match &h.pin {
-                                Some(p) => format!("{} · {}", h.name, p.name),
-                                None => h.name.clone(),
-                            },
-                            request_access: false,
-                            preset: h.pin.as_ref().map(|p| p.id.clone()),
-                        })
+                        .map(|h| ConnectIntent::to_host(h, None))
                 });
                 self.bus.send(ConsoleCmd::CancelWake);
                 self.wake = None;

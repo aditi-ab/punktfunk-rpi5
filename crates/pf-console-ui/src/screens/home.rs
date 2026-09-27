@@ -462,18 +462,7 @@ impl HomeScreen {
                     Slot::Host(h) => {
                         // Dial even when the pips say offline: a routed or VPN host
                         // can miss mDNS and still answer.
-                        fx.connect = Some(ConnectIntent {
-                            addr: h.addr.clone(),
-                            port: h.port,
-                            fp_hex: h.fp_hex.clone(),
-                            launch: None,
-                            title: match &h.pin {
-                                Some(p) => format!("{} · {}", h.name, p.name),
-                                None => h.name.clone(),
-                            },
-                            request_access: false,
-                            preset: h.pin.as_ref().map(|p| p.id.clone()),
-                        });
+                        fx.connect = Some(ConnectIntent::to_host(h, None));
                     }
                 }
                 Some(MenuPulse::Confirm)
@@ -1465,6 +1454,41 @@ mod tests {
         let intent = fx.connect.expect("a pinned card connects");
         assert_eq!(intent.preset.as_deref(), Some("p1"));
         assert_eq!(intent.title, "Tower · Work");
+    }
+
+    /// Connect on a host with a game up resumes it, so the takeover names the game, as the
+    /// card menu's Connect and the shelf's desk tile do.
+    #[test]
+    fn a_running_hosts_connect_names_the_game() {
+        let mut settings = ctx_settings();
+        let hosts = [HostRow {
+            running: "Elden Ring".into(),
+            ..host("busy", true, true, false)
+        }];
+        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &hosts,
+            library: &library,
+            settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
+            screen: None,
+            pads: &pads,
+            deck: false,
+            tv: false,
+            fallback_ui: false,
+            pyrowave_ok: true,
+            av1_ok: true,
+            device_name: "test",
+            t: 0.0,
+        };
+        let mut s = HomeScreen::new();
+        let mut fx = Outbox::default();
+        s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
+        let intent = fx.connect.expect("a connect");
+        assert_eq!(intent.title, "Elden Ring");
+        assert_eq!(intent.launch, None, "resuming launches nothing");
     }
 
     #[test]

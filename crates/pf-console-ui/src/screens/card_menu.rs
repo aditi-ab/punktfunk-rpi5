@@ -199,21 +199,6 @@ impl CardMenu {
         }
     }
 
-    /// What the connecting takeover names for [`Action::Connect`]: the game being resumed
-    /// if there is one, else the host, with a pinned card's preset.
-    fn title_for_connect(&self) -> String {
-        let host = self.host();
-        let subject = if host.running.is_empty() {
-            &host.name
-        } else {
-            &host.running
-        };
-        match &host.pin {
-            Some(p) => format!("{subject} \u{b7} {}", p.name),
-            None => subject.clone(),
-        }
-    }
-
     /// Commands address the host, not a pinned card's composite key.
     fn host_key(&self) -> &str {
         self.host().host_key()
@@ -560,26 +545,11 @@ impl CardMenu {
 
     /// A connect with `preset`: a poster's launches its title, a card's the host alone.
     fn connect(&self, preset: Option<String>) -> super::ConnectIntent {
-        let host = self.host();
-        let (launch, title) = match &self.subject {
-            Subject::Game { game, .. } => (
-                Some(game.id.clone()),
-                match &host.pin {
-                    Some(p) => format!("{} \u{b7} {}", game.title, p.name),
-                    None => game.title.clone(),
-                },
-            ),
-            Subject::Host(_) => (None, self.title_for_connect()),
+        let game = match &self.subject {
+            Subject::Game { game, .. } => Some((game.id.as_str(), game.title.as_str())),
+            Subject::Host(_) => None,
         };
-        super::ConnectIntent {
-            addr: host.addr.clone(),
-            port: host.port,
-            fp_hex: host.fp_hex.clone(),
-            launch,
-            title,
-            request_access: false,
-            preset,
-        }
+        super::ConnectIntent::to_host(self.host(), game).with_preset(preset)
     }
 
     fn run(&mut self, action: Action, ctx: &mut Ctx, fx: &mut Outbox) {

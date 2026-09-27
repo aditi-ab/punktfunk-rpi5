@@ -123,6 +123,36 @@ pub(crate) struct ConnectIntent {
     pub preset: Option<String>,
 }
 
+impl ConnectIntent {
+    /// Stream `h`: launch `game` (id, title), else its desk. The takeover names the game,
+    /// else what the host has up, else the host. A pinned card's preset rides along and
+    /// adds its name to the title.
+    pub(crate) fn to_host(h: &HostRow, game: Option<(&str, &str)>) -> ConnectIntent {
+        let subject = match game {
+            Some((_, title)) => title,
+            None if !h.running.is_empty() => &h.running,
+            None => &h.name,
+        };
+        ConnectIntent {
+            addr: h.addr.clone(),
+            port: h.port,
+            fp_hex: h.fp_hex.clone(),
+            launch: game.map(|(id, _)| id.to_string()),
+            title: match &h.pin {
+                Some(p) => format!("{subject} \u{b7} {}", p.name),
+                None => subject.to_string(),
+            },
+            request_access: false,
+            preset: h.pin.as_ref().map(|p| p.id.clone()),
+        }
+    }
+
+    /// The same connect with `preset` in place of the pin's: Connect with….
+    pub(crate) fn with_preset(self, preset: Option<String>) -> ConnectIntent {
+        ConnectIntent { preset, ..self }
+    }
+}
+
 pub(crate) enum Nav {
     Push(Box<Screen>),
     /// Pop this screen; popping the root focuses its tab, and the tab's Back asks to exit.

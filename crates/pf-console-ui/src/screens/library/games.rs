@@ -10,14 +10,14 @@
 use super::super::collections::{paint_tile, TILE_CORNER, TILE_H, TILE_W};
 use super::bar::{pill_id, Pill};
 use super::card::{self, Card, DESK_H, DESK_W};
-use super::{desk_intent, store_sort, store_view, LibraryScreen};
+use super::{store_sort, store_view, LibraryScreen};
 use crate::el::{El, Id};
 use crate::glyphs::{Hint, HintKey};
 use crate::library::{LibraryGame, LibraryPhase, LibraryView, Section, DESKTOP_ID, GRID_GAP};
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::Pointer;
 use crate::screens::card_menu::CardMenu;
-use crate::screens::{Ctx, Outbox, Screen};
+use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
 use crate::theme::{fg, Fonts, W};
 use crate::widgets::{button, button_w, text_tab, ListMsg, MenuList, RowSpec};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
@@ -379,7 +379,7 @@ impl LibraryScreen {
                 Zone::Band { band, item } => {
                     let intent = match &bands[band].items[item] {
                         Item::Desktop(h) if self.own(h) => self.desktop_intent(),
-                        Item::Desktop(h) => desk_intent(h),
+                        Item::Desktop(h) => ConnectIntent::to_host(h, None),
                         Item::Game(i) => self.launch_intent(&self.games[*i]),
                         Item::Collection(c) => {
                             self.open_collection(*c, fx);
