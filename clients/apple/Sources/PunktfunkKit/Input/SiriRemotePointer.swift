@@ -30,6 +30,8 @@ public final class SiriRemotePointer {
     private var bound: GCController?
     /// Finger position (±1 axes) at the last dpad callback while touched; nil = lifted.
     private var lastTouch: (x: Float, y: Float)?
+    /// Sub-pixel motion not yet sent, so a slow drag still moves the cursor.
+    private var carry: (x: Float, y: Float) = (0, 0)
     /// When the finger landed; nil while lifted. Set by a touch report, else by the first sample
     /// after a lift or a quiet gap.
     private var contactAt: Date?
@@ -234,10 +236,11 @@ public final class SiriRemotePointer {
             return
         }
         if ringOpen { return ringSwipe(x: x, y: y) }
-        let dx = stepX * Self.pointerScale / 2 // axes span ±1 → full swipe = 2.0
-        let dy = -stepY * Self.pointerScale / 2 // GC +y is up; mouse +y is down
-        let ix = Int32(dx.rounded())
-        let iy = Int32(dy.rounded())
+        let dx = stepX * Self.pointerScale / 2 + carry.x // axes span ±1 → full swipe = 2.0
+        let dy = -stepY * Self.pointerScale / 2 + carry.y // GC +y is up; mouse +y is down
+        let ix = Int32(dx.rounded(.towardZero))
+        let iy = Int32(dy.rounded(.towardZero))
+        carry = (dx - Float(ix), dy - Float(iy))
         guard ix != 0 || iy != 0 else { return }
         connection.send(.mouseMove(dx: ix, dy: iy))
     }
