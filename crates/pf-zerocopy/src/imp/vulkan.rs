@@ -650,6 +650,11 @@ impl VkBridge {
             offset % 4 == 0 && stride % 4 == 0,
             "LINEAR dmabuf offset/stride not word-aligned ({offset}/{stride})"
         );
+        // The shader reads `width` texels per row; a shorter stride runs the last row off the span.
+        anyhow::ensure!(
+            u64::from(stride) >= u64::from(width) * 4,
+            "LINEAR dmabuf stride {stride} shorter than a {width}-pixel row"
+        );
         let layout = nv12_layout(width, height)
             .context("NV12 destination layout exceeds addressable buffer or shader offsets")?;
         // SAFETY: `fd` is the caller's live dmabuf (`import_src` dups it). This frame's source
