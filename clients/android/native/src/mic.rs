@@ -303,6 +303,7 @@ fn supervise(
     // decode thread opens keeps mic encode on a fast core too (the playback side's decode_loop
     // does the same). No-op below API 33.
     client.register_hot_thread();
+    crate::audio::boost_audio_thread("mic");
     let Some(mut up) = Uplink::new() else {
         let _ = ready.send(None);
         return;

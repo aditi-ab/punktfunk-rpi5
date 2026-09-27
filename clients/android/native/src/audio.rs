@@ -707,6 +707,7 @@ fn supervise(
     // pump's first frame arrives, so it's captured when that session is created). No-op below API
     // 33. Done once for the thread, not once per generation — it is the same thread throughout.
     client.register_hot_thread();
+    boost_audio_thread("audio");
     let tuning = punktfunk_core::audio::JitterTuning::AAUDIO;
     let counters = Arc::new(Counters::default());
     // The A/V sync hand-off: the realtime callback owns the ring (so it publishes the depth and
@@ -821,6 +822,21 @@ fn plane_counter_key(fmt: SessionAudio) -> &'static str {
         "pcm"
     } else {
         "opus"
+    }
+}
+
+/// `ANDROID_PRIORITY_AUDIO`: Android gives app threads no SCHED_FIFO, and -16 is what the
+/// platform's own audio threads run at.
+pub(crate) const AUDIO_NICE: i32 = -16;
+
+/// Raise the calling audio or mic thread to [`AUDIO_NICE`], every session.
+pub(crate) fn boost_audio_thread(who: &str) {
+    // SAFETY: `setpriority` on the calling thread; no pointers, no shared state.
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, AUDIO_NICE) } != 0 {
+        log::debug!(
+            "{who}: setpriority({AUDIO_NICE}) refused (non-fatal): {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 

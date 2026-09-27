@@ -143,11 +143,12 @@ fn decoder_supports_max_operating_rate(name_lower: &str) -> bool {
 }
 
 /// Raise the pipeline's OTHER hot threads — the core's data-plane pump (UDP receive + FEC
-/// reassembly) and the audio decode thread — toward the display band, matching this decode thread's
-/// own boost. `setpriority(PRIO_PROCESS, tid)` targets any task in the process, so we do it from
-/// here once their tids are known (the same set ADPF hints), without a per-platform priority hook
-/// in the shared core. Slightly below the decode thread's -10 so the display path still wins.
-/// Best-effort; skips this thread (already boosted) and is non-fatal if the platform refuses.
+/// reassembly) and any other registered thread — toward the display band, matching this decode
+/// thread's own boost. `setpriority(PRIO_PROCESS, tid)` targets any task in the process, so we do
+/// it from here once their tids are known (the same set ADPF hints), without a per-platform
+/// priority hook in the shared core. Slightly below the decode thread's -10 so the display path
+/// still wins. Only ever raises: the audio and mic threads already sit at
+/// [`crate::audio::AUDIO_NICE`]. Best-effort; skips this thread and is non-fatal if refused.
 pub(super) fn boost_hot_threads(tids: &[i32]) {
     // SAFETY: `gettid` is an always-safe syscall on the calling thread.
     let self_tid = unsafe { libc::gettid() };
@@ -155,9 +156,13 @@ pub(super) fn boost_hot_threads(tids: &[i32]) {
         if tid == self_tid {
             continue;
         }
-        // SAFETY: `setpriority` with PRIO_PROCESS + a live tid in our own process is an always-safe
-        // syscall; a refusal is reported via the return value, not UB.
+        // SAFETY: `getpriority`/`setpriority` with PRIO_PROCESS + a tid in our own process are
+        // always-safe syscalls; a refusal is reported via the return value, not UB. A failed read
+        // returns -1, which is above -8, so the set is tried and fails the same way.
         unsafe {
+            if libc::getpriority(libc::PRIO_PROCESS, tid as libc::id_t) <= -8 {
+                continue;
+            }
             if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -8) != 0 {
                 log::debug!("decode: setpriority(-8) on hot tid {tid} failed (non-fatal)");
             }
