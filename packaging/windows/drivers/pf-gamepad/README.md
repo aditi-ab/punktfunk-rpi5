@@ -79,5 +79,5 @@ silently breaks them:
   mailbox (the DATA section itself is unnamed — the sealed pad channel,
   punktfunk-planning: `gamepad-channel-sealing.md` — and its `pad_index` is validated against this
   index on attach).
-- Port of the WDK `vhidmini2` UMDF2 sample; the DualSense identity + 273-byte descriptor + feature
-  blobs `0x05`/`0x09`/`0x20` come from `crates/pf-inject/src/inject/proto/dualsense_proto.rs`.
+- Port of the WDK `vhidmini2` UMDF2 sample; the PlayStation and Deck descriptors and feature
+  blobs come from `pf_driver_proto::{dualsense, dualshock4, deck}`, which the Linux pads serve too.
