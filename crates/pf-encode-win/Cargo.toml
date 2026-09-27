@@ -21,11 +21,14 @@ tracing = "0.1"
 # backend in pf-encode, so the binding is declared for both targets.
 nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = true }
 
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+# PyroWave, only under `pyrowave`: the Windows NV12 zero-copy encoder, and the packetize step
+# both platform backends share (`pyrowave_ffi`). pf-encode links the same crate on Linux.
+pyrowave-sys = { path = "../pyrowave-sys", optional = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 # Native Intel QSV (VPL): vendored static MIT dispatcher + bindgen'd C API, only under `qsv`.
 libvpl-sys = { path = "../libvpl-sys", optional = true }
-# PyroWave NV12 zero-copy D3D11→Vulkan encoder, only under `pyrowave`.
-pyrowave-sys = { path = "../pyrowave-sys", optional = true }
 # `#[implement]` for the Media Foundation event sink. The macro's generated code names the
 # `windows_core` crate directly, so the façade's re-export alone does not satisfy it.
 windows-core = "0.62"

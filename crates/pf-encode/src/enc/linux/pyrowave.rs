@@ -23,6 +23,8 @@ use super::vk_util::{
     color_range, import_failure_feeds_latch, import_rgb_dmabuf, make_host_buffer, make_plain_image,
     normalize_cpu_rgb, pixel_to_vk, reject_dmabuf, select_physical_device,
 };
+use crate::pyrowave_ffi::{packetize, pw_check};
+use crate::pyrowave_wire::{AuStream, FrameBudget};
 use crate::{EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
 use ash::vk;
@@ -170,14 +172,6 @@ unsafe fn device_owns_node(
         }
     }
     false
-}
-
-fn pw_check(r: pw::pyrowave_result, what: &str) -> Result<()> {
-    if r == pw::pyrowave_result_PYROWAVE_SUCCESS {
-        Ok(())
-    } else {
-        bail!("pyrowave {what} failed: result {r}")
-    }
 }
 
 /// Create-infos `pyrowave_create_device` requires to outlive the `pyrowave_device`.
@@ -510,7 +504,6 @@ pub struct PyroWaveEncoder {
 
     width: u32,
     height: u32,
-    fps: u32,
     /// Session chroma: 4:4:4 = full-res chroma + per-pixel CSC + `Chroma444` objects.
     chroma444: bool,
     /// 10-bit session: R16/RG16 planes holding `code10 << 6` (P010-style), matching the
@@ -523,24 +516,18 @@ pub struct PyroWaveEncoder {
     priority: super::worker::PriorityOutcome,
     /// Opened `deviceName`. On a multi-GPU host the worker's GPU is otherwise invisible.
     device_name: String,
-    /// Per-frame bitstream budget (hard CBR): `bitrate / (8 * fps)`.
-    frame_budget: usize,
+    budget: FrameBudget,
     /// `PUNKTFUNK_PERF` reservoir of submit→AU durations. Other backends already log
     /// a submit split; this is the number the priority lever exists to protect.
     perf_us: Vec<u32>,
     perf_logged_at: Option<std::time::Instant>,
     /// `PUNKTFUNK_PERF` only; `None` when the queue family has no timestamps.
     gpu_timer: Option<GpuTimer>,
-    /// Datagram-aligned packetize boundary; packets pad to it so each shard carries
-    /// whole self-delimiting packets. `None` = one packet per AU.
-    wire_chunk: Option<usize>,
-    /// Windowing inflation → rate-budget deflation so the pin holds on the wire.
-    wire_budget: crate::pyrowave_wire::WireBudget,
+    /// Boundary and streamed-AU cursor. Packets pad to the boundary so each shard carries
+    /// whole self-delimiting packets, and an AU is complete before its first chunk leaves.
+    stream: AuStream,
     bitstream: Vec<u8>,
     pending: VecDeque<EncodedFrame>,
-    /// AU being handed out in streamed chunks (`Some` between `first` and `last`).
-    /// Encode is synchronous, so the AU is complete before the first chunk leaves.
-    chunker: Option<crate::pyrowave_wire::AuChunker>,
     /// The worker's mapped return buffer: `build_au` writes windows straight into it.
     au_arena: Option<AuArena>,
     /// Bytes the last AU put in `au_arena`, until the worker reports them.
@@ -633,10 +620,6 @@ impl Drop for AuArena {
 // SAFETY: encode thread only; Vulkan handles are owned and never shared. Pyrowave
 // handles are touched from that thread, and it only submits GPU work inside our API calls.
 unsafe impl Send for PyroWaveEncoder {}
-
-fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
-    ((bitrate_bps / (8 * fps.max(1) as u64)) as usize).max(64 * 1024)
-}
 
 impl PyroWaveEncoder {
     /// `PUNKTFUNK_PERF`: record one encode duration and summarise on a slow cadence.
@@ -1142,7 +1125,6 @@ impl PyroWaveEncoder {
             max_inflight: 1,
             width: w,
             height: h,
-            fps,
             chroma444,
             // The CSC shaders write `code10 << 6` for 10-bit; PQ labelling only makes
             // sense on the 10-bit stream — an 8-bit `hdr` ask degrades to 709 codes.
@@ -1150,15 +1132,13 @@ impl PyroWaveEncoder {
             pq: hdr && bit_depth >= 10,
             priority,
             device_name,
-            frame_budget: budget_for(bitrate, fps),
+            budget: FrameBudget::new(bitrate, fps),
             perf_us: Vec::new(),
             perf_logged_at: None,
             gpu_timer: None,
-            wire_chunk: None,
-            wire_budget: crate::pyrowave_wire::WireBudget::new(),
+            stream: AuStream::default(),
             bitstream: Vec::new(),
             pending: VecDeque::new(),
-            chunker: None,
             au_arena: None,
             arena_len: None,
             frame_count: 0,
@@ -1428,7 +1408,7 @@ impl PyroWaveEncoder {
         tracing::info!(
             gpu = %props.device_name_as_c_str().unwrap_or(c"?").to_string_lossy(),
             mode = %format!("{w}x{h}@{fps}"),
-            budget_kib = me.frame_budget / 1024,
+            budget_kib = me.budget.bytes / 1024,
             chroma = if chroma444 { "4:4:4" } else { "4:2:0" },
             bit_depth = if me.ten_bit { 10 } else { 8 },
             colour = if me.pq { "BT.2020 PQ" } else { "BT.709" },
@@ -1675,15 +1655,6 @@ impl PyroWaveEncoder {
         Ok(self.slots[slot].cpu_img.unwrap().2)
     }
 
-    /// Per-frame rate-control budget: `frame_budget`, deflated by windowing inflation
-    /// when datagram-aligned. The pin is the wire, not the raw bitstream.
-    fn rate_budget(&self) -> usize {
-        match self.wire_chunk {
-            Some(_) => self.wire_budget.deflate(self.frame_budget).max(64 * 1024),
-            None => self.frame_budget,
-        }
-    }
-
     /// Record and submit ingest, CSC and encode. The in-flight entry owns any raw
     /// source hold until [`wait_and_packetize`] retires its fence.
     unsafe fn submit_frame(&mut self, frame: &CapturedFrame, t0: std::time::Instant) -> Result<()> {
@@ -1709,7 +1680,8 @@ impl PyroWaveEncoder {
         // `begin` through `queue_submit` in one closure whose error arm resets `cmd`.
         // Never PENDING on those arms. Failures after must not reset: a fence timeout
         // leaves PENDING (VUID-vkResetCommandBuffer-commandBuffer-00045).
-        let rate_budget = self.rate_budget(); // before the closure (mutably borrows `self`)
+        // Before the closure, which mutably borrows `self`.
+        let rate_budget = self.budget.rate_control(self.stream.wire_chunk.is_some());
         let slot = self.next_slot;
         let seq = self.wire_seq;
         let cmd = self.slots[slot].cmd;
@@ -2006,8 +1978,8 @@ impl PyroWaveEncoder {
             slot,
             seq: (seq & pw::PYROWAVE_SEQUENCE_MASK) as u8,
             pts_ns: frame.pts_ns,
-            cap: self.frame_budget + BS_SLACK,
-            wire_chunk: self.wire_chunk,
+            cap: self.budget.bytes + BS_SLACK,
+            wire_chunk: self.stream.wire_chunk,
             t0,
             cpu_ns,
             _src_hold: match &frame.payload {
@@ -2036,46 +2008,23 @@ impl PyroWaveEncoder {
         // Dense: boundary = whole buffer → one packet. Datagram-aligned: boundary = shard
         // payload; packets pad so a lost shard costs only those blocks. Use `fr.cap` /
         // `fr.wire_chunk`, not the live fields: bitrate/chunking can land mid-flight.
-        let cap = fr.cap;
-        self.bitstream.resize(cap, 0);
-        // Chunked mode reserves the 4-byte window prefix from the packetize boundary.
-        let boundary = crate::pyrowave_wire::packet_boundary(fr.wire_chunk, cap);
-        let mut n: usize = 0;
-        pw_check(
-            pw::pyrowave_encoder_compute_num_packets(self.pw_encs[fr.slot], boundary, &mut n),
-            "compute_num_packets",
+        let pkts = packetize(
+            self.pw_encs[fr.slot],
+            &mut self.bitstream,
+            fr.cap,
+            fr.wire_chunk,
+            self.pq,
         )?;
-        if n == 0 || (fr.wire_chunk.is_none() && n != 1) {
-            bail!("pyrowave: unexpected packet count {n} at boundary {boundary}");
-        }
-        let mut packets = vec![pw::pyrowave_packet { offset: 0, size: 0 }; n];
-        let mut out_n: usize = 0;
-        pw_check(
-            pw::pyrowave_encoder_packetize(
-                self.pw_encs[fr.slot],
-                packets.as_mut_ptr(),
-                boundary,
-                &mut out_n,
-                self.bitstream.as_mut_ptr() as *mut std::ffi::c_void,
-                cap,
-            ),
-            "packetize",
-        )?;
-        packets.truncate(out_n.max(1));
-        // Pyrowave's C API signals FULL range + centered siting; our CSC emits limited-range,
-        // left-sited codes (BT.2020/PQ when `pq`). Stamp the bits honest so VUI-honoring
-        // clients don't wash out blacks.
-        if let Some(p) = packets.first() {
-            crate::pyrowave_wire::stamp_color_bits(&mut self.bitstream, p.offset, self.pq);
+        if let Some(&(offset, _)) = pkts.first() {
             // Without patch 0007 the two handles count independently and clients swallow
             // repeats. A re-vendor that loses the patch still builds. Once per process.
-            if crate::pyrowave_wire::wire_sequence(&self.bitstream, p.offset) != Some(fr.seq) {
+            if crate::pyrowave_wire::wire_sequence(&self.bitstream, offset) != Some(fr.seq) {
                 static WARNED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     tracing::error!(
                         expected = fr.seq,
-                        got = ?crate::pyrowave_wire::wire_sequence(&self.bitstream, p.offset),
+                        got = ?crate::pyrowave_wire::wire_sequence(&self.bitstream, offset),
                         "pyrowave: the wire sequence counter is NOT what we stamped — \
                          patches/0007-encoder-sequence-override.patch is missing or ineffective. \
                          With two alternating encoder handles this silently halves the frame rate \
@@ -2084,7 +2033,6 @@ impl PyroWaveEncoder {
                 }
             }
         }
-        let pkts: Vec<(usize, usize)> = packets.iter().map(|p| (p.offset, p.size)).collect();
         let (au, au_len) = match self.au_arena.as_mut() {
             // The worker's return buffer: the AU is laid out in place, the frame carries
             // its length and no bytes.
@@ -2100,8 +2048,7 @@ impl PyroWaveEncoder {
             }
         };
         if fr.wire_chunk.is_some() {
-            let raw: usize = pkts.iter().map(|&(_, s)| s).sum();
-            self.wire_budget.observe(raw, au_len);
+            self.budget.observe(&pkts, au_len);
         }
         self.frame_count += 1;
         self.pending.push_back(EncodedFrame {
@@ -2186,11 +2133,8 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        // Each AU is drained through one method. Erroring beats double-emitting bytes the
-        // chunk cursor already handed out. Check before the fence wait.
-        if self.chunker.is_some() {
-            bail!("pyrowave: poll() on an AU already being drained through poll_chunk");
-        }
+        // Before the fence wait: a cut still open is a caller bug, not a reason to block.
+        self.stream.check_whole_poll()?;
         if self.pending.is_empty() && !self.inflight.is_empty() {
             // SAFETY: single-threaded encoder, waiting its own fence and reading its own
             // bitstream; failure leaves the entry in flight for `reset()` to re-wait.
@@ -2200,16 +2144,12 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn supports_chunked_poll(&self) -> bool {
-        crate::pyrowave_wire::stream_chunk_step(self.wire_chunk).is_some()
+        self.stream.supports_chunked_poll()
     }
 
     fn poll_chunk(&mut self) -> Result<Option<crate::AuChunk>> {
-        // Finish the AU already in flight: `handle_chunk` keys off `first`/`last`.
-        if let Some(c) = self.chunker.as_mut() {
-            if let Some(chunk) = c.next() {
-                return Ok(Some(chunk));
-            }
-            self.chunker = None;
+        if let Some(chunk) = self.stream.next_open() {
+            return Ok(Some(chunk));
         }
         // `submit` only queues GPU work; mirror `poll`'s wait so the AU reaches `pending`.
         if self.pending.is_empty() && !self.inflight.is_empty() {
@@ -2217,22 +2157,13 @@ impl Encoder for PyroWaveEncoder {
             // bitstream; failure leaves the entry in flight for `reset()` to re-wait.
             unsafe { self.wait_and_packetize()? };
         }
-        let Some(f) = self.pending.pop_front() else {
-            return Ok(None);
-        };
-        match crate::pyrowave_wire::stream_chunk_step(self.wire_chunk) {
-            Some(step) => Ok(self
-                .chunker
-                .insert(crate::pyrowave_wire::AuChunker::new(f, step))
-                .next()),
-            None => Ok(Some(crate::AuChunk::whole(f))),
-        }
+        Ok(self.pending.pop_front().and_then(|f| self.stream.cut(f)))
     }
 
     fn reset(&mut self) -> bool {
         // Rebuild forfeits in-flight frames, including a half-handed-out AU. Drop the
         // cursor first so the next `poll_chunk` cannot splice a dead tail onto a fresh AU.
-        self.chunker = None;
+        self.stream.reset();
         // Recreate the pyrowave encoder object only (no RC history). Bounded wait first:
         // an untimed `device_wait_idle` would park recovery on a wedged GPU. Destroying
         // the encoder under live GPU work is a use-after-free.
@@ -2296,20 +2227,12 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
-        // Per-frame byte budget — in-place retarget is free (no IDR, nothing in flight).
-        self.frame_budget = budget_for(bps, self.fps);
-        tracing::debug!(
-            mbps = bps / 1_000_000,
-            budget_kib = self.frame_budget / 1024,
-            "pyrowave: per-frame rate budget retargeted in place"
-        );
+        self.budget.retarget(bps);
         true
     }
 
     fn set_wire_chunking(&mut self, shard_payload: usize) {
-        // Below one block header + payload word is meaningless.
-        if shard_payload >= 64 {
-            self.wire_chunk = Some(shard_payload);
+        if self.stream.set_chunking(shard_payload) {
             tracing::info!(
                 shard_payload,
                 "pyrowave: datagram-aligned packetization on (partial-frame loss mode)"
@@ -2558,7 +2481,7 @@ mod tests {
             assert!(au.keyframe, "every pyrowave AU is a keyframe");
             assert!(!au.data.is_empty());
             assert!(
-                au.data.len() <= enc.frame_budget + BS_SLACK,
+                au.data.len() <= enc.budget.bytes + BS_SLACK,
                 "AU exceeds rate budget"
             );
             // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
@@ -2850,7 +2773,7 @@ mod tests {
             let au = enc.poll().expect("poll").expect("one AU per frame");
             assert!(au.keyframe);
             assert!(
-                au.data.len() <= enc.frame_budget + BS_SLACK,
+                au.data.len() <= enc.budget.bytes + BS_SLACK,
                 "AU exceeds rate budget"
             );
             // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
@@ -2873,10 +2796,10 @@ mod tests {
             enc.submit(&test_card(w, h, 7)).expect("busy submit");
             let au = enc.poll().expect("poll").expect("busy AU");
             assert!(
-                au.data.len() <= enc.frame_budget + BS_SLACK,
+                au.data.len() <= enc.budget.bytes + BS_SLACK,
                 "busy 4:4:4 AU exceeds rate budget ({} > {})",
                 au.data.len(),
-                enc.frame_budget + BS_SLACK
+                enc.budget.bytes + BS_SLACK
             );
             // SAFETY: test-only FFI with locally-owned buffers.
             let _ = unsafe { decode_planes_chroma(w, h, &au.data, true) };

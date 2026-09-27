@@ -66,6 +66,9 @@ pub mod pyrowave;
 // Shared PyroWave AU wire-framing — both platform backends emit this layout.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "pyrowave"))]
 pub mod pyrowave_wire;
+// The pyrowave-sys calls both PyroWave backends make the same way.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "pyrowave"))]
+pub mod pyrowave_ffi;
 
 /// Whether a PyroWave mode fits the rate controller's packed 16-bit block
 /// index: false ≈ 8K-class 4:4:4. Negotiator downgrades to 4:2:0; encoders refuse.

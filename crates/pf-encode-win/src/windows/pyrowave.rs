@@ -19,7 +19,8 @@
 
 // Every `unsafe` block in this module carries a `// SAFETY:` proof (crate root enforces it).
 
-use crate::pyrowave_wire;
+use crate::pyrowave_ffi::{packetize, pw_check};
+use crate::pyrowave_wire::{self, AuStream, FrameBudget};
 use crate::{EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload};
@@ -49,18 +50,6 @@ const VK_IMAGE_USAGE_SAMPLED_BIT: u32 = 0x0000_0004;
 /// acquire/release transitions across the interop boundary.
 const VK_QUEUE_FAMILY_EXTERNAL: u32 = 0xFFFF_FFFE;
 
-fn pw_check(r: pw::pyrowave_result, what: &str) -> Result<()> {
-    if r == pw::pyrowave_result_PYROWAVE_SUCCESS {
-        Ok(())
-    } else {
-        bail!("pyrowave {what} failed: result {r}")
-    }
-}
-
-fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
-    ((bitrate_bps / (8 * fps.max(1) as u64)) as usize).max(64 * 1024)
-}
-
 // Do not raise GPU scheduling here. `pf-frame`'s `dxgi::elevate_gpu_priority_of` owns
 // that process-wide (`PUNKTFUNK_GPU_PRIORITY_CLASS`); a second owner races it.
 
@@ -77,23 +66,17 @@ pub struct PyroWaveEncoder {
 
     width: u32,
     height: u32,
-    fps: u32,
     /// 4:4:4 = full-res CbCr plane + `Chroma444` pyrowave objects.
     chroma444: bool,
     /// Depth ≥10: capturer HDR CSC writes P010-style studio codes into 16-bit
     /// UNORM planes; sequence header is BT.2020/PQ.
     hdr16: bool,
-    /// Per-frame bitstream budget (hard CBR): `bitrate / (8 * fps)`.
-    frame_budget: usize,
-    /// Datagram-aligned packetize boundary. `None` = one dense packet/AU.
-    wire_chunk: Option<usize>,
-    /// Windowing inflation → rate-budget deflation so the pin holds on the wire.
-    wire_budget: pyrowave_wire::WireBudget,
+    budget: FrameBudget,
+    /// Boundary and streamed-AU cursor. Encode is synchronous, so an AU is complete before
+    /// its first chunk leaves.
+    stream: AuStream,
     bitstream: Vec<u8>,
     pending: VecDeque<EncodedFrame>,
-    /// AU being handed out in streamed chunks (`Some` between `first` and `last`).
-    /// Encode is synchronous, so the AU is complete before the first chunk leaves.
-    chunker: Option<pyrowave_wire::AuChunker>,
 }
 
 // SAFETY: encode thread only; pyrowave handles are owned and only touched from
@@ -186,11 +169,11 @@ impl PyroWaveEncoder {
                 return Err(e);
             }
 
-            let frame_budget = budget_for(bitrate_bps.max(1_000_000), fps);
+            let budget = FrameBudget::new(bitrate_bps, fps);
             tracing::info!(
                 gpu = format!("{vid:04x}:{pid:04x}"),
                 mode = %format!("{width}x{height}@{fps}"),
-                budget_kib = frame_budget / 1024,
+                budget_kib = budget.bytes / 1024,
                 chroma = if chroma444 { "4:4:4" } else { "4:2:0" },
                 hdr = hdr16,
                 "PyroWave encoder open (Windows separate-plane zero-copy, intra-only wavelet)"
@@ -205,15 +188,12 @@ impl PyroWaveEncoder {
                 cbcr_images: Vec::new(),
                 width,
                 height,
-                fps,
                 chroma444,
                 hdr16,
-                frame_budget,
-                wire_chunk: None,
-                wire_budget: pyrowave_wire::WireBudget::new(),
+                budget,
+                stream: AuStream::default(),
                 bitstream: Vec::new(),
                 pending: VecDeque::new(),
-                chunker: None,
             })
         }
     }
@@ -341,16 +321,6 @@ impl PyroWaveEncoder {
         }
         self.sync = sync;
         Ok(())
-    }
-
-    /// Per-frame budget for pyrowave rate control. With datagram-aligned wire,
-    /// `frame_budget` is deflated by measured windowing inflation so the pin is
-    /// on the wire, not the raw bitstream ([`pyrowave_wire::WireBudget`]).
-    fn rate_budget(&self) -> usize {
-        match self.wire_chunk {
-            Some(_) => self.wire_budget.deflate(self.frame_budget).max(64 * 1024),
-            None => self.frame_budget,
-        }
     }
 
     /// One synchronous frame: cache-import planes + fence, encode, packetize.
@@ -517,7 +487,7 @@ impl PyroWaveEncoder {
             sync: std::mem::zeroed(),
         };
         let rc = pw::pyrowave_rate_control {
-            maximum_bitstream_size: self.rate_budget(),
+            maximum_bitstream_size: self.budget.rate_control(self.stream.wire_chunk.is_some()),
         };
         pw_check(
             pw::pyrowave_encoder_encode_gpu_synchronous(
@@ -530,41 +500,17 @@ impl PyroWaveEncoder {
             "encode_gpu_synchronous",
         )?;
 
-        let cap = self.frame_budget + BS_SLACK;
-        self.bitstream.resize(cap, 0);
-        let boundary = pyrowave_wire::packet_boundary(self.wire_chunk, cap);
-        let mut n: usize = 0;
-        pw_check(
-            pw::pyrowave_encoder_compute_num_packets(self.pw_enc, boundary, &mut n),
-            "compute_num_packets",
+        let wire_chunk = self.stream.wire_chunk;
+        let pkts = packetize(
+            self.pw_enc,
+            &mut self.bitstream,
+            self.budget.bytes + BS_SLACK,
+            wire_chunk,
+            self.hdr16,
         )?;
-        if n == 0 || (self.wire_chunk.is_none() && n != 1) {
-            bail!("pyrowave: unexpected packet count {n} at boundary {boundary}");
-        }
-        let mut packets = vec![pw::pyrowave_packet { offset: 0, size: 0 }; n];
-        let mut out_n: usize = 0;
-        pw_check(
-            pw::pyrowave_encoder_packetize(
-                self.pw_enc,
-                packets.as_mut_ptr(),
-                boundary,
-                &mut out_n,
-                self.bitstream.as_mut_ptr() as *mut std::ffi::c_void,
-                cap,
-            ),
-            "packetize",
-        )?;
-        packets.truncate(out_n.max(1));
-        // Pyrowave zero-fills VUI as FULL; our CSC is studio range. Stamp LIMITED
-        // (and BT.2020/PQ on HDR) so VUI-honoring clients do not wash out blacks.
-        if let Some(p) = packets.first() {
-            pyrowave_wire::stamp_color_bits(&mut self.bitstream, p.offset, self.hdr16);
-        }
-        let pkts: Vec<(usize, usize)> = packets.iter().map(|p| (p.offset, p.size)).collect();
-        let au = pyrowave_wire::build_au(&pkts, &self.bitstream, self.wire_chunk);
-        if self.wire_chunk.is_some() {
-            let raw: usize = pkts.iter().map(|&(_, s)| s).sum();
-            self.wire_budget.observe(raw, au.len());
+        let au = pyrowave_wire::build_au(&pkts, &self.bitstream, wire_chunk);
+        if wire_chunk.is_some() {
+            self.budget.observe(&pkts, au.len());
         }
         self.pending.push_back(EncodedFrame {
             data: au,
@@ -573,7 +519,7 @@ impl PyroWaveEncoder {
             recovery_anchor: false,
             recovery_point: false,
             recovery_close: false,
-            chunk_aligned: self.wire_chunk.is_some(),
+            chunk_aligned: wire_chunk.is_some(),
         });
         Ok(())
     }
@@ -598,47 +544,28 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        // Each AU drains through one method. Polling here while `chunker` is live
-        // would emit the same bytes twice under the same frame index.
-        if self.chunker.is_some() {
-            bail!("pyrowave: poll() on an AU already being drained through poll_chunk");
-        }
+        self.stream.check_whole_poll()?;
         Ok(self.pending.pop_front())
     }
 
-    // Cutting lives in [`pyrowave_wire::AuChunker`] (compiles on every platform).
-    // This file cannot be built off Windows, so the helper is the verified path.
+    // Cutting lives in [`AuStream`] (compiles on every platform). This file cannot be built
+    // off Windows, so the helper is the verified path.
     fn supports_chunked_poll(&self) -> bool {
-        pyrowave_wire::stream_chunk_step(self.wire_chunk).is_some()
+        self.stream.supports_chunked_poll()
     }
 
     fn poll_chunk(&mut self) -> Result<Option<crate::AuChunk>> {
-        // Drain the in-flight AU first; the host keys begin/finish off `first`/`last`
-        // and cannot interleave two AUs.
-        if let Some(c) = self.chunker.as_mut() {
-            if let Some(chunk) = c.next() {
-                return Ok(Some(chunk));
-            }
-            self.chunker = None;
+        if let Some(chunk) = self.stream.next_open() {
+            return Ok(Some(chunk));
         }
-        let Some(f) = self.pending.pop_front() else {
-            return Ok(None);
-        };
         // No wait: `submit` already encoded synchronously, so `pending` is complete.
-        match pyrowave_wire::stream_chunk_step(self.wire_chunk) {
-            Some(step) => Ok(self
-                .chunker
-                .insert(pyrowave_wire::AuChunker::new(f, step))
-                .next()),
-            // Dense: the trait default, so a host that polls chunks still gets whole AUs.
-            None => Ok(Some(crate::AuChunk::whole(f))),
-        }
+        Ok(self.pending.pop_front().and_then(|f| self.stream.cut(f)))
     }
 
     fn reset(&mut self) -> bool {
         // Drop the cursor before `pending.clear()` so the next `poll_chunk` cannot
         // splice a dead AU's tail onto a fresh one.
-        self.chunker = None;
+        self.stream.reset();
         // Recreate only the encoder object; device, imported textures and fence survive.
         // SAFETY: encode is synchronous (no work in flight); the device outlives the swapped encoder.
         unsafe {
@@ -672,20 +599,12 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
-        // Per-frame byte budget; retarget is free (no IDR, nothing in flight).
-        self.frame_budget = budget_for(bps.max(1_000_000), self.fps);
-        tracing::debug!(
-            mbps = bps / 1_000_000,
-            budget_kib = self.frame_budget / 1024,
-            "pyrowave: per-frame rate budget retargeted in place"
-        );
+        self.budget.retarget(bps);
         true
     }
 
     fn set_wire_chunking(&mut self, shard_payload: usize) {
-        // Below one block header + payload word the boundary is meaningless.
-        if shard_payload >= 64 {
-            self.wire_chunk = Some(shard_payload);
+        if self.stream.set_chunking(shard_payload) {
             tracing::info!(
                 shard_payload,
                 "pyrowave: datagram-aligned packetization on (partial-frame loss mode)"

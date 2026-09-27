@@ -16,7 +16,7 @@
 //! `grep` finds every rung.
 
 use super::worker::{self, FromWorker, PriorityOutcome, ToWorker, WireCursor};
-use crate::pyrowave_wire::{stream_chunk_step, AuChunker};
+use crate::pyrowave_wire::AuStream;
 use crate::{AuChunk, ChromaFormat, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload};
@@ -500,9 +500,8 @@ pub(crate) fn open_preferring_worker(
         bitrate_bps,
         worker_path: path,
         caps: hs.caps,
-        wire_chunk: None,
+        stream: AuStream::default(),
         pending: VecDeque::new(),
-        chunker: None,
         respawn_used: false,
     }))
 }
@@ -520,15 +519,13 @@ pub(crate) struct RemotePyroWave {
     bitrate_bps: u64,
     worker_path: PathBuf,
     caps: EncoderCaps,
-    /// Datagram-aligned boundary, mirrored here as well as forwarded. It changes the AU bytes
-    /// and this proxy's chunked-poll answers — see [`Self::poll_chunk`].
-    wire_chunk: Option<usize>,
+    /// Datagram-aligned boundary, mirrored here as well as forwarded (it changes the AU bytes),
+    /// and the streamed-AU cursor — the proxy's in both modes, so exactly one can ever be open
+    /// (see [`Self::poll_chunk`]).
+    stream: AuStream,
     /// AUs the worker returned that the caller has not polled. Empty in in-process mode except
     /// leftovers from the fallback, which [`Self::poll_whole`] drains first.
     pending: VecDeque<EncodedFrame>,
-    /// AU currently being handed out in streamed chunks — the proxy's, in both modes, so exactly
-    /// one chunker can ever be open (see [`Self::poll_chunk`]).
-    chunker: Option<AuChunker>,
     /// One respawn per session. After that, in-process: a worker that dies twice will keep dying,
     /// and burning the host's five-reset budget on it costs the session.
     respawn_used: bool,
@@ -564,7 +561,7 @@ impl RemotePyroWave {
             // Replay: the boundary changes the AU bytes, so a fallback that forgot it would ship
             // dense AUs flagged as datagram-aligned. (Bitrate needs no replay — it is an open
             // parameter above.)
-            if let Some(shard) = self.wire_chunk {
+            if let Some(shard) = self.stream.wire_chunk {
                 e.set_wire_chunking(shard);
             }
             self.inline = Some(e);
@@ -674,11 +671,7 @@ impl Encoder for RemotePyroWave {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        // Each AU is drained through one method. Same wording as the in-process impl: same
-        // caller bug.
-        if self.chunker.is_some() {
-            bail!("pyrowave: poll() on an AU already being drained through poll_chunk");
-        }
+        self.stream.check_whole_poll()?;
         self.poll_whole()
     }
 
@@ -689,32 +682,23 @@ impl Encoder for RemotePyroWave {
     }
 
     fn supports_chunked_poll(&self) -> bool {
-        stream_chunk_step(self.wire_chunk).is_some()
+        self.stream.supports_chunked_poll()
     }
 
     fn poll_chunk(&mut self) -> Result<Option<AuChunk>> {
         // Streamed-AU cut needs no protocol. `submit` is synchronous, so an AU in `pending` is
-        // complete and the same `AuChunker` runs here. The chunker is the proxy's in both modes
-        // (the fallback's `poll_chunk` is never called), so exactly one cursor can be open.
-        if let Some(c) = self.chunker.as_mut() {
-            if let Some(chunk) = c.next() {
-                return Ok(Some(chunk));
-            }
-            self.chunker = None;
+        // complete and the same cut runs here. The cursor is the proxy's in both modes (the
+        // fallback's `poll_chunk` is never called), so exactly one can be open.
+        if let Some(chunk) = self.stream.next_open() {
+            return Ok(Some(chunk));
         }
-        let Some(f) = self.poll_whole()? else {
-            return Ok(None);
-        };
-        match stream_chunk_step(self.wire_chunk) {
-            Some(step) => Ok(self.chunker.insert(AuChunker::new(f, step)).next()),
-            None => Ok(Some(AuChunk::whole(f))),
-        }
+        Ok(self.poll_whole()?.and_then(|f| self.stream.cut(f)))
     }
 
     fn reset(&mut self) -> bool {
         // A rebuild forfeits every in-flight frame, including a half-handed-out AU — drop the
         // cursor first so the next `poll_chunk` cannot splice a dead AU's tail onto a fresh one.
-        self.chunker = None;
+        self.stream.reset();
         self.pending.clear();
         if let Some(link) = self.link.as_mut() {
             // A Reset message, not a respawn: the expensive thing is the priority-elevated
@@ -743,7 +727,7 @@ impl Encoder for RemotePyroWave {
                 Ok(hs) => {
                     self.caps = hs.caps;
                     self.link = Some(hs.link);
-                    if let Some(shard) = self.wire_chunk {
+                    if let Some(shard) = self.stream.wire_chunk {
                         // Same replay the in-process fallback does: the boundary changes AU bytes.
                         self.set_wire_chunking(shard);
                     }
@@ -829,12 +813,11 @@ impl Encoder for RemotePyroWave {
     }
 
     fn set_wire_chunking(&mut self, shard_payload: usize) {
-        // Same sanity floor as the in-process impl, applied here so mirrored state and the
-        // worker's cannot disagree about whether chunking is on.
-        if shard_payload < 64 {
+        // Same floor as the in-process impl, so mirrored state and the worker's cannot disagree
+        // about whether chunking is on.
+        if !self.stream.set_chunking(shard_payload) {
             return;
         }
-        self.wire_chunk = Some(shard_payload);
         if let Some(link) = self.link.as_mut() {
             // Must cross: it changes the packetize boundary and the rate budget (AU bytes).
             // Only the streamed-AU cut stays host-side.
@@ -1113,9 +1096,8 @@ mod tests {
             // fails, which is the case this budget exists for.
             worker_path: PathBuf::from("/bin/false"),
             caps: EncoderCaps::default(),
-            wire_chunk: None,
+            stream: AuStream::default(),
             pending: VecDeque::new(),
-            chunker: None,
             respawn_used: false,
         };
         // Reply never comes: the link dies, the one respawn is spent and fails, session in-process.
@@ -1149,9 +1131,8 @@ mod tests {
             bitrate_bps: 5_000_000,
             worker_path: PathBuf::from("/usr/bin/punktfunk-encode-worker"),
             caps: EncoderCaps::default(),
-            wire_chunk: None,
+            stream: AuStream::default(),
             pending: VecDeque::new(),
-            chunker: None,
             respawn_used: false,
         };
         let cpu = CapturedFrame {

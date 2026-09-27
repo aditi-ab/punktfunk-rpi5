@@ -134,6 +134,59 @@ impl WireBudget {
     }
 }
 
+/// Per-frame rate budget (hard CBR): `bitrate / (8 * fps)`, never below 64 KiB. Both local
+/// encoders size their bitstream from [`Self::bytes`] and hand [`Self::rate_control`] to
+/// pyrowave's rate control.
+pub struct FrameBudget {
+    fps: u32,
+    /// Bytes per frame the link allows.
+    pub bytes: usize,
+    /// Windowing inflation → rate-budget deflation, so the pin holds on the wire.
+    wire: WireBudget,
+}
+
+impl FrameBudget {
+    const FLOOR: usize = 64 * 1024;
+
+    pub fn new(bitrate_bps: u64, fps: u32) -> FrameBudget {
+        FrameBudget {
+            fps,
+            bytes: Self::bytes_for(bitrate_bps, fps),
+            wire: WireBudget::new(),
+        }
+    }
+
+    fn bytes_for(bitrate_bps: u64, fps: u32) -> usize {
+        ((bitrate_bps / (8 * u64::from(fps.max(1)))) as usize).max(Self::FLOOR)
+    }
+
+    /// Retarget in place: free, since every frame is intra and nothing waits on the old rate.
+    pub fn retarget(&mut self, bitrate_bps: u64) {
+        self.bytes = Self::bytes_for(bitrate_bps, self.fps);
+        tracing::debug!(
+            mbps = bitrate_bps / 1_000_000,
+            budget_kib = self.bytes / 1024,
+            "pyrowave: per-frame rate budget retargeted in place"
+        );
+    }
+
+    /// The target for pyrowave's rate control: [`Self::bytes`], deflated by the measured
+    /// windowing inflation when `chunked`, so the pin is the wire rather than the bitstream.
+    pub fn rate_control(&self, chunked: bool) -> usize {
+        if chunked {
+            self.wire.deflate(self.bytes).max(Self::FLOOR)
+        } else {
+            self.bytes
+        }
+    }
+
+    /// Feed one windowed AU's inflation: `packets` became `au_len` wire bytes.
+    pub fn observe(&mut self, packets: &[(usize, usize)], au_len: usize) {
+        let raw: usize = packets.iter().map(|&(_, s)| s).sum();
+        self.wire.observe(raw, au_len);
+    }
+}
+
 /// Where [`build_au`] writes: a growing `Vec`, or a fixed slice for the worker's mapped
 /// return buffer. Each write reports whether it fit.
 trait AuSink {
@@ -447,6 +500,67 @@ impl AuChunker {
     }
 }
 
+/// The datagram-aligned boundary and the streamed-AU cursor over it. Every PyroWave encoder
+/// (Windows, Linux, and the Linux worker proxy) holds one, so the cut cannot drift between them.
+#[derive(Default)]
+pub struct AuStream {
+    /// Datagram-aligned packetize boundary. `None` = one dense packet per AU.
+    pub wire_chunk: Option<usize>,
+    /// AU being handed out in streamed chunks (`Some` between `first` and `last`).
+    chunker: Option<AuChunker>,
+}
+
+impl AuStream {
+    /// Take `shard_payload` as the boundary. Below one block header plus a payload word it
+    /// means nothing: `false`, and nothing changes.
+    pub fn set_chunking(&mut self, shard_payload: usize) -> bool {
+        if shard_payload < 64 {
+            return false;
+        }
+        self.wire_chunk = Some(shard_payload);
+        true
+    }
+
+    /// [`crate::Encoder::supports_chunked_poll`].
+    pub fn supports_chunked_poll(&self) -> bool {
+        stream_chunk_step(self.wire_chunk).is_some()
+    }
+
+    /// Each AU drains through one method: a whole-AU `poll` while a cut is open would emit the
+    /// same bytes twice under one frame index.
+    pub fn check_whole_poll(&self) -> anyhow::Result<()> {
+        if self.chunker.is_some() {
+            anyhow::bail!("pyrowave: poll() on an AU already being drained through poll_chunk");
+        }
+        Ok(())
+    }
+
+    /// Forfeit a half-handed-out AU, so the next `poll_chunk` cannot splice its tail onto a
+    /// fresh one.
+    pub fn reset(&mut self) {
+        self.chunker = None;
+    }
+
+    /// The next piece of the AU already being cut. `None` once it is done: the caller then
+    /// produces the next whole AU for [`Self::cut`]. The host keys begin/finish off
+    /// `first`/`last` and cannot interleave two AUs.
+    pub fn next_open(&mut self) -> Option<crate::AuChunk> {
+        let chunk = self.chunker.as_mut()?.next();
+        if chunk.is_none() {
+            self.chunker = None;
+        }
+        chunk
+    }
+
+    /// Start handing out `f`: window-aligned pieces when streaming is armed, else whole.
+    pub fn cut(&mut self, f: crate::EncodedFrame) -> Option<crate::AuChunk> {
+        match stream_chunk_step(self.wire_chunk) {
+            Some(step) => self.chunker.insert(AuChunker::new(f, step)).next(),
+            None => Some(crate::AuChunk::whole(f)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,5 +837,34 @@ mod tests {
     fn dense_mode_never_streams() {
         assert!(stream_chunk_step(None).is_none());
         assert!(stream_chunk_step(Some(0)).is_none());
+    }
+
+    /// One floor on both platforms: 64 KiB a frame. A low rate at a low frame rate is honoured,
+    /// not lifted to 1 Mb/s.
+    #[test]
+    fn frame_budget_floors_at_64_kib_a_frame() {
+        assert_eq!(FrameBudget::new(0, 60).bytes, 64 * 1024);
+        assert_eq!(FrameBudget::new(600_000, 1).bytes, 75_000);
+        let mut b = FrameBudget::new(400_000_000, 60);
+        assert_eq!(b.bytes, 833_333);
+        assert_eq!(b.rate_control(false), 833_333);
+        assert_eq!(
+            b.rate_control(true),
+            833_333 * 1024 / 1280,
+            "startup inflation prior"
+        );
+        b.retarget(0);
+        assert_eq!(b.rate_control(true), 64 * 1024);
+    }
+
+    /// A boundary below one block header is ignored, never a switch back to dense.
+    #[test]
+    fn chunking_below_the_floor_keeps_the_boundary() {
+        let mut s = AuStream::default();
+        assert!(!s.set_chunking(63));
+        assert_eq!(s.wire_chunk, None);
+        assert!(s.set_chunking(1408));
+        assert!(!s.set_chunking(0));
+        assert_eq!(s.wire_chunk, Some(1408));
     }
 }
