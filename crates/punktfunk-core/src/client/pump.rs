@@ -46,16 +46,13 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         host_caps,
     } = hs;
     let WorkerArgs {
-        bitrate_kbps,
-        frames,
+        params,
+        shared,
         audio_tx,
         rumble_tx,
         rumble_feed,
         hidout_tx,
         pad_audio_tx,
-        pad_audio_caps,
-        pad_mouse,
-        scroll_invert,
         hdr_meta_tx,
         host_timing_tx,
         cursor_shape_tx,
@@ -68,35 +65,9 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         clip_event_tx,
         clip_cmd_rx,
         ready_tx,
-        shutdown,
-        end_reason,
-        quit,
-        mode_slot,
-        probe,
-        frames_dropped,
-        fec_recovered,
-        unsustainable_pin_kbps,
-        mic_stats,
-        hot_tids,
-        clock_offset,
-        rtt_us,
-        decode_lat,
-        live_bitrate,
-        rate_cut,
-        abr_windows,
-        abr_ramp,
-        recent_rfis,
-        short_frames,
-        audio_mute,
-        pad_slots,
-        launch_outcome,
-        access_grants,
-        access_deadline_unix,
         access_tx,
-        end_reject_code,
-        end_reject_said,
-        ..
     } = args;
+    let bitrate_kbps = params.bitrate_kbps;
     let clock_rtt_ns = negotiated.clock_rtt_ns;
     let resolved_bitrate_kbps = negotiated.bitrate_kbps;
     let negotiated_codec = negotiated.codec;
@@ -142,17 +113,23 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         negotiated.chroma_format,
     );
     // ABR encode-threshold unit ([`BitrateController::encode_thresholds`]). Negotiated
-    // refresh, not the request still sitting in `mode_slot` (60-for-120 must score at 60).
+    // refresh, not the request still sitting in `shared.mode` (60-for-120 must score at 60).
     let refresh_hz = negotiated.mode.refresh_hz;
     // Seed before `ready_tx`: `clock_offset_now_ns` must not read a pre-handshake 0.
-    clock_offset.store(negotiated.clock_offset_ns, Ordering::Relaxed);
+    shared
+        .clock_offset
+        .store(negotiated.clock_offset_ns, Ordering::Relaxed);
     // Welcome is the starting encoder target (0 if the host reports none).
-    live_bitrate.store(negotiated.bitrate_kbps, Ordering::Relaxed);
+    shared
+        .live_bitrate_kbps
+        .store(negotiated.bitrate_kbps, Ordering::Relaxed);
     // Seed before the embedder observes us, so `access_grants()` never reads
     // GRANT_ALL on a limited session. Deadline is client wall clock: the wire
     // carries relative `expires_in_secs`, so skew does not move the countdown.
-    access_grants.store(negotiated.grants, Ordering::Relaxed);
-    access_deadline_unix.store(
+    shared
+        .access_grants
+        .store(negotiated.grants, Ordering::Relaxed);
+    shared.access_deadline_unix.store(
         access_deadline_from(wall_clock_ns(), negotiated.expires_in_secs),
         Ordering::Relaxed,
     );
@@ -172,25 +149,22 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         input_rx,
         gamepad_snapshots,
         pad_audio_arrivals,
-        pad_audio_caps,
         input_task::MouseArgs {
-            shared: pad_mouse,
-            grants: access_grants.clone(),
-            mode: mode_slot.clone(),
-            scroll_invert,
+            client: shared.clone(),
             normalized_scroll,
         },
     ));
 
     // Smoothed path round trip for the overlay, sampled while the connection lives.
     let rtt_conn = conn.clone();
+    let rtt_shared = shared.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
                 _ = tick.tick() => {
                     let us = rtt_conn.rtt().as_micros().min(u128::from(u32::MAX)) as u32;
-                    rtt_us.store(us, Ordering::Relaxed);
+                    rtt_shared.rtt_us.store(us, Ordering::Relaxed);
                 }
                 _ = rtt_conn.closed() => break,
             }
@@ -200,15 +174,17 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // 0xCB mic uplink. A frame with more than [`MIC_BACKLOG_MAX`] successors is
     // shed: a stall costs a dropout, not session-long lag ([`MIC_QUEUE`]).
     let mic_conn = conn.clone();
+    let mic_shared = shared.clone();
     tokio::spawn(async move {
+        let stats = &mic_shared.mic_stats;
         while let Some((seq, pts_ns, opus)) = mic_rx.recv().await {
             if mic_rx.len() > MIC_BACKLOG_MAX {
-                mic_stats.dropped_stale.fetch_add(1, Ordering::Relaxed);
+                stats.dropped_stale.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let d = crate::quic::encode_mic_datagram(seq, pts_ns, &opus);
             let _ = mic_conn.send_datagram(d.into());
-            mic_stats.sent.fetch_add(1, Ordering::Relaxed);
+            stats.sent.fetch_add(1, Ordering::Relaxed);
         }
     });
 
@@ -235,30 +211,20 @@ pub(super) async fn run_pump(args: WorkerArgs) {
 
     // Handshake stream stays open ([`control_task`]). When `mode_gen` moves, the
     // data pump re-sizes ABR encode thresholds for the new refresh.
-    let mode_slot_pump = mode_slot.clone();
     tokio::spawn(
         control_task::ControlTask {
             ctrl_rx,
             ctrl_send,
             ctrl_recv,
             clock_rtt_ns,
-            mode_slot,
-            probe: probe.clone(),
+            shared: shared.clone(),
             bitrate_ack: bitrate_ack.clone(),
-            live_bitrate,
             recovery_kf: recovery_kf.clone(),
-            recent_rfis,
             pipeline_gap: pipeline_gap.clone(),
-            clock_offset: clock_offset.clone(),
             clock_gen: clock_gen.clone(),
             clip_event_tx: clip_event_tx.clone(),
             cursor_shape_tx,
             mode_gen: mode_gen.clone(),
-            audio_mute,
-            pad_slots,
-            launch_outcome,
-            access_grants,
-            access_deadline_unix,
             access_tx,
         }
         .run(),
@@ -287,8 +253,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
 
     // Connection close: classify, then shutdown.
     {
-        let shutdown = shutdown.clone();
-        let end_reason = end_reason.clone();
+        let shared = shared.clone();
         let conn = conn.clone();
         tokio::spawn(async move {
             let why = conn.closed().await;
@@ -299,30 +264,24 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             // not find the text still missing.
             if let Some((r, said)) = reject_from_close(&conn) {
                 if !said.is_empty() {
-                    let _ = end_reject_said.set(said);
+                    let _ = shared.end_reject_said.set(said);
                 }
-                end_reject_code.store(r.close_code(), Ordering::SeqCst);
+                shared
+                    .end_reject_code
+                    .store(r.close_code(), Ordering::SeqCst);
             }
-            end_reason.store(reason as u8, Ordering::SeqCst);
-            shutdown.store(true, Ordering::SeqCst);
+            shared.end_reason.store(reason as u8, Ordering::SeqCst);
+            shared.shutdown.store(true, Ordering::SeqCst);
         });
     }
 
     let pump = data::DataPump {
         session,
-        frames,
+        shared: shared.clone(),
         ctrl_tx,
-        shutdown,
-        probe,
-        hot_tids,
-        clock_offset,
         clock_gen,
-        decode_lat,
         encode_lat,
         mode_gen,
-        frames_dropped,
-        fec_recovered,
-        unsustainable_pin_kbps,
         bitrate_ack,
         recovery_kf,
         pipeline_gap,
@@ -337,16 +296,11 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         audio_reserved_kbps,
         stream_cap_kbps,
         refresh_hz,
-        mode_slot: mode_slot_pump,
-        rate_cut,
-        abr_windows,
-        abr_ramp,
-        short_frames,
     };
     let _ = tokio::task::spawn_blocking(move || pump.run()).await;
 
     // Quit code: host skips keep-alive linger. Close 0: host lingers for reconnect.
-    let close_code = if quit.load(Ordering::SeqCst) {
+    let close_code = if shared.quit.load(Ordering::SeqCst) {
         crate::quic::QUIT_CLOSE_CODE
     } else {
         0

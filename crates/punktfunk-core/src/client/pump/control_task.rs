@@ -12,25 +12,20 @@ pub(super) struct ControlTask {
     pub(super) ctrl_recv: io::MsgReader<quinn::RecvStream>,
     /// `None` = no connect-time skew handshake (old host); clock re-sync stays off.
     pub(super) clock_rtt_ns: Option<u64>,
-    pub(super) mode_slot: Arc<Mutex<Mode>>,
-    pub(super) probe: Arc<Mutex<ProbeState>>,
+    /// The cells this task writes as the host reports them: mode, probe, live bitrate, clock
+    /// offset, access, mute, pad slots, launch verdict. Access lands before `access_tx` fires.
+    pub(super) shared: Arc<ClientShared>,
     /// Latest host `BitrateChanged` ack with its reason; the pump ABR drains it on the
     /// report tick.
     pub(super) bitrate_ack: Arc<Mutex<AckQueue>>,
-    /// Live encoder-target ([`NativeClient::current_bitrate_kbps`]). Unlike the
-    /// drain-once ack above, this always holds the latest acked rate for HUDs.
-    pub(super) live_bitrate: Arc<AtomicU32>,
     /// Outbound KEYFRAME asks. Counted here: every emitter (embedder,
     /// `note_frame_index`, pump) funnels through this choke point. The pump
     /// drains the count per report window as the ABR recovery signal.
     pub(super) recovery_kf: Arc<AtomicU32>,
-    /// Outbound RFIs, noted at the same choke point for the overlay's per-minute count.
-    pub(super) recent_rfis: Arc<Mutex<RecentRfis>>,
     /// Last host pipeline gap in ms ([`crate::quic::PipelineGap`]); `0` = none.
     /// Pump drains it and discards the in-flight report window — a host-local
     /// rebuild is not congestion. Atomic because the pump only ever swaps it.
     pub(super) pipeline_gap: Arc<AtomicU32>,
-    pub(super) clock_offset: Arc<std::sync::atomic::AtomicI64>,
     pub(super) clock_gen: Arc<AtomicU32>,
     /// ClipState/ClipOffer share the fetch-data event plane.
     pub(super) clip_event_tx: std::sync::mpsc::SyncSender<ClipEventCore>,
@@ -39,25 +34,9 @@ pub(super) struct ControlTask {
     /// Bumped on every ACCEPTED mode switch (`clock_gen` pattern). The pump
     /// resets bitrate-controller state that belonged to the old mode.
     pub(super) mode_gen: Arc<AtomicU32>,
-    /// Live access grants ([`NativeClient::access_grants`]). Every inbound
-    /// [`AccessUpdate`] overwrites this BEFORE the event is forwarded, so a
-    /// reader woken by the event never sees the pre-update mask.
-    pub(super) access_grants: Arc<AtomicU32>,
-    /// Live access deadline (client unix seconds; `0` = permanent). Re-anchored
-    /// from each `AccessUpdate`'s relative `remaining_secs`.
-    pub(super) access_deadline_unix: Arc<std::sync::atomic::AtomicU64>,
     /// Access updates → [`NativeClient::next_access_update`]. try_send: a
     /// lagging embedder drops the oldest; the two live slots already hold truth.
     pub(super) access_tx: std::sync::mpsc::SyncSender<crate::quic::AccessUpdate>,
-    /// Live mute mask ([`NativeClient::audio_mute`]). This task owns
-    /// [`crate::client::AUDIO_MUTE_HOST`]; the embedder's own bit shares the cell.
-    pub(super) audio_mute: Arc<AtomicU8>,
-    /// Live pad-slot mask ([`NativeClient::pad_slots`]). Latest wins — the host
-    /// resends the whole set whenever one of this session's pads comes or goes.
-    pub(super) pad_slots: Arc<std::sync::atomic::AtomicU16>,
-    /// Latest [`crate::quic::LaunchOutcome`] ([`NativeClient::launch_outcome`]). Latest
-    /// wins: the host sends a second verdict when a spawned game dies on the spot.
-    pub(super) launch_outcome: Arc<std::sync::Mutex<Option<crate::quic::LaunchOutcome>>>,
 }
 
 impl ControlTask {
@@ -67,25 +46,29 @@ impl ControlTask {
             mut ctrl_send,
             mut ctrl_recv,
             clock_rtt_ns,
-            mode_slot,
-            probe,
+            shared,
             bitrate_ack,
-            live_bitrate,
             recovery_kf,
-            recent_rfis,
             pipeline_gap,
-            clock_offset,
             clock_gen,
             clip_event_tx,
             cursor_shape_tx,
             mode_gen,
+            access_tx,
+        } = self;
+        let ClientShared {
+            mode: mode_slot,
+            probe,
+            live_bitrate_kbps: live_bitrate,
+            recent_rfis,
+            clock_offset,
             access_grants,
             access_deadline_unix,
-            access_tx,
             audio_mute,
             pad_slots,
             launch_outcome,
-        } = self;
+            ..
+        } = &*shared;
         // Mid-stream clock re-sync ([`ClockResync`]): a batch every
         // CLOCK_RESYNC_INTERVAL and when the pump asks (CtrlRequest::ClockResync
         // after its first no-op flush). Echoes land in the read arm; skip if
@@ -336,7 +319,7 @@ impl ControlTask {
                         // player's local mute is theirs, and neither clears the other.
                         tracing::info!(muted = st.muted, "host set this session's audio mute");
                         crate::client::set_mute_bit(
-                            &audio_mute,
+                            audio_mute,
                             crate::client::AUDIO_MUTE_HOST,
                             st.muted,
                         );

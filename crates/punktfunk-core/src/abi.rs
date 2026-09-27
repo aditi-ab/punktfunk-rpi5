@@ -2468,38 +2468,35 @@ unsafe fn connect_ex_impl(
                 return std::ptr::null_mut();
             }
         };
-        match crate::client::NativeClient::connect_with_audio_format(
-            host,
-            port,
-            mode,
-            pref,
+        let params = crate::client::ConnectParams {
+            compositor: pref,
             gamepad,
             bitrate_kbps,
             video_caps,
-            crate::audio::normalize_channels(audio_channels),
+            audio_channels: crate::audio::normalize_channels(audio_channels),
             // Unvalidated on purpose: a bad rate is the host's to decline, not a failed connect.
             audio_rate_hz,
             audio_bits,
-            // No C-side ask yet; every embedder decodes whatever coupling the host answers.
-            crate::audio::AudioLayout::Legacy,
-            crate::video_fit::VideoFit::from_wire(video_fit),
+            video_fit: crate::video_fit::VideoFit::from_wire(video_fit),
             video_codecs,
             preferred_codec,
-            // No display-HDR-volume in the C ABI; host EDID defaults stand.
-            None,
             // CLIENT_CAP_CURSOR: host stops compositing; only if the embedder draws the cursor.
             client_caps,
-            // No slice-progressive parts: `PunktfunkFrame` cannot tell a part from a whole AU.
-            false,
             launch,
             // Knock label: embedder `device_name`, else OS default.
-            Some(name),
+            name: Some(name),
             pin,
             identity,
-            std::time::Duration::from_millis(timeout_ms as u64),
-            // No abort switch: connect is blocking with nothing to poll.
-            None,
-        ) {
+            // The rest stays default: Legacy coupling (embedders decode what the host answers),
+            // no display volume, whole AUs (`PunktfunkFrame` cannot tell a part), no abort.
+            ..crate::client::ConnectParams::new(
+                host,
+                port,
+                mode,
+                std::time::Duration::from_millis(timeout_ms as u64),
+            )
+        };
+        match crate::client::NativeClient::connect(params) {
             Ok(c) => {
                 // SAFETY: `observed_sha256_out` is null or writable for 32 bytes (caller contract).
                 unsafe { put_sha256(observed_sha256_out, c.host_fingerprint) };

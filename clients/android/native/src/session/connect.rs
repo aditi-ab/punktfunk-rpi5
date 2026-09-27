@@ -5,7 +5,7 @@ use jni::errors::LogErrorAndDefault;
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, jlong};
 use jni::EnvUnowned;
-use punktfunk_core::client::NativeClient;
+use punktfunk_core::client::{ConnectParams, NativeClient};
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -505,14 +505,11 @@ fn connect(req: ConnectRequest) -> jlong {
     // playback.
     let (audio_rate_hz, audio_bits) =
         resolve_requested_audio_format(audio_rate_hz, audio_bits, audio_channels);
-    match NativeClient::connect_with_audio_format(
-        &host,
-        port,
-        mode,
-        CompositorPref::from_u8(compositor_pref),
-        GamepadPref::from_u8(gamepad_pref),
+    let params = ConnectParams {
+        compositor: CompositorPref::from_u8(compositor_pref),
+        gamepad: GamepadPref::from_u8(gamepad_pref),
         bitrate_kbps, // 0 = host default
-        video_caps(hdr_enabled, ten_bit_sdr, multi_slice_ok),
+        video_caps: video_caps(hdr_enabled, ten_bit_sdr, multi_slice_ok),
         audio_channels,
         // The audio format this session ASKS for (resolved above). A non-default pair is what
         // makes core set `CLIENT_CAP_AUDIO_HIRES` in the `Hello` — capable AND the user turned it
@@ -523,14 +520,14 @@ fn connect(req: ConnectRequest) -> jlong {
         audio_rate_hz,
         audio_bits,
         // Legacy coupling: libopus here decodes either, and nothing on Android needs the other.
-        punktfunk_core::audio::AudioLayout::Legacy,
-        punktfunk_core::video_fit::VideoFit::from_name(&video_fit),
+        audio_layout: punktfunk_core::audio::AudioLayout::Legacy,
+        video_fit: punktfunk_core::video_fit::VideoFit::from_name(&video_fit),
         // Codecs this device decodes (`VideoDecoders.decodableCodecBits`): H.264 + HEVC always,
         // AV1 on a real `video/av01` decoder, PyroWave on a GPU that passes the probe — the one
         // bit here naming no MediaCodec, since it decodes as Vulkan compute in `crate::pyro`.
         // Masked to the known bits, falling back to H.264|HEVC on 0 so a bogus value cannot
         // advertise nothing and kill the handshake. The host echoes its pick in `connector.codec`.
-        {
+        video_codecs: {
             let bits = video_codecs
                 & (punktfunk_core::quic::CODEC_H264
                     | punktfunk_core::quic::CODEC_HEVC
@@ -545,7 +542,7 @@ fn connect(req: ConnectRequest) -> jlong {
         preferred_codec,
         // No display-volume forwarding from Android yet (the panel tone-maps PQ itself via the
         // Surface dataspace + static metadata) — the host keeps its virtual-display EDID defaults.
-        None,
+        display_hdr: None,
         // No CLIENT_CAP_CURSOR: this client does not render the host cursor locally (no
         // shape/state planes in the jni surface) — advertising it would stream cursor-less.
         // CLIENT_CAP_PHASE_LOCK is honest: the async decode loop's presenter feeds
@@ -555,7 +552,7 @@ fn connect(req: ConnectRequest) -> jlong {
         // arrival bits: without it the host never sets HOST_CAP_PAD_AUDIO and never emits 0xD1,
         // so declaring a pad's render caps later would have nothing to gate. Gated on the
         // settings so a user with pad audio off does not make the host provision endpoints.
-        punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
+        client_caps: punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
             | if pad_audio_ok {
                 punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO
             } else {
@@ -577,17 +574,16 @@ fn connect(req: ConnectRequest) -> jlong {
         // loop feeds them with BUFFER_FLAG_PARTIAL_FRAME.
         frame_parts,
         launch, // a store-qualified library id to boot into a game, or None for the desktop
-        device_name, // Kotlin's Build.MODEL — the host's approval-list / trust-store label
+        name: device_name, // Kotlin's Build.MODEL — the host's approval-list / trust-store label
         pin,    // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)
         // Handshake budget from Kotlin: ~10 s for a normal connect, ~185 s for "request access"
         // (the host parks the connection until the operator approves the device — see ConnectScreen).
-        Duration::from_millis(timeout_ms),
-        // The Kotlin side cancels by dropping the result (`Dial.cancelled`), not by aborting
-        // the dial — its connect runs on a pool thread, so a parked one costs a thread, not a
-        // stuck UI. Wire a flag through here if that ever stops being true.
-        None,
-    ) {
+        // No `cancel`: Kotlin drops the result (`Dial.cancelled`) rather than abort the dial — its
+        // connect runs on a pool thread, so a parked one costs a thread, not a stuck UI.
+        ..ConnectParams::new(&host, port, mode, Duration::from_millis(timeout_ms))
+    };
+    match NativeClient::connect(params) {
         Ok(client) => {
             let client = Arc::new(client);
             let handle = SessionHandle {

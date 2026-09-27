@@ -6,8 +6,8 @@
 //!
 //! Usage: `mu-smoke <port> <W> <H> [seconds] [--input]`
 
-use punktfunk_core::client::NativeClient;
-use punktfunk_core::config::{CompositorPref, GamepadPref};
+use punktfunk_core::client::{ConnectParams, NativeClient};
+use punktfunk_core::config::CompositorPref;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::{Mode, PunktfunkError};
 use std::time::{Duration, Instant};
@@ -25,26 +25,11 @@ fn main() {
         height: h,
         refresh_hz: 60,
     };
-    let client = NativeClient::connect(
-        "127.0.0.1",
-        port,
-        mode,
-        CompositorPref::Gamescope,
-        GamepadPref::Auto,
-        0, // host default
-        0, // 8-bit SDR
-        2, // stereo
-        0, // 0 → HEVC-only
-        0, // auto
-        None,
-        0,
-        false, // no part decoder
-        None,  // bare spawn
-        Some(format!("mu-smoke-{w}x{h}")),
-        None, // TOFU
-        None, // ephemeral
-        Duration::from_secs(40),
-    )
+    let client = NativeClient::connect(ConnectParams {
+        compositor: CompositorPref::Gamescope,
+        name: Some(format!("mu-smoke-{w}x{h}")),
+        ..ConnectParams::new("127.0.0.1", port, mode, Duration::from_secs(40))
+    })
     .expect("connect");
     eprintln!("mu-smoke {w}x{h}: connected");
 

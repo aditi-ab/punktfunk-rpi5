@@ -69,7 +69,7 @@ use self::probe::ProbeState;
 use self::pump::run_pump;
 pub use self::recovery::FrameOrder;
 use self::recovery::{RecentRfis, RecoveryAsk, RfiRecovery, ShortFrames};
-use self::worker::WorkerArgs;
+use self::worker::{ClientShared, WorkerArgs};
 
 /// What this client calls itself in the host's `handshake complete` line: build plus the shell
 /// and path that dialled. Process-wide because it describes the embedder, not one session; set it
@@ -234,9 +234,10 @@ impl From<&quinn::ConnectionError> for PunktfunkEndReason {
 }
 
 pub struct NativeClient {
+    /// Cells the worker writes and this handle reads, or the other way round.
+    shared: Arc<ClientShared>,
     // Per-plane mutex so `NativeClient` is `Sync`. One-thread-per-plane (C ABI); the
     // lock is uncontended there. Two threads racing one plane serialize instead of UB.
-    frames: Arc<FrameChannel>,
     audio: Mutex<Receiver<AudioPacket>>,
     rumble: Mutex<Receiver<RumbleUpdate>>,
     /// Policy engine in parallel with the raw `rumble` queue. Consume ONE of the two APIs
@@ -246,13 +247,6 @@ pub struct NativeClient {
     /// DualSense haptics/speaker Opus. Empty unless [`quic::CLIENT_CAP_PAD_AUDIO`] met
     /// [`quic::HOST_CAP_PAD_AUDIO`].
     pad_audio: Mutex<Receiver<PadAudioFrame>>,
-    /// Per-pad render caps (bit0 haptics, bit1 speaker). OR'd into arrival flags 8/9 toward
-    /// a `HOST_CAP_PAD_AUDIO` host only.
-    pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]>,
-    /// Pads translated into pointer and keys ([`NativeClient::set_pad_mouse`]).
-    pad_mouse: Arc<pad_mouse::PadMouseShared>,
-    /// Live setting read by the shared input seam for every scroll event.
-    scroll_invert: Arc<AtomicBool>,
     hdr_meta: Mutex<Receiver<HdrMeta>>,
     /// Newest entry [`NativeClient::latest_hdr_meta`] drained.
     hdr_meta_last: Mutex<Option<HdrMeta>>,
@@ -270,7 +264,6 @@ pub struct NativeClient {
     /// Bounded ([`MIC_QUEUE`]): pump sheds oldest-first; a full queue drops the fresh frame.
     /// Standing backlog is worse than a dropout.
     mic_tx: tokio::sync::mpsc::Sender<(u32, u64, Vec<u8>)>,
-    mic_stats: Arc<MicUplinkCounters>,
     /// Pre-encoded 0xCC bytes ([`RichInput`] and [`crate::quic::PenBatch`]). Worker forwards;
     /// a new 0xCC kind never touches the pump.
     rich_input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
@@ -288,37 +281,9 @@ pub struct NativeClient {
     pub host_caps2: u8,
     /// `0` when the host did not advertise a management port.
     pub mgmt_port: u16,
-    /// Seeded from Welcome, latest [`crate::quic::AccessUpdate`] wins.
-    access_grants: Arc<AtomicU32>,
-    /// Client-wall unix seconds; `0` = permanent.
-    access_deadline_unix: Arc<AtomicU64>,
-    /// Mid-session [`crate::reject::RejectReason`] close code; `0` = none.
-    end_reject_code: Arc<AtomicU32>,
-    /// The sentence the host sent with that close, if any.
-    end_reject_said: Arc<std::sync::OnceLock<String>>,
-    probe: Arc<Mutex<ProbeState>>,
-    shutdown: Arc<AtomicBool>,
-    /// [`PunktfunkEndReason`] as `u8`, latched with `shutdown`.
-    end_reason: Arc<AtomicU8>,
-    /// [`NativeClient::disconnect_quit`] → [`crate::quic::QUIT_CLOSE_CODE`] (skip keep-alive
-    /// linger). A plain drop leaves this false → close code 0.
-    quit: Arc<AtomicBool>,
-    /// Unrecoverable AUs. Watch for increases to request a keyframe: infinite GOP conceals
-    /// reference-missing frames, so a decode-error trigger misses them.
-    frames_dropped: Arc<AtomicU64>,
-    /// Parity-repaired shards. HUD windows by diffing successive reads.
-    fec_recovered: Arc<AtomicU64>,
-    /// See [`unsustainable_pin_kbps`](Self::unsustainable_pin_kbps).
-    unsustainable_pin_kbps: Arc<AtomicU32>,
     /// Shared loss-range detector for [`note_frame_index`](Self::note_frame_index): next
     /// expected `frame_index` plus RFI throttle. Avoids per-embedder wrapping arithmetic.
     rfi: Mutex<RfiRecovery>,
-    /// Pump tid plus [`NativeClient::register_hot_thread`] ids. Android feeds ADPF. Empty
-    /// without `gettid` (see [`current_hot_tid`]).
-    hot_tids: Arc<Mutex<Vec<i32>>>,
-    /// Live host−client offset (ns). Seeded at connect, refreshed every 60 s and on the
-    /// pump's first no-op clock flush.
-    clock_offset: Arc<AtomicI64>,
     /// `displayed + clock_offset − pts` (ns). `0` = nothing presented yet. Presenter writes;
     /// audio reads to land with the picture ([`crate::audio::AvSync`]). Lives next to
     /// `clock_offset` because neither plane owns the other.
@@ -327,38 +292,12 @@ pub struct NativeClient {
     audio_av_offset_ms: Arc<AtomicI64>,
     /// Playback-ring depth (ms). Audio writes, HUD reads.
     audio_buffer_ms: Arc<AtomicU32>,
-    /// Why the speakers are silent: [`AUDIO_MUTE_LOCAL`] | [`AUDIO_MUTE_HOST`]. The embedder
-    /// owns its bit, the control task the host's; clearing one leaves the other standing.
-    audio_mute: Arc<AtomicU8>,
-    /// OS pad slots the host gave this session, one bit each. Slot `n` is player
-    /// `n + 1`; `0` until a pad of ours has a device on the host.
-    pad_slots: Arc<AtomicU16>,
-    /// Latest launch verdict from the host; `None` until one arrives.
-    launch_outcome: Arc<Mutex<Option<crate::quic::LaunchOutcome>>>,
-    /// Smoothed QUIC round trip (µs), sampled by the worker. `0` until the first sample.
-    rtt_us: Arc<AtomicU32>,
     /// The stats overlay window. Receipt and 0xCF timings land in it as they are pulled.
     hud: Arc<crate::hud::Stats>,
-    /// Embedder decode-latency samples. Pump drains per window into ABR; see [`DecodeLatAcc`].
-    decode_lat: Arc<Mutex<DecodeLatAcc>>,
-    /// Live encoder target (kbps), follows `BitrateChanged`. [`resolved_bitrate_kbps`] is the
-    /// frozen session-start value. `0` = old host that never reported a rate.
-    live_bitrate_kbps: Arc<AtomicU32>,
-    /// [`crate::hud::RateCut`] code the pump publishes each window; `0` = no standing cut.
-    rate_cut: Arc<AtomicU8>,
-    /// Closed ABR windows waiting to be read ([`NativeClient::take_abr_windows`]).
-    abr_windows: Arc<Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>>,
-    /// What the bring-up ramp measured ([`NativeClient::abr_ramp`]).
-    abr_ramp: Arc<Mutex<Option<crate::abr::RampRecord>>>,
-    /// RFIs the control task sent, aged at each overlay read.
-    recent_rfis: Arc<Mutex<RecentRfis>>,
-    /// Frames the pump skipped while short; [`request_rfi`](Self::request_rfi) logs theirs.
-    short_frames: Arc<Mutex<ShortFrames>>,
     /// ABR armed (Automatic, not rate-pinned PyroWave). Skip per-frame decode measurement when
     /// false ([`wants_decode_latency`](Self::wants_decode_latency)).
     wants_decode: bool,
     worker: Option<std::thread::JoinHandle<()>>,
-    mode: Arc<std::sync::Mutex<Mode>>,
     /// SHA-256 of the cert the host presented. A TOFU caller (`pin = None`) persists this.
     pub host_fingerprint: [u8; 32],
     /// Host-resolved compositor. `Auto` = older host. Gamescope capture has no cursor, so
@@ -560,7 +499,7 @@ fn os_hostname() -> Option<String> {
 fn advertised_client_caps(client_caps: u8, audio_rate_hz: u32, audio_bits: u8) -> u8 {
     // Non-zero = caller specified a format, not "differs from default". 48 kHz/16-bit is
     // both the default and the cheapest lossless rung; a "differs" rule would make it
-    // unreachable. [`NativeClient::connect`] passes 0/0; the wire encodes 48 000/16 as absent.
+    // unreachable. [`ConnectParams::new`] leaves 0/0; the wire encodes 48 000/16 as absent.
     let hires = audio_rate_hz != 0 || audio_bits != 0;
     client_caps
         | crate::quic::CLIENT_CAP_AUDIO_RED
@@ -571,128 +510,102 @@ fn advertised_client_caps(client_caps: u8, audio_rate_hz: u32, audio_bits: u8) -
         }
 }
 
-impl NativeClient {
-    /// Connect to a `punktfunk/1` host at (up to) `mode`. Blocks until handshake or `timeout`.
-    ///
-    /// `pin`: expected SHA-256 of the host cert. Mismatch → [`PunktfunkError::Crypto`].
-    /// `None` = TOFU; read [`NativeClient::host_fingerprint`] afterwards.
-    ///
-    /// `identity`: persistent PEM + PKCS#8 ([`endpoint::generate_identity`]) for TLS client
-    /// auth. `None` = anonymous (rejected by hosts that require pairing).
-    ///
-    /// Asks for legacy Opus 48 kHz / 16-bit so `Hello` stays byte-identical to the pre-hi-res
-    /// wire. Lossless callers use [`connect_with_audio_format`](Self::connect_with_audio_format).
-    #[allow(clippy::too_many_arguments)]
-    pub fn connect(
-        host: &str,
-        port: u16,
-        mode: Mode,
-        compositor: CompositorPref,
-        gamepad: GamepadPref,
-        bitrate_kbps: u32,
-        // quic::VIDEO_CAP_10BIT / VIDEO_CAP_HDR. Host upgrades only when the matching bit is
-        // set. 0 = 8-bit BT.709, which every client understands.
-        video_caps: u8,
-        // 2 / 6 / 8; host clamps to capture and echoes in [`NativeClient::audio_channels`].
-        audio_channels: u8,
-        // Decode bitfield (H264 / HEVC / AV1) plus a single-bit preference (`0` = auto).
-        // Host echoes the chosen codec in [`NativeClient::codec`].
-        video_codecs: u8,
-        preferred_codec: u8,
-        // Panel volume for the virtual display's EDID. `None` = unknown/SDR (host EDID defaults).
-        display_hdr: Option<HdrMeta>,
-        // Set [`crate::quic::CLIENT_CAP_CURSOR`] only if this embedder renders the pointer:
-        // the host then stops compositing it, so a non-renderer streams with no cursor. `0`
-        // = composited.
-        client_caps: u8,
-        // AU prefixes as [`Frame`]s with `part = Some` while the rest is on the wire. Set
-        // only if the decoder understands parts (MediaCodec BUFFER_FLAG_PARTIAL_FRAME).
-        frame_parts: bool,
-        launch: Option<String>,
-        // [`crate::quic::Hello::name`]. `None` → fingerprint "device abcd1234". Usually
-        // [`device_name`].
-        name: Option<String>,
-        pin: Option<[u8; 32]>,
-        identity: Option<(String, String)>,
-        timeout: Duration,
-    ) -> Result<NativeClient> {
-        Self::connect_with_audio_format(
-            host,
+/// One dial's ask: the `Hello` fields plus how to reach, trust and wait for the host.
+///
+/// [`ConnectParams::new`] fills what a plain dial sends: host-decided compositor, pad and
+/// bitrate, 8-bit SDR, stereo Opus, HEVC only, no client caps, no launch, anonymous TOFU.
+/// Set the rest by field name.
+pub struct ConnectParams {
+    /// IP literal or resolvable hostname.
+    pub host: String,
+    pub port: u16,
+    /// Asked-for size; the host answers in [`NativeClient::mode`].
+    pub mode: Mode,
+    pub compositor: CompositorPref,
+    pub gamepad: GamepadPref,
+    /// Encoder rate in kbps; `0` = host default, and the only value that arms ABR.
+    pub bitrate_kbps: u32,
+    /// [`crate::quic::VIDEO_CAP_10BIT`] / [`crate::quic::VIDEO_CAP_HDR`]; the host upgrades only
+    /// on a set bit. `0` = 8-bit BT.709.
+    pub video_caps: u8,
+    /// 2 / 6 / 8; the host clamps and answers in [`NativeClient::audio_channels`].
+    pub audio_channels: u8,
+    /// Audio format ask ([`crate::audio::pcm::rate_is_supported`]); `0` = unspecified. Either
+    /// half non-zero asks for lossless ([`advertised_client_caps`]), 48 kHz/16-bit included.
+    pub audio_rate_hz: u32,
+    /// 16 or 24; see `audio_rate_hz`.
+    pub audio_bits: u8,
+    /// Surround coupling to ask for; `Legacy` keeps the `Hello` byte-identical.
+    pub audio_layout: crate::audio::AudioLayout,
+    /// How this client fills its view ([`crate::quic::Hello::video_fit`]).
+    pub video_fit: crate::video_fit::VideoFit,
+    /// Decode bitfield (H264 / HEVC / AV1 / PyroWave); `0` = HEVC only.
+    pub video_codecs: u8,
+    /// One codec bit to prefer; `0` = host's choice. The host answers in [`NativeClient::codec`].
+    pub preferred_codec: u8,
+    /// Panel volume for the virtual display's EDID; `None` = unknown/SDR.
+    pub display_hdr: Option<HdrMeta>,
+    /// Set [`crate::quic::CLIENT_CAP_CURSOR`] only when this embedder draws the pointer: the
+    /// host then stops compositing it.
+    pub client_caps: u8,
+    /// AU prefixes as [`Frame`]s with `part = Some`. Only for a decoder that takes parts.
+    pub frame_parts: bool,
+    /// Store-qualified library id to launch (`steam:570`).
+    pub launch: Option<String>,
+    /// [`crate::quic::Hello::name`], usually [`device_name`]. `None` knocks as "device abcd1234".
+    pub name: Option<String>,
+    /// Expected SHA-256 of the host cert; a mismatch is [`PunktfunkError::Crypto`]. `None` =
+    /// TOFU: read [`NativeClient::host_fingerprint`] afterwards.
+    pub pin: Option<[u8; 32]>,
+    /// PEM cert + PKCS#8 key ([`endpoint::generate_identity`]); `None` = anonymous.
+    pub identity: Option<(String, String)>,
+    /// Handshake budget. The dial re-dials inside it, so a waking host is not a failure.
+    pub timeout: Duration,
+    /// Abort while blocked: a request-access knock parks ~185 s. Never alias the session's
+    /// `shutdown` onto it; that races the end reason. `None` = uncancelable.
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl ConnectParams {
+    /// A plain dial to `host:port` at (up to) `mode`, giving up after `timeout`.
+    pub fn new(host: impl Into<String>, port: u16, mode: Mode, timeout: Duration) -> Self {
+        ConnectParams {
+            host: host.into(),
             port,
             mode,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            video_caps,
-            audio_channels,
-            // 0/0 = unspecified, so `Hello` stays pre-hi-res. Explicit 48 000/16 would mean
-            // "cheapest lossless rung" under `advertised_client_caps`.
-            0,
-            0,
-            crate::audio::AudioLayout::Legacy,
-            crate::video_fit::VideoFit::Fit,
-            video_codecs,
-            preferred_codec,
-            display_hdr,
-            client_caps,
-            frame_parts,
-            launch,
-            name,
-            pin,
-            identity,
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            video_caps: 0,
+            audio_channels: 2,
+            audio_rate_hz: 0,
+            audio_bits: 0,
+            audio_layout: crate::audio::AudioLayout::Legacy,
+            video_fit: crate::video_fit::VideoFit::Fit,
+            video_codecs: 0,
+            preferred_codec: 0,
+            display_hdr: None,
+            client_caps: 0,
+            frame_parts: false,
+            launch: None,
+            name: None,
+            pin: None,
+            identity: None,
             timeout,
-            None,
-        )
+            cancel: None,
+        }
     }
+}
 
-    /// [`connect`](Self::connect) plus the audio format asked for: `audio_rate_hz`
-    /// ([`crate::audio::pcm::rate_is_supported`]) and `audio_bits` (16 or 24).
+impl NativeClient {
+    /// Dial a `punktfunk/1` host and block until the handshake lands, `timeout` passes or
+    /// `cancel` is set. A host that turns the dial away is [`PunktfunkError::Rejected`].
     ///
-    /// [`quic::CLIENT_CAP_AUDIO_HIRES`] is set when either argument is non-zero (`0` =
-    /// unspecified, which [`connect`](Self::connect) passes). Not "differs from 48/16": that
-    /// would make the cheapest lossless rung unreachable. Unlike [`quic::CLIENT_CAP_AUDIO_RED`]
-    /// (always OR'd), hi-res costs 1.5–4.6 Mbps ABR cannot reclaim.
-    ///
-    /// 48 kHz/16-bit through this pair stays Opus (byte-identical to legacy). Ask 48 kHz/24-bit
-    /// for lossless at the default rate, or set [`quic::CLIENT_CAP_AUDIO_HIRES`] in `client_caps`
-    /// (OR'd, never substituted). The host may still answer Opus; open the device from
+    /// The host may answer below the ask: open the audio device from
     /// [`audio_codec`](Self::audio_codec) / [`audio_sample_rate_hz`](Self::audio_sample_rate_hz) /
-    /// [`audio_bits`](Self::audio_bits).
-    #[allow(clippy::too_many_arguments)]
-    pub fn connect_with_audio_format(
-        host: &str,
-        port: u16,
-        mode: Mode,
-        compositor: CompositorPref,
-        gamepad: GamepadPref,
-        bitrate_kbps: u32,
-        video_caps: u8,
-        audio_channels: u8,
-        audio_rate_hz: u32,
-        audio_bits: u8,
-        // Surround coupling to ask for ([`crate::audio::AudioLayout`]). The host answers in
-        // [`NativeClient::audio_layout`]; `Legacy` keeps the Hello byte-identical.
-        audio_layout: crate::audio::AudioLayout,
-        // How this client fills its view ([`crate::quic::Hello::video_fit`]); `Fit` keeps the
-        // Hello byte-identical.
-        video_fit: crate::video_fit::VideoFit,
-        video_codecs: u8,
-        preferred_codec: u8,
-        display_hdr: Option<HdrMeta>,
-        client_caps: u8,
-        frame_parts: bool,
-        launch: Option<String>,
-        name: Option<String>,
-        pin: Option<[u8; 32]>,
-        identity: Option<(String, String)>,
-        timeout: Duration,
-        // Abort while blocked. Request-access can park ~185 s; Cancel cannot honour that if
-        // this call ignores the flag. Same give-up as budget expiry (quit + shutdown). Do not
-        // alias onto `shutdown` — the pump means "this connection died" and a caller-set flag
-        // would race the end reason. `None` = uncancelable.
-        cancel: Option<Arc<AtomicBool>>,
-    ) -> Result<NativeClient> {
-        let frame_chan = Arc::new(FrameChannel::new());
+    /// [`audio_bits`](Self::audio_bits) and build the decoder from [`codec`](Self::codec), never
+    /// from `params`.
+    pub fn connect(mut params: ConnectParams) -> Result<NativeClient> {
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioPacket>(AUDIO_QUEUE);
         let (rumble_tx, rumble_rx) = std::sync::mpsc::sync_channel::<RumbleUpdate>(RUMBLE_QUEUE);
         let rumble_sched = Arc::new(rumble::RumbleShared::new());
@@ -700,10 +613,6 @@ impl NativeClient {
         let (hidout_tx, hidout_rx) = std::sync::mpsc::sync_channel::<HidOutput>(HIDOUT_QUEUE);
         let (pad_audio_tx, pad_audio_rx) =
             std::sync::mpsc::sync_channel::<PadAudioFrame>(PAD_AUDIO_QUEUE);
-        let pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]> =
-            Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
-        let pad_mouse = Arc::new(pad_mouse::PadMouseShared::default());
-        let scroll_invert = Arc::new(AtomicBool::new(false));
         let (hdr_meta_tx, hdr_meta_rx) = std::sync::mpsc::sync_channel::<HdrMeta>(HDR_META_QUEUE);
         let (host_timing_tx, host_timing_rx) =
             std::sync::mpsc::sync_channel::<crate::quic::HostTiming>(HOST_TIMING_QUEUE);
@@ -720,71 +629,15 @@ impl NativeClient {
         let (access_tx, access_rx) =
             std::sync::mpsc::sync_channel::<crate::quic::AccessUpdate>(ACCESS_QUEUE);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Negotiated>>();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let end_reason = Arc::new(AtomicU8::new(PunktfunkEndReason::None as u8));
-        let quit = Arc::new(AtomicBool::new(false));
-        let mode_slot = Arc::new(std::sync::Mutex::new(mode));
-        let probe = Arc::new(Mutex::new(ProbeState::default()));
-        let frames_dropped = Arc::new(AtomicU64::new(0));
-        let fec_recovered = Arc::new(AtomicU64::new(0));
-        let unsustainable_pin_kbps = Arc::new(AtomicU32::new(0));
-        let mic_stats = Arc::new(MicUplinkCounters::default());
-        let hot_tids = Arc::new(Mutex::new(Vec::new()));
-        let clock_offset = Arc::new(AtomicI64::new(0));
-        let video_e2e_ns = Arc::new(AtomicU64::new(0));
-        let audio_av_offset_ms = Arc::new(AtomicI64::new(0));
-        let audio_buffer_ms = Arc::new(AtomicU32::new(0));
-        let audio_mute = Arc::new(AtomicU8::new(0));
-        let pad_slots = Arc::new(AtomicU16::new(0));
-        let launch_outcome = Arc::new(Mutex::new(None));
-        let rtt_us = Arc::new(AtomicU32::new(0));
-        let decode_lat = Arc::new(Mutex::new(DecodeLatAcc::default()));
-        let abr_windows = Arc::new(Mutex::new(std::collections::VecDeque::new()));
-        let abr_ramp = Arc::new(Mutex::new(None));
-        // Pump seeds from Welcome before ready_tx, then follows every ack.
-        let live_bitrate = Arc::new(AtomicU32::new(0));
-        let rate_cut = Arc::new(AtomicU8::new(0));
-        let recent_rfis = Arc::new(Mutex::new(RecentRfis::default()));
-        let short_frames = Arc::new(Mutex::new(ShortFrames::default()));
-        // Same seeding: Welcome before ready_tx, then every AccessUpdate. GRANT_ALL /
-        // permanent here is the pre-handshake placeholder.
-        let access_grants = Arc::new(AtomicU32::new(crate::quic::GRANT_ALL));
-        let access_deadline_unix = Arc::new(AtomicU64::new(0));
-        let end_reject_code = Arc::new(AtomicU32::new(0));
-        let end_reject_said: Arc<std::sync::OnceLock<String>> =
-            Arc::new(std::sync::OnceLock::new());
+        let shared = Arc::new(ClientShared::new(params.mode));
 
-        let host = host.to_string();
-        let frame_chan_w = frame_chan.clone();
-        let shutdown_w = shutdown.clone();
-        let end_reason_w = end_reason.clone();
-        let quit_w = quit.clone();
-        let mode_slot_w = mode_slot.clone();
-        let probe_w = probe.clone();
-        let frames_dropped_w = frames_dropped.clone();
-        let fec_recovered_w = fec_recovered.clone();
-        let unsustainable_pin_kbps_w = unsustainable_pin_kbps.clone();
-        let mic_stats_w = mic_stats.clone();
-        let hot_tids_w = hot_tids.clone();
-        let clock_offset_w = clock_offset.clone();
-        let rtt_us_w = rtt_us.clone();
-        let decode_lat_w = decode_lat.clone();
-        let abr_windows_w = abr_windows.clone();
-        let abr_ramp_w = abr_ramp.clone();
-        let live_bitrate_w = live_bitrate.clone();
-        let rate_cut_w = rate_cut.clone();
-        let recent_rfis_w = recent_rfis.clone();
-        let short_frames_w = short_frames.clone();
-        let pad_audio_caps_w = pad_audio_caps.clone();
-        let pad_mouse_w = pad_mouse.clone();
-        let scroll_invert_w = scroll_invert.clone();
-        let audio_mute_w = audio_mute.clone();
-        let pad_slots_w = pad_slots.clone();
-        let launch_outcome_w = launch_outcome.clone();
-        let access_grants_w = access_grants.clone();
-        let access_deadline_w = access_deadline_unix.clone();
-        let end_reject_w = end_reject_code.clone();
-        let end_reject_said_w = end_reject_said.clone();
+        let cancel = params.cancel.take();
+        let (timeout, bitrate_kbps, requested_gamepad) =
+            (params.timeout, params.bitrate_kbps, params.gamepad);
+        // RED is core-decided; HIRES is not. See `advertised_client_caps`.
+        params.client_caps =
+            advertised_client_caps(params.client_caps, params.audio_rate_hz, params.audio_bits);
+        let shared_w = shared.clone();
         let ctrl_tx_pump = ctrl_tx.clone(); // pump sends adaptive-FEC LossReports
         let worker = std::thread::Builder::new()
             .name("punktfunk-client".into())
@@ -804,38 +657,13 @@ impl NativeClient {
                     }
                 };
                 rt.block_on(run_pump(WorkerArgs {
-                    host,
-                    port,
-                    mode,
-                    compositor,
-                    gamepad,
-                    bitrate_kbps,
-                    video_caps,
-                    audio_channels,
-                    audio_rate_hz,
-                    audio_bits,
-                    audio_layout,
-                    video_fit,
-                    video_codecs,
-                    preferred_codec,
-                    display_hdr,
-                    // RED is core-decided; HIRES is not. See `advertised_client_caps`.
-                    client_caps: advertised_client_caps(client_caps, audio_rate_hz, audio_bits),
-                    frame_parts,
-                    launch,
-                    name,
-                    pin,
-                    identity,
-                    connect_timeout: timeout,
-                    frames: frame_chan_w,
+                    params,
+                    shared: shared_w,
                     audio_tx,
                     rumble_tx,
                     rumble_feed,
                     hidout_tx,
                     pad_audio_tx,
-                    pad_audio_caps: pad_audio_caps_w,
-                    pad_mouse: pad_mouse_w,
-                    scroll_invert: scroll_invert_w,
                     hdr_meta_tx,
                     host_timing_tx,
                     cursor_shape_tx,
@@ -848,33 +676,7 @@ impl NativeClient {
                     clip_event_tx,
                     clip_cmd_rx,
                     ready_tx,
-                    shutdown: shutdown_w,
-                    end_reason: end_reason_w,
-                    quit: quit_w,
-                    mode_slot: mode_slot_w,
-                    probe: probe_w,
-                    frames_dropped: frames_dropped_w,
-                    fec_recovered: fec_recovered_w,
-                    unsustainable_pin_kbps: unsustainable_pin_kbps_w,
-                    mic_stats: mic_stats_w,
-                    hot_tids: hot_tids_w,
-                    clock_offset: clock_offset_w,
-                    rtt_us: rtt_us_w,
-                    decode_lat: decode_lat_w,
-                    abr_windows: abr_windows_w,
-                    abr_ramp: abr_ramp_w,
-                    live_bitrate: live_bitrate_w,
-                    rate_cut: rate_cut_w,
-                    recent_rfis: recent_rfis_w,
-                    short_frames: short_frames_w,
-                    audio_mute: audio_mute_w,
-                    pad_slots: pad_slots_w,
-                    launch_outcome: launch_outcome_w,
-                    access_grants: access_grants_w,
-                    access_deadline_unix: access_deadline_w,
                     access_tx,
-                    end_reject_code: end_reject_w,
-                    end_reject_said: end_reject_said_w,
                 }));
             })
             .map_err(PunktfunkError::Io)?;
@@ -895,40 +697,29 @@ impl NativeClient {
                 Err(_) => {
                     // Failed connect must not linger if handshake lands late: QUIT, not close
                     // code 0, so the host tears down instead of holding a virtual display.
-                    quit.store(true, Ordering::SeqCst);
-                    shutdown.store(true, Ordering::SeqCst);
+                    shared.quit.store(true, Ordering::SeqCst);
+                    shared.shutdown.store(true, Ordering::SeqCst);
                     return Err(PunktfunkError::Timeout);
                 }
             }
         };
-        *mode_slot.lock().unwrap() = negotiated.mode;
-        let hud = Arc::new(crate::hud::Stats::new(clock_offset.clone()));
+        *shared.mode.lock().unwrap() = negotiated.mode;
+        let hud = Arc::new(crate::hud::Stats::new(shared.clock_offset.clone()));
         Ok(NativeClient {
-            frames: frame_chan,
+            shared,
             audio: Mutex::new(audio_rx),
             rumble: Mutex::new(rumble_rx),
             rumble_sched,
             hidout: Mutex::new(hidout_rx),
             pad_audio: Mutex::new(pad_audio_rx),
-            pad_audio_caps,
-            pad_mouse,
-            scroll_invert,
             hdr_meta: Mutex::new(hdr_meta_rx),
             hdr_meta_last: Mutex::new(None),
             host_timing: Mutex::new(host_timing_rx),
             cursor_shape: cursor_shape_rx,
             cursor_state: Mutex::new(cursor_state_rx),
             access: Mutex::new(access_rx),
-            audio_mute,
-            pad_slots,
-            launch_outcome,
-            access_grants,
-            access_deadline_unix,
-            end_reject_code,
-            end_reject_said,
             input_tx,
             mic_tx,
-            mic_stats,
             rich_input_tx,
             ctrl_tx,
             clip: Mutex::new(clip_event_rx),
@@ -938,39 +729,21 @@ impl NativeClient {
             host_caps: negotiated.host_caps,
             host_caps2: negotiated.host_caps2,
             mgmt_port: negotiated.mgmt_port,
-            probe,
-            shutdown,
-            end_reason,
-            quit,
             worker: Some(worker),
-            frames_dropped,
-            fec_recovered,
-            unsustainable_pin_kbps,
             rfi: Mutex::new(RfiRecovery::default()),
-            hot_tids,
-            clock_offset,
-            video_e2e_ns,
-            audio_av_offset_ms,
-            audio_buffer_ms,
-            rtt_us,
+            video_e2e_ns: Arc::new(AtomicU64::new(0)),
+            audio_av_offset_ms: Arc::new(AtomicI64::new(0)),
+            audio_buffer_ms: Arc::new(AtomicU32::new(0)),
             hud,
-            decode_lat,
-            abr_windows,
-            abr_ramp,
-            live_bitrate_kbps: live_bitrate,
-            rate_cut,
-            recent_rfis,
-            short_frames,
             // Match the pump: Automatic, not rate-pinned PyroWave, AND host echoed a rate.
             // Dropping the last term over-advertises against an old host that reports no rate.
             wants_decode: bitrate_kbps == 0
                 && negotiated.codec != crate::quic::CODEC_PYROWAVE
                 && negotiated.bitrate_kbps > 0,
-            mode: mode_slot,
             host_fingerprint: negotiated.host_fingerprint,
             resolved_compositor: negotiated.compositor,
             resolved_gamepad: negotiated.gamepad,
-            requested_gamepad: gamepad,
+            requested_gamepad,
             resolved_bitrate_kbps: negotiated.bitrate_kbps,
             shard_payload: negotiated.shard_payload,
             clock_offset_ns: negotiated.clock_offset_ns,
@@ -1035,7 +808,7 @@ impl NativeClient {
 
     /// Welcome mode, until an accepted [`NativeClient::request_mode`] switches it.
     pub fn mode(&self) -> Mode {
-        *self.mode.lock().unwrap()
+        *self.shared.mode.lock().unwrap()
     }
 
     /// Queue a live mode switch (no reconnect). Accepted: next frames open with an IDR and
@@ -1083,7 +856,7 @@ impl NativeClient {
                 last_frame,
             }))
             .map_err(|_| PunktfunkError::Closed)?;
-        let short = self.short_frames.lock().unwrap().get(first_frame);
+        let short = self.shared.short_frames.lock().unwrap().get(first_frame);
         tracing::info!(
             first = first_frame,
             last = last_frame,
@@ -1150,28 +923,28 @@ impl NativeClient {
     /// on increase: infinite GOP conceals reference-missing frames, so a decode-error trigger
     /// misses them. Monotonic; compare against the last observed value.
     pub fn frames_dropped(&self) -> u64 {
-        self.frames_dropped.load(Ordering::Relaxed)
+        self.shared.frames_dropped.load(Ordering::Relaxed)
     }
 
     /// The pinned bitrate (kbps) this client could not keep up with — it shed its receive
     /// backlog repeatedly and a pin leaves nothing else to give. `0` = not so far. Latches
     /// for the session; show it to the user once with the next move (Automatic, or lower).
     pub fn unsustainable_pin_kbps(&self) -> u32 {
-        self.unsustainable_pin_kbps.load(Ordering::Relaxed)
+        self.shared.unsustainable_pin_kbps.load(Ordering::Relaxed)
     }
 
     /// Parity-repaired shards (loss that never became a dropped frame). Monotonic; HUD diffs
     /// successive reads against [`frames_dropped`](Self::frames_dropped).
     pub fn fec_recovered_shards(&self) -> u64 {
-        self.fec_recovered.load(Ordering::Relaxed)
+        self.shared.fec_recovered.load(Ordering::Relaxed)
     }
 
     /// Mic uplink counts per stage. Monotonic; HUD diffs successive reads.
     pub fn mic_stats(&self) -> MicUplinkStats {
         MicUplinkStats {
-            sent: self.mic_stats.sent.load(Ordering::Relaxed),
-            dropped_full: self.mic_stats.dropped_full.load(Ordering::Relaxed),
-            dropped_stale: self.mic_stats.dropped_stale.load(Ordering::Relaxed),
+            sent: self.shared.mic_stats.sent.load(Ordering::Relaxed),
+            dropped_full: self.shared.mic_stats.dropped_full.load(Ordering::Relaxed),
+            dropped_stale: self.shared.mic_stats.dropped_stale.load(Ordering::Relaxed),
         }
     }
 
@@ -1179,7 +952,7 @@ impl NativeClient {
     /// Once true, every `next_*` plane returns [`PunktfunkError::Closed`]. Poll-friendly
     /// counterpart to catching `Closed` in a plane loop.
     pub fn is_session_ended(&self) -> bool {
-        self.shutdown.load(Ordering::SeqCst)
+        self.shared.shutdown.load(Ordering::SeqCst)
     }
 
     /// Why the session ended — see [`PunktfunkEndReason`].
@@ -1187,7 +960,7 @@ impl NativeClient {
     /// Refinement of [`is_session_ended`](Self::is_session_ended), never a substitute: stays
     /// [`PunktfunkEndReason::None`] until that is true. Latches through teardown.
     pub fn end_reason(&self) -> PunktfunkEndReason {
-        PunktfunkEndReason::from_u8(self.end_reason.load(Ordering::SeqCst))
+        PunktfunkEndReason::from_u8(self.shared.end_reason.load(Ordering::SeqCst))
     }
 
     pub fn ended_because_game_exited(&self) -> bool {
@@ -1198,7 +971,9 @@ impl NativeClient {
     /// otherwise file as `HostError`. Latches with `end_reason`. Connect-time rejections
     /// are [`PunktfunkError::Rejected`] from [`connect`](Self::connect).
     pub fn end_reject(&self) -> Option<crate::reject::RejectReason> {
-        crate::reject::RejectReason::from_close_code(self.end_reject_code.load(Ordering::SeqCst))
+        crate::reject::RejectReason::from_close_code(
+            self.shared.end_reject_code.load(Ordering::SeqCst),
+        )
     }
 
     /// What the host said about that close, in its own words — already stripped of
@@ -1208,20 +983,20 @@ impl NativeClient {
     /// [`end_reject`](Self::end_reject)'s own wording then. A host names what only it
     /// can know, a mis-set capture monitor being the case this exists for.
     pub fn end_reject_said(&self) -> Option<&str> {
-        self.end_reject_said.get().map(String::as_str)
+        self.shared.end_reject_said.get().map(String::as_str)
     }
 
     /// Fold the calling thread into [`hot_thread_ids`](Self::hot_thread_ids) (decode/audio
     /// with the pump). Idempotent; no-op without `gettid`.
     pub fn register_hot_thread(&self) {
-        register_hot_tid(&self.hot_tids);
+        register_hot_tid(&self.shared.hot_tids);
     }
 
     /// Pump tid plus [`register_hot_thread`](Self::register_hot_thread) ids. Android ADPF.
     /// Empty without `gettid`. Call after the first frame so the pump has registered.
     /// Exited threads are pruned: ADPF refuses a whole session over one dead tid.
     pub fn hot_thread_ids(&self) -> Vec<i32> {
-        let Ok(mut v) = self.hot_tids.lock() else {
+        let Ok(mut v) = self.shared.hot_tids.lock() else {
             return Vec::new();
         };
         v.retain(|t| std::path::Path::new(&format!("/proc/self/task/{t}")).exists());
@@ -1232,13 +1007,13 @@ impl NativeClient {
     /// Prefer over connect-time [`clock_offset_ns`](Self::clock_offset_ns): NTP/drift silently
     /// corrupts capture-clock math. `0` = old host / synced clocks.
     pub fn clock_offset_now_ns(&self) -> i64 {
-        self.clock_offset.load(Ordering::Relaxed)
+        self.shared.clock_offset.load(Ordering::Relaxed)
     }
 
     /// Live offset for plane threads that outlive `&self`. Load Relaxed each use; never cache
     /// across frames. Holding this does not keep the session alive (unlike `Arc<NativeClient>`).
     pub fn clock_offset_shared(&self) -> Arc<AtomicI64> {
-        self.clock_offset.clone()
+        self.shared.clock_offset.clone()
     }
 
     /// Video e2e latency cell (ns, `0` = nothing presented). Presenter writes; audio reads.
@@ -1272,7 +1047,7 @@ impl NativeClient {
 
     /// Smoothed QUIC round trip, µs. `0` until the worker's first sample.
     pub fn rtt_us(&self) -> u32 {
-        self.rtt_us.load(Ordering::Relaxed)
+        self.shared.rtt_us.load(Ordering::Relaxed)
     }
 
     fn hud_counters(&self) -> crate::hud::Counters {
@@ -1288,8 +1063,13 @@ impl NativeClient {
                 .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
             rtt_us: self.rtt_us(),
             target_kbps: self.current_bitrate_kbps(),
-            rate_cut: self.rate_cut.load(Ordering::Relaxed),
-            rfis_last_min: self.recent_rfis.lock().unwrap().count(Instant::now()),
+            rate_cut: self.shared.rate_cut.load(Ordering::Relaxed),
+            rfis_last_min: self
+                .shared
+                .recent_rfis
+                .lock()
+                .unwrap()
+                .count(Instant::now()),
             pad_slots: self.pad_slots(),
         }
     }
@@ -1331,7 +1111,7 @@ impl NativeClient {
     /// vsync wait. Feeds Automatic ABR so rate caps at the decoder, not the link. Call every
     /// frame; ignored when Automatic is off; pump drains each window so the acc stays bounded.
     pub fn report_decode_us(&self, us: u32) {
-        let mut acc = self.decode_lat.lock().unwrap();
+        let mut acc = self.shared.decode_lat.lock().unwrap();
         acc.sum_us += us as u64;
         acc.count += 1;
     }
@@ -1350,7 +1130,8 @@ impl NativeClient {
     /// re-derivation. The queue holds [`ABR_TRAJECTORY_WINDOWS`] and sheds the
     /// oldest, so an embedder that never calls this costs a few kilobytes.
     pub fn take_abr_windows(&self) -> Vec<crate::abr::WindowRecord> {
-        self.abr_windows
+        self.shared
+            .abr_windows
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain(..)
@@ -1360,14 +1141,15 @@ impl NativeClient {
     /// What the bring-up ramp measured, or `None` while it is still running,
     /// was declined, or never ran.
     pub fn abr_ramp(&self) -> Option<crate::abr::RampRecord> {
-        self.abr_ramp
+        self.shared
+            .abr_ramp
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
     pub fn current_bitrate_kbps(&self) -> u32 {
-        self.live_bitrate_kbps.load(Ordering::Relaxed)
+        self.shared.live_bitrate_kbps.load(Ordering::Relaxed)
     }
 
     /// Display-latch grid for host capture phase-lock (~1 Hz). `next_latch_host_ns` must
@@ -1396,7 +1178,7 @@ impl NativeClient {
     /// [`NativeClient::probe_result`] until `done`. Resets any prior measurement. Host clamps
     /// ≤ 10 Gbps, ≤ 5 s.
     pub fn request_probe(&self, target_kbps: u32, duration_ms: u32) -> Result<()> {
-        *self.probe.lock().unwrap() = ProbeState {
+        *self.shared.probe.lock().unwrap() = ProbeState {
             active: true,
             duration_ms,
             ..Default::default()
@@ -1411,7 +1193,7 @@ impl NativeClient {
         if sent.is_err() {
             // Send failed: nothing will answer. Leaving `active` would suppress the pump's
             // report tick for the rest of the session.
-            self.probe.lock().unwrap().active = false;
+            self.shared.probe.lock().unwrap().active = false;
         }
         sent
     }
@@ -1420,12 +1202,12 @@ impl NativeClient {
     /// inside it is the burst's own doing on a link it exceeds, so a "connection issues" notice
     /// gated on this stays quiet for it.
     pub fn probe_active(&self) -> bool {
-        self.probe.lock().unwrap().active
+        self.shared.probe.lock().unwrap().active
     }
 
     /// Speed-test measurement: partial until `done`, then the host's end-of-burst report.
     pub fn probe_result(&self) -> ProbeOutcome {
-        let p = self.probe.lock().unwrap();
+        let p = self.shared.probe.lock().unwrap();
         // Live (rx_now − base) while bursting; frozen once the host report lands.
         let (delivered_packets, delivered_bytes) = if p.done {
             (p.delivered_packets, p.delivered_bytes)
@@ -1478,7 +1260,7 @@ impl NativeClient {
     /// Next FEC-recovered AU. [`PunktfunkError::NoFrame`] on timeout, `Closed` once ended.
     /// One thread per plane; `&self` is for sharing across planes, not two consumers of one.
     pub fn next_frame(&self, timeout: Duration) -> Result<Frame> {
-        match self.frames.pop(timeout) {
+        match self.shared.frames.pop(timeout) {
             FramePop::Frame(f) => {
                 let completes_au = f.part.as_ref().is_none_or(|p| p.last);
                 self.hud
@@ -1504,13 +1286,13 @@ impl NativeClient {
     /// decoding — the embedder zeroes only what it queues for the device — so the decoder never
     /// loses its state and unmute lands in step. Leaves [`AUDIO_MUTE_HOST`] alone.
     pub fn set_audio_muted(&self, muted: bool) {
-        set_mute_bit(&self.audio_mute, AUDIO_MUTE_LOCAL, muted);
+        set_mute_bit(&self.shared.audio_mute, AUDIO_MUTE_LOCAL, muted);
     }
 
     /// Why this session is silent: [`AUDIO_MUTE_LOCAL`], [`AUDIO_MUTE_HOST`], both, or `0`.
     /// The overlay names the reason from this; [`audio_mute_label`] is the shared wording.
     pub fn audio_mute(&self) -> u8 {
-        self.audio_mute.load(Ordering::Relaxed)
+        self.shared.audio_mute.load(Ordering::Relaxed)
     }
 
     /// Either reason silences the speakers. Zero the decoded frame on this; show
@@ -1523,14 +1305,15 @@ impl NativeClient {
     /// `n + 1`. `0` before a pad of ours has a device, or on a host too old to
     /// send [`crate::quic::PadSlots`]. [`crate::hud::player_label`] is the wording.
     pub fn pad_slots(&self) -> u16 {
-        self.pad_slots.load(Ordering::Relaxed)
+        self.shared.pad_slots.load(Ordering::Relaxed)
     }
 
     /// What became of this session's library launch, latest verdict first. `None` before the
     /// host sends one, on a session that launched nothing, and on a host too old to say.
     /// [`crate::quic::LaunchOutcome::notice`] is the line to show.
     pub fn launch_outcome(&self) -> Option<crate::quic::LaunchOutcome> {
-        self.launch_outcome
+        self.shared
+            .launch_outcome
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -1595,7 +1378,7 @@ impl NativeClient {
     /// worker ORs bits 8/9 toward a [`quic::HOST_CAP_PAD_AUDIO`] host only. Never calling
     /// this leaves the wire unchanged. Latest-wins; unknown bits masked.
     pub fn set_pad_audio_caps(&self, pad: u8, audio_caps: u8) {
-        if let Some(slot) = self.pad_audio_caps.get(pad as usize) {
+        if let Some(slot) = self.shared.pad_audio_caps.get(pad as usize) {
             slot.store(audio_caps & 0x03, Ordering::Relaxed);
         }
     }
@@ -1681,13 +1464,13 @@ impl NativeClient {
     /// the host enforces. Load per use; never cache across
     /// [`next_access_update`](Self::next_access_update).
     pub fn access_grants(&self) -> u32 {
-        self.access_grants.load(Ordering::Relaxed)
+        self.shared.access_grants.load(Ordering::Relaxed)
     }
 
     /// Access expiry as client-wall unix seconds. `None` = permanent (old host). Anchored
     /// from relative wire seconds so skew cannot move a countdown; re-anchored on update.
     pub fn access_deadline_unix(&self) -> Option<u64> {
-        match self.access_deadline_unix.load(Ordering::Relaxed) {
+        match self.shared.access_deadline_unix.load(Ordering::Relaxed) {
             0 => None,
             d => Some(d),
         }
@@ -1782,7 +1565,10 @@ impl NativeClient {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 // Worker outran the pump's oldest-first shed. Drop (best-effort); counter visible.
-                self.mic_stats.dropped_full.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .mic_stats
+                    .dropped_full
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("mic uplink queue full — dropping frame");
                 Ok(())
             }
@@ -1800,27 +1586,27 @@ impl NativeClient {
                 "host did not grant pointer input",
             ));
         }
-        self.pad_mouse.request(mask);
+        self.shared.pad_mouse.request(mask);
         Ok(())
     }
 
     /// Change scroll direction for this session at the shared outbound seam.
     pub fn set_invert_scroll(&self, invert: bool) {
-        self.scroll_invert.store(invert, Ordering::Relaxed);
+        self.shared.scroll_invert.store(invert, Ordering::Relaxed);
     }
 
     pub fn invert_scroll(&self) -> bool {
-        self.scroll_invert.load(Ordering::Relaxed)
+        self.shared.scroll_invert.load(Ordering::Relaxed)
     }
 
     /// Pads the embedder switched to controller mouse and that are still connected.
     pub fn pad_mouse(&self) -> u16 {
-        self.pad_mouse.active(self.access_grants())
+        self.shared.pad_mouse.active(self.access_grants())
     }
 
     /// Wire pad indices the host holds right now: declared or driven, not yet removed.
     pub fn live_pads(&self) -> u16 {
-        self.pad_mouse.live()
+        self.shared.pad_mouse.live()
     }
 
     /// DualSense touchpad/motion (0xCC). Best-effort. No-op unless the host runs DualSense.
@@ -1862,14 +1648,14 @@ impl NativeClient {
     /// User stop: close with [`crate::quic::QUIT_CLOSE_CODE`] so the host skips keep-alive
     /// linger. A plain drop closes with code 0 and the host waits for reconnect.
     pub fn disconnect_quit(&self) {
-        self.quit.store(true, Ordering::SeqCst);
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.shared.quit.store(true, Ordering::SeqCst);
+        self.shared.shutdown.store(true, Ordering::SeqCst);
     }
 }
 
 impl Drop for NativeClient {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.shared.shutdown.store(true, Ordering::SeqCst);
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }

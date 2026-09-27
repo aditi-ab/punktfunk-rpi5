@@ -12,8 +12,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use pf_client_core::orchestrate::{trust_route, ConnectOutcome, TrustRoute};
 use pf_client_core::start;
-use punktfunk_core::client::NativeClient;
-use punktfunk_core::config::{CompositorPref, GamepadPref};
+use punktfunk_core::client::{ConnectParams, NativeClient};
 use relm4::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -993,32 +992,22 @@ impl AppModel {
         let (host, port) = (req.addr.clone(), req.port);
         std::thread::spawn(move || {
             let result = (|| {
-                let c = NativeClient::connect(
-                    &host,
-                    port,
-                    punktfunk_core::config::Mode {
-                        width: 1280,
-                        height: 720,
-                        refresh_hz: 60,
-                    },
-                    CompositorPref::Auto,
-                    GamepadPref::Auto,
-                    0,                                // bitrate_kbps (host default)
-                    0,                                // video_caps: probe connect, nothing presents
-                    2,                                // audio_channels: stereo
-                    crate::video::decodable_codecs(), // codecs (unused by the probe, but honest)
-                    0,                                // preferred_codec: no preference
-                    None,  // display_hdr: probe connect, nothing presents
-                    0,     // client_caps: probe connect, nothing renders a cursor
-                    false, // frame_parts: probe/whole-AU consumer
-                    None,  // launch: probe connect, no game
+                let mode = punktfunk_core::config::Mode {
+                    width: 1280,
+                    height: 720,
+                    refresh_hz: 60,
+                };
+                // A probe connect: nothing presents, so every other Hello field stays default.
+                let c = NativeClient::connect(ConnectParams {
+                    // Unused by the probe, but honest.
+                    video_codecs: crate::video::decodable_codecs(),
                     // Knock under this device's name, not a fingerprint placeholder, when the
                     // probed host doesn't know us yet.
-                    Some(pf_client_core::trust::device_name()),
+                    name: Some(pf_client_core::trust::device_name()),
                     pin,
-                    Some(identity),
-                    std::time::Duration::from_secs(15),
-                )
+                    identity: Some(identity),
+                    ..ConnectParams::new(&host, port, mode, std::time::Duration::from_secs(15))
+                })
                 .map_err(|e| {
                     tracing::warn!(error = ?e, "speed test connect");
                     "Couldn't start the speed test".to_string()

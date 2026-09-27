@@ -466,7 +466,6 @@ fn chime(t: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GamepadPref;
 
     #[test]
     fn demo_mode_fits_1080p_at_the_asked_aspect() {
@@ -514,30 +513,22 @@ mod tests {
     #[test]
     fn a_native_client_streams_from_the_demo_host() {
         let host = DemoHost::start(quic::CODEC_H264).expect("demo host");
-        let client = crate::client::NativeClient::connect(
-            "127.0.0.1",
-            host.port(),
-            Mode {
-                width: 1280,
-                height: 720,
-                refresh_hz: 60,
-            },
-            CompositorPref::Auto,
-            GamepadPref::Auto,
-            0,
-            0,
-            2,
-            quic::CODEC_H264 | quic::CODEC_HEVC,
-            0,
-            None,
-            0,
-            false,
-            Some("custom:aurora".into()),
-            None,
-            Some(host.fingerprint()),
-            None,
-            Duration::from_secs(10),
-        )
+        let mode = Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+        let client = crate::client::NativeClient::connect(crate::client::ConnectParams {
+            video_codecs: quic::CODEC_H264 | quic::CODEC_HEVC,
+            launch: Some("custom:aurora".into()),
+            pin: Some(host.fingerprint()),
+            ..crate::client::ConnectParams::new(
+                "127.0.0.1",
+                host.port(),
+                mode,
+                Duration::from_secs(10),
+            )
+        })
         .expect("connect");
         let session = host.session().expect("a live session");
         assert_eq!(session.codec, quic::CODEC_H264);
