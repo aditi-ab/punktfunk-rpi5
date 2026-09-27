@@ -5,8 +5,8 @@
 //!
 //! Multiply, keep the aspect ratio, even-floor (host `validate_dimensions`
 //! rejects odd sizes), clamp to the codec per-axis ceiling so a connect cannot
-//! request a size the encoder will refuse. Twin of
-//! `PunktfunkShared/RenderScale.swift`. Pure; tested here.
+//! request a size the encoder will refuse. The Swift and Kotlin twins run
+//! `clients/shared/render-scale-vectors.json`; change the rule there first.
 
 /// Under-render floor; presenter upscales.
 pub const MIN_SCALE: f64 = 0.5;
@@ -82,57 +82,39 @@ fn even_floor(value: f64, minimum: u32) -> u32 {
 mod tests {
     use super::*;
 
+    /// The cross-language contract; Swift, Kotlin and pf-encode-win read the same file.
     #[test]
-    fn sanitize_clamps_and_defaults() {
-        assert_eq!(sanitize(0.0), 1.0);
-        assert_eq!(sanitize(-3.0), 1.0);
-        assert_eq!(sanitize(f64::NAN), 1.0);
-        assert_eq!(sanitize(0.1), 0.5);
-        assert_eq!(sanitize(9.0), 4.0);
-        assert_eq!(sanitize(1.5), 1.5);
-    }
-
-    #[test]
-    fn max_dimension_is_codec_aware() {
-        assert_eq!(max_dimension("h264"), 4096);
-        assert_eq!(max_dimension("hevc"), 8192);
-        assert_eq!(max_dimension("av1"), 8192);
-        assert_eq!(max_dimension("auto"), 8192);
-    }
-
-    #[test]
-    fn native_is_identity() {
-        assert_eq!(apply(1920, 1080, 1.0, 8192), (1920, 1080));
-    }
-
-    #[test]
-    fn supersample_doubles() {
-        assert_eq!(apply(1920, 1080, 2.0, 8192), (3840, 2160));
-    }
-
-    #[test]
-    fn under_render_halves() {
-        assert_eq!(apply(1920, 1080, 0.5, 8192), (960, 540));
-    }
-
-    #[test]
-    fn results_are_even() {
-        let (w, h) = apply(1366, 768, 1.5, 8192);
-        assert_eq!(w % 2, 0);
-        assert_eq!(h % 2, 0);
-        assert_eq!((w, h), (2048, 1152));
-    }
-
-    #[test]
-    fn over_ceiling_clamps_uniformly() {
-        let (w, h) = apply(3840, 2160, 4.0, 8192);
-        assert!(w <= 8192 && h <= 8192);
-        assert_eq!((w, h), (8192, 4608));
-    }
-
-    #[test]
-    fn h264_ceiling_is_tighter() {
-        assert_eq!(apply(1920, 1080, 4.0, 4096), (4096, 2304));
+    fn shared_vectors() {
+        let raw = include_str!("../../../clients/shared/render-scale-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+        // JSON has no NaN; the file writes it as null.
+        let num = |v: &serde_json::Value| v.as_f64().unwrap_or(f64::NAN);
+        for row in file["max_dimension"].as_array().expect("max_dimension") {
+            let codec = row["codec"].as_str().unwrap();
+            assert_eq!(
+                max_dimension(codec) as u64,
+                row["max"].as_u64().unwrap(),
+                "{codec}"
+            );
+        }
+        for row in file["sanitize"].as_array().expect("sanitize") {
+            assert_eq!(sanitize(num(&row["raw"])), num(&row["want"]), "{row}");
+        }
+        let cases = file["apply"].as_array().expect("apply");
+        assert!(
+            cases.len() >= 12,
+            "the vector file is the contract; keep it rich"
+        );
+        for case in cases {
+            let pair = |k: &str| {
+                let a = case[k].as_array().unwrap();
+                (a[0].as_u64().unwrap() as u32, a[1].as_u64().unwrap() as u32)
+            };
+            let (w, h) = pair("base");
+            let cap = max_dimension(case["codec"].as_str().unwrap());
+            let got = apply(w, h, num(&case["scale"]), cap);
+            assert_eq!(got, pair("want"), "{}", case["name"]);
+        }
     }
 
     #[test]
@@ -154,11 +136,5 @@ mod tests {
     fn fit_inside_is_even_on_the_free_axis() {
         assert_eq!(fit_inside(3440, 1440, 1280, 800), (1280, 534));
         assert_eq!(fit_inside(2160, 3840, 1280, 800), (450, 800));
-    }
-
-    #[test]
-    fn minimum_floor_honoured() {
-        let (w, h) = apply(400, 300, 0.5, 8192);
-        assert!(w >= 320 && h >= 200);
     }
 }
