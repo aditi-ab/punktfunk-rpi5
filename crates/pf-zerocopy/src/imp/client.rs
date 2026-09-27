@@ -574,18 +574,23 @@ fn open_mapping(desc: &BufferDesc) -> Result<Mapping> {
     })
 }
 
-/// A sealed memfd holding `bytes`, for a bitmap that must not ride the socket.
+/// A memfd holding `bytes`, for a bitmap that must not ride the socket. Written once, then
+/// sealed against any change, so the worker's mapping of it cannot fault on a shrink.
 fn memfd_with(bytes: &[u8]) -> Result<OwnedFd> {
+    use rustix::fs::{MemfdFlags, SealFlags};
     use std::io::Write as _;
-    // SAFETY: a NUL-terminated literal name; the flags are plain constants.
-    let raw = unsafe { libc::memfd_create(c"punktfunk-cursor".as_ptr(), libc::MFD_CLOEXEC) };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error()).context("memfd_create(cursor)");
-    }
-    // SAFETY: `raw` is a fresh descriptor this function owns.
-    let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+    let fd = rustix::fs::memfd_create(
+        c"punktfunk-cursor",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )
+    .context("memfd_create(cursor)")?;
     let mut f = std::fs::File::from(fd);
     f.write_all(bytes).context("write cursor memfd")?;
+    rustix::fs::fcntl_add_seals(
+        &f,
+        SealFlags::SHRINK | SealFlags::GROW | SealFlags::WRITE | SealFlags::SEAL,
+    )
+    .context("seal cursor memfd")?;
     Ok(OwnedFd::from(f))
 }
 

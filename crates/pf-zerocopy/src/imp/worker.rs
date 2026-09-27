@@ -368,7 +368,7 @@ impl ImportBackend for EglBackend {
                 message: "SetCursor without a memfd".into(),
             };
         };
-        let r = MappedFd::new(fd.as_raw_fd(), len as usize)
+        let r = MappedFd::new(fd.as_fd(), len as usize)
             .and_then(|m| self.importer.set_cursor(serial, w, h, m.bytes()));
         match r {
             Ok(()) => Reply::Done,
@@ -424,19 +424,28 @@ struct MappedFd {
     len: usize,
 }
 impl MappedFd {
-    fn new(fd: i32, len: usize) -> Result<MappedFd> {
+    /// Map the first `len` bytes of `fd`. A `len` past the file's end is refused: touching a
+    /// mapped page beyond it is a SIGBUS, not an error.
+    fn new(fd: BorrowedFd<'_>, len: usize) -> Result<MappedFd> {
         if len == 0 {
             bail!("empty cursor memfd");
         }
-        // SAFETY: a fresh read-only private mapping of `len` bytes of `fd`; the pointer is
-        // checked below and unmapped in `Drop`.
+        let size = rustix::fs::fstat(fd)
+            .context("fstat(cursor memfd)")?
+            .st_size;
+        if u64::try_from(size).unwrap_or(0) < len as u64 {
+            bail!("cursor memfd holds {size} bytes, message says {len}");
+        }
+        // SAFETY: a fresh read-only private mapping of `len` bytes of `fd`, which holds at least
+        // that many (checked above; the host seals it against shrinking). The pointer is checked
+        // below and unmapped in `Drop`.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ,
                 libc::MAP_PRIVATE,
-                fd,
+                fd.as_raw_fd(),
                 0,
             )
         };
