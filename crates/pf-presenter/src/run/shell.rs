@@ -347,6 +347,9 @@ impl Shell {
         }
         self.overlay_damage
             .rendered(self.overlay_frame.as_ref().map(|f| f.image));
+        // The native lane shows the overlay on its own surface; the swapchain path draws it.
+        self.presenter
+            .sync_native_overlay(self.overlay_frame.as_ref(), self.window.size());
         Ok(())
     }
 }

@@ -21,3 +21,7 @@ pub const OVERLAY_FRAG: &[u8] = include_bytes!("../shaders/overlay.frag.spv");
 pub const OVERLAY_PQ_FRAG: &[u8] = include_bytes!("../shaders/overlay_pq.frag.spv");
 /// One axis of the video scale: nearest, Catmull-Rom or widened Lanczos-3.
 pub const SCALE_FRAG: &[u8] = include_bytes!("../shaders/scale.frag.spv");
+/// PyroWave's Cb and Cr planes interleaved into NV12's chroma plane (compute).
+pub const CHROMA_RG8_COMP: &[u8] = include_bytes!("../shaders/chroma_rg8.comp.spv");
+/// The same into P010's chroma plane: 16-bit codes.
+pub const CHROMA_RG16_COMP: &[u8] = include_bytes!("../shaders/chroma_rg16.comp.spv");

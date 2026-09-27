@@ -99,6 +99,10 @@ struct SettingsView: View {
     #if DEBUG && !os(tvOS)
     @State var showControllerTest = false
     #endif
+    #if !os(tvOS)
+    /// The OS keeps the controller's Home press from the stream (`watchHomeButton`).
+    @State var homeButtonKept = false
+    #endif
     #if os(iOS)
     @AppStorage(DefaultsKey.pointerCapture) var pointerCapture = true
     @AppStorage(DefaultsKey.touchMode) var touchMode = TouchInputMode.trackpad.rawValue
@@ -579,7 +583,9 @@ struct SettingsView: View {
                     Button(role: .destructive) {
                         presetPendingDelete = active
                     } label: {
+                        // Text and symbol in one colour: the role reddens only the text.
                         Label("Delete…", systemImage: "trash")
+                            .foregroundStyle(.red)
                     }
                 }
             }

@@ -265,10 +265,23 @@ struct HostDetailView: View {
                     Button("Wake Host", systemImage: "power", action: wake)
                 }
                 ForEach(a.power) { action in
-                    Button(
-                        action.available ? action.label : "\(action.label) (Unavailable)",
-                        systemImage: "power", role: action.danger ? .destructive : nil
-                    ) { a.runPower(action) }
+                    // iOS reddens a destructive title and leaves the symbol on the accent, so
+                    // the symbol is coloured itself. The tint is for the Mac, whose form
+                    // draws a destructive title in the window's tint.
+                    Button(role: action.danger ? .destructive : nil) {
+                        a.runPower(action)
+                    } label: {
+                        Label {
+                            Text(action.available ? action.label : "\(action.label) (Unavailable)")
+                        } icon: {
+                            if action.danger {
+                                Image(systemName: "power").foregroundStyle(.red)
+                            } else {
+                                Image(systemName: "power")
+                            }
+                        }
+                    }
+                    .tint(action.danger ? Color.red : nil)
                 }
             } header: {
                 Text("Power")

@@ -210,6 +210,10 @@ unsafe extern "C" fn queue_unlock_cb(ud: *mut c_void) {
 pub struct PyroWavePlanarFrame {
     /// Raw `VkImageView`s (Y, Cb, Cr) for planar CSC sampling.
     pub views: [u64; 3],
+    /// Raw `VkImage` of the Y plane, for the native lane's copy.
+    pub luma: u64,
+    /// Cb/Cr at full resolution rather than half.
+    pub chroma444: bool,
     pub width: u32,
     pub height: u32,
     pub color: ColorDesc,
@@ -848,6 +852,8 @@ impl PyroWaveDecoder {
                 self.ring[slot].views[1].as_raw(),
                 self.ring[slot].views[2].as_raw(),
             ],
+            luma: self.ring[slot].imgs[0].as_raw(),
+            chroma444: self.chroma444,
             width: w,
             height: h,
             color: self.color,
@@ -883,8 +889,13 @@ impl PyroWaveDecoder {
         };
         let to_write = |img| {
             vk::ImageMemoryBarrier2::default()
-                // Order against the presenter's prior sampling of this slot (same queue).
-                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                // Order against the presenter's prior reads of this slot (same queue): CSC
+                // sampling, or the native lane's chroma pass and luma copy.
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags2::COMPUTE_SHADER
+                        | vk::PipelineStageFlags2::COPY,
+                )
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)

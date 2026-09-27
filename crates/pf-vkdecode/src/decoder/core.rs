@@ -24,6 +24,7 @@ use crate::caps::DecodeProfile;
 use crate::device::DecodeDevice;
 use crate::device::QueueLock;
 use crate::device::QueueSubmitGuard;
+use crate::images::allow_copy_out;
 use crate::images::plan_pools;
 use crate::images::DpbPool;
 use crate::images::PicturePool;
@@ -102,14 +103,15 @@ pub(crate) struct SessionState<C: VkCodec> {
 
 impl<C: VkCodec> SessionState<C> {
     /// Pools, bitstream ring and op ring around a freshly created `session`,
-    /// for `required_slots` DPB slots at `image_extent`.
+    /// for `required_slots` DPB slots at `image_extent`, with `dec`'s export
+    /// and copy-out choices.
     ///
     /// # Safety
     ///
-    /// `dev` wraps live handles ([`crate::DeviceHandles`] contract), and
+    /// `dec.dev` wraps live handles ([`crate::DeviceHandles`] contract), and
     /// `session` was created on it for `profile`.
     pub(crate) unsafe fn create(
-        dev: &DecodeDevice,
+        dec: &VkDecoder<C>,
         caps: &DecodeCaps,
         session: C::Session,
         profile: DecodeProfile,
@@ -123,6 +125,11 @@ impl<C: VkCodec> SessionState<C> {
         // pools omit. Opt-in via env so no production path grows it.
         if std::env::var("PF_VKD_TEST_READBACK").is_ok_and(|v| v == "1") {
             pool_plan.picture_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+        let dev = &dec.dev;
+        if dec.copy_out {
+            // SAFETY: fn contract; a physical-device format query.
+            unsafe { allow_copy_out(dev, profile, &mut pool_plan, caps.output_format) };
         }
         // SAFETY: fn contract, for every create in this block; each created half
         // is owned by a Drop type the moment it exists, so a mid-build failure
@@ -147,6 +154,7 @@ impl<C: VkCodec> SessionState<C> {
                     caps.min_bitstream_size_alignment,
                 ),
                 profile,
+                dec.export_bitstream,
             )
             .map_err(VkDecodeError::from)?;
             let ops = OpRing::create(dev, profile, pool_plan.picture_count, RING_SLOTS)
@@ -254,6 +262,10 @@ pub struct VkDecoder<C: VkCodec> {
     /// Bumped on every rebuild; stamped into frames.
     generation: u64,
     device_lost: bool,
+    /// [`Self::export_bitstream`].
+    export_bitstream: bool,
+    /// [`Self::copy_out`].
+    copy_out: bool,
 }
 
 impl<C: VkCodec> VkDecoder<C> {
@@ -273,7 +285,28 @@ impl<C: VkCodec> VkDecoder<C> {
             decoded: 0,
             generation: 0,
             device_lost: false,
+            export_bitstream: false,
+            copy_out: false,
         }
+    }
+
+    /// Export the bitstream ring as a dma-buf from the next session on, for an owner that
+    /// waits the decode through the kernel ([`Self::bitstream_dmabuf`]).
+    pub fn export_bitstream(&mut self) {
+        self.export_bitstream = true;
+    }
+
+    /// From the next session on, give pictures TRANSFER_SRC where the driver answers for
+    /// it, so the owner can copy them out ([`DecodedVkFrame::copyable`]).
+    pub fn copy_out(&mut self) {
+        self.copy_out = true;
+    }
+
+    /// The bitstream ring's dma-buf, while its backing lives; every decode writes fences
+    /// onto it. `None` before the first session or without an export.
+    #[cfg(unix)]
+    pub fn bitstream_dmabuf(&self) -> Option<std::os::fd::RawFd> {
+        self.state.as_ref().and_then(|s| s.ring.dmabuf_fd())
     }
 
     /// Decode one access unit and return the next display-ready frame; drain
@@ -1404,6 +1437,7 @@ pub(crate) fn build_frame(
     generation: u64,
 ) -> DecodedVkFrame {
     let format = pool.format;
+    let copyable = pool.copyable;
     let picture = &mut pool.pictures[entry.image];
     picture.pending = false;
     picture.held += 1;
@@ -1433,6 +1467,7 @@ pub(crate) fn build_frame(
         submission: entry.submission,
         picture: entry.image as u32,
         generation,
+        copyable,
     }
 }
 

@@ -416,7 +416,7 @@ impl VkDecoder<H265> {
         let state = unsafe {
             let session = VideoSessionH265::create(&self.dev, caps, config)?;
             SessionState::create(
-                &self.dev,
+                self,
                 caps,
                 session,
                 DecodeProfile::H265(key),

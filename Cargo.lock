@@ -3469,10 +3469,12 @@ dependencies = [
  "pf-dmabuf",
  "pf-vkdecode",
  "punktfunk-core",
+ "rustix",
  "sdl3",
  "tracing",
  "wayland-backend",
  "wayland-client",
+ "wayland-protocols",
  "wayland-sys",
  "windows-sys 0.61.2",
 ]
@@ -6632,6 +6634,17 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "wl-scanout-probe"
+version = "0.40.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "rustix",
+ "wayland-client",
+ "wayland-protocols",
+]
 
 [[package]]
 name = "writeable"
