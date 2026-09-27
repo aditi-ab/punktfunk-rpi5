@@ -675,9 +675,7 @@ mod tests {
     use pf_bitstream::av1::Av1Planner;
     use std::collections::HashMap;
 
-    const AV1_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
-    );
+    const AV1_25FPS: &[u8] = pf_bitstream::testing::AV1_25FPS;
 
     /// Recognisable per-slot values, so a wrong index is a wrong number.
     fn surface_table() -> Vec<u32> {

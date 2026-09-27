@@ -259,11 +259,9 @@ pub fn plan_to_vk(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::io::Cursor;
     use std::rc::Rc;
 
     use cros_codecs::codec::h264::nalu_writer::NaluWriter;
-    use cros_codecs::codec::h264::parser::Nalu;
     use cros_codecs::codec::h264::parser::NaluType;
     use cros_codecs::codec::h264::parser::Pps;
     use cros_codecs::codec::h264::parser::PpsBuilder;
@@ -273,39 +271,11 @@ mod tests {
     use cros_codecs::codec::h264::synthesizer::Synthesizer;
     use pf_bitstream::h264::H264Planner;
     use pf_bitstream::h264::Level;
+    use pf_bitstream::testing::split_h264_aus;
 
     use super::*;
 
-    /// Shared vendored vector (same path as pf-bitstream goldens).
-    const TEST_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-    );
-
-    /// Test-only AU splitter. A new AU starts at a non-slice NALU following
-    /// a slice, or at a slice whose `first_mb_in_slice` is 0 following a slice.
-    fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut cursor = Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let nalu_offset = cursor.position() as usize;
-            let start = nalu_offset - nalu.offset;
-            let is_slice = matches!(nalu.header.type_, NaluType::Slice | NaluType::SliceIdr);
-            let first_mb_zero =
-                is_slice && stream.get(nalu_offset + 1).is_some_and(|b| b & 0x80 != 0);
-
-            if au_has_slice && (!is_slice || first_mb_zero) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
+    const TEST_25FPS: &[u8] = pf_bitstream::testing::H264_25FPS;
 
     /// Picture-pool occupancy (`bound`/`pending`/`held`) over the vendored
     /// vector, with a consumer that holds `hold` delivered frames before
@@ -320,7 +290,7 @@ mod tests {
             held: u32,
         }
 
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h264_aus(TEST_25FPS);
         let mut planner = H264Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut pictures = vec![SimPicture::default(); pool_size];
@@ -410,7 +380,7 @@ mod tests {
 
     #[test]
     fn the_full_25fps_vector_converts_with_stable_slots_and_start_code_offsets() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h264_aus(TEST_25FPS);
         let mut planner = H264Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut held: BTreeMap<PicId, u8> = BTreeMap::new();

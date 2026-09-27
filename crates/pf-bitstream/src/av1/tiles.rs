@@ -308,9 +308,7 @@ mod tests {
 
     use super::*;
     use crate::av1::Av1Planner;
-
-    const AV1_25FPS: &[u8] =
-        include_bytes!("../../vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1");
+    use crate::testing::AV1_25FPS;
 
     /// [`plan_bitstream`] vs the parser's independent `Tile::tile_offset` /
     /// `tile_size`. A whole-OBU or off-by-header split fails here.

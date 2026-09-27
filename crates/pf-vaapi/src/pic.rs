@@ -432,6 +432,8 @@ pub fn plan_to_va(
 
 #[cfg(test)]
 mod tests {
+    use pf_bitstream::testing::split_h264_aus;
+
     use super::*;
     use crate::va::VA_INVALID_SURFACE;
 
@@ -442,9 +444,7 @@ mod tests {
 
     /// Vendored 250-AU vector: two slices per picture, four IDRs, real
     /// reordering. Same stream the other rungs decode.
-    const TEST_25FPS_H264: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-    );
+    const TEST_25FPS_H264: &[u8] = pf_bitstream::testing::H264_25FPS;
 
     /// Host output: 120 pictures, `max_num_ref_frames = max_dec_frame_buffering = 3`
     /// and `max_num_reorder_frames = 0`. DPB depth equals the reference count, so
@@ -452,43 +452,13 @@ mod tests {
     const LOWDELAY_640X480: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h264");
 
-    /// Test-only Annex-B splitter. Production delivers whole access units. A new
-    /// AU starts at a non-VCL NALU after slices, or a first-in-picture slice.
-    fn split_aus(stream: &[u8]) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let (mut au_start, mut au_has_slice) = (0usize, false);
-        let mut i = 0usize;
-        while i + 3 <= stream.len() {
-            if stream[i..i + 3] != [0x00, 0x00, 0x01] {
-                i += 1;
-                continue;
-            }
-            let header = i + 3;
-            let mut start = i;
-            if start > 0 && stream[start - 1] == 0x00 {
-                start -= 1;
-            }
-            let is_slice = matches!(stream[header] & 0x1f, 1 | 5);
-            let first = is_slice && stream.get(header + 1).is_some_and(|b| b & 0x80 != 0);
-            if au_has_slice && (!is_slice || first) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-            i += 3;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
-
     /// Every AU of a real stream converts, and the fields a driver reads agree.
     /// A synthetic single-picture case never hits a mid-stream slot exhaust.
     #[test]
     fn the_whole_vendored_vector_converts() {
         use pf_bitstream::h264::H264Planner;
 
-        let aus = split_aus(TEST_25FPS_H264);
+        let aus = split_h264_aus(TEST_25FPS_H264);
         assert_eq!(aus.len(), 250, "the vendored vector is 250 access units");
 
         let mut planner = H264Planner::new();
@@ -609,7 +579,7 @@ mod tests {
         let mut table: Vec<u32> = Vec::new();
         let mut out = AliasWalk::default();
 
-        for (index, au) in split_aus(stream).into_iter().enumerate() {
+        for (index, au) in split_h264_aus(stream).into_iter().enumerate() {
             let plan = planner
                 .plan_au(au)
                 .unwrap_or_else(|e| panic!("AU {index}: this stream must plan, got {e:?}"));
@@ -767,7 +737,7 @@ mod tests {
         let mut table: Vec<u32> = Vec::new();
         let (mut converted, mut aliased) = (0usize, 0usize);
 
-        for (index, au) in split_aus(LOWDELAY_640X480).into_iter().enumerate() {
+        for (index, au) in split_h264_aus(LOWDELAY_640X480).into_iter().enumerate() {
             let plan = planner.plan_au(au).expect("the low-delay stream plans");
             let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
             table.resize(map.capacity(), VA_INVALID_SURFACE);

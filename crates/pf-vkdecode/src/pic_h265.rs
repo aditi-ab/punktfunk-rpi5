@@ -340,10 +340,8 @@ pub fn plan_to_vk_h265(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::io::Cursor;
     use std::rc::Rc;
 
-    use cros_codecs::codec::h265::parser::Nalu;
     use cros_codecs::codec::h265::parser::Pps;
     use cros_codecs::codec::h265::parser::ShortTermRefPicSet;
     use cros_codecs::codec::h265::parser::Sps;
@@ -357,44 +355,13 @@ mod tests {
     use pf_bitstream::h265::RpsPlan;
     use pf_bitstream::h265::SliceHeader;
     use pf_bitstream::h265::SlicePlan;
+    use pf_bitstream::testing::split_h265_aus;
 
     use super::*;
 
-    // Same vendored vectors pf-bitstream's h265 tests plan, from the same path.
-    const TEST_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-    );
-    const TEST_64X64_I_P_B_P: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/64x64-I-P-B-P.h265"
-    );
-
-    /// Test-only AU splitter, mirroring pf-bitstream's private helper: a new AU
-    /// starts at a non-VCL NALU following slices, or at a slice segment with
-    /// `first_slice_segment_in_pic_flag == 1` (first bit of the byte after the
-    /// 2-byte NAL header) when the current AU already has slices.
-    fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut cursor = Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let header_start = cursor.position() as usize;
-            let start = header_start - nalu.offset;
-            let is_slice = (nalu.header.type_ as u32) < 32;
-            let first_slice_flag =
-                is_slice && stream.get(header_start + 2).is_some_and(|b| b & 0x80 != 0);
-
-            if au_has_slice && (!is_slice || first_slice_flag) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
+    // Same vendored vectors pf-bitstream's h265 tests plan.
+    const TEST_25FPS: &[u8] = pf_bitstream::testing::H265_25FPS;
+    const TEST_64X64_I_P_B_P: &[u8] = pf_bitstream::testing::H265_64X64_I_P_B_P;
 
     /// Host low-delay HEVC: 120 pictures, five-picture DPB, reorder 0 — 115 of
     /// 120 AUs retire a picture. The stream the GPU legs decode against.
@@ -408,7 +375,7 @@ mod tests {
     /// setup slot is assigned from freed slots, so the two would alias.
     #[test]
     fn every_marked_picture_binds_and_none_aliases_the_setup_slot() {
-        let aus = split_into_aus(LOWDELAY_640X480_H265);
+        let aus = split_h265_aus(LOWDELAY_640X480_H265);
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut prev: Option<AuPlan> = None;
@@ -529,7 +496,7 @@ mod tests {
 
     #[test]
     fn the_full_25fps_vector_converts_with_stable_slots_and_start_code_offsets() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         // PicId → slot assigned when that picture was decoded; drop on `removed`.
@@ -650,7 +617,7 @@ mod tests {
 
     #[test]
     fn the_b_frame_vector_populates_both_current_index_arrays_around_the_picture() {
-        let aus = split_into_aus(TEST_64X64_I_P_B_P);
+        let aus = split_h265_aus(TEST_64X64_I_P_B_P);
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut b_pictures_seen = 0usize;

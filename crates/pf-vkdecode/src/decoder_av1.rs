@@ -610,9 +610,7 @@ mod tests {
     use crate::decoder::core::sync_slot_bindings;
     use crate::slots::SlotMap;
 
-    const AV1_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
-    );
+    const AV1_25FPS: &[u8] = pf_bitstream::testing::AV1_25FPS;
 
     fn std_ref(order_hint: u8, frame_type: u8) -> hh::StdVideoDecodeAV1ReferenceInfo {
         // SAFETY: Std bindgen struct; all-zero is valid for every field.

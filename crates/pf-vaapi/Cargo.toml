@@ -15,5 +15,9 @@ repository.workspace = true
 cros-codecs = { path = "../pf-bitstream/vendor/cros-codecs" }
 pf-bitstream = { path = "../pf-bitstream" }
 
+[dev-dependencies]
+# `pf_bitstream::testing`: the vendored vectors and access-unit splitters.
+pf-bitstream = { path = "../pf-bitstream", features = ["test-vectors"] }
+
 [lints]
 workspace = true

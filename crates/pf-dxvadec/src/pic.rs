@@ -429,11 +429,9 @@ pub fn slice_control(records: &[crate::pack::SliceRecord]) -> Vec<SliceH264Short
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
     use std::rc::Rc;
 
     use cros_codecs::codec::h264::nalu_writer::NaluWriter;
-    use cros_codecs::codec::h264::parser::Nalu;
     use cros_codecs::codec::h264::parser::NaluType;
     use cros_codecs::codec::h264::parser::Pps;
     use cros_codecs::codec::h264::parser::PpsBuilder;
@@ -443,46 +441,17 @@ mod tests {
     use cros_codecs::codec::h264::synthesizer::Synthesizer;
     use pf_bitstream::h264::H264Planner;
     use pf_bitstream::h264::Level;
+    use pf_bitstream::testing::split_h264_aus;
 
     use super::*;
 
-    /// Shared vendored vector (same path as pf-bitstream / pf-vkdecode goldens).
-    const TEST_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-    );
+    const TEST_25FPS: &[u8] = pf_bitstream::testing::H264_25FPS;
 
     /// Host-emitted low-delay IPPP: `max_num_reorder_frames = 0` and a DPB
     /// as deep as its reference count — the shape `release_after_decode`
     /// exists for. Shared with `pf-vkdecode` and `pf-client-core` GPU legs.
     const LOWDELAY_640X480: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h264");
-
-    /// Test-only AU splitter. A new AU starts at a non-slice NALU following
-    /// a slice, or at a slice whose `first_mb_in_slice` is 0 following a slice.
-    fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-        use cros_codecs::codec::h264::parser::NaluType;
-        let mut aus = Vec::new();
-        let mut cursor = Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let nalu_offset = cursor.position() as usize;
-            let start = nalu_offset - nalu.offset;
-            let is_slice = matches!(nalu.header.type_, NaluType::Slice | NaluType::SliceIdr);
-            let first_mb_zero =
-                is_slice && stream.get(nalu_offset + 1).is_some_and(|b| b & 0x80 != 0);
-
-            if au_has_slice && (!is_slice || first_mb_zero) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
 
     fn convert_stream() -> Vec<(AuPlan, DecodePlanDxva)> {
         convert(TEST_25FPS)
@@ -498,7 +467,7 @@ mod tests {
         let mut planner = H264Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut out = Vec::new();
-        for (i, au) in split_into_aus(stream).into_iter().enumerate() {
+        for (i, au) in split_h264_aus(stream).into_iter().enumerate() {
             let Ok(plan) = planner.plan_au(au) else {
                 continue;
             };
@@ -702,7 +671,7 @@ mod tests {
         // Vendored vectors have equal top/bottom counts, so a swapped pair is
         // invisible. Drive one AU with distinct counts.
         let mut planner = H264Planner::new();
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h264_aus(TEST_25FPS);
         let first = planner.plan_au(aus[0]).expect("plan 0");
         let mut second = planner.plan_au(aus[1]).expect("plan 1");
         let ref_id = first.dpb.stored.unwrap();
@@ -776,7 +745,7 @@ mod tests {
         fn intersections(stream: &[u8]) -> (usize, usize, usize) {
             let mut planner = H264Planner::new();
             let (mut both, mut with_removals, mut planned) = (0usize, 0usize, 0usize);
-            for au in split_into_aus(stream) {
+            for au in split_h264_aus(stream) {
                 let Ok(plan) = planner.plan_au(au) else {
                     continue;
                 };
@@ -856,7 +825,7 @@ mod tests {
         let mut slots: Option<SlotMap> = None;
         let mut peak = 0usize;
         let mut capacity = 0usize;
-        for (i, au) in split_into_aus(LOWDELAY_640X480).into_iter().enumerate() {
+        for (i, au) in split_h264_aus(LOWDELAY_640X480).into_iter().enumerate() {
             let Ok(plan) = planner.plan_au(au) else {
                 continue;
             };
@@ -1029,7 +998,7 @@ mod tests {
     #[test]
     fn a_capacity_mismatch_is_refused_and_leaves_the_map_untouched() {
         let mut planner = H264Planner::new();
-        let au = split_into_aus(TEST_25FPS).into_iter().next().unwrap();
+        let au = split_h264_aus(TEST_25FPS).into_iter().next().unwrap();
         let plan = planner.plan_au(au).expect("plan");
         // Map sized for a different DPB depth (SPS renegotiation).
         let mut slots = SlotMap::new(plan.picture.max_dpb_frames + 1);
@@ -1047,7 +1016,7 @@ mod tests {
     #[test]
     fn a_reference_the_map_never_saw_is_refused_and_leaves_the_map_untouched() {
         // Plan two AUs; feed only the second through the map so its ref is missing.
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h264_aus(TEST_25FPS);
         let mut planner = H264Planner::new();
         let first = planner.plan_au(aus[0]).expect("plan 0");
         let second = planner.plan_au(aus[1]).expect("plan 1");
@@ -1103,7 +1072,7 @@ mod tests {
             let mut planner = H264Planner::new();
             let mut slots: Option<SlotMap> = None;
             let mut live: Vec<(PicId, u8)> = Vec::new();
-            for (i, au) in split_into_aus(stream).into_iter().enumerate() {
+            for (i, au) in split_h264_aus(stream).into_iter().enumerate() {
                 let Ok(plan) = planner.plan_au(au) else {
                     continue;
                 };

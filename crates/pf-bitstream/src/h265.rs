@@ -1425,48 +1425,17 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::testing::split_h265_aus;
 
-    const TEST_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265");
-    const TEST_BEAR: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h265/test_data/bear.h265");
-    const TEST_BBB: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h265/test_data/bbb.h265");
-    const TEST_64X64_I_P_B_P: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h265/test_data/64x64-I-P-B-P.h265");
-
-    /// Split a raw Annex-B vector into the pre-split AUs `plan_au` takes. A new
-    /// AU starts at a non-VCL NALU after slices, or at a slice with
-    /// `first_slice_segment_in_pic_flag == 1` (first payload bit after the 2-byte
-    /// NAL header) once the current AU already has slices.
-    pub(super) fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut cursor = Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let header_start = cursor.position() as usize;
-            let start = header_start - nalu.offset;
-            let is_slice = (nalu.header.type_ as u32) < 32;
-            let first_slice_flag =
-                is_slice && stream.get(header_start + 2).is_some_and(|b| b & 0x80 != 0);
-
-            if au_has_slice && (!is_slice || first_slice_flag) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
+    const TEST_25FPS: &[u8] = crate::testing::H265_25FPS;
+    const TEST_BEAR: &[u8] = crate::testing::H265_BEAR;
+    const TEST_BBB: &[u8] = crate::testing::H265_BBB;
+    const TEST_64X64_I_P_B_P: &[u8] = crate::testing::H265_64X64_I_P_B_P;
 
     /// Plan a vendored clip: every AU plans, no integrity warnings, every stored
     /// id reaches output once, outputs ascend POC within each IRAP period.
     fn plan_whole_clip(stream: &[u8]) -> (H265Planner, Vec<AuPlan>) {
-        let aus = split_into_aus(stream);
+        let aus = split_h265_aus(stream);
         let mut planner = H265Planner::new();
         let mut plans = Vec::new();
         for au in &aus {
@@ -1534,7 +1503,7 @@ mod tests {
 
     #[test]
     fn the_full_25fps_vector_plans_every_picture_and_every_pic_id_reaches_output() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         assert_eq!(aus.len(), 250, "the vendored golden: 250 pictures");
         let (_, plans) = plan_whole_clip(TEST_25FPS);
         assert_eq!(plans.len(), 250);
@@ -1569,7 +1538,7 @@ mod tests {
         let path = std::env::var("PF_H265_DUMP").expect("PF_H265_DUMP=<capture>");
         let bytes = std::fs::read(&path).expect("read the capture");
         let mut planner = H265Planner::new();
-        for (i, au) in split_into_aus(&bytes).iter().enumerate() {
+        for (i, au) in split_h265_aus(&bytes).iter().enumerate() {
             let plan = planner.plan_au(au).expect("plan");
             let refs: Vec<i32> = plan
                 .slices
@@ -1610,7 +1579,7 @@ mod tests {
 
     #[test]
     fn b_slices_get_a_future_led_list1_distinct_from_list0() {
-        let aus = split_into_aus(TEST_64X64_I_P_B_P);
+        let aus = split_h265_aus(TEST_64X64_I_P_B_P);
         let mut planner = H265Planner::new();
         let mut b_slices_seen = 0usize;
 
@@ -2868,7 +2837,7 @@ mod tests {
 
     #[test]
     fn a_dropped_reference_au_degrades_to_warnings_and_planning_continues() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
 
         // Droppable AU: non-IRAP reference not followed by an IRAP (that would
         // reset state and hide the loss).

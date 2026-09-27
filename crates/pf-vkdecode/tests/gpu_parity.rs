@@ -1230,7 +1230,7 @@ fn av1_parity_run_against(
 #[test]
 #[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
 fn av1_every_frame_hashes_bit_identical_to_libavcodec() {
-    av1_parity_run(&common::split_av1_aus(common::TEST_25FPS_AV1), "AV1");
+    av1_parity_run(&common::split_ivf(common::TEST_25FPS_AV1), "AV1");
 }
 
 /// Host AV1 at the only resolution that emits more than one tile.
@@ -1242,7 +1242,7 @@ fn av1_every_frame_hashes_bit_identical_to_libavcodec() {
 #[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
 fn low_delay_host_av1_every_frame_hashes_bit_identical_to_libavcodec() {
     av1_parity_run_against(
-        &common::split_av1_aus(LOWDELAY_AV1),
+        &common::split_ivf(LOWDELAY_AV1),
         "AV1 (low-delay host stream, 4K two-tile)",
         GOLDENS_LOWDELAY_AV1,
         "data/lowdelay-3840x2160-av1.nv12.sha256",
@@ -1264,8 +1264,8 @@ fn av1_size_change_mid_session_rebuilds_and_stays_bit_identical() {
     let _gpu = common::gpu_lock();
     arm_test_readback(&_gpu);
 
-    let small = common::split_av1_aus(common::TEST_25FPS_AV1);
-    let large = common::split_av1_aus(LOWDELAY_AV1);
+    let small = common::split_ivf(common::TEST_25FPS_AV1);
+    let large = common::split_ivf(LOWDELAY_AV1);
     assert_eq!(small.len(), FRAME_COUNT);
     assert_eq!(large.len(), LOWDELAY_AV1_UNIT_COUNT);
 
@@ -1381,7 +1381,7 @@ fn av1_frame0_pixels_say_which_plane_and_how_badly() {
     let _gpu = common::gpu_lock();
     arm_test_readback(&_gpu);
 
-    let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
+    let aus = common::split_ivf(common::TEST_25FPS_AV1);
     assert_eq!(
         aus.len(),
         FRAME_COUNT,
@@ -1423,7 +1423,7 @@ fn av1_frame0_probes_whether_the_driver_reads_the_chroma_deblocking_levels() {
     let _gpu = common::gpu_lock();
     arm_test_readback(&_gpu);
 
-    let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
+    let aus = common::split_ivf(common::TEST_25FPS_AV1);
     assert_eq!(aus.len(), FRAME_COUNT);
 
     let mutated_au = av1_frame0_with_max_chroma_deblocking(aus[0]);
@@ -1513,7 +1513,7 @@ fn av1_frame0_with_max_chroma_deblocking(au: &[u8]) -> Vec<u8> {
 
 #[test]
 fn the_av1_chroma_deblocking_mutation_changes_only_those_two_levels() {
-    let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
+    let aus = common::split_ivf(common::TEST_25FPS_AV1);
     let mutated = av1_frame0_with_max_chroma_deblocking(aus[0]);
     // U ends mid-byte, so two or three bytes change; a whole-unit diff means
     // `set_bits` walked off its field.
@@ -2095,7 +2095,7 @@ fn the_low_delay_av1_stream_agrees_with_its_goldens_and_still_carries_two_tiles(
         "data/lowdelay-3840x2160-av1.nv12.sha256",
     );
 
-    let aus = common::split_av1_aus(LOWDELAY_AV1);
+    let aus = common::split_ivf(LOWDELAY_AV1);
     assert_eq!(
         aus.len(),
         LOWDELAY_AV1_UNIT_COUNT,
@@ -2314,7 +2314,7 @@ fn av1_goldens_and_the_ivf_split_agree_with_the_planner() {
 
     // One IVF packet per temporal unit. No start codes; a truncated remux shortens
     // the split silently.
-    let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
+    let aus = common::split_ivf(common::TEST_25FPS_AV1);
     assert_eq!(
         aus.len(),
         FRAME_COUNT,

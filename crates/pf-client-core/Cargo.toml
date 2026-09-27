@@ -250,6 +250,8 @@ sha2 = "0.11"
 # deliberately doesn't need.
 log = "0.4"
 tracing-subscriber = { version = "0.3" }
+# `pf_bitstream::testing`: the vendored vectors and access-unit splitters.
+pf-bitstream = { path = "../pf-bitstream", features = ["test-vectors"] }
 
 # PyroWave decode (the opt-in wired-LAN wavelet codec, design/pyrowave-codec-plan.md
 # §4.5) — pure Vulkan compute on the device the frame is presented from, so it builds

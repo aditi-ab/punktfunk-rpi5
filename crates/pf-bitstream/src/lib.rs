@@ -19,6 +19,8 @@ pub mod h265;
 mod report;
 pub mod sei;
 pub mod slots;
+#[cfg(any(test, feature = "test-vectors"))]
+pub mod testing;
 
 #[cfg(test)]
 mod plan_error_tests {
@@ -115,14 +117,10 @@ mod vendor_smoke {
     use cros_codecs::codec::h265::parser::Nalu as H265Nalu;
     use cros_codecs::codec::h265::parser::Parser as H265Parser;
 
-    const H264_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264");
-    const H265_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265");
-    const AV1_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1");
-    const VP9_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/vp9/test_data/test-25fps.vp9");
+    use crate::testing::AV1_25FPS;
+    use crate::testing::H264_25FPS;
+    use crate::testing::H265_25FPS;
+    use crate::testing::VP9_25FPS;
 
     #[test]
     fn h264_parses_the_vendored_vector_to_its_goldens() {

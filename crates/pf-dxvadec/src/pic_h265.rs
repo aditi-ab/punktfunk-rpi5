@@ -521,21 +521,15 @@ pub fn slice_control_h265(records: &[crate::pack::SliceRecord]) -> Vec<SliceHevc
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
 
-    use cros_codecs::codec::h265::parser::Nalu;
     use pf_bitstream::h265::H265Planner;
+    use pf_bitstream::testing::split_h265_aus;
 
     use super::*;
 
-    /// Vendored vectors pf-bitstream's and pf-vkdecode's h265 tests plan, included
-    /// from the same path.
-    const TEST_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-    );
-    const TEST_64X64_I_P_B_P: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/64x64-I-P-B-P.h265"
-    );
+    /// Vendored vectors pf-bitstream's and pf-vkdecode's h265 tests plan.
+    const TEST_25FPS: &[u8] = pf_bitstream::testing::H265_25FPS;
+    const TEST_64X64_I_P_B_P: &[u8] = pf_bitstream::testing::H265_64X64_I_P_B_P;
 
     /// Host HEVC: the only stream in this repository that reaches the DPB pressure
     /// HEVC's no-aliasing exemption is claimed against — low-delay IPPP,
@@ -545,37 +539,11 @@ mod tests {
     const LOWDELAY_640X480_H265: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h265");
 
-    /// Test-only AU splitter, mirroring pf-vkdecode's (which mirrors
-    /// pf-bitstream's `#[cfg(test)]`-private helper).
-    fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut cursor = Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let header_start = cursor.position() as usize;
-            let start = header_start - nalu.offset;
-            let is_slice = (nalu.header.type_ as u32) < 32;
-            let first_slice_flag =
-                is_slice && stream.get(header_start + 2).is_some_and(|b| b & 0x80 != 0);
-
-            if au_has_slice && (!is_slice || first_slice_flag) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
-
     fn convert_stream(stream: &[u8]) -> Vec<(AuPlan, DecodePlanDxvaH265)> {
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut out = Vec::new();
-        for (i, au) in split_into_aus(stream).into_iter().enumerate() {
+        for (i, au) in split_h265_aus(stream).into_iter().enumerate() {
             let Ok(plan) = planner.plan_au(au) else {
                 continue;
             };
@@ -673,7 +641,7 @@ mod tests {
         // Injected into the snapshot rather than synthesised as a bitstream — the
         // conversion, not the planner, is under test. Vendored vectors never produce
         // this (their RPS names every marked picture they hold).
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let plans: Vec<AuPlan> = aus
             .iter()
@@ -943,7 +911,7 @@ mod tests {
         let mut aliased = 0usize;
         let mut converted = 0usize;
 
-        for (i, au) in split_into_aus(LOWDELAY_640X480_H265)
+        for (i, au) in split_h265_aus(LOWDELAY_640X480_H265)
             .into_iter()
             .enumerate()
         {
@@ -1133,7 +1101,7 @@ mod tests {
         pps_coded: Option<u8>,
     ) -> (AuPlan, DecodePlanDxvaH265) {
         let mut planner = H265Planner::new();
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut plan = planner.plan_au(aus[0]).expect("plan");
 
         let mut sps = (*plan.sps).clone();
@@ -1257,7 +1225,7 @@ mod tests {
         // matrix for the inter slot.
         let (_, dxva) = {
             let mut planner = H265Planner::new();
-            let aus = split_into_aus(TEST_25FPS);
+            let aus = split_h265_aus(TEST_25FPS);
             let mut plan = planner.plan_au(aus[0]).expect("plan");
             let mut sps = (*plan.sps).clone();
             sps.scaling_list_enabled_flag = true;
@@ -1304,7 +1272,7 @@ mod tests {
 
     #[test]
     fn slice_ranges_ride_through_in_plan_order_on_start_code_boundaries() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         for (i, au) in aus.iter().enumerate() {
@@ -1320,7 +1288,7 @@ mod tests {
 
     #[test]
     fn a_capacity_mismatch_is_refused_and_leaves_the_map_untouched() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let plan = planner.plan_au(aus[0]).expect("plan");
         let mut slots = SlotMap::new(plan.picture.max_dpb_frames + 1);
@@ -1336,7 +1304,7 @@ mod tests {
 
     #[test]
     fn a_reference_the_map_never_saw_is_refused_and_leaves_the_map_untouched() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let first = planner.plan_au(aus[0]).expect("plan 0");
         let second = planner.plan_au(aus[1]).expect("plan 1");
@@ -1381,7 +1349,7 @@ mod tests {
 
     #[test]
     fn a_slot_is_reused_only_after_its_picture_leaves_the_dpb() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut live: Vec<(PicId, u8)> = Vec::new();

@@ -752,6 +752,7 @@ fn picture_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::AV1_25FPS;
     use cros_codecs::bitstream_utils::IvfIterator;
 
     /// `PF_AV1_DUMP=<capture>` with its `.idx`: print each frame's type, entropy source and
@@ -830,11 +831,6 @@ mod tests {
             "the vendored vector's first unit"
         );
     }
-
-    /// Vendored 25 fps conformance vector. Driven through the planner; the
-    /// crate's vendor-pin smoke test walks the same file through the parser.
-    const AV1_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1");
 
     /// Walk the whole vector and check the plan is self-consistent at every frame.
     ///

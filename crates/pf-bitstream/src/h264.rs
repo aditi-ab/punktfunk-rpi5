@@ -1671,11 +1671,9 @@ impl H264Planner {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
     use std::rc::Rc;
 
     use cros_codecs::codec::h264::nalu_writer::NaluWriter;
-    use cros_codecs::codec::h264::parser::Nalu;
     use cros_codecs::codec::h264::parser::NaluType;
     use cros_codecs::codec::h264::parser::PpsBuilder;
     use cros_codecs::codec::h264::parser::Profile;
@@ -1684,47 +1682,16 @@ mod tests {
     use cros_codecs::codec::h264::synthesizer::Synthesizer;
 
     use super::*;
+    use crate::testing::split_h264_aus;
 
-    const TEST_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264");
-    // The non-high 64x64-I-P-B-P.h264 is constrained-baseline: x264 dropped the B.
-    // This high variant actually carries the B slice.
-    const TEST_64X64_I_P_B_P_HIGH: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h264/test_data/64x64-I-P-B-P-high.h264");
-
-    /// Split a raw Annex-B vector into the AUs `plan_au` expects. A new AU
-    /// starts at a non-slice after slices, or at `first_mb_in_slice == 0`
-    /// (ue(v) encodes that as the first RBSP bit set) once the current AU
-    /// already has slices.
-    fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut cursor = Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let nalu_offset = cursor.position() as usize;
-            let start = nalu_offset - nalu.offset;
-            let is_slice = matches!(nalu.header.type_, NaluType::Slice | NaluType::SliceIdr);
-            let first_mb_zero =
-                is_slice && stream.get(nalu_offset + 1).is_some_and(|b| b & 0x80 != 0);
-
-            if au_has_slice && (!is_slice || first_mb_zero) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
+    const TEST_25FPS: &[u8] = crate::testing::H264_25FPS;
+    const TEST_64X64_I_P_B_P_HIGH: &[u8] = crate::testing::H264_64X64_I_P_B_P_HIGH;
 
     /// `nal` starts at the NAL header whatever prefix the encoder wrote, so
     /// the three bytes before it are always `00 00 01`.
     #[test]
     fn a_slices_nal_range_skips_a_three_or_four_byte_start_code() {
-        let au = split_into_aus(TEST_25FPS)[0];
+        let au = split_h264_aus(TEST_25FPS)[0];
         let plan = H264Planner::new().plan_au(au).expect("plans");
         let first = &plan.slices[0];
         assert_eq!(first.nal.start - first.data.start, 3);
@@ -1743,7 +1710,7 @@ mod tests {
 
     #[test]
     fn the_full_25fps_vector_plans_every_picture_and_every_pic_id_reaches_output() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h264_aus(TEST_25FPS);
         let mut planner = H264Planner::new();
         let mut plans = Vec::new();
         for au in &aus {
@@ -1817,7 +1784,7 @@ mod tests {
 
     #[test]
     fn b_slices_get_a_poc_ordered_list1_distinct_from_list0() {
-        let aus = split_into_aus(TEST_64X64_I_P_B_P_HIGH);
+        let aus = split_h264_aus(TEST_64X64_I_P_B_P_HIGH);
         let mut planner = H264Planner::new();
         let mut b_slices_seen = 0usize;
 
@@ -2118,7 +2085,7 @@ mod tests {
         // The converse is false: the DPB holds unmarked pictures for output.
         let mut planner = H264Planner::new();
         let mut plans = Vec::new();
-        for au in split_into_aus(TEST_25FPS) {
+        for au in split_h264_aus(TEST_25FPS) {
             let plan = planner.plan_au(au).expect("plan");
             plans.push(plan);
         }
@@ -2150,7 +2117,7 @@ mod tests {
 
     #[test]
     fn a_dropped_reference_au_degrades_to_gap_warnings_and_planning_continues() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h264_aus(TEST_25FPS);
 
         // Find a non-IDR reference not followed by an IDR (an IDR would hide the gap).
         let mut planner = H264Planner::new();

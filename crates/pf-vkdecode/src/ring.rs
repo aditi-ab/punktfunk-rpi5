@@ -497,6 +497,9 @@ impl Drop for BitstreamRing {
 
 #[cfg(test)]
 mod tests {
+    use pf_bitstream::testing::split_h264_aus;
+    use pf_bitstream::testing::split_h265_aus;
+
     use super::*;
 
     #[test]
@@ -717,14 +720,10 @@ mod tests {
         assert_eq!(aus, 250, "the vector's own golden");
     }
 
-    /// Vendored H.265 vector, same path as `pic_h265`'s tests.
-    const TEST_25FPS_H265: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-    );
+    /// Vendored H.265 vector, as in `pic_h265`'s tests.
+    const TEST_25FPS_H265: &[u8] = pf_bitstream::testing::H265_25FPS;
     /// H.264 twin — same packer, different prefix convention.
-    const TEST_25FPS_H264: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-    );
+    const TEST_25FPS_H264: &[u8] = pf_bitstream::testing::H264_25FPS;
 
     /// One AU packed as [`BitstreamRing::upload`] would. 256 is the widest
     /// `minBitstreamBufferSizeAlignment` we size the recorded range for.
@@ -734,61 +733,6 @@ mod tests {
         let mut slot = vec![0xFFu8; layout.record_range(len) as usize];
         pack_into(&mut slot, au, &packed.segments);
         slot
-    }
-
-    /// H.265 AU split (same rule as `pic_h265` / GPU `tests/common`, private
-    /// there): a new AU starts at a non-VCL NALU after slices, or at a slice
-    /// whose `first_slice_segment_in_pic_flag` (top bit of the byte after the
-    /// two-byte NAL header) is set while the current AU already has slices.
-    fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
-        use cros_codecs::codec::h265::parser::Nalu;
-
-        let mut aus = Vec::new();
-        let mut cursor = std::io::Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let header_start = cursor.position() as usize;
-            let start = header_start - nalu.offset;
-            let is_slice = (nalu.header.type_ as u32) < 32;
-            let first_slice_flag =
-                is_slice && stream.get(header_start + 2).is_some_and(|b| b & 0x80 != 0);
-            if au_has_slice && (!is_slice || first_slice_flag) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
-
-    /// [`split_h265_aus`]' H.264 twin: one-byte NAL header, so
-    /// `first_mb_in_slice` is the top bit of the next byte.
-    fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
-        use cros_codecs::codec::h264::parser::Nalu;
-        use cros_codecs::codec::h264::parser::NaluType;
-
-        let mut aus = Vec::new();
-        let mut cursor = std::io::Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let nalu_offset = cursor.position() as usize;
-            let start = nalu_offset - nalu.offset;
-            let is_slice = matches!(nalu.header.type_, NaluType::Slice | NaluType::SliceIdr);
-            let first_mb_zero =
-                is_slice && stream.get(nalu_offset + 1).is_some_and(|b| b & 0x80 != 0);
-            if au_has_slice && (!is_slice || first_mb_zero) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
     }
 
     #[test]

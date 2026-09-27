@@ -17,67 +17,13 @@
 
 use pf_bitstream::h264::H264Planner;
 use pf_bitstream::h265::H265Planner;
+use pf_bitstream::testing::split_h264_aus;
+use pf_bitstream::testing::split_h265_aus;
 use pf_vkdecode::{AuFault, FaultAction, FaultMode, H265PlanWarning, PlanWarning};
-use std::io::Cursor;
 
 /// 250 AUs, IDR then P — the host envelope. GPU tests share these files.
-const TEST_25FPS_H264: &[u8] = include_bytes!(
-    "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-);
-const TEST_25FPS_H265: &[u8] = include_bytes!(
-    "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-);
-
-fn split_h264(stream: &[u8]) -> Vec<&[u8]> {
-    use cros_codecs::codec::h264::parser::{Nalu, NaluType};
-    let mut aus = Vec::new();
-    let mut cursor = Cursor::new(stream);
-    let mut au_start = 0usize;
-    let mut au_has_slice = false;
-
-    while let Ok(nalu) = Nalu::next(&mut cursor) {
-        let nalu_offset = cursor.position() as usize;
-        let start = nalu_offset - nalu.offset;
-        let is_slice = matches!(nalu.header.type_, NaluType::Slice | NaluType::SliceIdr);
-        let first_mb_zero = is_slice && stream.get(nalu_offset + 1).is_some_and(|b| b & 0x80 != 0);
-
-        if au_has_slice && (!is_slice || first_mb_zero) {
-            aus.push(&stream[au_start..start]);
-            au_start = start;
-            au_has_slice = false;
-        }
-        au_has_slice |= is_slice;
-    }
-    aus.push(&stream[au_start..]);
-    aus
-}
-
-/// `first_slice_segment_in_pic_flag` is bit 7 of the first RBSP byte;
-/// HEVC NAL header is 2 bytes, so `header_start + 2`.
-fn split_h265(stream: &[u8]) -> Vec<&[u8]> {
-    use cros_codecs::codec::h265::parser::Nalu;
-    let mut aus = Vec::new();
-    let mut cursor = Cursor::new(stream);
-    let mut au_start = 0usize;
-    let mut au_has_slice = false;
-
-    while let Ok(nalu) = Nalu::next(&mut cursor) {
-        let header_start = cursor.position() as usize;
-        let start = header_start - nalu.offset;
-        let is_slice = (nalu.header.type_ as u32) < 32;
-        let first_slice_flag =
-            is_slice && stream.get(header_start + 2).is_some_and(|b| b & 0x80 != 0);
-
-        if au_has_slice && (!is_slice || first_slice_flag) {
-            aus.push(&stream[au_start..start]);
-            au_start = start;
-            au_has_slice = false;
-        }
-        au_has_slice |= is_slice;
-    }
-    aus.push(&stream[au_start..]);
-    aus
-}
+const TEST_25FPS_H264: &[u8] = pf_bitstream::testing::H264_25FPS;
+const TEST_25FPS_H265: &[u8] = pf_bitstream::testing::H265_25FPS;
 
 /// Driver `Failed` on a prior frame has no analogue here.
 fn damaged_h264(planner: &mut H264Planner, au: &[u8]) -> bool {
@@ -134,7 +80,7 @@ fn replay_h264(fault: Option<AuFault>) -> (Vec<bool>, usize) {
     let mut planner = H264Planner::new();
     replay(
         TEST_25FPS_H264,
-        split_h264,
+        split_h264_aus,
         move |au| damaged_h264(&mut planner, au),
         fault,
     )
@@ -144,7 +90,7 @@ fn replay_h265(fault: Option<AuFault>) -> (Vec<bool>, usize) {
     let mut planner = H265Planner::new();
     replay(
         TEST_25FPS_H265,
-        split_h265,
+        split_h265_aus,
         move |au| damaged_h265(&mut planner, au),
         fault,
     )
@@ -231,7 +177,7 @@ fn a_dropped_access_unit_is_detected_on_the_very_next_one() {
 fn a_dropped_hevc_reference_picture_is_detected_through_the_rps() {
     // Classify from a clean replay so the labels are the stream's, not a guess.
     let mut planner = H265Planner::new();
-    let referenced: Vec<bool> = split_h265(TEST_25FPS_H265)
+    let referenced: Vec<bool> = split_h265_aus(TEST_25FPS_H265)
         .into_iter()
         .map(|au| {
             planner

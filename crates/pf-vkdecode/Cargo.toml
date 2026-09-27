@@ -19,6 +19,8 @@ pf-bitstream = { path = "../pf-bitstream" }
 tracing = "0.1"
 
 [dev-dependencies]
+# `pf_bitstream::testing`: the vendored vectors and access-unit splitters.
+pf-bitstream = { path = "../pf-bitstream", features = ["test-vectors"] }
 # The GPU parity test hashes decoded frames against libavcodec goldens (already
 # in the workspace lock via other crates).
 sha2 = "0.11"

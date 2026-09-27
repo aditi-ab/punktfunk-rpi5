@@ -498,52 +498,21 @@ fn narrow_21(src: &[u32]) -> [u16; 21] {
 
 #[cfg(test)]
 mod tests {
+    use pf_bitstream::testing::split_h265_aus;
+
     use super::*;
     use crate::va_h265::REF_PIC_LIST_UNUSED;
     use crate::va_h265::VA_PICTURE_HEVC_INVALID;
 
     const SURFACE_BASE: u32 = 0xa000;
 
-    const TEST_25FPS_H265: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-    );
+    const TEST_25FPS_H265: &[u8] = pf_bitstream::testing::H265_25FPS;
     const TEST_MAIN10_H265: &[u8] = include_bytes!("../../pf-vkdecode/tests/data/test-main10.h265");
-
-    /// Split HEVC Annex-B into access units. The NAL header is two bytes, so
-    /// `first_slice_segment_in_pic_flag` is the top bit at `+2` (H.264 reads `+1`)
-    /// and a slice is nal_unit_type `< 32`.
-    fn split_aus(stream: &[u8]) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let (mut au_start, mut au_has_slice) = (0usize, false);
-        let mut i = 0usize;
-        while i + 3 <= stream.len() {
-            if stream[i..i + 3] != [0x00, 0x00, 0x01] {
-                i += 1;
-                continue;
-            }
-            let header = i + 3;
-            let mut start = i;
-            if start > 0 && stream[start - 1] == 0x00 {
-                start -= 1;
-            }
-            let is_slice = (stream[header] >> 1) & 0x3f < 32;
-            let first = is_slice && stream.get(header + 2).is_some_and(|b| b & 0x80 != 0);
-            if au_has_slice && (!is_slice || first) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-            i += 3;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
 
     fn walk(stream: &[u8], expect_aus: usize, label: &str) {
         use pf_bitstream::h265::H265Planner;
 
-        let aus = split_aus(stream);
+        let aus = split_h265_aus(stream);
         assert_eq!(aus.len(), expect_aus, "{label}: access-unit count");
 
         let mut planner = H265Planner::new();
