@@ -8,7 +8,7 @@ use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
 use crate::trust::{self, KnownHost, KnownHosts};
 use pf_client_core::discovery::{DiscoveredHost, DiscoveryEvent};
-use pf_client_core::orchestrate::{CancelHandle, WakeOutcome, WakeWait};
+use pf_client_core::orchestrate::{CancelHandle, ConnectOutcome, WakeOutcome, WakeWait};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -257,7 +257,7 @@ fn connect_spawn(
 
     let persist_paired = opts.persist_paired;
     let cancel = opts.cancel;
-    let wake_on_fail = opts.wake_on_fail;
+    let mut wake_on_fail = opts.wake_on_fail;
     let ctx2 = ctx.clone();
     let shared = ctx.shared.clone();
     let (ss, st) = (set_screen.clone(), set_status.clone());
@@ -290,6 +290,8 @@ fn connect_spawn(
             }
             match event {
                 SpawnEvent::Ready => {
+                    // Ready proves the host answered, so no later exit is the asleep case.
+                    wake_on_fail = false;
                     if persist_paired || tofu {
                         // Request-access: the operator approved this device — record the
                         // host PAIRED so future connects are silent. Plain TOFU persists
@@ -316,42 +318,38 @@ fn connect_spawn(
                     ss.call(Screen::Stream);
                 }
                 SpawnEvent::Stats(s) => *shared.stats.lock().unwrap() = Some(*s),
-                SpawnEvent::Exited { error, ended, code } => {
-                    match error {
-                        Some((msg, true)) => {
-                            // Pinned-fingerprint mismatch / pairing required → re-pair via
-                            // the PIN screen. The host ANSWERED, so never the wake fallback.
-                            st.call(msg);
-                            *shared.target.lock().unwrap() = target.clone();
-                            ss.call(Screen::Pair);
-                        }
-                        Some((_, false))
-                            if wake_on_fail && ctx2.settings.lock().unwrap().auto_wake =>
-                        {
-                            // The dial-first attempt to a non-advertising host failed — it
-                            // may genuinely be asleep. NOW wake and wait. Skipped entirely
-                            // when auto-wake is off: the wait is only worth showing if we
-                            // are actually sending magic packets to end it.
-                            wake_and_connect(&ctx2, target.clone(), &ss, &st);
-                        }
-                        Some((msg, false)) => {
-                            st.call(msg);
-                            ss.call(Screen::Hosts);
-                        }
-                        // `ended` = the host ended the session (banner); a clean exit
-                        // (user closed the stream window / Disconnect) returns silently.
-                        // A child that said nothing AND failed gets the exit code, so the
-                        // return to the host list is never unexplained.
-                        None => {
-                            st.call(
-                                ended
-                                    .or_else(|| crate::spawn::silent_exit_banner(code))
-                                    .unwrap_or_default(),
-                            );
-                            ss.call(Screen::Hosts);
-                        }
+                SpawnEvent::Exited(outcome) => match outcome {
+                    ConnectOutcome::TrustRejected(msg) => {
+                        // Pinned-fingerprint mismatch / pairing required → re-pair via
+                        // the PIN screen. The host ANSWERED, so never the wake fallback.
+                        st.call(msg);
+                        *shared.target.lock().unwrap() = target.clone();
+                        ss.call(Screen::Pair);
                     }
-                }
+                    // The dial-first attempt to a non-advertising host failed — it may
+                    // genuinely be asleep. Only with auto-wake on: the wait is worth showing
+                    // only while magic packets are going out to end it.
+                    o if o.warrants_wake()
+                        && wake_on_fail
+                        && ctx2.settings.lock().unwrap().auto_wake =>
+                    {
+                        wake_and_connect(&ctx2, target.clone(), &ss, &st);
+                    }
+                    ConnectOutcome::ConnectFailed(msg) | ConnectOutcome::Ended(Some(msg)) => {
+                        st.call(msg);
+                        ss.call(Screen::Hosts);
+                    }
+                    // A child that said nothing AND failed gets the exit code, so the return
+                    // to the host list is never unexplained.
+                    ConnectOutcome::RendererFailed { code } => {
+                        st.call(crate::spawn::renderer_failed_banner(code));
+                        ss.call(Screen::Hosts);
+                    }
+                    // The user closed the stream window, or Disconnect killed it.
+                    ConnectOutcome::Ended(None) | ConnectOutcome::Cancelled => {
+                        ss.call(Screen::Hosts);
+                    }
+                },
             }
         },
     );
@@ -390,18 +388,20 @@ pub(crate) fn open_console(
                 ss.call(Screen::Stream);
             }
             SpawnEvent::Stats(s) => *shared.stats.lock().unwrap() = Some(*s),
-            SpawnEvent::Exited { error, ended, code } => {
+            SpawnEvent::Exited(outcome) => {
                 crate::shell_window::restore();
-                // Quit from the library (B / closing the window) returns silently;
-                // a failed start surfaces its error line, or the exit code when it
-                // died without producing one.
-                st.call(
-                    error
-                        .map(|(msg, _)| msg)
-                        .or(ended)
-                        .or_else(|| crate::spawn::silent_exit_banner(code))
-                        .unwrap_or_default(),
-                );
+                // Quit from the library (B / closing the window) or Disconnect returns
+                // silently; a failed start surfaces its error line, or the exit code when
+                // it died without producing one.
+                match outcome {
+                    ConnectOutcome::TrustRejected(msg)
+                    | ConnectOutcome::ConnectFailed(msg)
+                    | ConnectOutcome::Ended(Some(msg)) => st.call(msg),
+                    ConnectOutcome::RendererFailed { code } => {
+                        st.call(crate::spawn::renderer_failed_banner(code))
+                    }
+                    ConnectOutcome::Ended(None) | ConnectOutcome::Cancelled => {}
+                }
                 ss.call(Screen::Hosts);
             }
         }

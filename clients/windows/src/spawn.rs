@@ -5,7 +5,7 @@
 //! `--window-pos`, the log-file tee for the child's stderr, and [`SpawnEvent`]s for the app's
 //! navigation closure.
 
-use pf_client_core::orchestrate::{self, CancelHandle, SessionEvent};
+use pf_client_core::orchestrate::{self, CancelHandle, ConnectOutcome, SessionEvent};
 use std::os::windows::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,39 +16,20 @@ pub(crate) enum SpawnEvent {
     Ready,
     /// One stats window for the session status page.
     Stats(Box<punktfunk_core::hud::StatsSnapshot>),
-    /// The child exited (stdout EOF + reap; a kill lands here too). `error`/`ended` carry the
-    /// contract lines seen on the way out. `code` (-1 = no code) covers a child that died
-    /// before it could speak the contract, which would otherwise read as a clean quit.
-    Exited {
-        error: Option<(String, bool)>,
-        ended: Option<String>,
-        code: i32,
-    },
+    /// The child exited (stdout EOF + reap; a kill lands here too), classified.
+    Exited(ConnectOutcome),
 }
 
-/// The banner for a child that exited having said NOTHING on stdout — no `ready`, no
-/// `error`, no `ended`. `None` keeps the silent return the UI has always given a clean
-/// quit: code 0 is the user closing the stream window, and -1 is our own Disconnect/Cancel
-/// kill (no exit code). Anything else is the session dying before it could speak its
-/// contract — a missing runtime DLL, a crash, or the wrong binary sitting next to the
-/// shell — and reporting the code is the difference between a diagnosable failure and a
-/// connect that silently drops back to the host list.
-pub(crate) fn silent_exit_banner(code: i32) -> Option<String> {
-    (code != 0 && code != -1).then(|| {
-        // Name the log's actual location — "check the client log" without a path is a
-        // scavenger hunt (Settings ▸ About's "Open log folder" reaches it too).
-        let log = crate::logfile::path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "the client log".into());
-        // NTSTATUS codes arrive as negative i32s; the hex form matches the crash filter's
-        // log line and the Event Log record, so the two can be tied together.
-        let how = match code as u32 {
-            0xC000_0005 => "crashed with an access violation (0xC0000005)".to_string(),
-            c if code < 0 => format!("died with exception 0x{c:08X}"),
-            _ => format!("exited with code {code}"),
-        };
-        format!("The session didn't start (punktfunk-session {how}). Check {log}.")
-    })
+/// The banner for a session that died without a contract line — a missing runtime DLL, a
+/// crash, or the wrong binary next to the shell. It names the log's real location.
+pub(crate) fn renderer_failed_banner(code: i32) -> String {
+    let log = crate::logfile::path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "the client log".into());
+    format!(
+        "The session didn't start (punktfunk-session {}). Check {log}.",
+        ConnectOutcome::exit_phrase(code)
+    )
 }
 
 /// Spawn the session binary for a connect with `fp_hex` pinned and feed its lifecycle to
@@ -117,7 +98,7 @@ fn add_window_pos(cmd: &mut Command) {
 }
 
 /// [`orchestrate::spawn_child`] with this shell's window flags and log tee, folding the
-/// contract's `error`/`ended` lines into [`SpawnEvent::Exited`].
+/// contract's `error`/`ended` lines and our own kill into [`SpawnEvent::Exited`].
 fn spawn(
     mut cmd: Command,
     spec_path: Option<PathBuf>,
@@ -129,6 +110,7 @@ fn spawn(
     add_window_pos(&mut cmd);
     cmd.creation_flags(CREATE_NO_WINDOW);
     let (mut error, mut ended) = (None::<(String, bool)>, None::<String>);
+    let cancel = slot.clone();
     orchestrate::spawn_child(cmd, spec_path, Some(slot), crate::logfile::Tee, move |ev| {
         match ev {
             SessionEvent::Ready => on_event(SpawnEvent::Ready),
@@ -140,11 +122,12 @@ fn spawn(
             SessionEvent::Ended(msg) => ended = Some(msg),
             // orchestrate persists the window size on the way past.
             SessionEvent::Window { .. } => {}
-            SessionEvent::Exited(code) => on_event(SpawnEvent::Exited {
-                error: error.take(),
-                ended: ended.take(),
+            SessionEvent::Exited(code) => on_event(SpawnEvent::Exited(ConnectOutcome::from_exit(
                 code,
-            }),
+                error.take(),
+                ended.take(),
+                cancel.is_cancelled(),
+            ))),
         }
     })
     .map_err(|e| {
@@ -153,27 +136,4 @@ fn spawn(
     })?;
     tracing::info!(host = %label, "session binary spawned");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_silent_failing_exit_is_never_blank() {
-        // Clean quit (stream window closed) and our own kill stay silent.
-        assert!(silent_exit_banner(0).is_none());
-        assert!(silent_exit_banner(-1).is_none());
-        // A child that died without speaking the contract names its code — the 0.22.0
-        // regression (a stub session binary exiting 2) showed as a blank bounce to the
-        // host list precisely because nothing filled this in.
-        let banner = silent_exit_banner(2).expect("failing exit must say something");
-        assert!(banner.contains('2'), "{banner}");
-        assert!(silent_exit_banner(101).is_some());
-        // An NTSTATUS names the crash in hex, the form the Event Log and the crash filter use.
-        let av = silent_exit_banner(-1073741819).unwrap();
-        assert!(av.contains("access violation (0xC0000005)"), "{av}");
-        let other = silent_exit_banner(0xC000_0409u32 as i32).unwrap();
-        assert!(other.contains("0xC0000409"), "{other}");
-    }
 }

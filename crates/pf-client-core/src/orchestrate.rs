@@ -3,7 +3,7 @@
 //!
 //! A [`ConnectPlan`] is built from a card click, a CLI verb, or a URL. Front-ends
 //! render; they do not decide when to prompt, how long to wait for a sleeping host,
-//! or what counts as a refusal. [`UiDelegate`] is the presentation surface.
+//! or what counts as a refusal. A session exit reaches them as a [`ConnectOutcome`].
 //!
 //! Wake cadence lives on [`WAKE_TIMEOUT_SECS`] / [`WAKE_RESEND_SECS`].
 
@@ -454,15 +454,6 @@ impl WakeWait {
     }
 }
 
-/// Front-end presentation. Nothing here decides policy.
-pub trait UiDelegate {
-    /// Unknown or never-pinned host. Return true to enter the trust flow. A
-    /// non-interactive front-end returns false — refusing is always safe.
-    fn confirm_unknown_host(&mut self, host: &UnknownHost) -> bool;
-    fn wake_progress(&mut self, host: &HostTarget, tick: WakeTick);
-    fn report(&mut self, outcome: &ConnectOutcome);
-}
-
 /// How a connect finished. Front-ends map this onto their own surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectOutcome {
@@ -471,8 +462,52 @@ pub enum ConnectOutcome {
     ConnectFailed(String),
     /// No pin, or the pin no longer matches. Never retried silently.
     TrustRejected(String),
-    RendererFailed(String),
+    /// The session died without a contract line. `-1` = no exit code (a Unix signal).
+    RendererFailed {
+        code: i32,
+    },
+    /// Our own kill: Disconnect or a cancelled request.
     Cancelled,
+}
+
+impl ConnectOutcome {
+    /// Classify a session exit: its code, the `error`/`ended` lines it spoke, and whether
+    /// we killed it. A contract line says more than a code. `cancelled` covers whatever
+    /// code our kill leaves: `-1` from a Unix signal, `1` from Windows' TerminateProcess.
+    pub fn from_exit(
+        code: i32,
+        error: Option<(String, bool)>,
+        ended: Option<String>,
+        cancelled: bool,
+    ) -> ConnectOutcome {
+        match (code, error) {
+            (_, Some((msg, true))) => ConnectOutcome::TrustRejected(msg),
+            (_, Some((msg, false))) => ConnectOutcome::ConnectFailed(msg),
+            (0, None) => ConnectOutcome::Ended(ended),
+            _ if cancelled => ConnectOutcome::Cancelled,
+            (code, None) => ConnectOutcome::RendererFailed { code },
+        }
+    }
+
+    /// Whether the dial-first wake fallback runs: the dial failed, or the session died
+    /// without a word. A trust rejection means the host answered; `-1` is a system kill.
+    pub fn warrants_wake(&self) -> bool {
+        match self {
+            ConnectOutcome::ConnectFailed(_) => true,
+            ConnectOutcome::RendererFailed { code } => *code != -1,
+            _ => false,
+        }
+    }
+
+    /// How a session that died silently went, for a banner. An NTSTATUS crash reads in
+    /// hex, the form the Event Log and the crash filter use.
+    pub fn exit_phrase(code: i32) -> String {
+        match code as u32 {
+            0xC000_0005 => "crashed with an access violation (0xC0000005)".to_string(),
+            c if code < 0 => format!("died with exception 0x{c:08X}"),
+            _ => format!("exited with code {code}"),
+        }
+    }
 }
 
 /// Everything a session needs, resolved by the caller — what `--resolved-spec`
@@ -1076,6 +1111,43 @@ mod tests {
         assert_eq!(spec.settings.bitrate_kbps, 80000, "the overlay is baked in");
         assert_eq!(spec.preset.as_deref(), Some("Game"));
         assert!(spec.clipboard, "the host's decision, resolved once");
+    }
+
+    #[test]
+    fn session_exits_classify_once() {
+        use ConnectOutcome as O;
+        // A contract line says more than a code.
+        let trust = O::from_exit(3, Some(("pin".into(), true)), None, false);
+        assert_eq!(trust, O::TrustRejected("pin".into()));
+        assert!(!trust.warrants_wake(), "the host answered");
+        let failed = O::from_exit(2, Some(("no route".into(), false)), None, false);
+        assert_eq!(failed, O::ConnectFailed("no route".into()));
+        assert!(failed.warrants_wake());
+        assert_eq!(O::from_exit(0, None, None, false), O::Ended(None));
+        assert_eq!(
+            O::from_exit(0, None, Some("Host ended".into()), false),
+            O::Ended(Some("Host ended".into()))
+        );
+        // Our own kill is silent whatever code it leaves: a Unix signal, or TerminateProcess's 1.
+        assert_eq!(O::from_exit(-1, None, None, true), O::Cancelled);
+        assert_eq!(O::from_exit(1, None, None, true), O::Cancelled);
+        // Anything else that died silently is a failure, never a blank return.
+        let crashed = O::from_exit(1, None, None, false);
+        assert_eq!(crashed, O::RendererFailed { code: 1 });
+        assert!(crashed.warrants_wake());
+        assert!(
+            !O::RendererFailed { code: -1 }.warrants_wake(),
+            "a system kill"
+        );
+    }
+
+    #[test]
+    fn exit_phrase_names_an_ntstatus_in_hex() {
+        assert_eq!(ConnectOutcome::exit_phrase(2), "exited with code 2");
+        let av = ConnectOutcome::exit_phrase(-1073741819);
+        assert!(av.contains("access violation (0xC0000005)"), "{av}");
+        let other = ConnectOutcome::exit_phrase(0xC000_0409u32 as i32);
+        assert!(other.contains("0xC0000409"), "{other}");
     }
 
     #[test]
