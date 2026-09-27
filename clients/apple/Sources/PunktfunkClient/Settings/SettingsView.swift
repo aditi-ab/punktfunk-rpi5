@@ -583,7 +583,9 @@ struct SettingsView: View {
                     Button(role: .destructive) {
                         presetPendingDelete = active
                     } label: {
+                        // Text and symbol in one colour: the role reddens only the text.
                         Label("Delete…", systemImage: "trash")
+                            .foregroundStyle(.red)
                     }
                 }
             }
