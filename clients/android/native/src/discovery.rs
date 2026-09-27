@@ -22,8 +22,6 @@ use std::time::Duration;
 
 /// DNS-SD service type punktfunk hosts advertise (host side: `punktfunk_host::discovery`).
 const SERVICE_TYPE: &str = "_punktfunk._udp.local.";
-/// Wire protocol id in the `proto` TXT record; a host advertising anything else is skipped.
-const PROTO: &str = "punktfunk/1";
 /// Field separator inside one serialized record (ASCII Unit Separator — never in a field value).
 const FIELD_SEP: char = '\u{1f}';
 /// How long the fold thread waits for an event before it looks at the rescan flag.
@@ -237,40 +235,27 @@ fn remove_discovery(handle: jlong) -> Option<Arc<Discovery>> {
     crate::session::lock_recover(discoveries()).remove(&handle)
 }
 
-/// Build a [`Host`] from a resolved mDNS record, or `None` if it isn't a usable punktfunk host
-/// (incompatible advertised proto, or no IPv4 address). IPv4 only on purpose: the core dials with
-/// `format!("{host}:{port}").parse::<SocketAddr>()`, which can't parse a bare/scoped IPv6 literal
-/// (it needs the `[addr%scope]:port` form), so surfacing a v6-only host would present a card that
-/// fails on every tap. Dropping it shows the honest "not found" instead.
+/// The [`Host`] a resolved mDNS record describes, or `None` if it isn't a usable punktfunk host
+/// (see `punktfunk_core::discovery::advert_from_txt`, the parse every client shares).
 fn resolve(info: &ResolvedService) -> Option<Host> {
-    let val = |k: &str| info.get_property_val_str(k).unwrap_or("").to_string();
-    let proto = val("proto");
-    if !proto.is_empty() && proto != PROTO {
-        return None; // some other DNS-SD service sharing the type — ignore
-    }
-    // Deterministic pick from the union of per-interface answers (the host OS's responder
-    // contributes VPN/overlay addresses; `iter().next()` on the HashSet dialed an arbitrary
-    // one) — same policy as the desktop client, shared in `punktfunk_core::discovery`.
-    let candidates: Vec<std::net::Ipv4Addr> = info.get_addresses_v4().into_iter().collect();
-    let addr = punktfunk_core::discovery::pick_host_addr(&candidates, val("addr").parse().ok())?
-        .to_string();
-    let id = val("id");
-    let fullname = info.get_fullname();
+    let v4: Vec<std::net::Ipv4Addr> = info.get_addresses_v4().into_iter().collect();
+    let h = punktfunk_core::discovery::advert_from_txt(
+        info.get_fullname(),
+        info.get_port(),
+        &v4,
+        |k| info.get_property_val_str(k),
+    )?;
     Some(Host {
-        key: if id.is_empty() {
-            fullname.to_string()
-        } else {
-            id
-        },
-        name: fullname.split('.').next().unwrap_or("?").to_string(),
-        addr,
-        port: info.get_port(),
-        fp: val("fp"),
-        pair: val("pair"),
-        mac: val("mac"),
-        os: val("os"),
+        key: h.key,
+        name: h.name,
+        addr: h.addr,
+        port: h.port,
+        fp: h.fp_hex,
+        pair: h.pair,
+        mac: h.mac.join(","),
+        os: h.os,
         // 0 = the host didn't advertise one (older host); Kotlin then falls back to 47990.
-        mgmt: val("mgmt").parse().unwrap_or(0),
+        mgmt: h.mgmt_port.unwrap_or(0),
     })
 }
 
