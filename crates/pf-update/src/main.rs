@@ -14,7 +14,7 @@
 //!
 //! Design: `host-update-from-web-console.md`.
 
-// `deny` not `forbid`: `effective_uid` is the one `#[allow(unsafe_code)]` in this root helper.
+// `deny` not `forbid`: the `effective_uid` declaration is the one `#[allow(unsafe_code)]` here.
 #![deny(unsafe_code)]
 
 #[cfg(target_os = "linux")]
@@ -358,21 +358,13 @@ mod linux_main {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
-    // Direct `geteuid` — a libc crate is not worth it here. Edition 2024 `unsafe extern`
-    // trips `unsafe_code`; the allow matches `effective_uid` below.
+    // Direct `geteuid` — a libc crate is not worth it here, nor `rustix::process::geteuid()`:
+    // Cargo.toml's zero-dep posture is the point. `safe fn`: no arguments, no memory, cannot
+    // fail. The `unsafe extern` block is the crate's sole `unsafe_code`.
     #[allow(unsafe_code)]
     unsafe extern "C" {
         #[link_name = "geteuid"]
-        fn libc_geteuid() -> u32;
-    }
-
-    /// Sole `unsafe` in the crate so `deny(unsafe_code)` can stand. Do not swap in
-    /// `rustix::process::geteuid()` — Cargo.toml's zero-dep posture is the point of this helper.
-    #[allow(unsafe_code)]
-    fn effective_uid() -> u32 {
-        // SAFETY: `geteuid` is a POSIX syscall wrapper that takes no arguments, reads no memory
-        // through a pointer, cannot fail, and has no preconditions whatsoever.
-        unsafe { libc_geteuid() }
+        safe fn effective_uid() -> u32;
     }
 }
 

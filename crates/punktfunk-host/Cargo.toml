@@ -231,7 +231,7 @@ tempfile = "3"
 opus = "0.3"
 
 [target.'cfg(unix)'.dependencies]
-# The POSIX calls behind the `#[cfg(unix)]` helpers in `hooks.rs` (geteuid) and the SIGTERM
+# The POSIX calls behind the `#[cfg(unix)]` helpers in `hooks.rs` (kill) and the SIGTERM
 # ladder in `gamelease.rs`. Declared for every unix, not just Linux, or a macOS build fails on
 # code whose own cfg already says it is portable.
 libc = "0.2"
