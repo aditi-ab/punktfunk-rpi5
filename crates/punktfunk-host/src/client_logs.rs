@@ -78,20 +78,13 @@ fn sanitize_name(name: &str) -> String {
 /// newest-last; dashes (not colons) so the stem is a valid Windows filename.
 /// Underscores separate the three fields; name/fp stay `[A-Za-z0-9.-]`.
 fn bundle_id(unix_ms: u64, fp_hex: &str, name: &str) -> String {
-    let secs = (unix_ms / 1000) as i64;
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    let (y, mo, d) = crate::stats_recorder::civil_from_days(days);
-    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let stamp = punktfunk_core::time::utc_rfc3339(unix_ms, false).replace(':', "-");
     let fp16: String = fp_hex
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .take(16)
         .collect();
-    format!(
-        "{y:04}-{mo:02}-{d:02}T{h:02}-{mi:02}-{s:02}Z_{fp16}_{}",
-        sanitize_name(name)
-    )
+    format!("{stamp}_{fp16}_{}", sanitize_name(name))
 }
 
 impl ClientLogStore {
