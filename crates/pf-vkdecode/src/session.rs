@@ -45,7 +45,8 @@ pub enum ParamsAction {
     Current,
     /// New id; one update (seq += 1) may add both sets.
     Add { add_sps: bool, add_pps: bool },
-    /// Content changed under a stored id, or capacity would overflow.
+    /// No object yet, content changed under a stored id, or capacity would
+    /// overflow.
     Recreate,
 }
 
@@ -61,6 +62,11 @@ pub(crate) struct ParamsLedger {
 impl ParamsLedger {
     /// Decide without mutating. Apply via [`Self::commit`].
     pub(crate) fn plan(&self, sps: &Rc<Sps>, pps: &Rc<Pps>) -> ParamsAction {
+        // The first pair creates the object. One created with no set at all
+        // faults Intel's Windows driver; FFmpeg never creates one either.
+        if self.sps.is_empty() && self.pps.is_empty() {
+            return ParamsAction::Recreate;
+        }
         let sps_key = sps.seq_parameter_set_id;
         let pps_key = (pps.seq_parameter_set_id, pps.pic_parameter_set_id);
 
@@ -278,6 +284,12 @@ pub(crate) unsafe fn bind_session_memory(
                 .memory_size(mr.size),
         );
     }
+    // A session with no memory requirements is bound already. The bind call with
+    // zero entries is invalid (VUID arraylength), and Intel's Windows driver takes it
+    // as a poisoned session: the next parameters create faults inside the driver.
+    if binds.is_empty() {
+        return Ok(allocated);
+    }
     // SAFETY: session + freshly allocated memory, one bind per requirement.
     let r = unsafe {
         (dev.video_queue().fp().bind_video_session_memory_khr)(
@@ -419,13 +431,12 @@ impl VideoSession {
                     return Err(failure.error);
                 }
             }
-            built.parameters = built.create_parameters_object(Vec::new(), Vec::new())?;
         }
         Ok(built)
     }
 
-    /// Parameters object holding exactly `sps` / `pps` (either may be empty),
-    /// fused with the wrappers those Std pointers address.
+    /// Parameters object holding exactly `sps` / `pps`, fused with the wrappers
+    /// those Std pointers address.
     ///
     /// # Safety
     ///
@@ -541,7 +552,7 @@ impl VideoSession {
                 debug!(
                     sps_id = sps.seq_parameter_set_id,
                     pps_id = pps.pic_parameter_set_id,
-                    "recreating session parameters (content change or capacity)"
+                    "fresh session parameters object"
                 );
                 let mut owned_sps = sps_to_std(sps)?;
                 owned_sps.clamp_level(self.config.max_level_idc);
@@ -553,16 +564,20 @@ impl VideoSession {
                     unsafe { self.create_parameters_object(vec![owned_sps], vec![owned_pps])? };
                 // Destroy the old object before its backings drop.
                 let old = std::mem::replace(&mut self.parameters, fresh);
-                // SAFETY: the fn-level contract — the caller drained every
-                // in-flight decode before a Recreate reached here (checked via
-                // parameters_action), so no submitted work reads the old object;
-                // it is this session's own handle, on a live device.
-                unsafe {
-                    (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                        self.device.handle(),
-                        old.object,
-                        std::ptr::null(),
-                    );
+                // The first activation has no old object. The spec lets destroy take
+                // NULL; AMD's Windows driver reads through it.
+                if old.object != vk::VideoSessionParametersKHR::null() {
+                    // SAFETY: the fn-level contract — the caller drained every
+                    // in-flight decode before a Recreate reached here (checked via
+                    // parameters_action), so no submitted work reads the old
+                    // object; it is this session's own handle, on a live device.
+                    unsafe {
+                        (self.video_queue.fp().destroy_video_session_parameters_khr)(
+                            self.device.handle(),
+                            old.object,
+                            std::ptr::null(),
+                        );
+                    }
                 }
                 // Std blocks `old` owns are released only after that destroy.
                 drop(old);
@@ -614,16 +629,19 @@ impl ResetArm {
 impl Drop for VideoSession {
     fn drop(&mut self) {
         // SAFETY: this session's handles on a live device; the decoder drains
-        // GPU work first. Destroy ignores NULL (half-built sessions). Bound
-        // memory must not be freed while the session lives, so destroy the
-        // session first — a failed bind parks allocations here ([`BindFailure`]).
-        // Std backings drop with `parameters` after this body.
+        // GPU work first. A session that never decoded has no parameters object
+        // and skips that destroy. Bound memory must not be freed while the
+        // session lives, so destroy the session first — a failed bind parks
+        // allocations here ([`BindFailure`]). Std backings drop with
+        // `parameters` after this body.
         unsafe {
-            (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                self.device.handle(),
-                self.parameters.object,
-                std::ptr::null(),
-            );
+            if self.parameters.object != vk::VideoSessionParametersKHR::null() {
+                (self.video_queue.fp().destroy_video_session_parameters_khr)(
+                    self.device.handle(),
+                    self.parameters.object,
+                    std::ptr::null(),
+                );
+            }
             (self.video_queue.fp().destroy_video_session_khr)(
                 self.device.handle(),
                 self.session,
@@ -791,13 +809,7 @@ mod tests {
 
         let mut ledger = ParamsLedger::default();
         let first = ledger.plan(&sps_a, &pps_a);
-        assert_eq!(
-            first,
-            ParamsAction::Add {
-                add_sps: true,
-                add_pps: true
-            }
-        );
+        assert_eq!(first, ParamsAction::Recreate);
         ledger.commit(first, &sps_a, &pps_a);
         assert_eq!(ledger.plan(&sps_b, &pps_b), ParamsAction::Current);
     }
@@ -828,6 +840,9 @@ mod tests {
         let mut ledger = ParamsLedger::default();
         let a = ledger.plan(&sps, &pps);
         ledger.commit(a, &sps, &pps);
+        let (_, pps1) = authored(0, 1, 26);
+        let a = ledger.plan(&sps, &pps1);
+        ledger.commit(a, &sps, &pps1);
         assert_eq!(ledger.next_update_seq(), 2, "one Add happened");
 
         // Same ids, different content: Vulkan cannot replace a stored set.
@@ -858,7 +873,8 @@ mod tests {
             assert!(matches!(a, ParamsAction::Add { .. }));
             ledger.commit(a, &sps, &pps);
         }
-        assert_eq!(ledger.next_update_seq() - 1, MAX_STD_PPS as u32);
+        // The first PPS came with the object, not through an update.
+        assert_eq!(ledger.next_update_seq() - 1, MAX_STD_PPS as u32 - 1);
 
         // One past capacity: Recreate; the evicted first PPS re-Adds later.
         let overflow = PpsBuilder::new(Rc::clone(&sps))
@@ -898,9 +914,17 @@ mod tests {
     fn update_sequence_counts_one_per_add_call_not_per_set() {
         let (sps, pps) = authored(0, 0, 26);
         let mut ledger = ParamsLedger::default();
-        assert_eq!(ledger.next_update_seq(), 1);
-        // One call carries both sets: the counter moves by exactly one.
         let a = ledger.plan(&sps, &pps);
+        assert_eq!(
+            a,
+            ParamsAction::Recreate,
+            "the first pair creates the object"
+        );
+        ledger.commit(a, &sps, &pps);
+        assert_eq!(ledger.next_update_seq(), 1);
+        // One call carries both new sets: the counter moves by exactly one.
+        let (sps1, pps1) = authored(1, 1, 26);
+        let a = ledger.plan(&sps1, &pps1);
         assert_eq!(
             a,
             ParamsAction::Add {
@@ -908,7 +932,7 @@ mod tests {
                 add_pps: true
             }
         );
-        ledger.commit(a, &sps, &pps);
+        ledger.commit(a, &sps1, &pps1);
         assert_eq!(ledger.next_update_seq(), 2);
     }
 }

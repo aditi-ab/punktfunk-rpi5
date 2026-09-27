@@ -262,10 +262,18 @@ impl Presenter {
             OverlayPipe::new(&self.device, target.format, on)?,
         );
         old_pipe.destroy(&self.device);
-        // The scale pass renders into the swapchain format too; fence quiesce above. Build the
-        // new one first: a failed create must not leave destroyed handles for Drop to free again.
+        // The scale and direct passes render into the swapchain format too; fence quiesce above.
+        // Build each new one first: a failed create must not leave destroyed handles for Drop.
         let new_scale = crate::scale::ScalePass::new(&self.device, target.format)?;
         std::mem::replace(&mut self.scale, new_scale).destroy(&self.device);
+        let new_direct = crate::csc::DirectPass::new(
+            &self.device,
+            target.format,
+            self.csc.pipeline_layout,
+            self.csc_planar.pipeline_layout,
+        )?;
+        std::mem::replace(&mut self.direct, new_direct).destroy(&self.device);
+        self.direct_last = None;
         self.format = target;
         self.hdr_active = on;
         match self.recreate_swapchain(window) {

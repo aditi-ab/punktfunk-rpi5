@@ -92,8 +92,8 @@ pub enum ParamsActionH265 {
         add_sps: bool,
         add_pps: bool,
     },
-    /// Stored id changed content, or capacity would overflow. Vulkan cannot
-    /// replace or evict a stored set.
+    /// No object yet, a stored id changed content, or capacity would overflow.
+    /// Vulkan cannot replace or evict a stored set.
     Recreate,
 }
 
@@ -110,6 +110,11 @@ pub(crate) struct ParamsLedgerH265 {
 
 impl ParamsLedgerH265 {
     pub(crate) fn plan(&self, vps: &VpsSource, sps: &Rc<Sps>, pps: &Rc<Pps>) -> ParamsActionH265 {
+        // The first triple creates the object. One created with no set at all
+        // faults Intel's Windows driver; FFmpeg never creates one either.
+        if self.vps.is_empty() && self.sps.is_empty() && self.pps.is_empty() {
+            return ParamsActionH265::Recreate;
+        }
         let vps_key = vps.id();
         let sps_key = sps.seq_parameter_set_id;
         let pps_key = (pps.seq_parameter_set_id, pps.pic_parameter_set_id);
@@ -266,8 +271,8 @@ impl StoredParamsH265 {
         }
     }
 
-    /// Empty placeholder. Destroy ignores a NULL handle, so a create that fails
-    /// before the object exists still drops cleanly.
+    /// No object until the first activation's Recreate. Destroy ignores a NULL
+    /// handle, so a session that never decoded still drops cleanly.
     fn none() -> Self {
         Self::assemble(Vec::new(), Vec::new(), Vec::new())
     }
@@ -361,14 +366,12 @@ impl VideoSessionH265 {
                     return Err(failure.error);
                 }
             }
-            built.parameters =
-                built.create_parameters_object(Vec::new(), Vec::new(), Vec::new())?;
         }
         Ok(built)
     }
 
-    /// Parameters object holding exactly `vps`/`sps`/`pps` (any may be empty),
-    /// fused with the wrappers whose heap blocks it points at. Wrappers are
+    /// Parameters object holding exactly `vps`/`sps`/`pps`, fused with the
+    /// wrappers whose heap blocks it points at. Wrappers are
     /// taken by value so the object owns everything the driver may dereference.
     ///
     /// # Safety
@@ -511,7 +514,7 @@ impl VideoSessionH265 {
                     vps_id = vps.id(),
                     sps_id = sps.seq_parameter_set_id,
                     pps_id = pps.pic_parameter_set_id,
-                    "recreating H.265 session parameters (content change or capacity)"
+                    "fresh H.265 session parameters object"
                 );
                 let mut owned_vps = vps.to_std()?;
                 let mut owned_sps = sps_to_std_h265(sps)?;
@@ -531,16 +534,20 @@ impl VideoSessionH265 {
                 // Replace first so destroy of `old` runs before its backings
                 // free — the order a driver still holding the old pointers needs.
                 let old = std::mem::replace(&mut self.parameters, fresh);
-                // SAFETY: the fn-level contract — the caller drained every
-                // in-flight decode before a Recreate reached here (checked via
-                // parameters_action), so no submitted work reads the old object;
-                // it is this session's own handle, on a live device.
-                unsafe {
-                    (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                        self.device.handle(),
-                        old.object,
-                        std::ptr::null(),
-                    );
+                // The first activation has no old object. The spec lets destroy take
+                // NULL; AMD's Windows driver reads through it.
+                if old.object != vk::VideoSessionParametersKHR::null() {
+                    // SAFETY: the fn-level contract — the caller drained every
+                    // in-flight decode before a Recreate reached here (checked via
+                    // parameters_action), so no submitted work reads the old
+                    // object; it is this session's own handle, on a live device.
+                    unsafe {
+                        (self.video_queue.fp().destroy_video_session_parameters_khr)(
+                            self.device.handle(),
+                            old.object,
+                            std::ptr::null(),
+                        );
+                    }
                 }
                 // Drop only after destroy: Std blocks `old` owns must outlive
                 // the object that pointed at them.
@@ -574,17 +581,20 @@ impl VideoSessionH265 {
 impl Drop for VideoSessionH265 {
     fn drop(&mut self) {
         // SAFETY: all handles are this session's own on a live device; the
-        // decoder drains GPU work first. Destroy ignores NULL (half-built
-        // sessions). Memory bound into a session must not be freed while the
-        // session lives, so destroy the session first — a failed bind parks
-        // allocations here (`crate::session::BindFailure`). Std backings drop
-        // after this body, after the parameters object is destroyed.
+        // decoder drains GPU work first. A session that never decoded has no
+        // parameters object and skips that destroy. Memory bound into a session
+        // must not be freed while the session lives, so destroy the session
+        // first — a failed bind parks allocations here
+        // (`crate::session::BindFailure`). Std backings drop after this body,
+        // after the parameters object is destroyed.
         unsafe {
-            (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                self.device.handle(),
-                self.parameters.object,
-                std::ptr::null(),
-            );
+            if self.parameters.object != vk::VideoSessionParametersKHR::null() {
+                (self.video_queue.fp().destroy_video_session_parameters_khr)(
+                    self.device.handle(),
+                    self.parameters.object,
+                    std::ptr::null(),
+                );
+            }
             (self.video_queue.fp().destroy_video_session_khr)(
                 self.device.handle(),
                 self.session,
@@ -802,26 +812,32 @@ mod tests {
     }
 
     #[test]
-    fn the_first_activation_adds_all_three_sets_in_one_update_call() {
+    fn the_first_activation_creates_the_object_with_its_triple() {
         let sps = with_vps(&authored_sps(0, 0, 64), 0, 0);
         let vps = VpsSource::for_sps(&sps);
         let pps = authored_pps(&sps, 0, 0);
 
         let mut ledger = ParamsLedgerH265::default();
-        assert_eq!(ledger.next_update_seq(), 1);
         let action = ledger.plan(&vps, &sps, &pps);
+        assert_eq!(action, ParamsActionH265::Recreate);
+        ledger.commit(action, &vps, &sps, &pps);
+        assert_eq!(ledger.next_update_seq(), 1, "a fresh object, no update yet");
+        assert_eq!(ledger.plan(&vps, &sps, &pps), ParamsActionH265::Current);
+
+        // ONE update call carries every missing set: the counter moves by one.
+        let sps1 = with_vps(&authored_sps(1, 0, 64), 0, 0);
+        let pps1 = authored_pps(&sps1, 1, 0);
+        let action = ledger.plan(&vps, &sps1, &pps1);
         assert_eq!(
             action,
             ParamsActionH265::Add {
-                add_vps: true,
+                add_vps: false,
                 add_sps: true,
                 add_pps: true
             }
         );
-        ledger.commit(action, &vps, &sps, &pps);
-        // ONE call carried all three: the counter moves by exactly one.
+        ledger.commit(action, &vps, &sps1, &pps1);
         assert_eq!(ledger.next_update_seq(), 2);
-        assert_eq!(ledger.plan(&vps, &sps, &pps), ParamsActionH265::Current);
     }
 
     #[test]
@@ -876,14 +892,7 @@ mod tests {
 
         let mut ledger = ParamsLedgerH265::default();
         let action = ledger.plan(&fallback, &sps_no_vps, &pps);
-        assert_eq!(
-            action,
-            ParamsActionH265::Add {
-                add_vps: true,
-                add_sps: true,
-                add_pps: true
-            }
-        );
+        assert_eq!(action, ParamsActionH265::Recreate);
         ledger.commit(action, &fallback, &sps_no_vps, &pps);
         assert_eq!(
             ledger.plan(&fallback, &sps_no_vps, &pps),
@@ -958,6 +967,9 @@ mod tests {
         let mut ledger = ParamsLedgerH265::default();
         let action = ledger.plan(&vps, &sps, &pps);
         ledger.commit(action, &vps, &sps, &pps);
+        let pps1 = authored_pps(&sps, 1, 0);
+        let action = ledger.plan(&vps, &sps, &pps1);
+        ledger.commit(action, &vps, &sps, &pps1);
         assert_eq!(ledger.next_update_seq(), 2, "one Add happened");
 
         let pps2 = authored_pps(&sps, 0, 4);
@@ -990,7 +1002,8 @@ mod tests {
             assert!(matches!(action, ParamsActionH265::Add { .. }));
             ledger.commit(action, &vps, &sps, &pps);
         }
-        assert_eq!(ledger.next_update_seq() - 1, MAX_STD_PPS as u32);
+        // The first PPS came with the object, not through an update.
+        assert_eq!(ledger.next_update_seq() - 1, MAX_STD_PPS as u32 - 1);
 
         // One past capacity recreates. The evicted first PPS then re-Adds;
         // recreate kept only the current triple.
@@ -1011,7 +1024,10 @@ mod tests {
         let mut ledger = ParamsLedgerH265::default();
         let sps = authored_sps(0, 0, 64);
         let pps = authored_pps(&sps, 0, 0);
-        for vps_id in 0..MAX_STD_VPS as u8 {
+        let vps0 = standalone_vps(0, 0);
+        let action = ledger.plan(&vps0, &sps, &pps);
+        ledger.commit(action, &vps0, &sps, &pps);
+        for vps_id in 1..MAX_STD_VPS as u8 {
             let vps = standalone_vps(vps_id, 0);
             let action = ledger.plan(&vps, &sps, &pps);
             assert!(matches!(

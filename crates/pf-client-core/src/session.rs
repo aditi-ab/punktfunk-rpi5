@@ -107,17 +107,18 @@ pub struct SessionParams {
     /// Overlay vocabulary this launch resolved: Standard (`false`) or Advanced. Rides per
     /// launch like the tier, so a browse-mode presenter adopts a change made between streams.
     pub advanced_stats: bool,
-    /// Advertise `CLIENT_CAP_PHASE_LOCK`: the presenter has real on-glass latch stamps
-    /// (`VK_KHR_present_wait`) and will feed [`latch_grid`](Self::latch_grid). Never
-    /// set without present timing — the host arms on report receipt.
+    /// Advertise `CLIENT_CAP_PHASE_LOCK` and feed [`latch_grid`](Self::latch_grid). The
+    /// desktop leaves it off: the lock moves the wait for the latch into the host's hold
+    /// and costs 3–4 ms end to end on an iGPU at 4K. Never set without present timing.
     pub phase_lock: bool,
     pub latch_grid: Arc<LatchGrid>,
 }
 
 /// Presenter → pump latch grid (the `force_software` pattern the other way). The
-/// presenter's 1 Hz fold writes an on-glass latch plus panel period; the pump folds
-/// AU arrivals against them into the ~1 Hz `PhaseReport`. All zeros until the first
-/// fold — and forever without present timing — so the pump stays quiet then.
+/// presenter writes an on-glass latch, the panel period and what a frame needs before
+/// its latch; the pump folds AU arrivals against them into the ~1 Hz `PhaseReport`.
+/// All zeros until the first fold — and forever without present timing — so the pump
+/// stays quiet then.
 #[derive(Default)]
 pub struct LatchGrid {
     /// Recent on-glass latch (client `CLOCK_REALTIME` ns — same domain as AU arrivals).
@@ -125,6 +126,8 @@ pub struct LatchGrid {
     pub anchor_ns: std::sync::atomic::AtomicU64,
     /// Panel latch period (ns). `0` = no grid yet.
     pub period_ns: std::sync::atomic::AtomicU64,
+    /// Hand-over to latch, as the presenter learned it (ns). `0` = the host's lead covers it.
+    pub need_ns: std::sync::atomic::AtomicU64,
 }
 
 /// Host, pin, launch, and budget for one dial.
@@ -201,7 +204,8 @@ impl SessionParams {
             height,
             ..mode
         };
-        let phase_lock = probes.vulkan.as_ref().is_some_and(|v| v.present_timing);
+        // Off on the desktop (see the field). The report path stays for a client that asks.
+        let phase_lock = false;
         let caps_444 = settings.enable_444 && probes.hevc_444_hardware;
         let advertise_hdr = settings.hdr_enabled && probes.hdr_enabled;
         // The host writes the volume into its display's EDID, so it rides only with HDR on.
@@ -218,7 +222,12 @@ impl SessionParams {
             audio_format: settings.audio_format.clone(),
             preferred_codec: settings.preferred_codec(),
             exclude_codecs: 0,
-            video_caps: crate::video::video_caps_for(advertise_hdr, settings.ten_bit_sdr, caps_444),
+            video_caps: crate::video::video_caps_for(
+                advertise_hdr,
+                settings.ten_bit_sdr,
+                caps_444,
+                crate::video::multi_slice_decodable(probes.vulkan.as_ref().map(|v| v.vendor_id)),
+            ),
             want_444: settings.enable_444,
             display_hdr,
             mic_enabled: settings.mic_enabled,
@@ -1040,10 +1049,11 @@ fn pump(
     // Live host↔client clock offset, loaded per frame so mid-stream re-syncs keep
     // capture-clock latency honest — never cached at session start.
     let clock_offset_live = connector.clock_offset_shared();
-    // Every received AU's arrival stamp, folded per stats window against the latch
-    // grid into the ~1 Hz PhaseReport. 256 ≈ 2 s at 120 Hz.
+    // Every received AU's arrival stamp and decode time, folded per stats window against
+    // the latch grid into the ~1 Hz PhaseReport. 256 ≈ 2 s at 120 Hz.
     let latch_grid = params.latch_grid.clone();
     let mut phase_arrivals: Vec<u64> = Vec::new();
+    let mut phase_decodes: Vec<u64> = Vec::new();
     let mut last_applied_phase: Option<i32> = None;
     // `PUNKTFUNK_DEBUG_RECONFIGURE=WxH@HZ:SECS` — request one mid-stream mode
     // switch N seconds in, so a headless session can exercise the resize path.
@@ -1332,6 +1342,9 @@ fn pump(
                         // Travels with the frame so the presenter can measure `display`.
                         let decoded_ns = now_ns();
                         connector.hud().note_decoded(frame.pts_ns, decoded_ns);
+                        if params.phase_lock && phase_decodes.len() < 256 {
+                            phase_decodes.push(decoded_ns.saturating_sub(received_ns));
+                        }
                         // Ship first, then the decode stat. Vulkan returns at submission;
                         // a per-frame fence wait serializes to 1/decode_latency. One
                         // honest sample per window. Polling would quantize by a whole
@@ -1564,18 +1577,25 @@ fn pump(
                 let period = latch_grid.period_ns.load(Ordering::Relaxed);
                 let anchor = latch_grid.anchor_ns.load(Ordering::Relaxed);
                 if period > 0 && anchor > 0 {
+                    // The instant an arrival must beat: the latch less the window's p75
+                    // decode and what the presenter needs. The host aims its lead at it.
+                    phase_decodes.sort_unstable();
+                    let decode = phase_decodes
+                        .get(phase_decodes.len() * 3 / 4)
+                        .copied()
+                        .unwrap_or(0);
+                    let need = latch_grid.need_ns.load(Ordering::Relaxed);
+                    let ready_by = anchor as i128 - phase_shift_ns(need, decode, period) as i128;
                     let leads_us: Vec<u64> = phase_arrivals
                         .iter()
-                        .map(|a| {
-                            ((anchor as i128 - *a as i128).rem_euclid(period as i128) / 1000) as u64
-                        })
+                        .map(|a| ((ready_by - *a as i128).rem_euclid(period as i128) / 1000) as u64)
                         .collect();
                     if let Some((lead_ns, coherence)) =
                         punktfunk_core::phase::circular_latch(&leads_us, period as i64)
                     {
-                        // Extrapolate the (possibly ~1 s old) anchor to the next latch
+                        // Extrapolate the (possibly ~1 s old) instant to the next one
                         // at or after now, then express it on the host clock.
-                        let (now, p, a) = (now_ns() as i128, period as i128, anchor as i128);
+                        let (now, p, a) = (now_ns() as i128, period as i128, ready_by);
                         let k = ((now - a).max(0) + p - 1) / p;
                         let offset = clock_offset_live.load(Ordering::Relaxed) as i128;
                         connector.report_phase(
@@ -1588,6 +1608,7 @@ fn pump(
                     }
                 }
                 phase_arrivals.clear();
+                phase_decodes.clear();
             }
             let _ = ev_tx.try_send(SessionEvent::DecodeFacts(DecodeFacts {
                 decoder: dec_path,
@@ -1919,9 +1940,25 @@ fn parse_debug_reconfigure(s: &str) -> Option<(Mode, Duration)> {
     Some((mode, Duration::from_secs(secs_s.trim().parse().ok()?)))
 }
 
+/// How far before its latch an arrival has to land: decode plus what the presenter needs.
+/// Held 3 ms under a period, the room the host's own lead takes.
+fn phase_shift_ns(need_ns: u64, decode_ns: u64, period_ns: u64) -> u64 {
+    need_ns
+        .saturating_add(decode_ns)
+        .min(period_ns.saturating_sub(3_000_000))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_phase_shift_adds_decode_to_the_need_below_a_period() {
+        assert_eq!(phase_shift_ns(0, 0, 16_666_666), 0);
+        assert_eq!(phase_shift_ns(6_000_000, 500_000, 16_666_666), 6_500_000);
+        assert_eq!(phase_shift_ns(6_000_000, 9_000_000, 8_333_333), 5_333_333);
+        assert_eq!(phase_shift_ns(1_000_000, 0, 2_000_000), 0);
+    }
 
     /// Every spelling the env-var doc promises has to land on the right side of
     /// `CLIENT_CAP_AUDIO_HIRES`.
