@@ -8,7 +8,7 @@
 //!
 //! A monitor rule sets the client's exact mode ([`set_monitor_rule`]). xdph is
 //! steered at that output through a custom picker ([`crate::portal_picker`]).
-//! [`StopGuard`] is session-scoped; [`OutputGuard`] lingers the named head and
+//! The cast ([`crate::portal_cast`]) is session-scoped; [`OutputGuard`] lingers the named head and
 //! evacuates its workspace onto a remaining physical before `output remove`.
 //!
 //! Requires a reachable Hyprland instance (`HYPRLAND_INSTANCE_SIGNATURE` or
@@ -18,16 +18,15 @@
 //! an error.
 
 use super::{DisplayOwnership, Mode, SessionCastParts, VirtualDisplay, VirtualOutput};
-use anyhow::{anyhow, bail, Context, Result};
-use pf_capture::portal_rt::HANDSHAKE_BUDGET;
+use crate::portal_cast::StopGuard;
+use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -65,11 +64,15 @@ fn picker_is_plain(cmd: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || " ._/@:+=-".contains(c))
 }
 
-/// `[SELECTION]/screen:<name>` — every byte is load-bearing. Format lives in
-/// [`crate::portal_picker`] (this file is Linux-only).
-fn picker_selection_line(name: &str) -> String {
-    crate::portal_picker::selection_line(name)
-}
+/// xdph's custom picker cats [`selection_file`]: `[SELECTION]/screen:<name>`,
+/// every byte load-bearing ([`crate::portal_picker`]).
+pub(crate) const SELECTOR: crate::portal_cast::Selector = crate::portal_cast::Selector {
+    file: selection_file,
+    line: crate::portal_picker::selection_line,
+    ensure_config: ensure_xdph_config,
+    thread: "punktfunk-hypr-cast",
+    portal: "xdph",
+};
 
 /// Per-process seq for `PF-<pid>-<n>`. Named outputs skip sway's before/after
 /// diff race.
@@ -288,7 +291,7 @@ impl VirtualDisplay for HyprlandDisplay {
     /// Kept out of [`casts`]: that map holds one cast per name, and a joiner must not close
     /// the owner's.
     fn join_cast(&mut self, name: &str, _node_id: u32) -> Result<Option<SessionCastParts>> {
-        let stream = stream_existing_output(name, self.hw_cursor)?;
+        let stream = crate::portal_cast::stream_existing_output(&SELECTOR, name, self.hw_cursor)?;
         self.last_cursor_mode = stream.cursor_mode;
         Ok(Some(stream.into_cast()))
     }
@@ -456,10 +459,7 @@ fn stop_cast(name: &str) {
 fn start_cast(name: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, crate::portal_cursor::Mode)> {
     stop_cast(name);
     focus_output(name);
-    let (fd, node_id, cursor_mode, stop) = {
-        let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        select_and_cast(name, hw_cursor)?
-    };
+    let (fd, node_id, cursor_mode, stop) = crate::portal_cast::cast(&SELECTOR, name, hw_cursor)?;
     casts()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -592,64 +592,6 @@ fn is_window_event(line: &str) -> bool {
 /// watcher is on the socket — then the caller must not trust a frozen value.
 pub(crate) fn window_gen() -> Option<u64> {
     (WINDOW_WATCHERS.load(Ordering::Relaxed) > 0).then(|| WINDOW_GEN.load(Ordering::Relaxed))
-}
-
-/// How long teardown waits for ScreenCast close before removing the output
-/// anyway. One D-Bus round trip; three seconds is generous. Bounded so a
-/// wedged portal cannot wedge the host — same as every blocking helper on
-/// this path ([`HYPRCTL_BUDGET`]).
-const CAST_CLOSE_BUDGET: Duration = Duration::from_secs(3);
-
-/// Live casts of ours. The picker config is borrowed while this is non-zero;
-/// a host streaming two outputs must not hand the picker back when the first ends.
-static LIVE_CASTS: AtomicU32 = AtomicU32::new(0);
-
-/// Ends the cast: signals the portal thread, then waits for ScreenCast close
-/// so the caller may remove the output afterwards.
-///
-/// The wait is the point. xdph destroys a session only on explicit
-/// `org.freedesktop.impl.portal.Session.Close`; it has no peer-vanished
-/// watcher. Dropping a flag and removing the output while xdph is still
-/// capturing wedges its event-loop thread (unbounded `pw_loop_iterate` with
-/// timeout 0 inside `Start`). Waiting until `close()` returns means the
-/// output we remove next is one nobody is capturing.
-struct StopGuard {
-    stop: Arc<AtomicBool>,
-    /// Signalled once the portal thread has closed the ScreenCast session.
-    ///
-    /// `None` when no cast was established (rejected or timed-out handshake):
-    /// nothing to close, and a portal that just failed for 20 s would burn
-    /// this budget for nothing.
-    closed: Option<std::sync::mpsc::Receiver<()>>,
-}
-
-impl Drop for StopGuard {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let Some(closed) = self.closed.take() else {
-            // Never counted toward [`LIVE_CASTS`] — the increment is in the
-            // same arm that arms `closed`.
-            return;
-        };
-        LIVE_CASTS.fetch_sub(1, Ordering::SeqCst);
-        // Do not restore the picker here. Per-cast restore rewrites the config
-        // and restarts xdph; a ScreenCast bound across that restart never
-        // delivers a buffer (D-Bus connection is process-global). The shim
-        // delegates when idle; `punktfunk-omarchy remove` puts the config back.
-        match closed.recv_timeout(CAST_CLOSE_BUDGET) {
-            Ok(()) => {}
-            // Thread gone without confirming (panic or runtime death). Nothing
-            // is holding the cast either way.
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-            // Budget expired. A leaked output is worse than a racy one; this
-            // is the state that wedges xdph, and the next session pays for it.
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
-                budget_s = CAST_CLOSE_BUDGET.as_secs(),
-                "the ScreenCast session did not close in time — removing the output underneath it, \
-                 which is what wedges xdph's frame loop; the next cast may find the portal busy"
-            ),
-        }
-    }
 }
 
 /// Remove `PF-<pid>-<n>` outputs whose owner pid is gone, once per process
@@ -1422,91 +1364,6 @@ fn hyprctl_command(args: &[&str], sig: Option<String>) -> Command {
     cmd
 }
 
-/// Serializes write-the-selection → complete-the-handshake, process-wide.
-/// One per-user file: a concurrent write between ours and xdph's read would
-/// steer capture at the other session's output.
-static SELECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Per-session selection file, removed when the handshake it steers is over.
-///
-/// Lifetime is the handshake, not the session: the shim cats it once inside
-/// [`select_and_cast`]'s critical section. Left behind, a stale
-/// `[SELECTION]screen:PF-…` permanently shadows xdph's empty-read fallback.
-/// Tying removal to the cast would be worse: the file is one per user, so a
-/// session ending later would delete a sibling's selection.
-struct SelectionFile(String);
-
-impl Drop for SelectionFile {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.0) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(path = %self.0, error = %e, "xdph selection file not removed");
-            }
-        }
-    }
-}
-
-/// Point xdph's custom picker at `output` and run the ScreenCast handshake.
-/// The caller must hold [`SELECTION_LOCK`].
-fn select_and_cast(
-    output: &str,
-    hw_cursor: bool,
-) -> Result<(OwnedFd, u32, crate::portal_cursor::Mode, StopGuard)> {
-    ensure_xdph_config()?;
-    let sel = selection_file();
-    std::fs::write(&sel, picker_selection_line(output)).with_context(|| format!("write {sel}"))?;
-    // Owned from the write on: every arm below (and every `?`) leaves the
-    // handshake, which is the only thing that reads it.
-    let _sel_file = SelectionFile(sel);
-    // Negotiated mode rides back with the fd: decided inside the portal
-    // thread (only there is the proxy to ask). `hw_cursor` is the request.
-    let (setup_tx, setup_rx) =
-        std::sync::mpsc::channel::<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>();
-    // Teardown handshake: the thread signals this once ScreenCast is closed.
-    // Separate from the setup channel — it fires at the other end of the cast.
-    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = stop.clone();
-    thread::Builder::new()
-        .name("punktfunk-hypr-cast".into())
-        .spawn(move || portal_thread(setup_tx, closed_tx, stop_thread, hw_cursor))
-        .context("spawn hyprland portal thread")?;
-    // Built before the wait so every error arm sets the flag on the way out.
-    // Returning a bare `Arc` left the failure arms dropping an un-set flag:
-    // the thread's `send` can still land after `recv_timeout` gives up, then
-    // park forever on `while !stop` holding a live ScreenCast.
-    let mut guard = StopGuard { stop, closed: None };
-    match setup_rx.recv_timeout(Duration::from_secs(20)) {
-        Ok(Ok((fd, node_id, cursor_mode))) => {
-            // A cast exists, so teardown must wait. Only this arm arms it.
-            guard.closed = Some(closed_rx);
-            // Only this arm counts toward the borrowed picker: a handshake
-            // that never produced a cast has nothing to hand back.
-            LIVE_CASTS.fetch_add(1, Ordering::SeqCst);
-            Ok((fd, node_id, cursor_mode, guard))
-        }
-        Ok(Err(e)) => bail!("ScreenCast portal on {output} failed: {e}"),
-        Err(_) => bail!("timed out waiting for the ScreenCast portal on {output}"),
-    }
-}
-
-/// Stream an existing Hyprland monitor — same custom picker as the virtual
-/// path, pointed at a physical connector, no GUI picker. The keepalive stops
-/// the cast only; the monitor is Hyprland's, not ours.
-pub(crate) fn stream_existing_output(
-    connector: &str,
-    hw_cursor: bool,
-) -> Result<crate::mirror::MirrorStream> {
-    let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (fd, node_id, cursor_mode, stop) = select_and_cast(connector, hw_cursor)?;
-    Ok(crate::mirror::MirrorStream {
-        node_id,
-        remote_fd: Some(fd),
-        cursor_mode: Some(cursor_mode),
-        keepalive: Box::new(stop),
-    })
-}
-
 /// Every head Hyprland reports, for [`crate::monitors::list`].
 ///
 /// `hyprctl -j monitors all` so disabled heads are listed too. Geometry is
@@ -1848,8 +1705,9 @@ fn ensure_xdph_config() -> Result<()> {
 }
 
 /// Hand `custom_picker_binary` back and restart xdph (it reads config only at
-/// startup). Called from the host's shutdown path, never per cast — see
-/// [`StopGuard::drop`]. Safe on a box we never touched (no-op).
+/// startup). Called from the host's shutdown path, never per cast: a ScreenCast
+/// bound across the restart never delivers a buffer. Safe on a box we never
+/// touched (no-op).
 ///
 /// The restart is the cost: xdph cannot tell us whether another application's
 /// cast is live, so a share started during our session can be cut. Leaving
@@ -1888,146 +1746,6 @@ fn restart_xdph() {
         ]),
         PORTAL_RESTART_BUDGET,
     );
-}
-
-/// ScreenCast handshake. Backend-neutral portal (served here by xdph); mirrors
-/// the wlroots portal thread: reports fd + node id and parks until stopped
-/// (the zbus connection is the cast's lifetime). xdph answers source selection
-/// via our custom picker, no dialog.
-fn portal_thread(
-    setup_tx: Sender<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>,
-    closed_tx: Sender<()>,
-    stop: Arc<AtomicBool>,
-    hw_cursor: bool,
-) {
-    use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
-    use ashpd::desktop::PersistMode;
-    use ashpd::enumflags2::BitFlags;
-
-    // Shared, never-dropped runtime — not per-cast. ashpd caches its D-Bus
-    // connection process-globally; a per-cast runtime takes that connection's
-    // background reader down with it, leaving later handshakes awaiting a
-    // reply nothing is alive to read. See [`pf_capture::portal_rt`].
-    let rt = match pf_capture::portal_rt::portal_runtime() {
-        Ok(rt) => rt,
-        Err(e) => {
-            let _ = setup_tx.send(Err(e));
-            return;
-        }
-    };
-    let err_tx = setup_tx.clone();
-
-    rt.block_on(async move {
-        let result: Result<()> = async {
-            // Inside the bound: when the cached connection was orphaned this
-            // is where the thread hung — `Screencast::new()` itself. A bound
-            // that started after it reported the caller's generic timeout.
-            let connect = async {
-                Screencast::new().await.context(
-                    "connect ScreenCast portal (is xdg-desktop-portal running with the hyprland backend/xdph?)",
-                )
-            };
-            let proxy = match tokio::time::timeout(HANDSHAKE_BUDGET, connect).await {
-                Ok(v) => v?,
-                Err(_) => bail!(
-                    "connecting to the ScreenCast portal did not return within {}s",
-                    HANDSHAKE_BUDGET.as_secs()
-                ),
-            };
-            // Negotiated against what xdph advertises, never asserted from
-            // `hw_cursor` alone: an unadvertised mode does not degrade —
-            // xdg-desktop-portal fails the call before xdph sees it. Current
-            // xdph advertises Hidden|Embedded only.
-            let cursor_mode = crate::portal_cursor::negotiate(&proxy, hw_cursor, "xdph").await;
-            // Bounded, and that bound is load-bearing. `select_sources`/`start`
-            // await a D-Bus reply a wedged portal never sends, and an await
-            // that never returns cannot be cancelled by `stop`. Shorter than
-            // the caller's 20 s wait so the failure is reported here.
-            let handshake = async {
-                let session = proxy
-                    .create_session(Default::default())
-                    .await
-                    .context("create_session")?;
-                proxy
-                    .select_sources(
-                        &session,
-                        SelectSourcesOptions::default()
-                            .set_cursor_mode(pf_capture::portal_rt::to_ashpd(cursor_mode))
-                            // xdph offers MONITOR; the custom picker selects our output.
-                            .set_sources(BitFlags::from_flag(SourceType::Monitor))
-                            .set_multiple(false)
-                            .set_persist_mode(PersistMode::DoNot),
-                    )
-                    .await
-                    .context("select_sources")?
-                    .response()
-                    .context("select_sources rejected")?;
-                let streams = proxy
-                    .start(&session, None, Default::default())
-                    .await
-                    .context("start cast")?
-                    .response()
-                    .context("start response (custom picker declined? check the xdph config/shim/selection file)")?;
-                let stream = streams
-                    .streams()
-                    .first()
-                    .context("portal returned no streams")?
-                    .clone();
-                let node_id = stream.pipe_wire_node_id();
-                let fd = proxy
-                    .open_pipe_wire_remote(&session, Default::default())
-                    .await
-                    .context("open_pipe_wire_remote")?;
-                Ok::<_, anyhow::Error>((session, fd, node_id))
-            };
-            let (session, fd, node_id) =
-                match tokio::time::timeout(HANDSHAKE_BUDGET, handshake).await {
-                    Ok(v) => v?,
-                    Err(_) => bail!(
-                        "the ScreenCast portal did not complete the handshake within {}s — \
-                         abandoning it instead of parking this thread on it forever (a hung \
-                         request poisons every later one from this process)",
-                        HANDSHAKE_BUDGET.as_secs()
-                    ),
-                };
-
-            setup_tx
-                .send(Ok((fd, node_id, cursor_mode)))
-                .map_err(|_| anyhow!("virtual-output opener went away"))?;
-
-            // Park, keeping `proxy` + `session` alive until stopped. Polled at
-            // 20 ms not 200 ms: teardown now waits on what follows.
-            let _keep_alive = (&proxy, &session);
-            while !stop.load(Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-
-            // Close the session before the output goes away. xdph destroys a
-            // session only on explicit `Session.Close`. `StopGuard::drop` waits
-            // on the signal below. Bounded: timeout still signals so teardown
-            // pays the budget once rather than hanging on an already-gone portal.
-            match tokio::time::timeout(CAST_CLOSE_BUDGET, session.close()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    error = %e,
-                    "closing the ScreenCast session failed — the next cast may find xdph busy"
-                ),
-                Err(_) => tracing::warn!(
-                    budget_s = CAST_CLOSE_BUDGET.as_secs(),
-                    "the ScreenCast portal did not answer Session.Close in time — it is probably \
-                     already wedged"
-                ),
-            }
-            // Best-effort: the receiver is gone if the caller already gave up.
-            let _ = closed_tx.send(());
-            Ok(())
-        }
-        .await;
-
-        if let Err(e) = result {
-            let _ = err_tx.send(Err(format!("{e:#}")));
-        }
-    });
 }
 
 #[cfg(test)]
@@ -2178,7 +1896,7 @@ mod tests {
     /// That module owns the format and its tests run on every platform.
     #[test]
     fn picker_line_is_the_shared_selection_format() {
-        assert_eq!(picker_selection_line("PF-1"), "[SELECTION]/screen:PF-1\n");
+        assert_eq!((SELECTOR.line)("PF-1"), "[SELECTION]/screen:PF-1\n");
     }
 
     fn head(connector: &str, enabled: bool) -> crate::monitors::PhysicalMonitor {
