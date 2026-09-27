@@ -41,6 +41,17 @@ pub enum Release {
     Noop,
 }
 
+/// Linger applied on release. A deliberate quit (`force_immediate`) turns a
+/// linger window into Immediate. `Forever` outranks quit: the screen stays
+/// until `/display/release`.
+pub fn effective_linger(force_immediate: bool, policy: Linger) -> Linger {
+    match (force_immediate, policy) {
+        (true, Linger::Forever) => Linger::Forever,
+        (true, _) => Linger::Immediate,
+        (false, l) => l,
+    }
+}
+
 impl State {
     // Tests pin the resource-alive invariant; not production API.
     #[allow(dead_code)]
@@ -191,6 +202,16 @@ mod tests {
         assert_eq!(s.refs(), 1);
         let mut idle = State::default();
         assert!(!idle.force_release());
+    }
+
+    #[test]
+    fn deliberate_quit_skips_the_linger_window_but_never_a_pin() {
+        let ten = Linger::For(Duration::from_secs(10));
+        assert_eq!(effective_linger(true, ten), Linger::Immediate);
+        assert_eq!(effective_linger(true, Linger::Immediate), Linger::Immediate);
+        assert_eq!(effective_linger(true, Linger::Forever), Linger::Forever);
+        assert_eq!(effective_linger(false, ten), ten);
+        assert_eq!(effective_linger(false, Linger::Forever), Linger::Forever);
     }
 
     #[test]

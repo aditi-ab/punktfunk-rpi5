@@ -28,6 +28,14 @@ pub(crate) enum Block<'a> {
 const PRIOR: &str = "# punktfunk: previous";
 const PRIOR_NONE: &str = "(none)";
 
+/// `$XDG_CONFIG_HOME`, else `$HOME/.config`: where xdpw and xdph read their config.
+pub(crate) fn user_config_dir() -> Result<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .ok_or_else(|| anyhow::anyhow!("neither XDG_CONFIG_HOME nor HOME set"))
+}
+
 fn opens(line: &str, block: Block<'_>) -> bool {
     let t = line.trim();
     match block {
