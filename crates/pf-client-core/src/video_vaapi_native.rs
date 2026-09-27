@@ -37,6 +37,7 @@ use crate::video::DmabufPlane;
 use crate::video::DrmFrameGuard;
 use crate::video::StreamFormat;
 use crate::video_color::ColorDesc;
+use crate::video_types::trim_deliverable;
 
 /// `PUNKTFUNK_DECODER=native-vaapi`. Skips the vendor order so a box that would
 /// pick Vulkan first can still reach this rung; gating the pin would make the
@@ -365,29 +366,6 @@ fn max_deliverable(s: &Session) -> usize {
     s.shape.max_dpb_frames
 }
 
-/// First drop in full, then a heartbeat (~every 5 s at 60 fps). A drop-every-AU
-/// shape would bury the log at frame rate.
-const DROP_WARN_EVERY: u64 = 300;
-
-/// Drop oldest first after this AU's own frame is taken off the front, so `cap`
-/// bounds carry-over. Trimming before the take would invert display order inside
-/// one AU. Returned frames drop via [`VaFrameGuard`]; the caller counts first.
-fn trim_deliverable(
-    queue: &mut std::collections::VecDeque<DmabufFrame>,
-    cap: usize,
-) -> Vec<DmabufFrame> {
-    let mut dropped = Vec::new();
-    while queue.len() > cap {
-        match queue.pop_front() {
-            Some(frame) => dropped.push(frame),
-            // `len() > cap` means non-empty. Break, not `expect`: a bound of 0
-            // on an empty queue must not panic in the decode path.
-            None => break,
-        }
-    }
-    dropped
-}
-
 pub(crate) struct NativeVaapiDecoder {
     display: Display,
     planner: Planner,
@@ -536,6 +514,7 @@ impl NativeVaapiDecoder {
     }
 
     /// This AU's frame off the front first so [`trim_deliverable`] bounds carry-over.
+    /// Trimmed frames free their surface through [`VaFrameGuard`] on drop.
     fn take_deliverable(&mut self) -> Option<DmabufFrame> {
         let shipped = self.deliverable.pop_front();
         // No session means no pool; cap 0 is "no surfaces exist".
@@ -543,8 +522,7 @@ impl NativeVaapiDecoder {
         // Pre-trim depth: after the trim this would be `cap` every time.
         let queued = self.deliverable.len();
         for frame in trim_deliverable(&mut self.deliverable, cap) {
-            self.health.note_dropped();
-            if self.health.dropped == 1 || self.health.dropped % DROP_WARN_EVERY == 0 {
+            if self.health.note_dropped() {
                 tracing::warn!(
                     queued,
                     cap,
