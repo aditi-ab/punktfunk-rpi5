@@ -7,7 +7,8 @@
 //! [`seat_home`] is the XDG data dir a seat's nested Steam runs under.
 //! [`create_private_dir`] / [`create_secret_dir`] / [`write_secret_file`] apply
 //! 0700 / 0600 on Unix and a restrictive DACL on Windows. Secret dirs omit the
-//! `BUILTIN\Users` read grant the config dir needs for the tray. [`system32`] is how a
+//! `BUILTIN\Users` read grant the config dir needs for the tray. [`replace_file`] /
+//! [`replace_secret_file`] are the one temp-and-rename writer for stores. [`system32`] is how a
 //! privileged process names a Windows system tool.
 #![forbid(unsafe_code)]
 
@@ -366,6 +367,7 @@ fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool, users_read: 
 /// The DACL step is fatal; a failure unlinks the still-empty file. Do not
 /// write first: the config dir grants `Users (OI)(CI)(RX)`, so a newborn
 /// secret is Users-readable for the life of the `icacls` child.
+/// The bytes reach the disk before return, so a rename after it never publishes an empty file.
 pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     // Never write a secret through a link: the bytes would land on the attacker's target.
@@ -410,13 +412,82 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Re
         return Err(e);
     }
     f.write_all(contents)?;
-    f.flush()?;
+    f.sync_all()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+/// Replace `path` with `contents` through a synced sibling temp and a rename: a reader or a
+/// power cut sees the old file or the new one, never half of either. Default permissions; the
+/// parent is made with `create_dir_all`.
+pub fn replace_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    replace(path, contents, false)
+}
+
+/// [`replace_file`] for an owner-only file: the parent is a [`create_private_dir`] and the temp
+/// a [`write_secret_file`], whose mode or DACL the rename carries to `path`.
+pub fn replace_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    replace(path, contents, true)
+}
+
+/// The temp is removed on every error. A crash between write and rename leaves it behind:
+/// nothing reaps `*.tmp`, since another writer may own an in-flight one.
+fn replace(path: &std::path::Path, contents: &[u8], secret: bool) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        if secret {
+            create_private_dir(dir)?;
+        } else {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    let tmp = TmpFile(Some(unique_tmp_path(path)));
+    if secret {
+        write_secret_file(tmp.path(), contents)?;
+    } else {
+        use std::io::Write;
+        let mut f = std::fs::File::create(tmp.path())?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(tmp.path(), path)?;
+    tmp.published();
+    Ok(())
+}
+
+/// `<name>.<pid>.<n>.tmp`. The pid keeps the CLI and the service apart; `n` keeps threads
+/// apart, since [`write_secret_file`] unlinks whatever already holds the name.
+fn unique_tmp_path(path: &std::path::Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{n}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Owns a temp until [`Self::published`]; dropping it earlier deletes the file.
+struct TmpFile(Option<PathBuf>);
+
+impl TmpFile {
+    fn path(&self) -> &std::path::Path {
+        self.0.as_deref().expect("disarmed only by consuming self")
+    }
+    /// The rename landed: the path is the real file now.
+    fn published(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// OWNER RIGHTS is the creating account (SYSTEM service or a manual run).
@@ -612,6 +683,52 @@ mod tests {
         std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o644)).unwrap();
         write_secret_file(&planted, b"new").unwrap();
         assert_eq!(mode(&planted), 0o600);
+
+        let store = dir.join("store").join("hooks.json");
+        replace_file(&store, b"plain").unwrap();
+        replace_secret_file(&store, b"secret").unwrap();
+        assert_eq!(mode(&store), 0o600, "the rename carries the temp's mode");
+        assert_eq!(mode(store.parent().unwrap()), 0o700);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn temp_names_never_repeat_and_stay_beside_the_file() {
+        let path = PathBuf::from("/tmp/pf/display-settings.json");
+        let (a, b) = (unique_tmp_path(&path), unique_tmp_path(&path));
+        assert_ne!(a, b, "a shared temp name is what two writers collide on");
+        assert_eq!(a.parent(), path.parent(), "rename stays intra-filesystem");
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("display-settings.json."), "{name}");
+        assert!(name.ends_with(".tmp"), "{name}");
+    }
+
+    #[test]
+    fn a_replace_lands_whole_and_a_failed_one_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("pf-paths-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("store.json");
+        replace_file(&path, b"first").unwrap();
+        replace_secret_file(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert_eq!(names(&dir), ["store.json"]);
+
+        // A non-empty directory on the target refuses the rename on every platform.
+        let blocked = dir.join("blocked.json");
+        std::fs::create_dir_all(blocked.join("child")).unwrap();
+        assert!(replace_file(&blocked, b"x").is_err());
+        assert!(replace_secret_file(&blocked, b"x").is_err());
+        assert_eq!(names(&dir), ["blocked.json", "store.json"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
