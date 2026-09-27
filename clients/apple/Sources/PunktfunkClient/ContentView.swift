@@ -494,7 +494,10 @@ struct ContentView: View {
                 break
             }
         }
-        .onDisappear { model.disconnect() } // window closed mid-session (Cmd+N spawns more)
+        .onDisappear { // window closed mid-session or mid-wake (Cmd+N spawns more)
+            waker.cancel() // its onOnline would dial for a window that is gone
+            model.disconnect()
+        }
         // Expose the session to the Scene-level Stream menu (Disconnect ⌃⌥⇧D works even when
         // the HUD is hidden). tvOS has no such menu.
         #if !os(tvOS)
