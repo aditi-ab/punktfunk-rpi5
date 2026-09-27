@@ -9,29 +9,12 @@
 
 use std::path::PathBuf;
 
+use crate::choices::{parse_web_bind, LAN_BIND};
 use crate::seam::Env;
 
 use super::args::{InnoArgs, TaskFlag};
 use super::plan::Artifact;
 use super::{NetCategory, WinFacts};
-
-/// What "this PC only" means to the console's listener.
-pub const LOOPBACK_BIND: &str = "127.0.0.1";
-
-/// The console's default listen address: every interface. The console answers only peers on the
-/// local network or a VPN, never the internet.
-pub const LAN_BIND: &str = "0.0.0.0";
-
-/// `/WEBBIND` and its env twin, in the Linux installer's spelling.
-fn parse_bind(raw: &str) -> Option<String> {
-    match raw.trim() {
-        "" => None,
-        "localhost" | "loopback" => Some(LOOPBACK_BIND.to_string()),
-        "lan" | "any" => Some(LAN_BIND.to_string()),
-        v if v.parse::<std::net::IpAddr>().is_ok() => Some(v.to_string()),
-        _ => None,
-    }
-}
 
 /// D12. `Skip` is the silent default: a profile change needs a consent surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,7 +171,7 @@ impl WinChoices {
         .into_iter()
         .flatten()
         {
-            match parse_bind(raw) {
+            match parse_web_bind(raw) {
                 Some(addr) => self.web_bind = Some(addr),
                 None => warnings.push(format!(
                     "web console bind '{raw}' is not an address — ignored"

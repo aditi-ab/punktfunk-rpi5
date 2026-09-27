@@ -21,12 +21,23 @@ use crate::facts::{Channel, Facts, Family};
 /// The management API's home when Sunshine already holds 47990.
 pub const DEFAULT_MGMT_PORT: u16 = 47991;
 
-/// What `--web-bind` writes for "this machine only".
+/// What "this machine only" means to the console's listener.
 pub const LOOPBACK_BIND: &str = "127.0.0.1";
 
 /// The console's default listen address (`PUNKTFUNK_UI_BIND` in host.env): every interface. The
 /// console answers only peers on the local network or a VPN, never the internet.
 pub const LAN_BIND: &str = "0.0.0.0";
+
+/// `--web-bind`, `/WEBBIND` and their env twin: an address, `localhost`/`loopback` or
+/// `lan`/`any`. `None` for anything else; the caller decides whether that fails the run.
+pub fn parse_web_bind(raw: &str) -> Option<String> {
+    match raw.trim() {
+        "localhost" | "loopback" => Some(LOOPBACK_BIND.to_string()),
+        "lan" | "any" => Some(LAN_BIND.to_string()),
+        v if v.parse::<std::net::IpAddr>().is_ok() => Some(v.to_string()),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
@@ -232,6 +243,24 @@ mod tests {
             scripting_unit_disabled: false,
             ip: Some("192.168.1.10".into()),
             user: "pf".into(),
+        }
+    }
+
+    /// One grammar for `--web-bind` and `/WEBBIND`; only the caller's strictness differs.
+    #[test]
+    fn web_bind_grammar() {
+        for (raw, want) in [
+            ("localhost", Some(LOOPBACK_BIND)),
+            (" loopback ", Some(LOOPBACK_BIND)),
+            ("lan", Some(LAN_BIND)),
+            ("any", Some(LAN_BIND)),
+            ("192.168.1.24", Some("192.168.1.24")),
+            ("::1", Some("::1")),
+            ("", None),
+            ("lan-only", None),
+            ("192.168.1", None),
+        ] {
+            assert_eq!(parse_web_bind(raw).as_deref(), want, "{raw:?}");
         }
     }
 
