@@ -3,31 +3,29 @@ package io.unom.punktfunk
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.discovery.WakeLoop
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Wake a sleeping host and WAIT for it to come back before proceeding — the Android mirror of the
- * Apple client's `HostWaker`.
+ * Apple client's `HostWaker`, driving [WakeLoop] behind a visible "Waking…" state.
  *
  * A magic packet is fire-and-forget, and a cold box can take 20–60 s to POST, boot, and start
- * answering again — far longer than a connect attempt will sit. So instead of firing one packet and
- * immediately dialing (which just fails on a genuinely-asleep host), this drives a visible "Waking…"
- * state: it polls [isOnline] about once a second, (re-)sends the packet while that stays false, and
- * on success runs [onOnline] (the real connect for a Wake-&-Connect, or nothing for a wake-only);
- * on timeout it parks in a retry/cancel state. One wake at a time.
+ * answering again — far longer than a connect attempt will sit. On success this runs [onOnline]
+ * (the real connect for a Wake-&-Connect, or nothing for a wake-only); on timeout it parks in a
+ * retry/cancel state. One wake at a time.
  *
- * [isOnline] suspends because the only trustworthy answer costs a round trip: mDNS presence is a
- * cache a sleeping host keeps warm for up to 75 minutes, so waiting on it both returned true for a
- * host that never woke and never returned true for a routed host that does not advertise at all.
+ * [isOnline] is a blocking probe run off the main thread: mDNS presence is a cache a sleeping
+ * host keeps warm for up to 75 minutes, so it cannot answer this.
  *
  * [scope] is the composition's coroutine scope (main-dispatched), so [waking] mutations and the
- * [onOnline] callback run on the main thread; the probe and the blocking send are off-loaded.
+ * [onOnline] callback run on the main thread; the loop itself runs on IO.
  */
 class WakeController(private val scope: CoroutineScope) {
     /** null = idle; non-null drives the "Waking…" phase of [ConnectOverlay]. */
@@ -50,15 +48,14 @@ class WakeController(private val scope: CoroutineScope) {
     /**
      * Wake the host and wait for [isOnline] to go true, then run [onOnline]. [macs]/[lastIp] target
      * the magic packet. No-ops straight to [onOnline] when there's nothing to wake with; a host
-     * that turns out to be up already (a race with the caller's check) falls out of the loop's
-     * first pass, before any packet is sent.
+     * that is up already passes the first probe and gets no packet.
      */
     fun start(
         hostName: String,
         connectsAfter: Boolean,
         macs: List<String>,
         lastIp: String,
-        isOnline: suspend () -> Boolean,
+        isOnline: () -> Boolean,
         onOnline: () -> Unit,
     ) {
         if (macs.isEmpty()) {
@@ -88,49 +85,26 @@ class WakeController(private val scope: CoroutineScope) {
         connectsAfter: Boolean,
         macs: List<String>,
         lastIp: String,
-        isOnline: suspend () -> Boolean,
+        isOnline: () -> Boolean,
         onOnline: () -> Unit,
     ) {
         loop?.cancel()
         waking = Waking(hostName = hostName, connectsAfter = connectsAfter)
         loop = scope.launch {
-            // Wall-clock, not a lap count: one [isOnline] costs a probe round trip, so laps are
-            // longer than the delay and a counted one would stretch both the timeout and the
-            // seconds this shows.
-            val started = android.os.SystemClock.elapsedRealtime()
-            fun elapsed() = ((android.os.SystemClock.elapsedRealtime() - started) / 1000).toInt()
-            var sentAt: Int? = null
-            while (isActive) {
-                if (isOnline()) {
-                    waking = null
-                    loop = null
-                    onOnline()
-                    return@launch
+            val job = coroutineContext.job
+            val up = withContext(Dispatchers.IO) {
+                WakeLoop.run(macs, lastIp, isOnline, cancelled = { !isActive }) { seconds, _, _ ->
+                    // Posted, and dropped once this wait is no longer the current one.
+                    scope.launch { if (loop === job) waking = waking?.copy(seconds = seconds) }
                 }
-                if (elapsed() >= TIMEOUT_S) {
-                    waking = waking?.copy(timedOut = true)
-                    loop = null
-                    return@launch
-                }
-                // Checked before sent, so a host that is already up never gets a packet. Re-sent on
-                // a cadence because a single one can be missed, and some NICs only wake on a fresh
-                // packet after dropping into a deeper sleep state.
-                if (sentAt == null || elapsed() - sentAt >= RESEND_EVERY_S) {
-                    sentAt = elapsed()
-                    val csv = macs.joinToString(",")
-                    launch(Dispatchers.IO) { NativeBridge.nativeWakeOnLan(csv, lastIp) }
-                }
-                delay(1000)
-                waking = waking?.copy(seconds = elapsed())
+            }
+            loop = null
+            if (up) {
+                waking = null
+                onOnline()
+            } else {
+                waking = waking?.copy(timedOut = true)
             }
         }
-    }
-
-    companion object {
-        /** How long to wait for the host to reappear before giving up (a cold boot can be a minute+). */
-        const val TIMEOUT_S = 90
-
-        /** Re-send the magic packet this often. */
-        const val RESEND_EVERY_S = 6
     }
 }
