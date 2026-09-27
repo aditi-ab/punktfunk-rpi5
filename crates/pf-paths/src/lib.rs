@@ -90,18 +90,34 @@ pub fn seat_record(id: &str) -> PathBuf {
 /// [`config_dir`]: a seat home holds a Steam install, not configuration.
 #[cfg(target_os = "linux")]
 fn data_dir() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .filter(|s| !s.is_empty())
+    xdg_home("XDG_DATA_HOME", ".local/share").join("punktfunk")
+}
+
+/// `$var` when it holds an absolute path, else `$HOME/<fallback>`. The XDG base-dir spec
+/// ignores an empty or relative value.
+#[cfg(not(windows))]
+fn xdg_home(var: &str, fallback: &str) -> PathBuf {
+    xdg_home_from(std::env::var_os(var), std::env::var_os("HOME"), fallback)
+}
+
+#[cfg(not(windows))]
+fn xdg_home_from(
+    value: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    fallback: &str,
+) -> PathBuf {
+    value
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| PathBuf::from(h).join(fallback)))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("punktfunk")
 }
 
 /// Host identity, pairing, mgmt token, library.
 ///
 /// Windows uses `%ProgramData%` so the SYSTEM service and the interactive
-/// user share one dir that survives logout. `PUNKTFUNK_CONFIG_DIR` overrides.
+/// user share one dir that survives logout. Elsewhere `$XDG_CONFIG_HOME`, ignored
+/// when empty or relative. `PUNKTFUNK_CONFIG_DIR` overrides.
 pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PUNKTFUNK_CONFIG_DIR").filter(|s| !s.is_empty()) {
         return PathBuf::from(dir);
@@ -112,10 +128,7 @@ pub fn config_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     #[cfg(not(target_os = "windows"))]
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base = xdg_home("XDG_CONFIG_HOME", ".config");
     base.join("punktfunk")
 }
 
@@ -500,6 +513,27 @@ mod tests {
         assert!(
             ps.ends_with(r"\System32\WindowsPowerShell\v1.0\powershell.exe"),
             "{ps}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_empty_or_relative_xdg_value_falls_back_to_home() {
+        let home = || Some("/home/u".into());
+        for bad in ["", "punktfunk-rel"] {
+            assert_eq!(
+                xdg_home_from(Some(bad.into()), home(), ".config"),
+                PathBuf::from("/home/u/.config"),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            xdg_home_from(Some("/xdg".into()), home(), ".config"),
+            PathBuf::from("/xdg")
+        );
+        assert_eq!(
+            xdg_home_from(None, home(), ".local/share"),
+            PathBuf::from("/home/u/.local/share")
         );
     }
 
