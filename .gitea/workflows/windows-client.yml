@@ -117,6 +117,8 @@ on:
       - 'crates/pyrowave-sys/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
+      - 'scripts/ci/pf-version.ps1'
+      - 'scripts/ci/pf-version.vectors'
       - '.gitea/workflows/windows-client.yml'
     tags: ['v*']
   pull_request:
@@ -135,6 +137,8 @@ on:
       - 'crates/pyrowave-sys/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
+      - 'scripts/ci/pf-version.ps1'
+      - 'scripts/ci/pf-version.vectors'
       - '.gitea/workflows/windows-client.yml'
   workflow_dispatch:
 
@@ -228,6 +232,11 @@ jobs:
       - name: Ensure Windows toolchain (WDK, ARM64 target)
         shell: pwsh
         run: ./scripts/ci/ensure-windows-toolchain.ps1
+
+      # The version rule's pwsh twin must agree with pf-version.sh (ci.yml checks that side).
+      - name: pf-version vectors
+        shell: pwsh
+        run: ./scripts/ci/pf-version.ps1 -SelfTest
 
       - name: Configure + version
         shell: pwsh

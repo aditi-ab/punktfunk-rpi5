@@ -77,6 +77,7 @@ jobs:
         run: |
           set -eu
           sh scripts/ci/changed.sh --self-test
+          bash scripts/ci/pf-version.sh --self-test
           if [ -n "${BASE_SHA:-}" ]; then
             git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null || git fetch origin "$BASE_SHA"
             git diff --no-renames --name-only "$BASE_SHA...HEAD" > /tmp/changed-paths

@@ -178,22 +178,15 @@ jobs:
         run: sh scripts/ci/ensure-sccache.sh
 
       - name: Version + channel
-        # vX.Y.Z tag -> X.Y.Z, published to the `stable` apt distribution (a real release).
-        # A main push -> <next-minor>~ciN.g<sha>, published to the `canary` distribution: the '~' sorts
-        # below the eventual tag, it climbs monotonically by run number, and the canary base is
-        # derived one minor AHEAD of the latest stable tag (scripts/ci/pf-version.sh) so a
-        # stable->canary box re-point still moves forward (see channels.md). Computed BEFORE the build so it's stamped into the binary
+        # vX.Y.Z tag -> X.Y.Z in the `stable` apt distribution; a main push -> <next-minor>~ciN.g<sha>
+        # in `canary`, where the '~' sorts below the eventual tag (scripts/ci/pf-version.sh owns the
+        # rule, see channels.md). Computed BEFORE the build so it's stamped into the binary
         # (PUNKTFUNK_BUILD_VERSION -> build.rs -> --version).
         run: |
-          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of the latest stable tag)
-          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
-          case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
-            *)            V="${PF_BASE}~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
-          esac
-          echo "VERSION=$V" >> "$GITHUB_ENV"
-          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
-          echo "package version $V -> apt distribution '$DIST'"
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "package version $PF_VERSION -> apt distribution '$PF_CHANNEL'"
 
       # dpkg-shlibdeps (Depends resolution) + dpkg-deb live in dpkg-dev. The client's link
       # deps are also baked into the rust-ci image, but this job runs against the image
@@ -397,8 +390,8 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   # The HOST .deb — built on Ubuntu 24.04 (noble), so it installs on Ubuntu 24.04 LTS through
   # 26.04 (see the file header + packaging/debian/README.md). Runs in
-  # parallel with build-publish and publishes to the SAME distribution/component; the version step is
-  # byte-identical so host and clients share a version line.
+  # parallel with build-publish and publishes to the SAME distribution/component; both version steps
+  # run `pf-version.sh --format deb`, so host and clients share a version line.
   build-publish-host:
     runs-on: ubuntu-24.04
     container:
@@ -419,15 +412,10 @@ jobs:
       - name: Version + channel
         run: |
           git config --global --add safe.directory "$PWD"
-          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of the latest stable tag)
-          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
-          case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
-            *)            V="${PF_BASE}~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
-          esac
-          echo "VERSION=$V" >> "$GITHUB_ENV"
-          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
-          echo "host package version $V -> apt distribution '$DIST'"
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "host package version $PF_VERSION -> apt distribution '$PF_CHANNEL'"
 
       # dpkg-shlibdeps/dpkg-deb are baked into rust-ci-noble; python3 is for the release-attach
       # helper. Re-install defensively so the job stays green against the PREVIOUS image on the
@@ -577,19 +565,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Byte-identical to the other jobs' version step (pf-version.sh is deterministic per commit)
-      # — but only DISTRIBUTION is used here. The package version is the gamescope upstream
-      # version + our patch level, which build-gamescope-deb.sh derives itself; it deliberately
-      # does NOT follow the punktfunk version line, because this package moves on its own cadence.
+      # Only the channel is used here. The package version is the gamescope upstream version + our
+      # patch level, which build-gamescope-deb.sh derives itself; this package moves on its own
+      # cadence, not the punktfunk version line.
       - name: Channel
         run: |
           git config --global --add safe.directory "$PWD"
-          case "$GITHUB_REF" in
-            refs/tags/v*) DIST=stable ;;
-            *)            DIST=canary ;;
-          esac
-          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
-          echo "gamescope -> apt distribution '$DIST'"
+          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_CHANNEL
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "gamescope -> apt distribution '$PF_CHANNEL'"
 
       # CACHED on packaging/gamescope/** alone — it depends on nothing else in this repo, so a
       # normal push restores a binary instead of spending ~10 minutes on someone else's tree.
@@ -682,19 +666,13 @@ jobs:
       - name: sccache (no-op once the image bakes it)
         run: sh scripts/ci/ensure-sccache.sh
 
-      # Byte-identical to build-publish's version step (pf-version.sh is deterministic per
-      # commit), so the arm64 package always shares the amd64 version line.
+      # pf-version.sh is deterministic per commit, so the arm64 package shares the amd64 version line.
       - name: Version + channel
         run: |
-          eval "$(bash scripts/ci/pf-version.sh)"
-          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
-          case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
-            *)            V="${PF_BASE}~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
-          esac
-          echo "VERSION=$V" >> "$GITHUB_ENV"
-          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
-          echo "package version $V -> apt distribution '$DIST' (arm64)"
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "package version $PF_VERSION -> apt distribution '$PF_CHANNEL' (arm64)"
 
       # dpkg-shlibdeps + dpkg-deb. The arm64 link deps themselves are the cross image's whole
       # point and are already baked in; python3 is for scripts/ci/gitea-release.sh.
@@ -825,15 +803,10 @@ jobs:
       - name: Channel + expected version
         run: |
           git config --global --add safe.directory "$PWD"
-          eval "$(bash scripts/ci/pf-version.sh)"
-          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
-          case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
-            *)            V="${PF_BASE}~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
-          esac
-          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
-          echo "EXPECT_VERSION=$V" >> "$GITHUB_ENV"
-          echo "expecting $V in apt distribution '$DIST'"
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "EXPECT_VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "expecting $PF_VERSION in apt distribution '$PF_CHANNEL'"
 
       # The support matrix, asserted rather than asserted-in-prose. Each row names the packages
       # that MUST install on that distro; anything absent from the row is expected not to and is
