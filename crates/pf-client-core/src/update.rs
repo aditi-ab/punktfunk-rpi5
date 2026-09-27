@@ -88,17 +88,23 @@ pub struct Status {
 
 /// Operator kill switch for checks. Same env name the host honours.
 pub fn check_disabled() -> bool {
-    matches!(
-        std::env::var("PUNKTFUNK_UPDATE_CHECK").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
-    )
+    env_off("PUNKTFUNK_UPDATE_CHECK")
 }
 
 /// Operator kill switch for apply. Status still reports what is available and the hand command.
 pub fn apply_disabled() -> bool {
+    env_off("PUNKTFUNK_UPDATE_APPLY")
+}
+
+fn env_off(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| is_off(&v))
+}
+
+/// The host's off grammar for these switches: trimmed, any case, `0`, `false`, `off` or `no`.
+fn is_off(value: &str) -> bool {
     matches!(
-        std::env::var("PUNKTFUNK_UPDATE_APPLY").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
     )
 }
 
@@ -526,6 +532,17 @@ mod tests {
             apply_route(InstallKind::Flatpak, bare),
             (Apply::Full, Applier::Flatpak)
         );
+    }
+
+    /// The host reads `PUNKTFUNK_UPDATE_CHECK=no` as off; the client must too.
+    #[test]
+    fn kill_switches_read_the_hosts_off_grammar() {
+        for off in ["0", "false", "off", "no", "OFF", " No ", "0 "] {
+            assert!(is_off(off), "{off:?}");
+        }
+        for on in ["1", "true", "yes", "", "garbage"] {
+            assert!(!is_off(on), "{on:?}");
+        }
     }
 
     #[test]
