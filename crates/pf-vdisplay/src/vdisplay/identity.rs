@@ -138,7 +138,7 @@ const LEGACY_FILE: &str = "pf-vdisplay-identity.json";
 
 /// Fingerprint hex; `{hex}@{w}x{h}` when `per_client_mode` so each resolution keeps its scale.
 pub(crate) fn identity_key(fp: [u8; 32], mode: (u32, u32), per_client_mode: bool) -> String {
-    let hex: String = fp.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = hex::encode(fp);
     if per_client_mode {
         format!("{hex}@{}x{}", mode.0, mode.1)
     } else {
@@ -346,7 +346,7 @@ pub(crate) fn resolve_slot_bounded(
 static SLOT_OWNER: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
 
 fn remember_slot_owner(slot: u32, fp: [u8; 32]) {
-    let hex: String = fp.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = hex::encode(fp);
     SLOT_OWNER
         .lock()
         .unwrap_or_else(|e| e.into_inner())

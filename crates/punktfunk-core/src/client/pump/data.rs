@@ -518,8 +518,8 @@ impl DataPump {
                     // window median (a frame arrived visibly off-beat).
                     if arrivals_us.len() >= 8 {
                         arrivals_us.sort_unstable();
-                        let pct = |q: usize| arrivals_us[(arrivals_us.len() - 1) * q / 100];
-                        let (p50, p95) = (pct(50), pct(95));
+                        let rank = |q| crate::hud::rank(&arrivals_us, q);
+                        let (p50, p95) = (rank(50), rank(95));
                         let late = arrivals_us.iter().filter(|&&d| d > p50 * 2).count();
                         tracing::info!(
                             frames = arrivals_us.len() + 1,

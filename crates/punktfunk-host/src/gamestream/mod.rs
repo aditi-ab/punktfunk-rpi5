@@ -687,17 +687,6 @@ pub fn serve(
     })
 }
 
-/// Host wall clock, unix seconds. Access deadlines are stored and evaluated in this
-/// clock so an NTP step moves them. Shared by nvhttp launch gates and the control
-/// thread's expiry check.
-#[cfg(feature = "gamestream")]
-pub(crate) fn wall_unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// Display name for Moonlight's host tile and both mDNS instance names.
 /// `PUNKTFUNK_HOST_NAME` wins; otherwise the machine hostname.
 fn hostname_string() -> String {

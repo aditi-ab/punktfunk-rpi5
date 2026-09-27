@@ -1,5 +1,15 @@
 //! Certificate fingerprint spelling shared by every Rust client.
 
+/// The 32-byte fingerprint as 64 lowercase hex digits: the spelling every store, advert and
+/// host log uses.
+pub fn hex(fp: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    fp.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 /// 64 hex digits, either case, into the 32-byte SHA-256 fingerprint. `None` on any
 /// other length or a non-hex byte, multibyte UTF-8 included: an mDNS `fp` is peer text.
 pub fn parse_hex32(s: &str) -> Option<[u8; 32]> {
@@ -17,12 +27,13 @@ pub fn parse_hex32(s: &str) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_hex32;
+    use super::{hex, parse_hex32};
 
     #[test]
     fn parses_either_case_and_refuses_everything_else() {
-        let lower: String = (0..32u8).map(|b| format!("{b:02x}")).collect();
         let want: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let lower = hex(&want);
+        assert_eq!(&lower[..6], "000102");
         assert_eq!(parse_hex32(&lower), Some(want));
         assert_eq!(parse_hex32(&lower.to_uppercase()), Some(want));
         assert_eq!(parse_hex32(&lower[..62]), None);

@@ -589,14 +589,6 @@ pub fn ensure_modules() {
 /// `PUNKTFUNK_STEAM_GADGET` on/off forces it. A host that *is* a Deck never reaches
 /// here: `resolve_gamepad` degrades `SteamDeck` → DualSense before the manager is built.
 pub fn gadget_preferred() -> bool {
-    pf_host_config::row_tri("PUNKTFUNK_STEAM_GADGET").unwrap_or_else(is_steamos)
-}
-
-fn is_steamos() -> bool {
-    std::fs::read_to_string("/etc/os-release")
-        .map(|s| {
-            s.lines()
-                .any(|l| l == "ID=steamos" || (l.starts_with("ID_LIKE=") && l.contains("steamos")))
-        })
-        .unwrap_or(false)
+    pf_host_config::row_tri("PUNKTFUNK_STEAM_GADGET")
+        .unwrap_or_else(|| pf_host_config::os_release::os_release().is("steamos"))
 }

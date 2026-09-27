@@ -26,7 +26,7 @@ use manifest::Manifest;
 use pf_update_check::{FeedError, PublicKey};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// Same Ed25519 signers the client trusts. A host that pinned a different set
 /// would accept a feed the client rejects (or the reverse).
@@ -156,13 +156,6 @@ fn runtime() -> &'static Mutex<Runtime> {
     RT.get_or_init(|| Mutex::new(Runtime::default()))
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Highest accepted manifest serial per channel. Persist this or a replayed
 /// older manifest becomes a silent downgrade of knowledge.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -255,7 +248,7 @@ pub(crate) fn refresh_blocking() -> Result<Checked, FeedError> {
         Ok(m) => {
             let checked = Checked {
                 manifest: m,
-                fetched_unix: now_unix(),
+                fetched_unix: crate::clock::unix_secs_u64(),
             };
             let newer = if source_build {
                 source_newer(rt.source_behind)
@@ -435,7 +428,7 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
             jobs::reconcile(
                 jobs::read_intent(&jobs::intent_path()),
                 crate::version::get(),
-                now_unix()
+                crate::clock::unix_secs_u64()
             ),
             jobs::Reconciled::StillApplying
         ) {
@@ -474,7 +467,7 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
             },
             received_bytes: 0,
             total_bytes: None,
-            started_unix: now_unix(),
+            started_unix: crate::clock::unix_secs_u64(),
         });
         (version, serial, asset)
     };
@@ -534,7 +527,7 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
                     ok: false,
                     from: crate::version::get().into(),
                     to: target_version.clone(),
-                    finished_unix: now_unix(),
+                    finished_unix: crate::clock::unix_secs_u64(),
                     stage: Some(stage_name.into()),
                     error: Some(error),
                     log_path: None,
@@ -563,7 +556,7 @@ enum PostApply {
 pub(crate) fn reconcile_at_boot() {
     let path = jobs::intent_path();
     let intent = jobs::read_intent(&path);
-    match jobs::reconcile(intent, crate::version::get(), now_unix()) {
+    match jobs::reconcile(intent, crate::version::get(), crate::clock::unix_secs_u64()) {
         jobs::Reconciled::None | jobs::Reconciled::StillApplying => {}
         jobs::Reconciled::Success(record) => {
             tracing::info!(from = %record.from, to = %record.to, "host update applied");
@@ -609,7 +602,11 @@ impl Snapshot {
             return None;
         }
         let intent = jobs::read_intent(&jobs::intent_path())?;
-        match jobs::reconcile(Some(intent.clone()), crate::version::get(), now_unix()) {
+        match jobs::reconcile(
+            Some(intent.clone()),
+            crate::version::get(),
+            crate::clock::unix_secs_u64(),
+        ) {
             jobs::Reconciled::StillApplying => Some(intent),
             _ => None,
         }
@@ -620,7 +617,10 @@ impl Snapshot {
     pub(crate) fn stale(&self) -> bool {
         self.checked
             .as_ref()
-            .map(|c| now_unix().saturating_sub(c.manifest.serial) > STALE_AFTER.as_secs())
+            .map(|c| {
+                crate::clock::unix_secs_u64().saturating_sub(c.manifest.serial)
+                    > STALE_AFTER.as_secs()
+            })
             .unwrap_or(false)
     }
 }
@@ -719,7 +719,7 @@ mod tests {
                     "stable",
                 )
                 .unwrap(),
-                fetched_unix: now_unix(),
+                fetched_unix: crate::clock::unix_secs_u64(),
             }),
             last_error: None,
             not_published: false,
@@ -727,8 +727,8 @@ mod tests {
             last_result: None,
             source_behind: None,
         };
-        assert!(!mk(now_unix()).stale());
-        assert!(mk(now_unix() - STALE_AFTER.as_secs() - 10).stale());
+        assert!(!mk(crate::clock::unix_secs_u64()).stale());
+        assert!(mk(crate::clock::unix_secs_u64() - STALE_AFTER.as_secs() - 10).stale());
     }
 
     #[test]

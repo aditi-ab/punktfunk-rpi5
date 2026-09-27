@@ -79,10 +79,7 @@ pub(crate) fn game_stats() -> BTreeMap<String, GameStats> {
 
 /// This host spawned `id` just now. Not for an adopted launch (a reconnect).
 pub fn record_launch(id: &str) {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let now_ms = crate::clock::unix_ms();
     update(id, |s| s.launched(now_ms));
 }
 

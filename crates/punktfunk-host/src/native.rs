@@ -196,21 +196,7 @@ pub fn test_frame(idx: u32, len: usize) -> Vec<u8> {
     d
 }
 
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-/// Unix seconds. Access deadlines are stored and checked in wall time, not a cached
-/// monotonic offset, so an NTP step moves a deadline with the clock.
-fn wall_unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+use punktfunk_core::quic::wall_clock_ns as now_ns;
 
 /// Remaining lifetime on the wire: saturating whole seconds, floor 1. `0` means *permanent*,
 /// so a deadline due this second still advertises as expiring.
@@ -257,10 +243,6 @@ fn run_ephemeral(opts: Punktfunk1Options) -> Result<()> {
     let stats = StatsRecorder::new(crate::stats_recorder::default_dir());
     let ident = crate::identity::ephemeral()?;
     rt.block_on(serve(opts, 0, np, stats, ident, None))
-}
-
-fn fingerprint_hex(fp: &[u8; 32]) -> String {
-    fp.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Native host config when unified `serve` runs it in-process.
@@ -342,7 +324,7 @@ pub(crate) async fn serve(
     tracing::info!(
         port = opts.port,
         source = ?opts.source,
-        fingerprint = %fingerprint_hex(&fingerprint),
+        fingerprint = %hex::encode(fingerprint),
         "punktfunk/1 host listening (QUIC) — clients pin this fingerprint"
     );
 
@@ -358,7 +340,7 @@ pub(crate) async fn serve(
         Ok(h) => crate::discovery::advertise_native(
             &h.hostname,
             opts.port,
-            &fingerprint_hex(&fingerprint),
+            &hex::encode(fingerprint),
             opts.require_pairing,
             &h.uniqueid,
             // 0 = standalone (no mgmt API) → do not advertise an `mgmt` port.
@@ -737,11 +719,11 @@ async fn access_lifecycle(
     mut deadline: Option<i64>,
     device: crate::events::DeviceRef,
 ) {
-    let mut warned = spent_warnings(deadline, wall_unix_now());
+    let mut warned = spent_warnings(deadline, crate::clock::unix_secs());
     // `power.*` ending every session: typed close so the client does not see a transport error.
     let mut power_rx = crate::power::closing_rx();
     loop {
-        let now = wall_unix_now();
+        let now = crate::clock::unix_secs();
         if let Some(d) = deadline {
             if now >= d {
                 // Wall clock at fire: `d − now` is recomputed each lap, so an NTP step moves it.
@@ -766,7 +748,7 @@ async fn access_lifecycle(
             }
         }
         tokio::select! {
-            () = tokio::time::sleep(access_sleep(deadline, &warned, wall_unix_now())) => {}
+            () = tokio::time::sleep(access_sleep(deadline, &warned, crate::clock::unix_secs())) => {}
             changed = watch_rx.changed() => {
                 if changed.is_err() {
                     return; // registry gone — host shutting down
@@ -794,7 +776,7 @@ async fn access_lifecycle(
                 controls
                     .deadline_unix
                     .store(deadline.unwrap_or(0), Ordering::Relaxed);
-                let now = wall_unix_now();
+                let now = crate::clock::unix_secs();
                 warned = spent_warnings(deadline, now);
                 // Skip an "expire now" (deadline already past) so we do not advertise a phantom second.
                 if deadline.is_none_or(|d| d > now) {
@@ -1223,7 +1205,7 @@ async fn serve_session(
             );
             anyhow::bail!("pairing requires the client to present a certificate");
         };
-        let client_fp_hex = fingerprint_hex(&client_fp);
+        let client_fp_hex = hex::encode(client_fp);
         // Charge the cooldown before consulting arming, on every outcome including rejections.
         // Otherwise "is pairing armed?" is a free oracle. A spam of knocks can hold the
         // cooldown against the real device.
@@ -1298,7 +1280,7 @@ async fn serve_session(
         let authorized = fp
             .as_ref()
             .map(|fp| {
-                np.effective(&fingerprint_hex(fp), wall_unix_now())
+                np.effective(&hex::encode(fp), crate::clock::unix_secs())
                     .is_some()
             })
             .unwrap_or(false);
@@ -1314,7 +1296,7 @@ async fn serve_session(
                      client identity and approve it in the console, or run the PIN ceremony)"
                 );
             };
-            let fp_hex = fingerprint_hex(&fp);
+            let fp_hex = hex::encode(fp);
             // Sanitize the wire name before log/console (escapes / bidi). Empty → fingerprint label.
             let label = crate::native_pairing::sanitize_device_name(
                 gate_hello.name.as_deref().unwrap_or(""),
@@ -1442,7 +1424,7 @@ pub(crate) async fn run_admitted(
     data_plane: DataPlane,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Served> {
-    let session_fp_hex = conn.peer_fingerprint().map(|fp| fingerprint_hex(&fp));
+    let session_fp_hex = conn.peer_fingerprint().map(hex::encode);
     let SessionHost {
         opts,
         audio_cap,
@@ -1460,7 +1442,7 @@ pub(crate) async fn run_admitted(
 
     // Grants once at admission: effective mask + deadline + watch. Anonymous (`--open`) and
     // an identity with no record keep full control — nothing on the trust record to enforce.
-    let admit_unix = wall_unix_now();
+    let admit_unix = crate::clock::unix_secs();
     let (initial_grants, deadline_unix, access_watch) = match session_fp_hex.as_deref() {
         Some(fp_hex) => match np.effective(fp_hex, admit_unix) {
             Some(mask) => {
@@ -2088,12 +2070,7 @@ pub(crate) async fn run_admitted(
     let _live_guard = {
         let id = conn.peer_fingerprint();
         let label = id
-            .map(|fp| {
-                fp.iter()
-                    .take(4)
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            })
+            .map(|fp| hex::encode(&fp[..4]))
             .unwrap_or_else(|| "client".to_string());
         crate::vdisplay::admission::register(
             id,
@@ -2285,7 +2262,7 @@ pub(crate) async fn run_admitted(
     // Stats label: device-fingerprint prefix, else peer IP (anonymous, `--open`).
     let client_label = conn
         .peer_fingerprint()
-        .map(|fp| fingerprint_hex(&fp)[..12].to_string())
+        .map(|fp| hex::encode(fp)[..12].to_string())
         .unwrap_or_else(|| conn.remote_address().ip().to_string());
     // Reconnect inside the game's window: cancel pending termination. Data plane re-adopts via
     // `launchreg` (carries the original launch instant). Matched on (this client, this title).
@@ -3788,7 +3765,7 @@ mod tests {
         });
         std::thread::sleep(std::time::Duration::from_millis(500));
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let expected_fp = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let expected_fp = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         let mode = punktfunk_core::Mode {
             width: 1280,
             height: 720,
@@ -4199,13 +4176,13 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add_with_access(
             "Evening Guest",
             &fp_hex,
             Some(crate::native_pairing::Access {
                 grants: GRANT_ALL,
-                expires_unix: Some(wall_unix_now() + 2),
+                expires_unix: Some(crate::clock::unix_secs() + 2),
                 until_disconnect: false,
             }),
         )
@@ -4238,7 +4215,7 @@ mod tests {
         });
         // The row survives expiry — only authorization ends.
         assert!(np.is_paired(&fp_hex));
-        assert_eq!(np.effective(&fp_hex, wall_unix_now()), None);
+        assert_eq!(np.effective(&fp_hex, crate::clock::unix_secs()), None);
         let _ = std::fs::remove_file(&store);
         host.join().unwrap().unwrap();
     }
@@ -4254,7 +4231,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add("Edited Device", &fp_hex).unwrap();
         let host = spawn_access_host(19783, 1, np.clone());
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4270,7 +4247,7 @@ mod tests {
             assert_eq!(welcome.expires_in_secs, 0, "permanent access advertises 0");
 
             // Controller-only, 62 s out (inside T−5 m, outside T−1 m): one warning, ~2 s later.
-            let now = wall_unix_now();
+            let now = crate::clock::unix_secs();
             np.set_access(
                 &fp_hex,
                 crate::native_pairing::Access {
@@ -4315,7 +4292,7 @@ mod tests {
                 &fp_hex,
                 crate::native_pairing::Access {
                     grants: punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
-                    expires_unix: Some(wall_unix_now() - 1),
+                    expires_unix: Some(crate::clock::unix_secs() - 1),
                     until_disconnect: false,
                 },
             )
@@ -4342,7 +4319,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add_with_access(
             "Guest Pad",
             &fp_hex,
@@ -4434,7 +4411,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add_with_access("Launcher", &fp_hex, None).unwrap();
         let host = spawn_access_host(19786, 1, np);
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4493,20 +4470,20 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         // Still listed, no longer authorized.
         np.add_with_access(
             "Yesterday's Guest",
             &fp_hex,
             Some(crate::native_pairing::Access {
                 grants: GRANT_ALL,
-                expires_unix: Some(wall_unix_now() - 3600),
+                expires_unix: Some(crate::clock::unix_secs() - 3600),
                 until_disconnect: false,
             }),
         )
         .unwrap();
         assert!(np.is_paired(&fp_hex), "expired but still listed");
-        assert_eq!(np.effective(&fp_hex, wall_unix_now()), None);
+        assert_eq!(np.effective(&fp_hex, crate::clock::unix_secs()), None);
 
         let host = spawn_access_host(19785, 1, np.clone());
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4536,7 +4513,7 @@ mod tests {
                     None,
                     Some(crate::native_pairing::Access {
                         grants: punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
-                        expires_unix: Some(wall_unix_now() + 4 * 3600),
+                        expires_unix: Some(crate::clock::unix_secs() + 4 * 3600),
                         until_disconnect: false,
                     }),
                 )
@@ -4573,7 +4550,7 @@ mod tests {
         approver.join().unwrap();
         // Re-grant in force: controller-only.
         assert_eq!(
-            np.effective(&fp_hex, wall_unix_now()),
+            np.effective(&fp_hex, crate::clock::unix_secs()),
             Some(punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY)
         );
         drop(client);

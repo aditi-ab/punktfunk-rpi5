@@ -5,15 +5,7 @@ use punktfunk_core::session::Frame;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-/// Wall-clock now in nanoseconds (CLOCK_REALTIME basis), to compare against the host-stamped
-/// capture `pts_ns` after the skew offset is applied.
-pub(crate) fn now_realtime_ns() -> i128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i128)
-        .unwrap_or(0)
-}
+pub(crate) use punktfunk_core::client::now_realtime_ns;
 
 /// HUD `decoded` point for one dequeued output frame, keyed by the echoed `presentationTimeUs`:
 /// hand the frame and its `decode` span (received→decoded, single-clock local, ≥ 0) to

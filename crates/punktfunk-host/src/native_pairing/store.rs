@@ -77,14 +77,6 @@ fn default_path() -> Result<PathBuf> {
     Ok(pf_paths::config_dir().join("punktfunk1-paired.json"))
 }
 
-/// Host wall-clock unix seconds. Grant and expiry fields use this clock.
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// A store a non-admin planted before the first elevated run is a pre-trusted device.
 fn load(path: &Path) -> PairedClients {
     if crate::planted::quarantine_planted_secret(path) {
@@ -184,7 +176,7 @@ impl TrustStore {
                     existing.grants = Some(a.grants);
                     existing.expires_unix = a.expires_unix;
                     existing.until_disconnect = a.until_disconnect;
-                    existing.granted_unix = Some(now_unix());
+                    existing.granted_unix = Some(crate::clock::unix_secs());
                 }
             }
             None => p.clients.clients.push(PairedClient {
@@ -192,7 +184,7 @@ impl TrustStore {
                 fingerprint: fp_hex.to_string(),
                 grants: access.map(|a| a.grants),
                 expires_unix: access.and_then(|a| a.expires_unix),
-                granted_unix: access.map(|_| now_unix()),
+                granted_unix: access.map(|_| crate::clock::unix_secs()),
                 until_disconnect: access.is_some_and(|a| a.until_disconnect),
                 preferred_pad_slot: None,
             }),
@@ -220,7 +212,7 @@ impl TrustStore {
         existing.grants = Some(access.grants);
         existing.expires_unix = access.expires_unix;
         existing.until_disconnect = access.until_disconnect;
-        existing.granted_unix = Some(now_unix());
+        existing.granted_unix = Some(crate::clock::unix_secs());
         if let Err(e) = save(&p) {
             p.clients.clients = snapshot;
             return Err(e);

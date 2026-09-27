@@ -14,7 +14,6 @@
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
@@ -104,13 +103,6 @@ impl PadFeed {
             let _ = self.tx.send(frame());
         }
     }
-}
-
-/// Unix milliseconds; 0 if the clock is before the epoch.
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[cfg(test)]

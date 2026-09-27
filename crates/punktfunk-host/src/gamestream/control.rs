@@ -465,7 +465,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                         }
                         if let Some(a) = access
                             .as_ref()
-                            .filter(|a| a.expired(super::wall_unix_now()))
+                            .filter(|a| a.expired(crate::clock::unix_secs()))
                         {
                             // Expiry ends the session as a decision, not a network drop.
                             // `quit_session` clears `launch`; the host-side-ended arm then
@@ -1286,7 +1286,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&p);
         let np = Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
-        let now = super::super::wall_unix_now();
+        let now = crate::clock::unix_secs();
 
         // No registry wired (an AppState that never went through `serve`): ungoverned forever.
         let a = super::SessionAccess::resolve(None, "ab12".into());

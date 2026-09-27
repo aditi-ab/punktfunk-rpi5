@@ -90,7 +90,7 @@ pub(super) fn run_apply(
             from: crate::version::get().into(),
             to: target_version.into(),
             serial,
-            started_unix: super::now_unix(),
+            started_unix: crate::clock::unix_secs_u64(),
             installer_sha256: asset.sha256.to_ascii_lowercase(),
             log_path: log.display().to_string(),
             source_build: false,
@@ -253,17 +253,13 @@ fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
         }
         ctx.update(&buf[..n]);
     }
-    let got = hex(ctx.finish().as_ref());
+    let got = hex::encode(ctx.finish());
     if got != expected_hex.to_ascii_lowercase() {
         return Err(format!(
             "installer sha256 mismatch: got {got}, manifest says {expected_hex}"
         ));
     }
     Ok(())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn preflight_disk(at: &Path, needed: u64) -> Result<(), String> {
@@ -417,7 +413,7 @@ pub(crate) fn verify_authenticode(
             let der = unsafe {
                 std::slice::from_raw_parts(leaf.pbCertEncoded, leaf.cbCertEncoded as usize)
             };
-            let fp = hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der).as_ref());
+            let fp = hex::encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der));
             if !pins.iter().any(|p| p.eq_ignore_ascii_case(&fp)) {
                 return Err(format!(
                     "installer signing-leaf fingerprint {fp} matches none of the manifest's \

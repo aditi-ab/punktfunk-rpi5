@@ -227,13 +227,11 @@ async fn pair(
     }
     let client_fp = sha256(&req.device_key);
     let source = crate::native_pairing::classify_source(Some(conn.remote_address().ip()));
-    let pin = match serving.plane.pairing.pin_for_attempt(
-        &client_fp
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>(),
-        source,
-    ) {
+    let pin = match serving
+        .plane
+        .pairing
+        .pin_for_attempt(&hex::encode(client_fp), source)
+    {
         crate::native_pairing::PinAttempt::Pin(pin) => pin,
         crate::native_pairing::PinAttempt::Disarmed => {
             return Err(refused(
@@ -344,10 +342,7 @@ mod tests {
         // Unpaired: a perfect signature buys nothing.
         assert!(admit(&auth, &nonce, &s).is_err(), "not paired yet");
 
-        let fp: String = sha256(&auth.device_key)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let fp = hex::encode(sha256(&auth.device_key));
         np.add("Enrico's browser", &fp).unwrap();
         let (name, admitted_fp) = admit(&auth, &nonce, &s).unwrap();
         assert_eq!(name, "Enrico's browser");

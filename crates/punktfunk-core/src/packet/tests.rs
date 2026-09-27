@@ -2061,7 +2061,7 @@ fn a_frame_that_never_completes_is_still_timed() {
     let mut h = base_header();
     h.frame_bytes = 64;
     h.data_shards = 4;
-    h.pts_ns = crate::stats::now_realtime_ns() - 30_000_000;
+    h.pts_ns = crate::quic::wall_clock_ns() - 30_000_000;
     assert!(r
         .push(&packet(h), coder.as_ref(), &stats)
         .unwrap()

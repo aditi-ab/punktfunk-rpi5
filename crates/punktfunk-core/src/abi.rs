@@ -4588,16 +4588,7 @@ pub unsafe extern "C" fn punktfunk_connection_access_expires_in(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        let remaining = match c.inner.access_deadline_unix() {
-            None => 0,
-            Some(deadline) => {
-                let now = crate::quic::wall_clock_ns() / 1_000_000_000;
-                // Clamp to ≥ 1 while a deadline is set: 0 means "permanent", never "expired".
-                u32::try_from(deadline.saturating_sub(now))
-                    .unwrap_or(u32::MAX)
-                    .max(1)
-            }
-        };
+        let remaining = c.inner.access_expires_in_secs();
         // SAFETY: out-param is optional; null-checked before write.
         unsafe {
             if !secs.is_null() {

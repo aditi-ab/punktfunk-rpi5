@@ -159,11 +159,7 @@ const ICON_TOKEN_MAX: usize = 32;
 /// The alphabet makes `../`, a URL, a `data:` payload and a NUL unrepresentable:
 /// plugins control the field and clients interpolate it into names and paths.
 pub fn is_icon_token(t: &str) -> bool {
-    !t.is_empty()
-        && t.len() <= ICON_TOKEN_MAX
-        && t.starts_with(|c: char| c.is_ascii_lowercase())
-        && t.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    crate::slug::is_kebab(t, ICON_TOKEN_MAX, true)
 }
 
 /// Reject a malformed [`GameEntry::icon`] token. `Ok(())` when absent.

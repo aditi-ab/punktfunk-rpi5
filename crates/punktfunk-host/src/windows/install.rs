@@ -35,7 +35,9 @@ pub(crate) fn resolve_tool(cmd: &str) -> String {
     }
     sys32(&format!("{cmd}.exe"))
 }
-fn run_quiet(cmd: &str, args: &[&str]) -> bool {
+/// Whether the tool ran and exited 0, output discarded. Resolved through [`resolve_tool`], so a
+/// bare name is System32's: `service install` and `driver` run elevated.
+pub(crate) fn run_quiet(cmd: &str, args: &[&str]) -> bool {
     run_code(cmd, args) == Some(0)
 }
 /// Exit code, output discarded. `None` when the tool did not launch.

@@ -13,6 +13,7 @@
 //! Subcommands: `run` (SCM binPath), `install`/`uninstall`, `start`/`stop`/`restart`/`status`.
 //! Config: `%ProgramData%\punktfunk\host.env`. Logs: `%ProgramData%\punktfunk\logs\`.
 
+use crate::install::run_quiet;
 use anyhow::{bail, Context, Result};
 use std::ffi::{c_void, OsString};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId,
@@ -647,12 +648,7 @@ unsafe fn spawn_host(
 /// Open `path` for append as an inheritable handle (child stdout/stderr). The returned `HANDLE`
 /// is owned by the caller — an ownership obligation, not a safety one.
 fn open_log_handle(path: &std::path::Path) -> Result<HANDLE> {
-    let wpath: Vec<u16> = path
-        .as_os_str()
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let wpath = HSTRING::from(path.as_os_str());
     let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
@@ -1044,13 +1040,7 @@ fn spawn_web(cfg: &WebConfig, data: &Path, job: HANDLE) -> Result<Child> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let cwd: Vec<u16> = cfg
-        .web_dir
-        .as_os_str()
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let cwd = HSTRING::from(cfg.web_dir.as_os_str());
     let mut pi = PROCESS_INFORMATION::default();
 
     // CREATE_SUSPENDED: assign to the job before the first instruction or children escape it.
@@ -1790,17 +1780,6 @@ fn sc(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// System32 path for a bare tool: `service install` runs elevated.
-fn run_quiet(cmd: &str, args: &[&str]) -> bool {
-    std::process::Command::new(crate::install::resolve_tool(cmd))
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 /// Boot-loop rollback after a host update. A fresh intent plus a crash-looping child that *is*
 /// the intent's target means the just-installed host does not stay up. Re-run the cached
 /// previous installer once per intent, Authenticode-checked. This process is not in the
@@ -1814,10 +1793,7 @@ fn maybe_boot_loop_rollback(restarts: u32, attempted: &mut bool) {
     let Some(intent) = crate::update::jobs::read_intent(&intent_path) else {
         return;
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::clock::unix_secs_u64();
     // Stale intent: no rollback. A boot-looping *old* binary is not this update; reconcile owns it.
     if now.saturating_sub(intent.started_unix) > 30 * 60 || crate::version::get() != intent.to {
         return;

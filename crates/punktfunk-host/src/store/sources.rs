@@ -84,7 +84,7 @@ impl Source {
     }
 
     fn validate(&self) -> Result<()> {
-        if !valid_source_name(&self.name) {
+        if !crate::slug::source_name(&self.name) {
             bail!("source name must be kebab-case `[a-z][a-z0-9-]*`, ≤32 characters");
         }
         if !self.url.starts_with("https://") || self.url.len() > 500 {
@@ -95,15 +95,6 @@ impl Source {
         }
         Ok(())
     }
-}
-
-pub(crate) fn valid_source_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 32
-        && name.as_bytes()[0].is_ascii_lowercase()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 #[derive(Serialize, Deserialize, Default)]

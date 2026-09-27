@@ -64,6 +64,8 @@ pub mod resolutions;
 pub mod rumble;
 pub mod session;
 pub mod stats;
+/// cbindgen:ignore
+pub mod time;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod transport;

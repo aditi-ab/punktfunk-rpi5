@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::{
-    get_session, hex32, insert_session, jni_guard, lock_recover, parse_hex32, remove_session,
+    get_session, hex, insert_session, jni_guard, lock_recover, parse_hex32, remove_session,
     SessionHandle,
 };
 
@@ -707,7 +707,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerp
     handle: jlong,
 ) -> JString<'local> {
     let out = get_session(handle)
-        .map(|session| hex32(&session.client.host_fingerprint))
+        .map(|session| hex(&session.client.host_fingerprint))
         .unwrap_or_default();
     env.with_env(|env| env.new_string(out))
         .resolve::<LogErrorAndDefault>()
@@ -783,7 +783,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePair<'local
                 &name,
                 Duration::from_secs(60),
             ) {
-                Ok(host_fp) => hex32(&host_fp),
+                Ok(host_fp) => hex(&host_fp),
                 Err(e) => {
                     // Crypto error == wrong PIN / MITM; anything else == transport/host reject.
                     // The token lets Kotlin say WHICH (`nativeTakeLastError`).

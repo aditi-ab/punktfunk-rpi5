@@ -15,7 +15,6 @@
 //! yields a short-lived bearer token, and the key is used once per session.
 
 use super::shared::*;
-use crate::mgmt::auth::unix_now;
 use base64::Engine as _;
 use rand::RngCore;
 use std::collections::HashMap;
@@ -92,7 +91,7 @@ impl DeviceAuth {
         }
         let mut raw = [0u8; 32];
         rand::rng().fill_bytes(&mut raw);
-        let nonce: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        let nonce = hex::encode(raw);
         guard.nonces.insert(nonce.clone(), (now, peer));
         nonce
     }
@@ -112,7 +111,7 @@ impl DeviceAuth {
     fn issue(&self, fingerprint: String) -> (String, i64) {
         let mut raw = [0u8; 32];
         rand::rng().fill_bytes(&mut raw);
-        let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        let token = hex::encode(raw);
         let now = Instant::now();
         let expires = now + TOKEN_TTL;
         let mut guard = self.inner.lock().expect("device-auth mutex");
@@ -140,7 +139,10 @@ impl DeviceAuth {
                 expires,
             },
         );
-        (token, unix_now() + TOKEN_TTL.as_secs() as i64)
+        (
+            token,
+            crate::clock::unix_secs() + TOKEN_TTL.as_secs() as i64,
+        )
     }
 
     /// The device behind a bearer token, if it is live. The caller still re-checks the
@@ -258,7 +260,7 @@ pub(crate) async fn post_device_token(
     if !st.device_auth.spend(&req.nonce) {
         return refuse();
     }
-    let Some(nonce) = unhex32(&req.nonce) else {
+    let Ok(nonce) = <[u8; 32] as hex::FromHex>::from_hex(&req.nonce) else {
         return refuse();
     };
     let Some(point) = crate::webtransport::spki_p256_point(&spki) else {
@@ -281,16 +283,13 @@ pub(crate) async fn post_device_token(
         return refuse();
     }
 
-    let fingerprint: String = crate::webtransport::sha256(&spki)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let fingerprint = hex::encode(crate::webtransport::sha256(&spki));
     // Paired *and* unexpired, read now rather than trusted from the ceremony: the same
     // `effective` check the certificate lane makes.
-    let paired = st
-        .native
-        .as_ref()
-        .is_some_and(|n| n.effective(&fingerprint, unix_now()).is_some());
+    let paired = st.native.as_ref().is_some_and(|n| {
+        n.effective(&fingerprint, crate::clock::unix_secs())
+            .is_some()
+    });
     if !paired {
         return refuse();
     }
@@ -303,18 +302,6 @@ pub(crate) async fn post_device_token(
         fingerprint,
     })
     .into_response()
-}
-
-/// Hex back to the 32 bytes the signed message wants.
-fn unhex32(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
 }
 
 #[cfg(test)]

@@ -431,7 +431,7 @@ pub struct EffectivePolicy {
 /// Hex form of a peer fingerprint — the key `clients` is stored under, and what
 /// the pairing store and the device list already use.
 pub fn fp_hex(fp: Option<[u8; 32]>) -> Option<String> {
-    fp.map(|fp| fp.iter().map(|b| format!("{b:02x}")).collect())
+    fp.map(hex::encode)
 }
 
 impl DisplayPolicy {

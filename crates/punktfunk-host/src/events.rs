@@ -14,7 +14,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
@@ -669,10 +668,7 @@ impl EventBus {
     /// Fire-and-forget. No receivers is fine — the ring still records for later catch-up.
     /// Returns the event as sent, for a caller that hands it on.
     pub fn emit(&self, kind: EventKind) -> HostEvent {
-        let ts_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let ts_ms = crate::clock::unix_ms();
         let mut ring = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let ev = HostEvent {
             seq: ring.next_seq,

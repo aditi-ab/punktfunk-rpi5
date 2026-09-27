@@ -52,32 +52,11 @@ pub fn note(mut line: String) {
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ` from the system clock. Wall time so a bundle
-/// correlates with the host log beside it. No chrono; same civil-date math the
-/// host uses. Shared by every feeder (`ring_layer`, Android logcat tee).
+/// correlates with the host log beside it. Shared by every feeder (`ring_layer`,
+/// Android logcat tee).
 pub fn wallclock() -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let secs = (ms / 1000) as i64;
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
-    format!(
-        "{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{:03}Z",
-        ms % 1000
-    )
+    let ms = punktfunk_core::quic::wall_clock_ns() / 1_000_000;
+    punktfunk_core::time::utc_rfc3339(ms, true)
 }
 
 /// Oldest-first text bundle. `header` is the shell identity line; an eviction

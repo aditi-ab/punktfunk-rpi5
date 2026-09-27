@@ -171,7 +171,7 @@ pub(super) fn run_apply_steamos(
             from: crate::version::get().into(),
             to: target_version.into(),
             serial,
-            started_unix: super::now_unix(),
+            started_unix: crate::clock::unix_secs_u64(),
             installer_sha256: String::new(),
             log_path: log.display().to_string(),
             source_build: true,
@@ -243,7 +243,7 @@ pub(super) fn run_apply(
     serial: u64,
     stage: &dyn Fn(&'static str),
 ) -> Result<(), (&'static str, String)> {
-    let started_unix = super::now_unix();
+    let started_unix = crate::clock::unix_secs_u64();
 
     let mut child = Command::new("systemctl")
         .args(["start", "punktfunk-update.service"])
@@ -334,7 +334,7 @@ pub(super) fn run_apply(
                 ok: true,
                 from: current.into(),
                 to: target_version.into(),
-                finished_unix: super::now_unix(),
+                finished_unix: crate::clock::unix_secs_u64(),
                 stage: None,
                 error: None,
                 log_path: None,
@@ -351,7 +351,7 @@ pub(super) fn run_apply(
                 ok: true,
                 from: current.into(),
                 to: current.into(),
-                finished_unix: super::now_unix(),
+                finished_unix: crate::clock::unix_secs_u64(),
                 stage: None,
                 error: None,
                 log_path: None,
@@ -374,7 +374,7 @@ pub(super) fn run_apply(
             from: current.into(),
             to,
             serial,
-            started_unix: super::now_unix(),
+            started_unix: crate::clock::unix_secs_u64(),
             installer_sha256: String::new(),
             log_path: "journalctl -u punktfunk-update.service".into(),
             source_build: false,

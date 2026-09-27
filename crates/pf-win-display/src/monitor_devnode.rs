@@ -16,7 +16,7 @@
 //! its node re-enabled. [`startup_recover`] replays leftovers on host start. If the host dies and
 //! never restarts, the monitor stays disabled until Device Manager.
 
-use windows::core::PCWSTR;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Disable_DevNode, CM_Enable_DevNode, CM_Get_DevNode_Status, CM_Locate_DevNodeW,
     CM_DISABLE_PERSIST, CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CM_PROB_DISABLED,
@@ -177,7 +177,7 @@ fn monitor_instance(adapter: LUID, target_id: u32) -> Option<(String, String)> {
 /// `false` only for a node whose problem code is "disabled" — the operator's own Device Manager
 /// state, which we must not lease.
 fn devnode_enabled(id: &str) -> Option<bool> {
-    let wide: Vec<u16> = id.encode_utf16().chain([0]).collect();
+    let wide = HSTRING::from(id);
     let mut devinst = 0u32;
     // SAFETY: `wide` is a live NUL-terminated UTF-16 instance id outliving the call; `devinst` is
     // a valid out-param.
@@ -202,7 +202,7 @@ fn devnode_enabled(id: &str) -> Option<bool> {
 }
 
 fn set_devnode(id: &str, disable: bool) -> bool {
-    let wide: Vec<u16> = id.encode_utf16().chain([0]).collect();
+    let wide = HSTRING::from(id);
     let mut devinst = 0u32;
     // A disabled or departed devnode may not be in the live tree — PHANTOM on enable so recovery
     // still finds it; disable requires a present device.

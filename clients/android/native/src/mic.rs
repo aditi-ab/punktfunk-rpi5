@@ -25,7 +25,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// What one capture open attempt yields: the stream, plus both halves of the PCM hand-off — the
 /// receiver the encode worker drains and the sender that returns emptied buffers for reuse. Note
@@ -495,10 +495,7 @@ impl Uplink {
                 }
                 match self.enc.encode_float(&self.pcm, &mut self.out) {
                     Ok(len) => {
-                        let pts = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as u64)
-                            .unwrap_or(0);
+                        let pts = punktfunk_core::quic::wall_clock_ns();
                         let _ = client.send_mic(self.seq, pts, self.out[..len].to_vec());
                         self.seq = self.seq.wrapping_add(1);
                         self.sent += 1;

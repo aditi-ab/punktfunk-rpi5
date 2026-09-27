@@ -736,10 +736,7 @@ fn mic_thread(
             let pcm: Vec<f32> = ring.drain(..MIC_FRAME).collect();
             match encoder.encode_float(&pcm, &mut out) {
                 Ok(len) => {
-                    let pts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0);
+                    let pts = punktfunk_core::quic::wall_clock_ns();
                     let _ = connector.send_mic(seq, pts, out[..len].to_vec());
                     seq = seq.wrapping_add(1);
                 }

@@ -736,14 +736,14 @@ fn with_policy_config<R>(
     device_id: &str,
     f: impl FnOnce(*mut c_void, &IPolicyConfigVtbl, windows::core::PCWSTR) -> R,
 ) -> Result<R> {
-    use windows::core::{IUnknown, Interface, GUID, PCWSTR};
+    use windows::core::{IUnknown, Interface, GUID, HSTRING, PCWSTR};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
     // PolicyConfigClient coclass + IPolicyConfig (Win7+) IID.
     const CLSID_POLICY_CONFIG: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
     const IID_IPOLICY_CONFIG: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
 
-    let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide = HSTRING::from(device_id);
 
     // SAFETY: CoCreateInstance returns an owned IUnknown, Released by its Drop. The QI'd pointer
     // is checked non-null; its first word is the vtable whose layout the asserts above pin. It is

@@ -23,6 +23,17 @@ pub use input_desktop::{refresh_secure_desktop, secure_desktop};
 pub mod monitor_devnode;
 /// Display identity, inventory and the snapshot cache — pure std, unit-tested on every platform.
 pub mod snapshot;
+
+/// A `REG_MULTI_SZ` value in UTF-16 units: each string NUL-terminated, the list NUL-terminated
+/// again. Pure std, so it is tested on every platform.
+pub fn multi_sz(items: &[&str]) -> Vec<u16> {
+    let mut units: Vec<u16> = items
+        .iter()
+        .flat_map(|s| s.encode_utf16().chain([0]))
+        .collect();
+    units.push(0);
+    units
+}
 /// Cross-crate "topology churn in flight" latch. Pure std — no Windows surface, so compiled and
 /// unit-tested on every platform.
 pub mod topology_churn;
@@ -87,4 +98,14 @@ pub fn console_session_mismatch() -> Option<(u32, u32)> {
     // SAFETY: takes no arguments and returns the console session id by value.
     let console = unsafe { WTSGetActiveConsoleSessionId() };
     (console != 0xFFFF_FFFF && own != console).then_some((own, console))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn multi_sz_terminates_each_string_and_the_list() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let want = [w("a"), vec![0], w("bc"), vec![0, 0]].concat();
+        assert_eq!(super::multi_sz(&["a", "bc"]), want);
+    }
 }

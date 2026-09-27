@@ -483,7 +483,7 @@ impl Reassembler {
                 // This packet is the frame's first: timed before the frame's own
                 // pacing spread, and before FEC knows whether it will ever complete.
                 if !is_probe && shard_delay_ns.len() < SHARD_DELAY_SAMPLES {
-                    shard_delay_ns.push(crate::stats::now_realtime_ns() as i64 - hdr.pts_ns as i64);
+                    shard_delay_ns.push(crate::quic::wall_clock_ns() as i64 - hdr.pts_ns as i64);
                 }
                 e.insert(FrameBuf {
                     shard_bytes,
