@@ -130,7 +130,7 @@ pub(super) fn install_idle_dropin() -> Result<()> {
     std::fs::write(&path, idle_dropin_body(sleep_binary()))
         .with_context(|| format!("write {}", path.display()))?;
     systemctl_user(&["daemon-reload"]);
-    *IDLE_DROPIN_ARMED.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    takeover().idle_dropin_armed = true;
     Ok(())
 }
 
@@ -140,10 +140,10 @@ fn idle_dropin_body(sleep_bin: &str) -> String {
     format!("[Service]\nExecStart=\nExecStart={sleep_bin} infinity\n")
 }
 
-/// Not gated on [`IDLE_DROPIN_ARMED`]: a drop-in that outlived a dead host still has to be swept.
+/// Not gated on the armed flag: a drop-in that outlived a dead host still has to be swept.
 pub(super) fn remove_idle_dropin() -> bool {
     let removed = std::fs::remove_file(idle_dropin_path()).is_ok();
-    *IDLE_DROPIN_ARMED.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    takeover().idle_dropin_armed = false;
     if removed {
         systemctl_user(&["daemon-reload"]);
     }
@@ -197,12 +197,10 @@ pub(super) fn remove_session_plus_dropin() -> bool {
     removed
 }
 
-/// Remove + clear [`SESSION_DROPIN_ARMED`] + `daemon-reload`, so the flag and the template cannot disagree.
+/// Remove, clear the armed flag, `daemon-reload`: the flag and the template cannot disagree.
 pub(super) fn disarm_session_plus_dropin() {
     let removed = remove_session_plus_dropin();
-    *SESSION_DROPIN_ARMED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = false;
+    takeover().session_dropin_armed = false;
     if removed {
         systemctl_user(&["daemon-reload"]);
     }

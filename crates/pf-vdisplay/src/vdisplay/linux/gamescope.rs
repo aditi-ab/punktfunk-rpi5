@@ -4,7 +4,7 @@
 //! Three routes, resolved per session by [`crate::resolve_gamescope_route`] and stored on
 //! [`GamescopeDisplay`]. Never reread from the process env: a second connect would retarget
 //! this instance between the decision and `create`. Dropping a spawned [`VirtualOutput`] kills
-//! the process. Managed sessions live at host lifetime ([`MANAGED_SESSION`]); restore is this
+//! the process. Managed sessions live at host lifetime ([`Takeover`]); restore is this
 //! module's job.
 //!
 //! Needs PipeWire + libei in gamescope, and a usable Vulkan device. Input: `inject/libei.rs`.
@@ -99,12 +99,21 @@ struct SessionState {
     hdr: bool,
 }
 
+impl SessionState {
+    fn matches(&self, mode: Mode, hdr: bool) -> bool {
+        self.width == mode.width
+            && self.height == mode.height
+            && self.refresh_hz == mode.refresh_hz
+            && self.hdr == hdr
+    }
+}
+
 /// Serialises the managed-session launch in [`create_managed_session`] — and nothing else.
 ///
-/// LOCK ORDER: `MANAGED_LAUNCH` → [`MANAGED_SESSION`], never the reverse. No restore path may
-/// take this lock: `do_restore_tv_session` needs [`MANAGED_SESSION`] and must not sit behind a
-/// ~90 s launch. Two Managed connects in one launch window both relaunch otherwise, and the
-/// second `stop_session(SESSION_UNIT)` kills the unit the first is still polling.
+/// LOCK ORDER: `MANAGED_LAUNCH` → [`takeover()`], never the reverse. No restore path may take this
+/// lock: `do_restore_tv_session` needs [`takeover()`] and must not sit behind a ~90 s launch. Two
+/// Managed connects in one launch window both relaunch otherwise, and the second
+/// `stop_session(SESSION_UNIT)` kills the unit the first is still polling.
 static MANAGED_LAUNCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const SESSION_UNIT: &str = "punktfunk-gamescope";
@@ -371,8 +380,8 @@ impl VirtualDisplay for GamescopeDisplay {
     }
 }
 
-/// Host-managed session at the client's mode, state in [`MANAGED_SESSION`]. Reuse if mode and node
-/// are live; otherwise relaunch — gamescope cannot change output mode live.
+/// Host-managed session at the client's mode, state in [`Takeover::managed`]. Reuse if mode and
+/// node are live; otherwise relaunch — gamescope cannot change output mode live.
 fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<VirtualOutput> {
     // Not a bare `PENDING_RESTORE` clear: cancel also waits out a restore that already popped
     // (`keep_alive=off` is 0 s debounce).
@@ -380,11 +389,11 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
     if steamos_session_present() {
         return create_managed_session_steamos(mode, hdr);
     }
-    // Gated on the idled takeover, not [`STOPPED_DM`]: live takeovers leave the DM up, and that
-    // static is what armed this. Skip and capture loss relaunches game mode over the booting desktop.
+    // Gated on the idled takeover, not `stopped_dm`: live takeovers leave the DM up, and that field
+    // is what armed this. Skip and capture loss relaunches game mode over the booting desktop.
     if takeover_idled() && session_select_requested() {
         // Consume an adopted DM stop exactly once; a live takeover has none.
-        let adopted_dm = std::mem::take(&mut *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()));
+        let adopted_dm = takeover().stopped_dm.take();
         honor_session_select_switch(adopted_dm);
         return Err(anyhow!(
             "the user switched the box to the desktop session — the box's own game mode is handed \
@@ -393,13 +402,12 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
     }
     // While the selected desktop boots, a managed relaunch wins the race (gamescope+Steam start
     // faster than KWin). A live autologin unit supersedes: the user already switched back.
-    let honor_pending = SWITCH_HONORED_AT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let honor_pending = takeover()
+        .switch_honored_at
         .is_some_and(|t| t.elapsed() < SWITCH_HONOR_GRACE);
     if honor_pending {
         if running_autologin_gamescope_unit().is_some() {
-            *SWITCH_HONORED_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            takeover().switch_honored_at = None;
         } else {
             return Err(anyhow!(
                 "waiting for the desktop session the user selected — refusing to relaunch game \
@@ -409,17 +417,8 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
     }
     // Never stop/relaunch here: post-capture-loss session detection can be stale.
     if crate::rebuild_probe_active() {
-        // Don't hold MANAGED_SESSION across `pw-dump` / file write — that pins the restore worker.
-        let same_mode = {
-            let guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
-            guard.as_ref().is_some_and(|s| {
-                s.width == mode.width
-                    && s.height == mode.height
-                    && s.refresh_hz == mode.refresh_hz
-                    && s.hdr == hdr
-            })
-        };
-        if same_mode {
+        // Not held across `pw-dump` / file write — that pins the restore worker.
+        if managed_session_matches(mode, hdr) {
             if let Some(node_id) = find_gamescope_node() {
                 point_injector_at_eis();
                 tracing::info!(
@@ -461,24 +460,19 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
     }
     // Desktop Steam also holds the instance; SESSION_UNIT's own Steam is exempt via cgroup.
     free_desktop_steam()?;
-    // Decide under the lock, act outside it. Holding MANAGED_SESSION across `launch_session`
+    // Decide under the lock, act outside it. Holding the takeover lock across `launch_session`
     // (~90 s) pins shutdown restore behind `native.rs`'s 20 s grace. [`MANAGED_LAUNCH`] is the
     // exclusion: held from before the decision so a second connect re-tests after the first
     // records, and touched by no restore path.
     let _launching = MANAGED_LAUNCH.lock().unwrap_or_else(|e| e.into_inner());
     let same_mode = {
-        let mut guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
-        let same = guard.as_ref().is_some_and(|s| {
-            s.width == mode.width
-                && s.height == mode.height
-                && s.refresh_hz == mode.refresh_hz
-                && s.hdr == hdr
-        });
+        let mut t = takeover();
+        let same = t.managed.as_ref().is_some_and(|s| s.matches(mode, hdr));
         // Mode change: drop the tracked session so a concurrent restore does not read it as live.
         // During launch a session that stole nothing is invisible to `takeover_live`; holding the
         // guard instead pins shutdown restore. Failure arms a restore; success re-records.
         if !same {
-            *guard = None;
+            t.managed = None;
         }
         same
     };
@@ -495,7 +489,7 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
             return Ok(managed_output(node_id, mode));
         }
         tracing::warn!("gamescope session: tracked session has no live node — relaunching");
-        *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        takeover().managed = None;
     }
     // Holding nothing: `launch_session` stops the old unit first, so discovery sees one node.
     let node_id = match launch_session(client, SESSION_UNIT, mode, hdr) {
@@ -509,7 +503,7 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
     // Only a write from inside this session should read as a switch, not the one that led here.
     record_session_select_baseline();
     point_injector_at_eis();
-    *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(SessionState {
+    takeover().managed = Some(SessionState {
         width: mode.width,
         height: mode.height,
         refresh_hz: mode.refresh_hz,
@@ -530,16 +524,10 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
 
 /// Whether the tracked managed session runs at `mode` and `hdr`, so a `join` session can share it.
 fn managed_session_matches(mode: Mode, hdr: bool) -> bool {
-    MANAGED_SESSION
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    takeover()
+        .managed
         .as_ref()
-        .is_some_and(|s| {
-            s.width == mode.width
-                && s.height == mode.height
-                && s.refresh_hz == mode.refresh_hz
-                && s.hdr == hdr
-        })
+        .is_some_and(|s| s.matches(mode, hdr))
 }
 
 /// Box-level session: restore is this module's (`schedule_restore_tv_session`), so
@@ -600,14 +588,10 @@ fn systemctl_user(args: &[&str]) {
 /// SteamOS: PATH-shim + drop-in, restart `gamescope-session.target`. Restart kills any prior
 /// gamescope, so discovery sees one node. Same-mode reconnect reuses.
 fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput> {
-    let mut guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
-    let same_mode = guard.as_ref().is_some_and(|s| {
-        s.width == mode.width
-            && s.height == mode.height
-            && s.refresh_hz == mode.refresh_hz
-            && s.hdr == hdr
-    });
-    if same_mode {
+    // Held through the restart, so a second connect waits for this launch instead of restarting
+    // the target again.
+    let mut t = takeover();
+    if t.managed.as_ref().is_some_and(|s| s.matches(mode, hdr)) {
         if let Some(node_id) = find_gamescope_node() {
             point_injector_at_eis();
             tracing::info!(
@@ -619,7 +603,7 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
             );
             return Ok(managed_output(node_id, mode));
         }
-        *guard = None; // tracked session lost its node — fall through to a clean restart
+        t.managed = None; // tracked session lost its node — fall through to a clean restart
     }
     // Reuse may attach; restarting the target would steal the seat from a session the user switched to.
     if crate::rebuild_probe_active() {
@@ -633,10 +617,8 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
     write_steamos_dropin(&shim_dir, mode, hdr)?;
     systemctl_user(&["daemon-reload"]);
     systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
-    // LOCK ORDER: restore takes STEAMOS_TOOK_OVER then MANAGED_SESSION. Reverse here is AB/BA
-    // with the restore worker. Nothing below reads the tracked session.
-    drop(guard);
-    *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    t.steamos = true;
+    drop(t); // `persist_takeover` takes the same lock
     persist_takeover();
     // Takeover already happened; a bare `?` would leave the box headless with PENDING_RESTORE unset.
     let node_id = match poll_managed_node(Duration::from_secs(30)) {
@@ -656,7 +638,7 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
         return Err(e);
     }
     point_injector_at_eis();
-    *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(SessionState {
+    takeover().managed = Some(SessionState {
         width: mode.width,
         height: mode.height,
         refresh_hz: mode.refresh_hz,
@@ -764,24 +746,20 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
         "gamescope: relaunching the box game-mode session at the client's resolution"
     );
     // Manager keeps these for the rest of the login; restore owes [`unset_forced_session_screen_env`].
-    *FORCED_SESSION_SCREEN_ENV
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = true;
+    takeover().forced_screen_env = true;
     systemctl_user(&[
         "set-environment",
         &format!("SCREEN_WIDTH={}", mode.width),
         &format!("SCREEN_HEIGHT={}", mode.height),
         &format!("CUSTOM_REFRESH_RATES={}", mode.refresh_hz.max(1)),
     ]);
-    persist_takeover(); // no static held; these SCREEN_* outlive the process
+    persist_takeover(); // takeover lock not held; these SCREEN_* outlive the process
     let mut bound = match write_gamescope_bin_wrapper()
         .and_then(|w| write_session_plus_dropin(&w, mode, hdr, WsiPlan::resolve()))
     {
         Ok(true) => {
             // Before the restart: skip this flag and `takeover_live()` is false, so the drop-in outlives us.
-            *SESSION_DROPIN_ARMED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = true;
+            takeover().session_dropin_armed = true;
             tracing::info!(
                 bin = %gamescope_bin(),
                 %unit,
@@ -793,9 +771,7 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
         }
         Ok(false) => {
             // No bind to arm also removes; the flag must follow or restore owes a gone drop-in.
-            *SESSION_DROPIN_ARMED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = false;
+            takeover().session_dropin_armed = false;
             false
         }
         Err(e) => {

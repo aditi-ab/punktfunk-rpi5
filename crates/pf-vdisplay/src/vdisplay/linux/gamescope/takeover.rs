@@ -5,57 +5,105 @@
 use super::*;
 use crate::routing::{TakeoverInapplicable, TakeoverVerdict};
 
-/// Host-lifetime managed session. `GamescopeDisplay` is recreated per client; storing the session
-/// there would cold-start Steam on every reconnect. Same-mode reuse; different mode relaunches.
-pub(super) static MANAGED_SESSION: std::sync::Mutex<Option<SessionState>> =
-    std::sync::Mutex::new(None);
+/// What this host took over on the box. One lock for all of it, so a crash-restore record or a
+/// liveness check never mixes two moments. `std::sync::Mutex` is not reentrant: never call
+/// anything that takes [`takeover()`] while holding it.
+pub(super) struct Takeover {
+    /// Host-lifetime managed session. `GamescopeDisplay` is recreated per client; storing the
+    /// session there would cold-start Steam on every reconnect. Same-mode reuse; different mode
+    /// relaunches.
+    pub(super) managed: Option<SessionState>,
+    /// Autologin `gamescope-session-plus@*` units stopped so Steam's single instance is free.
+    /// [`schedule_restore_tv_session`] restarts them on disconnect.
+    stopped_autologin: Vec<String>,
+    /// Display-manager unit an *adopted* pre-idle takeover stopped. Restore is `reset-failed` +
+    /// `restart` of the DM: a `--user start` of the gamescope unit has no seat without a DM login,
+    /// so gamescope never gets DRM master.
+    ///
+    /// Adoption-only: live takeovers idle the autologin ([`install_idle_dropin`]) and leave the
+    /// DM up. [`takeover_idled`] is the live marker; reading this as that marker skips the switch
+    /// gate.
+    pub(super) stopped_dm: Option<String>,
+    /// Mask left to lift on `stopped_autologin`. Live takeovers idle instead of masking: a masked
+    /// unit fails, and a failing unit is the DM relogin-loop engine. True only for a takeover
+    /// adopted from a host that still masked. Unmasking a unit we never masked is a no-op; missing
+    /// one that is masked bars Game Mode until reboot.
+    autologin_masked: bool,
+    /// Sentinel mtime at takeover. ChimeraOS-layout `os-session-select` writes
+    /// `~/.config/steamos-session-select` in its USER pass; that mtime is the only durable trace of
+    /// an in-stream "Switch to Desktop". Bazzite/SteamOS write none; [`is_steam_htpc_platform`]
+    /// follows the switch instead.
+    ///
+    /// Two `Option`s, because the meanings invert:
+    /// * outer `None` — never baselined. A missing baseline treats an ancient write as a live
+    ///   request.
+    /// * `Some(None)` — no sentinel yet; a later file *is* a request.
+    /// * `Some(Some(t))` — anything newer than `t` is a request.
+    select_baseline: Option<Option<std::time::SystemTime>>,
+    /// When [`honor_session_select_switch`] last ran. While recent, refuse a managed relaunch:
+    /// gamescope+Steam come up faster than KWin, and a delivering pipeline ends re-detection.
+    pub(super) switch_honored_at: Option<Instant>,
+    /// This host has an idle drop-in outstanding. Crash sweep: [`restore_takeover_on_startup`].
+    pub(super) idle_dropin_armed: bool,
+    /// SteamOS analogue of `stopped_autologin`: drop-in is in; restore must remove it and restart
+    /// the physical session.
+    pub(super) steamos: bool,
+    /// Bind drop-in is on the box's own `gamescope-session-plus@` template. That path steals
+    /// nothing, so the other fields stay empty. Skip this flag and the drop-in outlives the stream
+    /// and Game Mode runs our patched gamescope.
+    pub(super) session_dropin_armed: bool,
+    /// This host pushed `SCREEN_WIDTH`/`SCREEN_HEIGHT`/`CUSTOM_REFRESH_RATES` into the user
+    /// manager. Those survive every unit restart for the rest of the login; restore may
+    /// `unset-environment` only values it set (an operator's own `set-environment` is theirs).
+    pub(super) forced_screen_env: bool,
+}
 
-/// Autologin `gamescope-session-plus@*` units stopped so Steam's single instance is free.
-/// [`schedule_restore_tv_session`] restarts them on disconnect.
-static STOPPED_AUTOLOGIN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static TAKEOVER: std::sync::Mutex<Takeover> = std::sync::Mutex::new(Takeover::EMPTY);
 
-/// Display-manager unit an *adopted* pre-idle takeover stopped. Restore is `reset-failed` +
-/// `restart` of the DM: a `--user start` of the gamescope unit has no seat without a DM login,
-/// so gamescope never gets DRM master.
-///
-/// Adoption-only: live takeovers idle the autologin ([`install_idle_dropin`]) and leave the DM
-/// up. [`takeover_idled`] is the live marker; reading this as that marker skips the switch gate.
-pub(super) static STOPPED_DM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub(super) fn takeover() -> std::sync::MutexGuard<'static, Takeover> {
+    TAKEOVER.lock().unwrap_or_else(|e| e.into_inner())
+}
 
-/// Mask left to lift on [`STOPPED_AUTOLOGIN`] units. Live takeovers idle instead of masking: a
-/// masked unit fails, and a failing unit is the DM relogin-loop engine. True only for a takeover
-/// adopted from a host that still masked. Unmasking a unit we never masked is a no-op; missing
-/// one that is masked bars Game Mode until reboot.
-static AUTOLOGIN_MASKED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+impl Takeover {
+    const EMPTY: Self = Self {
+        managed: None,
+        stopped_autologin: Vec::new(),
+        stopped_dm: None,
+        autologin_masked: false,
+        select_baseline: None,
+        switch_honored_at: None,
+        idle_dropin_armed: false,
+        steamos: false,
+        session_dropin_armed: false,
+        forced_screen_env: false,
+    };
 
-/// Sentinel mtime at takeover. ChimeraOS-layout `os-session-select` writes
-/// `~/.config/steamos-session-select` in its USER pass; that mtime is the only durable trace of
-/// an in-stream "Switch to Desktop". Bazzite/SteamOS write none; [`is_steam_htpc_platform`]
-/// follows the switch instead.
-///
-/// Two `Option`s, because the meanings invert:
-/// * outer `None` — never baselined. A missing baseline treats an ancient write as a live request.
-/// * `Some(None)` — no sentinel yet; a later file *is* a request.
-/// * `Some(Some(t))` — anything newer than `t` is a request.
-static SESSION_SELECT_BASELINE: std::sync::Mutex<Option<Option<std::time::SystemTime>>> =
-    std::sync::Mutex::new(None);
+    fn record(&self) -> TakeoverState {
+        TakeoverState {
+            stopped_autologin: self.stopped_autologin.clone(),
+            steamos: self.steamos,
+            stopped_dm: self.stopped_dm.clone(),
+            managed_session: self.managed.is_some(),
+            forced_screen_env: self.forced_screen_env,
+        }
+    }
 
-/// When [`honor_session_select_switch`] last ran. While recent, refuse a managed relaunch:
-/// gamescope+Steam come up faster than KWin, and a delivering pipeline ends re-detection.
-pub(super) static SWITCH_HONORED_AT: std::sync::Mutex<Option<Instant>> =
-    std::sync::Mutex::new(None);
+    /// Anything left to hand back. Wider than the record by the bind drop-in: attach re-mode
+    /// steals nothing, but it did rewrite the template.
+    fn live(&self) -> bool {
+        self.session_dropin_armed || takeover_state_is_live(&self.record())
+    }
+}
 
 /// After an in-stream desktop switch, refuse managed relaunch until the DM session can come up.
 pub(super) const SWITCH_HONOR_GRACE: Duration = Duration::from_secs(120);
-
-/// This host has an idle drop-in outstanding. Crash sweep: [`restore_takeover_on_startup`].
-pub(super) static IDLE_DROPIN_ARMED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// Managed-route [`crate::panel_dpms`] hold for `Topology::Exclusive`.
 ///
 /// Managed reports `SessionManaged`, so `registry::acquire` never picks up `take_topology_restore`.
 /// Release lives in [`do_restore_tv_session`]. A bool, not a count: the session outlives connects,
-/// and a per-connect acquire would pin the panel dark for the host's life.
+/// and a per-connect acquire would pin the panel dark for the host's life. Not in [`Takeover`]: the
+/// panel call runs under this lock so a release never overtakes an acquire.
 static MANAGED_DARKEN_HELD: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// 0→1 edge: take a hold? Split so the balance is testable without a compositor.
@@ -113,21 +161,7 @@ static RESTORE_FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Default restore delay: long enough that a controller hiccup reuses the warm session.
 const RESTORE_DEBOUNCE: Duration = Duration::from_secs(5);
 
-/// SteamOS analogue of [`STOPPED_AUTOLOGIN`]: drop-in is in; restore must remove it and restart
-/// the physical session.
-pub(super) static STEAMOS_TOOK_OVER: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
-
-/// Bind drop-in is on the box's own `gamescope-session-plus@` template. That path steals nothing,
-/// so the other takeover statics stay empty. Skip this flag and the drop-in outlives the stream
-/// and Game Mode runs our patched gamescope.
-pub(super) static SESSION_DROPIN_ARMED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
-
-/// This host pushed `SCREEN_WIDTH`/`SCREEN_HEIGHT`/`CUSTOM_REFRESH_RATES` into the user manager.
-/// Those survive every unit restart for the rest of the login; restore may `unset-environment`
-/// only values it set (an operator's own `set-environment` is theirs).
-pub(super) static FORCED_SESSION_SCREEN_ENV: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
-
-/// Crash-restore snapshot of the takeover statics (`design/gamemode-and-dedicated-sessions.md`).
+/// Crash-restore record of [`Takeover`] (`design/gamemode-and-dedicated-sessions.md`).
 /// Process memory dies with the host; this file lets [`restore_takeover_on_startup`] heal the box.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct TakeoverState {
@@ -153,24 +187,9 @@ fn takeover_state_path() -> std::path::PathBuf {
     std::path::Path::new(&base).join("punktfunk-session-takeover.json")
 }
 
-/// Best-effort crash-restore snapshot. Never call while holding any static it samples —
-/// [`MANAGED_SESSION`] included. `std::sync::Mutex` is not reentrant.
+/// Best-effort crash-restore snapshot. Never call while holding [`takeover()`].
 pub(super) fn persist_takeover() {
-    let state = TakeoverState {
-        stopped_autologin: STOPPED_AUTOLOGIN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone(),
-        steamos: *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()),
-        stopped_dm: STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-        managed_session: MANAGED_SESSION
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some(),
-        forced_screen_env: *FORCED_SESSION_SCREEN_ENV
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()),
-    };
+    let state = takeover().record();
     if !takeover_state_is_live(&state) {
         clear_takeover();
         return;
@@ -184,10 +203,10 @@ fn clear_takeover() {
     let _ = std::fs::remove_file(takeover_state_path());
 }
 
-/// File-side twin of [`takeover_live`]. Narrower by [`SESSION_DROPIN_ARMED`]: that drop-in is
-/// swept unconditionally at startup, so persisting it would leave a restore with nothing to do.
-/// [`FORCED_SESSION_SCREEN_ENV`] is the opposite — it lives in the user manager, nothing sweeps
-/// it, and a crash must still know to unset it.
+/// Whether a crash-restore record still owes the box something. No bind drop-in here: startup
+/// sweeps it unconditionally, so persisting it would leave a restore with nothing to do. Forced
+/// `SCREEN_*` is the opposite — it lives in the user manager, nothing sweeps it, and a crash must
+/// still know to unset it.
 fn takeover_state_is_live(state: &TakeoverState) -> bool {
     !state.stopped_autologin.is_empty()
         || state.steamos
@@ -267,27 +286,27 @@ pub fn restore_takeover_on_startup() {
     );
     // Mask presence is not persisted. Unmasking a unit we never masked is a no-op; skipping one
     // that is masked bars Game Mode until reboot.
-    *AUTOLOGIN_MASKED.lock().unwrap_or_else(|e| e.into_inner()) =
-        !state.stopped_autologin.is_empty();
-    *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = state.stopped_autologin;
-    *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()) = state.steamos;
-    *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = state.stopped_dm;
-    // Drop-in already swept above. SCREEN_* live in the user manager; only this flag authorises
-    // [`unset_forced_session_screen_env`]. Adopting `false` is correct: the crashed host never
-    // forced them, and unsetting an operator's values would be a bug.
-    *FORCED_SESSION_SCREEN_ENV
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = state.forced_screen_env;
-    if state.managed_session {
-        // Adopted session is something to STOP, never reuse: the launch mode is not persisted.
-        // 0x0/0 Hz can never match `create_managed_session`, so every route relaunches, while
-        // `takeover_live` still sees a session that owes a `stop`.
-        *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(SessionState {
-            width: 0,
-            height: 0,
-            refresh_hz: 0,
-            hdr: false,
-        });
+    {
+        let mut t = takeover();
+        t.autologin_masked = !state.stopped_autologin.is_empty();
+        t.stopped_autologin = state.stopped_autologin;
+        t.steamos = state.steamos;
+        t.stopped_dm = state.stopped_dm;
+        // Drop-in already swept above. SCREEN_* live in the user manager; only this flag
+        // authorises [`unset_forced_session_screen_env`]. Adopting `false` is correct: the crashed
+        // host never forced them, and unsetting an operator's values would be a bug.
+        t.forced_screen_env = state.forced_screen_env;
+        if state.managed_session {
+            // Adopted session is something to STOP, never reuse: the launch mode is not persisted.
+            // 0x0/0 Hz can never match `create_managed_session`, so every route relaunches, while
+            // `takeover_live` still sees a session that owes a `stop`.
+            t.managed = Some(SessionState {
+                width: 0,
+                height: 0,
+                refresh_hz: 0,
+                hdr: false,
+            });
+        }
     }
     // Launch-time baseline is gone; a long-existing sentinel must not read as a live switch.
     record_session_select_baseline();
@@ -299,19 +318,14 @@ pub fn restore_takeover_on_startup() {
 /// Live managed-takeover marker (arms the in-stream switch gate). Process memory, not disk: a
 /// drop-in we did not write belongs to a dead host.
 pub(super) fn takeover_idled() -> bool {
-    *IDLE_DROPIN_ARMED.lock().unwrap_or_else(|e| e.into_inner())
+    takeover().idle_dropin_armed
 }
 
 /// No-op unless we set them: `unset-environment` is indiscriminate.
 fn unset_forced_session_screen_env() {
-    let mut forced = FORCED_SESSION_SCREEN_ENV
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if !*forced {
+    if !std::mem::take(&mut takeover().forced_screen_env) {
         return;
     }
-    *forced = false;
-    drop(forced);
     systemctl_user(&[
         "unset-environment",
         "SCREEN_WIDTH",
@@ -347,20 +361,19 @@ fn unmask_unit(unit: &str) {
     );
 }
 
-/// Idempotent. Does not consume [`STOPPED_AUTOLOGIN`]: mask lifetime is shorter than the takeover;
-/// restore still owes that list a start.
+/// Idempotent. Keeps the stopped units: mask lifetime is shorter than the takeover, and restore
+/// still owes them a start. Holds [`takeover()`] across the unmask, so a restore never restarts a
+/// unit that is still masked.
 fn lift_autologin_mask() {
-    let mut masked = AUTOLOGIN_MASKED.lock().unwrap_or_else(|e| e.into_inner());
-    if !*masked {
+    let mut t = takeover();
+    if !std::mem::take(&mut t.autologin_masked) {
         return;
     }
-    *masked = false;
-    let units = STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner());
-    for unit in units.iter() {
+    for unit in &t.stopped_autologin {
         unmask_unit(unit);
     }
     tracing::info!(
-        units = ?*units,
+        units = ?t.stopped_autologin,
         "gamescope: lifted the takeover's runtime mask — the box can enter its own game mode again"
     );
 }
@@ -384,8 +397,8 @@ pub fn release_autologin_mask(switched_to: crate::ActiveKind) {
         return;
     }
     lift_autologin_mask();
-    // Not [`clear_takeover`]: restore still owes [`STOPPED_AUTOLOGIN`] a start. Left on, "Return
-    // to Gaming Mode" starts a unit that only sleeps.
+    // Not [`clear_takeover`]: restore still owes the stopped units a start. Left on, "Return to
+    // Gaming Mode" starts a unit that only sleeps.
     if remove_idle_dropin() {
         tracing::info!(
             switched_to = ?switched_to,
@@ -719,15 +732,11 @@ fn session_select_mtime() -> Option<std::time::SystemTime> {
 /// At takeover and again at launch: the switch *into* game mode writes the sentinel on the way in.
 /// Baselining only at launch treats a months-old file as a live request after a failed launch.
 pub(super) fn record_session_select_baseline() {
-    *SESSION_SELECT_BASELINE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(session_select_mtime());
+    takeover().select_baseline = Some(session_select_mtime());
 }
 
 pub(super) fn session_select_requested() -> bool {
-    let baseline = *SESSION_SELECT_BASELINE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let baseline = takeover().select_baseline;
     sentinel_advanced(baseline, session_select_mtime())
 }
 
@@ -753,9 +762,9 @@ pub(super) fn honor_session_select_switch(adopted_dm: Option<String>) {
     );
     // Mask first, while the unit list still exists — this path discards that list.
     lift_autologin_mask();
-    std::mem::take(&mut *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()));
+    takeover().stopped_autologin.clear();
     clear_takeover();
-    *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    takeover().managed = None;
     stop_session(SESSION_UNIT); // switch already killed Steam — clear the unit
                                 // A switch is not a disconnect; skip this and "Return to Gaming Mode" starts a sleep.
     if remove_idle_dropin() {
@@ -769,7 +778,7 @@ pub(super) fn honor_session_select_switch(adopted_dm: Option<String>) {
         replay_switch_under_restored_dm(&dm);
     }
     record_session_select_baseline();
-    *SWITCH_HONORED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    takeover().switch_honored_at = Some(Instant::now());
 }
 
 /// Adopted pre-idle takeover only: start the stopped DM, run `os-session-select desktop`, stop
@@ -890,7 +899,7 @@ pub(super) fn stop_autologin_sessions() -> Result<()> {
     if plan.skip {
         return Ok(());
     }
-    if *IDLE_DROPIN_ARMED.lock().unwrap_or_else(|e| e.into_inner()) {
+    if takeover().idle_dropin_armed {
         return Ok(());
     }
     if plan.dm_relogins {
@@ -916,7 +925,7 @@ pub(super) fn stop_autologin_sessions() -> Result<()> {
         );
         stopped.push(unit);
     }
-    *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = stopped;
+    takeover().stopped_autologin = stopped;
     persist_takeover();
     watch_for_relogin_storm(logins_before);
     Ok(())
@@ -1035,35 +1044,9 @@ pub fn schedule_restore_tv_session() {
     }
 }
 
-/// True while any takeover static is live. One lock at a time: a `||` chain of `.lock()`
-/// temporaries lives to the end of the statement.
+/// True while anything taken over is still ours to hand back.
 fn takeover_live() -> bool {
-    let autologin = !STOPPED_AUTOLOGIN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty();
-    let steamos = *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner());
-    let dm = STOPPED_DM
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some();
-    // Attach re-mode steals nothing, but it did rewrite the template and pin SCREEN_*.
-    let dropin = *SESSION_DROPIN_ARMED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let screen_env = *FORCED_SESSION_SCREEN_ENV
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    autologin
-        || steamos
-        || dm
-        || dropin
-        || screen_env
-        // Managed session beside a live desktop still owns SESSION_UNIT; restore must stop it.
-        || MANAGED_SESSION
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+    takeover().live()
 }
 
 /// Synchronous: the host is exiting and a live takeover must not outlive it. Ignores keep-alive
@@ -1251,10 +1234,11 @@ fn do_restore_tv_session(verify: bool) {
     // Only release for managed Exclusive: SessionManaged never rides `take_topology_restore`.
     // Above every early return. Idempotent.
     managed_darken_release();
-    // SteamOS restore: remove drop-in + restart the target, unless a desktop is already up.
+    // SteamOS restore: remove drop-in + restart the target, unless a desktop is already up. The
+    // takeover lock spans it, so a SteamOS launch waits for the restart instead of racing it.
     {
-        let mut took = STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner());
-        if *took {
+        let mut t = takeover();
+        if t.steamos {
             // No panel: restarting the target crash-loops gamescope. Keep headless. Check at
             // restore time so plugging a panel in later restores.
             if !physical_display_connected() {
@@ -1264,8 +1248,8 @@ fn do_restore_tv_session(verify: bool) {
                 );
                 return;
             }
-            *took = false;
-            *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            t.steamos = false;
+            t.managed = None;
             remove_steamos_dropin();
             systemctl_user(&["daemon-reload"]);
             use crate::ActiveKind;
@@ -1311,14 +1295,15 @@ fn do_restore_tv_session(verify: bool) {
     }
     // Before taking the list (it reads that list) and before any early return.
     lift_autologin_mask();
-    let units = std::mem::take(&mut *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()));
-    let dm = std::mem::take(&mut *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()));
-    // Don't hold MANAGED_SESSION across the work below — launch can hold it ~90 s.
-    let managed_was_running = MANAGED_SESSION
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .is_some();
+    // Drained in one short hold: nothing below runs under the takeover lock.
+    let (units, dm, managed_was_running) = {
+        let mut t = takeover();
+        (
+            std::mem::take(&mut t.stopped_autologin),
+            t.stopped_dm.take(),
+            t.managed.take().is_some(),
+        )
+    };
     if units.is_empty() && dm.is_none() {
         if managed_was_running {
             stop_session(SESSION_UNIT);
@@ -1491,6 +1476,30 @@ mod tests {
             stopped_dm: Some("sddm.service".into()),
             ..Default::default()
         }));
+    }
+
+    /// Live is the record's answer plus the bind drop-in, which startup sweeps and so is never
+    /// persisted.
+    #[test]
+    fn only_the_bind_dropin_is_live_without_being_persisted() {
+        assert!(!Takeover::EMPTY.live());
+        let dropin = Takeover {
+            session_dropin_armed: true,
+            ..Takeover::EMPTY
+        };
+        assert!(dropin.live());
+        assert!(!takeover_state_is_live(&dropin.record()));
+        let managed = Takeover {
+            managed: Some(SessionState {
+                width: 0,
+                height: 0,
+                refresh_hz: 0,
+                hdr: false,
+            }),
+            ..Takeover::EMPTY
+        };
+        assert!(managed.live());
+        assert!(managed.record().managed_session);
     }
 
     /// SCREEN_* live in the user manager; the persisted flag is the only crash-safe record they are ours.
@@ -1833,8 +1842,11 @@ mod tests {
         unmask_unit(PROBE); // a previous failed run must not decide this one
 
         // Lay the takeover's mask exactly as `stop_autologin_sessions` does.
-        *STOPPED_AUTOLOGIN.lock().unwrap() = vec![PROBE.to_string()];
-        *AUTOLOGIN_MASKED.lock().unwrap() = true;
+        {
+            let mut t = takeover();
+            t.stopped_autologin = vec![PROBE.to_string()];
+            t.autologin_masked = true;
+        }
         mask_unit(PROBE);
         assert_eq!(is_enabled(), "masked-runtime");
 
@@ -1870,15 +1882,15 @@ mod tests {
         );
         // The restart list survives the lift: the mask's lifetime is shorter than the takeover's,
         // and the disconnect restore still owes these units a `start`.
-        assert_eq!(STOPPED_AUTOLOGIN.lock().unwrap().as_slice(), [PROBE]);
+        assert_eq!(takeover().stopped_autologin.as_slice(), [PROBE]);
         // Idempotent — the watcher calls it on every switch it confirms.
         release_autologin_mask(crate::ActiveKind::DesktopGnome);
         assert_ne!(is_enabled(), "masked-runtime");
 
         unmask_unit(PROBE);
         remove_idle_dropin();
-        STOPPED_AUTOLOGIN.lock().unwrap().clear();
-        *AUTOLOGIN_MASKED.lock().unwrap() = false;
+        takeover().stopped_autologin.clear();
+        takeover().autologin_masked = false;
     }
 
     #[test]
