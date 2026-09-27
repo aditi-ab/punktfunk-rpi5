@@ -870,7 +870,7 @@ pub(super) fn input_thread(
     let mut rumble_seq = [0u8; MAX_WIRE_PADS];
     let mut rumble_stop_burst = [0u8; MAX_WIRE_PADS];
     let mut last_refresh = std::time::Instant::now();
-    let rumble_envelope_on = std::env::var("PUNKTFUNK_RUMBLE_ENVELOPE").as_deref() != Ok("0");
+    let rumble_envelope_on = pf_host_config::env_on("PUNKTFUNK_RUMBLE_ENVELOPE").unwrap_or(true);
     let rumble_ttl_ms: u16 = std::env::var("PUNKTFUNK_RUMBLE_TTL_MS")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())

@@ -71,14 +71,11 @@ pub fn enabled() -> bool {
     flag_opt("PUNKTFUNK_ZEROCOPY").unwrap_or(true)
 }
 
-/// GPU RGB→NV12 before NVENC. Default ON: NVENC's internal CSC otherwise
-/// runs on the SM the game saturates. `PUNKTFUNK_NV12=0` restores RGB/BGRx.
-/// LINEAR (gamescope/Vulkan-bridge) captures ignore this.
 /// `PUNKTFUNK_NVENC_RAW=0` keeps the NVENC lane on the import path: the capture converts each
 /// frame into a CUDA buffer and the encoder copies it into a slot. Default on: the capture
 /// hands the encoder the held dmabuf and the worker's fused pass writes the slot directly.
 pub fn nvenc_raw_enabled() -> bool {
-    std::env::var("PUNKTFUNK_NVENC_RAW").as_deref() != Ok("0")
+    flag_opt("PUNKTFUNK_NVENC_RAW").unwrap_or(true)
 }
 
 /// Can this box run the fused convert at all? Asks a worker to export the convert timeline,
@@ -107,6 +104,9 @@ pub fn fused_convert_available() -> bool {
     })
 }
 
+/// GPU RGB→NV12 before NVENC. Default ON: NVENC's internal CSC otherwise
+/// runs on the SM the game saturates. `PUNKTFUNK_NV12=0` restores RGB/BGRx.
+/// LINEAR (gamescope/Vulkan-bridge) captures ignore this.
 pub fn nv12_enabled() -> bool {
     flag_opt("PUNKTFUNK_NV12").unwrap_or(true)
 }

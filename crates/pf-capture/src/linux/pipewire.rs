@@ -2003,7 +2003,7 @@ pub fn pipewire_thread(
         pts: crate::pts_provenance::PtsProvenance::new(),
         pts_reported: std::time::Instant::now(),
         rt_minus_mono_ns: realtime_minus_monotonic_ns(),
-        hdr_pts_enabled: std::env::var("PUNKTFUNK_CAPTURE_HDR_PTS").as_deref() != Ok("0"),
+        hdr_pts_enabled: pf_host_config::env_on("PUNKTFUNK_CAPTURE_HDR_PTS").unwrap_or(true),
         fence_wait: FenceWaitStats::default(),
         pool: PoolCensus::default(),
         passthrough_fallbacks: PassthroughFallbacks::default(),

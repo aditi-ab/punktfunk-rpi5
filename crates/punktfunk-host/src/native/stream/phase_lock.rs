@@ -10,7 +10,7 @@ use super::*;
 /// `PUNKTFUNK_PHASE_LOCK=0` disarms the controller. Armed, it still waits for a [`PhaseReport`].
 pub(super) fn phase_lock_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PUNKTFUNK_PHASE_LOCK").as_deref() != Ok("0"))
+    *ON.get_or_init(|| pf_host_config::env_on("PUNKTFUNK_PHASE_LOCK").unwrap_or(true))
 }
 
 /// Control-task → encode-loop bridge: latest-wins [`PhaseReport`], drained ~1 Hz, published as

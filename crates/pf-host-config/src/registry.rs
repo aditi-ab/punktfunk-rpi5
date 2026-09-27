@@ -254,7 +254,7 @@ const WINDOWS: &[&str] = &["windows"];
 const LINUX_WINDOWS: &[&str] = &["linux", "windows"];
 /// Row `pyrowave_bpp`'s default: Themaister's clean point for 4:2:0, 200 Mbps at 1080p60.
 pub const PYROWAVE_BPP: f64 = 1.6;
-const TRI: Kind = Kind::Enum(&["auto", "on", "off"]);
+pub(crate) const TRI: Kind = Kind::Enum(&["auto", "on", "off"]);
 const TRI_SPELLINGS: &[(&str, &str)] = &[
     ("1", "on"),
     ("true", "on"),

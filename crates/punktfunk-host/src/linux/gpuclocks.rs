@@ -90,12 +90,6 @@ fn nvidia_present() -> bool {
     std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/nvidia0").exists()
 }
 
-fn flag_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
 struct NvmlPin {
     nvml: Nvml,
     pinned: Vec<NvmlDevice>,
@@ -177,14 +171,16 @@ fn pin_refcount() -> &'static Mutex<PinRefcount> {
 }
 
 /// Holds the box-wide pin armed. Last drop restores idle downclocking.
-/// No-op when `PUNKTFUNK_PIN_CLOCKS` is unset.
+/// No-op unless `PUNKTFUNK_PIN_CLOCKS` is on; blank or junk stays off.
 pub struct SessionClockPin {
     /// False: opt-in gate off, this handle did not tick the refcount.
     counted: bool,
 }
 
 pub fn session_pin() -> SessionClockPin {
-    if !flag_truthy("PUNKTFUNK_PIN_CLOCKS") {
+    let asked = pf_host_config::knob("PUNKTFUNK_PIN_CLOCKS")
+        .and_then(|v| pf_host_config::registry::parse_bool(&v.trim().to_ascii_lowercase()));
+    if asked != Some(true) {
         return SessionClockPin { counted: false };
     }
     let mut state = pin_refcount().lock().unwrap();
@@ -354,7 +350,7 @@ fn pin_nvidia() -> Option<NvmlPin> {
 /// `~/.nv/nvidia-application-profiles-rc.d/`. Never overwrite: the file is the
 /// operator's once it exists.
 fn ensure_cuda_perf_profile() {
-    if std::env::var("PUNKTFUNK_NV_PROFILE").as_deref() == Ok("0") {
+    if pf_host_config::env_on("PUNKTFUNK_NV_PROFILE") == Some(false) {
         return;
     }
     let Some(home) = std::env::var_os("HOME") else {

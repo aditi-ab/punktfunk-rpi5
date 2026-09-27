@@ -42,19 +42,13 @@ pub(crate) const FORCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const STALE_AFTER: Duration = Duration::from_secs(45 * 24 * 60 * 60);
 
 pub(crate) fn check_disabled() -> bool {
-    matches!(
-        pf_host_config::knob("PUNKTFUNK_UPDATE_CHECK").as_deref(),
-        Some("0") | Some("false") | Some("off")
-    )
+    !pf_host_config::row_bool("PUNKTFUNK_UPDATE_CHECK")
 }
 
 /// Operator kill switch: apply 409s and status reports `notify` even when a
 /// one-click leg exists. Check is unaffected.
 pub(crate) fn apply_disabled() -> bool {
-    matches!(
-        pf_host_config::knob("PUNKTFUNK_UPDATE_APPLY").as_deref(),
-        Some("0") | Some("false") | Some("off")
-    )
+    !pf_host_config::row_bool("PUNKTFUNK_UPDATE_APPLY")
 }
 
 /// `full` (one-click), `staged` (apply then reboot — rpm-ostree), or `notify`
