@@ -239,8 +239,9 @@ struct PosterImage: View {
     }
 
     private func loadCurrent() async {
+        // Already drawn: a new loader (a tab switch back) must not fetch and decode it again.
         // Past the end: the placeholder IS the final look.
-        guard index < candidates.count else { return }
+        guard image == nil, index < candidates.count else { return }
         // No loader yet is not a failed candidate — the task refires when one arrives.
         guard let loader else { return }
         // Twice the drawn edge: headroom for the focus pop and a Retina-crisp cover, without
