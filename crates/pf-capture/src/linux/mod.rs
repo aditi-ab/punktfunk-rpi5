@@ -246,7 +246,7 @@ impl PortalCapturer {
     /// inherits that grant (no second dialog). `false` is a plain ScreenCast
     /// (wlroots has no RemoteDesktop portal). `want_metadata_cursor` asks
     /// for `SPA_META_Cursor` vs compositor-embedded pointer
-    /// (`portal::choose_cursor_mode`).
+    /// ([`crate::portal_rt::negotiate_cursor_mode`]).
     pub fn open(
         anchored: bool,
         want_hdr: bool,

@@ -1118,7 +1118,7 @@ fn portal_thread(
                     .select_sources(
                         &session,
                         SelectSourcesOptions::default()
-                            .set_cursor_mode(cursor_mode.to_ashpd())
+                            .set_cursor_mode(pf_capture::portal_rt::to_ashpd(cursor_mode))
                             // xdpw offers MONITOR only; the chooser picks our output.
                             .set_sources(BitFlags::from_flag(SourceType::Monitor))
                             .set_multiple(false)

@@ -256,8 +256,8 @@ pub struct HostConfig {
     /// `design/per-monitor-portal-capture.md`.
     pub capture_monitor: Option<String>,
     /// `PUNKTFUNK_PORTAL_CURSOR_MODE` — `auto` (default) · `hidden` · `embedded` ·
-    /// `metadata`. Preference, not a command: `portal_cursor::pick` closes the
-    /// session if the backend does not advertise it. `embedded` is the safe pin.
+    /// `metadata`. Preference, not a command: `pf_frame::cursor_mode::pick` never
+    /// requests a mode the backend does not advertise. `embedded` is the safe pin.
     pub portal_cursor_mode: Option<String>,
     /// `PUNKTFUNK_COMPOSITOR` — explicit compositor override (operator/CI/test).
     /// Not the runtime-detected session; `apply_session_env` never writes this.
@@ -388,7 +388,7 @@ impl HostConfig {
             capture_monitor: val("PUNKTFUNK_CAPTURE_MONITOR")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
-            // Emptied-to-None. Spellings are parsed at `portal_cursor::want`.
+            // Emptied-to-None. Spellings are parsed by `pf_frame::cursor_mode::parse_pin`.
             portal_cursor_mode: val("PUNKTFUNK_PORTAL_CURSOR_MODE")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),

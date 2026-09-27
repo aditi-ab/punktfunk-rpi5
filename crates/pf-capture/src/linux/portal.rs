@@ -1,5 +1,5 @@
 //! xdg ScreenCast / RemoteDesktop control plane: ashpd handshake on the shared
-//! portal runtime, cursor-mode ladder, and GNOME's BT.2100 colour-mode probe.
+//! portal runtime, and GNOME's BT.2100 colour-mode probe.
 //!
 //! Nothing here is per-frame. The handshake runs once; the thread then parks until
 //! `PortalSession`'s `Drop` (parent module) fires `quit_rx`, closes the portal
@@ -115,73 +115,6 @@ fn hdr_offer_for(heads: &[(&str, bool)], pinned: Option<&str>) -> bool {
     }
 }
 
-/// Ladder against `AvailableCursorModes`. Metadata keeps the HW cursor plane
-/// and ships `SPA_META_Cursor`; Embedded burns the pointer into every frame
-/// (gamescope: that defeats its HW plane). Prefer Metadata when `want_metadata`;
-/// otherwise Embedded — a metadata cursor with no blend stage is never drawn.
-/// Hidden only when advertised. A failed or empty query defaults Embedded.
-async fn choose_cursor_mode(
-    proxy: &ashpd::desktop::screencast::Screencast,
-    want_metadata: bool,
-) -> ashpd::desktop::screencast::CursorMode {
-    use ashpd::desktop::screencast::CursorMode;
-    match crate::portal_rt::available_cursor_modes(proxy).await {
-        Ok(avail) if want_metadata && avail.contains(CursorMode::Metadata) => {
-            tracing::info!(
-                ?avail,
-                "ScreenCast: requesting cursor-as-metadata (SPA_META_Cursor)"
-            );
-            CursorMode::Metadata
-        }
-        Ok(avail) if avail.contains(CursorMode::Embedded) => {
-            if want_metadata {
-                tracing::info!(
-                    ?avail,
-                    "ScreenCast: cursor metadata unavailable — requesting Embedded cursor"
-                );
-            } else {
-                tracing::info!(
-                    ?avail,
-                    "ScreenCast: requesting Embedded cursor (this session's encoder does not \
-                     composite a metadata cursor)"
-                );
-            }
-            CursorMode::Embedded
-        }
-        Ok(avail) if avail.contains(CursorMode::Metadata) => {
-            // Embedded wanted, not offered. Metadata still beats Hidden: the CPU
-            // path composites `SPA_META_Cursor` inline.
-            tracing::warn!(
-                ?avail,
-                "ScreenCast: Embedded cursor not advertised — requesting cursor-as-metadata \
-                 (only CPU-path frames will composite it)"
-            );
-            CursorMode::Metadata
-        }
-        Ok(avail) if avail.contains(CursorMode::Hidden) => {
-            tracing::warn!(
-                ?avail,
-                "ScreenCast: neither Metadata nor Embedded cursor advertised — cursor will be hidden"
-            );
-            CursorMode::Hidden
-        }
-        Ok(avail) => {
-            tracing::warn!(
-                ?avail,
-                "ScreenCast: portal advertised no cursor modes — requesting Embedded cursor"
-            );
-            CursorMode::Embedded
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "ScreenCast: AvailableCursorModes query failed — defaulting to Embedded cursor"
-            );
-            CursorMode::Embedded
-        }
-    }
-}
-
 /// Session.Close is the only teardown now that the zbus connection outlives the
 /// thread. Bounded so a wedged portal cannot hang a session switch.
 const CAST_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
@@ -236,12 +169,14 @@ pub(super) fn portal_thread(
                 .create_session(Default::default())
                 .await
                 .context("create_session")?;
-            let cursor_mode = choose_cursor_mode(&proxy, want_metadata_cursor).await;
+            let cursor_mode =
+                crate::portal_rt::negotiate_cursor_mode(&proxy, want_metadata_cursor, "screencast")
+                    .await;
             proxy
                 .select_sources(
                     &session,
                     SelectSourcesOptions::default()
-                        .set_cursor_mode(cursor_mode)
+                        .set_cursor_mode(crate::portal_rt::to_ashpd(cursor_mode))
                         // wlroots advertises MONITOR only (`AvailableSourceTypes=1`).
                         // Asking for an unsupported type invalidates the session.
                         .set_sources(BitFlags::from_flag(SourceType::Monitor))
@@ -339,12 +274,17 @@ pub(super) fn portal_thread_remote_desktop(
                 .context("select_devices")?
                 .response()
                 .context("select_devices rejected")?;
-            let cursor_mode = choose_cursor_mode(&screencast, want_metadata_cursor).await;
+            let cursor_mode = crate::portal_rt::negotiate_cursor_mode(
+                &screencast,
+                want_metadata_cursor,
+                "remote-desktop",
+            )
+            .await;
             screencast
                 .select_sources(
                     &session,
                     SelectSourcesOptions::default()
-                        .set_cursor_mode(cursor_mode)
+                        .set_cursor_mode(crate::portal_rt::to_ashpd(cursor_mode))
                         .set_sources(BitFlags::from_flag(SourceType::Monitor))
                         .set_multiple(false)
                         .set_persist_mode(PersistMode::DoNot),

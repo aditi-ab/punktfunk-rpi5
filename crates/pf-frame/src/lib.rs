@@ -6,9 +6,10 @@
 //! [`pf_zerocopy::DeviceBuffer`], `FramePayload::D3d11` a [`dxgi::D3d11Frame`].
 //!
 //! Same seam: [`hdr`] (HDR10 static metadata / SEI), [`metronome`] (periodic-stall
-//! detector), [`thread_qos`], [`session_tuning`], and on Windows [`dxgi`] (capture
-//! identity + D3D11 device).
+//! detector), [`thread_qos`], [`session_tuning`], [`cursor_mode`] (ScreenCast cursor
+//! ladder), and on Windows [`dxgi`] (capture identity + D3D11 device).
 
+pub mod cursor_mode;
 pub mod hdr;
 pub use hdr::HdrMeta;
 pub mod health;
