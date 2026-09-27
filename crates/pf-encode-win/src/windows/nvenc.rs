@@ -2412,59 +2412,18 @@ fn with_probe_session<T>(
     let _gate = DRIVER_SESSION_GATE
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Graphics::Direct3D::{
-        D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
-    };
-    use windows::Win32::Graphics::Direct3D11::{
-        D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-    };
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
+    use windows::Win32::Graphics::Direct3D11::D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     // No loadable NVENC → nothing to confirm. Also the `api()` gate for every call below and in `f`.
     if try_api().is_err() {
         return None;
     }
-    // SAFETY: this probe owns every handle it creates. `CreateDXGIFactory1` /
-    // `EnumAdapterByLuid` return owned COM or err. `D3D11CreateDevice` fills `device`
-    // or returns Err. `open_encode_session_ex` opens against that device's raw pointer
-    // (valid while `device` is held); a failed open destroys any residue session.
-    // `destroy_encoder` runs once after `f` returns. No handle escapes.
+    // Probe the selected render adapter — the GPU the session will encode on. The OS default
+    // can be the other GPU on a hybrid box.
+    let device = pf_frame::dxgi::probe_device(adapter_luid, D3D11_CREATE_DEVICE_BGRA_SUPPORT)?;
+    // SAFETY: this probe owns every handle it creates. `open_encode_session_ex` opens against
+    // `device`'s raw pointer (valid while `device` is held); a failed open destroys any residue
+    // session. `destroy_encoder` runs once after `f` returns. No handle escapes.
     unsafe {
-        // Probe the selected render adapter — the GPU the session will encode on. The OS default
-        // can be the other GPU on a hybrid box.
-        let adapter: Option<IDXGIAdapter1> = adapter_luid.and_then(|luid| {
-            let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
-            factory.EnumAdapterByLuid(luid).ok()
-        });
-        let mut device: Option<ID3D11Device> = None;
-        let created = match &adapter {
-            Some(a) => D3D11CreateDevice(
-                a,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            ),
-            None => D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            ),
-        };
-        if created.is_err() {
-            return None;
-        }
-        let device = device?;
         let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
             version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
             deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,
