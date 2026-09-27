@@ -9,7 +9,8 @@
 //! 3. The ScreenCast portal yields the PipeWire node. There is no GUI picker, so a
 //!    managed `~/.config/xdg-desktop-portal-wlr/config` sets `chooser_type=simple` and a
 //!    `chooser_cmd` that cats a per-session file (`Monitor: <NAME>` — xdpw 0.8 parses
-//!    that prefix strictly). Written once; the portal restarts on change.
+//!    that prefix strictly). Host shutdown puts the user's chooser back
+//!    ([`restore_chooser_on_shutdown`]); the portal restarts on each change.
 //! 4. Teardown is ordered: drop closes the ScreenCast session and waits for the portal
 //!    to confirm, then `swaymsg output <NAME> unplug` (sway ≥1.8). See [`StopGuard`].
 //!
@@ -1030,38 +1031,75 @@ fn wait_new_output(before: &[String], timeout: Duration) -> Result<String> {
     }
 }
 
+const XDPW_BLOCK: crate::portal_config::Block<'static> =
+    crate::portal_config::Block::Ini("screencast");
+
+fn xdpw_config_path() -> Result<std::path::PathBuf> {
+    Ok(crate::portal_config::user_config_dir()?
+        .join("xdg-desktop-portal-wlr")
+        .join("config"))
+}
+
 /// Point xdpw at our chooser. It reads config only at startup, so `try-restart` on
 /// change (D-Bus activation starts it later if it is not running). Selection is the
-/// chooser file; this config is static.
+/// chooser file; this config is static. The edit records what it replaced, so
+/// [`restore_chooser_on_shutdown`] can put it back.
 fn ensure_xdpw_config() -> Result<()> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME set"))?;
-    let path = base.join("xdg-desktop-portal-wlr").join("config");
-    // Only the two keys we own, in place. A full-file write would wipe the user's other xdpw settings.
-    let mut changed = crate::portal_config::ensure_key(
-        &path,
-        crate::portal_config::Block::Ini("screencast"),
-        "chooser_type",
-        "simple",
-    )?;
-    changed |= crate::portal_config::ensure_key(
-        &path,
-        crate::portal_config::Block::Ini("screencast"),
-        "chooser_cmd",
-        &chooser_cmd(),
-    )?;
-    if !changed {
+    let path = xdpw_config_path()?;
+    if !take_chooser(&path)? {
         return Ok(());
     }
     tracing::info!(path = %path.display(), "pointed xdg-desktop-portal-wlr at the managed output chooser");
-    // Stream thread: `systemctl --user` blocks on the job queue. Result already ignored.
+    restart_xdpw();
+    Ok(())
+}
+
+/// Only the two keys we own, in place. A full-file write would wipe the user's
+/// other xdpw settings. `true` when the file changed.
+fn take_chooser(path: &std::path::Path) -> Result<bool> {
+    let mut changed = crate::portal_config::ensure_key(path, XDPW_BLOCK, "chooser_type", "simple")?;
+    changed |= crate::portal_config::ensure_key(path, XDPW_BLOCK, "chooser_cmd", &chooser_cmd())?;
+    Ok(changed)
+}
+
+/// Hand `chooser_type` and `chooser_cmd` back and restart xdpw if either changed.
+/// Host shutdown only, never per cast: the restart cuts a live cast. Safe on a box
+/// we never touched (no-op).
+///
+/// Left in place, every screen share on the box goes to our chooser and falls back
+/// to `HEADLESS-1` once the selection file is gone.
+pub(crate) fn restore_chooser_on_shutdown() {
+    let Ok(path) = xdpw_config_path() else { return };
+    if !give_back_chooser(&path) {
+        return;
+    }
+    tracing::info!(
+        path = %path.display(),
+        "restored the screen-share chooser xdg-desktop-portal-wlr had before this host"
+    );
+    restart_xdpw();
+}
+
+/// Undo [`take_chooser`]. `true` when the file changed.
+fn give_back_chooser(path: &std::path::Path) -> bool {
+    let mut changed = false;
+    for key in ["chooser_type", "chooser_cmd"] {
+        match crate::portal_config::restore_key(path, XDPW_BLOCK, key) {
+            Ok(c) => changed |= c,
+            Err(e) => tracing::warn!(path = %path.display(), key, error = %format!("{e:#}"),
+                "previous xdpw chooser key not restored"),
+        }
+    }
+    changed
+}
+
+/// Bounded: `systemctl --user` blocks on the job queue, and this can run on the
+/// stream thread. A timeout means xdpw picks the config up when it next starts.
+fn restart_xdpw() {
     let _ = crate::proc::status_within(
         Command::new("systemctl").args(["--user", "try-restart", "xdg-desktop-portal-wlr.service"]),
         PORTAL_RESTART_BUDGET,
     );
-    Ok(())
 }
 
 /// ScreenCast handshake: report fd + node id, then park. The zbus connection is the
@@ -1391,6 +1429,27 @@ mod tests {
             head("DP-3", false),
         ];
         assert_eq!(heads_to_disable(&heads, ""), vec!["DP-1"]);
+    }
+
+    /// Shutdown hands both chooser keys back byte for byte; left taken, every share on
+    /// the box goes to our chooser.
+    #[test]
+    fn shutdown_hands_the_users_chooser_back_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("pf-vd-xdpw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("config");
+        let user = "[screencast]\nchooser_type=dmenu\nchooser_cmd=wofi -d\noutput_name=DP-1\n";
+        std::fs::write(&path, user).expect("seed");
+        assert!(take_chooser(&path).expect("take"));
+        let taken = std::fs::read_to_string(&path).expect("taken");
+        assert!(give_back_chooser(&path));
+        let back = std::fs::read_to_string(&path).expect("restored");
+        let again = give_back_chooser(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(taken.contains("chooser_type=simple"), "{taken}");
+        assert_eq!(back, user);
+        assert!(!again, "a second restore finds nothing of ours");
     }
 
     #[test]

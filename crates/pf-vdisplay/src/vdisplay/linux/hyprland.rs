@@ -46,11 +46,9 @@ fn picker_shim_path() -> String {
 }
 
 fn xdph_config_path() -> Result<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME set"))?;
-    Ok(base.join("hypr").join("xdph.conf"))
+    Ok(crate::portal_config::user_config_dir()?
+        .join("hypr")
+        .join("xdph.conf"))
 }
 const XDPH_BLOCK: crate::portal_config::Block<'static> =
     crate::portal_config::Block::Hyprlang("screencopy");

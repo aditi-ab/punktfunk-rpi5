@@ -615,18 +615,18 @@ pub fn takeover_privilege_verdict() -> TakeoverVerdict {
     }
 }
 
-/// Restore the box's own session now — host is exiting. Blocks on `systemctl`,
-/// so call off the async runtime. A takeover that outlives the host leaves
-/// the box with no display manager and nobody to restart it. No-op when
-/// nothing was taken.
+/// Restore the box's own session and the portal pickers now — host is exiting.
+/// Blocks on `systemctl`, so call off the async runtime. A takeover that
+/// outlives the host leaves the box with no display manager and nobody to
+/// restart it. No-op when nothing was taken.
 #[cfg(target_os = "linux")]
 pub fn restore_takeover_now() {
     gamescope::restore_takeover_now();
-    // xdph picker is the other hold a host can outlive. Not restored per cast:
-    // rewriting the config restarts xdph and orphans the portal's cached D-Bus
-    // (`hyprland::StopGuard::drop`) — a stream that never delivers a buffer.
-    // Shutdown: no live cast, restart is free. No-op if we never took it.
+    // Not per cast: the rewrite restarts the portal and orphans its cached D-Bus
+    // (`hyprland::StopGuard::drop`), a stream that never delivers a buffer.
+    // Shutdown has no live cast. Each is a no-op if we never took it.
     hyprland::restore_picker_on_shutdown();
+    wlroots::restore_chooser_on_shutdown();
 }
 
 #[cfg(not(target_os = "linux"))]
