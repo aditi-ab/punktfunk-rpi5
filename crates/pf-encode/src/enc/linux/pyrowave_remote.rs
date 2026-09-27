@@ -24,7 +24,7 @@ use pf_zerocopy::ipc;
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -287,19 +287,9 @@ impl Link {
     }
 }
 
-/// Dmabuf identity across frames: its inode. dma-buf objects live on one anonymous inode
-/// filesystem and the number is unique per object — the same key the zerocopy importer uses.
+/// Dmabuf identity across frames: its inode, the key the zerocopy importer uses too.
 fn dmabuf_key(fd: BorrowedFd) -> io::Result<u64> {
-    // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value; `fstat` writes
-    // into the live, correctly-sized `&mut st` and only reads `fd`, which the caller keeps open
-    // for the duration. `st_ino` is read only after the return value is checked.
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd.as_raw_fd(), &mut st) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(st.st_ino as u64)
-    }
+    ipc::dmabuf_inode(fd).map(|(_, ino)| ino)
 }
 
 #[derive(Debug)]

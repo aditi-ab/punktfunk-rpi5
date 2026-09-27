@@ -358,17 +358,6 @@ fn queue_priority_candidates(raw: Option<&str>, vendor_id: u32) -> Vec<vk::Queue
     }
 }
 
-/// `create_device` error that means "this priority class was refused" — walk the
-/// ladder down rather than failing the open. `ERROR_NOT_PERMITTED_KHR` is specified;
-/// `ERROR_INITIALIZATION_FAILED` matches pf-zerocopy's VkBridge. A PyroWave open is
-/// a negotiated session, so a hard error here is a dead stream.
-fn priority_refused(e: vk::Result) -> bool {
-    matches!(
-        e,
-        vk::Result::ERROR_NOT_PERMITTED_KHR | vk::Result::ERROR_INITIALIZATION_FAILED
-    )
-}
-
 /// Independent per-frame resource sets. Two: Granite's device defaults to
 /// `init_frame_contexts(2)` and `next_frame_context()` waits the context it rotates
 /// into, so frame N may not begin until N-2 completed. A third slot needs a
@@ -1025,7 +1014,7 @@ impl PyroWaveEncoder {
                         device = Some(d);
                         break;
                     }
-                    Err(e) if priority_refused(e) => {
+                    Err(e) if pf_zerocopy::vkdev::priority_refused(e) => {
                         tracing::debug!(
                             priority = ?want,
                             error = ?e,
@@ -1579,11 +1568,9 @@ impl PyroWaveEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        let mut st: libc::stat = std::mem::zeroed();
-        let key = if libc::fstat(d.fd.as_raw_fd(), &mut st) == 0 {
-            (st.st_dev as u64, st.st_ino as u64)
-        } else {
-            (u64::MAX, self.frame_count)
+        let key = match pf_zerocopy::ipc::dmabuf_inode(d.fd.as_raw_fd()) {
+            Ok(key) => key,
+            Err(_) => (u64::MAX, self.frame_count),
         };
         if let Some(&(_, _, img, _, view)) = self.import_cache.iter().find(|e| (e.0, e.1) == key) {
             return Ok((img, view, false));
@@ -3117,17 +3104,6 @@ mod tests {
         for raw in ["", "yes", "1", "medium", "  high"] {
             assert_eq!(queue_priority_candidates(Some(raw), AMD), LADDER, "{raw:?}");
         }
-    }
-
-    /// A refused class walks the ladder down, never fails the open. `NOT_PERMITTED` is
-    /// specified; `INITIALIZATION_FAILED` matches VkBridge. Anything else must propagate.
-    #[test]
-    fn only_refusals_walk_the_ladder_down() {
-        assert!(priority_refused(vk::Result::ERROR_NOT_PERMITTED_KHR));
-        assert!(priority_refused(vk::Result::ERROR_INITIALIZATION_FAILED));
-        assert!(!priority_refused(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
-        assert!(!priority_refused(vk::Result::ERROR_EXTENSION_NOT_PRESENT));
-        assert!(!priority_refused(vk::Result::SUCCESS));
     }
 
     /// Walk a windowed AU back into the flat codec-packet stream (the clients' parse).

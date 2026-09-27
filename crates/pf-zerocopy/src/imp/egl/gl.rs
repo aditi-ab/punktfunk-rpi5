@@ -93,12 +93,6 @@ unsafe extern "C" {
     );
 }
 
-#[link(name = "gbm")]
-unsafe extern "C" {
-    pub(crate) fn gbm_create_device(fd: c_int) -> *mut c_void;
-    pub(crate) fn gbm_device_destroy(device: *mut c_void);
-}
-
 /// `glEGLImageTargetTexture2DOES` — `eglGetProcAddress`, not `#[link]`.
 pub(crate) type EglImageTargetFn = unsafe extern "system" fn(u32, *mut c_void);
 
@@ -192,9 +186,4 @@ pub(crate) unsafe fn compile_program_with(frag: &[u8]) -> Result<u32> {
         glUseProgram(0);
         Ok(prog)
     }
-}
-
-pub(crate) unsafe fn compile_program() -> Result<u32> {
-    // SAFETY: the GL context is current on this thread (forwarded to `compile_program_with`).
-    unsafe { compile_program_with(FRAG_SRC) }
 }

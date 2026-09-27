@@ -22,10 +22,6 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_DISABLE_PERSIST, CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CM_PROB_DISABLED,
     CR_SUCCESS, DN_HAS_PROBLEM,
 };
-use windows::Win32::Devices::Display::{
-    DisplayConfigGetDeviceInfo, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-    DISPLAYCONFIG_TARGET_DEVICE_NAME,
-};
 use windows::Win32::Foundation::LUID;
 
 /// Which selector leased a devnode: `BaselineInactive` (a sink that was dark before this acquire)
@@ -152,25 +148,12 @@ pub fn instance_id_from_interface_path(path: &str) -> Option<String> {
     Some(rest[..cut].replace('#', "\\"))
 }
 
-fn utf16z(buf: &[u16]) -> String {
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    String::from_utf16_lossy(&buf[..len])
-}
-
 fn monitor_instance(adapter: LUID, target_id: u32) -> Option<(String, String)> {
-    let mut req = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
-    req.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-    req.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
-    req.header.adapterId = adapter;
-    req.header.id = target_id;
-    // SAFETY: `req` is a properly-sized DISPLAYCONFIG_TARGET_DEVICE_NAME local whose header
-    // (type/size/adapterId/id) is fully initialised; the API writes only within the struct.
-    let rc = unsafe { DisplayConfigGetDeviceInfo(&mut req.header) };
-    if rc != 0 {
-        return None;
-    }
-    let id = instance_id_from_interface_path(&utf16z(&req.monitorDevicePath))?;
-    Some((id, utf16z(&req.monitorFriendlyDeviceName)))
+    let name = crate::ccd_info::target_name(adapter, target_id)?;
+    Some((
+        instance_id_from_interface_path(&name.device_path)?,
+        name.friendly,
+    ))
 }
 
 /// Whether the devnode is currently enabled: `None` when it cannot be located (departed), else

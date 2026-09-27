@@ -1389,7 +1389,7 @@ unsafe fn push_hdr_metadata(
 /// Can this GPU's AMF runtime `Init` a `codec` encoder on the selected render adapter?
 /// Tears down before return. `false` on any failure, including no runtime.
 pub fn probe_can_encode(codec: Codec, adapter_luid: Option<LUID>) -> bool {
-    let Some(device) = selected_adapter_device(adapter_luid) else {
+    let Some(device) = pf_frame::dxgi::probe_device(adapter_luid, Default::default()) else {
         return false;
     };
     probe_can_encode_on(&device, codec)
@@ -1406,7 +1406,7 @@ pub fn probe_can_encode_10bit(codec: Codec, adapter_luid: Option<LUID>) -> bool 
     if !codec.supports_10bit() {
         return false;
     }
-    let Some(device) = selected_adapter_device(adapter_luid) else {
+    let Some(device) = pf_frame::dxgi::probe_device(adapter_luid, Default::default()) else {
         return false;
     };
     probe_open_on(&device, codec, true)
@@ -1477,53 +1477,6 @@ fn probe_open_on(device: &ID3D11Device, codec: Codec, ten_bit: bool) -> bool {
             sys::AMF_SURFACE_NV12
         };
         ((*(*comp.0).vtbl).init)(comp.0, surface, 640, 480) == sys::AMF_OK
-    }
-}
-
-/// D3D11 device on the selected render adapter; OS default hardware adapter if unresolved.
-fn selected_adapter_device(adapter_luid: Option<LUID>) -> Option<ID3D11Device> {
-    use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Graphics::Direct3D::{
-        D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
-    };
-    use windows::Win32::Graphics::Direct3D11::{D3D11CreateDevice, D3D11_SDK_VERSION};
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
-    // SAFETY: probe owns every handle. Factory/adapter COM objects or err → default fallback.
-    // `D3D11CreateDevice` fills `device` only on success. Everything drops with its COM wrapper.
-    unsafe {
-        let adapter: Option<IDXGIAdapter1> = adapter_luid.and_then(|luid| {
-            let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
-            factory.EnumAdapterByLuid(luid).ok()
-        });
-        let mut device: Option<ID3D11Device> = None;
-        let created = match &adapter {
-            Some(a) => D3D11CreateDevice(
-                a,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE::default(),
-                Default::default(),
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            ),
-            None => D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                Default::default(),
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            ),
-        };
-        if created.is_err() {
-            return None;
-        }
-        device
     }
 }
 

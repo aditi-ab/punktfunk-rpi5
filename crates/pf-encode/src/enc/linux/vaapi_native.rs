@@ -20,6 +20,7 @@ use pf_vaapi::drm::ExportedPlane;
 use pf_vaapi::enc_params::SessionParams;
 use pf_vaapi::hevc::{HdrStatic, COLOUR_BT2020_PQ, COLOUR_BT709};
 use pf_vaapi::vpp;
+use pf_zerocopy::gbm::{GbmBo, GbmDevice, GBM_BO_USE_RENDERING};
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use pf_encode_win::rfi::{self, plan_slot_recovery, Wave, WaveMark};
@@ -158,117 +159,28 @@ impl NativeVaapiEncoder {
     }
 }
 
-// libgbm allocation half, declared the same way pf-capture's `gbm_pool.rs` does:
-// both resolve to the same `libgbm`, already a workspace runtime dependency.
-#[link(name = "gbm")]
-unsafe extern "C" {
-    fn gbm_create_device(fd: i32) -> *mut std::ffi::c_void;
-    fn gbm_device_destroy(device: *mut std::ffi::c_void);
-    fn gbm_bo_create_with_modifiers2(
-        device: *mut std::ffi::c_void,
-        width: u32,
-        height: u32,
-        format: u32,
-        modifiers: *const u64,
-        count: u32,
-        flags: u32,
-    ) -> *mut std::ffi::c_void;
-    fn gbm_bo_destroy(bo: *mut std::ffi::c_void);
-    fn gbm_bo_get_fd(bo: *mut std::ffi::c_void) -> i32;
-    fn gbm_bo_get_stride(bo: *mut std::ffi::c_void) -> u32;
-    fn gbm_bo_get_offset(bo: *mut std::ffi::c_void, plane: i32) -> u32;
-    fn gbm_bo_get_modifier(bo: *mut std::ffi::c_void) -> u64;
-    fn gbm_bo_get_plane_count(bo: *mut std::ffi::c_void) -> i32;
-}
-
-/// The buffer is rendered into by the compositor's GPU.
-const GBM_BO_USE_RENDERING: u32 = 1 << 2;
 /// Probe picture size: large enough to exercise the real import + VPP path.
 const PROBE_DIM: u32 = 64;
 
-/// A GBM BO allocated on the probe node. Drop order is the contract: `bo`
-/// references `device`, so it dies first, and `device` borrows the node fd,
-/// so `_node` is declared last — its close lands after `Drop` ran.
-struct ProbeBo {
-    bo: *mut std::ffi::c_void,
-    device: *mut std::ffi::c_void,
-    /// `gbm_bo_get_fd`'s fresh fd; `OwnedFd` closes it exactly once.
-    fd: std::os::fd::OwnedFd,
-    offset: u32,
-    stride: u32,
-    _node: std::fs::File,
-}
-
-impl Drop for ProbeBo {
-    fn drop(&mut self) {
-        // SAFETY: `bo`/`device` are the live handles this guard uniquely owns,
-        // destroyed once, in libgbm's required order.
-        unsafe {
-            gbm_bo_destroy(self.bo);
-            gbm_device_destroy(self.device);
-        }
-    }
-}
-
-/// Allocate a 64x64 BO tiled exactly as `modifier` on `node`'s GBM device.
-/// `Err`/`None` is a refused candidate, never a host failure.
-fn alloc_probe_bo(node: &std::path::Path, fourcc: u32, modifier: u64) -> Option<ProbeBo> {
-    use std::os::fd::FromRawFd as _;
+/// Allocate a 64x64 BO tiled exactly as `modifier` on `node`'s GBM device, one plane.
+/// `None` is a refused candidate, never a host failure.
+fn alloc_probe_bo(node: &std::path::Path, fourcc: u32, modifier: u64) -> Option<GbmBo> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(node)
         .ok()?;
-    // SAFETY: `file` outlives every call into `device` — it is kept open in the
-    // caller's scope for the whole probe.
-    let device = unsafe { gbm_create_device(file.as_raw_fd()) };
-    if device.is_null() {
-        return None;
-    }
-    // SAFETY: `device` is live; `modifier` is read as one u64.
-    let bo = unsafe {
-        gbm_bo_create_with_modifiers2(
-            device,
-            PROBE_DIM,
-            PROBE_DIM,
-            fourcc,
-            &modifier,
-            1,
-            GBM_BO_USE_RENDERING,
-        )
-    };
-    if bo.is_null() {
-        // SAFETY: `device` is live, owned here.
-        unsafe { gbm_device_destroy(device) };
-        return None;
-    }
-    // SAFETY: plain accessors on the BO just created, valid until `gbm_bo_destroy`.
-    let (planes, got_mod, fd, stride, offset) = unsafe {
-        (
-            gbm_bo_get_plane_count(bo),
-            gbm_bo_get_modifier(bo),
-            gbm_bo_get_fd(bo),
-            gbm_bo_get_stride(bo),
-            gbm_bo_get_offset(bo, 0),
-        )
-    };
-    if planes != 1 || got_mod != modifier || fd < 0 || stride == 0 {
-        // SAFETY: `bo`/`device` are live and owned here; nothing was handed out.
-        unsafe {
-            gbm_bo_destroy(bo);
-            gbm_device_destroy(device);
-        }
-        return None;
-    }
-    Some(ProbeBo {
-        bo,
-        device,
-        // SAFETY: `fd` is the fresh descriptor `gbm_bo_get_fd` returned (>= 0).
-        fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
-        offset,
-        stride,
-        _node: file,
-    })
+    let device = std::rc::Rc::new(GbmDevice::open(file).ok()?);
+    let bo = GbmBo::alloc(
+        &device,
+        PROBE_DIM,
+        PROBE_DIM,
+        fourcc,
+        &[modifier],
+        GBM_BO_USE_RENDERING,
+    )
+    .ok()?;
+    (bo.planes == 1 && bo.modifier == modifier && bo.stride != 0).then_some(bo)
 }
 
 /// Prove one candidate: allocate the modifier on the session's own render node

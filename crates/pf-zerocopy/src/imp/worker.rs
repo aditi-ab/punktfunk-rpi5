@@ -19,7 +19,7 @@ use super::proto::{
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 /// PipeWire pools are ≤ ~16; 64 only applies if a producer churns fds without renegotiating.
 const FD_CACHE_CAP: usize = 64;
@@ -33,32 +33,7 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
     unsafe {
         libc::prctl(libc::PR_SET_NAME, c"pf-zerocopy".as_ptr());
     }
-    let fd: i32 = args
-        .iter()
-        .skip_while(|a| *a != "--fd")
-        .nth(1)
-        .map(|s| s.parse())
-        .transpose()
-        .context("parse --fd")?
-        .unwrap_or(3);
-    // Negative fd is UB in `OwnedFd`'s niche; 0–2 would close stdio on drop. `fstat` then
-    // confirms an open socket: this hidden subcommand is runnable by hand, and adopting an
-    // inherited fd would close it behind its real owner.
-    anyhow::ensure!(fd >= 3, "--fd must be >= 3 (got {fd})");
-    // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
-    // `mem::zeroed()` is a sound initializer; `fstat` writes into the live, correctly-sized
-    // `&mut st` and only reads `fd`. `st_mode` is read only after the return value is checked.
-    let is_socket = unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
-    };
-    anyhow::ensure!(is_socket, "--fd {fd} is not an open socket");
-    // SAFETY: the spawning host `dup2`'d its socketpair end onto exactly this fd number before
-    // exec (the subcommand's contract, just verified to be an open socket ≥ 3) and nothing else
-    // in this fresh process owns it, so `OwnedFd` takes sole ownership and closes it exactly
-    // once at exit.
-    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
-    run(sock)
+    run(ipc::adopt_spawned_socket(args)?)
 }
 
 fn run(sock: OwnedFd) -> Result<()> {
@@ -295,6 +270,29 @@ impl EglBackend {
         }
     }
 
+    /// The dmabuf fd for `key`, storing `fd` first when it rode along. `Err` is the reply to
+    /// send instead: `what` claimed an fd that did not arrive, or [`Reply::NeedFd`] after an LRU
+    /// eviction or cache desync, so the host resends rather than failing the frame.
+    fn resolve_fd(
+        &mut self,
+        key: u64,
+        has_fd: bool,
+        fd: Option<OwnedFd>,
+        what: &str,
+    ) -> Result<i32, Reply> {
+        if let Some(fd) = fd {
+            self.store_fd(key, fd);
+        } else if has_fd {
+            return Err(Reply::Err {
+                message: format!("{what} said has_fd but no fd arrived"),
+            });
+        }
+        self.fds
+            .get(&key)
+            .map(|f| f.as_raw_fd())
+            .ok_or(Reply::NeedFd)
+    }
+
     fn note_dims(&mut self, kind: ImportKind, width: u32, height: u32) {
         if self.last_shape != Some((kind, width, height)) {
             self.last_shape = Some((kind, width, height));
@@ -309,16 +307,9 @@ impl ImportBackend for EglBackend {
     }
 
     fn import(&mut self, req: &ImportReq, fd: Option<OwnedFd>) -> Reply {
-        if let Some(fd) = fd {
-            self.store_fd(req.key, fd);
-        } else if req.has_fd {
-            return Reply::Err {
-                message: "Import said has_fd but no fd arrived".into(),
-            };
-        }
-        let Some(raw) = self.fds.get(&req.key).map(|f| f.as_raw_fd()) else {
-            // LRU eviction / cache desync: ask the host to resend the fd rather than fail the frame.
-            return Reply::NeedFd;
+        let raw = match self.resolve_fd(req.key, req.has_fd, fd, "Import") {
+            Ok(raw) => raw,
+            Err(reply) => return reply,
         };
         match self.import_inner(req, raw) {
             Ok((id, desc)) => Reply::Frame { id, desc },
@@ -387,17 +378,10 @@ impl ImportBackend for EglBackend {
         cursor: Option<CursorRect>,
         fd: Option<OwnedFd>,
     ) -> Reply {
-        if let Some(fd) = fd {
-            self.store_fd(key, fd);
-        } else if has_fd {
-            return Reply::Err {
-                message: "Convert said has_fd but no fd arrived".into(),
-            };
-        }
-        let Some(raw) = self.fds.get(&key).map(|f| f.as_raw_fd()) else {
-            return Reply::NeedFd;
+        src.fd = match self.resolve_fd(key, has_fd, fd, "Convert") {
+            Ok(raw) => raw,
+            Err(reply) => return reply,
         };
-        src.fd = raw;
         match self.importer.convert(&src, slot, &out, cursor) {
             Ok(value) => Reply::Converted { value },
             Err(e) => Reply::Err {
@@ -467,30 +451,14 @@ impl EglBackend {
             stride: req.stride,
         };
         self.note_dims(req.kind, req.width, req.height);
-        let buf = match req.kind {
-            ImportKind::Tiled => {
-                self.importer
-                    .import(&plane, req.width, req.height, req.fourcc, req.modifier)?
-            }
-            ImportKind::TiledNv12 => self.importer.import_nv12(
-                &plane,
-                req.width,
-                req.height,
-                req.fourcc,
-                req.modifier,
-            )?,
-            ImportKind::Tiled444 => self.importer.import_yuv444(
-                &plane,
-                req.width,
-                req.height,
-                req.fourcc,
-                req.modifier,
-            )?,
-            ImportKind::Linear => self.importer.import_linear(&plane, req.width, req.height)?,
-            ImportKind::LinearNv12 => self
-                .importer
-                .import_linear_nv12(&plane, req.width, req.height)?,
-        };
+        let buf = self.importer.import(
+            req.kind,
+            &plane,
+            req.width,
+            req.height,
+            req.fourcc,
+            req.modifier,
+        )?;
         cuda::make_current()?;
         let (id, desc) = match self.ids.get(&buf.ptr) {
             Some(&id) => (id, None),
@@ -498,7 +466,7 @@ impl EglBackend {
                 let id = self.next_id;
                 self.next_id = self.next_id.wrapping_add(1);
                 let y_handle = cuda::ipc_export(buf.ptr)?.to_vec();
-                let uv = match buf.uv {
+                let uv = match buf.uv() {
                     Some((uv_ptr, uv_pitch)) => {
                         Some((cuda::ipc_export(uv_ptr)?.to_vec(), uv_pitch))
                     }
@@ -535,15 +503,7 @@ mod tests {
     /// the dispatch test asserts the arrived fd is the one the host sent, not just that JSON
     /// claimed one.
     fn fd_ino(fd: impl AsRawFd) -> u64 {
-        // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
-        // `mem::zeroed()` is a sound initializer. `fd` is a live descriptor owned by the caller;
-        // `fstat` writes into the live, correctly-sized `&mut st`, and `st_ino` is read only
-        // after the return value is checked.
-        unsafe {
-            let mut st: libc::stat = std::mem::zeroed();
-            assert_eq!(libc::fstat(fd.as_raw_fd(), &mut st), 0, "fstat");
-            st.st_ino
-        }
+        ipc::dmabuf_inode(fd).expect("fstat").1
     }
 
     struct MockBackend {

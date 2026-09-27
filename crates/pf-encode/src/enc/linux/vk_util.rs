@@ -305,8 +305,9 @@ pub(crate) unsafe fn import_rgb_dmabuf(
     )
 }
 
-/// Also imports one-fd LINEAR NV12: UV layout from plane-1, else shared-stride
-/// contiguous planes.
+/// Import `d` as a `usage` image plus a view; fd ownership and the memory pick are
+/// [`pf_zerocopy::vkdev::import_dmabuf_image`]'s. Also imports one-fd LINEAR NV12: UV layout
+/// from plane-1, else shared-stride contiguous planes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn import_rgb_dmabuf_as(
     device: &ash::Device,
@@ -319,13 +320,9 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
     profile_list: Option<&mut vk::VideoProfileListInfoKHR>,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
     use anyhow::Context;
-    use std::os::fd::{AsRawFd, IntoRawFd};
+    use std::os::fd::AsFd;
     let fmt = fourcc_to_vk(d.fourcc)
         .with_context(|| format!("unsupported dmabuf fourcc {:#x}", d.fourcc))?;
-    // Dup first, keep owned: Vulkan takes the fd only on successful
-    // `allocate_memory`; `vkFreeMemory` then closes it. Close-after-success
-    // is a double-close of a recycled number.
-    let dup = d.fd.try_clone().context("dup dmabuf fd")?;
     let two_plane = matches!(
         fmt,
         vk::Format::G8_B8R8_2PLANE_420_UNORM
@@ -349,98 +346,28 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
             .offset(d.offset as u64)
             .row_pitch(d.stride as u64)]
     };
-    let mut drm = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-        .drm_format_modifier(d.modifier)
-        .plane_layouts(&planes);
-    let mut ext = vk::ExternalMemoryImageCreateInfo::default()
-        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let mut ci = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(fmt)
-        .extent(vk::Extent3D {
+    let (img, mem) = pf_zerocopy::vkdev::import_dmabuf_image(
+        device,
+        ext_fd,
+        mem_props,
+        &pf_zerocopy::vkdev::DmabufImage {
+            fd: d.fd.as_fd(),
+            format: fmt,
             width: cw,
             height: ch,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-        .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .push_next(&mut ext)
-        .push_next(&mut drm);
-    if let Some(pl) = profile_list {
-        ci = ci.push_next(pl);
-    }
-    let img = device.create_image(&ci, None)?;
-    // Destroy only what this call created; the caller's `DmabufFrame` fd stays theirs.
-    let fd_props = {
-        let mut p = vk::MemoryFdPropertiesKHR::default();
-        // Borrow-only; error leaves `memory_type_bits = 0` and the fallback uses image reqs.
-        let _ = (ext_fd.fp().get_memory_fd_properties_khr)(
-            device.handle(),
-            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-            dup.as_raw_fd(),
-            &mut p,
-        );
-        p.memory_type_bits
-    };
-    let req = device.get_image_memory_requirements(img);
-    let bits = req.memory_type_bits & fd_props;
-    let bits = if bits != 0 {
-        bits
-    } else {
-        req.memory_type_bits
-    };
-    let ti = match find_mem(mem_props, bits, vk::MemoryPropertyFlags::empty()) {
-        Ok(ti) => ti,
-        Err(e) => {
-            device.destroy_image(img, None);
-            return Err(e); // `dup` drops: nothing imported it
-        }
-    };
-    let mut ded = vk::MemoryDedicatedAllocateInfo::default().image(img);
-    let mut import = vk::ImportMemoryFdInfoKHR::default()
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-        .fd(dup.as_raw_fd());
-    let mem = match device.allocate_memory(
-        &vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(ti)
-            .push_next(&mut ded)
-            .push_next(&mut import),
-        None,
-    ) {
-        Ok(mem) => {
-            // Success transferred fd ownership to the memory object — release, don't close.
-            let _ = dup.into_raw_fd();
-            mem
-        }
-        Err(e) => {
-            device.destroy_image(img, None);
-            return Err(e.into()); // `dup` drops: the one close of the failed import
-        }
-    };
-    if let Err(e) = device.bind_image_memory(img, mem, 0) {
-        device.destroy_image(img, None);
-        device.free_memory(mem, None); // closes the imported fd
-        return Err(e.into());
-    }
-    let view = match device.create_image_view(
-        &vk::ImageViewCreateInfo::default()
-            .image(img)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(fmt)
-            .subresource_range(color_range(0)),
-        None,
-    ) {
+            modifier: d.modifier,
+            planes: &planes,
+            usage,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+        },
+        profile_list,
+    )?;
+    let view = match make_view(device, img, fmt, 0) {
         Ok(v) => v,
         Err(e) => {
             device.destroy_image(img, None);
             device.free_memory(mem, None);
-            return Err(e.into());
+            return Err(e);
         }
     };
     Ok((img, mem, view))

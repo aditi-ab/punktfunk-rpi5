@@ -332,34 +332,7 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
     // no-op. The worker is single-threaded, so this is the encode thread.
     pf_frame::thread_qos::boost_thread_priority(true);
 
-    let fd: i32 = args
-        .iter()
-        .skip_while(|a| *a != "--fd")
-        .nth(1)
-        .map(|s| s.parse())
-        .transpose()
-        .context("parse --fd")?
-        .unwrap_or(3);
-    // Refuse anything that cannot be the spawning host's socket: a negative fd is
-    // UB inside `OwnedFd` (its niche), and 0–2 would close stdio on exit. Then
-    // confirm the number really holds a socket — this binary is runnable by hand.
-    anyhow::ensure!(fd >= 3, "--fd must be >= 3 (got {fd})");
-    // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so `mem::zeroed`
-    // is a sound initializer; `fstat` writes into the live, correctly-sized `&mut st` and only
-    // reads `fd`. `st_mode` is read only after the return value is checked.
-    let is_socket = unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
-    };
-    anyhow::ensure!(
-        is_socket,
-        "--fd {fd} is not an open socket (this binary is spawned by punktfunk-host, not run by hand)"
-    );
-    // SAFETY: the spawning host `dup2`'d its socketpair end onto exactly this fd number before
-    // exec (the worker's contract, just verified to be an open socket ≥ 3) and nothing else in
-    // this fresh process owns it, so `OwnedFd` takes sole ownership and closes it once at exit.
-    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
-    run(sock)
+    run(ipc::adopt_spawned_socket(args)?)
 }
 
 /// Drop env this process must not act on. A denylist, not an allowlist: the

@@ -131,14 +131,12 @@ impl Capturer for SyntheticNv12Capturer {
 /// Same render adapter the encoder picks (`PUNKTFUNK_RENDER_ADAPTER` / preference /
 /// max-VRAM LUID), else adapter 0.
 fn resolve_render_adapter() -> Result<IDXGIAdapter1> {
-    // SAFETY: DXGI enumeration over owned locals; factory and adapters own their COM refs.
+    if let Some(a) = pf_frame::dxgi::adapter_by_luid(pf_gpu::resolve_render_adapter_luid()) {
+        return Ok(a);
+    }
+    // SAFETY: DXGI enumeration over owned locals; factory and adapter own their COM refs.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
-        if let Some(luid) = pf_gpu::resolve_render_adapter_luid() {
-            if let Ok(a) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) {
-                return Ok(a);
-            }
-        }
         factory.EnumAdapters1(0).context("EnumAdapters1(0)")
     }
 }

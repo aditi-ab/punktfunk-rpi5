@@ -13,12 +13,16 @@
 use anyhow::{Context, Result};
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, LUID};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
+};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
 };
-use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice, IDXGIDevice1};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIDevice1, IDXGIFactory4,
+};
 
 #[derive(Clone)]
 pub struct WinCaptureTarget {
@@ -127,6 +131,53 @@ pub unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D
         let _ = unsafe { dxgi1.SetMaximumFrameLatency(1) };
     }
     Ok((device, context))
+}
+
+/// The DXGI adapter with `luid`; `None` when the LUID is unset or names no adapter.
+pub fn adapter_by_luid(luid: Option<LUID>) -> Option<IDXGIAdapter1> {
+    let luid = luid?;
+    // SAFETY: both calls return an owned COM reference or an error; nothing is borrowed.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        factory.EnumAdapterByLuid(luid).ok()
+    }
+}
+
+/// A throwaway D3D11 device for a capability probe: on the adapter with `luid`, else the OS
+/// default hardware adapter. Unlike [`make_device`] it raises no GPU priority.
+pub fn probe_device(luid: Option<LUID>, flags: D3D11_CREATE_DEVICE_FLAG) -> Option<ID3D11Device> {
+    let adapter = adapter_by_luid(luid);
+    let mut device: Option<ID3D11Device> = None;
+    // SAFETY: `adapter` is an owned COM reference live for the call; `device` is a local
+    // out-param the callee fills only on success.
+    let created = unsafe {
+        match &adapter {
+            Some(a) => D3D11CreateDevice(
+                a,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                flags,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            ),
+            None => D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                flags,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            ),
+        }
+    };
+    created.ok()?;
+    device
 }
 
 /// `PUNKTFUNK_GPU_PRIORITY_CLASS` policy.

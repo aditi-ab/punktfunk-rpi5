@@ -245,121 +245,62 @@ pub fn capture_virtual_output(
     // Direct capture first where the compositor has it: the portal's re-request timer
     // halves the rate above ~140 Hz. GPU consumers only — this delivers dmabufs, and a
     // software encoder wants the portal's CPU pixels. Any failure falls through.
+    let mut keepalive = vout.keepalive;
     if let (Some(name), true) = (
         vout.output_name.clone(),
         want.gpu && pf_capture::direct_capture(),
     ) {
-        // `keepalive` must move exactly once: rebuild it for the portal on failure.
         match pf_capture::open_direct_output(
             name.clone(),
-            Box::new(()),
+            keepalive,
             zero_copy_policy(want.pyrowave, want.nv12_native, codec, bit_depth, want.hdr),
         ) {
             Ok(c) => {
                 tracing::info!(output = %name, "capturing the compositor output directly");
-                // The keepalive still has to outlive the capturer; hand it over now that
-                // the session is known good.
-                return Ok(Box::new(KeptAlive {
-                    inner: c,
-                    keepalive: Some(vout.keepalive),
-                }));
+                return Ok(c);
             }
-            Err(e) => tracing::info!(
-                output = %name,
-                reason = %format!("{e:#}"),
-                "no direct capture on this compositor — using the ScreenCast portal"
-            ),
+            Err((e, handed_back)) => {
+                keepalive = handed_back;
+                tracing::info!(
+                    output = %name,
+                    reason = %format!("{e:#}"),
+                    "no direct capture on this compositor — using the ScreenCast portal"
+                )
+            }
         }
     }
+    let producer = if kwin {
+        pf_capture::Producer::Kwin
+    } else if gamescope {
+        pf_capture::Producer::Gamescope
+    } else {
+        pf_capture::Producer::Other
+    };
     pf_capture::open_virtual_output(
         vout.remote_fd,
         vout.node_id,
         vout.preferred_mode,
-        vout.keepalive,
-        want.gpu,
-        want.chroma_444,
-        want.hdr,
-        want.ten_bit_sdr,
-        pf_capture::ZeroCopyPolicy {
-            // No route here. A wrong "foreign" only keeps the LINEAR offer.
-            gamescope_tiled,
-            ..zero_copy_policy(
-                want.pyrowave,
-                want.nv12_native,
-                modifier_codec,
-                bit_depth,
-                want.hdr,
-            )
+        keepalive,
+        pf_capture::VirtualOutputOpts {
+            allow_zerocopy: want.gpu,
+            want_444: want.chroma_444,
+            want_hdr: want.hdr,
+            ten_bit_sdr: want.ten_bit_sdr,
+            expect_exact_dims: vout.expect_exact_dims,
+            producer,
+            policy: pf_capture::ZeroCopyPolicy {
+                // No route here. A wrong "foreign" only keeps the LINEAR offer.
+                gamescope_tiled,
+                ..zero_copy_policy(
+                    want.pyrowave,
+                    want.nv12_native,
+                    modifier_codec,
+                    bit_depth,
+                    want.hdr,
+                )
+            },
         },
-        vout.expect_exact_dims,
-        kwin,
-        gamescope,
-        if kwin {
-            pf_capture::KWIN_POOL_MIN
-        } else {
-            pf_capture::POOL_MIN
-        },
-        kwin.then_some(pf_capture::KWIN_POOL_MAX),
-        kwin && pf_capture::unpaced_capture(),
     )
-}
-
-/// Keeps the compositor's output alive for a capturer that did not take it.
-///
-/// `pf-capture` owns the keepalive on the portal path; the direct path is opened before
-/// the keepalive can be committed, so it rides here instead. Every trait call forwards.
-#[cfg(target_os = "linux")]
-struct KeptAlive {
-    inner: Box<dyn Capturer>,
-    /// Dropped after `inner`, releasing the output only once capture has stopped — unless a
-    /// capture-only rebuild took it back first.
-    keepalive: Option<Box<dyn Send>>,
-}
-
-#[cfg(target_os = "linux")]
-impl Capturer for KeptAlive {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
-        self.inner.next_frame()
-    }
-    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
-        self.keepalive.take()
-    }
-    fn next_frame_within(&mut self, b: std::time::Duration) -> Result<CapturedFrame> {
-        self.inner.next_frame_within(b)
-    }
-    fn next_frame_within_provisional(&mut self, b: std::time::Duration) -> Result<CapturedFrame> {
-        self.inner.next_frame_within_provisional(b)
-    }
-    fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        self.inner.try_latest()
-    }
-    fn supports_arrival_wait(&self) -> bool {
-        self.inner.supports_arrival_wait()
-    }
-    fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        self.inner.wait_arrival(deadline)
-    }
-    fn set_active(&mut self, active: bool) {
-        self.inner.set_active(active)
-    }
-    fn is_alive(&self) -> bool {
-        self.inner.is_alive()
-    }
-    fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
-        self.inner.cursor()
-    }
-    fn set_cursor_forward(&mut self, on: bool) {
-        self.inner.set_cursor_forward(on)
-    }
-    fn attach_gamescope_cursor(&mut self, t: pf_capture::GamescopeCursorTargets) {
-        self.inner.attach_gamescope_cursor(t)
-    }
-    fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
-        self.inner.hdr_meta()
-    }
-    fn pipeline_depth(&self) -> usize {
-        self.inner.pipeline_depth()
-    }
 }
 
 /// Can the native-plane source this session will drive deliver 10-bit PQ/BT.2020?

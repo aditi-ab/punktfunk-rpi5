@@ -296,11 +296,7 @@ impl PortalCapturer {
         let join = thread::Builder::new()
             .name("punktfunk-portal".into())
             .spawn(move || {
-                if anchored {
-                    portal_thread_remote_desktop(setup_tx, quit_rx, want_metadata_cursor)
-                } else {
-                    portal_thread(setup_tx, quit_rx, want_metadata_cursor)
-                }
+                portal_thread(setup_tx, quit_rx, want_metadata_cursor, anchored);
                 // After the fn closed its portal session, so `Drop`'s
                 // `recv_timeout` means the cast is gone. Covers early returns.
                 let _ = done_tx.send(());
@@ -351,67 +347,57 @@ impl PortalCapturer {
     }
 
     /// Capturer for an already-created virtual output's PipeWire node.
-    /// The host supplies producer contracts because node ids do not identify
-    /// a compositor. `keepalive` releases the output with the capturer.
-    #[allow(clippy::too_many_arguments)]
+    /// `opts.producer` supplies the producer contracts a node id cannot reveal.
+    /// `keepalive` releases the output with the capturer.
     pub fn from_virtual_output(
         remote_fd: Option<OwnedFd>,
         node_id: u32,
         preferred_mode: Option<(u32, u32, u32)>,
         keepalive: Box<dyn Send>,
-        allow_zerocopy: bool,
-        want_444: bool,
-        want_hdr: bool,
-        ten_bit_sdr: bool,
-        policy: ZeroCopyPolicy,
-        expect_exact_dims: bool,
-        cursor_id0_hides: bool,
-        producer_is_gamescope: bool,
-        pool_min: i32,
-        pool_max: Option<i32>,
-        unpaced: bool,
+        opts: super::VirtualOutputOpts,
     ) -> Result<PortalCapturer> {
+        let kwin = opts.producer == super::Producer::Kwin;
+        let capture = CaptureOpts {
+            allow_zerocopy: opts.allow_zerocopy,
+            want_444: opts.want_444,
+            want_hdr: opts.want_hdr,
+            ten_bit_sdr: opts.ten_bit_sdr,
+            expect_exact_dims: opts.expect_exact_dims,
+            cursor_id0_hides: kwin,
+            producer_is_gamescope: opts.producer == super::Producer::Gamescope,
+            pool_min: if kwin {
+                crate::KWIN_POOL_MIN
+            } else {
+                crate::POOL_MIN
+            },
+            pool_max: kwin.then_some(crate::KWIN_POOL_MAX),
+            unpaced: kwin && crate::unpaced_capture(),
+            lazy: crate::lazy_capture(),
+        };
         tracing::info!(
             node_id,
-            allow_zerocopy,
-            want_444,
-            want_hdr,
-            expect_exact_dims,
-            cursor_id0_hides,
-            producer_is_gamescope,
-            pool_min,
-            ?pool_max,
-            unpaced,
+            allow_zerocopy = capture.allow_zerocopy,
+            want_444 = capture.want_444,
+            want_hdr = capture.want_hdr,
+            expect_exact_dims = capture.expect_exact_dims,
+            producer = ?opts.producer,
+            pool_min = capture.pool_min,
+            pool_max = ?capture.pool_max,
+            unpaced = capture.unpaced,
             "connecting PipeWire to virtual output"
         );
         // Virtual outputs are SDR-only except a gamescope node from our
         // `pipewire-hdr` build — the host checks before Welcome
         // (`capture::capturer_supports_hdr_for`).
-        Ok(spawn_pipewire(
-            remote_fd,
-            node_id,
-            preferred_mode,
-            CaptureOpts {
-                allow_zerocopy,
-                want_444,
-                want_hdr,
-                ten_bit_sdr,
-                expect_exact_dims,
-                cursor_id0_hides,
-                producer_is_gamescope,
-                pool_min,
-                pool_max,
-                unpaced,
-                lazy: crate::lazy_capture(),
-            },
-            policy,
-        )?
-        .into_capturer(
-            node_id,
-            Some(keepalive),
-            None,
-            super::HdrSource::VirtualOutput,
-        ))
+        Ok(
+            spawn_pipewire(remote_fd, node_id, preferred_mode, capture, opts.policy)?
+                .into_capturer(
+                    node_id,
+                    Some(keepalive),
+                    None,
+                    super::HdrSource::VirtualOutput,
+                ),
+        )
     }
 }
 
@@ -998,18 +984,20 @@ pub struct WlCapturer {
     output_name: String,
     quit: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
-    /// Holds the compositor output; dropped after the thread is joined.
-    _keepalive: Box<dyn Send>,
+    /// Holds the compositor output; dropped after the thread is joined, unless a
+    /// capture-only rebuild took it back (`take_keepalive`).
+    keepalive: Option<Box<dyn Send>>,
 }
 
 impl WlCapturer {
     /// Open the named compositor output with identity-scoped failure health.
-    /// Missing protocol/output or no consumer-importable dmabuf keeps the portal path.
+    /// Missing protocol/output or no consumer-importable dmabuf keeps the portal path,
+    /// so a failure hands `keepalive` back for it.
     pub fn open(
         output_name: String,
         keepalive: Box<dyn Send>,
         policy: ZeroCopyPolicy,
-    ) -> Result<WlCapturer> {
+    ) -> std::result::Result<WlCapturer, (anyhow::Error, Box<dyn Send>)> {
         let slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -1017,7 +1005,10 @@ impl WlCapturer {
         let identity = health_identity(hash.finish() | (1 << 63), &policy);
         let signals = CaptureSignals::new(pf_zerocopy::zero_copy_health(identity));
         signals.active.store(true, Ordering::Relaxed);
-        let h = wl_capture::spawn(output_name.clone(), policy, slot, signals)?;
+        let h = match wl_capture::spawn(output_name.clone(), policy, slot, signals) {
+            Ok(h) => h,
+            Err(e) => return Err((e, keepalive)),
+        };
         Ok(WlCapturer {
             slot: h.slot,
             wake: h.wake,
@@ -1025,7 +1016,7 @@ impl WlCapturer {
             output_name,
             quit: h.quit,
             join: Some(h.join),
-            _keepalive: keepalive,
+            keepalive: Some(keepalive),
         })
     }
 
@@ -1103,6 +1094,10 @@ impl Capturer for WlCapturer {
         !self.signals.broken.load(Ordering::Relaxed)
             && self.join.as_ref().is_some_and(|j| !j.is_finished())
     }
+
+    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
+        self.keepalive.take()
+    }
 }
 
 impl Drop for WlCapturer {
@@ -1132,7 +1127,7 @@ impl Drop for PortalCapturer {
 // not per-frame. `gnome_hdr_monitor_active` is re-exported from `lib.rs`.
 mod portal;
 pub use portal::gnome_hdr_monitor_active;
-use portal::{portal_thread, portal_thread_remote_desktop};
+use portal::portal_thread;
 
 // PipeWire consumer (`!Send`, owns its thread). Directory `mod pipewire`
 // resolves to `linux/pipewire.rs`; `super` inside still means `linux`.
@@ -1251,7 +1246,7 @@ mod wl_capturer_tests {
             output_name: "TEST-1".into(),
             quit: Arc::new(AtomicBool::new(false)),
             join: None,
-            _keepalive: Box::new(()),
+            keepalive: None,
         };
         edge.try_send(()).expect("empty channel");
         assert!(
