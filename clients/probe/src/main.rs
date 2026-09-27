@@ -18,7 +18,7 @@ mod trajectory;
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::GamepadPref;
 use punktfunk_core::config::Role;
-use punktfunk_core::fp::parse_hex32;
+use punktfunk_core::fp::{hex, parse_hex32};
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::FLAG_PROBE;
 use punktfunk_core::quic::{
@@ -151,10 +151,6 @@ fn parse_mode(m: &str) -> Option<Mode> {
         height: it.next()?.parse().ok()?,
         refresh_hz: it.next()?.parse().ok()?,
     })
-}
-
-fn hex(fp: &[u8; 32]) -> String {
-    fp.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// This probe's identity. The same files as the desktop client, including

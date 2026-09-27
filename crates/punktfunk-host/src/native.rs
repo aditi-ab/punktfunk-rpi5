@@ -259,10 +259,6 @@ fn run_ephemeral(opts: Punktfunk1Options) -> Result<()> {
     rt.block_on(serve(opts, 0, np, stats, ident, None))
 }
 
-fn fingerprint_hex(fp: &[u8; 32]) -> String {
-    fp.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Native host config when unified `serve` runs it in-process.
 pub(crate) struct NativeServe {
     pub port: u16,
@@ -342,7 +338,7 @@ pub(crate) async fn serve(
     tracing::info!(
         port = opts.port,
         source = ?opts.source,
-        fingerprint = %fingerprint_hex(&fingerprint),
+        fingerprint = %hex::encode(fingerprint),
         "punktfunk/1 host listening (QUIC) — clients pin this fingerprint"
     );
 
@@ -358,7 +354,7 @@ pub(crate) async fn serve(
         Ok(h) => crate::discovery::advertise_native(
             &h.hostname,
             opts.port,
-            &fingerprint_hex(&fingerprint),
+            &hex::encode(fingerprint),
             opts.require_pairing,
             &h.uniqueid,
             // 0 = standalone (no mgmt API) → do not advertise an `mgmt` port.
@@ -1223,7 +1219,7 @@ async fn serve_session(
             );
             anyhow::bail!("pairing requires the client to present a certificate");
         };
-        let client_fp_hex = fingerprint_hex(&client_fp);
+        let client_fp_hex = hex::encode(client_fp);
         // Charge the cooldown before consulting arming, on every outcome including rejections.
         // Otherwise "is pairing armed?" is a free oracle. A spam of knocks can hold the
         // cooldown against the real device.
@@ -1297,10 +1293,7 @@ async fn serve_session(
         // knocks like an unpaired device and re-approval is the re-grant.
         let authorized = fp
             .as_ref()
-            .map(|fp| {
-                np.effective(&fingerprint_hex(fp), wall_unix_now())
-                    .is_some()
-            })
+            .map(|fp| np.effective(&hex::encode(fp), wall_unix_now()).is_some())
             .unwrap_or(false);
         if !authorized {
             // Anonymous: no identity to approve. PIN ceremony is the way in.
@@ -1314,7 +1307,7 @@ async fn serve_session(
                      client identity and approve it in the console, or run the PIN ceremony)"
                 );
             };
-            let fp_hex = fingerprint_hex(&fp);
+            let fp_hex = hex::encode(fp);
             // Sanitize the wire name before log/console (escapes / bidi). Empty → fingerprint label.
             let label = crate::native_pairing::sanitize_device_name(
                 gate_hello.name.as_deref().unwrap_or(""),
@@ -1442,7 +1435,7 @@ pub(crate) async fn run_admitted(
     data_plane: DataPlane,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Served> {
-    let session_fp_hex = conn.peer_fingerprint().map(|fp| fingerprint_hex(&fp));
+    let session_fp_hex = conn.peer_fingerprint().map(hex::encode);
     let SessionHost {
         opts,
         audio_cap,
@@ -2088,12 +2081,7 @@ pub(crate) async fn run_admitted(
     let _live_guard = {
         let id = conn.peer_fingerprint();
         let label = id
-            .map(|fp| {
-                fp.iter()
-                    .take(4)
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            })
+            .map(|fp| hex::encode(&fp[..4]))
             .unwrap_or_else(|| "client".to_string());
         crate::vdisplay::admission::register(
             id,
@@ -2285,7 +2273,7 @@ pub(crate) async fn run_admitted(
     // Stats label: device-fingerprint prefix, else peer IP (anonymous, `--open`).
     let client_label = conn
         .peer_fingerprint()
-        .map(|fp| fingerprint_hex(&fp)[..12].to_string())
+        .map(|fp| hex::encode(fp)[..12].to_string())
         .unwrap_or_else(|| conn.remote_address().ip().to_string());
     // Reconnect inside the game's window: cancel pending termination. Data plane re-adopts via
     // `launchreg` (carries the original launch instant). Matched on (this client, this title).
@@ -3788,7 +3776,7 @@ mod tests {
         });
         std::thread::sleep(std::time::Duration::from_millis(500));
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let expected_fp = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let expected_fp = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         let mode = punktfunk_core::Mode {
             width: 1280,
             height: 720,
@@ -4199,7 +4187,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add_with_access(
             "Evening Guest",
             &fp_hex,
@@ -4254,7 +4242,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add("Edited Device", &fp_hex).unwrap();
         let host = spawn_access_host(19783, 1, np.clone());
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4342,7 +4330,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add_with_access(
             "Guest Pad",
             &fp_hex,
@@ -4434,7 +4422,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add_with_access("Launcher", &fp_hex, None).unwrap();
         let host = spawn_access_host(19786, 1, np);
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4493,7 +4481,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         // Still listed, no longer authorized.
         np.add_with_access(
             "Yesterday's Guest",

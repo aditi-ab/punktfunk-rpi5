@@ -4251,10 +4251,7 @@ async fn a_paired_device_key_buys_the_cert_lane_and_no_more() {
         Arc::new(crate::native_pairing::NativePairing::load_with(Some(path), None, false).unwrap());
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let spki = key.subject_public_key_info();
-    let fp: String = crate::webtransport::sha256(&spki)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let fp = hex::encode(crate::webtransport::sha256(&spki));
     let app = test_app_native(test_state(), np.clone());
 
     // The exchange, as the page runs it.

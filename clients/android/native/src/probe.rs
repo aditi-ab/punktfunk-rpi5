@@ -31,14 +31,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeProbe<'loca
         let port = port.clamp(0, u16::MAX as jint) as u16;
         let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
         match NativeClient::probe_identity(&host, port, timeout) {
-            Some(fp) => Ok(env.new_string(hex(&fp))?.into_raw()),
+            Some(fp) => Ok(env.new_string(punktfunk_core::fp::hex(&fp))?.into_raw()),
             None => Ok(std::ptr::null_mut()),
         }
     })
     .resolve::<LogErrorAndDefault>()
-}
-
-/// Lowercase hex, the spelling every store and advert uses for a fingerprint.
-fn hex(fp: &[u8; 32]) -> String {
-    fp.iter().map(|b| format!("{b:02x}")).collect()
 }

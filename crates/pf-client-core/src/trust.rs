@@ -316,11 +316,7 @@ pub mod store_health {
     }
 }
 
-pub fn hex(fp: &[u8; 32]) -> String {
-    fp.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub use punktfunk_core::fp::parse_hex32;
+pub use punktfunk_core::fp::{hex, parse_hex32};
 
 /// One trusted host: pinned cert fingerprint, how trust was granted, last-reached address.
 #[derive(Clone, Debug, Serialize, Deserialize)]

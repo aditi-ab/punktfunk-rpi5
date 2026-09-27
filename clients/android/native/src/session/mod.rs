@@ -16,7 +16,7 @@ mod planes;
 mod probe;
 
 use punktfunk_core::client::NativeClient;
-use punktfunk_core::fp::parse_hex32;
+use punktfunk_core::fp::{hex, parse_hex32};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -265,15 +265,6 @@ impl Drop for SessionHandle {
         #[cfg(target_os = "android")]
         self.stop_pad_audio();
     }
-}
-
-/// SHA-256 fingerprint → 64 lowercase hex chars (matches the host log + client-rs).
-fn hex32(fp: &[u8; 32]) -> String {
-    use std::fmt::Write;
-    fp.iter().fold(String::with_capacity(64), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
 }
 
 #[cfg(test)]
