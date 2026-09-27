@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Emit the three INLINE launcher-icon registries from the assets/launcher-icons masters.
 
-The OS-icon pipeline prints its path data for a human to paste into each client. That is fine
-for a mark you add once a year; it is not fine here, where three clients each need seven paths
-of up to 3 kB and a single mangled character is a silently wrong logo. So these three files are
-generated outright, with their commentary baked in below:
+Three clients each need seven paths of up to 3 kB, and a single mangled character is a silently
+wrong logo, so these files are generated outright, with their commentary baked in below:
 
     web/src/components/launcher-icon.tsx           web console, inline SVG
     clients/android/.../components/LauncherIcons.kt Android, Compose ImageVector via PathParser
@@ -17,11 +15,8 @@ Usage: python3 scripts/gen_launcher_icon_tables.py     (from anywhere; paths are
 
 from __future__ import annotations
 
-import pathlib
-import re
-import sys
+from svg_marks import ROOT, comment, mark, write
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
 MASTERS = ROOT / "assets" / "launcher-icons"
 
 # Registry order — the order a reader of any of the three files sees. Live tiles first, then the
@@ -35,33 +30,7 @@ BANNER = (
     "Per-mark provenance and licensing: assets/launcher-icons/README.md."
 )
 
-
-def mark(token: str) -> tuple[str, str, float, float]:
-    """(token, path data, viewport width, viewport height) for one master."""
-    svg = (MASTERS / f"{token}.svg").read_text()
-    box = re.search(r'viewBox="([^"]+)"', svg).group(1)
-    paths = re.findall(r'<path[^>]*\sd="([^"]+)"', svg)
-    if len(paths) != 1:
-        sys.exit(f"{token}: expected exactly one <path>, found {len(paths)}")
-    d = paths[0]
-    if any(c in d for c in "\n\t\"\\"):
-        sys.exit(f"{token}: path data must be single-line and free of quotes/backslashes")
-    _, _, w, h = box.split()
-    return token, d, float(w), float(h)
-
-
-MARKS = [mark(t) for t in TOKENS]
-
-
-def comment(prefix: str) -> str:
-    return "\n".join(f"{prefix} {line}".rstrip() for line in BANNER.splitlines())
-
-
-def write(rel: str, body: str) -> None:
-    p = ROOT / rel
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(body)
-    print(f"  {rel} ({len(body):,} bytes)")
+MARKS = [mark(MASTERS, t) for t in TOKENS]
 
 
 # --- web console -----------------------------------------------------------------------------
@@ -72,7 +41,7 @@ rows = "\n".join(
 )
 write(
     "web/src/components/launcher-icon.tsx",
-    f"""{comment("//")}
+    f"""{comment(BANNER, "//")}
 //
 // The mark a `role: "launcher"` tile draws, resolved from the entry's `icon` token. lucide
 // deliberately ships no brand marks, so this is a curated registry — the same shape as
@@ -133,7 +102,7 @@ write(
     "clients/android/app/src/main/kotlin/io/unom/punktfunk/components/LauncherIcons.kt",
     f"""package io.unom.punktfunk.components
 
-{comment("//")}
+{comment(BANNER, "//")}
 
 import androidx.compose.ui.graphics.vector.ImageVector
 
@@ -166,7 +135,7 @@ rows = "\n".join(
 )
 write(
     "crates/pf-console-ui/src/launcher_icons.rs",
-    f"""{comment("//!")}
+    f"""{comment(BANNER, "//!")}
 //!
 //! Brand mark a `role: "launcher"` tile draws, resolved from the entry's
 //! `icon` token.
