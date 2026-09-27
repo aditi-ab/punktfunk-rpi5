@@ -16,6 +16,7 @@
 
 use super::VkBridge;
 use crate::imp::proto::{ConvertOut, ConvertSrc, CursorRect};
+use crate::imp::vkdev;
 use anyhow::{anyhow, bail, Context, Result};
 use ash::vk;
 use std::collections::HashMap;
@@ -568,109 +569,34 @@ impl VkBridge {
             }
             let fmt = vk_format(s.fourcc)
                 .ok_or_else(|| anyhow!("no VkFormat for dmabuf fourcc {:#x}", s.fourcc))?;
-            let d = &self.device;
-            let dup = libc::dup(s.fd);
-            if dup < 0 {
-                bail!("dup(dmabuf fd)");
-            }
-            // SAFETY: `dup` came from a successful `dup` and nothing else owns it.
-            let dup = <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(dup);
-            let planes = [vk::SubresourceLayout::default()
-                .offset(u64::from(s.offset))
-                .row_pitch(u64::from(s.stride))];
-            let mut drm = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-                .drm_format_modifier(s.modifier)
-                .plane_layouts(&planes);
-            let mut ext = vk::ExternalMemoryImageCreateInfo::default()
-                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-            let image = d
-                .create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(fmt)
-                        .extent(vk::Extent3D {
-                            width: s.width,
-                            height: s.height,
-                            depth: 1,
-                        })
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                        .usage(vk::ImageUsageFlags::SAMPLED)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .initial_layout(vk::ImageLayout::PREINITIALIZED)
-                        .push_next(&mut ext)
-                        .push_next(&mut drm),
-                    None,
-                )
-                .context("create dmabuf image (modifier)")?;
-            let mut fd_props = vk::MemoryFdPropertiesKHR::default();
-            let _ = self.ext_fd.get_memory_fd_properties(
-                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-                dup.as_raw_fd(),
-                &mut fd_props,
-            );
-            let reqs = d.get_image_memory_requirements(image);
-            let bits = reqs.memory_type_bits & fd_props.memory_type_bits;
-            let mem_type = match self.memory_type(
-                if bits != 0 {
-                    bits
-                } else {
-                    reqs.memory_type_bits
+            // SAFETY: `s.fd` is the worker's cached dmabuf fd, open for this synchronous call;
+            // the import dups it and keeps no borrow.
+            let fd = std::os::fd::BorrowedFd::borrow_raw(s.fd);
+            let (image, memory) = vkdev::import_dmabuf_image(
+                &self.device,
+                &self.ext_fd,
+                &self.mem_props,
+                &vkdev::DmabufImage {
+                    fd,
+                    format: fmt,
+                    width: s.width,
+                    height: s.height,
+                    modifier: s.modifier,
+                    planes: &[vk::SubresourceLayout::default()
+                        .offset(u64::from(s.offset))
+                        .row_pitch(u64::from(s.stride))],
+                    usage: vk::ImageUsageFlags::SAMPLED,
+                    // The first acquire barrier transitions from PREINITIALIZED.
+                    initial_layout: vk::ImageLayout::PREINITIALIZED,
                 },
-                vk::MemoryPropertyFlags::empty(),
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    d.destroy_image(image, None);
-                    return Err(e);
-                }
-            };
-            let mut import = vk::ImportMemoryFdInfoKHR::default()
-                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-                .fd(dup.as_raw_fd());
-            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
-            let memory = match d.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(reqs.size)
-                    .memory_type_index(mem_type)
-                    .push_next(&mut import)
-                    .push_next(&mut dedicated),
                 None,
-            ) {
-                Ok(m) => {
-                    let _ = dup.into_raw_fd(); // Vulkan owns the dup now
-                    m
-                }
-                Err(e) => {
-                    d.destroy_image(image, None);
-                    return Err(e).context("import dmabuf memory (image)");
-                }
-            };
-            if let Err(e) = d.bind_image_memory(image, memory, 0) {
-                d.free_memory(memory, None);
-                d.destroy_image(image, None);
-                return Err(e).context("bind dmabuf image");
-            }
-            let view = match d.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(fmt)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                    ),
-                None,
-            ) {
+            )?;
+            let view = match vkdev::color_view(&self.device, image, fmt, 0) {
                 Ok(v) => v,
                 Err(e) => {
-                    d.destroy_image(image, None);
-                    d.free_memory(memory, None);
-                    return Err(e).context("create dmabuf image view");
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                    return Err(e);
                 }
             };
             let st = self.conv.as_mut().expect("convert state");

@@ -1,6 +1,6 @@
-//! The NVIDIA Vulkan compute device the LINEAR bridge ([`super::vulkan`]) and the NVENC slot
-//! blend ([`super::vkslot`]) open: the GPU CUDA runs on, one compute queue, external memory,
-//! and whichever optional extensions the device has.
+//! Vulkan helpers the LINEAR bridge ([`super::vulkan`]), the NVENC slot blend
+//! ([`super::vkslot`]) and pf-encode's Vulkan encoders share: the NVIDIA compute device CUDA
+//! runs on, the memory-type pick, and the explicit-modifier dmabuf import.
 
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
@@ -246,6 +246,153 @@ pub(crate) fn memory_type(
                     .contains(flags)
         })
         .ok_or_else(|| anyhow!("no Vulkan memory type with {flags:?} in bits {type_bits:#x}"))
+}
+
+/// A dmabuf to import as a `TYPE_2D` image with an explicit DRM modifier layout.
+pub struct DmabufImage<'a> {
+    /// Borrowed: the import takes a dup of it.
+    pub fd: std::os::fd::BorrowedFd<'a>,
+    pub format: vk::Format,
+    pub width: u32,
+    pub height: u32,
+    pub modifier: u64,
+    /// One `(offset, row_pitch)` layout per memory plane of `format`.
+    pub planes: &'a [vk::SubresourceLayout],
+    pub usage: vk::ImageUsageFlags,
+    /// `PREINITIALIZED` when the first acquire barrier transitions from it; else `UNDEFINED`.
+    pub initial_layout: vk::ImageLayout,
+}
+
+/// Import `src` as an image bound to its own dedicated memory. The memory type comes from the
+/// fd's properties intersected with the image's requirements, or the requirements alone when
+/// the driver reports no fd types. `profile_list` chains a video profile into the image.
+///
+/// The import takes a dup of `src.fd`: Vulkan owns the dup only once memory allocation
+/// succeeds, and `vkFreeMemory` then closes it. On failure every handle this call created is
+/// destroyed, and the caller's fd stays theirs. The caller destroys the image, then frees the
+/// memory.
+///
+/// # Safety
+/// `device` and `ext_fd` belong to the live device `mem_props` describes, with
+/// `VK_EXT_external_memory_dma_buf` and `VK_EXT_image_drm_format_modifier` enabled.
+pub unsafe fn import_dmabuf_image(
+    device: &ash::Device,
+    ext_fd: &ash::khr::external_memory_fd::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    src: &DmabufImage,
+    profile_list: Option<&mut vk::VideoProfileListInfoKHR>,
+) -> Result<(vk::Image, vk::DeviceMemory)> {
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    let dup = src.fd.try_clone_to_owned().context("dup dmabuf fd")?;
+    let mut drm = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+        .drm_format_modifier(src.modifier)
+        .plane_layouts(src.planes);
+    let mut ext = vk::ExternalMemoryImageCreateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let mut ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(src.format)
+        .extent(vk::Extent3D {
+            width: src.width,
+            height: src.height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(src.usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(src.initial_layout)
+        .push_next(&mut ext)
+        .push_next(&mut drm);
+    if let Some(pl) = profile_list {
+        ci = ci.push_next(pl);
+    }
+    // SAFETY: caller contract for `device`/`ext_fd`; every create info is a local that outlives
+    // the synchronous call reading it, and each failure destroys what this call created.
+    unsafe {
+        let image = device
+            .create_image(&ci, None)
+            .context("create dmabuf image (modifier)")?;
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        // Borrow-only; a failure leaves no fd types, and the image requirements decide.
+        let _ = ext_fd.get_memory_fd_properties(
+            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+            dup.as_raw_fd(),
+            &mut fd_props,
+        );
+        let reqs = device.get_image_memory_requirements(image);
+        let bits = match reqs.memory_type_bits & fd_props.memory_type_bits {
+            0 => reqs.memory_type_bits,
+            bits => bits,
+        };
+        let mem_type = match memory_type(mem_props, bits, vk::MemoryPropertyFlags::empty()) {
+            Ok(t) => t,
+            Err(e) => {
+                device.destroy_image(image, None);
+                return Err(e); // `dup` drops: nothing imported it
+            }
+        };
+        let mut import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(dup.as_raw_fd());
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let memory = match device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(reqs.size)
+                .memory_type_index(mem_type)
+                .push_next(&mut import)
+                .push_next(&mut dedicated),
+            None,
+        ) {
+            Ok(m) => {
+                let _ = dup.into_raw_fd(); // Vulkan owns the dup now
+                m
+            }
+            Err(e) => {
+                device.destroy_image(image, None);
+                return Err(e).context("import dmabuf memory (image)"); // `dup` closes once
+            }
+        };
+        if let Err(e) = device.bind_image_memory(image, memory, 0) {
+            device.destroy_image(image, None);
+            device.free_memory(memory, None); // closes the imported fd
+            return Err(e).context("bind dmabuf image");
+        }
+        Ok((image, memory))
+    }
+}
+
+/// A `TYPE_2D` colour view of one layer of `image`.
+///
+/// # Safety
+/// `image` is a live image of `device` in `format`.
+pub unsafe fn color_view(
+    device: &ash::Device,
+    image: vk::Image,
+    format: vk::Format,
+    layer: u32,
+) -> Result<vk::ImageView> {
+    // SAFETY: caller contract; the create info is a local that outlives the call.
+    unsafe {
+        device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .base_array_layer(layer)
+                            .layer_count(1),
+                    ),
+                None,
+            )
+            .context("create dmabuf image view")
+    }
 }
 
 #[cfg(test)]
