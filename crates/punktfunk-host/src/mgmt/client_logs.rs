@@ -6,9 +6,9 @@
 //! device. List/fetch/delete stay on the loopback bearer: bundles can hold addresses and
 //! host names, same lane as the host's own logs.
 
+use super::auth::PairedDevice;
 use super::shared::*;
 use crate::client_logs::{ClientLogMeta, MAX_BUNDLE_BYTES};
-use crate::gamestream::tls::PeerCertFingerprint;
 use axum::body::Bytes;
 use axum::Extension;
 
@@ -29,7 +29,7 @@ pub(crate) struct ClientLogUploaded {
     request_body(content = String, content_type = "text/plain", description = "The client's log text"),
     responses(
         (status = CREATED, description = "Bundle stored", body = ClientLogUploaded),
-        (status = BAD_REQUEST, description = "No paired-device certificate on the connection", body = ApiError),
+        (status = BAD_REQUEST, description = "No paired device behind the request", body = ApiError),
         (status = FORBIDDEN, description = "The device's access has expired (per-client access)", body = ApiError),
         (status = PAYLOAD_TOO_LARGE, description = "Bundle exceeds the size cap", body = ApiError),
         (status = UNPROCESSABLE_ENTITY, description = "Empty body", body = ApiError),
@@ -38,15 +38,15 @@ pub(crate) struct ClientLogUploaded {
 )]
 pub(crate) async fn client_logs_upload(
     State(st): State<Arc<MgmtState>>,
-    fp: Option<Extension<PeerCertFingerprint>>,
+    device: Option<Extension<PairedDevice>>,
     body: Bytes,
 ) -> Response {
-    // Auth admits this route for paired certs and the admin bearer, but an upload with no
-    // device identity has no owner to file it under — bearer here is a caller error.
-    let Some(Extension(PeerCertFingerprint(Some(fp)))) = fp else {
+    // Auth admits this route for paired devices, by certificate or by device key, and for the
+    // admin bearer. An upload with no device behind it has no owner to file it under.
+    let Some(Extension(PairedDevice(fp))) = device else {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "client log upload requires a paired device certificate",
+            "client log upload requires a paired device",
         );
     };
     if body.is_empty() {
