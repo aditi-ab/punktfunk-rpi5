@@ -38,6 +38,28 @@ const expand = (p: string): string =>
 	p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
 
 /**
+ * Ask the host to install emulators for the operator to approve; this never installs anything
+ * itself. Each outcome names the folder the install lands in — the grant that follows — or
+ * `refused:not_offered` / `refused:not_in_catalog`. Same posture as {@link requestAccess}: a
+ * host that can't take the request is logged once.
+ */
+export const requestEmulators = (
+	emulators: ReadonlyArray<string>,
+	reason?: string,
+): Effect.Effect<AccessRequestOutcome[], never, HostClient> =>
+	post({ paths: [], emulators: [...emulators], ...(reason ? { reason } : {}) });
+
+/**
+ * Ask the host for libretro cores in its RetroArch; the operator approves, hermir fetches them
+ * from the buildbot. Outcomes name RetroArch's cores folder, or `refused:no_retroarch`.
+ */
+export const requestCores = (
+	cores: ReadonlyArray<string>,
+	reason?: string,
+): Effect.Effect<AccessRequestOutcome[], never, HostClient> =>
+	post({ paths: [], cores: [...cores], ...(reason ? { reason } : {}) });
+
+/**
  * Ask the host to put these folders before the operator; this never grants access itself. It
  * never fails either: a host that can't take the request is logged once, and the scan goes on
  * with what it can reach.
@@ -47,7 +69,6 @@ export const requestAccess = (
 	reason?: string,
 ): Effect.Effect<AccessRequestOutcome[], never, HostClient> =>
 	Effect.gen(function* () {
-		const host = yield* HostClient;
 		const body = {
 			paths: paths.map((entry) =>
 				typeof entry === "string"
@@ -56,6 +77,15 @@ export const requestAccess = (
 			),
 			...(reason ? { reason } : {}),
 		};
+		return yield* post(body);
+	});
+
+/** One request to the host, its outcomes filtered to the rows that are what they claim. */
+const post = (
+	body: object,
+): Effect.Effect<AccessRequestOutcome[], never, HostClient> =>
+	Effect.gen(function* () {
+		const host = yield* HostClient;
 		return yield* host.request("POST", "/plugin-access/requests", body).pipe(
 			Effect.map((value) =>
 				(Array.isArray(value) ? value : []).filter(

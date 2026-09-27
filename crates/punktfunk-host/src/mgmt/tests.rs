@@ -2189,6 +2189,11 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("POST", "/api/v1/plugin-access/requests", true, false),
         ("GET", "/api/v1/plugin-access/requests", true, false),
         ("GET", "/api/v1/plugin-access", false, false),
+        // A managed emulator's program is what a plugin's launch template points at; installing is
+        // the operator's, like every install.
+        ("GET", "/api/v1/emulators", true, false),
+        ("POST", "/api/v1/emulators/{id}/install", false, false),
+        ("POST", "/api/v1/emulators/{id}/remove", false, false),
         (
             "POST",
             "/api/v1/plugin-access/{plugin}/decide",

@@ -31,6 +31,7 @@ mod cors;
 mod device_auth;
 mod diagnostics;
 mod display;
+mod emulators;
 mod events;
 mod gpu;
 mod hooks;
@@ -466,6 +467,9 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         .routes(routes!(plugin_access::get_plugin_access))
         .routes(routes!(plugin_access::decide_plugin_access))
         .routes(routes!(plugin_access::release_plugin_access))
+        .routes(routes!(emulators::get_emulators))
+        .routes(routes!(emulators::install_emulator))
+        .routes(routes!(emulators::remove_emulator))
         .routes(routes!(store::get_catalog))
         .routes(routes!(store::refresh_catalog))
         .routes(routes!(store::list_installed))
@@ -521,6 +525,7 @@ pub fn openapi_json() -> String {
         (name = "hooks", description = "Operator hooks: commands and webhooks fired on lifecycle events (fire-and-forget — hooks observe, never veto)"),
         (name = "plugins", description = "Plugin directory: running `punktfunk-plugin-*` processes register a lease and, optionally, a loopback UI the web console proxies and adds to its nav"),
         (name = "plugin-access", description = "Plugin folder access: a plugin requests a directory (its own token), the operator grants or denies it (admin lane only)"),
+        (name = "emulators", description = "Managed emulators (hermir): the catalog, what is installed or detected, install and remove (admin lane only)"),
         (name = "store", description = "Plugin store: browse signed catalogs (verified first-party entries, attributed third-party sources), install/uninstall as tracked jobs, and switch the plugin runner on"),
         (name = "update", description = "Host update check: install kind + channel, the last verified release manifest, and whether a newer host exists (admin lane only)"),
         (name = "actions", description = "Host actions: discover what this host offers (per-caller availability + permission) and invoke one by id — v1: sleep, restart, shut down the machine, gated per device by the Host power grant"),
