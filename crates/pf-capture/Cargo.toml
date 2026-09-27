@@ -31,6 +31,8 @@ ashpd = { version = "0.13", features = ["screencast", "remote_desktop"] }
 # `v0_3_49` (as pf-client-core): `Stream::is_driving`/`trigger_process` for the lazy driver.
 pipewire = { version = "0.9", features = ["v0_3_49"] }
 libc = "0.2"
+# The dmabuf read-ready fence wait before a frame is handed on.
+pf-dmabuf = { path = "../pf-dmabuf" }
 # ashpd 0.13 uses the tokio runtime for the one-time portal handshake (control plane).
 # `sync` is for the `tokio::sync::oneshot` quit channels in the portal/linux capture paths. It used
 # to be absent and compile anyway, borrowed from ashpd→zbus via feature unification.

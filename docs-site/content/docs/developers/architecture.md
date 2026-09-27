@@ -118,7 +118,8 @@ HDR over the virtual display.
 | `crates/pf-capture` | PipeWire portal capture (Linux) and driver push (Windows) behind `Capturer` |
 | `crates/pf-encode`, `pf-encode-win` | Encoder backends on Linux and Windows behind one `Encoder` trait |
 | `crates/punktfunk-encode-worker` | Separate binary that runs PyroWave at raised GPU priority |
-| `crates/pf-zerocopy` | CUDA, EGL and Vulkan dmabuf import and fence sync (Linux) |
+| `crates/pf-zerocopy` | CUDA, EGL and Vulkan dmabuf import (Linux) |
+| `crates/pf-dmabuf` | dmabuf fence wait, shared by host capture and the clients (Linux) |
 | `crates/pf-inject` | Keyboard, mouse, pen and virtual-gamepad injection |
 | `crates/pf-clipboard` | Shared clipboard backends and the clipboard plane |
 | `crates/pf-frame`, `pf-gpu`, `pf-win-display` | Frame vocabulary; GPU selection; Windows display topology |

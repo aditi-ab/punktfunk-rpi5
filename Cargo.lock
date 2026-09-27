@@ -3110,6 +3110,7 @@ dependencies = [
  "ashpd",
  "bitflags 2.13.1",
  "libc",
+ "pf-dmabuf",
  "pf-driver-proto",
  "pf-encode-win",
  "pf-frame",
@@ -3141,12 +3142,12 @@ dependencies = [
  "openh264",
  "opus",
  "pf-bitstream",
+ "pf-dmabuf",
  "pf-dxvadec",
  "pf-libva",
  "pf-update-check",
  "pf-vaapi",
  "pf-vkdecode",
- "pf-zerocopy",
  "pipewire",
  "punktfunk-core",
  "pyrowave-sys",
@@ -3202,6 +3203,14 @@ dependencies = [
  "skia-safe",
  "taffy",
  "tracing",
+]
+
+[[package]]
+name = "pf-dmabuf"
+version = "0.40.0"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]
@@ -3368,8 +3377,8 @@ dependencies = [
  "ash",
  "async-channel",
  "pf-client-core",
+ "pf-dmabuf",
  "pf-vkdecode",
- "pf-zerocopy",
  "punktfunk-core",
  "sdl3",
  "tracing",

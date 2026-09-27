@@ -52,6 +52,7 @@ on:
       - 'crates/pf-client-core/**'
       - 'crates/pf-clipboard/**'
       - 'crates/pf-console-ui/**'
+      - 'crates/pf-dmabuf/**'
       - 'crates/pf-driver-proto/**'
       - 'crates/pf-encode/**'
       - 'crates/pf-encode-win/**'

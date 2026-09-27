@@ -48,7 +48,7 @@ on:
       - 'crates/pf-vkdecode/**'
       - 'crates/pf-vaapi/**'
       - 'crates/pf-libva/**'
-      - 'crates/pf-zerocopy/**'
+      - 'crates/pf-dmabuf/**'
       - 'crates/pf-update-check/**'
       - 'crates/pyrowave-sys/**'
       - 'packaging/flatpak/**'

@@ -418,14 +418,14 @@ fn wait_render_fence(ud: &mut UserData, sync: Option<SyncPoints>, plane: Option<
             std::time::Duration::from_millis(100),
         ),
         None => match plane {
-            Some(plane) => pf_zerocopy::dmabuf_fence::wait_read_ready(plane, 100),
+            Some(plane) => pf_dmabuf::fence::wait_read_ready(plane, 100),
             None => Err(std::io::Error::from_raw_os_error(libc::EBADF)),
         },
     };
     ud.fence_wait.record(t0.elapsed().as_micros() as u64);
     match waited {
         Ok(outcome) => {
-            use pf_zerocopy::dmabuf_fence::WaitOutcome;
+            use pf_dmabuf::fence::WaitOutcome;
             match outcome {
                 WaitOutcome::Signaled => ud.fence_wait.signaled += 1,
                 WaitOutcome::NoFence => ud.fence_wait.no_fence += 1,
