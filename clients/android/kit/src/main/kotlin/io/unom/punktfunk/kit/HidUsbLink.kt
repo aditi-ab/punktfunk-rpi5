@@ -67,7 +67,8 @@ class HidUsbLink(
         val epIn: UsbEndpoint,
         val epOut: UsbEndpoint?,
     ) {
-        val inBuf: ByteBuffer = ByteBuffer.allocate(64)
+        // Direct: UsbRequest.queue copies a heap buffer into a fresh direct one on every report.
+        val inBuf: ByteBuffer = ByteBuffer.allocateDirect(64)
         var inReq: UsbRequest? = null
         var outReq: UsbRequest? = null
         var outBusy = false
