@@ -1,13 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { CustomEntry } from "@/api/gen/model/customEntry";
-import type { CustomInput } from "@/api/gen/model/customInput";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
-import { carriesCommandExecution } from "../../../../server/util/libraryConfirm";
 import {
 	emptyForm,
 	formFrom,
 	formFromStored,
-	needsPassword,
 	toInput,
 	withPassword,
 	withStored,
@@ -109,26 +106,6 @@ describe("entry model", () => {
 });
 
 describe("password gate", () => {
-	const cases: [string, CustomInput][] = [
-		["neither", { title: "a", launch: { kind: "steam_appid", value: "1" } }],
-		["command", { title: "a", launch: { kind: "command", value: "x" } }],
-		["prep", { title: "a", prep: [{ do: "x" }] }],
-		[
-			"both",
-			{
-				title: "a",
-				prep: [{ do: "x" }],
-				launch: { kind: "command", value: "x" },
-			},
-		],
-		["empty prep", { title: "a", prep: [] }],
-	];
-	for (const [name, input] of cases) {
-		test(`agrees with the BFF: ${name}`, () => {
-			expect(needsPassword(input)).toBe(carriesCommandExecution(input));
-		});
-	}
-
 	test("prep without a command still asks", () => {
 		const f = withStored(formFrom({ ...entry, launch: null }), stored);
 		const body = withPassword(toInput(f), "pw");

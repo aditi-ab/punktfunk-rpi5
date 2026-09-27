@@ -12,6 +12,21 @@ import { consoleOriginPort, pluginOriginPort } from "./pluginOrigin";
 /** A plugin id — its `definePlugin` name; the same shape the host validates. */
 export const PLUGIN_ID_RE = /^[a-z][a-z0-9-]*$/;
 
+/**
+ * A library id the host accepts: `<store>:<external id>`, both halves non-empty, at most 1024
+ * UTF-8 bytes. Control characters are refused too. clients/shared/library-id-vectors.json pins it.
+ */
+export const validEntryId = (v: unknown): v is string => {
+	if (typeof v !== "string") return false;
+	const colon = v.indexOf(":");
+	return (
+		colon > 0 &&
+		colon < v.length - 1 &&
+		new TextEncoder().encode(v).length <= 1024 &&
+		![...v].some((c) => c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f)
+	);
+};
+
 /** The proxy credential for a plugin's loopback UI. */
 export interface UiCredential {
 	port: number;

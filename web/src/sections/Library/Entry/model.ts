@@ -4,6 +4,7 @@ import type { CustomInput } from "@/api/gen/model/customInput";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
 import type { LaunchSpec } from "@/api/gen/model/launchSpec";
 import type { PrepCmd } from "@/api/gen/model/prepCmd";
+import { carriesCommandExecution } from "@/lib/command-execution";
 
 /** The entry page's one draft. Numbers and lists stay the raw text typed; `toInput` parses them. */
 export interface FormState {
@@ -182,16 +183,10 @@ export function toInput(f: FormState): CustomInput {
 	};
 }
 
-/** Does this body carry something the host hands to a shell? Same rule as the BFF's
- * `carriesCommandExecution`; a test holds the two together. */
-export function needsPassword(input: CustomInput): boolean {
-	return (input.prep?.length ?? 0) > 0 || input.launch?.kind === "command";
-}
-
 /** The body the BFF expects: the console password rides along only when the gate applies. */
 export function withPassword(
 	input: CustomInput,
 	password: string,
 ): CustomInput & { password?: string } {
-	return needsPassword(input) ? { ...input, password } : input;
+	return carriesCommandExecution(input) ? { ...input, password } : input;
 }

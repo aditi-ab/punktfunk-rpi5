@@ -1,7 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Globe, KeyRound, UserPlus, X } from "lucide-react";
 import { type FC, useState } from "react";
-import { ApiError } from "@/api/fetcher";
 import type { ApprovePending } from "@/api/gen/model/approvePending";
 import type { PendingDevice } from "@/api/gen/model/pendingDevice";
 import {
@@ -11,6 +10,7 @@ import {
 	useListPendingDevices,
 } from "@/api/gen/native/native";
 import { useApprovePendingDevice } from "@/api/pairing";
+import { usePasswordFailure } from "@/components/password-confirm";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -39,18 +39,18 @@ export const PendingDevicesSection: FC<{
 	const deny = useDenyPendingDevice();
 	// The row whose Approve dialog is open — a snapshot, so the 10 s poll can't reset the form.
 	const [approving, setApproving] = useState<PendingDevice | null>(null);
-	const [wrongPassword, setWrongPassword] = useState(false);
+	const refusal = usePasswordFailure();
 
 	const refresh = () => {
 		qc.invalidateQueries({ queryKey: getListPendingDevicesQueryKey() });
 		qc.invalidateQueries({ queryKey: getListNativeClientsQueryKey() });
 	};
 	const openApprove = (device: PendingDevice | null) => {
-		setWrongPassword(false);
+		refusal.reset();
 		setApproving(device);
 	};
 	const onApprove = (id: number, body: ApprovePending, password: string) => {
-		setWrongPassword(false);
+		refusal.reset();
 		approve.mutate(
 			{ id, data: body, password },
 			{
@@ -58,9 +58,7 @@ export const PendingDevicesSection: FC<{
 					setApproving(null);
 					refresh();
 				},
-				onError: (e) => {
-					if (e instanceof ApiError && e.status === 401) setWrongPassword(true);
-				},
+				onError: refusal.classify,
 			},
 		);
 	};
@@ -86,7 +84,7 @@ export const PendingDevicesSection: FC<{
 				onCancel={() => openApprove(null)}
 				onApprove={onApprove}
 				isPending={approve.isPending}
-				wrongPassword={wrongPassword}
+				failure={refusal.failure}
 			/>
 		</>
 	);

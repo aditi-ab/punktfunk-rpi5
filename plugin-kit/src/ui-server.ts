@@ -149,12 +149,19 @@ export interface ServeUiGame<S extends Schema.Top> {
 	) => Effect.Effect<ReadonlyArray<StatusLine>>;
 }
 
-/** Library ids are `<store>:<external id>`; the external part is the provider's own. */
-export const validEntryId = (id: string): boolean =>
-	id.length > 0 &&
-	id.length <= 256 &&
-	id.includes(":") &&
-	![...id].some(isControl);
+/**
+ * A library id the host accepts: `<store>:<external id>`, both halves non-empty, at most 1024
+ * UTF-8 bytes. Control characters are refused too. clients/shared/library-id-vectors.json pins it.
+ */
+export const validEntryId = (id: string): boolean => {
+	const colon = id.indexOf(":");
+	return (
+		colon > 0 &&
+		colon < id.length - 1 &&
+		new TextEncoder().encode(id).length <= 1024 &&
+		![...id].some(isControl)
+	);
+};
 
 function isControl(c: string): boolean {
 	const n = c.charCodeAt(0);

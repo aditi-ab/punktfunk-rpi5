@@ -1,7 +1,7 @@
 // The library-provider wire schemas — a browser-safe module (no node imports) so plugin
 // CONTRACTS can share these types with their UIs. Mirrors the host's `ProviderEntryInput`
-// (crates/punktfunk-host mgmt/library.rs). Identity codecs: plain JSON shapes, so values
-// pass through unencoded; the value is the shared type + authoring validation.
+// (crates/punktfunk-host library/custom.rs); test/wire-contract.test.ts pins the fields. Identity
+// codecs: plain JSON shapes, so values pass through unencoded.
 import { Schema } from "effect";
 
 export const Artwork = Schema.Struct({
@@ -172,6 +172,37 @@ export type GameMeta = typeof GameMeta.Type;
 export const EntryIds = Schema.Record(Schema.String, Schema.String);
 export type EntryIds = typeof EntryIds.Type;
 
+/**
+ * Which sessions on the title's display hear it: `all` (the default), `owner` (the session that
+ * owns the display), `joined` (the sessions that joined it) or `launcher` (only the one that
+ * launched the title).
+ */
+export const AudioPolicy = Schema.Struct({
+	sessions: Schema.optionalKey(
+		Schema.Literals(["all", "owner", "joined", "launcher"]),
+	),
+});
+export type AudioPolicy = typeof AudioPolicy.Type;
+
+/**
+ * What the host does with the title's own window once it first reaches the streamed screen. Every
+ * key is optional; an absent one keeps the host's default.
+ */
+export const OnWindow = Schema.Struct({
+	/** `own` opens it on an empty workspace, `current` on the one in view. Default: the host's
+	 * display policy. Only backends that can place a launch honour it. */
+	workspace: Schema.optionalKey(
+		Schema.NullOr(Schema.Literals(["own", "current"])),
+	),
+	/** Raise it. Default on. */
+	focus: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
+	/** Make it full-screen. Default off: most games set their own mode. */
+	fullscreen: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
+	/** Move it onto the streamed head if it opened elsewhere. Default on. */
+	move_to_stream_output: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
+});
+export type OnWindow = typeof OnWindow.Type;
+
 export const ProviderEntry = Schema.Struct({
 	external_id: Schema.String,
 	title: Schema.String,
@@ -203,6 +234,8 @@ export const ProviderEntry = Schema.Struct({
 	 */
 	icon: Schema.optionalKey(Schema.String),
 	ids: Schema.optionalKey(EntryIds),
+	on_window: Schema.optionalKey(OnWindow),
+	audio: Schema.optionalKey(Schema.NullOr(AudioPolicy)),
 	...GameMeta.fields,
 });
 export type ProviderEntry = typeof ProviderEntry.Type;

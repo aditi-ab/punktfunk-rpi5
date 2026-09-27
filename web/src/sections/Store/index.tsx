@@ -19,6 +19,7 @@ import {
 	useUninstallPlugin,
 } from "@/api/store";
 import { useDialogs } from "@/components/dialogs";
+import { usePasswordFailure } from "@/components/password-confirm";
 import { Stagger } from "@/components/stagger";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useLocale } from "@/lib/i18n";
@@ -66,7 +67,7 @@ export const SectionStore: FC = () => {
 	// The catalog entry awaiting its install confirmation, and the raw-spec dialog's open state.
 	const [target, setTarget] = useState<StoreEntry | null>(null);
 	const [specOpen, setSpecOpen] = useState(false);
-	const [specWrongPassword, setSpecWrongPassword] = useState(false);
+	const specRefusal = usePasswordFailure();
 	// The job the host is running for us, if any. Cleared by the operator, not by completion — a
 	// finished job's log is the only record of what happened.
 	const [jobId, setJobId] = useState<string | null>(null);
@@ -123,7 +124,7 @@ export const SectionStore: FC = () => {
 	};
 
 	const onConfirmSpec = async (spec: string, password: string) => {
-		setSpecWrongPassword(false);
+		specRefusal.reset();
 		try {
 			const { job } = await install.mutateAsync({
 				spec,
@@ -133,12 +134,9 @@ export const SectionStore: FC = () => {
 			setSpecOpen(false);
 			setJobId(job);
 		} catch (e) {
-			// A rejected password keeps the dialog open with everything the operator typed still in
+			// A refused password keeps the dialog open with everything the operator typed still in
 			// it; anything else is an ordinary install failure.
-			if (e instanceof ApiError && e.status === 401) {
-				setSpecWrongPassword(true);
-				return;
-			}
+			if (specRefusal.classify(e)) return;
 			setSpecOpen(false);
 			failed(e, m.store_install_failed());
 		}
@@ -333,10 +331,10 @@ export const SectionStore: FC = () => {
 				<SpecInstallDialog
 					open={specOpen}
 					isPending={install.isPending}
-					wrongPassword={specWrongPassword}
+					failure={specRefusal.failure}
 					onCancel={() => {
 						setSpecOpen(false);
-						setSpecWrongPassword(false);
+						specRefusal.reset();
 					}}
 					onConfirm={onConfirmSpec}
 				/>
