@@ -529,11 +529,12 @@ struct LibraryView: View {
     /// Played titles, newest first, at most twelve: the shared Recent order, cut at the first
     /// title never played.
     private var recentTitles: [GameEntry] {
-        let titles = shelfGames.filter { !$0.isLauncher }
+        // Filtered first: the sort then runs over the played titles, not the shelf.
+        let titles = shelfGames.filter {
+            !$0.isLauncher && ($0.stats?.lastPlayedUnixMs ?? 0) > 0
+        }
         let order = LibraryCollation.collate(titles, sort: .recent, groupBy: nil).first?.indices ?? []
-        return Array(order.map { titles[$0] }
-            .filter { ($0.stats?.lastPlayedUnixMs ?? 0) > 0 }
-            .prefix(12))
+        return Array(order.map { titles[$0] }.prefix(12))
     }
 
     private var favoriteIDs: [String] {
@@ -546,10 +547,11 @@ struct LibraryView: View {
     /// Favorited titles, in the shelf's current sort.
     private var favoriteTitles: [GameEntry] {
         let marked = Set(favoriteIDs)
-        let titles = shelfGames
+        guard !marked.isEmpty else { return [] }
+        // Filtered first: the sort then runs over the favorites, not the shelf.
+        let titles = shelfGames.filter { marked.contains($0.id) }
         return LibraryCollation.collate(titles, sort: LibrarySortKey(stored: sortRaw), groupBy: nil)
             .flatMap(\.indices).map { titles[$0] }
-            .filter { marked.contains($0.id) }
     }
 
     private var customizeButton: some View {
