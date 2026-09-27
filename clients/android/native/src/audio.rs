@@ -502,6 +502,8 @@ struct OpenCtx<'a> {
     sync: &'a Arc<punktfunk_core::audio::AudioSyncCell>,
     /// Set by the AAudio error callback when the device disconnects — see [`supervise`].
     disconnected: &'a Arc<AtomicBool>,
+    /// The session is closing: the ladder stops between rungs, so a stop waits for one open.
+    shutdown: &'a AtomicBool,
 }
 
 /// Why a rung that opened could not be used.
@@ -555,6 +557,9 @@ fn log_started(live: &LiveStream, proven: bool) {
 fn open_any(ladder: &[OpenRung], ctx: &OpenCtx) -> Option<LiveStream> {
     let mut unproven: Option<OpenRung> = None;
     for rung in ladder {
+        if ctx.shutdown.load(Ordering::Relaxed) {
+            return None;
+        }
         let live = match try_open(*rung, ctx) {
             Ok(live) => live,
             Err(e) => {
@@ -562,7 +567,7 @@ fn open_any(ladder: &[OpenRung], ctx: &OpenCtx) -> Option<LiveStream> {
                 continue;
             }
         };
-        match arm(&live, ctx.fmt, ctx.counters, true) {
+        match arm(&live, ctx.fmt, ctx.counters, Some(ctx.shutdown)) {
             Ok(()) => {
                 log_started(&live, true);
                 return Some(live);
@@ -585,7 +590,7 @@ fn open_any(ladder: &[OpenRung], ctx: &OpenCtx) -> Option<LiveStream> {
             }
         }
     }
-    let rung = unproven?;
+    let rung = unproven.filter(|_| !ctx.shutdown.load(Ordering::Relaxed))?;
     log::warn!(
         "audio: no rung proved it was pulling — falling back to {rung:?} unproven; if this device is silent, this line is where to look"
     );
@@ -596,7 +601,7 @@ fn open_any(ladder: &[OpenRung], ctx: &OpenCtx) -> Option<LiveStream> {
             return None;
         }
     };
-    match arm(&live, ctx.fmt, ctx.counters, false) {
+    match arm(&live, ctx.fmt, ctx.counters, None) {
         Ok(()) => {
             log_started(&live, false);
             Some(live)
@@ -608,39 +613,26 @@ fn open_any(ladder: &[OpenRung], ctx: &OpenCtx) -> Option<LiveStream> {
     }
 }
 
-/// Bring one opened stream up and prove the device is really pulling from it.
+/// Bring one opened stream up and prove the device is really pulling from it. Three failures
+/// after a successful `open_stream` each end in silence behind a healthy-looking log:
 ///
-/// Three things can go wrong AFTER a successful `open_stream`, and all three used to end as
-/// permanent silence behind a healthy-looking log:
+/// 1. **The grant differs from the request.** The data callback writes `num_frames * channels`
+///    `f32`s, so another layout or format is an out-of-bounds write on a realtime thread. The NDK
+///    promises the explicit value or a failed open; a buffer length is not taken on trust.
+/// 2. **`request_start` fails.** The rung is out, and [`open_any`] tries the next.
+/// 3. **The stream starts and never calls back.** Decoding would carry on into a device that
+///    never plays it.
 ///
-/// 1. **The grant differs from the request.** The data callback casts AAudio's buffer to `f32` and
-///    writes `num_frames * channels` of them, so a stream that came back with a different layout
-///    or format is not merely mis-tuned — it is an out-of-bounds write on a realtime thread.
-///    The NDK contract says an explicitly-requested value is honoured or the open fails, so this
-///    should be unreachable; "should be unreachable" is not a licence to trust a HAL about the
-///    length of a buffer we are about to write.
-/// 2. **`request_start` fails.** The old code gave up on the spot rather than trying the next rung,
-///    so one grumpy configuration disabled audio for the whole session.
-/// 3. **The stream starts and never calls back.** Nothing detected this, and it is the failure that
-///    matters most: the decode thread cheerfully decodes into a device that will never play it,
-///    every counter looks plausible, and the only symptom is silence.
+/// The rate is held to the RUNG's request, or to the session's for an unspecified rung: any other
+/// rate is a resample, which the hi-res rule (§9) forbids — rejecting the rung is how it says so.
 ///
-/// ⚠ **The rate check is compared against the RUNG, not a constant, and it is no longer only a
-/// memory-safety check.** Every rung used to ask for 48 kHz, so `!= 48000` could only mean a HAL
-/// misbehaving. Now the session negotiates its rate, so this comparison is also the §9 rule — *a
-/// client that opens its device and gets a rate other than the resolved one must say so and fall
-/// back, not resample quietly* — and rejecting the rung is how it says so. A rung that asked for
-/// nothing (AAUDIO_UNSPECIFIED) is held to the SESSION's rate: it exists to rescue a HAL that
-/// refuses explicit requests while already running at the rate we wanted, never to accept whatever
-/// the HAL felt like.
-///
-/// `prove_pulling` runs (3); the last-resort reopen in [`open_any`] passes `false`, having already
-/// decided that an unproven stream beats no stream.
+/// `prove_pulling` runs (3) and gives up once that flag is set (a closing session); the
+/// last-resort reopen in [`open_any`] passes `None`, an unproven stream beating none.
 fn arm(
     live: &LiveStream,
     fmt: SessionAudio,
     counters: &Counters,
-    prove_pulling: bool,
+    prove_pulling: Option<&AtomicBool>,
 ) -> Result<(), ArmError> {
     let s = &live.stream;
     let channels = fmt.channels;
@@ -663,12 +655,15 @@ fn arm(
     // device still glitches. set_buffer_size_in_frames clamps to capacity.
     let burst = s.frames_per_burst().max(1);
     let _ = s.set_buffer_size_in_frames((burst * 3).min(s.buffer_capacity_in_frames()));
-    if !prove_pulling {
+    let Some(shutdown) = prove_pulling else {
         return Ok(());
-    }
+    };
     let before = counters.callbacks.load(Ordering::Relaxed);
     let mut waited = 0u64;
-    while counters.callbacks.load(Ordering::Relaxed) == before && waited < START_WATCHDOG_MS {
+    while counters.callbacks.load(Ordering::Relaxed) == before
+        && waited < START_WATCHDOG_MS
+        && !shutdown.load(Ordering::Relaxed)
+    {
         std::thread::sleep(Duration::from_millis(START_WATCHDOG_POLL_MS));
         waited += START_WATCHDOG_POLL_MS;
     }
@@ -750,12 +745,14 @@ fn supervise(
             counters: &counters,
             sync: &sync,
             disconnected: &disconnected,
+            shutdown,
         };
         let live = match open_any(&ladder, &ctx) {
             Some(live) => {
                 reopen_attempt = 0;
                 live
             }
+            None if shutdown.load(Ordering::Relaxed) => return,
             // A reopen that lands in the middle of the very route change that caused the
             // disconnect finds no usable device and would otherwise disable audio permanently —
             // the exact outcome this supervisor exists to prevent. An HDMI mode switch or an AVR
