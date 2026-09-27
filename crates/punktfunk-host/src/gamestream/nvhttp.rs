@@ -75,7 +75,7 @@ fn peer_grants(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) -> 
         return None;
     };
     match st.access.get() {
-        Some(np) => np.moonlight_effective(fp, super::wall_unix_now()),
+        Some(np) => np.moonlight_effective(fp, crate::clock::unix_secs()),
         // No registry (tests / embedders that skip `serve`): pre-grants = full control.
         None => Some(GRANT_ALL),
     }
@@ -840,7 +840,7 @@ mod tests {
             &fp_hex,
             Access {
                 grants: GRANT_ALL,
-                expires_unix: Some(super::super::wall_unix_now() - 5),
+                expires_unix: Some(crate::clock::unix_secs() - 5),
                 until_disconnect: false,
             },
         )
@@ -894,7 +894,7 @@ mod tests {
         .await;
         assert!(ok.contains("<resume>1</resume>"), "ungoverned resume: {ok}");
 
-        let now = super::super::wall_unix_now();
+        let now = crate::clock::unix_secs();
         np.add_with_access(
             "Guest",
             &fp_hex,

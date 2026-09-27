@@ -315,13 +315,6 @@ fn parse_args() -> Args {
     }
 }
 
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
 /// Human name for the negotiated `Welcome::codec` (also the natural `--out` file extension). The
 /// bitstream is dumped verbatim, so an H.264 software-host session should be saved as `.h264`.
 fn codec_ext(codec: u8) -> &'static str {
@@ -1190,7 +1183,11 @@ async fn session(args: Args) -> Result<()> {
                         pcm[f * 2 + 1] = s;
                     }
                     if let Ok(n) = enc.encode_float(&pcm, &mut out) {
-                        let d = punktfunk_core::quic::encode_mic_datagram(seq, now_ns(), &out[..n]);
+                        let d = punktfunk_core::quic::encode_mic_datagram(
+                            seq,
+                            punktfunk_core::quic::wall_clock_ns(),
+                            &out[..n],
+                        );
                         if conn2.send_datagram(d.into()).is_err() {
                             break 'stream;
                         }
@@ -1582,7 +1579,8 @@ async fn session(args: Args) -> Result<()> {
                     bytes += frame.data.len() as u64;
                     // capture→received: our receive instant in the host clock (now + offset)
                     // minus the host's capture pts. offset is 0 same-host / old host.
-                    let lat = (now_ns() as i128 + clock_offset as i128 - frame.pts_ns as i128)
+                    let lat = (punktfunk_core::quic::wall_clock_ns() as i128 + clock_offset as i128
+                        - frame.pts_ns as i128)
                         .max(0) as u64;
                     if lat > 0 && lat < 10_000_000_000 {
                         latencies_us.push(lat / 1000);

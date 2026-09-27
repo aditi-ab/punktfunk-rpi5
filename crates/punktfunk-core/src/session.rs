@@ -107,7 +107,7 @@ pub struct Session {
 /// frames return as the last shard lands, so this is reassembly completion. CLOCK_REALTIME
 /// to match `pts_ns` and the skew handshake — not monotonic; the math is cross-machine.
 fn stamp_received(mut f: Frame) -> Frame {
-    f.received_ns = crate::stats::now_realtime_ns();
+    f.received_ns = crate::quic::wall_clock_ns();
     f
 }
 

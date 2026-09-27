@@ -208,9 +208,7 @@ impl SessionControls {
         self.grants.store(applied, Ordering::Relaxed);
         let deadline = self.deadline_unix.load(Ordering::Relaxed);
         if let Some(tx) = &self.access_tx {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs() as i64);
+            let now = crate::clock::unix_secs();
             // Best-effort, like every other `AccessUpdate`: the host enforces either way.
             let _ = tx.send(punktfunk_core::quic::AccessUpdate {
                 grants: applied,
@@ -495,13 +493,6 @@ fn session_ref(s: &LiveSession) -> crate::events::SessionRef {
     }
 }
 
-/// Host wall clock, unix seconds — the same clock `mgmt::auth` stamps deadlines in.
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
-}
-
 /// `None` until a pad sends motion: a keyboard-and-mouse session owes no gyro row.
 fn gyro_cadence(c: &SessionCounters) -> Option<GyroCadence> {
     let samples = c.motion_samples.load(Ordering::Relaxed);
@@ -669,7 +660,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         join,
         controls,
         started: std::time::Instant::now(),
-        started_unix: unix_now(),
+        started_unix: crate::clock::unix_secs(),
         bit_depth,
         chroma,
         end_reason,

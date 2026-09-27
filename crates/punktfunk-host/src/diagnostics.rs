@@ -15,7 +15,6 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::{OnceLock, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use utoipa::ToSchema;
 
 pub(crate) mod catalog;
@@ -232,7 +231,7 @@ impl Diagnostics {
             let probes = self.probes.read().unwrap();
             probes.iter().map(|p| p()).collect()
         };
-        let now = now_unix();
+        let now = crate::clock::unix_secs_u64();
         let mut checks = self.checks.write().unwrap();
         for mut check in fresh {
             let previous_since = prior_since(checks.get(&check.id));
@@ -246,7 +245,7 @@ impl Diagnostics {
     /// Push one event-source verdict. Returns whether *status* changed so the caller emits SSE
     /// on a transition, not once per backoff retry.
     pub fn set(&self, mut check: HostCheck) -> bool {
-        let now = now_unix();
+        let now = crate::clock::unix_secs_u64();
         let mut checks = self.checks.write().unwrap();
         let previous = checks.get(&check.id);
         let changed = previous.is_none_or(|p| p.status != check.status);
@@ -296,13 +295,6 @@ fn carry_since(check: &mut HostCheck, previous_since: Option<u64>, now: u64) {
         .status
         .needs_attention()
         .then(|| previous_since.unwrap_or(now));
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Process-wide registry, not an `AppState` field: one set of device nodes and group membership

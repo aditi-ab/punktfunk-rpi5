@@ -101,14 +101,6 @@ pub(crate) use sanitize::is_spoofy_char;
 /// Stable path for the native accept loop.
 pub(crate) use sanitize::sanitize_device_name;
 
-/// Host wall clock, unix seconds. An NTP step moves stored deadlines with the clock.
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// How long a "this session" record outlives its last session. A router blip, a client
 /// restart or a sleeping laptop must not cost the guest a re-pair; anything longer starts to
 /// look like the deadline this grant exists to replace. Deliberately not `gamelease`'s
@@ -609,7 +601,9 @@ impl NativePairing {
     ) -> PairingDecision {
         self.approval
             .wait_for_decision(fp_hex, knock_seq, timeout, |fp| {
-                self.store.effective(fp, unix_now()).is_some()
+                self.store
+                    .effective(fp, crate::clock::unix_secs())
+                    .is_some()
             })
             .await
     }

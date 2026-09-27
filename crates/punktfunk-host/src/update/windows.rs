@@ -90,7 +90,7 @@ pub(super) fn run_apply(
             from: crate::version::get().into(),
             to: target_version.into(),
             serial,
-            started_unix: super::now_unix(),
+            started_unix: crate::clock::unix_secs_u64(),
             installer_sha256: asset.sha256.to_ascii_lowercase(),
             log_path: log.display().to_string(),
             source_build: false,

@@ -201,13 +201,6 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn unix_ms_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Filesystem-safe id from start time + resolution, e.g.
 /// `2026-06-26T20-14-03Z_5120x1440`. Dashes, not colons, so Windows accepts it.
 fn capture_id(unix_ms: u64, width: u32, height: u32) -> String {
@@ -266,7 +259,7 @@ impl StatsRecorder {
         if guard.is_none() {
             *guard = Some(Live {
                 started: Instant::now(),
-                started_unix_ms: unix_ms_now(),
+                started_unix_ms: crate::clock::unix_ms(),
                 meta: None,
                 samples: Vec::new(),
                 link: Vec::new(),

@@ -476,10 +476,7 @@ pub fn set_thread_boost(boost: fn()) {
 /// [`crate::audio::AvSync`] lives in an embedder crate and must use this basis: `Instant` or
 /// a monotonic clock is wrong by boot time and still looks plausible.
 pub fn now_realtime_ns() -> i128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i128)
-        .unwrap_or(0)
+    crate::quic::wall_clock_ns() as i128
 }
 
 /// Calling thread's kernel id for ADPF-style hints. Linux/Android `gettid`; elsewhere `None`.

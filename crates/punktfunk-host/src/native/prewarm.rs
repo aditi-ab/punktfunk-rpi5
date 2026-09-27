@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{seat_id, session_isolation, wall_unix_now};
+use super::{seat_id, session_isolation};
 use crate::vdisplay::{Compositor, GamescopeRoute};
 use punktfunk_core::Mode;
 
@@ -69,7 +69,7 @@ pub(crate) fn record(fp_hex: &str, mode: Mode, hdr: bool, hw_cursor: bool) {
         refresh_hz: mode.refresh_hz,
         hdr,
         hw_cursor,
-        last_steam_launch: wall_unix_now(),
+        last_steam_launch: crate::clock::unix_secs(),
     };
     if let Err(e) = write(&seat_id(fp_hex), &rec) {
         tracing::warn!(error = %e, "seat record not written — this seat is not pre-warmed");
@@ -128,7 +128,7 @@ fn run(why: &'static str) {
         );
         return;
     }
-    for (id, rec) in candidates(wall_unix_now(), all_records()) {
+    for (id, rec) in candidates(crate::clock::unix_secs(), all_records()) {
         if parked.len() >= cap {
             break;
         }

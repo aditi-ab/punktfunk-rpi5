@@ -250,7 +250,7 @@ impl Pads {
     fn feed_frame(&self, idx: usize, state: &PadState, mask: u16) -> crate::pad_feed::PadFrame {
         crate::pad_feed::PadFrame {
             pad: idx as u8,
-            ts_ms: crate::pad_feed::now_ms(),
+            ts_ms: crate::clock::unix_ms(),
             device: self.kinds[idx].as_str().to_string(),
             declared: self.declared[idx].map(|k| k.as_str().to_string()),
             slot: self.slots.slot_of(idx),

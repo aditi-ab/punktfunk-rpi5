@@ -134,6 +134,8 @@ mod inject {
     pub(crate) use pf_inject::*;
 }
 mod client_logs;
+// Unix wall clock every stored deadline and event stamp reads.
+mod clock;
 // Compositor + gamescope route for a connect, shared by the native and GameStream planes.
 mod compositor_route;
 // Re-`Hello::launch` must not start a second copy — design/session-game-lifetime.md.
@@ -266,10 +268,7 @@ fn main() {
             .unwrap_or("<unnamed>")
             .to_string();
         let backtrace = std::backtrace::Backtrace::force_capture();
-        let ts_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let ts_ms = clock::unix_ms();
         log_capture::ring().push_remote(
             "ERROR",
             "punktfunk_host::panic",

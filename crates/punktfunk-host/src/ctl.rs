@@ -690,10 +690,7 @@ fn console_stub() -> Result<String> {
             dir.join("mgmt-token").display()
         ))
     })?;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let ts = crate::clock::unix_secs_u64();
     let mut raw = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut raw);
     let nonce = hex::encode(raw);

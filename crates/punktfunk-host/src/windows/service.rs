@@ -1814,10 +1814,7 @@ fn maybe_boot_loop_rollback(restarts: u32, attempted: &mut bool) {
     let Some(intent) = crate::update::jobs::read_intent(&intent_path) else {
         return;
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::clock::unix_secs_u64();
     // Stale intent: no rollback. A boot-looping *old* binary is not this update; reconcile owns it.
     if now.saturating_sub(intent.started_unix) > 30 * 60 || crate::version::get() != intent.to {
         return;

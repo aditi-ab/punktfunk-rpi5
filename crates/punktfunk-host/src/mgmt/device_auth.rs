@@ -15,7 +15,6 @@
 //! yields a short-lived bearer token, and the key is used once per session.
 
 use super::shared::*;
-use crate::mgmt::auth::unix_now;
 use base64::Engine as _;
 use rand::RngCore;
 use std::collections::HashMap;
@@ -140,7 +139,10 @@ impl DeviceAuth {
                 expires,
             },
         );
-        (token, unix_now() + TOKEN_TTL.as_secs() as i64)
+        (
+            token,
+            crate::clock::unix_secs() + TOKEN_TTL.as_secs() as i64,
+        )
     }
 
     /// The device behind a bearer token, if it is live. The caller still re-checks the
@@ -284,10 +286,10 @@ pub(crate) async fn post_device_token(
     let fingerprint = hex::encode(crate::webtransport::sha256(&spki));
     // Paired *and* unexpired, read now rather than trusted from the ceremony: the same
     // `effective` check the certificate lane makes.
-    let paired = st
-        .native
-        .as_ref()
-        .is_some_and(|n| n.effective(&fingerprint, unix_now()).is_some());
+    let paired = st.native.as_ref().is_some_and(|n| {
+        n.effective(&fingerprint, crate::clock::unix_secs())
+            .is_some()
+    });
     if !paired {
         return refuse();
     }

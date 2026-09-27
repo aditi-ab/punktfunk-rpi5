@@ -79,7 +79,7 @@ fn begin(kind: &str, target: &str) -> Result<String> {
         );
     }
     g.counter += 1;
-    let id = format!("job-{}-{}", super::catalog::unix_now(), g.counter);
+    let id = format!("job-{}-{}", crate::clock::unix_secs_u64(), g.counter);
     let job = Job {
         id: id.clone(),
         kind: kind.to_string(),
@@ -88,7 +88,7 @@ fn begin(kind: &str, target: &str) -> Result<String> {
         phase: "queued".into(),
         log: Vec::new(),
         error: None,
-        started_at: super::catalog::unix_now(),
+        started_at: crate::clock::unix_secs_u64(),
         finished_at: None,
     };
     g.jobs.push_back(job);
@@ -121,7 +121,7 @@ fn log_line(id: &str, line: String) {
 
 fn finish(id: &str, result: Result<()>) {
     update(id, |j| {
-        j.finished_at = Some(super::catalog::unix_now());
+        j.finished_at = Some(crate::clock::unix_secs_u64());
         match &result {
             Ok(()) => {
                 j.state = State::Done;

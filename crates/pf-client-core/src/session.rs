@@ -382,12 +382,8 @@ pub fn start(params: SessionParams) -> SessionHandle {
     }
 }
 
-pub fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
+/// The client's present and latency clock: the same wall-clock basis the host stamps `pts_ns` in.
+pub use punktfunk_core::quic::wall_clock_ns as now_ns;
 
 /// Session audio decoder: `0xC9` Opus or `0xD3` PCM, behind one pair of methods so
 /// the pull loop is plane-agnostic. The plane is chosen once from

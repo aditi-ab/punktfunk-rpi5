@@ -74,13 +74,6 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
-fn unix_ms_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// `{ISO-date}T{h-m-s}Z_{fp16}_{name}` — timestamp first so a directory sort is
 /// newest-last; dashes (not colons) so the stem is a valid Windows filename.
 /// Underscores separate the three fields; name/fp stay `[A-Za-z0-9.-]`.
@@ -113,7 +106,7 @@ impl ClientLogStore {
 
     /// Prunes that device past [`KEEP_PER_DEVICE`].
     pub fn save(&self, fp_hex: &str, device_name: &str, body: &[u8]) -> std::io::Result<String> {
-        let id = bundle_id(unix_ms_now(), fp_hex, device_name);
+        let id = bundle_id(crate::clock::unix_ms(), fp_hex, device_name);
         // Body may contain addresses and host names; owner-only, like host secrets.
         // The dir ACL is not the only gate.
         pf_paths::write_secret_file(&self.dir.join(format!("{id}.log")), body)?;

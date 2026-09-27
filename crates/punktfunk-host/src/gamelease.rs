@@ -241,14 +241,6 @@ impl LeaseShared {
     }
 }
 
-/// Unix ms; same clock as the event bus and status API.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Session handle. Drop stops the watcher; the *game* is the caller's
 /// decision via [`crate::session_settings`] at teardown ([`on_session_end`]).
 pub struct GameLease {
@@ -475,7 +467,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         spawned,
         procs: procs.clone(),
         terminating: AtomicBool::new(false),
-        created_ms: now_ms(),
+        created_ms: crate::clock::unix_ms(),
         was_running: AtomicBool::new(false),
         last_seen_ms: AtomicU64::new(0),
         outcome,
@@ -976,7 +968,9 @@ fn watch(
             known = live.clone();
             publish(&live);
             shared.was_running.store(true, Ordering::Relaxed);
-            shared.last_seen_ms.store(now_ms(), Ordering::Relaxed);
+            shared
+                .last_seen_ms
+                .store(crate::clock::unix_ms(), Ordering::Relaxed);
             shared.set_state(GameState::Running);
             crate::events::emit(crate::events::EventKind::GameRunning {
                 game: game_event_ref(&shared),
@@ -1059,7 +1053,9 @@ fn watch(
             known = live;
             gone_since = None;
             vetoed = false;
-            shared.last_seen_ms.store(now_ms(), Ordering::Relaxed);
+            shared
+                .last_seen_ms
+                .store(crate::clock::unix_ms(), Ordering::Relaxed);
         } else if let Some(said) = reported() {
             // Provider report is decisive both ways; `running_hint` may only
             // delay. A live report may hold a scan-invisible game; it dies
@@ -1067,7 +1063,9 @@ fn watch(
             if said.running {
                 gone_since = None;
                 vetoed = false;
-                shared.last_seen_ms.store(now_ms(), Ordering::Relaxed);
+                shared
+                    .last_seen_ms
+                    .store(crate::clock::unix_ms(), Ordering::Relaxed);
             } else {
                 finish(
                     &shared,

@@ -168,7 +168,7 @@ pub(crate) async fn require_auth(
             && st
                 .native
                 .as_ref()
-                .is_some_and(|n| n.effective(fp, unix_now()).is_some())
+                .is_some_and(|n| n.effective(fp, crate::clock::unix_secs()).is_some())
         {
             let fp = fp.clone();
             return forward_device(req, next, fp).await;
@@ -184,7 +184,7 @@ pub(crate) async fn require_auth(
                 && st
                     .native
                     .as_ref()
-                    .is_some_and(|n| n.effective(&fp, unix_now()).is_some())
+                    .is_some_and(|n| n.effective(&fp, crate::clock::unix_secs()).is_some())
             {
                 return forward_device(req, next, fp).await;
             }
@@ -395,15 +395,6 @@ pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
 /// dependency.
 pub(crate) fn token_eq(presented: &str, expected: &str) -> bool {
     Sha256::digest(presented.as_bytes()) == Sha256::digest(expected.as_bytes())
-}
-
-/// Host wall clock, unix seconds — the clock every stored access deadline is expressed in.
-/// Sampled at each check, same as `mgmt::native`'s copy.
-pub(crate) fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

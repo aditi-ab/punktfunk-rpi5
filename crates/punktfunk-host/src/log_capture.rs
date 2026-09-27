@@ -14,7 +14,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use utoipa::ToSchema;
 
 /// Ring capacity — bounds memory at a few MB worst case ([`MAX_MSG`]-sized entries).
@@ -66,10 +65,7 @@ impl LogRing {
 
     /// `pub(crate)` for the mgmt handler tests; production entries only come from [`RingLayer`].
     pub(crate) fn push(&self, level: &tracing::Level, target: &str, msg: String) {
-        let ts_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let ts_ms = crate::clock::unix_ms();
         self.push_entry(level.to_string(), target.to_string(), msg, ts_ms);
     }
 
