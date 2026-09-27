@@ -186,8 +186,8 @@ fn load_host_env() {
             let secret = k.contains("TOKEN") || k.contains("PASSWORD");
             let allowed = (k.starts_with("PUNKTFUNK_") || k == "RUST_LOG") && !secret;
             if !k.is_empty() && allowed {
-                // SAFETY: no other thread yet. The network-profile warner and the host child both
-                // start after `load_host_env` returns, so nothing reads the environment concurrently.
+                // SAFETY: std documents `set_var` as always safe on Windows: the OS serializes
+                // environment access, so the SCM dispatcher thread cannot see a torn write.
                 unsafe { std::env::set_var(k, v) };
                 n += 1;
             } else if !k.is_empty() {
