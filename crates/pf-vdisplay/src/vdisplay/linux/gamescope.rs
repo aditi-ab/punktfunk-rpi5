@@ -1087,10 +1087,8 @@ fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode, hdr: bool) -> Re
         hz = game_hz(mode.refresh_hz),
         // Quoted: systemd `Environment=` with spaces otherwise keeps only the first flag.
         // SteamOS never reads `CUSTOM_REFRESH_RATES`; the shim only forwards `PF_HDR_ARGS`.
-        hdr_args = hdr_args(hdr)
+        hdr_args = our_flags(hdr, game_hz(mode.refresh_hz))
             .into_iter()
-            .chain(cursor_args())
-            .chain(adaptive_sync_args(game_hz(mode.refresh_hz)))
             // Advertised set vs `-r` = `PF_HZ` (frame-limited) — same split as `launch_session`.
             .chain(refresh_rate_args(mode.refresh_hz.max(1)))
             .collect::<Vec<_>>()
@@ -1199,12 +1197,7 @@ fn write_session_plus_dropin(
         binds = bind.unit_lines(),
         xkb = xkb_unit_lines(),
         hz = game_hz(mode.refresh_hz),
-        hdr_args = hdr_args(hdr)
-            .into_iter()
-            .chain(cursor_args())
-            .chain(adaptive_sync_args(game_hz(mode.refresh_hz)))
-            .collect::<Vec<_>>()
-            .join(" "),
+        hdr_args = our_flags(hdr, game_hz(mode.refresh_hz)).join(" "),
         wsi = wsi.unit_lines(hdr),
     );
     std::fs::write(&path, body).with_context(|| format!("write drop-in {}", path.display()))?;
@@ -1670,12 +1663,10 @@ fn mode_mismatch(want_w: u32, want_h: u32, want_hz: u32, argvs: &[Vec<String>]) 
 /// refuse; the retry plans host-composited SDR. Fail open if we cannot look. Any one gamescope
 /// carrying the flags is enough — demanding every one would reject a good session beside a nested.
 fn verify_managed_spawn_flags(hdr: bool) -> Result<()> {
-    let expected: Vec<String> = hdr_args(hdr)
+    // The rate is a placeholder: only flag NAMES are kept, and `--adaptive-sync` is what proves
+    // the VRR half of the plan reached the compositor.
+    let expected: Vec<String> = our_flags(hdr, 1)
         .into_iter()
-        .chain(cursor_args())
-        // The rate value is a placeholder: the filter below keeps flag NAMES only, and
-        // `--adaptive-sync` is what proves the VRR half of the plan reached the compositor.
-        .chain(adaptive_sync_args(1))
         .filter(|a| a.starts_with("--")) // flag names only — their values are bare words
         .collect();
     if expected.is_empty() {
@@ -3758,12 +3749,7 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
             // Unquoted: wrapper word-splits. Empty for stock-gamescope SDR.
             .arg(format!(
                 "--setenv=PF_HDR_ARGS={}",
-                hdr_args(hdr)
-                    .into_iter()
-                    .chain(cursor_args())
-                    .chain(adaptive_sync_args(game))
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                our_flags(hdr, game).join(" ")
             ))
             .arg(format!("--setenv=GAMESCOPE_BIN={}", wrapper.display()))
             .arg("--setenv=DRM_MODE=cvt")
@@ -4101,16 +4087,19 @@ fn add_bare_gamescope_args(
     if grab_cursor {
         command.arg("--force-grab-cursor");
     }
+    command.args(our_flags(hdr, game_hz(hz)));
     // `-r` is already the reported refresh. This adds the rest of the advertised set.
-    for arg in hdr_args(hdr)
-        .into_iter()
-        .chain(cursor_args())
-        .chain(adaptive_sync_args(game_hz(hz)))
-        .chain(refresh_rate_args(hz))
-    {
-        command.arg(arg);
-    }
+    command.args(refresh_rate_args(hz));
     command.args(["--xwayland-count", "1", "--"]);
+}
+
+/// Our compositor flags, the set [`verify_managed_spawn_flags`] checks. Every spawn path passes
+/// them; the refresh list travels separately (argv or `CUSTOM_REFRESH_RATES`).
+fn our_flags(hdr: bool, game_hz: u32) -> Vec<String> {
+    let mut flags = hdr_args(hdr);
+    flags.extend(cursor_args());
+    flags.extend(adaptive_sync_args(game_hz));
+    flags
 }
 
 /// Shared by all three spawn paths — a kept display is keyed on `hdr`. Headless hardcodes
