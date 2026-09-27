@@ -848,8 +848,10 @@ pub struct QsvEncoder {
     resets_without_output: u32,
 }
 
-// SAFETY: raw VPL and D3D11 handles are not auto-`Send`. The session moves the encoder onto
-// one encode thread and drives it there; the immediate context is never shared.
+// SAFETY: raw VPL handles are not auto-`Send`, and none is thread-affine. Every call on this
+// encoder runs on the one thread that owns it; only the sync thread shares the session (see
+// `Retrieve`). The immediate context the runtime also uses is multithread-protected in
+// `ensure_inner`.
 unsafe impl Send for QsvEncoder {}
 
 impl QsvEncoder {
