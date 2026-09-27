@@ -1113,89 +1113,9 @@ struct ContentView: View {
                     }
                     .animation(.smooth(duration: 0.28), value: statsVerbosity)
                 }
-                // The bottom-centre stack: the muted-microphone badge over the start-of-stream
-                // shortcut banner. ONE overlay for both, so the two can never land on top of each
-                // other in the seconds where they overlap.
                 .overlay(alignment: .bottom) {
-                    VStack(spacing: 8) {
-                        // A forwarded pad has a gyro this session's virtual controller cannot
-                        // carry. Shown briefly at every stats tier and with the overlay off: the
-                        // failure is otherwise completely silent — the gyro just does nothing —
-                        // and the fix is a setting, so the hint has to name it. Every platform,
-                        // including tvOS, where a DualSense is an ordinary way to play.
-                        if captureEnabled, model.motionUnreachableKind != nil {
-                            MotionUnreachableBadge()
-                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                        }
-                        // The SC2 passthrough's claim edge. Same transient contract as the motion
-                        // hint above; without it the raw BLE capture engages with no visible
-                        // trace anywhere in the app.
-                        if captureEnabled, model.sc2CapturedHint {
-                            Sc2CapturedBadge()
-                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                        }
-                        // The Touch (passthrough) model met a host that drops contacts; the
-                        // fingers run the trackpad engine instead, and this says so once.
-                        if captureEnabled, model.touchFallbackNotice {
-                            TouchFallbackBadge()
-                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                        }
-                        // The expiry-warning toast (T−5 m / T−1 m, per-client access §7) —
-                        // transient, every platform, every tier: "the pad just died" must
-                        // read as "the evening's access ended" while it can still be fixed.
-                        if captureEnabled, let warning = model.accessWarning {
-                            AccessWarningBadge(text: warning)
-                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                        }
-                        // The host's word on a launch that did not give the player their game.
-                        if captureEnabled, let notice = model.launchNotice {
-                            AccessWarningBadge(text: notice, icon: "exclamationmark.triangle")
-                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                        }
-                        #if !os(tvOS)
-                        // The access chip — up for a LIMITED session ("Controller only ·
-                        // ends in 1 h 58 m") while the stats overlay is on. It rides the
-                        // stats tier rather than standing for the whole stream: a pill that
-                        // never goes away is chrome you read as distraction. Never mounted
-                        // for a full-and-permanent session (every old host): today's look
-                        // must not change there. tvOS states it as a line in the stats
-                        // overlay instead (StreamHUDView).
-                        if captureEnabled && statsVerbosity != .off && model.accessLimited {
-                            AccessChipBadge(
-                                label: model.accessLevel.label,
-                                remainingSecs: model.accessRemainingSecs)
-                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                        }
-                        // Shown for as long as the mic is muted, at every stats tier and with the
-                        // overlay off — see MicMutedBadge. tvOS has no microphone to mute.
-                        if captureEnabled && model.micMuted {
-                            MicMutedBadge { model.setMicMuted(false) }
-                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                        }
-                        #endif
-                        // The start-of-stream shortcut banner used to sit here (macOS/tvOS): the
-                        // platform's reserved controls on a glass pill for the first 6 seconds of
-                        // every session. It is now a page you can OPEN — About ▸ Shortcuts, on
-                        // both the touch and the controller surface (ShortcutsCatalog) — because
-                        // a message that shows once, over the stream you have just connected to,
-                        // is unavailable at the moment the question is actually asked. It also
-                        // put a composited overlay above the stream for those 6 seconds, which on
-                        // this path costs a refresh of display latency (see the iOS exit disc's
-                        // note below); the reference page costs nothing during a session.
-                    }
-                    .padding(.bottom, 24)
-                    .animation(.easeOut(duration: 0.2), value: model.micMuted)
-                    .animation(.easeOut(duration: 0.2), value: model.accessWarning)
-                    .animation(.easeOut(duration: 0.2), value: model.launchNotice)
-                    .animation(.easeOut(duration: 0.2), value: model.accessLimited)
-                    // The access chip now rides the stats tier, so the tier is a visibility
-                    // driver for this stack too — without it the chip pops on the toggle.
-                    .animation(.easeOut(duration: 0.2), value: statsVerbosity)
-                    // The motion hint was the one badge missing from this cluster — its
-                    // `.transition` fired in an unanimated transaction and popped. One list,
-                    // so every badge in the stack enters and exits the same way.
-                    .animation(.easeOut(duration: 0.2), value: model.motionUnreachableKind)
-                    .animation(.easeOut(duration: 0.2), value: model.sc2CapturedHint)
+                    StreamBadgeStack(
+                        model: model, captureEnabled: captureEnabled, statsVerbosity: statsVerbosity)
                 }
                 #if os(iOS)
                 // Touch has no menu or ⌘D: while the HUD shows no Disconnect (compact, off) a
@@ -1245,18 +1165,11 @@ struct ContentView: View {
                                         wire: pad, openRing: { [ring] at in ring.openAt(at) })
                     }
                 }
-                // The quick-action ring: opened by the two-finger twist under the fingers, the
-                // disc above, or the pad's ring button. Mounted only while open — a closed
-                // overlay costs nothing.
-                .overlay {
-                    if captureEnabled, ring.visible {
-                        RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn))
-                    }
-                }
-                .onChange(of: ring.committed) { _, open in model.setRingOpen(open) }
                 #endif
-                #if os(tvOS) || os(macOS)
-                // The ring on the Apple TV and the Mac: mounted only while open, like iOS.
+                #if os(iOS) || os(tvOS) || os(macOS)
+                // The quick-action ring, over the virtual controller: opened by the iOS twist or
+                // disc, the pad's ring button, the remote's Back or the Mac's chord. Mounted only
+                // while open — a closed overlay costs nothing.
                 .overlay {
                     if captureEnabled, ring.visible {
                         RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn))
