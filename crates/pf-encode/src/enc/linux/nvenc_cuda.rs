@@ -690,6 +690,8 @@ pub struct NvencCudaEncoder {
     /// The worker's convert timeline in CUDA: each pass's value is waited on the copy stream
     /// before NVENC maps the slot.
     convert_sem: Option<cuda::ExternalSemaphore>,
+    /// Highest value waited on `convert_sem`: what a stuck copy stream is queued behind.
+    convert_waited: u64,
     /// Earliest the lane may spawn another convert worker ([`WORKER_RESPAWN_BACKOFF`]).
     worker_retry_at: Option<std::time::Instant>,
     /// One-shot [`diagnose_failed_open`](Self::diagnose_failed_open) — a reset burst logs once.
@@ -822,6 +824,7 @@ impl NvencCudaEncoder {
             worker_cursor_serial: u64::MAX,
             last_raw: None,
             convert_sem: None,
+            convert_waited: 0,
             worker_retry_at: None,
             diagnosed: false,
             inited: false,
@@ -892,7 +895,38 @@ impl NvencCudaEncoder {
         }
     }
 
-    /// Stop retrieval, unmap pending inputs, then release source holds and session resources.
+    /// Drop the fused-pass semaphore once no queued wait needs it. CUDA forbids destroying it
+    /// under a wait, and a stalled or dead worker never signals: past a short drain the worker
+    /// goes and the wait is satisfied here, so the copy stream (NVENC's input) runs on.
+    fn release_convert_sem(&mut self) {
+        let Some(sem) = self.convert_sem.take() else {
+            return;
+        };
+        let waited = std::mem::take(&mut self.convert_waited);
+        let drained = |budget| {
+            cuda::make_current().is_ok() && cuda::copy_stream_sync_deadline(budget).is_ok()
+        };
+        if waited == 0 || drained(std::time::Duration::from_millis(100)) {
+            return;
+        }
+        // The old worker must not signal after this: a timeline only moves forward.
+        self.worker = None;
+        if sem.signal_detached(waited).is_ok() && drained(std::time::Duration::from_secs(1)) {
+            tracing::warn!(
+                value = waited,
+                "fused-pass wait satisfied for a retired worker"
+            );
+            return;
+        }
+        tracing::error!(
+            value = waited,
+            "copy stream stuck on the fused pass; semaphore leaked"
+        );
+        std::mem::forget(sem);
+    }
+
+    /// Stop retrieval, drain the copy stream, unmap pending inputs, then release source holds
+    /// and session resources.
     unsafe fn teardown(&mut self) {
         if self.encoder.is_null() {
             return;
@@ -905,6 +939,8 @@ impl NvencCudaEncoder {
                 let _ = j.join();
             }
         }
+        // An encode queued behind a fused-pass wait still reads the inputs unmapped below.
+        self.release_convert_sem();
         for pending in &self.pending {
             if !pending.map.is_null() {
                 let _ = (api().unmap_input_resource)(self.encoder, pending.map);
@@ -924,7 +960,6 @@ impl NvencCudaEncoder {
         // `clear_cache` dropped the worker's cursor bitmap; the next frame must upload it again.
         self.worker_cursor_serial = u64::MAX;
         self.last_raw = None;
-        self.convert_sem = None;
         for &bs in &self.bitstreams {
             let _ = (api().destroy_bitstream_buffer)(self.encoder, bs);
         }
@@ -1848,12 +1883,16 @@ impl NvencCudaEncoder {
             .ok_or_else(|| anyhow!("convert timeline not imported"))?
             .wait(value)
             .context("NVENC (Linux): wait the fused pass")?;
+        self.convert_waited = value;
         if !ordered || self.reframe.is_some() {
             // Bounded: the value came from another process, so a lost signal must cost this
-            // frame, not the encode thread. Generous against a slow 4K pass under load.
-            cuda::copy_stream_sync_deadline(std::time::Duration::from_secs(2))
-                .inspect_err(|_| super::vk_util::reject_dmabuf(d, "fused pass stalled"))
-                .context("NVENC (Linux): sync the fused pass")?;
+            // frame, not the encode thread. Generous against a slow 4K pass under load. A
+            // stall retires the worker and frees the stream for the next frame.
+            if let Err(e) = cuda::copy_stream_sync_deadline(std::time::Duration::from_secs(2)) {
+                super::vk_util::reject_dmabuf(d, "fused pass stalled");
+                self.release_convert_sem();
+                return Err(e).context("NVENC (Linux): sync the fused pass");
+            }
         }
         if let Some(r) = &self.reframe {
             let (crop, out) = (r.crop, r.out);
@@ -1883,7 +1922,7 @@ impl NvencCudaEncoder {
             // The timeline and the slot registrations belonged to that process.
             self.worker_slots.clear();
             self.worker_cursor_serial = u64::MAX;
-            self.convert_sem = None;
+            self.release_convert_sem();
             let now = std::time::Instant::now();
             if self.worker_retry_at.is_some_and(|at| now < at) {
                 bail!("NVENC (Linux): the convert worker is restarting");
@@ -4986,6 +5025,83 @@ mod tests {
             !enc.io_stream.is_null(),
             "the boxed CUstream must be held while armed"
         );
+    }
+
+    /// Queue a convert-timeline wait nothing will signal, as a worker that died mid-pass leaves.
+    fn wedge_copy_stream(enc: &mut NvencCudaEncoder) {
+        const NEVER: u64 = 1_000;
+        let mut worker = pf_zerocopy::Importer::new_for_capture().expect("in-process importer");
+        let fd = worker.convert_timeline().expect("convert timeline fd");
+        let sem = cuda::ExternalSemaphore::import_timeline_fd(fd).expect("import the timeline");
+        sem.wait(NEVER).expect("queue the wait");
+        enc.worker = Some(worker);
+        enc.convert_sem = Some(sem);
+        enc.convert_waited = NEVER;
+        assert!(
+            cuda::copy_stream_sync_deadline(std::time::Duration::from_millis(50)).is_err(),
+            "the unsignalled wait must hold the copy stream"
+        );
+    }
+
+    /// Hardware: a stuck fused-pass wait on the stream NVENC is bound to. Releasing the
+    /// semaphore retires the worker and frees the stream; the session keeps encoding, and a
+    /// teardown over a second stuck wait returns.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_stuck_fused_wait_releases() {
+        const W: u32 = 640;
+        const H: u32 = 360;
+        set_env("PUNKTFUNK_ZEROCOPY_INPROC", "1");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        if !stream_ordered_requested() || async_retrieve_requested() {
+            println!("skipped: stream-ordered submit disabled by env");
+            return;
+        }
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            8_000_000,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+            false,
+            4,
+        )
+        .expect("open NVENC CUDA session");
+        enc.submit_indexed(&nv12_frame(W, H, 0), 0).expect("submit");
+        enc.poll().expect("poll").expect("AU");
+        assert!(
+            enc.stream_ordered,
+            "IO streams must be bound to the copy stream"
+        );
+
+        wedge_copy_stream(&mut enc);
+        let t = std::time::Instant::now();
+        enc.release_convert_sem();
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "release must not hang"
+        );
+        assert!(enc.convert_sem.is_none() && enc.worker.is_none());
+        cuda::copy_stream_sync_deadline(std::time::Duration::from_millis(100))
+            .expect("the copy stream drains once the wait is satisfied");
+        for i in 1..5 {
+            enc.submit_indexed(&nv12_frame(W, H, i), i)
+                .expect("submit after release");
+            enc.poll().expect("poll").expect("AU after release");
+        }
+
+        wedge_copy_stream(&mut enc);
+        let t = std::time::Instant::now();
+        drop(enc);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(3),
+            "teardown must not hang"
+        );
+        remove_env("PUNKTFUNK_ZEROCOPY_INPROC");
     }
 
     /// Hardware: cursor frames stay on the stream-ordered path (`blend_ref_ordered`, ticket

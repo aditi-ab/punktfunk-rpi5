@@ -1203,6 +1203,31 @@ impl ExternalSemaphore {
         }
     }
 
+    /// Signal `value` on a throwaway stream, outside every copy stream. Only for a wait whose
+    /// signaller is gone: it releases a copy stream queued behind that wait. No CPU wait.
+    pub fn signal_detached(&self, value: u64) -> Result<()> {
+        let params = CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS {
+            value,
+            ..Default::default()
+        };
+        let mut stream: CUstream = std::ptr::null_mut();
+        // SAFETY: context current (as `signal`). `&mut stream` is a live out-param; the stream
+        // is non-blocking, so the signal does not queue behind the legacy NULL stream. A stream
+        // destroyed with work pending is released once that work completes.
+        unsafe {
+            ck(
+                cuStreamCreateWithPriority(&mut stream, CU_STREAM_NON_BLOCKING, 0),
+                "cuStreamCreateWithPriority",
+            )?;
+            let r = ck(
+                cuSignalExternalSemaphoresAsync(&self.sem, &params, 1, stream),
+                "cuSignalExternalSemaphoresAsync",
+            );
+            cuStreamDestroy_v2(stream);
+            r
+        }
+    }
+
     /// Enqueue a wait: later work on this thread's copy stream runs only once the timeline
     /// reaches `value`. No CPU wait.
     pub fn wait(&self, value: u64) -> Result<()> {

@@ -213,6 +213,7 @@ pub(crate) struct CudaApi {
     cuEventDestroy_v2: unsafe extern "C" fn(CUevent) -> CUresult,
     cuCtxGetStreamPriorityRange: unsafe extern "C" fn(*mut c_int, *mut c_int) -> CUresult,
     cuStreamCreateWithPriority: unsafe extern "C" fn(*mut CUstream, c_uint, c_int) -> CUresult,
+    cuStreamDestroy_v2: unsafe extern "C" fn(CUstream) -> CUresult,
     cuGraphicsGLRegisterImage:
         unsafe extern "C" fn(*mut CUgraphicsResource, c_uint, c_uint, c_uint) -> CUresult,
     cuGraphicsMapResources:
@@ -295,6 +296,7 @@ pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
                 cuEventDestroy_v2: *lib.get(b"cuEventDestroy_v2\0").ok()?,
                 cuCtxGetStreamPriorityRange: *lib.get(b"cuCtxGetStreamPriorityRange\0").ok()?,
                 cuStreamCreateWithPriority: *lib.get(b"cuStreamCreateWithPriority\0").ok()?,
+                cuStreamDestroy_v2: *lib.get(b"cuStreamDestroy_v2\0").ok()?,
                 cuGraphicsGLRegisterImage: *lib.get(b"cuGraphicsGLRegisterImage\0").ok()?,
                 cuGraphicsMapResources: *lib.get(b"cuGraphicsMapResources\0").ok()?,
                 cuGraphicsUnmapResources: *lib.get(b"cuGraphicsUnmapResources\0").ok()?,
@@ -366,6 +368,7 @@ forward! {
     cuEventDestroy_v2(event: CUevent);
     cuCtxGetStreamPriorityRange(least: *mut c_int, greatest: *mut c_int);
     cuStreamCreateWithPriority(stream: *mut CUstream, flags: c_uint, priority: c_int);
+    cuStreamDestroy_v2(stream: CUstream);
     cuGraphicsGLRegisterImage(
         resource: *mut CUgraphicsResource,
         texture: c_uint,
