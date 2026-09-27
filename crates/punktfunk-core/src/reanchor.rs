@@ -57,14 +57,6 @@ pub const RECOVERY_MARK_PATIENCE: Duration = Duration::from_millis(1500);
 /// the 120 ms loss window plus jitter, and expires so leftover credit cannot mask a later climb.
 pub const DROP_CREDIT_WINDOW: Duration = Duration::from_millis(1000);
 
-/// Frames skipped when `got` is ahead of `expected`, else `None`. Indices wrap: wrapping
-/// subtraction split at the half-space — small positive is a forward gap, top half is a
-/// straggler already passed.
-pub fn index_gap(expected: u32, got: u32) -> Option<u32> {
-    let ahead = got.wrapping_sub(expected);
-    (ahead != 0 && ahead < u32::MAX / 2).then_some(ahead)
-}
-
 /// Fold one decoded frame: IDR or honoured LTR-RFI anchor lifts immediately. With a host
 /// that marks the close (`close_aware`), `marks` counts wave starts since the arm and the
 /// first close after one lifts; otherwise [`REANCHOR_MARKS_TO_LIFT`] marks must accumulate.
@@ -676,34 +668,6 @@ mod tests {
         assert_eq!(marks, 0, "a lift resets the running mark count");
         let (lift, _) = reanchor_after_frame(false, true, true, false, false, 1);
         assert!(lift, "an anchor lifts regardless of the pending mark count");
-    }
-
-    #[test]
-    fn contiguous_indices_are_not_a_gap() {
-        assert_eq!(index_gap(5, 5), None);
-        assert_eq!(index_gap(0, 0), None);
-    }
-
-    #[test]
-    fn a_forward_jump_reports_the_skip_count() {
-        assert_eq!(index_gap(5, 6), Some(1));
-        assert_eq!(index_gap(5, 9), Some(4));
-    }
-
-    #[test]
-    fn a_straggler_behind_us_is_not_a_gap() {
-        // Reassembler can emit a newer frame first; the late one must not re-arm.
-        assert_eq!(index_gap(9, 5), None);
-        assert_eq!(index_gap(1, 0), None);
-    }
-
-    #[test]
-    fn the_index_counter_wraps_cleanly() {
-        assert_eq!(index_gap(0, 0), None);
-        // wrapping_sub half-space: MAX → 0 is one skipped frame, not a straggler.
-        assert_eq!(index_gap(u32::MAX, 0), Some(1));
-        assert_eq!(index_gap(u32::MAX, 2), Some(3));
-        assert_eq!(index_gap(0, u32::MAX), None);
     }
 
     const SOF: u32 = FLAG_SOF as u32;

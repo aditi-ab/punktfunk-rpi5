@@ -302,17 +302,15 @@ impl VkDecodeError {
     }
 
     /// Nothing was fed: the planner waits for an IDR, or for the parameter sets a
-    /// decoder built mid-GOP has not seen. Idle, not a refusal.
+    /// decoder built mid-GOP has not seen. Idle, not a refusal. H.26x reads the
+    /// planner's own rule; AV1's wait is this decoder's.
     pub fn awaits_idr(&self) -> bool {
-        matches!(
-            self,
-            VkDecodeError::Plan(PlanError::AwaitingIdr | PlanError::NoActiveParamSet { .. })
-                | VkDecodeError::PlanH265(
-                    pf_bitstream::h265::PlanError::AwaitingIdr
-                        | pf_bitstream::h265::PlanError::NoActiveParamSet { .. }
-                )
-                | VkDecodeError::AwaitingKeyAv1
-        )
+        match self {
+            VkDecodeError::Plan(e) => e.awaits_idr(),
+            VkDecodeError::PlanH265(e) => e.awaits_idr(),
+            VkDecodeError::AwaitingKeyAv1 => true,
+            _ => false,
+        }
     }
 }
 

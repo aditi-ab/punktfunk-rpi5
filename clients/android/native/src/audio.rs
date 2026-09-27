@@ -198,12 +198,19 @@ impl AudioDec {
     /// `out` is a fixed slice and is never grown: on the PCM arm the staged samples are copied in
     /// clamped to what fits, which is what makes an oversized or malformed datagram a truncated
     /// frame rather than an overrun on the decode thread.
+    ///
+    /// Empty `input` is Opus DTX or a torn PCM datagram: `Ok(0)`, nothing decoded. libopus would
+    /// read it as a loss and fill all of `out` with PLC, and `PcmConceal::accept` would drop the
+    /// frame the next loss repeats.
     fn decode_float(
         &mut self,
         input: &[u8],
         out: &mut [f32],
         channels: usize,
     ) -> Result<usize, DecodeErr> {
+        if input.is_empty() {
+            return Ok(0);
+        }
         match self {
             AudioDec::Stereo(d) => d.decode_float(input, out, false).map_err(DecodeErr::Opus),
             AudioDec::Surround(d) => d.decode_float(input, out, false).map_err(DecodeErr::Opus),
@@ -212,13 +219,6 @@ impl AudioDec {
                 scratch,
                 conceal,
             } => {
-                // No host emits an empty `0xD3` payload — PCM has no DTX — but a torn datagram
-                // can present as one, and it must NOT reach `PcmConceal::accept`: accepting an
-                // empty frame would clear the last good frame and leave the next loss with
-                // nothing to conceal from.
-                if input.is_empty() {
-                    return Ok(0);
-                }
                 let n = punktfunk_core::audio::pcm::to_f32(input, *bits, scratch)
                     .ok_or(DecodeErr::Ragged)?;
                 let n = n.min(out.len());
@@ -1267,8 +1267,6 @@ impl<'a> Plane<'a> {
         }
     }
 
-    /// Place the packet against the picture, conceal any seq gap in front of it, decode it into
-    /// the ring, and keep the 1 Hz line.
     /// Device output latency past the ring, ns: when AAudio will play the newest frame it was
     /// handed, less now. `0` until the stream reports a timestamp (it has just started).
     fn output_latency_ns(&self) -> u64 {
@@ -1290,6 +1288,8 @@ impl<'a> Plane<'a> {
         (heard_at - now_ns).max(0) as u64
     }
 
+    /// Place the packet against the picture, conceal any seq gap in front of it, decode it into
+    /// the ring, and keep the 1 Hz line. An empty payload decodes nothing.
     fn on_packet(&mut self, pkt: &AudioPacket) -> Result<(), DecodeExit> {
         // BEFORE it is queued: `buffered_ahead` is everything that must still play first, so
         // the depth read here is exactly what delays it. Published unconditionally — the ring's
@@ -1328,6 +1328,8 @@ impl<'a> Plane<'a> {
             .dec
             .decode_float(&pkt.data, &mut self.pcm, self.channels)
         {
+            // Empty payload: the last frame stays the concealment unit.
+            Ok(0) => return Ok(()),
             Ok(s) => s,
             Err(e) => {
                 log::debug!("audio: decode: {e}");

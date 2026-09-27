@@ -16,6 +16,7 @@ mod planes;
 mod probe;
 
 use punktfunk_core::client::NativeClient;
+use punktfunk_core::fp::parse_hex32;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -273,18 +274,6 @@ fn hex32(fp: &[u8; 32]) -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
-}
-
-/// 64-hex → [u8; 32]; `None` on bad length/char.
-fn parse_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
 }
 
 #[cfg(test)]

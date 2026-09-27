@@ -18,6 +18,25 @@ pub mod h264;
 pub mod h265;
 pub mod sei;
 
+#[cfg(test)]
+mod plan_error_tests {
+    use crate::{h264, h265};
+
+    /// The idle rule the Vulkan, VAAPI and D3D11VA rungs all read.
+    #[test]
+    fn only_a_missing_idr_or_parameter_set_is_idle() {
+        assert!(h264::PlanError::AwaitingIdr.awaits_idr());
+        assert!(h264::PlanError::NoActiveParamSet { pps_id: 0 }.awaits_idr());
+        assert!(!h264::PlanError::Parse(String::new()).awaits_idr());
+        assert!(!h264::PlanError::OutsideEnvelope("").awaits_idr());
+        assert!(h265::PlanError::AwaitingIdr.awaits_idr());
+        assert!(h265::PlanError::NoActiveParamSet { pps_id: 0 }.awaits_idr());
+        assert!(!h265::PlanError::RaslSkipped { poc: 0 }.awaits_idr());
+        assert!(!h265::PlanError::Parse(String::new()).awaits_idr());
+        assert!(!h265::PlanError::OutsideEnvelope("").awaits_idr());
+    }
+}
+
 // Golden counts from the vendored snapshot's own vectors. A cros-codecs re-sync that
 // shifts parser behaviour must trip here, not in a decode session.
 #[cfg(test)]

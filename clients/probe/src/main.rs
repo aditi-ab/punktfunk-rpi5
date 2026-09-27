@@ -18,6 +18,7 @@ mod trajectory;
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::GamepadPref;
 use punktfunk_core::config::Role;
+use punktfunk_core::fp::parse_hex32;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::FLAG_PROBE;
 use punktfunk_core::quic::{
@@ -150,17 +151,6 @@ fn parse_mode(m: &str) -> Option<Mode> {
         height: it.next()?.parse().ok()?,
         refresh_hz: it.next()?.parse().ok()?,
     })
-}
-
-fn parse_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
 }
 
 fn hex(fp: &[u8; 32]) -> String {
