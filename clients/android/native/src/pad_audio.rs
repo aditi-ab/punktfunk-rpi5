@@ -497,10 +497,12 @@ impl Drop for PadAudio {
 /// Start the renderer for a pad whose descriptor Java has handed over.
 ///
 /// Returns `None` when neither kind is enabled (nothing to render) or the thread will not start.
-/// **The caller must keep the `UsbDeviceConnection` open until the returned handle is dropped** —
-/// the renderer borrows the descriptor and never closes it.
+///
+/// # Safety
+/// `fd` is a live usbfs descriptor whose `UsbDeviceConnection` stays open until the returned
+/// handle is dropped — the renderer borrows it and never closes it.
 #[cfg(target_os = "android")]
-pub(crate) fn start(
+pub(crate) unsafe fn start(
     client: Arc<NativeClient>,
     pad: u8,
     fd: i32,
@@ -511,7 +513,8 @@ pub(crate) fn start(
         return None;
     }
     let stop = Arc::new(AtomicBool::new(false));
-    let join = spawn(client, Arc::clone(&stop), pad, fd, haptics, speaker)?;
+    // SAFETY: forwarded from this function's contract; dropping the handle joins the thread.
+    let join = unsafe { spawn(client, Arc::clone(&stop), pad, fd, haptics, speaker) }?;
     Some(PadAudio {
         pad,
         stop,
@@ -519,13 +522,14 @@ pub(crate) fn start(
     })
 }
 
-/// Spawn the pad-audio renderer — the 0xD1 plane's single consumer on Android.
+/// Spawn the pad-audio renderer — the 0xD1 plane's single consumer on Android. Returns `None` if
+/// the thread could not be started.
 ///
-/// `fd` is the pad's usbfs descriptor from `UsbDeviceConnection.getFileDescriptor()`; the caller
-/// **must** keep that connection open until [`stop`](AtomicBool) has been observed and the handle
-/// joined. Returns `None` if the thread could not be started.
+/// # Safety
+/// `fd` is the pad's usbfs descriptor from `UsbDeviceConnection.getFileDescriptor()`, and that
+/// connection stays open until the returned handle is joined.
 #[cfg(target_os = "android")]
-pub(crate) fn spawn(
+unsafe fn spawn(
     client: Arc<NativeClient>,
     stop: Arc<AtomicBool>,
     pad: u8,
@@ -535,13 +539,25 @@ pub(crate) fn spawn(
 ) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("pf-pad-audio".into())
-        .spawn(move || run(&client, &stop, pad, fd, haptics, speaker))
+        // SAFETY: the caller keeps `fd` open until this thread is joined.
+        .spawn(move || unsafe { run(&client, &stop, pad, fd, haptics, speaker) })
         .map_err(|e| log::warn!("pad-audio thread not started: {e}"))
         .ok()
 }
 
+/// The renderer thread's body.
+///
+/// # Safety
+/// `fd` stays open until this returns (see [`spawn`]).
 #[cfg(target_os = "android")]
-fn run(client: &NativeClient, stop: &AtomicBool, pad: u8, fd: i32, haptics: bool, speaker: bool) {
+unsafe fn run(
+    client: &NativeClient,
+    stop: &AtomicBool,
+    pad: u8,
+    fd: i32,
+    haptics: bool,
+    speaker: bool,
+) {
     // Ask the scheduler for audio priority. Android does not hand SCHED_FIFO to ordinary app
     // threads, so -16 (ANDROID_PRIORITY_AUDIO) is the realistic knob — and WP7 measured that it
     // both applies and is enough to hold the 4 ms floor against eight busy cores.
@@ -550,7 +566,7 @@ fn run(client: &NativeClient, stop: &AtomicBool, pad: u8, fd: i32, haptics: bool
         libc::setpriority(libc::PRIO_PROCESS, 0, -16);
     }
 
-    // SAFETY: the caller's contract — the Java connection outlives this thread.
+    // SAFETY: forwarded from this function's contract.
     let dev = unsafe { sink::device(fd) };
     // Through a reference, deliberately: `UsbFsDevice` has a `Drop`, and opening the stream in
     // this same scope would make the borrow outlive the value it borrows.

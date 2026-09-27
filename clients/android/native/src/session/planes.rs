@@ -546,17 +546,22 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
         // Replace any previous renderer first: dropping it joins the old thread, so two of them
         // can never hold the same descriptor at once.
         h.stop_pad_audio();
+        // SAFETY: Kotlin keeps the connection that owns `fd` open until `nativeStopPadAudio`
+        // returns, and that call (or `nativeClose`) drops, and so joins, this renderer first.
+        let started = unsafe {
+            crate::pad_audio::start(
+                std::sync::Arc::clone(&h.client),
+                pad as u8,
+                fd,
+                haptics,
+                speaker,
+            )
+        };
         // The capability declaration and the rumble suppression are NOT done here: the renderer
         // makes both only once its USB stream actually opens (see `pad_audio::render`). Doing them
         // at spawn time would, on a kernel that refuses the interface claim, take the pad off wire
         // rumble and give it nothing in return — no haptics of any kind.
-        match crate::pad_audio::start(
-            std::sync::Arc::clone(&h.client),
-            pad as u8,
-            fd,
-            haptics,
-            speaker,
-        ) {
+        match started {
             Some(p) => {
                 *lock_recover(&h.pad_audio) = Some(p);
                 true
