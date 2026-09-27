@@ -151,11 +151,12 @@ pub(super) fn acquire() -> Option<Arc<EtwWatch>> {
     Some(w)
 }
 
-/// `EVENT_TRACE_PROPERTIES` plus trailing session-name space ETW writes into.
-fn properties_buffer() -> (Vec<u8>, usize) {
+/// `EVENT_TRACE_PROPERTIES` plus trailing session-name space ETW writes into. `u64` words: the
+/// struct is 8-aligned and a `Vec<u8>` is not. `BufferSize` is the rounded-up byte length.
+fn properties_buffer() -> (Vec<u64>, usize) {
     let base = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
     let total = base + (SESSION.len() + 1) * 2;
-    (vec![0u8; total], base)
+    (vec![0u64; total.div_ceil(8)], base)
 }
 
 impl EtwWatch {
@@ -164,11 +165,11 @@ impl EtwWatch {
         // A stale session from a crashed host blocks StartTrace with ERROR_ALREADY_EXISTS —
         // stop it by name first (fails benignly when there is none).
         let (mut stop_buf, _) = properties_buffer();
-        // SAFETY: `stop_buf` is a live, zeroed, correctly-sized properties allocation; the name is
+        // SAFETY: `stop_buf` is a live, zeroed, 8-aligned properties allocation; the name is
         // a live nul-terminated wide string; a session handle of 0 + name = control-by-name.
         unsafe {
             let props = stop_buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-            (*props).Wnode.BufferSize = stop_buf.len() as u32;
+            (*props).Wnode.BufferSize = std::mem::size_of_val(stop_buf.as_slice()) as u32;
             let _ = ControlTraceW(
                 CONTROLTRACE_HANDLE::default(),
                 PWSTR(name.as_ptr() as *mut _),
@@ -179,12 +180,12 @@ impl EtwWatch {
 
         let (mut buf, base) = properties_buffer();
         let mut session = CONTROLTRACE_HANDLE::default();
-        // SAFETY: `buf` is a live, zeroed allocation of base + name bytes; every write below is a
-        // field of the properties struct at its head; `LoggerNameOffset = base` points at the
-        // appended name space (ETW copies the name there itself).
+        // SAFETY: `buf` is a live, zeroed, 8-aligned allocation of base + name bytes; every write
+        // below is a field of the properties struct at its head; `LoggerNameOffset = base` points
+        // at the appended name space (ETW copies the name there itself).
         let rc = unsafe {
             let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-            (*props).Wnode.BufferSize = buf.len() as u32;
+            (*props).Wnode.BufferSize = std::mem::size_of_val(buf.as_slice()) as u32;
             (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
             (*props).Wnode.ClientContext = 1;
             (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
@@ -215,7 +216,7 @@ impl EtwWatch {
             // SAFETY: live handle + valid properties allocation, stopped exactly once on this path.
             unsafe {
                 let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-                (*props).Wnode.BufferSize = buf.len() as u32;
+                (*props).Wnode.BufferSize = std::mem::size_of_val(buf.as_slice()) as u32;
                 let _ = ControlTraceW(session, PWSTR::null(), props, EVENT_TRACE_CONTROL_STOP);
             }
             return None;
@@ -247,7 +248,7 @@ impl EtwWatch {
             // SAFETY: live handle + valid properties allocation, stopped exactly once on this path.
             unsafe {
                 let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-                (*props).Wnode.BufferSize = buf.len() as u32;
+                (*props).Wnode.BufferSize = std::mem::size_of_val(buf.as_slice()) as u32;
                 let _ = ControlTraceW(session, PWSTR::null(), props, EVENT_TRACE_CONTROL_STOP);
             }
             return None;
@@ -276,7 +277,7 @@ impl EtwWatch {
             // SAFETY: live handles + valid properties allocation, released exactly once on this path.
             unsafe {
                 let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-                (*props).Wnode.BufferSize = buf.len() as u32;
+                (*props).Wnode.BufferSize = std::mem::size_of_val(buf.as_slice()) as u32;
                 let _ = ControlTraceW(session, PWSTR::null(), props, EVENT_TRACE_CONTROL_STOP);
                 let _ = CloseTrace(consumer);
             }
@@ -581,7 +582,7 @@ impl Drop for EtwWatch {
         // CloseTrace releases the consumer — each exactly once, here.
         unsafe {
             let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-            (*props).Wnode.BufferSize = buf.len() as u32;
+            (*props).Wnode.BufferSize = std::mem::size_of_val(buf.as_slice()) as u32;
             let _ = ControlTraceW(self.session, PWSTR::null(), props, EVENT_TRACE_CONTROL_STOP);
             let _ = CloseTrace(self.consumer);
         }
