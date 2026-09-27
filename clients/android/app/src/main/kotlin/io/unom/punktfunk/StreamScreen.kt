@@ -438,7 +438,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     DisposableEffect(handle) {
         streamWindow.attach()
         peripherals.start()
-        // The panel's refresh pin, unbuffered pointer dispatch and the render-rate vote.
+        // The panel's refresh pin, unbuffered input dispatch and the render-rate vote.
         streamWindow.pinDisplay()
         onDispose {
             closed.set(true) // from here the handle gets freed; surfaceDestroyed must not touch it
@@ -1304,6 +1304,22 @@ internal class KeyCaptureView(context: Context) : View(context) {
     init {
         isFocusable = true
         isFocusableInTouchMode = true
+    }
+
+    // A leaf keeps its unbuffered request; a ViewGroup's is recomputed whenever focus moves below
+    // it. Pointer classes rise from any child, the rest through this view while it holds focus.
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            requestUnbufferedDispatch(STREAM_UNBUFFERED_SOURCES)
+        }
+    }
+
+    override fun onDetachedFromWindow() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            requestUnbufferedDispatch(0)
+        }
+        super.onDetachedFromWindow()
     }
 
     /** The session handle when the host types committed text; `0` = VK-only fallback. */
