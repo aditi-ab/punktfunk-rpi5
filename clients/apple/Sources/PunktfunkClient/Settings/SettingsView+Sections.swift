@@ -533,11 +533,21 @@ extension SettingsView {
         if showsSessionSection {
             Section("Session") {
                 #if os(macOS)
-                described("Go fullscreen when a session starts; return to a window on the host "
-                    + "list.", field: "fullscreen_on_stream") {
-                    Toggle(
-                        "Fullscreen while streaming",
-                        isOn: scoped(SettingsFields.fullscreenWhileStreaming))
+                if inPresetScope {
+                    described(fullscreenAlways
+                        ? "Every stream is fullscreen while Fullscreen is set to Always."
+                        : "Go fullscreen when a session starts; return to a window on the host "
+                            + "list.", field: "fullscreen_on_stream") {
+                        Toggle(
+                            "Fullscreen while streaming",
+                            isOn: scoped(SettingsFields.fullscreenWhileStreaming))
+                    }
+                } else {
+                    described(fullscreenCaption) {
+                        settingPicker(
+                            "Fullscreen", options: SettingsOptions.fullscreenModes,
+                            selection: fullscreenMode)
+                    }
                 }
                 #endif
                 if !inPresetScope {
@@ -574,6 +584,27 @@ extension SettingsView {
         "Ends a backgrounded session so it can't run down the battery."
         #endif
     }
+
+    #if os(macOS)
+    /// The Fullscreen picker over its two stores. Global scope only: a preset holds just the
+    /// streaming half, so "always" never reaches one.
+    private var fullscreenMode: Binding<String> {
+        Binding(
+            get: { fullscreenAlways ? "always" : (fullscreenWhileStreaming ? "stream" : "off") },
+            set: { mode in
+                fullscreenAlways = mode == "always"
+                if mode != "always" { fullscreenWhileStreaming = mode == "stream" }
+            })
+    }
+
+    private var fullscreenCaption: String {
+        switch fullscreenMode.wrappedValue {
+        case "always": "Punktfunk opens fullscreen and stays fullscreen between streams."
+        case "stream": "Streams go fullscreen. The host list returns to a window."
+        default: "Streams stay in a window."
+        }
+    }
+    #endif
 
     private static var gamepadUIModeCaption: String {
         #if os(tvOS)
