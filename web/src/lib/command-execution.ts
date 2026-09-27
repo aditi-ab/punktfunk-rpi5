@@ -21,6 +21,8 @@ export const UNPRIVILEGED_LAUNCH_KINDS: readonly string[] = [
 	"uplay",
 	"amazon",
 	"battlenet",
+	"ea",
+	"rockstar",
 	"exec",
 	"desktop_id",
 	"gamebar",
