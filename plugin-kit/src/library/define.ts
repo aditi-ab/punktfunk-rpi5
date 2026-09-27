@@ -9,6 +9,7 @@
 
 import * as fs from "node:fs";
 import type { PluginDef } from "@punktfunk/host";
+import type { GameRef } from "@punktfunk/host/core";
 import { Duration, Effect, type Schema, Stream } from "effect";
 import {
 	type AccessRequestOutcome,
@@ -98,6 +99,18 @@ export interface LibraryPluginDef<S extends Schema.Top> {
 	readonly title?: string;
 	/** Extra CLI verbs beyond the standard `detect` / `scan` / `uninstall` set. */
 	readonly commands?: Record<string, CliCommand<never>>;
+	/**
+	 * Work before the host starts one of this plugin's titles, like fetching its files. It fires for
+	 * every launch on the host, so check `game.app`. See `serveUi`'s `holds`.
+	 */
+	readonly holds?: {
+		readonly "game.launching"?: (
+			game: GameRef,
+			cfg: S["Type"],
+		) => Effect.Effect<void, unknown>;
+	};
+	/** How long the host waits for a hold, 1–120 000 ms. Default 30 000. */
+	readonly holdTimeoutMs?: number;
 }
 
 /** `--flag value` from an argv slice, or undefined. */
@@ -280,13 +293,27 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 			),
 		});
 
-		// The UI server exists ONLY to serve `__config` (and the SDK's `__health`): no `staticDir`,
-		// no API. That is the whole "settings without an SPA" story (design D7, closing G8), and the
-		// `library` category is what keeps six installed scanners out of the console's sidebar.
+		// The UI server serves `__config` (and the SDK's `__health`), plus `__hold` when the scanner
+		// holds a stage: no `staticDir`, no API. The `library` category keeps installed scanners out
+		// of the console's sidebar.
+		const launching = def.holds?.["game.launching"];
 		yield* serveUi({
 			title: def.title ?? def.name,
 			category: "library",
 			config: { schema: def.configSchema, service: cfgService },
+			...(launching
+				? {
+						holds: {
+							"game.launching": (game: GameRef) =>
+								cfgService.load.pipe(
+									Effect.flatMap((cfg) => launching(game, cfg)),
+								),
+						},
+					}
+				: {}),
+			...(def.holdTimeoutMs !== undefined
+				? { holdTimeoutMs: def.holdTimeoutMs }
+				: {}),
 		});
 
 		yield* engine.start;
