@@ -11,7 +11,7 @@
 //!
 //! Pin: `mgmt::tests` lane matrix and `crate::library` art/privilege tests.
 
-use super::auth::AuthLane;
+use super::auth::{AnyId, AuthLane, OwnedId, ProviderId};
 use super::shared::*;
 use axum::http::header;
 use axum::Extension;
@@ -261,16 +261,9 @@ pub(crate) async fn list_library_scanners() -> Json<Vec<crate::library::ScannerI
     )
 )]
 pub(crate) async fn set_library_scanner(
-    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
-    Path(id): Path<String>,
+    OwnedId(id, _): OwnedId<AnyId>,
     ApiJson(toggle): ApiJson<ScannerToggle>,
 ) -> Response {
-    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &id) {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "a plugin may only toggle its own source",
-        );
-    }
     match crate::library::set_scanner_enabled(&id, toggle.enabled) {
         Ok(Some(scanners)) => {
             tracing::info!(
@@ -472,17 +465,10 @@ pub(crate) struct ReconcileQuery {
 )]
 pub(crate) async fn reconcile_provider_entries(
     Extension(lane): Extension<AuthLane>,
-    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
-    Path(provider): Path<String>,
+    OwnedId(provider, _): OwnedId<ProviderId>,
     Query(q): Query<ReconcileQuery>,
     ApiJson(mut inputs): ApiJson<Vec<crate::library::ProviderEntryInput>>,
 ) -> Response {
-    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &provider) {
-        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
-    }
-    if let Err(e) = crate::library::validate_provider_name(&provider) {
-        return api_error(StatusCode::BAD_REQUEST, &e);
-    }
     let store = q.store.filter(|s| !s.is_empty());
     if let Some(store) = &store {
         if let Err(e) = crate::library::validate_store_claim(store) {
@@ -592,16 +578,7 @@ pub(crate) async fn reconcile_provider_entries(
         (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the catalog", body = ApiError),
     )
 )]
-pub(crate) async fn delete_provider_entries(
-    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
-    Path(provider): Path<String>,
-) -> Response {
-    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &provider) {
-        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
-    }
-    if let Err(e) = crate::library::validate_provider_name(&provider) {
-        return api_error(StatusCode::BAD_REQUEST, &e);
-    }
+pub(crate) async fn delete_provider_entries(OwnedId(provider, _): OwnedId<ProviderId>) -> Response {
     match crate::library::delete_provider(&provider) {
         Ok(removed) => {
             if removed > 0 {
@@ -665,20 +642,10 @@ pub(crate) struct ProviderRunningAccepted {
     )
 )]
 pub(crate) async fn report_provider_running(
-    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
-    Path(provider): Path<String>,
+    // Another plugin's report would end or prolong that provider's game lease.
+    OwnedId(provider, _): OwnedId<ProviderId>,
     ApiJson(input): ApiJson<ProviderRunningInput>,
 ) -> Response {
-    // Another plugin's report would end or prolong that provider's game lease.
-    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &provider) {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "a plugin may only report its own titles",
-        );
-    }
-    if let Err(e) = crate::library::validate_provider_name(&provider) {
-        return api_error(StatusCode::BAD_REQUEST, &e);
-    }
     // Map the provider's `external_id`s to catalog library ids. Only published entries
     // resolve, so a report cannot name a title it does not own.
     let mine: Vec<(String, String)> = crate::library::load_custom()
@@ -754,16 +721,9 @@ pub(crate) struct MetadataRemoved {
     )
 )]
 pub(crate) async fn put_library_metadata(
-    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
-    Path(source): Path<String>,
+    OwnedId(source, _): OwnedId<ProviderId>,
     ApiJson(input): ApiJson<crate::library::MetadataInput>,
 ) -> Response {
-    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &source) {
-        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
-    }
-    if let Err(e) = crate::library::validate_provider_name(&source) {
-        return api_error(StatusCode::BAD_REQUEST, &e);
-    }
     match crate::library::put_metadata(&source, input) {
         Ok((entries, dropped)) => {
             if dropped > 0 {
@@ -799,16 +759,7 @@ pub(crate) async fn put_library_metadata(
         (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the settings", body = ApiError),
     )
 )]
-pub(crate) async fn delete_library_metadata(
-    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
-    Path(source): Path<String>,
-) -> Response {
-    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &source) {
-        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
-    }
-    if let Err(e) = crate::library::validate_provider_name(&source) {
-        return api_error(StatusCode::BAD_REQUEST, &e);
-    }
+pub(crate) async fn delete_library_metadata(OwnedId(source, _): OwnedId<ProviderId>) -> Response {
     match crate::library::delete_metadata(&source) {
         Ok(removed) => Json(MetadataRemoved { removed }).into_response(),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),

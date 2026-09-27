@@ -1672,6 +1672,55 @@ async fn a_plugin_may_reconcile_only_its_own_provider() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// Every plugin-scoped write refuses another plugin's id before it reads the body, and
+/// checks the id's shape only for a caller that may write it.
+#[tokio::test]
+async fn every_plugin_scoped_write_checks_the_owner_first() {
+    let app = test_app(test_state(), None);
+    let req = |method: &str, path: &str, token: &str| {
+        bearer_req(
+            axum::http::Request::builder()
+                .method(method)
+                .uri(format!("/api/v1{path}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap(),
+            token,
+        )
+    };
+    for (method, path) in [
+        ("PUT", "/library/scanners/steam"),
+        ("PUT", "/library/provider/steam"),
+        ("DELETE", "/library/provider/steam"),
+        ("PUT", "/library/provider/steam/running"),
+        ("PUT", "/library/metadata/steam"),
+        ("DELETE", "/library/metadata/steam"),
+        ("PUT", "/plugins/rom-manager"),
+        ("DELETE", "/plugins/rom-manager"),
+    ] {
+        let (status, body) = send(&app, req(method, path, "demo-secret")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+        assert_eq!(body["error"], "a plugin may only write its own id");
+    }
+    for (method, path) in [
+        ("PUT", "/library/provider/manual"),
+        ("DELETE", "/library/provider/manual"),
+        ("PUT", "/library/metadata/manual"),
+        ("DELETE", "/library/metadata/manual"),
+        ("PUT", "/plugins/Not_Kebab"),
+    ] {
+        let (status, body) = send(&app, req(method, path, "plugin-secret")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("id"),
+            "the id is refused, not the body: {body}"
+        );
+    }
+    // Deregistering takes any id: an unknown one is already gone.
+    let (status, _) = send(&app, req("DELETE", "/plugins/Not_Kebab", "plugin-secret")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
 /// The runner's shared token keeps the older, unowned behaviour — a loose script has no plugin
 /// identity to check — so upgrading a host does not strand one.
 #[tokio::test]
