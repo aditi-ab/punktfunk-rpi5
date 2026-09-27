@@ -688,7 +688,7 @@ pub fn spawn_session(
         }
     };
     if let Some(stderr) = child.stderr.take() {
-        crate::logring::forward_child_stderr(stderr);
+        crate::logring::forward_child_stderr(stderr, std::io::stderr());
     }
     tracing::info!(
         host = %plan.host.addr, port = plan.host.port,

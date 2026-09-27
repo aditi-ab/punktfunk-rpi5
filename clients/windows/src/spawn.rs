@@ -238,7 +238,7 @@ fn spawn_with(
     tracing::info!(host = %host_label, "session binary spawned");
 
     if let Some(stderr) = child.stderr.take() {
-        crate::logfile::forward_child_stderr(stderr);
+        pf_client_core::logring::forward_child_stderr(stderr, crate::logfile::Tee);
     }
     let stdout = child.stdout.take().expect("piped stdout");
     // Park the child where the kill handle (and the reader, for the final reap) reach it.

@@ -41,7 +41,7 @@ pub(crate) fn run_browse() -> ! {
     // Spawn (not `status()`) so the stderr pipe can be drained into the client log.
     let run = cmd.spawn().and_then(|mut child| {
         if let Some(stderr) = child.stderr.take() {
-            crate::logfile::forward_child_stderr(stderr);
+            pf_client_core::logring::forward_child_stderr(stderr, crate::logfile::Tee);
         }
         child.wait()
     });

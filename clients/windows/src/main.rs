@@ -60,14 +60,9 @@ fn main() {
     set_app_user_model_id();
     punktfunk_core::tls::install_default_provider();
 
-    // Everything logs to stderr AND `%LOCALAPPDATA%\punktfunk\logs\client.log` (see [`logfile`]):
-    // a GUI/MSIX launch has no console, so without the file the client side of any field report
-    // simply doesn't exist. ANSI off — the file is what users send, keep it grep-clean.
-    // Plus the in-process ring (`pf_client_core::logring`, DEBUG+ regardless of RUST_LOG) that
-    // "Send logs to host" uploads — the env filter scopes the visible layer only: the ring
-    // exists precisely for the diagnostics nobody enabled before the bug happened. The spawned
-    // session's stderr joins the ring in `logfile::forward_child_stderr`, so a bundle carries
-    // the stream's trail too.
+    // Logs go to stderr, the client log file (a GUI launch has no console; ANSI off, users send
+    // it) and the DEBUG+ ring "Send logs to host" uploads; the env filter scopes stderr and file
+    // only. The session's stderr joins file and ring through `logring::forward_child_stderr`.
     logfile::init();
     {
         use tracing_subscriber::layer::SubscriberExt;
