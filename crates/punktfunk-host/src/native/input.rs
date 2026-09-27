@@ -942,6 +942,96 @@ fn declare_pad(
     }
 }
 
+/// The session's one `read_datagram` loop (two would race): 0xCB mic, 0xCC rich and pen, 0xC8
+/// input, magics disjoint. Each is tested against the live grant mask before it is offered, and a
+/// full queue drops rather than block the mic and this reader. Ends with the connection.
+pub(super) fn spawn_datagram_reader(
+    conn: super::link::SessionLink,
+    grants: Arc<AtomicU32>,
+    counters: Arc<crate::session_status::SessionCounters>,
+    mic_tx: std::sync::mpsc::SyncSender<crate::audio::MicFrame>,
+    input_tx: std::sync::mpsc::SyncSender<ClientInput>,
+) {
+    tokio::spawn(async move {
+        // Shared, not local: this task ends with the connection, which closes after the session
+        // summary is built, so a local total would never reach it.
+        let n = &*counters;
+        let mut denied = crate::session_status::GrantDrops::new(conn.plane());
+        let mic_source = crate::audio::mic_source_id();
+        // Full queue: drop, never block (would stall mic + this reader). Disconnected ends the loop.
+        let offer = |tx: &std::sync::mpsc::SyncSender<ClientInput>, item: ClientInput| match tx
+            .try_send(item)
+        {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                n.input_dropped.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        };
+        while let Ok(d) = conn.read_datagram().await {
+            // One relaxed load per datagram; test before offering. Mic/rich/pen by plane tag;
+            // 0xC8 through `classify`.
+            let mask = grants.load(Ordering::Relaxed);
+            if let Some((seq, pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
+                // Dropping here is the setup gate: forwarding is the only attach this plane has.
+                if !denied.permitted(mask, GrantClass::Mic) {
+                    continue;
+                }
+                n.input_mic.fetch_add(1, Ordering::Relaxed);
+                // Bounded `try_send`: never block this loop. seq + pts ride for de-jitter.
+                let _ = mic_tx.try_send(crate::audio::MicFrame {
+                    source: mic_source,
+                    seq,
+                    pts_ns: pts,
+                    opus: opus.to_vec(),
+                });
+            } else if let Some(rich) = punktfunk_core::quic::RichInput::decode(&d) {
+                if !denied.permitted(mask, GrantClass::Gamepad) {
+                    continue;
+                }
+                n.input_rich.fetch_add(1, Ordering::Relaxed);
+                if !offer(&input_tx, ClientInput::Rich(rich)) {
+                    break;
+                }
+            } else if let Some(pen) = punktfunk_core::quic::PenBatch::decode(&d) {
+                // 0xCC kind 0x05 stylus (`RichInput::decode` returns None). Same input thread.
+                if !denied.permitted(mask, GrantClass::Pointer) {
+                    continue;
+                }
+                n.input_rich.fetch_add(1, Ordering::Relaxed);
+                if !offer(&input_tx, ClientInput::Pen(pen)) {
+                    break;
+                }
+            } else if let Some(mut ev) = InputEvent::decode(&d) {
+                if !denied.permitted(mask, classify(ev.kind)) {
+                    continue;
+                }
+                n.input_events.fetch_add(1, Ordering::Relaxed);
+                // KEY_FLAG_SEMANTIC_VK is in-process (GameStream ingest). Strip it from the wire.
+                if matches!(
+                    ev.kind,
+                    punktfunk_core::input::InputKind::KeyDown
+                        | punktfunk_core::input::InputKind::KeyUp
+                ) {
+                    ev.flags &= !crate::inject::KEY_FLAG_SEMANTIC_VK;
+                }
+                if !offer(&input_tx, ClientInput::Event(ev)) {
+                    break;
+                }
+            }
+        }
+        tracing::info!(
+            input = n.input_events.load(Ordering::Relaxed),
+            mic = n.input_mic.load(Ordering::Relaxed),
+            rich = n.input_rich.load(Ordering::Relaxed),
+            dropped = n.input_dropped.load(Ordering::Relaxed),
+            denied = denied.summary().as_deref().unwrap_or("none"),
+            "client datagram stream ended"
+        );
+    });
+}
+
 /// Per-session input thread. Pointer/keyboard go through [`InputRoute`]; gamepad
 /// through [`Pads`] (Hello kind is the per-pad default). Rich input applies on
 /// arrival; rumble and HID-output pump between events. Gamepads die with the

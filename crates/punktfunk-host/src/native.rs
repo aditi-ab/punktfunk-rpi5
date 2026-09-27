@@ -1377,45 +1377,15 @@ pub(crate) async fn run_admitted(
     // RAII frees the slot on return.
     let _permit = permit;
 
-    // Grants once at admission: effective mask + deadline + watch. Anonymous (`--open`) and
-    // an identity with no record keep full control — nothing on the trust record to enforce.
-    let admit_unix = crate::clock::unix_secs();
-    let (initial_grants, deadline_unix, access_watch) = match session_fp_hex.as_deref() {
-        Some(fp_hex) => match np.effective(fp_hex, admit_unix) {
-            Some(mask) => {
-                // Subscribe before reading the deadline so a racing edit lands in this borrow
-                // or as the first change — never in a gap.
-                let rx = np.subscribe(fp_hex);
-                let deadline = rx.borrow().deadline_unix;
-                (mask, deadline, Some(rx))
-            }
-            // Expired between the pairing gate and here: typed expiry, not a setup error.
-            None if opts.require_pairing => {
-                close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired);
-                anyhow::bail!("access expired between admission and session setup");
-            }
-            // `--open`: unpaired / expired identities keep full control.
-            None => (GRANT_ALL, None, None),
-        },
-        None => (GRANT_ALL, None, None),
-    };
-    // Count this session while it runs. Held to the end of the function, so an error return or
-    // a cancelled task releases it too — a record granted "this session" is dropped once the
-    // guard falls and nothing reconnects inside the grace.
-    let _session = session_fp_hex
-        .as_deref()
-        .map(|fp_hex| host.np.session_started(fp_hex));
+    let Admission {
+        grants: initial_grants,
+        deadline_unix,
+        watch: access_watch,
+        at_unix: admit_unix,
+        session: _session,
+    } = admit(host, session_fp_hex.as_deref(), &conn, &first)?;
     // One relaxed load per event; the lifecycle task is the only writer after admission.
     let session_grants = Arc::new(AtomicU32::new(initial_grants));
-    // Launch without LAUNCH: refuse before handshake (typed reason), not a silent bare desktop.
-    if initial_grants & GRANT_LAUNCH == 0 && Hello::decode(&first).is_ok_and(|h| h.launch.is_some())
-    {
-        close_rejected(
-            &conn,
-            punktfunk_core::reject::RejectReason::LaunchNotPermitted,
-        );
-        anyhow::bail!("client requested a library launch without the LAUNCH grant");
-    }
     let expires_in_secs = remaining_secs_wire(deadline_unix, admit_unix);
 
     let source = opts.source;
@@ -1436,40 +1406,22 @@ pub(crate) async fn run_admitted(
     // Session totals for the summary. The input, audio and encode paths all outlive the
     // guard that reads them, so they bump a shared block rather than hand a figure over.
     let counters = Arc::new(crate::session_status::SessionCounters::default());
-    {
-        let stop = stop.clone();
-        let quit = quit.clone();
-        let end_reason = end_reason.clone();
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            let reason = conn.closed().await;
-            if reason.closed_with(QUIT_CODE) {
-                quit.store(true, Ordering::SeqCst);
-                crate::events::SessionEndReason::Local.latch(&end_reason);
-            } else {
-                // The client's own rule: anything that is not our close code is the link
-                // going away. A close this host made reads as `Other` here too, which is
-                // why the paths that make one latch before they call it.
-                crate::events::SessionEndReason::Lost.latch(&end_reason);
-            }
-            stop.store(true, Ordering::SeqCst);
-        });
-    }
+    spawn_end_watch(conn.clone(), stop.clone(), quit.clone(), end_reason.clone());
 
-    let (
+    let handshake::Negotiated {
         hello,
         welcome,
         udp_port,
         data_sock,
         start,
         client_label,
-        session_preset,
+        preset: session_preset,
         abr_features,
         compositor,
         gamescope_route,
         prep,
         joined,
-    ) = tokio::time::timeout(
+    } = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         handshake::negotiate(
             &conn,
@@ -1623,25 +1575,13 @@ pub(crate) async fn run_admitted(
     let session_bitrate_kbps = welcome.bitrate_kbps;
     // Control task flips on `ClipControl`; lifecycle clears it if CLIPBOARD is revoked.
     let clip_enabled = Arc::new(AtomicBool::new(false));
-    // Without CLIPBOARD the coordinator never starts (a watcher that doesn't exist can't leak).
-    // Inert handle (`available: false`) keeps control-task arms uniform: NOT_PERMITTED, and
-    // the decline loop still answers stray fetches.
-    // The clipboard's fetch transfers are quinn streams, so it is on offer only where there are
-    // some — a browser takes the declining arm below until the control plane is carrier-agnostic.
-    let clip_quic = (initial_grants & GRANT_CLIPBOARD != 0)
-        .then(|| conn.as_quic().cloned())
-        .flatten();
-    let clip = if let Some(quic) = clip_quic {
-        pf_clipboard::start(quic, clip_enabled.clone(), compositor.is_some()).await
-    } else {
-        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_offer_tx, offer_rx) = tokio::sync::mpsc::unbounded_channel();
-        pf_clipboard::ClipCoord {
-            available: false,
-            cmd_tx,
-            offer_rx,
-        }
-    };
+    let clip = start_clipboard(
+        &conn,
+        initial_grants,
+        clip_enabled.clone(),
+        compositor.is_some(),
+    )
+    .await;
     let clip_available = clip.available;
     // Lifecycle and the per-session management routes → control task. Both lanes stay
     // open for the whole session: the console can re-point or mute an anonymous client too.
@@ -1736,21 +1676,7 @@ pub(crate) async fn run_admitted(
         counters: counters.clone(),
         stats: stats.clone(),
     }));
-    // Trust-store name (a console rename wins), else the sanitized Hello name. `None` if
-    // nameless. Events, hook filters, the stream marker and the tray all show this one.
-    let client_name = session_fp_hex
-        .as_deref()
-        .and_then(|fp| np.list().into_iter().find(|c| c.fingerprint == fp))
-        .map(|c| c.name)
-        .or_else(|| {
-            let raw = hello.name.as_deref().unwrap_or("").trim();
-            (!raw.is_empty()).then(|| {
-                crate::native_pairing::sanitize_device_name(
-                    raw,
-                    session_fp_hex.as_deref().unwrap_or(""),
-                )
-            })
-        });
+    let client_name = client_name(np, session_fp_hex.as_deref(), &hello);
     // Only a fingerprint has a record to watch; with no record there is nothing to expire.
     match (session_fp_hex.clone(), access_watch) {
         (Some(fp_hex), Some(watch_rx)) => {
@@ -1780,73 +1706,21 @@ pub(crate) async fn run_admitted(
         }
     }
 
-    // Isolated gamescope: per-session input/audio/mic. Identity is the device-fingerprint prefix
-    // so keep-alive hands a kept spawn back to the same client. Minted after handshake, before
-    // the input/audio threads (`compositor_route::session_is_isolated`).
-    #[cfg(target_os = "linux")]
-    let isolation: Option<crate::vdisplay::SessionIsolation> = match joined.as_ref().map(|(d, _)| d)
-    {
-        // A joiner uses the owner's planes: its input relay and sink. A second mic source of the
-        // same name would split the owner's, so this session's mic stays on the shared one.
-        Some(d) => d
-            .isolation
-            .clone()
-            .map(|i| crate::vdisplay::SessionIsolation {
-                mic_source: None,
-                ..i
-            }),
-        None => compositor
-            .filter(|c| crate::compositor_route::session_is_isolated(*c, gamescope_route.as_ref()))
-            .map(|_| {
-                // `--open` has no fingerprint; a per-accept sequence isolates at the cost of keep-alive.
-                static ANON_SEQ: AtomicU64 = AtomicU64::new(0);
-                let paired = session_fp_hex.as_deref().map(seat_id);
-                let id = paired
-                    .clone()
-                    .unwrap_or_else(|| format!("anon{}", ANON_SEQ.fetch_add(1, Ordering::Relaxed)));
-                let iso = session_isolation(&id, paired.is_some());
-                tracing::info!(%id, sink = iso.sink.as_deref().unwrap_or("-"),
-                "isolated gamescope session — per-session input/audio/mic planes");
-                iso
-            }),
-    };
-    // Where this session's virtual pads are exposed, so its seat's Steam opens those and no
-    // other seat's. `None` on every host without the filter, which is today's box-wide pads.
-    #[cfg(target_os = "linux")]
-    let seat_dev = isolation
-        .as_ref()
-        .and_then(crate::vdisplay::seat_device_dir);
-    #[cfg(not(target_os = "linux"))]
-    let seat_dev: Option<std::path::PathBuf> = None;
-    // Pinned injector + swappable route. Drop at session end closes the EIS connection.
-    #[cfg(target_os = "linux")]
-    let session_injector = isolation
-        .as_ref()
-        .map(|i| crate::inject::InjectorService::start_at(i.ei_relay.clone()));
-    #[cfg(target_os = "linux")]
-    let inj_session_tx = session_injector.as_ref().map(|s| s.sender());
-    #[cfg(target_os = "linux")]
-    let input_route = input::InputRoute::new(match &inj_session_tx {
-        Some(tx) => tx.clone(),
-        None => inj_tx.clone(),
-    });
-    #[cfg(not(target_os = "linux"))]
-    let input_route = input::InputRoute::new(inj_tx.clone());
-    // Isolated mic pump (`punktfunk-mic-{id}`) for this session's 0xCB uplink. Drop tears it down.
-    #[cfg(target_os = "linux")]
-    let session_mic = isolation
-        .as_ref()
-        .and_then(|i| i.mic_source.clone())
-        .map(|name| crate::audio::MicPump::start_named(Some(name)));
-    #[cfg(target_os = "linux")]
-    let mic_tx = session_mic.as_ref().map(|p| p.sender()).unwrap_or(mic_tx);
+    let planes = SessionPlanes::mint(
+        joined.as_ref().map(|(d, _)| d),
+        compositor,
+        gamescope_route.as_ref(),
+        session_fp_hex.as_deref(),
+        &inj_tx,
+        mic_tx,
+    );
+    let input_route = planes.input_route.clone();
 
     // One bounded channel for pointer/keyboard and rich input. Unbounded is RSS DoS: the
     // producer outruns the consumer; pen batches amplify. Drop is correct — stale input is
     // already worthless; the injector re-syncs from the next event.
     const INPUT_QUEUE_DEPTH: usize = 1024;
     let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<ClientInput>(INPUT_QUEUE_DEPTH);
-    let rich_tx = input_tx.clone();
     // Stream loop parks the seat pointer through the same path client input takes.
     #[cfg(target_os = "linux")]
     let input_tx_stream = input_tx.clone();
@@ -1860,6 +1734,7 @@ pub(crate) async fn run_admitted(
         let frame_map = frame_map.clone();
         let pad_feed = controls.pads.clone();
         let counters = counters.clone();
+        let seat_dev = planes.seat_dev.clone();
         std::thread::Builder::new()
             .name("punktfunk1-input".into())
             .spawn({
@@ -1885,116 +1760,24 @@ pub(crate) async fn run_admitted(
             })
             .context("spawn input thread")?
     };
-    // One `read_datagram` loop (two would race): 0xCB mic, 0xCC rich, 0xC8 input. Magics disjoint.
-    let input_conn = conn.clone();
-    let grants_dp = session_grants.clone();
-    let counters_dp = counters.clone();
-    tokio::spawn(async move {
-        // Shared, not local: this task ends with the connection, which closes after the session
-        // summary is built, so a local total would never reach it.
-        let n = &*counters_dp;
-        let mut denied = crate::session_status::GrantDrops::new(input_conn.plane());
-        let mic_source = crate::audio::mic_source_id();
-        // Full queue: drop, never block (would stall mic + this reader). Disconnected ends the loop.
-        let offer = |tx: &std::sync::mpsc::SyncSender<ClientInput>, item: ClientInput| match tx
-            .try_send(item)
-        {
-            Ok(()) => true,
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                n.input_dropped.fetch_add(1, Ordering::Relaxed);
-                true
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
-        };
-        while let Ok(d) = input_conn.read_datagram().await {
-            // One relaxed load per datagram; test before offering. Mic/rich/pen by plane tag;
-            // 0xC8 through `classify`.
-            let mask = grants_dp.load(Ordering::Relaxed);
-            if let Some((seq, pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
-                // Dropping here is the setup gate: forwarding is the only attach this plane has.
-                if !denied.permitted(mask, GrantClass::Mic) {
-                    continue;
-                }
-                n.input_mic.fetch_add(1, Ordering::Relaxed);
-                // Bounded `try_send`: never block this loop. seq + pts ride for de-jitter.
-                let _ = mic_tx.try_send(crate::audio::MicFrame {
-                    source: mic_source,
-                    seq,
-                    pts_ns: pts,
-                    opus: opus.to_vec(),
-                });
-            } else if let Some(rich) = punktfunk_core::quic::RichInput::decode(&d) {
-                if !denied.permitted(mask, GrantClass::Gamepad) {
-                    continue;
-                }
-                n.input_rich.fetch_add(1, Ordering::Relaxed);
-                if !offer(&rich_tx, ClientInput::Rich(rich)) {
-                    break;
-                }
-            } else if let Some(pen) = punktfunk_core::quic::PenBatch::decode(&d) {
-                // 0xCC kind 0x05 stylus (`RichInput::decode` returns None). Same input thread.
-                if !denied.permitted(mask, GrantClass::Pointer) {
-                    continue;
-                }
-                n.input_rich.fetch_add(1, Ordering::Relaxed);
-                if !offer(&rich_tx, ClientInput::Pen(pen)) {
-                    break;
-                }
-            } else if let Some(mut ev) = InputEvent::decode(&d) {
-                if !denied.permitted(mask, classify(ev.kind)) {
-                    continue;
-                }
-                n.input_events.fetch_add(1, Ordering::Relaxed);
-                // KEY_FLAG_SEMANTIC_VK is in-process (GameStream ingest). Strip it from the wire.
-                if matches!(
-                    ev.kind,
-                    punktfunk_core::input::InputKind::KeyDown
-                        | punktfunk_core::input::InputKind::KeyUp
-                ) {
-                    ev.flags &= !crate::inject::KEY_FLAG_SEMANTIC_VK;
-                }
-                if !offer(&input_tx, ClientInput::Event(ev)) {
-                    break;
-                }
-            }
-        }
-        tracing::info!(
-            input = n.input_events.load(Ordering::Relaxed),
-            mic = n.input_mic.load(Ordering::Relaxed),
-            rich = n.input_rich.load(Ordering::Relaxed),
-            dropped = n.input_dropped.load(Ordering::Relaxed),
-            denied = denied.summary().as_deref().unwrap_or("none"),
-            "client datagram stream ended"
-        );
-    });
+    input::spawn_datagram_reader(
+        conn.clone(),
+        session_grants.clone(),
+        counters.clone(),
+        planes.mic_tx.clone(),
+        input_tx,
+    );
 
     // Handshake complete: CONNECTED. A client rejected earlier never emits either.
-    let event_client = crate::events::ClientRef {
-        name: client_name.clone().unwrap_or_default(),
-        fingerprint: session_fp_hex.clone(),
-        plane: conn.plane(),
-        preset: session_preset.clone(),
-    };
-    crate::events::emit(crate::events::EventKind::ClientConnected {
-        client: event_client.clone(),
-    });
-    {
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            let reason = conn.closed().await;
-            let why = if reason.closed_with(QUIT_CODE) {
-                crate::events::DisconnectReason::Quit
-            } else if matches!(reason, link::LinkClosed::TimedOut) {
-                crate::events::DisconnectReason::Timeout
-            } else {
-                crate::events::DisconnectReason::Error
-            };
-            crate::events::emit(crate::events::EventKind::ClientDisconnected {
-                client: event_client,
-                reason: why,
-            });
-        });
-    }
+    emit_connected(
+        &conn,
+        crate::events::ClientRef {
+            name: client_name.clone().unwrap_or_default(),
+            fingerprint: session_fp_hex.clone(),
+            plane: conn.plane(),
+            preset: session_preset.clone(),
+        },
+    );
 
     // Mode-conflict admission: later clients see this identity + mode + stop (and may `steal`).
     // The audio thread publishes the sink it captures here, for a joiner to tap.
@@ -2016,10 +1799,7 @@ pub(crate) async fn run_admitted(
             crate::vdisplay::admission::LiveDisplay {
                 compositor,
                 route: gamescope_route.clone(),
-                #[cfg(target_os = "linux")]
-                isolation: isolation.clone(),
-                #[cfg(not(target_os = "linux"))]
-                isolation: None,
+                isolation: planes.isolation.clone(),
                 audio_sink: audio_sink.clone(),
             },
         )
@@ -2053,10 +1833,7 @@ pub(crate) async fn run_admitted(
         );
         // Isolated session captures its own named sink; `None` is the shared path. A joiner
         // taps the owner's sink either way: its isolated one, or the one the owner published.
-        #[cfg(target_os = "linux")]
-        let iso_sink = isolation.as_ref().and_then(|i| i.sink.clone());
-        #[cfg(not(target_os = "linux"))]
-        let iso_sink: Option<String> = None;
+        let iso_sink = planes.isolation.clone().and_then(|i| i.sink);
         let tap_from = joined.as_ref().map(|(d, _)| d.audio_sink.clone());
         let published = audio_sink.clone();
         let muted = controls.muted.clone();
@@ -2085,52 +1862,13 @@ pub(crate) async fn run_admitted(
         None
     };
 
-    // HDR10 baseline at start. The virtual stream then sends the source's real mastering
-    // (GetDesc1) on capture start and keyframes. This covers synthetic + the pre-capture gap.
     if welcome.color.is_hdr() {
-        // Client display volume (Hello::display_hdr) — EDID advertises it. Generic HDR10 for old clients.
-        let meta = crate::encode::hdr_meta_to_wire(hello.display_hdr.map_or_else(
-            pf_frame::hdr::generic_hdr10,
-            crate::encode::hdr_meta_from_wire,
-        ));
-        let _ = conn.send_datagram(punktfunk_core::quic::encode_hdr_meta_datagram(&meta));
-        tracing::info!(
-            client_volume = hello.display_hdr.is_some(),
-            "sent HDR10 static metadata (0xCE baseline)"
-        );
+        send_hdr_baseline(&conn, hello.display_hdr);
     }
-
-    // Synthetic-only test hook: rumble (0xCA) + HID-output (0xCD) for loopback, no real pad.
     if opts.source == Punktfunk1Source::Synthetic
         && std::env::var("PUNKTFUNK_TEST_FEEDBACK").as_deref() == Ok("1")
     {
-        use punktfunk_core::quic::HidOutput;
-        // 400 ms TTL + both trigger motors. Trigger levels differ from each other and the
-        // handles so a wrong-offset decoder cannot hide behind a plausible zero.
-        let d = punktfunk_core::quic::encode_rumble_datagram_v3(
-            0, 0x4000, 0x8000, 0, 400, 0x2000, 0x6000,
-        );
-        let _ = conn.send_datagram(d.to_vec());
-        for h in [
-            HidOutput::Led {
-                pad: 0,
-                r: 10,
-                g: 20,
-                b: 30,
-            },
-            HidOutput::PlayerLeds {
-                pad: 0,
-                bits: 0b00100,
-            },
-            HidOutput::Trigger {
-                pad: 0,
-                which: 1,
-                effect: vec![0x21, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-            },
-        ] {
-            let _ = conn.send_datagram(h.encode());
-        }
-        tracing::info!("PUNKTFUNK_TEST_FEEDBACK: scripted rumble + hidout burst sent");
+        send_test_feedback(&conn);
     }
 
     // Native thread: no async on the hot path.
@@ -2153,40 +1891,7 @@ pub(crate) async fn run_admitted(
     // Linux `PUNKTFUNK_PIN_CLOCKS`: refcounted vendor clock floor while any session streams.
     #[cfg(target_os = "linux")]
     let _clock_pin = crate::gpuclocks::session_pin();
-    // One library lookup: command, title, process identity. Client picks an existing id, never
-    // a command. Blocking: plugin entries ask over loopback from this async context.
-    let launch_target = match hello.launch.as_deref() {
-        None => None,
-        Some(id) => {
-            let owned = id.to_string();
-            match tokio::task::spawn_blocking(move || crate::library::resolve_launch(&owned))
-                .await
-                .context("resolve the session's library launch")?
-            {
-                Some(t) => {
-                    tracing::info!(
-                        launch_id = id,
-                        title = %t.game.title,
-                        command = t.command.as_deref().unwrap_or("-"),
-                        "resolved library launch for this session"
-                    );
-                    Some(t)
-                }
-                None => {
-                    tracing::warn!(
-                        launch_id = id,
-                        "client requested a launch id not in this host's library — ignoring"
-                    );
-                    let _ = launch_outcome_tx.send(punktfunk_core::quic::LaunchOutcome::new(
-                        punktfunk_core::quic::LaunchOutcomeKind::Refused,
-                        "Couldn't start that title — this host doesn't have it in its library \
-                         any more.",
-                    ));
-                    None
-                }
-            }
-        }
-    };
+    let launch_target = resolve_launch(hello.launch.as_deref(), &launch_outcome_tx).await?;
     #[cfg(target_os = "windows")]
     let launch_for_dp = launch_target.as_ref().and(hello.launch.clone());
     #[cfg(not(target_os = "windows"))]
@@ -2202,25 +1907,7 @@ pub(crate) async fn run_admitted(
         plane: conn.plane(),
         preset: session_preset.clone(),
     };
-    // Custom-title prep: `PF_APP_ID` + `PF_STREAM_*` so a step can set a per-mode FPS cap,
-    // `PF_PRESET_*` so it can tell a docked session from a handheld one.
-    let (prep_cmds, prep_env) = match hello.launch.as_deref() {
-        None => (Vec::new(), Vec::new()),
-        Some(id) => {
-            let mut env = vec![("PF_APP_ID".to_string(), id.to_string())];
-            if let Some(p) = &session_preset {
-                env.push(("PF_PRESET_ID".to_string(), p.id.clone()));
-                env.push(("PF_PRESET_NAME".to_string(), p.name.clone()));
-            }
-            env.extend(crate::hooks::prep_mode_env(
-                hello.mode.width,
-                hello.mode.height,
-                hello.mode.refresh_hz,
-                welcome.color.is_hdr(),
-            ));
-            (crate::library::prep_for(id), env)
-        }
-    };
+    let (prep_cmds, prep_env) = launch_prep(&hello, &welcome, session_preset.as_ref());
     // Reprieve, claim, prep and the launch hold, before the display opens. `block_in_place`:
     // operator code is blocking and this is a multi-thread runtime.
     let crate::session_launch::Prepared {
@@ -2276,13 +1963,13 @@ pub(crate) async fn run_admitted(
     let resize_ms_dp = resize_ms.clone();
     // Stream thread re-points input across compositor switches and hands identity to backends.
     #[cfg(target_os = "linux")]
-    let isolation_dp = isolation.clone();
+    let isolation_dp = planes.isolation.clone();
     #[cfg(target_os = "linux")]
     let input_route_dp = input_route.clone();
     #[cfg(target_os = "linux")]
     let inj_shared_tx_dp = inj_tx.clone();
     #[cfg(target_os = "linux")]
-    let inj_session_tx_dp = inj_session_tx.clone();
+    let inj_session_tx_dp = planes.inj_session_tx.clone();
     // Control-plane local IP for the source-address check (send loop is a blocking thread).
     let control_local_ip = conn.local_ip();
     // Client address: what the registry groups sessions of one NAT or tunnel by.
@@ -2290,83 +1977,14 @@ pub(crate) async fn run_admitted(
     let plane = conn.plane();
     let result: Result<()> = async {
         let stream_thread = tokio::task::spawn_blocking(move || -> Result<()> {
-            let (transport, wire_sock): (Box<dyn punktfunk_core::transport::Transport>, _) = match (data_plane, data_sock) {
-                // A browser's video goes out on the connection it arrived on. Nothing to bind,
-                // nothing to punch, and the source-address check below has no second socket to
-                // compare — the datagrams leave from wherever the QUIC path already is.
-                (DataPlane::Web(plane), _) => {
-                    bringup_dp.mark("punch_done");
-                    (Box::new(plane), None)
-                }
-                (DataPlane::Udp, None) => anyhow::bail!("the native plane negotiated no data socket"),
-                (DataPlane::Udp, Some(data_sock)) => {
-            // Wait for the client's punch and stream to its observed source — the port a NAT or
-            // a port proxy actually answers from. A fixed --data-port is no exception (it fixes
-            // only the host's side), so the client-reported port is the fallback for a punch
-            // that never arrives, never the first choice. IP is the host-observed QUIC remote.
-            let bound = UdpTransport::from_socket_punch(
+            let (transport, wire_sock) = bind_data_plane(
+                data_plane,
                 data_sock,
-                &client_udp.to_string(),
-                client_udp.ip(),
-                std::time::Duration::from_millis(2500),
-            );
-            let (transport, punched) = match bound {
-                Ok(v) => v,
-                Err(e) => {
-                    // Surface here: a teardown stall would otherwise swallow a bind error.
-                    tracing::error!(error = %e, %client_udp, udp_port, "data-plane socket setup failed");
-                    return Err(anyhow::Error::new(e)).context("bind data plane");
-                }
-            };
-            bringup_dp.mark("punch_done");
-            // Post-`connect` `local_addr` is the source stamped on every video datagram.
-            let local = transport.local_addr().ok();
-            tracing::info!(
-                %client_udp,
+                client_udp,
                 udp_port,
-                punched,
-                local = ?local,
-                "data plane bound (punched=true → the client's observed source; false → no \
-                 punch seen, the reported address)"
-            );
-            // Wrong egress: the client's connected socket drops every datagram before userspace.
-            if let (Some(l), Some(c)) = (local.map(|a| a.ip()), control_local_ip) {
-                let c = match c {
-                    std::net::IpAddr::V6(v6) => {
-                        v6.to_ipv4_mapped().map_or(c, std::net::IpAddr::V4)
-                    }
-                    v4 => v4,
-                };
-                if !l.is_unspecified() && l != c {
-                    tracing::warn!(
-                        video_source_ip = %l,
-                        control_local_ip = %c,
-                        "the video data plane egresses from a DIFFERENT host address than the one \
-                         this client connected to — its data socket is connected to the address it \
-                         dialed, so its kernel drops every video datagram before userspace: black \
-                         screen, zero reported loss, healthy control plane. Usual cause is two \
-                         live paths to the client (Ethernet and Wi-Fi both up on the same LAN, or \
-                         a VPN/overlay adapter claiming the route)"
-                    );
-                }
-            }
-            // No punch: inbound UDP to this port looks blocked, fixed or not, and video now goes
-            // to an address the client only claimed.
-            if !punched {
-                tracing::warn!(
-                    %client_udp,
-                    udp_port,
-                    "no hole-punch reached this host's data port — inbound UDP to it looks \
-                     BLOCKED, so video is being sent to the address the client reported without \
-                     any confirmed return path. If the picture stays black while the session is \
-                     otherwise healthy, this line is the reason: allow inbound UDP for the host \
-                     executable (any port), or pin --data-port and open that one"
-                );
-            }
-            let wire_sock = transport.try_clone_socket().ok();
-            (Box::new(transport), wire_sock)
-                }
-            };
+                control_local_ip,
+                &bringup_dp,
+            )?;
             let mut session = Session::new(cfg, transport)
                 .map_err(|e| anyhow!("host session: {e:?}"))?;
             match source {
@@ -2553,13 +2171,466 @@ pub(crate) async fn run_admitted(
     }
     .await;
 
-    // Every path: stop audio, close, join side threads. Close ends the datagram task → input.
+    teardown(&stop, &conn, &result, audio_handle, input_handle).await;
+    // Managed gamescope on an autologin box: put the TV's gaming session back once no session
+    // streams gamescope. A `join` session still shows the owner's game after the owner leaves.
+    drop(gamescope_hold);
+    if LIVE_GAMESCOPE.load(Ordering::SeqCst) == 0 {
+        crate::vdisplay::restore_managed_session();
+    }
+    result.map(|()| Served::Session)
+}
+
+/// What admission resolved for this device: its effective grant mask, deadline and the record's
+/// watch. Anonymous (`--open`) and an identity with no record keep full control — nothing on the
+/// trust record to enforce.
+struct Admission {
+    grants: u32,
+    deadline_unix: Option<i64>,
+    watch: Option<tokio::sync::watch::Receiver<crate::native_pairing::AccessState>>,
+    /// When admission ran; Welcome's remaining time counts from here.
+    at_unix: i64,
+    /// Counts this session while it runs. Held to the end of the session, so an error return or
+    /// a cancelled task releases it too — a record granted "this session" is dropped once the
+    /// guard falls and nothing reconnects inside the grace.
+    session: Option<crate::native_pairing::SessionCountGuard>,
+}
+
+/// Grants once at admission, with its two typed refusals: access that expired since the pairing
+/// gate, and a library launch without `GRANT_LAUNCH` — refused before the handshake, not a silent
+/// bare desktop.
+fn admit(
+    host: &SessionHost,
+    fp_hex: Option<&str>,
+    conn: &link::SessionLink,
+    first: &[u8],
+) -> Result<Admission> {
+    let at_unix = crate::clock::unix_secs();
+    let (grants, deadline_unix, watch) = match fp_hex {
+        Some(fp_hex) => match host.np.effective(fp_hex, at_unix) {
+            Some(mask) => {
+                // Subscribe before reading the deadline so a racing edit lands in this borrow
+                // or as the first change — never in a gap.
+                let rx = host.np.subscribe(fp_hex);
+                let deadline = rx.borrow().deadline_unix;
+                (mask, deadline, Some(rx))
+            }
+            // Expired between the pairing gate and here: typed expiry, not a setup error.
+            None if host.opts.require_pairing => {
+                close_rejected(conn, punktfunk_core::reject::RejectReason::AccessExpired);
+                anyhow::bail!("access expired between admission and session setup");
+            }
+            // `--open`: unpaired / expired identities keep full control.
+            None => (GRANT_ALL, None, None),
+        },
+        None => (GRANT_ALL, None, None),
+    };
+    let session = fp_hex.map(|fp_hex| host.np.session_started(fp_hex));
+    if grants & GRANT_LAUNCH == 0 && Hello::decode(first).is_ok_and(|h| h.launch.is_some()) {
+        close_rejected(
+            conn,
+            punktfunk_core::reject::RejectReason::LaunchNotPermitted,
+        );
+        anyhow::bail!("client requested a library launch without the LAUNCH grant");
+    }
+    Ok(Admission {
+        grants,
+        deadline_unix,
+        watch,
+        at_unix,
+        session,
+    })
+}
+
+/// Stop the session when its connection closes, and latch why for the summary. First writer
+/// wins, so the host's own close (game exit, clean finish) beats the `Lost` this would read it
+/// back as.
+fn spawn_end_watch(
+    conn: link::SessionLink,
+    stop: Arc<AtomicBool>,
+    quit: Arc<AtomicBool>,
+    end_reason: Arc<AtomicU8>,
+) {
+    tokio::spawn(async move {
+        let reason = conn.closed().await;
+        if reason.closed_with(QUIT_CODE) {
+            quit.store(true, Ordering::SeqCst);
+            crate::events::SessionEndReason::Local.latch(&end_reason);
+        } else {
+            // The client's own rule: anything that is not our close code is the link
+            // going away. A close this host made reads as `Other` here too, which is
+            // why the paths that make one latch before they call it.
+            crate::events::SessionEndReason::Lost.latch(&end_reason);
+        }
+        stop.store(true, Ordering::SeqCst);
+    });
+}
+
+/// The clipboard coordinator. Without CLIPBOARD it never starts (a watcher that doesn't exist
+/// can't leak): an inert handle (`available: false`) keeps the control task's arms uniform —
+/// NOT_PERMITTED, and the decline loop still answers stray fetches. Fetch transfers are quinn
+/// streams, so a browser takes the inert arm until the control plane is carrier-agnostic.
+async fn start_clipboard(
+    conn: &link::SessionLink,
+    grants: u32,
+    enabled: Arc<AtomicBool>,
+    desktop: bool,
+) -> pf_clipboard::ClipCoord {
+    let quic = (grants & GRANT_CLIPBOARD != 0)
+        .then(|| conn.as_quic().cloned())
+        .flatten();
+    if let Some(quic) = quic {
+        return pf_clipboard::start(quic, enabled, desktop).await;
+    }
+    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_offer_tx, offer_rx) = tokio::sync::mpsc::unbounded_channel();
+    pf_clipboard::ClipCoord {
+        available: false,
+        cmd_tx,
+        offer_rx,
+    }
+}
+
+/// Trust-store name (a console rename wins), else the sanitized Hello name. `None` if nameless.
+/// Events, hook filters, the stream marker and the tray all show this one.
+fn client_name(np: &NativePairing, fp_hex: Option<&str>, hello: &Hello) -> Option<String> {
+    fp_hex
+        .and_then(|fp| np.list().into_iter().find(|c| c.fingerprint == fp))
+        .map(|c| c.name)
+        .or_else(|| {
+            let raw = hello.name.as_deref().unwrap_or("").trim();
+            (!raw.is_empty())
+                .then(|| crate::native_pairing::sanitize_device_name(raw, fp_hex.unwrap_or("")))
+        })
+}
+
+/// This session's input and mic planes. An isolated gamescope session
+/// (`compositor_route::session_is_isolated`) gets its own; everyone else shares the
+/// host-lifetime ones. Dropping it closes the pinned EIS connection and the isolated mic.
+struct SessionPlanes {
+    /// Linux only. Identity is the device-fingerprint prefix, so keep-alive hands a kept spawn
+    /// back to the same client.
+    isolation: Option<crate::vdisplay::SessionIsolation>,
+    /// Where this session's virtual pads are exposed, so its seat's Steam opens those and no
+    /// other seat's. `None` on every host without the filter, which is today's box-wide pads.
+    seat_dev: Option<std::path::PathBuf>,
+    /// Pointer and keyboard: the pinned injector, else the host-lifetime one. Swappable.
+    input_route: input::InputRoute,
+    #[cfg(target_os = "linux")]
+    inj_session_tx: Option<std::sync::mpsc::Sender<InputEvent>>,
+    /// The 0xCB uplink: this session's `punktfunk-mic-{id}` pump, else the shared one.
+    mic_tx: std::sync::mpsc::SyncSender<crate::audio::MicFrame>,
+    #[cfg(target_os = "linux")]
+    _mic: Option<crate::audio::MicPump>,
+    #[cfg(target_os = "linux")]
+    _injector: Option<crate::inject::InjectorService>,
+}
+
+impl SessionPlanes {
+    /// Minted after the handshake, before the input and audio threads.
+    fn mint(
+        joined: Option<&crate::vdisplay::admission::LiveDisplay>,
+        compositor: Option<crate::vdisplay::Compositor>,
+        route: Option<&crate::vdisplay::GamescopeRoute>,
+        fp_hex: Option<&str>,
+        inj_tx: &std::sync::mpsc::Sender<InputEvent>,
+        mic_tx: std::sync::mpsc::SyncSender<crate::audio::MicFrame>,
+    ) -> SessionPlanes {
+        #[cfg(target_os = "linux")]
+        {
+            let isolation = match joined {
+                // A joiner uses the owner's planes: its input relay and sink. A second mic source
+                // of the same name would split the owner's, so its mic stays on the shared one.
+                Some(d) => d
+                    .isolation
+                    .clone()
+                    .map(|i| crate::vdisplay::SessionIsolation {
+                        mic_source: None,
+                        ..i
+                    }),
+                None => compositor
+                    .filter(|c| crate::compositor_route::session_is_isolated(*c, route))
+                    .map(|_| {
+                        // `--open` has no fingerprint; a per-accept sequence isolates at the cost
+                        // of keep-alive.
+                        static ANON_SEQ: AtomicU64 = AtomicU64::new(0);
+                        let paired = fp_hex.map(seat_id);
+                        let id = paired.clone().unwrap_or_else(|| {
+                            format!("anon{}", ANON_SEQ.fetch_add(1, Ordering::Relaxed))
+                        });
+                        let iso = session_isolation(&id, paired.is_some());
+                        tracing::info!(%id, sink = iso.sink.as_deref().unwrap_or("-"),
+                            "isolated gamescope session — per-session input/audio/mic planes");
+                        iso
+                    }),
+            };
+            let seat_dev = isolation
+                .as_ref()
+                .and_then(crate::vdisplay::seat_device_dir);
+            let injector = isolation
+                .as_ref()
+                .map(|i| crate::inject::InjectorService::start_at(i.ei_relay.clone()));
+            let inj_session_tx = injector.as_ref().map(|s| s.sender());
+            let input_route =
+                input::InputRoute::new(inj_session_tx.clone().unwrap_or_else(|| inj_tx.clone()));
+            let mic = isolation
+                .as_ref()
+                .and_then(|i| i.mic_source.clone())
+                .map(|name| crate::audio::MicPump::start_named(Some(name)));
+            let mic_tx = mic.as_ref().map(|p| p.sender()).unwrap_or(mic_tx);
+            SessionPlanes {
+                isolation,
+                seat_dev,
+                input_route,
+                inj_session_tx,
+                mic_tx,
+                _mic: mic,
+                _injector: injector,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (joined, compositor, route, fp_hex);
+            SessionPlanes {
+                isolation: None,
+                seat_dev: None,
+                input_route: input::InputRoute::new(inj_tx.clone()),
+                mic_tx,
+            }
+        }
+    }
+}
+
+/// `ClientConnected` now, and `ClientDisconnected` with its reason once the connection closes.
+fn emit_connected(conn: &link::SessionLink, client: crate::events::ClientRef) {
+    crate::events::emit(crate::events::EventKind::ClientConnected {
+        client: client.clone(),
+    });
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        let reason = conn.closed().await;
+        let why = if reason.closed_with(QUIT_CODE) {
+            crate::events::DisconnectReason::Quit
+        } else if matches!(reason, link::LinkClosed::TimedOut) {
+            crate::events::DisconnectReason::Timeout
+        } else {
+            crate::events::DisconnectReason::Error
+        };
+        crate::events::emit(crate::events::EventKind::ClientDisconnected {
+            client,
+            reason: why,
+        });
+    });
+}
+
+/// HDR10 baseline at start, from the client's display volume (`Hello::display_hdr`, which
+/// its EDID advertises), else generic HDR10. The virtual stream then sends the source's real
+/// mastering on capture start and keyframes; this covers synthetic and the pre-capture gap.
+fn send_hdr_baseline(conn: &link::SessionLink, display_hdr: Option<punktfunk_core::quic::HdrMeta>) {
+    let meta = crate::encode::hdr_meta_to_wire(display_hdr.map_or_else(
+        pf_frame::hdr::generic_hdr10,
+        crate::encode::hdr_meta_from_wire,
+    ));
+    let _ = conn.send_datagram(punktfunk_core::quic::encode_hdr_meta_datagram(&meta));
+    tracing::info!(
+        client_volume = display_hdr.is_some(),
+        "sent HDR10 static metadata (0xCE baseline)"
+    );
+}
+
+/// `PUNKTFUNK_TEST_FEEDBACK=1` on the synthetic source: rumble (0xCA) and HID output (0xCD)
+/// for a loopback client, with no real pad.
+fn send_test_feedback(conn: &link::SessionLink) {
+    use punktfunk_core::quic::HidOutput;
+    // 400 ms TTL + both trigger motors. Trigger levels differ from each other and the
+    // handles so a wrong-offset decoder cannot hide behind a plausible zero.
+    let d =
+        punktfunk_core::quic::encode_rumble_datagram_v3(0, 0x4000, 0x8000, 0, 400, 0x2000, 0x6000);
+    let _ = conn.send_datagram(d.to_vec());
+    for h in [
+        HidOutput::Led {
+            pad: 0,
+            r: 10,
+            g: 20,
+            b: 30,
+        },
+        HidOutput::PlayerLeds {
+            pad: 0,
+            bits: 0b00100,
+        },
+        HidOutput::Trigger {
+            pad: 0,
+            which: 1,
+            effect: vec![0x21, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        },
+    ] {
+        let _ = conn.send_datagram(h.encode());
+    }
+    tracing::info!("PUNKTFUNK_TEST_FEEDBACK: scripted rumble + hidout burst sent");
+}
+
+/// One library lookup: command, title, process identity. The client picks an existing id,
+/// never a command. An id this host no longer has is refused onto `outcome`. Blocking: plugin
+/// entries ask over loopback from this async context.
+async fn resolve_launch(
+    launch: Option<&str>,
+    outcome: &crate::gamelease::OutcomeTx,
+) -> Result<Option<crate::library::LaunchTarget>> {
+    let Some(id) = launch else {
+        return Ok(None);
+    };
+    let owned = id.to_string();
+    let found = tokio::task::spawn_blocking(move || crate::library::resolve_launch(&owned))
+        .await
+        .context("resolve the session's library launch")?;
+    match &found {
+        Some(t) => tracing::info!(
+            launch_id = id,
+            title = %t.game.title,
+            command = t.command.as_deref().unwrap_or("-"),
+            "resolved library launch for this session"
+        ),
+        None => {
+            tracing::warn!(
+                launch_id = id,
+                "client requested a launch id not in this host's library — ignoring"
+            );
+            let _ = outcome.send(punktfunk_core::quic::LaunchOutcome::new(
+                punktfunk_core::quic::LaunchOutcomeKind::Refused,
+                "Couldn't start that title — this host doesn't have it in its library \
+                 any more.",
+            ));
+        }
+    }
+    Ok(found)
+}
+
+/// The launched title's prep steps and their environment: `PF_APP_ID` and `PF_STREAM_*`, so a
+/// step can set a per-mode FPS cap, and `PF_PRESET_*`, so it can tell a docked session from a
+/// handheld one. Empty without a launch.
+fn launch_prep(
+    hello: &Hello,
+    welcome: &Welcome,
+    preset: Option<&crate::events::PresetRef>,
+) -> (Vec<crate::hooks::PrepCmd>, Vec<(String, String)>) {
+    let Some(id) = hello.launch.as_deref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut env = vec![("PF_APP_ID".to_string(), id.to_string())];
+    if let Some(p) = preset {
+        env.push(("PF_PRESET_ID".to_string(), p.id.clone()));
+        env.push(("PF_PRESET_NAME".to_string(), p.name.clone()));
+    }
+    env.extend(crate::hooks::prep_mode_env(
+        hello.mode.width,
+        hello.mode.height,
+        hello.mode.refresh_hz,
+        welcome.color.is_hdr(),
+    ));
+    (crate::library::prep_for(id), env)
+}
+
+/// The video transport, and the data socket's clone for the `wire egress` probe. A browser's
+/// video goes out on the connection it arrived on: nothing to bind or punch, and no second socket
+/// to check the source address of. UDP waits for the client's punch and streams to its observed
+/// source — the port a NAT or a port proxy actually answers from. A fixed `--data-port` is no
+/// exception (it fixes only the host's side), so the client-reported port is the fallback for a
+/// punch that never arrives, never the first choice. The IP is the host-observed QUIC remote.
+fn bind_data_plane(
+    data_plane: DataPlane,
+    data_sock: Option<std::net::UdpSocket>,
+    client_udp: std::net::SocketAddr,
+    udp_port: u16,
+    control_local_ip: Option<std::net::IpAddr>,
+    bringup: &crate::bringup::Trace,
+) -> Result<(
+    Box<dyn punktfunk_core::transport::Transport>,
+    Option<std::net::UdpSocket>,
+)> {
+    let data_sock = match (data_plane, data_sock) {
+        (DataPlane::Web(plane), _) => {
+            bringup.mark("punch_done");
+            return Ok((Box::new(plane), None));
+        }
+        (DataPlane::Udp, None) => anyhow::bail!("the native plane negotiated no data socket"),
+        (DataPlane::Udp, Some(sock)) => sock,
+    };
+    let bound = UdpTransport::from_socket_punch(
+        data_sock,
+        &client_udp.to_string(),
+        client_udp.ip(),
+        std::time::Duration::from_millis(2500),
+    );
+    let (transport, punched) = match bound {
+        Ok(v) => v,
+        Err(e) => {
+            // Surface here: a teardown stall would otherwise swallow a bind error.
+            tracing::error!(error = %e, %client_udp, udp_port, "data-plane socket setup failed");
+            return Err(anyhow::Error::new(e)).context("bind data plane");
+        }
+    };
+    bringup.mark("punch_done");
+    // Post-`connect` `local_addr` is the source stamped on every video datagram.
+    let local = transport.local_addr().ok();
+    tracing::info!(
+        %client_udp,
+        udp_port,
+        punched,
+        local = ?local,
+        "data plane bound (punched=true → the client's observed source; false → no \
+         punch seen, the reported address)"
+    );
+    // Wrong egress: the client's connected socket drops every datagram before userspace.
+    if let (Some(l), Some(c)) = (local.map(|a| a.ip()), control_local_ip) {
+        let c = match c {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(c, std::net::IpAddr::V4),
+            v4 => v4,
+        };
+        if !l.is_unspecified() && l != c {
+            tracing::warn!(
+                video_source_ip = %l,
+                control_local_ip = %c,
+                "the video data plane egresses from a DIFFERENT host address than the one \
+                 this client connected to — its data socket is connected to the address it \
+                 dialed, so its kernel drops every video datagram before userspace: black \
+                 screen, zero reported loss, healthy control plane. Usual cause is two \
+                 live paths to the client (Ethernet and Wi-Fi both up on the same LAN, or \
+                 a VPN/overlay adapter claiming the route)"
+            );
+        }
+    }
+    // No punch: inbound UDP to this port looks blocked, fixed or not, and video now goes
+    // to an address the client only claimed.
+    if !punched {
+        tracing::warn!(
+            %client_udp,
+            udp_port,
+            "no hole-punch reached this host's data port — inbound UDP to it looks \
+             BLOCKED, so video is being sent to the address the client reported without \
+             any confirmed return path. If the picture stays black while the session is \
+             otherwise healthy, this line is the reason: allow inbound UDP for the host \
+             executable (any port), or pin --data-port and open that one"
+        );
+    }
+    let wire_sock = transport.try_clone_socket().ok();
+    Ok((Box::new(transport), wire_sock))
+}
+
+/// Every exit: stop audio, close the connection, join the side threads. The close ends the
+/// datagram task and with it the input thread. The join is bounded: a stuck side thread must not
+/// hold the permit or the admission entry.
+async fn teardown(
+    stop: &AtomicBool,
+    conn: &link::SessionLink,
+    result: &Result<()>,
+    audio_handle: Option<std::thread::JoinHandle<()>>,
+    input_handle: std::thread::JoinHandle<()>,
+) {
     stop.store(true, Ordering::SeqCst);
     conn.close(
         if result.is_ok() { 0u32 } else { 1u32 },
         if result.is_ok() { b"done" } else { b"error" },
     );
-    // Bounded join: a stuck side thread must not hold the permit/admission entry.
     let side_threads = tokio::task::spawn_blocking(move || {
         if let Some(h) = audio_handle {
             let _ = h.join();
@@ -2580,13 +2651,6 @@ pub(crate) async fn run_admitted(
              already-owned until it returns"
         );
     }
-    // Managed gamescope on an autologin box: put the TV's gaming session back once no session
-    // streams gamescope. A `join` session still shows the owner's game after the owner leaves.
-    drop(gamescope_hold);
-    if LIVE_GAMESCOPE.load(Ordering::SeqCst) == 0 {
-        crate::vdisplay::restore_managed_session();
-    }
-    result.map(|()| Served::Session)
 }
 
 /// Live native sessions on a gamescope display, for the managed TV restore above.
