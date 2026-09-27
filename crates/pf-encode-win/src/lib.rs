@@ -50,6 +50,9 @@ pub mod nvenc_status;
 // Shared `nvEncodeAPI` glue (`NvStatusExt`/`nv_ok`, `codec_guid`). Sibling of `nvenc_status`.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "nvenc"))]
 pub mod nvenc_core;
+// The direct-NVENC session both backends drive: open ladder, submit, RFI, retrieve.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "nvenc"))]
+pub mod nvenc_session;
 // Slot-family RFI policy (taint sweep + pre-loss anchor) for AMF, QSV, Vulkan
 // Video and the native VAAPI encoder. Mechanisms stay in each backend. Cfg is
 // the union of callers, and the VAAPI one is featureless on Linux.
