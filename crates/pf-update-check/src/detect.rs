@@ -52,6 +52,9 @@ impl Product {
 /// `CHANNEL=stable|canary` for the sysext updater.
 const SYSEXT_CONF: &str = "/etc/punktfunk-sysext.conf";
 
+/// Present on rpm-ostree and bootc boxes.
+pub const OSTREE_BOOTED: &str = "/run/ostree-booted";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallKind {
     WindowsInstaller,
@@ -112,7 +115,7 @@ pub fn gather(product: Product, version: &str) -> Probe {
         marker: std::fs::read_to_string(product.marker_path()).ok(),
         sysext: Path::new(product.sysext_marker()).exists(),
         sysext_conf: std::fs::read_to_string(SYSEXT_CONF).ok(),
-        ostree_booted: Path::new("/run/ostree-booted").exists(),
+        ostree_booted: Path::new(OSTREE_BOOTED).exists(),
         version: version.to_string(),
     }
 }
@@ -175,27 +178,29 @@ pub fn classify(p: &Probe, product: Product) -> (InstallKind, Channel) {
         }
     }
 
-    if let Some(marker) = &p.marker {
-        let mut words = marker.split_whitespace();
-        let kind = words.next().unwrap_or("");
-        let channel = match words.next() {
-            Some("canary") => Channel::Canary,
-            _ => Channel::Stable,
-        };
-        let kind = match kind {
-            "apt" => Some(InstallKind::Apt),
-            // Ostree consumed the RPM by layering; `dnf upgrade` is not the update path.
-            "dnf" if p.ostree_booted => Some(InstallKind::RpmOstree),
-            "dnf" => Some(InstallKind::Dnf),
-            "pacman" => Some(InstallKind::Pacman),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            return (kind, channel);
-        }
-    }
+    p.marker
+        .as_deref()
+        .and_then(|m| parse_marker(m, p.ostree_booted))
+        .unwrap_or((InstallKind::Source, Channel::Stable))
+}
 
-    (InstallKind::Source, Channel::Stable)
+/// A [`Product::marker_path`] file: kind, then an optional channel. `None` for a kind no
+/// package manager delivers. The root helper reads the kind through this too.
+pub fn parse_marker(text: &str, ostree_booted: bool) -> Option<(InstallKind, Channel)> {
+    let mut words = text.split_whitespace();
+    let kind = match words.next()? {
+        "apt" => InstallKind::Apt,
+        // Ostree consumed the RPM by layering; `dnf upgrade` is not the update path.
+        "dnf" if ostree_booted => InstallKind::RpmOstree,
+        "dnf" => InstallKind::Dnf,
+        "pacman" => InstallKind::Pacman,
+        _ => return None,
+    };
+    let channel = match words.next() {
+        Some("canary") => Channel::Canary,
+        _ => Channel::Stable,
+    };
+    Some((kind, channel))
 }
 
 /// One-line, copy-pastable "how to update" hint. No placeholders.
@@ -319,6 +324,14 @@ mod tests {
                 (kind, channel),
                 "marker `{marker}`"
             );
+        }
+    }
+
+    /// The root helper refuses what this returns `None` for.
+    #[test]
+    fn a_marker_without_a_package_manager_parses_as_none() {
+        for marker in ["", "snap stable", "sysext", "nix"] {
+            assert_eq!(parse_marker(marker, false), None, "marker `{marker}`");
         }
     }
 

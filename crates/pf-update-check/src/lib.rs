@@ -5,6 +5,7 @@
 //! security bug, so the check lives once:
 //!
 //! * [`sig`] — detached Ed25519 against pinned keys.
+//! * [`floor`] — the per-channel serial that refuses a replayed older manifest.
 //! * [`manifest`] — schema and fail-closed validation.
 //! * [`feed`] — fetch; verify the post-redirect bytes.
 //! * [`version`] — channel and "newer" across packaging formats.
@@ -28,14 +29,43 @@ pub const OFFICIAL_UPDATE_KEYS: [&str; 2] = [
     "", // rotation slot
 ];
 
+/// [`OFFICIAL_UPDATE_KEYS`] parsed, the empty rotation slot skipped.
+#[cfg(feature = "verify")]
+pub fn pinned_keys() -> Vec<PublicKey> {
+    OFFICIAL_UPDATE_KEYS
+        .iter()
+        .filter(|k| !k.is_empty())
+        .filter_map(|k| PublicKey::parse(k).ok())
+        .collect()
+}
+
 pub mod detect;
+#[cfg(feature = "verify")]
 pub mod feed;
+pub mod floor;
+#[cfg(feature = "verify")]
 pub mod manifest;
+#[cfg(feature = "verify")]
 pub mod sig;
 pub mod version;
 
 pub use detect::{InstallKind, Product};
+#[cfg(feature = "verify")]
 pub use feed::FeedError;
+#[cfg(feature = "verify")]
 pub use manifest::{Manifest, MAX_MANIFEST_BYTES, SCHEMA};
+#[cfg(feature = "verify")]
 pub use sig::{verify_signature, PublicKey};
 pub use version::{canary_run, is_newer, triple, Channel};
+
+#[cfg(all(test, feature = "verify"))]
+mod tests {
+    #[test]
+    fn pinned_keys_skip_the_empty_rotation_slot() {
+        assert_eq!(
+            super::pinned_keys().len(),
+            1,
+            "one live key, one empty slot"
+        );
+    }
+}

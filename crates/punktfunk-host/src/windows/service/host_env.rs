@@ -15,28 +15,21 @@ pub(super) fn load_host_env() {
         return;
     };
     let mut n = 0;
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            let (k, v) = (k.trim(), v.trim().trim_matches('"'));
-            // Allow-list matches `interactive::merged_env_block`. A planted host.env must not
-            // override `SystemRoot` — `icacls_path` / the powershell warner resolve through it.
-            // `PUNKTFUNK_HOST_CMD` still passes; a non-admin-owned host.env is rejected at install.
-            // Credentials are excluded outright: they live in their own owner-only files, and an
-            // environment copy is what every child process inherits.
-            let secret = k.contains("TOKEN") || k.contains("PASSWORD");
-            let allowed = (k.starts_with("PUNKTFUNK_") || k == "RUST_LOG") && !secret;
-            if !k.is_empty() && allowed {
-                // SAFETY: no other thread yet. The network-profile warner and the host child both
-                // start after `load_host_env` returns, so nothing reads the environment concurrently.
-                unsafe { std::env::set_var(k, v) };
-                n += 1;
-            } else if !k.is_empty() {
-                tracing::warn!(key = %k, "host.env: ignoring non-allow-listed key");
-            }
+    for (k, v) in pf_paths::env_file::parse(&contents) {
+        // Allow-list matches `interactive::merged_env_block`. A planted host.env must not
+        // override `SystemRoot` — `icacls_path` / the powershell warner resolve through it.
+        // `PUNKTFUNK_HOST_CMD` still passes; a non-admin-owned host.env is rejected at install.
+        // Credentials are excluded outright: they live in their own owner-only files, and an
+        // environment copy is what every child process inherits.
+        let secret = k.contains("TOKEN") || k.contains("PASSWORD");
+        let allowed = (k.starts_with("PUNKTFUNK_") || k == "RUST_LOG") && !secret;
+        if allowed {
+            // SAFETY: no other thread yet. The network-profile warner and the host child both
+            // start after `load_host_env` returns, so nothing reads the environment concurrently.
+            unsafe { std::env::set_var(k, v) };
+            n += 1;
+        } else {
+            tracing::warn!(key = %k, "host.env: ignoring non-allow-listed key");
         }
     }
     tracing::info!(path = %path.display(), vars = n, "loaded host.env");

@@ -280,12 +280,9 @@ fn competing_hosts(run: &dyn CommandRunner) -> Vec<String> {
         .collect()
 }
 
+/// Read as the service reads host.env, so setup and host agree on where the API listens.
 fn mgmt_bind_set(host_env: &str) -> bool {
-    host_env.lines().any(|line| {
-        line.trim()
-            .strip_prefix("PUNKTFUNK_MGMT_BIND=")
-            .is_some_and(|v| !v.trim().is_empty())
-    })
+    pf_paths::env_file::get(host_env, "PUNKTFUNK_MGMT_BIND").is_some_and(|v| !v.is_empty())
 }
 
 /// Steam streaming-audio drivers the host mic capture needs. Absence is a warning, not a fail.
@@ -641,6 +638,15 @@ mod tests {
         assert!(!mgmt_bind_set("# PUNKTFUNK_MGMT_BIND=0.0.0.0:48123\n"));
         assert!(!mgmt_bind_set("PUNKTFUNK_MGMT_BIND=\n"));
         assert!(mgmt_bind_set("  PUNKTFUNK_MGMT_BIND=0.0.0.0:47991\n"));
+    }
+
+    /// The service accepts spaces around `=` and quotes, and a later line wins.
+    #[test]
+    fn mgmt_bind_reads_the_service_grammar() {
+        assert!(mgmt_bind_set("PUNKTFUNK_MGMT_BIND = \"0.0.0.0:48123\"\n"));
+        assert!(!mgmt_bind_set(
+            "PUNKTFUNK_MGMT_BIND=0.0.0.0:48123\nPUNKTFUNK_MGMT_BIND=\n"
+        ));
     }
 
     #[test]

@@ -3381,6 +3381,7 @@ dependencies = [
 name = "pf-update"
 version = "0.40.0"
 dependencies = [
+ "pf-update-check",
  "serde",
  "serde_json",
 ]
@@ -3394,6 +3395,7 @@ dependencies = [
  "base64 0.23.1",
  "serde",
  "serde_json",
+ "tempfile",
  "ureq",
 ]
 
@@ -3934,6 +3936,8 @@ version = "0.40.0"
 dependencies = [
  "console",
  "getrandom 0.3.4",
+ "pf-host-config",
+ "pf-paths",
  "portable-pty",
  "serde",
  "serde_json",

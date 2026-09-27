@@ -6,9 +6,10 @@
 //!
 //! Goldens pin the strings. Design: `design/installer-v2-windows.md`.
 
-use super::choices::{NetworkAnswer, WinChoices, LAN_BIND, LOOPBACK_BIND};
+use super::choices::{NetworkAnswer, WinChoices};
 use super::plan::Artifact;
 use super::{WinFacts, MGMT_PORT_MOVED};
+use crate::choices::{LAN_BIND, LOOPBACK_BIND};
 use crate::facts::DOCS;
 use crate::ui::Reporter;
 

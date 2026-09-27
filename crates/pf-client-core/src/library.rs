@@ -209,14 +209,8 @@ pub fn agent(
     use rustls::pki_types::pem::PemObject;
     let bad =
         |what: &str, e: &dyn std::fmt::Display| LibraryError::Unreachable(format!("{what}: {e}"));
-    // Same aws-lc-rs provider the QUIC endpoints install — mixing rustls
-    // providers panics.
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| bad("tls config", &e))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(punktfunk_core::tls::PinVerify::new(pin)));
+    let builder = punktfunk_core::tls::pinned_builder(punktfunk_core::tls::PinVerify::new(pin))
+        .map_err(|e| bad("tls config", &e))?;
     let cert = rustls::pki_types::CertificateDer::from_pem_slice(identity.0.as_bytes())
         .map_err(|e| bad("client cert pem", &e))?;
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(identity.1.as_bytes())

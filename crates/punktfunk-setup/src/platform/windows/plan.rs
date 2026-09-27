@@ -819,22 +819,8 @@ mod tests {
 
     fn facts(arch: &str) -> WinFacts {
         WinFacts {
-            os_build: 26200,
             arch: arch.into(),
-            installed: None,
-            host_env_present: false,
-            web_password_present: false,
-            mgmt_bind_set: false,
-            competing_hosts: vec![],
-            mgmt_port_in_use: false,
-            networks: vec![],
-            steam_audio_drivers: true,
-            tray_autostart: false,
-            vulkan_layer_registered: false,
-            web_task: super::super::TaskState::Absent,
-            scripting_task: super::super::TaskState::Absent,
-            inno_uninstaller: false,
-            client_installed: None,
+            ..crate::fixtures::fresh_win()
         }
     }
 

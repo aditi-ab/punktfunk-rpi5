@@ -410,11 +410,7 @@ fn notify_on_connect(hwnd: HWND) {
 
 fn show_menu(hwnd: HWND) {
     let status = app().status().clone();
-    let running = matches!(
-        status,
-        TrayStatus::Running(_) | TrayStatus::Starting | TrayStatus::Degraded
-    );
-    let startable = matches!(status, TrayStatus::Stopped | TrayStatus::Error(_));
+    let running = status.is_running();
     let can_control = app().host_exe.is_some();
 
     // SAFETY: menu handle created and destroyed here; AppendMenuW copies the item strings, whose
@@ -438,22 +434,12 @@ fn show_menu(hwnd: HWND) {
         };
         add(IDM_HEADER, &status.headline(), true, None);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        // Keep the console entry even when the probe fails; hide-on-down is not discoverable.
-        if app().web_console.load(Ordering::SeqCst) {
-            add(
-                IDM_OPEN_WEB,
-                "Open web console",
-                false,
-                Some(win_theme::GLYPH_GLOBE),
-            );
-        } else {
-            add(
-                IDM_OPEN_WEB,
-                "Open web console (not responding)",
-                false,
-                Some(win_theme::GLYPH_GLOBE),
-            );
-        }
+        add(
+            IDM_OPEN_WEB,
+            crate::status::console_label(app().web_console.load(Ordering::SeqCst)),
+            false,
+            Some(win_theme::GLYPH_GLOBE),
+        );
         let _ = SetMenuDefaultItem(menu, IDM_OPEN_WEB as u32, 0);
         if status.pairing_attention() {
             add(
@@ -463,25 +449,13 @@ fn show_menu(hwnd: HWND) {
                 Some(win_theme::GLYPH_APPROVE),
             );
         }
-        match status.kept_displays() {
-            0 => {}
-            1 => add(
-                IDM_DISPLAYS,
-                "Release kept display…",
-                false,
-                Some(win_theme::GLYPH_DISPLAY),
-            ),
-            n => add(
-                IDM_DISPLAYS,
-                &format!("Release {n} kept displays…"),
-                false,
-                Some(win_theme::GLYPH_DISPLAY),
-            ),
+        if let Some(label) = status.release_label() {
+            add(IDM_DISPLAYS, &label, false, Some(win_theme::GLYPH_DISPLAY));
         }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         // Shield = this item opens a UAC prompt (`punktfunk-host.exe service …`).
         if can_control {
-            if startable {
+            if status.can_start() {
                 add(
                     IDM_START,
                     "Start host",
@@ -491,18 +465,11 @@ fn show_menu(hwnd: HWND) {
             }
             if running {
                 add(IDM_STOP, "Stop host", false, Some(win_theme::GLYPH_SHIELD));
-                // "Restart Punktfunk" restarts the service. Clients use "Restart host" for the
-                // machine (`design/host-actions.md`). Same phrase must not mean both.
+            }
+            if status.can_restart() {
                 add(
                     IDM_RESTART,
-                    "Restart Punktfunk",
-                    false,
-                    Some(win_theme::GLYPH_SHIELD),
-                );
-            } else if matches!(status, TrayStatus::Error(_)) {
-                add(
-                    IDM_RESTART,
-                    "Restart Punktfunk",
+                    crate::status::RESTART_LABEL,
                     false,
                     Some(win_theme::GLYPH_SHIELD),
                 );
@@ -660,11 +627,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     // Only this entry stops the host. `WM_CLOSE` (`--quit`) and `WM_ENDSESSION`
                     // leave a headless host. A declined UAC cancels the exit too.
                     // Match `show_menu`: no host exe means no stop, and the icon must still close.
-                    let stop_first = app.host_exe.is_some()
-                        && matches!(
-                            *app.status(),
-                            TrayStatus::Running(_) | TrayStatus::Starting | TrayStatus::Degraded
-                        );
+                    let stop_first = app.host_exe.is_some() && app.status().is_running();
                     if stop_first && !elevate_service(hwnd, "stop") {
                         return LRESULT(0);
                     }
