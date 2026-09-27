@@ -270,6 +270,29 @@ impl EglBackend {
         }
     }
 
+    /// The dmabuf fd for `key`, storing `fd` first when it rode along. `Err` is the reply to
+    /// send instead: `what` claimed an fd that did not arrive, or [`Reply::NeedFd`] after an LRU
+    /// eviction or cache desync, so the host resends rather than failing the frame.
+    fn resolve_fd(
+        &mut self,
+        key: u64,
+        has_fd: bool,
+        fd: Option<OwnedFd>,
+        what: &str,
+    ) -> Result<i32, Reply> {
+        if let Some(fd) = fd {
+            self.store_fd(key, fd);
+        } else if has_fd {
+            return Err(Reply::Err {
+                message: format!("{what} said has_fd but no fd arrived"),
+            });
+        }
+        self.fds
+            .get(&key)
+            .map(|f| f.as_raw_fd())
+            .ok_or(Reply::NeedFd)
+    }
+
     fn note_dims(&mut self, kind: ImportKind, width: u32, height: u32) {
         if self.last_shape != Some((kind, width, height)) {
             self.last_shape = Some((kind, width, height));
@@ -284,16 +307,9 @@ impl ImportBackend for EglBackend {
     }
 
     fn import(&mut self, req: &ImportReq, fd: Option<OwnedFd>) -> Reply {
-        if let Some(fd) = fd {
-            self.store_fd(req.key, fd);
-        } else if req.has_fd {
-            return Reply::Err {
-                message: "Import said has_fd but no fd arrived".into(),
-            };
-        }
-        let Some(raw) = self.fds.get(&req.key).map(|f| f.as_raw_fd()) else {
-            // LRU eviction / cache desync: ask the host to resend the fd rather than fail the frame.
-            return Reply::NeedFd;
+        let raw = match self.resolve_fd(req.key, req.has_fd, fd, "Import") {
+            Ok(raw) => raw,
+            Err(reply) => return reply,
         };
         match self.import_inner(req, raw) {
             Ok((id, desc)) => Reply::Frame { id, desc },
@@ -362,17 +378,10 @@ impl ImportBackend for EglBackend {
         cursor: Option<CursorRect>,
         fd: Option<OwnedFd>,
     ) -> Reply {
-        if let Some(fd) = fd {
-            self.store_fd(key, fd);
-        } else if has_fd {
-            return Reply::Err {
-                message: "Convert said has_fd but no fd arrived".into(),
-            };
-        }
-        let Some(raw) = self.fds.get(&key).map(|f| f.as_raw_fd()) else {
-            return Reply::NeedFd;
+        src.fd = match self.resolve_fd(key, has_fd, fd, "Convert") {
+            Ok(raw) => raw,
+            Err(reply) => return reply,
         };
-        src.fd = raw;
         match self.importer.convert(&src, slot, &out, cursor) {
             Ok(value) => Reply::Converted { value },
             Err(e) => Reply::Err {
@@ -442,30 +451,14 @@ impl EglBackend {
             stride: req.stride,
         };
         self.note_dims(req.kind, req.width, req.height);
-        let buf = match req.kind {
-            ImportKind::Tiled => {
-                self.importer
-                    .import(&plane, req.width, req.height, req.fourcc, req.modifier)?
-            }
-            ImportKind::TiledNv12 => self.importer.import_nv12(
-                &plane,
-                req.width,
-                req.height,
-                req.fourcc,
-                req.modifier,
-            )?,
-            ImportKind::Tiled444 => self.importer.import_yuv444(
-                &plane,
-                req.width,
-                req.height,
-                req.fourcc,
-                req.modifier,
-            )?,
-            ImportKind::Linear => self.importer.import_linear(&plane, req.width, req.height)?,
-            ImportKind::LinearNv12 => self
-                .importer
-                .import_linear_nv12(&plane, req.width, req.height)?,
-        };
+        let buf = self.importer.import(
+            req.kind,
+            &plane,
+            req.width,
+            req.height,
+            req.fourcc,
+            req.modifier,
+        )?;
         cuda::make_current()?;
         let (id, desc) = match self.ids.get(&buf.ptr) {
             Some(&id) => (id, None),

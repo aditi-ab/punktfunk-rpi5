@@ -10,6 +10,7 @@ use super::pw_pods::{
 use super::sync_timeline::{hand_back, plane_count, SyncDevice, SyncPoints};
 use super::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat, ZeroCopyPolicy};
 use anyhow::{Context, Result};
+use pf_zerocopy::ImportKind;
 use pipewire as pw;
 use pw::{properties::properties, spa};
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -761,6 +762,25 @@ fn holds_possible(hold_enabled: bool, pool_live: u32) -> bool {
     hold_enabled && pool_live > HOLD_POOL_RESERVE
 }
 
+/// The import a frame takes. 4:4:4 needs the tiled EGL convert and wins over NV12; 10-bit
+/// keeps packed RGB; a LINEAR NV12 CSC that failed once stays RGB for the stream.
+fn import_kind(
+    policy: ImportPolicy,
+    tiled: bool,
+    ten_bit: bool,
+    linear_nv12_failed: bool,
+) -> ImportKind {
+    let yuv444 = policy.yuv444 && !ten_bit;
+    let nv12 = policy.nv12 && !policy.yuv444 && !ten_bit;
+    match (tiled, yuv444, nv12) {
+        (true, true, _) => ImportKind::Tiled444,
+        (true, false, true) => ImportKind::TiledNv12,
+        (true, false, false) => ImportKind::Tiled,
+        (false, _, true) if !linear_nv12_failed => ImportKind::LinearNv12,
+        (false, _, _) => ImportKind::Linear,
+    }
+}
+
 /// One dmabuf → CUDA import: tiled through EGL, LINEAR through the Vulkan bridge, NV12 or
 /// YUV444 where the policy asks. Failures are graded here so both threads act alike: a tiled
 /// failure drops the frame and poisons the stream after [`IMPORT_FAIL_POISON`] (or at once
@@ -792,32 +812,21 @@ pub(super) fn gpu_import(
         signals.broken.store(true, Ordering::Relaxed);
         return ImportOutcome::Dropped;
     }
-    let yuv444 = policy.yuv444 && modifier.is_some() && !ten_bit;
-    let mut nv12 = policy.nv12 && !policy.yuv444 && !ten_bit;
-    let imported = if let Some(m) = modifier {
-        if yuv444 {
-            importer.import_yuv444(&plane, w, h, fourcc, Some(m))
-        } else if nv12 {
-            importer.import_nv12(&plane, w, h, fourcc, Some(m))
-        } else {
-            importer.import(&plane, w, h, fourcc, Some(m))
-        }
-    } else if nv12 && !state.linear_nv12_failed {
-        match importer.import_linear_nv12(&plane, w, h) {
-            Ok(buf) => Ok(buf),
-            Err(e) => {
-                state.linear_nv12_failed = true;
-                nv12 = false;
-                tracing::warn!(error = %format!("{e:#}"),
-                    "LINEAR NV12 compute CSC failed — RGB for the rest of this \
-                     stream (NVENC does the CSC internally)");
-                importer.import_linear(&plane, w, h)
-            }
-        }
-    } else {
-        nv12 = false;
-        importer.import_linear(&plane, w, h)
-    };
+    let mut kind = import_kind(
+        policy,
+        modifier.is_some(),
+        ten_bit,
+        state.linear_nv12_failed,
+    );
+    let mut imported = importer.import(kind, &plane, w, h, fourcc, modifier);
+    if let (ImportKind::LinearNv12, Err(e)) = (kind, &imported) {
+        state.linear_nv12_failed = true;
+        tracing::warn!(error = %format!("{e:#}"),
+            "LINEAR NV12 compute CSC failed — RGB for the rest of this \
+             stream (NVENC does the CSC internally)");
+        kind = ImportKind::Linear;
+        imported = importer.import(kind, &plane, w, h, fourcc, modifier);
+    }
     match imported {
         Ok(devbuf) => {
             state.fail_streak = 0;
@@ -828,17 +837,14 @@ pub(super) fn gpu_import(
                     w,
                     h,
                     modifier = modifier.unwrap_or(0),
-                    nv12,
-                    yuv444,
+                    ?kind,
                     "zero-copy: dmabuf imported to CUDA (no CPU copy)"
                 );
             }
-            let out = if yuv444 {
-                PixelFormat::Yuv444
-            } else if nv12 {
-                PixelFormat::Nv12
-            } else {
-                fmt
+            let out = match kind.layout() {
+                pf_zerocopy::cuda::PlaneLayout::Yuv444 => PixelFormat::Yuv444,
+                pf_zerocopy::cuda::PlaneLayout::Nv12 => PixelFormat::Nv12,
+                pf_zerocopy::cuda::PlaneLayout::Packed32 => fmt,
             };
             ImportOutcome::Frame(devbuf, out)
         }
@@ -3171,6 +3177,31 @@ mod tests {
             .nvenc_raw,
             "SHM builds no importer, so no raw lane"
         );
+    }
+
+    /// 4:4:4 needs a tiled source and beats NV12; 10-bit keeps packed RGB; a failed LINEAR
+    /// NV12 CSC stays RGB.
+    #[test]
+    fn the_import_kind_follows_the_policy_and_the_source() {
+        use pf_zerocopy::ImportKind as K;
+        let rgb = ImportPolicy::default();
+        let nv12 = ImportPolicy {
+            nv12: true,
+            yuv444: false,
+        };
+        let yuv444 = ImportPolicy {
+            nv12: true,
+            yuv444: true,
+        };
+        assert_eq!(super::import_kind(rgb, true, false, false), K::Tiled);
+        assert_eq!(super::import_kind(rgb, false, false, false), K::Linear);
+        assert_eq!(super::import_kind(nv12, true, false, false), K::TiledNv12);
+        assert_eq!(super::import_kind(nv12, false, false, false), K::LinearNv12);
+        assert_eq!(super::import_kind(nv12, false, false, true), K::Linear);
+        assert_eq!(super::import_kind(nv12, true, true, false), K::Tiled);
+        assert_eq!(super::import_kind(yuv444, true, false, false), K::Tiled444);
+        assert_eq!(super::import_kind(yuv444, false, false, false), K::Linear);
+        assert_eq!(super::import_kind(yuv444, true, true, false), K::Tiled);
     }
 
     /// The consumer imports with the offer's policy: NV12 unless the session is 4:4:4. Holds

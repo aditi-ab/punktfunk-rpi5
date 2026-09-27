@@ -657,11 +657,11 @@ fn run(
                     offset: bo.offset,
                     stride: bo.stride,
                 };
-                let imported = if modifier == 0 {
-                    imp.import_linear(&plane, w, h)
-                } else {
-                    imp.import(&plane, w, h, fourcc, Some(modifier))
+                let (kind, modifier) = match modifier {
+                    0 => (pf_zerocopy::ImportKind::Linear, None),
+                    m => (pf_zerocopy::ImportKind::Tiled, Some(m)),
                 };
+                let imported = imp.import(kind, &plane, w, h, fourcc, modifier);
                 free.put(idx);
                 match imported {
                     Ok(buf) => FramePayload::Cuda(buf),

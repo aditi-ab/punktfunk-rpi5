@@ -14,6 +14,7 @@
 
 use super::cuda::{self, DeviceBuffer};
 use super::gbm::GbmDevice;
+use super::proto::ImportKind;
 use anyhow::{ensure, Context as _, Result};
 use khronos_egl as egl;
 use std::os::raw::{c_int, c_void};
@@ -524,71 +525,41 @@ impl EglImporter {
         self.vk_bridge()?.convert_timeline_fd()
     }
 
-    /// Import a LINEAR dmabuf via the Vulkan bridge. NVIDIA EGL cannot sample LINEAR; CUDA
-    /// rejects raw dmabuf fds. See [`super::vulkan`].
-    pub fn import_linear(
+    /// Import a LINEAR dmabuf via the Vulkan bridge as packed RGB, or as two-plane NV12 through
+    /// the bridge's compute CSC. NVIDIA EGL cannot sample LINEAR; CUDA rejects raw dmabuf fds.
+    /// See [`super::vulkan`].
+    fn import_linear(
         &mut self,
         plane: &DmabufPlane,
         width: u32,
         height: u32,
+        layout: cuda::PlaneLayout,
     ) -> Result<DeviceBuffer> {
-        cuda::make_current()?;
-        if self.linear_pool.as_ref().map(|p| (p.width(), p.height())) != Some((width, height)) {
-            self.linear_pool = Some(cuda::BufferPool::new(
-                cuda::PlaneLayout::Packed32,
-                width,
-                height,
-            )?);
-        }
-        if self.vk.is_none() {
-            self.vk = Some(super::vulkan::VkBridge::new()?);
-        }
-        self.vk.as_mut().unwrap().import_linear(
-            plane.fd,
-            plane.offset,
-            plane.stride,
-            height,
-            self.linear_pool.as_ref().unwrap(),
-        )
-    }
-
-    /// LINEAR analogue of [`import_nv12`](Self::import_nv12): the bridge's compute CSC writes a
-    /// two-plane NV12 buffer so NVENC encodes native YUV.
-    pub fn import_linear_nv12(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-    ) -> Result<DeviceBuffer> {
+        let nv12 = layout == cuda::PlaneLayout::Nv12;
         // NVENC takes 4:2:0 at even dimensions only.
         anyhow::ensure!(
-            width % 2 == 0 && height % 2 == 0,
+            !nv12 || (width % 2 == 0 && height % 2 == 0),
             "LINEAR NV12 needs even dimensions (got {width}x{height})"
         );
         cuda::make_current()?;
-        if self
-            .linear_nv12_pool
-            .as_ref()
-            .map(|p| (p.width(), p.height()))
-            != Some((width, height))
-        {
-            self.linear_nv12_pool = Some(cuda::BufferPool::new(
-                cuda::PlaneLayout::Nv12,
-                width,
-                height,
-            )?);
+        let pool = if nv12 {
+            &mut self.linear_nv12_pool
+        } else {
+            &mut self.linear_pool
+        };
+        if pool.as_ref().map(|p| (p.width(), p.height())) != Some((width, height)) {
+            *pool = Some(cuda::BufferPool::new(layout, width, height)?);
         }
+        let pool = pool.as_ref().expect("set above");
         if self.vk.is_none() {
             self.vk = Some(super::vulkan::VkBridge::new()?);
         }
-        self.vk.as_mut().unwrap().import_linear_nv12(
-            plane.fd,
-            plane.offset,
-            plane.stride,
-            width,
-            height,
-            self.linear_nv12_pool.as_ref().unwrap(),
-        )
+        let vk = self.vk.as_mut().expect("set above");
+        if nv12 {
+            vk.import_linear_nv12(plane.fd, plane.offset, plane.stride, width, height, pool)
+        } else {
+            vk.import_linear(plane.fd, plane.offset, plane.stride, height, pool)
+        }
     }
 
     /// Drop the Vulkan bridge's cached per-fd import ([`super::vulkan::VkBridge::forget_fd`]).
@@ -662,67 +633,27 @@ impl EglImporter {
         }
     }
 
-    /// Import one dmabuf into an owned CUDA buffer. `modifier` is the negotiated 64-bit DRM
-    /// modifier, or `None` for the buffer's implicit modifier (`EGL_EXT_image_dma_buf_import`).
+    /// Import one dmabuf into an owned CUDA buffer as `kind`. Tiled kinds de-tile through
+    /// EGL/GL with `modifier`, the negotiated 64-bit DRM modifier (`None` for the buffer's
+    /// implicit one). LINEAR kinds go through the Vulkan bridge and ignore `fourcc` and
+    /// `modifier`.
     pub fn import(
         &mut self,
+        kind: ImportKind,
         plane: &DmabufPlane,
         width: u32,
         height: u32,
         fourcc: u32,
         modifier: Option<u64>,
     ) -> Result<DeviceBuffer> {
-        self.import_inner(
-            plane,
-            width,
-            height,
-            fourcc,
-            modifier,
-            cuda::PlaneLayout::Packed32,
-        )
+        if kind.is_tiled() {
+            self.import_tiled(plane, width, height, fourcc, modifier, kind.layout())
+        } else {
+            self.import_linear(plane, width, height, kind.layout())
+        }
     }
 
-    /// Like [`import`](Self::import), then GPU-convert to NV12 (BT.709 limited) so NVENC encodes
-    /// native YUV. Tiled EGL/GL only — LINEAR/Vulkan stays RGB. See [`DeviceBuffer::is_nv12`].
-    pub fn import_nv12(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-        fourcc: u32,
-        modifier: Option<u64>,
-    ) -> Result<DeviceBuffer> {
-        self.import_inner(
-            plane,
-            width,
-            height,
-            fourcc,
-            modifier,
-            cuda::PlaneLayout::Nv12,
-        )
-    }
-
-    /// Like [`import_nv12`](Self::import_nv12), but planar YUV444 into one stacked
-    /// [`DeviceBuffer`] (`DeviceBuffer::yuv444`). Tiled EGL/GL only.
-    pub fn import_yuv444(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-        fourcc: u32,
-        modifier: Option<u64>,
-    ) -> Result<DeviceBuffer> {
-        self.import_inner(
-            plane,
-            width,
-            height,
-            fourcc,
-            modifier,
-            cuda::PlaneLayout::Yuv444,
-        )
-    }
-
-    fn import_inner(
+    fn import_tiled(
         &mut self,
         plane: &DmabufPlane,
         width: u32,
@@ -805,7 +736,7 @@ impl EglImporter {
         let convert = self.convert_for(layout, width, height)?;
         // SAFETY: `GlConvert::run` needs GL current and a valid `EGLImage`. GL is current on this
         // capture thread (never released); `image` is the live `eglCreateImage` handle
-        // `import_inner` destroys only after this call returns.
+        // `import_tiled` destroys only after this call returns.
         unsafe { convert.run(egl_image_target, image)? };
         convert.copy_out()
     }
