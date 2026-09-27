@@ -252,20 +252,8 @@ fn run(
     let want = layout_for(&params).channels as u32;
     // Always 48 kHz: GameStream Opus has no rate field, and libopus tops out here.
     // Hi-res `0xD3` is native-only (`design/hi-res-audio.md`).
-    let mut cap = match audio_cap.lock().unwrap().take() {
-        Some(mut c) if c.channels() == want && c.reusable() => {
-            c.drain(); // previous session's buffer would play first
-            c
-        }
-        Some(c) => {
-            tracing::info!(
-                have = c.channels(),
-                want,
-                "parked audio capturer no longer fits (channels or audio settings) — reopening"
-            );
-            drop(c);
-            audio::open_audio_capture(want, SAMPLE_RATE).context("open audio capture")?
-        }
+    let mut cap = match audio::take_parked_capture(audio_cap, want, SAMPLE_RATE) {
+        Some(c) => c,
         None => audio::open_audio_capture(want, SAMPLE_RATE).context("open audio capture")?,
     };
     let result = audio_body(&mut *cap, &sock, aes_key, rikeyid, params, running, on_lost);
@@ -275,51 +263,6 @@ fn run(
         audio::park_audio_capture(audio_cap, cap); // drop on Windows (restores default); keep on Linux
     }
     result
-}
-
-enum SessionEncoder {
-    Stereo(opus::Encoder),
-    Surround(opus::MSEncoder),
-}
-
-impl SessionEncoder {
-    fn new(layout: &'static OpusLayout) -> Result<SessionEncoder> {
-        // LowDelay + hard CBR: FEC shards must be equal length, and the client
-        // asserts a constant per-stream TOC.
-        if layout.channels == 2 {
-            let mut enc = opus::Encoder::new(
-                SAMPLE_RATE,
-                opus::Channels::Stereo,
-                opus::Application::LowDelay,
-            )
-            .context("create Opus encoder")?;
-            enc.set_bitrate(opus::Bitrate::Bits(layout.bitrate)).ok();
-            enc.set_vbr(false).ok();
-            Ok(SessionEncoder::Stereo(enc))
-        } else {
-            let mut enc = opus::MSEncoder::new(
-                SAMPLE_RATE,
-                layout.streams,
-                layout.coupled,
-                layout.mapping,
-                opus::Application::LowDelay,
-            )
-            .map_err(|e| anyhow::anyhow!("create Opus multistream encoder: {e}"))?;
-            enc.set_bitrate(opus::Bitrate::Bits(layout.bitrate)).ok();
-            enc.set_vbr(false).ok();
-            Ok(SessionEncoder::Surround(enc))
-        }
-    }
-
-    /// Both encoders infer per-channel samples from `frame.len()` and their channel count.
-    fn encode_float(&mut self, frame: &[f32], out: &mut [u8]) -> Result<usize> {
-        match self {
-            SessionEncoder::Stereo(enc) => enc.encode_float(frame, out).context("opus encode"),
-            SessionEncoder::Surround(enc) => enc
-                .encode_float(frame, out)
-                .context("opus multistream encode"),
-        }
-    }
 }
 
 fn audio_payload(opus: &[u8], aes_key: Option<&[u8; 16]>, iv_seq: u32) -> Vec<u8> {
@@ -349,7 +292,10 @@ fn audio_body(
     on_lost: &super::OnSessionLost,
 ) -> Result<()> {
     let layout = layout_for(&params);
-    let mut enc = SessionEncoder::new(layout)?;
+    // Hard CBR: FEC shards must be equal length, and the client asserts a constant
+    // per-stream TOC.
+    let mut enc = audio::OpusEnc::new(layout, layout.bitrate, audio::RateControl::HardCbr)
+        .context("create Opus encoder")?;
     // Snap to a legal Opus frame (48 kHz × {5,10} ms = 240/480). Parse already
     // clamps; a bad value here would reach the encoder.
     let frame_ms = if params.packet_duration_ms >= 10 {
@@ -399,7 +345,7 @@ fn audio_body(
             if gain != 1.0 {
                 punktfunk_core::audio::apply_gain(&mut frame, gain);
             }
-            let n = enc.encode_float(&frame, &mut out)?;
+            let n = enc.encode_float(&frame, &mut out).context("opus encode")?;
             let iv_seq = (rikeyid as u32).wrapping_add(seq as u32);
             let payload = audio_payload(&out[..n], aes_key, iv_seq);
             let pkt = build_rtp(seq, timestamp, &payload);
@@ -679,15 +625,8 @@ mod tests {
     fn surround_capture_live() {
         let mut cap = crate::audio::open_audio_capture(6, SAMPLE_RATE).expect("open 6ch capture");
         let layout = &LAYOUT_51;
-        let mut enc = opus::MSEncoder::new(
-            SAMPLE_RATE,
-            layout.streams,
-            layout.coupled,
-            layout.mapping,
-            opus::Application::LowDelay,
-        )
-        .unwrap();
-        enc.set_vbr(false).ok();
+        let mut enc =
+            audio::OpusEnc::new(layout, layout.bitrate, audio::RateControl::HardCbr).unwrap();
         let mut out = vec![0u8; 1400];
         let mut acc: Vec<f32> = Vec::new();
         let frame_len = 240 * 6;

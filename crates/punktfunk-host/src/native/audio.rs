@@ -5,10 +5,10 @@
 //! `design/hi-res-audio.md`.
 //!
 //! The plane is chosen once at handshake and never switches: the client's output device is
-//! open at a fixed rate. [`NativeAudioEnc`] and [`audio_thread`] compile on linux/windows
+//! open at a fixed rate. [`native_encoder`] and [`audio_thread`] compile on linux/windows
 //! (libopus + a real capturer); other targets get the stub so a dev build streams video-only.
 //! Unlike GameStream this path has no FEC, so it uses constrained VBR rather than hard CBR —
-//! see [`NativeAudioEnc::new`].
+//! see [`native_encoder`].
 
 use super::*;
 
@@ -76,59 +76,23 @@ impl PtsClock {
     }
 }
 
-/// Opus encoder: stereo (`opus::Encoder`) or 5.1/7.1 multistream (`opus::MSEncoder`), both
-/// behind one `encode_float`. Surround uses the safe wrapper, not `audiopus_sys`.
-enum NativeAudioEnc {
-    Stereo(opus::Encoder),
-    Surround(opus::MSEncoder),
-}
-
-impl NativeAudioEnc {
-    /// Encoder for `channels` (2/6/8) at `tier`, `LowDelay`, constrained VBR.
-    ///
-    /// GameStream uses hard CBR because its audio FEC needs fixed-size packets. This plane
-    /// has no FEC (`punktfunk_core::audio::AudioGapTracker` exists because a lost packet has
-    /// nothing to rebuild it from), so CBR would be a quality tax. Constrained VBR keeps the
-    /// same average bitrate and a bounded packet size. Do not change the GameStream encoder:
-    /// its FEC still needs fixed-size packets.
-    fn new(
-        channels: u8,
-        tier: punktfunk_core::audio::AudioTier,
-        layout: punktfunk_core::audio::AudioLayout,
-    ) -> Result<NativeAudioEnc, opus::Error> {
-        let l = punktfunk_core::audio::layout_for(channels, layout);
-        let bitrate = l.bitrate_for(tier);
-        if channels == 2 {
-            let mut e = opus::Encoder::new(
-                crate::audio::SAMPLE_RATE,
-                opus::Channels::Stereo,
-                opus::Application::LowDelay,
-            )?;
-            e.set_bitrate(opus::Bitrate::Bits(bitrate)).ok();
-            e.set_vbr(true).ok();
-            e.set_vbr_constraint(true).ok();
-            Ok(NativeAudioEnc::Stereo(e))
-        } else {
-            let mut e = opus::MSEncoder::new(
-                crate::audio::SAMPLE_RATE,
-                l.streams,
-                l.coupled,
-                l.mapping,
-                opus::Application::LowDelay,
-            )?;
-            e.set_bitrate(opus::Bitrate::Bits(bitrate)).ok();
-            e.set_vbr(true).ok();
-            e.set_vbr_constraint(true).ok();
-            Ok(NativeAudioEnc::Surround(e))
-        }
-    }
-
-    fn encode_float(&mut self, frame: &[f32], out: &mut [u8]) -> Result<usize, opus::Error> {
-        match self {
-            NativeAudioEnc::Stereo(e) => e.encode_float(frame, out),
-            NativeAudioEnc::Surround(e) => e.encode_float(frame, out),
-        }
-    }
+/// Opus encoder for `channels` (2/6/8) at `tier`, constrained VBR.
+///
+/// GameStream uses hard CBR because its audio FEC needs fixed-size packets. This plane has no
+/// FEC (`punktfunk_core::audio::AudioGapTracker` exists because a lost packet has nothing to
+/// rebuild it from), so CBR would be a quality tax. Constrained VBR keeps the same average
+/// bitrate and a bounded packet size.
+fn native_encoder(
+    channels: u8,
+    tier: punktfunk_core::audio::AudioTier,
+    layout: punktfunk_core::audio::AudioLayout,
+) -> Result<crate::audio::OpusEnc, opus::Error> {
+    let l = punktfunk_core::audio::layout_for(channels, layout);
+    crate::audio::OpusEnc::new(
+        l,
+        l.bitrate_for(tier),
+        crate::audio::RateControl::ConstrainedVbr,
+    )
 }
 
 /// Desktop capture → the session's resolved plane (Opus on `AUDIO_MAGIC`/`AUDIO_RED_MAGIC`,
@@ -236,39 +200,24 @@ pub(super) fn audio_thread(
         }
     };
     let mut target = resolve();
-    // Reuse the parked capturer only when channels AND rate match: a mismatch garbles the
-    // encoder and drifts the sample clock against the wire. The audio settings must still
-    // match too: a keep-host session must not inherit a sink claim. Isolated sessions never adopt
-    // the parked shared capturer (the match cannot see the wrong sink). A failed first open
-    // enters the same reopen-with-backoff loop as a mid-session death.
-    let cached = if target.is_none() {
-        audio_cap.lock().unwrap().take()
+    // The audio settings must match too: a keep-host session must not inherit a sink claim.
+    // Isolated sessions never adopt the parked shared capturer (the match cannot see the wrong
+    // sink). A failed first open enters the same reopen-with-backoff loop as a mid-session death.
+    let parked = if target.is_none() {
+        crate::audio::take_parked_capture(&audio_cap, want as u32, rate_hz)
     } else {
         None
     };
-    let capturer = match cached {
-        Some(mut c)
-            if c.channels() == want as u32 && c.sample_rate() == rate_hz && c.reusable() =>
+    let capturer = parked.or_else(|| {
+        match crate::audio::open_audio_capture_named(want as u32, rate_hz, target.as_deref(), tap)
         {
-            c.drain(); // discard audio captured between sessions (also re-claims routing)
-            Some(c)
-        }
-        prev => {
-            drop(prev);
-            match crate::audio::open_audio_capture_named(
-                want as u32,
-                rate_hz,
-                target.as_deref(),
-                tap,
-            ) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "punktfunk/1 audio failed to open — retrying in the background until it comes up");
-                    None
-                }
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "punktfunk/1 audio failed to open — retrying in the background until it comes up");
+                None
             }
         }
-    };
+    });
     let publish = |c: &dyn crate::audio::AudioCapturer| {
         *published.lock().unwrap() = c.sink_name().map(str::to_owned);
     };
@@ -280,7 +229,7 @@ pub(super) fn audio_thread(
     let mut enc = if pcm_plane {
         None
     } else {
-        match NativeAudioEnc::new(want, tier, plane.layout) {
+        match native_encoder(want, tier, plane.layout) {
             Ok(e) => Some(e),
             Err(e) => {
                 tracing::warn!(error = %e, "opus encoder init failed — session continues without audio");
