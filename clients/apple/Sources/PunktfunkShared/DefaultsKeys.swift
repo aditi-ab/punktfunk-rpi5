@@ -271,6 +271,10 @@ public enum DefaultsKey {
     public static let libraryShelf = "punktfunk.libraryShelf"
     /// macOS: take the window fullscreen while streaming and restore it on the host list. On by default.
     public static let fullscreenWhileStreaming = "punktfunk.fullscreenWhileStreaming"
+    /// macOS: open the window fullscreen and keep it there on the host list — the cross-client
+    /// `fullscreen_always`. Outranks `fullscreenWhileStreaming`. A device preference, never part
+    /// of a stream preset.
+    public static let fullscreenAlways = "punktfunk.fullscreenAlways"
     /// LEGACY (pre-tiered overlay): the old boolean stats-overlay toggle. Kept ONLY as the
     /// migration fallback `StatsVerbosity.current` reads when `statsVerbosity` was never
     /// written (absent-or-true → .normal, explicit false → .off). Never written anymore.

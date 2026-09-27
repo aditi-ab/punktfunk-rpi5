@@ -135,6 +135,7 @@ public enum ConsoleSettings {
         .string("stats_verbosity", DefaultsKey.statsVerbosity, "normal"),
         .bool("advanced_stats", DefaultsKey.advancedStats, false),
         .bool("fullscreen_on_stream", DefaultsKey.fullscreenWhileStreaming, true),
+        .bool("fullscreen_always", DefaultsKey.fullscreenAlways, false),
         .string("present_priority", DefaultsKey.presentPriority, "latency"),
         .int("smooth_buffer", DefaultsKey.smoothBuffer, 0),
         .bool("vsync", DefaultsKey.vsync, false),

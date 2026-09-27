@@ -85,6 +85,14 @@ enum SettingsOptions {
     static let hudPlacements: [(label: String, tag: String)] =
         HUDPlacement.allCases.map { ($0.label, $0.rawValue) }
 
+    /// The macOS Fullscreen picker. "always" is `fullscreenAlways`; the other two are the
+    /// presetable `fullscreenWhileStreaming`.
+    static let fullscreenModes: [(label: String, tag: String)] = [
+        ("Off", "off"),
+        ("While streaming", "stream"),
+        ("Always", "always"),
+    ]
+
     /// When the gamepad UI takes over (`DefaultsKey.gamepadUIMode`) — only meaningful while
     /// `gamepadUIEnabled` is on, so every surface that offers it hides the row when the switch
     /// is off rather than showing a picker that decides nothing.
