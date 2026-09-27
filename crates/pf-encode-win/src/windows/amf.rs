@@ -10,10 +10,6 @@
 //! `CreateSurfaceFromDX11Native`. No readback: Bgra/Rgb10a2 or CPU frames fail open/submit.
 //! VCN does not encode 4:4:4. Evidence: `design/native-amf-encoder.md`.
 
-// `unsafe_op_in_unsafe_fn` is off here: the body is raw AMF vtable calls. Clearing it means
-// deleting markers that carry no caller contract, not wrapping each call in `unsafe {}`.
-#![allow(unsafe_op_in_unsafe_fn)]
-
 use super::policy::{intra_refresh_period, intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::retrieve::Ready;
@@ -24,7 +20,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use windows::core::{w, Interface, PCWSTR};
+use windows::core::{h, w, Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D,
@@ -70,13 +66,16 @@ fn amf_version_str(v: u64) -> String {
 /// `module` must be a live handle the caller owns (the never-unloaded `amfrt64.dll`).
 unsafe fn loaded_dll_identity(module: HMODULE) -> (Option<String>, Option<String>) {
     let mut buf = [0u16; 512];
-    let n = GetModuleFileNameW(Some(module), &mut buf) as usize;
+    // SAFETY: `module` is live (caller contract); the call writes at most `buf.len()` units.
+    let n = unsafe { GetModuleFileNameW(Some(module), &mut buf) } as usize;
     // n == 0 failed; n >= len truncated (no guaranteed NUL). Otherwise `buf[n]` is the terminator.
     if n == 0 || n >= buf.len() {
         return (None, None);
     }
     let path = String::from_utf16_lossy(&buf[..n]);
-    (Some(path), dll_file_version(PCWSTR(buf.as_ptr())))
+    // SAFETY: `buf[n]` is the terminator (checked above) and `buf` names the loaded DLL.
+    let version = unsafe { dll_file_version(PCWSTR(buf.as_ptr())) };
+    (Some(path), version)
 }
 
 /// `VS_FIXEDFILEINFO` file version as `a.b.c.d`. `None` if the resource is missing.
@@ -84,27 +83,33 @@ unsafe fn loaded_dll_identity(module: HMODULE) -> (Option<String>, Option<String
 /// # Safety
 /// `path` is a valid NUL-terminated wide string to a readable file.
 unsafe fn dll_file_version(path: PCWSTR) -> Option<String> {
-    let size = GetFileVersionInfoSizeW(path, None);
+    // SAFETY: `path` is NUL-terminated (caller contract).
+    let size = unsafe { GetFileVersionInfoSizeW(path, None) };
     if size == 0 {
         return None;
     }
     let mut block = vec![0u8; size as usize];
-    GetFileVersionInfoW(path, None, size, block.as_mut_ptr() as *mut c_void).ok()?;
+    // SAFETY: as above; `block` is writable for the `size` bytes passed.
+    unsafe { GetFileVersionInfoW(path, None, size, block.as_mut_ptr() as *mut c_void) }.ok()?;
     let mut value: *mut c_void = ptr::null_mut();
     let mut len: u32 = 0;
-    let ok = VerQueryValueW(
-        block.as_ptr() as *const c_void,
-        w!("\\"),
-        &mut value,
-        &mut len,
-    );
+    // SAFETY: `block` holds the version resource just read; the out-params are locals.
+    let ok = unsafe {
+        VerQueryValueW(
+            block.as_ptr() as *const c_void,
+            w!("\\"),
+            &mut value,
+            &mut len,
+        )
+    };
     if !ok.as_bool() || value.is_null() || (len as usize) < std::mem::size_of::<VS_FIXEDFILEINFO>()
     {
         return None;
     }
-    // SAFETY: on success `VerQueryValueW` points `value` at a `VS_FIXEDFILEINFO` living inside
-    // `block` and valid for `len` bytes (checked >= its size); `block` outlives this read.
-    let ffi = &*(value as *const VS_FIXEDFILEINFO);
+    // SAFETY: on success `VerQueryValueW` points `value` at a `VS_FIXEDFILEINFO` inside `block`,
+    // valid for `len` bytes (checked >= its size). A `u8` buffer promises no alignment, so the
+    // read is unaligned.
+    let ffi = unsafe { (value as *const VS_FIXEDFILEINFO).read_unaligned() };
     let (ms, ls) = (ffi.dwFileVersionMS, ffi.dwFileVersionLS);
     Some(format!(
         "{}.{}.{}.{}",
@@ -253,48 +258,48 @@ const PRIMARIES_BT2020: i64 = 9;
 
 struct CodecProps {
     /// `factory->CreateComponent` id.
-    component: PCWSTR,
-    usage: PCWSTR,
-    rc_method: PCWSTR,
+    component: &'static HSTRING,
+    usage: &'static HSTRING,
+    rc_method: &'static HSTRING,
     /// `RATE_CONTROL_METHOD_CBR` — 1 on AVC, **3** on HEVC and AV1.
     rc_cbr: i64,
-    target_bitrate: PCWSTR,
-    peak_bitrate: PCWSTR,
-    vbv_size: PCWSTR,
-    enforce_hrd: PCWSTR,
-    filler_data: PCWSTR,
+    target_bitrate: &'static HSTRING,
+    peak_bitrate: &'static HSTRING,
+    vbv_size: &'static HSTRING,
+    enforce_hrd: &'static HSTRING,
+    filler_data: &'static HSTRING,
     /// Rate-control frame skip; the latency usages default it on.
-    skip_frame: PCWSTR,
-    quality_preset: PCWSTR,
+    skip_frame: &'static HSTRING,
+    quality_preset: &'static HSTRING,
     /// `QUALITY_PRESET_SPEED` — 1 on AVC, **10** on HEVC, **100** on AV1.
     quality_speed: i64,
     /// AVC/HEVC: `L"LowLatencyInternal"` (bool). AV1: `Av1EncodingLatencyMode` (enum).
-    lowlatency: PCWSTR,
+    lowlatency: &'static HSTRING,
     /// Bool `true` (AVC/HEVC) or the AV1 latency-mode enum value.
     lowlatency_value: AmfVariantKind,
-    framerate: PCWSTR,
+    framerate: &'static HSTRING,
     /// AVC `IDRPeriod`, HEVC `HevcGOPSize`, AV1 `Av1GOPSize`. Value is `i32::MAX` (infinite GOP)
     /// except AV1, whose header defines **0** as "key frame at first frame only".
-    idr_period: PCWSTR,
+    idr_period: &'static HSTRING,
     idr_period_value: i64,
     /// Per-surface forced-keyframe: 2 = PICTURE_TYPE_IDR (AVC/HEVC), **1** = KEY (AV1).
-    force_picture_type: PCWSTR,
+    force_picture_type: &'static HSTRING,
     force_idr_value: i64,
     /// Output `*_OUTPUT_DATA_TYPE_*` / `Av1OutputFrameType`. Type ≤ `output_key_max` is a
     /// keyframe. AV1 INTRA_ONLY=1 does not reset references — not a join point.
-    output_data_type: PCWSTR,
+    output_data_type: &'static HSTRING,
     output_key_max: i64,
     /// `QueryTimeout` (ms): how long `QueryOutput` may block. Codec-prefixed like the rest, and
     /// optional — an older runtime rejects it and the retrieve thread samples instead.
-    query_timeout: PCWSTR,
-    out_color_profile: PCWSTR,
-    out_transfer: PCWSTR,
-    out_primaries: PCWSTR,
+    query_timeout: &'static HSTRING,
+    out_color_profile: &'static HSTRING,
+    out_transfer: &'static HSTRING,
+    out_primaries: &'static HSTRING,
     /// `*InHDRMetadata` (`AMFBuffer` of [`sys::AmfHdrMetadata`]). `None` on AVC — no HDR on the wire.
-    hdr_metadata: Option<PCWSTR>,
+    hdr_metadata: Option<&'static HSTRING>,
     /// Intra-refresh: (units-per-slot, block edge px). AVC 16-px MBs, HEVC 64-px CTBs. `None` on
     /// AV1 (mode enum only, no slot-size control).
-    intra_refresh: Option<(PCWSTR, u32)>,
+    intra_refresh: Option<(&'static HSTRING, u32)>,
     /// LTR-RFI property names, on every codec.
     ltr: Option<LtrProps>,
 }
@@ -303,13 +308,13 @@ struct CodecProps {
 /// open, two per-frame on the input surface.
 struct LtrProps {
     /// `MaxOfLTRFrames` — user LTR slots (we request [`NUM_LTR_SLOTS`]).
-    max_ltr_frames: PCWSTR,
+    max_ltr_frames: &'static HSTRING,
     /// `MaxNumRefFrames` — reference-picture budget; must exceed 1 for LTR to engage.
-    max_num_ref_frames: PCWSTR,
+    max_num_ref_frames: &'static HSTRING,
     /// `MarkCurrentWithLTRIndex` — tag this frame as long-term reference slot N.
-    mark_ltr_index: PCWSTR,
+    mark_ltr_index: &'static HSTRING,
     /// `ForceLTRReferenceBitfield` — reference only LTR slots in the bitfield (`1<<N`).
-    force_ltr_bitfield: PCWSTR,
+    force_ltr_bitfield: &'static HSTRING,
 }
 
 enum AmfVariantKind {
@@ -329,108 +334,108 @@ impl AmfVariantKind {
 fn codec_props(codec: Codec) -> CodecProps {
     match codec {
         Codec::H264 => CodecProps {
-            component: w!("AMFVideoEncoderVCE_AVC"),
-            usage: w!("Usage"),
-            rc_method: w!("RateControlMethod"),
+            component: h!("AMFVideoEncoderVCE_AVC"),
+            usage: h!("Usage"),
+            rc_method: h!("RateControlMethod"),
             rc_cbr: 1,
-            target_bitrate: w!("TargetBitrate"),
-            peak_bitrate: w!("PeakBitrate"),
-            vbv_size: w!("VBVBufferSize"),
-            enforce_hrd: w!("EnforceHRD"),
-            filler_data: w!("FillerDataEnable"),
-            skip_frame: w!("RateControlSkipFrameEnable"),
-            quality_preset: w!("QualityPreset"),
+            target_bitrate: h!("TargetBitrate"),
+            peak_bitrate: h!("PeakBitrate"),
+            vbv_size: h!("VBVBufferSize"),
+            enforce_hrd: h!("EnforceHRD"),
+            filler_data: h!("FillerDataEnable"),
+            skip_frame: h!("RateControlSkipFrameEnable"),
+            quality_preset: h!("QualityPreset"),
             quality_speed: 1,
-            lowlatency: w!("LowLatencyInternal"),
+            lowlatency: h!("LowLatencyInternal"),
             lowlatency_value: AmfVariantKind::Bool(true),
-            framerate: w!("FrameRate"),
-            idr_period: w!("IDRPeriod"),
+            framerate: h!("FrameRate"),
+            idr_period: h!("IDRPeriod"),
             idr_period_value: i32::MAX as i64,
-            force_picture_type: w!("ForcePictureType"),
+            force_picture_type: h!("ForcePictureType"),
             force_idr_value: 2,
-            output_data_type: w!("OutputDataType"),
-            query_timeout: w!("QueryTimeout"),
+            output_data_type: h!("OutputDataType"),
+            query_timeout: h!("QueryTimeout"),
             output_key_max: 1,
-            out_color_profile: w!("OutColorProfile"),
-            out_transfer: w!("OutColorTransferChar"),
-            out_primaries: w!("OutColorPrimaries"),
+            out_color_profile: h!("OutColorProfile"),
+            out_transfer: h!("OutColorTransferChar"),
+            out_primaries: h!("OutColorPrimaries"),
             hdr_metadata: None,
-            intra_refresh: Some((w!("IntraRefreshMBsNumberPerSlot"), 16)),
+            intra_refresh: Some((h!("IntraRefreshMBsNumberPerSlot"), 16)),
             ltr: Some(LtrProps {
-                max_ltr_frames: w!("MaxOfLTRFrames"),
-                max_num_ref_frames: w!("MaxNumRefFrames"),
-                mark_ltr_index: w!("MarkCurrentWithLTRIndex"),
-                force_ltr_bitfield: w!("ForceLTRReferenceBitfield"),
+                max_ltr_frames: h!("MaxOfLTRFrames"),
+                max_num_ref_frames: h!("MaxNumRefFrames"),
+                mark_ltr_index: h!("MarkCurrentWithLTRIndex"),
+                force_ltr_bitfield: h!("ForceLTRReferenceBitfield"),
             }),
         },
         Codec::H265 => CodecProps {
-            component: w!("AMFVideoEncoderHW_HEVC"),
-            usage: w!("HevcUsage"),
-            rc_method: w!("HevcRateControlMethod"),
+            component: h!("AMFVideoEncoderHW_HEVC"),
+            usage: h!("HevcUsage"),
+            rc_method: h!("HevcRateControlMethod"),
             rc_cbr: 3,
-            target_bitrate: w!("HevcTargetBitrate"),
-            peak_bitrate: w!("HevcPeakBitrate"),
-            vbv_size: w!("HevcVBVBufferSize"),
-            enforce_hrd: w!("HevcEnforceHRD"),
-            filler_data: w!("HevcFillerDataEnable"),
-            skip_frame: w!("HevcRateControlSkipFrameEnable"),
-            quality_preset: w!("HevcQualityPreset"),
+            target_bitrate: h!("HevcTargetBitrate"),
+            peak_bitrate: h!("HevcPeakBitrate"),
+            vbv_size: h!("HevcVBVBufferSize"),
+            enforce_hrd: h!("HevcEnforceHRD"),
+            filler_data: h!("HevcFillerDataEnable"),
+            skip_frame: h!("HevcRateControlSkipFrameEnable"),
+            quality_preset: h!("HevcQualityPreset"),
             quality_speed: 10,
-            lowlatency: w!("LowLatencyInternal"),
+            lowlatency: h!("LowLatencyInternal"),
             lowlatency_value: AmfVariantKind::Bool(true),
-            framerate: w!("HevcFrameRate"),
-            idr_period: w!("HevcGOPSize"),
+            framerate: h!("HevcFrameRate"),
+            idr_period: h!("HevcGOPSize"),
             idr_period_value: i32::MAX as i64,
-            force_picture_type: w!("HevcForcePictureType"),
+            force_picture_type: h!("HevcForcePictureType"),
             force_idr_value: 2,
-            output_data_type: w!("HevcOutputDataType"),
-            query_timeout: w!("HevcQueryTimeout"),
+            output_data_type: h!("HevcOutputDataType"),
+            query_timeout: h!("HevcQueryTimeout"),
             output_key_max: 1,
-            out_color_profile: w!("HevcOutColorProfile"),
-            out_transfer: w!("HevcOutColorTransferChar"),
-            out_primaries: w!("HevcOutColorPrimaries"),
-            hdr_metadata: Some(w!("HevcInHDRMetadata")),
-            intra_refresh: Some((w!("HevcIntraRefreshCTBsNumberPerSlot"), 64)),
+            out_color_profile: h!("HevcOutColorProfile"),
+            out_transfer: h!("HevcOutColorTransferChar"),
+            out_primaries: h!("HevcOutColorPrimaries"),
+            hdr_metadata: Some(h!("HevcInHDRMetadata")),
+            intra_refresh: Some((h!("HevcIntraRefreshCTBsNumberPerSlot"), 64)),
             ltr: Some(LtrProps {
-                max_ltr_frames: w!("HevcMaxOfLTRFrames"),
-                max_num_ref_frames: w!("HevcMaxNumRefFrames"),
-                mark_ltr_index: w!("HevcMarkCurrentWithLTRIndex"),
-                force_ltr_bitfield: w!("HevcForceLTRReferenceBitfield"),
+                max_ltr_frames: h!("HevcMaxOfLTRFrames"),
+                max_num_ref_frames: h!("HevcMaxNumRefFrames"),
+                mark_ltr_index: h!("HevcMarkCurrentWithLTRIndex"),
+                force_ltr_bitfield: h!("HevcForceLTRReferenceBitfield"),
             }),
         },
         Codec::Av1 => CodecProps {
-            component: w!("AMFVideoEncoderHW_AV1"),
-            usage: w!("Av1Usage"),
-            rc_method: w!("Av1RateControlMethod"),
+            component: h!("AMFVideoEncoderHW_AV1"),
+            usage: h!("Av1Usage"),
+            rc_method: h!("Av1RateControlMethod"),
             rc_cbr: 3,
-            target_bitrate: w!("Av1TargetBitrate"),
-            peak_bitrate: w!("Av1PeakBitrate"),
-            vbv_size: w!("Av1VBVBufferSize"),
-            enforce_hrd: w!("Av1EnforceHRD"),
-            filler_data: w!("Av1FillerData"),
-            skip_frame: w!("Av1RateControlSkipFrameEnable"),
-            quality_preset: w!("Av1QualityPreset"),
+            target_bitrate: h!("Av1TargetBitrate"),
+            peak_bitrate: h!("Av1PeakBitrate"),
+            vbv_size: h!("Av1VBVBufferSize"),
+            enforce_hrd: h!("Av1EnforceHRD"),
+            filler_data: h!("Av1FillerData"),
+            skip_frame: h!("Av1RateControlSkipFrameEnable"),
+            quality_preset: h!("Av1QualityPreset"),
             quality_speed: 100,
-            lowlatency: w!("Av1EncodingLatencyMode"),
+            lowlatency: h!("Av1EncodingLatencyMode"),
             lowlatency_value: AmfVariantKind::I64(AV1_LATENCY_LOWEST),
-            framerate: w!("Av1FrameRate"),
-            idr_period: w!("Av1GOPSize"),
+            framerate: h!("Av1FrameRate"),
+            idr_period: h!("Av1GOPSize"),
             idr_period_value: 0,
-            force_picture_type: w!("Av1ForceFrameType"),
+            force_picture_type: h!("Av1ForceFrameType"),
             force_idr_value: 1,
-            output_data_type: w!("Av1OutputFrameType"),
-            query_timeout: w!("Av1QueryTimeout"),
+            output_data_type: h!("Av1OutputFrameType"),
+            query_timeout: h!("Av1QueryTimeout"),
             output_key_max: 0,
-            out_color_profile: w!("Av1OutputColorProfile"),
-            out_transfer: w!("Av1OutputColorTransferChar"),
-            out_primaries: w!("Av1OutputColorPrimaries"),
-            hdr_metadata: Some(w!("Av1InHDRMetadata")),
+            out_color_profile: h!("Av1OutputColorProfile"),
+            out_transfer: h!("Av1OutputColorTransferChar"),
+            out_primaries: h!("Av1OutputColorPrimaries"),
+            hdr_metadata: Some(h!("Av1InHDRMetadata")),
             intra_refresh: None,
             ltr: Some(LtrProps {
-                max_ltr_frames: w!("Av1MaxNumLTRFrames"),
-                max_num_ref_frames: w!("Av1MaxNumRefFrames"),
-                mark_ltr_index: w!("Av1MarkCurrentWithLTRIndex"),
-                force_ltr_bitfield: w!("Av1ForceLTRReferenceBitfield"),
+                max_ltr_frames: h!("Av1MaxNumLTRFrames"),
+                max_num_ref_frames: h!("Av1MaxNumRefFrames"),
+                mark_ltr_index: h!("Av1MarkCurrentWithLTRIndex"),
+                force_ltr_bitfield: h!("Av1ForceLTRReferenceBitfield"),
             }),
         },
         Codec::PyroWave => unreachable!("PyroWave never opens the AMF backend"),
@@ -474,25 +479,161 @@ fn ltr_mark_interval(fps: u32) -> i64 {
     super::policy::ltr_interval().unwrap_or_else(|| (fps.max(2) / 2).max(1) as i64)
 }
 
-// Owned-pointer guards: Terminate before Release (amfenc.c teardown order).
+// Owned-pointer guards: Terminate before Release (amfenc.c teardown order). Each holds one
+// owned reference to a non-null AMF object, and `amf_sys.rs` pins every vtable slot called
+// here: that pair is the proof behind every `unsafe` call in the methods below. Names are
+// `HSTRING`s, which are always NUL-terminated.
 
-/// Owned `AMFComponent*` — `Terminate` + `Release` on drop.
+impl AmfLib {
+    /// `CreateContext` → an owned [`Ctx`].
+    fn create_context(&self) -> Result<Ctx> {
+        let mut ctx: *mut sys::AmfContext = ptr::null_mut();
+        // SAFETY: `factory` is the live process singleton (null-checked at load, DLL never
+        // unloaded); on AMF_OK `ctx` holds one owned reference.
+        let r = unsafe { ((*(*self.factory).vtbl).create_context)(self.factory, &mut ctx) };
+        amf_ok(r, "AMF CreateContext")?;
+        if ctx.is_null() {
+            bail!("AMF CreateContext returned null");
+        }
+        Ok(Ctx(ctx))
+    }
+
+    /// `CreateComponent(id)` on `ctx` → an owned [`Component`].
+    fn create_component(&self, ctx: &Ctx, id: &HSTRING) -> Result<Component> {
+        let mut comp: *mut sys::AmfComponent = ptr::null_mut();
+        // SAFETY: live factory as above and a live owned context; `id` is NUL-terminated. On
+        // AMF_OK `comp` holds one owned reference.
+        let r = unsafe {
+            ((*(*self.factory).vtbl).create_component)(self.factory, ctx.0, id.as_ptr(), &mut comp)
+        };
+        amf_ok(r, "AMF CreateComponent")?;
+        if comp.is_null() {
+            bail!("AMF CreateComponent returned null");
+        }
+        Ok(Component(comp))
+    }
+}
+
+/// Owned `AMFComponent*` — `Flush` + `Terminate` + `Release` on drop.
+///
+/// Shared with the retrieve thread through an `Arc`. `init`, `flush` and `terminate` take
+/// `&mut self`, so they only run once that thread has been joined and dropped its clone.
 struct Component(*mut sys::AmfComponent);
+
+// SAFETY: AMF objects have no thread affinity; the last reference is released wherever the
+// guard drops.
+unsafe impl Send for Component {}
+// SAFETY: shared the way AMF's submit/retrieve split runs a component: the retrieve thread calls
+// only `query_output`, while SubmitInput, Drain and property calls stay on the encode thread.
+// Init, Flush and Terminate need `&mut self`, which no thread gets while the other holds a clone.
+unsafe impl Sync for Component {}
+
+impl Component {
+    /// `SetProperty`, raw result.
+    fn set_property(&self, name: &HSTRING, value: AmfVariant) -> sys::AmfResult {
+        // SAFETY: live component (guard proof above); `name` outlives the call. AMF copies the
+        // variant in, AddRef'ing an interface payload.
+        unsafe { ((*(*self.0).vtbl).set_property)(self.0, name.as_ptr(), value) }
+    }
+
+    /// `GetProperty`; `None` when the component declines.
+    fn get_property(&self, name: &HSTRING) -> Option<AmfVariant> {
+        let mut v = AmfVariant::zeroed();
+        // SAFETY: live component; `v` is a local out-param AMF fills.
+        let r = unsafe { ((*(*self.0).vtbl).get_property)(self.0, name.as_ptr(), &mut v) };
+        (r == sys::AMF_OK).then_some(v)
+    }
+
+    /// Set one component property. Required: abort the open. Optional: log and continue
+    /// (VCN/driver variance). Returns whether it applied, so callers gate advertised caps on the
+    /// driver's answer.
+    fn set_prop(&self, name: &HSTRING, value: AmfVariant, required: bool) -> Result<bool> {
+        let r = self.set_property(name, value);
+        if r == sys::AMF_OK {
+            return Ok(true);
+        }
+        if required {
+            Err(anyhow!(
+                "AMF SetProperty({name}) failed: {} ({r})",
+                result_name(r)
+            ))
+        } else {
+            // INFO not debug: rejected optional props are the per-box capability matrix.
+            tracing::info!(
+                property = %name,
+                result = result_name(r),
+                amf_code = r,
+                "optional AMF encoder property rejected (VCN generation/driver) — continuing"
+            );
+            Ok(false)
+        }
+    }
+
+    /// `GetProperty` BOOL. `None` on decline or non-BOOL.
+    fn get_prop_bool(&self, name: &HSTRING) -> Option<bool> {
+        self.get_property(name)?.as_bool()
+    }
+
+    /// `GetProperty` INT64 after any internal clamp. `None` on decline or non-INT64 — never
+    /// treat as 0.
+    fn get_prop_i64(&self, name: &HSTRING) -> Option<i64> {
+        self.get_property(name)?.as_i64()
+    }
+
+    /// `Init` at `format` (`AMF_SURFACE_*`) and `width`×`height`.
+    fn init(&mut self, format: i32, width: i32, height: i32) -> sys::AmfResult {
+        // SAFETY: live component, and `&mut self` means no other thread is inside it.
+        unsafe { ((*(*self.0).vtbl).init)(self.0, format, width, height) }
+    }
+
+    /// `Flush`: drop everything queued. Legal on a wedge.
+    fn flush(&mut self) -> sys::AmfResult {
+        // SAFETY: as `init`.
+        unsafe { ((*(*self.0).vtbl).flush)(self.0) }
+    }
+
+    /// `Terminate`: releases every input surface; `init` may follow.
+    fn terminate(&mut self) -> sys::AmfResult {
+        // SAFETY: as `init`.
+        unsafe { ((*(*self.0).vtbl).terminate)(self.0) }
+    }
+
+    /// `Drain`: end of stream; the owed AUs surface through `QueryOutput` until AMF_EOF.
+    fn drain(&self) -> sys::AmfResult {
+        // SAFETY: live component; Drain beside QueryOutput is AMF's end-of-stream pattern.
+        unsafe { ((*(*self.0).vtbl).drain)(self.0) }
+    }
+
+    /// `SubmitInput`. The component takes its own reference to `surface`.
+    fn submit_input(&self, surface: &OwnedData) -> sys::AmfResult {
+        // SAFETY: live component and a live surface, both owned by their guards.
+        unsafe { ((*(*self.0).vtbl).submit_input)(self.0, surface.0) }
+    }
+
+    /// `QueryOutput`: the result plus the output, owned, when there is one.
+    fn query_output(&self) -> (sys::AmfResult, Option<OwnedData>) {
+        let mut data: *mut sys::AmfData = ptr::null_mut();
+        // SAFETY: live component; `data` is a local out-param that holds one owned reference
+        // whenever AMF fills it.
+        let r = unsafe { ((*(*self.0).vtbl).query_output)(self.0, &mut data) };
+        (r, (!data.is_null()).then_some(OwnedData(data)))
+    }
+}
+
 impl Drop for Component {
     fn drop(&mut self) {
-        // SAFETY: `self.0` is the non-null `CreateComponent` pointer this guard uniquely owns;
-        // vtable calls run on the owning thread. Flush-then-Terminate-then-Release; drop once.
+        // Flush before Terminate: an unflushed session can occupy AMD's limited VCN slots so
+        // the next Init returns AMF_OK but never emits an AU. Best-effort on a wedge.
+        self.flush();
+        let tr = self.terminate();
+        if tr != sys::AMF_OK {
+            tracing::debug!(
+                result = %format!("{} ({tr})", result_name(tr)),
+                "AMF component Terminate returned non-OK on drop"
+            );
+        }
+        // SAFETY: the one reference this guard owns, released once; `self.0` is not used after.
         unsafe {
-            // Flush before Terminate: an unflushed session can occupy AMD's limited VCN slots so
-            // the next Init returns AMF_OK but never emits an AU. Best-effort on a wedge.
-            ((*(*self.0).vtbl).flush)(self.0);
-            let tr = ((*(*self.0).vtbl).terminate)(self.0);
-            if tr != sys::AMF_OK {
-                tracing::debug!(
-                    result = %format!("{} ({tr})", result_name(tr)),
-                    "AMF component Terminate returned non-OK on drop"
-                );
-            }
             ((*(*self.0).vtbl).release)(self.0);
         }
     }
@@ -500,10 +641,63 @@ impl Drop for Component {
 
 /// Owned `AMFContext*` — `Terminate` + `Release` on drop.
 struct Ctx(*mut sys::AmfContext);
+
+impl Ctx {
+    /// `InitDX11` on `device`; `None` lets AMF create its own.
+    ///
+    /// # Safety
+    /// `device` outlives this context.
+    unsafe fn init_dx11(&self, device: Option<&ID3D11Device>) -> sys::AmfResult {
+        let raw = device.map_or(ptr::null_mut(), |d| d.as_raw());
+        // SAFETY: live context (guard proof above); `raw` is null or a device the caller keeps
+        // alive for the context's life.
+        unsafe { ((*(*self.0).vtbl).init_dx11)(self.0, raw, sys::AMF_DX11_1) }
+    }
+
+    /// `AllocBuffer` of `size` bytes of host memory.
+    fn alloc_host_buffer(&self, size: usize) -> Result<Buffer> {
+        let mut buf: *mut sys::AmfBuffer = ptr::null_mut();
+        // SAFETY: live context; on AMF_OK `buf` holds one owned reference.
+        let r = unsafe {
+            ((*(*self.0).vtbl).alloc_buffer)(self.0, sys::AMF_MEMORY_HOST, size, &mut buf)
+        };
+        amf_ok(r, "AMF AllocBuffer")?;
+        if buf.is_null() {
+            bail!("AMF AllocBuffer returned null");
+        }
+        Ok(Buffer(buf))
+    }
+
+    /// Wrap `texture` as an `AMFSurface`, viewed through its `AMFData` prefix.
+    ///
+    /// # Safety
+    /// `texture` lives on this context's device and stays alive until the component has let go
+    /// of the surface: its AU is out, or Terminate has returned. The AMF docs do not say the
+    /// surface holds a reference to it.
+    unsafe fn create_surface_from_dx11(&self, texture: &ID3D11Texture2D) -> Result<OwnedData> {
+        let mut surf: *mut sys::AmfData = ptr::null_mut();
+        // SAFETY: live context; `texture` is live for as long as AMF may read it (caller
+        // contract); no observer. On AMF_OK `surf` holds one owned reference.
+        let r = unsafe {
+            ((*(*self.0).vtbl).create_surface_from_dx11_native)(
+                self.0,
+                texture.as_raw(),
+                &mut surf,
+                ptr::null_mut(),
+            )
+        };
+        amf_ok(r, "AMF CreateSurfaceFromDX11Native")?;
+        if surf.is_null() {
+            bail!("AMF CreateSurfaceFromDX11Native returned null");
+        }
+        Ok(OwnedData(surf))
+    }
+}
+
 impl Drop for Ctx {
     fn drop(&mut self) {
-        // SAFETY: `self.0` is the non-null `CreateContext` pointer this guard uniquely owns
-        // (`Inner` declares `comp` before `ctx`, so components drop first). Drop once, owning thread.
+        // SAFETY: the one reference this guard owns, terminated then released once (`Inner`
+        // declares `comp` before `ctx`, so components drop first).
         unsafe {
             let tr = ((*(*self.0).vtbl).terminate)(self.0);
             if tr != sys::AMF_OK {
@@ -517,66 +711,78 @@ impl Drop for Ctx {
     }
 }
 
-/// Owned `AMFData*` (surface or buffer viewed through the `AMFData` prefix) — `Release` on drop.
+/// Owned `AMFData*` (a surface, or an encoder output) — `Release` on drop.
 struct OwnedData(*mut sys::AmfData);
+
+impl OwnedData {
+    /// `SetPts` in 100 ns units.
+    fn set_pts(&self, pts: i64) {
+        // SAFETY: live data object (guard proof above).
+        unsafe { ((*(*self.0).vtbl).set_pts)(self.0, pts) }
+    }
+
+    /// `SetProperty`, raw result.
+    fn set_property(&self, name: &HSTRING, value: AmfVariant) -> sys::AmfResult {
+        // SAFETY: live data object; `name` outlives the call; the variant is copied in.
+        unsafe { ((*(*self.0).vtbl).set_property)(self.0, name.as_ptr(), value) }
+    }
+
+    /// `GetProperty`; `None` when the object has no such property.
+    fn get_property(&self, name: &HSTRING) -> Option<AmfVariant> {
+        let mut v = AmfVariant::zeroed();
+        // SAFETY: live data object; `v` is a local out-param AMF fills.
+        let r = unsafe { ((*(*self.0).vtbl).get_property)(self.0, name.as_ptr(), &mut v) };
+        (r == sys::AMF_OK).then_some(v)
+    }
+
+    /// `QueryInterface(IID_AMFBuffer)`: the same object as an owned [`Buffer`].
+    fn query_buffer(&self) -> Result<Buffer> {
+        let mut buf: *mut c_void = ptr::null_mut();
+        // SAFETY: live data object; the IID is a static. On AMF_OK `buf` holds one AddRef'd
+        // reference to an `AMFBuffer`.
+        let r =
+            unsafe { ((*(*self.0).vtbl).query_interface)(self.0, &sys::IID_AMF_BUFFER, &mut buf) };
+        amf_ok(r, "AMF QueryInterface(AMFBuffer)")?;
+        if buf.is_null() {
+            bail!("AMF output is not an AMFBuffer");
+        }
+        Ok(Buffer(buf.cast()))
+    }
+}
+
 impl Drop for OwnedData {
     fn drop(&mut self) {
-        // SAFETY: one owned/AddRef'd reference from CreateSurface / QueryOutput / QueryInterface.
-        // `release` is slot 2 of every AMF vtable. Drop once.
+        // SAFETY: the one reference this guard owns, released once.
         unsafe {
             ((*(*self.0).vtbl).release)(self.0);
         }
     }
 }
 
-/// Set one component property. Required: abort the open. Optional: log and continue (VCN/driver
-/// variance). Returns whether it applied, so callers gate advertised caps on the driver's answer.
-unsafe fn set_prop(
-    comp: *mut sys::AmfComponent,
-    name: PCWSTR,
-    value: AmfVariant,
-    required: bool,
-) -> Result<bool> {
-    let r = ((*(*comp).vtbl).set_property)(comp, name.0, value);
-    if r == sys::AMF_OK {
-        return Ok(true);
+/// Owned `AMFBuffer*` — `Release` on drop.
+struct Buffer(*mut sys::AmfBuffer);
+
+impl Buffer {
+    /// Host pointer, valid while `self` lives. Null for a buffer without host memory.
+    fn native(&self) -> *mut c_void {
+        // SAFETY: live buffer (guard proof above); GetNative only reads it.
+        unsafe { ((*(*self.0).vtbl).get_native)(self.0) }
     }
-    let name = String::from_utf16_lossy(name.as_wide());
-    if required {
-        Err(anyhow!(
-            "AMF SetProperty({name}) failed: {} ({r})",
-            result_name(r)
-        ))
-    } else {
-        // INFO not debug: rejected optional props are the per-box capability matrix.
-        tracing::info!(
-            property = %name,
-            result = result_name(r),
-            amf_code = r,
-            "optional AMF encoder property rejected (VCN generation/driver) — continuing"
-        );
-        Ok(false)
+
+    /// Size in bytes.
+    fn size(&self) -> usize {
+        // SAFETY: live buffer; GetSize only reads it.
+        unsafe { ((*(*self.0).vtbl).get_size)(self.0) }
     }
 }
 
-/// `GetProperty` BOOL. `None` on decline or non-BOOL.
-unsafe fn get_prop_bool(comp: *mut sys::AmfComponent, name: PCWSTR) -> Option<bool> {
-    let mut v = AmfVariant::zeroed();
-    let r = ((*(*comp).vtbl).get_property)(comp, name.0, &mut v);
-    if r != sys::AMF_OK {
-        return None;
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        // SAFETY: the one reference this guard owns, released once.
+        unsafe {
+            ((*(*self.0).vtbl).release)(self.0);
+        }
     }
-    v.as_bool()
-}
-
-/// `GetProperty` INT64 after any internal clamp. `None` on decline or non-INT64 — never treat as 0.
-unsafe fn get_prop_i64(comp: *mut sys::AmfComponent, name: PCWSTR) -> Option<i64> {
-    let mut v = AmfVariant::zeroed();
-    let r = ((*(*comp).vtbl).get_property)(comp, name.0, &mut v);
-    if r != sys::AMF_OK {
-        return None;
-    }
-    v.as_i64()
 }
 
 /// Input texture ring depth. AMF keeps reading a slot until its AU is retrieved, so at most
@@ -612,9 +818,9 @@ struct Out {
 /// encode thread never waits on VCN — it takes finished AUs off a queue, and a caller that parks
 /// on handles takes [`Ready`] instead.
 ///
-/// Dropping this stops and joins, which must happen before the component is terminated under it:
-/// [`Inner`] declares it first for exactly that reason, and [`AmfEncoder::reset`] stops it by
-/// hand around the in-place re-Init.
+/// Dropping this stops and joins, and the joined thread has dropped its `Arc` of the component.
+/// [`Inner`] declares it first so the component's last reference, and its Terminate, stay on the
+/// encode thread; [`AmfEncoder::reset`] stops it by hand to get `&mut` for the re-Init.
 struct Retrieve {
     out: Arc<Mutex<Out>>,
     have: Arc<Ready>,
@@ -625,15 +831,11 @@ struct Retrieve {
 impl Retrieve {
     /// Start a thread draining `comp`. `blocking` says `QueryTimeout` took, so the loop parks in
     /// `QueryOutput` instead of sampling.
-    fn start(comp: *mut sys::AmfComponent, props: &CodecProps, blocking: bool) -> Result<Self> {
+    fn start(comp: Arc<Component>, props: &CodecProps, blocking: bool) -> Result<Self> {
         let out: Arc<Mutex<Out>> = Arc::default();
         let have = Arc::new(Ready::new().ok_or_else(|| anyhow!("AMF: no completion event"))?);
         let stop = Arc::new(AtomicBool::new(false));
-        let (comp, odt, okm) = (
-            comp as usize,
-            props.output_data_type.0 as usize,
-            props.output_key_max,
-        );
+        let (odt, okm) = (props.output_data_type, props.output_key_max);
         let (t_out, t_have, t_stop) = (out.clone(), have.clone(), stop.clone());
         let join = std::thread::Builder::new()
             .name("punktfunk-amf-out".into())
@@ -681,12 +883,11 @@ impl Drop for Retrieve {
     }
 }
 
-/// Block in `QueryOutput` and hand finished AUs to the encode thread. Pointers travel as `usize`
-/// (process-global AMF handles); the thread is joined before the component is terminated, so
-/// `comp` outlives every call here.
+/// Block in `QueryOutput` and hand finished AUs to the encode thread. `QueryOutput` is the only
+/// call this thread makes on `comp`; its clone drops when the loop exits.
 fn retrieve_loop(
-    comp: usize,
-    output_data_type: usize,
+    comp: Arc<Component>,
+    output_data_type: &'static HSTRING,
     output_key_max: i64,
     blocking: bool,
     out: Arc<Mutex<Out>>,
@@ -694,12 +895,8 @@ fn retrieve_loop(
     stop: Arc<AtomicBool>,
 ) {
     pf_frame::thread_qos::boost_thread_priority(false);
-    let comp = comp as *mut sys::AmfComponent;
-    let odt = PCWSTR(output_data_type as *const u16);
     while !stop.load(Ordering::Acquire) {
-        // SAFETY: `comp` is the live component this thread was started for and is joined before
-        // anything terminates it; this thread makes every `QueryOutput` call on it.
-        match unsafe { drain_one_output(comp, odt, output_key_max) } {
+        match drain_one_output(&comp, output_data_type, output_key_max) {
             Ok(DrainOutcome::Frame { data, key_prop }) => {
                 let mut g = lock(&out);
                 // An AU with no submit behind it would pair every later AU with the wrong
@@ -749,20 +946,19 @@ fn retrieve_loop(
 
 /// Ask the component to let `QueryOutput` block. `false` means the driver declined and the
 /// retrieve thread samples instead — older AMF runtimes have no such property.
-///
-/// # Safety
-/// `comp` is live and not yet initialized past `apply_static_props`.
-unsafe fn set_query_timeout(comp: *mut sys::AmfComponent, name: PCWSTR) -> bool {
-    set_prop(comp, name, AmfVariant::from_i64(QUERY_TIMEOUT_MS), false).unwrap_or(false)
+fn set_query_timeout(comp: &Component, name: &HSTRING) -> bool {
+    comp.set_prop(name, AmfVariant::from_i64(QUERY_TIMEOUT_MS), false)
+        .unwrap_or(false)
 }
 
 /// Live AMF session. Field order: `retrieve` stops and joins first, then `comp` drops
-/// (Flush+Terminate+Release), then `ctx`.
+/// (Flush+Terminate+Release), then `ctx`, then the device and textures they used.
 struct Inner {
     retrieve: Retrieve,
-    comp: Component,
+    /// Shared with the retrieve thread, which holds the only other clone.
+    comp: Arc<Component>,
     ctx: Ctx,
-    /// Capturer device — kept alive for the ring textures.
+    /// Capturer device — kept alive for `ctx` and the ring textures.
     _device: ID3D11Device,
     /// Immediate context for the ring copy. The AMF runtime uses it too, so it runs
     /// multithread-protected.
@@ -970,50 +1166,41 @@ impl AmfEncoder {
     /// Static encoder config, before `Init` and again on `reset()` re-`Init` (Terminate does not
     /// keep properties on every driver). Returns `(ir_active, ltr_active)` as requested AND
     /// accepted. Mutually exclusive — see [`Self::ltr_wanted`].
-    unsafe fn apply_static_props(&self, comp: *mut sys::AmfComponent) -> Result<(bool, bool)> {
+    fn apply_static_props(&self, comp: &Component) -> Result<(bool, bool)> {
         let p = &self.props;
         // Usage first: it fully configures the parameter set; everything after is an override.
-        set_prop(
-            comp,
+        comp.set_prop(
             p.usage,
             AmfVariant::from_i64(usage_from_knobs(self.codec)),
             true,
         )?;
-        set_prop(comp, p.rc_method, AmfVariant::from_i64(p.rc_cbr), true)?;
+        comp.set_prop(p.rc_method, AmfVariant::from_i64(p.rc_cbr), true)?;
         let bps = self.bitrate_bps.min(i64::MAX as u64) as i64;
-        set_prop(comp, p.target_bitrate, AmfVariant::from_i64(bps), true)?;
-        set_prop(comp, p.peak_bitrate, AmfVariant::from_i64(bps), true)?;
-        set_prop(
-            comp,
-            p.framerate,
-            AmfVariant::from_rate(self.fps.max(1), 1),
-            true,
-        )?;
-        set_prop(
-            comp,
+        comp.set_prop(p.target_bitrate, AmfVariant::from_i64(bps), true)?;
+        comp.set_prop(p.peak_bitrate, AmfVariant::from_i64(bps), true)?;
+        comp.set_prop(p.framerate, AmfVariant::from_rate(self.fps.max(1), 1), true)?;
+        comp.set_prop(
             p.vbv_size,
             AmfVariant::from_i64(self.vbv_bits(self.bitrate_bps)),
             false,
         )?;
-        set_prop(comp, p.enforce_hrd, AmfVariant::from_bool(true), false)?;
-        set_prop(comp, p.filler_data, AmfVariant::from_bool(false), false)?;
+        comp.set_prop(p.enforce_hrd, AmfVariant::from_bool(true), false)?;
+        comp.set_prop(p.filler_data, AmfVariant::from_bool(false), false)?;
         // The latency usages default this on: a frame over the one-frame VBV is then skipped
         // and the reference stays stale, so the next frame is over budget too — a scene cut
         // freezes the picture until the content drifts back to it.
-        let usage_default = get_prop_bool(comp, p.skip_frame);
-        set_prop(comp, p.skip_frame, AmfVariant::from_bool(false), false)?;
+        let usage_default = comp.get_prop_bool(p.skip_frame);
+        comp.set_prop(p.skip_frame, AmfVariant::from_bool(false), false)?;
         tracing::info!(?usage_default, "AMF rate-control frame skip disabled");
         // Latency-first quality; low-latency submit (optional on older VCN).
-        set_prop(
-            comp,
+        comp.set_prop(
             p.quality_preset,
             AmfVariant::from_i64(p.quality_speed),
             false,
         )?;
-        set_prop(comp, p.lowlatency, p.lowlatency_value.to_variant(), false)?;
+        comp.set_prop(p.lowlatency, p.lowlatency_value.to_variant(), false)?;
         // No periodic IDR (`i32::MAX` AVC/HEVC; 0 on AV1 = first frame only). Forced type supplies IDRs.
-        set_prop(
-            comp,
+        comp.set_prop(
             p.idr_period,
             AmfVariant::from_i64(p.idr_period_value),
             false,
@@ -1023,14 +1210,12 @@ impl AmfEncoder {
         let mut ltr_active = false;
         if let Some(ltr) = p.ltr.as_ref().filter(|_| self.ltr_wanted()) {
             // LTR needs >1 ref frames and is mutually exclusive with intra-refresh.
-            let ref_ok = set_prop(
-                comp,
+            let ref_ok = comp.set_prop(
                 ltr.max_num_ref_frames,
                 AmfVariant::from_i64(NUM_LTR_SLOTS as i64),
                 false,
             )?;
-            let ltr_ok = set_prop(
-                comp,
+            let ltr_ok = comp.set_prop(
                 ltr.max_ltr_frames,
                 AmfVariant::from_i64(NUM_LTR_SLOTS as i64),
                 false,
@@ -1054,7 +1239,7 @@ impl AmfEncoder {
                 let period = intra_refresh_period(self.fps);
                 let blocks = self.width.div_ceil(block) * self.height.div_ceil(block);
                 let per_slot = blocks.div_ceil(period).max(1);
-                ir_active = set_prop(comp, name, AmfVariant::from_i64(per_slot as i64), false)?;
+                ir_active = comp.set_prop(name, AmfVariant::from_i64(per_slot as i64), false)?;
                 if ir_active {
                     tracing::info!(
                         period_frames = period,
@@ -1072,36 +1257,28 @@ impl AmfEncoder {
         match self.codec {
             Codec::H264 => {
                 // Never B-frames: a full frame of latency each (RDNA3+ defaults > 0).
-                set_prop(comp, w!("BPicturesPattern"), AmfVariant::from_i64(0), false)?;
+                comp.set_prop(h!("BPicturesPattern"), AmfVariant::from_i64(0), false)?;
                 // Limited-range YUV (matches the video processor's NV12).
-                set_prop(
-                    comp,
-                    w!("FullRangeColor"),
-                    AmfVariant::from_bool(false),
-                    false,
-                )?;
+                comp.set_prop(h!("FullRangeColor"), AmfVariant::from_bool(false), false)?;
             }
             Codec::H265 => {
                 // In-band VPS/SPS/PPS on every IDR. Forced-IDR surfaces also set `HevcInsertHeader`.
-                set_prop(
-                    comp,
-                    w!("HevcHeaderInsertionMode"),
+                comp.set_prop(
+                    h!("HevcHeaderInsertionMode"),
                     AmfVariant::from_i64(HEVC_HEADER_IDR_ALIGNED),
                     false,
                 )?;
                 // Studio range, matching NV12/P010 video-processor output.
-                set_prop(comp, w!("HevcNominalRange"), AmfVariant::from_i64(0), false)?;
+                comp.set_prop(h!("HevcNominalRange"), AmfVariant::from_i64(0), false)?;
                 if self.ten_bit {
                     // Main10 + 10-bit surfaces: required — silent 8-bit HDR is worse than failing open.
-                    set_prop(
-                        comp,
-                        w!("HevcProfile"),
+                    comp.set_prop(
+                        h!("HevcProfile"),
                         AmfVariant::from_i64(HEVC_PROFILE_MAIN_10),
                         true,
                     )?;
-                    set_prop(
-                        comp,
-                        w!("HevcColorBitDepth"),
+                    comp.set_prop(
+                        h!("HevcColorBitDepth"),
                         AmfVariant::from_i64(COLOR_BIT_DEPTH_10),
                         true,
                     )?;
@@ -1111,52 +1288,41 @@ impl AmfEncoder {
                 // Never B-frames: VCN5 can grow them (H.264 already did on RDNA3+). A B-frame
                 // adds a frame of latency and breaks FIFO on the codec with no LTR/IR. Pre-VCN5
                 // rejects the names (no-op). HEVC has no B-frame property at all.
-                set_prop(
-                    comp,
-                    w!("Av1BPicturesPattern"),
+                comp.set_prop(h!("Av1BPicturesPattern"), AmfVariant::from_i64(0), false)?;
+                comp.set_prop(
+                    h!("Av1MaxConsecutiveBPictures"),
                     AmfVariant::from_i64(0),
                     false,
                 )?;
-                set_prop(
-                    comp,
-                    w!("Av1MaxConsecutiveBPictures"),
-                    AmfVariant::from_i64(0),
-                    false,
-                )?;
-                set_prop(
-                    comp,
-                    w!("Av1AdaptiveMiniGop"),
+                comp.set_prop(
+                    h!("Av1AdaptiveMiniGop"),
                     AmfVariant::from_bool(false),
                     false,
                 )?;
                 // Sequence header OBU on every key frame (self-contained join points).
-                set_prop(
-                    comp,
-                    w!("Av1HeaderInsertionMode"),
+                comp.set_prop(
+                    h!("Av1HeaderInsertionMode"),
                     AmfVariant::from_i64(AV1_HEADER_KEY_ALIGNED),
                     false,
                 )?;
                 // Default `64X16_ONLY` rejects non-16-multiple heights (1080p). Prefer unrestricted;
                 // fall back to 1080p-coded-1082. If neither applies, Init fails.
-                let unrestricted = set_prop(
-                    comp,
-                    w!("Av1AlignmentMode"),
+                let unrestricted = comp.set_prop(
+                    h!("Av1AlignmentMode"),
                     AmfVariant::from_i64(AV1_ALIGNMENT_NO_RESTRICTIONS),
                     false,
                 )?;
                 if !unrestricted && self.height % 16 != 0 {
-                    set_prop(
-                        comp,
-                        w!("Av1AlignmentMode"),
+                    comp.set_prop(
+                        h!("Av1AlignmentMode"),
                         AmfVariant::from_i64(AV1_ALIGNMENT_1080P_CODED_1082),
                         false,
                     )?;
                 }
                 if self.ten_bit {
                     // 10-bit is AV1 Main — only the surface depth needs forcing.
-                    set_prop(
-                        comp,
-                        w!("Av1ColorBitDepth"),
+                    comp.set_prop(
+                        h!("Av1ColorBitDepth"),
                         AmfVariant::from_i64(COLOR_BIT_DEPTH_10),
                         true,
                     )?;
@@ -1172,24 +1338,9 @@ impl AmfEncoder {
         } else {
             (COLOR_PROFILE_709, TRANSFER_BT709, PRIMARIES_BT709)
         };
-        set_prop(
-            comp,
-            p.out_color_profile,
-            AmfVariant::from_i64(profile),
-            self.hdr,
-        )?;
-        set_prop(
-            comp,
-            p.out_transfer,
-            AmfVariant::from_i64(transfer),
-            self.hdr,
-        )?;
-        set_prop(
-            comp,
-            p.out_primaries,
-            AmfVariant::from_i64(primaries),
-            self.hdr,
-        )?;
+        comp.set_prop(p.out_color_profile, AmfVariant::from_i64(profile), self.hdr)?;
+        comp.set_prop(p.out_transfer, AmfVariant::from_i64(transfer), self.hdr)?;
+        comp.set_prop(p.out_primaries, AmfVariant::from_i64(primaries), self.hdr)?;
         Ok((ir_active, ltr_active))
     }
 
@@ -1210,188 +1361,148 @@ impl AmfEncoder {
         self.inner = None;
         self.bound_device = dev_raw;
         let lib = try_factory().map_err(|e| anyhow!("native AMF unavailable: {e}"))?;
-        // SAFETY: `lib.factory` is live (gated above). CreateContext/CreateComponent fill
-        // out-pointers only on AMF_OK (null-checked); each object moves into a guard so early
-        // `?` releases once. `InitDX11` borrows a live `ID3D11Device`; AMF AddRefs until Terminate.
-        unsafe {
-            let mut ctx: *mut sys::AmfContext = ptr::null_mut();
-            amf_ok(
-                ((*(*lib.factory).vtbl).create_context)(lib.factory, &mut ctx),
-                "AMF CreateContext",
-            )?;
-            if ctx.is_null() {
-                bail!("AMF CreateContext returned null");
-            }
-            let ctx = Ctx(ctx);
-            let dctx = device
-                .GetImmediateContext()
-                .context("ID3D11Device immediate context")?;
-            // The AMF runtime drives this immediate context from its own threads (the retrieve
-            // thread's QueryOutput included) while this thread copies into the ring on it.
-            if let Ok(mt) = dctx.cast::<ID3D11Multithread>() {
-                let _ = mt.SetMultithreadProtected(true);
-            }
-            amf_ok(
-                ((*(*ctx.0).vtbl).init_dx11)(ctx.0, device.as_raw(), sys::AMF_DX11_1),
-                "AMF InitDX11 (capturer device)",
-            )?;
-            let mut comp: *mut sys::AmfComponent = ptr::null_mut();
-            amf_ok(
-                ((*(*lib.factory).vtbl).create_component)(
-                    lib.factory,
-                    ctx.0,
-                    self.props.component.0,
-                    &mut comp,
-                ),
-                "AMF CreateComponent",
-            )?;
-            if comp.is_null() {
-                bail!("AMF CreateComponent returned null");
-            }
-            let comp = Component(comp);
-            let (ir_active, ltr_active) = self.apply_static_props(comp.0)?;
-            let fmt = if self.ten_bit {
-                sys::AMF_SURFACE_P010
-            } else {
-                sys::AMF_SURFACE_NV12
-            };
-            amf_ok(
-                ((*(*comp.0).vtbl).init)(comp.0, fmt, self.width as i32, self.height as i32),
-                "AMF encoder Init",
-            )?;
-            self.ir_active = ir_active;
-            // Rebuilt component has no reference history; drop prior LTR marks.
-            self.ltr_active = ltr_active;
-            if ltr_active {
-                self.ltr_slots = [None; NUM_LTR_SLOTS];
-                self.next_ltr_slot = 0;
-                self.pending_force = None;
-            }
-
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: self.width,
-                Height: self.height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: if self.ten_bit {
-                    DXGI_FORMAT_P010
-                } else {
-                    DXGI_FORMAT_NV12
-                },
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-            };
-            let mut ring = Vec::with_capacity(RING);
-            for _ in 0..RING {
-                let mut t: Option<ID3D11Texture2D> = None;
-                device
-                    .CreateTexture2D(&desc, None, Some(&mut t))
-                    .context("CreateTexture2D (AMF input ring)")?;
-                ring.push(t.context("AMF input ring texture")?);
-            }
-            // Bump after successful Init so a failed bring-up never counts.
-            let context_no =
-                AMF_CONTEXTS_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            tracing::info!(
-                codec = ?self.codec,
-                context = context_no,
-                device = %format_args!("{:#x}", device.as_raw() as usize),
-                width = self.width,
-                height = self.height,
-                fps = self.fps,
-                ring = if self.ten_bit { "P010" } else { "NV12" },
-                ltr = ltr_active,
-                intra_refresh = ir_active,
-                runtime = %format_args!(
-                    "{}.{}.{}",
-                    (lib.version >> 48) & 0xffff,
-                    (lib.version >> 32) & 0xffff,
-                    (lib.version >> 16) & 0xffff
-                ),
-                "native AMF encode active (zero-copy D3D11)"
-            );
-            // The retrieve thread starts against the initialized component and is joined before
-            // anything terminates it (`Inner` drops it first; `reset` stops it by hand).
-            let blocking = set_query_timeout(comp.0, self.props.query_timeout);
-            let retrieve = Retrieve::start(comp.0, &self.props, blocking)?;
-            tracing::debug!(
-                blocking,
-                "AMF retrieve thread started ({})",
-                if blocking {
-                    "QueryOutput blocks on the driver's own timeout"
-                } else {
-                    "runtime declined QueryTimeout — the thread samples"
-                }
-            );
-            self.inner = Some(Inner {
-                retrieve,
-                comp,
-                ctx,
-                _device: device.clone(),
-                dctx,
-                ring,
-                next: 0,
-                held: VecDeque::new(),
-                hdr_pushed: None,
-                first_au_logged: false,
-            });
-            Ok(())
+        let ctx = lib.create_context()?;
+        // SAFETY: plain accessor on a live device.
+        let dctx =
+            unsafe { device.GetImmediateContext() }.context("ID3D11Device immediate context")?;
+        // The AMF runtime drives this immediate context from its own threads (the retrieve
+        // thread's QueryOutput included) while this thread copies into the ring on it.
+        if let Ok(mt) = dctx.cast::<ID3D11Multithread>() {
+            // SAFETY: a device-wide flag on a live context, set before AMF is handed the device.
+            let _ = unsafe { mt.SetMultithreadProtected(true) };
         }
+        // SAFETY: `device` outlives `ctx`: borrowed for this call, then kept in `Inner` behind
+        // `ctx`, which drops first.
+        let r = unsafe { ctx.init_dx11(Some(device)) };
+        amf_ok(r, "AMF InitDX11 (capturer device)")?;
+        let mut comp = lib.create_component(&ctx, self.props.component)?;
+        let (ir_active, ltr_active) = self.apply_static_props(&comp)?;
+        let fmt = if self.ten_bit {
+            sys::AMF_SURFACE_P010
+        } else {
+            sys::AMF_SURFACE_NV12
+        };
+        amf_ok(
+            comp.init(fmt, self.width as i32, self.height as i32),
+            "AMF encoder Init",
+        )?;
+        self.ir_active = ir_active;
+        // Rebuilt component has no reference history; drop prior LTR marks.
+        self.ltr_active = ltr_active;
+        if ltr_active {
+            self.ltr_slots = [None; NUM_LTR_SLOTS];
+            self.next_ltr_slot = 0;
+            self.pending_force = None;
+        }
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: self.width,
+            Height: self.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: if self.ten_bit {
+                DXGI_FORMAT_P010
+            } else {
+                DXGI_FORMAT_NV12
+            },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut ring = Vec::with_capacity(RING);
+        for _ in 0..RING {
+            let mut t: Option<ID3D11Texture2D> = None;
+            // SAFETY: a complete description, no initial data; `t` is a local out-param.
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut t)) }
+                .context("CreateTexture2D (AMF input ring)")?;
+            ring.push(t.context("AMF input ring texture")?);
+        }
+        // Bump after successful Init so a failed bring-up never counts.
+        let context_no = AMF_CONTEXTS_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::info!(
+            codec = ?self.codec,
+            context = context_no,
+            device = %format_args!("{:#x}", device.as_raw() as usize),
+            width = self.width,
+            height = self.height,
+            fps = self.fps,
+            ring = if self.ten_bit { "P010" } else { "NV12" },
+            ltr = ltr_active,
+            intra_refresh = ir_active,
+            runtime = %format_args!(
+                "{}.{}.{}",
+                (lib.version >> 48) & 0xffff,
+                (lib.version >> 32) & 0xffff,
+                (lib.version >> 16) & 0xffff
+            ),
+            "native AMF encode active (zero-copy D3D11)"
+        );
+        // The retrieve thread starts against the initialized component; `Inner` joins it
+        // before its own reference drops, and `reset` stops it by hand.
+        let blocking = set_query_timeout(&comp, self.props.query_timeout);
+        let comp = Arc::new(comp);
+        let retrieve = Retrieve::start(Arc::clone(&comp), &self.props, blocking)?;
+        tracing::debug!(
+            blocking,
+            "AMF retrieve thread started ({})",
+            if blocking {
+                "QueryOutput blocks on the driver's own timeout"
+            } else {
+                "runtime declined QueryTimeout — the thread samples"
+            }
+        );
+        self.inner = Some(Inner {
+            retrieve,
+            comp,
+            ctx,
+            _device: device.clone(),
+            dctx,
+            ring,
+            next: 0,
+            held: VecDeque::new(),
+            hdr_pushed: None,
+            first_au_logged: false,
+        });
+        Ok(())
     }
 }
 
 /// Push HDR mastering metadata as `*InHDRMetadata` (dynamic). Units match [`HdrMeta`]; primary
 /// order is the trap: ST.2086 wire is G,B,R → labeled R/G/B fields.
-///
-/// # Safety
-/// `ctx` and `comp` are the live pair owned by the calling encoder, encode thread only.
-unsafe fn push_hdr_metadata(
-    ctx: *mut sys::AmfContext,
-    comp: *mut sys::AmfComponent,
-    name: PCWSTR,
+fn push_hdr_metadata(
+    ctx: &Ctx,
+    comp: &Component,
+    name: &HSTRING,
     meta: &pf_frame::HdrMeta,
 ) -> Result<()> {
-    let mut buf: *mut sys::AmfBuffer = ptr::null_mut();
-    amf_ok(
-        ((*(*ctx).vtbl).alloc_buffer)(
-            ctx,
-            sys::AMF_MEMORY_HOST,
-            std::mem::size_of::<sys::AmfHdrMetadata>(),
-            &mut buf,
-        ),
-        "AMF AllocBuffer(HDR metadata)",
-    )?;
-    if buf.is_null() {
-        bail!("AMF AllocBuffer(HDR metadata) returned null");
-    }
-    // AMFData-prefix guard (slot 2 is Release). SetProperty AddRefs; our drop leaves the property.
-    let guard = OwnedData(buf as *mut sys::AmfData);
-    let native = ((*(*buf).vtbl).get_native)(buf) as *mut sys::AmfHdrMetadata;
+    let buf = ctx
+        .alloc_host_buffer(std::mem::size_of::<sys::AmfHdrMetadata>())
+        .context("HDR metadata")?;
+    let native = buf.native().cast::<sys::AmfHdrMetadata>();
     if native.is_null() {
         bail!("AMF HDR metadata buffer has no host pointer");
     }
-    // Host AMFBuffer heap alignment is unknown — write unaligned.
-    native.write_unaligned(sys::AmfHdrMetadata {
-        red_primary: meta.display_primaries[2],
-        green_primary: meta.display_primaries[0],
-        blue_primary: meta.display_primaries[1],
-        white_point: meta.white_point,
-        max_mastering_luminance: meta.max_display_mastering_luminance,
-        min_mastering_luminance: meta.min_display_mastering_luminance,
-        max_content_light_level: meta.max_cll,
-        max_frame_average_light_level: meta.max_fall,
-    });
-    let r = ((*(*comp).vtbl).set_property)(
-        comp,
-        name.0,
-        AmfVariant::from_interface(guard.0 as *mut c_void),
-    );
+    // SAFETY: `native` addresses the `size_of::<AmfHdrMetadata>()` host bytes just allocated,
+    // live while `buf` is. Host AMFBuffer alignment is unknown, hence the unaligned write.
+    unsafe {
+        native.write_unaligned(sys::AmfHdrMetadata {
+            red_primary: meta.display_primaries[2],
+            green_primary: meta.display_primaries[0],
+            blue_primary: meta.display_primaries[1],
+            white_point: meta.white_point,
+            max_mastering_luminance: meta.max_display_mastering_luminance,
+            min_mastering_luminance: meta.min_display_mastering_luminance,
+            max_content_light_level: meta.max_cll,
+            max_frame_average_light_level: meta.max_fall,
+        })
+    };
+    // SetProperty AddRefs the buffer; dropping `buf` leaves the property's reference.
+    let r = comp.set_property(name, AmfVariant::from_interface(buf.0.cast()));
     amf_ok(r, "AMF SetProperty(InHDRMetadata)")
 }
 
@@ -1423,70 +1534,45 @@ pub fn probe_can_encode_10bit(codec: Codec, adapter_luid: Option<LUID>) -> bool 
 
 /// Probe body: context + component + usage + optional 10-bit props + tiny `Init`. `false` on fail.
 fn probe_open_on(device: &ID3D11Device, codec: Codec, ten_bit: bool) -> bool {
-    if try_factory().is_err() {
+    let Ok(lib) = try_factory() else { return false };
+    let props = codec_props(codec);
+    let Ok(ctx) = lib.create_context() else {
+        return false;
+    };
+    // SAFETY: `device` is borrowed for this whole call, and `ctx` drops before it returns.
+    if unsafe { ctx.init_dx11(Some(device)) } != sys::AMF_OK {
         return false;
     }
-    let props = codec_props(codec);
-    // SAFETY: factory is live; each created object moves into a guard so early return releases
-    // once. `InitDX11` borrows `device`; AMF AddRefs until Terminate. Usage must be set before
-    // `Init` (header default is N/A).
-    unsafe {
-        let Ok(lib) = try_factory() else { return false };
-        let mut ctx: *mut sys::AmfContext = ptr::null_mut();
-        if ((*(*lib.factory).vtbl).create_context)(lib.factory, &mut ctx) != sys::AMF_OK
-            || ctx.is_null()
-        {
-            return false;
-        }
-        let ctx = Ctx(ctx);
-        if ((*(*ctx.0).vtbl).init_dx11)(ctx.0, device.as_raw(), sys::AMF_DX11_1) != sys::AMF_OK {
-            return false;
-        }
-        let mut comp: *mut sys::AmfComponent = ptr::null_mut();
-        if ((*(*lib.factory).vtbl).create_component)(
-            lib.factory,
-            ctx.0,
-            props.component.0,
-            &mut comp,
-        ) != sys::AMF_OK
-            || comp.is_null()
-        {
-            return false;
-        }
-        let comp = Component(comp);
-        if ((*(*comp.0).vtbl).set_property)(
-            comp.0,
-            props.usage.0,
-            AmfVariant::from_i64(usage_from_knobs(codec)),
-        ) != sys::AMF_OK
-        {
-            return false;
-        }
-        if ten_bit {
-            // Same required 10-bit props as a real session — reject here is the probe's answer.
-            let depth_props: &[(PCWSTR, i64)] = match codec {
-                Codec::H265 => &[
-                    (w!("HevcProfile"), HEVC_PROFILE_MAIN_10),
-                    (w!("HevcColorBitDepth"), COLOR_BIT_DEPTH_10),
-                ],
-                Codec::Av1 => &[(w!("Av1ColorBitDepth"), COLOR_BIT_DEPTH_10)],
-                Codec::H264 | Codec::PyroWave => return false,
-            };
-            for (name, value) in depth_props {
-                if ((*(*comp.0).vtbl).set_property)(comp.0, name.0, AmfVariant::from_i64(*value))
-                    != sys::AMF_OK
-                {
-                    return false;
-                }
+    let Ok(mut comp) = lib.create_component(&ctx, props.component) else {
+        return false;
+    };
+    // Usage must be set before `Init` (header default is N/A).
+    if comp.set_property(props.usage, AmfVariant::from_i64(usage_from_knobs(codec))) != sys::AMF_OK
+    {
+        return false;
+    }
+    if ten_bit {
+        // Same required 10-bit props as a real session — reject here is the probe's answer.
+        let depth_props: &[(&HSTRING, i64)] = match codec {
+            Codec::H265 => &[
+                (h!("HevcProfile"), HEVC_PROFILE_MAIN_10),
+                (h!("HevcColorBitDepth"), COLOR_BIT_DEPTH_10),
+            ],
+            Codec::Av1 => &[(h!("Av1ColorBitDepth"), COLOR_BIT_DEPTH_10)],
+            Codec::H264 | Codec::PyroWave => return false,
+        };
+        for (name, value) in depth_props {
+            if comp.set_property(name, AmfVariant::from_i64(*value)) != sys::AMF_OK {
+                return false;
             }
         }
-        let surface = if ten_bit {
-            sys::AMF_SURFACE_P010
-        } else {
-            sys::AMF_SURFACE_NV12
-        };
-        ((*(*comp.0).vtbl).init)(comp.0, surface, 640, 480) == sys::AMF_OK
     }
+    let surface = if ten_bit {
+        sys::AMF_SURFACE_P010
+    } else {
+        sys::AMF_SURFACE_NV12
+    };
+    comp.init(surface, 640, 480) == sys::AMF_OK
 }
 
 /// D3D11 device on the selected render adapter; OS default hardware adapter if unresolved.
@@ -1547,53 +1633,36 @@ enum DrainOutcome {
 }
 
 /// One `QueryOutput`. Blocks up to the component's `QueryTimeout` when [`set_query_timeout`]
-/// took, else returns [`DrainOutcome::NotReady`] at once.
-///
-/// # Safety
-/// `comp` is live and only the retrieve thread calls this on it — AMF documents `SubmitInput`
-/// and `QueryOutput` as a submit/retrieve thread pair, which is the whole reason this is a free
-/// fn taking a raw pointer.
-unsafe fn drain_one_output(
-    comp: *mut sys::AmfComponent,
-    output_data_type: PCWSTR,
+/// took, else returns [`DrainOutcome::NotReady`] at once. Only the retrieve thread calls this —
+/// AMF documents `SubmitInput` and `QueryOutput` as a submit/retrieve thread pair.
+fn drain_one_output(
+    comp: &Component,
+    output_data_type: &HSTRING,
     output_key_max: i64,
 ) -> Result<DrainOutcome> {
-    // SAFETY: `QueryOutput` fills `data` with an owned ref only when it returns one; non-null
-    // moves into `OwnedData`. `QueryInterface(IID_AMFBuffer)` AddRefs (slot-2 release). Host
-    // memory is valid until buffer release: copy to `Vec` before the guards drop.
-    let mut data: *mut sys::AmfData = ptr::null_mut();
-    let r = ((*(*comp).vtbl).query_output)(comp, &mut data);
-    if data.is_null() {
+    let (r, data) = comp.query_output();
+    let Some(data) = data else {
         return match r {
             sys::AMF_EOF => Ok(DrainOutcome::Eof),
             sys::AMF_OK | sys::AMF_REPEAT | sys::AMF_NEED_MORE_INPUT => Ok(DrainOutcome::NotReady),
             // Typed failure on this frame (device-lost, …) — caller resets in place.
             other => bail!("AMF QueryOutput failed: {} ({other})", result_name(other)),
         };
-    }
-    let data = OwnedData(data);
+    };
     // Keyframe from output type, OR the forced flag so a driver that skips the property still flags.
-    let mut var = AmfVariant::zeroed();
-    let key_prop = ((*(*data.0).vtbl).get_property)(data.0, output_data_type.0, &mut var)
-        == sys::AMF_OK
-        && var.as_i64().is_some_and(|t| t <= output_key_max);
-    let mut buf: *mut c_void = ptr::null_mut();
-    amf_ok(
-        ((*(*data.0).vtbl).query_interface)(data.0, &sys::IID_AMF_BUFFER, &mut buf),
-        "AMF QueryInterface(AMFBuffer)",
-    )?;
-    if buf.is_null() {
-        bail!("AMF output is not an AMFBuffer");
-    }
-    // AMFData-prefix guard: slot 2 is Release on every vtable.
-    let buf_guard = OwnedData(buf as *mut sys::AmfData);
-    let buf = buf_guard.0 as *mut sys::AmfBuffer;
-    let size = ((*(*buf).vtbl).get_size)(buf);
-    let native = ((*(*buf).vtbl).get_native)(buf);
+    let key_prop = data
+        .get_property(output_data_type)
+        .and_then(|v| v.as_i64())
+        .is_some_and(|t| t <= output_key_max);
+    let buf = data.query_buffer()?;
+    let size = buf.size();
+    let native = buf.native();
     if native.is_null() || size == 0 {
         bail!("AMF output buffer is empty");
     }
-    let data = std::slice::from_raw_parts(native as *const u8, size).to_vec();
+    // SAFETY: an encoder output is host memory AMF has filled: `native` addresses `size`
+    // initialized bytes until `buf` is released, and they are copied out before that.
+    let data = unsafe { std::slice::from_raw_parts(native.cast::<u8>(), size) }.to_vec();
     Ok(DrainOutcome::Frame { data, key_prop })
 }
 
@@ -1659,7 +1728,8 @@ impl AmfEncoder {
         let pts_100ns = self.frame_idx * 10_000_000 / self.fps.max(1) as i64;
         self.frame_idx += 1;
         // LTR decisions before borrowing `inner`: the test hook re-enters `&mut self`, and
-        // PCWSTR copies let the surface block set props without re-borrowing `self.props`.
+        // `&'static` name copies let the surface block set props without re-borrowing
+        // `self.props`.
         let ltr_names = self
             .props
             .ltr
@@ -1716,8 +1786,7 @@ impl AmfEncoder {
         if let Some(name) = self.props.hdr_metadata {
             if self.hdr && inner.hdr_pushed != self.hdr_meta {
                 if let Some(m) = self.hdr_meta {
-                    // SAFETY: live context/component pair, encode thread (`push_hdr_metadata`).
-                    match unsafe { push_hdr_metadata(inner.ctx.0, inner.comp.0, name, &m) } {
+                    match push_hdr_metadata(&inner.ctx, &inner.comp, name, &m) {
                         Ok(()) => tracing::debug!(
                             "AMF HDR mastering metadata attached (in-band on keyframes)"
                         ),
@@ -1756,157 +1825,123 @@ impl AmfEncoder {
         }
         let slot = inner.next % RING;
         inner.next += 1;
-        // SAFETY: `src`/`dst` are same-format, same-size, same-device (ring rebuilt on device
-        // change). `CopySubresourceRegion` on the protected immediate context is a valid GPU copy.
-        // The surface moves into `OwnedData`; SubmitInput takes the component's own reference, so
-        // our release frees nothing in flight. `held` keeps the texture under it alive.
-        unsafe {
-            // The texture the hardware will read: the caller's own when it declared a depth deep
-            // enough to leave it alone, else our copy of it.
-            let source = if in_place.is_some() {
-                frame.texture.clone()
-            } else {
-                let src: ID3D11Resource = frame.texture.cast().context("texture -> resource")?;
-                let dst: ID3D11Resource = inner.ring[slot].cast().context("ring -> resource")?;
+        // The texture the hardware will read: the caller's own when it declared a depth deep
+        // enough to leave it alone, else our copy of it.
+        let source = if in_place.is_some() {
+            frame.texture.clone()
+        } else {
+            let src: ID3D11Resource = frame.texture.cast().context("texture -> resource")?;
+            let dst: ID3D11Resource = inner.ring[slot].cast().context("ring -> resource")?;
+            // SAFETY: `src`/`dst` are same-format, same-size textures on one device (the ring is
+            // rebuilt on a device change); the immediate context is multithread-protected.
+            unsafe {
                 inner
                     .dctx
-                    .CopySubresourceRegion(&dst, 0, 0, 0, 0, &src, 0, None);
-                inner.ring[slot].clone()
+                    .CopySubresourceRegion(&dst, 0, 0, 0, 0, &src, 0, None)
             };
-            // Kept alive until its AU is out (see `Inner::held`).
-            inner.held.push_back(source.clone());
-            while inner.held.len() > RING {
-                inner.held.pop_front();
-            }
-
-            let mut surf: *mut sys::AmfData = ptr::null_mut();
-            amf_ok(
-                ((*(*inner.ctx.0).vtbl).create_surface_from_dx11_native)(
-                    inner.ctx.0,
-                    source.as_raw(),
-                    &mut surf,
-                    ptr::null_mut(),
-                ),
-                "AMF CreateSurfaceFromDX11Native",
-            )?;
-            if surf.is_null() {
-                bail!("AMF CreateSurfaceFromDX11Native returned null");
-            }
-            let surf = OwnedData(surf);
-            ((*(*surf.0).vtbl).set_pts)(surf.0, pts_100ns);
-            if forced {
-                // Forced IDR/KEY + in-band headers. Log-and-continue: reject still encodes.
-                let r = ((*(*surf.0).vtbl).set_property)(
-                    surf.0,
-                    self.props.force_picture_type.0,
-                    AmfVariant::from_i64(self.props.force_idr_value),
+            inner.ring[slot].clone()
+        };
+        // Kept alive until its AU is out (see `Inner::held`).
+        inner.held.push_back(source.clone());
+        while inner.held.len() > RING {
+            inner.held.pop_front();
+        }
+        // SAFETY: `source` is on the context's device (`ensure_inner` rebinds on a device
+        // change) and `held` keeps it until RING newer submits or Terminate; in-flight never
+        // exceeds RING.
+        let surf = unsafe { inner.ctx.create_surface_from_dx11(&source) }?;
+        surf.set_pts(pts_100ns);
+        if forced {
+            // Forced IDR/KEY + in-band headers. Log-and-continue: reject still encodes.
+            let r = surf.set_property(
+                self.props.force_picture_type,
+                AmfVariant::from_i64(self.props.force_idr_value),
+            );
+            if r != sys::AMF_OK {
+                tracing::warn!(
+                    result = result_name(r),
+                    amf_code = r,
+                    "AMF forced-keyframe picture type rejected"
                 );
+                // Only the component's first frame is an IDR without the property; flagging
+                // any other AU a keyframe hands the client a join point that is not one.
+                forced = opening;
+            }
+            match self.codec {
+                Codec::H264 => {
+                    let _ = surf.set_property(h!("InsertSPS"), AmfVariant::from_bool(true));
+                    let _ = surf.set_property(h!("InsertPPS"), AmfVariant::from_bool(true));
+                }
+                Codec::H265 => {
+                    let _ = surf.set_property(h!("HevcInsertHeader"), AmfVariant::from_bool(true));
+                }
+                // KEY_FRAME_ALIGNED already puts a sequence header OBU on every key frame.
+                Codec::Av1 => {}
+                Codec::PyroWave => unreachable!("PyroWave never opens the AMF backend"),
+            }
+        }
+        // LTR mark/force decided above. Best-effort: reject leaves the client on IDR fallback.
+        if let Some((mark_name, force_name)) = ltr_names {
+            if let Some(slot) = mark_slot {
+                let r = surf.set_property(mark_name, AmfVariant::from_i64(slot as i64));
                 if r != sys::AMF_OK {
                     tracing::warn!(
+                        slot,
                         result = result_name(r),
                         amf_code = r,
-                        "AMF forced-keyframe picture type rejected"
+                        "AMF LTR mark rejected"
                     );
-                    // Only the component's first frame is an IDR without the property; flagging
-                    // any other AU a keyframe hands the client a join point that is not one.
-                    forced = opening;
-                }
-                match self.codec {
-                    Codec::H264 => {
-                        let _ = ((*(*surf.0).vtbl).set_property)(
-                            surf.0,
-                            w!("InsertSPS").0,
-                            AmfVariant::from_bool(true),
-                        );
-                        let _ = ((*(*surf.0).vtbl).set_property)(
-                            surf.0,
-                            w!("InsertPPS").0,
-                            AmfVariant::from_bool(true),
-                        );
-                    }
-                    Codec::H265 => {
-                        let _ = ((*(*surf.0).vtbl).set_property)(
-                            surf.0,
-                            w!("HevcInsertHeader").0,
-                            AmfVariant::from_bool(true),
-                        );
-                    }
-                    // KEY_FRAME_ALIGNED already puts a sequence header OBU on every key frame.
-                    Codec::Av1 => {}
-                    Codec::PyroWave => unreachable!("PyroWave never opens the AMF backend"),
+                    // The mirror must not claim a slot the hardware never marked.
+                    self.ltr_slots[slot] = None;
                 }
             }
-            // LTR mark/force decided above. Best-effort: reject leaves the client on IDR fallback.
-            if let Some((mark_name, force_name)) = ltr_names {
-                if let Some(slot) = mark_slot {
-                    let r = ((*(*surf.0).vtbl).set_property)(
-                        surf.0,
-                        mark_name.0,
-                        AmfVariant::from_i64(slot as i64),
+            if let Some(slot) = force_slot {
+                let r = surf.set_property(force_name, AmfVariant::from_i64(1_i64 << slot));
+                if r == sys::AMF_OK {
+                    tracing::info!(
+                        slot,
+                        frame = cur_idx,
+                        "AMF LTR-RFI: re-referencing known-good LTR (clean recovery, no IDR)"
                     );
-                    if r != sys::AMF_OK {
-                        tracing::warn!(
-                            slot,
-                            result = result_name(r),
-                            amf_code = r,
-                            "AMF LTR mark rejected"
-                        );
-                        // The mirror must not claim a slot the hardware never marked.
-                        self.ltr_slots[slot] = None;
-                    }
-                }
-                if let Some(slot) = force_slot {
-                    let r = ((*(*surf.0).vtbl).set_property)(
-                        surf.0,
-                        force_name.0,
-                        AmfVariant::from_i64(1_i64 << slot),
+                } else {
+                    tracing::warn!(
+                        slot,
+                        result = result_name(r),
+                        amf_code = r,
+                        "AMF LTR force-reference rejected — forcing an IDR on the next frame"
                     );
-                    if r == sys::AMF_OK {
-                        tracing::info!(
-                            slot,
-                            frame = cur_idx,
-                            "AMF LTR-RFI: re-referencing known-good LTR (clean recovery, no IDR)"
-                        );
-                    } else {
-                        tracing::warn!(
-                            slot,
-                            result = result_name(r),
-                            amf_code = r,
-                            "AMF LTR force-reference rejected — forcing an IDR on the next frame"
-                        );
-                        // The host booked a recovery on this frame; make the next one real.
-                        self.force_kf = true;
-                    }
+                    // The host booked a recovery on this frame; make the next one real.
+                    self.force_kf = true;
                 }
             }
-            // Queued before the component takes the frame: the retrieve thread can pop for it the
-            // moment SubmitInput returns, so a push after that races an empty queue. A refusal
-            // below takes the entry back off.
-            lock(&inner.retrieve.out)
-                .pending
-                .push_back((captured.pts_ns, forced, recovery_anchor));
-            let mut r = ((*(*inner.comp.0).vtbl).submit_input)(inner.comp.0, surf.0);
-            // AMF_INPUT_FULL is "busy, drain and retry", not a wedge. Re-submit the same surface.
+        }
+        // Queued before the component takes the frame: the retrieve thread can pop for it the
+        // moment SubmitInput returns, so a push after that races an empty queue. A refusal
+        // below takes the entry back off.
+        lock(&inner.retrieve.out)
+            .pending
+            .push_back((captured.pts_ns, forced, recovery_anchor));
+        let mut r = inner.comp.submit_input(&surf);
+        // AMF_INPUT_FULL is "busy, drain and retry", not a wedge. Re-submit the same surface.
+        if r == sys::AMF_INPUT_FULL {
+            let deadline = std::time::Instant::now() + INPUT_DRAIN_BUDGET;
+            loop {
+                // The retrieve thread drains; this only re-offers the same surface until a
+                // slot opens, on the same budget the drain loop used to run on.
+                std::thread::sleep(std::time::Duration::from_micros(250));
+                r = inner.comp.submit_input(&surf);
+                if r != sys::AMF_INPUT_FULL || std::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+        // NEED_MORE_INPUT = accepted; no AU owed for this submit alone.
+        if !matches!(r, sys::AMF_OK | sys::AMF_NEED_MORE_INPUT) {
+            lock(&inner.retrieve.out).pending.pop_back();
             if r == sys::AMF_INPUT_FULL {
-                let deadline = std::time::Instant::now() + INPUT_DRAIN_BUDGET;
-                loop {
-                    // The retrieve thread drains; this only re-offers the same surface until a
-                    // slot opens, on the same budget the drain loop used to run on.
-                    std::thread::sleep(std::time::Duration::from_micros(250));
-                    r = ((*(*inner.comp.0).vtbl).submit_input)(inner.comp.0, surf.0);
-                    if r != sys::AMF_INPUT_FULL || std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                }
+                bail!("AMF SubmitInput stayed AMF_INPUT_FULL past the drain budget — wedged");
             }
-            // NEED_MORE_INPUT = accepted; no AU owed for this submit alone.
-            if !matches!(r, sys::AMF_OK | sys::AMF_NEED_MORE_INPUT) {
-                lock(&inner.retrieve.out).pending.pop_back();
-                if r == sys::AMF_INPUT_FULL {
-                    bail!("AMF SubmitInput stayed AMF_INPUT_FULL past the drain budget — wedged");
-                }
-                bail!("AMF SubmitInput failed: {} ({r})", result_name(r));
-            }
+            bail!("AMF SubmitInput failed: {} ({r})", result_name(r));
         }
         Ok(())
     }
@@ -2068,78 +2103,66 @@ impl Encoder for AmfEncoder {
     fn reset(&mut self) -> bool {
         self.force_kf = true;
         self.resets_without_output = self.resets_without_output.saturating_add(1);
-        if self.inner.is_none() {
+        // Taken so the rebuild can borrow `self` beside it; put back only once it is live again.
+        let Some(mut inner) = self.inner.take() else {
             return true; // next submit rebuilds lazily
-        }
-        // Second no-output reset: the fault is the context. Drop `inner` before borrowing it.
+        };
+        // Second no-output reset: the fault is the context.
         if self.resets_without_output >= 2 {
             tracing::warn!(
                 resets = self.resets_without_output,
                 "AMF stall persisted across in-place re-Init — full context teardown, reopening a \
                  fresh context (next submit)"
             );
-            self.inner = None;
+            drop(inner);
             self.bound_device = 0;
             self.ir_active = false;
             self.ltr_active = false;
             return true;
         }
-        let inner = self
-            .inner
-            .as_mut()
-            .expect("inner is Some — checked above and not cleared since");
         // Stop and join before Terminate: the retrieve thread is inside `QueryOutput` on this
         // very component, and a re-Init under it would run against a terminated one.
         inner.retrieve.stop_and_join();
         inner.retrieve.reset_queues(); // owed AUs forfeited; rebuilt stream restarts at IDR
         inner.next = 0; // the rebuilt component's first frame is `opening` again
         inner.hdr_pushed = None; // re-Init'd component needs HDR metadata again
-
-        // SAFETY: live component, encode thread, no AMF call in flight. Flush/Terminate are
-        // legal on a wedge (results ignored); apply_static_props + init rebuild it.
-        let rebuilt = unsafe {
-            let comp = inner.comp.0;
-            ((*(*comp).vtbl).flush)(comp);
-            ((*(*comp).vtbl).terminate)(comp);
-            // VCN may read an input surface until Terminate returns; only then can they go.
-            inner.held.clear();
-            let fmt = if self.ten_bit {
-                sys::AMF_SURFACE_P010
-            } else {
-                sys::AMF_SURFACE_NV12
-            };
-            match self.apply_static_props(comp) {
-                Ok((ir, ltr)) => {
-                    self.ir_active = ir;
-                    // Re-Init voids reference history; drop prior LTR marks.
-                    self.ltr_active = ltr;
-                    self.ltr_slots = [None; NUM_LTR_SLOTS];
-                    self.next_ltr_slot = 0;
-                    self.pending_force = None;
-                    ((*(*comp).vtbl).init)(comp, fmt, self.width as i32, self.height as i32)
-                        == sys::AMF_OK
+        let fmt = if self.ten_bit {
+            sys::AMF_SURFACE_P010
+        } else {
+            sys::AMF_SURFACE_NV12
+        };
+        // The joined thread dropped its clone, so this is the only reference.
+        let rebuilt = match Arc::get_mut(&mut inner.comp) {
+            Some(comp) => {
+                // Legal on a wedge; results ignored.
+                comp.flush();
+                comp.terminate();
+                // VCN may read an input surface until Terminate returns; only then can they go.
+                inner.held.clear();
+                match self.apply_static_props(comp) {
+                    Ok((ir, ltr)) => {
+                        self.ir_active = ir;
+                        // Re-Init voids reference history; drop prior LTR marks.
+                        self.ltr_active = ltr;
+                        self.ltr_slots = [None; NUM_LTR_SLOTS];
+                        self.next_ltr_slot = 0;
+                        self.pending_force = None;
+                        comp.init(fmt, self.width as i32, self.height as i32) == sys::AMF_OK
+                    }
+                    Err(_) => false,
                 }
-                Err(_) => false,
             }
+            // Unreachable once joined; a failed rebuild tears the context down.
+            None => false,
         };
         if rebuilt {
             // The component is live again, so it needs its retrieve thread back. Without one no
             // AU would ever be taken off it and the rebuild would read as a second wedge.
-            let comp = self
-                .inner
-                .as_ref()
-                .expect("inner is Some — checked above and not cleared since")
-                .comp
-                .0;
-            // SAFETY: `comp` is the component just re-initialized on this thread, with its
-            // retrieve thread joined, so nothing else is calling into it.
-            let blocking = unsafe { set_query_timeout(comp, self.props.query_timeout) };
-            match Retrieve::start(comp, &self.props, blocking) {
+            let blocking = set_query_timeout(&inner.comp, self.props.query_timeout);
+            match Retrieve::start(Arc::clone(&inner.comp), &self.props, blocking) {
                 Ok(r) => {
-                    self.inner
-                        .as_mut()
-                        .expect("inner is Some — checked above and not cleared since")
-                        .retrieve = r;
+                    inner.retrieve = r;
+                    self.inner = Some(inner);
                     tracing::info!(
                         "AMF encoder rebuilt in place (Terminate + re-Init on the same context)"
                     );
@@ -2149,7 +2172,7 @@ impl Encoder for AmfEncoder {
                         error = %format!("{e:#}"),
                         "AMF rebuilt but its retrieve thread would not start — reopening lazily"
                     );
-                    self.inner = None;
+                    drop(inner);
                     self.bound_device = 0;
                 }
             }
@@ -2157,7 +2180,7 @@ impl Encoder for AmfEncoder {
             self.ir_active = false;
             self.ltr_active = false;
             tracing::warn!("AMF in-place re-Init failed — full context teardown, reopening lazily");
-            self.inner = None;
+            drop(inner);
             self.bound_device = 0;
         }
         true
@@ -2167,8 +2190,9 @@ impl Encoder for AmfEncoder {
     /// the requested rate. Without this, ABR never learns `encoder_ceiling_kbps` on AMD.
     fn applied_bitrate_bps(&self) -> Option<u64> {
         let inner = self.inner.as_ref()?;
-        // SAFETY: live component, session thread, no AMF call in flight; out-param is a local.
-        unsafe { get_prop_i64(inner.comp.0, self.props.target_bitrate) }
+        inner
+            .comp
+            .get_prop_i64(self.props.target_bitrate)
             .filter(|&b| b > 0)
             .map(|b| b as u64)
     }
@@ -2182,17 +2206,18 @@ impl Encoder for AmfEncoder {
             return true;
         };
         // Target/Peak/VBV are dynamic: SetProperty retargets without Terminate (no IDR).
-        // SAFETY: live component, encode thread, no AMF call in flight.
-        let applied = unsafe {
+        let applied = {
             let p = &self.props;
-            let comp = inner.comp.0;
-            let ok = set_prop(comp, p.target_bitrate, AmfVariant::from_i64(bps_i), false)
+            let comp = &inner.comp;
+            let ok = comp
+                .set_prop(p.target_bitrate, AmfVariant::from_i64(bps_i), false)
                 .unwrap_or(false)
-                && set_prop(comp, p.peak_bitrate, AmfVariant::from_i64(bps_i), false)
+                && comp
+                    .set_prop(p.peak_bitrate, AmfVariant::from_i64(bps_i), false)
                     .unwrap_or(false);
             if ok {
                 // Optional VBV rescale; decline keeps the old buffer (HRD absorbs the mismatch).
-                let _ = set_prop(comp, p.vbv_size, AmfVariant::from_i64(vbv), false);
+                let _ = comp.set_prop(p.vbv_size, AmfVariant::from_i64(vbv), false);
             }
             ok
         };
@@ -2212,8 +2237,8 @@ impl Encoder for AmfEncoder {
         let Some(inner) = self.inner.as_mut() else {
             return Ok(());
         };
-        // SAFETY: live component, owning thread. Drain = EOS; remaining AUs surface until AMF_EOF.
-        let r = unsafe { ((*(*inner.comp.0).vtbl).drain)(inner.comp.0) };
+        // Drain = EOS; remaining AUs surface until AMF_EOF.
+        let r = inner.comp.drain();
         if r != sys::AMF_OK {
             tracing::debug!(
                 result = result_name(r),
@@ -2363,14 +2388,12 @@ mod tests {
             }
         };
         enc.prepare(&device).expect("prepare");
-        let comp = enc
+        let comp = &enc
             .inner
             .as_ref()
             .expect("prepare opened the component")
-            .comp
-            .0;
-        // SAFETY: a live component on this thread; `get_property` only reads it.
-        let skip = unsafe { get_prop_bool(comp, enc.props.skip_frame) };
+            .comp;
+        let skip = comp.get_prop_bool(enc.props.skip_frame);
         assert_eq!(
             skip,
             Some(false),
@@ -3324,48 +3347,29 @@ mod tests {
             return;
         };
         let Ok(lib) = try_factory() else { return };
-        // SAFETY: guards own every created object; `set_prop` on this thread.
-        unsafe {
-            let mut ctx: *mut sys::AmfContext = ptr::null_mut();
-            assert_eq!(
-                ((*(*lib.factory).vtbl).create_context)(lib.factory, &mut ctx),
-                sys::AMF_OK
+        let ctx = lib.create_context().expect("AMF CreateContext");
+        // SAFETY: `device` is declared first, so it outlives `ctx`.
+        assert_eq!(unsafe { ctx.init_dx11(Some(&device)) }, sys::AMF_OK);
+        for codec in [Codec::H264, Codec::H265] {
+            let props = codec_props(codec);
+            let Ok(comp) = lib.create_component(&ctx, props.component) else {
+                eprintln!("skipping {codec:?}: component unavailable");
+                continue;
+            };
+            let _ = comp.set_prop(
+                props.usage,
+                AmfVariant::from_i64(usage_from_knobs(codec)),
+                true,
             );
-            let ctx = Ctx(ctx);
-            assert_eq!(
-                ((*(*ctx.0).vtbl).init_dx11)(ctx.0, device.as_raw(), sys::AMF_DX11_1),
-                sys::AMF_OK
+            let (name, block) = props.intra_refresh.expect("AVC/HEVC define intra-refresh");
+            let blocks = 640u32.div_ceil(block) * 480u32.div_ceil(block);
+            let per_slot = blocks.div_ceil(30).max(1);
+            let applied = comp
+                .set_prop(name, AmfVariant::from_i64(per_slot as i64), false)
+                .expect("optional set_prop never errors");
+            eprintln!(
+                "intra-refresh {codec:?}: {per_slot} units/slot accepted={applied} on this VCN"
             );
-            for codec in [Codec::H264, Codec::H265] {
-                let props = codec_props(codec);
-                let mut comp: *mut sys::AmfComponent = ptr::null_mut();
-                if ((*(*lib.factory).vtbl).create_component)(
-                    lib.factory,
-                    ctx.0,
-                    props.component.0,
-                    &mut comp,
-                ) != sys::AMF_OK
-                    || comp.is_null()
-                {
-                    eprintln!("skipping {codec:?}: component unavailable");
-                    continue;
-                }
-                let comp = Component(comp);
-                let _ = set_prop(
-                    comp.0,
-                    props.usage,
-                    AmfVariant::from_i64(usage_from_knobs(codec)),
-                    true,
-                );
-                let (name, block) = props.intra_refresh.expect("AVC/HEVC define intra-refresh");
-                let blocks = 640u32.div_ceil(block) * 480u32.div_ceil(block);
-                let per_slot = blocks.div_ceil(30).max(1);
-                let applied = set_prop(comp.0, name, AmfVariant::from_i64(per_slot as i64), false)
-                    .expect("optional set_prop never errors");
-                eprintln!(
-                    "intra-refresh {codec:?}: {per_slot} units/slot accepted={applied} on this VCN"
-                );
-            }
         }
     }
 
@@ -3460,35 +3464,19 @@ mod tests {
             }
         };
         assert!(lib.version >= sys::AMF_MIN_VERSION);
-        // SAFETY: CreateContext fills `ctx` only on AMF_OK; InitDX11(null) is AMF's own device
-        // (fail → skip). Guards release every created object once.
-        unsafe {
-            let mut ctx: *mut sys::AmfContext = ptr::null_mut();
-            let r = ((*(*lib.factory).vtbl).create_context)(lib.factory, &mut ctx);
-            assert_eq!(r, sys::AMF_OK, "CreateContext: {}", result_name(r));
-            assert!(!ctx.is_null());
-            let ctx = Ctx(ctx);
-            let r = ((*(*ctx.0).vtbl).init_dx11)(ctx.0, ptr::null_mut(), sys::AMF_DX11_1);
-            if r != sys::AMF_OK {
-                eprintln!(
-                    "skipping: InitDX11(default device) failed ({})",
-                    result_name(r)
-                );
-                return;
-            }
-            let mut comp: *mut sys::AmfComponent = ptr::null_mut();
-            let r = ((*(*lib.factory).vtbl).create_component)(
-                lib.factory,
-                ctx.0,
-                w!("AMFVideoEncoderHW_HEVC").0,
-                &mut comp,
+        let ctx = lib.create_context().expect("AMF CreateContext");
+        // SAFETY: no device is borrowed: AMF creates and owns its own (fail → skip).
+        let r = unsafe { ctx.init_dx11(None) };
+        if r != sys::AMF_OK {
+            eprintln!(
+                "skipping: InitDX11(default device) failed ({})",
+                result_name(r)
             );
-            if r != sys::AMF_OK || comp.is_null() {
-                // Probe answer (no HEVC VCN), not a mirror failure.
-                eprintln!("note: CreateComponent(HEVC) declined ({})", result_name(r));
-                return;
-            }
-            let _comp = Component(comp);
+            return;
+        }
+        if let Err(e) = lib.create_component(&ctx, h!("AMFVideoEncoderHW_HEVC")) {
+            // Probe answer (no HEVC VCN), not a mirror failure.
+            eprintln!("note: CreateComponent(HEVC) declined ({e:#})");
         }
     }
 }
