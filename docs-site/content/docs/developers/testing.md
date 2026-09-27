@@ -41,11 +41,11 @@ Two traps:
 | Host without GameStream | `cargo clippy -p punktfunk-host --no-default-features --features pyrowave --all-targets -- -D warnings` |
 | Guided installer | `cargo test -p punktfunk-setup` and `sh scripts/ci/check-installer-behavior.sh` |
 | Settings table in the docs | `cargo test -p pf-host-config docs_table_is_current` |
-| Windows or Linux code from another OS | `scripts/xcheck.sh windows` or `scripts/xcheck.sh linux` |
+| Windows code from another OS | `scripts/xcheck.sh` |
 
-`scripts/xcheck.sh` type-checks and lints the `#[cfg(target_os = …)]` code of the capture, display
-and frame crates in about a second. It needs the target installed:
-`rustup target add x86_64-pc-windows-msvc` (or `x86_64-unknown-linux-gnu`).
+`scripts/xcheck.sh` type-checks and lints the Windows code of the capture, display and frame crates.
+It needs the target installed: `rustup target add x86_64-pc-windows-msvc`. Linux-only code needs a
+Linux box or container, because pipewire's build script needs the Linux library.
 
 A settings change regenerates the table in [Configuration](/docs/configuration) with
 `UPDATE_SETTINGS_DOCS=1 cargo test -p pf-host-config docs_table_is_current`.
