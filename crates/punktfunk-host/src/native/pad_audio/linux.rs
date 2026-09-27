@@ -7,7 +7,7 @@ use super::*;
 /// A source exists when the PipeWire daemon is reachable (sinks mint lazily at spawn).
 pub(super) fn host_cap(asked: bool) -> bool {
     asked
-        && pf_host_config::knob("PUNKTFUNK_PAD_AUDIO").is_none_or(|v| v != "0")
+        && pf_host_config::row_bool("PUNKTFUNK_PAD_AUDIO")
         && crate::audio::pad_sink::pipewire_reachable()
 }
 

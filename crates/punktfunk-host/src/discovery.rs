@@ -25,23 +25,11 @@ use std::time::Duration;
 
 pub const NATIVE_SERVICE: &str = "_punktfunk._udp.local.";
 
-/// `PUNKTFUNK_MDNS` gate. Default ON; `0|false|off|no` (same off-grammar as
-/// `PUNKTFUNK_ZEROCOPY`) disables both native and GameStream adverts. CLI `--no-mdns` is the
-/// same knob. Multicast-dead environments (bridged Docker, CI netns) otherwise abort the
-/// GameStream plane; clients can still dial a manually-added host.
+/// The `PUNKTFUNK_MDNS` row. Default ON; off disables both native and GameStream adverts.
+/// CLI `--no-mdns` is the same knob. Multicast-dead environments (bridged Docker, CI netns)
+/// otherwise abort the GameStream plane; clients can still dial a manually-added host.
 pub(crate) fn mdns_enabled() -> bool {
-    !pf_host_config::knob("PUNKTFUNK_MDNS")
-        .map(|s| mdns_off_value(&s))
-        .unwrap_or(false)
-}
-
-/// Whether a `PUNKTFUNK_MDNS` value means off. Split from the env read so tests do not race
-/// the process-global env.
-fn mdns_off_value(s: &str) -> bool {
-    matches!(
-        s.trim().to_ascii_lowercase().as_str(),
-        "0" | "false" | "off" | "no"
-    )
+    pf_host_config::row_bool("PUNKTFUNK_MDNS")
 }
 
 pub const NATIVE_PROTO: &str = "punktfunk/1";
@@ -196,7 +184,7 @@ pub fn advertise_native(
 
 #[cfg(test)]
 mod tests {
-    use super::{dns_label, mdns_off_value};
+    use super::dns_label;
 
     #[test]
     fn dns_label_passes_machine_names_through_and_tames_display_names() {
@@ -212,16 +200,5 @@ mod tests {
         assert_eq!(dns_label(""), "punktfunk-host");
         // DNS caps a label at 63 bytes.
         assert!(dns_label(&"a".repeat(200)).len() <= 63);
-    }
-
-    #[test]
-    fn mdns_off_grammar() {
-        for off in ["0", "false", "off", "no", " OFF ", "False"] {
-            assert!(mdns_off_value(off), "{off:?} should disable mDNS");
-        }
-        // Anything else, including set-but-empty, stays on. Same grammar as `PUNKTFUNK_ZEROCOPY`.
-        for on in ["", "1", "true", "yes", "on", "banana"] {
-            assert!(!mdns_off_value(on), "{on:?} should keep mDNS on");
-        }
     }
 }

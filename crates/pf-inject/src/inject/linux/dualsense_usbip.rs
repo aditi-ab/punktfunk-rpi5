@@ -705,14 +705,11 @@ pub fn find_usb_topology() -> Option<UsbTopology> {
     None
 }
 
-/// Prefer usbip DualSense over uhid when `PUNKTFUNK_DUALSENSE_USBIP` is `1`/`true`.
+/// Prefer usbip DualSense over uhid when the `PUNKTFUNK_DUALSENSE_USBIP` row is on.
 ///
 /// Opt-in: this mints a real ALSA card that supersedes the pad-audio sinks.
 pub fn usbip_preferred() -> bool {
-    matches!(
-        pf_host_config::knob("PUNKTFUNK_DUALSENSE_USBIP").as_deref(),
-        Some("1") | Some("true")
-    )
+    pf_host_config::row_bool("PUNKTFUNK_DUALSENSE_USBIP")
 }
 
 #[cfg(test)]

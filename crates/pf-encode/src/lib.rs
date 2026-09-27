@@ -684,13 +684,11 @@ fn open_nvenc(
 }
 
 /// Vulkan Video HEVC/AV1 on AMD/Intel. Default on.
-/// `PUNKTFUNK_VULKAN_ENCODE=0` (`false`/`no`/`off`) is the VAAPI hatch.
+/// The `PUNKTFUNK_VULKAN_ENCODE` row off is the VAAPI hatch.
 /// A failed open falls back to VAAPI. See `design/linux-vulkan-video-encode.md`.
 #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
 fn vulkan_encode_enabled() -> bool {
-    pf_host_config::knob("PUNKTFUNK_VULKAN_ENCODE")
-        .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
-        .unwrap_or(true)
+    pf_host_config::row_bool("PUNKTFUNK_VULKAN_ENCODE")
 }
 
 /// Whether `bit_depth`/`hdr` describes a frame a native planar source can carry: 8-bit SDR is
