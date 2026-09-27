@@ -770,8 +770,7 @@ impl ServiceState {
                 } else {
                     name
                 };
-                h.addr = addr;
-                h.port = port;
+                h.move_to(&addr, port);
                 self.save_known(&known);
                 self.last_probe = Instant::now() - Duration::from_secs(60); // the address moved
             }
@@ -781,19 +780,15 @@ impl ServiceState {
                     tracing::warn!(%key, "forget for an unknown host — ignoring");
                     return;
                 };
-                let gone = known.hosts.remove(i);
-                self.save_known(&known);
-                // A forgotten host leaves no list of what somebody plays behind on disk. The
-                // catalog cache is keyed on the fingerprint, so this is the only moment that
-                // key is still known.
-                pf_client_core::library_cache::forget(&gone.fp_hex);
-                // The resolver already refuses a dangling id, so this is hygiene: without
-                // it, pairing a different box that reuses the id would inherit the choice.
-                let mut settings = trust::Settings::load();
-                if start::clear_default(&mut settings, gone.id.as_deref()) {
-                    settings.save();
+                match pf_client_core::orchestrate::forget_host(&mut known, i) {
+                    Ok(gone) => {
+                        tracing::info!(name = %gone.name, addr = %gone.addr, "host forgotten")
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
+                        self.console.set_notice(format!("Couldn't save — {e:#}"));
+                    }
                 }
-                tracing::info!(name = %gone.name, addr = %gone.addr, "host forgotten");
                 // It may still be advertising, in which case it comes straight back as a
                 // DISCOVERED row — unsaved and unpaired, which is the honest state.
                 self.last_probe = Instant::now() - Duration::from_secs(60);

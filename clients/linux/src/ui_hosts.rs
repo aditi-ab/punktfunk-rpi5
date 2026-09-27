@@ -1598,22 +1598,10 @@ impl HostsPage {
             let (id, addr, port) = (id.map(str::to_string), addr.to_string(), port);
             dialog.connect_response(Some("remove"), move |_, _| {
                 let mut known = KnownHosts::load();
-                let target = known.index_of_card(id.as_deref(), &addr, port);
-                let gone = target.and_then(|i| known.hosts[i].id.clone());
-                // The cached game catalog is keyed by fingerprint and outlives the record
-                // otherwise: forgetting a host must not leave its title list on disk.
-                if let Some(fp) = target.map(|i| known.hosts[i].fp_hex.clone()) {
-                    pf_client_core::library_cache::forget(&fp);
-                }
-                known.remove_card(id.as_deref(), &addr, port);
-                if let Err(e) = known.save() {
-                    let _ = sender.output(HostsOutput::Toast(format!("Couldn't save — {e:#}")));
-                }
-                // The resolver already ignores a dangling pointer, so this is hygiene: without
-                // it a later re-pair of a different box would inherit somebody's old choice.
-                let mut settings = trust::Settings::load();
-                if start::clear_default(&mut settings, gone.as_deref()) {
-                    settings.save();
+                if let Some(i) = known.index_of_card(id.as_deref(), &addr, port) {
+                    if let Err(e) = pf_client_core::orchestrate::forget_host(&mut known, i) {
+                        let _ = sender.output(HostsOutput::Toast(format!("Couldn't save — {e:#}")));
+                    }
                 }
                 sender.input(HostsMsg::Refresh);
             });

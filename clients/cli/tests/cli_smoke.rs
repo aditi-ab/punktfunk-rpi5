@@ -110,6 +110,53 @@ fn default_host_is_set_read_and_cleared() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// `hosts forget` takes what is keyed on the record with it: a default pointing at it and its
+/// cached game list, which a re-pair of another box would otherwise inherit.
+#[test]
+fn forgetting_a_host_clears_its_default_and_cached_catalog() {
+    let home = std::env::temp_dir().join(format!("pf-cli-forget-{}", std::process::id()));
+    let store = home.join("config");
+    let fp = "ab".repeat(32);
+    let catalog = if cfg!(windows) {
+        home.join("punktfunk/cache/library")
+    } else {
+        home.join("punktfunk/library")
+    };
+    std::fs::create_dir_all(&store).expect("scratch config dir");
+    std::fs::create_dir_all(&catalog).expect("scratch cache dir");
+    std::fs::write(
+        store.join("client-known-hosts.json"),
+        format!(r#"{{"hosts":[{{"name":"Desk","addr":"10.0.0.5","port":9777,"fp_hex":"{fp}","paired":true,"id":"rec-1"}}]}}"#),
+    )
+    .expect("seed the store");
+    let settings_file = store.join(if cfg!(windows) {
+        "client-windows-settings.json"
+    } else {
+        "client-gtk-settings.json"
+    });
+    std::fs::write(&settings_file, r#"{"default_host":"rec-1"}"#).expect("seed the default");
+    let cached = catalog.join(format!("{fp}.json"));
+    std::fs::write(&cached, r#"{"games":[],"fetched_at":0}"#).expect("seed the catalog");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_punktfunk"))
+        .args(["hosts", "forget", "Desk"])
+        .env("PUNKTFUNK_CONFIG_DIR", &store)
+        .env("XDG_CACHE_HOME", &home)
+        .env("LOCALAPPDATA", &home)
+        .output()
+        .expect("run punktfunk");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let settings = std::fs::read_to_string(&settings_file).expect("settings written back");
+    assert!(!settings.contains("rec-1"), "{settings}");
+    assert!(!cached.exists(), "the cached catalog outlived the host");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn version_prints_the_crate_version() {
     let out = punktfunk(&["--version"]);

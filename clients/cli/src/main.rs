@@ -130,8 +130,9 @@ punktfunk hosts — the saved-hosts store (shared with the desktop client)
       a changed identity is a decision for a person.
 
   punktfunk hosts forget <host-ref>
-      Remove a saved host, its pinned fingerprint included. A later connect
-      must pair or trust it again."
+      Remove a saved host with its pinned fingerprint and cached game list,
+      and stop opening on it by default. A later connect must pair or trust
+      it again."
             }
             "default-host" => {
                 "\
@@ -734,8 +735,7 @@ from the config directory for a true factory reset."
                     .position(|h| !fp.is_empty() && h.fp_hex.eq_ignore_ascii_case(&fp))
                 {
                     let was = format!("{}:{}", known.hosts[i].addr, known.hosts[i].port);
-                    known.hosts[i].addr = addr.clone();
-                    known.hosts[i].port = port;
+                    known.hosts[i].move_to(&addr, port);
                     return match known.save() {
                         Ok(()) => {
                             println!("moved {was} to {addr}:{port}");
@@ -774,9 +774,8 @@ from the config directory for a true factory reset."
                     Ok(v) => v,
                     Err(code) => return code,
                 };
-                let gone = known.hosts.remove(i);
-                match known.save() {
-                    Ok(()) => {
+                match orchestrate::forget_host(&mut known, i) {
+                    Ok(gone) => {
                         println!("forgot {}", gone.name);
                         OK
                     }
