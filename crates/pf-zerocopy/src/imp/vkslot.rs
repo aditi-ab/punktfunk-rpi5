@@ -149,6 +149,7 @@ struct Timeline {
 
 /// 28-byte push-constant block; must match `cursor_blend.comp`'s `Push`.
 #[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Push {
     pitch: u32,
     surf_w: u32,
@@ -161,7 +162,7 @@ struct Push {
 
 /// 56-byte push-constant block; must match `reframe_buf.comp`'s `Push`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct ReframePush {
     lay: u32,
     axis: u32,
@@ -926,8 +927,7 @@ impl VkSlotBlend {
         gy: u32,
     ) -> Result<vk::CommandBuffer> {
         // SAFETY: caller contract (`# Safety`): previous submit completed, so
-        // the command buffer is re-recordable. Single-thread owner. `bytes`
-        // reborrows `push` (`repr(C)`) for the synchronous copy.
+        // the command buffer is re-recordable. Single-thread owner.
         unsafe {
             let alloc = self
                 .slots
@@ -967,16 +967,12 @@ impl VkSlotBlend {
                 &[alloc.desc],
                 &[],
             );
-            let bytes = std::slice::from_raw_parts(
-                (push as *const Push) as *const u8,
-                std::mem::size_of::<Push>(),
-            );
             d.cmd_push_constants(
                 cmd,
                 self.pipe_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
-                bytes,
+                bytemuck::bytes_of(push),
             );
             d.cmd_dispatch(cmd, gx.max(1), gy.max(1), 1);
             // Release shader writes for the downstream CUDA/NVENC read.
@@ -1158,7 +1154,7 @@ impl VkSlotBlend {
             .cmd;
         // SAFETY: single-thread owner. `dst`'s previous submit completed (fence-waited blend
         // or reframe; reframing sessions never submit ordered). Every info and slice is a
-        // local outliving its synchronous call; `bytes` reborrows a `repr(C)` push block.
+        // local outliving its synchronous call.
         // Shader reads and writes stay inside the slots by `reframe_passes`' geometry.
         unsafe {
             let d = &self.device;
@@ -1190,16 +1186,12 @@ impl VkSlotBlend {
                 &[],
             );
             for (push, gx, gy) in &passes {
-                let bytes = std::slice::from_raw_parts(
-                    (push as *const ReframePush) as *const u8,
-                    std::mem::size_of::<ReframePush>(),
-                );
                 d.cmd_push_constants(
                     cmd,
                     stage.pipe_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    bytes,
+                    bytemuck::bytes_of(push),
                 );
                 d.cmd_dispatch(cmd, (*gx).max(1), (*gy).max(1), 1);
                 // Each pass reads what the one before wrote. Without a barrier between them
