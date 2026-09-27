@@ -84,7 +84,7 @@ impl Shell {
 
     /// The 1 Hz close: the HUD window, the adaptive slot margin, the latch need, and the
     /// presenter line.
-    fn close_present_window(&self, st: &mut StreamState) {
+    fn close_present_window(&mut self, st: &mut StreamState) {
         let [import, submit, fence, acquire, queue_present] = st.win.take_timings();
         // Drained once per window and shared by the HUD and the log line — a
         // second `take_counters` would read zeros.
@@ -143,10 +143,15 @@ impl Shell {
             } else {
                 0
             };
+            #[cfg(target_os = "linux")]
+            let native_zero_copy = self.presenter.take_native_zero_copy();
+            #[cfg(not(target_os = "linux"))]
+            let native_zero_copy = (0u32, 0u32);
             tracing::info!(
                 smoothing = present.smoothing,
                 mode = present.mode,
                 vrr = present.vrr.label(),
+                native_zero_copy = ?native_zero_copy,
                 replaced,
                 q_drop,
                 q_dry,
@@ -216,8 +221,13 @@ impl StreamState {
             // Hand the audio plane the figure it has to hit: the on-glass branch.
             self.publish_e2e(clock_offset_ns, s.displayed_ns, s.pts_ns);
             if let Some(c) = &self.connector {
-                c.hud()
-                    .note_displayed(s.pts_ns, s.decoded_ns, s.submitted_ns, s.displayed_ns);
+                c.hud().note_displayed_split(
+                    s.pts_ns,
+                    s.decoded_ns,
+                    s.submitted_ns,
+                    s.gpu_done_ns,
+                    s.displayed_ns,
+                );
             }
             // Latch miss: glass later than one panel period past submit plus
             // the lead we already applied. Store evictions happen whenever
@@ -345,7 +355,14 @@ impl StreamState {
                 // session presents through the HDR10 path like the H.26x codecs.
                 self.hdr = f.color.is_pq();
                 self.hdr_untonemapped = false;
-                let res = presenter.present(window, FrameInput::PyroWave(f), overlay);
+                // The native lane first: the planes copied into the window's buffer.
+                let res = match presenter.present_native_pyro(f, pts_ns, decoded_ns) {
+                    crate::vk::NativeVkOutcome::Shown => Ok(Presented::Shown),
+                    crate::vk::NativeVkOutcome::Dropped => Ok(Presented::Stale),
+                    crate::vk::NativeVkOutcome::Declined(f) => {
+                        presenter.present(window, FrameInput::PyroWave(f), overlay)
+                    }
+                };
                 (Rung::PyroWave, res.map(Shown::of))
             }
             DecodedImage::Cpu(c) => {
@@ -372,7 +389,14 @@ impl StreamState {
             {
                 self.hdr = d.color.is_pq();
                 self.hdr_untonemapped = false;
-                let res = presenter.present(window, FrameInput::Dmabuf(d), overlay);
+                // The native lane first: the compositor takes the dma-buf itself.
+                let res = match presenter.present_native(d, pts_ns, decoded_ns) {
+                    crate::wl_native::Outcome::Shown => Ok(Presented::Shown),
+                    crate::wl_native::Outcome::Dropped => Ok(Presented::Stale),
+                    crate::wl_native::Outcome::Declined(d) => {
+                        presenter.present(window, FrameInput::Dmabuf(d), overlay)
+                    }
+                };
                 (Rung::Hardware("hardware"), res.map(Shown::of))
             }
             #[cfg(target_os = "linux")]
@@ -417,7 +441,14 @@ impl StreamState {
             DecodedImage::NativeVk(v) if !self.health.demoted => {
                 self.hdr = v.color.is_pq();
                 self.hdr_untonemapped = false;
-                let res = presenter.present(window, FrameInput::NativeVk(v), overlay);
+                // The native lane first: a copy of the picture as the window's buffer.
+                let res = match presenter.present_native_vk(v, pts_ns, decoded_ns) {
+                    crate::vk::NativeVkOutcome::Shown => Ok(Presented::Shown),
+                    crate::vk::NativeVkOutcome::Dropped => Ok(Presented::Stale),
+                    crate::vk::NativeVkOutcome::Declined(v) => {
+                        presenter.present(window, FrameInput::NativeVk(v), overlay)
+                    }
+                };
                 (Rung::Hardware("native vulkan"), res.map(Shown::of))
             }
             DecodedImage::NativeVk(_) => return Ok(false), // demoted — drain until rebuild

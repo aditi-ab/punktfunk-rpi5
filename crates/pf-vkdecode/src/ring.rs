@@ -263,6 +263,15 @@ pub(crate) struct UploadedAu {
 /// Timeline `(semaphore, value)` signalled by the submit that consumed the slot.
 pub(crate) type Token = (vk::Semaphore, u64);
 
+/// One ring backing: the buffer, its memory, the mapping, and the export if asked.
+struct Backing {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    #[cfg(unix)]
+    dmabuf: Option<std::os::fd::OwnedFd>,
+}
+
 /// Buffer + memory + persistent map. The spec requires the src buffer to be
 /// profile-listed.
 pub(crate) struct BitstreamRing {
@@ -272,10 +281,18 @@ pub(crate) struct BitstreamRing {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     ptr: *mut u8,
+    /// Export the memory as a dma-buf ([`Self::dmabuf_fd`]).
+    export: bool,
+    #[cfg(unix)]
+    dmabuf: Option<std::os::fd::OwnedFd>,
     pub(crate) pending: SlotStates<Token>,
 }
 
 impl BitstreamRing {
+    /// `export`: also hand the memory out as a dma-buf, so the owner can wait the decode
+    /// through the kernel's own GEM interface. Needs `VK_KHR_external_memory_fd` on the
+    /// device; a refused export leaves [`Self::dmabuf_fd`] `None`.
+    ///
     /// # Safety
     ///
     /// `dev` wraps live handles ([`crate::DeviceHandles`] contract).
@@ -283,22 +300,33 @@ impl BitstreamRing {
         dev: &DecodeDevice,
         layout: RingLayout,
         profile: DecodeProfile,
+        export: bool,
     ) -> Result<Self, AllocError> {
         // SAFETY: live device; allocate_backing only creates objects it returns.
-        let (buffer, memory, ptr) = unsafe { Self::allocate_backing(dev, &layout, profile)? };
+        let backing = unsafe { Self::allocate_backing(dev, &layout, profile, export)? };
         Ok(Self {
             device: dev.ash().clone(),
             layout,
             profile,
-            buffer,
-            memory,
-            ptr,
+            buffer: backing.buffer,
+            memory: backing.memory,
+            ptr: backing.ptr,
+            export,
+            #[cfg(unix)]
+            dmabuf: backing.dmabuf,
             pending: SlotStates::new(layout.slots as usize),
         })
     }
 
     pub(crate) fn buffer(&self) -> vk::Buffer {
         self.buffer
+    }
+
+    /// The memory as a dma-buf, while this backing lives. A grown ring has a new one.
+    #[cfg(unix)]
+    pub(crate) fn dmabuf_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd as _;
+        self.dmabuf.as_ref().map(|fd| fd.as_raw_fd())
     }
 
     /// # Safety
@@ -308,16 +336,22 @@ impl BitstreamRing {
         dev: &DecodeDevice,
         layout: &RingLayout,
         decode_profile: DecodeProfile,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), AllocError> {
+        export: bool,
+    ) -> Result<Backing, AllocError> {
         let mut chain = decode_profile.chain();
         let profile = chain.wire();
         let mut profile_list =
             vk::VideoProfileListInfoKHR::default().profiles(std::slice::from_ref(profile));
-        let ci = vk::BufferCreateInfo::default()
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut ci = vk::BufferCreateInfo::default()
             .size(layout.buffer_size())
             .usage(vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .push_next(&mut profile_list);
+        if export {
+            ci = ci.push_next(&mut external);
+        }
         // SAFETY: only the buffer and memory created below go in, before any use.
         let mut unwind = unsafe { Unwind::new(dev.ash()) };
         // SAFETY: live device; `ci` roots a chain of locals outliving the call.
@@ -330,10 +364,15 @@ impl BitstreamRing {
             req.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
-        let alloc = vk::MemoryAllocateInfo::default()
+        let mut exportable = vk::ExportMemoryAllocateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
             .memory_type_index(type_index);
-        // SAFETY: live device; `alloc` is a local.
+        if export {
+            alloc = alloc.push_next(&mut exportable);
+        }
+        // SAFETY: live device; `alloc` roots locals outliving the call.
         let memory = unsafe { dev.ash().allocate_memory(&alloc, None)? };
         unwind.memory = memory;
         // SAFETY: fresh buffer + fresh memory of at least the required size.
@@ -344,8 +383,32 @@ impl BitstreamRing {
             dev.ash()
                 .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
         };
+        // A refused export is not a failed ring: the owner just gets no fd to wait on.
+        #[cfg(unix)]
+        let dmabuf = if export {
+            let info = vk::MemoryGetFdInfoKHR::default()
+                .memory(memory)
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            // SAFETY: `memory` is live and was allocated exportable as DMA_BUF.
+            match unsafe { dev.external_memory_fd().get_memory_fd(&info) } {
+                // SAFETY: the fd is the dma-buf the driver just created for this process.
+                Ok(fd) => Some(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) }),
+                Err(e) => {
+                    debug!(error = ?e, "bitstream ring memory does not export as a dma-buf");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         unwind.disarm();
-        Ok((buffer, memory, ptr.cast::<u8>()))
+        Ok(Backing {
+            buffer,
+            memory,
+            ptr: ptr.cast::<u8>(),
+            #[cfg(unix)]
+            dmabuf,
+        })
     }
 
     /// Upload one AU, recycling or growing as needed.
@@ -392,15 +455,19 @@ impl BitstreamRing {
             // Allocate before destroying: a failed grow keeps the old mapping and
             // layout, never a null `ptr` for the next AU that fits.
             // SAFETY: caller's live-device contract.
-            let (buffer, memory, ptr) =
-                unsafe { Self::allocate_backing(dev, &grown, self.profile)? };
+            let backing =
+                unsafe { Self::allocate_backing(dev, &grown, self.profile, self.export)? };
             // SAFETY: every in-flight read was drained above; destroy_backing only
             // touches this ring's own objects.
             unsafe { self.destroy_backing() };
             self.layout = grown;
-            self.buffer = buffer;
-            self.memory = memory;
-            self.ptr = ptr;
+            self.buffer = backing.buffer;
+            self.memory = backing.memory;
+            self.ptr = backing.ptr;
+            #[cfg(unix)]
+            {
+                self.dmabuf = backing.dmabuf;
+            }
             self.pending = SlotStates::new(grown.slots as usize);
         }
 

@@ -105,6 +105,9 @@ pub struct DecodedVkFrame {
     pub picture: u32,
     /// Session generation; `release_frame` routes by this (current vs graveyard).
     pub generation: u64,
+    /// The picture carries TRANSFER_SRC, so a consumer may copy it out
+    /// ([`crate::VkDecoder::copy_out`]).
+    pub copyable: bool,
 }
 
 /// Decode failure. Never panics; device loss is first-class so the session

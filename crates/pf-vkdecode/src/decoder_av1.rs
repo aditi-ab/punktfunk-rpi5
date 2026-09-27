@@ -496,7 +496,7 @@ impl VkDecoder<Av1> {
         let state = unsafe {
             let session = VideoSessionAv1::create(&self.dev, caps, config)?;
             SessionState::create(
-                &self.dev,
+                self,
                 caps,
                 session,
                 DecodeProfile::Av1(key),

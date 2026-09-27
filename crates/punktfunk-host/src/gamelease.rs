@@ -1211,16 +1211,8 @@ fn finish(shared: &Arc<LeaseShared>, on_exit: &OnExit, why: &str, run: Option<Ru
     if let Some(mut run) = run {
         run.flush();
     }
-    shared.set_state(GameState::Exited);
+    report_exit(shared);
     let terminated = shared.is_terminating();
-    crate::events::emit(crate::events::EventKind::GameExited {
-        game: game_event_ref(shared),
-        reason: if terminated {
-            crate::events::GameEndReason::Terminated
-        } else {
-            crate::events::GameEndReason::Exited
-        },
-    });
     if terminated {
         // Host-requested: the caller is already tearing down (or is not).
         tracing::info!(title = %shared.game.title, "the game the host asked to end is gone");
@@ -1228,6 +1220,26 @@ fn finish(shared: &Arc<LeaseShared>, on_exit: &OnExit, why: &str, run: Option<Ru
     }
     tracing::info!(title = %shared.game.title, reason = why, "the launched game exited");
     on_exit();
+}
+
+/// Mark the game exited and emit `game.exited`, once per lease: the watcher and the session's
+/// own exit signals (gamescope's atoms, a nested capture going away) can both see one exit.
+pub fn report_exit(shared: &LeaseShared) {
+    if shared
+        .state
+        .swap(GameState::Exited as u8, Ordering::Relaxed)
+        == GameState::Exited as u8
+    {
+        return;
+    }
+    crate::events::emit(crate::events::EventKind::GameExited {
+        game: game_event_ref(shared),
+        reason: if shared.is_terminating() {
+            crate::events::GameEndReason::Terminated
+        } else {
+            crate::events::GameEndReason::Exited
+        },
+    });
 }
 
 pub fn game_event_ref(shared: &LeaseShared) -> crate::events::GameRefPayload {
@@ -1262,11 +1274,7 @@ pub fn terminate(shared: Arc<LeaseShared>, why: &'static str) {
         // Live watcher reports the exit. Grace expiry / `POST /game/end`
         // already cancelled it, so this is the only reporter left.
         if shared.cancel.load(Ordering::Relaxed) {
-            shared.set_state(GameState::Exited);
-            crate::events::emit(crate::events::EventKind::GameExited {
-                game: game_event_ref(&shared),
-                reason: crate::events::GameEndReason::Terminated,
-            });
+            report_exit(&shared);
         }
     });
 }
@@ -2224,6 +2232,28 @@ mod tests {
         let shared = l.shared();
         terminate(shared.clone(), "test");
         assert!(!shared.is_terminating(), "untracked leases must stay inert");
+    }
+
+    /// A dedicated Steam session sees the exit on gamescope's atoms and the watcher sees it on
+    /// the process scan; hooks hear it once.
+    #[test]
+    fn two_exit_reporters_emit_one_game_exited() {
+        let mut rx = crate::events::bus().subscribe_live();
+        let l = open(
+            req("steam:160", DetectSpec::steam(160), true),
+            Box::new(|| {}),
+        );
+        let shared = l.shared();
+        report_exit(&shared);
+        report_exit(&shared);
+        assert_eq!(shared.state(), GameState::Exited);
+        let mut exited = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::events::EventKind::GameExited { game, .. } = ev.kind {
+                exited += usize::from(game.title == shared.game.title);
+            }
+        }
+        assert_eq!(exited, 1);
     }
 
     #[test]

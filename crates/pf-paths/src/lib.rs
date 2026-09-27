@@ -88,9 +88,10 @@ pub fn seat_record(id: &str) -> PathBuf {
 }
 
 /// `$XDG_DATA_HOME/punktfunk`, else `~/.local/share/punktfunk`. Separate from
-/// [`config_dir`]: a seat home holds a Steam install, not configuration.
-#[cfg(target_os = "linux")]
-fn data_dir() -> PathBuf {
+/// [`config_dir`]: it holds installs (a seat's Steam, managed emulators), and the plugin
+/// runner shares nothing under the config dir.
+#[cfg(not(target_os = "windows"))]
+pub fn data_dir() -> PathBuf {
     xdg_home("XDG_DATA_HOME", ".local/share").join("punktfunk")
 }
 
@@ -108,6 +109,7 @@ fn xdg_home_from(
     fallback: &str,
 ) -> PathBuf {
     value
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| home.map(|h| PathBuf::from(h).join(fallback)))

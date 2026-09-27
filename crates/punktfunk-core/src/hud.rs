@@ -780,6 +780,21 @@ impl Stats {
         submitted_ns: u64,
         displayed_ns: u64,
     ) {
+        self.note_displayed_split(pts_ns, decoded_ns, submitted_ns, 0, displayed_ns);
+    }
+
+    /// [`Self::note_displayed`] with the instant our own GPU work for the present was
+    /// done. Then `latch` is submit → GPU done, ours, and `os_floor` is GPU done → glass:
+    /// the compositor's margin and the vblank, which no pacing on our side gets under.
+    /// `gpu_done_ns` 0 keeps `latch` as submit → glass.
+    pub fn note_displayed_split(
+        &self,
+        pts_ns: u64,
+        decoded_ns: u64,
+        submitted_ns: u64,
+        gpu_done_ns: u64,
+        displayed_ns: u64,
+    ) {
         if !self.live() {
             return;
         }
@@ -796,13 +811,27 @@ impl Stats {
         if let Some(us) = local(displayed_ns, decoded_ns) {
             w.display.push(us);
         }
-        if submitted_ns != 0 {
-            if let (Some(p), Some(l)) = (
-                local(submitted_ns, decoded_ns),
-                local(displayed_ns, submitted_ns),
-            ) {
+        if submitted_ns == 0 {
+            return;
+        }
+        let Some(p) = local(submitted_ns, decoded_ns) else {
+            return;
+        };
+        // A GPU-done stamp before the submit is a clock artefact: fall back to the whole.
+        let split = (gpu_done_ns >= submitted_ns && gpu_done_ns <= displayed_ns)
+            .then(|| local(gpu_done_ns, submitted_ns).zip(local(displayed_ns, gpu_done_ns)))
+            .flatten();
+        match split {
+            Some((ours, floor)) => {
                 w.pace.push(p);
-                w.latch.push(l);
+                w.latch.push(ours);
+                w.os_floor.push(floor);
+            }
+            None => {
+                if let Some(l) = local(displayed_ns, submitted_ns) {
+                    w.pace.push(p);
+                    w.latch.push(l);
+                }
             }
         }
     }
@@ -1094,10 +1123,15 @@ fn equation(s: &StatsSnapshot, ep: Endpoint) -> Option<HudLine> {
         // With the floor shaved, display is already pace alone; the split would count latch twice.
         if floor == 0 && s.pace.is_measured() && s.latch.is_measured() {
             t.push_str(&format!(
-                " (pace {} + latch {})",
+                " (pace {} + latch {}",
                 ms(s.pace.p50_us),
                 ms(s.latch.p50_us)
             ));
+            // A measured, unshaved floor is the compositor's share, named beside ours.
+            if s.os_floor.is_measured() {
+                t.push_str(&format!(" + os floor {}", ms(s.os_floor.p50_us)));
+            }
+            t.push(')');
         }
         terms.push(t);
     }
@@ -1307,11 +1341,20 @@ fn standard_lines(s: &StatsSnapshot, tier: StatsVerbosity) -> Vec<HudLine> {
             ));
         }
         if floor == 0 && s.pace.is_measured() && s.latch.is_measured() {
-            spread.push(format!(
-                "display queue {} + render {} ms (incl. vsync)",
-                ms(s.pace.mean_us),
-                ms(s.latch.mean_us)
-            ));
+            spread.push(if s.os_floor.is_measured() {
+                format!(
+                    "display queue {} + render {} + compositor {} ms",
+                    ms(s.pace.mean_us),
+                    ms(s.latch.mean_us),
+                    ms(s.os_floor.mean_us)
+                )
+            } else {
+                format!(
+                    "display queue {} + render {} ms (incl. vsync)",
+                    ms(s.pace.mean_us),
+                    ms(s.latch.mean_us)
+                )
+            });
         }
         if !spread.is_empty() {
             out.push(line(Role::Detail, spread));
@@ -1434,6 +1477,49 @@ mod tests {
         // Without glass stamps the unsplit figure stands alone rather than a zero latch.
         s.latch = Summary::default();
         assert!(!all(&s, StatsVerbosity::Detailed, true).contains("pace 1.1"));
+    }
+
+    /// A desktop compositor's share is named, not shaved: the headline stays the glass truth.
+    #[test]
+    fn a_measured_compositor_floor_is_named_beside_latch() {
+        let mut s = desktop();
+        s.display = sum(119, 12_400, 14_000);
+        s.pace = sum(119, 400, 600);
+        s.latch = sum(119, 1_200, 1_500);
+        s.os_floor = sum(119, 10_800, 12_000);
+        let text = all(&s, StatsVerbosity::Detailed, true);
+        assert!(
+            text.contains("display 12.4 (pace 0.4 + latch 1.2 + os floor 10.8)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_gpu_done_stamp_splits_latch_from_the_floor() {
+        let st = Stats::new(Arc::new(AtomicI64::new(0)));
+        st.set_enabled(true, &Counters::default());
+        // decoded → submitted 400 µs → GPU done 1.6 ms → glass 12.4 ms.
+        st.note_displayed_split(
+            1,
+            1_000_000_000,
+            1_000_400_000,
+            1_001_600_000,
+            1_012_400_000,
+        );
+        // A GPU stamp before the submit cannot split: latch stays submit → glass.
+        st.note_displayed_split(
+            2,
+            2_000_000_000,
+            2_000_400_000,
+            2_000_100_000,
+            2_012_400_000,
+        );
+        let s = st.drain(&Counters::default());
+        assert_eq!(s.pace.n, 2);
+        assert_eq!(s.latch.n, 2);
+        assert_eq!(s.os_floor.n, 1);
+        assert_eq!(s.os_floor.max_us, 10_800);
+        assert_eq!(s.latch.max_us, 12_000);
     }
 
     #[test]

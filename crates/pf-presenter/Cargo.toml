@@ -52,6 +52,10 @@ pf-zerocopy = { path = "../pf-zerocopy" }
 wayland-client = { version = "0.31", features = ["system", "dlopen"] }
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 wayland-sys = { version = "0.31", default-features = false, features = ["client"] }
+# `wl_native`: linux-dmabuf, presentation-time and colour-representation on that same
+# connection; `rustix` reads CLOCK_MONOTONIC to move presentation stamps onto the session clock.
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+rustix = { version = "1", features = ["time"] }
 
 [target.'cfg(windows)'.dependencies]
 sdl3 = { version = "0.18", features = ["hidapi", "ash", "build-from-source"] }

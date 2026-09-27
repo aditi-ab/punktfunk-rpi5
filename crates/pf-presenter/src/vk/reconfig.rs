@@ -27,6 +27,13 @@ impl Presenter {
     /// Replace the swapchain at the window's current size. A zero-size (minimized) window
     /// keeps the old swapchain and any image already acquired from it.
     pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
+        // The native lane owns the window: no surface to size. The next frame through the
+        // swapchain path makes both again at the size recorded here.
+        if self.suspended {
+            let (width, height) = window.size_in_pixels();
+            self.extent = vk::Extent2D { width, height };
+            return Ok(());
+        }
         self.quiesce_own()?;
         // SAFETY: `pdev` and `surface` are live handles owned by this presenter.
         let caps = unsafe {
@@ -153,10 +160,11 @@ impl Presenter {
         Ok(())
     }
 
-    /// Swapchain is HDR10/PQ, not a PQ stream tone-mapped onto SDR.
-    /// User-facing "HDR" indicators should report this, not stream signalling.
+    /// Swapchain is HDR10/PQ, or the native lane hands PQ to the compositor with a PQ
+    /// description; not a PQ stream tone-mapped onto SDR by us. User-facing "HDR"
+    /// indicators should report this, not stream signalling.
     pub fn hdr_active(&self) -> bool {
-        self.hdr_active
+        self.hdr_active || (self.native_last && self.native_pq)
     }
 
     /// The swapchain holds 10 bits a channel (SDR or HDR10): an overlay drawn in 8 would band.
@@ -207,6 +215,10 @@ impl Presenter {
         let Some(ext) = &self.hdr_metadata_d else {
             return;
         };
+        // Suspended for the native lane: the rebuilt swapchain gets it pushed again.
+        if self.swapchain == vk::SwapchainKHR::null() {
+            return;
+        }
         // Same generic baseline as the Windows presenter: BT.2020 + D65,
         // 1000-nit mastering, MaxCLL 1000 / MaxFALL 400.
         let m = self.hdr_meta.unwrap_or(punktfunk_core::quic::HdrMeta {

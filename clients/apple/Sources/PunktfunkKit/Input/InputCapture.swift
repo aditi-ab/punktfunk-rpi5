@@ -92,11 +92,10 @@ public final class InputCapture {
     private var cmdKeysDown: Set<UInt32> = []
 
     #if os(macOS)
-    /// Windows VKs the ⌘-chord passthrough sent DOWN (see the keyDown monitor). macOS stops
-    /// delivering keyUp for ordinary keys while Command is held, so the release half of ⌘Q/⌘W/…
-    /// cannot be relied on to arrive through the responder chain at all: these are flushed when
-    /// the last ⌘ comes up (`flushCommandChord`), which is what stands between the host and a
-    /// key held down for the rest of the session.
+    /// Windows VKs the ⌘-chord passthrough sent DOWN (see the keyDown monitor). AppKit keeps a
+    /// keyUp from the responder chain while Command is held, so the monitor sends these releases
+    /// itself (`takeRelease`). Whatever is still here when the last ⌘ comes up is released then
+    /// (`flushCommandChord`), so a chord key never outlives its ⌘ on the host.
     private var commandChordVKs: Set<UInt32> = []
 
     #endif
@@ -310,9 +309,17 @@ public final class InputCapture {
         // handler detects the combos.)
         #if os(macOS)
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.keyDown]
+            matching: [.keyDown, .keyUp]
         ) { [weak self] event in
             guard let self, self.ownsEvent?(event) ?? true else { return event }
+            if event.type == .keyUp {
+                guard let vk = Self.takeRelease(
+                    event, forwarding: self.forwarding, pressedVKs: self.pressedVKs,
+                    chordVKs: &self.commandChordVKs)
+                else { return event }
+                self.sendKey(vk, down: false)
+                return nil // The monitor owns this release; the responder must not send it again
+            }
             let flags = Self.chordFlags(event)
             // A held chord auto-repeats: swallow the repeats and act on the first press only.
             func take(_ vk: UInt32, _ action: (() -> Void)?) -> NSEvent? {
@@ -611,9 +618,8 @@ public final class InputCapture {
                 cmdKeysDown.insert(vk)
             } else {
                 cmdKeysDown.remove(vk)
-                // Last ⌘ up: release the chord keys whose own keyUp macOS never delivered. BEFORE
-                // the ⌘'s own release goes out, so the host never sees the letter outlive the
-                // modifier it was pressed with.
+                // Last ⌘ up: release the chord keys still held, BEFORE the ⌘'s own release goes
+                // out, so the host never sees the letter outlive the modifier it was pressed with.
                 if cmdKeysDown.isEmpty { flushCommandChord() }
             }
         }
@@ -695,9 +701,22 @@ public final class InputCapture {
         sendKey(vk, down: true)
     }
 
+    /// The keyUp the key monitor sends itself; nil leaves it to the responder chain. AppKit keeps
+    /// a keyUp from `keyUp(with:)` while ⌘ is held, so the monitor takes any held key released
+    /// under ⌘, including one pressed before ⌘ went down. A key the ⌘-chord passthrough pressed
+    /// is taken whatever the modifiers are by its release.
+    static func takeRelease(
+        _ event: NSEvent, forwarding: Bool, pressedVKs: Set<UInt32>, chordVKs: inout Set<UInt32>
+    ) -> UInt32? {
+        guard forwarding, event.type == .keyUp, let vk = keyCodeToVK[event.keyCode]
+        else { return nil }
+        if chordVKs.remove(vk) != nil { return vk }
+        return chordFlags(event).contains(.command) && pressedVKs.contains(vk) ? vk : nil
+    }
+
     /// Release whatever the ⌘-chord passthrough sent down and is still held — called when the last
-    /// physical ⌘ comes up. A keyUp that DID arrive has already taken its VK out of `pressedVKs`,
-    /// so this only fires for the ones macOS swallowed.
+    /// physical ⌘ comes up, so a chord key never outlives its ⌘. A release the key monitor took
+    /// has already removed its VK.
     private func flushCommandChord() {
         // Same cause, different victim: a one-shot latch whose key-up never arrived goes on to eat
         // the NEXT press of that key (⌃⌘F's F, ⌘⎋'s Esc). Once ⌘ is up, a pending latch is stale.

@@ -1,5 +1,5 @@
 //! Managed emulators: hermir, opened on this host's prefix. A plugin only asks; an install runs
-//! on the operator's click and lands under `<config>/emulators/<id>/app`, the folder the plugin
+//! on the operator's click and lands under `<prefix>/<id>/app`, the folder the plugin
 //! is then granted, so its launch templates may point inside it.
 use std::path::{Path, PathBuf};
 
@@ -7,9 +7,14 @@ use hermir::progress::Quiet;
 use hermir::{Hermir, Installed, Options};
 
 /// Where managed emulators live. `%ProgramData%\punktfunk\emulators` on Windows, so the SYSTEM
-/// service installs and the player's session runs; the config dir on POSIX.
+/// service installs and the player's session runs. The data dir on POSIX: a plugin is granted
+/// the emulator's folder, and the runner shares nothing under the config dir.
 pub fn prefix() -> PathBuf {
-    pf_paths::config_dir().join("emulators")
+    #[cfg(windows)]
+    let base = pf_paths::config_dir();
+    #[cfg(not(windows))]
+    let base = pf_paths::data_dir();
+    base.join("emulators")
 }
 
 /// The emulator's own folder: exe, config and saves for a portable one. The path a plugin is

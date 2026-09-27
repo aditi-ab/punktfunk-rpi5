@@ -352,7 +352,7 @@ impl VkDecoder<H264> {
         let state = unsafe {
             let session = VideoSession::create(&self.dev, caps, config)?;
             SessionState::create(
-                &self.dev,
+                self,
                 caps,
                 session,
                 DecodeProfile::H264(std_profile),
