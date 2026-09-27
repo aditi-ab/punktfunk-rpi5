@@ -693,7 +693,8 @@ impl NativeD3d11Decoder {
                     codec: Codec::H265,
                     facts: PictureFacts {
                         colour: colour_of(plan.picture.colour),
-                        keyframe: plan.picture.is_irap,
+                        // IDR only, as on every rung: a CRA's leading pictures may not decode.
+                        keyframe: plan.picture.is_idr,
                         references_clean: plan.picture.references_clean,
                         width: plan.picture.display_crop.width,
                         height: plan.picture.display_crop.height,
