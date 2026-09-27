@@ -274,6 +274,21 @@ impl DecodedImage {
             DecodedImage::NativeVk(f) => (f.width, f.height),
         }
     }
+
+    /// The rung that decoded this frame, as the `stats:` decode-path tag. A machine
+    /// interface: additive only, and surviving tags keep their exact spelling.
+    pub fn path_label(&self) -> &'static str {
+        match self {
+            DecodedImage::Cpu(_) => "software",
+            #[cfg(target_os = "linux")]
+            DecodedImage::NativeDmabuf(_) => "native-vaapi",
+            #[cfg(windows)]
+            DecodedImage::D3d11(_) => "native-d3d11va",
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
+            DecodedImage::PyroWave(_) => "pyrowave",
+            DecodedImage::NativeVk(_) => "native-vulkan",
+        }
+    }
 }
 
 /// Software-decoded 8-bit 4:2:0: Y, Cb, Cr packed back-to-back at each plane's width.
