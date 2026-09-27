@@ -31,6 +31,104 @@ pub struct StageTiming {
     pub p99_us: f32,
 }
 
+/// One stage's p50/p99 over a window's samples.
+pub(crate) fn stage(name: &str, v: &mut [u32]) -> StageTiming {
+    StageTiming {
+        name: name.into(),
+        p50_us: crate::send_pacing::percentile(v, 0.50) as f32,
+        p99_us: crate::send_pacing::percentile(v, 0.99) as f32,
+    }
+}
+
+/// One Windows-driver AU's stages, from the driver encoder's telemetry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DriverSample {
+    /// The driver stamped its slot: pool wait (`None` = unmeasured), its encode, the hand-off.
+    Split {
+        pool: Option<u32>,
+        encode: u32,
+        ipc: u32,
+    },
+    /// Present → arrival in one lump, from a driver that does not stamp. `None` = unmeasured.
+    Lump(Option<u32>),
+}
+
+impl DriverSample {
+    pub(crate) fn from_telemetry(t: Option<&pf_frame::health::EncoderTelemetry>) -> DriverSample {
+        let us = |d: std::time::Duration| d.as_micros().min(u128::from(u32::MAX)) as u32;
+        match t.and_then(|t| t.driver_split) {
+            Some(s) => DriverSample::Split {
+                pool: s.pool.map(us),
+                encode: us(s.encode),
+                ipc: us(s.ipc),
+            },
+            None => DriverSample::Lump(t.and_then(|t| t.present_to_arrival).map(us)),
+        }
+    }
+
+    /// `(queue, encode)` µs for the per-AU host-timing stages; unmeasured reads 0.
+    pub(crate) fn queue_encode_us(self) -> (u32, u32) {
+        match self {
+            DriverSample::Split { pool, encode, .. } => (pool.unwrap_or(0), encode),
+            DriverSample::Lump(lump) => (0, lump.unwrap_or(0)),
+        }
+    }
+}
+
+/// A stats window's driver stages. An unmeasured value adds nothing, never a zero.
+#[derive(Default)]
+pub(crate) struct DriverStages {
+    /// Some AU this window came from the driver.
+    path: bool,
+    /// The driver stamped its split on some AU this window.
+    split: bool,
+    pool: Vec<u32>,
+    encode: Vec<u32>,
+    ipc: Vec<u32>,
+    lump: Vec<u32>,
+}
+
+impl DriverStages {
+    pub(crate) fn note(&mut self, sample: DriverSample) {
+        self.path = true;
+        match sample {
+            DriverSample::Split { pool, encode, ipc } => {
+                self.split = true;
+                self.pool.extend(pool);
+                self.encode.push(encode);
+                self.ipc.push(ipc);
+            }
+            DriverSample::Lump(lump) => self.lump.extend(lump),
+        }
+    }
+
+    /// Some AU this window came from the driver.
+    pub(crate) fn active(&self) -> bool {
+        self.path
+    }
+
+    /// The window's leading stages: `pool encode ipc`, or `driver` from a driver that does
+    /// not stamp. `None` off the driver path, where the plane's host stages apply.
+    pub(crate) fn stages(&mut self) -> Option<Vec<StageTiming>> {
+        if self.split {
+            Some(vec![
+                stage("pool", &mut self.pool),
+                stage("encode", &mut self.encode),
+                stage("ipc", &mut self.ipc),
+            ])
+        } else if self.path {
+            Some(vec![stage("driver", &mut self.lump)])
+        } else {
+            None
+        }
+    }
+
+    /// Start the next window.
+    pub(crate) fn reset(&mut self) {
+        *self = DriverStages::default();
+    }
+}
+
 /// One aggregated sample (~2 s native, ~1 s GameStream).
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct StatsSample {
@@ -227,6 +325,24 @@ impl StatsRecorder {
     /// [`Self::register_session`] again when this moves: the header is per capture.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    /// This loop's session id in the live capture. `cached` holds `(generation, id)`;
+    /// `register` runs again whenever a new capture has started, since the header is per capture.
+    pub fn session_id(
+        &self,
+        cached: &mut Option<(u64, u32)>,
+        register: impl FnOnce() -> u32,
+    ) -> u32 {
+        let generation = self.generation();
+        match *cached {
+            Some((g, id)) if g == generation => id,
+            _ => {
+                let id = register();
+                *cached = Some((generation, id));
+                id
+            }
+        }
     }
 
     /// Per-frame `Relaxed` load: whether this frame should measure.
@@ -460,6 +576,59 @@ fn meta_of(live: &Live) -> CaptureMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unmeasured lump or pool adds no sample; a measured 0 µs pool counts. Both planes
+    /// feed these, so a missing present stamp cannot drag the `driver` p50 to zero.
+    #[test]
+    fn driver_stages_count_what_was_measured_and_nothing_else() {
+        assert_eq!(DriverSample::from_telemetry(None), DriverSample::Lump(None));
+        let mut d = DriverStages::default();
+        assert!(d.stages().is_none());
+        for lump in [None, None, Some(500)] {
+            d.note(DriverSample::Lump(lump));
+        }
+        let lump = d.stages().expect("driver path");
+        assert_eq!(lump.len(), 1);
+        assert_eq!((lump[0].name.as_str(), lump[0].p50_us), ("driver", 500.0));
+
+        d.reset();
+        assert!(!d.active());
+        for pool in [Some(0), Some(0), Some(900), None] {
+            d.note(DriverSample::Split {
+                pool,
+                encode: 2_000,
+                ipc: 40,
+            });
+        }
+        let split = d.stages().expect("split path");
+        let names: Vec<_> = split.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["pool", "encode", "ipc"]);
+        assert_eq!(split[0].p50_us, 0.0);
+        assert_eq!(
+            DriverSample::Split {
+                pool: None,
+                encode: 2_000,
+                ipc: 40
+            }
+            .queue_encode_us(),
+            (0, 2_000)
+        );
+    }
+
+    /// A loop keeps its session id for one capture and registers again for the next.
+    #[test]
+    fn session_id_registers_once_per_capture() {
+        let dir = temp_dir();
+        let rec = StatsRecorder::new(dir.clone());
+        let mut sid = None;
+        rec.start();
+        assert_eq!(rec.session_id(&mut sid, || 7), 7);
+        assert_eq!(rec.session_id(&mut sid, || unreachable!()), 7);
+        let _ = rec.stop();
+        rec.start();
+        assert_eq!(rec.session_id(&mut sid, || 9), 9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn temp_dir() -> PathBuf {
         // Process-wide counter, not a timestamp: parallel tests in the same

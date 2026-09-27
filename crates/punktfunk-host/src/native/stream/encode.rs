@@ -4,6 +4,7 @@
 use super::recovery::{reset_stalled_encoder, run_loop_stage};
 use super::state::{encode_stalled, Flow, StreamState, Tick, MAX_ENCODER_RESETS};
 use super::*;
+use crate::stats_recorder::DriverSample;
 
 // ~20 net behind-frames (≈0.3 s) escalates; warmup skips the first ~1 s of bring-up.
 const DEPTH_ESCALATE: u32 = 20;
@@ -505,14 +506,12 @@ impl StreamState {
                 deadline,
                 encode_us: d.encode_us,
                 queue_us: d.queue_us,
-                ipc_us: d.ipc_us,
-                split: d.split,
                 cap_us: st.cap_us,
                 submit_us: st.submit_us,
                 wait_us: if st.measure { wait_total_us } else { 0 },
                 repeat: st.repeat,
                 was_measured: st.measure,
-                driver: st.owed,
+                driver: d.driver,
             };
             if self.frame_tx.send(SendMsg::Chunk(msg)).is_err() {
                 return Polled::SendGone;
@@ -591,14 +590,12 @@ impl StreamState {
             deadline,
             encode_us: d.encode_us,
             queue_us: d.queue_us,
-            ipc_us: d.ipc_us,
-            split: d.split,
             cap_us: st.cap_us,
             submit_us: st.submit_us,
             wait_us,
             repeat: st.repeat,
             was_measured: st.measure,
-            driver: st.owed,
+            driver: d.driver,
         };
         self.bringup.mark("first_au");
         if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
@@ -829,14 +826,12 @@ impl StreamState {
                 deadline,
                 encode_us,
                 queue_us: 0,
-                ipc_us: 0,
-                split: false,
                 cap_us: 0,
                 submit_us: 0,
                 wait_us: 0,
                 repeat: false,
                 was_measured: false,
-                driver: false,
+                driver: None,
             };
             if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
                 break;
@@ -848,13 +843,11 @@ impl StreamState {
 }
 
 /// What one AU's `queue_us`/`encode_us` mean on its message: the host's own stamps, or the
-/// driver's. `split` = the driver stamped its slot, so `queue_us` is its pool wait, `encode_us`
-/// its encode and `ipc_us` the hand-off; otherwise `encode_us` is present → arrival in one lump.
+/// driver's ([`DriverSample::queue_encode_us`]), whose full sample rides along for the stats.
 struct AuStages {
     queue_us: u32,
     encode_us: u32,
-    ipc_us: u32,
-    split: bool,
+    driver: Option<DriverSample>,
 }
 
 impl AuStages {
@@ -862,29 +855,19 @@ impl AuStages {
         AuStages {
             queue_us,
             encode_us,
-            ipc_us: 0,
-            split: false,
+            driver: None,
         }
     }
 }
 
-/// The driver's stages for the AU just taken. All zero before its first AU.
+/// The driver's stages for the AU just taken. Unmeasured before its first AU.
 fn driver_stages(enc: &dyn crate::encode::Encoder) -> AuStages {
-    let us = |d: std::time::Duration| d.as_micros().min(u128::from(u32::MAX)) as u32;
-    let t = enc.telemetry();
-    match t.as_ref().and_then(|t| t.driver_split) {
-        Some(s) => AuStages {
-            queue_us: s.pool.map_or(0, us),
-            encode_us: us(s.encode),
-            ipc_us: us(s.ipc),
-            split: true,
-        },
-        None => AuStages {
-            queue_us: 0,
-            encode_us: t.and_then(|t| t.present_to_arrival).map_or(0, us),
-            ipc_us: 0,
-            split: false,
-        },
+    let sample = DriverSample::from_telemetry(enc.telemetry().as_ref());
+    let (queue_us, encode_us) = sample.queue_encode_us();
+    AuStages {
+        queue_us,
+        encode_us,
+        driver: Some(sample),
     }
 }
 
