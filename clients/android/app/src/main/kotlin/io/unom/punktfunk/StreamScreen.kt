@@ -23,11 +23,7 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
-import android.widget.Toast
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -72,10 +68,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.LifecycleOwner
-import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.security.IdentityLoad
@@ -93,7 +85,6 @@ import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * The immersive stream. Everything it reads about the session comes from [session] — the settings
@@ -153,29 +144,8 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             ui.motionHint = false
         }
     }
-    // The start-of-stream banner: what this session's shortcuts ARE, said once. A stream takes the
-    // whole screen and answers to none of the device's usual gestures, so it has to say how to get
-    // back out — the desktop console draws the same pill for the same reason
-    // (`pf-console-ui/src/skia_overlay.rs`, BANNER_S = 6 s with a BANNER_FADE_S = 0.6 s tail).
-    // Two states because the fade and the removal are different moments: `bannerUp` composes the
-    // pill at all, `bannerFading` runs its alpha down over the last 600 ms.
-    var bannerUp by remember(handle) { mutableStateOf(true) }
-    var bannerFading by remember(handle) { mutableStateOf(false) }
-    val bannerAlpha by animateFloatAsState(
-        targetValue = if (bannerFading) 0f else 1f,
-        // Linear, like the desktop's (BANNER_S - age) / BANNER_FADE_S ramp — Compose's default
-        // easing would hold near-opaque and then drop, which reads as a glitch rather than a fade.
-        animationSpec = tween(600, easing = LinearEasing),
-        label = "streamStartBanner",
-    )
-    LaunchedEffect(handle) {
-        delay(5400) // 6 s − the 0.6 s tail: fully opaque until here, exactly as on the desktop
-        bannerFading = true
-        delay(600)
-        bannerUp = false // stop composing it once it is invisible
-    }
-    // Live decode stats for the HUD, polled below once the companion panel is known.
-    var statsLines by remember { mutableStateOf<List<HudLine>>(emptyList()) }
+    // The start-of-stream banner: what this session's shortcuts ARE, said once.
+    val banner = rememberStartBanner(handle)
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
     // Passthrough needs a host that injects touch; without the bit every contact would vanish, so
     // the session runs the trackpad model instead and `touchHint` below says so, once.
@@ -201,17 +171,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // How the picture fills the container, and the frame it places: the SurfaceView, the touch and
     // pen lanes and the mouse all map through this one placement (kit `VideoFit`).
     val videoFit = remember(handle) { VideoFit.fromName(initialSettings.videoFit) }
-    // The decoder's picture size once known: a host framing the picture for this device (a join,
-    // a mirrored head) sends a size other than the mode, and the placement follows the frames.
-    var decodedSize by remember(handle) { mutableStateOf<IntArray?>(null) }
-    LaunchedEffect(handle) {
-        while (true) {
-            NativeBridge.nativeVideoDecodedSize(handle)
-                ?.takeIf { it.size >= 2 && it[0] > 0 && it[1] > 0 && !it.contentEquals(decodedSize) }
-                ?.let { decodedSize = it }
-            delay(500)
-        }
-    }
+    val decodedSize by rememberDecodedSize(handle)
     fun videoFrame() = decodedSize?.let { VideoFrame(videoFit, it[0], it[1]) }
         ?: VideoFrame(videoFit, requestedMode.getOrElse(0) { 0 }, requestedMode.getOrElse(1) { 0 })
     val haptics = rememberConsoleHaptics()
@@ -242,30 +202,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         )
     }
 
-    // The virtual controller (design §4): shown from the ring's `pad` slot, per session. While
-    // up it holds one wire pad on the router, so the host sees one controller arrive and, on
-    // hide, one leave (§9). Never toggled by the ring's own open and close (§8 trap 4).
+    // The virtual controller (design §4), shown from the ring's `pad` slot, per session.
     var padShown by remember(handle) { mutableStateOf(false) }
-    var virtualPad by remember(handle) { mutableStateOf<GamepadRouter.ExternalPad?>(null) }
-    // Its kind follows the Controller type setting. Automatic is an Xbox 360 pad, or a
-    // DualSense when this phone's gyro is to speak for it — a 360 has no motion plane.
-    val virtualPadKind = when {
-        initialSettings.gamepad != Gamepad.PREF_AUTO -> initialSettings.gamepad
-        initialSettings.gyroOnPhone -> Gamepad.PREF_DUALSENSE
-        else -> Gamepad.PREF_XBOX360
-    }
-    DisposableEffect(padShown) {
-        val ext = if (padShown) {
-            activity?.gamepadRouter?.openExternal(virtualPadKind, ownMotion = false)
-        } else {
-            null
-        }
-        virtualPad = ext
-        onDispose {
-            ext?.close()
-            virtualPad = null
-        }
-    }
+    val virtualPad by rememberVirtualPad(handle, padShown, initialSettings, activity)
     var touchHint by remember { mutableStateOf(touchUnsupported) }
     LaunchedEffect(touchHint) {
         if (touchHint) {
@@ -315,114 +254,10 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         else -> ui.statsVerbosity
     }
     val statsOn = hudTier != StatsVerbosity.OFF
-    // Read at each poll, so a tier change never blanks the numbers: the effect keys on `statsOn`.
-    val pollTier by rememberUpdatedState(hudTier)
-    LaunchedEffect(handle, statsOn) {
-        // Enabling resets the native window, so re-showing never renders stale data.
-        NativeBridge.nativeSetVideoStatsEnabled(handle, statsOn)
-        if (statsOn) {
-            while (true) {
-                delay(1000)
-                // The panel's LIVE rate, re-read each poll: a governor that ignored the mode pin
-                // leaves the panel below the stream, which the overlay names as a warning line.
-                val display = runCatching { context.display }.getOrNull()
-                statsLines = decodeHudLines(
-                    NativeBridge.nativeVideoStatsLines(
-                        handle, pollTier.ordinal, initialSettings.advancedStats,
-                        display?.refreshRate ?: 0f, display?.mode?.refreshRate ?: 0f,
-                        session.presetName,
-                    ),
-                )
-            }
-        } else {
-            statsLines = emptyList() // drop the last window so a re-show never flashes stale numbers
-        }
-    }
+    val statsLines by rememberStatsLines(session, statsOn, hudTier)
 
-    // Host-gone watchdog. When the host suspends/sleeps (or crashes, or drops off the network) it
-    // stops answering the QUIC keep-alive and the connection idle-times out (~8 s) — no more frames
-    // arrive and the decoder would otherwise sit frozen on its last decoded frame until the user
-    // manually backed out. Poll the native session-liveness flag (one atomic load, independent of the
-    // stats HUD) and, the moment the session is dead, drop back to the menu so the user can
-    // Wake-on-LAN the host instead of being stranded on a frozen picture. Mirrors the Apple client's
-    // onSessionEnd → sessionEnded() → disconnect(). The 1 s cadence + the ~8 s idle timeout is a
-    // deliberately generous window: the keep-alive holds a merely-quiet connection (a static desktop)
-    // open, so this fires only on a genuinely dead peer, never a false positive. Keyed on `handle`, so
-    // it stops the moment we navigate away (the handle is only freed later, in onDispose).
-    LaunchedEffect(handle) {
-        var lastAccessSeq = initialAccess?.getOrNull(2) ?: 0
-        while (true) {
-            delay(1000)
-            // Access first, ended second: a session about to close on its expiry gets its final
-            // countdown read, which is what lets the ended branch word that close honestly.
-            NativeBridge.nativeAccessState(handle)?.let { st ->
-                val grants = st.getOrNull(0) ?: SessionAccess.ALL
-                val seq = st.getOrNull(2) ?: 0
-                if (grants != ui.accessGrants) {
-                    ui.accessGrants = grants
-                    peripherals.applyAccess(grants)
-                }
-                ui.accessRemaining = st.getOrNull(1) ?: 0
-                if (seq != lastAccessSeq) {
-                    lastAccessSeq = seq
-                    // A fresh AccessUpdate close to the deadline is the host's T−5 m / T−1 m
-                    // courtesy warning — surface it. Grant edits (and a warning's grant echo)
-                    // otherwise just move the chip; a toast per edit would be noise.
-                    if (ui.accessRemaining in 1..330) {
-                        val mins = (ui.accessRemaining + 30) / 60
-                        Toast.makeText(
-                            context,
-                            if (mins <= 1) {
-                                "Access expires in about a minute."
-                            } else {
-                                "Access expires in about $mins minutes."
-                            },
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    }
-                }
-            }
-            // The operator's per-session mute rides the control stream, so the badge learns it
-            // on this tick. The local bit is in the same mask — the toggle writes it at once.
-            ui.audioMute = NativeBridge.nativeAudioMute(handle)
-            if (NativeBridge.nativeSessionEnded(handle)) {
-                // WHY it ended decides what the user is told. This used to show the "host may be
-                // asleep" line for EVERY ending — including a game the player had just quit and a
-                // session the host ended on purpose — which reads as a failure report for
-                // something nobody did wrong. Only a connection that actually died says that now.
-                val reason = SessionEndReason.fromNative(NativeBridge.nativeEndReason(handle))
-                when {
-                    // The session died inside the access countdown's final stretch: that IS the
-                    // typed expiry close (ACCESS_EXPIRED), worded with the shared rejection
-                    // sentence rather than the generic host-ended silence. Recognized off the
-                    // countdown because the generic end-reason byte predates the expiry code.
-                    ui.accessRemaining in 1..75 ->
-                        Toast.makeText(
-                            context,
-                            "Your access to this host has expired.",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    reason == SessionEndReason.LOST ->
-                        Toast.makeText(
-                            context,
-                            "Connection lost — the host may be asleep. Wake it to reconnect.",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    reason == SessionEndReason.HOST_ERROR ->
-                        Toast.makeText(
-                            context,
-                            "The host ended the session with an error.",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    // Deliberate endings — the player quit the game, the host was stopped, or we
-                    // closed it. Leaving the stream IS the feedback; a toast would only add noise.
-                    else -> {}
-                }
-                onSessionEnded(reason)
-                return@LaunchedEffect
-            }
-        }
-    }
+    // Host-gone watchdog and the live access level.
+    SessionWatchEffect(handle, initialAccess, ui, peripherals, onSessionEnded)
 
     // One-shot teardown guard. Both the SurfaceView callback and DisposableEffect tear down on the
     // way out, but `nativeClose` frees the handle — so once it's closed, NO path may touch the handle
@@ -481,26 +316,10 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             backOpensRing -> openRingCentred()
         }
     }
-    // Host actions are PRE-FETCHED on the session tick, never fetched when the ring opens: two
-    // of these buttons shut a machine down, and buttons that appear under a moving finger are a
-    // hazard. Empty toward an older host, an unreachable one, or without the record.
-    var hostActions by remember(handle) { mutableStateOf<List<HostActions.Action>>(emptyList()) }
     val hostRecord = remember(session.hostId) {
         session.hostId?.let { id -> KnownHostStore(context).all().firstOrNull { it.id == id } }
     }
-    LaunchedEffect(handle) {
-        val kh = hostRecord ?: return@LaunchedEffect
-        if (kh.fpHex.isEmpty()) return@LaunchedEffect
-        val identity = withContext(Dispatchers.IO) {
-            (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity
-        } ?: return@LaunchedEffect
-        while (true) {
-            hostActions = withContext(Dispatchers.IO) {
-                HostActions.list(identity, kh.address, kh.effectiveMgmtPort, kh.fpHex)
-            }
-            delay(300_000)
-        }
-    }
+    val hostActions by rememberHostActions(handle, hostRecord)
     val scope = rememberCoroutineScope()
 
     // The background keep-alive (Settings › General). Off — the default, and what every build
@@ -509,24 +328,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // outside the app could stop.
     val keepAliveSpan = keepAliveSpanMs(initialSettings, isTv)
     val keepAlive = keepAliveSpan != null
-    var away by remember(handle) { mutableStateOf(false) }
-    val startedAt = remember(handle) { System.currentTimeMillis() }
-    // What the notification says. All of it is fixed at the handshake, so it is read once.
-    val noteHost = hostRecord?.name?.takeIf { it.isNotEmpty() }
-        ?: context.getString(R.string.app_name)
-    val noteTitle = session.launchHold?.game?.title
-    val modeLine = remember(handle) {
-        val mode = NativeBridge.nativeVideoSize(handle)
-        val w = mode?.getOrNull(0) ?: 0
-        val h = mode?.getOrNull(1) ?: 0
-        val hz = mode?.getOrNull(2) ?: 0
-        listOfNotNull(
-            if (w > 0 && h > 0) "$w×$h" else null,
-            if (hz > 0) "$hz Hz" else null,
-            NativeBridge.nativeVideoCodecLabel(handle).takeIf { it.isNotEmpty() },
-        ).joinToString(" · ")
-    }
-    fun note(deadline: Long?) = StreamNote(noteHost, noteTitle, modeLine, startedAt, deadline)
 
     // Ending from a path that fires while the app is already away — minutes after the recomposer
     // paused, so the disposal that `onSessionEnded` schedules will not run until the user comes
@@ -539,58 +340,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         onSessionEnded(reason)
     }
 
-    // The ongoing notification goes up when the session starts, not when the user leaves: an app
-    // already in the background may not start a foreground service, and without that service the
-    // OS freezes the process the moment the app is away — taking the audio and the QUIC traffic
-    // with it. Its End action is the ring's, a deliberate quit that closes the host session.
-    DisposableEffect(handle, keepAlive) {
-        if (keepAlive) {
-            StreamKeepAliveService.onEnd = { endAway(deliberate = true) }
-            StreamKeepAliveService.start(context, note(null))
-        }
-        onDispose {
-            StreamKeepAliveService.onEnd = null
-            StreamKeepAliveService.stop(context)
-        }
-    }
-
-    // Leaving the app (Home, task switch, screen off). Without the keep-alive this MUST end the
-    // session: Android does not suspend a process for going to background, so the native worker
-    // kept running and its QUIC connection kept answering the host's keep-alives — the user long
-    // gone, the host still holding the session (and its display + encoder) open until the OS
-    // reclaimed the process, which on a TV box is effectively never.
-    //
-    // Route it through `onSessionEnded()` so the composable's `onDispose` above runs the one real
-    // teardown path. Deliberately NOT a `nativeDisconnectQuit`: backgrounding isn't a user "quit",
-    // so the host should linger the display and make coming straight back a fast reconnect.
-    DisposableEffect(handle, keepAlive) {
-        val lifecycle = (context as? LifecycleOwner)?.lifecycle
-        val obs = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_STOP -> if (keepAlive) away = true else onSessionEnded(SessionEndReason.LOCAL)
-                Lifecycle.Event.ON_START -> away = false
-                else -> {}
-            }
-        }
-        lifecycle?.addObserver(obs)
-        onDispose { lifecycle?.removeObserver(obs) }
-    }
-
-    // While away the notification counts down instead of up, and the session gets exactly that
-    // long: a host cannot tell a player who walked off from one who is watching, so something has
-    // to decide. Coming back re-keys this effect, which cancels the wait. The give-up is the same
-    // non-deliberate end as backgrounding without the keep-alive — the host lingers the display,
-    // so returning later still reconnects fast.
-    LaunchedEffect(handle, keepAliveSpan, away) {
-        val span = keepAliveSpan ?: return@LaunchedEffect
-        if (!away) {
-            StreamKeepAliveService.update(context, note(null))
-            return@LaunchedEffect
-        }
-        StreamKeepAliveService.update(context, note(System.currentTimeMillis() + span))
-        delay(span)
-        endAway(deliberate = false)
-    }
+    KeepAliveEffects(session, hostRecord, keepAliveSpan, { endAway(it) }, onSessionEnded)
 
     // Auto-engage pointer capture at stream start (setting on + a mouse actually present).
     // Delayed a beat: the grab needs window focus and the capture view attached.
@@ -935,7 +685,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             // and names the setting that fixes it, while the banner repeats shortcuts that will be
             // there next stream too. Two pills sharing an edge for six seconds would cost the reader
             // both.
-            if (bannerUp && !ui.motionHint && !touchHint) OsdScaled {
+            if (banner.up && !ui.motionHint && !touchHint) OsdScaled {
                 StreamStartBanner(
                     text = buildList {
                         if (ui.padPresent) {
@@ -964,7 +714,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                             if (keyboard && !KeyCaptureService.running) add("Alt+` for Alt+Tab")
                         }
                     }.joinToString(" · "),
-                    alpha = bannerAlpha,
+                    alpha = banner.alpha,
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp),
                 )
             }
@@ -1089,8 +839,8 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
 
 /**
  * The virtual controller wherever it is held: overlaid on the picture, alone on the lower half of a
- * fold, or on the companion's controller page. The wire pad itself lives above
- * (`DisposableEffect(padShown)`), so moving the layer never makes the host see a controller reconnect.
+ * fold, or on the companion's controller page. The wire pad itself lives in [rememberVirtualPad],
+ * so moving the layer never makes the host see a controller reconnect.
  */
 @Composable
 private fun PadHalf(pad: GamepadRouter.ExternalPad?, cfg: PadConfig, size: IntSize, haptics: ConsoleHaptics, openRing: () -> Unit) {
