@@ -125,6 +125,10 @@ impl Av1ProfileKey {
 /// not move the value between `wire()` and the last use of the returned reference.
 pub(crate) struct Av1ProfileChain {
     av1: vk::VideoDecodeAV1ProfileInfoKHR<'static>,
+    /// Decode usage hints between the profile and the codec struct. Optional by the
+    /// spec, but Intel's Windows driver walks the chain expecting it and faults on
+    /// the first parameters create without it; FFmpeg always chains it.
+    usage: vk::VideoDecodeUsageInfoKHR<'static>,
     profile: vk::VideoProfileInfoKHR<'static>,
 }
 
@@ -137,6 +141,7 @@ impl Av1ProfileChain {
                 // a grain-less profile would decode a grain stream into pictures
                 // the encoder never intended (module docs).
                 .film_grain_support(key.film_grain),
+            usage: vk::VideoDecodeUsageInfoKHR::default(),
             profile: vk::VideoProfileInfoKHR::default()
                 .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_AV1)
                 .chroma_subsampling(key.chroma_subsampling)
@@ -148,7 +153,8 @@ impl Av1ProfileChain {
     /// Do not move `self` while the returned reference (or any pointer taken
     /// from it) lives.
     pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'static> {
-        self.profile.p_next = (&self.av1 as *const vk::VideoDecodeAV1ProfileInfoKHR<'_>).cast();
+        self.usage.p_next = (&self.av1 as *const vk::VideoDecodeAV1ProfileInfoKHR<'_>).cast();
+        self.profile.p_next = (&self.usage as *const vk::VideoDecodeUsageInfoKHR<'_>).cast();
         &self.profile
     }
 }
@@ -451,13 +457,17 @@ mod tests {
             vk::VideoComponentBitDepthFlagsKHR::TYPE_10
         );
         assert!(!profile.p_next.is_null());
-        // SAFETY: wire() pointed p_next at chain's own av1 field, which lives for
-        // this whole scope and is a valid VideoDecodeAV1ProfileInfoKHR.
-        let av1 = unsafe {
-            &*profile
-                .p_next
-                .cast::<vk::VideoDecodeAV1ProfileInfoKHR<'_>>()
-        };
+        // SAFETY: wire() pointed p_next at chain's own usage field, which lives for
+        // this whole scope and is a valid VideoDecodeUsageInfoKHR.
+        let usage = unsafe { &*profile.p_next.cast::<vk::VideoDecodeUsageInfoKHR<'_>>() };
+        assert_eq!(usage.s_type, vk::StructureType::VIDEO_DECODE_USAGE_INFO_KHR);
+        assert_eq!(
+            usage.video_usage_hints,
+            vk::VideoDecodeUsageFlagsKHR::DEFAULT
+        );
+        // SAFETY: wire() pointed the usage struct's p_next at chain's own av1 field,
+        // which lives for this whole scope and is a valid VideoDecodeAV1ProfileInfoKHR.
+        let av1 = unsafe { &*usage.p_next.cast::<vk::VideoDecodeAV1ProfileInfoKHR<'_>>() };
         assert_eq!(av1.std_profile, STD_PROFILE_MAIN);
         assert_eq!(
             av1.film_grain_support,
@@ -468,9 +478,9 @@ mod tests {
         let plain = Av1ProfileKey::from_stream(0, 1, 10, false).unwrap();
         let mut chain = Av1ProfileChain::new(plain);
         let profile = chain.wire();
-        // SAFETY: as above.
+        // SAFETY: as above — usage struct first, then the chain's own AV1 struct.
         let av1 = unsafe {
-            &*profile
+            &*(*profile.p_next.cast::<vk::VideoDecodeUsageInfoKHR<'_>>())
                 .p_next
                 .cast::<vk::VideoDecodeAV1ProfileInfoKHR<'_>>()
         };
@@ -484,9 +494,9 @@ mod tests {
             profile.video_codec_operation,
             vk::VideoCodecOperationFlagsKHR::DECODE_AV1
         );
-        // SAFETY: as above — the erased chain wires its own AV1 struct.
+        // SAFETY: as above — the erased chain wires its own usage and AV1 structs.
         let av1 = unsafe {
-            &*profile
+            &*(*profile.p_next.cast::<vk::VideoDecodeUsageInfoKHR<'_>>())
                 .p_next
                 .cast::<vk::VideoDecodeAV1ProfileInfoKHR<'_>>()
         };
@@ -613,7 +623,8 @@ mod tests {
         let raw = coincide_device(vec![VideoFormat {
             format: NV12,
             image_usage: COINCIDE_USAGE,
-            image_create_flags: vk::ImageCreateFlags::empty(),
+            // A non-empty report that lacks MUTABLE_FORMAT: an explicit envelope, refused.
+            image_create_flags: vk::ImageCreateFlags::ALIAS,
             ..Default::default()
         }]);
         assert_eq!(

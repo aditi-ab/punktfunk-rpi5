@@ -287,18 +287,20 @@ impl VideoSessionAv1 {
 impl Drop for VideoSessionAv1 {
     fn drop(&mut self) {
         // SAFETY: all handles are this session's own on the (contract-live) device;
-        // the owning decoder drains GPU work before dropping state. Destroy
-        // entry points ignore NULL (half-built sessions, and sessions that never
-        // got a parameters object). Destroy the session before freeing bound
+        // the owning decoder drains GPU work before dropping state. A session
+        // that never got a parameters object skips that destroy. Destroy the
+        // session before freeing bound
         // memory — Vulkan forbids freeing while the session lives, which is why
         // BindFailure parks allocations here. Sequence-header backing drops
         // after both, same order as `ensure_parameters`.
         unsafe {
-            (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                self.device.handle(),
-                self.parameters(),
-                std::ptr::null(),
-            );
+            if self.parameters() != vk::VideoSessionParametersKHR::null() {
+                (self.video_queue.fp().destroy_video_session_parameters_khr)(
+                    self.device.handle(),
+                    self.parameters(),
+                    std::ptr::null(),
+                );
+            }
             (self.video_queue.fp().destroy_video_session_khr)(
                 self.device.handle(),
                 self.session,

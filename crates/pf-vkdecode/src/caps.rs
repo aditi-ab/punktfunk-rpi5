@@ -90,6 +90,17 @@ pub struct VideoFormat {
     pub image_type: vk::ImageType,
     /// `imageTiling`. Likewise equality-compared by VUID-06811; pools create `OPTIMAL`.
     pub image_tiling: vk::ImageTiling,
+    /// Usage the query that returned this entry asked for. Empty in a hand-built entry.
+    pub queried: vk::ImageUsageFlags,
+}
+
+impl VideoFormat {
+    /// The driver answered with a mask that lacks the usage it was asked about: one
+    /// fixed report for every query. Intel's Windows driver does this, and its decode
+    /// images read as zeros when sampled, so the mask is the truth about `SAMPLED`.
+    pub fn echoed(&self) -> bool {
+        !self.image_usage.contains(self.queried)
+    }
 }
 
 impl Default for VideoFormat {
@@ -102,6 +113,7 @@ impl Default for VideoFormat {
             image_create_flags: vk::ImageCreateFlags::empty(),
             image_type: vk::ImageType::TYPE_2D,
             image_tiling: vk::ImageTiling::OPTIMAL,
+            queried: vk::ImageUsageFlags::empty(),
         }
     }
 }
@@ -257,6 +269,24 @@ pub enum CapsError {
         mode: &'static str,
         format: vk::Format,
     },
+    /// The picture has more slice segments than the owner allows this driver
+    /// ([`crate::VkH265Decoder::refuse_multi_slice`]). Refused before any driver call.
+    SliceSegments { segments: usize },
+    /// The driver answered the `mode` query with a mask that lacks the queried usage
+    /// ([`VideoFormat::echoed`]). Its decode images cannot be sampled.
+    EchoedReport {
+        mode: &'static str,
+        format: vk::Format,
+    },
+}
+
+/// One slice segment per picture when `single_slice` is set, any number otherwise.
+pub(crate) fn require_segments(single_slice: bool, segments: usize) -> Result<(), CapsError> {
+    if single_slice && segments > 1 {
+        Err(CapsError::SliceSegments { segments })
+    } else {
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for CapsError {
@@ -301,6 +331,19 @@ impl std::fmt::Display for CapsError {
                 write!(
                     f,
                     "the {mode} {format:?} entry does not allow MUTABLE_FORMAT (per-plane views)"
+                )
+            }
+            CapsError::SliceSegments { segments } => {
+                write!(
+                    f,
+                    "this driver takes one slice segment per picture, the stream sends {segments}"
+                )
+            }
+            CapsError::EchoedReport { mode, format } => {
+                write!(
+                    f,
+                    "the {mode} {format:?} report echoes the query; decode images here \
+                     read as zeros when sampled, a copy stage is needed"
                 )
             }
         }
@@ -421,8 +464,15 @@ pub(crate) fn derive_arrangement(
     };
     // Coincide preferred (struct docs). A device offering both whose coincide
     // arrangement is unusable decodes distinct; the error names distinct then.
+    // `PUNKTFUNK_VKDECODE_ARRANGEMENT=distinct` skips coincide on such a device: the
+    // switch for a driver whose coincide path faults at the first decode.
+    let prefer_distinct = distinct
+        && std::env::var("PUNKTFUNK_VKDECODE_ARRANGEMENT")
+            .ok()
+            .as_deref()
+            == Some("distinct");
     let (coincide, (dpb_format, output_format)) = match try_coincide() {
-        Ok(formats) if coincide => (true, formats),
+        Ok(formats) if coincide && !prefer_distinct => (true, formats),
         Err(unusable) if !distinct => return Err(unusable),
         tried => {
             if let (true, Err(unusable)) = (coincide, &tried) {
@@ -456,12 +506,20 @@ fn pick_format(
         .ok_or(CapsError::NoFormat { mode, wanted })
 }
 
-/// Pool creation usage must sit inside the driver's advertised envelope.
+/// Pool creation usage must sit inside what the driver advertised. An echoed report
+/// refuses outright: Intel's Windows driver decodes into such an image, and every
+/// sample of it reads zero.
 fn require_usage(
     entry: &VideoFormat,
     usage: vk::ImageUsageFlags,
     mode: &'static str,
 ) -> Result<(), CapsError> {
+    if entry.echoed() {
+        return Err(CapsError::EchoedReport {
+            mode,
+            format: entry.format,
+        });
+    }
     let missing = usage & !entry.image_usage;
     if missing.is_empty() {
         Ok(())
@@ -476,6 +534,7 @@ fn require_usage(
     }
 }
 
+/// Per-plane views need `MUTABLE_FORMAT` in the driver's create-flag report.
 fn require_mutable(entry: &VideoFormat, mode: &'static str) -> Result<(), CapsError> {
     if entry
         .image_create_flags
@@ -503,6 +562,10 @@ fn require_mutable(entry: &VideoFormat, mode: &'static str) -> Result<(), CapsEr
 /// it holds the reference across the call in `OpRing::create_status_query_pool`.
 pub(crate) struct H264ProfileChain {
     h264: vk::VideoDecodeH264ProfileInfoKHR<'static>,
+    /// Decode usage hints between the profile and the codec struct. Optional by the
+    /// spec, but Intel's Windows driver walks the chain expecting it and faults on
+    /// the first parameters create without it; FFmpeg always chains it.
+    usage: vk::VideoDecodeUsageInfoKHR<'static>,
     profile: vk::VideoProfileInfoKHR<'static>,
 }
 
@@ -514,6 +577,7 @@ impl H264ProfileChain {
             h264: vk::VideoDecodeH264ProfileInfoKHR::default()
                 .std_profile_idc(std_profile_idc)
                 .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE),
+            usage: vk::VideoDecodeUsageInfoKHR::default(),
             profile: vk::VideoProfileInfoKHR::default()
                 .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
                 .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
@@ -525,7 +589,8 @@ impl H264ProfileChain {
     /// Wire the internal `p_next` chain and hand out the profile root. Do not
     /// move `self` while the returned reference (or any pointer from it) lives.
     pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'static> {
-        self.profile.p_next = (&self.h264 as *const vk::VideoDecodeH264ProfileInfoKHR<'_>).cast();
+        self.usage.p_next = (&self.h264 as *const vk::VideoDecodeH264ProfileInfoKHR<'_>).cast();
+        self.profile.p_next = (&self.usage as *const vk::VideoDecodeUsageInfoKHR<'_>).cast();
         &self.profile
     }
 }
@@ -725,6 +790,7 @@ pub(crate) unsafe fn query_formats_on(
         return Err(r);
     }
     props.truncate(count as usize);
+    // The driver's masks stay verbatim for the probe; the queried usage rides beside them.
     Ok(props
         .iter()
         .map(|p| VideoFormat {
@@ -733,6 +799,7 @@ pub(crate) unsafe fn query_formats_on(
             image_create_flags: p.image_create_flags,
             image_type: p.image_type,
             image_tiling: p.image_tiling,
+            queried: usage,
         })
         .collect())
 }
@@ -750,6 +817,54 @@ mod tests {
                 | vk::ImageCreateFlags::EXTENDED_USAGE,
             ..Default::default()
         }
+    }
+
+    /// One fixed video-only mask and no create flags for every query, as Intel's
+    /// Windows driver answers.
+    fn echoed_entry(format: vk::Format, queried: vk::ImageUsageFlags) -> VideoFormat {
+        VideoFormat {
+            format,
+            image_usage: vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+                | vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR,
+            queried,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_second_slice_segment_is_refused_only_for_a_single_slice_driver() {
+        assert!(require_segments(false, 4).is_ok());
+        assert!(require_segments(true, 1).is_ok());
+        let refused = require_segments(true, 2).unwrap_err();
+        assert_eq!(refused, CapsError::SliceSegments { segments: 2 });
+        assert!(crate::VkDecodeError::Caps(refused).is_device_fact());
+    }
+
+    #[test]
+    fn an_echoed_report_refuses_by_name() {
+        let e = echoed_entry(NV12, COINCIDE_USAGE);
+        assert!(e.echoed());
+        let refused = require_usage(&e, COINCIDE_USAGE, "coincide").unwrap_err();
+        assert_eq!(
+            refused,
+            CapsError::EchoedReport {
+                mode: "coincide",
+                format: NV12
+            }
+        );
+        assert!(crate::VkDecodeError::Caps(refused).is_device_fact());
+    }
+
+    #[test]
+    fn a_report_that_answers_the_query_keeps_its_refusals() {
+        let mut e = entry(NV12, DPB_USAGE);
+        e.queried = DPB_USAGE;
+        assert!(!e.echoed());
+        assert!(require_usage(&e, DPB_USAGE, "DPB").is_ok());
+        assert!(require_usage(&e, COINCIDE_USAGE, "coincide").is_err());
+        e.image_create_flags = vk::ImageCreateFlags::empty();
+        assert!(require_mutable(&e, "coincide").is_err());
     }
 
     fn radv_like() -> RawH264Caps {
@@ -981,7 +1096,8 @@ mod tests {
         raw.coincide_formats = vec![VideoFormat {
             format: NV12,
             image_usage: COINCIDE_USAGE,
-            image_create_flags: vk::ImageCreateFlags::empty(),
+            // A non-empty report that lacks MUTABLE_FORMAT: an explicit envelope, refused.
+            image_create_flags: vk::ImageCreateFlags::ALIAS,
             ..Default::default()
         }];
         assert_eq!(
@@ -1081,13 +1197,17 @@ mod tests {
             vk::VideoCodecOperationFlagsKHR::DECODE_H264
         );
         assert!(!profile.p_next.is_null());
-        // SAFETY: wire() pointed p_next at chain's own h264 field, which lives for
-        // this whole scope and is a valid VideoDecodeH264ProfileInfoKHR.
-        let h264 = unsafe {
-            &*profile
-                .p_next
-                .cast::<vk::VideoDecodeH264ProfileInfoKHR<'_>>()
-        };
+        // SAFETY: wire() pointed p_next at chain's own usage field, which lives for
+        // this whole scope and is a valid VideoDecodeUsageInfoKHR.
+        let usage = unsafe { &*profile.p_next.cast::<vk::VideoDecodeUsageInfoKHR<'_>>() };
+        assert_eq!(usage.s_type, vk::StructureType::VIDEO_DECODE_USAGE_INFO_KHR);
+        assert_eq!(
+            usage.video_usage_hints,
+            vk::VideoDecodeUsageFlagsKHR::DEFAULT
+        );
+        // SAFETY: wire() pointed the usage struct's p_next at chain's own h264 field,
+        // which lives for this whole scope and is a valid VideoDecodeH264ProfileInfoKHR.
+        let h264 = unsafe { &*usage.p_next.cast::<vk::VideoDecodeH264ProfileInfoKHR<'_>>() };
         assert_eq!(
             h264.std_profile_idc,
             hh::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN

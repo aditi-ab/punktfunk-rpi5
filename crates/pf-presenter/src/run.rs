@@ -276,6 +276,18 @@ struct StreamState {
     /// Consecutive on-glass spacings this window, in whole panel periods: `[0, 1, 2, 3, 4, 5+]`.
     /// The mode is the expected step; everything else is judder.
     win_steps: [u32; 6],
+    /// Non-blocking presents that came back busy this window: [fence, acquire].
+    win_busy: [u32; 2],
+    /// Hand-over to latch, learned from this stream's misses and published to the
+    /// host-facing `latch_grid`. Latency intent on a stream at panel rate only.
+    need: punktfunk_core::phase::LatchNeed,
+    /// This window's on-glass frames: the lead each had to its first latch, and whether
+    /// it landed on a later one.
+    win_leads: Vec<(i64, bool)>,
+    /// What the held frame waits on. The fence paces the loop itself (the presenter waits
+    /// it for a millisecond per pass), so the pass turns straight around and drains the
+    /// channel first: a newer frame replaces the held one instead of queuing behind it.
+    busy_on: crate::vk::BusyOn,
     last_displayed_ns: u64,
     /// Smoothing: the latch slot the last vended frame was aimed at. One present per
     /// slot; a second frame due before the same slot waits for the next.
@@ -430,6 +442,10 @@ impl StreamState {
             win_misses: 0,
             win_out_max: 0,
             win_steps: [0; 6],
+            win_busy: [0; 2],
+            need: punktfunk_core::phase::LatchNeed::default(),
+            win_leads: Vec::with_capacity(256),
+            busy_on: crate::vk::BusyOn::Fence,
             last_displayed_ns: 0,
             last_slot_ns: 0,
             busy_retry: false,
@@ -461,12 +477,11 @@ impl StreamState {
         }
     }
 
-    /// User exit: release capture, close with QUIT_CLOSE_CODE so the host tears down
-    /// instead of lingering, stop the pump. The pump then emits `Ended(None)`.
-    /// The presenter had no swapchain image for `image`: keep it for the next pass and
-    /// wake soon. Newest-wins drops it if a fresher frame has landed meanwhile.
+    /// The presenter found `on` busy for `image`: keep it for the next pass and wake
+    /// soon. Newest-wins drops it if a fresher frame has landed meanwhile.
     fn hold_busy(
         &mut self,
+        on: crate::vk::BusyOn,
         image: Option<DecodedImage>,
         pts_ns: u64,
         decoded_ns: u64,
@@ -482,9 +497,13 @@ impl StreamState {
                 due_ns,
             });
         }
+        self.win_busy[on as usize] += 1;
+        self.busy_on = on;
         self.busy_retry = true;
     }
 
+    /// User exit: release capture, close with QUIT_CLOSE_CODE so the host tears down
+    /// instead of lingering, stop the pump. The pump then emits `Ended(None)`.
     fn request_quit(&mut self) {
         if let Some(cap) = &mut self.capture {
             cap.release(true);
@@ -501,8 +520,12 @@ impl StreamState {
     fn wake_timeout(&self) -> Duration {
         const TICK: Duration = Duration::from_millis(15);
         if self.busy_retry {
-            // A frame is waiting on a swapchain image; a refresh frees one.
-            return Duration::from_millis(1);
+            // The fence wait inside the presenter is the pace; only a full swapchain
+            // needs a refresh to pass.
+            return match self.busy_on {
+                crate::vk::BusyOn::Fence => Duration::ZERO,
+                crate::vk::BusyOn::Acquire => Duration::from_millis(1),
+            };
         }
         if !self.store.is_smoothing() {
             return TICK;
@@ -547,9 +570,10 @@ impl StreamState {
         }
         self.cadence.reset();
         self.pacer.reset();
-        // The slot margin was sized by the old panel's misses.
+        // The slot margin and the latch need were sized by the old panel's misses.
         self.margin_ns = 0;
         self.win_misses = 0;
+        self.need = punktfunk_core::phase::LatchNeed::default();
         tracing::info!(
             refresh_hz = hz,
             "display changed — relearning the latch grid"
@@ -2064,8 +2088,21 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         .as_ref()
                         .map_or(0, |o| o.load(Ordering::Relaxed));
                     let period = st.clock.period_ns();
+                    // A queue holds frames on purpose and a stream off the panel's rate
+                    // replaces them on purpose: neither miss says anything about lead.
+                    let learn_need = st.latch_grid.is_some()
+                        && !st.store.is_smoothing()
+                        && st.source_interval_ns.abs_diff(period as i64) < period / 10;
                     let mut stamps = Vec::with_capacity(samples.len());
                     for s in &samples {
+                        if learn_need {
+                            st.win_leads.extend(punktfunk_core::phase::latch_lead(
+                                st.clock.anchor_ns(),
+                                period as i64,
+                                s.decoded_ns,
+                                s.displayed_ns,
+                            ));
+                        }
                         let e2e = (s.displayed_ns as i128 + clock_offset_ns as i128
                             - s.pts_ns as i128)
                             .max(0) as u64;
@@ -2117,6 +2154,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             .store(st.clock.period_ns(), Ordering::Relaxed);
                         grid.anchor_ns
                             .store(st.clock.anchor_ns(), Ordering::Relaxed);
+                        grid.need_ns
+                            .store(st.need.need_ns() as u64, Ordering::Relaxed);
                     }
                 }
             }
@@ -2223,8 +2262,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 true
                             }
                             Ok(Presented::Stale) => false,
-                            Ok(Presented::Busy(input)) => {
-                                st.hold_busy(input.into_image(), pts_ns, decoded_ns, due_ns);
+                            Ok(Presented::Busy(input, on)) => {
+                                st.hold_busy(on, input.into_image(), pts_ns, decoded_ns, due_ns);
                                 false
                             }
                             Err(e) => {
@@ -2253,17 +2292,18 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         let outcome = presenter
                             .present(&window, FrameInput::Cpu(&c), overlay_frame.as_ref())
                             .map(|p| match p {
-                                Presented::Shown => Some(true),
-                                Presented::Stale => Some(false),
-                                Presented::Busy(_) => None,
+                                Presented::Shown => Ok(true),
+                                Presented::Stale => Ok(false),
+                                Presented::Busy(_, on) => Err(on),
                             });
                         match outcome {
-                            Ok(Some(shown)) => {
+                            Ok(Ok(shown)) => {
                                 st.cpu_present_warned = false;
                                 shown
                             }
-                            Ok(None) => {
+                            Ok(Err(on)) => {
                                 st.hold_busy(
+                                    on,
                                     Some(DecodedImage::Cpu(c)),
                                     pts_ns,
                                     decoded_ns,
@@ -2304,8 +2344,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 true
                             }
                             Ok(Presented::Stale) => false,
-                            Ok(Presented::Busy(input)) => {
-                                st.hold_busy(input.into_image(), pts_ns, decoded_ns, due_ns);
+                            Ok(Presented::Busy(input, on)) => {
+                                st.hold_busy(on, input.into_image(), pts_ns, decoded_ns, due_ns);
                                 false
                             }
                             // Import/CSC failure is survivable — a streak means this box
@@ -2357,8 +2397,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 true
                             }
                             Ok(Presented::Stale) => false,
-                            Ok(Presented::Busy(input)) => {
-                                st.hold_busy(input.into_image(), pts_ns, decoded_ns, due_ns);
+                            Ok(Presented::Busy(input, on)) => {
+                                st.hold_busy(on, input.into_image(), pts_ns, decoded_ns, due_ns);
                                 false
                             }
                             Err(e) => {
@@ -2408,8 +2448,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 true
                             }
                             Ok(Presented::Stale) => false,
-                            Ok(Presented::Busy(input)) => {
-                                st.hold_busy(input.into_image(), pts_ns, decoded_ns, due_ns);
+                            Ok(Presented::Busy(input, on)) => {
+                                st.hold_busy(on, input.into_image(), pts_ns, decoded_ns, due_ns);
                                 false
                             }
                             Err(e) => {
@@ -2517,6 +2557,19 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         "smoothness slot margin widened (measured latch misses)"
                     );
                 }
+                // The need never shrinks: a smaller picture mid-stream keeps the larger one's.
+                let missed = st.win_leads.iter().filter(|(_, missed)| *missed).count();
+                if st.need.observe(&st.win_leads, st.clock.period_ns() as i64) {
+                    tracing::info!(
+                        need_us = st.need.need_ns() / 1000,
+                        missed,
+                        shown = st.win_leads.len(),
+                        "latch need changed (frames landed one latch late)"
+                    );
+                }
+                st.win_leads.sort_unstable();
+                let lead_us = st.win_leads.get(st.win_leads.len() / 2).map_or(0, |l| l.0) / 1000;
+                st.win_leads.clear();
                 // The 1 Hz presenter line, always: the field bundle's only record of where a
                 // frame went after decode and how evenly the glass stepped.
                 if pacing_active {
@@ -2542,6 +2595,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         misses = st.win_misses,
                         out_max = st.win_out_max,
                         steps = ?st.win_steps,
+                        busy = ?st.win_busy,
                         judder,
                         pace_ms,
                         latch_ms,
@@ -2555,6 +2609,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         present_us = queue_present.p50_us,
                         period_us = st.clock.period_ns() / 1000,
                         margin_us = st.margin_ns / 1000,
+                        // Hand-over to first latch: what it takes, the window's median,
+                        // and the frames that landed a latch later all the same.
+                        need_us = st.need.need_ns() / 1000,
+                        lead_us,
+                        missed,
                         // Cadence loop's current hold and the jitter it is sized from,
                         // plus frames whose due time had already passed when they arrived.
                         // Cumulative/instantaneous, not window sums like the counters above.
@@ -2567,6 +2626,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 st.win_misses = 0;
                 st.win_out_max = 0;
                 st.win_steps = [0; 6];
+                st.win_busy = [0; 2];
             }
         }
 

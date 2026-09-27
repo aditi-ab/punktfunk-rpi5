@@ -464,8 +464,8 @@ impl ScalePass {
 }
 
 /// One colour attachment; the dependency is the overlay pass's, so framebuffers made for
-/// either pass fit both.
-fn render_pass(
+/// either pass fit both. The direct CSC pass builds its two passes here as well.
+pub(crate) fn render_pass(
     device: &ash::Device,
     format: vk::Format,
     load: vk::AttachmentLoadOp,
