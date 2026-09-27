@@ -226,6 +226,71 @@ struct StreamHUDView: View {
     }
 }
 
+/// The bottom-centre badges over the stream: the transient hints, the access chip and the muted
+/// microphone. One stack, so two badges never land on top of each other while they overlap.
+/// Nothing mounts while `captureEnabled` is off (the trust prompt, the console's launch hold).
+struct StreamBadgeStack: View {
+    @ObservedObject var model: SessionModel
+    let captureEnabled: Bool
+    let statsVerbosity: StatsVerbosity
+
+    /// How every badge enters and leaves.
+    private static let pop: AnyTransition = .opacity.combined(with: .scale(scale: 0.9))
+
+    var body: some View {
+        VStack(spacing: 8) {
+            // A forwarded pad has a gyro this session's virtual controller cannot carry. Shown
+            // briefly at every stats tier, on every platform: the gyro otherwise just does
+            // nothing, and the fix is a setting, so the hint has to name it.
+            if captureEnabled, model.motionUnreachableKind != nil {
+                MotionUnreachableBadge().transition(Self.pop)
+            }
+            // The SC2 passthrough's claim edge, the capture's only visible trace.
+            if captureEnabled, model.sc2CapturedHint {
+                Sc2CapturedBadge().transition(Self.pop)
+            }
+            // The Touch (passthrough) model met a host that drops contacts; the fingers run the
+            // trackpad engine instead, and this says so once.
+            if captureEnabled, model.touchFallbackNotice {
+                TouchFallbackBadge().transition(Self.pop)
+            }
+            // The expiry warning (T−5 m / T−1 m, per-client access §7), every platform and tier:
+            // a dead pad must read as ended access while it can still be fixed.
+            if captureEnabled, let warning = model.accessWarning {
+                AccessWarningBadge(text: warning).transition(Self.pop)
+            }
+            // The host's word on a launch that did not give the player their game.
+            if captureEnabled, let notice = model.launchNotice {
+                AccessWarningBadge(text: notice, icon: "exclamationmark.triangle")
+                    .transition(Self.pop)
+            }
+            #if !os(tvOS)
+            // The access chip rides the stats tier for a LIMITED session only; a
+            // full-and-permanent one never mounts it. tvOS states it in the stats overlay.
+            if captureEnabled && statsVerbosity != .off && model.accessLimited {
+                AccessChipBadge(
+                    label: model.accessLevel.label, remainingSecs: model.accessRemainingSecs)
+                    .transition(Self.pop)
+            }
+            // Up for as long as the mic is muted, at every stats tier (see MicMutedBadge).
+            if captureEnabled && model.micMuted {
+                MicMutedBadge { model.setMicMuted(false) }.transition(Self.pop)
+            }
+            #endif
+        }
+        .padding(.bottom, 24)
+        // The badges' visibility drivers, the stats tier included (the access chip rides it). A
+        // badge whose driver is missing here pops in unanimated.
+        .animation(.easeOut(duration: 0.2), value: model.micMuted)
+        .animation(.easeOut(duration: 0.2), value: model.accessWarning)
+        .animation(.easeOut(duration: 0.2), value: model.launchNotice)
+        .animation(.easeOut(duration: 0.2), value: model.accessLimited)
+        .animation(.easeOut(duration: 0.2), value: statsVerbosity)
+        .animation(.easeOut(duration: 0.2), value: model.motionUnreachableKind)
+        .animation(.easeOut(duration: 0.2), value: model.sc2CapturedHint)
+    }
+}
+
 /// "This pad's gyro can't reach the game" — shown briefly when a forwarded controller with motion
 /// meets a session whose virtual controller has no motion plane (an X-Box class pad has no gyro in
 /// its HID contract, so every sample would be decoded and dropped).
