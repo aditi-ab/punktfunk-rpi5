@@ -12,7 +12,7 @@ use crate::linux::sync_timeline::{plane_count, SyncPoints};
 use crate::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
 use pipewire as pw;
 use pw::spa;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -259,8 +259,7 @@ fn packed_frame_geometry(
 /// cast as libspa's `Buffer::datas_mut`, so the safe `Data` accessors keep working. `pw_buf`
 /// is identity for [`UserData::try_defer`] only — never dereferenced here. `stream` is the
 /// stream running this `.process`; `try_defer` requeues a stale held buffer on it.
-/// A broken raw-passthrough frame routes through [`handle_passthrough_fallback`]:
-/// CPU de-pad, drop, or tiled-offer refusal + rebuild.
+/// The lanes in order: [`try_passthrough`], [`try_gpu_hold`], then [`cpu_depad`].
 pub(super) fn consume_frame(
     ud: &mut UserData,
     spa_buf: *mut spa::sys::spa_buffer,
@@ -297,8 +296,42 @@ pub(super) fn consume_frame(
         return; // format not negotiated yet
     }
 
-    // One stamp for every publish path, taken before de-pad/import. Sampling at publish put
-    // CPU work inside the timestamp and let the three paths drift apart.
+    let pts_ns = stamp_frame(ud, hdr_pts_ns);
+    if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
+        wait_render_fence(ud, spa_buf, datas[0].fd());
+    }
+    let arrival = Arrival {
+        datas,
+        w,
+        h,
+        pts_ns,
+        pw_buf,
+        stream,
+    };
+    if ud.vaapi_passthrough && try_passthrough(ud, &arrival) {
+        return;
+    }
+    if try_gpu_hold(ud, &arrival) {
+        return;
+    }
+    cpu_depad(ud, arrival);
+}
+
+/// One arrival: its planes, size and wire stamp, and the identity [`UserData::try_defer`]
+/// holds it by.
+struct Arrival<'a> {
+    datas: &'a mut [pw::spa::buffer::Data],
+    w: usize,
+    h: usize,
+    pts_ns: u64,
+    pw_buf: *mut pw::sys::pw_buffer,
+    stream: *mut pw::sys::pw_stream,
+}
+
+/// The wire stamp for this arrival, taken once before de-pad or import. Sampling at publish
+/// put CPU work inside the timestamp and let the three lanes drift apart. Emits the
+/// provenance line every [`PTS_REPORT_EVERY`].
+fn stamp_frame(ud: &mut UserData, hdr_pts_ns: Option<i64>) -> u64 {
     let delivery_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -312,7 +345,6 @@ pub(super) fn consume_frame(
         delivery_ns,
         ud.rt_minus_mono_ns,
     );
-    let pts_ns = stamp.pts_ns;
     if ud.hdr_pts_enabled && hdr_pts_ns.is_some() && !stamp.from_header {
         ud.pts.implausible += 1;
     }
@@ -348,238 +380,244 @@ pub(super) fn consume_frame(
         // Clocks drift by µs over a window; re-pair here so a multi-hour session stays honest.
         ud.rt_minus_mono_ns = realtime_minus_monotonic_ns();
     }
+    stamp.pts_ns
+}
 
-    // The render is fenced at the acquire point when the stream negotiated explicit sync, else
-    // by the dmabuf's implicit fence (none on NVIDIA: a stale frame can be read). 100 ms is a
-    // guard: past it the producer is wedged, not slow. A CPU wait on the loop thread; a GPU
-    // semaphore import would free it, and the perf line below says whether that is owed.
-    if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-        let t0 = std::time::Instant::now();
-        // SAFETY: `spa_buf` is the buffer this callback holds.
-        let explicit = ud.sync.as_ref().zip(unsafe { SyncPoints::of(spa_buf) });
-        let waited = match &explicit {
-            Some((dev, p)) => dev.wait(
-                p.acquire_fd,
-                p.acquire_point,
-                std::time::Duration::from_millis(100),
-            ),
-            None => pf_zerocopy::dmabuf_fence::wait_read_ready(datas[0].fd(), 100),
-        };
-        ud.fence_wait.record(t0.elapsed().as_micros() as u64);
-        match waited {
-            Ok(outcome) => {
-                use pf_zerocopy::dmabuf_fence::WaitOutcome;
-                match outcome {
-                    WaitOutcome::Signaled => ud.fence_wait.signaled += 1,
-                    WaitOutcome::NoFence => ud.fence_wait.no_fence += 1,
-                    WaitOutcome::TimedOut => ud.fence_wait.timed_out += 1,
-                }
-                static F0: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-                if explicit.is_some() && F0.swap(false, Ordering::Relaxed) {
-                    tracing::info!(
-                        ?outcome,
-                        "dmabuf explicit sync active (SyncTimeline): the producer's acquire \
-                         point is waited here and its release point signalled on hand-back — \
-                         it no longer finishes the GPU for this stream"
-                    );
-                }
-                static F1: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-                if explicit.is_none() && F1.swap(false, Ordering::Relaxed) {
-                    tracing::info!(
-                        ?outcome,
-                        "dmabuf implicit-fence sync active (Signaled → driver fences the \
-                         render, race closed; NoFence → no implicit fence, zero-copy may \
-                         still show stale frames; TimedOut → fence pending past 100ms, \
-                         proceeded anyway)"
-                    );
-                }
+/// Wait out the producer's render before anything reads the dmabuf `fd`, and tally the wait.
+///
+/// The render is fenced at the acquire point when the stream negotiated explicit sync, else
+/// by the dmabuf's implicit fence (none on NVIDIA: a stale frame can be read). 100 ms is a
+/// guard: past it the producer is wedged, not slow. A CPU wait on the loop thread; a GPU
+/// semaphore import would free it, and the `PUNKTFUNK_PERF` line says whether that is owed.
+fn wait_render_fence(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer, fd: RawFd) {
+    let t0 = std::time::Instant::now();
+    // SAFETY: `spa_buf` is the buffer this callback holds.
+    let explicit = ud.sync.as_ref().zip(unsafe { SyncPoints::of(spa_buf) });
+    let waited = match &explicit {
+        Some((dev, p)) => dev.wait(
+            p.acquire_fd,
+            p.acquire_point,
+            std::time::Duration::from_millis(100),
+        ),
+        None => pf_zerocopy::dmabuf_fence::wait_read_ready(fd, 100),
+    };
+    ud.fence_wait.record(t0.elapsed().as_micros() as u64);
+    match waited {
+        Ok(outcome) => {
+            use pf_zerocopy::dmabuf_fence::WaitOutcome;
+            match outcome {
+                WaitOutcome::Signaled => ud.fence_wait.signaled += 1,
+                WaitOutcome::NoFence => ud.fence_wait.no_fence += 1,
+                WaitOutcome::TimedOut => ud.fence_wait.timed_out += 1,
             }
-            Err(e) => {
-                ud.fence_wait.failed += 1;
-                static F2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-                if F2.swap(false, Ordering::Relaxed) {
-                    tracing::warn!(
-                        error = %e,
-                        "dmabuf EXPORT_SYNC_FILE failed — no implicit-fence sync; NVIDIA \
-                         zero-copy may show stale frames (no producer explicit sync)"
-                    );
-                }
-            }
-        }
-        // One line per ~5 s at 60 fps, under PUNKTFUNK_PERF only — same gate as encode submit splits.
-        if pf_host_config::config().perf
-            && ud.fence_wait.is_meaningful()
-            && ud.fence_wait.samples % 300 == 0
-        {
-            let q = |p: f64| match ud.fence_wait.quantile_bucket_us(p) {
-                Some(Some(us)) => format!("<={us}us"),
-                Some(None) => format!(
-                    ">{}us",
-                    FENCE_WAIT_BUCKETS_US[FENCE_WAIT_BUCKETS_US.len() - 1]
-                ),
-                None => "n/a".to_string(),
-            };
-            tracing::info!(
-                samples = ud.fence_wait.samples,
-                mean_us = ud.fence_wait.mean_us(),
-                max_us = ud.fence_wait.max_us,
-                p50 = %q(0.50),
-                p99 = %q(0.99),
-                signaled = ud.fence_wait.signaled,
-                no_fence = ud.fence_wait.no_fence,
-                timed_out = ud.fence_wait.timed_out,
-                failed = ud.fence_wait.failed,
-                "dmabuf implicit-fence wait on the PipeWire loop thread (PW4: a p99 in the first \
-                 bucket means this wait is already free and moving it off-thread buys nothing)"
-            );
-        }
-    }
-
-    // Raw DMA-BUF passthrough: packed RGB for GPU CSC, or producer NV12 without another convert.
-    // Publishes and returns, or breaks with a named reason. Silent fall-through CPU-touches
-    // every frame on a session that had negotiated zero-copy.
-    if ud.vaapi_passthrough {
-        let reason = 'passthrough: {
-            let Some(fmt) = ud.format else {
-                break 'passthrough PassthroughFallback::NoFormat;
-            };
-            if datas[0].type_() != pw::spa::buffer::DataType::DmaBuf {
-                break 'passthrough PassthroughFallback::NotDmabuf;
-            }
-            let Some(fourcc) = pf_frame::drm_fourcc(fmt) else {
-                break 'passthrough PassthroughFallback::NoFourcc;
-            };
-            let chunk = datas[0].chunk();
-            let offset = chunk.offset();
-            let stride = chunk.stride().max(0) as u32;
-            // NV12/P010 are usually two SPA planes on one BO; plane 1's chunk has the real UV
-            // offset/stride. BO identity is inode, not fd number. A two-BO frame cannot
-            // travel the single-fd import — drop it rather than stream garbage chroma.
-            let planar = matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010);
-            let plane1 = if planar && datas.len() >= 2 && datas[1].fd() > 0 {
-                // SAFETY: zeroed `libc::stat` is a valid POD initializer; both fds are
-                // owned by the live PipeWire buffer for this callback, and `fstat`
-                // only writes the out-param structs, whose fields are read only after
-                // the `== 0` success checks.
-                let same_bo = unsafe {
-                    let mut s0: libc::stat = std::mem::zeroed();
-                    let mut s1: libc::stat = std::mem::zeroed();
-                    libc::fstat(datas[0].fd() as i32, &mut s0) == 0
-                        && libc::fstat(datas[1].fd() as i32, &mut s1) == 0
-                        && (s0.st_dev, s0.st_ino) == (s1.st_dev, s1.st_ino)
-                };
-                if !same_bo {
-                    warn_once(
-                        "the planes live in different buffer objects — frames \
-                                 dropped (single-fd import only)",
-                    );
-                    // Dropped, not downgraded: de-padding as linear would scramble chroma.
-                    return;
-                }
-                let c1 = datas[1].chunk();
-                Some((c1.offset(), c1.stride().max(0) as u32))
-            } else {
-                None
-            };
-            // iHD reads a linear import at a pitch rounded to 64 bytes, so an odd pitch shears
-            // the picture. Mutter's RENDERING-only GBM buffers pad only for SCANOUT. The
-            // de-pad copy below uploads through a driver-allocated surface instead.
-            if ud.modifier == 0
-                && linear_pitch_rounds()
-                && (stride % 64 != 0 || plane1.is_some_and(|(_, s)| s % 64 != 0))
-            {
-                break 'passthrough PassthroughFallback::UnalignedPitch;
-            }
-            // Dup so the fd outlives SPA recycle. Content stability is `try_defer`: a raw
-            // frame is published only under a hold, so the producer can never rewrite a
-            // DMA-BUF the encoder still reads. No hold — shallow pool or
-            // PUNKTFUNK_ZEROCOPY_HOLD=0 — is a safe CPU fallback, never an unsafe publish.
-
-            // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
-            // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
-            // touches no Rust memory, and returns a fresh independent CLOEXEC duplicate (or -1).
-            // The original stays owned by PipeWire; the dup is a new fd we own (checked >= 0).
-            let dup = unsafe { libc::fcntl(datas[0].fd() as i32, libc::F_DUPFD_CLOEXEC, 0) };
-            if dup < 0 {
-                break 'passthrough PassthroughFallback::DupFailed;
-            }
-            let Some(hold) = ud.try_defer(pw_buf, stream) else {
-                // SAFETY: `dup` is ours and was not published.
-                unsafe { libc::close(dup) };
-                // A shortage, not a broken frame: drop it as the import lane does — the slot
-                // keeps its frame, the next arrival takes the hold that comes back. The CPU
-                // copy on this thread starves the requeues that would end the shortage; a
-                // tiled rebuild asks KWin for a new output each time (#1443 never settled).
-                // Only a pool that can never hold falls through, or nothing would stream.
-                if holds_possible(zerocopy_hold_enabled(), ud.pool.live) {
-                    ud.held_drops += 1;
-                    return;
-                }
-                break 'passthrough PassthroughFallback::NoHold;
-            };
-            ud.publish(CapturedFrame {
-                provenance: Default::default(),
-                width: w as u32,
-                height: h as u32,
-                pts_ns,
-                format: fmt,
-                payload: FramePayload::Dmabuf(DmabufFrame {
-                    // SAFETY: `dup` is the fresh fd `fcntl(F_DUPFD_CLOEXEC)` just returned
-                    // (checked `dup >= 0`); nothing else owns it, so `OwnedFd` takes sole
-                    // ownership and closes it exactly once on drop — no alias, no
-                    // double-close.
-                    fd: unsafe { OwnedFd::from_raw_fd(dup) },
-                    fourcc,
-                    modifier: ud.modifier,
-                    offset,
-                    stride,
-                    plane1,
-                    hold: Some(hold),
-                    health: ud.signals.health.clone(),
-                    rebuild: ud.signals.broken.clone(),
-                }),
-                // RGB→NV12 backends blend cursor-as-metadata. Gamescope burns the pointer in;
-                // native NV12/P010 has none.
-                cursor: ud.cursor.overlay(),
-            });
-            // Once per geometry, not once: a resize renegotiates the pool, and a stale
-            // stride against a new size is a sheared picture.
-            static LAST: std::sync::Mutex<(usize, usize, u32, u32)> =
-                std::sync::Mutex::new((0, 0, 0, 0));
-            let geometry = (w, h, offset, stride);
-            let changed = std::mem::replace(
-                &mut *LAST.lock().unwrap_or_else(|e| e.into_inner()),
-                geometry,
-            ) != geometry;
-            if changed {
+            static F0: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            if explicit.is_some() && F0.swap(false, Ordering::Relaxed) {
                 tracing::info!(
-                    w,
-                    h,
-                    offset,
-                    stride,
-                    fd_size = dmabuf_len(dup),
-                    modifier = ud.modifier,
-                    fourcc = format_args!("{:#010x}", fourcc),
-                    source = match fmt {
-                        PixelFormat::Nv12 => "producer-native NV12",
-                        PixelFormat::P010 => "producer-native P010",
-                        _ => "packed RGB (encoder GPU CSC)",
-                    },
-                    "zero-copy: handing the raw DMA-BUF to the encoder"
+                    ?outcome,
+                    "dmabuf explicit sync active (SyncTimeline): the producer's acquire \
+                     point is waited here and its release point signalled on hand-back — \
+                     it no longer finishes the GPU for this stream"
                 );
             }
-            return;
-        };
-        if !handle_passthrough_fallback(ud, reason) {
-            return;
+            static F1: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            if explicit.is_none() && F1.swap(false, Ordering::Relaxed) {
+                tracing::info!(
+                    ?outcome,
+                    "dmabuf implicit-fence sync active (Signaled → driver fences the \
+                     render, race closed; NoFence → no implicit fence, zero-copy may \
+                     still show stale frames; TimedOut → fence pending past 100ms, \
+                     proceeded anyway)"
+                );
+            }
+        }
+        Err(e) => {
+            ud.fence_wait.failed += 1;
+            static F2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            if F2.swap(false, Ordering::Relaxed) {
+                tracing::warn!(
+                    error = %e,
+                    "dmabuf EXPORT_SYNC_FILE failed — no implicit-fence sync; NVIDIA \
+                     zero-copy may show stale frames (no producer explicit sync)"
+                );
+            }
         }
     }
+    // One line per ~5 s at 60 fps, under PUNKTFUNK_PERF only — same gate as encode submit splits.
+    if pf_host_config::config().perf
+        && ud.fence_wait.is_meaningful()
+        && ud.fence_wait.samples % 300 == 0
+    {
+        let q = |p: f64| match ud.fence_wait.quantile_bucket_us(p) {
+            Some(Some(us)) => format!("<={us}us"),
+            Some(None) => format!(
+                ">{}us",
+                FENCE_WAIT_BUCKETS_US[FENCE_WAIT_BUCKETS_US.len() - 1]
+            ),
+            None => "n/a".to_string(),
+        };
+        tracing::info!(
+            samples = ud.fence_wait.samples,
+            mean_us = ud.fence_wait.mean_us(),
+            max_us = ud.fence_wait.max_us,
+            p50 = %q(0.50),
+            p99 = %q(0.99),
+            signaled = ud.fence_wait.signaled,
+            no_fence = ud.fence_wait.no_fence,
+            timed_out = ud.fence_wait.timed_out,
+            failed = ud.fence_wait.failed,
+            "dmabuf implicit-fence wait on the PipeWire loop thread (PW4: a p99 in the first \
+             bucket means this wait is already free and moving it off-thread buys nothing)"
+        );
+    }
+}
 
-    // dmabuf + importer → CUDA, no CPU touch. Else fall through to the shm de-pad copy.
-    // dmabuf + importer: hand the held buffer to the consumer, which imports at its own tick
-    // (`import_held`). Arrivals above the wire rate then cost nothing here. A buffer that
-    // cannot be held is dropped while holds are possible at all — the slot already has a held
-    // frame — and imported here only when this pool can never hold.
+/// Raw DMA-BUF passthrough: packed RGB for GPU CSC, or producer NV12/P010 without another
+/// convert. `true` = the frame ends here, published or dropped; `false` = take the CPU de-pad.
+/// A broken frame names its reason: a silent fall-through CPU-touches every frame on a session
+/// that negotiated zero-copy.
+fn try_passthrough(ud: &mut UserData, a: &Arrival) -> bool {
+    let (datas, w, h) = (&*a.datas, a.w, a.h);
+    let reason = 'passthrough: {
+        let Some(fmt) = ud.format else {
+            break 'passthrough PassthroughFallback::NoFormat;
+        };
+        if datas[0].type_() != pw::spa::buffer::DataType::DmaBuf {
+            break 'passthrough PassthroughFallback::NotDmabuf;
+        }
+        let Some(fourcc) = pf_frame::drm_fourcc(fmt) else {
+            break 'passthrough PassthroughFallback::NoFourcc;
+        };
+        let chunk = datas[0].chunk();
+        let offset = chunk.offset();
+        let stride = chunk.stride().max(0) as u32;
+        // NV12/P010 are usually two SPA planes on one BO; plane 1's chunk has the real UV
+        // offset/stride. BO identity is inode, not fd number. A two-BO frame cannot
+        // travel the single-fd import — drop it rather than stream garbage chroma.
+        let planar = matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010);
+        let plane1 = if planar && datas.len() >= 2 && datas[1].fd() > 0 {
+            // SAFETY: zeroed `libc::stat` is a valid POD initializer; both fds are
+            // owned by the live PipeWire buffer for this callback, and `fstat`
+            // only writes the out-param structs, whose fields are read only after
+            // the `== 0` success checks.
+            let same_bo = unsafe {
+                let mut s0: libc::stat = std::mem::zeroed();
+                let mut s1: libc::stat = std::mem::zeroed();
+                libc::fstat(datas[0].fd(), &mut s0) == 0
+                    && libc::fstat(datas[1].fd(), &mut s1) == 0
+                    && (s0.st_dev, s0.st_ino) == (s1.st_dev, s1.st_ino)
+            };
+            if !same_bo {
+                warn_once(
+                    "the planes live in different buffer objects — frames \
+                             dropped (single-fd import only)",
+                );
+                // Dropped, not downgraded: de-padding as linear would scramble chroma.
+                return true;
+            }
+            let c1 = datas[1].chunk();
+            Some((c1.offset(), c1.stride().max(0) as u32))
+        } else {
+            None
+        };
+        // iHD reads a linear import at a pitch rounded to 64 bytes, so an odd pitch shears
+        // the picture. Mutter's RENDERING-only GBM buffers pad only for SCANOUT. The
+        // de-pad copy below uploads through a driver-allocated surface instead.
+        if ud.modifier == 0
+            && linear_pitch_rounds()
+            && (stride % 64 != 0 || plane1.is_some_and(|(_, s)| s % 64 != 0))
+        {
+            break 'passthrough PassthroughFallback::UnalignedPitch;
+        }
+        // Dup so the fd outlives SPA recycle. Content stability is `try_defer`: a raw
+        // frame is published only under a hold, so the producer can never rewrite a
+        // DMA-BUF the encoder still reads. No hold — shallow pool or
+        // PUNKTFUNK_ZEROCOPY_HOLD=0 — is a safe CPU fallback, never an unsafe publish.
+
+        // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
+        // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
+        // touches no Rust memory, and returns a fresh independent CLOEXEC duplicate (or -1).
+        // The original stays owned by PipeWire; the dup is a new fd we own (checked >= 0).
+        let dup = unsafe { libc::fcntl(datas[0].fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            break 'passthrough PassthroughFallback::DupFailed;
+        }
+        let Some(hold) = ud.try_defer(a.pw_buf, a.stream) else {
+            // SAFETY: `dup` is ours and was not published.
+            unsafe { libc::close(dup) };
+            // A shortage, not a broken frame: drop it as the import lane does — the slot
+            // keeps its frame, the next arrival takes the hold that comes back. The CPU
+            // copy on this thread starves the requeues that would end the shortage; a
+            // tiled rebuild asks KWin for a new output each time (#1443 never settled).
+            // Only a pool that can never hold falls through, or nothing would stream.
+            if holds_possible(zerocopy_hold_enabled(), ud.pool.live) {
+                ud.held_drops += 1;
+                return true;
+            }
+            break 'passthrough PassthroughFallback::NoHold;
+        };
+        ud.publish(CapturedFrame {
+            provenance: Default::default(),
+            width: w as u32,
+            height: h as u32,
+            pts_ns: a.pts_ns,
+            format: fmt,
+            payload: FramePayload::Dmabuf(DmabufFrame {
+                // SAFETY: `dup` is the fresh fd `fcntl(F_DUPFD_CLOEXEC)` just returned
+                // (checked `dup >= 0`); nothing else owns it, so `OwnedFd` takes sole
+                // ownership and closes it exactly once on drop — no alias, no
+                // double-close.
+                fd: unsafe { OwnedFd::from_raw_fd(dup) },
+                fourcc,
+                modifier: ud.modifier,
+                offset,
+                stride,
+                plane1,
+                hold: Some(hold),
+                health: ud.signals.health.clone(),
+                rebuild: ud.signals.broken.clone(),
+            }),
+            // RGB→NV12 backends blend cursor-as-metadata. Gamescope burns the pointer in;
+            // native NV12/P010 has none.
+            cursor: ud.cursor.overlay(),
+        });
+        // Once per geometry, not once: a resize renegotiates the pool, and a stale
+        // stride against a new size is a sheared picture.
+        static LAST: std::sync::Mutex<(usize, usize, u32, u32)> =
+            std::sync::Mutex::new((0, 0, 0, 0));
+        let geometry = (w, h, offset, stride);
+        let changed = std::mem::replace(
+            &mut *LAST.lock().unwrap_or_else(|e| e.into_inner()),
+            geometry,
+        ) != geometry;
+        if changed {
+            tracing::info!(
+                w,
+                h,
+                offset,
+                stride,
+                fd_size = dmabuf_len(dup),
+                modifier = ud.modifier,
+                fourcc = format_args!("{:#010x}", fourcc),
+                source = match fmt {
+                    PixelFormat::Nv12 => "producer-native NV12",
+                    PixelFormat::P010 => "producer-native P010",
+                    _ => "packed RGB (encoder GPU CSC)",
+                },
+                "zero-copy: handing the raw DMA-BUF to the encoder"
+            );
+        }
+        return true;
+    };
+    !handle_passthrough_fallback(ud, reason)
+}
+
+/// dmabuf + importer: hand the held buffer to the consumer, which imports at its own tick
+/// (`import_held`), so arrivals above the wire rate cost nothing here. A buffer that cannot be
+/// held is dropped while holds are possible at all (the slot already has a held frame) and
+/// imported here only when this pool can never hold. `true` = the frame ends here; `false` =
+/// take the CPU de-pad.
+fn try_gpu_hold(ud: &mut UserData, a: &Arrival) -> bool {
+    let (datas, w, h) = (&*a.datas, a.w, a.h);
     let mut gpu_import_broken = false;
     if ud.signals.has_importer.load(Ordering::Relaxed) {
         if let Some(fmt) = ud.format {
@@ -595,7 +633,7 @@ pub(super) fn consume_frame(
                 && (!hdr_tiled || ud.hdr_tiled_raw)
             {
                 let Some(fourcc) = pf_frame::drm_fourcc(fmt) else {
-                    return; // format has no DRM fourcc mapping — skip the frame
+                    return true; // format has no DRM fourcc mapping — skip the frame
                 };
                 let plane = pf_zerocopy::DmabufPlane {
                     fd: datas[0].fd(),
@@ -604,14 +642,14 @@ pub(super) fn consume_frame(
                 };
                 // SAFETY: `fd` is the producer's open dmabuf for this buffer; F_DUPFD_CLOEXEC
                 // only creates a second descriptor.
-                let dup = unsafe { libc::fcntl(datas[0].fd() as i32, libc::F_DUPFD_CLOEXEC, 0) };
+                let dup = unsafe { libc::fcntl(datas[0].fd(), libc::F_DUPFD_CLOEXEC, 0) };
                 if dup >= 0 {
-                    if let Some(hold) = ud.try_defer(pw_buf, stream) {
+                    if let Some(hold) = ud.try_defer(a.pw_buf, a.stream) {
                         ud.publish(CapturedFrame {
                             provenance: Default::default(),
                             width: w as u32,
                             height: h as u32,
-                            pts_ns,
+                            pts_ns: a.pts_ns,
                             format: fmt,
                             payload: FramePayload::Dmabuf(DmabufFrame {
                                 // SAFETY: `dup` is a fresh descriptor this frame owns.
@@ -627,13 +665,13 @@ pub(super) fn consume_frame(
                             }),
                             cursor: ud.cursor.overlay(),
                         });
-                        return;
+                        return true;
                     }
                     // SAFETY: `dup` is ours and nothing else saw it.
                     unsafe { libc::close(dup) };
                     if holds_possible(zerocopy_hold_enabled(), ud.pool.live) {
                         ud.held_drops += 1;
-                        return;
+                        return true;
                     }
                 }
                 let cell = ud.signals.importer.clone();
@@ -655,14 +693,14 @@ pub(super) fn consume_frame(
                                 provenance: Default::default(),
                                 width: w as u32,
                                 height: h as u32,
-                                pts_ns,
+                                pts_ns: a.pts_ns,
                                 format: out_fmt,
                                 payload: FramePayload::Cuda(devbuf),
                                 cursor: ud.cursor.overlay(),
                             });
-                            return;
+                            return true;
                         }
-                        ImportOutcome::Dropped => return,
+                        ImportOutcome::Dropped => return true,
                         ImportOutcome::ImporterLost => gpu_import_broken = true,
                     }
                 }
@@ -675,7 +713,19 @@ pub(super) fn consume_frame(
     if gpu_import_broken {
         ud.signals.has_importer.store(false, Ordering::Relaxed);
     }
+    false
+}
 
+/// The CPU lane: de-pad one packed plane out of the mapped buffer, blit the pointer unless the
+/// host places it, and publish.
+fn cpu_depad(ud: &mut UserData, a: Arrival) {
+    let Arrival {
+        datas,
+        w,
+        h,
+        pts_ns,
+        ..
+    } = a;
     let d = &mut datas[0];
     // LINEAR dmabufs also land here (gamescope). Capture the fd before `data()` borrows `d`.
     let data_type = d.type_();
@@ -724,8 +774,7 @@ pub(super) fn consume_frame(
         // after the return value is confirmed `== 0`. `st` is a fresh local, so nothing aliases it.
         unsafe {
             let mut st: libc::stat = std::mem::zeroed();
-            (libc::fstat(raw_fd as i32, &mut st) == 0 && st.st_size > 0)
-                .then_some(st.st_size as usize)
+            (libc::fstat(raw_fd, &mut st) == 0 && st.st_size > 0).then_some(st.st_size as usize)
         }
     } else {
         None
@@ -735,7 +784,7 @@ pub(super) fn consume_frame(
                   // falling back to `offset + needed` maps a producer-invented length and can SIGBUS past
                   // the object. Without a real length, decline to self-map.
     let self_mapped: Option<&[u8]> = if raw_fd > 0 {
-        match fd_len.and_then(|map_len| DmabufMap::new(raw_fd as i32, map_len)) {
+        match fd_len.and_then(|map_len| DmabufMap::new(raw_fd, map_len)) {
             Some(m) => {
                 _mapping = m;
                 // SAFETY: `_mapping` is the `DmabufMap` just stored; its `ptr`/`len` come from a
@@ -744,7 +793,7 @@ pub(super) fn consume_frame(
                 // path `map_len == fd_len` (the fd's real size from `fstat`), so the mapping spans the
                 // whole object; the de-pad copy below is further bounded by the `offset <= buf.len()`
                 // and `needed > avail` guards. The `&[u8]` borrows `_mapping`, which lives to the end
-                // of `consume_frame`, so the slice never outlives the mapping, and the memory is only
+                // of `cpu_depad`, so the slice never outlives the mapping, and the memory is only
                 // read here, so there is no aliasing/mutation.
                 Some(unsafe { std::slice::from_raw_parts(_mapping.ptr as *const u8, _mapping.len) })
             }
