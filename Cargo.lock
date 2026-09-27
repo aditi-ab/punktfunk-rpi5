@@ -3253,6 +3253,7 @@ dependencies = [
  "pf-zerocopy",
  "punktfunk-core",
  "pyrowave-sys",
+ "rustix",
  "serde",
  "serde_json",
  "tracing",
@@ -3349,6 +3350,7 @@ dependencies = [
  "libloading 0.9.0",
  "pf-bitstream",
  "pf-vaapi",
+ "rustix",
  "tracing",
 ]
 

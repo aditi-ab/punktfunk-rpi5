@@ -13,7 +13,6 @@ use super::proto::{
 };
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::process::Child;
@@ -255,17 +254,17 @@ impl RemoteImporter {
         if self.dead() {
             bail!("zerocopy worker is dead");
         }
-        let key = dmabuf_key(plane.fd)?;
+        // SAFETY: `plane.fd` is the dmabuf fd of the PipeWire buffer the capture thread still
+        // holds for this callback (`consume_frame`'s contract), so it is open and stays open
+        // for this synchronous call; the `BorrowedFd` never outlives it (the key and the `send`).
+        let fd = unsafe { BorrowedFd::borrow_raw(plane.fd) };
+        let key = dmabuf_key(fd)?;
         // One retry: NeedFd (worker evicted this key) clears sent_keys so the resend carries the fd.
         let mut attempts = 0;
         let reply = loop {
             attempts += 1;
             let has_fd = self.sent_keys.insert(key);
-            // SAFETY: `plane.fd` is the dmabuf fd of the PipeWire buffer the capture thread still
-            // holds for this callback (`consume_frame`'s contract), so it is open and stays open
-            // for this synchronous call; the `BorrowedFd` never outlives it (used only for the
-            // `send`).
-            let pass = has_fd.then(|| unsafe { BorrowedFd::borrow_raw(plane.fd) });
+            let pass = has_fd.then_some(fd);
             let req = Request::Import {
                 key,
                 kind,
@@ -441,13 +440,14 @@ impl RemoteImporter {
         out: &ConvertOut,
         cursor: Option<CursorRect>,
     ) -> Result<u64> {
-        let key = dmabuf_key(src.fd)?;
+        // SAFETY: `src.fd` is the caller's live dmabuf for the duration of this call.
+        let fd = unsafe { BorrowedFd::borrow_raw(src.fd) };
+        let key = dmabuf_key(fd)?;
         let mut attempts = 0;
         loop {
             attempts += 1;
             let has_fd = self.sent_keys.insert(key);
-            // SAFETY: `src.fd` is the caller's live dmabuf for the duration of this call.
-            let pass = has_fd.then(|| unsafe { BorrowedFd::borrow_raw(src.fd) });
+            let pass = has_fd.then_some(fd);
             let req = Request::Convert {
                 key,
                 has_fd,
@@ -526,18 +526,8 @@ impl Drop for RemoteImporter {
 /// dma-buf identity, stable across frames and SCM_RIGHTS re-numbering: the
 /// kernel gives each dma-buf a unique inode for its lifetime. Worker fd-cache
 /// key, so the fd itself is passed once.
-fn dmabuf_key(fd: i32) -> Result<u64> {
-    // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
-    // `mem::zeroed()` is a sound initializer. `fd` is the caller's live dmabuf fd; `fstat` writes
-    // into `&mut st`, a live, correctly-sized stack struct that outlives the synchronous call,
-    // and `st_ino` is read only after the return value is checked.
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut st) != 0 {
-            bail!("fstat(dmabuf fd): {}", io::Error::last_os_error());
-        }
-        Ok(st.st_ino)
-    }
+fn dmabuf_key(fd: BorrowedFd<'_>) -> Result<u64> {
+    Ok(super::fd_identity(fd).context("fstat(dmabuf fd)")?.1)
 }
 
 fn open_mapping(desc: &BufferDesc) -> Result<Mapping> {
@@ -683,7 +673,7 @@ mod tests {
                 let needs_reply = matches!(req, Request::Modifiers { .. } | Request::Import { .. });
                 let ino = fd
                     .as_ref()
-                    .map(|f| dmabuf_key(f.as_raw_fd()).expect("fstat received fd"));
+                    .map(|f| dmabuf_key(f.as_fd()).expect("fstat received fd"));
                 seen.push((req, ino));
                 if needs_reply {
                     match replies.next() {
@@ -741,7 +731,7 @@ mod tests {
         assert!(imp.import(&plane, 64, 64, 1, Some(2)).is_err());
         assert!(!imp.dead(), "NeedFd handling must not mark the worker dead");
         // SCM_RIGHTS re-numbers the fd; st_ino of the open file survives.
-        let key = dmabuf_key(plane.fd).unwrap();
+        let key = dmabuf_key(pr.as_fd()).unwrap();
         drop(imp);
         let fd_sends: Vec<(bool, Option<u64>)> = join
             .join()
@@ -784,7 +774,7 @@ mod tests {
         };
         assert!(format!("{err:#}").contains("died"), "{err:#}");
         assert!(imp.dead());
-        let key = dmabuf_key(plane.fd).unwrap();
+        let key = dmabuf_key(pr.as_fd()).unwrap();
         drop(imp);
         let seen = join.join().unwrap();
         match (&seen[0], &seen[1]) {

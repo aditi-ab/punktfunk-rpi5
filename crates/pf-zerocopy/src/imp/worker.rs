@@ -543,16 +543,8 @@ mod tests {
     /// `st_ino` of an open fd. SCM_RIGHTS preserves identity while re-numbering the descriptor;
     /// the dispatch test asserts the arrived fd is the one the host sent, not just that JSON
     /// claimed one.
-    fn fd_ino(fd: impl AsRawFd) -> u64 {
-        // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
-        // `mem::zeroed()` is a sound initializer. `fd` is a live descriptor owned by the caller;
-        // `fstat` writes into the live, correctly-sized `&mut st`, and `st_ino` is read only
-        // after the return value is checked.
-        unsafe {
-            let mut st: libc::stat = std::mem::zeroed();
-            assert_eq!(libc::fstat(fd.as_raw_fd(), &mut st), 0, "fstat");
-            st.st_ino
-        }
+    fn fd_ino(fd: impl AsFd) -> u64 {
+        crate::imp::fd_identity(fd.as_fd()).expect("fstat").1
     }
 
     struct MockBackend {
@@ -567,7 +559,7 @@ mod tests {
         }
         fn import(&mut self, req: &ImportReq, fd: Option<OwnedFd>) -> Reply {
             let received = match &fd {
-                Some(f) => format!("ino:{}", fd_ino(f.as_raw_fd())),
+                Some(f) => format!("ino:{}", fd_ino(f)),
                 None => "none".into(),
             };
             let _ = self.calls.send(format!(
@@ -659,7 +651,7 @@ mod tests {
         // SCM_RIGHTS must deliver a live fd with the sender's identity. `serve` dropping it
         // (`backend.import(&req, None)`) is only caught here.
         let (pr, _pw) = std::io::pipe().unwrap();
-        let sent_ino = fd_ino(pr.as_fd().as_raw_fd());
+        let sent_ino = fd_ino(&pr);
         ipc::send(host.as_fd(), &import_req(3, true), Some(pr.as_fd())).unwrap();
         let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         assert_eq!(reply, Reply::Frame { id: 2, desc: None });

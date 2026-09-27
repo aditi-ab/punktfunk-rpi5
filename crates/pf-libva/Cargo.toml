@@ -19,6 +19,8 @@ cros-codecs = { path = "../pf-bitstream/vendor/cros-codecs" }
 [target.'cfg(target_os = "linux")'.dependencies]
 # libva is dlopen'd, never linked: a machine without it refuses cleanly.
 libloading = "0.9"
+# `fstat` on a borrowed dmabuf fd, for its size.
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 # The hardware test reads the encoder's own output back through the client's planner:

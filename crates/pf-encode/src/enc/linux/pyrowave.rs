@@ -30,7 +30,7 @@ use ash::vk::Handle as _;
 use pf_frame::{CapturedFrame, FramePayload};
 use pyrowave_sys as pw;
 use std::collections::VecDeque;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::raw::c_char;
 
 /// Shared RGB→(Y, interleaved-UV) BT.709-limited CSC, 4:2:0 8-bit. `stamp_color_bits`
@@ -1576,12 +1576,7 @@ impl PyroWaveEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        let mut st: libc::stat = std::mem::zeroed();
-        let key = if libc::fstat(d.fd.as_raw_fd(), &mut st) == 0 {
-            (st.st_dev as u64, st.st_ino as u64)
-        } else {
-            (u64::MAX, self.frame_count)
-        };
+        let key = pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.frame_count));
         if let Some(&(_, _, img, _, view)) = self.import_cache.iter().find(|e| (e.0, e.1) == key) {
             return Ok((img, view, false));
         }
