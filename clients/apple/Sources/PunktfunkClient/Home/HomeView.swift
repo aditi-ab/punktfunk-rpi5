@@ -48,12 +48,12 @@ struct HomeView: View {
     /// The host whose page is pushed.
     @State private var detailTarget: StoredHost.ID?
     #endif
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     @Environment(\.horizontalSizeClass) private var sizeClass
     /// The host whose page is up as the iPad's sheet of sections.
     @State private var sectionsHost: StoredHost?
     #endif
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(visionOS) || os(tvOS)
     /// An act the sectioned page handed back, run once the page is gone.
     @State private var pendingHandOff: HostPageRequest?
     #endif
@@ -165,7 +165,7 @@ struct HomeView: View {
             .navigationDestination(item: $speedTestTarget) { host in
                 SpeedTestView(host: host)
                     .navigationTitle("Speed Test")
-                    #if os(iOS)
+                    #if os(iOS) || os(visionOS)
                     .navigationBarTitleDisplayMode(.inline)
                     #endif
             }
@@ -182,7 +182,7 @@ struct HomeView: View {
             #endif
             #if !os(tvOS)
             .toolbar {
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 // Adjacent trailing items share one glass pill (the system default).
                 ToolbarItem(placement: .topBarTrailing) { settingsButton }
                 if showsArrangeMenu {
@@ -190,6 +190,9 @@ struct HomeView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) { refreshButton }
                 ToolbarItem(placement: .topBarTrailing) { addHostButton }
+                #if os(visionOS)
+                ToolbarItem(placement: .topBarTrailing) { NewWindowButton() }
+                #endif
                 #else
                 if showsArrangeMenu {
                     ToolbarItem(placement: .primaryAction) {
@@ -266,7 +269,7 @@ struct HomeView: View {
         .sheet(isPresented: $showAddHost) {
             AddHostSheet { store.add($0) }
         }
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // SettingsView owns its own NavigationSplitView (sidebar + detail) and Done button, so it
         // is presented directly — wrapping it in a NavigationStack here would nest a split view in
         // a stack (double title bars). `settingsSheetSizing()` widens the sheet on iPad for the
@@ -356,14 +359,14 @@ struct HomeView: View {
     private func showDetails(_ host: StoredHost) {
         #if os(macOS)
         openWindow(id: MacHostWindow.sceneID, value: host.id)
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         if sizeClass == .regular { sectionsHost = host } else { detailTarget = host.id }
         #else
         detailTarget = host.id
         #endif
     }
 
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(visionOS) || os(tvOS)
     /// The iPad's host sheet or the TV's host page closed on an act that belongs to the grid: run
     /// it now it is gone.
     private func runHandOff() {
@@ -442,14 +445,14 @@ struct HomeView: View {
         } actions: {
             Button("Add Host") { showAddHost = true }
                 .glassProminentButtonStyle()
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 .controlSize(.large)
                 #endif
             // The screen a host SHOULD have appeared on is where a rescan is worth offering
             // outright rather than hiding behind a pull gesture.
             Button("Scan Again") { discovery.refresh() }
                 .disabled(discovery.isScanning)
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 .controlSize(.large)
                 #endif
         }

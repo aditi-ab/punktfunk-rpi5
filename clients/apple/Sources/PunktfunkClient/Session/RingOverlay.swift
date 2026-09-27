@@ -11,7 +11,7 @@
 // and no software keyboard, so the touch-mode, virtual-controller and keyboard slots are dimmed
 // the way tvOS dims its own: the mouse and the real keyboard already do that work.
 
-#if os(iOS) || os(tvOS) || os(macOS)
+#if os(iOS) || os(visionOS) || os(tvOS) || os(macOS)
 import PunktfunkKit
 import PunktfunkShared
 import SwiftUI
@@ -312,7 +312,7 @@ func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> SlotSpec {
 }
 
 /// The second-press prompt for a destructive slot, in the words of the input that reaches it.
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 private let againHint = "Tap again"
 #else
 private let againHint = "Press again"
@@ -400,7 +400,7 @@ struct RingOverlay: View {
                 // while it is open. The editor has no stream under it and draws none.
                 Color.black.opacity(editing == nil ? 0.18 * (phase == 1 ? 1 : phase == 0 ? state.progress : 0) : 0)
                     .contentShape(Rectangle())
-                    #if os(iOS) || os(macOS)
+                    #if os(iOS) || os(visionOS) || os(macOS)
                     .onTapGesture {
                         if state.sheet { state.sheet = false } else { state.close() }
                     }
@@ -432,7 +432,7 @@ struct RingOverlay: View {
                     .offset(drag?.k == k ? drag?.offset ?? .zero : .zero)
                     .position(x: cx + ringRadius * q * cos(rad), y: cy + ringRadius * q * sin(rad))
                     .allowsHitTesting(q > 0)
-                    #if os(iOS) || os(macOS)
+                    #if os(iOS) || os(visionOS) || os(macOS)
                     // Editing: one gesture owns the disc, so a drag never also fires the tap.
                     // In-stream the mask leaves the Button alone.
                     .highPriorityGesture(slotDrag(k), including: editing == nil ? .subviews : .all)
@@ -502,7 +502,7 @@ struct RingOverlay: View {
                 state.hint = nil
             }
         }
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         .sensoryFeedback(.selection, trigger: state.armTick)
         .sensoryFeedback(.impact(weight: .medium), trigger: state.commitTick)
         .sensoryFeedback(.impact(weight: .light), trigger: state.pressTick)
@@ -617,7 +617,7 @@ struct RingOverlay: View {
         }
     }
 
-    #if os(iOS) || os(macOS)
+    #if os(iOS) || os(visionOS) || os(macOS)
     /// Editing: the disc's one gesture. A touch that stays put is the pick; one carried onto
     /// another slot swaps the two (§3.3); released near the centre or over its own slot it
     /// springs home and nothing changes. Masked off in-stream (see the call site).

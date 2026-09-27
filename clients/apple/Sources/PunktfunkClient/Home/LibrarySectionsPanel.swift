@@ -68,7 +68,7 @@ struct LibrarySectionsPanel: View {
                 }
                 Section { restoreButton }
             }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             .environment(\.editMode, .constant(.active))
             .navigationBarTitleDisplayMode(.inline)
             .navigationTitle("Customize Library")

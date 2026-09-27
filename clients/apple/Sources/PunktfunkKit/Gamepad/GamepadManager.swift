@@ -158,7 +158,7 @@ public final class GamepadManager: ObservableObject {
         })
         for c in GCController.controllers() { connectOrder.append(ObjectIdentifier(c)) }
         rebuild()
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // Both switches behind the menu pad live in UserDefaults and only this app writes them,
         // so one notification covers a Settings toggle of either without a call site to forget.
         observers.append(NotificationCenter.default.addObserver(
@@ -349,7 +349,7 @@ public final class GamepadManager: ObservableObject {
 
     // MARK: - Steam Controller 2 (menu)
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// The app-lifetime SC2 reader — see `Sc2MenuPad`. Nil whenever the switches below say
     /// nothing could use it, so the radio and its permission prompt cost nothing by default.
     private var sc2Menu: Sc2MenuPad?
@@ -360,7 +360,7 @@ public final class GamepadManager: ObservableObject {
     /// The live SC2 menu state for `GamepadMenuInput`'s poll — nil off iOS, and whenever no pad
     /// is delivering. Polled rather than published: see `sc2MenuAttached`.
     var sc2MenuState: Sc2Device.State? {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         return sc2Menu?.snapshot
         #else
         return nil
@@ -371,14 +371,14 @@ public final class GamepadManager: ObservableObject {
     /// subscribed to one peripheral would double-feed it, so the menu pad stands down for the
     /// stream and re-acquires after it. Only iOS has a menu pad to move.
     func holdSc2Hardware(_ held: Bool) {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         guard held != sc2HardwareHeld else { return }
         sc2HardwareHeld = held
         syncSc2Menu()
         #endif
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// Start or stop the menu pad from the two switches that decide whether anything could use
     /// it — the SC2 passthrough opt-in, which is what pays for the Bluetooth prompt, and the
     /// gamepad UI switch — plus `holdSc2Hardware`. Runs on every defaults write, so it stays an

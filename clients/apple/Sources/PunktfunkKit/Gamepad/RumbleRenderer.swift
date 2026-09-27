@@ -565,7 +565,7 @@ final class RumbleRenderer: @unchecked Sendable {
     /// iPhone has one — everything else (iPad, Mac, TV) reports no haptic hardware and latches
     /// off (nothing to retry; the settings toggle is hidden there anyway, this is the backstop).
     private func setupDevice() {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         guard CHHapticEngine.capabilitiesForHardware().supportsHaptics else {
             log.info("rumble: this device has no haptic actuator — device rumble unavailable")
             broken = true

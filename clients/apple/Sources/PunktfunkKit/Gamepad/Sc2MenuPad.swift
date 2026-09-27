@@ -18,7 +18,7 @@
 // Threading matches `Sc2Capture`: reports arrive on the link queue, `snapshot` is read from the
 // main actor, so the state sits behind a lock; the attach edge hops to main.
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 
 import Foundation
 import UIKit

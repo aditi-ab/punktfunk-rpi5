@@ -240,7 +240,7 @@ extension SettingsView {
         base.vsync = vsync
         base.windowedSafePresent = windowedSafePresent
         #endif
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         base.touchMode = touchMode
         #endif
         guard let preset = activePreset else { return base }
@@ -464,7 +464,7 @@ extension SettingsView {
     }
     #endif
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// A standard value row at the head of the settings list: label on the left, current layer on
     /// the right, the system's up/down chevron. Its caption belongs to the section FOOTER, not to
     /// the row — stacked inside the row it wrapped to four lines and made the first thing on the

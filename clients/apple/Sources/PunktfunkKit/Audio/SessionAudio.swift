@@ -252,7 +252,7 @@ public final class SessionAudio {
         let session = AVAudioSession.sharedInstance()
         let wanted = Double(wireRateHz)
         do {
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             if micEnabled {
                 // NO .defaultToSpeaker here, deliberately. It reads like "prefer the speaker over
                 // the earpiece", and the comment that used to sit here claimed headphones and
@@ -345,7 +345,7 @@ public final class SessionAudio {
                     buffer at this size.
                     """)
             }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             // Only the `.playAndRecord` session can land on the earpiece, and only it accepts an
             // output override — so the mic-off (`.playback`) path deliberately does neither.
             // (The route OBSERVER that re-applies this per route is installed by
@@ -359,7 +359,7 @@ public final class SessionAudio {
     }
     #endif
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// `.playAndRecord` parks the BUILT-IN output on the earpiece — right for a phone call,
     /// useless for a game. Move it to the speaker, but ONLY when the route we were actually given
     /// is the receiver: anything external (Bluetooth, wired, CarPlay, AirPlay) is left strictly
@@ -403,7 +403,7 @@ public final class SessionAudio {
             // other call into it.
             SessionAudio.sessionQueue.async {
                 guard let self, !self.flag.isStopped else { return }
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 self.steerBuiltInOutputToSpeaker(AVAudioSession.sharedInstance())
                 #endif
                 self.reviveStoppedEngines("the audio route changed")

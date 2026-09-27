@@ -6,7 +6,7 @@
 // input rules as the Android `VirtualPad.kt` (`padControls`, `dpadBits`, `stickWire`,
 // `triggerWire` live in the kit).
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import PunktfunkKit
 import PunktfunkShared
 import SwiftUI
@@ -93,7 +93,16 @@ final class PadControlUIView: UIView {
     private var pull: CGFloat = 0
     private var active = false
 
+    #if os(visionOS)
+    /// visionOS has no haptics, so the pad's tick is silent there.
+    private struct SilentTick {
+        func prepare() {}
+        func impactOccurred() {}
+    }
+    private static let tick = SilentTick()
+    #else
     private static let tick = UIImpactFeedbackGenerator(style: .light)
+    #endif
 
     /// Half the 1.5 pt stroke. A stroke is centred on its path, and the single discs, the
     /// D-pad cross and the trigger pill run their paths along the view's own edge — without

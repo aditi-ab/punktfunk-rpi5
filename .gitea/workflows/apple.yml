@@ -218,8 +218,8 @@ jobs:
           "$RUSTUP" target add aarch64-apple-darwin
           # The iOS/tvOS simulator slices the two scheme builds below link against.
           "$RUSTUP" target add aarch64-apple-ios aarch64-apple-ios-sim
-          # tvOS is tier-3 (no prebuilt std) — build-xcframework.sh compiles it with the PINNED
-          # nightly + -Zbuild-std, the same way the distribute and screenshots jobs do. The
+          # tvOS and visionOS are tier-3 (no prebuilt std) — build-xcframework.sh compiles them with
+          # the PINNED nightly + -Zbuild-std, the same way the distribute and screenshots jobs do. The
           # date lives in the script; rust-src must land on that toolchain, not the channel.
           NIGHTLY="$(sed -n 's/^NIGHTLY=//p' scripts/build-xcframework.sh)"
           "$RUSTUP" toolchain install "$NIGHTLY" --profile minimal
@@ -249,8 +249,8 @@ jobs:
           # inherits this from the env during the xcframework build).
           echo "CMAKE_POLICY_VERSION_MINIMUM=3.5" >> "$GITHUB_ENV"
 
-      - name: Build PunktfunkCore.xcframework (mac + iOS + tvOS slices)
-        # iOS and tvOS slices on purpose: the two scheme builds below need them. A rebuild replaces
+      - name: Build PunktfunkCore.xcframework (mac + iOS + tvOS + visionOS slices)
+        # iOS, tvOS and visionOS slices on purpose: the scheme builds below need them. A rebuild replaces
         # the whole xcframework and drops any slice not asked for, so this must stay in step with
         # them. The bundle is parked per commit, so distribute and screenshots copy it instead.
         run: sh scripts/ci/mac-xcframework.sh
@@ -292,6 +292,14 @@ jobs:
           xcodebuild -project Punktfunk.xcodeproj -scheme Punktfunk-tvOS \
             -destination 'generic/platform=tvOS Simulator' \
             -skipMacroValidation -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO build
+
+      # visionOS is a destination of the iOS scheme; its SDK ships with Xcode, no runtime needed.
+      - name: Build the visionOS app (type-check the os(visionOS) regions)
+        working-directory: clients/apple
+        run: |
+          xcodebuild -project Punktfunk.xcodeproj -scheme Punktfunk-iOS \
+            -destination 'generic/platform=visionOS Simulator' \
             CODE_SIGNING_ALLOWED=NO build
 
       - name: sccache stats (visibility only)

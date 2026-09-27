@@ -16,6 +16,10 @@ public enum NativeDisplay {
         return (
             Int(screen.frame.width * scale), Int(screen.frame.height * scale),
             screen.maximumFramesPerSecond)
+        #elseif os(visionOS)
+        // No screen to read: a window can grow past 4K's detail, and every Vision Pro runs 90 Hz.
+        // Fixed until visionOS reports a refresh ceiling; M5 panels reach 120.
+        return (3840, 2160, 90)
         #else
         let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels (tvOS: the TV mode)
         return (

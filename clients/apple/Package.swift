@@ -6,7 +6,7 @@ import PackageDescription
 
 let package = Package(
     name: "PunktfunkKit",
-    platforms: [.macOS(.v14), .iOS(.v17), .tvOS(.v17)],
+    platforms: [.macOS(.v14), .iOS(.v17), .tvOS(.v17), .visionOS("26.0")],
     products: [
         .library(name: "PunktfunkKit", targets: ["PunktfunkKit"]),
         // Dependency-free foundation (stored-host model + JSON codec, settings keys, App-Group
@@ -63,8 +63,8 @@ let package = Package(
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("ImageIO"),
                 .linkedFramework("ApplicationServices", .when(platforms: [.macOS])),
-                .linkedFramework("UIKit", .when(platforms: [.iOS, .tvOS])),
-                .linkedFramework("MobileCoreServices", .when(platforms: [.iOS, .tvOS])),
+                .linkedFramework("UIKit", .when(platforms: [.iOS, .tvOS, .visionOS])),
+                .linkedFramework("MobileCoreServices", .when(platforms: [.iOS, .tvOS, .visionOS])),
             ]
         ),
         // Development app shell (swift run PunktfunkClient): connect form → stream + input.

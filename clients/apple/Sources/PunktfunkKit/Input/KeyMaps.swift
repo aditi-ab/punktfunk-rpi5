@@ -147,7 +147,7 @@ extension InputCapture {
     #endif
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// US-layout character → Windows VK for the on-screen keyboard (`StreamLayerUIView`'s
 /// UIKeyInput). Unlike every other key source, `insertText` delivers CHARACTERS, not key
 /// positions, so this is the inverse of a US layout: `shift` means "wrap in VK_LSHIFT so the

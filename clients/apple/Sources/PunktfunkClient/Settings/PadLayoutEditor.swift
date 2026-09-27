@@ -7,7 +7,7 @@
 // landscape keeps its upright preset untouched. The chrome sits where the trio of small discs
 // is not: they ride the bottom edge on a wide layer and the top edge on a narrow one.
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import PunktfunkKit
 import PunktfunkShared
 import SwiftUI

@@ -104,7 +104,7 @@ struct StreamHUDView: View {
                     .font(.geist(11, relativeTo: .caption2))
                     .foregroundStyle(.secondary)
             }
-            #elseif os(iOS)
+            #elseif os(iOS) || os(visionOS)
             // Touch always plays directly; ⌘⎋ (hardware keyboard) captures kb/mouse.
             if !model.mouseCaptured, connection.canSendPointer || connection.canSendKeyboard {
                 Text("⌘⎋ captures keyboard & mouse")
@@ -133,7 +133,7 @@ struct StreamHUDView: View {
             #if os(macOS)
             Button("Disconnect (⌃⌥⇧D)") { model.disconnect() }
                 .font(.geist(12, relativeTo: .caption))
-            #elseif os(iOS)
+            #elseif os(iOS) || os(visionOS)
             Button("Disconnect") { model.disconnect() }
                 .font(.geist(12, relativeTo: .caption))
             #endif
@@ -177,7 +177,7 @@ struct StreamHUDView: View {
     private var cardPadding: CGFloat {
         #if os(tvOS)
         return 16
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         return max(10, cardCornerRadius * 0.45)
         #else
         return 10
@@ -189,7 +189,7 @@ struct StreamHUDView: View {
     /// radius (below); tvOS floats it well clear of the TV's overscan-ish edge; macOS windows
     /// keep the classic 10.
     private var edgeInset: CGFloat {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         return 14
         #elseif os(tvOS)
         return 24
@@ -210,7 +210,7 @@ struct StreamHUDView: View {
     /// 28 pt is the most this card's stack can wear (with `cardPadding` scaling alongside), and
     /// devices whose display radius asks for less than that still get a truly concentric corner.
     private var cardCornerRadius: CGFloat {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         return min(28, max(12, DeviceMetrics.displayCornerRadius - edgeInset))
         #elseif os(tvOS)
         return 16 // scales with the roomier padding
@@ -448,7 +448,7 @@ struct MicMutedBadge: View {
 }
 #endif
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// Device display geometry the overlay needs but UIKit doesn't expose publicly.
 enum DeviceMetrics {
     /// The physical display's corner radius. There's no public API for it, so read the private
@@ -457,6 +457,9 @@ enum DeviceMetrics {
     /// less-perfect inset, never a crash. The key is assembled from parts so it isn't a plain literal
     /// in the binary; note the App Store private-API consideration regardless.
     static var displayCornerRadius: CGFloat {
+        #if os(visionOS)
+        return 46 // every visionOS window's corner radius
+        #else
         let key = ["_display", "Corner", "Radius"].joined()
         guard
             let screen = UIApplication.shared.connectedScenes
@@ -466,6 +469,7 @@ enum DeviceMetrics {
             radius.doubleValue > 0
         else { return 44 }
         return CGFloat(radius.doubleValue)
+        #endif
     }
 }
 #endif

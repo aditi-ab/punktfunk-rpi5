@@ -15,7 +15,7 @@
 
 import PunktfunkKit
 import SwiftUI
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(visionOS) || os(macOS)
 
 extension View {
     /// Route arrows / Return / Esc into the same handlers the controller poll drives.

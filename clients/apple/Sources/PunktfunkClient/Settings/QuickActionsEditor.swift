@@ -11,7 +11,7 @@
 // open on it, a mouse drags the discs where a finger did, and there is no on-screen controller
 // to configure. A shortcut is removed from its own sheet — a macOS Form has no swipe.
 
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(visionOS) || os(macOS)
 import PunktfunkKit
 import PunktfunkShared
 import SwiftUI
@@ -40,7 +40,7 @@ struct QuickActionsEditor: View {
     @StateObject private var ring = RingState()
     @State private var picking: PickSlot?
     @State private var editingShortcut: ShortcutDraft?
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     @State private var editingLayout = false
     #endif
     /// The backdrop's middle, where the ring opens and re-opens.
@@ -99,7 +99,7 @@ struct QuickActionsEditor: View {
                      : "\(pickVerb) a button to change it, drag one onto another to swap.")
                     .font(.geist(13, relativeTo: .footnote))
             }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             // The virtual controller's preset and look (§4.3), written to the blob's `pad`
             // through the same binding the ring uses. Absent on the Mac: there is no touch screen
             // to draw it on, and a `pad` block written from here would configure nothing.
@@ -147,7 +147,7 @@ struct QuickActionsEditor: View {
                     }
                     .buttonStyle(.plain)
                 }
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 .onDelete { offsets in
                     for id in offsets.map({ cfg.shortcuts[$0].id }) { remove(id) }
                 }
@@ -189,7 +189,7 @@ struct QuickActionsEditor: View {
                 .frame(width: 460, height: 600)
                 #endif
         }
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // Full screen deliberately, not a sheet: settings live in a sheet, and on an iPad a
         // sheet is a card — its geometry (and even the wide/narrow layout class) would lie
         // about the stream the layout is for.

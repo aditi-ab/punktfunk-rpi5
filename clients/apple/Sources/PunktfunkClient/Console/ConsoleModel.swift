@@ -275,8 +275,8 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
         return min(max(share, 64 << 20), 256 << 20)
     }
 
-    /// This device's panel and its safe area, landscape, for the Aspect row. A Mac's window is
-    /// not a panel, and a TV's is standard, so neither sends one.
+    /// This device's panel and its safe area, landscape, for the Aspect row. A Mac's or a Vision
+    /// Pro's window is not a panel, and a TV's is standard, so none of them sends one.
     private static var screenSize: (Int, Int)? {
         #if os(iOS)
         let bounds = UIScreen.main.nativeBounds

@@ -3,7 +3,7 @@
 
 import SwiftUI
 
-#if os(iOS) || os(tvOS)
+#if os(iOS) || os(visionOS) || os(tvOS)
 /// The settings groups, mirroring the macOS preference tabs. On iPad each is a sidebar row that
 /// drives the detail pane; on iPhone the same list collapses to pushed sub-pages; on a TV the rows
 /// head the settings screen and focus picks one. Internal (not private) so the screenshot harness
@@ -12,7 +12,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
     // General = session/app behavior, Display = everything about the picture (resolution,
     // quality, presentation, host output), Input = touch/keyboard/mouse, which a TV has none of.
     case general, display
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     case input
     #endif
     case audio, controllers
@@ -27,7 +27,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "General"
         case .display: return "Display"
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         case .input: return "Input"
         #endif
         case .audio: return "Audio"
@@ -43,7 +43,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "gearshape"
         case .display: return "display"
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         case .input: return "keyboard"
         #endif
         case .audio: return "speaker.wave.2"
@@ -57,7 +57,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
 }
 #endif
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 extension View {
     /// Present the settings sheet large on iPad so the NavigationSplitView has room for its
     /// sidebar + detail — a default form sheet is too narrow and the split view would collapse to
