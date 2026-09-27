@@ -20,13 +20,6 @@ import VideoToolbox
 import XCTest
 @testable import PunktfunkKit
 
-/// Sendable holder for the values the (background-thread) decode callback writes.
-private final class FrameBox: @unchecked Sendable {
-    let lock = NSLock()
-    var frame: ReadyFrame?
-    var error: OSStatus?
-}
-
 final class AV1Tests: XCTestCase {
     // MARK: - OBU walk
 
@@ -204,35 +197,10 @@ final class AV1Tests: XCTestCase {
         try XCTSkipUnless(
             AV1.hardwareDecodeSupported, "no AV1 hardware decoder — AV1 is never advertised here")
 
-        let box = FrameBox()
-        let decoded = expectation(description: "decoded frame")
-        let decoder = VideoDecoder(
-            onDecoded: { frame in
-                box.lock.lock()
-                box.frame = frame
-                box.lock.unlock()
-                decoded.fulfill()
-            },
-            onDecodeError: { status in
-                box.lock.lock()
-                box.error = status
-                box.lock.unlock()
-                decoded.fulfill()
-            })
-        decoder.setCodec(.av1)
-
         let format = try XCTUnwrap(AV1.formatDescription(fromKeyframe: Data(Self.keyframeTU)))
         let au = AccessUnit(
             data: Data(Self.keyframeTU), ptsNs: 42_000_000, frameIndex: 0, flags: 0, receivedNs: 1)
-        XCTAssertTrue(decoder.decode(au: au, format: format), "hardware session must accept the keyframe")
-        wait(for: [decoded], timeout: 5)
-
-        box.lock.lock()
-        let frame = box.frame
-        let error = box.error
-        box.lock.unlock()
-        XCTAssertNil(error.map { "decode error \($0)" })
-        let ready = try XCTUnwrap(frame)
+        let ready = try decodeOnce(au, format: format) { $0.setCodec(.av1) }
         XCTAssertEqual(ready.ptsNs, 42_000_000)
         XCTAssertFalse(ready.isHDR)
         let buffer = try XCTUnwrap(ready.pixelBuffer, "a VT decode delivers a .video frame")
@@ -241,7 +209,6 @@ final class AV1Tests: XCTestCase {
         XCTAssertEqual(
             CVPixelBufferGetPixelFormatType(buffer),
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, "SDR AV1 must decode to NV12")
-        decoder.reset()
     }
 
     // MARK: - Blobs
