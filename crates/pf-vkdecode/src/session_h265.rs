@@ -534,16 +534,20 @@ impl VideoSessionH265 {
                 // Replace first so destroy of `old` runs before its backings
                 // free — the order a driver still holding the old pointers needs.
                 let old = std::mem::replace(&mut self.parameters, fresh);
-                // SAFETY: the fn-level contract — the caller drained every
-                // in-flight decode before a Recreate reached here (checked via
-                // parameters_action), so no submitted work reads the old object;
-                // it is this session's own handle, on a live device.
-                unsafe {
-                    (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                        self.device.handle(),
-                        old.object,
-                        std::ptr::null(),
-                    );
+                // The first activation has no old object. The spec lets destroy take
+                // NULL; AMD's Windows driver reads through it.
+                if old.object != vk::VideoSessionParametersKHR::null() {
+                    // SAFETY: the fn-level contract — the caller drained every
+                    // in-flight decode before a Recreate reached here (checked via
+                    // parameters_action), so no submitted work reads the old
+                    // object; it is this session's own handle, on a live device.
+                    unsafe {
+                        (self.video_queue.fp().destroy_video_session_parameters_khr)(
+                            self.device.handle(),
+                            old.object,
+                            std::ptr::null(),
+                        );
+                    }
                 }
                 // Drop only after destroy: Std blocks `old` owns must outlive
                 // the object that pointed at them.
@@ -577,17 +581,20 @@ impl VideoSessionH265 {
 impl Drop for VideoSessionH265 {
     fn drop(&mut self) {
         // SAFETY: all handles are this session's own on a live device; the
-        // decoder drains GPU work first. Destroy ignores NULL (half-built
-        // sessions). Memory bound into a session must not be freed while the
-        // session lives, so destroy the session first — a failed bind parks
-        // allocations here (`crate::session::BindFailure`). Std backings drop
-        // after this body, after the parameters object is destroyed.
+        // decoder drains GPU work first. A session that never decoded has no
+        // parameters object and skips that destroy. Memory bound into a session
+        // must not be freed while the session lives, so destroy the session
+        // first — a failed bind parks allocations here
+        // (`crate::session::BindFailure`). Std backings drop after this body,
+        // after the parameters object is destroyed.
         unsafe {
-            (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                self.device.handle(),
-                self.parameters.object,
-                std::ptr::null(),
-            );
+            if self.parameters.object != vk::VideoSessionParametersKHR::null() {
+                (self.video_queue.fp().destroy_video_session_parameters_khr)(
+                    self.device.handle(),
+                    self.parameters.object,
+                    std::ptr::null(),
+                );
+            }
             (self.video_queue.fp().destroy_video_session_khr)(
                 self.device.handle(),
                 self.session,
