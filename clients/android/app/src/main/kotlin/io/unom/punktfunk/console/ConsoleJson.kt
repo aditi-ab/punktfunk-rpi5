@@ -249,7 +249,10 @@ internal object ConsoleJson {
 
     // ---- library ------------------------------------------------------------------------------
 
-    /** `[LibraryGame]` from the Kotlin catalog — the desktop service's `to_model` mapping. */
+    /**
+     * `[LibraryGame]` from the Kotlin catalog — the desktop service's `to_model` mapping.
+     * Without `stats` the Recent and Most played sorts fall back to host order.
+     */
     fun libraryGames(games: List<GameEntry>): String {
         val out = JSONArray()
         for (g in games) {
@@ -264,6 +267,7 @@ internal object ConsoleJson {
                     .put("developer", g.developer ?: JSONObject.NULL)
                     .put("year", g.releaseYear ?: JSONObject.NULL)
                     .put("genres", JSONArray(g.genres))
+                    .put("stats", g.stats?.toJson() ?: JSONObject.NULL)
                     .put("running", false),
             )
         }

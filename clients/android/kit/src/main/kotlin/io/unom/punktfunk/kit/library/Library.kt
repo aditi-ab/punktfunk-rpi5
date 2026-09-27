@@ -42,6 +42,32 @@ data class Artwork(val portrait: String?, val header: String?, val hero: String?
     val posterCandidates: List<String> get() = listOfNotNull(portrait, header, hero)
 }
 
+/** A title's play numbers as the host keeps them (`GameEntry.stats`), in the host's keys. */
+data class GameStats(
+    val lastPlayedUnixMs: Long = 0,
+    val playTimeMs: Long = 0,
+    val lastRunMs: Long = 0,
+    val launchCount: Int = 0,
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("last_played_unix_ms", lastPlayedUnixMs)
+        .put("play_time_ms", playTimeMs)
+        .put("last_run_ms", lastRunMs)
+        .put("launch_count", launchCount)
+
+    companion object {
+        /** A missing number reads as zero: numbers are never worth an empty library. */
+        fun from(o: JSONObject?): GameStats? = o?.let {
+            GameStats(
+                lastPlayedUnixMs = it.optLong("last_played_unix_ms"),
+                playTimeMs = it.optLong("play_time_ms"),
+                lastRunMs = it.optLong("last_run_ms"),
+                launchCount = it.optInt("launch_count"),
+            )
+        }
+    }
+}
+
 /**
  * One title in the unified library. [id] is store-qualified (`steam:<appid>` / `custom:<id>`).
  *
@@ -73,6 +99,8 @@ data class GameEntry(
     val developer: String? = null,
     val releaseYear: Int? = null,
     val genres: List<String> = emptyList(),
+    /** Null until the host has launched the title once. */
+    val stats: GameStats? = null,
 ) {
     val isCustom: Boolean get() = store == "custom"
 
@@ -342,6 +370,7 @@ object LibraryClient {
                     genres = o.optJSONArray("genres")?.let { g ->
                         (0 until g.length()).mapNotNull { g.optString(it).ifBlank { null } }
                     } ?: emptyList(),
+                    stats = GameStats.from(o.optJSONObject("stats")),
                 ),
             )
         }
