@@ -1729,7 +1729,8 @@ impl NvencCudaEncoder {
         }
     }
 
-    /// Arm a live split experiment. Opt-in (`PUNKTFUNK_NVENC_SPLIT_ARBITRATE=1`).
+    /// Arm a live split experiment. Opt-in (`PUNKTFUNK_NVENC_SPLIT_ARBITRATE=1`); both
+    /// knobs come from [`crate::knobs`], as on Windows.
     ///
     /// Operator pin (`PUNKTFUNK_SPLIT_ENCODE`) wins. A cached verdict is not re-run. Sync
     /// depth-1 only: pipelined retrieve would mix queue depth into the cost. Needs ≥ 2
@@ -1737,13 +1738,11 @@ impl NvencCudaEncoder {
     /// encode time only, so it would prefer split and lose send/encode overlap. Arbitrate
     /// where nothing is traded (sub-frame already off, or AV1).
     fn arm_split_arbiter(&mut self) {
-        if !matches!(
-            std::env::var("PUNKTFUNK_NVENC_SPLIT_ARBITRATE").as_deref(),
-            Ok("1")
-        ) {
+        let knobs = crate::knobs::get();
+        if knobs.nvenc_split_arbitrate != 1 {
             return;
         }
-        if std::env::var_os("PUNKTFUNK_SPLIT_ENCODE").is_some()
+        if knobs.split_encode != 0
             || cached_split_verdict(&self.split_key()).is_some()
             || self.async_rt.is_some()
             || self.encoder_engines < 2
