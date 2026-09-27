@@ -107,9 +107,9 @@ pub struct SessionParams {
     /// Overlay vocabulary this launch resolved: Standard (`false`) or Advanced. Rides per
     /// launch like the tier, so a browse-mode presenter adopts a change made between streams.
     pub advanced_stats: bool,
-    /// Advertise `CLIENT_CAP_PHASE_LOCK`: the presenter has real on-glass latch stamps
-    /// (`VK_KHR_present_wait`) and will feed [`latch_grid`](Self::latch_grid). Never
-    /// set without present timing — the host arms on report receipt.
+    /// Advertise `CLIENT_CAP_PHASE_LOCK` and feed [`latch_grid`](Self::latch_grid). The
+    /// desktop leaves it off: the lock moves the wait for the latch into the host's hold
+    /// and costs 3–4 ms end to end on an iGPU at 4K. Never set without present timing.
     pub phase_lock: bool,
     pub latch_grid: Arc<LatchGrid>,
 }
@@ -204,7 +204,8 @@ impl SessionParams {
             height,
             ..mode
         };
-        let phase_lock = probes.vulkan.as_ref().is_some_and(|v| v.present_timing);
+        // Off on the desktop (see the field). The report path stays for a client that asks.
+        let phase_lock = false;
         let caps_444 = settings.enable_444 && probes.hevc_444_hardware;
         let advertise_hdr = settings.hdr_enabled && probes.hdr_enabled;
         // The host writes the volume into its display's EDID, so it rides only with HDR on.
