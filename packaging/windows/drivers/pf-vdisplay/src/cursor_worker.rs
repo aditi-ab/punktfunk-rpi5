@@ -30,7 +30,7 @@ use windows::Win32::System::Memory::{FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFil
 use windows::Win32::System::Threading::WaitForMultipleObjects;
 
 use crate::cursor_cell::{CursorCell, CursorImage};
-use crate::worker::{OwnedHandle, OwnedView, Sendable, Worker};
+use crate::worker::{OwnedHandle, OwnedView, Worker};
 
 /// The host's `IOCTL_SET_CURSOR_CHANNEL` delivery: the [`CursorShm`] mapping handle VALUE,
 /// already duplicated into this WUDFHost process. Owning a `CursorChannel` means owning the
@@ -159,12 +159,11 @@ pub fn setup_and_spawn(
     // Spawn BEFORE declaring: a declaration names `data_event`, which the caller closes when
     // this returns `None`. `declare = false` (a delivery landing in COMPOSITE render mode)
     // already spawns undeclared, so a later enable-flip has an event to declare against.
-    // The IddCx monitor handle is a raw pointer; the view carries its own `Send` wrapper.
+    // The IddCx monitor handle travels as an integer; the view is `Send` itself.
     let monitor_v = monitor as usize;
-    let view = Sendable(view);
     let worker = Worker::spawn("pf-vd-cursor", move |stop| {
-        let view = view; // the wrapper, not the field: the view unmaps when this thread returns
-        run_worker(monitor_v, view.0.base() as usize, data_event, stop, &cell);
+        // The view unmaps when this thread returns.
+        run_worker(monitor_v, view.base() as usize, data_event, stop, &cell);
     })?;
 
     if declare {

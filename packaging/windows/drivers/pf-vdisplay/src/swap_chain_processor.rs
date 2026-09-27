@@ -34,12 +34,12 @@ use wdk_sys::iddcx::{
 use wdk_sys::{HANDLE, NTSTATUS, WDFOBJECT, call_unsafe_wdf_function_binding};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE as WHANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{HANDLE as WHANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
         Graphics::{
             Direct3D11::ID3D11Texture2D,
             Dxgi::{IDXGIDevice, IDXGIResource},
         },
-        System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject},
+        System::Threading::{SetEvent, WaitForMultipleObjects, WaitForSingleObject},
     },
     core::Interface,
 };
@@ -47,7 +47,7 @@ use windows::{
 use crate::{
     direct_3d_device::Direct3DDevice,
     monitor::Monitor,
-    worker::{Mmcss, Sendable},
+    worker::{Mmcss, OwnedHandle, Sendable},
 };
 
 /// E_PENDING — `ReleaseAndAcquireBuffer2` returns this (HRESULT-shaped) when the swap-chain is valid but
@@ -87,23 +87,15 @@ pub struct SwapChainProcessor {
     terminate: Arc<AtomicBool>,
     /// AUTO-reset event that releases the worker's idle wait: a fresh encode session or a stop
     /// reaches it at once instead of waiting out [`IDLE_WAIT_MS`]. `None` when the event could not
-    /// be created — the worker then only has its timeout. Closed by `Drop` AFTER the worker is
-    /// joined, so [`Self::wake`] can never signal a closed handle.
-    wake: Option<WHANDLE>,
+    /// be created — the worker then only has its timeout. It closes as a field, after `Drop` has
+    /// joined the worker, so [`Self::wake`] can never signal a closed handle.
+    wake: Option<OwnedHandle>,
     thread: Option<JoinHandle<()>>,
 }
 
-// SAFETY: Raw ptr is managed by external library; access is serialised by the worker thread + the
-// terminate flag.
-unsafe impl Send for SwapChainProcessor {}
-// SAFETY: as above — the raw pointer is only touched by the serialised worker, so a shared
-// `&SwapChainProcessor` reference exposes no unsynchronised access.
-unsafe impl Sync for SwapChainProcessor {}
-
 impl SwapChainProcessor {
     pub fn new() -> Self {
-        // SAFETY: plain event creation — auto-reset, unsignalled, unnamed, no security descriptor.
-        let wake = unsafe { CreateEventW(None, false, false, None) }.ok();
+        let wake = OwnedHandle::event(false);
         if wake.is_none() {
             dbglog!("[pf-vd] swap-chain: wake event creation failed — timeout-only idle wait");
         }
@@ -118,9 +110,9 @@ impl SwapChainProcessor {
     /// pool lands, and from `Drop`. `SetEvent` never blocks, so a caller may hold the monitor's
     /// `swap` guard across it. No-op when the event could not be created (the worker polls).
     pub fn wake(&self) {
-        if let Some(h) = self.wake {
-            // SAFETY: `h` is our own event handle; `Drop` closes it only after joining the worker.
-            let _ = unsafe { SetEvent(h) };
+        if let Some(h) = &self.wake {
+            // SAFETY: `h` is our own event handle; it closes only after `Drop` joins the worker.
+            let _ = unsafe { SetEvent(h.as_raw()) };
         }
     }
 
@@ -137,7 +129,8 @@ impl SwapChainProcessor {
         available_buffer_event: HANDLE,
         monitor: Weak<Monitor>,
     ) {
-        let events = Sendable((self.wake, available_buffer_event));
+        let wake = self.wake.as_ref().map(|h| Sendable(h.as_raw()));
+        let available_buffer_event = Sendable(available_buffer_event);
         let swap_chain = Sendable(swap_chain);
         let terminate = self.terminate.clone();
         // For the log lines: 0 for a monitor the registry does not hold, whose worker only drains.
@@ -147,12 +140,12 @@ impl SwapChainProcessor {
         // swap-chain and must delete it, or IddCx keeps an undrained chain.
         let sc_raw = swap_chain.0;
         let spawned = thread::Builder::new().name("pf-vd-swapchain".into()).spawn(move || {
-            // Rust 2021 disjoint closure captures would otherwise grab the raw `swap_chain.0` /
-            // `events.0` FIELDS directly (defeating the `Sendable` Send wrapper, since the inner
-            // `*mut IDDCX_SWAPCHAIN__` / `HANDLE` are `!Send`). Rebind the WHOLE wrappers here so the
-            // closure captures them as `Sendable<_>` (which IS `Send`), then unwrap from the locals.
+            // Rust 2021 disjoint closure captures would otherwise grab the raw `.0` FIELDS
+            // directly (defeating the `Sendable` Send wrapper, since the handles inside are
+            // `!Send`). Rebind the WHOLE wrappers here so the closure captures them as `Sendable`.
             let swap_chain = swap_chain;
-            let events = events;
+            let wake = wake;
+            let available_buffer_event = available_buffer_event;
             // This thread is the whole display's frame pump: at normal priority a display-stack
             // disturbance (DDC/HPD servicing, poller-software storms) starves it into
             // multi-hundred-ms delivery holes. Reverted when the registration drops, at exit.
@@ -161,7 +154,7 @@ impl SwapChainProcessor {
             Self::run_core(
                 swap_chain.0,
                 &device,
-                events.0,
+                (wake.map(|w| w.0), available_buffer_event.0),
                 &terminate,
                 &monitor,
                 target_id,
@@ -422,13 +415,9 @@ impl Drop for SwapChainProcessor {
             // wake, an idle worker would sit out its whole timeout before seeing the flag.
             self.terminate.store(true, Ordering::Relaxed);
             self.wake();
-            // The worker deletes the swap-chain object before returning.
+            // The worker deletes the swap-chain object before returning. `wake` closes after
+            // this, as a field.
             let _ = handle.join();
-        }
-        if let Some(h) = self.wake.take() {
-            // SAFETY: the worker has been joined (or never started), so nothing can signal `h` any
-            // more; this is its sole close.
-            let _ = unsafe { CloseHandle(h) };
         }
     }
 }
