@@ -1943,11 +1943,12 @@ fn gs_encoder_bps(bitrate_kbps: u32, fec_pct: u8, packet_size: usize) -> u64 {
     video.max(500_000)
 }
 
-/// `PUNKTFUNK_GS_ADAPT=0` pins the GameStream plane's loss adaptation off — FEC percent and
-/// wire budget stay at their configured values for the whole session (the A/B lever).
+/// `PUNKTFUNK_GAMESTREAM_ADAPT` off pins the GameStream plane's loss adaptation off — FEC
+/// percent and wire budget stay at their configured values for the whole session (the A/B
+/// lever). A restart-class row, so the first read holds.
 fn gs_adapt_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| pf_host_config::knob("PUNKTFUNK_GAMESTREAM_ADAPT").as_deref() != Some("0"))
+    *ON.get_or_init(|| pf_host_config::row_bool("PUNKTFUNK_GAMESTREAM_ADAPT"))
 }
 
 /// Loss-driven FEC percent and wire budget, stepped ~1 s from client `0x0201` reports.

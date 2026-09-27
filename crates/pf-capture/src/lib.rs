@@ -32,7 +32,7 @@ pub const KWIN_POOL_MAX: i32 = 4;
 /// The ceiling is `KWIN_UNPACED_HEADROOM` times the rate, or none when the rate is unknown.
 /// `PUNKTFUNK_KWIN_PACED=1` asks for the stream rate itself.
 pub fn unpaced_capture() -> bool {
-    !pf_host_config::env_on("PUNKTFUNK_KWIN_PACED").unwrap_or(false)
+    !pf_host_config::row_bool("PUNKTFUNK_KWIN_PACED")
 }
 
 /// Offer PipeWire explicit sync (`SPA_META_SyncTimeline`) on the dmabuf lane.
@@ -54,7 +54,7 @@ pub fn explicit_sync() -> bool {
 /// `PUNKTFUNK_DIRECT_CAPTURE=0` keeps the portal.
 #[cfg(target_os = "linux")]
 pub fn direct_capture() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_DIRECT_CAPTURE").unwrap_or(true)
+    pf_host_config::row_bool("PUNKTFUNK_DIRECT_CAPTURE")
 }
 
 /// Whether a virtual output may be driven as a PipeWire lazy driver.
@@ -66,7 +66,7 @@ pub fn direct_capture() -> bool {
 /// producer-driven stream.
 #[cfg(target_os = "linux")]
 pub fn lazy_capture() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_LAZY_CAPTURE").unwrap_or(true)
+    pf_host_config::row_bool("PUNKTFUNK_LAZY_CAPTURE")
 }
 
 /// A FATAL capture fault: retrying `try_latest` cannot help — the caller must rebuild the

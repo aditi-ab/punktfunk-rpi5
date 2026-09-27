@@ -13,20 +13,10 @@ pub(super) struct SessionSwitch {
     pub(super) env: crate::vdisplay::SessionEnv,
 }
 
-/// `PUNKTFUNK_SESSION_WATCH` wins (truthy → on; `0`/`false`/`no`/`off`/empty → off). Unset defaults
-/// on for Bazzite/SteamOS (they flip Gaming↔Desktop mid-stream) and off elsewhere.
+/// `PUNKTFUNK_SESSION_WATCH` on/off wins. Auto is on for Bazzite/SteamOS (they flip
+/// Gaming↔Desktop mid-stream) and off elsewhere.
 pub(super) fn session_watch_enabled() -> bool {
-    match pf_host_config::knob("PUNKTFUNK_SESSION_WATCH") {
-        Some(v) => {
-            let v = v.trim();
-            !(v.is_empty()
-                || v == "0"
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("no")
-                || v.eq_ignore_ascii_case("off"))
-        }
-        None => is_steam_htpc_platform(),
-    }
+    pf_host_config::row_tri("PUNKTFUNK_SESSION_WATCH").unwrap_or_else(is_steam_htpc_platform)
 }
 
 /// Bazzite or SteamOS (`ID`/`ID_LIKE`). Absent os-release (non-Linux) → false.

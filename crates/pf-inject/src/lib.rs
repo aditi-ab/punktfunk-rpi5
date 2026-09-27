@@ -377,11 +377,11 @@ pub fn scroll_supported() -> bool {
 }
 
 /// Full-fidelity stylus (`HOST_CAP_PEN`). Linux only: [`pen::VirtualPen`] uinput tablet.
-/// Probe is "can we open /dev/uinput" (same permission as virtual gamepads) plus
-/// `PUNKTFUNK_PEN=0`. Welcome-time; clients without the bit fold pen into touch/pointer.
+/// Probe is "can we open /dev/uinput" (same permission as virtual gamepads) plus the
+/// `PUNKTFUNK_PEN` row. Welcome-time; clients without the bit fold pen into touch/pointer.
 #[cfg(target_os = "linux")]
 pub fn pen_supported() -> bool {
-    if pf_host_config::knob("PUNKTFUNK_PEN").as_deref() == Some("0") {
+    if !pf_host_config::row_bool("PUNKTFUNK_PEN") {
         return false;
     }
     // SAFETY: 'static NUL-terminated path literal; `open` returns a fresh fd (or -1) and
@@ -401,11 +401,11 @@ pub fn pen_supported() -> bool {
 }
 
 /// Synthetic PT_PEN/PT_TOUCH on Win10 1809+. Probe creates then destroys a PT_PEN device.
-/// Same `PUNKTFUNK_PEN=0` kill-switch. Result also stands in for PT_TOUCH (both APIs arrived
+/// Same `PUNKTFUNK_PEN` kill-switch. Result also stands in for PT_TOUCH (both APIs arrived
 /// in 1809).
 #[cfg(target_os = "windows")]
 pub fn pen_supported() -> bool {
-    if pf_host_config::knob("PUNKTFUNK_PEN").as_deref() == Some("0") {
+    if !pf_host_config::row_bool("PUNKTFUNK_PEN") {
         return false;
     }
     pen::synthetic_pen_available()

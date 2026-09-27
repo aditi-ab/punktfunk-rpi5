@@ -37,10 +37,10 @@ enum Mode {
 }
 
 fn mode() -> Mode {
-    match pf_host_config::knob("PUNKTFUNK_INSTANT_REPLAY_PAUSE").as_deref() {
-        Some("on") => Mode::On,
-        Some("off") => Mode::Off,
-        _ => Mode::Auto,
+    match pf_host_config::row_tri("PUNKTFUNK_INSTANT_REPLAY_PAUSE") {
+        Some(true) => Mode::On,
+        Some(false) => Mode::Off,
+        None => Mode::Auto,
     }
 }
 

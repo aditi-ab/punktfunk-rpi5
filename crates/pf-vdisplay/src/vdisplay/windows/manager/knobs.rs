@@ -56,12 +56,15 @@ pub(super) fn exclusive_reassert_ms() -> u64 {
 
 /// Topology for a freshly-created monitor (never `Auto`): console
 /// [`effective_topology`](crate::effective_topology) when configured, else
-/// `PUNKTFUNK_NO_ISOLATE` → `Extend`, otherwise `Exclusive`.
+/// `PUNKTFUNK_NO_ISOLATE` on (`env_on`, so `=0` is off) → `Extend`, otherwise `Exclusive`.
 pub(super) fn topology_action(client: Option<[u8; 32]>) -> crate::policy::Topology {
     let configured = crate::policy::prefs()
         .configured_effective()
         .map(|_| crate::effective_topology(client));
-    resolve_topology_action(configured, std::env::var("PUNKTFUNK_NO_ISOLATE").is_ok())
+    resolve_topology_action(
+        configured,
+        pf_host_config::env_on("PUNKTFUNK_NO_ISOLATE") == Some(true),
+    )
 }
 
 /// Unconfigured host: `PUNKTFUNK_NO_ISOLATE` → `Extend`, else `Exclusive`.

@@ -96,12 +96,12 @@ struct OperatorGamescope {
 #[cfg(target_os = "linux")]
 fn operator_gamescope() -> &'static OperatorGamescope {
     OPERATOR_GAMESCOPE.get_or_init(|| {
-        // Presence is not the grammar: `PUNKTFUNK_GAMESCOPE_ATTACH=0` must be off,
-        // matching every other host knob (`env_on`). This rung outranks dedicated
-        // spawn, so a silent inversion costs the client its own display.
+        // Presence is not the grammar: `PUNKTFUNK_GAMESCOPE_ATTACH=0` must be off, as the
+        // console shows it. This rung outranks dedicated spawn, so a silent inversion costs
+        // the client its own display.
         let ov = with_env_lock(|| OperatorGamescope {
-            managed: pf_host_config::env_on("PUNKTFUNK_GAMESCOPE_MANAGED").unwrap_or(false),
-            attach: pf_host_config::env_on("PUNKTFUNK_GAMESCOPE_ATTACH").unwrap_or(false),
+            managed: pf_host_config::row_bool("PUNKTFUNK_GAMESCOPE_MANAGED"),
+            attach: pf_host_config::row_bool("PUNKTFUNK_GAMESCOPE_ATTACH"),
             node: std::env::var("PUNKTFUNK_GAMESCOPE_NODE")
                 .ok()
                 .filter(|v| !v.is_empty()),

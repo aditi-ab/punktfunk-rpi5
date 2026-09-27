@@ -173,14 +173,10 @@ fn rgb_request() -> Option<bool> {
     parse_rgb_request(std::env::var("PUNKTFUNK_VULKAN_RGB_DIRECT").ok().as_deref())
 }
 
-/// Pure half of [`rgb_request`]: accepted spellings without mutating the process environment
-/// (parallel tests cannot).
+/// Pure half of [`rgb_request`]: the registry's boolean grammar, any case, without mutating
+/// the process environment (parallel tests cannot).
 fn parse_rgb_request(raw: Option<&str>) -> Option<bool> {
-    match raw?.trim() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
+    pf_host_config::registry::parse_bool(&raw?.trim().to_ascii_lowercase())
 }
 
 /// Unaligned RGB-direct true-extent (default ON; `PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT=0` restores
@@ -188,13 +184,13 @@ fn parse_rgb_request(raw: Option<&str>) -> Option<bool> {
 /// RADV derives nonzero VCN firmware padding (see [`RgbDirect::true_extent`]). EFC exists on
 /// Mesa ≥ 26, where `codedExtent`-driven `session_init` is guaranteed.
 fn rgb_true_extent_request() -> bool {
-    std::env::var("PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT").as_deref() != Ok("0")
+    pf_host_config::env_on("PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT").unwrap_or(true)
 }
 
 /// `PUNKTFUNK_VULKAN_DIRECT_PLANES=0`: keep the scratch-plane copies even where the driver lists
 /// the picture format as a storage target (the A/B for a driver that lists it and misrenders).
 fn direct_planes_request() -> bool {
-    std::env::var("PUNKTFUNK_VULKAN_DIRECT_PLANES").as_deref() != Ok("0")
+    pf_host_config::env_on("PUNKTFUNK_VULKAN_DIRECT_PLANES").unwrap_or(true)
 }
 
 /// `VK_KHR_video_encode_intra_refresh` latched at open (see [`intra_refresh_caps`]).
@@ -5617,13 +5613,16 @@ mod tests {
         eprintln!("done — under validation layers this run must report ZERO VUID errors");
     }
 
-    /// `PUNKTFUNK_VULKAN_RGB_DIRECT` accepts the same spellings as every sibling knob, trimmed.
+    /// `PUNKTFUNK_VULKAN_RGB_DIRECT` accepts the same spellings as every sibling knob, trimmed,
+    /// in any case.
     #[test]
     fn rgb_direct_knob_accepts_the_house_spellings() {
-        for on in ["1", "true", "yes", "on", " 1", "1 ", "\ton\n"] {
+        for on in ["1", "true", "yes", "on", " 1", "1 ", "\ton\n", "TRUE", "On"] {
             assert_eq!(parse_rgb_request(Some(on)), Some(true), "{on:?}");
         }
-        for off in ["0", "false", "no", "off", " 0", "0 ", "\toff\n"] {
+        for off in [
+            "0", "false", "no", "off", " 0", "0 ", "\toff\n", "FALSE", "Off",
+        ] {
             assert_eq!(parse_rgb_request(Some(off)), Some(false), "{off:?}");
         }
     }
