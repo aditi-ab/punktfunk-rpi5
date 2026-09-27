@@ -664,6 +664,24 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Every key the generic pad emits is the row `gamepad-button-vectors.json` gives its
+    /// bit, so the web console names a press the way an evdev dump reads it.
+    #[test]
+    fn button_map_matches_the_shared_vectors() {
+        let raw = include_str!("../../../../punktfunk-core/testdata/gamepad-button-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+        let keyed: Vec<(u32, u16)> = file["buttons"]
+            .as_array()
+            .expect("buttons array")
+            .iter()
+            .filter_map(|r| Some((r["bit"].as_u64()? as u32, r["code"].as_u64()? as u16)))
+            .collect();
+        assert_eq!(keyed.len(), BUTTON_MAP.len());
+        for pair in BUTTON_MAP {
+            assert!(keyed.contains(&pair), "{pair:x?}");
+        }
+    }
+
     /// The evdev node for `name` that also advertises `FF`. A match without it is a
     /// sibling node effects cannot be written to.
     fn find_ff_node(name: &str) -> Option<String> {

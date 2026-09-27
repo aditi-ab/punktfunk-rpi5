@@ -2,44 +2,44 @@
 // and the tests — the pad count, button bits, axis ids, and the touchpad/motion unit conversions.
 
 import Foundation
+import PunktfunkCore
 
-/// The gamepad wire contract (mirrors `punktfunk_core::input::gamepad`).
+/// The gamepad wire contract: `punktfunk_core::input::gamepad`, read from the C header.
 public enum GamepadWire {
     /// Gamepads addressable on the wire — the pad index rides the low byte of `flags` on every
-    /// per-pad event, 0...15 (`punktfunk_core::input::MAX_PADS`).
-    public static let maxPads: Int = 16
+    /// per-pad event, 0...15.
+    public static let maxPads = Int(PUNKTFUNK_MAX_PADS)
 
-    public static let dpadUp: UInt32 = 0x0001
-    public static let dpadDown: UInt32 = 0x0002
-    public static let dpadLeft: UInt32 = 0x0004
-    public static let dpadRight: UInt32 = 0x0008
-    public static let start: UInt32 = 0x0010
-    public static let back: UInt32 = 0x0020
-    public static let leftStickClick: UInt32 = 0x0040
-    public static let rightStickClick: UInt32 = 0x0080
-    public static let leftShoulder: UInt32 = 0x0100
-    public static let rightShoulder: UInt32 = 0x0200
-    public static let guide: UInt32 = 0x0400
-    public static let a: UInt32 = 0x1000
-    public static let b: UInt32 = 0x2000
-    public static let x: UInt32 = 0x4000
-    public static let y: UInt32 = 0x8000
+    public static let dpadUp = UInt32(PUNKTFUNK_BTN_DPAD_UP)
+    public static let dpadDown = UInt32(PUNKTFUNK_BTN_DPAD_DOWN)
+    public static let dpadLeft = UInt32(PUNKTFUNK_BTN_DPAD_LEFT)
+    public static let dpadRight = UInt32(PUNKTFUNK_BTN_DPAD_RIGHT)
+    public static let start = UInt32(PUNKTFUNK_BTN_START)
+    public static let back = UInt32(PUNKTFUNK_BTN_BACK)
+    public static let leftStickClick = UInt32(PUNKTFUNK_BTN_LS_CLICK)
+    public static let rightStickClick = UInt32(PUNKTFUNK_BTN_RS_CLICK)
+    public static let leftShoulder = UInt32(PUNKTFUNK_BTN_LB)
+    public static let rightShoulder = UInt32(PUNKTFUNK_BTN_RB)
+    public static let guide = UInt32(PUNKTFUNK_BTN_GUIDE)
+    public static let a = UInt32(PUNKTFUNK_BTN_A)
+    public static let b = UInt32(PUNKTFUNK_BTN_B)
+    public static let x = UInt32(PUNKTFUNK_BTN_X)
+    public static let y = UInt32(PUNKTFUNK_BTN_Y)
     /// DualSense touchpad click (Moonlight's extended-button bit position).
-    public static let touchpadClick: UInt32 = 0x10_0000
-    /// Misc / capture button — Xbox-Series Share, DualSense Create, Steam-Deck quick-access
-    /// (Moonlight's extended-button namespace; `input::gamepad::BTN_MISC1`). The host routes it to
-    /// the DualSense mute / Steam quick-access menu; a plain virtual xpad has no such button.
-    public static let misc1: UInt32 = 0x0020_0000
-    /// Back-grip paddles (Xbox Elite P1–P4 / DualSense Edge / Steam-Deck L4-L5-R4-R5), in
-    /// Moonlight's extended-button namespace (`input::gamepad::BTN_PADDLE1..4`, R4/L4/R5/L5).
-    /// Defined for wire completeness and pinned by the tests; `GamepadCapture.buttonMask` does not
-    /// read them yet — the GameController `paddleButton1..4` ↔ BTN_PADDLE physical correspondence
-    /// needs confirming on a real Elite pad first (see the gamepad-review-cleanup plan, G22), so
-    /// they are intentionally absent from `allButtons` until that forwarding lands.
-    public static let paddle1: UInt32 = 0x0001_0000
-    public static let paddle2: UInt32 = 0x0002_0000
-    public static let paddle3: UInt32 = 0x0004_0000
-    public static let paddle4: UInt32 = 0x0008_0000
+    public static let touchpadClick = UInt32(PUNKTFUNK_BTN_TOUCHPAD)
+    /// Misc / capture button — Xbox-Series Share, DualSense Create, Steam-Deck quick-access. The
+    /// host routes it to the DualSense mute / Steam quick-access menu; a plain virtual xpad has no
+    /// such button.
+    public static let misc1 = UInt32(PUNKTFUNK_BTN_MISC1)
+    /// Back-grip paddles (Xbox Elite P1–P4 / DualSense Edge / Steam-Deck L4-L5-R4-R5, as
+    /// R4/L4/R5/L5). `GamepadCapture.buttonMask` does not read them yet — the GameController
+    /// `paddleButton1..4` ↔ BTN_PADDLE physical correspondence needs confirming on a real Elite
+    /// pad first (see the gamepad-review-cleanup plan, G22), so they are intentionally absent
+    /// from `allButtons` until that forwarding lands.
+    public static let paddle1 = UInt32(PUNKTFUNK_BTN_PADDLE1)
+    public static let paddle2 = UInt32(PUNKTFUNK_BTN_PADDLE2)
+    public static let paddle3 = UInt32(PUNKTFUNK_BTN_PADDLE3)
+    public static let paddle4 = UInt32(PUNKTFUNK_BTN_PADDLE4)
 
     /// Every button `buttonMask`/`sendGuide` can set — walked by `sync`'s transition diff and by
     /// `flush` on release. Paddles are excluded until their capture lands (see above).
@@ -49,12 +49,12 @@ public enum GamepadWire {
         a, b, x, y, touchpadClick, misc1,
     ]
 
-    public static let axisLSX: UInt32 = 0
-    public static let axisLSY: UInt32 = 1
-    public static let axisRSX: UInt32 = 2
-    public static let axisRSY: UInt32 = 3
-    public static let axisLT: UInt32 = 4
-    public static let axisRT: UInt32 = 5
+    public static let axisLSX = UInt32(PUNKTFUNK_AXIS_LS_X)
+    public static let axisLSY = UInt32(PUNKTFUNK_AXIS_LS_Y)
+    public static let axisRSX = UInt32(PUNKTFUNK_AXIS_RS_X)
+    public static let axisRSY = UInt32(PUNKTFUNK_AXIS_RS_Y)
+    public static let axisLT = UInt32(PUNKTFUNK_AXIS_LT)
+    public static let axisRT = UInt32(PUNKTFUNK_AXIS_RT)
 
     /// Raw DualSense gyro units per rad/s: hid-playstation's calibration over the host's
     /// fixed blob resolves to 20 LSB per deg/s.

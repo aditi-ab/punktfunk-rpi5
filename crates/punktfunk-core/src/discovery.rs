@@ -7,7 +7,8 @@
 //! to the same set.
 //!
 //! [`rank_host_addr`] is the pure policy; [`pick_host_addr`] applies it
-//! with this machine's live context.
+//! with this machine's live context. [`advert_from_txt`] turns one resolved
+//! advert into the host record every client's browse loop keeps.
 
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 
@@ -90,9 +91,105 @@ fn routed_local_ipv4() -> Option<Ipv4Addr> {
     }
 }
 
+/// The `proto` TXT a compatible host advertises. Absent is an older host.
+const PROTO: &str = "punktfunk/1";
+
+/// One resolved `_punktfunk._udp` advert.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiscoveredHost {
+    /// Advertised host id, or the mDNS fullname when `id` is absent.
+    pub key: String,
+    /// mDNS service fullname. A removal names the advert by this.
+    pub fullname: String,
+    pub name: String,
+    pub addr: String,
+    pub port: u16,
+    /// Certificate fingerprint to pin (lowercase hex). Empty if not advertised.
+    pub fp_hex: String,
+    /// `"required"` or `"optional"`.
+    pub pair: String,
+    /// Management API port from mDNS `mgmt`. `None` if absent or `0`; the library
+    /// client then uses the well-known default.
+    pub mgmt_port: Option<u16>,
+    /// Wake-on-LAN MACs from mDNS `mac` (comma-separated `aa:bb:cc:dd:ee:ff`). Empty if absent.
+    pub mac: Vec<String>,
+    /// OS-identity chain from mDNS `os` (`windows` | `macos` | `linux[/<family>][/<id>]`),
+    /// sanitized ([`sanitize_os`]). Empty if absent.
+    pub os: String,
+}
+
+impl DiscoveredHost {
+    /// Advertised mDNS TXT `id`, or `""` when absent. [`DiscoveredHost::key`] then
+    /// equals `fullname` — that equality is the no-id signal; use this, do not re-derive.
+    pub fn advertised_id(&self) -> &str {
+        if self.key == self.fullname {
+            ""
+        } else {
+            &self.key
+        }
+    }
+}
+
+/// The host a resolved advert describes, or `None` when it is no usable punktfunk host:
+/// another `proto` (some other service sharing the type) or no IPv4 address. IPv4 only:
+/// clients dial `{host}:{port}`, which a bare IPv6 literal cannot parse. `txt` reads one
+/// TXT value; every value is unauthenticated.
+pub fn advert_from_txt<'a>(
+    fullname: &str,
+    port: u16,
+    v4: &[Ipv4Addr],
+    txt: impl Fn(&str) -> Option<&'a str>,
+) -> Option<DiscoveredHost> {
+    let val = |k: &str| txt(k).unwrap_or("");
+    let proto = val("proto");
+    if !proto.is_empty() && proto != PROTO {
+        return None;
+    }
+    let addr = pick_host_addr(v4, val("addr").parse().ok())?.to_string();
+    let id = val("id");
+    Some(DiscoveredHost {
+        key: if id.is_empty() { fullname } else { id }.to_string(),
+        fullname: fullname.to_string(),
+        name: fullname.split('.').next().unwrap_or("?").to_string(),
+        addr,
+        port,
+        fp_hex: val("fp").to_string(),
+        pair: val("pair").to_string(),
+        // Absent, unparsable and `0` all mean "not advertised".
+        mgmt_port: val("mgmt").parse().ok().filter(|&p| p != 0),
+        mac: val("mac")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        os: sanitize_os(val("os")),
+    })
+}
+
+/// Untrusted mDNS `os=` TXT, cut to at most five lowercase `[a-z0-9._-]` tokens of 32.
+/// Empty is an older host that does not advertise `os`.
+pub fn sanitize_os(raw: &str) -> String {
+    let tokens: Vec<String> = raw
+        .to_lowercase()
+        .split('/')
+        .map(|t| {
+            t.chars()
+                .filter(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+                })
+                .take(32)
+                .collect::<String>()
+        })
+        .filter(|t| !t.is_empty())
+        .take(5)
+        .collect();
+    tokens.join("/")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::rank_host_addr;
+    use super::{advert_from_txt, rank_host_addr, sanitize_os};
     use std::net::Ipv4Addr;
 
     fn ip(s: &str) -> Ipv4Addr {
@@ -157,5 +254,82 @@ mod tests {
             Some(ip("10.0.0.5"))
         );
         assert_eq!(rank_host_addr(&[], None, &[], None), None);
+    }
+
+    fn advert(txt: &[(&str, &str)]) -> Option<super::DiscoveredHost> {
+        advert_from_txt(
+            "desk._punktfunk._udp.local.",
+            9777,
+            &[ip("192.168.1.9")],
+            |k| txt.iter().find(|(key, _)| *key == k).map(|(_, v)| *v),
+        )
+    }
+
+    #[test]
+    fn an_advert_reads_into_the_host_record() {
+        let h = advert(&[
+            ("proto", "punktfunk/1"),
+            ("id", "id-1"),
+            ("fp", "ab12"),
+            ("pair", "required"),
+            ("mgmt", "47991"),
+            ("mac", " aa:bb:cc:dd:ee:01 ,,aa:bb:cc:dd:ee:02"),
+            ("os", "Linux/Fedora"),
+        ])
+        .unwrap();
+        assert_eq!(h.key, "id-1");
+        assert_eq!(h.advertised_id(), "id-1");
+        assert_eq!(h.name, "desk");
+        assert_eq!((h.addr.as_str(), h.port), ("192.168.1.9", 9777));
+        assert_eq!((h.fp_hex.as_str(), h.pair.as_str()), ("ab12", "required"));
+        assert_eq!(h.mgmt_port, Some(47991));
+        assert_eq!(h.mac, ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"]);
+        assert_eq!(h.os, "linux/fedora");
+    }
+
+    #[test]
+    fn an_older_host_reads_with_defaults() {
+        let h = advert(&[]).unwrap();
+        assert_eq!(h.key, "desk._punktfunk._udp.local.");
+        assert_eq!(h.advertised_id(), "");
+        assert_eq!(h.mgmt_port, None);
+        assert!(h.mac.is_empty() && h.os.is_empty());
+    }
+
+    #[test]
+    fn another_proto_or_no_ipv4_is_no_host() {
+        assert!(advert(&[("proto", "sunshine/1")]).is_none());
+        assert!(advert_from_txt("x.local.", 9777, &[], |_| None).is_none());
+    }
+
+    #[test]
+    fn mgmt_zero_is_not_an_advertised_port() {
+        assert_eq!(advert(&[("mgmt", "0")]).unwrap().mgmt_port, None);
+        assert_eq!(advert(&[("mgmt", "70000")]).unwrap().mgmt_port, None);
+    }
+
+    #[test]
+    fn sanitize_passes_well_formed_chains() {
+        assert_eq!(sanitize_os("windows"), "windows");
+        assert_eq!(sanitize_os("linux/fedora/bazzite"), "linux/fedora/bazzite");
+        assert_eq!(
+            sanitize_os("linux/opensuse/opensuse-tumbleweed"),
+            "linux/opensuse/opensuse-tumbleweed"
+        );
+    }
+
+    #[test]
+    fn sanitize_folds_case_and_drops_junk() {
+        assert_eq!(sanitize_os("Linux/Fedora"), "linux/fedora");
+        assert_eq!(sanitize_os("linux/fe do ra!/§"), "linux/fedora");
+        assert_eq!(sanitize_os("///"), "");
+        assert_eq!(sanitize_os(""), "");
+    }
+
+    #[test]
+    fn sanitize_caps_token_length_and_count() {
+        let long = "x".repeat(80);
+        assert_eq!(sanitize_os(&long), "x".repeat(32));
+        assert_eq!(sanitize_os("a/b/c/d/e/f/g"), "a/b/c/d/e");
     }
 }

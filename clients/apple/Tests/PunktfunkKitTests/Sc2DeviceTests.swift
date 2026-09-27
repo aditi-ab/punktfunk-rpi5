@@ -1,5 +1,5 @@
 // The Steam Controller 2 protocol tables: the per-report characteristic map, the stripped-length
-// table's parity with the host's id-INCLUDED `pf_driver_proto::triton::out_report_len`, the
+// table against `clients/shared/sc2-vectors.json`, the
 // feature-command bytes (hardware-confirmed 2026-06-08), the state parser and the WIRE_MAP —
 // all pure statics on `Sc2Device` (the DualSenseHIDTests convention: pin the wire layout
 // without a physical pad). Plus the escape-chord invariant mirror (GamepadEscapeChordTests
@@ -28,24 +28,23 @@ final class Sc2DeviceTests: XCTestCase {
         XCTAssertEqual(Sc2Device.outputCharUUID(id: 0xF0), "100f6c25-1735-4313-b402-38567131e5f3")
     }
 
-    func testStrippedLenPlusOneMatchesTheHostTableForEveryKnownId() {
-        // The host's id-INCLUDED wire lengths, verbatim from
-        // `pf_driver_proto::triton::out_report_len` (crates/pf-driver-proto/src/lib.rs): a
-        // Swift-side edit that drifts from the Rust contract fails here, GamepadWireTests-style.
-        let hostLen: [UInt8: Int] = [
-            0x80: 10, 0x81: 8, 0x82: 4, 0x83: 10, 0x84: 9, 0x85: 4, 0x86: 4,
-            0x87: 64, 0x88: 64, 0x89: 64,
-        ]
-        for (id, host) in hostLen {
-            let stripped = Sc2Device.strippedOutputLen(id: id)
-            XCTAssertNotNil(stripped, "id 0x\(String(id, radix: 16)) missing from the client table")
-            XCTAssertEqual(
-                (stripped ?? -999) + 1, host,
-                "stripped+1 must equal the host wire length for id 0x\(String(id, radix: 16))")
+    /// `clients/shared/sc2-vectors.json`: the host's id-INCLUDED lengths, which
+    /// `pf_driver_proto::triton::out_report_len` and the Kotlin table replay too.
+    func testStrippedLenPlusOneMatchesTheSharedVectors() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // PunktfunkKitTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // apple
+            .deletingLastPathComponent() // clients
+            .appendingPathComponent("shared/sc2-vectors.json")
+        let root = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        for row in try XCTUnwrap(root["out_report_len"] as? [[String: Any]]) {
+            let id = try UInt8(XCTUnwrap(row["id"] as? Int))
+            // Undeclared ids answer nil: clamp to what arrived, never guess a length.
+            let want = (row["len"] as? Int).map { $0 - 1 }
+            XCTAssertEqual(Sc2Device.strippedOutputLen(id: id), want, "id 0x\(String(id, radix: 16))")
         }
-        // Unknown ids answer nil — clamp to what arrived, never guess a length (the host's
-        // default arm is 64 = no trim, the same "never guess" policy from the other side).
-        XCTAssertNil(Sc2Device.strippedOutputLen(id: 0x8A))
         XCTAssertNil(Sc2Device.strippedOutputLen(id: 0x42))
         XCTAssertNil(Sc2Device.strippedOutputLen(id: 0x00))
     }

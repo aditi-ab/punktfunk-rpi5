@@ -19,5 +19,10 @@ publish = false
 # `min_const_generics`: Pod/Zeroable for `[u8; N]` of any N (the gamepad SHM reserved tails are >32).
 bytemuck = { version = "1.19", features = ["derive", "min_const_generics"] }
 
+[dev-dependencies]
+# Reads `clients/shared/sc2-vectors.json`. A path dependency's dev-dependencies never reach
+# the driver workspace's graph.
+serde_json = "1"
+
 [lints]
 workspace = true

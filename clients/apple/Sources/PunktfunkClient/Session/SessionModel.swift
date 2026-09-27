@@ -518,12 +518,13 @@ final class SessionModel: ObservableObject {
             // NSCursor. Capture-mode sessions keep today's composited pointer.
             #if os(macOS)
             let presentCaps: UInt8 =
-                (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop ? 0x01 : 0
+                (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop
+                ? PunktfunkConnection.clientCapCursor : 0
             #else
             // iOS/tvOS run the stage-4 deadline presenter, whose link thread feeds
-            // reportPhase — advertise the vsync-aware presenter (0x02, CLIENT_CAP_PHASE_LOCK).
+            // reportPhase — advertise the vsync-aware presenter (CLIENT_CAP_PHASE_LOCK).
             // macOS stays without it: the stage-2 arrival presenter has no latch grid.
-            let presentCaps: UInt8 = 0x02
+            let presentCaps = PunktfunkConnection.clientCapPhaseLock
             #endif
             // "Keep host audio playing": the host taps its default playback device instead of
             // parking it on a silent endpoint, so the speakers on the host PC stay live. Pure

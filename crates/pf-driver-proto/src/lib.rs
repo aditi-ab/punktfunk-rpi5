@@ -2798,8 +2798,8 @@ pub mod triton {
     /// Declared wire length (id byte included) of each OUTPUT report. hidclass pads every write
     /// to `OutputReportByteLength` (64), so the host trims before forwarding — a 0x80 rumble is
     /// 10 bytes on GATT, not 64. Unknown id returns 64: no trim, never guess a length.
-    /// Hand-mirrored on the Apple client as `Sc2Device.strippedOutputLen` (id-excluded, so
-    /// `stripped + 1` == the value here). Edit this table and that one together.
+    /// The Apple and Android `Sc2Device.strippedOutputLen` tables are this one without the id
+    /// byte; `clients/shared/sc2-vectors.json` holds all three to the same rows.
     pub const fn out_report_len(id: u8) -> usize {
         match id {
             0x80 => 10,
@@ -4762,21 +4762,19 @@ mod tests {
         assert_eq!(triton::input_len(0x01), None);
     }
 
+    /// `clients/shared/sc2-vectors.json`: the Apple and Android `strippedOutputLen` tables replay
+    /// the same rows one byte shorter.
     #[test]
-    fn triton_out_report_len_matches_the_descriptor_and_bench_table() {
-        assert_eq!(triton::out_report_len(0x80), 10);
-        assert_eq!(triton::out_report_len(0x81), 8);
-        assert_eq!(triton::out_report_len(0x82), 4);
-        assert_eq!(triton::out_report_len(0x83), 10);
-        assert_eq!(triton::out_report_len(0x84), 9);
-        assert_eq!(triton::out_report_len(0x85), 4);
-        assert_eq!(triton::out_report_len(0x86), 4);
-        assert_eq!(triton::out_report_len(0x87), 64);
-        assert_eq!(triton::out_report_len(0x88), 64);
-        assert_eq!(triton::out_report_len(0x89), 64);
-        // Undeclared ids stay whole (64 = no trim) — never guess a length.
+    fn triton_out_report_len_matches_the_shared_vectors() {
+        let raw = include_str!("../../../clients/shared/sc2-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+        for row in file["out_report_len"].as_array().expect("out_report_len") {
+            let id = row["id"].as_u64().unwrap() as u8;
+            // Undeclared ids stay whole (64 = no trim) — never guess a length.
+            let want = row["len"].as_u64().unwrap_or(64) as usize;
+            assert_eq!(triton::out_report_len(id), want, "id {id:#x}");
+        }
         assert_eq!(triton::out_report_len(0x00), 64);
-        assert_eq!(triton::out_report_len(0x8A), 64);
     }
 
     #[test]

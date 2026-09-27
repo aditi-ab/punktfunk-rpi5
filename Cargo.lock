@@ -3220,6 +3220,7 @@ name = "pf-driver-proto"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+ "serde_json",
 ]
 
 [[package]]
@@ -3270,6 +3271,7 @@ dependencies = [
  "pf-driver-proto",
  "pf-frame",
  "pyrowave-sys",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -3326,6 +3328,7 @@ dependencies = [
  "pf-win-display",
  "punktfunk-core",
  "reis",
+ "serde_json",
  "tokio",
  "tracing",
  "usbip-sim",

@@ -1,5 +1,7 @@
 package io.unom.punktfunk.kit
 
+import java.io.File
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -28,6 +30,32 @@ class Sc2ImuGateTest {
 
     private fun imuIsZero(r: ByteArray): Boolean =
         (off until off + imuLen).all { r[it] == 0.toByte() }
+
+    /** `clients/shared/sc2-vectors.json`'s trace through one gate; Swift and pf-client-core too. */
+    @Test
+    fun matchesTheSharedTrace() {
+        val file = File("../../shared/sc2-vectors.json")
+        assertTrue("the shared vector file must be reachable at ${file.absolutePath}", file.isFile)
+        val trace = JSONObject(file.readText()).getJSONArray("imu_trace")
+        val gate = Sc2ImuGate()
+        for (i in 0 until trace.length()) {
+            val step = trace.getJSONObject(i)
+            val len = step.getInt("len")
+            val ts = step.getLong("ts").toInt()
+            val r = ByteArray(len)
+            r[0] = step.getInt("id").toByte()
+            for (k in 0 until 4) r[off + k] = (ts ushr (8 * k)).toByte()
+            val end = minOf(len, off + imuLen)
+            for (k in off + 4 until end) r[k] = 0x11
+            val before = r.copyOf()
+            gate.apply(r, len)
+            if (step.getBoolean("pass")) {
+                assertTrue("step $i", before.contentEquals(r))
+            } else {
+                assertTrue("step $i", (off until end).all { r[it] == 0.toByte() })
+            }
+        }
+    }
 
     // FROZEN: frames whose IMU timestamp never advances (gyro disabled on the
     // controller, the real default). The stale non-zero IMU must come out zeroed on EVERY frame

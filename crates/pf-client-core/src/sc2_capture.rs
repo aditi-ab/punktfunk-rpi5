@@ -271,6 +271,36 @@ mod tests {
         r
     }
 
+    /// `clients/shared/sc2-vectors.json`'s trace through one gate; the Swift and Kotlin gates
+    /// replay the same file.
+    #[test]
+    fn imu_gate_matches_the_shared_trace() {
+        let raw = include_str!("../../../clients/shared/sc2-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+        let mut gate = ImuGate::default();
+        for (i, step) in file["imu_trace"]
+            .as_array()
+            .expect("imu_trace")
+            .iter()
+            .enumerate()
+        {
+            let len = step["len"].as_u64().unwrap() as usize;
+            let mut r = vec![0u8; len];
+            r[0] = step["id"].as_u64().unwrap() as u8;
+            let ts = step["ts"].as_u64().unwrap() as u32;
+            let imu = ImuGate::OFFSET..len.min(ImuGate::OFFSET + ImuGate::LEN);
+            r[ImuGate::OFFSET..ImuGate::OFFSET + 4].copy_from_slice(&ts.to_le_bytes());
+            r[ImuGate::OFFSET + 4..imu.end].fill(0x11);
+            let before = r.clone();
+            gate.apply(&mut r);
+            if step["pass"].as_bool().unwrap() {
+                assert_eq!(r, before, "step {i}");
+            } else {
+                assert!(r[imu].iter().all(|&b| b == 0), "step {i}");
+            }
+        }
+    }
+
     #[test]
     fn detects_every_sc2_identity() {
         assert_eq!(

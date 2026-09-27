@@ -7,7 +7,8 @@
 //!
 //! [`csc_rows`] is the shared coefficient table. Tests in this file pin
 //! limited-range white/black (8-bit and 10-bit P010) and the 601-vs-709 red
-//! excursion.
+//! excursion, and write `clients/shared/csc-vectors.json`, which the Swift
+//! port replays.
 
 /// Per-frame H.273. Follow this, not the session handshake.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -221,5 +222,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `csc_rows` for every matrix family (and the unspecified/other fallbacks), both ranges,
+    /// both depths and both packings, one case per line.
+    fn csc_vectors() -> String {
+        let about = "Generated from pf_client_core::video_color::csc_rows by \
+            csc_vectors_are_checked_in (UPDATE_VECTORS=1 rewrites it). The Swift CscRows tests \
+            replay every case.";
+        let mut cases = Vec::new();
+        for matrix in [1u8, 2, 5, 6, 7, 9, 10] {
+            for full_range in [false, true] {
+                for (depth, msb_packed) in [(8u8, false), (10, false), (10, true)] {
+                    let rows = csc_rows(desc(matrix, full_range), depth, msb_packed);
+                    let rows = rows.map(|r| format!("[{}, {}, {}, {}]", r[0], r[1], r[2], r[3]));
+                    cases.push(format!(
+                        "    {{\"matrix\": {matrix}, \"full_range\": {full_range}, \
+                         \"depth\": {depth}, \"msb_packed\": {msb_packed}, \"rows\": [{}]}}",
+                        rows.join(", ")
+                    ));
+                }
+            }
+        }
+        format!(
+            "{{\n  \"$comment\": \"{about}\",\n  \"cases\": [\n{}\n  ]\n}}\n",
+            cases.join(",\n")
+        )
+    }
+
+    #[test]
+    fn csc_vectors_are_checked_in() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../clients/shared/csc-vectors.json"
+        );
+        let fresh = csc_vectors();
+        if std::env::var_os("UPDATE_VECTORS").is_some() {
+            std::fs::write(path, &fresh).unwrap();
+        }
+        let on_disk = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            on_disk == fresh,
+            "{path} is stale: rerun with UPDATE_VECTORS=1"
+        );
     }
 }

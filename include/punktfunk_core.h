@@ -533,7 +533,7 @@
 // [`USER_FLAG_RECOVERY_POINT`]: the picture is fully swept on this AU. A client that
 // has seen the bit lifts on the first close after a start seen since its loss instead
 // of counting two marks, so a close whose wave began before the loss never lifts.
-#define USER_FLAG_RECOVERY_CLOSE 512
+#define PUNKTFUNK_USER_FLAG_RECOVERY_CLOSE 512
 
 // `user_flags` bit. Each `shard_payload`-sized window of the frame buffer
 // is a self-delimiting codec packet, zero-padded. Missing shards stay zero
@@ -574,32 +574,32 @@
 #define PUNKTFUNK_MIN_STREAM_BLOCK_SHARDS 16
 
 // DualSense `0xCC`, pad-audio, rumble, and virtual-pad creation (no bit, no uinput node).
-#define PUNKTFUNK_GRANT_GAMEPAD (1 << 0)
+#define PUNKTFUNK_GRANT_GAMEPAD 1
 
 // Mouse, scroll, touch, and the pen plane.
-#define PUNKTFUNK_GRANT_POINTER (1 << 1)
+#define PUNKTFUNK_GRANT_POINTER 2
 
 // Key down/up and IME-committed text.
-#define PUNKTFUNK_GRANT_KEYBOARD (1 << 2)
+#define PUNKTFUNK_GRANT_KEYBOARD 4
 
 // Clipboard coordinator. ANDed with the operator clipboard policy; never overrides it.
-#define PUNKTFUNK_GRANT_CLIPBOARD (1 << 3)
+#define PUNKTFUNK_GRANT_CLIPBOARD 8
 
 // Mic datagram plane and the per-session mic-service attach.
-#define PUNKTFUNK_GRANT_MIC (1 << 4)
+#define PUNKTFUNK_GRANT_MIC 16
 
 // `Hello.launch` resolution.
-#define PUNKTFUNK_GRANT_LAUNCH (1 << 5)
+#define PUNKTFUNK_GRANT_LAUNCH 32
 
 // `power.*` (sleep/reboot/shutdown) on the mgmt cert lane (`design/host-actions.md`).
 // Not a datagram; [`classify`] is untouched. Machine power only — never plugin actions.
-#define PUNKTFUNK_GRANT_POWER (1 << 6)
+#define PUNKTFUNK_GRANT_POWER 64
 
-// An omitted Welcome or registry mask reads as this.
-#define PUNKTFUNK_GRANT_ALL ((((((PUNKTFUNK_GRANT_GAMEPAD | PUNKTFUNK_GRANT_POINTER) | PUNKTFUNK_GRANT_KEYBOARD) | PUNKTFUNK_GRANT_CLIPBOARD) | PUNKTFUNK_GRANT_MIC) | PUNKTFUNK_GRANT_LAUNCH) | PUNKTFUNK_GRANT_POWER)
+// An omitted Welcome or registry mask reads as this: every bit above.
+#define PUNKTFUNK_GRANT_ALL 127
 
 // Stored "Full control" before [`GRANT_POWER`]. [`normalize_legacy_full`] lifts it.
-#define PUNKTFUNK_GRANT_ALL_PRE_POWER (((((PUNKTFUNK_GRANT_GAMEPAD | PUNKTFUNK_GRANT_POINTER) | PUNKTFUNK_GRANT_KEYBOARD) | PUNKTFUNK_GRANT_CLIPBOARD) | PUNKTFUNK_GRANT_MIC) | PUNKTFUNK_GRANT_LAUNCH)
+#define PUNKTFUNK_GRANT_ALL_PRE_POWER 63
 
 // The management API rejects these; it never silently clears unknown bits
 // (that would grant less than the caller asked).

@@ -620,6 +620,38 @@ pub fn validate_dimensions(codec: Codec, width: u32, height: u32) -> Result<()> 
 mod tests {
     use super::*;
 
+    /// The host's per-axis wall is the client's render-scale clamp: both read
+    /// `clients/shared/render-scale-vectors.json`, and every size a client asks for passes here.
+    #[test]
+    fn walls_match_the_render_scale_vectors() {
+        let raw = include_str!("../../../clients/shared/render-scale-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+        let all = [Codec::H264, Codec::H265, Codec::Av1, Codec::PyroWave];
+        let codec = |label: &str| all.into_iter().find(|c| c.label() == label);
+        let rows = file["max_dimension"].as_array().expect("max_dimension");
+        for c in all {
+            let row = rows
+                .iter()
+                .find(|r| r["codec"] == c.label())
+                .unwrap_or_else(|| panic!("no max_dimension row for {c:?}"));
+            assert_eq!(
+                u64::from(c.max_dimension()),
+                row["max"].as_u64().unwrap(),
+                "{c:?}"
+            );
+        }
+        for case in file["apply"].as_array().expect("apply") {
+            let Some(c) = codec(case["codec"].as_str().unwrap()) else {
+                continue;
+            };
+            let want = case["want"].as_array().unwrap();
+            let (w, h) = (want[0].as_u64().unwrap(), want[1].as_u64().unwrap());
+            if let Err(e) = validate_dimensions(c, w as u32, h as u32) {
+                panic!("{}: {e}", case["name"]);
+            }
+        }
+    }
+
     /// The knob is held to what the hardware can deliver. One engine cannot split, and its
     /// ceiling is `DISABLE` rather than a named mode, so the ordered comparison alone let an
     /// operator's `=2`/`=3` through on a GPU that would then encode narrower in silence.
