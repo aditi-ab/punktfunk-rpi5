@@ -1,7 +1,6 @@
 //! The trust dialogs in front of a connect: TOFU, the SPAKE2 PIN ceremony, and
-//! delegated (request-access) approval. The trust GATE itself (rules 1–3) lives in
-//! `AppModel::update` (`AppMsg::Connect`); these are the interaction surfaces it opens,
-//! each resolving into typed [`AppMsg`]s.
+//! delegated (request-access) approval. The trust GATE itself is `orchestrate::trust_route`;
+//! `AppModel::connect` opens these surfaces for it, each resolving into typed [`AppMsg`]s.
 
 use crate::app::{AppModel, AppMsg};
 use crate::spawn::{CancelHandle, SpawnOpts};

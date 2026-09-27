@@ -49,6 +49,49 @@ impl From<&KnownHost> for HostTarget {
     }
 }
 
+/// Where a connect goes before it dials. Each front-end opens its own surface per arm.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrustRoute {
+    /// A stored pin: dial silently.
+    Pinned(String),
+    /// A new fingerprint where another is pinned: PIN only, even under `pair=optional`.
+    /// It may be an impostor; the other OS of a dual-boot box pairs once with a PIN.
+    FingerprintChanged,
+    /// A new host advertising `pair=optional`: this fingerprint may be trusted on first use.
+    OfferTofu(String),
+    /// PIN or delegated approval.
+    NeedsPairing,
+}
+
+/// The connect trust gate. `advertised_fp` follows [`KnownHosts::resolve_index`]: `None`
+/// is a typed address and takes the record pinned there; `Some("")` is a card saved
+/// without a pin and has none. A placeholder is no pin, so a fingerprint arriving at one
+/// is a new host, not a changed one.
+pub fn trust_route(
+    known: &KnownHosts,
+    advertised_fp: Option<&str>,
+    addr: &str,
+    port: u16,
+    pair_optional: bool,
+) -> TrustRoute {
+    // `find_by_addr` prefers a pinned record, so this misses only when none is pinned here.
+    let pinned_here = || {
+        known
+            .find_by_addr(addr, port)
+            .filter(|h| !h.fp_hex.is_empty())
+    };
+    match advertised_fp {
+        None => pinned_here().map_or(TrustRoute::NeedsPairing, |h| {
+            TrustRoute::Pinned(h.fp_hex.clone())
+        }),
+        Some("") => TrustRoute::NeedsPairing,
+        Some(fp) if known.find_by_fp(fp).is_some() => TrustRoute::Pinned(fp.to_string()),
+        Some(_) if pinned_here().is_some() => TrustRoute::FingerprintChanged,
+        Some(fp) if pair_optional => TrustRoute::OfferTofu(fp.to_string()),
+        Some(_) => TrustRoute::NeedsPairing,
+    }
+}
+
 /// One session, every policy question already answered. Front-ends do not re-decide.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectPlan {
@@ -954,6 +997,41 @@ mod tests {
             mac: vec!["aa:bb:cc:dd:ee:ff".into()],
             id: Some(id.into()),
             ..Default::default()
+        }
+    }
+
+    /// A stored pin dials; a new fingerprint where another is pinned asks for a PIN even
+    /// under `pair=optional`; a placeholder holds no pin to change.
+    #[test]
+    fn trust_route_sends_a_changed_fingerprint_to_the_pin() {
+        use TrustRoute::*;
+        let (desk, other, fresh) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let (desk, other, fresh) = (desk.as_str(), other.as_str(), fresh.as_str());
+        let known = KnownHosts {
+            hosts: vec![
+                host("Desk", "10.0.0.2", "1", desk),
+                host("Typed", "10.0.0.3", "2", ""),
+            ],
+        };
+        for (fp, addr, optional, want) in [
+            (Some(desk), "10.0.0.2", false, Pinned(desk.into())),
+            (Some(desk), "10.0.0.9", false, Pinned(desk.into())), // a moved lease
+            (Some(other), "10.0.0.2", true, FingerprintChanged),
+            (Some(other), "10.0.0.2", false, FingerprintChanged),
+            (Some(fresh), "10.0.0.9", true, OfferTofu(fresh.into())),
+            (Some(fresh), "10.0.0.9", false, NeedsPairing),
+            (Some(fresh), "10.0.0.3", true, OfferTofu(fresh.into())),
+            (Some(fresh), "10.0.0.3", false, NeedsPairing),
+            // A card saved without a pin never borrows the one pinned at its address.
+            (Some(""), "10.0.0.2", false, NeedsPairing),
+            (Some(""), "10.0.0.3", true, NeedsPairing),
+            // A typed address takes whatever is pinned there.
+            (None, "10.0.0.2", false, Pinned(desk.into())),
+            (None, "10.0.0.3", false, NeedsPairing),
+            (None, "10.0.0.9", true, NeedsPairing),
+        ] {
+            let got = trust_route(&known, fp, addr, 9777, optional);
+            assert_eq!(got, want, "{fp:?} at {addr}, optional {optional}");
         }
     }
 
