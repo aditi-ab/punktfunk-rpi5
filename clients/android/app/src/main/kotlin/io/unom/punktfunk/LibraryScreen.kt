@@ -77,6 +77,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.ImageLoader
 import io.unom.punktfunk.components.launcherIcon
+import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.link.DeepLinks
 import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.library.LibraryClient
@@ -84,9 +85,9 @@ import io.unom.punktfunk.kit.library.LibraryResult
 import io.unom.punktfunk.kit.library.LibraryCache
 import io.unom.punktfunk.kit.library.RunningGame
 import io.unom.punktfunk.kit.security.ClientIdentity
-import io.unom.punktfunk.kit.security.IdentityStore
+import io.unom.punktfunk.kit.security.IdentityHolder
 import io.unom.punktfunk.kit.security.KnownHost
-import io.unom.punktfunk.kit.security.obtainIdentity
+import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.LaunchHold
 import kotlin.math.PI
@@ -208,6 +209,7 @@ fun LibraryScreen(
         PresetStore(context).resolveFor(host, pinnedPresetId)
     }
     val streamSettings = remember(settings, preset) { settings.effectiveFor(preset) }
+    val knownHostStore = remember { KnownHostStore(context) }
 
     // Keyed on the mgmt port too: a discovery tick can learn it after this screen is composed, and
     // the fetch must redo itself against the real port rather than stay on a stale 47990 failure.
@@ -251,12 +253,7 @@ fun LibraryScreen(
             launching = false
             if (handle != 0L) {
                 onLaunched(
-                    ActiveSession(
-                        handle,
-                        streamSettings,
-                        host.clipboardSync,
-                        presetName = preset?.name,
-                        hostId = host.id,
+                    SessionFactory.afterDial(handle, host, streamSettings, preset, knownHostStore).copy(
                         // Where to come back to when this game exits — this shelf, pin and all,
                         // not the host's default one.
                         launchedFromLibrary = true,
@@ -274,7 +271,7 @@ fun LibraryScreen(
             } else {
                 Toast.makeText(
                     context,
-                    "Launch failed — check the host and try again.",
+                    ConnectErrors.connectMessage(NativeBridge.nativeTakeLastError(), requestAccess = false),
                     Toast.LENGTH_LONG,
                 ).show()
             }
@@ -421,7 +418,7 @@ private suspend fun loadLibrary(
  */
 private suspend fun prepareLoader(context: Context, host: KnownHost): Pair<ClientIdentity, ImageLoader>? =
     withContext(Dispatchers.IO) {
-        val id = runCatching { obtainIdentity(IdentityStore(context)) }.getOrNull() ?: return@withContext null
+        val id = IdentityHolder.shared(context).await() ?: return@withContext null
         val loader = runCatching { posterLoader(context, id, host.address, host.fpHex) }.getOrNull()
             ?: return@withContext null
         id to loader

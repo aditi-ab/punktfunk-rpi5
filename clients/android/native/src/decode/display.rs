@@ -8,21 +8,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::latency::now_realtime_ns;
+use super::latency::{now_realtime_ns, take_by_pts};
 use super::RENDERED_CAP;
-
-/// `CLOCK_MONOTONIC` now in nanoseconds — the base of the `systemNano` render timestamp the
-/// `OnFrameRendered` callback reports (Android's `System.nanoTime`), read only to re-base that
-/// stamp onto `CLOCK_REALTIME` (see [`on_frame_rendered`]).
-fn now_monotonic_ns() -> i128 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `clock_gettime` with a valid out-pointer is an always-safe syscall.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128
-}
+use crate::sys::now_monotonic_ns;
 
 /// State shared between the decode loop and the `AMediaCodec` `OnFrameRendered` callback (which
 /// fires on a codec-internal thread): rendered frames awaiting their render timestamp, so the HUD
@@ -48,10 +36,10 @@ pub(super) struct DisplayTracker {
     /// Always-on latch/display accumulator for the presenter's 1 Hz `pf-present` line —
     /// independent of the HUD gate, so a HUD-off A/B stays measurable from logcat.
     meter: Arc<super::presenter::PresentMeter>,
-    /// `(pts_us, decoded_real_ns, released_real_ns)` of frames released with `render = true`, in
+    /// `(pts_us, (decoded_real_ns, released_real_ns))` of frames released with `render = true`, in
     /// release order, awaiting their callback. Pushed on EVERY render (no HUD gate — the ring is
     /// a 64-tuple bound and the latch metric wants to exist when nobody is watching).
-    rendered: Mutex<VecDeque<(u64, i128, i128)>>,
+    rendered: Mutex<VecDeque<(u64, (i128, i128))>>,
 }
 
 impl DisplayTracker {
@@ -77,7 +65,7 @@ impl DisplayTracker {
             .rendered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.push_back((pts_us, decoded_ns, released_ns));
+        g.push_back((pts_us, (decoded_ns, released_ns)));
         if g.len() > RENDERED_CAP {
             g.pop_front(); // render callbacks stopped coming (allowed under load) — evict
         }
@@ -178,27 +166,17 @@ unsafe extern "C" fn on_frame_rendered(
     // `Arc::into_raw` pointer from `install_render_callback`, whose refcount is held for as long as
     // the codec exists, and the codec is what delivers this call.
     let t = unsafe { &*(userdata as *const DisplayTracker) };
-    let displayed_ns = now_realtime_ns() - (now_monotonic_ns() - system_nano as i128);
+    let displayed_ns =
+        now_realtime_ns() - (i128::from(now_monotonic_ns()) - i128::from(system_nano));
     let pts_us = media_time_us.max(0) as u64;
-    // Pair the frame back to its release record, evicting older entries (their callbacks were
-    // dropped by the platform) — same monotonic-eviction discipline as `note_decoded_pts`.
-    let mut paired = None;
-    {
-        let mut g = t
+    // Pair the frame back to its release record; older entries' callbacks were dropped.
+    let paired = take_by_pts(
+        &mut t
             .rendered
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while let Some(&(p, d, r)) = g.front() {
-            if p > pts_us {
-                break; // future frame — leave it for its own callback
-            }
-            g.pop_front();
-            if p == pts_us {
-                paired = Some((d, r));
-                break;
-            }
-        }
-    }
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        pts_us,
+    );
     // Clamped to (0, 10 s) like the e2e sample: a vendor's first render callbacks can carry a
     // garbage `system_nano` (observed on-glass: an epoch-sized latch max on the session's first
     // window), and one such sample would poison every max/percentile it lands in.

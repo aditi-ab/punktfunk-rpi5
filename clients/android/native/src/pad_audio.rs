@@ -377,10 +377,7 @@ fn run(client: &NativeClient, stop: &AtomicBool, pad: u8, fd: i32, haptics: bool
     // Ask the scheduler for audio priority. Android does not hand SCHED_FIFO to ordinary app
     // threads, so -16 (ANDROID_PRIORITY_AUDIO) is the realistic knob — and WP7 measured that it
     // both applies and is enough to hold the 4 ms floor against eight busy cores.
-    // SAFETY: `setpriority` on the calling thread; no pointers, no shared state.
-    unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, 0, -16);
-    }
+    let _ = crate::sys::set_thread_nice(None, -16);
 
     // SAFETY: the caller's contract — the Java connection outlives this thread.
     let dev = unsafe { sink::device(fd) };

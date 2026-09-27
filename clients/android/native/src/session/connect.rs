@@ -10,10 +10,7 @@ use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::{
-    get_session, hex, insert_session, jni_guard, lock_recover, parse_hex32, remove_session,
-    SessionHandle,
-};
+use super::{hex, jni_guard, lock_recover, parse_hex32, SessionHandle, SESSIONS};
 
 /// Machine token of the most recent `nativeConnect`/`nativePair` failure, taken (and cleared)
 /// by `nativeTakeLastError` so Kotlin can render a cause-specific message instead of the old
@@ -89,22 +86,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetLowLaten
 /// Kotlin `FEATURE_PartialFrame` probe said no — the rebuild-free on-glass experiment for a
 /// decoder that may accept `BUFFER_FLAG_PARTIAL_FRAME` without declaring the feature (the NP3's
 /// c2.qti decoders declare nothing). Android-only; everywhere else the probe verdict stands.
-#[cfg(target_os = "android")]
 fn force_parts_sysprop() -> bool {
-    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
-                             // SAFETY: __system_property_get with a valid name + PROP_VALUE_MAX buffer is always safe.
-    let n = unsafe {
-        libc::__system_property_get(
-            c"debug.punktfunk.force_parts".as_ptr(),
-            buf.as_mut_ptr().cast(),
-        )
-    };
-    n > 0 && std::str::from_utf8(&buf[..n as usize]).unwrap_or("").trim() == "1"
-}
-
-#[cfg(not(target_os = "android"))]
-fn force_parts_sysprop() -> bool {
-    false
+    crate::sys::sysprop(c"debug.punktfunk.force_parts").as_deref() == Some("1")
 }
 
 /// The rates this session may ask for when the one the user chose will not open, best first.
@@ -627,7 +610,7 @@ fn connect(req: ConnectRequest) -> jlong {
                 src_crop: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 decoded_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             };
-            insert_session(handle)
+            SESSIONS.insert(handle)
         }
         Err(e) => {
             log::error!("nativeConnect to {host}:{port} failed: {e}");
@@ -647,7 +630,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     _this: JObject,
     handle: jlong,
 ) {
-    jni_guard((), || drop(remove_session(handle)))
+    jni_guard((), || drop(SESSIONS.remove(handle)))
 }
 
 /// Mark an explicit user disconnect so the host skips reconnect linger.
@@ -661,7 +644,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQ
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(session) = get_session(handle) {
+        if let Some(session) = SESSIONS.get(handle) {
             session.client.disconnect_quit();
         }
     })
@@ -684,7 +667,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRequestMode
         if width <= 0 || height <= 0 || refresh_hz <= 0 {
             return false;
         }
-        let Some(session) = get_session(handle) else {
+        let Some(session) = SESSIONS.get(handle) else {
             return false;
         };
         session
@@ -706,7 +689,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerp
     _this: JObject<'local>,
     handle: jlong,
 ) -> JString<'local> {
-    let out = get_session(handle)
+    let out = SESSIONS
+        .get(handle)
         .map(|session| hex(&session.client.host_fingerprint))
         .unwrap_or_default();
     env.with_env(|env| env.new_string(out))
@@ -724,7 +708,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnde
     handle: jlong,
 ) -> jboolean {
     jni_guard(false, || {
-        get_session(handle).is_some_and(|session| session.client.is_session_ended())
+        SESSIONS
+            .get(handle)
+            .is_some_and(|session| session.client.is_session_ended())
     })
 }
 
@@ -739,7 +725,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
     handle: jlong,
 ) -> jint {
     jni_guard(0, || {
-        get_session(handle)
+        SESSIONS
+            .get(handle)
             .map(|session| session.client.end_reason() as jint)
             .unwrap_or(0)
     })

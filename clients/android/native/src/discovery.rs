@@ -8,15 +8,15 @@
 //! daemon down and joins its fold thread. This makes stop-vs-poll races safe without JVM callbacks
 //! or Rust pointers crossing JNI.
 
-use crate::session::jni_guard;
+use crate::session::{jni_guard, HandleTable};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JObject, JString};
 use jni::sys::jlong;
 use jni::EnvUnowned;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -200,40 +200,7 @@ impl Drop for Discovery {
     }
 }
 
-static NEXT_DISCOVERY_HANDLE: AtomicU64 = AtomicU64::new(0x3000_0000_0000_0001);
-
-fn discoveries() -> &'static Mutex<HashMap<jlong, Arc<Discovery>>> {
-    static DISCOVERIES: OnceLock<Mutex<HashMap<jlong, Arc<Discovery>>>> = OnceLock::new();
-    DISCOVERIES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn insert_discovery(discovery: Discovery) -> jlong {
-    let discovery = Arc::new(discovery);
-    let mut discoveries = crate::session::lock_recover(discoveries());
-    loop {
-        let handle = NEXT_DISCOVERY_HANDLE.fetch_add(1, Ordering::Relaxed) as jlong;
-        if handle != 0 && !discoveries.contains_key(&handle) {
-            discoveries.insert(handle, discovery);
-            return handle;
-        }
-    }
-}
-
-fn get_discovery(handle: jlong) -> Option<Arc<Discovery>> {
-    if handle == 0 {
-        return None;
-    }
-    crate::session::lock_recover(discoveries())
-        .get(&handle)
-        .cloned()
-}
-
-fn remove_discovery(handle: jlong) -> Option<Arc<Discovery>> {
-    if handle == 0 {
-        return None;
-    }
-    crate::session::lock_recover(discoveries()).remove(&handle)
-}
+static DISCOVERIES: HandleTable<Discovery> = HandleTable::new(0x3000_0000_0000_0001);
 
 /// The [`Host`] a resolved mDNS record describes, or `None` if it isn't a usable punktfunk host
 /// (see `punktfunk_core::discovery::advert_from_txt`, the parse every client shares).
@@ -267,7 +234,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoverySt
     _this: JObject,
 ) -> jlong {
     jni_guard(0, || match Discovery::start() {
-        Some(discovery) => insert_discovery(discovery),
+        Some(discovery) => DISCOVERIES.insert(discovery),
         None => 0,
     })
 }
@@ -284,7 +251,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPo
     // `LogErrorAndDefault` logs then yields `JString::default()` — the null reference the old
     // `std::ptr::null_mut()` default returned. Kotlin still sees a null String on failure.
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        let out = get_discovery(handle)
+        let out = DISCOVERIES
+            .get(handle)
             .map(|discovery| discovery.snapshot())
             .unwrap_or_default();
         env.new_string(out)
@@ -300,7 +268,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryRe
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(discovery) = get_discovery(handle) {
+        if let Some(discovery) = DISCOVERIES.get(handle) {
             discovery.rescan();
         }
     })
@@ -314,7 +282,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoverySt
     _this: JObject,
     handle: jlong,
 ) {
-    jni_guard((), || drop(remove_discovery(handle)))
+    jni_guard((), || drop(DISCOVERIES.remove(handle)))
 }
 
 #[cfg(test)]

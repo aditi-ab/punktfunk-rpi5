@@ -13,13 +13,13 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::asc_presenter::{asc_backend_selected, sysprop, AscBackend};
+use super::asc_presenter::{asc_backend_selected, AscBackend};
 use super::display::{
     apply_reported_dataspace, color_dataspace, install_render_callback, release_render_callback,
     reported_dataspace, DisplayTracker,
 };
 use super::latency::{
-    note_decoded_pts, note_received_frame, now_realtime_ns, take_flags, take_stamp,
+    note_decoded_pts, note_received_frame, now_realtime_ns, take_by_pts, take_flags,
 };
 use super::presenter::{presenter_disabled_by_sysprop, PresentMeter, PresentPriority, Presenter};
 use super::setup::{
@@ -27,9 +27,10 @@ use super::setup::{
     low_latency_format, try_set_frame_rate,
 };
 use super::surface_control::{Layer, PresentComplete};
-use super::vsync::{now_monotonic_ns, VsyncClock, VsyncShared};
+use super::vsync::{VsyncClock, VsyncShared};
 use super::{Backstops, DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP};
 use crate::input_stall::{InputStall, INPUT_STALL_PATIENCE};
+use crate::sys::{now_monotonic_ns, sysprop};
 
 /// One decoded output buffer ready to release: its codec buffer index + the pts the codec echoed
 /// (from the output callback's `BufferInfo`), used to pair the `decode` HUD stat, and the
@@ -1088,7 +1089,7 @@ impl State {
             } else {
                 None
             };
-            let queued = take_stamp(&mut self.queued_stamps, o.pts_us);
+            let queued = take_by_pts(&mut self.queued_stamps, o.pts_us);
             let codec_us = queued.map(|q| ((o.decoded_ns - q).max(0) / 1000) as u64);
             let feed_us = match (queued, received_ns) {
                 (Some(q), Some(r)) => Some(((q - r).max(0) / 1000) as u64),

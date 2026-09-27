@@ -18,59 +18,23 @@ use jni::objects::{JByteArray, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
 use jni::EnvUnowned;
 
-use crate::session::jni_guard;
+use crate::session::{jni_guard, HandleTable};
 use pf_client_core::menu_nav::MenuSample;
 use pf_console_ui::bridge::{self, CreateOptions, EntryJson, MenuCode, PadsJson, PresetJson};
 use pf_console_ui::{
     HostRow, Insets, LibraryGame, LibraryPhase, PairPhase, Platform, SpeedPhase, Stale, WakeStatus,
 };
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// How long `nativeConsoleNextEvent` blocks at most — short enough that Kotlin's poll thread
 /// notices `running = false` promptly on teardown (the rumble poll's cadence).
 const EVENT_TIMEOUT: Duration = Duration::from_millis(100);
 
-static NEXT_CONSOLE_HANDLE: AtomicU64 = AtomicU64::new(0x2000_0000_0000_0001);
-
-fn console_hosts() -> &'static Mutex<HashMap<jlong, Arc<ConsoleHost>>> {
-    static HOSTS: OnceLock<Mutex<HashMap<jlong, Arc<ConsoleHost>>>> = OnceLock::new();
-    HOSTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn insert_host(host: ConsoleHost) -> jlong {
-    let host = Arc::new(host);
-    let mut hosts = crate::session::lock_recover(console_hosts());
-    loop {
-        let handle = NEXT_CONSOLE_HANDLE.fetch_add(1, Ordering::Relaxed) as jlong;
-        if handle != 0 && !hosts.contains_key(&handle) {
-            hosts.insert(handle, host);
-            return handle;
-        }
-    }
-}
-
-fn host(handle: jlong) -> Option<Arc<ConsoleHost>> {
-    if handle == 0 {
-        return None;
-    }
-    crate::session::lock_recover(console_hosts())
-        .get(&handle)
-        .cloned()
-}
+static CONSOLES: HandleTable<ConsoleHost> = HandleTable::new(0x2000_0000_0000_0001);
 
 /// A Kotlin `Int` code as the `u8` the bridge decoders read; out of range is unknown.
 fn code(v: jint) -> Option<u8> {
     u8::try_from(v).ok()
-}
-
-fn remove_host(handle: jlong) -> Option<Arc<ConsoleHost>> {
-    if handle == 0 {
-        return None;
-    }
-    crate::session::lock_recover(console_hosts()).remove(&handle)
 }
 
 fn json_arg<T: serde::de::DeserializeOwned>(env: &mut jni::Env, s: &JString) -> Option<T> {
@@ -97,7 +61,7 @@ macro_rules! json_pusher {
             json: JString,
         ) {
             env.with_env(|env| -> jni::errors::Result<()> {
-                if let (Some($h), Some($v)) = (host(handle), json_arg::<$ty>(env, &json)) {
+                if let (Some($h), Some($v)) = (CONSOLES.get(handle), json_arg::<$ty>(env, &json)) {
                     $apply;
                 }
                 Ok(())
@@ -132,7 +96,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleCrea
                 return Ok(0);
             }
         };
-        Ok(insert_host(host))
+        Ok(CONSOLES.insert(host))
     })
     .resolve::<LogErrorAndDefault>()
 }
@@ -146,7 +110,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleDest
     handle: jlong,
 ) {
     jni_guard((), || {
-        drop(remove_host(handle));
+        drop(CONSOLES.remove(handle));
     })
 }
 
@@ -160,7 +124,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSurf
     surface: JObject,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        let Some(h) = host(handle) else {
+        let Some(h) = CONSOLES.get(handle) else {
             return Ok(());
         };
         // SAFETY: `env`/`surface` are valid JNI pointers for this call; the raw casts bridge the
@@ -188,7 +152,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSurf
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
+        if let Some(h) = CONSOLES.get(handle) {
             h.shared.send(Cmd::SurfaceChanged);
         }
     })
@@ -204,7 +168,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSurf
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
+        if let Some(h) = CONSOLES.get(handle) {
             h.shared.destroy_surface_blocking();
         }
     })
@@ -224,7 +188,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetV
     scale: jfloat,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
+        if let Some(h) = CONSOLES.get(handle) {
             h.shared.send(Cmd::Viewport {
                 insets: Insets {
                     left: left.max(0.0),
@@ -254,7 +218,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsolePadS
     dpad: jint,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
+        if let Some(h) = CONSOLES.get(handle) {
             let bit = |v: jint, i: u32| v & (1 << i) != 0;
             h.shared.send(Cmd::PadSample(MenuSample {
                 buttons: [
@@ -286,7 +250,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleMenu
     event: jint,
 ) {
     jni_guard((), || {
-        let (Some(h), Some(code)) = (host(handle), code(event).and_then(bridge::menu_code)) else {
+        let (Some(h), Some(code)) = (CONSOLES.get(handle), code(event).and_then(bridge::menu_code))
+        else {
             return;
         };
         h.shared.send(match code {
@@ -312,7 +277,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsolePoin
 ) {
     jni_guard((), || {
         let input = code(kind).and_then(|kind| bridge::pointer_code(kind, x, y, dy));
-        if let (Some(h), Some(input)) = (host(handle), input) {
+        if let (Some(h), Some(input)) = (CONSOLES.get(handle), input) {
             h.shared.send(Cmd::Pointer(input));
         }
     })
@@ -331,7 +296,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleKey(
     repeat: jboolean,
 ) {
     jni_guard((), || {
-        if let (Some(h), Some(key)) = (host(handle), code(key).and_then(bridge::key_code)) {
+        if let (Some(h), Some(key)) = (CONSOLES.get(handle), code(key).and_then(bridge::key_code)) {
             h.shared.send(Cmd::Key { key, shift, repeat });
         }
     })
@@ -347,7 +312,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleText
     text: JString,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        if let (Some(h), Ok(t)) = (host(handle), text.try_to_string(env)) {
+        if let (Some(h), Ok(t)) = (CONSOLES.get(handle), text.try_to_string(env)) {
             h.shared.send(Cmd::Text(t));
         }
         Ok(())
@@ -367,7 +332,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSess
     message: JString,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        let Some(h) = host(handle) else {
+        let Some(h) = CONSOLES.get(handle) else {
             return Ok(());
         };
         // Decoded on the render thread: `SessionPhase` borrows the message.
@@ -414,7 +379,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleNext
     handle: jlong,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        let out = match host(handle).and_then(|h| h.shared.next_event(EVENT_TIMEOUT)) {
+        let out = match CONSOLES
+            .get(handle)
+            .and_then(|h| h.shared.next_event(EVENT_TIMEOUT))
+        {
             Some(ev) => ev.to_json(),
             None => String::new(),
         };
@@ -432,7 +400,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleDrai
     handle: jlong,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        let out = match host(handle) {
+        let out = match CONSOLES.get(handle) {
             Some(h) => {
                 let cmds = h.handles.bus.drain();
                 serde_json::to_string(&cmds).unwrap_or_else(|_| "[]".into())
@@ -482,7 +450,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleAdva
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         if let (Some(h), Ok(k), Some(p)) = (
-            host(handle),
+            CONSOLES.get(handle),
             key.try_to_string(env),
             json_arg::<SpeedPhase>(env, &json),
         ) {
@@ -502,7 +470,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleNoti
     text: JString,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        if let (Some(h), Ok(t)) = (host(handle), text.try_to_string(env)) {
+        if let (Some(h), Ok(t)) = (CONSOLES.get(handle), text.try_to_string(env)) {
             h.handles.console.set_notice(t);
         }
         Ok(())
@@ -520,7 +488,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
+        if let Some(h) = CONSOLES.get(handle) {
             h.handles.library.begin_fetch();
         }
     })
@@ -561,7 +529,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
     cached: jboolean,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        if let (Some(h), Some(games)) = (host(handle), json_arg::<Vec<LibraryGame>>(env, &json)) {
+        if let (Some(h), Some(games)) = (
+            CONSOLES.get(handle),
+            json_arg::<Vec<LibraryGame>>(env, &json),
+        ) {
             if cached {
                 h.handles.library.set_games_cached(games);
             } else {
@@ -584,7 +555,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
     bytes: JByteArray,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        let Some(h) = host(handle) else {
+        let Some(h) = CONSOLES.get(handle) else {
             return Ok(());
         };
         let id = id.try_to_string(env)?;
@@ -612,7 +583,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
     stale: jint,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
+        if let Some(h) = CONSOLES.get(handle) {
             h.handles
                 .library
                 .set_stale(code(stale).map_or(Stale::No, bridge::stale_code));

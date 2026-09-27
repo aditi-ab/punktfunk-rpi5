@@ -7,7 +7,7 @@
 //! Not android-gated: `next_rumble`/`next_hidout` are pure-Rust on the `quic` feature, so these
 //! compile on the host build too (parity with the input shims in [`crate::session`]).
 
-use crate::session::{get_session, jni_guard};
+use crate::session::{jni_guard, SESSIONS};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteBuffer, JObject};
 use jni::sys::{jint, jlong};
@@ -70,7 +70,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
 ) -> jlong {
     // Runs on a Kotlin poll thread, so a panic here would abort the process; guard the boundary.
     jni_guard(-1, || {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return -1;
         };
         match h.client.next_rumble_command(PULL_TIMEOUT) {
@@ -114,7 +114,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
     // rather than `Err`, so the policy's default is unreachable by construction.
     jni_guard(-1, || {
         env.with_env_no_catch(|env| -> jni::errors::Result<jint> {
-            let Some(h) = get_session(handle) else {
+            let Some(h) = SESSIONS.get(handle) else {
                 return Ok(-1);
             };
             let ev = match h.client.next_hidout(PULL_TIMEOUT) {

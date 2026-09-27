@@ -7,10 +7,16 @@ import android.util.Log
 import io.unom.punktfunk.kit.NativeBridge
 import java.io.File
 import java.security.KeyStore
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Future
+import java.util.concurrent.FutureTask
+import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import kotlin.concurrent.thread
 
 private const val TAG = "PunktfunkIdentity"
 
@@ -46,8 +52,8 @@ fun splitGenerated(joined: String): ClientIdentity? {
 /** Serialises the mint below. Process-wide: the two shells share one file, not one store object. */
 private val MINT_LOCK = Any()
 
-/** Bound callers put on [obtainIdentity]: the keystore answers in ms, so a wedge must surface. */
-const val IDENTITY_OBTAIN_TIMEOUT_MS = 10_000L
+/** How long [IdentityHolder] waits on [obtainIdentity]: the keystore answers in ms, a wedge never. */
+private const val IDENTITY_OBTAIN_TIMEOUT_MS = 10_000L
 
 // Three in-band attempts absorb a transient KeyMint failure without making the player tap again.
 private const val IDENTITY_MINT_ATTEMPTS = 3
@@ -58,9 +64,10 @@ private const val IDENTITY_MINT_RETRY_DELAY_MS = 100L
  * an [IdentityLoad.Unrecoverable] surfaces as a throw so the UI can tell the user (re-pair) rather
  * than silently swapping in a new identity (which would change our fingerprint everywhere).
  *
- * Both shells start this on a background thread. The lock and re-read make concurrent first-run
- * calls share one persisted identity. A first mint can fail transiently in KeyMint, so the same
- * call retries in-band and re-reads before each attempt; it never mints over a recovered identity.
+ * [IdentityHolder] runs this on a background thread, and a retry can overlap a wedged call. The
+ * lock and re-read make concurrent first-run calls share one persisted identity. A first mint can
+ * fail transiently in KeyMint, so the same call retries in-band and re-reads before each attempt;
+ * it never mints over a recovered identity.
  */
 fun obtainIdentity(store: IdentityStore): ClientIdentity =
     when (val r = store.load()) {
@@ -74,6 +81,88 @@ fun obtainIdentity(store: IdentityStore): ClientIdentity =
         is IdentityLoad.Unrecoverable ->
             throw IdentityUnrecoverableException(r.reason, r.cause)
     }
+
+/**
+ * The device identity, loaded once per process and shared by both shells. Three states: a load in
+ * flight, ready ([current]), or failed — the obtain threw or outlived [timeoutMs], which a wedged
+ * keystore does. A guarded action that finds no identity shows [blockedMessage], which re-kicks a
+ * failed load, so the tap that reports the failure is also its retry.
+ */
+class IdentityHolder internal constructor(
+    private val obtain: () -> ClientIdentity,
+    private val timeoutMs: Long = IDENTITY_OBTAIN_TIMEOUT_MS,
+    private val onFailure: (Throwable) -> Unit = { Log.w(TAG, "identity unavailable", it) },
+) {
+    @Volatile
+    var current: ClientIdentity? = null
+        private set
+
+    /** The last load ended without an identity. Stays set while a retry is in flight. */
+    @Volatile
+    var failed = false
+        private set
+
+    /** The first load has ended, with or without an identity. */
+    val settled: Boolean get() = current != null || failed
+
+    private var pending: Future<ClientIdentity?>? = null
+
+    /** Start a load unless one is ready or in flight. The future settles within [timeoutMs]. */
+    @Synchronized
+    fun ensure(): Future<ClientIdentity?> {
+        current?.let { return CompletableFuture.completedFuture(it) }
+        pending?.let { return it }
+        val obtained = FutureTask(obtain)
+        val waited = FutureTask {
+            val id = try {
+                obtained.get(timeoutMs, TimeUnit.MILLISECONDS)
+            } catch (e: Exception) {
+                onFailure((e as? ExecutionException)?.cause ?: e)
+                null
+            }
+            settle(id)
+            id
+        }
+        pending = waited
+        thread(isDaemon = true, name = "pf-identity") { obtained.run() }
+        thread(isDaemon = true, name = "pf-identity-wait") { waited.run() }
+        return waited
+    }
+
+    /** [ensure], then wait for it: the identity, or null once the load failed. Blocks. */
+    fun await(): ClientIdentity? = ensure().get()
+
+    /** The line a guarded action shows while [current] is null. Re-kicks a failed load. */
+    fun blockedMessage(): String {
+        if (!failed) return NOT_READY
+        ensure()
+        return UNAVAILABLE
+    }
+
+    @Synchronized
+    private fun settle(id: ClientIdentity?) {
+        current = id
+        failed = id == null
+        pending = null
+    }
+
+    companion object {
+        const val NOT_READY = "Identity not ready yet — try again in a moment"
+        const val UNAVAILABLE =
+            "Couldn't create an identity — this device's secure key storage isn't working"
+
+        @Volatile
+        private var instance: IdentityHolder? = null
+
+        /** The process's one holder. */
+        fun shared(context: Context): IdentityHolder =
+            instance ?: synchronized(this) {
+                instance ?: context.applicationContext.let { app ->
+                    IdentityHolder({ obtainIdentity(IdentityStore(app)) })
+                }.also { instance = it }
+            }
+    }
+}
 
 /** Retry a genuine first-run mint, re-reading before every attempt so a persisted identity wins. */
 internal fun obtainAbsentIdentity(
