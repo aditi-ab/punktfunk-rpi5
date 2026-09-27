@@ -187,8 +187,3 @@ pub(crate) unsafe fn compile_program_with(frag: &[u8]) -> Result<u32> {
         Ok(prog)
     }
 }
-
-pub(crate) unsafe fn compile_program() -> Result<u32> {
-    // SAFETY: the GL context is current on this thread (forwarded to `compile_program_with`).
-    unsafe { compile_program_with(FRAG_SRC) }
-}

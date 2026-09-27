@@ -372,7 +372,7 @@ fn alloc_rows(row_bytes: usize, rows: usize, what: &str) -> Result<(CUdeviceptr,
 }
 
 /// A pitched plane: `(ptr, pitch)`.
-type PlaneSpan = (CUdeviceptr, usize);
+pub type PlaneSpan = (CUdeviceptr, usize);
 
 /// One buffer in `layout`: `(ptr, pitch)`, plus NV12's chroma as its own allocation.
 /// YUV444 stacks Y, U and V in the one allocation, so the wire carries it like one plane.
@@ -599,6 +599,25 @@ impl DeviceBuffer {
         self.layout() == PlaneLayout::Nv12
     }
 
+    /// Each plane as `((ptr, pitch), (row_bytes, rows))`, in layout order: NV12 chroma from its
+    /// own allocation, stacked planes one after another under [`ptr`](Self::ptr).
+    pub fn plane_spans(&self) -> impl Iterator<Item = (PlaneSpan, (usize, usize))> + '_ {
+        let mut stacked = self.ptr;
+        let planes = self.layout().planes(self.width, self.height);
+        planes
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, (_, rows))| rows > 0)
+            .map(move |(i, (row_bytes, rows))| {
+                let at = match (i, self.uv()) {
+                    (1, Some(uv)) => uv,
+                    _ => (stacked, self.pitch),
+                };
+                stacked += (self.pitch * rows) as CUdeviceptr;
+                (at, (row_bytes, rows))
+            })
+    }
+
     /// [`ptr`](Self::ptr) holds 3·[`height`](Self::height) stacked Y, U, V rows.
     pub fn is_yuv444(&self) -> bool {
         self.layout() == PlaneLayout::Yuv444
@@ -697,13 +716,6 @@ impl RegisteredTexture {
         }
     }
 
-    /// Map, copy the linear RGBA8 array into `dst`, unmap. Syncs before unmap so `dst` is
-    /// ready before the dmabuf is recycled.
-    pub fn copy_mapped_to(&mut self, dst: &DeviceBuffer) -> Result<()> {
-        let [(row_bytes, rows), ..] = PlaneLayout::Packed32.planes(dst.width, dst.height);
-        self.copy_mapped_plane(dst.ptr, dst.pitch, row_bytes, rows)
-    }
-
     /// Map and copy into `(dst_ptr, dst_pitch)` for `width_bytes`×`height`, one plane of
     /// [`PlaneLayout::planes`]. Syncs before unmap; always unmaps, even on copy error.
     fn copy_mapped_plane(
@@ -746,31 +758,14 @@ impl RegisteredTexture {
     }
 }
 
-/// Copy registered `R8` luma + `RG8` chroma into `dst`'s NV12 planes. Both copies sync
-/// before return.
-pub fn copy_mapped_nv12(
-    y_tex: &mut RegisteredTexture,
-    uv_tex: &mut RegisteredTexture,
+/// Copy each registered texture into the matching plane of `dst`, in layout order. Each copy
+/// syncs before return.
+pub fn copy_mapped_planes<'a>(
+    textures: impl IntoIterator<Item = &'a mut RegisteredTexture>,
     dst: &DeviceBuffer,
 ) -> Result<()> {
-    let (uv_ptr, uv_pitch) = dst
-        .uv()
-        .ok_or_else(|| anyhow::anyhow!("copy_mapped_nv12 on a non-NV12 buffer"))?;
-    let [(y_bytes, y_rows), (uv_bytes, uv_rows), _] =
-        PlaneLayout::Nv12.planes(dst.width, dst.height);
-    y_tex.copy_mapped_plane(dst.ptr, dst.pitch, y_bytes, y_rows)?;
-    uv_tex.copy_mapped_plane(uv_ptr, uv_pitch, uv_bytes, uv_rows)
-}
-
-/// Copy three full-res `R8` textures into `dst`'s stacked YUV444 planes (`[0,H)` Y, `[H,2H)` U,
-/// `[2H,3H)` V). Each copy syncs before return.
-pub fn copy_mapped_yuv444(textures: [&mut RegisteredTexture; 3], dst: &DeviceBuffer) -> Result<()> {
-    anyhow::ensure!(dst.is_yuv444(), "copy_mapped_yuv444 on a non-YUV444 buffer");
-    let planes = PlaneLayout::Yuv444.planes(dst.width, dst.height);
-    let mut at = dst.ptr;
-    for (tex, (row_bytes, rows)) in textures.into_iter().zip(planes) {
-        tex.copy_mapped_plane(at, dst.pitch, row_bytes, rows)?;
-        at += (dst.pitch * rows) as CUdeviceptr;
+    for (tex, ((ptr, pitch), (row_bytes, rows))) in textures.into_iter().zip(dst.plane_spans()) {
+        tex.copy_mapped_plane(ptr, pitch, row_bytes, rows)?;
     }
     Ok(())
 }
@@ -835,15 +830,7 @@ fn copy_planes_to_device(
     dsts: &[(CUdeviceptr, usize)],
     sync: bool,
 ) -> Result<()> {
-    let planes = src.layout().planes(src.width, src.height);
-    let mut stacked = src.ptr;
-    for (i, (&dst, (row_bytes, rows))) in dsts.iter().zip(planes).enumerate() {
-        // NV12 chroma is its own allocation; YUV444 stacks every plane under Y.
-        let from = match (i, src.uv()) {
-            (1, Some(uv)) => uv,
-            _ => (stacked, src.pitch),
-        };
-        stacked += (src.pitch * rows) as CUdeviceptr;
+    for (&dst, (from, (row_bytes, rows))) in dsts.iter().zip(src.plane_spans()) {
         let copy = device_copy(from, dst, row_bytes, rows);
         // SAFETY: caller: context current. `copy` outlives the enqueue. `from` is a plane of
         // the live `src` inside its allocation (the layout's own plane table); `dst` is the
