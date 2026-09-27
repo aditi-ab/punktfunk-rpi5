@@ -3,10 +3,12 @@ import { ArrowLeft, Eye, EyeOff, Trash2 } from "lucide-react";
 import { type FC, useState } from "react";
 import type { OperatorGameEntry } from "@/api/gen/model/operatorGameEntry";
 import { LauncherIcon } from "@/components/launcher-icon";
+import {
+	PasswordConfirmField,
+	type PasswordFailure,
+} from "@/components/password-confirm";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { m } from "@/paraglide/messages";
 
 export interface EntryHeaderProps {
@@ -24,6 +26,8 @@ export interface EntryHeaderProps {
 	gated: boolean;
 	password: string;
 	onPassword: (value: string) => void;
+	/** Why the BFF refused the last save's password, if it did. */
+	failure?: PasswordFailure;
 	/** Absent on a read-only entry. */
 	onSave?: () => void;
 	onDelete?: () => void;
@@ -87,6 +91,7 @@ export const EntryHeader: FC<EntryHeaderProps> = ({
 	gated,
 	password,
 	onPassword,
+	failure = null,
 	onSave,
 	onDelete,
 	deleting,
@@ -171,18 +176,14 @@ export const EntryHeader: FC<EntryHeaderProps> = ({
 			{/* Saving a command, or a row that carries prep, runs code as the host user: the
 			    console password is asked for exactly when the BFF gate applies. */}
 			{onSave && gated && (
-				<div className="max-w-sm space-y-2">
-					<Label htmlFor="entry-password">{m.library_field_password()}</Label>
-					<Input
+				<div className="max-w-sm">
+					<PasswordConfirmField
 						id="entry-password"
-						type="password"
-						autoComplete="current-password"
 						value={password}
-						onChange={(e) => onPassword(e.target.value)}
+						onChange={onPassword}
+						failure={failure}
+						help={m.library_field_password_help()}
 					/>
-					<p className="text-xs text-muted-foreground">
-						{m.library_field_password_help()}
-					</p>
 				</div>
 			)}
 			{error && (

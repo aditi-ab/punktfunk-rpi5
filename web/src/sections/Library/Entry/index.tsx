@@ -20,8 +20,10 @@ import {
 } from "@/api/gen/library/library";
 import type { OperatorGameEntry } from "@/api/gen/model/operatorGameEntry";
 import { useDialogs } from "@/components/dialogs";
+import { passwordFailure } from "@/components/password-confirm";
 import { QueryState } from "@/components/query-state";
 import { Card, CardContent } from "@/components/ui/card";
+import { carriesCommandExecution } from "@/lib/command-execution";
 import { apiErrorMessage } from "@/lib/errors";
 import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
@@ -32,7 +34,6 @@ import {
 	type FormState,
 	formFrom,
 	formFromStored,
-	needsPassword,
 	toInput,
 	withPassword,
 } from "./model";
@@ -126,7 +127,7 @@ const EntryEditor: FC<{
 	const readOnly = entry !== null && !owned;
 	const dirty = !readOnly && JSON.stringify(draft) !== JSON.stringify(baseline);
 	const input = toInput(draft);
-	const gated = !readOnly && needsPassword(input);
+	const gated = !readOnly && carriesCommandExecution(input);
 
 	useBlocker({
 		shouldBlockFn: async ({ current, next }) => {
@@ -208,6 +209,8 @@ const EntryEditor: FC<{
 	};
 
 	const source = entry?.provider ?? entry?.store;
+	const saveError = create.error ?? update.error;
+	const failure = passwordFailure(saveError);
 	return (
 		<EntryView
 			entry={entry}
@@ -234,12 +237,13 @@ const EntryEditor: FC<{
 				gated,
 				password,
 				onPassword: setPassword,
+				failure,
 				onSave: readOnly ? undefined : save,
 				onDelete: entry && owned ? onDelete : undefined,
 				deleting: remove.isPending,
 				onToggleHidden: entry ? onToggleHidden : undefined,
 				hiding: setHidden.isPending,
-				error: apiErrorMessage(create.error ?? update.error),
+				error: failure ? null : apiErrorMessage(saveError),
 			}}
 		/>
 	);

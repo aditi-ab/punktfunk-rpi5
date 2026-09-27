@@ -1,7 +1,7 @@
 // PUT /api/v1/library/provider/{provider} — the reconcile route a provider plugin uses to publish
 // its whole set of entries at once. It carries the SAME primitive the create/update routes gate:
-// an entry in the payload can bring `prep` or a `launch.kind === "command"`, both run verbatim as
-// the host user. The host defers the "is this the operator's authority?" question to the console
+// an entry in the payload can bring `prep` or a privileged launch kind, both run as the host
+// user. The host defers the "is this the operator's authority?" question to the console
 // (mgmt/library.rs), and the console must actually ask it — otherwise a bare session cookie plants
 // a persistent command through this lane while `custom.post.ts`/`custom/[id].put.ts` are gated.
 // See util/libraryConfirm.ts; security-review 2026-08-15 finding 6.

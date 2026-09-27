@@ -786,6 +786,27 @@ mod tests {
         assert!(!valid_entry_id(&format!("s:{}", "x".repeat(ENTRY_ID_MAX))));
     }
 
+    /// The console and the plugin kit reject early by these same cases.
+    #[test]
+    fn shared_id_and_url_vectors_hold() {
+        let raw = include_str!("../../../../clients/shared/library-id-vectors.json");
+        let v: serde_json::Value = serde_json::from_str(raw).expect("vectors parse");
+        let cases = |key: &str| {
+            v[key].as_array().expect("case list").iter().map(|c| {
+                let fill = c["fill"].as_str().unwrap_or("");
+                let count = c["count"].as_u64().unwrap_or(0) as usize;
+                let value = format!("{}{}", c["value"].as_str().unwrap(), fill.repeat(count));
+                (value, c["valid"].as_bool().unwrap())
+            })
+        };
+        for (id, valid) in cases("entry_ids") {
+            assert_eq!(valid_entry_id(&id), valid, "entry id {id:?}");
+        }
+        for (url, valid) in cases("urls") {
+            assert_eq!(valid_remote_url(&url), valid, "url {url:?}");
+        }
+    }
+
     /// The persisted shapes are what an operator may hand-edit — pin them.
     #[test]
     fn settings_and_picks_parse_their_documented_shape() {

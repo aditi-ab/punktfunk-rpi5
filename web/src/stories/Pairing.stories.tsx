@@ -70,7 +70,7 @@ export const Armed: Story = {
 				onArm={noop}
 				onDisarm={noop}
 				isArming={false}
-				wrongPassword={false}
+				failure={null}
 				isDisarming={false}
 			/>
 		),
@@ -83,7 +83,7 @@ export const Armed: Story = {
 				onLabelChange={noop}
 				password=""
 				onPasswordChange={noop}
-				wrongPassword={false}
+				failure={null}
 				target=""
 				onTargetChange={noop}
 				onSubmit={noop}
