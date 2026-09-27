@@ -639,15 +639,23 @@ fn connect(req: ConnectRequest) -> jlong {
 
 /// `NativeBridge.nativeClose(handle)` — remove one session key and begin teardown.
 ///
-/// Existing JNI calls retain their `Arc` until they return, then the final drop joins media workers
-/// and closes the connector. Zero, stale, duplicate, and concurrent closes are no-ops.
+/// Pad audio is joined here, since it borrows a USB fd Kotlin may close once this returns. Other
+/// JNI calls keep their `Arc` until they return; the final drop joins the remaining workers and
+/// closes the connector. Zero, stale, duplicate, and concurrent closes are no-ops.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
-    jni_guard((), || drop(remove_session(handle)))
+    jni_guard((), || {
+        let Some(session) = remove_session(handle) else {
+            return;
+        };
+        #[cfg(target_os = "android")]
+        session.stop_pad_audio();
+        drop(session);
+    })
 }
 
 /// Mark an explicit user disconnect so the host skips reconnect linger.
