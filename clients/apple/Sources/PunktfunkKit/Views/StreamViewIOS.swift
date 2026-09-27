@@ -706,15 +706,7 @@ public final class StreamViewController: StreamViewControllerBase {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
         #if os(iOS)
-        // Match-window (C3): feed the follower the view's physical-pixel size (points × scale).
-        // Not while a monitor shows the picture: its mode comes from `requestSurfaceMode`.
-        let b = streamView.bounds
-        if b.width > 0, b.height > 0, !onExternal {
-            let scale = renderScale
-            matchFollower?.noteSize(
-                widthPx: Int((b.width * scale).rounded()),
-                heightPx: Int((b.height * scale).rounded()))
-        }
+        if !onExternal { noteMatchWindowSize() }
         // The window back at screen size (a windowed scene re-maximised) can hold the lock again.
         let fills = windowFillsScreen
         if fills, !windowFilledScreen { requestPointerLock() }
@@ -844,7 +836,21 @@ public final class StreamViewController: StreamViewControllerBase {
         }
         presenter.move(to: videoLayer)
         layoutMetalLayer()
-        requestSurfaceMode()
+        // A monitor takes its mode from `requestSurfaceMode`; back on the phone, Match-window
+        // owns it again, and a size request queued before the plug-in must not fire.
+        let follows = !external && (connection?.settings.matchWindow ?? false)
+        matchFollower?.setEnabled(follows)
+        if follows { noteMatchWindowSize() } else { requestSurfaceMode() }
+    }
+
+    /// Match-window (C3): feed the follower the view's physical-pixel size (points × scale).
+    private func noteMatchWindowSize() {
+        let b = streamView.bounds
+        guard b.width > 0, b.height > 0 else { return }
+        let scale = renderScale
+        matchFollower?.noteSize(
+            widthPx: Int((b.width * scale).rounded()),
+            heightPx: Int((b.height * scale).rounded()))
     }
 
     /// Ask the host for the mode that fits where the picture is: the monitor's pixels at its top

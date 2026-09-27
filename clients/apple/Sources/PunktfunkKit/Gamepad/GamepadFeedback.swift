@@ -207,8 +207,10 @@ public final class GamepadFeedback {
                 }
                 }
                 // ~8 ms poll cadence (≈125 Hz), slept OUTSIDE the feedback lock — low rumble/HID
-                // latency without holding the lock the HDR-meta drain needs.
-                if alive, !flag.isStopped { Thread.sleep(forTimeInterval: 0.008) }
+                // latency without holding the lock the HDR-meta drain needs. With no pad to drive
+                // every command is dropped anyway, so idle at 20 Hz.
+                let idle = self?.hasNoTarget ?? true
+                if alive, !flag.isStopped { Thread.sleep(forTimeInterval: idle ? 0.05 : 0.008) }
             }
             drainDone.signal()
         }
@@ -279,6 +281,9 @@ public final class GamepadFeedback {
         defer { routingLock.unlock() }
         return body()
     }
+
+    /// No pad renderer and no raw sink: every rumble and HID command would be dropped.
+    private var hasNoTarget: Bool { withRouting { rumbleByPad.isEmpty && hidRawSink == nil } }
 
     /// Register (or clear) the `.hidRaw` sink — the session owner wires `Sc2Capture.onHidRaw`
     /// here beside starting the capture, and clears it BEFORE stopping either side (the

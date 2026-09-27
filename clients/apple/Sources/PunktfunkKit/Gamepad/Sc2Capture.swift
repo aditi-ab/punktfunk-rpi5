@@ -572,11 +572,11 @@ public final class Sc2Capture {
                     return
                 }
                 src.padIndex = index
-                self.lock.unlock()
+                // Under the lock, like the link queue's own sends: a report must not reach the
+                // host before the arrival that creates its pad.
                 self.connection.send(.gamepadArrival(pref: kind.rawValue, pad: UInt32(index)))
                 // Replay the connect edge the Puck emitted before this slot existed, ahead of
                 // any state — see `handleWireless`.
-                self.lock.lock()
                 if var pending = src.pendingWireless {
                     src.pendingWireless = nil
                     self.forwardRawLocked(src, &pending, pad: index)

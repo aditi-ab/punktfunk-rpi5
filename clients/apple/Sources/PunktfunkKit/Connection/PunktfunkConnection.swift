@@ -200,7 +200,7 @@ public extension PunktfunkConnection {
 
     /// Send a Wake-on-LAN magic packet to wake a sleeping host. `macs` are the host's NIC MAC(s)
     /// (`aa:bb:cc:dd:ee:ff`, learned from its mDNS `mac` TXT while awake); malformed entries are
-    /// skipped. `lastKnownIP`, when set, is additionally unicast. The core broadcasts to every
+    /// skipped. `lastKnownIP`, when an IPv4 address, is additionally unicast. The core broadcasts to every
     /// interface's subnet-directed broadcast + 255.255.255.255 on ports 9/7, repeated.
     ///
     /// Returns true if at least one datagram went out. Does blocking sends — call OFF the main
@@ -285,8 +285,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// non-blockingly by the app's 1 s stats tick (never contends with the blocking pullers).
     private let statsLock = NSLock()
     /// Same role for the shared-clipboard drain thread (`nextClipboard` — its own plane in the
-    /// core). The clip *sends* (`clipControl`/`clipOffer`/`clipServe`…) share this lock too:
-    /// they're quick non-blocking enqueues, and a single lock keeps close() ordering simple.
+    /// core). The clip *sends* take `abiLock` instead: this one is held across a 200 ms poll.
     private let clipboardLock = NSLock()
     /// Serializes the (single) cursor pull thread against close() — both cursor planes are
     /// drained by ONE thread, so one lock covers them.
@@ -769,14 +768,6 @@ public final class PunktfunkConnection: @unchecked Sendable {
         _ = punktfunk_connection_live_pads(h, &mask)
         return mask
     }
-    /// Anything about this session's access differs from the everyday full-and-permanent —
-    /// the chip's visibility gate: full + permanent must look exactly like today. Compared
-    /// through ``normalizedGrants(_:)`` so an old host's pre-power full mask stays chipless.
-    public var accessIsLimited: Bool {
-        Self.normalizedGrants(accessGrants) & Self.grantAll != Self.grantAll
-            || accessExpiresInSeconds != 0
-    }
-
     /// The grant bit one wire input kind needs — the Swift mirror of core's exhaustive
     /// `classify` (keys → keyboard; mouse/scroll/touch → pointer; pads → gamepad), consulted
     /// by ``send(_:)``'s courtesy filter. An unknown/future kind maps to 0 — never granted —
@@ -2007,18 +1998,18 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// outcome (its operator policy is authoritative). Best-effort — a dropped call on a
     /// closing session is fine.
     public func clipControl(enabled: Bool, flags: UInt8 = 0) {
-        clipboardLock.lock()
-        defer { clipboardLock.unlock() }
-        guard let h = liveHandle() else { return }
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
         _ = punktfunk_connection_clipboard_control(h, enabled, flags)
     }
 
     /// Announce that the local pasteboard changed — the lazy format-list offer (`seq` monotonic,
     /// newest wins; empty `kinds` clears the host side). The bytes cross only if the host fetches.
     public func clipOffer(seq: UInt32, kinds: [ClipKind]) {
-        clipboardLock.lock()
-        defer { clipboardLock.unlock() }
-        guard let h = liveHandle() else { return }
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
         guard !kinds.isEmpty else {
             _ = punktfunk_connection_clipboard_offer(h, seq, nil, 0)
             return
@@ -2038,9 +2029,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// transfer id echoed on the resulting `.data`/`.error`/`.cancelled` events, or nil when the
     /// session is closing.
     public func clipFetch(seq: UInt32, mime: String, fileIndex: UInt32 = UInt32.max) -> UInt32? {
-        clipboardLock.lock()
-        defer { clipboardLock.unlock() }
-        guard let h = liveHandle() else { return nil }
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return nil }
         var xfer: UInt32 = 0
         let rc = mime.withCString {
             punktfunk_connection_clipboard_fetch(h, seq, $0, fileIndex, &xfer)
@@ -2051,9 +2042,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Provide bytes answering a `.fetchRequest` (the host is pasting our offered data). Call
     /// repeatedly to stream; `last = true` completes the transfer. An empty final chunk is fine.
     public func clipServe(reqId: UInt32, data: Data, last: Bool) {
-        clipboardLock.lock()
-        defer { clipboardLock.unlock() }
-        guard let h = liveHandle() else { return }
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
         if data.isEmpty {
             _ = punktfunk_connection_clipboard_serve(h, reqId, nil, 0, last)
         } else {
@@ -2067,9 +2058,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Cancel a clipboard transfer by id — an outbound fetch's `xferId` or an inbound
     /// `.fetchRequest`'s `reqId`.
     public func clipCancel(id: UInt32) {
-        clipboardLock.lock()
-        defer { clipboardLock.unlock() }
-        guard let h = liveHandle() else { return }
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
         _ = punktfunk_connection_clipboard_cancel(h, id)
     }
 
