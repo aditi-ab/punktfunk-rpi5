@@ -895,6 +895,10 @@ impl State {
             }
             if let Some(a) = self.asc.as_mut() {
                 a.poll_fences(ctx.offset(), &ctx.stats, &ctx.video_e2e);
+                // The host re-sends the source's grade on capture start and keyframes.
+                if ctx.client.color.is_hdr() {
+                    a.set_hdr_meta(ctx.client.latest_hdr_meta(Duration::ZERO));
+                }
             }
         }
         ctx.stats.note_skipped_overflow(pass.aus_dropped); // parked-AU overflow: skips, flagged as such

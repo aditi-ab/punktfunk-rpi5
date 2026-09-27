@@ -253,6 +253,8 @@ pub struct NativeClient {
     /// Live setting read by the shared input seam for every scroll event.
     scroll_invert: Arc<AtomicBool>,
     hdr_meta: Mutex<Receiver<HdrMeta>>,
+    /// Newest entry [`NativeClient::latest_hdr_meta`] drained.
+    hdr_meta_last: Mutex<Option<HdrMeta>>,
     /// Per-AU capture→send timings. Client always advertises [`quic::VIDEO_CAP_HOST_TIMING`];
     /// an older host never sends any.
     host_timing: Mutex<Receiver<crate::quic::HostTiming>>,
@@ -914,6 +916,7 @@ impl NativeClient {
             pad_mouse,
             scroll_invert,
             hdr_meta: Mutex::new(hdr_meta_rx),
+            hdr_meta_last: Mutex::new(None),
             host_timing: Mutex::new(host_timing_rx),
             cursor_shape: cursor_shape_rx,
             cursor_state: Mutex::new(cursor_state_rx),
@@ -1583,6 +1586,14 @@ impl NativeClient {
         }
     }
 
+    /// The newest [`HdrMeta`] so far: drains the queue, blocking up to `wait` only while none
+    /// has ever arrived. Kept across calls, so a decoder rebuilt mid-session starts from the
+    /// current grade. Use this OR [`next_hdr_meta`](Self::next_hdr_meta), never both.
+    pub fn latest_hdr_meta(&self, wait: Duration) -> Option<HdrMeta> {
+        let rx = self.hdr_meta.lock().unwrap();
+        latest_of(&rx, &mut self.hdr_meta_last.lock().unwrap(), wait)
+    }
+
     /// RGBA cursor bitmap + hotspot, on pointer-bitmap change. Cache by `serial`;
     /// [`NativeClient::next_cursor_state`] references it. Empty unless
     /// [`crate::quic::CLIENT_CAP_CURSOR`] was advertised against a capable host.
@@ -1851,6 +1862,37 @@ pub fn display_hdr_env_override() -> Option<HdrMeta> {
         max_cll: 0,
         max_fall: 0,
     })
+}
+
+/// Drain `rx` into `last`, blocking up to `wait` only while `last` is still empty.
+fn latest_of<T: Copy>(rx: &Receiver<T>, last: &mut Option<T>, wait: Duration) -> Option<T> {
+    if last.is_none() {
+        *last = rx.recv_timeout(wait).ok();
+    }
+    while let Ok(m) = rx.try_recv() {
+        *last = Some(m);
+    }
+    *last
+}
+
+#[cfg(test)]
+mod latest_of_tests {
+    use super::latest_of;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn keeps_the_newest_and_stops_waiting_once_one_arrived() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u8>(8);
+        let mut last = None;
+        assert_eq!(latest_of(&rx, &mut last, Duration::ZERO), None);
+        for v in 1..=3 {
+            tx.send(v).unwrap();
+        }
+        assert_eq!(latest_of(&rx, &mut last, Duration::ZERO), Some(3));
+        let t = Instant::now();
+        assert_eq!(latest_of(&rx, &mut last, Duration::from_secs(5)), Some(3));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
 }
 
 #[cfg(test)]
