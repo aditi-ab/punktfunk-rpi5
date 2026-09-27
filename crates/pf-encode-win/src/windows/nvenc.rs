@@ -227,7 +227,7 @@ unsafe fn reap_parked_sessions() {
 /// Operator asked for two-thread retrieve (`PUNKTFUNK_NVENC_ASYNC` truthy). Combined with
 /// `NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT` in `init_session`. An async-rejecting config fails the open.
 fn async_retrieve_requested() -> bool {
-    crate::knobs::get().nvenc_async != 0
+    crate::knobs::get().nvenc_async == 1
 }
 
 /// Max in-flight encodes in async mode (`PUNKTFUNK_NVENC_ASYNC_DEPTH`, default 4,

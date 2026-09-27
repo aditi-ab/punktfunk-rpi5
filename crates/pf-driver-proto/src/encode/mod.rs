@@ -140,7 +140,8 @@ pub struct EncodeKnobs {
     /// `PUNKTFUNK_SPLIT_ENCODE`: `0` = by pixel rate, `1` = disable, `2` = auto-forced,
     /// `3` = two engines, `4` = three engines.
     pub split_encode: u8,
-    /// `PUNKTFUNK_NVENC_ASYNC`: `1` = the two-thread retrieve.
+    /// `PUNKTFUNK_NVENC_ASYNC`: `1` = the two-thread retrieve, `2` = never pipelined (a falsy
+    /// value), `0` = unset: the Linux backend escalates on demand.
     pub nvenc_async: u8,
     /// `PUNKTFUNK_NVENC_ASYNC_DEPTH`: in-flight encodes in async mode; `0` = 4.
     pub nvenc_async_depth: u8,
@@ -219,7 +220,18 @@ impl EncodeKnobs {
                     _ => self.split_encode,
                 }
             }
-            "PUNKTFUNK_NVENC_ASYNC" => self.nvenc_async = truthy(v) as u8,
+            "PUNKTFUNK_NVENC_ASYNC" => {
+                let falsy = ["0", "false", "no", "off"]
+                    .iter()
+                    .any(|f| v.eq_ignore_ascii_case(f));
+                self.nvenc_async = if truthy(v) {
+                    1
+                } else if falsy {
+                    2
+                } else {
+                    0
+                }
+            }
             "PUNKTFUNK_NVENC_ASYNC_DEPTH" => {
                 if let Some(n) = num(1, 255) {
                     self.nvenc_async_depth = n as u8;
@@ -927,6 +939,10 @@ mod tests {
         assert_eq!(k.split_encode, 4, "garbage keeps the last value");
         k.apply_env("PUNKTFUNK_NVENC_ASYNC", " yes ");
         assert_eq!(k.nvenc_async, 1);
+        k.apply_env("PUNKTFUNK_NVENC_ASYNC", "Off");
+        assert_eq!(k.nvenc_async, 2, "a falsy value vetoes pipelining");
+        k.apply_env("PUNKTFUNK_NVENC_ASYNC", "maybe");
+        assert_eq!(k.nvenc_async, 0);
         k.apply_env("PUNKTFUNK_NVENC_SUBFRAME", "0");
         assert_eq!(k.nvenc_subframe, 1);
         k.apply_env("PUNKTFUNK_NVENC_SLICES", "33");

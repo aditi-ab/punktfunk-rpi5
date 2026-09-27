@@ -241,20 +241,15 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
 /// slot is never reused mid-encode.
 const POOL: usize = 8;
 
-/// `PUNKTFUNK_NVENC_ASYNC`: `Some(true)` forces two-thread retrieve (at depth-1 the AU rides
-/// the next tick); `Some(false)` vetoes [`Encoder::set_pipelined`]; `None` = adaptive.
-/// Linux stays SYNC; only the blocking lock moves, so open cannot reject this.
-fn async_retrieve_env() -> Option<bool> {
-    match std::env::var("PUNKTFUNK_NVENC_ASYNC") {
-        Ok(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => Some(true),
-        Ok(v) if matches!(v.trim(), "0" | "false" | "no" | "off") => Some(false),
-        _ => None,
-    }
+/// `PUNKTFUNK_NVENC_ASYNC=1` — two-thread retrieve from session open (at depth-1 the AU rides
+/// the next tick). Linux stays SYNC; only the blocking lock moves, so open cannot reject this.
+fn async_retrieve_requested() -> bool {
+    crate::knobs::get().nvenc_async == 1
 }
 
-/// `PUNKTFUNK_NVENC_ASYNC=1` — two-thread retrieve from session open.
-fn async_retrieve_requested() -> bool {
-    async_retrieve_env() == Some(true)
+/// `PUNKTFUNK_NVENC_ASYNC=0` — [`Encoder::set_pipelined`] never escalates.
+fn async_retrieve_vetoed() -> bool {
+    crate::knobs::get().nvenc_async == 2
 }
 
 /// Two-thread in-flight cap (`PUNKTFUNK_NVENC_ASYNC_DEPTH`, default 4, clamped `2..=POOL-1`).
@@ -262,11 +257,11 @@ fn async_retrieve_requested() -> bool {
 fn async_inflight_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
-        std::env::var("PUNKTFUNK_NVENC_ASYNC_DEPTH")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(4)
-            .clamp(2, POOL - 1)
+        match crate::knobs::get().nvenc_async_depth {
+            0 => 4,
+            n => usize::from(n),
+        }
+        .clamp(2, POOL - 1)
     })
 }
 
@@ -2561,7 +2556,7 @@ impl Encoder for NvencCudaEncoder {
         if !on {
             // Latch de-escalation; switch at the next drained point. Caller re-queries until
             // inactive.
-            if async_retrieve_env() == Some(true) {
+            if async_retrieve_requested() {
                 // Operator pinned async on — do not undo it.
                 return self.want_async || self.async_rt.is_some();
             }
@@ -2572,7 +2567,7 @@ impl Encoder for NvencCudaEncoder {
             }
             return self.want_async || self.async_rt.is_some();
         }
-        if async_retrieve_env() == Some(false) {
+        if async_retrieve_vetoed() {
             return false; // `PUNKTFUNK_NVENC_ASYNC=0`
         }
         self.want_sync = false; // latest intent wins
@@ -5077,7 +5072,7 @@ mod tests {
         const W: u32 = 1280;
         const H: u32 = 720;
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
-        if async_retrieve_env() == Some(false) {
+        if async_retrieve_vetoed() {
             println!("skipped: PUNKTFUNK_NVENC_ASYNC=0 vetoes the escalation");
             return;
         }
