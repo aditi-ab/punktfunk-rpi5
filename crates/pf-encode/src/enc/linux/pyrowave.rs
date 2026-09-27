@@ -2769,18 +2769,14 @@ mod tests {
     #[test]
     #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
     fn import_failure_leaks_no_fds() {
-        use std::os::fd::FromRawFd;
         let enc =
             PyroWaveEncoder::open(64, 64, 60, 5_000_000, crate::ChromaFormat::Yuv420, 8, false)
                 .expect("open");
         let memfd_frame = |modifier: u64| {
-            // SAFETY: plain memfd_create; the fresh descriptor is immediately owned below.
-            let raw = unsafe { libc::memfd_create(c"pf-import-leak".as_ptr(), 0) };
-            assert!(raw >= 0, "memfd_create failed");
-            // SAFETY: `raw` is a freshly-created descriptor this closure owns.
-            let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-            // SAFETY: size the owned memfd so an mmap-happy driver sees real pages.
-            unsafe { libc::ftruncate(fd.as_raw_fd(), 64 * 64 * 4) };
+            let fd = rustix::fs::memfd_create(c"pf-import-leak", rustix::fs::MemfdFlags::empty())
+                .expect("memfd_create");
+            // Real pages, for an mmap-happy driver.
+            rustix::fs::ftruncate(&fd, 64 * 64 * 4).expect("size the memfd");
             pf_frame::DmabufFrame {
                 fd,
                 fourcc: 0x3432_5258, // XR24 — maps, so failure lands past the fourcc gate
