@@ -237,7 +237,8 @@ struct RetiredRing {
     retired_at: Instant,
 }
 
-/// One decode-output plane: STORAGE (decode writes) + SAMPLED (presenter CSC).
+/// One decode-output plane: STORAGE (decode writes) + SAMPLED (presenter CSC), in
+/// device-local memory. No such memory type is an error.
 unsafe fn make_plane(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -263,14 +264,15 @@ unsafe fn make_plane(
         None,
     )?;
     let req = device.get_image_memory_requirements(img);
-    let ti = (0..mem_props.memory_type_count)
-        .find(|&i| {
-            (req.memory_type_bits & (1 << i)) != 0
-                && mem_props.memory_types[i as usize]
-                    .property_flags
-                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        })
-        .unwrap_or(0);
+    let Some(ti) = (0..mem_props.memory_type_count).find(|&i| {
+        (req.memory_type_bits & (1 << i)) != 0
+            && mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    }) else {
+        device.destroy_image(img, None);
+        bail!("no device-local memory type for a PyroWave plane");
+    };
     let mem = match device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)

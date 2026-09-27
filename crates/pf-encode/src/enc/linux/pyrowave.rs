@@ -1569,7 +1569,10 @@ impl PyroWaveEncoder {
         }
     }
 
-    /// Per-buffer dmabuf import cache; same policy as `vulkan_video.rs`.
+    /// Import a dmabuf, reusing the cached import when the same buffer recurs. Keyed by
+    /// `(st_dev, st_ino)`: each `DmabufFrame` owns a fresh dup of the same inode. A hit is
+    /// always the right size, because `submit_frame` refuses a frame off the session mode.
+    /// `fresh` is true only on first import.
     unsafe fn import_cached(
         &mut self,
         d: &pf_frame::DmabufFrame,
@@ -1600,6 +1603,11 @@ impl PyroWaveEncoder {
                     return Err(e);
                 }
             };
+        // FIFO eviction. The other slot may still sample the oldest import, so idle the
+        // device before destroying it. Only the evicting path pays for the wait.
+        if self.import_cache.len() >= IMPORT_CACHE_CAP {
+            let _ = self.device.device_wait_idle();
+        }
         while self.import_cache.len() >= IMPORT_CACHE_CAP {
             let (_, _, oi, om, ov) = self.import_cache.remove(0);
             self.device.destroy_image_view(ov, None);
@@ -1624,7 +1632,8 @@ impl PyroWaveEncoder {
     ) -> Result<vk::ImageView> {
         let dev = self.device.clone();
         let (w, h) = (self.width, self.height);
-        let need = (w * h * 4) as u64;
+        // Widen before the multiply: `w * h * 4` wraps in u32 once `w * h > 2^30`.
+        let need = w as u64 * h as u64 * 4;
         if self.slots[slot].cpu_img.map(|(_, _, _, f)| f) != Some(fmt) {
             if let Some((i, m, v, _)) = self.slots[slot].cpu_img.take() {
                 dev.destroy_image_view(v, None);

@@ -146,17 +146,29 @@ pub(crate) fn color_range(layer: u32) -> vk::ImageSubresourceRange {
     }
 }
 
-pub(crate) unsafe fn find_mem(
+/// First memory type in `bits` carrying every flag in `want`. A miss is an error, never
+/// index 0: that type may sit outside `bits` or lack a flag the caller relies on.
+pub(crate) fn find_mem(
     mp: &vk::PhysicalDeviceMemoryProperties,
     bits: u32,
     want: vk::MemoryPropertyFlags,
-) -> u32 {
-    for i in 0..mp.memory_type_count {
-        if (bits & (1 << i)) != 0 && mp.memory_types[i as usize].property_flags.contains(want) {
-            return i;
-        }
-    }
-    0
+) -> Result<u32> {
+    (0..mp.memory_type_count)
+        .find(|&i| {
+            bits & (1 << i) != 0 && mp.memory_types[i as usize].property_flags.contains(want)
+        })
+        .ok_or_else(|| anyhow::anyhow!("no Vulkan memory type with {want:?} in bits {bits:#x}"))
+}
+
+/// [`find_mem`] for `prefer`, else any type in `bits`. For video session and video image
+/// memory, which a driver may legally place off the device-local heap.
+#[cfg_attr(not(feature = "vulkan-encode"), allow(dead_code))]
+pub(crate) fn find_mem_preferring(
+    mp: &vk::PhysicalDeviceMemoryProperties,
+    bits: u32,
+    prefer: vk::MemoryPropertyFlags,
+) -> Result<u32> {
+    find_mem(mp, bits, prefer).or_else(|_| find_mem(mp, bits, vk::MemoryPropertyFlags::empty()))
 }
 
 /// DRM fourcc → VkFormat whose *color* components match; Vulkan does the byte swizzle.
@@ -377,15 +389,18 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
     };
     let req = device.get_image_memory_requirements(img);
     let bits = req.memory_type_bits & fd_props;
-    let ti = find_mem(
-        mem_props,
-        if bits != 0 {
-            bits
-        } else {
-            req.memory_type_bits
-        },
-        vk::MemoryPropertyFlags::empty(),
-    );
+    let bits = if bits != 0 {
+        bits
+    } else {
+        req.memory_type_bits
+    };
+    let ti = match find_mem(mem_props, bits, vk::MemoryPropertyFlags::empty()) {
+        Ok(ti) => ti,
+        Err(e) => {
+            device.destroy_image(img, None);
+            return Err(e); // `dup` drops: nothing imported it
+        }
+    };
     let mut ded = vk::MemoryDedicatedAllocateInfo::default().image(img);
     let mut import = vk::ImportMemoryFdInfoKHR::default()
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
@@ -443,20 +458,19 @@ pub(crate) unsafe fn make_host_buffer(
         None,
     )?;
     let req = device.get_buffer_memory_requirements(buf);
-    let mem = match device.allocate_memory(
-        &vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(find_mem(
-                mp,
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )),
-        None,
-    ) {
+    let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let mem = match find_mem(mp, req.memory_type_bits, host).and_then(|ti| {
+        Ok(device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(ti),
+            None,
+        )?)
+    }) {
         Ok(m) => m,
         Err(e) => {
             device.destroy_buffer(buf, None);
-            return Err(e.into());
+            return Err(e);
         }
     };
     if let Err(e) = device.bind_buffer_memory(buf, mem, 0) {
@@ -494,20 +508,19 @@ pub(crate) unsafe fn make_plain_image(
     )?;
     let req = device.get_image_memory_requirements(img);
     // Unwind: callers only ever see the completed triple.
-    let mem = match device.allocate_memory(
-        &vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(find_mem(
-                mp,
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )),
-        None,
-    ) {
+    let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    let mem = match find_mem(mp, req.memory_type_bits, local).and_then(|ti| {
+        Ok(device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(ti),
+            None,
+        )?)
+    }) {
         Ok(m) => m,
         Err(e) => {
             device.destroy_image(img, None);
-            return Err(e.into());
+            return Err(e);
         }
     };
     if let Err(e) = device.bind_image_memory(img, mem, 0) {
@@ -559,6 +572,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_memory_type_miss_is_an_error_not_index_0() {
+        let mut mp = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 3,
+            ..Default::default()
+        };
+        mp.memory_types[1].property_flags = vk::MemoryPropertyFlags::HOST_VISIBLE;
+        mp.memory_types[2].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        assert_eq!(find_mem(&mp, 0b110, local).unwrap(), 2);
+        assert!(find_mem(&mp, 0b011, local).is_err());
+        assert_eq!(find_mem_preferring(&mp, 0b011, local).unwrap(), 0);
+        assert_eq!(find_mem_preferring(&mp, 0b010, local).unwrap(), 1);
+        assert!(find_mem_preferring(&mp, 0, local).is_err());
+    }
 
     #[test]
     fn normalize_cpu_rgb_expands_24bpp_and_borrows_4bpp() {

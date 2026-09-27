@@ -25,9 +25,9 @@
 
 use super::nvenc_core::{
     apply_low_latency_config, build_init_params, cached_ceiling, cached_split_verdict, codec_guid,
-    plan_range_recovery, resolve_slices, resolve_split_subframe, resolve_subframe, store_ceiling,
-    store_split_verdict, subframe_env_forced, wave_rows, ArbAction, CeilingKey, LowLatencyConfig,
-    NvStatusExt, RangePlan, SplitArbiter, SplitKey,
+    open_split_mode, plan_range_recovery, resolve_slices, resolve_split_subframe, resolve_subframe,
+    store_ceiling, store_split_verdict, subframe_env_forced, wave_rows, ArbAction, CeilingKey,
+    LowLatencyConfig, NvStatusExt, RangePlan, SplitArbiter, SplitKey,
 };
 use super::nvenc_status;
 use super::{max_forced_split_mode, resolve_split_mode};
@@ -1217,11 +1217,12 @@ impl NvencCudaEncoder {
         self.encoder_engines = engines.max(0) as u32;
         // Resolve slices + sub-frame here, before open, so config/init/chunked-poll agree.
         // Clamp to `max_slices`: a client that never asked for multi-slice can wedge on
-        // several slice NALs. Caps gate the sub-frame default. Env knobs still override.
+        // several slice NALs. Caps and the slice count gate sub-frame. Env knobs still override.
         self.slices = resolve_slices(self.codec, 4.min(self.max_slices));
         // `subframe_broken` beats the operator force: this encoder already proved the
         // driver's sub-frame accounting corrupt. Per-encoder; a fresh one retests.
-        self.subframe_on = resolve_subframe(self.subframe_cap) && !self.subframe_broken;
+        self.subframe_on =
+            resolve_subframe(self.slices, self.subframe_cap) && !self.subframe_broken;
         self.subframe_forced = subframe_env_forced();
         tracing::info!(
             rfi = self.rfi_supported,
@@ -1417,25 +1418,13 @@ impl NvencCudaEncoder {
             }
             const FLOOR_BPS: u64 = 10_000_000;
             let requested_bps = self.bitrate_bps;
-            // [`resolve_split_mode`]: env / 10-bit / pixel-rate precedence.
+            // [`resolve_split_mode`]: env / 10-bit / pixel-rate precedence; a measured verdict
+            // wins over the static rule ([`open_split_mode`]).
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let mut split_mode: u32 =
-                resolve_split_mode(self.codec, self.bit_depth, pixel_rate, self.encoder_engines);
-            // Cached verdict wins over the static rule. Operator pin still beats both
-            // (`resolve_split_mode`); only consult the cache when the knob is unset.
-            if std::env::var_os("PUNKTFUNK_SPLIT_ENCODE").is_none() {
-                if let Some(known) = cached_split_verdict(&self.split_key()) {
-                    if known != split_mode {
-                        tracing::info!(
-                            from = split_mode,
-                            to = known,
-                            "NVENC: using the split mode a previous arbitration measured as \
-                             fastest for this config"
-                        );
-                    }
-                    split_mode = known;
-                }
-            }
+            let split_mode = open_split_mode(
+                resolve_split_mode(self.codec, self.bit_depth, pixel_rate, self.encoder_engines),
+                &self.split_key(),
+            );
             // Split × sub-frame *before* the ladder, ceiling key, and chunked-poll latch —
             // a drop inside `build_init_params` would leave `poll_chunk` busy-polling.
             let (split_mode, subframe_on) = resolve_split_subframe(
@@ -1740,7 +1729,8 @@ impl NvencCudaEncoder {
         }
     }
 
-    /// Arm a live split experiment. Opt-in (`PUNKTFUNK_NVENC_SPLIT_ARBITRATE=1`).
+    /// Arm a live split experiment. Opt-in (`PUNKTFUNK_NVENC_SPLIT_ARBITRATE=1`); both
+    /// knobs come from [`crate::knobs`], as on Windows.
     ///
     /// Operator pin (`PUNKTFUNK_SPLIT_ENCODE`) wins. A cached verdict is not re-run. Sync
     /// depth-1 only: pipelined retrieve would mix queue depth into the cost. Needs ≥ 2
@@ -1748,13 +1738,11 @@ impl NvencCudaEncoder {
     /// encode time only, so it would prefer split and lose send/encode overlap. Arbitrate
     /// where nothing is traded (sub-frame already off, or AV1).
     fn arm_split_arbiter(&mut self) {
-        if !matches!(
-            std::env::var("PUNKTFUNK_NVENC_SPLIT_ARBITRATE").as_deref(),
-            Ok("1")
-        ) {
+        let knobs = crate::knobs::get();
+        if knobs.nvenc_split_arbitrate != 1 {
             return;
         }
-        if std::env::var_os("PUNKTFUNK_SPLIT_ENCODE").is_some()
+        if knobs.split_encode != 0
             || cached_split_verdict(&self.split_key()).is_some()
             || self.async_rt.is_some()
             || self.encoder_engines < 2
@@ -2594,6 +2582,9 @@ impl NvencCudaEncoder {
             if let Err(e) = (api().encode_picture)(self.encoder, &mut pic).nv_ok() {
                 // Nothing owns the mapping yet; left mapped, the slot's next map fails too.
                 let _ = (api().unmap_input_resource)(self.encoder, mp.mappedResource);
+                // The forced IDR and the anchor were spent on a picture that never went out.
+                self.force_kf |= flags != 0;
+                self.pending_anchor |= anchor;
                 return Err(nvenc_status::call_err("encode_picture", e));
             }
             t_pic = tp.elapsed();
@@ -2621,12 +2612,13 @@ impl NvencCudaEncoder {
             );
         }
         // Hand the blocking lock to the retrieve thread. `sync_channel(POOL)` cannot fill
-        // (in-flight is capped < POOL).
+        // (in-flight is capped < POOL). A dead thread would strand this AU, so rebuild.
         if let Some(rt) = &self.async_rt {
-            if let Some(tx) = &rt.work_tx {
-                let _ = tx.send(RetrieveJob {
-                    bs: self.bitstreams[slot] as usize,
-                });
+            let job = RetrieveJob {
+                bs: self.bitstreams[slot] as usize,
+            };
+            if rt.work_tx.as_ref().is_none_or(|tx| tx.send(job).is_err()) {
+                bail!("NVENC retrieve thread gone — rebuilding the session");
             }
         }
         Ok(())
