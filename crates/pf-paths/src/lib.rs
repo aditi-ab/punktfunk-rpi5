@@ -9,10 +9,14 @@
 //! 0700 / 0600 on Unix and a restrictive DACL on Windows. Secret dirs omit the
 //! `BUILTIN\Users` read grant the config dir needs for the tray. [`replace_file`] /
 //! [`replace_secret_file`] are the one temp-and-rename writer for stores. [`system32`] is how a
-//! privileged process names a Windows system tool.
+//! privileged process names a Windows system tool; [`remove_device`] runs one. [`seat`] is the
+//! Windows multi-seat marker.
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+
+#[cfg(target_os = "windows")]
+pub mod seat;
 
 /// `$XDG_RUNTIME_DIR/punktfunk-gamescope-ei` (per-user 0700), or `/tmp/…`
 /// when the runtime dir is unset. `pf-vdisplay` writes it under the session
@@ -328,6 +332,30 @@ pub fn system32(rel: &str) -> String {
         .or_else(|_| std::env::var("WINDIR"))
         .unwrap_or_else(|_| r"C:\Windows".to_string());
     format!(r"{root}\System32\{rel}")
+}
+
+/// `pnputil /remove-device` by absolute path: an uninstaller must not depend on `%PATH%`.
+/// `Err` carries pnputil's exit status and message, or why it did not run.
+#[cfg(windows)]
+pub fn remove_device(instance_id: &str) -> std::io::Result<()> {
+    let o = std::process::Command::new(system32("pnputil.exe"))
+        .args(["/remove-device", instance_id])
+        .output()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("run pnputil: {e}")))?;
+    if o.status.success() {
+        return Ok(());
+    }
+    // Whichever stream pnputil wrote its reason to.
+    let msg = if o.stderr.is_empty() {
+        &o.stdout
+    } else {
+        &o.stderr
+    };
+    Err(std::io::Error::other(format!(
+        "pnputil /remove-device {}: {}",
+        o.status,
+        String::from_utf8_lossy(msg).trim()
+    )))
 }
 
 /// Default `%ProgramData%` lets `BUILTIN\Users` create and become

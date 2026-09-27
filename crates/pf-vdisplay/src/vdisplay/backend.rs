@@ -347,6 +347,13 @@ pub trait VirtualDisplay: Send {
     fn kept_display_alive(&mut self, _node_id: u32) -> bool {
         true
     }
+    /// May the registry hand this acquire a kept display that already matched every generic
+    /// reuse key (backend, isolation, shape, epoch, and the mode unless
+    /// [`can_resize_kept`](Self::can_resize_kept))? `identity_slot` and `output_name` are the
+    /// kept display's. Default `true`; Hyprland adds its own rule.
+    fn accepts_kept(&self, _identity_slot: Option<u32>, _output_name: Option<&str>) -> bool {
+        true
+    }
     /// May a kept display of this backend be moved to another mode in place? Gates the reuse
     /// probe, which must not offer a candidate [`resize_kept`](Self::resize_kept) would refuse.
     /// Default `false` — every other backend retires a kept display it cannot serve at the mode.

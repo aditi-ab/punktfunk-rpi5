@@ -21,7 +21,7 @@ const ATTEMPTS: u32 = 15;
 const INTERVAL: Duration = Duration::from_secs(1);
 
 /// Detached: the caller is the capture-thread open path, and waiting there drops pad audio.
-pub(crate) fn spawn_pin(pad: u8) {
+pub fn spawn_pin(pad: u8) {
     if matches!(
         std::env::var("PUNKTFUNK_PAD_SINK_VOLUME").as_deref(),
         Ok("0" | "false" | "off" | "no")

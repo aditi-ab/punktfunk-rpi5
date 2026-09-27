@@ -101,7 +101,7 @@ BuildRequires:  pkgconfig(sdl3)
 # --- Runtime -----------------------------------------------------------------
 Requires:       pipewire
 Requires:       wireplumber
-# The host captures the sink monitor through NATIVE PipeWire (audio/linux.rs) and never opens a
+# The host captures the sink monitor through NATIVE PipeWire (pf-audio) and never opens a
 # Pulse socket itself — the shim is for the GAMES, which commonly emit through the PulseAudio
 # API. Weak-dep, because `pipewire-pulseaudio` CONFLICTS with `pulseaudio`: as a hard Requires it
 # made the host uninstallable for anyone running real PulseAudio, which serves those games just

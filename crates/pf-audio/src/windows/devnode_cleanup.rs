@@ -21,7 +21,7 @@ use anyhow::Result;
 use windows::Win32::Devices::DeviceAndDriverInstallation::SPDRP_HARDWAREID;
 
 /// `Device Parameters` REG_DWORD names. Presence of the name is "ours"; the value is family-specific.
-pub(crate) const OWNER_MARKERS: [&str; 3] = [
+pub const OWNER_MARKERS: [&str; 3] = [
     pe::PAD_INDEX_VALUE,
     minted::ROLE_MARKER,
     audio_probe::PROBE_MARKER,
@@ -35,7 +35,7 @@ const MINTED_HWIDS: [&str; 2] = [
 
 /// Sweep counts. `endpoint_records` is best-effort; see [`delete_endpoint_record`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Removed {
+pub struct Removed {
     pub devnodes: usize,
     pub devnode_failures: usize,
     pub endpoint_records: usize,
@@ -44,7 +44,7 @@ pub(crate) struct Removed {
 /// Unpark defaults, then sweep minted DEVNODEs.
 ///
 /// Stuck devices are counted, never fatal: a non-zero exit aborts the uninstaller.
-pub(crate) fn purge() -> Result<Removed> {
+pub fn purge() -> Result<Removed> {
     // Restore first: the parked default may still point at a device this sweep is about to delete.
     // Windows would re-pick by its own ranking, not the operator's original device.
     if audio_control::unpark_default_for_uninstall() {
@@ -180,9 +180,9 @@ fn is_removable_instance(instance_id: &str) -> bool {
     instance_id.to_ascii_uppercase().starts_with("ROOT\\")
 }
 
-/// [`crate::install::remove_device`], reported on the uninstaller's console.
+/// [`pf_paths::remove_device`], reported on the uninstaller's console.
 fn remove_devnode(instance_id: &str) -> bool {
-    match crate::install::remove_device(instance_id) {
+    match pf_paths::remove_device(instance_id) {
         Ok(()) => {
             println!("removed audio devnode {instance_id}");
             true

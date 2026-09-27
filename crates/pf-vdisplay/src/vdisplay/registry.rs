@@ -1601,11 +1601,7 @@ mod linux {
             .name("vdisplay-linger".into())
             .spawn(|| loop {
                 std::thread::sleep(Duration::from_millis(500));
-                let expired = {
-                    let mut es = reg().entries.lock().unwrap();
-                    take_expired(&mut es, Instant::now(), crate::session_epoch())
-                };
-                expired.finish("linger expired — torn down");
+                reap(crate::session_epoch());
             }) {
             Ok(_) => *started = true,
             Err(e) => tracing::error!(
@@ -1671,6 +1667,15 @@ mod linux {
         out
     }
 
+    /// Tear down the kept displays whose linger ran out or whose session epoch ended.
+    fn reap(cur_epoch: u64) {
+        let expired = {
+            let mut es = reg().entries.lock().unwrap();
+            take_expired(&mut es, Instant::now(), cur_epoch)
+        };
+        expired.finish("linger expired — torn down");
+    }
+
     /// `park` marks what this acquire creates as pre-warmed: it is a display with no session
     /// behind it, so the lease drop keeps it instead of applying the keep-alive policy.
     pub(super) fn acquire(
@@ -1688,12 +1693,7 @@ mod linux {
         let isolation = vd.isolation_key();
         let cur_epoch = crate::session_epoch();
         let r = reg();
-
-        let expired = {
-            let mut es = r.entries.lock().unwrap();
-            take_expired(&mut es, Instant::now(), cur_epoch)
-        };
-        expired.finish("linger expired — torn down");
+        reap(cur_epoch);
 
         // Before linger reuse: admission named a live session, so share its display.
         if vd.join_live() {
@@ -1705,162 +1705,8 @@ mod linux {
         // Held across the reuse probe and the create below: a second create on this seat is a
         // second compositor under one Steam home, and a waiter must see what the first publishes.
         let _seat = create_slot(backend, &isolation);
-
-        // Gated on `poolable_now()`: gamescope managed/attach shares the
-        // `"gamescope"` name with a bare spawn and must not reuse it.
-        if vd.poolable_now() {
-            // A backend that can move a kept display to another mode is offered one whose only
-            // mismatch is the mode; every other key still has to match exactly.
-            let resizable = vd.can_resize_kept();
-            // Probe liveness (may shell `pw-dump`) outside the lock:
-            // snapshot (generation, node_id, pid), probe, re-find by generation.
-            // A concurrent reuse/remove just misses and creates fresh.
-            let candidate = {
-                let es = r.entries.lock().unwrap();
-                es.iter()
-                    .find(|e| {
-                        matches!(
-                            e.life,
-                            lifecycle::State::Lingering { .. } | lifecycle::State::Pinned
-                        ) && reuse_keys_match(
-                            e,
-                            backend,
-                            mode,
-                            &isolation,
-                            vd.hw_cursor(),
-                            vd.hdr(),
-                            cur_epoch,
-                            resizable,
-                        ) && (backend != "hyprland"
-                            || matches!(
-                                crate::hyprland::linger_reuse_decision(
-                                    backend,
-                                    mode,
-                                    vd.last_identity_slot(),
-                                    e.backend,
-                                    e.mode,
-                                    e.identity_slot,
-                                    e.output_name.as_deref(),
-                                ),
-                                crate::hyprland::LingerReuse::Recast { .. }
-                            ))
-                    })
-                    .map(|e| (e.generation, e.node_id, e.pid, e.mode, e.seat.clone()))
-            };
-            if let Some((cand_gen, node_id, pid, cand_mode, cand_seat)) = candidate {
-                // OUTSIDE the lock (may block). A dead compositor is dead whatever PipeWire
-                // still lists under its node id.
-                let alive =
-                    pid.is_none_or(crate::proc::pid_alive) && vd.kept_display_alive(node_id);
-                // Also outside the lock: this blocks on the compositor. A kept display whose only
-                // mismatch is the mode moves to it instead of being retired, so the Steam a
-                // pre-warm booted inside it survives the change. A refusal falls through to the
-                // create below, which is the retire-and-spawn this always did.
-                let resized =
-                    cand_mode == mode || (alive && vd.resize_kept(cand_seat.as_deref(), mode));
-                if alive && !resized {
-                    tracing::info!(
-                        backend,
-                        node_id,
-                        seat = cand_seat.as_deref().unwrap_or("-"),
-                        "virtual display: the kept compositor did not take the new mode — \
-                         retiring it and spawning"
-                    );
-                }
-                let reuse = {
-                    let mut es = r.entries.lock().unwrap();
-                    match es.iter().position(|e| {
-                        e.generation == cand_gen
-                            && matches!(
-                                e.life,
-                                lifecycle::State::Lingering { .. } | lifecycle::State::Pinned
-                            )
-                    }) {
-                        Some(idx) if kept_verdict(alive, resized) == Kept::Reuse => {
-                            es[idx].life.acquire();
-                            let generation = r.generation.fetch_add(1, Ordering::Relaxed);
-                            es[idx].generation = generation;
-                            // A session claiming a parked seat makes it an ordinary display,
-                            // ending by the linger rules. A re-park keeps it parked.
-                            let claimed = es[idx].parked && !park;
-                            es[idx].parked = park;
-                            // The compositor has confirmed the new mode, so the entry is at it:
-                            // its reuse key, and what the capture is told to expect.
-                            if cand_mode != mode {
-                                es[idx].mode = mode;
-                                es[idx].preferred_mode =
-                                    Some((mode.width, mode.height, mode.refresh_hz));
-                                tracing::info!(
-                                    backend,
-                                    node_id,
-                                    seat = es[idx].seat.as_deref().unwrap_or("-"),
-                                    from = %format!("{}x{}@{}", cand_mode.width, cand_mode.height, cand_mode.refresh_hz),
-                                    to = %format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
-                                    "virtual display: kept compositor resized for this session — \
-                                     nothing inside it restarts"
-                                );
-                            }
-                            let preferred_mode = es[idx].preferred_mode;
-                            let names = (es[idx].output_name.clone(), es[idx].input_output.clone());
-                            let seat = es[idx].seat.clone();
-                            tracing::info!(
-                                backend,
-                                node_id,
-                                seat = seat.as_deref().unwrap_or("-"),
-                                "virtual display reused (keep-alive reconnect)"
-                            );
-                            if claimed {
-                                tracing::info!(
-                                    backend,
-                                    node_id,
-                                    isolation = isolation.as_deref().unwrap_or("-"),
-                                    "virtual display: this session claimed its parked seat — its \
-                                     Steam is already up"
-                                );
-                            }
-                            ReuseOutcome::Reused(output_for(
-                                node_id,
-                                preferred_mode,
-                                names,
-                                seat,
-                                generation,
-                                quit.clone(),
-                                true,
-                            ))
-                        }
-                        Some(_) if kept_verdict(alive, resized) == Kept::Spawn => {
-                            ReuseOutcome::Miss
-                        }
-                        Some(idx) => {
-                            let g = es[idx].generation;
-                            ReuseOutcome::Dead(drain_where(&mut es, |e| e.generation == g))
-                        }
-                        None => ReuseOutcome::Miss, // adopted/removed by another thread
-                    }
-                };
-                match reuse {
-                    ReuseOutcome::Reused(out) => {
-                        let pool_gen = out.pool_gen;
-                        match attach_session_cast(vd, out) {
-                            Ok(out) => return Ok(out),
-                            Err(e) => {
-                                if let Some(g) = pool_gen {
-                                    mark_failed(g);
-                                }
-                                tracing::info!(
-                                    backend,
-                                    error = %format!("{e:#}"),
-                                    "virtual display: recast of kept head failed — recreating"
-                                );
-                            }
-                        }
-                    }
-                    ReuseOutcome::Dead(dead) => {
-                        dead.finish("kept display was dead — recreating (validated reuse)");
-                    }
-                    ReuseOutcome::Miss => {}
-                }
-            }
+        if let Some(out) = try_reuse(vd, mode, &isolation, cur_epoch, park, &quit) {
+            return Ok(out);
         }
 
         // Nothing reusable, so this acquire creates. A sole-instance backend must not end up
@@ -1901,7 +1747,6 @@ mod linux {
         let real = vd.create(mode);
         vd.set_session_cast_handoff(false);
         let real = real?;
-        let identity_slot = vd.last_identity_slot();
 
         // Pool only `Owned` with no portal fd on the output. Pass through
         // `External`/`SessionManaged` (gamescope owns those; pooling wedges on
@@ -1915,7 +1760,200 @@ mod linux {
             );
             return Ok(real);
         }
+        pool_created(
+            vd, real, generation, mode, isolation, cur_epoch, park, supersedes, quit,
+        )
+    }
 
+    /// Reuse a kept display that matches this acquire, resizing it in place when that is the
+    /// only mismatch. `None` means create: nothing matched, the kept one refused the mode, its
+    /// compositor was dead (torn down here, restore handed on), or the recast failed.
+    ///
+    /// Liveness and resize may block (`pw-dump`, the compositor), so they run outside the pool
+    /// lock: snapshot the candidate, probe, then re-find it by generation. A concurrent reuse
+    /// or remove just misses.
+    fn try_reuse(
+        vd: &mut Box<dyn VirtualDisplay>,
+        mode: Mode,
+        isolation: &Option<String>,
+        cur_epoch: u64,
+        park: bool,
+        quit: &Arc<AtomicBool>,
+    ) -> Option<VirtualOutput> {
+        // Gamescope managed/attach shares the `"gamescope"` name with a bare spawn and must
+        // not reuse it.
+        if !vd.poolable_now() {
+            return None;
+        }
+        let backend = vd.name();
+        let r = reg();
+        // A backend that can move a kept display to another mode is offered one whose only
+        // mismatch is the mode; every other key still has to match exactly.
+        let resizable = vd.can_resize_kept();
+        let kept = |e: &Entry| {
+            matches!(
+                e.life,
+                lifecycle::State::Lingering { .. } | lifecycle::State::Pinned
+            )
+        };
+        let (cand_gen, node_id, pid, cand_mode, cand_seat) = {
+            let es = r.entries.lock().unwrap();
+            es.iter()
+                .find(|e| {
+                    kept(e)
+                        && reuse_keys_match(
+                            e,
+                            backend,
+                            mode,
+                            isolation,
+                            vd.hw_cursor(),
+                            vd.hdr(),
+                            cur_epoch,
+                            resizable,
+                        )
+                        && vd.accepts_kept(e.identity_slot, e.output_name.as_deref())
+                })
+                .map(|e| (e.generation, e.node_id, e.pid, e.mode, e.seat.clone()))
+        }?;
+        // A dead compositor is dead whatever PipeWire still lists under its node id.
+        let alive = pid.is_none_or(crate::proc::pid_alive) && vd.kept_display_alive(node_id);
+        // A kept display whose only mismatch is the mode moves to it instead of being retired,
+        // so the Steam a pre-warm booted inside it survives the change. A refusal falls through
+        // to the create, which is the retire-and-spawn this always did.
+        let resized = cand_mode == mode || (alive && vd.resize_kept(cand_seat.as_deref(), mode));
+        if alive && !resized {
+            tracing::info!(
+                backend,
+                node_id,
+                seat = cand_seat.as_deref().unwrap_or("-"),
+                "virtual display: the kept compositor did not take the new mode — \
+                 retiring it and spawning"
+            );
+        }
+        let reuse = {
+            let mut es = r.entries.lock().unwrap();
+            let idx = es.iter().position(|e| e.generation == cand_gen && kept(e));
+            match (idx, kept_verdict(alive, resized)) {
+                (Some(idx), Kept::Reuse) => {
+                    let generation = r.generation.fetch_add(1, Ordering::Relaxed);
+                    ReuseOutcome::Reused(claim_kept(
+                        &mut es[idx],
+                        generation,
+                        mode,
+                        park,
+                        isolation,
+                        quit,
+                    ))
+                }
+                (Some(idx), Kept::Dead) => {
+                    let g = es[idx].generation;
+                    ReuseOutcome::Dead(drain_where(&mut es, |e| e.generation == g))
+                }
+                // `None`: adopted or removed by another thread.
+                (Some(_), Kept::Spawn) | (None, _) => ReuseOutcome::Miss,
+            }
+        };
+        match reuse {
+            ReuseOutcome::Reused(out) => {
+                let pool_gen = out.pool_gen;
+                match attach_session_cast(vd, out) {
+                    Ok(out) => return Some(out),
+                    Err(e) => {
+                        if let Some(g) = pool_gen {
+                            mark_failed(g);
+                        }
+                        tracing::info!(
+                            backend,
+                            error = %format!("{e:#}"),
+                            "virtual display: recast of kept head failed — recreating"
+                        );
+                    }
+                }
+            }
+            ReuseOutcome::Dead(dead) => {
+                dead.finish("kept display was dead — recreating (validated reuse)");
+            }
+            ReuseOutcome::Miss => {}
+        }
+        None
+    }
+
+    /// Hand kept entry `e` to this acquire under the pool lock: re-stamp it with `generation`,
+    /// settle its parked flag, and record `mode` once the compositor has confirmed it.
+    fn claim_kept(
+        e: &mut Entry,
+        generation: u64,
+        mode: Mode,
+        park: bool,
+        isolation: &Option<String>,
+        quit: &Arc<AtomicBool>,
+    ) -> VirtualOutput {
+        let (backend, node_id) = (e.backend, e.node_id);
+        e.life.acquire();
+        e.generation = generation;
+        // A session claiming a parked seat makes it an ordinary display, ending by the linger
+        // rules. A re-park keeps it parked.
+        let claimed = e.parked && !park;
+        e.parked = park;
+        // The compositor has confirmed the new mode, so the entry is at it: its reuse key, and
+        // what the capture is told to expect.
+        if e.mode != mode {
+            let from = e.mode;
+            e.mode = mode;
+            e.preferred_mode = Some((mode.width, mode.height, mode.refresh_hz));
+            tracing::info!(
+                backend,
+                node_id,
+                seat = e.seat.as_deref().unwrap_or("-"),
+                from = %format!("{}x{}@{}", from.width, from.height, from.refresh_hz),
+                to = %format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
+                "virtual display: kept compositor resized for this session — \
+                 nothing inside it restarts"
+            );
+        }
+        tracing::info!(
+            backend,
+            node_id,
+            seat = e.seat.as_deref().unwrap_or("-"),
+            "virtual display reused (keep-alive reconnect)"
+        );
+        if claimed {
+            tracing::info!(
+                backend,
+                node_id,
+                isolation = isolation.as_deref().unwrap_or("-"),
+                "virtual display: this session claimed its parked seat — its \
+                 Steam is already up"
+            );
+        }
+        output_for(
+            node_id,
+            e.preferred_mode,
+            (e.output_name.clone(), e.input_output.clone()),
+            e.seat.clone(),
+            generation,
+            quit.clone(),
+            true,
+        )
+    }
+
+    /// File a fresh poolable display in the pool, place it in its group, and attach the
+    /// session cast. A failed attach marks the entry failed so the next acquire recreates.
+    #[allow(clippy::too_many_arguments)]
+    fn pool_created(
+        vd: &mut Box<dyn VirtualDisplay>,
+        real: VirtualOutput,
+        generation: u64,
+        mode: Mode,
+        isolation: Option<String>,
+        cur_epoch: u64,
+        park: bool,
+        supersedes: Option<u64>,
+        quit: Arc<AtomicBool>,
+    ) -> Result<VirtualOutput> {
+        let r = reg();
+        let backend = vd.name();
+        let identity_slot = vd.last_identity_slot();
         let node_id = real.node_id;
         let preferred_mode = real.preferred_mode;
         let output_name = real.output_name.clone();
@@ -1944,7 +1982,7 @@ mod linux {
             backend,
             identity_slot,
             topology_restore,
-            isolation: isolation.clone(),
+            isolation,
             seat: real.seat.clone(),
             pid: real.pid,
             epoch: cur_epoch,

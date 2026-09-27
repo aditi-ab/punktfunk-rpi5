@@ -66,6 +66,7 @@ struct PumpTuning {
     stable_after: std::time::Duration,
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 const PUMP_TUNING: PumpTuning = PumpTuning {
     backoff_start: std::time::Duration::from_secs(2),
     backoff_cap: std::time::Duration::from_secs(60),

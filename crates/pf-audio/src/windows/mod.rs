@@ -1,32 +1,32 @@
 //! Windows audio: WASAPI loopback of the wiring plan's sink for capture, a minted virtual
 //! device for the mic, and the devnode plumbing every pad/minted endpoint shares. The seven
-//! `pub(super)` functions are the platform seam `audio.rs` calls through.
+//! `pub(super)` functions are the platform seam `lib.rs` calls through.
 
 use super::*;
 use anyhow::Result;
 
-pub(crate) mod audio_control;
+pub mod audio_control;
 // `audio-probe` devtest: mint Steam-driver instances and measure render→capture /
 // loopback paths for the Windows audio-substrate design.
-pub(crate) mod audio_probe;
+pub mod audio_probe;
 // SetupAPI + PROPVARIANT plumbing under every audio devnode we mint. Shared by pad_endpoint,
 // minted, audio_probe and devnode_cleanup — only one of which provisions pads.
-pub(crate) mod devnode_api;
+pub mod devnode_api;
 // Uninstall sweep of every audio devnode the providers (and the probe) mint.
 // `driver uninstall --audio` / installer [UninstallRun].
-pub(crate) mod devnode_cleanup;
+pub mod devnode_cleanup;
 // Minted "Punktfunk Speakers/Microphone": our instances of Valve's streaming-audio
 // drivers. Wiring-plan tier-0.
-pub(crate) mod minted;
+pub mod minted;
 // WASAPI loopback of a minted pad endpoint, plus the tone/probe devtests. Capturing is a
 // different job from provisioning, and the same one `wasapi_cap` does for the desktop.
-pub(crate) mod pad_capture;
+pub mod pad_capture;
 // DualSense pad-audio endpoint + loopback (design: pad haptics/audio). Session
 // queries by pad index; CLI `pad-endpoint`.
-pub(crate) mod pad_endpoint;
+pub mod pad_endpoint;
 // Voice-chat apps pinned to the operator's output while the stream captures the silent
 // sink; also the `voice-route` subcommand that writes the pins as the console user.
-pub(crate) mod voice_route;
+pub mod voice_route;
 mod wasapi_cap;
 mod wasapi_mic;
 

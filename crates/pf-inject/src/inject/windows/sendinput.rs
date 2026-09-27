@@ -26,7 +26,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
     MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
     MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    VIRTUAL_KEY,
+    MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -167,181 +167,33 @@ impl Drop for SendInputInjector {
 
 impl InputInjector for SendInputInjector {
     fn inject(&mut self, event: &InputEvent) -> Result<()> {
+        let down = matches!(event.kind, InputKind::MouseButtonDown | InputKind::KeyDown);
         match event.kind {
-            InputKind::MouseMove => {
-                let mi = MOUSEINPUT {
-                    dx: event.x,
-                    dy: event.y,
-                    mouseData: 0,
-                    dwFlags: MOUSEEVENTF_MOVE,
-                    time: 0,
-                    dwExtraInfo: 0,
-                };
-                self.send(&[mouse(mi)])
-            }
+            InputKind::MouseMove => self.send(&[mouse(MOUSEINPUT {
+                dx: event.x,
+                dy: event.y,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            })]),
             InputKind::MouseMoveAbs => {
-                let w = (event.flags >> 16) & 0xffff;
-                let h = event.flags & 0xffff;
-                if w == 0 || h == 0 {
-                    return Ok(()); // contract: drop zero extent
-                }
-                // Client (0..w,0..h) → STREAMED output rect ([`crate::stream_target`];
-                // whole virtual desktop only as fallback) → 0..65535 over the virtual
-                // desktop for MOUSEEVENTF_VIRTUALDESK. Mapping over the desktop alone
-                // is the Extend-topology offset bug (design/pen-tablet-input.md).
-                let cx = (event.x.clamp(0, w as i32)) as f64 / w as f64;
-                let cy = (event.y.clamp(0, h as i32)) as f64 / h as f64;
-                let px = crate::stream_target::map_normalized(cx, cy);
-                let (ax, ay) = crate::stream_target::desktop_px_to_virtualdesk(px);
-                let mi = MOUSEINPUT {
-                    dx: ax,
-                    dy: ay,
-                    mouseData: 0,
-                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                    time: 0,
-                    dwExtraInfo: 0,
-                };
-                self.send(&[mouse(mi)])
+                abs_move_input(event).map_or(Ok(()), |mi| self.send(&[mouse(mi)]))
             }
             InputKind::MouseButtonDown | InputKind::MouseButtonUp => {
-                let down = event.kind == InputKind::MouseButtonDown;
-                let (flag, data) = match event.code {
-                    1 => (
-                        if down {
-                            MOUSEEVENTF_LEFTDOWN
-                        } else {
-                            MOUSEEVENTF_LEFTUP
-                        },
-                        0u32,
-                    ),
-                    2 => (
-                        if down {
-                            MOUSEEVENTF_MIDDLEDOWN
-                        } else {
-                            MOUSEEVENTF_MIDDLEUP
-                        },
-                        0,
-                    ),
-                    3 => (
-                        if down {
-                            MOUSEEVENTF_RIGHTDOWN
-                        } else {
-                            MOUSEEVENTF_RIGHTUP
-                        },
-                        0,
-                    ),
-                    4 => (
-                        if down {
-                            MOUSEEVENTF_XDOWN
-                        } else {
-                            MOUSEEVENTF_XUP
-                        },
-                        XBUTTON1,
-                    ),
-                    5 => (
-                        if down {
-                            MOUSEEVENTF_XDOWN
-                        } else {
-                            MOUSEEVENTF_XUP
-                        },
-                        XBUTTON2,
-                    ),
-                    _ => return Ok(()),
-                };
-                let mi = MOUSEINPUT {
-                    dx: 0,
-                    dy: 0,
-                    mouseData: data,
-                    dwFlags: flag,
-                    time: 0,
-                    dwExtraInfo: 0,
-                };
-                self.send(&[mouse(mi)])
+                mouse_button_input(event.code, down).map_or(Ok(()), |mi| self.send(&[mouse(mi)]))
             }
             InputKind::MouseScroll | InputKind::Scroll => self.inject_scroll(event),
             InputKind::KeyDown | InputKind::KeyUp => {
-                let down = event.kind == InputKind::KeyDown;
                 let vk = (event.code & 0xff) as u16;
                 let semantic = (event.flags & crate::KEY_FLAG_SEMANTIC_VK) != 0;
-                // Pause make is E1 1D 45. Scan 0x45 is NumLock; KEYEVENTF_EXTENDEDKEY invents E0+45.
-                if vk == crate::keymap::VK_PAUSE {
-                    let ki = KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(vk),
-                        wScan: 0,
-                        dwFlags: if down {
-                            KEYBD_EVENT_FLAGS(0)
-                        } else {
-                            KEYEVENTF_KEYUP
-                        },
-                        time: 0,
-                        dwExtraInfo: 0,
-                    };
-                    return self.send(&[key(ki)]);
-                }
-                // Positional VKs: US table for the layout-variant typing area; everything
-                // else falls through to `MapVirtualKeyExW` (layout-invariant, extended bit).
-                // Semantic VKs skip the table and use the foreground app's layout.
-                let table = if semantic {
-                    None
-                } else {
-                    positional_vk_to_scan(vk)
-                };
-                let (scan, extended) = match table {
-                    Some(scan) => (scan, crate::keymap::vk_forced_extended(vk)), // typing area: never E0-extended
-                    None => {
-                        let hkl = if semantic { foreground_hkl() } else { None };
-                        // SAFETY: `MapVirtualKeyExW` is a pure value translation (VK → scancode);
-                        // all three args are by-value (`u32`, the `MAPVK_VK_TO_VSC_EX` map-type
-                        // constant, an optional `HKL` handle used only as a lookup key). It
-                        // dereferences no pointer and returns a `u32` — FFI-`unsafe` only.
-                        let sc_ex = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, hkl) };
-                        if sc_ex == 0 {
-                            return Ok(()); // unmappable -> drop
-                        }
-                        (
-                            (sc_ex & 0xff) as u16,
-                            (sc_ex & 0xe000) == 0xe000 || crate::keymap::vk_forced_extended(vk),
-                        )
-                    }
-                };
-                let mut flags = KEYEVENTF_SCANCODE;
-                if extended {
-                    flags |= KEYEVENTF_EXTENDEDKEY;
-                }
-                if !down {
-                    flags |= KEYEVENTF_KEYUP;
-                }
-                let ki = KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: scan,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                };
-                self.send(&[key(ki)])
+                key_input(vk, semantic, down, |vk| scan_ex(vk, semantic))
+                    .map_or(Ok(()), |ki| self.send(&[key(ki)]))
             }
             InputKind::TextInput => {
-                // Committed IME text: one Unicode scalar per event, injected as
-                // `KEYEVENTF_UNICODE` (wScan = UTF-16 unit, no scancode/layout). An
-                // astral-plane scalar is its surrogate pair, each unit down+up in order.
-                let Some(ch) = char::from_u32(event.code) else {
-                    return Ok(()); // lone surrogate / out of range — drop
-                };
-                if ch.is_control() {
-                    return Ok(()); // control chars ride the VK path (Enter/Backspace/Tab)
-                }
-                let mut units = [0u16; 2];
-                let mut inputs: Vec<INPUT> = Vec::with_capacity(4);
-                for &unit in ch.encode_utf16(&mut units).iter() {
-                    for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
-                        inputs.push(key(KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(0),
-                            wScan: unit,
-                            dwFlags: flags,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        }));
-                    }
+                let inputs: Vec<INPUT> = text_units(event.code).into_iter().map(key).collect();
+                if inputs.is_empty() {
+                    return Ok(());
                 }
                 self.send(&inputs)
             }
@@ -351,28 +203,173 @@ impl InputInjector for SendInputInjector {
             | InputKind::GamepadState
             | InputKind::GamepadRemove
             | InputKind::GamepadArrival => Ok(()),
-            // Wire touch → PT_TOUCH (design/pen-tablet-input.md). Lazy: a session that
-            // never touches never creates one; a pre-1809 create failure latches the no-op.
+            // Wire touch → PT_TOUCH (design/pen-tablet-input.md).
             InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {
-                if self.touch.is_none() && !self.touch_failed {
-                    match crate::pen::SyntheticTouch::create() {
-                        Ok(t) => self.touch = Some(t),
-                        Err(e) => {
-                            self.touch_failed = true;
-                            tracing::warn!(
-                                error = %format!("{e:#}"),
-                                "touch: synthetic pointer unavailable — wire touch stays a no-op"
-                            );
-                        }
-                    }
-                }
-                if let Some(t) = self.touch.as_mut() {
+                if let Some(t) = self.ensure_touch() {
                     t.apply(event);
                 }
                 Ok(())
             }
         }
     }
+}
+
+impl SendInputInjector {
+    /// The PT_TOUCH device, created on the first wire touch: a session that never touches
+    /// never creates one, and a pre-1809 create failure latches the no-op.
+    fn ensure_touch(&mut self) -> Option<&mut crate::pen::SyntheticTouch> {
+        if self.touch.is_none() && !self.touch_failed {
+            match crate::pen::SyntheticTouch::create() {
+                Ok(t) => self.touch = Some(t),
+                Err(e) => {
+                    self.touch_failed = true;
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "touch: synthetic pointer unavailable — wire touch stays a no-op"
+                    );
+                }
+            }
+        }
+        self.touch.as_mut()
+    }
+}
+
+/// Client (0..w,0..h) → STREAMED output rect ([`crate::stream_target`]; whole virtual desktop
+/// only as fallback) → 0..65535 over the virtual desktop for MOUSEEVENTF_VIRTUALDESK. Mapping
+/// over the desktop alone is the Extend-topology offset bug (design/pen-tablet-input.md).
+/// `None` for a zero extent, which the contract drops.
+fn abs_move_input(event: &InputEvent) -> Option<MOUSEINPUT> {
+    let w = (event.flags >> 16) & 0xffff;
+    let h = event.flags & 0xffff;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let cx = (event.x.clamp(0, w as i32)) as f64 / w as f64;
+    let cy = (event.y.clamp(0, h as i32)) as f64 / h as f64;
+    let px = crate::stream_target::map_normalized(cx, cy);
+    let (ax, ay) = crate::stream_target::desktop_px_to_virtualdesk(px);
+    Some(MOUSEINPUT {
+        dx: ax,
+        dy: ay,
+        mouseData: 0,
+        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        time: 0,
+        dwExtraInfo: 0,
+    })
+}
+
+/// Wire buttons 1..=5 (left, middle, right, X1, X2) as (down, up, `mouseData`).
+const BUTTONS: [(MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS, u32); 5] = [
+    (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 0),
+    (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, 0),
+    (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0),
+    (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON1),
+    (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON2),
+];
+
+/// `None` for a button the wire does not define.
+fn mouse_button_input(code: u32, down: bool) -> Option<MOUSEINPUT> {
+    let &(press, release, data) = BUTTONS.get(code.checked_sub(1)? as usize)?;
+    Some(MOUSEINPUT {
+        dx: 0,
+        dy: 0,
+        mouseData: data,
+        dwFlags: if down { press } else { release },
+        time: 0,
+        dwExtraInfo: 0,
+    })
+}
+
+/// One key edge as a scancode input. Positional VKs take the US table for the layout-variant
+/// typing area; everything else, and every semantic VK, goes through `map` (the extended
+/// scancode `MapVirtualKeyExW` returns, 0 = unmappable → `None`). Pause make is E1 1D 45:
+/// scan 0x45 is NumLock and KEYEVENTF_EXTENDEDKEY invents E0+45, so Pause goes by `wVk`.
+fn key_input(
+    vk: u16,
+    semantic: bool,
+    down: bool,
+    map: impl FnOnce(u16) -> u32,
+) -> Option<KEYBDINPUT> {
+    if vk == crate::keymap::VK_PAUSE {
+        return Some(KEYBDINPUT {
+            wVk: VIRTUAL_KEY(vk),
+            wScan: 0,
+            dwFlags: if down {
+                KEYBD_EVENT_FLAGS(0)
+            } else {
+                KEYEVENTF_KEYUP
+            },
+            time: 0,
+            dwExtraInfo: 0,
+        });
+    }
+    let table = if semantic {
+        None
+    } else {
+        positional_vk_to_scan(vk)
+    };
+    let (scan, extended) = match table {
+        // Typing area: never E0-extended.
+        Some(scan) => (scan, crate::keymap::vk_forced_extended(vk)),
+        None => {
+            let sc_ex = map(vk);
+            if sc_ex == 0 {
+                return None;
+            }
+            (
+                (sc_ex & 0xff) as u16,
+                (sc_ex & 0xe000) == 0xe000 || crate::keymap::vk_forced_extended(vk),
+            )
+        }
+    };
+    let mut flags = KEYEVENTF_SCANCODE;
+    if extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    if !down {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    Some(KEYBDINPUT {
+        wVk: VIRTUAL_KEY(0),
+        wScan: scan,
+        dwFlags: flags,
+        time: 0,
+        dwExtraInfo: 0,
+    })
+}
+
+/// `MapVirtualKeyExW` VK → extended scancode, under the foreground app's layout for a
+/// semantic VK and this thread's otherwise. 0 = unmappable.
+fn scan_ex(vk: u16, semantic: bool) -> u32 {
+    let hkl = if semantic { foreground_hkl() } else { None };
+    // SAFETY: `MapVirtualKeyExW` is a pure value translation (VK → scancode); all three args
+    // are by-value (`u32`, the `MAPVK_VK_TO_VSC_EX` map-type constant, an optional `HKL`
+    // handle used only as a lookup key). It dereferences no pointer and returns a `u32`.
+    unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, hkl) }
+}
+
+/// Committed IME text: one Unicode scalar as `KEYEVENTF_UNICODE` (wScan = UTF-16 unit, no
+/// scancode or layout), each unit down then up, so an astral scalar is its surrogate pair.
+/// Empty for a lone surrogate, an out-of-range code, or a control character, which rides
+/// the VK path (Enter/Backspace/Tab).
+fn text_units(code: u32) -> Vec<KEYBDINPUT> {
+    let Some(ch) = char::from_u32(code).filter(|c| !c.is_control()) else {
+        return Vec::new();
+    };
+    let mut units = [0u16; 2];
+    let mut out = Vec::with_capacity(4);
+    for &unit in ch.encode_utf16(&mut units).iter() {
+        for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+            out.push(KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: unit,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            });
+        }
+    }
+    out
 }
 
 fn mouse(mi: MOUSEINPUT) -> INPUT {
@@ -511,6 +508,55 @@ mod tests {
             }
         }
         assert_eq!(checked, 57, "typing-area coverage changed unexpectedly");
+    }
+
+    #[test]
+    fn wire_buttons_one_to_five_map_and_nothing_else_does() {
+        let x2 = mouse_button_input(5, true).unwrap();
+        assert_eq!((x2.dwFlags, x2.mouseData), (MOUSEEVENTF_XDOWN, XBUTTON2));
+        assert_eq!(
+            mouse_button_input(3, false).unwrap().dwFlags,
+            MOUSEEVENTF_RIGHTUP
+        );
+        assert!(mouse_button_input(0, true).is_none());
+        assert!(mouse_button_input(6, true).is_none());
+    }
+
+    /// A positional VK never asks the layout; a semantic one does, and keeps its E0 bit.
+    #[test]
+    fn key_input_takes_the_table_for_positional_and_the_layout_for_semantic() {
+        let ki = key_input(0x59, false, true, |_| panic!("positional must not map")).unwrap();
+        assert_eq!((ki.wScan, ki.dwFlags), (0x15, KEYEVENTF_SCANCODE));
+        let ki = key_input(0x59, true, false, |_| 0xe02c).unwrap();
+        assert_eq!(ki.wScan, 0x2c);
+        assert_eq!(
+            ki.dwFlags,
+            KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP
+        );
+        assert!(
+            key_input(0x0D, false, true, |_| 0).is_none(),
+            "unmappable drops"
+        );
+        // Pause rides `wVk`: its scancode is NumLock's.
+        let pause = key_input(crate::keymap::VK_PAUSE, false, true, |_| panic!()).unwrap();
+        assert_eq!(
+            (pause.wVk, pause.wScan),
+            (VIRTUAL_KEY(crate::keymap::VK_PAUSE), 0)
+        );
+    }
+
+    #[test]
+    fn text_is_utf16_units_down_then_up() {
+        assert_eq!(text_units('a' as u32).len(), 2);
+        let pair = text_units(0x1F600);
+        assert_eq!(pair.len(), 4);
+        assert_eq!((pair[0].wScan, pair[2].wScan), (0xD83D, 0xDE00));
+        assert_eq!(pair[1].dwFlags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+        assert!(
+            text_units(0x0A).is_empty(),
+            "control characters ride the VK path"
+        );
+        assert!(text_units(0xD800).is_empty(), "a lone surrogate drops");
     }
 
     /// US Y/Z/ö/ü stay on those positions. Pause and NumLock stay out — they share scan 0x45.

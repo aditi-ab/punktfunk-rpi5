@@ -4,8 +4,8 @@
 //! (`PUNKTFUNK_STREAM_SINK=0` records the default sink's monitor). Windows: WASAPI
 //! loopback of the wiring-plan endpoint. Capture is interleaved `f32` PCM; channel
 //! count is the open request (GameStream order FL FR FC LFE RL RR [SL SR]).
-//! `gamestream::audio` reframes it into Opus. Rate honesty: [`CaptureRate`] and
-//! `design/hi-res-audio.md`. Isolated-session names: `design/gamescope-multiuser.md`.
+//! The host's audio planes reframe it into Opus ([`OpusEnc`]). Rate honesty: [`CaptureRate`]
+//! and `design/hi-res-audio.md`. Isolated-session names: `design/gamescope-multiuser.md`.
 
 use anyhow::Result;
 
@@ -324,7 +324,7 @@ pub struct MicBackendStats {
 /// `PUNKTFUNK_MIC_LEGACY_BUFFER=1`: pump never drives the backend target (rings stay
 /// on 48 ms prime / 120 ms cap on Windows, 3-quanta clamp on Linux) and never
 /// creep-trims depth.
-pub(crate) fn mic_legacy_buffer() -> bool {
+pub fn mic_legacy_buffer() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PUNKTFUNK_MIC_LEGACY_BUFFER").is_some_and(|v| v != "0"))
 }
@@ -345,18 +345,12 @@ pub fn open_virtual_mic_named(channels: u32, source: Option<&str>) -> Result<Box
 #[cfg(target_os = "windows")]
 mod windows;
 
-/// `punktfunk-host voice-route …`: writes the per-app output pins in whatever user context
-/// it runs in — the capture thread spawns it as the console user ([`windows::voice_route`]).
-#[cfg(target_os = "windows")]
-pub(crate) fn voice_route_cli(args: &[String]) -> anyhow::Result<()> {
-    windows::voice_route::cli(args)
-}
 #[cfg(target_os = "windows")]
 use self::windows as plat;
-// Flat names for the session, the devtests and the installer: `crate::audio::pad_endpoint`.
+// Flat names for the session, the devtests and the installer: `pf_audio::pad_endpoint`.
 #[cfg(target_os = "windows")]
-pub(crate) use self::windows::{
-    audio_control, audio_probe, devnode_cleanup, minted, pad_capture, pad_endpoint,
+pub use self::windows::{
+    audio_control, audio_probe, devnode_cleanup, minted, pad_capture, pad_endpoint, voice_route,
 };
 #[cfg(target_os = "linux")]
 mod linux;
@@ -366,7 +360,7 @@ use self::linux as plat;
 // mints per-pad sinks; CLI `pad-sink-test`. USB DualSense: capture the isochronous
 // endpoint instead of minting a PipeWire node.
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{pad_sink, pad_usb};
+pub use linux::{pad_sink, pad_usb};
 /// No capture backend: `open_audio_capture` bails, so there is no rate to promise either.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 mod plat {
@@ -405,13 +399,11 @@ mod plat {
     }
 }
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-#[path = "audio/wiring_plan.rs"]
-pub(crate) mod wiring_plan;
+pub mod wiring_plan;
 // Capture-loop policy, split out like `wiring_plan`: tests must run on every
 // platform's CI, not only Windows.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-#[path = "audio/capture_policy.rs"]
-pub(crate) mod capture_policy;
+pub mod capture_policy;
 
 mod mic_jitter;
 mod mic_pump;
@@ -419,7 +411,7 @@ pub use mic_pump::{mic_source_id, MicFrame, MicPump};
 
 /// Apps playing audio on the host right now, lowercased. Empty where the host cannot list them.
 /// Blocks on a PipeWire round trip; call it off the async runtime.
-pub(crate) fn playing_apps() -> Vec<String> {
+pub fn playing_apps() -> Vec<String> {
     #[cfg(target_os = "linux")]
     return linux::playing_apps().unwrap_or_else(|e| {
         tracing::debug!(error = %format!("{e:#}"), "playing apps not listed");
@@ -431,7 +423,7 @@ pub(crate) fn playing_apps() -> Vec<String> {
 
 /// Last wiring-pass assignment on Windows; `None` elsewhere or before the first pass.
 /// Read-only for the status API — never triggers a pass.
-pub(crate) fn wiring_snapshot() -> Option<wiring_plan::Wiring> {
+pub fn wiring_snapshot() -> Option<wiring_plan::Wiring> {
     plat::wiring_snapshot()
 }
 

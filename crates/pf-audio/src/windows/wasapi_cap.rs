@@ -196,7 +196,7 @@ fn live_captures() -> std::sync::MutexGuard<'static, usize> {
 }
 
 /// A loopback capture is running, so the parked defaults are its to manage.
-pub(crate) fn capture_live() -> bool {
+pub fn capture_live() -> bool {
     *live_captures() > 0
 }
 
@@ -628,7 +628,7 @@ fn capture_once(
     // 4 bytes per f32 sample, interleaved.
     let block_align = channels as usize * 4;
     let keep_default = audio_control::keep_default_devices();
-    let seat = crate::seat::is_seat_host();
+    let seat = pf_paths::seat::is_seat_host();
     let (bind_plan, assert_plan) = binding(mode, keep_default, seat);
     let mut plan = audio_control::wire_now_full(assert_plan);
 

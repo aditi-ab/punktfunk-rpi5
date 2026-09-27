@@ -300,6 +300,13 @@ impl VirtualDisplay for HyprlandDisplay {
         "hyprland"
     }
 
+    /// A keep-alive reconnect recasts the kept head at its name, so it needs that name and
+    /// this session's identity. A nameless kept head is refused: lingering a black head is
+    /// worse than tearing it down. Mode already matched, since a kept head never resizes.
+    fn accepts_kept(&self, identity_slot: Option<u32>, output_name: Option<&str>) -> bool {
+        output_name.is_some() && identity_slot == self.last_identity_slot()
+    }
+
     fn set_hw_cursor(&mut self, on: bool) {
         self.hw_cursor = on;
     }
@@ -1066,39 +1073,6 @@ fn evacuate_workspace(ours: &str) {
                 );
             }
         }
-    }
-}
-
-/// Keep-alive reconnect: recast the named head, or create if nothing matches.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LingerReuse {
-    Recast { output_name: String },
-    Create,
-}
-
-/// Matching backend + mode + identity on a named Hyprland head skips `output create`.
-/// A missing name is Create: lingering a black head is worse than tearing down.
-pub(crate) fn linger_reuse_decision(
-    backend: &str,
-    mode: Mode,
-    identity: Option<u32>,
-    kept_backend: &str,
-    kept_mode: Mode,
-    kept_identity: Option<u32>,
-    kept_output_name: Option<&str>,
-) -> LingerReuse {
-    if backend != "hyprland" {
-        return LingerReuse::Create;
-    }
-    match kept_output_name {
-        Some(output_name)
-            if kept_backend == backend && kept_mode == mode && kept_identity == identity =>
-        {
-            LingerReuse::Recast {
-                output_name: output_name.to_string(),
-            }
-        }
-        _ => LingerReuse::Create,
     }
 }
 
@@ -2101,76 +2075,13 @@ mod tests {
         assert!(first_physical_dest(&[head(ours, true)], ours).is_none());
     }
 
-    fn mode(w: u32, h: u32, hz: u32) -> Mode {
-        Mode {
-            width: w,
-            height: h,
-            refresh_hz: hz,
-        }
-    }
-
-    /// Reconnect with matching backend + mode + identity skips `output create`
-    /// and recasts at the existing name. Anything else creates — including a
-    /// kept head with no name, which would otherwise linger black.
+    /// Reconnect recasts only a named head of its own identity; anything else creates.
     #[test]
-    fn linger_reuse_recasts_a_matching_named_hyprland_head() {
-        let m = mode(1920, 1080, 60);
-        assert_eq!(
-            linger_reuse_decision(
-                "hyprland",
-                m,
-                Some(1),
-                "hyprland",
-                m,
-                Some(1),
-                Some("PF-1-1"),
-            ),
-            LingerReuse::Recast {
-                output_name: "PF-1-1".into(),
-            }
-        );
-        assert_eq!(
-            linger_reuse_decision("hyprland", m, None, "hyprland", m, None, Some("PF-1-1")),
-            LingerReuse::Recast {
-                output_name: "PF-1-1".into(),
-            }
-        );
-        assert_eq!(
-            linger_reuse_decision(
-                "hyprland",
-                m,
-                Some(1),
-                "hyprland",
-                mode(1280, 720, 60),
-                Some(1),
-                Some("PF-1-1"),
-            ),
-            LingerReuse::Create
-        );
-        assert_eq!(
-            linger_reuse_decision(
-                "hyprland",
-                m,
-                Some(1),
-                "hyprland",
-                m,
-                Some(2),
-                Some("PF-1-1"),
-            ),
-            LingerReuse::Create
-        );
-        assert_eq!(
-            linger_reuse_decision("hyprland", m, None, "hyprland", m, None, None),
-            LingerReuse::Create
-        );
-        assert_eq!(
-            linger_reuse_decision("wlroots", m, None, "wlroots", m, None, Some("HEADLESS-1")),
-            LingerReuse::Create
-        );
-        assert_eq!(
-            linger_reuse_decision("hyprland", m, None, "kwin", m, None, Some("PF-1-1")),
-            LingerReuse::Create
-        );
+    fn a_reconnect_reuses_only_a_named_head_of_its_own_identity() {
+        let display = HyprlandDisplay::new().unwrap();
+        assert!(display.accepts_kept(None, Some("PF-1-1")));
+        assert!(!display.accepts_kept(None, None));
+        assert!(!display.accepts_kept(Some(1), Some("PF-1-1")));
     }
 
     /// A reconnect backend must adopt from the pooled head when a later mode

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// DNS-SD service type punktfunk hosts advertise (host side: `punktfunk_host::discovery`).
+/// DNS-SD service type punktfunk hosts advertise (host side: `punktfunk_host::hostsys::discovery`).
 const SERVICE_TYPE: &str = "_punktfunk._udp.local.";
 /// Field separator inside one serialized record (ASCII Unit Separator — never in a field value).
 const FIELD_SEP: char = '\u{1f}';

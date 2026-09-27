@@ -34,6 +34,7 @@ members = [
     "crates/pf-encode-win",
     "crates/pf-capture",
     "crates/pf-inject",
+    "crates/pf-audio",
     "crates/pf-vdisplay",
     "crates/pf-vkdecode",
     "crates/pf-dxvadec",

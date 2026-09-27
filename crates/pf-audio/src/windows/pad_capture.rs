@@ -19,7 +19,7 @@ use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
 pub const PAD_CHANNELS: u32 = 4;
 /// 4-ch pad layout (FL FR BL BR). Not `punktfunk_core::audio::wasapi_channel_mask`,
 /// which only speaks GameStream stereo/5.1/7.1.
-pub(crate) const PAD_CHANNEL_MASK: u32 = 0x33;
+pub const PAD_CHANNEL_MASK: u32 = 0x33;
 const PAD_BLOCK_ALIGN: usize = PAD_CHANNELS as usize * 4;
 
 /// WASAPI loopback of one pad endpoint: interleaved 4-ch f32 at 48 kHz.
@@ -87,7 +87,7 @@ fn reap_with_timeout(join: JoinHandle<()>, budget: Duration) -> bool {
 /// Back = voice coils (BL BR). Driving one pair and silencing the other
 /// is how a result names which kind the framer routed.
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum TonePair {
+pub enum TonePair {
     Front,
     Back,
     Both,
@@ -95,14 +95,14 @@ pub(crate) enum TonePair {
 
 impl TonePair {
     /// `--pair` argument; anything unrecognised keeps the haptics (Back) default.
-    pub(crate) fn parse(s: &str) -> TonePair {
+    pub fn parse(s: &str) -> TonePair {
         match s {
             "front" | "speaker" => TonePair::Front,
             "both" => TonePair::Both,
             _ => TonePair::Back,
         }
     }
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             TonePair::Front => "FRONT pair (the pad's speaker)",
             TonePair::Back => "BACK pair (the voice coils)",
@@ -121,12 +121,7 @@ impl TonePair {
 /// Render a test tone into a pad endpoint. Default BACK (voice coils) so a
 /// pass is felt in the grips and cannot be the speaker; `--pair front` is
 /// the speaker kind without a game.
-pub(crate) fn render_test_tone(
-    endpoint_id: &str,
-    seconds: u32,
-    hz: f32,
-    pair: TonePair,
-) -> Result<()> {
+pub fn render_test_tone(endpoint_id: &str, seconds: u32, hz: f32, pair: TonePair) -> Result<()> {
     wasapi::initialize_mta()
         .ok()
         .context("initialize COM (MTA) for the tone render")?;
@@ -153,7 +148,7 @@ const TONE_AMP: f32 = 0.5;
 
 /// Play a `hz` sine into `device` for `seconds` (1–60) or until `stop`: shared-mode 48 kHz
 /// f32 with autoconvert, the open the virtual mic uses. Channels `carries` rejects are silent.
-pub(crate) fn play_tone(
+pub fn play_tone(
     device: &wasapi::Device,
     channels: usize,
     mask: Option<u32>,
@@ -232,7 +227,7 @@ pub(crate) fn play_tone(
 /// Run with [`render_test_tone`]: BACK-only is the 0xD1 coil signal;
 /// front energy means pair routing is wrong; both silent means the
 /// endpoint carries no audio.
-pub(crate) fn capture_probe(endpoint_id: &str, seconds: u32) -> Result<()> {
+pub fn capture_probe(endpoint_id: &str, seconds: u32) -> Result<()> {
     let mut cap = PadLoopbackCapturer::open(endpoint_id)
         .with_context(|| format!("open pad loopback on {endpoint_id}"))?;
     let deadline = Instant::now() + Duration::from_secs(u64::from(seconds.clamp(1, 60)));
@@ -324,8 +319,8 @@ fn initialize_loopback(audio_client: &mut wasapi::AudioClient) -> Result<()> {
 /// The endpoint mixes at fewer channels than the pad has. The open still succeeds, since the
 /// engine upmixes for the capture, but a game sees a stereo speaker and no DualSense.
 #[derive(Debug)]
-pub(crate) struct MixFormatMismatch {
-    pub(crate) channels: u16,
+pub struct MixFormatMismatch {
+    pub channels: u16,
 }
 
 impl std::fmt::Display for MixFormatMismatch {
@@ -343,7 +338,7 @@ impl std::error::Error for MixFormatMismatch {}
 /// Whether the endpoint takes the streamer's own open AND mixes at the pad's channel count.
 /// Same device, format and flags as the capture thread; nothing starts, and the client drops
 /// on return.
-pub(crate) fn probe_open(endpoint_id: &str) -> Result<()> {
+pub fn probe_open(endpoint_id: &str) -> Result<()> {
     wasapi::initialize_mta()
         .ok()
         .context("CoInitializeEx (MTA)")?;
@@ -363,13 +358,13 @@ pub(crate) fn probe_open(endpoint_id: &str) -> Result<()> {
 
 /// `AUDCLNT_E_UNSUPPORTED_FORMAT` anywhere in the chain: the endpoint's own graph refuses the
 /// format, so a retry on this process changes nothing.
-pub(crate) fn is_unsupported_format(e: &anyhow::Error) -> bool {
+pub fn is_unsupported_format(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("0x88890008")
 }
 
 /// What a policy-API reshape to the pad's format can cure: a refused open, or an open that
 /// works at the wrong channel count.
-pub(crate) fn needs_reshape(e: &anyhow::Error) -> bool {
+pub fn needs_reshape(e: &anyhow::Error) -> bool {
     is_unsupported_format(e) || e.downcast_ref::<MixFormatMismatch>().is_some()
 }
 

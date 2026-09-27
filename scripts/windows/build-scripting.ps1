@@ -7,7 +7,7 @@
 
   WHY the layout matters: the plugins CLI forwards package ops (add/remove/list) to the runner, and
   on Windows it resolves the runner RELATIVE TO THE RUNNING EXE - <exe-dir>\bun\bun.exe and
-  <exe-dir>\scripting\runner-cli.js (crates\punktfunk-host\src\plugins.rs). deploy-host.ps1 runs the
+  <exe-dir>\scripting\runner-cli.js (crates\punktfunk-host\src\plugin_host\plugins.rs). deploy-host.ps1 runs the
   service out of target\release, so a bundle sitting only in the installed {app} leaves the freshly
   built exe reporting "the plugin runner isn't installed". We therefore deploy next to EVERY host exe
   we can find: the built one, and whatever the PunktfunkHost service actually runs.

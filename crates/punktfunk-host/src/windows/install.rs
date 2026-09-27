@@ -25,6 +25,7 @@ fn flag_val(args: &[String], name: &str) -> Option<String> {
 fn flag_present(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
+use pf_paths::remove_device;
 pub(crate) use pf_paths::system32 as sys32;
 
 /// [`sys32`] for a bare tool name. A name that already carries a separator (the staged
@@ -39,28 +40,6 @@ pub(crate) fn resolve_tool(cmd: &str) -> String {
 /// bare name is System32's: `service install` and `driver` run elevated.
 pub(crate) fn run_quiet(cmd: &str, args: &[&str]) -> bool {
     run_code(cmd, args) == Some(0)
-}
-/// `pnputil /remove-device` by absolute path: an uninstaller must not depend on `%PATH%`.
-/// `Err` carries pnputil's exit status and message, or why it did not run.
-pub(crate) fn remove_device(instance_id: &str) -> Result<()> {
-    let o = Command::new(sys32("pnputil.exe"))
-        .args(["/remove-device", instance_id])
-        .output()
-        .context("run pnputil")?;
-    if !o.status.success() {
-        // Whichever stream pnputil wrote its reason to.
-        let msg = if o.stderr.is_empty() {
-            &o.stdout
-        } else {
-            &o.stderr
-        };
-        bail!(
-            "pnputil /remove-device {}: {}",
-            o.status,
-            String::from_utf8_lossy(msg).trim()
-        );
-    }
-    Ok(())
 }
 /// Exit code, output discarded. `None` when the tool did not launch.
 fn run_code(cmd: &str, args: &[&str]) -> Option<i32> {

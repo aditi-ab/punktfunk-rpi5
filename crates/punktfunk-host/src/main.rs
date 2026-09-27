@@ -14,7 +14,10 @@
 // Keep `unsafe fn` only where a caller can violate a contract (raw pointer / borrowed HANDLE).
 // Workspace lints already require `// SAFETY:` on every `unsafe` block.
 
-mod audio;
+// Shim: audio backends live in `pf-audio`; keep `crate::audio::*` for this crate's callers.
+mod audio {
+    pub(crate) use pf_audio::*;
+}
 mod bringup;
 mod capture;
 mod detect;
@@ -22,11 +25,6 @@ mod devtest;
 /// Structured health verdicts — design/web-console-diagnostics.md.
 #[forbid(unsafe_code)]
 mod diagnostics;
-// Network-facing; same `forbid` as `mod mgmt`.
-#[forbid(unsafe_code)]
-mod discovery;
-#[forbid(unsafe_code)]
-mod wol;
 // `#[path]` keeps `crate::*` names flat while files live under `src/linux/`.
 #[cfg(target_os = "linux")]
 #[path = "linux/drm_sync.rs"]
@@ -36,7 +34,10 @@ mod drm_sync;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-use windows::{game_term, install, interactive, seat, service, tray};
+use windows::{game_term, install, interactive, service, tray};
+// What this host reads of the multi-seat contract; unset means the console host.
+#[cfg(target_os = "windows")]
+use pf_paths::seat;
 #[cfg(not(target_os = "windows"))]
 mod windows {
     pub(crate) mod entry {
@@ -115,11 +116,13 @@ mod encode {
     }
 }
 mod encode_recovery;
-// Who else holds an NVENC session (NVML); names the neighbour when a stream falls behind.
-mod encoder_sessions;
 mod events;
-// Session⇄game lifetime — design/session-game-lifetime.md.
-mod gamelease;
+// Launch, lease and liveness of a session's game; the flat names keep `crate::gamelease::*`.
+mod game;
+use game::{
+    gamelease, holds, launchreg, procscan, runstate, session_launch, session_settings,
+    stream_marker,
+};
 mod gamestream;
 #[cfg(target_os = "linux")]
 #[path = "linux/gpuclocks.rs"]
@@ -127,27 +130,19 @@ mod gpuclocks;
 mod hooks;
 // What every plane shares: host facts, session state, `serve`.
 mod host;
-// Launch holds: plugins and hooks that act before a game starts.
-mod holds;
-// Network-facing; same `forbid` as `mod mgmt`. Tests mutate process env (`set_var` is unsafe in 2024).
-#[cfg_attr(not(test), forbid(unsafe_code))]
-mod identity;
+// The box itself: identity, adverts, wake, power, sleep; the flat names keep `crate::power::*`.
+mod hostsys;
+use hostsys::{discovery, identity, osinfo, power, sleep_inhibit, wol};
 // Shim: inject backends live in `pf-inject`; keep `crate::inject::*` for this crate's callers.
 mod inject {
     pub(crate) use pf_inject::*;
 }
-mod client_logs;
 mod pen_sink;
 // Unix wall clock every stored deadline and event stamp reads.
 mod clock;
 // Compositor + gamescope route for a connect, shared by the native and GameStream planes.
 mod compositor_route;
-// Re-`Hello::launch` must not start a second copy — design/session-game-lifetime.md.
-mod launchreg;
 mod library;
-#[forbid(unsafe_code)]
-mod link_health;
-mod log_capture;
 // Network-facing secure-default surface. `not(test)` because tests mutate process env
 // (`set_var` is unsafe in 2024) and `native` has in-process C-ABI roundtrips.
 #[cfg_attr(not(test), forbid(unsafe_code))]
@@ -161,29 +156,21 @@ mod ctl;
 mod native;
 #[forbid(unsafe_code)]
 mod native_pairing;
-mod net_health;
-mod osinfo;
 // Live per-session pad tap the console's Controllers page streams.
 mod pad_feed;
-mod plugins;
-mod power;
-// Process-table half of session⇄game binding — design/session-game-lifetime.md. Empty on macOS.
-mod procscan;
-// Plugin-reported liveness; `procscan` only sees the process table.
-mod runstate;
+// Plugin runner, access and store; the flat names keep `crate::plugins::*`.
+mod plugin_host;
+use plugin_host::{plugins, store};
 mod send_pacing;
-mod session_launch;
 mod session_plan;
-// Operator policy for session⇄game binding (`session-settings.json`).
-mod session_settings;
-mod session_status;
-mod sleep_inhibit;
 mod slug;
 mod spike;
-mod stats_recorder;
-// Signed catalogs and install jobs via the `plugins` runner — design/plugin-store.md.
-mod store;
-mod stream_marker;
+// Session status, stats and log capture; the flat names keep `crate::session_status::*`.
+mod telemetry;
+use telemetry::{
+    client_logs, encoder_sessions, link_health, log_capture, net_health, session_status,
+    stats_recorder,
+};
 #[cfg(test)]
 mod test_support {
     /// A fresh directory that lives until the calling test's thread ends, for a helper that
@@ -404,8 +391,8 @@ fn is_management_cli(args: &[String]) -> bool {
 }
 
 /// Once per process, before the subcommand: the banner, the capture anchor, the display
-/// event sink, platform preflight and the GPU driver profile. A management CLI skips the
-/// host parts.
+/// event sink, the voice-pin hooks, platform preflight and the GPU driver profile. A
+/// management CLI skips the host parts.
 fn startup(args: &[String]) {
     let management_cli = is_management_cli(args);
 
@@ -437,6 +424,14 @@ fn startup(args: &[String]) {
             events::emit(events::EventKind::DisplayReleased { count })
         }
     }));
+
+    // Once: the voice-chat pin reaches processes and the console user through the host.
+    #[cfg(target_os = "windows")]
+    let _ = audio::voice_route::HOST_HOOKS.set(audio::voice_route::HostHooks {
+        processes: procscan::processes,
+        run_hidden_as_user: interactive::run_hidden_as_current_session_user,
+        running_as_system: hooks::running_as_system,
+    });
 
     windows::entry::preflight(management_cli);
 
@@ -537,7 +532,7 @@ fn real_main() -> Result<()> {
         // `voice-route set|clear …`: the per-app output pin. The capture thread spawns it as the
         // console user, because a SYSTEM caller writes SYSTEM's app preferences, not the user's.
         #[cfg(target_os = "windows")]
-        Some("voice-route") => audio::voice_route_cli(&args[1..]),
+        Some("voice-route") => audio::voice_route::cli(&args[1..]),
         #[cfg(target_os = "linux")]
         Some("list-monitors") => devtest::list_monitors(),
         #[cfg(target_os = "linux")]

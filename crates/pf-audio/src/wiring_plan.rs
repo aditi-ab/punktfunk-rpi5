@@ -16,7 +16,7 @@
 //! Callers wait on [`fingerprint`], not retry. Pin via the unit tests in this file.
 
 /// WASAPI `(friendly_name, endpoint_id)`.
-pub(crate) type Endpoint = (String, String);
+pub type Endpoint = (String, String);
 
 /// Engine mix format from `IAudioClient::GetMixFormat`.
 ///
@@ -24,7 +24,7 @@ pub(crate) type Endpoint = (String, String);
 /// converts silently. The logged "48 kHz f32 stereo" is the REQUEST, not the
 /// source — a 24 kHz mono mix is already bottlenecked before Opus sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MixFormat {
+pub struct MixFormat {
     pub rate_hz: u32,
     pub channels: u16,
     pub bits: u16,
@@ -33,7 +33,7 @@ pub(crate) struct MixFormat {
 impl MixFormat {
     /// Why this mix would narrow a `want`-channel desktop stream, or `None`.
     /// Bit depth is not a criterion: 16-bit is ~96 dB, below Opus's noise floor.
-    pub(crate) fn narrowing(&self, want: u8) -> Option<String> {
+    pub fn narrowing(&self, want: u8) -> Option<String> {
         if self.rate_hz < 48_000 && self.channels < want as u16 {
             return Some(format!(
                 "mixes at {} Hz and only {} channel(s)",
@@ -59,9 +59,9 @@ impl MixFormat {
 
 /// Mix-format lookup. `None` = unknown, treated as intact so a probe failure
 /// cannot make the plan worse than the format-blind path.
-pub(crate) type FormatProbe<'a> = &'a dyn Fn(&Endpoint) -> Option<MixFormat>;
+pub type FormatProbe<'a> = &'a dyn Fn(&Endpoint) -> Option<MixFormat>;
 
-pub(crate) fn no_formats(_: &Endpoint) -> Option<MixFormat> {
+pub fn no_formats(_: &Endpoint) -> Option<MixFormat> {
     None
 }
 
@@ -71,7 +71,7 @@ pub(crate) fn no_formats(_: &Endpoint) -> Option<MixFormat> {
 /// friendly name from Steam's primaries, so the provider records ids and the
 /// plan matches those. Empty fields fall through to the name ladder.
 #[derive(Debug, Default, Clone, PartialEq)]
-pub(crate) struct MintedIds {
+pub struct MintedIds {
     /// Reserved client-only loopback sink. Steam Remote Play never contends it.
     pub speakers_render: Option<String>,
     pub mic_render: Option<String>,
@@ -80,14 +80,14 @@ pub(crate) struct MintedIds {
 
 /// Whether desktop audio and the mic both have endpoints after a plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AudioReadiness {
+pub enum AudioReadiness {
     Full,
     AudioOnly,
     MicOnly,
     Nothing,
 }
 
-pub(crate) fn readiness(w: &Wiring) -> AudioReadiness {
+pub fn readiness(w: &Wiring) -> AudioReadiness {
     match (w.loopback_render.is_some(), w.mic_render.is_some()) {
         (true, true) => AudioReadiness::Full,
         (true, false) => AudioReadiness::AudioOnly,
@@ -99,7 +99,7 @@ pub(crate) fn readiness(w: &Wiring) -> AudioReadiness {
 /// Endpoint assignment for one wiring pass. Recomputed on every mic/capture
 /// (re)open — Windows endpoints churn, so a once-per-process plan goes stale.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Wiring {
+pub struct Wiring {
     /// Virtual-mic write target. The loopback must never capture this device.
     pub mic_render: Option<Endpoint>,
     /// Capture side of the mic device; parked as the default recording device.
@@ -120,7 +120,7 @@ pub(crate) struct Wiring {
 impl Wiring {
     /// No loopback endpoint, not even last resort. [`plan`] is pure, so this is
     /// structural: retry without a [`fingerprint`] change repeats the same verdict.
-    pub(crate) fn loopback_unsatisfiable(&self) -> bool {
+    pub fn loopback_unsatisfiable(&self) -> bool {
         self.loopback_render.is_none()
     }
 }
@@ -152,7 +152,7 @@ fn capture_for(mic_render_lname: &str) -> &'static [&'static str] {
 /// Steam Streaming Speakers (silent loopback), VoiceMeeter (one shared mixer —
 /// any strip recaptures the mic), and generic "virtual". Also the capture
 /// watchdog's "this new default can never work" test.
-pub(crate) fn excluded_from_loopback(lname: &str) -> bool {
+pub fn excluded_from_loopback(lname: &str) -> bool {
     lname.contains("cable")
         || lname.contains("steam streaming speakers")
         || lname.contains("voicemeeter")
@@ -161,13 +161,13 @@ pub(crate) fn excluded_from_loopback(lname: &str) -> bool {
 
 /// Silent on the host but loopback-capturable. Only the Streaming Microphone
 /// render side qualifies (the Speakers' loopback is silent).
-pub(crate) fn silent_sink(lname: &str) -> bool {
+pub fn silent_sink(lname: &str) -> bool {
     lname.contains("steam streaming microphone")
 }
 
 /// Capture side of a virtual device. Recording-default hygiene must never
 /// park the box's default on one of these.
-pub(crate) fn virtual_capture(lname: &str) -> bool {
+pub fn virtual_capture(lname: &str) -> bool {
     lname.contains("cable output")
         || lname.contains("steam streaming")
         || lname.contains("voicemeeter")
@@ -177,10 +177,7 @@ pub(crate) fn virtual_capture(lname: &str) -> bool {
 
 /// First real capture endpoint (skip `avoid_id` and every [`virtual_capture`]).
 /// `None` when there is no real microphone: leave the default alone.
-pub(crate) fn real_capture<'a>(
-    captures: &'a [Endpoint],
-    avoid_id: Option<&str>,
-) -> Option<&'a Endpoint> {
+pub fn real_capture<'a>(captures: &'a [Endpoint], avoid_id: Option<&str>) -> Option<&'a Endpoint> {
     captures
         .iter()
         .find(|(n, id)| Some(id.as_str()) != avoid_id && !virtual_capture(&n.to_lowercase()))
@@ -198,13 +195,13 @@ fn virtualish(lname: &str) -> bool {
 ///
 /// Pad endpoints are stamped with the controller name so games treat them as
 /// the pad speaker; no name rule can recognise one. Match the provisioner's ids.
-pub(crate) fn is_pad_render(id: &str, pad_renders: &[String]) -> bool {
+pub fn is_pad_render(id: &str, pad_renders: &[String]) -> bool {
     pad_renders.iter().any(|p| p == id)
 }
 
 /// Assign endpoints. `mic_want` (`PUNKTFUNK_MIC_DEVICE`, lowercased) beats the
 /// mic ladder. `host_audio` prefers real hardware; default prefers the silent sink.
-pub(crate) fn plan(
+pub fn plan(
     renders: &[Endpoint],
     captures: &[Endpoint],
     mic_want: Option<&str>,
@@ -231,7 +228,7 @@ pub(crate) fn plan(
 /// beats none) and flagged in [`Wiring::loopback_narrowing`]. Unknown format
 /// counts as intact so a probe failure cannot make the plan worse.
 #[allow(clippy::too_many_arguments)] // mirrors the enumeration inputs; a param struct would only rename the problem
-pub(crate) fn plan_with_formats(
+pub fn plan_with_formats(
     renders: &[Endpoint],
     captures: &[Endpoint],
     mic_want: Option<&str>,
@@ -399,7 +396,7 @@ pub(crate) fn plan_with_formats(
 /// function of these inputs, so an unchanged fingerprint proves an unchanged
 /// verdict. Capture polls this instead of re-planning (IPolicyConfig writes
 /// are the side effect of a needless re-plan).
-pub(crate) fn fingerprint(renders: &[Endpoint], captures: &[Endpoint]) -> u64 {
+pub fn fingerprint(renders: &[Endpoint], captures: &[Endpoint]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -416,7 +413,7 @@ pub(crate) fn fingerprint(renders: &[Endpoint], captures: &[Endpoint]) -> u64 {
 /// Why every enumerated render was rejected, then only remedies not already
 /// taken. Static "install Steam" advice is wrong when the pair is installed
 /// but reserved. Pure: same enumeration [`plan`] consumed.
-pub(crate) fn describe_no_loopback(renders: &[Endpoint], wiring: &Wiring) -> String {
+pub fn describe_no_loopback(renders: &[Endpoint], wiring: &Wiring) -> String {
     debug_assert!(wiring.loopback_unsatisfiable());
     let mic_id = wiring.mic_render.as_ref().map(|(_, id)| id.as_str());
     let rejected: Vec<String> = renders

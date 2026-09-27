@@ -277,7 +277,7 @@ fn repair_pins(minted: bool) {
 /// when the INFs are absent, install is denied (needs admin; host is SYSTEM),
 /// or `PUNKTFUNK_NO_MIC_INSTALL` is set. [`super::wasapi_cap`] installs the
 /// same pair when no silent sink exists.
-pub(crate) fn install_steam_audio_pair() -> bool {
+pub fn install_steam_audio_pair() -> bool {
     let mic = try_install_steam_audio("SteamStreamingMicrophone.inf");
     let spk = try_install_steam_audio("SteamStreamingSpeakers.inf");
     mic || spk
@@ -287,7 +287,7 @@ pub(crate) fn install_steam_audio_pair() -> bool {
 /// `%CommonProgramFiles(x86)%\Steam\drivers\Windows10\{arch}\`. Shared with
 /// [`super::pad_endpoint`] (`UpdateDriverForPlugAndPlayDevicesW` when no
 /// installed Speakers devnode exposes `oemNN.inf`). `None` if expansion fails.
-pub(crate) fn steam_driver_inf_path(inf_name: &str) -> Option<Vec<u16>> {
+pub fn steam_driver_inf_path(inf_name: &str) -> Option<Vec<u16>> {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 
@@ -315,7 +315,7 @@ pub(crate) fn steam_driver_inf_path(inf_name: &str) -> Option<Vec<u16>> {
 /// Whether Steam's streaming-audio INFs exist. Files are not endpoints, so
 /// the capture install latch keys on this instead of staying once-per-process
 /// ([`super::wasapi_cap`]) — Steam installed mid-run would otherwise be missed.
-pub(crate) fn steam_infs_present() -> bool {
+pub fn steam_infs_present() -> bool {
     use std::os::windows::ffi::OsStringExt;
     ["SteamStreamingMicrophone.inf", "SteamStreamingSpeakers.inf"]
         .iter()

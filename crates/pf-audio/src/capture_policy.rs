@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 static KEEP_HOST_AUDIO_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// One session's `CLIENT_CAP_KEEP_HOST_AUDIO` ask. Drop decrements on every exit, including panic.
-pub(crate) struct KeepHostAudioGuard(());
+pub struct KeepHostAudioGuard(());
 
-pub(crate) fn keep_host_audio_guard() -> KeepHostAudioGuard {
+pub fn keep_host_audio_guard() -> KeepHostAudioGuard {
     KEEP_HOST_AUDIO_SESSIONS.fetch_add(1, Ordering::Relaxed);
     KeepHostAudioGuard(())
 }
@@ -29,20 +29,20 @@ impl Drop for KeepHostAudioGuard {
     }
 }
 
-pub(crate) fn session_keeps_default() -> bool {
+pub fn session_keeps_default() -> bool {
     KEEP_HOST_AUDIO_SESSIONS.load(Ordering::Relaxed) > 0
 }
 
 /// Transient default-device churn settles; looping capture teardowns do not.
-pub(crate) const FIGHT_LIMIT: u32 = 4;
-pub(crate) const FIGHT_WINDOW: Duration = Duration::from_secs(20);
+pub const FIGHT_LIMIT: u32 = 4;
+pub const FIGHT_WINDOW: Duration = Duration::from_secs(20);
 /// Do not fight again until this elapses; a program that keeps taking the default will win it.
-pub(crate) const FIGHT_BACKOFF: Duration = Duration::from_secs(60);
+pub const FIGHT_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Caps default-playback re-asserts: fight a few times, then concede for [`FIGHT_BACKOFF`].
 ///
 /// Time is passed in so the policy stays pure and the tests run off Windows.
-pub(crate) struct FightDamper {
+pub struct FightDamper {
     count: u32,
     window_started: Instant,
     paused_until: Option<Instant>,
@@ -53,7 +53,7 @@ pub(crate) struct FightDamper {
 }
 
 impl FightDamper {
-    pub(crate) fn new(now: Instant) -> FightDamper {
+    pub fn new(now: Instant) -> FightDamper {
         FightDamper {
             count: 0,
             window_started: now,
@@ -64,7 +64,7 @@ impl FightDamper {
         }
     }
 
-    pub(crate) fn observed_at(&mut self, now: Instant) {
+    pub fn observed_at(&mut self, now: Instant) {
         self.now = now;
         if now.duration_since(self.window_started) >= FIGHT_WINDOW {
             self.window_started = now;
@@ -79,7 +79,7 @@ impl FightDamper {
         }
     }
 
-    pub(crate) fn should_reassert(&mut self) -> bool {
+    pub fn should_reassert(&mut self) -> bool {
         if self.paused_until.is_some() {
             return false;
         }
@@ -92,20 +92,20 @@ impl FightDamper {
     }
 
     /// First re-assert of a burst only; the rest are noise.
-    pub(crate) fn warn_now(&mut self) -> bool {
+    pub fn warn_now(&mut self) -> bool {
         !std::mem::replace(&mut self.warned_fighting, true)
     }
 
-    pub(crate) fn warn_giving_up(&mut self) -> bool {
+    pub fn warn_giving_up(&mut self) -> bool {
         self.paused_until.is_some() && !std::mem::replace(&mut self.warned_giving_up, true)
     }
 
-    pub(crate) fn is_paused(&self) -> bool {
+    pub fn is_paused(&self) -> bool {
         self.paused_until.is_some()
     }
 }
 
-pub(crate) const STATS_EVERY: Duration = Duration::from_secs(30);
+pub const STATS_EVERY: Duration = Duration::from_secs(30);
 
 /// Floor on a gap, even when `2 × quantum` is smaller. At 48 kHz a 128-frame quantum is 2.7 ms,
 /// and scoring that as a hole would count ordinary scheduling jitter.
@@ -113,48 +113,48 @@ const GAP_FLOOR: Duration = Duration::from_millis(10);
 
 /// Exclusive upper edges (ms). PLC hides ~50 ms; the drought fuse is two de-prime windows
 /// (80–120 ms): `<20` inaudible, `<50` concealable, `<100` borderline, `≥100` a dropout.
-pub(crate) const GAP_HIST_EDGES_MS: [u64; 3] = [20, 50, 100];
+pub const GAP_HIST_EDGES_MS: [u64; 3] = [20, 50, 100];
 
 /// One reporting window of capture vitals.
 ///
 /// Distinguishes a quiet host (`peak` ~0, no drops), a working stream (`peak` > 0), and a stream
 /// we are damaging (`dropped_chunks` > 0). Without these, those three look identical in a log.
 #[derive(Default)]
-pub(crate) struct CaptureStats {
-    pub(crate) frames: u64,
+pub struct CaptureStats {
+    pub frames: u64,
     /// Interleaved samples — RMS denominator. Using `frames` instead inflates RMS by
     /// `sqrt(channels)`, so a sine reports RMS equal to its peak.
-    pub(crate) samples: u64,
+    pub samples: u64,
     /// Separates a silent endpoint from a working one.
-    pub(crate) peak: f32,
+    pub peak: f32,
     /// Sum of squares for RMS. Far below peak means the endpoint is attenuated (20 % volume is
     /// ~14 dB before Opus).
-    pub(crate) sumsq: f64,
+    pub sumsq: f64,
     /// Chunks the encode thread did not take. The encoder concatenates across the hole: a click
     /// and a permanent shift of everything after it.
-    pub(crate) dropped_chunks: u64,
+    pub dropped_chunks: u64,
     /// Callbacks that missed cadence. `delivered_pct` cannot say how: one 2 s hole and three
     /// hundred 8 ms hiccups are the same percentage and different faults.
-    pub(crate) gaps: u64,
+    pub gaps: u64,
     /// Largest of those, µs. Logged in ms; stored in µs so a sub-ms threshold is expressible.
-    pub(crate) max_gap_us: u64,
+    pub max_gap_us: u64,
     /// Counts in [`GAP_HIST_EDGES_MS`] buckets. `gaps` + `max_gap_ms` cannot tell sixty 30 ms
     /// stalls from fifty-nine 12 ms hiccups and one outage.
-    pub(crate) gap_hist: [u64; GAP_HIST_EDGES_MS.len() + 1],
+    pub gap_hist: [u64; GAP_HIST_EDGES_MS.len() + 1],
     /// Audio those gaps cost. If this does not account for the `delivered_pct` shortfall, the
     /// remainder is sub-[`GAP_FLOOR`] loss.
-    pub(crate) missing_us: u64,
+    pub missing_us: u64,
     /// Callbacks that ran with nothing to dequeue. On-time empty is not the same as nobody feeding.
-    pub(crate) missed_dequeues: u64,
+    pub missed_dequeues: u64,
     /// Spans spent away from `Streaming`. `gaps` cannot see these: a paused stream fires no
     /// callbacks, so the caller drops its cadence stamp. The reporting window still stretches
     /// by that time, which is why `delivered_pct` falls with `gaps=0`.
-    pub(crate) pauses: u64,
-    pub(crate) paused_us: u64,
+    pub pauses: u64,
+    pub paused_us: u64,
 }
 
 impl CaptureStats {
-    pub(crate) fn observe(&mut self, samples: &[f32], channels: u32) {
+    pub fn observe(&mut self, samples: &[f32], channels: u32) {
         self.frames += (samples.len() / channels.max(1) as usize) as u64;
         self.samples += samples.len() as u64;
         for &s in samples {
@@ -170,7 +170,7 @@ impl CaptureStats {
     /// drops its stamp across pause so a legitimate Paused span is not one enormous hole.
     /// [`Self::observe_pause`] records that span. `quantum` is the negotiated buffer duration,
     /// not the one we asked for — a 21.3 ms graph is not gapping at 21.3 ms cadence.
-    pub(crate) fn observe_callback(&mut self, since_last: Option<Duration>, quantum: Duration) {
+    pub fn observe_callback(&mut self, since_last: Option<Duration>, quantum: Duration) {
         let Some(delta) = since_last else { return };
         if delta > (quantum * 2).max(GAP_FLOOR) {
             // Missing audio, not the callback delta: one quantum of that delta is the buffer we
@@ -181,7 +181,7 @@ impl CaptureStats {
     }
 
     /// Shared hole accounting: Linux callback cadence and the Windows discontinuity flag.
-    pub(crate) fn observe_gap(&mut self, missing: Duration) {
+    pub fn observe_gap(&mut self, missing: Duration) {
         self.gaps += 1;
         let us = missing.as_micros() as u64;
         self.max_gap_us = self.max_gap_us.max(us);
@@ -194,16 +194,16 @@ impl CaptureStats {
         self.gap_hist[bucket] += 1;
     }
 
-    pub(crate) fn max_gap_ms(&self) -> u64 {
+    pub fn max_gap_ms(&self) -> u64 {
         self.max_gap_us / 1_000
     }
 
-    pub(crate) fn missing_ms(&self) -> u64 {
+    pub fn missing_ms(&self) -> u64 {
         self.missing_us / 1_000
     }
 
     /// `a/b/c/d` = counts under 20 / 50 / 100 ms and ≥100 ms. One field so the line stays greppable.
-    pub(crate) fn gap_hist(&self) -> String {
+    pub fn gap_hist(&self) -> String {
         self.gap_hist
             .iter()
             .map(u64::to_string)
@@ -213,19 +213,19 @@ impl CaptureStats {
 
     /// Record a span away from `Streaming`. Called on the transition back so the span lands in
     /// the same window whose `delivered_pct` it diluted.
-    pub(crate) fn observe_pause(&mut self, span: Duration) {
+    pub fn observe_pause(&mut self, span: Duration) {
         self.pauses += 1;
         self.paused_us += span.as_micros() as u64;
     }
 
-    pub(crate) fn paused_ms(&self) -> u64 {
+    pub fn paused_ms(&self) -> u64 {
         self.paused_us / 1_000
     }
 
     /// Once [`STATS_EVERY`] has passed since `since`: log the window (with a warning when
     /// chunks were dropped) and start the next. `device` names the endpoint on a backend
     /// that picks one; `pauses` stays zero on a backend that never pauses.
-    pub(crate) fn flush_window(&mut self, since: &mut Instant, rate_hz: u32, device: Option<&str>) {
+    pub fn flush_window(&mut self, since: &mut Instant, rate_hz: u32, device: Option<&str>) {
         if since.elapsed() < STATS_EVERY {
             return;
         }
@@ -262,7 +262,7 @@ impl CaptureStats {
     }
 
     /// `(peak dBFS, rms dBFS, delivered %)`. Silence is -120 dB, not -inf, so the log stays parseable.
-    pub(crate) fn summary(&self, elapsed: Duration, sample_rate: u32) -> (f64, f64, f64) {
+    pub fn summary(&self, elapsed: Duration, sample_rate: u32) -> (f64, f64, f64) {
         let rms = (self.sumsq / (self.samples as f64).max(1.0)).sqrt();
         let db = |v: f64| if v > 0.0 { 20.0 * v.log10() } else { -120.0 };
         // Expected frames. A shortfall is the endpoint not delivering in real time; peak/RMS cannot show that.
@@ -280,24 +280,24 @@ impl CaptureStats {
 /// Denominated in this session's frame, like [`InfillPolicy`] — see [`SendStats::new`]. Capture
 /// holes and send slips are different claims; a clean egress line with capture holes moves the
 /// search upstream.
-pub(crate) struct SendStats {
+pub struct SendStats {
     /// One protocol frame of this session, and the slip threshold: late by less than this is jitter.
     ///
     /// Carried, not read from Opus [`FRAME_MS`](punktfunk_core::audio::FRAME_MS). On a lossless
     /// plane pacing 1 ms frames, a 5 ms threshold would miss four-frame slips and still report
     /// `late=0`.
     frame: Duration,
-    pub(crate) sent: u64,
+    pub sent: u64,
     /// Frames synthesized to cover a capture hole. Wire continuity is not captured continuity.
-    pub(crate) infilled: u64,
-    pub(crate) late: u64,
+    pub infilled: u64,
+    pub late: u64,
     /// Worst miss, µs. Kept even at `late=0`: never late vs never late by a whole frame.
-    pub(crate) max_late_us: u64,
+    pub max_late_us: u64,
     /// Widest gap between consecutive departures, µs. Client starvation is the wire going quiet.
-    pub(crate) max_spacing_us: u64,
+    pub max_spacing_us: u64,
     /// Schedule fell more than `PACE_REANCHOR` behind and was re-anchored. Each one silently
     /// forgives accumulated debt.
-    pub(crate) reanchors: u64,
+    pub reanchors: u64,
 }
 
 impl SendStats {
@@ -306,7 +306,7 @@ impl SendStats {
     ///
     /// No `Default`: a zero frame makes `late >= self.frame` true for every departure, so a
     /// mistaken window would report 100 % slips. Windows are rebuilt on every flush.
-    pub(crate) fn new(frame_us: u32) -> SendStats {
+    pub fn new(frame_us: u32) -> SendStats {
         SendStats {
             // Same floor as `InfillPolicy::new`.
             frame: Duration::from_micros(frame_us.max(1) as u64),
@@ -321,7 +321,7 @@ impl SendStats {
 
     /// `true` when this departure counted as late, so the session total scores it against the
     /// same threshold this window does rather than a second copy of it.
-    pub(crate) fn observe_departure(
+    pub fn observe_departure(
         &mut self,
         late: Duration,
         since_prev: Option<Duration>,
@@ -343,15 +343,15 @@ impl SendStats {
         was_late
     }
 
-    pub(crate) fn observe_reanchor(&mut self) {
+    pub fn observe_reanchor(&mut self) {
         self.reanchors += 1;
     }
 
-    pub(crate) fn max_late_ms(&self) -> u64 {
+    pub fn max_late_ms(&self) -> u64 {
         self.max_late_us / 1_000
     }
 
-    pub(crate) fn max_spacing_ms(&self) -> u64 {
+    pub fn max_spacing_ms(&self) -> u64 {
         self.max_spacing_us / 1_000
     }
 }
@@ -359,7 +359,7 @@ impl SendStats {
 /// Wall-clock silence budget for one hole. Past this the desktop is quiet, not glitching, and
 /// the wire stops. Not derived from the frame duration: 500 ms is 500 ms whether the plane
 /// sends 100 or 500 frames into it. See `design/hi-res-audio.md`.
-pub(crate) const INFILL_MAX: Duration = Duration::from_millis(500);
+pub const INFILL_MAX: Duration = Duration::from_millis(500);
 
 // No module-scope frame constant: `punktfunk_core::audio::FRAME_MS` is the Opus plane only.
 // Infill threshold and egress slip live on [`InfillPolicy::new`] and [`SendStats::new`]. The
@@ -367,7 +367,7 @@ pub(crate) const INFILL_MAX: Duration = Duration::from_millis(500);
 // "5 ms session is unchanged" assertions.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Infill {
+pub enum Infill {
     Wait,
     Silence,
     /// The budget is spent. Next real chunk begins a new continuity.
@@ -383,14 +383,14 @@ const CHUNK_MAX_WINDOW: Duration = Duration::from_secs(2);
 
 /// Largest value noted over the last one to two [`CHUNK_MAX_WINDOW`]s. Time is passed in.
 #[derive(Debug, Default)]
-pub(crate) struct RecentMax<T> {
+pub struct RecentMax<T> {
     cur: T,
     prev: T,
     since: Option<Instant>,
 }
 
 impl<T: Ord + Copy + Default> RecentMax<T> {
-    pub(crate) fn note(&mut self, v: T, now: Instant) {
+    pub fn note(&mut self, v: T, now: Instant) {
         let since = *self.since.get_or_insert(now);
         let age = now.duration_since(since);
         if age >= CHUNK_MAX_WINDOW {
@@ -405,7 +405,7 @@ impl<T: Ord + Copy + Default> RecentMax<T> {
         self.cur = self.cur.max(v);
     }
 
-    pub(crate) fn get(&self) -> T {
+    pub fn get(&self) -> T {
         self.cur.max(self.prev)
     }
 }
@@ -413,7 +413,7 @@ impl<T: Ord + Copy + Default> RecentMax<T> {
 /// Silence on the session's frame schedule, with continuous `seq` and pts, keeps the client's
 /// de-jitter ring fed so a hole costs only the audio that was missing, not a de-prime/re-prime.
 /// Time is passed in. Denominated in the session's frame — see [`InfillPolicy::new`].
-pub(crate) struct InfillPolicy {
+pub struct InfillPolicy {
     /// One protocol frame of this session. A 96/24 lossless session paces 1 ms frames; a policy
     /// written in 5 ms units would cover a fifth as long and spend the budget five times as fast.
     frame: Duration,
@@ -431,7 +431,7 @@ impl InfillPolicy {
     ///
     /// `max(1)` floors a malformed plane. A zero frame would leave [`Self::decide`] unable to
     /// spend the budget, covering a hole with silence forever.
-    pub(crate) fn new(frame_us: u32) -> InfillPolicy {
+    pub fn new(frame_us: u32) -> InfillPolicy {
         InfillPolicy {
             frame: Duration::from_micros(frame_us.max(1) as u64),
             filled: Duration::ZERO,
@@ -442,7 +442,7 @@ impl InfillPolicy {
 
     /// Keep the largest recent capture-chunk duration. A short buffer never lowers
     /// [`Self::after`]; a long one stops raising it once it ages out of [`RecentMax`].
-    pub(crate) fn note_quantum(&mut self, chunk: Duration, now: Instant) {
+    pub fn note_quantum(&mut self, chunk: Duration, now: Instant) {
         self.quantum.note(chunk, now);
     }
 
@@ -451,12 +451,12 @@ impl InfillPolicy {
     /// Two frames of this session: the client's ring is sized in its own frames. Never less than
     /// one chunk plus one frame, so a graph clamped to a 21 ms buffer (`min-quantum = 1024`) is
     /// not a hole when a chunk is a couple of milliseconds late.
-    pub(crate) fn after(&self) -> Duration {
+    pub fn after(&self) -> Duration {
         (self.frame * 2).max(self.quantum.get() + self.frame)
     }
 
     /// Decide the slot due now. Call exactly once per due frame — it consumes budget.
-    pub(crate) fn decide(&mut self, since_last_chunk: Duration) -> Infill {
+    pub fn decide(&mut self, since_last_chunk: Duration) -> Infill {
         if since_last_chunk < self.after() {
             return Infill::Wait;
         }
@@ -470,23 +470,23 @@ impl InfillPolicy {
     }
 
     /// Budget spent: the caller can block for real audio instead of waking to stay quiet.
-    pub(crate) fn exhausted(&self) -> bool {
+    pub fn exhausted(&self) -> bool {
         self.filled >= INFILL_MAX
     }
 
     /// Silence sent for the open hole. After [`decide`](Self::decide) returns `Silence`, equal to
     /// one frame means this is the first of the hole (the fade); larger is plain silence.
-    pub(crate) fn covered(&self) -> Duration {
+    pub fn covered(&self) -> Duration {
         self.filled
     }
 
-    pub(crate) fn frame(&self) -> Duration {
+    pub fn frame(&self) -> Duration {
         self.frame
     }
 
     /// A real chunk arrived. `true` if the hole broke continuity: the redundancy predecessor
     /// and any partial frame straddling the hole must not be spliced onto what comes next.
-    pub(crate) fn chunk_arrived(&mut self) -> bool {
+    pub fn chunk_arrived(&mut self) -> bool {
         self.filled = Duration::ZERO;
         std::mem::take(&mut self.broke)
     }

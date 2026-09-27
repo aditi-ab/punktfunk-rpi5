@@ -20,10 +20,10 @@
 mod host_bridge;
 mod monitor_rate;
 mod pad_card_volume;
-pub(crate) mod pad_sink;
+pub mod pad_sink;
 mod playing_apps;
-pub(crate) use playing_apps::playing_apps;
-pub(crate) mod pad_usb;
+pub use playing_apps::playing_apps;
+pub mod pad_usb;
 mod pw_oneshot;
 mod stream_sink;
 
@@ -66,12 +66,12 @@ impl CaptureMode {
 /// Whether capture owns a per-capturer sink that isolation can env-route into.
 /// Monitor mode (`PUNKTFUNK_STREAM_SINK=0`) has none, so isolation's audio
 /// half degrades to shared.
-pub(crate) fn sink_capture_active() -> bool {
+pub fn sink_capture_active() -> bool {
     capture_mode().owns_sink()
 }
 
 fn capture_mode() -> CaptureMode {
-    if crate::audio::capture_policy::session_keeps_default()
+    if crate::capture_policy::session_keeps_default()
         || pf_host_config::config().audio_output_mode.keeps_default()
     {
         // `CLIENT_CAP_KEEP_HOST_AUDIO` or `audio.output_mode = follow_default`:
@@ -467,12 +467,8 @@ struct MicRingShared {
 }
 
 impl PwMicSource {
-    pub fn open(channels: u32) -> Result<PwMicSource> {
-        Self::open_named(channels, None)
-    }
-
-    /// [`open`](Self::open) with a caller-chosen source `node.name` so
-    /// isolation can pin nested apps (`PULSE_SOURCE`) to this session's uplink.
+    /// A 1- or 2-channel source under a caller-chosen `node.name`, so isolation can
+    /// pin nested apps (`PULSE_SOURCE`) to this session's uplink.
     /// `None` = shared `punktfunk-mic`. PipeWire 1.4 never assigns a driver to
     /// a non-default `Audio/Source` recorded by target — per-session mic needs
     /// the 1.6 daemon; on 1.4 the election losers read silence.
@@ -903,7 +899,7 @@ impl QuantumTracker {
 struct CapUd {
     tx: std::sync::mpsc::SyncSender<Vec<f32>>,
     channels: u32,
-    stats: crate::audio::capture_policy::CaptureStats,
+    stats: crate::capture_policy::CaptureStats,
     last_stats: std::time::Instant,
     quantum_frames: QuantumTracker,
     reported_sched: bool,
@@ -1576,7 +1572,7 @@ fn pw_thread(
     result
 }
 
-// ---- the platform seam `audio.rs` calls through ---------------------------------------------
+// ---- the platform seam `lib.rs` calls through -----------------------------------------------
 
 /// Open a live capturer for system output. Default: host-owned stream sink claimed as
 /// the default, advertising `channels` so apps can produce real surround.

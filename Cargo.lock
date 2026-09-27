@@ -3102,6 +3102,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pf-audio"
+version = "0.40.0"
+dependencies = [
+ "anyhow",
+ "opus",
+ "pf-capture",
+ "pf-frame",
+ "pf-host-config",
+ "pf-inject",
+ "pf-paths",
+ "pf-win-display",
+ "pipewire",
+ "punktfunk-core",
+ "sha2 0.11.0",
+ "tracing",
+ "wasapi",
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "windows-service",
+ "winreg 0.56.0",
+]
+
+[[package]]
 name = "pf-bitstream"
 version = "0.40.0"
 dependencies = [
@@ -3904,6 +3926,7 @@ dependencies = [
  "mac_address",
  "mdns-sd",
  "opus",
+ "pf-audio",
  "pf-capture",
  "pf-clipboard",
  "pf-driver-proto",
@@ -3918,7 +3941,6 @@ dependencies = [
  "pf-vdisplay",
  "pf-win-display",
  "pf-zerocopy",
- "pipewire",
  "punktfunk-core",
  "punktfunk-ffi",
  "quinn",

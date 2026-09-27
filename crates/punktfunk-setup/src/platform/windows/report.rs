@@ -108,7 +108,9 @@ pub fn outro(ui: &dyn Reporter, facts: &WinFacts, choices: &WinChoices, artifact
             ui.line(&format!(
                 "  2. Install a client on the device you stream to ({DOCS}/install-client), connect, and click Approve in the console."
             ));
-            footnotes(ui, facts, choices);
+            for note in footnotes(facts, choices) {
+                ui.line(&format!("  {note}"));
+            }
         }
         Artifact::Client => {
             ui.line("  1. Open Punktfunk from the Start menu and pick your host.");
@@ -121,19 +123,21 @@ pub fn outro(ui: &dyn Reporter, facts: &WinFacts, choices: &WinChoices, artifact
 
 /// The D11/D12 footnotes: the moved console port and the unreachable-host warning — the
 /// two facts a user must leave the installer knowing. The wizard's Done page renders these
-/// alone; the transcript's outro embeds them.
-pub fn footnotes(ui: &dyn Reporter, facts: &WinFacts, choices: &WinChoices) {
+/// as cards; the transcript's outro indents them.
+pub fn footnotes(facts: &WinFacts, choices: &WinChoices) -> Vec<String> {
+    let mut notes = Vec::new();
     if facts.needs_coexistence() {
-        ui.line(&format!(
-            "  Running next to Sunshine/Apollo: punktfunk's management API is on :{MGMT_PORT_MOVED} — {DOCS}/switching-from-sunshine"
+        notes.push(format!(
+            "Running next to Sunshine/Apollo: punktfunk's management API is on :{MGMT_PORT_MOVED} — {DOCS}/switching-from-sunshine"
         ));
     }
     if matches!(choices.network, NetworkAnswer::Skip)
         && choices.allow_public_fw != Some(true)
         && !facts.public_networks().is_empty()
     {
-        ui.line(&format!(
-            "  ⚠ This network is Public and the firewall rules don't apply there — the host is unreachable until that changes ({DOCS}/troubleshooting#windows-firewall)"
+        notes.push(format!(
+            "⚠ This network is Public and the firewall rules don't apply there — the host is unreachable until that changes ({DOCS}/troubleshooting#windows-firewall)"
         ));
     }
+    notes
 }

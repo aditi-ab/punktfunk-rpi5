@@ -7,7 +7,7 @@
 use anyhow::Result;
 
 /// Every audio output stream's app, deduped and sorted. The host's own streams are left out.
-pub(crate) fn playing_apps() -> Result<Vec<String>> {
+pub fn playing_apps() -> Result<Vec<String>> {
     use pipewire as pw;
     use std::cell::RefCell;
     use std::rc::Rc;

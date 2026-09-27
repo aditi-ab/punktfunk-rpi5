@@ -10,13 +10,13 @@
 //! `docs-site/content/docs/developers/multi-seat-contract.md` is the contract of record.
 
 /// Whether an add-on-managed seat owns this host rather than the console.
-pub(crate) fn is_seat_host() -> bool {
+pub fn is_seat_host() -> bool {
     std::env::var("PUNKTFUNK_SEAT_SESSION").as_deref() == Ok("1")
 }
 
 /// 32 lowercase hexadecimal characters, so the id is safe as a device-parameter
 /// marker and in a log line. Any other value is a supervisor bug, not a seat.
-pub(crate) fn validate_seat_id(raw: &str) -> Result<&str, &'static str> {
+pub fn validate_seat_id(raw: &str) -> Result<&str, &'static str> {
     let valid = raw.len() == SEAT_ID_LEN
         && raw
             .bytes()
@@ -30,7 +30,7 @@ const SEAT_ID_LEN: usize = 32;
 
 /// This process's validated seat id, or `None` for the console host.
 /// The error is a rejected id, which callers surface rather than ignore.
-pub(crate) fn seat_id() -> Result<Option<String>, &'static str> {
+pub fn seat_id() -> Result<Option<String>, &'static str> {
     let Some(raw) = std::env::var_os("PUNKTFUNK_SEAT_ID") else {
         // A seat without an id would mint audio devnodes the console host also matches.
         if is_seat_host() {
