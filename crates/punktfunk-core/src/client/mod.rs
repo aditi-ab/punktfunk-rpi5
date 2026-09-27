@@ -1192,8 +1192,13 @@ impl NativeClient {
 
     /// Pump tid plus [`register_hot_thread`](Self::register_hot_thread) ids. Android ADPF.
     /// Empty without `gettid`. Call after the first frame so the pump has registered.
+    /// Exited threads are pruned: ADPF refuses a whole session over one dead tid.
     pub fn hot_thread_ids(&self) -> Vec<i32> {
-        self.hot_tids.lock().map(|v| v.clone()).unwrap_or_default()
+        let Ok(mut v) = self.hot_tids.lock() else {
+            return Vec::new();
+        };
+        v.retain(|t| std::path::Path::new(&format!("/proc/self/task/{t}")).exists());
+        v.clone()
     }
 
     /// Live host−client offset (ns). Re-syncs every 60 s and on a suspected wall-clock step.
