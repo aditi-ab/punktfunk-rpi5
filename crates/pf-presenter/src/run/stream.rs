@@ -89,11 +89,7 @@ impl StreamState {
             busy_retry: false,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             pyro_latency_forced: false,
-            dmabuf_demoted: false,
-            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-            pyro_present_warned: false,
-            cpu_present_warned: false,
-            hw_fails: 0,
+            health: PresentHealth::default(),
             osd: Vec::new(),
             resize_pending: None,
             resize_sent_at: None,

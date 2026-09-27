@@ -25,6 +25,7 @@ mod gpu;
 mod overlay_pipe;
 mod present;
 mod present_timing;
+pub(crate) use present_timing::PresentedSample;
 mod reconfig;
 mod resources;
 mod setup;
