@@ -1667,7 +1667,7 @@ impl VulkanVideoEncoder {
                 &mem_props,
                 mr.memory_type_bits,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            );
+            )?;
             let m = device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(mr.size)
