@@ -276,15 +276,4 @@ mod tests {
         assert_eq!(DS4_FEATURE_FIRMWARE.len(), 49);
         assert_eq!(DS4_FEATURE_FIRMWARE[0], 0xA3);
     }
-
-    /// Pairing MAC low octet is per-pad. SDL/Steam dedup controllers by that serial.
-    #[test]
-    fn pairing_reply_mac_is_per_pad() {
-        assert_eq!(ds4_pairing_reply(0).as_slice(), DS4_FEATURE_PAIRING);
-        let (a, b) = (ds4_pairing_reply(1), ds4_pairing_reply(2));
-        assert_eq!(a[0], 0x12);
-        assert_eq!(a[1], DS4_FEATURE_PAIRING[1].wrapping_add(1));
-        assert_eq!(b[1], DS4_FEATURE_PAIRING[1].wrapping_add(2));
-        assert_eq!(a[2..], b[2..]);
-    }
 }

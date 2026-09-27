@@ -15,8 +15,8 @@
 
 use super::dualsense_proto::{
     ds_pairing_reply, parse_ds_output, serialize_state, DsFeedback, DsState, DsTriggers,
-    DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN, DS_PRODUCT, DS_VENDOR,
-    DUALSENSE_RDESC,
+    DEVTYPE_DUALSENSE, DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN,
+    DS_PRODUCT, DS_VENDOR, DUALSENSE_RDESC,
 };
 use super::steam_usbip::{attach_device, boxed, UsbipAttachment};
 use crate::sensor_clock::SensorClock;
@@ -349,7 +349,7 @@ impl UsbInterfaceHandler for HidHandler {
                 (0x81, 0x06) if (setup.value >> 8) == 0x22 => DUALSENSE_RDESC.to_vec(),
                 // HID GET_REPORT(Feature): wValue low byte is the report id.
                 (0xA1, 0x01) => {
-                    let pairing = ds_pairing_reply(self.pad);
+                    let pairing = ds_pairing_reply(DEVTYPE_DUALSENSE, self.pad);
                     match setup.value as u8 {
                         0x05 => DS_FEATURE_CALIBRATION.to_vec(),
                         0x09 => pairing.to_vec(),

@@ -526,23 +526,12 @@ pub const RDESC_DECK_KBD: &[u8] = &[
     0x75,0x01,0x95,0x08,0x81,0x02,0x81,0x01,0x19,0x00,0x29,0x65,0x15,0x00,0x25,0x65,
     0x75,0x08,0x95,0x06,0x81,0x00,0xc0];
 /// Interface 2, EP 0x83 (Usage Page `0xFFFF`, `bCountryCode 33`). Steam filters on this interface.
-#[rustfmt::skip]
-pub const RDESC_DECK_CTRL: &[u8] = &[
-    0x06,0xff,0xff,0x09,0x01,0xa1,0x01,0x09,0x02,0x09,0x03,0x15,0x00,0x26,0xff,0x00,
-    0x75,0x08,0x95,0x40,0x81,0x02,0x09,0x06,0x09,0x07,0x15,0x00,0x26,0xff,0x00,0x75,
-    0x08,0x95,0x40,0xb1,0x02,0xc0];
+pub const RDESC_DECK_CTRL: &[u8] = &pf_driver_proto::deck::RDESC;
 
-/// Stamped into `0x83` attrs `0x0a`/`0x04`. High word is `"PF"` (`0x5046`)
-/// plus index so two virtual Decks never collide.
-pub fn deck_unit_id(index: u8) -> u32 {
-    0x5046_0000 | index as u32
-}
-
-/// Steam rejects a `"PF"`-leading serial and substitutes a hash. `'F'`-leading
-/// passes, so the marker sits one slot in (`"FVPF"`) — distinct from a real
-/// Deck `"FVZZ"`. Derived from [`deck_unit_id`] so `0xAE` and `0x83` agree.
+/// Unit serial of virtual Deck `index`, the one the Windows driver reports too. `FVPF` marks it
+/// virtual, apart from a real Deck's `FVZZ`; Steam rejects a `PF`-leading serial.
 pub fn deck_serial(index: u8) -> String {
-    format!("FVPF{:08X}", deck_unit_id(index))
+    pf_driver_proto::gamepad::pad_serial(pf_driver_proto::gamepad::DEVTYPE_STEAMDECK, index)
 }
 
 /// Header only (controls released). Real-USB transports stream this until the first [`serialize_deck_state`].
@@ -554,56 +543,10 @@ pub fn neutral_deck_report() -> [u8; STEAM_REPORT_LEN] {
     r
 }
 
-/// HID feature GET_REPORT for the real-USB Deck (gadget + usbip). Serving
-/// the real `0x83` blob stops Steam re-probing (gamepad-evdev churn).
-/// Raw 64-byte EP0 payload (command id first, no report-id prefix) —
-/// unlike [`serial_reply`], which carries the UHID report-id the kernel
-/// strips. `unit_id` stamps [`deck_unit_id`] into the device-id attrs.
-pub fn feature_reply(last_set: &[u8], serial: &str, unit_id: u32) -> [u8; STEAM_REPORT_LEN] {
-    let cmd = last_set.first().copied().unwrap_or(ID_GET_STRING_ATTRIBUTE);
-    let mut r = [0u8; STEAM_REPORT_LEN];
-    match cmd {
-        ID_GET_ATTRIBUTES_VALUES => {
-            // [0x83, 0x2d, then 9 × (attr-id, u32-LE)].
-            r[0] = ID_GET_ATTRIBUTES_VALUES;
-            r[1] = 0x2d;
-            let attrs: [(u8, u32); 9] = [
-                (0x01, 0x1205), // product id
-                (0x02, 0),
-                (0x0a, unit_id), // unit serial number (per-instance)
-                (0x04, unit_id ^ 0x5555_5555),
-                (0x09, 0x2e),
-                (0x0b, 0x0fa0),
-                (0x0d, 0),
-                (0x0c, 0),
-                (0x0e, 0),
-            ];
-            let mut o = 2;
-            for (id, val) in attrs {
-                r[o] = id;
-                r[o + 1..o + 5].copy_from_slice(&val.to_le_bytes());
-                o += 5;
-            }
-        }
-        ID_GET_STRING_ATTRIBUTE => {
-            // [0xAE, len, attr, ascii…]. Serial (attr 0x01) wants
-            // `reply[2]==0x01` and `1<=len<=21`; other attrs echo the id.
-            let attr = last_set.get(2).copied().unwrap_or(ATTRIB_STR_UNIT_SERIAL);
-            let b = serial.as_bytes();
-            let len = b.len().clamp(1, 20);
-            r[0] = ID_GET_STRING_ATTRIBUTE;
-            r[1] = len as u8;
-            r[2] = attr;
-            r[3..3 + len].copy_from_slice(&b[..len]);
-        }
-        _ => {
-            // Unknown cmd (e.g. 0x87 settings): echo last SET_REPORT.
-            let n = last_set.len().min(STEAM_REPORT_LEN);
-            r[..n].copy_from_slice(&last_set[..n]);
-        }
-    }
-    r
-}
+/// HID feature GET_REPORT for the real-USB Deck (gadget + usbip). Serving the real `0x83` blob
+/// stops Steam re-probing (gamepad-evdev churn). Raw 64-byte EP0 payload (command id first, no
+/// report-id prefix), unlike [`serial_reply`], which carries the UHID report-id the kernel strips.
+pub use pf_driver_proto::deck::feature_reply;
 
 #[cfg(test)]
 mod tests {
@@ -907,40 +850,5 @@ mod tests {
         let mut d = vec![0u8; 12];
         d[1] = ID_SET_SETTINGS_VALUES; // a settings write — no rumble
         assert_eq!(parse_steam_output(&d).rumble, None);
-    }
-
-    /// Real-USB `0x83` attrs carry the per-instance unit id; `0xAE` carries
-    /// the Steam-accepted serial. A slip is Steam re-probing.
-    #[test]
-    fn deck_feature_reply_contract() {
-        let serial = deck_serial(0);
-        let unit_id = deck_unit_id(0);
-        assert_eq!(serial, "FVPF50460000"); // 12-char alphanumeric, derived from the unit id
-        assert_eq!(serial.len(), 12);
-
-        // 0x83 GET_ATTRIBUTES_VALUES: header + (0x0a, unit_id) at the 3rd attribute slot.
-        let r = feature_reply(&[ID_GET_ATTRIBUTES_VALUES], &serial, unit_id);
-        assert_eq!(r[0], ID_GET_ATTRIBUTES_VALUES);
-        assert_eq!(r[1], 0x2d);
-        assert_eq!(r[12], 0x0a); // 3rd attr id (slots at 2,7,12,…)
-        assert_eq!(
-            u32::from_le_bytes([r[13], r[14], r[15], r[16]]),
-            unit_id,
-            "unit serial attribute must carry the per-instance unit id"
-        );
-
-        // 0xAE GET_STRING_ATTRIBUTE: [0xAE, len, attr(0x01), ascii serial…].
-        let r = feature_reply(
-            &[ID_GET_STRING_ATTRIBUTE, 0, ATTRIB_STR_UNIT_SERIAL],
-            &serial,
-            unit_id,
-        );
-        assert_eq!(r[0], ID_GET_STRING_ATTRIBUTE);
-        assert_eq!(r[1] as usize, serial.len());
-        assert_eq!(r[2], ATTRIB_STR_UNIT_SERIAL);
-        assert_eq!(&r[3..3 + serial.len()], serial.as_bytes());
-
-        assert_ne!(deck_unit_id(0), deck_unit_id(1));
-        assert_ne!(deck_serial(0), deck_serial(1));
     }
 }

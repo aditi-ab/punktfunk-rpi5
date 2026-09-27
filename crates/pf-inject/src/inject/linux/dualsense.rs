@@ -11,8 +11,9 @@
 
 use super::dualsense_proto::{
     ds_pairing_reply, edge_paddle_bits, parse_ds_output, serialize_state, DsFeedback, DsState,
-    DsTriggers, DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN,
-    DS_PRODUCT, DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC, DUALSENSE_RDESC,
+    DsTriggers, DEVTYPE_DUALSENSE, DEVTYPE_DUALSENSE_EDGE, DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION,
+    DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN, DS_PRODUCT, DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR,
+    DUALSENSE_EDGE_RDESC, DUALSENSE_RDESC,
 };
 use crate::sensor_clock::SensorClock;
 use crate::uhid_abi::{
@@ -30,6 +31,8 @@ use std::time::Instant;
 
 /// CREATE2 identity: DualSense vs Edge. Same codec; Edge is PID, descriptor, and `buttons[2]`.
 pub struct DsUhidIdentity {
+    /// `pf_driver_proto::gamepad` device type; keys the pairing MAC.
+    device_type: u8,
     product: u32,
     rdesc: &'static [u8],
     name: &'static str,
@@ -40,6 +43,7 @@ pub struct DsUhidIdentity {
 impl DsUhidIdentity {
     pub const fn dualsense() -> DsUhidIdentity {
         DsUhidIdentity {
+            device_type: DEVTYPE_DUALSENSE,
             product: DS_PRODUCT,
             rdesc: DUALSENSE_RDESC,
             name: "DualSense",
@@ -50,6 +54,7 @@ impl DsUhidIdentity {
 
     pub const fn dualsense_edge() -> DsUhidIdentity {
         DsUhidIdentity {
+            device_type: DEVTYPE_DUALSENSE_EDGE,
             product: DS_EDGE_PRODUCT,
             rdesc: DUALSENSE_EDGE_RDESC,
             name: "DualSense Edge",
@@ -62,6 +67,7 @@ impl DsUhidIdentity {
 /// Virtual DualSense on `/dev/uhid`. Drop sends `UHID_DESTROY` and unbinds `hid-playstation`.
 pub struct DualSensePad {
     fd: File,
+    device_type: u8,
     seq: u8,
     clock: SensorClock,
     triggers: DsTriggers,
@@ -80,6 +86,7 @@ impl DualSensePad {
             })?;
         let mut ds = DualSensePad {
             fd,
+            device_type: id.device_type,
             seq: 0,
             clock: SensorClock::dualsense(),
             triggers: DsTriggers::default(),
@@ -143,7 +150,7 @@ impl DualSensePad {
                     // uhid_get_report_req: id u32 [4..8], rnum u8 [8].
                     let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
                     // Per-pad MAC becomes HID uniq; SDL/Steam dedup on it (`ds_pairing_reply`).
-                    let pairing = ds_pairing_reply(pad);
+                    let pairing = ds_pairing_reply(self.device_type, pad);
                     let data: &[u8] = match ev[8] {
                         0x05 => DS_FEATURE_CALIBRATION,
                         0x09 => &pairing,

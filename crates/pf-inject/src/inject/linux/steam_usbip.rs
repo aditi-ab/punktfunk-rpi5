@@ -12,8 +12,8 @@
 //! Callers degrade to UHID on failure.
 
 use super::steam_proto::{
-    deck_serial, deck_unit_id, feature_reply, neutral_deck_report, parse_steam_output,
-    SteamFeedback, SteamState, RDESC_DECK_CTRL, RDESC_DECK_KBD, RDESC_DECK_MOUSE,
+    deck_serial, feature_reply, neutral_deck_report, parse_steam_output, SteamFeedback, SteamState,
+    RDESC_DECK_CTRL, RDESC_DECK_KBD, RDESC_DECK_MOUSE,
 };
 use anyhow::{bail, Context, Result};
 use std::any::Any;
@@ -54,7 +54,6 @@ struct ControllerHandler {
     /// Last SET_REPORT; next GET_REPORT feeds [`feature_reply`].
     last_set: Vec<u8>,
     serial: String,
-    unit_id: u32,
 }
 
 impl UsbInterfaceHandler for ControllerHandler {
@@ -73,7 +72,7 @@ impl UsbInterfaceHandler for ControllerHandler {
             Ok(match (setup.request_type, setup.request) {
                 // GET_DESCRIPTOR report (wValue hi = 0x22).
                 (0x81, 0x06) if (setup.value >> 8) == 0x22 => RDESC_DECK_CTRL.to_vec(),
-                (0xA1, 0x01) => feature_reply(&self.last_set, &self.serial, self.unit_id).to_vec(),
+                (0xA1, 0x01) => feature_reply(&self.last_set, &self.serial).to_vec(),
                 (0x21, 0x09) => {
                     self.last_set = req.to_vec();
                     // `parse_steam_output` expects `[report-id(0), cmd, …]`; EP0 OUT data is `[cmd, …]`.
@@ -195,7 +194,6 @@ fn build_device(
             feedback: feedback.clone(),
             last_set: vec![],
             serial: deck_serial(index),
-            unit_id: deck_unit_id(index),
         }),
     )
 }
