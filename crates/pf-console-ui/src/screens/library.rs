@@ -2646,14 +2646,17 @@ mod tests {
         assert_eq!(titles(&s, &bands[1]), vec!["New", "Old"]);
         assert!(!s.view.iter().any(|&i| s.games[i].launcher));
 
-        settings.library_sections = "-launchers".into();
+        settings.library_sections = "-launchers,-desktops".into();
         s.adopt_settings(&Ctx::test(&mut settings, &library));
         let (bands, _) = s.bands(&Ctx::test(&mut settings, &library));
-        assert!(bands.iter().all(|b| b.section != Section::Launchers));
+        assert!(bands
+            .iter()
+            .all(|b| !matches!(b.section, Section::Launchers | Section::Desktops)));
         assert!(
-            s.view.iter().any(|&i| s.games[i].launcher),
-            "switched off, the launchers rejoin the grid"
+            !s.view.iter().any(|&i| s.games[i].leads()),
+            "switched off, the launchers and the desktop stay off"
         );
+        assert!(!s.view.is_empty(), "the titles still fill the grid");
     }
 
     #[test]

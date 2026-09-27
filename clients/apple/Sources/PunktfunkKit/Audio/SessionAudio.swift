@@ -483,6 +483,12 @@ public final class SessionAudio {
                 guard let self else { return }
                 self.engineQueue.async { [weak self] in
                     guard let self, granted, !self.flag.isStopped else { return }
+                    // A rebuild during the prompt asks again, so a grant can call back twice, and
+                    // a rebuild after it may have started the mic already. Never start a second.
+                    self.stateLock.lock()
+                    let micLive = self.captureEngine != nil || self.combinedEngine != nil
+                    self.stateLock.unlock()
+                    guard !micLive else { return }
                     if combined {
                         self.stateLock.lock()
                         let playback = self.playbackEngine
@@ -685,6 +691,15 @@ public final class SessionAudio {
             #else
             break // the watcher only raises this one on macOS
             #endif
+        case .deviceList:
+            #if os(macOS)
+            // Only a pinned endpoint returns without the default moving. Unpinned sessions skip
+            // it: the voice processor's own aggregate device churns this list.
+            stateLock.lock()
+            let pinned = startConfig.map { !$0.speakerUID.isEmpty || !$0.micUID.isEmpty } ?? false
+            stateLock.unlock()
+            if pinned { defaultOutputChanged() }
+            #endif
         }
     }
 
@@ -822,11 +837,11 @@ public final class SessionAudio {
     }
 
     #if os(macOS)
-    /// The system's output device moved. Rebuild only when it actually concerns this session: the
-    /// engine is gone or stopped, or it is playing to a device that is no longer the one we should
-    /// be on. Somebody changing the default while we are pinned to a named speaker is none of our
-    /// business, and rebuilding for it would cost an audible gap for nothing. Main queue (the
-    /// listener block is registered against it).
+    /// The system's output device moved, or a device came or went. Rebuild only when it concerns
+    /// this session: the engine is gone or stopped, or the speaker or pinned mic is not the device
+    /// it should be on (a pinned one that came back). Somebody changing the default while we are
+    /// pinned to a named speaker is none of our business, and rebuilding for it would cost an
+    /// audible gap for nothing. Main queue (the listener block is registered against it).
     private func defaultOutputChanged() {
         guard !flag.isStopped, let config = startConfig else { return }
         stateLock.lock()
@@ -844,8 +859,21 @@ public final class SessionAudio {
         let shouldBeOn = config.speakerUID.isEmpty
             ? AudioDevices.defaultOutputDevice()
             : AudioDevices.deviceID(forUID: config.speakerUID)
-        guard let shouldBeOn, shouldBeOn != playingOn else { return }
-        scheduleEngineRebuild(reason: "the output device changed under the session")
+        if let shouldBeOn, shouldBeOn != playingOn {
+            scheduleEngineRebuild(reason: "the output device changed under the session")
+            return
+        }
+        // The split capture engine fell back to the default when its pinned mic went away.
+        guard !config.micUID.isEmpty,
+              let wanted = AudioDevices.deviceID(forUID: config.micUID)
+        else { return }
+        stateLock.lock()
+        let capture = captureEngine
+        stateLock.unlock()
+        guard let unit = capture?.inputNode.audioUnit, let micOn = Self.currentDevice(of: unit),
+              micOn != wanted
+        else { return }
+        scheduleEngineRebuild(reason: "the pinned microphone came back")
     }
     #endif
 
@@ -911,19 +939,32 @@ public final class SessionAudio {
     /// Two-engine sessions pause/resume the capture engine; a combined session instead mutes the
     /// voice processor's input (playback shares that engine and must keep running, so the engine
     /// itself never pauses — the mute zeroes the mic at the IO unit, and the tap encodes silence).
-    /// Local and instant either way: nothing is negotiated with the host, and the packets that do
+    /// Local either way: nothing is negotiated with the host, and the packets that do
     /// leave carry silence. A no-op when there's no uplink (playback-only / tvOS / mic disabled),
     /// except that the state is LATCHED for an uplink that starts later. The audio SESSION stays
     /// active for background playback, so iOS may keep showing the recording indicator until a
     /// full reconfigure — either path stops room audio leaving the device, which is the
-    /// privacy-relevant part. Main thread.
+    /// privacy-relevant part. Main thread; the engine work runs on `engineQueue`, where an unmute's
+    /// start can block on a Bluetooth mic, and where it can't race a rebuild's teardown.
     public func setMicMuted(_ muted: Bool) {
         stateLock.lock()
         micMuted = muted
-        let capture = captureEngine
-        let combined = combinedEngine
         stateLock.unlock()
-        apply(micMuted: muted, capture: capture, combined: combined)
+        engineQueue.async { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            let muted = self.micMuted // the newest request, if several queued
+            let capture = self.captureEngine
+            let combined = self.combinedEngine
+            self.stateLock.unlock()
+            self.apply(micMuted: muted, capture: capture, combined: combined)
+        }
+    }
+
+    private var latchedMicMute: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return micMuted
     }
 
     /// Push the latched mute onto whichever engine carries the uplink. Split out from
@@ -1287,6 +1328,8 @@ public final class SessionAudio {
             startCapture(micUID: micUID, micChannel: micChannel)
             return
         }
+        // Mute before the IO unit opens: applied after start, the first tap buffer is room audio.
+        engine.inputNode.isVoiceProcessingInputMuted = latchedMicMute
         do {
             try engine.start()
         } catch {
@@ -1348,8 +1391,10 @@ public final class SessionAudio {
             engine.stop()
             return
         }
+        // A muted uplink stays unstarted (the unmute starts it): a start opens the mic before
+        // the mute could pause it.
         do {
-            try engine.start()
+            if !latchedMicMute { try engine.start() }
         } catch {
             log.error("capture engine failed to start: \(error.localizedDescription)")
             input.removeTap(onBus: 0)

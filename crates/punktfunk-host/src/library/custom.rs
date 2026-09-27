@@ -441,6 +441,8 @@ const UNPRIVILEGED_LAUNCH_KINDS: &[&str] = &[
     "uplay",
     "amazon",
     "battlenet",
+    "ea",
+    "rockstar",
     "exec",
     "desktop_id",
     "gamebar",
@@ -577,6 +579,14 @@ fn entry_fault(
             "battlenet" => bad(
                 valid_battlenet_code(&launch.value),
                 "must be a launch code of [A-Za-z0-9_]",
+            ),
+            "ea" => bad(
+                valid_ea_id(&launch.value),
+                "must be a content id of [A-Za-z0-9._-]",
+            ),
+            "rockstar" => bad(
+                valid_rockstar_title(&launch.value),
+                "must be a title id of [A-Za-z0-9_]",
             ),
             "gamebar" => bad(
                 valid_gamebar_exe(&launch.value),
@@ -1248,6 +1258,8 @@ mod tests {
                 "uplay",
                 "amazon",
                 "battlenet",
+                "ea",
+                "rockstar",
                 "exec",
                 "desktop_id",
                 "gamebar",

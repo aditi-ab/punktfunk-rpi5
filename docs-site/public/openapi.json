@@ -272,7 +272,7 @@
             }
           },
           "400": {
-            "description": "No paired-device certificate on the connection",
+            "description": "No paired device behind the request",
             "content": {
               "application/json": {
                 "schema": {

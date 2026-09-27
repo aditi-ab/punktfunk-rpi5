@@ -140,6 +140,23 @@ final class ConsoleJSONTests: XCTestCase {
         XCTAssertTrue(pads.last?["battery"] is NSNull)
     }
 
+    /// The Recent and Most played sorts read `stats`; a title the host never launched has none.
+    func testLibraryGamesCarryPlayStats() throws {
+        let wire = #"""
+            [{"id": "steam:1", "store": "steam", "title": "Played", "art": {},
+              "stats": {"last_played_unix_ms": 1757160000000, "play_time_ms": 5400000,
+                        "last_run_ms": 2700000, "launch_count": 12}},
+             {"id": "steam:2", "store": "steam", "title": "Never", "art": {}}]
+            """#
+        let games = try JSONDecoder().decode([GameEntry].self, from: Data(wire.utf8))
+        let out = try rows(ConsoleJSON.libraryGames(games))
+        let stats = try XCTUnwrap(out.first?["stats"] as? [String: Any])
+        XCTAssertEqual(stats["last_played_unix_ms"] as? UInt64, 1_757_160_000_000)
+        XCTAssertEqual(stats["play_time_ms"] as? UInt64, 5_400_000)
+        XCTAssertEqual(stats["launch_count"] as? Int, 12)
+        XCTAssertTrue(out.last?["stats"] is NSNull)
+    }
+
     func testKnownHostsCarryWhatALinkNeeds() throws {
         let saved = host(name: "Desk")
         let data = try XCTUnwrap(ConsoleJSON.knownHosts([saved]).data(using: .utf8))

@@ -430,10 +430,13 @@ impl Present {
         self.frame = (frame + 1) % FRAMES;
         match outcome {
             Ok(false) if !suboptimal => Ok(true),
-            // Suboptimal is not an error — the picture was shown — but the surface has
-            // moved on (a rotation, or the bars retracting), so rebuild before the next.
+            // Suboptimal is not an error — the picture was shown. Android reports it on every
+            // present whose IDENTITY transform differs from the panel's rotation, so only a
+            // size change (the bars retracting) earns a rebuild.
             Ok(_) => {
-                self.recreate()?;
+                if self.extent_changed()? {
+                    self.recreate()?;
+                }
                 Ok(true)
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
@@ -516,6 +519,16 @@ impl Present {
             self.device.cmd_draw(cmd, 3, 1, 0, 0);
             self.device.cmd_end_render_pass(cmd);
         }
+    }
+
+    /// Whether the surface's size differs from the swapchain's.
+    fn extent_changed(&self) -> Result<bool> {
+        // SAFETY: physical device and surface are live.
+        let caps = unsafe {
+            self.surface_i
+                .get_physical_device_surface_capabilities(self.pdev, self.surface)
+        }?;
+        Ok(caps.current_extent != self.swap.extent)
     }
 
     /// Idle the device, then rebuild the swapchain against the surface's current size.

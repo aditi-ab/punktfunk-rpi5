@@ -87,9 +87,11 @@ struct AUIntake {
         return Intake(au: au, step: step, idr: idrFormat != nil)
     }
 
-    /// The sink lost its decoder state: wait for the next IDR's parameter sets.
+    /// The sink lost its decoder state: wait for the next IDR's parameter sets. Stamps the wait
+    /// start for the resume log.
     mutating func requireIDR() {
         pump.requireIDR()
+        awaitingSince = Date()
     }
 
     /// Run the H.265 concealer over `au`, swapping in its rewrite.

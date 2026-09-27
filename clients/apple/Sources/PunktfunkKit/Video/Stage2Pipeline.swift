@@ -63,7 +63,7 @@ public enum FrameStorePolicy: Sendable, Equatable {
 
 public final class FrameStore<Frame>: @unchecked Sendable {
     private let lock = NSLock()
-    private let capacity: Int // 1 = newest-wins semantics
+    let capacity: Int // 1 = newest-wins semantics
     private let isFifo: Bool
     private var frames: [Frame] = []
     private var prerolled = false
@@ -977,10 +977,11 @@ public final class Stage2Pipeline {
             thread = Thread {
             defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
             var intake = AUIntake(connection: connection, gate: reanchorGate, recovery: recovery)
-            // 4:4:4 backstop: a run of decode/create failures in a 4:4:4 session means this device can't
-            // decode 4:4:4 at the negotiated resolution (the HW probe clears the common case but not a
-            // resolution-ceiling miss). End cleanly instead of looping on a black screen.
-            var decodeFailRun = 0
+            // Hardware-only backstop (4:4:4, AV1): 3 s in which every decode fails means this device
+            // can't decode the mode at all, e.g. past a resolution ceiling. End instead of looping on
+            // black. Timed, not counted: after a failure only IDRs reach the decoder.
+            let hardwareOnly = connection.isChroma444 || connection.videoCodec == .av1
+            var failingSinceNs: UInt64?
             // Every iteration drains its own autorelease pool: this thread has no runloop, so
             // autoreleased VT/CM temporaries would otherwise accumulate until session end.
             // `false` = session over — exit the loop (the closure can't `break` across itself).
@@ -988,6 +989,8 @@ public final class Stage2Pipeline {
             while alive, !token.isStopped {
                 alive = autoreleasepool { () -> Bool in
                 do {
+                    // Background time is not failure time: the intake drains without decoding.
+                    if connection.isVideoDropped { failingSinceNs = nil }
                     // HDR mastering metadata (0xCE) goes to the presenter (→ CAEDRMetadata).
                     guard let ready = try intake.next(
                         onFrame: onFrame, onDecodedSize: onDecodedSize,
@@ -1000,16 +1003,16 @@ public final class Stage2Pipeline {
                     if ready.step.withhold { return true }
                     guard let f = intake.pump.format, !token.isStopped else { return true }
                     if decoder.decode(au: au, format: f) {
-                        decodeFailRun = 0
+                        failingSinceNs = nil
                     } else {
                         // Submit/decoder error: drop the session and re-gate on the next IDR's in-band
                         // parameter sets (a delta frame can't recover) and keep asking for that IDR.
                         decoder.reset()
                         intake.requireIDR()
-                        decodeFailRun += 1
-                        // ~3 s of solid failure in a 4:4:4 session (and only there — a 4:2:0 loss
-                        // recovers within a GOP) ⇒ 4:4:4 isn't decodable here; end the session.
-                        if connection.isChroma444, decodeFailRun >= 180 {
+                        let nowNs = DispatchTime.now().uptimeNanoseconds
+                        let sinceNs = failingSinceNs ?? nowNs
+                        failingSinceNs = sinceNs
+                        if hardwareOnly, nowNs - sinceNs >= 3_000_000_000 {
                             if !token.isStopped { onSessionEnd?() }
                             return false
                         }
@@ -1607,8 +1610,10 @@ public final class Stage2Pipeline {
             // Compiles the two compute kernels on the session's first frames' thread — ~tens of
             // ms, once per session. Failure = this device can't run the negotiated codec (the
             // advertisement probe should have prevented this); end the session cleanly.
+            // Ring past the store: its queued frames, the render thread's, a put-back, the decode.
             guard let decoder = MetalWaveletDecoder(
-                device: device, queue: queue, tenBit: connection.bitDepth >= 10)
+                device: device, queue: queue, tenBit: connection.bitDepth >= 10,
+                ringDepth: max(4, ring.capacity + 3))
             else {
                 if !token.isStopped { onSessionEnd?() }
                 return

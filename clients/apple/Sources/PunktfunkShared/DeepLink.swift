@@ -292,7 +292,7 @@ public struct DeepLink: Equatable, Sendable {
             switch key {
             case "fp" where link.fp == nil:
                 let fp = value.lowercased()
-                guard fp.count == 64, fp.allSatisfy(\.isHexDigit) else {
+                guard fp.count == 64, fp.allSatisfy({ $0.isASCII && $0.isHexDigit }) else {
                     throw DeepLinkError.badFingerprint
                 }
                 link.fp = fp

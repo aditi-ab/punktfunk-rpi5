@@ -193,7 +193,7 @@ fn resolve_requested_audio_format(rate_hz: u32, bits: u8, channels: u8) -> (u32,
         .unwrap_or(HZ48);
     if granted != rate_hz {
         log::warn!(
-            "audio: this device will not open a {rate_hz} Hz output, so the session asks for {granted} Hz / {bits}-bit instead — the wire is only ever offered a format this client has proved it can play"
+            "audio: this device can't play {rate_hz} Hz without resampling, so the session asks for {granted} Hz / {bits}-bit instead — the wire is only ever offered a format this client has proved it can play"
         );
     }
     (granted, bits)

@@ -479,7 +479,8 @@ fn pump(
         // that state indistinguishable from the renderer being dead.
         tally.report(playback);
 
-        let Some(frame) = client.next_pad_audio(Duration::from_millis(10)) else {
+        let mut next = client.next_pad_audio(Duration::from_millis(10));
+        if next.is_none() {
             // R12: `next_pad_audio` collapses a DISCONNECTED channel into the same `None` as an
             // ordinary timeout, so this arm cannot tell "nothing arrived in 10 ms" from "the
             // session is gone and nothing will ever arrive again". Left to `continue`, a closed
@@ -490,57 +491,62 @@ fn pump(
                 break;
             }
             continue;
-        };
-
-        // R14: `PadAudioFrame` carries the wire pad it was addressed to, and this renderer serves
-        // exactly one. A frame for another pad — a queue still holding the previous occupant's
-        // when a slot is re-used, or a host bug — would otherwise be decoded here AND seed the
-        // gap tracker from a foreign sequence space, which shows up as a burst of phantom
-        // concealment rather than as anything obviously wrong.
-        if frame.pad != pad {
-            log::debug!(
-                "pad audio: dropping frame for pad {} on pad {pad}",
-                frame.pad
-            );
-            continue;
         }
+        // Everything queued goes into the mixer before one write, so its MAX_BUFFER_FRAMES
+        // ceiling bounds the backlog. One frame per USB-paced write never sheds a burst.
+        while let Some(frame) = next.take() {
+            next = client.next_pad_audio(Duration::ZERO);
 
-        // The settings gate each kind independently: haptics off but speaker on is a legitimate
-        // configuration, and the host may still be sending both.
-        let wanted = match frame.kind {
-            PAD_AUDIO_KIND_HAPTICS => haptics,
-            PAD_AUDIO_KIND_SPEAKER => speaker,
-            _ => false,
-        };
-        if !wanted {
-            continue;
+            // R14: `PadAudioFrame` carries the wire pad it was addressed to, and this renderer serves
+            // exactly one. A frame for another pad — a queue still holding the previous occupant's
+            // when a slot is re-used, or a host bug — would otherwise be decoded here AND seed the
+            // gap tracker from a foreign sequence space, which shows up as a burst of phantom
+            // concealment rather than as anything obviously wrong.
+            if frame.pad != pad {
+                log::debug!(
+                    "pad audio: dropping frame for pad {} on pad {pad}",
+                    frame.pad
+                );
+                continue;
+            }
+
+            // The settings gate each kind independently: haptics off but speaker on is a legitimate
+            // configuration, and the host may still be sending both.
+            let wanted = match frame.kind {
+                PAD_AUDIO_KIND_HAPTICS => haptics,
+                PAD_AUDIO_KIND_SPEAKER => speaker,
+                _ => false,
+            };
+            if !wanted {
+                continue;
+            }
+
+            // A real haptics frame is the evidence that the game is driving the coils, and therefore
+            // that wire rumble must stand down for this pad (see `haptics_owns_coils`). Stamped on
+            // arrival rather than after decode so a decoder hiccup cannot hand the coils back
+            // mid-effect; concealment never reaches here, so PLC still does not count.
+            if frame.kind == PAD_AUDIO_KIND_HAPTICS {
+                HAPTICS.note(pad);
+            }
+
+            tally.frames_in += 1;
+            let k = usize::from(frame.kind).min(1);
+            let st = match &mut streams[k] {
+                Some(s) => s,
+                slot @ None => match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo) {
+                    Ok(dec) => slot.insert(KindStream {
+                        dec,
+                        gaps: AudioGapTracker::default(),
+                        frame_samples: 0,
+                    }),
+                    Err(e) => {
+                        log::warn!("pad audio: no Opus decoder for kind {}: {e}", frame.kind);
+                        continue;
+                    }
+                },
+            };
+            decode_into(st, &frame, &mut pcm, &mut mixer, &mut tally);
         }
-
-        // A real haptics frame is the evidence that the game is driving the coils, and therefore
-        // that wire rumble must stand down for this pad (see `haptics_owns_coils`). Stamped on
-        // arrival rather than after decode so a decoder hiccup cannot hand the coils back
-        // mid-effect; concealment never reaches here, so PLC still does not count.
-        if frame.kind == PAD_AUDIO_KIND_HAPTICS {
-            HAPTICS.note(pad);
-        }
-
-        tally.frames_in += 1;
-        let k = usize::from(frame.kind).min(1);
-        let st = match &mut streams[k] {
-            Some(s) => s,
-            slot @ None => match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo) {
-                Ok(dec) => slot.insert(KindStream {
-                    dec,
-                    gaps: AudioGapTracker::default(),
-                    frame_samples: 0,
-                }),
-                Err(e) => {
-                    log::warn!("pad audio: no Opus decoder for kind {}: {e}", frame.kind);
-                    continue;
-                }
-            },
-        };
-        decode_into(st, &frame, &mut pcm, &mut mixer, &mut tally);
 
         // Hand over whole frames only. `write` stages any remainder internally, so a partial
         // chunk is never padded with silence mid-stream.

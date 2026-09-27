@@ -58,6 +58,10 @@ export const SinglePlatform: Story = {
 	},
 };
 
+export const Detected: Story = {
+	args: { entry: { ...BASE, detected: true } },
+};
+
 export const Installed: Story = {
 	args: { entry: { ...BASE, installed_version: "0.3.2" } },
 };

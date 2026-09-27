@@ -174,13 +174,15 @@ final class HostStore: ObservableObject {
     }
 
     /// Did the host pinned to `pin` (any host, when `nil`) answer a probe at this address?
+    /// The probe blocks for up to its timeout, so it runs on GCD: a sweep of silent hosts would
+    /// otherwise hold the cooperative pool, two threads on an Apple TV HD.
     private static func answers(_ address: String, _ port: UInt16, pin: Data?) async -> Bool {
-        await Task.detached(priority: .utility) {
-            guard let answered = PunktfunkConnection.probeIdentity(host: address, port: port) else {
-                return false
+        await withCheckedContinuation { done in
+            DispatchQueue.global(qos: .utility).async {
+                let answered = PunktfunkConnection.probeIdentity(host: address, port: port)
+                done.resume(returning: answered.map { got in pin.map { $0 == got } ?? true } ?? false)
             }
-            return pin.map { $0 == answered } ?? true
-        }.value
+        }
     }
 
     /// One reachability sweep, driving `probedOnline`: probe every saved host and publish the

@@ -130,4 +130,14 @@ final class LatencyMeterTests: XCTestCase {
         m.record(ptsNs: UInt64(atNs - 9_000_000), atNs: atNs, offsetNs: 0)
         XCTAssertEqual(m.latestSample(asOfNs: atNs, maxAgeMs: 500), 9_000_000)
     }
+
+    func testAnUndrainedMeterStopsGrowingButKeepsItsLevel() {
+        let m = LatencyMeter()
+        let atNs: Int64 = 1_700_000_000_000_000_000
+        for i in 0..<5000 {
+            m.record(ptsNs: UInt64(atNs - 1_000_000 - Int64(i)), atNs: atNs, offsetNs: 0)
+        }
+        XCTAssertEqual(m.latestSample(asOfNs: atNs, maxAgeMs: 500), 1_004_999)
+        XCTAssertEqual(m.drain()?.count, 4096)
+    }
 }

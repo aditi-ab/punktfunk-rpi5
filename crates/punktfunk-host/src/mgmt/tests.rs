@@ -4382,6 +4382,32 @@ async fn a_paired_device_key_buys_the_cert_lane_and_no_more() {
         "a device token must not reach the admin lane"
     );
 
+    // The lane's writes are the device's too, whichever way it proved itself: its log upload,
+    // and the power actions its grants allow.
+    let upload = axum::http::Request::post("/api/v1/client-logs")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from("the page's own log"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(upload).await.unwrap().status(),
+        StatusCode::CREATED,
+        "a browser files its log under its device"
+    );
+    let list = axum::http::Request::get("/api/v1/actions")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(list).await.unwrap();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let actions: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let sleep = actions["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "power.sleep")
+        .unwrap();
+    assert_eq!(sleep["permitted"], true, "full access includes host power");
+
     // Unpairing revokes at once, rather than when the token lapses.
     np.remove(&fp).unwrap();
     assert_ne!(

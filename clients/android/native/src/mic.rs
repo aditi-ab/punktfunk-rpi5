@@ -291,6 +291,7 @@ fn supervise(
     // decode thread opens keeps mic encode on a fast core too (the playback side's decode_loop
     // does the same). No-op below API 33.
     client.register_hot_thread();
+    crate::audio::boost_audio_thread("mic");
     // Self-heal on: the capture callback drops the NEWEST chunk when the channel is full, so a
     // stall here would otherwise become standing mic delay the host never makes back up.
     let mut up = match MicEncoder::new(true) {

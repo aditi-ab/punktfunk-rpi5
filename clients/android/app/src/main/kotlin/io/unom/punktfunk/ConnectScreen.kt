@@ -22,6 +22,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.withStarted
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
@@ -222,12 +223,15 @@ fun ConnectScreen(
         discovery.addNetworkListener(onNetwork)
         onDispose { discovery.removeNetworkListener(onNetwork) }
     }
+    // Probe laps wait while the app is away: a stopped activity does not pause a coroutine.
+    val appLifecycle = (context as? LifecycleOwner)?.lifecycle
     LaunchedEffect(savedHosts, lnpGranted, networkGen) {
         if (!lnpGranted) {
             reachable = emptySet()
             return@LaunchedEffect
         }
         while (true) {
+            appLifecycle?.withStarted {}
             val saved = savedHosts
             val up = withContext(Dispatchers.IO) {
                 Presence.sweep(
@@ -292,6 +296,7 @@ fun ConnectScreen(
     LaunchedEffect(savedHosts, identity) {
         val id = identity ?: return@LaunchedEffect
         while (true) {
+            appLifecycle?.withStarted {}
             val now = android.os.SystemClock.elapsedRealtime()
             for (kh in savedHosts) {
                 if (!kh.paired || kh.fpHex.isEmpty()) continue
@@ -334,9 +339,10 @@ fun ConnectScreen(
     fun session(handle: Long, record: KnownHost?, preset: StreamPreset?): ActiveSession =
         SessionFactory.afterDial(handle, record, settings.effectiveFor(preset), preset, knownHostStore)
 
-    // The actual dial (identity already ready). A TOFU dial (pinHex null) pins what the host
-    // presented, as an unpaired known host. [onFailure] takes over an unreachable dial (the
-    // wake-wait fallback, discovery already restarted); [onMismatch] takes over a refused pin.
+    // The actual dial (identity already ready). A TOFU dial (no saved record; pinned to the
+    // advertised fingerprint when there is one) saves what the host presented, as an unpaired
+    // known host. [onFailure] takes over an unreachable dial (the wake-wait fallback, discovery
+    // already restarted); [onMismatch] takes over a refused pin.
     fun doConnectDirect(
         targetHost: String,
         targetPort: Int,
@@ -367,12 +373,9 @@ fun ConnectScreen(
             connecting = false
             if (handle != 0L) {
                 // By this dial's pin (the address may also name the other OS of a dual-boot box);
-                // a TOFU dial pins what the host presented, unpaired.
-                val record = if (pinHex != null) {
-                    knownHostStore.resolve(pinHex, targetHost, targetPort)
-                } else {
-                    SessionFactory.pinPresented(handle, targetHost, targetPort, name, paired = false, knownHostStore)
-                }
+                // with no saved record, a TOFU dial pins what the host presented, unpaired.
+                val record = pinHex?.let { knownHostStore.resolve(it, targetHost, targetPort) }
+                    ?: SessionFactory.pinPresented(handle, targetHost, targetPort, name, paired = false, knownHostStore)
                 onConnected(session(handle, record, preset))
             } else {
                 discovery.addListener(subscriber)
@@ -906,7 +909,14 @@ fun ConnectScreen(
         onPendingTrustChange = { pendingTrust = it },
         onTrustNew = { pt ->
             pendingTrust = null
-            doConnect(pt.host, pt.port, pt.name, null, pt.preset, pt.launch)
+            // Pinned to the fingerprint the prompt showed, when the advert carried one.
+            doConnect(
+                pt.host, pt.port, pt.name, pt.advertisedFp, pt.preset, pt.launch,
+                onMismatch = {
+                    status = "Couldn't connect: the host didn't present the identity it advertised. " +
+                        "Pair with its PIN instead."
+                },
+            )
         },
         onPaired = { pt, fp ->
             knownHostStore.trust(pt.host, pt.port, pt.name, fp, paired = true)

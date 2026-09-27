@@ -342,11 +342,12 @@ async fn session(
     // Slot after the handshake, as the native plane does: a full host still accepts, so the
     // browser sees a live path (keep-alive) instead of a silent dial timeout.
     let permit = sem
+        .clone()
         .acquire_owned()
         .await
         .expect("session semaphore is never closed");
     let peer = connection.remote_address();
-    match session::run(connection.clone(), serving.clone(), permit).await {
+    match session::run(connection.clone(), serving.clone(), permit, sem).await {
         Ok(crate::native::Served::Session) => tracing::info!(%peer, "browser session complete"),
         Ok(crate::native::Served::ProbeClose) => {}
         Err(e) => {
@@ -374,7 +375,7 @@ async fn session(
 
 /// Say why on a fresh unidirectional stream, then give the browser a moment to read it. The
 /// close that follows carries no retransmit, so the wait is what makes the message arrive.
-async fn refuse(connection: &wtransport::Connection, code: u32, reason: &str) {
+pub(crate) async fn refuse(connection: &wtransport::Connection, code: u32, reason: &str) {
     let msg = punktfunk_core::quic::Refused {
         code,
         reason: reason.to_string(),

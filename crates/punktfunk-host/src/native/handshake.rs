@@ -348,7 +348,8 @@ pub(super) async fn negotiate(
         close_rejected(
             conn,
             punktfunk_core::reject::RejectReason::WireVersionMismatch,
-        );
+        )
+        .await;
         anyhow::bail!(
             "wire version mismatch: client {} host {}",
             hello.abi_version,
@@ -474,7 +475,7 @@ pub(super) async fn negotiate(
                 tracing::warn!("mode-conflict: REJECT — {reason}");
                 // Typed refusal: BUSY + reason bytes. The client reads `ApplicationClosed`,
                 // not a bare drop, so the UI can name the live session.
-                conn.close(REJECT_BUSY_CODE, reason.as_bytes());
+                conn.refuse(REJECT_BUSY_CODE, &reason).await;
                 anyhow::bail!("{reason}");
             }
         }
@@ -629,9 +630,10 @@ pub(super) async fn negotiate(
         // Negotiated codec; the client must not assume HEVC.
         codec: codec_bit,
         // Sequence-gated gamepad snapshots; capable clients send those, not per-transition events.
-        // Clipboard only when operator policy and a platform backend both exist.
+        // Clipboard only when operator policy and a platform backend both exist, and never to a
+        // browser: its transfers ride quinn streams.
         host_caps: punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE
-            | if pf_clipboard::cap_advertised() {
+            | if pf_clipboard::cap_advertised() && !conn.is_web() {
                 punktfunk_core::quic::HOST_CAP_CLIPBOARD
             } else {
                 0

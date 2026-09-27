@@ -121,6 +121,7 @@ class LibraryCache(private val directory: File) {
             g.developer?.let { put("developer", it) }
             g.releaseYear?.let { put("release_year", it) }
             if (g.genres.isNotEmpty()) put("genres", JSONArray(g.genres))
+            g.stats?.let { put("stats", it.toJson()) }
         }
 
     private fun decode(o: JSONObject): GameEntry {
@@ -142,6 +143,7 @@ class LibraryCache(private val directory: File) {
             genres = o.optJSONArray("genres")
                 ?.let { a -> List(a.length()) { a.optString(it) }.filter { it.isNotBlank() } }
                 ?: emptyList(),
+            stats = GameStats.from(o.optJSONObject("stats")),
         )
     }
 

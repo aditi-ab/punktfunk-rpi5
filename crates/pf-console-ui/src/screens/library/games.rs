@@ -3,7 +3,7 @@
 //! Focus walks lines top to bottom: the sort/view pills, the host chips and a Customize
 //! chip, the enabled sections in `library_sections` order, and the Games field (grid or
 //! shelf) where Games sits among them. An empty section hides. Desktops and Launchers
-//! leave the field while their rows show. A list that failed, is empty or still loading
+//! never sit in the field, row on or off. A list that failed, is empty or still loading
 //! keeps the chips and the Desktops row, with the state's action where the field was.
 //! A collection's shelf has only the pills and its field.
 
@@ -14,7 +14,7 @@ use super::{store_sort, store_view, LibraryScreen};
 use crate::el::{El, Id};
 use crate::glyphs::{Hint, HintKey};
 use crate::grid::GRID_GAP;
-use crate::library::{LibraryGame, LibraryPhase, LibraryView, Section, DESKTOP_ID};
+use crate::library::{LibraryGame, LibraryPhase, LibraryView, Section};
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::Pointer;
 use crate::screens::card_menu::CardMenu;
@@ -152,16 +152,14 @@ impl LibraryScreen {
         self.sections.iter().any(|&(x, on)| x == s && on)
     }
 
-    /// A band shows this title, so the field does not. Under the Hosts row the card above
-    /// is the desk, and launchers follow the Games tab.
+    /// The field keeps this title out. The desktop and the launchers live only in their own
+    /// rows: a row switched off hides them, it does not drop them into the grid. The shelf
+    /// under the Hosts row follows the Games tab.
     pub(super) fn banded(&self, g: &LibraryGame) -> bool {
         if self.embedded {
-            return g.id == DESKTOP_ID || (g.launcher && self.shows(Section::Launchers));
+            return g.leads();
         }
-        self.sectioned()
-            && (!self.shows(Section::Games)
-                || (g.id == DESKTOP_ID && self.shows(Section::Desktops))
-                || (g.launcher && self.shows(Section::Launchers)))
+        self.sectioned() && (!self.shows(Section::Games) || g.leads())
     }
 
     /// The bands with something in them, in order; `.1` of them sit above the field. Until

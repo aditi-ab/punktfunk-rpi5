@@ -37,6 +37,8 @@ export type Artwork = typeof Artwork.Type;
  * | `uplay` | digits — a Ubisoft Connect game id | windows |
  * | `amazon` | an Amazon Games product id (`amzn1.adg.product.…`) | windows |
  * | `battlenet` | a Battle.net launch code (`WTCG`, `Pro`, `Fen`, …), case kept | windows |
+ * | `ea` | an EA app content id from the game's `installerdata.xml` | windows |
+ * | `rockstar` | a Rockstar Games Launcher title id (`gta5`, `rdr2`); the host finds the folder | windows |
  * | `gamebar` | an exe's absolute path; the host runs it only if a signed-in user's Game Bar list names it | windows |
  * | `desktop_id` | an installed `.desktop` entry's id; the host reads its `Exec` | linux |
  * | `exec` | the name of an `exec` template in THIS plugin's manifest — see below | both |

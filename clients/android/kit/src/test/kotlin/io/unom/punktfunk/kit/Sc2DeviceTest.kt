@@ -310,7 +310,7 @@ class Sc2DeviceTest {
     @Test
     fun `a rumble stream collapses while a queued pulse survives`() {
         // More rumbles than the queue holds: uncoalesced, the overflow evicts the pulse.
-        val q = OutReportQueue()
+        val q = OutReportQueue<ByteArray>()
         val pulse = byteArrayOf(0x81.toByte(), 1)
         q.offer(pulse, Sc2Device.outputCoalesceKey(pulse))
         repeat(OutReportQueue.CAP + 8) { n ->

@@ -144,14 +144,20 @@ fn decoder_supports_max_operating_rate(name_lower: &str) -> bool {
 }
 
 /// Raise the pipeline's OTHER hot threads — the core's data-plane pump (UDP receive + FEC
-/// reassembly) and the audio decode thread — toward the display band, matching this decode thread's
-/// own boost. `setpriority(PRIO_PROCESS, tid)` targets any task in the process, so we do it from
-/// here once their tids are known (the same set ADPF hints), without a per-platform priority hook
-/// in the shared core. Slightly below the decode thread's -10 so the display path still wins.
-/// Best-effort; skips this thread (already boosted) and is non-fatal if the platform refuses.
+/// reassembly) and any other registered thread — toward the display band, matching this decode
+/// thread's own boost. `setpriority(PRIO_PROCESS, tid)` targets any task in the process, so we do
+/// it from here once their tids are known (the same set ADPF hints), without a per-platform
+/// priority hook in the shared core. Slightly below the decode thread's -10 so the display path
+/// still wins. Only ever raises: the audio and mic threads already sit at
+/// [`crate::audio::AUDIO_NICE`]. Best-effort; skips this thread and is non-fatal if refused.
 pub(super) fn boost_hot_threads(tids: &[i32]) {
     let self_tid = crate::sys::gettid();
     for &tid in tids.iter().filter(|&&tid| tid != self_tid) {
+        // SAFETY: `getpriority` takes no pointers. A failed read returns -1, above -8, so the set
+        // is tried and fails the same way.
+        if unsafe { libc::getpriority(libc::PRIO_PROCESS, tid as libc::id_t) } <= -8 {
+            continue;
+        }
         if set_thread_nice(Some(tid), -8).is_err() {
             log::debug!("decode: setpriority(-8) on hot tid {tid} failed (non-fatal)");
         }
@@ -263,16 +269,17 @@ pub(super) fn android_hdr_static_info(m: &punktfunk_core::quic::HdrMeta) -> [u8;
 /// host sends a 0xCE right after the handshake, so it's typically already queued; wait briefly
 /// otherwise. The Surface DataSpace (applied on the format change) carries transfer/primaries
 /// regardless — this adds the luminance the tone-mapper needs. `None` on an SDR session.
+/// The newest entry, not the first: the host follows its generic baseline with the source's grade.
 pub(super) fn hdr_static(client: &NativeClient) -> Option<punktfunk_core::quic::HdrMeta> {
     if !client.color.is_hdr() {
         return None;
     }
-    match client.next_hdr_meta(Duration::from_millis(250)) {
-        Ok(meta) => {
+    match client.latest_hdr_meta(Duration::from_millis(250)) {
+        Some(meta) => {
             log::info!("decode: HDR static metadata applied (KEY_HDR_STATIC_INFO)");
             Some(meta)
         }
-        Err(_) => {
+        None => {
             log::info!("decode: HDR session but no mastering metadata yet — DataSpace only");
             None
         }

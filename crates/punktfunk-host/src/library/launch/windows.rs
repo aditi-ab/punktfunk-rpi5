@@ -217,6 +217,26 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
                 spec.value
             ))
         }),
+        // The EA app answers `origin2://` for a game's content id, the `uplay` shape.
+        "ea" => valid_ea_id(&spec.value).then(|| {
+            WinRecipe::handoff(format!(
+                "explorer.exe \"origin2://game/launch/?offerIds={}\"",
+                spec.value
+            ))
+        }),
+        // Rockstar's launcher starts a title by its folder. Both paths come from the
+        // launcher's uninstall entries, so the plugin names only the title id.
+        "rockstar" => {
+            if !valid_rockstar_title(&spec.value) {
+                return None;
+            }
+            let (launcher, dir) = rockstar_paths(&spec.value)?;
+            Some(WinRecipe::handoff(format!(
+                "\"{}\" -launchTitleInFolder \"{}\"",
+                launcher.display(),
+                dir.display()
+            )))
+        }
         // `battlenet://<code>` only opens the game's page; `--exec="launch <code>"` on the
         // client's exe starts it. No exe found refuses the launch rather than opening a page.
         "battlenet" => {
@@ -324,6 +344,47 @@ fn battlenet_exe() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// The Rockstar Games Launcher's `Launcher.exe` and `title`'s install folder, from the
+/// machine-wide uninstall entries the launcher writes. Either missing refuses the launch.
+fn rockstar_paths(title: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let (mut launcher, mut folder) = (None, None);
+    for path in [
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ] {
+        let Ok(uninstall) = hklm.open_subkey_with_flags(path, KEY_READ) else {
+            continue;
+        };
+        for name in uninstall.enum_keys().flatten() {
+            let Ok(entry) = uninstall.open_subkey_with_flags(&name, KEY_READ) else {
+                continue;
+            };
+            let location = entry
+                .get_value::<String, _>("InstallLocation")
+                .map(|l| std::path::PathBuf::from(l.trim().trim_matches('"')))
+                .unwrap_or_default();
+            if location.as_os_str().is_empty() || location.to_string_lossy().contains('"') {
+                continue;
+            }
+            let display: String = entry.get_value("DisplayName").unwrap_or_default();
+            let uninstall_cmd: String = entry.get_value("UninstallString").unwrap_or_default();
+            if display == "Rockstar Games Launcher" {
+                launcher = Some(location.join("Launcher.exe")).filter(|p| p.is_file());
+            } else if rockstar_uninstall_title(&uninstall_cmd)
+                .is_some_and(|t| t.eq_ignore_ascii_case(title))
+                && location.is_dir()
+            {
+                folder = Some(location);
+            }
+        }
+    }
+    Some((launcher?, folder?))
 }
 
 /// PackageFamilyName from `AppRepository\Packages\<PackageFullName>`:
@@ -968,6 +1029,23 @@ mod tests {
         assert!(windows_launch_for(&LaunchSpec {
             kind: "battlenet".into(),
             value: "WTCG\" & calc".into(),
+            args: None,
+        })
+        .is_none());
+        let ea = windows_launch_for(&LaunchSpec {
+            kind: "ea".into(),
+            value: "Origin.SFT.50.0000123".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            ea.cmdline,
+            "explorer.exe \"origin2://game/launch/?offerIds=Origin.SFT.50.0000123\""
+        );
+        assert!(!ea.owns_game);
+        assert!(windows_launch_for(&LaunchSpec {
+            kind: "rockstar".into(),
+            value: "gta5\" & calc".into(),
             args: None,
         })
         .is_none());

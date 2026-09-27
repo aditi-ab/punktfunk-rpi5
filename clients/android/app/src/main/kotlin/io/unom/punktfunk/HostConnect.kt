@@ -11,7 +11,13 @@ import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Handshake budget for a normal / library-launch connect (not the long request-access park). */
@@ -92,6 +98,19 @@ object SessionGate {
     fun release() {
         dialing.set(false)
     }
+
+    /** Session closes, off the UI thread: the QUIC close drains for up to 300 ms. */
+    private val closer = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "pf-close").apply { isDaemon = true }
+    }
+
+    /** Close [handle] in the background. The next dial waits for it, so sessions never overlap. */
+    fun close(handle: Long) = closer.execute { NativeBridge.nativeClose(handle) }
+
+    /** Block until every queued close finished, bounded. Off the main thread. */
+    fun awaitClosed() {
+        runCatching { closer.submit {}.get(2, TimeUnit.SECONDS) }
+    }
 }
 
 /**
@@ -168,7 +187,10 @@ private suspend fun dial(
     // connection's real datagram size in hand, not one to pre-empt from here with an MTU this side
     // never measured.
     val (audioRateHz, audioBits) = settings.audioFormatWire()
-    return withContext(Dispatchers.IO) {
+    // NonCancellable: a cancelled withContext drops its result, and the dial cannot be
+    // interrupted — the session would open with nobody to close it.
+    val handle = withContext(Dispatchers.IO + NonCancellable) {
+        SessionGate.awaitClosed() // the last stream's close, which its screen handed off
         // Transport-level half of "Low-latency mode (experimental)" (DSCP marking on the media
         // sockets) — must be applied before connect, since sockets are tagged at creation.
         NativeBridge.nativeSetLowLatencyMode(settings.lowLatencyMode)
@@ -231,4 +253,9 @@ private suspend fun dial(
         )
         NativeBridge.nativeConnect(request.toJson())
     }
+    if (handle != 0L && !currentCoroutineContext().isActive) {
+        withContext(Dispatchers.IO + NonCancellable) { NativeBridge.nativeClose(handle) }
+    }
+    currentCoroutineContext().ensureActive()
+    return handle
 }

@@ -86,7 +86,9 @@ import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.VideoFit
 import io.unom.punktfunk.models.ActiveSession
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -427,6 +429,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // again (use-after-free → SIGSEGV: the consistent back-while-streaming crash). Both run on the
     // main thread, so a plain flag is race-free; AtomicBoolean just makes the intent explicit.
     val closed = remember { AtomicBoolean(false) }
+    // The mic opens off the UI thread (AAudio input opens can take hundreds of ms), one start at a
+    // time. Every stop bumps `micGen`, so a start that lost its surface meanwhile undoes itself.
+    val micStarter = remember {
+        Executors.newSingleThreadExecutor { r -> Thread(r, "pf-mic-start").apply { isDaemon = true } }
+    }
+    val micGen = remember { AtomicInteger(0) }
 
     // Everything this stream does to the window — wake/Wi-Fi locks, the refresh pin, ALLM, the
     // cutout and soft-keyboard modes, the landscape lock — and the prior values it puts back.
@@ -438,10 +446,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     DisposableEffect(handle) {
         streamWindow.attach()
         peripherals.start()
-        // The panel's refresh pin, unbuffered pointer dispatch and the render-rate vote.
+        // The panel's refresh pin, unbuffered input dispatch and the render-rate vote.
         streamWindow.pinDisplay()
         onDispose {
             closed.set(true) // from here the handle gets freed; surfaceDestroyed must not touch it
+            micGen.incrementAndGet()
+            micStarter.shutdown()
             peripherals.stop()
             streamWindow.detach()
             // Leaving the stream: stop the mic + audio + decode threads and tear down the session.
@@ -450,7 +460,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             NativeBridge.nativeStopAudio(handle)
             NativeBridge.nativeStopVideo(handle)
             NativeBridge.nativeVideoDrain(handle, false)
-            NativeBridge.nativeClose(handle)
+            SessionGate.close(handle) // the QUIC close drains for up to 300 ms, off this thread
         }
     }
 
@@ -779,16 +789,31 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                 // service, so the platform's recording indicator would announce a
                                 // mic nobody can hear.
                                 if (micWanted && ui.accessGrants and SessionAccess.MIC != 0) {
-                                    val sessionId =
-                                        NativeBridge.nativeStartMic(handle, initialSettings.echoCancel)
-                                    if (initialSettings.echoCancel) {
-                                        attachMicEffects(sessionId, micEffects)
+                                    val gen = micGen.incrementAndGet()
+                                    val echo = initialSettings.echoCancel
+                                    val main = ContextCompat.getMainExecutor(context)
+                                    if (!micStarter.isShutdown) micStarter.execute {
+                                        if (micGen.get() != gen) return@execute
+                                        val sessionId = NativeBridge.nativeStartMic(handle, echo)
+                                        // Stopped during the open: that stop found nothing to stop.
+                                        if (micGen.get() != gen) {
+                                            NativeBridge.nativeStopMic(handle)
+                                            return@execute
+                                        }
+                                        main.execute {
+                                            if (micGen.get() != gen) return@execute
+                                            if (ui.accessGrants and SessionAccess.MIC == 0) {
+                                                NativeBridge.nativeStopMic(handle) // revoked meanwhile
+                                                return@execute
+                                            }
+                                            if (echo) attachMicEffects(sessionId, micEffects)
+                                            // Did a capture actually open? That — not the setting —
+                                            // puts the mute control on screen. A restart after a
+                                            // surface recreate comes back already muted if the user
+                                            // muted: the flag lives on the session handle.
+                                            ui.micRunning = NativeBridge.nativeMicActive(handle)
+                                        }
                                     }
-                                    // Did a capture actually open? That — not the setting — is what
-                                    // puts the mute control on screen. A restart after a surface
-                                    // recreate comes back already muted if the user muted: the flag
-                                    // lives on the session handle, so nothing has to be re-applied.
-                                    ui.micRunning = NativeBridge.nativeMicActive(handle)
                                 }
                             }
 
@@ -828,6 +853,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                 // DisposableEffect has closed it, the handle is freed; dereferencing it
                                 // here is the use-after-free that crashed on back-navigation.
                                 if (!closed.get()) {
+                                    micGen.incrementAndGet()
                                     releaseMicEffects(micEffects)
                                     NativeBridge.nativeStopMic(handle)
                                     // No capture, no control — but the MUTE state is deliberately left
@@ -1304,6 +1330,22 @@ internal class KeyCaptureView(context: Context) : View(context) {
     init {
         isFocusable = true
         isFocusableInTouchMode = true
+    }
+
+    // A leaf keeps its unbuffered request; a ViewGroup's is recomputed whenever focus moves below
+    // it. Pointer classes rise from any child, the rest through this view while it holds focus.
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            requestUnbufferedDispatch(STREAM_UNBUFFERED_SOURCES)
+        }
+    }
+
+    override fun onDetachedFromWindow() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            requestUnbufferedDispatch(0)
+        }
+        super.onDetachedFromWindow()
     }
 
     /** The session handle when the host types committed text; `0` = VK-only fallback. */
