@@ -105,7 +105,47 @@ impl TrayStatus {
     pub fn pairing_attention(&self) -> bool {
         matches!(self, TrayStatus::Running(s) if s.pin_pending || s.pending_approvals > 0)
     }
+
+    /// The service is up or coming up, so Stop applies.
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self,
+            TrayStatus::Running(_) | TrayStatus::Starting | TrayStatus::Degraded
+        )
+    }
+
+    /// The service is installed and down, so Start applies.
+    pub fn can_start(&self) -> bool {
+        matches!(self, TrayStatus::Stopped | TrayStatus::Error(_))
+    }
+
+    /// Running, or stopped unexpectedly.
+    pub fn can_restart(&self) -> bool {
+        self.is_running() || matches!(self, TrayStatus::Error(_))
+    }
+
+    /// The release-kept-displays menu entry, `None` when nothing is kept.
+    pub fn release_label(&self) -> Option<String> {
+        match self.kept_displays() {
+            0 => None,
+            1 => Some("Release kept display…".into()),
+            n => Some(format!("Release {n} kept displays…")),
+        }
+    }
 }
+
+/// Always shown: a dead console changes the label, never hides the row.
+pub fn console_label(responding: bool) -> &'static str {
+    if responding {
+        "Open web console"
+    } else {
+        "Open web console (not responding)"
+    }
+}
+
+/// The service restart. Clients' host-power "Restart host" reboots the machine
+/// (`design/host-actions.md`), so one phrase must not mean both.
+pub const RESTART_LABEL: &str = "Restart Punktfunk";
 
 /// Unreachable-summary window before Starting becomes Degraded. Re-armed while
 /// Running so a child restart shows Starting, not Degraded.
@@ -477,6 +517,37 @@ mod tests {
         s.kept_displays = 2;
         assert_eq!(TrayStatus::Running(s).kept_displays(), 2);
         assert_eq!(TrayStatus::Degraded.kept_displays(), 0);
+    }
+
+    #[test]
+    fn menu_rules_per_status() {
+        use TrayStatus as T;
+        // (status, running, start, restart)
+        for (st, running, start, restart) in [
+            (T::NotInstalled, false, false, false),
+            (T::Stopped, false, true, false),
+            (T::Starting, true, false, true),
+            (T::Running(summary(false)), true, false, true),
+            (T::Degraded, true, false, true),
+            (T::Error("exit code 3".into()), false, true, true),
+        ] {
+            assert_eq!(st.is_running(), running, "{st:?}");
+            assert_eq!(st.can_start(), start, "{st:?}");
+            assert_eq!(st.can_restart(), restart, "{st:?}");
+        }
+    }
+
+    #[test]
+    fn release_label_counts_the_kept_displays() {
+        let with = |n| {
+            let mut s = summary(false);
+            s.kept_displays = n;
+            TrayStatus::Running(s).release_label()
+        };
+        assert_eq!(with(0), None);
+        assert_eq!(with(1).as_deref(), Some("Release kept display…"));
+        assert_eq!(with(3).as_deref(), Some("Release 3 kept displays…"));
+        assert_eq!(TrayStatus::Stopped.release_label(), None);
     }
 
     #[test]
