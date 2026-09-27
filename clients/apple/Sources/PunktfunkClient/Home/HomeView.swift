@@ -146,16 +146,6 @@ struct HomeView: View {
             #if !os(tvOS)
             .navigationTitle("Punktfunk")
             #endif
-            // Browse the LAN for advertised hosts only while the grid is up — not during a
-            // session. The home appears/disappears as the stream swaps in and out.
-            .onAppear { discovery.start() }
-            .onDisappear { discovery.stop() }
-            // Presence while the grid is up (`HostStore.keepPresence`); the `.task` is cancelled
-            // on disappear, matching `discovery.stop()`.
-            .task {
-                await store.keepPresence(
-                    discovery: discovery, power: hostPower, nowPlaying: nowPlaying)
-            }
             // The host page, from a card's ⓘ or its menu (design §2.4), and the speed test pushed
             // from it. The Mac opens both in the host's own window (`MacHostWindow`).
             #if !os(macOS)
@@ -564,5 +554,22 @@ extension View {
         #else
         self
         #endif
+    }
+}
+
+/// LAN browse and host presence for as long as the home is up, whichever tab or page shows.
+/// On the container, because a grid that owns them stops both when a tab or a push covers it.
+struct HomePresence: ViewModifier {
+    let store: HostStore
+    let discovery: HostDiscovery
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear { discovery.start() }
+            .onDisappear { discovery.stop() }
+            .task {
+                await store.keepPresence(
+                    discovery: discovery, power: .shared, nowPlaying: .shared)
+            }
     }
 }
