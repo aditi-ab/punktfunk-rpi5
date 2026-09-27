@@ -1,4 +1,4 @@
-//! Compiles `tests/c/harness.c`, links it to a freshly built `libpunktfunk_core.a`,
+//! Compiles `tests/c/harness.c`, links it to a freshly built `libpunktfunk_ffi.a`,
 //! and asserts a lossy-loopback frame round-trip. Canonical path is `tests/c/run.sh`;
 //! this mirrors it so `cargo test` alone covers the C boundary.
 
@@ -10,7 +10,7 @@ use std::process::Command;
 fn native_libs() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
         // Workspace `quic` pulls rustls's platform verifier (Security/CoreFoundation)
-        // and in-core Opus decode (`next_audio_pcm`), whose symbols `abi.rs` references.
+        // and in-core Opus decode (`next_audio_pcm`), whose symbols the ABI references.
         &[
             "-lopus",
             "-liconv",
@@ -47,10 +47,10 @@ fn ensure_staticlib(profile_dir: &Path) -> PathBuf {
         .join("c-abi-harness");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let _ = Command::new(cargo)
-        .args(["build", "-p", "punktfunk-core", "--features", "quic"])
+        .args(["build", "-p", "punktfunk-ffi", "--features", "quic"])
         .env("CARGO_TARGET_DIR", &nested)
         .status();
-    nested.join("debug").join("libpunktfunk_core.a")
+    nested.join("debug").join("libpunktfunk_ffi.a")
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn c_abi_harness_round_trips() {
     let staticlib = ensure_staticlib(&profile_dir);
     assert!(
         staticlib.exists(),
-        "staticlib not found at {} (run `cargo build -p punktfunk-core`)",
+        "staticlib not found at {} (run `cargo build -p punktfunk-ffi`)",
         staticlib.display()
     );
     assert!(

@@ -221,6 +221,8 @@ http-body-util = "0.1"
 h2 = "0.4"
 # Disposable directory fixtures for the Steam local-librarycache scan tests (library.rs).
 tempfile = "3"
+# The C ABI, driven from Rust by the native plane's connection round-trip tests (native.rs).
+punktfunk-ffi = { path = "../punktfunk-ffi", features = ["quic"] }
 
 # Opus encode for the host->client audio plane — stereo (`opus::Encoder`) AND 5.1/7.1 surround
 # (`opus::MSEncoder`, the safe multistream API the crate exposes; no `audiopus_sys` needed). The

@@ -73,7 +73,7 @@ pub fn audio_mute_notice(mask: u8, since: Duration) -> Option<&'static str> {
 /// The lossless plane negotiates shorter frames ([`pcm::frame_us_for`]); the resolved value is
 /// `audio_frame_us` on `Welcome`. Exported to C as `PUNKTFUNK_AUDIO_FRAME_MS` and kept at 5 —
 /// embedders size rings from it. Sizing as *frames × this* is wrong by up to 2.5× on lossless;
-/// drain [`crate::abi::punktfunk_connection_next_audio_pcm`] and use `frame_count` instead.
+/// drain `punktfunk_connection_next_audio_pcm` and use `frame_count` instead.
 pub const FRAME_MS: u32 = 5;
 
 /// Opus-plane sample rate, and the protocol default. Lossless negotiates via [`pcm`].

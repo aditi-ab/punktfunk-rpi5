@@ -3,13 +3,13 @@
 //! [`NativeClient::connect`] runs QUIC handshake ([`crate::quic`]), UDP data plane
 //! ([`crate::session::Session`] on a native thread), and input datagrams. The surface is
 //! pull reassembled access units, push input. Platform clients link via the C ABI
-//! (`punktfunk_connect` in [`crate::abi`]); `punktfunk-probe` is the Rust-native consumer.
+//! (`punktfunk_connect` in `punktfunk-ffi`); `punktfunk-probe` is the Rust-native consumer.
 //!
 //! One worker owns a tokio runtime (QUIC control plane only) plus a blocking data-plane
 //! pump. Frames cross to the embedder on a bounded channel. Methods are safe from any
 //! single embedder thread.
 
-// Carve-out with `abi`: thread ids and QoS pins, each with a `// SAFETY:` proof.
+// Carve-out: thread ids and QoS pins, each with a `// SAFETY:` proof.
 // Host code never runs this module.
 #![allow(unsafe_code)]
 
@@ -428,7 +428,7 @@ fn register_hot_tid(reg: &Mutex<Vec<i32>>) {
 ///
 /// Apple GUI processes have neither `COMPUTERNAME` nor `HOSTNAME` (`launchd` does not
 /// export the shell variable), so without `gethostname` every Apple client knocks as
-/// "This device". Pass a better name via [`crate::abi::punktfunk_connect_ex10`].
+/// "This device". Pass a better name via `punktfunk_connect_ex10`.
 pub fn device_name() -> String {
     #[cfg(target_os = "linux")]
     if let Ok(s) = std::fs::read_to_string("/etc/hostname") {

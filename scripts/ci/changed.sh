@@ -56,7 +56,7 @@ classify() {
             case "$path" in
                 .cargo/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|\
                 clients/linux/*|clients/session/*|clients/shared/*|\
-                crates/punktfunk-core/*|\
+                crates/punktfunk-core/*|crates/punktfunk-ffi/*|\
                 crates/pf-bitstream/*|crates/pf-client-core/*|crates/pf-console-ui/*|\
                 crates/pf-dxvadec/*|crates/pf-libva/*|crates/pf-presenter/*|\
                 crates/pf-update-check/*|crates/pf-vaapi/*|crates/pf-vkdecode/*|\

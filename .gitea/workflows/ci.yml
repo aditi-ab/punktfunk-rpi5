@@ -354,7 +354,7 @@ jobs:
           cargo test -p pf-encode --locked --features nvenc,vulkan-encode,pyrowave
 
       - name: C ABI harness (standalone link proof)
-        run: bash crates/punktfunk-core/tests/c/run.sh
+        run: bash crates/punktfunk-ffi/tests/c/run.sh
 
       - name: sccache stats (visibility only)
         run: sccache --show-stats
@@ -491,9 +491,9 @@ jobs:
       - name: Clippy for aarch64 (deny warnings)
         run: |
           cargo clippy --target aarch64-unknown-linux-gnu --all-targets --locked \
-            -p punktfunk-core -p pf-client-core -p pf-presenter -p pf-console-ui \
+            -p punktfunk-core -p punktfunk-ffi -p pf-client-core -p pf-presenter -p pf-console-ui \
             -p punktfunk-client-session -p punktfunk-client-linux \
-            -- -D warnings
+            --features punktfunk-ffi/quic -- -D warnings
 
       # The minimal embedded build — no Skia, no PyroWave — is what a small image installs, so
       # it has to keep compiling on its own, not just as a subset of the default features.

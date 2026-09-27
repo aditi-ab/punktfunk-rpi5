@@ -13,20 +13,28 @@
 //! Panics never cross: [`guard`] maps them to `PunktfunkStatus::Panic`;
 //! [`guard_void`] swallows teardown panics. Bare entry points cannot panic.
 //! Evidence: `include/punktfunk_core.h`.
+//!
+//! Everything behind the surface is `punktfunk-core`. This crate holds only the
+//! boundary, so core's Rust consumers never build the cdylib or staticlib.
 
-// Crate-denied `unsafe_code` (lib.rs). This `extern "C"` surface is a carve-out;
-// every `unsafe` site has a proof.
-#![allow(unsafe_code)]
+// An `unsafe fn` body still scopes each unsafe op in a block with its own proof.
+#![forbid(unsafe_op_in_unsafe_fn)]
 
-use crate::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
-use crate::crypto::SessionKey;
-use crate::error::PunktfunkStatus;
-use crate::input::InputEvent;
-use crate::reanchor::{AuAdmission, DecoderClass, GateVerdict, ReanchorGate};
-use crate::session::Session;
-use crate::stats::Stats;
-use crate::transport::{loopback_pair, Transport, UdpTransport};
+// The loopback host behind `punktfunk_demo_host_*`. Safe Rust, like core.
+/// cbindgen:ignore
+#[cfg(feature = "quic")]
+#[deny(unsafe_code)]
+pub mod demo_host;
+
 use pf_bitstream::h265::conceal::{Concealment, H265Concealer};
+use punktfunk_core::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
+use punktfunk_core::crypto::SessionKey;
+use punktfunk_core::error::PunktfunkStatus;
+use punktfunk_core::input::InputEvent;
+use punktfunk_core::reanchor::{AuAdmission, DecoderClass, GateVerdict, ReanchorGate};
+use punktfunk_core::session::Session;
+use punktfunk_core::stats::Stats;
+use punktfunk_core::transport::{loopback_pair, Transport, UdpTransport};
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
@@ -42,7 +50,7 @@ fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct PunktfunkSession {
     inner: Session,
     /// Last polled frame. [`PunktfunkFrame::data`] is valid until the next poll/free.
-    last_frame: Option<crate::session::Frame>,
+    last_frame: Option<punktfunk_core::session::Frame>,
     input_cb: Option<(PunktfunkInputCb, *mut c_void)>,
 }
 
@@ -207,7 +215,7 @@ unsafe fn put<T>(p: *mut T, v: T) {
 }
 
 /// `Ok(())` is `Ok`; an error is its status.
-fn status_of(r: crate::Result<()>) -> PunktfunkStatus {
+fn status_of(r: punktfunk_core::Result<()>) -> PunktfunkStatus {
     match r {
         Ok(()) => PunktfunkStatus::Ok,
         Err(e) => e.status(),
@@ -310,10 +318,10 @@ fn new_handle(session: Session) -> *mut PunktfunkSession {
     }))
 }
 
-/// Current ABI version. Mismatch with [`crate::ABI_VERSION`] is an incompatible core.
+/// Current ABI version. Mismatch with [`punktfunk_core::ABI_VERSION`] is an incompatible core.
 #[unsafe(no_mangle)]
 pub extern "C" fn punktfunk_abi_version() -> u32 {
-    crate::ABI_VERSION
+    punktfunk_core::ABI_VERSION
 }
 
 /// Log sink for [`punktfunk_set_log_callback`]. `level` 1..=5 (error…trace).
@@ -429,7 +437,7 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
         if macs.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        let Some(byte_len) = ffi_slice_bytes::<crate::wol::Mac>(mac_count) else {
+        let Some(byte_len) = ffi_slice_bytes::<punktfunk_core::wol::Mac>(mac_count) else {
             return PunktfunkStatus::InvalidArg;
         };
         if byte_len == 0 {
@@ -437,7 +445,7 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
         }
         // SAFETY: `ffi_slice_bytes` proved `mac_count` MACs fit a Rust slice; borrowed for this call.
         let bytes = unsafe { std::slice::from_raw_parts(macs, byte_len) };
-        let mac_vec: Vec<crate::wol::Mac> = bytes
+        let mac_vec: Vec<punktfunk_core::wol::Mac> = bytes
             .chunks_exact(6)
             .map(|c| {
                 let mut m = [0u8; 6];
@@ -451,7 +459,7 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
             .ok()
             .flatten()
             .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok());
-        match crate::wol::send_magic_packet(&mac_vec, ip) {
+        match punktfunk_core::wol::send_magic_packet(&mac_vec, ip) {
             Ok(()) => PunktfunkStatus::Ok,
             Err(_) => PunktfunkStatus::Io,
         }
@@ -659,7 +667,7 @@ unsafe fn read_input_event<'a>(ev: *const InputEvent) -> Result<&'a InputEvent, 
         return Err(PunktfunkStatus::NullPointer);
     }
     // SAFETY: non-null, readable; a one-byte read of the leading `kind` tag is valid for any value.
-    if crate::input::InputKind::from_u8(unsafe { ev.cast::<u8>().read() }).is_none() {
+    if punktfunk_core::input::InputKind::from_u8(unsafe { ev.cast::<u8>().read() }).is_none() {
         return Err(PunktfunkStatus::InvalidArg);
     }
     // SAFETY: discriminant validated; remaining fields are valid for any bit pattern.
@@ -754,19 +762,19 @@ pub unsafe extern "C" fn punktfunk_get_stats(
 /// One puller thread per plane; never two threads on the same plane.
 #[cfg(feature = "quic")]
 pub struct PunktfunkConnection {
-    inner: crate::client::NativeClient,
+    inner: punktfunk_core::client::NativeClient,
     /// Last `next_au` payload. Pointer valid until the next video pull.
-    last: std::sync::Mutex<Option<crate::session::Frame>>,
+    last: std::sync::Mutex<Option<punktfunk_core::session::Frame>>,
     /// Last `next_audio` payload. Independent of the video slot.
-    last_audio: std::sync::Mutex<Option<crate::client::AudioPacket>>,
+    last_audio: std::sync::Mutex<Option<punktfunk_core::client::AudioPacket>>,
     /// In-core PCM decode. Returned pointer valid until the next PCM call.
     audio_pcm: std::sync::Mutex<AudioPcmState>,
     /// Last clipboard payload. Pointer valid until the next `next_clipboard`.
     last_clip: std::sync::Mutex<Option<Vec<u8>>>,
     /// Last cursor RGBA. Pointer valid until the next cursor-shape call.
-    last_cursor_shape: std::sync::Mutex<Option<crate::quic::CursorShape>>,
+    last_cursor_shape: std::sync::Mutex<Option<punktfunk_core::quic::CursorShape>>,
     /// Stats overlay window as last drained; `hud_text` formats it at any tier.
-    hud_snap: std::sync::Mutex<crate::hud::StatsSnapshot>,
+    hud_snap: std::sync::Mutex<punktfunk_core::hud::StatsSnapshot>,
 }
 
 // Plane pullers and the demo host's callers use these handles from several threads at once.
@@ -779,19 +787,19 @@ const _: fn() = || {
 
 // Handshake-resolved audio format, read fresh each call; the host never changes it live.
 #[cfg(feature = "quic")]
-use crate::audio::plane::PlaneFormat as AudioFormat;
+use punktfunk_core::audio::plane::PlaneFormat as AudioFormat;
 
-/// In-core decode for either audio plane ([`crate::audio::plane::PlaneDecoder`]), plus the
+/// In-core decode for either audio plane ([`punktfunk_core::audio::plane::PlaneDecoder`]), plus the
 /// fixed buffer and drought bookkeeping the C surface needs on top.
 #[cfg(feature = "quic")]
 #[derive(Default)]
 struct AudioPcmState {
     /// Built on the first packet.
-    decoder: Option<crate::audio::plane::PlaneDecoder>,
+    decoder: Option<punktfunk_core::audio::plane::PlaneDecoder>,
     /// Interleaved f32. Sized once; growth would dangle the pointer handed to the embedder.
     pcm: Vec<f32>,
     /// Seq-gap tracker. Without it a lost packet is a hard click in the playout ring.
-    gaps: crate::audio::AudioGapTracker,
+    gaps: punktfunk_core::audio::AudioGapTracker,
     /// Last real decode's per-channel samples, the Opus PLC unit. 0 = nothing to size from.
     frame_samples: usize,
     /// PLC frames already given during a drought. Subtract so a later gap is not covered twice.
@@ -807,7 +815,7 @@ impl AudioPcmState {
         if !self.pcm.is_empty() {
             return;
         }
-        let run = crate::audio::max_conceal_packets(fmt.frame_us) as usize;
+        let run = punktfunk_core::audio::max_conceal_packets(fmt.frame_us) as usize;
         self.pcm = vec![0f32; (1 + run) * fmt.max_frame_samples().max(1)];
         // Cap the tracker at this same run. A larger cap would silently truncate frames.
         self.gaps.set_frame_us(fmt.frame_us);
@@ -823,7 +831,7 @@ impl AudioPcmState {
         fmt: AudioFormat,
     ) -> Result<usize, PunktfunkStatus> {
         if self.decoder.is_none() {
-            let dec = crate::audio::plane::PlaneDecoder::new(&fmt)
+            let dec = punktfunk_core::audio::plane::PlaneDecoder::new(&fmt)
                 .map_err(|_| PunktfunkStatus::Unsupported)?;
             self.ensure_buffer(fmt);
             self.decoder = Some(dec);
@@ -896,6 +904,9 @@ pub const PUNKTFUNK_HIDOUT_HID_RAW: u8 = 6;
 pub const PUNKTFUNK_HIDOUT_MIC_LED: u8 = 7;
 /// Capacity of `PunktfunkHidOutput::effect` (DualSense trigger parameter block).
 pub const PUNKTFUNK_HID_EFFECT_MAX: u8 = 11;
+// The wire clamps a trigger effect to this length; `effect` must hold it whole.
+const _: () =
+    assert!(PUNKTFUNK_HID_EFFECT_MAX as usize == punktfunk_core::quic::TRIGGER_EFFECT_MAX);
 
 /// HID-output feedback from the host virtual pad ([`punktfunk_connection_next_hidout`]).
 /// `kind` selects which fields to replay on the physical controller.
@@ -926,14 +937,14 @@ pub struct PunktfunkHidOutput {
     /// HidRaw: number of valid bytes in `raw` (≤ `PUNKTFUNK_HID_REPORT_MAX`).
     pub raw_len: u8,
     /// HidRaw report, id byte first. Feature frames may be zero-padded; sized off `HID_REPORT_MAX`.
-    pub raw: [u8; crate::quic::HID_REPORT_MAX],
+    pub raw: [u8; punktfunk_core::quic::HID_REPORT_MAX],
 }
 
 #[cfg(feature = "quic")]
 impl PunktfunkHidOutput {
-    /// Map every [`HidOutput`](crate::quic::HidOutput) variant. `HidRaw` uses `raw`/`hid_kind`.
-    fn from_hid(h: &crate::quic::HidOutput) -> PunktfunkHidOutput {
-        use crate::quic::HidOutput;
+    /// Map every [`HidOutput`](punktfunk_core::quic::HidOutput) variant. `HidRaw` uses `raw`/`hid_kind`.
+    fn from_hid(h: &punktfunk_core::quic::HidOutput) -> PunktfunkHidOutput {
+        use punktfunk_core::quic::HidOutput;
         let mut out = PunktfunkHidOutput {
             kind: 0,
             pad: 0,
@@ -946,7 +957,7 @@ impl PunktfunkHidOutput {
             effect: [0u8; 11],
             hid_kind: 0,
             raw_len: 0,
-            raw: [0u8; crate::quic::HID_REPORT_MAX],
+            raw: [0u8; punktfunk_core::quic::HID_REPORT_MAX],
         };
         match h {
             HidOutput::Led { pad, r, g, b } => {
@@ -1039,7 +1050,7 @@ pub struct PunktfunkHdrMeta {
 
 #[cfg(feature = "quic")]
 impl PunktfunkHdrMeta {
-    fn from_meta(m: &crate::quic::HdrMeta) -> PunktfunkHdrMeta {
+    fn from_meta(m: &punktfunk_core::quic::HdrMeta) -> PunktfunkHdrMeta {
         PunktfunkHdrMeta {
             display_primaries_x: [
                 m.display_primaries[0][0],
@@ -1114,8 +1125,8 @@ pub struct PunktfunkRichInput {
 
 #[cfg(feature = "quic")]
 impl PunktfunkRichInput {
-    fn to_rich(self) -> Option<crate::quic::RichInput> {
-        use crate::quic::RichInput;
+    fn to_rich(self) -> Option<punktfunk_core::quic::RichInput> {
+        use punktfunk_core::quic::RichInput;
         match self.kind {
             PUNKTFUNK_RICH_TOUCHPAD => Some(RichInput::Touchpad {
                 pad: self.pad,
@@ -1171,8 +1182,8 @@ pub struct PunktfunkRichInputEx {
 
 #[cfg(feature = "quic")]
 impl PunktfunkRichInputEx {
-    fn to_rich(self) -> Option<crate::quic::RichInput> {
-        use crate::quic::RichInput;
+    fn to_rich(self) -> Option<punktfunk_core::quic::RichInput> {
+        use punktfunk_core::quic::RichInput;
         match self.kind {
             PUNKTFUNK_RICH_TOUCHPAD_EX => Some(RichInput::TouchpadEx {
                 pad: self.pad,
@@ -1260,8 +1271,8 @@ pub struct PunktfunkPenSample {
 impl PunktfunkPenSample {
     /// `None` = invalid field (non-finite coordinate, unknown state bit, unknown tool).
     /// Embedder input is validated strictly, unlike the loss-tolerant wire decode.
-    fn to_sample(self) -> Option<crate::quic::PenSample> {
-        use crate::quic as q;
+    fn to_sample(self) -> Option<punktfunk_core::quic::PenSample> {
+        use punktfunk_core::quic as q;
         let known = q::PEN_IN_RANGE | q::PEN_TOUCHING | q::PEN_BARREL1 | q::PEN_BARREL2;
         if !self.x.is_finite() || !self.y.is_finite() || self.state & !known != 0 {
             return None;
@@ -1423,47 +1434,49 @@ pub const PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER: u8 = 0x02;
 // ABI cap bits must match the wire constants.
 #[cfg(feature = "quic")]
 const _: () = {
-    assert!(PUNKTFUNK_VIDEO_CAP_10BIT == crate::quic::VIDEO_CAP_10BIT);
-    assert!(PUNKTFUNK_VIDEO_CAP_HDR == crate::quic::VIDEO_CAP_HDR);
-    assert!(PUNKTFUNK_VIDEO_CAP_444 == crate::quic::VIDEO_CAP_444);
-    assert!(PUNKTFUNK_CODEC_H264 == crate::quic::CODEC_H264);
-    assert!(PUNKTFUNK_CODEC_HEVC == crate::quic::CODEC_HEVC);
-    assert!(PUNKTFUNK_CODEC_AV1 == crate::quic::CODEC_AV1);
-    assert!(PUNKTFUNK_CODEC_PYROWAVE == crate::quic::CODEC_PYROWAVE);
-    assert!(PUNKTFUNK_HOST_CAP_GAMEPAD_STATE == crate::quic::HOST_CAP_GAMEPAD_STATE);
-    assert!(PUNKTFUNK_HOST_CAP_CLIPBOARD == crate::quic::HOST_CAP_CLIPBOARD);
-    assert!(PUNKTFUNK_HOST_CAP_PEN == crate::quic::HOST_CAP_PEN);
-    assert!(PUNKTFUNK_HOST_CAP_PAD_AUDIO == crate::quic::HOST_CAP_PAD_AUDIO);
-    assert!(PUNKTFUNK_HOST_CAP_AUDIO_HIRES == crate::quic::HOST_CAP_AUDIO_HIRES);
-    assert!(PUNKTFUNK_HOST_CAP2_TOUCH == crate::quic::HOST_CAP2_TOUCH);
-    assert!(PUNKTFUNK_CLIENT_CAP_PAD_AUDIO == crate::quic::CLIENT_CAP_PAD_AUDIO);
-    assert!(PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES == crate::quic::CLIENT_CAP_AUDIO_HIRES);
-    assert!(PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO == crate::quic::CLIENT_CAP_KEEP_HOST_AUDIO);
-    assert!(PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS == crate::quic::PAD_AUDIO_KIND_HAPTICS);
-    assert!(PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER == crate::quic::PAD_AUDIO_KIND_SPEAKER);
+    assert!(PUNKTFUNK_VIDEO_CAP_10BIT == punktfunk_core::quic::VIDEO_CAP_10BIT);
+    assert!(PUNKTFUNK_VIDEO_CAP_HDR == punktfunk_core::quic::VIDEO_CAP_HDR);
+    assert!(PUNKTFUNK_VIDEO_CAP_444 == punktfunk_core::quic::VIDEO_CAP_444);
+    assert!(PUNKTFUNK_CODEC_H264 == punktfunk_core::quic::CODEC_H264);
+    assert!(PUNKTFUNK_CODEC_HEVC == punktfunk_core::quic::CODEC_HEVC);
+    assert!(PUNKTFUNK_CODEC_AV1 == punktfunk_core::quic::CODEC_AV1);
+    assert!(PUNKTFUNK_CODEC_PYROWAVE == punktfunk_core::quic::CODEC_PYROWAVE);
+    assert!(PUNKTFUNK_HOST_CAP_GAMEPAD_STATE == punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE);
+    assert!(PUNKTFUNK_HOST_CAP_CLIPBOARD == punktfunk_core::quic::HOST_CAP_CLIPBOARD);
+    assert!(PUNKTFUNK_HOST_CAP_PEN == punktfunk_core::quic::HOST_CAP_PEN);
+    assert!(PUNKTFUNK_HOST_CAP_PAD_AUDIO == punktfunk_core::quic::HOST_CAP_PAD_AUDIO);
+    assert!(PUNKTFUNK_HOST_CAP_AUDIO_HIRES == punktfunk_core::quic::HOST_CAP_AUDIO_HIRES);
+    assert!(PUNKTFUNK_HOST_CAP2_TOUCH == punktfunk_core::quic::HOST_CAP2_TOUCH);
+    assert!(PUNKTFUNK_CLIENT_CAP_PAD_AUDIO == punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO);
+    assert!(PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES == punktfunk_core::quic::CLIENT_CAP_AUDIO_HIRES);
+    assert!(
+        PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO == punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO
+    );
+    assert!(PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS == punktfunk_core::quic::PAD_AUDIO_KIND_HAPTICS);
+    assert!(PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER == punktfunk_core::quic::PAD_AUDIO_KIND_SPEAKER);
     // Setter cap bits are arrival flags 8/9 shifted down.
     assert!(
         (PUNKTFUNK_PAD_AUDIO_CAP_HAPTICS as u32) << 8
-            == crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS
+            == punktfunk_core::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS
     );
     assert!(
         (PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER as u32) << 8
-            == crate::input::ARRIVAL_FLAG_PAD_AUDIO_SPEAKER
+            == punktfunk_core::input::ARRIVAL_FLAG_PAD_AUDIO_SPEAKER
     );
-    assert!(PUNKTFUNK_PEN_IN_RANGE == crate::quic::PEN_IN_RANGE);
-    assert!(PUNKTFUNK_PEN_TOUCHING == crate::quic::PEN_TOUCHING);
-    assert!(PUNKTFUNK_PEN_BARREL1 == crate::quic::PEN_BARREL1);
-    assert!(PUNKTFUNK_PEN_BARREL2 == crate::quic::PEN_BARREL2);
-    assert!(PUNKTFUNK_PEN_BATCH_MAX as usize == crate::quic::PEN_BATCH_MAX);
-    assert!(PUNKTFUNK_PEN_TILT_UNKNOWN == crate::quic::PEN_TILT_UNKNOWN);
-    assert!(PUNKTFUNK_PEN_ANGLE_UNKNOWN == crate::quic::PEN_ANGLE_UNKNOWN);
-    assert!(PUNKTFUNK_PEN_DISTANCE_UNKNOWN == crate::quic::PEN_DISTANCE_UNKNOWN);
+    assert!(PUNKTFUNK_PEN_IN_RANGE == punktfunk_core::quic::PEN_IN_RANGE);
+    assert!(PUNKTFUNK_PEN_TOUCHING == punktfunk_core::quic::PEN_TOUCHING);
+    assert!(PUNKTFUNK_PEN_BARREL1 == punktfunk_core::quic::PEN_BARREL1);
+    assert!(PUNKTFUNK_PEN_BARREL2 == punktfunk_core::quic::PEN_BARREL2);
+    assert!(PUNKTFUNK_PEN_BATCH_MAX as usize == punktfunk_core::quic::PEN_BATCH_MAX);
+    assert!(PUNKTFUNK_PEN_TILT_UNKNOWN == punktfunk_core::quic::PEN_TILT_UNKNOWN);
+    assert!(PUNKTFUNK_PEN_ANGLE_UNKNOWN == punktfunk_core::quic::PEN_ANGLE_UNKNOWN);
+    assert!(PUNKTFUNK_PEN_DISTANCE_UNKNOWN == punktfunk_core::quic::PEN_DISTANCE_UNKNOWN);
 };
 
 // ABI gamepad constants must match the wire enum.
 const _: () = {
-    use crate::config::GamepadPref;
-    use crate::input::gamepad as g;
+    use punktfunk_core::config::GamepadPref;
+    use punktfunk_core::input::gamepad as g;
     assert!(PUNKTFUNK_GAMEPAD_AUTO == GamepadPref::Auto.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_XBOX360 == GamepadPref::Xbox360.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_DUALSENSE == GamepadPref::DualSense.to_u8() as u32);
@@ -1487,12 +1500,14 @@ const _: () = {
 };
 
 // No `struct_size`: growing these corrupts old callers. Additive kinds must not
-// grow them; a deliberate widen needs an [`crate::ABI_VERSION`] bump. RichInput
+// grow them; a deliberate widen needs an [`punktfunk_core::ABI_VERSION`] bump. RichInput
 // is frozen at 20. HidOutput is 19 + 2 + `HID_REPORT_MAX`.
 #[cfg(feature = "quic")]
 const _: () = {
     assert!(core::mem::size_of::<PunktfunkRichInput>() == 20);
-    assert!(core::mem::size_of::<PunktfunkHidOutput>() == 19 + 2 + crate::quic::HID_REPORT_MAX);
+    assert!(
+        core::mem::size_of::<PunktfunkHidOutput>() == 19 + 2 + punktfunk_core::quic::HID_REPORT_MAX
+    );
 };
 
 /// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 of the host
@@ -1962,7 +1977,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex9(
 }
 
 /// [`punktfunk_connect_ex9`] plus `device_name` — the label this device knocks
-/// with. NULL/empty = [`crate::client::device_name`]. Longer than
+/// with. NULL/empty = [`punktfunk_core::client::device_name`]. Longer than
 /// [`HELLO_NAME_MAX`] is truncated on a character boundary, not rejected.
 ///
 /// # Safety
@@ -2192,7 +2207,7 @@ fn clamp_device_name(s: &str) -> String {
     let end = s
         .char_indices()
         .map(|(i, c)| i + c.len_utf8())
-        .take_while(|&i| i <= crate::quic::HELLO_NAME_MAX)
+        .take_while(|&i| i <= punktfunk_core::quic::HELLO_NAME_MAX)
         .last()
         .unwrap_or(0);
     s[..end].to_string()
@@ -2201,7 +2216,7 @@ fn clamp_device_name(s: &str) -> String {
 /// Growable connect options for [`punktfunk_connect_opts`]. Zero-init, set
 /// `struct_size = sizeof(PunktfunkConnectOpts)`, then the fields you mean.
 /// Zero = auto/unspecified (`audio_rate_hz = 0` is Opus; a non-zero pair is
-/// lossless). Append only; no tail padding (sizes asserted in `abi.rs`); bump ABI.
+/// lossless). Append only; no tail padding (sizes asserted in `punktfunk-ffi`); bump ABI.
 #[cfg(feature = "quic")]
 #[repr(C)]
 pub struct PunktfunkConnectOpts {
@@ -2338,7 +2353,7 @@ fn legacy_opts() -> PunktfunkConnectOpts {
 /// What [`punktfunk_set_session_preset`] last named. Process-wide, so a connect whose opts name
 /// no preset reads it once, at entry, into that dial's own parameters.
 #[cfg(feature = "quic")]
-static SESSION_PRESET: std::sync::Mutex<Option<crate::quic::SessionPreset>> =
+static SESSION_PRESET: std::sync::Mutex<Option<punktfunk_core::quic::SessionPreset>> =
     std::sync::Mutex::new(None);
 
 /// Name the settings preset the next connect sends: its stable id and display name. The host
@@ -2359,7 +2374,7 @@ pub unsafe extern "C" fn punktfunk_set_session_preset(
     // SAFETY: null or NUL-terminated per the contract above.
     let preset = match unsafe { (opt_cstr(id), opt_cstr(name)) } {
         (Ok(Some(id)), name) => {
-            crate::quic::SessionPreset::new(id, name.ok().flatten().unwrap_or(""))
+            punktfunk_core::quic::SessionPreset::new(id, name.ok().flatten().unwrap_or(""))
         }
         _ => None,
     };
@@ -2392,19 +2407,19 @@ pub unsafe extern "C" fn punktfunk_connect_opts(
     observed_sha256_out: *mut u8,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
-    let set_status = |s: crate::error::PunktfunkStatus| {
+    let set_status = |s: punktfunk_core::error::PunktfunkStatus| {
         // SAFETY: the caller passes `status_out` null or writable for one value.
         unsafe { put(status_out, s as i32) };
     };
     if opts.is_null() {
-        set_status(crate::error::PunktfunkStatus::NullPointer);
+        set_status(punktfunk_core::error::PunktfunkStatus::NullPointer);
         return std::ptr::null_mut();
     }
     // Size prefix first; a shorter caller gets a zeroed tail, not a misread.
     // SAFETY: `addr_of!` does not form a `&`; the caller may have a different size.
     let declared = unsafe { std::ptr::addr_of!((*opts).struct_size).read_unaligned() } as usize;
     if declared < CONNECT_OPTS_MIN_SIZE {
-        set_status(crate::error::PunktfunkStatus::InvalidArg);
+        set_status(punktfunk_core::error::PunktfunkStatus::InvalidArg);
         return std::ptr::null_mut();
     }
     // Copy the known prefix over zeros so a shorter caller's missing tail stays unspecified.
@@ -2435,7 +2450,7 @@ unsafe fn connect_ex_impl(
     observed_sha256_out: *mut u8,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
-    let set_status = |s: crate::error::PunktfunkStatus| {
+    let set_status = |s: punktfunk_core::error::PunktfunkStatus| {
         // SAFETY: the caller passes `status_out` null or writable for one value.
         unsafe { put(status_out, s as i32) };
     };
@@ -2448,11 +2463,11 @@ unsafe fn connect_ex_impl(
                 return std::ptr::null_mut();
             }
         };
-        match crate::client::NativeClient::connect(params) {
+        match punktfunk_core::client::NativeClient::connect(params) {
             Ok(c) => {
                 // SAFETY: `observed_sha256_out` is null or writable for 32 bytes (caller contract).
                 unsafe { put_sha256(observed_sha256_out, c.host_fingerprint) };
-                set_status(crate::error::PunktfunkStatus::Ok);
+                set_status(punktfunk_core::error::PunktfunkStatus::Ok);
                 Box::into_raw(Box::new(PunktfunkConnection {
                     inner: c,
                     last: std::sync::Mutex::new(None),
@@ -2460,7 +2475,7 @@ unsafe fn connect_ex_impl(
                     audio_pcm: std::sync::Mutex::new(AudioPcmState::default()),
                     last_clip: std::sync::Mutex::new(None),
                     last_cursor_shape: std::sync::Mutex::new(None),
-                    hud_snap: std::sync::Mutex::new(crate::hud::StatsSnapshot::default()),
+                    hud_snap: std::sync::Mutex::new(punktfunk_core::hud::StatsSnapshot::default()),
                 }))
             }
             Err(e) => {
@@ -2470,7 +2485,7 @@ unsafe fn connect_ex_impl(
         }
     }));
     r.unwrap_or_else(|_| {
-        set_status(crate::error::PunktfunkStatus::Panic);
+        set_status(punktfunk_core::error::PunktfunkStatus::Panic);
         std::ptr::null_mut()
     })
 }
@@ -2483,7 +2498,7 @@ unsafe fn connect_ex_impl(
 #[cfg(feature = "quic")]
 unsafe fn connect_params(
     o: &PunktfunkConnectOpts,
-) -> Result<crate::client::ConnectParams, PunktfunkStatus> {
+) -> Result<punktfunk_core::client::ConnectParams, PunktfunkStatus> {
     // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
     let Ok(Some(host)) = (unsafe { opt_cstr(o.host) }) else {
         return Err(PunktfunkStatus::InvalidArg);
@@ -2497,15 +2512,15 @@ unsafe fn connect_params(
     // SAFETY: as above.
     let name = match unsafe { opt_cstr(o.device_name) } {
         Ok(Some(s)) if !s.trim().is_empty() => clamp_device_name(s.trim()),
-        _ => crate::client::device_name(),
+        _ => punktfunk_core::client::device_name(),
     };
     // Unrecognized = Auto must hold for the full u32 domain: `as u8` would wrap
     // 0x101 into a concrete choice before `from_u8`'s fallback could apply.
     let compositor = u8::try_from(o.compositor)
-        .map(crate::config::CompositorPref::from_u8)
+        .map(punktfunk_core::config::CompositorPref::from_u8)
         .unwrap_or_default();
     let gamepad = u8::try_from(o.gamepad)
-        .map(crate::config::GamepadPref::from_u8)
+        .map(punktfunk_core::config::GamepadPref::from_u8)
         .unwrap_or_default();
     let pin = if o.pin_sha256.is_null() {
         None
@@ -2528,25 +2543,25 @@ unsafe fn connect_params(
         Ok(Some(id)) => {
             // SAFETY: as above.
             let name = unsafe { opt_cstr(o.preset_name) }.ok().flatten();
-            crate::quic::SessionPreset::new(id, name.unwrap_or(""))
+            punktfunk_core::quic::SessionPreset::new(id, name.unwrap_or(""))
         }
         Err(()) => None,
     };
-    let mode = crate::config::Mode {
+    let mode = punktfunk_core::config::Mode {
         width: o.width,
         height: o.height,
         refresh_hz: o.refresh_hz,
     };
-    Ok(crate::client::ConnectParams {
+    Ok(punktfunk_core::client::ConnectParams {
         compositor,
         gamepad,
         bitrate_kbps: o.bitrate_kbps,
         video_caps: o.video_caps,
-        audio_channels: crate::audio::normalize_channels(o.audio_channels),
+        audio_channels: punktfunk_core::audio::normalize_channels(o.audio_channels),
         // Unvalidated on purpose: a bad rate is the host's to decline, not a failed connect.
         audio_rate_hz: o.audio_rate_hz,
         audio_bits: o.audio_bits,
-        video_fit: crate::video_fit::VideoFit::from_wire(o.video_fit),
+        video_fit: punktfunk_core::video_fit::VideoFit::from_wire(o.video_fit),
         video_codecs: o.video_codecs,
         preferred_codec: o.preferred_codec,
         // CLIENT_CAP_CURSOR: host stops compositing; only if the embedder draws the cursor.
@@ -2558,7 +2573,7 @@ unsafe fn connect_params(
         preset,
         // The rest stays default: Legacy coupling (embedders decode what the host answers),
         // no display volume, whole AUs (`PunktfunkFrame` cannot tell a part), no abort.
-        ..crate::client::ConnectParams::new(
+        ..punktfunk_core::client::ConnectParams::new(
             host,
             o.port,
             mode,
@@ -2587,7 +2602,7 @@ pub unsafe extern "C" fn punktfunk_generate_identity(
         if cert_pem_out.is_null() || key_pem_out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        let (cert, key) = match crate::quic::endpoint::generate_identity() {
+        let (cert, key) = match punktfunk_core::quic::endpoint::generate_identity() {
             Ok(t) => t,
             Err(_) => return PunktfunkStatus::Io,
         };
@@ -2628,7 +2643,7 @@ pub unsafe extern "C" fn punktfunk_probe(
         let Ok(Some(host)) = (unsafe { opt_cstr(host) }) else {
             return PunktfunkStatus::NullPointer;
         };
-        match crate::client::NativeClient::probe_identity(
+        match punktfunk_core::client::NativeClient::probe_identity(
             host,
             port,
             std::time::Duration::from_millis(timeout_ms as u64),
@@ -2681,7 +2696,7 @@ pub unsafe extern "C" fn punktfunk_pair(
         if host_sha256_out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        match crate::client::NativeClient::pair(
+        match punktfunk_core::client::NativeClient::pair(
             host,
             port,
             (cert, key),
@@ -2833,7 +2848,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_mute(
 
 /// Host-resolved audio channel count: `2` (stereo), `6` (5.1) or `8` (7.1).
 /// `*out` is filled when non-NULL. Raw `0xC9` Opus is encoded for this layout
-/// ([`crate::audio::layout_for`]); or use [`punktfunk_connection_next_audio_pcm`].
+/// ([`punktfunk_core::audio::layout_for`]); or use [`punktfunk_connection_next_audio_pcm`].
 /// Fixed until a reconfigure.
 ///
 /// # Safety
@@ -3309,7 +3324,7 @@ pub unsafe extern "C" fn punktfunk_connection_set_rumble_quirks(
     with_conn!(c => {
         c.inner.set_rumble_quirks(
             pad,
-            crate::client::ActuatorQuirks {
+            punktfunk_core::client::ActuatorQuirks {
                 keepalive_ms,
                 min_pulse_ms,
                 dedup_jitter: flags & PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER != 0,
@@ -3728,11 +3743,11 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
 
 /// Clamp `pad` to 16 and the report to `HID_REPORT_MAX` — same rules as the Android shim.
 #[cfg(feature = "quic")]
-fn hid_report_rich_input(pad: u8, report: &[u8]) -> crate::quic::RichInput {
-    let n = report.len().min(crate::quic::HID_REPORT_MAX);
-    let mut data = [0u8; crate::quic::HID_REPORT_MAX];
+fn hid_report_rich_input(pad: u8, report: &[u8]) -> punktfunk_core::quic::RichInput {
+    let n = report.len().min(punktfunk_core::quic::HID_REPORT_MAX);
+    let mut data = [0u8; punktfunk_core::quic::HID_REPORT_MAX];
     data[..n].copy_from_slice(&report[..n]);
-    crate::quic::RichInput::HidReport {
+    punktfunk_core::quic::RichInput::HidReport {
         pad: pad & 0xF,
         len: n as u8,
         data,
@@ -3761,7 +3776,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_hid_report(
         }
         // SAFETY: caller pointer/length; borrowed for this call only. The clamp copies.
         let report =
-            unsafe { std::slice::from_raw_parts(data, len.min(crate::quic::HID_REPORT_MAX)) };
+            unsafe { std::slice::from_raw_parts(data, len.min(punktfunk_core::quic::HID_REPORT_MAX)) };
         status_of(c.inner.send_rich_input(hid_report_rich_input(pad, report)))
     })
 }
@@ -3791,7 +3806,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_pen(
         }
         // SAFETY: caller pointer/length; borrowed for this call only.
         let raw = unsafe { std::slice::from_raw_parts(samples, count as usize) };
-        let mut batch = [crate::quic::PenSample::default(); crate::quic::PEN_BATCH_MAX];
+        let mut batch = [punktfunk_core::quic::PenSample::default(); punktfunk_core::quic::PEN_BATCH_MAX];
         for (slot, s) in batch.iter_mut().zip(raw) {
             match s.to_sample() {
                 Some(v) => *slot = v,
@@ -3911,10 +3926,10 @@ pub struct PunktfunkClipEvent {
 /// in `slot` (borrow-until-next-call) and pointing `data`/`len` at them.
 #[cfg(feature = "quic")]
 fn build_clip_event(
-    ev: crate::clipboard::ClipEventCore,
+    ev: punktfunk_core::clipboard::ClipEventCore,
     slot: &mut Option<Vec<u8>>,
 ) -> PunktfunkClipEvent {
-    use crate::clipboard::ClipEventCore as E;
+    use punktfunk_core::clipboard::ClipEventCore as E;
     let mut out = PunktfunkClipEvent {
         kind: 0,
         enabled: 0,
@@ -4142,7 +4157,7 @@ pub unsafe extern "C" fn punktfunk_connection_end_reject(
 ) -> PunktfunkStatus {
     with_conn!(c => {
         let value = match c.inner.end_reject() {
-            Some(reason) => crate::error::PunktfunkError::Rejected(reason).status() as i32,
+            Some(reason) => punktfunk_core::error::PunktfunkError::Rejected(reason).status() as i32,
             None => 0,
         };
         // SAFETY: the caller passes `status` null or writable for one value.
@@ -4188,7 +4203,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
         if kinds.is_null() && n != 0 {
             return PunktfunkStatus::NullPointer;
         }
-        if n > crate::quic::CLIP_MAX_KINDS || ffi_slice_bytes::<PunktfunkClipKind>(n).is_none() {
+        if n > punktfunk_core::quic::CLIP_MAX_KINDS || ffi_slice_bytes::<PunktfunkClipKind>(n).is_none() {
             return PunktfunkStatus::InvalidArg;
         }
         let mut out = Vec::with_capacity(n);
@@ -4200,7 +4215,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
                 let Ok(mime) = (unsafe { opt_cstr(k.mime) }) else {
                     return PunktfunkStatus::InvalidArg;
                 };
-                out.push(crate::quic::ClipKind {
+                out.push(punktfunk_core::quic::ClipKind {
                     mime: mime.unwrap_or_default().to_string(),
                     size_hint: k.size_hint,
                 });
@@ -4395,7 +4410,7 @@ pub unsafe extern "C" fn punktfunk_connection_request_mode(
     refresh_hz: u32,
 ) -> PunktfunkStatus {
     with_conn!(c => {
-        status_of(c.inner.request_mode(crate::config::Mode {
+        status_of(c.inner.request_mode(punktfunk_core::config::Mode {
             width,
             height,
             refresh_hz,
@@ -4536,9 +4551,9 @@ const _: () = assert!(core::mem::size_of::<PunktfunkHudFacts>() == 32);
 /// NUL-terminated or null.
 #[cfg(feature = "quic")]
 unsafe fn hud_with_facts(
-    mut s: crate::hud::StatsSnapshot,
+    mut s: punktfunk_core::hud::StatsSnapshot,
     facts: *const PunktfunkHudFacts,
-) -> Result<crate::hud::StatsSnapshot, PunktfunkStatus> {
+) -> Result<punktfunk_core::hud::StatsSnapshot, PunktfunkStatus> {
     if facts.is_null() {
         return Ok(s);
     }
@@ -4577,11 +4592,11 @@ unsafe fn hud_with_facts(
     s.extras
         .extend(extras.unwrap_or_default().lines().filter_map(|line| {
             let (code, text) = line.split_once('\t')?;
-            Some(crate::hud::Extra {
+            Some(punktfunk_core::hud::Extra {
                 text: text.to_owned(),
-                tier: crate::hud::StatsVerbosity::Detailed,
+                tier: punktfunk_core::hud::StatsVerbosity::Detailed,
                 advanced_only: true,
-                role: crate::hud::Role::from_code(code.parse().ok()?),
+                role: punktfunk_core::hud::Role::from_code(code.parse().ok()?),
             })
         }));
     Ok(s)
@@ -4690,8 +4705,8 @@ pub unsafe extern "C" fn punktfunk_connection_hud_text(
             Ok(s) => s,
             Err(status) => return status,
         };
-        let tier = crate::hud::StatsVerbosity::from_index(tier);
-        let text = crate::hud::encode_lines(&crate::hud::format(&snap, tier, advanced));
+        let tier = punktfunk_core::hud::StatsVerbosity::from_index(tier);
+        let text = punktfunk_core::hud::encode_lines(&punktfunk_core::hud::format(&snap, tier, advanced));
         // SAFETY: the caller passes `needed` null or writable for one value.
         unsafe { put(needed, text.len() + 1) };
         // SAFETY: `out` is null or writable for `cap` bytes, per this function's contract.
@@ -5289,8 +5304,10 @@ pub unsafe extern "C" fn punktfunk_au_admission_note(
         };
         let verdict = match concealed {
             PUNKTFUNK_CONCEALED_NONE => None,
-            PUNKTFUNK_CONCEALED_DECODABLE => Some(crate::reanchor::Concealment::Decodable),
-            PUNKTFUNK_CONCEALED_UNRECOVERABLE => Some(crate::reanchor::Concealment::Unrecoverable),
+            PUNKTFUNK_CONCEALED_DECODABLE => Some(punktfunk_core::reanchor::Concealment::Decodable),
+            PUNKTFUNK_CONCEALED_UNRECOVERABLE => {
+                Some(punktfunk_core::reanchor::Concealment::Unrecoverable)
+            }
             _ => return PunktfunkStatus::InvalidArg,
         };
         let class = if strict {
@@ -5531,11 +5548,11 @@ pub unsafe extern "C" fn punktfunk_demo_host_submit_video(
 
 #[cfg(test)]
 mod abi_version_tests {
-    /// Pin [`crate::ABI_VERSION`]. A bump must update this test in the same change.
+    /// Pin [`punktfunk_core::ABI_VERSION`]. A bump must update this test in the same change.
     #[test]
     fn abi_version_is_pinned() {
         // Current ABI. A bump must update this pin.
-        assert_eq!(crate::ABI_VERSION, 41);
+        assert_eq!(punktfunk_core::ABI_VERSION, 41);
         assert_eq!(super::punktfunk_abi_version(), 41);
     }
 
@@ -5557,7 +5574,7 @@ mod abi_version_tests {
         // readable-region precondition does not apply.
         let status =
             unsafe { super::punktfunk_wake_on_lan(pointer, usize::MAX / 6 + 1, std::ptr::null()) };
-        assert_eq!(status, crate::error::PunktfunkStatus::InvalidArg);
+        assert_eq!(status, punktfunk_core::error::PunktfunkStatus::InvalidArg);
     }
 }
 
@@ -5659,7 +5676,7 @@ mod tests {
         assert_eq!((s.audio_buffer_ms, s.av_offset_ms), (28, -3));
         assert_eq!(s.preset.as_deref(), Some("Work"));
         assert_eq!(s.extras.len(), 2);
-        assert_eq!(s.extras[1].role, crate::hud::Role::Warn);
+        assert_eq!(s.extras[1].role, punktfunk_core::hud::Role::Warn);
         assert!(s.extras.iter().all(|e| e.advanced_only));
         f.struct_size = 8;
         // SAFETY: as above; the short size is the documented rejected case.
@@ -5726,16 +5743,19 @@ mod tests {
         unsafe { punktfunk_set_session_preset(c"old".as_ptr(), std::ptr::null()) };
         // SAFETY: every pointer field is null or a live C-string literal.
         let p = unsafe { connect_params(&o) }.unwrap();
-        assert_eq!(p.video_fit, crate::video_fit::VideoFit::Crop);
+        assert_eq!(p.video_fit, punktfunk_core::video_fit::VideoFit::Crop);
         assert_eq!(
             p.preset,
-            crate::quic::SessionPreset::new("dock-1", "Docked")
+            punktfunk_core::quic::SessionPreset::new("dock-1", "Docked")
         );
 
         o.preset_id = std::ptr::null();
         // SAFETY: as above.
         let p = unsafe { connect_params(&o) }.unwrap();
-        assert_eq!(p.preset, crate::quic::SessionPreset::new("old", ""));
+        assert_eq!(
+            p.preset,
+            punktfunk_core::quic::SessionPreset::new("old", "")
+        );
         // SAFETY: null `id` clears the fallback.
         unsafe { punktfunk_set_session_preset(std::ptr::null(), std::ptr::null()) };
     }
@@ -5828,7 +5848,7 @@ mod tests {
     /// Truncation lands on a character boundary; `s[..HELLO_NAME_MAX]` would panic mid-scalar.
     #[test]
     fn device_name_truncates_on_a_character_boundary() {
-        let max = crate::quic::HELLO_NAME_MAX;
+        let max = punktfunk_core::quic::HELLO_NAME_MAX;
         assert_eq!(clamp_device_name("Enrico's iPad"), "Enrico's iPad");
 
         // Straddling: 2-byte characters over an odd-length prefix, so the cap lands mid-scalar.
@@ -5865,13 +5885,13 @@ mod tests {
         unsafe { p.cast::<u8>().write(0) };
         // SAFETY: as above.
         let ev = unsafe { read_input_event(p) }.expect("valid tag must pass");
-        assert_eq!(ev.kind, crate::input::InputKind::KeyDown);
+        assert_eq!(ev.kind, punktfunk_core::input::InputKind::KeyDown);
     }
 
     /// AudioCtl packs as kind 5, `which` = flags, `effect[0..6]`, `effect_len = 6`.
     #[test]
     fn hidout_abi_maps_audio_ctl() {
-        let out = PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::AudioCtl {
+        let out = PunktfunkHidOutput::from_hid(&punktfunk_core::quic::HidOutput::AudioCtl {
             pad: 3,
             flags: 0x17,
             raw: [0x50, 0x60, 0x70, 0x05, 0, 0],
@@ -5888,7 +5908,10 @@ mod tests {
     /// MicLed maps to kind 7 with the mode in `which`.
     #[test]
     fn hidout_abi_maps_mic_led() {
-        let out = PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::MicLed { pad: 2, mode: 2 });
+        let out = PunktfunkHidOutput::from_hid(&punktfunk_core::quic::HidOutput::MicLed {
+            pad: 2,
+            mode: 2,
+        });
         assert_eq!(out.kind, PUNKTFUNK_HIDOUT_MIC_LED);
         assert_eq!(out.pad, 2);
         assert_eq!(out.which, 2);
@@ -5900,32 +5923,35 @@ mod tests {
     fn hidout_abi_maps_hid_raw() {
         // OUTPUT report (id 0x80), host-trimmed to its declared 10 bytes.
         let rumble: Vec<u8> = vec![0x80, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
-        let out = PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::HidRaw {
+        let out = PunktfunkHidOutput::from_hid(&punktfunk_core::quic::HidOutput::HidRaw {
             pad: 2,
-            kind: crate::quic::HID_RAW_OUTPUT,
+            kind: punktfunk_core::quic::HID_RAW_OUTPUT,
             data: rumble.clone(),
         });
         assert_eq!(out.kind, PUNKTFUNK_HIDOUT_HID_RAW);
         assert_eq!(out.pad, 2);
-        assert_eq!(out.hid_kind, crate::quic::HID_RAW_OUTPUT);
+        assert_eq!(out.hid_kind, punktfunk_core::quic::HID_RAW_OUTPUT);
         assert_eq!(out.raw_len, 10);
         assert_eq!(out.raw[..10], rumble[..]);
-        assert_eq!(out.raw[10..], [0; crate::quic::HID_REPORT_MAX - 10]);
+        assert_eq!(
+            out.raw[10..],
+            [0; punktfunk_core::quic::HID_REPORT_MAX - 10]
+        );
         // The other fields stay zero — `kind` alone says which ones are meaningful.
         assert_eq!(out.effect_len, 0);
 
         // A FEATURE frame arrives whole (zero-padded) and must round-trip whole;
         // anything longer clamps instead of overrunning.
-        let mut lizard = vec![0u8; crate::quic::HID_REPORT_MAX + 8];
+        let mut lizard = vec![0u8; punktfunk_core::quic::HID_REPORT_MAX + 8];
         lizard[..6].copy_from_slice(&[0x01, 0x87, 0x03, 0x09, 0x00, 0x00]);
-        let out = PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::HidRaw {
+        let out = PunktfunkHidOutput::from_hid(&punktfunk_core::quic::HidOutput::HidRaw {
             pad: 0,
-            kind: crate::quic::HID_RAW_FEATURE,
+            kind: punktfunk_core::quic::HID_RAW_FEATURE,
             data: lizard.clone(),
         });
-        assert_eq!(out.hid_kind, crate::quic::HID_RAW_FEATURE);
-        assert_eq!(out.raw_len as usize, crate::quic::HID_REPORT_MAX);
-        assert_eq!(out.raw[..], lizard[..crate::quic::HID_REPORT_MAX]);
+        assert_eq!(out.hid_kind, punktfunk_core::quic::HID_RAW_FEATURE);
+        assert_eq!(out.raw_len as usize, punktfunk_core::quic::HID_REPORT_MAX);
+        assert_eq!(out.raw[..], lizard[..punktfunk_core::quic::HID_REPORT_MAX]);
     }
 
     /// `punktfunk_connection_send_hid_report`'s clamp: `pad` masked to 16 and the
@@ -5937,21 +5963,21 @@ mod tests {
         state[0] = 0x45;
         state[1] = 0xE5; // seq
         match hid_report_rich_input(3, &state) {
-            crate::quic::RichInput::HidReport { pad, len, data } => {
+            punktfunk_core::quic::RichInput::HidReport { pad, len, data } => {
                 assert_eq!(pad, 3);
                 assert_eq!(len, 46);
                 assert_eq!(data[..46], state[..]);
-                assert_eq!(data[46..], [0; crate::quic::HID_REPORT_MAX - 46]);
+                assert_eq!(data[46..], [0; punktfunk_core::quic::HID_REPORT_MAX - 46]);
             }
             other => panic!("expected HidReport, got {other:?}"),
         }
         // Oversize input truncates to the wire body; a pad above the wire space wraps into it.
         let big = vec![0xAB; 100];
         match hid_report_rich_input(0x17, &big) {
-            crate::quic::RichInput::HidReport { pad, len, data } => {
+            punktfunk_core::quic::RichInput::HidReport { pad, len, data } => {
                 assert_eq!(pad, 0x7);
-                assert_eq!(len as usize, crate::quic::HID_REPORT_MAX);
-                assert_eq!(data, [0xAB; crate::quic::HID_REPORT_MAX]);
+                assert_eq!(len as usize, punktfunk_core::quic::HID_REPORT_MAX);
+                assert_eq!(data, [0xAB; punktfunk_core::quic::HID_REPORT_MAX]);
             }
             other => panic!("expected HidReport, got {other:?}"),
         }
@@ -5960,26 +5986,27 @@ mod tests {
     /// Opus on `0xC9`, 48 kHz, 16-bit, stereo — what an embedder that does not call
     /// `punktfunk_connect_ex11` still gets.
     const OPUS_48K: AudioFormat = AudioFormat {
-        codec: crate::quic::AUDIO_CODEC_OPUS,
-        rate_hz: crate::audio::SAMPLE_RATE_HZ,
-        bits: crate::audio::pcm::BITS_16,
+        codec: punktfunk_core::quic::AUDIO_CODEC_OPUS,
+        rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
+        bits: punktfunk_core::audio::pcm::BITS_16,
         channels: 2,
-        frame_us: crate::audio::FRAME_MS * 1000,
+        frame_us: punktfunk_core::audio::FRAME_MS * 1000,
         layout: 0,
     };
 
     /// Lossless session at 48 kHz / 24-bit.
     const PCM_48K_24: AudioFormat = AudioFormat {
-        codec: crate::quic::AUDIO_CODEC_PCM,
-        rate_hz: crate::audio::SAMPLE_RATE_HZ,
-        bits: crate::audio::pcm::BITS_24,
+        codec: punktfunk_core::quic::AUDIO_CODEC_PCM,
+        rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
+        bits: punktfunk_core::audio::pcm::BITS_24,
         channels: 2,
-        frame_us: crate::audio::pcm::FRAME_US_LADDER[0],
+        frame_us: punktfunk_core::audio::pcm::FRAME_US_LADDER[0],
         layout: 0,
     };
 
     /// Concealment run a 5 ms session owes: ten frames (50 ms cap).
-    const CONCEAL_RUN: u32 = crate::audio::max_conceal_packets(crate::audio::FRAME_MS * 1000);
+    const CONCEAL_RUN: u32 =
+        punktfunk_core::audio::max_conceal_packets(punktfunk_core::audio::FRAME_MS * 1000);
 
     /// One `0xD3` payload of `n` interleaved stereo samples at `bits`, from a
     /// deterministic ramp so any stride or sign-extension error is visible.
@@ -5989,18 +6016,21 @@ mod tests {
             samples.push((i as f32 / n as f32) * 1.8 - 0.9);
         }
         let mut wire = Vec::new();
-        crate::audio::pcm::from_f32(&samples, bits, &mut wire);
+        punktfunk_core::audio::pcm::from_f32(&samples, bits, &mut wire);
         // Quantised once, so the expectation is what the wire carries rather than the
         // pre-quantisation floats.
         let mut expect = Vec::new();
-        crate::audio::pcm::to_f32(&wire, bits, &mut expect).expect("whole samples");
+        punktfunk_core::audio::pcm::to_f32(&wire, bits, &mut expect).expect("whole samples");
         (expect, wire)
     }
 
     /// PCM decode is bit-exact at the ABI boundary.
     #[test]
     fn the_pcm_plane_decodes_bit_exactly() {
-        for bits in [crate::audio::pcm::BITS_16, crate::audio::pcm::BITS_24] {
+        for bits in [
+            punktfunk_core::audio::pcm::BITS_16,
+            punktfunk_core::audio::pcm::BITS_24,
+        ] {
             let fmt = AudioFormat { bits, ..PCM_48K_24 };
             // 5 ms at 48 kHz stereo — the longest rung of the ladder.
             let (expect, wire) = pcm_frame(240 * 2, bits);
@@ -6024,7 +6054,7 @@ mod tests {
     /// real one (`design/hi-res-audio.md`).
     #[test]
     fn a_missing_pcm_frame_is_concealed_without_libopus() {
-        let bits = crate::audio::pcm::BITS_24;
+        let bits = punktfunk_core::audio::pcm::BITS_24;
         let (expect, wire) = pcm_frame(240 * 2, bits);
         let mut state = AudioPcmState::default();
         assert_eq!(state.decode_packet(&wire, 0, PCM_48K_24), Ok(expect.len()));
@@ -6093,7 +6123,7 @@ mod tests {
     #[test]
     fn a_torn_pcm_datagram_is_refused_not_shifted() {
         let mut state = AudioPcmState::default();
-        let (_, wire) = pcm_frame(240 * 2, crate::audio::pcm::BITS_24);
+        let (_, wire) = pcm_frame(240 * 2, punktfunk_core::audio::pcm::BITS_24);
         assert_eq!(
             state.decode_packet(&wire[..wire.len() - 1], 0, PCM_48K_24),
             Err(PunktfunkStatus::BadPacket)
@@ -6119,7 +6149,7 @@ mod tests {
     /// `PcmConceal` is never involved.
     #[test]
     fn an_opus_session_is_unaffected_by_the_lossless_plane() {
-        let l = crate::audio::LAYOUT_STEREO;
+        let l = punktfunk_core::audio::LAYOUT_STEREO;
         let mut enc = opus::MSEncoder::new(
             48_000,
             l.streams,
@@ -6147,7 +6177,7 @@ mod tests {
         assert_eq!(state.conceal(OPUS_48K), Ok(240 * 2));
 
         // Accessors report 48 kHz / 16-bit, matching `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`.
-        assert_eq!(OPUS_48K.rate_hz, crate::audio::SAMPLE_RATE_HZ);
+        assert_eq!(OPUS_48K.rate_hz, punktfunk_core::audio::SAMPLE_RATE_HZ);
         assert!(!OPUS_48K.is_pcm());
     }
 
@@ -6184,11 +6214,11 @@ mod tests {
             frame_us: 2_000,
             ..PCM_48K_24
         };
-        let run = crate::audio::max_conceal_packets(short.frame_us);
+        let run = punktfunk_core::audio::max_conceal_packets(short.frame_us);
         assert_eq!(run, 25, "50 ms of 2 ms frames");
 
         // 2 ms at 44 100 Hz stereo: 88 samples per channel, not 88.2.
-        let frame = crate::audio::pcm::samples_per_frame(44_100, 2_000, 2);
+        let frame = punktfunk_core::audio::pcm::samples_per_frame(44_100, 2_000, 2);
         assert_eq!(frame, 176);
         let (expect, wire) = pcm_frame(frame, short.bits);
 
@@ -6215,7 +6245,7 @@ mod tests {
     #[test]
     fn audio_pcm_decode_conceals_seq_gaps() {
         const FRAME: usize = 240; // 5 ms @ 48 kHz, per channel
-        let l = crate::audio::LAYOUT_STEREO;
+        let l = punktfunk_core::audio::LAYOUT_STEREO;
         let mut enc = opus::MSEncoder::new(
             48_000,
             l.streams,
@@ -6276,7 +6306,7 @@ mod tests {
     #[test]
     fn drought_concealment_is_not_charged_again_by_the_loss_path() {
         const FRAME: usize = 240; // 5 ms @ 48 kHz, per channel
-        let l = crate::audio::LAYOUT_STEREO;
+        let l = punktfunk_core::audio::LAYOUT_STEREO;
         let mut enc = opus::MSEncoder::new(
             48_000,
             l.streams,

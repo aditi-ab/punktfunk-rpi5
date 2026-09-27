@@ -6,7 +6,7 @@ Punktfunk is the client half of a two-part system: it streams from a host on the
 Guideline 2.1(a) asks for a way to exercise every feature, and a reviewer has no such PC. Build
 0.37.0 was rejected on exactly that (September 14, 2026), with no notes attached.
 
-The app answers it with a **built-in demo host** (`Home/DemoMode.swift`, core `demo_host.rs`): a
+The app answers it with a **built-in demo host** (`Home/DemoMode.swift`, `punktfunk-ffi`'s `demo_host.rs`): a
 real `punktfunk/1` host on `127.0.0.1` inside the app. It renders a live desktop that reacts to
 every input, encodes it with VideoToolbox and streams it through the same connect, decode, audio,
 HUD and input path a real PC uses.

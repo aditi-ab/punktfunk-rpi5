@@ -3174,7 +3174,7 @@ mod tests {
     }
 
     /// Pull and byte-verify `count` synthetic frames through the C ABI connection.
-    unsafe fn pull_verified(conn: *mut punktfunk_core::abi::PunktfunkConnection, count: u32) {
+    unsafe fn pull_verified(conn: *mut punktfunk_ffi::PunktfunkConnection, count: u32) {
         use punktfunk_core::error::PunktfunkStatus;
         let mut got = 0u32;
         // SAFETY: `PunktfunkFrame` is `#[repr(C)]` POD; all-zero is valid (null `data`, `len == 0`).
@@ -3184,9 +3184,7 @@ mod tests {
             // SAFETY: `conn` is the live handle from `punktfunk_connect` (caller asserts non-null,
             // does not close until after return). `&mut frame` outlives this call. This thread is
             // the only video puller.
-            match unsafe {
-                punktfunk_core::abi::punktfunk_connection_next_au(conn, &mut frame, 2000)
-            } {
+            match unsafe { punktfunk_ffi::punktfunk_connection_next_au(conn, &mut frame, 2000) } {
                 PunktfunkStatus::Ok => {
                     // SAFETY: on `Ok`, `frame.data`/`len` is the connection-owned AU, valid until the
                     // next `next_au` on this handle. We read the whole slice before that next call.
@@ -3218,11 +3216,11 @@ mod tests {
     fn c_abi_connection_roundtrip() {
         let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        use punktfunk_core::abi::{
+        use punktfunk_core::error::PunktfunkStatus;
+        use punktfunk_ffi::{
             punktfunk_connect, punktfunk_connection_close, punktfunk_connection_mode,
             punktfunk_connection_send_input,
         };
-        use punktfunk_core::error::PunktfunkStatus;
 
         let host = std::thread::spawn(|| {
             run_ephemeral(Punktfunk1Options {
@@ -3276,9 +3274,7 @@ mod tests {
 
         // Mid-stream renegotiation: request a new mode; `punktfunk_connection_mode` reflects it.
         // SAFETY: `conn` is the live handle; remaining args are by-value. Handle outlives enqueue.
-        let st = unsafe {
-            punktfunk_core::abi::punktfunk_connection_request_mode(conn, 1920, 1080, 144)
-        };
+        let st = unsafe { punktfunk_ffi::punktfunk_connection_request_mode(conn, 1920, 1080, 144) };
         assert_eq!(st, PunktfunkStatus::Ok);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {

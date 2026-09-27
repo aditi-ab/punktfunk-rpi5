@@ -3756,7 +3756,7 @@ version = "0.40.0"
 dependencies = [
  "pf-client-core",
  "pf-console-ui",
- "punktfunk-core",
+ "punktfunk-ffi",
  "serde",
  "serde_json",
  "skia-safe",
@@ -3818,7 +3818,6 @@ dependencies = [
  "hmac 0.13.0",
  "if-addrs",
  "libc",
- "log",
  "opus",
  "pf-bitstream",
  "proptest",
@@ -3848,6 +3847,21 @@ dependencies = [
  "pf-encode",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "punktfunk-ffi"
+version = "0.40.0"
+dependencies = [
+ "log",
+ "opus",
+ "pf-bitstream",
+ "punktfunk-core",
+ "quinn",
+ "rand 0.9.5",
+ "rcgen",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3893,6 +3907,7 @@ dependencies = [
  "pf-zerocopy",
  "pipewire",
  "punktfunk-core",
+ "punktfunk-ffi",
  "quinn",
  "rand 0.9.5",
  "rcgen",

@@ -5,9 +5,9 @@
 #   bash scripts/build-xcframework.sh
 #
 # Output: clients/apple/PunktfunkCore.xcframework (consumed by clients/apple/Package.swift).
-# The library is clients/apple/native: punktfunk-core WITH the `quic` feature (the punktfunk/1
-# connection API), so the bundled header gets PUNKTFUNK_FEATURE_QUIC pre-defined, plus the Skia
-# console (`punktfunk_console.h`).
+# The library is clients/apple/native: the C ABI (punktfunk-ffi) WITH the `quic` feature (the
+# punktfunk/1 connection API), so the bundled header gets PUNKTFUNK_FEATURE_QUIC pre-defined, plus
+# the Skia console (`punktfunk_console.h`).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # CI points CARGO_TARGET_DIR at a dir that outlives the job (scripts/ci/mac-cargo-target.sh).

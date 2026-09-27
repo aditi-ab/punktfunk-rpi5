@@ -94,6 +94,7 @@ on:
     branches: [main]
     paths:
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
       - 'crates/pf-console-ui/**'
       - 'crates/pf-client-core/**'
       - 'crates/pf-bitstream/**'
@@ -116,6 +117,7 @@ on:
   pull_request:
     paths:
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
       - 'crates/pf-console-ui/**'
       - 'crates/pf-client-core/**'
       - 'crates/pf-bitstream/**'

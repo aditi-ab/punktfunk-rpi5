@@ -9,17 +9,17 @@
 //! [`DemoHost::next_input`] so the picture can answer it. Audio is Opus silence with a short
 //! chime on each press.
 
-use crate::audio::{LAYOUT_STEREO, SAMPLE_RATE_HZ};
-use crate::config::{CompositorPref, FecConfig, FecScheme, Mode, Role};
-use crate::error::{PunktfunkError, Result};
-use crate::input::{GamepadSnapshot, InputEvent, InputKind, INPUT_MAGIC};
-use crate::packet::{FLAG_PIC, FLAG_SOF};
-use crate::quic::{
+use punktfunk_core::audio::{LAYOUT_STEREO, SAMPLE_RATE_HZ};
+use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, Mode, Role};
+use punktfunk_core::error::{PunktfunkError, Result};
+use punktfunk_core::input::{GamepadSnapshot, InputEvent, InputKind, INPUT_MAGIC};
+use punktfunk_core::packet::{FLAG_PIC, FLAG_SOF};
+use punktfunk_core::quic::{
     self, endpoint, io, wall_clock_ns, ClockEcho, ClockProbe, Hello, Reconfigure, Reconfigured,
     RequestKeyframe, RfiRequest, Start, Welcome,
 };
-use crate::session::Session;
-use crate::transport::UdpTransport;
+use punktfunk_core::session::Session;
+use punktfunk_core::transport::UdpTransport;
 use rand::RngCore;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -91,7 +91,7 @@ impl DemoHost {
             .build()?;
         let cert = rcgen::generate_simple_self_signed(vec!["punktfunk".into()])
             .map_err(|_| PunktfunkError::Crypto)?;
-        let fingerprint = crate::tls::cert_fingerprint(cert.cert.der());
+        let fingerprint = punktfunk_core::tls::cert_fingerprint(cert.cert.der());
         let endpoint = {
             let _rt = rt.enter();
             endpoint::server_with_identity(
@@ -236,7 +236,7 @@ async fn serve(conn: &quinn::Connection, shared: &Arc<Shared>, codecs: u8) -> Re
     rand::rng().fill_bytes(&mut key);
     rand::rng().fill_bytes(&mut salt);
     let welcome = Welcome {
-        abi_version: crate::WIRE_VERSION,
+        abi_version: punktfunk_core::WIRE_VERSION,
         udp_port: data_sock.local_addr()?.port(),
         mode,
         fec: FecConfig {
@@ -268,7 +268,7 @@ async fn serve(conn: &quinn::Connection, shared: &Arc<Shared>, codecs: u8) -> Re
         key_chacha: None,
         audio_codec: quic::AUDIO_CODEC_OPUS,
         audio_rate_hz: SAMPLE_RATE_HZ,
-        audio_bits: crate::audio::pcm::BITS_16,
+        audio_bits: punktfunk_core::audio::pcm::BITS_16,
         audio_frame_us: 0,
         host_caps2: 0,
         audio_layout: 0,
@@ -319,7 +319,7 @@ fn send_video(
     sock: UdpSocket,
     fallback: SocketAddr,
     peer: IpAddr,
-    config: crate::config::Config,
+    config: punktfunk_core::config::Config,
     rx: mpsc::Receiver<(Vec<u8>, bool)>,
 ) -> Result<()> {
     let (transport, _) =
@@ -518,18 +518,19 @@ mod tests {
             height: 720,
             refresh_hz: 60,
         };
-        let client = crate::client::NativeClient::connect(crate::client::ConnectParams {
-            video_codecs: quic::CODEC_H264 | quic::CODEC_HEVC,
-            launch: Some("custom:aurora".into()),
-            pin: Some(host.fingerprint()),
-            ..crate::client::ConnectParams::new(
-                "127.0.0.1",
-                host.port(),
-                mode,
-                Duration::from_secs(10),
-            )
-        })
-        .expect("connect");
+        let client =
+            punktfunk_core::client::NativeClient::connect(punktfunk_core::client::ConnectParams {
+                video_codecs: quic::CODEC_H264 | quic::CODEC_HEVC,
+                launch: Some("custom:aurora".into()),
+                pin: Some(host.fingerprint()),
+                ..punktfunk_core::client::ConnectParams::new(
+                    "127.0.0.1",
+                    host.port(),
+                    mode,
+                    Duration::from_secs(10),
+                )
+            })
+            .expect("connect");
         let session = host.session().expect("a live session");
         assert_eq!(session.codec, quic::CODEC_H264);
         assert_eq!(session.launch.as_deref(), Some("custom:aurora"));

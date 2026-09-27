@@ -1,7 +1,7 @@
 /*
- * punktfunk-core C ABI harness — M1 acceptance.
+ * punktfunk C ABI harness — M1 acceptance.
  *
- * Proves the core links from C and round-trips encoded access units through the full
+ * Proves the C ABI links from C and round-trips encoded access units through the full
  * packetize -> FEC -> in-process loopback (with deterministic packet loss) -> FEC
  * recover -> reassemble path, recovering every byte exactly.
  *
@@ -31,7 +31,7 @@ static PunktfunkConfig make_config(uint32_t role, uint32_t drop_period) {
 }
 
 int main(void) {
-    printf("punktfunk-core C ABI harness (abi_version=%u)\n", punktfunk_abi_version());
+    printf("punktfunk C ABI harness (abi_version=%u)\n", punktfunk_abi_version());
 
     /* PunktfunkConnectOpts (v41): the C compiler must agree with Rust's const-asserted layout —
      * 120 bytes on 64-bit / 84 on 32-bit, NO tail padding (the growth contract: an appended field

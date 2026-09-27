@@ -70,6 +70,7 @@ on:
     paths:
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
       - 'crates/punktfunk-tray/**'
       - 'crates/pf-bitstream/**'
       - 'crates/pf-encode/**'
@@ -104,6 +105,7 @@ on:
     paths:
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
       - 'crates/punktfunk-tray/**'
       - 'crates/pf-bitstream/**'
       - 'crates/pf-encode/**'
