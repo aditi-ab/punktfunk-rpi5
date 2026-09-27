@@ -23,14 +23,10 @@ pub(crate) use pf_update_check::manifest;
 pub(crate) mod windows;
 
 use manifest::Manifest;
-use pf_update_check::{FeedError, PublicKey};
+use pf_update_check::{floor, FeedError};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
-/// Same Ed25519 signers the client trusts. A host that pinned a different set
-/// would accept a feed the client rejects (or the reverse).
-pub(crate) use pf_update_check::OFFICIAL_UPDATE_KEYS as UPDATE_KEYS;
 
 /// 6 h: long enough not to hammer the signed feed; status polls kick refresh.
 const AUTO_REFRESH_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
@@ -116,14 +112,6 @@ pub(crate) fn opt_in_hint() -> Option<String> {
     None
 }
 
-fn pinned_keys() -> Vec<PublicKey> {
-    UPDATE_KEYS
-        .iter()
-        .filter(|k| !k.is_empty())
-        .filter_map(|k| PublicKey::parse(k).ok())
-        .collect()
-}
-
 #[derive(Clone)]
 pub(crate) struct Checked {
     pub manifest: Manifest,
@@ -156,43 +144,15 @@ fn runtime() -> &'static Mutex<Runtime> {
     RT.get_or_init(|| Mutex::new(Runtime::default()))
 }
 
-/// Highest accepted manifest serial per channel. Persist this or a replayed
-/// older manifest becomes a silent downgrade of knowledge.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct FloorFile {
-    #[serde(default)]
-    serial_floor: std::collections::BTreeMap<String, u64>,
-}
-
+/// The [`floor`] file: highest accepted manifest serial per channel.
 fn state_path() -> PathBuf {
     pf_paths::config_dir().join("update-state.json")
 }
 
-fn load_floor(path: &Path, channel: &str) -> u64 {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<FloorFile>(&b).ok())
-        .and_then(|f| f.serial_floor.get(channel).copied())
-        .unwrap_or(0)
-}
-
-/// Raise (never lower) the floor through [`pf_paths::replace_file`]. Where that cannot work it
-/// writes in place, since an unraised floor lets a replayed older manifest through.
-fn store_floor(path: &Path, channel: &str, serial: u64) -> std::io::Result<()> {
-    let mut file: FloorFile = std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    let slot = file.serial_floor.entry(channel.to_string()).or_insert(0);
-    if serial <= *slot {
-        return Ok(());
-    }
-    *slot = serial;
-    let bytes = serde_json::to_vec_pretty(&file)?;
-    if pf_paths::replace_file(path, &bytes).is_ok() {
-        return Ok(());
-    }
-    std::fs::write(path, &bytes)
+/// The floor's write: [`pf_paths::replace_file`], else in place, since an unraised floor lets a
+/// replayed older manifest through.
+fn write_floor(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    pf_paths::replace_file(path, bytes).or_else(|_| std::fs::write(path, bytes))
 }
 
 /// Is a newer build out, for an install with no published artifact to compare?
@@ -209,7 +169,7 @@ fn fetch_manifest_blocking(channel: &str) -> Result<Manifest, FeedError> {
     pf_update_check::feed::fetch_manifest_blocking(
         &pf_update_check::feed::feed_base(),
         channel,
-        &pinned_keys(),
+        &pf_update_check::pinned_keys(),
         &format!("punktfunk-host/{} (update-check)", crate::version::get()),
     )
 }
@@ -225,14 +185,8 @@ pub(crate) fn refresh_blocking() -> Result<Checked, FeedError> {
     let behind: Option<u64> = None;
     let result = fetch_manifest_blocking(channel.as_str()).and_then(|m| {
         let path = state_path();
-        let floor = load_floor(&path, channel.as_str());
-        if m.serial < floor {
-            return Err(FeedError::Failed(format!(
-                "manifest serial {} is older than the last accepted {} — refusing rollback",
-                m.serial, floor
-            )));
-        }
-        if let Err(e) = store_floor(&path, channel.as_str(), m.serial) {
+        floor::check(&path, channel.as_str(), m.serial).map_err(FeedError::Failed)?;
+        if let Err(e) = floor::raise(&path, channel.as_str(), m.serial, write_floor) {
             tracing::warn!(path = %path.display(), error = %e, "update serial floor not raised");
         }
         Ok(m)
@@ -629,36 +583,6 @@ impl Snapshot {
 mod tests {
     use super::*;
 
-    #[test]
-    fn floor_roundtrip_and_monotonicity() {
-        let dir = std::env::temp_dir().join(format!("pf-update-floor-{}", std::process::id()));
-        let path = dir.join("update-state.json");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        assert_eq!(load_floor(&path, "stable"), 0);
-        store_floor(&path, "stable", 100).unwrap();
-        assert_eq!(load_floor(&path, "stable"), 100);
-        store_floor(&path, "stable", 50).unwrap();
-        assert_eq!(load_floor(&path, "stable"), 100);
-        store_floor(&path, "canary", 7).unwrap();
-        assert_eq!(load_floor(&path, "canary"), 7);
-        assert_eq!(load_floor(&path, "stable"), 100);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn corrupt_floor_file_reads_as_zero() {
-        let dir = std::env::temp_dir().join(format!("pf-update-floor2-{}", std::process::id()));
-        let path = dir.join("update-state.json");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, b"not json").unwrap();
-        assert_eq!(load_floor(&path, "stable"), 0);
-        store_floor(&path, "stable", 5).unwrap();
-        assert_eq!(load_floor(&path, "stable"), 5);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// A temp file that cannot be written beside the floor still raises it.
     #[test]
     fn floor_rises_when_the_temp_cannot_be_written() {
@@ -666,9 +590,9 @@ mod tests {
         // A 255-byte name fits, but its temp name does not: the temp write fails, as a failed
         // rename would.
         let path = dir.path().join(format!("{}.json", "f".repeat(250)));
-        store_floor(&path, "stable", 5).unwrap();
-        store_floor(&path, "stable", 9).unwrap();
-        assert_eq!(load_floor(&path, "stable"), 9);
+        floor::raise(&path, "stable", 5, write_floor).unwrap();
+        floor::raise(&path, "stable", 9, write_floor).unwrap();
+        assert_eq!(floor::load(&path, "stable"), 9);
         let files = std::fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(files, 1, "no temp is left behind");
     }
@@ -696,12 +620,6 @@ mod tests {
             assert_eq!(err.as_deref(), Some("feed returned HTTP 500"));
             assert!(!not_published);
         }
-    }
-
-    #[test]
-    fn pinned_keys_skip_empty_rotation_slot() {
-        let keys = pinned_keys();
-        assert_eq!(keys.len(), 1, "one live key, one empty rotation slot");
     }
 
     #[test]
