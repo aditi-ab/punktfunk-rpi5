@@ -89,22 +89,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetLowLaten
 /// Kotlin `FEATURE_PartialFrame` probe said no — the rebuild-free on-glass experiment for a
 /// decoder that may accept `BUFFER_FLAG_PARTIAL_FRAME` without declaring the feature (the NP3's
 /// c2.qti decoders declare nothing). Android-only; everywhere else the probe verdict stands.
-#[cfg(target_os = "android")]
 fn force_parts_sysprop() -> bool {
-    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
-                             // SAFETY: __system_property_get with a valid name + PROP_VALUE_MAX buffer is always safe.
-    let n = unsafe {
-        libc::__system_property_get(
-            c"debug.punktfunk.force_parts".as_ptr(),
-            buf.as_mut_ptr().cast(),
-        )
-    };
-    n > 0 && std::str::from_utf8(&buf[..n as usize]).unwrap_or("").trim() == "1"
-}
-
-#[cfg(not(target_os = "android"))]
-fn force_parts_sysprop() -> bool {
-    false
+    crate::sys::sysprop(c"debug.punktfunk.force_parts").as_deref() == Some("1")
 }
 
 /// The rates this session may ask for when the one the user chose will not open, best first.

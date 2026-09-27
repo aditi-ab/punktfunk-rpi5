@@ -250,16 +250,8 @@ impl Drop for ConsoleHost {
 ///
 /// Non-fatal if the platform refuses (the exact floor a foreground app may set is policy).
 fn boost_thread_priority() {
-    // SAFETY: `gettid`/`setpriority` on the calling thread are always-safe syscalls; PRIO_PROCESS
-    // with a TID targets that one task on Linux — the idiom `Process.setThreadPriority` uses.
-    unsafe {
-        let tid = libc::gettid();
-        if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -8) != 0 {
-            log::debug!(
-                "console: setpriority(-8) failed (non-fatal): {}",
-                std::io::Error::last_os_error()
-            );
-        }
+    if let Err(e) = crate::sys::set_thread_nice(None, -8) {
+        log::debug!("console: setpriority(-8) failed (non-fatal): {e}");
     }
 }
 

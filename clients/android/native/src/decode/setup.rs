@@ -1,5 +1,6 @@
 //! Codec creation, low-latency config, thread/frame-rate tuning, HDR static-info encode.
 
+use crate::sys::{set_thread_nice, sysprop};
 use ndk::media::media_codec::MediaCodec;
 use ndk::media::media_format::MediaFormat;
 use ndk::native_window::NativeWindow;
@@ -149,18 +150,10 @@ fn decoder_supports_max_operating_rate(name_lower: &str) -> bool {
 /// in the shared core. Slightly below the decode thread's -10 so the display path still wins.
 /// Best-effort; skips this thread (already boosted) and is non-fatal if the platform refuses.
 pub(super) fn boost_hot_threads(tids: &[i32]) {
-    // SAFETY: `gettid` is an always-safe syscall on the calling thread.
-    let self_tid = unsafe { libc::gettid() };
-    for &tid in tids {
-        if tid == self_tid {
-            continue;
-        }
-        // SAFETY: `setpriority` with PRIO_PROCESS + a live tid in our own process is an always-safe
-        // syscall; a refusal is reported via the return value, not UB.
-        unsafe {
-            if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -8) != 0 {
-                log::debug!("decode: setpriority(-8) on hot tid {tid} failed (non-fatal)");
-            }
+    let self_tid = crate::sys::gettid();
+    for &tid in tids.iter().filter(|&&tid| tid != self_tid) {
+        if set_thread_nice(Some(tid), -8).is_err() {
+            log::debug!("decode: setpriority(-8) on hot tid {tid} failed (non-fatal)");
         }
     }
 }
@@ -169,16 +162,8 @@ pub(super) fn boost_hot_threads(tids: &[i32]) {
 /// can't preempt it under load (which shows up as late/dropped frames). Non-fatal if the platform
 /// refuses (foreground apps may set their own threads; the exact floor is policy-dependent).
 pub(crate) fn boost_thread_priority() {
-    // SAFETY: `gettid`/`setpriority` on the calling thread are always-safe syscalls. PRIO_PROCESS
-    // with a TID targets that one task on Linux — the same idiom `Process.setThreadPriority` uses.
-    unsafe {
-        let tid = libc::gettid();
-        if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -10) != 0 {
-            log::warn!(
-                "decode: setpriority(-10) failed (non-fatal): {}",
-                std::io::Error::last_os_error()
-            );
-        }
+    if let Err(e) = set_thread_nice(None, -10) {
+        log::warn!("decode: setpriority(-10) failed (non-fatal): {e}");
     }
 }
 
@@ -307,7 +292,6 @@ pub(super) const LOW_LATENCY_KEY_PROP: &std::ffi::CStr = c"debug.punktfunk.low_l
 const HALF_RATE_TVS: &[(&str, &str)] = &[("TPV", "PH1M_WW_9972"), ("TCL", "G08")];
 
 fn half_rate_tv() -> bool {
-    use super::asc_presenter::sysprop;
     let (Some(maker), Some(device)) = (
         sysprop(c"ro.product.manufacturer"),
         sysprop(c"ro.product.device"),
@@ -341,7 +325,7 @@ pub(super) fn low_latency_format(
         (mode.width * mode.height).max(2_000_000) as i32,
     );
     if let Some(aggressive) = keys {
-        let forced = super::asc_presenter::sysprop(LOW_LATENCY_KEY_PROP);
+        let forced = sysprop(LOW_LATENCY_KEY_PROP);
         let profile = match forced.as_deref() {
             Some(p @ ("standard" | "off" | "mtk-tv")) => p,
             _ if codec_name.to_ascii_lowercase().starts_with("c2.mtk") && half_rate_tv() => {

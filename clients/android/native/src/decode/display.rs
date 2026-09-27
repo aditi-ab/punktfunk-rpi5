@@ -10,19 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use super::latency::{now_realtime_ns, take_by_pts};
 use super::RENDERED_CAP;
-
-/// `CLOCK_MONOTONIC` now in nanoseconds — the base of the `systemNano` render timestamp the
-/// `OnFrameRendered` callback reports (Android's `System.nanoTime`), read only to re-base that
-/// stamp onto `CLOCK_REALTIME` (see [`on_frame_rendered`]).
-fn now_monotonic_ns() -> i128 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `clock_gettime` with a valid out-pointer is an always-safe syscall.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128
-}
+use crate::sys::now_monotonic_ns;
 
 /// State shared between the decode loop and the `AMediaCodec` `OnFrameRendered` callback (which
 /// fires on a codec-internal thread): rendered frames awaiting their render timestamp, so the HUD
@@ -178,7 +166,8 @@ unsafe extern "C" fn on_frame_rendered(
     // `Arc::into_raw` pointer from `install_render_callback`, whose refcount is held for as long as
     // the codec exists, and the codec is what delivers this call.
     let t = unsafe { &*(userdata as *const DisplayTracker) };
-    let displayed_ns = now_realtime_ns() - (now_monotonic_ns() - system_nano as i128);
+    let displayed_ns =
+        now_realtime_ns() - (i128::from(now_monotonic_ns()) - i128::from(system_nano));
     let pts_us = media_time_us.max(0) as u64;
     // Pair the frame back to its release record; older entries' callbacks were dropped.
     let paired = take_by_pts(

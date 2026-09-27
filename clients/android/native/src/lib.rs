@@ -63,6 +63,7 @@ mod pad_audio;
 mod pyro;
 mod session;
 mod stats;
+mod sys;
 // Ungated like `discovery`: pure `jni` + `punktfunk_core::wol` (no Android framework), so it links
 // into the host workspace build too. Kotlin only ever calls it on device.
 mod wol;

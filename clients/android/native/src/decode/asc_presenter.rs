@@ -24,7 +24,6 @@ use ndk::media::media_codec::MediaCodec;
 use ndk::native_window::NativeWindow;
 use punktfunk_core::phase::{pace_slot, CadenceClock, CadenceTuning, SlotClock, SlotIntervals};
 use std::collections::VecDeque;
-use std::ffi::CStr;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -34,7 +33,7 @@ use super::async_loop::DecodeEvent;
 use super::latency::{now_realtime_ns, p50_max_ms, take_by_pts};
 use super::presenter::{cadence_suffix, PresentPriority};
 use super::surface_control::{fence_signal_ns, Layer, PresentComplete};
-use super::vsync::now_monotonic_ns;
+use crate::sys::{now_monotonic_ns, sysprop};
 
 /// Reader pool depth. Must cover the codec's own in-flight outputs + the presenter's held candidate
 /// / FIFO + the buffers still latched on SurfaceFlinger awaiting their release fence. Eight is
@@ -892,18 +891,6 @@ impl AscBackend {
             log::info!("asc: buffer dataspace now {dataspace:#x}");
         }
     }
-}
-
-/// A system property, trimmed; `None` when unset.
-pub(super) fn sysprop(name: &CStr) -> Option<String> {
-    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
-                             // SAFETY: __system_property_get with a valid name + PROP_VALUE_MAX buffer is always safe.
-    let n = unsafe { libc::__system_property_get(name.as_ptr(), buf.as_mut_ptr().cast()) };
-    (n > 0).then(|| {
-        String::from_utf8_lossy(&buf[..n as usize])
-            .trim()
-            .to_string()
-    })
 }
 
 /// Whether the ASurfaceControl backend is selected. Default ON; `debug.punktfunk.present_backend =
