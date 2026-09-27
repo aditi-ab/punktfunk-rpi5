@@ -1,6 +1,7 @@
 package io.unom.punktfunk.kit.library
 
 import android.util.Log
+import io.unom.punktfunk.kit.NativeBridge
 import okhttp3.Cache
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -315,6 +316,66 @@ object LibraryClient {
         } else {
             LibraryResult.Error("the host refused it ($code)")
         }
+
+    /** Tries per wake: a cold box takes 20–60 s to serve, and 12 × 5 s covers that. */
+    internal const val WAKE_ATTEMPTS = 12
+    internal const val WAKE_RETRY_MS = 5_000L
+
+    /** Re-send the magic packet every other attempt: one packet can be missed. */
+    internal const val WAKE_RESEND_EVERY = 2
+
+    /**
+     * [fetch] across a host's boot window, for both Android shells (the desktop's `spawn_fetch`).
+     *
+     * With [autoWake] on and a MAC to send to, a magic packet goes out first, [onWaking] runs
+     * once, and the fetch is retried [WAKE_ATTEMPTS] times while it stays transient, resending
+     * the packet on the way. Otherwise it is one plain fetch and no packet. Null only when
+     * [isCancelled] stopped it before an answer. BLOCKING.
+     */
+    fun fetchAcrossWake(
+        address: String,
+        mgmtPort: Int,
+        certPem: String,
+        keyPem: String,
+        fpHex: String,
+        macs: List<String>,
+        autoWake: Boolean,
+        isCancelled: () -> Boolean = { false },
+        onWaking: () -> Unit = {},
+    ): LibraryResult? = acrossWake(
+        waking = autoWake && macs.isNotEmpty(),
+        fetch = { fetch(address, mgmtPort, certPem, keyPem, fpHex) },
+        wake = { NativeBridge.nativeWakeOnLan(macs.joinToString(","), address) },
+        isCancelled = isCancelled,
+        onWaking = onWaking,
+        sleep = { Thread.sleep(it) },
+    )
+
+    /** [fetchAcrossWake] with its effects passed in, so the cadence is testable off-device. */
+    internal fun acrossWake(
+        waking: Boolean,
+        fetch: () -> LibraryResult,
+        wake: () -> Unit,
+        isCancelled: () -> Boolean,
+        onWaking: () -> Unit,
+        sleep: (Long) -> Unit,
+    ): LibraryResult? {
+        if (waking) {
+            wake()
+            onWaking()
+        }
+        val attempts = if (waking) WAKE_ATTEMPTS else 1
+        var last: LibraryResult? = null
+        for (attempt in 0 until attempts) {
+            if (isCancelled()) break
+            val res = fetch()
+            last = res
+            if (!res.isTransient || attempt + 1 >= attempts) break
+            if (attempt % WAKE_RESEND_EVERY == WAKE_RESEND_EVERY - 1) wake()
+            sleep(WAKE_RETRY_MS)
+        }
+        return last
+    }
 
     /** Just the `games[]` slice of `/status`; everything else on that payload is the console's. */
     private fun parseRunning(json: String): List<RunningGame> {

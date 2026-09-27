@@ -759,7 +759,7 @@ object SkiaConsole {
         // launcher tile go straight through, so the session is handed over at once. Mirrors
         // `Shell::launch_hold`, and reads the same cached catalog the shelf was drawn from.
         holdsLaunch = launchId != null &&
-            LibraryCache.standard(app.cacheDir).load(kh?.id ?: fp)?.games
+            LibraryCache.standard(app.cacheDir).load(LibraryCache.keyFor(kh, fp))?.games
                 ?.firstOrNull { it.id == launchId }?.isLauncher == false
         val preset: StreamPreset? = presetStore.resolveFor(kh, presetId, launchId)
         val effective = settings.effectiveFor(preset)
@@ -1132,9 +1132,9 @@ object SkiaConsole {
     }
 
     /**
-     * The library pipeline (the desktop's `spawn_fetch`): cached shelf first, wake + retry
-     * across the boot window when the host has a MAC, then the catalog, the running set and
-     * the posters — each poster fetched over the same mTLS client and pushed as bytes.
+     * The library pipeline (the desktop's `spawn_fetch`): cached shelf first, then
+     * [LibraryClient.fetchAcrossWake], then the running set and the posters — each poster
+     * fetched over the same mTLS client and pushed as bytes.
      */
     private fun fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
         val app = appContext ?: return
@@ -1164,25 +1164,17 @@ object SkiaConsole {
             return
         }
         val cache = LibraryCache.standard(app.cacheDir)
-        val cacheKey = kh?.id ?: fp.ifEmpty { "$addr:$mgmt" }
+        val cacheKey = LibraryCache.keyFor(kh, fp)
         ioPool.execute {
             val cached = cache.load(cacheKey)?.games?.takeIf { it.isNotEmpty() }
             if (cached != null) main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryGames(handle, ConsoleJson.libraryGames(cached), true) }
-            val macs = kh?.mac.orEmpty()
-            val waking = macs.isNotEmpty() && settings.autoWakeEnabled
-            if (waking) NativeBridge.nativeWakeOnLan(macs.joinToString(","), addr)
-            val attempts = if (waking) 12 else 1
-            var result: LibraryResult? = null
-            for (attempt in 0 until attempts) {
-                if (gen != fetchGen.get()) return@execute
-                val r = LibraryClient.fetch(addr, mgmt, id.certPem, id.privateKeyPem, fp)
-                result = r
-                if (r is LibraryResult.Ok || r is LibraryResult.Unauthorized) break
-                if (attempt + 1 >= attempts) break
-                if (attempt % 2 == 1) NativeBridge.nativeWakeOnLan(macs.joinToString(","), addr)
-                main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryStale(handle, 1) }
-                Thread.sleep(5_000)
-            }
+            val result = LibraryClient.fetchAcrossWake(
+                addr, mgmt, id.certPem, id.privateKeyPem, fp,
+                macs = kh?.mac.orEmpty(),
+                autoWake = settings.autoWakeEnabled,
+                isCancelled = { gen != fetchGen.get() },
+                onWaking = { main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryStale(handle, 1) } },
+            )
             if (gen != fetchGen.get()) return@execute
             when (val r = result) {
                 is LibraryResult.Ok -> {
