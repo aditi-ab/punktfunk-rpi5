@@ -2,12 +2,13 @@
 check-workflow-paths.py."""
 
 
-def closure(meta, roots):
+def closure(meta, roots, dev=True):
     """Package ids reachable from the packages named `roots` through the resolve graph.
 
     It follows whatever graph `meta` holds: the whole feature-unified resolve by default, or one
     target's slice when the caller ran `cargo metadata --filter-platform`. It never pulls in
-    crates reachable only from other workspace members.
+    crates reachable only from other workspace members. With `dev=False` it skips edges that are
+    only dev-dependencies, leaving what the roots link.
     """
     by_name = {}
     for p in meta["packages"]:
@@ -24,5 +25,10 @@ def closure(meta, roots):
         if pid in seen:
             continue
         seen.add(pid)
-        stack.extend(nodes.get(pid, {}).get("dependencies", []))
+        node = nodes.get(pid, {})
+        if dev:
+            stack.extend(node.get("dependencies", []))
+        else:
+            stack.extend(d["pkg"] for d in node.get("deps", [])
+                         if any(k["kind"] != "dev" for k in d["dep_kinds"]))
     return seen

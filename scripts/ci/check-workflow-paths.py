@@ -31,7 +31,8 @@ LINUX_HOST_FEATURES = "punktfunk-host/nvenc,punktfunk-host/vulkan-encode"
 # One row per workflow: the arch with the widest feature set.
 BUILDS = [
     ("windows-host", "Cargo.toml", "x86_64-pc-windows-msvc",
-     ["punktfunk-host", "punktfunk-tray"], "punktfunk-host/nvenc,punktfunk-host/qsv"),
+     ["punktfunk-host", "punktfunk-tray", "display-disturb"],
+     "punktfunk-host/nvenc,punktfunk-host/qsv"),
     ("windows-client", "Cargo.toml", "x86_64-pc-windows-msvc",
      ["punktfunk-client-windows", "punktfunk-client-session", "punktfunk-cli"], None),
     ("windows-drivers", "packaging/windows/drivers/Cargo.toml", "x86_64-pc-windows-msvc",

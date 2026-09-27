@@ -146,7 +146,7 @@ HDR over the virtual display.
 | `api/openapi.json`, `include/punktfunk_core.h` | Generated API spec and C header, checked in |
 | `packaging/` | apt, rpm, Arch, Flatpak, Bazzite, bootc, Nix, Windows installer and drivers, winget |
 | `docs-site/` | This site |
-| `tools/` | Measurement tools: `loss-harness`, `latency-probe`, `cursor-probe`, `display-disturb` |
+| `tools/` | Measurement tools: `loss-harness`, `cursor-probe`, `display-disturb`, and the `latency-probe` glass timer page |
 | `ci/`, `scripts/` | CI builder images; install, packaging and CI scripts |
 
 The browser client and the LG webOS client live in their own repositories and pin these crates as

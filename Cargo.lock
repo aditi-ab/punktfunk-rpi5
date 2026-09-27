@@ -1413,13 +1413,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fence-ring-spike"
-version = "0.40.0"
-dependencies = [
- "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2455,10 +2448,6 @@ dependencies = [
  "task-local",
  "zbus",
 ]
-
-[[package]]
-name = "latency-probe"
-version = "0.40.0"
 
 [[package]]
 name = "lazy_static"
