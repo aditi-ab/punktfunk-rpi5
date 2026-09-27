@@ -1,5 +1,6 @@
 //! The window, presenter, overlay and pads the run loop owns.
 
+use super::stream::ring_facts;
 use super::*;
 
 impl Shell {
@@ -346,6 +347,39 @@ impl Shell {
         }
         self.overlay_damage
             .rendered(self.overlay_frame.as_ref().map(|f| f.image));
+        Ok(())
+    }
+}
+
+impl Shell {
+    /// Present the overlay alone when no video frame carried it: every pass across a
+    /// resize scrim (the host's rebuild gap), and once per change while browsing or
+    /// after a mid-stream picture has gone still. An idle console hands back the same
+    /// image, so browsing presents only what the overlay re-rendered.
+    pub(super) fn present_overlay_alone(
+        &mut self,
+        stream: &Option<StreamState>,
+        presented_video: bool,
+    ) -> Result<()> {
+        let resize_scrim = stream.as_ref().is_some_and(|s| s.resize_overlay.active());
+        let browse_idle = self.browse && stream.as_ref().is_none_or(|s| s.connector.is_none());
+        let still_picture = stream.as_ref().is_some_and(|s| s.last_video.is_some())
+            && self.overlay_damage.take_due(Instant::now());
+        let browse_changed = browse_idle && self.overlay_damage.take_dirty();
+        if !presented_video && (resize_scrim || browse_changed || still_picture) {
+            // The UI owns the screen: hand the swapchain back to SDR. A finished PQ stream
+            // leaves HDR10 live, and UI presents carry no frame. Not applied to
+            // `resize_scrim`: that gap is still an HDR session, and flipping would rebuild
+            // the swapchain twice.
+            if browse_idle {
+                self.presenter.leave_hdr(&self.window)?;
+            }
+            self.presenter.present(
+                &self.window,
+                FrameInput::Redraw,
+                self.overlay_frame.as_ref(),
+            )?;
+        }
         Ok(())
     }
 }

@@ -1,5 +1,6 @@
 //! Input: SDL events into capture, touch into the gesture engine, and the pad mask.
 
+use super::pace::bump_stats_tier;
 use super::*;
 use sdl3::keyboard::{Keycode, Scancode};
 

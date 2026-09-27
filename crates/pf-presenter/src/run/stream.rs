@@ -1,5 +1,7 @@
 //! One stream's life: start, the session events, mode switches, and the quick-action ring.
 
+use super::events::touch_devices;
+use super::pace::{bump_stats_tier, frame_interval_ns};
 use super::*;
 
 impl StreamState {

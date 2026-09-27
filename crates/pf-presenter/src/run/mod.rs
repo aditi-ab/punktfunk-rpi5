@@ -10,8 +10,13 @@
 //! once per window while the overlay tier is not Off: `stats: …` (the Advanced Detailed
 //! text, lines joined by ` | `) and `stats-json: …` (the snapshot). Logs go to stderr.
 //!
+//! Each pass runs the same phases in order: SDL events and the input ticks (`events.rs`),
+//! browse actions and the session drain (`stream.rs`), the overlay (`shell.rs`), then the
+//! video present and its 1 Hz window (`pace.rs`). [`Shell`] holds what setup built,
+//! [`StreamState`] one stream's life.
+//!
 //! In-stream chords share Ctrl+Alt+Shift: Q release/engage, M mouse model, D
-//! disconnect, S stats tier, V microphone mute.
+//! disconnect, S stats tier, O quick-action ring, V microphone mute.
 
 use crate::input::{Capture, FingerPhase};
 use crate::overlay::{
@@ -48,9 +53,8 @@ mod pace;
 mod shell;
 mod stream;
 
-use events::*;
-use pace::*;
-use stream::*;
+use pace::{OverlayDamage, PresentHealth, PresentWindow};
+use stream::ResizeIndicator;
 
 /// [`SessionOpts::on_connected`]: host fingerprint, then Welcome's management-API
 /// port (`0` = none advertised).
@@ -143,7 +147,6 @@ where
             (build.take().expect("single build runs once"))(gp, native, hdr, fs, vk)
         })),
     )
-    .map(|o| o.expect("single mode always yields an outcome"))
 }
 
 /// Console library idles between streams. `on_action` gets every overlay action plus what
@@ -405,7 +408,7 @@ fn capture_mut(stream: &mut Option<StreamState>) -> Option<&mut Capture> {
     stream.as_mut().and_then(|s| s.capture.as_mut())
 }
 
-fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
+fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
     let mut sh = Shell::open(opts, matches!(mode, ModeCtl::Browse(_)))?;
     let mut stream: Option<StreamState> = match &mut mode {
         ModeCtl::Single(build) => {
@@ -443,7 +446,7 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
         );
         for event in queued {
             if let ControlFlow::Break(outcome) = sh.on_event(&mut stream, event)? {
-                break 'main Some(outcome);
+                break 'main outcome;
             }
         }
         // Native events forward only when capture owns the entire SDL batch.
@@ -463,12 +466,12 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
         sh.pad_owner_tick(&mut stream, want_mask_ui);
         if let ModeCtl::Browse(on_action) = &mut mode {
             if let ControlFlow::Break(outcome) = sh.browse_tick(&mut stream, on_action) {
-                break 'main Some(outcome);
+                break 'main outcome;
             }
         }
 
         if let ControlFlow::Break(outcome) = sh.drain_session_events(&mut stream) {
-            break 'main Some(outcome);
+            break 'main outcome;
         }
 
         if let Some(st) = stream.as_mut() {
@@ -482,26 +485,7 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
             None => false,
         };
 
-        // Present the overlay alone when no video frame carried it: every pass across a
-        // resize scrim (the host's rebuild gap), and once per change while browsing or
-        // after a mid-stream picture has gone still. An idle console hands back the same
-        // image, so browsing presents only what the overlay re-rendered.
-        let resize_scrim = stream.as_ref().is_some_and(|s| s.resize_overlay.active());
-        let browse_idle = sh.browse && stream.as_ref().is_none_or(|s| s.connector.is_none());
-        let still_picture = stream.as_ref().is_some_and(|s| s.last_video.is_some())
-            && sh.overlay_damage.take_due(Instant::now());
-        let browse_changed = browse_idle && sh.overlay_damage.take_dirty();
-        if !presented_video && (resize_scrim || browse_changed || still_picture) {
-            // The UI owns the screen: hand the swapchain back to SDR. A finished PQ stream
-            // leaves HDR10 live, and UI presents carry no frame. Not applied to
-            // `resize_scrim`: that gap is still an HDR session, and flipping would rebuild
-            // the swapchain twice.
-            if browse_idle {
-                sh.presenter.leave_hdr(&sh.window)?;
-            }
-            sh.presenter
-                .present(&sh.window, FrameInput::Redraw, sh.overlay_frame.as_ref())?;
-        }
+        sh.present_overlay_alone(&stream, presented_video)?;
     };
 
     // Every loop exit converges here, so gamepad teardown belongs here, not on the
