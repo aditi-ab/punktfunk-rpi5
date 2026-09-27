@@ -45,7 +45,7 @@ pub use instance::claim_instance_eagerly;
 
 #[path = "manager/knobs.rs"]
 mod knobs;
-use knobs::{keep_alive_forever, linger_ms, topology_action};
+use knobs::{linger_for, topology_action};
 
 /// One live virtual monitor, owned by manager state (not by a session).
 /// No `Drop`: [`teardown_removed`](VirtualDisplayManager::teardown_removed)
@@ -92,6 +92,9 @@ struct Monitor {
     position: (i32, i32),
     /// Generation stamp; a [`MonitorLease`] releases only if this still matches.
     generation: u64,
+    /// Device whose acquire created this monitor. Its `keep_alive` overlay decides
+    /// the linger at release ([`linger_for`]); `None` follows the host.
+    client_fp: Option<[u8; 32]>,
 }
 
 impl Monitor {
@@ -902,7 +905,7 @@ impl VirtualDisplayManager {
         // SAFETY: `create_monitor` requires `dev` to be a valid control handle; the `dev` Arc
         // `ensure_device()` returned above is held across this call (so the handle stays open even
         // against a concurrent retire), and we hold the `state` lock.
-        let mon = match unsafe {
+        let mut mon = match unsafe {
             self.create_monitor(dev_raw(&dev), mode, slot, client_hdr, hw_cursor, &mut inner)
         } {
             // Cached device died under us. Retire, reopen, retry once so a
@@ -928,6 +931,7 @@ impl VirtualDisplayManager {
             }
             r => r?,
         };
+        mon.client_fp = client_fp;
         let out = self.output_for(slot, &mon, quit);
         inner.slots.insert(slot, SlotState::Active { mon, refs: 1 });
         // Arrange live members and commit desktop origins in one CCD apply.
@@ -1673,6 +1677,8 @@ impl VirtualDisplayManager {
             generation: self.generation.fetch_add(1, Ordering::Relaxed),
             hw_cursor,
             cursor_excluded: added.cursor_excluded,
+            // `acquire` records the creating device.
+            client_fp: None,
         })
     }
 
@@ -1939,6 +1945,7 @@ impl VirtualDisplayManager {
             // Fresh from this reply, not `old`: the driver's per-target
             // declare registry is ground truth.
             cursor_excluded: added.cursor_excluded,
+            client_fp: old.client_fp,
         });
         match rollback_err {
             None => ReAdd::Arrived(mon),
@@ -2107,11 +2114,13 @@ impl VirtualDisplayManager {
         done.store(true, Ordering::SeqCst);
     }
 
-    /// Release a session's hold. Last session lingers unless `quit_now` (QUIT
-    /// code): then tear down immediately so a reconnect finds Idle instead of
-    /// the Lingering-preempt REMOVE→ADD. `keep_alive = forever` outranks quit —
-    /// only `/display/release` frees a pin. A stale lease is a no-op.
+    /// Release a session's hold. The last one applies the creating device's
+    /// `keep_alive` ([`linger_for`]): a window lingers, `forever` pins, off tears
+    /// down now. A QUIT (`quit_now`) skips the window so a reconnect finds Idle
+    /// instead of the Lingering-preempt REMOVE→ADD, but never a pin: only
+    /// `/display/release` frees that. A stale lease is a no-op.
     fn release(&self, slot: u32, generation: u64, quit_now: bool) {
+        use crate::policy::Linger;
         let mut inner = self.state.lock().unwrap();
         let stale = match inner.slots.get(&slot) {
             Some(s) => s.mon().generation != generation,
@@ -2123,7 +2132,7 @@ impl VirtualDisplayManager {
         let Some(entry) = inner.slots.remove(&slot) else {
             return;
         };
-        match entry {
+        let mon = match entry {
             SlotState::Active { mon, refs } if refs > 1 => {
                 inner.slots.insert(
                     slot,
@@ -2132,25 +2141,46 @@ impl VirtualDisplayManager {
                         refs: refs - 1,
                     },
                 );
+                return;
             }
-            // Pin before considering quit: keep_alive=forever means the
-            // screen stays alive. A deliberate quit skips linger, never pin.
-            SlotState::Active { mon, .. } if keep_alive_forever() => {
+            SlotState::Active { mon, .. } => mon,
+            // Kept slot has no live hold — stale/duplicate release; put it back.
+            other => {
+                inner.slots.insert(slot, other);
+                return;
+            }
+        };
+        match crate::lifecycle::effective_linger(quit_now, linger_for(mon.client_fp)) {
+            Linger::Forever => {
                 tracing::info!(
                     slot,
                     "virtual-display: last session left — PINNED (keep_alive=forever); free via /display/release"
                 );
                 inner.slots.insert(slot, SlotState::Pinned { mon });
             }
-            // Deliberate quit: tear down now, under the state lock so a racing
-            // `acquire` waits rather than ADD into an in-flight REMOVE.
-            // `device_handle()` None is impossible with a live monitor; fall
-            // back to Lingering (timer retries) rather than leak.
-            SlotState::Active { mon, .. } if quit_now => match self.device_handle() {
+            Linger::For(window) => {
+                tracing::info!(
+                    slot,
+                    linger_ms = window.as_millis() as u64,
+                    "virtual-display: last session left — lingering before teardown"
+                );
+                inner.slots.insert(
+                    slot,
+                    SlotState::Lingering {
+                        mon,
+                        until: Instant::now() + window,
+                    },
+                );
+            }
+            // Under the state lock, so a racing `acquire` waits rather than ADD
+            // into an in-flight REMOVE. No handle is impossible with a live
+            // monitor; an expired linger lets the timer retry rather than leak.
+            Linger::Immediate => match self.device_handle() {
                 Some(dev) => {
                     tracing::info!(
                         slot,
-                        "virtual-display: last session left (deliberate quit) — tearing down now, linger skipped"
+                        quit_now,
+                        "virtual-display: last session left — tearing down now, no linger"
                     );
                     // SAFETY: `teardown_removed` requires `dev` to be the live control handle; the
                     // `dev` Arc from `device_handle()` (the `Some` checked above) is held across
@@ -2163,30 +2193,11 @@ impl VirtualDisplayManager {
                         slot,
                         SlotState::Lingering {
                             mon,
-                            until: Instant::now() + Duration::from_millis(linger_ms()),
+                            until: Instant::now(),
                         },
                     );
                 }
             },
-            SlotState::Active { mon, .. } => {
-                let ms = linger_ms();
-                tracing::info!(
-                    slot,
-                    linger_ms = ms,
-                    "virtual-display: last session left — lingering before teardown"
-                );
-                inner.slots.insert(
-                    slot,
-                    SlotState::Lingering {
-                        mon,
-                        until: Instant::now() + Duration::from_millis(ms),
-                    },
-                );
-            }
-            // Kept slot has no live hold — stale/duplicate release; put it back.
-            other => {
-                inner.slots.insert(slot, other);
-            }
         }
     }
 

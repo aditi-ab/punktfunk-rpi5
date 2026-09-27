@@ -1,15 +1,19 @@
-//! Runtime display-management knobs: linger window, keep-alive-forever pin,
-//! and per-monitor topology action. Readers of [`crate::policy`] plus legacy
-//! env fallbacks — no manager state.
+//! Runtime display-management knobs: linger and per-monitor topology action.
+//! Readers of [`crate::policy`] plus legacy env fallbacks — no manager state.
 
-/// 10 s: historical default, and the fallback when a rung cannot answer.
+use crate::policy::{DisplayPolicy, Linger};
+use std::time::Duration;
+
+/// 10 s: an unconfigured host's linger when `PUNKTFUNK_MONITOR_LINGER_MS` is unset.
 const DEFAULT_LINGER_MS: u64 = 10_000;
 
-pub(super) fn linger_ms() -> u64 {
-    resolve_linger_ms(
-        crate::policy::prefs()
-            .configured_effective()
-            .map(|eff| eff.keep_alive.linger()),
+/// Linger for a monitor `client_fp` created: the console's `keep_alive` with that
+/// device's overlay applied (§6.1), so the TV can keep its screen forever while the
+/// tablet's goes at once.
+pub(super) fn linger_for(client_fp: Option<[u8; 32]>) -> Linger {
+    resolve_linger(
+        crate::policy::prefs().configured().as_ref(),
+        crate::policy::fp_hex(client_fp).as_deref(),
         std::env::var("PUNKTFUNK_MONITOR_LINGER_MS")
             .ok()
             .and_then(|s| s.parse().ok()),
@@ -18,30 +22,17 @@ pub(super) fn linger_ms() -> u64 {
 
 /// Console policy outranks the env knob: an operator who set the console
 /// must not have it silently overridden by a leftover
-/// `PUNKTFUNK_MONITOR_LINGER_MS`.
-fn resolve_linger_ms(configured: Option<crate::policy::Linger>, env_ms: Option<u64>) -> u64 {
-    use crate::policy::Linger;
+/// `PUNKTFUNK_MONITOR_LINGER_MS`. Unconfigured: the env knob, else 10 s.
+/// Unparseable env arrives as `None` (`parse().ok()`), i.e. unset, not zero.
+fn resolve_linger(
+    configured: Option<&DisplayPolicy>,
+    fp: Option<&str>,
+    env_ms: Option<u64>,
+) -> Linger {
     match configured {
-        Some(Linger::Immediate) => 0,
-        Some(Linger::For(d)) => d.as_millis() as u64,
-        // `forever` is handled by `keep_alive_forever()` in `release` (→ `Pinned`).
-        // Reached only if a caller skipped the pin check — fall back to the
-        // default, not a huge linger.
-        Some(Linger::Forever) => DEFAULT_LINGER_MS,
-        // Unconfigured: env knob, else the default. Unparseable arrives as `None`
-        // (`parse().ok()`), i.e. unset, not zero.
-        None => env_ms.unwrap_or(DEFAULT_LINGER_MS),
+        Some(p) => p.effective_for(fp).keep_alive.linger(),
+        None => Linger::For(Duration::from_millis(env_ms.unwrap_or(DEFAULT_LINGER_MS))),
     }
-}
-
-/// Whether configured `keep_alive` is forever (`Pinned`). `release` keeps
-/// the last-released monitor indefinitely. Unconfigured hosts are never forever.
-pub(super) fn keep_alive_forever() -> bool {
-    use crate::policy::{prefs, Linger};
-    prefs()
-        .configured_effective()
-        .map(|eff| matches!(eff.keep_alive.linger(), Linger::Forever))
-        .unwrap_or(false)
 }
 
 /// Exclusive-topology re-assert cadence. Default 2000 ms; `0` disables.
@@ -80,37 +71,48 @@ fn resolve_topology_action(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_linger_ms, resolve_topology_action, DEFAULT_LINGER_MS};
-    use crate::policy::{Linger, Topology};
+    use super::{resolve_linger, resolve_topology_action, DEFAULT_LINGER_MS};
+    use crate::policy::{ClientOverlay, DisplayPolicy, KeepAlive, Linger, Topology};
     use std::time::Duration;
 
+    /// The device overlay decides its own linger; everyone else follows the host,
+    /// and a configured host outranks the legacy env knob.
     #[test]
-    fn configured_policy_beats_the_legacy_env_knob() {
-        assert_eq!(
-            resolve_linger_ms(Some(Linger::For(Duration::from_secs(3))), Some(60_000)),
-            3_000
+    fn a_device_overlay_decides_its_own_linger() {
+        let mut p = DisplayPolicy {
+            keep_alive: KeepAlive::Off,
+            ..DisplayPolicy::default()
+        };
+        p.clients.insert(
+            "aa11".into(),
+            ClientOverlay {
+                keep_alive: Some(KeepAlive::Forever),
+                ..ClientOverlay::default()
+            },
         );
-        assert_eq!(resolve_linger_ms(Some(Linger::Immediate), Some(60_000)), 0);
+        assert_eq!(
+            resolve_linger(Some(&p), Some("aa11"), None),
+            Linger::Forever
+        );
+        assert_eq!(
+            resolve_linger(Some(&p), Some("bb22"), Some(60_000)),
+            Linger::Immediate
+        );
+        assert_eq!(resolve_linger(Some(&p), None, None), Linger::Immediate);
     }
 
     /// Unparseable env reaches here as `None` (`parse().ok()`), so it reads as
-    /// unset, not zero. `linger_ms = 0` would tear the monitor down on every
+    /// unset, not zero. A zero linger would tear the monitor down on every
     /// disconnect.
     #[test]
     fn an_unconfigured_host_honours_the_env_knob_then_the_default() {
-        assert_eq!(resolve_linger_ms(None, Some(250)), 250);
-        assert_eq!(resolve_linger_ms(None, None), DEFAULT_LINGER_MS);
-    }
-
-    /// `Forever` is the `Pinned` lifecycle, resolved by `keep_alive_forever()`
-    /// before any ms are asked. Reaching here skipped the pin check; the answer
-    /// is the default window, not an infinite linger that keeps physical panels
-    /// dark with nothing to release them.
-    #[test]
-    fn forever_resolves_to_the_default_not_a_huge_linger() {
         assert_eq!(
-            resolve_linger_ms(Some(Linger::Forever), None),
-            DEFAULT_LINGER_MS
+            resolve_linger(None, Some("aa11"), Some(250)),
+            Linger::For(Duration::from_millis(250))
+        );
+        assert_eq!(
+            resolve_linger(None, None, None),
+            Linger::For(Duration::from_millis(DEFAULT_LINGER_MS))
         );
     }
 
