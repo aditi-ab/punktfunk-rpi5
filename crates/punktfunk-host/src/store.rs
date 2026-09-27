@@ -245,7 +245,7 @@ pub(crate) fn plugin_id_for_pkg(pkg: &str) -> Option<String> {
     let id = last
         .strip_prefix("punktfunk-plugin-")
         .or_else(|| last.strip_prefix("plugin-"))?;
-    index::valid_plugin_id(id).then(|| id.to_string())
+    crate::slug::plugin_id(id).then(|| id.to_string())
 }
 
 #[derive(Clone)]

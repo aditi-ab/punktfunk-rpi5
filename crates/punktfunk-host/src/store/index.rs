@@ -159,7 +159,7 @@ impl Index {
 
 impl Entry {
     fn validate(&mut self) -> Result<()> {
-        if !valid_plugin_id(&self.id) {
+        if !crate::slug::plugin_id(&self.id) {
             bail!("id must be kebab-case `[a-z][a-z0-9-]*`, ≤64");
         }
         if !valid_scoped_pkg(&self.pkg) {
@@ -182,7 +182,7 @@ impl Entry {
             bail!("integrity must look like `sha512-<base64>`");
         }
         if let Some(icon) = &self.icon {
-            if !valid_icon(icon) {
+            if !crate::slug::lucide_icon(icon) {
                 self.icon = None; // drop the icon, not the entry
             }
         }
@@ -208,7 +208,7 @@ impl Entry {
             .retain(|p| matches!(p.as_str(), "linux" | "windows" | "macos"));
         self.platforms.truncate(4);
         // Unknown or malformed categories/probes drop those fields, never the entry.
-        self.categories.retain(|c| valid_category(c));
+        self.categories.retain(|c| crate::slug::category(c));
         self.categories.truncate(4);
         if let Some(d) = &mut self.detect {
             d.linux.retain(|p| valid_probe(p));
@@ -312,15 +312,6 @@ fn sanitize(s: &str, max: usize) -> String {
         .to_string()
 }
 
-pub(crate) fn valid_plugin_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.as_bytes()[0].is_ascii_lowercase()
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
 /// `@scope/name`, stricter than npm: no URL-ish characters into `bun add` or `bunfig.toml`.
 pub(crate) fn valid_scoped_pkg(pkg: &str) -> bool {
     let Some(rest) = pkg.strip_prefix('@') else {
@@ -348,13 +339,6 @@ pub(crate) fn scope_of(pkg: &str) -> Option<String> {
     Some(format!("@{scope}"))
 }
 
-fn valid_icon(icon: &str) -> bool {
-    (1..=48).contains(&icon.len())
-        && icon
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
 fn valid_integrity(s: &str) -> bool {
     if s.len() > 200 {
         return false;
@@ -371,14 +355,6 @@ fn valid_integrity(s: &str) -> bool {
 
 fn is_https(url: &str) -> bool {
     url.starts_with("https://") && url.len() > "https://".len()
-}
-
-/// Same spelling the registration API accepts, so a catalog row cannot disagree with a plugin.
-fn valid_category(c: &str) -> bool {
-    (1..=32).contains(&c.len())
-        && c.starts_with(|ch: char| ch.is_ascii_lowercase())
-        && c.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Per-platform probe cap; bounds the stat cost of rendering the catalog.

@@ -171,6 +171,7 @@ mod session_plan;
 mod session_settings;
 mod session_status;
 mod sleep_inhibit;
+mod slug;
 mod spike;
 mod stats_recorder;
 // Signed catalogs and install jobs via the `plugins` runner — design/plugin-store.md.
