@@ -1,6 +1,6 @@
 [package]
 name = "pf-vkdecode"
-description = "Native Vulkan Video H.264 decode for the clients (M2): StdVideo parameter-set/picture conversion and DPB slot management over pf-bitstream's AuPlans — the CPU-testable half; session, memory and command recording follow in WP-B (design/client-native-decode.md §3.2)"
+description = "Native Vulkan Video H.264/HEVC/AV1 decode for the clients: StdVideo parameter-set/picture conversion over pf-bitstream's AuPlans, plus the video session, picture pool, upload ring and command recording on the presenter's device (design/client-native-decode.md §3.2)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

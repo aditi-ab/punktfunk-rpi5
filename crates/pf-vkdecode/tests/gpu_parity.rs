@@ -945,7 +945,10 @@ fn field_h265_stream_writes_frame_hashes_for_ffmpeg_diff() {
                     // Lossy captures hold concealed AUs; ffmpeg conceals them
                     // differently, so a divergence there is not this decoder.
                     let warnings = decoder.take_warnings();
-                    if warnings.iter().any(pf_vkdecode::is_integrity_warning_h265) {
+                    if warnings
+                        .iter()
+                        .any(pf_vkdecode::H265PlanWarning::is_integrity)
+                    {
                         if concealed_aus.len() < 10 {
                             eprintln!("AU {au_index}: planned with concealment {warnings:?}");
                         }

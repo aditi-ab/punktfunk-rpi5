@@ -1175,7 +1175,9 @@ mod tests {
         lost.warnings
             .push(pf_bitstream::av1::PlanWarning::TruncatedAu { offset: 0 });
         assert!(
-            lost.warnings.iter().any(crate::is_integrity_warning_av1),
+            lost.warnings
+                .iter()
+                .any(crate::PlanWarningAv1::is_integrity),
             "the plan this test drives must be one the rung CONCEALS"
         );
 

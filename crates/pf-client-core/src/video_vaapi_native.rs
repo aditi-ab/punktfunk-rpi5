@@ -631,7 +631,10 @@ impl NativeVaapiDecoder {
             plan.picture.chroma_format_idc,
             8 + plan.picture.bit_depth_luma_minus8,
         )?;
-        let damaged = plan.warnings.iter().any(pf_vaapi::is_integrity_warning);
+        let damaged = plan
+            .warnings
+            .iter()
+            .any(pf_vaapi::PlanWarning::is_integrity);
         if !plan.warnings.is_empty() {
             tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI plan warnings");
         }
@@ -709,7 +712,7 @@ impl NativeVaapiDecoder {
         let damaged = plan
             .warnings
             .iter()
-            .any(pf_vaapi::is_integrity_warning_h265);
+            .any(pf_vaapi::PlanWarningH265::is_integrity);
         if !plan.warnings.is_empty() {
             tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI plan warnings");
         }
@@ -778,7 +781,10 @@ impl NativeVaapiDecoder {
         let mut shown: Vec<DmabufFrame> = Vec::new();
         let mut damaged_unit = false;
         for plan in &plans {
-            let damaged = plan.warnings.iter().any(pf_vaapi::is_integrity_warning_av1);
+            let damaged = plan
+                .warnings
+                .iter()
+                .any(pf_vaapi::PlanWarningAv1::is_integrity);
             damaged_unit |= damaged;
             if !plan.warnings.is_empty() {
                 tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI AV1 plan warnings");

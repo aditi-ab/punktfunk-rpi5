@@ -1,6 +1,6 @@
 //! One AV1 [`AuPlan`] into the DXVA picture-parameter and tile-control records
 //! `SubmitDecoderBuffers` takes — [`crate::dxva_av1`] layouts, [`crate::pic`] one
-//! codec over, twin of [`pf_vkdecode::pic_av1`].
+//! codec over, twin of `pf_vkdecode::pic_av1`.
 //!
 //! # Two arrays, two indices
 //!

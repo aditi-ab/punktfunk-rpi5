@@ -197,7 +197,7 @@ pub enum PlanWarning {
 
 impl PlanWarning {
     /// Whether the PICTURE is damaged. Twin of [`crate::h264::PlanWarning::is_integrity`];
-    /// `pf_vkdecode::is_integrity_warning_h265` delegates here.
+    /// every backend conceals on this.
     ///
     /// `NonZeroReorder` is not damage: it fires on the AU that activates an SPS
     /// (opening IRAP, ABR resolution change). Treating it as concealment would
@@ -1495,13 +1495,6 @@ mod tests {
         aus
     }
 
-    /// Integrity warnings a clean stream must not produce. Delegates rather than
-    /// restating: a `matches!` here would treat a future variant as clean.
-    /// [`PlanWarning::is_integrity`] is exhaustive, so a new variant fails there.
-    fn is_integrity_warning(w: &PlanWarning) -> bool {
-        w.is_integrity()
-    }
-
     /// Plan a vendored clip: every AU plans, no integrity warnings, every stored
     /// id reaches output once, outputs ascend POC within each IRAP period.
     fn plan_whole_clip(stream: &[u8]) -> (H265Planner, Vec<AuPlan>) {
@@ -1518,7 +1511,7 @@ mod tests {
 
         for plan in &plans {
             assert!(
-                !plan.warnings.iter().any(is_integrity_warning),
+                !plan.warnings.iter().any(PlanWarning::is_integrity),
                 "clean vector produced an integrity warning: {:?}",
                 plan.warnings
             );

@@ -1,4 +1,4 @@
-//! Native D3D11VA (DXVA) H.264/HEVC/AV1 decode for the Windows clients, counterpart of [`pf_vkdecode`].
+//! Native D3D11VA (DXVA) H.264/HEVC/AV1 decode for the Windows clients, counterpart of `pf-vkdecode`.
 //!
 //! CPU-testable half: everything between a [`pf_bitstream`] access-unit plan and the
 //! bytes `ID3D11VideoContext::SubmitDecoderBuffers` delivers. It never names a D3D11,
@@ -62,11 +62,6 @@ pub use pf_bitstream::h265::AuPlan as AuPlanH265;
 pub use pf_bitstream::h265::H265Planner;
 pub use pf_bitstream::h265::PlanError as PlanErrorH265;
 pub use pf_bitstream::h265::PlanWarning as PlanWarningH265;
-/// Integrity warnings: pf-vkdecode's list, so both native rungs conceal on the
-/// same predicate.
-pub use pf_vkdecode::is_integrity_warning;
-pub use pf_vkdecode::is_integrity_warning_av1;
-pub use pf_vkdecode::is_integrity_warning_h265;
 
 pub use config::align_surface;
 pub use config::pick_config;

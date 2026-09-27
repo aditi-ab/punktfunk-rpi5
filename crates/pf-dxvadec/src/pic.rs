@@ -1,11 +1,11 @@
 //! Per-AU H.264 conversion: one [`AuPlan`] into the `DXVA_PicParams_H264`,
 //! `DXVA_Qmatrix_H264` and slice-control records
 //! `ID3D11VideoContext::SubmitDecoderBuffers` is built from —
-//! [`pf_vkdecode::pic`]'s job, one hardware API over.
+//! `pf_vkdecode::pic`'s job, one hardware API over.
 //!
 //! Surfaces are slots. A `DXVA_PicEntry_H264` carries the uncompressed surface
 //! index, so DPB slot and decode-texture `ArraySlice` are the same number and
-//! this module drives the Vulkan rung's [`SlotMap`] unchanged.
+//! this module drives the shared [`SlotMap`] unchanged.
 //!
 //! `RefFrameList` is the marked DPB ([`AuPlan::dpb_refs`]), not the AU's
 //! reference set — DXVA asks for every picture currently used for reference;
@@ -204,7 +204,7 @@ impl From<SlotError> for PlanToDxvaError {
 /// `status_id` becomes `StatusReportFeedbackNumber`. libavcodec starts at 1;
 /// 0 is the value a driver reads out of a buffer nobody wrote.
 ///
-/// Atomicity matches [`pf_vkdecode::plan_to_vk`]: every fallible step runs
+/// Atomicity matches `pf_vkdecode::plan_to_vk`: every fallible step runs
 /// before any mutation of `slots`. Envelope and capacity first (read-only);
 /// references resolve against the pre-removal state (this AU's marking can
 /// evict a picture its slices still name); setup is assigned last, and

@@ -247,7 +247,7 @@ pub enum PlanWarning {
 
 impl PlanWarning {
     /// Does this warning mean the picture is damaged? Same contract as
-    /// [`crate::h264::PlanWarning::is_integrity`]; `pf_vkdecode` delegates here.
+    /// [`crate::h264::PlanWarning::is_integrity`]; every backend conceals on this.
     ///
     /// Every AV1 variant is damage: the codec has no reorder envelope and no MMCO
     /// to report, so the only warnings are missing or wrong pictures and a walk

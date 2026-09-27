@@ -385,7 +385,7 @@ impl NativeD3d11Decoder {
             let damaged = plan
                 .warnings
                 .iter()
-                .any(pf_dxvadec::is_integrity_warning_av1);
+                .any(pf_dxvadec::PlanWarningAv1::is_integrity);
             concealed |= damaged;
             match self.frame_av1(au, plan, damaged) {
                 Ok(Some(frame)) => shown = Some(frame),
@@ -596,7 +596,10 @@ impl NativeD3d11Decoder {
                     }
                     Err(e) => bail!("plan: {e}"),
                 };
-                let concealed = plan.warnings.iter().any(pf_dxvadec::is_integrity_warning);
+                let concealed = plan
+                    .warnings
+                    .iter()
+                    .any(pf_dxvadec::PlanWarning::is_integrity);
                 let session = ensure_session(
                     &mut self.session,
                     &self.device,
@@ -656,7 +659,7 @@ impl NativeD3d11Decoder {
                 let concealed = plan
                     .warnings
                     .iter()
-                    .any(pf_dxvadec::is_integrity_warning_h265);
+                    .any(pf_dxvadec::PlanWarningH265::is_integrity);
                 let session = ensure_session(
                     &mut self.session,
                     &self.device,

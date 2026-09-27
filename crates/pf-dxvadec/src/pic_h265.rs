@@ -1,7 +1,7 @@
 //! Per-AU H.265 conversion: one [`AuPlan`] into the `DXVA_PicParams_HEVC`,
 //! `DXVA_Qmatrix_HEVC` and slice-control records
 //! `ID3D11VideoContext::SubmitDecoderBuffers` takes — [`crate::pic`] one codec
-//! over, and the DXVA twin of [`pf_vkdecode::pic_h265`].
+//! over, and the DXVA twin of `pf_vkdecode::pic_h265`.
 //!
 //! HEVC decode takes no per-slice reference lists. Hardware re-derives 8.3.4
 //! from the slice bits, keyed by `RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr`

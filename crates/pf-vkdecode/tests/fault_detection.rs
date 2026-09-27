@@ -2,8 +2,8 @@
 //!
 //! Damages the vendored 250-AU host-shaped streams, plans each AU as
 //! `VkH264Decoder::decode` / `VkH265Decoder::decode` would, and scores with
-//! [`pf_vkdecode::is_integrity_warning`] /
-//! [`pf_vkdecode::is_integrity_warning_h265`]. Vulkan submit is omitted; it
+//! [`pf_vkdecode::PlanWarning::is_integrity`] /
+//! [`pf_vkdecode::H265PlanWarning::is_integrity`]. Vulkan submit is omitted; it
 //! cannot change a plan's warnings.
 //!
 //! H.264 drop is a `frame_num` gap. HEVC has none — POC jumps are legal —
@@ -17,9 +17,7 @@
 
 use pf_bitstream::h264::H264Planner;
 use pf_bitstream::h265::H265Planner;
-use pf_vkdecode::{
-    is_integrity_warning, is_integrity_warning_h265, AuFault, FaultAction, FaultMode,
-};
+use pf_vkdecode::{AuFault, FaultAction, FaultMode, H265PlanWarning, PlanWarning};
 use std::io::Cursor;
 
 /// 250 AUs, IDR then P — the host envelope. GPU tests share these files.
@@ -84,7 +82,7 @@ fn split_h265(stream: &[u8]) -> Vec<&[u8]> {
 /// Driver `Failed` on a prior frame has no analogue here.
 fn damaged_h264(planner: &mut H264Planner, au: &[u8]) -> bool {
     match planner.plan_au(au) {
-        Ok(plan) => plan.warnings.iter().any(is_integrity_warning),
+        Ok(plan) => plan.warnings.iter().any(PlanWarning::is_integrity),
         // A refused plan is concealment; the client never shows that picture.
         Err(_) => true,
     }
@@ -95,7 +93,7 @@ fn damaged_h264(planner: &mut H264Planner, au: &[u8]) -> bool {
 fn damaged_h265(planner: &mut H265Planner, au: &[u8]) -> bool {
     use pf_bitstream::h265::PlanError;
     match planner.plan_au(au) {
-        Ok(plan) => plan.warnings.iter().any(is_integrity_warning_h265),
+        Ok(plan) => plan.warnings.iter().any(H265PlanWarning::is_integrity),
         Err(PlanError::RaslSkipped { .. }) => false,
         Err(_) => true,
     }
