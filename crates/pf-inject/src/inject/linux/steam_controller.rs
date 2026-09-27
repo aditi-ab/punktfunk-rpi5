@@ -17,17 +17,10 @@ use super::steam_proto::{
     btn, parse_steam_output, sc_from_gamepad, serial_reply, serialize_deck_state,
     serialize_sc_state, SteamModel, SteamState, STEAMDECK_RDESC, STEAM_REPORT_LEN, STEAM_VENDOR,
 };
-use crate::uhid_abi::{
-    put_cstr, request_id, set_report_data, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2,
-    UHID_DESTROY, UHID_EVENT_SIZE, UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2,
-    UHID_OUTPUT, UHID_PATH, UHID_SET_REPORT, UHID_SET_REPORT_REPLY,
-};
+use crate::uhid_abi::{Create2, UhidDevice, UhidEvent};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use punktfunk_core::quic::RichInput;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -56,7 +49,7 @@ fn try_clear_lizard_mode() {
 
 /// Virtual Steam Deck or classic Steam Controller on `/dev/uhid`. Drop unbinds `hid-steam`.
 pub struct SteamDeckPad {
-    fd: File,
+    dev: UhidDevice,
     model: SteamModel,
     seq: u32,
     created: Instant,
@@ -74,45 +67,26 @@ impl SteamDeckPad {
         if model == SteamModel::Deck {
             try_clear_lizard_mode();
         }
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(UHID_PATH)
-            .with_context(|| {
-                format!("open {UHID_PATH} (is the uhid udev rule installed + are you in 'input'?)")
-            })?;
-        let mut pad = SteamDeckPad {
-            fd,
+        let (name, phys, uniq) = match model {
+            SteamModel::Deck => ("Steam Deck", "steam", "steam"),
+            SteamModel::Controller => ("Steam Controller", "steamctrl", "steamctrl"),
+        };
+        let dev = UhidDevice::open(&Create2 {
+            name: &format!("Punktfunk {name} {index}"),
+            phys: &format!("punktfunk/{phys}/{index}"),
+            uniq: &format!("punktfunk-{uniq}-{index}"),
+            rdesc: STEAMDECK_RDESC,
+            vendor: STEAM_VENDOR,
+            product: model.product(),
+            version: 0x0100,
+        })?;
+        Ok(SteamDeckPad {
+            dev,
             model,
             seq: 0,
             created: Instant::now(),
             menu_hold_since: None,
-        };
-        pad.send_create2(index).context("UHID_CREATE2 Steam pad")?;
-        Ok(pad)
-    }
-
-    fn send_create2(&mut self, index: u8) -> Result<()> {
-        let (name, phys, uniq) = match self.model {
-            SteamModel::Deck => ("Steam Deck", "steam", "steam"),
-            SteamModel::Controller => ("Steam Controller", "steamctrl", "steamctrl"),
-        };
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
-        // uhid_create2_req at 4: name[128] phys[64] uniq[64] rd_size bus vid pid version country rd_data.
-        put_cstr(&mut ev, 4, 128, &format!("Punktfunk {name} {index}"));
-        put_cstr(&mut ev, 132, 64, &format!("punktfunk/{phys}/{index}"));
-        put_cstr(&mut ev, 196, 64, &format!("punktfunk-{uniq}-{index}"));
-        ev[260..262].copy_from_slice(&(STEAMDECK_RDESC.len() as u16).to_ne_bytes());
-        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes());
-        ev[264..268].copy_from_slice(&STEAM_VENDOR.to_ne_bytes());
-        ev[268..272].copy_from_slice(&self.model.product().to_ne_bytes());
-        ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes());
-        ev[276..280].copy_from_slice(&0u32.to_ne_bytes());
-        ev[280..280 + STEAMDECK_RDESC.len()].copy_from_slice(STEAMDECK_RDESC);
-        self.fd.write_all(&ev).context("write UHID_CREATE2")?;
-        Ok(())
+        })
     }
 
     /// Deck: apply the mode-entry overlay and anti-toggle guard, then serialize.
@@ -127,14 +101,7 @@ impl SteamDeckPad {
             }
             SteamModel::Controller => serialize_sc_state(&mut r, st, self.seq),
         }
-
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
-        // uhid_input2_req: size u16 at 4, data at 6.
-        ev[4..6].copy_from_slice(&(r.len() as u16).to_ne_bytes());
-        ev[6..6 + r.len()].copy_from_slice(&r);
-        self.fd.write_all(&ev).context("write UHID_INPUT2")?;
-        Ok(())
+        self.dev.write_input(&r)
     }
 
     /// Create-time `b9.6` pulse still running (Deck only).
@@ -162,69 +129,21 @@ impl SteamDeckPad {
         buttons
     }
 
-    /// Non-blocking. Ack GET_REPORT (serial) and SET_REPORT (`err=0` or the kernel stalls ~5 s).
-    /// Parse `0xEB` rumble from SET_REPORT or OUTPUT.
+    /// Non-blocking. Answer GET_REPORT with the serial; `poll` acks SET_REPORT. Parse `0xEB`
+    /// rumble from SET_REPORT or OUTPUT.
     pub fn service(&mut self) -> Option<(u16, u16)> {
         let mut rumble = None;
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        while let Ok(n) = self.fd.read(&mut ev) {
-            if n < UHID_EVENT_SIZE {
-                break;
+        self.dev.poll(|dev, ev| match ev {
+            UhidEvent::Output(data) | UhidEvent::SetReport(data) => {
+                if let Some(r) = parse_steam_output(data).rumble {
+                    rumble = Some(r);
+                }
             }
-            match u32::from_ne_bytes([ev[0], ev[1], ev[2], ev[3]]) {
-                UHID_OUTPUT => {
-                    let size = u16::from_ne_bytes([ev[4100], ev[4101]]) as usize;
-                    let end = 4 + size.min(HID_MAX_DESCRIPTOR_SIZE);
-                    if let Some(r) = parse_steam_output(&ev[4..end]).rumble {
-                        rumble = Some(r);
-                    }
-                }
-                UHID_GET_REPORT => {
-                    let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
-                    let _ = self.reply_get_report(id, &serial_reply("PUNKTFUNK01"));
-                }
-                UHID_SET_REPORT => {
-                    let id = request_id(&ev);
-                    // Kernel-declared size; a fixed window truncates or parses leftover bytes in this reused buffer.
-                    if let Some(r) = parse_steam_output(set_report_data(&ev)).rumble {
-                        rumble = Some(r);
-                    }
-                    let _ = self.reply_set_report(id);
-                }
-                _ => {}
+            UhidEvent::GetReport { id, .. } => {
+                let _ = dev.reply_get_report(id, Some(&serial_reply("PUNKTFUNK01")));
             }
-        }
+        });
         rumble
-    }
-
-    fn reply_get_report(&mut self, id: u32, data: &[u8]) -> Result<()> {
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_GET_REPORT_REPLY.to_ne_bytes());
-        // uhid_get_report_reply_req: id u32 [4..8], err u16 [8..10], size u16 [10..12], data [12..].
-        ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        ev[8..10].copy_from_slice(&0u16.to_ne_bytes());
-        ev[10..12].copy_from_slice(&(data.len() as u16).to_ne_bytes());
-        ev[12..12 + data.len()].copy_from_slice(data);
-        self.fd.write_all(&ev).context("UHID_GET_REPORT_REPLY")?;
-        Ok(())
-    }
-
-    fn reply_set_report(&mut self, id: u32) -> Result<()> {
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_SET_REPORT_REPLY.to_ne_bytes());
-        // uhid_set_report_reply_req: id u32 [4..8], err u16 [8..10].
-        ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        ev[8..10].copy_from_slice(&0u16.to_ne_bytes());
-        self.fd.write_all(&ev).context("UHID_SET_REPORT_REPLY")?;
-        Ok(())
-    }
-}
-
-impl Drop for SteamDeckPad {
-    fn drop(&mut self) {
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_DESTROY.to_ne_bytes());
-        let _ = self.fd.write_all(&ev);
     }
 }
 

@@ -854,8 +854,8 @@ pub mod triton_usbip;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/triton_windows.rs"]
 pub mod triton_windows;
-/// `/dev/uhid` event ABI shared by every UHID gamepad backend — constants each used to
-/// transcribe, plus field accessors that read a payload's real length.
+/// `/dev/uhid` event ABI and [`uhid_abi::UhidDevice`], the one device every UHID gamepad
+/// backend drives.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/uhid_abi.rs"]
 pub mod uhid_abi;
