@@ -13,6 +13,9 @@
 /// Wait for a dmabuf's implicit read-ready fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` + poll).
 #[cfg(target_os = "linux")]
 pub mod dmabuf_fence;
+/// The `I915_GEM_WAIT` that keeps Intel's media engine clocked while it decodes.
+#[cfg(target_os = "linux")]
+pub mod i915_boost;
 
 #[cfg(target_os = "linux")]
 mod imp;

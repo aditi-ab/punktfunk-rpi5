@@ -797,7 +797,7 @@ pub fn decodable_codecs() -> u8 {
 }
 
 /// PCI vendor of Intel GPUs.
-const VENDOR_INTEL: u32 = 0x8086;
+pub(crate) const VENDOR_INTEL: u32 = 0x8086;
 
 /// The decode ops the native Vulkan rung may use, from what the device advertises.
 /// Intel's Mesa driver decodes H.264 and HEVC bit-exact with libavcodec but not AV1,
@@ -1410,8 +1410,8 @@ impl Decoder {
 
     /// Wait for a Vulkan-Video GPU decode (timeline). `false` declines the
     /// sample: not this backend, timeout, missing ledger pair, or stale generation.
-    pub fn wait_hw_decoded(&self, timeline_sem: u64, value: u64, timeout_ns: u64) -> bool {
-        match &self.backend {
+    pub fn wait_hw_decoded(&mut self, timeline_sem: u64, value: u64, timeout_ns: u64) -> bool {
+        match &mut self.backend {
             Backend::NativeVulkan(d) => d.wait_timeline(timeline_sem, value, timeout_ns),
             _ => false,
         }

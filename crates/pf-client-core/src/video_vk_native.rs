@@ -249,6 +249,16 @@ impl Codec {
             Codec::Av1(d) => d.decode_order(),
         }
     }
+
+    /// The bitstream ring's dma-buf, once exported and a session exists.
+    #[cfg(target_os = "linux")]
+    fn bitstream_dmabuf(&self) -> Option<std::os::fd::RawFd> {
+        match self {
+            Codec::H264(d) => d.bitstream_dmabuf(),
+            Codec::H265(d) => d.bitstream_dmabuf(),
+            Codec::Av1(d) => d.bitstream_dmabuf(),
+        }
+    }
 }
 
 /// Status of previously shipped frames from one [`NativeVulkanDecoder::settle_statuses`].
@@ -567,6 +577,9 @@ pub(crate) struct NativeVulkanDecoder {
     /// `PUNKTFUNK_AU_FAULT`. Armed here so a faulted AU is byte-identical to a lossy
     /// network delivery; other backends cannot see a typo'd variable.
     fault: Option<pf_vkdecode::AuFault>,
+    /// Intel on i915: the GEM wait that keeps the media engine clocked (`wait_timeline`).
+    #[cfg(target_os = "linux")]
+    boost: Option<pf_zerocopy::i915_boost::I915Boost>,
 }
 
 // SAFETY: used strictly serially through `&mut self` from the session pump that owns
@@ -602,11 +615,23 @@ impl NativeVulkanDecoder {
         // `video_decode` means the presenter enabled the decode extension stack and
         // per-codec decode extensions. Decoders re-check the family's
         // `videoCodecOperations` — same fact `native_vulkan_gate` and `vk/setup.rs` use.
+
+        // Intel's media engine idles at 100 MHz and i915 raises it only for its own GEM
+        // wait, so this rung waits every decode through one, on the exported ring.
+        #[cfg(target_os = "linux")]
+        let boost = (vk.vendor_id == crate::video::VENDOR_INTEL && vk.dmabuf_import)
+            .then(pf_zerocopy::i915_boost::I915Boost::open)
+            .flatten();
+        #[cfg(not(target_os = "linux"))]
+        let boost: Option<()> = None;
         let dec = match codec {
             NativeCodec::H264 => {
                 // SAFETY: the handle contract stated directly above.
-                let d = unsafe { VkH264Decoder::new(&handles, lock) }
+                let mut d = unsafe { VkH264Decoder::new(&handles, lock) }
                     .map_err(|e| anyhow!("VkH264Decoder init: {e}"))?;
+                if boost.is_some() {
+                    d.export_bitstream();
+                }
                 Codec::H264(d)
             }
             NativeCodec::H265 => {
@@ -618,6 +643,9 @@ impl NativeVulkanDecoder {
                 // A host may cut a second slice whatever the caps asked for.
                 if !crate::video::multi_slice_decodable(Some(vk.vendor_id)) {
                     d.refuse_multi_slice();
+                }
+                if boost.is_some() {
+                    d.export_bitstream();
                 }
                 // Does this driver advertise that format for this profile? Same query
                 // `ensure_state` would run at the first AU — only the timing differs.
@@ -641,8 +669,11 @@ impl NativeVulkanDecoder {
                 // ladder walks; discovered at first AU the only exit is an error streak.
                 let wanted = picture_format("AV1", stream)?;
                 // SAFETY: the handle contract stated directly above.
-                let d = unsafe { VkAv1Decoder::new(&handles, lock) }
+                let mut d = unsafe { VkAv1Decoder::new(&handles, lock) }
                     .map_err(|e| anyhow!("VkAv1Decoder init: {e}"))?;
+                if boost.is_some() {
+                    d.export_bitstream();
+                }
                 d.probe_stream_support(
                     stream.chroma_format_idc,
                     // AV1 profile key takes absolute bit depth (8/10), not H.265's
@@ -708,6 +739,8 @@ impl NativeVulkanDecoder {
             },
             want_recovery: false,
             fault,
+            #[cfg(target_os = "linux")]
+            boost,
         })
     }
 
@@ -913,7 +946,14 @@ impl NativeVulkanDecoder {
     /// Bounded wait for a shipped frame's decode-complete signal (pump decode-latency).
     /// Lookup is the liveness proof: an unreleased frame pins its pool; a pair matching
     /// nothing (already settled, or stray) declines the sample instead of unknown handles.
-    pub(crate) fn wait_timeline(&self, sem: u64, value: u64, timeout_ns: u64) -> bool {
+    pub(crate) fn wait_timeline(&mut self, sem: u64, value: u64, timeout_ns: u64) -> bool {
+        // The GEM wait is the one i915 boosts for; the semaphore wait then returns at once.
+        #[cfg(target_os = "linux")]
+        if let (Some(boost), Some(fd)) = (self.boost.as_mut(), self.dec.bitstream_dmabuf()) {
+            if boost.track(fd) {
+                boost.wait(timeout_ns.min(i64::MAX as u64) as i64);
+            }
+        }
         self.outstanding
             .iter()
             .find(|s| s.frame.semaphore.as_raw() == sem && s.frame.value == value)

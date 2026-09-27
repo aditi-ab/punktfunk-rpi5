@@ -456,6 +456,8 @@ pub struct VkAv1Decoder {
     ready: VecDeque<DecodedVkFrame>,
     /// Retired generations' pools with consumer-held images (die on last token).
     graveyard: Vec<RetiredPool>,
+    /// [`Self::export_bitstream`].
+    export_bitstream: bool,
     last_warnings: Vec<PlanWarning>,
     /// Decode-order ordinal stamped onto frames. Survives rebuilds: it describes
     /// the stream, not the Vulkan objects.
@@ -506,7 +508,21 @@ impl VkAv1Decoder {
             recovery: RecoveryLatch::default(),
             awaiting_key: false,
             level_advisory_warned: false,
+            export_bitstream: false,
         })
+    }
+
+    /// Export the bitstream ring as a dma-buf from the next session on, for an owner that
+    /// waits the decode through the kernel ([`Self::bitstream_dmabuf`]).
+    pub fn export_bitstream(&mut self) {
+        self.export_bitstream = true;
+    }
+
+    /// The bitstream ring's dma-buf, while its backing lives; every decode writes fences
+    /// onto it. `None` before the first session or without an export.
+    #[cfg(unix)]
+    pub fn bitstream_dmabuf(&self) -> Option<std::os::fd::RawFd> {
+        self.state.as_ref().and_then(|s| s.ring.dmabuf_fd())
     }
 
     /// Caps check before any AU. `film_grain` is part of the AV1 decode profile;
@@ -1265,6 +1281,7 @@ impl VkAv1Decoder {
                     caps.min_bitstream_size_alignment,
                 ),
                 decode_profile,
+                self.export_bitstream,
             )
             .map_err(VkDecodeError::from)?;
             let ops = OpRing::create(

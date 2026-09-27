@@ -604,6 +604,8 @@ pub struct VkH264Decoder {
     ready: VecDeque<DecodedVkFrame>,
     /// Retired generations' pools with consumer-held images (die on last token).
     graveyard: Vec<RetiredPool>,
+    /// [`Self::export_bitstream`].
+    export_bitstream: bool,
     /// Most recent plan warnings ([`Self::take_warnings`]).
     last_warnings: Vec<PlanWarning>,
     /// Outstanding recovery-point SEI ([`crate::recovery`]). Survives session
@@ -665,7 +667,21 @@ impl VkH264Decoder {
             generation: 0,
             device_lost: false,
             level_clamp_warned: false,
+            export_bitstream: false,
         })
+    }
+
+    /// Export the bitstream ring as a dma-buf from the next session on, for an owner that
+    /// waits the decode through the kernel ([`Self::bitstream_dmabuf`]).
+    pub fn export_bitstream(&mut self) {
+        self.export_bitstream = true;
+    }
+
+    /// The bitstream ring's dma-buf, while its backing lives; every decode writes fences
+    /// onto it. `None` before the first session or without an export.
+    #[cfg(unix)]
+    pub fn bitstream_dmabuf(&self) -> Option<std::os::fd::RawFd> {
+        self.state.as_ref().and_then(|s| s.ring.dmabuf_fd())
     }
 
     /// Decode one access unit. Returns the next display-ready frame if the
@@ -1457,6 +1473,7 @@ impl VkH264Decoder {
                     caps.min_bitstream_size_alignment,
                 ),
                 decode_profile,
+                self.export_bitstream,
             )
             .map_err(VkDecodeError::from)?;
             let ops = OpRing::create(
