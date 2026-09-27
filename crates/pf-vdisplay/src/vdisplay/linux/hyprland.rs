@@ -46,11 +46,9 @@ fn picker_shim_path() -> String {
 }
 
 fn xdph_config_path() -> Result<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME set"))?;
-    Ok(base.join("hypr").join("xdph.conf"))
+    Ok(crate::portal_config::user_config_dir()?
+        .join("hypr")
+        .join("xdph.conf"))
 }
 const XDPH_BLOCK: crate::portal_config::Block<'static> =
     crate::portal_config::Block::Hyprlang("screencopy");
@@ -744,19 +742,6 @@ fn warn_primary_is_not_expressible() {
     );
 }
 
-/// Which heads `exclusive` should disable: enabled, not ours, not managed.
-///
-/// Pure so the group-awareness rule is unit-testable without a compositor.
-/// `managed` is [`is_managed_output`], covering a second host's outputs, so a
-/// concurrent session cannot be blacked out. `ours` is excluded by name too.
-fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> Vec<String> {
-    heads
-        .iter()
-        .filter(|h| h.enabled && !h.managed && h.connector != ours)
-        .map(|h| h.connector.clone())
-        .collect()
-}
-
 /// DPMS every head that is not ours and not a sibling's, for a **gamescope**
 /// session honoring `Topology::Exclusive` — see [`crate::panel_dpms`].
 ///
@@ -764,13 +749,14 @@ fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> V
 /// known undo is re-reading the operator's whole config ([`restore_heads`]),
 /// dropping every runtime override. DPMS is a separate axis (`dispatch dpms on
 /// <name>` does not re-enable a *disabled* head). A gamescope spawn owns no
-/// Hyprland output, hence empty `ours`.
+/// Hyprland output, hence empty `ours`. No keep list: the gamescope darken
+/// ignores `keep_monitors` on every compositor.
 pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
     let Ok(heads) = list_monitors() else {
         return Vec::new();
     };
     let mut changed = Vec::new();
-    for name in heads_to_disable(&heads, "") {
+    for name in crate::monitors::heads_to_darken(&heads, "", &[]) {
         match dpms_one(&name, on) {
             // Only a head this call moved. The dispatcher toggles, so "fixing"
             // one already in the wanted state would break it, and the re-light
@@ -1201,8 +1187,10 @@ fn lua_workspace_focus_expr(ws: &str) -> String {
     format!("hl.dsp.focus({{ workspace = \"{ws}\" }})")
 }
 
-/// Disable every non-managed head for an `exclusive` session, returning the
-/// ones actually disabled (input to [`restore_heads`]). Best-effort per head.
+/// Disable every head [`crate::monitors::darkens`] names for an `exclusive`
+/// session, returning the ones actually disabled (input to [`restore_heads`]).
+/// `managed` is [`is_managed_output`], so a concurrent session is never blacked
+/// out, and `keep_monitors` stays lit. Best-effort per head.
 fn disable_other_heads(ours: &str) -> Vec<String> {
     let heads = match list_monitors() {
         Ok(h) => h,
@@ -1215,11 +1203,12 @@ fn disable_other_heads(ours: &str) -> Vec<String> {
             return Vec::new();
         }
     };
-    let targets = heads_to_disable(&heads, ours);
+    let keep = crate::policy::prefs().get().keep_monitors;
+    let targets = crate::monitors::heads_to_darken(&heads, ours, &keep);
     if targets.is_empty() {
         tracing::info!(
             "hyprland: `topology: exclusive` had nothing to disable — no enabled head besides the \
-             managed ones (a headless box, or a sibling session already took the desk)"
+             managed and kept ones (a headless box, or a sibling session already took the desk)"
         );
         return Vec::new();
     }
@@ -2232,7 +2221,10 @@ mod tests {
             // would switch on a head the operator had left dark.
             head("DP-3", false),
         ];
-        assert_eq!(heads_to_disable(&heads, ours), vec!["DP-1", "HDMI-A-1"]);
+        assert_eq!(
+            crate::monitors::heads_to_darken(&heads, ours, &[]),
+            vec!["DP-1", "HDMI-A-1"]
+        );
     }
 
     /// A box with no physical head has nothing to disable, so no restore is
@@ -2240,7 +2232,7 @@ mod tests {
     #[test]
     fn exclusive_on_a_headless_box_disables_nothing() {
         let ours = "PF-4242-1";
-        assert!(heads_to_disable(&[head(ours, true)], ours).is_empty());
+        assert!(crate::monitors::heads_to_darken(&[head(ours, true)], ours, &[]).is_empty());
     }
 
     /// Both config eras, pinned. `hyprctl` answers a wrong-era or malformed

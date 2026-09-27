@@ -658,18 +658,7 @@ mod pool {
         if parked {
             Linger::Forever
         } else {
-            effective_linger(force_immediate, policy)
-        }
-    }
-
-    /// Linger applied on release. A deliberate quit (`force_immediate`) turns a
-    /// linger window into Immediate. `Forever` outranks quit: the screen stays
-    /// until `/display/release`.
-    fn effective_linger(force_immediate: bool, policy: Linger) -> Linger {
-        match (force_immediate, policy) {
-            (true, Linger::Forever) => Linger::Forever,
-            (true, _) => Linger::Immediate,
-            (false, l) => l,
+            lifecycle::effective_linger(force_immediate, policy)
         }
     }
 
@@ -847,22 +836,6 @@ mod pool {
             drop(test_entry("gamescope", 1, None));
             assert!(!hdr_capture_failed(HdrSource::VirtualOutput));
             assert!(hdr_capture_failed(HdrSource::PortalMonitor));
-        }
-
-        #[test]
-        fn deliberate_quit_skips_the_linger_window_but_never_a_pin() {
-            use std::time::Duration;
-            assert_eq!(
-                effective_linger(true, Linger::For(Duration::from_secs(10))),
-                Linger::Immediate
-            );
-            assert_eq!(effective_linger(true, Linger::Immediate), Linger::Immediate);
-            assert_eq!(effective_linger(true, Linger::Forever), Linger::Forever);
-            assert_eq!(
-                effective_linger(false, Linger::For(Duration::from_secs(10))),
-                Linger::For(Duration::from_secs(10))
-            );
-            assert_eq!(effective_linger(false, Linger::Forever), Linger::Forever);
         }
 
         /// A parked seat survives `keep_alive: off`, which is what every other display on that

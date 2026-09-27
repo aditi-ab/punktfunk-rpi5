@@ -67,17 +67,24 @@ fn edid_lock_available() -> bool {
     false
 }
 
-/// Whether KWin is the backend this host will drive. Cached like the gamescope probe beside
-/// it, and for the same reason: `available()` walks /proc and forks.
+/// Can any backend here keep a listed monitor lit under `exclusive`? Cached like the
+/// gamescope probe beside it, and for the same reason: `available()` walks /proc and forks.
 #[cfg(target_os = "linux")]
-fn kwin_available() -> bool {
+fn keep_monitors_available() -> bool {
+    use crate::vdisplay::Compositor;
     static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PRESENT
-        .get_or_init(|| crate::vdisplay::available().contains(&crate::vdisplay::Compositor::Kwin))
+    *PRESENT.get_or_init(|| {
+        crate::vdisplay::available().iter().any(|c| {
+            matches!(
+                c,
+                Compositor::Kwin | Compositor::Hyprland | Compositor::Wlroots
+            )
+        })
+    })
 }
 
 /// Can any backend here put a launch on a workspace of its own
-/// (`vdisplay::claim_workspace`)? Cached: see [`kwin_available`].
+/// (`vdisplay::claim_workspace`)? Cached: see [`keep_monitors_available`].
 #[cfg(target_os = "linux")]
 fn workspace_placement_available() -> bool {
     use crate::vdisplay::Compositor;
@@ -159,11 +166,10 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
     if workspace_placement_available() {
         enforced.push("launch_workspace".into());
     }
-    // KWin only. wlroots, Hyprland, Mutter and the Windows CCD isolate all darken every head
-    // they find, so the keep-list would store and do nothing there — the dead control this
-    // whole gate exists to prevent.
+    // KWin, Hyprland and sway. Mutter and the Windows CCD isolate darken every head they
+    // find, so the keep-list would store and do nothing there.
     #[cfg(target_os = "linux")]
-    if kwin_available() {
+    if keep_monitors_available() {
         enforced.push("keep_monitors".into());
     }
     // What acts per device. The rest are stored and served but read inside a backend

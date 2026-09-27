@@ -66,8 +66,8 @@ On gamescope the game keeps running as long as its screen does.
   and before each library launch; a window that opens later follows whatever has focus then.
 - **Hyprland** turns monitors back on with `hyprctl reload` when the screen is removed. That
   re-reads your config: changes made with `hyprctl keyword` are lost, and `exec =` lines run again.
-- **KWin** can keep chosen monitors lit under **Turn off**: set each to **Stay on** in **Your
-  monitors**.
+- **KWin, Sway and Hyprland** can keep chosen monitors lit under **Turn off**: set each to **Stay
+  on** in **Your monitors**.
 - Punktfunk never turns off a screen it created, so a second device never goes dark.
 
 ### A second device connects
