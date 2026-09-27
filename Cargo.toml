@@ -52,6 +52,7 @@ members = [
     "tools/latency-probe",
     "tools/loss-harness",
     "tools/scroll-probe",
+    "tools/wl-scanout-probe",
 ]
 # Standalone PoC (built on its own; pulls usbip/tokio/libusb we don't want in the workspace).
 # The vendored `ndk` is a [patch.crates-io] source, not a member: it only compiles for the

@@ -1,0 +1,23 @@
+# What a Wayland compositor does with a YUV dma-buf: dumps its linux-dmabuf feedback and colour
+# protocols, then presents Vulkan-exported NV12/P010 test buffers fullscreen, as the toplevel's
+# buffer and as a subsurface over a black parent, and reports the presentation feedback (zero-copy,
+# vsync, commit-to-glass). The measurement behind the client's native scanout path.
+[package]
+name = "wl-scanout-probe"
+description = "On-glass probe: does this compositor scan a YUV dma-buf out, and how late"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+anyhow = "1"
+ash = { version = "0.38", features = ["loaded"] }
+rustix = { version = "1", features = ["event", "fs", "time"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+
+[lints]
+workspace = true
