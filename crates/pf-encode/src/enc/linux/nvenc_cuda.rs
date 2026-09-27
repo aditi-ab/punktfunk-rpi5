@@ -2582,6 +2582,9 @@ impl NvencCudaEncoder {
             if let Err(e) = (api().encode_picture)(self.encoder, &mut pic).nv_ok() {
                 // Nothing owns the mapping yet; left mapped, the slot's next map fails too.
                 let _ = (api().unmap_input_resource)(self.encoder, mp.mappedResource);
+                // The forced IDR and the anchor were spent on a picture that never went out.
+                self.force_kf |= flags != 0;
+                self.pending_anchor |= anchor;
                 return Err(nvenc_status::call_err("encode_picture", e));
             }
             t_pic = tp.elapsed();
