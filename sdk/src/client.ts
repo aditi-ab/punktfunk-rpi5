@@ -8,19 +8,19 @@ import {
 	Data,
 	Effect,
 	Layer,
-	Result,
 	Schema as S,
 	Stream,
 } from "effect";
 import type { Connection } from "./connection.js";
 import { HttpStatusError, httpRequest } from "./http.js";
 import {
+	classifyFrame,
 	type EventStreamOptions,
 	type SseFrame,
 	SseAuthError,
 	sseFrames,
 } from "./sse.js";
-import { decodeHostEvent, type HostEvent } from "./wire.js";
+import type { HostEvent } from "./wire.js";
 
 /** Bad credentials — the token (or paired cert) was rejected. */
 export class AuthError extends Data.TaggedError("AuthError")<{
@@ -121,29 +121,26 @@ export const makeService = (cfg: Connection): PunktfunkHostService => {
 		// primitives and keeps the `warn` side effects exactly where they were.
 		return eventsRaw(opts).pipe(
 			Stream.flatMap((frame) => {
-				if (frame.event === "dropped") {
-					warn(
-						"event cursor fell off the host's ring — resync via the REST snapshots",
-					);
-					return Stream.empty;
+				const c = classifyFrame(frame);
+				switch (c.tag) {
+					case "event":
+						return Stream.succeed(c.event);
+					case "dropped":
+						warn(
+							"event cursor fell off the host's ring — resync via the REST snapshots",
+						);
+						break;
+					case "garbled":
+						warn(`unparseable event frame (${frame.event})`);
+						break;
+					// An unknown kind from a NEWER host is expected (additive-only wire) — it
+					// rides the raw channel; a consumer that wants it uses eventsRaw.
+					case "unknown":
+						warn(`unknown/undecodable event kind "${frame.event}"`);
+						break;
 				}
-				// End of the host's catch-up; not an event, and not worth a warning per connect.
-				if (frame.event === "live") return Stream.empty;
-				let json: unknown;
-				try {
-					json = JSON.parse(frame.data);
-				} catch {
-					warn(`unparseable event frame (${frame.event})`);
-					return Stream.empty;
-				}
-				const decoded = decodeHostEvent(json);
-				if (Result.isFailure(decoded)) {
-					// An unknown kind from a NEWER host is expected (additive-only wire) —
-					// it rides the raw channel; a consumer that wants it uses eventsRaw.
-					warn(`unknown/undecodable event kind "${frame.event}"`);
-					return Stream.empty;
-				}
-				return Stream.succeed(decoded.success);
+				// `live` ends the host's catch-up; not worth a warning per connect.
+				return Stream.empty;
 			}),
 		);
 	};

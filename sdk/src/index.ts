@@ -9,7 +9,7 @@
 //   pf.events.on("pairing.pending", async (e) => {
 //     await notifyPhone(`Pairing request from ${e.device.name}`);
 //   });
-import { type Effect, Result } from "effect";
+import type { Effect } from "effect";
 import { type HostApi, makeHostApi } from "./api.js";
 import type { PunktfunkHost } from "./client.js";
 import {
@@ -18,9 +18,8 @@ import {
 	resolveConfig,
 } from "./config.js";
 import { HttpStatusError, httpRequest } from "./http.js";
-import { type SseFrame, sseFrames } from "./sse.js";
+import { classifyFrame, type SseFrame, sseFrames } from "./sse.js";
 import {
-	decodeHostEvent,
 	type EventOf,
 	type HostEvent,
 	type HostEventKind,
@@ -126,24 +125,11 @@ export const connect = async (options?: ConnectOptions): Promise<Punktfunk> => {
 			try {
 				for await (const frame of pump) {
 					if (closed) break;
-					if (frame.event === "dropped") {
-						dispatch("dropped", frame);
-						continue;
-					}
-					// End of the host's catch-up, not an event: never an `"unknown"` dispatch.
-					if (frame.event === "live") continue;
-					let json: unknown;
-					try {
-						json = JSON.parse(frame.data);
-					} catch {
-						continue;
-					}
-					const decoded = decodeHostEvent(json);
-					if (Result.isFailure(decoded)) {
-						dispatch("unknown", json);
-						continue;
-					}
-					dispatch(decoded.success.kind, decoded.success);
+					// `live` and `garbled` frames are not dispatched at all.
+					const c = classifyFrame(frame);
+					if (c.tag === "dropped") dispatch("dropped", frame);
+					else if (c.tag === "unknown") dispatch("unknown", c.json);
+					else if (c.tag === "event") dispatch(c.event.kind, c.event);
 				}
 			} catch (e) {
 				if (!closed) warn(`event stream stopped: ${e}`);
