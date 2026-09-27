@@ -413,23 +413,24 @@ pub unsafe extern "C" fn monitor_query_modes2(
     }
 }
 
-/// Read an `IDDCX_PATH*`'s `Flags` field as its underlying `u32`, without depending on the bindgen
-/// enum shape (newtype vs constified int): the field is a 4-byte `#[repr]` over `u32` either way, so
-/// a byte-read of it is the flag bits. `IDDCX_PATH_FLAGS_CHANGED = 0x1`, `_ACTIVE = 0x2` (IddCx.h).
+/// The framework's `pPaths` array as a slice; empty when `ptr` is null.
 ///
 /// # Safety
-/// `flags` must point at a live `IDDCX_PATH{,2}::Flags` field (4 readable bytes).
-unsafe fn path_flag_bits<T>(flags: &T) -> u32 {
-    // SAFETY: the caller passes a live `Flags` field; every IDDCX_PATH_FLAGS binding is a 4-byte
-    // scalar over u32, so reading it as u32 yields the flag bits regardless of the wrapper shape.
-    unsafe { core::ptr::read((flags as *const T).cast::<u32>()) }
+/// A non-null `ptr` must point at `count` initialized entries that outlive the returned slice.
+unsafe fn path_slice<'a, P>(ptr: *const P, count: u32) -> &'a [P] {
+    if ptr.is_null() {
+        return &[];
+    }
+    // SAFETY: non-null, and per this function's contract `count` initialized entries.
+    unsafe { core::slice::from_raw_parts(ptr, count as usize) }
 }
 
 /// Commit is a no-op for assign to drive — but the OS stamps each path ACTIVE/CHANGED here, and an
 /// active→inactive flip on OUR head (while a sibling stays active) is the driver-visible form of
 /// Enrico's hypothesis: the OS idles the virtual head like a physical one and the drain loop then
 /// sees only E_PENDING with no unassign. Log every commit's per-path flags so a hole can be lined
-/// up against a path the OS just deactivated. Low frequency (topology changes only).
+/// up against a path the OS just deactivated. Low frequency (topology changes only). `Flags` is a
+/// plain integer (bindgen `ModuleConsts`): `IDDCX_PATH_FLAGS_CHANGED = 0x1`, `_ACTIVE = 0x2`.
 pub unsafe extern "C" fn adapter_commit_modes(
     _adapter: iddcx::IDDCX_ADAPTER,
     p_in: *const iddcx::IDARG_IN_COMMITMODES,
@@ -437,11 +438,12 @@ pub unsafe extern "C" fn adapter_commit_modes(
     // SAFETY: the framework supplies a valid, live input-args pointer for the call.
     let in_args = unsafe { &*p_in };
     let count = in_args.PathCount;
-    for i in 0..count as usize {
-        // SAFETY: `pPaths` points to `PathCount` valid `IDDCX_PATH` entries (framework contract).
-        let path = unsafe { &*in_args.pPaths.add(i) };
-        // SAFETY: `path.Flags` is a live IDDCX_PATH_FLAGS field on the framework's path array.
-        let bits = unsafe { path_flag_bits(&path.Flags) };
+    // SAFETY: `pPaths` points to `PathCount` valid `IDDCX_PATH` entries (framework contract).
+    for (i, path) in unsafe { path_slice(in_args.pPaths, count) }
+        .iter()
+        .enumerate()
+    {
+        let bits = path.Flags;
         dbglog!(
             "[pf-vd] commit_modes: path[{i}/{count}] monitor={:?} active={} changed={} flags={bits:#x}",
             path.MonitorObject,
@@ -462,11 +464,12 @@ pub unsafe extern "C" fn adapter_commit_modes2(
     // SAFETY: the framework supplies a valid, live input-args pointer for the call.
     let in_args = unsafe { &*p_in };
     let count = in_args.PathCount;
-    for i in 0..count as usize {
-        // SAFETY: `pPaths` points to `PathCount` valid `IDDCX_PATH2` entries (framework contract).
-        let path = unsafe { &*in_args.pPaths.add(i) };
-        // SAFETY: `path.Flags` is a live IDDCX_PATH_FLAGS field on the framework's path array.
-        let bits = unsafe { path_flag_bits(&path.Flags) };
+    // SAFETY: `pPaths` points to `PathCount` valid `IDDCX_PATH2` entries (framework contract).
+    for (i, path) in unsafe { path_slice(in_args.pPaths, count) }
+        .iter()
+        .enumerate()
+    {
+        let bits = path.Flags;
         dbglog!(
             "[pf-vd] commit_modes2: path[{i}/{count}] monitor={:?} active={} changed={} flags={bits:#x}",
             path.MonitorObject,
