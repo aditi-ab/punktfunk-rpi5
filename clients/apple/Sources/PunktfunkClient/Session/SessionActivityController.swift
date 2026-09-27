@@ -23,10 +23,14 @@ final class SessionActivityController {
     /// How far past the next expected update to mark the content stale — a frozen opt-out session
     /// then greys out instead of showing a lying clock.
     private static let staleWindow: TimeInterval = 90
+    private static var swept = false
 
-    /// End any Activity left over from a previous launch that was killed mid-session. Call once at
-    /// app start (ContentView.onAppear).
+    /// End any Activity left over from a previous launch that was killed mid-session. Runs once
+    /// per process: every window's appearance calls it, and a later window's sweep would end
+    /// the Activity of a session live in the first.
     static func sweepOrphans() {
+        guard !swept else { return }
+        swept = true
         Task {
             for activity in Activity<PunktfunkSessionAttributes>.activities {
                 await activity.end(nil, dismissalPolicy: .immediate)

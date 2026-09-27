@@ -60,9 +60,16 @@ final class DisplaySleepGuard {
         #else
             // iOS/iPadOS/tvOS: app-wide, and ignored while backgrounded — the background keep-alive
             // (audio-only, video dropped) correctly lets the device sleep without touching this.
+            Self.holders += 1
             UIApplication.shared.isIdleTimerDisabled = true
         #endif
     }
+
+    #if !os(macOS)
+        /// Guards holding the app-wide idle timer off. An iPad runs a session per window, and
+        /// one window's disconnect must not re-arm the timer under another's stream.
+        private static var holders = 0
+    #endif
 
     /// Idempotent — safe to call when not held (`disconnect` runs on paths that never streamed).
     func release() {
@@ -80,7 +87,8 @@ final class DisplaySleepGuard {
                 userActivityAssertion = IOPMAssertionID(0)
             }
         #else
-            UIApplication.shared.isIdleTimerDisabled = false
+            Self.holders -= 1
+            UIApplication.shared.isIdleTimerDisabled = Self.holders > 0
         #endif
     }
 
