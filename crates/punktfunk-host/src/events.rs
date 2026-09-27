@@ -438,6 +438,9 @@ pub enum EventKind {
     /// Boot-time reconciliation by the NEW binary after a successful apply.
     #[serde(rename = "update.applied")]
     UpdateApplied { from: String, to: String },
+    /// A managed emulator was installed or removed. Re-read `GET /api/v1/emulators`.
+    #[serde(rename = "emulators.changed")]
+    EmulatorsChanged { id: String },
     #[serde(rename = "plugins.changed")]
     PluginsChanged {
         /// Plugin that registered, restarted, deregistered, or lease-expired. Re-read `GET /api/v1/plugins`.
@@ -495,6 +498,7 @@ impl EventKind {
             EventKind::UpdateAvailable { .. } => "update.available",
             EventKind::UpdateApplied { .. } => "update.applied",
             EventKind::PluginsChanged { .. } => "plugins.changed",
+            EventKind::EmulatorsChanged { .. } => "emulators.changed",
             EventKind::StoreChanged => "store.changed",
             EventKind::SettingsChanged { .. } => "settings.changed",
             EventKind::ActionInvoked { .. } => "action.invoked",

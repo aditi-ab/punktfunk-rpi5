@@ -1375,6 +1375,220 @@
         }
       }
     },
+    "/api/v1/emulators": {
+      "get": {
+        "tags": [
+          "emulators"
+        ],
+        "summary": "List the emulators this host knows",
+        "description": "Every catalog entry: whether this OS can install it, what hermir installed, and the copies\nthe user installed. A plugin may read this to find a managed copy's program.",
+        "operationId": "getEmulators",
+        "responses": {
+          "200": {
+            "description": "One row per catalog emulator",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EmulatorStatus"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The catalog or the prefix could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/emulators/{id}/install": {
+      "post": {
+        "tags": [
+          "emulators"
+        ],
+        "summary": "Install an emulator",
+        "description": "Fetches the emulator through its own release channel (Flatpak on Linux, the official\nportable build on Windows), verifies it, and places it under the host's emulator prefix.\nReinstalls an existing copy. Admin lane only.",
+        "operationId": "installEmulator",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The catalog id, like `pcsx2`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Installed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedEmulator"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not offered on this OS, or never installed by policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not in the catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another install holds the prefix",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The files could not be placed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The release could not be fetched or verified",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/emulators/{id}/remove": {
+      "post": {
+        "tags": [
+          "emulators"
+        ],
+        "summary": "Remove a managed emulator",
+        "description": "Takes the release's files away and keeps the emulator's own data unless `purge` is set.\nA Flatpak is uninstalled. Grants on its folder stay until the operator forgets them.",
+        "operationId": "removeEmulator",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The catalog id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoveEmulatorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not in the catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another install holds the prefix",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Not installed by the host, or the files could not be removed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/events": {
       "get": {
         "tags": [
@@ -6036,10 +6250,21 @@
       },
       "AccessRequest": {
         "type": "object",
-        "required": [
-          "paths"
-        ],
         "properties": {
+          "cores": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "libretro cores the plugin wants in RetroArch (`snes9x`). Each answers with RetroArch's\ncores folder; `refused:no_retroarch` without one on this host."
+          },
+          "emulators": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Catalog ids of emulators the plugin wants installed (`pcsx2`). Each answers with the\nfolder the install lands in; the operator's yes installs it, then grants that folder."
+          },
           "paths": {
             "type": "array",
             "items": {
@@ -8026,6 +8251,86 @@
           }
         }
       },
+      "EmulatorCopy": {
+        "type": "object",
+        "description": "One copy of an emulator on this host.",
+        "required": [
+          "kind",
+          "exe"
+        ],
+        "properties": {
+          "config_root": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exe": {
+            "type": "string",
+            "description": "The program, or `flatpak run <app id>`."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`managed`, `flatpak`, `native` or `portable`."
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "EmulatorStatus": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "platforms",
+          "offered",
+          "detected",
+          "home"
+        ],
+        "properties": {
+          "detected": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EmulatorCopy"
+            }
+          },
+          "home": {
+            "type": "string",
+            "description": "The folder a plugin is granted to reach the managed copy."
+          },
+          "id": {
+            "type": "string"
+          },
+          "managed": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ManagedEmulator"
+              }
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "offered": {
+            "type": "boolean",
+            "description": "Whether this host's OS has an install channel. A detect-only entry is never offered."
+          },
+          "platforms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Platform ids the emulator plays."
+          }
+        }
+      },
       "EndGameRequest": {
         "type": "object",
         "properties": {
@@ -8534,6 +8839,25 @@
               },
               "to": {
                 "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A managed emulator was installed or removed. Re-read `GET /api/v1/emulators`.",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "emulators.changed"
+                ]
               }
             }
           },
@@ -10155,6 +10479,40 @@
           }
         }
       },
+      "ManagedEmulator": {
+        "type": "object",
+        "description": "What hermir installed, and from where.",
+        "required": [
+          "channel",
+          "exe",
+          "installed_at"
+        ],
+        "properties": {
+          "channel": {
+            "type": "string",
+            "description": "`flatpak`, `github` or `url`."
+          },
+          "exe": {
+            "type": "string"
+          },
+          "installed_at": {
+            "type": "string",
+            "description": "RFC 3339."
+          },
+          "release": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Matching": {
         "type": "string",
         "description": "How a source finds its games. A new source lands after the last one of its kind, exact first.",
@@ -10746,6 +11104,20 @@
         "properties": {
           "at": {
             "type": "string"
+          },
+          "core": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A libretro core to install into `path` (RetroArch's cores folder) first."
+          },
+          "emulator": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An emulator to install into `path` first: the operator's yes installs, then grants."
           },
           "path": {
             "type": "string"
@@ -11379,6 +11751,15 @@
           "text": {
             "type": "string",
             "description": "English fallback. The console overrides it by check id."
+          }
+        }
+      },
+      "RemoveEmulatorRequest": {
+        "type": "object",
+        "properties": {
+          "purge": {
+            "type": "boolean",
+            "description": "Also delete the emulator's own data (config, saves)."
           }
         }
       },
@@ -13214,6 +13595,10 @@
     {
       "name": "plugin-access",
       "description": "Plugin folder access: a plugin requests a directory (its own token), the operator grants or denies it (admin lane only)"
+    },
+    {
+      "name": "emulators",
+      "description": "Managed emulators (hermir): the catalog, what is installed or detected, install and remove (admin lane only)"
     },
     {
       "name": "store",

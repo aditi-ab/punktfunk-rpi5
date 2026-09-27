@@ -157,6 +157,7 @@ mod native;
 #[forbid(unsafe_code)]
 mod native_pairing;
 // Live per-session pad tap the console's Controllers page streams.
+mod emulators;
 mod pad_feed;
 // Plugin runner, access and store; the flat names keep `crate::plugins::*`.
 mod plugin_host;

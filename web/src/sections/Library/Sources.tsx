@@ -30,6 +30,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { apiErrorMessage } from "@/lib/errors";
 import { m } from "@/paraglide/messages";
+import { EmulatorsCard } from "@/sections/Library/Emulators";
 import { PendingAccess, usePluginAccess } from "@/sections/PluginAccess";
 import { SourceSettingsDialog } from "./SourceSettings";
 
@@ -180,6 +181,7 @@ export const SourcesSection: FC<{
 				accessBusy={access.busy}
 				onAccessDecision={access.onDecide}
 			/>
+			<EmulatorsCard />
 			{settingsFor && (
 				<SourceSettingsDialog
 					source={settingsFor}

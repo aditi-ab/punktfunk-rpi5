@@ -4,6 +4,8 @@ export {
 	type AccessRequestOutcome,
 	type AccessRequestPath,
 	requestAccess,
+	requestCores,
+	requestEmulators,
 	unreachable,
 } from "./access.js";
 export { type CacheStore, makeCacheStore } from "./cache-store.js";

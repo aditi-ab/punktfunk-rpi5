@@ -28,6 +28,7 @@ import { useEffect, useSyncExternalStore } from "react";
 import { getListPairedClientsQueryKey } from "@/api/gen/clients/clients";
 import { getGetDiagnosticsQueryKey } from "@/api/gen/diagnostics/diagnostics";
 import { getGetDisplayStateQueryKey } from "@/api/gen/display/display";
+import { getGetEmulatorsQueryKey } from "@/api/gen/emulators/emulators";
 import {
 	getGetHostSettingsQueryKey,
 	getGetStatusQueryKey,
@@ -112,6 +113,7 @@ const INVALIDATES = {
 		getGetLibraryQueryKey(),
 		getListLibraryScannersQueryKey(),
 	],
+	"emulators.changed": [getGetEmulatorsQueryKey()],
 	"update.available": [getGetUpdateStatusQueryKey()],
 	"update.applied": [getGetUpdateStatusQueryKey()],
 	// Registration and folder-access changes move plugin views; a new pending request can add a
