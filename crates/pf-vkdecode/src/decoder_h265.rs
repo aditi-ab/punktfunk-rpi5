@@ -30,10 +30,10 @@ use tracing::debug;
 use tracing::trace;
 use tracing::warn;
 
+use crate::caps::derive_caps;
+use crate::caps::query_caps;
 use crate::caps::DecodeCaps;
 use crate::caps::DecodeProfile;
-use crate::caps_h265::derive_caps_h265;
-use crate::caps_h265::query_h265_caps;
 use crate::caps_h265::H265ProfileKey;
 use crate::decoder::build_frame;
 use crate::decoder::settle_dpb;
@@ -187,7 +187,7 @@ impl VkH265Decoder {
         // SAFETY: forwarded caller contract.
         let dev = unsafe { DecodeDevice::wrap(handles)? };
         // Queue family must advertise DECODE_H265 before any query or create:
-        // `query_h265_caps` is a physical-device query and succeeds without the
+        // `query_caps` is a physical-device query and succeeds without the
         // extension; `vkCreateVideoSessionKHR` with DECODE_H265 then is UB.
         dev.require_codec_op(vk::VideoCodecOperationFlagsKHR::DECODE_H265, "H.265 decode")?;
         Ok(Self {
@@ -233,8 +233,9 @@ impl VkH265Decoder {
         // SAFETY: the constructor's `DeviceHandles` contract holds for this
         // decoder's whole lifetime, so the physical device is live — the same
         // proof `ensure_state`'s identical call carries.
-        let raw = unsafe { query_h265_caps(&self.dev, key) }.map_err(VkDecodeError::from)?;
-        derive_caps_h265(&raw, wanted)?;
+        let raw = unsafe { query_caps(&self.dev, DecodeProfile::H265(key)) }
+            .map_err(VkDecodeError::from)?;
+        derive_caps(&raw, wanted)?;
         Ok(())
     }
 
@@ -893,8 +894,9 @@ impl VkH265Decoder {
                 .output_format()
                 .expect("from_stream gated the chroma/depth combination");
             // SAFETY: live device (constructor contract).
-            let raw = unsafe { query_h265_caps(&self.dev, key) }.map_err(VkDecodeError::from)?;
-            self.caps = Some((key, derive_caps_h265(&raw, wanted)?));
+            let raw = unsafe { query_caps(&self.dev, DecodeProfile::H265(key)) }
+                .map_err(VkDecodeError::from)?;
+            self.caps = Some((key, derive_caps(&raw, wanted)?));
         }
         // A declared level above `maxLevelIdc` is not a refusal. SPS level is
         // a claim; encoders over-declare. Real limits are coded extent and DPB

@@ -37,10 +37,11 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::caps::derive_caps;
-use crate::caps::query_h264_caps;
+use crate::caps::query_caps;
 use crate::caps::CapsError;
 use crate::caps::DecodeCaps;
 use crate::caps::DecodeProfile;
+use crate::caps::NV12;
 use crate::device::AllocError;
 use crate::device::DecodeDevice;
 use crate::device::DeviceError;
@@ -644,9 +645,9 @@ impl VkH264Decoder {
         // the profile every host encodes, so an unusable device refuses the rung
         // before its first AU. A stream in another profile re-queries at its SPS.
         // SAFETY: live device (the `wrap` contract above).
-        let raw =
-            unsafe { query_h264_caps(&dev, H264_PROFILE_HIGH) }.map_err(VkDecodeError::from)?;
-        let caps = Some((H264_PROFILE_HIGH, derive_caps(&raw)?));
+        let raw = unsafe { query_caps(&dev, DecodeProfile::H264(H264_PROFILE_HIGH)) }
+            .map_err(VkDecodeError::from)?;
+        let caps = Some((H264_PROFILE_HIGH, derive_caps(&raw, NV12)?));
         Ok(Self {
             dev,
             lock,
@@ -1302,9 +1303,9 @@ impl VkH264Decoder {
         let std_profile = std_profile_for(plan)?;
         if self.caps.as_ref().map(|(p, _)| *p) != Some(std_profile) {
             // SAFETY: live device (constructor contract).
-            let raw =
-                unsafe { query_h264_caps(&self.dev, std_profile) }.map_err(VkDecodeError::from)?;
-            self.caps = Some((std_profile, derive_caps(&raw)?));
+            let raw = unsafe { query_caps(&self.dev, DecodeProfile::H264(std_profile)) }
+                .map_err(VkDecodeError::from)?;
+            self.caps = Some((std_profile, derive_caps(&raw, NV12)?));
         }
         // A declared level above `maxLevelIdc` is not a refusal — encoders
         // over-claim. Real demands (extent, DPB depth) are checked in

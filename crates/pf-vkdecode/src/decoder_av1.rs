@@ -36,10 +36,10 @@ use tracing::debug;
 use tracing::trace;
 use tracing::warn;
 
+use crate::caps::derive_caps;
+use crate::caps::query_caps;
 use crate::caps::DecodeCaps;
 use crate::caps::DecodeProfile;
-use crate::caps_av1::derive_caps_av1;
-use crate::caps_av1::query_av1_caps;
 use crate::caps_av1::Av1ProfileKey;
 use crate::decoder::build_frame;
 use crate::decoder::settle_dpb_ids;
@@ -523,12 +523,12 @@ impl VkAv1Decoder {
     ) -> Result<(), VkDecodeError> {
         let key = Av1ProfileKey::from_negotiated(chroma_format_idc, bit_depth, film_grain)?;
         // SAFETY: the constructor `DeviceHandles` contract holds for this lifetime.
-        let raw =
-            unsafe { query_av1_caps(&self.dev, key) }.map_err(|r| caps_query_error(r, key))?;
+        let raw = unsafe { query_caps(&self.dev, DecodeProfile::Av1(key)) }
+            .map_err(|r| caps_query_error(r, key))?;
         let wanted = key
             .output_format()
             .expect("from_negotiated gated the sampling/depth combination");
-        derive_caps_av1(&raw, wanted)?;
+        derive_caps(&raw, wanted)?;
         Ok(())
     }
 
@@ -1138,9 +1138,9 @@ impl VkAv1Decoder {
                 .output_format()
                 .expect("from_stream gated the sampling/depth combination");
             // SAFETY: live device (constructor contract).
-            let raw =
-                unsafe { query_av1_caps(&self.dev, key) }.map_err(|r| caps_query_error(r, key))?;
-            self.caps = Some((key, derive_caps_av1(&raw, wanted)?));
+            let raw = unsafe { query_caps(&self.dev, DecodeProfile::Av1(key)) }
+                .map_err(|r| caps_query_error(r, key))?;
+            self.caps = Some((key, derive_caps(&raw, wanted)?));
         }
         // Declared level above maxLevel is not a refusal: extent and DPB depth
         // are the physical facts. `seq_level_idx` 31 is Annex A's "maximum
