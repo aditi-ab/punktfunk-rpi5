@@ -2711,13 +2711,16 @@ mod tests {
             "three-quarter fill lights the midpoint: {:?}",
             px(&on, mid)
         );
-        // The icon sits in the gutter the label used to start in, so something is inked there.
+        // The icon sits in the gutter the label used to start in, so its box holds ink. A box,
+        // not one pixel: the sun's centre is hollow and would read the row's ground.
         let gutter = (f64::from(r0.left) + 26.0, f64::from(r0.center_y()));
-        assert!(
-            px(&on, gutter).iter().any(|c| *c > 80),
-            "icon in the gutter: {:?}",
-            px(&on, gutter)
-        );
+        let inked = (-10..=10).any(|dy| {
+            (-12..=12).any(|dx| {
+                let at = (gutter.0 + f64::from(dx), gutter.1 + f64::from(dy));
+                px(&on, at).iter().all(|c| *c > 120)
+            })
+        });
+        assert!(inked, "icon in the gutter: {:?}", px(&on, gutter));
     }
 
     /// Slip arms only when the value actually changed, and settles back to
