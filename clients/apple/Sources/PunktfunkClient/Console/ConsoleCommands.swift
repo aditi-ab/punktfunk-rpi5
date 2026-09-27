@@ -322,9 +322,11 @@ extension ConsoleModel {
         waker.start(
             host: host, connectsAfter: thenConnect, macs: host.wakeMacs, lastIP: host.address,
             isOnline: { [weak self] in
-                guard let self else { return false }
-                await store.refreshReachability(discovery: discovery)
-                return store.probedOnline.contains(host.id)
+                guard let self, await store.isReachable(host, discovery: discovery)
+                else { return false }
+                // The wake card reads this set.
+                store.probedOnline.insert(host.id)
+                return true
             },
             onOnline: { [weak self] in
                 guard let self else { return }
