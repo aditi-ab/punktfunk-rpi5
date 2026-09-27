@@ -876,6 +876,7 @@ struct ContentView: View {
                 // On appear too: `returnToLibrary` writes the shelf while the stream is still up.
                 .onAppear(perform: showShelfInSidebar)
                 .onChange(of: libraryTarget) { _, _ in showShelfInSidebar() }
+                .modifier(HomePresence(store: store, discovery: discovery))
             }
         }
         #else
@@ -887,6 +888,7 @@ struct ContentView: View {
                     // On appear too: `returnToLibrary` writes the shelf while the stream is still up.
                     .onAppear(perform: showShelfInTab)
                     .onChange(of: libraryTarget) { _, _ in showShelfInTab() }
+                    .modifier(HomePresence(store: store, discovery: discovery))
             }
         }
         #endif
