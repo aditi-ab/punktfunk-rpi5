@@ -720,6 +720,72 @@ impl Shell {
 }
 
 impl Shell {
+    /// Per-pass stream upkeep: the HUD/title mode, the Match-window request, the resize
+    /// scrim's timeout and the touch long-press clock.
+    pub(super) fn stream_tick(&mut self, st: &mut StreamState) {
+        // HUD/title follow the live mode slot on any accepted switch — also when the
+        // match-window follower is off (another trigger, or a host-side rollback).
+        hud_mode_tick(st, &mut self.window, &self.opts.window_title);
+        if let Some(persist) = self.opts.match_window.as_mut() {
+            resize_tick(
+                st,
+                &mut self.window,
+                persist.as_mut(),
+                self.opts.render_scale,
+                self.opts.render_scale_max_dim,
+            );
+        }
+        // A switch the host rejected/capped never delivers the exact target frame —
+        // drop the scrim so it cannot linger.
+        st.resize_overlay.tick(Instant::now());
+        // Touch long-press: a still finger raises no SDL event, so the gesture engine
+        // needs the clock — SDL ticks, the millisecond base the finger timestamps use.
+        if let Some(cap) = st.capture.as_mut() {
+            cap.tick(sdl3::timer::ticks() as f64);
+        }
+    }
+
+    /// The ring's commands this pass. Stats tier, keyboard, pad mouse, stream mute and
+    /// system buttons are the loop's; the rest go to [`Shell::ring_command`].
+    pub(super) fn ring_tick(&mut self, stream: &mut Option<StreamState>) {
+        let mut ring_cmds = Vec::new();
+        if let (Some(o), true) = (self.overlay.as_mut(), stream.is_some()) {
+            while let Some(cmd) = o.take_ring_command() {
+                ring_cmds.push(cmd);
+            }
+        }
+        for cmd in ring_cmds {
+            tracing::info!(?cmd, "ring");
+            match cmd {
+                RingCommand::CycleStats => {
+                    bump_stats_tier(&mut self.stats_verbosity, stream);
+                }
+                RingCommand::Keyboard => self.ring_keyboard = !self.ring_keyboard,
+                RingCommand::TogglePadMouse => {
+                    if let Some(c) = stream.as_ref().and_then(|st| st.connector.as_ref()) {
+                        toggle_pad_mouse(c, self.ring_opener);
+                    }
+                }
+                RingCommand::ToggleStreamMute => {
+                    if let Some(c) = stream.as_ref().and_then(|st| st.connector.as_ref()) {
+                        let on = c.audio_mute() & punktfunk_core::client::AUDIO_MUTE_LOCAL != 0;
+                        c.set_audio_muted(!on);
+                    }
+                }
+                // The pad worker owns the wire index and the owed release, so this one is
+                // the service's, not `ring_command`'s.
+                RingCommand::TapButton(bit) => self.gamepad.tap_button(bit),
+                other => {
+                    if let Some(st) = stream.as_mut() {
+                        self.ring_command(other, st);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Shell {
     /// Run one ring command against the live session (stats tier, keyboard, system buttons
     /// and controller mouse are the loop's own and are handled at the call site).
     pub(super) fn ring_command(&mut self, cmd: RingCommand, st: &mut StreamState) {

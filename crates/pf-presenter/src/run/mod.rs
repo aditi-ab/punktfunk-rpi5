@@ -50,7 +50,6 @@ mod stream;
 
 use events::*;
 use pace::*;
-use shell::*;
 use stream::*;
 
 /// [`SessionOpts::on_connected`]: host fingerprint, then Welcome's management-API
@@ -498,173 +497,11 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
             break 'main Some(outcome);
         }
 
-        // HUD/title follow the live mode slot on any accepted switch — also when the
-        // match-window follower is off (another trigger, or a host-side rollback).
         if let Some(st) = stream.as_mut() {
-            hud_mode_tick(st, &mut sh.window, &sh.opts.window_title);
+            sh.stream_tick(st);
         }
-        if let Some(persist) = sh.opts.match_window.as_mut() {
-            if let Some(st) = stream.as_mut() {
-                resize_tick(
-                    st,
-                    &mut sh.window,
-                    persist.as_mut(),
-                    sh.opts.render_scale,
-                    sh.opts.render_scale_max_dim,
-                );
-            }
-        }
-        // A switch the host rejected/capped never delivers the exact target frame —
-        // drop the scrim so it cannot linger.
-        if let Some(st) = stream.as_mut() {
-            st.resize_overlay.tick(Instant::now());
-        }
-        // Touch long-press: a still finger raises no SDL event, so the gesture engine
-        // needs the clock — SDL ticks, the millisecond base the finger timestamps use.
-        if let Some(cap) = capture_mut(&mut stream) {
-            cap.tick(sdl3::timer::ticks() as f64);
-        }
-        let mut ring_cmds = Vec::new();
-        if let (Some(o), true) = (sh.overlay.as_mut(), stream.is_some()) {
-            while let Some(cmd) = o.take_ring_command() {
-                ring_cmds.push(cmd);
-            }
-        }
-        for cmd in ring_cmds {
-            tracing::info!(?cmd, "ring");
-            match cmd {
-                RingCommand::CycleStats => {
-                    bump_stats_tier(&mut sh.stats_verbosity, &mut stream);
-                }
-                RingCommand::Keyboard => sh.ring_keyboard = !sh.ring_keyboard,
-                RingCommand::TogglePadMouse => {
-                    if let Some(c) = stream.as_ref().and_then(|st| st.connector.as_ref()) {
-                        toggle_pad_mouse(c, sh.ring_opener);
-                    }
-                }
-                RingCommand::ToggleStreamMute => {
-                    if let Some(c) = stream.as_ref().and_then(|st| st.connector.as_ref()) {
-                        let on = c.audio_mute() & punktfunk_core::client::AUDIO_MUTE_LOCAL != 0;
-                        c.set_audio_muted(!on);
-                    }
-                }
-                // The pad worker owns the wire index and the owed release, so this one is
-                // the service's, not `ring_command`'s.
-                RingCommand::TapButton(bit) => sh.gamepad.tap_button(bit),
-                other => {
-                    if let Some(st) = stream.as_mut() {
-                        sh.ring_command(other, st);
-                    }
-                }
-            }
-        }
-
-        if let Some(st) = stream.as_mut() {
-            if st
-                .session_notice
-                .as_ref()
-                .is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(ACCESS_NOTICE_S))
-            {
-                st.session_notice = None;
-            }
-        }
-
-        if let Some(o) = sh.overlay.as_mut() {
-            let (pw, ph) = sh.window.size_in_pixels();
-            let (stats, hint) = match &stream {
-                Some(st) if st.connector.is_some() => {
-                    // No "click to capture" over a session with nothing to capture for.
-                    let hint = match &st.capture {
-                        Some(cap) if !cap.captured() && cap.can_capture() => {
-                            Some(if sh.gamepad.active().is_some() {
-                                HINT_WITH_PAD
-                            } else {
-                                HINT_KEYBOARD
-                            })
-                        }
-                        _ => None,
-                    };
-                    (
-                        (sh.stats_verbosity != StatsVerbosity::Off && !st.osd.is_empty())
-                            .then_some(st.osd.as_slice()),
-                        hint,
-                    )
-                }
-                _ => (None, None),
-            };
-            // Access chip: a standing pill in the stats overlay family. A pill that never
-            // goes away is chrome, so it rides the stats tier. `None` for a full-control
-            // permanent session — what a host that never sent access looks like.
-            let access_chip = match &stream {
-                Some(st) if st.connector.is_some() && sh.stats_verbosity != StatsVerbosity::Off => {
-                    st.access.chip_text(Instant::now())
-                }
-                _ => None,
-            };
-            let session_notice = stream
-                .as_ref()
-                .filter(|st| st.connector.is_some())
-                .and_then(|st| st.session_notice.as_ref().map(|(n, _)| n.as_str()));
-            let pad = sh.gamepad.active();
-            let pads = sh.gamepad.pads();
-            let resizing = stream
-                .as_ref()
-                .is_some_and(|st| st.connector.is_some() && st.resize_overlay.active());
-            // Read live from the session's control rather than mirrored into StreamState:
-            // the pump knows whether an uplink exists, and a mirrored copy would go stale
-            // at session end.
-            let mic_muted = stream.as_ref().is_some_and(|st| st.handle.mic.muted());
-            // The badge clears itself once a local mute has been read; the mask's own clock
-            // lives here because only the frame loop knows when it last moved.
-            let audio_mute = stream
-                .as_ref()
-                .and_then(|st| st.connector.as_ref())
-                .and_then(|c| {
-                    let mask = c.audio_mute();
-                    if mask != sh.audio_mute_seen {
-                        sh.audio_mute_seen = mask;
-                        sh.audio_mute_at = Instant::now();
-                    }
-                    punktfunk_core::client::audio_mute_notice(mask, sh.audio_mute_at.elapsed())
-                });
-            let ring_facts = stream
-                .as_ref()
-                .filter(|st| st.connector.is_some())
-                .map(|st| ring_facts(st, &sh.opts, sh.stats_verbosity, mic_muted, sh.ring_opener));
-            let ctx = FrameCtx {
-                width: pw,
-                height: ph,
-                ten_bit: sh.presenter.ten_bit(),
-                // Re-read per frame: dragging to a second monitor with a different scale
-                // updates this.
-                scale: overlay_scale(sh.window.display_scale(), sh.osd_scale_pref),
-                stats,
-                hint,
-                access: access_chip.as_deref(),
-                notice: session_notice,
-                mic_muted,
-                audio_mute,
-                resizing,
-                pad: pad.as_ref().map(|p| p.name.as_str()),
-                pad_pref: pad.as_ref().map(|p| p.pref),
-                pads: &pads,
-                ring: ring_facts.as_ref(),
-            };
-            match o.frame(&ctx) {
-                Ok(f) => sh.overlay_frame = f,
-                Err(e) => {
-                    if sh.browse {
-                        return Err(e).context("console UI frame (required for --browse)");
-                    }
-                    tracing::warn!(error = %format!("{e:#}"),
-                        "overlay frame failed — disabling the console UI");
-                    sh.overlay = None;
-                    sh.overlay_frame = None;
-                }
-            }
-        }
-        sh.overlay_damage
-            .rendered(sh.overlay_frame.as_ref().map(|f| f.image));
+        sh.ring_tick(&mut stream);
+        sh.overlay_tick(&mut stream)?;
 
         let mut presented_video = false;
         if let Some(st) = &mut stream {
