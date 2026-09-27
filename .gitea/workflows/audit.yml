@@ -12,6 +12,8 @@
 #   * docs-site   → scanned NON-blocking. Its `overrides` lift the chains fumadocs and @unom/ui
 #                   pull in (next, sharp, fast-uri, immutable), as web's do; it carries web's
 #                   three ignores for the same reasons.
+#   * vendored-inventory → every `vendor/` tree has a CVE-watch row in
+#                   compliance/vendored-components.md.
 #   * cargo-about → license-allowlist gate over the host + driver workspaces (about.toml `accepted`);
 #                   fails if any crate carries a license outside the allowlist. Android dependencies
 #                   are locked and checksum-verified by Gradle in android.yml.
@@ -56,6 +58,7 @@ on:
       - 'plugin-kit/bun.lock'
       - 'clients/decky/pnpm-lock.yaml'
       - 'about.toml'
+      - 'compliance/vendored-components.md'
       - '.gitea/workflows/audit.yml'
   workflow_dispatch:
 # NOTE on the `paths:` list above and the `miri:` job: `crates/pf-driver-proto/**` is deliberately
@@ -94,6 +97,22 @@ jobs:
           cargo audit --deny unsound --file packaging/windows/pf-vkhdr-layer/Cargo.lock
           cargo audit --deny unsound --file tools/win-input-matrix/Cargo.lock
           cargo audit --deny unsound --file tools/hid-descriptor-dump/Cargo.lock
+
+  # cargo-audit matches registry crates by name and version, so a vendored tree has no feed but
+  # its row in compliance/vendored-components.md. Every `vendor/<tree>` needs one.
+  vendored-inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Every vendored tree has an inventory row
+        run: |
+          missing=0
+          for d in $(git ls-files crates clients packaging | awk -F/vendor/ 'NF > 1 { split($2, t, "/"); print $1 "/vendor/" t[1] }' | sort -u); do
+            grep -qF "\`$d\`" compliance/vendored-components.md \
+              || { echo "::error::$d has no row in compliance/vendored-components.md"; missing=1; }
+          done
+          exit $missing
 
   bun-audit:
     strategy:

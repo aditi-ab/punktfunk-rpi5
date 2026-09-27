@@ -105,6 +105,114 @@
     },
     {
       "type": "library",
+      "name": "fec-rs",
+      "version": "0.1.0",
+      "description": "Reed-Solomon FEC, forked at crates/punktfunk-core/vendor/fec-rs with the Cauchy generator matrix Moonlight's nanors uses",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-2-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hgaiser/fec-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "cros-codecs",
+      "version": "5ff6d693ffae0b36935b8fc13092c733b4c2646f",
+      "description": "H.264/H.265/AV1/VP9 parser layer, vendored at crates/pf-bitstream/vendor/cros-codecs with the deviations in its PROVENANCE.md",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://android.googlesource.com/platform/system/cros-codecs/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "usbip",
+      "version": "0.8.0",
+      "description": "USB/IP server simulation, vendored and trimmed as usbip-sim at crates/punktfunk-host/vendor/usbip-sim; changes listed in its NOTICE",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jiegec/usbip"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ndk",
+      "version": "0.9.0",
+      "description": "Android NDK bindings, vendored with a patch set at clients/android/native/vendor/ndk via [patch.crates-io]",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-mobile/ndk"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "wdk-sys",
+      "version": "0.5.1",
+      "description": "WDK FFI bindings with an added iddcx ApiSubset, vendored at packaging/windows/drivers/vendor/wdk-sys via [patch.crates-io]",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-drivers-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "wdk-build",
+      "version": "0.5.1",
+      "description": "WDK build-script support, vendored at packaging/windows/drivers/vendor/wdk-build via [patch.crates-io]",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-drivers-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "name": "SDL3",
       "version": "3.x (system-provided or bundled per platform package)",
       "description": "Windowing/input layer for the desktop clients, dynamically linked",
