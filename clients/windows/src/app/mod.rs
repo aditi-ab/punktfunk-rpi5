@@ -574,7 +574,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                             .collect();
                         let online = crate::trust::probe_known(&hosts, Duration::from_millis(2500));
                         let map: HashMap<String, bool> =
-                            hosts.into_iter().map(|h| h.fp_hex).zip(online).collect();
+                            hosts.iter().map(|h| h.card_key()).zip(online).collect();
                         set_probed.call(map);
                         std::thread::sleep(Duration::from_secs(12));
                     }

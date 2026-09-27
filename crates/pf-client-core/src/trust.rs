@@ -454,6 +454,16 @@ impl Default for KnownHost {
 }
 
 impl KnownHost {
+    /// The key a host card and its probe result go by: the pin, else `addr:port`. A bare
+    /// `fp_hex` is empty for every unpaired placeholder, so they would all share one key.
+    pub fn card_key(&self) -> String {
+        if self.fp_hex.is_empty() {
+            format!("{}:{}", self.addr, self.port)
+        } else {
+            self.fp_hex.clone()
+        }
+    }
+
     /// Learned mgmt port, else compiled-in 47990. Library/art calls must use this, not
     /// [`crate::library::DEFAULT_MGMT_PORT`] — that constant is the fallback, not the answer.
     pub fn effective_mgmt_port(&self) -> u16 {
@@ -1780,6 +1790,27 @@ pub fn resolve_preset(
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    /// Unpaired placeholders must not share the empty pin as a key: each would show the
+    /// last-probed one's pip.
+    #[test]
+    fn card_key_is_the_pin_else_the_address() {
+        let placeholder = |addr: &str| KnownHost {
+            addr: addr.into(),
+            port: 9777,
+            ..Default::default()
+        };
+        assert_eq!(placeholder("10.0.0.2").card_key(), "10.0.0.2:9777");
+        assert_ne!(
+            placeholder("10.0.0.2").card_key(),
+            placeholder("10.0.0.3").card_key()
+        );
+        let pinned = KnownHost {
+            fp_hex: "ab".repeat(32),
+            ..placeholder("10.0.0.2")
+        };
+        assert_eq!(pinned.card_key(), "ab".repeat(32));
+    }
 
     /// A non-empty override wins. Empty and absent leave the OS default to the caller.
     /// The helper takes the override as an argument.

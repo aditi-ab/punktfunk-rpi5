@@ -794,18 +794,10 @@ fn is_hex_colour(s: &str) -> bool {
     s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn saved_key(h: &KnownHost) -> String {
-    if h.fp_hex.is_empty() {
-        format!("{}:{}", h.addr, h.port)
-    } else {
-        h.fp_hex.clone()
-    }
-}
-
 pub struct HostsPage {
     adverts: HashMap<String, DiscoveredHost>,
     /// Saved hosts proven reachable by the periodic QUIC probe (mDNS-independent), keyed by
-    /// [`saved_key`]. OR'd with live-advert presence to drive the Online pip.
+    /// [`KnownHost::card_key`]. OR'd with live-advert presence to drive the Online pip.
     probed: HashMap<String, bool>,
     connecting: Option<String>,
     saved: FactoryVecDeque<HostCard>,
@@ -1073,7 +1065,7 @@ impl SimpleComponent for HostsPage {
                             .spawn(move || {
                                 let results = crate::trust::probe_known(&hosts, PROBE_TIMEOUT);
                                 let map: HashMap<String, bool> =
-                                    hosts.iter().map(saved_key).zip(results).collect();
+                                    hosts.iter().map(KnownHost::card_key).zip(results).collect();
                                 let _ = tx.send_blocking(map);
                             })
                             .expect("spawn probe thread");
@@ -1285,7 +1277,7 @@ impl HostsPage {
                 // sends no goodbye for, so counting it kept a sleeping machine's pip green — and
                 // the wake gate reads `!online`, which is how Wake-on-LAN stayed silent for
                 // exactly the host it was meant to wake.
-                let online = self.probed.get(&saved_key(k)).copied().unwrap_or(false);
+                let online = self.probed.get(&k.card_key()).copied().unwrap_or(false);
                 // Learn what this host's live advert teaches: its wake MAC(s), its OS chain (so
                 // the icon survives it going offline), its management port, and an address the
                 // probe sweep asks — the card moves there only once its pin answers.
@@ -1313,10 +1305,9 @@ impl HostsPage {
                     pf_client_core::host_actions::refresh(&k.addr, mgmt, &k.fp_hex);
                 }
                 saved.push_back(HostCard {
-                    // `saved_key`, the same key `ConnectRequest::card_key` mints — a bare
-                    // `fp_hex` is empty for an unpaired record, so it matched every other
-                    // unpaired card and none of them was the one clicked.
-                    connecting: self.connecting.as_deref() == Some(saved_key(k).as_str()),
+                    // The key `ConnectRequest::card_key` mints. A bare `fp_hex` is empty for
+                    // every unpaired record.
+                    connecting: self.connecting.as_deref() == Some(k.card_key().as_str()),
                     kind: CardKind::Saved {
                         host: k.clone(),
                         online,
