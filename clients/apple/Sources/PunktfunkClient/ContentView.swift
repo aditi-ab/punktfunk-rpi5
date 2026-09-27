@@ -1183,21 +1183,12 @@ struct ContentView: View {
                     .animation(.easeOut(duration: 0.2), value: model.sc2CapturedHint)
                 }
                 #if os(iOS)
-                // Touch users have no menu / ⌘D, so when the HUD's Disconnect button isn't on
-                // screen — the overlay off, or the compact pill (which carries no button) —
-                // keep a minimal touch exit in a corner. It rides a material disc (like the
-                // HUD) so the glyph stays legible over a bright frame.
-                //
-                // In the OFF tier the disc shows for the first 8 s of a session, then leaves
-                // the hierarchy ENTIRELY (the shortcut-banner pattern): any composited overlay
-                // above the stream — a glass one doubly so, its blur SAMPLES the video layer —
-                // forces the CAMetalLayer through the compositor, costing ~a refresh of display
-                // latency and blocking direct-to-display promotion. Off is the immersive/
-                // measurement tier; after the fade, touch-only exits are backgrounding the app
-                // or re-enabling the stats overlay. Compact keeps its disc permanently — that
-                // tier composites a HUD pill anyway, so hiding the exit there wins nothing.
+                // Touch has no menu or ⌘D: while the HUD shows no Disconnect (compact, off) a
+                // corner disc opens the ring. Off drops it after 8 s, since any overlay above the
+                // stream costs ~a refresh of latency; compact composites a pill anyway. The
+                // virtual controller carries its own ring button, so the discs leave while it is up.
                 .overlay(alignment: .topLeading) {
-                    if captureEnabled,
+                    if captureEnabled, !model.virtualPadShown,
                        statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
                         HStack(spacing: 10) {
                             // Opens the quick-action ring (End stream is a slot inside, behind
@@ -1236,11 +1227,12 @@ struct ContentView: View {
                 .overlay {
                     if captureEnabled, model.virtualPadShown, let pad = model.virtualPad {
                         VirtualPadLayer(config: OverlayConfig.parse(model.settings.overlayActions).pad,
-                                        wire: pad)
+                                        wire: pad, openRing: { [ring] at in ring.openAt(at) })
                     }
                 }
-                // The quick-action ring: opened by the two-finger twist under the fingers, or by
-                // the disc above. Mounted only while open — a closed overlay costs nothing.
+                // The quick-action ring: opened by the two-finger twist under the fingers, the
+                // disc above, or the pad's ring button. Mounted only while open — a closed
+                // overlay costs nothing.
                 .overlay {
                     if captureEnabled, ring.visible {
                         RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn))

@@ -160,7 +160,8 @@ public struct PadTweak: Equatable, Sendable {
 
 /// The virtual controller: `layout` is `full`, `sticks` or `dpad`; `opacity` and `scale` are
 /// the two sliders. `controls` carries the per-control overrides keyed by control id (`ls`,
-/// `rs`, `dpad`, `face`, `lb`, `rb`, `lt`, `rt`, `select`, `guide`, `start`), `controlsNarrow`
+/// `rs`, `dpad`, `face`, `lb`, `rb`, `lt`, `rt`, `l3`, `r3`, `select`, `guide`, `start`,
+/// `ring`), `controlsNarrow`
 /// the same for a narrow (upright) layer — the two classes the preset already lays out
 /// differently.
 public struct PadConfig: Equatable, Sendable {
