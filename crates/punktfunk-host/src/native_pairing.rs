@@ -96,9 +96,7 @@ pub struct AccessState {
     pub revoked: bool,
 }
 
-/// Re-exported for the stream marker's quoting. `imp` is `cfg(unix)` — gate alike, or
-/// Windows trips `-D unused-imports`.
-#[cfg(unix)]
+/// Shared by the stream marker's quoting and the plugin-text sanitizers.
 pub(crate) use sanitize::is_spoofy_char;
 /// Stable path for the native accept loop.
 pub(crate) use sanitize::sanitize_device_name;

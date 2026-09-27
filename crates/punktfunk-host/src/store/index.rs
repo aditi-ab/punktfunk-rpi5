@@ -302,10 +302,10 @@ pub(crate) fn host_version() -> &'static str {
     crate::version::get()
 }
 
-/// Catalog strings land in logs and the console.
+/// Catalog strings land in logs and the console: controls and bidi marks go, as in a device name.
 fn sanitize(s: &str, max: usize) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|&c| !c.is_control() && !crate::native_pairing::is_spoofy_char(c))
         .take(max)
         .collect::<String>()
         .trim()
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn sanitizes_control_characters_in_display_fields() {
-        let e = GOOD.replace("ROM Manager", "RO\\u0007M");
+        let e = GOOD.replace("ROM Manager", "RO\\u0007\\u202eM");
         let idx = Index::parse(&doc(&e)).unwrap();
         assert_eq!(idx.plugins[0].title, "ROM");
     }

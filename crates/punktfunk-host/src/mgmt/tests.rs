@@ -4915,7 +4915,7 @@ async fn plugin_access_refusals_and_reason_sanitizing() {
                         { "path": "relative/dir" },
                         { "path": path },
                     ],
-                    "reason": "games\u{7}\n library"
+                    "reason": "games\u{7}\u{2066}\n library"
                 }),
             ),
             "demo-secret",
