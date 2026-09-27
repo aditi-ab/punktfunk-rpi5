@@ -25,20 +25,7 @@ fn flag_val(args: &[String], name: &str) -> Option<String> {
 fn flag_present(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
-/// `%SystemRoot%\System32\<rel>` — the one place the System32 rule lives.
-///
-/// `CreateProcess` searches the calling process's directory and the working directory before
-/// `%PATH%`, and everything routed through here runs elevated or as SYSTEM: a `certutil.exe`
-/// planted beside the installer would otherwise win. `SystemRoot`, then `WINDIR`, then the
-/// literal default — never a bare name, which is the PATH search this exists to avoid.
-///
-/// `rel` may carry a subdirectory, as PowerShell does.
-pub(crate) fn sys32(rel: &str) -> String {
-    let root = std::env::var("SystemRoot")
-        .or_else(|_| std::env::var("WINDIR"))
-        .unwrap_or_else(|_| r"C:\Windows".to_string());
-    format!(r"{root}\System32\{rel}")
-}
+pub(crate) use pf_paths::system32 as sys32;
 
 /// [`sys32`] for a bare tool name. A name that already carries a separator (the staged
 /// `nefconc.exe`) is its own path and passes through.
