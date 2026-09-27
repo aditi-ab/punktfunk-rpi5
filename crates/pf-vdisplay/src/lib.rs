@@ -769,6 +769,11 @@ mod portal_cast;
 #[path = "vdisplay/linux/hyprland.rs"]
 mod hyprland;
 
+/// Bounded dispatch loop shared by the in-process Wayland protocol clients.
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/wl_pump.rs"]
+mod wl_pump;
+
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/kwin.rs"]
 mod kwin;

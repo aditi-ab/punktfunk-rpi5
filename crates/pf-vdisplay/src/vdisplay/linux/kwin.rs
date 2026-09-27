@@ -12,8 +12,8 @@
 //! DRM backend, or VirtualBackend since KWin 6.5.6.
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
+use crate::wl_pump::{pump_until, sync_barrier, Pumped, SyncDone};
 use anyhow::{anyhow, bail, Context, Result};
-use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -1339,6 +1339,12 @@ impl Dispatch<WlCallback, u32> for State {
     }
 }
 
+impl SyncDone for State {
+    fn sync_done(&self) -> u32 {
+        self.sync_done
+    }
+}
+
 /// Bind `wl_output` at 4: that is the `name` event carrying the connector.
 const WL_OUTPUT_MAX_VERSION: u32 = 4;
 
@@ -1822,10 +1828,6 @@ fn run(
     Ok(())
 }
 
-/// Poll slice while waiting on the Wayland fd — granularity at which `stop` and a
-/// deadline are observed (matches `kwin_output_mgmt`'s `POLL_MS`).
-const POLL_MS: i32 = 200;
-
 /// Budget for one compositor roundtrip. Healthy is a few ms; this exists so a KWin
 /// that accepted the connection and then stopped serving cannot pin the calling thread.
 const ROUNDTRIP_BUDGET: Duration = Duration::from_secs(3);
@@ -1844,66 +1846,6 @@ const WORKER_MARGIN: Duration = Duration::from_millis(500);
 /// therefore takes the worker's start instant and bounds by whichever comes first.
 const CREATE_BUDGET: Duration = Duration::from_secs(15);
 
-enum Pumped {
-    Done,
-    /// `stop` was set — the caller's output/recording was released while we waited.
-    Stopped,
-    Expired,
-}
-
-/// Bounded event loop: dispatch, poll the connection fd up to [`POLL_MS`], read,
-/// until `done`, `stop`, or `deadline`.
-///
-/// `blocking_dispatch` and `roundtrip` cannot be interrupted and have no ceiling.
-/// `deadline: None` is correct only for [`park_until_stopped`], where the wait IS
-/// the output's lifetime.
-fn pump_until(
-    conn: &Connection,
-    queue: &mut wayland_client::EventQueue<State>,
-    state: &mut State,
-    deadline: Option<Instant>,
-    stop: &AtomicBool,
-    done: impl Fn(&State) -> bool,
-) -> Result<Pumped> {
-    loop {
-        queue.dispatch_pending(state).context("dispatch_pending")?;
-        if done(state) {
-            return Ok(Pumped::Done);
-        }
-        if stop.load(Ordering::Relaxed) {
-            return Ok(Pumped::Stopped);
-        }
-        let timeout = match deadline {
-            Some(d) => {
-                let remaining = d.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Ok(Pumped::Expired);
-                }
-                (remaining.as_millis() as i64).clamp(0, i64::from(POLL_MS)) as i32
-            }
-            None => POLL_MS,
-        };
-        conn.flush().context("wayland flush")?;
-        let Some(guard) = conn.prepare_read() else {
-            continue; // events already queued — loop dispatches them
-        };
-        let mut pfd = libc::pollfd {
-            fd: conn.as_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `&mut pfd` points at a single live, fully-initialized `libc::pollfd` on the stack, and
-        // the count `1` matches that one-element array, so `poll` reads `fd`/`events` and writes `revents`
-        // strictly within `pfd`. `pfd.fd` is the Wayland connection's fd, valid because `conn` (and the
-        // `prepare_read` guard) are alive across the call. `poll` blocks up to `timeout` ms and writes
-        // only `revents`; `pfd` outlives the synchronous call and aliases nothing (a fresh local).
-        let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
-        if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
-            let _ = guard.read();
-        } // else: timeout or signal — drop the guard, re-check `stop` and the deadline
-    }
-}
-
 /// A `wl_display.sync` barrier bounded by [`ROUNDTRIP_BUDGET`] — replacement for
 /// `EventQueue::roundtrip`, which waits on the socket with no ceiling. `serial`
 /// must be unique per connection (callers number from 1).
@@ -1915,12 +1857,8 @@ fn roundtrip_within(
     serial: u32,
     what: &str,
 ) -> Result<()> {
-    let qh = queue.handle();
-    let _cb = conn.display().sync(&qh, serial);
     let deadline = Instant::now() + ROUNDTRIP_BUDGET;
-    match pump_until(conn, queue, state, Some(deadline), stop, |st| {
-        st.sync_done >= serial
-    })? {
+    match sync_barrier(conn, queue, state, serial, deadline, Some(stop))? {
         Pumped::Done => Ok(()),
         Pumped::Stopped => bail!("{what} abandoned — the stream was released while we waited"),
         Pumped::Expired => bail!(
@@ -1941,7 +1879,7 @@ fn park_until_stopped(
     output: &str,
     node_id: u32,
 ) -> Result<()> {
-    match pump_until(conn, queue, state, None, stop, |st| st.closed)? {
+    match pump_until(conn, queue, state, None, Some(stop), |st| st.closed)? {
         Pumped::Done => {
             tracing::warn!(output = %output, node_id, "KWin closed the screencast stream");
         }
@@ -1967,7 +1905,7 @@ fn await_created(
     let began = Instant::now();
     let deadline = (began + CREATE_BUDGET).min(started + OPENER_BUDGET - WORKER_MARGIN);
     let settled = |st: &State| st.node_id.is_some() || st.failed.is_some() || st.closed;
-    match pump_until(conn, queue, state, Some(deadline), stop, settled)? {
+    match pump_until(conn, queue, state, Some(deadline), Some(stop), settled)? {
         // Node id first: a `closed` in the same burst as `created` is a stream that
         // was made and then torn down, not a failure to make one.
         Pumped::Done => match (state.node_id, state.failed.take()) {
