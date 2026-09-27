@@ -73,9 +73,11 @@ mod cursor_fwd;
 mod stream;
 use stream::{
     reconfig_allowed, software_stream, synthetic_abr_stream, synthetic_stream, virtual_stream,
-    SessionContext, SynthAbrContext,
+    SessionContext, StreamCommon, SynthAbrContext,
 };
+mod wiring;
 pub use stream::{Content, KeyframeAnswer, SynthAbrShape, DEFAULT_IDR_PCT};
+use wiring::SessionWiring;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Punktfunk1Source {
@@ -1486,60 +1488,24 @@ pub(crate) async fn run_admitted(
 
     // Handshake stream stays open: Reconfigure → data plane rebuilds capture/encoder;
     // ProbeRequest → FLAG_PROBE burst. Inbound and outbound multiplexed with `select!`.
-    let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<punktfunk_core::Mode>();
-    let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel::<()>();
-    // LTR-RFI: encode loop prefers `invalidate_ref_frames` over a full IDR when the encoder can.
-    let (rfi_tx, rfi_rx) = std::sync::mpsc::channel::<(u32, u32)>();
-    let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
-    // Encoder truth for `SetBitrate` resolve: applied rate, a ceiling the encoder taught and
-    // re-tests, cadence-degraded (climb refused — more bits are not the fix).
-    let live_bitrate = Arc::new(AtomicU32::new(welcome.bitrate_kbps));
-    let encoder_ceiling = Arc::new(std::sync::Mutex::new(EncoderCeiling::new()));
-    let cadence_degraded = Arc::new(AtomicBool::new(false));
-    // Behind-cadence score for the climb-refusal log (the flag alone has no evidence).
-    let cadence_behind_score = Arc::new(AtomicU32::new(0));
-    // Client-received packet count (`u32::MAX` until the client answers). Distinguishes a
-    // clean link from a dead one (`loss_ppm = 0` means both).
-    let client_packets_received = Arc::new(AtomicU32::new(u32::MAX));
-    let client_packets_received_ctl = client_packets_received.clone();
-    let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
-    // The bring-up ramp's window: probe requests are served on the punched
-    // data plane without the control task's spacing until the send thread
-    // takes it. Open from the handshake, because the client asks as soon as
-    // it has punched — before this host has built anything.
-    let ramp_open = Arc::new(AtomicBool::new(
-        welcome.host_caps2 & punktfunk_core::quic::HOST_CAP2_RAMP != 0,
-    ));
-    let ramp_open_ctl = ramp_open.clone();
-    let (probe_result_tx, probe_result_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
-    // Accept ack is written before the rebuild; a failed or differently-honored rebuild must
-    // correct the client's mode slot with a second `Reconfigured { accepted: true, mode }`.
-    let (reconfig_result_tx, reconfig_result_rx) =
-        tokio::sync::mpsc::unbounded_channel::<Reconfigured>();
-    // Rebuild can re-resolve Automatic (1080p client mirroring a 4K panel). Tell the client
-    // (`BitrateChanged`); otherwise ABR's first climb is from a stale lower base.
-    let (retarget_tx, retarget_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, AckReason)>();
-    // Rebuild gap (ms) → `PipelineGap` so the client discards that ABR window as congestion.
-    let (gap_tx, gap_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    // Encode loop diffs cursor serial; control task is the sole writer. Wired even if unused.
-    // Depth-1 latest-wins: a shape a stalled peer never drained is stale, not a backlog.
-    let (cursor_shape_tx, cursor_shape_rx) =
-        tokio::sync::watch::channel::<Option<punktfunk_core::quic::CursorShape>>(None);
-    // Channels always wired. Driver only if `Hello::max_shard_payload` and not PyroWave
-    // (PyroWave pins the Welcome value for the session; mid-stream re-key would desync).
-    let (shard_change_tx, shard_change_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
-    let (shard_ack_tx, shard_ack_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
-    let (shard_apply_tx, shard_apply_rx) = std::sync::mpsc::channel::<usize>();
-    // Not for a browser either: the driver's targets are UDP-over-IP maths, and a WebTransport
-    // datagram also carries QUIC and HTTP/3 framing, so a grow it computed would not fit.
+    let SessionWiring {
+        control: control_ends,
+        stream: stream_ends,
+        shard,
+        shared,
+    } = SessionWiring::new(&welcome, source);
+    // Shard renegotiation only if `Hello::max_shard_payload` and not PyroWave (PyroWave pins
+    // the Welcome value for the session; a mid-stream re-key would desync). Not for a browser
+    // either: the driver's targets are UDP-over-IP maths, and a WebTransport datagram also
+    // carries QUIC and HTTP/3 framing, so a grow it computed would not fit.
     let shard_reneg = (hello.max_shard_payload > 0
         && codec != crate::encode::Codec::PyroWave
         && matches!(data_plane, DataPlane::Udp))
     .then_some(wire_mtu::ShardReneg {
         client_ceiling: hello.max_shard_payload,
-        change_tx: shard_change_tx,
-        ack_rx: shard_ack_rx,
-        apply_tx: shard_apply_tx,
+        change_tx: shard.change_tx,
+        ack_rx: shard.ack_rx,
+        apply_tx: shard.apply_tx,
     });
     // Path-MTU watch: clamp for the next session, and heal/grow this one if the driver exists.
     wire_mtu::spawn_watch(
@@ -1550,27 +1516,11 @@ pub(crate) async fn run_admitted(
     );
     // Read back from Welcome, not recomputed (would re-probe and could drift).
     let cursor_forward = welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0;
-    // `true` = client draws (exclude + forward), `false` = host composites. Starts true.
-    let cursor_client_draws = Arc::new(AtomicBool::new(true));
-    let cursor_client_draws_dp = cursor_client_draws.clone();
     // Only sources that can keep encoder and packetizer FEC in one wire budget adapt it.
     // Synthetic-abr derives frame bytes from FEC every frame; the virtual path publishes
     // a proposal only after its encoder accepts the matching rate. Fixed synthetic and
     // the standalone software source have no coordinated retarget path.
     let adaptive_fec = adaptive_fec_for(source, fec_static_override().is_some());
-    // A proposal lands on `fec_requested`; the stream loop publishes it to `fec_target`
-    // only after the encoder accepts the matching rate. Synthetic-abr aliases the pair:
-    // it re-derives frame bytes from FEC every frame and has no retarget to coordinate.
-    let fec_target = Arc::new(AtomicU8::new(welcome.fec.fec_percent));
-    let fec_requested = match source {
-        Punktfunk1Source::SyntheticAbr(_) => fec_target.clone(),
-        _ => Arc::new(AtomicU8::new(welcome.fec.fec_percent)),
-    };
-    // The client's proven link rate; the send loop paces a pinned stream against it.
-    let link_kbps = Arc::new(AtomicU32::new(0));
-    // PhaseReports from the control task; encode loop drains. Inert until a vsync-aware client.
-    let phase_ctl = Arc::new(stream::PhaseCtl::new());
-    let phase_ctl_control = phase_ctl.clone();
     // Negotiated rate; PyroWave retarget-refusals ack this pin.
     let session_bitrate_kbps = welcome.bitrate_kbps;
     // Control task flips on `ClipControl`; lifecycle clears it if CLIPBOARD is revoked.
@@ -1641,29 +1591,8 @@ pub(crate) async fn run_admitted(
             + punktfunk_core::abr::budget::SHARD_WIRE_OVERHEAD,
         audio_kbps: audio_reserved_kbps(&welcome),
         ack_reason: abr_features & punktfunk_core::quic::EXT_ABR_ACK_REASON != 0,
-        live_bitrate: live_bitrate.clone(),
-        encoder_ceiling: encoder_ceiling.clone(),
-        cadence_degraded: cadence_degraded.clone(),
-        cadence_behind_score: cadence_behind_score.clone(),
-        client_packets_received: client_packets_received_ctl,
-        fec_target: fec_target.clone(),
-        fec_requested: fec_requested.clone(),
-        link_kbps: link_kbps.clone(),
-        phase_ctl: phase_ctl_control,
-        reconfig_tx,
-        keyframe_tx,
-        rfi_tx,
-        bitrate_tx,
-        probe_tx,
-        probe_result_rx,
-        ramp_open: ramp_open_ctl,
-        reconfig_result_rx,
-        retarget_rx,
-        gap_rx,
-        shard_change_rx,
-        shard_ack_tx,
-        cursor_shape_rx,
-        cursor_client_draws,
+        ends: control_ends,
+        shared: shared.clone(),
         clip_enabled: clip_enabled.clone(),
         clip,
         session_grants: session_grants.clone(),
@@ -1938,9 +1867,6 @@ pub(crate) async fn run_admitted(
     let counters_stream = counters.clone();
     // Client HDR volume for EDID + 0xCE. `None` = older client / no HDR → built-in defaults.
     let client_hdr = hello.display_hdr.map(crate::encode::hdr_meta_from_wire);
-    let fec_target_dp = fec_target.clone();
-    let link_kbps_dp = link_kbps.clone();
-    let fec_requested_dp = fec_requested.clone();
     let conn_stream = conn.clone();
     // 0xCF host-timing only if the client advertised the cap; older clients get no extra datagrams.
     let timing_conn =
@@ -1952,6 +1878,7 @@ pub(crate) async fn run_admitted(
     // Absent ⇒ single-slice. Some TV-SoC decoders wedge on multi-slice AUs.
     let multi_slice = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE != 0;
     let stats_dp = stats;
+    let shared_dp = shared;
     // The title's `audio.sessions`, over every session on this display. Lifted with the session.
     let _audio_policy = hello
         .launch
@@ -1985,126 +1912,79 @@ pub(crate) async fn run_admitted(
                 control_local_ip,
                 &bringup_dp,
             )?;
-            let mut session = Session::new(cfg, transport)
+            let session = Session::new(cfg, transport)
                 .map_err(|e| anyhow!("host session: {e:?}"))?;
+            let mut common = StreamCommon {
+                session,
+                mode,
+                seconds,
+                stop: stop_stream,
+                quit: quit_stream,
+                end_reason: end_reason_stream,
+                counters: counters_stream,
+                ends: stream_ends,
+                shared: shared_dp,
+                bitrate_kbps,
+                audio_reserved_kbps,
+                shard_payload: welcome.shard_payload,
+                timing_conn,
+                probe_seq,
+                stats: stats_dp,
+                client_label,
+                bringup: bringup_dp,
+                wire_sock,
+                codec,
+                controls,
+                client_name,
+                hdr,
+                bit_depth,
+                chroma,
+            };
             match source {
                 Punktfunk1Source::Software => software_stream(
-                    &mut session,
+                    &mut common.session,
                     codec,
                     mode,
                     bitrate_kbps,
-                    &stop_stream,
-                    &probe_rx,
-                    &probe_result_tx,
-                    &fec_target_dp,
+                    &common.stop,
+                    &common.ends.probe_rx,
+                    &common.ends.probe_result_tx,
+                    &common.shared.fec_target,
                     probe_seq,
                 ),
                 Punktfunk1Source::Synthetic => synthetic_stream(
-                    &mut session,
+                    &mut common.session,
                     frames,
-                    &stop_stream,
-                    &probe_rx,
-                    &probe_result_tx,
-                    &fec_target_dp,
-                    timing_conn.as_ref(),
+                    &common.stop,
+                    &common.ends.probe_rx,
+                    &common.ends.probe_result_tx,
+                    &common.shared.fec_target,
+                    common.timing_conn.as_ref(),
                     probe_seq,
                 ),
-                Punktfunk1Source::SyntheticAbr(shape) => {
-                    synthetic_abr_stream(SynthAbrContext {
-                    session,
-                    mode,
-                    seconds,
+                Punktfunk1Source::SyntheticAbr(shape) => synthetic_abr_stream(SynthAbrContext {
+                    common,
                     content: shape.content,
                     recovery: shape.recovery,
                     answer: shape.answer,
                     idr_pct: shape.idr_pct,
                     bringup_delay: shape.bringup,
-                    ramp_open,
                     fit_pin: hello.bitrate_kbps == 0 && codec == crate::encode::Codec::PyroWave,
-                    stop: stop_stream,
-                    counters: counters_stream,
-                    keyframe: keyframe_rx,
-                    rfi: rfi_rx,
-                    bitrate_rx,
-                    shard_rx: shard_apply_rx,
-                    bitrate_kbps,
-                    audio_reserved_kbps,
-                    shard_payload: welcome.shard_payload,
-                    live_bitrate,
-                    fec_target: fec_target_dp,
-                    probe_rx,
-                    probe_result_tx,
-                    timing_conn,
-                    phase: phase_ctl,
-                    probe_seq,
-                    stats: stats_dp,
-                    client_label,
                     plane,
-                    bringup: bringup_dp,
-                    wire_sock,
-                    codec,
-                    quit: quit_stream,
-                    end_reason: end_reason_stream,
-                    controls,
-                    client_name,
-                    hdr,
-                    bit_depth,
-                    chroma,
                     peer: peer_ip,
-                    })
-                }
+                }),
                 Punktfunk1Source::Virtual => {
                     let compositor = compositor
                         .expect("the Virtual source resolves a compositor during the handshake");
                     let ctx = SessionContext {
-                        session,
-                        mode,
-                        seconds,
-                        stop: stop_stream,
-                        quit: quit_stream,
-                        end_reason: end_reason_stream,
-                        counters: counters_stream,
-                        reconfig: reconfig_rx,
-                        keyframe: keyframe_rx,
-                        rfi: rfi_rx,
-                        bitrate_rx,
-                        shard_rx: shard_apply_rx,
+                        common,
                         compositor,
                         gamescope_route,
-                        bitrate_kbps,
-                        audio_reserved_kbps,
-                        shard_payload: welcome.shard_payload,
-                        live_bitrate,
-                        encoder_ceiling,
-                        cadence_degraded,
-                        cadence_behind_score,
-                        client_packets_received,
                         bitrate_auto,
-                        bit_depth,
-                        hdr,
-                        chroma,
-                        codec,
-                        probe_rx,
-                        probe_result_tx,
-                        ramp_open,
-                        reconfig_result_tx,
-                        retarget_tx,
-                        gap_tx,
-                        fec_target: fec_target_dp,
-                        fec_requested: fec_requested_dp,
-                        link_kbps: link_kbps_dp,
-                        phase: phase_ctl,
-                        conn: conn_stream,
-                        timing_conn,
                         cursor_forward,
-                        cursor_shape_tx,
-                        cursor_client_draws: cursor_client_draws_dp,
-                        probe_seq,
                         streamed_au,
                         multi_slice,
-                        stats: stats_dp,
-                        client_label,
-                        client_name,
+                        conn: conn_stream,
                         launch: launch_for_dp,
                         launch_target,
                         launch_claim,
@@ -2113,12 +1993,9 @@ pub(crate) async fn run_admitted(
                         launch_outcome: launch_outcome_dp,
                         client_hdr,
                         join_live,
-                        controls,
                         reframe_to,
                         frame_map,
-                        bringup: bringup_dp,
                         resize_ms: resize_ms_dp,
-                        wire_sock,
                         #[cfg(target_os = "linux")]
                         input_tx: input_tx_stream,
                         #[cfg(target_os = "linux")]

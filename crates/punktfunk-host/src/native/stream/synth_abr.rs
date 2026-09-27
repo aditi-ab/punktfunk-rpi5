@@ -207,13 +207,10 @@ fn owe_idr(
     }
 }
 
-/// Per-session inputs for [`synthetic_abr_stream`]. The display-side half of
-/// [`SessionContext`] has no meaning here and is not carried.
+/// Per-session inputs for [`synthetic_abr_stream`]: the [`StreamCommon`] plus the shape it
+/// encodes. The display-side half of [`SessionContext`] has no meaning here and is not carried.
 pub(crate) struct SynthAbrContext {
-    pub(crate) session: Session,
-    pub(crate) mode: punktfunk_core::Mode,
-    /// `0` = until the client leaves.
-    pub(crate) seconds: u32,
+    pub(crate) common: StreamCommon,
     pub(crate) content: Content,
     /// How long after a keyframe ask a decodable frame reaches the wire. `0` = the next one.
     /// A GPU host that answers with a pipeline rebuild takes about a second, and the asks
@@ -226,90 +223,71 @@ pub(crate) struct SynthAbrContext {
     /// pipeline build holds it. The client's bring-up ramp is served on the
     /// idle data plane for exactly this long.
     pub(crate) bringup_delay: std::time::Duration,
-    /// The ramp window's flag, cleared on hand-over.
-    pub(crate) ramp_open: Arc<AtomicBool>,
     /// Automatic PyroWave: the client's ramp closes with one lower pin, so the
     /// window lingers a bounded grace past the fake bring-up for it to cross.
     pub(crate) fit_pin: bool,
-    pub(crate) stop: Arc<AtomicBool>,
-    pub(crate) counters: Arc<crate::session_status::SessionCounters>,
-    pub(crate) keyframe: std::sync::mpsc::Receiver<()>,
-    pub(crate) rfi: std::sync::mpsc::Receiver<(u32, u32)>,
-    pub(crate) bitrate_rx: std::sync::mpsc::Receiver<u32>,
-    pub(crate) shard_rx: std::sync::mpsc::Receiver<usize>,
-    /// Total wire budget (kbps): video + FEC + framing + the audio reservation.
-    pub(crate) bitrate_kbps: u32,
-    pub(crate) audio_reserved_kbps: u32,
-    pub(crate) shard_payload: u16,
-    pub(crate) live_bitrate: Arc<AtomicU32>,
-    pub(crate) fec_target: Arc<AtomicU8>,
-    pub(crate) probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
-    pub(crate) probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
-    pub(crate) timing_conn: Option<super::super::link::SessionLink>,
-    pub(crate) phase: Arc<PhaseCtl>,
-    pub(crate) probe_seq: bool,
-    pub(crate) stats: Arc<StatsRecorder>,
-    pub(crate) client_label: String,
+    /// What [`crate::session_status::register`] needs and this source can't derive: which
+    /// plane carries it, and the client's address, which is how the shared-path governor
+    /// groups sessions.
     pub(crate) plane: crate::events::Plane,
-    pub(crate) bringup: Arc<crate::bringup::Trace>,
-    pub(crate) wire_sock: Option<std::net::UdpSocket>,
-    /// What [`crate::session_status::register`] needs and this source cannot derive: the
-    /// session's own handles, what the handshake negotiated, and the client's address, which
-    /// is how the shared-path governor groups sessions.
-    pub(crate) codec: crate::encode::Codec,
-    pub(crate) quit: Arc<AtomicBool>,
-    pub(crate) end_reason: Arc<AtomicU8>,
-    pub(crate) controls: crate::session_status::SessionControls,
-    pub(crate) client_name: Option<String>,
-    pub(crate) hdr: bool,
-    pub(crate) bit_depth: u8,
-    pub(crate) chroma: crate::encode::ChromaFormat,
     pub(crate) peer: std::net::IpAddr,
 }
 
-/// Stream until the client leaves, `seconds` elapse, or the send thread goes.
+/// Stream until the client leaves, `seconds` (`0` = until the client leaves) elapse, or the
+/// send thread goes.
 pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
     boost_thread_priority(true);
     let SynthAbrContext {
-        session,
-        mode,
-        seconds,
+        common:
+            StreamCommon {
+                session,
+                mode,
+                seconds,
+                stop,
+                quit,
+                end_reason,
+                counters,
+                ends:
+                    StreamEnds {
+                        keyframe,
+                        rfi,
+                        bitrate_rx,
+                        shard_rx,
+                        probe_rx,
+                        probe_result_tx,
+                        ..
+                    },
+                shared:
+                    SessionShared {
+                        live_bitrate,
+                        fec_target,
+                        phase,
+                        ramp_open,
+                        ..
+                    },
+                bitrate_kbps,
+                audio_reserved_kbps,
+                shard_payload,
+                timing_conn,
+                probe_seq,
+                stats,
+                client_label,
+                bringup,
+                wire_sock,
+                codec,
+                controls,
+                client_name,
+                hdr,
+                bit_depth,
+                chroma,
+            },
         content,
         recovery,
         answer,
         idr_pct,
         bringup_delay,
-        ramp_open,
         fit_pin,
-        stop,
-        counters,
-        keyframe,
-        rfi,
-        bitrate_rx,
-        shard_rx,
-        bitrate_kbps,
-        audio_reserved_kbps,
-        shard_payload,
-        live_bitrate,
-        fec_target,
-        probe_rx,
-        probe_result_tx,
-        timing_conn,
-        phase,
-        probe_seq,
-        stats,
-        client_label,
         plane,
-        bringup,
-        wire_sock,
-        codec,
-        quit,
-        end_reason,
-        controls,
-        client_name,
-        hdr,
-        bit_depth,
-        chroma,
         peer,
     } = ctx;
     let fps = mode.refresh_hz.max(1);
