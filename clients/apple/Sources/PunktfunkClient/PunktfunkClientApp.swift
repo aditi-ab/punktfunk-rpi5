@@ -116,6 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Without this a quit reads to the host as a dropped link, and it lingers the display.
     func applicationWillTerminate(_ notification: Notification) {
         SessionModel.quitAll()
+        PresetStore.shared.flush()
     }
 }
 #elseif os(iOS)

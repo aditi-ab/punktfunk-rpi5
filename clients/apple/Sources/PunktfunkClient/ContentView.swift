@@ -376,6 +376,8 @@ struct ContentView: View {
             switch phase {
             case .background:
                 applyBackgroundPolicy()
+                // A kill from the background runs no teardown.
+                presets.flush()
             case .active:
                 model.exitBackground()
             default:
