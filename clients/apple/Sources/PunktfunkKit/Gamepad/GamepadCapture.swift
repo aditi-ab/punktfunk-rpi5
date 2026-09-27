@@ -338,7 +338,9 @@ public final class GamepadCapture {
         let pad = slots.first?.pad ?? 0
         wire.send(.gamepadButton(bit, down: true, pad: pad))
         let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self] _ in
-            Task { @MainActor in self?.wire?.send(.gamepadButton(bit, down: false, pad: pad)) }
+            MainActor.assumeIsolated {
+                self?.wire?.send(.gamepadButton(bit, down: false, pad: pad))
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
     }
@@ -680,7 +682,7 @@ public final class GamepadCapture {
             if slot.tapReleaseOwed { finishTap(slot) }
             slot.selectPending = true
             let timer = Timer(timeInterval: Self.guideHold, repeats: false) { [weak self, weak slot] _ in
-                Task { @MainActor in
+                MainActor.assumeIsolated {
                     if let self, let slot { self.gestureHoldFired(slot) }
                 }
             }
@@ -716,7 +718,7 @@ public final class GamepadCapture {
         wire?.send(.gamepadButton(GamepadWire.back, down: true, pad: slot.pad))
         slot.tapReleaseOwed = true
         let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self, weak slot] _ in
-            Task { @MainActor in
+            MainActor.assumeIsolated {
                 if let self, let slot { self.finishTap(slot) }
             }
         }
@@ -918,7 +920,7 @@ public final class GamepadCapture {
         let held = slots.contains { $0.buttons & Self.escapeChord == Self.escapeChord }
         if held, chordTimer == nil {
             let timer = Timer(timeInterval: Self.disconnectHold, repeats: false) { [weak self] _ in
-                Task { @MainActor in self?.onDisconnectRequest?() }
+                MainActor.assumeIsolated { self?.onDisconnectRequest?() }
             }
             RunLoop.main.add(timer, forMode: .common)
             chordTimer = timer
