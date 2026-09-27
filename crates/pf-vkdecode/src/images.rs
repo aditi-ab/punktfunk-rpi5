@@ -25,6 +25,7 @@ use crate::caps::OUTPUT_USAGE;
 use crate::device::find_memory_type_preferring;
 use crate::device::AllocError;
 use crate::device::DecodeDevice;
+use crate::device::Unwind;
 
 /// Extra pictures the consumer may hold (delivered, unreleased) on top of
 /// the stream's DPB depth. Pool size is `required_slots + HOLD_HEADROOM`.
@@ -403,47 +404,29 @@ unsafe fn create_video_image(
     } else {
         ci.sharing_mode(vk::SharingMode::EXCLUSIVE)
     };
+    // SAFETY: only the image and memory created below go in, before any use.
+    let mut unwind = unsafe { Unwind::new(dev.ash()) };
     // SAFETY: live device; `ci` roots a chain of locals outliving the call.
     let image = unsafe { dev.ash().create_image(&ci, None)? };
+    unwind.image = image;
     // SAFETY: `image` was just created on this device.
     let req = unsafe { dev.ash().get_image_memory_requirements(image) };
-    let props = dev.memory_properties();
     // DEVICE_LOCAL preferred; any type in `memoryTypeBits` is accepted (the
     // driver's placement contract, same as session bindings).
-    let type_index = match find_memory_type_preferring(
-        &props,
+    let type_index = find_memory_type_preferring(
+        &dev.memory_properties(),
         req.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    ) {
-        Ok(index) => index,
-        Err(e) => {
-            // SAFETY: destroying the just-created, never-bound image.
-            unsafe { dev.ash().destroy_image(image, None) };
-            return Err(e);
-        }
-    };
+    )?;
     let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(req.size)
         .memory_type_index(type_index);
-    // SAFETY: live device; unwind destroys the unbound image so the error path
-    // leaks nothing.
-    let memory = match unsafe { dev.ash().allocate_memory(&alloc, None) } {
-        Ok(m) => m,
-        Err(e) => {
-            // SAFETY: destroying the just-created, never-bound image.
-            unsafe { dev.ash().destroy_image(image, None) };
-            return Err(e.into());
-        }
-    };
+    // SAFETY: live device; `alloc` is a local.
+    let memory = unsafe { dev.ash().allocate_memory(&alloc, None)? };
+    unwind.memory = memory;
     // SAFETY: fresh image + fresh memory of the required size.
-    if let Err(e) = unsafe { dev.ash().bind_image_memory(image, memory, 0) } {
-        // SAFETY: unwinding the two objects created above.
-        unsafe {
-            dev.ash().destroy_image(image, None);
-            dev.ash().free_memory(memory, None);
-        }
-        return Err(e.into());
-    }
+    unsafe { dev.ash().bind_image_memory(image, memory, 0)? };
+    unwind.disarm();
     Ok((image, memory))
 }
 
