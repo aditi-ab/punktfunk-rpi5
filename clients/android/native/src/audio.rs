@@ -13,6 +13,7 @@
 //! `design/audio-latency-overhaul.md` for the full policy.
 
 use crate::audio_format::SessionAudio;
+use crate::sysprop;
 use ndk::audio::{
     AudioCallbackResult, AudioContentType, AudioDirection, AudioFormat, AudioPerformanceMode,
     AudioSharingMode, AudioStream, AudioStreamBuilder, AudioUsage,
@@ -318,25 +319,6 @@ fn av_sync_enabled() -> bool {
         sysprop(c"debug.punktfunk.no_av_sync").as_deref(),
         Some("1") | Some("true")
     )
-}
-
-/// Read an Android system property; `None` when unset, empty or not UTF-8.
-///
-/// One reader for all of them: the audio plane now has four field-reachable knobs
-/// (`no_av_sync`, `audio_sharing`, `audio_perf`, `audio_reopen`) and the open-ladder ones exist
-/// precisely so a device that reports silence can be bisected WITHOUT a rebuild — an app launched
-/// from a TV's home screen inherits no environment, so a sysprop is the only lever a field tester
-/// can actually reach.
-fn sysprop(name: &std::ffi::CStr) -> Option<String> {
-    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
-                             // SAFETY: a valid NUL-terminated name + a PROP_VALUE_MAX-sized buffer is always safe.
-    let n = unsafe { libc::__system_property_get(name.as_ptr(), buf.as_mut_ptr().cast()) };
-    if n <= 0 {
-        return None;
-    }
-    std::str::from_utf8(&buf[..n as usize])
-        .ok()
-        .map(str::to_owned)
 }
 
 /// Is this an Android TV / set-top box (as opposed to a phone, tablet or handheld)?
@@ -1279,15 +1261,7 @@ impl<'a> Plane<'a> {
         let ahead = stream.frames_written() - ts.frame_position;
         let heard_at =
             ts.time_nanoseconds + ahead * 1_000_000_000 / i64::from(self.fmt.rate_hz.max(1));
-        let mut now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `now` is a valid, writable timespec.
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
-        #[allow(clippy::unnecessary_cast)] // `time_t` and `c_long` are 32-bit on armv7
-        let now_ns = now.tv_sec as i64 * 1_000_000_000 + now.tv_nsec as i64;
-        (heard_at - now_ns).max(0) as u64
+        (heard_at - crate::decode::now_monotonic_ns()).max(0) as u64
     }
 
     fn on_packet(&mut self, pkt: &AudioPacket) -> Result<(), DecodeExit> {

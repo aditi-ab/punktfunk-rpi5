@@ -50,16 +50,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
         if guard.is_some() {
             return Ok(()); // already streaming
         }
-        // SAFETY: `env`/`surface` are valid JNI pointers for this call. `as *mut _` bridges any
-        // jni-sys version skew between the `jni` and `ndk` crates (both are raw `*mut _` pointers)
-        // — a real skew here, not a hypothetical one: `jni` is on jni-sys 0.4 while the vendored
-        // `ndk` is still on 0.3.
-        let window = match unsafe {
-            ndk::native_window::NativeWindow::from_surface(
-                env.get_raw() as *mut _,
-                surface.as_raw() as *mut _,
-            )
-        } {
+        // SAFETY: Kotlin declares `surface` a non-null `Surface`.
+        let window = match unsafe { crate::window_from_surface(env, &surface) } {
             Some(w) => w,
             None => {
                 log::error!("nativeStartVideo: no ANativeWindow from Surface");

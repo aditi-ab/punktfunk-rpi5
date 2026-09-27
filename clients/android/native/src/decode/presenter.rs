@@ -54,26 +54,10 @@ const LATCH_MARGIN_NS: i64 = 2_500_000;
 /// `debug.punktfunk.latch_margin_us` (0..=8000 µs): PIN the submit margin for a sweep —
 /// setprop + stream restart, no rebuild. Unset/invalid = `None` = the adaptive default.
 fn latch_margin_ns() -> Option<i64> {
-    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
-                             // SAFETY: __system_property_get with a valid name + PROP_VALUE_MAX buffer is always safe.
-    let n = unsafe {
-        libc::__system_property_get(
-            c"debug.punktfunk.latch_margin_us".as_ptr(),
-            buf.as_mut_ptr().cast(),
-        )
-    };
-    if n > 0 {
-        if let Ok(us) = std::str::from_utf8(&buf[..n as usize])
-            .unwrap_or("")
-            .trim()
-            .parse::<i64>()
-        {
-            if (0..=8_000).contains(&us) {
-                return Some(us * 1_000);
-            }
-        }
-    }
-    None
+    let us = crate::sysprop(c"debug.punktfunk.latch_margin_us")?
+        .parse::<i64>()
+        .ok()?;
+    (0..=8_000).contains(&us).then_some(us * 1_000)
 }
 
 /// The budget's liveness backstop: a release whose predicted latch never seems to arrive
@@ -788,15 +772,7 @@ fn release_unrendered(codec: &MediaCodec, index: usize) {
 /// `debug.punktfunk.presenter` sysprop: `arrival` = the legacy release-immediately path,
 /// anything else / unset = the timeline presenter. The rebuild-free on-device A/B lever.
 pub(super) fn presenter_disabled_by_sysprop() -> bool {
-    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
-                             // SAFETY: __system_property_get with a valid name + PROP_VALUE_MAX buffer is always safe.
-    let n = unsafe {
-        libc::__system_property_get(
-            c"debug.punktfunk.presenter".as_ptr(),
-            buf.as_mut_ptr().cast(),
-        )
-    };
-    n > 0 && &buf[..n as usize] == b"arrival"
+    crate::sysprop(c"debug.punktfunk.presenter").as_deref() == Some("arrival")
 }
 
 #[cfg(test)]

@@ -210,9 +210,8 @@ pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: 
     //     ANativeWindow*, float frameRate, int8_t compatibility, int8_t changeFrameRateStrategy)
     type SetFrameRateStrategyFn = unsafe extern "C" fn(*mut c_void, f32, i8, i8) -> i32;
     // SAFETY: `dlopen` of the always-mapped `libandroid.so` (only bumps its refcount; never closed —
-    // process-lifetime handle). Each `dlsym` returns null when the symbol is absent (device below the
-    // symbol's API level), checked before transmuting the non-null pointer to its fn-pointer type.
-    // `window.ptr()` is the live `ANativeWindow` this `NativeWindow` owns for the call's duration.
+    // process-lifetime handle; null is checked). Each `sym` type is the NDK header's signature;
+    // absent = below its API level. `window.ptr()` is live for the call (`&NativeWindow`).
     unsafe {
         let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
         if lib.is_null() {
@@ -223,21 +222,17 @@ pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: 
         // TV: prefer the API-31 change-strategy form to force the mode switch (strategy 1 =
         // ALWAYS). Absent on API 30 ⇒ fall through to the 2-arg hint below.
         if is_tv {
-            let sym = libc::dlsym(
+            if let Some(set) = crate::sym::<SetFrameRateStrategyFn>(
                 lib,
-                c"ANativeWindow_setFrameRateWithChangeStrategy".as_ptr(),
-            );
-            if !sym.is_null() {
-                let set = std::mem::transmute::<*mut c_void, SetFrameRateStrategyFn>(sym);
+                c"ANativeWindow_setFrameRateWithChangeStrategy",
+            ) {
                 return set(window.ptr().as_ptr().cast(), frame_rate, FIXED_SOURCE, 1) == 0;
             }
         }
-        let sym = libc::dlsym(lib, c"ANativeWindow_setFrameRate".as_ptr());
-        if sym.is_null() {
+        let Some(set) = crate::sym::<SetFrameRateFn>(lib, c"ANativeWindow_setFrameRate") else {
             return false; // device API < 30 — no per-surface frame-rate hint
-        }
-        let set_frame_rate = std::mem::transmute::<*mut c_void, SetFrameRateFn>(sym);
-        set_frame_rate(window.ptr().as_ptr().cast(), frame_rate, FIXED_SOURCE) == 0
+        };
+        set(window.ptr().as_ptr().cast(), frame_rate, FIXED_SOURCE) == 0
     }
 }
 
@@ -307,7 +302,7 @@ pub(super) const LOW_LATENCY_KEY_PROP: &std::ffi::CStr = c"debug.punktfunk.low_l
 const HALF_RATE_TVS: &[(&str, &str)] = &[("TPV", "PH1M_WW_9972"), ("TCL", "G08")];
 
 fn half_rate_tv() -> bool {
-    use super::asc_presenter::sysprop;
+    use crate::sysprop;
     let (Some(maker), Some(device)) = (
         sysprop(c"ro.product.manufacturer"),
         sysprop(c"ro.product.device"),
@@ -341,7 +336,7 @@ pub(super) fn low_latency_format(
         (mode.width * mode.height).max(2_000_000) as i32,
     );
     if let Some(aggressive) = keys {
-        let forced = super::asc_presenter::sysprop(LOW_LATENCY_KEY_PROP);
+        let forced = crate::sysprop(LOW_LATENCY_KEY_PROP);
         let profile = match forced.as_deref() {
             Some(p @ ("standard" | "off" | "mtk-tv")) => p,
             _ if codec_name.to_ascii_lowercase().starts_with("c2.mtk") && half_rate_tv() => {

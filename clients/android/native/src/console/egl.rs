@@ -207,14 +207,21 @@ impl EglContext {
         }
     }
 
-    /// A window surface over `window` (an `ANativeWindow*`), made current on the calling
-    /// thread with a vsync-locked swap interval. Returns the surface and its pixel size.
-    pub(super) fn window_surface(&self, window: *mut c_void) -> Result<EglSurface> {
-        // SAFETY: `window` is a live ANativeWindow the caller holds a reference to for the
-        // surface's lifetime; the display/config/context are this object's own.
+    /// A window surface over `window`, made current on the calling thread with a vsync-locked
+    /// swap interval. Returns the surface and its pixel size.
+    pub(super) fn window_surface(
+        &self,
+        window: &ndk::native_window::NativeWindow,
+    ) -> Result<EglSurface> {
+        // SAFETY: `window` is live for the call and EGL takes its own reference for the surface's
+        // lifetime; the display/config/context are this object's own.
         unsafe {
-            let surface =
-                eglCreateWindowSurface(self.display, self.config, window, std::ptr::null());
+            let surface = eglCreateWindowSurface(
+                self.display,
+                self.config,
+                window.ptr().as_ptr().cast(),
+                std::ptr::null(),
+            );
             if surface == EGL_NO_SURFACE {
                 bail!("eglCreateWindowSurface: 0x{:x}", eglGetError());
             }
