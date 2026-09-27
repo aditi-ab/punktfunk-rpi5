@@ -461,7 +461,14 @@ impl AudioDec {
     /// `out` is caller scratch. Opus decodes into a fixed slice, so it must already
     /// hold the biggest frame the plane can carry. PCM hands the Vec to `pcm::to_f32`,
     /// which grows it — a malformed oversized datagram cannot overrun there.
+    ///
+    /// Empty `input` is Opus DTX or a torn PCM datagram: `Some(0)`, nothing decoded.
+    /// libopus would read it as a loss and fill all of `out` with PLC, and
+    /// `PcmConceal::accept` would drop the frame the next loss repeats.
     fn decode(&mut self, input: &[u8], out: &mut Vec<f32>) -> Option<usize> {
+        if input.is_empty() {
+            return Some(0);
+        }
         let channels = self.channels;
         match &mut self.kind {
             DecKind::Stereo(d) => d.decode_float(input, out, false).ok().map(|n| n * channels),
@@ -1876,6 +1883,8 @@ fn spawn_audio(
                             }
                         }
                         match dec.decode(&pkt.data, &mut pcm) {
+                            // Empty payload: the last frame stays the concealment unit.
+                            Some(0) => {}
                             Some(n) => {
                                 frame_samples = n;
                                 queue(&player, &pcm[..n]);
@@ -2098,6 +2107,10 @@ mod tests {
         // Not a whole number of samples at the negotiated depth: refuse rather than
         // decode a shifted frame.
         assert_eq!(dec.decode(&wire[..wire.len() - 1], &mut out), None);
+
+        // A torn empty datagram decodes nothing and keeps the frame to repeat.
+        assert_eq!(dec.decode(&[], &mut out), Some(0));
+        assert_eq!(dec.conceal(0, &mut out), Some(frame));
     }
 
     /// Opus arm through the same methods: they return interleaved counts where
@@ -2122,6 +2135,10 @@ mod tests {
         // Pump scratch: 120 ms — the biggest frame the Opus plane can carry.
         let mut out = vec![0f32; 120 * 48 * 2];
         assert_eq!(dec.decode(&packet[..n], &mut out), Some(240 * 2));
+        // DTX: no PLC, not even into the scratch.
+        out.fill(7.0);
+        assert_eq!(dec.decode(&[], &mut out), Some(0));
+        assert!(out.iter().all(|&s| s == 7.0));
         // PLC is asked for, and answered, in the same unit.
         assert_eq!(dec.conceal(240 * 2, &mut out), Some(240 * 2));
         // Nothing to size PLC from is a `None`, not a panic on an empty slice.
