@@ -3982,7 +3982,6 @@ version = "0.40.0"
 dependencies = [
  "anyhow",
  "ksni",
- "libc",
  "pf-paths",
  "punktfunk-core",
  "rustls",
