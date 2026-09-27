@@ -47,6 +47,7 @@ use crate::device::DeviceError;
 use crate::device::DeviceHandles;
 use crate::device::QueueLock;
 use crate::device::QueueSubmitGuard;
+use crate::images::allow_copy_out;
 use crate::images::plan_pools;
 use crate::images::DpbPool;
 use crate::images::PicturePool;
@@ -148,6 +149,8 @@ pub struct DecodedVkFrame {
     pub picture: u32,
     /// Session generation; `release_frame` routes by this (current vs graveyard).
     pub generation: u64,
+    /// The picture carries TRANSFER_SRC, so a consumer may copy it out (`copy_out`).
+    pub copyable: bool,
 }
 
 /// Decode failure. Never panics; device loss is first-class so the session
@@ -604,6 +607,10 @@ pub struct VkH264Decoder {
     ready: VecDeque<DecodedVkFrame>,
     /// Retired generations' pools with consumer-held images (die on last token).
     graveyard: Vec<RetiredPool>,
+    /// [`Self::export_bitstream`].
+    export_bitstream: bool,
+    /// [`Self::copy_out`].
+    copy_out: bool,
     /// Most recent plan warnings ([`Self::take_warnings`]).
     last_warnings: Vec<PlanWarning>,
     /// Outstanding recovery-point SEI ([`crate::recovery`]). Survives session
@@ -665,7 +672,28 @@ impl VkH264Decoder {
             generation: 0,
             device_lost: false,
             level_clamp_warned: false,
+            export_bitstream: false,
+            copy_out: false,
         })
+    }
+
+    /// Export the bitstream ring as a dma-buf from the next session on, for an owner that
+    /// waits the decode through the kernel ([`Self::bitstream_dmabuf`]).
+    pub fn export_bitstream(&mut self) {
+        self.export_bitstream = true;
+    }
+
+    /// From the next session on, give pictures TRANSFER_SRC where the driver answers for
+    /// it, so the owner can copy them out ([`DecodedVkFrame::copyable`]).
+    pub fn copy_out(&mut self) {
+        self.copy_out = true;
+    }
+
+    /// The bitstream ring's dma-buf, while its backing lives; every decode writes fences
+    /// onto it. `None` before the first session or without an export.
+    #[cfg(unix)]
+    pub fn bitstream_dmabuf(&self) -> Option<std::os::fd::RawFd> {
+        self.state.as_ref().and_then(|s| s.ring.dmabuf_fd())
     }
 
     /// Decode one access unit. Returns the next display-ready frame if the
@@ -1432,6 +1460,17 @@ impl VkH264Decoder {
             pool_plan.picture_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
         }
         let decode_profile = DecodeProfile::H264(std_profile);
+        if self.copy_out {
+            // SAFETY: live device per the constructor contract.
+            unsafe {
+                allow_copy_out(
+                    &self.dev,
+                    decode_profile,
+                    &mut pool_plan,
+                    caps.output_format,
+                )
+            };
+        }
         // SAFETY: live device per the constructor contract, for every create in
         // this block; each created half is owned by a Drop type the moment it
         // exists, so a mid-build failure unwinds cleanly.
@@ -1457,6 +1496,7 @@ impl VkH264Decoder {
                     caps.min_bitstream_size_alignment,
                 ),
                 decode_profile,
+                self.export_bitstream,
             )
             .map_err(VkDecodeError::from)?;
             let ops = OpRing::create(
@@ -1545,6 +1585,7 @@ pub(crate) fn build_frame(
     generation: u64,
 ) -> DecodedVkFrame {
     let format = pool.format;
+    let copyable = pool.copyable;
     let picture = &mut pool.pictures[entry.image];
     picture.pending = false;
     picture.held += 1;
@@ -1574,6 +1615,7 @@ pub(crate) fn build_frame(
         submission: entry.submission,
         picture: entry.image as u32,
         generation,
+        copyable,
     }
 }
 

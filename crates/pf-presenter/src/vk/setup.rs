@@ -436,9 +436,10 @@ impl Presenter {
         .context("vkCreateDevice")?;
         let swap_d = ash::khr::swapchain::Device::new(&instance, &device);
         let present_timer = present_wait_ok.then(|| {
-            super::present_timing::PresentTimer::spawn(ash::khr::present_wait::Device::new(
-                &instance, &device,
-            ))
+            super::present_timing::PresentTimer::spawn(
+                ash::khr::present_wait::Device::new(&instance, &device),
+                device.clone(),
+            )
         });
         tracing::info!(
             present_wait = present_wait_ok,
@@ -458,11 +459,18 @@ impl Presenter {
                 "dmabuf decode sync (a decode fence the sampling submit waits; \
                  `false` polls the fence on the presenter thread)"
             );
+            // SAFETY: live, paired handles; the extension and feature are checked alongside.
+            let timelines = (sync_fd_ext && have_f12.timeline_semaphore == vk::TRUE)
+                .then(|| unsafe {
+                    super::sync_timeline::TimelineMaker::new(&instance, pdev, &device)
+                })
+                .flatten();
             Some(HwCtx {
                 ext_mem_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
                 modifier_cache: Default::default(),
                 imports: Default::default(),
                 sync,
+                timelines,
             })
         } else {
             None
@@ -627,6 +635,21 @@ impl Presenter {
         let acquire_sem =
             // SAFETY: CREATE — CreateInfo is a local; the handle is stored on the Presenter.
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
+        let mut timeline_type = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        // Null without the timeline feature: the waiter then keeps latch whole.
+        let done_sem = if have_f12.timeline_semaphore == vk::TRUE {
+            // SAFETY: CREATE — CreateInfo chains a local; the handle is stored on the Presenter.
+            unsafe {
+                device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut timeline_type),
+                    None,
+                )
+            }?
+        } else {
+            vk::Semaphore::null()
+        };
         // SAFETY: CREATE — CreateInfo is a local; SIGNALED so the first wait is a no-op.
         let fence = unsafe {
             device.create_fence(
@@ -635,6 +658,8 @@ impl Presenter {
             )
         }?;
 
+        #[cfg(target_os = "linux")]
+        let native_timelines = hw.as_ref().is_some_and(|h| h.timelines.is_some());
         let mut p = Presenter {
             entry,
             instance,
@@ -679,6 +704,7 @@ impl Presenter {
             extent: vk::Extent2D::default(),
             render_sems: Vec::new(),
             acquire_sem,
+            done_sem,
             fence,
             cmd_pool,
             cmd_buf,
@@ -691,6 +717,35 @@ impl Presenter {
             last_presented: None,
             video_fit: Default::default(),
             placement_logged: None,
+            #[cfg(target_os = "linux")]
+            native: if crate::wl_native::enabled() {
+                crate::wl_native::NativeLane::new(window, native_timelines).unwrap_or_else(|e| {
+                    tracing::warn!(error = %format!("{e:#}"), "native scanout lane unavailable");
+                    None
+                })
+            } else {
+                None
+            },
+            #[cfg(target_os = "linux")]
+            export_ring: None,
+            #[cfg(target_os = "linux")]
+            export_refused: None,
+            #[cfg(target_os = "linux")]
+            export_gen: 0,
+            #[cfg(target_os = "linux")]
+            overlay_ring: None,
+            #[cfg(target_os = "linux")]
+            overlay_refused: None,
+            #[cfg(target_os = "linux")]
+            overlay_shown: None,
+            #[cfg(target_os = "linux")]
+            vaapi_sync: Default::default(),
+            native_pq: false,
+            #[cfg(target_os = "linux")]
+            native_flip: crate::wl_native::flip_mode().then(std::time::Instant::now),
+            overlay_blocks_native: false,
+            native_last: false,
+            suspended: false,
         };
         p.recreate_swapchain(window)?;
         Ok(p)

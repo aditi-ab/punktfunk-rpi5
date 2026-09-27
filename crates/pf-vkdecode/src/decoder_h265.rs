@@ -48,6 +48,7 @@ use crate::device::DecodeDevice;
 use crate::device::DeviceHandles;
 use crate::device::QueueLock;
 use crate::device::QueueSubmitGuard;
+use crate::images::allow_copy_out;
 use crate::images::plan_pools;
 use crate::images::DpbPool;
 use crate::images::PicturePool;
@@ -166,6 +167,10 @@ pub struct VkH265Decoder {
     level_clamp_warned: bool,
     /// [`Self::refuse_multi_slice`].
     single_slice: bool,
+    /// [`Self::export_bitstream`].
+    export_bitstream: bool,
+    /// [`Self::copy_out`].
+    copy_out: bool,
 }
 
 impl VkH265Decoder {
@@ -209,7 +214,28 @@ impl VkH265Decoder {
             recovery: RecoveryLatch::default(),
             level_clamp_warned: false,
             single_slice: false,
+            export_bitstream: false,
+            copy_out: false,
         })
+    }
+
+    /// Export the bitstream ring as a dma-buf from the next session on, for an owner that
+    /// waits the decode through the kernel ([`Self::bitstream_dmabuf`]).
+    pub fn export_bitstream(&mut self) {
+        self.export_bitstream = true;
+    }
+
+    /// From the next session on, give pictures TRANSFER_SRC where the driver answers for
+    /// it, so the owner can copy them out ([`DecodedVkFrame::copyable`]).
+    pub fn copy_out(&mut self) {
+        self.copy_out = true;
+    }
+
+    /// The bitstream ring's dma-buf, while its backing lives; every decode writes fences
+    /// onto it. `None` before the first session or without an export.
+    #[cfg(unix)]
+    pub fn bitstream_dmabuf(&self) -> Option<std::os::fd::RawFd> {
+        self.state.as_ref().and_then(|s| s.ring.dmabuf_fd())
     }
 
     /// Refuse a picture with more than one slice segment before it reaches the driver.
@@ -1022,6 +1048,17 @@ impl VkH265Decoder {
             pool_plan.picture_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
         }
         let decode_profile = DecodeProfile::H265(key);
+        if self.copy_out {
+            // SAFETY: live device per the constructor contract.
+            unsafe {
+                allow_copy_out(
+                    &self.dev,
+                    decode_profile,
+                    &mut pool_plan,
+                    caps.output_format,
+                )
+            };
+        }
         // SAFETY: live device per the constructor contract, for every create in
         // this block; each created half is owned by a Drop type the moment it
         // exists, so a mid-build failure unwinds cleanly.
@@ -1047,6 +1084,7 @@ impl VkH265Decoder {
                     caps.min_bitstream_size_alignment,
                 ),
                 decode_profile,
+                self.export_bitstream,
             )
             .map_err(VkDecodeError::from)?;
             let ops = OpRing::create(

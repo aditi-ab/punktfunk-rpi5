@@ -138,6 +138,18 @@ impl Presenter {
         if self.extent.width == 0 || self.extent.height == 0 {
             return Ok(Presented::Shown); // minimized: not Stale (Stale recreates)
         }
+        // While the native lane owns the window a swapchain redraw would paint over the
+        // picture (and has no swapchain to paint into); a real frame takes the window back.
+        if self.native_last || self.suspended {
+            if matches!(input, FrameInput::Redraw) {
+                return Ok(Presented::Shown);
+            }
+            self.native_last = false;
+            #[cfg(target_os = "linux")]
+            if self.suspended {
+                self.resume_swapchain(window)?;
+            }
+        }
         // FIFO without present-wait: the queue is policed here rather than by blocking.
         // Give the previous submit's fence up to 1 ms (it is the frame's real gate, and a
         // sleep-and-retry either spins or wakes late), then take the image ahead of time;
@@ -1101,6 +1113,13 @@ impl Presenter {
                     wait_values.push(0);
                 }
             }
+            // With present timing the submit also signals `done_sem` with the id the
+            // present below will carry: the waiter splits our GPU time from the compositor's.
+            let timed = self.present_timer.is_some() && self.done_sem != vk::Semaphore::null();
+            if timed {
+                signal_sems.push(self.done_sem);
+                signal_values.push(self.next_present_id + 1);
+            }
             let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
                 .wait_semaphore_values(&wait_values)
                 .signal_semaphore_values(&signal_values);
@@ -1109,7 +1128,7 @@ impl Presenter {
                 .wait_dst_stage_mask(&wait_stages)
                 .command_buffers(&cmd_bufs)
                 .signal_semaphores(&signal_sems);
-            if native_wait.is_some() {
+            if native_wait.is_some() || timed {
                 submit = submit.push_next(&mut timeline);
             }
             // Keyed mutex, key 0 both ways (decode writes under acquire(0)/release(0)

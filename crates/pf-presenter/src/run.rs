@@ -2068,6 +2068,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             }
         }
         overlay_damage.rendered(overlay_frame.as_ref().map(|f| f.image));
+        // The native lane shows the overlay on its own surface; the swapchain path draws it.
+        presenter.sync_native_overlay(overlay_frame.as_ref(), window.size());
 
         let mut presented_video = false;
         if let Some(st) = &mut stream {
@@ -2113,10 +2115,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             }
                         }
                         if let Some(c) = &st.connector {
-                            c.hud().note_displayed(
+                            c.hud().note_displayed_split(
                                 s.pts_ns,
                                 s.decoded_ns,
                                 s.submitted_ns,
+                                s.gpu_done_ns,
                                 s.displayed_ns,
                             );
                         }
@@ -2252,11 +2255,17 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         // session presents through the HDR10 path like the H.26x codecs.
                         st.hdr = f.color.is_pq();
                         st.hdr_untonemapped = false;
-                        match presenter.present(
-                            &window,
-                            FrameInput::PyroWave(f),
-                            overlay_frame.as_ref(),
-                        ) {
+                        // The native lane first: the planes copied into the window's buffer.
+                        let native = presenter.present_native_pyro(f, pts_ns, decoded_ns);
+                        match match native {
+                            crate::vk::NativeVkOutcome::Shown => Ok(Presented::Shown),
+                            crate::vk::NativeVkOutcome::Dropped => Ok(Presented::Stale),
+                            crate::vk::NativeVkOutcome::Declined(f) => presenter.present(
+                                &window,
+                                FrameInput::PyroWave(f),
+                                overlay_frame.as_ref(),
+                            ),
+                        } {
                             Ok(Presented::Shown) => {
                                 st.pyro_present_warned = false;
                                 true
@@ -2334,11 +2343,17 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     {
                         st.hdr = d.color.is_pq();
                         st.hdr_untonemapped = false;
-                        match presenter.present(
-                            &window,
-                            FrameInput::Dmabuf(d),
-                            overlay_frame.as_ref(),
-                        ) {
+                        // The native lane first: the compositor takes the dma-buf itself.
+                        let native = presenter.present_native(d, pts_ns, decoded_ns);
+                        match match native {
+                            crate::wl_native::Outcome::Shown => Ok(Presented::Shown),
+                            crate::wl_native::Outcome::Dropped => Ok(Presented::Stale),
+                            crate::wl_native::Outcome::Declined(d) => presenter.present(
+                                &window,
+                                FrameInput::Dmabuf(d),
+                                overlay_frame.as_ref(),
+                            ),
+                        } {
                             Ok(Presented::Shown) => {
                                 st.hw_fails = 0;
                                 true
@@ -2438,11 +2453,17 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     DecodedImage::NativeVk(v) if !st.dmabuf_demoted => {
                         st.hdr = v.color.is_pq();
                         st.hdr_untonemapped = false;
-                        match presenter.present(
-                            &window,
-                            FrameInput::NativeVk(v),
-                            overlay_frame.as_ref(),
-                        ) {
+                        // The native lane first: a copy of the picture as the window's buffer.
+                        let native = presenter.present_native_vk(v, pts_ns, decoded_ns);
+                        match match native {
+                            crate::vk::NativeVkOutcome::Shown => Ok(Presented::Shown),
+                            crate::vk::NativeVkOutcome::Dropped => Ok(Presented::Stale),
+                            crate::vk::NativeVkOutcome::Declined(v) => presenter.present(
+                                &window,
+                                FrameInput::NativeVk(v),
+                                overlay_frame.as_ref(),
+                            ),
+                        } {
                             Ok(Presented::Shown) => {
                                 st.hw_fails = 0;
                                 true
@@ -2583,10 +2604,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     } else {
                         0
                     };
+                    #[cfg(target_os = "linux")]
+                    let native_zero_copy = presenter.take_native_zero_copy();
+                    #[cfg(not(target_os = "linux"))]
+                    let native_zero_copy = (0u32, 0u32);
                     tracing::info!(
                         smoothing = present.smoothing,
                         mode = present.mode,
                         vrr = present.vrr.label(),
+                        native_zero_copy = ?native_zero_copy,
                         replaced,
                         q_drop,
                         q_dry,

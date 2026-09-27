@@ -1,0 +1,24 @@
+#version 450
+// Interleaves PyroWave's Cb and Cr planes into one two-channel image: the chroma plane of
+// NV12, or with WIDE of P010 (16-bit codes, the 10 significant bits on top).
+
+#ifdef WIDE
+#define PLANE_FMT r16
+#define CHROMA_FMT rg16
+#else
+#define PLANE_FMT r8
+#define CHROMA_FMT rg8
+#endif
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, PLANE_FMT) uniform readonly image2D cb;
+layout(set = 0, binding = 1, PLANE_FMT) uniform readonly image2D cr;
+layout(set = 0, binding = 2, CHROMA_FMT) uniform writeonly image2D chroma;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, imageSize(chroma)))) {
+        return;
+    }
+    imageStore(chroma, p, vec4(imageLoad(cb, p).r, imageLoad(cr, p).r, 0.0, 0.0));
+}
