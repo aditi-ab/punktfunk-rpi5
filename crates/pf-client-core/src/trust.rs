@@ -171,12 +171,14 @@ fn write_private_key(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// `icacls.exe` from `SystemRoot`, or `icacls` on `PATH`.
-#[cfg(windows)]
+/// `icacls.exe` under `SystemRoot`, else `WINDIR`, else `C:\Windows` — never a bare name,
+/// which `CreateProcess` would look up beside the exe first. `pf_paths::system32`'s rule.
+#[cfg(any(windows, test))]
 fn icacls_exe() -> String {
-    std::env::var("SystemRoot")
-        .map(|root| format!("{root}\\System32\\icacls.exe"))
-        .unwrap_or_else(|_| "icacls".to_string())
+    let root = std::env::var("SystemRoot")
+        .or_else(|_| std::env::var("WINDIR"))
+        .unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\icacls.exe")
 }
 
 /// One `icacls` call with no console window: the WinUI shell has no console, so a
@@ -1788,6 +1790,12 @@ mod tests {
             let raw = OsStr::from_bytes(b"/from-env/\xff");
             assert_eq!(resolve_config_dir(Some(raw)).unwrap().as_os_str(), raw);
         }
+    }
+
+    #[test]
+    fn icacls_is_named_under_system32_never_by_bare_name() {
+        let p = icacls_exe();
+        assert!(p.ends_with(r"\System32\icacls.exe"), "{p}");
     }
 
     /// The key file is owner-only on create. Unix is mode 0600. Windows is an

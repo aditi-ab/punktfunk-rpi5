@@ -7,7 +7,8 @@
 //! [`seat_home`] is the XDG data dir a seat's nested Steam runs under.
 //! [`create_private_dir`] / [`create_secret_dir`] / [`write_secret_file`] apply
 //! 0700 / 0600 on Unix and a restrictive DACL on Windows. Secret dirs omit the
-//! `BUILTIN\Users` read grant the config dir needs for the tray.
+//! `BUILTIN\Users` read grant the config dir needs for the tray. [`system32`] is how a
+//! privileged process names a Windows system tool.
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
@@ -89,18 +90,34 @@ pub fn seat_record(id: &str) -> PathBuf {
 /// [`config_dir`]: a seat home holds a Steam install, not configuration.
 #[cfg(target_os = "linux")]
 fn data_dir() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .filter(|s| !s.is_empty())
+    xdg_home("XDG_DATA_HOME", ".local/share").join("punktfunk")
+}
+
+/// `$var` when it holds an absolute path, else `$HOME/<fallback>`. The XDG base-dir spec
+/// ignores an empty or relative value.
+#[cfg(not(windows))]
+fn xdg_home(var: &str, fallback: &str) -> PathBuf {
+    xdg_home_from(std::env::var_os(var), std::env::var_os("HOME"), fallback)
+}
+
+#[cfg(not(windows))]
+fn xdg_home_from(
+    value: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    fallback: &str,
+) -> PathBuf {
+    value
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| PathBuf::from(h).join(fallback)))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("punktfunk")
 }
 
 /// Host identity, pairing, mgmt token, library.
 ///
 /// Windows uses `%ProgramData%` so the SYSTEM service and the interactive
-/// user share one dir that survives logout. `PUNKTFUNK_CONFIG_DIR` overrides.
+/// user share one dir that survives logout. Elsewhere `$XDG_CONFIG_HOME`, ignored
+/// when empty or relative. `PUNKTFUNK_CONFIG_DIR` overrides.
 pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PUNKTFUNK_CONFIG_DIR").filter(|s| !s.is_empty()) {
         return PathBuf::from(dir);
@@ -111,10 +128,7 @@ pub fn config_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     #[cfg(not(target_os = "windows"))]
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base = xdg_home("XDG_CONFIG_HOME", ".config");
     base.join("punktfunk")
 }
 
@@ -262,7 +276,7 @@ pub fn restrict_existing_secret_file(path: &std::path::Path) {
     if !path.exists() {
         return;
     }
-    let icacls = icacls_path();
+    let icacls = system32("icacls.exe");
     let _ = std::process::Command::new(&icacls)
         .arg(path.as_os_str())
         .args(["/setowner", "*S-1-5-32-544"]) // BUILTIN\Administrators
@@ -278,12 +292,16 @@ pub fn restrict_existing_secret_file(path: &std::path::Path) {
 #[cfg(not(windows))]
 pub fn restrict_existing_secret_file(_path: &std::path::Path) {}
 
-/// `icacls` by absolute path — a privileged service must never resolve it through `PATH`.
-#[cfg(windows)]
-fn icacls_path() -> String {
-    std::env::var("SystemRoot")
-        .map(|r| format!("{r}\\System32\\icacls.exe"))
-        .unwrap_or_else(|_| "icacls".to_string())
+/// `%SystemRoot%\System32\<rel>`, else under `%WINDIR%`, else `C:\Windows`.
+///
+/// `CreateProcess` searches the exe's directory and the cwd before `PATH`, and the callers run
+/// elevated or as SYSTEM, so a system tool is never spawned by bare name. `rel` may carry a
+/// subdirectory (`WindowsPowerShell\v1.0\powershell.exe`). Ungated: string work only.
+pub fn system32(rel: &str) -> String {
+    let root = std::env::var("SystemRoot")
+        .or_else(|_| std::env::var("WINDIR"))
+        .unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\{rel}")
 }
 
 /// Default `%ProgramData%` lets `BUILTIN\Users` create and become
@@ -292,7 +310,7 @@ fn icacls_path() -> String {
 /// `(OI)(CI)(RX)` so the tray can read non-secret config. Hard-coded SIDs; never fatal.
 #[cfg(windows)]
 fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool, users_read: bool) {
-    let icacls = icacls_path();
+    let icacls = system32("icacls.exe");
     // Re-own to Administrators first: an owner keeps WRITE_DAC.
     // `deep` (once per dir per process) also re-owns contents; directory-only
     // left planted files still writable by their creator.
@@ -407,7 +425,7 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Re
 /// only warns.
 #[cfg(windows)]
 fn restrict_to_system_admins(path: &std::path::Path) -> std::io::Result<()> {
-    let icacls = icacls_path();
+    let icacls = system32("icacls.exe");
     let status = std::process::Command::new(icacls)
         .arg(path.as_os_str())
         .args([
@@ -481,6 +499,42 @@ mod tests {
         let record = seat_record("cafe0123");
         assert_eq!(record.parent(), seat.parent());
         assert!(!record.starts_with(&seat), "{}", record.display());
+    }
+
+    #[test]
+    fn system_tools_resolve_under_system32_never_by_bare_name() {
+        let p = system32("icacls.exe");
+        assert!(p.ends_with(r"\System32\icacls.exe"), "{p}");
+        assert!(
+            p.len() > r"\System32\icacls.exe".len(),
+            "a root, not a bare name: {p}"
+        );
+        let ps = system32(r"WindowsPowerShell\v1.0\powershell.exe");
+        assert!(
+            ps.ends_with(r"\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "{ps}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_empty_or_relative_xdg_value_falls_back_to_home() {
+        let home = || Some("/home/u".into());
+        for bad in ["", "punktfunk-rel"] {
+            assert_eq!(
+                xdg_home_from(Some(bad.into()), home(), ".config"),
+                PathBuf::from("/home/u/.config"),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            xdg_home_from(Some("/xdg".into()), home(), ".config"),
+            PathBuf::from("/xdg")
+        );
+        assert_eq!(
+            xdg_home_from(None, home(), ".local/share"),
+            PathBuf::from("/home/u/.local/share")
+        );
     }
 
     #[test]

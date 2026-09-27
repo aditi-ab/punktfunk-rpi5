@@ -159,62 +159,10 @@ fn configured_gpu_priority_mode() -> PrioMode {
 /// Enable `SE_INC_BASE_PRIORITY` on this process token (best-effort).
 ///
 /// The kernel gates HIGH/REALTIME GPU scheduling on it. SYSTEM/Administrators
-/// hold it; a UAC-filtered token does not, so [`elevate_process_gpu_priority`]
-/// may silently no-op.
+/// hold it; a UAC-filtered token does not, and the warning says so.
 fn enable_inc_base_priority() {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
-    use windows::Win32::Security::{
-        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
-        SE_INC_BASE_PRIORITY_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
-        TOKEN_QUERY,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    let mut token = HANDLE::default();
-    // SAFETY: `GetCurrentProcess` returns the current-process pseudo-handle, always valid and never
-    // closed; `token` is a local the callee only writes, and it is only used below if this succeeded.
-    let opened = unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            &mut token,
-        )
-    }
-    .is_ok();
-    if opened {
-        let mut luid = LUID::default();
-        // SAFETY: a null system name means "local system"; `SE_INC_BASE_PRIORITY_NAME` is a static
-        // NUL-terminated constant, and `luid` is a local the callee only writes.
-        let found =
-            unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_INC_BASE_PRIORITY_NAME, &mut luid) }
-                .is_ok();
-        if found {
-            let tp = TOKEN_PRIVILEGES {
-                PrivilegeCount: 1,
-                Privileges: [LUID_AND_ATTRIBUTES {
-                    Luid: luid,
-                    Attributes: SE_PRIVILEGE_ENABLED,
-                }],
-            };
-            // SAFETY: `token` is the live handle opened above; `tp` is a correctly sized local
-            // `TOKEN_PRIVILEGES` whose `PrivilegeCount` matches its one-element array, borrowed only
-            // for the duration of the call.
-            let adjusted = unsafe {
-                AdjustTokenPrivileges(
-                    token,
-                    false,
-                    Some(&tp as *const TOKEN_PRIVILEGES),
-                    0,
-                    None,
-                    None,
-                )
-            };
-            if adjusted.is_err() {
-                tracing::warn!("AdjustTokenPrivileges(SE_INC_BASE_PRIORITY) failed (run as admin/SYSTEM for GPU priority)");
-            }
-        }
-        // SAFETY: `token` was opened above, is owned here, and is closed exactly once on this path.
-        let _ = unsafe { CloseHandle(token) };
+    if let Err(e) = crate::privilege::enable("SeIncreaseBasePriorityPrivilege") {
+        tracing::warn!(error = %e, "SE_INC_BASE_PRIORITY not enabled (run as admin/SYSTEM for GPU priority)");
     }
 }
 

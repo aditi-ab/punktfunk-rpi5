@@ -266,29 +266,11 @@ fn load_pin() -> Option<[u8; 32]> {
     Some(punktfunk_core::tls::cert_fingerprint(der.as_ref()))
 }
 
-/// Host config dir, mirroring `gamestream::config_dir()` without linking the
-/// host crate. `None` on Windows: those files are SYSTEM/Admins-DACL'd.
+/// The host's [`pf_paths::config_dir`] where the tray may read it: on Linux, or wherever
+/// `PUNKTFUNK_CONFIG_DIR` points. `None` otherwise: Windows' files are SYSTEM/Admins-DACL'd.
 pub fn punktfunk_config_dir() -> Option<std::path::PathBuf> {
-    if let Some(d) = std::env::var_os("PUNKTFUNK_CONFIG_DIR") {
-        if !d.is_empty() {
-            return Some(std::path::PathBuf::from(d));
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-            if !x.is_empty() {
-                return Some(std::path::PathBuf::from(x).join("punktfunk"));
-            }
-        }
-        std::env::var_os("HOME").map(|h| {
-            std::path::PathBuf::from(h)
-                .join(".config")
-                .join("punktfunk")
-        })
-    }
-    #[cfg(not(target_os = "linux"))]
-    None
+    let overridden = std::env::var_os("PUNKTFUNK_CONFIG_DIR").is_some_and(|d| !d.is_empty());
+    (cfg!(target_os = "linux") || overridden).then(pf_paths::config_dir)
 }
 
 /// Sync HTTPS agent: rustls(aws-lc-rs) + `PinVerify` (Linux client `library.rs`).
