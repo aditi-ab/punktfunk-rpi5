@@ -78,6 +78,9 @@ const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Bounds reading each request's header block (slowloris). Response streaming
 /// is unaffected; hyper re-arms this per request on a keep-alive connection.
 const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Requests in flight on one HTTP/2 connection. A client past it queues on that connection
+/// rather than opening another, so a library's worth of covers stays one of `MAX_CONNS_PER_IP`.
+const MAX_H2_STREAMS: u32 = 32;
 
 /// Decrements the per-IP live count on drop so every exit path (handshake
 /// failure, served connection, cancellation) releases the ceiling.
@@ -202,6 +205,10 @@ fn connection_builder() -> hyper_util::server::conn::auto::Builder<hyper_util::r
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT);
     builder
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .max_concurrent_streams(MAX_H2_STREAMS);
+    builder
 }
 
 async fn serve_conn<S>(stream: S, app: Router, fp: PeerCertFingerprint, addr: PeerAddr)
@@ -230,6 +237,55 @@ mod governed_tests {
     use super::*;
     use axum::routing::get;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A client that offers `h2` gets it, and more requests than the per-IP connection ceiling
+    /// all ride its one connection, `MAX_H2_STREAMS` at a time.
+    #[tokio::test]
+    async fn the_management_api_multiplexes_a_burst_over_http2() {
+        punktfunk_core::tls::install_default_provider();
+        let id = crate::identity::ephemeral().unwrap();
+        let server_tls = server_config_optional_client(&id.cert_pem, &id.key_pem).unwrap();
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let app = Router::new().route("/", get(|| async { "ok" }));
+        tokio::spawn(async move {
+            let tls = tokio_rustls::TlsAcceptor::from(server_tls)
+                .accept(server_io)
+                .await
+                .unwrap();
+            let peer = PeerAddr("127.0.0.1:1".parse().unwrap());
+            serve_conn(tls, app, PeerCertFingerprint(None), peer).await;
+        });
+
+        let mut client = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(punktfunk_core::tls::PinVerify::new(None)))
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect("localhost".try_into().unwrap(), client_io)
+            .await
+            .unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+
+        let (h2, connection) = h2::client::handshake(tls).await.unwrap();
+        tokio::spawn(connection);
+        let mut replies = tokio::task::JoinSet::new();
+        for _ in 0..MAX_CONNS_PER_IP * 3 {
+            let mut ready = h2.clone().ready().await.unwrap();
+            let request = axum::http::Request::get("https://localhost/")
+                .body(())
+                .unwrap();
+            let (response, _) = ready.send_request(request, true).unwrap();
+            replies.spawn(async move { response.await.unwrap().status() });
+        }
+        let mut ok = 0;
+        while let Some(status) = replies.join_next().await {
+            assert_eq!(status.unwrap(), axum::http::StatusCode::OK);
+            ok += 1;
+        }
+        assert_eq!(ok, MAX_CONNS_PER_IP * 3);
+        assert_eq!(h2.current_max_send_streams(), MAX_H2_STREAMS as usize);
+    }
 
     #[tokio::test]
     async fn configured_header_timeout_has_a_timer() {
@@ -452,8 +508,13 @@ pub fn server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>>
 /// Like [`server_config`] but the client cert is optional — a certless
 /// peer (browser + bearer token) still completes the handshake. Mgmt
 /// API: paired clients present a cert; everyone else falls back to the token.
+///
+/// Offers HTTP/2. Over HTTP/1.1 a library screen spends one connection per cover, and past
+/// `MAX_CONNS_PER_IP` the acceptor drops the rest — the covers that never load.
 pub fn server_config_optional_client(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>> {
-    build_server_config(cert_pem, key_pem, false)
+    let mut config = Arc::unwrap_or_clone(build_server_config(cert_pem, key_pem, false)?);
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
 }
 
 fn build_server_config(
