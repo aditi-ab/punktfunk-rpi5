@@ -402,8 +402,20 @@ object LibraryClient {
 /**
  * `cache`: an HTTP cache the client honours (`Cache-Control` / `ETag`, which the host's art proxy
  * sends). One instance per directory: OkHttp forbids two on the same path.
+ *
+ * One connection pool per identity, host and pin, shared by every caller: a pool per call leaves
+ * each connection idle for five minutes, and the host drops a peer's 33rd connection.
  */
 fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String, cache: Cache? = null): OkHttpClient {
+    val base = mtlsClients.computeIfAbsent("$host|${fpHex.lowercase()}|$certPem") {
+        buildMtlsClient(certPem, keyPem, host, fpHex)
+    }
+    return if (cache == null) base else base.newBuilder().cache(cache).build()
+}
+
+private val mtlsClients = java.util.concurrent.ConcurrentHashMap<String, OkHttpClient>()
+
+private fun buildMtlsClient(certPem: String, keyPem: String, host: String, fpHex: String): OkHttpClient {
     val clientCert = CertificateFactory.getInstance("X.509")
         .generateCertificate(ByteArrayInputStream(certPem.toByteArray())) as X509Certificate
     val privateKey = parsePrivateKey(keyPem)
@@ -462,7 +474,6 @@ fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String,
         .hostnameVerifier(verifier)
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
-        .cache(cache)
         .build()
 }
 

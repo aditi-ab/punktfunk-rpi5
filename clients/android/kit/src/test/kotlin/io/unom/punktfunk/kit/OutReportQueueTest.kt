@@ -17,12 +17,12 @@ class OutReportQueueTest {
     private fun report(marker: Int) = byteArrayOf(0x02, marker.toByte())
 
     // Masked: the marker rides in a Byte, and Byte.toInt() sign-extends.
-    private fun drain(q: OutReportQueue): List<Int> =
+    private fun drain(q: OutReportQueue<ByteArray>): List<Int> =
         generateSequence { q.poll() }.map { it[1].toInt() and 0xFF }.toList()
 
     @Test
     fun `rumble supersedes the pending rumble instead of queueing another`() {
-        val q = OutReportQueue()
+        val q = OutReportQueue<ByteArray>()
         assertTrue(q.offer(report(1), OutReportQueue.KEY_RUMBLE))
         assertTrue(q.offer(report(2), OutReportQueue.KEY_RUMBLE))
         assertTrue(q.offer(report(3), OutReportQueue.KEY_RUMBLE))
@@ -33,7 +33,7 @@ class OutReportQueueTest {
 
     @Test
     fun `superseding keeps the queue position so a rumble stream cannot jump one-shots`() {
-        val q = OutReportQueue()
+        val q = OutReportQueue<ByteArray>()
         q.offer(report(1), OutReportQueue.KEY_RUMBLE)
         q.offer(report(10)) // a one-shot queued behind it
         q.offer(report(2), OutReportQueue.KEY_RUMBLE)
@@ -44,7 +44,7 @@ class OutReportQueueTest {
 
     @Test
     fun `a full queue sacrifices rumble, never a one-shot`() {
-        val q = OutReportQueue(cap = 4)
+        val q = OutReportQueue<ByteArray>(cap = 4)
         q.offer(report(1), OutReportQueue.KEY_RUMBLE)
         q.offer(report(10))
         q.offer(report(11))
@@ -58,7 +58,7 @@ class OutReportQueueTest {
 
     @Test
     fun `the one-shot the host never repeats survives a rumble storm`() {
-        val q = OutReportQueue(cap = 4)
+        val q = OutReportQueue<ByteArray>(cap = 4)
         // The exact regression: a lightbar colour queued once, then a flood of rumble. Under the
         // old newest-wins eviction the colour was dropped from the head and never came back,
         // leaving the pad lit wrong until the value next happened to change.
@@ -71,7 +71,7 @@ class OutReportQueueTest {
 
     @Test
     fun `a queue full of one-shots refuses a rumble rather than dropping one`() {
-        val q = OutReportQueue(cap = 2)
+        val q = OutReportQueue<ByteArray>(cap = 2)
         q.offer(report(10))
         q.offer(report(11))
         assertFalse(
@@ -83,7 +83,7 @@ class OutReportQueueTest {
 
     @Test
     fun `only a queue of nothing but one-shots drops one, and it is the oldest`() {
-        val q = OutReportQueue(cap = 2)
+        val q = OutReportQueue<ByteArray>(cap = 2)
         q.offer(report(10))
         q.offer(report(11))
         assertTrue(q.offer(report(12)))
@@ -92,7 +92,7 @@ class OutReportQueueTest {
 
     @Test
     fun `clear empties the queue`() {
-        val q = OutReportQueue()
+        val q = OutReportQueue<ByteArray>()
         q.offer(report(1), OutReportQueue.KEY_RUMBLE)
         q.offer(report(10))
         q.clear()
