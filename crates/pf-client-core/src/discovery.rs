@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// DNS-SD type hosts advertise. See host crate `punktfunk_host::discovery`.
+/// DNS-SD type hosts advertise. See host crate `punktfunk_host::hostsys::discovery`.
 const SERVICE_TYPE: &str = "_punktfunk._udp.local.";
 
 pub use punktfunk_core::discovery::DiscoveredHost;

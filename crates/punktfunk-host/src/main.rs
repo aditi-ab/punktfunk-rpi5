@@ -25,11 +25,6 @@ mod devtest;
 /// Structured health verdicts — design/web-console-diagnostics.md.
 #[forbid(unsafe_code)]
 mod diagnostics;
-// Network-facing; same `forbid` as `mod mgmt`.
-#[forbid(unsafe_code)]
-mod discovery;
-#[forbid(unsafe_code)]
-mod wol;
 // `#[path]` keeps `crate::*` names flat while files live under `src/linux/`.
 #[cfg(target_os = "linux")]
 #[path = "linux/drm_sync.rs"]
@@ -135,9 +130,9 @@ mod gpuclocks;
 mod hooks;
 // What every plane shares: host facts, session state, `serve`.
 mod host;
-// Network-facing; same `forbid` as `mod mgmt`. Tests mutate process env (`set_var` is unsafe in 2024).
-#[cfg_attr(not(test), forbid(unsafe_code))]
-mod identity;
+// The box itself: identity, adverts, wake, power, sleep; the flat names keep `crate::power::*`.
+mod hostsys;
+use hostsys::{discovery, identity, osinfo, power, sleep_inhibit, wol};
 // Shim: inject backends live in `pf-inject`; keep `crate::inject::*` for this crate's callers.
 mod inject {
     pub(crate) use pf_inject::*;
@@ -161,14 +156,11 @@ mod ctl;
 mod native;
 #[forbid(unsafe_code)]
 mod native_pairing;
-mod osinfo;
 // Live per-session pad tap the console's Controllers page streams.
 mod pad_feed;
 mod plugins;
-mod power;
 mod send_pacing;
 mod session_plan;
-mod sleep_inhibit;
 mod slug;
 mod spike;
 // Session status, stats and log capture; the flat names keep `crate::session_status::*`.

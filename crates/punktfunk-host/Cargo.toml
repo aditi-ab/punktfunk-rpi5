@@ -93,7 +93,7 @@ socket2 = "0.6"
 tokio = { version = "1", features = ["full"] }
 # GameStream-only (behind the `gamestream` feature): the Moonlight RSA-2048 identity generator +
 # pairing signer (cert.rs, pairing.rs) and the legacy-client-cert leniency verifier (tls.rs).
-# The native planes use the P-256 identity (src/identity.rs) and never touch this crate — so a
+# The native planes use the P-256 identity (src/hostsys/identity.rs) and never touch this crate — so a
 # native-only build also sheds the accepted Marvin advisory (RUSTSEC-2023-0071, .cargo/audit.toml).
 #
 # TWO independent `rsa` features, arriving from two different bumps in this wave — both are load-
@@ -330,7 +330,7 @@ windows = { version = "0.62", features = [
     # GetApplicationUserModelId — a packaged (UWP) game's identity, which its frame window carries
     # (src/windows/game_term.rs).
     "Win32_Storage_Packaging_Appx",
-    # The host power actions (src/power.rs, design/host-actions.md): SetSuspendState /
+    # The host power actions (src/hostsys/power.rs, design/host-actions.md): SetSuspendState /
     # IsPwrSuspendAllowed (Power) and InitiateSystemShutdownExW + the SeShutdownPrivilege
     # constants (Shutdown).
     "Win32_System_Power",
