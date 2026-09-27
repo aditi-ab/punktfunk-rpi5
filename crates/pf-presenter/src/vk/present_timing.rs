@@ -2,6 +2,8 @@
 //!
 //! `vkQueuePresentKHR` return is CPU submit, not vblank. A waiter thread
 //! blocks in `vkWaitForPresentKHR` until the image is visible and stamps that.
+//! Given the submit's timeline value it first stamps when our own GPU work was
+//! done, which splits the compositor's share from ours.
 //!
 //! [`PresentTimer::drain`] before `vkDestroySwapchainKHR` and before any
 //! `vkCreateSwapchainKHR` that names the live swapchain as `oldSwapchain` —
@@ -23,6 +25,8 @@ pub(crate) struct PresentedSample {
     /// `vkQueuePresentKHR` return (client clock) — pace/latch split:
     /// submitted−decoded is pipeline, displayed−submitted is the vsync latch.
     pub submitted_ns: u64,
+    /// Our GPU work for this present finished (client clock). 0 when not waited.
+    pub gpu_done_ns: u64,
     /// `vkWaitForPresentKHR` completion: the image is visible (client clock).
     pub displayed_ns: u64,
 }
@@ -30,6 +34,8 @@ pub(crate) struct PresentedSample {
 struct Job {
     swapchain: vk::SwapchainKHR,
     present_id: u64,
+    /// The submit's timeline signal, waited before the present.
+    done: Option<(vk::Semaphore, u64)>,
     pts_ns: u64,
     decoded_ns: u64,
     submitted_ns: u64,
@@ -51,7 +57,7 @@ pub(crate) struct PresentTimer {
 }
 
 impl PresentTimer {
-    pub(crate) fn spawn(wait_d: ash::khr::present_wait::Device) -> Self {
+    pub(crate) fn spawn(wait_d: ash::khr::present_wait::Device, device: ash::Device) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
         let pending = Arc::new(AtomicUsize::new(0));
         let results = Arc::new(Mutex::new(Vec::with_capacity(256)));
@@ -63,6 +69,19 @@ impl PresentTimer {
                 // The on-glass stamp is taken at wake; scheduler delay reads as latch.
                 pf_client_core::audio_rt::boost_and_log("present-wait");
                 while let Ok(job) = rx.recv() {
+                    let mut gpu_done_ns = 0;
+                    if let Some((sem, value)) = job.done {
+                        let semaphores = [sem];
+                        let values = [value];
+                        let info = vk::SemaphoreWaitInfo::default()
+                            .semaphores(&semaphores)
+                            .values(&values);
+                        // SAFETY: `sem` is the presenter's timeline semaphore, alive until
+                        // teardown, which drains this thread first.
+                        if unsafe { device.wait_semaphores(&info, 250_000_000) }.is_ok() {
+                            gpu_done_ns = pf_client_core::session::now_ns();
+                        }
+                    }
                     // 250 ms: ids complete in order; longer means the pipeline is wedged.
                     // SAFETY: `job.swapchain` stays live for this call — enqueue runs
                     // while the swapchain exists, and `drain`/Drop wait it out first.
@@ -75,6 +94,7 @@ impl PresentTimer {
                             pts_ns: job.pts_ns,
                             decoded_ns: job.decoded_ns,
                             submitted_ns: job.submitted_ns,
+                            gpu_done_ns,
                             displayed_ns,
                         });
                     }
@@ -113,6 +133,7 @@ impl PresentTimer {
         &self,
         swapchain: vk::SwapchainKHR,
         present_id: u64,
+        done: Option<(vk::Semaphore, u64)>,
         pts_ns: u64,
         decoded_ns: u64,
         submitted_ns: u64,
@@ -123,6 +144,7 @@ impl PresentTimer {
                 .send(Job {
                     swapchain,
                     present_id,
+                    done,
                     pts_ns,
                     decoded_ns,
                     submitted_ns,

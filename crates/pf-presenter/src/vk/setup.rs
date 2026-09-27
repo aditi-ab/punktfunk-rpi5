@@ -436,9 +436,10 @@ impl Presenter {
         .context("vkCreateDevice")?;
         let swap_d = ash::khr::swapchain::Device::new(&instance, &device);
         let present_timer = present_wait_ok.then(|| {
-            super::present_timing::PresentTimer::spawn(ash::khr::present_wait::Device::new(
-                &instance, &device,
-            ))
+            super::present_timing::PresentTimer::spawn(
+                ash::khr::present_wait::Device::new(&instance, &device),
+                device.clone(),
+            )
         });
         tracing::info!(
             present_wait = present_wait_ok,
@@ -627,6 +628,21 @@ impl Presenter {
         let acquire_sem =
             // SAFETY: CREATE — CreateInfo is a local; the handle is stored on the Presenter.
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
+        let mut timeline_type = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        // Null without the timeline feature: the waiter then keeps latch whole.
+        let done_sem = if have_f12.timeline_semaphore == vk::TRUE {
+            // SAFETY: CREATE — CreateInfo chains a local; the handle is stored on the Presenter.
+            unsafe {
+                device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut timeline_type),
+                    None,
+                )
+            }?
+        } else {
+            vk::Semaphore::null()
+        };
         // SAFETY: CREATE — CreateInfo is a local; SIGNALED so the first wait is a no-op.
         let fence = unsafe {
             device.create_fence(
@@ -679,6 +695,7 @@ impl Presenter {
             extent: vk::Extent2D::default(),
             render_sems: Vec::new(),
             acquire_sem,
+            done_sem,
             fence,
             cmd_pool,
             cmd_buf,

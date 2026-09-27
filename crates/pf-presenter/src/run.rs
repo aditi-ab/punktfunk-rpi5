@@ -2108,10 +2108,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             }
                         }
                         if let Some(c) = &st.connector {
-                            c.hud().note_displayed(
+                            c.hud().note_displayed_split(
                                 s.pts_ns,
                                 s.decoded_ns,
                                 s.submitted_ns,
+                                s.gpu_done_ns,
                                 s.displayed_ns,
                             );
                         }

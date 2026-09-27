@@ -283,6 +283,9 @@ pub struct Presenter {
     /// image's schedule; one shared semaphore can still be held by a previous present.
     render_sems: Vec<vk::Semaphore>,
     acquire_sem: vk::Semaphore,
+    /// Timeline each submit signals with its present id: when our GPU work for that
+    /// present was done, so the waiter can split our share of latch from the compositor's.
+    done_sem: vk::Semaphore,
     fence: vk::Fence,
     cmd_pool: vk::CommandPool,
     cmd_buf: vk::CommandBuffer,
@@ -347,9 +350,11 @@ impl Presenter {
     pub(crate) fn note_presented(&mut self, pts_ns: u64, decoded_ns: u64) {
         if let (Some(t), Some((sc, id))) = (&self.present_timer, self.last_presented.take()) {
             // Submit stamp: `present()` has returned, so "now" is the present-call tail.
+            // The submit signalled `done_sem` with this id when its GPU work finished.
             t.enqueue(
                 sc,
                 id,
+                (self.done_sem != vk::Semaphore::null()).then_some((self.done_sem, id)),
                 pts_ns,
                 decoded_ns,
                 pf_client_core::session::now_ns(),
@@ -519,6 +524,7 @@ impl Drop for Presenter {
                 self.device.destroy_semaphore(s, None);
             }
             self.device.destroy_semaphore(self.acquire_sem, None);
+            self.device.destroy_semaphore(self.done_sem, None);
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.cmd_pool, None);
             if self.swapchain != vk::SwapchainKHR::null() {

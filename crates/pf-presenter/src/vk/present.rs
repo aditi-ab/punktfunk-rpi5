@@ -1084,6 +1084,13 @@ impl Presenter {
                     wait_values.push(0);
                 }
             }
+            // With present timing the submit also signals `done_sem` with the id the
+            // present below will carry: the waiter splits our GPU time from the compositor's.
+            let timed = self.present_timer.is_some() && self.done_sem != vk::Semaphore::null();
+            if timed {
+                signal_sems.push(self.done_sem);
+                signal_values.push(self.next_present_id + 1);
+            }
             let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
                 .wait_semaphore_values(&wait_values)
                 .signal_semaphore_values(&signal_values);
@@ -1092,7 +1099,7 @@ impl Presenter {
                 .wait_dst_stage_mask(&wait_stages)
                 .command_buffers(&cmd_bufs)
                 .signal_semaphores(&signal_sems);
-            if native_wait.is_some() {
+            if native_wait.is_some() || timed {
                 submit = submit.push_next(&mut timeline);
             }
             // Keyed mutex, key 0 both ways (decode writes under acquire(0)/release(0)
