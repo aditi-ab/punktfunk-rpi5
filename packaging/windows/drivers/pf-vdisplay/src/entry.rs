@@ -24,8 +24,8 @@ pub unsafe extern "system" fn driver_entry(
         "[pf-vd] encode: {} linked",
         crate::encode::backends_linked().join(" ")
     );
-    // Before any thread of ours exists: mutating the environment is unsound once they do, and
-    // PyroWave's Vulkan instance hangs in session 0 without these.
+    // Before the first encoder opens: PyroWave's Vulkan instance hangs in session 0 without
+    // these.
     crate::encode::thread::disable_implicit_vulkan_layers();
     crate::log::install_tracing_bridge();
     let mut config = WDF_DRIVER_CONFIG {
