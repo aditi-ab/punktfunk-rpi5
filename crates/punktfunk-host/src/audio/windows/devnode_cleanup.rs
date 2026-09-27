@@ -18,9 +18,7 @@
 use super::devnode_api as da;
 use super::{audio_control, audio_probe, minted, pad_endpoint as pe};
 use anyhow::Result;
-use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    SetupDiEnumDeviceInfo, SPDRP_HARDWAREID,
-};
+use windows::Win32::Devices::DeviceAndDriverInstallation::SPDRP_HARDWAREID;
 
 /// `Device Parameters` REG_DWORD names. Presence of the name is "ours"; the value is family-specific.
 pub(crate) const OWNER_MARKERS: [&str; 3] = [
@@ -90,12 +88,7 @@ pub(crate) fn purge() -> Result<Removed> {
 fn owned_devnodes() -> Result<Vec<String>> {
     let set = da::media_class_devs()?;
     let mut out = Vec::new();
-    for i in 0.. {
-        let mut did = da::devinfo_data();
-        // SAFETY: live set; `did` is a live out-param with cbSize set.
-        if unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }.is_err() {
-            break; // ERROR_NO_MORE_ITEMS
-        }
+    for did in set.iter() {
         let Some(inst) = da::instance_id(&set, &did) else {
             continue;
         };
