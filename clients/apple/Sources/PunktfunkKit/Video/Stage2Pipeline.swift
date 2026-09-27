@@ -679,9 +679,7 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
         // host aims frames at the latch point, not the refresh. One clock read per update; the
         // reporter itself flushes ~1 Hz.
         if let phase {
-            var ts = timespec()
-            clock_gettime(CLOCK_REALTIME, &ts)
-            let nowNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+            let nowNs = realtimeNowNs()
             phase.noteGrid(
                 targetRealNs: nowNs + Int64(leadS * 1_000_000_000),
                 latchLeadNs: Int64(floorS * 1_000_000_000))
@@ -1726,10 +1724,7 @@ public final class Stage2Pipeline {
                             // Metal completed-handler thread — stamp + enqueue, don't block
                             // (the exact contract of the VT output callback).
                             guard let planes else { return }
-                            var ts = timespec()
-                            clock_gettime(CLOCK_REALTIME, &ts)
-                            let decodedNs =
-                                Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+                            let decodedNs = realtimeNowNs()
                             hud.decoded(
                                 ptsNs: ptsNs, receivedNs: receivedNs, decodedNs: decodedNs)
                             stats.decoded(
@@ -1785,9 +1780,7 @@ public final class Stage2Pipeline {
     /// present time (when the frame is actually on glass), not the moment we drew.
     public static func realtimeNs(forDisplayLinkTimestamp t: CFTimeInterval) -> Int64 {
         let caNow = CACurrentMediaTime()
-        var ts = timespec()
-        clock_gettime(CLOCK_REALTIME, &ts)
-        let realtimeNow = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+        let realtimeNow = realtimeNowNs()
         return realtimeNow + Int64((t - caNow) * 1_000_000_000)
     }
 
@@ -1806,9 +1799,7 @@ public final class Stage2Pipeline {
     /// rather than once per session.)
     static func mediaTimeNs(forRealtimeNs t: Int64) -> Int64 {
         let caNow = CACurrentMediaTime()
-        var ts = timespec()
-        clock_gettime(CLOCK_REALTIME, &ts)
-        let realtimeNow = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+        let realtimeNow = realtimeNowNs()
         return Int64(caNow * 1_000_000_000) + (t - realtimeNow)
     }
 

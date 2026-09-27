@@ -93,9 +93,7 @@ enum AudioDrain {
             // does not even read the ring.
             if let videoLatency {
                 let depth = ring.bufferedSamples
-                var ts = timespec()
-                clock_gettime(CLOCK_REALTIME, &ts)
-                let nowNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+                let nowNs = realtimeNowNs()
                 // Half a second of tolerance on the reference, and steer only on an
                 // observation the sync ACCEPTED: the desired depth builds on the current one,
                 // so re-requesting it against a frozen offset walks the ring to its cap.

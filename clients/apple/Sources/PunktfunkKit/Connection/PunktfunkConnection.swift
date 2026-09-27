@@ -1360,9 +1360,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         case statusOK:
             guard let base = frame.data, frame.len > 0 else { return nil }
             let data = Data(bytes: base, count: Int(frame.len)) // copy: ptr valid only until next call
-            var ts = timespec()
-            clock_gettime(CLOCK_REALTIME, &ts)
-            let pulledNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+            let pulledNs = realtimeNowNs()
             // Receipt = the core's reassembly-completion stamp (ABI v9); the pull instant is
             // kept separately so the client-queue wait is its own measured term. 0 would mean a
             // pre-v9 core — impossible here (core and Kit ship in one binary), but fall back to
