@@ -169,9 +169,9 @@ public final class InputCapture {
     public var onQuickActions: (() -> Void)?
 
     /// Fired on ⌃⌘F (macOS) — toggle the streaming window in/out of fullscreen. Detected in the
-    /// monitor only WHILE FORWARDING, for the same reason as the ⌃⌥⇧ combos: a captured stream view
-    /// swallows keys, so the Stream menu's identical ⌃⌘F equivalent never reaches it; released, the
-    /// menu handles it. Main queue.
+    /// monitor only WHILE FORWARDING with `inhibit_shortcuts` off: a captured stream view swallows
+    /// keys, so the Stream menu's identical ⌃⌘F equivalent never reaches it. With the setting on,
+    /// ⌃⌘F is the host's like any ⌘ chord; released, the menu handles it. Main queue.
     public var onToggleFullscreen: (() -> Void)?
 
     #if os(iOS)
@@ -294,19 +294,10 @@ public final class InputCapture {
         ) { [weak self] _ in
             self?.releaseAll()
         })
-        // This monitor is the FIRST thing in the app to see a key: AppKit calls it before
-        // `sendEvent:`, so before any menu key equivalent and before StreamLayerView's keyDown.
-        // Returning nil discards the event outright — which cuts BOTH of those off, and on macOS
-        // the second one is the host's only key path (the GCKeyboard send is iOS-only; see
-        // `attach(keyboard:)`). So the rule here is: anything swallowed must either be handled
-        // client-side or forwarded to the host from inside this block, because nothing downstream
-        // will get a second chance at it.
-        //
-        // ⌘⎋ (capture toggle) and ⌃⌥⇧M (mouse model) are client-side in BOTH states; ⌃⌥⇧Q/D/S/A/O
-        // and ⌃⌘F are client-side only while forwarding (released, the events pass through and the
-        // menu's identical key equivalents handle them). Every OTHER ⌘ chord is the HOST's while
-        // captured — see `forwardsCommandChord`. (On iOS there is no NSEvent monitor — the GC key
-        // handler detects the combos.)
+        // Runs before any menu key equivalent and StreamLayerView's keyDown, the host's only key
+        // path on macOS, so an event it swallows must be handled or forwarded right here.
+        // ⌘⎋ and ⌃⌥⇧M are the client's in both states, ⌃⌥⇧Q/D/S/A/O only while forwarding. Every
+        // other ⌘ chord, ⌃⌘F included, is the host's while captured (`forwardsCommandChord`).
         #if os(macOS)
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.keyDown, .keyUp]
@@ -361,12 +352,6 @@ public final class InputCapture {
                     break
                 }
             }
-            // ⌃⌘F toggles the streaming window's fullscreen. Intercepted only while forwarding (the
-            // captured stream view swallows the menu's identical equivalent); the F is latched so its
-            // keyUp can't type into the host. keyCode 3 = kVK_ANSI_F (layout-independent).
-            if self.forwarding, flags == [.control, .command], event.keyCode == 3 /* F */ {
-                return take(0x46, self.onToggleFullscreen) // VK_F
-            }
             // Every OTHER ⌘ chord is the HOST's while captured, or the menu takes ⌘Q first. It is
             // sent from here, since returning nil also skips StreamLayerView's keyDown; a chord
             // with no host VK is swallowed. The ⌘ itself already went out as a flagsChanged.
@@ -376,6 +361,12 @@ public final class InputCapture {
             ) {
                 if let vk = Self.keyCodeToVK[event.keyCode] { self.sendCommandChordKey(vk) }
                 return nil
+            }
+            // Captured with `inhibit_shortcuts` off, ⌃⌘F is the client's. The captured view swallows
+            // the menu's identical equivalent; the F is latched so its keyUp can't type into the
+            // host. keyCode 3 = kVK_ANSI_F (layout-independent).
+            if self.forwarding, flags == [.control, .command], event.keyCode == 3 /* F */ {
+                return take(0x46, self.onToggleFullscreen) // VK_F
             }
             return event
         }
@@ -667,18 +658,9 @@ public final class InputCapture {
         event.modifierFlags.intersection(chordFlagMask)
     }
 
-    /// The ⌘ chords the CLIENT keeps while captured, which is to say: the way out. ⌘⎋ releases
-    /// the mouse/keyboard and ⌃⌘F leaves fullscreen — hand either of those to the host and a
-    /// captured stream becomes a room with no door. (⌃⌥⇧Q/D/S/A carry no ⌘ and never reach here.)
-    static func isClientReservedChord(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> Bool {
-        if keyCode == 53, flags == .command { return true } // ⌘⎋ — capture toggle
-        if keyCode == 3, flags == [.control, .command] { return true } // ⌃⌘F — fullscreen
-        return false
-    }
-
     /// Does this keyDown get taken off AppKit and forwarded to the host instead? Only while input
-    /// is actually captured, only with the cross-client `inhibit_shortcuts` on — and never for the
-    /// client's own reserved chords, whatever the setting says.
+    /// is actually captured, only with the cross-client `inhibit_shortcuts` on — and never ⌘⎋,
+    /// the way out of capture. ⌃⌘F goes to the host too; ⌘⎋, then the menu, leaves fullscreen.
     ///
     /// The mouse model is NOT a condition, and re-adding it is the trap: `inhibit_shortcuts`
     /// applies in both models here exactly as it does on the SDL clients, whose keyboard grab
@@ -691,7 +673,7 @@ public final class InputCapture {
     ) -> Bool {
         guard forwarding, inhibitShortcuts else { return false }
         guard flags.contains(.command) else { return false }
-        return !isClientReservedChord(keyCode: keyCode, flags: flags)
+        return !(keyCode == 53 && flags == .command) // ⌘⎋
     }
 
     /// Forward one key of a ⌘ chord the monitor just took off AppKit, remembering it so its

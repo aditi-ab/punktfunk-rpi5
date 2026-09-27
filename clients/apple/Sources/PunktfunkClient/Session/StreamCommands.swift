@@ -93,9 +93,9 @@ struct StreamCommands: Commands {
             .keyboardShortcut("o", modifiers: [.control, .option, .shift])
             .disabled(session?.isStreaming != true)
             // Toggle the window's fullscreen. ⌃⌘F is the macOS-standard fullscreen combo; here it's
-            // explicit so it's discoverable AND survives capture — while streaming the stream view
-            // swallows keys, so InputCapture's monitor detects the same combo and posts the same
-            // notification the key window's FullscreenController observes.
+            // explicit so it's discoverable. A captured stream view swallows keys, so with Capture
+            // system shortcuts off InputCapture's monitor posts the same notification; with it on,
+            // ⌃⌘F goes to the host.
             Button("Toggle Fullscreen") {
                 NotificationCenter.default.post(name: .punktfunkToggleFullscreen, object: nil)
             }
