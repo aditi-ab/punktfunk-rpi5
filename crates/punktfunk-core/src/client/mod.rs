@@ -1258,11 +1258,7 @@ impl NativeClient {
 
     /// Next audio packet. Drain on a dedicated thread — packets arrive every 5 ms.
     pub fn next_audio(&self, timeout: Duration) -> Result<AudioPacket> {
-        match self.audio.lock().unwrap().recv_timeout(timeout) {
-            Ok(p) => Ok(p),
-            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
-            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
-        }
+        pull(&self.audio, timeout)
     }
 
     /// Mute this client's own speakers. Nothing leaves for the host: it keeps encoding, and a
@@ -1312,11 +1308,7 @@ impl NativeClient {
     /// `(pad, low, high, ttl_ms)`. `Some(ms)` = v2 lease; `None` = v1, use the renderer's
     /// staleness heuristic. Reorder gate is applied in demux; stale envelopes never surface.
     pub fn next_rumble_ttl(&self, timeout: Duration) -> Result<RumbleUpdate> {
-        match self.rumble.lock().unwrap().recv_timeout(timeout) {
-            Ok(r) => Ok(r),
-            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
-            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
-        }
+        pull(&self.rumble, timeout)
     }
 
     /// Policy-engine command: level on every wire update, explicit zero at expiry/staleness/
@@ -1343,11 +1335,7 @@ impl NativeClient {
 
     /// DualSense HID-output (lightbar / LEDs / adaptive trigger). DualSense host backend only.
     pub fn next_hidout(&self, timeout: Duration) -> Result<HidOutput> {
-        match self.hidout.lock().unwrap().recv_timeout(timeout) {
-            Ok(h) => Ok(h),
-            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
-            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
-        }
+        pull(&self.hidout, timeout)
     }
 
     /// Pad-audio Opus (haptics 5 ms / speaker 10 ms). Shared queue; fan out by `pad`/`kind`.
@@ -1370,11 +1358,7 @@ impl NativeClient {
     /// ST.2086 mastering + CLL. Host sends at start and on mastering/keyframe changes. HDR
     /// (`color.is_hdr()`, PQ) only; drain on its own thread and apply the latest.
     pub fn next_hdr_meta(&self, timeout: Duration) -> Result<HdrMeta> {
-        match self.hdr_meta.lock().unwrap().recv_timeout(timeout) {
-            Ok(m) => Ok(m),
-            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
-            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
-        }
+        pull(&self.hdr_meta, timeout)
     }
 
     /// The newest [`HdrMeta`] so far: drains the queue, blocking up to `wait` only while none
@@ -1389,35 +1373,22 @@ impl NativeClient {
     /// [`NativeClient::next_cursor_state`] references it. Empty unless
     /// [`crate::quic::CLIENT_CAP_CURSOR`] was advertised against a capable host.
     pub fn next_cursor_shape(&self, timeout: Duration) -> Result<crate::quic::CursorShape> {
-        match self.cursor_shape.recv_timeout(timeout) {
-            Ok(s) => Ok(s),
-            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
-            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
-        }
+        self.cursor_shape.recv_timeout(timeout).map_err(plane_err)
     }
 
     /// Per-frame cursor state (`0xD0`): position, visibility, relative-mode hint. Latest-wins
     /// — drain and apply only the newest. Same gate as [`NativeClient::next_cursor_shape`].
     pub fn next_cursor_state(&self, timeout: Duration) -> Result<crate::quic::CursorState> {
-        match self.cursor_state.lock().unwrap().recv_timeout(timeout) {
-            Ok(s) => Ok(s),
-            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
-            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
-        }
+        pull(&self.cursor_state, timeout)
     }
 
     /// Per-AU capture→sent (`pts_ns`). HUD split: `network = (received + clock_offset − pts)
     /// − host_us`. Older host never sends any — keep combined `host+network`. Drain
     /// non-blockingly alongside frame samples.
     pub fn next_host_timing(&self, timeout: Duration) -> Result<crate::quic::HostTiming> {
-        match self.host_timing.lock().unwrap().recv_timeout(timeout) {
-            Ok(t) => {
-                self.hud.note_host_timing(&t);
-                Ok(t)
-            }
-            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
-            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
-        }
+        let t = pull(&self.host_timing, timeout)?;
+        self.hud.note_host_timing(&t);
+        Ok(t)
     }
 
     /// Queue one event. The input task drops a class the live grants refuse; the host
@@ -1474,11 +1445,7 @@ impl NativeClient {
     /// only: truth is already in [`access_grants`](Self::access_grants) /
     /// [`access_deadline_unix`](Self::access_deadline_unix).
     pub fn next_access_update(&self, timeout: Duration) -> Result<crate::quic::AccessUpdate> {
-        match self.access.lock().unwrap().recv_timeout(timeout) {
-            Ok(u) => Ok(u),
-            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
-            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
-        }
+        pull(&self.access, timeout)
     }
 
     /// Opt-in clipboard. Nothing is announced until `enabled = true`. `flags` carries
@@ -1535,11 +1502,7 @@ impl NativeClient {
     /// Clipboard events (offer, state, fetch-request, data, cancel, error). Drain on its own
     /// thread onto the OS pasteboard.
     pub fn next_clip(&self, timeout: Duration) -> Result<ClipEventCore> {
-        match self.clip.lock().unwrap().recv_timeout(timeout) {
-            Ok(e) => Ok(e),
-            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
-            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
-        }
+        pull(&self.clip, timeout)
     }
 
     /// Opus mic uplink (0xCB). `seq`/`pts_ns` are caller diagnostics. Best-effort; no retransmit.
@@ -1690,6 +1653,19 @@ mod expires_in_tests {
         assert_eq!(expires_in_secs(Some(50), 100), 1);
         assert_eq!(expires_in_secs(Some(u64::MAX), 0), u32::MAX);
     }
+}
+
+/// A plane's timeout is [`PunktfunkError::NoFrame`]; a dropped worker is `Closed`.
+fn plane_err(e: RecvTimeoutError) -> PunktfunkError {
+    match e {
+        RecvTimeoutError::Timeout => PunktfunkError::NoFrame,
+        RecvTimeoutError::Disconnected => PunktfunkError::Closed,
+    }
+}
+
+/// One blocking pull from a plane queue, waiting up to `timeout`.
+fn pull<T>(rx: &Mutex<Receiver<T>>, timeout: Duration) -> Result<T> {
+    rx.lock().unwrap().recv_timeout(timeout).map_err(plane_err)
 }
 
 /// Drain `rx` into `last`, blocking up to `wait` only while `last` is still empty.
