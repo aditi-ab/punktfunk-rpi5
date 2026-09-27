@@ -501,7 +501,8 @@ impl NativeVaapiDecoder {
 
     /// One AU in, at most one frame out. Surplus waits in [`Self::deliverable`].
     /// `Ok(None)` is not an error: buffering, concealment (re-anchor, not demotion),
-    /// HEVC RASL skip (8.1.3 NOTE — must not re-anchor), or no session yet.
+    /// HEVC RASL skip (8.1.3 NOTE — must not re-anchor), the idle wait for an IDR
+    /// (re-anchor, no verdict), or no session yet.
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<DmabufFrame>> {
         self.drain_releases();
         let result = match self.planner {
@@ -513,11 +514,14 @@ impl NativeVaapiDecoder {
         // One verdict, here. Damage is reported by the codec arm; a failure after a
         // clean plan is a refusal only — not also a clean AU that would reset the run.
         match &result {
-            Ok((_, damaged)) => self.health.note(*damaged, false, 0),
+            Ok(Some((_, damaged))) => self.health.note(*damaged, false, 0),
+            Ok(None) => {}
             Err(_) => self.health.note(false, true, 0),
         }
         // Codec arms return exported frames only on `Ok`; an error never reaches the queue.
-        let (fresh, damaged) = result?;
+        let Some((fresh, damaged)) = result? else {
+            return Ok(None);
+        };
         if damaged {
             // Do not drain the queue. Shipping here reports `delivered` on a concealed
             // AU and zeros the demotion streak (`delivered || !concealed`).
@@ -602,9 +606,21 @@ impl NativeVaapiDecoder {
         out
     }
 
-    fn decode_h264(&mut self, au: &[u8]) -> Result<(Vec<DmabufFrame>, bool)> {
+    /// Nothing to feed until the IDR and its parameter sets land: a decoder built mid-GOP
+    /// sees slices first. Idle, not a refusal, so no health verdict (`None`).
+    fn idle_until_idr(&mut self, e: impl std::fmt::Display) -> Option<(Vec<DmabufFrame>, bool)> {
+        self.recovery_request = true;
+        tracing::debug!(error = %e, "native VAAPI idle until the next IDR");
+        None
+    }
+
+    fn decode_h264(&mut self, au: &[u8]) -> Result<Option<(Vec<DmabufFrame>, bool)>> {
         let plan = match &mut self.planner {
-            Planner::H264(p) => p.plan_au(au).map_err(|e| anyhow!("{e:?}"))?,
+            Planner::H264(p) => match p.plan_au(au) {
+                Ok(plan) => plan,
+                Err(e) if e.awaits_idr() => return Ok(self.idle_until_idr(e)),
+                Err(e) => return Err(anyhow!("{e:?}")),
+            },
             _ => unreachable!("dispatched on the planner's own arm"),
         };
         let shape = shape_of(
@@ -666,15 +682,18 @@ impl NativeVaapiDecoder {
             &mut self.recovery_request,
             &self.release_tx,
         )?;
-        Ok((frames, damaged))
+        Ok(Some((frames, damaged)))
     }
 
-    fn decode_h265(&mut self, au: &[u8]) -> Result<(Vec<DmabufFrame>, bool)> {
+    fn decode_h265(&mut self, au: &[u8]) -> Result<Option<(Vec<DmabufFrame>, bool)>> {
         let plan = match &mut self.planner {
             Planner::H265(p) => match p.plan_au(au) {
                 Ok(plan) => plan,
                 // Spec 8.1.3 NOTE: skipped RASL is Ok, never a re-anchor.
-                Err(pf_vaapi::PlanErrorH265::RaslSkipped { .. }) => return Ok((Vec::new(), false)),
+                Err(pf_vaapi::PlanErrorH265::RaslSkipped { .. }) => {
+                    return Ok(Some((Vec::new(), false)))
+                }
+                Err(e) if e.awaits_idr() => return Ok(self.idle_until_idr(e)),
                 Err(e) => return Err(anyhow!("{e:?}")),
             },
             _ => unreachable!("dispatched on the planner's own arm"),
@@ -742,7 +761,7 @@ impl NativeVaapiDecoder {
             &mut self.recovery_request,
             &self.release_tx,
         )?;
-        Ok((frames, damaged))
+        Ok(Some((frames, damaged)))
     }
 
     /// One temporal unit: decode every frame, present at most one. Hidden frames
@@ -751,7 +770,7 @@ impl NativeVaapiDecoder {
     /// a later `show_existing_frame` must not export unwritten memory) but withhold
     /// display. Lost-ref slots get a live surface (`va_dec_av1.h:352`); lost tile
     /// groups bind nothing ([`Self::frame_av1`]).
-    fn decode_av1(&mut self, au: &[u8]) -> Result<(Vec<DmabufFrame>, bool)> {
+    fn decode_av1(&mut self, au: &[u8]) -> Result<Option<(Vec<DmabufFrame>, bool)>> {
         let plans = match &mut self.planner {
             Planner::Av1(p) => p.plan_au(au).map_err(|e| anyhow!("{e}"))?,
             _ => unreachable!("dispatched on the planner's own arm"),
@@ -770,9 +789,9 @@ impl NativeVaapiDecoder {
             // A later frame of the same unit may have been the damaged one; the
             // guard returns already-exported surfaces.
             drop(shown);
-            return Ok((Vec::new(), true));
+            return Ok(Some((Vec::new(), true)));
         }
-        Ok((shown, false))
+        Ok(Some((shown, false)))
     }
 
     /// Convert and submit. `damaged` gates display ([`finish`]) and turns a lost
