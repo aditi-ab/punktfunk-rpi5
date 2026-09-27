@@ -90,8 +90,8 @@ impl CursorShared {
         })
     }
 
-    pub(super) fn section_handle(&self) -> HANDLE {
-        HANDLE(self.section.handle.as_raw_handle())
+    pub(super) fn section_handle(&self) -> BorrowedHandle<'_> {
+        self.section.handle.as_handle()
     }
 
     /// Tell the driver where this HDR desktop puts SDR white (1.0 = 80 nits) for its blend

@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use windows::core::{GUID, PWSTR};
+use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS};
 use windows::Win32::System::Diagnostics::Etw::{
     CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW,
@@ -159,24 +159,30 @@ fn properties_buffer() -> (Vec<u64>, usize) {
     (vec![0u64; total.div_ceil(8)], base)
 }
 
+/// STOP `session`, or with `None` whatever session holds [`SESSION`]'s name. The result is
+/// ignored: every caller is already giving the session up.
+fn stop_session(session: Option<CONTROLTRACE_HANDLE>) {
+    let name: Vec<u16> = SESSION.encode_utf16().chain([0]).collect();
+    let (handle, by_name) = match session {
+        Some(h) => (h, PCWSTR::null()),
+        None => (CONTROLTRACE_HANDLE::default(), PCWSTR(name.as_ptr())),
+    };
+    let (mut buf, _) = properties_buffer();
+    let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+    // SAFETY: `buf` is a live, zeroed, 8-aligned properties allocation with room for the name
+    // ETW writes back; `by_name` is null or `name`, a nul-terminated string that outlives this.
+    unsafe {
+        (*props).Wnode.BufferSize = std::mem::size_of_val(buf.as_slice()) as u32;
+        let _ = ControlTraceW(handle, by_name, props, EVENT_TRACE_CONTROL_STOP);
+    }
+}
+
 impl EtwWatch {
     fn start() -> Option<Self> {
         let name: Vec<u16> = SESSION.encode_utf16().chain([0]).collect();
         // A stale session from a crashed host blocks StartTrace with ERROR_ALREADY_EXISTS —
         // stop it by name first (fails benignly when there is none).
-        let (mut stop_buf, _) = properties_buffer();
-        // SAFETY: `stop_buf` is a live, zeroed, 8-aligned properties allocation; the name is
-        // a live nul-terminated wide string; a session handle of 0 + name = control-by-name.
-        unsafe {
-            let props = stop_buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-            (*props).Wnode.BufferSize = std::mem::size_of_val(stop_buf.as_slice()) as u32;
-            let _ = ControlTraceW(
-                CONTROLTRACE_HANDLE::default(),
-                PWSTR(name.as_ptr() as *mut _),
-                props,
-                EVENT_TRACE_CONTROL_STOP,
-            );
-        }
+        stop_session(None);
 
         let (mut buf, base) = properties_buffer();
         let mut session = CONTROLTRACE_HANDLE::default();
@@ -212,13 +218,7 @@ impl EtwWatch {
         // Fatal on failure — the DDI families + queue witnesses are this watch's reason to exist.
         if !enable_provider(session, &DXGKRNL, &FILTER_IDS) {
             tracing::debug!("DxgKrnl ETW enable failed — stopping the session");
-            let (mut buf, _) = properties_buffer();
-            // SAFETY: live handle + valid properties allocation, stopped exactly once on this path.
-            unsafe {
-                let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-                (*props).Wnode.BufferSize = std::mem::size_of_val(buf.as_slice()) as u32;
-                let _ = ControlTraceW(session, PWSTR::null(), props, EVENT_TRACE_CONTROL_STOP);
-            }
+            stop_session(Some(session));
             return None;
         }
         // DXGI present witness rides the same session. Degraded-not-fatal: a refusal only costs
@@ -244,13 +244,7 @@ impl EtwWatch {
         let consumer = unsafe { OpenTraceW(&mut log) };
         if consumer.Value == u64::MAX {
             tracing::debug!("DxgKrnl ETW OpenTrace failed — stopping the session");
-            let (mut buf, _) = properties_buffer();
-            // SAFETY: live handle + valid properties allocation, stopped exactly once on this path.
-            unsafe {
-                let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-                (*props).Wnode.BufferSize = std::mem::size_of_val(buf.as_slice()) as u32;
-                let _ = ControlTraceW(session, PWSTR::null(), props, EVENT_TRACE_CONTROL_STOP);
-            }
+            stop_session(Some(session));
             return None;
         }
         // ProcessTrace blocks for the session's lifetime; Drop's STOP unblocks it.
@@ -273,14 +267,9 @@ impl EtwWatch {
             })
         {
             tracing::debug!(error = %e, "DxgKrnl ETW consumer thread not spawned");
-            let (mut buf, _) = properties_buffer();
-            // SAFETY: live handles + valid properties allocation, released exactly once on this path.
-            unsafe {
-                let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-                (*props).Wnode.BufferSize = std::mem::size_of_val(buf.as_slice()) as u32;
-                let _ = ControlTraceW(session, PWSTR::null(), props, EVENT_TRACE_CONTROL_STOP);
-                let _ = CloseTrace(consumer);
-            }
+            stop_session(Some(session));
+            // SAFETY: `consumer` is the live handle opened above, closed exactly once here.
+            let _ = unsafe { CloseTrace(consumer) };
             return None;
         }
         tracing::debug!("DxgKrnl ETW stall-watch session live (event-id filtered)");
@@ -576,16 +565,10 @@ fn duration_qpc(d: Duration, freq: i64) -> i64 {
 
 impl Drop for EtwWatch {
     fn drop(&mut self) {
-        let (mut buf, _) = properties_buffer();
-        // SAFETY: `self.session`/`self.consumer` are the live handles this watch owns; the STOP
-        // (with a valid properties allocation) ends the session and unblocks ProcessTrace, and
-        // CloseTrace releases the consumer — each exactly once, here.
-        unsafe {
-            let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-            (*props).Wnode.BufferSize = std::mem::size_of_val(buf.as_slice()) as u32;
-            let _ = ControlTraceW(self.session, PWSTR::null(), props, EVENT_TRACE_CONTROL_STOP);
-            let _ = CloseTrace(self.consumer);
-        }
+        // The STOP ends the session and unblocks ProcessTrace.
+        stop_session(Some(self.session));
+        // SAFETY: `self.consumer` is the live handle this watch owns, closed exactly once here.
+        let _ = unsafe { CloseTrace(self.consumer) };
     }
 }
 
