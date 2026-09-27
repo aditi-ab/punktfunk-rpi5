@@ -897,6 +897,16 @@ impl AscBackend {
         self.hdr_meta = meta;
     }
 
+    /// The decoded picture's size, which the layer's source rect crops against. The reader was
+    /// sized at the session's first mode; an in-session mode change keeps the same reader.
+    pub(super) fn set_src_size(&mut self, w: i32, h: i32) {
+        if (self.src_w, self.src_h) != (w.max(1), h.max(1)) {
+            self.src_w = w.max(1);
+            self.src_h = h.max(1);
+            log::info!("asc: source picture now {w}x{h}");
+        }
+    }
+
     /// Update the `ADataSpace` applied to every subsequent transaction (a refinement from the
     /// codec's output format — the analogue of the SurfaceView path's `apply_reported_dataspace`;
     /// the negotiated colour set the initial value at create).

@@ -906,6 +906,9 @@ impl State {
             if let Some((w, h)) = super::display::picture_size(&ctx.codec) {
                 ctx.decoded_size
                     .store(crate::session::pack_surface_size(w, h), Ordering::Relaxed);
+                if let Some(a) = self.asc.as_mut() {
+                    a.set_src_size(w, h);
+                }
             }
             match self.asc.as_mut() {
                 // ASC carries the colour on the transaction, not the SurfaceView window. Refine
