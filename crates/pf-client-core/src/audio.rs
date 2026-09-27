@@ -470,11 +470,7 @@ fn pw_thread(
     info.set_format(AudioFormat::F32LE);
     info.set_rate(fmt.rate_hz);
     info.set_channels(channels as u32);
-    // Canonical wire order (FL FR FC LFE RL RR SL SR). Identity; PipeWire downmixes if the sink is smaller.
-    let order = punktfunk_core::audio::spa_positions(channels as u8);
-    let mut positions = [0u32; 64];
-    positions[..order.len()].copy_from_slice(order);
-    info.set_position(positions);
+    info.set_position(punktfunk_core::audio::spa_positions(channels as u8));
     let obj = pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: pw::spa::param::ParamType::EnumFormat.as_raw(),
