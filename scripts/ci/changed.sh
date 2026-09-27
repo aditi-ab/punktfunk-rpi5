@@ -38,7 +38,7 @@ classify() {
                 .cargo/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|\
                 crates/*|tools/*|clients/cli/*|clients/linux/*|clients/probe/*|clients/session/*|\
                 clients/shared/*|clients/android/native/*|include/*|api/openapi.json|\
-                data/platforms.json|ci/rust-ci.Dockerfile|\
+                data/platforms.json|ci/rust-ci.Dockerfile|web/src/lib/command-execution.ts|\
                 scripts/ci/ensure-sccache.sh|scripts/ci/install-retrying-curl.sh|\
                 scripts/ci/check-installer-behavior.sh|scripts/ci/check-install-defaults.sh|\
                 scripts/ci/check-unsafe-hygiene.sh|\
@@ -64,7 +64,7 @@ classify() {
                     ;;
             esac
             case "$path" in
-                web/*|api/openapi.json|scripts/ci/retry.sh)
+                web/*|api/openapi.json|scripts/ci/retry.sh|crates/punktfunk-host/src/library/custom.rs)
                     web=true
                     ;;
             esac
@@ -135,6 +135,11 @@ self_test() {
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check client-shared 'clients/shared/deeplink-vectors.json' \
         'rust=true rust_arm64=true web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # The host's unprivileged launch kinds and the console's copy: each side's test reads the other.
+    check launch-kinds-console 'web/src/lib/command-execution.ts' \
+        'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check launch-kinds-host 'crates/punktfunk-host/src/library/custom.rs' \
+        'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check openapi 'api/openapi.json' \
         'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=true decky_typecheck=false'
     check platforms 'data/platforms.json' \

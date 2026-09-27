@@ -1230,7 +1230,7 @@ mod tests {
     }
 
     /// Unlisted kinds are operator-privileged. The listed set is pinned so widening it is an
-    /// edit to this test.
+    /// edit to this test and to the console's password gate, which keeps the same list.
     #[test]
     fn an_unlisted_launch_kind_is_operator_privileged() {
         let kind = |k: &str| {
@@ -1270,6 +1270,19 @@ mod tests {
         assert_eq!(kind(""), Some("launch.kind"));
         // Resolvers match the exact string; `GOG` is not `gog`.
         assert_eq!(kind("GOG"), Some("launch.kind"));
+
+        let web = include_str!("../../../../web/src/lib/command-execution.ts");
+        let list = web
+            .split_once("UNPRIVILEGED_LAUNCH_KINDS")
+            .and_then(|(_, rest)| rest.split_once("= ["))
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .map(|(list, _)| list)
+            .expect("console list");
+        let console: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+        assert_eq!(
+            console, UNPRIVILEGED_LAUNCH_KINDS,
+            "a kind the console lists and the host does not skips the console password"
+        );
     }
 
     #[test]
