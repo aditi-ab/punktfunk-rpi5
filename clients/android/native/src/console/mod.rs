@@ -250,8 +250,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleMenu
     event: jint,
 ) {
     jni_guard((), || {
-        let (Some(h), Some(code)) = (CONSOLES.get(handle), code(event).and_then(bridge::menu_code))
-        else {
+        let (Some(h), Some(code)) = (
+            CONSOLES.get(handle),
+            code(event).and_then(bridge::menu_code),
+        ) else {
             return;
         };
         h.shared.send(match code {
