@@ -275,8 +275,11 @@ fn current_user_sid() -> Option<Vec<u8>> {
             )
         }
         .ok()?;
-        // SAFETY: on success `buf` starts with a TOKEN_USER whose Sid points inside it.
-        let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        // SAFETY: on success `buf` starts with a TOKEN_USER whose Sid points inside it. A
+        // `Vec<u8>` is only byte-aligned, so the struct is read unaligned.
+        let sid = unsafe { buf.as_ptr().cast::<TOKEN_USER>().read_unaligned() }
+            .User
+            .Sid;
         if sid.is_invalid() {
             return None;
         }

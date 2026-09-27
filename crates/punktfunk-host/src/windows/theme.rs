@@ -42,8 +42,11 @@ pub(crate) fn console_session_sid() -> Option<String> {
     // SAFETY: the token handle is ours and closed exactly once, on every path below.
     let _ = unsafe { CloseHandle(token) };
     got.ok()?;
-    // SAFETY: on success the buffer holds a TOKEN_USER whose `Sid` points inside it.
-    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // SAFETY: on success the buffer holds a TOKEN_USER whose `Sid` points inside it. A
+    // `Vec<u8>` is only byte-aligned, so the struct is read unaligned.
+    let sid = unsafe { buf.as_ptr().cast::<TOKEN_USER>().read_unaligned() }
+        .User
+        .Sid;
     let mut out = PWSTR::null();
     // SAFETY: `sid` is the live SID above; `out` receives a LocalAlloc'd string we free.
     unsafe { ConvertSidToStringSidW(sid, &mut out) }.ok()?;
