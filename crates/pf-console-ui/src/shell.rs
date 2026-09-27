@@ -9,12 +9,11 @@
 
 use crate::anim::{springs, Spring};
 use crate::glyphs::GlyphStyle;
-use crate::library::{
-    field_camera, field_motion, field_sksl, palette, LibraryShared, VIOLET_FIELD,
-};
+use crate::library::LibraryShared;
 use crate::model::{
     ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, SpeedPhase, SpeedStatus, WakeStatus,
 };
+use crate::palette::{field_camera, field_motion, field_sksl, palette, VIOLET_FIELD};
 use crate::platform::Platform;
 #[cfg(test)]
 use crate::pointer::DRAG_TICK_DP;
@@ -931,10 +930,24 @@ impl Shell {
     }
 
     fn sync(&mut self) {
-        // Settings writes palette/follow-OS into `self.settings`; recompile
-        // here so the backdrop re-colours live. A rejected compile keeps the
-        // field that is drawing (never black) and still advances bookkeeping
-        // so a broken build warns once, not once per frame.
+        self.sync_backdrop();
+        self.sync_hosts();
+        if let Some(text) = self.console.take_notice() {
+            self.show_toast(text);
+        }
+        self.feed_top();
+        self.sync_pair();
+        self.open_first_paired_library();
+        self.sync_wake();
+        self.home_shelf();
+        self.tick_launch();
+        self.settle_focus();
+    }
+
+    /// Settings writes palette/follow-OS into `self.settings`; recompile here so the
+    /// backdrop re-colours live. A rejected compile keeps the field that is drawing (never
+    /// black) and still advances bookkeeping so a broken build warns once, not once per frame.
+    fn sync_backdrop(&mut self) {
         let (os_rev, os) = crate::os_theme::os_theme();
         let want_os = if self.settings.follow_os_theme {
             os
@@ -944,24 +957,14 @@ impl Shell {
         if let Some(t) = want_os {
             if self.mesh_os != Some(os_rev) {
                 match build_mesh_os(&t) {
-                    Ok((mesh, lift, scrim, ink)) => {
-                        self.mesh = mesh;
-                        self.mesh_lift = lift;
-                        self.mesh_scrim = scrim;
-                        self.ink = ink;
-                    }
+                    Ok(look) => self.apply_look(look),
                     Err(e) => tracing::warn!("console: OS theme rejected: {e}"),
                 }
                 self.mesh_os = Some(os_rev);
             }
         } else if self.mesh_os.is_some() || self.settings.ui_palette != self.mesh_palette {
             match build_mesh(&self.settings.ui_palette) {
-                Ok((mesh, lift, scrim, ink)) => {
-                    self.mesh = mesh;
-                    self.mesh_lift = lift;
-                    self.mesh_scrim = scrim;
-                    self.ink = ink;
-                }
+                Ok(look) => self.apply_look(look),
                 Err(e) => {
                     tracing::warn!(
                         "console: {} palette rejected: {e}",
@@ -972,7 +975,14 @@ impl Shell {
             self.mesh_os = None;
             self.mesh_palette = self.settings.ui_palette.clone();
         }
-        // The row's order is a setting too: re-arrange when either the list or it moves.
+    }
+
+    fn apply_look(&mut self, (mesh, lift, scrim, ink): MeshLook) {
+        (self.mesh, self.mesh_lift, self.mesh_scrim, self.ink) = (mesh, lift, scrim, ink);
+    }
+
+    /// The row's order is a setting too: re-arrange when either the list or it moves.
+    fn sync_hosts(&mut self) {
         let order = (
             self.settings
                 .extra
@@ -988,11 +998,11 @@ impl Shell {
             crate::screens::home::arrange(&mut self.hosts, &self.settings);
             self.hosts_order = order;
         }
+    }
 
-        if let Some(text) = self.console.take_notice() {
-            self.show_toast(text);
-        }
-        // The host's test mode follows the test screen, whatever took it off the top.
+    /// Feeds the top screen what the service reported: pad test, other players, licences.
+    /// The host's test mode follows the test screen, whatever took it off the top.
+    fn feed_top(&mut self) {
         let testing = matches!(self.stack.last(), Some(Screen::InputTest(_))) && !self.in_stream;
         if testing != self.pad_testing {
             self.pad_testing = testing;
@@ -1017,7 +1027,9 @@ impl Shell {
                 }
             }
         }
+    }
 
+    fn sync_pair(&mut self) {
         let pair = self.console.pair();
         match &pair {
             PairPhase::Idle => {}
@@ -1048,8 +1060,11 @@ impl Shell {
                 }
             }
         }
-        self.open_first_paired_library();
+    }
 
+    /// Mirrors the service's wake and speed status. A woken host with `then_connect` goes
+    /// straight into its connect.
+    fn sync_wake(&mut self) {
         match self.console.wake() {
             Some(w) => {
                 self.wake_optimistic = false;
@@ -1081,10 +1096,6 @@ impl Shell {
                 }
             }
         }
-
-        self.home_shelf();
-        self.tick_launch();
-        self.settle_focus();
     }
 
     /// A root with nothing to focus parks focus on the tab strip; once it has something

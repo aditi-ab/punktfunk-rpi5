@@ -681,7 +681,7 @@ pub unsafe extern "C" fn punktfunk_console_drain_cmds(c: *const PunktfunkConsole
 #[unsafe(no_mangle)]
 pub extern "C" fn punktfunk_console_palettes() -> *mut c_char {
     guard(std::ptr::null_mut(), || {
-        let list: Vec<_> = (pf_console_ui::library::PALETTES.iter())
+        let list: Vec<_> = (pf_console_ui::palette::PALETTES.iter())
             .map(|p| serde_json::json!({ "id": p.id, "name": p.name }))
             .collect();
         out_string(serde_json::Value::from(list).to_string())

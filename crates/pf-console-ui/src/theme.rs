@@ -225,7 +225,7 @@ pub(crate) fn luma((r, g, b): (f64, f64, f64)) -> f64 {
 impl Ink {
     /// Palette ink. Pale fields get near-black fg tinted toward the ground (a
     /// foreign grey reads as a second palette) and white-frost glass.
-    pub fn of(p: &crate::library::Palette) -> Ink {
+    pub fn of(p: &crate::palette::Palette) -> Ink {
         let accent = Color4f::new(p.accent.0 as f32, p.accent.1 as f32, p.accent.2 as f32, 1.0);
         if !p.light && luma(p.ground) > VIVID_GROUND {
             return VIVID_INK;
@@ -1052,7 +1052,7 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_theme_lab() {
-        use crate::library::{field_sksl, CELL_RAMP, MESH_COLORS, PALETTES, VIOLET_FIELD};
+        use crate::palette::{field_sksl, CELL_RAMP, MESH_COLORS, PALETTES, VIOLET_FIELD};
         use serde_json::json;
         let rgb = |c: (f64, f64, f64)| json!([c.0, c.1, c.2]);
         let c4 = |c: Color4f| json!([c.r, c.g, c.b, c.a]);
@@ -1084,7 +1084,7 @@ mod tests {
             "palettes": palettes,
             "violet_field": VIOLET_FIELD.iter().map(|c| rgb(*c)).collect::<Vec<_>>(),
             "vivid_ground": VIVID_GROUND,
-            // The palette gate's inputs (`library.rs` tests): it samples this mesh, not the field.
+            // The palette gate's inputs (`palette.rs` tests): it samples this mesh, not the field.
             "cell_ramp": CELL_RAMP,
             "mesh_colors": MESH_COLORS.iter().map(|c| rgb(*c)).collect::<Vec<_>>(),
             "inks": { "dark": ink(&DARK_INK), "vivid": ink(&VIVID_INK), "pale": ink(&PALE_INK) },
@@ -1165,11 +1165,11 @@ mod tests {
         let lum = |v: [f32; 4]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
         let card = [0.55f32, 0.55, 0.6, 1.0];
 
-        set_ink(Ink::of(crate::library::palette("violet")));
+        set_ink(Ink::of(crate::palette::palette("violet")));
         assert!(ink().scrim.r < 0.5, "violet is a dark field");
         let dark_side = apply(&recede_matrix(1.0), card);
 
-        set_ink(Ink::of(crate::library::palette("sky")));
+        set_ink(Ink::of(crate::palette::palette("sky")));
         assert!(ink().scrim.r > 0.5, "mint is a pale field");
         let pale_side = apply(&recede_matrix(1.0), card);
 
@@ -1194,7 +1194,7 @@ mod tests {
     #[test]
     fn a_dark_card_face_survives_a_full_recede() {
         // Coverless card at the quieter placeholder tint: the darkest face the shelf has.
-        for p in crate::library::PALETTES.iter().filter(|p| !p.light) {
+        for p in crate::palette::PALETTES.iter().filter(|p| !p.light) {
             set_ink(Ink::of(p));
             let f = card_face(0.20);
             let out = apply(&recede_matrix(1.0), [f.r, f.g, f.b, 1.0]);

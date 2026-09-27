@@ -1567,7 +1567,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             return RowSpec {
                 label: "Background".into(),
                 value: Some(
-                    crate::library::palette(&ctx.settings.ui_palette)
+                    crate::palette::palette(&ctx.settings.ui_palette)
                         .name
                         .into(),
                 ),

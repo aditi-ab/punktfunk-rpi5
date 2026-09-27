@@ -9,7 +9,7 @@ use crate::anim::approach;
 use crate::el::{Axis, El, Id, Tree};
 use crate::glyphs::{Hint, HintKey};
 use crate::icons::{by_name, draw_icon_weight};
-use crate::library::{Palette, PALETTES, VIOLET_FIELD};
+use crate::palette::{Palette, PALETTES, VIOLET_FIELD};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Ctx, Outbox};
 use crate::theme::{edge, fill, stroke, Fonts, W};

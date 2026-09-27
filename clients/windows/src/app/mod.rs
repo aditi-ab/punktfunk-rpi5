@@ -195,6 +195,8 @@ pub struct AppCtx {
     pub(crate) settings: Mutex<Settings>,
     pub(crate) gamepad: GamepadService,
     pub(crate) shared: Arc<Shared>,
+    /// The settings page's GPU and audio-endpoint lists, re-probed with the snapshot above.
+    pub(crate) probes: Mutex<settings::DeviceProbes>,
 }
 
 pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_reactor::Result<()> {
@@ -208,6 +210,7 @@ pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_react
         settings: Mutex::new(Settings::load()),
         gamepad,
         shared: Arc::new(Shared::default()),
+        probes: Mutex::default(),
     });
     // Re-apply the persisted forwarded-controller pin (stable key; the service matches it
     // whenever such a pad connects) — GTK-shell parity.
