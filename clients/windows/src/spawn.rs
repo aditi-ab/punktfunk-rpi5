@@ -7,9 +7,7 @@
 //! `{"ready":true}`, banner from the `{"error"|"ended": …}` line, `trust_rejected`
 //! routed to the re-pair PIN ceremony, `stats:` lines to the session status page.
 
-// The session binary's location: ONE resolver, shared with the couch entry points
-// (`crate::couch`), which the standalone `punktfunk-console.exe` bin includes by path.
-use crate::couch::session_binary;
+use pf_client_core::orchestrate::session_binary;
 use std::io::BufRead as _;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};

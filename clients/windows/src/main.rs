@@ -42,7 +42,7 @@ mod spawn;
 mod trust;
 
 #[cfg(windows)]
-mod wol;
+use pf_client_core::wol;
 
 #[cfg(windows)]
 fn main() {
