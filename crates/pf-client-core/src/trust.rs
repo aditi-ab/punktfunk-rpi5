@@ -576,6 +576,23 @@ impl KnownHosts {
         self.hosts.iter().find(|h| h.fp_hex == fp_hex)
     }
 
+    /// Load, hand the record pinned to `fp_hex` to `f`, and save when `f` says it changed.
+    /// No-op, and no disk write, for an empty or unstored fingerprint.
+    fn update_by_fp(fp_hex: &str, f: impl FnOnce(&mut KnownHost) -> bool) {
+        if fp_hex.is_empty() {
+            return;
+        }
+        let mut known = Self::load();
+        if known
+            .hosts
+            .iter_mut()
+            .find(|h| h.fp_hex == fp_hex)
+            .is_some_and(f)
+        {
+            let _ = known.save();
+        }
+    }
+
     /// Index of the record an `addr:port` lookup resolves to (so mutators avoid a second
     /// borrow).
     ///
@@ -912,33 +929,19 @@ pub fn learn_from_advert(
 /// the one it leaves in `prev_addrs`. No-op, and no disk write, when unchanged. Only for an
 /// address where the pin answered: an mDNS advert's address is not proof of who is there.
 pub fn rekey_addr(fp_hex: &str, addr: &str, port: u16) {
-    if fp_hex.is_empty() {
-        return;
-    }
-    let mut known = KnownHosts::load();
-    let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp_hex) else {
-        return;
-    };
-    if h.move_to(addr, port) {
-        let _ = known.save();
-    }
+    KnownHosts::update_by_fp(fp_hex, |h| h.move_to(addr, port));
 }
 
-/// Stamp now as this host's last successful connect. No-op if the fingerprint is not stored.
+/// Stamp now as this host's last successful connect. No-op if the fingerprint is not stored:
+/// an empty one would stamp a placeholder, and `last_used` drives the "most recent" accent.
 pub fn touch_last_used(fp_hex: &str) {
-    // An empty fingerprint would stamp the first placeholder in the file, and `last_used`
-    // drives the "most recent" accent on the hosts page.
-    if fp_hex.is_empty() {
-        return;
-    }
-    let mut known = KnownHosts::load();
-    if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp_hex) {
+    KnownHosts::update_by_fp(fp_hex, |h| {
         h.last_used = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .ok();
-        let _ = known.save();
-    }
+        true
+    });
 }
 
 /// Persist mgmt port from the session `Welcome`, keyed by fingerprint.
@@ -946,18 +949,14 @@ pub fn touch_last_used(fp_hex: &str) {
 /// mDNS-free: [`learn_from_advert`] needs a visible advert; this fires on any successful
 /// connect, including a host added by IP. No-op, and no disk write, when unchanged.
 pub fn learn_mgmt_port_by_fp(fp_hex: &str, mgmt_port: u16) {
-    if fp_hex.is_empty() || mgmt_port == 0 {
+    if mgmt_port == 0 {
         return;
     }
-    let mut known = KnownHosts::load();
-    let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp_hex) else {
-        return;
-    };
-    if h.mgmt_port == Some(mgmt_port) {
-        return;
-    }
-    h.mgmt_port = Some(mgmt_port);
-    let _ = known.save();
+    KnownHosts::update_by_fp(fp_hex, |h| {
+        let changed = h.mgmt_port != Some(mgmt_port);
+        h.mgmt_port = Some(mgmt_port);
+        changed
+    });
 }
 
 /// SPAKE2 PIN ceremony. `device_name` is the label the host stores; 90 s covers a
