@@ -211,12 +211,12 @@ pub(super) fn run_async(
     }
 }
 
-/// One codec's life: bring-up, the event loop, teardown. The codec drives the loop: an
+/// One codec's life: bring-up, the event loop, [`teardown`]. The codec drives the loop: an
 /// async-notify callback fires the instant an input buffer frees or a frame finishes decoding,
 /// so a decoded frame is presented without waiting out a poll interval. The callbacks run on the
 /// codec's looper thread and only push events; every `AMediaCodec` buffer op stays on this
-/// thread, which owns the codec. A `pf-decode-feed` thread blocks on the network so this loop
-/// never does.
+/// thread, which owns the codec. The [`Feeder`] thread blocks on the network so this loop never
+/// does.
 ///
 /// Each run owns its event channel, so a dead codec's late callbacks cannot hand this run a
 /// stale buffer index. `rebuilt`: a previous codec failed, so this one waits for a keyframe.
@@ -276,9 +276,9 @@ fn run_codec(
     let in_flight = Arc::new(Mutex::new(VecDeque::<(u64, i128)>::new()));
     // Display stage (spec `display` + the capture→displayed headline): the rendered frame is
     // parked in the tracker at release; the OnFrameRendered callback pairs it with
-    // SurfaceFlinger's render timestamp. `render_cb` is the callback's leaked Arc refcount,
-    // reclaimed after the codec is dropped below. SurfaceView backend only — the ASC path measures
-    // its display stage directly off the transaction completions.
+    // SurfaceFlinger's render timestamp. `render_cb` is the callback's leaked Arc refcount, which
+    // [`teardown`] reclaims once the codec is gone. SurfaceView backend only — the ASC path
+    // measures its display stage directly off the transaction completions.
     let meter = Arc::new(PresentMeter::new());
     let tracker = DisplayTracker::new(
         stats.clone(),
@@ -291,31 +291,11 @@ fn run_codec(
     } else {
         None
     };
-    let priority = PresentPriority::resolve(opts.present_priority, opts.smooth_buffer);
-    // The SurfaceView timeline presenter (see `presenter.rs`): newest-wins / smoothing store,
-    // one-in-flight glass budget, timeline-timed release. `None` under the ASC backend, or when
-    // `debug.punktfunk.presenter = arrival` selects the legacy release-immediately path.
-    let presenter = if asc.is_some() {
-        None
-    } else if presenter_disabled_by_sysprop() {
-        log::info!("decode: presenter = arrival (sysprop) — legacy immediate release");
-        None
-    } else {
-        log::info!(
-            "decode: presenter = timeline ({})",
-            match priority {
-                PresentPriority::Latency => "lowest latency".to_string(),
-                PresentPriority::Smooth { buffer } => format!("smoothness, buffer {buffer}"),
-            }
-        );
-        Some(Presenter::new(priority, mode.refresh_hz))
-    };
-    // The vsync clock, started LAZILY on the first decoded frame (see `vsync.rs`); its ticks ride
-    // the same event channel. Both presenters need it: the SurfaceView one for its timelines, the
-    // ASC one for the panel period (its phase comes from present fences) and the fence poll on
-    // every tick.
-    let mut vsync: Option<VsyncClock> = None;
-    let mut vsync_tx = (presenter.is_some() || asc.is_some()).then(|| ev_tx.clone());
+    let presenter = select_presenter(asc.is_some(), opts, mode.refresh_hz);
+    // Both presenters need the vsync clock: the SurfaceView one for its timelines, the ASC one for
+    // the panel period (its phase comes from present fences) and the fence poll on every tick.
+    let vsync_tx = (presenter.is_some() || asc.is_some()).then(|| ev_tx.clone());
+    let mut aux = LoopAux::new(vsync_tx, opts, mode.refresh_hz);
     let ctx = Ctx {
         codec,
         client: client.clone(),
@@ -342,31 +322,11 @@ fn run_codec(
         let _ = client.request_keyframe();
     }
 
-    // Feeder thread: block on the network so this loop doesn't (an AU's arrival becomes an event that
-    // wakes us immediately, with no input-side poll latency). It also records the `received` HUD stat.
-    // `feed_stop` ends it with this run; the session's `shutdown` would end every later run too.
-    let feed_stop = Arc::new(AtomicBool::new(false));
-    let feeder = {
-        let client = client.clone();
-        let stats = stats.clone();
-        let stop = feed_stop.clone();
-        std::thread::Builder::new()
-            .name("pf-decode-feed".into())
-            .spawn(move || {
-                feeder_loop(client, stats, measure_decode, in_flight, stop, ev_tx);
-            })
-            .ok()
-    };
-    // Only the feeder + callbacks keep the channel alive now (`ev_tx` moved into the feeder).
-
-    // ADPF: same as the sync path — register this thread now, create the session lazily on the first
-    // presented frame (by when the pump + audio + feeder threads have registered their tids too).
+    // `ev_tx` moves into the feeder: from here only it and the codec callbacks keep the channel up.
+    let feeder = Feeder::spawn(client, stats, measure_decode, in_flight, ev_tx);
+    // ADPF: register this thread now. `aux` creates the session on the first presented frame, by
+    // when the pump, audio and feeder threads have registered their tids too.
     client.register_hot_thread();
-    let mut hint: Option<crate::adpf::HintSession> = None;
-    let mut hint_tried = false;
-    // Productive (dispatch+feed+present) time between displayed frames; reported to ADPF once one is
-    // presented. The blocking event wait is excluded (idle, not work).
-    let mut work_accum_ns: i64 = 0;
 
     while !shutdown.load(Ordering::Relaxed) && !state.fatal && !state.wedged {
         // Block for the next event (idle wait — excluded from the work tally). The short timeout
@@ -389,35 +349,10 @@ fn run_codec(
         let had_output = !state.ready.is_empty();
         let rendered_before = state.rendered;
         state.apply(&ctx, &mut pass);
-        state.pump(&ctx, vsync.as_ref().map(|v| v.shared().as_ref()));
+        state.pump(&ctx, aux.clock());
         let presented_now = state.rendered > rendered_before;
-        // Start the vsync clock LAZILY on the first decoded output (eager, it ticks the panel
-        // rate into a session that has no frame yet — the Apple deadline presenter's bootstrap
-        // lesson). A `None` from start (no choreographer surface) simply leaves ASAP targets.
-        if had_output && vsync.is_none() {
-            if let Some(tx) = vsync_tx.take() {
-                vsync = VsyncClock::start(
-                    opts.panel_hz,
-                    Box::new(move || {
-                        let _ = tx.send(DecodeEvent::Vsync);
-                    }),
-                );
-                if vsync.is_none() {
-                    log::info!("decode: no choreographer clock — presenter uses ASAP targets");
-                }
-            }
-        }
-
-        work_accum_ns += work_t0.elapsed().as_nanos() as i64;
+        aux.after_pass(client, work_t0, had_output, presented_now);
         if presented_now {
-            if !hint_tried {
-                hint_tried = true;
-                hint = start_hint(client, mode.refresh_hz, opts.low_latency_mode);
-            }
-            if let Some(h) = &hint {
-                h.report_actual(work_accum_ns);
-            }
-            work_accum_ns = 0;
             state.log_progress();
             if let Some(layer) = stale.take() {
                 layer.hide();
@@ -425,9 +360,122 @@ fn run_codec(
         }
         state.housekeeping(&ctx, had_output, &pass);
     }
+    teardown(state, ctx, aux, render_cb, feeder, shutdown, stale)
+}
 
+/// The SurfaceView timeline presenter (see `presenter.rs`): newest-wins / smoothing store,
+/// one-in-flight glass budget, timeline-timed release. `None` under the ASC backend, or when
+/// `debug.punktfunk.presenter = arrival` selects the legacy release-immediately path.
+fn select_presenter(asc: bool, opts: &DecodeOptions, refresh_hz: u32) -> Option<Presenter> {
+    if asc {
+        return None;
+    }
+    if presenter_disabled_by_sysprop() {
+        log::info!("decode: presenter = arrival (sysprop) — legacy immediate release");
+        return None;
+    }
+    let priority = PresentPriority::resolve(opts.present_priority, opts.smooth_buffer);
+    log::info!(
+        "decode: presenter = timeline ({})",
+        match priority {
+            PresentPriority::Latency => "lowest latency".to_string(),
+            PresentPriority::Smooth { buffer } => format!("smoothness, buffer {buffer}"),
+        }
+    );
+    Some(Presenter::new(priority, refresh_hz))
+}
+
+/// What the pass tail keeps between passes: the vsync clock, started lazily (see `vsync.rs`) with
+/// its ticks on the event channel, and the ADPF hint session with the work it has yet to report.
+struct LoopAux {
+    vsync: Option<VsyncClock>,
+    /// The clock's tick sender, taken when it starts; `None` from the outset without a presenter.
+    vsync_tx: Option<mpsc::Sender<DecodeEvent>>,
+    panel_hz: i32,
+    hint: Option<crate::adpf::HintSession>,
+    hint_tried: bool,
+    refresh_hz: u32,
+    low_latency_mode: bool,
+    /// Productive (dispatch+feed+present) time since the last displayed frame. The blocking
+    /// event wait is idle, not work.
+    work_accum_ns: i64,
+}
+
+impl LoopAux {
+    fn new(
+        vsync_tx: Option<mpsc::Sender<DecodeEvent>>,
+        opts: &DecodeOptions,
+        refresh_hz: u32,
+    ) -> LoopAux {
+        LoopAux {
+            vsync: None,
+            vsync_tx,
+            panel_hz: opts.panel_hz,
+            hint: None,
+            hint_tried: false,
+            refresh_hz,
+            low_latency_mode: opts.low_latency_mode,
+            work_accum_ns: 0,
+        }
+    }
+
+    fn clock(&self) -> Option<&VsyncShared> {
+        self.vsync.as_ref().map(|v| v.shared().as_ref())
+    }
+
+    /// The pass's tail. The vsync clock starts on the first decoded output: started eagerly, it
+    /// ticks the panel rate into a session that has no frame yet. A `None` from start (no
+    /// choreographer surface) leaves ASAP targets. A presented frame reports the work since the
+    /// last one to ADPF, which creates its session on the first.
+    fn after_pass(
+        &mut self,
+        client: &NativeClient,
+        pass_start: Instant,
+        had_output: bool,
+        presented: bool,
+    ) {
+        if had_output && self.vsync.is_none() {
+            if let Some(tx) = self.vsync_tx.take() {
+                self.vsync = VsyncClock::start(
+                    self.panel_hz,
+                    Box::new(move || {
+                        let _ = tx.send(DecodeEvent::Vsync);
+                    }),
+                );
+                if self.vsync.is_none() {
+                    log::info!("decode: no choreographer clock — presenter uses ASAP targets");
+                }
+            }
+        }
+        self.work_accum_ns += pass_start.elapsed().as_nanos() as i64;
+        if presented {
+            if !self.hint_tried {
+                self.hint_tried = true;
+                self.hint = start_hint(client, self.refresh_hz, self.low_latency_mode);
+            }
+            if let Some(h) = &self.hint {
+                h.report_actual(self.work_accum_ns);
+            }
+            self.work_accum_ns = 0;
+        }
+    }
+}
+
+/// End one run. The order is what keeps it sound: held output buffers and reader images go back
+/// before the codec stops, the codec is deleted before the render callback's `Arc` is reclaimed,
+/// and the feeder stops last. `render_cb` is the registration on `ctx.codec`. A failed run that
+/// presented leaves its layer in `stale`.
+fn teardown(
+    state: State,
+    ctx: Ctx,
+    aux: LoopAux,
+    render_cb: Option<*const DisplayTracker>,
+    feeder: Feeder,
+    shutdown: &AtomicBool,
+    stale: &mut Option<Layer>,
+) -> RunEnd {
     let State {
-        asc,
+        mut asc,
         presenter,
         fed,
         rendered,
@@ -439,11 +487,10 @@ fn run_codec(
     if let Some(mut p) = presenter {
         p.release_all(&ctx.codec); // hand every held output buffer back before the codec stops
     }
-    let mut asc = asc;
     if let Some(a) = asc.as_mut() {
         a.release_all(); // drop every held image back to the reader pool before it goes away
     }
-    drop(vsync); // stop + join the choreographer thread; its channel sends are harmless after
+    drop(aux.vsync); // stop + join the choreographer thread; its channel sends are harmless after
     let _ = ctx.codec.stop();
     // AMediaCodec_delete — after this no render callback can fire. The ASC reader + layer outlive
     // the codec, which rendered into the reader's window. `into_layer` then drops the reader; the
@@ -452,14 +499,12 @@ fn run_codec(
     drop(ctx);
     let layer = asc.map(AscBackend::into_layer);
     if let Some(ud) = render_cb {
-        // SAFETY: the codec was dropped above; this registration's single reclaim.
+        // SAFETY: `ud` is `install_render_callback`'s pointer for `ctx.codec`, which was dropped
+        // above; this is its single reclaim.
         unsafe { release_render_callback(ud) };
     }
     // The feeder stops last: while a hung codec is slow to stop, it keeps the receive queue drained.
-    feed_stop.store(true, Ordering::SeqCst);
-    if let Some(j) = feeder {
-        let _ = j.join();
-    }
+    feeder.stop_and_join();
     log::info!("decode: stopped (async, fed={fed} rendered={rendered} discarded={discarded})");
     if (fatal || wedged) && !shutdown.load(Ordering::Relaxed) {
         if rendered > 0 {
@@ -1343,6 +1388,45 @@ fn report_arrival_phase(ctx: &Ctx, clock: &VsyncShared, stamps: &mut Vec<i128>) 
         lead_mean_ns.min(u32::MAX as u64) as u32,
         coherence,
     );
+}
+
+/// The `pf-decode-feed` thread ([`feeder_loop`]): it blocks on the network so the loop doesn't,
+/// and an AU's arrival becomes an event that wakes the loop at once. `stop` ends it with this
+/// run; the session's `shutdown` would end every later run too.
+struct Feeder {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Feeder {
+    fn spawn(
+        client: &Arc<NativeClient>,
+        stats: &Arc<crate::stats::VideoStats>,
+        measure_decode: bool,
+        in_flight: Arc<Mutex<VecDeque<(u64, i128)>>>,
+        ev_tx: mpsc::Sender<DecodeEvent>,
+    ) -> Feeder {
+        let stop = Arc::new(AtomicBool::new(false));
+        let join = {
+            let client = client.clone();
+            let stats = stats.clone();
+            let stop = stop.clone();
+            std::thread::Builder::new()
+                .name("pf-decode-feed".into())
+                .spawn(move || {
+                    feeder_loop(client, stats, measure_decode, in_flight, stop, ev_tx);
+                })
+                .ok()
+        };
+        Feeder { stop, join }
+    }
+
+    fn stop_and_join(self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(j) = self.join {
+            let _ = j.join();
+        }
+    }
 }
 
 /// The `pf-decode-feed` thread: block on the connector for the next access unit so the async loop
