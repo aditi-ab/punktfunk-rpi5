@@ -270,6 +270,18 @@ pub enum CapsError {
         mode: &'static str,
         format: vk::Format,
     },
+    /// The picture has more slice segments than the owner allows this driver
+    /// ([`crate::VkH265Decoder::refuse_multi_slice`]). Refused before any driver call.
+    SliceSegments { segments: usize },
+}
+
+/// One slice segment per picture when `single_slice` is set, any number otherwise.
+pub(crate) fn require_segments(single_slice: bool, segments: usize) -> Result<(), CapsError> {
+    if single_slice && segments > 1 {
+        Err(CapsError::SliceSegments { segments })
+    } else {
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for CapsError {
@@ -314,6 +326,12 @@ impl std::fmt::Display for CapsError {
                 write!(
                     f,
                     "the {mode} {format:?} entry does not allow MUTABLE_FORMAT (per-plane views)"
+                )
+            }
+            CapsError::SliceSegments { segments } => {
+                write!(
+                    f,
+                    "this driver takes one slice segment per picture, the stream sends {segments}"
                 )
             }
         }
@@ -801,6 +819,15 @@ mod tests {
             queried,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_second_slice_segment_is_refused_only_for_a_single_slice_driver() {
+        assert!(require_segments(false, 4).is_ok());
+        assert!(require_segments(true, 1).is_ok());
+        let refused = require_segments(true, 2).unwrap_err();
+        assert_eq!(refused, CapsError::SliceSegments { segments: 2 });
+        assert!(crate::VkDecodeError::Caps(refused).is_device_fact());
     }
 
     #[test]
