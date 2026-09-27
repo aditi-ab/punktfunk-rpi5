@@ -9,6 +9,8 @@
 //! host timing, cursor) take the prefix the peer knows. Evidence:
 //! `design/trigger-rumble-plane.md`, `design/phase-locked-capture.md`.
 
+use super::wire::{Rd, Wr};
+
 pub const AUDIO_MAGIC: u8 = 0xC9;
 pub const RUMBLE_MAGIC: u8 = 0xCA;
 /// Client → host Opus. The host feeds a virtual PipeWire source so apps can record it.
@@ -16,23 +18,29 @@ pub const MIC_MAGIC: u8 = 0xCB;
 pub const RICH_INPUT_MAGIC: u8 = 0xCC;
 pub const HIDOUT_MAGIC: u8 = 0xCD;
 
+/// `[tag][u32 seq LE][u64 pts_ns LE][payload]`: the audio, PCM and mic planes.
+const SEQ_PTS_HEADER: usize = 1 + 4 + 8;
+
+fn encode_seq_pts(tag: u8, seq: u32, pts_ns: u64, payload: &[u8]) -> Vec<u8> {
+    Wr::tag(tag, SEQ_PTS_HEADER + payload.len())
+        .u32(seq)
+        .u64(pts_ns)
+        .bytes(payload)
+        .done()
+}
+
+fn decode_seq_pts(b: &[u8], tag: u8) -> Option<(u32, u64, &[u8])> {
+    let mut r = Rd::tag(b, tag, SEQ_PTS_HEADER)?;
+    Some((r.u32(), r.u64(), r.rest()))
+}
+
 /// One Opus frame, 5 ms — under any MTU.
 pub fn encode_audio_datagram(seq: u32, pts_ns: u64, opus: &[u8]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(13 + opus.len());
-    b.push(AUDIO_MAGIC);
-    b.extend_from_slice(&seq.to_le_bytes());
-    b.extend_from_slice(&pts_ns.to_le_bytes());
-    b.extend_from_slice(opus);
-    b
+    encode_seq_pts(AUDIO_MAGIC, seq, pts_ns, opus)
 }
 
 pub fn decode_audio_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
-    if b.len() < 13 || b[0] != AUDIO_MAGIC {
-        return None;
-    }
-    let seq = u32::from_le_bytes(b[1..5].try_into().unwrap());
-    let pts_ns = u64::from_le_bytes(b[5..13].try_into().unwrap());
-    Some((seq, pts_ns, &b[13..]))
+    decode_seq_pts(b, AUDIO_MAGIC)
 }
 
 /// Previous-frame copy on the successor datagram — a lost 0xC9 is reconstructed, not concealed.
@@ -101,21 +109,11 @@ pub const AUDIO_PCM_MAGIC: u8 = 0xD3;
 pub const AUDIO_PCM_HEADER: usize = crate::audio::pcm::PCM_HEADER_LEN;
 
 pub fn encode_audio_pcm_datagram(seq: u32, pts_ns: u64, pcm: &[u8]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(AUDIO_PCM_HEADER + pcm.len());
-    b.push(AUDIO_PCM_MAGIC);
-    b.extend_from_slice(&seq.to_le_bytes());
-    b.extend_from_slice(&pts_ns.to_le_bytes());
-    b.extend_from_slice(pcm);
-    b
+    encode_seq_pts(AUDIO_PCM_MAGIC, seq, pts_ns, pcm)
 }
 
 pub fn decode_audio_pcm_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
-    if b.len() < AUDIO_PCM_HEADER || b[0] != AUDIO_PCM_MAGIC {
-        return None;
-    }
-    let seq = u32::from_le_bytes(b[1..5].try_into().unwrap());
-    let pts_ns = u64::from_le_bytes(b[5..13].try_into().unwrap());
-    Some((seq, pts_ns, &b[AUDIO_PCM_HEADER..]))
+    decode_seq_pts(b, AUDIO_PCM_MAGIC)
 }
 
 /// Legacy rumble v1. Level-triggered — persists until superseded; the host re-sends as loss heal.
@@ -237,21 +235,11 @@ pub fn decode_rumble_envelope(b: &[u8]) -> Option<RumbleUpdate> {
 }
 
 pub fn encode_mic_datagram(seq: u32, pts_ns: u64, opus: &[u8]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(13 + opus.len());
-    b.push(MIC_MAGIC);
-    b.extend_from_slice(&seq.to_le_bytes());
-    b.extend_from_slice(&pts_ns.to_le_bytes());
-    b.extend_from_slice(opus);
-    b
+    encode_seq_pts(MIC_MAGIC, seq, pts_ns, opus)
 }
 
 pub fn decode_mic_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
-    if b.len() < 13 || b[0] != MIC_MAGIC {
-        return None;
-    }
-    let seq = u32::from_le_bytes(b[1..5].try_into().unwrap());
-    let pts_ns = u64::from_le_bytes(b[5..13].try_into().unwrap());
-    Some((seq, pts_ns, &b[13..]))
+    decode_seq_pts(b, MIC_MAGIC)
 }
 
 pub(super) const RICH_TOUCHPAD: u8 = 0x01;
@@ -1036,6 +1024,20 @@ mod tests {
             13,
             "phase without stages must encode as the legacy form (prefix discipline)"
         );
+    }
+
+    /// `[tag][u32 seq][u64 pts][payload]`, written out for the three planes that share it.
+    #[test]
+    fn seq_pts_datagrams_keep_their_wire_bytes() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let (seq, pts, payload) = (0x0102_0304, 0x1122_3344_5566_7788, &[0xaa, 0xbb][..]);
+        for (tag, d) in [
+            ("c9", encode_audio_datagram(seq, pts, payload)),
+            ("cb", encode_mic_datagram(seq, pts, payload)),
+            ("d3", encode_audio_pcm_datagram(seq, pts, payload)),
+        ] {
+            assert_eq!(hex(&d), format!("{tag}040302018877665544332211aabb"));
+        }
     }
 
     #[test]
