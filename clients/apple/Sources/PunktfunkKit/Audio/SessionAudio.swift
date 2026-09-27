@@ -932,6 +932,12 @@ public final class SessionAudio {
         apply(micMuted: muted, capture: capture, combined: combined)
     }
 
+    private var latchedMicMute: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return micMuted
+    }
+
     /// Push the latched mute onto whichever engine carries the uplink. Split out from
     /// `setMicMuted` because the start paths call it too, with the engine they just started —
     /// that's how a mute requested before the permission grant lands on the engine the grant
@@ -1300,6 +1306,8 @@ public final class SessionAudio {
             startCapture(micUID: micUID, micChannel: micChannel)
             return
         }
+        // Mute before the IO unit opens: applied after start, the first tap buffer is room audio.
+        engine.inputNode.isVoiceProcessingInputMuted = latchedMicMute
         do {
             try engine.start()
         } catch {
@@ -1361,8 +1369,10 @@ public final class SessionAudio {
             engine.stop()
             return
         }
+        // A muted uplink stays unstarted (the unmute starts it): a start opens the mic before
+        // the mute could pause it.
         do {
-            try engine.start()
+            if !latchedMicMute { try engine.start() }
         } catch {
             log.error("capture engine failed to start: \(error.localizedDescription)")
             input.removeTap(onBus: 0)
