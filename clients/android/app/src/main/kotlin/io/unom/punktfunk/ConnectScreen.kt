@@ -391,9 +391,10 @@ fun ConnectScreen(
         )
     }
 
-    // The actual dial (identity already ready). A TOFU dial (pinHex null) pins what the host
-    // presented, as an unpaired known host. [onFailure] takes over an unreachable dial (the
-    // wake-wait fallback, discovery already restarted); [onMismatch] takes over a refused pin.
+    // The actual dial (identity already ready). A TOFU dial (no saved record; pinned to the
+    // advertised fingerprint when there is one) saves what the host presented, as an unpaired
+    // known host. [onFailure] takes over an unreachable dial (the wake-wait fallback, discovery
+    // already restarted); [onMismatch] takes over a refused pin.
     fun doConnectDirect(
         targetHost: String,
         targetPort: Int,
@@ -425,7 +426,7 @@ fun ConnectScreen(
             if (handle != 0L) {
                 // By this dial's pin: the address may also name the other OS of a dual-boot box.
                 var record = pinHex?.let { knownHostStore.resolve(it, targetHost, targetPort) }
-                if (pinHex == null) { // TOFU: pin what we observed (unpaired)
+                if (record == null) { // TOFU: pin what we observed (unpaired)
                     val fp = NativeBridge.nativeHostFingerprint(handle)
                     if (fp.isNotEmpty()) {
                         record = knownHostStore.trust(targetHost, targetPort, name, fp, paired = false)
@@ -976,7 +977,14 @@ fun ConnectScreen(
         onPendingTrustChange = { pendingTrust = it },
         onTrustNew = { pt ->
             pendingTrust = null
-            doConnect(pt.host, pt.port, pt.name, null, pt.preset, pt.launch)
+            // Pinned to the fingerprint the prompt showed, when the advert carried one.
+            doConnect(
+                pt.host, pt.port, pt.name, pt.advertisedFp, pt.preset, pt.launch,
+                onMismatch = {
+                    status = "Couldn't connect: the host didn't present the identity it advertised. " +
+                        "Pair with its PIN instead."
+                },
+            )
         },
         onPaired = { pt, fp ->
             knownHostStore.trust(pt.host, pt.port, pt.name, fp, paired = true)
