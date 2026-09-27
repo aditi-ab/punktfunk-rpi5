@@ -16,8 +16,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::vk_util::{
-    color_range, find_mem, import_failure_feeds_latch, make_host_buffer, make_plain_image,
-    make_view, normalize_cpu_rgb, pixel_to_vk, reject_dmabuf,
+    color_range, find_mem_preferring, import_failure_feeds_latch, make_host_buffer,
+    make_plain_image, make_view, normalize_cpu_rgb, pixel_to_vk, reject_dmabuf,
 };
 use crate::rfi::Wave;
 use crate::{Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -1663,11 +1663,11 @@ impl VulkanVideoEncoder {
         let mut binds = Vec::new();
         for rq in &reqs {
             let mr = rq.memory_requirements;
-            let ti = find_mem(
+            let ti = find_mem_preferring(
                 &mem_props,
                 mr.memory_type_bits,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            );
+            )?;
             let m = device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(mr.size)
