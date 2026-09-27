@@ -24,6 +24,8 @@ use std::ops::Range;
 use pf_bitstream::av1::coded_cdef_sec_strength;
 use pf_bitstream::av1::AuPlan as AuPlanAv1;
 use pf_bitstream::av1::FrameType;
+use pf_bitstream::av1::ParsedFrameHeader as ParsedFrameHeaderAv1;
+use pf_bitstream::av1::ParsedSequenceHeader as ParsedSequenceHeaderAv1;
 use pf_bitstream::av1::PicId;
 use pf_bitstream::av1::NUM_REF_SLOTS;
 use pf_bitstream::av1::REFS_PER_FRAME;
@@ -43,6 +45,7 @@ use crate::va_av1::VaSegmentationStructAV1;
 use crate::va_av1::VaSliceParameterBufferAV1;
 use crate::va_av1::VaWarpedMotionParamsAV1;
 use crate::va_av1::ANCHOR_FRAME_UNUSED;
+use crate::va_av1::CDEF_MAX;
 use crate::va_av1::LAST_FRAME;
 use crate::va_av1::SUPERRES_NUM;
 use crate::va_av1::TILE_SBS_LEN;
@@ -210,7 +213,8 @@ fn narrow32(field: &'static str, value: usize) -> Result<u32, PlanToVaAv1Error> 
     })
 }
 
-/// Convert one planned AV1 frame.
+/// Convert one planned AV1 frame: one helper per picture-parameter section,
+/// assembled here.
 ///
 /// `au` is the access unit `plan` was planned from: tile records need per-tile
 /// byte ranges from each group's `tile_size_minus_1` walk, which the plan does
@@ -238,7 +242,6 @@ pub fn plan_to_va_av1(
     let setup_id = plan.dpb.stored.ok_or(PlanToVaAv1Error::NoDecode)?;
     let h = &*plan.header;
     let seq = &*plan.sequence;
-    let color = &seq.color_config;
 
     let required = NUM_REF_SLOTS + 1;
     if slots.capacity() != required {
@@ -255,62 +258,11 @@ pub fn plan_to_va_av1(
         });
     }
 
-    // By `RefPic::slot` (bitstream 0..8), not ledger slot. A ledger index
-    // names the wrong reference after the first eviction.
-    let mut ref_frame_map = [VA_INVALID_SURFACE; NUM_REF_SLOTS];
-    // Shown key frame: empty store. libavcodec writes `VA_INVALID_ID` for
-    // every slot. `dpb_refs` is the store before this refresh; listing those
-    // surfaces would disagree with that empty map.
-    let publishes_store = !(h.frame_type == FrameType::KeyFrame && h.show_frame);
-    if publishes_store {
-        for r in &plan.dpb_refs {
-            let ledger = slots
-                .slot_of(r.id)
-                .ok_or(PlanToVaAv1Error::UnresolvedReference(r.id))?;
-            let surface =
-                *surfaces
-                    .get(usize::from(ledger))
-                    .ok_or(PlanToVaAv1Error::SurfaceOutOfRange {
-                        slot: ledger,
-                        surfaces: surfaces.len(),
-                    })?;
-            let slot = usize::from(r.slot);
-            if slot >= NUM_REF_SLOTS {
-                return Err(PlanToVaAv1Error::FieldOverflow {
-                    field: "RefPic::slot",
-                    value: u32::from(r.slot),
-                });
-            }
-            ref_frame_map[slot] = surface;
-        }
-    }
-
-    // Empty slot → a live surface (`va_dec_av1.h`): planner-empty or a
-    // refused conversion the caller left unbound. Prefer a resolved
-    // reference; `setup_surface` is the fallback (it is about to be written).
-    let mut substituted_refs = 0u8;
-    if publishes_store {
-        let alternative = ref_frame_map
-            .iter()
-            .copied()
-            .find(|&s| s != VA_INVALID_SURFACE)
-            .unwrap_or(setup_surface);
-        for (slot, entry) in ref_frame_map.iter_mut().enumerate() {
-            if *entry == VA_INVALID_SURFACE {
-                *entry = alternative;
-                substituted_refs |= 1 << slot;
-            }
-        }
-    }
-
-    // Header `ref_frame_idx[name]` verbatim — not `plan.refs`, where a lost
-    // reference is a hole. Concealment is the substituted `ref_frame_map` slot.
-    let ref_frame_idx = h.ref_frame_idx;
+    let (ref_frame_map, substituted_refs) = refs(plan, slots, surfaces, setup_surface)?;
 
     // After reference resolve, before the tile walk: a later refusal must
     // leave the ledger in step with the planner. Resolve used the pre-removal
     // store; releasing first would drop a still-named picture.
-
     for &id in &plan.dpb.removed {
         if id == setup_id {
             continue;
@@ -332,6 +284,173 @@ pub fn plan_to_va_av1(
         return Err(PlanToVaAv1Error::FilmGrain);
     }
 
+    let tile_groups = tiles(au, plan)?;
+    let seg_info = segmentation(h);
+    let (cdef_y_strengths, cdef_uv_strengths) = cdef_strengths(h)?;
+    let (width_in_sbs_minus_1, height_in_sbs_minus_1) = tile_sizes(h)?;
+    let wm = global_motion(h);
+
+    let t = &h.tile_info;
+    let color = &seq.color_config;
+    let mut pic_params = VaDecPictureParameterBufferAV1::zeroed();
+    pic_params.profile = seq.seq_profile as u8;
+    // Parser leaves -1 when `enable_order_hint` is 0; `as u8` is 255 (hints
+    // 256 bits wide). Disabled case sends 0, matching libavcodec CBS.
+    pic_params.order_hint_bits_minus_1 = if seq.enable_order_hint {
+        narrow(
+            "order_hint_bits_minus_1",
+            u32::try_from(seq.order_hint_bits_minus_1).map_err(|_| {
+                PlanToVaAv1Error::FieldOverflow {
+                    field: "order_hint_bits_minus_1",
+                    value: 0,
+                }
+            })?,
+        )?
+    } else {
+        0
+    };
+    pic_params.bit_depth_idx = if color.high_bitdepth {
+        if color.twelve_bit {
+            2
+        } else {
+            1
+        }
+    } else {
+        0
+    };
+    pic_params.matrix_coefficients = color.matrix_coefficients as u8;
+    pic_params.seq_info_fields = seq_info_fields(seq);
+    pic_params.current_frame = setup_surface;
+    // Equal to `current_frame`: `apply_grain` is 0 on every frame that reaches here.
+    pic_params.current_display_picture = setup_surface;
+    pic_params.anchor_frames_num = 0;
+    pic_params.anchor_frames_list = std::ptr::null_mut();
+    // Upscaled width: libavcodec's `frame_width_minus_1`. AV1 5.9.8 reads
+    // this into `UpscaledWidth` before superres divides it to `FrameWidth`.
+    pic_params.frame_width_minus1 = narrow16(
+        "frame_width_minus1",
+        h.upscaled_width
+            .checked_sub(1)
+            .ok_or(PlanToVaAv1Error::FieldOverflow {
+                field: "upscaled_width",
+                value: 0,
+            })?,
+    )?;
+    pic_params.frame_height_minus1 = narrow16(
+        "frame_height_minus1",
+        h.frame_height
+            .checked_sub(1)
+            .ok_or(PlanToVaAv1Error::FieldOverflow {
+                field: "frame_height",
+                value: 0,
+            })?,
+    )?;
+    pic_params.ref_frame_map = ref_frame_map;
+    // Header `ref_frame_idx[name]` verbatim — not `plan.refs`, where a lost
+    // reference is a hole. Concealment is the substituted `ref_frame_map` slot.
+    pic_params.ref_frame_idx = h.ref_frame_idx;
+    pic_params.primary_ref_frame = narrow("primary_ref_frame", h.primary_ref_frame)?;
+    pic_params.order_hint = narrow("order_hint", h.order_hint)?;
+    pic_params.seg_info = seg_info;
+    pic_params.tile_cols = narrow("tile_cols", t.tile_cols)?;
+    pic_params.tile_rows = narrow("tile_rows", t.tile_rows)?;
+    pic_params.width_in_sbs_minus_1 = width_in_sbs_minus_1;
+    pic_params.height_in_sbs_minus_1 = height_in_sbs_minus_1;
+    pic_params.context_update_tile_id =
+        narrow16("context_update_tile_id", t.context_update_tile_id)?;
+    pic_params.pic_info_fields = frame_flags(h);
+    // Real denominator, or `SUPERRES_NUM` when superres is off. libva
+    // documents 8 there and 9..=16 otherwise; 0 is outside the range.
+    pic_params.superres_scale_denominator = if h.use_superres {
+        narrow("superres_denom", h.superres_denom)?
+    } else {
+        SUPERRES_NUM
+    };
+    pic_params.interp_filter = h.interpolation_filter as u8;
+    loop_filter(h, &mut pic_params);
+    quantization(h, &mut pic_params)?;
+    let c = &h.cdef_params;
+    // Parser holds `CdefDamping` (coded + 3); libva wants the coded value.
+    pic_params.cdef_damping_minus_3 =
+        narrow("cdef_damping_minus_3", c.cdef_damping.saturating_sub(3))?;
+    pic_params.cdef_bits = narrow("cdef_bits", c.cdef_bits)?;
+    pic_params.cdef_y_strengths = cdef_y_strengths;
+    pic_params.cdef_uv_strengths = cdef_uv_strengths;
+    pic_params.loop_restoration_fields = loop_restoration(h);
+    pic_params.wm = wm;
+    // Zeroed: `apply_grain` is 0 here; libva documents that as set the rest
+    // to zero and ignore.
+    pic_params.film_grain_info.film_grain_info_fields = FilmGrainInfoFieldsAV1::default().pack();
+
+    Ok(DecodePlanVaAv1 {
+        pic_params,
+        tile_groups,
+        setup_slot,
+        setup_id,
+        substituted_refs,
+    })
+}
+
+/// `ref_frame_map` by `RefPic::slot` (bitstream 0..8), not ledger slot: a
+/// ledger index names the wrong reference after the first eviction. Returns
+/// the map and the substituted-slot bits. Read-only on `slots`.
+fn refs(
+    plan: &AuPlanAv1,
+    slots: &SlotMap,
+    surfaces: &[u32],
+    setup_surface: u32,
+) -> Result<([u32; NUM_REF_SLOTS], u8), PlanToVaAv1Error> {
+    let h = &*plan.header;
+    let mut ref_frame_map = [VA_INVALID_SURFACE; NUM_REF_SLOTS];
+    // Shown key frame: empty store. libavcodec writes `VA_INVALID_ID` for
+    // every slot. `dpb_refs` is the store before this refresh; listing those
+    // surfaces would disagree with that empty map.
+    let publishes_store = !(h.frame_type == FrameType::KeyFrame && h.show_frame);
+    if !publishes_store {
+        return Ok((ref_frame_map, 0));
+    }
+    for r in &plan.dpb_refs {
+        let ledger = slots
+            .slot_of(r.id)
+            .ok_or(PlanToVaAv1Error::UnresolvedReference(r.id))?;
+        let surface =
+            *surfaces
+                .get(usize::from(ledger))
+                .ok_or(PlanToVaAv1Error::SurfaceOutOfRange {
+                    slot: ledger,
+                    surfaces: surfaces.len(),
+                })?;
+        let slot = usize::from(r.slot);
+        if slot >= NUM_REF_SLOTS {
+            return Err(PlanToVaAv1Error::FieldOverflow {
+                field: "RefPic::slot",
+                value: u32::from(r.slot),
+            });
+        }
+        ref_frame_map[slot] = surface;
+    }
+
+    // Empty slot → a live surface (`va_dec_av1.h`): planner-empty or a
+    // refused conversion the caller left unbound. Prefer a resolved
+    // reference; `setup_surface` is the fallback (it is about to be written).
+    let mut substituted_refs = 0u8;
+    let alternative = ref_frame_map
+        .iter()
+        .copied()
+        .find(|&s| s != VA_INVALID_SURFACE)
+        .unwrap_or(setup_surface);
+    for (slot, entry) in ref_frame_map.iter_mut().enumerate() {
+        if *entry == VA_INVALID_SURFACE {
+            *entry = alternative;
+            substituted_refs |= 1 << slot;
+        }
+    }
+    Ok((ref_frame_map, substituted_refs))
+}
+
+/// One [`TileGroupVa`] per tile-group OBU, offsets rebased onto its data.
+fn tiles(au: &[u8], plan: &AuPlanAv1) -> Result<Vec<TileGroupVa>, PlanToVaAv1Error> {
+    let h = &*plan.header;
     // Empty/short tiles with a stored picture is a lost packet. Refuse here;
     // [`PlanToVaAv1Error::lost_tiles`] is how the caller tells damage from a defect.
     if plan.tiles.is_empty() {
@@ -417,14 +536,34 @@ pub fn plan_to_va_av1(
             grid,
         });
     }
+    Ok(tile_groups)
+}
 
-    let lf = &h.loop_filter_params;
-    let q = &h.quantization_params;
-    let c = &h.cdef_params;
-    let lr = &h.loop_restoration_params;
+/// Coded tile sizes. Arrays are 63 long: the last tile size is derived.
+/// libavcodec loops to `tile_cols` and overruns index 63 on a 64-column frame.
+fn tile_sizes(
+    h: &ParsedFrameHeaderAv1,
+) -> Result<([u16; TILE_SBS_LEN], [u16; TILE_SBS_LEN]), PlanToVaAv1Error> {
+    let t = &h.tile_info;
+    let mut width_in_sbs_minus_1 = [0u16; TILE_SBS_LEN];
+    let mut height_in_sbs_minus_1 = [0u16; TILE_SBS_LEN];
+    for (out, coded) in width_in_sbs_minus_1
+        .iter_mut()
+        .zip(&t.width_in_sbs_minus_1[..(t.tile_cols as usize).min(TILE_SBS_LEN)])
+    {
+        *out = narrow16("width_in_sbs_minus_1", *coded)?;
+    }
+    for (out, coded) in height_in_sbs_minus_1
+        .iter_mut()
+        .zip(&t.height_in_sbs_minus_1[..(t.tile_rows as usize).min(TILE_SBS_LEN)])
+    {
+        *out = narrow16("height_in_sbs_minus_1", *coded)?;
+    }
+    Ok((width_in_sbs_minus_1, height_in_sbs_minus_1))
+}
+
+fn segmentation(h: &ParsedFrameHeaderAv1) -> VaSegmentationStructAV1 {
     let sp = &h.segmentation_params;
-    let gm = &h.global_motion_params;
-
     let mut seg_info = VaSegmentationStructAV1::zeroed();
     seg_info.segment_info_fields = SegmentInfoFieldsAV1 {
         enabled: sp.segmentation_enabled,
@@ -445,36 +584,29 @@ pub fn plan_to_va_av1(
         // clips on read.
         seg_info.feature_data[segment] = sp.feature_data[segment];
     }
+    seg_info
+}
 
-    let mut cdef_y_strengths = [0u8; crate::va_av1::CDEF_MAX];
-    let mut cdef_uv_strengths = [0u8; crate::va_av1::CDEF_MAX];
-    for i in 0..crate::va_av1::CDEF_MAX {
-        // Pack the CODED two-bit `sec`. AV1 5.9.19 rewrites a coded 3 to 4
-        // in place; masking the parser value with 3 turns the strongest
-        // secondary filter into none. `coded_cdef_sec_strength` inverts that.
+/// Pack the CODED two-bit `sec`. AV1 5.9.19 rewrites a coded 3 to 4 in
+/// place; masking the parser value with 3 turns the strongest secondary
+/// filter into none. `coded_cdef_sec_strength` inverts that.
+fn cdef_strengths(
+    h: &ParsedFrameHeaderAv1,
+) -> Result<([u8; CDEF_MAX], [u8; CDEF_MAX]), PlanToVaAv1Error> {
+    let c = &h.cdef_params;
+    let mut cdef_y_strengths = [0u8; CDEF_MAX];
+    let mut cdef_uv_strengths = [0u8; CDEF_MAX];
+    for i in 0..CDEF_MAX {
         let pri_y = narrow("cdef_y_pri_strength", c.cdef_y_pri_strength[i])?;
         let pri_uv = narrow("cdef_uv_pri_strength", c.cdef_uv_pri_strength[i])?;
         cdef_y_strengths[i] = (pri_y << 2) | coded_cdef_sec_strength(c.cdef_y_sec_strength[i]);
         cdef_uv_strengths[i] = (pri_uv << 2) | coded_cdef_sec_strength(c.cdef_uv_sec_strength[i]);
     }
+    Ok((cdef_y_strengths, cdef_uv_strengths))
+}
 
-    let mut width_in_sbs_minus_1 = [0u16; TILE_SBS_LEN];
-    let mut height_in_sbs_minus_1 = [0u16; TILE_SBS_LEN];
-    // Arrays are 63 long: the last tile size is derived. libavcodec loops
-    // to `tile_cols` and overruns index 63 on a 64-column frame.
-    for (out, coded) in width_in_sbs_minus_1
-        .iter_mut()
-        .zip(&t.width_in_sbs_minus_1[..(t.tile_cols as usize).min(TILE_SBS_LEN)])
-    {
-        *out = narrow16("width_in_sbs_minus_1", *coded)?;
-    }
-    for (out, coded) in height_in_sbs_minus_1
-        .iter_mut()
-        .zip(&t.height_in_sbs_minus_1[..(t.tile_rows as usize).min(TILE_SBS_LEN)])
-    {
-        *out = narrow16("height_in_sbs_minus_1", *coded)?;
-    }
-
+fn global_motion(h: &ParsedFrameHeaderAv1) -> [VaWarpedMotionParamsAV1; REFS_PER_FRAME] {
+    let gm = &h.global_motion_params;
     let mut wm = [VaWarpedMotionParamsAV1::zeroed(); REFS_PER_FRAME];
     for (name, entry) in wm.iter_mut().enumerate() {
         // By reference NAME, never DPB slot. Parser stores
@@ -487,37 +619,12 @@ pub fn plan_to_va_av1(
         // Parser `setup_shear` verdict; libva's flag is the inverse.
         entry.invalid = u8::from(!gm.warp_valid[gm_name]);
     }
+    wm
+}
 
-    let bit_depth_idx = if color.high_bitdepth {
-        if color.twelve_bit {
-            2
-        } else {
-            1
-        }
-    } else {
-        0
-    };
-
-    let mut pic_params = VaDecPictureParameterBufferAV1::zeroed();
-    pic_params.profile = seq.seq_profile as u8;
-    // Parser leaves -1 when `enable_order_hint` is 0; `as u8` is 255 (hints
-    // 256 bits wide). Disabled case sends 0, matching libavcodec CBS.
-    pic_params.order_hint_bits_minus_1 = if seq.enable_order_hint {
-        narrow(
-            "order_hint_bits_minus_1",
-            u32::try_from(seq.order_hint_bits_minus_1).map_err(|_| {
-                PlanToVaAv1Error::FieldOverflow {
-                    field: "order_hint_bits_minus_1",
-                    value: 0,
-                }
-            })?,
-        )?
-    } else {
-        0
-    };
-    pic_params.bit_depth_idx = bit_depth_idx;
-    pic_params.matrix_coefficients = color.matrix_coefficients as u8;
-    pic_params.seq_info_fields = SeqInfoFieldsAV1 {
+fn seq_info_fields(seq: &ParsedSequenceHeaderAv1) -> u32 {
+    let color = &seq.color_config;
+    SeqInfoFieldsAV1 {
         still_picture: seq.still_picture,
         use_128x128_superblock: seq.use_128x128_superblock,
         enable_filter_intra: seq.enable_filter_intra,
@@ -535,44 +642,11 @@ pub fn plan_to_va_av1(
         chroma_sample_position: color.chroma_sample_position as u8,
         film_grain_params_present: seq.film_grain_params_present,
     }
-    .pack();
-    pic_params.current_frame = setup_surface;
-    // Equal to `current_frame`: `apply_grain` is 0 on every frame that reaches here.
-    pic_params.current_display_picture = setup_surface;
-    pic_params.anchor_frames_num = 0;
-    pic_params.anchor_frames_list = std::ptr::null_mut();
-    // Upscaled width: libavcodec's `frame_width_minus_1`. AV1 5.9.8 reads
-    // this into `UpscaledWidth` before superres divides it to `FrameWidth`.
-    pic_params.frame_width_minus1 = narrow16(
-        "frame_width_minus1",
-        h.upscaled_width
-            .checked_sub(1)
-            .ok_or(PlanToVaAv1Error::FieldOverflow {
-                field: "upscaled_width",
-                value: 0,
-            })?,
-    )?;
-    pic_params.frame_height_minus1 = narrow16(
-        "frame_height_minus1",
-        h.frame_height
-            .checked_sub(1)
-            .ok_or(PlanToVaAv1Error::FieldOverflow {
-                field: "frame_height",
-                value: 0,
-            })?,
-    )?;
-    pic_params.ref_frame_map = ref_frame_map;
-    pic_params.ref_frame_idx = ref_frame_idx;
-    pic_params.primary_ref_frame = narrow("primary_ref_frame", h.primary_ref_frame)?;
-    pic_params.order_hint = narrow("order_hint", h.order_hint)?;
-    pic_params.seg_info = seg_info;
-    pic_params.tile_cols = narrow("tile_cols", t.tile_cols)?;
-    pic_params.tile_rows = narrow("tile_rows", t.tile_rows)?;
-    pic_params.width_in_sbs_minus_1 = width_in_sbs_minus_1;
-    pic_params.height_in_sbs_minus_1 = height_in_sbs_minus_1;
-    pic_params.context_update_tile_id =
-        narrow16("context_update_tile_id", t.context_update_tile_id)?;
-    pic_params.pic_info_fields = PicInfoFieldsAV1 {
+    .pack()
+}
+
+fn frame_flags(h: &ParsedFrameHeaderAv1) -> u32 {
+    PicInfoFieldsAV1 {
         frame_type: h.frame_type as u8,
         show_frame: h.show_frame,
         showable_frame: h.showable_frame,
@@ -586,19 +660,15 @@ pub fn plan_to_va_av1(
         is_motion_mode_switchable: h.is_motion_mode_switchable,
         use_ref_frame_mvs: h.use_ref_frame_mvs,
         disable_frame_end_update_cdf: h.disable_frame_end_update_cdf,
-        uniform_tile_spacing_flag: t.uniform_tile_spacing_flag,
+        uniform_tile_spacing_flag: h.tile_info.uniform_tile_spacing_flag,
         allow_warped_motion: h.allow_warped_motion,
         large_scale_tile: false,
     }
-    .pack();
-    // Real denominator, or `SUPERRES_NUM` when superres is off. libva
-    // documents 8 there and 9..=16 otherwise; 0 is outside the range.
-    pic_params.superres_scale_denominator = if h.use_superres {
-        narrow("superres_denom", h.superres_denom)?
-    } else {
-        SUPERRES_NUM
-    };
-    pic_params.interp_filter = h.interpolation_filter as u8;
+    .pack()
+}
+
+fn loop_filter(h: &ParsedFrameHeaderAv1, pic_params: &mut VaDecPictureParameterBufferAV1) {
+    let lf = &h.loop_filter_params;
     pic_params.filter_level = [lf.loop_filter_level[0], lf.loop_filter_level[1]];
     pic_params.filter_level_u = lf.loop_filter_level[2];
     pic_params.filter_level_v = lf.loop_filter_level[3];
@@ -610,6 +680,16 @@ pub fn plan_to_va_av1(
     .pack();
     pic_params.ref_deltas = lf.loop_filter_ref_deltas;
     pic_params.mode_deltas = lf.loop_filter_mode_deltas;
+}
+
+/// Quantizer indices and matrices, plus the mode-control word that carries
+/// the delta-q and delta-lf switches.
+fn quantization(
+    h: &ParsedFrameHeaderAv1,
+    pic_params: &mut VaDecPictureParameterBufferAV1,
+) -> Result<(), PlanToVaAv1Error> {
+    let q = &h.quantization_params;
+    let lf = &h.loop_filter_params;
     pic_params.base_qindex = narrow("base_qindex", q.base_q_idx)?;
     // `su(1+6)`: parser cannot emit outside -63..=63, so this cannot truncate.
     pic_params.y_dc_delta_q = q.delta_q_y_dc as i8;
@@ -638,13 +718,12 @@ pub fn plan_to_va_av1(
         skip_mode_present: h.skip_mode_present,
     }
     .pack();
-    // Parser holds `CdefDamping` (coded + 3); libva wants the coded value.
-    pic_params.cdef_damping_minus_3 =
-        narrow("cdef_damping_minus_3", c.cdef_damping.saturating_sub(3))?;
-    pic_params.cdef_bits = narrow("cdef_bits", c.cdef_bits)?;
-    pic_params.cdef_y_strengths = cdef_y_strengths;
-    pic_params.cdef_uv_strengths = cdef_uv_strengths;
-    pic_params.loop_restoration_fields = LoopRestorationFieldsAV1 {
+    Ok(())
+}
+
+fn loop_restoration(h: &ParsedFrameHeaderAv1) -> u16 {
+    let lr = &h.loop_restoration_params;
+    LoopRestorationFieldsAV1 {
         // Parser `FrameRestorationType` is the spec's; no remap.
         // [`LoopRestorationFieldsAV1`] documents libavcodec's coded-`lr_type` swap.
         yframe_restoration_type: lr.frame_restoration_type[0] as u8,
@@ -653,19 +732,7 @@ pub fn plan_to_va_av1(
         lr_unit_shift: lr.lr_unit_shift,
         lr_uv_shift: lr.lr_uv_shift,
     }
-    .pack();
-    pic_params.wm = wm;
-    // Zeroed: `apply_grain` is 0 here; libva documents that as set the rest
-    // to zero and ignore.
-    pic_params.film_grain_info.film_grain_info_fields = FilmGrainInfoFieldsAV1::default().pack();
-
-    Ok(DecodePlanVaAv1 {
-        pic_params,
-        tile_groups,
-        setup_slot,
-        setup_id,
-        substituted_refs,
-    })
+    .pack()
 }
 
 #[cfg(test)]

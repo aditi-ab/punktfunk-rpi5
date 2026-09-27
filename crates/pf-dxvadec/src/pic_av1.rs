@@ -20,6 +20,8 @@
 use pf_bitstream::av1::coded_cdef_sec_strength;
 use pf_bitstream::av1::AuPlan;
 use pf_bitstream::av1::FrameType;
+use pf_bitstream::av1::ParsedFrameHeader;
+use pf_bitstream::av1::ParsedSequenceHeader;
 use pf_bitstream::av1::PicId;
 use pf_bitstream::av1::NUM_REF_SLOTS;
 use pf_bitstream::av1::REFS_PER_FRAME;
@@ -174,7 +176,8 @@ fn narrow16(field: &'static str, value: u32) -> Result<u16, PlanToDxvaAv1Error> 
     u16::try_from(value).map_err(|_| PlanToDxvaAv1Error::FieldOverflow { field, value })
 }
 
-/// Convert one planned AV1 frame.
+/// Convert one planned AV1 frame: one helper per picture-parameter section,
+/// assembled here.
 ///
 /// `au` is the access unit `plan` was planned from: tile-control records need
 /// per-tile byte ranges from each group's `tile_size_minus_1` walk, which the
@@ -192,9 +195,106 @@ pub fn plan_to_dxva_av1(
     let h = &*plan.header;
     let seq = &*plan.sequence;
 
-    // Resolve before any mutation. `RefFrameMapTextureIndex` is the whole
-    // store by SLOT — same job as `RefFrameList`; an LTR no slice names still
-    // has to appear.
+    let (ref_frame_map, frame_refs) = refs(plan, slots)?;
+    let (tiles, tile_records, bitstream) = tiles(au, plan)?;
+    let loop_filter = loop_filter(h);
+    let quantization = quantization(h)?;
+    let cdef = cdef(h)?;
+    let segmentation = segmentation(h);
+    let film_grain = film_grain(h, seq)?;
+
+    // Hold every removal; release nothing here. A named picture this refresh
+    // displaces is still in `ref_frame_map`; freeing it hands the surface to
+    // `setup_slot`. `dpb.removed` is a subset of that store (planner snapshot
+    // before mutation); `setup_id` cannot also be a displaced id.
+    let release_after_decode: Vec<PicId> = plan
+        .dpb
+        .removed
+        .iter()
+        .copied()
+        .filter(|id| *id != setup_id)
+        .collect();
+    let setup_slot = match slots.slot_of(setup_id) {
+        Some(existing) => existing,
+        None => slots.assign(setup_id)?,
+    };
+
+    let color = &seq.color_config;
+    let mut pic_params = PicParamsAv1::zeroed();
+    // Upscaled width. libavcodec sends coded `FrameWidth` (`avctx->width`).
+    // Equal when superres is off (7.20), which is every stream here; revisit
+    // with a superres vector, not by reading.
+    pic_params.width = h.upscaled_width;
+    pic_params.height = h.frame_height;
+    pic_params.max_width = u32::from(seq.max_frame_width_minus_1) + 1;
+    pic_params.max_height = u32::from(seq.max_frame_height_minus_1) + 1;
+    pic_params.curr_pic_texture_index = setup_slot;
+    // Real denominator, not the coded one; `SUPERRES_NUM` when superres is off.
+    pic_params.superres_denom = if h.use_superres {
+        narrow("superres_denom", h.superres_denom)?
+    } else {
+        SUPERRES_NUM
+    };
+    pic_params.bitdepth = if color.high_bitdepth {
+        if color.twelve_bit {
+            12
+        } else {
+            10
+        }
+    } else {
+        8
+    };
+    pic_params.seq_profile = seq.seq_profile as u8;
+    pic_params.tiles = tiles;
+    (pic_params.coding, pic_params.format) = frame_flags(h, seq);
+    pic_params.primary_ref_frame = narrow("primary_ref_frame", h.primary_ref_frame)?;
+    pic_params.order_hint = narrow("order_hint", h.order_hint)?;
+    pic_params.order_hint_bits = if seq.enable_order_hint {
+        // Parser types this signed; a negative would be a parse bug, and
+        // wrapping it unsigned here would hide that.
+        narrow(
+            "order_hint_bits",
+            u32::try_from(seq.order_hint_bits_minus_1).map_err(|_| {
+                PlanToDxvaAv1Error::FieldOverflow {
+                    field: "order_hint_bits_minus_1",
+                    value: 0,
+                }
+            })? + 1,
+        )?
+    } else {
+        0
+    };
+    pic_params.frame_refs = frame_refs;
+    pic_params.ref_frame_map_texture_index = ref_frame_map;
+    pic_params.loop_filter = loop_filter;
+    pic_params.quantization = quantization;
+    pic_params.cdef = cdef;
+    pic_params.interp_filter = h.interpolation_filter as u8;
+    pic_params.segmentation = segmentation;
+    pic_params.film_grain = film_grain;
+    // Leave zero. libavcodec comments the assignment out for AV1 ("breaks
+    // decoding on some drivers"); Chromium ships zero too ("crashes"). This
+    // rung does not even take a number (fn docs).
+
+    Ok(DecodePlanDxvaAv1 {
+        pic_params,
+        tiles: tile_records,
+        bitstream,
+        setup_slot,
+        setup_id,
+        release_after_decode,
+    })
+}
+
+/// `RefFrameMapTextureIndex` by SLOT and `frame_refs` by NAME (module docs).
+/// Read-only on `slots`.
+fn refs(
+    plan: &AuPlan,
+    slots: &SlotMap,
+) -> Result<([u8; NUM_REF_SLOTS], [PicEntryAv1; REFS_PER_FRAME]), PlanToDxvaAv1Error> {
+    let h = &*plan.header;
+    // `RefFrameMapTextureIndex` is the whole store by SLOT — same job as
+    // `RefFrameList`; an LTR no slice names still has to appear.
     let mut ref_frame_map = [UNUSED_INDEX; NUM_REF_SLOTS];
     for r in &plan.dpb_refs {
         let slot = slots
@@ -245,7 +345,15 @@ pub fn plan_to_dxva_av1(
             };
         }
     }
+    Ok((ref_frame_map, frame_refs))
+}
 
+/// The tile grid, one control record per TILE, and the walked byte ranges.
+fn tiles(
+    au: &[u8],
+    plan: &AuPlan,
+) -> Result<(TilesAv1, Vec<TileAv1>, Av1Bitstream), PlanToDxvaAv1Error> {
+    let h = &*plan.header;
     let t = &h.tile_info;
     if t.tile_cols as usize > MAX_TILE_DIM || t.tile_rows as usize > MAX_TILE_DIM {
         return Err(PlanToDxvaAv1Error::TooManyTiles {
@@ -324,7 +432,11 @@ pub fn plan_to_dxva_av1(
             }
         })?;
     }
+    Ok((tiles, tile_records, bitstream))
+}
 
+/// Loop filter, plus the loop-restoration fields DXVA keeps in the same block.
+fn loop_filter(h: &ParsedFrameHeader) -> LoopFilterAv1 {
     let lf = &h.loop_filter_params;
     let mut loop_filter = LoopFilterAv1::zeroed();
     loop_filter.filter_level = [lf.loop_filter_level[0], lf.loop_filter_level[1]];
@@ -354,7 +466,10 @@ pub fn plan_to_dxva_av1(
             LOG2_RESTORATION_UNIT_SIZE_UNUSED
         };
     }
+    loop_filter
+}
 
+fn quantization(h: &ParsedFrameHeader) -> Result<QuantizationAv1, PlanToDxvaAv1Error> {
     let q = &h.quantization_params;
     let mut quantization = QuantizationAv1::zeroed();
     quantization.control_flags = QuantizationFlagsAv1 {
@@ -382,7 +497,13 @@ pub fn plan_to_dxva_av1(
     quantization.qm_y = qm_y;
     quantization.qm_u = qm_u;
     quantization.qm_v = qm_v;
+    Ok(quantization)
+}
 
+/// Two fields packed into a byte. `secondary` is two bits: AV1 5.9.19
+/// rewrites a coded 3 to 4 in place, and `& 0x3` would turn the strongest
+/// filter into none. `coded_cdef_sec_strength` inverts that.
+fn cdef(h: &ParsedFrameHeader) -> Result<CdefAv1, PlanToDxvaAv1Error> {
     let c = &h.cdef_params;
     let mut cdef = CdefAv1::zeroed();
     cdef.control_flags = CdefFlagsAv1 {
@@ -390,9 +511,6 @@ pub fn plan_to_dxva_av1(
         bits: narrow("cdef_bits", c.cdef_bits)?,
     }
     .pack();
-    // Two fields packed into a byte. `secondary` is two bits: AV1 5.9.19
-    // rewrites a coded 3 to 4 in place, and `& 0x3` would turn the strongest
-    // filter into none. `coded_cdef_sec_strength` inverts that.
     for i in 0..8 {
         cdef.y_strengths[i] = CdefStrength {
             primary: c.cdef_y_pri_strength[i] as u8,
@@ -405,7 +523,10 @@ pub fn plan_to_dxva_av1(
         }
         .pack();
     }
+    Ok(cdef)
+}
 
+fn segmentation(h: &ParsedFrameHeader) -> SegmentationAv1 {
     let s = &h.segmentation_params;
     let mut segmentation = SegmentationAv1::zeroed();
     segmentation.control_flags = SegmentationFlagsAv1 {
@@ -430,125 +551,94 @@ pub fn plan_to_dxva_av1(
         .pack();
         segmentation.feature_data[seg] = s.feature_data[seg];
     }
+    segmentation
+}
 
-    // Same film-grain gate as Vulkan: sequence present AND frame apply.
-    let fg_on = seq.film_grain_params_present && h.film_grain_params.apply_grain;
+/// Same film-grain gate as Vulkan: sequence present AND frame apply.
+/// Otherwise the block stays zero.
+fn film_grain(
+    h: &ParsedFrameHeader,
+    seq: &ParsedSequenceHeader,
+) -> Result<FilmGrainAv1, PlanToDxvaAv1Error> {
     let mut film_grain = FilmGrainAv1::zeroed();
-    if fg_on {
-        let fg = &h.film_grain_params;
-        film_grain.control_flags = FilmGrainFlagsAv1 {
-            apply_grain: true,
-            scaling_shift_minus8: fg.grain_scaling_minus_8,
-            chroma_scaling_from_luma: fg.chroma_scaling_from_luma,
-            ar_coeff_lag: narrow("ar_coeff_lag", fg.ar_coeff_lag)?,
-            ar_coeff_shift_minus6: fg.ar_coeff_shift_minus_6,
-            grain_scale_shift: fg.grain_scale_shift,
-            overlap_flag: fg.overlap_flag,
-            clip_to_restricted_range: fg.clip_to_restricted_range,
-            matrix_coeff_is_identity: seq.color_config.matrix_coefficients as u32 == 0,
-        }
-        .pack();
-        film_grain.grain_seed = fg.grain_seed;
-        // DXVA wants [value, scaling] pairs; parser/Vulkan keep parallel
-        // arrays. Over-count is refused, not truncated: fewer points is
-        // different grain, not less grain.
-        let pts = |name: &'static str, n: u8, cap: usize| -> Result<usize, PlanToDxvaAv1Error> {
-            if usize::from(n) > cap {
-                return Err(PlanToDxvaAv1Error::FieldOverflow {
-                    field: name,
-                    value: u32::from(n),
-                });
-            }
-            Ok(usize::from(n))
-        };
-        let ny = pts(
-            "num_y_points",
-            fg.num_y_points,
-            film_grain.scaling_points_y.len(),
-        )?;
-        let ncb = pts(
-            "num_cb_points",
-            fg.num_cb_points,
-            film_grain.scaling_points_cb.len(),
-        )?;
-        let ncr = pts(
-            "num_cr_points",
-            fg.num_cr_points,
-            film_grain.scaling_points_cr.len(),
-        )?;
-        for i in 0..ny {
-            film_grain.scaling_points_y[i] = [fg.point_y_value[i], fg.point_y_scaling[i]];
-        }
-        for i in 0..ncb {
-            film_grain.scaling_points_cb[i] = [fg.point_cb_value[i], fg.point_cb_scaling[i]];
-        }
-        for i in 0..ncr {
-            film_grain.scaling_points_cr[i] = [fg.point_cr_value[i], fg.point_cr_scaling[i]];
-        }
-        film_grain.num_y_points = fg.num_y_points;
-        film_grain.num_cb_points = fg.num_cb_points;
-        film_grain.num_cr_points = fg.num_cr_points;
-        film_grain
-            .ar_coeffs_y
-            .copy_from_slice(&fg.ar_coeffs_y_plus_128[..24]);
-        film_grain
-            .ar_coeffs_cb
-            .copy_from_slice(&fg.ar_coeffs_cb_plus_128[..25]);
-        film_grain
-            .ar_coeffs_cr
-            .copy_from_slice(&fg.ar_coeffs_cr_plus_128[..25]);
-        film_grain.cb_mult = fg.cb_mult;
-        film_grain.cb_luma_mult = fg.cb_luma_mult;
-        film_grain.cr_mult = fg.cr_mult;
-        film_grain.cr_luma_mult = fg.cr_luma_mult;
-        film_grain.cb_offset = fg.cb_offset as i16;
-        film_grain.cr_offset = fg.cr_offset as i16;
+    if !(seq.film_grain_params_present && h.film_grain_params.apply_grain) {
+        return Ok(film_grain);
     }
-
-    // Hold every removal; release nothing here. A named picture this refresh
-    // displaces is still in `ref_frame_map`; freeing it hands the surface to
-    // `setup_slot`. `dpb.removed` is a subset of that store (planner snapshot
-    // before mutation); `setup_id` cannot also be a displaced id.
-    let release_after_decode: Vec<PicId> = plan
-        .dpb
-        .removed
-        .iter()
-        .copied()
-        .filter(|id| *id != setup_id)
-        .collect();
-    let setup_slot = match slots.slot_of(setup_id) {
-        Some(existing) => existing,
-        None => slots.assign(setup_id)?,
-    };
-
-    let color = &seq.color_config;
-    let mut pic_params = PicParamsAv1::zeroed();
-    // Upscaled width. libavcodec sends coded `FrameWidth` (`avctx->width`).
-    // Equal when superres is off (7.20), which is every stream here; revisit
-    // with a superres vector, not by reading.
-    pic_params.width = h.upscaled_width;
-    pic_params.height = h.frame_height;
-    pic_params.max_width = u32::from(seq.max_frame_width_minus_1) + 1;
-    pic_params.max_height = u32::from(seq.max_frame_height_minus_1) + 1;
-    pic_params.curr_pic_texture_index = setup_slot;
-    // Real denominator, not the coded one; `SUPERRES_NUM` when superres is off.
-    pic_params.superres_denom = if h.use_superres {
-        narrow("superres_denom", h.superres_denom)?
-    } else {
-        SUPERRES_NUM
-    };
-    pic_params.bitdepth = if color.high_bitdepth {
-        if color.twelve_bit {
-            12
-        } else {
-            10
+    let fg = &h.film_grain_params;
+    film_grain.control_flags = FilmGrainFlagsAv1 {
+        apply_grain: true,
+        scaling_shift_minus8: fg.grain_scaling_minus_8,
+        chroma_scaling_from_luma: fg.chroma_scaling_from_luma,
+        ar_coeff_lag: narrow("ar_coeff_lag", fg.ar_coeff_lag)?,
+        ar_coeff_shift_minus6: fg.ar_coeff_shift_minus_6,
+        grain_scale_shift: fg.grain_scale_shift,
+        overlap_flag: fg.overlap_flag,
+        clip_to_restricted_range: fg.clip_to_restricted_range,
+        matrix_coeff_is_identity: seq.color_config.matrix_coefficients as u32 == 0,
+    }
+    .pack();
+    film_grain.grain_seed = fg.grain_seed;
+    // DXVA wants [value, scaling] pairs; parser/Vulkan keep parallel
+    // arrays. Over-count is refused, not truncated: fewer points is
+    // different grain, not less grain.
+    let pts = |name: &'static str, n: u8, cap: usize| -> Result<usize, PlanToDxvaAv1Error> {
+        if usize::from(n) > cap {
+            return Err(PlanToDxvaAv1Error::FieldOverflow {
+                field: name,
+                value: u32::from(n),
+            });
         }
-    } else {
-        8
+        Ok(usize::from(n))
     };
-    pic_params.seq_profile = seq.seq_profile as u8;
-    pic_params.tiles = tiles;
-    pic_params.coding = CodingFlagsAv1 {
+    let ny = pts(
+        "num_y_points",
+        fg.num_y_points,
+        film_grain.scaling_points_y.len(),
+    )?;
+    let ncb = pts(
+        "num_cb_points",
+        fg.num_cb_points,
+        film_grain.scaling_points_cb.len(),
+    )?;
+    let ncr = pts(
+        "num_cr_points",
+        fg.num_cr_points,
+        film_grain.scaling_points_cr.len(),
+    )?;
+    for i in 0..ny {
+        film_grain.scaling_points_y[i] = [fg.point_y_value[i], fg.point_y_scaling[i]];
+    }
+    for i in 0..ncb {
+        film_grain.scaling_points_cb[i] = [fg.point_cb_value[i], fg.point_cb_scaling[i]];
+    }
+    for i in 0..ncr {
+        film_grain.scaling_points_cr[i] = [fg.point_cr_value[i], fg.point_cr_scaling[i]];
+    }
+    film_grain.num_y_points = fg.num_y_points;
+    film_grain.num_cb_points = fg.num_cb_points;
+    film_grain.num_cr_points = fg.num_cr_points;
+    film_grain
+        .ar_coeffs_y
+        .copy_from_slice(&fg.ar_coeffs_y_plus_128[..24]);
+    film_grain
+        .ar_coeffs_cb
+        .copy_from_slice(&fg.ar_coeffs_cb_plus_128[..25]);
+    film_grain
+        .ar_coeffs_cr
+        .copy_from_slice(&fg.ar_coeffs_cr_plus_128[..25]);
+    film_grain.cb_mult = fg.cb_mult;
+    film_grain.cb_luma_mult = fg.cb_luma_mult;
+    film_grain.cr_mult = fg.cr_mult;
+    film_grain.cr_luma_mult = fg.cr_luma_mult;
+    film_grain.cb_offset = fg.cb_offset as i16;
+    film_grain.cr_offset = fg.cr_offset as i16;
+    Ok(film_grain)
+}
+
+/// The packed `coding` and `format` words.
+fn frame_flags(h: &ParsedFrameHeader, seq: &ParsedSequenceHeader) -> (u32, u8) {
+    let color = &seq.color_config;
+    let coding = CodingFlagsAv1 {
         use_128x128_superblock: seq.use_128x128_superblock,
         intra_edge_filter: seq.enable_intra_edge_filter,
         interintra_compound: seq.enable_interintra_compound,
@@ -576,11 +666,11 @@ pub fn plan_to_dxva_av1(
         enable_ref_frame_mvs: seq.enable_ref_frame_mvs,
         // Literal 1, not `refresh_frame_flags != 0`. libavcodec writes 1;
         // Chromium writes `!(show_existing && KEY)`, which is also 1 here
-        // (`NoDecode` above). A no-refresh frame is legal AV1.
+        // (`NoDecode` in the caller). A no-refresh frame is legal AV1.
         reference_frame_update: true,
     }
     .pack();
-    pic_params.format = FormatFlagsAv1 {
+    let format = FormatFlagsAv1 {
         frame_type: h.frame_type as u8,
         show_frame: h.show_frame,
         showable_frame: h.showable_frame,
@@ -589,43 +679,7 @@ pub fn plan_to_dxva_av1(
         mono_chrome: color.mono_chrome,
     }
     .pack();
-    pic_params.primary_ref_frame = narrow("primary_ref_frame", h.primary_ref_frame)?;
-    pic_params.order_hint = narrow("order_hint", h.order_hint)?;
-    pic_params.order_hint_bits = if seq.enable_order_hint {
-        // Parser types this signed; a negative would be a parse bug, and
-        // wrapping it unsigned here would hide that.
-        narrow(
-            "order_hint_bits",
-            u32::try_from(seq.order_hint_bits_minus_1).map_err(|_| {
-                PlanToDxvaAv1Error::FieldOverflow {
-                    field: "order_hint_bits_minus_1",
-                    value: 0,
-                }
-            })? + 1,
-        )?
-    } else {
-        0
-    };
-    pic_params.frame_refs = frame_refs;
-    pic_params.ref_frame_map_texture_index = ref_frame_map;
-    pic_params.loop_filter = loop_filter;
-    pic_params.quantization = quantization;
-    pic_params.cdef = cdef;
-    pic_params.interp_filter = h.interpolation_filter as u8;
-    pic_params.segmentation = segmentation;
-    pic_params.film_grain = film_grain;
-    // Leave zero. libavcodec comments the assignment out for AV1 ("breaks
-    // decoding on some drivers"); Chromium ships zero too ("crashes"). This
-    // rung does not even take a number (fn docs).
-
-    Ok(DecodePlanDxvaAv1 {
-        pic_params,
-        tiles: tile_records,
-        bitstream,
-        setup_slot,
-        setup_id,
-        release_after_decode,
-    })
+    (coding, format)
 }
 
 /// `SUPERRES_NUM` (AV1 spec): the denominator that means "no upscaling".
