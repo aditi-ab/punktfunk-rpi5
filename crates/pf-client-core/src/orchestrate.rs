@@ -3,7 +3,7 @@
 //!
 //! A [`ConnectPlan`] is built from a card click, a CLI verb, or a URL. Front-ends
 //! render; they do not decide when to prompt, how long to wait for a sleeping host,
-//! or what counts as a refusal. [`UiDelegate`] is the presentation surface.
+//! or what counts as a refusal. A session exit reaches them as a [`ConnectOutcome`].
 //!
 //! Wake cadence lives on [`WAKE_TIMEOUT_SECS`] / [`WAKE_RESEND_SECS`].
 
@@ -454,15 +454,6 @@ impl WakeWait {
     }
 }
 
-/// Front-end presentation. Nothing here decides policy.
-pub trait UiDelegate {
-    /// Unknown or never-pinned host. Return true to enter the trust flow. A
-    /// non-interactive front-end returns false — refusing is always safe.
-    fn confirm_unknown_host(&mut self, host: &UnknownHost) -> bool;
-    fn wake_progress(&mut self, host: &HostTarget, tick: WakeTick);
-    fn report(&mut self, outcome: &ConnectOutcome);
-}
-
 /// How a connect finished. Front-ends map this onto their own surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectOutcome {
@@ -471,8 +462,52 @@ pub enum ConnectOutcome {
     ConnectFailed(String),
     /// No pin, or the pin no longer matches. Never retried silently.
     TrustRejected(String),
-    RendererFailed(String),
+    /// The session died without a contract line. `-1` = no exit code (a Unix signal).
+    RendererFailed {
+        code: i32,
+    },
+    /// Our own kill: Disconnect or a cancelled request.
     Cancelled,
+}
+
+impl ConnectOutcome {
+    /// Classify a session exit: its code, the `error`/`ended` lines it spoke, and whether
+    /// we killed it. A contract line says more than a code. `cancelled` covers whatever
+    /// code our kill leaves: `-1` from a Unix signal, `1` from Windows' TerminateProcess.
+    pub fn from_exit(
+        code: i32,
+        error: Option<(String, bool)>,
+        ended: Option<String>,
+        cancelled: bool,
+    ) -> ConnectOutcome {
+        match (code, error) {
+            (_, Some((msg, true))) => ConnectOutcome::TrustRejected(msg),
+            (_, Some((msg, false))) => ConnectOutcome::ConnectFailed(msg),
+            (0, None) => ConnectOutcome::Ended(ended),
+            _ if cancelled => ConnectOutcome::Cancelled,
+            (code, None) => ConnectOutcome::RendererFailed { code },
+        }
+    }
+
+    /// Whether the dial-first wake fallback runs: the dial failed, or the session died
+    /// without a word. A trust rejection means the host answered; `-1` is a system kill.
+    pub fn warrants_wake(&self) -> bool {
+        match self {
+            ConnectOutcome::ConnectFailed(_) => true,
+            ConnectOutcome::RendererFailed { code } => *code != -1,
+            _ => false,
+        }
+    }
+
+    /// How a session that died silently went, for a banner. An NTSTATUS crash reads in
+    /// hex, the form the Event Log and the crash filter use.
+    pub fn exit_phrase(code: i32) -> String {
+        match code as u32 {
+            0xC000_0005 => "crashed with an access violation (0xC0000005)".to_string(),
+            c if code < 0 => format!("died with exception 0x{c:08X}"),
+            _ => format!("exited with code {code}"),
+        }
+    }
 }
 
 /// Everything a session needs, resolved by the caller — what `--resolved-spec`
@@ -549,13 +584,15 @@ impl ResolvedSpec {
     }
 }
 
-/// One event from the session child's stdout contract (`{"ready":true}`,
+/// One event from the session child's stdout contract (`{"ready":true}`, `stats-json:`,
 /// `{"error":…}`, `{"ended":…}`, then EOF and an exit code). Parsed once so
 /// shells cannot disagree about what "ready" or "trust rejected" means.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SessionEvent {
     /// First frame presented — the stream is up.
     Ready,
+    /// One `stats-json:` window, once a second.
+    Stats(Box<punktfunk_core::hud::StatsSnapshot>),
     Error {
         msg: String,
         trust_rejected: bool,
@@ -572,8 +609,14 @@ pub enum SessionEvent {
     Exited(i32),
 }
 
-/// Parse one stdout line of the session contract. `None` for `stats:` and stray output.
+/// Parse one stdout line of the session contract. `None` for the text `stats:` line, which
+/// is for a person reading a log, and for stray output.
 pub fn parse_session_line(line: &str) -> Option<SessionEvent> {
+    if let Some(json) = line.strip_prefix("stats-json: ") {
+        return serde_json::from_str(json)
+            .ok()
+            .map(|s| SessionEvent::Stats(Box::new(s)));
+    }
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     if v.get("ready").and_then(|r| r.as_bool()) == Some(true) {
         return Some(SessionEvent::Ready);
@@ -644,21 +687,19 @@ impl CancelHandle {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
+
+    /// Whether a child is spawned and not yet reaped.
+    pub fn is_running(&self) -> bool {
+        self.child.lock().unwrap().is_some()
+    }
 }
 
-/// Spawns the session and supervises stdout on a reader thread. `cancel` accepts
-/// cancellation before or after the child is armed. [`SessionEvent::Exited`] always
-/// arrives, and `None` creates a fresh handle.
-pub fn spawn_session(
-    plan: &ConnectPlan,
-    cancel: Option<CancelHandle>,
-    on_event: impl FnMut(SessionEvent) + Send + 'static,
-) -> Result<CancelHandle, String> {
+/// The session command for `plan`, and the `--resolved-spec` temp it names. Spec mode: the
+/// child reads no stores and cannot disagree about a file either of us might write. A failed
+/// write is not fatal — the child's compat path resolves the same values through the same helper.
+pub fn session_command(plan: &ConnectPlan) -> (Command, Option<std::path::PathBuf>) {
     let mut cmd = Command::new(session_binary());
     let mut args = plan.session_args();
-    // Spec mode: the child reads no stores and cannot disagree about a file either
-    // of us might write. A failed write is not fatal — the child's compat path
-    // resolves the same values through the same helper.
     let spec_path = match plan.spec(plan.clipboard).write_temp() {
         Ok(path) => {
             args.push("--resolved-spec".into());
@@ -670,14 +711,42 @@ pub fn spawn_session(
             None
         }
     };
-    cmd.args(args)
-        .stdin(Stdio::null())
+    cmd.args(args);
+    (cmd, spec_path)
+}
+
+/// Spawns the session for `plan` and supervises it. See [`spawn_child`].
+pub fn spawn_session(
+    plan: &ConnectPlan,
+    cancel: Option<CancelHandle>,
+    on_event: impl FnMut(SessionEvent) + Send + 'static,
+) -> Result<CancelHandle, String> {
+    let (cmd, spec_path) = session_command(plan);
+    let slot = spawn_child(cmd, spec_path, cancel, std::io::stderr(), on_event)?;
+    tracing::info!(
+        host = %plan.host.addr, port = plan.host.port,
+        preset = plan.preset.as_ref().map(|p| p.name.as_str()).unwrap_or("-"),
+        "session binary spawned"
+    );
+    Ok(slot)
+}
+
+/// Spawns a session command and supervises its stdout contract on a reader thread.
+/// Stderr goes to `stderr_sink` and the log ring. `spec_path` is deleted once the child
+/// exits, or at once if it never starts. `cancel` accepts cancellation before or after the
+/// child is armed; `None` creates a fresh handle. [`SessionEvent::Exited`] always arrives.
+pub fn spawn_child(
+    mut cmd: Command,
+    spec_path: Option<std::path::PathBuf>,
+    cancel: Option<CancelHandle>,
+    stderr_sink: impl std::io::Write + Send + 'static,
+    on_event: impl FnMut(SessionEvent) + Send + 'static,
+) -> Result<CancelHandle, String> {
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Piped through the ring forwarder, not inherited: a GUI-only log export
         // otherwise holds everything except the stream it was exported about.
         .stderr(Stdio::piped());
-    // The reader thread below deletes the spec once the child is done with it; a spawn that
-    // never gets there has to clean up after itself, or the temp is left for good.
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -688,13 +757,8 @@ pub fn spawn_session(
         }
     };
     if let Some(stderr) = child.stderr.take() {
-        crate::logring::forward_child_stderr(stderr);
+        crate::logring::forward_child_stderr(stderr, stderr_sink);
     }
-    tracing::info!(
-        host = %plan.host.addr, port = plan.host.port,
-        preset = plan.preset.as_ref().map(|p| p.name.as_str()).unwrap_or("-"),
-        "session binary spawned"
-    );
     let stdout = child.stdout.take().expect("piped stdout");
     let slot = cancel.unwrap_or_default();
     *slot.child.lock().unwrap() = Some(child);
@@ -1050,6 +1114,43 @@ mod tests {
     }
 
     #[test]
+    fn session_exits_classify_once() {
+        use ConnectOutcome as O;
+        // A contract line says more than a code.
+        let trust = O::from_exit(3, Some(("pin".into(), true)), None, false);
+        assert_eq!(trust, O::TrustRejected("pin".into()));
+        assert!(!trust.warrants_wake(), "the host answered");
+        let failed = O::from_exit(2, Some(("no route".into(), false)), None, false);
+        assert_eq!(failed, O::ConnectFailed("no route".into()));
+        assert!(failed.warrants_wake());
+        assert_eq!(O::from_exit(0, None, None, false), O::Ended(None));
+        assert_eq!(
+            O::from_exit(0, None, Some("Host ended".into()), false),
+            O::Ended(Some("Host ended".into()))
+        );
+        // Our own kill is silent whatever code it leaves: a Unix signal, or TerminateProcess's 1.
+        assert_eq!(O::from_exit(-1, None, None, true), O::Cancelled);
+        assert_eq!(O::from_exit(1, None, None, true), O::Cancelled);
+        // Anything else that died silently is a failure, never a blank return.
+        let crashed = O::from_exit(1, None, None, false);
+        assert_eq!(crashed, O::RendererFailed { code: 1 });
+        assert!(crashed.warrants_wake());
+        assert!(
+            !O::RendererFailed { code: -1 }.warrants_wake(),
+            "a system kill"
+        );
+    }
+
+    #[test]
+    fn exit_phrase_names_an_ntstatus_in_hex() {
+        assert_eq!(ConnectOutcome::exit_phrase(2), "exited with code 2");
+        let av = ConnectOutcome::exit_phrase(-1073741819);
+        assert!(av.contains("access violation (0xC0000005)"), "{av}");
+        let other = ConnectOutcome::exit_phrase(0xC000_0409u32 as i32);
+        assert!(other.contains("0xC0000409"), "{other}");
+    }
+
+    #[test]
     fn session_contract_lines() {
         assert_eq!(
             parse_session_line(r#"{"ready":true}"#),
@@ -1081,7 +1182,11 @@ mod tests {
         // ignoring it.
         assert_eq!(parse_session_line(r#"{"window":{"w":1600}}"#), None);
         assert_eq!(parse_session_line("stats: 1280×800@60 · 60 fps"), None);
-        assert_eq!(parse_session_line(r#"stats-json: {"received":60}"#), None);
+        // The snapshot is an event; the text line is for a person reading a log.
+        match parse_session_line(r#"stats-json: {"width":1280,"received":60}"#) {
+            Some(SessionEvent::Stats(s)) => assert_eq!((s.width, s.received), (1280, 60)),
+            other => panic!("stats line parsed as {other:?}"),
+        }
         assert_eq!(parse_session_line(""), None);
         assert_eq!(parse_session_line(r#"{"other":1}"#), None);
     }

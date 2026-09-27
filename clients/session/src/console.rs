@@ -193,7 +193,9 @@ pub fn run(target: Option<&str>) -> u8 {
             // host as paired (it was unsaved/discovered), keyed to the fingerprint we pinned.
             if let Some(p) = pending_cb.lock().unwrap().take() {
                 if p.fp_hex == fp_hex {
-                    if let Err(e) = trust::persist_host(&p.name, &p.addr, p.port, &fp_hex, true) {
+                    if let Err(e) =
+                        trust::persist_host(&p.name, &p.addr, p.port, &fp_hex, true, &[])
+                    {
                         tracing::warn!(error = %format!("{e:#}"), "saving the approved host");
                     }
                 }
@@ -710,7 +712,7 @@ impl ServiceState {
                                     .or_else(|| named.iter().find(|(f, _)| f.is_empty()))
                                     .map_or_else(|| addr.clone(), |(_, n)| n.clone());
                                 if let Err(e) =
-                                    trust::persist_host(&name, &addr, port, &fp_hex, true)
+                                    trust::persist_host(&name, &addr, port, &fp_hex, true, &[])
                                 {
                                     tracing::warn!(error = %format!("{e:#}"), "saving the paired host");
                                 }

@@ -3798,7 +3798,6 @@ version = "0.40.0"
 dependencies = [
  "pf-client-core",
  "punktfunk-core",
- "serde_json",
  "test_reactor",
  "tracing",
  "tracing-subscriber",

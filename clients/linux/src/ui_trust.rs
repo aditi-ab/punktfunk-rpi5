@@ -247,7 +247,8 @@ pub fn pin_dialog(
             match rx.recv().await {
                 Ok(Ok(fp)) => {
                     let fp_hex = trust::hex(&fp);
-                    let saved = trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true);
+                    let saved =
+                        trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true, &[]);
                     sender.input(AppMsg::Toast(match saved {
                         Ok(()) => "Paired — connecting…".into(),
                         // The ceremony succeeded and this session will connect; the pairing

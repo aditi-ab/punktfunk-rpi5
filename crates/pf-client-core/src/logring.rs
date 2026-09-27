@@ -209,22 +209,24 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
     }
 }
 
-/// Line-buffered tee of a spawned session child's stderr into ours and the ring.
-/// Returns immediately; the thread dies with the pipe. WinUI has its own
-/// forwarder (it also tees the client log file); this is for `orchestrate`'s spawn.
+/// Line-buffered tee of a spawned session child's stderr into `out` and the ring.
+/// `out` is our stderr, or the WinUI shell's log-file tee. Returns immediately; the
+/// thread dies with the pipe.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-pub fn forward_child_stderr(stderr: impl std::io::Read + Send + 'static) {
+pub fn forward_child_stderr(
+    stderr: impl std::io::Read + Send + 'static,
+    mut out: impl std::io::Write + Send + 'static,
+) {
     let _ = std::thread::Builder::new()
         .name("pf-session-log".into())
         .spawn(move || {
-            use std::io::{BufRead as _, Write as _};
+            use std::io::BufRead as _;
             let mut reader = std::io::BufReader::new(stderr);
             let mut buf = Vec::new();
             // Bytes, not `read_line`: that fails the whole read on one non-UTF-8 byte, which
-            // ended the drain — and a stderr pipe nobody empties fills up and blocks the child
-            // mid-stream.
+            // ends the drain — and a stderr pipe nobody empties blocks the child mid-stream.
             while matches!(reader.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
-                let _ = std::io::stderr().write_all(&buf);
+                let _ = out.write_all(&buf);
                 note(String::from_utf8_lossy(&buf).trim_end().to_string());
                 buf.clear();
             }
@@ -256,6 +258,36 @@ mod tests {
         note("x".repeat(10_000));
         let text = render("h");
         assert!(text.contains('…'));
+    }
+
+    /// A non-UTF-8 byte must not end the drain: the child blocks once its pipe fills.
+    #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+    #[test]
+    fn stderr_forward_drains_past_a_non_utf8_line() {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let _own = RING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let marker = format!("drain-{}", std::process::id());
+        let input = [b"one\n\xff\n".as_slice(), marker.as_bytes(), b"\n"].concat();
+        let sink = Sink::default();
+        forward_child_stderr(std::io::Cursor::new(input.clone()), sink.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let drained = || {
+            *sink.0.lock().unwrap() == input && render("test").contains(&format!("\n{marker}\n"))
+        };
+        while !drained() {
+            assert!(std::time::Instant::now() < deadline, "drain stopped early");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]

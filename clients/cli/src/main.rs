@@ -23,7 +23,7 @@
 mod cli {
     use pf_client_core::deeplink::{self, DeepLink, HostResolution};
     use pf_client_core::orchestrate::{
-        self, ConnectPlan, PlanOutcome, SessionEvent, WakeOutcome, WakeWait,
+        self, ConnectOutcome, ConnectPlan, PlanOutcome, SessionEvent, WakeOutcome, WakeWait,
     };
     use pf_client_core::presets::PresetsFile;
     use pf_client_core::trust::{self, KnownHost, KnownHosts, Settings};
@@ -606,7 +606,7 @@ from the config directory for a true factory reset."
         match trust::pair_with_host(&addr, port, &identity, &pin, &name) {
             Ok(fp) => {
                 let fp_hex = trust::hex(&fp);
-                if let Err(e) = trust::persist_host(&addr, &addr, port, &fp_hex, true) {
+                if let Err(e) = trust::persist_host(&addr, &addr, port, &fp_hex, true, &[]) {
                     eprintln!("couldn't save the host: {e:#}");
                 }
                 trust::forget_placeholder(&addr, port);
@@ -1157,6 +1157,7 @@ from the config directory for a true factory reset."
                                 plan.host.port,
                                 fp_hex,
                                 true,
+                                &[],
                             ) {
                                 eprintln!("couldn't save the host: {e:#}");
                             }
@@ -1169,20 +1170,21 @@ from the config directory for a true factory reset."
                     trust_rejected,
                 } => failure = Some((msg, trust_rejected)),
                 SessionEvent::Ended(reason) => eprintln!("{reason}"),
-                // Persisted by the brain on the way past; nothing to report here.
-                SessionEvent::Window { .. } => {}
+                // The window size is persisted by the brain on the way past.
+                SessionEvent::Window { .. } | SessionEvent::Stats(_) => {}
+                // `ended` is printed as it arrives; its absence changes no exit code.
                 SessionEvent::Exited(code) => {
-                    return match failure {
-                        Some((msg, true)) => {
+                    return match ConnectOutcome::from_exit(code, failure.take(), None, false) {
+                        ConnectOutcome::TrustRejected(msg) => {
                             eprintln!("{msg}");
                             TRUST_REJECTED
                         }
-                        Some((msg, false)) => {
+                        ConnectOutcome::ConnectFailed(msg) => {
                             eprintln!("{msg}");
                             CONNECT_FAILED
                         }
-                        None if code == 0 => OK,
-                        None => RENDERER_FAILED,
+                        ConnectOutcome::RendererFailed { .. } => RENDERER_FAILED,
+                        ConnectOutcome::Ended(_) | ConnectOutcome::Cancelled => OK,
                     };
                 }
             }
