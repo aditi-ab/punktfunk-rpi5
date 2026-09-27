@@ -26,7 +26,7 @@ tracing = "0.1"
 [dev-dependencies]
 # A test writer for the NVENC backend's unit tests (`with_test_writer().try_init()`).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# The PyroWave tests' strict window walk and CPU decoder.
+# Shared test drivers: the PyroWave window walk and decoder, the trait-forwarding guard.
 pf-encode-win = { path = "../pf-encode-win", features = ["test-support"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]

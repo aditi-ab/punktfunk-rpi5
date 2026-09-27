@@ -1752,6 +1752,14 @@ mod pyrowave_remote;
 #[cfg(all(target_os = "linux", feature = "pyrowave"))]
 #[path = "enc/linux/worker.rs"]
 pub mod worker;
+// CPU frames the Linux PyroWave and Vulkan Video tests share.
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(feature = "pyrowave", feature = "vulkan-encode")
+))]
+#[path = "enc/linux/test_frames.rs"]
+mod test_frames;
 // Live tests pairing a `pf_encode_win` backend with what only this crate has
 // (pf-capture's P010 converter).
 #[cfg(all(test, target_os = "windows"))]
@@ -1998,60 +2006,14 @@ mod tests {
         assert_eq!(amd_intel_vulkan_depth(Codec::H264, false, false), None);
     }
 
-    /// Every `Encoder` method must be forwarded by `TrackedEncoder`. An
-    /// unforwarded default silently no-ops — the host loop only holds the
-    /// wrapper. Source-text parse: each item ends at the first column-0 `}`;
-    /// method names sit on a line starting `fn `.
+    /// Every `Encoder` method must be forwarded by `TrackedEncoder`: the host loop only ever
+    /// holds the wrapped box.
     #[test]
     fn tracked_encoder_forwards_every_trait_method() {
-        fn item_block<'a>(src: &'a str, marker: &str) -> &'a str {
-            let start = src
-                .find(marker)
-                .unwrap_or_else(|| panic!("marker {marker:?} not found — update this guard"));
-            let body = &src[start..];
-            let end = body
-                .find("\n}")
-                .unwrap_or_else(|| panic!("no column-0 close brace after {marker:?}"));
-            &body[..end]
-        }
-        fn fn_names(block: &str) -> std::collections::BTreeSet<&str> {
-            block
-                .lines()
-                .map(str::trim_start)
-                .filter(|l| !l.starts_with("//"))
-                .filter_map(|l| l.strip_prefix("fn "))
-                .map(|rest| {
-                    rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                        .next()
-                        .expect("split yields at least one item")
-                })
-                .collect()
-        }
-        // `find` takes the first occurrence: the real impl precedes this test's copy.
-        let trait_fns = fn_names(item_block(
-            include_str!("../../pf-encode-win/src/codec.rs"),
-            "pub trait Encoder: Send {",
-        ));
-        let impl_fns = fn_names(item_block(
+        crate::smoke_pattern::assert_writes_every_encoder_method(
             include_str!("lib.rs"),
             "impl Encoder for TrackedEncoder {",
-        ));
-        assert!(
-            trait_fns.len() >= 12,
-            "only {} trait methods parsed — the extraction markers have rotted, fix the parse \
-             before trusting this guard",
-            trait_fns.len()
         );
-        let missing: Vec<_> = trait_fns.difference(&impl_fns).collect();
-        assert!(
-            missing.is_empty(),
-            "Encoder methods NOT forwarded by TrackedEncoder: {missing:?} — the host loop only \
-             ever holds the wrapped box, so an unforwarded default silently disables the feature \
-             for every session. Forward each one in `impl Encoder for TrackedEncoder`."
-        );
-        // Reverse (impl fn absent from the trait) is a compile error; equality
-        // guards a parse regression.
-        assert_eq!(trait_fns, impl_fns);
     }
 
     /// Resolver alias table. The panicking closure is the laziness contract:

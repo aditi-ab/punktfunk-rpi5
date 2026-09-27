@@ -4554,6 +4554,7 @@ use self::build::{
 #[cfg(test)]
 mod tests {
     use super::{build_h265_rps_s0, intra_refresh_caps, parse_rgb_request, VulkanVideoEncoder};
+    use crate::test_frames::{cpu_frame, cpu_frame_24};
     use crate::{Codec, Encoder};
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 
@@ -4714,22 +4715,6 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(&deltas[..3], &[0, 2, 3]);
         assert_eq!(used, 1 << 1, "POC 6 is the 2nd-newest → S0 index 1");
-    }
-
-    fn cpu_frame(w: u32, h: u32, pts_ns: u64, fill: [u8; 4]) -> CapturedFrame {
-        let mut buf = vec![0u8; (w * h * 4) as usize];
-        for px in buf.chunks_exact_mut(4) {
-            px.copy_from_slice(&fill);
-        }
-        CapturedFrame {
-            provenance: Default::default(),
-            width: w,
-            height: h,
-            pts_ns,
-            format: PixelFormat::Bgrx,
-            payload: FramePayload::Cpu(buf),
-            cursor: None,
-        }
     }
 
     /// BGRX frame of the shared moving texture at `frame` frames of motion
@@ -5198,28 +5183,6 @@ mod tests {
     fn vulkan_smoke_10bit_sdr_av1() {
         if let Some(aus) = run_smoke_10bit_sdr(Codec::Av1) {
             dump_smoke(&aus, "10bit.sdr.obu");
-        }
-    }
-
-    /// 24-bpp packed CPU frame. `rgb` is (r, g, b) regardless of `fmt`'s byte order.
-    fn cpu_frame_24(w: u32, h: u32, pts_ns: u64, rgb: [u8; 3], fmt: PixelFormat) -> CapturedFrame {
-        let px = match fmt {
-            PixelFormat::Rgb => [rgb[0], rgb[1], rgb[2]],
-            PixelFormat::Bgr => [rgb[2], rgb[1], rgb[0]],
-            _ => unreachable!("24-bpp helper"),
-        };
-        let mut buf = vec![0u8; (w * h * 3) as usize];
-        for p in buf.chunks_exact_mut(3) {
-            p.copy_from_slice(&px);
-        }
-        CapturedFrame {
-            provenance: Default::default(),
-            width: w,
-            height: h,
-            pts_ns,
-            format: fmt,
-            payload: FramePayload::Cpu(buf),
-            cursor: None,
         }
     }
 

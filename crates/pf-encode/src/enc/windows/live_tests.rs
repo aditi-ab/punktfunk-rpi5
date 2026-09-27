@@ -6,10 +6,7 @@
 #![allow(dead_code)]
 
 use super::*;
-use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11Texture2D, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-};
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
 
 const VENDOR_AMD: u32 = 0x1002;
@@ -60,30 +57,6 @@ fn amd_d3d11_device() -> Option<ID3D11Device> {
         .ok()?;
     }
     device
-}
-
-/// DEFAULT-usage NV12 texture (uninit GPU memory; content is irrelevant).
-fn nv12_texture(device: &ID3D11Device, w: u32, h: u32) -> ID3D11Texture2D {
-    use windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE;
-    let desc = D3D11_TEXTURE2D_DESC {
-        Width: w,
-        Height: h,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: DXGI_FORMAT_NV12,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-        CPUAccessFlags: 0,
-        MiscFlags: 0,
-    };
-    let mut tex: Option<ID3D11Texture2D> = None;
-    // SAFETY: CreateTexture2D fills the out-param only on success; owned COM, this thread.
-    unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }.expect("NV12 texture");
-    tex.expect("NV12 texture")
 }
 
 /// `p`-quantile of `samples` (µs), sorting in place. `0` when empty.

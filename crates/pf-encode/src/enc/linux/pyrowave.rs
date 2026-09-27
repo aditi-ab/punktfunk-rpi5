@@ -2313,23 +2313,8 @@ mod tests {
     use super::*;
     use crate::pyrowave_ffi::oracle;
     use crate::pyrowave_wire::unwindow;
+    use crate::test_frames::{cpu_frame, cpu_frame_24};
     use pf_frame::PixelFormat;
-
-    fn cpu_frame(w: u32, h: u32, pts_ns: u64, fill: [u8; 4]) -> CapturedFrame {
-        let mut buf = vec![0u8; (w * h * 4) as usize];
-        for px in buf.chunks_exact_mut(4) {
-            px.copy_from_slice(&fill);
-        }
-        CapturedFrame {
-            provenance: Default::default(),
-            width: w,
-            height: h,
-            pts_ns,
-            format: PixelFormat::Bgrx,
-            payload: FramePayload::Cpu(buf),
-            cursor: None,
-        }
-    }
 
     #[test]
     fn in_flight_frame_owns_the_raw_source_hold() {
@@ -2460,28 +2445,6 @@ mod tests {
         enc.submit(&cpu_frame(w, h, 999, [10, 20, 30, 255]))
             .expect("submit after reset");
         assert!(enc.poll().expect("poll").is_some());
-    }
-
-    /// Packed 24-bpp CPU frame. `rgb` is (r, g, b) regardless of `fmt`'s byte order.
-    fn cpu_frame_24(w: u32, h: u32, pts_ns: u64, rgb: [u8; 3], fmt: PixelFormat) -> CapturedFrame {
-        let px = match fmt {
-            PixelFormat::Rgb => [rgb[0], rgb[1], rgb[2]],
-            PixelFormat::Bgr => [rgb[2], rgb[1], rgb[0]],
-            _ => unreachable!("24-bpp helper"),
-        };
-        let mut buf = vec![0u8; (w * h * 3) as usize];
-        for p in buf.chunks_exact_mut(3) {
-            p.copy_from_slice(&px);
-        }
-        CapturedFrame {
-            provenance: Default::default(),
-            width: w,
-            height: h,
-            pts_ns,
-            format: fmt,
-            payload: FramePayload::Cpu(buf),
-            cursor: None,
-        }
     }
 
     /// 24-bpp CPU payloads expand 3→4, not refuse. Channel order is load-bearing: a

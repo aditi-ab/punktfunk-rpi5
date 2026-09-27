@@ -1383,52 +1383,12 @@ mod tests {
     }
 
     /// Every `Encoder` trait method must be written here. The proxy has two backends, so an
-    /// unforwarded default silently disables a feature only on worker-backed sessions. Source-text
-    /// parse, same as `tracked_encoder_forwards_every_trait_method`.
+    /// unforwarded default silently disables a feature only on worker-backed sessions.
     #[test]
     fn the_proxy_writes_every_trait_method() {
-        fn item_block<'a>(src: &'a str, marker: &str) -> &'a str {
-            let start = src
-                .find(marker)
-                .unwrap_or_else(|| panic!("marker {marker:?} not found — update this guard"));
-            let body = &src[start..];
-            let end = body
-                .find("\n}")
-                .unwrap_or_else(|| panic!("no column-0 close brace after {marker:?}"));
-            &body[..end]
-        }
-        fn fn_names(block: &str) -> std::collections::BTreeSet<&str> {
-            block
-                .lines()
-                .map(str::trim_start)
-                .filter(|l| !l.starts_with("//"))
-                .filter_map(|l| l.strip_prefix("fn "))
-                .map(|rest| {
-                    rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                        .next()
-                        .expect("split yields at least one item")
-                })
-                .collect()
-        }
-        let trait_fns = fn_names(item_block(
-            include_str!("../../../../pf-encode-win/src/codec.rs"),
-            "pub trait Encoder: Send {",
-        ));
-        let impl_fns = fn_names(item_block(
+        crate::smoke_pattern::assert_writes_every_encoder_method(
             include_str!("pyrowave_remote.rs"),
             "impl Encoder for RemotePyroWave {",
-        ));
-        assert!(
-            trait_fns.len() >= 12,
-            "only {} trait methods parsed — the extraction markers have rotted",
-            trait_fns.len()
         );
-        let missing: Vec<_> = trait_fns.difference(&impl_fns).collect();
-        assert!(
-            missing.is_empty(),
-            "Encoder methods NOT written by RemotePyroWave: {missing:?} — an unforwarded default \
-             silently disables the feature for every worker-backed session."
-        );
-        assert_eq!(trait_fns, impl_fns);
     }
 }

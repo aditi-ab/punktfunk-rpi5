@@ -70,8 +70,8 @@ qsv = ["dep:libvpl-sys"]
 pyrowave = ["dep:pyrowave-sys"]
 # Linux Vulkan Video in pf-encode shares `rfi` and `vbv_window_ms`; the gate mirrors pf-encode's.
 vulkan-encode = []
-# Helpers for pf-encode's GPU tests: `pyrowave_wire::unwindow`, the `pyrowave_ffi::oracle`
-# decoder. Never in a shipped build.
+# Helpers for pf-encode's tests: `pyrowave_wire::unwindow`, the `pyrowave_ffi::oracle` decoder,
+# and the `smoke_pattern` drivers. Never in a shipped build.
 test-support = []
 
 [lints]
