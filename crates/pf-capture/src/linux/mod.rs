@@ -33,6 +33,43 @@ use std::time::Duration;
 /// pins compositor buffers.
 type FrameSlot = Arc<std::sync::Mutex<Option<CapturedFrame>>>;
 
+/// `wait_arrival` for either capturer: returns once `slot` holds a frame,
+/// `deadline` passes, or the producer is broken or gone. Never consumes: the
+/// frame stays for `try_latest`, which also classifies a dead producer.
+fn wait_for_frame(
+    slot: &FrameSlot,
+    wake: &Receiver<()>,
+    broken: &AtomicBool,
+    deadline: std::time::Instant,
+) {
+    if broken.load(Ordering::Relaxed) {
+        return;
+    }
+    loop {
+        if slot.lock().is_ok_and(|s| s.is_some()) {
+            return;
+        }
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return;
+        };
+        if wake.recv_timeout(left).is_err() {
+            return;
+        }
+    }
+}
+
+/// Drains stale wakeup edges so the next [`wait_for_frame`] cannot return
+/// early. `true` when the producer thread is gone (its sender dropped).
+fn drain_edges(wake: &Receiver<()>) -> bool {
+    loop {
+        match wake.try_recv() {
+            Ok(()) => continue,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => return true,
+        }
+    }
+}
+
 /// Named bools: four adjacent same-typed args transpose silently and
 /// negotiate the wrong pod family (black screen).
 #[derive(Clone, Copy)]
@@ -246,7 +283,7 @@ impl PortalCapturer {
     /// inherits that grant (no second dialog). `false` is a plain ScreenCast
     /// (wlroots has no RemoteDesktop portal). `want_metadata_cursor` asks
     /// for `SPA_META_Cursor` vs compositor-embedded pointer
-    /// (`portal::choose_cursor_mode`).
+    /// ([`crate::portal_rt::negotiate_cursor_mode`]).
     pub fn open(
         anchored: bool,
         want_hdr: bool,
@@ -574,24 +611,9 @@ impl Capturer for PortalCapturer {
     }
 
     fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        // Must not consume: observe the slot, leave the frame for `try_latest`.
-        // Broken/ended: return; `try_latest` surfaces the error. A driven producer
-        // paints on its own requests (`pipewire::Pacer`), so this never triggers.
-        if self.signals.broken.load(Ordering::Relaxed) {
-            return;
-        }
-        loop {
-            if self.slot.lock().is_ok_and(|s| s.is_some()) {
-                return;
-            }
-            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return;
-            };
-            // Timeout or a dead producer: stop waiting; `try_latest` classifies.
-            if self.wake.recv_timeout(left).is_err() {
-                return;
-            }
-        }
+        // A driven producer paints on its own requests (`pipewire::Pacer`), so
+        // this wait never triggers a paint.
+        wait_for_frame(&self.slot, &self.wake, &self.signals.broken, deadline);
     }
 
     /// Only the virtual-output path holds one; the portal thread owns its own session.
@@ -608,20 +630,8 @@ impl Capturer for PortalCapturer {
             )
             .context(super::DisplayStillAlive));
         }
-        // Drain wakeup edges first — stale ones must not make the next
-        // `wait_arrival` return early. `Disconnected` is a dead thread;
-        // a leftover frame is still served first.
-        let mut producer_gone = false;
-        loop {
-            match self.wake.try_recv() {
-                Ok(()) => continue,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    producer_gone = true;
-                    break;
-                }
-            }
-        }
+        // A dead thread's leftover frame is still served first.
+        let producer_gone = drain_edges(&self.wake);
         let latest = self.take_frame();
         if producer_gone && latest.is_none() {
             return Err(anyhow!("PipeWire capture thread ended"));
@@ -1065,21 +1075,7 @@ impl Capturer for WlCapturer {
     }
 
     fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        // Must not consume: the frame stays for `try_latest`.
-        if self.signals.broken.load(Ordering::Relaxed) {
-            return;
-        }
-        loop {
-            if self.slot.lock().is_ok_and(|s| s.is_some()) {
-                return;
-            }
-            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return;
-            };
-            if self.wake.recv_timeout(left).is_err() {
-                return;
-            }
-        }
+        wait_for_frame(&self.slot, &self.wake, &self.signals.broken, deadline);
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
@@ -1089,9 +1085,14 @@ impl Capturer for WlCapturer {
                 self.output_name
             ));
         }
-        // Drain stale edges so the next `wait_arrival` cannot return early.
-        while self.wake.try_recv().is_ok() {}
-        Ok(self.take_frame())
+        // A thread that ended without a failure (the compositor stopped the
+        // session) fails here too, after its leftover frame, so the loop rebuilds.
+        let producer_gone = drain_edges(&self.wake);
+        let latest = self.take_frame();
+        if producer_gone && latest.is_none() {
+            return Err(anyhow!("direct wayland capture thread ended"));
+        }
+        Ok(latest)
     }
 
     fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
@@ -1228,5 +1229,36 @@ mod first_frame_timeout_tests {
             classify_first_frame_timeout(false, false, true, true, true),
             TimeoutOffer::NoFormat
         );
+    }
+}
+
+#[cfg(test)]
+mod wl_capturer_tests {
+    use super::{CaptureSignals, Capturer, WlCapturer};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::sync_channel;
+    use std::sync::Arc;
+
+    /// A thread that ended cleanly drops its wake sender. `try_latest` must say so,
+    /// or the encode loop repeats the last frame and never rebuilds capture.
+    #[test]
+    fn try_latest_reports_an_ended_thread() {
+        let (edge, wake) = sync_channel::<()>(1);
+        let mut cap = WlCapturer {
+            slot: Arc::default(),
+            wake,
+            signals: CaptureSignals::new(pf_zerocopy::zero_copy_health(u64::MAX)),
+            output_name: "TEST-1".into(),
+            quit: Arc::new(AtomicBool::new(false)),
+            join: None,
+            _keepalive: Box::new(()),
+        };
+        edge.try_send(()).expect("empty channel");
+        assert!(
+            matches!(cap.try_latest(), Ok(None)),
+            "a live thread with no frame is idle"
+        );
+        drop(edge);
+        assert!(cap.try_latest().is_err());
     }
 }

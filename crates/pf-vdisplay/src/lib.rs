@@ -47,7 +47,7 @@ pub(crate) mod backend;
 pub use backend::SessionCastParts;
 pub use backend::{DisplayOwnership, SessionIsolation, VirtualDisplay, VirtualOutput};
 /// Negotiated ScreenCast cursor mode of a portal-backed output
-/// ([`VirtualDisplay::last_portal_cursor_mode`]). The picker stays private; the verdict is the caller's.
+/// ([`VirtualDisplay::last_portal_cursor_mode`]). The verdict is the caller's.
 pub use portal_cursor::Mode as PortalCursorMode;
 
 /// Time-bounded child-process helpers. Compositor queries shell out; an unbounded wait wedges the session thread.
@@ -749,8 +749,7 @@ pub mod admission;
 mod portal_config;
 
 /// ScreenCast cursor mode to request, negotiated against `AvailableCursorModes`.
-/// A mode the backend does not advertise closes the session. Unconditional
-/// so the ladder's tests run without a compositor, on every CI.
+/// Unconditional: [`PortalCursorMode`] is public on every platform.
 #[path = "vdisplay/linux/portal_cursor.rs"]
 mod portal_cursor;
 
