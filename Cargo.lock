@@ -1678,6 +1678,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gen-headers"
+version = "0.40.0"
+dependencies = [
+ "cbindgen",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3747,7 +3754,6 @@ dependencies = [
 name = "punktfunk-client-apple"
 version = "0.40.0"
 dependencies = [
- "cbindgen",
  "pf-client-core",
  "pf-console-ui",
  "punktfunk-core",
@@ -3806,7 +3812,6 @@ version = "0.40.0"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
- "cbindgen",
  "chacha20poly1305",
  "criterion",
  "fec-rs",

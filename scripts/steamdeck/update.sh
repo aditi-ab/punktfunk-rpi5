@@ -33,10 +33,10 @@ WEB=0; [ -f "$HOME/.config/systemd/user/punktfunk-web.service" ] && WEB=1
 
 if [ "${1:-}" = "--pull" ]; then
     [ -d "$SRC/.git" ] || die "$SRC is not a git checkout — rsync new source then run without --pull"
-    # A build regenerates these committed files (bun2nix, cbindgen). When main carries a stale
-    # copy, the rebuild dirties it and the next pull that touches it aborts. Restoring derived
-    # paths is lossless. Not `reset --hard`: this is the operator's own checkout.
-    git -C "$SRC" checkout -- web/bun.nix sdk/bun.nix include/punktfunk_core.h 2>/dev/null || true
+    # A build regenerates these committed files (bun2nix). When main carries a stale copy, the
+    # rebuild dirties it and the next pull that touches it aborts. Restoring derived paths is
+    # lossless. Not `reset --hard`: this is the operator's own checkout.
+    git -C "$SRC" checkout -- web/bun.nix sdk/bun.nix 2>/dev/null || true
     log "git pull"
     git -C "$SRC" pull --ff-only \
         || die "git pull --ff-only failed in $SRC. If it named locally-modified files, this checkout

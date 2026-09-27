@@ -1,5 +1,5 @@
 //! Stable `extern "C"` surface. `cbindgen` emits `include/punktfunk_core.h`
-//! (`build.rs`). Pin with [`punktfunk_abi_version`] and `struct_size`.
+//! (`cargo run -p gen-headers`). Pin with [`punktfunk_abi_version`] and `struct_size`.
 //!
 //! Opaque handles only. Cross-boundary structs are `#[repr(C)]`; buffers are
 //! pointer + length. Every handle from `*_new` / `*_pair` must reach

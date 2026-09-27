@@ -37,7 +37,8 @@ classify() {
             case "$path" in
                 .cargo/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|\
                 crates/*|tools/*|clients/cli/*|clients/linux/*|clients/probe/*|clients/session/*|\
-                clients/shared/*|clients/android/native/*|include/*|api/openapi.json|\
+                clients/shared/*|clients/android/native/*|clients/apple/native/*|include/*|\
+                api/openapi.json|\
                 data/platforms.json|ci/rust-ci.Dockerfile|web/src/lib/command-execution.ts|\
                 scripts/ci/ensure-sccache.sh|scripts/ci/install-retrying-curl.sh|\
                 scripts/ci/check-installer-behavior.sh|scripts/ci/check-install-defaults.sh|\
@@ -125,6 +126,9 @@ self_test() {
     # A workspace member with no cfg gate: workspace clippy compiles it on Linux, android.yml
     # (cargo-ndk, android cfg) does not stand in for that.
     check android-native 'clients/android/native/src/lib.rs' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # The console header's drift gate runs in the rust job.
+    check apple-console 'clients/apple/native/src/console.rs' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check notice-config 'about.toml' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'

@@ -9,8 +9,8 @@ Two things about this crate are contracts rather than choices:
 - **No async on the per-frame path.** `tokio` and `quinn` are confined to the optional `quic`
   feature — the control plane — which is off by default so the core stays runtime-free.
 - **The C ABI is versioned.** `abi.rs` generates [`include/punktfunk_core.h`](../../include/punktfunk_core.h)
-  via cbindgen at build time; `punktfunk_abi_version()` and `PunktfunkConfig::struct_size` are how an
-  embedder detects a mismatch instead of corrupting a struct.
+  via cbindgen (`cargo run -p gen-headers`); `punktfunk_abi_version()` and `PunktfunkConfig::struct_size`
+  are how an embedder detects a mismatch instead of corrupting a struct.
 
 The crate builds `lib`, `cdylib` and `staticlib` at once: the rlib for the host and tools, the
 cdylib for the Swift and Kotlin clients over the C ABI, the staticlib for C embedding and the test

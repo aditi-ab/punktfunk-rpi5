@@ -75,7 +75,7 @@ fn c_abi_harness_round_trips() {
     );
     assert!(
         include.join("punktfunk_core.h").exists(),
-        "generated header missing; build punktfunk-core to regenerate it"
+        "generated header missing; run `cargo run -p gen-headers`"
     );
 
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());

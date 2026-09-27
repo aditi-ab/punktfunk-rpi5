@@ -154,7 +154,8 @@ mkdir -p "$STAGE/macos"
 cp "$TARGET_DIR"/aarch64-apple-darwin/release/libpunktfunk_apple.a "$STAGE/macos/"
 
 # Headers dir: the generated C headers (core's with the quic API force-enabled) + a modulemap
-# so Swift can `import PunktfunkCore`.
+# so Swift can `import PunktfunkCore`. Regenerated first: no build step writes include/.
+cargo run -q -p gen-headers
 mkdir -p "$STAGE/include"
 {
     echo "#define PUNKTFUNK_FEATURE_QUIC 1"

@@ -48,6 +48,7 @@ members = [
     "clients/apple/native",
     "tools/cursor-probe",
     "tools/display-disturb",
+    "tools/gen-headers",
     "tools/loss-harness",
     "tools/scroll-probe",
 ]
