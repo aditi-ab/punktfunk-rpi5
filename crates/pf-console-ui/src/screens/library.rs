@@ -589,14 +589,19 @@ impl LibraryScreen {
         }
     }
 
-    /// The row has focus (`true`) or has handed it down.
     /// OK went down: the plate dips under the focused poster.
     pub(crate) fn press(&mut self) {
         self.grid.get_mut().press();
     }
 
+    /// The row has focus (`true`) or has handed it down. A quiet shelf rests on its top
+    /// row, where the pad leaves it: a pointer can leave from any row.
     pub(crate) fn set_quiet(&mut self, quiet: bool) {
         self.quiet = quiet;
+        if let Some(shape) = self.grid_shape().filter(|_| quiet) {
+            self.cursor = self.grid_col.min(shape.row_len(0).saturating_sub(1)) as i32;
+            self.follow = true;
+        }
     }
 
     /// Titles to walk: Down from the row has somewhere to land.
@@ -1528,10 +1533,11 @@ impl LibraryScreen {
             (bump, 0.0)
         };
         // Room left of the first column for the plate's outset; the padding gives it back.
-        // With a band to treat them, the lines run on up under the chrome as well.
+        // With a band to treat them, the lines run on up under the chrome as well. A quiet
+        // shelf clips at its top: the Hosts row is drawn there.
         let air = PLATE_AIR * k;
         let bleed = crate::blur::active();
-        let top = if bleed {
+        let top = if bleed && !(self.embedded && self.quiet) {
             clip.top.min(rect.top)
         } else {
             rect.top
@@ -2364,6 +2370,25 @@ mod tests {
         press(&mut s, &library, &mut settings, up());
         let (_, fx) = press(&mut s, &library, &mut settings, MenuEvent::Back);
         assert!(matches!(fx.nav, Some(crate::screens::Nav::Pop)));
+    }
+
+    /// A pointer leaves the Hosts shelf from any row. Quiet, the shelf rests on its top
+    /// row in the same column, so it scrolls home instead of over the returning row.
+    #[test]
+    fn a_quiet_shelf_rests_on_its_top_row() {
+        let (_, library) = live_shelf();
+        let mut s = LibraryScreen::embedded(&host());
+        s.sync(&library);
+        s.grid_cols_last = Some(3);
+        s.cursor = 4;
+        s.seat_grid_col();
+        s.set_quiet(false);
+        assert!(!s.at_top());
+        s.follow = false;
+        s.set_quiet(true);
+        assert!(s.at_top(), "cursor {}", s.cursor);
+        assert_eq!(s.cursor, 1, "the column stays");
+        assert!(s.follow, "the scroll chases it");
     }
 
     /// On a plain grid, Up from row 0 reaches the pills; anywhere else it is a row move.
