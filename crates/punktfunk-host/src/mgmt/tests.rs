@@ -29,7 +29,6 @@ use super::*;
 /// Knocks in these tests come from the LAN unless the test is about a WAN knock. An unknown
 /// source classifies as WAN, which the approve endpoint refuses.
 const LAN_KNOCK: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 44));
-use crate::encode::Codec;
 #[cfg(feature = "gamestream")]
 use crate::gamestream::cert::ServerIdentity;
 use crate::gamestream::tls::{PeerAddr, PeerCertFingerprint};
@@ -526,29 +525,11 @@ fn fake_native_session(
     fps: u32,
 ) -> crate::session_status::LiveSessionGuard {
     let packed = ((width as u64) << 32) | ((height as u64) << 16) | fps as u64;
+    // Desktop stream: no game row.
     crate::session_status::register(crate::session_status::Registration {
         mode: Arc::new(std::sync::atomic::AtomicU64::new(packed)),
-        bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(20_000)),
-        codec: Codec::H265,
-        stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        quit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        force_idr: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        client: "test-client".into(),
-        plane: crate::events::Plane::Native,
         client_name: Some("studio-deck".into()),
-        hdr: false,
-        ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        // Desktop stream: no game row.
-        game: None,
-        capture_health: Arc::new(std::sync::Mutex::new(None)),
-        join: false,
-        controls: crate::session_status::SessionControls::open(),
-        bit_depth: 8,
-        chroma: crate::encode::ChromaFormat::Yuv420,
-        end_reason: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-        counters: Arc::new(crate::session_status::SessionCounters::default()),
-        peer: None,
+        ..crate::session_status::Registration::fake("test-client")
     })
 }
 
@@ -579,26 +560,11 @@ fn fake_session_with_flags(
         mode: Arc::new(std::sync::atomic::AtomicU64::new(
             (1920u64 << 32) | (1080u64 << 16) | 60,
         )),
-        bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(20_000)),
-        codec: Codec::H265,
         stop: stop.clone(),
         quit: quit.clone(),
         force_idr: idr.clone(),
-        client: client.into(),
-        client_name: None,
-        plane: crate::events::Plane::Native,
-        hdr: false,
-        ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        game: None,
-        capture_health: Arc::new(std::sync::Mutex::new(None)),
-        join: false,
         controls,
-        bit_depth: 8,
-        chroma: crate::encode::ChromaFormat::Yuv420,
-        end_reason: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-        counters: Arc::new(crate::session_status::SessionCounters::default()),
-        peer: None,
+        ..crate::session_status::Registration::fake(client)
     });
     (guard, stop, quit, idr)
 }

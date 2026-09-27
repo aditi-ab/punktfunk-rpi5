@@ -1307,27 +1307,13 @@ pub(crate) mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
         let _guard = register(Registration {
-            mode: Arc::new(AtomicU64::new(0)),
-            bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
-            codec: Codec::H265,
             stop: stop.clone(),
             quit: quit.clone(),
-            force_idr: Arc::new(AtomicBool::new(false)),
-            client: "9f86d0818840".into(),
             client_name: Some("Living Room TV".into()),
             plane: crate::events::Plane::Gamestream,
             hdr: true,
-            ttff_ms: Arc::new(AtomicU32::new(0)),
-            last_resize_ms: Arc::new(AtomicU32::new(0)),
-            game: None,
-            capture_health: Arc::new(Mutex::new(None)),
-            join: false,
-            controls: SessionControls::open(),
             bit_depth: 10,
-            chroma: ChromaFormat::Yuv420,
-            end_reason: Arc::new(AtomicU8::new(0)),
-            counters: Arc::new(SessionCounters::default()),
-            peer: None,
+            ..Registration::fake("9f86d0818840")
         });
         let row = snapshot()
             .into_iter()
@@ -1346,6 +1332,36 @@ pub(crate) mod tests {
         assert!(!stop_quit(u64::MAX), "an id nothing holds stops nothing");
     }
 
+    impl Registration {
+        /// A native 8-bit H.265 session for `client` at 20 Mbps, every handle fresh and
+        /// zeroed, no peer. A test overrides only the fields it reads.
+        pub(crate) fn fake(client: &str) -> Registration {
+            Registration {
+                mode: Arc::new(AtomicU64::new(0)),
+                bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
+                codec: Codec::H265,
+                stop: Arc::new(AtomicBool::new(false)),
+                quit: Arc::new(AtomicBool::new(false)),
+                force_idr: Arc::new(AtomicBool::new(false)),
+                client: client.into(),
+                client_name: None,
+                plane: crate::events::Plane::Native,
+                hdr: false,
+                ttff_ms: Arc::new(AtomicU32::new(0)),
+                last_resize_ms: Arc::new(AtomicU32::new(0)),
+                game: None,
+                capture_health: Arc::new(Mutex::new(None)),
+                join: false,
+                controls: SessionControls::open(),
+                bit_depth: 8,
+                chroma: ChromaFormat::Yuv420,
+                end_reason: Arc::new(AtomicU8::new(0)),
+                counters: Arc::new(SessionCounters::default()),
+                peer: None,
+            }
+        }
+    }
+
     fn fake_session(client: &str) -> (LiveSessionGuard, Arc<AtomicBool>, Arc<AtomicBool>) {
         fake_session_with_reason(
             client,
@@ -1362,27 +1378,11 @@ pub(crate) mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
         let guard = register(Registration {
-            mode: Arc::new(AtomicU64::new(0)),
-            bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
-            codec: Codec::H265,
             stop: stop.clone(),
             quit: quit.clone(),
-            force_idr: Arc::new(AtomicBool::new(false)),
-            client: client.into(),
-            client_name: None,
-            plane: crate::events::Plane::Native,
-            hdr: false,
-            ttff_ms: Arc::new(AtomicU32::new(0)),
-            last_resize_ms: Arc::new(AtomicU32::new(0)),
-            game: None,
-            capture_health: Arc::new(Mutex::new(None)),
-            join: false,
-            controls: SessionControls::open(),
-            bit_depth: 8,
-            chroma: ChromaFormat::Yuv420,
             end_reason,
             counters,
-            peer: None,
+            ..Registration::fake(client)
         });
         (guard, stop, quit)
     }
@@ -1415,27 +1415,10 @@ pub(crate) mod tests {
     ) -> (LiveSessionGuard, SessionControls) {
         let controls = SessionControls::open();
         let guard = register(Registration {
-            mode: Arc::new(AtomicU64::new(0)),
-            bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
-            codec: Codec::H265,
-            stop: Arc::new(AtomicBool::new(false)),
-            quit: Arc::new(AtomicBool::new(false)),
-            force_idr: Arc::new(AtomicBool::new(false)),
-            client: client.into(),
-            client_name: None,
-            plane: crate::events::Plane::Native,
-            hdr: false,
-            ttff_ms: Arc::new(AtomicU32::new(0)),
-            last_resize_ms: Arc::new(AtomicU32::new(0)),
-            game: None,
-            capture_health: Arc::new(Mutex::new(None)),
             join,
             controls: controls.clone(),
-            bit_depth: 8,
-            chroma: ChromaFormat::Yuv420,
-            end_reason: Arc::new(AtomicU8::new(0)),
-            counters: Arc::new(SessionCounters::default()),
             peer,
+            ..Registration::fake(client)
         });
         (guard, controls)
     }
@@ -1450,27 +1433,10 @@ pub(crate) mod tests {
         let counters = Arc::new(SessionCounters::default());
         let bitrate_kbps = Arc::new(AtomicU32::new(kbps));
         let guard = register(Registration {
-            mode: Arc::new(AtomicU64::new(0)),
             bitrate_kbps: bitrate_kbps.clone(),
-            codec: Codec::H265,
-            stop: Arc::new(AtomicBool::new(false)),
-            quit: Arc::new(AtomicBool::new(false)),
-            force_idr: Arc::new(AtomicBool::new(false)),
-            client: client.into(),
-            client_name: None,
-            plane: crate::events::Plane::Native,
-            hdr: false,
-            ttff_ms: Arc::new(AtomicU32::new(0)),
-            last_resize_ms: Arc::new(AtomicU32::new(0)),
-            game: None,
-            capture_health: Arc::new(Mutex::new(None)),
-            join: false,
-            controls: SessionControls::open(),
-            bit_depth: 8,
-            chroma: ChromaFormat::Yuv420,
-            end_reason: Arc::new(AtomicU8::new(0)),
             counters: counters.clone(),
             peer: Some(peer),
+            ..Registration::fake(client)
         });
         (guard, counters, bitrate_kbps)
     }
