@@ -22,11 +22,10 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_DISABLE_PERSIST, CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CM_PROB_DISABLED,
     CR_SUCCESS, DN_HAS_PROBLEM,
 };
-use windows::Win32::Devices::Display::{
-    DisplayConfigGetDeviceInfo, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-    DISPLAYCONFIG_TARGET_DEVICE_NAME,
-};
+use windows::Win32::Devices::Display::DISPLAYCONFIG_TARGET_DEVICE_NAME;
 use windows::Win32::Foundation::LUID;
+
+use crate::win_display::device_info_get;
 
 /// Which selector leased a devnode: `BaselineInactive` (a sink that was dark before this acquire)
 /// or `DeactivatedByUs` (a display the isolate itself switched off).
@@ -158,17 +157,7 @@ fn utf16z(buf: &[u16]) -> String {
 }
 
 fn monitor_instance(adapter: LUID, target_id: u32) -> Option<(String, String)> {
-    let mut req = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
-    req.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-    req.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
-    req.header.adapterId = adapter;
-    req.header.id = target_id;
-    // SAFETY: `req` is a properly-sized DISPLAYCONFIG_TARGET_DEVICE_NAME local whose header
-    // (type/size/adapterId/id) is fully initialised; the API writes only within the struct.
-    let rc = unsafe { DisplayConfigGetDeviceInfo(&mut req.header) };
-    if rc != 0 {
-        return None;
-    }
+    let req = device_info_get::<DISPLAYCONFIG_TARGET_DEVICE_NAME>(adapter, target_id)?;
     let id = instance_id_from_interface_path(&utf16z(&req.monitorDevicePath))?;
     Some((id, utf16z(&req.monitorFriendlyDeviceName)))
 }
