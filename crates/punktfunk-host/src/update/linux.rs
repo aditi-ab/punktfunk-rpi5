@@ -86,12 +86,6 @@ fn capture(cmd: &mut Command) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Shown instead of an Apply button.
-pub(super) fn opt_in_hint() -> String {
-    "sudo usermod -aG punktfunk-update $USER   # enables web-triggered updates for this host"
-        .to_string()
-}
-
 /// The Deck's build tree, or `None` where there is no on-device source build.
 fn source_tree() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -287,7 +281,7 @@ pub(super) fn run_apply(
                 format!(
                     "not authorized to start the update helper — enable web-triggered \
                      updates first: {}",
-                    opt_in_hint()
+                    super::OPT_IN_HINT
                 )
             } else {
                 format!(

@@ -47,69 +47,106 @@ pub(crate) fn apply_disabled() -> bool {
     !pf_host_config::row_bool("PUNKTFUNK_UPDATE_APPLY")
 }
 
-/// `full` (one-click), `staged` (apply then reboot — rpm-ostree), or `notify`
-/// (show the command). Linux `full`/`staged` also need the packaged root helper
-/// and the operator's group; pacman also the root-owned full-sysupgrade config.
-pub(crate) fn apply_support() -> &'static str {
-    if apply_disabled() {
-        return "notify";
-    }
-    // Omarchy owns `pacman` (snapper snapshot, then sysupgrade). A one-click
-    // apply here would hit their `pacman -Syu` guard or skip that snapshot.
-    // Packages ride their transaction once the repo is configured.
-    #[cfg(target_os = "linux")]
-    if crate::osinfo::is_omarchy() {
-        return "notify";
-    }
-    let (kind, _) = detect::detect();
-    match kind {
-        detect::InstallKind::WindowsInstaller => "full",
+/// What an apply can use on this box, probed once so [`apply_leg`] is a pure table.
+#[derive(Debug, Clone, Copy, Default)]
+struct Caps {
+    apply_disabled: bool,
+    /// The only OS with helper and source-rebuild legs.
+    linux: bool,
+    /// Omarchy owns `pacman`: a one-click apply would hit its `pacman -Syu` guard or skip the
+    /// snapper snapshot. Packages ride its transaction once the repo is configured.
+    omarchy: bool,
+    /// The packaged root helper's unit exists.
+    helper: bool,
+    /// The operator is in `punktfunk-update`, which polkit checks.
+    opted_in: bool,
+    /// Pacman's root-owned full-sysupgrade opt-in; the helper refuses pacman without it.
+    pacman_optin: bool,
+}
+
+impl Caps {
+    fn probe() -> Self {
         #[cfg(target_os = "linux")]
-        detect::InstallKind::Apt | detect::InstallKind::Dnf | detect::InstallKind::Sysext
-            if linux::helper_installed() && linux::opted_in() =>
         {
-            "full"
+            let helper = linux::helper_installed();
+            Self {
+                apply_disabled: apply_disabled(),
+                linux: true,
+                omarchy: crate::osinfo::is_omarchy(),
+                helper,
+                // Both shell out or read root-owned config, and neither matters without a helper.
+                opted_in: helper && linux::opted_in(),
+                pacman_optin: helper && linux::pacman_opted_in(),
+            }
         }
-        #[cfg(target_os = "linux")]
-        detect::InstallKind::RpmOstree if linux::helper_installed() && linux::opted_in() => {
-            "staged"
+        #[cfg(not(target_os = "linux"))]
+        Self {
+            apply_disabled: apply_disabled(),
+            ..Self::default()
         }
-        #[cfg(target_os = "linux")]
-        detect::InstallKind::Pacman
-            if linux::helper_installed() && linux::opted_in() && linux::pacman_opted_in() =>
-        {
-            "full"
-        }
-        // SteamOS source rebuild is user-owned: no helper, no group.
-        #[cfg(target_os = "linux")]
-        detect::InstallKind::SteamosSource => "full",
-        _ => "notify",
     }
 }
 
-/// Status copy when the helper is installed but the operator is not in
-/// `punktfunk-update`.
-pub(crate) fn opt_in_hint() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        // Apply is notify-only on Omarchy; the group would buy no button.
-        if crate::osinfo::is_omarchy() {
-            return None;
-        }
-        let (kind, _) = detect::detect();
-        let capable = matches!(
-            kind,
-            detect::InstallKind::Apt
-                | detect::InstallKind::Dnf
-                | detect::InstallKind::Sysext
-                | detect::InstallKind::RpmOstree
-                | detect::InstallKind::Pacman
-        );
-        if capable && !apply_disabled() && linux::helper_installed() && !linux::opted_in() {
-            return Some(linux::opt_in_hint());
-        }
+/// How [`start_apply`] installs a newer build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    /// Download, verify and run the Windows installer.
+    Installer,
+    /// Start the `pf-update` root oneshot.
+    Helper,
+    /// Rebuild the Deck's own checkout. User-owned: no helper, no group.
+    SteamosSource,
+}
+
+/// Kinds the root helper applies.
+fn helper_kind(kind: detect::InstallKind) -> bool {
+    use detect::InstallKind as K;
+    matches!(kind, K::Apt | K::Dnf | K::Sysext | K::RpmOstree | K::Pacman)
+}
+
+/// The leg [`start_apply`] may run, or `None` where the console shows the command instead.
+/// Group membership is not checked here: polkit enforces it when the helper starts.
+fn apply_leg(kind: detect::InstallKind, c: Caps) -> Option<Leg> {
+    use detect::InstallKind as K;
+    if c.apply_disabled || c.omarchy {
+        return None;
     }
-    None
+    match kind {
+        K::WindowsInstaller => Some(Leg::Installer),
+        K::SteamosSource if c.linux => Some(Leg::SteamosSource),
+        K::Pacman if !c.pacman_optin => None,
+        k if helper_kind(k) && c.helper => Some(Leg::Helper),
+        _ => None,
+    }
+}
+
+/// `full` (one-click), `staged` (apply then reboot, rpm-ostree) or `notify` (show the command).
+/// A helper leg also needs the operator's group before the console offers it.
+fn support(kind: detect::InstallKind, c: Caps) -> &'static str {
+    match apply_leg(kind, c) {
+        Some(Leg::Helper) if !c.opted_in => "notify",
+        Some(Leg::Helper) if kind == detect::InstallKind::RpmOstree => "staged",
+        Some(_) => "full",
+        None => "notify",
+    }
+}
+
+/// Joining `punktfunk-update` would turn the command into a button.
+fn opt_in_would_help(kind: detect::InstallKind, c: Caps) -> bool {
+    !c.apply_disabled && !c.omarchy && c.helper && !c.opted_in && helper_kind(kind)
+}
+
+/// Shown instead of an Apply button when joining the group would enable one.
+pub(crate) const OPT_IN_HINT: &str =
+    "sudo usermod -aG punktfunk-update $USER   # enables web-triggered updates for this host";
+
+pub(crate) fn apply_support() -> &'static str {
+    support(detect::detect().0, Caps::probe())
+}
+
+/// Status copy when the helper is installed but the operator is not in `punktfunk-update`.
+pub(crate) fn opt_in_hint() -> Option<String> {
+    opt_in_would_help(detect::detect().0, Caps::probe()).then(|| OPT_IN_HINT.to_string())
 }
 
 #[derive(Clone)]
@@ -331,42 +368,9 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
         return Err(ApplyError::Disabled);
     }
     let (kind, channel) = detect::detect();
-    let windows_leg = kind == detect::InstallKind::WindowsInstaller;
-    let linux_leg = matches!(
-        kind,
-        detect::InstallKind::Apt
-            | detect::InstallKind::Dnf
-            | detect::InstallKind::Sysext
-            | detect::InstallKind::RpmOstree
-            | detect::InstallKind::Pacman
-            | detect::InstallKind::SteamosSource
-    );
-    if !windows_leg && !linux_leg {
-        return Err(ApplyError::Unsupported);
-    }
-    // Same Omarchy refusal as [`apply_support`], enforced here so a direct POST
-    // cannot run `pacman -Syu` into their guard or past the snapper snapshot.
-    #[cfg(target_os = "linux")]
-    if crate::osinfo::is_omarchy() {
-        return Err(ApplyError::Unsupported);
-    }
-    #[cfg(target_os = "linux")]
-    if linux_leg && kind != detect::InstallKind::SteamosSource {
-        // SteamOS source rebuild is user-owned; every other Linux leg needs
-        // the root helper.
-        if !linux::helper_installed() {
-            return Err(ApplyError::Unsupported);
-        }
-        // Helper enforces the full-sysupgrade opt-in too; refuse here so the
-        // console never spawns a job that will fail.
-        if kind == detect::InstallKind::Pacman && !linux::pacman_opted_in() {
-            return Err(ApplyError::Unsupported);
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    if linux_leg {
-        return Err(ApplyError::Unsupported);
-    }
+    // The table [`apply_support`] reads, so a direct POST meets the same refusals.
+    let leg = apply_leg(kind, Caps::probe()).ok_or(ApplyError::Unsupported)?;
+    let windows_leg = leg == Leg::Installer;
     if session_active && !force {
         return Err(ApplyError::SessionActive);
     }
@@ -450,7 +454,7 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
             #[cfg(target_os = "linux")]
             {
                 let _ = &asset; // unused: Linux legs use the package manager
-                let run = if detect::detect().0 == detect::InstallKind::SteamosSource {
+                let run = if leg == Leg::SteamosSource {
                     linux::run_apply_steamos(&target_version, serial, &stage)
                 } else {
                     linux::run_apply(&target_version, serial, &stage)
@@ -595,6 +599,145 @@ mod tests {
         assert_eq!(floor::load(&path, "stable"), 9);
         let files = std::fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(files, 1, "no temp is left behind");
+    }
+
+    fn ready() -> Caps {
+        Caps {
+            apply_disabled: false,
+            linux: true,
+            omarchy: false,
+            helper: true,
+            opted_in: true,
+            pacman_optin: true,
+        }
+    }
+
+    const KINDS: [detect::InstallKind; 10] = {
+        use detect::InstallKind as K;
+        [
+            K::WindowsInstaller,
+            K::Flatpak,
+            K::Sysext,
+            K::RpmOstree,
+            K::Apt,
+            K::Dnf,
+            K::Pacman,
+            K::SteamosSource,
+            K::Nix,
+            K::Source,
+        ]
+    };
+
+    /// The kill switch and Omarchy refuse every kind, in status and in apply alike.
+    #[test]
+    fn kill_switch_and_omarchy_refuse_every_leg() {
+        for caps in [
+            Caps {
+                apply_disabled: true,
+                ..ready()
+            },
+            Caps {
+                omarchy: true,
+                ..ready()
+            },
+        ] {
+            for kind in KINDS {
+                assert_eq!(apply_leg(kind, caps), None, "{}", kind.as_str());
+                assert_eq!(support(kind, caps), "notify", "{}", kind.as_str());
+                assert!(!opt_in_would_help(
+                    kind,
+                    Caps {
+                        opted_in: false,
+                        ..caps
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn each_kind_routes_to_its_leg() {
+        use detect::InstallKind as K;
+        for (kind, leg, tier) in [
+            (K::WindowsInstaller, Some(Leg::Installer), "full"),
+            (K::Apt, Some(Leg::Helper), "full"),
+            (K::Dnf, Some(Leg::Helper), "full"),
+            (K::Sysext, Some(Leg::Helper), "full"),
+            (K::Pacman, Some(Leg::Helper), "full"),
+            (K::RpmOstree, Some(Leg::Helper), "staged"),
+            (K::SteamosSource, Some(Leg::SteamosSource), "full"),
+            (K::Flatpak, None, "notify"),
+            (K::Nix, None, "notify"),
+            (K::Source, None, "notify"),
+        ] {
+            assert_eq!(apply_leg(kind, ready()), leg, "{}", kind.as_str());
+            assert_eq!(support(kind, ready()), tier, "{}", kind.as_str());
+        }
+    }
+
+    /// No helper, no helper leg. The Deck's source rebuild needs neither helper nor group.
+    #[test]
+    fn helper_legs_need_the_helper_and_pacman_its_opt_in() {
+        use detect::InstallKind as K;
+        let bare = Caps {
+            helper: false,
+            opted_in: false,
+            pacman_optin: false,
+            ..ready()
+        };
+        for kind in [K::Apt, K::Dnf, K::Sysext, K::RpmOstree, K::Pacman] {
+            assert_eq!(apply_leg(kind, bare), None, "{}", kind.as_str());
+        }
+        assert_eq!(apply_leg(K::SteamosSource, bare), Some(Leg::SteamosSource));
+        let no_sysupgrade = Caps {
+            pacman_optin: false,
+            ..ready()
+        };
+        assert_eq!(apply_leg(K::Pacman, no_sysupgrade), None);
+        assert_eq!(apply_leg(K::Apt, no_sysupgrade), Some(Leg::Helper));
+    }
+
+    /// Apply runs a helper leg without the group, since polkit decides; status shows the
+    /// command and the hint until the operator joins.
+    #[test]
+    fn the_group_gates_the_button_and_the_hint_only() {
+        use detect::InstallKind as K;
+        let outside = Caps {
+            opted_in: false,
+            ..ready()
+        };
+        assert_eq!(apply_leg(K::Apt, outside), Some(Leg::Helper));
+        assert_eq!(support(K::Apt, outside), "notify");
+        assert!(opt_in_would_help(K::Apt, outside));
+        assert!(opt_in_would_help(
+            K::Pacman,
+            Caps {
+                pacman_optin: false,
+                ..outside
+            }
+        ));
+        assert!(!opt_in_would_help(K::SteamosSource, outside));
+        assert!(!opt_in_would_help(K::Apt, ready()));
+        assert!(!opt_in_would_help(
+            K::Apt,
+            Caps {
+                helper: false,
+                ..outside
+            }
+        ));
+    }
+
+    /// Source-rebuild and helper legs are Linux-only.
+    #[test]
+    fn off_linux_only_the_installer_applies() {
+        let elsewhere = Caps {
+            apply_disabled: false,
+            ..Caps::default()
+        };
+        for kind in KINDS {
+            let want = (kind == detect::InstallKind::WindowsInstaller).then_some(Leg::Installer);
+            assert_eq!(apply_leg(kind, elsewhere), want, "{}", kind.as_str());
+        }
     }
 
     /// `last_error` and `not_published` never arrive together. The benign
