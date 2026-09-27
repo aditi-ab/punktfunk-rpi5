@@ -25,7 +25,7 @@ pub use store::{
 /// `None`. Callers must use this — `var(k) != Ok("0")` treats `"0 "` and
 /// `"false"` as ON.
 ///
-/// Not `pf-zerocopy`'s grammar (`1|true|yes|on` on, everything else off).
+/// Not `pf-zerocopy`'s grammar, where blank is off and junk keeps the default.
 ///
 /// For env-only knobs. A registry Bool or tri-state row reads through [`row_bool`] or
 /// [`row_tri`], which also see the console.

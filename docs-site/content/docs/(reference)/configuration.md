@@ -203,7 +203,7 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 | `PUNKTFUNK_MONITOR_LINGER_MS` | ms (default `10000`) | Keep a client's virtual display this long after it disconnects. **Keep alive** in [Virtual displays](/docs/virtual-displays) supersedes it. |
 | `PUNKTFUNK_EXCLUSIVE_REASSERT_MS` | ms (default `2000`), `0` off | How often the host checks that exclusive topology held, re-applying it when Windows or a driver turns a physical monitor back on. |
 | `PUNKTFUNK_STANDBY_SINK_KEEP` | any value but `0`/`off` | Keep a connected but inactive external display (a TV on standby, a capture card) powered while streaming; by default the host turns it off, because Windows keeps drawing for it. Also keeps enabled the monitors **Disable monitor devices (PnP)** would disable. |
-| `PUNKTFUNK_NO_ISOLATE` | set | Extend the desktop onto the virtual display instead of making it the only one. **Topology** in [Virtual displays](/docs/virtual-displays) supersedes it. |
+| `PUNKTFUNK_NO_ISOLATE` | `1` | Extend the desktop onto the virtual display instead of making it the only one. **Topology** in [Virtual displays](/docs/virtual-displays) supersedes it. |
 | `PUNKTFUNK_HOST_CMD` | `serve` | The command the service runs; every install writes `serve`. With no line the service runs `serve --gamestream`, which `punktfunk-host service install` rewrites to `serve` with **GameStream** kept on. |
 | `PUNKTFUNK_WEB_CONSOLE` | `off` | Don't run the web console alongside the service. |
 

@@ -41,7 +41,7 @@ fn mark_recovery_boundary(ir_wave_pos: &mut u32, is_keyframe: bool, period: u32)
 /// `PUNKTFUNK_IDD_ADAPTIVE=0` pins the capturer's full depth. Off when max depth is already 1.
 fn idd_adaptive_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PUNKTFUNK_IDD_ADAPTIVE").as_deref() != Ok("0"))
+    *ON.get_or_init(|| pf_host_config::env_on("PUNKTFUNK_IDD_ADAPTIVE").unwrap_or(true))
 }
 
 /// Escalated sessions flag on any net behind-frame; being escalated alone does not latch a cap.

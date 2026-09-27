@@ -449,10 +449,10 @@ impl StreamState {
             identity: budget_identity,
         };
         let streamed_wire =
-            streamed_au && std::env::var("PUNKTFUNK_STREAMED_AU").as_deref() != Ok("0");
+            streamed_au && pf_host_config::env_on("PUNKTFUNK_STREAMED_AU").unwrap_or(true);
         let slice_wire = streamed_wire
             && multi_slice
-            && std::env::var("PUNKTFUNK_SLICE_STREAM").as_deref() != Ok("0");
+            && pf_host_config::env_on("PUNKTFUNK_SLICE_STREAM").unwrap_or(true);
         let cursor_fwd = cursor_forward.then(super::super::cursor_fwd::CursorForwarder::new);
         if cursor_forward {
             tracing::info!("cursor channel negotiated — forwarding shape/state, encoder blend off");

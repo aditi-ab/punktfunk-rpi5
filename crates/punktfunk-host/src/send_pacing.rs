@@ -235,7 +235,7 @@ pub(crate) fn pace_frame<T: AsRef<[u8]>, E>(
 /// [`pf_capture::Capturer::supports_arrival_wait`]. Shared by both video planes.
 pub(crate) fn frame_driven_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PUNKTFUNK_FRAME_DRIVEN").as_deref() != Ok("0"))
+    *ON.get_or_init(|| pf_host_config::env_on("PUNKTFUNK_FRAME_DRIVEN").unwrap_or(true))
 }
 
 /// Wire-rate credit bucket for arrival-wait capture, shared by both planes.
