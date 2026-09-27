@@ -90,6 +90,18 @@ pub struct VideoFormat {
     pub image_type: vk::ImageType,
     /// `imageTiling`. Likewise equality-compared by VUID-06811; pools create `OPTIMAL`.
     pub image_tiling: vk::ImageTiling,
+    /// Usage the query that returned this entry asked for. The query returns only
+    /// formats that support it, so it counts as supported whatever `image_usage` says.
+    /// Empty in a hand-built entry.
+    pub queried: vk::ImageUsageFlags,
+}
+
+impl VideoFormat {
+    /// The driver answered with a mask that lacks the usage it was asked about: one
+    /// fixed report for every query. Such a report refuses nothing.
+    pub fn echoed(&self) -> bool {
+        !self.image_usage.contains(self.queried)
+    }
 }
 
 impl Default for VideoFormat {
@@ -102,6 +114,7 @@ impl Default for VideoFormat {
             image_create_flags: vk::ImageCreateFlags::empty(),
             image_type: vk::ImageType::TYPE_2D,
             image_tiling: vk::ImageTiling::OPTIMAL,
+            queried: vk::ImageUsageFlags::empty(),
         }
     }
 }
@@ -463,13 +476,13 @@ fn pick_format(
         .ok_or(CapsError::NoFormat { mode, wanted })
 }
 
-/// Pool creation usage must sit inside the driver's advertised envelope.
+/// Pool creation usage must sit inside what the driver advertised or was asked about.
 fn require_usage(
     entry: &VideoFormat,
     usage: vk::ImageUsageFlags,
     mode: &'static str,
 ) -> Result<(), CapsError> {
-    let missing = usage & !entry.image_usage;
+    let missing = usage & !(entry.image_usage | entry.queried);
     if missing.is_empty() {
         Ok(())
     } else {
@@ -483,40 +496,20 @@ fn require_usage(
     }
 }
 
-/// `PUNKTFUNK_VKDECODE_TRUST_QUERY=1`: take a format's return from the usage query as
-/// support for that usage, and an all-empty create-flag report as "not refused". For
-/// driver investigation; on Intel Windows it turns the refusal into a driver fault.
-pub(crate) fn trust_query() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("PUNKTFUNK_VKDECODE_TRUST_QUERY")
-            .ok()
-            .as_deref()
-            == Some("1")
-    })
-}
-
+/// An echoed report with no create flags at all has not said no: the pool asks for
+/// MUTABLE_FORMAT and `vkCreateImage` is the judge. Any other report without the flag
+/// refuses.
 fn require_mutable(entry: &VideoFormat, mode: &'static str) -> Result<(), CapsError> {
-    require_mutable_with(entry, mode, trust_query())
-}
-
-/// `trust`: a driver that reports no create flags at all has not said no, the pool asks
-/// for MUTABLE_FORMAT and `vkCreateImage` is the judge. Off, the empty report refuses.
-fn require_mutable_with(
-    entry: &VideoFormat,
-    mode: &'static str,
-    trust: bool,
-) -> Result<(), CapsError> {
     if entry
         .image_create_flags
         .contains(vk::ImageCreateFlags::MUTABLE_FORMAT)
     {
         Ok(())
-    } else if trust && entry.image_create_flags.is_empty() {
+    } else if entry.echoed() && entry.image_create_flags.is_empty() {
         tracing::info!(
             format = ?entry.format,
             mode,
-            "driver reports no image create flags; creating with MUTABLE_FORMAT anyway"
+            "driver echoes one format report for every query; creating with MUTABLE_FORMAT"
         );
         Ok(())
     } else {
@@ -768,23 +761,16 @@ pub(crate) unsafe fn query_formats_on(
         return Err(r);
     }
     props.truncate(count as usize);
-    // Opted in, the queried usage rides the entry: the query's contract says a returned
-    // format supports it. Intel's Windows driver echoes one fixed video-only mask for
-    // every query, and creating past that mask faults inside its media module, so the
-    // echoed mask stays the default authority.
-    let trusted = if trust_query() {
-        usage
-    } else {
-        vk::ImageUsageFlags::empty()
-    };
+    // The driver's masks stay verbatim for the probe; the queried usage rides beside them.
     Ok(props
         .iter()
         .map(|p| VideoFormat {
             format: p.format,
-            image_usage: p.image_usage_flags | trusted,
+            image_usage: p.image_usage_flags,
             image_create_flags: p.image_create_flags,
             image_type: p.image_type,
             image_tiling: p.image_tiling,
+            queried: usage,
         })
         .collect())
 }
@@ -804,14 +790,39 @@ mod tests {
         }
     }
 
+    /// One fixed video-only mask and no create flags for every query, as Intel's
+    /// Windows driver answers.
+    fn echoed_entry(format: vk::Format, queried: vk::ImageUsageFlags) -> VideoFormat {
+        VideoFormat {
+            format,
+            image_usage: vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+                | vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR,
+            queried,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn an_empty_create_flag_report_refuses_unless_the_query_is_trusted() {
-        let mut e = entry(vk::Format::G8_B8R8_2PLANE_420_UNORM, COINCIDE_USAGE);
+    fn an_echoed_report_refuses_neither_the_queried_usage_nor_mutable_format() {
+        let e = echoed_entry(NV12, COINCIDE_USAGE);
+        assert!(e.echoed());
+        assert!(require_usage(&e, COINCIDE_USAGE, "coincide").is_ok());
+        assert!(require_mutable(&e, "coincide").is_ok());
+    }
+
+    #[test]
+    fn a_report_that_answers_the_query_keeps_its_refusals() {
+        let mut e = entry(NV12, DPB_USAGE);
+        e.queried = DPB_USAGE;
+        assert!(!e.echoed());
+        assert!(require_usage(&e, COINCIDE_USAGE, "coincide").is_err());
         e.image_create_flags = vk::ImageCreateFlags::empty();
-        assert!(require_mutable_with(&e, "coincide", false).is_err());
-        assert!(require_mutable_with(&e, "coincide", true).is_ok());
-        e.image_create_flags = vk::ImageCreateFlags::ALIAS;
-        assert!(require_mutable_with(&e, "coincide", true).is_err());
+        assert!(require_mutable(&e, "coincide").is_err());
+        // Echoed, but it names create flags and MUTABLE_FORMAT is not among them.
+        let mut named = echoed_entry(NV12, COINCIDE_USAGE);
+        named.image_create_flags = vk::ImageCreateFlags::ALIAS;
+        assert!(require_mutable(&named, "coincide").is_err());
     }
 
     fn radv_like() -> RawH264Caps {
