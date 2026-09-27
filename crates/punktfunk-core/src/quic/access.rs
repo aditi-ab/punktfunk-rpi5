@@ -192,6 +192,77 @@ mod tests {
         );
     }
 
+    /// The bit table, the legacy-full read, and the mask → preset level each client derives:
+    /// normalize, drop unknown bits, then match the three presets or fall to `custom`.
+    fn grant_vectors() -> String {
+        let bits = [
+            ("GAMEPAD", GRANT_GAMEPAD),
+            ("POINTER", GRANT_POINTER),
+            ("KEYBOARD", GRANT_KEYBOARD),
+            ("CLIPBOARD", GRANT_CLIPBOARD),
+            ("MIC", GRANT_MIC),
+            ("LAUNCH", GRANT_LAUNCH),
+            ("POWER", GRANT_POWER),
+        ];
+        let masks = [
+            0,
+            GRANT_GAMEPAD,
+            GRANT_ALL,
+            GRANT_ALL_PRE_POWER,
+            GRANT_ALL_PRE_POWER & !GRANT_KEYBOARD,
+            GRANT_ALL & !GRANT_LAUNCH,
+            GRANT_GAMEPAD | GRANT_CLIPBOARD,
+            GRANT_POWER,
+            0x80,
+            0x80 | GRANT_GAMEPAD,
+            0x80 | GRANT_ALL,
+            0x80 | GRANT_ALL_PRE_POWER,
+            0x100 | GRANT_ALL_PRE_POWER,
+        ];
+        let level = |mask: u32| match normalize_legacy_full(mask) & GRANT_ALL {
+            GRANT_PRESET_FULL => "full",
+            GRANT_PRESET_CONTROLLER_ONLY => "controller",
+            GRANT_PRESET_VIEW_ONLY => "view",
+            _ => "custom",
+        };
+        let about = "Generated from punktfunk_core::quic::access by grant_vectors_are_checked_in \
+            (UPDATE_VECTORS=1 rewrites it). The web console and Kotlin SessionAccess tests \
+            replay it.";
+        let mut out = format!("{{\n  \"$comment\": \"{about}\",\n  \"bits\": {{\n");
+        for (i, (name, bit)) in bits.iter().enumerate() {
+            let comma = if i + 1 < bits.len() { "," } else { "" };
+            out += &format!("    \"{name}\": {bit}{comma}\n");
+        }
+        out += &format!(
+            "  }},\n  \"all\": {GRANT_ALL},\n  \"all_pre_power\": {GRANT_ALL_PRE_POWER},\n  \
+             \"masks\": [\n"
+        );
+        for (i, &mask) in masks.iter().enumerate() {
+            let comma = if i + 1 < masks.len() { "," } else { "" };
+            let normalized = normalize_legacy_full(mask);
+            let level = level(mask);
+            out += &format!(
+                "    {{\"mask\": {mask}, \"normalized\": {normalized}, \"level\": \"{level}\"}}\
+                 {comma}\n"
+            );
+        }
+        out + "  ]\n}\n"
+    }
+
+    #[test]
+    fn grant_vectors_are_checked_in() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/grant-vectors.json");
+        let fresh = grant_vectors();
+        if std::env::var_os("UPDATE_VECTORS").is_some() {
+            std::fs::write(path, &fresh).unwrap();
+        }
+        let on_disk = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            on_disk == fresh,
+            "{path} is stale: rerun with UPDATE_VECTORS=1"
+        );
+    }
+
     #[test]
     fn class_bits_round_onto_the_grant_consts() {
         assert_eq!(GrantClass::Gamepad.bit(), GRANT_GAMEPAD);

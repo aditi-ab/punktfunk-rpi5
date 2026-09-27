@@ -145,6 +145,23 @@ mod tests {
         assert_eq!(preset_label(GRANT_ALL | (1 << 20)), "Full control");
     }
 
+    /// The level core writes for each mask; the web console and Kotlin replay the same file.
+    #[test]
+    fn labels_match_the_core_grant_vectors() {
+        let raw = include_str!("../../punktfunk-core/testdata/grant-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("grant-vectors.json parses");
+        for case in file["masks"].as_array().expect("masks array") {
+            let mask = case["mask"].as_u64().expect("mask") as u32;
+            let want = match case["level"].as_str().expect("level") {
+                "full" => "Full control",
+                "controller" => "Controller only",
+                "view" => "View only",
+                _ => "Custom",
+            };
+            assert_eq!(preset_label(mask), want, "mask {mask:#x}");
+        }
+    }
+
     #[test]
     fn the_default_session_wears_no_chip() {
         let now = Instant::now();
