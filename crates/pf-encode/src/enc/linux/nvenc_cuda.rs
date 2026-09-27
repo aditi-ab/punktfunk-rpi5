@@ -1228,231 +1228,29 @@ impl NvencCudaEncoder {
         Ok(buf)
     }
 
-    /// Prepare and submit one device frame. The pending entry owns a raw source hold
-    /// until retrieval completes, including stream-ordered fused conversion.
+    /// Prepare and submit one device frame: rebuild on a changed input, backpressure, fill the
+    /// ring slot, blend the cursor, encode. The pending entry owns a raw source hold until
+    /// retrieval completes, including stream-ordered fused conversion.
     fn submit_device(&mut self, captured: &CapturedFrame, src: Source<'_>) -> Result<()> {
         self.maybe_engage_async();
         self.maybe_disengage_async();
-        // Size or format change (NV12↔YUV444) re-inits.
-        let new_fmt = match src {
-            Source::Cuda(b) => buffer_format(b, captured.format),
-            Source::Dmabuf(_) => self.raw_buffer_format(captured.format),
-        };
-        let input = (captured.width, captured.height);
-        let size_changed = self.s.inited()
-            && match &self.reframe {
-                Some(r) => r.src != input,
-                None => (self.s.width, self.s.height) != input,
-            };
-        let fmt_changed = self.s.inited() && self.s.buffer_fmt != new_fmt;
-        if self.s.inited() && (size_changed || fmt_changed) {
-            tracing::info!(
-                size_changed,
-                fmt_changed,
-                new = format!("{}x{}", captured.width, captured.height),
-                "NVENC (Linux): capture size/format changed — re-initializing session"
-            );
-            // SAFETY: encode thread, the session open, previous frame already polled — nothing
-            // mid-encode. Cached ring/bitstreams/pending belong to this session.
-            unsafe { self.teardown() };
-        }
-        if !self.s.inited() {
-            (self.s.width, self.s.height) = input;
-            if let Some(r) = &mut self.reframe {
-                let [x, y, w, h] = r.crop;
-                ensure!(
-                    x + w <= input.0 && y + h <= input.1,
-                    "NVENC (Linux): a {}x{} capture does not hold the {w}x{h} crop at {x},{y}",
-                    input.0,
-                    input.1
-                );
-                r.src = input;
-                (self.s.width, self.s.height) = r.out;
-            }
-            self.s.buffer_fmt = new_fmt;
-            // Depth and HDR from the capture format: a packed-RGB 8-bit surface reaches a
-            // 10-bit SDR stream; a planar 8-bit one (NV12/YUV444) stays 8-bit rather than
-            // failing the 10-bit session.
-            let (depth, hdr) = depth_and_hdr(new_fmt, self.depth_asked);
-            if self.depth_asked >= 10 && depth < 10 {
-                tracing::warn!(
-                    format = ?captured.format,
-                    "Linux direct-NVENC: 10-bit negotiated but the capture is a planar 8-bit \
-                     surface NVENC can't feed a 10-bit session — encoding 8-bit SDR (the stream \
-                     is labelled to match)"
-                );
-            }
-            (self.s.bit_depth, self.s.hdr) = (depth, hdr);
-            // FREXT only on genuine YUV444; NV12/RGB cannot reconstruct full chroma.
-            self.s.chroma_444 = self.s.chroma_444
-                && match src {
-                    Source::Cuda(b) => b.is_yuv444(),
-                    Source::Dmabuf(_) => true,
-                };
-            // `init_session` publishes the handle before later fallible steps. A failure leaves
-            // a live session with `inited` false; the next submit would skip teardown and leak.
-            // `teardown` keys off the handle, so it cleans this half-built state.
-            if let Err(e) = self.init_session() {
-                // SAFETY: encode thread owns the session; failed init left nothing mid-encode.
-                unsafe { self.teardown() };
-                return Err(e);
-            }
-        } else {
-            cuda::make_current().context("cuCtxSetCurrent (encode thread)")?;
-        }
-
+        self.ensure_session(captured, src)?;
         // Two-thread backpressure: block on the oldest completion so this slot is free before
         // reuse. Cap-deep instead of 1.
         self.s.wait_below(async_inflight_cap())?;
         let slot = self.s.slot();
-
         // `PUNKTFUNK_PERF` submit split (~1 line / 2 s at 60 fps). Host `submit_us` folds
         // copy/blend/map/pic; this splits them.
         let sample = pf_host_config::config().perf && self.frames % 120 == 0;
         self.frames += 1;
-
-        // Stream-ordered only while `pending` is empty: blocking `poll` drained the prior
-        // encode, so the reused slot was fully read and the caller still holds this payload
-        // across `poll`. Pipelined / two-thread falls back to a blocking copy so an
-        // early-recycled source cannot be read late.
-        let base_ordered = self.stream_ordered
-            && !self.s.retrieving()
-            && self.s.pending().is_empty()
-            && self.reframe.is_none();
-        // Cursor stays stream-ordered when the blend can wait a CUDA-held timeline semaphore.
-        // Otherwise the fence/CPU path sits between copy and encode.
-        let cursor_ordered = base_ordered
-            && captured.cursor.is_some()
-            && matches!(self.ring[slot].surface, SlotSurface::Vk(_))
-            && self.vk_blend.as_ref().is_some_and(|vk| vk.ordered_ready());
-        let ordered = base_ordered && (captured.cursor.is_none() || cursor_ordered);
+        let (ordered, cursor_ordered) = self.ordering(captured, slot);
         let t0 = std::time::Instant::now();
-
-        // A held dmabuf goes through the worker's fused pass (cursor included); a CUDA buffer
-        // is copied in, reframed when the session scales, and the cursor blended after.
-        let fused_cursor = if let Source::Dmabuf(d) = src {
-            self.convert_raw(captured, d, slot, ordered)?;
-            true
-        } else {
-            let Source::Cuda(buf) = src else {
-                unreachable!("the dmabuf arm returned above")
-            };
-            match &self.reframe {
-                // A reframe reads the staging slot on the Vulkan queue: the copy must have landed.
-                Some(r) => {
-                    let (stage, fmt) = (r.staging[slot], slot_fmt_of(self.s.buffer_fmt));
-                    // SAFETY: the staging slot is this session's, sized for its layout; the
-                    // context is current (above), and the copy is synchronous.
-                    unsafe {
-                        self.copy_into(buf, stage.ptr, stage.pitch, u64::from(stage.height), true)
-                    }?;
-                    let (crop, out) = (r.crop, r.out);
-                    let (vk, SlotSurface::Vk(dst)) =
-                        (self.vk_blend.as_mut(), &self.ring[slot].surface)
-                    else {
-                        bail!("NVENC (Linux): a reframing session without Vulkan slots");
-                    };
-                    vk.expect("a Vk ring implies the slot device")
-                        .reframe(&stage, dst, fmt, crop, out)
-                        .context("NVENC (Linux): reframe")?;
-                }
-                None => self.copy_into_slot(buf, slot, !ordered)?,
-            }
-            false
-        };
+        let fused_cursor = self.fill_slot(captured, src, slot, ordered)?;
         let t_copy = t0.elapsed();
-
-        // Blend into this slot's owned surface (cursor rect, never the compositor dmabuf).
-        // Ordered: copy/dispatch/encode on-device via timeline. Else CUDA copy then
-        // fence-waited dispatch, then encode. Failure drops the cursor, never the frame.
         // A fused convert already carries the cursor.
         if let (false, Some(ov)) = (fused_cursor, &captured.cursor) {
-            // A reframed picture takes the pointer scaled and moved with it.
-            let (cw, ch, cx, cy) = match &mut self.reframe {
-                Some(r) => {
-                    let [x, y, w, _] = r.crop;
-                    let (ow, oh) = r.out;
-                    let scale = |v: i64, n: u32| (v * i64::from(n)).div_euclid(i64::from(w));
-                    let h = r.crop[3];
-                    let scale_y = |v: i64| (v * i64::from(oh)).div_euclid(i64::from(h));
-                    if r.cursor.as_ref().map(|c| c.0) != Some(ov.serial) {
-                        let tw = (u64::from(ov.w) * u64::from(ow) / u64::from(w)).max(1) as u32;
-                        let th = (u64::from(ov.h) * u64::from(oh) / u64::from(h)).max(1) as u32;
-                        let src = if captured.format.is_hdr() {
-                            ov.pq_rgba()
-                        } else {
-                            ov.rgba.clone()
-                        };
-                        let scaled = shrink_rgba(&src, ov.w, ov.h, tw, th);
-                        r.cursor = Some((ov.serial, scaled, tw, th));
-                    }
-                    let (_, _, tw, th) = r.cursor.as_ref().expect("set above");
-                    (
-                        *tw,
-                        *th,
-                        scale(i64::from(ov.x) - i64::from(x), ow) as i32,
-                        scale_y(i64::from(ov.y) - i64::from(y)) as i32,
-                    )
-                }
-                None => (ov.w, ov.h, ov.x, ov.y),
-            };
-            if let (Some(vk), SlotSurface::Vk(vref)) =
-                (self.vk_blend.as_mut(), &self.ring[slot].surface)
-            {
-                if self.cursor_serial != ov.serial {
-                    // Quiesces in-flight ordered blends before touching staging.
-                    let pq = captured.format.is_hdr().then(|| ov.pq_rgba());
-                    let bitmap = match &self.reframe {
-                        Some(r) => r.cursor.as_ref().map_or(&[][..], |c| c.1.as_slice()),
-                        None => pq.as_deref().unwrap_or(&ov.rgba).as_slice(),
-                    };
-                    vk.upload_cursor(bitmap, cw, ch);
-                    self.cursor_serial = ov.serial;
-                }
-                // `surfW` = content width. Pixels past content land in cropped padding.
-                let r = if cursor_ordered {
-                    vk.blend_ref_ordered(
-                        vref,
-                        slot_fmt_of(self.s.buffer_fmt),
-                        self.s.width,
-                        cw,
-                        ch,
-                        cx,
-                        cy,
-                    )
-                } else {
-                    vk.blend_ref(
-                        vref,
-                        slot_fmt_of(self.s.buffer_fmt),
-                        self.s.width,
-                        cw,
-                        ch,
-                        cx,
-                        cy,
-                    )
-                };
-                if let Err(e) = r {
-                    if !self.cursor_blend_warned {
-                        self.cursor_blend_warned = true;
-                        tracing::warn!(
-                            error = %format!("{e:#}"),
-                            "NVENC (Linux): cursor blend dispatch failed — cursor not composited"
-                        );
-                    }
-                } else {
-                    self.cursor_blend_warned = false;
-                }
-            } else if !self.cursor_blend_warned {
-                self.cursor_blend_warned = true;
-                tracing::warn!(
-                    blend_wanted = self.blend_wanted,
-                    "NVENC (Linux): cursor overlay present but no Vulkan blend (bring-up failed, \
-                     or a non-blend session unexpectedly carried an overlay) — cursor not \
-                     composited"
-                );
-            }
+            self.blend_cursor(captured, ov, slot, cursor_ordered);
         }
-
         let t_blend = t0.elapsed() - t_copy;
         let input = EncodeInput {
             reg: self.ring[slot].reg,
@@ -1461,10 +1259,10 @@ impl NvencCudaEncoder {
             pts_ns: captured.pts_ns,
             hold: source_hold(captured),
         };
-        // SAFETY: the session is open (above) and `input.reg` is this slot's registration. The
-        // slot was just filled (blocking copy, or IO-stream / timeline ordered before this
-        // encode) and is not overwritten until POOL submits later, by which time this encode
-        // was polled.
+        // SAFETY: the session is open (`ensure_session`) and `input.reg` is this slot's
+        // registration. The slot was just filled (blocking copy, or IO-stream / timeline ordered
+        // before this encode) and is not overwritten until POOL submits later, by which time
+        // this encode was polled.
         let times = unsafe { self.s.encode(input) }?;
         if sample {
             tracing::info!(
@@ -1477,6 +1275,220 @@ impl NvencCudaEncoder {
             );
         }
         Ok(())
+    }
+
+    /// Open the session for this capture, first tearing down one whose size or format
+    /// (NV12↔YUV444) no longer matches. Depth, HDR and 4:4:4 follow the capture format.
+    fn ensure_session(&mut self, captured: &CapturedFrame, src: Source<'_>) -> Result<()> {
+        let new_fmt = match src {
+            Source::Cuda(b) => buffer_format(b, captured.format),
+            Source::Dmabuf(_) => self.raw_buffer_format(captured.format),
+        };
+        let input = (captured.width, captured.height);
+        let inited = self.s.inited();
+        let size_changed = inited
+            && match &self.reframe {
+                Some(r) => r.src != input,
+                None => (self.s.width, self.s.height) != input,
+            };
+        let fmt_changed = inited && self.s.buffer_fmt != new_fmt;
+        if inited && (size_changed || fmt_changed) {
+            tracing::info!(
+                size_changed,
+                fmt_changed,
+                new = format!("{}x{}", captured.width, captured.height),
+                "NVENC (Linux): capture size/format changed — re-initializing session"
+            );
+            // SAFETY: encode thread, the session open, previous frame already polled — nothing
+            // mid-encode. Cached ring/bitstreams/pending belong to this session.
+            unsafe { self.teardown() };
+        }
+        if self.s.inited() {
+            return cuda::make_current().context("cuCtxSetCurrent (encode thread)");
+        }
+        (self.s.width, self.s.height) = input;
+        if let Some(r) = &mut self.reframe {
+            let [x, y, w, h] = r.crop;
+            ensure!(
+                x + w <= input.0 && y + h <= input.1,
+                "NVENC (Linux): a {}x{} capture does not hold the {w}x{h} crop at {x},{y}",
+                input.0,
+                input.1
+            );
+            r.src = input;
+            (self.s.width, self.s.height) = r.out;
+        }
+        self.s.buffer_fmt = new_fmt;
+        // Depth and HDR from the capture format: a packed-RGB 8-bit surface reaches a
+        // 10-bit SDR stream; a planar 8-bit one (NV12/YUV444) stays 8-bit rather than
+        // failing the 10-bit session.
+        let (depth, hdr) = depth_and_hdr(new_fmt, self.depth_asked);
+        if self.depth_asked >= 10 && depth < 10 {
+            tracing::warn!(
+                format = ?captured.format,
+                "Linux direct-NVENC: 10-bit negotiated but the capture is a planar 8-bit \
+                 surface NVENC can't feed a 10-bit session — encoding 8-bit SDR (the stream \
+                 is labelled to match)"
+            );
+        }
+        (self.s.bit_depth, self.s.hdr) = (depth, hdr);
+        // FREXT only on genuine YUV444; NV12/RGB cannot reconstruct full chroma.
+        self.s.chroma_444 = self.s.chroma_444
+            && match src {
+                Source::Cuda(b) => b.is_yuv444(),
+                Source::Dmabuf(_) => true,
+            };
+        // `init_session` publishes the handle before later fallible steps. A failure leaves
+        // a live session with `inited` false; the next submit would skip teardown and leak.
+        // `teardown` keys off the handle, so it cleans this half-built state.
+        if let Err(e) = self.init_session() {
+            // SAFETY: encode thread owns the session; failed init left nothing mid-encode.
+            unsafe { self.teardown() };
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Whether this frame's copy and cursor blend may enqueue ahead of the encode without a CPU
+    /// sync: `(ordered, cursor_ordered)`. Only while `pending` is empty — the blocking `poll`
+    /// drained the prior encode, so the reused slot was fully read and the caller still holds
+    /// this payload across `poll`. Pipelined / two-thread falls back to a blocking copy so an
+    /// early-recycled source cannot be read late.
+    fn ordering(&self, captured: &CapturedFrame, slot: usize) -> (bool, bool) {
+        let base_ordered = self.stream_ordered
+            && !self.s.retrieving()
+            && self.s.pending().is_empty()
+            && self.reframe.is_none();
+        // Cursor stays stream-ordered when the blend can wait a CUDA-held timeline semaphore.
+        // Otherwise the fence/CPU path sits between copy and encode.
+        let cursor_ordered = base_ordered
+            && captured.cursor.is_some()
+            && matches!(self.ring[slot].surface, SlotSurface::Vk(_))
+            && self.vk_blend.as_ref().is_some_and(|vk| vk.ordered_ready());
+        let ordered = base_ordered && (captured.cursor.is_none() || cursor_ordered);
+        (ordered, cursor_ordered)
+    }
+
+    /// Fill ring slot `slot` with this frame. A held dmabuf goes through the worker's fused
+    /// pass, cursor included (`true`); a CUDA buffer is copied in, reframed when the session
+    /// scales, and leaves the cursor to [`Self::blend_cursor`] (`false`).
+    fn fill_slot(
+        &mut self,
+        captured: &CapturedFrame,
+        src: Source<'_>,
+        slot: usize,
+        ordered: bool,
+    ) -> Result<bool> {
+        let buf = match src {
+            Source::Dmabuf(d) => {
+                self.convert_raw(captured, d, slot, ordered)?;
+                return Ok(true);
+            }
+            Source::Cuda(buf) => buf,
+        };
+        match &self.reframe {
+            // A reframe reads the staging slot on the Vulkan queue: the copy must have landed.
+            Some(r) => {
+                let (stage, fmt) = (r.staging[slot], slot_fmt_of(self.s.buffer_fmt));
+                // SAFETY: the staging slot is this session's, sized for its layout; the
+                // context is current (`ensure_session`), and the copy is synchronous.
+                unsafe {
+                    self.copy_into(buf, stage.ptr, stage.pitch, u64::from(stage.height), true)
+                }?;
+                let (crop, out) = (r.crop, r.out);
+                let (vk, SlotSurface::Vk(dst)) = (self.vk_blend.as_mut(), &self.ring[slot].surface)
+                else {
+                    bail!("NVENC (Linux): a reframing session without Vulkan slots");
+                };
+                vk.expect("a Vk ring implies the slot device")
+                    .reframe(&stage, dst, fmt, crop, out)
+                    .context("NVENC (Linux): reframe")?;
+            }
+            None => self.copy_into_slot(buf, slot, !ordered)?,
+        }
+        Ok(false)
+    }
+
+    /// Blend the cursor into this slot's owned surface (cursor rect, never the compositor
+    /// dmabuf). Ordered: copy/dispatch/encode on-device via timeline. Else CUDA copy then
+    /// fence-waited dispatch, then encode. Failure drops the cursor, never the frame.
+    fn blend_cursor(
+        &mut self,
+        captured: &CapturedFrame,
+        ov: &pf_frame::CursorOverlay,
+        slot: usize,
+        cursor_ordered: bool,
+    ) {
+        // A reframed picture takes the pointer scaled and moved with it.
+        let (cw, ch, cx, cy) = match &mut self.reframe {
+            Some(r) => {
+                let [x, y, w, _] = r.crop;
+                let (ow, oh) = r.out;
+                let scale = |v: i64, n: u32| (v * i64::from(n)).div_euclid(i64::from(w));
+                let h = r.crop[3];
+                let scale_y = |v: i64| (v * i64::from(oh)).div_euclid(i64::from(h));
+                if r.cursor.as_ref().map(|c| c.0) != Some(ov.serial) {
+                    let tw = (u64::from(ov.w) * u64::from(ow) / u64::from(w)).max(1) as u32;
+                    let th = (u64::from(ov.h) * u64::from(oh) / u64::from(h)).max(1) as u32;
+                    let src = if captured.format.is_hdr() {
+                        ov.pq_rgba()
+                    } else {
+                        ov.rgba.clone()
+                    };
+                    let scaled = shrink_rgba(&src, ov.w, ov.h, tw, th);
+                    r.cursor = Some((ov.serial, scaled, tw, th));
+                }
+                let (_, _, tw, th) = r.cursor.as_ref().expect("set above");
+                (
+                    *tw,
+                    *th,
+                    scale(i64::from(ov.x) - i64::from(x), ow) as i32,
+                    scale_y(i64::from(ov.y) - i64::from(y)) as i32,
+                )
+            }
+            None => (ov.w, ov.h, ov.x, ov.y),
+        };
+        let (Some(vk), SlotSurface::Vk(vref)) = (self.vk_blend.as_mut(), &self.ring[slot].surface)
+        else {
+            if !self.cursor_blend_warned {
+                self.cursor_blend_warned = true;
+                tracing::warn!(
+                    blend_wanted = self.blend_wanted,
+                    "NVENC (Linux): cursor overlay present but no Vulkan blend (bring-up failed, \
+                     or a non-blend session unexpectedly carried an overlay) — cursor not \
+                     composited"
+                );
+            }
+            return;
+        };
+        if self.cursor_serial != ov.serial {
+            // Quiesces in-flight ordered blends before touching staging.
+            let pq = captured.format.is_hdr().then(|| ov.pq_rgba());
+            let bitmap = match &self.reframe {
+                Some(r) => r.cursor.as_ref().map_or(&[][..], |c| c.1.as_slice()),
+                None => pq.as_deref().unwrap_or(&ov.rgba).as_slice(),
+            };
+            vk.upload_cursor(bitmap, cw, ch);
+            self.cursor_serial = ov.serial;
+        }
+        // `surfW` = content width. Pixels past content land in cropped padding.
+        let (fmt, width) = (slot_fmt_of(self.s.buffer_fmt), self.s.width);
+        let r = if cursor_ordered {
+            vk.blend_ref_ordered(vref, fmt, width, cw, ch, cx, cy)
+        } else {
+            vk.blend_ref(vref, fmt, width, cw, ch, cx, cy)
+        };
+        if let Err(e) = r {
+            if !self.cursor_blend_warned {
+                self.cursor_blend_warned = true;
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "NVENC (Linux): cursor blend dispatch failed — cursor not composited"
+                );
+            }
+        } else {
+            self.cursor_blend_warned = false;
+        }
     }
 }
 
