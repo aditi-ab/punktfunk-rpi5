@@ -301,6 +301,11 @@
       "error": "bad-fingerprint"
     },
     {
+      "name": "fingerprint-fullwidth-digit",
+      "url": "punktfunk://connect/Desk?fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%EF%BC%90",
+      "error": "bad-fingerprint"
+    },
+    {
       "name": "host-parameter-with-an-unparsable-port",
       "url": "punktfunk://connect/Desk?host=box:notaport",
       "error": "bad-host-param"

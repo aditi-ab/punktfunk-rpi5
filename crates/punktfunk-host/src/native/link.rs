@@ -135,7 +135,7 @@ impl SessionLink {
                 .receive_datagram()
                 .await
                 .map(|d| d.payload().to_vec())
-                .map_err(|e| LinkClosed::Other(format!("{e:?}"))),
+                .map_err(LinkClosed::from),
         }
     }
 
@@ -171,9 +171,30 @@ impl SessionLink {
         self.quic().close(code.into(), reason);
     }
 
+    /// Close with a typed code and its reason. A browser is never shown a close reason, so it
+    /// gets the same code and text on a stream first.
+    pub(crate) async fn refuse(&self, code: u32, reason: &str) {
+        if let SessionLink::Web(c, _) = self {
+            crate::webtransport::refuse(c, code, reason).await;
+        }
+        self.close(code, reason.as_bytes());
+    }
+
     /// Resolves when the peer is gone.
+    ///
+    /// A page's `close({closeCode})` ends the WebTransport session, not the QUIC connection
+    /// under it, which the driver then closes with a code of its own. So a browser's close is
+    /// read from the session. The page never opens a unidirectional stream, so this accept only
+    /// ever returns the session's end.
     pub(crate) async fn closed(&self) -> LinkClosed {
-        LinkClosed::from(self.quic().closed().await)
+        match self {
+            SessionLink::Quic(c) => LinkClosed::from(c.closed().await),
+            SessionLink::Web(c, _) => loop {
+                if let Err(e) = c.accept_uni().await {
+                    break LinkClosed::from(e);
+                }
+            },
+        }
     }
 
     /// The peer's first bidirectional stream — the control stream on both carriers.
@@ -289,6 +310,20 @@ impl From<quinn::ConnectionError> for LinkClosed {
                 reason: String::from_utf8_lossy(&ac.reason).into_owned(),
             },
             quinn::ConnectionError::TimedOut => LinkClosed::TimedOut,
+            other => LinkClosed::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<wtransport::error::ConnectionError> for LinkClosed {
+    fn from(e: wtransport::error::ConnectionError) -> LinkClosed {
+        use wtransport::error::ConnectionError;
+        match e {
+            ConnectionError::ApplicationClosed(ac) => LinkClosed::App {
+                code: ac.code().into_inner(),
+                reason: String::from_utf8_lossy(ac.reason()).into_owned(),
+            },
+            ConnectionError::TimedOut => LinkClosed::TimedOut,
             other => LinkClosed::Other(other.to_string()),
         }
     }

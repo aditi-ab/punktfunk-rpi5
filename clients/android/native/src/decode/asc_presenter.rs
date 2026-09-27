@@ -897,6 +897,28 @@ impl AscBackend {
         self.hdr_meta = meta;
     }
 
+    /// Wake the decode loop when a rendered frame reaches the reader. Codec2 queues it inside
+    /// the render call, OMX later on ACodec's looper — without a wake the pass that could
+    /// present it is the next AU, vsync or 5 ms timeout.
+    pub(super) fn wake_on_image(&mut self, tx: mpsc::Sender<DecodeEvent>) {
+        let wake = Box::new(move |_: &ImageReader| {
+            let _ = tx.send(DecodeEvent::ImageAvailable);
+        });
+        if let Err(e) = self.reader.set_image_listener(wake) {
+            log::warn!("asc: image listener not set ({e:?}) — frames wait for the next wake");
+        }
+    }
+
+    /// The decoded picture's size, which the layer's source rect crops against. The reader was
+    /// sized at the session's first mode; an in-session mode change keeps the same reader.
+    pub(super) fn set_src_size(&mut self, w: i32, h: i32) {
+        if (self.src_w, self.src_h) != (w.max(1), h.max(1)) {
+            self.src_w = w.max(1);
+            self.src_h = h.max(1);
+            log::info!("asc: source picture now {w}x{h}");
+        }
+    }
+
     /// Update the `ADataSpace` applied to every subsequent transaction (a refinement from the
     /// codec's output format — the analogue of the SurfaceView path's `apply_reported_dataspace`;
     /// the negotiated colour set the initial value at create).

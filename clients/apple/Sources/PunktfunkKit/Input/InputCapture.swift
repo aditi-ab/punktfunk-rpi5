@@ -270,6 +270,20 @@ public final class InputCapture {
         ) { [weak self] n in
             if let k = n.object as? GCKeyboard { self?.attach(keyboard: k) }
         })
+        #if !os(macOS)
+        // A device that drops mid-press never sends its releases, and the repeat ticker would
+        // keep typing a held key.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .GCMouseDidDisconnect, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.releaseMouseButtons()
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .GCKeyboardDidDisconnect, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.releaseAll()
+        })
+        #endif
         // Focus loss: GC stops delivering, so release everything still held host-side.
         #if os(macOS)
         let resignActive = NSApplication.didResignActiveNotification
@@ -300,10 +314,13 @@ public final class InputCapture {
         ) { [weak self] event in
             guard let self, self.ownsEvent?(event) ?? true else { return event }
             let flags = Self.chordFlags(event)
-            if event.keyCode == 53 /* Esc */, flags == .command {
-                self.suppressedVK = 0x1B // VK_ESC — its keyUp still reaches the responder chain
-                self.onToggleCapture?()
+            // A held chord auto-repeats: swallow the repeats and act on the first press only.
+            func take(_ vk: UInt32, _ action: (() -> Void)?) -> NSEvent? {
+                if !event.isARepeat { self.suppressedVK = vk; action?() }
                 return nil
+            }
+            if event.keyCode == 53 /* Esc */, flags == .command {
+                return take(0x1B, self.onToggleCapture) // VK_ESC
             }
             // ⌃⌥⇧M flips the mouse model (capture ⇄ desktop — the SDL clients' identical
             // chord). Detected in both capture states, like ⌘⎋, so the model can be set
@@ -311,9 +328,7 @@ public final class InputCapture {
             // (latched like ⌘⎋'s Esc) so it doesn't type into the host, and swallow the
             // event so it doesn't beep.
             if event.keyCode == 46 /* M */, flags == [.control, .option, .shift] {
-                self.suppressedVK = 0x4D // VK_M — its keyUp still reaches the responder chain
-                self.onToggleMouseMode?()
-                return nil
+                return take(0x4D, self.onToggleMouseMode) // VK_M
             }
             // The cross-client combos (Ctrl+Alt+Shift+Q/D/S/O — the same set every other
             // punktfunk client reserves), intercepted only while forwarding so the host never
@@ -326,25 +341,15 @@ public final class InputCapture {
             if self.forwarding, flags == [.control, .option, .shift] {
                 switch event.keyCode {
                 case 12 /* Q */:
-                    self.suppressedVK = 0x51
-                    self.onReleaseCapture?()
-                    return nil
+                    return take(0x51, self.onReleaseCapture)
                 case 2 /* D */:
-                    self.suppressedVK = 0x44
-                    self.onDisconnect?()
-                    return nil
+                    return take(0x44, self.onDisconnect)
                 case 1 /* S */:
-                    self.suppressedVK = 0x53
-                    self.onCycleStats?()
-                    return nil
+                    return take(0x53, self.onCycleStats)
                 case 0 /* A */:
-                    self.suppressedVK = 0x41
-                    self.onToggleMicMute?()
-                    return nil
+                    return take(0x41, self.onToggleMicMute)
                 case 31 /* O */:
-                    self.suppressedVK = 0x4F
-                    self.onQuickActions?()
-                    return nil
+                    return take(0x4F, self.onQuickActions)
                 default:
                     break
                 }
@@ -353,9 +358,7 @@ public final class InputCapture {
             // captured stream view swallows the menu's identical equivalent); the F is latched so its
             // keyUp can't type into the host. keyCode 3 = kVK_ANSI_F (layout-independent).
             if self.forwarding, flags == [.control, .command], event.keyCode == 3 /* F */ {
-                self.suppressedVK = 0x46 // VK_F — its keyUp still reaches the responder chain
-                self.onToggleFullscreen?()
-                return nil
+                return take(0x46, self.onToggleFullscreen) // VK_F
             }
             // Every OTHER ⌘ chord is the HOST's while captured, or the menu takes ⌘Q first. It is
             // sent from here, since returning nil also skips StreamLayerView's keyDown; a chord

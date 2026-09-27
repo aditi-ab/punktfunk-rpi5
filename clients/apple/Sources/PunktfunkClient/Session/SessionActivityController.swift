@@ -24,8 +24,6 @@ final class SessionActivityController {
     /// then greys out instead of showing a lying clock.
     private static let staleWindow: TimeInterval = 90
 
-    var isActive: Bool { activity != nil }
-
     /// End any Activity left over from a previous launch that was killed mid-session. Call once at
     /// app start (ContentView.onAppear).
     static func sweepOrphans() {

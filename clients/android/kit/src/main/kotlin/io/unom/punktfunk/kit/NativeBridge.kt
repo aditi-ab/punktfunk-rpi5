@@ -211,8 +211,9 @@ object NativeBridge {
 
     /**
      * The MediaCodec MIME the host resolved for this session (`"video/hevc"` / `"video/avc"` /
-     * `"video/av01"`), or `""` on a `0` handle. Kotlin ranks `MediaCodecList` decoders for this
-     * MIME (see [io.unom.punktfunk.kit.VideoDecoders]) before [nativeStartVideo]. Cheap; UI-safe.
+     * `"video/av01"`), or `""` on a `0` or closed handle. Kotlin ranks `MediaCodecList` decoders
+     * for this MIME (see [io.unom.punktfunk.kit.VideoDecoders]) before [nativeStartVideo]. Cheap;
+     * UI-safe.
      */
     external fun nativeVideoMime(handle: Long): String
 

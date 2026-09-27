@@ -113,6 +113,8 @@ struct LibraryView: View {
     /// A Play pressed on that sheet, run once the sheet is down so the session never presents
     /// over a sheet that is still leaving.
     @State private var launchAfterDetails: String?
+    /// The shelf went behind a full-screen details page with its catalog loaded (tvOS).
+    @State private var keptForDetail = false
 
     /// The host this shelf belongs to — every fetch, every poster URL and the launch itself address
     /// it, and a pinned shelf is the same host seen through one of its cards.
@@ -209,7 +211,9 @@ struct LibraryView: View {
                 guard games.isEmpty else { return }
                 if let seen = Self.shown[host.id.uuidString] { games = seen } else { loading = true }
             }
-            .task { await load() }
+            .task {
+                if keptForDetail { keptForDetail = false } else { await load() }
+            }
             .task(id: loading) {
                 spinnerDue = false
                 guard loading else { return }
@@ -217,6 +221,12 @@ struct LibraryView: View {
                 spinnerDue = loading
             }
             .onDisappear {
+                // tvOS's full-screen details hide the shelf without leaving it: keep the loader
+                // they draw with, and skip the reload on return unless a load was cut short.
+                if detailGame != nil {
+                    keptForDetail = !loading
+                    return
+                }
                 // Hand the loader off before clearing it, so its pooled connections are closed
                 // rather than left open on a screen the user has left.
                 let leaving = artLoader
@@ -836,11 +846,9 @@ struct LibraryView: View {
             loading = false
             return
         }
-        // Beyond the client identity, require the HOST's pinned fingerprint. MgmtTransport accepts
-        // ANY cert for a pin-less host (self-signed, no SAN → system trust is bypassed), so browsing
-        // one lets a LAN MITM serve a forged catalog and harvest this device's mTLS identity. A host
-        // can hold a client identity yet no host pin (abandoned pairing, or after "Forget
-        // Identity"), so this is a distinct check. security-review 2026-08-15 finding 8.
+        // Beyond the client identity, require the HOST's pinned fingerprint. MgmtTransport refuses a
+        // pin-less host; this check only names the remedy. A host can hold a client identity yet no
+        // host pin (abandoned pairing, or after "Forget Identity").
         guard current.pinnedSHA256 != nil else {
             games = []
             errorText = "Pair with this host before browsing its library."
@@ -877,7 +885,10 @@ struct LibraryView: View {
         // waiting to find out whether it is needed costs more than sending it.
         let waking = !current.wakeMacs.isEmpty && PunktfunkConnection.wakeOnLANAvailable
         if waking {
-            _ = PunktfunkConnection.wakeOnLAN(macs: current.wakeMacs, lastKnownIP: current.address)
+            let (macs, address) = (current.wakeMacs, current.address)
+            DispatchQueue.global(qos: .userInitiated).async { // blocking sends — off main
+                PunktfunkConnection.wakeOnLAN(macs: macs, lastKnownIP: address)
+            }
         }
 
         // A woken box takes 20–60 s to answer, so one attempt would almost always land on a host

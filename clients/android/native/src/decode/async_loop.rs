@@ -67,6 +67,8 @@ pub(super) enum DecodeEvent {
     FormatChanged,
     /// A panel vsync (from the [`VsyncClock`] thread) — the presenter's retry/pacing tick.
     Vsync,
+    /// A rendered frame reached the ASC reader. Only wakes the loop: its pass drains the reader.
+    ImageAvailable,
     /// An `ASurfaceControl` transaction completed (ASurfaceControl backend only): the real latch
     /// time + the previous buffer's release fence, forwarded from the completion callback (a binder
     /// thread) so the decode loop applies it on its own thread.
@@ -560,6 +562,7 @@ fn bring_up(
             )
             .map(|mut a| {
                 a.set_hdr_meta(hdr_static);
+                a.wake_on_image(ev_tx.clone());
                 a
             })
         });
@@ -724,6 +727,8 @@ struct Admit {
     parts_of: Option<u32>,
     /// A backstop asked for a keyframe during the current stretch.
     backstop: bool,
+    /// This loop dropped an admitted AU; the next first part is noted with a gap.
+    local_gap: bool,
 }
 
 /// The receiver rule for this session: AV1 only, strict on the Tensor G5 decoder, lenient on
@@ -745,6 +750,7 @@ fn admission(codec: u8, decoder: &str) -> Option<Admit> {
         class,
         parts_of: None,
         backstop: false,
+        local_gap: false,
     })
 }
 
@@ -819,6 +825,7 @@ impl State {
                 if self.pending_aus.len() > FRAME_PARK_CAP {
                     self.pending_aus.pop_front(); // sustained overflow — drop oldest
                     pass.aus_dropped += 1;
+                    self.local_loss(pass);
                 }
             }
             DecodeEvent::InputAvailable(i) => {
@@ -838,6 +845,7 @@ impl State {
             }),
             DecodeEvent::FormatChanged => pass.fmt_dirty = true,
             DecodeEvent::Vsync => pass.vsync_tick = true,
+            DecodeEvent::ImageAvailable => {}
             DecodeEvent::Error { fatal: true } => self.fatal = true,
             // A recoverable/transient codec error is a decode hiccup on a broken reference chain —
             // arm the freeze so the concealed output it recovers into is held off the screen.
@@ -855,6 +863,11 @@ impl State {
         if f.part.is_some_and(|p| !p.first) {
             return a.parts_of == Some(f.frame_index);
         }
+        let gap = if std::mem::take(&mut a.local_gap) {
+            gap.max(1)
+        } else {
+            gap
+        };
         let step = a.rule.note(f.frame_index, gap, f.flags, a.class, None);
         a.parts_of = step.withhold.then_some(f.frame_index);
         if let Some(e) = step.ended {
@@ -881,6 +894,20 @@ impl State {
         step.withhold
     }
 
+    /// This loop dropped an AU the rule had admitted, and the AUs behind it may name it. The
+    /// parked ones are judged again and the next arrival sees the gap, as for a network loss.
+    fn local_loss(&mut self, pass: &mut Pass) {
+        let Some(a) = self.admit.as_mut() else {
+            return;
+        };
+        a.local_gap = true;
+        for f in std::mem::take(&mut self.pending_aus) {
+            if !self.withhold(&f, 0, pass) {
+                self.pending_aus.push_back(f);
+            }
+        }
+    }
+
     /// The pass proper, after the drain: completions, the vsync tick, the format change, feeding,
     /// the re-anchor cadence reset, then presenting.
     fn apply(&mut self, ctx: &Ctx, pass: &mut Pass) {
@@ -896,6 +923,10 @@ impl State {
             }
             if let Some(a) = self.asc.as_mut() {
                 a.poll_fences(ctx.offset(), &ctx.stats, &ctx.video_e2e);
+                // The host re-sends the source's grade on capture start and keyframes.
+                if ctx.client.color.is_hdr() {
+                    a.set_hdr_meta(ctx.client.latest_hdr_meta(Duration::ZERO));
+                }
             }
         }
         ctx.stats.note_skipped_overflow(pass.aus_dropped); // parked-AU overflow: skips, flagged as such
@@ -903,6 +934,9 @@ impl State {
             if let Some((w, h)) = super::display::picture_size(&ctx.codec) {
                 ctx.decoded_size
                     .store(crate::session::pack_surface_size(w, h), Ordering::Relaxed);
+                if let Some(a) = self.asc.as_mut() {
+                    a.set_src_size(w, h);
+                }
             }
             match self.asc.as_mut() {
                 // ASC carries the colour on the transaction, not the SurfaceView window. Refine
@@ -916,7 +950,7 @@ impl State {
                 None => apply_reported_dataspace(&ctx.codec, &ctx.window, &mut self.applied_ds),
             }
         }
-        self.feed(ctx);
+        self.feed(ctx, pass);
         // The cadence loop's re-anchor seam. A fresh arm means a loss was detected: the frames
         // that reach the presenter on the far side come through a decoder that has just
         // recovered, so the source→presentable delay the loop had measured is not the one it
@@ -944,7 +978,7 @@ impl State {
     /// [`BUFFER_FLAG_PARTIAL_FRAME`] except the AU's last, all at the AU's pts. `part_open` is
     /// the continuity ledger — any break (gap, orphan, oversize) abandons the AU per
     /// [`PartFeed::pts_us`]'s close contract and re-syncs at the next `first`.
-    fn feed(&mut self, ctx: &Ctx) {
+    fn feed(&mut self, ctx: &Ctx, pass: &mut Pass) {
         let codec = &ctx.codec;
         while !self.pending_aus.is_empty() && !self.free_inputs.is_empty() {
             let idx = self.free_inputs.pop_front().unwrap();
@@ -976,6 +1010,7 @@ impl State {
                     self.gate.arm(Instant::now());
                     let _ = ctx.client.request_keyframe();
                     self.pending_aus.push_front(frame);
+                    self.local_loss(pass);
                     continue;
                 }
                 // No AU open: an orphan non-first piece lost its head upstream — discard and
@@ -1010,8 +1045,8 @@ impl State {
                     self.oversized_dropped
                 );
                 let _ = ctx.client.request_keyframe();
+                self.gate.arm(Instant::now());
                 if frame.part.is_some() {
-                    self.gate.arm(Instant::now());
                     // Pieces already queued can't be unqueued: poison the ledger so the next
                     // delivery mismatches and takes the close-empty path above.
                     self.part_open = Some(PartFeed {
@@ -1019,6 +1054,8 @@ impl State {
                         expected: usize::MAX,
                         pts_us,
                     });
+                } else {
+                    self.local_loss(pass);
                 }
                 continue;
             }
@@ -1039,6 +1076,11 @@ impl State {
                         expected: usize::MAX,
                         pts_us,
                     });
+                } else {
+                    // A whole AU lost here is a loss like any other: freeze and ask.
+                    self.gate.arm(Instant::now());
+                    let _ = ctx.client.request_keyframe();
+                    self.local_loss(pass);
                 }
                 continue;
             }

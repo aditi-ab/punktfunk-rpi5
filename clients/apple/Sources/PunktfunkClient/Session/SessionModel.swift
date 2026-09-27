@@ -116,7 +116,26 @@ final class SessionModel: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .idle
-    @Published private(set) var connection: PunktfunkConnection?
+    @Published private(set) var connection: PunktfunkConnection? {
+        didSet {
+            #if os(macOS)
+            Self.liveConnections[ObjectIdentifier(self)] = connection
+            #endif
+        }
+    }
+    #if os(macOS)
+    /// Every window's live connection: a Cmd+Q runs no window's teardown.
+    private static var liveConnections: [ObjectIdentifier: PunktfunkConnection] = [:]
+
+    /// App quit: end each live session as a deliberate quit, before the process goes.
+    static func quitAll() {
+        for conn in liveConnections.values {
+            conn.disconnectQuit()
+            conn.close()
+        }
+        liveConnections.removeAll()
+    }
+    #endif
     /// The launched title whose game is not up yet: its cover flies out of the shelf tile at the
     /// tap and holds the screen — through the dial, and then over the stream — until the host's
     /// `/status` says the game left `launching` (`punktfunk-host::gamelease`), or the player asks
@@ -302,7 +321,6 @@ final class SessionModel: ObservableObject {
     @Published private(set) var clipboardEnabled = false
     /// The host's last `ClipState.reason` (`CLIP_REASON_*`) — why an enable was refused
     /// (backend unavailable / policy disabled / …); 0 = OK.
-    @Published private(set) var clipboardReason: UInt8 = 0
 
     // MARK: - Per-client access (design/per-client-access.md §7)
 
@@ -960,7 +978,6 @@ final class SessionModel: ObservableObject {
         clipboardSync = nil
         #endif
         clipboardEnabled = false
-        clipboardReason = 0
         if let conn = connection {
             // Drain-thread teardown waits the pullers out and close() waits out in-flight
             // polls + joins the Rust worker threads — keep all of it off the main actor,
@@ -1131,7 +1148,7 @@ final class SessionModel: ObservableObject {
                     self?.revealStream()
                     return
                 }
-                self?.launchWindowWait = windowWait
+                if self?.launchWindowWait != windowWait { self?.launchWindowWait = windowWait }
                 try? await Task.sleep(nanoseconds: NSEC_PER_SEC)
             }
         }
@@ -1245,14 +1262,11 @@ final class SessionModel: ObservableObject {
     #if !os(tvOS)
     /// Create + start the session's clipboard bridge and route its host acks into the published
     /// UI state. `ClipboardSync.start()` sends the enable; the host's `.state` answer flips
-    /// `clipboardEnabled` (or leaves it false with a `clipboardReason` the UI can explain).
+    /// `clipboardEnabled`, or leaves it false.
     private func startClipboardSync(_ conn: PunktfunkConnection) {
         let sync = ClipboardSync(connection: conn)
-        sync.onState = { [weak self] enabled, _, reason in
-            Task { @MainActor in
-                self?.clipboardEnabled = enabled
-                self?.clipboardReason = reason
-            }
+        sync.onState = { [weak self] enabled, _, _ in
+            Task { @MainActor in self?.clipboardEnabled = enabled }
         }
         sync.start()
         clipboardSync = sync
@@ -1268,7 +1282,6 @@ final class SessionModel: ObservableObject {
         if let sync = clipboardSync {
             clipboardSync = nil
             clipboardEnabled = false
-            clipboardReason = 0
             Task.detached { sync.stop() }
         } else if conn.hostSupportsClipboard, conn.canUseClipboard {
             startClipboardSync(conn)
@@ -1289,7 +1302,11 @@ final class SessionModel: ObservableObject {
                 // decodes (a rejected/capped switch). The decoded-frame END clears it promptly on
                 // success; this only fires after the timeout.
                 self.resizeIndicator.tick(now: ProcessInfo.processInfo.systemUptime)
-                self.resizing = self.resizeIndicator.active
+                // Published only on change: @Published fires on every assignment, and each one
+                // re-renders the window over the stream.
+                if self.resizing != self.resizeIndicator.active {
+                    self.resizing = self.resizeIndicator.active
+                }
                 // Access chip + expiry warnings: the same tick that drives every other live
                 // readout also walks the countdown and picks up mid-session grant edits.
                 self.updateAccessState()
@@ -1324,11 +1341,12 @@ final class SessionModel: ObservableObject {
     /// change so a cycle never waits for the next tick.
     func renderHud() {
         guard let conn = connection else {
-            hudLines = []
+            if !hudLines.isEmpty { hudLines = [] }
             return
         }
         let advanced = UserDefaults.standard.bool(forKey: DefaultsKey.advancedStats)
-        hudLines = conn.hudLines(tier: statsVerbosity, advanced: advanced, facts: hudFacts())
+        let lines = conn.hudLines(tier: statsVerbosity, advanced: advanced, facts: hudFacts())
+        if lines != hudLines { hudLines = lines } // an unchanged overlay must not re-render
     }
 
     /// What only the app knows: the floor policy (macOS presents straight to the display, so

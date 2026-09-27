@@ -114,12 +114,6 @@ public enum AnnexB {
         return (first >> 1) & 0x3F
     }
 
-    /// H.264 NAL unit type (bits 0..4 of the first byte).
-    static func h264NalType(_ nal: Data) -> UInt8 {
-        guard let first = nal.first else { return 0xFF }
-        return first & 0x1F
-    }
-
     /// Build a format description from an IDR AU's in-band parameter sets (HEVC: VPS/SPS/PPS;
     /// H.264: SPS/PPS). Returns nil when the AU carries no parameter sets (non-IDR). Runs per
     /// AU on the pump thread: parameter sets precede the first VCL NAL in a conforming AU, so

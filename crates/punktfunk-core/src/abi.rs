@@ -353,8 +353,9 @@ pub unsafe extern "C" fn punktfunk_set_log_callback(
 }
 
 /// Wake-on-LAN magic packet. `macs` is `mac_count` contiguous 6-byte MACs.
-/// `last_known_ip` is an optional IPv4 dotted-quad unicast target. Broadcasts
-/// subnet-directed and `255.255.255.255` on ports 9 and 7. No session needed.
+/// `last_known_ip` is an optional unicast target, used only when it is an IPv4
+/// dotted quad. Broadcasts subnet-directed and `255.255.255.255` on ports 9
+/// and 7. No session needed.
 /// `Ok` if at least one datagram was sent. Call off the UI thread.
 ///
 /// # Safety
@@ -386,12 +387,12 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
                 m
             })
             .collect();
+        // A hostname or IPv6 address skips the unicast; the broadcasts still go.
         // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
-        let ip = match unsafe { opt_cstr(last_known_ip) }.map(|s| s.map(str::parse)) {
-            Ok(None) => None,
-            Ok(Some(Ok(ip))) => Some(ip),
-            _ => return PunktfunkStatus::InvalidArg,
-        };
+        let ip = unsafe { opt_cstr(last_known_ip) }
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok());
         match crate::wol::send_magic_packet(&mac_vec, ip) {
             Ok(()) => PunktfunkStatus::Ok,
             Err(_) => PunktfunkStatus::Io,

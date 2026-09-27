@@ -1,11 +1,13 @@
 package io.unom.punktfunk.kit
 
 /**
- * The pending interrupt-OUT reports for a captured controller: a bounded FIFO whose overflow
- * policy knows which reports may be thrown away and which may not.
+ * The pending output reports for a captured controller: a bounded FIFO whose overflow policy
+ * knows which reports may be thrown away and which may not. [T] is what one write carries —
+ * the bytes on USB, the bytes and their characteristic on BLE.
  *
  * The queue exists because only one thread may drive a connection's `UsbRequest`s, so writes from
- * the feedback threads are handed to the reader thread rather than submitted directly. It has to
+ * the feedback threads are handed to the reader thread rather than submitted directly — and on
+ * BLE because Android takes one GATT operation per connection at a time. It has to
  * be bounded — a stalled or unplugged device would otherwise grow it without limit — and the
  * question is what to discard when it fills.
  *
@@ -31,10 +33,10 @@ package io.unom.punktfunk.kit
  *
  * Thread-safe: offered by the feedback threads, drained by the reader thread.
  */
-internal class OutReportQueue(private val cap: Int = CAP) {
-    private class Entry(val key: Int, val data: ByteArray)
+internal class OutReportQueue<T>(private val cap: Int = CAP) {
+    private class Entry<T>(val key: Int, val data: T)
 
-    private val items = ArrayDeque<Entry>()
+    private val items = ArrayDeque<Entry<T>>()
 
     /**
      * Queue [data] for submission. [key] is [NO_COALESCE] for a one-shot, or a caller-chosen
@@ -43,7 +45,7 @@ internal class OutReportQueue(private val cap: Int = CAP) {
      * Returns false only if the report had to be dropped outright — the caller can then treat the
      * write as failed rather than assuming it is on its way.
      */
-    fun offer(data: ByteArray, key: Int = NO_COALESCE): Boolean = synchronized(items) {
+    fun offer(data: T, key: Int = NO_COALESCE): Boolean = synchronized(items) {
         if (key != NO_COALESCE) {
             val at = items.indexOfFirst { it.key == key }
             if (at >= 0) {
@@ -70,7 +72,7 @@ internal class OutReportQueue(private val cap: Int = CAP) {
     }
 
     /** The next report to submit, or null when nothing is pending. */
-    fun poll(): ByteArray? = synchronized(items) { items.removeFirstOrNull()?.data }
+    fun poll(): T? = synchronized(items) { items.removeFirstOrNull()?.data }
 
     fun clear() = synchronized(items) { items.clear() }
 

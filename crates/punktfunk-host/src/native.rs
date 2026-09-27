@@ -205,7 +205,7 @@ fn now_ns() -> u64 {
 
 /// Unix seconds. Access deadlines are stored and checked in wall time, not a cached
 /// monotonic offset, so an NTP step moves a deadline with the clock.
-fn wall_unix_now() -> i64 {
+pub(crate) fn wall_unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -624,8 +624,8 @@ const REJECT_BUSY_CODE: u32 = punktfunk_core::reject::REJECT_BUSY_CLOSE_CODE;
 
 /// Close with the typed reject code before the session task returns `Err`. A bare drop
 /// closes with code 0, which the client cannot tell from transport trouble.
-fn close_rejected(conn: &link::SessionLink, reason: punktfunk_core::reject::RejectReason) {
-    conn.close(reason.close_code(), reason.to_string().as_bytes());
+async fn close_rejected(conn: &link::SessionLink, reason: punktfunk_core::reject::RejectReason) {
+    conn.refuse(reason.close_code(), &reason.to_string()).await;
 }
 
 /// One counter and one `warn!` per grant class per session. Totals at end-of-stream;
@@ -751,7 +751,7 @@ async fn access_lifecycle(
                     "temporary access expired — closing this device's session"
                 );
                 crate::events::emit(crate::events::EventKind::AccessExpired { device });
-                close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired);
+                close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired).await;
                 return;
             }
             let remaining = d - now;
@@ -779,7 +779,7 @@ async fn access_lifecycle(
                         fingerprint = %device.fingerprint,
                         "device unpaired — closing its live session"
                     );
-                    close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired);
+                    close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired).await;
                     return;
                 }
                 // Live mask updates now; the datagram filter reads it on the next event.
@@ -806,7 +806,7 @@ async fn access_lifecycle(
             }
             changed = power_rx.changed() => {
                 if changed.is_ok() && *power_rx.borrow_and_update() {
-                    close_rejected(&conn, punktfunk_core::reject::RejectReason::HostPower);
+                    close_rejected(&conn, punktfunk_core::reject::RejectReason::HostPower).await;
                     return;
                 }
             }
@@ -1181,6 +1181,45 @@ type AudioCapSlot = Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCaptu
 /// the path; approval streams with no reconnect. Under the pending TTL (10 min).
 const PENDING_APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Park an unpaired knock until the console decides, holding no session slot while it waits.
+///
+/// `Ok(Ok(_))` is an approval, with the slot taken back like any fresh client's (waits if busy).
+/// `Ok(Err(reason))` is the refusal to send. `Err` means the client left before a decision.
+pub(crate) async fn park_knock(
+    conn: &link::SessionLink,
+    np: &NativePairing,
+    label: &str,
+    fp_hex: &str,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    sem: &Arc<tokio::sync::Semaphore>,
+) -> Result<Result<tokio::sync::OwnedSemaphorePermit, punktfunk_core::reject::RejectReason>> {
+    use punktfunk_core::reject::RejectReason;
+    tracing::info!(name = %label, fingerprint = %fp_hex,
+        "unpaired device knocked — parking connection for delegated approval in the console");
+    // QUIC-validated source IP for the pending per-source cap. Knock generation makes
+    // this connection the one an approval admits — siblings must not all start a session.
+    let knock_seq = np.note_pending(label, fp_hex, Some(conn.remote_address().ip()));
+    drop(permit);
+    let decision = tokio::select! {
+        d = np.wait_for_decision(fp_hex, knock_seq, PENDING_APPROVAL_WAIT) => d,
+        _ = conn.closed() => anyhow::bail!("client disconnected before pairing approval"),
+    };
+    let reason = match decision {
+        PairingDecision::Approved => {
+            tracing::info!(name = %label, fingerprint = %fp_hex,
+                "device approved in console — admitting session (no reconnect)");
+            let permit = sem.clone().acquire_owned().await;
+            return Ok(Ok(permit.expect("session semaphore is never closed")));
+        }
+        PairingDecision::Denied => RejectReason::Denied,
+        // The device can knock again.
+        PairingDecision::TimedOut => RejectReason::ApprovalTimeout,
+        // Only the newest connection from a device is admitted on approval.
+        PairingDecision::Superseded => RejectReason::Superseded,
+    };
+    Ok(Err(reason))
+}
+
 /// A QUIC handshake that closes code 0 with no control stream is a reachability probe
 /// (`--reachable` / hosts-page pips). Log at debug, not warn.
 pub(crate) enum Served {
@@ -1240,25 +1279,29 @@ async fn serve_session(
             close_rejected(
                 &conn,
                 punktfunk_core::reject::RejectReason::IdentityRequired,
-            );
+            )
+            .await;
             anyhow::bail!("pairing requires the client to present a certificate");
         };
         let client_fp_hex = fingerprint_hex(&client_fp);
         // Charge the cooldown before consulting arming, on every outcome including rejections.
         // Otherwise "is pairing armed?" is a free oracle. A spam of knocks can hold the
         // cooldown against the real device.
-        {
+        let limited = {
             let mut last = last_pairing.lock().unwrap();
-            if let Some(t) = *last {
-                if t.elapsed() < PAIRING_COOLDOWN {
-                    close_rejected(
-                        &conn,
-                        punktfunk_core::reject::RejectReason::PairingRateLimited,
-                    );
-                    anyhow::bail!("pairing rate-limited — retry shortly");
-                }
+            let limited = last.is_some_and(|t| t.elapsed() < PAIRING_COOLDOWN);
+            if !limited {
+                *last = Some(std::time::Instant::now());
             }
-            *last = Some(std::time::Instant::now());
+            limited
+        };
+        if limited {
+            close_rejected(
+                &conn,
+                punktfunk_core::reject::RejectReason::PairingRateLimited,
+            )
+            .await;
+            anyhow::bail!("pairing rate-limited — retry shortly");
         }
         // Live PIN per attempt so a lapsed window no longer pairs; honor fingerprint binding
         // and the address the knock came from.
@@ -1266,7 +1309,7 @@ async fn serve_session(
         let pin = match np.pin_for_attempt(&client_fp_hex, source) {
             crate::native_pairing::PinAttempt::Pin(pin) => pin,
             crate::native_pairing::PinAttempt::Disarmed => {
-                close_rejected(&conn, punktfunk_core::reject::RejectReason::PairingNotArmed);
+                close_rejected(&conn, punktfunk_core::reject::RejectReason::PairingNotArmed).await;
                 anyhow::bail!(
                     "pairing not armed (arm it in the console, or start with --allow-pairing)"
                 )
@@ -1276,7 +1319,8 @@ async fn serve_session(
                 close_rejected(
                     &conn,
                     punktfunk_core::reject::RejectReason::PairingBoundToOtherDevice,
-                );
+                )
+                .await;
                 anyhow::bail!(
                     "pairing is armed for a different device — this attempt does not consume the window"
                 )
@@ -1284,7 +1328,7 @@ async fn serve_session(
             // An open window is for the device in the operator's hands. This one is on the
             // internet, so it reads as not armed and the window survives for its owner.
             crate::native_pairing::PinAttempt::UnboundForWan => {
-                close_rejected(&conn, punktfunk_core::reject::RejectReason::PairingNotArmed);
+                close_rejected(&conn, punktfunk_core::reject::RejectReason::PairingNotArmed).await;
                 anyhow::bail!(
                     "a knock from {peer} needs a pairing window bound to its fingerprint \
                      ({client_fp_hex}) — an open window does not answer the internet"
@@ -1305,7 +1349,8 @@ async fn serve_session(
             close_rejected(
                 &conn,
                 punktfunk_core::reject::RejectReason::WireVersionMismatch,
-            );
+            )
+            .await;
             anyhow::bail!(
                 "wire version mismatch: client {} host {}",
                 gate_hello.abi_version,
@@ -1328,7 +1373,8 @@ async fn serve_session(
                 close_rejected(
                     &conn,
                     punktfunk_core::reject::RejectReason::IdentityRequired,
-                );
+                )
+                .await;
                 anyhow::bail!(
                     "unpaired anonymous client rejected (this host requires pairing — present a \
                      client identity and approve it in the console, or run the PIN ceremony)"
@@ -1340,47 +1386,13 @@ async fn serve_session(
                 gate_hello.name.as_deref().unwrap_or(""),
                 &fp_hex,
             );
-            tracing::info!(name = %label, fingerprint = %fp_hex,
-                "unpaired device knocked — parking connection for delegated approval in the console");
-            // QUIC-validated source IP for the pending per-source cap. Knock generation makes
-            // this connection the one an approval admits — siblings must not all start a session.
-            let knock_seq = np.note_pending(&label, &fp_hex, Some(peer.ip()));
-            // Parked knock must not hold an NVENC permit.
-            drop(permit);
-            let decision = tokio::select! {
-                d = np.wait_for_decision(&fp_hex, knock_seq, PENDING_APPROVAL_WAIT) => d,
-                _ = conn.closed() => anyhow::bail!("client disconnected before pairing approval"),
+            permit = match park_knock(&conn, np, &label, &fp_hex, permit, &sem).await? {
+                Ok(permit) => permit,
+                Err(reason) => {
+                    close_rejected(&conn, reason).await;
+                    anyhow::bail!("pairing request refused: {reason}");
+                }
             };
-            match decision {
-                PairingDecision::Approved => {
-                    tracing::info!(name = %label, fingerprint = %fp_hex,
-                        "device approved in console — admitting session (no reconnect)");
-                }
-                PairingDecision::Denied => {
-                    close_rejected(&conn, punktfunk_core::reject::RejectReason::Denied);
-                    anyhow::bail!("pairing request denied in the console")
-                }
-                PairingDecision::TimedOut => {
-                    close_rejected(&conn, punktfunk_core::reject::RejectReason::ApprovalTimeout);
-                    anyhow::bail!(
-                        "pairing request not approved within {PENDING_APPROVAL_WAIT:?} \
-                         — the device can knock again"
-                    )
-                }
-                PairingDecision::Superseded => {
-                    close_rejected(&conn, punktfunk_core::reject::RejectReason::Superseded);
-                    anyhow::bail!(
-                        "parked knock superseded by a newer connection from the same device — \
-                         only the newest is admitted on approval"
-                    )
-                }
-            }
-            // Re-acquire like any freshly accepted client (waits if busy).
-            permit = sem
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("session semaphore is never closed");
         }
     }
     // Admitted. From here the session is the same on every carrier.
@@ -1492,7 +1504,7 @@ pub(crate) async fn run_admitted(
             }
             // Expired between the pairing gate and here: typed expiry, not a setup error.
             None if opts.require_pairing => {
-                close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired);
+                close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired).await;
                 anyhow::bail!("access expired between admission and session setup");
             }
             // `--open`: unpaired / expired identities keep full control.
@@ -1514,7 +1526,8 @@ pub(crate) async fn run_admitted(
         close_rejected(
             &conn,
             punktfunk_core::reject::RejectReason::LaunchNotPermitted,
-        );
+        )
+        .await;
         anyhow::bail!("client requested a library launch without the LAUNCH grant");
     }
     let expires_in_secs = remaining_secs_wire(deadline_unix, admit_unix);

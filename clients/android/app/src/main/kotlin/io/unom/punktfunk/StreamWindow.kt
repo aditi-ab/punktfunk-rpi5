@@ -15,10 +15,16 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import io.unom.punktfunk.kit.NativeBridge
 
+/** Touch and mouse, sticks and triggers, captured mouse-look, captured touchpad. */
+internal const val STREAM_UNBUFFERED_SOURCES = android.view.InputDevice.SOURCE_CLASS_POINTER or
+    android.view.InputDevice.SOURCE_CLASS_JOYSTICK or
+    android.view.InputDevice.SOURCE_CLASS_TRACKBALL or
+    android.view.InputDevice.SOURCE_CLASS_POSITION
+
 /**
  * Everything a stream does to the activity's WINDOW, and how to put it back: the wake and Wi-Fi
  * locks, the Wi-Fi link log, the panel's refresh pin, HDMI ALLM, the soft-keyboard and cutout
- * modes, the landscape lock, unbuffered pointer dispatch and the render-rate vote.
+ * modes, the landscape lock, unbuffered input dispatch and the render-rate vote.
  *
  * It is one object because it is one obligation — every field below is a prior value captured on the
  * way in, and [detach] is the only thing that ever restores one. Held in [StreamScreen]'s session
@@ -86,7 +92,7 @@ internal class StreamWindow(
     }
 
     private fun logPanel(why: String) {
-        val d = activity?.display ?: return
+        val d = runCatching { activity?.display }.getOrNull() ?: return // API 30; hidden below
         Log.i("pf.display", "panel $why mode=${d.mode.refreshRate} render=${d.refreshRate}")
     }
 
@@ -194,11 +200,12 @@ internal class StreamWindow(
         } else {
             activity?.setStreamDisplayMode(streamHz)
         }
-        // Touch/pointer events are vsync-batched by default — up to a frame of input latency the
-        // stream shouldn't pay. Unbuffered dispatch delivers them the moment the kernel does.
+        // Moves are vsync-batched by default — up to a frame of input latency the stream
+        // shouldn't pay. Unbuffered dispatch delivers them the moment the kernel does. A focus
+        // change below this view recomputes its request, so [KeyCaptureView] holds one too.
         // Undone by passing 0 on the way out (API 30+).
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            composeView.requestUnbufferedDispatch(android.view.InputDevice.SOURCE_CLASS_POINTER)
+            composeView.requestUnbufferedDispatch(STREAM_UNBUFFERED_SOURCES)
         }
         // Vote the app's RENDER rate up to the stream's (API 35+). The mode pin above governs the
         // panel, but the platform separately down-rates a quiet app's choreographer stream
