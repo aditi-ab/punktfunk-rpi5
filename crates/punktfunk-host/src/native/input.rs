@@ -183,12 +183,8 @@ impl Pads {
 
     /// This pad as the Controllers feed reports it: the device the host built, the
     /// kind the client asked for, and the state this thread just applied.
-    fn feed_frame(
-        &self,
-        idx: usize,
-        state: &punktfunk_core::input::GamepadSnapshot,
-        mask: u16,
-    ) -> crate::pad_feed::PadFrame {
+    fn feed_frame(&self, idx: usize, wire: &WirePads) -> crate::pad_feed::PadFrame {
+        let (state, mask) = (&wire.state[idx], wire.mask);
         crate::pad_feed::PadFrame {
             pad: idx as u8,
             ts_ms: crate::clock::unix_ms(),
@@ -204,6 +200,12 @@ impl Pads {
             rs_x: state.rs_x,
             rs_y: state.rs_y,
         }
+    }
+
+    /// Apply wire pad `idx`'s frame, and show it on the Controllers feed.
+    fn apply_wire(&mut self, wire: &WirePads, idx: usize, feed: &crate::pad_feed::PadFeed) {
+        self.handle(&punktfunk_core::input::GamepadEvent::State(wire.frame(idx)));
+        feed.publish(|| self.feed_frame(idx, wire));
     }
 
     fn handle(&mut self, ev: &punktfunk_core::input::GamepadEvent) {
@@ -627,12 +629,6 @@ const RUMBLE_RENEW_FLOOR_MS: u64 = 60;
 /// Immediate send + this many = 3 zeros total.
 const RUMBLE_STOP_BURST: u8 = 2;
 
-/// Drop a removed pad's rumble lease (level, seen, stop burst) so a re-plug
-/// on the same wire index cannot buzz the new device.
-///
-/// Do not take or reset `rumble_seq`. The client gates with a wrapping
-/// half-space compare and never resets (`client/pump/datagram_task.rs`);
-/// resetting here is the bug in [`tests::rumble_seq_survives_a_removal_so_the_client_gate_accepts`].
 /// The session encoder's framing of the captured picture. Default maps nothing.
 pub(super) type FrameMap = Arc<std::sync::Mutex<punktfunk_core::video_fit::Reframe>>;
 
@@ -670,12 +666,6 @@ fn reframe_pen(
     punktfunk_core::quic::PenBatch::new(batch.seq, &samples)
 }
 
-fn clear_pad_feedback(state: &mut RumbleLevels, seen: &mut bool, stop_burst: &mut u8) {
-    *state = (0, 0, 0, 0);
-    *seen = false;
-    *stop_burst = 0;
-}
-
 /// `(low, high, left_trigger, right_trigger)`, `0..=0xFFFF`, 0xCA order. One
 /// value because they share one `seq` and one TTL on the wire.
 type RumbleLevels = (u16, u16, u16, u16);
@@ -687,8 +677,8 @@ fn rumble_silent(lv: RumbleLevels) -> bool {
     lv == (0, 0, 0, 0)
 }
 
-/// 0xCA rumble. `envelope_on` selects v3 (default) or v1 (`PUNKTFUNK_RUMBLE_ENVELOPE=0`).
-/// Best-effort, like every side-plane datagram.
+/// One 0xCA rumble datagram. `envelope_on` selects v3 (default) or v1
+/// (`PUNKTFUNK_RUMBLE_ENVELOPE=0`). Best-effort, like every side-plane datagram.
 ///
 /// v3 is unconditional while the envelope is on — not "only if a trigger is
 /// non-zero". A history-dependent wire form is a sequence bug; pre-v3 clients
@@ -696,22 +686,260 @@ fn rumble_silent(lv: RumbleLevels) -> bool {
 ///
 /// The v1 hatch has no trigger tail. "Trigger rumble stopped" is an expected
 /// symptom of the hatch — do not bisect a trigger bug into it.
-fn send_rumble(
-    conn: &super::link::SessionLink,
-    envelope_on: bool,
-    pad: u16,
-    lv: RumbleLevels,
-    seq: u8,
-    ttl_ms: u16,
-) {
+fn rumble_datagram(envelope_on: bool, pad: u16, lv: RumbleLevels, seq: u8, ttl_ms: u16) -> Vec<u8> {
     let (low, high, lt, rt) = lv;
-    let d: Vec<u8> = if envelope_on {
+    if envelope_on {
         punktfunk_core::quic::encode_rumble_datagram_v3(pad, low, high, seq, ttl_ms, lt, rt)
             .to_vec()
     } else {
         punktfunk_core::quic::encode_rumble_datagram(pad, low, high).to_vec()
+    }
+}
+
+/// Per-pad 0xCA rumble leases. Rumble is v3 (`[level][seq][ttl_ms][trigger levels]`):
+/// an active level renews every `ttl × 3/10` and an abandoned one expires client-side
+/// (`design/rumble-envelope-plan.md`, `design/trigger-rumble-plane.md`). Four motors
+/// share one `seq` and one TTL. `PUNKTFUNK_RUMBLE_ENVELOPE=0` reverts to v1 plus a flat
+/// 500 ms refresh, which drops trigger rumble ([`rumble_datagram`]).
+struct RumbleLeases {
+    lv: [RumbleLevels; MAX_WIRE_PADS],
+    seen: [bool; MAX_WIRE_PADS],
+    /// Wraps per pad and is bumped on every change and renewal. Never reset, not even
+    /// by [`Self::clear`]: the client's gate has no reset (`client/pump/datagram_task.rs`).
+    seq: [u8; MAX_WIRE_PADS],
+    stop_burst: [u8; MAX_WIRE_PADS],
+    envelope_on: bool,
+    ttl_ms: u16,
+    every: std::time::Duration,
+    last: std::time::Instant,
+}
+
+impl RumbleLeases {
+    fn from_env() -> RumbleLeases {
+        let ttl_ms = std::env::var("PUNKTFUNK_RUMBLE_TTL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .map(|v| v.clamp(RUMBLE_TTL_FLOOR_MS, RUMBLE_TTL_CEIL_MS))
+            .unwrap_or(RUMBLE_TTL_MS);
+        RumbleLeases::new(
+            pf_host_config::env_on("PUNKTFUNK_RUMBLE_ENVELOPE").unwrap_or(true),
+            ttl_ms,
+            std::time::Instant::now(),
+        )
+    }
+
+    /// Renew at 30 % of TTL (≈120 ms at 400) so 2–3 renewals cover the lease.
+    fn new(envelope_on: bool, ttl_ms: u16, now: std::time::Instant) -> RumbleLeases {
+        let every = if envelope_on {
+            std::time::Duration::from_millis((ttl_ms as u64 * 3 / 10).max(RUMBLE_RENEW_FLOOR_MS))
+        } else {
+            std::time::Duration::from_millis(500)
+        };
+        RumbleLeases {
+            lv: [(0, 0, 0, 0); MAX_WIRE_PADS],
+            seen: [false; MAX_WIRE_PADS],
+            seq: [0; MAX_WIRE_PADS],
+            stop_burst: [0; MAX_WIRE_PADS],
+            envelope_on,
+            ttl_ms,
+            every,
+            last: now,
+        }
+    }
+
+    /// A backend's new level for `pad`, as the datagram to send. Every change bumps
+    /// `seq`; a fall to zero arms the stop burst, and a re-assert clears it.
+    fn on_level(&mut self, pad: u16, lv: RumbleLevels) -> Vec<u8> {
+        let idx = pad as usize;
+        if idx >= MAX_WIRE_PADS {
+            // Out of range (backends never emit this): forwarded ungated.
+            return rumble_datagram(self.envelope_on, pad, lv, 0, self.ttl_ms);
+        }
+        let (silent, prev) = (rumble_silent(lv), self.lv[idx]);
+        // Silent→active once per buzz, with the triggers, so "host never saw trigger
+        // rumble" is separable from "client never rendered it".
+        if rumble_silent(prev) && !silent {
+            let (low, high, lt, rt) = lv;
+            tracing::debug!(
+                pad,
+                low,
+                high,
+                lt,
+                rt,
+                "rumble: forwarding to client (0xCA)"
+            );
+        }
+        self.lv[idx] = lv;
+        self.seen[idx] = true;
+        self.seq[idx] = self.seq[idx].wrapping_add(1);
+        self.stop_burst[idx] = if silent && !rumble_silent(prev) {
+            RUMBLE_STOP_BURST
+        } else {
+            0
+        };
+        // Any of the four motors → live TTL. See `rumble_silent`.
+        let ttl = if silent { 0 } else { self.ttl_ms };
+        rumble_datagram(self.envelope_on, pad, lv, self.seq[idx], ttl)
+    }
+
+    /// Once per interval: renew each active lease (bump `seq`, fresh TTL), drain a stop
+    /// burst, then go quiet. v1 re-sends every seen pad's handles instead.
+    fn tick(&mut self, now: std::time::Instant, mut send: impl FnMut(Vec<u8>)) {
+        if now.saturating_duration_since(self.last) < self.every {
+            return;
+        }
+        self.last = now;
+        for i in (0..MAX_WIRE_PADS).filter(|&i| self.seen[i]) {
+            let lv = self.lv[i];
+            if !self.envelope_on {
+                send(rumble_datagram(false, i as u16, lv, 0, 0));
+                continue;
+            }
+            let silent = rumble_silent(lv);
+            if silent {
+                if self.stop_burst[i] == 0 {
+                    continue;
+                }
+                self.stop_burst[i] -= 1;
+            }
+            self.seq[i] = self.seq[i].wrapping_add(1);
+            let ttl = if silent { 0 } else { self.ttl_ms };
+            send(rumble_datagram(true, i as u16, lv, self.seq[i], ttl));
+        }
+    }
+
+    /// Drop a removed pad's lease so a re-plug on the same index can't buzz the new
+    /// device. `seq` stays ([`tests::rumble_seq_survives_a_removal_so_the_client_gate_accepts`]).
+    fn clear(&mut self, idx: usize) {
+        self.lv[idx] = (0, 0, 0, 0);
+        self.seen[idx] = false;
+        self.stop_burst[idx] = 0;
+    }
+}
+
+/// The session's wire pads: each one's state, the attached mask and the seq gate that
+/// snapshots and removals share. An accepted event returns the pad whose
+/// [`Self::frame`] must reach the backends.
+#[derive(Default)]
+struct WirePads {
+    /// Incremental events fold in; a snapshot replaces one. `pad`/`seq` stay zero so an
+    /// unchanged snapshot refresh compares equal.
+    state: [punktfunk_core::input::GamepadSnapshot; MAX_WIRE_PADS],
+    mask: u16,
+    /// Last applied snapshot or removal seq, `None` until the first. An older one must
+    /// not roll held state back.
+    seq: [Option<u8>; MAX_WIRE_PADS],
+}
+
+impl WirePads {
+    fn frame(&self, idx: usize) -> punktfunk_core::input::GamepadFrame {
+        self.state[idx].to_frame(idx as u8, self.mask)
+    }
+
+    fn attached(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..MAX_WIRE_PADS).filter(|i| self.mask & (1 << i) != 0)
+    }
+
+    /// One button or axis event. `None` = bad index or unknown axis.
+    fn fold(&mut self, ev: &InputEvent) -> Option<usize> {
+        let idx = ev.flags as usize;
+        if idx >= MAX_WIRE_PADS || !self.state[idx].fold(ev) {
+            return None;
+        }
+        self.mask |= 1 << idx;
+        Some(idx)
+    }
+
+    /// A newer snapshot replaces the pad. An unchanged refresh (~100 ms) advances the
+    /// gate but returns `None`: re-emitting it churns the XInput packet number.
+    fn snapshot(&mut self, snap: punktfunk_core::input::GamepadSnapshot) -> Option<usize> {
+        let idx = snap.pad as usize;
+        if idx >= MAX_WIRE_PADS
+            || !punktfunk_core::input::GamepadSnapshot::seq_newer(snap.seq, self.seq[idx])
+        {
+            return None;
+        }
+        self.seq[idx] = Some(snap.seq);
+        let state = punktfunk_core::input::GamepadSnapshot {
+            pad: 0,
+            seq: 0,
+            ..snap
+        };
+        if self.mask & (1 << idx) != 0 && self.state[idx] == state {
+            return None;
+        }
+        self.state[idx] = state;
+        self.mask |= 1 << idx;
+        Some(idx)
+    }
+
+    /// A hot-unplug. `None` = stale or out of range; `Some(true)` = the pad was attached
+    /// and its cleared [`Self::frame`] fires each backend's unplug sweep.
+    fn remove(&mut self, pad: u8, seq: u8) -> Option<bool> {
+        let idx = pad as usize;
+        if idx >= MAX_WIRE_PADS
+            || !punktfunk_core::input::GamepadSnapshot::seq_newer(seq, self.seq[idx])
+        {
+            return None;
+        }
+        self.seq[idx] = Some(seq);
+        let attached = self.mask & (1 << idx) != 0;
+        if attached {
+            self.mask &= !(1 << idx);
+            self.state[idx] = Default::default();
+        }
+        Some(attached)
+    }
+}
+
+/// A `GamepadArrival`: `code` is the [`GamepadPref`], the low byte of `flags` the pad and
+/// bits 8/9 its audio-render caps (always [`decode_gamepad_arrival`], never the whole
+/// word). Starts or stops the pad's 0xD1 streamer when pad audio was negotiated.
+///
+/// [`decode_gamepad_arrival`]: punktfunk_core::input::decode_gamepad_arrival
+fn declare_pad(
+    pads: &mut Pads,
+    streams: &mut PadAudioSlots,
+    conn: &super::link::SessionLink,
+    ev: &InputEvent,
+    pad_audio_on: bool,
+) {
+    let (pad, audio_caps) = punktfunk_core::input::decode_gamepad_arrival(ev.flags);
+    let idx = pad as usize;
+    let kind = GamepadPref::from_u8(ev.code as u8);
+    if audio_caps != 0 {
+        tracing::debug!(
+            pad = idx,
+            haptics = audio_caps & 0x01 != 0,
+            speaker = audio_caps & 0x02 != 0,
+            "pad-audio render caps declared (arrival flags bits 8/9)"
+        );
+    }
+    pads.set_kind(idx, kind);
+    if !pad_audio_on {
+        return;
+    }
+    // DualSense-family with renderer bits. A re-declare without bits, or a kind with no
+    // pad audio, stops the streamer.
+    let dualsense = matches!(kind, GamepadPref::DualSense | GamepadPref::DualSenseEdge);
+    let want = if dualsense { audio_caps } else { 0 };
+    // The streamer captures what the pad's OS slot names, and the first frame that would
+    // claim the slot may be seconds away, so the declaration reserves it. No slot = no device.
+    let slot = if want != 0 {
+        pads.claim_os_slot(idx)
+    } else {
+        None
     };
-    conn.send_datagram(d);
+    match slot {
+        Some(slot) => streams.ensure(
+            conn,
+            pad,
+            slot,
+            want,
+            matches!(kind, GamepadPref::DualSenseEdge),
+        ),
+        None => streams.stop(idx),
+    }
 }
 
 /// Per-session input thread. Pointer/keyboard go through [`InputRoute`]; gamepad
@@ -720,14 +948,8 @@ fn send_rumble(
 /// session; the pointer/keyboard injector (and its portal grant) outlives it.
 ///
 /// Every pad state that reaches [`Pads`] also reaches `pad_feed`, which is what
-/// the console's Controllers page draws ([`crate::pad_feed`]).
-///
-/// Rumble is 0xCA v3 (`[level][seq][ttl_ms][trigger levels]`). The host renews
-/// an active level every ~`RUMBLE_TTL_MS × 3/10` and lets an abandoned one
-/// expire client-side (`design/rumble-envelope-plan.md`,
-/// `design/trigger-rumble-plane.md`). Four motors share one `seq` and one TTL.
-/// `PUNKTFUNK_RUMBLE_ENVELOPE=0` reverts to v1 + a flat 500 ms refresh, which
-/// drops trigger rumble ([`send_rumble`]).
+/// the console's Controllers page draws ([`crate::pad_feed`]). Wire pads fold in
+/// [`WirePads`]; rumble leases live in [`RumbleLeases`].
 ///
 /// Ends on `stop` or when `rx` disconnects. The pads (and their OS slots) go
 /// before the streamer join, so a session that preempted this one can claim
@@ -768,32 +990,8 @@ pub(super) fn input_thread(
     // Per-pad motion cadence, always on. Summarized at `info` on session end.
     let mut motion_cadence = super::motion_cadence::MotionCadence::new();
     let mut pad_uplink = super::pad_uplink::PadUplink::new(std::time::Instant::now());
-    // Incremental events fold into these ([`GamepadSnapshot::fold`]); a snapshot replaces
-    // one. `pad`/`seq` stay zero so an unchanged snapshot refresh compares equal.
-    let mut pad_state = [punktfunk_core::input::GamepadSnapshot::default(); MAX_WIRE_PADS];
-    let mut pad_mask = 0u16;
-    // Last applied snapshot seq (`None` until first). Older seq must not roll held state back.
-    let mut pad_seq: [Option<u8>; MAX_WIRE_PADS] = [None; MAX_WIRE_PADS];
-    // 0xCA v3 envelopes. `rumble_seq` wraps per pad and is bumped on changes and
-    // renewals; the client gates on it. `PUNKTFUNK_RUMBLE_ENVELOPE=0` is v1 every 500 ms.
-    let mut rumble_state = [(0u16, 0u16, 0u16, 0u16); MAX_WIRE_PADS];
-    let mut rumble_seen = [false; MAX_WIRE_PADS];
-    let mut rumble_seq = [0u8; MAX_WIRE_PADS];
-    let mut rumble_stop_burst = [0u8; MAX_WIRE_PADS];
-    let mut last_refresh = std::time::Instant::now();
-    let rumble_envelope_on = pf_host_config::env_on("PUNKTFUNK_RUMBLE_ENVELOPE").unwrap_or(true);
-    let rumble_ttl_ms: u16 = std::env::var("PUNKTFUNK_RUMBLE_TTL_MS")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .map(|v| v.clamp(RUMBLE_TTL_FLOOR_MS, RUMBLE_TTL_CEIL_MS))
-        .unwrap_or(RUMBLE_TTL_MS);
-    // Renew at 30 % of TTL (≈120 ms at 400) so 2–3 renewals cover the lease.
-    // Legacy mode is a flat 500 ms full-state refresh.
-    let rumble_refresh_interval = if rumble_envelope_on {
-        std::time::Duration::from_millis((rumble_ttl_ms as u64 * 3 / 10).max(RUMBLE_RENEW_FLOOR_MS))
-    } else {
-        std::time::Duration::from_millis(500)
-    };
+    let mut wire = WirePads::default();
+    let mut rumble = RumbleLeases::from_env();
     // Injector is host-lifetime: matching ups for whatever is still held go out at session end.
     let mut held = crate::inject::held::HeldInput::default();
     let mut pen = PenSession::new();
@@ -807,8 +1005,8 @@ pub(super) fn input_thread(
         // frames, so re-publish every live pad or the page draws nothing until the
         // next press. One relaxed load per wake when the page is closed.
         if pad_feed.take_resync() {
-            for idx in (0..MAX_WIRE_PADS).filter(|i| pad_mask & (1 << i) != 0) {
-                pad_feed.publish(|| pads.feed_frame(idx, &pad_state[idx], pad_mask));
+            for idx in wire.attached() {
+                pad_feed.publish(|| pads.feed_frame(idx, &wire));
             }
         }
         // Pen in range: wake at least every 100 ms so check_timeout can meet its 200 ms deadline.
@@ -862,25 +1060,15 @@ pub(super) fn input_thread(
                     InputKind::GamepadButton | InputKind::GamepadAxis => {
                         // Bad index / unknown axis: fall through, no `continue`.
                         // The DualSense GET_REPORT handshake still has to run this tick.
-                        let idx = ev.flags as usize;
-                        if idx < MAX_WIRE_PADS && pad_state[idx].fold(&ev) {
-                            pad_mask |= 1 << idx;
-                            let frame = pad_state[idx].to_frame(idx as u8, pad_mask);
-                            pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
-                            pad_feed.publish(|| pads.feed_frame(idx, &pad_state[idx], pad_mask));
+                        if let Some(idx) = wire.fold(&ev) {
+                            pads.apply_wire(&wire, idx, &pad_feed);
                         }
                     }
                     InputKind::GamepadState => {
-                        // Snapshot: apply only if seq is newer so a reorder cannot
-                        // roll held state back. Unchanged refresh (~100 ms) skips
-                        // the frame emit (XInput packet-number churn) but still
-                        // advances the gate.
                         use punktfunk_core::input::GamepadSnapshot;
                         if let Some(snap) = GamepadSnapshot::from_event(&ev) {
-                            let idx = snap.pad as usize;
-                            if let Some(g) =
-                                pad_uplink.note(idx, snap.seq, std::time::Instant::now())
-                            {
+                            let now = std::time::Instant::now();
+                            if let Some(g) = pad_uplink.note(snap.pad as usize, snap.seq, now) {
                                 tracing::warn!(
                                     pad = g.pad,
                                     silence_ms = g.silence_ms,
@@ -891,114 +1079,30 @@ pub(super) fn input_thread(
                                      sent none"
                                 );
                             }
-                            if idx < MAX_WIRE_PADS
-                                && GamepadSnapshot::seq_newer(snap.seq, pad_seq[idx])
-                            {
-                                pad_seq[idx] = Some(snap.seq);
-                                let before = pad_state[idx];
-                                pad_state[idx] = GamepadSnapshot {
-                                    pad: 0,
-                                    seq: 0,
-                                    ..snap
-                                };
-                                let first = pad_mask & (1 << idx) == 0;
-                                if first || pad_state[idx] != before {
-                                    pad_mask |= 1 << idx;
-                                    let frame = pad_state[idx].to_frame(idx as u8, pad_mask);
-                                    pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
-                                    pad_feed.publish(|| {
-                                        pads.feed_frame(idx, &pad_state[idx], pad_mask)
-                                    });
-                                }
+                            if let Some(idx) = wire.snapshot(snap) {
+                                pads.apply_wire(&wire, idx, &pad_feed);
                             }
                         }
                     }
                     InputKind::GamepadRemove => {
-                        // Hot-unplug, seq-gated in the same space as snapshots so a
-                        // reordered snapshot cannot resurrect the pad and a later
-                        // re-plug (newer seq) is accepted. Clearing `active_mask`
-                        // and re-emitting fires each backend's unplug sweep.
                         let (pad, seq) = punktfunk_core::input::decode_gamepad_remove(ev.flags);
                         let idx = pad as usize;
-                        if idx < MAX_WIRE_PADS
-                            && punktfunk_core::input::GamepadSnapshot::seq_newer(seq, pad_seq[idx])
-                        {
-                            pad_seq[idx] = Some(seq);
+                        if let Some(attached) = wire.remove(pad, seq) {
                             pad_uplink.forget(idx);
-                            if pad_mask & (1 << idx) != 0 {
-                                pad_mask &= !(1 << idx);
-                                pad_state[idx] = Default::default();
-                                let frame = pad_state[idx].to_frame(idx as u8, pad_mask);
-                                pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
-                                pad_feed
-                                    .publish(|| pads.feed_frame(idx, &pad_state[idx], pad_mask));
+                            if attached {
+                                pads.apply_wire(&wire, idx, &pad_feed);
                                 tracing::info!(pad = idx, "gamepad unplugged (native detach)");
                             } else {
                                 pads.release_unbuilt(idx);
                             }
-                            // Drop the lease so a re-plug cannot buzz the new pad.
-                            // Do not reset `rumble_seq`: the client gate is per-
-                            // connection and has no reset (`datagram_task.rs`).
-                            // `pad_seq` is kept for the same reason.
-                            clear_pad_feedback(
-                                &mut rumble_state[idx],
-                                &mut rumble_seen[idx],
-                                &mut rumble_stop_burst[idx],
-                            );
+                            rumble.clear(idx);
                             // Streamer goes with the pad. Seq-gated so a stale
                             // removal cannot kill a re-plugged pad's stream.
                             pad_streams.stop(idx);
                         }
                     }
                     InputKind::GamepadArrival => {
-                        // `code` is GamepadPref. Index is the low byte of `flags`;
-                        // bits 8/9 are audio-render caps. Always
-                        // `decode_gamepad_arrival` — never the whole word.
-                        let (pad, audio_caps) =
-                            punktfunk_core::input::decode_gamepad_arrival(ev.flags);
-                        let idx = pad as usize;
-                        let kind = GamepadPref::from_u8(ev.code as u8);
-                        if audio_caps != 0 {
-                            tracing::debug!(
-                                pad = idx,
-                                haptics = audio_caps & 0x01 != 0,
-                                speaker = audio_caps & 0x02 != 0,
-                                "pad-audio render caps declared (arrival flags bits 8/9)"
-                            );
-                        }
-                        pads.set_kind(idx, kind);
-                        // 0xD1: DualSense-family with renderer bits, if negotiated.
-                        // Re-declare without bits, or a kind with no pad audio, stops it.
-                        if pad_audio_on {
-                            let want = if matches!(
-                                kind,
-                                GamepadPref::DualSense | GamepadPref::DualSenseEdge
-                            ) {
-                                audio_caps
-                            } else {
-                                0
-                            };
-                            // The streamer captures the pad's own endpoint / card / sink,
-                            // all named by its OS slot, so reserve that here: the
-                            // declaration is what starts the stream, and the first frame
-                            // that would otherwise claim the slot may be seconds away.
-                            // No slot means no device, so no audio either.
-                            let slot = if want != 0 {
-                                pads.claim_os_slot(idx)
-                            } else {
-                                None
-                            };
-                            match slot {
-                                Some(slot) => pad_streams.ensure(
-                                    &conn,
-                                    pad,
-                                    slot,
-                                    want,
-                                    matches!(kind, GamepadPref::DualSenseEdge),
-                                ),
-                                None => pad_streams.stop(idx),
-                            }
-                        }
+                        declare_pad(&mut pads, &mut pad_streams, &conn, &ev, pad_audio_on)
                     }
                     _ => {
                         // Track press/release so a mid-press disconnect can be undone below.
@@ -1024,44 +1128,7 @@ pub(super) fn input_thread(
         // GET_REPORT. Rumble is 0xCA; rich HID-out is 0xCD.
         pads.pump(
             |pad, low, high, lt, rt| {
-                let lv: RumbleLevels = (low, high, lt, rt);
-                let silent = rumble_silent(lv);
-                let idx = pad as usize;
-                if idx < MAX_WIRE_PADS {
-                    let prev = rumble_state[idx];
-                    // Silent→active once per buzz, with `lt`/`rt`, so "host never
-                    // saw trigger rumble" is separable from "client never rendered it".
-                    if rumble_silent(prev) && !silent {
-                        tracing::debug!(
-                            pad,
-                            low,
-                            high,
-                            lt,
-                            rt,
-                            "rumble: forwarding to client (0xCA)"
-                        );
-                    }
-                    rumble_state[idx] = lv;
-                    rumble_seen[idx] = true;
-                    // Bump seq on every change. Arm the stop burst on a fall to
-                    // zero (lost stop vs legacy client); clear it if the game re-asserts.
-                    rumble_seq[idx] = rumble_seq[idx].wrapping_add(1);
-                    if silent {
-                        rumble_stop_burst[idx] = if !rumble_silent(prev) {
-                            RUMBLE_STOP_BURST
-                        } else {
-                            0
-                        };
-                    } else {
-                        rumble_stop_burst[idx] = 0;
-                    }
-                    // Any of the four motors → live TTL. See `rumble_silent`.
-                    let ttl = if silent { 0 } else { rumble_ttl_ms };
-                    send_rumble(&conn, rumble_envelope_on, pad, lv, rumble_seq[idx], ttl);
-                } else {
-                    // Out-of-range (backends never emit this) — forward ungated.
-                    send_rumble(&conn, rumble_envelope_on, pad, lv, 0, rumble_ttl_ms);
-                }
+                conn.send_datagram(rumble.on_level(pad, (low, high, lt, rt)));
             },
             |h| {
                 conn.send_datagram(h.encode());
@@ -1077,36 +1144,9 @@ pub(super) fn input_thread(
                 let _ = tx.send(punktfunk_core::quic::PadSlots { slots: mask });
             }
         }
-        if last_refresh.elapsed() >= rumble_refresh_interval {
-            last_refresh = std::time::Instant::now();
-            if rumble_envelope_on {
-                // Renew an active lease (bump seq, fresh TTL). Drain the stop burst,
-                // then go quiet — no perpetual zero refreshes.
-                for i in 0..MAX_WIRE_PADS {
-                    if !rumble_seen[i] {
-                        continue;
-                    }
-                    let lv = rumble_state[i];
-                    if !rumble_silent(lv) {
-                        rumble_seq[i] = rumble_seq[i].wrapping_add(1);
-                        send_rumble(&conn, true, i as u16, lv, rumble_seq[i], rumble_ttl_ms);
-                    } else if rumble_stop_burst[i] > 0 {
-                        rumble_stop_burst[i] -= 1;
-                        rumble_seq[i] = rumble_seq[i].wrapping_add(1);
-                        send_rumble(&conn, true, i as u16, (0, 0, 0, 0), rumble_seq[i], 0);
-                    }
-                }
-            } else {
-                // Legacy v1: re-send every seen pad every 500 ms. Trigger levels
-                // are dropped — v1 has no tail (`send_rumble`).
-                for (i, &(low, high, _, _)) in rumble_state.iter().enumerate() {
-                    if rumble_seen[i] {
-                        let d = punktfunk_core::quic::encode_rumble_datagram(i as u16, low, high);
-                        conn.send_datagram(d.to_vec());
-                    }
-                }
-            }
-        }
+        rumble.tick(std::time::Instant::now(), |d| {
+            conn.send_datagram(d);
+        });
     }
     // Lift remaining ink (buttons → tip → proximity). VirtualPen drop destroys
     // the tablet with this thread.
@@ -1348,73 +1388,86 @@ mod tests {
         assert_eq!(pads.slots.slot_of(1), None);
     }
 
+    /// Incremental events fold in, a newer snapshot replaces the pad, and a removal
+    /// shares the snapshot seq gate so a reordered packet can't roll state back.
     #[test]
-    fn pad_snapshot_replaces_state_and_seq_gates() {
+    fn wire_pads_fold_replace_and_seq_gate() {
         use punktfunk_core::input::{gamepad, GamepadSnapshot};
-        let mut state = GamepadSnapshot::default();
-        let mut last_seq: Option<u8> = None;
-
-        // Incremental events first, then a snapshot replaces the whole state.
+        let mut wire = WirePads::default();
         let axis = InputEvent {
             kind: InputKind::GamepadAxis,
             _pad: [0; 3],
             code: gamepad::AXIS_LT,
             x: 200,
             y: 0,
-            flags: 0,
+            flags: 1,
         };
-        assert!(state.fold(&axis));
-        assert_eq!(state.left_trigger, 200);
+        assert_eq!(wire.fold(&axis), Some(1));
+        assert_eq!((wire.frame(1).left_trigger, wire.mask), (200, 0b10));
+        let unknown = InputEvent { code: 42, ..axis };
+        assert_eq!(wire.fold(&unknown), None, "unknown axis");
+        assert_eq!(
+            wire.fold(&InputEvent { flags: 16, ..axis }),
+            None,
+            "bad index"
+        );
 
         let snap = GamepadSnapshot {
-            pad: 0,
+            pad: 1,
             seq: 1,
             buttons: gamepad::BTN_A,
             left_trigger: 255,
-            right_trigger: 0,
             ls_x: 100,
             ls_y: -100,
-            rs_x: 0,
-            rs_y: 0,
+            ..Default::default()
         };
-        assert!(GamepadSnapshot::seq_newer(snap.seq, last_seq));
-        last_seq = Some(snap.seq);
-        state = GamepadSnapshot {
-            pad: 0,
-            seq: 0,
-            ..snap
-        };
-        assert_eq!(state.left_trigger, 255);
-        assert_eq!(state.buttons, gamepad::BTN_A);
-        assert_eq!((state.ls_x, state.ls_y), (100, -100));
+        assert_eq!(wire.snapshot(snap), Some(1));
+        let f = wire.frame(1);
+        assert_eq!(
+            (f.index, f.buttons, f.left_trigger),
+            (1, gamepad::BTN_A, 255)
+        );
+        assert_eq!((f.ls_x, f.ls_y), (100, -100));
 
-        // A reordered (stale) snapshot must not roll the trigger back.
         let stale = GamepadSnapshot {
             seq: 0,
             left_trigger: 10,
             ..snap
         };
-        assert!(!GamepadSnapshot::seq_newer(stale.seq, last_seq));
+        assert_eq!(wire.snapshot(stale), None, "a reorder rolled state back");
+        assert_eq!(wire.frame(1).left_trigger, 255);
+        // An unchanged refresh advances the gate but emits nothing.
+        assert_eq!(wire.snapshot(GamepadSnapshot { seq: 2, ..snap }), None);
+        assert_eq!(wire.snapshot(GamepadSnapshot { seq: 2, ..stale }), None);
 
-        // Unchanged refresh: newer seq, identical payload, compares equal after apply.
-        let refresh = GamepadSnapshot { seq: 2, ..snap };
-        assert!(GamepadSnapshot::seq_newer(refresh.seq, last_seq));
-        let before = state;
-        state = GamepadSnapshot {
-            pad: 0,
-            seq: 0,
-            ..refresh
+        assert_eq!(wire.remove(1, 2), None, "a removal older than the gate");
+        assert_eq!(wire.remove(1, 3), Some(true));
+        assert_eq!((wire.mask, wire.frame(1).buttons), (0, 0));
+        assert_eq!(wire.remove(1, 4), Some(false), "nothing attached");
+        // The first snapshot after a re-plug emits even when it matches the cleared state.
+        let replug = GamepadSnapshot {
+            pad: 1,
+            seq: 5,
+            ..Default::default()
         };
-        assert_eq!(state, before);
-
-        // Wire roundtrip must decode to the same snapshot.
-        let dec =
-            GamepadSnapshot::from_event(&InputEvent::decode(&snap.to_event().encode()).unwrap())
-                .unwrap();
-        assert_eq!(dec, snap);
+        assert_eq!(wire.snapshot(replug), Some(1));
+        assert_eq!(wire.attached().collect::<Vec<_>>(), [1]);
     }
 
-    /// A pad re-plug must not reset `rumble_seq`.
+    /// The client's gate: accepts a seq newer than the last it applied.
+    fn deliver(d: &[u8], gate: &mut Option<u8>) -> bool {
+        let env = punktfunk_core::quic::decode_rumble_envelope(d)
+            .expect("rumble decodes")
+            .envelope
+            .expect("envelope tail present");
+        let fresh = punktfunk_core::input::GamepadSnapshot::seq_newer(env.seq, *gate);
+        if fresh {
+            *gate = Some(env.seq);
+        }
+        fresh
+    }
+
+    /// A pad re-plug must not reset the rumble `seq`.
     ///
     /// The client's `rumble_last_seq` lives for the whole QUIC connection and has
     /// no reset (`client/pump/datagram_task.rs`). Resetting the host counter on
@@ -1422,57 +1475,82 @@ mod tests {
     /// stored value (up to 128 sends).
     #[test]
     fn rumble_seq_survives_a_removal_so_the_client_gate_accepts() {
-        use punktfunk_core::input::GamepadSnapshot;
-        use punktfunk_core::quic::{decode_rumble_envelope, encode_rumble_datagram_v2};
-
-        // Client half: one per-pad slot, per connection, never reset.
-        let deliver = |seq: u8, gate: &mut Option<u8>| {
-            let d = encode_rumble_datagram_v2(0, 0x4000, 0x8000, seq, 400);
-            let env = decode_rumble_envelope(&d)
-                .expect("v2 envelope decodes")
-                .envelope
-                .expect("v2 tail present");
-            if GamepadSnapshot::seq_newer(env.seq, *gate) {
-                *gate = Some(env.seq);
-                true
-            } else {
-                false
-            }
-        };
-
-        // Host half: one wrapping counter, bumped on every change and every renewal.
+        let mut leases = RumbleLeases::new(true, RUMBLE_TTL_MS, std::time::Instant::now());
         let mut gate: Option<u8> = None;
-        let mut seq = 0u8;
-
-        // A long rumble before the unplug pushes the client's stored seq well past zero.
-        for _ in 0..100 {
-            seq = seq.wrapping_add(1);
-            assert!(deliver(seq, &mut gate));
+        for i in 0..100u16 {
+            assert!(deliver(
+                &leases.on_level(0, (0x4000 + i, 0x8000, 0, 0)),
+                &mut gate
+            ));
         }
         assert_eq!(gate, Some(100));
 
         // Unplug mid-buzz: the lease is cleared, the counter is not.
-        let (mut state, mut seen, mut burst) =
-            ((0x1234, 0x5678, 0x9ABC, 0xDEF0), true, RUMBLE_STOP_BURST);
-        clear_pad_feedback(&mut state, &mut seen, &mut burst);
+        leases.clear(0);
         assert_eq!(
-            (state, seen, burst),
-            ((0, 0, 0, 0), false, 0),
-            "lease not cleared"
+            (leases.lv[0], leases.seen[0], leases.stop_burst[0]),
+            ((0, 0, 0, 0), false, 0)
         );
-
-        // Re-plug on the same index: the first envelope must reach the actuator.
-        seq = seq.wrapping_add(1);
         assert!(
-            deliver(seq, &mut gate),
+            deliver(&leases.on_level(0, (0x1234, 0, 0, 0)), &mut gate),
             "first envelope after a re-plug was dropped by the client's reorder gate"
         );
 
         // Non-vacuity: a counter restarted at 0 is rejected for the whole forward window.
+        let mut restarted = RumbleLeases::new(true, RUMBLE_TTL_MS, std::time::Instant::now());
         let mut stranded = Some(100u8);
         assert!(
-            (1..=100).all(|s| !deliver(s, &mut stranded)),
+            (0..100u16).all(|i| !deliver(&restarted.on_level(0, (i + 1, 0, 0, 0)), &mut stranded)),
             "test is vacuous — a restarted counter should have been gated out"
+        );
+    }
+
+    /// An active lease renews once per interval with a fresh TTL. A fall to zero sends
+    /// its zero at once, then [`RUMBLE_STOP_BURST`] more on the next ticks, then goes quiet.
+    #[test]
+    fn a_stopped_rumble_sends_its_burst_then_goes_quiet() {
+        use punktfunk_core::quic::decode_rumble_envelope;
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let mut leases = RumbleLeases::new(true, 400, t0);
+        assert_eq!(leases.every, Duration::from_millis(120));
+        let tick = |leases: &mut RumbleLeases, at: Duration| {
+            let mut out = Vec::new();
+            leases.tick(t0 + at, |d| out.push(decode_rumble_envelope(&d).unwrap()));
+            out
+        };
+        leases.on_level(3, (0x4000, 0, 0, 0));
+        assert!(
+            tick(&mut leases, Duration::from_millis(119)).is_empty(),
+            "renewed early"
+        );
+        let renew = tick(&mut leases, Duration::from_millis(120));
+        assert_eq!(renew.len(), 1);
+        let env = renew[0].envelope.unwrap();
+        assert_eq!(
+            (renew[0].pad, renew[0].low, env.seq, env.ttl_ms),
+            (3, 0x4000, 2, 400)
+        );
+
+        let stop = decode_rumble_envelope(&leases.on_level(3, (0, 0, 0, 0))).unwrap();
+        assert_eq!(stop.envelope.unwrap().ttl_ms, 0);
+        let mut zeros = 0;
+        for n in 2..10u64 {
+            for u in tick(&mut leases, Duration::from_millis(120 * n)) {
+                assert_eq!((u.low, u.envelope.unwrap().ttl_ms), (0, 0));
+                zeros += 1;
+            }
+        }
+        assert_eq!(zeros, RUMBLE_STOP_BURST, "stop burst");
+
+        // The v1 hatch re-sends every seen pad's handles on its flat 500 ms clock.
+        let mut v1 = RumbleLeases::new(false, 400, t0);
+        v1.on_level(0, (7, 8, 9, 10));
+        let mut sent = Vec::new();
+        v1.tick(t0 + Duration::from_millis(500), |d| sent.push(d));
+        assert_eq!(
+            sent,
+            [punktfunk_core::quic::encode_rumble_datagram(0, 7, 8).to_vec()]
         );
     }
 
@@ -1480,25 +1558,12 @@ mod tests {
     /// (`design/trigger-rumble-plane.md`).
     ///
     /// `(low, high) == (0, 0)` as silence stamps trigger-only rumble `ttl = 0`;
-    /// the client silences on arrival with no error. Uses the real predicate and
-    /// encoder/decoder.
+    /// the client silences on arrival with no error.
     #[test]
     fn a_trigger_only_rumble_gets_a_live_ttl() {
-        use punktfunk_core::quic::{decode_rumble_envelope, encode_rumble_datagram_v3};
-
-        // Impulse-trigger stream: handles at rest, triggers driven.
-        let trigger_only: RumbleLevels = (0, 0, 0x8000, 0);
-        assert!(
-            !rumble_silent(trigger_only),
-            "a trigger-only level was read as silence — the ttl=0 trap"
-        );
-        let ttl = if rumble_silent(trigger_only) {
-            0
-        } else {
-            RUMBLE_TTL_MS
-        };
-        let d = encode_rumble_datagram_v3(0, 0, 0, 1, ttl, trigger_only.2, trigger_only.3);
-        let u = decode_rumble_envelope(&d).expect("v3 envelope decodes");
+        let mut leases = RumbleLeases::new(true, RUMBLE_TTL_MS, std::time::Instant::now());
+        let d = leases.on_level(0, (0, 0, 0x8000, 0));
+        let u = punktfunk_core::quic::decode_rumble_envelope(&d).expect("v3 envelope decodes");
         assert_eq!(
             u.envelope.expect("v3 carries the v2 tail").ttl_ms,
             RUMBLE_TTL_MS,
