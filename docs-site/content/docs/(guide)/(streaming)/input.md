@@ -224,7 +224,7 @@ What the dial can hold:
 
 | Group | Actions |
 |---|---|
-| Session | **End stream**, **Disconnect, keep the game running** |
+| Session | **End stream**, **End game** (a game this device launched, then the stream), **Disconnect, keep the game running** |
 | Input | **Touch mode**, **Keyboard**, **Virtual controller**, **Send text**, **Guide button**, **Quick access menu**, **Controller mouse** |
 | View · Audio | **Statistics**, **Microphone**, **Mute this stream** (this device only) |
 | Host | **Sleep host**, **Restart host**, **Shut down host** ([Host power](/docs/host-power)) |
