@@ -170,6 +170,7 @@ mod procscan;
 // Plugin-reported liveness; `procscan` only sees the process table.
 mod runstate;
 mod send_pacing;
+mod session_launch;
 mod session_plan;
 // Operator policy for session⇄game binding (`session-settings.json`).
 mod session_settings;

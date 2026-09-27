@@ -2196,55 +2196,40 @@ pub(crate) async fn run_admitted(
         .peer_fingerprint()
         .map(|fp| hex::encode(fp)[..12].to_string())
         .unwrap_or_else(|| conn.remote_address().ip().to_string());
-    // Reconnect inside the game's window: cancel pending termination. Data plane re-adopts via
-    // `launchreg` (carries the original launch instant). Matched on (this client, this title).
-    let fp = conn.peer_fingerprint().map(hex::encode);
-    if let Some(target) = launch_target.as_ref() {
-        // `readopt` already logged leftover processes.
-        let _reprieved = crate::gamelease::readopt(fp.as_deref(), target.game.id.as_deref());
-    }
-    // Stamp and claim before prep: a nested gamescope starts the game with its display, so the
-    // hold below must know already whether this session spawns. A re-dial adopts the original.
-    let fresh_stamp = crate::gamelease::launch_clock();
-    let launch_claim = launch_target.as_ref().map(|t| {
-        crate::launchreg::claim(fp.as_deref(), t.game.id.as_deref(), t.launcher, fresh_stamp)
-    });
-    // Custom-title prep before the display opens. Drop undoes in reverse. `block_in_place`:
-    // operator code is blocking and this is a multi-thread runtime.
-    let _prep = hello.launch.as_deref().and_then(|id| {
-        let cmds = crate::library::prep_for(id);
-        // `PF_APP_ID` + `PF_STREAM_*` so a prep step can set a per-mode FPS cap; `PF_PRESET_*`
-        // so it can tell a docked session from a handheld one.
-        let mut env = vec![("PF_APP_ID".to_string(), id.to_string())];
-        if let Some(p) = &session_preset {
-            env.push(("PF_PRESET_ID".to_string(), p.id.clone()));
-            env.push(("PF_PRESET_NAME".to_string(), p.name.clone()));
+    let launch_owner = crate::session_launch::LaunchOwner {
+        client: client_label.clone(),
+        fingerprint: conn.peer_fingerprint().map(hex::encode),
+        plane: conn.plane(),
+        preset: session_preset.clone(),
+    };
+    // Custom-title prep: `PF_APP_ID` + `PF_STREAM_*` so a step can set a per-mode FPS cap,
+    // `PF_PRESET_*` so it can tell a docked session from a handheld one.
+    let (prep_cmds, prep_env) = match hello.launch.as_deref() {
+        None => (Vec::new(), Vec::new()),
+        Some(id) => {
+            let mut env = vec![("PF_APP_ID".to_string(), id.to_string())];
+            if let Some(p) = &session_preset {
+                env.push(("PF_PRESET_ID".to_string(), p.id.clone()));
+                env.push(("PF_PRESET_NAME".to_string(), p.name.clone()));
+            }
+            env.extend(crate::hooks::prep_mode_env(
+                hello.mode.width,
+                hello.mode.height,
+                hello.mode.refresh_hz,
+                welcome.color.is_hdr(),
+            ));
+            (crate::library::prep_for(id), env)
         }
-        env.extend(crate::hooks::prep_mode_env(
-            hello.mode.width,
-            hello.mode.height,
-            hello.mode.refresh_hz,
-            welcome.color.is_hdr(),
-        ));
-        (!cmds.is_empty())
-            .then(|| tokio::task::block_in_place(|| crate::hooks::run_prep(&cmds, &env)))
+    };
+    // Reprieve, claim, prep and the launch hold, before the display opens. `block_in_place`:
+    // operator code is blocking and this is a multi-thread runtime.
+    let crate::session_launch::Prepared {
+        claim: launch_claim,
+        stamp: launch_stamp,
+        prep: _prep,
+    } = tokio::task::block_in_place(|| {
+        crate::session_launch::prepare(launch_target.as_ref(), &launch_owner, &prep_cmds, &prep_env)
     });
-    // A spawn waits for whoever holds `game.launching`. An adopted game is already running.
-    if let Some(t) = launch_target
-        .as_ref()
-        .filter(|_| launch_claim.as_ref().is_some_and(|c| c.must_spawn()))
-    {
-        let game = crate::events::GameRefPayload {
-            app: t.game.id.clone(),
-            title: t.game.title.clone(),
-            store: t.game.store.clone(),
-            client: client_label.clone(),
-            fingerprint: fp.clone(),
-            plane: conn.plane(),
-            preset: session_preset.clone(),
-        };
-        tokio::task::block_in_place(|| crate::holds::launching(game));
-    }
     // Welcome/acks/HUD speak wire budget. Encoder opens get the derived video rate (`EncDerive`).
     // PyroWave: budget == encoder rate (bpp pin).
     let bitrate_kbps = welcome.bitrate_kbps;
@@ -2505,7 +2490,8 @@ pub(crate) async fn run_admitted(
                         launch: launch_for_dp,
                         launch_target,
                         launch_claim,
-                        fresh_stamp,
+                        launch_stamp,
+                        launch_owner,
                         launch_outcome: launch_outcome_dp,
                         client_hdr,
                         join_live,

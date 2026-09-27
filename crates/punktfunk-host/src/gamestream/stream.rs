@@ -231,11 +231,11 @@ pub fn start(
             if let Err(e) = result {
                 tracing::error!(error = %format!("{e:#}"), "video stream failed");
             }
-            // `session.ended` before the stream and client events, as the native loop orders them.
+            // `session.ended`, then the stream marker, then `client.disconnected`. Native emits
+            // its disconnect from the connection task, so there it can come first.
             drop(live_session);
             running.store(false, Ordering::SeqCst);
             *video_hdr.lock().unwrap() = None;
-            // Before `client.disconnected` — native loop event order.
             drop(stream_marker);
             crate::events::emit(crate::events::EventKind::ClientDisconnected {
                 client: event_client,
@@ -292,35 +292,16 @@ fn run(
 
     // Not pooled: a reconnect at a different resolution needs a freshly-sized output.
     if pf_host_config::config().video_source.as_deref() == Some("virtual") {
-        // Before prep, source, and launch — a later stamp would reject the process it is meant to find.
-        let fresh_stamp = crate::gamelease::launch_clock();
         let target = resolve_gs_app(app);
-        // Moonlight has no resume; relaunch must reprieve the leftover game before anything starts.
-        if let Some(t) = target.as_ref() {
-            let reprieved =
-                crate::gamelease::readopt(life.fingerprint.as_deref(), t.game.id.as_deref());
-            if !reprieved.is_empty() {
-                tracing::info!(
-                    reprieved = reprieved.len(),
-                    title = %t.game.title,
-                    "gamestream: this client came back for its game — keeping it"
-                );
-            }
-        }
-        // Do not start a second copy or mint a stamp the running game could never satisfy.
-        // Anonymous / no library id is unrecordable.
-        let launch_claim = target.as_ref().map(|t| {
-            crate::launchreg::claim(
-                life.fingerprint.as_deref(),
-                t.game.id.as_deref(),
-                t.launcher,
-                fresh_stamp,
-            )
-        });
-        let launch_stamp = launch_claim.as_ref().map_or(fresh_stamp, |c| c.stamp());
-        let adopt_launch = launch_claim.as_ref().is_some_and(|c| !c.must_spawn());
-        // Before the virtual output opens: HDR toggle / sink switch must land first.
-        // Guard drop undoes in reverse, including panic-unwind.
+        // RTSP carries no device name; the peer IP is the stats-capture label too.
+        let owner = crate::session_launch::LaunchOwner {
+            client: client_label.clone(),
+            fingerprint: life.fingerprint.clone(),
+            plane: crate::events::Plane::Gamestream,
+            preset: None,
+        };
+        // The entry's own `apps.json` prep, then its library entry's. `PF_APP_TITLE` and the
+        // `PF_STREAM_*` names the native plane's prep env and the marker file use.
         let mut prep_cmds = app.map(|a| a.prep.clone()).unwrap_or_default();
         if let Some(lib_id) = app.and_then(|a| a.library_id.as_deref()) {
             prep_cmds.extend(crate::library::prep_for(lib_id));
@@ -329,23 +310,15 @@ fn run(
             "PF_APP_TITLE".to_string(),
             app.map(|a| a.title.clone()).unwrap_or_default(),
         )];
-        // Same `PF_STREAM_*` names as the native plane's prep env and the marker file.
         prep_env.extend(crate::hooks::prep_mode_env(
             cfg.width, cfg.height, cfg.fps, cfg.hdr,
         ));
-        let _prep = (!prep_cmds.is_empty()).then(|| crate::hooks::run_prep(&prep_cmds, &prep_env));
-        // A spawn waits for whoever holds `game.launching`. An adopted game is already running.
-        if let Some(t) = target.as_ref().filter(|_| !adopt_launch) {
-            crate::holds::launching(crate::events::GameRefPayload {
-                app: t.game.id.clone(),
-                title: t.game.title.clone(),
-                store: t.game.store.clone(),
-                client: client_label.clone(),
-                fingerprint: life.fingerprint.clone(),
-                plane: crate::events::Plane::Gamestream,
-                preset: None,
-            });
-        }
+        // Moonlight has no resume, so a relaunch is what reprieves the leftover game.
+        let crate::session_launch::Prepared {
+            claim: launch_claim,
+            stamp: launch_stamp,
+            prep: _prep,
+        } = crate::session_launch::prepare(target.as_ref(), &owner, &prep_cmds, &prep_env);
         // Re-runnable: the encode loop calls it again on a mid-stream capture loss.
         let GsSource {
             mut capturer,
@@ -382,167 +355,46 @@ fn run(
             "video source: virtual display (native client resolution)"
         );
         // Launch now that capture is live, for backends that do not nest via `set_launch_command`.
-        // Library id wins over an operator-typed `cmd`. Skip spawn when `adopt_launch`.
-        #[allow(unused_mut)]
-        let mut spawned_now = false;
-        // Windows pid for the lease. `None` when nothing spawned, or the spawn only forwards.
-        #[allow(unused_mut)]
-        let mut spawned_pid: Option<u32> = None;
-        // `GameOnNewLaunch`: Moonlight is cert-paired, so the fingerprint keys the same records.
-        if !adopt_launch {
-            if let Some(t) = target.as_ref() {
-                crate::gamelease::end_others_for_new_launch(
-                    life.fingerprint.as_deref(),
-                    t.game.id.as_deref(),
-                );
-            }
-        }
-        #[cfg(windows)]
-        if let Some(t) = target.as_ref() {
-            if adopt_launch {
-                tracing::info!(
-                    title = %t.game.title,
-                    "gamestream: this client's copy of this title is already running — not starting \
-                     a second one"
-                );
-            } else {
-                let launched = match (t.game.id.as_deref(), t.command.as_deref()) {
-                    (Some(id), _) => crate::library::launch_gamestream_library(id).map(Some),
-                    (None, Some(cmd)) => crate::library::launch_gamestream_command(cmd).map(Some),
-                    (None, None) => Ok(None),
-                };
-                match launched {
-                    Ok(l) => {
-                        spawned_pid = l.and_then(|l| l.tracked_pid());
-                        spawned_now = true;
-                    }
-                    Err(e) => {
-                        tracing::warn!(title = %t.game.title, error = %e, "gamestream: app not launched")
-                    }
-                }
-            }
-        }
-        // Keep the child: it is the liveness signal and the termination-ladder handle.
-        // Gamescope bare-spawn already nested the command; launching again would start it twice.
-        // Workspace this launch owns on the streamed head; handed to the lease, which
-        // releases it when the game is done.
-        #[cfg(target_os = "linux")]
-        let mut launch_workspace: Option<crate::vdisplay::WorkspaceClaim> = None;
-        #[cfg(target_os = "linux")]
-        let spawned_launch = match target.as_ref().and_then(|t| t.command.as_deref()) {
-            Some(cmd) if adopt_launch => {
-                tracing::info!(
-                    command = %cmd,
-                    "gamestream: this client's copy of this title is already running — not starting \
-                     a second one"
-                );
-                // The claim belongs to the launch, not to us: go back to the game's
-                // workspace rather than opening an empty one beside it.
-                launch_workspace = launch_claim
-                    .as_ref()
-                    .and_then(|c| c.workspace())
-                    .and_then(|ws| crate::library::adopt_launch_workspace(compositor, ws));
-                None
-            }
-            // Nested only when this acquire spawned gamescope with `cmd` as its primary child. A
-            // keep-alive reuse spawned nothing, so it falls through and launches into its seat.
-            Some(_)
-                if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref())
-                    && nested_launch_started =>
-            {
-                spawned_now = true;
-                None
-            }
-            Some(cmd) => {
-                let own = target.as_ref().is_some_and(|t| t.own_workspace);
-                let seat = seat.as_deref();
-                match crate::library::launch_session_command(compositor, cmd, seat, own, None) {
-                    Ok(mut spawned) => {
-                        spawned_now = true;
-                        launch_workspace = spawned.workspace.take();
-                        Some(spawned)
-                    }
-                    Err(e) => {
-                        tracing::warn!(command = %cmd, error = %e, "gamestream: app not launched");
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-        if let Some(c) = launch_claim.as_ref() {
-            if spawned_now {
-                c.launched();
-                if let Some(id) = c.credits() {
-                    crate::library::record_launch(id);
-                }
-            } else if c.must_spawn() {
-                c.abandon();
-            }
-            // On the record, not on the session: the next reconnect focuses it.
+        let spawned = crate::session_launch::spawn(
+            target.as_ref(),
+            &owner,
+            launch_claim.as_ref(),
             #[cfg(target_os = "linux")]
-            if let Some(ws) = launch_workspace.as_ref() {
-                c.placed(ws.id());
-            }
-        }
+            crate::session_launch::SpawnAt {
+                compositor,
+                nested_spawn: crate::vdisplay::launch_is_nested(
+                    compositor,
+                    gamescope_route.as_ref(),
+                ) && nested_launch_started,
+                seat: seat.as_deref(),
+                steam_home: None,
+            },
+        );
 
         // Exit ends the session; session end can end the game only if asked, and a drop waits
         // the reconnect window (`design/session-game-lifetime.md`).
         let _game_life = target.as_ref().map(|t| {
-            #[cfg(target_os = "linux")]
-            let nested = crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref());
-            #[cfg(not(target_os = "linux"))]
-            let nested = false;
-            #[cfg(target_os = "linux")]
-            let child = spawned_launch.map(|s| (s.child, s.group_leader));
-            #[cfg(not(target_os = "linux"))]
-            let child = None;
-
-            let on_exit: crate::gamelease::OnExit = {
-                let on_game_exit = life.on_game_exit.clone();
-                Box::new(move || {
-                    // Read at fire time so a mid-session flip takes effect. The lease still runs.
-                    if !crate::session_settings::get().session_on_game_exit {
-                        tracing::info!(
-                            "the launched game exited, but ending the session on game exit is off — \
-                             leaving the stream up"
-                        );
-                        return;
-                    }
-                    tracing::info!("the launched game exited — ending the session");
-                    // Skip keep-alive linger so the next `/launch` starts clean.
-                    on_game_exit();
-                })
-            };
-            let lease = crate::gamelease::open(
-                crate::gamelease::LeaseRequest {
-                    game: t.game.clone(),
-                    // RTSP carries no device name; peer IP is the stats-capture label too.
-                    client: client_label.clone(),
-                    fingerprint: life.fingerprint.clone(),
-                    preset: None,
-                    plane: crate::events::Plane::Gamestream,
-                    spec: t.detect.clone(),
-                    // Native plane only: this one has no per-session head to
-                    // watch, so a Moonlight launch keeps the `running` stage.
-                    window: None,
-                    nested,
-                    // No pool generation on this plane, and a GameStream session never isolates,
-                    // so there is no sibling seat to be confused with.
-                    scope_pid: None,
-                    launcher: t.launcher,
-                    child,
-                    spawned: spawned_pid,
-                    launch_stamp,
-                    // Adopted launch keeps the original slot across the handover.
-                    procs: launch_claim.as_ref().and_then(|c| c.procs()),
+            let on_game_exit = life.on_game_exit.clone();
+            let on_exit = crate::session_launch::end_on_game_exit(move || {
+                tracing::info!("the launched game exited — ending the session");
+                // Skip keep-alive linger so the next `/launch` starts clean.
+                on_game_exit();
+            });
+            let lease = crate::session_launch::lease(
+                t,
+                &owner,
+                launch_stamp,
+                launch_claim.as_ref(),
+                spawned,
+                // No per-session head to watch, no pool generation, no control channel of
+                // ours: a Moonlight launch keeps the `running` stage, never isolates, and its
+                // launch findings stay in the log.
+                crate::session_launch::LeaseExtras {
                     #[cfg(target_os = "linux")]
-                    workspace: launch_workspace,
-                    // Moonlight has no control channel of ours to say it on; the
-                    // finding stays in the log, as it did before.
-                    outcome: None,
+                    nested: crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()),
+                    ..Default::default()
                 },
-                on_exit,
+                Box::new(on_exit),
             );
             // Drops first so the console does not briefly show live and `grace` rows together.
             let published = crate::session_status::publish_gamestream_game(lease.shared());
@@ -759,33 +611,13 @@ fn open_gs_mirror_source(
     .context("attach a capturer to the mirrored monitor")
 }
 
-/// Resolved launch: lease identity, detect signals, and the command to run.
-struct GsApp {
-    game: crate::gamelease::GameRef,
-    /// Launcher tile, not a game — the lease stays untracked ([`crate::library::LaunchTarget`]).
-    launcher: bool,
-    detect: crate::library::DetectSpec,
-    /// `Some` on Linux (host runs it). `None` for a Windows library title (launch by id).
-    command: Option<String>,
-    /// Own workspace on the streamed head ([`crate::library::LaunchTarget`]).
-    own_workspace: bool,
-}
-
 /// Resolve a `/launch` catalog entry against the host's own library. The client sends only
 /// an appid. `None` = nothing to launch (Desktop, or an unresolvable entry).
-fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
+fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<crate::library::LaunchTarget> {
     let app = app?;
     if let Some(id) = app.library_id.as_deref() {
         match crate::library::resolve_launch(id) {
-            Some(t) => {
-                return Some(GsApp {
-                    game: t.game,
-                    launcher: t.launcher,
-                    detect: t.detect,
-                    command: t.command,
-                    own_workspace: t.own_workspace,
-                })
-            }
+            Some(t) => return Some(t),
             None => tracing::warn!(
                 launch_id = id,
                 "requested launch id not in this host's library (or no launch recipe) — ignoring"
@@ -797,7 +629,7 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
         .as_deref()
         .map(str::trim)
         .filter(|c| !c.is_empty())?;
-    Some(GsApp {
+    Some(crate::library::LaunchTarget {
         launcher: false,
         game: crate::gamelease::GameRef {
             id: None,
@@ -812,6 +644,7 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
         command: Some(cmd.to_string()),
         // A bare `apps.json` command names no entry, so the host default decides.
         own_workspace: crate::library::OnWindow::default().own_workspace(),
+        on_window: crate::library::OnWindow::default(),
     })
 }
 
@@ -882,7 +715,7 @@ fn open_gs_virtual_source(
     cfg: StreamConfig,
     app: Option<&super::apps::AppEntry>,
     // Resolved once by the caller so a rebuild cannot re-resolve to something different.
-    launch: Option<&GsApp>,
+    launch: Option<&crate::library::LaunchTarget>,
     quit: &Arc<AtomicBool>,
     revive: bool,
 ) -> Result<GsSource> {
