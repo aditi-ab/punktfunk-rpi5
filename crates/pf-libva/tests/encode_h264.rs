@@ -11,6 +11,9 @@
 //! opinion — our own planner agreeing with our own encoder proves less than a decoder
 //! that shares no code with either.
 
+mod common;
+
+use common::frame;
 use pf_libva::encode::open;
 use pf_libva::encode::CodecParams;
 use pf_vaapi::enc_params::SessionParams;
@@ -29,20 +32,6 @@ fn params() -> SessionParams {
         initial_qp: 26,
         vbv_frames: 1.0,
     }
-}
-
-/// A moving edge, so successive frames actually differ — an encoder fed identical
-/// pictures can emit almost nothing and still look like it works.
-fn frame(width: usize, height: usize, phase: usize) -> (Vec<u8>, Vec<u8>) {
-    let mut y = vec![16u8; width * height];
-    for (row, line) in y.chunks_mut(width).enumerate() {
-        for (col, px) in line.iter_mut().enumerate() {
-            if (col + phase * 8) % 64 < 32 || row % 48 < 8 {
-                *px = 235;
-            }
-        }
-    }
-    (y, vec![128u8; width * height / 2])
 }
 
 /// Thirty frames: SPS, PPS, one IDR, twenty-nine P slices, and every access unit
@@ -124,46 +113,7 @@ fn a_loss_recovers_on_an_anchored_p_not_an_idr() {
         ..params()
     };
     let mut enc = open(p, CodecParams::H264).expect("an encoder");
-    let (w, h) = (p.width as usize, p.height as usize);
-    let mut aus = Vec::new();
-    let encode = |enc: &mut pf_libva::encode::Encoder, i: usize, anchor: Option<usize>| {
-        let (y, uv) = frame(w, h, i);
-        enc.write_nv12(&y, &uv).expect("fill");
-        match anchor {
-            Some(slot) => enc.encode_anchored(slot).expect("anchored encode"),
-            None => enc.encode(i == 0).expect("encode"),
-        }
-        let pic = enc
-            .collect(true)
-            .expect("collect")
-            .expect("a picture per encode");
-        assert_eq!(pic.is_idr, i == 0, "picture {i}");
-        assert_eq!(pic.recovery_anchor, anchor.is_some());
-        assert_eq!(pic.wire, i as i64);
-        pic.bytes
-    };
-    for i in 0..10 {
-        aus.push(encode(&mut enc, i, None));
-    }
-    // Pictures 8 and 9 never reached the client. `plan_slot_recovery` on the
-    // session's slots: taint everything from 8 on, anchor on the newest before it.
-    let refs = enc.slots();
-    let tainted = refs
-        .iter()
-        .filter(|&&(_, wire)| wire >= 8)
-        .fold(0u32, |m, &(slot, _)| m | 1 << slot);
-    let (anchor, anchor_wire) = refs
-        .iter()
-        .copied()
-        .filter(|&(_, wire)| wire < 8)
-        .max_by_key(|&(_, wire)| wire)
-        .expect("a pre-loss slot survives");
-    assert_eq!(anchor_wire, 7);
-    enc.distrust(tainted);
-    aus.push(encode(&mut enc, 10, Some(anchor)));
-    for i in 11..13 {
-        aus.push(encode(&mut enc, i, None));
-    }
+    let aus = common::encode_through_a_loss(&mut enc, p.width as usize, p.height as usize);
 
     // What the client decodes: everything but 8 and 9.
     let received: Vec<&[u8]> = aus

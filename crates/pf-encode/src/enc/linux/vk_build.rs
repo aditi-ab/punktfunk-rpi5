@@ -66,7 +66,7 @@ pub(super) unsafe fn probe_rgb_direct(
     }
     // Caps under the rgb-chained profile: colour math must match the compute CSC (`rgb2yuv.comp`
     // 709 / `rgb2yuv10.comp` 2020 / `rgb2yuv10_709.comp` 709 at ten bits). Depth-only profile here.
-    let mut ps = RgbProfileStack::new(codec_op, ten_bit);
+    let mut ps = ProfileStack::new(codec_op, ten_bit, true);
     let profile = *ps.wire(av1);
     let mut rgb_caps = vrgb::VideoEncodeRgbConversionCapabilitiesVALVE {
         s_type: vrgb::stype(vrgb::ST_CAPABILITIES),

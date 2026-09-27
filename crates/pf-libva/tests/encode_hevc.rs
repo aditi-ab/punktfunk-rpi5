@@ -4,9 +4,11 @@
 //!
 //! Ignored: needs a VAAPI encode device. `.25` and `.50` both have one.
 
+mod common;
+
+use common::frame;
 use pf_libva::encode::open;
 use pf_libva::encode::CodecParams;
-use pf_libva::encode::Encoder;
 use pf_vaapi::enc_h265::NAL_IDR_W_RADL;
 use pf_vaapi::enc_h265::NAL_PPS;
 use pf_vaapi::enc_h265::NAL_PREFIX_SEI;
@@ -42,19 +44,6 @@ fn hevc(ten_bit: bool) -> CodecParams {
             COLOUR_BT709
         },
     }
-}
-
-/// A moving edge, so successive frames actually differ.
-fn frame(width: usize, height: usize, phase: usize) -> (Vec<u8>, Vec<u8>) {
-    let mut y = vec![16u8; width * height];
-    for (row, line) in y.chunks_mut(width).enumerate() {
-        for (col, px) in line.iter_mut().enumerate() {
-            if (col + phase * 8) % 64 < 32 || row % 48 < 8 {
-                *px = 235;
-            }
-        }
-    }
-    (y, vec![128u8; width * height / 2])
 }
 
 /// The NAL unit types in an access unit, in order.
@@ -119,43 +108,7 @@ fn the_hevc_stream_decodes() {
 fn an_hevc_loss_recovers_through_the_rps() {
     let p = params();
     let mut enc = open(p, hevc(false)).expect("an HEVC encoder");
-    let (w, h) = (p.width as usize, p.height as usize);
-    let encode = |enc: &mut Encoder, i: usize, anchor: Option<usize>| {
-        let (y, uv) = frame(w, h, i);
-        enc.write_nv12(&y, &uv).expect("fill");
-        match anchor {
-            Some(slot) => enc.encode_anchored(slot).expect("anchored encode"),
-            None => enc.encode(i == 0).expect("encode"),
-        }
-        let pic = enc
-            .collect(true)
-            .expect("collect")
-            .expect("a picture per encode");
-        assert_eq!(pic.is_idr, i == 0, "picture {i}");
-        assert_eq!(pic.recovery_anchor, anchor.is_some());
-        pic.bytes
-    };
-    let mut aus = Vec::new();
-    for i in 0..10 {
-        aus.push(encode(&mut enc, i, None));
-    }
-    let refs = enc.slots();
-    let tainted = refs
-        .iter()
-        .filter(|&&(_, wire)| wire >= 8)
-        .fold(0u32, |m, &(slot, _)| m | 1 << slot);
-    let (anchor, anchor_wire) = refs
-        .iter()
-        .copied()
-        .filter(|&(_, wire)| wire < 8)
-        .max_by_key(|&(_, wire)| wire)
-        .expect("a pre-loss slot survives");
-    assert_eq!(anchor_wire, 7);
-    enc.distrust(tainted);
-    aus.push(encode(&mut enc, 10, Some(anchor)));
-    for i in 11..13 {
-        aus.push(encode(&mut enc, i, None));
-    }
+    let aus = common::encode_through_a_loss(&mut enc, p.width as usize, p.height as usize);
 
     let received: Vec<&[u8]> = aus
         .iter()

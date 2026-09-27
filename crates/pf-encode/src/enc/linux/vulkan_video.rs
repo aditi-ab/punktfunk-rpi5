@@ -277,74 +277,29 @@ struct RgbDirect {
     true_extent: bool,
 }
 
-/// Stack storage for a complete rgb-chained video profile. Post-open image creation (dmabuf
-/// imports, CPU staging) must present a profile identical by value to the session's.
-/// `wire()` links `p_next` into this struct's own addresses, so the value must not move between
-/// `wire()` and the last use of `.profile`.
-struct RgbProfileStack {
-    rgb: super::vk_valve_rgb::VideoEncodeProfileRgbConversionInfoVALVE,
+/// Stack storage for a complete video profile: profile → codec profile → usage, then the VALVE
+/// rgb-conversion struct when `rgb`. Profile identity is by value, so the session and every
+/// post-open image (dmabuf imports, CPU staging) build theirs here. `wire()` links `p_next` into
+/// this struct's own addresses, so the value must not move between `wire()` and the last use of
+/// `.profile`.
+struct ProfileStack {
+    rgb: Option<super::vk_valve_rgb::VideoEncodeProfileRgbConversionInfoVALVE>,
     usage: vk::VideoEncodeUsageInfoKHR<'static>,
     h265: vk::VideoEncodeH265ProfileInfoKHR<'static>,
     av1: super::vk_av1_encode::VideoEncodeAV1ProfileInfoKHR,
     profile: vk::VideoProfileInfoKHR<'static>,
 }
 
-impl RgbProfileStack {
-    fn new(codec_op: vk::VideoCodecOperationFlagsKHR, ten_bit: bool) -> Self {
+impl ProfileStack {
+    fn new(codec_op: vk::VideoCodecOperationFlagsKHR, ten_bit: bool, rgb: bool) -> Self {
         use super::vk_av1_encode as av1b;
         use super::vk_valve_rgb as vrgb;
         Self {
-            rgb: vrgb::VideoEncodeProfileRgbConversionInfoVALVE {
+            rgb: rgb.then_some(vrgb::VideoEncodeProfileRgbConversionInfoVALVE {
                 s_type: vrgb::stype(vrgb::ST_PROFILE_INFO),
                 p_next: std::ptr::null(),
                 perform_encode_rgb_conversion: vk::TRUE,
-            },
-            usage: vk::VideoEncodeUsageInfoKHR::default()
-                .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
-                .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
-                .tuning_mode(vk::VideoEncodeTuningModeKHR::ULTRA_LOW_LATENCY),
-            h265: vk::VideoEncodeH265ProfileInfoKHR::default()
-                .std_profile_idc(h265_profile_idc(ten_bit)),
-            av1: av1b::VideoEncodeAV1ProfileInfoKHR {
-                s_type: av1b::stype(av1b::ST_PROFILE_INFO),
-                p_next: std::ptr::null(),
-                std_profile: vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
-            },
-            profile: vk::VideoProfileInfoKHR::default()
-                .video_codec_operation(codec_op)
-                .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-                .luma_bit_depth(component_depth(ten_bit))
-                .chroma_bit_depth(component_depth(ten_bit)),
-        }
-    }
-
-    /// Link `p_next` into this value's final address; returns `&self.profile`.
-    fn wire(&mut self, av1: bool) -> &vk::VideoProfileInfoKHR<'static> {
-        self.usage.p_next = &self.rgb as *const _ as *const c_void;
-        if av1 {
-            self.av1.p_next = &self.usage as *const _ as *const c_void;
-            self.profile.p_next = &self.av1 as *const _ as *const c_void;
-        } else {
-            self.h265.p_next = &self.usage as *const _ as *const c_void;
-            self.profile.p_next = &self.h265 as *const _ as *const c_void;
-        }
-        &self.profile
-    }
-}
-
-/// Non-RGB profile for native NV12 DMA-BUF imports. Post-`open` image creation must match the
-/// session profile by value.
-struct NativeProfileStack {
-    usage: vk::VideoEncodeUsageInfoKHR<'static>,
-    h265: vk::VideoEncodeH265ProfileInfoKHR<'static>,
-    av1: super::vk_av1_encode::VideoEncodeAV1ProfileInfoKHR,
-    profile: vk::VideoProfileInfoKHR<'static>,
-}
-
-impl NativeProfileStack {
-    fn new(codec_op: vk::VideoCodecOperationFlagsKHR, ten_bit: bool) -> Self {
-        use super::vk_av1_encode as av1b;
-        Self {
+            }),
             usage: vk::VideoEncodeUsageInfoKHR::default()
                 .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
                 .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
@@ -365,7 +320,12 @@ impl NativeProfileStack {
         }
     }
 
+    /// Link `p_next` into this value's final address; returns `&self.profile`.
     fn wire(&mut self, av1: bool) -> &vk::VideoProfileInfoKHR<'static> {
+        self.usage.p_next = self
+            .rgb
+            .as_ref()
+            .map_or(std::ptr::null(), |r| r as *const _ as *const c_void);
         if av1 {
             self.av1.p_next = &self.usage as *const _ as *const c_void;
             self.profile.p_next = &self.av1 as *const _ as *const c_void;
@@ -475,7 +435,7 @@ unsafe fn depth_supported(
     av1: bool,
     ten_bit: bool,
 ) -> bool {
-    let mut ps = NativeProfileStack::new(codec_op, ten_bit);
+    let mut ps = ProfileStack::new(codec_op, ten_bit, false);
     let profile = *ps.wire(av1);
     let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
     let mut av1_caps: super::vk_av1_encode::VideoEncodeAV1CapabilitiesKHR = std::mem::zeroed();
@@ -613,13 +573,8 @@ pub(crate) fn vulkan_capture_modifiers(codec: Codec, fourcc: u32, ten_bit: bool)
             .map(|pd| {
                 // The probe must name the profile the import will use: planar fourccs
                 // (NV12/P010) go in under the native profile, packed RGB under EFC conversion.
-                let mut native_ps = NativeProfileStack::new(codec_op, ten_bit);
-                let mut rgb_ps = RgbProfileStack::new(codec_op, ten_bit);
-                let encode_profile = *if matches!(fmt, NV12 | P010) {
-                    native_ps.wire(av1)
-                } else {
-                    rgb_ps.wire(av1)
-                };
+                let mut ps = ProfileStack::new(codec_op, ten_bit, !matches!(fmt, NV12 | P010));
+                let encode_profile = *ps.wire(av1);
                 let mut accepted: Vec<u64> = Vec::new();
                 for m in one_plane_modifiers(&instance, pd, fmt) {
                     // LINEAR is appended by the capture offer, never probed here.
@@ -1329,44 +1284,11 @@ impl VulkanVideoEncoder {
             );
         }
 
-        // Encode profile, chained raw (vendored AV1 + rgb structs can't `push_next`). Must
-        // match [`RgbProfileStack::wire`] when rgb is active — profile identity is by value:
-        // profile → codec profile → usage (→ rgb-conversion when active).
-        let rgb_info = vrgb::VideoEncodeProfileRgbConversionInfoVALVE {
-            s_type: vrgb::stype(vrgb::ST_PROFILE_INFO),
-            p_next: std::ptr::null(),
-            perform_encode_rgb_conversion: vk::TRUE,
-        };
-        let mut h265_profile =
-            vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(h265_profile_idc(ten_bit));
-        let mut av1_profile = av1b::VideoEncodeAV1ProfileInfoKHR {
-            s_type: av1b::stype(av1b::ST_PROFILE_INFO),
-            p_next: std::ptr::null(),
-            std_profile: vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
-        };
-        let mut usage = vk::VideoEncodeUsageInfoKHR::default()
-            .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
-            .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
-            .tuning_mode(vk::VideoEncodeTuningModeKHR::ULTRA_LOW_LATENCY);
-        if rgb_cfg.is_some() {
-            usage.p_next = &rgb_info as *const _ as *const c_void;
-        }
-        // A device that cannot encode 10-bit fails this query with
-        // VIDEO_PROFILE_FORMAT_NOT_SUPPORTED; a failed Vulkan open falls back to VAAPI.
-        // No separate probe, and no way to reach a half-configured session.
-        let depth = component_depth(ten_bit);
-        let mut profile = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(codec_op)
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(depth)
-            .chroma_bit_depth(depth);
-        if av1 {
-            av1_profile.p_next = &usage as *const _ as *const c_void;
-            profile.p_next = &av1_profile as *const _ as *const c_void;
-        } else {
-            h265_profile.p_next = &usage as *const _ as *const c_void;
-            profile.p_next = &h265_profile as *const _ as *const c_void;
-        }
+        // Encode profile, from the same constructor every later image profile uses. A device
+        // that cannot encode 10-bit fails the caps query below with
+        // VIDEO_PROFILE_FORMAT_NOT_SUPPORTED, and a failed Vulkan open falls back to VAAPI.
+        let mut ps = ProfileStack::new(codec_op, ten_bit, rgb_cfg.is_some());
+        let profile = *ps.wire(av1);
 
         // Device extensions, queried once: the intra-refresh caps chain below and the
         // `VK_EXT_queue_family_foreign` decision both read it.
@@ -2131,7 +2053,7 @@ impl VulkanVideoEncoder {
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
         if self.native_nv12 {
             let mut ps =
-                NativeProfileStack::new(codec_op_for(self.codec == Codec::Av1), self.ten_bit);
+                ProfileStack::new(codec_op_for(self.codec == Codec::Av1), self.ten_bit, false);
             let profile = *ps.wire(self.codec == Codec::Av1);
             let arr = [profile];
             let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
@@ -2159,7 +2081,8 @@ impl VulkanVideoEncoder {
                 None,
             )
         } else if self.rgb.is_some() {
-            let mut ps = RgbProfileStack::new(codec_op_for(self.codec == Codec::Av1), self.ten_bit);
+            let mut ps =
+                ProfileStack::new(codec_op_for(self.codec == Codec::Av1), self.ten_bit, true);
             let profile = *ps.wire(self.codec == Codec::Av1);
             let arr = [profile];
             let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
@@ -2290,7 +2213,7 @@ impl VulkanVideoEncoder {
                 // with the encode queue (compute only copies in; semaphore orders; CONCURRENT
                 // avoids a QFOT).
                 let av1 = self.codec == Codec::Av1;
-                let mut ps = RgbProfileStack::new(codec_op_for(av1), self.ten_bit);
+                let mut ps = ProfileStack::new(codec_op_for(av1), self.ten_bit, true);
                 let profile = *ps.wire(av1);
                 let arr = [profile];
                 let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
@@ -3494,9 +3417,149 @@ impl VulkanVideoEncoder {
         );
     }
 
-    /// HEVC Std structs + begin/encode/end. A recovery anchor is an ordinary P whose
-    /// `RefPicList0` names the known-good slot; the full short-term RPS ([`build_h265_rps_s0`])
-    /// keeps all resident DPB pictures alive. Direct imports return to the producer after coding.
+    /// `(coded, source)` extents. Coded is the aligned size for app-aligned sessions (pairs
+    /// with the aligned SPS) and the render size for native NV12's true-size headers. RGB
+    /// true-extent passes the render size as the source: RADV derives firmware padding from
+    /// `srcPictureResource.codedExtent`.
+    fn coding_extents(&self) -> (vk::Extent2D, vk::Extent2D) {
+        let render = vk::Extent2D {
+            width: self.render_w,
+            height: self.render_h,
+        };
+        let coded = if self.native_nv12 {
+            render
+        } else {
+            vk::Extent2D {
+                width: self.width,
+                height: self.height,
+            }
+        };
+        let src = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
+            render
+        } else {
+            coded
+        };
+        (coded, src)
+    }
+
+    /// One rate-control layer at `bps` (average and peak alike) at the session frame rate.
+    fn rc_layer(&self, bps: u64) -> [vk::VideoEncodeRateControlLayerInfoKHR<'static>; 1] {
+        [vk::VideoEncodeRateControlLayerInfoKHR::default()
+            .average_bitrate(bps)
+            .max_bitrate(bps)
+            .frame_rate_numerator(self.fps)
+            .frame_rate_denominator(1)]
+    }
+
+    /// Rate control over `layer`, the codec's own RC struct chained at `codec_rc` by hand
+    /// (`push_next` would clobber `rc.p_next`).
+    fn rc_info<'a>(
+        &self,
+        layer: &'a [vk::VideoEncodeRateControlLayerInfoKHR<'a>],
+        codec_rc: *const c_void,
+    ) -> vk::VideoEncodeRateControlInfoKHR<'a> {
+        let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
+            .rate_control_mode(self.rc_mode)
+            .layers(layer)
+            .virtual_buffer_size_in_ms(self.vbv_ms.0)
+            .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
+        rc.p_next = codec_rc;
+        rc
+    }
+
+    /// Begin, the first-frame and retarget controls, encode, end: what both codecs record once
+    /// their Std structs exist. `codec_rc` and `codec_pic` are the codec's rate-control and
+    /// picture-info structs, chained by address and alive for this call. `enc_refs` is empty
+    /// on an IDR. A direct import returns to the producer after coding ends.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_coding_common(
+        &self,
+        dev: &ash::Device,
+        cmd: vk::CommandBuffer,
+        query_pool: vk::QueryPool,
+        bs_buf: vk::Buffer,
+        src_img: vk::Image,
+        src_view: vk::ImageView,
+        acquire: SrcAcquire,
+        src_extent: vk::Extent2D,
+        begin_slots: &[vk::VideoReferenceSlotInfoKHR],
+        setup_slot: &vk::VideoReferenceSlotInfoKHR,
+        enc_refs: &[vk::VideoReferenceSlotInfoKHR],
+        codec_rc: *const c_void,
+        codec_pic: *const c_void,
+        mut ir_info: super::vk_intra_refresh::VideoEncodeIntraRefreshInfoKHR,
+    ) -> Result<()> {
+        use super::vk_intra_refresh as vir;
+        // Declares CURRENT state (`self.bitrate`), never a pending retarget (VUID-...-08254).
+        let layer = self.rc_layer(self.bitrate);
+        let rc = self.rc_info(&layer, codec_rc);
+
+        self.begin_encode_cmd(dev, cmd, query_pool, src_img, acquire)?;
+        let mut begin = vk::VideoBeginCodingInfoKHR::default()
+            .video_session(self.session)
+            .video_session_parameters(self.params)
+            .reference_slots(begin_slots);
+        // Declare the session's actual RC state, not `!first_frame` (`reset()` re-arms that).
+        if self.rc_installed {
+            begin.p_next = &rc as *const _ as *const c_void;
+        }
+        (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
+        if self.first_frame {
+            // RESET + RC install + quality. Without ENCODE_QUALITY_LEVEL RADV never sends a
+            // VCN preset op. Quality chains ahead of RC (spec: a quality-level change must
+            // carry ENCODE_RATE_CONTROL). Pending retarget folds into the install, not
+            // `self.bitrate` before recording — begin must declare the old rate after `reset()`.
+            let install_layer = self.rc_layer(self.pending_bitrate.unwrap_or(self.bitrate));
+            let install_rc = self.rc_info(&install_layer, codec_rc);
+            let mut q =
+                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
+            q.p_next = &install_rc as *const _ as *const c_void;
+            let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
+                vk::VideoCodingControlFlagsKHR::RESET
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+            );
+            ctrl.p_next = &q as *const _ as *const c_void;
+            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
+        } else if let Some(nb) = self.pending_bitrate {
+            // Mid-stream retarget: begin declared CURRENT; this control installs NEW. No RESET.
+            let layer2 = self.rc_layer(nb);
+            let rc2 = self.rc_info(&layer2, codec_rc);
+            let mut ctrl = vk::VideoCodingControlInfoKHR::default()
+                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
+            ctrl.p_next = &rc2 as *const _ as *const c_void;
+            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
+        }
+        dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
+        let src_res = vk::VideoPictureResourceInfoKHR::default()
+            .coded_extent(src_extent)
+            .image_view_binding(src_view);
+        let mut enc = vk::VideoEncodeInfoKHR::default()
+            .dst_buffer(bs_buf)
+            .dst_buffer_offset(0)
+            .dst_buffer_range(self.bs_size)
+            .src_picture_resource(src_res)
+            .setup_reference_slot(setup_slot);
+        if !enc_refs.is_empty() {
+            enc = enc.reference_slots(enc_refs);
+        }
+        enc.p_next = codec_pic;
+        if self.wave.is_some() {
+            enc.flags |= vk::VideoEncodeFlagsKHR::from_raw(vir::ENCODE_INTRA_REFRESH_BIT);
+            ir_info.p_next = enc.p_next;
+            enc.p_next = &ir_info as *const _ as *const c_void;
+        }
+        (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
+        dev.cmd_end_query(cmd, query_pool, 0);
+        (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
+        self.release_direct_source(dev, cmd, src_img, acquire);
+        dev.end_command_buffer(cmd)?;
+        Ok(())
+    }
+
+    /// HEVC Std structs, then [`Self::record_coding_common`]. A recovery anchor is an ordinary
+    /// P whose `RefPicList0` names the known-good slot; the full short-term RPS
+    /// ([`build_h265_rps_s0`]) keeps all resident DPB pictures alive.
     #[allow(clippy::too_many_arguments)]
     unsafe fn record_coding_h265(
         &self,
@@ -3512,30 +3575,8 @@ impl VulkanVideoEncoder {
         setup_idx: usize,
         poc: i32,
     ) -> Result<()> {
-        use super::vk_intra_refresh as vir;
         use ash::vk::native as h;
-        // Aligned size for app-aligned sessions (pairs with aligned SPS); render size for
-        // native NV12's true-size headers.
-        let ext2d = if self.native_nv12 {
-            vk::Extent2D {
-                width: self.render_w,
-                height: self.render_h,
-            }
-        } else {
-            vk::Extent2D {
-                width: self.width,
-                height: self.height,
-            }
-        };
-        // RGB true-extent: RADV derives firmware padding from `srcPictureResource.codedExtent`.
-        let src_extent = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
-            vk::Extent2D {
-                width: self.render_w,
-                height: self.render_h,
-            }
-        } else {
-            ext2d
-        };
+        let (ext2d, src_extent) = self.coding_extents();
         let ref_poc = if is_idr { 0 } else { self.slot_poc[ref_slot] };
 
         let mut pic_flags: h::StdVideoEncodeH265PictureInfoFlags = std::mem::zeroed();
@@ -3582,7 +3623,7 @@ impl VulkanVideoEncoder {
             .constant_qp(0)
             .std_slice_segment_header(&std_sh);
         let slices = [slice];
-        let mut h265_pic = vk::VideoEncodeH265PictureInfoKHR::default()
+        let h265_pic = vk::VideoEncodeH265PictureInfoKHR::default()
             .nalu_slice_segment_entries(&slices)
             .std_picture_info(&std_pic);
 
@@ -3638,115 +3679,36 @@ impl VulkanVideoEncoder {
         let begin_i = [begin_setup];
         let enc_refs = [ref_enc];
 
-        // Chained manually (`push_next` would clobber `rc.p_next`). Declares CURRENT state
-        // (`self.bitrate`), never a pending retarget (VUID-...-08254).
-        let rc_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(self.bitrate)
-            .max_bitrate(self.bitrate)
-            .frame_rate_numerator(self.fps)
-            .frame_rate_denominator(1)];
         let h265_rc = vk::VideoEncodeH265RateControlInfoKHR::default()
             .flags(vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP)
             .gop_frame_count(u32::MAX)
             .idr_period(u32::MAX)
             .consecutive_b_frame_count(0)
             .sub_layer_count(1);
-        let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
-            .rate_control_mode(self.rc_mode)
-            .layers(&rc_layer)
-            .virtual_buffer_size_in_ms(self.vbv_ms.0)
-            .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-        rc.p_next = &h265_rc as *const _ as *const c_void;
-        let rc_ptr = &rc as *const _ as *const c_void;
-
-        self.begin_encode_cmd(dev, cmd, query_pool, src_img, acquire)?;
         let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
             if is_idr { &begin_i } else { &begin_p };
-        let mut begin = vk::VideoBeginCodingInfoKHR::default()
-            .video_session(self.session)
-            .video_session_parameters(self.params)
-            .reference_slots(begin_slots);
-        // Declare the session's actual RC state, not `!first_frame` (`reset()` re-arms that).
-        if self.rc_installed {
-            begin.p_next = rc_ptr;
-        }
-        (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
-        if self.first_frame {
-            // RESET + RC install + quality. Without ENCODE_QUALITY_LEVEL RADV never sends a
-            // VCN preset op. Quality chains ahead of RC (spec: a quality-level change must
-            // carry ENCODE_RATE_CONTROL). Pending retarget folds into the install, not
-            // `self.bitrate` before recording — begin must declare the old rate after `reset()`.
-            let nb = self.pending_bitrate.unwrap_or(self.bitrate);
-            let install_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-                .average_bitrate(nb)
-                .max_bitrate(nb)
-                .frame_rate_numerator(self.fps)
-                .frame_rate_denominator(1)];
-            let mut install_rc = vk::VideoEncodeRateControlInfoKHR::default()
-                .rate_control_mode(self.rc_mode)
-                .layers(&install_layer)
-                .virtual_buffer_size_in_ms(self.vbv_ms.0)
-                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-            install_rc.p_next = &h265_rc as *const _ as *const c_void;
-            let mut q =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
-            q.p_next = &install_rc as *const _ as *const c_void;
-            let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
-                vk::VideoCodingControlFlagsKHR::RESET
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-            );
-            ctrl.p_next = &q as *const _ as *const c_void;
-            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-        } else if let Some(nb) = self.pending_bitrate {
-            // Mid-stream retarget: begin declared CURRENT; this control installs NEW. No RESET.
-            let rc_layer2 = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-                .average_bitrate(nb)
-                .max_bitrate(nb)
-                .frame_rate_numerator(self.fps)
-                .frame_rate_denominator(1)];
-            let mut rc2 = vk::VideoEncodeRateControlInfoKHR::default()
-                .rate_control_mode(self.rc_mode)
-                .layers(&rc_layer2)
-                .virtual_buffer_size_in_ms(self.vbv_ms.0)
-                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-            rc2.p_next = &h265_rc as *const _ as *const c_void;
-            let mut ctrl = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
-            ctrl.p_next = &rc2 as *const _ as *const c_void;
-            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-        }
-        dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
-        let src_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(src_extent)
-            .image_view_binding(src_view);
-        let mut enc = vk::VideoEncodeInfoKHR::default()
-            .dst_buffer(bs_buf)
-            .dst_buffer_offset(0)
-            .dst_buffer_range(self.bs_size)
-            .src_picture_resource(src_res)
-            .setup_reference_slot(&setup_slot)
-            .push_next(&mut h265_pic);
-        if !is_idr {
-            enc = enc.reference_slots(&enc_refs);
-        }
-        let mut ir_info = ir_info;
-        if self.wave.is_some() {
-            enc.flags |= vk::VideoEncodeFlagsKHR::from_raw(vir::ENCODE_INTRA_REFRESH_BIT);
-            ir_info.p_next = enc.p_next;
-            enc.p_next = &ir_info as *const _ as *const c_void;
-        }
-        (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
-        dev.cmd_end_query(cmd, query_pool, 0);
-        (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
-        self.release_direct_source(dev, cmd, src_img, acquire);
-        dev.end_command_buffer(cmd)?;
-        Ok(())
+        let enc_refs: &[vk::VideoReferenceSlotInfoKHR] = if is_idr { &[] } else { &enc_refs };
+        self.record_coding_common(
+            dev,
+            cmd,
+            query_pool,
+            bs_buf,
+            src_img,
+            src_view,
+            acquire,
+            src_extent,
+            begin_slots,
+            &setup_slot,
+            enc_refs,
+            &h265_rc as *const _ as *const c_void,
+            &h265_pic as *const _ as *const c_void,
+            ir_info,
+        )
     }
 
-    /// AV1 Std structs + begin/encode/end. IDR, recovery and a wave start break the CDF chain;
-    /// a normal P inherits context through `ref_slot`. Virtual slots persist until refreshed,
-    /// and a direct import returns to the producer only after coding ends.
+    /// AV1 Std structs, then [`Self::record_coding_common`]. IDR, recovery and a wave start
+    /// break the CDF chain; a normal P inherits context through `ref_slot`. Virtual slots
+    /// persist until refreshed.
     #[allow(clippy::too_many_arguments)]
     unsafe fn record_coding_av1(
         &self,
@@ -3764,30 +3726,8 @@ impl VulkanVideoEncoder {
         order: i32,
     ) -> Result<()> {
         use super::vk_av1_encode as av1;
-        use super::vk_intra_refresh as vir;
         use ash::vk::native as h;
-        // Aligned size for app-aligned sessions (pairs with aligned SPS); render size for
-        // native NV12's true-size headers.
-        let ext2d = if self.native_nv12 {
-            vk::Extent2D {
-                width: self.render_w,
-                height: self.render_h,
-            }
-        } else {
-            vk::Extent2D {
-                width: self.width,
-                height: self.height,
-            }
-        };
-        // RGB true-extent: RADV derives firmware padding from `srcPictureResource.codedExtent`.
-        let src_extent = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
-            vk::Extent2D {
-                width: self.render_w,
-                height: self.render_h,
-            }
-        } else {
-            ext2d
-        };
+        let (_, src_extent) = self.coding_extents();
 
         let mut tile_flags: h::StdVideoAV1TileInfoFlags = std::mem::zeroed();
         tile_flags.set_uniform_tile_spacing_flag(1);
@@ -3930,7 +3870,7 @@ impl VulkanVideoEncoder {
         ref_begin.p_next = &ref_dpb as *const _ as *const c_void;
         // Wave frame: the reference is the previous frame, `cycle - index` of its regions
         // still dirty (VUID-10843). Absent = 0, which every non-wave frame requires.
-        let (mut ir_info, mut ref_ir) = intra_refresh_chain(self.wave);
+        let (ir_info, mut ref_ir) = intra_refresh_chain(self.wave);
         ref_ir.p_next = &ref_dpb as *const _ as *const c_void;
         let mut ref_enc = vk::VideoReferenceSlotInfoKHR::default()
             .slot_index(ref_slot as i32)
@@ -3944,12 +3884,6 @@ impl VulkanVideoEncoder {
         let begin_i = [begin_setup];
         let enc_refs = [ref_enc];
 
-        // Declares CURRENT state (`self.bitrate`); see the HEVC twin for VUID-08254.
-        let rc_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(self.bitrate)
-            .max_bitrate(self.bitrate)
-            .frame_rate_numerator(self.fps)
-            .frame_rate_denominator(1)];
         let av1_rc = av1::VideoEncodeAV1RateControlInfoKHR {
             s_type: av1::stype(av1::ST_RATE_CONTROL_INFO),
             p_next: std::ptr::null(),
@@ -3959,93 +3893,25 @@ impl VulkanVideoEncoder {
             consecutive_bipredictive_frame_count: 0,
             temporal_layer_count: 1,
         };
-        let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
-            .rate_control_mode(self.rc_mode)
-            .layers(&rc_layer)
-            .virtual_buffer_size_in_ms(self.vbv_ms.0)
-            .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-        rc.p_next = &av1_rc as *const _ as *const c_void;
-        let rc_ptr = &rc as *const _ as *const c_void;
-
-        self.begin_encode_cmd(dev, cmd, query_pool, src_img, acquire)?;
         let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
             if is_idr { &begin_i } else { &begin_p };
-        let mut begin = vk::VideoBeginCodingInfoKHR::default()
-            .video_session(self.session)
-            .video_session_parameters(self.params)
-            .reference_slots(begin_slots);
-        // Declare what the session actually has, not `!first_frame`.
-        if self.rc_installed {
-            begin.p_next = rc_ptr;
-        }
-        (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
-        if self.first_frame {
-            // RESET + RC + quality. Pending retarget folds into the install, not the declaration.
-            let nb = self.pending_bitrate.unwrap_or(self.bitrate);
-            let install_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-                .average_bitrate(nb)
-                .max_bitrate(nb)
-                .frame_rate_numerator(self.fps)
-                .frame_rate_denominator(1)];
-            let mut install_rc = vk::VideoEncodeRateControlInfoKHR::default()
-                .rate_control_mode(self.rc_mode)
-                .layers(&install_layer)
-                .virtual_buffer_size_in_ms(self.vbv_ms.0)
-                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-            install_rc.p_next = &av1_rc as *const _ as *const c_void;
-            let mut q =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
-            q.p_next = &install_rc as *const _ as *const c_void;
-            let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
-                vk::VideoCodingControlFlagsKHR::RESET
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-            );
-            ctrl.p_next = &q as *const _ as *const c_void;
-            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-        } else if let Some(nb) = self.pending_bitrate {
-            // Mid-stream retarget: begin declares CURRENT, this control installs NEW. No RESET.
-            let rc_layer2 = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-                .average_bitrate(nb)
-                .max_bitrate(nb)
-                .frame_rate_numerator(self.fps)
-                .frame_rate_denominator(1)];
-            let mut rc2 = vk::VideoEncodeRateControlInfoKHR::default()
-                .rate_control_mode(self.rc_mode)
-                .layers(&rc_layer2)
-                .virtual_buffer_size_in_ms(self.vbv_ms.0)
-                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-            rc2.p_next = &av1_rc as *const _ as *const c_void;
-            let mut ctrl = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
-            ctrl.p_next = &rc2 as *const _ as *const c_void;
-            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-        }
-        dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
-        let src_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(src_extent)
-            .image_view_binding(src_view);
-        let mut enc = vk::VideoEncodeInfoKHR::default()
-            .dst_buffer(bs_buf)
-            .dst_buffer_offset(0)
-            .dst_buffer_range(self.bs_size)
-            .src_picture_resource(src_res)
-            .setup_reference_slot(&setup_slot);
-        if !is_idr {
-            enc = enc.reference_slots(&enc_refs);
-        }
-        enc.p_next = &av1_pic as *const _ as *const c_void;
-        if self.wave.is_some() {
-            enc.flags |= vk::VideoEncodeFlagsKHR::from_raw(vir::ENCODE_INTRA_REFRESH_BIT);
-            ir_info.p_next = enc.p_next;
-            enc.p_next = &ir_info as *const _ as *const c_void;
-        }
-        (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
-        dev.cmd_end_query(cmd, query_pool, 0);
-        (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
-        self.release_direct_source(dev, cmd, src_img, acquire);
-        dev.end_command_buffer(cmd)?;
-        Ok(())
+        let enc_refs: &[vk::VideoReferenceSlotInfoKHR] = if is_idr { &[] } else { &enc_refs };
+        self.record_coding_common(
+            dev,
+            cmd,
+            query_pool,
+            bs_buf,
+            src_img,
+            src_view,
+            acquire,
+            src_extent,
+            begin_slots,
+            &setup_slot,
+            enc_refs,
+            &av1_rc as *const _ as *const c_void,
+            &av1_pic as *const _ as *const c_void,
+            ir_info,
+        )
     }
 
     /// Read a completed slot's bitstream. HEVC keyframes carry VPS/SPS/PPS; AV1 opens every
@@ -4686,8 +4552,43 @@ use self::build::{
 #[cfg(test)]
 mod tests {
     use super::{build_h265_rps_s0, intra_refresh_caps, parse_rgb_request, VulkanVideoEncoder};
+    use crate::test_frames::{cpu_frame, cpu_frame_24};
     use crate::{Codec, Encoder};
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
+
+    /// The profile chain's structure types, head first.
+    fn chain_types(p: &ash::vk::VideoProfileInfoKHR) -> Vec<ash::vk::StructureType> {
+        let mut out = vec![p.s_type];
+        let mut next = p.p_next as *const ash::vk::BaseInStructure;
+        while !next.is_null() {
+            // SAFETY: every link `ProfileStack::wire` makes is a Vulkan struct that opens with
+            // `sType`/`pNext`, alive in the stack the caller still holds.
+            let base = unsafe { &*next };
+            out.push(base.s_type);
+            next = base.p_next;
+        }
+        out
+    }
+
+    /// One constructor for the session and every image profile: the VALVE rgb link is the only
+    /// thing `rgb` changes, and it hangs off usage.
+    #[test]
+    fn profile_chain_adds_rgb_conversion_only_when_asked() {
+        use super::{codec_op_for, ProfileStack};
+        use crate::vk_valve_rgb as vrgb;
+        for av1 in [false, true] {
+            let mut plain = ProfileStack::new(codec_op_for(av1), false, false);
+            let mut rgb = ProfileStack::new(codec_op_for(av1), false, true);
+            let (plain, rgb) = (chain_types(plain.wire(av1)), chain_types(rgb.wire(av1)));
+            assert_eq!(plain.len(), 3, "profile → codec → usage");
+            assert_eq!(
+                plain[2],
+                ash::vk::StructureType::VIDEO_ENCODE_USAGE_INFO_KHR
+            );
+            assert_eq!(rgb[..3], plain[..]);
+            assert_eq!(rgb[3..], [vrgb::stype(vrgb::ST_PROFILE_INFO)]);
+        }
+    }
 
     /// Native planar pairs: NV12 is the 8-bit source, P010 the 10-bit one; a crossed pair
     /// names a picture the session cannot program.
@@ -4812,22 +4713,6 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(&deltas[..3], &[0, 2, 3]);
         assert_eq!(used, 1 << 1, "POC 6 is the 2nd-newest → S0 index 1");
-    }
-
-    fn cpu_frame(w: u32, h: u32, pts_ns: u64, fill: [u8; 4]) -> CapturedFrame {
-        let mut buf = vec![0u8; (w * h * 4) as usize];
-        for px in buf.chunks_exact_mut(4) {
-            px.copy_from_slice(&fill);
-        }
-        CapturedFrame {
-            provenance: Default::default(),
-            width: w,
-            height: h,
-            pts_ns,
-            format: PixelFormat::Bgrx,
-            payload: FramePayload::Cpu(buf),
-            cursor: None,
-        }
     }
 
     /// BGRX frame of the shared moving texture at `frame` frames of motion
@@ -5296,28 +5181,6 @@ mod tests {
     fn vulkan_smoke_10bit_sdr_av1() {
         if let Some(aus) = run_smoke_10bit_sdr(Codec::Av1) {
             dump_smoke(&aus, "10bit.sdr.obu");
-        }
-    }
-
-    /// 24-bpp packed CPU frame. `rgb` is (r, g, b) regardless of `fmt`'s byte order.
-    fn cpu_frame_24(w: u32, h: u32, pts_ns: u64, rgb: [u8; 3], fmt: PixelFormat) -> CapturedFrame {
-        let px = match fmt {
-            PixelFormat::Rgb => [rgb[0], rgb[1], rgb[2]],
-            PixelFormat::Bgr => [rgb[2], rgb[1], rgb[0]],
-            _ => unreachable!("24-bpp helper"),
-        };
-        let mut buf = vec![0u8; (w * h * 3) as usize];
-        for p in buf.chunks_exact_mut(3) {
-            p.copy_from_slice(&px);
-        }
-        CapturedFrame {
-            provenance: Default::default(),
-            width: w,
-            height: h,
-            pts_ns,
-            format: fmt,
-            payload: FramePayload::Cpu(buf),
-            cursor: None,
         }
     }
 
