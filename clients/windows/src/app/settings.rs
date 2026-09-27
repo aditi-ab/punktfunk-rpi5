@@ -314,18 +314,9 @@ fn edit_preset_modal(
                     .icon(lucide::icon("copy"))
                     .on_click(move || {
                         let mut catalog = PresetsFile::load();
-                        let Some(source) = catalog.find_by_id(&id).cloned() else {
+                        let Some(new_id) = catalog.duplicate(&id) else {
                             return;
                         };
-                        let name = (2..)
-                            .map(|n| format!("{} {n}", source.name))
-                            .find(|n| !catalog.name_taken(n, None))
-                            .unwrap_or_else(|| source.name.clone());
-                        let mut copy = StreamPreset::new(name);
-                        copy.overrides = source.overrides.clone();
-                        copy.accent = source.accent.clone();
-                        let new_id = copy.id.clone();
-                        catalog.presets.push(copy);
                         if catalog.save().is_ok() {
                             // The sheet stays open and now edits the copy — scope follows it.
                             set_scope.call(new_id);

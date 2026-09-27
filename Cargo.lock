@@ -3775,7 +3775,6 @@ dependencies = [
  "relm4",
  "serde_json",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3788,7 +3787,6 @@ dependencies = [
  "punktfunk-core",
  "serde_json",
  "tracing",
- "tracing-subscriber",
  "winresource",
 ]
 
@@ -3800,7 +3798,6 @@ dependencies = [
  "punktfunk-core",
  "test_reactor",
  "tracing",
- "tracing-subscriber",
  "windows 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
  "windows-reactor",
  "windows-reactor-setup",

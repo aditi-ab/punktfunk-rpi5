@@ -1195,27 +1195,9 @@ fn clear_steam_sdl_device_filter() {
 }
 
 pub fn run() -> glib::ExitCode {
-    // The env filter scopes the fmt layer only; the ring (`pf_client_core::logring`) keeps
-    // DEBUG+ regardless of RUST_LOG, because "Send logs to host" uploads it. The spawned
-    // session's stderr joins the ring too, so a bundle carries the stream's trail.
-    {
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-        use tracing_subscriber::Layer;
-        tracing_subscriber::registry()
-            .with(
-                // The default (stdout) writer, exactly as `fmt().init()` had it.
-                tracing_subscriber::fmt::layer().with_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "info".into()),
-                ),
-            )
-            .with(
-                pf_client_core::logring::RingLayer
-                    .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-            )
-            .init();
-    }
+    // Logs to stdout and the ring "Send logs to host" uploads. The spawned session's stderr
+    // joins the ring too, so a bundle carries the stream's trail.
+    pf_client_core::logring::init_tracing(std::io::stdout, true);
     // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming every
     // physical pad Steam Input has virtualized; the Settings controller list needs the
     // real devices (same rationale as the session binary).

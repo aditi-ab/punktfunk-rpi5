@@ -168,6 +168,28 @@ pub fn send_bundle(
     }
 }
 
+/// Install the process subscriber: a fmt layer on `writer` scoped by `RUST_LOG` (default
+/// `info`), beside [`RingLayer`] at DEBUG regardless, since the ring exists for the
+/// diagnostics nobody enabled before the bug happened. `ansi: false` turns colour off for a
+/// log file; `true` keeps the fmt layer's default.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+pub fn init_tracing<W>(writer: W, ansi: bool)
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    let fmt = tracing_subscriber::fmt::layer().with_writer(writer);
+    let fmt = if ansi { fmt } else { fmt.with_ansi(false) };
+    tracing_subscriber::registry()
+        .with(fmt.with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        ))
+        .with(RingLayer.with_filter(tracing_subscriber::filter::LevelFilter::DEBUG))
+        .init();
+}
+
 /// `tracing` layer that feeds the ring. Installed beside the visible layer with
 /// its own `LevelFilter::DEBUG`, not under the env filter: a field bundle must
 /// carry diagnostics nobody enabled beforehand. Mirrors the host's

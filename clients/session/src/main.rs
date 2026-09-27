@@ -771,28 +771,8 @@ mod session_main {
 
     pub fn run() -> u8 {
         // Logs to STDERR — stdout is the machine interface (ready/stats/error lines) — plus
-        // the in-process ring (`pf_client_core::logring`, DEBUG+ regardless of RUST_LOG) that
-        // "Send logs to host" uploads. The env filter scopes the STDERR layer only: the ring
-        // exists precisely for the diagnostics nobody enabled before the bug happened.
-        {
-            use tracing_subscriber::layer::SubscriberExt;
-            use tracing_subscriber::util::SubscriberInitExt;
-            use tracing_subscriber::Layer;
-            tracing_subscriber::registry()
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(std::io::stderr)
-                        .with_filter(
-                            tracing_subscriber::EnvFilter::try_from_default_env()
-                                .unwrap_or_else(|_| "info".into()),
-                        ),
-                )
-                .with(
-                    pf_client_core::logring::RingLayer
-                        .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-                )
-                .init();
-        }
+        // the ring "Send logs to host" uploads.
+        pf_client_core::logring::init_tracing(std::io::stderr, true);
         // SEH last-resort: a driver AV otherwise leaves only an exit code in the shell's log.
         #[cfg(windows)]
         punktfunk_core::crash::install();

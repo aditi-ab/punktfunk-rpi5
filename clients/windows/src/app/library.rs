@@ -20,7 +20,7 @@ use super::lucide;
 use super::style::*;
 use super::{AppCtx, Screen, Svc};
 use pf_client_core::collate::{self, Collatable, SortKey};
-use pf_client_core::library::{self, store_label, DESKTOP_ID};
+use pf_client_core::library::{self, initials, store_label, DESKTOP_ID};
 use pf_client_core::trust::Settings;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -242,17 +242,6 @@ fn file_uri(p: &Path) -> String {
     format!("file:///{}", p.display().to_string().replace('\\', "/"))
 }
 
-/// The store badge text — shared spelling with the GTK page and the console UI's posters.
-/// Monogram for the placeholder poster: the first letters of the first two words.
-fn initials(title: &str) -> String {
-    title
-        .split_whitespace()
-        .take(2)
-        .filter_map(|w| w.chars().next())
-        .flat_map(char::to_uppercase)
-        .collect()
-}
-
 /// The tile overflow's only entry today — the per-GAME half of the pairing the host tiles
 /// already offer (design/client-deep-links.md §5 names the library game context menu as an
 /// attach point for exactly this).
@@ -267,15 +256,13 @@ const MENU_COPY_LINK: &str = "Copy link";
 /// copied URL streams the way the shelf it came from does. `None` only when the host has
 /// left the store while the page was open.
 fn game_link(target: &super::Target, game_id: &str) -> Option<String> {
-    let known = crate::trust::KnownHosts::load();
-    let host = known.resolve(target.fp_hex.as_deref(), &target.addr, target.port)?;
-    Some(
-        pf_client_core::deeplink::DeepLink::for_host(
-            host,
-            Some(game_id),
-            target.preset.as_deref().filter(|p| !p.is_empty()),
-        )
-        .to_url(),
+    pf_client_core::deeplink::saved_host_link(
+        &crate::trust::KnownHosts::load(),
+        target.fp_hex.as_deref(),
+        &target.addr,
+        target.port,
+        target.preset.as_deref().filter(|p| !p.is_empty()),
+        Some(game_id),
     )
 }
 

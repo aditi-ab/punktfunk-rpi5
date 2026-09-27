@@ -117,6 +117,17 @@ pub const DESKTOP_ID: &str = "\0desktop";
 /// [`crate::lucide`], the nearest system symbol on Apple and Android.
 pub const DESKTOP_ICON: &str = "monitor";
 
+/// Monogram for a poster without art: the first letters of the first two words. Every
+/// Rust shell draws its placeholder tiles with it.
+pub fn initials(title: &str) -> String {
+    title
+        .split_whitespace()
+        .take(2)
+        .filter_map(|w| w.chars().next())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
 /// Store id → display label. One table: the console, the GTK dialog and the WinUI dialog all
 /// drew this from a copy of their own, and a store added to one never reached the others.
 pub fn store_label(store: &str) -> &'static str {
@@ -565,6 +576,14 @@ pub(crate) fn classify(e: ureq::Error) -> LibraryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initials_take_two_words() {
+        assert_eq!(initials("Dota 2"), "D2");
+        assert_eq!(initials("half-life"), "H");
+        assert_eq!(initials("The Witness III"), "TW");
+        assert_eq!(initials(""), "");
+    }
 
     #[test]
     fn poster_candidates_order_and_resolution() {

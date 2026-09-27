@@ -2678,17 +2678,7 @@ pub fn show_scoped(
         // taken from what the user was actually looking at.
         if let Some(src) = pending_dup.borrow_mut().take() {
             let mut catalog = PresetsFile::load();
-            if let Some(source) = catalog.find_by_id(&src).cloned() {
-                // "Work 2", "Work 3", … — the first name the catalog doesn't already hold.
-                let copy_name = (2..)
-                    .map(|n| format!("{} {n}", source.name))
-                    .find(|n| !catalog.name_taken(n, None))
-                    .unwrap_or_else(|| source.name.clone());
-                let mut copy = StreamPreset::new(copy_name);
-                copy.overrides = source.overrides.clone();
-                copy.accent = source.accent.clone();
-                let new_id = copy.id.clone();
-                catalog.presets.push(copy);
+            if let Some(new_id) = catalog.duplicate(&src) {
                 if catalog.save().is_ok() {
                     *next_scope.borrow_mut() = Some(Scope::Preset(new_id));
                 }

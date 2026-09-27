@@ -42,10 +42,9 @@ pub fn arg_flag(flag: &str) -> bool {
 /// "Open Punktfunk?" prompt ends up invoking. Validation happens later, in the shared parser —
 /// this only decides whether argv contains something addressed to us.
 pub fn deep_link_arg() -> Option<String> {
-    std::env::args().skip(1).find(|a| {
-        let lower = a.to_ascii_lowercase();
-        lower.starts_with("punktfunk://") || lower.starts_with("pf://")
-    })
+    std::env::args()
+        .skip(1)
+        .find(|a| pf_client_core::deeplink::is_link_arg(a))
 }
 
 /// A bare launch under Gaming Mode opens the console, not the desktop shell. Gaming Mode

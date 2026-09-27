@@ -1526,7 +1526,7 @@ fn order(games: &mut [LibraryGame]) {
 /// The desktop tile's id and mark, and the store→label table. All live in `pf-client-core`
 /// now, so the GTK and WinUI dialogs read the same ones; re-exported because the screens name
 /// them through this module.
-pub use pf_client_core::library::{store_label, DESKTOP_ICON, DESKTOP_ID};
+pub use pf_client_core::library::{initials, store_label, DESKTOP_ICON, DESKTOP_ID};
 
 /// Every shelf leads with the host's own desktop, so Library is never a dead end for the
 /// desktop-only user and a plugin-less host is still one press from streaming. Model state
@@ -1545,15 +1545,6 @@ fn desktop_tile() -> LibraryGame {
         stats: None,
         running: false,
     }
-}
-
-pub fn initials(title: &str) -> String {
-    title
-        .split_whitespace()
-        .take(2)
-        .filter_map(|w| w.chars().next())
-        .flat_map(char::to_uppercase)
-        .collect()
 }
 
 /// One band of the Games tab, by the id `Settings::library_sections` stores.
@@ -2438,12 +2429,6 @@ mod tests {
             tall(&left, 0.0) > tall(&left, w),
             "the outer edge comes forward"
         );
-    }
-
-    #[test]
-    fn initials_take_two_words() {
-        assert_eq!(initials("Dota 2"), "D2");
-        assert_eq!(initials("half-life"), "H");
     }
 
     /// The field's turn at t = 0 is its fixed tilt alone, and at any t a rotation: rows
