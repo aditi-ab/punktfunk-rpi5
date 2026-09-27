@@ -19,7 +19,7 @@ use crate::imp::proto::{ConvertOut, ConvertSrc, CursorRect};
 use anyhow::{anyhow, bail, Context, Result};
 use ash::vk;
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
 
 const CONVERT_SPV: &[u8] = include_bytes!("../convert_img.spv");
 /// Push constants of `convert_img.comp`: nine 32-bit words.
@@ -103,6 +103,8 @@ pub(super) struct ConvertState {
     srcs: HashMap<i32, SrcImage>,
     slots: HashMap<u32, SlotBuf>,
     cursor: Option<CursorBuf>,
+    /// `(width, height)` of the bitmap in `cursor`; `None` until one is uploaded.
+    cursor_dims: Option<(u32, u32)>,
     cursor_serial: u64,
 }
 
@@ -184,6 +186,7 @@ impl VkBridge {
                 srcs: HashMap::new(),
                 slots: HashMap::new(),
                 cursor: None,
+                cursor_dims: None,
                 cursor_serial: u64::MAX,
             };
             if let Err(e) = self.build_convert(&mut st) {
@@ -431,6 +434,7 @@ impl VkBridge {
             let st = self.conv.as_mut().expect("ensured above");
             let c = st.cursor.as_ref().expect("capacity ensured");
             std::ptr::copy_nonoverlapping(rgba.as_ptr(), c.map, need as usize);
+            st.cursor_dims = Some((width, height));
             st.cursor_serial = serial;
             Ok(())
         }
@@ -490,6 +494,8 @@ impl VkBridge {
                 return Ok(());
             }
             let d = &self.device;
+            // The bitmap goes with its buffer; a rect is refused until the next upload.
+            st.cursor_dims = None;
             if let Some(old) = st.cursor.take() {
                 let _ = d.device_wait_idle();
                 d.unmap_memory(old.memory);
@@ -569,12 +575,10 @@ impl VkBridge {
             let fmt = vk_format(s.fourcc)
                 .ok_or_else(|| anyhow!("no VkFormat for dmabuf fourcc {:#x}", s.fourcc))?;
             let d = &self.device;
-            let dup = libc::dup(s.fd);
-            if dup < 0 {
-                bail!("dup(dmabuf fd)");
-            }
-            // SAFETY: `dup` came from a successful `dup` and nothing else owns it.
-            let dup = <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(dup);
+            // `s.fd` is the worker's cached dmabuf, open for this call.
+            let dup = BorrowedFd::borrow_raw(s.fd)
+                .try_clone_to_owned()
+                .context("dup(dmabuf fd)")?;
             let planes = [vk::SubresourceLayout::default()
                 .offset(u64::from(s.offset))
                 .row_pitch(u64::from(s.stride))];
@@ -730,11 +734,23 @@ impl VkBridge {
                     src.height
                 );
             }
+            check_layout(out)?;
             let need = slot_bytes(out);
-            let (image, view, first) = self.src_image(src)?;
-            if cursor.is_some() && self.conv.as_ref().expect("state").cursor.is_none() {
-                bail!("cursor rect without an uploaded bitmap");
+            if let Some(c) = cursor {
+                match self.conv.as_ref().expect("state").cursor_dims {
+                    None => bail!("cursor rect without an uploaded bitmap"),
+                    // The shader indexes the bitmap with `c.w` as its row length.
+                    Some(dims) if dims != (c.w, c.h) => bail!(
+                        "cursor rect {}x{} does not match the uploaded {}x{} bitmap",
+                        c.w,
+                        c.h,
+                        dims.0,
+                        dims.1
+                    ),
+                    Some(_) => {}
+                }
             }
+            let (image, view, first) = self.src_image(src)?;
             if self.conv.as_ref().expect("state").cursor.is_none() {
                 self.ensure_cursor_capacity(16)?;
             }
@@ -893,6 +909,30 @@ impl VkBridge {
     }
 }
 
+/// Refuse a layout whose rows `convert_img.comp` would write past: a row pitch shorter than
+/// the row, fewer plane rows than picture rows, or a mode the shader does not know.
+fn check_layout(out: &ConvertOut) -> Result<()> {
+    let row_bytes = match out.mode {
+        0 | 3 | 4 => u64::from(out.width) * 4,
+        1 | 2 => u64::from(out.width),
+        m => bail!("unknown convert mode {m}"),
+    };
+    if u64::from(out.pitch_w) * 4 < row_bytes {
+        bail!(
+            "slot pitch of {} words is short of a {row_bytes}-byte row",
+            out.pitch_w
+        );
+    }
+    if matches!(out.mode, 1 | 2) && out.plane_rows < out.height {
+        bail!(
+            "{} plane rows cannot hold a {}-row picture",
+            out.plane_rows,
+            out.height
+        );
+    }
+    Ok(())
+}
+
 /// Bytes the slot must hold for `out`: packed modes one word per pixel per row, NV12 its
 /// luma rows plus half as many chroma rows, YUV444 three planes.
 fn slot_bytes(out: &ConvertOut) -> u64 {
@@ -933,6 +973,33 @@ mod tests {
         assert_eq!(vk_format(0), None);
     }
 
+    /// Layouts the shader would write past are refused before any GPU work.
+    #[test]
+    fn check_layout_bounds_the_shader_writes() {
+        let out = |mode, pitch_w, plane_rows| ConvertOut {
+            mode,
+            width: 100,
+            height: 50,
+            pitch_w,
+            plane_rows,
+        };
+        assert!(check_layout(&out(0, 100, 50)).is_ok());
+        assert!(
+            check_layout(&out(0, 99, 50)).is_err(),
+            "packed row is 100 words"
+        );
+        assert!(check_layout(&out(1, 25, 50)).is_ok());
+        assert!(
+            check_layout(&out(1, 24, 50)).is_err(),
+            "NV12 luma row is 25 words"
+        );
+        assert!(
+            check_layout(&out(2, 25, 49)).is_err(),
+            "plane rows short of the height"
+        );
+        assert!(check_layout(&out(5, 1000, 1000)).is_err(), "unknown mode");
+    }
+
     /// The BT.709 limited-range bytes `convert_img.comp` writes, in f32 like the shader.
     fn yuv(c: [u8; 3]) -> (u8, u8, u8) {
         let [r, g, b] = c.map(|v| v as f32 / 255.0);
@@ -966,11 +1033,8 @@ mod tests {
         bridge
             .set_cursor(7, cw, ch, &cursor)
             .expect("cursor upload");
-        let sem = cuda::ExternalSemaphore::import_owned_timeline_fd(
-            bridge
-                .convert_timeline_fd()
-                .expect("timeline fd")
-                .into_raw_fd(),
+        let sem = cuda::ExternalSemaphore::import_timeline_fd(
+            bridge.convert_timeline_fd().expect("timeline fd"),
         )
         .expect("convert timeline into CUDA");
         let reference = |x: u32, y: u32| -> [u8; 3] {

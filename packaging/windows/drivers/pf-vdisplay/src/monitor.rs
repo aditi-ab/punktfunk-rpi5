@@ -12,7 +12,7 @@
 //! [`Monitor::teardown`] stops the workers (cursor first, then the encode session, the drain
 //! worker, the pool), and only then does the caller run `IddCxMonitorDeparture`.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,12 @@ pub use pf_driver_proto::vdisplay::{Mode, flatten};
 
 /// The IddCx monitor handle, set once `IddCxMonitorCreate` returns.
 type SendMonitor = Sendable<iddcx::IDDCX_MONITOR>;
+
+/// [`Monitor::state`]: the IddCx lifecycle. `IddCxMonitorDeparture` is legal only on an arrived
+/// monitor, so exactly one caller wins the `ARRIVED → DEPARTED` swap and departs it.
+const CREATING: u8 = 0;
+const ARRIVED: u8 = 1;
+const DEPARTED: u8 = 2;
 
 /// What `IddCxMonitorArrival` reported: the OS target id — the key the host addresses every
 /// later delivery by — and the render-adapter LUID for the ADD reply.
@@ -96,6 +102,8 @@ pub struct Monitor {
     pub created_at: Instant,
     object: OnceLock<SendMonitor>,
     arrival: OnceLock<Arrival>,
+    /// `CREATING`, `ARRIVED` or `DEPARTED`; see [`Monitor::claim_departure`].
+    state: AtomicU8,
     /// Advertised modes (requested mode first, then the proto's fallbacks).
     modes: Mutex<Vec<Mode>>,
     /// The live swap-chain drain worker; dropping it joins the thread.
@@ -156,6 +164,7 @@ impl Monitor {
             created_at: Instant::now(),
             object: OnceLock::new(),
             arrival: OnceLock::new(),
+            state: AtomicU8::new(CREATING),
             modes: Mutex::new(modes),
             swap: Mutex::new(None),
             source_seq: Arc::new(AtomicU64::new(0)),
@@ -294,14 +303,27 @@ impl Monitor {
         }
     }
 
-    /// The IddCx handle — `None` until `IddCxMonitorCreate` returned.
     /// True once the OS has assigned this monitor a swap chain — the seat bring-up waits on it.
     pub fn has_swap_chain(&self) -> bool {
         lock(&self.swap).is_some()
     }
 
+    /// The IddCx handle — `None` until `IddCxMonitorCreate` returned. It is set before the
+    /// arrival, so the mode DDIs the arrival re-enters can match on it.
     pub fn object(&self) -> Option<iddcx::IDDCX_MONITOR> {
         self.object.get().map(|o| o.0)
+    }
+
+    /// True between a successful arrival and the departure claim.
+    fn arrived(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ARRIVED
+    }
+
+    /// Mark the monitor departed. `true` only when it had arrived: the caller, alone, then runs
+    /// `IddCxMonitorDeparture`. A monitor still creating is left to its creator, which sees the
+    /// mark after the arrival and departs it itself.
+    fn claim_departure(&self) -> bool {
+        self.state.swap(DEPARTED, Ordering::AcqRel) == ARRIVED
     }
 
     /// The OS target id — 0 until arrival, a value the host never sends (OS target ids are
@@ -421,15 +443,19 @@ impl Monitor {
     }
 }
 
-/// Tear every removed monitor down, then depart the ones that have an IddCx object: a worker
-/// can be inside a DDI against the handle departure destroys, so the joins come first.
+/// Tear every removed monitor down, then depart the ones this call claims
+/// ([`Monitor::claim_departure`]): a worker can be inside a DDI against the handle departure
+/// destroys, so the joins come first. A monitor still creating is marked, and its creator
+/// departs it.
 fn depart(removed: Vec<Arc<Monitor>>) {
     for m in &removed {
         m.teardown();
     }
     for m in removed {
-        if let Some(object) = m.object() {
-            // SAFETY: `object` is a live IddCx monitor handle; departure tears it down.
+        if m.claim_departure()
+            && let Some(object) = m.object()
+        {
+            // SAFETY: `object` arrived, and this call won its one departure claim.
             unsafe { wdk_iddcx::IddCxMonitorDeparture(object) };
         }
     }
@@ -460,20 +486,22 @@ fn signal_info(
         cx: width,
         cy: height,
     };
-    let mut si = pod_init!(wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO);
-    si.pixelRate = n.pixel_rate;
-    si.hSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
-        Numerator: n.h_sync_num,
-        Denominator: 1,
+    let mut si = wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
+        pixelRate: n.pixel_rate,
+        hSyncFreq: wdk_sys::DISPLAYCONFIG_RATIONAL {
+            Numerator: n.h_sync_num,
+            Denominator: 1,
+        },
+        vSyncFreq: wdk_sys::DISPLAYCONFIG_RATIONAL {
+            Numerator: n.v_sync_num,
+            Denominator: 1,
+        },
+        totalSize: region,
+        activeSize: region,
+        scanLineOrdering:
+            wdk_sys::DISPLAYCONFIG_SCANLINE_ORDERING::DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE,
+        ..Default::default()
     };
-    si.vSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
-        Numerator: n.v_sync_num,
-        Denominator: 1,
-    };
-    si.totalSize = region;
-    si.activeSize = region;
-    si.scanLineOrdering =
-        wdk_sys::DISPLAYCONFIG_SCANLINE_ORDERING::DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
     // union { AdditionalSignalInfo bitfield | videoStandard:u32 } — the proto packs the
     // vSyncFreqDivider into bits 16..21 of the "other" video standard.
     si.__bindgen_anon_1.videoStandard = n.video_standard;
@@ -491,12 +519,13 @@ pub fn display_info(
 
 /// `IDDCX_TARGET_MODE` for a scan-out mode (vSyncFreqDivider = 1, per the DDI contract).
 pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_TARGET_MODE {
-    let mut tm = pod_init!(iddcx::IDDCX_TARGET_MODE);
-    tm.Size = core::mem::size_of::<iddcx::IDDCX_TARGET_MODE>() as u32;
-    tm.TargetVideoSignalInfo = wdk_sys::DISPLAYCONFIG_TARGET_MODE {
-        targetVideoSignalInfo: signal_info(width, height, refresh_rate, 1),
-    };
-    tm
+    iddcx::IDDCX_TARGET_MODE {
+        Size: core::mem::size_of::<iddcx::IDDCX_TARGET_MODE>() as u32,
+        TargetVideoSignalInfo: wdk_sys::DISPLAYCONFIG_TARGET_MODE {
+            targetVideoSignalInfo: signal_info(width, height, refresh_rate, 1),
+        },
+        ..Default::default()
+    }
 }
 
 /// Wire bit-depth advertised per mode in the `*2` (HDR) mode DDIs. STEP 7: advertise BOTH 8 and 10 bpc
@@ -508,12 +537,12 @@ pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_T
 pub fn wire_bits() -> iddcx::IDDCX_WIRE_BITS_PER_COMPONENT {
     let rgb = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_8
         | iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_10;
-    let mut w = pod_init!(iddcx::IDDCX_WIRE_BITS_PER_COMPONENT);
-    w.Rgb = rgb;
-    w.YCbCr444 = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE;
-    w.YCbCr422 = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE;
-    w.YCbCr420 = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE;
-    w
+    iddcx::IDDCX_WIRE_BITS_PER_COMPONENT {
+        Rgb: rgb,
+        YCbCr444: iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE,
+        YCbCr422: iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE,
+        YCbCr420: iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE,
+    }
 }
 
 /// `IDDCX_TARGET_MODE2` for a scan-out mode (HDR `*2` path): builds the v1 [`target_mode`] and copies its
@@ -521,19 +550,21 @@ pub fn wire_bits() -> iddcx::IDDCX_WIRE_BITS_PER_COMPONENT {
 /// zeroed.
 pub fn target_mode2(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_TARGET_MODE2 {
     let m1 = target_mode(width, height, refresh_rate);
-    let mut tm = pod_init!(iddcx::IDDCX_TARGET_MODE2);
-    tm.Size = core::mem::size_of::<iddcx::IDDCX_TARGET_MODE2>() as u32;
-    tm.TargetVideoSignalInfo = m1.TargetVideoSignalInfo;
-    tm.BitsPerComponent = wire_bits();
-    tm
+    iddcx::IDDCX_TARGET_MODE2 {
+        Size: core::mem::size_of::<iddcx::IDDCX_TARGET_MODE2>() as u32,
+        TargetVideoSignalInfo: m1.TargetVideoSignalInfo,
+        BitsPerComponent: wire_bits(),
+        ..Default::default()
+    }
 }
 
 /// Adopt a hardware-cursor channel delivery (`IOCTL_SET_CURSOR_CHANNEL`, proto v5): create the
 /// cursor-data event, declare the hardware cursor to the OS, start the worker. `Err(ch)` when
-/// `owner` has no arrived monitor with `target_id`, or the event could not be made. A
-/// re-delivery replaces both — the host only re-sends after recreating the section. A monitor
-/// added without `hw_cursor` gets one only because the adapter already excludes the pointer:
-/// its client draws nothing, so the channel exists for the pool's blend alone.
+/// `owner` has no arrived monitor with `target_id`, the event could not be made, or the section
+/// failed to map or validate. A re-delivery replaces both — the host only re-sends after
+/// recreating the section. A monitor added without `hw_cursor` gets one only because the
+/// adapter already excludes the pointer: its client draws nothing, so the channel exists for
+/// the pool's blend alone.
 ///
 /// The monitor keeps one data event across deliveries: a re-declare after a swap-chain assign
 /// copies its value out and must never find it closed. A replaced worker is joined before the
@@ -581,17 +612,21 @@ pub fn set_cursor_channel(
     // the channel and spawn the worker WITHOUT declaring, so DWM keeps compositing; a later
     // enable-flip declares against this event. Once anything declared, the pointer is gone
     // from every frame and the worker's shape is what the pool blends, so declare regardless.
-    let Some(worker) = crate::cursor_worker::setup_and_spawn(
+    let spawned = crate::cursor_worker::setup_and_spawn(
         object,
         ch,
         declare,
         data_event.as_raw().0 as isize,
         cell,
-    ) else {
-        // setup_and_spawn consumed the channel and released everything it mapped; `data_event`
-        // drops here. The host detects the missing publish and keeps its composited cursor.
-        lock(&m.cursor).set_blend(registry::any_declared());
-        return Ok(());
+    );
+    let worker = match spawned {
+        Ok(worker) => worker,
+        Err(unadopted) => {
+            // `data_event` drops here. An adopted channel is released already and the host sees
+            // no publish; one that failed validation goes back for the host to reap.
+            lock(&m.cursor).set_blend(registry::any_declared());
+            return unadopted.map_or(Ok(()), Err);
+        }
     };
     if declare {
         // The worker only spawns after `IddCxMonitorSetupHardwareCursor` succeeded.
@@ -698,8 +733,9 @@ pub const SEAT_PLACEHOLDER_SESSION: u64 = 0;
 /// re-enters find it by id; the handle and then the arrival are filled in write-once. A create
 /// failure reclaims the id. An arrival failure must also `WdfObjectDelete` the created object:
 /// departure is only valid for an arrived monitor, and a leaked object pins its slot against the
-/// adapter's monitor budget. The entry is removed before that delete so a concurrent clear or
-/// reap cannot depart the handle being deleted.
+/// adapter's monitor budget. A concurrent clear or reap never departs a monitor that has not
+/// arrived ([`Monitor::claim_departure`]), so that delete, and the creator's own departure after
+/// a mid-create removal, each run exactly once.
 pub fn create_monitor(
     owner: u32,
     req: &pf_driver_proto::control::AddRequest,
@@ -738,33 +774,37 @@ pub fn create_monitor(
     // EDID (serial = id) describes the monitor; the OS calls back into parse_monitor_description.
     // The session's own mode becomes the preferred-timing DTD when it fits the encoding.
     let mut edid = pf_driver_proto::edid::generate(id, client_lum, Some((width, height, refresh)));
-    let mut desc = pod_init!(iddcx::IDDCX_MONITOR_DESCRIPTION);
-    desc.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_DESCRIPTION>() as u32;
-    desc.Type = iddcx::IDDCX_MONITOR_DESCRIPTION_TYPE::IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    desc.DataSize = edid.len() as u32;
-    // SAFETY: `edid` is a local array that outlives this `create_monitor` call; IddCxMonitorCreate
-    // (below) reads through `pData` SYNCHRONOUSLY, before `edid` drops — the pointer never escapes.
-    desc.pData = edid.as_mut_ptr().cast();
+    let desc = iddcx::IDDCX_MONITOR_DESCRIPTION {
+        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_DESCRIPTION>() as u32,
+        Type: iddcx::IDDCX_MONITOR_DESCRIPTION_TYPE::IDDCX_MONITOR_DESCRIPTION_TYPE_EDID,
+        DataSize: edid.len() as u32,
+        // SAFETY: `edid` is a local array that outlives this `create_monitor` call; IddCxMonitorCreate
+        // (below) reads through `pData` SYNCHRONOUSLY, before `edid` drops — the pointer never escapes.
+        pData: edid.as_mut_ptr().cast(),
+    };
 
-    let mut info = pod_init!(iddcx::IDDCX_MONITOR_INFO);
-    info.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_INFO>() as u32;
-    info.MonitorContainerId = container_guid(id);
-    info.MonitorType =
-        wdk_sys::DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY::DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
-    info.ConnectorIndex = id;
-    info.MonitorDescription = desc;
+    let mut info = iddcx::IDDCX_MONITOR_INFO {
+        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_INFO>() as u32,
+        MonitorContainerId: container_guid(id),
+        MonitorType:
+            wdk_sys::DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY::DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
+        ConnectorIndex: id,
+        MonitorDescription: desc,
+    };
 
-    let mut attr = pod_init!(wdk_sys::WDF_OBJECT_ATTRIBUTES);
-    attr.Size = core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32;
-    attr.ExecutionLevel = wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent;
-    attr.SynchronizationScope =
-        wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent;
+    let mut attr = wdk_sys::WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32,
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        ..Default::default()
+    };
 
     let create_in = iddcx::IDARG_IN_MONITORCREATE {
         ObjectAttributes: &raw mut attr,
         pMonitorInfo: &raw mut info,
     };
-    let mut create_out = pod_init!(iddcx::IDARG_OUT_MONITORCREATE);
+    let mut create_out = iddcx::IDARG_OUT_MONITORCREATE::default();
     // SAFETY: adapter is a valid IddCx adapter; create_in points to valid local storage read synchronously.
     let st = unsafe { wdk_iddcx::IddCxMonitorCreate(adapter, &create_in, &mut create_out) };
     dbglog!("[pf-vd] IddCxMonitorCreate(id={id}) -> {st:#x}");
@@ -776,33 +816,43 @@ pub fn create_monitor(
     let _ = monitor.object.set(Sendable(object));
 
     // Tell the OS the monitor is plugged in.
-    let mut arrival_out = pod_init!(iddcx::IDARG_OUT_MONITORARRIVAL);
-    // SAFETY: `object` is the just-created IddCx monitor handle.
+    let mut arrival_out = iddcx::IDARG_OUT_MONITORARRIVAL::default();
+    // SAFETY: `object` is the just-created IddCx monitor handle. No one departs it before it
+    // arrives: `claim_departure` only marks a monitor still creating.
     let st = unsafe { wdk_iddcx::IddCxMonitorArrival(object, &mut arrival_out) };
     dbglog!("[pf-vd] IddCxMonitorArrival(id={id}) -> {st:#x}");
     if !wdk_iddcx::nt_success(st) {
         dbglog!(
             "[pf-vd] IddCxMonitorArrival(id={id}) FAILED — reclaiming the id + deleting the created monitor"
         );
+        monitor.state.store(DEPARTED, Ordering::Release);
         remove_by_id(id);
-        // SAFETY: `object` is the just-created (not-yet-arrived) IddCx monitor handle, now owned
-        // solely here (its registry entry was just removed); `WdfObjectDelete` takes a `WDFOBJECT`
-        // (a raw handle cast, as in the swap-chain / device-cleanup teardowns).
+        // SAFETY: `object` never arrived, so no departure ran on it, and only this thread
+        // deletes it; `WdfObjectDelete` takes a `WDFOBJECT` (a raw handle cast, as in the
+        // swap-chain teardown).
         unsafe {
             call_unsafe_wdf_function_binding!(WdfObjectDelete, object as WDFOBJECT);
         }
         return None;
     }
 
-    // A clear that landed while the create was in flight found the entry with no handle set,
-    // so `depart` skipped it and dropped it from the registry. The monitor has now arrived and
-    // nothing can reach it: it would stay plugged in for the device's life. Undo it here.
-    // `reap_owner`'s grace already covers the reaper; this covers CLEAR_ALL, which has none.
-    if !registry::find(|m| m.id == id).is_some_and(|m| Arc::ptr_eq(&m, &monitor)) {
+    // A removal that ran while the create was in flight either marked the monitor departed
+    // (clear, reap, remove) or only unlinked it (device cleanup). Either way nothing else will
+    // depart it, and it would stay plugged in for the device's life: undo it here.
+    let arrived = monitor
+        .state
+        .compare_exchange(CREATING, ARRIVED, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    let linked = registry::find(|m| m.id == id).is_some_and(|m| Arc::ptr_eq(&m, &monitor));
+    if !arrived || !linked {
         dbglog!("[pf-vd] create_monitor(id={id}): cleared mid-create — departing the new monitor");
-        // SAFETY: `object` arrived successfully just above, which is what makes departure legal.
-        unsafe { wdk_iddcx::IddCxMonitorDeparture(object) };
         monitor.teardown();
+        // A lost swap means a removal marked it and left the departure here; an unlinked one
+        // is claimed like any other removal, so a remover still in `depart` skips it.
+        if !arrived || monitor.claim_departure() {
+            // SAFETY: `object` arrived successfully just above, and this is its one departure.
+            unsafe { wdk_iddcx::IddCxMonitorDeparture(object) };
+        }
         return None;
     }
 
@@ -840,8 +890,8 @@ pub fn update_monitor_modes(
     let Some(m) = registry::find(|m| m.owner == owner && m.session_id == session_id) else {
         return crate::STATUS_NOT_FOUND;
     };
-    let Some(object) = m.object() else {
-        return crate::STATUS_NOT_FOUND; // created but not yet arrived — nothing to update
+    let Some(object) = m.object().filter(|_| m.arrived()) else {
+        return crate::STATUS_NOT_FOUND; // not arrived, or departing — nothing to update
     };
     let Some(_ddi) = m.ddi() else {
         return crate::STATUS_NOT_FOUND; // torn down under us
@@ -867,10 +917,11 @@ pub fn update_monitor_modes(
     let mut targets: Vec<iddcx::IDDCX_TARGET_MODE2> = flatten(&new_modes)
         .map(|item| target_mode2(item.width, item.height, item.refresh_rate))
         .collect();
-    let mut in_args = pod_init!(iddcx::IDARG_IN_UPDATEMODES2);
-    in_args.Reason = iddcx::IDDCX_UPDATE_REASON::IDDCX_UPDATE_REASON_OTHER;
-    in_args.TargetModeCount = targets.len() as u32;
-    in_args.pTargetModes = targets.as_mut_ptr();
+    let in_args = iddcx::IDARG_IN_UPDATEMODES2 {
+        Reason: iddcx::IDDCX_UPDATE_REASON::IDDCX_UPDATE_REASON_OTHER,
+        TargetModeCount: targets.len() as u32,
+        pTargetModes: targets.as_mut_ptr(),
+    };
     // SAFETY: `object` is a live IddCx monitor handle (arrived — checked above) and `_ddi` holds
     // its teardown and departure off until this call returns. `in_args` points at valid local
     // storage (`targets` outlives the synchronous DDI call).

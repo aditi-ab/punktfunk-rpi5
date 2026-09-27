@@ -23,9 +23,11 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::nvenc_core::{
-    apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, plan_range_recovery,
-    resolve_slices, resolve_split_subframe, resolve_subframe, store_ceiling, subframe_env_forced,
-    wave_rows, CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
+    apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, encode_cap,
+    force_frame_mode, plan_range_recovery, prefix_diverged, resolve_slices, resolve_split_subframe,
+    resolve_subframe, seed_config, seed_pic_params, seed_preset_config, session_wave_cycle,
+    slice_offsets_len, store_ceiling, subframe_env_forced, BitstreamLock, CeilingKey,
+    CreateInstance, EncodeApi, GetMaxSupportedVersion, LowLatencyConfig, NvStatusExt, RangePlan,
 };
 use crate::rfi::{Wave, WaveMark};
 // Shared with Linux's direct session. Do not fork this copy.
@@ -51,61 +53,6 @@ use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
 // Runtime-loaded NVENC entry table. A link-time import of `nvEncodeAPI64.dll` would
 // refuse to start on AMD/Intel before `main`. Only the two DLL exports resolve by
 // name; `NvEncodeAPICreateInstance` fills the rest.
-
-/// NVENC entry table unwrapped at load. Do not touch the sdk crate's `EncodeAPI` lazy static:
-/// it calls the statically-declared externs and would demand the import lib at link time.
-struct EncodeApi {
-    open_encode_session_ex: unsafe extern "C" fn(
-        *mut nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
-        *mut *mut c_void,
-    ) -> nv::NVENCSTATUS,
-    initialize_encoder:
-        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_INITIALIZE_PARAMS) -> nv::NVENCSTATUS,
-    reconfigure_encoder:
-        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_RECONFIGURE_PARAMS) -> nv::NVENCSTATUS,
-    destroy_encoder: unsafe extern "C" fn(*mut c_void) -> nv::NVENCSTATUS,
-    get_encode_caps: unsafe extern "C" fn(
-        *mut c_void,
-        nv::GUID,
-        *mut nv::NV_ENC_CAPS_PARAM,
-        *mut core::ffi::c_int,
-    ) -> nv::NVENCSTATUS,
-    // Driver GUID list for [`probe_codec_support`]. Missing entries fail the table load.
-    get_encode_guid_count: unsafe extern "C" fn(*mut c_void, *mut u32) -> nv::NVENCSTATUS,
-    get_encode_guids:
-        unsafe extern "C" fn(*mut c_void, *mut nv::GUID, u32, *mut u32) -> nv::NVENCSTATUS,
-    get_encode_preset_config_ex: unsafe extern "C" fn(
-        *mut c_void,
-        nv::GUID,
-        nv::GUID,
-        nv::NV_ENC_TUNING_INFO,
-        *mut nv::NV_ENC_PRESET_CONFIG,
-    ) -> nv::NVENCSTATUS,
-    create_bitstream_buffer: unsafe extern "C" fn(
-        *mut c_void,
-        *mut nv::NV_ENC_CREATE_BITSTREAM_BUFFER,
-    ) -> nv::NVENCSTATUS,
-    destroy_bitstream_buffer:
-        unsafe extern "C" fn(*mut c_void, nv::NV_ENC_OUTPUT_PTR) -> nv::NVENCSTATUS,
-    lock_bitstream:
-        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_LOCK_BITSTREAM) -> nv::NVENCSTATUS,
-    unlock_bitstream: unsafe extern "C" fn(*mut c_void, nv::NV_ENC_OUTPUT_PTR) -> nv::NVENCSTATUS,
-    register_resource:
-        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_REGISTER_RESOURCE) -> nv::NVENCSTATUS,
-    unregister_resource:
-        unsafe extern "C" fn(*mut c_void, nv::NV_ENC_REGISTERED_PTR) -> nv::NVENCSTATUS,
-    map_input_resource:
-        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_MAP_INPUT_RESOURCE) -> nv::NVENCSTATUS,
-    unmap_input_resource:
-        unsafe extern "C" fn(*mut c_void, nv::NV_ENC_INPUT_PTR) -> nv::NVENCSTATUS,
-    encode_picture:
-        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_PIC_PARAMS) -> nv::NVENCSTATUS,
-    register_async_event:
-        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_EVENT_PARAMS) -> nv::NVENCSTATUS,
-    unregister_async_event:
-        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_EVENT_PARAMS) -> nv::NVENCSTATUS,
-    invalidate_ref_frames: unsafe extern "C" fn(*mut c_void, u64) -> nv::NVENCSTATUS,
-}
 
 /// Resolve the table once per process. `Err` = no NVIDIA driver/DLL or a driver older than our
 /// headers. [`NvencD3d11Encoder::open`] and [`probe_can_encode_444`] gate on it.
@@ -137,8 +84,7 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
     };
     // SAFETY: `LoadLibraryExW`/`GetProcAddress` take static NUL-terminated names;
     // `LOAD_LIBRARY_SEARCH_SYSTEM32` excludes a planted DLL. The transmutes are the
-    // `nvEncodeAPI.h` prototypes. `GetMaxSupportedVersion` writes one u32; `CreateInstance`
-    // fills `list` (version set) only during the call. The module is never freed.
+    // `nvEncodeAPI.h` prototypes. The module is never freed.
     unsafe {
         let module = LoadLibraryExW(w!("nvEncodeAPI64.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)
             .map_err(|e| format!("nvEncodeAPI64.dll not loadable (no NVIDIA driver?): {e}"))?;
@@ -146,57 +92,9 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
             .ok_or("nvEncodeAPI64.dll exports no NvEncodeAPIGetMaxSupportedVersion")?;
         let create_instance = GetProcAddress(module, s!("NvEncodeAPICreateInstance"))
             .ok_or("nvEncodeAPI64.dll exports no NvEncodeAPICreateInstance")?;
-        let get_version: unsafe extern "C" fn(*mut u32) -> nv::NVENCSTATUS =
-            std::mem::transmute(get_version);
-        let create_instance: unsafe extern "C" fn(
-            *mut nv::NV_ENCODE_API_FUNCTION_LIST,
-        ) -> nv::NVENCSTATUS = std::mem::transmute(create_instance);
-
-        let mut version = 0u32;
-        get_version(&mut version)
-            .nv_ok()
-            .map_err(|e| format!("NvEncodeAPIGetMaxSupportedVersion: {e:?}"))?;
-        // Same check as the sdk's `assert_versions_match`, but an older driver is `Err`, not a panic.
-        let (major, minor) = (version >> 4, version & 0xf);
-        if (major, minor) < (nv::NVENCAPI_MAJOR_VERSION, nv::NVENCAPI_MINOR_VERSION) {
-            return Err(format!(
-                "driver NVENC API {major}.{minor} is older than the host's headers {}.{} — \
-                 update the NVIDIA driver",
-                nv::NVENCAPI_MAJOR_VERSION,
-                nv::NVENCAPI_MINOR_VERSION
-            ));
-        }
-
-        let mut list = nv::NV_ENCODE_API_FUNCTION_LIST {
-            version: nv::NV_ENCODE_API_FUNCTION_LIST_VER,
-            ..Default::default()
-        };
-        create_instance(&mut list)
-            .nv_ok()
-            .map_err(|e| format!("NvEncodeAPICreateInstance: {e:?}"))?;
-        const MISSING: &str = "NvEncodeAPICreateInstance left an entry point unfilled";
-        Ok(EncodeApi {
-            open_encode_session_ex: list.nvEncOpenEncodeSessionEx.ok_or(MISSING)?,
-            initialize_encoder: list.nvEncInitializeEncoder.ok_or(MISSING)?,
-            reconfigure_encoder: list.nvEncReconfigureEncoder.ok_or(MISSING)?,
-            destroy_encoder: list.nvEncDestroyEncoder.ok_or(MISSING)?,
-            get_encode_caps: list.nvEncGetEncodeCaps.ok_or(MISSING)?,
-            get_encode_guid_count: list.nvEncGetEncodeGUIDCount.ok_or(MISSING)?,
-            get_encode_guids: list.nvEncGetEncodeGUIDs.ok_or(MISSING)?,
-            get_encode_preset_config_ex: list.nvEncGetEncodePresetConfigEx.ok_or(MISSING)?,
-            create_bitstream_buffer: list.nvEncCreateBitstreamBuffer.ok_or(MISSING)?,
-            destroy_bitstream_buffer: list.nvEncDestroyBitstreamBuffer.ok_or(MISSING)?,
-            lock_bitstream: list.nvEncLockBitstream.ok_or(MISSING)?,
-            unlock_bitstream: list.nvEncUnlockBitstream.ok_or(MISSING)?,
-            register_resource: list.nvEncRegisterResource.ok_or(MISSING)?,
-            unregister_resource: list.nvEncUnregisterResource.ok_or(MISSING)?,
-            map_input_resource: list.nvEncMapInputResource.ok_or(MISSING)?,
-            unmap_input_resource: list.nvEncUnmapInputResource.ok_or(MISSING)?,
-            encode_picture: list.nvEncEncodePicture.ok_or(MISSING)?,
-            register_async_event: list.nvEncRegisterAsyncEvent.ok_or(MISSING)?,
-            unregister_async_event: list.nvEncUnregisterAsyncEvent.ok_or(MISSING)?,
-            invalidate_ref_frames: list.nvEncInvalidateRefFrames.ok_or(MISSING)?,
-        })
+        let get_version: GetMaxSupportedVersion = std::mem::transmute(get_version);
+        let create_instance: CreateInstance = std::mem::transmute(create_instance);
+        EncodeApi::from_exports(get_version, create_instance)
     }
 }
 
@@ -387,9 +285,8 @@ fn retrieve_loop(
         let wait_ms = if wedged { WEDGED_DRAIN_WAIT_MS } else { 5000 };
         // SAFETY: `job.event` is an auto-reset event `init_session` registered; `job.bs` is
         // a pool bitstream. Both stay valid until `teardown` joins this thread first.
-        // On WAIT_OBJECT_0 the encode is done, so `lock_bitstream` (version set) yields a
-        // pointer valid until `unlock_bitstream`; the slice is copied first. Secondary-thread
-        // lock/unlock while the encode thread submits is the documented NVENC model.
+        // On WAIT_OBJECT_0 the encode is done; the guard copies the bytes, then unlocks.
+        // Secondary-thread lock/unlock while the encode thread submits is the NVENC model.
         let result = unsafe {
             if WaitForSingleObject(HANDLE(job.event as *mut c_void), wait_ms) != WAIT_OBJECT_0 {
                 wedged = true;
@@ -398,26 +295,14 @@ fn retrieve_loop(
                 ))
             } else {
                 wedged = false;
-                let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
-                    version: nv::NV_ENC_LOCK_BITSTREAM_VER,
-                    outputBitstream: job.bs as *mut c_void,
-                    ..Default::default()
-                };
-                match (api().lock_bitstream)(enc as *mut c_void, &mut lock).nv_ok() {
-                    Ok(()) => {
-                        let data = std::slice::from_raw_parts(
-                            lock.bitstreamBufferPtr as *const u8,
-                            lock.bitstreamSizeInBytes as usize,
-                        )
-                        .to_vec();
-                        let keyframe = matches!(
-                            lock.pictureType,
-                            nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR
-                                | nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
-                        );
-                        let _ = (api().unlock_bitstream)(enc as *mut c_void, job.bs as *mut c_void);
-                        Ok((data, keyframe))
-                    }
+                match BitstreamLock::new(
+                    api(),
+                    enc as *mut c_void,
+                    job.bs as *mut c_void,
+                    false,
+                    None,
+                ) {
+                    Ok(lock) => Ok((lock.bytes().to_vec(), lock.keyframe())),
                     Err(e) => Err(format!(
                         "lock_bitstream (async): {e:?} — {}",
                         nvenc_status::explain(e)
@@ -541,6 +426,8 @@ pub struct NvencD3d11Encoder {
     /// Later opens on this encoder resolve sub-frame off. Never cleared: a fresh encoder retests.
     subframe_broken: bool,
     chunk: Option<ChunkState>,
+    /// `sliceOffsets` for the doNotWait sampler, sized at session open ([`slice_offsets_len`]).
+    slice_offsets: Vec<u32>,
     session_async: bool,
     /// Last invalidated ref range. Dedupes the client's resends of the same loss event.
     last_rfi_range: Option<(i64, i64)>,
@@ -692,6 +579,7 @@ impl NvencD3d11Encoder {
             subframe_chunks: false,
             subframe_broken: false,
             chunk: None,
+            slice_offsets: Vec::new(),
             session_async: false,
             last_rfi_range: None,
             distrusted: false,
@@ -825,33 +713,14 @@ impl NvencD3d11Encoder {
         self.wave_span.is_some_and(|(_, close)| ts < close)
     }
 
-    /// Frames a forced intra refresh wave takes on this session; 0 when the wave is off.
-    /// AV1 never waves: NVENC codes every AV1 frame to load its entropy state from the
-    /// last, so a sweep cannot heal a loss. AV1 answers with an anchor or an IDR.
+    /// Frames a forced intra refresh wave takes on this session ([`session_wave_cycle`]).
     fn wave_cycle(&self) -> u32 {
-        if !crate::rfi::wave_enabled() || self.codec == Codec::Av1 {
-            return 0;
-        }
-        crate::rfi::wave_cycle(
-            wave_rows(self.height),
-            self.fps,
-            256,
-            crate::rfi::pinned_cycle(),
-        )
+        session_wave_cycle(self.codec, self.height, self.fps)
     }
 
-    /// One `NV_ENC_CAPS` value; 0 on error (unqueryable = unsupported).
+    /// One `NV_ENC_CAPS` value for this codec on `enc`; 0 on error ([`encode_cap`]).
     unsafe fn get_cap(&self, enc: *mut c_void, which: nv::NV_ENC_CAPS) -> i32 {
-        let mut param = nv::NV_ENC_CAPS_PARAM {
-            version: nv::NV_ENC_CAPS_PARAM_VER,
-            capsToQuery: which,
-            reserved: [0; 62],
-        };
-        let mut val: i32 = 0;
-        match (api().get_encode_caps)(enc, self.codec_guid, &mut param, &mut val).nv_ok() {
-            Ok(()) => val,
-            Err(_) => 0,
-        }
+        encode_cap(api(), enc, self.codec_guid, which)
     }
 
     /// Probe GPU caps on a throwaway session before the bitrate-probe loop: max dimensions,
@@ -947,9 +816,9 @@ impl NvencD3d11Encoder {
             version: nv::NV_ENC_PRESET_CONFIG_VER,
             presetCfg: nv::NV_ENC_CONFIG {
                 version: nv::NV_ENC_CONFIG_VER,
-                ..Default::default()
+                ..seed_config()
             },
-            ..Default::default()
+            ..seed_preset_config()
         };
         (api().get_encode_preset_config_ex)(
             enc,
@@ -960,6 +829,7 @@ impl NvencD3d11Encoder {
         )
         .nv_ok()
         .map_err(|e| nvenc_status::call_err("get_encode_preset_config_ex", e))?;
+        force_frame_mode(&raw mut preset.presetCfg);
         let mut cfg = preset.presetCfg;
 
         // Shared low-latency contract. Windows full-chroma input is packed RGB (NVENC CSCs under
@@ -1187,6 +1057,9 @@ impl NvencD3d11Encoder {
 
     /// Lazily create the session on the first frame's D3D11 device so capture and encode share it.
     fn init_session(&mut self, device: &ID3D11Device) -> Result<()> {
+        // Sized per session, never per frame: the doNotWait sampler hands it to the driver.
+        self.slice_offsets
+            .resize(slice_offsets_len(self.width, self.height), 0);
         // Serialize this open (caps + clamp + charge) against other opens and the zombie reap.
         let _gate = DRIVER_SESSION_GATE
             .lock()
@@ -1758,7 +1631,7 @@ impl Encoder for NvencD3d11Encoder {
                     .get(slot)
                     .map(|&e| e as *mut c_void)
                     .unwrap_or(ptr::null_mut()),
-                ..Default::default()
+                ..seed_pic_params()
             };
 
             // In-band HDR10 SEI on every IDR: ST.2086 mastering + CEA-861.3 CLL.
@@ -1985,29 +1858,14 @@ impl Encoder for NvencD3d11Encoder {
             return Ok(None);
         };
         // SAFETY: non-empty `pending` implies `submit` ran, so `self.encoder` is live
-        // (`teardown` clears `pending` when it nulls the handle). `lock` (version set)
-        // targets a pool bitstream; `lock_bitstream` blocks until the encode finishes,
-        // so `bitstreamBufferPtr` is CPU-readable until unlock. Copy first; unmap `map` once.
+        // (`teardown` clears `pending` when it nulls the handle) and `bs` is a pool bitstream
+        // with an encode submitted. The blocking lock copies, then unlocks; unmap `map` once.
         unsafe {
-            let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
-                version: nv::NV_ENC_LOCK_BITSTREAM_VER,
-                outputBitstream: bs,
-                ..Default::default()
-            };
-            (api().lock_bitstream)(self.encoder, &mut lock)
-                .nv_ok()
+            let lock = BitstreamLock::new(api(), self.encoder, bs, false, None)
                 .map_err(|e| nvenc_status::call_err("lock_bitstream", e))?;
-            let data = std::slice::from_raw_parts(
-                lock.bitstreamBufferPtr as *const u8,
-                lock.bitstreamSizeInBytes as usize,
-            )
-            .to_vec();
-            let keyframe = matches!(
-                lock.pictureType,
-                nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
-            );
-            (api().unlock_bitstream)(self.encoder, bs)
-                .nv_ok()
+            let data = lock.bytes().to_vec();
+            let keyframe = lock.keyframe();
+            lock.unlock()
                 .map_err(|e| nvenc_status::call_err("unlock_bitstream", e))?;
             if !map.is_null() {
                 let _ = (api().unmap_input_resource)(self.encoder, map);
@@ -2061,66 +1919,48 @@ impl Encoder for NvencD3d11Encoder {
         // finish through the blocking lock.
         let budget = std::time::Duration::from_micros(2_000_000 / self.fps.max(1) as u64);
         let t0 = std::time::Instant::now();
-        let mut offsets = [0u32; 32];
         loop {
             let emitted = self.chunk.as_ref().map_or(0, |c| c.emitted);
             let slices_out = self.chunk.as_ref().map_or(0, |c| c.slices_out);
             // SAFETY: `bs` is the front `pending` pool bitstream (`teardown` clears `pending`
-            // when it nulls the session). `lock` (version set, doNotWait) and `offsets` are
-            // live stack locals; the driver may write up to 32 offsets. On a successful
-            // sub-frame lock, `bitstreamBufferPtr` is valid until unlock; copy first.
-            // Every successful lock is unlocked exactly once.
-            unsafe {
-                let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
-                    version: nv::NV_ENC_LOCK_BITSTREAM_VER,
-                    outputBitstream: bs,
-                    sliceOffsets: offsets.as_mut_ptr(),
-                    ..Default::default()
-                };
-                lock.set_doNotWait(1);
-                if (api().lock_bitstream)(self.encoder, &mut lock)
-                    .nv_ok()
-                    .is_ok()
-                {
-                    let n = lock.numSlices;
-                    let bytes = lock.bitstreamSizeInBytes as usize;
-                    if n >= self.slices {
-                        // Every slice readable — finish through the blocking lock (`numSlices`
-                        // alone is not trusted across driver branches).
-                        let _ = (api().unlock_bitstream)(self.encoder, bs);
-                        break;
-                    }
-                    if n > slices_out && bytes > emitted {
-                        // New completed slice(s): cut `[emitted..bytes)`. Contiguous Annex-B, so
-                        // the cut lands on a NAL boundary.
-                        let data =
-                            std::slice::from_raw_parts(lock.bitstreamBufferPtr as *const u8, bytes)
-                                [emitted..]
-                                .to_vec();
-                        (api().unlock_bitstream)(self.encoder, bs)
-                            .nv_ok()
-                            .map_err(|e| nvenc_status::call_err("unlock_bitstream (chunk)", e))?;
-                        let cs = self.chunk.get_or_insert_with(ChunkState::new);
-                        cs.shadow.extend_from_slice(&data);
-                        let first = !cs.opened;
-                        cs.opened = true;
-                        cs.emitted = bytes;
-                        cs.slices_out = n;
-                        return Ok(Some(AuChunk {
-                            data,
-                            pts_ns,
-                            keyframe: idr_hint,
-                            recovery_anchor: anchor,
-                            recovery_point: mark.point(),
-                            recovery_close: mark.close(),
-                            chunk_aligned: false,
-                            first,
-                            last: false,
-                        }));
-                    }
-                    let _ = (api().unlock_bitstream)(self.encoder, bs);
+            // when it nulls the session). `init_session` sized `slice_offsets` for this frame.
+            let lock = unsafe {
+                BitstreamLock::new(api(), self.encoder, bs, true, Some(&mut self.slice_offsets))
+            };
+            // LOCK_BUSY = not ready. The finishing blocking lock owns real failures.
+            if let Ok(lock) = lock {
+                let n = lock.info().numSlices;
+                let bytes = lock.bytes().len();
+                if n >= self.slices {
+                    // Every slice readable — finish through the blocking lock (`numSlices`
+                    // alone is not trusted across driver branches).
+                    drop(lock);
+                    break;
                 }
-                // LOCK_BUSY = not ready. The finishing blocking lock owns real failures.
+                if n > slices_out && bytes > emitted {
+                    // New completed slice(s): cut `[emitted..bytes)`. Contiguous Annex-B, so
+                    // the cut lands on a NAL boundary.
+                    let data = lock.bytes()[emitted..].to_vec();
+                    lock.unlock()
+                        .map_err(|e| nvenc_status::call_err("unlock_bitstream (chunk)", e))?;
+                    let cs = self.chunk.get_or_insert_with(ChunkState::new);
+                    cs.shadow.extend_from_slice(&data);
+                    let first = !cs.opened;
+                    cs.opened = true;
+                    cs.emitted = bytes;
+                    cs.slices_out = n;
+                    return Ok(Some(AuChunk {
+                        data,
+                        pts_ns,
+                        keyframe: idr_hint,
+                        recovery_anchor: anchor,
+                        recovery_point: mark.point(),
+                        recovery_close: mark.close(),
+                        chunk_aligned: false,
+                        first,
+                        last: false,
+                    }));
+                }
             }
             if t0.elapsed() > budget {
                 break;
@@ -2133,28 +1973,20 @@ impl Encoder for NvencD3d11Encoder {
         let (bs, map, pts_ns, anchor, idr_hint, mark) =
             self.pending.pop_front().expect("front() checked above");
         // SAFETY: same contract as `poll`'s blocking lock: `bs` is the popped in-flight pool
-        // bitstream on the live session (encode thread); blocking `lock_bitstream` (version set)
-        // yields CPU-readable bytes valid until `unlock_bitstream` — every read happens first.
-        // `map` is unmapped here, after completion, exactly once.
+        // bitstream on the live session (encode thread); every read of the locked bytes
+        // happens before its unlock. `map` is unmapped here, after completion, exactly once.
         unsafe {
-            let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
-                version: nv::NV_ENC_LOCK_BITSTREAM_VER,
-                outputBitstream: bs,
-                ..Default::default()
-            };
-            (api().lock_bitstream)(self.encoder, &mut lock)
-                .nv_ok()
+            let lock = BitstreamLock::new(api(), self.encoder, bs, false, None)
                 .map_err(|e| nvenc_status::call_err("lock_bitstream (chunk finish)", e))?;
-            let total = lock.bitstreamSizeInBytes as usize;
-            let full = std::slice::from_raw_parts(lock.bitstreamBufferPtr as *const u8, total);
+            let full = lock.bytes();
+            let total = full.len();
             let cs = self.chunk.take().unwrap_or_else(ChunkState::new);
             // Completion authority vs sampler: doNotWait bytes must be a byte-exact prefix of
             // the finished AU, or the wire already carries undetectable corruption. On
             // divergence, latch sub-frame off and bail into stall-recovery (rebuild without
-            // sub-frame, force IDR). Check `emitted > total` first — the prefix slice is ill-formed.
-            let diverged = cs.emitted > total || cs.shadow.as_slice() != &full[..cs.emitted];
-            if diverged {
-                let _ = (api().unlock_bitstream)(self.encoder, bs);
+            // sub-frame, force IDR).
+            if prefix_diverged(&cs.shadow, cs.emitted, full) {
+                drop(lock);
                 if !map.is_null() {
                     let _ = (api().unmap_input_resource)(self.encoder, map);
                 }
@@ -2174,12 +2006,8 @@ impl Encoder for NvencD3d11Encoder {
                 );
             }
             let data = full[cs.emitted..].to_vec();
-            let keyframe = matches!(
-                lock.pictureType,
-                nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
-            );
-            (api().unlock_bitstream)(self.encoder, bs)
-                .nv_ok()
+            let keyframe = lock.keyframe();
+            lock.unlock()
                 .map_err(|e| nvenc_status::call_err("unlock_bitstream (chunk finish)", e))?;
             if !map.is_null() {
                 let _ = (api().unmap_input_resource)(self.encoder, map);

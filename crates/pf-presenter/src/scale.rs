@@ -7,6 +7,7 @@
 //! here: a NEAREST blit is exact and costs nothing extra.
 
 use crate::csc::build_fullscreen_pipeline;
+use crate::vk::gpu::image_with_memory;
 use anyhow::{Context as _, Result};
 use ash::vk;
 use punktfunk_core::video_fit::{Kernel, Placement};
@@ -27,6 +28,22 @@ struct Params {
     other_size: i32,
 }
 
+impl Params {
+    /// The push-constant bytes, in declaration order.
+    fn to_ne_bytes(self) -> [[u8; 4]; 8] {
+        [
+            self.origin.to_ne_bytes(),
+            self.step.to_ne_bytes(),
+            self.dst_offset.to_ne_bytes(),
+            self.other_offset.to_ne_bytes(),
+            self.axis.to_ne_bytes(),
+            self.kernel.to_ne_bytes(),
+            self.size.to_ne_bytes(),
+            self.other_size.to_ne_bytes(),
+        ]
+    }
+}
+
 struct Mid {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -34,6 +51,19 @@ struct Mid {
     framebuffer: vk::Framebuffer,
     width: u32,
     height: u32,
+}
+
+impl Mid {
+    /// A null framebuffer is a no-op, so a build that failed at it unwinds here.
+    fn destroy(self, device: &ash::Device) {
+        // SAFETY: DESTROY — never submitted, or the fence contract of `prepare`/`destroy`.
+        unsafe {
+            device.destroy_framebuffer(self.framebuffer, None);
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
 }
 
 pub struct ScalePass {
@@ -160,20 +190,16 @@ impl ScalePass {
         })
     }
 
-    /// The pass a destination framebuffer must be compatible with.
-    pub fn out_render_pass(&self) -> vk::RenderPass {
-        self.out_pass
-    }
-
-    /// Size the intermediate for `p` and bind `src` (a view in SHADER_READ_ONLY_OPTIMAL at
-    /// record time). Only while no submitted command buffer references this pass.
+    /// Size the intermediate for `p` (device-local memory from `mem_props`) and bind `src`
+    /// (a view in SHADER_READ_ONLY_OPTIMAL at record time). Only while no submitted command
+    /// buffer references this pass.
     pub fn prepare(
         &mut self,
         device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
         frame_h: u32,
         p: &Placement,
         src: vk::ImageView,
-        allocate: impl Fn(vk::MemoryRequirements) -> Result<vk::DeviceMemory>,
     ) -> Result<()> {
         if self
             .mid
@@ -181,7 +207,7 @@ impl ScalePass {
             .is_none_or(|m| (m.width, m.height) != (p.dst_w, frame_h))
         {
             self.destroy_mid(device);
-            self.mid = Some(self.build_mid(device, p.dst_w, frame_h, allocate)?);
+            self.mid = Some(self.build_mid(device, mem_props, p.dst_w, frame_h)?);
         }
         let mid_view = self.mid.as_ref().map_or(vk::ImageView::null(), |m| m.view);
         let infos = [src, mid_view].map(|view| {
@@ -203,8 +229,8 @@ impl ScalePass {
     }
 
     /// Record both passes after [`ScalePass::prepare`] for the same placement. `target` is a
-    /// framebuffer of [`ScalePass::out_render_pass`] over `extent`; it ends in
-    /// COLOR_ATTACHMENT_OPTIMAL with the bars cleared black.
+    /// framebuffer compatible with the output pass (an overlay framebuffer) over `extent`;
+    /// it ends in COLOR_ATTACHMENT_OPTIMAL with the bars cleared black.
     ///
     /// # Safety
     /// `cmd` is recording, the source is in SHADER_READ_ONLY_OPTIMAL, and `target` is live.
@@ -301,8 +327,8 @@ impl ScalePass {
         set: vk::DescriptorSet,
         params: Params,
     ) {
-        // SAFETY: RECORD per the crate contract (`record`'s caller); `Params` is `repr(C)`
-        // plain data, so its byte view is valid for the push.
+        let words = params.to_ne_bytes();
+        // SAFETY: RECORD per the crate contract (`record`'s caller).
         unsafe {
             let clear = [vk::ClearValue {
                 color: vk::ClearColorValue {
@@ -340,16 +366,12 @@ impl ScalePass {
                 &[set],
                 &[],
             );
-            let bytes = std::slice::from_raw_parts(
-                (&params as *const Params).cast::<u8>(),
-                std::mem::size_of::<Params>(),
-            );
             device.cmd_push_constants(
                 cmd,
                 self.pipeline_layout,
                 vk::ShaderStageFlags::FRAGMENT,
                 0,
-                bytes,
+                words.as_flattened(),
             );
             device.cmd_draw(cmd, 3, 1, 0, 0);
             device.cmd_end_render_pass(cmd);
@@ -359,58 +381,39 @@ impl ScalePass {
     fn build_mid(
         &self,
         device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
         width: u32,
         height: u32,
-        allocate: impl Fn(vk::MemoryRequirements) -> Result<vk::DeviceMemory>,
     ) -> Result<Mid> {
-        // SAFETY: CREATE per the crate contract.
-        let image = unsafe {
-            device.create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(MID_FORMAT)
-                    .extent(vk::Extent3D {
-                        width,
-                        height,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )
-        }
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(MID_FORMAT)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let (image, memory, view) = image_with_memory(
+            device,
+            mem_props,
+            &info,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
         .context("scale intermediate image")?;
-        // SAFETY: `image` was created above and is owned here.
-        let memory = match allocate(unsafe { device.get_image_memory_requirements(image) }) {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: never bound or submitted.
-                unsafe { device.destroy_image(image, None) };
-                return Err(e);
-            }
+        let mid = Mid {
+            image,
+            memory,
+            view,
+            framebuffer: vk::Framebuffer::null(),
+            width,
+            height,
         };
-        // SAFETY: `image` and `memory` were created above and are owned here.
-        unsafe { device.bind_image_memory(image, memory, 0) }?;
-        // SAFETY: CREATE per the crate contract.
-        let view = unsafe {
-            device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(MID_FORMAT)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                    ),
-                None,
-            )
-        }?;
         let attachments = [view];
         // SAFETY: CREATE per the crate contract.
         let framebuffer = unsafe {
@@ -423,26 +426,19 @@ impl ScalePass {
                     .layers(1),
                 None,
             )
-        }?;
-        Ok(Mid {
-            image,
-            memory,
-            view,
-            framebuffer,
-            width,
-            height,
-        })
+        };
+        match framebuffer {
+            Ok(framebuffer) => Ok(Mid { framebuffer, ..mid }),
+            Err(e) => {
+                mid.destroy(device);
+                Err(e).context("scale intermediate framebuffer")
+            }
+        }
     }
 
     fn destroy_mid(&mut self, device: &ash::Device) {
         if let Some(m) = self.mid.take() {
-            // SAFETY: DESTROY — callers hold the fence contract of `prepare`/`destroy`.
-            unsafe {
-                device.destroy_framebuffer(m.framebuffer, None);
-                device.destroy_image_view(m.view, None);
-                device.destroy_image(m.image, None);
-                device.free_memory(m.memory, None);
-            }
+            m.destroy(device);
         }
     }
 
@@ -850,9 +846,7 @@ mod tests {
                     (view.0 * view.1 * 4) as usize,
                     vk::BufferUsageFlags::TRANSFER_DST,
                 )?;
-                scale.prepare(d, frame.1, p, src_view, |r| {
-                    self.memory(r, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-                })?;
+                scale.prepare(d, &self.mem_props, frame.1, p, src_view)?;
                 // SAFETY: test harness; one command buffer, waited to completion before any
                 // destroy below.
                 unsafe {
@@ -866,7 +860,7 @@ mod tests {
                     d.unmap_memory(up_mem);
                     let fb = d.create_framebuffer(
                         &vk::FramebufferCreateInfo::default()
-                            .render_pass(scale.out_render_pass())
+                            .render_pass(scale.out_pass)
                             .attachments(&[dst_view])
                             .width(view.0)
                             .height(view.1)

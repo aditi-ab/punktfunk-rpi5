@@ -173,9 +173,11 @@ fn intel_loader() -> Result<(Loader, Vec<VplImpl>)> {
             if cfg.is_null() {
                 bail!("MFXCreateConfig returned null");
             }
-            let mut var: vpl::mfxVariant = std::mem::zeroed();
-            var.Type = vpl::MFX_VARIANT_TYPE_U32;
-            var.Data = vpl::mfxVariant_data { U32: value };
+            let var = vpl::mfxVariant {
+                Type: vpl::MFX_VARIANT_TYPE_U32,
+                Data: vpl::mfxVariant_data { U32: value },
+                ..Default::default()
+            };
             vpl_ok(
                 vpl::MFXSetConfigFilterProperty(cfg, name.as_ptr(), var),
                 "MFXSetConfigFilterProperty",
@@ -250,7 +252,7 @@ fn create_session(target_luid: Option<[u8; 8]>) -> Result<(Loader, Session, (u16
             "MFXCreateSession",
         )?;
         let session = Session(session);
-        let mut ver: vpl::mfxVersion = std::mem::zeroed();
+        let mut ver = vpl::mfxVersion::default();
         let _ = vpl::MFXQueryVersion(session.0, &mut ver);
         let api = (ver.__bindgen_anon_1.Major, ver.__bindgen_anon_1.Minor);
         Ok((loader, session, api))
@@ -317,11 +319,13 @@ fn codec_id(codec: Codec) -> u32 {
 
 /// Low-latency block: `AsyncDepth=1`, no B-frames, CBR, HRD off (no-IDR Reset), infinite GOP.
 fn build_params(cfg: &EncodeConfig) -> ParamSet {
-    // SAFETY: all-zero is the documented initial state for every VPL parameter struct; fields
-    // are then set through the typed accessors.
-    let mut par: vpl::mfxVideoParam = unsafe { std::mem::zeroed() };
-    par.AsyncDepth = 1;
-    par.IOPattern = vpl::MFX_IOPATTERN_IN_VIDEO_MEMORY as u16;
+    // All-zero is VPL's documented initial state for every parameter and ext-buffer struct, and
+    // bindgen's `Default` is all-zero for each one used here (no padding, or a zero-fill impl).
+    let mut par = vpl::mfxVideoParam {
+        AsyncDepth: 1,
+        IOPattern: vpl::MFX_IOPATTERN_IN_VIDEO_MEMORY as u16,
+        ..Default::default()
+    };
     let mfx = mfx_of(&mut par);
     mfx.CodecId = codec_id(cfg.codec);
     mfx.LowPower = vpl::MFX_CODINGOPTION_ON as u16;
@@ -369,8 +373,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
     }
 
     // HRD off: spec prerequisite for a bitrate Reset that does not emit a keyframe.
-    // SAFETY: all-zero is valid for every ext buffer; the header is then stamped.
-    let mut co: Box<vpl::mfxExtCodingOption> = Box::new(unsafe { std::mem::zeroed() });
+    let mut co = Box::new(vpl::mfxExtCodingOption::default());
     co.Header.BufferId = vpl::MFX_EXTBUFF_CODING_OPTION as u32;
     co.Header.BufferSz = std::mem::size_of::<vpl::mfxExtCodingOption>() as u32;
     co.NalHrdConformance = vpl::MFX_CODINGOPTION_OFF as u16;
@@ -379,7 +382,8 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
 
     // Intra-refresh: AVC/HEVC only — AV1 has no IntRefType.
     let co2 = (cfg.intra_refresh && matches!(cfg.codec, Codec::H264 | Codec::H265)).then(|| {
-        // SAFETY: all-zero is valid; header stamped below.
+        // SAFETY: all-zero is a valid `mfxExtCodingOption2`; header stamped below. Not
+        // `Default`: this struct has padding, which the derived impl leaves unwritten.
         let mut b: Box<vpl::mfxExtCodingOption2> = Box::new(unsafe { std::mem::zeroed() });
         b.Header.BufferId = vpl::MFX_EXTBUFF_CODING_OPTION2 as u32;
         b.Header.BufferSz = std::mem::size_of::<vpl::mfxExtCodingOption2>() as u32;
@@ -392,8 +396,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
     // BT.2020 PQ. An "unspecified" stream lets decoders pick 601 at sub-HD.
     let hdr = cfg.ten_bit && cfg.codec != Codec::H264;
     let vsi = {
-        // SAFETY: all-zero is valid; header stamped below.
-        let mut b: Box<vpl::mfxExtVideoSignalInfo> = Box::new(unsafe { std::mem::zeroed() });
+        let mut b = Box::new(vpl::mfxExtVideoSignalInfo::default());
         b.Header.BufferId = vpl::MFX_EXTBUFF_VIDEO_SIGNAL_INFO as u32;
         b.Header.BufferSz = std::mem::size_of::<vpl::mfxExtVideoSignalInfo>() as u32;
         b.VideoFormat = 5; // unspecified
@@ -411,9 +414,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         Some(b)
     };
     let mastering = cfg.hdr_meta.filter(|_| hdr).map(|m| {
-        // SAFETY: all-zero is valid; header stamped below.
-        let mut b: Box<vpl::mfxExtMasteringDisplayColourVolume> =
-            Box::new(unsafe { std::mem::zeroed() });
+        let mut b = Box::new(vpl::mfxExtMasteringDisplayColourVolume::default());
         b.Header.BufferId = vpl::MFX_EXTBUFF_MASTERING_DISPLAY_COLOUR_VOLUME as u32;
         b.Header.BufferSz = std::mem::size_of::<vpl::mfxExtMasteringDisplayColourVolume>() as u32;
         b.InsertPayloadToggle = vpl::MFX_PAYLOAD_IDR as u16;
@@ -445,9 +446,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         .filter(|_| hdr)
         .filter(|m| m.max_cll != 0 || m.max_fall != 0)
         .map(|m| {
-            // SAFETY: all-zero is valid; header stamped below.
-            let mut b: Box<vpl::mfxExtContentLightLevelInfo> =
-                Box::new(unsafe { std::mem::zeroed() });
+            let mut b = Box::new(vpl::mfxExtContentLightLevelInfo::default());
             b.Header.BufferId = vpl::MFX_EXTBUFF_CONTENT_LIGHT_LEVEL_INFO as u32;
             b.Header.BufferSz = std::mem::size_of::<vpl::mfxExtContentLightLevelInfo>() as u32;
             b.InsertPayloadToggle = vpl::MFX_PAYLOAD_IDR as u16;
@@ -471,9 +470,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
 
 /// Idle `mfxExtRefListCtrl`: every `FrameOrder` is `MFX_FRAMEORDER_UNKNOWN`.
 fn empty_reflist() -> vpl::mfxExtRefListCtrl {
-    // SAFETY: all-zero is a valid `mfxExtRefListCtrl`; the header + sentinel FrameOrders are
-    // stamped before use.
-    let mut r: vpl::mfxExtRefListCtrl = unsafe { std::mem::zeroed() };
+    let mut r = vpl::mfxExtRefListCtrl::default();
     r.Header.BufferId = vpl::MFX_EXTBUFF_UNIVERSAL_REFLIST_CTRL as u32;
     r.Header.BufferSz = std::mem::size_of::<vpl::mfxExtRefListCtrl>() as u32;
     let unknown = vpl::MFX_FRAMEORDER_UNKNOWN as u32;
@@ -499,10 +496,9 @@ struct FrameCtrl {
 
 impl FrameCtrl {
     fn new() -> Box<Self> {
-        // SAFETY: all-zero is valid for `mfxEncodeCtrl` (no ext buffers attached, no forced
-        // type); the reflist starts as the sentinel idle state and the pointer array is wired
-        // only when the reflist is actually used.
-        let ctrl: vpl::mfxEncodeCtrl = unsafe { std::mem::zeroed() };
+        // All-zero: no ext buffers attached, no forced type. The pointer array is wired only
+        // when the reflist is actually used.
+        let ctrl = vpl::mfxEncodeCtrl::default();
         let mut b = Box::new(FrameCtrl {
             ctrl,
             reflist: empty_reflist(),
@@ -536,8 +532,7 @@ struct BsBuf {
 
 impl BsBuf {
     fn new(capacity: usize) -> Box<Self> {
-        // SAFETY: all-zero is a valid `mfxBitstream`; Data/MaxLength are wired below.
-        let mfx: vpl::mfxBitstream = unsafe { std::mem::zeroed() };
+        let mfx = vpl::mfxBitstream::default();
         let mut b = Box::new(BsBuf {
             buf: vec![0u8; capacity],
             mfx,
@@ -848,8 +843,10 @@ pub struct QsvEncoder {
     resets_without_output: u32,
 }
 
-// SAFETY: raw VPL and D3D11 handles are not auto-`Send`. The session moves the encoder onto
-// one encode thread and drives it there; the immediate context is never shared.
+// SAFETY: raw VPL handles are not auto-`Send`, and none is thread-affine. Every call on this
+// encoder runs on the one thread that owns it; only the sync thread shares the session (see
+// `Retrieve`). The immediate context the runtime also uses is multithread-protected in
+// `ensure_inner`.
 unsafe impl Send for QsvEncoder {}
 
 impl QsvEncoder {
@@ -982,7 +979,7 @@ impl QsvEncoder {
         let ir_requested = cfg.intra_refresh && set.co2.is_some();
         // SAFETY: `session` is live; `got` and its (empty) ext chain outlive the call.
         let bs_bytes = unsafe {
-            let mut got: vpl::mfxVideoParam = std::mem::zeroed();
+            let mut got = vpl::mfxVideoParam::default();
             vpl_ok(
                 vpl::MFXVideoENCODE_GetVideoParam(session, &mut got),
                 "MFXVideoENCODE_GetVideoParam",
@@ -1001,7 +998,8 @@ impl QsvEncoder {
             // only reference to it) all outlive the synchronous call, and the runtime writes back
             // only into the buffer whose header we stamped.
             let confirmed = unsafe {
-                let mut got: vpl::mfxVideoParam = std::mem::zeroed();
+                let mut got = vpl::mfxVideoParam::default();
+                // Zero-filled, padding included, as at `build_params`.
                 let mut co2_out: vpl::mfxExtCodingOption2 = std::mem::zeroed();
                 co2_out.Header.BufferId = vpl::MFX_EXTBUFF_CODING_OPTION2 as u32;
                 co2_out.Header.BufferSz = std::mem::size_of::<vpl::mfxExtCodingOption2>() as u32;
@@ -1660,9 +1658,8 @@ impl Encoder for QsvEncoder {
         self.bitrate_bps = bps;
         let cfg = self.encode_config();
         let mut set = build_params(&cfg);
-        // SAFETY: all-zero valid; header stamped below; outlives the synchronous Reset call.
-        let mut reset_opt: Box<vpl::mfxExtEncoderResetOption> =
-            Box::new(unsafe { std::mem::zeroed() });
+        // Header stamped below; outlives the synchronous Reset call.
+        let mut reset_opt = Box::new(vpl::mfxExtEncoderResetOption::default());
         reset_opt.Header.BufferId = vpl::MFX_EXTBUFF_ENCODER_RESET_OPTION as u32;
         reset_opt.Header.BufferSz = std::mem::size_of::<vpl::mfxExtEncoderResetOption>() as u32;
         reset_opt.StartNewSequence = vpl::MFX_CODINGOPTION_OFF as u16;
@@ -1688,7 +1685,7 @@ impl Encoder for QsvEncoder {
         // SAFETY: `session` is live on this thread and drained above; `got` and its (empty) ext
         // chain outlive the synchronous call.
         let refreshed = unsafe {
-            let mut got: vpl::mfxVideoParam = std::mem::zeroed();
+            let mut got = vpl::mfxVideoParam::default();
             let sts = vpl::MFXVideoENCODE_GetVideoParam(session, &mut got);
             (sts >= vpl::MFX_ERR_NONE).then(|| {
                 let m = &mut got.__bindgen_anon_1.mfx;

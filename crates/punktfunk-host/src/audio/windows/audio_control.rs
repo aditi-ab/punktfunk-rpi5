@@ -18,7 +18,7 @@
 //! computes the plan — the mic needs a target — but skips the default writes.
 
 use super::wiring_plan::{self, plan, plan_with_formats, Endpoint, MixFormat, Wiring};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use wasapi::Direction;
@@ -730,49 +730,50 @@ const _: () = {
     assert!(size_of::<IPolicyConfigVtbl>() == 15 * size_of::<P>());
 };
 
-/// Run `f` with a live `IPolicyConfig` pointer and its vtable, and a NUL-terminated
-/// UTF-16 `device_id`. The pointer is Released after `f` returns.
+/// A live `IPolicyConfig`; the `IUnknown` inside releases it on drop.
+#[repr(transparent)]
+#[derive(Clone)]
+struct PolicyConfig(windows::core::IUnknown);
+
+// SAFETY: one COM pointer (transparent over `IUnknown`) to an object whose table starts with
+// `IPolicyConfigVtbl`, the layout the asserts above pin.
+unsafe impl windows::core::Interface for PolicyConfig {
+    type Vtable = IPolicyConfigVtbl;
+    /// IPolicyConfig, Windows 7 and later.
+    const IID: windows::core::GUID =
+        windows::core::GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
+}
+
+/// Run `f` with a live `IPolicyConfig` and a NUL-terminated UTF-16 `device_id`.
 fn with_policy_config<R>(
     device_id: &str,
-    f: impl FnOnce(*mut c_void, &IPolicyConfigVtbl, windows::core::PCWSTR) -> R,
+    f: impl FnOnce(&PolicyConfig, windows::core::PCWSTR) -> R,
 ) -> Result<R> {
     use windows::core::{IUnknown, Interface, GUID, PCWSTR};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
-    // PolicyConfigClient coclass + IPolicyConfig (Win7+) IID.
+    // PolicyConfigClient coclass.
     const CLSID_POLICY_CONFIG: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
-    const IID_IPOLICY_CONFIG: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
 
     let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
-
-    // SAFETY: CoCreateInstance returns an owned IUnknown, Released by its Drop. The QI'd pointer
-    // is checked non-null; its first word is the vtable whose layout the asserts above pin. It is
-    // Released exactly once, after `f`. `wide` outlives `f`.
-    unsafe {
-        let unk: IUnknown = CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL)
-            .map_err(|e| anyhow!("CoCreateInstance(PolicyConfig): {e}"))?;
-        let mut raw: *mut c_void = std::ptr::null_mut();
-        unk.query(&IID_IPOLICY_CONFIG, &mut raw)
-            .ok()
-            .map_err(|e| anyhow!("QueryInterface(IPolicyConfig): {e}"))?;
-        if raw.is_null() {
-            bail!("IPolicyConfig QueryInterface returned null");
-        }
-        let vtbl = &**(raw as *const *const IPolicyConfigVtbl);
-        let out = f(raw, vtbl, PCWSTR(wide.as_ptr()));
-        (vtbl.release)(raw);
-        Ok(out)
-    }
+    // SAFETY: a plain activation by static CLSID; the result is an owned IUnknown.
+    let unk: IUnknown = unsafe { CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL) }
+        .map_err(|e| anyhow!("CoCreateInstance(PolicyConfig): {e}"))?;
+    let policy: PolicyConfig = unk
+        .cast()
+        .map_err(|e| anyhow!("QueryInterface(IPolicyConfig): {e}"))?;
+    Ok(f(&policy, PCWSTR(wide.as_ptr())))
 }
 
 /// Set `device_id` as default for eConsole/eMultimedia/eCommunications via
 /// `IPolicyConfig::SetDefaultEndpoint`. Errs if any role fails.
 pub(crate) fn set_default_endpoint(device_id: &str) -> Result<()> {
-    with_policy_config(device_id, |raw, vtbl, id| {
+    use windows::core::Interface;
+    with_policy_config(device_id, |pc, id| {
         let mut result = Ok(());
         for role in 0u32..=2 {
             // SAFETY: live IPolicyConfig from `with_policy_config`; in-range ERole.
-            let hr = unsafe { (vtbl.set_default_endpoint)(raw, id, role) };
+            let hr = unsafe { (pc.vtable().set_default_endpoint)(pc.as_raw(), id, role) };
             if hr.is_err() {
                 result = hr
                     .ok()
@@ -789,9 +790,10 @@ pub(crate) fn set_default_endpoint(device_id: &str) -> Result<()> {
 /// a PnP reinstall. Pad-endpoint provider hides the idle DualSense speaker so
 /// libScePad titles do not take the haptics path against an unserviced endpoint.
 pub(crate) fn set_endpoint_visibility(device_id: &str, visible: bool) -> Result<()> {
-    with_policy_config(device_id, |raw, vtbl, id| {
+    use windows::core::Interface;
+    with_policy_config(device_id, |pc, id| {
         // SAFETY: live IPolicyConfig from `with_policy_config`; INT bool.
-        let hr = unsafe { (vtbl.set_endpoint_visibility)(raw, id, visible as i32) };
+        let hr = unsafe { (pc.vtable().set_endpoint_visibility)(pc.as_raw(), id, visible as i32) };
         hr.ok()
             .map_err(|e| anyhow!("SetEndpointVisibility({visible}): {e}"))
     })?
@@ -830,9 +832,10 @@ pub(crate) fn set_endpoint_format(
     samples: &[(usize, usize, wasapi::SampleType)],
 ) -> Result<()> {
     use wasapi::WaveFormat;
+    use windows::core::Interface;
     // WAVEFORMATEXTENSIBLE is 40 bytes, packed.
     let mix = [0u8; 40];
-    with_policy_config(device_id, |raw, vtbl, id| {
+    with_policy_config(device_id, |pc, id| {
         let mut last = None;
         for &m in masks {
             for (store, valid, ty) in samples {
@@ -847,7 +850,9 @@ pub(crate) fn set_endpoint_format(
                 let fmt = std::ptr::from_ref(wave.as_waveformatex_ref()).cast();
                 // SAFETY: live IPolicyConfig from `with_policy_config`; `fmt` points at `wave` (a
                 // full WAVEFORMATEXTENSIBLE, cbSize 22), `mix` at 40 bytes; both outlive the call.
-                let hr = unsafe { (vtbl.set_device_format)(raw, id, fmt, mix.as_ptr().cast()) };
+                let hr = unsafe {
+                    (pc.vtable().set_device_format)(pc.as_raw(), id, fmt, mix.as_ptr().cast())
+                };
                 match hr.ok() {
                     Ok(()) => return Ok(()),
                     Err(e) => last = Some(e),

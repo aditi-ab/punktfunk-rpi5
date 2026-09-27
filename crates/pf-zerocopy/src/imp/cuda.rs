@@ -12,6 +12,7 @@
 #![allow(non_camel_case_types, non_snake_case)]
 
 use anyhow::{bail, Result};
+use std::os::fd::{AsRawFd as _, IntoRawFd as _, OwnedFd};
 use std::os::raw::{c_uint, c_void};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -49,7 +50,11 @@ pub fn read_plane_to_host(
 /// Packed host→pitched-device upload. Synchronous: the direct encoder's CPU-frame path, and
 /// the benchmarks, where uninitialised device memory comes back zeroed and CBR has nothing
 /// to code.
-pub fn write_plane_from_host(
+///
+/// # Safety
+/// The context is current, and `dst_ptr` is a live allocation of `height` rows of `dst_pitch`
+/// bytes, each at least `width_bytes`.
+pub unsafe fn write_plane_from_host(
     dst_ptr: CUdeviceptr,
     dst_pitch: usize,
     src: &[u8],
@@ -74,7 +79,8 @@ pub fn write_plane_from_host(
         ..Default::default()
     };
     // SAFETY: `copy` outlives the synchronous copy. `srcHost` is `src` (≥ `width_bytes*height`);
-    // `dstDevice`/`dstPitch` are the caller's pitched plane. Sync, so `src` need not outlive return.
+    // the destination and the current context are this fn's contract. Sync, so `src` need not
+    // outlive return.
     unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(host->dev)") }
 }
 
@@ -109,12 +115,10 @@ pub fn ipc_close(ptr: CUdeviceptr) {
     if ptr == 0 {
         return;
     }
+    bind_shared_ctx();
     // SAFETY: `ptr` came from `cuIpcOpenMemHandle` and is closed once by the owning cache. Context
     // is set current first: this runs from `Drop` on whichever thread holds the last reference.
     unsafe {
-        if let Some(c) = CONTEXT.get() {
-            let _ = cuCtxSetCurrent(c.0);
-        }
         let _ = cuIpcCloseMemHandle(ptr);
     }
 }
@@ -166,16 +170,35 @@ pub fn make_current() -> Result<()> {
     unsafe { ck(cuCtxSetCurrent(ctx), "cuCtxSetCurrent") }
 }
 
-/// Run `probe` on a throwaway device-0 context, then restore the shared one. Diagnostic: splits a
-/// bad shared context from a driver-wide failure. Never a hot path.
+/// Best-effort [`make_current`] for teardown: binds the shared context if one exists. `Drop`
+/// paths call it first, since they may run on a thread where it is not current.
+fn bind_shared_ctx() {
+    if let Some(c) = CONTEXT.get() {
+        // SAFETY: `c.0` is the shared context, created once and never destroyed.
+        // `cuCtxSetCurrent` binds it to this thread and takes no Rust pointer.
+        let _ = unsafe { cuCtxSetCurrent(c.0) };
+    }
+}
+
+/// Run `probe` on a throwaway device-0 context, then restore the shared one — also when `probe`
+/// panics. Diagnostic: splits a bad shared context from a driver-wide failure. Never a hot path.
 pub fn with_fresh_context<R>(probe: impl FnOnce(CUcontext) -> R) -> Result<R> {
+    /// Destroys the throwaway context and rebinds the shared one on every exit.
+    struct Fresh(CUcontext);
+    impl Drop for Fresh {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is the context `cuCtxCreate_v2` returned below, owned by this
+            // guard alone and destroyed once, here.
+            let _ = unsafe { cuCtxDestroy_v2(self.0) };
+            bind_shared_ctx();
+        }
+    }
     if cuda_api().is_none() {
         bail!("libcuda.so.1 not available");
     }
     // SAFETY: driver table present (checked above). `cuInit(0)` is idempotent. `&mut dev`/`&mut ctx`
-    // are live out-params. `ctx` is destroyed once below; creation left it current, so restore the
-    // shared context afterwards.
-    unsafe {
+    // are live out-params. `ck` bails unless `ctx` is a valid context, which `Fresh` then owns.
+    let fresh = unsafe {
         ck(cuInit(0), "cuInit")?;
         let mut dev: CUdevice = 0;
         ck(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
@@ -184,13 +207,9 @@ pub fn with_fresh_context<R>(probe: impl FnOnce(CUcontext) -> R) -> Result<R> {
             cuCtxCreate_v2(&mut ctx, CU_CTX_SCHED_BLOCKING_SYNC, dev),
             "cuCtxCreate_v2 (diagnostic)",
         )?;
-        let r = probe(ctx);
-        let _ = cuCtxDestroy_v2(ctx);
-        if let Some(c) = CONTEXT.get() {
-            let _ = cuCtxSetCurrent(c.0);
-        }
-        Ok(r)
-    }
+        Fresh(ctx)
+    };
+    Ok(probe(fresh.0))
 }
 
 thread_local! {
@@ -461,12 +480,10 @@ impl Drop for InputSurface {
         if self.ptr == 0 {
             return;
         }
+        bind_shared_ctx();
         // SAFETY: this surface exclusively owns `self.ptr`, freed once (`ptr == 0` skips empty).
         // Context is set current first: drop may run on a thread where it isn't.
         unsafe {
-            if let Some(c) = CONTEXT.get() {
-                let _ = cuCtxSetCurrent(c.0);
-            }
             let _ = cuMemFree_v2(self.ptr);
         }
     }
@@ -482,13 +499,11 @@ struct PoolInner {
 
 impl Drop for PoolInner {
     fn drop(&mut self) {
+        bind_shared_ctx();
         // SAFETY: drops only after every `DeviceBuffer` `Arc` is gone, so `free`/`free_uv` hold
         // each allocation once and nothing still uses them. Context is set current first: drop
         // may run off the allocating thread. Each `p` came from `cuMemAllocPitch_v2`.
         unsafe {
-            if let Some(c) = CONTEXT.get() {
-                let _ = cuCtxSetCurrent(c.0);
-            }
             for &p in &self.free {
                 let _ = cuMemFree_v2(p);
             }
@@ -684,10 +699,15 @@ impl DeviceBuffer {
         self.uv.is_some()
     }
 
+    // unsafe-fn-no-op-ok: every copy helper trusts `ptr`/`pitch`/`uv` as a live mapping.
     /// Wrap planes owned by another process ([`ipc_open`]). `release` runs once on drop; nothing
     /// is freed or pooled here (the IPC cache closes the mapping after the last remote buffer).
     /// `yuv444` marks stacked 3-plane YUV444 — the wire carries no format (`ImportKind::Tiled444`).
-    pub fn remote(
+    ///
+    /// # Safety
+    /// `ptr` (and `uv`'s pointer, when set) must address a live device mapping with the layout
+    /// `pitch`/`width`/`height`/`yuv444` describe, and stay mapped until `release` runs.
+    pub unsafe fn remote(
         ptr: CUdeviceptr,
         pitch: usize,
         width: u32,
@@ -726,13 +746,11 @@ impl Drop for DeviceBuffer {
                 g.free_uv.push(uv_ptr);
             }
         } else {
+            bind_shared_ctx();
             // SAFETY: un-pooled: this buffer exclusively owns `self.ptr` and `self.uv`, each from
             // `cuMemAllocPitch_v2`, freed once (`ptr == 0` skipped above). Context is set current
             // first: drop may run on the encode thread, where it isn't.
             unsafe {
-                if let Some(c) = CONTEXT.get() {
-                    let _ = cuCtxSetCurrent(c.0);
-                }
                 let _ = cuMemFree_v2(self.ptr);
                 if let Some((uv_ptr, _)) = self.uv {
                     let _ = cuMemFree_v2(uv_ptr);
@@ -882,9 +900,12 @@ pub fn copy_mapped_yuv444(
 
 /// Device→device copy of one pitched surface into another of the same layout: `rows` rows of
 /// `pitch` bytes. A repeat frame's slot is cloned this way instead of being converted again.
-/// Context must be current. `sync: false`: no CPU wait; both surfaces must stay valid until
-/// downstream stream work completes.
-pub fn copy_surface_to_surface(
+/// `sync: false` enqueues with no CPU wait.
+///
+/// # Safety
+/// The context is current, both surfaces are live allocations of `rows` rows of `pitch` bytes,
+/// and with `sync: false` both stay valid until downstream stream work completes.
+pub unsafe fn copy_surface_to_surface(
     src_ptr: CUdeviceptr,
     dst_ptr: CUdeviceptr,
     pitch: usize,
@@ -902,14 +923,19 @@ pub fn copy_surface_to_surface(
         Height: rows,
         ..Default::default()
     };
-    // SAFETY: caller: context current; both surfaces hold `pitch × rows` bytes and outlive the
-    // copy (`sync: false` shifts that to the caller).
+    // SAFETY: this fn's contract: context current, both surfaces hold `pitch × rows` bytes and
+    // outlive the copy. `copy` outlives the enqueue.
     unsafe { copy_issue(&copy, "cuMemcpy2DAsync_v2(slot->slot)", sync) }
 }
 
-/// Device→device copy of a 4-byte (BGRx) [`DeviceBuffer`] into `dst_ptr`. Context must be current.
-/// `sync: false`: no CPU wait; `src` must stay valid until downstream stream work completes.
-pub fn copy_device_to_device(
+/// Device→device copy of a 4-byte (BGRx) [`DeviceBuffer`] into `dst_ptr`. `sync: false`
+/// enqueues with no CPU wait.
+///
+/// # Safety
+/// The context is current, `src` describes a live allocation, `dst_ptr` is a live allocation of
+/// `src.height` rows of `dst_pitch` ≥ `src.width * 4` bytes, and with `sync: false` `src` stays
+/// valid until downstream stream work completes.
+pub unsafe fn copy_device_to_device(
     src: &DeviceBuffer,
     dst_ptr: CUdeviceptr,
     dst_pitch: usize,
@@ -926,15 +952,19 @@ pub fn copy_device_to_device(
         Height: src.height as usize,
         ..Default::default()
     };
-    // SAFETY: caller: context current. `copy` outlives the enqueue; `src` and `dst` are live;
-    // `width*4`×`height` fit both. `sync: false` shifts source lifetime to the caller.
+    // SAFETY: this fn's contract: context current, `src` and `dst` live, `width*4`×`height` fit
+    // both, and the source outlives an unsynced copy. `copy` outlives the enqueue.
     unsafe { copy_issue(&copy, "cuMemcpy2DAsync_v2(dev->dev)", sync) }
 }
 
 /// Copy imported NV12 into NVENC's two-plane surface (`data[0]`/`data[1]`). Y is `width`×`height`;
-/// UV is `(width/2)·2` × `height/2`. Context current. `sync: false`: `src` must stay valid until
+/// UV is `(width/2)·2` × `height/2`. `sync: false` enqueues with no CPU wait.
+///
+/// # Safety
+/// The context is current, `src` describes a live allocation, `y_dst`/`uv_dst` are live planes
+/// of those sizes at `y_pitch`/`uv_pitch`, and with `sync: false` `src` stays valid until
 /// downstream stream work completes.
-pub fn copy_nv12_to_device(
+pub unsafe fn copy_nv12_to_device(
     src: &DeviceBuffer,
     y_dst: CUdeviceptr,
     y_pitch: usize,
@@ -969,9 +999,8 @@ pub fn copy_nv12_to_device(
         Height: h / 2,
         ..Default::default()
     };
-    // SAFETY: caller: context current. `&y`/`&uv` outlive each enqueue. `src` is a live NV12
-    // buffer (`.uv` checked); `y_dst`/`uv_dst` are the caller's NVENC planes. `sync` waits both
-    // (FIFO); `sync: false` shifts source lifetime to the caller.
+    // SAFETY: this fn's contract covers the context, `src` (NV12, `.uv` checked) and both
+    // destination planes. `&y`/`&uv` outlive each enqueue; `sync` waits both (FIFO).
     unsafe {
         // Failed enqueue: drain before return. Caller drops `src` on `Err` (pool recycle); a
         // copy still in flight would race the next frame in that allocation.
@@ -989,9 +1018,13 @@ pub fn copy_nv12_to_device(
 }
 
 /// Copy stacked YUV444 into NVENC's three-plane surface (`data[0..3]`). Each plane is
-/// `width`×`height`; source at row offsets `0/H/2H`. Context current. `sync: false`: `src` must
-/// stay valid until downstream stream work completes.
-pub fn copy_yuv444_to_device(
+/// `width`×`height`; source at row offsets `0/H/2H`. `sync: false` enqueues with no CPU wait.
+///
+/// # Safety
+/// The context is current, `src` describes a live stacked allocation, each `dsts` plane is live
+/// with `src.height` rows of its pitch ≥ `src.width`, and with `sync: false` `src` stays valid
+/// until downstream stream work completes.
+pub unsafe fn copy_yuv444_to_device(
     src: &DeviceBuffer,
     dsts: [(CUdeviceptr, usize); 3],
     sync: bool,
@@ -1011,9 +1044,9 @@ pub fn copy_yuv444_to_device(
             Height: h,
             ..Default::default()
         };
-        // SAFETY: caller: context current. `copy` outlives the enqueue. `src.ptr + pitch·h·i`
-        // is inside the live 3·H stacked allocation (`yuv444` checked); dest is the caller's
-        // NVENC plane. Drain on enqueue failure: earlier planes are queued and caller recycles
+        // SAFETY: this fn's contract covers the context and each destination plane. `copy`
+        // outlives the enqueue; `src.ptr + pitch·h·i` is inside the live 3·H stacked allocation
+        // (`yuv444` checked). Drain on enqueue failure: earlier planes are queued and caller recycles
         // `src` on `Err`.
         unsafe {
             if let Err(e) = copy_async(&copy, "cuMemcpy2DAsync_v2(yuv444 plane dev->dev)") {
@@ -1023,8 +1056,8 @@ pub fn copy_yuv444_to_device(
         }
     }
     if sync {
-        // SAFETY: one stream sync after the last enqueue covers all three planes (FIFO). Context
-        // current per the caller.
+        // SAFETY: one stream sync after the last enqueue covers all three planes (FIFO); the
+        // context is current per this fn's contract.
         unsafe { sync_copy_stream()? };
     }
     Ok(())
@@ -1037,13 +1070,11 @@ impl RegisteredTexture {
         if self.resource.is_null() {
             return;
         }
+        bind_shared_ctx();
         // SAFETY: `self.resource` is the exclusive `CUgraphicsResource` from `register_gl`;
         // nulling it after unregister makes Drop a no-op. Context is set current first: teardown
         // may run on a thread where it isn't.
         unsafe {
-            if let Some(c) = CONTEXT.get() {
-                let _ = cuCtxSetCurrent(c.0);
-            }
             let _ = cuGraphicsUnregisterResource(self.resource);
         }
         self.resource = std::ptr::null_mut();
@@ -1069,35 +1100,23 @@ pub struct ExternalDmabuf {
 unsafe impl Send for ExternalDmabuf {}
 
 impl ExternalDmabuf {
-    /// Import `fd` without consuming it: a `dup` is handed to the driver. Maps `size` bytes.
-    /// Context must be current.
-    pub fn import(fd: i32, size: u64) -> Result<ExternalDmabuf> {
-        // SAFETY: `dup` reads the integer `fd` (still owned by the caller) and returns a new fd.
-        let dup = unsafe { libc::dup(fd) };
-        if dup < 0 {
-            bail!("dup(dmabuf fd) failed");
-        }
-        Self::import_owned_fd(dup, size)
-    }
-
-    /// Import an fd the caller hands over (Vulkan `OPAQUE_FD`). Driver owns it on success; we
-    /// close it on failure.
-    pub fn import_owned_fd(dup: i32, size: u64) -> Result<ExternalDmabuf> {
+    /// Import an `OPAQUE_FD` (Vulkan-exported) as `size` bytes of mapped device memory. The
+    /// driver owns `fd` on success; a failed import drops (closes) it. Context must be current.
+    pub fn import_owned_fd(fd: OwnedFd, size: u64) -> Result<ExternalDmabuf> {
         let mut desc = CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
             type_: CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
             size,
             ..Default::default()
         };
-        desc.handle[0] = dup as u32 as u64; // union member `int fd` (LE low bytes)
+        desc.handle[0] = fd.as_raw_fd() as u32 as u64; // union member `int fd` (LE low bytes)
         let mut ext: CUexternalMemory = std::ptr::null_mut();
         // SAFETY: `&desc` outlives the call (`OPAQUE_FD`, fd in union `int fd` low bytes, `size`
         // set). `&mut ext` is a live out-param. Driver takes the fd only on success. Context current.
         let r = unsafe { cuImportExternalMemory(&mut ext, &desc) };
         if r != 0 {
-            // SAFETY: import failed, so we still own `dup`; close it once. Success never closes it.
-            unsafe { libc::close(dup) };
             bail!("cuImportExternalMemory failed ({r}) — LINEAR dmabuf import unsupported?");
         }
+        let _ = fd.into_raw_fd(); // the driver owns it now
         let buf = CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
             offset: 0,
             size,
@@ -1121,13 +1140,11 @@ impl ExternalDmabuf {
 
 impl Drop for ExternalDmabuf {
     fn drop(&mut self) {
+        bind_shared_ctx();
         // SAFETY: exclusive owner of `self.ptr` and `self.ext`, torn down once (`!= 0` / `!null`).
         // Context is set current first: drop may run off the import thread. Free the mapped buffer
         // before destroying its backing external memory.
         unsafe {
-            if let Some(c) = CONTEXT.get() {
-                let _ = cuCtxSetCurrent(c.0);
-            }
             if self.ptr != 0 {
                 let _ = cuMemFree_v2(self.ptr); // mapped buffers free like device memory
             }
@@ -1151,23 +1168,22 @@ pub struct ExternalSemaphore {
 unsafe impl Send for ExternalSemaphore {}
 
 impl ExternalSemaphore {
-    /// Import a Vulkan timeline semaphore (`vkGetSemaphoreFdKHR` OPAQUE_FD). Driver owns the fd
-    /// on success; we close it on failure. Context must be current.
-    pub fn import_owned_timeline_fd(fd: i32) -> Result<ExternalSemaphore> {
+    /// Import a Vulkan timeline semaphore (`vkGetSemaphoreFdKHR` OPAQUE_FD). The driver owns
+    /// `fd` on success; a failed import drops (closes) it. Context must be current.
+    pub fn import_timeline_fd(fd: OwnedFd) -> Result<ExternalSemaphore> {
         let mut desc = CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC {
             type_: CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD,
             ..Default::default()
         };
-        desc.handle[0] = fd as u32 as u64; // union member `int fd` (LE low bytes)
+        desc.handle[0] = fd.as_raw_fd() as u32 as u64; // union member `int fd` (LE low bytes)
         let mut sem: CUexternalSemaphore = std::ptr::null_mut();
         // SAFETY: `&desc` outlives the call (`TIMELINE_SEMAPHORE_FD`, fd in union `int fd` low
         // bytes). `&mut sem` is a live out-param. Context current.
         let r = unsafe { cuImportExternalSemaphore(&mut sem, &desc) };
         if r != 0 {
-            // SAFETY: import failed, so we still own `fd`; close it once.
-            unsafe { libc::close(fd) };
             bail!("cuImportExternalSemaphore failed ({r}) — timeline-semaphore fd export/import unsupported?");
         }
+        let _ = fd.into_raw_fd(); // the driver owns it now
         Ok(ExternalSemaphore { sem })
     }
 
@@ -1207,12 +1223,10 @@ impl ExternalSemaphore {
 
 impl Drop for ExternalSemaphore {
     fn drop(&mut self) {
+        bind_shared_ctx();
         // SAFETY: exclusive owner, destroyed once. Context is set current first: drop may run off
         // the import thread (`VkSlotBlend` quiesces the GPU first, so no in-flight signal/wait).
         unsafe {
-            if let Some(c) = CONTEXT.get() {
-                let _ = cuCtxSetCurrent(c.0);
-            }
             let _ = cuDestroyExternalSemaphore(self.sem);
         }
     }
@@ -1220,7 +1234,11 @@ impl Drop for ExternalSemaphore {
 
 /// Copy a pitched span at `src_ptr` (e.g. an [`ExternalDmabuf`] mapping) into `dst`. Context
 /// must be current.
-pub fn copy_pitched_to_buffer(
+///
+/// # Safety
+/// `src_ptr` must address live device memory holding `dst.height` rows of `src_pitch` bytes
+/// (the last row needs only `dst.width * 4`).
+pub unsafe fn copy_pitched_to_buffer(
     src_ptr: CUdeviceptr,
     src_pitch: usize,
     dst: &DeviceBuffer,
@@ -1236,16 +1254,19 @@ pub fn copy_pitched_to_buffer(
         Height: dst.height as usize,
         ..Default::default()
     };
-    // SAFETY: caller: context current. `copy` outlives the synchronous call; `src` is the caller's
-    // mapped span, `dst` is live; `width*4`×`height` fit both. Sync completes before the dmabuf is
-    // requeued.
+    // SAFETY: the source span is live and large enough (this fn's contract); `dst` is a live
+    // buffer of `width*4`×`height`. `copy` outlives the synchronous call, which completes before
+    // the dmabuf is requeued.
     unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(ext->dev)") }
 }
 
 /// De-stride an NV12 pair from an external mapping into a pooled two-plane [`DeviceBuffer`]: Y
 /// (`width` × `height`) and interleaved UV (`width` × ⌈h/2⌉), each from `src_pitch` to the pool
 /// pitch. Context must be current.
-pub fn copy_pitched_nv12_to_buffer(
+///
+/// # Safety
+/// `y_src` and `uv_src` must address live device memory holding those rows at `src_pitch`.
+pub unsafe fn copy_pitched_nv12_to_buffer(
     y_src: CUdeviceptr,
     uv_src: CUdeviceptr,
     src_pitch: usize,
@@ -1277,8 +1298,8 @@ pub fn copy_pitched_nv12_to_buffer(
         Height: dst.height.div_ceil(2) as usize,
         ..Default::default()
     };
-    // SAFETY: caller: context current. Both copies are live locals over the caller's mapping and
-    // `dst`'s pooled planes; each `copy_blocking` syncs before return.
+    // SAFETY: both sources are live and large enough (this fn's contract); `dst`'s planes are
+    // its live pooled allocations. Each `copy_blocking` syncs before return.
     unsafe {
         copy_blocking(&y, "cuMemcpy2DAsync_v2(ext->dev nv12 Y)")?;
         copy_blocking(&uv, "cuMemcpy2DAsync_v2(ext->dev nv12 UV)")

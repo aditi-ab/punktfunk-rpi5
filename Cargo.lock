@@ -3315,6 +3315,7 @@ dependencies = [
 name = "pf-dxvadec"
 version = "0.40.0"
 dependencies = [
+ "bytemuck",
  "cros-codecs",
  "pf-bitstream",
  "pf-vkdecode",
@@ -3341,6 +3342,7 @@ dependencies = [
  "pf-zerocopy",
  "punktfunk-core",
  "pyrowave-sys",
+ "rustix",
  "serde",
  "serde_json",
  "tracing",
@@ -3437,6 +3439,7 @@ dependencies = [
  "libloading 0.9.0",
  "pf-bitstream",
  "pf-vaapi",
+ "rustix",
  "tracing",
 ]
 
@@ -3565,9 +3568,11 @@ version = "0.40.0"
 dependencies = [
  "anyhow",
  "ash",
+ "bytemuck",
  "khronos-egl",
  "libc",
  "libloading 0.9.0",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -4077,7 +4082,6 @@ version = "0.40.0"
 dependencies = [
  "anyhow",
  "ksni",
- "libc",
  "pf-paths",
  "punktfunk-core",
  "rustls",

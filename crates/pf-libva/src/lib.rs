@@ -590,9 +590,12 @@ impl Display {
             let object = match objects[..n].iter().position(|o| o.fd == plane.fd) {
                 Some(o) => o,
                 None if n < MAX_OBJECTS => {
+                    // SAFETY: the plane fds are the caller's, open for this call
+                    // (`DmabufSource`'s contract); the borrow ends with the statement.
+                    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(plane.fd) };
                     objects[n] = VaDrmPrimeObject {
                         fd: plane.fd,
-                        size: dmabuf_size(plane.fd)?,
+                        size: dmabuf_size(fd)?,
                         drm_format_modifier: source.modifier,
                     };
                     desc.num_objects += 1;
@@ -706,15 +709,10 @@ pub struct DmabufSource<'a> {
 }
 
 /// A dma-buf reports its size as its file size.
-fn dmabuf_size(fd: c_int) -> Result<u32> {
-    use std::os::fd::FromRawFd as _;
-    // SAFETY: `fd` is the caller's live dmabuf; `ManuallyDrop` keeps this from
-    // closing it.
-    let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-    let len = file
-        .metadata()
-        .with_context(|| format!("fstat dmabuf fd {fd}"))?
-        .len();
+fn dmabuf_size(fd: std::os::fd::BorrowedFd<'_>) -> Result<u32> {
+    let len = rustix::fs::fstat(fd)
+        .with_context(|| format!("fstat dmabuf fd {}", fd.as_raw_fd()))?
+        .st_size;
     u32::try_from(len).context("a dmabuf over 4 GiB")
 }
 

@@ -1449,7 +1449,6 @@ mod parity {
     use windows::Win32::d3d11::D3D11_USAGE_STAGING;
     use windows::Win32::dxgi::CreateDXGIFactory1;
     use windows::Win32::dxgi::IDXGIFactory1;
-    use windows::Win32::dxgi::DXGI_ADAPTER_DESC1;
 
     use super::*;
 
@@ -1753,18 +1752,7 @@ mod parity {
             return None;
         };
         let mut chosen = None;
-        for i in 0.. {
-            // SAFETY: a COM call on the live factory; `Ok` proves an adapter came back.
-            let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else {
-                break;
-            };
-            // SAFETY: `DXGI_ADAPTER_DESC1` is plain-old-data, so all-zeroes is valid.
-            let mut desc: DXGI_ADAPTER_DESC1 = unsafe { std::mem::zeroed() };
-            // SAFETY: a COM call on the adapter just enumerated, filling the zeroed
-            // local through the out-param; checked before the descriptor is read.
-            if unsafe { adapter.GetDesc1(&mut desc) }.is_err() {
-                continue;
-            }
+        for (i, (_, desc)) in crate::video_d3d11::adapters(&factory).enumerate() {
             let end = desc
                 .Description
                 .iter()

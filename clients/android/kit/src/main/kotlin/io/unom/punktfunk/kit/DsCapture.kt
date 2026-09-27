@@ -310,7 +310,6 @@ class DsCapture(
             Log.w(TAG, "pad audio: second USB connection failed")
             return
         }
-        padAudioConn = conn
         padAudioStarted = true
         // Real-world self test, opt-in: `adb shell setprop debug.punktfunk.pad_audio_selftest 3`
         // drives the voice coils for N seconds through the actual client path before the renderer
@@ -323,14 +322,19 @@ class DsCapture(
                 .invoke(null, "debug.punktfunk.pad_audio_selftest", "0") as String
         }.getOrNull()?.toIntOrNull() ?: 0
         if (secs > 0) {
-            // Diagnostic mode: the self test OWNS this descriptor for the capture, and the renderer
-            // must not also drive it — two engines on one usbfs descriptor reap each other's
-            // completions, which is precisely the fault this test exists to expose.
+            // Diagnostic mode: the self test OWNS this connection and closes it once the native
+            // call returns, so teardown never closes it mid-write. The renderer must not also drive
+            // it — two engines on one usbfs descriptor reap each other's completions.
             Thread({
-                val r = NativeBridge.nativePadAudioSelfTest(fd, secs, 60)
+                val r = try {
+                    NativeBridge.nativePadAudioSelfTest(fd, secs, 60)
+                } finally {
+                    conn?.close()
+                }
                 Log.i(TAG, "pad audio self-test → ${if (r > 0) "PASS ($r frames)" else "FAIL ($r)"}")
             }, "pf-pad-selftest").start()
         } else {
+            padAudioConn = conn
             // B6: hand the coils back before the first haptics frame. Any rumble earlier in this
             // session asserted HAPTICS_SELECT, which firmware-mutes them, and nothing else ever
             // clears it — so without this the stream renders into a muted actuator and looks for

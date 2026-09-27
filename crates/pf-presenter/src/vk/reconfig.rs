@@ -24,20 +24,10 @@ fn kmsdrm_swapchain_hint() -> String {
 }
 
 impl Presenter {
+    /// Replace the swapchain at the window's current size. A zero-size (minimized) window
+    /// keeps the old swapchain and any image already acquired from it.
     pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
         self.quiesce_own()?;
-        // An image acquired ahead of a present belongs to the swapchain that goes now.
-        self.acquired = None;
-        // Presentation-engine semaphore waits finish here. A fence wait proves
-        // only OUR submit (VUID-vkDestroySemaphore-05149 /
-        // VUID-vkDestroySwapchainKHR-01282). Decode submits share `queue_lock`.
-        {
-            let _q = self.queue_lock.guard();
-            // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
-            unsafe { self.device.queue_wait_idle(self.queue) }
-                .context("vkQueueWaitIdle (swapchain recreate)")?;
-        }
-
         // SAFETY: `pdev` and `surface` are live handles owned by this presenter.
         let caps = unsafe {
             self.surface_i
@@ -56,6 +46,22 @@ impl Presenter {
             // Minimized: keep the old swapchain. Presents return OUT_OF_DATE
             // and land back here once the window has a size.
             return Ok(());
+        }
+        // Presentation-engine semaphore waits finish here. A fence wait proves
+        // only OUR submit (VUID-vkDestroySemaphore-05149 /
+        // VUID-vkDestroySwapchainKHR-01282). Decode submits share `queue_lock`.
+        {
+            let _q = self.queue_lock.guard();
+            // An image acquired ahead of a present belongs to the swapchain that goes now.
+            if self.acquired.is_some() {
+                // SAFETY: `queue_lock` is held above.
+                unsafe { self.retire_acquire_sem() }
+                    .context("vkQueueSubmit (discard the acquired image)")?;
+                self.acquired = None;
+            }
+            // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
+            unsafe { self.device.queue_wait_idle(self.queue) }
+                .context("vkQueueWaitIdle (swapchain recreate)")?;
         }
         let mut min_images = caps.min_image_count + 1;
         if caps.max_image_count > 0 {
@@ -104,16 +110,10 @@ impl Presenter {
         // Quiesce covered our cmd bufs, queue drain the presentation-engine
         // semaphore waits, present-timer drain the last waiter — nothing
         // still names these objects.
-        let (overlay_views, overlay_framebuffers) = self.overlay_pipe.take_targets();
+        self.overlay_pipe.destroy_targets(&self.device);
         // SAFETY: quiesce, `queue_wait_idle`, and present-timer drain above;
-        // GPU idle on these views, framebuffers, semaphores, and `old`.
+        // GPU idle on these semaphores and `old`.
         unsafe {
-            for fb in overlay_framebuffers {
-                self.device.destroy_framebuffer(fb, None);
-            }
-            for v in overlay_views {
-                self.device.destroy_image_view(v, None);
-            }
             for s in self.render_sems.drain(..) {
                 self.device.destroy_semaphore(s, None);
             }
@@ -252,13 +252,7 @@ impl Presenter {
         tracing::info!(hdr = on, format = ?target, "switching presentation mode");
         self.quiesce_own()?;
         if let Some(v) = self.video.take() {
-            // SAFETY: `quiesce_own` above; GPU idle on this video image.
-            unsafe {
-                self.device.destroy_framebuffer(v.framebuffer, None);
-                self.device.destroy_image_view(v.view, None);
-                self.device.destroy_image(v.image, None);
-                self.device.free_memory(v.memory, None);
-            }
+            v.destroy(&self.device); // `quiesce_own` above: GPU idle on it
         }
         // New overlay pipe for the new format. Old views/framebuffers are
         // only in our cmd bufs — fence quiesce makes destroy safe here;
@@ -267,27 +261,18 @@ impl Presenter {
             &mut self.overlay_pipe,
             OverlayPipe::new(&self.device, target.format, on)?,
         );
-        let (overlay_views, overlay_framebuffers) = old_pipe.take_targets();
-        // SAFETY: fence quiesce above; these views/framebuffers are only in our cmd bufs.
-        unsafe {
-            for fb in overlay_framebuffers {
-                self.device.destroy_framebuffer(fb, None);
-            }
-            for v in overlay_views {
-                self.device.destroy_image_view(v, None);
-            }
-        }
         old_pipe.destroy(&self.device);
-        // The scale pass renders into the swapchain format too; fence quiesce above.
-        self.scale.destroy(&self.device);
-        self.scale = crate::scale::ScalePass::new(&self.device, target.format)?;
-        self.direct.destroy(&self.device);
-        self.direct = crate::csc::DirectPass::new(
+        // The scale and direct passes render into the swapchain format too; fence quiesce above.
+        // Build each new one first: a failed create must not leave destroyed handles for Drop.
+        let new_scale = crate::scale::ScalePass::new(&self.device, target.format)?;
+        std::mem::replace(&mut self.scale, new_scale).destroy(&self.device);
+        let new_direct = crate::csc::DirectPass::new(
             &self.device,
             target.format,
             self.csc.pipeline_layout,
             self.csc_planar.pipeline_layout,
         )?;
+        std::mem::replace(&mut self.direct, new_direct).destroy(&self.device);
         self.direct_last = None;
         self.format = target;
         self.hdr_active = on;

@@ -133,9 +133,11 @@ mod imp {
             };
             let path_units = path_bytes / size_of::<u16>();
             // SAFETY: `DevicePath` is u16-aligned within the aligned detail record. `path_units`
-            // covers only complete WCHARs inside SetupAPI's exact returned byte count.
+            // covers only complete WCHARs inside SetupAPI's exact returned byte count, and
+            // `addr_of!` keeps the pointer's reach over all of `storage`, not the `[u16; 1]`.
             let path = unsafe {
-                let wide = std::slice::from_raw_parts((*detail).DevicePath.as_ptr(), path_units);
+                let first = std::ptr::addr_of!((*detail).DevicePath).cast::<u16>();
+                let wide = std::slice::from_raw_parts(first, path_units);
                 let len = wide
                     .iter()
                     .position(|&unit| unit == 0)

@@ -9,7 +9,6 @@
 //! Status model and poller: `status.rs`. Service-vs-machine restart wording:
 //! `design/host-actions.md`.
 
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -223,10 +222,8 @@ fn acquire_instance_lock() -> Option<std::fs::File> {
         .write(true)
         .open(dir.join("punktfunk-tray.lock"))
         .ok()?;
-    // SAFETY: `file` is an open, owned fd for the duration of the call; LOCK_NB makes this a
-    // non-blocking advisory lock attempt with no other side effects.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    (rc == 0).then_some(file)
+    file.try_lock().ok()?;
+    Some(file)
 }
 
 pub fn run(args: crate::Args) -> anyhow::Result<()> {

@@ -11,10 +11,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::mem::ManuallyDrop;
-use windows::core::{w, GUID, PCWSTR, PWSTR};
+use windows::core::{w, Owned, GUID, PCWSTR, PWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiCreateDevRegKeyW, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW,
-    SetupDiDestroyDeviceInfoList, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
+    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
     SetupDiGetDevicePropertyW, SetupDiGetDeviceRegistryPropertyW, SetupDiOpenDevRegKey,
     SetupDiRegisterDeviceInfo, SetupDiSetDeviceRegistryPropertyW,
     UpdateDriverForPlugAndPlayDevicesW, DICD_GENERATE_ID, DICS_FLAG_GLOBAL, DIREG_DEV,
@@ -29,8 +29,7 @@ use windows::Win32::System::Com::StructuredStorage::{
 };
 use windows::Win32::System::Com::BLOB;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegQueryValueExW, RegSetValueExW, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD,
-    REG_VALUE_TYPE,
+    RegQueryValueExW, RegSetValueExW, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_VALUE_TYPE,
 };
 use windows::Win32::System::Variant::{VT_BLOB, VT_CLSID, VT_LPWSTR};
 
@@ -150,15 +149,25 @@ pub(crate) fn pv_bytes(pv: &PROPVARIANT) -> Option<Vec<u8>> {
     }
 }
 
-pub(crate) struct DevInfoSet(pub(crate) HDEVINFO);
+/// A device-information set, destroyed on drop.
+pub(crate) struct DevInfoSet(Owned<HDEVINFO>);
 
-impl Drop for DevInfoSet {
-    fn drop(&mut self) {
-        // SAFETY: the handle came from SetupDiGetClassDevsW/SetupDiCreateDeviceInfoList and is
-        // destroyed exactly once (this owner's drop).
-        unsafe {
-            let _ = SetupDiDestroyDeviceInfoList(self.0);
-        }
+impl DevInfoSet {
+    /// Adopts a set from `SetupDiGetClassDevsW` / `SetupDiCreateDeviceInfoList`.
+    fn adopt(set: HDEVINFO) -> Self {
+        // SAFETY: both producers hand the caller a set it alone owns and destroys once.
+        Self(unsafe { Owned::new(set) })
+    }
+
+    /// Every element, in SetupAPI order, until the first `ERROR_NO_MORE_ITEMS`.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = SP_DEVINFO_DATA> + '_ {
+        (0..).map_while(move |i| {
+            let mut did = devinfo_data();
+            // SAFETY: live set; `did` is a live out-param with cbSize set.
+            unsafe { SetupDiEnumDeviceInfo(*self.0, i, &mut did) }
+                .ok()
+                .map(|()| did)
+        })
     }
 }
 
@@ -174,10 +183,10 @@ pub(crate) fn media_class_devs() -> Result<DevInfoSet> {
         )
     }
     .context("SetupDiGetClassDevs(MEDIA)")?;
-    Ok(DevInfoSet(set))
+    Ok(DevInfoSet::adopt(set))
 }
 
-pub(crate) fn devinfo_data() -> SP_DEVINFO_DATA {
+fn devinfo_data() -> SP_DEVINFO_DATA {
     SP_DEVINFO_DATA {
         cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
         ..Default::default()
@@ -187,7 +196,7 @@ pub(crate) fn devinfo_data() -> SP_DEVINFO_DATA {
 pub(crate) fn instance_id(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
     let mut buf = [0u16; 200];
     // SAFETY: live devinfo set + element; the buffer length travels with the slice.
-    unsafe { SetupDiGetDeviceInstanceIdW(set.0, did, Some(&mut buf), None) }.ok()?;
+    unsafe { SetupDiGetDeviceInstanceIdW(*set.0, did, Some(&mut buf), None) }.ok()?;
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     Some(String::from_utf16_lossy(&buf[..len]))
 }
@@ -201,7 +210,7 @@ pub(crate) fn devnode_multi_sz_prop(
     let mut req = 0u32;
     // SAFETY: live set + element; the output buffer length travels with the slice.
     if unsafe {
-        SetupDiGetDeviceRegistryPropertyW(set.0, did, prop, None, Some(&mut buf), Some(&mut req))
+        SetupDiGetDeviceRegistryPropertyW(*set.0, did, prop, None, Some(&mut buf), Some(&mut req))
     }
     .is_err()
     {
@@ -227,7 +236,7 @@ pub(crate) fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Optio
     // travels with the slice.
     unsafe {
         SetupDiGetDevicePropertyW(
-            set.0,
+            *set.0,
             did,
             &DEVPKEY_Device_DriverInfPath,
             &mut ty,
@@ -254,18 +263,21 @@ pub(crate) fn read_devparam_dword(
     did: &SP_DEVINFO_DATA,
     value_name: &str,
 ) -> Option<u32> {
-    // SAFETY: live set + element; DIREG_DEV opens the devnode's Device Parameters key.
+    // SAFETY: live set + element; DIREG_DEV opens the devnode's Device Parameters key, which
+    // `Owned` closes once.
     let hkey = unsafe {
-        SetupDiOpenDevRegKey(
-            set.0,
-            did,
-            DICS_FLAG_GLOBAL.0,
-            0,
-            DIREG_DEV,
-            KEY_QUERY_VALUE.0,
+        Owned::new(
+            SetupDiOpenDevRegKey(
+                *set.0,
+                did,
+                DICS_FLAG_GLOBAL.0,
+                0,
+                DIREG_DEV,
+                KEY_QUERY_VALUE.0,
+            )
+            .ok()?,
         )
-    }
-    .ok()?;
+    };
     let name = wide(value_name);
     let mut data = [0u8; 4];
     let mut len = data.len() as u32;
@@ -274,7 +286,7 @@ pub(crate) fn read_devparam_dword(
     // sized together.
     let rc = unsafe {
         RegQueryValueExW(
-            hkey,
+            *hkey,
             PCWSTR(name.as_ptr()),
             None,
             Some(&mut ty),
@@ -282,10 +294,6 @@ pub(crate) fn read_devparam_dword(
             Some(&mut len),
         )
     };
-    // SAFETY: closing the key opened above, exactly once.
-    unsafe {
-        let _ = RegCloseKey(hkey);
-    }
     (rc.is_ok() && ty == REG_DWORD && len == 4).then(|| u32::from_le_bytes(data))
 }
 
@@ -299,7 +307,7 @@ pub(crate) fn write_devparam_dword(
     // SAFETY: live set + element; DIREG_DEV opens the devnode's Device Parameters key.
     let opened = unsafe {
         SetupDiOpenDevRegKey(
-            set.0,
+            *set.0,
             did,
             DICS_FLAG_GLOBAL.0,
             0,
@@ -313,7 +321,7 @@ pub(crate) fn write_devparam_dword(
         // create it (no INF association).
         Err(_) => unsafe {
             SetupDiCreateDevRegKeyW(
-                set.0,
+                *set.0,
                 did,
                 DICS_FLAG_GLOBAL.0,
                 0,
@@ -324,22 +332,20 @@ pub(crate) fn write_devparam_dword(
         }
         .with_context(|| format!("create the Device Parameters key for {value_name}"))?,
     };
+    // SAFETY: the key opened or created above is ours alone; `Owned` closes it once.
+    let hkey = unsafe { Owned::new(hkey) };
     let name = wide(value_name);
     // SAFETY: the value name is NUL-terminated and outlives the call; the DWORD bytes travel
     // with the slice.
     let rc = unsafe {
         RegSetValueExW(
-            hkey,
+            *hkey,
             PCWSTR(name.as_ptr()),
             None,
             REG_DWORD,
             Some(&value.to_le_bytes()),
         )
     };
-    // SAFETY: closing the key opened/created above, exactly once.
-    unsafe {
-        let _ = RegCloseKey(hkey);
-    }
     rc.ok().with_context(|| format!("write {value_name}"))
 }
 
@@ -354,14 +360,14 @@ pub(crate) fn create_media_devnode(
     // SAFETY: the class GUID is a static const.
     let set = unsafe { SetupDiCreateDeviceInfoList(Some(&GUID_DEVCLASS_MEDIA), None) }
         .context("SetupDiCreateDeviceInfoList(MEDIA)")?;
-    let set = DevInfoSet(set);
+    let set = DevInfoSet::adopt(set);
     let mut did = devinfo_data();
     let desc = wide(desc);
     // SAFETY: name/class/description are live NUL-terminated buffers; DICD_GENERATE_ID makes
     // PnP mint the ROOT\MEDIA\00NN instance id; `did` receives the element.
     unsafe {
         SetupDiCreateDeviceInfoW(
-            set.0,
+            *set.0,
             w!("MEDIA"),
             &GUID_DEVCLASS_MEDIA,
             PCWSTR(desc.as_ptr()),
@@ -373,12 +379,12 @@ pub(crate) fn create_media_devnode(
     .context("SetupDiCreateDeviceInfo")?;
     let hwid = multi_sz_bytes(&[hwid]);
     // SAFETY: live set + element; the multi-sz property bytes travel with the slice.
-    unsafe { SetupDiSetDeviceRegistryPropertyW(set.0, &mut did, SPDRP_HARDWAREID, Some(&hwid)) }
+    unsafe { SetupDiSetDeviceRegistryPropertyW(*set.0, &mut did, SPDRP_HARDWAREID, Some(&hwid)) }
         .context("set SPDRP_HARDWAREID")?;
     // NOT SetupDiCallClassInstaller(DIF_REGISTERDEVICE): needs an interactive
     // window station and fails with 1459 from a service.
     // SAFETY: live set + element; no compare callback.
-    unsafe { SetupDiRegisterDeviceInfo(set.0, &mut did, 0, None, None, None) }
+    unsafe { SetupDiRegisterDeviceInfo(*set.0, &mut did, 0, None, None, None) }
         .context("SetupDiRegisterDeviceInfo")?;
     mark(&set, &mut did)?;
     instance_id(&set, &did).context("read the new devnode's instance id")

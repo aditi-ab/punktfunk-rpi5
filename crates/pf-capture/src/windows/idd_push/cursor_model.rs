@@ -98,9 +98,7 @@ pub(super) fn deliver_cursor_channel(
     cs: &cursor::CursorShared,
     send_cursor: &crate::CursorChannelSender,
 ) -> bool {
-    // SAFETY: `cs.section_handle()` borrows the mapping `cs` owns for this call;
-    // the broker's WUDFHost process handle is live for the broker's lifetime.
-    let value = match unsafe { broker.dup_into_public(cs.section_handle()) } {
+    let value = match broker.dup_into_public(cs.section_handle()) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("cursor section duplication failed (composited cursor stays): {e:#}");

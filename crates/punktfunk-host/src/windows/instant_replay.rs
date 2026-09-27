@@ -14,10 +14,6 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::GENERIC_ALL;
-use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
-};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
     VIRTUAL_KEY,
@@ -120,29 +116,15 @@ fn key(vk: u16, up: bool) -> INPUT {
 }
 
 /// Press the chord on the input desktop: downs in order, ups reversed. Binds this thread
-/// only, so call it from a thread of its own.
+/// for the send and rebinds its previous desktop after; unbound, it sends to the current one.
 fn press(chord: &[u16]) -> bool {
     let mut inputs: Vec<INPUT> = chord.iter().map(|&vk| key(vk, false)).collect();
     inputs.extend(chord.iter().rev().map(|&vk| key(vk, true)));
-    // SAFETY: `OpenInputDesktop` yields an owned HDESK only on `Ok`, closed exactly once after
-    // the send; `SetThreadDesktop` rebinds this thread. `SendInput` reads the live `inputs`
-    // slice with the exact element stride and returns the count injected.
-    unsafe {
-        let desk = OpenInputDesktop(
-            DESKTOP_CONTROL_FLAGS(0),
-            false,
-            DESKTOP_ACCESS_FLAGS(GENERIC_ALL.0),
-        )
-        .ok();
-        if let Some(h) = desk {
-            let _ = SetThreadDesktop(h);
-        }
-        let n = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-        if let Some(h) = desk {
-            let _ = CloseDesktop(h);
-        }
-        n as usize == inputs.len()
-    }
+    let _desk = super::game_term::InputDesktop::attach();
+    // SAFETY: `SendInput` reads the live `inputs` slice with the exact element stride and
+    // returns the count injected.
+    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    n as usize == inputs.len()
 }
 
 enum Outcome {

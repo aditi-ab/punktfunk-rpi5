@@ -332,14 +332,21 @@ pub(super) unsafe fn make_video_image_flags(
     let img = device.create_image(&ci, None)?;
     let req = device.get_image_memory_requirements(img);
     // Destroy the image if alloc fails: callers only ever see the completed pair.
+    let ti = match find_mem(
+        mp,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            device.destroy_image(img, None);
+            return Err(e);
+        }
+    };
     let mem = match device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
-            .memory_type_index(find_mem(
-                mp,
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )),
+            .memory_type_index(ti),
         None,
     ) {
         Ok(m) => m,
@@ -537,7 +544,7 @@ unsafe fn make_frame_csc(
                 mem_props,
                 cs_req.memory_type_bits,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )),
+            )?),
         None,
     )?;
     device.bind_buffer_memory(f.cursor_stage, f.cursor_stage_mem, 0)?;
@@ -611,7 +618,7 @@ unsafe fn make_frame_common(
                 mem_props,
                 bs_req.memory_type_bits,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )),
+            )?),
         None,
     )?;
     device.bind_buffer_memory(f.bs_buf, f.bs_mem, 0)?;

@@ -959,6 +959,26 @@ fn resolve_bitrate_kbps_for(
     chroma: crate::encode::ChromaFormat,
     bit_depth: u8,
 ) -> u32 {
+    resolve_bitrate_kbps_under(
+        codec,
+        requested,
+        mode,
+        chroma,
+        bit_depth,
+        pyrowave_auto_pin_ceiling_kbps,
+    )
+}
+
+/// [`resolve_bitrate_kbps_for`] with the PyroWave ceiling (kbps) read through `ceiling`, so a
+/// test hands one in without writing the process environment.
+fn resolve_bitrate_kbps_under(
+    codec: crate::encode::Codec,
+    requested: u32,
+    mode: &punktfunk_core::config::Mode,
+    chroma: crate::encode::ChromaFormat,
+    bit_depth: u8,
+    ceiling: fn() -> Option<u32>,
+) -> u32 {
     if codec == crate::encode::Codec::PyroWave {
         if requested != 0 {
             tracing::warn!(
@@ -970,7 +990,7 @@ fn resolve_bitrate_kbps_for(
         let pin = pyrowave_pin_kbps(mode, chroma, bit_depth, bpp);
         // Open-loop pin can outrun the link. `PUNKTFUNK_PYROWAVE_MAX_MBPS` caps it;
         // unset ⇒ no cap.
-        if let Some(ceiling) = pyrowave_auto_pin_ceiling_kbps() {
+        if let Some(ceiling) = ceiling() {
             if pin > ceiling {
                 tracing::warn!(
                     pin_kbps = pin,
@@ -3156,21 +3176,22 @@ mod tests {
             height: 1440,
             refresh_hz: 240,
         };
-        let uncapped =
-            resolve_bitrate_kbps_for(Codec::PyroWave, 0, &mode, ChromaFormat::Yuv444, 10);
+        let pin = |requested, mode: &Mode, chroma, depth, ceiling: fn() -> Option<u32>| {
+            resolve_bitrate_kbps_under(Codec::PyroWave, requested, mode, chroma, depth, ceiling)
+        };
+        fn none() -> Option<u32> {
+            None
+        }
+        fn link() -> Option<u32> {
+            Some(4_500_000)
+        }
+        let uncapped = pin(0, &mode, ChromaFormat::Yuv444, 10, none);
         assert!(
             uncapped > 5_000_000,
             "expected the open-loop pin, got {uncapped}"
         );
         // Ceiling caps the Automatic pin to the link rate.
-        // SAFETY: this test is the only writer of this variable in the process; the only
-        // reader is `resolve_bitrate_kbps_for` on this same thread.
-        unsafe { std::env::set_var("PUNKTFUNK_PYROWAVE_MAX_MBPS", "4500") };
-        pf_host_config::reload();
-        assert_eq!(
-            resolve_bitrate_kbps_for(Codec::PyroWave, 0, &mode, ChromaFormat::Yuv444, 10),
-            4_500_000
-        );
+        assert_eq!(pin(0, &mode, ChromaFormat::Yuv444, 10, link), 4_500_000);
         // A pin already under the ceiling is untouched.
         let small = Mode {
             width: 1920,
@@ -3178,17 +3199,14 @@ mod tests {
             refresh_hz: 60,
         };
         assert_eq!(
-            resolve_bitrate_kbps_for(Codec::PyroWave, 0, &small, ChromaFormat::Yuv420, 8),
+            pin(0, &small, ChromaFormat::Yuv420, 8, link),
             1920 * 1080 * 60 * 16 / 10 / 1000
         );
         // Explicit client rate still goes through pin + ceiling.
         assert_eq!(
-            resolve_bitrate_kbps_for(Codec::PyroWave, 6_000_000, &mode, ChromaFormat::Yuv444, 10),
+            pin(6_000_000, &mode, ChromaFormat::Yuv444, 10, link),
             4_500_000
         );
-        // SAFETY: same as the set above — single writer; readers run on this thread.
-        unsafe { std::env::remove_var("PUNKTFUNK_PYROWAVE_MAX_MBPS") };
-        pf_host_config::reload();
     }
 
     /// An RFI ask prices the report window it lands in. A report a window late closes a

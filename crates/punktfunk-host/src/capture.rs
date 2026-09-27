@@ -381,7 +381,7 @@ pub fn capture_virtual_output(
             "pf-vdisplay control device not open (monitor not created via the manager?)"
         )
     })?;
-    // Each closure clones the `Arc<OwnedHandle>`, so the handle stays open for the closure's
+    // Each closure clones the `Arc<ControlDevice>`, so the handle stays open for the closure's
     // life and closes when the manager retires it and the last session drops. An open control
     // handle vetoes the wake-from-sleep PnP cycle.
 
@@ -394,16 +394,7 @@ pub fn capture_virtual_output(
     let cursor_sender: Option<pf_capture::CursorChannelSender> = want_channel.then(|| {
         std::sync::Arc::new(
             move |req: &pf_driver_proto::control::SetCursorChannelRequest| {
-                // SAFETY: the captured `control_cursor` Arc keeps the control handle open across
-                // this call (`send_cursor_channel`'s precondition).
-                unsafe {
-                    crate::vdisplay::driver::send_cursor_channel(
-                        windows::Win32::Foundation::HANDLE(
-                            std::os::windows::io::AsRawHandle::as_raw_handle(&*control_cursor),
-                        ),
-                        req,
-                    )
-                }
+                crate::vdisplay::driver::send_cursor_channel(&control_cursor, req)
             },
         ) as pf_capture::CursorChannelSender
     });
@@ -419,16 +410,7 @@ pub fn capture_virtual_output(
                 target_id,
                 enable: enable as u32,
             };
-            // SAFETY: the captured `control` Arc keeps the control handle open across this call
-            // (`send_cursor_forward`'s precondition).
-            unsafe {
-                crate::vdisplay::driver::send_cursor_forward(
-                    windows::Win32::Foundation::HANDLE(
-                        std::os::windows::io::AsRawHandle::as_raw_handle(&*control),
-                    ),
-                    &req,
-                )
-            }
+            crate::vdisplay::driver::send_cursor_forward(&control, &req)
         }) as pf_capture::CursorForwardSender
     });
     pf_capture::open_idd_push(
@@ -485,29 +467,11 @@ pub fn open_driver_encoder(
     let control_open = control.clone();
     let set_encode: pf_capture::SetEncodeSender =
         std::sync::Arc::new(move |req: &pf_driver_proto::encode::SetEncodeRequest| {
-            // SAFETY: the captured Arc keeps the control handle open across this call
-            // (`send_set_encode`'s precondition).
-            unsafe {
-                crate::vdisplay::driver::send_set_encode(
-                    windows::Win32::Foundation::HANDLE(
-                        std::os::windows::io::AsRawHandle::as_raw_handle(&*control_open),
-                    ),
-                    req,
-                )
-            }
+            crate::vdisplay::driver::send_set_encode(&control_open, req)
         });
     let encode_ctl: pf_capture::EncodeCtlSender =
         std::sync::Arc::new(move |req: &pf_driver_proto::encode::EncodeCtlRequest| {
-            // SAFETY: the captured Arc keeps the control handle open across this call
-            // (`send_encode_ctl`'s precondition).
-            unsafe {
-                crate::vdisplay::driver::send_encode_ctl(
-                    windows::Win32::Foundation::HANDLE(
-                        std::os::windows::io::AsRawHandle::as_raw_handle(&*control),
-                    ),
-                    req,
-                )
-            }
+            crate::vdisplay::driver::send_encode_ctl(&control, req)
         });
     use pf_driver_proto::encode::{backend as be, codec as cc};
     let backend = match plan.codec {

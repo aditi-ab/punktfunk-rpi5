@@ -9,20 +9,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::latency::now_realtime_ns;
+use super::vsync::now_monotonic_ns;
 use super::RENDERED_CAP;
-
-/// `CLOCK_MONOTONIC` now in nanoseconds — the base of the `systemNano` render timestamp the
-/// `OnFrameRendered` callback reports (Android's `System.nanoTime`), read only to re-base that
-/// stamp onto `CLOCK_REALTIME` (see [`on_frame_rendered`]).
-fn now_monotonic_ns() -> i128 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `clock_gettime` with a valid out-pointer is an always-safe syscall.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128
-}
 
 /// State shared between the decode loop and the `AMediaCodec` `OnFrameRendered` callback (which
 /// fires on a codec-internal thread): rendered frames awaiting their render timestamp, so the HUD
@@ -107,16 +95,16 @@ pub(super) fn install_render_callback(
         *mut c_void,
     ) -> ndk_sys::media_status_t;
     // SAFETY: `dlopen` of `libmediandk.so`, which the `ndk` media wrapper already links — always
-    // mapped, so this only bumps its refcount (never closed — process-lifetime handle). `dlsym`
-    // returns null when the symbol is absent (device below API 33), checked before transmuting the
-    // non-null pointer to its fn-pointer type.
+    // mapped, so this only bumps its refcount (never closed — process-lifetime handle; null is
+    // checked). The `sym` type is the NDK header's signature; absent = API < 33.
     let set_on_frame_rendered = unsafe {
         let lib = libc::dlopen(c"libmediandk.so".as_ptr(), libc::RTLD_NOW);
         if lib.is_null() {
             return None;
         }
-        let sym = libc::dlsym(lib, c"AMediaCodec_setOnFrameRenderedCallback".as_ptr());
-        if sym.is_null() {
+        let Some(set) =
+            crate::sym::<SetOnFrameRenderedFn>(lib, c"AMediaCodec_setOnFrameRenderedCallback")
+        else {
             // No confirmed present ⇒ no `display` stage AND no reference for the audio plane's A/V
             // sync, which then stays inert and leaves the ring exactly as it was. The release
             // instant is NOT substituted: releases target a future vsync, so it runs a whole latch
@@ -126,8 +114,8 @@ pub(super) fn install_render_callback(
                 "decode: no render callback on this API level (<33) — no display stage, no A/V sync"
             );
             return None;
-        }
-        std::mem::transmute::<*mut c_void, SetOnFrameRenderedFn>(sym)
+        };
+        set
     };
     let ud = Arc::into_raw(tracker.clone());
     // SAFETY: `codec.as_ptr()` is the live codec this thread owns; `ud` outlives the registration
@@ -178,7 +166,7 @@ unsafe extern "C" fn on_frame_rendered(
     // `Arc::into_raw` pointer from `install_render_callback`, whose refcount is held for as long as
     // the codec exists, and the codec is what delivers this call.
     let t = unsafe { &*(userdata as *const DisplayTracker) };
-    let displayed_ns = now_realtime_ns() - (now_monotonic_ns() - system_nano as i128);
+    let displayed_ns = now_realtime_ns() - (i128::from(now_monotonic_ns()) - system_nano as i128);
     let pts_us = media_time_us.max(0) as u64;
     // Pair the frame back to its release record, evicting older entries (their callbacks were
     // dropped by the platform) — same monotonic-eviction discipline as `note_decoded_pts`.

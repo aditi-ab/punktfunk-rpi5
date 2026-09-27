@@ -269,17 +269,17 @@ fn load_pin() -> Option<[u8; 32]> {
 /// Host config dir, mirroring `gamestream::config_dir()` without linking the
 /// host crate. `None` on Windows: those files are SYSTEM/Admins-DACL'd.
 pub fn punktfunk_config_dir() -> Option<std::path::PathBuf> {
-    if let Some(d) = std::env::var_os("PUNKTFUNK_CONFIG_DIR") {
-        if !d.is_empty() {
-            return Some(std::path::PathBuf::from(d));
-        }
+    if let Some(d) = std::env::var_os("PUNKTFUNK_CONFIG_DIR")
+        && !d.is_empty()
+    {
+        return Some(std::path::PathBuf::from(d));
     }
     #[cfg(target_os = "linux")]
     {
-        if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-            if !x.is_empty() {
-                return Some(std::path::PathBuf::from(x).join("punktfunk"));
-            }
+        if let Some(x) = std::env::var_os("XDG_CONFIG_HOME")
+            && !x.is_empty()
+        {
+            return Some(std::path::PathBuf::from(x).join("punktfunk"));
         }
         std::env::var_os("HOME").map(|h| {
             std::path::PathBuf::from(h)

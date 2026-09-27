@@ -103,6 +103,30 @@ struct AdapterInfo {
     iOSDisplayIndex: i32,
 }
 
+impl AdapterInfo {
+    /// All zero with `iSize` stamped, as ADL expects of each array entry.
+    fn stamped() -> Self {
+        let path = [0; ADL_MAX_PATH];
+        Self {
+            iSize: std::mem::size_of::<Self>() as i32,
+            iAdapterIndex: 0,
+            strUDID: path,
+            iBusNumber: 0,
+            iDeviceNumber: 0,
+            iFunctionNumber: 0,
+            iVendorID: 0,
+            strAdapterName: path,
+            strDisplayName: path,
+            iPresent: 0,
+            iExist: 0,
+            strDriverPath: path,
+            strDriverPathExt: path,
+            strPNPString: path,
+            iOSDisplayIndex: 0,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ADLMSTRad {
@@ -131,7 +155,7 @@ impl ADLDevicePort {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ADLConnectionProperties {
     iValidProperties: i32,
     iBitrate: i32,
@@ -150,6 +174,19 @@ struct ADLConnectionData {
     iActiveConnections: i32,
     iDataSize: i32,
     EdidData: [u8; ADL_MAX_DISPLAY_EDID_DATA_SIZE],
+}
+
+impl Default for ADLConnectionData {
+    fn default() -> Self {
+        Self {
+            iConnectionType: 0,
+            aConnectionProperties: ADLConnectionProperties::default(),
+            iNumberofPorts: 0,
+            iActiveConnections: 0,
+            iDataSize: 0,
+            EdidData: [0; ADL_MAX_DISPLAY_EDID_DATA_SIZE],
+        }
+    }
 }
 
 #[repr(C)]
@@ -378,15 +415,7 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
         let _ = unsafe { (adl.destroy)(ctx) };
         return RunOutcome::InitFailed(recs);
     }
-    let mut infos: Vec<AdapterInfo> = (0..count)
-        .map(|_| {
-            // SAFETY: AdapterInfo is plain ints + byte arrays — the all-zero pattern is valid,
-            // and ADL fills the array in place.
-            let mut a: AdapterInfo = unsafe { std::mem::zeroed() };
-            a.iSize = std::mem::size_of::<AdapterInfo>() as i32;
-            a
-        })
-        .collect();
+    let mut infos: Vec<AdapterInfo> = (0..count).map(|_| AdapterInfo::stamped()).collect();
     let bytes = std::mem::size_of_val(infos.as_slice()) as i32;
     // SAFETY: caller-allocated array of exactly `count` stamped entries, byte size passed as the
     // API's iInputSize contract requires.
@@ -518,9 +547,7 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
 
             match action {
                 EmulAction::Probe => {
-                    // SAFETY: ADLConnectionData is plain ints + a byte array; all-zero is valid
-                    // and ADL overwrites it.
-                    let mut data: ADLConnectionData = unsafe { std::mem::zeroed() };
+                    let mut data = ADLConnectionData::default();
                     let t = Instant::now();
                     // SAFETY: live context/port as above; REAL query fills `data` in place.
                     let rc = unsafe {
@@ -553,8 +580,7 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
                         );
                         continue;
                     }
-                    // SAFETY: as in Probe — zeroed then driver-filled.
-                    let mut data: ADLConnectionData = unsafe { std::mem::zeroed() };
+                    let mut data = ADLConnectionData::default();
                     let t = Instant::now();
                     // SAFETY: live context/port; REAL query first so the pin is the sink's current EDID.
                     let mut rc = unsafe {

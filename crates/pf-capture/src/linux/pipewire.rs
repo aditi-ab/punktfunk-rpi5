@@ -12,7 +12,7 @@ use super::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat, ZeroCopyPolic
 use anyhow::{Context, Result};
 use pipewire as pw;
 use pw::{properties::properties, spa};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -204,6 +204,35 @@ impl UserData {
         // Its hold's late release finds the book already completed and no-ops.
         drop(stale);
         requeued
+    }
+
+    /// Requeue a buffer this `.process` publishes nothing from. One the book still lists was
+    /// re-sent while held (PipeWire < 1.6): its hold is purged first, so the stale release
+    /// no-ops and the buffer rejoins once, and `resent` asks for the covering IDR.
+    ///
+    /// # Safety
+    /// Loop thread; `buf` was dequeued from the live `stream` and is not yet requeued.
+    unsafe fn requeue_unpublished(
+        &self,
+        stream: *mut pw::sys::pw_stream,
+        buf: *mut pw::sys::pw_buffer,
+    ) {
+        let held = self
+            .defer
+            .book
+            .lock()
+            .map(|mut b| {
+                let held = b.contains(buf as usize);
+                b.purge(buf as usize);
+                held
+            })
+            .unwrap_or(false);
+        if held {
+            self.signals.resent.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: the caller's contract is `hand_back`'s; the purge above leaves no hold that
+        // would queue `buf` a second time.
+        unsafe { hand_back(self.sync.as_deref(), stream, buf) };
     }
 }
 
@@ -1133,6 +1162,22 @@ fn dmabuf_len(fd: i32) -> u64 {
     }
 }
 
+/// `data`'s fd, borrowed for as long as `data` is. `None` when the data carries no fd.
+fn data_fd(data: &pw::spa::buffer::Data) -> Option<BorrowedFd<'_>> {
+    let fd = RawFd::try_from(data.as_raw().fd)
+        .ok()
+        .filter(|&fd| fd >= 0)?;
+    // SAFETY: `data` borrows a `spa_data` of a buffer this side holds; its fd stays open
+    // while that borrow lives, and a non-negative fd is a valid `BorrowedFd`.
+    Some(unsafe { BorrowedFd::borrow_raw(fd) })
+}
+
+/// A CLOEXEC dup of `data`'s fd, so a published frame keeps the dmabuf past the requeue.
+/// `None`: the data carries no fd, or the process is out of descriptors.
+fn dup_data_fd(data: &pw::spa::buffer::Data) -> Option<OwnedFd> {
+    data_fd(data)?.try_clone_to_owned().ok()
+}
+
 /// Whether the selected GPU's driver rounds a linear import pitch: iHD does; an unknown
 /// selection is treated as one, a CPU copy being the cheaper mistake.
 fn linear_pitch_rounds() -> bool {
@@ -1188,6 +1233,9 @@ fn consume_frame(
     if ud.signals.broken.load(Ordering::Relaxed) {
         return;
     }
+    // Read before `datas` below borrows the same array mutably.
+    // SAFETY: `spa_buf` is the buffer this callback holds.
+    let sync_points = unsafe { SyncPoints::of(spa_buf) };
     // SAFETY: the dequeued buffer stays held for this callback. We reject counts outside the
     // one/two-plane formats this function supports before using PipeWire's array pointer;
     // the sync datas behind the planes never enter the slice.
@@ -1267,15 +1315,17 @@ fn consume_frame(
     // semaphore import would free it, and the perf line below says whether that is owed.
     if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
         let t0 = std::time::Instant::now();
-        // SAFETY: `spa_buf` is the buffer this callback holds.
-        let explicit = ud.sync.as_ref().zip(unsafe { SyncPoints::of(spa_buf) });
+        let explicit = ud.sync.as_ref().zip(sync_points);
         let waited = match &explicit {
             Some((dev, p)) => dev.wait(
                 p.acquire_fd,
                 p.acquire_point,
                 std::time::Duration::from_millis(100),
             ),
-            None => pf_zerocopy::dmabuf_fence::wait_read_ready(datas[0].fd(), 100),
+            None => match data_fd(&datas[0]) {
+                Some(plane) => pf_zerocopy::dmabuf_fence::wait_read_ready(plane, 100),
+                None => Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+            },
         };
         ud.fence_wait.record(t0.elapsed().as_micros() as u64);
         match waited {
@@ -1406,18 +1456,10 @@ fn consume_frame(
             // frame is published only under a hold, so the producer can never rewrite a
             // DMA-BUF the encoder still reads. No hold — shallow pool or
             // PUNKTFUNK_ZEROCOPY_HOLD=0 — is a safe CPU fallback, never an unsafe publish.
-
-            // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
-            // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
-            // touches no Rust memory, and returns a fresh independent CLOEXEC duplicate (or -1).
-            // The original stays owned by PipeWire; the dup is a new fd we own (checked >= 0).
-            let dup = unsafe { libc::fcntl(datas[0].fd() as i32, libc::F_DUPFD_CLOEXEC, 0) };
-            if dup < 0 {
+            let Some(dup) = dup_data_fd(&datas[0]) else {
                 break 'passthrough PassthroughFallback::DupFailed;
-            }
+            };
             let Some(hold) = ud.try_defer(pw_buf, stream) else {
-                // SAFETY: `dup` is ours and was not published.
-                unsafe { libc::close(dup) };
                 // A shortage, not a broken frame: drop it as the import lane does — the slot
                 // keeps its frame, the next arrival takes the hold that comes back. The CPU
                 // copy on this thread starves the requeues that would end the shortage; a
@@ -1436,11 +1478,7 @@ fn consume_frame(
                 pts_ns,
                 format: fmt,
                 payload: FramePayload::Dmabuf(DmabufFrame {
-                    // SAFETY: `dup` is the fresh fd `fcntl(F_DUPFD_CLOEXEC)` just returned
-                    // (checked `dup >= 0`); nothing else owns it, so `OwnedFd` takes sole
-                    // ownership and closes it exactly once on drop — no alias, no
-                    // double-close.
-                    fd: unsafe { OwnedFd::from_raw_fd(dup) },
+                    fd: dup,
                     fourcc,
                     modifier: ud.modifier,
                     offset,
@@ -1469,7 +1507,8 @@ fn consume_frame(
                     h,
                     offset,
                     stride,
-                    fd_size = dmabuf_len(dup),
+                    // The held buffer's own fd: the consumer may already have closed the dup.
+                    fd_size = dmabuf_len(datas[0].fd() as i32),
                     modifier = ud.modifier,
                     fourcc = format_args!("{:#010x}", fourcc),
                     source = match fmt {
@@ -1514,10 +1553,7 @@ fn consume_frame(
                     offset: datas[0].chunk().offset(),
                     stride: datas[0].chunk().stride().max(0) as u32,
                 };
-                // SAFETY: `fd` is the producer's open dmabuf for this buffer; F_DUPFD_CLOEXEC
-                // only creates a second descriptor.
-                let dup = unsafe { libc::fcntl(datas[0].fd() as i32, libc::F_DUPFD_CLOEXEC, 0) };
-                if dup >= 0 {
+                if let Some(dup) = dup_data_fd(&datas[0]) {
                     if let Some(hold) = ud.try_defer(pw_buf, stream) {
                         ud.publish(CapturedFrame {
                             provenance: Default::default(),
@@ -1526,8 +1562,7 @@ fn consume_frame(
                             pts_ns,
                             format: fmt,
                             payload: FramePayload::Dmabuf(DmabufFrame {
-                                // SAFETY: `dup` is a fresh descriptor this frame owns.
-                                fd: unsafe { OwnedFd::from_raw_fd(dup) },
+                                fd: dup,
                                 fourcc,
                                 modifier: ud.modifier,
                                 offset: plane.offset,
@@ -1541,8 +1576,6 @@ fn consume_frame(
                         });
                         return;
                     }
-                    // SAFETY: `dup` is ours and nothing else saw it.
-                    unsafe { libc::close(dup) };
                     if holds_possible(zerocopy_hold_enabled(), ud.pool.live) {
                         ud.held_drops += 1;
                         return;
@@ -2170,7 +2203,7 @@ pub fn pipewire_thread(
                 }
                 // SAFETY: `newest` was dequeued from this stream and not yet requeued; we immediately
                 // overwrite it, so the requeued pointer is never touched again.
-                unsafe { hand_back(ud.sync.as_deref(), stream.as_raw_ptr(), newest) };
+                unsafe { ud.requeue_unpublished(stream.as_raw_ptr(), newest) };
                 newest = next;
                 drained += 1;
             }
@@ -2233,7 +2266,7 @@ pub fn pipewire_thread(
                     }
                     // SAFETY: `newest` was dequeued from this stream and not yet requeued;
                     // requeued exactly once here, then never touched (mirrors the null path).
-                    unsafe { hand_back(ud.sync.as_deref(), stream.as_raw_ptr(), newest) };
+                    unsafe { ud.requeue_unpublished(stream.as_raw_ptr(), newest) };
                     return;
                 }
             }

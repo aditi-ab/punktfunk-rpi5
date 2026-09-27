@@ -51,7 +51,8 @@ pub unsafe extern "C" fn device_d0_entry(
         crate::monitor::cleanup_for_device_removal();
         crate::adapter::clear_adapter();
     }
-    crate::adapter::init_adapter(device)
+    // SAFETY: `device` is the framework's live WDFDEVICE for this D0 entry.
+    unsafe { crate::adapter::init_adapter(device) }
 }
 
 /// Async completion of `IddCxAdapterInitAsync`: stash the adapter for later DDIs — IFF the init
@@ -135,11 +136,13 @@ fn present_seat_display(stop: HANDLE) {
     if let Some((id, ..)) = made
         && let Some(object) = crate::registry::find(|m| m.id == id).and_then(|m| m.object())
     {
-        let mut path = pod_init!(iddcx::IDDCX_DISPLAYCONFIGPATH2);
-        path.Size = core::mem::size_of::<iddcx::IDDCX_DISPLAYCONFIGPATH2>() as u32;
-        path.Flags = iddcx::IDDCX_DISPLAYCONFIGPATH2_FLAGS::IDDCX_DISPLAYCONFIGPATH2_FLAGS_MODE_VALID
-            | iddcx::IDDCX_DISPLAYCONFIGPATH2_FLAGS::IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_SCALE_FACTOR_VALID;
-        path.MonitorObject = object;
+        let mut path = iddcx::IDDCX_DISPLAYCONFIGPATH2 {
+            Size: core::mem::size_of::<iddcx::IDDCX_DISPLAYCONFIGPATH2>() as u32,
+            Flags: iddcx::IDDCX_DISPLAYCONFIGPATH2_FLAGS::IDDCX_DISPLAYCONFIGPATH2_FLAGS_MODE_VALID
+                | iddcx::IDDCX_DISPLAYCONFIGPATH2_FLAGS::IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_SCALE_FACTOR_VALID,
+            MonitorObject: object,
+            ..Default::default()
+        };
         path.Mode.Resolution.cx = w;
         path.Mode.Resolution.cy = h;
         path.Mode.Rotation = 1; // DISPLAYCONFIG_ROTATION_IDENTITY
@@ -191,22 +194,22 @@ pub unsafe extern "C" fn device_cleanup(_object: WDFOBJECT) {
 
 /// One `IDDCX_MONITOR_MODE` (SDR) for the description mode list.
 fn monitor_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_MONITOR_MODE {
-    let mut mode = pod_init!(iddcx::IDDCX_MONITOR_MODE);
-    mode.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE>() as u32;
-    mode.Origin = iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-    mode.MonitorVideoSignalInfo = crate::monitor::display_info(width, height, refresh_rate);
-    mode
+    iddcx::IDDCX_MONITOR_MODE {
+        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE>() as u32,
+        Origin: iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR,
+        MonitorVideoSignalInfo: crate::monitor::display_info(width, height, refresh_rate),
+    }
 }
 
 /// One `IDDCX_MONITOR_MODE2`: the SDR mode plus the per-mode wire bit-depth, which is what makes the
 /// OS offer HDR10 modes on this monitor.
 fn monitor_mode2(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_MONITOR_MODE2 {
-    let mut mode = pod_init!(iddcx::IDDCX_MONITOR_MODE2);
-    mode.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE2>() as u32;
-    mode.Origin = iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-    mode.MonitorVideoSignalInfo = crate::monitor::display_info(width, height, refresh_rate);
-    mode.BitsPerComponent = crate::monitor::wire_bits();
-    mode
+    iddcx::IDDCX_MONITOR_MODE2 {
+        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE2>() as u32,
+        Origin: iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR,
+        MonitorVideoSignalInfo: crate::monitor::display_info(width, height, refresh_rate),
+        BitsPerComponent: crate::monitor::wire_bits(),
+    }
 }
 
 /// The body both `EvtIddCxParseMonitorDescription` variants share: the EDID serial selects the
@@ -410,23 +413,24 @@ pub unsafe extern "C" fn monitor_query_modes2(
     }
 }
 
-/// Read an `IDDCX_PATH*`'s `Flags` field as its underlying `u32`, without depending on the bindgen
-/// enum shape (newtype vs constified int): the field is a 4-byte `#[repr]` over `u32` either way, so
-/// a byte-read of it is the flag bits. `IDDCX_PATH_FLAGS_CHANGED = 0x1`, `_ACTIVE = 0x2` (IddCx.h).
+/// The framework's `pPaths` array as a slice; empty when `ptr` is null.
 ///
 /// # Safety
-/// `flags` must point at a live `IDDCX_PATH{,2}::Flags` field (4 readable bytes).
-unsafe fn path_flag_bits<T>(flags: &T) -> u32 {
-    // SAFETY: the caller passes a live `Flags` field; every IDDCX_PATH_FLAGS binding is a 4-byte
-    // scalar over u32, so reading it as u32 yields the flag bits regardless of the wrapper shape.
-    unsafe { core::ptr::read((flags as *const T).cast::<u32>()) }
+/// A non-null `ptr` must point at `count` initialized entries that outlive the returned slice.
+unsafe fn path_slice<'a, P>(ptr: *const P, count: u32) -> &'a [P] {
+    if ptr.is_null() {
+        return &[];
+    }
+    // SAFETY: non-null, and per this function's contract `count` initialized entries.
+    unsafe { core::slice::from_raw_parts(ptr, count as usize) }
 }
 
 /// Commit is a no-op for assign to drive — but the OS stamps each path ACTIVE/CHANGED here, and an
 /// active→inactive flip on OUR head (while a sibling stays active) is the driver-visible form of
 /// Enrico's hypothesis: the OS idles the virtual head like a physical one and the drain loop then
 /// sees only E_PENDING with no unassign. Log every commit's per-path flags so a hole can be lined
-/// up against a path the OS just deactivated. Low frequency (topology changes only).
+/// up against a path the OS just deactivated. Low frequency (topology changes only). `Flags` is a
+/// plain integer (bindgen `ModuleConsts`): `IDDCX_PATH_FLAGS_CHANGED = 0x1`, `_ACTIVE = 0x2`.
 pub unsafe extern "C" fn adapter_commit_modes(
     _adapter: iddcx::IDDCX_ADAPTER,
     p_in: *const iddcx::IDARG_IN_COMMITMODES,
@@ -434,11 +438,12 @@ pub unsafe extern "C" fn adapter_commit_modes(
     // SAFETY: the framework supplies a valid, live input-args pointer for the call.
     let in_args = unsafe { &*p_in };
     let count = in_args.PathCount;
-    for i in 0..count as usize {
-        // SAFETY: `pPaths` points to `PathCount` valid `IDDCX_PATH` entries (framework contract).
-        let path = unsafe { &*in_args.pPaths.add(i) };
-        // SAFETY: `path.Flags` is a live IDDCX_PATH_FLAGS field on the framework's path array.
-        let bits = unsafe { path_flag_bits(&path.Flags) };
+    // SAFETY: `pPaths` points to `PathCount` valid `IDDCX_PATH` entries (framework contract).
+    for (i, path) in unsafe { path_slice(in_args.pPaths, count) }
+        .iter()
+        .enumerate()
+    {
+        let bits = path.Flags;
         dbglog!(
             "[pf-vd] commit_modes: path[{i}/{count}] monitor={:?} active={} changed={} flags={bits:#x}",
             path.MonitorObject,
@@ -459,11 +464,12 @@ pub unsafe extern "C" fn adapter_commit_modes2(
     // SAFETY: the framework supplies a valid, live input-args pointer for the call.
     let in_args = unsafe { &*p_in };
     let count = in_args.PathCount;
-    for i in 0..count as usize {
-        // SAFETY: `pPaths` points to `PathCount` valid `IDDCX_PATH2` entries (framework contract).
-        let path = unsafe { &*in_args.pPaths.add(i) };
-        // SAFETY: `path.Flags` is a live IDDCX_PATH_FLAGS field on the framework's path array.
-        let bits = unsafe { path_flag_bits(&path.Flags) };
+    // SAFETY: `pPaths` points to `PathCount` valid `IDDCX_PATH2` entries (framework contract).
+    for (i, path) in unsafe { path_slice(in_args.pPaths, count) }
+        .iter()
+        .enumerate()
+    {
+        let bits = path.Flags;
         dbglog!(
             "[pf-vd] commit_modes2: path[{i}/{count}] monitor={:?} active={} changed={} flags={bits:#x}",
             path.MonitorObject,
@@ -482,7 +488,7 @@ pub unsafe extern "C" fn query_target_info(
 ) -> NTSTATUS {
     // SAFETY: p_out is the framework's (uninitialised) out buffer; zero then set the one field we report.
     unsafe {
-        core::ptr::write(p_out, pod_init!(iddcx::IDARG_OUT_QUERYTARGET_INFO));
+        core::ptr::write(p_out, iddcx::IDARG_OUT_QUERYTARGET_INFO::default());
         (*p_out).TargetCaps = iddcx::IDDCX_TARGET_CAPS::IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE;
     }
     STATUS_SUCCESS

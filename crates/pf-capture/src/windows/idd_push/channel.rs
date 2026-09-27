@@ -57,22 +57,19 @@ impl ChannelBroker {
     /// Duplicate `h` into the WUDFHost table. The returned value is valid only there.
     /// `Some(rights)` grants exactly those rights; `None` copies the source
     /// (`DUPLICATE_SAME_ACCESS`).
-    ///
-    /// # Safety
-    /// `h` must be a live handle of the current process.
-    pub(super) unsafe fn dup_into(&self, h: HANDLE, access: Option<u32>) -> Result<u64> {
+    pub(super) fn dup_into(&self, h: BorrowedHandle<'_>, access: Option<u32>) -> Result<u64> {
         let mut out = HANDLE::default();
         let (desired, options) = match access {
             Some(rights) => (rights, DUPLICATE_HANDLE_OPTIONS(0)),
             None => (0, DUPLICATE_SAME_ACCESS),
         };
-        // SAFETY: `h` is live per the contract; `self.process` is the live PROCESS_DUP_HANDLE
+        // SAFETY: `h` is borrowed, so live; `self.process` is the live PROCESS_DUP_HANDLE
         // target; `&mut out` is a valid out-param. Explicit mask (options == 0) or
         // `DUPLICATE_SAME_ACCESS` (desired ignored) — never both.
         unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
-                h,
+                HANDLE(h.as_raw_handle()),
                 HANDLE(self.process.as_raw_handle()),
                 &mut out,
                 desired,
@@ -86,12 +83,8 @@ impl ChannelBroker {
 
     /// Duplicate a cursor section into WUDFHost with the same `SECTION_MAP_RW` as the
     /// AU section.
-    ///
-    /// # Safety
-    /// `h` must be a live handle of the current process.
-    pub(super) unsafe fn dup_into_public(&self, h: HANDLE) -> Result<u64> {
-        // SAFETY: forwarded — `h` is live per this fn's contract.
-        unsafe { self.dup_into(h, Some(SECTION_MAP_RW)) }
+    pub(super) fn dup_into_public(&self, h: BorrowedHandle<'_>) -> Result<u64> {
+        self.dup_into(h, Some(SECTION_MAP_RW))
     }
 
     /// Failure-path reaper for a cursor-channel duplicate the driver never adopted.

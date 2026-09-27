@@ -21,7 +21,7 @@ use ash::vk;
 use pf_client_core::video::DmabufFrame;
 use pf_client_core::video::{CpuPlanarFrame, DecodedImage, NativeVkFrame};
 
-mod gpu;
+pub(crate) mod gpu;
 mod overlay_pipe;
 mod present;
 mod present_timing;
@@ -291,7 +291,8 @@ pub struct Presenter {
     /// Submit fence has work pending. Wait before recording; also what makes the single
     /// staging buffer safe to overwrite.
     submitted: bool,
-    /// Swapchain image taken by the non-blocking probe, waiting for its present.
+    /// Swapchain image acquired and not yet submitted: the non-blocking probe's, or one an
+    /// error left behind. Its `acquire_sem` signal is pending until a batch waits it.
     acquired: Option<u32>,
     /// `VK_KHR_present_wait` on-glass timing. `None` without present-id/present-wait;
     /// the run loop then keeps its submit-time display stamp.
@@ -474,6 +475,11 @@ impl Drop for Presenter {
                 // Against a straggling submitter. The run loop joins the pump first, so
                 // this is normally uncontended.
                 let _q = self.queue_lock.guard();
+                // A held image's semaphore signal must not outlive the semaphore. The
+                // `queue_lock` held here is `retire_acquire_sem`'s contract.
+                if self.acquired.take().is_some() {
+                    self.retire_acquire_sem().ok();
+                }
                 self.device.device_wait_idle().ok();
             }
             if let Some(f) = self.retired_hw.take() {
@@ -491,19 +497,10 @@ impl Drop for Presenter {
                 }
             }
             if let Some(s) = self.staging.take() {
-                self.device.unmap_memory(s.memory);
-                self.device.destroy_buffer(s.buffer, None);
-                self.device.free_memory(s.memory, None);
+                s.destroy(&self.device);
             }
             if let Some(v) = self.video.take() {
-                if v.framebuffer != vk::Framebuffer::null() {
-                    self.device.destroy_framebuffer(v.framebuffer, None);
-                }
-                if v.view != vk::ImageView::null() {
-                    self.device.destroy_image_view(v.view, None);
-                }
-                self.device.destroy_image(v.image, None);
-                self.device.free_memory(v.memory, None);
+                v.destroy(&self.device);
             }
             #[cfg(target_os = "linux")]
             self.hw.take();

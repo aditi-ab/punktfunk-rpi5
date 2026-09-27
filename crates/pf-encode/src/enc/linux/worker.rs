@@ -289,16 +289,7 @@ pub(crate) fn send_eintr<T: Serialize>(
 
 /// Grows on `pwrite`; callers never size it.
 fn memfd(name: &CStr) -> io::Result<File> {
-    // SAFETY: `memfd_create` reads a NUL-terminated name (a live `CStr` for the duration of the
-    // call) and returns a fresh descriptor or -1; it retains no pointer. The result is checked
-    // before use, and the returned fd is owned by nobody else, so `File::from_raw_fd` takes sole
-    // ownership and closes it exactly once.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is the fresh, valid descriptor just created and checked above.
-    Ok(unsafe { File::from_raw_fd(fd) })
+    Ok(rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC)?.into())
 }
 
 pub(crate) fn cursor_upload(rgba: &[u8]) -> io::Result<(File, usize)> {

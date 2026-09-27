@@ -199,7 +199,8 @@ pub fn probe(verb: PowerVerb) -> Availability {
 /// The reason string is what the system event log records.
 #[cfg(target_os = "windows")]
 pub fn act(verb: PowerVerb) -> Result<(), String> {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+    use windows::core::Owned;
+    use windows::Win32::Foundation::{HANDLE, LUID};
     use windows::Win32::Security::{
         AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
         SE_SHUTDOWN_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
@@ -216,7 +217,8 @@ pub fn act(verb: PowerVerb) -> Result<(), String> {
         std::process::exit(RESTART_EXIT_CODE as i32);
     }
 
-    // SAFETY: privilege-enable on our own process token; CloseHandle on every path.
+    // SAFETY: privilege-enable on our own process token, adopted by `Owned` once the open
+    // succeeds so it closes on every path.
     unsafe {
         let mut token = HANDLE::default();
         OpenProcessToken(
@@ -225,20 +227,20 @@ pub fn act(verb: PowerVerb) -> Result<(), String> {
             &mut token,
         )
         .map_err(|e| format!("OpenProcessToken: {e}"))?;
+        let token = Owned::new(token);
         let mut luid = LUID::default();
-        let looked_up = LookupPrivilegeValueW(None, SE_SHUTDOWN_NAME, &mut luid);
-        let adjusted = looked_up.and_then(|()| {
-            let privs = TOKEN_PRIVILEGES {
-                PrivilegeCount: 1,
-                Privileges: [LUID_AND_ATTRIBUTES {
-                    Luid: luid,
-                    Attributes: SE_PRIVILEGE_ENABLED,
-                }],
-            };
-            AdjustTokenPrivileges(token, false, Some(&raw const privs), 0, None, None)
-        });
-        let _ = CloseHandle(token);
-        adjusted.map_err(|e| format!("enabling SeShutdownPrivilege: {e}"))?;
+        LookupPrivilegeValueW(None, SE_SHUTDOWN_NAME, &mut luid)
+            .and_then(|()| {
+                let privs = TOKEN_PRIVILEGES {
+                    PrivilegeCount: 1,
+                    Privileges: [LUID_AND_ATTRIBUTES {
+                        Luid: luid,
+                        Attributes: SE_PRIVILEGE_ENABLED,
+                    }],
+                };
+                AdjustTokenPrivileges(*token, false, Some(&raw const privs), 0, None, None)
+            })
+            .map_err(|e| format!("enabling SeShutdownPrivilege: {e}"))?;
     }
 
     match verb {

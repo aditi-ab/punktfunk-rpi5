@@ -9,7 +9,9 @@
 name = "pf-clipboard"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Not workspace-inherited (1.85): the Wayland transfer pipe is `std::io::pipe`, stable in 1.87.
+# rust-toolchain.toml pins 1.96, so this records reality rather than raising it.
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 description = "punktfunk host shared clipboard: per-OS session-clipboard backends behind one HostClipboard + the QUIC clipboard-plane coordinator."
 publish = false

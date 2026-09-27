@@ -12,9 +12,11 @@
 //! [`super::steam_proto`]. The Secure-Boot-clean alternative is
 //! [`super::steam_usbip`].
 
-use anyhow::{bail, Context, Result};
+use crate::uapi;
+use anyhow::{Context, Result};
+use std::fs::File;
 use std::mem::size_of;
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -47,6 +49,11 @@ struct UsbEndpointDescriptor {
     b_refresh: u8,
     b_synch_address: u8,
 }
+
+// SAFETY: byte arrays and a byte; no padding.
+unsafe impl uapi::Pod for UsbRawInit {}
+// SAFETY: `packed` integers, so no padding.
+unsafe impl uapi::Pod for UsbEndpointDescriptor {}
 
 const fn ioc(dir: u64, nr: u64, size: usize) -> libc::c_ulong {
     ((dir << 30) | ((size as u64) << 16) | ((b'U' as u64) << 8) | nr) as libc::c_ulong
@@ -130,55 +137,41 @@ fn string_desc(idx: u8, serial: &str) -> Vec<u8> {
     v
 }
 
-fn ioctl_ptr<T>(fd: RawFd, req: libc::c_ulong, arg: *const T) -> i32 {
-    // SAFETY: `fd` is the open `/dev/raw-gadget`; `arg` is a live, correctly-sized
-    // initialized UAPI struct or `usb_raw_ep_io` buffer for `req`. `ioctl` is
-    // variadic; a thin pointer is the ABI.
-    unsafe { libc::ioctl(fd, req as _, arg) as i32 }
-}
-fn ioctl_mut<T>(fd: RawFd, req: libc::c_ulong, arg: *mut T) -> i32 {
-    // SAFETY: as `ioctl_ptr`, but `arg` is a writable buffer the kernel fills for `req` (EVENT_FETCH / EP0_READ).
-    unsafe { libc::ioctl(fd, req as _, arg) as i32 }
-}
-fn ioctl_val(fd: RawFd, req: libc::c_ulong, val: libc::c_ulong) -> i32 {
-    // SAFETY: `req` (VBUS_DRAW) takes an integer argument by value; `fd` is our descriptor.
-    unsafe { libc::ioctl(fd, req as _, val) as i32 }
-}
-fn ioctl_none(fd: RawFd, req: libc::c_ulong) -> i32 {
-    // SAFETY: `req` (RUN / CONFIGURE / EP0_STALL) takes no argument. raw_gadget EINVAL on a
-    // non-zero `value`; an omitted vararg is an indeterminate register — pass 0.
-    unsafe { libc::ioctl(fd, req as _, 0) as i32 }
+/// One raw_gadget transfer or event fetch. `buf` is the 8-byte header (`usb_raw_ep_io` or
+/// `usb_raw_event`, payload length at bytes 4..8) followed by the payload the kernel copies
+/// in or out. Panics unless `buf` holds that payload. Negative on error, as `ioctl`.
+fn transfer(fd: BorrowedFd<'_>, req: libc::c_ulong, buf: &mut [u8]) -> i32 {
+    let len = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    assert!(
+        buf.len() >= EPIO_HDR + len,
+        "raw_gadget payload overruns its buffer"
+    );
+    // SAFETY: `req` reads the header, then copies at most its `len` payload bytes to or from
+    // the bytes right after it, all inside `buf`, which outlives the synchronous call.
+    unsafe { libc::ioctl(fd.as_raw_fd(), req as _, buf.as_mut_ptr()) }
 }
 
-fn ep0_write(fd: RawFd, data: &[u8]) -> i32 {
+fn ep0_write(fd: BorrowedFd<'_>, data: &[u8]) -> i32 {
     let mut buf = vec![0u8; EPIO_HDR + data.len()];
     buf[0..2].copy_from_slice(&0u16.to_ne_bytes());
     buf[4..8].copy_from_slice(&(data.len() as u32).to_ne_bytes());
     buf[EPIO_HDR..].copy_from_slice(data);
-    ioctl_ptr(fd, IOCTL_EP0_WRITE, buf.as_ptr())
+    transfer(fd, IOCTL_EP0_WRITE, &mut buf)
 }
-fn ep0_read(fd: RawFd, len: usize) -> (i32, Vec<u8>) {
+fn ep0_read(fd: BorrowedFd<'_>, len: usize) -> (i32, Vec<u8>) {
     let mut buf = vec![0u8; EPIO_HDR + len.max(1)];
     buf[4..8].copy_from_slice(&(len as u32).to_ne_bytes());
-    let r = ioctl_mut(fd, IOCTL_EP0_READ, buf.as_mut_ptr());
+    let r = transfer(fd, IOCTL_EP0_READ, &mut buf);
     let n = if r > 0 { r as usize } else { 0 };
     (r, buf[EPIO_HDR..EPIO_HDR + n.min(len.max(1))].to_vec())
 }
 /// Status stage of a no-data OUT is an IN; a zero-length `EP0_READ` completes it.
-fn ep0_ack(fd: RawFd) {
+fn ep0_ack(fd: BorrowedFd<'_>) {
     ep0_read(fd, 0);
 }
-fn ep0_stall(fd: RawFd) {
-    ioctl_none(fd, IOCTL_EP0_STALL);
-}
-
-/// Unique owner of `/dev/raw-gadget`; close tears the gadget down.
-struct GadgetFd(RawFd);
-impl Drop for GadgetFd {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` is the fd we opened in `SteamDeckGadget::open` and own uniquely here.
-        unsafe { libc::close(self.0) };
-    }
+/// raw_gadget fails a no-argument request whose value is not 0.
+fn ep0_stall(fd: BorrowedFd<'_>) {
+    let _ = uapi::ioctl_value(fd, IOCTL_EP0_STALL, 0);
 }
 
 /// Wakes a worker blocked in `EVENT_FETCH`/`EP_WRITE` at teardown.
@@ -222,7 +215,8 @@ pub struct SteamDeckGadget {
     running: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     wakers: Vec<Waker>,
-    _fd: Arc<GadgetFd>,
+    /// Closing `/dev/raw-gadget` tears the gadget down.
+    _fd: Arc<File>,
     seq: u32,
 }
 
@@ -230,28 +224,24 @@ impl SteamDeckGadget {
     /// Bind a Deck on `dummy_udc.0`. `index` only changes the serial.
     /// Needs `dummy_hcd` + `raw_gadget` and write access to `/dev/raw-gadget`.
     pub fn open(index: u8) -> Result<SteamDeckGadget> {
-        // SAFETY: opening a constant NUL-terminated device path with O_RDWR; returns a fd or -1.
-        let fd = unsafe { libc::open(c"/dev/raw-gadget".as_ptr(), libc::O_RDWR) };
-        if fd < 0 {
-            bail!(
-                "open /dev/raw-gadget ({}) — is raw_gadget+dummy_hcd loaded and are we root?",
-                std::io::Error::last_os_error()
-            );
-        }
-        let fd = Arc::new(GadgetFd(fd));
-        let raw = fd.0;
+        // std opens CLOEXEC: a spawned game must not inherit the gadget and keep it bound
+        // past our drop.
+        let fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/raw-gadget")
+            .context("open /dev/raw-gadget (is raw_gadget+dummy_hcd loaded, are we root?)")?;
+        let fd = Arc::new(fd);
 
-        // SAFETY: `UsbRawInit` is a plain-old-data struct (byte arrays + u8); all-zero is a valid value.
-        let mut init: UsbRawInit = unsafe { std::mem::zeroed() };
+        let mut init = UsbRawInit {
+            driver_name: [0; UDC_NAME_MAX],
+            device_name: [0; UDC_NAME_MAX],
+            speed: USB_SPEED_HIGH,
+        };
         copy_cstr(&mut init.driver_name, "dummy_udc");
         copy_cstr(&mut init.device_name, "dummy_udc.0");
-        init.speed = USB_SPEED_HIGH;
-        if ioctl_ptr(raw, IOCTL_INIT, &init as *const _) < 0 {
-            bail!("raw_gadget INIT: {}", std::io::Error::last_os_error());
-        }
-        if ioctl_none(raw, IOCTL_RUN) < 0 {
-            bail!("raw_gadget RUN: {}", std::io::Error::last_os_error());
-        }
+        uapi::ioctl_with(fd.as_fd(), IOCTL_INIT, &mut init).context("raw_gadget INIT")?;
+        uapi::ioctl_value(fd.as_fd(), IOCTL_RUN, 0).context("raw_gadget RUN")?;
 
         let serial = deck_serial(index);
         let unit_id = deck_unit_id(index);
@@ -290,12 +280,20 @@ impl SteamDeckGadget {
                 })
                 .context("spawn gadget control thread")?
         };
+        // Built before the second spawn: if that fails, `Drop` stops and joins the first.
+        let mut gadget = SteamDeckGadget {
+            report,
+            feedback,
+            running,
+            threads: vec![control],
+            wakers: vec![ctrl_waker],
+            _fd: fd,
+            seq: 0,
+        };
         let stream = {
-            let fd = fd.clone();
-            let running = running.clone();
-            let ctrl_ep = ctrl_ep.clone();
-            let configured = configured.clone();
-            let report = report.clone();
+            let fd = gadget._fd.clone();
+            let running = gadget.running.clone();
+            let report = gadget.report.clone();
             let tid = stream_waker.tid.clone();
             let done = stream_waker.done.clone();
             std::thread::Builder::new()
@@ -308,16 +306,9 @@ impl SteamDeckGadget {
                 })
                 .context("spawn gadget stream thread")?
         };
-
-        Ok(SteamDeckGadget {
-            report,
-            feedback,
-            running,
-            threads: vec![control, stream],
-            wakers: vec![ctrl_waker, stream_waker],
-            _fd: fd,
-            seq: 0,
-        })
+        gadget.threads.push(stream);
+        gadget.wakers.push(stream_waker);
+        Ok(gadget)
     }
 
     pub fn write_state(&mut self, st: &super::steam_proto::SteamState) {
@@ -374,7 +365,7 @@ fn copy_cstr(dst: &mut [u8], s: &str) {
 }
 
 fn control_loop(
-    fd: Arc<GadgetFd>,
+    file: Arc<File>,
     running: Arc<AtomicBool>,
     ctrl_ep: Arc<std::sync::atomic::AtomicI32>,
     configured: Arc<AtomicBool>,
@@ -382,13 +373,13 @@ fn control_loop(
     serial: String,
     unit_id: u32,
 ) {
-    let raw = fd.0;
+    let fd = file.as_fd();
     let cfg = build_config();
     let mut last_set: Vec<u8> = Vec::new();
     let mut evbuf = [0u8; EVENT_BUF];
     while running.load(Ordering::SeqCst) {
         evbuf[4..8].copy_from_slice(&(8u32).to_ne_bytes()); // setup packet is 8 bytes
-        let r = ioctl_mut(raw, IOCTL_EVENT_FETCH, evbuf.as_mut_ptr());
+        let r = transfer(fd, IOCTL_EVENT_FETCH, &mut evbuf);
         if r < 0 {
             if running.load(Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(2));
@@ -408,7 +399,7 @@ fn control_loop(
                     w_length: u16::from_le_bytes([s[6], s[7]]),
                 };
                 handle_control(
-                    raw,
+                    fd,
                     &ctrl,
                     &cfg,
                     &serial,
@@ -434,7 +425,7 @@ struct Setup {
 
 #[allow(clippy::too_many_arguments)]
 fn handle_control(
-    raw: RawFd,
+    fd: BorrowedFd<'_>,
     ctrl: &Setup,
     cfg: &[u8],
     serial: &str,
@@ -465,27 +456,27 @@ fn handle_control(
                     },
                     HID_DT => hid_desc_for(cfg, idx),
                     _ => {
-                        ep0_stall(raw);
+                        ep0_stall(fd);
                         return;
                     }
                 };
                 let n = resp.len().min(wl);
-                ep0_write(raw, &resp[..n]);
+                ep0_write(fd, &resp[..n]);
             }
             0x09 => {
                 // SET_CONFIGURATION
-                ioctl_val(raw, IOCTL_VBUS_DRAW, 0x32);
-                ioctl_none(raw, IOCTL_CONFIGURE);
-                enable_endpoints(raw, ctrl_ep);
-                ep0_ack(raw);
+                let _ = uapi::ioctl_value(fd, IOCTL_VBUS_DRAW, 0x32);
+                let _ = uapi::ioctl_value(fd, IOCTL_CONFIGURE, 0);
+                enable_endpoints(fd, ctrl_ep);
+                ep0_ack(fd);
                 configured.store(true, Ordering::SeqCst);
             }
-            0x0b => ep0_ack(raw), // SET_INTERFACE
+            0x0b => ep0_ack(fd), // SET_INTERFACE
             0x00 => {
                 let st = 0u16;
-                ep0_write(raw, &st.to_le_bytes());
+                ep0_write(fd, &st.to_le_bytes());
             }
-            _ => ep0_stall(raw),
+            _ => ep0_stall(fd),
         }
     } else if type_class == 0x20 {
         // HID class
@@ -494,11 +485,11 @@ fn handle_control(
                 // GET_REPORT — feature reply for the last SET_REPORT
                 let resp = feature_reply(last_set, serial, unit_id);
                 let n = resp.len().min(wl);
-                ep0_write(raw, &resp[..n]);
+                ep0_write(fd, &resp[..n]);
             }
             0x09 => {
                 // SET_REPORT
-                let (r, data) = ep0_read(raw, wl);
+                let (r, data) = ep0_read(fd, wl);
                 if r > 0 {
                     *last_set = data.clone();
                     // parse_steam_output expects [report-id(0), cmd, …]; EP0 OUT data is [cmd, …].
@@ -513,14 +504,14 @@ fn handle_control(
                     }
                 }
             }
-            0x0a | 0x0b => ep0_ack(raw), // SET_IDLE / SET_PROTOCOL
+            0x0a | 0x0b => ep0_ack(fd), // SET_IDLE / SET_PROTOCOL
             0x03 => {
-                ep0_write(raw, &[0u8]);
+                ep0_write(fd, &[0u8]);
             } // GET_PROTOCOL
-            _ => ep0_stall(raw),
+            _ => ep0_stall(fd),
         }
     } else {
-        ep0_stall(raw);
+        ep0_stall(fd);
     }
 }
 
@@ -537,33 +528,33 @@ fn hid_desc_for(cfg: &[u8], idx: u8) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn enable_endpoints(raw: RawFd, ctrl_ep: &std::sync::atomic::AtomicI32) {
-    let mk = |addr: u8, mps: u16| UsbEndpointDescriptor {
-        b_length: 7,
-        b_descriptor_type: 5,
-        b_endpoint_address: addr,
-        bm_attributes: 0x03,
-        w_max_packet_size: mps,
-        b_interval: 4,
-        ..Default::default()
+/// Enable the three interrupt-IN endpoints; the controller's handle, or -1, lands in `ctrl_ep`.
+fn enable_endpoints(fd: BorrowedFd<'_>, ctrl_ep: &std::sync::atomic::AtomicI32) {
+    let enable = |addr: u8, mps: u16| {
+        let mut ep = UsbEndpointDescriptor {
+            b_length: 7,
+            b_descriptor_type: 5,
+            b_endpoint_address: addr,
+            bm_attributes: 0x03,
+            w_max_packet_size: mps,
+            b_interval: 4,
+            ..Default::default()
+        };
+        uapi::ioctl_with(fd, IOCTL_EP_ENABLE, &mut ep).unwrap_or(-1)
     };
-    let e0 = mk(0x81, 8);
-    let e1 = mk(0x82, 8);
-    let e2 = mk(0x83, 64);
-    ioctl_ptr(raw, IOCTL_EP_ENABLE, &e0 as *const _);
-    ioctl_ptr(raw, IOCTL_EP_ENABLE, &e1 as *const _);
-    let h2 = ioctl_ptr(raw, IOCTL_EP_ENABLE, &e2 as *const _);
-    ctrl_ep.store(h2, Ordering::SeqCst);
+    enable(0x81, 8);
+    enable(0x82, 8);
+    ctrl_ep.store(enable(0x83, 64), Ordering::SeqCst);
 }
 
 fn stream_loop(
-    fd: Arc<GadgetFd>,
+    file: Arc<File>,
     running: Arc<AtomicBool>,
     ctrl_ep: Arc<std::sync::atomic::AtomicI32>,
     configured: Arc<AtomicBool>,
     report: Arc<Mutex<[u8; 64]>>,
 ) {
-    let raw = fd.0;
+    let fd = file.as_fd();
     while running.load(Ordering::SeqCst) {
         let ep = ctrl_ep.load(Ordering::SeqCst);
         if configured.load(Ordering::SeqCst) && ep >= 0 {
@@ -576,7 +567,7 @@ fn stream_loop(
             buf[4..8].copy_from_slice(&(64u32).to_ne_bytes());
             buf[EPIO_HDR..].copy_from_slice(&r);
             // EP_WRITE blocks until the host polls interrupt-IN; this loop has its own thread.
-            ioctl_ptr(raw, IOCTL_EP_WRITE, buf.as_ptr());
+            transfer(fd, IOCTL_EP_WRITE, &mut buf);
         }
         std::thread::sleep(std::time::Duration::from_millis(8));
     }

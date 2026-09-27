@@ -19,23 +19,26 @@ use crate::pad_slots::PadCreateFault;
 use anyhow::{anyhow, Context, Result};
 use pf_driver_proto::gamepad::{PadBootstrap, BOOT_MAGIC, GAMEPAD_PROTO_VERSION};
 use std::ffi::c_void;
+use std::marker::PhantomData;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
-use windows::core::{w, HRESULT, HSTRING, PCWSTR};
+use windows::core::{w, GUID, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_PropertyW, CM_Get_DevNode_Status, CM_Locate_DevNodeW, CM_DEVNODE_STATUS_FLAGS,
     CM_LOCATE_DEVNODE_NORMAL, CM_PROB, CR_SUCCESS, DN_DRIVER_LOADED, DN_HAS_PROBLEM, DN_STARTED,
 };
-use windows::Win32::Devices::Enumeration::Pnp::{SwDeviceClose, HSWDEVICE};
+use windows::Win32::Devices::Enumeration::Pnp::{
+    SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
+};
 use windows::Win32::Devices::Properties::{
     DEVPKEY_Device_HardwareIds, DEVPROPTYPE, DEVPROP_TYPE_STRING_LIST,
 };
 use windows::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, LocalFree, SetLastError, DUPLICATE_HANDLE_OPTIONS,
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WIN32_ERROR,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, E_FAIL, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -45,7 +48,9 @@ use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
     FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, SetEvent, WaitForSingleObject,
+};
 
 /// `SECTION_MAP_READ | SECTION_MAP_WRITE` — what the pad driver maps. Granted in
 /// [`PadChannel::deliver_to`] instead of `DUPLICATE_SAME_ACCESS`, so the remote handle
@@ -58,6 +63,79 @@ pub(super) struct Shm {
     /// Duplication source for the sealed channel.
     handle: OwnedHandle,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
+    /// Bytes mapped at `view`.
+    len: usize,
+}
+
+/// Bounds-checked view of a mapped section, borrowed from the [`Shm`] that keeps it mapped.
+/// Words the driver also writes go through aligned atomics; report bodies are plain copies,
+/// ordered by the sequence word or seqlock around them. Every accessor panics out of range.
+#[derive(Clone, Copy)]
+pub(super) struct SectionView<'a> {
+    base: *mut u8,
+    len: usize,
+    _mapping: PhantomData<&'a [u8]>,
+}
+
+impl<'a> SectionView<'a> {
+    /// A test buffer standing in for a section.
+    #[cfg(test)]
+    pub(super) fn over(buf: &'a mut [u32]) -> SectionView<'a> {
+        SectionView {
+            base: buf.as_mut_ptr().cast(),
+            len: std::mem::size_of_val(buf),
+            _mapping: PhantomData,
+        }
+    }
+
+    /// `len` bytes at `off`, asserted inside the view.
+    fn range(&self, off: usize, len: usize) -> *mut u8 {
+        let end = off.checked_add(len);
+        assert!(
+            end.is_some_and(|e| e <= self.len),
+            "section range {off}+{len} out of bounds"
+        );
+        self.base.wrapping_add(off)
+    }
+
+    /// The atomic word at `off`, asserted in bounds and aligned.
+    fn word<T>(&self, off: usize) -> *const T {
+        let p = self.range(off, size_of::<T>());
+        assert!(
+            p as usize % align_of::<T>() == 0,
+            "section word {off} misaligned"
+        );
+        p.cast()
+    }
+
+    pub(super) fn load_u32(&self, off: usize, order: Ordering) -> u32 {
+        // SAFETY: `word` proved an aligned word inside the live mapping; both sides touch it
+        // only atomically.
+        unsafe { (*self.word::<AtomicU32>(off)).load(order) }
+    }
+
+    pub(super) fn store_u32(&self, off: usize, value: u32, order: Ordering) {
+        // SAFETY: as `load_u32`.
+        unsafe { (*self.word::<AtomicU32>(off)).store(value, order) }
+    }
+
+    pub(super) fn store_u64(&self, off: usize, value: u64, order: Ordering) {
+        // SAFETY: as `load_u32`, for an 8-aligned word.
+        unsafe { (*self.word::<AtomicU64>(off)).store(value, order) }
+    }
+
+    pub(super) fn write_bytes(&self, off: usize, src: &[u8]) {
+        let dst = self.range(off, src.len());
+        // SAFETY: `range` proved `dst` inside the live mapping, which no Rust reference
+        // overlaps; `src` is a separate allocation.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) }
+    }
+
+    pub(super) fn read_bytes(&self, off: usize, dst: &mut [u8]) {
+        let src = self.range(off, dst.len());
+        // SAFETY: as `write_bytes`, copying the other way.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) }
+    }
 }
 
 /// SDDL `SECURITY_ATTRIBUTES` plus the `LocalAlloc`'d descriptor it points at.
@@ -186,12 +264,23 @@ impl Shm {
             // SAFETY: `view` points at `size` writable bytes (just mapped).
             unsafe { core::ptr::write_bytes(view.Value as *mut u8, 0, size) };
         }
-        Ok((Shm { handle, view }, existed))
+        Ok((
+            Shm {
+                handle,
+                view,
+                len: size,
+            },
+            existed,
+        ))
     }
 
-    /// Mapped base. Stable for this `Shm`'s lifetime — `MapViewOfFile` pins the address.
-    pub(super) fn base(&self) -> *mut u8 {
-        self.view.Value as *mut u8
+    /// The mapping, stable for this `Shm`'s lifetime (`MapViewOfFile` pins the address).
+    pub(super) fn view(&self) -> SectionView<'_> {
+        SectionView {
+            base: self.view.Value.cast(),
+            len: self.len,
+            _mapping: PhantomData,
+        }
     }
 
     fn raw_handle(&self) -> HANDLE {
@@ -352,18 +441,19 @@ impl PadChannel {
             &HSTRING::from(boot_name.as_str()),
             core::mem::size_of::<PadBootstrap>(),
         )?;
-        let base = boot.base();
-        // SAFETY: `base` is the live, page-aligned mailbox view (>= size_of::<PadBootstrap>()); the
-        // field offsets are pinned by the proto's asserts and naturally aligned, so the atomic views
-        // are valid. `host_proto` is published BEFORE `magic` (Release) — a driver that observes the
-        // magic (Acquire) sees the version.
-        unsafe {
-            (*(base.add(core::mem::offset_of!(PadBootstrap, host_proto)) as *const AtomicU32))
-                .store(GAMEPAD_PROTO_VERSION, Ordering::Relaxed);
-            fence(Ordering::Release);
-            (*(base.add(core::mem::offset_of!(PadBootstrap, magic)) as *const AtomicU32))
-                .store(BOOT_MAGIC, Ordering::Release);
-        }
+        // `host_proto` before `magic` (Release): a driver that sees the magic sees the version.
+        let mailbox = boot.view();
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, host_proto),
+            GAMEPAD_PROTO_VERSION,
+            Ordering::Relaxed,
+        );
+        fence(Ordering::Release);
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, magic),
+            BOOT_MAGIC,
+            Ordering::Release,
+        );
         created_names().push(boot_name.clone());
         Ok(PadChannel {
             data,
@@ -391,8 +481,9 @@ impl Drop for PadChannel {
 }
 
 impl PadChannel {
-    pub(super) fn data_base(&self) -> *mut u8 {
-        self.data.base()
+    /// The DATA section this channel delivers.
+    pub(super) fn data(&self) -> SectionView<'_> {
+        self.data.view()
     }
 
     pub(super) fn boot_name(&self) -> &str {
@@ -400,10 +491,7 @@ impl PadChannel {
     }
 
     fn boot_load(&self, off: usize) -> u32 {
-        // SAFETY: the mailbox view is live (owned by `self.boot`), page-aligned, and every
-        // `PadBootstrap` u32 field offset is 4-aligned (proto asserts), so the atomic view is valid;
-        // no reference into the shared region outlives the load.
-        unsafe { (*(self.boot.base().add(off) as *const AtomicU32)).load(Ordering::Acquire) }
+        self.boot.view().load_u32(off, Ordering::Acquire)
     }
 
     /// Bind to the `SwDeviceCreate` instance so [`Self::pump`] can ask for a channel proof.
@@ -609,20 +697,26 @@ impl PadChannel {
             .context("DuplicateHandle(gamepad DATA section) into the driver's WUDFHost")?;
         }
         let value = remote.0 as usize as u64;
-        let base = self.boot.base();
         let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: live, page-aligned mailbox view; `data_handle` is 8-aligned and `handle_pid`/
-        // `handle_seq` 4-aligned (proto asserts). The handle value + owning pid are published BEFORE
-        // the seq (Release) — a driver that observes the new seq (Acquire) sees a complete delivery.
-        unsafe {
-            (*(base.add(core::mem::offset_of!(PadBootstrap, data_handle)) as *const AtomicU64))
-                .store(value, Ordering::Relaxed);
-            (*(base.add(core::mem::offset_of!(PadBootstrap, handle_pid)) as *const AtomicU32))
-                .store(pid, Ordering::Relaxed);
-            fence(Ordering::Release);
-            (*(base.add(core::mem::offset_of!(PadBootstrap, handle_seq)) as *const AtomicU32))
-                .store(seq, Ordering::Release);
-        }
+        // Handle value + owning pid before the seq (Release): a driver that sees the new seq
+        // (Acquire) sees a complete delivery.
+        let mailbox = self.boot.view();
+        mailbox.store_u64(
+            core::mem::offset_of!(PadBootstrap, data_handle),
+            value,
+            Ordering::Relaxed,
+        );
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, handle_pid),
+            pid,
+            Ordering::Relaxed,
+        );
+        fence(Ordering::Release);
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, handle_seq),
+            seq,
+            Ordering::Release,
+        );
         Ok((seq, process))
     }
 
@@ -649,17 +743,17 @@ impl PadChannel {
 }
 
 /// `SwDeviceCreate` completion context: event, HRESULT, and PnP instance id.
-/// Shared by every Windows companion backend; the creator blocks on the event.
+/// [`sw_device_create`] blocks on the event.
 #[repr(C)]
-pub(super) struct SwCreateCtx {
-    pub(super) event: HANDLE,
-    pub(super) result: HRESULT,
-    pub(super) instance_id: [u16; 128],
+struct SwCreateCtx {
+    event: HANDLE,
+    result: HRESULT,
+    instance_id: [u16; 128],
 }
 
 /// `SwDeviceCreate` callback: stash result + instance id and wake the creator.
 /// The creator blocks on the event, so there is no concurrent access to `*ctx`.
-pub(super) unsafe extern "system" fn sw_create_cb(
+unsafe extern "system" fn sw_create_cb(
     _dev: HSWDEVICE,
     result: HRESULT,
     ctx: *const c_void,
@@ -686,10 +780,118 @@ pub(super) unsafe extern "system" fn sw_create_cb(
 }
 
 impl SwCreateCtx {
-    pub(super) fn instance_id(&self) -> Option<String> {
+    fn instance_id(&self) -> Option<String> {
         let len = self.instance_id.iter().position(|&c| c == 0)?;
         (len > 0).then(|| String::from_utf16_lossy(&self.instance_id[..len]))
     }
+}
+
+/// What [`sw_device_create`] puts on a software devnode. An empty `compatible_ids` sets none.
+pub(super) struct SwDeviceSpec<'a> {
+    /// `SWD\<enumerator>\<instance>`. No `_` in it, or `E_INVALIDARG`.
+    pub enumerator: &'a str,
+    pub instance: &'a str,
+    pub hardware_ids: &'a [&'a str],
+    pub compatible_ids: &'a [&'a str],
+    pub description: &'a str,
+    /// The driver reads its bootstrap-mailbox index from here.
+    pub location: &'a str,
+    pub container: GUID,
+}
+
+/// `SwDeviceCreate` a DriverRequired | SilentInstall | Removable devnode under the root and
+/// wait up to 10 s for PnP's callback. Returns the handle `SwDeviceClose` removes, and the
+/// instance id. A wedged PnP leaks the callback context and event, so a late callback still
+/// writes live memory. The caller must be Administrator.
+pub(super) fn sw_device_create(spec: &SwDeviceSpec) -> Result<(HSWDEVICE, Option<String>)> {
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain([0]).collect() };
+    let multi_sz = |ids: &[&str]| -> Vec<u16> {
+        ids.iter()
+            .flat_map(|s| s.encode_utf16().chain([0]))
+            .chain([0])
+            .collect()
+    };
+    let (instance, hwids, compat) = (
+        wide(spec.instance),
+        multi_sz(spec.hardware_ids),
+        multi_sz(spec.compatible_ids),
+    );
+    let (desc, loc, enumerator) = (
+        wide(spec.description),
+        wide(spec.location),
+        wide(spec.enumerator),
+    );
+    let info = SW_DEVICE_CREATE_INFO {
+        cbSize: size_of::<SW_DEVICE_CREATE_INFO>() as u32,
+        pszInstanceId: PCWSTR(instance.as_ptr()),
+        pszzHardwareIds: PCWSTR(hwids.as_ptr()),
+        pszzCompatibleIds: if spec.compatible_ids.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(compat.as_ptr())
+        },
+        pContainerId: &spec.container,
+        CapabilityFlags: 0x0000_000B, // DriverRequired | SilentInstall | Removable
+        pszDeviceDescription: PCWSTR(desc.as_ptr()),
+        pszDeviceLocation: PCWSTR(loc.as_ptr()),
+        ..Default::default()
+    };
+
+    // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
+    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
+    // `result` starts as E_FAIL: a timeout must not read a zeroed HRESULT as success.
+    let ctx = Box::into_raw(Box::new(SwCreateCtx {
+        event,
+        result: E_FAIL,
+        instance_id: [0; 128],
+    }));
+    // SAFETY: `info`, its buffers and `spec.container` outlive the call and the wait below;
+    // `ctx` is a live heap allocation reclaimed only where the callback provably ran.
+    let hsw = match unsafe {
+        SwDeviceCreate(
+            PCWSTR(enumerator.as_ptr()),
+            w!("HTREE\\ROOT\\0"),
+            &info,
+            None,
+            Some(sw_create_cb),
+            Some(ctx as *const c_void),
+        )
+    } {
+        Ok(h) => h,
+        Err(e) => {
+            // SAFETY: the call failed, so no callback is pending: `ctx` and `event` are ours.
+            unsafe {
+                drop(Box::from_raw(ctx));
+                let _ = CloseHandle(event);
+            }
+            return Err(anyhow!("SwDeviceCreate {}: {e}", spec.instance));
+        }
+    };
+    // SAFETY: `event` is valid.
+    if unsafe { WaitForSingleObject(event, 10_000) } != WAIT_OBJECT_0 {
+        // SAFETY: `hsw` is the handle SwDeviceCreate returned; `ctx` and `event` leak.
+        unsafe { SwDeviceClose(hsw) };
+        return Err(anyhow!(
+            "SwDeviceCreate {}: no enumeration callback in 10 s — PnP may be wedged",
+            spec.instance
+        ));
+    }
+    // SAFETY: the callback signalled, so nothing else touches `ctx` or `event`; `ctx` came from
+    // `Box::into_raw` above and is reclaimed exactly once.
+    let ctx = unsafe {
+        let _ = CloseHandle(event);
+        Box::from_raw(ctx)
+    };
+    if ctx.result.is_err() {
+        // SAFETY: `hsw` is the handle SwDeviceCreate returned.
+        unsafe { SwDeviceClose(hsw) };
+        return Err(anyhow!(
+            "SwDeviceCreate {} enumeration: {:?}",
+            spec.instance,
+            ctx.result
+        ));
+    }
+    Ok((hsw, ctx.instance_id()))
 }
 
 pub(super) struct SwDevice(HSWDEVICE);

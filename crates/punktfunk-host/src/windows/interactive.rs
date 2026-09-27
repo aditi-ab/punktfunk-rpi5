@@ -12,17 +12,17 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::core::{Owned, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetCurrentProcessId, GetExitCodeProcess, WaitForSingleObject,
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, GetExitCodeProcess, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+    STARTUPINFOW,
 };
 
 /// Resolves one process through an injected WTS session query. A failed query
@@ -38,9 +38,7 @@ fn query_process_session<E>(
 
 /// The WTS session that contains this host process.
 fn current_process_session_id() -> Result<u32> {
-    // SAFETY: this takes no arguments and returns the caller's process id by value.
-    let process_id = unsafe { GetCurrentProcessId() };
-    query_process_session(process_id, |id, session| {
+    query_process_session(std::process::id(), |id, session| {
         // SAFETY: `id` names the live current process and `session` is a local out-parameter that
         // remains valid for this synchronous call.
         unsafe { ProcessIdToSessionId(id, session) }
@@ -76,7 +74,7 @@ fn exe_dir(cmdline: &str) -> Option<PathBuf> {
 /// Spawns `cmdline` as the signed-in user of this process's WTS session on
 /// `winsta0\default`. Returns the new process id.
 ///
-/// Fire-and-forget: child handles close before return; the process keeps
+/// Fire-and-forget: the child's handles close on return; the process keeps
 /// running. Environment is the user's block plus this process's
 /// `PUNKTFUNK_*` / `RUST_LOG` (see [`merged_env_block`]).
 ///
@@ -84,14 +82,7 @@ fn exe_dir(cmdline: &str) -> Option<PathBuf> {
 /// process's session has no signed-in user. `workdir` defaults to the
 /// executable's own directory ([`exe_dir`]) — never this process's.
 pub fn spawn_as_current_session_user(cmdline: &str, workdir: Option<&Path>) -> Result<u32> {
-    let pi = launch(cmdline, workdir, PROCESS_CREATION_FLAGS(0))?;
-    let pid = pi.dwProcessId;
-    // SAFETY: `launch` returned two owned handles; each is closed exactly once here and never
-    // used after. Closing them does not terminate the child, which owns its own lifetime.
-    unsafe {
-        let _ = CloseHandle(pi.hProcess);
-        let _ = CloseHandle(pi.hThread);
-    }
+    let (_process, pid) = launch(cmdline, workdir, PROCESS_CREATION_FLAGS(0))?;
     Ok(pid)
 }
 
@@ -99,17 +90,13 @@ pub fn spawn_as_current_session_user(cmdline: &str, workdir: Option<&Path>) -> R
 /// user's desktop, and the caller learns the exit code. Errs when the helper is still
 /// running after `timeout`; it keeps running on its own then.
 pub fn run_hidden_as_current_session_user(cmdline: &str, timeout: Duration) -> Result<u32> {
-    let pi = launch(cmdline, None, CREATE_NO_WINDOW)?;
-    // SAFETY: `pi.hThread` is an owned handle this function does not need; closed once here.
-    let _ = unsafe { CloseHandle(pi.hThread) };
+    let (process, _) = launch(cmdline, None, CREATE_NO_WINDOW)?;
     let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
-    // SAFETY: `pi.hProcess` is a live owned handle for both calls and `code` a live out-param;
-    // the handle is closed exactly once below, after its last use.
+    // SAFETY: `process` is a live owned handle for both calls and `code` a live out-param.
     let (waited, got, code) = unsafe {
-        let waited = WaitForSingleObject(pi.hProcess, millis);
+        let waited = WaitForSingleObject(*process, millis);
         let mut code = 0u32;
-        let got = GetExitCodeProcess(pi.hProcess, &mut code);
-        let _ = CloseHandle(pi.hProcess);
+        let got = GetExitCodeProcess(*process, &mut code);
         (waited, got, code)
     };
     if waited != WAIT_OBJECT_0 {
@@ -120,41 +107,41 @@ pub fn run_hidden_as_current_session_user(cmdline: &str, timeout: Duration) -> R
 }
 
 /// The `CreateProcessAsUserW` core both launchers share. `extra` joins the creation flags.
-/// Returns the live process and thread handles; the caller closes both.
+/// Returns the child's process handle and pid; its thread handle closes here.
 fn launch(
     cmdline: &str,
     workdir: Option<&Path>,
     extra: PROCESS_CREATION_FLAGS,
-) -> Result<PROCESS_INFORMATION> {
+) -> Result<(Owned<HANDLE>, u32)> {
     let session = current_process_session_id()?;
     let mut user_token = HANDLE::default();
-    // SAFETY: `session` is a plain id and `user_token` a live local out-param; on `Ok` the call
-    // yields an owned token handle, closed exactly once below.
+    // SAFETY: `session` is a plain id and `user_token` a live local out-param.
     unsafe { WTSQueryUserToken(session, &mut user_token) }.context(
         "WTSQueryUserToken (host must be SYSTEM; its WTS session needs a signed-in user)",
     )?;
+    // SAFETY: the query succeeded, so `user_token` is a token this frame alone owns.
+    let user_token = unsafe { Owned::new(user_token) };
 
     let mut primary = HANDLE::default();
-    // SAFETY: `user_token` is the live token just opened; `primary` is a live local out-param that
-    // receives a second owned handle on `Ok`. Both are closed exactly once, below.
-    let dup = unsafe {
+    // SAFETY: `user_token` is the live token just opened; `primary` is a live local out-param.
+    unsafe {
         DuplicateTokenEx(
-            user_token,
+            *user_token,
             TOKEN_ALL_ACCESS,
             None,
             SecurityImpersonation,
             TokenPrimary,
             &mut primary,
         )
-    };
-    // SAFETY: `user_token` is live and owned here, and is not used again after this close.
-    let _ = unsafe { CloseHandle(user_token) };
-    dup.context("DuplicateTokenEx(TokenPrimary)")?;
+    }
+    .context("DuplicateTokenEx(TokenPrimary)")?;
+    // SAFETY: the duplicate succeeded, so `primary` is a second token this frame alone owns.
+    let primary = unsafe { Owned::new(primary) };
 
     let mut env_block: *mut core::ffi::c_void = std::ptr::null_mut();
     // SAFETY: `env_block` is a live local out-param and `primary` the live token above; on success
     // the call stores an owned block pointer, destroyed exactly once below.
-    let _ = unsafe { CreateEnvironmentBlock(&mut env_block, Some(primary), false) };
+    let _ = unsafe { CreateEnvironmentBlock(&mut env_block, Some(*primary), false) };
     // SAFETY: `env_block` is either still null (the call above failed) or the double-null-terminated
     // UTF-16 block `CreateEnvironmentBlock` just wrote — exactly the two states the helper accepts.
     let merged_env = unsafe { merged_env_block(env_block as *const u16, true) };
@@ -197,7 +184,7 @@ fn launch(
         // `pi` is a live local out-param, and the API retains none of these pointers.
         let r = unsafe {
             CreateProcessAsUserW(
-                Some(primary),
+                Some(*primary),
                 None,
                 Some(PWSTR(cmd.as_mut_ptr())),
                 None,
@@ -216,10 +203,11 @@ fn launch(
         tracing::debug!("breakaway launch refused ({r:?}) — retrying inside the job");
         flags &= !CREATE_BREAKAWAY_FROM_JOB;
     };
-    // SAFETY: `primary` is live and owned here, closed exactly once and not used after.
-    let _ = unsafe { CloseHandle(primary) };
     created.context("CreateProcessAsUserW (current-session user launch)")?;
-    Ok(pi)
+    // SAFETY: the launch succeeded, so both handles in `pi` are ours alone; the thread's closes
+    // here, and closing either never ends the child.
+    let (process, _thread) = unsafe { (Owned::new(pi.hProcess), Owned::new(pi.hThread)) };
+    Ok((process, pi.dwProcessId))
 }
 
 /// UTF-16, double-null-terminated block for `CREATE_UNICODE_ENVIRONMENT`:
@@ -270,6 +258,10 @@ pub(crate) unsafe fn merged_env_block(user_block: *const u16, strip_secrets: boo
     let mut block: Vec<u16> = Vec::new();
     for e in entries {
         block.extend(e.encode_utf16());
+        block.push(0);
+    }
+    // An empty block is still two NULs; one would send CreateProcess reading past the end.
+    if block.is_empty() {
         block.push(0);
     }
     block.push(0);

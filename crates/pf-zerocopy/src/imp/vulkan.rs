@@ -14,7 +14,7 @@
 //! for a stream). Init/import failure disables the importer; CPU mmap takes over.
 
 use super::cuda::{self, DeviceBuffer};
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
 use std::collections::HashMap;
 
@@ -328,19 +328,19 @@ impl VkBridge {
     }
 
     /// Import `fd` (dup'd internally; Vulkan owns the dup) as a transfer-src buffer of `size`.
+    /// The caller keeps `fd` open for the call.
     unsafe fn import_src(&mut self, fd: i32, size: u64) -> Result<()> {
-        // SAFETY: caller contract: this thread owns the handles. Every builder info is a local
-        // that outlives the call that reads it. Each fallible step destroys what it created.
+        // SAFETY: caller contract: this thread owns the handles and `fd` is open. Every builder
+        // info is a local that outlives the call that reads it. Each fallible step destroys what
+        // it created.
         unsafe {
-            use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-            let dup = libc::dup(fd);
-            if dup < 0 {
-                bail!("dup(dmabuf fd)");
-            }
+            use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
             // Own the dup until `allocate_memory` succeeds (Vulkan then consumes it). `SrcBuf`
             // has no Drop and is filled only on success, so each fallible step must destroy the
             // buffer it created: a failed import retries every frame.
-            let dup = OwnedFd::from_raw_fd(dup);
+            let dup = BorrowedFd::borrow_raw(fd)
+                .try_clone_to_owned()
+                .context("dup(dmabuf fd)")?;
             let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
             let buffer = self
@@ -377,11 +377,9 @@ impl VkBridge {
                     return Err(e);
                 }
             };
-            // Successful import consumes the fd. On failure close it and destroy the buffer.
-            let raw = dup.into_raw_fd();
             let mut import = vk::ImportMemoryFdInfoKHR::default()
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-                .fd(raw);
+                .fd(dup.as_raw_fd());
             let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
             let memory = match self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
@@ -391,9 +389,12 @@ impl VkBridge {
                     .push_next(&mut dedicated),
                 None,
             ) {
-                Ok(m) => m,
+                Ok(m) => {
+                    let _ = dup.into_raw_fd(); // Vulkan owns the dup now
+                    m
+                }
                 Err(e) => {
-                    libc::close(raw); // failed import does not consume the fd
+                    // A failed import does not consume the fd: `dup` drops and closes it.
                     self.device.destroy_buffer(buffer, None);
                     return Err(anyhow!("import dmabuf memory: {e}"));
                 }
@@ -419,7 +420,8 @@ impl VkBridge {
     /// Recreate the exportable destination if it is smaller than `size`, plus its CUDA mapping.
     unsafe fn ensure_dst(&mut self, size: u64) -> Result<()> {
         // SAFETY: caller contract: this thread owns the handles. Builder infos are locals that
-        // outlive the call. Created handles are destroyed on error or owned by `DstBuf`.
+        // outlive the call. Created handles are destroyed on error or owned by `DstBuf`; the
+        // exported fd is fresh, so `OwnedFd` is its only owner.
         unsafe {
             if self.dst.as_ref().is_some_and(|d| d.size >= size) {
                 return Ok(());
@@ -479,15 +481,16 @@ impl VkBridge {
                     .memory(memory)
                     .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
             ) {
-                Ok(f) => f,
+                // A fresh descriptor this call alone owns.
+                Ok(f) => <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(f),
                 Err(e) => {
                     self.device.free_memory(memory, None);
                     self.device.destroy_buffer(buffer, None);
                     return Err(e).context("vkGetMemoryFdKHR");
                 }
             };
-            // CUDA owns the fd on success. Size must match the allocation. `import_owned_fd`
-            // closes `opaque_fd` on failure, so only Vulkan objects unwind here.
+            // CUDA owns the fd on success. Size must match the allocation. A failed import drops
+            // `opaque_fd`, so only Vulkan objects unwind here.
             let cuda = match cuda::ExternalDmabuf::import_owned_fd(opaque_fd, reqs.size) {
                 Ok(c) => c,
                 Err(e) => {
@@ -650,11 +653,17 @@ impl VkBridge {
             offset % 4 == 0 && stride % 4 == 0,
             "LINEAR dmabuf offset/stride not word-aligned ({offset}/{stride})"
         );
+        // The shader reads `width` texels per row; a shorter stride runs the last row off the span.
+        anyhow::ensure!(
+            u64::from(stride) >= u64::from(width) * 4,
+            "LINEAR dmabuf stride {stride} shorter than a {width}-pixel row"
+        );
         let layout = nv12_layout(width, height)
             .context("NV12 destination layout exceeds addressable buffer or shader offsets")?;
         // SAFETY: `fd` is the caller's live dmabuf (`import_src` dups it). This frame's source
         // span is checked below. `nv12_layout` proved dest sizes and shader offsets;
-        // `ensure_dst(layout.size)` covers the write range. Descriptor binds live src/dst
+        // `ensure_dst(layout.size)` covers the shader writes and the CUDA de-stride reads
+        // (`copy_pitched_nv12_to_buffer`). Descriptor binds live src/dst
         // WHOLE_SIZE; `*Info` arrays are locals; `cmd`/`queue`/`fence` are this thread's.
         // Dispatch is ⌈w/32⌉×⌈h/16⌉ groups of 8×8, writing whole words inside that range.
         // `wait_for_fences` retires the compute pass (shader-write barrier recorded) before

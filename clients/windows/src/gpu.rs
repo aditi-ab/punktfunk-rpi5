@@ -11,18 +11,15 @@ use windows::Win32::dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
 
 /// The adapter's human-readable description.
 fn adapter_name(adapter: &IDXGIAdapter) -> String {
-    // SAFETY: a read-only COM call on the live `adapter` borrow, filling a zeroed local
-    // descriptor through the out-param, checked before the descriptor is read; `&IDXGIAdapter`
-    // is a reference-counted wrapper, so the borrow IS the liveness.
-    unsafe {
-        let mut d: windows::Win32::dxgi::DXGI_ADAPTER_DESC = std::mem::zeroed();
-        if adapter.GetDesc(&mut d).is_ok() {
-            String::from_utf16_lossy(&d.Description)
-                .trim_end_matches('\0')
-                .to_string()
-        } else {
-            "<unknown adapter>".into()
-        }
+    let mut d = windows::Win32::dxgi::DXGI_ADAPTER_DESC::default();
+    // SAFETY: a read-only COM call on the live `adapter` borrow, writing only the local
+    // descriptor through the out-param; `&IDXGIAdapter` holds a reference, so it stays live.
+    if unsafe { adapter.GetDesc(&mut d) }.is_ok() {
+        String::from_utf16_lossy(&d.Description)
+            .trim_end_matches('\0')
+            .to_string()
+    } else {
+        "<unknown adapter>".into()
     }
 }
 
@@ -63,11 +60,11 @@ pub fn adapter_names() -> Vec<String> {
         let desc1 = a
             .cast::<windows::Win32::dxgi::IDXGIAdapter1>()
             .ok()
-            // SAFETY: a read-only COM call on the adapter just cast, filling a zeroed local
-            // descriptor through the out-param, discarded unless the call reports success.
-            .and_then(|a1| unsafe {
-                let mut d: windows::Win32::dxgi::DXGI_ADAPTER_DESC1 = std::mem::zeroed();
-                a1.GetDesc1(&mut d).is_ok().then_some(d)
+            .and_then(|a1| {
+                let mut d = windows::Win32::dxgi::DXGI_ADAPTER_DESC1::default();
+                // SAFETY: a read-only COM call on the adapter just cast, writing only the local
+                // descriptor, which is discarded unless the call reports success.
+                unsafe { a1.GetDesc1(&mut d) }.is_ok().then_some(d)
             });
         let name = adapter_name(&a);
         // Forensics for the next duplicate/oddity report — which adapters DXGI actually

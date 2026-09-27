@@ -1,8 +1,8 @@
 //! Video-image / staging-buffer rebuild and retired-frame destruction.
 
-use super::gpu::subresource_range;
+use super::gpu::image_with_memory;
 use super::{CpuPlanes, Presenter, Retired, Staging, VideoImage};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use ash::vk;
 use pf_client_core::video::CpuPlanarFrame;
 
@@ -52,6 +52,36 @@ impl CpuPlanes {
     }
 }
 
+impl VideoImage {
+    /// A null framebuffer is a no-op, so a build that failed at it unwinds here.
+    pub(super) fn destroy(self, device: &ash::Device) {
+        // SAFETY: handles owned by `self`. GPU idle: fence/queue-wait on this
+        // path, or never submitted.
+        unsafe {
+            device.destroy_framebuffer(self.framebuffer, None);
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
+impl Staging {
+    /// Null handles and a null `ptr` are a no-op, so a build that failed part-way
+    /// unwinds here.
+    pub(super) fn destroy(self, device: &ash::Device) {
+        // SAFETY: handles owned by `self`. GPU idle: fence/queue-wait on this
+        // path, or never submitted. Unmapped before its memory is freed.
+        unsafe {
+            if !self.ptr.is_null() {
+                device.unmap_memory(self.memory);
+            }
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
 impl Presenter {
     /// Touches no queue: a failed rebuild must fail before acquire, same
     /// rule as the hardware imports.
@@ -94,7 +124,7 @@ impl Presenter {
         }
         let (cw, ch) = CpuPlanarFrame::chroma_dims(width, height);
         let dims = [(width, height), (cw, ch), (cw, ch)];
-        // Build into the owning value, not loose arrays: nine fallible steps,
+        // Build into the owning value, not loose arrays: three fallible planes,
         // and `destroy` treats `VK_NULL_HANDLE` as a no-op so a prefix unwinds.
         let mut planes = CpuPlanes {
             images: [vk::Image::null(); 3],
@@ -115,46 +145,32 @@ impl Presenter {
         Ok(())
     }
 
-    /// One R8 plane, written into `planes` as each handle is created so a
-    /// failure part-way leaves the caller something it can destroy.
+    /// One R8 plane into slot `i` of `planes`: all three handles or none, so a
+    /// failure leaves the caller only whole earlier planes to destroy.
     fn build_cpu_plane(&self, planes: &mut CpuPlanes, i: usize, (w, h): (u32, u32)) -> Result<()> {
-        // SAFETY: `device` is live; create-info is a local that outlives the call.
-        let image = unsafe {
-            self.device.create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(vk::Format::R8_UNORM)
-                    .extent(vk::Extent3D {
-                        width: w,
-                        height: h,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )
-        }?;
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8_UNORM)
+            .extent(vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let (image, memory, view) = image_with_memory(
+            &self.device,
+            &self.mem_props,
+            &info,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
         planes.images[i] = image;
-        // SAFETY: `image` was created above and is owned here.
-        let reqs = unsafe { self.device.get_image_memory_requirements(image) };
-        planes.memory[i] = self.allocate(reqs, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-        // SAFETY: `image` and `planes.memory[i]` were created above and are owned here.
-        unsafe { self.device.bind_image_memory(image, planes.memory[i], 0) }?;
-        // SAFETY: `device` is live; `image` is owned here; create-info is a local.
-        planes.views[i] = unsafe {
-            self.device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::R8_UNORM)
-                    .subresource_range(subresource_range()),
-                None,
-            )
-        }?;
+        planes.memory[i] = memory;
+        planes.views[i] = view;
         Ok(())
     }
 
@@ -162,61 +178,43 @@ impl Presenter {
         // Old image is only referenced by our command buffers.
         self.quiesce_own()?;
         if let Some(v) = self.video.take() {
-            // SAFETY: `quiesce_own` above; GPU idle on this image, view, and framebuffer.
-            unsafe {
-                if v.framebuffer != vk::Framebuffer::null() {
-                    self.device.destroy_framebuffer(v.framebuffer, None);
-                }
-                if v.view != vk::ImageView::null() {
-                    self.device.destroy_image_view(v.view, None);
-                }
-                self.device.destroy_image(v.image, None);
-                self.device.free_memory(v.memory, None);
-            }
+            v.destroy(&self.device); // `quiesce_own` above: GPU idle on it
         }
         // COLOR_ATTACHMENT is the CSC render target; SAMPLED feeds the scale pass.
-        // SAFETY: `device` is live; create-info is a local that outlives the call.
-        let image = unsafe {
-            self.device.create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(super::VIDEO_FORMAT)
-                    .extent(vk::Extent3D {
-                        width,
-                        height,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(
-                        vk::ImageUsageFlags::TRANSFER_DST
-                            | vk::ImageUsageFlags::TRANSFER_SRC
-                            | vk::ImageUsageFlags::COLOR_ATTACHMENT
-                            | vk::ImageUsageFlags::SAMPLED,
-                    )
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(super::VIDEO_FORMAT)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED,
             )
-        }?;
-        // SAFETY: `image` was created above and is owned here.
-        let reqs = unsafe { self.device.get_image_memory_requirements(image) };
-        let memory = self.allocate(reqs, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-        // SAFETY: `image` and `memory` were created above and are owned here.
-        unsafe { self.device.bind_image_memory(image, memory, 0) }?;
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let (image, memory, view) = image_with_memory(
+            &self.device,
+            &self.mem_props,
+            &info,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        let video = VideoImage {
+            image,
+            memory,
+            view,
+            framebuffer: vk::Framebuffer::null(),
+            width,
+            height,
+        };
         // View + framebuffer always: Vulkan Video needs the CSC pass on every device.
-        // SAFETY: `device` is live; create-info is a local that outlives the call.
-        let view = unsafe {
-            self.device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(super::VIDEO_FORMAT)
-                    .subresource_range(subresource_range()),
-                None,
-            )
-        }?;
         let attachments = [view];
         // SAFETY: `device` is live; `view`/`csc.render_pass` are owned here;
         // create-info is a local that outlives the call.
@@ -230,27 +228,26 @@ impl Presenter {
                     .layers(1),
                 None,
             )
-        }?;
-        self.video = Some(VideoImage {
-            image,
-            memory,
-            view,
-            framebuffer,
-            width,
-            height,
-        });
+        };
+        match framebuffer {
+            Ok(framebuffer) => {
+                self.video = Some(VideoImage {
+                    framebuffer,
+                    ..video
+                })
+            }
+            Err(e) => {
+                video.destroy(&self.device);
+                return Err(e).context("vkCreateFramebuffer (video image)");
+            }
+        }
         Ok(())
     }
 
     fn rebuild_staging(&mut self, capacity: usize) -> Result<()> {
         self.quiesce_own()?;
         if let Some(s) = self.staging.take() {
-            // SAFETY: `quiesce_own` above; GPU idle on this buffer. Unmap before free.
-            unsafe {
-                self.device.unmap_memory(s.memory);
-                self.device.destroy_buffer(s.buffer, None);
-                self.device.free_memory(s.memory, None);
-            }
+            s.destroy(&self.device); // `quiesce_own` above: GPU idle on it
         }
         // SAFETY: `device` is live; create-info is a local that outlives the call.
         let buffer = unsafe {
@@ -261,26 +258,44 @@ impl Presenter {
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )
-        }?;
-        // SAFETY: `buffer` was created above and is owned here.
-        let reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-        let memory = self.allocate(
-            reqs,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        // SAFETY: `buffer` and `memory` were created above and are owned here.
-        unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }?;
-        // SAFETY: `memory` is HOST_VISIBLE, bound above, and owned here until unmap.
-        let ptr = unsafe {
-            self.device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-        }? as *mut u8;
-        self.staging = Some(Staging {
+        }
+        .context("vkCreateBuffer (staging)")?;
+        let mut memory = vk::DeviceMemory::null();
+        let mapped = (|| {
+            // SAFETY: `buffer` was created above and is owned here.
+            let reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+            memory = self.allocate(
+                reqs,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            // SAFETY: `buffer` and `memory` were created above; neither is bound yet.
+            unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }
+                .context("vkBindBufferMemory")?;
+            // SAFETY: `memory` is HOST_VISIBLE, bound above, and not mapped yet.
+            unsafe {
+                self.device
+                    .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            }
+            .context("vkMapMemory")
+        })();
+        let staging = Staging {
             buffer,
             memory,
-            ptr,
+            ptr: std::ptr::null_mut(),
             capacity,
-        });
+        };
+        match mapped {
+            Ok(ptr) => {
+                self.staging = Some(Staging {
+                    ptr: ptr.cast(),
+                    ..staging
+                })
+            }
+            Err(e) => {
+                staging.destroy(&self.device);
+                return Err(e);
+            }
+        }
         Ok(())
     }
 }

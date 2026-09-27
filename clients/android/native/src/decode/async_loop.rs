@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::asc_presenter::{asc_backend_selected, sysprop, AscBackend};
+use super::asc_presenter::{asc_backend_selected, AscBackend};
 use super::display::{
     apply_reported_dataspace, color_dataspace, install_render_callback, release_render_callback,
     reported_dataspace, DisplayTracker,
@@ -30,6 +30,7 @@ use super::surface_control::{Layer, PresentComplete};
 use super::vsync::{now_monotonic_ns, VsyncClock, VsyncShared};
 use super::{Backstops, DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP};
 use crate::input_stall::{InputStall, INPUT_STALL_PATIENCE};
+use crate::sysprop;
 
 /// One decoded output buffer ready to release: its codec buffer index + the pts the codec echoed
 /// (from the output callback's `BufferInfo`), used to pair the `decode` HUD stat, and the
