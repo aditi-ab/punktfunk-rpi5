@@ -117,6 +117,12 @@ public final class SiriRemotePointer {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.rebind() }
         })
+        // Control Center or the Home button: the lift of a held click never reaches us.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.resetGesture() }
+        })
         rebind()
     }
 
@@ -145,14 +151,7 @@ public final class SiriRemotePointer {
             old.buttonX.pressedChangedHandler = nil
             old.buttonMenu.pressedChangedHandler = nil
         }
-        // Timers first, then the lift: a tap whose release is still owed is held state, so
-        // `releaseHeld` below is what sends its button-up.
-        cancelPlayPause()
-        releaseHeld()
-        lastTouch = nil
-        contactAt = nil
-        inReleaseRamp = false
-        menuDownAt = nil
+        resetGesture()
         bound = controller
         guard let micro = controller?.microGamepad else { return }
 
@@ -366,6 +365,17 @@ public final class SiriRemotePointer {
             // swallowed in ContentView.
             onShortBack?()
         }
+    }
+
+    /// Forget the gesture in progress and lift anything held. Timers first: a tap whose release
+    /// is still owed is held state, so `releaseHeld` is what sends its button-up.
+    private func resetGesture() {
+        cancelPlayPause()
+        releaseHeld()
+        lastTouch = nil
+        contactAt = nil
+        inReleaseRamp = false
+        menuDownAt = nil
     }
 
     private func releaseHeld() {
