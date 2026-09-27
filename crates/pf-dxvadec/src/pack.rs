@@ -62,7 +62,7 @@ pub enum PackError {
     /// AV1 ([`mod@crate::pack_av1`]): frame carried no tile data.
     NoTiles,
     /// AV1: tile payload is in no tile-group region from the same walk.
-    /// Unreachable via [`pf_vkdecode::plan_bitstream`]; the alternative is a
+    /// Unreachable via [`crate::plan_bitstream`]; the alternative is a
     /// record addressing another tile's bytes.
     TileOutsideGroup {
         start: usize,

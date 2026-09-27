@@ -46,6 +46,9 @@ pub use pf_bitstream::slots;
 /// crate's `ash::vk::Handle`. Their own `ash` is optional; versions must not skew.
 pub use ash;
 // pf-bitstream types a [`DecodedVkFrame`] consumer names, without taking that dep.
+pub use pf_bitstream::av1::tiles::plan_bitstream;
+pub use pf_bitstream::av1::tiles::Av1Bitstream;
+pub use pf_bitstream::av1::tiles::Av1TileError;
 /// [`VkAv1Decoder::take_warnings`] warning type. Distinct from [`PlanWarning`]:
 /// AV1 has `MissingShowExisting`; `MissingReference` has no legal substitute.
 pub use pf_bitstream::av1::PlanWarning as Av1PlanWarning;
@@ -77,9 +80,6 @@ pub use decoder::core::VkDecoder;
 pub use decoder::DecodeStatus;
 pub use decoder::DecodedVkFrame;
 pub use decoder::VkDecodeError;
-pub use decoder_av1::plan_bitstream;
-pub use decoder_av1::Av1Bitstream;
-pub use decoder_av1::Av1TileError;
 pub use decoder_av1::VkAv1Decoder;
 pub use decoder_h264::VkH264Decoder;
 pub use decoder_h265::VkH265Decoder;

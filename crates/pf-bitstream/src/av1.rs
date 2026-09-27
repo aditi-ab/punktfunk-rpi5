@@ -22,6 +22,8 @@ use cros_codecs::codec::av1::parser::SequenceHeaderObu;
 
 use crate::h264::ColourDescription;
 
+pub mod tiles;
+
 /// Parsed types a backend conversion names. Re-exported so backends do not reach
 /// into the vendored crate — the same courtesy [`crate::h264`] does for `Sps`/`Pps`.
 pub use cros_codecs::codec::av1::parser::FrameHeaderObu as ParsedFrameHeader;

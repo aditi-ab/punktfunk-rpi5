@@ -128,7 +128,7 @@ pub enum VkDecodeError {
     ParamsAv1(ParamsAv1Error),
     /// Tile groups could not be split into `pTileOffsets` ranges. Refused
     /// rather than submitting the whole OBU as tiles ([`crate::decoder_av1`]).
-    TilesAv1(crate::decoder_av1::Av1TileError),
+    TilesAv1(pf_bitstream::av1::tiles::Av1TileError),
     /// Named a reference slot the planner no longer holds. Fatal: the planner
     /// compacting survivors into `AuPlan::refs` would make later names resolve
     /// to the wrong picture. `ref_index` is LAST_FRAME=0 … ALTREF_FRAME=6.

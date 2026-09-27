@@ -5,7 +5,7 @@
 //! in plan order: from the first tile's `tile_size_minus_1` through the end of the
 //! OBU payload. Not the OBU header, not `obu_size`, not an `OBU_FRAME` frame header
 //! — those live in `DXVA_PicParams_AV1`. Inter-tile `tile_size_minus_1` fields ride
-//! along unread. [`pf_vkdecode::Av1Bitstream::groups`] is that region.
+//! along unread. [`Av1Bitstream::groups`] is that region.
 //!
 //! Vulkan uploads tile payloads alone (size fields stripped). Both are correct:
 //! both APIs address tiles by an explicit (offset, size) pair. This path matches
@@ -19,7 +19,7 @@
 //!    size is exact; its entropy decoder is not looking for a stop bit.
 //! 2. **One record per TILE, not per tile group.** See [`TileAv1`].
 
-use pf_vkdecode::Av1Bitstream;
+use pf_bitstream::av1::tiles::Av1Bitstream;
 
 use crate::dxva::BITSTREAM_ALIGN;
 use crate::dxva_av1::TileAv1;

@@ -48,9 +48,9 @@ use crate::va_av1::SUPERRES_NUM;
 use crate::va_av1::TILE_SBS_LEN;
 use crate::SlotError;
 use crate::SlotMap;
-use pf_vkdecode::plan_bitstream;
-use pf_vkdecode::Av1Bitstream;
-use pf_vkdecode::Av1TileError;
+use pf_bitstream::av1::tiles::plan_bitstream;
+use pf_bitstream::av1::tiles::Av1Bitstream;
+use pf_bitstream::av1::tiles::Av1TileError;
 
 /// libavcodec's ceiling: 256. Spec `MAX_TILE_COLS` × `MAX_TILE_ROWS` is 4096,
 /// which no AV1 level defines.
