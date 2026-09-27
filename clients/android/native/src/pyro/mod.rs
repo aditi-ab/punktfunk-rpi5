@@ -116,8 +116,7 @@ mod imp {
         opts: &DecodeOptions,
     ) -> Result<()> {
         crate::decode::boost_thread_priority();
-        let (entry, instance, surface) = PyroDevice::open_surface(window)?;
-        let dev = PyroDevice::new(entry, instance, surface)?;
+        let dev = PyroDevice::new(PyroDevice::open_surface(window)?)?;
         stats.set_decoder(&decoder_label(&dev.vkd.device_name), false);
         let smooth = opts.present_priority == 1;
         let mut present = Present::new(&dev, smooth)?;
@@ -248,23 +247,8 @@ mod imp {
             }
         }
 
-        // Teardown order is Vulkan's, not ours: the decoder's images, then everything the
-        // present half built, then the device, then the surface, then the instance.
-        drop(decoder);
-        {
-            let _q = dev.vkd.queue_lock.guard();
-            // SAFETY: idling is the precondition for destroying objects still referenced by
-            // submitted work.
-            let _ = unsafe { dev.device.device_wait_idle() };
-        }
-        // SAFETY: the device is idle and the decoder is gone.
-        unsafe {
-            present.destroy();
-            dev.destroy();
-            ash::khr::surface::Instance::new(&dev.entry, &dev.instance)
-                .destroy_surface(dev.surface, None);
-            dev.instance.destroy_instance(None);
-        }
+        // Every exit path tears down in reverse declaration order, which is Vulkan's: the
+        // decoder, the present half, the device, then the surface and instance.
         log::info!("pyro: lane stopped after {received} access units");
         Ok(())
     }

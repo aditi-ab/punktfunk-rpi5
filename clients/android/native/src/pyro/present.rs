@@ -13,6 +13,7 @@ use anyhow::{anyhow, Result};
 use ash::vk::{self, Handle as _};
 use pf_client_core::video_color::{csc_rows, ColorDesc};
 use pf_client_core::video_vk::QueueLock;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// Frames the CPU may record ahead of the GPU. Two is the whole budget this lane wants:
@@ -45,8 +46,8 @@ struct SwapRes {
 }
 
 /// The lane's present half: owns the surface-side Vulkan objects and draws one decoded
-/// frame per call.
-pub(super) struct Present {
+/// frame per call. Borrows the device it was built on, so it drops first.
+pub(super) struct Present<'d> {
     device: ash::Device,
     queue: vk::Queue,
     queue_lock: Arc<QueueLock>,
@@ -69,21 +70,22 @@ pub(super) struct Present {
     fences: Vec<vk::Fence>,
     swap: SwapRes,
     frame: usize,
+    _dev: PhantomData<&'d super::device::PyroDevice>,
 }
 
-impl Present {
+impl<'d> Present<'d> {
     /// Build the render pass, pipeline and first swapchain for `dev`'s surface.
     ///
     /// `smooth` picks FIFO over MAILBOX: the same "presentation intent" the MediaCodec
     /// backends take from the settings, expressed in the only actuator a swapchain has.
     /// MAILBOX shows the newest picture and discards what it overtook — the latency intent
     /// — where FIFO queues every one onto the panel's own cadence.
-    pub(super) fn new(dev: &super::device::PyroDevice, smooth: bool) -> Result<Present> {
-        let surface_i = ash::khr::surface::Instance::new(&dev.entry, &dev.instance);
-        let swap_d = ash::khr::swapchain::Device::new(&dev.instance, &dev.device);
+    pub(super) fn new(dev: &'d super::device::PyroDevice, smooth: bool) -> Result<Present<'d>> {
+        let surface = dev.base.surface;
+        let surface_i = ash::khr::surface::Instance::new(&dev.base.entry, &dev.base.instance);
+        let swap_d = ash::khr::swapchain::Device::new(&dev.base.instance, &dev.device);
         // SAFETY: physical device and surface are live for the lane's lifetime.
-        let formats =
-            unsafe { surface_i.get_physical_device_surface_formats(dev.pdev, dev.surface) }?;
+        let formats = unsafe { surface_i.get_physical_device_surface_formats(dev.pdev, surface) }?;
         // Whatever the compositor offers first in 8-bit UNORM; the CSC writes non-linear
         // sRGB values, so an _SRGB swapchain format would apply the transfer twice.
         let format = formats
@@ -99,7 +101,7 @@ impl Present {
         let (format, color_space) = (format.format, format.color_space);
         // SAFETY: as above.
         let modes =
-            unsafe { surface_i.get_physical_device_surface_present_modes(dev.pdev, dev.surface) }?;
+            unsafe { surface_i.get_physical_device_surface_present_modes(dev.pdev, surface) }?;
         let present_mode = if !smooth && modes.contains(&vk::PresentModeKHR::MAILBOX) {
             vk::PresentModeKHR::MAILBOX
         } else {
@@ -175,7 +177,7 @@ impl Present {
             queue: dev.queue,
             queue_lock: dev.vkd.queue_lock.clone(),
             surface_i,
-            surface: dev.surface,
+            surface,
             swap_d,
             pdev: dev.pdev,
             format,
@@ -199,6 +201,7 @@ impl Present {
                 extent: vk::Extent2D::default(),
             },
             frame: 0,
+            _dev: PhantomData,
         };
         p.rebuild_swapchain(color_space)?;
         log::info!(
@@ -212,7 +215,8 @@ impl Present {
     }
 
     /// (Re)create the swapchain and everything sized by it, keeping the old one as the
-    /// `oldSwapchain` handover so the compositor never sees a gap.
+    /// `oldSwapchain` handover so the compositor never sees a gap. On an error, `swap` names
+    /// only live objects, which `Drop` destroys.
     fn rebuild_swapchain(&mut self, color_space: vk::ColorSpaceKHR) -> Result<()> {
         // SAFETY: physical device and surface are live.
         let caps = unsafe {
@@ -262,12 +266,11 @@ impl Present {
         // SAFETY: destroys only what this struct built; the queue is idle at every call
         // site (see `present`) and the retired swapchain was handed over above.
         unsafe { self.destroy_swap_res(old) };
+        self.swap.swapchain = swapchain;
+        self.swap.extent = extent;
 
         // SAFETY: the swapchain is live; the images belong to it.
         let images = unsafe { self.swap_d.get_swapchain_images(swapchain) }?;
-        let mut views = Vec::with_capacity(images.len());
-        let mut framebuffers = Vec::with_capacity(images.len());
-        let mut done = Vec::with_capacity(images.len());
         for image in images {
             // SAFETY: builders are locals; the view is owned by this struct.
             let view = unsafe {
@@ -285,6 +288,7 @@ impl Present {
                     None,
                 )
             }?;
+            self.swap.views.push(view);
             let attachments = [view];
             // SAFETY: as above; the framebuffer borrows `view`, which outlives it here.
             let fb = unsafe {
@@ -298,22 +302,14 @@ impl Present {
                     None,
                 )
             }?;
+            self.swap.framebuffers.push(fb);
             // SAFETY: device live.
             let sem = unsafe {
                 self.device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
             }?;
-            views.push(view);
-            framebuffers.push(fb);
-            done.push(sem);
+            self.swap.done.push(sem);
         }
-        self.swap = SwapRes {
-            swapchain,
-            views,
-            framebuffers,
-            done,
-            extent,
-        };
         Ok(())
     }
 
@@ -560,17 +556,21 @@ impl Present {
             }
         }
     }
+}
 
-    /// Destroy everything this half owns. The surface and instance outlive it.
-    ///
-    /// # Safety
-    /// Nothing may be in flight; the caller idles the device first.
-    pub(super) unsafe fn destroy(&mut self) {
+impl Drop for Present<'_> {
+    /// Idle the device, then destroy everything this half owns. The device and surface
+    /// outlive it (`'d`).
+    fn drop(&mut self) {
+        {
+            let _q = self.queue_lock.guard();
+            // SAFETY: idling is the precondition for destroying objects submitted work uses.
+            let _ = unsafe { self.device.device_wait_idle() };
+        }
         let current = self.swap.swapchain;
-        // SAFETY: the caller guarantees nothing is in flight.
+        // SAFETY: the device is idle, and every handle here was created on it by this struct.
         unsafe {
             self.destroy_swap_res(current);
-            self.swap.swapchain = vk::SwapchainKHR::null();
             for sem in self.acquire.drain(..) {
                 self.device.destroy_semaphore(sem, None);
             }
