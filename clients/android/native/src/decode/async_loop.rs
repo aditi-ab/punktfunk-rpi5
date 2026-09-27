@@ -66,6 +66,8 @@ pub(super) enum DecodeEvent {
     FormatChanged,
     /// A panel vsync (from the [`VsyncClock`] thread) — the presenter's retry/pacing tick.
     Vsync,
+    /// A rendered frame reached the ASC reader. Only wakes the loop: its pass drains the reader.
+    ImageAvailable,
     /// An `ASurfaceControl` transaction completed (ASurfaceControl backend only): the real latch
     /// time + the previous buffer's release fence, forwarded from the completion callback (a binder
     /// thread) so the decode loop applies it on its own thread.
@@ -559,6 +561,7 @@ fn bring_up(
             )
             .map(|mut a| {
                 a.set_hdr_meta(hdr_static);
+                a.wake_on_image(ev_tx.clone());
                 a
             })
         });
@@ -837,6 +840,7 @@ impl State {
             }),
             DecodeEvent::FormatChanged => pass.fmt_dirty = true,
             DecodeEvent::Vsync => pass.vsync_tick = true,
+            DecodeEvent::ImageAvailable => {}
             DecodeEvent::Error { fatal: true } => self.fatal = true,
             // A recoverable/transient codec error is a decode hiccup on a broken reference chain —
             // arm the freeze so the concealed output it recovers into is held off the screen.
