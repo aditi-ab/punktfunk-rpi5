@@ -472,18 +472,15 @@ struct ContentView: View {
                 let approvedFingerprint = awaitingApproval?.host.id == host.id
                     ? model.connection?.hostFingerprint : nil
                 if awaitingApproval?.host.id == host.id { awaitingApproval = nil }
-                // Persist on the next runloop tick: HostStore is an ObservableObject, and mutating
-                // its @Published from inside .onChange (a view-update callback) trips SwiftUI's
-                // "Publishing changes from within view updates". A one-tick delay is imperceptible.
-                // The session's own Welcome told us where this host's library lives — the one
-                // source that does not need an mDNS advert, so it also covers a host reached by
-                // address over a VPN. 0 = not advertised; updateMgmtPort ignores it.
+                // The session's Welcome names the library's port without an mDNS advert, so a
+                // host reached by address over a VPN has one too. 0 is not advertised.
                 let liveMgmtPort = model.connection?.hostMgmtPort
                 let store = store
+                // On the next run-loop turn: a store write inside `.onChange` publishes from
+                // within a view update.
                 DispatchQueue.main.async {
-                    store.markConnected(host.id)
-                    store.updateMgmtPort(host.id, port: liveMgmtPort)
-                    if let approvedFingerprint { store.pin(host.id, fingerprint: approvedFingerprint) }
+                    store.markConnected(
+                        host.id, mgmtPort: liveMgmtPort, fingerprint: approvedFingerprint)
                 }
             case .idle:
                 // The delegated-approval connect failed, timed out, or was cancelled — drop the

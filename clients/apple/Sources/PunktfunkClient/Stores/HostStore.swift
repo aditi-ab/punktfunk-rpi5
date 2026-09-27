@@ -120,9 +120,16 @@ final class HostStore: ObservableObject {
         hosts[i] = host
     }
 
-    func markConnected(_ hostID: UUID) {
+    /// A session started: stamp it, with what the session itself taught us about the host.
+    /// One write, because each one encodes the store and reloads both widgets. A `mgmtPort`
+    /// of 0 is not advertised.
+    func markConnected(_ hostID: UUID, mgmtPort: UInt16? = nil, fingerprint: Data? = nil) {
         guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
-        hosts[i].lastConnected = Date() // didSet → persist() writes the shared suite + reloads widget
+        var host = hosts[i]
+        host.lastConnected = Date()
+        if let mgmtPort, mgmtPort > 0 { host.mgmtPort = mgmtPort }
+        if let fingerprint { host.pinnedSHA256 = fingerprint }
+        hosts[i] = host
     }
 
     /// Is `host` reachable RIGHT NOW — the one definition of online, used by the pip, the
