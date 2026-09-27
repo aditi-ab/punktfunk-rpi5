@@ -58,7 +58,7 @@ classify() {
                 clients/linux/*|clients/session/*|clients/shared/*|\
                 crates/punktfunk-core/*|crates/punktfunk-ffi/*|\
                 crates/pf-bitstream/*|crates/pf-client-core/*|crates/pf-console-ui/*|\
-                crates/pf-dxvadec/*|crates/pf-libva/*|crates/pf-presenter/*|\
+                crates/pf-dmabuf/*|crates/pf-dxvadec/*|crates/pf-libva/*|crates/pf-presenter/*|\
                 crates/pf-update-check/*|crates/pf-vaapi/*|crates/pf-vkdecode/*|\
                 crates/pyrowave-sys/*|ci/rust-ci-arm64cross.Dockerfile|\
                 scripts/ci/ensure-sccache.sh|scripts/ci/install-retrying-curl.sh)

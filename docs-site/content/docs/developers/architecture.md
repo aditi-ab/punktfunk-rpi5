@@ -120,8 +120,10 @@ HDR over the virtual display.
 | `crates/pf-encode-core` | The `Encoder` trait and the policy every backend shares |
 | `crates/pf-encode`, `pf-encode-win` | Encoder backends on Linux and Windows |
 | `crates/punktfunk-encode-worker` | Separate binary that runs PyroWave at raised GPU priority |
-| `crates/pf-zerocopy` | CUDA, EGL and Vulkan dmabuf import and fence sync (Linux) |
+| `crates/pf-zerocopy` | CUDA, EGL and Vulkan dmabuf import (Linux) |
+| `crates/pf-dmabuf` | dmabuf fence wait and read-only mapping, shared by host and clients (Linux) |
 | `crates/pf-inject` | Keyboard, mouse, pen and virtual-gamepad injection |
+| `crates/pf-portal` | The one tokio runtime every portal call runs on (Linux) |
 | `crates/pf-clipboard` | Shared clipboard backends and the clipboard plane |
 | `crates/pf-audio` | Desktop audio capture, the virtual microphone, pad audio and the Windows wiring plan |
 | `crates/pf-frame`, `pf-gpu`, `pf-win-display` | Frame vocabulary; GPU selection; Windows display topology |

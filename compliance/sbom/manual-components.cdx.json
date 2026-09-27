@@ -145,7 +145,7 @@
       "type": "library",
       "name": "usbip",
       "version": "0.8.0",
-      "description": "USB/IP server simulation, vendored and trimmed as usbip-sim at crates/punktfunk-host/vendor/usbip-sim; changes listed in its NOTICE",
+      "description": "USB/IP server simulation, vendored and trimmed as usbip-sim at crates/pf-inject/vendor/usbip-sim; changes listed in its NOTICE",
       "licenses": [
         {
           "license": {

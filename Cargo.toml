@@ -4,7 +4,6 @@ members = [
     "crates/punktfunk-core",
     "crates/punktfunk-ffi",
     "crates/punktfunk-host",
-    "crates/punktfunk-host/vendor/usbip-sim",
     # The capability-carrying PyroWave encode worker. A SEPARATE binary by design — never a
     # hardlink of, or a subcommand of, punktfunk-host (design/gpu-priority-capability-worker.md).
     "crates/punktfunk-encode-worker",
@@ -27,6 +26,8 @@ members = [
     "crates/pf-host-config",
     "crates/pf-gpu",
     "crates/pf-zerocopy",
+    "crates/pf-dmabuf",
+    "crates/pf-portal",
     "crates/pf-frame",
     "crates/pf-win-display",
     "crates/pf-encode",
@@ -35,6 +36,7 @@ members = [
     "crates/pf-capture",
     "crates/pf-inject",
     "crates/pf-audio",
+    "crates/pf-inject/vendor/usbip-sim",
     "crates/pf-vdisplay",
     "crates/pf-vkdecode",
     "crates/pf-dxvadec",
@@ -122,7 +124,7 @@ unsafe_op_in_unsafe_fn = "deny"
 # with `[lints] workspace = true`; `packaging/windows/drivers` and `packaging/windows/pf-vkhdr-layer`
 # are SEPARATE workspaces and restate it (any "workspace-wide" claim must be made three times or it
 # is false). Of the members, only the two vendored snapshots (pf-bitstream/vendor/cros-codecs,
-# punktfunk-host/vendor/usbip-sim) stay out, deliberately — upstream code stays pristine.
+# pf-inject/vendor/usbip-sim) stay out, deliberately — upstream code stays pristine.
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 

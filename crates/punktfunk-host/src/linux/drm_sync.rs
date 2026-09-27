@@ -3,7 +3,7 @@
 //!
 //! Unused: no target compositor ships a usable producer `sync_fd`.
 //! Zero-copy waits the consumer dmabuf fence instead
-//! (`pf_zerocopy::dmabuf_fence`). Kept compiled and ioctl-locked so a
+//! (`pf_dmabuf::fence`). Kept compiled and ioctl-locked so a
 //! producer can be wired without rediscovering request numbers.
 //!
 //! Syncobjs are DRM-core; any render node can import and wait them.
