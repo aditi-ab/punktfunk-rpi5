@@ -121,6 +121,7 @@ HDR over the virtual display.
 | `crates/pf-zerocopy` | CUDA, EGL and Vulkan dmabuf import (Linux) |
 | `crates/pf-dmabuf` | dmabuf fence wait and read-only mapping, shared by host and clients (Linux) |
 | `crates/pf-inject` | Keyboard, mouse, pen and virtual-gamepad injection |
+| `crates/pf-portal` | The one tokio runtime every portal call runs on (Linux) |
 | `crates/pf-clipboard` | Shared clipboard backends and the clipboard plane |
 | `crates/pf-frame`, `pf-gpu`, `pf-win-display` | Frame vocabulary; GPU selection; Windows display topology |
 | `crates/pf-host-config` | The settings registry, its store and the env knobs |

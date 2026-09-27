@@ -7,7 +7,7 @@
 //!
 //! The portal/Mutter session and the EIS connection must stay alive, and the event
 //! stream must be polled (resume/pause/ping). The worker parks on the shared portal
-//! runtime (`pf_capture::portal_rt`); the control thread only enqueues via
+//! runtime (`pf_portal`); the control thread only enqueues via
 //! [`LibeiInjector::inject`].
 //!
 //! Keyboard codes are Linux evdev. The compositor supplies the keymap, so there is
@@ -78,7 +78,7 @@ impl InputInjector for LibeiInjector {
 fn worker(rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     // Shared, never dropped: a per-worker runtime took ashpd's process-global
     // D-Bus connection down with it, and the next session's portal open hung.
-    let rt = match pf_capture::portal_rt::portal_runtime() {
+    let rt = match pf_portal::portal_runtime() {
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!(error = %e, "libei: no portal runtime");

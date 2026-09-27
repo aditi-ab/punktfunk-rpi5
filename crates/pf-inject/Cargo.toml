@@ -27,9 +27,10 @@ tracing = "0.1"
 libc = "0.2"
 parking_lot = "0.12"
 # The RemoteDesktop portal for the libei injector on KWin/GNOME (headless grant via kde-authorized).
-ashpd = { version = "0.13", features = ["remote_desktop"] }
-# The shared, never-dropped portal runtime the libei worker parks on (`pf_capture::portal_rt`).
-pf-capture = { path = "../pf-capture" }
+# `screencast` too: ashpd 0.13's `remote_desktop` names `screencast::Stream` without enabling it.
+ashpd = { version = "0.13", features = ["remote_desktop", "screencast"] }
+# The shared, never-dropped portal runtime the libei worker parks on.
+pf-portal = { path = "../pf-portal" }
 # Input injection into headless Sway via the wlroots virtual-input Wayland protocols.
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }

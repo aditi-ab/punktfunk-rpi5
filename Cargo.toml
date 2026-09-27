@@ -27,6 +27,7 @@ members = [
     "crates/pf-gpu",
     "crates/pf-zerocopy",
     "crates/pf-dmabuf",
+    "crates/pf-portal",
     "crates/pf-frame",
     "crates/pf-win-display",
     "crates/pf-encode",

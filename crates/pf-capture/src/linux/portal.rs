@@ -4,7 +4,7 @@
 //! Nothing here is per-frame. The handshake runs once; the thread then parks until
 //! `PortalSession`'s `Drop` (parent module) fires `quit_rx`, closes the portal
 //! session and signals done. ashpd's `Session` has no `Drop`, and the zbus
-//! connection is process-global (`crate::portal_rt`), so only `Session.Close`
+//! connection is process-global (`pf_portal`), so only `Session.Close`
 //! ends the compositor's cast.
 //!
 //! HDR offer is scoped to `PUNKTFUNK_CAPTURE_MONITOR` when set; unpinned it is
@@ -132,10 +132,10 @@ pub(super) fn portal_thread(
     want_metadata_cursor: bool,
     anchored: bool,
 ) {
-    // Shared, never dropped (`crate::portal_rt`): a per-session runtime took
+    // Shared, never dropped (`pf_portal`): a per-session runtime took
     // ashpd's process-global D-Bus connection down with it, and every later
     // handshake in the process hung.
-    let rt = match crate::portal_rt::portal_runtime() {
+    let rt = match pf_portal::portal_runtime() {
         Ok(rt) => rt,
         Err(e) => {
             let _ = setup_tx.send(Err(e));

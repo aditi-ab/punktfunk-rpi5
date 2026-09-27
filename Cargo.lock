@@ -3116,6 +3116,7 @@ dependencies = [
  "pf-frame",
  "pf-gpu",
  "pf-host-config",
+ "pf-portal",
  "pf-win-display",
  "pf-zerocopy",
  "pipewire",
@@ -3324,6 +3325,7 @@ dependencies = [
  "pf-driver-proto",
  "pf-host-config",
  "pf-paths",
+ "pf-portal",
  "pf-win-display",
  "punktfunk-core",
  "reis",
@@ -3367,6 +3369,13 @@ version = "0.40.0"
 dependencies = [
  "tracing",
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "pf-portal"
+version = "0.40.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -3435,6 +3444,7 @@ dependencies = [
  "pf-gpu",
  "pf-host-config",
  "pf-paths",
+ "pf-portal",
  "pf-win-display",
  "punktfunk-core",
  "serde",

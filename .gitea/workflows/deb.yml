@@ -63,6 +63,7 @@ on:
       - 'crates/pf-libva/**'
       - 'crates/pf-paths/**'
       - 'crates/pf-paths-win/**'
+      - 'crates/pf-portal/**'
       - 'crates/pf-presenter/**'
       - 'crates/pf-update/**'
       - 'crates/pf-update-check/**'
