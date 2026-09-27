@@ -243,10 +243,11 @@
       "id": "apple-client",
       "name": "iPhone, iPad, Apple TV",
       "installs": "client",
-      "packageManager": "testflight",
+      "packageManager": "appstore",
       "docs": "/docs/install-client#ios-ipados-apple-tv",
       "floor": "iOS, iPadOS and tvOS 17 or newer",
-      "url": "https://testflight.apple.com/join/Qr7uSemk"
+      "url": "https://apps.apple.com/app/id6779991756",
+      "testflight": "https://testflight.apple.com/join/Qr7uSemk"
     },
     {
       "id": "android-client",
