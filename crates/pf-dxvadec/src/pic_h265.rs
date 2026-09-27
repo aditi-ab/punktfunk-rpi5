@@ -25,10 +25,9 @@ use cros_codecs::codec::h265::parser::Sps;
 use pf_bitstream::h265::AuPlan;
 use pf_bitstream::h265::PicId;
 use pf_bitstream::h265::RefPic;
+use pf_bitstream::h265::RefRpsIdxError;
 use pf_bitstream::slots::SlotError;
 use pf_bitstream::slots::SlotMap;
-use pf_vkdecode::num_delta_pocs_of_ref_rps_idx;
-use pf_vkdecode::RefRpsIdxError;
 use tracing::trace;
 
 use crate::dxva::HevcFormatFlags;
@@ -368,7 +367,7 @@ pub fn plan_to_dxva_h265(
     }
 
     // Everything else fallible, before any mutation.
-    let num_delta_pocs = num_delta_pocs_of_ref_rps_idx(plan)?;
+    let num_delta_pocs = plan.num_delta_pocs_of_ref_rps_idx()?;
     let st_rps_bits = u16::try_from(pic.short_term_ref_pic_set_size_bits).map_err(|_| {
         PlanToDxvaH265Error::StRpsBitsOverflow(pic.short_term_ref_pic_set_size_bits)
     })?;

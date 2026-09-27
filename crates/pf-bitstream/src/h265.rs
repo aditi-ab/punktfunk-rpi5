@@ -58,6 +58,9 @@ use crate::sei;
 pub use crate::sei::RecoveryPointHevc;
 
 pub mod conceal;
+mod refs;
+
+pub use refs::RefRpsIdxError;
 
 /// Everything a backend needs to submit one access unit.
 #[derive(Debug, Clone)]

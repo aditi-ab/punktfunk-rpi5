@@ -59,6 +59,7 @@ pub use pf_bitstream::h264::PlanWarning;
 /// `NonZeroReorder` (and H.264 `Mmco5Rebase`) are planned in full; dropping
 /// those frames hitches every SPS activation.
 pub use pf_bitstream::h265::PlanWarning as H265PlanWarning;
+pub use pf_bitstream::h265::RefRpsIdxError;
 
 pub use caps::derive_caps;
 pub use caps::plane_formats;
@@ -124,11 +125,9 @@ pub use pic_av1::OwnedStdAv1PictureInfo;
 pub use pic_av1::PlanToVkAv1Error;
 pub use pic_av1::VkRefAv1;
 pub use pic_av1::REFERENCE_NAME_UNUSED;
-pub use pic_h265::num_delta_pocs_of_ref_rps_idx;
 pub use pic_h265::plan_to_vk_h265;
 pub use pic_h265::DecodePlanVkH265;
 pub use pic_h265::PlanToVkH265Error;
-pub use pic_h265::RefRpsIdxError;
 pub use pic_h265::VkRefH265;
 pub use pic_h265::H265_RPS_LIST_SIZE;
 pub use recovery::RecoveryMark;

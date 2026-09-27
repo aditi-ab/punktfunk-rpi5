@@ -33,13 +33,10 @@ pub mod pic_h265;
 pub use pf_bitstream::av1::tiles::plan_bitstream;
 pub use pf_bitstream::av1::tiles::Av1Bitstream;
 pub use pf_bitstream::av1::tiles::Av1TileError;
+pub use pf_bitstream::h265::RefRpsIdxError;
 /// DPB slot ledger, re-exported from [`pf_bitstream`] (crate docs).
 pub use pf_bitstream::slots::SlotError;
 pub use pf_bitstream::slots::SlotMap;
-/// `NumDeltaPocsOfRefRpsIdx` (7.4.8), re-exported from [`pf_vkdecode`]: one
-/// derivation for both backends, tested there.
-pub use pf_vkdecode::num_delta_pocs_of_ref_rps_idx;
-pub use pf_vkdecode::RefRpsIdxError;
 
 // DXVA submit is synchronous (`BeginFrame`…`EndFrame`); there is no decoder
 // object here. Re-exports let the Windows layer name planner types without a
