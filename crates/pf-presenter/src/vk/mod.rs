@@ -30,6 +30,8 @@ mod present_timing;
 mod reconfig;
 mod resources;
 mod setup;
+#[cfg(target_os = "linux")]
+mod sync_timeline;
 
 pub use setup::{list_adapters, probe_decode, AdapterDecode, PresentPref};
 
@@ -119,6 +121,8 @@ struct HwCtx {
     imports: crate::dmabuf::ImportCache,
     /// Decode sync_file → semaphore. `None`: the frame's fences are polled instead.
     sync: Option<crate::dmabuf::SyncImport>,
+    /// Exportable timelines for the native lane's explicit sync; `None` keeps it implicit.
+    timelines: Option<sync_timeline::TimelineMaker>,
 }
 
 /// Win32 external-memory + keyed-mutex table; present only when both extensions exist.
@@ -329,6 +333,14 @@ pub struct Presenter {
     /// The overlay image on the lane's overlay surface now.
     #[cfg(target_os = "linux")]
     overlay_shown: Option<vk::Image>,
+    /// Explicit-sync timelines per VAAPI pool slot the lane has shown.
+    #[cfg(target_os = "linux")]
+    vaapi_sync: std::collections::HashMap<u64, sync_timeline::Timelines>,
+    /// The lane's last frame was PQ, shown through the compositor's colour management.
+    native_pq: bool,
+    /// `flip` diagnostic: when it started; the lane owns even periods, the swapchain odd.
+    #[cfg(target_os = "linux")]
+    native_flip: Option<std::time::Instant>,
     /// An overlay is up that the lane cannot show: frames go through the swapchain.
     overlay_blocks_native: bool,
     /// The last frame shown went through the native lane, not the swapchain.
@@ -397,8 +409,12 @@ impl Presenter {
         decoded_ns: u64,
     ) -> crate::wl_native::Outcome {
         use crate::wl_native::{Outcome, SlotState};
+        self.poll_native_releases();
         let view = (self.extent.width, self.extent.height);
         let suspended = self.suspended;
+        if self.flip_holds_swapchain() {
+            return Outcome::Declined(d);
+        }
         let Some(lane) = self.native.as_mut().filter(|_| !self.overlay_blocks_native) else {
             return Outcome::Declined(d);
         };
@@ -426,14 +442,89 @@ impl Presenter {
                 return Outcome::Declined(d);
             }
         }
+        let (key, pq, meta) = (d.pool_key, d.color.is_pq(), self.hdr_meta);
+        let point = match self.vaapi_point(key) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "native scanout: acquire point");
+                return Outcome::Dropped;
+            }
+        };
         let Some(lane) = self.native.as_mut() else {
             return Outcome::Dropped;
         };
-        if lane.commit_vaapi(d, pts_ns, decoded_ns) {
+        if lane.commit_vaapi(d, meta, pts_ns, decoded_ns, point) {
             self.native_last = true;
+            self.native_pq = pq;
             Outcome::Shown
         } else {
+            if let Some(t) = self.vaapi_sync.get_mut(&key) {
+                t.uncommit();
+            }
             Outcome::Dropped
+        }
+    }
+
+    /// Under explicit sync, the next acquire and release point for VAAPI slot `key`, its
+    /// acquire already signalled from the host: the pump waited the decode. Timelines are made
+    /// and imported on the slot's first commit. `None` under implicit sync.
+    #[cfg(target_os = "linux")]
+    fn vaapi_point(&mut self, key: u64) -> anyhow::Result<Option<u64>> {
+        let (Some(lane), Some(maker)) = (
+            self.native.as_mut(),
+            self.hw.as_ref().and_then(|h| h.timelines.as_ref()),
+        ) else {
+            return Ok(None);
+        };
+        if !lane.explicit_sync() {
+            return Ok(None);
+        }
+        let t = match self.vaapi_sync.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                // SAFETY: the maker was made for this presenter's device.
+                let t = unsafe { maker.make(&self.device)? };
+                let (a, r) = t.fds();
+                lane.import_timelines(key, a, r);
+                v.insert(t)
+            }
+        };
+        let point = t.next_point();
+        // SAFETY: the presenter's device owns the timeline; points only rise.
+        if let Err(e) = unsafe { t.signal_acquire(&self.device, point) } {
+            t.uncommit();
+            return Err(e);
+        }
+        Ok(Some(point))
+    }
+
+    /// Under the `flip` diagnostic, whether this period belongs to the swapchain.
+    #[cfg(target_os = "linux")]
+    fn flip_holds_swapchain(&self) -> bool {
+        self.native_flip.is_some_and(|t| {
+            (t.elapsed().as_millis() / crate::wl_native::FLIP_PERIOD.as_millis()) % 2 == 1
+        })
+    }
+
+    /// Free every lane buffer whose release point passed: ring slots and VAAPI slots.
+    #[cfg(target_os = "linux")]
+    fn poll_native_releases(&mut self) {
+        let Some(lane) = self.native.as_mut() else {
+            return;
+        };
+        for ring in [self.export_ring.as_mut(), self.overlay_ring.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            for key in ring.poll_releases() {
+                lane.released(key);
+            }
+        }
+        for (key, t) in &mut self.vaapi_sync {
+            // SAFETY: the presenter's device owns the timelines.
+            if t.is_committed() && !unsafe { t.poll_held(&self.device) } {
+                lane.released(*key);
+            }
         }
     }
 
@@ -478,6 +569,9 @@ impl Presenter {
             f.destroy(&self.device); // queue drained above: its reads are done
         }
         self.suspended = true;
+        if let Some(lane) = self.native.as_mut() {
+            lane.take_window();
+        }
         tracing::info!("native scanout: the lane owns the window, swapchain suspended");
         Ok(())
     }
@@ -486,6 +580,10 @@ impl Presenter {
     /// a swapchain on it.
     #[cfg(target_os = "linux")]
     fn resume_swapchain(&mut self, window: &sdl3::video::Window) -> anyhow::Result<()> {
+        // The lane's surface objects go first: the swapchain makes its own.
+        if let Some(lane) = self.native.as_mut() {
+            lane.release_window();
+        }
         // SAFETY: CREATE — `instance` is live; SDL returns a surface we own and destroy.
         let surface = unsafe { window.vulkan_create_surface(self.instance.handle()) }
             .map_err(|e| anyhow::anyhow!("SDL_Vulkan_CreateSurface: {e}"))?;
@@ -532,13 +630,16 @@ impl Presenter {
         decoded_ns: u64,
     ) -> NativeVkOutcome {
         use crate::wl_native::SlotState;
+        self.poll_native_releases();
         let view = (self.extent.width, self.extent.height);
-        if self.overlay_blocks_native {
+        if self.overlay_blocks_native || self.flip_holds_swapchain() {
             return NativeVkOutcome::Declined(f);
         }
         let (Some(lane), Some(hw)) = (self.native.as_mut(), self.hw.as_ref()) else {
             return NativeVkOutcome::Declined(f);
         };
+        // Timelines only where the lane will put points on the surface.
+        let timelines = hw.timelines.as_ref().filter(|_| lane.explicit_sync());
         lane.pump();
         let Some((fourcc, format)) = export_ring::fourcc_for(f.vk_format) else {
             return NativeVkOutcome::Declined(f);
@@ -585,6 +686,7 @@ impl Presenter {
                     &lane.modifiers_for(fourcc),
                     want.3,
                     export_ring::KEY_PICTURES | (self.export_gen << 8),
+                    timelines,
                 )
             };
             match built {
@@ -594,6 +696,7 @@ impl Presenter {
                         modifier = format!("{:#x}", ring.modifier),
                         width = f.width,
                         height = f.height,
+                        explicit_sync = timelines.is_some(),
                         "native scanout: Vulkan Video pictures copy into exported buffers"
                     );
                     for i in 0..ring.len() {
@@ -604,6 +707,9 @@ impl Presenter {
                             ring.modifier,
                             &ring.planes(i),
                         );
+                        if let Some((a, r)) = ring.sync_fds(i) {
+                            lane.import_timelines(ring.key(i), a, r);
+                        }
                     }
                     self.export_ring = Some(ring);
                 }
@@ -650,20 +756,23 @@ impl Presenter {
                 tracing::warn!(error = %format!("{e:#}"), "native scanout: picture copy failed");
                 NativeVkOutcome::Declined(f)
             }
-            Ok(done) => {
+            Ok(copied) => {
                 // The submit carries `value + 1`: the decoder waits it before reusing the picture.
                 let mut f = f;
                 f.guard.mark_presented();
-                let color = f.color;
+                let (color, pq) = (f.color, f.color.is_pq());
                 drop(f);
-                if !done {
+                let export_ring::Copied::Ready(point) = copied else {
                     return NativeVkOutcome::Dropped;
-                }
+                };
                 let hold = Box::new(ring.hold(slot));
-                if lane.commit(ring.key(slot), color, hold, pts_ns, decoded_ns) {
+                let key = ring.key(slot);
+                if lane.commit(key, color, self.hdr_meta, hold, pts_ns, decoded_ns, point) {
                     self.native_last = true;
+                    self.native_pq = pq;
                     NativeVkOutcome::Shown
                 } else {
+                    ring.uncommit(slot);
                     NativeVkOutcome::Dropped
                 }
             }
@@ -692,6 +801,7 @@ impl Presenter {
         logical: (u32, u32),
     ) {
         use crate::wl_native::SlotState;
+        self.poll_native_releases();
         let Some(lane) = self.native.as_mut() else {
             return;
         };
@@ -716,6 +826,7 @@ impl Presenter {
         let (Some(fourcc), Some(hw)) = (fourcc, self.hw.as_ref()) else {
             return;
         };
+        let timelines = hw.timelines.as_ref().filter(|_| lane.explicit_sync());
         if self
             .overlay_ring
             .as_ref()
@@ -744,6 +855,7 @@ impl Presenter {
                     &lane.modifiers_for(fourcc),
                     shape.3,
                     export_ring::KEY_OVERLAY | (self.export_gen << 8),
+                    timelines,
                 )
             };
             match built {
@@ -756,6 +868,9 @@ impl Presenter {
                             ring.modifier,
                             &ring.planes(i),
                         );
+                        if let Some((a, r)) = ring.sync_fds(i) {
+                            lane.import_timelines(ring.key(i), a, r);
+                        }
                     }
                     self.overlay_ring = Some(ring);
                 }
@@ -788,13 +903,15 @@ impl Presenter {
         // written on this queue; `queue` is this presenter's, synchronised by `queue_lock`.
         let copied = unsafe { ring.copy_overlay(slot, o.image, self.queue, &self.queue_lock) };
         match copied {
-            Ok(true) => {
+            Ok(export_ring::Copied::Ready(point)) => {
                 let hold = Box::new(ring.hold(slot));
-                if lane.overlay_show(ring.key(slot), logical, hold) {
+                if lane.overlay_show(ring.key(slot), logical, hold, point) {
                     self.overlay_shown = Some(o.image);
+                } else {
+                    ring.uncommit(slot);
                 }
             }
-            Ok(false) => {}
+            Ok(export_ring::Copied::Late) => {}
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "native scanout: overlay copy failed");
                 self.overlay_refused = Some(shape);
@@ -964,6 +1081,10 @@ impl Drop for Presenter {
             self.native.take();
             self.export_ring.take();
             self.overlay_ring.take();
+            for (_, t) in self.vaapi_sync.drain() {
+                // SAFETY: host-signalled only; the compositor holds its own syncobj refs.
+                unsafe { t.destroy(&self.device) };
+            }
         }
         // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
         // type and live for the call, and every builder struct is a local that outlives it.

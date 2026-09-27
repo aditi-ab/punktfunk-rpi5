@@ -914,7 +914,7 @@ pub fn native_scanout_wanted() -> bool {
     cfg!(target_os = "linux")
         && matches!(
             std::env::var("PUNKTFUNK_NATIVE_SCANOUT").as_deref(),
-            Ok("1")
+            Ok("1" | "flip")
         )
 }
 

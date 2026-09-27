@@ -160,10 +160,11 @@ impl Presenter {
         Ok(())
     }
 
-    /// Swapchain is HDR10/PQ, not a PQ stream tone-mapped onto SDR.
-    /// User-facing "HDR" indicators should report this, not stream signalling.
+    /// Swapchain is HDR10/PQ, or the native lane hands PQ to the compositor with a PQ
+    /// description; not a PQ stream tone-mapped onto SDR by us. User-facing "HDR"
+    /// indicators should report this, not stream signalling.
     pub fn hdr_active(&self) -> bool {
-        self.hdr_active
+        self.hdr_active || (self.native_last && self.native_pq)
     }
 
     /// The swapchain holds 10 bits a channel (SDR or HDR10): an overlay drawn in 8 would band.

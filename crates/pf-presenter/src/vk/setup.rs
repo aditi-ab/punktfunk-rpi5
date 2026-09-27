@@ -459,11 +459,18 @@ impl Presenter {
                 "dmabuf decode sync (a decode fence the sampling submit waits; \
                  `false` polls the fence on the presenter thread)"
             );
+            // SAFETY: live, paired handles; the extension and feature are checked alongside.
+            let timelines = (sync_fd_ext && have_f12.timeline_semaphore == vk::TRUE)
+                .then(|| unsafe {
+                    super::sync_timeline::TimelineMaker::new(&instance, pdev, &device)
+                })
+                .flatten();
             Some(HwCtx {
                 ext_mem_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
                 modifier_cache: Default::default(),
                 imports: Default::default(),
                 sync,
+                timelines,
             })
         } else {
             None
@@ -651,6 +658,8 @@ impl Presenter {
             )
         }?;
 
+        #[cfg(target_os = "linux")]
+        let native_timelines = hw.as_ref().is_some_and(|h| h.timelines.is_some());
         let mut p = Presenter {
             entry,
             instance,
@@ -710,7 +719,7 @@ impl Presenter {
             placement_logged: None,
             #[cfg(target_os = "linux")]
             native: if crate::wl_native::enabled() {
-                crate::wl_native::NativeLane::new(window).unwrap_or_else(|e| {
+                crate::wl_native::NativeLane::new(window, native_timelines).unwrap_or_else(|e| {
                     tracing::warn!(error = %format!("{e:#}"), "native scanout lane unavailable");
                     None
                 })
@@ -729,6 +738,11 @@ impl Presenter {
             overlay_refused: None,
             #[cfg(target_os = "linux")]
             overlay_shown: None,
+            #[cfg(target_os = "linux")]
+            vaapi_sync: Default::default(),
+            native_pq: false,
+            #[cfg(target_os = "linux")]
+            native_flip: crate::wl_native::flip_mode().then(std::time::Instant::now),
             overlay_blocks_native: false,
             native_last: false,
             suspended: false,

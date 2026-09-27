@@ -7,6 +7,7 @@
 //! write-back the decoder waits before it reuses a sampled picture. Every copy's fence is
 //! waited on the CPU before the commit, so the compositor never reads a half-written buffer.
 
+use super::sync_timeline::{TimelineMaker, Timelines};
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
@@ -79,6 +80,16 @@ struct Slot {
     in_flight: bool,
     /// The compositor holds the buffer.
     busy: Rc<Cell<bool>>,
+    /// Acquire and release timelines under explicit sync; `None` for implicit.
+    sync: Option<Timelines>,
+}
+
+/// What a copy left for the commit.
+pub(crate) enum Copied {
+    /// Committable: under explicit sync once its acquire point (given) signals, else now.
+    Ready(Option<u64>),
+    /// Submitted, but it did not finish in time: nothing to show.
+    Late,
 }
 
 pub(crate) struct ExportRing {
@@ -191,6 +202,7 @@ impl ExportRing {
         wanted: &[u64],
         feedback_gen: u64,
         key_base: u64,
+        timelines: Option<&TimelineMaker>,
     ) -> Result<Self> {
         // SAFETY: fn contract.
         let driver = unsafe { driver_modifiers(instance, pdev, format) };
@@ -241,8 +253,40 @@ impl ExportRing {
                     modifier,
                 )?
             };
+            if let (Some(maker), Some(slot)) = (timelines, ring.slots.last_mut()) {
+                // SAFETY: fn contract: the maker was made for this device.
+                slot.sync = Some(unsafe { maker.make(device)? });
+            }
         }
         Ok(ring)
+    }
+
+    /// `slot`'s (acquire, release) timeline fds, under explicit sync.
+    pub(crate) fn sync_fds(&self, slot: usize) -> Option<(BorrowedFd<'_>, BorrowedFd<'_>)> {
+        self.slots[slot].sync.as_ref().map(Timelines::fds)
+    }
+
+    /// A commit of `slot` that did not happen: its release point is not owed.
+    pub(crate) fn uncommit(&mut self, slot: usize) {
+        if let Some(t) = &mut self.slots[slot].sync {
+            t.uncommit();
+        }
+    }
+
+    /// Keys whose release point passed since the last poll, under explicit sync.
+    pub(crate) fn poll_releases(&mut self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for i in 0..self.slots.len() {
+            let key = self.key(i);
+            let d = &self.device;
+            if let Some(t) = &mut self.slots[i].sync {
+                // SAFETY: the ring's device owns the timelines.
+                if t.is_committed() && !unsafe { t.poll_held(d) } {
+                    out.push(key);
+                }
+            }
+        }
+        out
     }
 
     /// # Safety
@@ -373,6 +417,7 @@ impl ExportRing {
             fence: *fence.as_ref().unwrap_or(&vk::Fence::null()),
             in_flight: false,
             busy: Rc::new(Cell::new(false)),
+            sync: None,
         });
         cmd.context("vkAllocateCommandBuffers")?;
         fence.context("vkCreateFence")?;
@@ -411,10 +456,11 @@ impl ExportRing {
         RingHold(busy.clone())
     }
 
-    /// Copy `frame`'s visible picture into `slot` and wait for the copy. `Err` means nothing
-    /// was submitted. `Ok(true)`: the buffer is complete. `Ok(false)`: submitted, but the copy
-    /// did not finish in time; the slot stays in flight and the frame is not shown. On any
-    /// `Ok` the submit carries the frame's `value + 1` signal.
+    /// Copy `frame`'s visible picture into `slot`. `Err` means nothing was submitted.
+    /// [`Copied::Ready`]: committable (under explicit sync at the given point, the copy still
+    /// running). [`Copied::Late`]: the waited copy did not finish in time; the slot stays in
+    /// flight and the frame is not shown. On any `Ok` the submit carries the frame's
+    /// `value + 1` signal.
     ///
     /// # Safety
     ///
@@ -426,7 +472,7 @@ impl ExportRing {
         frame: &NativeVkFrame,
         queue: vk::Queue,
         lock: &QueueLock,
-    ) -> Result<bool> {
+    ) -> Result<Copied> {
         let src = vk::Image::from_raw(frame.image);
         let decode_layout = match frame.layout {
             NativeVkLayout::DecodeDst => vk::ImageLayout::VIDEO_DECODE_DST_KHR,
@@ -527,7 +573,7 @@ impl ExportRing {
         src: vk::Image,
         queue: vk::Queue,
         lock: &QueueLock,
-    ) -> Result<bool> {
+    ) -> Result<Copied> {
         let range = subresource(0);
         let region = vk::ImageCopy {
             src_subresource: vk::ImageSubresourceLayers {
@@ -602,7 +648,9 @@ impl ExportRing {
 
     /// One copy into `slot`: take the export image back from the compositor, let `record`
     /// copy into it, hand it back, submit (waiting `timeline`'s value at TRANSFER and
-    /// signalling value + 1) and wait the fence. Results as [`Self::copy`].
+    /// signalling value + 1). Under explicit sync the submit also signals the slot's next
+    /// acquire point and returns at once; otherwise the fence is waited. Results as
+    /// [`Self::copy`].
     ///
     /// # Safety
     ///
@@ -614,7 +662,7 @@ impl ExportRing {
         queue: vk::Queue,
         lock: &QueueLock,
         record: impl FnOnce(&ash::Device, vk::CommandBuffer, vk::Image),
-    ) -> Result<bool> {
+    ) -> Result<Copied> {
         let d = &self.device;
         let own = self.qfi;
         let s = &mut self.slots[slot];
@@ -678,38 +726,56 @@ impl ExportRing {
             d.end_command_buffer(s.cmd)?;
         }
         let cmds = [s.cmd];
-        let sems: Vec<vk::Semaphore> = timeline.iter().map(|t| t.0).collect();
+        let wait_sems: Vec<vk::Semaphore> = timeline.iter().map(|t| t.0).collect();
         let wait_values: Vec<u64> = timeline.iter().map(|t| t.1).collect();
-        let signal_values: Vec<u64> = timeline.iter().map(|t| t.1 + 1).collect();
         let stages: Vec<vk::PipelineStageFlags> = timeline
             .iter()
             .map(|_| vk::PipelineStageFlags::TRANSFER)
             .collect();
+        let mut signal_sems = wait_sems.clone();
+        let mut signal_values: Vec<u64> = timeline.iter().map(|t| t.1 + 1).collect();
+        // The acquire point the commit will carry; recorded as owed until its release.
+        let point = s.sync.as_mut().map(|t| {
+            let p = t.next_point();
+            signal_sems.push(t.acquire);
+            signal_values.push(p);
+            p
+        });
         let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
             .wait_semaphore_values(&wait_values)
             .signal_semaphore_values(&signal_values);
         let mut submit = vk::SubmitInfo::default()
-            .wait_semaphores(&sems)
+            .wait_semaphores(&wait_sems)
             .wait_dst_stage_mask(&stages)
             .command_buffers(&cmds)
-            .signal_semaphores(&sems);
-        if timeline.is_some() {
+            .signal_semaphores(&signal_sems);
+        if !signal_sems.is_empty() {
             submit = submit.push_next(&mut timeline_info);
         }
-        {
+        let submitted = {
             let _q = lock.guard();
             // SAFETY: fn contract (queue external sync held by `_q`); the submit's arrays
             // are locals that outlive the call.
-            unsafe { d.queue_submit(queue, &[submit], s.fence) }.context("vkQueueSubmit (copy)")?;
+            unsafe { d.queue_submit(queue, &[submit], s.fence) }
+        };
+        if let Err(e) = submitted {
+            if let Some(t) = &mut s.sync {
+                t.uncommit();
+            }
+            return Err(e).context("vkQueueSubmit (copy)");
         }
         s.in_flight = true;
+        // The compositor waits the acquire point itself.
+        if point.is_some() {
+            return Ok(Copied::Ready(point));
+        }
         // SAFETY: the fence belongs to the submit above.
         match unsafe { d.wait_for_fences(&[s.fence], true, COPY_WAIT_NS) } {
             Ok(()) => {
                 s.in_flight = false;
-                Ok(true)
+                Ok(Copied::Ready(None))
             }
-            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(vk::Result::TIMEOUT) => Ok(Copied::Late),
             Err(e) => Err(e).context("vkWaitForFences (copy)"),
         }
     }
@@ -774,6 +840,9 @@ impl Drop for ExportRing {
             for s in self.slots.drain(..) {
                 if s.fence != vk::Fence::null() {
                     d.destroy_fence(s.fence, None);
+                }
+                if let Some(t) = s.sync {
+                    t.destroy(d);
                 }
                 d.destroy_image(s.image, None);
                 d.free_memory(s.memory, None);
