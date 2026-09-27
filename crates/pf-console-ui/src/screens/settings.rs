@@ -639,11 +639,11 @@ impl SettingsScreen {
         if mbps == 0 {
             return;
         }
-        // Rebase first: another writer may have stored the file while the keyboard was up.
-        *ctx.settings = ctx.store.load();
-        let ceiling_mbps = bitrate_ceiling_kbps(ctx.platform) / 1_000;
-        ctx.settings.bitrate_kbps = mbps.min(ceiling_mbps) * 1000;
-        ctx.store.save(ctx.settings);
+        ctx.write(|c| {
+            let ceiling_mbps = bitrate_ceiling_kbps(c.platform) / 1_000;
+            c.settings.bitrate_kbps = mbps.min(ceiling_mbps) * 1000;
+            true
+        });
     }
 
     fn custom_menu(&mut self, ev: MenuEvent, ctx: &mut Ctx) -> Option<MenuPulse> {
@@ -1017,25 +1017,17 @@ impl SettingsScreen {
             }
             _ => {}
         }
-        // Whole-file writer: rebase before mutate or another writer's store is reverted.
         // Cursor moves must not touch the disk.
-        if matches!(msg, ListMsg::Adjust(_) | ListMsg::Activate) {
-            *ctx.settings = ctx.store.load();
-        }
         match msg {
             ListMsg::Adjust(delta) => {
-                let changed = adjust(focused, delta, false, ctx);
-                if changed {
-                    ctx.store.save(ctx.settings);
+                if ctx.write(|c| adjust(focused, delta, false, c)) {
                     Some(MenuPulse::Move)
                 } else {
                     Some(MenuPulse::Boundary)
                 }
             }
             ListMsg::Activate => {
-                if adjust(focused, 1, true, ctx) {
-                    ctx.store.save(ctx.settings);
-                }
+                ctx.write(|c| adjust(focused, 1, true, c));
                 pulse
             }
             ListMsg::None => pulse,

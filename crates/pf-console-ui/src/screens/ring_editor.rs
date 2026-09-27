@@ -133,11 +133,12 @@ impl RingEditorScreen {
         });
     }
 
-    /// Whole-file writer: rebase on a fresh load so a concurrent save is not reverted.
+    /// Stores `blob` as the ring and adopts it.
     fn write(&mut self, blob: String, ctx: &mut Ctx) {
-        *ctx.settings = ctx.store.load();
-        ctx.settings.overlay_actions = blob;
-        ctx.store.save(ctx.settings);
+        ctx.write(|c| {
+            c.settings.overlay_actions = blob;
+            true
+        });
         let b = ctx.settings.overlay_actions.clone();
         self.adopt(&b, ctx.platform);
     }

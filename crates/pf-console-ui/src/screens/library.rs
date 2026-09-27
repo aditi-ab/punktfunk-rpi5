@@ -435,14 +435,18 @@ fn desk_intent(h: &HostRow) -> ConnectIntent {
 
 /// Write `library_sort` only. Screens re-read it each frame; assigning the field reverts.
 pub(super) fn store_sort(sort: crate::collate::SortKey, ctx: &mut Ctx) {
-    ctx.settings.library_sort = sort.id().to_string();
-    ctx.store.save(ctx.settings);
+    ctx.write(|c| {
+        c.settings.library_sort = sort.id().to_string();
+        true
+    });
 }
 
 /// Write `library_view`. Settings and this bar share the key; last write wins next frame.
 fn store_view(view: LibraryView, ctx: &mut Ctx) {
-    ctx.settings.library_view = view.id().to_string();
-    ctx.store.save(ctx.settings);
+    ctx.write(|c| {
+        c.settings.library_view = view.id().to_string();
+        true
+    });
 }
 
 pub(crate) struct LibraryScreen {
