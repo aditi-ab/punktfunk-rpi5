@@ -189,6 +189,31 @@ impl<B: PadProto + Default> Default for UhidManager<B> {
     }
 }
 
+/// The per-tick half of [`UhidManager`] as an object, so a host keeps its managers of different
+/// backends in one list that both pump and heartbeat walk.
+pub trait UhidTick {
+    fn pump(
+        &mut self,
+        rumble: &mut dyn FnMut(u16, u16, u16, u16, u16),
+        hidout: &mut dyn FnMut(HidOutput),
+    );
+    fn heartbeat(&mut self, max_gap: Duration);
+}
+
+impl<B: PadProto> UhidTick for UhidManager<B> {
+    fn pump(
+        &mut self,
+        rumble: &mut dyn FnMut(u16, u16, u16, u16, u16),
+        hidout: &mut dyn FnMut(HidOutput),
+    ) {
+        UhidManager::pump(self, rumble, hidout);
+    }
+
+    fn heartbeat(&mut self, max_gap: Duration) {
+        UhidManager::heartbeat(self, max_gap);
+    }
+}
+
 impl<B: PadProto> UhidManager<B> {
     pub fn with_backend(backend: B) -> UhidManager<B> {
         let state = (0..MAX_PADS).map(|_| backend.neutral()).collect();
