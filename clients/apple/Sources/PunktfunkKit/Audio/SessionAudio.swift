@@ -917,19 +917,26 @@ public final class SessionAudio {
     /// Two-engine sessions pause/resume the capture engine; a combined session instead mutes the
     /// voice processor's input (playback shares that engine and must keep running, so the engine
     /// itself never pauses — the mute zeroes the mic at the IO unit, and the tap encodes silence).
-    /// Local and instant either way: nothing is negotiated with the host, and the packets that do
+    /// Local either way: nothing is negotiated with the host, and the packets that do
     /// leave carry silence. A no-op when there's no uplink (playback-only / tvOS / mic disabled),
     /// except that the state is LATCHED for an uplink that starts later. The audio SESSION stays
     /// active for background playback, so iOS may keep showing the recording indicator until a
     /// full reconfigure — either path stops room audio leaving the device, which is the
-    /// privacy-relevant part. Main thread.
+    /// privacy-relevant part. Main thread; the engine work runs on `engineQueue`, where an unmute's
+    /// start can block on a Bluetooth mic, and where it can't race a rebuild's teardown.
     public func setMicMuted(_ muted: Bool) {
         stateLock.lock()
         micMuted = muted
-        let capture = captureEngine
-        let combined = combinedEngine
         stateLock.unlock()
-        apply(micMuted: muted, capture: capture, combined: combined)
+        engineQueue.async { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            let muted = self.micMuted // the newest request, if several queued
+            let capture = self.captureEngine
+            let combined = self.combinedEngine
+            self.stateLock.unlock()
+            self.apply(micMuted: muted, capture: capture, combined: combined)
+        }
     }
 
     private var latchedMicMute: Bool {
