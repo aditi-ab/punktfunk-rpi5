@@ -24,7 +24,7 @@ use punktfunk_core::quic::{
     classify, endpoint, io, AccessUpdate, AckReason, BitrateChanged, ClockEcho, ClockProbe,
     ColorInfo, GrantClass, Hello, LinkReport, LossReport, PairRequest, PipelineGap, ProbeRequest,
     ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, RfiRequest, SetBitrate, Start,
-    Welcome, GRANT_ALL, GRANT_CLIPBOARD, GRANT_GAMEPAD, GRANT_LAUNCH, GRANT_MIC, GRANT_POINTER,
+    Welcome, GRANT_ALL, GRANT_CLIPBOARD, GRANT_LAUNCH,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
@@ -608,68 +608,6 @@ const REJECT_BUSY_CODE: u32 = punktfunk_core::reject::REJECT_BUSY_CLOSE_CODE;
 /// closes with code 0, which the client cannot tell from transport trouble.
 fn close_rejected(conn: &link::SessionLink, reason: punktfunk_core::reject::RejectReason) {
     conn.close(reason.close_code(), reason.to_string().as_bytes());
-}
-
-/// One counter and one `warn!` per grant class per session. Totals at end-of-stream;
-/// per-event logging would be a log DoS.
-struct GrantDrops {
-    // One slot per grant bit (7 with `Power`). Power never drops input; `idx` must still
-    // stay in bounds for every `GrantClass`.
-    counts: [AtomicU64; 7],
-    warned: [AtomicBool; 7],
-}
-
-impl GrantDrops {
-    fn new() -> GrantDrops {
-        GrantDrops {
-            counts: std::array::from_fn(|_| AtomicU64::new(0)),
-            warned: std::array::from_fn(|_| AtomicBool::new(false)),
-        }
-    }
-
-    /// Bit position of the grant, so the table cannot drift from the wire vocabulary.
-    fn idx(class: GrantClass) -> usize {
-        class.bit().trailing_zeros() as usize
-    }
-
-    /// Count one drop; log only the first of each class.
-    fn note(&self, class: GrantClass) {
-        let i = Self::idx(class);
-        self.counts[i].fetch_add(1, Ordering::Relaxed);
-        if !self.warned[i].swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                class = ?class,
-                "dropping client input this session's access grants don't cover — counted; \
-                 further drops of this class are silent until the session-end totals"
-            );
-        }
-    }
-
-    /// `Class=count` pairs; `"none"` when nothing was dropped.
-    fn summary(&self) -> String {
-        use std::fmt::Write;
-        let mut out = String::new();
-        for class in [
-            GrantClass::Gamepad,
-            GrantClass::Pointer,
-            GrantClass::Keyboard,
-            GrantClass::Clipboard,
-            GrantClass::Mic,
-            GrantClass::Launch,
-        ] {
-            let n = self.counts[Self::idx(class)].load(Ordering::Relaxed);
-            if n != 0 {
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                let _ = write!(out, "{class:?}={n}");
-            }
-        }
-        if out.is_empty() {
-            out.push_str("none");
-        }
-        out
-    }
 }
 
 /// Seconds before the deadline for best-effort toasts (T−5 m, T−1 m). Older clients miss them.
@@ -1795,6 +1733,7 @@ pub(crate) async fn run_admitted(
         pad_slots_rx,
         launch_outcome_rx,
         peer: peer.ip(),
+        plane: conn.plane(),
         counters: counters.clone(),
         stats: stats.clone(),
     }));
@@ -1955,8 +1894,7 @@ pub(crate) async fn run_admitted(
         // Shared, not local: this task ends with the connection, which closes after the session
         // summary is built, so a local total would never reach it.
         let n = &*counters_dp;
-        // Per-class counts; one warn on the first drop; totals at end-of-stream.
-        let denied = GrantDrops::new();
+        let mut denied = crate::session_status::GrantDrops::new(input_conn.plane());
         let mic_source = crate::audio::mic_source_id();
         // Full queue: drop, never block (would stall mic + this reader). Disconnected ends the loop.
         let offer = |tx: &std::sync::mpsc::SyncSender<ClientInput>, item: ClientInput| match tx
@@ -1974,9 +1912,8 @@ pub(crate) async fn run_admitted(
             // 0xC8 through `classify`.
             let mask = grants_dp.load(Ordering::Relaxed);
             if let Some((seq, pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
-                if mask & GRANT_MIC == 0 {
-                    // Dropping here is the setup gate: forwarding is the only attach this plane has.
-                    denied.note(GrantClass::Mic);
+                // Dropping here is the setup gate: forwarding is the only attach this plane has.
+                if !denied.permitted(mask, GrantClass::Mic) {
                     continue;
                 }
                 n.input_mic.fetch_add(1, Ordering::Relaxed);
@@ -1988,8 +1925,7 @@ pub(crate) async fn run_admitted(
                     opus: opus.to_vec(),
                 });
             } else if let Some(rich) = punktfunk_core::quic::RichInput::decode(&d) {
-                if mask & GRANT_GAMEPAD == 0 {
-                    denied.note(GrantClass::Gamepad);
+                if !denied.permitted(mask, GrantClass::Gamepad) {
                     continue;
                 }
                 n.input_rich.fetch_add(1, Ordering::Relaxed);
@@ -1998,8 +1934,7 @@ pub(crate) async fn run_admitted(
                 }
             } else if let Some(pen) = punktfunk_core::quic::PenBatch::decode(&d) {
                 // 0xCC kind 0x05 stylus (`RichInput::decode` returns None). Same input thread.
-                if mask & GRANT_POINTER == 0 {
-                    denied.note(GrantClass::Pointer);
+                if !denied.permitted(mask, GrantClass::Pointer) {
                     continue;
                 }
                 n.input_rich.fetch_add(1, Ordering::Relaxed);
@@ -2007,9 +1942,7 @@ pub(crate) async fn run_admitted(
                     break;
                 }
             } else if let Some(mut ev) = InputEvent::decode(&d) {
-                let class = classify(ev.kind);
-                if mask & class.bit() == 0 {
-                    denied.note(class);
+                if !denied.permitted(mask, classify(ev.kind)) {
                     continue;
                 }
                 n.input_events.fetch_add(1, Ordering::Relaxed);
@@ -2031,7 +1964,7 @@ pub(crate) async fn run_admitted(
             mic = n.input_mic.load(Ordering::Relaxed),
             rich = n.input_rich.load(Ordering::Relaxed),
             dropped = n.input_dropped.load(Ordering::Relaxed),
-            denied = %denied.summary(),
+            denied = denied.summary().as_deref().unwrap_or("none"),
             "client datagram stream ended"
         );
     });
@@ -4011,7 +3944,7 @@ mod tests {
 
     /// Controller-only passes pads only; View-only passes nothing. Classify is pinned in core.
     #[test]
-    fn input_admission_matrix_and_quiet_drop_accounting() {
+    fn input_admission_matrix() {
         use punktfunk_core::quic::{GRANT_PRESET_CONTROLLER_ONLY, GRANT_PRESET_VIEW_ONLY};
         let admitted = |mask: u32, kind: InputKind| mask & classify(kind).bit() != 0;
 
@@ -4038,14 +3971,6 @@ mod tests {
             assert!(!admitted(GRANT_PRESET_VIEW_ONLY, kind), "{kind:?}");
         }
         assert!(admitted(GRANT_ALL, InputKind::KeyDown));
-
-        // Per-class counters; `"none"` when clean.
-        let drops = GrantDrops::new();
-        assert_eq!(drops.summary(), "none");
-        drops.note(GrantClass::Keyboard);
-        drops.note(GrantClass::Keyboard);
-        drops.note(GrantClass::Mic);
-        assert_eq!(drops.summary(), "Keyboard=2 Mic=1");
     }
 
     /// Pairing-required synthetic host sharing `np` so the test can edit the store live.

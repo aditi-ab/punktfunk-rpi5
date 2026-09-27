@@ -27,8 +27,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::encode::{ChromaFormat, Codec};
 use crate::events::{
-    AudioEgress, BitrateSpan, GyroCadence, InputCounts, SessionEndReason, SessionSummary,
+    AudioEgress, BitrateSpan, GyroCadence, InputCounts, Plane, SessionEndReason, SessionSummary,
 };
+use punktfunk_core::quic::GrantClass;
 
 /// One live native session. The Arcs are the video loop's own handles, so a
 /// mid-stream mode/bitrate change shows on `/status` with no second write.
@@ -333,6 +334,59 @@ impl SessionCounters {
         self.bitrate_sum_kbps
             .fetch_add(u64::from(kbps), Ordering::Relaxed);
         self.bitrate_notes.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Input one session dropped because its access grants don't cover it, per grant class.
+/// One `warn!` on a class's first drop (per-event logging is a log DoS; on GameStream it is
+/// the only support signal, as Moonlight has no grants UX), totals at session end.
+pub struct GrantDrops {
+    plane: Plane,
+    counts: [u64; GrantClass::ALL.len()],
+    warned: [bool; GrantClass::ALL.len()],
+}
+
+impl GrantDrops {
+    pub fn new(plane: Plane) -> GrantDrops {
+        GrantDrops {
+            plane,
+            counts: [0; GrantClass::ALL.len()],
+            warned: [false; GrantClass::ALL.len()],
+        }
+    }
+
+    /// `true` when `mask` grants `class`; otherwise counts the drop and returns `false`.
+    pub fn permitted(&mut self, mask: u32, class: GrantClass) -> bool {
+        if mask & class.bit() != 0 {
+            return true;
+        }
+        self.note(class);
+        false
+    }
+
+    /// Count one drop; log only the first of each class.
+    pub fn note(&mut self, class: GrantClass) {
+        let i = class.bit().trailing_zeros() as usize;
+        self.counts[i] += 1;
+        if !std::mem::replace(&mut self.warned[i], true) {
+            tracing::warn!(
+                class = ?class,
+                plane = self.plane.as_str(),
+                "dropping client input this session's access grants don't cover — counted; \
+                 further drops of this class are silent until the session-end totals"
+            );
+        }
+    }
+
+    /// `Class=count` pairs in bit order; `None` when nothing was dropped.
+    pub fn summary(&self) -> Option<String> {
+        let pairs: Vec<String> = GrantClass::ALL
+            .iter()
+            .zip(self.counts)
+            .filter(|(_, n)| *n != 0)
+            .map(|(class, n)| format!("{class:?}={n}"))
+            .collect();
+        (!pairs.is_empty()).then(|| pairs.join(" "))
     }
 }
 
@@ -1301,6 +1355,27 @@ pub fn force_idr_all() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Controller-only passes the pad and counts keyboard and pointer drops per class;
+    /// the summary lists only classes that dropped, in bit order.
+    #[test]
+    fn grant_drops_pass_the_granted_class_and_count_the_rest() {
+        use punktfunk_core::input::InputKind;
+        use punktfunk_core::quic::{classify, GRANT_PRESET_CONTROLLER_ONLY};
+        let mut drops = GrantDrops::new(Plane::Gamestream);
+        assert_eq!(drops.summary(), None);
+        let mask = GRANT_PRESET_CONTROLLER_ONLY;
+        assert!(drops.permitted(mask, classify(InputKind::GamepadButton)));
+        assert!(!drops.permitted(mask, classify(InputKind::KeyDown)));
+        assert!(!drops.permitted(mask, classify(InputKind::TextInput)));
+        assert!(!drops.permitted(mask, classify(InputKind::MouseMove)));
+        assert!(!drops.permitted(mask, GrantClass::Pointer));
+        drops.note(GrantClass::Mic);
+        assert_eq!(
+            drops.summary().as_deref(),
+            Some("Pointer=2 Keyboard=2 Mic=1")
+        );
+    }
 
     /// The live-session registry is one table for the whole test binary: a
     /// session one test registers is an active stream to another test's route,

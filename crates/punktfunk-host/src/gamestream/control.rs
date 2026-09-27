@@ -17,7 +17,9 @@
 //! one is removed. Pairing itself is HTTPS on nvhttp, never this port.
 
 use super::{AppState, LaunchSession, CONTROL_PORT};
+use crate::events::Plane;
 use crate::inject::gamepad::GamepadManager;
+use crate::session_status::GrantDrops;
 use anyhow::{anyhow, Context, Result};
 use pf_frame::HdrMeta;
 use punktfunk_core::input::{GamepadEvent, InputEvent};
@@ -132,79 +134,11 @@ impl SessionAccess {
     }
 }
 
-/// Per-(session, grant-class) drop counts. One `warn!` per class for the whole session
-/// (per-event logging is a DoS); totals at session end. Plain integers: this thread is
-/// the only writer and reader.
-struct GrantDrops {
-    // One slot per grant bit (7 with `Power`). Power never drops input, but `idx` must
-    // stay in bounds for every `GrantClass`.
-    counts: [u64; 7],
-    warned: [bool; 7],
-}
-
-impl GrantDrops {
-    fn new() -> GrantDrops {
-        GrantDrops {
-            counts: [0; 7],
-            warned: [false; 7],
-        }
+/// Log the ending session's grant-drop totals, if any, and zero the count for the next one.
+fn end_of_session(drops: &mut GrantDrops) {
+    if let Some(totals) = std::mem::replace(drops, GrantDrops::new(Plane::Gamestream)).summary() {
+        tracing::info!(drops = %totals, "gamestream: access-grant drop totals for the session");
     }
-
-    /// Slot in the fixed tables: the grant's bit position, so layout cannot drift from the wire.
-    fn idx(class: GrantClass) -> usize {
-        class.bit().trailing_zeros() as usize
-    }
-
-    /// Count one drop; log only the first of each class. Moonlight has no grants UX, so
-    /// that first warn is the only support signal.
-    fn note(&mut self, class: GrantClass) {
-        let i = Self::idx(class);
-        self.counts[i] += 1;
-        if !self.warned[i] {
-            self.warned[i] = true;
-            tracing::warn!(
-                class = ?class,
-                "gamestream: dropping client input this session's access grants don't cover — \
-                 counted; further drops of this class are silent until the session-end totals"
-            );
-        }
-    }
-
-    /// Log drop totals (if any) and reset. Call from every teardown arm.
-    fn end_of_session(&mut self) {
-        use std::fmt::Write;
-        let mut out = String::new();
-        for class in [
-            GrantClass::Gamepad,
-            GrantClass::Pointer,
-            GrantClass::Keyboard,
-            GrantClass::Clipboard,
-            GrantClass::Mic,
-            GrantClass::Launch,
-        ] {
-            let n = self.counts[Self::idx(class)];
-            if n != 0 {
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                let _ = write!(out, "{class:?}={n}");
-            }
-        }
-        if !out.is_empty() {
-            tracing::info!(drops = %out, "gamestream: access-grant drop totals for the session");
-        }
-        *self = GrantDrops::new();
-    }
-}
-
-/// Mask test between a decoded event class and its injector. Free function so tests
-/// exercise the same filter the session runs.
-fn permitted(mask: u32, class: GrantClass, drops: &mut GrantDrops) -> bool {
-    if mask & class.bit() != 0 {
-        return true;
-    }
-    drops.note(class);
-    false
 }
 
 /// The virtual Xbox pad this session presents, and the only place this plane picks a backend.
@@ -421,7 +355,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
             let mut last_key: Option<[u8; 16]> = None;
             // Grant mask + deadline for the launch owner; `None` while no session is live.
             let mut access: Option<SessionAccess> = None;
-            let mut drops = GrantDrops::new();
+            let mut drops = GrantDrops::new(Plane::Gamestream);
             loop {
                 // Last pairing removed while live. Send termination + disconnect (same
                 // farewell as host-side session end), flush so it reaches the wire, then
@@ -443,7 +377,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                             while matches!(host.service(), Ok(Some(_))) {}
                         }
                     }
-                    drops.end_of_session();
+                    end_of_session(&mut drops);
                     state.end_session("control stream stopped — last pairing removed");
                     tracing::info!(port = CONTROL_PORT, "control: stopped (no paired clients)");
                     return;
@@ -522,7 +456,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                                 for ev in held.release() {
                                     let _ = inj_tx.send(ev);
                                 }
-                                drops.end_of_session();
+                                end_of_session(&mut drops);
                                 // This stream is the session's liveness. Moonlight holds it
                                 // for the whole stream; a quit or drop often sends no RTSP
                                 // TEARDOWN / `/cancel`. UDP send only errors on ICMP, so
@@ -601,7 +535,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                         for ev in held.release() {
                             let _ = inj_tx.send(ev);
                         }
-                        drops.end_of_session();
+                        end_of_session(&mut drops);
                     }
                 }
                 // Pump FF every tick (games block in EVIOCSFF until answered). Legacy GCM
@@ -770,7 +704,7 @@ fn on_receive(
     // arrives, so no uinput node and no pad-audio streamer.
     if let Some(gp) = super::gamepad::decode(&pt) {
         crate::sleep_inhibit::note_input();
-        if permitted(grants, GrantClass::Gamepad, drops) {
+        if drops.permitted(grants, GrantClass::Gamepad) {
             state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
             pads.handle(&gp);
         }
@@ -781,7 +715,7 @@ fn on_receive(
     // touches. Pointer-class by the plane tag.
     if let Some(p) = super::input::decode_pointer(&pt) {
         crate::sleep_inhibit::note_input();
-        if permitted(grants, GrantClass::Pointer, drops) {
+        if drops.permitted(grants, GrantClass::Pointer) {
             state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
             pointer.apply(&p, |ev| {
                 held.note(&ev);
@@ -820,7 +754,7 @@ fn on_receive(
     // One mask test, then the injector thread. A closed channel means the injector
     // died at startup; input is lossy, so drop silently.
     for ev in events {
-        if permitted(grants, classify(ev.kind), drops) {
+        if drops.permitted(grants, classify(ev.kind)) {
             state.counters.input_events.fetch_add(1, Ordering::Relaxed);
             held.note(&ev);
             let _ = inj_tx.send(ev);
@@ -1226,47 +1160,6 @@ mod tests {
         assert_eq!(pt.len(), 31);
         assert_eq!(&pt[2..4], &27u16.to_le_bytes());
         assert_eq!(pt[4], 0); // disabled
-    }
-
-    /// Controller-only mask: pad injects, keyboard/pointer are counted-and-dropped.
-    /// `permitted` is what `on_receive` calls. Also pins the drop-count reset.
-    #[test]
-    fn controller_only_mask_passes_the_pad_and_drops_keyboard_and_pointer() {
-        use punktfunk_core::input::InputKind;
-        use punktfunk_core::quic::{classify, GrantClass, GRANT_PRESET_CONTROLLER_ONLY};
-        let mut drops = super::GrantDrops::new();
-        let mask = GRANT_PRESET_CONTROLLER_ONLY;
-        // Pad injects (creation with it — deny-at-setup is upstream of this).
-        assert!(super::permitted(
-            mask,
-            classify(InputKind::GamepadButton),
-            &mut drops
-        ));
-        assert!(!super::permitted(
-            mask,
-            classify(InputKind::KeyDown),
-            &mut drops
-        ));
-        assert!(!super::permitted(
-            mask,
-            classify(InputKind::TextInput),
-            &mut drops
-        ));
-        assert!(!super::permitted(
-            mask,
-            classify(InputKind::MouseMove),
-            &mut drops
-        ));
-        // The pen/touch plane is Pointer-class by its plane tag.
-        assert!(!super::permitted(mask, GrantClass::Pointer, &mut drops));
-        assert_eq!(
-            drops.counts[super::GrantDrops::idx(GrantClass::Keyboard)],
-            2
-        );
-        assert_eq!(drops.counts[super::GrantDrops::idx(GrantClass::Pointer)], 2);
-        assert_eq!(drops.counts[super::GrantDrops::idx(GrantClass::Gamepad)], 0);
-        drops.end_of_session();
-        assert_eq!(drops.counts, [0u64; 7]);
     }
 
     /// No grants record at session start is ungoverned (full control, back-compat for
