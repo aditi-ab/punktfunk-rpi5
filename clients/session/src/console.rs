@@ -1049,9 +1049,10 @@ impl ServiceState {
         }
     }
 
-    /// The console home's rows: saved hosts (most recent first) — each followed by its
-    /// pinned preset cards (design §5.2a) — then discovered-but-unsaved ones, then a
-    /// still-uncovered `--browse` seed.
+    /// The console home's rows: saved hosts in store order, each followed by its pinned
+    /// preset cards (design §5.2a), then discovered-but-unsaved ones by name, then a
+    /// still-uncovered `--browse` seed. `home::arrange` applies the player's sort; the Apple
+    /// and Android producers send the same order (`clients/shared/host-row-vectors.json`).
     fn rows(&self) -> Vec<HostRow> {
         let known = trust::KnownHosts::load();
         let catalog = pf_client_core::presets::PresetsFile::load();
@@ -1064,12 +1065,10 @@ impl ServiceState {
             // host streams at, so the console must not offer to write the global instead.
             bitrate_kbps: p.overrides.bitrate_kbps,
         };
-        // Primary rows paired with their pinned cards, so the sort below can order hosts
-        // while every host's cards stay glued behind its primary tile.
-        let mut saved: Vec<(HostRow, Vec<HostRow>)> = known
+        let mut rows: Vec<HostRow> = known
             .hosts
             .iter()
-            .map(|h| {
+            .flat_map(|h| {
                 let key = if h.fp_hex.is_empty() {
                     format!("{}:{}", h.addr, h.port)
                 } else {
@@ -1158,14 +1157,9 @@ impl ServiceState {
                         bound_preset: None,
                         ..row.clone()
                     })
-                    .collect();
-                (row, pins)
+                    .collect::<Vec<_>>();
+                std::iter::once(row).chain(pins)
             })
-            .collect();
-        saved.sort_by(|(a, _), (b, _)| b.last_used.cmp(&a.last_used).then(a.name.cmp(&b.name)));
-        let mut rows: Vec<HostRow> = saved
-            .into_iter()
-            .flat_map(|(row, pins)| std::iter::once(row).chain(pins))
             .collect();
 
         let mut extra: Vec<HostRow> = self
@@ -1201,7 +1195,7 @@ impl ServiceState {
                 game_presets: Default::default(),
             })
             .collect();
-        extra.sort_by(|a, b| a.name.cmp(&b.name));
+        extra.sort_by_key(|h| h.name.to_lowercase());
         rows.extend(extra);
 
         if let Some(seed) = &self.seed {

@@ -48,6 +48,7 @@ import io.unom.punktfunk.kit.security.IDENTITY_OBTAIN_TIMEOUT_MS
 import io.unom.punktfunk.kit.security.IdentityStore
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
+import io.unom.punktfunk.kit.security.nowSecs
 import io.unom.punktfunk.kit.security.obtainIdentity
 import io.unom.punktfunk.models.ActiveSession
 import java.util.concurrent.Callable
@@ -798,6 +799,7 @@ object SkiaConsole {
                         }
                     }
                     if (record != null) {
+                        knownHostStore.touchLastUsed(record)
                         NativeBridge.nativeHostMgmtPort(h).takeIf { it > 0 }?.let {
                             knownHostStore.learnMgmtPort(record, it)
                         }
@@ -905,7 +907,12 @@ object SkiaConsole {
         if (existing != null) {
             if (name.isNotEmpty()) knownHostStore.save(existing.copy(name = name))
         } else {
-            knownHostStore.save(KnownHost(address = addr, port = port, name = name.ifEmpty { addr }, fpHex = "", paired = false))
+            knownHostStore.save(
+                KnownHost(
+                    address = addr, port = port, name = name.ifEmpty { addr }, fpHex = "", paired = false,
+                    addedAt = nowSecs(),
+                ),
+            )
         }
         pushHosts(); pushKnownHosts()
     }

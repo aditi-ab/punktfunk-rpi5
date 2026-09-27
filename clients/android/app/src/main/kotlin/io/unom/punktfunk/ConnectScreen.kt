@@ -378,6 +378,7 @@ fun ConnectScreen(
         // moved off 47990 browsable over a VPN or when it was added by address. 0 = not
         // advertised, and learnMgmtPort ignores it.
         if (record != null) {
+            knownHostStore.touchLastUsed(record)
             NativeBridge.nativeHostMgmtPort(handle).takeIf { it > 0 }?.let {
                 knownHostStore.learnMgmtPort(record, it)
             }

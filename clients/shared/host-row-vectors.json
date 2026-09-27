@@ -1,0 +1,38 @@
+{
+  "$comment": "Console home rows (pf-console-ui HostRow) each client builds from its saved and discovered hosts, replayed by the Kotlin ConsoleJson and Swift ConsoleJSON tests; clients/session/src/console.rs rows() follows the same rules. `saved` is store order, the order the hosts were added (an undated record predates the stamp and comes first). The console applies the player's sort on top, so producers never sort saved hosts. A saved host matches an advert by fingerprint when both carry one, else by addr:port. `rows` lists only the fields every producer derives the same way; `pin` is the pinned preset's id.",
+  "cases": [
+    {
+      "name": "store order, pins, advert fallbacks, dual-boot neighbour",
+      "presets": ["couch", "travel"],
+      "saved": [
+        {"id": "zed", "name": "Zed", "addr": "10.0.0.9", "port": 9777, "fp": "", "mac": ["aa:bb:cc:dd:ee:01"], "os": "windows", "mgmt_port": null, "last_used": 1700000100, "added": null, "pins": ["couch", "gone", "couch"]},
+        {"id": "alpha", "name": "alpha", "addr": "10.0.0.2", "port": 9777, "fp": "ab12", "mac": ["aa:bb:cc:dd:ee:02"], "os": "linux", "mgmt_port": 48000, "last_used": null, "added": 1700000000, "pins": []},
+        {"id": "bravo", "name": "Bravo", "addr": "10.0.0.3", "port": 9777, "fp": "cd34", "mac": [], "os": "linux/arch", "mgmt_port": 48000, "last_used": 1600000000, "added": 1700000050, "pins": ["travel"]}
+      ],
+      "discovered": [
+        {"name": "bravo windows", "addr": "10.0.0.3", "port": 9777, "fp": "ef56", "os": "windows", "mgmt_port": 47000},
+        {"name": "Zed advert", "addr": "10.0.0.9", "port": 9777, "fp": "9999", "os": "", "mgmt_port": 48200},
+        {"name": "attic", "addr": "10.0.0.7", "port": 9777, "fp": "", "os": "", "mgmt_port": null},
+        {"name": "alpha advert", "addr": "10.0.0.99", "port": 9777, "fp": "AB12", "os": "linux/fedora", "mgmt_port": 48100}
+      ],
+      "online": ["alpha"],
+      "rows": [
+        {"key": "10.0.0.9:9777", "saved": true, "online": false, "can_wake": true, "mgmt_port": 48200, "os": "windows", "last_used": 1700000100, "pin": null},
+        {"key": "10.0.0.9:9777\u0000couch", "saved": true, "online": false, "can_wake": true, "mgmt_port": 48200, "os": "windows", "last_used": 1700000100, "pin": "couch"},
+        {"key": "ab12", "saved": true, "online": true, "can_wake": false, "mgmt_port": 48100, "os": "linux/fedora", "last_used": null, "pin": null},
+        {"key": "cd34", "saved": true, "online": false, "can_wake": false, "mgmt_port": 48000, "os": "linux/arch", "last_used": 1600000000, "pin": null},
+        {"key": "cd34\u0000travel", "saved": true, "online": false, "can_wake": false, "mgmt_port": 48000, "os": "linux/arch", "last_used": 1600000000, "pin": "travel"},
+        {"key": "10.0.0.7:9777", "saved": false, "online": true, "can_wake": false, "mgmt_port": 47990, "os": "", "last_used": null, "pin": null},
+        {"key": "ef56", "saved": false, "online": true, "can_wake": false, "mgmt_port": 47000, "os": "windows", "last_used": null, "pin": null}
+      ]
+    },
+    {
+      "name": "nothing saved, nothing seen",
+      "presets": [],
+      "saved": [],
+      "discovered": [],
+      "online": [],
+      "rows": []
+    }
+  ]
+}
