@@ -683,15 +683,24 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
             guard (200..<300).contains(http.statusCode) else {
                 throw LibraryError.http(http.statusCode)
             }
-            // Bound the body WHILE it streams — the ceiling is decorative if every byte is in
-            // memory already when it's checked.
-            var data = Data()
-            for try await byte in bytes {
-                data.append(byte)
-                if data.count > MgmtTransport.maxResponseBytes {
-                    throw MgmtTransportError.tooLarge
-                }
+            // Bound the body WHILE it streams: the ceiling is decorative if every byte is in
+            // memory already when it's checked. A declared length past it is refused unread.
+            let ceiling = MgmtTransport.maxResponseBytes
+            guard http.expectedContentLength <= Int64(ceiling) else {
+                throw MgmtTransportError.tooLarge
             }
+            var data = Data()
+            var block: [UInt8] = []
+            block.reserveCapacity(65_536)
+            for try await byte in bytes {
+                block.append(byte)
+                guard block.count == 65_536 else { continue }
+                data.append(contentsOf: block)
+                block.removeAll(keepingCapacity: true)
+                if data.count > ceiling { throw MgmtTransportError.tooLarge }
+            }
+            data.append(contentsOf: block)
+            if data.count > ceiling { throw MgmtTransportError.tooLarge }
             return data
         }
         let response = try await LibraryClient.send(
