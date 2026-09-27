@@ -24,7 +24,7 @@ pub struct DiscoveredHost {
     pub fp_hex: String,
     /// `"required"` or `"optional"`.
     pub pair: String,
-    /// Management API port from mDNS `mgmt`. `None` if absent; the library
+    /// Management API port from mDNS `mgmt`. `None` if absent or `0`; the library
     /// client then uses the well-known default.
     pub mgmt_port: Option<u16>,
     /// Wake-on-LAN MACs from mDNS `mac` (comma-separated `aa:bb:cc:dd:ee:ff`). Empty if absent.
@@ -161,7 +161,7 @@ pub fn browse() -> (async_channel::Receiver<DiscoveryEvent>, Rescan) {
                             port: info.get_port(),
                             fp_hex: val("fp"),
                             pair: val("pair"),
-                            mgmt_port: val("mgmt").parse().ok(),
+                            mgmt_port: advertised_mgmt_port(&val("mgmt")),
                             mac: val("mac")
                                 .split(',')
                                 .map(|s| s.trim().to_string())
@@ -183,6 +183,11 @@ pub fn browse() -> (async_channel::Receiver<DiscoveryEvent>, Rescan) {
         })
         .expect("spawn mdns thread");
     (rx, Rescan(flag))
+}
+
+/// The `mgmt` TXT value. Absent, unparsable and `0` all mean "not advertised".
+fn advertised_mgmt_port(txt: &str) -> Option<u16> {
+    txt.parse().ok().filter(|&p| p != 0)
 }
 
 /// Folded advert map. Separate from [`discover_for`] so fold is testable offline.
@@ -287,6 +292,14 @@ mod tests {
         let mut unpinned = other_os.clone();
         unpinned.fp_hex = String::new();
         assert!(same_host(&placeholder, &unpinned));
+    }
+
+    #[test]
+    fn mgmt_zero_is_not_an_advertised_port() {
+        assert_eq!(advertised_mgmt_port("47991"), Some(47991));
+        assert_eq!(advertised_mgmt_port("0"), None);
+        assert_eq!(advertised_mgmt_port(""), None);
+        assert_eq!(advertised_mgmt_port("70000"), None);
     }
 
     #[test]

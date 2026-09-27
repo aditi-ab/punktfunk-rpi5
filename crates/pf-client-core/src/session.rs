@@ -11,9 +11,9 @@
 
 use crate::audio;
 use crate::video::{DecodedFrame, DecodedImage, Decoder};
-use punktfunk_core::client::NativeClient;
+use punktfunk_core::client::{FrameOrder, NativeClient};
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
-use punktfunk_core::reanchor::{index_gap, GateVerdict, ReanchorGate};
+use punktfunk_core::reanchor::{GateVerdict, ReanchorGate};
 use punktfunk_core::PunktfunkError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -461,7 +461,14 @@ impl AudioDec {
     /// `out` is caller scratch. Opus decodes into a fixed slice, so it must already
     /// hold the biggest frame the plane can carry. PCM hands the Vec to `pcm::to_f32`,
     /// which grows it — a malformed oversized datagram cannot overrun there.
+    ///
+    /// Empty `input` is Opus DTX or a torn PCM datagram: `Some(0)`, nothing decoded.
+    /// libopus would read it as a loss and fill all of `out` with PLC, and
+    /// `PcmConceal::accept` would drop the frame the next loss repeats.
     fn decode(&mut self, input: &[u8], out: &mut Vec<f32>) -> Option<usize> {
+        if input.is_empty() {
+            return Some(0);
+        }
         let channels = self.channels;
         match &mut self.kind {
             DecKind::Stereo(d) => d.decode_float(input, out, false).ok().map(|n| n * channels),
@@ -764,27 +771,6 @@ struct PlaneSettings {
     echo_cancel: bool,
 }
 
-/// Send the remembered lost range once the shared 100 ms ask throttle is open.
-/// A span wider than `RFI_MAX_RANGE` is beyond any encoder's history: keyframe.
-fn flush_pending_rfi(
-    pending: &mut Option<(u32, u32)>,
-    last_req: &mut Option<Instant>,
-    now: Instant,
-    connector: &NativeClient,
-) {
-    let throttled = last_req.is_some_and(|t| now.duration_since(t) < Duration::from_millis(100));
-    let Some((first, last)) = pending.filter(|_| !throttled) else {
-        return;
-    };
-    *pending = None;
-    *last_req = Some(now);
-    if last.wrapping_sub(first).wrapping_add(1) > punktfunk_core::packet::RFI_MAX_RANGE {
-        let _ = connector.request_keyframe();
-    } else {
-        let _ = connector.request_rfi(first, last);
-    }
-}
-
 fn spawn_plane_threads(
     connector: &Arc<NativeClient>,
     stop: &Arc<AtomicBool>,
@@ -1073,21 +1059,12 @@ fn pump(
     // What actually decoded the last frame — VAAPI can demote mid-session.
     let mut dec_path: &'static str = "";
     let mut last_kf_req: Option<Instant> = None;
-    // Lost range the ask throttle swallowed, `(first, last)`, widened by later gaps
-    // and sent by `flush_pending_rfi` once the throttle opens. Without it a second
-    // gap inside the window (a lost recovery anchor) asks nothing until the 500 ms
-    // backstop, and then for an IDR.
-    let mut pending_rfi: Option<(u32, u32)> = None;
     // PyroWave AUs decode independently, so a late one is still worth showing.
     let all_intra = connector.codec == punktfunk_core::quic::CODEC_PYROWAVE;
     // Freeze-until-reanchor. Armed on any loss signal, withholds concealed frames
     // until a clean re-anchor. Owns the no-output streak and overdue-freeze
     // backstop. Seeded with the current drop count so the first `poll` is not a loss.
     let mut gate = ReanchorGate::new(connector.frames_dropped());
-    // Frame index we expect next. A jump is the earliest loss signal — ~120 ms
-    // ahead of `frames_dropped` (the reassembler only declares a straggler lost
-    // once it ages out of the loss window).
-    let mut next_expected_index: Option<u32> = None;
     // Fixture capture of every AU as it reaches `decode_frame` (`au_dump.rs`).
     // This is what the host sent. `PUNKTFUNK_AU_FAULT` injects one level down, so
     // a faulted run's fixture is the clean bitstream and will not replay the damage.
@@ -1167,45 +1144,36 @@ fn pump(
                 // Host numbers frames consecutively, so a jump means a frame is missing
                 // and this AU references a picture we never decoded. Arm the freeze at
                 // the first such frame — ~120 ms before `frames_dropped` — so concealment
-                // never reaches the screen.
-                match next_expected_index {
-                    Some(exp) if frame.frame_index == exp => {
-                        next_expected_index = Some(exp.wrapping_add(1));
-                    }
-                    // Forward gap: hold the last good frame, but do not ask for a
-                    // keyframe here. Hiding concealment is free; an IDR at 4K120 is not
-                    // and can re-trigger the burst. A straggler (`index_gap` → None)
-                    // leaves the expectation so the real gap still trips.
-                    Some(exp) => {
-                        if let Some(gap) = index_gap(exp, frame.frame_index) {
-                            let now = Instant::now();
-                            // Credited arm: the reassembler books these lost frames into
-                            // `frames_dropped` up to ~120 ms from now; the credit keeps
-                            // that climb from re-freezing a stream the RFI anchor healed.
-                            gate.arm_expecting_drops(now, u64::from(gap));
-                            next_expected_index = Some(frame.frame_index.wrapping_add(1));
-                            // The oldest unsent loss stays `first`: the host invalidates
-                            // everything since it anyway, so one ask covers a burst.
-                            let first = pending_rfi.map_or(exp, |(first, _)| first);
-                            pending_rfi = Some((first, frame.frame_index.wrapping_sub(1)));
-                            flush_pending_rfi(&mut pending_rfi, &mut last_kf_req, now, &connector);
-                            tracing::trace!(
-                                gap,
-                                "frame gap — RFI recovery, holding last frame until re-anchor"
-                            );
-                        } else if !all_intra {
-                            // A whole AU behind one already decoded: decoding it now
-                            // rewinds the DPB (H.264 reads it as a frame_num wrap, HEVC's
-                            // RPS unmarks the newer picture) and phantoms an RFI. Skip.
-                            tracing::trace!(
-                                index = frame.frame_index,
-                                expected = exp,
-                                "skipping a straggler AU that arrived behind a decoded one"
-                            );
-                            continue;
+                // never reaches the screen. The connector asks for the RFI.
+                match connector.observe_frame_index(frame.frame_index) {
+                    // Credited arm: the reassembler books these lost frames into
+                    // `frames_dropped` up to ~120 ms from now; the credit keeps that
+                    // climb from re-freezing a stream the RFI anchor healed. A gap that finds
+                    // the ask window open spends it on the RFI; later gaps do not hold it shut.
+                    FrameOrder::Gap(gap) => {
+                        let now = Instant::now();
+                        gate.arm_expecting_drops(now, u64::from(gap));
+                        if last_kf_req
+                            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
+                        {
+                            last_kf_req = Some(now);
                         }
+                        tracing::trace!(
+                            gap,
+                            "frame gap — RFI recovery, holding last frame until re-anchor"
+                        );
                     }
-                    None => next_expected_index = Some(frame.frame_index.wrapping_add(1)),
+                    // A whole AU behind one already decoded: decoding it now rewinds the
+                    // DPB (H.264 reads it as a frame_num wrap, HEVC's RPS unmarks the
+                    // newer picture). PyroWave AUs decode independently, so it keeps them.
+                    FrameOrder::Straggler if !all_intra => {
+                        tracing::trace!(
+                            index = frame.frame_index,
+                            "skipping a straggler AU that arrived behind a decoded one"
+                        );
+                        continue;
+                    }
+                    FrameOrder::InOrder | FrameOrder::Straggler => {}
                 }
                 // A partial that lost the race (a newer frame already decoded) is time
                 // travel — skip it. Completes keep the normal path.
@@ -1529,15 +1497,13 @@ fn pump(
             && last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
         {
             last_kf_req = Some(now);
-            // The IDR repairs everything a pending RFI would have named.
-            pending_rfi = None;
             let _ = connector.request_keyframe();
             tracing::debug!(
                 dropped,
                 "requested keyframe (loss recovery / overdue re-anchor)"
             );
         }
-        flush_pending_rfi(&mut pending_rfi, &mut last_kf_req, now, &connector);
+        connector.flush_frame_recovery();
 
         if window_start.elapsed() >= Duration::from_secs(1) {
             let pin_kbps = connector.unsustainable_pin_kbps();
@@ -1876,6 +1842,8 @@ fn spawn_audio(
                             }
                         }
                         match dec.decode(&pkt.data, &mut pcm) {
+                            // Empty payload: the last frame stays the concealment unit.
+                            Some(0) => {}
                             Some(n) => {
                                 frame_samples = n;
                                 queue(&player, &pcm[..n]);
@@ -2098,6 +2066,10 @@ mod tests {
         // Not a whole number of samples at the negotiated depth: refuse rather than
         // decode a shifted frame.
         assert_eq!(dec.decode(&wire[..wire.len() - 1], &mut out), None);
+
+        // A torn empty datagram decodes nothing and keeps the frame to repeat.
+        assert_eq!(dec.decode(&[], &mut out), Some(0));
+        assert_eq!(dec.conceal(0, &mut out), Some(frame));
     }
 
     /// Opus arm through the same methods: they return interleaved counts where
@@ -2122,6 +2094,10 @@ mod tests {
         // Pump scratch: 120 ms — the biggest frame the Opus plane can carry.
         let mut out = vec![0f32; 120 * 48 * 2];
         assert_eq!(dec.decode(&packet[..n], &mut out), Some(240 * 2));
+        // DTX: no PLC, not even into the scratch.
+        out.fill(7.0);
+        assert_eq!(dec.decode(&[], &mut out), Some(0));
+        assert!(out.iter().all(|&s| s == 7.0));
         // PLC is asked for, and answered, in the same unit.
         assert_eq!(dec.conceal(240 * 2, &mut out), Some(240 * 2));
         // Nothing to size PLC from is a `None`, not a panic on an empty slice.

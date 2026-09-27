@@ -45,6 +45,8 @@ pub mod demo_host;
 pub mod discovery;
 pub mod error;
 pub mod fec;
+/// cbindgen:ignore
+pub mod fp;
 // The stats overlay every client draws: window, snapshot, formatter. The ABI exports it from `abi`.
 /// cbindgen:ignore
 pub mod hud;

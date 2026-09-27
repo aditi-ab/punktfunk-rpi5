@@ -67,6 +67,7 @@ use self::planes::{
 };
 use self::probe::ProbeState;
 use self::pump::run_pump;
+pub use self::recovery::FrameOrder;
 use self::recovery::{RecentRfis, RecoveryAsk, RfiRecovery, ShortFrames};
 use self::worker::WorkerArgs;
 
@@ -1057,11 +1058,14 @@ impl NativeClient {
     }
 
     /// Fire-and-forget IDR. Throttle: decode stays wedged until it lands, so per-frame
-    /// requests flood the control stream.
+    /// requests flood the control stream. Drops the lost range an RFI still owes; the
+    /// IDR repairs it.
     pub fn request_keyframe(&self) -> Result<()> {
         self.ctrl_tx
             .try_send(CtrlRequest::Keyframe)
-            .map_err(|_| PunktfunkError::Closed)
+            .map_err(|_| PunktfunkError::Closed)?;
+        self.rfi.lock().unwrap().keyframe_requested();
+        Ok(())
     }
 
     /// Recover `[first_frame, last_frame]` by RFI instead of a full IDR. Capable hosts emit a
@@ -1095,17 +1099,33 @@ impl NativeClient {
     /// [`frames_dropped`](Self::frames_dropped) + [`request_keyframe`](Self::request_keyframe)
     /// stays the backstop when the recovery frame is lost.
     ///
-    /// Returns gap width (`0` if none), even when RFI was throttled, so a freeze can re-arm
-    /// and pre-credit the later `frames_dropped` climb
-    /// ([`crate::reanchor::ReanchorGate::arm_expecting_drops`]). Without the credit a fast
-    /// LTR-RFI lift is re-frozen by the stale climb.
-    pub fn note_frame_index(&self, frame_index: u32) -> u32 {
+    /// Reports a gap even when the RFI was throttled, so a freeze can re-arm and pre-credit
+    /// the later `frames_dropped` climb ([`crate::reanchor::ReanchorGate::arm_expecting_drops`]).
+    /// Without the credit a fast LTR-RFI lift is re-frozen by the stale climb. A
+    /// [`FrameOrder::Straggler`] sits behind a frame already seen; feeding it to a reference
+    /// decoder rewinds the DPB.
+    pub fn observe_frame_index(&self, frame_index: u32) -> FrameOrder {
         // Update under the lock; fire the request after releasing it.
-        let (gap, ask) = self
+        let (order, ask) = self
             .rfi
             .lock()
             .unwrap()
             .observe(frame_index, Instant::now());
+        self.send_recovery(ask);
+        order
+    }
+
+    /// Send the lost range a throttled gap deferred, once its window opens. A pump
+    /// that wakes between frames calls this each tick so the ask does not wait for
+    /// the next arrival; [`observe_frame_index`](Self::observe_frame_index) sends it
+    /// there too.
+    pub fn flush_frame_recovery(&self) {
+        let ask = self.rfi.lock().unwrap().flush(Instant::now());
+        self.send_recovery(ask);
+    }
+
+    /// Fire a recovery ask. Called after the `rfi` lock is released.
+    fn send_recovery(&self, ask: RecoveryAsk) {
         match ask {
             RecoveryAsk::Rfi(first, last) => {
                 let _ = self.request_rfi(first, last);
@@ -1116,7 +1136,14 @@ impl NativeClient {
             }
             RecoveryAsk::None => {}
         }
-        gap
+    }
+
+    /// [`observe_frame_index`](Self::observe_frame_index) as the gap width, `0` when none.
+    pub fn note_frame_index(&self, frame_index: u32) -> u32 {
+        match self.observe_frame_index(frame_index) {
+            FrameOrder::Gap(gap) => gap,
+            FrameOrder::InOrder | FrameOrder::Straggler => 0,
+        }
     }
 
     /// Unrecoverable AUs (FEC failed). Poll and [`request_keyframe`](Self::request_keyframe)

@@ -232,6 +232,17 @@ pub enum PlanError {
     AwaitingIdr,
 }
 
+impl PlanError {
+    /// Nothing to plan until an IDR and its parameter sets land, as for a decoder built
+    /// mid-GOP. Every decode rung treats this as idle, not a refusal.
+    pub fn awaits_idr(&self) -> bool {
+        matches!(
+            self,
+            PlanError::AwaitingIdr | PlanError::NoActiveParamSet { .. }
+        )
+    }
+}
+
 impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

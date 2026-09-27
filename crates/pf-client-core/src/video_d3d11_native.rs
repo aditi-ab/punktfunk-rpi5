@@ -579,7 +579,7 @@ impl NativeD3d11Decoder {
     }
 
     /// Plan one AU and convert it, rebuilding the session when shape moved.
-    /// `Ok(None)` is the RASL skip and nothing else.
+    /// `Ok(None)` is a RASL skip or the idle wait for an IDR; neither feeds the decoder.
     fn plan(&mut self, au: &[u8]) -> Result<Option<Submission>> {
         self.status_id = self.status_id.wrapping_add(1).max(1);
         let status_id = self.status_id;
@@ -589,10 +589,7 @@ impl NativeD3d11Decoder {
                     Ok(plan) => plan,
                     // Nothing to feed until the IDR and its parameter sets land — a
                     // decoder built mid-GOP sees slices first. Idle, not a refusal.
-                    Err(
-                        e @ (pf_dxvadec::PlanError::AwaitingIdr
-                        | pf_dxvadec::PlanError::NoActiveParamSet { .. }),
-                    ) => {
+                    Err(e) if e.awaits_idr() => {
                         self.want_recovery = true;
                         tracing::debug!(error = %e, "native D3D11VA idle until the next IDR");
                         return Ok(None);
@@ -649,10 +646,7 @@ impl NativeD3d11Decoder {
                         return Ok(None);
                     }
                     // Same idle wait as the H.264 arm.
-                    Err(
-                        e @ (pf_dxvadec::PlanErrorH265::AwaitingIdr
-                        | pf_dxvadec::PlanErrorH265::NoActiveParamSet { .. }),
-                    ) => {
+                    Err(e) if e.awaits_idr() => {
                         self.want_recovery = true;
                         tracing::debug!(error = %e, "native D3D11VA idle until the next IDR");
                         return Ok(None);
@@ -699,7 +693,8 @@ impl NativeD3d11Decoder {
                     codec: Codec::H265,
                     facts: PictureFacts {
                         colour: colour_of(plan.picture.colour),
-                        keyframe: plan.picture.is_irap,
+                        // IDR only, as on every rung: a CRA's leading pictures may not decode.
+                        keyframe: plan.picture.is_idr,
                         references_clean: plan.picture.references_clean,
                         width: plan.picture.display_crop.width,
                         height: plan.picture.display_crop.height,
