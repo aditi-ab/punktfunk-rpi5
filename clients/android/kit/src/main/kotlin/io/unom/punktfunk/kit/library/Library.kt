@@ -2,6 +2,7 @@ package io.unom.punktfunk.kit.library
 
 import android.util.Log
 import okhttp3.Cache
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -35,6 +36,15 @@ import javax.net.ssl.X509TrustManager
 
 /** The management API's default port — matches `mgmt::DEFAULT_PORT` on the host and the Apple client. */
 const val DEFAULT_MGMT_PORT = 47990
+
+/**
+ * `https://<address>:<port>` for the management API. An IPv6 literal goes in brackets, whether it
+ * was saved bare or bracketed — the desktop's `base_url` and Apple's `baseURL`.
+ */
+fun mgmtBase(address: String, port: Int): String {
+    val bare = address.removeSurrounding("[", "]")
+    return if (':' in bare) "https://[$bare]:$port" else "https://$bare:$port"
+}
 
 /** Cover-art URLs. Steam art arrives as host-relative proxy paths, resolved to absolute by [LibraryClient]. */
 data class Artwork(val portrait: String?, val header: String?, val hero: String?) {
@@ -196,10 +206,10 @@ data class RunningGame(
 object LibraryClient {
     private const val TAG = "LibraryClient"
     /**
-     * `GET https://<address>:<mgmtPort>/api/v1/library`, authenticated by mTLS. [fpHex] is the pinned
-     * host-cert SHA-256 (64 hex, from the paired [io.unom.punktfunk.kit.security.KnownHost]); a blank
-     * value means the host was never connected/paired, so there's nothing authorized to browse.
-     * BLOCKING — call from a background dispatcher.
+     * `GET /api/v1/library` at [mgmtBase], authenticated by mTLS. [fpHex] is the pinned host-cert
+     * SHA-256 (64 hex, from the paired [io.unom.punktfunk.kit.security.KnownHost]); a blank value
+     * means the host was never paired, so there's nothing authorized to browse. A refusal maps
+     * through [refused]. BLOCKING — call from a background dispatcher.
      */
     fun fetch(
         address: String,
@@ -219,16 +229,14 @@ object LibraryClient {
             Log.w(TAG, "mTLS client for $address", e)
             return LibraryResult.Error("couldn't set up a secure connection to the host")
         }
-        val base = "https://$address:$mgmtPort"
-        val req = Request.Builder().url("$base/api/v1/library").build()
+        val base = mgmtBase(address, mgmtPort)
         return try {
+            val req = Request.Builder().url("$base/api/v1/library").build()
             client.newCall(req).execute().use { resp ->
-                when (resp.code) {
-                    200 -> LibraryResult.Ok(parse(resp.body?.string().orEmpty(), base))
-                    401 -> LibraryResult.Unauthorized(
-                        "the host doesn't recognize this device — pair with it first",
-                    )
-                    else -> LibraryResult.Error("the host refused it (${resp.code})")
+                if (resp.code == 200) {
+                    LibraryResult.Ok(parse(resp.body?.string().orEmpty(), base))
+                } else {
+                    refused(resp.code)
                 }
             }
         } catch (e: Exception) {
@@ -259,7 +267,7 @@ object LibraryClient {
         if (fpHex.isBlank()) return emptyList()
         return try {
             val client = mtlsHttpClient(certPem, keyPem, address, fpHex)
-            val req = Request.Builder().url("https://$address:$mgmtPort/api/v1/status").build()
+            val req = Request.Builder().url("${mgmtBase(address, mgmtPort)}/api/v1/status").build()
             client.newCall(req).execute().use { resp ->
                 if (resp.code != 200) return emptyList()
                 parseRunning(resp.body?.string().orEmpty())
@@ -289,7 +297,7 @@ object LibraryClient {
         return try {
             val body = JSONObject().put("app_id", appId).put("streaming", true)
             val req = Request.Builder()
-                .url("https://$address:$mgmtPort/api/v1/game/end")
+                .url("${mgmtBase(address, mgmtPort)}/api/v1/game/end")
                 .post(body.toString().toRequestBody("application/json".toMediaType()))
                 .build()
             mtlsHttpClient(certPem, keyPem, address, fpHex).newCall(req).execute()
@@ -299,6 +307,14 @@ object LibraryClient {
             false
         }
     }
+
+    /** A non-200 answer. 401 and 403 both mean "not paired", as on desktop and Apple. */
+    internal fun refused(code: Int): LibraryResult =
+        if (code == 401 || code == 403) {
+            LibraryResult.Unauthorized("the host doesn't recognize this device — pair with it first")
+        } else {
+            LibraryResult.Error("the host refused it ($code)")
+        }
 
     /** Just the `games[]` slice of `/status`; everything else on that payload is the console's. */
     private fun parseRunning(json: String): List<RunningGame> {
@@ -363,18 +379,17 @@ object LibraryClient {
  * reaches the host's own art proxy). The pinning trust manager trusts the host by fingerprint and
  * defers to normal public trust for any other origin (an external CDN URL).
  *
- * The two checks are only sound TOGETHER, and the composition is the point: the trust manager
- * cannot fail closed on its own (it has no hostname, so it must let a CDN chain through), so the
- * hostname verifier is what makes the pinned host pin-only. Loosen either and a publicly-trusted
- * certificate for any name is accepted for the host — which is exactly what 2026-08-05 review M-2
- * found. The host's own cert is self-signed with no matching SAN, so it can never satisfy the
- * default verifier; the pin is its only credential, on purpose.
- */
-/**
- * `cache`: an HTTP cache the client honours (`Cache-Control` / `ETag`, which the host's art proxy
+ * The two checks are only sound TOGETHER: the trust manager cannot fail closed on its own (it has
+ * no hostname, so it must let a CDN chain through), so the hostname verifier is what makes [host]
+ * pin-only, matched by the name OkHttp gives it ([urlHost]). Loosen either and a publicly-trusted
+ * certificate for any name is accepted for the host. The host's own cert is self-signed with no
+ * matching SAN, so it can never satisfy the default verifier; the pin is its only credential.
+ *
+ * [cache]: an HTTP cache the client honours (`Cache-Control` / `ETag`, which the host's art proxy
  * sends). One instance per directory: OkHttp forbids two on the same path.
  */
 fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String, cache: Cache? = null): OkHttpClient {
+    val pinnedHost = urlHost(host)
     val clientCert = CertificateFactory.getInstance("X.509")
         .generateCertificate(ByteArrayInputStream(certPem.toByteArray())) as X509Certificate
     val privateKey = parsePrivateKey(keyPem)
@@ -406,16 +421,10 @@ fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String,
 
     val defaultVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
     val verifier = HostnameVerifier { hostname, session ->
-        if (hostname == host) {
-            // The PINNED host fails closed: only the pinned leaf is acceptable for this name.
-            //
-            // This used to be a bare `hostname == host`, which composed with the trust manager's
-            // system-CA fall-through into "any publicly-trusted certificate, for any name, is
-            // accepted for the pinned host" — the pin was decorative (2026-08-05 review M-2). A
-            // MITM with any free CA-issued cert intercepted the connection, received the client's
-            // mTLS IDENTITY certificate, and served attacker-chosen library JSON and art URLs.
-            // The Rust (`pf-client-core`) and Apple (`ClientTLS`) paths already fail closed here;
-            // only Android did not.
+        if (hostname == pinnedHost) {
+            // The PINNED host fails closed: only the pinned leaf is acceptable for this name. The
+            // trust manager lets any public chain through, so without this a CA-issued cert for
+            // any name would stand in for the host and receive the client's mTLS identity.
             try {
                 sha256Hex((session.peerCertificates.firstOrNull() as? X509Certificate)?.encoded ?: return@HostnameVerifier false) == pinned
             } catch (_: Exception) {
@@ -436,6 +445,10 @@ fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String,
         .cache(cache)
         .build()
 }
+
+/** [address] as OkHttp names it to a hostname verifier: lowercased, IPv6 unbracketed. */
+internal fun urlHost(address: String): String =
+    mgmtBase(address, DEFAULT_MGMT_PORT).toHttpUrlOrNull()?.host ?: address
 
 /** Parse a PKCS#8 PEM private key (rcgen emits `-----BEGIN PRIVATE KEY-----`), trying EC then RSA/Ed25519. */
 private fun parsePrivateKey(pem: String): PrivateKey {

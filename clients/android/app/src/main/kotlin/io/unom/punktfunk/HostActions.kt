@@ -1,5 +1,6 @@
 package io.unom.punktfunk
 
+import io.unom.punktfunk.kit.library.mgmtBase
 import io.unom.punktfunk.kit.security.ClientIdentity
 import android.util.Log
 import okhttp3.Request
@@ -58,7 +59,7 @@ object HostActions {
             val client = io.unom.punktfunk.kit.library.mtlsHttpClient(
                 identity.certPem, identity.privateKeyPem, addr, fpHex,
             )
-            val req = Request.Builder().url("https://$addr:$mgmtPort/api/v1/actions").get().build()
+            val req = Request.Builder().url("${mgmtBase(addr, mgmtPort)}/api/v1/actions").get().build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@runCatching emptyList()
                 val arr = JSONObject(resp.body?.string().orEmpty()).optJSONArray("actions")
@@ -101,7 +102,7 @@ object HostActions {
                 identity.certPem, identity.privateKeyPem, addr, fpHex,
             )
             val req = Request.Builder()
-                .url("https://$addr:$mgmtPort/api/v1/actions/$actionId")
+                .url("${mgmtBase(addr, mgmtPort)}/api/v1/actions/$actionId")
                 // Empty body by design: the id is the whole request, and no request field ever
                 // reaches the host's privileged path.
                 .post(ByteArray(0).toRequestBody(null, 0, 0))
