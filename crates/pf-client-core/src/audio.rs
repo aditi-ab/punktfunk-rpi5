@@ -18,8 +18,6 @@ use std::sync::Arc;
 const SAMPLE_RATE: u32 = 48_000;
 /// Voice is mono at the source; the host Opus decoder upmixes. Half the samples, half the wire.
 const MIC_CHANNELS: usize = 1;
-/// 10 ms. Host accepts ≤ 120 ms; this is the frame-fill share of mouth-to-ear latency.
-const MIC_FRAME: usize = 480;
 
 struct Terminate;
 
@@ -555,10 +553,7 @@ impl Drop for MicStreamer {
 /// Encode-in-callback is fine: 10 ms Opus is well under 100 µs.
 struct MicData {
     connector: Arc<NativeClient>,
-    ring: VecDeque<f32>,
-    encoder: opus::Encoder,
-    seq: u32,
-    out: Vec<u8>,
+    mic: punktfunk_core::audio::mic::MicEncoder,
     /// In-stream mute (B4); session chord flips it. Read per callback.
     muted: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -621,14 +616,9 @@ fn mic_thread(
     static PW_INIT: std::sync::Once = std::sync::Once::new();
     PW_INIT.call_once(pw::init);
 
-    let mut encoder =
-        opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
-            .map_err(|e| anyhow::anyhow!("opus encoder: {e}"))?;
-    // 48 kbps mono is transparent for speech. In-band FEC + assumed 10% loss: datagrams
-    // are fire-and-forget, so this is the only redundancy the host decoder can use.
-    let _ = encoder.set_bitrate(opus::Bitrate::Bits(48_000));
-    let _ = encoder.set_inband_fec(true);
-    let _ = encoder.set_packet_loss_perc(10);
+    // The callback drains every frame it fills, so no backlog builds to self-heal.
+    let mic = punktfunk_core::audio::mic::MicEncoder::new(false)
+        .map_err(|e| anyhow::anyhow!("opus encoder: {e}"))?;
 
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw mic MainLoop")?;
     let context = pw::context::ContextRc::new(&mainloop, None).context("pw mic Context")?;
@@ -660,10 +650,7 @@ fn mic_thread(
 
     let ud = MicData {
         connector: connector.clone(),
-        ring: VecDeque::new(),
-        encoder,
-        seq: 0,
-        out: vec![0u8; 4000],
+        mic,
         muted,
     };
 
@@ -684,34 +671,20 @@ fn mic_thread(
                 let data = &mut datas[0];
                 let n = data.chunk().size() as usize;
                 if let Some(slice) = data.data() {
-                    for s in slice[..n.min(slice.len())].chunks_exact(4) {
-                        ud.ring
-                            .push_back(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
-                    }
+                    ud.mic.push(
+                        slice[..n.min(slice.len())]
+                            .chunks_exact(4)
+                            .map(|s| f32::from_le_bytes([s[0], s[1], s[2], s[3]])),
+                    );
                 }
-                // In-stream mute: stream stays open so the device keeps primed buffers.
-                // Discard whole frames so the ring cannot grow. `seq` does not advance — a gap
-                // the size of the mute would make the host conceal frame by frame.
-                if ud.muted.load(std::sync::atomic::Ordering::Relaxed) {
-                    let whole =
-                        (ud.ring.len() / (MIC_FRAME * MIC_CHANNELS)) * (MIC_FRAME * MIC_CHANNELS);
-                    ud.ring.drain(..whole);
-                    return;
-                }
-                while ud.ring.len() >= MIC_FRAME * MIC_CHANNELS {
-                    let pcm: Vec<f32> = ud.ring.drain(..MIC_FRAME * MIC_CHANNELS).collect();
-                    match ud.encoder.encode_float(&pcm, &mut ud.out) {
-                        Ok(len) => {
-                            let pts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos() as u64)
-                                .unwrap_or(0);
-                            let _ = ud.connector.send_mic(ud.seq, pts, ud.out[..len].to_vec());
-                            ud.seq = ud.seq.wrapping_add(1);
-                        }
-                        Err(e) => tracing::debug!(error = %e, "opus mic encode"),
-                    }
-                }
+                // In-stream mute: the stream stays open so the device keeps primed buffers.
+                let connector = &ud.connector;
+                ud.mic.drain(
+                    ud.muted.load(std::sync::atomic::Ordering::Relaxed),
+                    |seq, pts, packet| {
+                        let _ = connector.send_mic(seq, pts, packet.to_vec());
+                    },
+                );
             }));
             if outcome.is_err() {
                 tracing::error!("panic in pipewire mic callback");

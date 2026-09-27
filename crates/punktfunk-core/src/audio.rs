@@ -11,6 +11,9 @@
 //! Opus is 48 kHz; the lossless plane is a second plane — [`pcm`], `design/hi-res-audio.md`.
 
 /// cbindgen:ignore
+#[cfg(feature = "quic")]
+pub mod mic;
+/// cbindgen:ignore
 pub mod pad_mix;
 pub mod pcm;
 /// cbindgen:ignore
