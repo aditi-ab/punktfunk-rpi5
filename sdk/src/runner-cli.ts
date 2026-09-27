@@ -30,7 +30,8 @@ import {
 	reconcileSharedSdk,
 	removePlugins,
 } from "./plugins.js";
-import { discoverUnits, runner, runOneUnit } from "./runner.js";
+import { discoverUnits } from "./discover.js";
+import { runner, runOneUnit } from "./runner.js";
 import { redirectUiServe } from "./ui-forward.js";
 
 const arg = (flag: string): string | undefined => {
