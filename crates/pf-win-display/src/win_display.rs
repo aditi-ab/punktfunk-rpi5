@@ -25,7 +25,7 @@
 // DISPLAYCONFIG_MODE_INFO. Move that guard and the access is unjustified.
 use std::mem::size_of;
 
-use windows::core::PCWSTR;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Devices::Display::QUERY_DISPLAY_CONFIG_FLAGS;
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
@@ -281,7 +281,7 @@ pub fn active_resolution(key: CcdTargetKey) -> Option<(u32, u32)> {
 /// that RECORD a mode must record this, or they claim a refresh the display is not running.
 pub fn active_mode(key: CcdTargetKey) -> Option<(u32, u32, u32)> {
     let gdi = resolve_gdi_name(key)?;
-    let wname: Vec<u16> = gdi.encode_utf16().chain(std::iter::once(0)).collect();
+    let wname = HSTRING::from(gdi.as_str());
     let mut dm = DEVMODEW {
         dmSize: size_of::<DEVMODEW>() as u16,
         ..Default::default()
@@ -352,7 +352,7 @@ pub fn force_mode_reenumeration() -> bool {
 
 /// Distinct resolutions `gdi_name` advertises (fallback when the request is absent).
 pub fn advertised_resolutions(gdi_name: &str) -> Vec<(u32, u32)> {
-    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wname = HSTRING::from(gdi_name);
     let mut set = std::collections::BTreeSet::new();
     let mut i = 0u32;
     loop {
@@ -383,7 +383,7 @@ pub fn advertised_resolutions(gdi_name: &str) -> Vec<(u32, u32)> {
 /// land asynchronously after `IddCxMonitorUpdateModes2`. Refresh is part of
 /// the match — WxH-only would skip a rate-only update.
 pub fn wait_mode_advertised(gdi_name: &str, mode: Mode, ceiling: std::time::Duration) -> bool {
-    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wname = HSTRING::from(gdi_name);
     let deadline = std::time::Instant::now() + ceiling;
     loop {
         let mut i = 0u32;
@@ -527,7 +527,7 @@ pub fn advanced_color_enabled(key: CcdTargetKey) -> Option<bool> {
 /// a no-op. Restarts presentation after DWM stops composing to a virtual
 /// display. Same input-desktop retry as [`set_active_mode`].
 pub fn force_mode_reset(gdi_name: &str) -> bool {
-    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wname = HSTRING::from(gdi_name);
     let mut dm = DEVMODEW {
         dmSize: size_of::<DEVMODEW>() as u16,
         ..Default::default()
@@ -654,7 +654,7 @@ pub fn set_active_mode_ccd(key: CcdTargetKey, mode: Mode) -> bool {
 /// this as [`set_active_mode_ccd`]'s fallback owe that a log, or a display
 /// left on the wrong mode looks like it was never asked.
 pub fn set_active_mode(gdi_name: &str, mode: Mode) -> bool {
-    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wname = HSTRING::from(gdi_name);
 
     // Prefer same WxH: exact Hz, else highest advertised ≤ requested, else
     // highest at that resolution. A clamped pixel-rate must not collapse to

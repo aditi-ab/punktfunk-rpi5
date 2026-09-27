@@ -30,7 +30,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::core::{GUID, PCWSTR, PWSTR};
+use windows::core::{GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiEnumDeviceInfo, SPDRP_HARDWAREID, SP_DEVINFO_DATA,
 };
@@ -432,7 +432,7 @@ fn wait_for_endpoint(instance_id: &str) -> Result<String> {
 }
 
 fn open_mmdevice(endpoint_id: &str) -> Result<IMMDevice> {
-    let id_w = wide(endpoint_id);
+    let id_w = HSTRING::from(endpoint_id);
     // SAFETY: standard COM activation on a COM-initialized thread; the id buffer is
     // NUL-terminated and outlives the call.
     unsafe {
@@ -596,7 +596,7 @@ fn grant_system_full_control(subkey_path: &str) -> Result<()> {
 
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
-    let path_w = wide(subkey_path);
+    let path_w = HSTRING::from(subkey_path);
     let mut hkey = HKEY::default();
     // SAFETY: the path is NUL-terminated and outlives the call; hkey is a live out-param.
     unsafe {

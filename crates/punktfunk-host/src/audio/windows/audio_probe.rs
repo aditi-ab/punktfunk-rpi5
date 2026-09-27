@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
-use windows::core::PCWSTR;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiEnumDeviceInfo, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL, DIREG_DEV,
 };
@@ -362,10 +362,7 @@ fn write_probe_marker(
         }
         .context("create the probe devnode's Device Parameters key")?,
     };
-    let name: Vec<u16> = PROBE_MARKER
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let name = HSTRING::from(PROBE_MARKER);
     // SAFETY: the value name is NUL-terminated and outlives the call; the DWORD bytes travel
     // with the slice.
     let rc = unsafe {
@@ -406,10 +403,7 @@ fn probe_devnodes() -> Result<Vec<(String, u32)>> {
         }) else {
             continue;
         };
-        let name: Vec<u16> = PROBE_MARKER
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let name = HSTRING::from(PROBE_MARKER);
         let mut ty = REG_VALUE_TYPE(0);
         let mut data = [0u8; 4];
         let mut len = data.len() as u32;
