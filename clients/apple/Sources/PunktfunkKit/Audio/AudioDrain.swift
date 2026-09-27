@@ -34,7 +34,7 @@ enum AudioDrain {
         // a longer artifact than the missing audio. Given the SESSION's frame, like the ring —
         // it spends a wall-clock budget one frame at a time, and assuming 5 ms would misreport
         // a 2 ms lossless session by two and a half times.
-        var drought = DroughtConceal(maxMS: AudioRing.plcMaxMS, frameUs: frameUs)
+        var drought = DroughtConceal(maxMS: JitterPolicy.plcMaxMS, frameUs: frameUs)
         var lastPacketNs = DispatchTime.now().uptimeNanoseconds
         // Something has decoded, so there is both state to conceal from and continuity to
         // hold. Until then a session whose host never sends audio keeps the long timeout below
