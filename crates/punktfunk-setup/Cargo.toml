@@ -13,6 +13,8 @@ publish = false
 console = "0.16"
 # The host's own settings store, so a setting lands validated and owner-only. No platform crates.
 pf-host-config = { path = "../pf-host-config" }
+# host.env's grammar, read the way the Windows service reads it.
+pf-paths = { path = "../pf-paths" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

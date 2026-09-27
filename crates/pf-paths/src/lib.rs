@@ -152,6 +152,31 @@ pub fn published_mgmt_port_in(dir: &std::path::Path) -> Option<u16> {
         .and_then(|(_, port)| port.parse().ok())
 }
 
+/// `host.env`'s `KEY=VALUE` grammar, as the Windows service loads it into its environment.
+pub mod env_file {
+    /// Each entry in file order: lines trimmed, `#` comments and lines without `=` skipped,
+    /// split on the first `=`, both sides trimmed, surrounding quotes stripped.
+    pub fn parse(text: &str) -> impl Iterator<Item = (&str, &str)> {
+        text.lines().filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            (!key.is_empty()).then(|| (key, value.trim().trim_matches('"')))
+        })
+    }
+
+    /// The value `key` ends up with: a later line wins.
+    pub fn get<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+        parse(text)
+            .filter(|(k, _)| *k == key)
+            .last()
+            .map(|(_, v)| v)
+    }
+}
+
 /// Tightens an already-existing dir. Windows refuses a reparse point
 /// ([`reject_reparse_point`]): hardening a junction would harden the
 /// attacker-chosen target while the link stays theirs. Default
@@ -524,6 +549,22 @@ fn restrict_to_system_admins(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_file_reads_host_env_as_the_service_does() {
+        let text = "# PUNKTFUNK_MGMT_BIND=commented\n  PUNKTFUNK_MGMT_BIND = \"0.0.0.0:48123\" \n\
+                    no equals\n=orphan\nRUST_LOG=info\nRUST_LOG=debug\n";
+        assert_eq!(
+            env_file::parse(text).collect::<Vec<_>>(),
+            [
+                ("PUNKTFUNK_MGMT_BIND", "0.0.0.0:48123"),
+                ("RUST_LOG", "info"),
+                ("RUST_LOG", "debug"),
+            ]
+        );
+        assert_eq!(env_file::get(text, "RUST_LOG"), Some("debug"));
+        assert_eq!(env_file::get(text, "PUNKTFUNK_UI_BIND"), None);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
