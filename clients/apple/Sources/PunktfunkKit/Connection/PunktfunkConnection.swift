@@ -1,13 +1,13 @@
 // Swift wrapper around the punktfunk-core C ABI's punktfunk/1 connection API.
 //
-// Threading contract (mirrors the C header): one PunktfunkConnection is pumped from a single
-// video thread via nextAU(); nextAudio() runs on its own (single) drain thread, and
-// nextRumble2()/nextHidOutput() share one feedback drain thread (two core planes, one puller
-// each — polling them sequentially from one thread is within the contract); the core keeps
-// per-plane borrow slots, so the planes never alias. send() is enqueue-only and safe
-// alongside all of them. The pointers inside an AU/audio packet are only valid until the
-// next call of the same kind, so we copy into Data here — the copies are small and keep the
-// Swift side memory-safe.
+// Threading contract (mirrors the C header): each plane has one puller thread. Video pulls
+// nextAU() and nextHdrMeta(); audio pulls nextAudioPcm()/audioPlc(); feedback pulls
+// nextRumbleCommand() and nextHidOutput() in turn, under the lock nextHdrMeta() shares; cursor
+// pulls nextCursorShape()/nextCursorState(); nextClipboard() and nextHostTiming() each have
+// their own. The core keeps per-plane borrow
+// slots, so the planes never alias. send() is enqueue-only and safe alongside all of them.
+// A borrowed pointer is valid only until the next call of the same kind, so every puller
+// copies into an owned value.
 //
 // Trust: pass the host's pinned certificate fingerprint (the host logs it at startup, and
 // `hostFingerprint` reports what a trust-on-first-use connect observed — persist it, e.g.
@@ -1322,10 +1322,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
         }
     }
 
-    /// Pull the next Opus audio packet; nil on timeout, throws `.closed` once the session
-    /// ended. Drain from a dedicated audio thread — packets arrive every 5 ms (the core
-    /// buffers 320 ms and drops the newest when the puller lags).
-    public func nextAudio(timeoutMs: UInt32 = 100) throws -> AudioPacket? {
+    /// Pull the next raw Opus packet; nil on timeout, throws `.closed` once the session ended.
+    /// Tests only: it drains the queue `nextAudioPcm` reads, so a session uses one or the other.
+    func nextAudio(timeoutMs: UInt32 = 100) throws -> AudioPacket? {
         var pkt = PunktfunkAudioPacket()
         return try poll(audioLock) { h in
             punktfunk_connection_next_audio(h, &pkt, timeoutMs)
@@ -1353,8 +1352,8 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Pull the next audio frame, **decoded in-core** to interleaved f32 PCM — Apple's AudioToolbox
     /// Opus path is stereo-only, so surround (and, for uniformity, stereo too) is decoded by the
     /// Rust core (libopus multistream) and handed back as PCM. nil on timeout, throws `.closed` once
-    /// the session ended. Drain from a dedicated audio thread (do NOT also call `nextAudio` — they
-    /// share the underlying queue). The returned `samples` are copied out, so the buffer is owned.
+    /// the session ended. Drain from a dedicated audio thread. The returned `samples` are copied
+    /// out, so the buffer is owned.
     public func nextAudioPcm(timeoutMs: UInt32 = 100) throws -> AudioPCM? {
         var out = PunktfunkAudioPcm()
         return try poll(audioLock) { h in
@@ -1398,13 +1397,10 @@ public final class PunktfunkConnection: @unchecked Sendable {
         }
     }
 
-    /// Pull the next force-feedback update *including its self-termination TTL* (v2 envelopes):
-    /// `(pad, low, high, ttlMs)`. `ttlMs` is how long to render this level before silencing unless
-    /// the host renews it; `RumbleTuning.noTTL` (`UInt32.max`) means "no lease" — a legacy host, so
-    /// fall back to a client-side staleness timeout. The reorder gate (seq) already ran in the
-    /// core, so a stale/reordered envelope never surfaces here. Drain from the (single) feedback
-    /// thread, alongside `nextHidOutput`.
-    public func nextRumble2(timeoutMs: UInt32 = 0) throws
+    /// Pull the next raw rumble envelope `(pad, low, high, ttlMs)`, reorder gate already applied.
+    /// `ttlMs` is `UInt32.max` from a host that sends no lease. Tests only: it is the rumble
+    /// plane `nextRumbleCommand` reads, so a session uses one or the other.
+    func nextRumble2(timeoutMs: UInt32 = 0) throws
         -> (pad: UInt16, low: UInt16, high: UInt16, ttlMs: UInt32)?
     {
         var pad: UInt16 = 0, low: UInt16 = 0, high: UInt16 = 0, ttl: UInt32 = .max
@@ -1471,10 +1467,10 @@ public final class PunktfunkConnection: @unchecked Sendable {
 
     /// Pull the next HID-output feedback event (lightbar / player LEDs / adaptive triggers —
     /// or a raw `.hidRaw` report on an SC2 passthrough pad); nil on timeout, throws `.closed`
-    /// once the session ended. Drain from the (single) feedback thread, alongside `nextRumble`.
-    /// Nothing arrives unless a pad's virtual device is a DualSense (the first three), a
-    /// DualShock 4 (lightbar only), or an as-is Steam Controller 2 (`.hidRaw`) — poll with a
-    /// short timeout, never spin.
+    /// once the session ended. Drain from the (single) feedback thread, alongside
+    /// `nextRumbleCommand`. Nothing arrives unless a pad's virtual device is a DualSense (the
+    /// first three), a DualShock 4 (lightbar only), or an as-is Steam Controller 2 (`.hidRaw`)
+    /// — poll with a short timeout, never spin.
     public func nextHidOutput(timeoutMs: UInt32 = 0) throws -> HidOutputEvent? {
         var out = PunktfunkHidOutput()
         return try poll(feedbackLock) { h in
@@ -1607,8 +1603,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
     }
 
     /// Pull the next static HDR metadata update; nil on timeout, throws `.closed` once the session
-    /// ended. Drain from the feedback thread alongside `nextRumble`/`nextHidOutput`. Nothing arrives
-    /// unless `isHDR` — poll with a short timeout, never spin.
+    /// ended. The video pump drains it with timeout 0: it shares the feedback thread's lock with
+    /// `nextRumbleCommand`/`nextHidOutput`, and a blocking poll there starves the other side.
+    /// Only an HDR stream sends it, and a game can enter HDR mid-session.
     public func nextHdrMeta(timeoutMs: UInt32 = 0) throws -> HdrMeta? {
         var out = PunktfunkHdrMeta()
         return try poll(feedbackLock) { h in
