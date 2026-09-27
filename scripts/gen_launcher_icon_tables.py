@@ -171,49 +171,16 @@ write(
 //! Brand mark a `role: "launcher"` tile draws, resolved from the entry's
 //! `icon` token.
 
-use skia_safe::{{Matrix, Path, Rect}};
-use std::collections::HashMap;
-use std::sync::{{Mutex, OnceLock}};
+use crate::icons::MarkTable;
+use skia_safe::{{Path, Rect}};
 
-type Glyph = (Path, f32, f32);
-
-/// Token → parsed mark. `None` memoizes a miss so a bad token is not re-parsed
-/// every frame. Named: `clippy::type_complexity` rejects the inline form, and
-/// this file is generated — an inline type would fail `-D warnings` on regen.
-type GlyphCache = HashMap<String, Option<Glyph>>;
-
-const GLYPHS: &[(&str, f32, f32, &str)] = &[
+static TABLE: MarkTable = MarkTable::new(&[
 {rows}
-];
+]);
 
-/// Cached: `Path::from_svg` on a 3 kB string is not free, and the library
-/// shelf re-renders every frame. `None` is a miss or an unparseable path.
-fn glyph(token: &str) -> Option<Glyph> {{
-    static CACHE: OnceLock<Mutex<GlyphCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().ok()?;
-    if let Some(hit) = cache.get(token) {{
-        return hit.clone();
-    }}
-    let built = GLYPHS
-        .iter()
-        .find(|(t, ..)| *t == token)
-        .and_then(|(_, w, h, d)| Path::from_svg(d).map(|p| (p, *w, *h)));
-    cache.insert(token.to_string(), built.clone());
-    built
-}}
-
-/// Aspect preserved: the masters' viewports are not all square.
+/// `token`'s mark fitted into `dst`; `None` when this build ships no art for it.
 pub fn launcher_mark(token: &str, dst: Rect) -> Option<Path> {{
-    let (path, vw, vh) = glyph(token)?;
-    let scale = (dst.width() / vw).min(dst.height() / vh);
-    let mut m = Matrix::new_identity();
-    m.set_scale((scale, scale), None);
-    m.post_translate((
-        dst.left + (dst.width() - vw * scale) / 2.0,
-        dst.top + (dst.height() - vh * scale) / 2.0,
-    ));
-    Some(path.with_transform(&m))
+    TABLE.fit(token, dst)
 }}
 
 #[cfg(test)]
@@ -222,31 +189,12 @@ mod tests {{
 
     #[test]
     fn every_glyph_parses() {{
-        for (token, ..) in GLYPHS {{
-            assert!(glyph(token).is_some(), "{{token}} failed to parse");
-        }}
+        assert_eq!(TABLE.unparsed(), Vec::<&str>::new());
     }}
 
     #[test]
     fn unknown_token_draws_nothing() {{
         assert!(launcher_mark("not-a-launcher", Rect::from_wh(64.0, 64.0)).is_none());
-    }}
-
-    /// Letterboxed, never stretched. Steam's viewport is 496×512, not square.
-    #[test]
-    fn mark_is_contained_and_centred() {{
-        let dst = Rect::from_xywh(10.0, 20.0, 80.0, 40.0);
-        let b = launcher_mark("steam", dst).unwrap().compute_tight_bounds();
-        assert!(b.width() <= dst.width() + 0.5 && b.height() <= dst.height() + 0.5);
-        let (cx, cy) = (b.center_x(), b.center_y());
-        assert!(
-            (cx - dst.center_x()).abs() < 1.0,
-            "off-centre horizontally: {{cx}}"
-        );
-        assert!(
-            (cy - dst.center_y()).abs() < 1.0,
-            "off-centre vertically: {{cy}}"
-        );
     }}
 }}
 """,

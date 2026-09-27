@@ -65,52 +65,20 @@ body = f"""{banner}
 //! brand aliases included). This module only maps those tokens to path art and
 //! letterboxes them. `None` means no art — the tile keeps its monogram.
 
-use skia_safe::{{Matrix, Path, Rect}};
-use std::collections::HashMap;
-use std::sync::{{Mutex, OnceLock}};
+use crate::icons::MarkTable;
+use skia_safe::{{Path, Rect}};
 
-type Glyph = (Path, f32, f32);
-
-/// Token → parsed mark. `None` caches a miss so a bad token is not reparsed every frame.
-/// Named: `clippy::type_complexity` rejects the inline form, and this file is generated.
-type GlyphCache = HashMap<String, Option<Glyph>>;
-
-const GLYPHS: &[(&str, f32, f32, &str)] = &[
+static TABLE: MarkTable = MarkTable::new(&[
 {rows}
-];
+]);
 
-/// Parse once per token. `Path::from_svg` on a 3 kB string is not free, and the
-/// home carousel redraws every frame.
-fn glyph(token: &str) -> Option<Glyph> {{
-    static CACHE: OnceLock<Mutex<GlyphCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().ok()?;
-    if let Some(hit) = cache.get(token) {{
-        return hit.clone();
-    }}
-    let built = GLYPHS
-        .iter()
-        .find(|(t, ..)| *t == token)
-        .and_then(|(_, w, h, d)| Path::from_svg(d).map(|p| (p, *w, *h)));
-    cache.insert(token.to_string(), built.clone());
-    built
-}}
-
-/// Fitted mark for an OS-identity `chain`, aspect preserved — masters are not all square.
-/// `None` when no token has art; the tile then draws its monogram. Partial chains still
-/// resolve because the shared resolver walks most-specific-first.
+/// Fitted mark for an OS-identity `chain`, aspect preserved. `None` when no token has art;
+/// the tile then draws its monogram. Partial chains still resolve because the shared
+/// resolver walks most-specific-first.
 pub fn os_mark(chain: &str, dst: Rect) -> Option<Path> {{
-    let (path, vw, vh) = pf_client_core::os::os_icon_tokens(chain)
+    pf_client_core::os::os_icon_tokens(chain)
         .into_iter()
-        .find_map(|token| glyph(&token))?;
-    let scale = (dst.width() / vw).min(dst.height() / vh);
-    let mut m = Matrix::new_identity();
-    m.set_scale((scale, scale), None);
-    m.post_translate((
-        dst.left + (dst.width() - vw * scale) / 2.0,
-        dst.top + (dst.height() - vh * scale) / 2.0,
-    ));
-    Some(path.with_transform(&m))
+        .find_map(|token| TABLE.fit(&token, dst))
 }}
 
 #[cfg(test)]
@@ -120,9 +88,7 @@ mod tests {{
     /// A master that fails to parse is a tile that silently loses its icon.
     #[test]
     fn every_glyph_parses() {{
-        for (token, ..) in GLYPHS {{
-            assert!(glyph(token).is_some(), "{{token}} failed to parse");
-        }}
+        assert_eq!(TABLE.unparsed(), Vec::<&str>::new());
     }}
 
     /// Most-specific-first through the shared resolver; `steamos` → Steam is the alias, not table order.
@@ -151,16 +117,6 @@ mod tests {{
         assert!(os_mark("", dst).is_none());
         assert!(os_mark("plan9/glenda", dst).is_none());
         assert!(os_mark("!!!/???", dst).is_none());
-    }}
-
-    /// Letterboxed, never stretched. Apple's master is 384×512; Windows is 24×24.
-    #[test]
-    fn mark_is_contained_and_centred() {{
-        let dst = Rect::from_xywh(10.0, 20.0, 80.0, 40.0);
-        let b = os_mark("apple", dst).unwrap().compute_tight_bounds();
-        assert!(b.width() <= dst.width() + 0.5 && b.height() <= dst.height() + 0.5);
-        assert!((b.center_x() - dst.center_x()).abs() < 1.0);
-        assert!((b.center_y() - dst.center_y()).abs() < 1.0);
     }}
 }}
 """
