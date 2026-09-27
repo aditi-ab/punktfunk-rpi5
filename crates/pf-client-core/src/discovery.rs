@@ -47,6 +47,51 @@ impl Rescan {
     }
 }
 
+/// A browse watched for one host while it wakes. It owns the one advert match rule the
+/// wake-and-wait loops share, and their rescan cadence.
+pub struct AdvertWatch {
+    rx: async_channel::Receiver<DiscoveryEvent>,
+    rescan: Rescan,
+    polls: u32,
+}
+
+impl AdvertWatch {
+    pub fn start() -> AdvertWatch {
+        let (rx, rescan) = browse();
+        AdvertWatch {
+            rx,
+            rescan,
+            polls: 0,
+        }
+    }
+
+    /// Where the host advertised from since the last poll, if it did. A pinned host
+    /// (`fp` non-empty) is matched by its pin alone, an unpinned one by `addr:port`.
+    ///
+    /// Every fifth poll re-queries: `mdns-sd`'s backoff has doubled past a minute by the
+    /// time a cold box finishes booting.
+    pub fn poll(&mut self, fp: Option<&str>, addr: &str, port: u16) -> Option<(String, u16)> {
+        let mut seen = None;
+        while let Ok(ev) = self.rx.try_recv() {
+            let DiscoveryEvent::Resolved(h) = ev else {
+                continue;
+            };
+            let matched = match fp.filter(|f| !f.is_empty()) {
+                Some(fp) => h.fp_hex == fp,
+                None => h.addr == addr && h.port == port,
+            };
+            if matched {
+                seen = Some((h.addr, h.port));
+            }
+        }
+        self.polls += 1;
+        if self.polls % 5 == 0 {
+            self.rescan.request();
+        }
+        seen
+    }
+}
+
 /// Continuous browse plus [`Rescan`]. Worker exits when the receiver is
 /// dropped or the daemon dies — polled on a tick, so an empty LAN still stops.
 pub fn browse() -> (async_channel::Receiver<DiscoveryEvent>, Rescan) {
@@ -225,6 +270,43 @@ mod tests {
         let mut unpinned = other_os.clone();
         unpinned.fp_hex = String::new();
         assert!(same_host(&placeholder, &unpinned));
+    }
+
+    /// A woken host's advert counts only if it is that host: a pinned target is matched by
+    /// its pin wherever it came back, never by an fp-less advert at its old address.
+    #[test]
+    fn a_pinned_wake_target_is_matched_by_its_pin_alone() {
+        let (tx, rx) = async_channel::unbounded();
+        let mut w = AdvertWatch {
+            rx,
+            rescan: Rescan(Arc::default()),
+            polls: 0,
+        };
+        let mut fp_less = host("id-1", "desk._punktfunk._udp.local.", "192.168.1.9");
+        fp_less.fp_hex = String::new();
+        let mut moved = host("id-2", "desk._punktfunk._udp.local.", "192.168.1.20");
+        moved.fp_hex = "bb".into();
+
+        tx.try_send(DiscoveryEvent::Resolved(fp_less.clone()))
+            .unwrap();
+        assert_eq!(w.poll(Some("bb"), "192.168.1.9", 9777), None);
+        tx.try_send(DiscoveryEvent::Resolved(moved)).unwrap();
+        assert_eq!(
+            w.poll(Some("bb"), "192.168.1.9", 9777),
+            Some(("192.168.1.20".into(), 9777))
+        );
+        // A card saved without a pin has only its address to go on.
+        tx.try_send(DiscoveryEvent::Resolved(fp_less)).unwrap();
+        assert_eq!(
+            w.poll(Some(""), "192.168.1.9", 9777),
+            Some(("192.168.1.9".into(), 9777))
+        );
+        assert!(!w.rescan.0.load(Ordering::Relaxed));
+        (0..2).for_each(|_| drop(w.poll(None, "192.168.1.9", 9777)));
+        assert!(
+            w.rescan.0.load(Ordering::Relaxed),
+            "the fifth poll re-queries"
+        );
     }
 
     #[test]

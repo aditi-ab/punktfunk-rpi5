@@ -16,102 +16,32 @@ use crate::screens::{Ctx, Outbox};
 use crate::theme::{accent, fg, fill, on_accent, stroke, Fonts, PanelStroke, W};
 use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec, ROW_MAX_W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
-use pf_client_core::overlay_actions::{chord_chip, key_legend, OverlayConfig, Shortcut};
+use pf_client_core::overlay_actions::{
+    chord_chip, key_legend, Chord, OverlayConfig, Shortcut, CHORD_MODIFIERS, KEY_GRID,
+};
 use skia_safe::{Canvas, Color4f, RRect, Rect};
 
 use super::ring_editor::ring_platform;
 
-const MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "win"];
-
-const GRID: [&[&str]; 6] = [
-    &[
-        "escape", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
-    ],
-    &[
-        "1",
-        "2",
-        "3",
-        "4",
-        "5",
-        "6",
-        "7",
-        "8",
-        "9",
-        "0",
-        "backspace",
-    ],
-    &[
-        "tab", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "insert", "delete",
-    ],
-    &[
-        "capslock", "a", "s", "d", "f", "g", "h", "j", "k", "l", "enter",
-    ],
-    &[
-        "z", "x", "c", "v", "b", "n", "m", "home", "end", "pageup", "pagedown",
-    ],
-    &[
-        "space",
-        "left",
-        "up",
-        "down",
-        "right",
-        "printscreen",
-        "pause",
-    ],
-];
-
 const ROW_NAME: usize = 0;
 const ROW_KEY: usize = 1;
 const ROW_MODS: usize = 2;
-const ROW_SAVE: usize = ROW_MODS + MODIFIERS.len();
+const ROW_SAVE: usize = ROW_MODS + CHORD_MODIFIERS.len();
 const ROW_REMOVE: usize = ROW_SAVE + 1;
 
 pub(crate) struct Draft {
     pub id: Option<String>,
     pub label: String,
-    pub mods: [bool; 4],
-    pub key: Option<String>,
+    pub chord: Chord,
 }
 
 impl Draft {
     fn of(sc: Option<&Shortcut>) -> Draft {
-        let Some(sc) = sc else {
-            return Draft {
-                id: None,
-                label: String::new(),
-                mods: [false; 4],
-                key: None,
-            };
-        };
-        let has = |names: &[&str]| sc.keys.iter().any(|k| names.contains(&k.as_str()));
         Draft {
-            id: Some(sc.id.clone()),
-            label: sc.label.clone(),
-            mods: [
-                has(&["ctrl", "control"]),
-                has(&["alt", "option"]),
-                has(&["shift"]),
-                has(&["win", "cmd", "super", "meta"]),
-            ],
-            key: sc
-                .keys
-                .iter()
-                .rev()
-                .find(|k| GRID.iter().any(|row| row.contains(&k.as_str())))
-                .cloned(),
+            id: sc.map(|sc| sc.id.clone()),
+            label: sc.map(|sc| sc.label.clone()).unwrap_or_default(),
+            chord: sc.map(|sc| Chord::parse(&sc.keys)).unwrap_or_default(),
         }
-    }
-
-    /// Host send order: marked modifiers, then the key.
-    fn keys(&self) -> Vec<String> {
-        let mut v: Vec<String> = MODIFIERS
-            .iter()
-            .zip(self.mods)
-            .filter(|(_, on)| *on)
-            .map(|(m, _)| m.to_string())
-            .collect();
-        v.extend(self.key.clone());
-        v
     }
 
     fn row_count(&self) -> usize {
@@ -131,15 +61,15 @@ fn rows(d: &Draft, typing: bool, picking: bool) -> Vec<RowSpec> {
     v.push(name);
     let mut key = RowSpec::field(
         "Key",
-        d.key.as_deref().map(key_legend).unwrap_or_default(),
+        d.chord.key.as_deref().map(key_legend).unwrap_or_default(),
         "Choose…",
     );
     key.caret = picking;
     v.push(key);
-    for (i, m) in MODIFIERS.iter().enumerate() {
+    for (i, m) in CHORD_MODIFIERS.iter().enumerate() {
         let mut row = RowSpec::field(
             key_legend(m),
-            if d.mods[i] { "On" } else { "Off" }.into(),
+            if d.chord.mods[i] { "On" } else { "Off" }.into(),
             "",
         );
         row.header = if i == 0 { Some("Hold with") } else { None };
@@ -152,7 +82,7 @@ fn rows(d: &Draft, typing: bool, picking: bool) -> Vec<RowSpec> {
         } else {
             "Add to the dial"
         },
-        d.key.is_some(),
+        d.chord.key.is_some(),
     ));
     if d.id.is_some() {
         v.push(RowSpec::action("Remove shortcut", true));
@@ -162,7 +92,7 @@ fn rows(d: &Draft, typing: bool, picking: bool) -> Vec<RowSpec> {
 
 /// Pure upsert so tests can drive the blob without the process-wide settings file.
 fn apply_draft(cfg: &mut OverlayConfig, d: &Draft) {
-    cfg.upsert_shortcut(d.id.as_deref(), &d.label, d.keys());
+    cfg.upsert_shortcut(d.id.as_deref(), &d.label, d.chord.keys());
 }
 
 fn remove_shortcut(cfg: &mut OverlayConfig, id: &str) {
@@ -211,7 +141,7 @@ impl KeyTray {
             col: 0,
             tray: Spring::rest(0.0),
             flash: 0.0,
-            keys: GRID
+            keys: KEY_GRID
                 .iter()
                 .map(|r| vec![Rect::new_empty(); r.len()])
                 .collect(),
@@ -221,7 +151,8 @@ impl KeyTray {
     /// Focus `key` if it is on the grid; otherwise Esc at (0, 0).
     fn seat_on(&mut self, key: Option<&str>) {
         let at = key.and_then(|name| {
-            GRID.iter()
+            KEY_GRID
+                .iter()
                 .enumerate()
                 .find_map(|(r, row)| row.iter().position(|k| *k == name).map(|c| (r, c)))
         });
@@ -229,7 +160,7 @@ impl KeyTray {
     }
 
     fn tray_height() -> f64 {
-        let rows = GRID.len() as f64;
+        let rows = KEY_GRID.len() as f64;
         rows * Self::KEY_H + (rows - 1.0) * Self::GAP + 2.0 * Self::PAD
     }
 
@@ -261,7 +192,7 @@ impl KeyTray {
         };
         (self.row, self.col) = (r, c);
         self.flash = 1.0;
-        (TrayMsg::Pick(GRID[r][c]), Some(MenuPulse::Confirm))
+        (TrayMsg::Pick(KEY_GRID[r][c]), Some(MenuPulse::Confirm))
     }
 
     fn menu(&mut self, ev: MenuEvent) -> (TrayMsg, Option<MenuPulse>) {
@@ -271,9 +202,9 @@ impl KeyTray {
                 let x = self.keys[r][c].center_x();
                 let next = match dir {
                     MenuDir::Left if c > 0 => (r, c - 1),
-                    MenuDir::Right if c + 1 < GRID[r].len() => (r, c + 1),
+                    MenuDir::Right if c + 1 < KEY_GRID[r].len() => (r, c + 1),
                     MenuDir::Up if r > 0 => (r - 1, nearest_col(&self.keys[r - 1], x)),
-                    MenuDir::Down if r + 1 < GRID.len() => {
+                    MenuDir::Down if r + 1 < KEY_GRID.len() => {
                         (r + 1, nearest_col(&self.keys[r + 1], x))
                     }
                     _ => return (TrayMsg::None, Some(MenuPulse::Boundary)),
@@ -284,7 +215,7 @@ impl KeyTray {
             MenuEvent::Confirm => {
                 self.flash = 1.0;
                 (
-                    TrayMsg::Pick(GRID[self.row][self.col]),
+                    TrayMsg::Pick(KEY_GRID[self.row][self.col]),
                     Some(MenuPulse::Confirm),
                 )
             }
@@ -320,7 +251,7 @@ impl KeyTray {
         );
         let (gap, key_h, unit) = (Self::GAP * k, Self::KEY_H * k, Self::UNIT * k);
         let size = 13.0 * k;
-        for (r, row) in GRID.iter().enumerate() {
+        for (r, row) in KEY_GRID.iter().enumerate() {
             let legends: Vec<String> = row.iter().map(|n| key_legend(n)).collect();
             let widths: Vec<f64> = legends
                 .iter()
@@ -388,7 +319,7 @@ impl ShortcutEditorScreen {
     pub(crate) fn new(_ctx: &Ctx, existing: Option<&Shortcut>) -> ShortcutEditorScreen {
         let draft = Draft::of(existing);
         let mut list = MenuList::new();
-        list.jump_to(if draft.key.is_none() {
+        list.jump_to(if draft.chord.key.is_none() {
             ROW_KEY
         } else {
             ROW_NAME
@@ -428,12 +359,12 @@ impl ShortcutEditorScreen {
     }
 
     fn open_keys(&mut self) {
-        self.keys.seat_on(self.draft.key.as_deref());
+        self.keys.seat_on(self.draft.chord.key.as_deref());
         self.picking_key = true;
     }
 
     fn save(&mut self, ctx: &mut Ctx, fx: &mut Outbox) {
-        if self.draft.key.is_none() {
+        if self.draft.chord.key.is_none() {
             fx.toast = Some("Pick a key first".into());
             self.list.jump_to(ROW_KEY);
             self.open_keys();
@@ -505,7 +436,7 @@ impl ShortcutEditorScreen {
         match row {
             ROW_NAME => self.editing_name = true,
             ROW_KEY => self.open_keys(),
-            r if (ROW_MODS..ROW_SAVE).contains(&r) => self.draft.mods[r - ROW_MODS] ^= true,
+            r if (ROW_MODS..ROW_SAVE).contains(&r) => self.draft.chord.mods[r - ROW_MODS] ^= true,
             ROW_SAVE => self.save(ctx, fx),
             _ => self.remove(ctx, fx),
         }
@@ -517,7 +448,7 @@ impl ShortcutEditorScreen {
         if !(ROW_MODS..ROW_SAVE).contains(&row) {
             return Some(MenuPulse::Boundary);
         }
-        let on = &mut self.draft.mods[row - ROW_MODS];
+        let on = &mut self.draft.chord.mods[row - ROW_MODS];
         let want = delta > 0;
         if *on == want {
             return Some(MenuPulse::Boundary);
@@ -529,7 +460,7 @@ impl ShortcutEditorScreen {
     fn take_pick(&mut self, msg: TrayMsg) -> Option<MenuPulse> {
         match msg {
             TrayMsg::Pick(name) => {
-                self.draft.key = Some(name.to_string());
+                self.draft.chord.key = Some(name.to_string());
                 self.picking_key = false;
                 Some(MenuPulse::Confirm)
             }
@@ -697,7 +628,7 @@ impl ShortcutEditorScreen {
 
         let top = rect.top + 40.0 * kf;
         let r = 30.0 * kf;
-        let chip = chord_chip(&self.draft.keys());
+        let chip = chord_chip(&self.draft.chord.keys());
         let row_w = (ROW_MAX_W * k).min(f64::from(rect.width()) - 48.0 * k);
         let left = (f64::from(rect.center_x()) - row_w / 2.0) as f32;
         draw_keycap_disc(canvas, fonts, left + r, top + r, r, kf, &chip);
@@ -764,7 +695,7 @@ impl ShortcutEditorScreen {
                 f64::from(rect.bottom),
                 seat_keys,
                 k,
-                self.draft.key.as_deref(),
+                self.draft.chord.key.as_deref(),
             );
         }
     }
@@ -782,10 +713,10 @@ mod tests {
         let blob = r#"{"v":2,"ring":["end_stream",null,null,null,null,null]}"#;
         let mut d = Draft::of(None);
         d.label = "Task Manager".into();
-        d.mods[0] = true;
-        d.mods[2] = true;
-        d.key = Some("escape".into());
-        assert_eq!(d.keys(), vec!["ctrl", "shift", "escape"]);
+        d.chord.mods[0] = true;
+        d.chord.mods[2] = true;
+        d.chord.key = Some("escape".into());
+        assert_eq!(d.chord.keys(), vec!["ctrl", "shift", "escape"]);
         let mut cfg = OverlayConfig::parse(blob, RingPlatform::Desktop);
         apply_draft(&mut cfg, &d);
         assert_eq!(cfg.shortcuts.len(), 1);
@@ -794,8 +725,8 @@ mod tests {
         assert_eq!(cfg.ring[1], Some(SlotId::Shortcut("s1".into())));
         let back = Draft::of(Some(&cfg.shortcuts[0]));
         assert_eq!(back.id.as_deref(), Some("s1"));
-        assert_eq!(back.mods, [true, false, true, false]);
-        assert_eq!(back.key.as_deref(), Some("escape"));
+        assert_eq!(back.chord.mods, [true, false, true, false]);
+        assert_eq!(back.chord.key.as_deref(), Some("escape"));
         remove_shortcut(&mut cfg, "s1");
         assert!(cfg.shortcuts.is_empty());
         assert_eq!(cfg.ring[1], None);
@@ -814,8 +745,8 @@ mod tests {
             .iter()
             .all(|m| m.adjustable && m.value.as_deref() == Some("Off")));
         assert!(!r[ROW_SAVE].enabled, "no key, nothing to add");
-        d.key = Some("escape".into());
-        d.mods[1] = true;
+        d.chord.key = Some("escape".into());
+        d.chord.mods[1] = true;
         d.id = Some("s1".into());
         let r = rows(&d, true, false);
         assert_eq!(r.len(), ROW_REMOVE + 1);
@@ -847,21 +778,6 @@ mod tests {
             (TrayMsg::None, Some(MenuPulse::Boundary))
         ));
         assert_eq!(t.menu(MenuEvent::Back).0, TrayMsg::Close);
-    }
-
-    #[test]
-    fn the_grid_holds_every_key_once_and_no_modifier() {
-        use pf_client_core::overlay_actions::key_vk;
-        let mut seen: Vec<&str> = Vec::new();
-        for row in GRID {
-            for name in row {
-                assert!(key_vk(name).is_some(), "{name} is unknown to the wire");
-                assert!(!MODIFIERS.contains(name), "{name} is a modifier");
-                assert!(!seen.contains(name), "{name} twice");
-                seen.push(name);
-            }
-        }
-        assert_eq!(seen.len(), 66);
     }
 
     #[test]

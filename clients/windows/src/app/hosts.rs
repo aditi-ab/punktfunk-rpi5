@@ -9,7 +9,6 @@ use super::style::*;
 use super::{Screen, Svc, Target};
 use crate::trust::{KnownHosts, Settings};
 use pf_client_core::discovery::DiscoveredHost;
-use pf_client_core::start;
 use std::collections::HashMap;
 use windows_reactor::*;
 
@@ -366,14 +365,19 @@ fn edit_editor(
                     h.name = name;
                 }
                 let addr = addr_draft.borrow().trim().to_string();
-                if !addr.is_empty() {
-                    h.addr = addr;
-                }
-                if let Ok(p) = port_draft.borrow().trim().parse::<u16>()
-                    && p != 0
-                {
-                    h.port = p;
-                }
+                let addr = if addr.is_empty() {
+                    h.addr.clone()
+                } else {
+                    addr
+                };
+                let port = port_draft
+                    .borrow()
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|&p| p != 0)
+                    .unwrap_or(h.port);
+                h.move_to(&addr, port);
                 let mac = mac_draft.borrow().trim().to_string();
                 h.mac = if mac.is_empty() {
                     Vec::new()
@@ -919,38 +923,21 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             }
                             let identity = svc.ctx.identity.clone();
                             let target = target.clone();
-                            if let Some(fp) = target.fp_hex.as_deref() {
-                                // Whatever the host said about itself is about to be wrong.
-                                pf_client_core::host_actions::invalidate(fp);
-                            }
                             set_status.call(format!("{label} — asking {}…", target.name));
                             let _ = std::thread::Builder::new()
                                 .name("punktfunk-hostaction".into())
                                 .spawn(move || {
-                                    let pin = target
-                                        .fp_hex
-                                        .as_deref()
-                                        .and_then(crate::trust::parse_hex32);
-                                    let mgmt = target
-                                        .mgmt_port
-                                        .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
-                                    let msg = match pf_client_core::host_actions::invoke(
+                                    set_status.call(pf_client_core::host_actions::run(
+                                        &target.name,
                                         &target.addr,
-                                        mgmt,
+                                        target
+                                            .mgmt_port
+                                            .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT),
                                         &identity,
-                                        pin,
+                                        target.fp_hex.as_deref().unwrap_or_default(),
                                         &action_id,
-                                    ) {
-                                        Ok(()) => {
-                                            tracing::info!(host = %target.name, action = %action_id, "host action accepted");
-                                            format!("{}: {label} — on its way", target.name)
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(host = %target.name, action = %action_id, error = %e, "host action refused");
-                                            format!("{label} failed — {e}")
-                                        }
-                                    };
-                                    set_status.call(msg);
+                                        &label,
+                                    ));
                                 });
                         }
                         // The preset items are dynamic, so they are matched by prefix before
@@ -1015,8 +1002,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         MENU_SEND_LOGS => {
                             // Blocking network (the library agent's 5 s connect / 10 s global
                             // budgets) — a worker thread, with the outcome routed to the
-                            // status line. Wording is the console's verbatim, so a quoted
-                            // message means the same thing everywhere.
+                            // status line.
                             let identity = svc.ctx.identity.clone();
                             let target = target.clone();
                             let set_status = svc.set_status.clone();
@@ -1024,40 +1010,16 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             let _ = std::thread::Builder::new()
                                 .name("punktfunk-sendlogs".into())
                                 .spawn(move || {
-                                    let header = format!(
-                                        "punktfunk-client {} ({} {}) — client log bundle",
-                                        env!("CARGO_PKG_VERSION"),
-                                        std::env::consts::OS,
-                                        std::env::consts::ARCH,
-                                    );
-                                    let pin = target
-                                        .fp_hex
-                                        .as_deref()
-                                        .and_then(crate::trust::parse_hex32);
-                                    let mgmt = target
-                                        .mgmt_port
-                                        .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
-                                    let msg = match pf_client_core::logring::send_to_host(
+                                    set_status.call(pf_client_core::logring::send_bundle(
+                                        "punktfunk-client",
+                                        &target.name,
                                         &target.addr,
-                                        mgmt,
+                                        target
+                                            .mgmt_port
+                                            .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT),
                                         &identity,
-                                        pin,
-                                        &header,
-                                    ) {
-                                        Ok(id) => {
-                                            tracing::info!(host = %target.name, id, "client logs uploaded");
-                                            format!(
-                                                "Logs sent to {} — download them from its web \
-                                                 console's Logs page",
-                                                target.name
-                                            )
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(host = %target.name, error = %e, "client log upload failed");
-                                            format!("Couldn't send logs — {e}")
-                                        }
-                                    };
-                                    set_status.call(msg);
+                                        target.fp_hex.as_deref().unwrap_or_default(),
+                                    ));
                                 });
                         }
                         MENU_SPEED => {
@@ -1295,7 +1257,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     // trips the reactor's phantom-child bookkeeping into an E_BOUNDS panic (as the delete-preset
     // dialog in settings.rs shows). Confirmed first: undoing a forget needs a fresh pairing.
     let forget_confirm: Element = {
-        let sf = set_forget.clone();
+        let (sf, st) = (set_forget.clone(), set_status.clone());
         let pending = forget.clone();
         let content = pending
             .as_ref()
@@ -1317,20 +1279,10 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     && let Some(who) = &pending
                 {
                     let mut known = KnownHosts::load();
-                    let target = who.index(&known);
-                    let gone = target.and_then(|i| known.hosts[i].id.clone());
-                    // Keyed by fingerprint and outliving the record otherwise: forgetting a
-                    // host must not leave its title list on disk (as the Linux shell does).
-                    if let Some(fp) = target.map(|i| known.hosts[i].fp_hex.clone()) {
-                        pf_client_core::library_cache::forget(&fp);
-                    }
-                    known.remove_card(who.id.as_deref(), &who.addr, who.port);
-                    let _ = known.save();
-                    // The resolver already ignores a dangling pointer, so this is hygiene:
-                    // without it a re-pair of a different box inherits an old choice.
-                    let mut settings = Settings::load();
-                    if start::clear_default(&mut settings, gone.as_deref()) {
-                        settings.save();
+                    if let Some(i) = who.index(&known)
+                        && let Err(e) = pf_client_core::orchestrate::forget_host(&mut known, i)
+                    {
+                        st.call(format!("Couldn't save — {e:#}"));
                     }
                 }
                 sf.call(None); // re-renders the page; the row is gone on the next load

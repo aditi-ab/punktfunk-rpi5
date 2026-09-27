@@ -117,6 +117,58 @@ pub fn send_to_host(
     }
 }
 
+/// [`send_to_host`] with the bundle header and outcome every shell uses. `app` names the
+/// binary in the header; the result is the sentence the shell shows the user.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+pub fn send_bundle(
+    app: &str,
+    host_name: &str,
+    addr: &str,
+    mgmt_port: u16,
+    identity: &(String, String),
+    fp_hex: &str,
+) -> String {
+    let header = format!(
+        "{app} {} ({} {}) — client log bundle",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    let pin = crate::trust::parse_hex32(fp_hex);
+    match send_to_host(addr, mgmt_port, identity, pin, &header) {
+        Ok(id) => {
+            tracing::info!(host = %host_name, id, "client logs uploaded");
+            format!("Logs sent to {host_name} — download them from its web console's Logs page")
+        }
+        Err(e) => {
+            tracing::warn!(host = %host_name, error = %e, "client log upload failed");
+            format!("Couldn't send logs — {e}")
+        }
+    }
+}
+
+/// Install the process subscriber: a fmt layer on `writer` scoped by `RUST_LOG` (default
+/// `info`), beside [`RingLayer`] at DEBUG regardless, since the ring exists for the
+/// diagnostics nobody enabled before the bug happened. `ansi: false` turns colour off for a
+/// log file; `true` keeps the fmt layer's default.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+pub fn init_tracing<W>(writer: W, ansi: bool)
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    let fmt = tracing_subscriber::fmt::layer().with_writer(writer);
+    let fmt = if ansi { fmt } else { fmt.with_ansi(false) };
+    tracing_subscriber::registry()
+        .with(fmt.with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        ))
+        .with(RingLayer.with_filter(tracing_subscriber::filter::LevelFilter::DEBUG))
+        .init();
+}
+
 /// `tracing` layer that feeds the ring. Installed beside the visible layer with
 /// its own `LevelFilter::DEBUG`, not under the env filter: a field bundle must
 /// carry diagnostics nobody enabled beforehand. Mirrors the host's

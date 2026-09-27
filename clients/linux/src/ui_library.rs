@@ -12,7 +12,7 @@ use crate::ui_hosts::ConnectRequest;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use pf_client_core::collate::{self, SortKey};
-use pf_client_core::library::{store_label, DESKTOP_ICON, DESKTOP_ID};
+use pf_client_core::library::{initials, store_label, DESKTOP_ICON, DESKTOP_ID};
 use relm4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -103,15 +103,13 @@ fn page_host_label(req: &ConnectRequest) -> String {
 /// what you copy off that shelf is what pressing the card and picking the title does.
 /// `None` only when the host has left the store while the page was open.
 fn game_link(req: &ConnectRequest, game_id: &str) -> Option<String> {
-    let known = pf_client_core::trust::KnownHosts::load();
-    let host = known.resolve(req.fp_hex.as_deref(), &req.addr, req.port)?;
-    Some(
-        pf_client_core::deeplink::DeepLink::for_host(
-            host,
-            Some(game_id),
-            req.preset.as_deref().filter(|p| !p.is_empty()),
-        )
-        .to_url(),
+    pf_client_core::deeplink::saved_host_link(
+        &pf_client_core::trust::KnownHosts::load(),
+        req.fp_hex.as_deref(),
+        &req.addr,
+        req.port,
+        req.preset.as_deref().filter(|p| !p.is_empty()),
+        Some(game_id),
     )
 }
 
@@ -696,31 +694,4 @@ fn load_art(state: &Rc<State>, games: &[GameEntry]) {
             }
         }
     });
-}
-
-/// The store badge text — `store` comes from the entry (today `steam`/`custom`; future
-/// stores per the host's provider list), with the id prefix as a fallback spelling.
-/// Shared with the gamepad launcher's posters.
-/// Monogram for the placeholder tile: the first letters of the first two words.
-/// Shared with the gamepad launcher's posters.
-pub fn initials(title: &str) -> String {
-    title
-        .split_whitespace()
-        .take(2)
-        .filter_map(|w| w.chars().next())
-        .flat_map(char::to_uppercase)
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn initials_take_two_words() {
-        assert_eq!(initials("Dota 2"), "D2");
-        assert_eq!(initials("half-life"), "H");
-        assert_eq!(initials("The Witness III"), "TW");
-        assert_eq!(initials(""), "");
-    }
 }

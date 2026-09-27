@@ -42,6 +42,7 @@
 //!   state, and root can only start a tween off a trigger it owns.
 
 mod connect;
+mod embedded_png;
 mod help;
 mod hosts;
 mod launcher_icons;

@@ -454,6 +454,37 @@ impl WakeWait {
     }
 }
 
+/// Wake-and-wait on this thread, with a reachability probe as the presence reading. Ticks
+/// are paced to wall-clock seconds, so the probe's own wait does not stretch the budget.
+/// `each` sees every tick before its packet goes out and returns `false` to stop; the
+/// result is the last tick, `None` when `each` stopped it.
+pub fn wake_by_probe(
+    addr: &str,
+    port: u16,
+    fp_hex: &str,
+    mac: &[String],
+    mut each: impl FnMut(&WakeTick) -> bool,
+) -> Option<WakeTick> {
+    let last_ip = addr.parse().ok();
+    let started = std::time::Instant::now();
+    let mut wait = WakeWait::new();
+    loop {
+        let online = crate::trust::probe_one(addr, port, fp_hex, Duration::from_millis(900));
+        let tick = wait.tick(online);
+        if !each(&tick) {
+            return None;
+        }
+        if tick.send_packet {
+            crate::wol::wake(mac, last_ip);
+        }
+        if tick.outcome.is_some() {
+            return Some(tick);
+        }
+        let next = Duration::from_secs(wait.seconds());
+        std::thread::sleep(next.saturating_sub(started.elapsed()));
+    }
+}
+
 /// How a connect finished. Front-ends map this onto their own surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectOutcome {
@@ -649,6 +680,21 @@ pub fn persist_window_size(w: u32, h: u32) {
         s.last_window_h = h;
         s.save();
     }
+}
+
+/// Forget `known.hosts[i]` and save. Once saved, what is keyed on the record goes too: its
+/// cached game catalog and action rows, and a default-host pointer that a later re-pair of
+/// another box would otherwise inherit.
+pub fn forget_host(known: &mut KnownHosts, i: usize) -> anyhow::Result<KnownHost> {
+    let gone = known.hosts.remove(i);
+    known.save()?;
+    crate::library_cache::forget(&gone.fp_hex);
+    crate::host_actions::invalidate(&gone.fp_hex);
+    let mut settings = Settings::load();
+    if crate::start::clear_default(&mut settings, gone.id.as_deref()) {
+        settings.save();
+    }
+    Ok(gone)
 }
 
 /// Session binary: installed next to this executable, else `$PATH` (a dev run

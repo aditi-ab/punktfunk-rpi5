@@ -15,8 +15,8 @@ use super::settings::{active_preset, commit};
 use super::style::*;
 use super::AppCtx;
 use pf_client_core::overlay_actions::{
-    catalogue, chord_chip, key_legend, slot_icon, OverlayConfig, RingPlatform, Shortcut, SlotId,
-    RING_SLOTS,
+    catalogue, chord_chip, key_legend, slot_icon, Chord, OverlayConfig, RingPlatform, Shortcut,
+    SlotId, CHORD_MODIFIERS, KEY_GRID, RING_SLOTS,
 };
 use pf_client_core::ring::{slot_offset, CENTRE_DIAMETER, RING_RADIUS, SLOT_DIAMETER};
 use std::sync::Arc;
@@ -32,47 +32,6 @@ const HIT_SLOP: f64 = 1.2;
 /// The Lucide mark on a disc, in DIPs. The console draws it at 1.05x the disc's radius; this is
 /// that, so a disc reads the same weight in the editor as it does in the stream.
 const ICON_DIP: f64 = SLOT_DIAMETER as f64 * 1.05 / 2.0;
-
-const MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "win"];
-
-/// The key grid, row by row, the way a keyboard lays them out — every name `key_vk` knows
-/// that is not a modifier (the same rows the console's editor draws).
-const GRID: [&[&str]; 6] = [
-    &[
-        "escape", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
-    ],
-    &[
-        "1",
-        "2",
-        "3",
-        "4",
-        "5",
-        "6",
-        "7",
-        "8",
-        "9",
-        "0",
-        "backspace",
-    ],
-    &[
-        "tab", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "insert", "delete",
-    ],
-    &[
-        "capslock", "a", "s", "d", "f", "g", "h", "j", "k", "l", "enter",
-    ],
-    &[
-        "z", "x", "c", "v", "b", "n", "m", "home", "end", "pageup", "pagedown",
-    ],
-    &[
-        "space",
-        "left",
-        "up",
-        "down",
-        "right",
-        "printscreen",
-        "pause",
-    ],
-];
 
 const CLOCK: [&str; RING_SLOTS] = [
     "12 o'clock",
@@ -120,41 +79,16 @@ impl Drag {
 struct Draft {
     id: Option<String>,
     label: String,
-    mods: [bool; 4],
-    key: Option<String>,
+    chord: Chord,
 }
 
 impl Draft {
     fn of(sc: &Shortcut) -> Draft {
-        let has = |names: &[&str]| sc.keys.iter().any(|k| names.contains(&k.as_str()));
         Draft {
             id: Some(sc.id.clone()),
             label: sc.label.clone(),
-            mods: [
-                has(&["ctrl", "control"]),
-                has(&["alt", "option"]),
-                has(&["shift"]),
-                has(&["win", "cmd", "super", "meta"]),
-            ],
-            key: sc
-                .keys
-                .iter()
-                .rev()
-                .find(|k| GRID.iter().any(|row| row.contains(&k.as_str())))
-                .cloned(),
+            chord: Chord::parse(&sc.keys),
         }
-    }
-
-    /// The chord in send order: the modifiers marked on, then the key.
-    fn keys(&self) -> Vec<String> {
-        let mut v: Vec<String> = MODIFIERS
-            .iter()
-            .zip(self.mods)
-            .filter(|(_, on)| *on)
-            .map(|(m, _)| m.to_string())
-            .collect();
-        v.extend(self.key.clone());
-        v
     }
 }
 
@@ -836,7 +770,7 @@ fn shortcut_editor(
     ui: &Ui,
     set_ui: &SetState<Ui>,
 ) -> Element {
-    let keys = draft.keys();
+    let keys = draft.chord.keys();
     let chip = chord_chip(&keys);
     let ink = Color {
         a: 242,
@@ -886,14 +820,14 @@ fn shortcut_editor(
         .max_width(320.0)
         .horizontal_alignment(HorizontalAlignment::Left);
 
-    let mut mods: Vec<Element> = MODIFIERS
+    let mut mods: Vec<Element> = CHORD_MODIFIERS
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            toggle_button(key_legend(m), draft.mods[i])
+            toggle_button(key_legend(m), draft.chord.mods[i])
                 .on_checked({
                     let (ui, set_ui) = (ui.clone(), set_ui.clone());
-                    move |on: bool| set_draft(&ui, &set_ui, &|d| d.mods[i] = on)
+                    move |on: bool| set_draft(&ui, &set_ui, &|d| d.chord.mods[i] = on)
                 })
                 .into()
         })
@@ -915,18 +849,20 @@ fn shortcut_editor(
             .into(),
     );
 
-    let grid: Vec<Element> = GRID
+    let grid: Vec<Element> = KEY_GRID
         .iter()
         .map(|row| {
             let keys: Vec<Element> = row
                 .iter()
                 .map(|name| {
-                    toggle_button(key_legend(name), draft.key.as_deref() == Some(*name))
+                    toggle_button(key_legend(name), draft.chord.key.as_deref() == Some(*name))
                         .on_checked({
                             let (ui, set_ui) = (ui.clone(), set_ui.clone());
                             move |on: bool| {
                                 if on {
-                                    set_draft(&ui, &set_ui, &|d| d.key = Some(name.to_string()));
+                                    set_draft(&ui, &set_ui, &|d| {
+                                        d.chord.key = Some(name.to_string())
+                                    });
                                 }
                             }
                         })
@@ -946,7 +882,7 @@ fn shortcut_editor(
         "Add shortcut"
     })
     .accent()
-    .enabled(draft.key.is_some())
+    .enabled(draft.chord.key.is_some())
     .on_click({
         let (props, cfg, ui, set_ui, d) = (
             props.clone(),
@@ -957,7 +893,7 @@ fn shortcut_editor(
         );
         move || {
             let mut next = cfg.clone();
-            next.upsert_shortcut(d.id.as_deref(), &d.label, d.keys());
+            next.upsert_shortcut(d.id.as_deref(), &d.label, d.chord.keys());
             write(&props, &next);
             let mut u = ui.clone();
             u.draft = None;
@@ -1028,7 +964,7 @@ fn shortcut_editor(
     // Pressing the chord on the real keyboard fills the modifiers and the key in one go: while
     // the capture is on, an accelerator per key and modifier mix on this card takes it.
     if ui.capture {
-        for row in GRID {
+        for row in KEY_GRID {
             for name in row {
                 let Some(vk) = virtual_key(name) else {
                     continue;
@@ -1041,8 +977,8 @@ fn shortcut_editor(
                         move || {
                             let mut u = ui.clone();
                             if let Some(d) = u.draft.as_mut() {
-                                d.mods = mods_of(mask);
-                                d.key = Some(name.to_string());
+                                d.chord.mods = mods_of(mask);
+                                d.chord.key = Some(name.to_string());
                             }
                             u.capture = false;
                             set_ui.call(u);
@@ -1111,7 +1047,7 @@ mod tests {
     /// back the way the editor wrote it.
     #[test]
     fn the_grid_maps_to_virtual_keys_and_the_draft_round_trips() {
-        for row in GRID {
+        for row in KEY_GRID {
             for name in row {
                 assert!(virtual_key(name).is_some(), "{name}");
             }
@@ -1126,8 +1062,8 @@ mod tests {
             keys: vec!["ctrl".into(), "shift".into(), "escape".into()],
         };
         let d = Draft::of(&sc);
-        assert_eq!(d.mods, [true, false, true, false]);
-        assert_eq!(d.keys(), sc.keys);
+        assert_eq!(d.chord.mods, [true, false, true, false]);
+        assert_eq!(d.chord.keys(), sc.keys);
         assert_eq!(
             mods_of(VirtualKeyModifiers::Control.0 | VirtualKeyModifiers::Shift.0),
             [true, false, true, false]

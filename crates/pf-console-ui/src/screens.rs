@@ -182,9 +182,14 @@ pub(crate) fn saved_host_link(
     preset: Option<&str>,
     launch: Option<&str>,
 ) -> Option<String> {
-    let known = store.known_hosts();
-    let host = known.resolve(Some(fp_hex), addr, port)?;
-    Some(pf_client_core::deeplink::DeepLink::for_host(host, launch, preset).to_url())
+    pf_client_core::deeplink::saved_host_link(
+        &store.known_hosts(),
+        Some(fp_hex),
+        addr,
+        port,
+        preset,
+        launch,
+    )
 }
 
 pub(crate) fn host_link(store: &dyn crate::store::SettingsStore, row: &HostRow) -> Option<String> {

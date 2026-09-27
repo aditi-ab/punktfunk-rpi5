@@ -23,7 +23,8 @@
 mod cli {
     use pf_client_core::deeplink::{self, DeepLink, HostResolution};
     use pf_client_core::orchestrate::{
-        self, ConnectOutcome, ConnectPlan, PlanOutcome, SessionEvent, WakeOutcome, WakeWait,
+        self, ConnectOutcome, ConnectPlan, PlanOutcome, SessionEvent, WakeOutcome, WakeTick,
+        WAKE_TIMEOUT_SECS,
     };
     use pf_client_core::presets::PresetsFile;
     use pf_client_core::trust::{self, KnownHost, KnownHosts, Settings};
@@ -130,8 +131,9 @@ punktfunk hosts — the saved-hosts store (shared with the desktop client)
       a changed identity is a decision for a person.
 
   punktfunk hosts forget <host-ref>
-      Remove a saved host, its pinned fingerprint included. A later connect
-      must pair or trust it again."
+      Remove a saved host with its pinned fingerprint and cached game list,
+      and stop opening on it by default. A later connect must pair or trust
+      it again."
             }
             "default-host" => {
                 "\
@@ -734,8 +736,7 @@ from the config directory for a true factory reset."
                     .position(|h| !fp.is_empty() && h.fp_hex.eq_ignore_ascii_case(&fp))
                 {
                     let was = format!("{}:{}", known.hosts[i].addr, known.hosts[i].port);
-                    known.hosts[i].addr = addr.clone();
-                    known.hosts[i].port = port;
+                    known.hosts[i].move_to(&addr, port);
                     return match known.save() {
                         Ok(()) => {
                             println!("moved {was} to {addr}:{port}");
@@ -774,9 +775,8 @@ from the config directory for a true factory reset."
                     Ok(v) => v,
                     Err(code) => return code,
                 };
-                let gone = known.hosts.remove(i);
-                match known.save() {
-                    Ok(()) => {
+                match orchestrate::forget_host(&mut known, i) {
+                    Ok(gone) => {
                         println!("forgot {}", gone.name);
                         OK
                     }
@@ -857,8 +857,8 @@ from the config directory for a true factory reset."
         AddOutcome::Pinned
     }
 
-    /// `wake <host-ref> [--wait]` — a magic packet, and with `--wait` the same bounded
-    /// wake-and-wait the shells run (`WakeWait`: a packet every 6 s, presence polled every
+    /// `wake <host-ref> [--wait]` — a magic packet, and with `--wait` the bounded wake-and-wait
+    /// the console runs (`orchestrate::wake_by_probe`: a packet every 6 s, a probe every
     /// second, 90 s budget).
     fn wake(args: &[String]) -> u8 {
         let Some(reference) = positional(args, 0) else {
@@ -881,29 +881,23 @@ from the config directory for a true factory reset."
             println!("sent a wake packet to {}", host.name);
             return OK;
         }
-        let mut wait = WakeWait::new();
-        loop {
-            let online = trust::probe_reachable_many(
-                vec![(host.addr.clone(), host.port, host.fp_hex.clone())],
-                Duration::from_millis(900),
-            )
-            .first()
-            .copied()
-            .unwrap_or(false);
-            let tick = wait.tick(online);
-            if tick.send_packet {
-                wol::wake(&host.mac, host.addr.parse().ok());
+        let last =
+            orchestrate::wake_by_probe(&host.addr, host.port, &host.fp_hex, &host.mac, |_| true);
+        match last {
+            Some(WakeTick {
+                outcome: Some(WakeOutcome::Online),
+                seconds,
+                ..
+            }) => {
+                println!("{} is up after {seconds}s", host.name);
+                OK
             }
-            match tick.outcome {
-                Some(WakeOutcome::Online) => {
-                    println!("{} is up after {}s", host.name, tick.seconds);
-                    return OK;
-                }
-                Some(WakeOutcome::TimedOut) => {
-                    eprintln!("{} didn't come online within {}s", host.name, tick.seconds);
-                    return CONNECT_FAILED;
-                }
-                None => std::thread::sleep(Duration::from_secs(1)),
+            _ => {
+                eprintln!(
+                    "{} didn't come online within {WAKE_TIMEOUT_SECS}s",
+                    host.name
+                );
+                CONNECT_FAILED
             }
         }
     }
@@ -1084,45 +1078,26 @@ from the config directory for a true factory reset."
         }
         // Wake first when the host is asleep and we know how to reach it. This is the thing the
         // old exec-style CLI never did: it fired a packet at best and dialled into the void.
+        let fp = plan.host.fp_hex.as_deref().unwrap_or_default();
         if plan.wake
-            && !trust::probe_reachable_many(
-                vec![(
-                    plan.host.addr.clone(),
-                    plan.host.port,
-                    plan.host.fp_hex.clone().unwrap_or_default(),
-                )],
+            && !trust::probe_one(
+                &plan.host.addr,
+                plan.host.port,
+                fp,
                 Duration::from_millis(900),
             )
-            .first()
-            .copied()
-            .unwrap_or(false)
         {
             eprintln!("waking {}…", plan.host.name);
-            let mut wait = WakeWait::new();
-            loop {
-                let online = trust::probe_reachable_many(
-                    vec![(
-                        plan.host.addr.clone(),
-                        plan.host.port,
-                        plan.host.fp_hex.clone().unwrap_or_default(),
-                    )],
-                    Duration::from_millis(900),
-                )
-                .first()
-                .copied()
-                .unwrap_or(false);
-                let tick = wait.tick(online);
-                if tick.send_packet {
-                    wol::wake(&plan.host.mac, plan.host.addr.parse().ok());
-                }
-                match tick.outcome {
-                    Some(WakeOutcome::Online) => break,
-                    Some(WakeOutcome::TimedOut) => {
-                        eprintln!("{} didn't come online", plan.host.name);
-                        return CONNECT_FAILED;
-                    }
-                    None => std::thread::sleep(Duration::from_secs(1)),
-                }
+            let last = orchestrate::wake_by_probe(
+                &plan.host.addr,
+                plan.host.port,
+                fp,
+                &plan.host.mac,
+                |_| true,
+            );
+            if last.and_then(|t| t.outcome) != Some(WakeOutcome::Online) {
+                eprintln!("{} didn't come online", plan.host.name);
+                return CONNECT_FAILED;
             }
         }
         if let Some(p) = &plan.preset {

@@ -7,7 +7,6 @@ use super::lucide;
 use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
 use crate::trust::{self, KnownHosts};
-use pf_client_core::discovery::{DiscoveredHost, DiscoveryEvent};
 use pf_client_core::orchestrate::{CancelHandle, ConnectOutcome, WakeOutcome, WakeWait};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -439,17 +438,14 @@ pub(crate) fn request_access(props: &Svc, target: &Target) {
     );
 }
 
-/// The Wake-on-LAN "wait until up" flow (mirrors the Apple `HostWaker`): the FALLBACK after a
-/// failed dial-first attempt ([`initiate_waking`]) to a non-advertising saved host with a MAC.
-/// Send a magic packet, show a cancelable "Waking…" screen, and POLL mDNS for the host to
-/// reappear — re-sending the packet periodically — on a bounded deadline (a cold box takes far
-/// longer to POST/boot/re-advertise than a connect attempt will sit). On reappearance we dial it
-/// (re-keying the saved host when it came back on a new IP); on timeout or Cancel we return to
-/// the host list.
+/// The Wake-on-LAN "wait until up" flow: the FALLBACK after a failed dial-first attempt
+/// ([`initiate_waking`]) to a non-advertising saved host with a MAC. A magic packet, a
+/// cancelable "Waking…" screen, and mDNS polled until the host advertises — re-sending the
+/// packet periodically — on a bounded deadline. On reappearance it dials the address the host
+/// came back on; on timeout or Cancel it returns to the host list.
 ///
-/// The cadence is [`WakeWait`], shared with the GTK shell and ported from Apple's `HostWaker`
-/// (design/client-architecture-split.md §3) — the comment this function used to carry ("mirrors
-/// the Apple HostWaker") is now literally true instead of aspirational.
+/// The cadence is [`WakeWait`] and the advert match `AdvertWatch`, both shared with the GTK
+/// shell (design/client-architecture-split.md §3).
 fn wake_and_connect(
     ctx: &Arc<AppCtx>,
     target: Target,
@@ -470,38 +466,14 @@ fn wake_and_connect(
 
     let (ctx, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
     std::thread::spawn(move || {
-        let (rx, rescan) = pf_client_core::discovery::browse();
-        let mut seen: Vec<DiscoveredHost> = Vec::new();
+        let mut adverts = pf_client_core::discovery::AdvertWatch::start();
         let mut wait = WakeWait::new();
-        // A waking host starts advertising at a moment we can't predict, and `mdns-sd`'s own
-        // re-query interval has doubled well past a minute by the time a boot finishes — so ask
-        // again periodically instead of waiting to be told (matches the GTK client's wake wait).
-        let mut ticks: u32 = 0;
         loop {
             // Cancel already returned the UI to the host list — stop re-sending and tear down.
             if cancel.load(Ordering::SeqCst) {
                 return;
             }
-            // Drain freshly-resolved adverts into the accumulator (newest wins per key).
-            while let Ok(event) = rx.try_recv() {
-                let DiscoveryEvent::Resolved(h) = event else {
-                    continue;
-                };
-                if let Some(e) = seen.iter_mut().find(|e| e.key == h.key) {
-                    *e = h;
-                } else {
-                    seen.push(h);
-                }
-            }
-            // Match on the pinned fingerprint first (it survives an IP change), else last address.
-            let resolved = seen
-                .iter()
-                .find(|h| match &target.fp_hex {
-                    Some(fp) if !h.fp_hex.is_empty() => h.fp_hex == *fp,
-                    _ => h.addr == target.addr && h.port == target.port,
-                })
-                .map(|h| (h.addr.clone(), h.port));
-
+            let resolved = adverts.poll(target.fp_hex.as_deref(), &target.addr, target.port);
             let tick = wait.tick(resolved.is_some());
             if tick.send_packet {
                 crate::wol::wake(&target.mac, target.addr.parse().ok());
@@ -527,10 +499,6 @@ fn wake_and_connect(
                     return;
                 }
                 None => {}
-            }
-            ticks += 1;
-            if ticks.is_multiple_of(5) {
-                rescan.request();
             }
             std::thread::sleep(Duration::from_secs(1));
         }

@@ -64,26 +64,7 @@ fn main() {
     // it) and the DEBUG+ ring "Send logs to host" uploads; the env filter scopes stderr and file
     // only. The session's stderr joins file and ring through `logring::forward_child_stderr`.
     logfile::init();
-    {
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-        use tracing_subscriber::Layer;
-        tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_ansi(false)
-                    .with_writer(logfile::tee)
-                    .with_filter(
-                        tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| "info".into()),
-                    ),
-            )
-            .with(
-                pf_client_core::logring::RingLayer
-                    .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-            )
-            .init();
-    }
+    pf_client_core::logring::init_tracing(logfile::tee, false);
     if let Some(p) = logfile::path() {
         tracing::info!(path = %p.display(), "client log file (rotated at 10 MB, one .old kept)");
     }

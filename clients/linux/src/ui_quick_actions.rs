@@ -14,8 +14,8 @@ use adw::prelude::*;
 use gtk::gdk;
 use gtk::glib;
 use pf_client_core::overlay_actions::{
-    catalogue, chord_chip, key_legend, slot_icon, OverlayConfig, RingPlatform, Shortcut, SlotId,
-    RING_SLOTS,
+    catalogue, chord_chip, key_legend, slot_icon, Chord, OverlayConfig, RingPlatform, Shortcut,
+    SlotId, CHORD_MODIFIERS, KEY_GRID, RING_SLOTS,
 };
 use pf_client_core::ring::{slot_offset, CENTRE_DIAMETER, RING_RADIUS, SLOT_DIAMETER};
 use std::cell::RefCell;
@@ -27,47 +27,6 @@ const STAGE_H: i32 = 340;
 /// The Lucide mark on a disc, in px. The console draws it at 1.05× the disc's radius; this is
 /// that, so a disc reads the same weight in the editor as it does in the stream.
 const ICON_PX: i32 = (SLOT_DIAMETER * 1.05 / 2.0) as i32;
-
-const MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "win"];
-
-/// The key grid, row by row, the way a keyboard lays them out — every name `key_vk` knows
-/// that is not a modifier (the same rows the console's editor draws).
-const GRID: [&[&str]; 6] = [
-    &[
-        "escape", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
-    ],
-    &[
-        "1",
-        "2",
-        "3",
-        "4",
-        "5",
-        "6",
-        "7",
-        "8",
-        "9",
-        "0",
-        "backspace",
-    ],
-    &[
-        "tab", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "insert", "delete",
-    ],
-    &[
-        "capslock", "a", "s", "d", "f", "g", "h", "j", "k", "l", "enter",
-    ],
-    &[
-        "z", "x", "c", "v", "b", "n", "m", "home", "end", "pageup", "pagedown",
-    ],
-    &[
-        "space",
-        "left",
-        "up",
-        "down",
-        "right",
-        "printscreen",
-        "pause",
-    ],
-];
 
 const CLOCK: [&str; RING_SLOTS] = [
     "12 o'clock",
@@ -194,7 +153,7 @@ fn key_name(key: gdk::Key) -> Option<&'static str> {
         K::Caps_Lock => "capslock",
         k => {
             let c = k.to_unicode()?;
-            return GRID
+            return KEY_GRID
                 .iter()
                 .flat_map(|row| row.iter())
                 .find(|n| n.len() == 1 && n.starts_with(c))
@@ -727,41 +686,16 @@ fn build_shortcuts(
 struct Draft {
     id: Option<String>,
     label: String,
-    mods: [bool; 4],
-    key: Option<String>,
+    chord: Chord,
 }
 
 impl Draft {
     fn of(sc: &Shortcut) -> Draft {
-        let has = |names: &[&str]| sc.keys.iter().any(|k| names.contains(&k.as_str()));
         Draft {
             id: Some(sc.id.clone()),
             label: sc.label.clone(),
-            mods: [
-                has(&["ctrl", "control"]),
-                has(&["alt", "option"]),
-                has(&["shift"]),
-                has(&["win", "cmd", "super", "meta"]),
-            ],
-            key: sc
-                .keys
-                .iter()
-                .rev()
-                .find(|k| GRID.iter().any(|row| row.contains(&k.as_str())))
-                .cloned(),
+            chord: Chord::parse(&sc.keys),
         }
-    }
-
-    /// The chord in send order: the modifiers marked on, then the key.
-    fn keys(&self) -> Vec<String> {
-        let mut v: Vec<String> = MODIFIERS
-            .iter()
-            .zip(self.mods)
-            .filter(|(_, on)| *on)
-            .map(|(m, _)| m.to_string())
-            .collect();
-        v.extend(self.key.clone());
-        v
     }
 }
 
@@ -817,7 +751,7 @@ fn shortcut_page(
             while let Some(c) = face_holder.first_child() {
                 face_holder.remove(&c);
             }
-            let keys = draft.borrow().keys();
+            let keys = draft.borrow().chord.keys();
             face_holder.append(&keycap(&keys));
             let chip = chord_chip(&keys);
             legend.set_text(if chip.is_empty() { "Pick a key" } else { &chip });
@@ -848,14 +782,14 @@ fn shortcut_page(
         .spacing(8)
         .build();
     let mut mod_buttons = Vec::new();
-    for (i, m) in MODIFIERS.iter().enumerate() {
+    for (i, m) in CHORD_MODIFIERS.iter().enumerate() {
         let b = gtk::ToggleButton::builder()
             .label(key_legend(m))
-            .active(draft.borrow().mods[i])
+            .active(draft.borrow().chord.mods[i])
             .build();
         let (draft, refresh) = (draft.clone(), refresh_preview.clone());
         b.connect_toggled(move |b| {
-            draft.borrow_mut().mods[i] = b.is_active();
+            draft.borrow_mut().chord.mods[i] = b.is_active();
             refresh();
         });
         mods_row.append(&b);
@@ -880,7 +814,7 @@ fn shortcut_page(
         .build();
     let mut first: Option<gtk::ToggleButton> = None;
     let key_buttons: Rc<RefCell<Vec<(&'static str, gtk::ToggleButton)>>> = Rc::default();
-    for row in GRID {
+    for row in KEY_GRID {
         let line = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
@@ -890,7 +824,7 @@ fn shortcut_page(
             let b = gtk::ToggleButton::builder()
                 .label(key_legend(name))
                 .css_classes(["pf-key"])
-                .active(draft.borrow().key.as_deref() == Some(*name))
+                .active(draft.borrow().chord.key.as_deref() == Some(*name))
                 .build();
             if let Some(f) = &first {
                 b.set_group(Some(f));
@@ -900,7 +834,7 @@ fn shortcut_page(
             let (draft, refresh) = (draft.clone(), refresh_preview.clone());
             b.connect_toggled(move |b| {
                 if b.is_active() {
-                    draft.borrow_mut().key = Some(name.to_string());
+                    draft.borrow_mut().chord.key = Some(name.to_string());
                     refresh();
                 }
             });
@@ -934,14 +868,14 @@ fn shortcut_page(
             let mods = held_modifiers(state);
             {
                 let mut d = draft.borrow_mut();
-                for (i, m) in MODIFIERS.iter().enumerate() {
-                    d.mods[i] = mods.iter().any(|x| x == m);
+                for (i, m) in CHORD_MODIFIERS.iter().enumerate() {
+                    d.chord.mods[i] = mods.iter().any(|x| x == m);
                 }
-                d.key = Some(name.to_string());
+                d.chord.key = Some(name.to_string());
             }
             // Copy out first: `set_active` emits `toggled` synchronously, and that handler
             // takes the draft mutably — a borrow still live inside the call panics.
-            let mods = draft.borrow().mods;
+            let mods = draft.borrow().chord.mods;
             for (i, b) in mod_buttons.iter().enumerate() {
                 b.set_active(mods[i]);
             }
@@ -979,14 +913,14 @@ fn shortcut_page(
         );
         save.connect_clicked(move |_| {
             let d = draft.borrow().clone();
-            if d.key.is_none() {
+            if d.chord.key.is_none() {
                 let toast = adw::AlertDialog::new(Some("Pick a key first"), None);
                 toast.add_responses(&[("ok", "OK")]);
                 toast.present(Some(&content));
                 return;
             }
             let mut cfg = shared.cfg();
-            cfg.upsert_shortcut(d.id.as_deref(), &d.label, d.keys());
+            cfg.upsert_shortcut(d.id.as_deref(), &d.label, d.chord.keys());
             shared.write(&cfg);
             if let Some(f) = &rebuild {
                 f();
@@ -1076,9 +1010,9 @@ mod tests {
         let cfg = OverlayConfig::parse(blob, RingPlatform::Desktop);
         assert_eq!(summary(&cfg), "End  ·  Ctrl+Shift+Esc  ·  ·  ·");
         let d = Draft::of(&cfg.shortcuts[0]);
-        assert_eq!(d.mods, [true, false, true, false]);
-        assert_eq!(d.key.as_deref(), Some("escape"));
-        assert_eq!(d.keys(), vec!["ctrl", "shift", "escape"]);
+        assert_eq!(d.chord.mods, [true, false, true, false]);
+        assert_eq!(d.chord.key.as_deref(), Some("escape"));
+        assert_eq!(d.chord.keys(), vec!["ctrl", "shift", "escape"]);
         let (label, note) = describe(&cfg, &SlotId::Pad);
         assert_eq!(
             (label.as_str(), note.as_str()),
