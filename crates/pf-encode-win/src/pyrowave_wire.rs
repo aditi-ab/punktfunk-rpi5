@@ -296,6 +296,49 @@ pub fn au_bound(packets: &[(usize, usize)], wire_chunk: Option<usize>) -> usize 
         * chunk
 }
 
+/// The strict inverse of [`build_au`]'s windowed layout: the codec packet stream, or what makes
+/// `au` something `build_au` never emits. Clients parse leniently instead (a zeroed window is a
+/// lost shard); this is the encoder-side check that every window is well formed.
+#[cfg(any(test, feature = "test-support"))]
+pub fn unwindow(au: &[u8], chunk: usize) -> anyhow::Result<Vec<u8>> {
+    use anyhow::{bail, ensure};
+    ensure!(
+        chunk > WINDOW_PREFIX && au.len() % chunk == 0,
+        "AU of {} B is not whole {chunk}-byte windows",
+        au.len()
+    );
+    let mut out = Vec::new();
+    let mut frag: Option<Vec<u8>> = None;
+    for (i, win) in au.chunks(chunk).enumerate() {
+        let used = u16::from_le_bytes([win[0], win[1]]) as usize;
+        let kind = u16::from_le_bytes([win[2], win[3]]);
+        ensure!(
+            WINDOW_PREFIX + used <= chunk,
+            "window {i} overruns: used {used}"
+        );
+        let body = &win[WINDOW_PREFIX..WINDOW_PREFIX + used];
+        ensure!(
+            win[WINDOW_PREFIX + used..].iter().all(|&b| b == 0),
+            "window {i} has non-zero padding after used"
+        );
+        match (kind, frag.take()) {
+            (WIN_PACKED, None) => out.extend_from_slice(body),
+            (WIN_FRAG_FIRST, None) => frag = Some(body.to_vec()),
+            (WIN_FRAG_CONT, Some(mut f)) => {
+                f.extend_from_slice(body);
+                frag = Some(f);
+            }
+            (WIN_FRAG_LAST, Some(f)) => {
+                out.extend_from_slice(&f);
+                out.extend_from_slice(body);
+            }
+            (k, _) => bail!("window {i}: kind {k} out of place"),
+        }
+    }
+    ensure!(frag.is_none(), "AU ends inside a fragment chain");
+    Ok(out)
+}
+
 /// The windowed layout, for either sink. `false` = the sink ran out.
 fn build_windows<S: AuSink>(
     packets: &[(usize, usize)],
@@ -566,31 +609,7 @@ mod tests {
     use super::*;
 
     fn walk(au: &[u8], chunk: usize) -> Vec<u8> {
-        assert_eq!(au.len() % chunk, 0, "AU is a whole number of windows");
-        let mut out = Vec::new();
-        let mut frag: Vec<u8> = Vec::new();
-        for win in au.chunks(chunk) {
-            let used = u16::from_le_bytes([win[0], win[1]]) as usize;
-            let kind = u16::from_le_bytes([win[2], win[3]]);
-            assert!(WINDOW_PREFIX + used <= win.len(), "window overrun");
-            assert!(
-                win[WINDOW_PREFIX + used..].iter().all(|&b| b == 0),
-                "non-zero padding after used"
-            );
-            let body = &win[WINDOW_PREFIX..WINDOW_PREFIX + used];
-            match kind {
-                0 => out.extend_from_slice(body),
-                1 => frag = body.to_vec(),
-                2 => frag.extend_from_slice(body),
-                3 => {
-                    frag.extend_from_slice(body);
-                    out.extend_from_slice(&frag);
-                    frag.clear();
-                }
-                k => panic!("unknown window kind {k}"),
-            }
-        }
-        out
+        unwindow(au, chunk).expect("a well-formed windowed AU")
     }
 
     #[test]
@@ -837,6 +856,24 @@ mod tests {
     fn dense_mode_never_streams() {
         assert!(stream_chunk_step(None).is_none());
         assert!(stream_chunk_step(Some(0)).is_none());
+    }
+
+    /// `unwindow` refuses what `build_au` never emits.
+    #[test]
+    fn unwindow_refuses_a_malformed_au() {
+        let bs: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        let chunk = 64;
+        let au = build_au(&[(0, 500)], &bs, Some(chunk));
+        assert_eq!(unwindow(&au, chunk).unwrap(), bs[..500]);
+        assert!(
+            unwindow(&au[..au.len() - chunk], chunk).is_err(),
+            "open chain"
+        );
+        assert!(unwindow(&au[chunk..], chunk).is_err(), "CONT without FIRST");
+        assert!(unwindow(&au[..au.len() - 1], chunk).is_err(), "ragged tail");
+        let mut packed = build_au(&[(0, 20)], &bs, Some(chunk));
+        packed[chunk - 1] = 1;
+        assert!(unwindow(&packed, chunk).is_err(), "non-zero padding");
     }
 
     /// One floor on both platforms: 64 KiB a frame. A low rate at a low frame rate is honoured,

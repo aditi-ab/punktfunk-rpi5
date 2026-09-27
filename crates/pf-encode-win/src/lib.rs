@@ -66,7 +66,7 @@ pub mod pyrowave;
 // Shared PyroWave AU wire-framing — both platform backends emit this layout.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "pyrowave"))]
 pub mod pyrowave_wire;
-// The pyrowave-sys calls both PyroWave backends make the same way.
+// The pyrowave-sys calls both PyroWave backends make the same way, and the tests' decoder.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "pyrowave"))]
 pub mod pyrowave_ffi;
 

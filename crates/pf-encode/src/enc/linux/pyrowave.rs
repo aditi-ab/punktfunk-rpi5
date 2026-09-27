@@ -2311,6 +2311,8 @@ impl Drop for PyroWaveEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pyrowave_ffi::oracle;
+    use crate::pyrowave_wire::unwindow;
     use pf_frame::PixelFormat;
 
     fn cpu_frame(w: u32, h: u32, pts_ns: u64, fill: [u8; 4]) -> CapturedFrame {
@@ -2390,59 +2392,8 @@ mod tests {
         au: &[u8],
         chroma444: bool,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let mut dev: pw::pyrowave_device = std::ptr::null_mut();
-        assert_eq!(
-            pw::pyrowave_create_default_device(&mut dev),
-            pw::pyrowave_result_PYROWAVE_SUCCESS
-        );
-        let dinfo = pw::pyrowave_decoder_create_info {
-            device: dev,
-            width: w as i32,
-            height: h as i32,
-            chroma: if chroma444 {
-                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
-            } else {
-                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
-            },
-            fragment_path: false,
-        };
-        let mut dec: pw::pyrowave_decoder = std::ptr::null_mut();
-        assert_eq!(
-            pw::pyrowave_decoder_create(&dinfo, &mut dec),
-            pw::pyrowave_result_PYROWAVE_SUCCESS
-        );
-        assert_eq!(
-            pw::pyrowave_decoder_push_packet(dec, au.as_ptr() as *const _, au.len()),
-            pw::pyrowave_result_PYROWAVE_SUCCESS
-        );
-        assert!(pw::pyrowave_decoder_decode_is_ready(dec, false));
-
-        let (cw, ch) = if chroma444 { (w, h) } else { (w / 2, h / 2) };
-        let mut y = vec![0u8; (w * h) as usize];
-        let mut cb = vec![0u8; (cw * ch) as usize];
-        let mut cr = vec![0u8; (cw * ch) as usize];
-        let mut buf: pw::pyrowave_cpu_buffer = std::mem::zeroed();
-        buf.format = if chroma444 {
-            pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV444P
-        } else {
-            pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P
-        };
-        buf.width = w as i32;
-        buf.height = h as i32;
-        buf.data = [
-            y.as_mut_ptr() as *mut _,
-            cb.as_mut_ptr() as *mut _,
-            cr.as_mut_ptr() as *mut _,
-        ];
-        buf.row_stride_in_bytes = [w as usize, cw as usize, cw as usize];
-        buf.plane_size_in_bytes = [y.len(), cb.len(), cr.len()];
-        assert_eq!(
-            pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &buf),
-            pw::pyrowave_result_PYROWAVE_SUCCESS
-        );
-        pw::pyrowave_decoder_destroy(dec);
-        pw::pyrowave_device_destroy(dev);
-        (y, cb, cr)
+        // SAFETY: same contract as the caller.
+        unsafe { oracle::decode_planes(w, h, &[au], chroma444) }.remove(0)
     }
 
     unsafe fn decode_planes(w: u32, h: u32, au: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -2452,9 +2403,7 @@ mod tests {
 
     unsafe fn decode_plane_means(w: u32, h: u32, au: &[u8], chroma444: bool) -> (f64, f64, f64) {
         // SAFETY: same contract as the caller.
-        let (y, cb, cr) = unsafe { decode_planes_chroma(w, h, au, chroma444) };
-        let mean = |v: &[u8]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
-        (mean(&y), mean(&cb), mean(&cr))
+        oracle::plane_means(&unsafe { decode_planes_chroma(w, h, au, chroma444) })
     }
 
     /// Open → CSC → GPU encode → packetize, then CPU-decode each AU and check plane
@@ -2501,73 +2450,11 @@ mod tests {
             .expect("chunked submit");
         let au = enc.poll().expect("poll").expect("chunked AU");
         assert!(au.chunk_aligned);
-        assert_eq!(au.data.len() % 1408, 0, "AU is a whole number of windows");
+        let stream = unwindow(&au.data, 1408).expect("well-formed windows");
+        assert!(!stream.is_empty(), "chunked AU carries real packets");
         // SAFETY: test-only FFI with locally-owned buffers.
-        unsafe {
-            let mut dev: pw::pyrowave_device = std::ptr::null_mut();
-            assert_eq!(
-                pw::pyrowave_create_default_device(&mut dev),
-                pw::pyrowave_result_PYROWAVE_SUCCESS
-            );
-            let dinfo = pw::pyrowave_decoder_create_info {
-                device: dev,
-                width: w as i32,
-                height: h as i32,
-                chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
-                fragment_path: false,
-            };
-            let mut dec: pw::pyrowave_decoder = std::ptr::null_mut();
-            assert_eq!(
-                pw::pyrowave_decoder_create(&dinfo, &mut dec),
-                pw::pyrowave_result_PYROWAVE_SUCCESS
-            );
-            let mut frag: Vec<u8> = Vec::new();
-            let mut pushed = 0usize;
-            for win in au.data.chunks(1408) {
-                let used = u16::from_le_bytes([win[0], win[1]]) as usize;
-                let kind = u16::from_le_bytes([win[2], win[3]]);
-                assert!(4 + used <= win.len(), "window overrun");
-                assert!(win[4 + used..].iter().all(|&b| b == 0), "non-zero padding");
-                let body = &win[4..4 + used];
-                match kind {
-                    0 => {
-                        assert_eq!(
-                            pw::pyrowave_decoder_push_packet(
-                                dec,
-                                body.as_ptr() as *const _,
-                                body.len()
-                            ),
-                            pw::pyrowave_result_PYROWAVE_SUCCESS
-                        );
-                        pushed += body.len();
-                    }
-                    1 => frag = body.to_vec(),
-                    2 => frag.extend_from_slice(body),
-                    3 => {
-                        frag.extend_from_slice(body);
-                        assert_eq!(
-                            pw::pyrowave_decoder_push_packet(
-                                dec,
-                                frag.as_ptr() as *const _,
-                                frag.len()
-                            ),
-                            pw::pyrowave_result_PYROWAVE_SUCCESS
-                        );
-                        pushed += frag.len();
-                        frag.clear();
-                    }
-                    k => panic!("unknown window kind {k}"),
-                }
-            }
-            assert!(pushed > 0, "chunked AU carries real packets");
-            assert!(
-                pw::pyrowave_decoder_decode_is_ready(dec, false),
-                "chunked AU incomplete after framed walk"
-            );
-            pw::pyrowave_decoder_destroy(dec);
-            pw::pyrowave_device_destroy(dev);
-        }
-        enc.set_wire_chunking(0); // below the floor — back to dense
+        unsafe { decode_planes(w, h, &stream) };
+        enc.set_wire_chunking(0); // below the floor — ignored, stays chunked
         assert!(enc.reconfigure_bitrate(100_000_000));
         assert!(enc.reset());
         enc.submit(&cpu_frame(w, h, 999, [10, 20, 30, 255]))
@@ -2930,29 +2817,9 @@ mod tests {
         assert!(au.chunk_aligned);
         assert_eq!(au.data.len() % 1408, 0);
         dump("au-chunked.bin", &au.data);
+        let stream = unwindow(&au.data, 1408).expect("well-formed windows");
         // SAFETY: test-only FFI with locally-owned buffers.
-        let (y, cb, cr) = unsafe {
-            // Same framed walk the clients use.
-            let mut stream = Vec::new();
-            let mut frag: Vec<u8> = Vec::new();
-            for win in au.data.chunks(1408) {
-                let used = u16::from_le_bytes([win[0], win[1]]) as usize;
-                let kind = u16::from_le_bytes([win[2], win[3]]);
-                let body = &win[4..4 + used];
-                match kind {
-                    0 => stream.extend_from_slice(body),
-                    1 => frag = body.to_vec(),
-                    2 => frag.extend_from_slice(body),
-                    3 => {
-                        frag.extend_from_slice(body);
-                        stream.extend_from_slice(&frag);
-                        frag.clear();
-                    }
-                    k => panic!("unknown window kind {k}"),
-                }
-            }
-            decode_planes(w, h, &stream)
-        };
+        let (y, cb, cr) = unsafe { decode_planes(w, h, &stream) };
         dump("ref-chunked-y.bin", &y);
         dump("ref-chunked-cb.bin", &cb);
         dump("ref-chunked-cr.bin", &cr);
@@ -3053,29 +2920,6 @@ mod tests {
         assert!(!priority_refused(vk::Result::SUCCESS));
     }
 
-    /// Walk a windowed AU back into the flat codec-packet stream (the clients' parse).
-    fn walk_windows(au: &[u8], window: usize) -> Vec<u8> {
-        let mut stream = Vec::new();
-        let mut frag: Vec<u8> = Vec::new();
-        for win in au.chunks(window) {
-            let used = u16::from_le_bytes([win[0], win[1]]) as usize;
-            let kind = u16::from_le_bytes([win[2], win[3]]);
-            let body = &win[4..4 + used];
-            match kind {
-                0 => stream.extend_from_slice(body),
-                1 => frag = body.to_vec(),
-                2 => frag.extend_from_slice(body),
-                3 => {
-                    frag.extend_from_slice(body);
-                    stream.extend_from_slice(&frag);
-                    frag.clear();
-                }
-                k => panic!("unknown window kind {k}"),
-            }
-        }
-        stream
-    }
-
     /// Luma PSNR (dB) of decoded Y against BT.709 limited luma of source BGRA. Luma
     /// only: chroma is subsampled on 4:2:0, and luma is where wavelet quantisation shows.
     fn luma_psnr(src_bgra: &[u8], decoded_y: &[u8]) -> f64 {
@@ -3161,7 +3005,7 @@ mod tests {
                 "no AU is in flight once `last` was handed out"
             );
 
-            let stream = walk_windows(&au, WINDOW);
+            let stream = unwindow(&au, WINDOW).expect("well-formed windows");
             // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
             let (y, _cb, _cr) = unsafe { decode_planes(w, h, &stream) };
             let psnr = luma_psnr(&src, &y);
@@ -3222,69 +3066,17 @@ mod tests {
             );
         }
 
-        // One decoder for the whole run: a fresh decoder per AU resets `last_seq`.
+        // One decoder for the whole run: a fresh decoder per AU resets `last_seq`. A frame
+        // that never becomes decodable is still being accumulated into the previous one.
         // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
-        unsafe {
-            let mut dev: pw::pyrowave_device = std::ptr::null_mut();
-            assert_eq!(
-                pw::pyrowave_create_default_device(&mut dev),
-                pw::pyrowave_result_PYROWAVE_SUCCESS
+        let lumas = unsafe { decode_stream_luma(w, h, &aus) };
+        for (i, pair) in lumas.windows(2).enumerate() {
+            assert_ne!(
+                pair[0],
+                pair[1],
+                "frame {} decoded to the SAME picture as frame {i} — a swallowed frame",
+                i + 1
             );
-            let dinfo = pw::pyrowave_decoder_create_info {
-                device: dev,
-                width: w as i32,
-                height: h as i32,
-                chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
-                fragment_path: false,
-            };
-            let mut dec: pw::pyrowave_decoder = std::ptr::null_mut();
-            assert_eq!(
-                pw::pyrowave_decoder_create(&dinfo, &mut dec),
-                pw::pyrowave_result_PYROWAVE_SUCCESS
-            );
-            let mut last_y: Option<Vec<u8>> = None;
-            for (i, au) in aus.iter().enumerate() {
-                assert_eq!(
-                    pw::pyrowave_decoder_push_packet(dec, au.as_ptr() as *const _, au.len()),
-                    pw::pyrowave_result_PYROWAVE_SUCCESS,
-                    "frame {i} was rejected by the decoder"
-                );
-                assert!(
-                    pw::pyrowave_decoder_decode_is_ready(dec, false),
-                    "frame {i} never became decodable — the decoder is still accumulating it into \
-                     the PREVIOUS frame, which is exactly the repeated-sequence failure"
-                );
-                let mut y = vec![0u8; (w * h) as usize];
-                let mut cb = vec![0u8; (w * h / 4) as usize];
-                let mut cr = vec![0u8; (w * h / 4) as usize];
-                let mut buf: pw::pyrowave_cpu_buffer = std::mem::zeroed();
-                buf.format = pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
-                buf.width = w as i32;
-                buf.height = h as i32;
-                buf.data = [
-                    y.as_mut_ptr() as *mut _,
-                    cb.as_mut_ptr() as *mut _,
-                    cr.as_mut_ptr() as *mut _,
-                ];
-                buf.row_stride_in_bytes = [w as usize, (w / 2) as usize, (w / 2) as usize];
-                buf.plane_size_in_bytes = [y.len(), cb.len(), cr.len()];
-                assert_eq!(
-                    pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &buf),
-                    pw::pyrowave_result_PYROWAVE_SUCCESS,
-                    "frame {i} failed to decode"
-                );
-                if let Some(prev) = &last_y {
-                    assert_ne!(
-                        prev,
-                        &y,
-                        "frame {i} decoded to the SAME picture as frame {} — a swallowed frame",
-                        i - 1
-                    );
-                }
-                last_y = Some(y);
-            }
-            pw::pyrowave_decoder_destroy(dec);
-            pw::pyrowave_device_destroy(dev);
         }
     }
 
@@ -3294,58 +3086,10 @@ mod tests {
     /// # Safety
     /// Test-only FFI into the vendored decoder with locally-owned buffers.
     unsafe fn decode_stream_luma(w: u32, h: u32, aus: &[Vec<u8>]) -> Vec<Vec<u8>> {
-        let mut dev: pw::pyrowave_device = std::ptr::null_mut();
-        assert_eq!(
-            pw::pyrowave_create_default_device(&mut dev),
-            pw::pyrowave_result_PYROWAVE_SUCCESS
-        );
-        let dinfo = pw::pyrowave_decoder_create_info {
-            device: dev,
-            width: w as i32,
-            height: h as i32,
-            chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
-            fragment_path: false,
-        };
-        let mut dec: pw::pyrowave_decoder = std::ptr::null_mut();
-        assert_eq!(
-            pw::pyrowave_decoder_create(&dinfo, &mut dec),
-            pw::pyrowave_result_PYROWAVE_SUCCESS
-        );
-        let mut out = Vec::with_capacity(aus.len());
-        for (i, au) in aus.iter().enumerate() {
-            assert_eq!(
-                pw::pyrowave_decoder_push_packet(dec, au.as_ptr() as *const _, au.len()),
-                pw::pyrowave_result_PYROWAVE_SUCCESS,
-                "frame {i} rejected"
-            );
-            assert!(
-                pw::pyrowave_decoder_decode_is_ready(dec, false),
-                "frame {i} never became decodable"
-            );
-            let mut y = vec![0u8; (w * h) as usize];
-            let mut cb = vec![0u8; (w * h / 4) as usize];
-            let mut cr = vec![0u8; (w * h / 4) as usize];
-            let mut buf: pw::pyrowave_cpu_buffer = std::mem::zeroed();
-            buf.format = pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
-            buf.width = w as i32;
-            buf.height = h as i32;
-            buf.data = [
-                y.as_mut_ptr() as *mut _,
-                cb.as_mut_ptr() as *mut _,
-                cr.as_mut_ptr() as *mut _,
-            ];
-            buf.row_stride_in_bytes = [w as usize, (w / 2) as usize, (w / 2) as usize];
-            buf.plane_size_in_bytes = [y.len(), cb.len(), cr.len()];
-            assert_eq!(
-                pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &buf),
-                pw::pyrowave_result_PYROWAVE_SUCCESS,
-                "frame {i} failed to decode"
-            );
-            out.push(y);
-        }
-        pw::pyrowave_decoder_destroy(dec);
-        pw::pyrowave_device_destroy(dev);
-        out
+        let aus: Vec<&[u8]> = aus.iter().map(Vec::as_slice).collect();
+        // SAFETY: same contract as the caller.
+        let planes = unsafe { oracle::decode_planes(w, h, &aus, false) };
+        planes.into_iter().map(|(y, _, _)| y).collect()
     }
 
     /// PSNR (dB) between two equal-sized 8-bit planes; `f64::INFINITY` when identical.

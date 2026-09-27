@@ -640,6 +640,7 @@ impl Drop for PyroWaveEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pyrowave_ffi::oracle;
     use pf_frame::dxgi::{D3d11Frame, PyroFrameShare};
     use pf_frame::PixelFormat;
     use windows::Win32::Foundation::HMODULE;
@@ -655,66 +656,6 @@ mod tests {
         DXGI_FORMAT, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8_UNORM,
         DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
     };
-
-    /// Decode a dense PyroWave AU with upstream's decoder; return YUV plane means.
-    ///
-    /// # Safety
-    /// `au` is a complete dense PyroWave AU for a `w`×`h` frame at `chroma444`.
-    unsafe fn decode_plane_means(w: u32, h: u32, au: &[u8], chroma444: bool) -> (f64, f64, f64) {
-        let mut dev: pw::pyrowave_device = std::ptr::null_mut();
-        assert_eq!(
-            pw::pyrowave_create_default_device(&mut dev),
-            pw::pyrowave_result_PYROWAVE_SUCCESS
-        );
-        let dinfo = pw::pyrowave_decoder_create_info {
-            device: dev,
-            width: w as i32,
-            height: h as i32,
-            chroma: if chroma444 {
-                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
-            } else {
-                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
-            },
-            fragment_path: false,
-        };
-        let mut dec: pw::pyrowave_decoder = std::ptr::null_mut();
-        assert_eq!(
-            pw::pyrowave_decoder_create(&dinfo, &mut dec),
-            pw::pyrowave_result_PYROWAVE_SUCCESS
-        );
-        assert_eq!(
-            pw::pyrowave_decoder_push_packet(dec, au.as_ptr() as *const _, au.len()),
-            pw::pyrowave_result_PYROWAVE_SUCCESS
-        );
-        assert!(pw::pyrowave_decoder_decode_is_ready(dec, false));
-        let (cw2, ch2) = if chroma444 { (w, h) } else { (w / 2, h / 2) };
-        let mut y = vec![0u8; (w * h) as usize];
-        let mut cb = vec![0u8; (cw2 * ch2) as usize];
-        let mut cr = vec![0u8; (cw2 * ch2) as usize];
-        let mut buf: pw::pyrowave_cpu_buffer = std::mem::zeroed();
-        buf.format = if chroma444 {
-            pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV444P
-        } else {
-            pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P
-        };
-        buf.width = w as i32;
-        buf.height = h as i32;
-        buf.data = [
-            y.as_mut_ptr() as *mut _,
-            cb.as_mut_ptr() as *mut _,
-            cr.as_mut_ptr() as *mut _,
-        ];
-        buf.row_stride_in_bytes = [w as usize, cw2 as usize, cw2 as usize];
-        buf.plane_size_in_bytes = [y.len(), cb.len(), cr.len()];
-        assert_eq!(
-            pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &buf),
-            pw::pyrowave_result_PYROWAVE_SUCCESS
-        );
-        pw::pyrowave_decoder_destroy(dec);
-        pw::pyrowave_device_destroy(dev);
-        let mean = |v: &[u8]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
-        (mean(&y), mean(&cb), mean(&cr))
-    }
 
     /// Shareable plane texture (`bpp` bytes/texel) filled with `bytes` via staging.
     /// Same SHARED|SHARED_NTHANDLE + RENDER_TARGET flags as the capturer out-ring.
@@ -906,7 +847,8 @@ mod tests {
                 "HDR sequence header must signal BT.2020 primaries + PQ + BT.2020 matrix"
             );
         }
-        decode_plane_means(w, h, &au.data, chroma444)
+        let planes = oracle::decode_planes(w, h, &[&au.data], chroma444);
+        oracle::plane_means(&planes[0])
     }
 
     /// End-to-end on a real GPU. `#[ignore]`d; build anywhere, run on the GPU host:
