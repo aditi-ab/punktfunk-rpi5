@@ -19,7 +19,7 @@ use super::dualsense_windows::{
 };
 use super::gamepad_raii::PadChannel;
 use super::steam_proto::{
-    neutral_deck_report, parse_steam_output, serialize_deck_state, SteamState, STEAM_REPORT_LEN,
+    neutral_deck_report, parse_steam_output, DeckEncoder, SteamState, STEAM_REPORT_LEN,
 };
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
@@ -38,7 +38,7 @@ pub struct DeckWinPad {
     _sw: Option<super::gamepad_raii::SwDevice>,
     channel: PadChannel,
     attach: super::gamepad_raii::DriverAttach,
-    seq: u32,
+    enc: DeckEncoder,
     /// v2.3 input-seqlock generation — see `publish_input`.
     input_gen: u32,
     /// Ring drain (v2.1+) or legacy latest-slot seq (old driver).
@@ -100,16 +100,14 @@ impl DeckWinPad {
                 boot_name,
                 instance_id,
             ),
-            seq: 0,
+            enc: DeckEncoder::default(),
             input_gen: 0,
             drain: OutputDrain::new(),
         })
     }
 
     fn write_state(&mut self, st: &SteamState) {
-        self.seq = self.seq.wrapping_add(1);
-        let mut r = [0u8; STEAM_REPORT_LEN];
-        serialize_deck_state(&mut r, st, self.seq);
+        let r = self.enc.encode(st);
         // SAFETY: `data_base()` points at a live PAD_SHM_SIZE-byte section and `r` is the 64-byte
         // Deck state frame.
         unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };

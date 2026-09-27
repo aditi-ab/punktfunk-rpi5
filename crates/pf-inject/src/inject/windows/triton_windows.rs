@@ -23,9 +23,7 @@ use super::dualsense_windows::{
     OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
 };
 use super::gamepad_raii::{DriverAttach, PadChannel, ProofTransport, SwDevice};
-use crate::triton_proto::{
-    parse_triton_rumble, serialize_triton_state, triton_serial, TritonState, TRITON_STATE_LEN,
-};
+use crate::triton_proto::{parse_triton_rumble, triton_serial, TritonState};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use pf_driver_proto::gamepad::DEVTYPE_TRITON;
@@ -113,16 +111,8 @@ impl TritonWinPad {
     }
 
     fn write_state(&mut self, st: &TritonState) {
-        let mut r = [0u8; 64];
-        if st.raw_len > 0 {
-            let len = (st.raw_len as usize).min(st.raw.len()).min(r.len());
-            r[..len].copy_from_slice(&st.raw[..len]);
-        } else {
-            self.seq = self.seq.wrapping_add(1);
-            let mut s = [0u8; TRITON_STATE_LEN];
-            serialize_triton_state(&mut s, st, self.seq);
-            r[..TRITON_STATE_LEN].copy_from_slice(&s);
-        }
+        // The whole 64-byte slot: the driver trims to the report id's declared length.
+        let (r, _) = st.report(&mut self.seq);
         // SAFETY: same contract as DeckWinPad::write_state — the v2.3 input_gen seqlock.
         unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };
     }

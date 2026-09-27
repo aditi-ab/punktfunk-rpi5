@@ -13,14 +13,14 @@ use super::dualsense_windows::{
     OFF_DEVTYPE, OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
 };
 use super::dualshock4_proto::{
-    parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H, DS4_TOUCH_W,
+    parse_ds4_output, serialize_state, Ds4Encoder, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H,
+    DS4_TOUCH_W,
 };
 use super::gamepad_raii::PadChannel;
-use crate::sensor_clock::SensorClock;
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use punktfunk_core::quic::{HidOutput, RichInput};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// INF hardware id. A package rename must not change this (`hwid_matches_inf`).
 pub(super) const DS4_HWID: &str = "pf_dualshock4";
@@ -30,8 +30,7 @@ pub struct Ds4WinPad {
     _sw: Option<super::gamepad_raii::SwDevice>,
     channel: PadChannel,
     attach: super::gamepad_raii::DriverAttach,
-    counter: u8,
-    clock: SensorClock,
+    enc: Ds4Encoder,
     /// v2.3 input-seqlock generation for `publish_input`.
     input_gen: u32,
     drain: OutputDrain,
@@ -88,18 +87,14 @@ impl Ds4WinPad {
                 boot_name,
                 instance_id,
             ),
-            counter: 0,
-            clock: SensorClock::dualshock4(),
+            enc: Ds4Encoder::default(),
             input_gen: 0,
             drain: OutputDrain::new(),
         })
     }
 
     fn write_state(&mut self, st: &DsState) {
-        self.counter = self.counter.wrapping_add(1);
-        let ts = self.clock.ds4_ticks(Instant::now());
-        let mut r = [0u8; DS4_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.counter, ts);
+        let r = self.enc.encode(st);
         // SAFETY: `data_base()` maps a live SHM_SIZE section; `r` is the 64-byte
         // input slot. Seqlock is `publish_input`.
         unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };

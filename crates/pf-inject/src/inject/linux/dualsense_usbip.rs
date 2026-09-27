@@ -14,12 +14,11 @@
 //! audio; concurrency needs seqnum-keyed out-of-order completions.
 
 use super::dualsense_proto::{
-    ds_pairing_reply, parse_ds_output, serialize_state, DsFeedback, DsState, DsTriggers,
-    DEVTYPE_DUALSENSE, DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN,
-    DS_PRODUCT, DS_VENDOR, DUALSENSE_RDESC,
+    ds_pairing_reply, parse_ds_output, DsEncoder, DsFeedback, DsState, DEVTYPE_DUALSENSE,
+    DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN, DS_PRODUCT, DS_VENDOR,
+    DUALSENSE_RDESC,
 };
 use super::steam_usbip::{attach_device, boxed, UsbipAttachment};
-use crate::sensor_clock::SensorClock;
 use anyhow::Result;
 use std::any::Any;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -505,10 +504,8 @@ fn build_device(
 pub struct DualSenseUsbip {
     report: Arc<Mutex<[u8; DS_INPUT_REPORT_LEN]>>,
     feedback: Arc<Mutex<DsFeedback>>,
-    clock: SensorClock,
     pad: u8,
-    seq: u8,
-    triggers: DsTriggers,
+    enc: DsEncoder,
     _attach: UsbipAttachment,
 }
 
@@ -544,21 +541,15 @@ impl DualSenseUsbip {
         Ok(DualSenseUsbip {
             report,
             feedback,
-            clock: SensorClock::dualsense(),
             pad: index,
-            seq: 0,
-            triggers: DsTriggers::default(),
+            enc: DsEncoder::default(),
             _attach: attach,
         })
     }
 
     /// Serialize `st` as report `0x01` for the next interrupt-IN poll.
     pub fn write_state(&mut self, st: &DsState) {
-        self.seq = self.seq.wrapping_add(1);
-        let ts = self.clock.ds_ticks(Instant::now());
-        let mut r = [0u8; DS_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.seq, ts);
-        self.triggers.stamp(&mut r, st.l2, st.r2);
+        let r = self.enc.encode(st);
         if let Ok(mut g) = self.report.lock() {
             *g = r;
         }
@@ -571,7 +562,7 @@ impl DualSenseUsbip {
             .lock()
             .map(|mut f| std::mem::take(&mut *f))
             .unwrap_or_default();
-        self.triggers.observe(&fb.hidout);
+        self.enc.observe(&fb.hidout);
         fb
     }
 }
@@ -715,6 +706,7 @@ pub fn usbip_preferred() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dualsense_proto::serialize_state;
 
     /// Byte length of the configuration descriptor `UsbDevice::handle_urb` would emit.
     /// [`config_descriptor_matches_hardware`] pins it to hardware `wTotalLength`.

@@ -12,17 +12,16 @@
 //! installed.
 
 use super::dualsense_proto::{
-    parse_ds_output, serialize_state, DsFeedback, DsState, DsTriggers, DS_INPUT_REPORT_LEN,
+    parse_ds_output, serialize_state, DsEncoder, DsFeedback, DsState, DS_INPUT_REPORT_LEN,
     DS_TOUCH_H, DS_TOUCH_W,
 };
 use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
-use crate::sensor_clock::SensorClock;
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{anyhow, Result};
 use punktfunk_core::quic::RichInput;
 use std::ffi::c_void;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
@@ -255,12 +254,10 @@ pub struct DsWinPad {
     _sw: Option<super::gamepad_raii::SwDevice>,
     channel: PadChannel,
     attach: super::gamepad_raii::DriverAttach,
-    seq: u8,
-    clock: SensorClock,
+    enc: DsEncoder,
     /// v2.3 input-seqlock generation — see [`publish_input`].
     input_gen: u32,
     drain: OutputDrain,
-    triggers: DsTriggers,
 }
 
 /// PnP identity for a virtual controller devnode, so one [`create_swdevice`] builds DualSense or
@@ -525,20 +522,14 @@ impl DsWinPad {
                 boot_name,
                 instance_id,
             ),
-            seq: 0,
-            clock: SensorClock::dualsense(),
+            enc: DsEncoder::default(),
             input_gen: 0,
             drain: OutputDrain::new(),
-            triggers: DsTriggers::default(),
         })
     }
 
     pub(super) fn write_state(&mut self, st: &DsState) {
-        self.seq = self.seq.wrapping_add(1);
-        let ts = self.clock.ds_ticks(Instant::now());
-        let mut r = [0u8; DS_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.seq, ts);
-        self.triggers.stamp(&mut r, st.l2, st.r2);
+        let r = self.enc.encode(st);
         // No driver-polled change-detect on this plane; the timer copies the whole slot. Seqlock:
         // see `publish_input`.
         // SAFETY: `data_base()` points at a live PAD_SHM_SIZE-byte section and `r` is the 64-byte
@@ -558,7 +549,7 @@ impl DsWinPad {
         fb.resync = self
             .drain
             .drain(base, |bytes| parse_ds_output(pad, bytes, &mut fb));
-        self.triggers.observe(&fb.hidout);
+        self.enc.observe(&fb.hidout);
         fb
     }
 }

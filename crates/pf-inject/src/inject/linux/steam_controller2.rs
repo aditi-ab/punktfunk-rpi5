@@ -11,9 +11,8 @@
 //! [`super::triton_usbip`] (`vhci_hcd`); this module is the fallback when that is missing.
 
 use super::triton_proto::{
-    parse_triton_rumble, serialize_triton_state, strip_report_prefix, triton_feature_reply,
-    triton_serial, triton_unit_id, TritonState, TRITON_RDESC, TRITON_STATE_LEN, TRITON_VENDOR,
-    TRITON_WIRED_PRODUCT,
+    parse_triton_rumble, strip_report_prefix, triton_feature_reply, triton_serial, triton_unit_id,
+    TritonState, TRITON_RDESC, TRITON_VENDOR, TRITON_WIRED_PRODUCT,
 };
 use crate::uhid_abi::{
     put_cstr, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2, UHID_DESTROY, UHID_EVENT_SIZE,
@@ -91,14 +90,8 @@ impl TritonPad {
 
     /// Client raw bytes verbatim, else a synthesized `0x42` state report from typed fields.
     pub fn write_state(&mut self, st: &TritonState) -> Result<()> {
-        if st.raw_len > 0 {
-            let len = (st.raw_len as usize).min(st.raw.len());
-            return self.write_input(&st.raw[..len]);
-        }
-        self.seq = self.seq.wrapping_add(1);
-        let mut r = [0u8; TRITON_STATE_LEN];
-        serialize_triton_state(&mut r, st, self.seq);
-        self.write_input(&r)
+        let (r, len) = st.report(&mut self.seq);
+        self.write_input(&r[..len])
     }
 
     fn write_input(&mut self, data: &[u8]) -> Result<()> {

@@ -10,12 +10,11 @@
 //! pad is [`super::gamepad`].
 
 use super::dualsense_proto::{
-    ds_pairing_reply, edge_paddle_bits, parse_ds_output, serialize_state, DsFeedback, DsState,
-    DsTriggers, DEVTYPE_DUALSENSE, DEVTYPE_DUALSENSE_EDGE, DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION,
-    DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN, DS_PRODUCT, DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR,
-    DUALSENSE_EDGE_RDESC, DUALSENSE_RDESC,
+    ds_pairing_reply, edge_paddle_bits, parse_ds_output, DsEncoder, DsFeedback, DsState,
+    DEVTYPE_DUALSENSE, DEVTYPE_DUALSENSE_EDGE, DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION,
+    DS_FEATURE_FIRMWARE, DS_PRODUCT, DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC,
+    DUALSENSE_RDESC,
 };
-use crate::sensor_clock::SensorClock;
 use crate::uhid_abi::{
     put_cstr, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2, UHID_DESTROY, UHID_EVENT_SIZE,
     UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2, UHID_OUTPUT, UHID_PATH, UHID_SET_REPORT,
@@ -27,7 +26,6 @@ use punktfunk_core::quic::RichInput;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::time::Instant;
 
 /// CREATE2 identity: DualSense vs Edge. Same codec; Edge is PID, descriptor, and `buttons[2]`.
 pub struct DsUhidIdentity {
@@ -68,9 +66,7 @@ impl DsUhidIdentity {
 pub struct DualSensePad {
     fd: File,
     device_type: u8,
-    seq: u8,
-    clock: SensorClock,
-    triggers: DsTriggers,
+    enc: DsEncoder,
 }
 
 impl DualSensePad {
@@ -87,9 +83,7 @@ impl DualSensePad {
         let mut ds = DualSensePad {
             fd,
             device_type: id.device_type,
-            seq: 0,
-            clock: SensorClock::dualsense(),
-            triggers: DsTriggers::default(),
+            enc: DsEncoder::default(),
         };
         ds.send_create2(index, id)
             .context("UHID_CREATE2 DualSense")?;
@@ -116,12 +110,7 @@ impl DualSensePad {
     }
 
     pub fn write_state(&mut self, st: &DsState) -> Result<()> {
-        self.seq = self.seq.wrapping_add(1);
-        let ts = self.clock.ds_ticks(Instant::now());
-        let mut r = [0u8; DS_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.seq, ts);
-        self.triggers.stamp(&mut r, st.l2, st.r2);
-
+        let r = self.enc.encode(st);
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
         // uhid_input2_req: size u16 at 4, data at 6.
@@ -167,7 +156,7 @@ impl DualSensePad {
                 _ => {}
             }
         }
-        self.triggers.observe(&fb.hidout);
+        self.enc.observe(&fb.hidout);
         fb
     }
 

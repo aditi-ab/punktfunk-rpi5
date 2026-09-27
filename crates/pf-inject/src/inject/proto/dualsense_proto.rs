@@ -9,8 +9,10 @@
 //! firmware 64). A USB backend rejects a longer reply as a malicious URB and drops the device.
 //! Tests pin sizes, field offsets, paddle bits, and valid-flag gating.
 
+use crate::sensor_clock::SensorClock;
 use punktfunk_core::input::{gamepad as gs, GamepadFrame};
 use punktfunk_core::quic::{HidOutput, RichInput};
+use std::time::Instant;
 
 // GET_REPORT during init (`0x05` calibration, `0x09` pairing, `0x20` firmware). Without these
 // hid-playstation never finishes calibration and creates no input devices. The bytes live in
@@ -380,6 +382,40 @@ pub fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8,
     r[54] = 0x18;
 }
 
+/// Report-`0x01` encoder a DualSense keeps across writes: its sequence byte, sensor clock and
+/// the adaptive-trigger status the game armed. Each transport holds one and only moves bytes.
+pub struct DsEncoder {
+    seq: u8,
+    clock: SensorClock,
+    triggers: DsTriggers,
+}
+
+impl Default for DsEncoder {
+    fn default() -> DsEncoder {
+        DsEncoder {
+            seq: 0,
+            clock: SensorClock::dualsense(),
+            triggers: DsTriggers::default(),
+        }
+    }
+}
+
+impl DsEncoder {
+    /// The next report `0x01` for `st`.
+    pub fn encode(&mut self, st: &DsState) -> [u8; DS_INPUT_REPORT_LEN] {
+        self.seq = self.seq.wrapping_add(1);
+        let mut r = [0u8; DS_INPUT_REPORT_LEN];
+        serialize_state(&mut r, st, self.seq, self.clock.ds_ticks(Instant::now()));
+        self.triggers.stamp(&mut r, st.l2, st.r2);
+        r
+    }
+
+    /// Latch the trigger effects one feedback pass carried; later reports report against them.
+    pub fn observe(&mut self, hidout: &[HidOutput]) {
+        self.triggers.observe(hidout);
+    }
+}
+
 /// Adaptive-trigger status the game reads back: report `0x01` struct offsets 41 (R2) and 42
 /// (L2), high nibble = status, low nibble = the zone the trigger stops in. A game that arms a
 /// Weapon effect fires on the 1 → 2 transition, so a pad that leaves these zero swallows every
@@ -637,6 +673,25 @@ pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each report carries the next sequence byte and the armed trigger's status.
+    #[test]
+    fn encoder_advances_the_seq_and_stamps_the_trigger_status() {
+        let mut enc = DsEncoder::default();
+        let st = DsState::neutral();
+        assert_eq!(enc.encode(&st)[7], 1);
+        enc.observe(&[HidOutput::Trigger {
+            pad: 0,
+            which: 1,
+            effect: vec![0x25, 0x04, 0x01], // Weapon, zones 2..8
+        }]);
+        let r = enc.encode(&st);
+        assert_eq!(r[7], 2);
+        assert_eq!(
+            r[42], 0x08,
+            "R2 at rest reports the armed Weapon's stop zone"
+        );
+    }
 
     /// Feature blobs match hid-playstation request sizes: calibration 41, pairing 20, firmware 64.
     /// A USB backend rejects a longer reply as a malicious URB and tears down the device.

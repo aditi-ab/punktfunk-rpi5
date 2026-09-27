@@ -356,6 +356,22 @@ pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq
     r[58..60].copy_from_slice(&st.rpad_pressure.to_le_bytes());
 }
 
+/// Deck state-frame encoder a transport keeps across writes: the frame sequence number.
+#[derive(Default)]
+pub struct DeckEncoder {
+    seq: u32,
+}
+
+impl DeckEncoder {
+    /// The next `ID_CONTROLLER_DECK_STATE` frame for `st`.
+    pub fn encode(&mut self, st: &SteamState) -> [u8; STEAM_REPORT_LEN] {
+        self.seq = self.seq.wrapping_add(1);
+        let mut r = [0u8; STEAM_REPORT_LEN];
+        serialize_deck_state(&mut r, st, self.seq);
+        r
+    }
+}
+
 /// Wire buttons → the Deck bits the classic Steam Controller shares with it: face, shoulders,
 /// full-pull triggers, View / Menu / Steam and the d-pad. Each model ORs its own tail on top.
 fn deck_low_buttons(buttons: u32, lt: u8, rt: u8) -> u64 {

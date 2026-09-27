@@ -176,6 +176,22 @@ impl TritonState {
         }
     }
 
+    /// The input report to present and its length: the client's raw report as-is, else a
+    /// synthesized `0x42` stamped with the next `seq`. The raw path carries its own sequence.
+    pub fn report(&self, seq: &mut u8) -> ([u8; TRITON_REPORT_LEN], usize) {
+        let mut r = [0u8; TRITON_REPORT_LEN];
+        if self.raw_len > 0 {
+            let len = (self.raw_len as usize).min(TRITON_REPORT_LEN);
+            r[..len].copy_from_slice(&self.raw[..len]);
+            return (r, len);
+        }
+        *seq = seq.wrapping_add(1);
+        let mut state = [0u8; TRITON_STATE_LEN];
+        serialize_triton_state(&mut state, self, *seq);
+        r[..TRITON_STATE_LEN].copy_from_slice(&state);
+        (r, TRITON_STATE_LEN)
+    }
+
     /// A raw report from the client's physical pad becomes the state. Touchpad and motion have
     /// nothing to fold: the raw feed carries pads + IMU, and the synth fallback has no surface.
     pub fn apply_rich(&mut self, rich: RichInput) {
@@ -255,6 +271,24 @@ pub fn triton_feature_reply(last_set: &[u8], serial: &str, unit_id: u32) -> [u8;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A raw report goes out as-is and leaves the synth sequence alone; the typed fallback
+    /// bumps it.
+    #[test]
+    fn report_mirrors_raw_else_synthesizes_with_the_next_seq() {
+        let mut seq = 7;
+        let (r, len) = TritonState::neutral().report(&mut seq);
+        assert_eq!(
+            (len, r[0], r[1], seq),
+            (TRITON_STATE_LEN, ID_TRITON_CONTROLLER_STATE, 8, 8)
+        );
+
+        let mut st = TritonState::neutral();
+        st.raw[..3].copy_from_slice(&[0x45, 0x11, 0x22]);
+        st.raw_len = 3;
+        let (r, len) = st.report(&mut seq);
+        assert_eq!((len, &r[..3], seq), (3, &[0x45, 0x11, 0x22][..], 8));
+    }
 
     #[test]
     fn fallback_state_serializes_sdl_layout() {

@@ -11,11 +11,9 @@
 
 use super::dualsense_proto::DsState;
 use super::dualshock4_proto::{
-    ds4_pairing_reply, parse_ds4_output, serialize_state, Ds4Feedback, DS4_FEATURE_CALIBRATION,
-    DS4_FEATURE_FIRMWARE, DS4_INPUT_REPORT_LEN, DS4_PRODUCT, DS4_RDESC, DS4_TOUCH_H, DS4_TOUCH_W,
-    DS4_VENDOR,
+    ds4_pairing_reply, parse_ds4_output, Ds4Encoder, Ds4Feedback, DS4_FEATURE_CALIBRATION,
+    DS4_FEATURE_FIRMWARE, DS4_PRODUCT, DS4_RDESC, DS4_TOUCH_H, DS4_TOUCH_W, DS4_VENDOR,
 };
-use crate::sensor_clock::SensorClock;
 use crate::uhid_abi::{
     put_cstr, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2, UHID_DESTROY, UHID_EVENT_SIZE,
     UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2, UHID_OUTPUT, UHID_PATH, UHID_SET_REPORT,
@@ -27,13 +25,11 @@ use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::time::Instant;
 
 /// Drop sends `UHID_DESTROY` and unbinds `hid-playstation`.
 pub struct DualShock4Pad {
     fd: File,
-    counter: u8,
-    clock: SensorClock,
+    enc: Ds4Encoder,
 }
 
 impl DualShock4Pad {
@@ -49,8 +45,7 @@ impl DualShock4Pad {
             })?;
         let mut ds = DualShock4Pad {
             fd,
-            counter: 0,
-            clock: SensorClock::dualshock4(),
+            enc: Ds4Encoder::default(),
         };
         ds.send_create2(index).context("UHID_CREATE2 DualShock4")?;
         Ok(ds)
@@ -77,11 +72,7 @@ impl DualShock4Pad {
     }
 
     pub fn write_state(&mut self, st: &DsState) -> Result<()> {
-        self.counter = self.counter.wrapping_add(1);
-        let ts = self.clock.ds4_ticks(Instant::now());
-        let mut r = [0u8; DS4_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.counter, ts);
-
+        let r = self.enc.encode(st);
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
         // uhid_input2_req: size u16 at 4, data at 6.

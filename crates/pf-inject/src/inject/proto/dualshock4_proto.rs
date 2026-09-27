@@ -7,6 +7,8 @@
 //! `_output_report_common`. Pin via `tests` here and `crates/pf-inject/tests/motion_contract.rs`.
 
 use super::dualsense_proto::{pack_touch, DsState};
+use crate::sensor_clock::SensorClock;
+use std::time::Instant;
 
 pub const DS4_VENDOR: u16 = 0x054C;
 pub const DS4_PRODUCT: u16 = 0x09CC;
@@ -53,6 +55,37 @@ pub fn serialize_state(r: &mut [u8; DS4_INPUT_REPORT_LEN], st: &DsState, counter
     r[34] = ts as u8;
     pack_touch(&mut r[35..39], &st.touch[0], DS4_TOUCH_W, DS4_TOUCH_H);
     pack_touch(&mut r[39..43], &st.touch[1], DS4_TOUCH_W, DS4_TOUCH_H);
+}
+
+/// Report-`0x01` encoder a DualShock 4 keeps across writes: its report counter and sensor
+/// clock. Each transport holds one and only moves bytes.
+pub struct Ds4Encoder {
+    counter: u8,
+    clock: SensorClock,
+}
+
+impl Default for Ds4Encoder {
+    fn default() -> Ds4Encoder {
+        Ds4Encoder {
+            counter: 0,
+            clock: SensorClock::dualshock4(),
+        }
+    }
+}
+
+impl Ds4Encoder {
+    /// The next report `0x01` for `st`.
+    pub fn encode(&mut self, st: &DsState) -> [u8; DS4_INPUT_REPORT_LEN] {
+        self.counter = self.counter.wrapping_add(1);
+        let mut r = [0u8; DS4_INPUT_REPORT_LEN];
+        serialize_state(
+            &mut r,
+            st,
+            self.counter,
+            self.clock.ds4_ticks(Instant::now()),
+        );
+        r
+    }
 }
 
 /// One HID-output pass: rumble on the 0xCA plane, lightbar as a `Led` on 0xCD.
