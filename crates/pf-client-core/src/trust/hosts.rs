@@ -253,7 +253,7 @@ impl KnownHosts {
         // Omarchy menu mirrors this store; save() is the one door every mutation walks.
         // No-op unless `--omarchy-menu on` — a scoped test HOME never has that.
         // `desktop` too: `trust` is portable, and a TV build has no omarchy_menu to call.
-        #[cfg(all(feature = "desktop", target_os = "linux"))]
+        #[cfg(all(desktop, target_os = "linux"))]
         crate::omarchy_menu::sync_if_enabled();
         Ok(())
     }

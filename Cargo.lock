@@ -3136,6 +3136,7 @@ dependencies = [
  "anyhow",
  "ash",
  "async-channel",
+ "cfg_aliases 0.2.2",
  "libc",
  "libloading 0.9.0",
  "log",

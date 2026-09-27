@@ -18,7 +18,7 @@ repository.workspace = true
 # (`pf-console-ui`) now runs inside the Android client too, and everything IT needs from
 # this crate is data — `trust::Settings`, the menu-event vocabulary + synthesizer, the
 # library model, the deep-link grammar, the overlay action/session-phase types. Those
-# modules are gated `any(linux, windows, android, wasm)` in lib.rs; the session pump, decoders,
+# modules are gated `cfg(portable)` in lib.rs (build.rs); the session pump, decoders,
 # audio, SDL gamepad service and the ureq fetches stay desktop-only, so this block carries
 # only what the portable modules touch. `quic` (not `ureq-tls`): `trust` names
 # `NativeClient`/`endpoint` for identity + pairing; nothing here fetches over HTTPS.
@@ -302,6 +302,10 @@ discovery = ["dep:mdns-sd", "dep:async-channel"]
 # vendored in-repo tree, offline-safe, and an empty stub off Linux/Windows). The codec is
 # still strictly per-session opt-in (Settings codec pick / PUNKTFUNK_PREFER_PYROWAVE=1).
 pyrowave = ["dep:pyrowave-sys", "dep:ash"]
+
+# build.rs names the `portable` and `desktop` module gates.
+[build-dependencies]
+cfg_aliases = "0.2"
 
 [lints]
 workspace = true

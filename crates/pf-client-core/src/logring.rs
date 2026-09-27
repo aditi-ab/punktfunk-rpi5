@@ -82,7 +82,7 @@ pub fn render(header: &str) -> String {
 /// POST the ring to the paired host; returns the stored bundle id. Same TLS
 /// client auth and pin as the library fetch. Errors reuse that classification
 /// (`NotPaired`, `PinMismatch`) so existing shell strings apply.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn send_to_host(
     addr: &str,
     mgmt_port: u16,
@@ -119,7 +119,7 @@ pub fn send_to_host(
 
 /// [`send_to_host`] with the bundle header and outcome every shell uses. `app` names the
 /// binary in the header; the result is the sentence the shell shows the user.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn send_bundle(
     app: &str,
     host_name: &str,
@@ -151,7 +151,7 @@ pub fn send_bundle(
 /// `info`), beside [`RingLayer`] at DEBUG regardless, since the ring exists for the
 /// diagnostics nobody enabled before the bug happened. `ansi: false` turns colour off for a
 /// log file; `true` keeps the fmt layer's default.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn init_tracing<W>(writer: W, ansi: bool)
 where
     W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
@@ -177,16 +177,16 @@ where
 /// DEBUG/TRACE from [`NOISY_DEBUG_TARGETS`] is dropped. The vendored H.265
 /// parser logs DPB bookkeeping every frame; at 120 fps that turns the ring over
 /// in seconds and flushes the session the bundle exists to keep.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub struct RingLayer;
 
 /// DEBUG/TRACE from these module-path prefixes is chatter, not diagnostics.
 /// Prefix-matched on `::` boundaries so `cros_codecs::…` is gated and
 /// `cros_codecs_probe` is not. Same shape as the host's `NOISY_DEBUG_TARGETS`.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 const NOISY_DEBUG_TARGETS: &[&str] = &["cros_codecs"];
 
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 fn is_noisy_debug(target: &str) -> bool {
     NOISY_DEBUG_TARGETS.iter().any(|t| {
         target
@@ -195,7 +195,7 @@ fn is_noisy_debug(target: &str) -> bool {
     })
 }
 
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
     fn on_event(
         &self,
@@ -243,7 +243,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
 /// Line-buffered tee of a spawned session child's stderr into `out` and the ring.
 /// `out` is our stderr, or the WinUI shell's log-file tee. Returns immediately; the
 /// thread dies with the pipe.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn forward_child_stderr(
     stderr: impl std::io::Read + Send + 'static,
     mut out: impl std::io::Write + Send + 'static,
@@ -292,7 +292,7 @@ mod tests {
     }
 
     /// A non-UTF-8 byte must not end the drain: the child blocks once its pipe fills.
-    #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+    #[cfg(desktop)]
     #[test]
     fn stderr_forward_drains_past_a_non_utf8_line() {
         #[derive(Clone, Default)]
@@ -321,7 +321,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+    #[cfg(desktop)]
     #[test]
     fn noisy_gate_matches_the_crate_and_its_modules_only() {
         assert!(is_noisy_debug("cros_codecs"));
@@ -332,7 +332,7 @@ mod tests {
     }
 
     /// Markers, not ring size: the ring is process-global.
-    #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+    #[cfg(desktop)]
     #[test]
     fn bridged_decoder_debug_is_dropped_and_the_audio_line_survives() {
         use tracing_subscriber::layer::SubscriberExt;
