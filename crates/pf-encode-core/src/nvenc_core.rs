@@ -939,6 +939,19 @@ mod tests {
         unsafe { assert_eq!(cfg.encodeCodecConfig.hevcConfig.pixelBitDepthMinus8(), 2) };
     }
 
+    /// H.264 codes its reorder bound only in the VUI restriction; HEVC's SPS always has one.
+    #[test]
+    fn h264_states_its_reorder_bound() {
+        let mut cfg = nv::NV_ENC_CONFIG {
+            version: nv::NV_ENC_CONFIG_VER,
+            ..seed_config()
+        };
+        apply_low_latency_config(&mut cfg, low_latency_cfg(Codec::H264, false, 8));
+        // SAFETY: an H.264 session's union arm is `h264Config` — the one this path wrote.
+        let vui = unsafe { cfg.encodeCodecConfig.h264Config.h264VUIParameters };
+        assert_eq!(vui.bitstreamRestrictionFlag, 1);
+    }
+
     #[test]
     fn av1_never_takes_the_hevc_444_union_write() {
         let mut cfg = nv::NV_ENC_CONFIG {
@@ -1462,7 +1475,7 @@ pub fn build_init_params(
 
 /// Low-latency NVENC config onto a **preset-seeded** `cfg`: CBR, infinite GOP,
 /// P-only, ~1-frame VBV, per-codec tier/level, chroma + bit depth, colour
-/// signaling, RFI DPB. Caller seeds from the P1/ULL preset for
+/// signaling, the H.264 reorder bound, RFI DPB. Caller seeds from the P1/ULL preset for
 /// [`LowLatencyConfig::codec`], which names the union arm every access here uses.
 pub fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: LowLatencyConfig) {
     cfg.gopLength = nv::NVENC_INFINITE_GOPLENGTH;
@@ -1595,6 +1608,9 @@ pub fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: LowLatencyConfig
                 vui.colourPrimaries = prim;
                 vui.transferCharacteristics = trc;
                 vui.colourMatrix = mat;
+                // States `max_num_reorder_frames = 0`. Unstated, a decoder infers the
+                // level's DPB depth and holds that many pictures: 12 at 1920x1200.
+                vui.bitstreamRestrictionFlag = 1;
             }
             Codec::Av1 => {
                 // SAFETY: AV1 session (matched on `c.codec`), so `av1Config` is the active arm;

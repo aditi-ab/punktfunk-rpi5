@@ -3550,6 +3550,62 @@ mod tests {
         println!("nvenc_cuda codec-switch: 5 legs across H265/AV1/H264, all clean");
     }
 
+    /// Hardware: the H.264 stream through the client's planner, one AU in, one picture
+    /// out. 1920x1200 is level 5, where an unstated reorder bound is 12 pictures.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_h264_shows_each_picture_in_its_own_au() {
+        const W: u32 = 1920;
+        const H: u32 = 1200;
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H264,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            20_000_000,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+            false,
+            4,
+        )
+        .expect("open NVENC CUDA session");
+
+        let mut planner = pf_vaapi::H264Planner::new();
+        let mut stored = Vec::new();
+        let mut lags = Vec::new();
+        for i in 0..40u32 {
+            let frame = nv12_frame(W, H, i);
+            enc.submit_indexed(&frame, i).expect("submit");
+            while let Some(au) = enc.poll().expect("poll") {
+                let plan = planner.plan_au(&au.data).expect("plan");
+                if stored.is_empty() {
+                    let vui = &plan.sps.vui_parameters;
+                    println!(
+                        "sps: level={:?} poc_type={} refs={} restriction={} reorder={} dpb={}",
+                        plan.sps.level_idc,
+                        plan.sps.pic_order_cnt_type,
+                        plan.sps.max_num_ref_frames,
+                        vui.bitstream_restriction_flag,
+                        vui.max_num_reorder_frames,
+                        vui.max_dec_frame_buffering,
+                    );
+                }
+                stored.push(plan.dpb.stored.expect("stored"));
+                for shown in &plan.dpb.outputs {
+                    let decoded_at = stored.iter().position(|id| id == shown).expect("known");
+                    lags.push(stored.len() - 1 - decoded_at);
+                }
+            }
+        }
+        enc.flush().ok();
+        println!("{} AUs planned, output lags {lags:?}", stored.len());
+        assert!(stored.len() >= 30, "only {} AUs produced", stored.len());
+        assert_eq!(lags, vec![0; stored.len()]);
+    }
+
     /// Hardware: drop with encodes in flight, then a fresh session must still open.
     #[test]
     #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
