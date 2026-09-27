@@ -19,8 +19,7 @@
 //! token; SDL matches `28DE:1302` on VID/PID alone, so `usb_mi` is `None`.
 
 use super::dualsense_windows::{
-    create_swdevice, driver_marks, publish_input, OutputDrain, SwDeviceProfile, OFF_DEVTYPE,
-    OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
+    create_swdevice, driver_marks, publish_input, stamp_pad, OutputDrain, SwDeviceProfile, SHM_SIZE,
 };
 use super::gamepad_raii::{DriverAttach, PadChannel, ProofTransport, SwDevice};
 use crate::triton_proto::{
@@ -57,20 +56,14 @@ impl TritonWinPad {
     fn open(index: u8) -> Result<TritonWinPad> {
         let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        let base = channel.data_base();
-        // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range.
-        unsafe {
-            *base.add(OFF_DEVTYPE) = DEVTYPE_TRITON;
-            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            // Ring capability `2` = "this host drains the v2.2 long ring", stamped before the
-            // magic so the driver sees it on attach (see the DualSense open path + PadShm docs).
-            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
-            std::ptr::write_unaligned(
-                base.add(OFF_INPUT) as *mut [u8; 64],
-                neutral_triton_report(),
-            );
-            std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
-        }
+        // Ring capability `2` = "this host drains the v2.2 long ring".
+        stamp_pad(
+            channel.data(),
+            DEVTYPE_TRITON,
+            index,
+            2,
+            &neutral_triton_report(),
+        );
         let inst = format!("pf_triton_{index}");
         let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
             instance: &inst,
@@ -123,8 +116,7 @@ impl TritonWinPad {
             serialize_triton_state(&mut s, st, self.seq);
             r[..TRITON_STATE_LEN].copy_from_slice(&s);
         }
-        // SAFETY: same contract as DeckWinPad::write_state — the v2.3 input_gen seqlock.
-        unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };
+        publish_input(self.channel.data(), &mut self.input_gen, &r);
     }
 
     /// Drain Steam writes: rumble on 0xCA from untagged OUTPUT only (FEATURE
@@ -132,38 +124,38 @@ impl TritonWinPad {
     /// ring-overflow flag and must reach `PadFeedback` unchanged.
     fn service(&mut self, idx: u8) -> (Option<(u16, u16)>, Vec<HidOutput>, bool) {
         self.channel.pump();
-        // SAFETY: the channel's section is live and SHM_SIZE bytes.
-        let (proto, rev) = unsafe { driver_marks(self.channel.data_base()) };
+        let (proto, rev) = driver_marks(self.channel.data());
         self.attach.observe_pad(proto, rev);
-        let base = self.channel.data_base();
         let mut rumble = None;
         let mut hidout = Vec::new();
-        let resync = self.drain.drain_tagged(base, |bytes, feature| {
-            // hidclass pads writes to 64; Linux forwards native length (0x80
-            // rumble is 10). Trim OUTPUT to `out_report_len` so GATT is not
-            // padded. FEATURE stays whole (Steam SETs full reports). Ring
-            // slices are non-empty; salvage/legacy is a fixed 64-byte slice.
-            let bytes = match (feature, bytes.first()) {
-                (false, Some(&id)) => {
-                    &bytes[..bytes.len().min(pf_driver_proto::triton::out_report_len(id))]
+        let resync = self
+            .drain
+            .drain_tagged(self.channel.data(), |bytes, feature| {
+                // hidclass pads writes to 64; Linux forwards native length (0x80
+                // rumble is 10). Trim OUTPUT to `out_report_len` so GATT is not
+                // padded. FEATURE stays whole (Steam SETs full reports). Ring
+                // slices are non-empty; salvage/legacy is a fixed 64-byte slice.
+                let bytes = match (feature, bytes.first()) {
+                    (false, Some(&id)) => {
+                        &bytes[..bytes.len().min(pf_driver_proto::triton::out_report_len(id))]
+                    }
+                    _ => bytes,
+                };
+                if !feature {
+                    if let Some(r) = parse_triton_rumble(bytes) {
+                        rumble = Some(r);
+                    }
                 }
-                _ => bytes,
-            };
-            if !feature {
-                if let Some(r) = parse_triton_rumble(bytes) {
-                    rumble = Some(r);
-                }
-            }
-            hidout.push(HidOutput::HidRaw {
-                pad: idx,
-                kind: if feature {
-                    HID_RAW_FEATURE
-                } else {
-                    HID_RAW_OUTPUT
-                },
-                data: bytes.to_vec(),
+                hidout.push(HidOutput::HidRaw {
+                    pad: idx,
+                    kind: if feature {
+                        HID_RAW_FEATURE
+                    } else {
+                        HID_RAW_OUTPUT
+                    },
+                    data: bytes.to_vec(),
+                });
             });
-        });
         (rumble, hidout, resync)
     }
 }

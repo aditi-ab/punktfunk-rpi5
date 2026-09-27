@@ -17,13 +17,10 @@
 //! decoded and dropped (`GamepadPref::motion_reaches`).
 
 use super::dualsense_windows::{
-    create_swdevice, driver_marks, publish_input, OutputDrain, SwDeviceProfile, OFF_DEVTYPE,
-    OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
+    create_swdevice, driver_marks, publish_input, stamp_pad, OutputDrain, SwDeviceProfile, SHM_SIZE,
 };
 use super::gamepad_raii::PadChannel;
-use super::xbox_proto::{
-    neutral_xbox_report, parse_xbox_output, serialize_xbox_state, XboxState, XBOX_REPORT_LEN,
-};
+use super::xbox_proto::{neutral_xbox_report, parse_xbox_output, serialize_xbox_state, XboxState};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use punktfunk_core::quic::RichInput;
@@ -185,21 +182,8 @@ impl XboxWinPad {
     fn open(index: u8, id: &WinXboxIdentity) -> Result<XboxWinPad> {
         let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        let base = channel.data_base();
-        // SAFETY: `base` is SHM_SIZE writable bytes; OFF_* offsets are in range.
-        // `device_type` must land before the magic — the driver reads it on
-        // attach, and a late stamp enumerates as DualSense.
-        unsafe {
-            *base.add(OFF_DEVTYPE) = id.devtype;
-            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            // `2` = host drains the v2.2 long ring (see DualSense open).
-            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
-            std::ptr::write_unaligned(
-                base.add(OFF_INPUT) as *mut [u8; XBOX_REPORT_LEN],
-                neutral_xbox_report(),
-            );
-            std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
-        }
+        // `2` = host drains the v2.2 long ring (see DualSense open).
+        stamp_pad(channel.data(), id.devtype, index, 2, &neutral_xbox_report());
         let inst = format!("{}_{index}", id.instance_prefix);
         let hwid = inf_hwid(id);
         let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
@@ -248,27 +232,22 @@ impl XboxWinPad {
     /// mid-copy.
     fn write_state(&mut self, st: &XboxState) {
         let r = serialize_xbox_state(st);
-        // SAFETY: `data_base()` is a live SHM_SIZE-byte section; `report_len` ≤ the codec's
-        // fixed-size report.
-        unsafe {
-            publish_input(
-                self.channel.data_base(),
-                &mut self.input_gen,
-                &r[..self.report_len],
-            )
-        };
+        publish_input(
+            self.channel.data(),
+            &mut self.input_gen,
+            &r[..self.report_len],
+        );
     }
 
     fn service(&mut self) -> (Option<(u16, u16, u16, u16)>, bool) {
         self.channel.pump();
-        // SAFETY: the channel's section is live and SHM_SIZE bytes.
-        let (proto, rev) = unsafe { driver_marks(self.channel.data_base()) };
+        let (proto, rev) = driver_marks(self.channel.data());
         self.attach.observe_pad(proto, rev);
         let mut rumble = None;
-        let base = self.channel.data_base();
+        let shm = self.channel.data();
         let seen = &mut self.seen_enable;
         let mailbox = self.channel.boot_name();
-        let resync = self.drain.drain(base, |bytes| {
+        let resync = self.drain.drain(shm, |bytes| {
             if let Some(r) = parse_xbox_output(bytes) {
                 // Which motor bits xinputhid sets is unmeasured; log each new mask once.
                 if !seen.contains(&bytes[1]) {

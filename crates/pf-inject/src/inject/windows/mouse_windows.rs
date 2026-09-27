@@ -15,7 +15,7 @@ use super::dualsense_windows::{create_swdevice, SwDeviceProfile};
 use super::gamepad_raii::{DriverAttach, PadChannel, ProofTransport};
 use anyhow::Result;
 use pf_driver_proto::mouse::{input_report, mouse_boot_name, MouseShm, MOUSE_MAGIC};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 use windows::Win32::Foundation::POINT;
@@ -27,6 +27,7 @@ const OFF_REPORT: usize = core::mem::offset_of!(MouseShm, report);
 const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(MouseShm, driver_proto);
 const OFF_DRIVER_HEARTBEAT: usize = core::mem::offset_of!(MouseShm, driver_heartbeat);
 const OFF_PAD_INDEX: usize = core::mem::offset_of!(MouseShm, pad_index);
+const OFF_MAGIC: usize = core::mem::offset_of!(MouseShm, magic);
 
 /// The reserved display connector a seat host owns; unset on the console.
 /// `docs-site/content/docs/developers/multi-seat-contract.md` is the contract of record.
@@ -63,13 +64,10 @@ impl VirtualMouse {
         let index = mouse_index_for_slot(std::env::var_os(SEAT_SLOT_ENV).as_deref());
         let boot_name = mouse_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        let base = channel.data_base();
-        // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range. Index
-        // first, magic LAST — the same publish order the pads use.
-        unsafe {
-            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, u32::from(index));
-            std::ptr::write_unaligned(base as *mut u32, MOUSE_MAGIC);
-        }
+        // Index first, magic LAST — the same publish order the pads use.
+        let shm = channel.data();
+        shm.store_u32(OFF_PAD_INDEX, u32::from(index), Ordering::Relaxed);
+        shm.store_u32(OFF_MAGIC, MOUSE_MAGIC, Ordering::Relaxed);
         let instance = format!("pf_mouse_{index}");
         let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
             instance: &instance,
@@ -114,15 +112,11 @@ impl VirtualMouse {
     pub fn send_report(&mut self, buttons: u8, x: u16, y: u16, wheel: i8, pan: i8) {
         let r = input_report(buttons, x, y, wheel, pan);
         self.seq = self.seq.wrapping_add(1).max(1); // never publish seq 0 (= "nothing yet")
-        let base = self.channel.data_base();
-        // SAFETY: base points at SHM_SIZE bytes; the report slot is OFF_REPORT..+8 and OFF_IN_SEQ
-        // (== 4) is 4-aligned off the page-aligned base, so the AtomicU32 view is valid. The report
-        // bytes are published BEFORE the seq (Release) — the driver's Acquire load of `in_seq`
-        // therefore observes the matching report.
-        unsafe {
-            std::ptr::copy_nonoverlapping(r.as_ptr(), base.add(OFF_REPORT), r.len());
-            (*(base.add(OFF_IN_SEQ) as *const AtomicU32)).store(self.seq, Ordering::Release);
-        }
+                                                    // The report before the seq (Release): the driver's Acquire load of `in_seq` observes
+                                                    // the matching report.
+        let shm = self.channel.data();
+        shm.write_bytes(OFF_REPORT, &r);
+        shm.store_u32(OFF_IN_SEQ, self.seq, Ordering::Release);
     }
 
     /// Pump sealed-channel delivery and feed the attach watcher (8 ms timer stamps `driver_proto`).
@@ -132,19 +126,15 @@ impl VirtualMouse {
     }
 
     fn driver_proto(&self) -> u32 {
-        // SAFETY: base points at SHM_SIZE bytes; OFF_DRIVER_PROTO is in range.
-        unsafe {
-            std::ptr::read_unaligned(self.channel.data_base().add(OFF_DRIVER_PROTO) as *const u32)
-        }
+        self.channel
+            .data()
+            .load_u32(OFF_DRIVER_PROTO, Ordering::Relaxed)
     }
 
     fn driver_heartbeat(&self) -> u32 {
-        // SAFETY: base points at SHM_SIZE bytes; OFF_DRIVER_HEARTBEAT is in range.
-        unsafe {
-            std::ptr::read_unaligned(
-                self.channel.data_base().add(OFF_DRIVER_HEARTBEAT) as *const u32
-            )
-        }
+        self.channel
+            .data()
+            .load_u32(OFF_DRIVER_HEARTBEAT, Ordering::Relaxed)
     }
 }
 
