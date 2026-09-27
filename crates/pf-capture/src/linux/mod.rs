@@ -15,7 +15,7 @@
 //! pipewire thread; [`PortalSession`]'s `Drop` fires the portal oneshot
 //! and waits bounded so the zbus drop ends the ScreenCast.
 
-use super::{CapturedFrame, Capturer, DmabufFrame, FramePayload, PixelFormat, ZeroCopyPolicy};
+use super::{CapturedFrame, Capturer, FramePayload, PixelFormat, ZeroCopyPolicy};
 use anyhow::{anyhow, Context, Result};
 
 // Gamescope's PipeWire node has no `SPA_META_Cursor`; this fills `cursor_live` from XFixes.
@@ -205,7 +205,7 @@ pub struct PortalCapturer {
     /// renegotiation; cleared on a frame or when `Streaming` again.
     stall_since: Option<std::time::Instant>,
     /// Raw-dmabuf passthrough offer, copied from the thread's
-    /// [`NegotiationPlan`](pipewire::NegotiationPlan) — never re-derived.
+    /// [`NegotiationPlan`](pipewire::plan::NegotiationPlan) — never re-derived.
     /// A failed offer latches this capture's [`pf_zerocopy::ZeroCopyHealth`].
     vaapi_dmabuf: bool,
     /// CUDA import choices for held frames ([`Self::import_held`]).
@@ -597,7 +597,7 @@ impl Capturer for PortalCapturer {
     }
 
     fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        // A driven producer paints on its own requests (`pipewire::Pacer`), so
+        // A driven producer paints on its own requests (`pipewire::pacer::Pacer`), so
         // this wait never triggers a paint.
         wait_for_frame(&self.slot, &self.wake, &self.signals.broken, deadline);
     }
@@ -1129,8 +1129,8 @@ mod portal;
 pub use portal::gnome_hdr_monitor_active;
 use portal::portal_thread;
 
-// PipeWire consumer (`!Send`, owns its thread). Directory `mod pipewire`
-// resolves to `linux/pipewire.rs`; `super` inside still means `linux`.
+// PipeWire consumer (`!Send`, owns its thread). Inner `mod pipewire` shadows
+// the crate, hence `::pipewire` in this file.
 mod pipewire;
 // Client-allocated dmabufs for the direct capture path.
 mod gbm_pool;

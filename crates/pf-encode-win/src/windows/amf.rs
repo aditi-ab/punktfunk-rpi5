@@ -1508,47 +1508,31 @@ impl AmfEncoder {
             .ltr
             .as_ref()
             .map(|l| (l.mark_ltr_index, l.force_ltr_bitfield));
-        let mut mark_slot: Option<usize> = None;
-        let mut force_slot: Option<usize> = None;
-        let mut recovery_anchor = false;
-        if self.ltr_active {
-            if forced {
-                // IDR resets decoder refs — drop stale LTR slots and any force queued against them.
-                self.ltr_slots = [None; NUM_LTR_SLOTS];
-                self.next_ltr_slot = 0;
-                self.pending_force = None;
-            } else if self.ltr_test_force_at == Some(cur_idx) {
-                // Spike hook: self-trigger the real invalidate path without a live client.
-                let triggered = self.invalidate_ref_frames(cur_idx, cur_idx);
-                tracing::info!(
-                    frame = cur_idx,
-                    triggered,
-                    "AMF LTR test hook fired invalidate_ref_frames"
-                );
-            }
-            // Apply a queued force to this frame. Skip if the taint sweep emptied the slot: the
-            // hardware still holds the tainted mark, so forcing it would re-reference the loss.
-            if let Some(slot) = self.pending_force.take() {
-                if self.ltr_slots[slot].is_some() {
-                    force_slot = Some(slot);
-                    recovery_anchor = true;
-                    // LTR_MODE_RESET_UNUSED, the default: referencing one slot discards the rest.
-                    for (s, marked) in self.ltr_slots.iter_mut().enumerate() {
-                        if s != slot {
-                            *marked = None;
-                        }
-                    }
-                }
-            }
-            // Mark on IDR and every interval, never on the recovery frame (would overwrite the force).
-            if force_slot.is_none() && (forced || cur_idx % self.ltr_mark_interval == 0) {
-                let trusted = self.ltr_slots.map(|m| m.is_some());
-                let slot = super::rfi::mark_slot(&trusted, self.next_ltr_slot);
-                self.ltr_slots[slot] = Some(cur_idx);
-                self.next_ltr_slot = (slot + 1) % NUM_LTR_SLOTS;
-                mark_slot = Some(slot);
-            }
+        if self.ltr_active && !forced && self.ltr_test_force_at == Some(cur_idx) {
+            // Spike hook: self-trigger the real invalidate path without a live client.
+            let triggered = self.invalidate_ref_frames(cur_idx, cur_idx);
+            tracing::info!(
+                frame = cur_idx,
+                triggered,
+                "AMF LTR test hook fired invalidate_ref_frames"
+            );
         }
+        let LtrStep {
+            mark_slot,
+            force_slot,
+        } = if self.ltr_active {
+            ltr_step(
+                &mut self.ltr_slots,
+                &mut self.next_ltr_slot,
+                &mut self.pending_force,
+                forced,
+                cur_idx,
+                self.ltr_mark_interval,
+            )
+        } else {
+            LtrStep::default()
+        };
+        let recovery_anchor = force_slot.is_some();
         #[cfg(test)]
         if self.fail_submit_at == Some(cur_idx) {
             bail!("test hook: frame {cur_idx} refused after the LTR decision");
@@ -1741,6 +1725,54 @@ impl AmfEncoder {
         }
         Ok(())
     }
+}
+
+/// One frame's LTR action, decided before the surface is built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LtrStep {
+    /// Mark this frame long-term into the slot.
+    mark_slot: Option<usize>,
+    /// Force-reference the slot; the AU is a recovery anchor.
+    force_slot: Option<usize>,
+}
+
+/// This frame's LTR mark and force over the slot mirror. An IDR empties the mirror and drops a
+/// queued force. A queued force needs its slot still marked: the taint sweep empties a slot
+/// whose tainted mark the hardware still holds, and forcing it would re-reference the loss. A
+/// force clears every other slot (`LTR_MODE_RESET_UNUSED`, the default: referencing one slot
+/// discards the rest) and takes the frame's mark, which would overwrite it.
+fn ltr_step(
+    slots: &mut [Option<i64>; NUM_LTR_SLOTS],
+    next_slot: &mut usize,
+    pending_force: &mut Option<usize>,
+    forced: bool,
+    cur_idx: i64,
+    mark_interval: i64,
+) -> LtrStep {
+    let mut step = LtrStep::default();
+    if forced {
+        *slots = [None; NUM_LTR_SLOTS];
+        *next_slot = 0;
+        *pending_force = None;
+    }
+    if let Some(slot) = pending_force.take() {
+        if slots[slot].is_some() {
+            step.force_slot = Some(slot);
+            for (s, marked) in slots.iter_mut().enumerate() {
+                if s != slot {
+                    *marked = None;
+                }
+            }
+        }
+    }
+    if step.force_slot.is_none() && (forced || cur_idx % mark_interval == 0) {
+        let trusted = slots.map(|m| m.is_some());
+        let slot = super::rfi::mark_slot(&trusted, *next_slot);
+        slots[slot] = Some(cur_idx);
+        *next_slot = (slot + 1) % NUM_LTR_SLOTS;
+        step.mark_slot = Some(slot);
+    }
+    step
 }
 
 impl Encoder for AmfEncoder {
@@ -2069,6 +2101,54 @@ impl Encoder for AmfEncoder {
 mod tests {
     use super::*;
     use crate::smoke_pattern::nv12_texture;
+
+    /// An IDR empties the mirror, drops a queued force and marks slot 0.
+    #[test]
+    fn an_idr_resets_the_ltr_mirror_and_marks_slot_zero() {
+        let (mut slots, mut next, mut pending) = ([Some(3), Some(5)], 1, Some(1));
+        let step = ltr_step(&mut slots, &mut next, &mut pending, true, 9, 8);
+        assert_eq!(
+            step,
+            LtrStep {
+                mark_slot: Some(0),
+                force_slot: None
+            }
+        );
+        assert_eq!((slots, next, pending), ([Some(9), None], 1, None));
+    }
+
+    /// A queued force on a marked slot re-references it, clears the other slot and takes the
+    /// frame's mark. On a slot the taint sweep emptied it ships a plain P.
+    #[test]
+    fn a_queued_force_needs_a_marked_slot() {
+        let (mut slots, mut next, mut pending) = ([Some(0), Some(8)], 0, Some(0));
+        let step = ltr_step(&mut slots, &mut next, &mut pending, false, 16, 8);
+        assert_eq!(
+            step,
+            LtrStep {
+                mark_slot: None,
+                force_slot: Some(0)
+            }
+        );
+        assert_eq!((slots, pending), ([Some(0), None], None));
+        let (mut slots, mut pending) = ([None, Some(8)], Some(0));
+        let step = ltr_step(&mut slots, &mut next, &mut pending, false, 17, 8);
+        assert_eq!(step, LtrStep::default());
+        assert_eq!(pending, None, "a force is consumed either way");
+    }
+
+    /// Marks land on the interval, first on an empty slot, else round robin.
+    #[test]
+    fn a_mark_prefers_an_empty_slot() {
+        let (mut slots, mut next, mut pending) = ([Some(0), None], 0, None);
+        let step = ltr_step(&mut slots, &mut next, &mut pending, false, 15, 8);
+        assert_eq!(step, LtrStep::default(), "off the interval");
+        let step = ltr_step(&mut slots, &mut next, &mut pending, false, 16, 8);
+        assert_eq!(step.mark_slot, Some(1));
+        let step = ltr_step(&mut slots, &mut next, &mut pending, false, 24, 8);
+        assert_eq!(step.mark_slot, Some(0), "both marked: the round robin");
+        assert_eq!(slots, [Some(24), Some(16)]);
+    }
 
     // Layout of the FFI mirrors lives as `const _: ()` in `amf_sys.rs` (every build). This
     // checks little-endian union payload packing, which a size/align assert cannot express.

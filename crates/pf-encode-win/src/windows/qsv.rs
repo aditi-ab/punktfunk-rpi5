@@ -1068,50 +1068,19 @@ impl QsvEncoder {
         let opening = self.inner.as_ref().is_none_or(|i| i.frames_submitted == 0);
         let forced = std::mem::take(&mut self.force_kf) || opening;
         self.frame_idx += 1;
-        let mut mark_slot: Option<usize> = None;
-        let mut force_ltr: Option<(usize, i64)> = None;
-        let mut recovery_anchor = false;
-        if self.ltr_active {
-            if forced {
-                // IDR voids decoder refs — drop stale slots and any queued force.
-                self.ltr_slots = [None; NUM_LTR_SLOTS];
-                self.ltr_tainted = [false; NUM_LTR_SLOTS]; // IDR flushed the DPB
-                self.next_ltr_slot = 0;
-                self.pending_force = None;
-            } else if self.ltr_test_force_at == Some(cur_idx) {
-                let triggered = self.invalidate_ref_frames(cur_idx, cur_idx);
-                tracing::info!(
-                    frame = cur_idx,
-                    triggered,
-                    "QSV LTR test hook fired invalidate_ref_frames"
-                );
-            }
-            if let Some(slot) = self.pending_force.take() {
-                // Resolve now: taint may have landed since the force was queued.
-                // Empty or tainted = ship a plain P, no `recovery_anchor` (that tag
-                // lifts the client's post-loss freeze).
-                if let Some(idx) = self.ltr_slots[slot].filter(|_| !self.ltr_tainted[slot]) {
-                    force_ltr = Some((slot, idx));
-                    recovery_anchor = true;
-                }
-            }
-            if force_ltr.is_none() && (forced || cur_idx % self.ltr_mark_interval == 0) {
-                let trusted: [bool; NUM_LTR_SLOTS] =
-                    std::array::from_fn(|s| self.ltr_slots[s].is_some() && !self.ltr_tainted[s]);
-                let slot = super::rfi::mark_slot(&trusted, self.next_ltr_slot);
-                self.ltr_slots[slot] = Some(cur_idx);
-                // Re-mark replaces LongTermIdx: the tainted frame leaves the DPB.
-                self.ltr_tainted[slot] = false;
-                self.next_ltr_slot = (slot + 1) % NUM_LTR_SLOTS;
-                mark_slot = Some(slot);
-            }
+        if self.ltr_active && !forced && self.ltr_test_force_at == Some(cur_idx) {
+            let triggered = self.invalidate_ref_frames(cur_idx, cur_idx);
+            tracing::info!(
+                frame = cur_idx,
+                triggered,
+                "QSV LTR test hook fired invalidate_ref_frames"
+            );
         }
+        let ltr = self.ltr_step(forced, cur_idx);
         #[cfg(test)]
         if self.fail_submit_at == Some(cur_idx) {
             bail!("test hook: frame {cur_idx} refused after the LTR decision");
         }
-        let ltr_slots = self.ltr_slots;
-        let reject_ok = self.codec != Codec::Av1;
         let inner = self.inner.as_mut().expect("ensure_inner succeeded");
         // Wait for the sync thread to free a slot before submitting: the runtime keeps writing a
         // bitstream until its frame is synced, so the queue must not grow under overload.
@@ -1121,18 +1090,173 @@ impl QsvEncoder {
             .wait_until(BUSY_BUDGET, "QSV output", |o| {
                 o.pending.len() < IN_FLIGHT_MAX
             })?;
-        // SAFETY: the whole block runs on the single encode thread against the live session.
-        // `MFXMemory_GetSurfaceForEncode` returns a runtime-owned surface we must Release
-        // exactly once (every exit path below does). `GetNativeHandle` returns a borrowed
-        // (non-AddRef'd) D3D11 texture the runtime keeps alive at least until the surface's
-        // Release — the `CopySubresourceRegion` happens strictly before that. The manually
+        let surf = inner.load_surface(&frame.texture, cur_idx, captured.pts_ns)?;
+        let mut ctrl = frame_ctrl(
+            forced,
+            ltr,
+            cur_idx,
+            &self.ltr_slots,
+            self.codec != Codec::Av1,
+        );
+        let mut bs = inner.take_bs();
+        let syncp = inner.encode_async(&surf, ctrl.as_deref_mut(), &mut bs)?;
+        inner.retrieve.q.lock().pending.push_back(Pending {
+            syncp,
+            bs,
+            pts_ns: captured.pts_ns,
+            forced,
+            recovery_anchor: ltr.force.is_some(),
+            _ctrl: ctrl,
+        });
+        inner.frames_submitted += 1;
+        // `surf` releases here; the runtime holds its own reference for the in-flight encode.
+        Ok(())
+    }
+
+    /// This frame's LTR mark and force. An IDR empties the mirror and drops a queued force. A
+    /// queued force resolves now: taint may have landed since it was queued, and an empty or
+    /// tainted slot ships a plain P with no recovery anchor (that tag lifts the client's
+    /// post-loss freeze). A force takes the frame's mark, which would overwrite it.
+    fn ltr_step(&mut self, forced: bool, cur_idx: i64) -> LtrStep {
+        let mut step = LtrStep::default();
+        if !self.ltr_active {
+            return step;
+        }
+        if forced {
+            self.ltr_slots = [None; NUM_LTR_SLOTS];
+            self.ltr_tainted = [false; NUM_LTR_SLOTS]; // IDR flushed the DPB
+            self.next_ltr_slot = 0;
+            self.pending_force = None;
+        }
+        if let Some(slot) = self.pending_force.take() {
+            step.force = self.ltr_slots[slot]
+                .filter(|_| !self.ltr_tainted[slot])
+                .map(|idx| (slot, idx));
+        }
+        if step.force.is_none() && (forced || cur_idx % self.ltr_mark_interval == 0) {
+            let trusted: [bool; NUM_LTR_SLOTS] =
+                std::array::from_fn(|s| self.ltr_slots[s].is_some() && !self.ltr_tainted[s]);
+            let slot = super::rfi::mark_slot(&trusted, self.next_ltr_slot);
+            self.ltr_slots[slot] = Some(cur_idx);
+            // Re-mark replaces LongTermIdx: the tainted frame leaves the DPB.
+            self.ltr_tainted[slot] = false;
+            self.next_ltr_slot = (slot + 1) % NUM_LTR_SLOTS;
+            step.mark_slot = Some(slot);
+        }
+        step
+    }
+}
+
+/// One frame's LTR action, decided before the surface is built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LtrStep {
+    /// Mark this frame long-term into the slot.
+    mark_slot: Option<usize>,
+    /// Re-reference `(slot, wire index)`; the AU is a recovery anchor.
+    force: Option<(usize, i64)>,
+}
+
+/// The encode control for an IDR, an LTR mark or an LTR force; `None` for a plain P. A force
+/// rejects the other DPB candidates on AVC/HEVC (`reject_ok`), naming the marks in `ltr_slots`.
+fn frame_ctrl(
+    forced: bool,
+    ltr: LtrStep,
+    cur_idx: i64,
+    ltr_slots: &[Option<i64>; NUM_LTR_SLOTS],
+    reject_ok: bool,
+) -> Option<Box<FrameCtrl>> {
+    if !forced && ltr.mark_slot.is_none() && ltr.force.is_none() {
+        return None;
+    }
+    let mut c = FrameCtrl::new();
+    if forced {
+        c.ctrl.FrameType =
+            (vpl::MFX_FRAMETYPE_IDR | vpl::MFX_FRAMETYPE_I | vpl::MFX_FRAMETYPE_REF) as u16;
+    }
+    let mut use_reflist = false;
+    if let Some(slot) = ltr.mark_slot {
+        c.reflist.LongTermRefList[0].FrameOrder = cur_idx as u32;
+        c.reflist.LongTermRefList[0].PicStruct = vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
+        c.reflist.LongTermRefList[0].LongTermIdx = slot as u16;
+        c.reflist.ApplyLongTermIdx = 1;
+        use_reflist = true;
+    }
+    if let Some((slot, ltr_frame)) = ltr.force {
+        // LongTermIdx stays 0 in PreferredRefList (AV1 rejects nonzero; AVC/HEVC key on
+        // FrameOrder).
+        c.reflist.PreferredRefList[0].FrameOrder = ltr_frame as u32;
+        c.reflist.PreferredRefList[0].PicStruct = vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
+        // PreferredRefList is a reorder hint; the encoder may still predict from tainted
+        // short-term refs. Reject the other DPB candidates and cap L0 at 1. AVC/HEVC only — AV1
+        // rejection is unvalidated; an unhonored hint still IDR-escalates.
+        if reject_ok {
+            let mut rej = 0;
+            let mut reject = |idx: i64| {
+                if idx >= 0 && idx != ltr_frame {
+                    c.reflist.RejectedRefList[rej].FrameOrder = idx as u32;
+                    c.reflist.RejectedRefList[rej].PicStruct =
+                        vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
+                    rej += 1;
+                }
+            };
+            reject(cur_idx - 1);
+            reject(cur_idx - 2);
+            for (s, marked) in ltr_slots.iter().enumerate() {
+                if s != slot {
+                    if let Some(idx) = *marked {
+                        reject(idx);
+                    }
+                }
+            }
+            c.reflist.NumRefIdxL0Active = 1;
+        }
+        use_reflist = true;
+        tracing::info!(
+            slot,
+            ltr_frame,
+            frame = cur_idx,
+            "QSV LTR-RFI: re-referencing known-good LTR (clean recovery, no IDR)"
+        );
+    }
+    if use_reflist {
+        c.attach_reflist();
+    }
+    Some(c)
+}
+
+/// A runtime surface for one encode. Dropping it releases our reference, on every path.
+struct EncodeSurface {
+    surf: *mut vpl::mfxFrameSurface1,
+    release: unsafe extern "C" fn(*mut vpl::mfxFrameSurface1) -> vpl::mfxStatus,
+}
+
+impl Drop for EncodeSurface {
+    fn drop(&mut self) {
+        // SAFETY: `surf` came from `MFXMemory_GetSurfaceForEncode` with this `release`, and this
+        // guard is its one owner, so the reference drops exactly once.
+        unsafe {
+            let _ = (self.release)(self.surf);
+        }
+    }
+}
+
+impl Inner {
+    /// A runtime surface holding a copy of `texture`, stamped with the frame's order and time.
+    fn load_surface(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        frame_order: i64,
+        pts_ns: u64,
+    ) -> Result<EncodeSurface> {
+        // SAFETY: encode thread, live session. The surface `MFXMemory_GetSurfaceForEncode`
+        // returns is released exactly once, by the guard, on every path after it is built.
+        // `GetNativeHandle` returns a borrowed (non-AddRef'd) D3D11 texture the runtime keeps
+        // alive at least until that release, and the copy lands strictly before it; the
         // re-wrapped `ID3D11Texture2D::from_raw_borrowed` reference is never released by us.
-        // `EncodeFrameAsync` copies `ctrl` internally; the attached ext buffers live on in the
-        // `Pending` entry until the sync point completes, per the API contract.
         unsafe {
             let mut surf: *mut vpl::mfxFrameSurface1 = ptr::null_mut();
             vpl_ok(
-                vpl::MFXMemory_GetSurfaceForEncode(inner.session.0, &mut surf),
+                vpl::MFXMemory_GetSurfaceForEncode(self.session.0, &mut surf),
                 "MFXMemory_GetSurfaceForEncode",
             )?;
             if surf.is_null() {
@@ -1143,161 +1267,94 @@ impl QsvEncoder {
                 .then(|| (*iface).Release)
                 .flatten()
                 .ok_or_else(|| anyhow!("QSV surface has no FrameInterface.Release"))?;
-            // Every failure path below must release the surface.
-            let submit_result: Result<vpl::mfxSyncPoint> = (|| {
-                let get_native = (*iface)
-                    .GetNativeHandle
-                    .ok_or_else(|| anyhow!("QSV surface has no GetNativeHandle"))?;
-                let mut res: vpl::mfxHDL = ptr::null_mut();
-                let mut res_type: vpl::mfxResourceType = 0;
-                vpl_ok(
-                    get_native(surf, &mut res, &mut res_type),
-                    "FrameInterface.GetNativeHandle",
-                )?;
-                if res_type != vpl::MFX_RESOURCE_DX11_TEXTURE || res.is_null() {
-                    bail!("QSV surface native handle is not a D3D11 texture (type {res_type})");
-                }
-                let dst = ID3D11Texture2D::from_raw_borrowed(&res)
-                    .ok_or_else(|| anyhow!("QSV native handle is not ID3D11Texture2D"))?;
-                if !inner.array_warned {
-                    let mut desc = D3D11_TEXTURE2D_DESC::default();
-                    dst.GetDesc(&mut desc);
-                    if desc.ArraySize > 1 {
-                        inner.array_warned = true;
-                        tracing::warn!(
-                            array_size = desc.ArraySize,
-                            "QSV runtime handed out an ARRAY texture — subresource-0 copy may \
-                             target the wrong slice (needs the on-glass check, design §3.4)"
-                        );
-                    }
-                }
-                let src: ID3D11Resource = frame.texture.cast().context("texture -> resource")?;
-                let dst_res: ID3D11Resource = dst.cast().context("qsv texture -> resource")?;
-                inner
-                    .dctx
-                    .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src, 0, None);
-                // mfxExtRefListCtrl keys on FrameOrder; `submit_indexed` keeps that = wire index.
-                (*surf).Data.FrameOrder = cur_idx as u32;
-                (*surf).Data.TimeStamp = captured.pts_ns.wrapping_mul(9) / 100_000; // 90 kHz
-                let mut ctrl: Option<Box<FrameCtrl>> = None;
-                if forced || mark_slot.is_some() || force_ltr.is_some() {
-                    let mut c = FrameCtrl::new();
-                    if forced {
-                        c.ctrl.FrameType = (vpl::MFX_FRAMETYPE_IDR
-                            | vpl::MFX_FRAMETYPE_I
-                            | vpl::MFX_FRAMETYPE_REF)
-                            as u16;
-                    }
-                    let mut use_reflist = false;
-                    if let Some(slot) = mark_slot {
-                        c.reflist.LongTermRefList[0].FrameOrder = cur_idx as u32;
-                        c.reflist.LongTermRefList[0].PicStruct =
-                            vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
-                        c.reflist.LongTermRefList[0].LongTermIdx = slot as u16;
-                        c.reflist.ApplyLongTermIdx = 1;
-                        use_reflist = true;
-                    }
-                    if let Some((slot, ltr_frame)) = force_ltr {
-                        // LongTermIdx stays 0 in PreferredRefList (AV1 rejects nonzero;
-                        // AVC/HEVC key on FrameOrder).
-                        c.reflist.PreferredRefList[0].FrameOrder = ltr_frame as u32;
-                        c.reflist.PreferredRefList[0].PicStruct =
-                            vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
-                        // PreferredRefList is a reorder hint; the encoder may still
-                        // predict from tainted short-term refs. Reject the other DPB
-                        // candidates and cap L0 at 1. AVC/HEVC only — AV1 rejection
-                        // is unvalidated; an unhonored hint still IDR-escalates.
-                        if reject_ok {
-                            let mut rej = 0;
-                            let mut reject = |idx: i64| {
-                                if idx >= 0 && idx != ltr_frame {
-                                    c.reflist.RejectedRefList[rej].FrameOrder = idx as u32;
-                                    c.reflist.RejectedRefList[rej].PicStruct =
-                                        vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
-                                    rej += 1;
-                                }
-                            };
-                            reject(cur_idx - 1);
-                            reject(cur_idx - 2);
-                            for (s, marked) in ltr_slots.iter().enumerate() {
-                                if s != slot {
-                                    if let Some(idx) = *marked {
-                                        reject(idx);
-                                    }
-                                }
-                            }
-                            c.reflist.NumRefIdxL0Active = 1;
-                        }
-                        use_reflist = true;
-                        tracing::info!(
-                            slot,
-                            ltr_frame,
-                            frame = cur_idx,
-                            "QSV LTR-RFI: re-referencing known-good LTR (clean recovery, \
-                             no IDR)"
-                        );
-                    }
-                    if use_reflist {
-                        c.attach_reflist();
-                    }
-                    ctrl = Some(c);
-                }
-                let mut bs = inner.take_bs();
-                let mut syncp: vpl::mfxSyncPoint = ptr::null_mut();
-                let ctrl_ptr = ctrl
-                    .as_mut()
-                    .map(|c| &mut c.ctrl as *mut vpl::mfxEncodeCtrl)
-                    .unwrap_or(ptr::null_mut());
-                let deadline = std::time::Instant::now() + BUSY_BUDGET;
-                let sts = loop {
-                    let sts = vpl::MFXVideoENCODE_EncodeFrameAsync(
-                        inner.session.0,
-                        ctrl_ptr,
-                        surf,
-                        &mut bs.mfx,
-                        &mut syncp,
+            let surf = EncodeSurface { surf, release };
+            let get_native = (*iface)
+                .GetNativeHandle
+                .ok_or_else(|| anyhow!("QSV surface has no GetNativeHandle"))?;
+            let mut res: vpl::mfxHDL = ptr::null_mut();
+            let mut res_type: vpl::mfxResourceType = 0;
+            vpl_ok(
+                get_native(surf.surf, &mut res, &mut res_type),
+                "FrameInterface.GetNativeHandle",
+            )?;
+            if res_type != vpl::MFX_RESOURCE_DX11_TEXTURE || res.is_null() {
+                bail!("QSV surface native handle is not a D3D11 texture (type {res_type})");
+            }
+            let dst = ID3D11Texture2D::from_raw_borrowed(&res)
+                .ok_or_else(|| anyhow!("QSV native handle is not ID3D11Texture2D"))?;
+            if !self.array_warned {
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                dst.GetDesc(&mut desc);
+                if desc.ArraySize > 1 {
+                    self.array_warned = true;
+                    tracing::warn!(
+                        array_size = desc.ArraySize,
+                        "QSV runtime handed out an ARRAY texture — subresource-0 copy may \
+                         target the wrong slice (needs the on-glass check, design §3.4)"
                     );
-                    if sts != vpl::MFX_WRN_DEVICE_BUSY {
-                        break sts;
-                    }
-                    // The sync thread is what frees the runtime; this only re-offers the frame.
-                    if std::time::Instant::now() >= deadline {
-                        break sts;
-                    }
-                    std::thread::sleep(std::time::Duration::from_micros(250));
-                };
-                match sts {
-                    s if s == vpl::MFX_WRN_DEVICE_BUSY => {
-                        bail!("QSV EncodeFrameAsync stayed DEVICE_BUSY past the drain budget");
-                    }
-                    // GopRefDist=1 owes one AU per submit; MORE_DATA would desync the FIFO.
-                    vpl::MFX_ERR_MORE_DATA => {
-                        bail!("QSV EncodeFrameAsync returned MORE_DATA with GopRefDist=1");
-                    }
-                    s if s < vpl::MFX_ERR_NONE => {
-                        bail!("QSV EncodeFrameAsync failed: {} ({s})", sts_name(s));
-                    }
-                    _ => {}
                 }
-                if syncp.is_null() {
-                    bail!("QSV EncodeFrameAsync returned no sync point");
-                }
-                inner.retrieve.q.lock().pending.push_back(Pending {
-                    syncp,
-                    bs,
-                    pts_ns: captured.pts_ns,
-                    forced,
-                    recovery_anchor,
-                    _ctrl: ctrl,
-                });
-                inner.frames_submitted += 1;
-                Ok(syncp)
-            })();
-            // Runtime holds its own ref for the in-flight encode; ours drops now.
-            let _ = release(surf);
-            submit_result?;
+            }
+            let src: ID3D11Resource = texture.cast().context("texture -> resource")?;
+            let dst_res: ID3D11Resource = dst.cast().context("qsv texture -> resource")?;
+            self.dctx
+                .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src, 0, None);
+            // mfxExtRefListCtrl keys on FrameOrder; `submit_indexed` keeps that = wire index.
+            (*surf.surf).Data.FrameOrder = frame_order as u32;
+            (*surf.surf).Data.TimeStamp = pts_ns.wrapping_mul(9) / 100_000; // 90 kHz
+            Ok(surf)
         }
-        Ok(())
+    }
+
+    /// Hand `surf` to the runtime, re-offering it while the device stays busy within
+    /// [`BUSY_BUDGET`]. Returns the sync point the retrieve thread waits on.
+    fn encode_async(
+        &self,
+        surf: &EncodeSurface,
+        ctrl: Option<&mut FrameCtrl>,
+        bs: &mut BsBuf,
+    ) -> Result<vpl::mfxSyncPoint> {
+        let ctrl_ptr = ctrl.map_or(ptr::null_mut(), |c| &mut c.ctrl as *mut vpl::mfxEncodeCtrl);
+        let mut syncp: vpl::mfxSyncPoint = ptr::null_mut();
+        let deadline = std::time::Instant::now() + BUSY_BUDGET;
+        let sts = loop {
+            // SAFETY: encode thread, live session. `EncodeFrameAsync` copies `ctrl`; its ext
+            // buffers and `bs` live on in the `Pending` entry until the sync point completes,
+            // and `surf` stays referenced until its guard drops.
+            let sts = unsafe {
+                vpl::MFXVideoENCODE_EncodeFrameAsync(
+                    self.session.0,
+                    ctrl_ptr,
+                    surf.surf,
+                    &mut bs.mfx,
+                    &mut syncp,
+                )
+            };
+            if sts != vpl::MFX_WRN_DEVICE_BUSY {
+                break sts;
+            }
+            // The sync thread is what frees the runtime; this only re-offers the frame.
+            if std::time::Instant::now() >= deadline {
+                break sts;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(250));
+        };
+        match sts {
+            s if s == vpl::MFX_WRN_DEVICE_BUSY => {
+                bail!("QSV EncodeFrameAsync stayed DEVICE_BUSY past the drain budget");
+            }
+            // GopRefDist=1 owes one AU per submit; MORE_DATA would desync the FIFO.
+            vpl::MFX_ERR_MORE_DATA => {
+                bail!("QSV EncodeFrameAsync returned MORE_DATA with GopRefDist=1");
+            }
+            s if s < vpl::MFX_ERR_NONE => {
+                bail!("QSV EncodeFrameAsync failed: {} ({s})", sts_name(s));
+            }
+            _ => {}
+        }
+        if syncp.is_null() {
+            bail!("QSV EncodeFrameAsync returned no sync point");
+        }
+        Ok(syncp)
     }
 }
 
@@ -1727,6 +1784,112 @@ mod tests {
                 assert!(can, "10-bit implies base codec support");
             }
         }
+    }
+
+    /// LTR on, no session: the LTR decision is pure over the mirror.
+    fn ltr_encoder() -> QsvEncoder {
+        let mut enc = QsvEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            640,
+            480,
+            30,
+            2_000_000,
+            8,
+            ChromaFormat::Yuv420,
+            None,
+        )
+        .expect("open");
+        enc.ltr_active = true;
+        enc.ltr_mark_interval = 8;
+        enc.ltr_test_force_at = None;
+        enc
+    }
+
+    /// An IDR empties the mirror, drops a queued force and marks slot 0.
+    #[test]
+    fn an_idr_resets_the_ltr_mirror_and_marks_slot_zero() {
+        let mut enc = ltr_encoder();
+        enc.ltr_slots = [Some(3), Some(5)];
+        enc.ltr_tainted = [true, false];
+        enc.next_ltr_slot = 1;
+        enc.pending_force = Some(1);
+        let step = enc.ltr_step(true, 9);
+        assert_eq!(
+            step,
+            LtrStep {
+                mark_slot: Some(0),
+                force: None
+            }
+        );
+        assert_eq!(enc.ltr_slots, [Some(9), None]);
+        assert_eq!(enc.ltr_tainted, [false, false]);
+        assert_eq!(enc.next_ltr_slot, 1);
+        assert_eq!(enc.pending_force, None);
+    }
+
+    /// A queued force on a clean slot re-references it and takes the frame's mark. On a tainted
+    /// slot it ships a plain P.
+    #[test]
+    fn a_queued_force_needs_a_clean_slot() {
+        let mut enc = ltr_encoder();
+        enc.ltr_slots = [Some(0), Some(8)];
+        enc.pending_force = Some(0);
+        assert_eq!(
+            enc.ltr_step(false, 16),
+            LtrStep {
+                mark_slot: None,
+                force: Some((0, 0))
+            }
+        );
+        assert_eq!(enc.pending_force, None, "a force is consumed");
+        enc.ltr_tainted = [true, false];
+        enc.pending_force = Some(0);
+        assert_eq!(enc.ltr_step(false, 17), LtrStep::default());
+        assert_eq!(enc.pending_force, None);
+    }
+
+    /// Marks land on the interval, first on a slot holding no trusted picture.
+    #[test]
+    fn a_mark_prefers_a_slot_without_a_trusted_picture() {
+        let mut enc = ltr_encoder();
+        enc.ltr_slots = [Some(0), Some(8)];
+        enc.ltr_tainted = [false, true];
+        assert_eq!(
+            enc.ltr_step(false, 15),
+            LtrStep::default(),
+            "off the interval"
+        );
+        assert_eq!(enc.ltr_step(false, 16).mark_slot, Some(1));
+        assert_eq!(enc.ltr_slots, [Some(0), Some(16)]);
+        assert!(!enc.ltr_tainted[1], "a re-mark clears the taint");
+        assert_eq!(enc.next_ltr_slot, 0);
+    }
+
+    /// A force rejects the two previous frames and every other mark and caps L0 at one; AV1
+    /// rejects nothing. A plain P carries no control.
+    #[test]
+    fn a_forced_ltr_rejects_every_other_reference() {
+        let ltr = LtrStep {
+            mark_slot: None,
+            force: Some((0, 4)),
+        };
+        let slots = [Some(4), Some(8)];
+        let c = frame_ctrl(false, ltr, 20, &slots, true).expect("ctrl");
+        let rejected: Vec<u32> = c.reflist.RejectedRefList[..3]
+            .iter()
+            .map(|e| e.FrameOrder)
+            .collect();
+        assert_eq!(rejected, [19, 18, 8]);
+        assert_eq!(c.reflist.PreferredRefList[0].FrameOrder, 4);
+        assert_eq!(c.reflist.NumRefIdxL0Active, 1);
+        assert_eq!(c.ctrl.NumExtParam, 1);
+        let av1 = frame_ctrl(false, ltr, 20, &slots, false).expect("ctrl");
+        assert_eq!(
+            av1.reflist.RejectedRefList[0].FrameOrder,
+            vpl::MFX_FRAMEORDER_UNKNOWN as u32
+        );
+        assert!(frame_ctrl(false, LtrStep::default(), 20, &slots, true).is_none());
     }
 
     fn init_tracing() {
