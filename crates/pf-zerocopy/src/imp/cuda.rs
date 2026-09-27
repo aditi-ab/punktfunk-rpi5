@@ -684,10 +684,15 @@ impl DeviceBuffer {
         self.uv.is_some()
     }
 
+    // unsafe-fn-no-op-ok: every copy helper trusts `ptr`/`pitch`/`uv` as a live mapping.
     /// Wrap planes owned by another process ([`ipc_open`]). `release` runs once on drop; nothing
     /// is freed or pooled here (the IPC cache closes the mapping after the last remote buffer).
     /// `yuv444` marks stacked 3-plane YUV444 — the wire carries no format (`ImportKind::Tiled444`).
-    pub fn remote(
+    ///
+    /// # Safety
+    /// `ptr` (and `uv`'s pointer, when set) must address a live device mapping with the layout
+    /// `pitch`/`width`/`height`/`yuv444` describe, and stay mapped until `release` runs.
+    pub unsafe fn remote(
         ptr: CUdeviceptr,
         pitch: usize,
         width: u32,
@@ -1220,7 +1225,11 @@ impl Drop for ExternalSemaphore {
 
 /// Copy a pitched span at `src_ptr` (e.g. an [`ExternalDmabuf`] mapping) into `dst`. Context
 /// must be current.
-pub fn copy_pitched_to_buffer(
+///
+/// # Safety
+/// `src_ptr` must address live device memory holding `dst.height` rows of `src_pitch` bytes
+/// (the last row needs only `dst.width * 4`).
+pub unsafe fn copy_pitched_to_buffer(
     src_ptr: CUdeviceptr,
     src_pitch: usize,
     dst: &DeviceBuffer,
@@ -1236,16 +1245,19 @@ pub fn copy_pitched_to_buffer(
         Height: dst.height as usize,
         ..Default::default()
     };
-    // SAFETY: caller: context current. `copy` outlives the synchronous call; `src` is the caller's
-    // mapped span, `dst` is live; `width*4`×`height` fit both. Sync completes before the dmabuf is
-    // requeued.
+    // SAFETY: the source span is live and large enough (this fn's contract); `dst` is a live
+    // buffer of `width*4`×`height`. `copy` outlives the synchronous call, which completes before
+    // the dmabuf is requeued.
     unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(ext->dev)") }
 }
 
 /// De-stride an NV12 pair from an external mapping into a pooled two-plane [`DeviceBuffer`]: Y
 /// (`width` × `height`) and interleaved UV (`width` × ⌈h/2⌉), each from `src_pitch` to the pool
 /// pitch. Context must be current.
-pub fn copy_pitched_nv12_to_buffer(
+///
+/// # Safety
+/// `y_src` and `uv_src` must address live device memory holding those rows at `src_pitch`.
+pub unsafe fn copy_pitched_nv12_to_buffer(
     y_src: CUdeviceptr,
     uv_src: CUdeviceptr,
     src_pitch: usize,
@@ -1277,8 +1289,8 @@ pub fn copy_pitched_nv12_to_buffer(
         Height: dst.height.div_ceil(2) as usize,
         ..Default::default()
     };
-    // SAFETY: caller: context current. Both copies are live locals over the caller's mapping and
-    // `dst`'s pooled planes; each `copy_blocking` syncs before return.
+    // SAFETY: both sources are live and large enough (this fn's contract); `dst`'s planes are
+    // its live pooled allocations. Each `copy_blocking` syncs before return.
     unsafe {
         copy_blocking(&y, "cuMemcpy2DAsync_v2(ext->dev nv12 Y)")?;
         copy_blocking(&uv, "cuMemcpy2DAsync_v2(ext->dev nv12 UV)")

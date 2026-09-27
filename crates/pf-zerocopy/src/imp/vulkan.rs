@@ -659,7 +659,8 @@ impl VkBridge {
             .context("NV12 destination layout exceeds addressable buffer or shader offsets")?;
         // SAFETY: `fd` is the caller's live dmabuf (`import_src` dups it). This frame's source
         // span is checked below. `nv12_layout` proved dest sizes and shader offsets;
-        // `ensure_dst(layout.size)` covers the write range. Descriptor binds live src/dst
+        // `ensure_dst(layout.size)` covers the shader writes and the CUDA de-stride reads
+        // (`copy_pitched_nv12_to_buffer`). Descriptor binds live src/dst
         // WHOLE_SIZE; `*Info` arrays are locals; `cmd`/`queue`/`fence` are this thread's.
         // Dispatch is ⌈w/32⌉×⌈h/16⌉ groups of 8×8, writing whole words inside that range.
         // `wait_for_fences` retires the compute pass (shader-write barrier recorded) before

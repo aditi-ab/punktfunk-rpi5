@@ -327,29 +327,27 @@ impl RemoteImporter {
                     entry.m
                 };
                 let shared = self.shared.clone();
-                Ok(DeviceBuffer::remote(
-                    m.y,
-                    m.y_pitch,
-                    m.width,
-                    m.height,
-                    m.uv,
-                    // Wire has no plane format; layout is the ImportKind we asked for.
-                    kind == ImportKind::Tiled444,
-                    Box::new(move || {
-                        // Recycle is fire-and-forget (EPIPE if dead). This Arc keeps mapping
-                        // and socket alive until the last frame drops; a retired mapping
-                        // closes here with its last ref.
-                        let _ = ipc::send(shared.sock.as_fd(), &Request::Release { id }, None);
-                        let mut g = shared.mappings.lock().unwrap();
-                        if let Some(entry) = g.get_mut(&id) {
-                            entry.refs = entry.refs.saturating_sub(1);
-                            if entry.retired && entry.refs == 0 {
-                                let entry = g.remove(&id).expect("entry exists");
-                                close_mapping(&entry.m);
-                            }
+                let release = Box::new(move || {
+                    // Recycle is fire-and-forget (EPIPE if dead). This Arc keeps mapping
+                    // and socket alive until the last frame drops; a retired mapping
+                    // closes here with its last ref.
+                    let _ = ipc::send(shared.sock.as_fd(), &Request::Release { id }, None);
+                    let mut g = shared.mappings.lock().unwrap();
+                    if let Some(entry) = g.get_mut(&id) {
+                        entry.refs = entry.refs.saturating_sub(1);
+                        if entry.retired && entry.refs == 0 {
+                            let entry = g.remove(&id).expect("entry exists");
+                            close_mapping(&entry.m);
                         }
-                    }),
-                ))
+                    }
+                });
+                // Wire has no plane format; layout is the ImportKind we asked for.
+                let yuv444 = kind == ImportKind::Tiled444;
+                // SAFETY: `m` is the IPC mapping `open_mapping` opened for this id, with the
+                // worker's layout; the ref taken above keeps it open until `release` drops it.
+                Ok(unsafe {
+                    DeviceBuffer::remote(m.y, m.y_pitch, m.width, m.height, m.uv, yuv444, release)
+                })
             }
             Reply::Err { message } => bail!("zerocopy worker import failed: {message}"),
             other => {
