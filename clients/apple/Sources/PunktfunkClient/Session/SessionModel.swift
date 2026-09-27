@@ -116,7 +116,26 @@ final class SessionModel: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .idle
-    @Published private(set) var connection: PunktfunkConnection?
+    @Published private(set) var connection: PunktfunkConnection? {
+        didSet {
+            #if os(macOS)
+            Self.liveConnections[ObjectIdentifier(self)] = connection
+            #endif
+        }
+    }
+    #if os(macOS)
+    /// Every window's live connection: a Cmd+Q runs no window's teardown.
+    private static var liveConnections: [ObjectIdentifier: PunktfunkConnection] = [:]
+
+    /// App quit: end each live session as a deliberate quit, before the process goes.
+    static func quitAll() {
+        for conn in liveConnections.values {
+            conn.disconnectQuit()
+            conn.close()
+        }
+        liveConnections.removeAll()
+    }
+    #endif
     /// The launched title whose game is not up yet: its cover flies out of the shelf tile at the
     /// tap and holds the screen — through the dial, and then over the stream — until the host's
     /// `/status` says the game left `launching` (`punktfunk-host::gamelease`), or the player asks
