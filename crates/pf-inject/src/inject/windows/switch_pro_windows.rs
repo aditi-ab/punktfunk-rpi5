@@ -150,44 +150,17 @@ impl PadProto for SwitchWinProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> SwitchState {
-        SwitchState::neutral()
-    }
-
-    /// Button/stick/trigger frame. Keep prev motion — it arrives on the rich plane.
     fn merge_frame(
         &self,
         prev: &SwitchState,
         f: &punktfunk_core::input::GamepadFrame,
     ) -> SwitchState {
         let buttons = crate::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
-        let mut s = SwitchState::from_gamepad(
-            buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s
+        SwitchState::merge_frame(prev, f, buttons)
     }
 
-    /// IMU samples only; a Pro Controller has no touchpad.
     fn apply_rich(&self, st: &mut SwitchState, rich: RichInput) {
-        if let RichInput::Motion { gyro, accel, .. } = rich {
-            st.apply_motion(gyro, accel);
-        }
-    }
-
-    fn neutralize_gyro(&self, st: &mut SwitchState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut SwitchState) {
-        st.clear_rich();
+        st.apply_rich(rich);
     }
 
     fn write_state(&self, pad: &mut SwitchWinPad, st: &SwitchState) {

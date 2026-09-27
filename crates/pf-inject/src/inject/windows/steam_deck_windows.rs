@@ -156,49 +156,16 @@ impl PadProto for DeckWinProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> SteamState {
-        SteamState::neutral()
-    }
-
-    /// Keep trackpads, motion, and pad clicks from `prev` — they arrive on a
-    /// different plane and must survive a button-only frame.
     fn merge_frame(
         &self,
         prev: &SteamState,
         f: &punktfunk_core::input::GamepadFrame,
     ) -> SteamState {
-        use super::steam_proto::btn;
-        let mut s = SteamState::from_gamepad(
-            f.buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        s.rpad_x = prev.rpad_x;
-        s.rpad_y = prev.rpad_y;
-        s.lpad_x = prev.lpad_x;
-        s.lpad_y = prev.lpad_y;
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s.buttons |= prev.buttons & (btn::RPAD_TOUCH | btn::LPAD_TOUCH);
-        s.lpad_click = prev.lpad_click;
-        s.rpad_click = prev.rpad_click;
-        s
+        SteamState::merge_frame(prev, f)
     }
 
     fn apply_rich(&self, st: &mut SteamState, rich: RichInput) {
         st.apply_rich(rich);
-    }
-
-    fn neutralize_gyro(&self, st: &mut SteamState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut SteamState) {
-        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DeckWinPad, st: &SteamState) {

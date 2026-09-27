@@ -9,7 +9,7 @@
 //! firmware 64). A USB backend rejects a longer reply as a malicious URB and drops the device.
 //! Tests pin sizes, field offsets, paddle bits, and valid-flag gating.
 
-use punktfunk_core::input::gamepad as gs;
+use punktfunk_core::input::{gamepad as gs, GamepadFrame};
 use punktfunk_core::quic::{HidOutput, RichInput};
 
 // GET_REPORT during init (`0x05` calibration, `0x09` pairing, `0x20` firmware). Without these
@@ -135,14 +135,14 @@ impl DsState {
     }
 
     /// Zero gyro only (gravity on accel is persistent). Returns whether it changed —
-    /// `PadProto::neutralize_gyro` idle-motion watchdog.
+    /// `PadState::neutralize_gyro` idle-motion watchdog.
     pub fn neutralize_gyro(&mut self) -> bool {
         let changed = self.gyro != [0; 3];
         self.gyro = [0; 3];
         changed
     }
 
-    /// Reset touch, pad-click, and motion; leave buttons/sticks/triggers. `PadProto::clear_rich`:
+    /// Reset touch, pad-click, and motion; leave buttons/sticks/triggers. `PadState::clear_rich`:
     /// a pad that takes this slot during replug grace must not inherit the last one's contacts.
     pub fn clear_rich(&mut self) {
         let fresh = DsState::neutral();
@@ -235,6 +235,26 @@ impl DsState {
             s.buttons[2] |= btn2::MUTE;
         }
         s
+    }
+
+    /// Fold a button/stick frame over `prev`. Touch, motion and pad clicks arrive on the rich
+    /// plane and survive it. `buttons` is the frame's, after any paddle fold.
+    pub fn merge_frame(prev: &DsState, f: &GamepadFrame, buttons: u32) -> DsState {
+        DsState {
+            touch: prev.touch,
+            gyro: prev.gyro,
+            accel: prev.accel,
+            touch_click: prev.touch_click,
+            ..DsState::from_gamepad(
+                buttons,
+                f.ls_x,
+                f.ls_y,
+                f.rs_x,
+                f.rs_y,
+                f.left_trigger,
+                f.right_trigger,
+            )
+        }
     }
 
     pub fn set_dpad(&mut self, up: bool, down: bool, left: bool, right: bool) {

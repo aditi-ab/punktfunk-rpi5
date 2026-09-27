@@ -260,40 +260,14 @@ impl PadProto for DsLinuxProto {
         open_transport(idx)
     }
 
-    fn neutral(&self) -> DsState {
-        DsState::neutral()
-    }
-
-    /// Button/stick/trigger frame. Keep prev touch/motion/click — they arrive on the rich plane.
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
         let buttons = crate::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
-        let mut s = DsState::from_gamepad(
-            buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        s.touch = prev.touch;
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s.touch_click = prev.touch_click;
-        s
+        DsState::merge_frame(prev, f, buttons)
     }
 
     /// Steam dual pads split the one touchpad left/right; clicks ride `touch_click`.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
-    }
-
-    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut DsState) {
-        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DsTransport, st: &DsState) {
@@ -353,40 +327,16 @@ impl PadProto for DsEdgeLinuxProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> DsState {
-        DsState::neutral()
-    }
-
     /// Same merge as DualSense, but paddles land on `buttons[2]` (rebuilt every frame, no persistence).
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
-        let mut s = DsState::from_gamepad(
-            f.buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
+        let mut s = DsState::merge_frame(prev, f, f.buttons);
         s.buttons[2] |= edge_paddle_bits(f.buttons);
-        s.touch = prev.touch;
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s.touch_click = prev.touch_click;
         s
     }
 
     /// Steam dual pads split the one touchpad left/right; clicks ride `touch_click`.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
-    }
-
-    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut DsState) {
-        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DualSensePad, st: &DsState) {

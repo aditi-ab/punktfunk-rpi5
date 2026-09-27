@@ -13,7 +13,7 @@
 //! - `UHID_SET_REPORT` must be answered.
 #![allow(dead_code)]
 
-use punktfunk_core::input::gamepad as gs;
+use punktfunk_core::input::{gamepad as gs, GamepadFrame};
 use punktfunk_core::quic::RichInput;
 
 /// `hid-steam` matches VID/PID on `BUS_USB`; no usage-page probe.
@@ -165,7 +165,7 @@ impl SteamState {
     }
 
     /// Zero gyro only (gravity stays). `true` if anything changed —
-    /// `PadProto::neutralize_gyro`.
+    /// `PadState::neutralize_gyro`.
     pub fn neutralize_gyro(&mut self) -> bool {
         let changed = self.gyro != [0; 3];
         self.gyro = [0; 3];
@@ -173,7 +173,7 @@ impl SteamState {
     }
 
     /// Drop trackpad + motion. A pad that took this slot inside the replug
-    /// grace must not inherit the last finger or rotation (`PadProto::clear_rich`).
+    /// grace must not inherit the last finger or rotation (`PadState::clear_rich`).
     pub fn clear_rich(&mut self) {
         let fresh = SteamState::neutral();
         self.lpad_x = fresh.lpad_x;
@@ -235,6 +235,31 @@ impl SteamState {
         set(&mut b, on(gs::BTN_PADDLE4), btn::L5);
         set(&mut b, on(gs::BTN_MISC1), btn::QAM);
         s.buttons = b;
+        s
+    }
+
+    /// Fold a Deck button/stick frame over `prev`. Trackpads, motion and pad clicks arrive on
+    /// the rich plane and survive it. Clicks are their own fields, not `buttons`: the serializer
+    /// ORs them with the frame's `RPAD_CLICK`, so keeping them cannot strand wire BTN_TOUCHPAD.
+    pub fn merge_frame(prev: &SteamState, f: &GamepadFrame) -> SteamState {
+        let mut s = SteamState::from_gamepad(
+            f.buttons,
+            f.ls_x,
+            f.ls_y,
+            f.rs_x,
+            f.rs_y,
+            f.left_trigger,
+            f.right_trigger,
+        );
+        s.rpad_x = prev.rpad_x;
+        s.rpad_y = prev.rpad_y;
+        s.lpad_x = prev.lpad_x;
+        s.lpad_y = prev.lpad_y;
+        s.gyro = prev.gyro;
+        s.accel = prev.accel;
+        s.buttons |= prev.buttons & (btn::RPAD_TOUCH | btn::LPAD_TOUCH);
+        s.lpad_click = prev.lpad_click;
+        s.rpad_click = prev.rpad_click;
         s
     }
 

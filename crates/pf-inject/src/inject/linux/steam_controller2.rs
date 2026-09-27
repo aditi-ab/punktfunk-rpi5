@@ -288,10 +288,6 @@ impl PadProto for TritonProto {
         open_transport(idx, self.puck)
     }
 
-    fn neutral(&self) -> TritonState {
-        TritonState::neutral()
-    }
-
     /// Typed fallback. Once `raw_len > 0`, only refresh typed fields for diagnostics;
     /// `write_state` keeps mirroring the raw report.
     fn merge_frame(
@@ -299,37 +295,12 @@ impl PadProto for TritonProto {
         prev: &TritonState,
         f: &punktfunk_core::input::GamepadFrame,
     ) -> TritonState {
-        let mut s = TritonState::from_gamepad(
-            f.buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        // As-is is sticky: a typed frame between two raw reports must not flap back to synth
-        // (the client sends both planes so degrade paths stay alive).
-        s.raw = prev.raw;
-        s.raw_len = prev.raw_len;
-        s
+        TritonState::merge_frame(prev, f)
     }
 
     fn apply_rich(&self, st: &mut TritonState, rich: RichInput) {
-        if let RichInput::HidReport { len, data, .. } = rich {
-            let len = (len as usize).min(data.len()).min(st.raw.len());
-            if len == 0 {
-                return;
-            }
-            st.raw[..len].copy_from_slice(&data[..len]);
-            st.raw_len = len as u8;
-        }
-        // Touchpad/Motion/TouchpadEx: the raw feed already carries pads + IMU; synth has no surface.
+        st.apply_rich(rich);
     }
-
-    // `neutralize_gyro` / `clear_rich` stay the no-op defaults: this backend never sees
-    // `RichInput::Motion`, and motion lives inside an opaque passthrough report.
-    // A stopped raw feed is the client's own last report; re-emit it.
 
     fn write_state(&self, pad: &mut TritonTransport, st: &TritonState) {
         pad.write_state(st);

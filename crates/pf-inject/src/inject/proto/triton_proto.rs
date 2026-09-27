@@ -16,7 +16,8 @@
 //! gamepad plane → a minimal `0x42` state report. The first raw report switches to as-is
 //! permanently.
 
-use punktfunk_core::input::gamepad as gs;
+use punktfunk_core::input::{gamepad as gs, GamepadFrame};
+use punktfunk_core::quic::RichInput;
 
 /// Same as [`super::steam_proto::STEAM_VENDOR`]; repeated so this module stays self-contained.
 pub const TRITON_VENDOR: u32 = 0x28DE;
@@ -154,6 +155,37 @@ impl TritonState {
             ly,
             rx,
             ry,
+        }
+    }
+
+    /// Typed fallback over `prev`. As-is mode is sticky: a typed frame between two raw reports
+    /// must not flap the pad back to synth (the client sends both planes).
+    pub fn merge_frame(prev: &TritonState, f: &GamepadFrame) -> TritonState {
+        TritonState {
+            raw: prev.raw,
+            raw_len: prev.raw_len,
+            ..TritonState::from_gamepad(
+                f.buttons,
+                f.ls_x,
+                f.ls_y,
+                f.rs_x,
+                f.rs_y,
+                f.left_trigger,
+                f.right_trigger,
+            )
+        }
+    }
+
+    /// A raw report from the client's physical pad becomes the state. Touchpad and motion have
+    /// nothing to fold: the raw feed carries pads + IMU, and the synth fallback has no surface.
+    pub fn apply_rich(&mut self, rich: RichInput) {
+        if let RichInput::HidReport { len, data, .. } = rich {
+            let len = (len as usize).min(data.len()).min(self.raw.len());
+            if len == 0 {
+                return;
+            }
+            self.raw[..len].copy_from_slice(&data[..len]);
+            self.raw_len = len as u8;
         }
     }
 }

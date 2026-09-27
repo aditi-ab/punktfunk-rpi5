@@ -198,40 +198,14 @@ impl PadProto for Ds4LinuxProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> DsState {
-        DsState::neutral()
-    }
-
-    /// Keep prev touch/motion/click — they arrive on the rich plane, not this button frame.
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
         let buttons = crate::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
-        let mut s = DsState::from_gamepad(
-            buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        s.touch = prev.touch;
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s.touch_click = prev.touch_click;
-        s
+        DsState::merge_frame(prev, f, buttons)
     }
 
     /// Steam dual pads split the one touchpad left/right; clicks ride `touch_click`.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS4_TOUCH_W, DS4_TOUCH_H);
-    }
-
-    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut DsState) {
-        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DualShock4Pad, st: &DsState) {

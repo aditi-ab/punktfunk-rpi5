@@ -343,48 +343,16 @@ impl PadProto for SteamProto {
         open_transport(idx)
     }
 
-    fn neutral(&self) -> SteamState {
-        SteamState::neutral()
-    }
-
-    /// Keep prev trackpad + motion; those arrive on the rich plane.
     fn merge_frame(
         &self,
         prev: &SteamState,
         f: &punktfunk_core::input::GamepadFrame,
     ) -> SteamState {
-        let mut s = SteamState::from_gamepad(
-            f.buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        s.rpad_x = prev.rpad_x;
-        s.rpad_y = prev.rpad_y;
-        s.lpad_x = prev.lpad_x;
-        s.lpad_y = prev.lpad_y;
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s.buttons |= prev.buttons & (btn::RPAD_TOUCH | btn::LPAD_TOUCH);
-        // Click is its own field, not `buttons`. Serialize ORs `RPAD_CLICK`; preserving it cannot strand wire BTN_TOUCHPAD.
-        s.lpad_click = prev.lpad_click;
-        s.rpad_click = prev.rpad_click;
-        s
+        SteamState::merge_frame(prev, f)
     }
 
     fn apply_rich(&self, st: &mut SteamState, rich: RichInput) {
         st.apply_rich(rich);
-    }
-
-    fn neutralize_gyro(&self, st: &mut SteamState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut SteamState) {
-        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DeckTransport, st: &SteamState) {
@@ -449,10 +417,6 @@ impl PadProto for ScProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> SteamState {
-        SteamState::neutral()
-    }
-
     /// PADDLE1/2 map natively in [`sc_from_gamepad`]. Mask them out of the fold so 3/4 cannot
     /// double-fire the same grips.
     fn merge_frame(
@@ -493,14 +457,6 @@ impl PadProto for ScProto {
 
     fn apply_rich(&self, st: &mut SteamState, rich: RichInput) {
         st.apply_rich(rich);
-    }
-
-    fn neutralize_gyro(&self, st: &mut SteamState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut SteamState) {
-        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut SteamDeckPad, st: &SteamState) {

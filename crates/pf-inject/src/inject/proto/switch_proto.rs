@@ -7,7 +7,8 @@
 //! via the factory-calibration identity. Evidence: this module's tests and hid-nintendo.c.
 
 use pf_driver_proto::switch::{self as wire, STICK_CENTER, STICK_RANGE};
-use punktfunk_core::input::gamepad as gs;
+use punktfunk_core::input::{gamepad as gs, GamepadFrame};
+use punktfunk_core::quic::RichInput;
 
 pub const SWITCH_VENDOR: u32 = 0x057E; // Nintendo Co., Ltd
 pub const SWITCH_PRODUCT: u32 = 0x2009; // Pro Controller
@@ -144,14 +145,39 @@ impl SwitchState {
         }
     }
 
-    /// Zero gyro only. Gravity stays. True iff the sample changed (`PadProto::neutralize_gyro`).
+    /// Fold a button/stick frame over `prev`, keeping its motion from the rich plane.
+    /// `buttons` is the frame's after the paddle fold.
+    pub fn merge_frame(prev: &SwitchState, f: &GamepadFrame, buttons: u32) -> SwitchState {
+        SwitchState {
+            gyro: prev.gyro,
+            accel: prev.accel,
+            ..SwitchState::from_gamepad(
+                buttons,
+                f.ls_x,
+                f.ls_y,
+                f.rs_x,
+                f.rs_y,
+                f.left_trigger,
+                f.right_trigger,
+            )
+        }
+    }
+
+    /// IMU samples only; a Pro Controller has no touchpad.
+    pub fn apply_rich(&mut self, rich: RichInput) {
+        if let RichInput::Motion { gyro, accel, .. } = rich {
+            self.apply_motion(gyro, accel);
+        }
+    }
+
+    /// Zero gyro only. Gravity stays. True iff the sample changed (`PadState::neutralize_gyro`).
     pub fn neutralize_gyro(&mut self) -> bool {
         let changed = self.gyro != [0; 3];
         self.gyro = [0; 3];
         changed
     }
 
-    /// Motion only — this pad has no touchpad (`PadProto::clear_rich`).
+    /// Motion only — this pad has no touchpad (`PadState::clear_rich`).
     pub fn clear_rich(&mut self) {
         let fresh = SwitchState::neutral();
         self.gyro = fresh.gyro;

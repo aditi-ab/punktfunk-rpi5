@@ -337,10 +337,6 @@ impl PadProto for XboxWinProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> XboxState {
-        XboxState::default()
-    }
-
     /// Frame fully replaces state — no rich-plane fields to preserve.
     fn merge_frame(&self, _prev: &XboxState, f: &punktfunk_core::input::GamepadFrame) -> XboxState {
         XboxState::from_gamepad(
@@ -356,13 +352,6 @@ impl PadProto for XboxWinProto {
 
     /// No rich plane on an Xbox pad.
     fn apply_rich(&self, _st: &mut XboxState, _rich: RichInput) {}
-
-    /// No motion plane, so never stale gyro.
-    fn neutralize_gyro(&self, _st: &mut XboxState) -> bool {
-        false
-    }
-
-    fn clear_rich(&self, _st: &mut XboxState) {}
 
     fn write_state(&self, pad: &mut XboxWinPad, st: &XboxState) {
         pad.write_state(st);
