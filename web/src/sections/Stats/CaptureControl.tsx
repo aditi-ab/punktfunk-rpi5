@@ -15,9 +15,10 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { apiErrorMessage } from "@/lib/errors";
+import { fmtClockDuration } from "@/lib/format";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
-import { fmtDuration, kindLabel, Stat } from "./helpers";
+import { kindLabel, Stat } from "./helpers";
 
 /**
  * Container: arm/disarm the capture. Owns the polled status query plus start/stop; stopping also
@@ -101,7 +102,10 @@ export const CaptureControlCard: FC<{
 					</p>
 					{armed && s && (
 						<dl className="flex flex-wrap gap-x-8 gap-y-2 text-sm tabular-nums">
-							<Stat label={m.stats_elapsed()} value={fmtDuration(elapsed)} />
+							<Stat
+								label={m.stats_elapsed()}
+								value={fmtClockDuration(elapsed / 1000)}
+							/>
 							<Stat label={m.stats_samples()} value={String(s.sample_count)} />
 							{s.kind && (
 								<Stat label={m.stats_kind()} value={kindLabel(s.kind)} />

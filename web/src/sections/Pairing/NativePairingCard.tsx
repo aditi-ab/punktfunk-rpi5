@@ -18,6 +18,7 @@ import {
 import { QueryState } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { fmtClockDuration } from "@/lib/format";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 import {
@@ -36,12 +37,6 @@ import {
 export interface BoundDevice {
 	fingerprint: string;
 	name: string;
-}
-
-/** Seconds → `m:ss`. */
-function fmtTime(secs: number): string {
-	const s = Math.max(0, Math.floor(secs));
-	return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
 }
 
 /**
@@ -225,7 +220,8 @@ export const NativePairingCard: FC<{
 							{d.expires_in_secs != null && (
 								<p className="flex items-center justify-center gap-1.5 text-sm text-muted-foreground">
 									<Timer className="size-4" />
-									{m.pairing_native_expires()} {fmtTime(d.expires_in_secs)}
+									{m.pairing_native_expires()}{" "}
+									{fmtClockDuration(d.expires_in_secs)}
 								</p>
 							)}
 							<Button
