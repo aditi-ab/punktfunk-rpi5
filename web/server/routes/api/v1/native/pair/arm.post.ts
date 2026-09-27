@@ -7,32 +7,22 @@
 // and nowhere else — the polled status has it stripped (../pair.get.ts), so reading it needs the
 // password too.
 import { defineEventHandler, readBody } from "h3";
+import type { ArmNativePairing } from "../../../../../../src/api/gen/model";
 import { confirmPassword } from "../../../../../util/confirm";
-import { forwardJson } from "../../../../../util/forward";
-
-interface ArmBody {
-	ttl_secs?: number;
-	fingerprint?: string;
-	grants?: number;
-	expires_in_secs?: number;
-	until_disconnect?: boolean;
-	password?: string;
-}
+import { type AllFields, forwardJson } from "../../../../../util/forward";
 
 export default defineEventHandler(async (event) => {
-	const body = await readBody<ArmBody>(event);
+	const body = await readBody<ArmNativePairing & { password?: string }>(event);
 	await confirmPassword(event, body?.password);
 	// Rebuild from the contract's own fields so the password cannot leak upstream, and so an
 	// unexpected extra field can't ride along to the host. Absent stays absent: the console omits
 	// `grants`/`expires_in_secs` to mean "keep what a re-pairing device already has".
-	const { ttl_secs, fingerprint, grants, expires_in_secs, until_disconnect } =
-		body ?? {};
-	const upstream: Omit<ArmBody, "password"> = {};
-	if (ttl_secs !== undefined) upstream.ttl_secs = ttl_secs;
-	if (fingerprint) upstream.fingerprint = fingerprint;
-	if (grants !== undefined) upstream.grants = grants;
-	if (expires_in_secs !== undefined) upstream.expires_in_secs = expires_in_secs;
-	if (until_disconnect !== undefined)
-		upstream.until_disconnect = until_disconnect;
+	const upstream = {
+		ttl_secs: body?.ttl_secs,
+		fingerprint: body?.fingerprint || undefined,
+		grants: body?.grants,
+		expires_in_secs: body?.expires_in_secs,
+		until_disconnect: body?.until_disconnect,
+	} satisfies AllFields<ArmNativePairing>;
 	return forwardJson(event, "/api/v1/native/pair/arm", "POST", upstream);
 });

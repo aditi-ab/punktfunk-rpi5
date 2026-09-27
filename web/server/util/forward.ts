@@ -11,6 +11,13 @@ import {
 } from "h3";
 import { loopbackTls, mgmtToken, mgmtUrl } from "./auth";
 
+/**
+ * Every field of a host request model, each present and possibly `undefined`. A password route
+ * rebuilds its upstream body as `{…} satisfies AllFields<Model>`, so `tsc` fails when the host
+ * grows a field the rebuild would strip. `JSON.stringify` drops the `undefined` ones.
+ */
+export type AllFields<T> = { [K in keyof Required<T>]: T[K] | undefined };
+
 /** Forward a JSON body to `path` on the management API and relay the upstream response verbatim.
  * Omit `body` for a bodiless method (GET) — a read whose RESPONSE we rewrite. */
 export async function forwardJson(
