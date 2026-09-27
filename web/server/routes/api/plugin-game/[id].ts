@@ -6,16 +6,10 @@ import {
 	defineEventHandler,
 	getQuery,
 	getRouterParam,
-	readRawBody,
 	setResponseStatus,
 } from "h3";
-import { putAndGrant } from "../../../util/handedPaths";
-import {
-	callPlugin,
-	PLUGIN_ID_RE,
-	pluginJson,
-	validEntryId,
-} from "../../../util/pluginProxy";
+import { PLUGIN_ID_RE, validEntryId } from "../../../util/pluginProxy";
+import { pluginSurface } from "../../../util/pluginSurface";
 
 export default defineEventHandler(async (event) => {
 	const id = getRouterParam(event, "id");
@@ -24,31 +18,18 @@ export default defineEventHandler(async (event) => {
 		setResponseStatus(event, 400);
 		return { error: "not a valid plugin or library id" };
 	}
-	const method = event.method;
-	if (method !== "GET" && method !== "PUT") {
-		setResponseStatus(event, 405);
-		return { error: "method not allowed" };
-	}
-	const path = `/__game?entry=${encodeURIComponent(entry)}`;
-	const body =
-		method === "PUT"
-			? ((await readRawBody(event, false)) as Uint8Array | undefined)
-			: undefined;
-	const { res, access } =
-		method === "PUT"
-			? await putAndGrant(id, path, body, `game:${entry}`)
-			: { res: await callPlugin(id, path, "GET"), access: undefined };
-	if (!res) {
-		setResponseStatus(event, 502);
-		return { error: `plugin ${id} is not reachable` };
-	}
-	// The plugin has nothing for this entry: the page shows no tab. Marked, so the host API's own
-	// 404 (under `bun run dev`, where these routes do not run) never reads as this.
-	if (res.status === 404) {
-		setResponseStatus(event, 404);
-		return { error: "plugin has no section for this entry", noSection: true };
-	}
-	setResponseStatus(event, res.status);
-	const json = await pluginJson(res, id);
-	return access ? { ...(json as object), access } : json;
+	// A 404 is the plugin having nothing for this entry: the page shows no tab.
+	return pluginSurface(
+		event,
+		id,
+		`/__game?entry=${encodeURIComponent(entry)}`,
+		{
+			methods: ["GET", "PUT"],
+			grantForm: `game:${entry}`,
+			notFound: {
+				error: "plugin has no section for this entry",
+				noSection: true,
+			},
+		},
+	);
 });
