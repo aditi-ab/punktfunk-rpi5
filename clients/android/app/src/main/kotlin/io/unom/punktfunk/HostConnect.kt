@@ -8,6 +8,10 @@ import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.security.ClientIdentity
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -118,7 +122,9 @@ private suspend fun dial(
     // connection's real datagram size in hand, not one to pre-empt from here with an MTU this side
     // never measured.
     val (audioRateHz, audioBits) = settings.audioFormatWire()
-    return withContext(Dispatchers.IO) {
+    // NonCancellable: a cancelled withContext drops its result, and the dial cannot be
+    // interrupted — the session would open with nobody to close it.
+    val handle = withContext(Dispatchers.IO + NonCancellable) {
         // Transport-level half of "Low-latency mode (experimental)" (DSCP marking on the media
         // sockets) — must be applied before connect, since sockets are tagged at creation.
         NativeBridge.nativeSetLowLatencyMode(settings.lowLatencyMode)
@@ -181,4 +187,9 @@ private suspend fun dial(
         )
         NativeBridge.nativeConnect(request.toJson())
     }
+    if (handle != 0L && !currentCoroutineContext().isActive) {
+        withContext(Dispatchers.IO + NonCancellable) { NativeBridge.nativeClose(handle) }
+    }
+    currentCoroutineContext().ensureActive()
+    return handle
 }
