@@ -384,20 +384,7 @@ pub fn pen_supported() -> bool {
     if pf_host_config::knob("PUNKTFUNK_PEN").as_deref() == Some("0") {
         return false;
     }
-    // SAFETY: 'static NUL-terminated path literal; `open` returns a fresh fd (or -1) and
-    // retains nothing.
-    let fd = unsafe {
-        libc::open(
-            c"/dev/uinput".as_ptr(),
-            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return false;
-    }
-    // SAFETY: `fd >= 0` is the fd opened above, owned by no one else; closed exactly once here.
-    unsafe { libc::close(fd) };
-    true
+    uapi::open_nonblock("/dev/uinput").is_ok()
 }
 
 /// Synthetic PT_PEN/PT_TOUCH on Win10 1809+. Probe creates then destroys a PT_PEN device.
@@ -439,29 +426,16 @@ pub enum UinputVerdict {
 /// Nodes every virtual input device needs, in report order: `/dev/uinput` kills pen and
 /// evdev pads; `/dev/uhid` kills DualSense/Switch Pro HID.
 #[cfg(target_os = "linux")]
-const INPUT_NODES: &[(&std::ffi::CStr, &str)] =
-    &[(c"/dev/uinput", "/dev/uinput"), (c"/dev/uhid", "/dev/uhid")];
+const INPUT_NODES: &[&str] = &["/dev/uinput", "/dev/uhid"];
 
 /// Probe `/dev/uinput` and `/dev/uhid` as the backends will, keeping the errno. Two
 /// `open()`s; diagnostics can re-run on demand.
 #[cfg(target_os = "linux")]
 pub fn uinput_probe() -> UinputVerdict {
-    for &(c_path, path) in INPUT_NODES {
-        // SAFETY: 'static NUL-terminated path literal; `open` returns a fresh fd (or -1) and
-        // retains nothing.
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if fd >= 0 {
-            // SAFETY: `fd >= 0` is the fd opened above, owned by no one else; closed exactly once.
-            unsafe { libc::close(fd) };
+    for &path in INPUT_NODES {
+        let Err(err) = uapi::open_nonblock(path) else {
             continue;
-        }
-        // Read errno immediately: any further libc call (including the close above) clobbers it.
-        let err = std::io::Error::last_os_error();
+        };
         return match err.raw_os_error() {
             Some(libc::EACCES) | Some(libc::EPERM) => UinputVerdict::PermissionDenied { path },
             Some(libc::ENOENT) | Some(libc::ENXIO) | Some(libc::ENODEV) => {
@@ -860,6 +834,11 @@ pub mod triton_usbip;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/triton_windows.rs"]
 pub mod triton_windows;
+/// Device-node `open`, typed `ioctl`, and the uinput structs shared by [`gamepad`], [`pen`],
+/// and [`steam_gadget`].
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/uapi.rs"]
+mod uapi;
 /// `/dev/uhid` event ABI shared by every UHID gamepad backend — constants each used to
 /// transcribe, plus field accessors that read a payload's real length.
 #[cfg(target_os = "linux")]
