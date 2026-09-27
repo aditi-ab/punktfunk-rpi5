@@ -9,6 +9,61 @@
 use anyhow::Context;
 use anyhow::Result;
 
+/// The value after `name` in `args`, e.g. `--seconds 30`.
+#[cfg(target_os = "linux")]
+fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .skip_while(|a| *a != name)
+        .nth(1)
+        .map(String::as_str)
+}
+
+/// [`flag`] parsed, or `default` when absent or malformed.
+#[cfg(target_os = "linux")]
+fn flag_or<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
+    flag(args, name)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Capture a pad's split_quad mix for `secs`, printing chunks and per-pair peaks each second.
+///
+/// ch0/1 are the speaker, ch2/3 the coils. A remix or a UAC channel-order slip zeros one pair
+/// while a global peak looks fine, so the pairs are metered apart.
+#[cfg(target_os = "linux")]
+fn meter_split_quad(
+    cap: &mut dyn crate::audio::AudioCapturer,
+    secs: u64,
+    what: &str,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let (mut chunks, mut samples) = (0u64, 0u64);
+    let (mut peak_spk, mut peak_coil) = (0f32, 0f32);
+    let mut last_report = Instant::now();
+    while Instant::now() < deadline {
+        let c = cap.next_chunk().with_context(|| what.to_owned())?;
+        if !c.is_empty() {
+            chunks += 1;
+            samples += c.len() as u64;
+            for f in c.chunks_exact(4) {
+                peak_spk = peak_spk.max(f[0].abs()).max(f[1].abs());
+                peak_coil = peak_coil.max(f[2].abs()).max(f[3].abs());
+            }
+        }
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            last_report = Instant::now();
+            println!(
+                "  chunks={chunks} samples={samples} (~{:.1}ms of 4ch audio) \
+                 peak_speaker={peak_spk:.4} peak_coils={peak_coil:.4}",
+                samples as f64 / (4.0 * 48.0)
+            );
+            (chunks, samples, peak_spk, peak_coil) = (0, 0, 0.0, 0.0);
+        }
+    }
+    Ok(())
+}
+
 /// Scripted stylus through [`PenTracker`](punktfunk_core::quic::PenTracker) → the "Punktfunk Pen"
 /// uinput tablet. No client.
 ///
@@ -244,12 +299,7 @@ pub fn list_monitors() -> Result<()> {
 pub fn dualsense_test(args: &[String]) -> Result<()> {
     use crate::inject::dualsense::{DsUhidIdentity, DualSensePad};
     use crate::inject::dualsense_proto::{edge_paddle_bits, DsState};
-    let secs: u64 = args
-        .iter()
-        .skip_while(|a| *a != "--seconds")
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    let secs: u64 = flag_or(args, "--seconds", 20);
     let edge = args.iter().any(|a| a == "--edge");
     let (identity, label) = if edge {
         (DsUhidIdentity::dualsense_edge(), "DualSense Edge")
@@ -311,20 +361,8 @@ pub fn dualsense_test(args: &[String]) -> Result<()> {
 /// `--seconds N` (default 30).
 #[cfg(target_os = "linux")]
 pub fn pad_sink_test(args: &[String]) -> Result<()> {
-    use crate::audio::AudioCapturer as _;
-    use std::time::{Duration, Instant};
-    let secs: u64 = args
-        .iter()
-        .skip_while(|a| *a != "--seconds")
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
-    let pad: u8 = args
-        .iter()
-        .skip_while(|a| *a != "--pad")
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let secs: u64 = flag_or(args, "--seconds", 30);
+    let pad: u8 = flag_or(args, "--pad", 0);
     let edge = args.iter().any(|a| a == "--edge");
     let mut cap = crate::audio::pad_sink::PadSinkCapturer::open(pad, edge)
         .context("mint pad-audio sink (is PipeWire running in this session?)")?;
@@ -350,31 +388,7 @@ pub fn pad_sink_test(args: &[String]) -> Result<()> {
         cap.haptic_name,
         cap.split_name,
     );
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    let (mut chunks, mut samples) = (0u64, 0u64);
-    // split_quad: ch0/1 speaker, ch2/3 coils. A remix can zero one pair while a global peak looks fine.
-    let (mut peak_spk, mut peak_coil) = (0f32, 0f32);
-    let mut last_report = Instant::now();
-    while Instant::now() < deadline {
-        let c = cap.next_chunk().context("pad sink capture")?;
-        if !c.is_empty() {
-            chunks += 1;
-            samples += c.len() as u64;
-            for f in c.chunks_exact(4) {
-                peak_spk = peak_spk.max(f[0].abs()).max(f[1].abs());
-                peak_coil = peak_coil.max(f[2].abs()).max(f[3].abs());
-            }
-        }
-        if last_report.elapsed() >= Duration::from_secs(1) {
-            last_report = Instant::now();
-            println!(
-                "  chunks={chunks} samples={samples} (~{:.1}ms of 4ch audio) \
-                 peak_speaker={peak_spk:.4} peak_coils={peak_coil:.4}",
-                samples as f64 / (4.0 * 48.0)
-            );
-            (chunks, samples, peak_spk, peak_coil) = (0, 0, 0.0, 0.0);
-        }
-    }
+    meter_split_quad(&mut cap, secs, "pad sink capture")?;
     println!("pad-sink-test: done");
     Ok(())
 }
@@ -387,17 +401,9 @@ pub fn pad_sink_test(args: &[String]) -> Result<()> {
 /// Ignores `PUNKTFUNK_DUALSENSE_USBIP` — this command is the opt-in. `--pad N`, `--seconds N`.
 #[cfg(target_os = "linux")]
 pub fn pad_usbip_test(args: &[String]) -> Result<()> {
-    use crate::audio::AudioCapturer as _;
-    use std::time::{Duration, Instant};
-    let arg = |name: &str, default: u64| -> u64 {
-        args.iter()
-            .skip_while(|a| *a != name)
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default)
-    };
-    let secs = arg("--seconds", 30);
-    let pad = arg("--pad", 0) as u8;
+    use std::time::Duration;
+    let secs: u64 = flag_or(args, "--seconds", 30);
+    let pad: u8 = flag_or(args, "--pad", 0);
 
     let _pad = pf_inject::dualsense_usbip::DualSenseUsbip::open(pad).context(
         "attach the usbip DualSense (is vhci_hcd loaded, and is \
@@ -449,31 +455,7 @@ pub fn pad_usbip_test(args: &[String]) -> Result<()> {
 
     let mut cap = crate::audio::pad_usb::PadUsbCapturer::open(pad)
         .context("claim the usbip pad's audio stream")?;
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    let (mut chunks, mut samples) = (0u64, 0u64);
-    // split_quad: ch0/1 speaker, ch2/3 coils. A UAC channel-order slip zeros one pair while a global peak looks fine.
-    let (mut peak_spk, mut peak_coil) = (0f32, 0f32);
-    let mut last_report = Instant::now();
-    while Instant::now() < deadline {
-        let c = cap.next_chunk().context("usb pad capture")?;
-        if !c.is_empty() {
-            chunks += 1;
-            samples += c.len() as u64;
-            for f in c.chunks_exact(4) {
-                peak_spk = peak_spk.max(f[0].abs()).max(f[1].abs());
-                peak_coil = peak_coil.max(f[2].abs()).max(f[3].abs());
-            }
-        }
-        if last_report.elapsed() >= Duration::from_secs(1) {
-            last_report = Instant::now();
-            println!(
-                "  chunks={chunks} samples={samples} (~{:.1}ms of 4ch audio) \
-                 peak_speaker={peak_spk:.4} peak_coils={peak_coil:.4}",
-                samples as f64 / (4.0 * 48.0)
-            );
-            (chunks, samples, peak_spk, peak_coil) = (0, 0, 0.0, 0.0);
-        }
-    }
+    meter_split_quad(&mut cap, secs, "usb pad capture")?;
     println!("pad-usbip-test: done");
     Ok(())
 }
@@ -486,12 +468,7 @@ pub fn pad_usbip_test(args: &[String]) -> Result<()> {
 pub fn switchpro_test(args: &[String]) -> Result<()> {
     use crate::inject::switch_pro::SwitchProPad;
     use crate::inject::switch_proto::SwitchState;
-    let secs: u64 = args
-        .iter()
-        .skip_while(|a| *a != "--seconds")
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    let secs: u64 = flag_or(args, "--seconds", 20);
     use std::time::{Duration, Instant};
     let mut pad =
         SwitchProPad::open(0).context("create virtual Switch Pro Controller via /dev/uhid")?;
@@ -550,16 +527,10 @@ pub fn switchpro_test(args: &[String]) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub fn mirror_test(args: &[String]) -> Result<()> {
     use std::time::{Duration, Instant};
-    let arg = |name: &str| {
-        args.iter()
-            .skip_while(|a| a.as_str() != name)
-            .nth(1)
-            .cloned()
-    };
-    let secs: u64 = arg("--seconds").and_then(|s| s.parse().ok()).unwrap_or(5);
+    let secs: u64 = flag_or(args, "--seconds", 5);
     // `--monitor` cannot set `PUNKTFUNK_CAPTURE_MONITOR`: config is snapshotted at
     // startup. Explicit connector → `open_mirror`; unset → pin / production `open`.
-    let explicit = arg("--monitor");
+    let explicit = flag(args, "--monitor").map(str::to_owned);
     let want = explicit
         .clone()
         .or_else(crate::vdisplay::capture_monitor)
@@ -667,15 +638,9 @@ pub fn mirror_test(args: &[String]) -> Result<()> {
 pub fn anchor_test(args: &[String]) -> Result<()> {
     use punktfunk_core::input::{InputEvent, InputKind};
     use std::time::Duration;
-    let arg = |name: &str| {
-        args.iter()
-            .skip_while(|a| a.as_str() != name)
-            .nth(1)
-            .cloned()
-    };
     let unanchored = args.iter().any(|a| a == "--none");
-    let w: u32 = arg("--width").and_then(|s| s.parse().ok()).unwrap_or(1920);
-    let h: u32 = arg("--height").and_then(|s| s.parse().ok()).unwrap_or(1080);
+    let w: u32 = flag_or(args, "--width", 1920);
+    let h: u32 = flag_or(args, "--height", 1080);
 
     let compositor = crate::vdisplay::detect()?;
     let monitors = crate::vdisplay::monitors::list(compositor)?;
@@ -712,7 +677,8 @@ pub fn anchor_test(args: &[String]) -> Result<()> {
         crate::inject::set_absolute_anchor(None);
         println!("anchor-test: UNANCHORED (--none) — the size/first rungs decide");
     } else {
-        let want = arg("--monitor")
+        let want = flag(args, "--monitor")
+            .map(str::to_owned)
             .or_else(crate::vdisplay::capture_monitor)
             .context("no monitor named — pass --monitor <CONNECTOR>, or --none for the A/B")?;
         let m = crate::vdisplay::monitors::resolve(&monitors, &want)?;

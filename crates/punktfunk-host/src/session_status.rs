@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering,
 };
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::encode::{ChromaFormat, Codec};
 use crate::events::{
@@ -440,7 +440,7 @@ static AUDIO_POLICY: Mutex<Option<AudioPolicy>> = Mutex::new(None);
 /// the client is told and the operator can unmute live. Drop unmutes what it muted.
 pub fn apply_audio_policy(sessions: AudioSessions, launcher: &str) -> AudioPolicyGuard {
     let mut muted = Vec::new();
-    for s in registry().lock().unwrap().iter() {
+    for s in registry().iter() {
         // Compat sessions have no per-session mute, and marking one muted without muting it
         // would put a Muted badge on a session the operator can still hear.
         if s.plane != crate::events::Plane::Gamestream
@@ -450,7 +450,7 @@ pub fn apply_audio_policy(sessions: AudioSessions, launcher: &str) -> AudioPolic
             muted.push(s.id);
         }
     }
-    let mut live = AUDIO_POLICY.lock().unwrap();
+    let mut live = AUDIO_POLICY.lock().unwrap_or_else(PoisonError::into_inner);
     // Replacing a live policy inherits what it muted: the first lease to end lifts both.
     if let Some(prev) = live.take() {
         muted.extend(prev.muted);
@@ -469,10 +469,14 @@ pub struct AudioPolicyGuard(());
 
 impl Drop for AudioPolicyGuard {
     fn drop(&mut self) {
-        let Some(policy) = AUDIO_POLICY.lock().unwrap().take() else {
+        let Some(policy) = AUDIO_POLICY
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        else {
             return;
         };
-        for s in registry().lock().unwrap().iter() {
+        for s in registry().iter() {
             if policy.muted.contains(&s.id) {
                 s.controls.set_muted(false);
             }
@@ -522,9 +526,18 @@ pub struct SessionSnapshot {
     pub shared_path_with: Vec<u64>,
 }
 
-fn registry() -> &'static Mutex<Vec<LiveSession>> {
+/// The live-session table, locked. A panic under the lock leaves every entry whole,
+/// so poison is recovered here rather than turned into a panic at the next caller.
+fn registry() -> MutexGuard<'static, Vec<LiveSession>> {
     static REG: OnceLock<Mutex<Vec<LiveSession>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `f` on live session `id`, under the registry lock. `None` = no such session.
+fn with_session<T>(id: u64, f: impl FnOnce(&LiveSession) -> T) -> Option<T> {
+    registry().iter().find(|s| s.id == id).map(f)
 }
 
 fn next_id() -> u64 {
@@ -687,7 +700,11 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
     } = reg;
     let id = next_id();
     // A standing title policy reaches a session that arrives under it.
-    if let Some(p) = AUDIO_POLICY.lock().unwrap().as_mut() {
+    if let Some(p) = AUDIO_POLICY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_mut()
+    {
         if plane != crate::events::Plane::Gamestream
             && policy_mutes(p.sessions, &p.launcher, &client, join)
         {
@@ -732,7 +749,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
     crate::events::emit(crate::events::EventKind::SessionStarted {
         session: session_ref(&session),
     });
-    let mut reg = registry().lock().unwrap();
+    let mut reg = registry();
     let sharing = shared_path(&reg, session.id, session.peer);
     if !sharing.is_empty() {
         // Same address is one NAT or tunnel, not proof of one bottleneck, so the
@@ -765,7 +782,7 @@ impl Drop for LiveSessionGuard {
     /// Retires the entry, then publishes the session's own numbers twice: onto
     /// `session.ended` for a live consumer, and into the ring a bug report reads back.
     fn drop(&mut self) {
-        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        let mut reg = registry();
         if let Some(pos) = reg.iter().position(|s| s.id == self.id) {
             let session = reg.remove(pos);
             drop(reg); // emit outside the registry lock; the bus takes its own
@@ -818,12 +835,7 @@ pub fn recent() -> Vec<SessionSummary> {
 /// Hand the video loop's totals to the registry as it finishes, so the summary the
 /// guard builds a moment later carries them. Unknown id = the entry is already gone.
 pub fn record_tally(id: u64, tally: SessionTally) {
-    if let Some(s) = registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter_mut()
-        .find(|s| s.id == id)
-    {
+    if let Some(s) = registry().iter_mut().find(|s| s.id == id) {
         s.tally = Some(tally);
     }
 }
@@ -952,7 +964,7 @@ fn share_for_at(
     clocks: punktfunk_core::abr::governor::Clocks,
 ) -> Option<u32> {
     use punktfunk_core::abr::governor;
-    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let reg = registry();
     let me = reg.iter().find(|s| s.id == id)?;
     if !me.counters.share.automatic.load(Ordering::Relaxed)
         || !me.counters.share.delivery_ready(now)
@@ -1051,12 +1063,12 @@ fn member(s: &LiveSession) -> punktfunk_core::abr::governor::Member {
 }
 
 pub fn count() -> usize {
-    registry().lock().unwrap().len()
+    registry().len()
 }
 
 /// Snapshot of every live native session; mode/bitrate read live. Newest last.
 pub fn snapshot() -> Vec<SessionSnapshot> {
-    let reg = registry().lock().unwrap();
+    let reg = registry();
     reg.iter()
         .map(|s| {
             let (width, height, fps) = crate::native::unpack_mode(s.mode.load(Ordering::Relaxed));
@@ -1145,8 +1157,6 @@ impl Drop for GamestreamGameGuard {
 /// off, and omitting it would hide "the host is about to close this game".
 pub fn games() -> Vec<GameSnapshot> {
     let mut out: Vec<GameSnapshot> = registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter_map(|s| {
             let g = s.game.as_ref()?;
@@ -1207,8 +1217,6 @@ pub fn live_games(app_id: Option<&str>) -> Vec<Arc<crate::gamelease::LeaseShared
     let mine =
         |g: &Arc<crate::gamelease::LeaseShared>| app_id.is_none() || g.game.id.as_deref() == app_id;
     let mut out: Vec<Arc<crate::gamelease::LeaseShared>> = registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter_map(|s| s.game.clone())
         .filter(&mine)
@@ -1228,7 +1236,7 @@ pub fn live_games(app_id: Option<&str>) -> Vec<Arc<crate::gamelease::LeaseShared
 /// flag and exit; the guard then clears the entry. Not intended teardown —
 /// prefer [`stop_all_quit`] for an operator action.
 pub fn stop_all() {
-    for s in registry().lock().unwrap().iter() {
+    for s in registry().iter() {
         s.stop.store(true, Ordering::SeqCst);
     }
 }
@@ -1241,7 +1249,7 @@ pub fn stop_all() {
 /// Returns how many sessions were signalled.
 pub fn stop_by_fingerprint(fp_hex: &str) -> usize {
     let mut n = 0;
-    for s in registry().lock().unwrap().iter() {
+    for s in registry().iter() {
         if s.client.len() == 12 && fp_hex.starts_with(s.client.as_str()) {
             SessionEndReason::StoppedByOperator.latch(&s.end_reason);
             s.quit.store(true, Ordering::SeqCst);
@@ -1259,8 +1267,6 @@ pub fn stop_by_fingerprint(fp_hex: &str) -> usize {
 /// An anonymous IP-labelled session always counts as another client.
 pub fn other_client_live(fp_hex: &str) -> bool {
     registry()
-        .lock()
-        .unwrap()
         .iter()
         .any(|s| !(s.client.len() == 12 && fp_hex.starts_with(s.client.as_str())))
 }
@@ -1271,8 +1277,6 @@ pub fn other_client_live(fp_hex: &str) -> bool {
 /// [`stop_by_fingerprint`], so an anonymous IP-labelled session owns nothing.
 pub fn owns_live_session(fp_hex: &str) -> bool {
     registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .any(|s| !s.join && s.client.len() == 12 && fp_hex.starts_with(s.client.as_str()))
 }
@@ -1283,7 +1287,7 @@ pub fn owns_live_session(fp_hex: &str) -> bool {
 /// display skips keep-alive linger and end-game-on-session-end sees intent.
 /// The summary says `stopped_by_operator`; the client only ever sees `host_ended`.
 pub fn stop_all_quit() {
-    for s in registry().lock().unwrap().iter() {
+    for s in registry().iter() {
         SessionEndReason::StoppedByOperator.latch(&s.end_reason);
         s.quit.store(true, Ordering::SeqCst);
         s.stop.store(true, Ordering::SeqCst);
@@ -1294,60 +1298,37 @@ pub fn stop_all_quit() {
 /// `false` = no such session. Same `quit`-before-`stop` order and same
 /// `stopped_by_operator` summary as [`stop_all_quit`].
 pub fn stop_quit(id: u64) -> bool {
-    registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .find(|s| s.id == id)
-        .is_some_and(|s| {
-            SessionEndReason::StoppedByOperator.latch(&s.end_reason);
-            s.quit.store(true, Ordering::SeqCst);
-            s.stop.store(true, Ordering::SeqCst);
-            true
-        })
+    with_session(id, |s| {
+        SessionEndReason::StoppedByOperator.latch(&s.end_reason);
+        s.quit.store(true, Ordering::SeqCst);
+        s.stop.store(true, Ordering::SeqCst);
+    })
+    .is_some()
 }
 
 /// Force a keyframe on ONE live native session (`POST /session/{id}/idr`).
 /// `false` = no such session.
 pub fn force_idr(id: u64) -> bool {
-    registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .find(|s| s.id == id)
-        .is_some_and(|s| {
-            s.force_idr.store(true, Ordering::Relaxed);
-            true
-        })
+    with_session(id, |s| s.force_idr.store(true, Ordering::Relaxed)).is_some()
 }
 
 /// Whether this session is served by the plane whose per-session mute, access and player
 /// lanes exist. `None` = no such session. The compat plane registers (so it has an id, a
 /// stop and a keyframe) but carries none of those three.
 pub fn has_native_lanes(id: u64) -> Option<bool> {
-    registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .find(|s| s.id == id)
-        .map(|s| s.plane != crate::events::Plane::Gamestream)
+    with_session(id, |s| s.plane != crate::events::Plane::Gamestream)
 }
 
 /// This session's management handles, cloned out so the caller acts without the
 /// registry lock. `None` = no such session (the routes' 404).
 pub fn controls(id: u64) -> Option<SessionControls> {
-    registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .find(|s| s.id == id)
-        .map(|s| s.controls.clone())
+    with_session(id, |s| s.controls.clone())
 }
 
 /// Force a keyframe on every live native session (`POST /session/idr`).
 /// The encode loop drains the flag like a client decode-recovery request.
 pub fn force_idr_all() {
-    for s in registry().lock().unwrap().iter() {
+    for s in registry().iter() {
         s.force_idr.store(true, Ordering::Relaxed);
     }
 }
@@ -1401,27 +1382,13 @@ pub(crate) mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
         let _guard = register(Registration {
-            mode: Arc::new(AtomicU64::new(0)),
-            bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
-            codec: Codec::H265,
             stop: stop.clone(),
             quit: quit.clone(),
-            force_idr: Arc::new(AtomicBool::new(false)),
-            client: "9f86d0818840".into(),
             client_name: Some("Living Room TV".into()),
             plane: crate::events::Plane::Gamestream,
             hdr: true,
-            ttff_ms: Arc::new(AtomicU32::new(0)),
-            last_resize_ms: Arc::new(AtomicU32::new(0)),
-            game: None,
-            capture_health: Arc::new(Mutex::new(None)),
-            join: false,
-            controls: SessionControls::open(),
             bit_depth: 10,
-            chroma: ChromaFormat::Yuv420,
-            end_reason: Arc::new(AtomicU8::new(0)),
-            counters: Arc::new(SessionCounters::default()),
-            peer: None,
+            ..Registration::fake("9f86d0818840")
         });
         let row = snapshot()
             .into_iter()
@@ -1440,6 +1407,36 @@ pub(crate) mod tests {
         assert!(!stop_quit(u64::MAX), "an id nothing holds stops nothing");
     }
 
+    impl Registration {
+        /// A native 8-bit H.265 session for `client` at 20 Mbps, every handle fresh and
+        /// zeroed, no peer. A test overrides only the fields it reads.
+        pub(crate) fn fake(client: &str) -> Registration {
+            Registration {
+                mode: Arc::new(AtomicU64::new(0)),
+                bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
+                codec: Codec::H265,
+                stop: Arc::new(AtomicBool::new(false)),
+                quit: Arc::new(AtomicBool::new(false)),
+                force_idr: Arc::new(AtomicBool::new(false)),
+                client: client.into(),
+                client_name: None,
+                plane: crate::events::Plane::Native,
+                hdr: false,
+                ttff_ms: Arc::new(AtomicU32::new(0)),
+                last_resize_ms: Arc::new(AtomicU32::new(0)),
+                game: None,
+                capture_health: Arc::new(Mutex::new(None)),
+                join: false,
+                controls: SessionControls::open(),
+                bit_depth: 8,
+                chroma: ChromaFormat::Yuv420,
+                end_reason: Arc::new(AtomicU8::new(0)),
+                counters: Arc::new(SessionCounters::default()),
+                peer: None,
+            }
+        }
+    }
+
     fn fake_session(client: &str) -> (LiveSessionGuard, Arc<AtomicBool>, Arc<AtomicBool>) {
         fake_session_with_reason(
             client,
@@ -1456,29 +1453,30 @@ pub(crate) mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
         let guard = register(Registration {
-            mode: Arc::new(AtomicU64::new(0)),
-            bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
-            codec: Codec::H265,
             stop: stop.clone(),
             quit: quit.clone(),
-            force_idr: Arc::new(AtomicBool::new(false)),
-            client: client.into(),
-            client_name: None,
-            plane: crate::events::Plane::Native,
-            hdr: false,
-            ttff_ms: Arc::new(AtomicU32::new(0)),
-            last_resize_ms: Arc::new(AtomicU32::new(0)),
-            game: None,
-            capture_health: Arc::new(Mutex::new(None)),
-            join: false,
-            controls: SessionControls::open(),
-            bit_depth: 8,
-            chroma: ChromaFormat::Yuv420,
             end_reason,
             counters,
-            peer: None,
+            ..Registration::fake(client)
         });
         (guard, stop, quit)
+    }
+
+    /// A panic under the registry lock costs the next caller nothing: a new session
+    /// registers, and the per-id and host-wide stops still reach it.
+    #[test]
+    fn a_poisoned_registry_keeps_answering() {
+        let _registry = registry_lock();
+        let _ = std::thread::spawn(|| {
+            let _held = registry();
+            panic!("poison the registry");
+        })
+        .join();
+        let (guard, stop, quit) = fake_session("aabbccddeeff");
+        assert!(count() >= 1);
+        assert!(force_idr(guard.id), "the per-id routes find it");
+        stop_all_quit();
+        assert!(stop.load(Ordering::SeqCst) && quit.load(Ordering::SeqCst));
     }
 
     fn fake_joiner(client: &str, join: bool) -> (LiveSessionGuard, SessionControls) {
@@ -1492,27 +1490,10 @@ pub(crate) mod tests {
     ) -> (LiveSessionGuard, SessionControls) {
         let controls = SessionControls::open();
         let guard = register(Registration {
-            mode: Arc::new(AtomicU64::new(0)),
-            bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
-            codec: Codec::H265,
-            stop: Arc::new(AtomicBool::new(false)),
-            quit: Arc::new(AtomicBool::new(false)),
-            force_idr: Arc::new(AtomicBool::new(false)),
-            client: client.into(),
-            client_name: None,
-            plane: crate::events::Plane::Native,
-            hdr: false,
-            ttff_ms: Arc::new(AtomicU32::new(0)),
-            last_resize_ms: Arc::new(AtomicU32::new(0)),
-            game: None,
-            capture_health: Arc::new(Mutex::new(None)),
             join,
             controls: controls.clone(),
-            bit_depth: 8,
-            chroma: ChromaFormat::Yuv420,
-            end_reason: Arc::new(AtomicU8::new(0)),
-            counters: Arc::new(SessionCounters::default()),
             peer,
+            ..Registration::fake(client)
         });
         (guard, controls)
     }
@@ -1527,27 +1508,10 @@ pub(crate) mod tests {
         let counters = Arc::new(SessionCounters::default());
         let bitrate_kbps = Arc::new(AtomicU32::new(kbps));
         let guard = register(Registration {
-            mode: Arc::new(AtomicU64::new(0)),
             bitrate_kbps: bitrate_kbps.clone(),
-            codec: Codec::H265,
-            stop: Arc::new(AtomicBool::new(false)),
-            quit: Arc::new(AtomicBool::new(false)),
-            force_idr: Arc::new(AtomicBool::new(false)),
-            client: client.into(),
-            client_name: None,
-            plane: crate::events::Plane::Native,
-            hdr: false,
-            ttff_ms: Arc::new(AtomicU32::new(0)),
-            last_resize_ms: Arc::new(AtomicU32::new(0)),
-            game: None,
-            capture_health: Arc::new(Mutex::new(None)),
-            join: false,
-            controls: SessionControls::open(),
-            bit_depth: 8,
-            chroma: ChromaFormat::Yuv420,
-            end_reason: Arc::new(AtomicU8::new(0)),
             counters: counters.clone(),
             peer: Some(peer),
+            ..Registration::fake(client)
         });
         (guard, counters, bitrate_kbps)
     }
