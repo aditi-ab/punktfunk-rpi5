@@ -483,6 +483,12 @@ public final class SessionAudio {
                 guard let self else { return }
                 self.engineQueue.async { [weak self] in
                     guard let self, granted, !self.flag.isStopped else { return }
+                    // A rebuild during the prompt asks again, so a grant can call back twice, and
+                    // a rebuild after it may have started the mic already. Never start a second.
+                    self.stateLock.lock()
+                    let micLive = self.captureEngine != nil || self.combinedEngine != nil
+                    self.stateLock.unlock()
+                    guard !micLive else { return }
                     if combined {
                         self.stateLock.lock()
                         let playback = self.playbackEngine
