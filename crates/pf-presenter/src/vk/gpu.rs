@@ -49,8 +49,7 @@ impl Presenter {
     }
 }
 
-/// First memory type in `mem_props` that `reqs` accepts with `flags`. A free function so a
-/// field borrowed mutably (the scale pass) can still allocate through its siblings.
+/// Memory of the first type in `mem_props` that `reqs` accepts with `flags`.
 pub(super) fn allocate(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -77,6 +76,44 @@ pub(super) fn allocate(
         )
     }
     .context("vkAllocateMemory")
+}
+
+/// A 2D colour image from `info`, bound to fresh `flags` memory, with a whole-image view in
+/// the image's format. A failure destroys whatever was created before the error returns.
+pub(crate) fn image_with_memory(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    info: &vk::ImageCreateInfo<'_>,
+    flags: vk::MemoryPropertyFlags,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+    // SAFETY: CREATE per the crate contract.
+    let image = unsafe { device.create_image(info, None) }.context("vkCreateImage")?;
+    let mut memory = vk::DeviceMemory::null();
+    let view = (|| {
+        // SAFETY: `image` was created above and is owned here.
+        let reqs = unsafe { device.get_image_memory_requirements(image) };
+        memory = allocate(device, mem_props, reqs, flags)?;
+        // SAFETY: `image` and `memory` were created above; neither is bound yet.
+        unsafe { device.bind_image_memory(image, memory, 0) }.context("vkBindImageMemory")?;
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(info.format)
+            .subresource_range(subresource_range());
+        // SAFETY: CREATE per the crate contract; `image` is bound above.
+        unsafe { device.create_image_view(&view_info, None) }.context("vkCreateImageView")
+    })();
+    match view {
+        Ok(view) => Ok((image, memory, view)),
+        Err(e) => {
+            // SAFETY: neither was recorded or submitted; freeing a null `memory` is a no-op.
+            unsafe {
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+            }
+            Err(e)
+        }
+    }
 }
 
 pub(super) fn subresource_layers() -> vk::ImageSubresourceLayers {

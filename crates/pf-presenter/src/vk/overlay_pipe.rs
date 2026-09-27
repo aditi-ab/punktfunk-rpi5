@@ -1,7 +1,6 @@
 //! Premultiplied-alpha overlay quad over the swapchain after the video blit.
 //!
-//! Views and framebuffers are per swapchain image: take, destroy after GPU idle,
-//! then rebuild.
+//! Views and framebuffers are per swapchain image: destroy after GPU idle, then rebuild.
 
 use super::gpu::subresource_range;
 use super::OverlayPipe;
@@ -125,16 +124,8 @@ impl OverlayPipe {
         })
     }
 
-    /// Caller destroys these after the GPU is idle.
-    pub(super) fn take_targets(&mut self) -> (Vec<vk::ImageView>, Vec<vk::Framebuffer>) {
-        (
-            std::mem::take(&mut self.views),
-            std::mem::take(&mut self.framebuffers),
-        )
-    }
-
-    /// Caller must have taken the old targets; otherwise `destroy_targets` frees them
-    /// while still in flight.
+    /// Caller must have destroyed the old targets once the GPU was idle for them;
+    /// otherwise `destroy_targets` here frees them while still in flight.
     pub(super) fn rebuild_targets(
         &mut self,
         device: &ash::Device,
@@ -142,7 +133,7 @@ impl OverlayPipe {
         format: vk::Format,
         extent: vk::Extent2D,
     ) -> Result<()> {
-        self.destroy_targets(device); // no-op after take_targets; safety net otherwise
+        self.destroy_targets(device); // no-op after the caller's; safety net otherwise
         for &image in images {
             // SAFETY: `image` is a live swapchain image; CreateInfo outlives the call.
             let view = unsafe {
@@ -174,9 +165,10 @@ impl OverlayPipe {
         Ok(())
     }
 
-    fn destroy_targets(&mut self, device: &ash::Device) {
+    /// Only once the GPU is done with every command buffer that drew through them.
+    pub(super) fn destroy_targets(&mut self, device: &ash::Device) {
         // SAFETY: these views and framebuffers are owned here; the GPU is idle for them
-        // (fence wait or the swapchain already retired).
+        // (the caller's fence or queue wait, or the swapchain already retired).
         unsafe {
             for fb in self.framebuffers.drain(..) {
                 device.destroy_framebuffer(fb, None);

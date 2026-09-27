@@ -417,15 +417,8 @@ impl Presenter {
         let targets_ready = self.overlay_pipe.framebuffers.len() == self.images.len();
         let filtered = match (placement, &self.video) {
             (Some(p), Some(v)) if !from_slot && targets_ready && crate::scale::needs_filter(&p) => {
-                let (device, mem_props) = (&self.device, &self.mem_props);
-                self.scale.prepare(device, v.height, &p, v.view, |reqs| {
-                    allocate(
-                        device,
-                        mem_props,
-                        reqs,
-                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    )
-                })?;
+                self.scale
+                    .prepare(&self.device, &self.mem_props, v.height, &p, v.view)?;
                 Some(p)
             }
             _ => None,

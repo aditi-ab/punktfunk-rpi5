@@ -21,7 +21,7 @@ use ash::vk;
 use pf_client_core::video::DmabufFrame;
 use pf_client_core::video::{CpuPlanarFrame, DecodedImage, NativeVkFrame};
 
-mod gpu;
+pub(crate) mod gpu;
 mod overlay_pipe;
 mod present;
 mod present_timing;
@@ -460,19 +460,10 @@ impl Drop for Presenter {
                 }
             }
             if let Some(s) = self.staging.take() {
-                self.device.unmap_memory(s.memory);
-                self.device.destroy_buffer(s.buffer, None);
-                self.device.free_memory(s.memory, None);
+                s.destroy(&self.device);
             }
             if let Some(v) = self.video.take() {
-                if v.framebuffer != vk::Framebuffer::null() {
-                    self.device.destroy_framebuffer(v.framebuffer, None);
-                }
-                if v.view != vk::ImageView::null() {
-                    self.device.destroy_image_view(v.view, None);
-                }
-                self.device.destroy_image(v.image, None);
-                self.device.free_memory(v.memory, None);
+                v.destroy(&self.device);
             }
             #[cfg(target_os = "linux")]
             self.hw.take();

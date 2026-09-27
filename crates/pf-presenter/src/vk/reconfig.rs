@@ -110,16 +110,10 @@ impl Presenter {
         // Quiesce covered our cmd bufs, queue drain the presentation-engine
         // semaphore waits, present-timer drain the last waiter — nothing
         // still names these objects.
-        let (overlay_views, overlay_framebuffers) = self.overlay_pipe.take_targets();
+        self.overlay_pipe.destroy_targets(&self.device);
         // SAFETY: quiesce, `queue_wait_idle`, and present-timer drain above;
-        // GPU idle on these views, framebuffers, semaphores, and `old`.
+        // GPU idle on these semaphores and `old`.
         unsafe {
-            for fb in overlay_framebuffers {
-                self.device.destroy_framebuffer(fb, None);
-            }
-            for v in overlay_views {
-                self.device.destroy_image_view(v, None);
-            }
             for s in self.render_sems.drain(..) {
                 self.device.destroy_semaphore(s, None);
             }
@@ -258,13 +252,7 @@ impl Presenter {
         tracing::info!(hdr = on, format = ?target, "switching presentation mode");
         self.quiesce_own()?;
         if let Some(v) = self.video.take() {
-            // SAFETY: `quiesce_own` above; GPU idle on this video image.
-            unsafe {
-                self.device.destroy_framebuffer(v.framebuffer, None);
-                self.device.destroy_image_view(v.view, None);
-                self.device.destroy_image(v.image, None);
-                self.device.free_memory(v.memory, None);
-            }
+            v.destroy(&self.device); // `quiesce_own` above: GPU idle on it
         }
         // New overlay pipe for the new format. Old views/framebuffers are
         // only in our cmd bufs — fence quiesce makes destroy safe here;
@@ -273,16 +261,6 @@ impl Presenter {
             &mut self.overlay_pipe,
             OverlayPipe::new(&self.device, target.format, on)?,
         );
-        let (overlay_views, overlay_framebuffers) = old_pipe.take_targets();
-        // SAFETY: fence quiesce above; these views/framebuffers are only in our cmd bufs.
-        unsafe {
-            for fb in overlay_framebuffers {
-                self.device.destroy_framebuffer(fb, None);
-            }
-            for v in overlay_views {
-                self.device.destroy_image_view(v, None);
-            }
-        }
         old_pipe.destroy(&self.device);
         // The scale pass renders into the swapchain format too; fence quiesce above. Build the
         // new one first: a failed create must not leave destroyed handles for Drop to free again.
