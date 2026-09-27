@@ -864,6 +864,10 @@ pub mod uhid_abi;
 /// only its protocol via [`uhid_manager::PadProto`].
 #[path = "inject/uhid_manager.rs"]
 pub mod uhid_manager;
+/// `/dev/uinput` ABI and device shared by the uinput pad and pen.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/uinput_abi.rs"]
+mod uinput_abi;
 /// Byte-level tracing of the USB/IP socket (`PUNKTFUNK_USBIP_TRACE`). A framing bug in that
 /// stream is only visible as damage the kernel notices later, so the wire itself has to be
 /// recoverable.
