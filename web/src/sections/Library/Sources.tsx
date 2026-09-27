@@ -125,13 +125,16 @@ export const SourcesSection: FC<{
 	);
 	// Compatible only: this rail is a row of Install buttons, and one for a scanner that cannot
 	// run on this OS is a control that does nothing (design/web-console-overhaul.md §2.1). The
-	// full catalog, incompatible entries included, is a checkbox away on the Store page.
-	const available = (catalog.data?.plugins ?? []).filter(
-		(p) =>
-			p.categories?.includes("library") &&
-			!installedPkgs.has(p.pkg) &&
-			p.compatible,
-	);
+	// full catalog, incompatible entries included, is a checkbox away on the Store page. A launcher
+	// found on this host leads.
+	const available = (catalog.data?.plugins ?? [])
+		.filter(
+			(p) =>
+				p.categories?.includes("library") &&
+				!installedPkgs.has(p.pkg) &&
+				p.compatible,
+		)
+		.sort((a, b) => Number(b.detected === true) - Number(a.detected === true));
 	// Every live registration, NOT just the `library`-category ones. A plugin's nav categorisation
 	// cannot decide whether its liveness badge is honest: a library plugin that registers without
 	// `category` is live, and filtering on it here badges a running plugin "Stopped".
