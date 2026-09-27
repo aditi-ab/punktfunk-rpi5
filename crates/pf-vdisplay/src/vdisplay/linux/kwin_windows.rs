@@ -9,7 +9,6 @@
 //! state, disconnect. Nothing is kept between reads, so a restarted KWin costs nothing.
 
 use crate::toplevels::Toplevel;
-use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
@@ -50,7 +49,6 @@ const STATE_FULLSCREEN: u32 = 0x8;
 /// One read, bind to answers. The lease watcher asks every second; a KWin slower than this is
 /// read again on the next tick.
 const READ_BUDGET: Duration = Duration::from_millis(800);
-const POLL_MS: i32 = 100;
 
 /// The missing global is a packaging fact; say it once per process, not every second.
 static NO_GLOBAL_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -229,35 +227,15 @@ fn barrier(
     serial: u32,
     deadline: Instant,
 ) -> bool {
-    let qh = queue.handle();
-    let _cb = conn.display().sync(&qh, serial);
-    loop {
-        if queue.dispatch_pending(state).is_err() {
-            return false;
-        }
-        if state.sync_done >= serial {
-            return true;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() || conn.flush().is_err() {
-            return false;
-        }
-        let Some(guard) = conn.prepare_read() else {
-            continue; // events already queued — the loop dispatches them
-        };
-        let mut pfd = libc::pollfd {
-            fd: conn.as_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let timeout = (remaining.as_millis() as i64).clamp(0, i64::from(POLL_MS)) as i32;
-        // SAFETY: `&mut pfd` is one live, initialized `libc::pollfd` on the stack and the count is 1,
-        // so `poll` reads `fd`/`events` and writes only `revents` within it. `pfd.fd` is the
-        // connection's fd, valid while `conn` and the `prepare_read` guard live across the call.
-        let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
-        if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
-            let _ = guard.read();
-        }
+    matches!(
+        crate::wl_pump::sync_barrier(conn, queue, state, serial, deadline, None),
+        Ok(crate::wl_pump::Pumped::Done)
+    )
+}
+
+impl crate::wl_pump::SyncDone for State {
+    fn sync_done(&self) -> u32 {
+        self.sync_done
     }
 }
 

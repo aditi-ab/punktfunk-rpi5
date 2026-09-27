@@ -622,8 +622,8 @@ pub fn takeover_privilege_verdict() -> TakeoverVerdict {
 #[cfg(target_os = "linux")]
 pub fn restore_takeover_now() {
     gamescope::restore_takeover_now();
-    // Not per cast: the rewrite restarts the portal and orphans its cached D-Bus
-    // (`hyprland::StopGuard::drop`), a stream that never delivers a buffer.
+    // Not per cast: the rewrite restarts the portal and orphans its cached D-Bus,
+    // a stream that never delivers a buffer.
     // Shutdown has no live cast. Each is a no-op if we never took it.
     hyprland::restore_picker_on_shutdown();
     wlroots::restore_chooser_on_shutdown();

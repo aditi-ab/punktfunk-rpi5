@@ -12,8 +12,9 @@
 //! DRM backend, or VirtualBackend since KWin 6.5.6.
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
+use crate::proc::StopFlag;
+use crate::wl_pump::{pump_until, sync_barrier, Pumped, SyncDone};
 use anyhow::{anyhow, bail, Context, Result};
-use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -289,7 +290,7 @@ impl VirtualDisplay for KwinDisplay {
         } else {
             POINTER_EMBEDDED
         };
-        let spawn_vout = |w: u32, h: u32| -> Result<(u32, Arc<AtomicBool>)> {
+        let spawn_vout = |w: u32, h: u32| -> Result<(u32, StopFlag)> {
             let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_thread = stop.clone();
@@ -300,6 +301,9 @@ impl VirtualDisplay for KwinDisplay {
                     virtual_output_thread(w, h, name_thread, pointer_mode, setup_tx, stop_thread)
                 })
                 .context("spawn KWin virtual-output thread")?;
+            // Built before the wait so every error arm stops the worker, which on a timeout
+            // is still inside `await_created` holding a half-built output.
+            let stop = StopFlag(stop);
             match setup_rx.recv_timeout(OPENER_BUDGET) {
                 Ok(Ok(v)) => Ok((v, stop)),
                 // Report as-is. The wrapper below prepends the "permanent, do not retry"
@@ -317,13 +321,7 @@ impl VirtualDisplay for KwinDisplay {
                      ~/.config/kwinoutputconfig.json, or a display config it refused to apply) \
                      reports the same. kwin_wayland's own journal says which"
                 ),
-                Err(_) => {
-                    // `StopGuard` is only built on success, so nothing else will flip
-                    // `stop`. The worker is still inside `await_created` holding a
-                    // half-built output KWin keeps alive for this connection.
-                    stop.store(true, Ordering::Relaxed);
-                    bail!("timed out creating the KWin virtual output")
-                }
+                Err(_) => bail!("timed out creating the KWin virtual output"),
             }
         };
         // `stream_virtual_output` has no refresh; the PipeWire offer (including the
@@ -399,7 +397,7 @@ impl VirtualDisplay for KwinDisplay {
                         "KWin rejected the custom mode — recreating the virtual output at the real \
                          size (60 Hz ceiling on this KWin)"
                     );
-                    stop.store(true, Ordering::Relaxed);
+                    stop.0.store(true, Ordering::Relaxed);
                     // Let KWin retire the doomed output before re-using its name.
                     std::thread::sleep(Duration::from_millis(300));
                     let (nid, st) = spawn_vout(width, height)?;
@@ -424,7 +422,7 @@ impl VirtualDisplay for KwinDisplay {
         };
         let disabled = self.apply_topology(&name, &our_prefix, final_dims, &pre_enabled);
         // Stash restore on the group, not this session's keepalive: a per-session
-        // `StopGuard` would re-enable physicals when the FIRST exclusive member drops
+        // keepalive would re-enable physicals when the FIRST exclusive member drops
         // under a still-live sibling. Empty ⇒ nothing to restore.
         let prepared = (!disabled.is_empty()).then(|| {
             let disabled = disabled.clone();
@@ -455,7 +453,8 @@ impl VirtualDisplay for KwinDisplay {
         let mut out = VirtualOutput::owned(
             node_id,
             Some((final_dims.0, final_dims.1, achieved_hz)),
-            Box::new(StopGuard { stop }),
+            // Dropping it releases the output: the worker's Wayland connection goes with it.
+            Box::new(stop),
         );
         out.expect_exact_dims = expect_exact_dims;
         out.input_output = Some(our_prefix);
@@ -1239,19 +1238,6 @@ fn apply_virtual_primary_only(ours: &str) {
     }
 }
 
-/// Dropping this releases the KWin virtual output: it flips the keepalive thread's
-/// `stop`, which drops the Wayland connection. Topology restore lives on the registry
-/// group and runs when the last member drops, before this keepalive is dropped.
-struct StopGuard {
-    stop: Arc<AtomicBool>,
-}
-
-impl Drop for StopGuard {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-}
-
 #[derive(Default)]
 struct State {
     screencast: Option<Screencast>,
@@ -1336,6 +1322,12 @@ impl Dispatch<WlCallback, u32> for State {
         if let wl_callback::Event::Done { .. } = event {
             state.sync_done = state.sync_done.max(*serial);
         }
+    }
+}
+
+impl SyncDone for State {
+    fn sync_done(&self) -> u32 {
+        self.sync_done
     }
 }
 
@@ -1429,15 +1421,12 @@ pub(crate) fn stream_existing_output(
             }
         })
         .context("spawn KWin monitor-mirror thread")?;
+    // Built before the wait so a timeout stops the recording too.
+    let stop = StopFlag(stop);
     let node_id = match setup_rx.recv_timeout(OPENER_BUDGET) {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => bail!("KWin monitor mirror failed: {e}"),
-        Err(_) => {
-            // Same leak as the virtual-output opener: `StopOnDrop` only owns `stop` on
-            // success, so without this the mirror thread keeps recording until its budget.
-            stop.store(true, Ordering::Relaxed);
-            bail!("timed out recording the KWin output {connector:?}")
-        }
+        Err(_) => bail!("timed out recording the KWin output {connector:?}"),
     };
     Ok(crate::mirror::MirrorStream {
         node_id,
@@ -1446,17 +1435,8 @@ pub(crate) fn stream_existing_output(
         // Not an xdg-portal session: the `zkde_screencast` pointer mode was asked of
         // KWin directly, so the request is the answer.
         cursor_mode: None,
-        keepalive: Box::new(StopOnDrop(stop)),
+        keepalive: Box::new(stop),
     })
-}
-
-/// Stops the mirror thread (and thus the recording) when the capturer drops it.
-struct StopOnDrop(Arc<AtomicBool>);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
 }
 
 /// The refusal for a registry without `zkde_screencast`, naming the path KWin read and
@@ -1822,10 +1802,6 @@ fn run(
     Ok(())
 }
 
-/// Poll slice while waiting on the Wayland fd — granularity at which `stop` and a
-/// deadline are observed (matches `kwin_output_mgmt`'s `POLL_MS`).
-const POLL_MS: i32 = 200;
-
 /// Budget for one compositor roundtrip. Healthy is a few ms; this exists so a KWin
 /// that accepted the connection and then stopped serving cannot pin the calling thread.
 const ROUNDTRIP_BUDGET: Duration = Duration::from_secs(3);
@@ -1844,66 +1820,6 @@ const WORKER_MARGIN: Duration = Duration::from_millis(500);
 /// therefore takes the worker's start instant and bounds by whichever comes first.
 const CREATE_BUDGET: Duration = Duration::from_secs(15);
 
-enum Pumped {
-    Done,
-    /// `stop` was set — the caller's output/recording was released while we waited.
-    Stopped,
-    Expired,
-}
-
-/// Bounded event loop: dispatch, poll the connection fd up to [`POLL_MS`], read,
-/// until `done`, `stop`, or `deadline`.
-///
-/// `blocking_dispatch` and `roundtrip` cannot be interrupted and have no ceiling.
-/// `deadline: None` is correct only for [`park_until_stopped`], where the wait IS
-/// the output's lifetime.
-fn pump_until(
-    conn: &Connection,
-    queue: &mut wayland_client::EventQueue<State>,
-    state: &mut State,
-    deadline: Option<Instant>,
-    stop: &AtomicBool,
-    done: impl Fn(&State) -> bool,
-) -> Result<Pumped> {
-    loop {
-        queue.dispatch_pending(state).context("dispatch_pending")?;
-        if done(state) {
-            return Ok(Pumped::Done);
-        }
-        if stop.load(Ordering::Relaxed) {
-            return Ok(Pumped::Stopped);
-        }
-        let timeout = match deadline {
-            Some(d) => {
-                let remaining = d.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Ok(Pumped::Expired);
-                }
-                (remaining.as_millis() as i64).clamp(0, i64::from(POLL_MS)) as i32
-            }
-            None => POLL_MS,
-        };
-        conn.flush().context("wayland flush")?;
-        let Some(guard) = conn.prepare_read() else {
-            continue; // events already queued — loop dispatches them
-        };
-        let mut pfd = libc::pollfd {
-            fd: conn.as_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `&mut pfd` points at a single live, fully-initialized `libc::pollfd` on the stack, and
-        // the count `1` matches that one-element array, so `poll` reads `fd`/`events` and writes `revents`
-        // strictly within `pfd`. `pfd.fd` is the Wayland connection's fd, valid because `conn` (and the
-        // `prepare_read` guard) are alive across the call. `poll` blocks up to `timeout` ms and writes
-        // only `revents`; `pfd` outlives the synchronous call and aliases nothing (a fresh local).
-        let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
-        if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
-            let _ = guard.read();
-        } // else: timeout or signal — drop the guard, re-check `stop` and the deadline
-    }
-}
-
 /// A `wl_display.sync` barrier bounded by [`ROUNDTRIP_BUDGET`] — replacement for
 /// `EventQueue::roundtrip`, which waits on the socket with no ceiling. `serial`
 /// must be unique per connection (callers number from 1).
@@ -1915,12 +1831,8 @@ fn roundtrip_within(
     serial: u32,
     what: &str,
 ) -> Result<()> {
-    let qh = queue.handle();
-    let _cb = conn.display().sync(&qh, serial);
     let deadline = Instant::now() + ROUNDTRIP_BUDGET;
-    match pump_until(conn, queue, state, Some(deadline), stop, |st| {
-        st.sync_done >= serial
-    })? {
+    match sync_barrier(conn, queue, state, serial, deadline, Some(stop))? {
         Pumped::Done => Ok(()),
         Pumped::Stopped => bail!("{what} abandoned — the stream was released while we waited"),
         Pumped::Expired => bail!(
@@ -1941,7 +1853,7 @@ fn park_until_stopped(
     output: &str,
     node_id: u32,
 ) -> Result<()> {
-    match pump_until(conn, queue, state, None, stop, |st| st.closed)? {
+    match pump_until(conn, queue, state, None, Some(stop), |st| st.closed)? {
         Pumped::Done => {
             tracing::warn!(output = %output, node_id, "KWin closed the screencast stream");
         }
@@ -1967,7 +1879,7 @@ fn await_created(
     let began = Instant::now();
     let deadline = (began + CREATE_BUDGET).min(started + OPENER_BUDGET - WORKER_MARGIN);
     let settled = |st: &State| st.node_id.is_some() || st.failed.is_some() || st.closed;
-    match pump_until(conn, queue, state, Some(deadline), stop, settled)? {
+    match pump_until(conn, queue, state, Some(deadline), Some(stop), settled)? {
         // Node id first: a `closed` in the same burst as `created` is a stream that
         // was made and then torn down, not a failure to make one.
         Pumped::Done => match (state.node_id, state.failed.take()) {

@@ -104,13 +104,17 @@ impl VirtualDisplay for MirrorDisplay {
                 crate::mutter::stream_existing_output(&target.connector, self.hw_cursor)?
             }
             #[cfg(target_os = "linux")]
-            Compositor::Wlroots => {
-                crate::wlroots::stream_existing_output(&target.connector, self.hw_cursor)?
-            }
+            Compositor::Wlroots => crate::portal_cast::stream_existing_output(
+                &crate::wlroots::SELECTOR,
+                &target.connector,
+                self.hw_cursor,
+            )?,
             #[cfg(target_os = "linux")]
-            Compositor::Hyprland => {
-                crate::hyprland::stream_existing_output(&target.connector, self.hw_cursor)?
-            }
+            Compositor::Hyprland => crate::portal_cast::stream_existing_output(
+                &crate::hyprland::SELECTOR,
+                &target.connector,
+                self.hw_cursor,
+            )?,
             // DRM gamescope drives a real head; nested/headless reports none, so
             // `resolve` fails above and this arm is not reached for those.
             #[cfg(target_os = "linux")]

@@ -759,9 +759,20 @@ mod portal_cursor;
 #[path = "vdisplay/linux/portal_picker.rs"]
 mod portal_picker;
 
+/// One ScreenCast of a named output through a portal that reads a picker file
+/// (Hyprland's xdph, wlroots' xdpw).
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/portal_cast.rs"]
+mod portal_cast;
+
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/hyprland.rs"]
 mod hyprland;
+
+/// Bounded dispatch loop shared by the in-process Wayland protocol clients.
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/wl_pump.rs"]
+mod wl_pump;
 
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/kwin.rs"]

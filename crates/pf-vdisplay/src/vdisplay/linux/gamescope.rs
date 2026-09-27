@@ -16,6 +16,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "gamescope/argv.rs"]
+mod argv;
 #[path = "gamescope/discovery.rs"]
 mod discovery;
 #[path = "gamescope/heads.rs"]
@@ -26,6 +28,7 @@ pub(crate) mod sandbox;
 pub(crate) mod seat;
 #[path = "gamescope/splash.rs"]
 mod splash;
+use argv::{argv_u32, gamescope_argvs, gamescope_output_size};
 use discovery::{
     check_gamescope_version, find_gamescope_eis_socket, find_gamescope_node, gamescope_bin,
     gamescope_can_composite_external_overlay, gamescope_can_offer_refresh_rates,
@@ -861,63 +864,18 @@ pub fn managed_session_available() -> bool {
 /// A gamescope we didn't spawn, for this uid. Our own bare-spawns are children of this process
 /// (ppid walk), so one client's nested gamescope never makes the next client attach to it.
 pub fn foreign_gamescope_running() -> bool {
-    let uid = crate::proc::current_uid();
     let our_pid = std::process::id();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(pid_str) = name.to_str() else {
-            continue;
-        };
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        let Ok(md) = std::fs::metadata(e.path()) else {
-            continue;
-        };
-        use std::os::unix::fs::MetadataExt;
-        if md.uid() != uid {
-            continue;
-        }
+    crate::proc::own_pids().any(|(pid, path)| {
         // Resolved name: nixpkgs wraps gamescope, so the kernel reports `.gamescope-wrap`.
-        let Some(comm) = crate::proc::match_name(&e.path()) else {
-            continue;
-        };
-        if !matches!(comm.as_str(), "gamescope" | "gamescope-wl") {
-            continue;
-        }
-        // A killed gamescope its parent has not reaped serves no node to attach to.
-        if is_zombie(pid) {
-            continue;
-        }
-        if !descends_from(pid, our_pid) {
-            return true;
-        }
-    }
-    false
+        crate::proc::match_name(&path)
+            .is_some_and(|comm| matches!(comm.as_str(), "gamescope" | "gamescope-wl"))
+            // A killed gamescope its parent has not reaped serves no node to attach to.
+            && crate::proc::pid_alive(pid)
+            && !descends_from(pid, our_pid)
+    })
 }
 
-/// `/proc/<pid>/stat` state `Z`. Unreadable counts as gone.
-fn is_zombie(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| stat_state(&stat))
-        .is_none_or(|state| state == 'Z')
-}
-
-/// Field 3 follows the parenthesized comm; split after the LAST ')' (comm may contain them).
-fn stat_state(stat: &str) -> Option<char> {
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .next()?
-        .chars()
-        .next()
-}
-
-/// Walk `/proc/<pid>/stat` ppid. Hop cap so a racing/exiting process cannot loop us.
+/// Walk the ppid chain. Hop cap so a racing/exiting process cannot loop us.
 fn descends_from(mut pid: u32, ancestor: u32) -> bool {
     for _ in 0..64 {
         if pid == ancestor {
@@ -926,14 +884,7 @@ fn descends_from(mut pid: u32, ancestor: u32) -> bool {
         if pid <= 1 {
             return false;
         }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        // Field 4 (ppid) follows parenthesized comm — split after the LAST ')' (comm may contain them).
-        let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
-            return false;
-        };
-        let Some(ppid) = rest.split_whitespace().nth(1).and_then(|s| s.parse().ok()) else {
+        let Some(ppid) = crate::proc::ppid(pid) else {
             return false;
         };
         pid = ppid;
@@ -1006,54 +957,26 @@ pub fn launch_into_session(
 /// gamescope, which is only right when the caller has no seat to be wrong about.
 #[cfg(target_os = "linux")]
 pub(crate) fn xwayland_cursor_targets(seat: Option<&str>) -> Vec<(String, Option<String>)> {
-    let uid = crate::proc::current_uid();
     let mut out: Vec<(String, Option<String>)> = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(pid_str) = name.to_str() else {
+    for (_, path) in crate::proc::own_pids() {
+        let Some(env) = crate::proc::display_env(&path) else {
             continue;
         };
-        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(md) = std::fs::metadata(e.path()) else {
-            continue;
-        };
-        use std::os::unix::fs::MetadataExt;
-        if md.uid() != uid {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(e.path().join("environ")) else {
+        // A sandboxed client rewrites the seat name to a bind path (`/run/pressure-vessel/…`), so
+        // it never matches. That is fine: the un-sandboxed members — the wrapper, `steam.sh`, the
+        // splash — all carry the real name, and one is enough.
+        let on_seat = env
+            .gamescope_wayland
+            .as_deref()
+            .is_some_and(|v| seat.is_none_or(|want| v == want));
+        let (true, Some(d)) = (on_seat, env.display) else {
             continue;
         };
-        let (mut display, mut is_gamescope, mut xauth) = (None, false, None);
-        for kv in raw.split(|&b| b == 0) {
-            let kv = String::from_utf8_lossy(kv);
-            if let Some(v) = kv.strip_prefix("GAMESCOPE_WAYLAND_DISPLAY=") {
-                // A sandboxed client rewrites this to a bind path (`/run/pressure-vessel/…`), so
-                // it never matches a seat name. That is fine: the un-sandboxed members — the
-                // wrapper, `steam.sh`, the splash — all carry the real name, and one is enough.
-                is_gamescope = seat.is_none_or(|want| v == want);
-            } else if let Some(v) = kv.strip_prefix("DISPLAY=") {
-                if !v.is_empty() {
-                    display = Some(v.to_string());
-                }
-            } else if let Some(v) = kv.strip_prefix("XAUTHORITY=") {
-                if !v.is_empty() {
-                    xauth = Some(v.to_string());
-                }
-            }
-        }
-        if let (true, Some(d)) = (is_gamescope, display) {
-            // Distinct DISPLAY only; prefer the first non-empty XAUTHORITY seen for it.
-            match out.iter_mut().find(|(dd, _)| *dd == d) {
-                Some((_, xa)) if xa.is_none() => *xa = xauth,
-                Some(_) => {}
-                None => out.push((d, xauth)),
-            }
+        // Distinct DISPLAY only; prefer the first non-empty XAUTHORITY seen for it.
+        match out.iter_mut().find(|(dd, _)| *dd == d) {
+            Some((_, xa)) if xa.is_none() => *xa = env.xauthority,
+            Some(_) => {}
+            None => out.push((d, env.xauthority)),
         }
     }
     out
@@ -1065,52 +988,13 @@ pub(crate) fn xwayland_cursor_targets(seat: Option<&str>) -> Vec<(String, Option
 fn discover_session_display_env(
     seat: Option<&str>,
 ) -> Option<(Option<String>, Option<String>, Option<String>)> {
-    let uid = crate::proc::current_uid();
-    for e in std::fs::read_dir("/proc").ok()?.flatten() {
-        let name = e.file_name();
-        let Some(pid_str) = name.to_str() else {
-            continue;
-        };
-        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(md) = std::fs::metadata(e.path()) else {
-            continue;
-        };
-        use std::os::unix::fs::MetadataExt;
-        if md.uid() != uid {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(e.path().join("environ")) else {
-            continue;
-        };
-        let mut display = None;
-        let mut gs_wayland = None;
-        let mut xauth = None;
-        for kv in raw.split(|&b| b == 0) {
-            let kv = String::from_utf8_lossy(kv);
-            if let Some(v) = kv.strip_prefix("GAMESCOPE_WAYLAND_DISPLAY=") {
-                if seat.is_some_and(|want| v != want) {
-                    continue;
-                }
-                if !v.is_empty() {
-                    gs_wayland = Some(v.to_string());
-                }
-            } else if let Some(v) = kv.strip_prefix("DISPLAY=") {
-                if !v.is_empty() {
-                    display = Some(v.to_string());
-                }
-            } else if let Some(v) = kv.strip_prefix("XAUTHORITY=") {
-                if !v.is_empty() {
-                    xauth = Some(v.to_string());
-                }
-            }
-        }
-        if gs_wayland.is_some() {
-            return Some((display, gs_wayland, xauth));
-        }
-    }
-    None
+    crate::proc::own_pids().find_map(|(_, path)| {
+        let env = crate::proc::display_env(&path)?;
+        let gs_wayland = env
+            .gamescope_wayland
+            .filter(|v| seat.is_none_or(|want| v == want))?;
+        Some((env.display, Some(gs_wayland), env.xauthority))
+    })
 }
 
 /// In-memory `systemctl is-active` budget. Callers must time out into the safe answer (assume
@@ -1206,10 +1090,8 @@ fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode, hdr: bool) -> Re
         hz = game_hz(mode.refresh_hz),
         // Quoted: systemd `Environment=` with spaces otherwise keeps only the first flag.
         // SteamOS never reads `CUSTOM_REFRESH_RATES`; the shim only forwards `PF_HDR_ARGS`.
-        hdr_args = hdr_args(hdr)
+        hdr_args = our_flags(hdr, game_hz(mode.refresh_hz))
             .into_iter()
-            .chain(cursor_args())
-            .chain(adaptive_sync_args(game_hz(mode.refresh_hz)))
             // Advertised set vs `-r` = `PF_HZ` (frame-limited) — same split as `launch_session`.
             .chain(refresh_rate_args(mode.refresh_hz.max(1)))
             .collect::<Vec<_>>()
@@ -1318,12 +1200,7 @@ fn write_session_plus_dropin(
         binds = bind.unit_lines(),
         xkb = xkb_unit_lines(),
         hz = game_hz(mode.refresh_hz),
-        hdr_args = hdr_args(hdr)
-            .into_iter()
-            .chain(cursor_args())
-            .chain(adaptive_sync_args(game_hz(mode.refresh_hz)))
-            .collect::<Vec<_>>()
-            .join(" "),
+        hdr_args = our_flags(hdr, game_hz(mode.refresh_hz)).join(" "),
         wsi = wsi.unit_lines(hdr),
     );
     std::fs::write(&path, body).with_context(|| format!("write drop-in {}", path.display()))?;
@@ -1620,48 +1497,6 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
     }
 }
 
-/// Compositor argv from `/proc/<pid>/cmdline`. Basename `ends_with("gamescope")` — `/proc/…/exe`
-/// is often unreadable, and `==` would miss `punktfunk-gamescope` while still excluding helpers.
-fn gamescope_argvs() -> Vec<Vec<String>> {
-    let mut found = Vec::new();
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return found;
-    };
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name.to_str() else { continue };
-        if !pid.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        let args: Vec<String> = raw
-            .split(|&b| b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect();
-        if args
-            .first()
-            .is_some_and(|a0| a0.rsplit('/').next().unwrap_or(a0).ends_with("gamescope"))
-        {
-            found.push(args);
-        }
-    }
-    found
-}
-
-/// `-W`/`-H` of one argv. `None` if either is missing — also the compositor vs helper filter.
-fn gamescope_output_size(argv: &[String]) -> Option<(u32, u32)> {
-    match (
-        argv_u32(argv, &["-W", "--output-width"]),
-        argv_u32(argv, &["-H", "--output-height"]),
-    ) {
-        (Some(w), Some(h)) => Some((w, h)),
-        _ => None,
-    }
-}
-
 /// Three states: Game Mode routinely runs a session compositor plus a nested per-title gamescope.
 /// Collapsing unknown with a different size would restart the box unit and kill the running game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1719,15 +1554,6 @@ fn any_output_size_is(argvs: &[Vec<String>], target: (u32, u32)) -> bool {
     argvs
         .iter()
         .any(|argv| gamescope_output_size(argv) == Some(target))
-}
-
-fn argv_u32(argv: &[String], names: &[&str]) -> Option<u32> {
-    argv.iter().enumerate().find_map(|(i, a)| {
-        names
-            .contains(&a.as_str())
-            .then(|| argv.get(i + 1).and_then(|v| v.parse().ok()))
-            .flatten()
-    })
 }
 
 /// Headless `--nested-refresh` is the session's only refresh (defaults to 60 Hz). The wrapper can
@@ -1799,12 +1625,10 @@ fn mode_mismatch(want_w: u32, want_h: u32, want_hz: u32, argvs: &[Vec<String>]) 
 /// refuse; the retry plans host-composited SDR. Fail open if we cannot look. Any one gamescope
 /// carrying the flags is enough — demanding every one would reject a good session beside a nested.
 fn verify_managed_spawn_flags(hdr: bool) -> Result<()> {
-    let expected: Vec<String> = hdr_args(hdr)
+    // The rate is a placeholder: only flag NAMES are kept, and `--adaptive-sync` is what proves
+    // the VRR half of the plan reached the compositor.
+    let expected: Vec<String> = our_flags(hdr, 1)
         .into_iter()
-        .chain(cursor_args())
-        // The rate value is a placeholder: the filter below keeps flag NAMES only, and
-        // `--adaptive-sync` is what proves the VRR half of the plan reached the compositor.
-        .chain(adaptive_sync_args(1))
         .filter(|a| a.starts_with("--")) // flag names only — their values are bare words
         .collect();
     if expected.is_empty() {
@@ -2561,7 +2385,7 @@ fn free_desktop_steam() -> Result<()> {
     );
     let deadline = Instant::now() + STEAM_SHUTDOWN_WAIT;
     while Instant::now() < deadline {
-        if !pid_running(pid) {
+        if !crate::proc::pid_alive(pid) {
             tracing::info!(pid, "desktop Steam exited — single instance free");
             return Ok(());
         }
@@ -2583,7 +2407,7 @@ fn desktop_steam_pid() -> Option<u32> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     // Steam's own processes report comm `steam` (the ubuntu12_32 binary) or `steam.sh`; anything
     // else means the pid was recycled since Steam last ran.
-    if !matches!(comm.trim(), "steam" | "steam.sh") || !pid_running(pid) {
+    if !matches!(comm.trim(), "steam" | "steam.sh") || !crate::proc::pid_alive(pid) {
         return None;
     }
     if descends_from(pid, std::process::id()) {
@@ -2598,18 +2422,6 @@ fn desktop_steam_pid() -> Option<u32> {
 
 fn cgroup_is_punktfunk_owned(cgroup: &str) -> bool {
     cgroup.contains("punktfunk-host.service") || cgroup.contains(&format!("{SESSION_UNIT}.service"))
-}
-
-/// A zombie keeps `/proc` but has already released Steam; waiting would burn the full deadline.
-fn pid_running(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    // Field 3 (state) follows the parenthesized comm — split after the LAST ')' since comm can
-    // itself contain parentheses.
-    stat.rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .is_some_and(|state| state != "Z")
 }
 
 /// Keep-alive reuse never calls `create_managed_session`; skip this and a reconnect inside the
@@ -3899,12 +3711,7 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
             // Unquoted: wrapper word-splits. Empty for stock-gamescope SDR.
             .arg(format!(
                 "--setenv=PF_HDR_ARGS={}",
-                hdr_args(hdr)
-                    .into_iter()
-                    .chain(cursor_args())
-                    .chain(adaptive_sync_args(game))
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                our_flags(hdr, game).join(" ")
             ))
             .arg(format!("--setenv=GAMESCOPE_BIN={}", wrapper.display()))
             .arg("--setenv=DRM_MODE=cvt")
@@ -4152,7 +3959,7 @@ fn hand_launch_to_steam_when_up(
             let deadline = Instant::now() + STEAM_UP_WAIT;
             let mut up = false;
             while Instant::now() < deadline {
-                if !pid_running(gamescope) {
+                if !crate::proc::pid_alive(gamescope) {
                     tracing::info!(
                         %uri,
                         "gamescope: the session ended before its Steam was up — launch not sent"
@@ -4242,16 +4049,19 @@ fn add_bare_gamescope_args(
     if grab_cursor {
         command.arg("--force-grab-cursor");
     }
+    command.args(our_flags(hdr, game_hz(hz)));
     // `-r` is already the reported refresh. This adds the rest of the advertised set.
-    for arg in hdr_args(hdr)
-        .into_iter()
-        .chain(cursor_args())
-        .chain(adaptive_sync_args(game_hz(hz)))
-        .chain(refresh_rate_args(hz))
-    {
-        command.arg(arg);
-    }
+    command.args(refresh_rate_args(hz));
     command.args(["--xwayland-count", "1", "--"]);
+}
+
+/// Our compositor flags, the set [`verify_managed_spawn_flags`] checks. Every spawn path passes
+/// them; the refresh list travels separately (argv or `CUSTOM_REFRESH_RATES`).
+fn our_flags(hdr: bool, game_hz: u32) -> Vec<String> {
+    let mut flags = hdr_args(hdr);
+    flags.extend(cursor_args());
+    flags.extend(adaptive_sync_args(game_hz));
+    flags
 }
 
 /// Shared by all three spawn paths — a kept display is keyed on `hdr`. Headless hardcodes
@@ -4706,6 +4516,11 @@ mod tests {
         );
         assert_eq!(
             gamescope_output_size(&argv("gamescope --output-width 800 --output-height 600")),
+            Some((800, 600))
+        );
+        // getopt_long also takes `--flag=value`, the spelling `heads` already reads.
+        assert_eq!(
+            gamescope_output_size(&argv("gamescope --output-width=800 --output-height=600")),
             Some((800, 600))
         );
         assert_eq!(gamescope_output_size(&argv("gamescope -W 2560")), None);
@@ -5559,19 +5374,6 @@ mod tests {
     /// A managed session that ignored `GAMESCOPE_BIN` / the PATH shim runs a stock gamescope, and
     /// the host — already told the compositor would paint the pointer — paints none either. Only a
     /// compositor we can see, missing a flag we can name, may fail.
-    #[test]
-    fn a_zombie_reads_from_the_state_field_after_the_comm() {
-        assert_eq!(
-            super::stat_state("9846 (gamescope-wl) Z 837 9846 9846 0 -1"),
-            Some('Z')
-        );
-        assert_eq!(
-            super::stat_state("77 (odd) name)) S 1 77 77 0 -1"),
-            Some('S')
-        );
-        assert_eq!(super::stat_state("garbage"), None);
-    }
-
     #[test]
     fn spawn_flag_verification_fails_closed_only_on_evidence() {
         let argv = |s: &str| -> Vec<String> { s.split(' ').map(str::to_string).collect() };

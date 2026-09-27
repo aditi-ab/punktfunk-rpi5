@@ -11,8 +11,8 @@
 //! "any head in BT.2100". See `design/per-monitor-portal-capture.md`. The probe
 //! is one session-bus round-trip; call from control-plane threads only.
 
+use crate::portal_rt::{close_session, finish_or_close, within};
 use anyhow::{anyhow, Context, Result};
-use std::future::Future;
 use std::os::fd::OwnedFd;
 
 /// Mutter advertises 10-bit PQ only while the mirrored head is BT.2100.
@@ -113,68 +113,6 @@ fn hdr_offer_for(heads: &[(&str, bool)], pinned: Option<&str>) -> bool {
             .find(|(connector, _)| connector.eq_ignore_ascii_case(want))
             .is_some_and(|(_, hdr)| *hdr),
         None => heads.iter().any(|(_, hdr)| *hdr),
-    }
-}
-
-/// Session.Close is the only teardown now that the zbus connection outlives the
-/// thread. Bounded so a wedged portal cannot hang a session switch.
-const CAST_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Close a portal session within [`CAST_CLOSE_BUDGET`]. A failure is logged, not
-/// fatal: the capturer is already going away.
-async fn close_session(close: impl Future<Output = std::result::Result<(), ashpd::Error>>) {
-    match tokio::time::timeout(CAST_CLOSE_BUDGET, close).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(
-            error = %e,
-            "closing the portal session failed — the next cast may find the portal busy"
-        ),
-        Err(_) => tracing::warn!(
-            budget_s = CAST_CLOSE_BUDGET.as_secs(),
-            "the portal did not answer Session.Close in time — it is probably already wedged"
-        ),
-    }
-}
-
-/// One handshake step under the shared deadline
-/// ([`crate::portal_rt::HANDSHAKE_BUDGET`]). An await the portal never answers
-/// would park this thread on the process-global connection for good.
-async fn within<T, E>(
-    deadline: tokio::time::Instant,
-    step: impl Future<Output = std::result::Result<T, E>>,
-) -> Result<T>
-where
-    anyhow::Error: From<E>,
-{
-    match tokio::time::timeout_at(deadline, step).await {
-        Ok(result) => Ok(result?),
-        Err(_) => Err(no_answer()),
-    }
-}
-
-fn no_answer() -> anyhow::Error {
-    anyhow!(
-        "the portal did not answer within {}s",
-        crate::portal_rt::HANDSHAKE_BUDGET.as_secs()
-    )
-}
-
-/// The steps after `create_session`, under the deadline. On timeout the
-/// half-built session is closed: nothing else ends it.
-async fn finish_or_close<T, C>(
-    deadline: tokio::time::Instant,
-    steps: impl Future<Output = Result<T>>,
-    close: impl FnOnce() -> C,
-) -> Result<T>
-where
-    C: Future<Output = std::result::Result<(), ashpd::Error>>,
-{
-    match tokio::time::timeout_at(deadline, steps).await {
-        Ok(result) => result,
-        Err(_) => {
-            close_session(close()).await;
-            Err(no_answer())
-        }
     }
 }
 
@@ -404,52 +342,5 @@ mod hdr_offer_tests {
     #[test]
     fn a_pin_naming_no_live_head_reports_sdr() {
         assert!(!hdr_offer_for(&[("DP-1", true)], Some("DP-9")));
-    }
-}
-
-#[cfg(test)]
-mod handshake_bound_tests {
-    use super::finish_or_close;
-    use std::future::Future;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
-    fn run<F: Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("build test runtime")
-            .block_on(f)
-    }
-
-    /// A portal that never answers: the setup fails and the half-built session is closed.
-    #[test]
-    fn a_hung_step_closes_the_half_built_session() {
-        let closed = AtomicBool::new(false);
-        let result = run(finish_or_close(
-            tokio::time::Instant::now(),
-            std::future::pending::<anyhow::Result<()>>(),
-            || async {
-                closed.store(true, Ordering::Relaxed);
-                Ok::<(), ashpd::Error>(())
-            },
-        ));
-        assert!(result.is_err());
-        assert!(closed.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn a_finished_handshake_keeps_its_session() {
-        let closed = AtomicBool::new(false);
-        let result = run(finish_or_close(
-            tokio::time::Instant::now() + Duration::from_secs(5),
-            async { Ok(7) },
-            || async {
-                closed.store(true, Ordering::Relaxed);
-                Ok::<(), ashpd::Error>(())
-            },
-        ));
-        assert_eq!(result.unwrap(), 7);
-        assert!(!closed.load(Ordering::Relaxed));
     }
 }
