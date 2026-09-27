@@ -691,6 +691,15 @@ public final class SessionAudio {
             #else
             break // the watcher only raises this one on macOS
             #endif
+        case .deviceList:
+            #if os(macOS)
+            // Only a pinned endpoint returns without the default moving. Unpinned sessions skip
+            // it: the voice processor's own aggregate device churns this list.
+            stateLock.lock()
+            let pinned = startConfig.map { !$0.speakerUID.isEmpty || !$0.micUID.isEmpty } ?? false
+            stateLock.unlock()
+            if pinned { defaultOutputChanged() }
+            #endif
         }
     }
 
@@ -828,11 +837,11 @@ public final class SessionAudio {
     }
 
     #if os(macOS)
-    /// The system's output device moved. Rebuild only when it actually concerns this session: the
-    /// engine is gone or stopped, or it is playing to a device that is no longer the one we should
-    /// be on. Somebody changing the default while we are pinned to a named speaker is none of our
-    /// business, and rebuilding for it would cost an audible gap for nothing. Main queue (the
-    /// listener block is registered against it).
+    /// The system's output device moved, or a device came or went. Rebuild only when it concerns
+    /// this session: the engine is gone or stopped, or the speaker or pinned mic is not the device
+    /// it should be on (a pinned one that came back). Somebody changing the default while we are
+    /// pinned to a named speaker is none of our business, and rebuilding for it would cost an
+    /// audible gap for nothing. Main queue (the listener block is registered against it).
     private func defaultOutputChanged() {
         guard !flag.isStopped, let config = startConfig else { return }
         stateLock.lock()
@@ -850,8 +859,21 @@ public final class SessionAudio {
         let shouldBeOn = config.speakerUID.isEmpty
             ? AudioDevices.defaultOutputDevice()
             : AudioDevices.deviceID(forUID: config.speakerUID)
-        guard let shouldBeOn, shouldBeOn != playingOn else { return }
-        scheduleEngineRebuild(reason: "the output device changed under the session")
+        if let shouldBeOn, shouldBeOn != playingOn {
+            scheduleEngineRebuild(reason: "the output device changed under the session")
+            return
+        }
+        // The split capture engine fell back to the default when its pinned mic went away.
+        guard !config.micUID.isEmpty,
+              let wanted = AudioDevices.deviceID(forUID: config.micUID)
+        else { return }
+        stateLock.lock()
+        let capture = captureEngine
+        stateLock.unlock()
+        guard let unit = capture?.inputNode.audioUnit, let micOn = Self.currentDevice(of: unit),
+              micOn != wanted
+        else { return }
+        scheduleEngineRebuild(reason: "the pinned microphone came back")
     }
     #endif
 
