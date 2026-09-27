@@ -36,7 +36,10 @@ mod drm_sync;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-use windows::{game_term, install, interactive, seat, service, tray};
+use windows::{game_term, install, interactive, service, tray};
+// What this host reads of the multi-seat contract; unset means the console host.
+#[cfg(target_os = "windows")]
+use pf_paths::seat;
 #[cfg(not(target_os = "windows"))]
 mod windows {
     pub(crate) mod entry {

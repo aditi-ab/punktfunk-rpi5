@@ -180,9 +180,9 @@ fn is_removable_instance(instance_id: &str) -> bool {
     instance_id.to_ascii_uppercase().starts_with("ROOT\\")
 }
 
-/// [`crate::install::remove_device`], reported on the uninstaller's console.
+/// [`pf_paths::remove_device`], reported on the uninstaller's console.
 fn remove_devnode(instance_id: &str) -> bool {
-    match crate::install::remove_device(instance_id) {
+    match pf_paths::remove_device(instance_id) {
         Ok(()) => {
             println!("removed audio devnode {instance_id}");
             true

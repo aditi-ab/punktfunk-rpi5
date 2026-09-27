@@ -810,7 +810,7 @@ pub fn ensure(pad_index: u8) -> Result<PadEndpoint> {
 /// Best-effort teardown (`pnputil /remove-device`). Tests and the
 /// `pad-endpoint remove` hatch only; endpoints are persistent.
 pub fn remove(pe: &PadEndpoint) {
-    match crate::install::remove_device(&pe.device_instance) {
+    match pf_paths::remove_device(&pe.device_instance) {
         Ok(()) => tracing::info!(devnode = %pe.device_instance, "pad-audio devnode removed"),
         Err(e) => tracing::warn!(devnode = %pe.device_instance, error = %format!("{e:#}"),
             "pad-audio devnode not removed"),

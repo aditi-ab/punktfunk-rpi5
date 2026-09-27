@@ -352,7 +352,7 @@ fn cleanup() -> Result<()> {
 
 /// Same teardown as `pad-endpoint remove`.
 fn remove_devnode(inst: &str) {
-    match crate::install::remove_device(inst) {
+    match pf_paths::remove_device(inst) {
         Ok(()) => println!("audio-probe: removed devnode {inst}"),
         Err(e) => println!("audio-probe: couldn't remove {inst}: {e:#}"),
     }
