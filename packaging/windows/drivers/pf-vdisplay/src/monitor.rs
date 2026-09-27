@@ -534,10 +534,11 @@ pub fn target_mode2(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_
 
 /// Adopt a hardware-cursor channel delivery (`IOCTL_SET_CURSOR_CHANNEL`, proto v5): create the
 /// cursor-data event, declare the hardware cursor to the OS, start the worker. `Err(ch)` when
-/// `owner` has no arrived monitor with `target_id`, or the event could not be made. A
-/// re-delivery replaces both — the host only re-sends after recreating the section. A monitor
-/// added without `hw_cursor` gets one only because the adapter already excludes the pointer:
-/// its client draws nothing, so the channel exists for the pool's blend alone.
+/// `owner` has no arrived monitor with `target_id`, the event could not be made, or the section
+/// failed to map or validate. A re-delivery replaces both — the host only re-sends after
+/// recreating the section. A monitor added without `hw_cursor` gets one only because the
+/// adapter already excludes the pointer: its client draws nothing, so the channel exists for
+/// the pool's blend alone.
 ///
 /// The monitor keeps one data event across deliveries: a re-declare after a swap-chain assign
 /// copies its value out and must never find it closed. A replaced worker is joined before the
@@ -585,17 +586,21 @@ pub fn set_cursor_channel(
     // the channel and spawn the worker WITHOUT declaring, so DWM keeps compositing; a later
     // enable-flip declares against this event. Once anything declared, the pointer is gone
     // from every frame and the worker's shape is what the pool blends, so declare regardless.
-    let Some(worker) = crate::cursor_worker::setup_and_spawn(
+    let spawned = crate::cursor_worker::setup_and_spawn(
         object,
         ch,
         declare,
         data_event.as_raw().0 as isize,
         cell,
-    ) else {
-        // setup_and_spawn consumed the channel and released everything it mapped; `data_event`
-        // drops here. The host detects the missing publish and keeps its composited cursor.
-        lock(&m.cursor).set_blend(registry::any_declared());
-        return Ok(());
+    );
+    let worker = match spawned {
+        Ok(worker) => worker,
+        Err(unadopted) => {
+            // `data_event` drops here. An adopted channel is released already and the host sees
+            // no publish; one that failed validation goes back for the host to reap.
+            lock(&m.cursor).set_blend(registry::any_declared());
+            return unadopted.map_or(Ok(()), Err);
+        }
     };
     if declare {
         // The worker only spawns after `IddCxMonitorSetupHardwareCursor` succeeded.
