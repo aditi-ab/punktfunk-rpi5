@@ -146,9 +146,10 @@ impl Presenter {
             && self.present_timer.is_none()
             && !matches!(input, FrameInput::Redraw);
         if nonblocking {
-            // SAFETY: `fence` is owned here; a bounded wait is always legal.
             if self.submitted {
-                match unsafe { self.device.wait_for_fences(&[self.fence], true, 1_000_000) } {
+                // SAFETY: `fence` is owned here; a bounded wait is always legal.
+                let waited = unsafe { self.device.wait_for_fences(&[self.fence], true, 1_000_000) };
+                match waited {
                     Ok(()) => {}
                     Err(vk::Result::TIMEOUT) => {
                         return Ok(Presented::Busy(input, BusyOn::Fence));
