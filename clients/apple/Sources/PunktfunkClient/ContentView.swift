@@ -375,19 +375,16 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background:
-                guard model.phase == .streaming else { break }
-                if backgroundKeepAlive {
-                    model.enterBackground(timeoutMinutes: backgroundTimeoutMinutes)
-                } else {
-                    // Not deliberate: the user may come straight back, so let the host linger the
-                    // display for a fast reconnect instead of tearing it down.
-                    model.disconnect(deliberate: false)
-                }
+                applyBackgroundPolicy()
             case .active:
                 model.exitBackground()
             default:
                 break
             }
+        }
+        // A dial in flight when the user swiped home can land before suspension: same rule.
+        .onChange(of: model.phase) { _, phase in
+            if phase == .streaming, scenePhase == .background { applyBackgroundPolicy() }
         }
         #endif
         #if os(iOS)
@@ -723,6 +720,20 @@ struct ContentView: View {
     /// live session (same host → focus, different host → say so; NEVER tear one down on a
     /// background tap), and carries only references — a preset it can't honor refuses with a
     /// notice rather than streaming with the wrong settings.
+    #if os(iOS) || os(tvOS)
+    /// Hold a streaming session under the opt-in keep-alive, or end it.
+    private func applyBackgroundPolicy() {
+        guard model.phase == .streaming else { return }
+        if backgroundKeepAlive {
+            model.enterBackground(timeoutMinutes: backgroundTimeoutMinutes)
+        } else {
+            // Not deliberate: the user may come straight back, so let the host linger the
+            // display for a fast reconnect instead of tearing it down.
+            model.disconnect(deliberate: false)
+        }
+    }
+    #endif
+
     private func handleDeepLink(_ url: URL) {
         // Explicit intent beats the start-screen policy, and the two race on a cold start:
         // `.onOpenURL` and `.onAppear` have no guaranteed order. Claiming the once-per-process
