@@ -241,6 +241,38 @@ struct AdaptiveSlotRegime {
     }
 }
 
+/// Arrival and glass pacing's schedule against the ordinary display link, resolved once per
+/// session. `PUNKTFUNK_PRESENT_MODE` (`slot`, `immediate`, `vsync`) picks one for on-device A/B.
+struct PresentPolicy: Equatable {
+    /// Adaptive-refresh latency: sparse input presents at once, dense input one frame per slot.
+    var adaptiveSlot: Bool
+    /// At most one present per display-link slot.
+    var fixedSlot: Bool
+    /// Schedule each present on the next vsync.
+    var fixedVsync: Bool
+
+    static func resolve(
+        env: String?, vsync: Bool, vsyncPaced: Bool, adaptiveSlotPaced: Bool
+    ) -> PresentPolicy {
+        let forcedSlot = env == "slot"
+        return PresentPolicy(
+            adaptiveSlot: adaptiveSlotPaced && !vsync && env != "immediate" && env != "vsync"
+                && !forcedSlot,
+            fixedSlot: vsyncPaced || forcedSlot,
+            fixedVsync: env == "vsync" || (env != "immediate" && vsync))
+    }
+
+    /// The pace the pf-present line names under `pacing`.
+    func label(_ pacing: PresentPacing) -> String {
+        switch pacing {
+        case .decoded: return "decoded"
+        case .deadline: return "deadline"
+        case .arrival, .glass:
+            return adaptiveSlot ? "adaptive" : fixedSlot ? "slot" : fixedVsync ? "vsync" : "immediate"
+        }
+    }
+}
+
 /// Selects when a decoded frame enters the layer; decode and the newest-wins store are shared.
 ///
 /// - `arrival` (stage-2): render from frame arrival. This is the macOS default and remains an
@@ -952,20 +984,15 @@ public final class Stage2Pipeline {
         presenter.configure(hdr: connection.isHDR, tenBitSDR: connection.bitDepth >= 10)
         decodedSink?.reset()
 
-        let token = token
-        let decoder = decoder
-        let recovery = recovery
-        let presenter = presenter
-        let pumpStopped = pumpStopped
-        let reanchorGate = gate
         // PyroWave rides a different decode half: no CMFormatDescription/VideoToolbox machinery
         // (a wavelet AU has no parameter sets), no keyframe recovery or re-anchor freeze (the
         // stream is all-intra and Phase 4's partial delivery WANTS lossy frames on glass as
         // localized blur, not a freeze). The ready ring, render thread, pacing and meters are
         // shared unchanged.
-        let thread: Thread
-        if connection.videoCodec == .pyrowave {
-            thread = Self.makePyroWavePump(
+        let presenter = presenter
+        let thread =
+            connection.videoCodec == .pyrowave
+            ? Self.makePyroWavePump(
                 connection: connection, token: token, pumpStopped: pumpStopped,
                 ring: ring, renderSignal: renderSignal,
                 device: presenter.metalDevice, queue: presenter.metalQueue,
@@ -973,96 +1000,49 @@ public final class Stage2Pipeline {
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
                 frameHDR: frameHDR,
                 onHdrMeta: { [weak presenter] meta in presenter?.setHdrMeta(meta) })
-        } else {
-            thread = Thread {
-            defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
-            var intake = AUIntake(connection: connection, gate: reanchorGate, recovery: recovery)
-            // Hardware-only backstop (4:4:4, AV1): 3 s in which every decode fails means this device
-            // can't decode the mode at all, e.g. past a resolution ceiling. End instead of looping on
-            // black. Timed, not counted: after a failure only IDRs reach the decoder.
-            let hardwareOnly = connection.isChroma444 || connection.videoCodec == .av1
-            var failingSinceNs: UInt64?
-            // Every iteration drains its own autorelease pool: this thread has no runloop, so
-            // autoreleased VT/CM temporaries would otherwise accumulate until session end.
-            // `false` = session over — exit the loop (the closure can't `break` across itself).
-            var alive = true
-            while alive, !token.isStopped {
-                alive = autoreleasepool { () -> Bool in
-                do {
-                    // Background time is not failure time: the intake drains without decoding.
-                    if connection.isVideoDropped { failingSinceNs = nil }
-                    // HDR mastering metadata (0xCE) goes to the presenter (→ CAEDRMetadata).
-                    guard let ready = try intake.next(
-                        onFrame: onFrame, onDecodedSize: onDecodedSize,
-                        onHdrMeta: { presenter.setHdrMeta($0) })
-                    else { return true }
-                    let au = ready.au
-                    // A delta between a loss and its re-anchor references the lost picture. Fed to
-                    // VideoToolbox it poisons the session — every later non-IDR AU, the anchor too,
-                    // comes back kVTVideoDecoderBadDataErr. Withheld, the anchor decodes and lifts.
-                    if ready.step.withhold { return true }
-                    guard let f = intake.pump.format, !token.isStopped else { return true }
-                    if decoder.decode(au: au, format: f) {
-                        failingSinceNs = nil
-                    } else {
-                        // Submit/decoder error: drop the session and re-gate on the next IDR's in-band
-                        // parameter sets (a delta frame can't recover) and keep asking for that IDR.
-                        decoder.reset()
-                        intake.requireIDR()
-                        let nowNs = DispatchTime.now().uptimeNanoseconds
-                        let sinceNs = failingSinceNs ?? nowNs
-                        failingSinceNs = sinceNs
-                        if hardwareOnly, nowNs - sinceNs >= 3_000_000_000 {
-                            if !token.isStopped { onSessionEnd?() }
-                            return false
-                        }
-                    }
-                    return true
-                } catch {
-                    if !token.isStopped { onSessionEnd?() }
-                    return false // session closed
-                }
-                }
-            }
-            }
-        }
+            : Self.makeVideoToolboxPump(
+                connection: connection, token: token, pumpStopped: pumpStopped,
+                decoder: decoder, gate: gate, recovery: recovery,
+                onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
+                onHdrMeta: { presenter.setHdrMeta($0) })
         thread.name = "punktfunk-stage2-pump"
         thread.qualityOfService = .userInteractive
         pumpJoinable = true
         thread.start()
 
         // Present policy, resolved once per session before the stats so each line names it.
-        // Adaptive-refresh latency chooses immediate sparse or slotted dense input. The env selects
-        // slot, immediate or legacy scheduled V-Sync explicitly for A/B.
-        let presentMode = ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENT_MODE"]
-        let forcedSlot = presentMode == "slot"
-        let adaptiveSlot = adaptiveSlotPaced && !connection.settings.vsync
-            && presentMode != "immediate" && presentMode != "vsync" && !forcedSlot
-        let fixedSlot = vsyncPaced || forcedSlot
-        let fixedVsync = presentMode == "vsync"
-            || (presentMode != "immediate" && connection.settings.vsync)
-        let vsyncClock = vsyncClock
-        frameRateHint.stagePace(
-            pacing == .decoded ? "decoded" : pacing == .deadline ? "deadline"
-                : adaptiveSlot ? "adaptive" : fixedSlot ? "slot" : fixedVsync ? "vsync" : "immediate")
+        let policy = PresentPolicy.resolve(
+            env: ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENT_MODE"],
+            vsync: connection.settings.vsync, vsyncPaced: vsyncPaced,
+            adaptiveSlotPaced: adaptiveSlotPaced)
+        frameRateHint.stagePace(policy.label(pacing))
         // The video plane has no present thread: `renderTick` stamps and flushes its line.
         let debugStats: PresentDebugStats? = self.debugStats
         if decodedSink != nil { return }
 
         // The present half. Deadline pacing (stage-4) swaps it wholesale: a CAMetalDisplayLink
-        // vends the drawables and its per-refresh updates co-drive the render thread — see
-        // startDeadlinePresenter. The V-Sync policy above doesn't apply there (the link deadline-
-        // times every present).
+        // vends the drawables and its per-refresh updates co-drive the render thread. The policy
+        // above doesn't apply there (the link deadline-times every present).
         if pacing == .deadline {
             startDeadlinePresenter(debugStats: debugStats)
-            return
+        } else {
+            startArrivalPresenter(policy: policy, debugStats: debugStats)
         }
+    }
 
-        // The render thread: one present per display-link signal. It owns every layer format/colour/
-        // drawable interaction (see MetalVideoPresenter's threading notes); with displaySyncEnabled on,
-        // nextDrawable's up-to-a-frame wait lands here instead of on main. The 100 ms timed wait is
-        // only the stop-flag poll for a session whose link stopped ticking.
+    /// Arrival and glass pacing's present half (stage-2/3 — see `PresentPacing`): one render
+    /// thread, one present per wake. Decoded frames are the primary wake; display-link ticks
+    /// retry a put-back frame and refresh the vsync grid `policy` schedules against.
+    ///
+    /// The thread owns every layer format/colour/drawable interaction (see MetalVideoPresenter's
+    /// threading notes); with displaySyncEnabled on, nextDrawable's up-to-a-frame wait lands here
+    /// instead of on main. The 100 ms timed wait is only the stop-flag poll for a session whose
+    /// link stopped ticking. Like the pump, the thread never captures `self`.
+    private func startArrivalPresenter(policy: PresentPolicy, debugStats: PresentDebugStats?) {
+        let token = token
         let ring = ring
+        let presenter = presenter
+        let vsyncClock = vsyncClock
         let endToEndMeter = endToEndMeter
         let hud = hud
         let clockOffset = clockOffset
@@ -1094,7 +1074,7 @@ public final class Stage2Pipeline {
                 // Fixed slot pacing can reject the wake before touching the store. Adaptive pacing
                 // resolves after taking a frame because its source stamp selects the regime.
                 let fixedSlotTarget =
-                    fixedSlot ? vsyncClock.nextVsync(after: CACurrentMediaTime()) : nil
+                    policy.fixedSlot ? vsyncClock.nextVsync(after: CACurrentMediaTime()) : nil
                 if let fixedSlotTarget, abs(fixedSlotTarget - lastPresentTarget) < 0.002 {
                     debugStats?.gatedWake()
                     debugStats?.flushIfDue(ring: ring, gate: gate)
@@ -1116,7 +1096,8 @@ public final class Stage2Pipeline {
                     return
                 }
                 let now = CACurrentMediaTime()
-                let adaptiveSlotActive = adaptiveSlot && adaptiveRegime.update(ptsNs: frame.ptsNs)
+                let adaptiveSlotActive =
+                    policy.adaptiveSlot && adaptiveRegime.update(ptsNs: frame.ptsNs)
                 let slotTarget = fixedSlotTarget
                     ?? (adaptiveSlotActive ? vsyncClock.nextVsync(after: now) : nil)
                 if adaptiveSlotActive, let slotTarget,
@@ -1128,7 +1109,7 @@ public final class Stage2Pipeline {
                     return
                 }
                 // A stale grid yields no target and falls back to an immediate present.
-                let scheduleOnGrid = fixedSlot || fixedVsync || adaptiveSlotActive
+                let scheduleOnGrid = policy.fixedSlot || policy.fixedVsync || adaptiveSlotActive
                 let presentAt = scheduleOnGrid
                     ? slotTarget
                         ?? vsyncClock.nextVsync(after: max(now, frame.dueMediaTime ?? now))
@@ -1583,6 +1564,70 @@ public final class Stage2Pipeline {
     deinit {
         token.stop()
         renderSignal.signal() // wake the render thread so it can observe the stop and exit
+    }
+
+    /// The VideoToolbox pump: the shared AU intake vets each AU and `decoder` decodes it; the
+    /// decoder's own callback fills the ready ring. A failed submit drops the decode session and
+    /// waits for the next IDR's parameter sets. Static + capture-by-parameter so a missed stop
+    /// can't leak a live pipeline.
+    private static func makeVideoToolboxPump(
+        connection: PunktfunkConnection, token: StopFlag, pumpStopped: DispatchSemaphore,
+        decoder: VideoDecoder, gate: ReanchorGate, recovery: KeyframeRecovery,
+        onFrame: (@Sendable (AccessUnit) -> Void)?,
+        onSessionEnd: (@Sendable () -> Void)?,
+        onDecodedSize: (@Sendable (Int, Int) -> Void)?,
+        onHdrMeta: @escaping @Sendable (PunktfunkConnection.HdrMeta) -> Void
+    ) -> Thread {
+        Thread {
+            defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
+            var intake = AUIntake(connection: connection, gate: gate, recovery: recovery)
+            // Hardware-only backstop (4:4:4, AV1): 3 s in which every decode fails means this device
+            // can't decode the mode at all, e.g. past a resolution ceiling. End instead of looping on
+            // black. Timed, not counted: after a failure only IDRs reach the decoder.
+            let hardwareOnly = connection.isChroma444 || connection.videoCodec == .av1
+            var failingSinceNs: UInt64?
+            // Every iteration drains its own autorelease pool: this thread has no runloop, so
+            // autoreleased VT/CM temporaries would otherwise accumulate until session end.
+            // `false` = session over — exit the loop (the closure can't `break` across itself).
+            var alive = true
+            while alive, !token.isStopped {
+                alive = autoreleasepool { () -> Bool in
+                    do {
+                        // Background time is not failure time: the intake drains without decoding.
+                        if connection.isVideoDropped { failingSinceNs = nil }
+                        // HDR mastering metadata (0xCE) goes to the presenter (→ CAEDRMetadata).
+                        guard let ready = try intake.next(
+                            onFrame: onFrame, onDecodedSize: onDecodedSize, onHdrMeta: onHdrMeta)
+                        else { return true }
+                        let au = ready.au
+                        // A delta between a loss and its re-anchor references the lost picture. Fed
+                        // to VideoToolbox it poisons the session — every later non-IDR AU, the anchor
+                        // too, comes back kVTVideoDecoderBadDataErr. Withheld, the anchor decodes.
+                        if ready.step.withhold { return true }
+                        guard let f = intake.pump.format, !token.isStopped else { return true }
+                        if decoder.decode(au: au, format: f) {
+                            failingSinceNs = nil
+                        } else {
+                            // Submit/decoder error: drop the session and re-gate on the next IDR's
+                            // in-band parameter sets (a delta frame can't recover) and keep asking.
+                            decoder.reset()
+                            intake.requireIDR()
+                            let nowNs = DispatchTime.now().uptimeNanoseconds
+                            let sinceNs = failingSinceNs ?? nowNs
+                            failingSinceNs = sinceNs
+                            if hardwareOnly, nowNs - sinceNs >= 3_000_000_000 {
+                                if !token.isStopped { onSessionEnd?() }
+                                return false
+                            }
+                        }
+                        return true
+                    } catch {
+                        if !token.isStopped { onSessionEnd?() }
+                        return false // session closed
+                    }
+                }
+            }
+        }
     }
 
     /// The PyroWave pump: AUs go straight into the Metal wavelet decoder (no VideoToolbox, no
