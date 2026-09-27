@@ -134,6 +134,7 @@ mod inject {
     pub(crate) use pf_inject::*;
 }
 mod client_logs;
+mod pen_sink;
 // Unix wall clock every stored deadline and event stamp reads.
 mod clock;
 // Compositor + gamescope route for a connect, shared by the native and GameStream planes.
