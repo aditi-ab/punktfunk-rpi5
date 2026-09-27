@@ -59,8 +59,12 @@ pub fn resolve_slices(codec: Codec, default_slices: u32) -> u32 {
 /// Sub-frame readback tri-state (`enableSubFrameWrite` + `reportSliceOffsets`,
 /// sync sessions only — see [`build_init_params`]): `PUNKTFUNK_NVENC_SUBFRAME`
 /// `0` never, `1` force, unset = `default_on` (the GPU's `SUBFRAME_READBACK`
-/// cap on both backends).
-pub fn resolve_subframe(default_on: bool) -> bool {
+/// cap on both backends). Off below two slices, force included: there is no
+/// slice to read ahead of, and on HEVC it costs the second engine.
+pub fn resolve_subframe(slices: u32, default_on: bool) -> bool {
+    if slices < 2 {
+        return false;
+    }
     match crate::knobs::get().nvenc_subframe {
         1 => false,
         2 => true,
@@ -154,13 +158,21 @@ pub fn resolve_split_subframe(
 
 #[cfg(test)]
 mod split_subframe_tests {
-    use super::{resolve_slices, resolve_split_subframe, Codec};
+    use super::{resolve_slices, resolve_split_subframe, resolve_subframe, Codec};
     use nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_SPLIT_ENCODE_MODE as M;
 
     const AUTO: u32 = M::NV_ENC_SPLIT_AUTO_MODE as u32;
     const TWO: u32 = M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32;
     const AUTO_F: u32 = M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32;
     const DISABLE: u32 = M::NV_ENC_SPLIT_DISABLE_MODE as u32;
+
+    /// A single-slice session never arms sub-frame, whatever the GPU cap says.
+    #[test]
+    fn one_slice_keeps_subframe_off() {
+        assert!(!resolve_subframe(1, true));
+        assert!(resolve_subframe(4, true));
+        assert!(!resolve_subframe(4, false));
+    }
 
     /// Plain AUTO + default-on subframe must pass through. Keying on `!= DISABLE`
     /// would disarm subframe on every default HEVC session (AUTO == 0 is the

@@ -1212,13 +1212,11 @@ impl NvencD3d11Encoder {
                 resolve_split_mode(self.codec, self.bit_depth, pixel_rate, self.encoder_engines);
             // Multi-slice default 4, clamped by the client ceiling. `PUNKTFUNK_NVENC_SLICES` overrides.
             self.slices = resolve_slices(self.codec, 4.min(self.max_slices));
-            // Sub-frame defaults ON where the GPU advertises SUBFRAME_READBACK.
-            // `PUNKTFUNK_NVENC_SUBFRAME` is the tri-state override. `subframe_broken`
-            // wins over the operator force so a failed prefix check does not re-arm.
-            // Sub-frame readback needs slices to read ahead of; at one slice it only costs the
-            // second engine on HEVC.
+            // Sub-frame follows the GPU cap and the slice count ([`resolve_subframe`]).
+            // `subframe_broken` wins over the operator force so a failed prefix check does
+            // not re-arm.
             let subframe_req =
-                self.slices >= 2 && resolve_subframe(self.subframe_cap) && !self.subframe_broken;
+                resolve_subframe(self.slices, self.subframe_cap) && !self.subframe_broken;
             let (split_mode, subframe_req) =
                 resolve_split_subframe(self.codec, split_mode, subframe_req, subframe_env_forced());
             // Highest bitrate the codec LEVEL accepts. If a forced split is the only problem,

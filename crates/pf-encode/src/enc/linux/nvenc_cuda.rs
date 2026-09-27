@@ -1217,11 +1217,12 @@ impl NvencCudaEncoder {
         self.encoder_engines = engines.max(0) as u32;
         // Resolve slices + sub-frame here, before open, so config/init/chunked-poll agree.
         // Clamp to `max_slices`: a client that never asked for multi-slice can wedge on
-        // several slice NALs. Caps gate the sub-frame default. Env knobs still override.
+        // several slice NALs. Caps and the slice count gate sub-frame. Env knobs still override.
         self.slices = resolve_slices(self.codec, 4.min(self.max_slices));
         // `subframe_broken` beats the operator force: this encoder already proved the
         // driver's sub-frame accounting corrupt. Per-encoder; a fresh one retests.
-        self.subframe_on = resolve_subframe(self.subframe_cap) && !self.subframe_broken;
+        self.subframe_on =
+            resolve_subframe(self.slices, self.subframe_cap) && !self.subframe_broken;
         self.subframe_forced = subframe_env_forced();
         tracing::info!(
             rfi = self.rfi_supported,
